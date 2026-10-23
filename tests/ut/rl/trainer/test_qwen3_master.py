@@ -24,16 +24,6 @@ import torch_npu
 from transformers import Qwen3Config, Qwen3ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP
 
-from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
-from hyper_parallel.distributed import ShardingPlanner as SharedPlanner
-from hyper_parallel.distributed._builder import parameter_sharding
-from hyper_parallel.distributed.mesh import DistributedSetup, MeshContext
-from hyper_parallel.distributed.tensor_parallel.param_role import ParameterClassifier
-from hyper_parallel.models._transformers import auto_model, model_builder
-from hyper_parallel.models._transformers.checkpoint_loader import CheckpointManager
-from hyper_parallel.models._transformers.model_builder import _move_model_to_device
-from hyper_parallel.models.build_options import FSDP2Config
-from hyper_parallel.models.replacement import apply_module_replacements, compile_module_replacements
 from rl.roles import qwen3_builder as qwen3
 from rl.roles.model_setup import ModelRegistration, resolve_vllm_model
 from rl.roles.qwen3_builder import Qwen3ShardingPlanner as ShardingPlanner
@@ -49,6 +39,17 @@ from rl.weight_sync.packed_weight import (
     unpack_packed_weights,
 )
 from rl.weight_sync.transfer import DirectReshardStrategy
+
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
+from hyper_parallel.distributed import ShardingPlanner as SharedPlanner
+from hyper_parallel.distributed._builder import parameter_sharding
+from hyper_parallel.distributed.mesh import DistributedSetup, MeshContext
+from hyper_parallel.distributed.tensor_parallel.param_role import ParameterClassifier
+from hyper_parallel.models._transformers import auto_model, model_builder
+from hyper_parallel.models._transformers.checkpoint_loader import CheckpointManager
+from hyper_parallel.models._transformers.model_builder import _move_model_to_device
+from hyper_parallel.models.build_options import FSDP2Config
+from hyper_parallel.models.replacement import apply_module_replacements, compile_module_replacements
 from tests.ut.auto_models.distributed.conftest import FakeDeviceMesh
 
 
@@ -350,22 +351,26 @@ def test_runtime_adapter_does_not_patch_shared_code_or_other_models():
                         parameter_sharding._broadcast_tied_param, model_builder._move_model_to_device)
 
 
-def test_scoped_fsdp_retie_precedes_shared_manager(monkeypatch):
+@pytest.mark.parametrize("exclude_embedding", [False, True])
+def test_scoped_fsdp_retie_precedes_shared_manager(monkeypatch, exclude_embedding):
     """Shared FSDP sees one tied parameter; its own implementation is reused."""
     model = Qwen3ForCausalLM(tiny_config())
     model.lm_head.weight = torch.nn.Parameter(model.model.embed_tokens.weight.detach().clone())
     source_info = object()
     received = []
 
-    def parallelize(unused_manager, value, source_shard_info=None):
+    ignored = {model.model.embed_tokens.weight} if exclude_embedding else None
+
+    def parallelize(unused_manager, value, source_shard_info=None, ignored_params=None):
         del unused_manager
         assert value.lm_head.weight is value.model.embed_tokens.weight
         received.append(source_shard_info)
+        assert ignored_params is ignored
         return value
 
     monkeypatch.setattr(qwen3.FSDP2Manager, "parallelize", parallelize)
     manager = qwen3._Qwen3FSDP2Manager(FSDP2Config(), MeshContext())
-    assert manager.parallelize(model, source_info) is model
+    assert manager.parallelize(model, source_info, ignored_params=ignored) is model
     assert received == [source_info]
 
 

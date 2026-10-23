@@ -291,6 +291,10 @@ class RLCheckpointManager:
             self._verify_reload(self.directory(step))
         self._export_hf(self.directory(step))
 
+    def save(self, state: Any) -> None:
+        """Persist one explicit, coordinated training boundary."""
+        self._save(state)
+
     def _save(self, state: Any) -> None:
         """Persist distributed model state and then publish RL completion metadata."""
         step = int(state.global_step)

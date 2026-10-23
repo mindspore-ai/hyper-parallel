@@ -46,6 +46,10 @@ _LOGGER = logging.getLogger(__name__)
 
 def register_hyper_models() -> None:
     """Register supported HyperParallel model adapters with vLLM."""
+    if os.environ.get("HYPER_RL_ASYNC_TRAINING") == "1":
+        # Optional server-only routes; ordinary synchronous services do not install them.
+        from rl.async_training.vllm_server import install_async_routes  # pylint: disable=C0415
+        install_async_routes()
     diagnostic_rms_norm = os.environ.get("HYPER_RL_TEST_QWEN3_RMS_NORM", "0")
     if diagnostic_rms_norm not in ("0", "1"):
         raise ValueError("HYPER_RL_TEST_QWEN3_RMS_NORM must be 0 or 1")
@@ -92,3 +96,13 @@ def register_hyper_models() -> None:
     for architecture, model_class in _ADAPTED_MODELS.items():
         if architecture not in supported_architectures:
             ModelRegistry.register_model(architecture, model_class)
+
+
+if __name__ in ("__main__", "__mp_main__"):
+    # The async service and spawned workers register hooks before loading their targets.
+    os.environ["HYPER_RL_ASYNC_TRAINING"] = "1"
+    register_hyper_models()
+    if __name__ == "__main__":
+        from vllm.entrypoints.cli.main import main
+
+        main()

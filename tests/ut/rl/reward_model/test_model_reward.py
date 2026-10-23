@@ -100,6 +100,9 @@ class TestModelReward(unittest.TestCase):
                 self.assertEqual(transition.reward, expected)
                 self.assertEqual(transition.info["extracted_answer"], "42")
                 self.assertEqual(transition.info["reward_components"], {} if deferred else {"correctness": 1.0})
+                self.assertEqual(transition.info["expected_answer"], "42")
+                self.assertEqual(transition.info["reward_scorer"],
+                                 None if deferred else "examples.gsm8k.agent.compute_gsm8k_reward")
 
     def test_rule_and_model_use_gsm8k_environment_scoring(self) -> None:
         """Single and multi-turn environments own rule and deferred RM selection."""

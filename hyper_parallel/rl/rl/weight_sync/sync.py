@@ -97,9 +97,9 @@ def coordinator_call(operation: str, callback: Callable[[], Any]) -> Any:
         except Exception as error:  # pylint: disable=W0718
             local_error = error
     synchronize_error(local_error, operation)
-    gathered: list[Any] = [None] * world_size
-    dist.all_gather_object(gathered, result if rank == 0 else None)
-    return gathered[0]
+    shared = [result]
+    dist.broadcast_object_list(shared, src=0)
+    return shared[0]
 
 
 class ActorRolloutWeightSync:

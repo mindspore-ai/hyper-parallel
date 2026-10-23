@@ -1,0 +1,170 @@
+# Qwen3 dense async recipe; prepared SWE-Smith data and task images are required.
+model:
+  registry_name: qwen3_4b
+  name: qwen3
+  weights_path: /models/Qwen3-4B
+  tokenizer_path: /models/Qwen3-4B
+  config_overrides: null
+  attention_implementation: transformers_builtin
+  trust_remote_code: false
+  tokenizer_trust_remote_code: false
+consistency: {enabled: false}
+data:
+  train_path: /results/swe_smith/train.parquet
+  test_path: /results/swe_smith/validation.parquet
+  row_adapter: examples.swe_smith.prepare_data:adapt_row
+  max_prompt_length: 4096
+  max_train_samples: null
+  shuffle: false
+  num_workers: 0
+  prefetch_factor: null
+  pin_memory: false
+rollout:
+  engine: vllm
+  num_return_sequences: 2
+  max_new_tokens: 512
+  ignore_eos: false
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  seed: 20261009
+  vllm:
+    sleep_level: 1  # Use 2 to discard old weights; fully republish before resuming sampling.
+    deployment: disjoint
+    visible_devices: "2,3"
+    data_parallel_size: 2
+    port: 18970
+    model_implementation: native
+    tensor_parallel_size: 1
+    server_hccl_if_base_port: 63400
+    server_hccl_npu_socket_port_range: 63400-63499
+    weight_sync: {strategy: full_gather, bucket_size_mb: 128}
+    dtype: bfloat16
+    trust_remote_code: false
+    enforce_eager: true
+    batch_invariant: false
+    enable_prefix_caching: false
+    enable_chunked_prefill: true
+    enable_auto_tool_choice: true
+    tool_call_parser: hermes
+    gpu_memory_utilization: 0.8
+    kv_cache_memory_bytes: 8589934592  # Bound short-run KV allocation to leave room for repeated publication.
+    max_model_len: 8192
+    block_size: 128
+    max_num_seqs: 4
+    max_num_batched_tokens: 2048
+    logprobs_mode: raw_logprobs
+    startup_timeout: 600
+    request_timeout: 1800
+    reasoning_parser: qwen3
+agentic:
+  runner: codex
+  interaction_mode: multi_turn
+  protocol: json_function_call
+  apply_chat_template: true
+  max_turns: 10
+  max_observation_tokens: 0
+  max_episode_tokens: 8192
+  codex:
+    executable: codex
+    version: 0.152.1
+    model: qwen3_4b
+    model_context_window: 6144
+    max_observation_chars: 8192
+    reasoning_effort: medium
+    enable_thinking: false
+    sandbox: danger-full-access
+    gateway_host: 127.0.0.1
+    gateway_public_host: 127.0.0.1
+    gateway_port: 18980
+    max_inflight_requests: 8
+    timeout_seconds: 5400
+    request_timeout: 1800
+    session_root: /results/sessions
+    program_callable: examples.swe_smith.agent:SWESmithProgram
+    reward_callable: examples.swe_smith.reward:score_submission
+    admin_auth: true
+    task:
+      data_dir: /results/swe_smith
+      images_path: /results/swe_smith/images.json
+      images_sha256: REPLACE_WITH_PREPARED_IMAGE_MANIFEST_SHA256
+      f2p_only: true
+      pytest_workers: 1
+      artifact_max_bytes: 134217728
+      artifact_max_files: 65536
+      run_timeout: 120
+      memory: 4g
+      cpus: 2
+      pids_limit: 1024
+    workspace:
+      memory: 4g
+      cpus: 2
+      pids_limit: 1024
+      max_concurrent: 2
+      output_limit_bytes: 4194304
+    max_request_bytes: 8388608
+    max_response_bytes: 67108864
+    model_instructions: Repair the offline repository in /workspace. Use exec_command with login=false,
+      inspect focused source excerpts and make a minimal fix. Preserve tests, configuration and Git metadata.
+      Run focused existing tests and finish within the configured model-call budget.
+    instruction_template: '{prompt}'
+evaluation:
+  enabled: false
+  batch_size: 1
+  max_samples: 1
+  max_new_tokens: 256
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  do_sample: false
+  log_samples: 2
+  progress_steps: 0
+algorithm:
+  name: grpo
+  advantage_epsilon: 1.0e-06
+  clip_ratio_low: 0.2
+  clip_ratio_high: 0.28
+  clip_ratio_c: 3.0
+  kl_coef: 0.0
+  kl_type: low_var_kl
+  loss_aggregation: token-mean
+train:
+  model_init_cpu_threads: null  # Optional 8 during model build; restore original threads afterward.
+  max_steps: 2
+  seed: 1234
+  prompt_batch_size: 1
+  micro_batch_size: 1
+  response_mini_batch_size: 20
+  policy_update_epochs: 1
+  init_device: meta
+  comm_backend: hccl
+  learning_gate: {enabled: false, min_gradient_norm: 0.0, require_mixed_rewards: false}
+  accelerator: {dp_replicate: 1, dp_shard: 2, tp: 1, cp: 1, pp: 1, reshard_after_forward: true, comm_fusion: false,
+    cpu_offload: true, activation_checkpoint: full}
+  mixed_precision: {enabled: true, param_dtype: bfloat16, reduce_dtype: float32, output_dtype: null}
+  optimizer: {lr: 1.0e-06, lr_min: 0.0, lr_decay_style: constant, lr_warmup_ratio: 0.0, weight_decay: 0.0,
+    max_grad_norm: 1.0, eps: 1.0e-08, betas: [0.9, 0.999], foreach: null}
+  checkpoint:
+    output_dir: /checkpoints/qwen3_4b
+    save_steps: 100
+    save_final: true
+    verify_reload: false
+logging:
+  backends: [console]
+  project_name: hyper-rl
+  experiment_name: qwen3_4b_swe_smith
+  log_steps: 1
+  log_samples: 2
+  wandb: {mode: disabled, entity: null, directory: /results/wandb}
+
+async_training:
+  groups_per_dp_rank: 1
+  max_inflight_groups: 2
+  max_buffer_groups: 4
+  max_group_bytes: 67108864
+  max_buffer_bytes: 268435456
+  publish_every_updates: 1
+  max_policy_lag_updates: 4
+  operation_timeout: 3600
+  max_candidate_retries: 1
+  audit_dir: /results/async-audit

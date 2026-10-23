@@ -28,6 +28,7 @@ __all__ = [
     "build_role_model",
     "build_role_optimizer",
     "iter_hsdp_roots",
+    "load_tokenizer",
     "normalize_model_implementation",
     "resolve_vllm_model",
 ]
@@ -39,6 +40,7 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
 
 import torch
+from transformers import AutoTokenizer
 
 from hyper_parallel import HSDPModule
 from hyper_parallel.components.optim.mixed_precision_optimizer import Float16OptimizerWithFloat16Params
@@ -294,3 +296,18 @@ def resolve_model(model: Mapping[str, Any]) -> ModelRegistration:
     _ = tokenizer_trust_remote_code(model)
     _ = trainer_attention_implementation(model)
     return registration
+
+
+def load_tokenizer(model_config: Mapping[str, Any]) -> Any:
+    """Load an independent tokenizer with the shared padding and terminal-token contract."""
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(model_config["tokenizer_path"]), local_files_only=True,
+        trust_remote_code=tokenizer_trust_remote_code(model_config))
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token_id is None:
+            raise ValueError("Tokenizer must define pad_token_id or eos_token_id")
+        tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.eos_token_id is None:
+        raise ValueError("Tokenizer must define eos_token_id for response truncation")
+    tokenizer.padding_side = "left"
+    return tokenizer

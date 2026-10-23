@@ -264,3 +264,10 @@ Codex 和 DeepSeek 除各自子配置外，还必须满足以下共享约束：
 `hyper_parallel/rl/tests/st/test_feature_st.py` 提供独立两进程 Gloo 梯度验证及真实 agent 训练入口。
 Gloo 验证不需要模型；真实训练须显式配置 CLI/SDK、模型、数据、设备与具有不等调用的任务，
 并保留真实参数更新、策略版本和零损失补齐断言。CPU 用例及资源缺失时的 skip 不能代替真机验收。
+
+## 异步 Codex 多轮任务
+
+异步入口复用现有 Codex 程序，支持 Qwen3 dense 的 Search/SWE-Smith 多轮候选。
+模型调用按实际提交版本记录，允许一个 episode 的不同调用跨版本；同步路径仍检查整个 episode 版本一致。
+权重发布等待活跃模型调用结束，工具执行继续，checkpoint 边界则排空完整任务。
+配置、重试、版本滞后及验证边界见[异步运行合同](architecture.md#codex-multi-turn-publication)。

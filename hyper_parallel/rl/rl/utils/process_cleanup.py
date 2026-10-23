@@ -15,8 +15,10 @@
 """RL service shutdown, process-group teardown and runtime cache cleanup."""
 
 import logging
+import os
 import subprocess
-from typing import TYPE_CHECKING
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Iterator, Mapping
 
 import torch.distributed as dist
 
@@ -33,6 +35,27 @@ if TYPE_CHECKING:
     from rl.utils.monitoring.tracker import TrainingTracker
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def temporary_environment(values: Mapping[str, str | None]) -> Iterator[None]:
+    """Apply child-launch environment values and restore them even if startup fails.
+
+    Note:
+        Process environment mutation requires serialized startup in the caller.
+    """
+    previous = {key: os.environ.get(key) for key in values}
+    try:
+        for key, value in values.items():
+            os.environ.pop(key, None)
+            if value is not None:
+                os.environ[key] = value
+        yield
+    finally:
+        for key, value in previous.items():
+            os.environ.pop(key, None)
+            if value is not None:
+                os.environ[key] = value
 
 
 def cleanup_processes(

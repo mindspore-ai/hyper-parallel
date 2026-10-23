@@ -22,7 +22,7 @@ HyperParallel-RL 是面向 LLM、VLM、世界模型、具身智能和 Agentic AI
 
 用户通过 Python 定义任务、交互、工具与奖励，基础策略优化与多轮 Agent 交互复用同一训练链路。HyperParallel 承载并行训练，vLLM 承载采样，HyperParallel-RL 通过显式编排、统一轨迹与策略发布连接两者。
 
-> **实验版本**：当前验证范围为单节点 Ascend NPU、Qwen3 dense 的同步 GRPO/PPO 配方，以及 Qwen3-30B-A3B 的已验证 GRPO 配方。异步、多模态、世界模型与具身智能的端到端训练尚未提供。具体能力与验证状态见[支持范围](#支持范围)。
+> **实验版本**：当前验证范围为单节点 Ascend NPU、Qwen3 dense 的同步 GRPO/PPO 配方，以及 Qwen3-30B-A3B 的已验证 GRPO 配方。单节点 rayless 异步 GRPO 已有实验实现，Codex 多轮异步仍需真实 NPU 验收；多模态、世界模型与具身智能尚未提供端到端训练。具体能力与验证状态见[支持范围](#支持范围)。
 
 **开始使用**：[安装环境](#安装与环境) → [运行一个训练步](#快速开始)　｜　**开始定制**：[替换奖励函数](#替换奖励函数)
 
@@ -279,7 +279,8 @@ GSM8K 的规则评分与模型评分都在 [agent.py](examples/gsm8k/agent.py)�
 | **权重同步与运行保障** | ✅ | 流式 full-gather / 显式 direct-reshard、IPC/HCCL、策略发布校验、checkpoint 恢复及 console / W&B 指标；见[架构合同](docs/architecture.md) |
 | **Bit-Exact 校验** | ✅ | 可选更新前 logprob 校验，仅限 Qwen3 dense + Hyper-vLLM matched TP1/TP2，见[完整条件](docs/qwen3_training_inference_consistency.md) |
 | **PPO / GAE / Critic** | ✅ | Dense Qwen3 内部 runner 已完成两卡 Actor/Critic 两步更新与发布；外部 harness 分段轨迹、MoE PPO 不支持 |
-| **异步与多节点训练** | ○ | Ray 采样/学习并发、策略滞后与恢复；扩展多节点及长耗时 Agent 异步 |
+| **单节点异步 GRPO** | ◐ | Qwen3 dense 的 internal GSM8K、Codex Search/SWE-Smith 两步 NPU 流程通过，Search 覆盖跨版本 episode；SWE 零奖励未验证学习收益，见[异步合同](docs/architecture.md#codex-multi-turn-publication) |
+| **多节点异步训练** | ○ | 扩展多节点采样、发布和恢复 |
 | **多模态训练与交互** | ○ | 视觉 RL、媒体与动作对齐、多模态 Agent |
 
 配置顶层 `reward_model` 时，Trainer 创建空闲 RM 句柄；生成服务休眠后才启动或唤醒 RM，并调用 `reward_model.scorer` 指定的 `examples` 异步函数。未配置时继续由环境规则函数直接评分。模型分数不自动记为准确率；共卡模式仅支持内部 Qwen3 Dense，详见[迁移与调用合同](docs/reward_model.md)。示例 Qwen3-4B 是用于验证评分链路的生成式模型，并非已训练和校准的偏好奖励模型。
@@ -308,7 +309,7 @@ Qwen3-MoE 的具体配置与同步边界见 [vLLM Rollout](docs/vllm_rollout.md#
 
 ## 🗺️ 规划方向
 
-- **异步与规模化训练**：以 Ray 支撑采样与学习并发，先验证单节点异步，再以完整 DeepSeek-V3 验证多节点训练。
+- **异步与规模化训练**：以 rayless runtime 支撑采样与学习并发，先验证单节点异步，再以完整 DeepSeek-V3 验证多节点训练。
 - **多模态训练**：以 Qwen2.5-VL-7B-Instruct 的图像数学问答打通视觉 RL，再验证多模态 Agent 交互。
 - **Agent 学习与异步执行**：完善已有多轮环境与程序化接入，以工具和状态化代码任务验证学习效果，扩展长耗时任务的异步执行。
 
@@ -407,3 +408,12 @@ python -m pytest -vv -s hyper_parallel/rl/tests/st/test_rl_st.py
   note  = {HyperParallel-RL module in the HyperParallel repository}
 }
 ```
+
+## Rayless asynchronous GRPO
+
+See [runtime architecture](docs/architecture.md#rayless-asynchronous-grpo) for the
+single-node Qwen3 dense scope, launch entry, publication and recovery contracts.
+GSM8K, Search and SWE-Smith recipes live in `examples/async_training/configs/`.
+The core contains five files, with a 1100 physical-line budget checked by
+`python -m pytest hyper_parallel/rl/tests/st/test_async_core_budget.py -q`.
+Shared helpers, examples and tests are counted separately. The synchronous loop remains independent.

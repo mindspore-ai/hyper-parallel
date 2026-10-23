@@ -17,6 +17,7 @@
 # pylint: disable=protected-access
 
 import subprocess
+import os
 import unittest
 from contextlib import ExitStack
 from unittest.mock import MagicMock, call, patch, sentinel
@@ -26,6 +27,26 @@ from rl.trainer import SyncTrainer
 
 from hyper_parallel.core.dtensor import device_mesh
 from hyper_parallel.core.pipeline_parallel import _p2p
+
+
+class TestLaunchEnvironment(unittest.TestCase):
+    """Service startup must not leak mode flags into later synchronous launches."""
+
+    def test_nested_startup_restores_original_and_missing_values(self):
+        with patch.dict(os.environ, {"HYPER_RL_ASYNC_TRAINING": "original"}, clear=True):
+            with runtime.temporary_environment({"HYPER_RL_ASYNC_TRAINING": "1", "ASYNC_AUDIT_PATH": "capture"}):
+                with runtime.temporary_environment({"HYPER_RL_ASYNC_TRAINING": None}):
+                    self.assertNotIn("HYPER_RL_ASYNC_TRAINING", os.environ)
+                self.assertEqual(os.environ["HYPER_RL_ASYNC_TRAINING"], "1")
+                self.assertEqual(os.environ["ASYNC_AUDIT_PATH"], "capture")
+            self.assertEqual(dict(os.environ), {"HYPER_RL_ASYNC_TRAINING": "original"})
+
+    def test_failed_startup_restores_environment_before_next_service(self):
+        with patch.dict(os.environ, {"MODE": "sync"}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "startup failed"):
+                with runtime.temporary_environment({"MODE": "async", "HYPER_RL_ASYNC_TRAINING": "1"}):
+                    raise RuntimeError("startup failed")
+            self.assertEqual(dict(os.environ), {"MODE": "sync"})
 
 
 class TestDistributedTeardown(unittest.TestCase):

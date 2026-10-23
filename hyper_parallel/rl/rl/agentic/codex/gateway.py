@@ -106,7 +106,7 @@ def _completion_outcome(session: _Session, response: dict, transformed: dict, re
 class _State:
     """Own registered gateway sessions and captured completion events."""
     def __init__(self, backend_url: str, model_name: str, request_timeout: float,
-                 max_inflight_requests: int = 1) -> None:
+                 max_inflight_requests: int = 1, async_training: bool = False) -> None:
         """Initialize shared admission limits and trace storage."""
         if (isinstance(max_inflight_requests, bool) or not isinstance(max_inflight_requests, int)
                 or max_inflight_requests <= 0):
@@ -116,6 +116,7 @@ class _State:
                 or parsed_backend.username or parsed_backend.password
                 or parsed_backend.query or parsed_backend.fragment):
             raise ValueError("Backend URL must be an HTTP origin without credentials, query or fragment")
+        self.async_training = async_training
         self.backend_url = backend_url.rstrip("/")
         self.model_name = model_name
         self.request_timeout = request_timeout
@@ -510,6 +511,12 @@ class _Handler(BaseHTTPRequestHandler):
                 response = self._backend_request(transformed)
             finally:
                 state.backend_slots.release()
+            call_version = response.pop("hyper_policy_version",
+                None if state.async_training else session.policy_version)
+            if state.async_training and (
+                    isinstance(call_version, bool) or not isinstance(call_version, int)
+                    or call_version < max(1, session.policy_version)):
+                raise ValueError("Backend call omitted a valid committed policy version")
             outcome = _completion_outcome(session, response, transformed, request_kind)
             route_payload = None
             for index, choice in enumerate(response.get("choices", [])):
@@ -522,7 +529,8 @@ class _Handler(BaseHTTPRequestHandler):
                 and len(session.completions) + 1 < session.max_completions
             )
             record = {"timestamp": time.time(), "original_request": original, "request": transformed,
-                      "response": response, "metadata": {"policy_version": session.policy_version,
+                      "response": response, "metadata": {"policy_version": call_version,
+                                                          **({"async_training": True} if state.async_training else {}),
                                                           "session_id": session_id,
                                                           "protocol_event_id": f"{session_id}:{uuid.uuid4().hex}",
                                                           "feedback_delivered": will_deliver_feedback,
@@ -634,6 +642,8 @@ class _Handler(BaseHTTPRequestHandler):
             timeout = self.server.state.request_timeout
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 body = self._read_backend(response)
+                version_header = (response.headers.get("X-Hyper-Policy-Version")
+                                  if self.server.state.async_training else None)
         except urllib.error.HTTPError as error:
             detail = self._read_backend(error).decode("utf-8", errors="replace")[:4096]
             raise RuntimeError(
@@ -651,6 +661,10 @@ class _Handler(BaseHTTPRequestHandler):
             raise RuntimeError("vLLM chat completion returned invalid JSON") from error
         if not isinstance(decoded, dict):
             raise RuntimeError("vLLM chat completion returned a non-object response")
+        if self.server.state.async_training:
+            if version_header is None or not version_header.isdecimal() or int(version_header) < 1:
+                raise ValueError("Async backend omitted its committed policy version")
+            decoded["hyper_policy_version"] = int(version_header)
         return decoded
 
     def _authorize_admin(self) -> bool:
@@ -790,6 +804,7 @@ class CodexGateway:
         max_request_bytes: int | None = None,
         max_response_bytes: int | None = None,
         router_capture_spec: Mapping[str, Any] | None = None,
+        async_training: bool = False,
     ) -> None:
         """Initialize an unstarted gateway."""
         if not host:
@@ -798,7 +813,7 @@ class CodexGateway:
             raise ValueError("Codex gateway port must be in [0, 65535]")
         self._server = _GatewayServer(
             (host, port),
-            _State(backend_url, model_name, request_timeout, max_inflight_requests),
+            _State(backend_url, model_name, request_timeout, max_inflight_requests, async_training),
             admin_token, max_request_bytes, max_response_bytes, router_capture_spec,
         )
         self._thread: Optional[threading.Thread] = None

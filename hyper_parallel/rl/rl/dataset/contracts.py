@@ -171,6 +171,7 @@ class ExperienceBatch:
     teacher_keys: Optional[tuple[str, ...]] = None
     rollout_log_probs: Optional[Any] = None
     router_traces: Optional[tuple[Optional[RouterTrace], ...]] = None
+    mixed_policy_versions: bool = False
 
     def __post_init__(self) -> None:
         """Validate the shared token dimensions before algorithm code runs."""
@@ -202,11 +203,18 @@ class ExperienceBatch:
         self._validate_teacher_scores(log_prob_shape)
         if bool(self.action_mask[:, 0].any().item()):
             raise ValueError("the first sequence token cannot be a trainable action")
+        self._validate_policy_versions()
+
+    def _validate_policy_versions(self) -> None:
+        """Keep synchronous batches uniform and require explicit mixed-version evidence."""
         if self.trajectories:
             trajectory_versions = {
                 trajectory.worker_policy_version for trajectory in self.trajectories
             }
-            if trajectory_versions != {self.worker_policy_version}:
+            if self.mixed_policy_versions:
+                if self.worker_policy_version is not None or None in trajectory_versions:
+                    raise ValueError("Mixed batches require explicit per-trajectory versions")
+            elif trajectory_versions != {self.worker_policy_version}:
                 raise ValueError(
                     "experience worker policy version must match every trajectory"
                 )

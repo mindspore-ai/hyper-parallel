@@ -89,6 +89,10 @@ def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--checkpoint-dir", type=Path, required=True)
     parser.add_argument("--devices", type=_devices, required=True)
+    parser.add_argument("--rollout-devices", type=_devices,
+                        help="Additional disjoint inference NPUs for an async recipe")
+    parser.add_argument("--controller-network", choices=("host", "none"), default="host",
+                        help="Use none for an offline controller with a local Docker sandbox")
     parser.add_argument("--docker-host", default=None)
     parser.add_argument("--steps", type=int)
     parser.add_argument("--resume", type=Path)
@@ -135,16 +139,10 @@ def _ssh_mounts(command: list[str], ssh_directory: Path) -> set[int]:
     return {socket.stat().st_gid}
 
 
-def _controller_command(args: argparse.Namespace, repository: Path, temporary: Path, name: str,
-                        *, ssh_directory: Path | None) -> list[str]:
-    """Build the trusted controller command with explicit device and bind ownership."""
-    user_id = 0 if args.privileged_controller else os.getuid()
-    command = [*_CONTROLLER_DOCKER, "run", "--detach", "--name", name, "--network", "host", "--shm-size", "32g",
-               "--user", f"{user_id}:{os.getgid()}", "--workdir", str(repository / "hyper_parallel/rl")]
-    if args.privileged_controller:
-        command.append("--privileged")
+def _controller_devices(command: list[str], args: argparse.Namespace) -> set[int]:
+    """Validate and map Ascend device nodes while collecting their access groups."""
     groups = set(os.getgroups())
-    for physical in args.devices:
+    for physical in (*args.devices, *(getattr(args, "rollout_devices", None) or ())):
         source = Path(f"/dev/davinci{physical}")
         if not source.exists():
             raise ValueError(f"NPU device does not exist: {source}")
@@ -155,6 +153,21 @@ def _controller_command(args: argparse.Namespace, repository: Path, temporary: P
             raise ValueError(f"Required Ascend device does not exist: {source}")
         command.extend(["--device", str(source)])
         groups.add(source.stat().st_gid)
+    return groups
+
+
+def _controller_command(args: argparse.Namespace, repository: Path, temporary: Path, name: str,
+                        *, ssh_directory: Path | None) -> list[str]:
+    """Build the trusted controller command with explicit device and bind ownership."""
+    user_id = 0 if args.privileged_controller else os.getuid()
+    network = getattr(args, "controller_network", "host")
+    command = [*_CONTROLLER_DOCKER, "run", "--detach", "--name", name, "--network", network, "--shm-size", "32g",
+               "--user", f"{user_id}:{os.getgid()}", "--workdir", str(repository / "hyper_parallel/rl")]
+    if network == "none":
+        command.extend(["--hostname", name, "--add-host", f"{name}:127.0.0.1"])
+    if args.privileged_controller:
+        command.append("--privileged")
+    groups = _controller_devices(command, args)
     for source in (Path("/usr/local/Ascend/driver/lib64"), Path("/usr/local/Ascend/driver/version.info"),
                    Path("/usr/local/dcmi"), Path("/etc/ascend_install.info"), Path("/etc/passwd"), Path("/etc/group")):
         if not source.exists():
@@ -196,7 +209,8 @@ def _script(args: argparse.Namespace, repository: Path, temporary: Path, *,
     resolved_config = args.output_dir / "resolved_config.yaml"
     command = ["torchrun", "--standalone", f"--nproc_per_node={len(args.devices)}"]
     if args.mode == "train":
-        command.extend([str(source_root / "train_rl.py"), str(resolved_config)])
+        entry = "examples/async_training/launch.py" if getattr(args, "fully_async", False) else "train_rl.py"
+        command.extend([str(source_root / entry), str(resolved_config)])
     else:
         command.extend(["-m", "examples.swe_smith.infer", str(resolved_config),
                         "--dataset", str(args.data_dir / "train.parquet"),
@@ -370,6 +384,26 @@ def _run_controller(command: list[str], name: str, output_dir: Path, timeout: fl
             _write_manifest(manifest_path, manifest)
 
 
+def _configure_async_devices(args: argparse.Namespace, config: dict) -> None:
+    """Validate disjoint ownership before changing inference visibility or audit paths."""
+    inference_devices = getattr(args, "rollout_devices", None) or ()
+    asynchronous = "async_training" in config
+    args.fully_async = asynchronous
+    if asynchronous != bool(inference_devices) or (asynchronous and args.mode != "train"):
+        raise ValueError("Async training requires --rollout-devices; synchronous/inference runs must omit it")
+    if set(args.devices) & set(inference_devices):
+        raise ValueError("Trainer and inference devices must be disjoint")
+    if asynchronous:
+        engine = config["rollout"]["vllm"]
+        expected_inference = int(engine.get("data_parallel_size", 1)) * int(engine.get("tensor_parallel_size", 1))
+        if len(inference_devices) != expected_inference:
+            raise ValueError(f"Recipe requires {expected_inference} inference devices")
+        selected = inference_devices if args.privileged_controller else tuple(
+            range(len(args.devices), len(args.devices) + len(inference_devices)))
+        engine["visible_devices"] = ",".join(map(str, selected))
+        config["async_training"]["audit_dir"] = str(args.output_dir / "async-audit")
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     """Resolve a recipe, record its launch inputs and run one owned controller."""
     logging.basicConfig(level=logging.INFO)
@@ -390,7 +424,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     config = build_config(template, data_dir=args.data_dir, images_path=args.images_path, model_dir=args.model_dir,
                           output_dir=args.output_dir, checkpoint_dir=args.checkpoint_dir,
                           docker_host=args.docker_host, steps=args.steps, resume=args.resume)
+    _configure_async_devices(args, config)
     args.docker_host = config["agentic"]["codex"]["workspace"]["docker_host"]
+    if getattr(args, "controller_network", "host") == "none" and args.docker_host.startswith("ssh://"):
+        raise ValueError("An offline controller requires a local Docker sandbox, not an SSH endpoint")
     ssh_directory = (Path(pwd.getpwuid(os.getuid()).pw_dir) / ".ssh"
                      if args.docker_host.startswith("ssh://") else None)
     if args.mode == "train":

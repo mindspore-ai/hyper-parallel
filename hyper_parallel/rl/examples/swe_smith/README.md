@@ -131,3 +131,10 @@ swe_common+=(--docker-host ssh://USER@HOST:PORT)
 真实零奖励、零梯度仅证明流程运行；学习验收仍需真实混合奖励和非零更新。
 参考预算推理使用 [qwen3_5_9b_infer.yaml](configs/qwen3_5_9b_infer.yaml)，通过 `launch --mode infer --config` 选择。
 评分合同、图配置、资源参数、27B 及全量验证限制见[开发说明](../../docs/swe_smith.md)。
+
+## Asynchronous training
+
+Pass `--config hyper_parallel/rl/examples/async_training/configs/qwen3_4b_swe_smith.yaml`
+to the existing launcher, with disjoint `--devices 0,1 --rollout-devices 2,3`.
+Qwen3.5/3.8 colocated recipes remain synchronous; see the
+[publication and recovery contract](../../docs/architecture.md#rayless-asynchronous-grpo).

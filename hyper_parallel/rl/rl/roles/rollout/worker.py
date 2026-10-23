@@ -145,6 +145,7 @@ class _ProgramRolloutManager:
         seed: Optional[int] = None,
         ignore_eos: bool = False,
         collect_router_trace: bool = False,
+        sample_index_offset: int = 0,
     ) -> None:
         """Build a contract-only program runner around an external harness."""
         settings = _generation_settings(
@@ -174,6 +175,7 @@ class _ProgramRolloutManager:
             num_samples=num_return_sequences,
             settings=settings,
             engine=runtime.engine,
+            sample_index_offset=sample_index_offset,
         )
 
     def generate(
@@ -183,6 +185,8 @@ class _ProgramRolloutManager:
     ) -> ExperienceBatch:
         """Run external programs against one stable served policy version."""
         self.runtime.ensure_started()
+        if getattr(self.runtime.engine, "asynchronous", False) is True:
+            return self.agent_runner.rollout(prompt_records, policy_version)
         version_before = self.runtime.engine.generation_policy_version()
         if version_before != policy_version:
             raise RuntimeError(

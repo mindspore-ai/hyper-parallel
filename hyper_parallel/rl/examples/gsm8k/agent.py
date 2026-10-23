@@ -230,6 +230,8 @@ class GSM8KSingleTurnEnvironment(_GSM8KRewardScorer):
             info={
                 "reward_components": {} if deferred else {"correctness": reward},
                 "extracted_answer": extract_answer(action.content),
+                "expected_answer": normalize_answer(str(self.prompt.ground_truth)),
+                "reward_scorer": None if deferred else f"{__name__}.compute_gsm8k_reward",
             },
         )
 

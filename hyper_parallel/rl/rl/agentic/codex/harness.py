@@ -231,6 +231,8 @@ class CodexRuntime(HarnessRuntime):
         gateway_options = {
             "max_inflight_requests": int(config.get("max_inflight_requests", 1)),
         }
+        if getattr(engine, "asynchronous", False) is True:
+            gateway_options["async_training"] = True
         capture_spec = getattr(engine, "router_capture_spec", None)
         if capture_spec is not None:
             gateway_options["router_capture_spec"] = asdict(capture_spec)

@@ -319,6 +319,21 @@ def _call_status(trace: Mapping[str, Any], episode_status: Optional[tuple[bool, 
     return truncated, "max_tokens" if truncated else "completed"
 
 
+def _harness_call_versions(records, policy_version):
+    """Validate complete asynchronous evidence before building any call rows."""
+    asynchronous = any(record.get("metadata", {}).get("async_training") is True for record in records)
+    if asynchronous and not all(record.get("metadata", {}).get("async_training") is True for record in records):
+        raise ValueError("An async episode requires version evidence for every model call")
+    versions = []
+    for record in records:
+        call_version = record["metadata"]["policy_version"] if asynchronous else policy_version
+        if asynchronous and (isinstance(call_version, bool) or not isinstance(call_version, int)
+                             or call_version < max(1, policy_version)):
+            raise ValueError("Invalid asynchronous model-call policy version")
+        versions.append(call_version)
+    return versions
+
+
 def build_harness_call_trajectories(
     *,
     label: str,
@@ -351,7 +366,9 @@ def build_harness_call_trajectories(
     count = len(traces)
     episode_status = status_resolver(traces, episode_metadata) if status_resolver else None
     results = []
+    versions = _harness_call_versions(ordered, policy_version)
     for index, (record, trace) in enumerate(zip(ordered, traces)):
+        call_version = versions[index]
         prompt_ids = list(trace["prompt_ids"])
         response_ids = list(trace["response_ids"])
         token_ids = prompt_ids + response_ids
@@ -371,6 +388,12 @@ def build_harness_call_trajectories(
                 key: value for key, value in record.items() if key not in ("routed_experts", "router_capture_spec")
             })),
         })
+        if record.get("metadata", {}).get("async_training") is True:
+            row_metadata.update({
+                "async_training": True,
+                "behavior_segments": ({"start": 0, "end": len(response_ids),
+                                       "policy_version": call_version, "source_update": call_version - 1},),
+            })
         message = record["response"]["choices"][0].get("message", {})
         action_text = message.get("content") if isinstance(message, Mapping) else None
         turns = _trajectory_turns(len(prompt_ids), action_mask, 1, label, runner_name)
@@ -381,7 +404,7 @@ def build_harness_call_trajectories(
             trajectory_id=f"{episode_id}:call:{index}",
             prompt_id=prompt.prompt_id,
             group_id=prompt.prompt_id,
-            policy_version=policy_version,
+            policy_version=call_version,
             turns=turns,
             token_ids=prototype.new_tensor(token_ids),
             attention_mask=prototype.new_ones((len(token_ids),)),
@@ -396,7 +419,7 @@ def build_harness_call_trajectories(
             truncated=truncated,
             terminal_reason=terminal_reason,
             metadata=row_metadata,
-            worker_policy_version=policy_version,
+            worker_policy_version=call_version,
             router_trace=router_trace_from_capture(record, len(token_ids)),
         ))
     return tuple(results)
@@ -510,7 +533,9 @@ class HarnessRuntime:
         backend_url = self.engine.inference_base_url
         model_name = self.engine.inference_model_name
         local_error = None
-        if dist.get_rank() == 0 and self._gateway is None:
+        asynchronous = getattr(self.engine, "asynchronous", False) is True
+        owner = asynchronous or dist.get_rank() == 0
+        if owner and self._gateway is None:
             try:
                 self._gateway = self._gateway_factory(
                     host=str(self.config.get("gateway_host", "127.0.0.1")),
@@ -524,6 +549,9 @@ class HarnessRuntime:
             except Exception as error:  # pylint: disable=W0718
                 local_error = error
         self.engine.synchronize_error(local_error, f"{self._label} gateway startup")
+        if asynchronous:
+            self.admin_token = self._gateway.admin_token
+            return
         if "admin_token" in self._gateway_options:
             credential = [self._gateway.admin_token if dist.get_rank() == 0 else None]
             dist.broadcast_object_list(credential, src=0)
@@ -576,7 +604,9 @@ class HarnessProgramFactory:
         self, prompt: PromptRecord, policy_version: int, sample_index: int
     ) -> AgentProgram:
         """Construct one program after verifying the served policy identity."""
-        served_version = self.runtime.episode_version
+        engine = getattr(self.runtime, "engine", None)
+        served_version = (policy_version if getattr(engine, "asynchronous", False) is True
+                          else self.runtime.episode_version)
         if served_version != policy_version:
             raise RuntimeError(
                 f"{self.label} requested policy version does not match the served policy: "
@@ -620,10 +650,12 @@ class ProgramAgentRunner:
         num_samples: int,
         settings: GenerationSettings,
         engine: Optional[Any] = None,
+        sample_index_offset: int = 0,
     ) -> None:
         """Initialize the runner with a program factory and sampling policy."""
         if num_samples <= 0:
             raise ValueError("num_samples must be positive")
+        self.sample_index_offset = sample_index_offset
         self.program_factory = program_factory
         self.num_samples = num_samples
         self.settings = settings
@@ -636,14 +668,28 @@ class ProgramAgentRunner:
     ) -> tuple[Trajectory, ...]:
         """Run every sampled user program concurrently on one event loop."""
         programs = [
-            self.program_factory(prompt, policy_version, sample_index)
+            self.program_factory(prompt, policy_version, self.sample_index_offset + sample_index)
             for prompt in prompt_records
             for sample_index in range(self.num_samples)
         ]
-        results = await asyncio.gather(*(program.run() for program in programs), return_exceptions=True)
+        tasks = [asyncio.create_task(program.run()) for program in programs]
+        cancellation = None
+        if getattr(self.engine, "asynchronous", False) is True:
+            cancellation = asyncio.create_task(self._watch_shutdown(tasks))
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            if cancellation is not None:
+                cancellation.cancel()
+                await asyncio.gather(cancellation, return_exceptions=True)
         errors = [result for result in results if isinstance(result, BaseException)]
         if errors:
             details = [f"{type(error).__name__}: {error}" for error in errors]
+            if getattr(self.engine, "asynchronous", False) is True:
+                contracts = [error for error in errors if isinstance(error, (ValueError, TypeError))]
+                if contracts:
+                    message = f"Agent program contract failed after draining all samples: {details}"
+                    raise ValueError(message) from contracts[0]
             raise RuntimeError(f"Agent program group failed after draining all samples: {details}")
         expected_prompts = [prompt.prompt_id for prompt in prompt_records for _ in range(self.num_samples)]
         trajectories = self._program_rows(results, expected_prompts)
@@ -651,6 +697,13 @@ class ProgramAgentRunner:
         episode_rows(trajectories)
         validate_trainability(trajectories)
         return tuple(trajectories)
+
+    async def _watch_shutdown(self, tasks: list[asyncio.Task]) -> None:
+        """Cancel external programs so their workspace/process finally blocks can run."""
+        while getattr(self.engine, "closed", False) is not True:
+            await asyncio.sleep(.05)
+        for task in tasks:
+            task.cancel()
 
     @staticmethod
     def _program_rows(results, expected_prompts: Sequence[str]) -> tuple[Trajectory, ...]:
@@ -705,6 +758,7 @@ class ProgramAgentRunner:
                 generation_seconds=time.perf_counter() - started,
                 settings=self.settings,
                 metadata={"runner": "program"},
+                mixed_policy_versions=getattr(self.engine, "asynchronous", False) is True,
             )
         except Exception as error:  # pylint: disable=broad-exception-caught
             local_error = error
@@ -735,7 +789,11 @@ class ProgramAgentRunner:
                 raise ValueError("Agent program trajectory reward must be finite")
             if trajectory.prompt_id not in allowed_prompt_ids:
                 raise ValueError("AgentProgram returned a trajectory for an unknown prompt")
-            if trajectory.policy_version != policy_version:
+            asynchronous = getattr(self.engine, "asynchronous", False) is True
+            if asynchronous:
+                if trajectory.metadata.get("async_training") is not True or trajectory.policy_version < policy_version:
+                    raise ValueError("Async programs require captured per-call policy identities")
+            elif trajectory.policy_version != policy_version:
                 raise ValueError(
                     "AgentProgram trajectory policy_version does not match the requested snapshot"
                 )

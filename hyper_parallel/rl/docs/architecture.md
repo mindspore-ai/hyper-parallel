@@ -316,3 +316,42 @@ CP/PP、更多 TP/EP 组合及动态专家重分配按实际任务需求推进�
 
 需要定位具体实现时，参阅 [模块导航](../../../docs/rl-navigation.md)、[PPO 配方](../examples/gsm8k/configs/qwen3_4b_gsm8k_ppo.yaml)
 和 [测试入口](../README.md#系统测试)。架构文档不重复维护函数级路径。
+
+## Rayless asynchronous GRPO
+
+`examples/async_training/launch.py` composes the existing roles with an independent asynchronous loop. `SyncTrainer`
+retains its synchronous loop and strict version defaults. The supported scope is single-node Qwen3 dense GRPO with
+disjoint vLLM devices, using internal single-turn tasks or Codex Search/Code/SWE-Smith programs. PPO, MoE, Qwen3.5,
+internal multi-turn, model rewards, distillation and synchronous consistency gates are rejected. Codex inline evaluation
+must be disabled.
+
+```bash
+bash hyper_parallel/rl/examples/async_training/scripts/run_async_training.sh \
+  hyper_parallel/rl/examples/async_training/configs/qwen3_4b_gsm8k_grpo.yaml \
+  --model.weights_path=/models/Qwen3-4B --model.tokenizer_path=/models/Qwen3-4B \
+  --data.train_path=/data/gsm8k/train.parquet --data.test_path=/data/gsm8k/test.parquet
+```
+
+Select nonoverlapping training/inference devices and matching parallel sizes. Search accepts `--fully-async` and
+four/eight `--devices`; SWE-Smith uses its async recipe and separate `--devices` / `--rollout-devices`. Task logic
+remains in examples.
+
+Rank zero reserves capacity for complete groups; a spawned CPU producer never joins training collectives. Batches retain
+original behavior probabilities, call versions and continuation segments. Staleness uses the oldest action; consumption
+commits after all ranks update. Infrastructure failures retry then discard a whole group; malformed trajectory contracts
+fail the run.
+
+Publication closes request admission. Internal requests preserve aborted output and resume its exact prefix; Codex calls
+drain before weights change, then subsequent calls observe the new committed version. Tool execution need not finish for
+publication. Buffer limits bound serialized payloads, not total process RSS.
+
+Checkpointing drains tasks, saves model/optimizer/RNG, then atomically commits `async_complete.json` with source cursor,
+ready groups, credits and configuration identity. The latest complete checkpoint is selected automatically unless an
+explicit load path is provided. Corrupt/incompatible committed state fails; restored Actor weights are republished
+before sampling. External side effects are not exactly-once.
+
+Optional `async_training.audit_dir` records events and backward tensors; audit IO affects timing. Consumed-response
+diagnostics live under `rollouts/` beside the audit or checkpoint output.
+
+UT covers protocol, publication, recovery and sync isolation. `tests/st/test_async_training.py` checks two/four-rank
+CPU/Gloo updates and recovery, independently of NPU/task-quality acceptance.

@@ -49,7 +49,18 @@ def _validate_episode(trajectories: Sequence[Any], indices: list[int], identity:
         row.metadata["call_index"] for row in rows
     ) != list(range(len(rows))):
         raise ValueError(f"Incomplete or duplicated calls in episode {identity}")
-    for field in ("prompt_id", "group_id", "policy_version", "worker_policy_version", "reward", "reward_components"):
+    asynchronous = all(row.metadata.get("async_training") is True for row in rows)
+    fields = ("prompt_id", "group_id", "reward", "reward_components")
+    if not asynchronous:
+        fields += ("policy_version", "worker_policy_version")
+    else:
+        ordered = sorted(rows, key=lambda row: row.metadata["call_index"])
+        versions = [row.policy_version for row in ordered]
+        if (any(isinstance(version, bool) or not isinstance(version, int) or version < 1 for version in versions)
+                or versions != sorted(versions)
+                or any(row.worker_policy_version != row.policy_version for row in rows)):
+            raise ValueError(f"Invalid asynchronous call versions in episode {identity}")
+    for field in fields:
         if any(getattr(row, field) != getattr(first, field) for row in rows[1:]):
             raise ValueError(f"Inconsistent {field} in episode {identity}")
     indices.sort(key=lambda index: trajectories[index].metadata["call_index"])

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import importlib
+import functools
 import random
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, Mapping, Optional, Sequence
@@ -229,6 +230,21 @@ def validate_chat_template_kwargs(value: Optional[Mapping[str, Any]]) -> dict[st
 
 class PromptDataset:
     """Read tokenized prompt records from supported text parquet layouts."""
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any], tokenizer: Any, *, split: str = "train") -> "PromptDataset":
+        """Build a train/test source with one shared interpretation of task options."""
+        if split not in ("train", "test"):
+            raise ValueError(f"Unknown prompt dataset split: {split}")
+        limit = config.get("max_train_samples") if split == "train" else None
+        return cls(
+            parquet_path=str(config[f"{split}_path"]), tokenizer=tokenizer,
+            max_prompt_length=int(config["max_prompt_length"]),
+            max_samples=None if limit is None else int(limit),
+            row_adapter=config.get("row_adapter"), metadata_columns=config.get("metadata_columns"),
+            chat_template_kwargs=config.get("chat_template_kwargs"),
+            **{key: None if config.get(key) is None else str(config[key])
+               for key in ("prompt_column", "answer_column", "prompt_instruction")})
 
     def __init__(
         self,
@@ -499,3 +515,37 @@ def build_train_dataloader(
     if num_workers > 0 and prefetch_factor is not None:
         loader_kwargs["prefetch_factor"] = prefetch_factor
     return StatefulDataLoader(dataset, **loader_kwargs), sampler
+
+
+class StatefulPromptSource:
+    """Read a recoverable single-owner prompt stream without allocating training task identities."""
+
+    def __init__(self, config: Mapping[str, Any], tokenizer: Any, seed: int,
+                 state: dict | None = None) -> None:
+        dataset = PromptDataset.from_config(config, tokenizer)
+        self.loader, self.sampler = build_train_dataloader(
+            dataset, functools.partial(collate_prompt_samples, pad_token_id=tokenizer.pad_token_id),
+            batch_size=1, rank=0, world_size=1, seed=seed, shuffle=config.get("shuffle", True),
+            num_workers=0, pin_memory=False)
+        if len(self.loader) == 0:
+            raise ValueError("Async prompt dataset is empty")
+        self.epoch = 0 if state is None else state["epoch"]
+        self.sampler.set_epoch(self.epoch)
+        if state is not None:
+            self.loader.load_state_dict(state["loader"])
+        self.iterator = iter(self.loader)
+
+    def next_record(self) -> PromptRecord:
+        """Advance once, preserving deterministic epoch rollover and original prompt identity."""
+        try:
+            batch = next(self.iterator)
+        except StopIteration:
+            self.epoch += 1
+            self.sampler.set_epoch(self.epoch)
+            self.iterator = iter(self.loader)
+            batch = next(self.iterator)
+        return build_prompt_records(batch, batch["input_ids"], batch["attention_mask"])[0]
+
+    def state_dict(self) -> dict[str, Any]:
+        """Export the original loader/epoch schema; the caller owns checkpoint quiescence."""
+        return {"epoch": self.epoch, "loader": self.loader.state_dict()}

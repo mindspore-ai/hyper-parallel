@@ -44,32 +44,43 @@ else:
 TRAINER_HCCL_ENV = {"HCCL_IF_BASE_PORT": "62800", "HCCL_NPU_SOCKET_PORT_RANGE": "62800-62900"}
 
 
-def training_command(steps: int, resume: bool = False, overrides: list[str] | None = None) -> list[str]:
+def training_command(steps: int, resume: bool = False, overrides: list[str] | None = None,
+                     fully_async: bool = False, rollout_devices: str = "2,3") -> list[str]:
     """Use the real trainer and search task program, not the frozen comparison worker."""
+    processes = len(rollout_devices.split(",")) if fully_async else 2
     command = [
         "python", "-m", "torch.distributed.run", "--nnodes=1", "--node_rank=0",
-        "--master_addr=127.0.0.1", "--master_port=29500", "--nproc_per_node=2", "train_rl.py",
+        "--master_addr=127.0.0.1", "--master_port=29500", f"--nproc_per_node={processes}", "train_rl.py",
         "examples/search_r1/configs/qwen3_4b_search_r1.yaml",
         f"--train.max_steps={steps}", "--data.train_path=/data/train.parquet",
         "--data.test_path=/data/test.parquet", "--agentic.codex.session_root=/results/jobs",
     ]
+    if fully_async:
+        command[command.index("train_rl.py")] = "examples/async_training/launch.py"
+        command[command.index("examples/search_r1/configs/qwen3_4b_search_r1.yaml")] = (
+            "examples/async_training/configs/qwen3_4b_search_r1.yaml")
+        command.append(f"--rollout.vllm.visible_devices={rollout_devices}")
+        command.extend((f"--train.accelerator.dp_shard={processes}",
+                        f"--rollout.vllm.data_parallel_size={processes}"))
     if resume:
         command.append("--train.checkpoint.load_path=/resume")
     command.extend(overrides or [])
     return command
 
 
-def verify_training(log: str, steps: int, strict: bool = False) -> None:
+def verify_training(log: str, steps: int, strict: bool = False, fully_async: bool = False) -> None:
     """Require a final synchronized policy version and a real nonzero-gradient update."""
     final = [line for line in log.splitlines() if re.search(rf"\bstep={steps} \|", line)]
-    if not final or not any(f"policy/version={steps}" in line and f"train/global_step={steps}" in line
-                            for line in final):
+    if not final or not any(f"train/global_step={steps}" in line and
+                            (fully_async or f"policy/version={steps}" in line) for line in final):
         raise RuntimeError("Training did not reach the requested synchronized policy version")
     gradients = re.findall(r"train/gradient_norm=([0-9.eE+-]+)", log)
     updates = re.findall(r"train/optimizer_steps=([0-9]+)", log)
     if not any(float(value) > 0 for value in gradients) or not any(int(value) > 0 for value in updates):
         raise RuntimeError("Training finished without evidence of a nonzero-gradient optimizer update")
-    if strict:
+    if fully_async and not any("async/optimizer_steps=" in line for line in final):
+        raise RuntimeError("Missing asynchronous optimizer evidence")
+    if strict and not fully_async:
         _verify_strict_training(log, final)
 
 
@@ -181,7 +192,8 @@ def _interrupt_host(signum, frame) -> None:
 def _parse_training_args():
     """Parse and validate required devices, inputs, and resume checkpoint."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--devices", required=True, help="Two explicitly reserved NPUs, e.g. 2,3")
+    parser.add_argument("--devices", required=True, help="Explicitly reserved Ascend device IDs")
+    parser.add_argument("--fully-async", action="store_true", help="Split four/eight NPUs for training and inference")
     parser.add_argument("--steps", type=int, default=2)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--image", default=IMAGE)
@@ -195,8 +207,10 @@ def _parse_training_args():
             parser.error(f"Invalid training override {override!r}; expected --section.field=value")
     args.overrides = overrides
     devices = args.devices.split(",")
-    if len(devices) != 2 or len(set(devices)) != 2 or any(value not in map(str, range(8)) for value in devices):
-        raise ValueError("Exactly two distinct Ascend device IDs are required")
+    expected = (4, 8) if args.fully_async else (2,)
+    if len(devices) not in expected or len(set(devices)) != len(devices) or any(
+            value not in map(str, range(8)) for value in devices):
+        raise ValueError(f"Expected {expected} distinct Ascend device IDs")
     if args.steps < 1:
         raise ValueError("Steps must be positive")
     if args.resume and not (args.resume / "checkpoint_complete.json").is_file():
@@ -211,6 +225,7 @@ def _parse_training_args():
 def _start_trainer(args, output: Path, devices: list[str]) -> tuple[str, str]:
     """Build and start the isolated trainer container."""
     repo = Path(__file__).resolve().parents[4]
+    split = len(devices) // 2 if args.fully_async else 2
     prefix = "search-r1-train-" + uuid.uuid4().hex[:10]
     worker = prefix + "-worker"
     launch = ["run", "-d", "--name", worker, "--hostname", worker, "--add-host", f"{worker}:127.0.0.1",
@@ -231,7 +246,7 @@ def _start_trainer(args, output: Path, devices: list[str]) -> tuple[str, str]:
         launch.extend(("-v", f"{source}:{target}:{mode}"))
     environment = {
         **TRAINER_HCCL_ENV,
-        "ASCEND_RT_VISIBLE_DEVICES": args.devices, "HYPER_PARALLEL_PLATFORM": "torch",
+        "ASCEND_RT_VISIBLE_DEVICES": ",".join(devices[:split]), "HYPER_PARALLEL_PLATFORM": "torch",
         "VLLM_WORKER_MULTIPROC_METHOD": "spawn", "VLLM_HOST_IP": "127.0.0.1", "GLOO_SOCKET_IFNAME": "lo",
         "HYPER_SEARCH_CONTAINER_BROKER": "1", "PHASE_UID": str(os.getuid()), "PHASE_GID": str(os.getgid()),
     }
@@ -243,7 +258,8 @@ def _start_trainer(args, output: Path, devices: list[str]) -> tuple[str, str]:
         "git config --global --add safe.directory /repo; "
         "python -m pip install --no-deps --no-build-isolation -e /repo; "
         "bash examples/search_r1/scripts/install_runtime.sh; "
-        + shlex.join(training_command(args.steps, resume=args.resume is not None, overrides=args.overrides))
+        + shlex.join(training_command(args.steps, resume=args.resume is not None, overrides=args.overrides,
+                                      fully_async=args.fully_async, rollout_devices=",".join(devices[split:])))
         + " 2>&1 | tee /results/train.log"
     )
     launch.extend(("-w", "/repo/hyper_parallel/rl", "--entrypoint", "/bin/bash", args.image, "-c", command))
@@ -284,10 +300,12 @@ def main() -> None:
             if time.monotonic() > deadline:
                 raise TimeoutError("Search-R1 training exceeded its overall deadline")
             time.sleep(1)
-        verify_training((output / "train.log").read_text(), args.steps, strict=True)
+        verify_training((output / "train.log").read_text(), args.steps, strict=True, fully_async=args.fully_async)
         checkpoint = output / "checkpoints" / f"step_{args.steps}" / "checkpoint_complete.json"
         if not checkpoint.is_file() or json.loads(checkpoint.read_text()).get("step") != args.steps:
             raise RuntimeError("Final checkpoint completion marker is missing or stale")
+        if args.fully_async and not (checkpoint.parent / "async_complete.json").is_file():
+            raise RuntimeError("Final asynchronous checkpoint completion marker is missing")
         audit = verify_artifacts(output)
         (output / "training-acceptance.json").write_text(json.dumps({
             "steps": args.steps, "optimizer_gate": "passed", **audit,

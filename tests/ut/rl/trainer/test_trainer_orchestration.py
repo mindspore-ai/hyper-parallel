@@ -30,9 +30,11 @@ import torch
 
 import rl.utils.process_cleanup as cleanup_module
 import rl.trainer as trainer_module
+import rl.roles.model_setup as model_setup_module
 import rl.utils.monitoring.metrics as metrics_module
 from rl.algorithm import build_algorithm
 from rl.dataset.contracts import ExperienceBatch
+from rl.dataset.data_source import PromptDataset
 from rl.distillation.config import DistillationConfig
 from rl.roles import Actor
 from rl.trainer import SyncTrainer
@@ -230,12 +232,14 @@ def test_trainer_step_orchestrates_required_role_outputs_in_order(
 
         @staticmethod
         def compute_log_probs(unused_experience: ExperienceBatch) -> torch.Tensor:
+            """Return scripted policy probabilities."""
             del unused_experience
             calls.append("actor-logprobs")
             return actor_log_probs
 
         @staticmethod
         def update(experience: ExperienceBatch) -> Any:
+            """Record one policy or value update."""
             assert experience is not None
             calls.append("actor-update")
             return SimpleNamespace(optimizer_steps=1)
@@ -243,6 +247,7 @@ def test_trainer_step_orchestrates_required_role_outputs_in_order(
     class ReferenceRole:
         @staticmethod
         def compute_log_probs(unused_experience: ExperienceBatch) -> torch.Tensor:
+            """Return scripted policy probabilities."""
             del unused_experience
             calls.append("reference")
             return reference_log_probs
@@ -251,12 +256,14 @@ def test_trainer_step_orchestrates_required_role_outputs_in_order(
         """Record bootstrapped value inference and the separate Critic update."""
         @staticmethod
         def compute_values(unused_experience: ExperienceBatch, *, include_last: bool = False) -> torch.Tensor:
+            """Return scripted value estimates."""
             del unused_experience
             calls.append("critic-values")
             return torch.cat((values, values[:, -1:]), dim=1) if include_last else values
 
         @staticmethod
         def update(unused_experience: ExperienceBatch) -> Any:
+            """Record one policy or value update."""
             del unused_experience
             calls.append("critic-update")
             return SimpleNamespace()
@@ -279,6 +286,7 @@ def test_trainer_step_orchestrates_required_role_outputs_in_order(
             return experience
 
     def complete_step(self: SyncTrainer, **kwargs: Any) -> None:
+        """Record checkpoint completion in the fixture."""
         assert kwargs["step"] == 1
         assert kwargs["critic_update"] is not None
         assert kwargs["diagnostic_metrics"] == {
@@ -377,6 +385,7 @@ def test_trainer_completes_metrics_and_evaluation_after_published_step(
     actor_update = ActorUpdateMetrics(0.1, 0.1, 0.0, 0.0, 0.0, 0.0, 1.0, 0.01, 2, 1)
 
     def summarize(*_args: Any, **_kwargs: Any) -> tuple[dict[str, float], list[Any]]:
+        """Return scripted rollout metrics."""
         assert trainer.state.global_step == 1
         calls.append("summarize")
         return {"reward/mean": 1.0}, []
@@ -453,18 +462,22 @@ def test_trainer_runs_one_complete_synchronous_training_step(
 
         @staticmethod
         def prepare_for_training() -> None:
+            """Record the switch to training residency."""
             calls.append("prepare-training")
 
         @staticmethod
         def update_weights(snapshot: Any) -> None:
+            """Record a policy publication."""
             calls.append(f"publish:{snapshot.version}")
 
         @staticmethod
         def prepare_for_rollout() -> None:
+            """Record the switch to generation residency."""
             calls.append("prepare-rollout")
 
         @staticmethod
         def close() -> None:
+            """Release the fixture-owned service."""
             calls.append("engine-close")
 
     class ActorRole:
@@ -473,11 +486,13 @@ def test_trainer_runs_one_complete_synchronous_training_step(
 
         @staticmethod
         def compute_log_probs(experience: ExperienceBatch) -> torch.Tensor:
+            """Return scripted policy probabilities."""
             calls.append("actor-logprobs")
             return experience.old_log_probs.clone()
 
         @staticmethod
         def update(experience: ExperienceBatch) -> ActorUpdateMetrics:
+            """Record one policy or value update."""
             assert experience is rollout
             calls.append("actor-update")
             return ActorUpdateMetrics(0.1, 0.1, 0.0, 0.0, 0.0, 0.0, 1.0, 0.01, 1, 1)
@@ -485,25 +500,30 @@ def test_trainer_runs_one_complete_synchronous_training_step(
     class ReferenceRole:
         @staticmethod
         def compute_log_probs(experience: ExperienceBatch) -> torch.Tensor:
+            """Return scripted policy probabilities."""
             calls.append("reference")
             return torch.zeros_like(experience.old_log_probs)
 
     class Preparer:
         @staticmethod
         def prepare(experience: ExperienceBatch, **kwargs: Any) -> ExperienceBatch:
+            """Prepare the fixture state for the operation."""
             assert kwargs["reference_log_probs"] is not None
             calls.append("targets")
             return experience
 
     checkpoints = _recording_checkpoints(calls)
     class Tracker:
+        """Tracker."""
         @staticmethod
         def log(unused_metrics: Any, *, step: int, **_kwargs: Any) -> None:
+            """Record the metrics emitted by the trainer."""
             del unused_metrics
             calls.append(f"log:{step}")
 
         @staticmethod
         def finish() -> None:
+            """Record tracking shutdown."""
             calls.append("tracker-finish")
 
     trainer.rollout_engine = Engine()
@@ -618,10 +638,11 @@ def test_trainer_builds_tokenizer_data_and_dataloader(
 
         @pad_token.setter
         def pad_token(self, value: str) -> None:
+            """Update the fixture padding token."""
             assert value == self.eos_token
             self.pad_token_id = self.eos_token_id
 
-    class Dataset:
+    class Dataset(PromptDataset):
         def __init__(self, **kwargs: Any) -> None:
             calls.append(("dataset", kwargs))
 
@@ -633,12 +654,13 @@ def test_trainer_builds_tokenizer_data_and_dataloader(
     sampler = object()
 
     def build_dataloader(dataset: Any, collate_fn: Any, **kwargs: Any) -> tuple[Any, Any]:
+        """Record the source and dataloader settings."""
         calls.append(("loader", dataset, collate_fn, kwargs))
         return loader, sampler
 
     tokenizer = Tokenizer()
     monkeypatch.setattr(
-        trainer_module.AutoTokenizer,
+        model_setup_module.AutoTokenizer,
         "from_pretrained",
         lambda *args, **kwargs: calls.append(("tokenizer", args, kwargs)) or tokenizer,
     )
@@ -699,12 +721,14 @@ def test_trainer_builds_rollout_evaluator_and_tp_request_owner(
 
     class Engine:
         def configure_trainer_tensor_parallel(self, **kwargs: Any) -> None:
+            """Record the supplied trainer topology."""
             calls.append(("tp", kwargs))
 
     engine = Engine()
     managers: list[Any] = []
 
     def manager(**kwargs: Any) -> Any:
+        """Construct the task-manager fixture."""
         result = SimpleNamespace(kwargs=kwargs)
         managers.append(result)
         return result
@@ -863,6 +887,7 @@ def test_trainer_validates_supported_shared_runtime_topology(
     monkeypatch.setattr(trainer_module.dist, "get_world_size", lambda: 2)
 
     def gather(output: list[Any], value: Any) -> None:
+        """Supply the peer-rank diagnostic records."""
         output[:] = [value, value]
 
     monkeypatch.setattr(trainer_module.dist, "all_gather_object", gather)
@@ -1067,6 +1092,7 @@ def test_trainer_builds_required_models_optimizers_and_role_runtime(
     frozen_flags = []
 
     def build_model(unused_runtime: Any, unused_setup: Any, *, frozen: bool, cpu_threads: Any = None) -> Any:
+        """Construct the configured model fixture."""
         del unused_runtime, unused_setup, cpu_threads
         frozen_flags.append(frozen)
         return next(models)
@@ -1082,6 +1108,7 @@ def test_trainer_builds_required_models_optimizers_and_role_runtime(
     actor_calls = []
 
     def actor(**kwargs: Any) -> Any:
+        """Construct the policy fixture."""
         actor_calls.append(kwargs)
         return SimpleNamespace(
             actor_model=kwargs["actor_model"],
@@ -1275,25 +1302,30 @@ def _recording_checkpoints(calls):
         """Record save and restore operations without filesystem side effects."""
         @staticmethod
         def validate_resume() -> None:
+            """Represent the scripted validate resume boundary."""
             calls.append("validate-resume")
 
         @staticmethod
         def begin(unused_state: Any) -> None:
+            """Represent the scripted begin boundary."""
             del unused_state
             calls.append("checkpoint-begin")
 
         @staticmethod
         def will_save(unused_step: int) -> bool:
+            """Represent the scripted will save boundary."""
             del unused_step
             return False
 
         @staticmethod
         def complete_step(unused_state: Any, **_kwargs: Any) -> None:
+            """Record checkpoint completion in the fixture."""
             del unused_state
             calls.append("checkpoint-step")
 
         @staticmethod
         def finalize(unused_state: Any) -> None:
+            """Represent the scripted finalize boundary."""
             del unused_state
             calls.append("checkpoint-finalize")
     return Checkpoints()

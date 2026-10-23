@@ -50,7 +50,7 @@ def _model():
 
 
 @pytest.fixture(autouse=True)
-def cpu_runtime(monkeypatch):
+def cpu_runtime(monkeypatch: Any) -> Any:
     """Provide a single-rank CPU runtime for real weight publication tests."""
     handle = SimpleNamespace(
         current_device=lambda: 0,
@@ -92,8 +92,10 @@ class LocalWorkers(VLLMWeightSyncClientMixin):
         self.resume_failure = False
         self.workers = []
 
-        def make_loader(parameter_map, worker_rank):
-            def load_weights(weights, require_all=True):
+        def make_loader(parameter_map: Any, worker_rank: Any) -> Any:
+            """Construct the scripted weight loader."""
+            def load_weights(weights: Any, require_all: Any=True) -> Any:
+                """Apply the fixture weight payload."""
                 del require_all
                 loaded = set()
                 for name, value in weights:
@@ -133,18 +135,22 @@ class LocalWorkers(VLLMWeightSyncClientMixin):
                 tp_rank=rank,
             ))
 
-    def get_world_size(self, base_url=None):
+    def get_world_size(self, base_url: Any=None) -> Any:
+        """Represent the scripted get world size boundary."""
         del base_url
         return 2
 
-    def pause(self):
+    def pause(self) -> Any:
+        """Represent the scripted pause boundary."""
         self.events.append("pause")
         self.paused = True
 
-    def is_paused(self):
+    def is_paused(self) -> Any:
+        """Represent the scripted is paused boundary."""
         return self.paused
 
-    def sleep(self, level=1, mode="wait"):
+    def sleep(self, level: Any=1, mode: Any='wait') -> Any:
+        """Represent the scripted sleep boundary."""
         del mode
         self.events.append("sleep")
         self.sleeping = True
@@ -154,31 +160,37 @@ class LocalWorkers(VLLMWeightSyncClientMixin):
                 for parameter in worker.parameters.values():
                     parameter.fill_(float("nan"))
 
-    def is_sleeping(self):
+    def is_sleeping(self) -> Any:
+        """Represent the scripted is sleeping boundary."""
         return self.sleeping
 
-    def wake_up(self, tags):
+    def wake_up(self, tags: Any) -> Any:
+        """Represent the scripted wake up boundary."""
         self.events.append("wake:" + ",".join(tags))
         self.sleeping = False
 
-    def resume(self):
+    def resume(self) -> Any:
+        """Represent the scripted resume boundary."""
         self.events.append("resume")
         self.paused = False
         if self.resume_failure:
             raise RuntimeError("resume failed")
 
-    def start_weight_update(self):
+    def start_weight_update(self) -> Any:
+        """Represent the scripted start weight update boundary."""
         self.events.append("start")
         for worker in self.workers:
             worker._weight_update_active = True
             worker._rl_pending_policy_version = None
 
-    def finish_weight_update(self):
+    def finish_weight_update(self) -> Any:
+        """Represent the scripted finish weight update boundary."""
         self.events.append("finish")
         for worker in self.workers:
             vllm_worker._finish_custom_weight_update(worker)
 
-    def collective_rpc(self, method, kwargs=None, base_url=None):
+    def collective_rpc(self, method: Any, kwargs: Any=None, base_url: Any=None) -> Any:
+        """Represent the scripted collective rpc boundary."""
         del kwargs, base_url
         self.rpc_methods.append(method)
         if method == "get_direct_reshard_layout":
@@ -208,7 +220,8 @@ class LocalWorkers(VLLMWeightSyncClientMixin):
             ],
         }
 
-    def apply(self, rank, metadata, packed, version):
+    def apply(self, rank: Any, metadata: Any, packed: Any, version: Any) -> Any:
+        """Represent the scripted apply boundary."""
         worker = self.workers[rank]
         vllm_worker._validate_update(worker, version, transport="CPU test")
         vllm_worker._apply_direct_bucket(
@@ -228,16 +241,19 @@ class TensorTransport:
         self.fail = False
         self.closed = False
 
-    def prepare(self, unused_client, destination_tp_size):
+    def prepare(self, unused_client: Any, destination_tp_size: Any) -> Any:
+        """Prepare the fixture state for the operation."""
         del unused_client
         if destination_tp_size != 2:
             raise ValueError("unexpected destination size")
 
-    def prepare_packed(self, unused_client):
+    def prepare_packed(self, unused_client: Any) -> Any:
+        """Prepare the packed transport fixture."""
         del unused_client
         return "packed"
 
-    def transfer_direct(self, client, state, plan, version):
+    def transfer_direct(self, client: Any, state: Any, plan: Any, version: Any) -> Any:
+        """Execute the scripted direct transport."""
         for (unused_source, target), buckets in plan.buckets.items():
             for bucket in buckets:
                 packed = pack_direct_bucket(state, bucket, torch.device("cpu"))
@@ -246,8 +262,15 @@ class TensorTransport:
                     raise RuntimeError("direct transfer failed")
 
     def send_packed_bucket(
-        self, client, unused_context, index, metadata, total_bytes, packed, version,
-    ):
+        self,
+        client: Any,
+        unused_context: Any,
+        index: Any,
+        metadata: Any,
+        total_bytes: Any,
+        packed: Any,
+        version: Any,
+    ) -> Any:
         """Load a complete packed bucket into each in-process worker."""
         del unused_context
         assert packed is not None and packed.numel() == total_bytes
@@ -263,7 +286,8 @@ class TensorTransport:
             raise RuntimeError("full-gather transfer failed")
         return PackedWeightAck(index, total_bytes, len(client.workers))
 
-    def close(self):
+    def close(self) -> Any:
+        """Release the fixture-owned service."""
         self.closed = True
 
 
@@ -366,7 +390,8 @@ def test_graph_refresh_failure_during_kv_wake_cannot_expose_transferred_policy()
     controller.update_weights(PolicySnapshot(1, "qwen", state))
     original_wake = client.wake_up
 
-    def fail_capture(tags):
+    def fail_capture(tags: Any) -> Any:
+        """Raise the injected graph-capture failure."""
         original_wake(tags)
         if "kv_cache" in tags:
             raise RuntimeError("worker graph recapture failed")
@@ -408,12 +433,45 @@ def test_strategies_cache_plans_and_reject_missing_sources():
 
 
 def test_coordinator_and_synchronized_failures_are_not_swallowed():
-    def fail():
+    def fail() -> Any:
+        """Raise the injected operation failure."""
         raise ValueError("local operation failed")
 
     for call in (coordinator_call, synchronized_call):
         with pytest.raises(ValueError, match="local operation failed"):
             call("test", fail)
+
+
+@pytest.mark.parametrize("rank", (0, 1))
+def test_coordinator_broadcasts_only_one_payload(monkeypatch: pytest.MonkeyPatch, rank: int) -> None:
+    """Share coordinator data without padding a full payload for every rank."""
+    payload = {"group": b"complete serialized episode"}
+    callbacks, broadcasts = [], []
+    monkeypatch.setattr(dist, "get_rank", lambda: rank)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 8)
+
+    def gather_errors(results: list[Any], error: Any) -> None:
+        """Only error metadata participates in the all-rank gather."""
+        assert error is None
+        results[:] = [None] * 8
+
+    def broadcast(values: list[Any], src: int) -> None:
+        """Represent one source object delivered to either training rank."""
+        assert src == 0 and len(values) == 1
+        assert values[0] == (payload if rank == 0 else None)
+        broadcasts.append(src)
+        values[0] = payload
+
+    def produce() -> dict:
+        """Execute solely on the coordinator."""
+        callbacks.append(rank)
+        return payload
+
+    monkeypatch.setattr(dist, "all_gather_object", gather_errors)
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast)
+    assert coordinator_call("share group", produce) == payload
+    assert broadcasts == [0]
+    assert callbacks == ([0] if rank == 0 else [])
 
 
 def test_full_gather_releases_acknowledged_payload_before_next_materialization(

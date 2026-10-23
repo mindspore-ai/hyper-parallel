@@ -112,7 +112,7 @@ class _CompletionRequest:
         return len(self.prompts) * self.num_choices
 
 
-class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
+class VLLMHTTPClient(VLLMWeightSyncClientMixin):
     """Synchronous token and RL control client for one vLLM server process."""
 
     def __init__(
@@ -710,13 +710,16 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
                 os.killpg(process_group_id, 0)
             except ProcessLookupError:
                 return
-            if not _VLLMHTTPClient._has_live_process_group_members(process_group_id):
+            if not VLLMHTTPClient._has_live_process_group_members(process_group_id):
                 return
             if time.monotonic() >= deadline:
                 raise RuntimeError(
                     f"vLLM process group {process_group_id} remained alive after shutdown"
                 )
             time.sleep(0.1)
+
+
+_VLLMHTTPClient = VLLMHTTPClient
 
 
 class VLLMGenerationEngine:
@@ -871,10 +874,12 @@ class VLLMGenerationEngine:
     def _server_command(self, host: str, port: int) -> list[str]:
         """Build the vLLM server command for this rollout configuration."""
         weight_transfer_backend = "ipc" if self._deployment == "colocated" else "nccl"
+        frontend = ("rl.roles.rollout.vllm_plugin" if os.environ.get("HYPER_RL_ASYNC_TRAINING") == "1"
+                    else "vllm.entrypoints.cli.main")
         command = [
             sys.executable,
             "-m",
-            "vllm.entrypoints.cli.main",
+            frontend,
             "serve",
             self._model.weights_path,
             "--host",
@@ -894,6 +899,9 @@ class VLLMGenerationEngine:
             "--weight-transfer-config",
             json.dumps({"backend": weight_transfer_backend}),
         ]
+        if os.environ.get("HYPER_RL_ASYNC_TRAINING") == "1":
+            # Partial-request admission has one owner even when inference uses multiple DP replicas.
+            command.extend(("--api-server-count", "1"))
         if self._rollout_model.is_adapted:
             command.extend(
                 (
@@ -1061,6 +1069,17 @@ class VLLMGenerationEngine:
             raise RuntimeError("Shared vLLM startup returned no client")
         self._client = client
         return self._client
+
+    def start_service(self) -> None:
+        """Start/connect the shared HTTP service on every training rank."""
+        self._ensure_client()
+
+    @staticmethod
+    def build_generation_result(
+        request: GenerationRequest, records: list, elapsed: float, version: int,
+    ) -> GenerationResult:
+        """Build the common token-aligned result for an independent HTTP client."""
+        return VLLMGenerationEngine._build_generation_result(request, records, elapsed, version)
 
     def prepare_for_training(self) -> None:
         """Sleep colocated rollout before policy Actor training starts."""

@@ -93,6 +93,8 @@ def build_experience_batch(
     generation_seconds: float,
     settings: GenerationSettings,
     metadata: Mapping[str, Any],
+    *,
+    mixed_policy_versions: bool = False,
 ) -> ExperienceBatch:
     """Pad canonical trajectories into the shared rollout batch contract."""
     if not trajectories:
@@ -116,7 +118,7 @@ def build_experience_batch(
         for trajectory in trajectories
     )
     worker_versions = {trajectory.worker_policy_version for trajectory in trajectories}
-    if len(worker_versions) != 1:
+    if len(worker_versions) != 1 and not mixed_policy_versions:
         raise ValueError(
             "Trajectories must carry one consistent worker policy version"
         )
@@ -132,7 +134,8 @@ def build_experience_batch(
         rollout_log_probs=_detached(old_log_probs),
         responses=responses,
         generation_seconds=generation_seconds,
-        worker_policy_version=worker_versions.pop(),
+        worker_policy_version=None if mixed_policy_versions else worker_versions.pop(),
+        mixed_policy_versions=mixed_policy_versions,
         metadata=batch_metadata,
         router_traces=_router_traces(trajectories, settings),
     )
