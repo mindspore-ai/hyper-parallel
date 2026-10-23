@@ -19,8 +19,12 @@ from hyper_parallel.core.multicore.diagnostics.api import (
 )
 from hyper_parallel.core.multicore.diagnostics.common.graph import validate_mega_kernel_diagnostic_contract
 from hyper_parallel.core.multicore.diagnostics.common.schedule import DiagnosticAction, schedule
+from hyper_parallel.core.multicore.diagnostics.execution import (
+    execution_monitor, inspect_execution, summarize_execution_reports,
+)
 
 __all__ = [
     "DiagnosticAction", "MegaKernelDiagnostics", "prepare_mega_kernel_diagnostics",
     "validate_mega_kernel_diagnostic_contract", "schedule",
+    "execution_monitor", "inspect_execution", "summarize_execution_reports",
 ]

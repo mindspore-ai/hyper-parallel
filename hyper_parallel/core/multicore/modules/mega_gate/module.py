@@ -16,16 +16,34 @@
 
 from __future__ import annotations
 
-__all__ = ["MegaGate"]
+__all__ = ["GateBackend", "GateOutput", "MegaGate"]
 
-from functools import lru_cache
 import math
+from collections.abc import Callable
+from functools import lru_cache
+from typing import Any, NamedTuple
 
 import torch
 from torch.nn import functional
 
+from hyper_parallel.core.multicore.modules._precision import preserve_fp32_parameters
 from hyper_parallel.core.multicore.modules.mega_gate.function import mega_gate
 from hyper_parallel.core.multicore.modules.mega_gate.plan import MegaGatePlan, build_mega_gate_plan
+
+
+class GateOutput(NamedTuple):
+    """Flattened token routing results, retaining positional unpacking compatibility."""
+
+    logits: torch.Tensor
+    weights: torch.Tensor
+    ids: torch.Tensor
+
+
+class GateBackend(NamedTuple):
+    """Selected Route implementation and its reason, without initializing native resources."""
+
+    name: str
+    reason: str
 
 
 def _reset_mega_gate_parameters(
@@ -135,6 +153,61 @@ class MegaGate(torch.nn.Module):
             self.initializer_range,
         )
 
+    @classmethod
+    def from_module(cls, module: torch.nn.Module, **configuration: Any) -> MegaGate:
+        """Bind an existing router's projection and correction-bias Parameters.
+
+        Args:
+            module: Router with weight [E, H], optional correction bias [E] and bias_vl [E].
+                Its bias is a TopK correction, not a linear-projection bias.
+            **configuration: top_k, scoring_func and routed_scaling_factor, when not present on module.
+
+        Returns:
+            Router sharing the original Parameters. Construct the optimizer after module replacement.
+        """
+        weight = getattr(module, "weight", None)
+        if not isinstance(weight, torch.nn.Parameter) or weight.ndim != 2:
+            raise ValueError("source router requires a weight Parameter shaped [num_experts, hidden_size]")
+        options = {}
+        for name in ("top_k", "scoring_func", "routed_scaling_factor"):
+            value = configuration.pop(name, getattr(module, name, None))
+            if value is None:
+                raise ValueError(f"Provide {name} or expose it on the source router")
+            options[name] = value
+        bias_vl = getattr(module, "bias_vl", None)
+        result = cls(hidden_size=weight.shape[1], num_experts=weight.shape[0],
+                     vision_enabled=bias_vl is not None, **options, **configuration).to(device=weight.device)
+        result.weight = weight
+        for name in ("bias", "bias_vl"):
+            value = getattr(module, name, None)
+            if value is not None:
+                if (not isinstance(value, torch.nn.Parameter) or value.shape != (weight.shape[0],)
+                        or value.dtype != torch.float32 or value.device != weight.device):
+                    raise ValueError(f"source {name} must be an FP32 Parameter [num_experts] on the weight device")
+                setattr(result, name, value)
+        return result
+
+    def _apply(self, fn: Callable, recurse: bool = True) -> MegaGate:
+        """Keep correction biases FP32 under enclosing model dtype conversion."""
+        return super()._apply(preserve_fp32_parameters(self, fn, ("bias", "bias_vl")), recurse=recurse)
+
+    def backend_for(self, hidden_states: torch.Tensor) -> GateBackend:
+        """Query Route selection for this input without loading or executing native code.
+
+        Args:
+            hidden_states: Input whose device and emptiness determine execution support.
+
+        Returns:
+            Selected backend name and reason; scoring semantics are never changed to select a backend.
+        """
+        if self.scoring_func != "sqrtsoftplus":
+            return GateBackend("torch", f"{self.scoring_func} uses the Torch implementation")
+        if hidden_states.device.type != "npu":
+            return GateBackend("torch", "native Route requires NPU input")
+        if hidden_states.numel() == 0:
+            return GateBackend("torch", "empty input uses the Torch implementation")
+        return GateBackend("native", "NPU sqrtsoftplus Route")
+
     def _plan(self, hidden_states: torch.Tensor) -> MegaGatePlan:
         """Return the process-level plan for an NPU tensor."""
         return _plan_for_device(hidden_states.device)
@@ -183,22 +256,21 @@ class MegaGate(torch.nn.Module):
         self,
         hidden_states: torch.Tensor,
         image_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> GateOutput:
         """Project hidden states and select experts for every flattened token.
 
         Args:
             hidden_states: Tensor shaped ``[batch, sequence, hidden_size]``.
-                The projection follows the active Torch autocast policy. The
+                The projection follows the active autocast policy. The
                 logits are converted to FP32 before the native NPU Route.
             image_mask: Optional BOOL tensor shaped ``[batch, sequence]``.
                 When visual bias is enabled, true entries select ``bias_vl``
                 and false entries select ``bias``. Native visual routing
                 requires a contiguous mask on the same NPU as
-                ``hidden_states``. The mask is ignored after shape validation
-                when no visual bias exists.
+                ``hidden_states``. Passing a mask without vision_enabled=True raises ValueError.
 
         Returns:
-            A tuple containing logits ``[tokens, num_experts]`` in the
+            A GateOutput containing logits ``[tokens, num_experts]`` in the
             projection output dtype, FP32 routing weights
             ``[tokens, top_k]`` and INT64 expert indices ``[tokens, top_k]``.
 
@@ -213,14 +285,12 @@ class MegaGate(torch.nn.Module):
             The native NPU Route supports first-order differentiation only.
             Differentiating through RouteGrad is unsupported.
         """
+        if image_mask is not None and self.bias_vl is None:
+            raise ValueError("image_mask requires vision_enabled=True when constructing MegaGate")
         if image_mask is not None and image_mask.shape != hidden_states.shape[:2]:
             raise ValueError("image_mask must have shape [batch, sequence]")
-        if (
-            self.scoring_func != "sqrtsoftplus"
-            or hidden_states.device.type != "npu"
-            or hidden_states.numel() == 0
-        ):
-            return self._torch_forward(hidden_states, image_mask)
+        if self.backend_for(hidden_states).name == "torch":
+            return GateOutput(*self._torch_forward(hidden_states, image_mask))
 
         vision_bias = self.bias_vl
         use_vision_bias = image_mask is not None and vision_bias is not None
@@ -229,7 +299,7 @@ class MegaGate(torch.nn.Module):
             if not image_mask.is_contiguous():
                 raise ValueError("image_mask must be contiguous for native MegaGate")
             flat_image_mask = image_mask.view(-1)
-        return mega_gate(
+        return GateOutput(*mega_gate(
             hidden_states,
             self.weight,
             self.bias,
@@ -238,4 +308,4 @@ class MegaGate(torch.nn.Module):
             image_mask=flat_image_mask,
             top_k=self.top_k,
             routed_scaling_factor=self.routed_scaling_factor,
-        )
+        ))

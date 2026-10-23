@@ -12,7 +12,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)
-ROOT="${HP_ROOT:-$(cd "$SCRIPT_DIR/../../../../.." && pwd)}"
+ROOT="${HP_ROOT:-$(cd "$SCRIPT_DIR/../../../.." && pwd)}"
 
 die() {
     echo "ERROR: $*" >&2
@@ -23,7 +23,6 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 if [[ "$PYTHON_BIN" != */* ]]; then
     PYTHON_BIN=$(command -v "$PYTHON_BIN") || die "Python is not executable: $PYTHON_BIN"
 fi
-TORCHRUN_BIN="${TORCHRUN_BIN:-$(dirname "$PYTHON_BIN")/torchrun}"
 CANN_ENV_FILE="${CANN_ENV_FILE:-/usr/local/Ascend/cann/set_env.sh}"  # codespell:ignore cann
 NATIVE_ENV_FILE="${NATIVE_ENV_FILE:-$ROOT/build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash}"
 SHMEM_LIB_DIR="${SHMEM_LIB_DIR:-$ROOT/build/native/payload/hyper_parallel/core/multicore/shmem/lib/shmem}"
@@ -46,8 +45,7 @@ source_env() {
 }
 
 [[ -x "$PYTHON_BIN" ]] || die "Python is not executable: $PYTHON_BIN"
-[[ -x "$TORCHRUN_BIN" ]] || die "torchrun is not executable: $TORCHRUN_BIN"
-[[ -f "$SCRIPT_DIR/qwen_moe_benchmark.py" ]] || \
+[[ -f "$SCRIPT_DIR/benchmark.py" ]] || \
     die "benchmark runner is missing under $ROOT"
 [[ -d "$SHMEM_LIB_DIR" ]] || die "SHMEM library directory is missing: $SHMEM_LIB_DIR"
 [[ "$NNODES_VALUE" =~ ^[0-9]+$ ]] || die "NNODES must be an integer"
@@ -77,11 +75,11 @@ case "$IMPORTED_PACKAGE" in
 esac
 
 exec timeout --kill-after=60s "$TIMEOUT_SECONDS" \
-    "$TORCHRUN_BIN" \
+    "$PYTHON_BIN" -m torch.distributed.run \
     --nnodes="$NNODES_VALUE" \
     --nproc_per_node="$NPROC_PER_NODE_VALUE" \
     --node_rank="$NODE_RANK_VALUE" \
     --master_addr="$MASTER_ADDR_VALUE" \
     --master_port="$MASTER_PORT_VALUE" \
-    hyper_parallel/core/multicore/examples/mega_moe/qwen_moe_benchmark.py \
+    hyper_parallel/core/multicore/examples/benchmark.py \
     "$@"

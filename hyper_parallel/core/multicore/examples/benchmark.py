@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 
-"""Minimal eight-NPU Qwen MoE optimizer-step benchmark."""
+"""Eight-NPU common versus three-Mega-kernel MoE Transformer optimizer benchmark."""
 
 from __future__ import annotations
 
@@ -31,22 +31,26 @@ from typing import Any
 import torch  # pylint: disable=forbidden-backend-import
 import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 import torch_npu
-from qwen_moe_model import QwenMoeConfig, QwenMoeModel
 
 from hyper_parallel import SkipDTensorDispatch, init_device_mesh
 from hyper_parallel.components.optim import (
     Float16OptimizerWithFloat16Params,
 )
 from hyper_parallel.core.dtensor.dtensor import DTensor
-from hyper_parallel.core.expert_parallel.expert_parallel import ExpertParallel
 from hyper_parallel.core.multicore import MegaMoeExperts, shmem
-from hyper_parallel.core.multicore.modules.mega_moe.spec import _resolve_capacity_factors
+from hyper_parallel.core.multicore.examples.model import (
+    MoeTransformerConfig,
+    MoeTransformerModel,
+)
+from hyper_parallel.core.multicore.examples.moe import NativeExperts, _local_tensor
+from hyper_parallel.core.multicore.modules.mega_moe.spec import (
+    _resolve_capacity_factors,
+)
 from hyper_parallel.core.optimizer import get_hyper_optimizer
-from hyper_parallel.components.modules.moe import GroupedExperts
 
 _WORLD_SIZE = 8
 _BATCH_SIZE = 1
-_SEQUENCE_LENGTH = QwenMoeConfig.local_num_tokens
+_SEQUENCE_LENGTH = MoeTransformerConfig.local_num_tokens
 _DTYPE = torch.bfloat16
 _RTOL = 2e-2
 _ATOL = 2e-3
@@ -56,7 +60,7 @@ _ATOL = 2e-3
 class _Workload:
     """Objects needed by one complete optimizer step."""
 
-    model: QwenMoeModel
+    model: MoeTransformerModel
     optimizer: Float16OptimizerWithFloat16Params
     input_ids: torch.Tensor
     labels: torch.Tensor
@@ -82,73 +86,17 @@ class _BenchmarkContext:
     rank: int
     world_size: int
     device: torch.device
-    config: QwenMoeConfig
+    config: MoeTransformerConfig
     initialized_here: bool
-    models: dict[str, QwenMoeModel] = field(default_factory=dict)
+    models: dict[str, MoeTransformerModel] = field(default_factory=dict)
 
 
-class _CommonExpertsAdapter(torch.nn.Module):
-    """Expose standard EP routed experts through the Qwen expert interface."""
-
-    def __init__(
-        self,
-        config: QwenMoeConfig,
-        source: MegaMoeExperts,
-        ep_mesh: Any,
-        device: torch.device,
-    ) -> None:
-        """Shard common experts and copy one local MegaMoe expert shard."""
-        super().__init__()
-        self.module = GroupedExperts(
-            dim=config.hidden_size,
-            hidden_dim=config.intermediate_size,
-            num_experts=config.num_experts,
-            use_grouped_mm=True,
-        ).to(device=device, dtype=_DTYPE)
-        ExpertParallel().apply(self.module, ep_mesh)
-        gate_weight, up_weight = source.gate_up_weight.split(
-            config.intermediate_size,
-            dim=-1,
-        )
-        with torch.no_grad():
-            _local_tensor(self.module.w1).copy_(gate_weight.transpose(1, 2))
-            _local_tensor(self.module.w3).copy_(up_weight.transpose(1, 2))
-            _local_tensor(self.module.w2).copy_(
-                source.down_weight.transpose(1, 2)
-            )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-        *,
-        tokens_per_expert: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Run the common routed-expert implementation.
-
-        Args:
-            hidden_states: Routed-expert input activations.
-            topk_ids: Selected expert identifiers.
-            topk_weights: Routing weights for selected experts.
-            tokens_per_expert: Optional token counts for each expert.
-        """
-        if tokens_per_expert is None:
-            tokens_per_expert = torch.bincount(
-                topk_ids.reshape(-1).to(torch.int64), minlength=self.module.num_experts,
-            )
-        routed_input, mapping = torch_npu.npu_moe_token_permute(
-            hidden_states.reshape(-1, hidden_states.shape[-1]), topk_ids,
-        )
-        expert_output = self.module(routed_input, tokens_per_expert)
-        output = torch_npu.npu_moe_token_unpermute(
-            expert_output, mapping, probs=topk_weights.float().contiguous(),
-        )
-        return output.reshape(hidden_states.shape)
-
-    @staticmethod
-    def close() -> None:
-        """Match the managed expert lifecycle without owning SHMEM."""
+def _parse_mega_kernels(value: str) -> tuple[str, ...]:
+    """Parse explicit comma-separated component names without changing model structure."""
+    names = tuple(part.strip() for part in value.split(","))
+    if not names or any(name not in ("moe", "gate", "mhc") for name in names) or len(set(names)) != len(names):
+        raise argparse.ArgumentTypeError("use a comma-separated subset of moe,gate,mhc without duplicates")
+    return names
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -158,7 +106,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         argv: Optional command-line arguments; ``None`` reads the process arguments.
     """
     parser = argparse.ArgumentParser(
-        description="Run an eight-NPU Qwen MoE optimizer-step benchmark.",
+        description="Compare common and selected Mega kernels in an eight-NPU MoE Transformer demo.",
     )
     parser.add_argument("--warmup-steps", type=int, default=3)
     parser.add_argument("--measured-steps", type=int, default=5)
@@ -169,10 +117,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dispatch-mode", choices=("push", "pull"), default="push")
     parser.add_argument("--capacity-growth-factor", type=float, default=None,
                         help="push only: growth multiplier (default: 1.25; 1.0 fits actual demand)")
+    parser.add_argument(
+        "--mega-kernels", type=_parse_mega_kernels, default=("moe", "gate", "mhc"),
+        help="optimized backend kernels; common always uses the same architecture with Torch references",
+    )
+    parser.add_argument(
+        "--accuracy-mode", choices=("components", "full_step"), default="components",
+        help="components isolates mHC rounding from discrete TopK; full_step checks all enabled kernels together",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--output",
-        default="output/qwen_moe_benchmark.json",
+        default="output/moe_transformer_benchmark.json",
         help="rank-zero JSON result path",
     )
     args = parser.parse_args(argv)
@@ -206,25 +162,22 @@ def _init_runtime() -> tuple[int, int, torch.device, bool]:
         if initialized_here:
             dist.destroy_process_group()
         raise ValueError(
-            f"Qwen benchmark requires {_WORLD_SIZE} ranks, got {world_size}."
+            f"MoE Transformer benchmark requires {_WORLD_SIZE} ranks, got {world_size}."
         )
     return rank, world_size, torch.device("npu", local_rank), initialized_here
 
 
-def _build_model(config: QwenMoeConfig, device: torch.device) -> QwenMoeModel:
-    """Build BF16 model weights and keep rotary buffers in their native dtype."""
+def _build_model(
+    config: MoeTransformerConfig, device: torch.device, mega_kernels: tuple[str, ...],
+) -> MoeTransformerModel:
+    """Build BF16 dense weights while preserving FP32 mHC predictors and rotary buffers."""
     default_dtype = torch.get_default_dtype()
     try:
         torch.set_default_dtype(_DTYPE)
-        model = QwenMoeModel(config, ep_group=dist.group.WORLD)
+        model = MoeTransformerModel(config, ep_group=dist.group.WORLD, mega_kernels=mega_kernels)
     finally:
         torch.set_default_dtype(default_dtype)
     return model.to(device=device)
-
-
-def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    """Return the local value of a plain tensor or DTensor."""
-    return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
 
 def _reset_seed(seed: int) -> None:
@@ -234,33 +187,32 @@ def _reset_seed(seed: int) -> None:
 
 
 def _build_backend_model(
-    config: QwenMoeConfig,
+    config: MoeTransformerConfig,
     device: torch.device,
     seed: int,
     backend: str,
-) -> QwenMoeModel:
-    """Build one deterministically initialized MegaMoe or common model."""
+    mega_kernels: tuple[str, ...],
+) -> MoeTransformerModel:
+    """Build equal architectures and select common or requested Mega execution paths."""
+    if backend not in ("common", "mega"):
+        raise ValueError(f"unsupported MoE Transformer backend {backend!r}.")
+    selected = mega_kernels if backend == "mega" else ()
     _reset_seed(seed)
-    model = _build_model(config, device)
-    if backend == "mega_moe":
+    model = _build_model(config, device, selected)
+    if "moe" in selected:
         return model
-    if backend != "common":
-        raise ValueError(f"unsupported Qwen expert backend {backend!r}.")
     ep_mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(config.ep_size,),
         mesh_dim_names=("ep",),
     )
     for layer in model.layers:
-        source = layer.mlp.experts
-        common = _CommonExpertsAdapter(config, source, ep_mesh, device)
-        source.close()
-        layer.mlp.experts = common
+        layer.mlp.use_native_experts(ep_mesh, device)
     return model
 
 
 def _build_workload(
-    model: QwenMoeModel,
+    model: MoeTransformerModel,
     args: argparse.Namespace,
     input_ids: torch.Tensor,
     labels: torch.Tensor,
@@ -297,7 +249,7 @@ def _build_workload(
 
 
 def _build_batch(
-    config: QwenMoeConfig,
+    config: MoeTransformerConfig,
     rank: int,
     seed: int,
     device: torch.device,
@@ -315,7 +267,7 @@ def _build_batch(
     return input_ids, input_ids.clone()
 
 
-def _dense_gradients(model: QwenMoeModel) -> list[torch.Tensor]:
+def _dense_gradients(model: MoeTransformerModel) -> list[torch.Tensor]:
     """Return gradients of replicated parameters, excluding expert shards."""
     expert_parameters = {id(parameter) for parameter in model.expert_parameters()}
     gradients = [
@@ -324,15 +276,27 @@ def _dense_gradients(model: QwenMoeModel) -> list[torch.Tensor]:
         if id(parameter) not in expert_parameters and parameter.grad is not None
     ]
     if not gradients:
-        raise RuntimeError("Qwen optimizer step produced no dense gradients.")
+        raise RuntimeError("MoE Transformer optimizer step produced no dense gradients.")
     return gradients
 
 
-def _synchronize_dense_gradients(model: QwenMoeModel, world_size: int) -> None:
-    """Average replicated dense gradients before the optimizer step."""
-    gradients = _dense_gradients(model)
-    dist.all_reduce_coalesced(gradients, op=dist.ReduceOp.SUM)
-    torch._foreach_div_(gradients, world_size)  # pylint: disable=protected-access
+def _synchronize_dense_gradients(model: MoeTransformerModel, world_size: int) -> None:
+    """Average replicated gradients in dtype buckets, leaving EP expert shards local."""
+    buckets: dict[torch.dtype, list[torch.Tensor]] = {}
+    for gradient in _dense_gradients(model):
+        buckets.setdefault(gradient.dtype, []).append(gradient)
+    for gradients in buckets.values():
+        dist.all_reduce_coalesced(gradients, op=dist.ReduceOp.SUM)
+        torch._foreach_div_(gradients, world_size)  # pylint: disable=protected-access
+
+
+def _prepare_expert_main_gradients(model: MoeTransformerModel) -> None:
+    """Attach EP layout to local expert gradients for the mixed-precision optimizer."""
+    for parameter in model.expert_parameters():
+        if isinstance(parameter, DTensor) and parameter.grad is not None:
+            parameter.main_grad = DTensor.from_local(
+                parameter.grad.detach(), parameter.device_mesh, parameter.placements, shape=tuple(parameter.shape),
+            )
 
 
 def _optimizer_step(
@@ -347,9 +311,9 @@ def _optimizer_step(
     loss = result["loss"]
     logits = result["logits"]
     if loss is None:
-        raise RuntimeError("Qwen model did not return a training loss.")
+        raise RuntimeError("MoE Transformer model did not return a training loss.")
     if logits is None:
-        raise RuntimeError("Qwen model did not return logits.")
+        raise RuntimeError("MoE Transformer model did not return logits.")
     loss.backward()
     _synchronize_dense_gradients(workload.model, workload.world_size)
     gradients = None
@@ -358,7 +322,8 @@ def _optimizer_step(
         canonical_gradients = _canonical_tensors(workload.model, gradients=True)
         for name, tensor in canonical_gradients.items():
             gradients[name] = tensor.detach().clone()
-    with SkipDTensorDispatch():
+    _prepare_expert_main_gradients(workload.model)
+    with SkipDTensorDispatch(no_skip={torch.zeros_like}):
         workload.optimizer.step()
     return loss.detach(), logits.detach(), gradients
 
@@ -426,7 +391,7 @@ def _validate_first_step(
     )
     torch.npu.synchronize(workload.device)
     if gradients is None:
-        raise RuntimeError("Qwen first optimizer step did not capture gradients.")
+        raise RuntimeError("MoE Transformer first optimizer step did not capture gradients.")
     first_step_ms = _rank_max(
         (time.perf_counter() - start) * 1000.0,
         workload.device,
@@ -462,12 +427,12 @@ def _parameter_value(
     """Return one local parameter or its required gradient."""
     value = parameter.grad if gradients else parameter
     if value is None:
-        raise RuntimeError("Qwen accuracy comparison found a missing gradient.")
+        raise RuntimeError("MoE Transformer accuracy comparison found a missing gradient.")
     return _local_tensor(value)
 
 
 def _canonical_tensors(
-    model: QwenMoeModel,
+    model: MoeTransformerModel,
     *,
     gradients: bool,
 ) -> dict[str, torch.Tensor]:
@@ -476,7 +441,7 @@ def _canonical_tensors(
     tensors = {
         f"dense.{name}": _parameter_value(parameter, gradients=gradients)
         for name, parameter in model.named_parameters()
-        if id(parameter) not in expert_parameters
+        if id(parameter) not in expert_parameters and (not gradients or parameter.requires_grad)
     }
     for layer_index, layer in enumerate(model.layers):
         experts = layer.mlp.experts
@@ -486,7 +451,7 @@ def _canonical_tensors(
                 gradients=gradients,
             )
             down = _parameter_value(experts.down_weight, gradients=gradients)
-        elif isinstance(experts, _CommonExpertsAdapter):
+        elif isinstance(experts, NativeExperts):
             grouped = experts.module
             gate = _parameter_value(grouped.w1, gradients=gradients)
             up = _parameter_value(grouped.w3, gradients=gradients)
@@ -498,7 +463,7 @@ def _canonical_tensors(
             down = down.transpose(1, 2)
         else:
             raise TypeError(
-                f"unsupported Qwen expert backend {type(experts).__name__}."
+                f"unsupported MoE Transformer expert backend {type(experts).__name__}."
             )
         tensors[f"experts.{layer_index}.gate_up_weight"] = gate_up
         tensors[f"experts.{layer_index}.down_weight"] = down
@@ -594,7 +559,7 @@ def _finalize_tensor_comparison(
         "max_normalized_error_tensor": comparison.tensor_names[int(normalized_index.cpu().item())],
     }
     if not result["passed"]:
-        raise RuntimeError(f"Qwen common/MegaMoe {name} comparison failed: {result}.")
+        raise RuntimeError(f"MoE Transformer common/Mega {name} comparison failed: {result}.")
     return result
 
 
@@ -626,7 +591,10 @@ def _measure_backend(
         "shmem_heap_bytes": state.get("config", {}).get("heap_size_bytes", 0),
         "heap_growth": [record for manager in managers.values() for record in manager.growth_records],
         "validation": validation,
-        "first_optimizer_step_ms": first_step_ms,
+        "validation_optimizer_step_ms": first_step_ms,
+        "validation_optimizer_step_index": (
+            2 if args.accuracy_mode == "components" and "mhc" in args.mega_kernels else 1
+        ),
         "steady_state_optimizer_step_ms": {
             "median": statistics.median(latencies),
             "minimum": min(latencies),
@@ -639,17 +607,24 @@ def _measure_backend(
 
 def _write_result(
     args: argparse.Namespace,
-    config: QwenMoeConfig,
+    config: MoeTransformerConfig,
     rank: int,
     accuracy: dict[str, Any],
     backends: dict[str, dict[str, Any]],
 ) -> None:
     """Write common-versus-MegaMoe accuracy and performance from rank zero."""
     common_median = backends["common"]["steady_state_optimizer_step_ms"]["median"]
-    mega_median = backends["mega_moe"]["steady_state_optimizer_step_ms"]["median"]
+    mega_median = backends["mega"]["steady_state_optimizer_step_ms"]["median"]
     ratio = mega_median / common_median
     if rank == 0:
         result = {
+            "architecture": "moe_transformer",
+            "mega_kernels": list(args.mega_kernels),
+            "accuracy_mode": args.accuracy_mode,
+            "common_mhc_backend": "torch",
+            "gate_route_backend": {"common": "torch",
+                                   "mega": "native" if "gate" in args.mega_kernels else "torch"},
+            "mhc_precision_reference": "torch",
             "topology": {"world_size": _WORLD_SIZE, "tp": 1, "ep": config.ep_size},
             "shape": {
                 "batch_size": _BATCH_SIZE,
@@ -662,13 +637,15 @@ def _write_result(
                 "dispatch_mode": config.dispatch_mode,
                 "capacity_growth_factor": config.capacity_growth_factor,
                 "dtype": "bfloat16",
+                "mhc_streams": 4,
+                "scoring_func": "sqrtsoftplus",
             },
             "optimizer": {
                 "name": "HyperParallel AdamW",
                 "wrapper": "Float16OptimizerWithFloat16Params",
                 "learning_rate": args.learning_rate,
                 "weight_decay": args.weight_decay,
-                "model_parameter_dtype": "bfloat16",
+                "model_parameter_dtype": "mixed_bfloat16_float32",
                 "main_parameter_dtype": "float32",
             },
             "warmup_steps": args.warmup_steps,
@@ -676,10 +653,10 @@ def _write_result(
             "comparison": {
                 "accuracy": accuracy,
                 "performance": {
-                    "order": ["common", "mega_moe"],
+                    "order": ["common", "mega"],
                     "metric": "rank-max complete optimizer-step milliseconds",
                     "common_median_ms": common_median,
-                    "mega_moe_median_ms": mega_median,
+                    "mega_median_ms": mega_median,
                     "mega_over_common": ratio,
                     "mega_reduction_percent": (1.0 - ratio) * 100.0,
                 },
@@ -702,7 +679,7 @@ def _write_result(
 
 
 def _compare_first_step_accuracy(
-    models: dict[str, QwenMoeModel],
+    models: dict[str, MoeTransformerModel],
     workloads: dict[str, _Workload],
     device: torch.device,
 ) -> tuple[dict[str, Any], dict[str, tuple[dict[str, Any], float]]]:
@@ -711,7 +688,7 @@ def _compare_first_step_accuracy(
         "initial_parameters": _compare_tensor_maps(
             "initial parameters",
             _canonical_tensors(models["common"], gradients=False),
-            _canonical_tensors(models["mega_moe"], gradients=False),
+            _canonical_tensors(models["mega"], gradients=False),
             device,
             rtol=0.0,
             atol=0.0,
@@ -730,7 +707,7 @@ def _compare_first_step_accuracy(
         mega_loss,
         mega_logits,
         mega_gradients,
-    ) = _validate_first_step(workloads["mega_moe"])
+    ) = _validate_first_step(workloads["mega"])
     accuracy.update(
         {
             "forward": _compare_tensor_maps(
@@ -752,7 +729,7 @@ def _compare_first_step_accuracy(
             "updated_parameters": _compare_tensor_maps(
                 "updated parameters",
                 _canonical_tensors(models["common"], gradients=False),
-                _canonical_tensors(models["mega_moe"], gradients=False),
+                _canonical_tensors(models["mega"], gradients=False),
                 device,
                 rtol=_RTOL,
                 atol=_ATOL,
@@ -764,8 +741,73 @@ def _compare_first_step_accuracy(
     torch.npu.empty_cache()
     first_steps = {
         "common": (common_validation, common_first_ms),
-        "mega_moe": (mega_validation, mega_first_ms),
+        "mega": (mega_validation, mega_first_ms),
     }
+    return accuracy, first_steps
+
+
+def _compare_mhc_component(context: _BenchmarkContext) -> dict[str, Any]:
+    """Check fused mHC outputs and all input/parameter gradients on identical inputs."""
+    hidden = context.config.hidden_size
+    tokens = _SEQUENCE_LENGTH
+    generator = torch.Generator(device="cpu").manual_seed(context.args.seed + 20_000 + context.rank)
+    shapes = ((1, tokens, hidden), (1, tokens, 4, hidden), (1, tokens, 4),
+              (1, tokens, 4), (1, tokens, 4, 4))
+    dtypes = (_DTYPE, _DTYPE, torch.float32, torch.float32, torch.float32)
+    inputs = tuple(torch.randn(shape, generator=generator).to(device=context.device, dtype=dtype)
+                   for shape, dtype in zip(shapes, dtypes))
+    probes = tuple(torch.randn(shape, generator=generator).to(device=context.device, dtype=dtype) / tokens
+                   for shape, dtype in zip((shapes[1], shapes[2], shapes[3], shapes[4], shapes[0]),
+                                           (_DTYPE, torch.float32, torch.float32, torch.float32, _DTYPE)))
+    forwards, gradients = {}, {}
+    for backend in ("reference", "common", "mega"):
+        boundary = context.models["common" if backend == "reference" else backend].layers[0].attention_mhc
+        state = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs)
+        outputs = boundary.reference_forward(*state) if backend == "reference" else boundary(*state)
+        values = torch.autograd.grad(outputs, (*state, *boundary.parameters()), grad_outputs=probes)
+        forwards[backend] = {str(index): output.detach() for index, output in enumerate(outputs)}
+        gradients[backend] = {str(index): value.detach() for index, value in enumerate(values)}
+    comparisons = {}
+    for backend in ("common", "mega"):
+        comparisons[f"{backend}_forward"] = _compare_tensor_maps(
+            f"mHC {backend} forward", forwards["reference"], forwards[backend],
+            context.device, rtol=_RTOL, atol=_ATOL,
+        )
+        comparisons[f"{backend}_gradients"] = _compare_tensor_maps(
+            f"mHC {backend} gradients", gradients["reference"], gradients[backend],
+            context.device, rtol=_RTOL, atol=_ATOL,
+        )
+    return comparisons
+
+
+def _validate_accuracy(
+    context: _BenchmarkContext, workloads: dict[str, _Workload],
+) -> tuple[dict[str, Any], dict[str, tuple[dict[str, Any], float]]]:
+    """Separate mHC component precision from complete-network discrete routing."""
+    if context.args.accuracy_mode == "full_step" or "mhc" not in context.args.mega_kernels:
+        accuracy, first_steps = _compare_first_step_accuracy(context.models, workloads, context.device)
+        accuracy["scope"] = "full_step_with_selected_kernels"
+        return accuracy, first_steps
+    component = _compare_mhc_component(context)
+    boundaries = [boundary for layer in context.models["mega"].layers
+                  for boundary in (layer.attention_mhc, layer.ffn_mhc)]
+    try:
+        for boundary in boundaries:
+            boundary.use_mega_mhc = False
+        accuracy, first_steps = _compare_first_step_accuracy(context.models, workloads, context.device)
+    finally:
+        for boundary in boundaries:
+            boundary.use_mega_mhc = True
+    accuracy["scope"] = "mhc_component_and_full_step_with_common_mhc"
+    accuracy["mhc_component"] = component
+    for backend in ("common", "mega"):
+        validation, latency, *captured = _validate_first_step(workloads[backend])
+        del captured
+        first_steps[backend] = (validation, latency)
+    accuracy["selected_kernels_training_step"] = {
+        backend: validation for backend, (validation, _) in first_steps.items()
+    }
+    torch.npu.empty_cache()
     return accuracy, first_steps
 
 
@@ -774,7 +816,7 @@ def _prepare_benchmark(argv: list[str] | None) -> _BenchmarkContext:
     args = parse_args(argv)
     rank, world_size, device, initialized_here = _init_runtime()
     config = replace(
-        QwenMoeConfig(),
+        MoeTransformerConfig(),
         initial_capacity_factor=args.initial_capacity_factor,
         dispatch_mode=args.dispatch_mode,
         capacity_growth_factor=args.capacity_growth_factor,
@@ -790,12 +832,13 @@ def _build_benchmark_workloads(context: _BenchmarkContext) -> dict[str, _Workloa
         context.args.seed,
         context.device,
     )
-    for backend in ("common", "mega_moe"):
+    for backend in ("common", "mega"):
         context.models[backend] = _build_backend_model(
             context.config,
             context.device,
             context.args.seed,
             backend,
+            tuple(context.args.mega_kernels),
         )
     return {
         backend: _build_workload(
@@ -817,14 +860,14 @@ def _measure_backends(
 ) -> dict[str, dict[str, Any]]:
     """Measure both backends after their compared first steps."""
     measurements = {}
-    for backend in ("common", "mega_moe"):
+    for backend in ("common", "mega"):
         validation, latency_ms = first_steps[backend]
         measurements[backend] = _measure_backend(workloads[backend], validation, latency_ms, args)
     return measurements
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Compare common and MegaMoe Qwen accuracy, then time A and B.
+    """Compare common and selected Mega kernels for MoE Transformer accuracy, then time A and B.
 
     Args:
         argv: Optional command-line arguments for tests or direct invocation.
@@ -835,11 +878,7 @@ def main(argv: list[str] | None = None) -> int:
     context = _prepare_benchmark(argv)
     try:
         workloads = _build_benchmark_workloads(context)
-        accuracy, first_steps = _compare_first_step_accuracy(
-            context.models,
-            workloads,
-            context.device,
-        )
+        accuracy, first_steps = _validate_accuracy(context, workloads)
         backends = _measure_backends(workloads, first_steps, context.args)
         _write_result(
             context.args,

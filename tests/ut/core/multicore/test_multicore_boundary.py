@@ -17,8 +17,8 @@
 
 import ast
 import sys
-from pathlib import Path
 import unittest
+from pathlib import Path
 
 import hyper_parallel
 from hyper_parallel.core import multicore
@@ -37,13 +37,19 @@ class TestMulticoreBoundary(unittest.TestCase):
         Description: Inspect the component and HyperParallel root package symbols.
         Expectation: Business modules and profiler are exported only by Multicore.
         """
-        self.assertEqual(multicore.__all__, [
-            "HyperMegaMhc", "MegaGate", "MegaMoeExperts", "MegaKernelDiagnostics",
+        self.assertCountEqual(multicore.__all__, [
+            "HyperMegaMhc", "MegaMhc", "MhcState", "MegaMhcOutput", "GateOutput", "GateBackend",
+            "MegaGate", "MegaMoeExperts", "MegaKernelDiagnostics",
             "prepare_mega_kernel_diagnostics", "validate_mega_kernel_diagnostic_contract",
         ])
         self.assertTrue(callable(multicore.prepare_mega_kernel_diagnostics))
         for name in (
             "HyperMegaMhc",
+            "MegaMhc",
+            "MhcState",
+            "MegaMhcOutput",
+            "GateOutput",
+            "GateBackend",
             "MegaGate",
             "MegaMoeExperts",
             "MulticoreModule",

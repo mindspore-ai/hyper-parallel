@@ -261,34 +261,41 @@ def _fixed_comparison(fixed: MegaMoeExperts, weights: tuple, inputs: tuple, actu
     return report
 
 
+def _lifecycle_forward(layers: list[MegaMoeExperts], rank: int, device: torch.device,
+                       replay: bool) -> tuple:
+    """Submit the same shared-layer forwards with optional checkpoint replay."""
+    world = dist.get_world_size()
+    streams = [torch.npu.Stream() for _ in layers]
+    default_stream = torch.npu.current_stream()
+    outputs, leaves = [], []
+    for size in (1, 129):
+        inputs = _inputs([size + index for index in range(world)], layers[0].num_experts, layers[0].top_k)
+        x = inputs[0][rank].to(device).requires_grad_()
+        ids = inputs[1][rank].to(device)
+        probs = [inputs[2][rank].to(device).requires_grad_() for _ in layers]
+        dy = inputs[3][rank].to(device)
+        value, previous = x, default_stream
+        for index, layer in enumerate(layers):
+            with torch.npu.stream(streams[index]):
+                streams[index].wait_stream(previous)
+                if replay:
+                    value = checkpoint(layer, value, ids, probs[index], use_reentrant=False)
+                else:
+                    value = layer(value, ids, probs[index])
+            previous = streams[index]
+        default_stream.wait_stream(previous)
+        outputs.append((value, dy))
+        leaves.extend([x, *probs])
+    return outputs, leaves
+
+
 def _lifecycle(layers: list[MegaMoeExperts], rank: int, device: torch.device) -> None:
     """Compare shared-layer checkpoint and cross-stream gradients and an SGD update."""
-    world = dist.get_world_size()
     references = None
     for replay in (False, True):
         for layer in layers:
             layer.zero_grad(set_to_none=True)
-        streams = [torch.npu.Stream() for _ in layers]
-        default_stream = torch.npu.current_stream()
-        outputs, leaves = [], []
-        for size in (1, 129):
-            inputs = _inputs([size + index for index in range(world)], layers[0].num_experts, layers[0].top_k)
-            x = inputs[0][rank].to(device).requires_grad_()
-            ids = inputs[1][rank].to(device)
-            probs = [inputs[2][rank].to(device).requires_grad_() for _ in layers]
-            dy = inputs[3][rank].to(device)
-            value, previous = x, default_stream
-            for index, layer in enumerate(layers):
-                with torch.npu.stream(streams[index]):
-                    streams[index].wait_stream(previous)
-                    if replay:
-                        value = checkpoint(layer, value, ids, probs[index], use_reentrant=False)
-                    else:
-                        value = layer(value, ids, probs[index])
-                previous = streams[index]
-            default_stream.wait_stream(previous)
-            outputs.append((value, dy))
-            leaves.extend([x, *probs])
+        outputs, leaves = _lifecycle_forward(layers, rank, device, replay)
         for value, dy in reversed(outputs):
             (value * dy).sum().backward()
         torch.npu.synchronize()
@@ -309,19 +316,18 @@ def _lifecycle(layers: list[MegaMoeExperts], rank: int, device: torch.device) ->
 
 
 def _configuration_failures(world: int, rank: int, device: torch.device) -> None:
-    """Configuration mismatches must fail on both static and dynamic ranks before SHMEM."""
+    """Configuration mismatches must fail on every rank before SHMEM."""
     if world == 1:
         return
-    for mixed_modes in (False, True):
-        options = ({"local_num_tokens": 128} if mixed_modes and rank == 0
-                   else {"max_local_num_tokens": 128 if rank == 0 else 127})
+    for different_split in (False, True):
+        options = ({"dispatch_split": 128 if rank == 0 else 256} if different_split
+                   else {"swiglu_limit": None if rank == 0 else 10.0})
         module = MegaMoeExperts(**options, hidden_size=_HIDDEN, intermediate_size=_INTERMEDIATE,
                                num_experts=world * 6, top_k=6, ep_size=world,
                                ep_group=dist.group.WORLD,
                                dispatch_mode=os.environ.get("HP_DYNAMIC_DISPATCH", "push"),
                                ).to(device=device, dtype=torch.bfloat16)
-        lengths = [128] * world if mixed_modes else [1] * world
-        # The dynamic peer's over-limit input still reaches the configuration check first.
+        lengths = [128] * world
         try:
             _forward(module, _inputs(lengths, world * 6, 6), rank, device)
         except (RuntimeError, ValueError) as error:
@@ -397,7 +403,7 @@ def test_dynamic_tokens() -> None:
                           ep_group=dist.group.WORLD,
                                dispatch_mode=os.environ.get("HP_DYNAMIC_DISPATCH", "push"),
                                ).to(device=device, dtype=torch.bfloat16)
-    fixed = MegaMoeExperts(local_num_tokens=_CAPACITY, hidden_size=_HIDDEN,
+    fixed = MegaMoeExperts( local_num_tokens=_CAPACITY, hidden_size=_HIDDEN,
                            intermediate_size=_INTERMEDIATE, num_experts=experts,
                            top_k=top_k, ep_size=world,
                           ep_group=dist.group.WORLD,
@@ -457,20 +463,15 @@ def test_dynamic_tokens() -> None:
     # Retire the other member so closing the last owner checks pending graphs.
     peer.close()
     _deferred(mega, weights, rank, device)
-    too_long = [4097] + [0] * (world - 1)
-    try:
-        _forward(mega, _inputs(too_long, experts, top_k), rank, device)
-    except RuntimeError as error:
-        if "token capacity overflow" not in str(error):
-            raise
-    else:
-        raise AssertionError("accepted an over-capacity source")
+    above_legacy_bound = [4097] + [0] * (world - 1)
+    extra = _forward(mega, _inputs(above_legacy_bound, experts, top_k), rank, device)
+    extra[2].sum().backward()
     mega.close()
     peer.close()
     fixed.close()
     bounded.close()
     result = {"status": "passed", "results": results, "deferred_backward": "passed",
-              "coordinated_overflow": "passed", "fixed_reference": fixed_reports,
+              "legacy_bound_ignored": "passed", "fixed_reference": fixed_reports,
               "checkpoint_shared_stream_sgd": "passed", "frozen_policies": "passed",
               "torch": torch.__version__, "torch_npu": torch_npu.__version__,
               "dispatch_mode": os.environ.get("HP_DYNAMIC_DISPATCH", "push")}

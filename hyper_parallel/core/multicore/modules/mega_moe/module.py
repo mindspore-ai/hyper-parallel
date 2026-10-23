@@ -20,7 +20,7 @@ __all__ = ["MegaMoeExperts"]
 
 import math
 import struct
-from collections import OrderedDict
+import time
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
@@ -29,6 +29,7 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel.core.multicore import _automatic, shmem
+from hyper_parallel.core.multicore.diagnostics.common.session import _get_execution_observer
 
 from ..module import MulticoreModule
 from .function import execute_mega_moe_with_permutation
@@ -36,7 +37,9 @@ from .heap_manager import _get_heap_manager, _workspace_layout
 from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
 from .spec import (
-    _COMMUNICATION_SPLIT, _align_capacity, _resolve_capacity_factors, bind_mega_moe_spec,
+    _COMMUNICATION_SPLIT,
+    _resolve_capacity_factors,
+    bind_mega_moe_spec,
 )
 from .workspace import MegaMoeWorkspace
 
@@ -69,26 +72,6 @@ def _validate_swiglu_limit(swiglu_limit: float | None) -> None:
         )
 
 
-def _resolve_token_capacity(
-    local_num_tokens: int | None,
-    max_local_num_tokens: int | None,
-    hidden_size: int,
-    top_k: int,
-) -> int:
-    """Validate the token mode and reserve aligned rows within the native route ABI."""
-    if (local_num_tokens is None) == (max_local_num_tokens is None):
-        raise ValueError("Provide exactly one of local_num_tokens and max_local_num_tokens")
-    if max_local_num_tokens is None:
-        return local_num_tokens
-    if (not isinstance(max_local_num_tokens, int) or isinstance(max_local_num_tokens, bool)
-            or max_local_num_tokens <= 0):
-        raise ValueError("max_local_num_tokens must be a positive integer")
-    reserved_tokens = _align_capacity(max_local_num_tokens)
-    if reserved_tokens * max(hidden_size, top_k) > 2**31 - 1:
-        raise ValueError("max_local_num_tokens exceeds native INT32 route limits")
-    return reserved_tokens
-
-
 def _create_mega_moe_parameters(
     local_experts: int,
     hidden_size: int,
@@ -107,6 +90,23 @@ def _create_mega_moe_parameters(
     return gate_up_weight, down_weight
 
 
+def _resolve_ep_size(ep_size: int | None, ep_group: Any | None) -> int:
+    """Infer size from an explicit group without silently choosing WORLD."""
+    if ep_size is not None and (not isinstance(ep_size, int) or isinstance(ep_size, bool) or ep_size <= 0):
+        raise ValueError("ep_size must be a positive integer or None")
+    if ep_group is not None:
+        if not dist.is_initialized():
+            raise ValueError("Initialize torch.distributed before passing ep_group")
+        group_size = dist.get_world_size(ep_group)
+        if ep_size is not None and ep_size != group_size:
+            raise ValueError(f"ep_size={ep_size} does not match ep_group size={group_size}")
+        return group_size
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        raise ValueError("Pass ep_group explicitly for distributed MegaMoeExperts")
+    return 1 if ep_size is None else ep_size
+
+
+
 class _MegaMoeExecutionResources:
     """Own one shape-bound plan and workspace in the shared SHMEM lifecycle."""
 
@@ -120,14 +120,16 @@ class _MegaMoeExecutionResources:
     ) -> None:
         """Bind resources once to the first NPU tensor."""
         self.spec = bind_mega_moe_spec(specification, tensor)
-        self._plans = OrderedDict()
+        self._token_capacity = self.spec.local_num_tokens
+        self._plans = {}
         if dist.is_initialized():
             self._validate_distributed_configuration(active_specifications)
         reservations = tuple((item, _workspace_layout(item, tensor.dtype)) for item in active_specifications)
         self.heap_manager = _get_heap_manager(self.spec.ep_group, tensor)
         added_specifications = self.heap_manager.reserve(
             reservations,
-            allow_resize=any(item.get("dispatch_mode", "push") == "push" for item in active_specifications),
+            allow_resize=any(item.get("dispatch_mode", "push") == "push" or item.get("auto_tokens", False)
+                             for item in active_specifications),
         )
         attached = False
         self.plan = None
@@ -138,7 +140,7 @@ class _MegaMoeExecutionResources:
             def construct() -> None:
                 """Build and bind local resources before collective commit."""
                 self.plan = (build_mega_moe_plan(self.spec, tensor.device)
-                             if self.spec.max_local_num_tokens is None else None)
+                             if not self.spec.dynamic_tokens else None)
                 self.workspace = MegaMoeWorkspace(shared=shared)
                 self.workspace.capacity_floor = self.heap_manager.bind(self.workspace, self.spec, specification)
                 self.workspace.heap_manager = self.heap_manager
@@ -167,8 +169,22 @@ class _MegaMoeExecutionResources:
             self.spec.intermediate_size, self.spec.num_experts, self.spec.top_k,
             self.spec.receive_capacity, self.spec.ep_size, self.spec.dispatch_mode,
             self.spec.initial_capacity_factor, self.spec.capacity_growth_factor,
-            self.spec.dispatch_split, self.spec.combine_split, self.spec.max_local_num_tokens,
+            self.spec.dispatch_split, self.spec.combine_split, self.spec.max_local_num_tokens, self.spec.auto_tokens,
         )
+
+    def prepare_auto_workspace(self, tokens: int, received: int, tensor: torch.Tensor) -> None:
+        """Commit physical capacity before taking a pull lease and publishing source rows.
+
+        Args:
+            tokens: Aligned group-maximum actual input length.
+            received: Group-maximum received route rows.
+            tensor: Input supplying device and dtype.
+        """
+        physical_spec = self.heap_manager.ensure_token_capacity(self.workspace, tokens, received)
+        self.workspace.ensure(physical_spec, tensor.dtype, tensor.device)
+        self._token_capacity = physical_spec.local_num_tokens
+        if self.spec.dispatch_mode == "pull":
+            self.workspace.claim()
 
     def can_close(self) -> bool:
         """Report whether neither an active call nor a backward graph needs buffers."""
@@ -180,9 +196,9 @@ class _MegaMoeExecutionResources:
             return
         fields = ("local_num_tokens", "max_local_num_tokens", "hidden_size", "intermediate_size",
                   "num_experts", "top_k", "initial_capacity_factor", "capacity_growth_factor", "dispatch_mode",
-                  "dispatch_split", "combine_split", "swiglu_limit", "ep_size")
+                  "dispatch_split", "combine_split", "swiglu_limit", "ep_size", "auto_tokens")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
-        manifest = ("dynamic_tokens_v1", "bfloat16",
+        manifest = ("dynamic_tokens_v3", "bfloat16",
                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications))
         # Resource groups must have the same order as their symmetric allocations.
         manifests = [None] * self.spec.ep_size
@@ -191,14 +207,36 @@ class _MegaMoeExecutionResources:
             raise ValueError("MegaMoe resource configurations differ across EP ranks")
 
     def plan_for_tokens(self, tokens: int, device: Any) -> Any:
-        """Cache bounded schedules without changing symmetric workspace capacity."""
-        if tokens not in self._plans:
-            self._plans[tokens] = build_mega_moe_plan(replace(self.spec, schedule_tokens=tokens), device)
-        self._plans.move_to_end(tokens)
-        plan = self._plans[tokens]
-        while len(self._plans) > 4:
-            # Autograd contexts keep in-flight plans alive independently of this cache.
-            self._plans.popitem(last=False)
+        """Reuse one covering plan per geometric bucket within committed capacity.
+
+        Args:
+            tokens: EP group maximum input rows, already aligned to 128.
+            device: Execution device used for the parameters and workspace.
+
+        Returns:
+            Immutable plan covering the requested rows without enlarging storage.
+        """
+        if tokens > self._token_capacity:
+            raise RuntimeError(f"MegaMoe schedule exceeds committed token capacity: "
+                               f"requested={tokens}, capacity={self._token_capacity}")
+        bucket = 1 << (max(128, tokens) - 1).bit_length()
+        plan = self._plans.get(bucket)
+        build = plan is None or plan.spec.plan_tokens < tokens
+        observer = _get_execution_observer()
+        started = time.perf_counter() if observer is not None and build else None
+        if build:
+            schedule_tokens = min(bucket, self._token_capacity)
+            plan = build_mega_moe_plan(replace(self.spec, schedule_tokens=schedule_tokens), device)
+            # INT32 route bounds allow at most 25 buckets starting at 128 rows.
+            # A growing partial bucket replaces its plan; backward keeps the old object.
+            self._plans[bucket] = plan
+        if observer is not None:
+            observer.record_event("plan", {
+                "requested_tokens": tokens, "bucket": bucket, "schedule_tokens": plan.spec.plan_tokens,
+                "cache_hit": not build, "cached_plans": len(self._plans),
+                "execution_resource": id(self),
+                "build_cpu_ms": (time.perf_counter() - started) * 1000 if started is not None else 0.0,
+            })
         return plan
 
     def close(self) -> None:
@@ -219,6 +257,69 @@ class MegaMoeExperts(MulticoreModule):
     their first forward to share one automatically growing workspace while keeping
     independent parameters and optimizer state.
     """
+
+    def execution_state(self) -> dict[str, Any]:
+        """Report current capacity and shared plan keys without allocating resources."""
+        state = super().execution_state()
+        resources = self._resource_group.resources
+        state.update({
+            "parameter_mode": "external" if self.gate_up_weight is None else "owned",
+            "execution_resource": id(resources) if resources is not None else None,
+            "token_mode": "automatic",
+            "token_capacity": getattr(resources, "_token_capacity", None),
+            "plan_buckets": sorted(getattr(resources, "_plans", {})),
+            "shmem_heap_bytes": getattr(getattr(resources, "heap_manager", None), "heap_bytes", None),
+            "receive_capacity": getattr(getattr(resources, "workspace", None), "capacity_floor", None),
+        })
+        if self._ep_group is not None and dist.is_initialized() and not self._resource_closed:
+            state["ep_ranks"] = dist.get_process_group_ranks(self._ep_group)
+        else:
+            state["ep_ranks"] = None
+        return state
+
+    @classmethod
+    def from_module(
+        cls, module: torch.nn.Module, *, top_k: int, ep_group: Any | None = None, **execution_options: Any,
+    ) -> MegaMoeExperts:
+        """Convert materialized local GroupedExperts SwiGLU weights before optimizer construction.
+
+        Args:
+            module: Module exposing w1/w3 [local_E, I, H], w2 [local_E, H, I].
+                DTensor local EP shards are accepted; FSDP weights must be materialized first.
+            top_k: Experts selected by the existing router for each token.
+            ep_group: Explicit EP group owning these local experts, or None for a standalone rank.
+            **execution_options: Advanced MegaMoe options, including optional num_experts override.
+
+        Returns:
+            Experts with copied, converted Parameters. Optimizer state is not migrated.
+        """
+        values = []
+        for name in ("w1", "w3", "w2"):
+            value = getattr(module, name, None)
+            if hasattr(value, "to_local"):
+                value = value.to_local()
+            if not isinstance(value, torch.Tensor) or value.ndim != 3:
+                raise ValueError(f"source {name} must be a materialized local rank-three expert tensor")
+            if value.is_meta:
+                raise ValueError(f"source {name} is meta; materialize and initialize/load weights before from_module")
+            values.append(value)
+        gate, up, down = values[0], values[1], values[2]
+        if (up.shape != gate.shape or down.shape != (gate.shape[0], gate.shape[2], gate.shape[1])
+                or any(value.device != gate.device or value.dtype != gate.dtype for value in values)
+                or gate.requires_grad != up.requires_grad):
+            raise ValueError("source SwiGLU expert shapes, dtypes, devices and gate/up gradient policies must match")
+        ep_size = _resolve_ep_size(execution_options.get("ep_size"), ep_group)
+        experts = execution_options.pop("num_experts", getattr(module, "num_experts", gate.shape[0] * ep_size))
+        if experts != gate.shape[0] * ep_size:
+            raise ValueError("source local expert count does not match num_experts and ep_group")
+        result = cls(hidden_size=gate.shape[2], intermediate_size=gate.shape[1], num_experts=experts,
+                     top_k=top_k, ep_group=ep_group, create_parameters=False, **execution_options)
+        result.gate_up_weight = torch.nn.Parameter(
+            torch.cat((gate.detach().transpose(1, 2), up.detach().transpose(1, 2)), dim=-1).contiguous(),
+            requires_grad=gate.requires_grad)
+        result.down_weight = torch.nn.Parameter(down.detach().transpose(1, 2).contiguous(),
+                                                requires_grad=down.requires_grad)
+        return result
 
     def _resource_signature(self, tensor: Any) -> Any:
         """Compare static configuration without process-local group identities."""
@@ -241,7 +342,7 @@ class MegaMoeExperts(MulticoreModule):
         num_experts: int,
         top_k: int,
         swiglu_limit: float | None = None,
-        ep_size: int = 1,
+        ep_size: int | None = None,
         ep_group: Any | None = None,
         create_parameters: bool = True,
         dispatch_mode: str = "push",
@@ -253,52 +354,48 @@ class MegaMoeExperts(MulticoreModule):
         """Initialize local expert parameters and a lazy execution owner.
 
         Args:
-            local_num_tokens: Static token rows supplied to this rank.
-            max_local_num_tokens: Opt-in variable token bound, exclusive with local_num_tokens.
+            local_num_tokens: Ignored compatibility keyword; input rows are inferred from forward.
+            max_local_num_tokens: Ignored compatibility keyword; it does not impose an input bound.
             hidden_size: Input and output hidden dimension.
             intermediate_size: SwiGLU intermediate dimension per expert.
             num_experts: Global routed-expert count.
             top_k: Experts selected for every token.
-            initial_capacity_factor: Push initial receive rows as a multiple of local routed rows.
-                Defaults to 1.25 for push; omitted for pull. Must be finite and at least 1.0.
+            initial_capacity_factor: Finite push receive-row factor >= 1.0, default 1.25; omitted for pull.
             capacity_growth_factor: Push capacity multiplier on overflow, defaulting to 1.25.
                 Must be finite and at least 1.0; 1.0 grows only to the current route demand.
                 The resulting capacity is capped by the lossless route bound. Pull rejects explicit factors.
             dispatch_mode: Dispatch transport, either "push" (default) or "pull".
                 Construct separate modules to switch modes; sharing requires equal modes.
             dispatch_split: Dispatch tile rows in forward and backward, default 128.
-                Must be a positive multiple of 128 that divides local_num_tokens.
-            combine_split: Combine tile rows in forward and backward, with the same
-                constraints and default as dispatch_split. Sharing requires equal splits.
+                Must be a positive multiple of 128.
+            combine_split: Combine tile rows; same constraints and default as dispatch_split.
             swiglu_limit: Optional positive, finite float32-representable clamp
                 limit for SwiGLU. The gate branch uses ``min(gate, limit)`` and
                 the up branch is clamped to ``[-limit, limit]``. ``None``
                 preserves the legacy unclamped path.
-            ep_size: Expert-parallel degree, equal to the size of ep_group.
+            ep_size: Optional compatibility check; normally inferred from explicit ep_group.
             create_parameters: Allocate owned weights; False requires explicit expert_weights each forward.
-            ep_group: Torch expert-parallel process group, possibly a subgroup of
-                WORLD. Expert ownership follows group-local rank order. Disjoint
-                PP/DP groups bootstrap independently; one process can have only
-                one ordered EP membership active in SHMEM at a time.
+            ep_group: Explicit EP group; expert ownership follows group-local rank order.
+                Disjoint PP/DP groups bootstrap independently. Only one ordered EP membership
+                can be active in SHMEM per process.
         """
-        reserved_tokens = _resolve_token_capacity(local_num_tokens, max_local_num_tokens, hidden_size, top_k)
+        del local_num_tokens, max_local_num_tokens
         specification = {
-            "local_num_tokens": reserved_tokens,
+            "local_num_tokens": _COMMUNICATION_SPLIT,
             "hidden_size": hidden_size,
             "intermediate_size": intermediate_size,
             "num_experts": num_experts,
             "top_k": top_k,
             "initial_capacity_factor": initial_capacity_factor,
             "swiglu_limit": swiglu_limit,
-            "ep_size": ep_size,
+            "ep_size": _resolve_ep_size(ep_size, ep_group),
             "ep_group": ep_group,
             "dispatch_mode": dispatch_mode,
             "capacity_growth_factor": capacity_growth_factor,
             "dispatch_split": dispatch_split,
             "combine_split": combine_split,
         }
-        if max_local_num_tokens is not None:
-            specification["max_local_num_tokens"] = max_local_num_tokens
+        specification["auto_tokens"] = True
         specification = self._resolve_specification(specification)
         compatibility_key = tuple(
             id(value) if name == "ep_group" else value for name, value in specification.items())
@@ -307,8 +404,8 @@ class MegaMoeExperts(MulticoreModule):
             resource_compatibility_key=compatibility_key,
             resource_scope_key=("mega_moe", shmem.root_members(ep_group) if dist.is_initialized() else id(ep_group)),
         )
-        self.local_num_tokens = local_num_tokens
-        self.max_local_num_tokens = max_local_num_tokens
+        self.local_num_tokens = None
+        self.max_local_num_tokens = None
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.num_experts = num_experts
@@ -319,8 +416,8 @@ class MegaMoeExperts(MulticoreModule):
         self.dispatch_split = dispatch_split
         self.combine_split = combine_split
         self.swiglu_limit = specification["swiglu_limit"]
-        self.ep_size = ep_size
-        self.local_experts = num_experts // ep_size
+        self.ep_size = specification["ep_size"]
+        self.local_experts = num_experts // self.ep_size
         self._ep_group = ep_group
         if create_parameters:
             self.gate_up_weight, self.down_weight = _create_mega_moe_parameters(
@@ -348,6 +445,7 @@ class MegaMoeExperts(MulticoreModule):
             ep_size=specification["ep_size"],
             dispatch_split=specification["dispatch_split"],
             combine_split=specification["combine_split"],
+            auto_tokens=specification.get("auto_tokens", False),
         )
         swiglu_limit = specification["swiglu_limit"]
         return {
@@ -369,6 +467,7 @@ class MegaMoeExperts(MulticoreModule):
         ep_size: int,
         dispatch_split: int,
         combine_split: int,
+        auto_tokens: bool = False,
     ) -> None:
         """Validate static shape and topology values before allocation."""
         values = {
@@ -396,7 +495,7 @@ class MegaMoeExperts(MulticoreModule):
                     or split <= 0 or split % _COMMUNICATION_SPLIT):
                 raise ValueError(
                     f"{name} must be a positive integer multiple of {_COMMUNICATION_SPLIT}, got {split!r}.")
-            if local_num_tokens % split:
+            if not auto_tokens and local_num_tokens % split:
                 raise ValueError(f"local_num_tokens ({local_num_tokens}) must be divisible by {name} ({split}).")
 
     def _root_group(self) -> Any:
@@ -453,11 +552,6 @@ class MegaMoeExperts(MulticoreModule):
                 f"hidden size {self.hidden_size}, got {tuple(hidden_states.shape)}."
             )
         hidden_flat = hidden_states.reshape(-1, self.hidden_size)
-        if self.max_local_num_tokens is None and hidden_flat.shape[0] != self.local_num_tokens:
-            raise ValueError(
-                f"MegaMoeExperts expects {self.local_num_tokens} local tokens, "
-                f"got {hidden_flat.shape[0]}."
-            )
         route_shape = (hidden_flat.shape[0], self.top_k)
         if tuple(topk_ids.shape) != route_shape:
             raise ValueError(
@@ -514,24 +608,39 @@ class MegaMoeExperts(MulticoreModule):
             tokens_per_expert,
             weights,
         )
-        if (self.dispatch_mode == "push" or self.max_local_num_tokens is not None) and (
+        if (self.dispatch_mode == "push" or self.local_num_tokens is None) and (
                 torch.npu.is_current_stream_capturing()):
             raise RuntimeError("MegaMoe push heap growth and dynamic tokens do not support graph capture")
         resources = self._get_execution_resources(hidden_flat)
         route_options = {}
-        if self.max_local_num_tokens is not None:
+        if self.local_num_tokens is None:
             route_options["autograd_mask"] = (
                 int(torch.is_grad_enabled()) | (int(hidden_flat.requires_grad) << 1)
                 | (int(weights[0].requires_grad) << 2) | (int(weights[1].requires_grad) << 3)
                 | (int(topk_weights.requires_grad) << 4)
             )
         pull = self.dispatch_mode == "pull"
-        if pull:
+        automatic = resources.spec.auto_tokens
+        claimed = False
+        def prepare_workspace(tokens: int, received: int) -> None:
+            """Grow before publishing pull source rows into symmetric memory.
+
+            Args:
+                tokens: Current local source-token count.
+                received: Current routed receive-row count.
+            """
+            nonlocal claimed
+            resources.prepare_auto_workspace(tokens, received, hidden_flat)
+            claimed = pull
+
+        if automatic:
+            route_options["prepare_workspace"] = prepare_workspace
+        elif pull:
             resources.workspace.ensure(resources.spec, hidden_flat.dtype, hidden_flat.device)
             resources.workspace.claim()
+            claimed = True
         try:
-            # Pull writes its permutation into SHMEM, so its lease must cover
-            # route preparation as well as execution and output restoration.
+            # Pull source writes and execution must share one workspace lease.
             with torch.no_grad():
                 route = prepare_topk_route(
                     hidden_flat,
@@ -542,10 +651,10 @@ class MegaMoeExperts(MulticoreModule):
                     workspace=resources.workspace,
                     **route_options,
                 )
-            if not pull:
+            if not pull and not automatic:
                 resources.ensure_capacity(route.maximum_received_slots)
-            plan = resources.plan if self.max_local_num_tokens is None else resources.plan_for_tokens(
-                route.metadata.plan_tokens, hidden_flat.device)
+            plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device)
+            self._record_execution_route(route, plan, hidden_flat.shape[0])
             expert_output = execute_mega_moe_with_permutation(
                 hidden_flat,
                 topk_ids,
@@ -558,7 +667,7 @@ class MegaMoeExperts(MulticoreModule):
                 workspace_claimed=pull,
             )
         finally:
-            if pull:
+            if claimed:
                 resources.workspace.release()
         if pull:
             return expert_output.reshape_as(hidden_states)
@@ -568,6 +677,17 @@ class MegaMoeExperts(MulticoreModule):
             topk_weights,
         )
         return output.reshape(hidden_states.shape)
+
+    def _record_execution_route(self, route: Any, plan: Any, tokens: int) -> None:
+        """Describe an existing route only when the execution observer is selected."""
+        observer = _get_execution_observer()
+        if observer is not None:
+            observer.record_event("moe", {
+                "resource_group": self._resource_group.identifier,
+                "local_tokens": tokens, "schedule_tokens": plan.spec.plan_tokens,
+                "maximum_received_rows": route.maximum_received_slots,
+                "local_receive_capacity": route.metadata.expert_capacity,
+            })
 
     def _create_execution_resources(
         self,

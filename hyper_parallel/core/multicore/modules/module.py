@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import itertools
 import weakref
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any, Optional
 
 import torch
@@ -254,6 +254,25 @@ class MulticoreModule(torch.nn.Module):
             group.identifier,
             member_token,
         )
+
+    def execution_state(self) -> dict[str, Any]:
+        """Inspect metadata without binding resources or performing a collective.
+
+        Group identifiers are process-local observation keys, not runtime handles.
+        """
+        group = self._resource_group
+        configuration = group.specification
+        if isinstance(configuration, Mapping):
+            configuration = {key: value for key, value in configuration.items() if key != "ep_group"}
+        return {
+            "type": f"{type(self).__module__}.{type(self).__qualname__}",
+            "resource_group": group.identifier,
+            "resource_bound": group.resources is not None,
+            "resource_shared": group.shared,
+            "resource_members": len(group.members),
+            "closed": self._resource_closed,
+            "configuration": configuration,
+        }
 
     @classmethod
     def share_execution_resources(cls, modules: Iterable[MulticoreModule]) -> None:

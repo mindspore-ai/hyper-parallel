@@ -50,6 +50,19 @@ def test_mega_moe_dynamic_tokens(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     _run_acceptance_worker(monkeypatch, tmp_path, "test_dynamic_tokens", 8, "_test_mega_moe_dynamic_tokens.py")
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="unessential")
+@pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
+def test_mega_moe_auto_tokens(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dispatch_mode: str) -> None:
+    """Feature: Automatic token capacity.
+
+    Description: Exercise source growth and pending backward for both transports on EP8.
+    Expectation: Inputs need no token bound, old graphs remain valid and fresh rank evidence is saved.
+    """
+    monkeypatch.setenv("HP_MEGA_MOE_DISPATCH_MODE", dispatch_mode)
+    _run_acceptance_worker(monkeypatch, tmp_path, "test_auto_tokens", 8, "_test_mega_moe_auto_tokens.py")
+
+
 def _prepare_torch_multicore_test_environment() -> None:
     """Activate multicore and require a payload built for the Torch framework."""
     prepare_multicore_test_environment()

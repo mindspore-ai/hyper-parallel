@@ -14,6 +14,6 @@
 # ============================================================================
 """MegaGate router component."""
 
-from .module import MegaGate
+from .module import GateBackend, GateOutput, MegaGate
 
-__all__ = ["MegaGate"]
+__all__ = ["GateBackend", "GateOutput", "MegaGate"]
