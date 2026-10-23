@@ -96,7 +96,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         v = v + (i_h * T_all + bos) * V
         k = k + (i_h * T_all + bos) * K
         w = w + (i_h * T_all + bos) * K
-        g = g + i_h * T_all + bos
+        if USE_G:
+            g = g + i_h * T_all + bos
         h = h + (i_h * NT_all + boh) * K * V
         if SAVE_NEW_VALUE:
             v_new_base = v_new + (i_h * T_all + bos) * V
@@ -104,7 +105,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         v = v + (i_n * H + i_h) * T * V
         k = k + (i_n * H + i_h) * T * K
         w = w + (i_n * H + i_h) * T * K
-        g = g + (i_n * H + i_h) * T
+        if USE_G:
+            g = g + (i_n * H + i_h) * T
         h = h + (i_n * H + i_h) * NT * K * V
         if SAVE_NEW_VALUE:
             v_new_base = v_new + (i_n * H + i_h) * T * V
@@ -187,8 +189,11 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
         # Apply key gate gk
         if USE_GK:
-            o_k1 = tl.arange(0, 64).to(tl.float32)
-            gk_base_ptr = gk + (i_n * H + i_h) * T * K
+            o_k1 = tl.arange(0, 64)
+            if IS_VARLEN:
+                gk_base_ptr = gk + (i_h * T_all + bos) * K
+            else:
+                gk_base_ptr = gk + (i_n * H + i_h) * T * K
             b_gk_last1 = tl.load(gk_base_ptr + last_idx * K + o_k1, mask=(o_k1 < K), other=0.)
             b_h1 *= tl.exp(b_gk_last1)[:, None]
             if K > 64:
@@ -286,7 +291,9 @@ def chunk_gated_delta_rule_fwd_h(
     k = k.permute(0, 2, 1, 3).contiguous()
     w = w.permute(0, 2, 1, 3).contiguous()
     u = u.permute(0, 2, 1, 3).contiguous()
-    g = g.permute(0, 2, 1).contiguous()
+    g = g.permute(0, 2, 1).contiguous() if g is not None else None
+    # Match the head-major layout used by the forward kernel's token strides.
+    gk = gk.permute(0, 2, 1, 3).contiguous() if gk is not None else None
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64[(triton.cdiv(V, BV), N * H)](
         k=k,
         v=u,
@@ -308,7 +315,7 @@ def chunk_gated_delta_rule_fwd_h(
         NT=NT,
     )
     h = h.permute(0, 2, 1, 3, 4).contiguous()
-    v_new = v_new.permute(0, 2, 1, 3).contiguous()
+    v_new = v_new.permute(0, 2, 1, 3).contiguous() if v_new is not None else None
     return h, v_new, final_state
 
 
