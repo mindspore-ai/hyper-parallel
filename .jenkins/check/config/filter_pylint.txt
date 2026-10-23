@@ -214,3 +214,12 @@
 "hyper-parallel/examples/training_demo/deepseek_v41/generated/" "unused-argument"
 "hyper-parallel/examples/training_demo/deepseek_v41/generated/" "protected-access"
 "hyper-parallel/examples/training_demo/deepseek_v41/generated/" "possibly-used-before-assignment"
+
+# Family config adapters need Target's raw arguments: to_dict serializes live
+# objects and callables, and Target has no public raw-argument accessors.
+"hyper-parallel/hyper_parallel/trainer/config/parallelism.py" "protected-access"
+"hyper-parallel/hyper_parallel/trainer/config/resolver.py" "protected-access"
+
+# Linear replacements must preserve forward(input=...) for keyword calls and
+# the existing replacement executor's signature validation.
+"hyper-parallel/tests/ut/trainer/test_module_family_replacement.py" "redefined-builtin"

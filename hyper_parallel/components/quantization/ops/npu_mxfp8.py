@@ -111,6 +111,59 @@ class MXFP8NpuOps:
             scale_alg=1,
         )
 
+    def validate_swiglu_fusion(self) -> None:
+        """Require both fused kernels; never silently fall back to plain SwiGLU."""
+        names = ("npu_swiglu_mx_quant_with_dual_axis", "_npu_swiglu_backward_mx_quant_with_dual_axis")
+        missing = [name for name in names if not hasattr(self._torch_npu, name)]
+        if missing:
+            raise LowPrecisionCapabilityError(f"MXFP8 SwiGLU fusion requires {missing}")
+
+    def swiglu_mx_quant_dual_axis(
+        self,
+        tensor: torch.Tensor,
+        *,
+        quant_dtype: torch.dtype = torch.float8_e4m3fn,
+        group_index: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply SiLU(gate) * up and quantize both MX directions.
+
+        Args:
+            tensor: BF16/FP16 matrix containing [gate | up] along its last axis.
+            quant_dtype: Payload dtype, E4M3 for the current MXFP8 recipe.
+            group_index: Cumulative expert token boundaries, or None for Dense.
+
+        Returns:
+            Row data, row scale, column data, and column scale.
+        """
+        return self._torch_npu.npu_swiglu_mx_quant_with_dual_axis(
+            tensor, group_index=group_index, activate_left=True,
+            dst_type=quant_dtype, scale_alg=1,
+        )
+
+    def swiglu_backward_mx_quant_dual_axis(
+        self,
+        tensor: torch.Tensor,
+        grad_output: torch.Tensor,
+        *,
+        quant_dtype: torch.dtype = torch.float8_e4m3fn,
+        group_index: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute the SwiGLU derivative and quantize both MX directions.
+
+        Args:
+            tensor: Saved BF16/FP16 packed Gate/Up matrix.
+            grad_output: BF16/FP16 gradient of the SwiGLU output.
+            quant_dtype: Payload dtype, E4M3 for the current MXFP8 recipe.
+            group_index: The same cumulative boundaries used by forward.
+
+        Returns:
+            Row data, row scale, column data, and column scale of the gradient.
+        """
+        return self._torch_npu._npu_swiglu_backward_mx_quant_with_dual_axis(  # pylint: disable=protected-access
+            tensor, grad_output, group_index=group_index, activate_left=True,
+            dst_type=quant_dtype, scale_alg=1,
+        )
+
     def quant_matmul(
         self,
         x1: torch.Tensor,
@@ -226,6 +279,11 @@ def validate_npu_runtime() -> None:
     _get_npu_ops()
 
 
+def validate_npu_swiglu_runtime() -> None:
+    """Validate fusion without storing runtime modules on a model's quantizer."""
+    _get_npu_ops().validate_swiglu_fusion()
+
+
 def validate_npu_gmm_runtime() -> None:
     """Fail during expert setup when the MXFP8 GMM runtime is unavailable."""
 
@@ -250,6 +308,7 @@ def _left_operand(
     *,
     transpose: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select MX data and scales for the requested left-operand layout."""
     if transpose:
         if not tensor.is_colwise():
             raise ValueError(
@@ -271,6 +330,7 @@ def _right_operand(
     *,
     transpose: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select MX data and scales for the requested right-operand layout."""
     if transpose:
         if not tensor.is_rowwise():
             raise ValueError(
