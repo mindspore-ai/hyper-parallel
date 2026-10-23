@@ -58,8 +58,8 @@ CP 总大小由训练的并行配置决定。`state_cp_method` 只选择状态 C
 
 | 参数 | 默认值 | 含义与约束 |
 |------|--------|------------|
-| `backend` | `triton` | 本地 KDA 后端。AG 和分组 AG 需要 `triton`；已有 P2P/Ulysses 支持 `eager`。 |
-| `state_cp_method` | `p2p` | 状态 CP 方式，可选 `p2p`、`allgather`、`grouped_allgather_p2p`。 |
+| `backend` | `triton` | 本地 KDA 后端。AG、分组 AG 和 RD 需要 `triton`；已有 P2P/Ulysses 支持 `eager`。 |
+| `state_cp_method` | `p2p` | 状态 CP 方式，可选 `p2p`、`allgather`、`grouped_allgather_p2p`、`recursive_doubling`。 |
 | `ulysses_degree` | `1` | U；正整数，必须整除 CP 大小，且 query/key head 数和 value head 数都必须能被 U 整除。 |
 | `allgather_group_size` | `1` | g；每个组内 AllGather 包含的状态 rank 数，必须整除 R。仅用于 `grouped_allgather_p2p`；纯 `allgather` 自动收集整个 R 组，此项保持1。 |
 
@@ -124,3 +124,8 @@ S/G 配对参照的是 Ascend 本地 h/dhu，FLA 通用 CP 摘要的舍入组织
 
 纯 P2P 且初态为零时，第一个状态 rank 不生成或保存没有后续读者的 M；AG 和分组 AG 仍为每个 rank
 保存本地 M。状态缓存按调用独立持有，以支持多个在途 forward、逆序 backward 与 checkpoint 重算。
+
+## 递归倍增扩展
+
+状态交换还可以选择 recursive_doubling，并与同一个 ulysses_degree 配置组合。
+适用条件、调用缓存和时间/显存取舍见 [KDA 递归倍增与 Ulysses 混合 CP](kda_recursive_doubling.md)。

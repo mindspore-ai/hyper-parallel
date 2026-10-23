@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""KDA state exchange through AllGather or grouped AllGather/P2P."""
+"""KDA state exchange and mesh construction for gathered or recursive scans."""
 # pylint: disable=forbidden-backend-import
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
+from hyper_parallel.distributed.context_parallel.kimi_delta_attention_rd import KDAStateRecursiveDoubling
 
 
 def _validate_mesh_order(mesh: DeviceMesh) -> None:
@@ -60,13 +61,13 @@ def build_kda_state_cp(mesh: DeviceMesh, protocol: str, allgather_group_size: in
 
     Args:
         mesh: One-dimensional mesh ordered along the state sequence.
-        protocol: p2p, allgather, or grouped_allgather_p2p.
+        protocol: p2p, allgather, grouped_allgather_p2p, or recursive_doubling.
         allgather_group_size: Consecutive ranks per local gather, only for the grouped protocol.
 
     Returns:
-        Gather executor, or None to select the existing P2P path.
+        State executor with an invocation-owned cache, or None for the P2P/local path.
     """
-    if protocol not in ("p2p", "allgather", "grouped_allgather_p2p"):
+    if protocol not in ("p2p", "allgather", "grouped_allgather_p2p", "recursive_doubling"):
         raise ValueError(f"Unknown KDA state_cp_method: {protocol!r}.")
     if not isinstance(allgather_group_size, int) or isinstance(allgather_group_size, bool) or allgather_group_size < 1:
         raise ValueError("KDA allgather_group_size must be a positive integer.")
@@ -76,6 +77,8 @@ def build_kda_state_cp(mesh: DeviceMesh, protocol: str, allgather_group_size: in
         return None
     ranks = tuple(mesh.rank_list)
     rank, size = mesh.get_local_rank(), mesh.size()
+    if protocol == "recursive_doubling":
+        return KDAStateRecursiveDoubling(mesh.get_group(), rank, ranks) if size > 1 else None
     if protocol == "allgather":
         _validate_mesh_order(mesh)
         return KDAStateAllGather(mesh.get_group(), rank, size)
@@ -163,30 +166,31 @@ class KDAStateAllGather:
             raise ValueError("AllGather requires a positive size and valid local rank.")
         self.group, self.rank, self.size = group, rank, size
 
-    def forward(self, state: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
-        """Return the incoming state; the caller saves its original local M.
+    def forward(self, state: torch.Tensor, matrix: torch.Tensor) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        """Return the incoming state and this invocation's original local M.
 
         Args:
             state: Local FP32 offset S [B,H,128,128].
             matrix: Local forward transfer M of the same shape.
 
         Returns:
-            This rank's incoming recurrent state.
+            This rank's incoming recurrent state and a one-tensor local M cache.
         """
         _validate_summary(state, matrix)
         maps = _gather_maps(state, matrix, self.group, self.size)
-        return merge_affine_summaries(maps[..., :128], maps[..., 128:], self.rank, True)
+        return merge_affine_summaries(maps[..., :128], maps[..., 128:], self.rank, True), (matrix,)
 
-    def backward(self, gradient: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
+    def backward(self, gradient: torch.Tensor, cache: tuple[torch.Tensor, ...]) -> torch.Tensor:
         """Collect new G with the saved local M and recover the outgoing gradient.
 
         Args:
             gradient: Local FP32 offset G [B,H,128,128].
-            matrix: This invocation's cached local forward M.
+            cache: One-tensor tuple containing this invocation's local forward M.
 
         Returns:
             This rank's outgoing recurrent-state gradient.
         """
+        matrix, = cache
         _validate_summary(gradient, matrix)
         maps = _gather_maps(gradient, matrix, self.group, self.size)
         return merge_affine_summaries(maps[..., :128], maps[..., 128:], self.rank, False)
@@ -257,7 +261,7 @@ class KDAStateAllGatherP2P:
             recv_handle = dist.irecv(incoming, src=self.ranks[peer], group=self.group)
         return incoming, recv_handle
 
-    def forward(self, state: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
+    def forward(self, state: torch.Tensor, matrix: torch.Tensor) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         """Relay ordered group scans and restore this rank's incoming state.
 
         Args:
@@ -265,7 +269,7 @@ class KDAStateAllGatherP2P:
             matrix: Local forward transfer M of the same shape.
 
         Returns:
-            This rank's incoming recurrent state.
+            This rank's incoming recurrent state and a one-tensor local M cache.
         """
         _validate_summary(state, matrix)
         incoming, recv_handle = self._receive(state, True)
@@ -285,18 +289,19 @@ class KDAStateAllGatherP2P:
             result, _ = _scan_maps(maps, incoming, range(self.local), True)
         if send_handle is not None:
             send_handle.wait()
-        return result
+        return result, (matrix,)
 
-    def backward(self, gradient: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
+    def backward(self, gradient: torch.Tensor, cache: tuple[torch.Tensor, ...]) -> torch.Tensor:
         """Regather G/M and reverse the owner chain with ordered state feedback.
 
         Args:
             gradient: Local FP32 offset G [B,H,128,128].
-            matrix: This invocation's cached local forward M.
+            cache: One-tensor tuple containing this invocation's local forward M.
 
         Returns:
             This rank's outgoing recurrent-state gradient.
         """
+        matrix, = cache
         _validate_summary(gradient, matrix)
         incoming, recv_handle = self._receive(gradient, False)
         maps = _gather_maps(gradient, matrix, self.intra, self.width)
