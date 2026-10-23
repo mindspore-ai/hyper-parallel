@@ -54,12 +54,12 @@ def _rescale_attention_outputs(
     )
 
 
-def _normal_attention_backward(ctx, grad_rescaled_output):
+def _normal_attention_backward(ctx, grad_rescaled_output, saved_tensors):
     """Compute the normal branch's Q/K/V gradients."""
     (
         query, key, value, sink_key, _, attention_mask, softmax_max, softmax_sum,
         _, _, rescaled_output, output_scale, _,
-    ) = ctx.saved_tensors
+    ) = saved_tensors
     grad_output = rearrange(output_scale * grad_rescaled_output, "s b n d -> (b s) n d")
     return torch_npu.npu_fusion_attention_grad(
         query, key, value, grad_output.to(sink_key.dtype), ctx.num_heads, "TND",
@@ -81,12 +81,12 @@ def _normal_attention_backward(ctx, grad_rescaled_output):
     )[:3]
 
 
-def _sink_attention_backward(ctx, grad_rescaled_output):
+def _sink_attention_backward(ctx, grad_rescaled_output, saved_tensors):
     """Compute sink gradients and restore the query gradient's TND layout."""
     (
         query, _, _, sink_key, sink_value, _, _, _,
         sink_softmax_max, sink_softmax_sum, rescaled_output, _, sink_scale,
-    ) = ctx.saved_tensors
+    ) = saved_tensors
     sink_query = rearrange(query, "(b s) n d -> s b (n d)", b=ctx.batch_size, s=ctx.sequence_length)
     grad_output = rearrange(sink_scale * grad_rescaled_output, "s b n d -> s b (n d)")
     grad_query, grad_key, grad_value = torch_npu.npu_fusion_attention_grad(
@@ -133,7 +133,21 @@ class _AttentionRescale(torch.autograd.Function):
         actual_seq_qlen: Optional[Sequence[int]],
         actual_seq_kvlen: Optional[Sequence[int]],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Run normal and sink fusion attention and rescale their outputs."""
+        """Run normal and sink fusion attention and rescale their outputs.
+
+        Args:
+            ctx: Autograd context used to retain backward inputs.
+            query, key, value: Inputs for the normal attention branch.
+            sink_key, sink_value: Key and value inputs for the sink branch.
+            attention_mask: Mask applied to the normal attention branch.
+            batch_size, sequence_length: Input batch and sequence dimensions.
+            num_heads: Number of attention heads.
+            scale: Attention score scale.
+            pre_tokens, next_tokens: Sparse-attention token limits.
+            keep_prob: Attention dropout keep probability.
+            sparse_mode: Sparse-attention mode.
+            actual_seq_qlen, actual_seq_kvlen: Cumulative query and key/value lengths.
+        """
         output, softmax_max, softmax_sum = torch_npu.npu_fusion_attention(
             query,
             key,
@@ -210,10 +224,19 @@ class _AttentionRescale(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, grad_rescaled_output: torch.Tensor, grad_softmax_max: torch.Tensor) -> tuple:
-        """Run the explicit fusion-attention backward operators."""
+        """Run the explicit fusion-attention backward operators.
+
+        Args:
+            ctx: Autograd context containing the saved forward tensors.
+            grad_rescaled_output: Gradient of the rescaled attention output.
+            grad_softmax_max: Unused gradient of the auxiliary softmax maximum.
+        """
         del grad_softmax_max
-        grad_query, grad_key, grad_value = _normal_attention_backward(ctx, grad_rescaled_output)
-        sink_grad_query, sink_grad_key, sink_grad_value = _sink_attention_backward(ctx, grad_rescaled_output)
+        saved_tensors = ctx.saved_tensors
+        grad_query, grad_key, grad_value = _normal_attention_backward(ctx, grad_rescaled_output, saved_tensors)
+        sink_grad_query, sink_grad_key, sink_grad_value = _sink_attention_backward(
+            ctx, grad_rescaled_output, saved_tensors,
+        )
         return (
             grad_query + sink_grad_query,
             grad_key,
@@ -246,7 +269,19 @@ def attention_rescale(
 
     Query, key, and value use TND layout. Sink key and value use SBH layout.
     Sequence lengths are cumulative Python sequences, as required by the
-    torch-npu TND fusion-attention interface.
+    NPU TND fusion-attention interface.
+
+    Args:
+        query, key, value: Inputs for the normal attention branch.
+        sink_key, sink_value: Key and value inputs for the sink branch.
+        attention_mask: Mask applied to the normal attention branch.
+        batch_size, sequence_length: Input batch and sequence dimensions.
+        num_heads: Number of attention heads.
+        scale: Attention score scale.
+        pre_tokens, next_tokens: Sparse-attention token limits.
+        keep_prob: Attention dropout keep probability.
+        sparse_mode: Sparse-attention mode.
+        actual_seq_qlen, actual_seq_kvlen: Cumulative query and key/value lengths.
 
     Returns:
         Rescaled attention output in SBND layout and the normal attention

@@ -165,6 +165,29 @@ def test_planner_internal_structure(tiny_llama):
         {"zzz.qqq.weight": ParamRole.SKIP})
     assert set(groups) == {"zzz.qqq"}, "case: boundary/backtrack_to_root_unknown"
 
+    # ---- case: test_root_unknown_siblings_keep_their_owners ----
+    # Unrelated unknown subtrees may merge while backtracking to the root.
+    # They must be split by their real owners instead of inheriting the first
+    # owner's FQN, otherwise relative paths are silently truncated (for
+    # example norm_gamma -> rm_gamma).
+    roles = {
+        "model.layers.0.attn_mhc_pre_module.norm_gamma": ParamRole.NORM,
+        "model.layers.0.attn_mhc_pre_module.phi.weight": ParamRole.SKIP,
+        "model.layers.0.mlp_mhc_pre_module.norm_gamma": ParamRole.NORM,
+        "model.layers.0.mlp_mhc_pre_module.phi.weight": ParamRole.SKIP,
+    }
+    groups = ShardingPlanner()._group_by_boundary(roles)
+    assert set(groups) == {
+        "model.layers.0.attn_mhc_pre_module",
+        "model.layers.0.attn_mhc_pre_module.phi",
+        "model.layers.0.mlp_mhc_pre_module",
+        "model.layers.0.mlp_mhc_pre_module.phi",
+    }, "case: boundary/root_unknown_siblings_keep_their_owners"
+    for boundary, params in groups.items():
+        assert all(
+            param_fqn.startswith(f"{boundary}.") for param_fqn, _ in params
+        ), "case: boundary/root_unknown_siblings_have_valid_relative_paths"
+
     # ---- case: test_skip_params_fold_into_boundary ----
     # SKIP params fold upward into the enclosing boundary, no separate group.
     roles = {

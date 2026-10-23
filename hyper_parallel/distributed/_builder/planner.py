@@ -715,10 +715,14 @@ class ShardingPlanner:
                     merged[parent].extend(params)
                 else:
                     # Still unknown after backtracking to the root:
-                    # attribute to the parameter's own module (no template
-                    # will match later → skipped)
-                    origin = ".".join(params[0][0].split(".")[:-1]) if params else mfqn
-                    groups.setdefault(origin, params)
+                    # attribute each parameter to its own module (no template
+                    # will match later → skipped). Unrelated unknown
+                    # subtrees may have merged at the root, so anchoring the
+                    # whole group to the first parameter would produce invalid
+                    # relative names for the remaining parameters.
+                    for param_fqn, role in params:
+                        origin = param_fqn.rsplit(".", 1)[0]
+                        groups.setdefault(origin, []).append((param_fqn, role))
         return groups
 
     # ── Phase 3 ─────────────────────────────────────────────────────────
