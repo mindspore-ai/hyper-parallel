@@ -174,7 +174,10 @@ class _MulticoreResourceManager:
                 self._groups.pop(group.identifier, None)
         if self.runtime_release is not None and not any(group.resources is not None
                                                         for group in self._groups.values()):
-            _automatic.collective_call(lambda: self._release_runtime(self.runtime_release))
+            _automatic.collective_call(
+                lambda: self._release_runtime(self.runtime_release),
+                stage="multicore Runtime release",
+            )
             self.runtime_release = None
             self._runtime_released = False
 
@@ -200,10 +203,10 @@ class _MulticoreResourceManager:
             raise RuntimeError("multicore cleanup requires idle workspaces and no pending backward graphs")
 
     def _close_group_collectively(self, group: _ExecutionResourceGroup) -> None:
-        """Keep a failed group reachable and prevent peers from advancing past it."""
+        """Close group resources collectively while retaining ownership on failure."""
         group.closing = True
-        _automatic.collective_call(group.resources.close)
-        # Commit ownership only after peers also succeed; retries need the same manifest.
+        _automatic.collective_call(group.resources.close, stage="multicore resource close")
+        # Ownership transfers only after every peer succeeds; retries require the same manifest.
         group.resources = None
         group.binding = None
         group.closed = True

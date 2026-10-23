@@ -39,9 +39,7 @@ const char *StateName(State state) {
   return "Unknown";
 }
 
-const char *DataEngineName(DataEngine engine) {
-  return engine == DataEngine::Mte ? "mte" : "unknown";
-}
+const char *DataEngineName(DataEngine engine) { return engine == DataEngine::Mte ? "mte" : "unknown"; }
 
 DfxPhase PhaseForDeviceStatus(const Status &status) {
   return status.error_code == ErrorCode::CannError || status.error_code == ErrorCode::Timeout ? DfxPhase::CannCall
@@ -88,20 +86,32 @@ Status Runtime::Initialize(const RootWorldInfo &root, const Config &config,
   allocations_.emplace(device_identity_->device_index, next_allocation_id_);
   config_.emplace(config);
 
-  const cann::InitOptions options{root.root_rank,         root.root_size,     config.heap_size_bytes,
-                                  config.timeout_seconds, config.data_engine, effective_bootstrap_endpoint, unique_id};
-  HP_SM_LOG_DEBUG(root.root_rank, "op=Initialize call=aclshmemx_init_attr enter");
+  const cann::InitOptions options{root.root_rank,
+                                  root.root_size,
+                                  config.heap_size_bytes,
+                                  config.timeout_seconds,
+                                  config.data_engine,
+                                  effective_bootstrap_endpoint,
+                                  unique_id};
+  HP_SM_LOG_DEBUG(root.root_rank, "Initialize", "CannCall", "aclshmemx_init_attr enter");
   const Status initialize_status = cann::host::initialize(options);
   if (initialize_status.error_code != ErrorCode::Ok) {
-    return FailInitialization(DfxPhase::CannCall, root.root_rank, initialize_status, __FILE__, __LINE__);
+    Status failure = initialize_status;
+    const std::string prefix =
+      "SHMEM initialization failed on NPU device " + std::to_string(device_identity_->device_index) + ": ";
+    failure.message = prefix + failure.message;
+    if (failure.log_message.has_value()) {
+      *failure.log_message = prefix + *failure.log_message;
+    }
+    return FailInitialization(DfxPhase::CannCall, root.root_rank, failure, __FILE__, __LINE__);
   }
-  HP_SM_LOG_DEBUG(root.root_rank, "op=Initialize call=aclshmemx_init_attr ok");
+  HP_SM_LOG_DEBUG(root.root_rank, "Initialize", "CannCall", "aclshmemx_init_attr ok");
 
   latest_failure_.reset();
   leaked_allocations_.clear();
   state_ = State::Ready;
-  HP_SM_LOG_INFO(root.root_rank, "op=Initialize ok root=%d/%d heap=%" PRIu64
-                 " timeout=%u engine=%s bootstrap=%s endpoint=%.*s",
+  HP_SM_LOG_INFO(root.root_rank, "Initialize", "Complete",
+                 "root=%d/%d heap_bytes=%" PRIu64 " timeout_seconds=%u engine=%s bootstrap=%s endpoint=%.*s",
                  root.root_rank, root.root_size, config.heap_size_bytes, config.timeout_seconds,
                  DataEngineName(config.data_engine), unique_id.empty() ? "endpoint" : "unique_id",
                  static_cast<int>(effective_bootstrap_endpoint.size()), effective_bootstrap_endpoint.data());
@@ -184,7 +194,7 @@ Result<AllocationRecord> Runtime::Allocate(const AllocationSpec &spec) {
 
   const bool has_explicit_alignment = spec.alignment_bytes != 0;
   const char *allocation_call = has_explicit_alignment ? "aclshmem_align" : "aclshmem_malloc";
-  HP_SM_LOG_DEBUG(root_rank, "op=Allocate call=%s enter bytes=%" PRIu64 " alignment=%" PRIu64, allocation_call,
+  HP_SM_LOG_DEBUG(root_rank, "Allocate", "CannCall", "%s enter bytes=%" PRIu64 " alignment=%" PRIu64, allocation_call,
                   spec.bytes, spec.alignment_bytes);
   const auto allocation = has_explicit_alignment ? cann::host::aligned_allocate(spec.alignment_bytes, spec.bytes)
                                                  : cann::host::allocate(spec.bytes);
@@ -194,7 +204,8 @@ Result<AllocationRecord> Runtime::Allocate(const AllocationSpec &spec) {
   }
 
   const AllocationRecord record = allocations_->Register(spec, allocation.value());
-  HP_SM_LOG_DEBUG(root_rank, "op=Allocate call=%s ok allocation_id=%" PRIu64, allocation_call, record.allocation_id);
+  HP_SM_LOG_DEBUG(root_rank, "Allocate", "CannCall", "%s ok allocation_id=%" PRIu64, allocation_call,
+                  record.allocation_id);
   return Result<AllocationRecord>::Success(record);
 }
 
@@ -220,10 +231,10 @@ Status Runtime::Free(const AllocationView &buffer) {
     return device_status;
   }
 
-  HP_SM_LOG_DEBUG(root_rank, "op=Free call=aclshmem_free enter allocation_id=%" PRIu64, buffer.allocation_id);
+  HP_SM_LOG_DEBUG(root_rank, "Free", "CannCall", "aclshmem_free enter allocation_id=%" PRIu64, buffer.allocation_id);
   cann::host::free_memory(record.value().allocation_base);
   allocations_->Remove(buffer.allocation_id);
-  HP_SM_LOG_DEBUG(root_rank, "op=Free call=aclshmem_free ok allocation_id=%" PRIu64, buffer.allocation_id);
+  HP_SM_LOG_DEBUG(root_rank, "Free", "CannCall", "aclshmem_free ok allocation_id=%" PRIu64, buffer.allocation_id);
   return Status{};
 }
 
@@ -255,9 +266,9 @@ Status Runtime::Barrier(const StreamView &stream) {
     return error;
   }
 
-  HP_SM_LOG_DEBUG(root_rank, "op=Barrier call=aclshmemx_barrier_on_stream enter");
+  HP_SM_LOG_DEBUG(root_rank, "Barrier", "Enqueue", "aclshmemx_barrier_on_stream enter");
   cann::host::barrier_on_stream(stream);
-  HP_SM_LOG_DEBUG(root_rank, "op=Barrier call=aclshmemx_barrier_on_stream ok enqueue_only=true");
+  HP_SM_LOG_DEBUG(root_rank, "Barrier", "Enqueue", "aclshmemx_barrier_on_stream ok enqueue_only=true");
   return Status{};
 }
 
@@ -281,8 +292,7 @@ DfxSnapshot Runtime::DebugState() const {
 
 void Runtime::RecordLeak(uint64_t allocation_id, uintptr_t allocation_base, uint64_t allocation_bytes) {
   std::lock_guard<std::mutex> lock(mutex_);
-  leaked_allocations_.push_back(
-    AllocationRecord{allocation_id, allocation_base, allocation_bytes, 0});
+  leaked_allocations_.push_back(AllocationRecord{allocation_id, allocation_base, allocation_bytes, 0});
 }
 
 Status Runtime::Shutdown() {
@@ -310,16 +320,17 @@ Status Runtime::Shutdown() {
     return error;
   }
 
-  HP_SM_LOG_DEBUG(root_rank, "op=Shutdown call=aclshmem_finalize enter");
+  HP_SM_LOG_DEBUG(root_rank, "Shutdown", "CannCall", "aclshmem_finalize enter");
   const Status finalize_status = cann::host::finalize();
   if (finalize_status.error_code != ErrorCode::Ok) {
     state_ = State::ShutdownFailed;
     RecordFailure(DfxOperation::Shutdown, DfxPhase::CannCall, root_rank, finalize_status, __FILE__, __LINE__);
     return finalize_status;
   }
-  HP_SM_LOG_DEBUG(root_rank, "op=Shutdown call=aclshmem_finalize ok");
+  HP_SM_LOG_DEBUG(root_rank, "Shutdown", "CannCall", "aclshmem_finalize ok");
   next_allocation_id_ = allocations_->next_allocation_id();
-  HP_SM_LOG_INFO(root_rank, "op=Shutdown ok mode=finalize active_allocations_at_shutdown=0 active_bytes_at_shutdown=0");
+  HP_SM_LOG_INFO(root_rank, "Shutdown", "Complete",
+                 "mode=finalize active_allocations_at_shutdown=0 active_bytes_at_shutdown=0");
   allocations_.reset();
   device_identity_.reset();
   root_.reset();

@@ -112,9 +112,7 @@ std::string_view ToString(DeviceModel model) {
   return "unknown";
 }
 
-std::string_view ToString(DataEngine engine) {
-  return engine == DataEngine::Mte ? "mte" : "Unknown";
-}
+std::string_view ToString(DataEngine engine) { return engine == DataEngine::Mte ? "mte" : "Unknown"; }
 
 std::string_view ToString(DfxOperation operation) {
   switch (operation) {
@@ -380,7 +378,7 @@ AllocationView TensorView(const at::Tensor &tensor) {
   c10::StorageImpl *storage = tensor.storage().unsafeGetStorageImpl();
   if (tensor.numel() > 0 && storage->nbytes() == 0) {
     throw std::runtime_error(
-        "Tensor Storage was invalidated by shmem.free(); the Tensor and its views can no longer be used");
+      "Tensor Storage was invalidated by shmem.free(); the Tensor and its views can no longer be used");
   }
   if (tensor.numel() > 0 && tensor.data_ptr() == nullptr) {
     throw std::runtime_error("Tensor data pointer must not be null");
@@ -402,9 +400,7 @@ AllocationView TensorView(const at::Tensor &tensor) {
                         static_cast<int32_t>(tensor.device().index())};
 }
 
-py::bytes GetUniqueId() {
-  return py::bytes(UnwrapOperation(cann::host::get_unique_id(), "GetUniqueId"));
-}
+py::bytes GetUniqueId() { return py::bytes(UnwrapOperation(cann::host::get_unique_id(), "GetUniqueId")); }
 
 void Initialize(int32_t root_rank, int32_t root_size, const py::bytes &unique_id, uint64_t heap_size_bytes) {
   const auto config = runtime::LoadConfigFromEnvironment();
@@ -438,12 +434,12 @@ at::Tensor Empty(const std::vector<int64_t> &shape, c10::ScalarType dtype, const
       Runtime::Instance().RecordLeak(association->allocation_id, association->allocation_base,
                                      association->allocation_bytes);
       runtime::log::Line(
-        runtime::log::Level::Error, association->root_rank, __FILE__, __LINE__,
-        "op=StorageRelease orphaned=true allocation_id=%" PRIu64 " allocation_base=0x%" PRIx64
-        " allocation_bytes=%" PRIu64 " "
-        "msg=\"The last Tensor Storage reference was dropped without shmem.free(). The Allocation remains active "
+        runtime::log::Level::Error, association->root_rank, __FILE__, __LINE__, "StorageRelease", "Validation",
+        "orphaned=true allocation_id=%" PRIu64 " allocation_base=0x%" PRIx64 " allocation_bytes=%" PRIu64
+        " "
+        "The last Tensor Storage reference was dropped without shmem.free(). The Allocation remains active "
         "and cannot be freed through the Tensor API. Call shmem.free(tensor) before overwriting or dropping its "
-        "last reference. The final shmem.release() will fail; restart the process to recover.\"",
+        "last reference. The final shmem.release() will fail; restart the process to recover.",
         association->allocation_id, association->allocation_base, association->allocation_bytes);
     }
   };
@@ -588,9 +584,9 @@ void Put(const at::Tensor &remote_dst, const at::Tensor &local_src, int64_t targ
     return;
   }
   const StreamView stream = PrepareTensorStream(remote_dst.device(), kOperation);
-  HP_SM_LOG_DEBUG(UnwrapRuntime(Runtime::Instance().RootRank(), kOperation),
-                  "op=put enqueue target_pe=%d bytes=%" PRIu64 " remote_addr=%p local_addr=%p", root_pe, bytes,
-                  remote_dst.data_ptr(), local_src.data_ptr());
+  HP_SM_LOG_DEBUG(UnwrapRuntime(Runtime::Instance().RootRank(), kOperation), "Put", "Enqueue",
+                  "target_pe=%d bytes=%" PRIu64 " remote_addr=%p local_addr=%p", root_pe, bytes, remote_dst.data_ptr(),
+                  local_src.data_ptr());
   cann::host::put_on_stream(reinterpret_cast<uintptr_t>(remote_dst.data_ptr()),
                             reinterpret_cast<uintptr_t>(local_src.data_ptr()), bytes, root_pe, stream);
 }
@@ -612,9 +608,9 @@ void Get(const at::Tensor &local_dst, const at::Tensor &remote_src, int64_t sour
     return;
   }
   const StreamView stream = PrepareTensorStream(local_dst.device(), kOperation);
-  HP_SM_LOG_DEBUG(UnwrapRuntime(Runtime::Instance().RootRank(), kOperation),
-                  "op=get enqueue source_pe=%d bytes=%" PRIu64 " local_addr=%p remote_addr=%p", root_pe, bytes,
-                  local_dst.data_ptr(), remote_src.data_ptr());
+  HP_SM_LOG_DEBUG(UnwrapRuntime(Runtime::Instance().RootRank(), kOperation), "Get", "Enqueue",
+                  "source_pe=%d bytes=%" PRIu64 " local_addr=%p remote_addr=%p", root_pe, bytes, local_dst.data_ptr(),
+                  remote_src.data_ptr());
   cann::host::get_on_stream(reinterpret_cast<uintptr_t>(local_dst.data_ptr()),
                             reinterpret_cast<uintptr_t>(remote_src.data_ptr()), bytes, root_pe, stream);
 }
@@ -634,8 +630,8 @@ void Signal(const at::Tensor &remote_signal, int64_t value, int64_t target_pe, c
   ValidateSignalTensor(remote_signal, kOperation);
   const int32_t root_pe = ValidateRootPe(target_pe, "target_pe", kOperation);
   const StreamView stream = PrepareTensorStream(remote_signal.device(), kOperation);
-  HP_SM_LOG_DEBUG(UnwrapRuntime(Runtime::Instance().RootRank(), kOperation),
-                  "op=signal enqueue target_pe=%d value=%d signal_op=%d remote_addr=%p", root_pe, signal_value,
+  HP_SM_LOG_DEBUG(UnwrapRuntime(Runtime::Instance().RootRank(), kOperation), "Signal", "Enqueue",
+                  "target_pe=%d value=%d signal_op=%d remote_addr=%p", root_pe, signal_value,
                   static_cast<int>(signal_op), remote_signal.data_ptr());
   cann::host::signal_on_stream(reinterpret_cast<uintptr_t>(remote_signal.data_ptr()), signal_value, signal_op, root_pe,
                                stream);
@@ -647,9 +643,9 @@ void WaitSignal(const at::Tensor &signal, int64_t value, const py::object &compa
   const int32_t signal_value = ValidateSignalValue(value);
   ValidateSignalTensor(signal, kOperation);
   const StreamView stream = PrepareTensorStream(signal.device(), kOperation);
-  HP_SM_LOG_DEBUG(UnwrapRuntime(Runtime::Instance().RootRank(), kOperation),
-                  "op=wait_signal enqueue value=%d compare_op=%d local_addr=%p", signal_value,
-                  static_cast<int>(compare_op), signal.data_ptr());
+  HP_SM_LOG_DEBUG(UnwrapRuntime(Runtime::Instance().RootRank(), kOperation), "WaitSignal", "Enqueue",
+                  "value=%d compare_op=%d local_addr=%p", signal_value, static_cast<int>(compare_op),
+                  signal.data_ptr());
   cann::host::wait_signal_on_stream(reinterpret_cast<uintptr_t>(signal.data_ptr()), compare_op, signal_value, stream);
 }
 
@@ -660,9 +656,8 @@ void AllGather(const at::Tensor &output, const at::Tensor &input) {
   const int32_t root_size = UnwrapRuntime(Runtime::Instance().RootSize(), kOperation);
   const DeviceModel device_model = UnwrapRuntime(Runtime::Instance().QueryDeviceModel(), kOperation);
   if (device_model == DeviceModel::kAscend950) {
-    ThrowStatus(
-      Status{ErrorCode::UnsupportedCapability, std::nullopt, "all_gather does not support Ascend 950"},
-      kOperation, DfxPhase::Validation);
+    ThrowStatus(Status{ErrorCode::UnsupportedCapability, std::nullopt, "all_gather does not support Ascend 950"},
+                kOperation, DfxPhase::Validation);
   }
 
   ValidateContiguousNpuTensor(output, "output");
@@ -710,8 +705,10 @@ void AllGather(const at::Tensor &output, const at::Tensor &input) {
     ShmemKernel::aclshmem_all_gather(reinterpret_cast<aclrtStream>(stream_handle), output.data_ptr(), input.data_ptr(),
                                      input_bytes, root_rank, root_size);
   if (launch_error != ACL_SUCCESS) {
+    const std::string message =
+      "all_gather kernel launch failed: ACL_ERROR(" + std::to_string(static_cast<int32_t>(launch_error)) + ")";
     ThrowStatus(
-      Status{ErrorCode::CannError, static_cast<int32_t>(launch_error), "all_gather kernel launch failed"},
+      Status{ErrorCode::CannError, static_cast<int32_t>(launch_error), message, "all_gather kernel launch failed"},
       kOperation, DfxPhase::CannCall);
   }
 }
@@ -789,6 +786,12 @@ py::dict DebugState() {
   return result;
 }
 
+void log_debug(const std::string &message) {
+  const auto root_rank = Runtime::Instance().RootRank();
+  runtime::log::Line(runtime::log::Level::Debug, root_rank.ok() ? root_rank.value() : -1, "_api.py", 0, "Allocate",
+                     "Callsite", "%s", message.c_str());
+}
+
 }  // namespace
 }  // namespace hyper_parallel::multicore::shmem::bindings
 
@@ -809,6 +812,7 @@ PYBIND11_MODULE(hyper_parallel_shmem_torch, module) {
   module.def("_wait_signal", &bindings::WaitSignal, py::arg("signal"), py::arg("value"), py::kw_only(),
              py::arg("comparison") = "eq");
   module.def("_all_gather", &bindings::AllGather, py::arg("output"), py::arg("input"));
+  module.def("_log_debug", &bindings::log_debug, py::arg("message"));
   module.def("_debug_state", &bindings::DebugState);
   module.def("_validate_shutdown", &bindings::ValidateShutdown);
   module.def("_shutdown",

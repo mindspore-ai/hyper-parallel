@@ -15,6 +15,7 @@
 """NPU workers for SHMEM Runtime lifecycle system tests."""
 
 import os
+import re
 import time
 
 import pytest
@@ -177,16 +178,50 @@ def test_binding_final_release_with_active_allocation_is_retryable() -> None:
     dist.destroy_process_group()
 
 
-def test_binding_init_timeout_injection() -> None:
+def test_binding_init_timeout_injection(capfd: pytest.CaptureFixture[str]) -> None:
     """Surface an unreachable bootstrap endpoint as a prompt RuntimeError, not a hang."""
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.npu.set_device(local_rank)
+    device_index = torch.npu.current_device()
     dist.init_process_group(backend="hccl")
 
     started = time.monotonic()
     with pytest.raises(RuntimeError) as exc_info:
         shmem.acquire()
     elapsed = time.monotonic() - started
-    print(f"[init-timeout] rank={local_rank} elapsed={elapsed:.2f}s error={exc_info.value}")
+    error = str(exc_info.value)
+    captured = capfd.readouterr()
+    native_log = captured.out + captured.err
+    print(f"[init-timeout] rank={local_rank} elapsed={elapsed:.2f}s error={error}\n{native_log}")
     assert elapsed < 60, f"Init failure must return promptly: rank={local_rank}, elapsed={elapsed:.2f}s"
+    assert f"SHMEM initialization failed on NPU device {device_index}" in error, error
+    assert "ACLSHMEM_" in error, error
+    if "cann_detail=" in error:
+        assert "cann_detail=[[SHM_SHMEM" in error, error
+        assert 'cann_detail="' not in error, error
+        assert "\n" not in error and "\r" not in error, error
+    cann_failures = [line for line in native_log.splitlines() if "[SHM_SHMEM " in line]
+    cann_prefix = re.compile(
+        r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6} error \d+ pid\[\d+\] "
+        r"\[SHM_SHMEM [^]]+:\d+\] "
+    )
+    assert all(cann_prefix.match(line) for line in cann_failures), cann_failures
+    assert "[rank -1]" not in native_log and "[rank unknown]" not in native_log, native_log
+    runtime_failures = [
+        line
+        for line in native_log.splitlines()
+        if "[HP_SHMEM " in line and "[Initialize|CannCall]" in line
+    ]
+    assert runtime_failures, f"expected a Runtime failure log, got output={native_log!r}"
+    runtime_prefix = re.compile(
+        r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6} error \d+ pid\[\d+\] "
+        r"\[HP_SHMEM runtime\.cpp:\d+\] \[rank 0\] \[Initialize\|CannCall\] "
+    )
+    assert all(runtime_prefix.match(line) for line in runtime_failures), runtime_failures
+    for line in runtime_failures:
+        assert " op=" not in line and " phase=" not in line and " error=" not in line and " msg=" not in line, line
+        assert re.search(r"ACLSHMEM_[A-Z_]+\(-?\d+\)", line), line
+        assert "CANN_ERROR" not in line, line
+        assert "cann_detail=" not in line and "[SHM_SHMEM " not in line, line
+        assert '"' not in line, f"expected a single-line Runtime message without quoting, got line={line!r}"
     dist.destroy_process_group()

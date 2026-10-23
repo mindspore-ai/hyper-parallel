@@ -16,9 +16,12 @@ Multicore 只有 `--multicore on|off` 开关，默认 on。SHMEM 是内部组件
 一起编译和打包，没有独立开关。off 不构建或打包 Multicore/SHMEM native 制品。
 `--strict on` 使组件编译失败时立即终止；默认 off 保留主入口原有的可选组件行为。
 
-SHMEM 构建保持锁定的上游 Git 源码不变，只在隔离副本应用经过 SHA256 校验的
-`cann_runtime_symbols.patch`。该适配使 SDK 从 `libruntime.so` 加载必需的 `rt*` 接口，
-兼容 `libascendcl.so` 不依赖 Runtime 库的 CANN 布局；缺失必需符号仍会导致初始化失败。
+SHMEM构建使用锁定的上游Git源码，并仅在隔离副本应用经过SHA256校验的
+`cann_runtime_symbols.patch`和`cann_shmem_log_api.patch`。`cann_runtime_symbols.patch`使SDK从
+`libruntime.so`加载必需的`rt*`接口，适配`libascendcl.so`不依赖Runtime库的CANN布局；
+`cann_shmem_log_api.patch`提供私有`hpshmem_log`接口，使HP-SHMEM复用CANN SHMEM内置日志sink。
+`hpshmem_log`的唯一C ABI声明位于`include/host/utils/hpshmem_log.h`，CANN include安装规则将其安装至
+私有SDK。缺失必需符号会导致构建或初始化失败。
 
 主入口调用本目录的 `build.sh` 并统一组包。业务入口负责私有 SHMEM、Torch adapter
 和正反向 vendor；依赖版本固定在 `_build/dependencies.lock.json`。

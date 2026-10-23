@@ -18,6 +18,7 @@ project(hyper_parallel_shmem_torch LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/hardening.cmake)
+include(CTest)
 
 # Generate position-independent code.
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -127,6 +128,7 @@ add_library(hyper_parallel_shmem_runtime STATIC
     runtime/log.cpp
     runtime/runtime.cpp
     cann/host.cpp
+    cann/log.cpp
 )
 target_include_directories(hyper_parallel_shmem_runtime PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -134,6 +136,31 @@ target_include_directories(hyper_parallel_shmem_runtime PRIVATE
     ${SHMEM_HOME_PATH}/shmem/include
 )
 hp_enable_compile_hardening(hyper_parallel_shmem_runtime)
+
+if(BUILD_TESTING)
+    find_package(Threads REQUIRED)
+    add_executable(hyper_parallel_shmem_native_log_test
+        ${CMAKE_CURRENT_LIST_DIR}/../../../../../tests/ut/core/multicore/shmem/native_log_test.cpp
+        runtime/log.cpp
+        cann/log.cpp
+    )
+    target_include_directories(hyper_parallel_shmem_native_log_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${ASCEND_HOME_PATH}/include
+        ${SHMEM_HOME_PATH}/shmem/include
+    )
+    target_link_libraries(hyper_parallel_shmem_native_log_test PRIVATE Threads::Threads)
+    hp_enable_compile_hardening(hyper_parallel_shmem_native_log_test)
+    add_test(NAME shmem_log_capture COMMAND hyper_parallel_shmem_native_log_test capture)
+    set_tests_properties(shmem_log_capture PROPERTIES TIMEOUT 10)
+    foreach(log_level IN ITEMS DEBUG INFO WARN ERROR FATAL INVALID)
+        string(TOLOWER ${log_level} log_level_name)
+        add_test(NAME shmem_log_level_${log_level_name}
+            COMMAND hyper_parallel_shmem_native_log_test ${log_level})
+        set_tests_properties(shmem_log_level_${log_level_name} PROPERTIES
+            ENVIRONMENT "SHMEM_LOG_LEVEL=${log_level}")
+    endforeach()
+endif()
 
 # pybind11 Torch binding module, imported by name from Python.
 add_library(hyper_parallel_shmem_torch MODULE

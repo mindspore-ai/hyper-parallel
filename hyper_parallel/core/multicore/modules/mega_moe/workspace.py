@@ -26,7 +26,7 @@ from typing import Any
 
 import torch
 
-from hyper_parallel.core.multicore import _automatic, shmem
+from hyper_parallel.core.multicore import _collective, shmem
 from hyper_parallel.core.multicore.scheduler.config import (
     MIN_EVENT_CAPACITY,
     event_workspace_bytes,
@@ -385,7 +385,12 @@ class MegaMoeWorkspace:
             remaining = tuple(tensor is not None for tensor in (
                 self.source_buffer, self.expert_buffer, self.routed_buffer,
                 self.forward_event_counters, self.backward_event_counters))
-            if any(peer != remaining for peer in _automatic.exchange(remaining)):
+            peers = _collective.exchange(
+                remaining,
+                group=self._root_group(),
+                failure_prefix="MegaMoe symmetric workspace release failed while converging rank results",
+            )
+            if any(peer != remaining for peer in peers):
                 raise RuntimeError("partial symmetric teardown differs across ranks; restart the process")
         for field_name in (
             "source_buffer",
@@ -413,8 +418,14 @@ class MegaMoeWorkspace:
             tensor.untyped_storage().resize_(0)
             setattr(self, field_name, None)
 
+    def _root_group(self) -> Any:
+        """Require an owning manager for collective teardown without a default-group fallback."""
+        if self.heap_manager is None:
+            raise RuntimeError("MegaMoe workspace collective teardown requires an owning HeapManager")
+        return self.heap_manager.root_group
+
     def close(self) -> None:
-        """Synchronize and release physical buffers."""
+        """Synchronize and release physical buffers on the owning HeapManager's Root."""
         with self._access(), self.lock:
             if self.in_use:
                 raise RuntimeError("cannot close MegaMoe workspace during an active call.")
@@ -430,18 +441,34 @@ class MegaMoeWorkspace:
                 self.swiglu_grad_workspace,
                 self.completion_event,
             ))
+            root_group = self._root_group()
             self.closing = True
         # An empty rank must still participate when peers retain buffers after a failure.
-        if all(_automatic.exchange(empty)):
+        peers = _collective.exchange(
+            empty, group=root_group, failure_prefix="MegaMoe workspace close failed while converging rank results",
+        )
+        if all(peers):
             self.closing = True
             return
-        _automatic.collective_call(lambda: None if empty else torch.npu.synchronize(self.device))
+        _collective.collective_call(
+            lambda: None if empty else torch.npu.synchronize(self.device),
+            stage="MegaMoe workspace synchronization",
+            group=root_group,
+        )
         # Workspace teardown requires each collective barrier to complete before
         # the following free or local Tensor release.
         shmem.host_barrier()
-        _automatic.collective_call(self._free_symmetric_tensors)
+        _collective.collective_call(
+            self._free_symmetric_tensors,
+            stage="MegaMoe symmetric workspace release",
+            group=root_group,
+        )
         shmem.host_barrier()
-        _automatic.collective_call(self._free_local_tensors)
+        _collective.collective_call(
+            self._free_local_tensors,
+            stage="MegaMoe local workspace release",
+            group=root_group,
+        )
         self.dtype = None
         self.device = None
         self.completion_event = None

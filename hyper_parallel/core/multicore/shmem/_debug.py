@@ -19,18 +19,16 @@ from __future__ import annotations
 __all__ = ["debug_state"]
 
 import os
-import sys
 import traceback
 from collections.abc import Mapping
-from datetime import datetime, timezone
 from typing import Any
 
 from ._lifecycle import _reference_count
-from ._runtime import _load_native, _torch_modules
+from ._runtime import _load_native
 
 
 _HEX_ADDRESS_FIELDS = frozenset({"allocation_base"})
-_LOG_LEVEL_ENV = "HYPER_PARALLEL_SHMEM_LOG_LEVEL"
+_LOG_LEVEL_ENV = "SHMEM_LOG_LEVEL"
 _INTERNAL_FRAME_PREFIX = os.path.dirname(os.path.abspath(__file__)) + os.sep
 
 
@@ -61,16 +59,9 @@ def _render_debug_fields(fields: Mapping[str, object], indent: int = 0) -> list[
     return lines
 
 
-def _site_rank() -> int:
-    """Return the Torch distributed rank when initialized, else 0 like the Native default."""
-    torch, _ = _torch_modules()
-    dist = getattr(torch, "distributed", None)
-    return int(dist.get_rank()) if dist is not None and dist.is_available() and dist.is_initialized() else 0
-
-
 def _log_allocation_site(tensor: Any) -> None:
     """Best-effort DEBUG line identifying the direct caller of :func:`empty`."""
-    if os.environ.get(_LOG_LEVEL_ENV) != "0":
+    if os.environ.get(_LOG_LEVEL_ENV) != "DEBUG":
         return
     try:
         frames = traceback.extract_stack()
@@ -83,14 +74,12 @@ def _log_allocation_site(tensor: Any) -> None:
             None,
         )
         callsite = "unknown" if caller is None else f"{caller.filename}:{caller.lineno} in {caller.name}"
-        now = datetime.now(timezone.utc).astimezone()
-        line = (
-            f"[HP-SHMEM][rank {_site_rank()}][DEBUG] {now:%Y-%m-%d-%H:%M:%S}.{now.microsecond // 1000:03d} "
-            f"[_api.py] op=Empty allocation_base={hex(tensor.data_ptr())} "
+        message = (
+            f"allocation_base={hex(tensor.data_ptr())} "
             f"bytes={tensor.numel() * tensor.element_size()} shape={tuple(tensor.shape)} dtype={tensor.dtype} "
             f"callsite={callsite}"
         )
-        print(line, file=sys.stderr, flush=True)
+        _load_native()._log_debug(message)  # pylint: disable=protected-access
     except Exception:  # pylint: disable=broad-exception-caught
         # Diagnostics must never turn a successful collective Allocation into a leaked Allocation.
         return

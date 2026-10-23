@@ -95,8 +95,8 @@ def empty(
     Note:
         Call ``shmem.acquire()`` before allocating and keep that reference until this Allocation is freed.
         The final ``shmem.release()`` must not run concurrently with this call.
-        With ``HYPER_PARALLEL_SHMEM_LOG_LEVEL=0``, one best-effort DEBUG stderr line records the direct caller so an
-        Allocation leaked without ``free`` can be traced back to its code site via ``allocation_base``.
+        With ``SHMEM_LOG_LEVEL=DEBUG``, one best-effort DEBUG line in the native SHMEM log records the direct caller so
+        an Allocation leaked without ``free`` can be traced back to its code site via ``allocation_base``.
     """
     torch, _ = _torch_modules()
     shape = _normalize_size(size)

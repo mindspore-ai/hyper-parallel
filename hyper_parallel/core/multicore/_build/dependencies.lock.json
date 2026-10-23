@@ -124,6 +124,12 @@
             "path": "hyper_parallel/core/multicore/shmem/_build/patches/cann_runtime_symbols.patch",
             "sha256": "049d3e85e413dbebc6953aaf0940108b66348e2ff3647aeb11349fd8ead2bc98",
             "purpose": "resolve required rt APIs from libruntime.so when libascendcl.so does not depend on it"
+          },
+          {
+            "path": "hyper_parallel/core/multicore/shmem/_build/patches/cann_shmem_log_api.patch",
+            "sha256": "3ec6f508509a70add2bb55671acf32cbfa77ef4eb2f75e2a56da2080607c2eb5",
+            "upstream_issue": "https://gitcode.com/cann/shmem/issues/704",
+            "purpose": "provide the HP-private hpshmem_log sink interface"
           }
         ],
         "packaging_policy": {

@@ -14,6 +14,8 @@
 # ============================================================================
 """Version-isolated adapters for cleanup before Torch communication teardown."""
 
+from __future__ import annotations
+
 import atexit
 import functools
 import logging
@@ -23,38 +25,31 @@ from typing import Any, Optional
 import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
 
+from . import _collective
+
 _LOGGER = logging.getLogger(__name__)
 
 
 def exchange(value: Any) -> list[Any]:
-    """Exchange cold-path lifecycle metadata across the registered root.
-
-    Args:
-        value: Picklable local lifecycle state.
-    """
-    if not dist.is_initialized():
-        return [value]
-    group = _CLEANUP.root_group
-    values = [None] * dist.get_world_size(group)
-    dist.all_gather_object(values, value, group=group)
-    return values
+    """Exchange resource metadata on the registered cleanup Root."""
+    return _collective.exchange(
+        value,
+        group=_CLEANUP.root_group,
+        failure_prefix="Multicore metadata exchange failed while converging rank results",
+    )
 
 
-def collective_call(callback: Callable[[], None]) -> None:
-    """Keep peers at the same teardown stage when a local operation raises.
-
-    Args:
-        callback: Teardown stage entered by every rank in the same order.
-    """
-    failure = None
-    try:
-        callback()
-    # Peers must see ordinary local errors before entering the next collective.
-    except Exception as error:  # pylint: disable=broad-exception-caught
-        failure = error
-    failures = exchange(None if failure is None else f"{type(failure).__name__}: {failure}")
-    if any(error is not None for error in failures):
-        raise RuntimeError(f"multicore teardown stage failed: {failures}") from failure
+def collective_call(
+    callback: Callable[[], None],
+    *,
+    stage: str,
+) -> None:
+    """Converge resource callback failures on the registered cleanup Root."""
+    _collective.collective_call(
+        callback,
+        stage=stage,
+        group=_CLEANUP.root_group,
+    )
 
 
 class _Cleanup:

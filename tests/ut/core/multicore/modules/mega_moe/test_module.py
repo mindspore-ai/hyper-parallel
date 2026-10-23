@@ -23,6 +23,7 @@ from unittest.mock import Mock, PropertyMock, patch
 
 import torch
 
+from hyper_parallel.core.multicore import _automatic, _collective
 from hyper_parallel.core.multicore.modules.mega_moe import module as mega_moe_module
 from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
@@ -377,7 +378,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
                                      dispatch_mode="push", max_local_num_tokens=None)
         workspace = Mock()
-        manager = Mock(heap_bytes=1024, epoch=0, workspaces=[], growth_records=[])
+        manager = Mock(root_group=root_group, heap_bytes=1024, epoch=0, workspaces=[], growth_records=[])
         manager.reserve.return_value = ({},)
         manager.attach_runtime.return_value = True
         manager.bind.return_value = 128
@@ -395,6 +396,8 @@ class TestMegaMoeExperts(unittest.TestCase):
                 mega_moe_module, "build_mega_moe_plan", return_value=object()
             ) as mock_build_plan,
             patch.object(mega_moe_module, "MegaMoeWorkspace", return_value=workspace),
+            patch.object(_automatic._CLEANUP, "root_group", object()),
+            patch.object(_collective, "exchange", wraps=_collective.exchange) as exchange,
         ):
             resources = mega_moe_module._MegaMoeExecutionResources(  # pylint: disable=protected-access
                 {},
@@ -404,6 +407,8 @@ class TestMegaMoeExperts(unittest.TestCase):
             )
             manager.reserve.assert_called_once()
             manager.attach_runtime.assert_called_once_with()
+            exchange.assert_called_once()
+            self.assertIs(exchange.call_args.kwargs["group"], root_group)
             mock_build_plan.assert_called_once_with(bound_spec, "npu:0")
             resources.close()
             resources.close()

@@ -15,6 +15,7 @@
 """Lightweight torchrun launchers for SHMEM Torch Binding system tests."""
 
 import os
+from pathlib import Path
 
 from tests.common.mark_utils import arg_mark
 from tests.common.port_utils import allocate_port
@@ -256,4 +257,45 @@ def test_binding_init_timeout_injection(monkeypatch) -> None:
     """Inject an unreachable bootstrap endpoint and a 1s timeout; expect a prompt error."""
     monkeypatch.setenv("HYPER_PARALLEL_SHMEM_TIMEOUT_SEC", "1")
     monkeypatch.setenv("HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT", "tcp://192.0.2.1:8662")
+    monkeypatch.setenv("SHMEM_LOG_TO_STDOUT", "1")
     _run(_LIFECYCLE_WORKER, "test_binding_init_timeout_injection")
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="onecard",
+    essential_mark="unessential",
+)
+def test_binding_native_log_path_and_levels(monkeypatch, tmp_path: Path) -> None:
+    """CANN and HP DEBUG logs share a file, and default ERROR filters lower levels."""
+    monkeypatch.delenv("SHMEM_LOG_TO_STDOUT", raising=False)
+    debug_path = tmp_path / "debug"
+    debug_path.mkdir()
+    monkeypatch.setenv("SHMEM_LOG_LEVEL", "DEBUG")
+    monkeypatch.setenv("SHMEM_LOG_PATH", str(debug_path))
+    _set_unique_bootstrap_endpoint(monkeypatch)
+    _run(_LIFECYCLE_WORKER, "test_binding_single_process_without_distributed")
+
+    debug_files = list(debug_path.glob("aclshmem_*.log"))
+    assert debug_files, "SHMEM_LOG_PATH produced no native DEBUG log"
+    debug_contents = [path.read_text(encoding="utf-8") for path in debug_files]
+    debug_lines = "\n".join(debug_contents).splitlines()
+    assert any(" debug " in line and "[HP_SHMEM " in line for line in debug_lines), debug_contents
+    assert any(" info " in line and "[HP_SHMEM " in line for line in debug_lines), debug_contents
+    assert any("[SHM_SHMEM " in content and "[HP_SHMEM " in content for content in debug_contents), debug_contents
+
+    default_path = tmp_path / "default"
+    default_path.mkdir()
+    monkeypatch.delenv("SHMEM_LOG_LEVEL")
+    monkeypatch.setenv("SHMEM_LOG_PATH", str(default_path))
+    _set_unique_bootstrap_endpoint(monkeypatch)
+    _run(_LIFECYCLE_WORKER, "test_binding_single_process_without_distributed")
+
+    default_contents = "\n".join(
+        path.read_text(encoding="utf-8") for path in default_path.glob("aclshmem_*.log")
+    )
+    assert not any(
+        " debug " in line or " info " in line
+        for line in default_contents.splitlines()
+    ), default_contents

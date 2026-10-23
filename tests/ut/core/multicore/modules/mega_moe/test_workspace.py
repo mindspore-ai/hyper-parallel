@@ -17,6 +17,7 @@
 import math
 import os
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -48,6 +49,21 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         self.assertFalse(workspace.can_close())
         workspace.release_graph(context)
         self.assertTrue(workspace.can_close())
+        with (
+            patch.object(workspace_module._collective, "exchange") as exchange,
+            self.assertRaisesRegex(RuntimeError, "owning HeapManager"),
+        ):
+            workspace.close()
+        exchange.assert_not_called()
+        self.assertFalse(workspace.closing)
+        workspace.heap_manager = SimpleNamespace(root_group=None, access=nullcontext)
+        with (
+            patch.object(workspace_module._collective.dist, "is_initialized", return_value=False),
+            patch.object(workspace_module._collective.dist, "all_gather_object") as gather,
+        ):
+            workspace.close()
+        gather.assert_not_called()
+        self.assertTrue(workspace.closing)
 
     @staticmethod
     def _specification(initial_capacity_factor):

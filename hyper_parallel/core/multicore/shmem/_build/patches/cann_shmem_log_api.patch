@@ -1,0 +1,94 @@
+--- a/src/host/utils/shmemi_logger.h
++++ b/src/host/utils/shmemi_logger.h
+@@ -44,6 +44,7 @@ public:
+     aclshmem_error_code_t set_log_level(log_level level);
+     void set_extern_log_func(external_log func, bool force_update = false);
+     void log(int32_t level, const std::ostringstream &oss);
++    void write_to_builtin_sink(int32_t level, const std::ostringstream &oss);
+
+     aclshmem_out_logger(const aclshmem_out_logger &) = delete;
+     aclshmem_out_logger(aclshmem_out_logger &&) = delete;
+--- a/src/host/utils/log/shmemi_logger.cpp
++++ b/src/host/utils/log/shmemi_logger.cpp
+@@ -353,6 +353,10 @@ void aclshmem_out_logger::log(int32_t level, const std::ostringstream &oss) {
+         aclshmem_log_func(level, oss.str().c_str());
+         return;
+     }
++    write_to_builtin_sink(level, oss);
++}
++
++void aclshmem_out_logger::write_to_builtin_sink(int32_t level, const std::ostringstream &oss) {
+
+     if (level < aclshmem_log_level) {
+         return;
+--- /dev/null
++++ b/include/host/utils/hpshmem_log.h
+@@ -0,0 +1,36 @@
++/**
++ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
++ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++ * CANN Open Software License Agreement Version 2.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ */
++#ifndef HPSHMEM_LOG_H
++#define HPSHMEM_LOG_H
++
++#include "host/shmem_host_def.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/**
++ * @brief Write one Hyper-Parallel message synchronously to the CANN SHMEM built-in log sink.
++ *
++ * This is an HP-private interface installed only in the Hyper-Parallel SHMEM SDK and exported by its private
++ * SONAME. It is not part of the public CANN SHMEM API or compatibility contract.
++ *
++ * @param level Log level in the inclusive range 0..4: DEBUG, INFO, WARN, ERROR, FATAL.
++ * @param message Non-null, NUL-terminated message. The implementation reads it only during this synchronous call.
++ * @return ACLSHMEM_SUCCESS on success, ACLSHMEM_INVALID_VALUE for invalid arguments, or ACLSHMEM_INNER_ERROR when
++ * writing the built-in sink fails.
++ */
++ACLSHMEM_HOST_API int32_t hpshmem_log(int32_t level, const char *message);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+--- /dev/null
++++ b/src/host/utils/log/hpshmem_log.cpp
+@@ -0,0 +1,29 @@
++/**
++ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
++ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++ * CANN Open Software License Agreement Version 2.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ */
++#include <sstream>
++
++#include "host/utils/hpshmem_log.h"
++#include "../shmemi_logger.h"
++
++extern "C" ACLSHMEM_HOST_API int32_t hpshmem_log(int32_t level, const char *message)
++{
++    if (message == nullptr || level < aclshmem_log::DEBUG_LEVEL || level >= aclshmem_log::BUTT_LEVEL) {
++        return ACLSHMEM_INVALID_VALUE;
++    }
++
++    try {
++        std::ostringstream stream;
++        stream << message;
++        aclshmem_log::aclshmem_out_logger::Instance().write_to_builtin_sink(level, stream);
++        return ACLSHMEM_SUCCESS;
++    } catch (...) {
++        return ACLSHMEM_INNER_ERROR;
++    }
++}

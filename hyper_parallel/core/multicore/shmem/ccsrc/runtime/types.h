@@ -41,13 +41,15 @@ enum class ErrorCode : uint8_t {
 /**
  * @brief Status for operations without a value and the error branch of Result.
  *
- * A successful status uses ErrorCode::Ok, no CANN error code, and an empty message. cann_error_code is absent when
- * the failing API does not expose an original CANN return code.
+ * A successful status uses ErrorCode::Ok, no native error metadata, and an empty message. cann_error_code is absent
+ * when the failing API does not expose an original CANN return code. log_message optionally provides a concise screen
+ * summary while message retains complete exception diagnostics.
  */
 struct Status {
   ErrorCode error_code{ErrorCode::Ok};
   std::optional<int32_t> cann_error_code;
   std::string message;
+  std::optional<std::string> log_message;
 };
 
 /**

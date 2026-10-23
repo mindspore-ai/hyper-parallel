@@ -22,7 +22,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from hyper_parallel.core.multicore import shmem
+from hyper_parallel.core.multicore import _collective, shmem
 from hyper_parallel.core.multicore.modules.mega_moe import heap_manager as heap_manager_module
 from hyper_parallel.core.multicore.modules.mega_moe.heap_manager import (
     _HeapManager,
@@ -52,17 +52,18 @@ class TestMegaMoeHeapManager(unittest.TestCase):
         )
         self.root_group = object()
         self.root_patch = patch.object(_lifecycle, "root_members", return_value=(0,))
-        self.stage_patch = patch.object(
-            _lifecycle,
-            "_reconfiguration_stage",
-            side_effect=lambda operation, **_kwargs: operation() or 0.0,
+        self.dist = SimpleNamespace(
+            is_initialized=Mock(return_value=True),
+            get_world_size=Mock(return_value=1),
+            all_gather_object=Mock(side_effect=lambda output, value, **_kw: output.__setitem__(slice(None), [value])),
         )
+        self.collective_patch = patch.object(_collective, "dist", self.dist)
         self.environment_patch = patch.dict(heap_manager_module.os.environ, {}, clear=True)
         self.root_patch.start()
-        self.stage = self.stage_patch.start()
+        self.collective_patch.start()
         self.environment_patch.start()
         self.addCleanup(self.root_patch.stop)
-        self.addCleanup(self.stage_patch.stop)
+        self.addCleanup(self.collective_patch.stop)
         self.addCleanup(self.environment_patch.stop)
         self.addCleanup(self._reset_manager)
         self._reset_manager()
@@ -116,14 +117,17 @@ class TestMegaMoeHeapManager(unittest.TestCase):
 
         self.assertEqual(manager.heap_bytes, 4 * 1024**2)
         self.assertEqual(added, tuple(item[0] for item in reservations))
-        self.assertIs(self.stage.call_args.kwargs["group"], self.root_group)
+        self.assertIs(self.dist.all_gather_object.call_args.kwargs["group"], self.root_group)
+        configuration, failure = self.dist.all_gather_object.call_args.args[1]
+        self.assertEqual(configuration, (None, str(self.reference.dtype), tuple(item[1] for item in reservations)))
+        self.assertIsNone(failure)
 
         first = {"shape": 1}
         equal = {"shape": 1}
         manager = self._manager_with_reservation(first, self._layout(512, 1))
 
         with (
-            patch.object(_lifecycle, "_reconfiguration_stage", side_effect=RuntimeError("agreement failed")),
+            patch.object(self.dist, "get_world_size", side_effect=RuntimeError("agreement failed")),
             self.assertRaisesRegex(RuntimeError, "agreement failed"),
         ):
             manager.reserve(((equal, self._layout(512, 1)),), allow_resize=True)
@@ -132,6 +136,10 @@ class TestMegaMoeHeapManager(unittest.TestCase):
 
         added = manager.reserve(((equal, self._layout(512, 1)),), allow_resize=True)
         self.assertEqual(added, (equal,))
+        self.assertEqual(
+            self.dist.all_gather_object.call_args.args[1],
+            (tuple(entry.layout for entry in manager.entries), None),
+        )
         manager.rollback_reservations(added, None)
         self.assertEqual([entry.specification for entry in manager.entries], [first])
 
@@ -140,6 +148,58 @@ class TestMegaMoeHeapManager(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "fixed SHMEM layout"):
             manager.reserve(((equal, self._layout(3 * 1024**2, 2)),), allow_resize=False)
         self.assertEqual([entry.specification for entry in manager.entries], [first])
+
+        self._assert_configuration_failures(reservations)
+
+    def _assert_configuration_failures(self, reservations: tuple) -> None:
+        """Check local, peer and communication failures through the real Heap agreement."""
+        for scenario in ("local", "local peers", "remote", "mismatch", "query", "gather"):
+            with self.subTest(scenario=scenario):
+                manager = _HeapManager(self.root_group, self.reference)
+                local_error = ValueError("invalid heap") if scenario.startswith("local") else None
+                communication_error = RuntimeError("communication unavailable")
+
+                def gather(
+                    output: list[Any], payload: Any, *, group: Any,
+                    case: str = scenario, gather_error: RuntimeError = communication_error,
+                ) -> None:
+                    """Return business agreement or a peer failure on the manager's Root."""
+                    self.assertIs(group, self.root_group)
+                    if case == "gather":
+                        raise gather_error
+                    output[:] = [payload]
+                    if case == "local peers":
+                        output.append(payload)
+                    elif case == "remote":
+                        output.append((None, ("ValueError", "peer invalid heap")))
+                    elif case == "mismatch":
+                        output.append(("different configuration", None))
+
+                with (
+                    patch.object(manager, "_configure", wraps=manager._configure, side_effect=local_error),
+                    patch.object(self.dist, "get_world_size",
+                                 return_value=2 if scenario in ("local peers", "remote", "mismatch") else 1,
+                                 side_effect=communication_error if scenario == "query" else None),
+                    patch.object(self.dist, "all_gather_object", side_effect=gather),
+                    self.assertRaises(ValueError if scenario == "local" else RuntimeError) as raised,
+                ):
+                    manager.reserve(reservations, allow_resize=True)
+                if scenario == "local":
+                    self.assertIs(raised.exception, local_error)
+                else:
+                    self.assertIn("SHMEM Heap failed during Configuration", str(raised.exception))
+                    self.assertIs(raised.exception.__cause__,
+                                  communication_error if scenario in ("query", "gather") else local_error)
+                if scenario in ("query", "gather"):
+                    self.assertIsInstance(raised.exception, _collective.CollectiveConvergenceError)
+                if scenario == "remote":
+                    self.assertIn("root_rank=1", str(raised.exception))
+                    self.assertTrue(raised.exception.__suppress_context__)
+                if scenario == "local peers":
+                    self.assertIn("root_ranks=[0, 1]", str(raised.exception))
+                self.assertEqual(manager.entries, [])
+                self.assertFalse(manager._configured)
+                self.assertEqual(manager.heap_bytes, 0)
 
     def test_manager_owns_and_reuses_one_retryable_runtime_reference(self) -> None:
         """Reuse an attached manager and commit detach only after its sole release succeeds."""
@@ -205,9 +265,12 @@ class TestMegaMoeHeapManager(unittest.TestCase):
             old_tensors.extend(current_tensors)
         for workspace, bound_spec, specification in zip(workspaces, bound_specs, specifications):
             manager.bind(workspace, bound_spec, specification)
+        replacements, bindings, agreement = manager._describe_restart(target_layouts)
+        with self.assertRaisesRegex(RuntimeError, "entries changed"):
+            manager._restart_preflight(target_layouts[:-1], replacements, bindings, agreement)
         stages = {
             "preflight_ms": 1.0, "quiesce_ms": 2.0, "release_ms": 3.0, "finalize_ms": 4.0,
-            "bootstrap_ms": 5.0, "initialize_ms": 6.0, "restore_ms": 7.0, "commit_ms": 8.0,
+            "bootstrap_ms": 5.0, "initialize_ms": 6.0, "restore_ms": 7.0,
         }
 
         def restart(**kwargs: Any) -> _lifecycle._RestartResult:
@@ -217,16 +280,42 @@ class TestMegaMoeHeapManager(unittest.TestCase):
             preflight_hook = kwargs["preflight_hook"]
             self.assertEqual(heap_size_bytes, 2 * 1024**2)
             self.assertEqual(len(replacements), 8)
+            for field, value, message in (
+                ("in_use", True, "active workspace lease"),
+                ("closing", True, "closing workspace"),
+                ("completion_event", None, "lazy workspace"),
+                ("expert_buffer", torch.empty(1), "mapping changed"),
+            ):
+                with self.subTest(field=field), patch.object(workspaces[0], field, value):
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        preflight_hook()
             agreement = preflight_hook()
             self.assertEqual([entry.is_materialized for entry in agreement.entries], [True, False, True])
             result_tensors = tuple(
                 torch.empty(replacement.target.shape, dtype=replacement.target.dtype)
                 for replacement in replacements
             )
+            self.assertNotIn("commit_hook", kwargs)
             return _lifecycle._RestartResult(result_tensors, stages)  # pylint: disable=protected-access
+
+        events = []
+        validate = manager._validate_restart_result
+        bind = manager._bind_restart_result
+
+        def validate_result(*args: Any, **kwargs: Any) -> None:
+            """Record local validation before invoking the manager implementation."""
+            events.append(("validate", manager.epoch))
+            validate(*args, **kwargs)
+
+        def bind_result(*args: Any, **kwargs: Any) -> None:
+            """Record result binding before delegating to the manager implementation."""
+            events.append(("bind", manager.epoch))
+            bind(*args, **kwargs)
 
         with (
             patch.object(shmem, "_restart", side_effect=restart),
+            patch.object(manager, "_validate_restart_result", side_effect=validate_result),
+            patch.object(manager, "_bind_restart_result", side_effect=bind_result),
             patch.object(heap_manager_module.time, "perf_counter", side_effect=(10.0, 10.125)),
         ):
             manager._restart(target_layouts, 2 * 1024**2)
@@ -244,6 +333,7 @@ class TestMegaMoeHeapManager(unittest.TestCase):
             )
         self.assertTrue(all(actual is not old for actual, old in zip(rebound_tensors, old_tensors)))
         self.assertIsNone(workspaces[1].completion_event)
+        self.assertEqual(events, [("validate", 0), ("bind", 0)])
         self.assertEqual(manager.epoch, 1)
         self.assertEqual(manager.growth_records[-1]["stages_ms"], stages)
         self.assertEqual(manager.growth_records[-1]["total_ms"], 125.0)
@@ -271,10 +361,16 @@ class TestMegaMoeHeapManager(unittest.TestCase):
             required = 3 * 1024**2 if capacity == 3 else 1024
             return self._layout(required, capacity)
 
+        def restart(**kwargs: Any) -> _lifecycle._RestartResult:
+            """Run the preflight hook and return an empty successful restart result."""
+            kwargs["preflight_hook"]()
+            self.assertNotIn("commit_hook", kwargs)
+            return _lifecycle._RestartResult((), {})
+
         with (
             patch.object(heap_manager_module, "_grow_receive_capacity", return_value=(3, 2)),
             patch.object(heap_manager_module, "_workspace_layout", side_effect=layout),
-            patch.object(shmem, "_restart", return_value=_lifecycle._RestartResult((), {})),
+            patch.object(shmem, "_restart", side_effect=restart),
         ):
             manager.ensure_capacity(workspace, 2)
         self.assertEqual(manager.entries[0].layout.receive_capacity, 2)
@@ -297,6 +393,7 @@ class TestMegaMoeHeapManager(unittest.TestCase):
             entered.set()
             if not resume.wait(timeout=2):
                 raise RuntimeError("test did not release restart")
+            self.assertNotIn("commit_hook", kwargs)
             return _lifecycle._RestartResult((), {})
 
         with (
@@ -316,7 +413,7 @@ class TestMegaMoeHeapManager(unittest.TestCase):
         self.assertFalse(thread.is_alive())
 
     def test_restart_failure_boundary_controls_manager_state(self) -> None:
-        """Keep preflight retryable and make destructive or binding failures terminal."""
+        """Preflight failures are retryable, and destructive restart failures are terminal."""
         initial = self._layout(512, 1)
         target = self._layout(1024, 2)
         manager = self._manager_with_reservation({"name": "failure"}, initial)
@@ -335,21 +432,62 @@ class TestMegaMoeHeapManager(unittest.TestCase):
         ):
             manager._restart([target], 2 * 1024**2)
         self.assertEqual(manager.state, "failed")
+        with self.assertRaisesRegex(RuntimeError, "restart the process"), manager.access():
+            self.fail("A failed SHMEM Heap allowed another operation")
 
+    def test_restart_validation_failure_is_local_and_does_not_publish(self) -> None:
+        """A local validation defect invalidates this manager without publishing business state."""
+        initial = self._layout(512, 1)
+        target = self._layout(1024, 2)
+        manager = self._manager_with_reservation({"name": "validation failure"}, initial)
+        result = _lifecycle._RestartResult((), {})
+        validation_error = RuntimeError("invalid local restart result")
+
+        with (
+            patch.object(shmem, "_restart", return_value=result),
+            patch.object(manager, "_validate_restart_result", side_effect=validation_error),
+            patch.object(manager, "_bind_restart_result") as bind,
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            manager._restart([target], 2 * 1024**2)
+
+        self.assertIn("invalid local restart result", str(raised.exception))
+        self.assertIn("MegaMoe restart result validation failed", str(raised.exception))
+        self.assertNotIn("workspace binding failed", str(raised.exception))
+        self.assertIn("local implementation error", str(raised.exception))
+        self.assertIn("cannot be rolled back", str(raised.exception))
+        self.assertIn("terminate", str(raised.exception))
+        self.assertNotIn("all ranks", str(raised.exception))
+        self.assertIs(raised.exception.__cause__, validation_error)
+        self.assertEqual(manager.state, "failed")
+        self.assertEqual((manager.entries[0].layout, manager.epoch, manager.growth_records), (initial, 0, []))
+        bind.assert_not_called()
+
+    def test_restart_binding_failure_is_local_and_does_not_publish(self) -> None:
+        """A binding defect invalidates the local manager without cross-rank atomicity."""
+        initial = self._layout(512, 1)
+        target = self._layout(1024, 2)
         manager = self._manager_with_reservation({"name": "binding failure"}, initial)
-        result = _lifecycle._RestartResult((Mock(),), {})
+        result = _lifecycle._RestartResult((), {})
+        binding_error = RuntimeError("binding failed")
+
         with (
             patch.object(shmem, "_restart", return_value=result),
             patch.object(manager, "_validate_restart_result"),
-            patch.object(manager, "_bind_restart_result", side_effect=RuntimeError("binding failed")),
-            patch.object(heap_manager_module.shmem, "free") as free,
-            patch.object(heap_manager_module.shmem, "release") as release,
-            self.assertRaisesRegex(RuntimeError, "binding failed"),
+            patch.object(manager, "_bind_restart_result", side_effect=binding_error),
+            self.assertRaises(RuntimeError) as raised,
         ):
             manager._restart([target], 2 * 1024**2)
+
+        self.assertIn("binding failed", str(raised.exception))
+        self.assertIn("MegaMoe workspace binding failed after SHMEM restart", str(raised.exception))
+        self.assertNotIn("result validation failed", str(raised.exception))
+        self.assertIn("implementation error", str(raised.exception))
+        self.assertIn("terminate", str(raised.exception))
+        self.assertNotIn("all ranks", str(raised.exception))
+        self.assertIs(raised.exception.__cause__, binding_error)
         self.assertEqual(manager.state, "failed")
-        free.assert_not_called()
-        release.assert_not_called()
+        self.assertEqual((manager.entries[0].layout, manager.epoch, manager.growth_records), (initial, 0, []))
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,12 +12,14 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iomanip>
 #include <iterator>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
 
-#include "runtime/log.h"
+#include "cann/log.h"
 #include "shmem.h"
 
 namespace hyper_parallel::multicore::shmem::cann::host {
@@ -28,12 +30,17 @@ constexpr uint32_t kOptionalAttrVersionMajorShift = 16U;
 constexpr int32_t kInitOptionalAttrVersion = static_cast<int32_t>(
   (kOptionalAttrVersionMajor << kOptionalAttrVersionMajorShift) + sizeof(aclshmem_init_optional_attr_t));
 constexpr int32_t kInvalidDeviceIndex = -1;
-constexpr int32_t kUnknownRootRank = -1;
 constexpr int32_t kNoSocketFd = -1;
 constexpr uint64_t kDefaultInstanceId = 0U;
 constexpr std::size_t kCannEndpointCapacity = ACLSHMEM_MAX_IP_PORT_LEN;
 constexpr std::size_t kCannMaxEndpointBytes = kCannEndpointCapacity - 1U;
-constexpr int32_t kCannErrorLogLevel = 3;
+constexpr double kBytesPerGiB = 1024.0 * 1024.0 * 1024.0;
+
+struct LargePageHbmSnapshot {
+  bool available{false};
+  uint64_t free_bytes{0U};
+  uint64_t total_bytes{0U};
+};
 
 static_assert(runtime::kMaxBootstrapEndpointBytes == kCannMaxEndpointBytes,
               "Runtime endpoint limit must match the locked CANN SHMEM ABI");
@@ -49,37 +56,109 @@ bool IsTimeoutError(int32_t error_code) {
   return error_code == ACLSHMEM_TIMEOUT_ERROR || error_code == ACLSHMEM_INNER_TIMEOUT;
 }
 
-runtime::Status CannFailure(std::string_view operation, int32_t error_code) {
-  const runtime::ErrorCode category =
-    IsTimeoutError(error_code) ? runtime::ErrorCode::Timeout : runtime::ErrorCode::CannError;
-  return runtime::Status{category, error_code,
-                         std::string(operation) + " failed with CANN error code " + std::to_string(error_code)};
+std::string_view cann_error_name(int32_t error_code) {
+  switch (error_code) {
+    case ACLSHMEM_INVALID_PARAM:
+      return "ACLSHMEM_INVALID_PARAM";
+    case ACLSHMEM_INVALID_VALUE:
+      return "ACLSHMEM_INVALID_VALUE";
+    case ACLSHMEM_SMEM_ERROR:
+      return "ACLSHMEM_SMEM_ERROR";
+    case ACLSHMEM_INNER_ERROR:
+      return "ACLSHMEM_INNER_ERROR";
+    case ACLSHMEM_NOT_INITED:
+      return "ACLSHMEM_NOT_INITED";
+    case ACLSHMEM_BOOTSTRAP_ERROR:
+      return "ACLSHMEM_BOOTSTRAP_ERROR";
+    case ACLSHMEM_TIMEOUT_ERROR:
+      return "ACLSHMEM_TIMEOUT_ERROR";
+    case ACLSHMEM_MALLOC_FAILED:
+      return "ACLSHMEM_MALLOC_FAILED";
+    case ACLSHMEM_DL_FUNC_FAILED:
+      return "ACLSHMEM_DL_FUNC_FAILED";
+    case ACLSHMEM_INNER_TIMEOUT:
+      return "ACLSHMEM_INNER_TIMEOUT";
+    case ACLSHMEM_UNDER_API_UNLOAD:
+      return "ACLSHMEM_UNDER_API_UNLOAD";
+    case ACLSHMEM_NOT_SUPPORTED:
+      return "ACLSHMEM_NOT_SUPPORTED";
+    default:
+      return "ACLSHMEM_UNKNOWN_ERROR";
+  }
 }
 
-void ForwardCannLog(int32_t level, const char *message) noexcept {
-  if (message == nullptr) {
-    return;
+std::string cann_error_description(int32_t error_code) {
+  return std::string(cann_error_name(error_code)) + "(" + std::to_string(error_code) + ")";
+}
+
+runtime::Status CannFailure(std::string_view operation, int32_t error_code, std::string_view detail = {}) {
+  const runtime::ErrorCode category =
+    IsTimeoutError(error_code) ? runtime::ErrorCode::Timeout : runtime::ErrorCode::CannError;
+  const std::string summary = std::string(operation) + " failed: " + cann_error_description(error_code);
+  std::string message = summary;
+  if (!detail.empty()) {
+    message += ", cann_detail=[" + std::string(detail) + "]";
   }
-  const runtime::log::Level severity = level >= kCannErrorLogLevel ? runtime::log::Level::Error
-                                       : level > 0                 ? runtime::log::Level::Info
-                                                                   : runtime::log::Level::Debug;
-  runtime::log::Line(severity, kUnknownRootRank, __FILE__, __LINE__, "source=shmem %s", message);
+  return runtime::Status{category, error_code, std::move(message), summary};
+}
+
+std::string hbm_summary(const InitOptions &options, const LargePageHbmSnapshot &memory) {
+  std::ostringstream message;
+  message << std::fixed << std::setprecision(2)
+          << "requested_heap=" << static_cast<double>(options.heap_size_bytes) / kBytesPerGiB
+          << " GiB, free_large_page_hbm=" << static_cast<double>(memory.free_bytes) / kBytesPerGiB
+          << " GiB, total_large_page_hbm=" << static_cast<double>(memory.total_bytes) / kBytesPerGiB << " GiB";
+  if (options.heap_size_bytes > memory.free_bytes) {
+    message << ", requested_heap_exceeds_free_large_page_hbm=true";
+  }
+  return message.str();
+}
+
+runtime::Status initialization_failure(const InitOptions &options, int32_t error_code,
+                                       const LargePageHbmSnapshot &memory, std::string_view detail) {
+  std::ostringstream summary;
+  summary << cann_error_description(error_code);
+  if (memory.available) {
+    summary << ", " << hbm_summary(options, memory);
+  }
+  const std::string log_message = summary.str();
+  std::ostringstream message;
+  message << log_message;
+  if (!detail.empty()) {
+    message << ", cann_detail=[" << detail << "]";
+  }
+  const runtime::ErrorCode category =
+    IsTimeoutError(error_code) ? runtime::ErrorCode::Timeout : runtime::ErrorCode::CannError;
+  return runtime::Status{category, error_code, message.str(), log_message};
+}
+
+LargePageHbmSnapshot query_current_device_large_page_hbm() {
+  std::size_t free_bytes = 0U;
+  std::size_t total_bytes = 0U;
+  if (aclrtGetMemInfo(ACL_HBM_MEM_HUGE, &free_bytes, &total_bytes) != ACL_SUCCESS) {
+    return {};
+  }
+  return LargePageHbmSnapshot{true, static_cast<uint64_t>(free_bytes), static_cast<uint64_t>(total_bytes)};
 }
 
 runtime::Status ConfigureCannLogger() {
-  // The private SHMEM library otherwise writes SMEM failures outside the worker's captured logs.
-  const int32_t status = aclshmemx_set_extern_logger(ForwardCannLog);
+  // Registration is best-effort because the CANN SHMEM external logger uses first-wins ownership.
+  const int32_t status = log::configure();
   return status == ACLSHMEM_SUCCESS ? Success() : CannFailure("aclshmemx_set_extern_logger", status);
 }
 
 runtime::Status AclFailure(std::string_view operation, int32_t error_code) {
-  return runtime::Status{runtime::ErrorCode::CannError, error_code,
-                         std::string(operation) + " failed with ACL error code " + std::to_string(error_code)};
+  const std::string summary = std::string(operation) + " failed: ACL_ERROR(" + std::to_string(error_code) + ")";
+  return runtime::Status{runtime::ErrorCode::CannError, error_code, summary, summary};
 }
 
-runtime::Status CannFailureWithoutCode(std::string_view operation) {
-  return runtime::Status{runtime::ErrorCode::CannError, std::nullopt,
-                         std::string(operation) + " failed without an available CANN error code"};
+runtime::Status CannFailureWithoutCode(std::string_view operation, std::string_view detail = {}) {
+  const std::string summary = std::string(operation) + " failed without an available CANN error code";
+  std::string message = summary;
+  if (!detail.empty()) {
+    message += ", cann_detail=[" + std::string(detail) + "]";
+  }
+  return runtime::Status{runtime::ErrorCode::CannError, std::nullopt, std::move(message), summary};
 }
 
 bool StartsWith(std::string_view value, std::string_view prefix) {
@@ -156,9 +235,11 @@ runtime::Result<std::string> get_unique_id() {
     return runtime::Result<std::string>::Failure(logging_status);
   }
   aclshmemx_uniqueid_t unique_id{};
+  log::ErrorCapture capture;
   const int32_t status = aclshmemx_get_uniqueid(&unique_id);
+  const std::string_view detail = capture.finish();
   if (status != ACLSHMEM_SUCCESS) {
-    return runtime::Result<std::string>::Failure(CannFailure("aclshmemx_get_uniqueid", status));
+    return runtime::Result<std::string>::Failure(CannFailure("aclshmemx_get_uniqueid", status, detail));
   }
   return runtime::Result<std::string>::Success(
     std::string(reinterpret_cast<const char *>(&unique_id), sizeof(unique_id)));
@@ -182,9 +263,11 @@ runtime::Status initialize(const InitOptions &options) {
     return logging_status;
   }
 
+  log::ErrorCapture config_store_tls_capture;
   const int32_t tls_status = aclshmemx_set_conf_store_tls(false, nullptr, 0);
+  const std::string_view tls_detail = config_store_tls_capture.finish();
   if (tls_status != ACLSHMEM_SUCCESS) {
-    return CannFailure("aclshmemx_set_conf_store_tls", tls_status);
+    return CannFailure("aclshmemx_set_conf_store_tls", tls_status, tls_detail);
   }
 
   aclshmemx_init_attr_t attributes{};
@@ -210,34 +293,46 @@ runtime::Status initialize(const InitOptions &options) {
       return InvalidArgument("unique_id has an invalid byte count: " + std::to_string(options.unique_id.size()));
     }
     std::memcpy(&unique_id, options.unique_id.data(), sizeof(unique_id));
-    const int32_t status = aclshmemx_set_attr_uniqueid_args(
-      options.root_rank, options.root_size, options.heap_size_bytes, &unique_id, &attributes);
+    log::ErrorCapture attribute_capture;
+    const int32_t status = aclshmemx_set_attr_uniqueid_args(options.root_rank, options.root_size,
+                                                            options.heap_size_bytes, &unique_id, &attributes);
+    const std::string_view attribute_detail = attribute_capture.finish();
     if (status != ACLSHMEM_SUCCESS) {
-      return CannFailure("aclshmemx_set_attr_uniqueid_args", status);
+      return CannFailure("aclshmemx_set_attr_uniqueid_args", status, attribute_detail);
     }
   }
+  const LargePageHbmSnapshot memory = query_current_device_large_page_hbm();
+  log::ErrorCapture init_capture;
   const int32_t init_status = aclshmemx_init_attr(
     options.unique_id.empty() ? ACLSHMEMX_INIT_WITH_DEFAULT : ACLSHMEMX_INIT_WITH_UNIQUEID, &attributes);
-  return init_status == ACLSHMEM_SUCCESS ? Success() : CannFailure("aclshmemx_init_attr", init_status);
+  const std::string_view init_detail = init_capture.finish();
+  return init_status == ACLSHMEM_SUCCESS ? Success()
+                                         : initialization_failure(options, init_status, memory, init_detail);
 }
 
 runtime::Status finalize() {
+  log::ErrorCapture capture;
   const int32_t status = aclshmem_finalize();
-  return status == ACLSHMEM_SUCCESS ? Success() : CannFailure("aclshmem_finalize", status);
+  const std::string_view detail = capture.finish();
+  return status == ACLSHMEM_SUCCESS ? Success() : CannFailure("aclshmem_finalize", status, detail);
 }
 
 runtime::Result<uintptr_t> allocate(uint64_t bytes) {
+  log::ErrorCapture capture;
   void *allocation = aclshmem_malloc(static_cast<std::size_t>(bytes));
+  const std::string_view detail = capture.finish();
   if (allocation == nullptr) {
-    return runtime::Result<uintptr_t>::Failure(CannFailureWithoutCode("aclshmem_malloc"));
+    return runtime::Result<uintptr_t>::Failure(CannFailureWithoutCode("aclshmem_malloc", detail));
   }
   return runtime::Result<uintptr_t>::Success(reinterpret_cast<uintptr_t>(allocation));
 }
 
 runtime::Result<uintptr_t> aligned_allocate(uint64_t alignment_bytes, uint64_t bytes) {
+  log::ErrorCapture capture;
   void *allocation = aclshmem_align(static_cast<std::size_t>(alignment_bytes), static_cast<std::size_t>(bytes));
+  const std::string_view detail = capture.finish();
   if (allocation == nullptr) {
-    return runtime::Result<uintptr_t>::Failure(CannFailureWithoutCode("aclshmem_align"));
+    return runtime::Result<uintptr_t>::Failure(CannFailureWithoutCode("aclshmem_align", detail));
   }
   return runtime::Result<uintptr_t>::Success(reinterpret_cast<uintptr_t>(allocation));
 }
@@ -281,8 +376,9 @@ runtime::Result<int32_t> query_current_device_index() {
     // aclrtGetDevice only fails when this thread has no active device (e.g. SHMEM initialize before any
     // torch.npu.set_device), so attach the actionable guidance instead of relying on a specific raw code.
     runtime::Status failure = AclFailure("aclrtGetDevice", static_cast<int32_t>(device_status));
-    failure.message += ": no active NPU device on this thread; set the current NPU device "
-                       "(torch.npu.set_device) before initializing SHMEM";
+    failure.message +=
+      ": no active NPU device on this thread; set the current NPU device "
+      "(torch.npu.set_device) before initializing SHMEM";
     return runtime::Result<int32_t>::Failure(std::move(failure));
   }
   return runtime::Result<int32_t>::Success(current_device);

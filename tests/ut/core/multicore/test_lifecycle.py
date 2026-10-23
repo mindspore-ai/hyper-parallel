@@ -15,6 +15,7 @@
 """CPU regressions for retryable explicit and automatic resource ownership."""
 
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
@@ -22,7 +23,7 @@ from unittest.mock import Mock, patch
 from torch import Tensor, ones
 from torch.autograd import Function
 
-from hyper_parallel.core.multicore import _automatic
+from hyper_parallel.core.multicore import _automatic, _collective
 from hyper_parallel.core.multicore.modules import module as module_api
 from hyper_parallel.core.multicore.modules.mega_moe.function import _release_completed_graph
 from hyper_parallel.core.multicore.modules.mega_moe.workspace import MegaMoeWorkspace
@@ -91,6 +92,102 @@ class TestLifecycle(unittest.TestCase):
         member.close()
         self.assertEqual(resources.close.call_count, 2)
 
+    def test_collective_failure_reports_only_failed_ranks(self) -> None:
+        """Callback and convergence failures omit internal payloads."""
+        local_error = RuntimeError("same failure")
+        failures = [
+            ("RuntimeError", "same failure"),
+            None,
+            ("RuntimeError", "same failure"),
+            ("ValueError", "different failure"),
+        ]
+        with (
+            patch.object(_collective, "exchange", return_value=failures),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            _automatic.collective_call(
+                Mock(side_effect=local_error),
+                stage="multicore test stage",
+            )
+
+        self.assertEqual(
+            str(raised.exception),
+            "multicore test stage failed on ranks=[0, 2]: same failure; "
+            "rank=3: ValueError: different failure",
+        )
+        self.assertIs(raised.exception.__cause__, local_error)
+        self.assertNotIn("None", str(raised.exception))
+
+        for exchange_error, expected_summary in (
+            (RuntimeError("gather unavailable"), "gather unavailable"),
+            (ValueError("invalid group"), "ValueError: invalid group"),
+        ):
+            with (
+                patch.object(_collective.dist, "is_initialized", return_value=True),
+                patch.object(_collective.dist, "get_world_size", side_effect=exchange_error),
+                self.assertRaises(RuntimeError) as convergence,
+            ):
+                _collective.collective_call(
+                    Mock(side_effect=local_error),
+                    stage="multicore resource construction",
+                    rank_label="root_rank",
+                    group=None,
+                )
+
+            self.assertEqual(
+                str(convergence.exception),
+                "multicore resource construction failed while converging root_rank results: "
+                f"{expected_summary}",
+            )
+            self.assertIsInstance(convergence.exception, _collective.CollectiveConvergenceError)
+            self.assertIs(convergence.exception.__cause__, exchange_error)
+
+    def test_collective_exchange_accepts_an_explicit_group(self) -> None:
+        """Automatic calls use the registered Root; shared calls use an explicit group."""
+        registered_group = object()
+        explicit_group = object()
+        gathered_groups = []
+
+        def gather(values: list[Any], value: Any, *, group: Any) -> None:
+            """Record the selected group and return the local value."""
+            gathered_groups.append(group)
+            values[0] = value
+
+        with (
+            patch.object(_automatic._CLEANUP, "root_group", registered_group),
+            patch.object(_collective.dist, "is_initialized", return_value=True),
+            patch.object(_collective.dist, "get_world_size", return_value=1),
+            patch.object(_collective.dist, "all_gather_object", side_effect=gather),
+        ):
+            self.assertEqual(_automatic.exchange("default"), ["default"])
+            _automatic.collective_call(Mock(), stage="registered close")
+            self.assertEqual(
+                _collective.exchange("explicit", group=explicit_group, failure_prefix="exchange failed"), ["explicit"]
+            )
+            self.assertEqual(_collective.exchange("world", group=None, failure_prefix="exchange failed"), ["world"])
+            _collective.collective_call(Mock(), stage="explicit close", group=explicit_group)
+
+        self.assertEqual(gathered_groups, [registered_group, registered_group, explicit_group, None, explicit_group])
+        with (
+            patch.object(_collective.dist, "is_initialized", return_value=False),
+            patch.object(_collective.dist, "all_gather_object") as gather_mock,
+        ):
+            for group in (None, explicit_group):
+                self.assertEqual(_collective.exchange("local", group=group, failure_prefix="exchange failed"), ["local"])
+            gather_mock.assert_not_called()
+        for method in ("is_initialized", "get_world_size", "all_gather_object"):
+            error = ValueError("invalid communicator")
+            with (
+                self.subTest(method=method),
+                patch.object(_collective.dist, "is_initialized", return_value=True),
+                patch.object(_collective.dist, "get_world_size", return_value=1),
+                patch.object(_collective.dist, method, side_effect=error),
+                self.assertRaises(_collective.CollectiveConvergenceError) as raised,
+            ):
+                _collective.exchange("state", group=explicit_group, failure_prefix="exchange failed")
+            self.assertIs(raised.exception.__cause__, error)
+            self.assertIn("ValueError: invalid communicator", str(raised.exception))
+
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_remote_failure_keeps_successful_rank_registered(self):
@@ -102,8 +199,8 @@ class TestLifecycle(unittest.TestCase):
             member, resources = self._bind()
             release = self.manager.runtime_release = Mock()
             self.assertFalse(self.manager._runtime_released)
-            failures = Mock(side_effect=[None] * (stage - 1) + ["remote failed"])
-            with patch.object(_automatic, "exchange", side_effect=lambda value, failures=failures: [
+            failures = Mock(side_effect=[None] * (stage - 1) + [("RuntimeError", "remote failed")])
+            with patch.object(_collective, "exchange", side_effect=lambda value, failures=failures, **_kwargs: [
                     value, failures() if value is None else value]):
                 with self.assertRaisesRegex(RuntimeError, "remote failed"):
                     member.close()
@@ -154,19 +251,34 @@ class TestLifecycle(unittest.TestCase):
 
     def test_workspace_retry_keeps_stages_aligned_and_rejects_claim(self):
         """A local free failure retains the event and re-enters both barriers on retry."""
-        workspace = MegaMoeWorkspace(shared=False, completion_event=Mock(), gmm_workspace=Mock())
+        root_group = object()
+        workspace = MegaMoeWorkspace(
+            shared=False, completion_event=Mock(), gmm_workspace=Mock(),
+            heap_manager=SimpleNamespace(root_group=root_group, access=nullcontext),
+        )
         workspace.gmm_workspace.untyped_storage.return_value.resize_.side_effect = [RuntimeError("busy"), None]
-        with patch("hyper_parallel.core.multicore.modules.mega_moe.workspace.torch.npu", create=True), patch(
-                "hyper_parallel.core.multicore.modules.mega_moe.workspace.shmem.host_barrier") as barrier:
+        with (
+            patch("hyper_parallel.core.multicore.modules.mega_moe.workspace.torch.npu", create=True),
+            patch("hyper_parallel.core.multicore.modules.mega_moe.workspace.shmem.host_barrier") as barrier,
+            patch.object(_automatic._CLEANUP, "root_group", object()),
+            patch.object(_collective.dist, "is_initialized", return_value=True),
+            patch.object(_collective.dist, "get_world_size", return_value=2),
+            patch.object(_collective.dist, "all_gather_object", side_effect=lambda values, value, **_kwargs:
+                         values.__setitem__(slice(None), [value, value])) as gather,
+        ):
             with self.assertRaisesRegex(RuntimeError, "busy"):
                 workspace.close()
             self.assertIsNotNone(workspace.completion_event)
             with self.assertRaisesRegex(RuntimeError, "closing"):
                 workspace.claim()
             workspace.close()
-            with patch.object(_automatic, "exchange", side_effect=lambda value: [
-                    value, False if isinstance(value, bool) else value]):
+            with patch.object(_collective, "exchange", side_effect=lambda value, **_kwargs: [
+                    value, False if isinstance(value, bool) else value]) as remote_exchange:
                 workspace.close()
+            self.assertEqual(remote_exchange.call_count, 5)
+            self.assertTrue(all(call.kwargs["group"] is root_group for call in remote_exchange.call_args_list))
+        self.assertEqual(gather.call_count, 10)
+        self.assertTrue(all(call.kwargs["group"] is root_group for call in gather.call_args_list))
         self.assertEqual(barrier.call_count, 6)
         self.assertIsNone(workspace.completion_event)
 

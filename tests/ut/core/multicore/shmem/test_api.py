@@ -14,9 +14,7 @@
 # ============================================================================
 """Unit tests for the private SHMEM Python capability boundary."""
 
-import io
 import unittest
-from contextlib import redirect_stderr
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -66,24 +64,35 @@ class TestShmemApiDiagnostics(unittest.TestCase):
 
     def test_allocation_log_records_only_direct_callsite(self) -> None:
         """Render the first SHMEM-external caller without a complete stack chain."""
-        output = io.StringIO()
-        with patch.dict("os.environ", {"HYPER_PARALLEL_SHMEM_LOG_LEVEL": "0"}), \
-             patch.object(_debug, "_site_rank", return_value=3), redirect_stderr(output):
+        native = SimpleNamespace(_log_debug=Mock())
+        with patch.dict("os.environ", {"SHMEM_LOG_LEVEL": "DEBUG"}), \
+             patch.object(_debug, "_load_native", return_value=native):
             _debug._log_allocation_site(_Tensor())  # pylint: disable=protected-access
 
-        message = output.getvalue()
-        self.assertIn("[rank 3][DEBUG]", message)
+        native._log_debug.assert_called_once()
+        message = native._log_debug.call_args.args[0]
         self.assertIn("allocation_base=0x10000", message)
         self.assertIn("bytes=8", message)
         self.assertIn("test_allocation_log_records_only_direct_callsite", message)
         self.assertNotIn(" <- ", message)
+
+    def test_allocation_log_is_disabled_without_native_debug_level(self) -> None:
+        """Stack extraction and Native logging require SHMEM DEBUG."""
+        native = SimpleNamespace(_log_debug=Mock())
+        with patch.dict("os.environ", {}, clear=True), \
+             patch.object(_debug, "_load_native", return_value=native), \
+             patch.object(_debug.traceback, "extract_stack") as extract_stack:
+            _debug._log_allocation_site(_Tensor())  # pylint: disable=protected-access
+
+        extract_stack.assert_not_called()
+        native._log_debug.assert_not_called()
 
     def test_allocation_log_failure_does_not_change_empty_result(self) -> None:
         """Return a successful Allocation even when optional stack extraction fails."""
         tensor = _Tensor()
         torch = SimpleNamespace(get_default_dtype=Mock(return_value="torch.float32"))
         native = SimpleNamespace(_empty=Mock(return_value=tensor))
-        with patch.dict("os.environ", {"HYPER_PARALLEL_SHMEM_LOG_LEVEL": "0"}), \
+        with patch.dict("os.environ", {"SHMEM_LOG_LEVEL": "DEBUG"}), \
              patch.object(_api, "_torch_modules", return_value=(torch, object())), \
              patch.object(_api, "_load_native", return_value=native), \
              patch.object(_debug.traceback, "extract_stack", side_effect=RuntimeError("diagnostic failure")):

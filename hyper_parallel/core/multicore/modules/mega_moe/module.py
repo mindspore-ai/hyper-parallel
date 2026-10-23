@@ -28,7 +28,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from hyper_parallel.core.multicore import _automatic, shmem
+from hyper_parallel.core.multicore import _collective, shmem
 
 from ..module import MulticoreModule
 from .function import execute_mega_moe_with_permutation
@@ -136,14 +136,16 @@ class _MegaMoeExecutionResources:
             attached = self.heap_manager.attach_runtime()
 
             def construct() -> None:
-                """Build and bind local resources before collective commit."""
+                """Build and bind local resources before converging construction results."""
                 self.plan = (build_mega_moe_plan(self.spec, tensor.device)
                              if self.spec.max_local_num_tokens is None else None)
                 self.workspace = MegaMoeWorkspace(shared=shared)
                 self.workspace.capacity_floor = self.heap_manager.bind(self.workspace, self.spec, specification)
                 self.workspace.heap_manager = self.heap_manager
 
-            _automatic.collective_call(construct)
+            _collective.collective_call(
+                construct, stage="MegaMoe resource construction", group=self.heap_manager.root_group,
+            )
         except Exception:
             self.heap_manager.rollback_reservations(added_specifications, self.workspace)
             if attached and not self.heap_manager.workspaces:

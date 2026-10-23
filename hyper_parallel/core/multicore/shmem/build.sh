@@ -196,6 +196,7 @@ cmake -S "${PROJECT_ROOT}/hyper_parallel/core/multicore/shmem/ccsrc" \
     -DSHMEM_OPS_LIB="${SHMEM_OPS_LIB}" \
     -DPython3_EXECUTABLE="${PYTHON_BIN}"
 cmake --build "${CCSRC_TORCH_BUILD_DIR}" --parallel "${NATIVE_JOBS}"
+ctest --test-dir "${CCSRC_TORCH_BUILD_DIR}" --output-on-failure
 cmake --install "${CCSRC_TORCH_BUILD_DIR}"
 CCSRC_TORCH_MODULE="${TORCH_INSTALL_DIR}/hyper_parallel_shmem_torch.so"
 if [[ ! -s "${CCSRC_TORCH_MODULE}" ]]; then
@@ -218,6 +219,12 @@ for private_library in \
             "Private SHMEM SONAME does not match ${private_library}: ${private_library_path}." 11
     fi
 done
+
+SHMEM_UTILS_LIB="${OPS_INSTALL_DIR}/lib/shmem/libhyper_parallel_shmem_utils.so"
+if ! readelf -Ws "${SHMEM_UTILS_LIB}" | grep -E '[[:space:]]hpshmem_log$' >/dev/null; then
+    fail "SHMEM_PRIVATE_LOG_API_MISSING" \
+        "Private SHMEM utility library does not export hpshmem_log: ${SHMEM_UTILS_LIB}." 11
+fi
 
 while IFS= read -r component_library; do
     dynamic_section=$(readelf -d "${component_library}")

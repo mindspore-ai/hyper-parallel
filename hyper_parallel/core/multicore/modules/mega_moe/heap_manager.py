@@ -19,14 +19,14 @@ from __future__ import annotations
 import os
 import threading
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NoReturn
 
 import torch
 
-from hyper_parallel.core.multicore import shmem
+from hyper_parallel.core.multicore import _collective, shmem
 from hyper_parallel.core.multicore.shmem import _lifecycle
 
 from .spec import MegaMoeSpec, _grow_receive_capacity, _resolve_receive_capacity
@@ -144,7 +144,9 @@ class _HeapManager:
             raise RuntimeError("SHMEM root does not support concurrent Heap operations")
         try:
             if self.state == "failed":
-                raise RuntimeError("SHMEM Heap is failed; no further execution is allowed")
+                raise RuntimeError(
+                    "SHMEM Heap is no longer usable after a failed restart; restart the process"
+                )
             yield
         finally:
             self._lock.release()
@@ -164,16 +166,16 @@ class _HeapManager:
             try:
                 configured = os.getenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE")
                 if not self._configured:
-                    _lifecycle._reconfiguration_stage(  # pylint: disable=protected-access
+                    self._run_and_check_consistency(
                         lambda: self._configure(configured),
-                        group=self.root_group,
+                        stage="Configuration",
                         value=(configured, str(self.dtype), tuple(layouts)),
                     )
                     self._configured = True
                 else:
-                    _lifecycle._reconfiguration_stage(  # pylint: disable=protected-access
+                    self._run_and_check_consistency(
                         lambda: None,
-                        group=self.root_group,
+                        stage="LayoutAgreement",
                         value=tuple(layouts),
                     )
                     required = self._required_bytes(layouts)
@@ -191,6 +193,37 @@ class _HeapManager:
                     del self.entries[previous_count:]
                     self._configured, self.heap_limit, self.heap_bytes = previous_configuration
                 raise
+
+    def _run_and_check_consistency(self, operation: Callable[[], None], *, stage: str, value: Any) -> None:
+        """Run a local operation, then check failures and values across the Root group.
+
+        One result exchange checks that every rank succeeded and supplied the same value. A single-rank configuration
+        ValueError is propagated unchanged.
+        """
+        local_error = None
+        try:
+            operation()
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            local_error = error
+        report = None if local_error is None else _collective.failure_report(local_error)
+        prefix = f"SHMEM Heap failed during {stage}"
+        peers = _collective.exchange(
+            (value, report),
+            group=self.root_group,
+            failure_prefix=f"{prefix} while converging root_rank results",
+        )
+        failures = [item[1] for item in peers]
+        if any(failure is not None for failure in failures):
+            if len(peers) == 1 and isinstance(local_error, ValueError):
+                raise local_error
+            details = _collective.format_collective_failures(
+                failures,
+                rank_label="root_rank",
+                ranks_label="root_ranks",
+            )
+            raise RuntimeError(f"{prefix} on {details}") from local_error
+        if any(item[0] != value for item in peers):
+            raise RuntimeError(f"{prefix}: values differ across Root ranks")
 
     def rollback_reservations(
         self,
@@ -372,15 +405,11 @@ class _HeapManager:
         """Validate the frozen business snapshot and return its rank-independent agreement."""
         if self.state != "ready":
             raise RuntimeError("SHMEM Heap is not ready for restart")
-        if len(layouts) != len(self.entries) or len(agreement.entries) != len(self.entries):
+        if len(layouts) != len(self.entries):
             raise RuntimeError("SHMEM Heap entries changed during restart preflight")
         binding_by_entry = {id(binding.entry): binding for binding in bindings}
-        for entry, layout, entry_agreement in zip(self.entries, layouts, agreement.entries):
-            if layout != entry_agreement.layout:
-                raise RuntimeError("SHMEM Heap restart layout changed during preflight")
+        for entry, entry_agreement in zip(self.entries, agreement.entries):
             if entry.workspace is None:
-                if entry_agreement.is_bound or entry_agreement.is_materialized:
-                    raise RuntimeError("lazy SHMEM Heap entry changed during restart preflight")
                 continue
             if entry.bound_spec is None:
                 raise RuntimeError("SHMEM Heap workspace has no bound MegaMoe specification")
@@ -392,8 +421,6 @@ class _HeapManager:
                 entry.layout.receive_capacity,
                 workspace_replacements,
             )
-            if not entry_agreement.is_bound:
-                raise RuntimeError("SHMEM Heap binding changed during restart preflight")
             if materialized != entry_agreement.is_materialized:
                 raise RuntimeError("SHMEM Heap materialization state changed during preflight")
         return agreement
@@ -439,10 +466,19 @@ class _HeapManager:
             )
 
     def _restart(self, layouts: list[_WorkspaceLayout], heap_bytes: int) -> None:
-        """Restart SHMEM and publish candidate layouts only after result binding."""
+        """Restart SHMEM, validate and bind local results, then publish business state."""
         started = time.perf_counter()
         replacements, bindings, agreement = self._describe_restart(layouts)
         old_bytes = self.heap_bytes
+
+        def raise_post_restart_failure(error: Exception, *, context: str) -> NoReturn:
+            """Invalidate the manager and report a post-restart business-state failure."""
+            self.state = "failed"
+            raise RuntimeError(
+                f"{context}: {error}. The restarted SHMEM Allocations cannot be rolled back; "
+                "terminate the process and let the launcher restart the job."
+            ) from error
+
         try:
             result = shmem._restart(  # pylint: disable=protected-access
                 heap_size_bytes=heap_bytes,
@@ -453,12 +489,16 @@ class _HeapManager:
             if not _lifecycle._runtime_is_healthy():  # pylint: disable=protected-access
                 self.state = "failed"
             raise
+
+        context = "MegaMoe restart result validation failed due to a local implementation error"
         try:
             self._validate_restart_result(result, bindings, layouts)
+            context = "MegaMoe workspace binding failed after SHMEM restart due to a local implementation error"
             self._bind_restart_result(result, bindings, layouts)
-        except Exception:
-            self.state = "failed"
-            raise
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            raise_post_restart_failure(error, context=context)
+
+        stages_ms = dict(result.stages_ms)
         for entry, layout in zip(self.entries, layouts):
             entry.layout = layout
             if entry.workspace is not None:
@@ -469,7 +509,7 @@ class _HeapManager:
             "epoch": self.epoch,
             "old_heap_bytes": old_bytes,
             "heap_bytes": heap_bytes,
-            "stages_ms": result.stages_ms,
+            "stages_ms": stages_ms,
             "total_ms": (time.perf_counter() - started) * 1000,
             "capacities": [entry.layout.receive_capacity for entry in self.entries],
         })
