@@ -542,5 +542,65 @@ class TestFullyShardListAPI(unittest.TestCase):
         linear1.set_modules_to_forward_prefetch([linear2])
         linear1.set_modules_to_backward_prefetch([linear2])
 
+
+class TestModuleControlScope(unittest.TestCase):
+    """Check control scopes and gradient clearing on shared module groups."""
+
+    def test_controls_allow_outer_override_and_respect_recurse(self):
+        """Local controls preserve child settings until an outer recursive update."""
+        class Unit(HSDPModule, nn.Module):
+            def __init__(self, scheduler=None):
+                nn.Module.__init__(self)
+                HSDPModule.__init__(self)
+                self.hsdp_scheduler = scheduler if scheduler is not None else MagicMock()
+
+        for method, control in (
+            ("set_requires_gradient_sync", "set_requires_grad_sync"),
+            ("set_requires_all_reduce", "set_requires_all_reduce"),
+            ("set_reshard_after_forward", "set_reshard_after_forward"),
+            ("set_reshard_after_backward", "set_reshard_after_backward"),
+        ):
+            with self.subTest(method=method):
+                root = Unit()
+                root.norm = Unit()
+                root.head = Unit(root.norm.hsdp_scheduler)
+                getattr(root.head, method)(False, recurse=False)
+                getattr(root, method)(False, recurse=False)
+                getattr(root.hsdp_scheduler, control).assert_called_once_with(False)
+                getattr(root.norm.hsdp_scheduler, control).assert_called_once_with(False)
+                root.hsdp_scheduler.reset_mock()
+                getattr(root, method)(True)
+                getattr(root.hsdp_scheduler, control).assert_called_once_with(True)
+                child_control = getattr(root.norm.hsdp_scheduler, control)
+                self.assertEqual(child_control.call_count, 3)
+                self.assertEqual(child_control.call_args.args, (True,))
+
+    def test_invalid_recurse_is_rejected(self):
+        """Every public control rejects a non-boolean recursion option."""
+        module = MagicMock(spec=HSDPModule)
+        for method in (
+            "set_requires_gradient_sync",
+            "set_requires_all_reduce",
+            "set_reshard_after_forward",
+            "set_reshard_after_backward",
+        ):
+            with self.subTest(method=method), self.assertRaisesRegex(ValueError, "recurse"):
+                getattr(HSDPModule, method)(module, True, recurse="invalid")
+
+    def test_zero_grad_accepts_set_to_none(self):
+        """Clear gradients by zeroing or setting them to None as requested."""
+        class Unit(HSDPModule, nn.Module):
+            def __init__(self):
+                nn.Module.__init__(self)
+                HSDPModule.__init__(self)
+                self.weight = nn.Parameter(torch.ones(3))
+
+        unit = Unit()
+        unit.weight.grad = torch.ones(3)
+        unit.zero_grad(set_to_none=False)
+        torch.testing.assert_close(unit.weight.grad, torch.zeros(3))
+        unit.zero_grad(set_to_none=True)
+        self.assertIsNone(unit.weight.grad)
+
 if __name__ == "__main__":
     unittest.main()
