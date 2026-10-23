@@ -22,6 +22,7 @@ import torch
 from torch import nn
 
 from hyper_parallel.components.functional import sparse_flash_mla as attention_ops
+from hyper_parallel.distributed.context_parallel.compressed_document import document_compression_plan
 from hyper_parallel.components.modules import shared_compressed_dsa_attention as attention
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import reference_sparse_attention
 from hyper_parallel.trainer.config import PlanOverride, Target, entries_to_module_replacements
@@ -205,3 +206,68 @@ class TestCompressedAttentionReference(unittest.TestCase):
         for current, target in zip(candidate, reference):
             torch.testing.assert_close(current.grad, target.grad)
         torch.testing.assert_close(actual[0, 0], torch.zeros_like(actual[0, 0]), rtol=0, atol=0)
+
+
+class TestNaturalDocumentCompression(unittest.TestCase):
+    """Odd documents retain their tokens without creating cross-document compressed keys."""
+
+    def test_pool_and_rotary_positions_match_independent_documents(self):
+        """A length-three document and a length-five document produce one and two keys."""
+        key = torch.arange(16, dtype=torch.float32).reshape(1, 8, 2).requires_grad_()
+        gate = torch.zeros_like(key, requires_grad=True)
+        plan = document_compression_plan((0, 3, 8), 2, 8, 1, 0)
+        actual = plan.pool(key, gate, None)
+        expected = torch.stack((key[:, :2].mean(1), key[:, 3:5].mean(1), key[:, 5:7].mean(1)), dim=1)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        actual.sum().backward()
+        expected_grad = torch.full_like(key, .5)
+        expected_grad[:, [2, 7]] = 0
+        torch.testing.assert_close(key.grad, expected_grad, rtol=0, atol=0)
+        positions = torch.arange(8).reshape(1, 8, 1).float()
+        cos, sin = plan.positions(positions, -positions, None)
+        torch.testing.assert_close(cos.flatten(), torch.tensor([0., 3., 5.]), rtol=0, atol=0)
+        torch.testing.assert_close(sin, -cos, rtol=0, atol=0)
+
+    def test_causal_topk_excludes_other_documents_and_incomplete_blocks(self):
+        """Compressed coordinates use cumulative complete blocks, not global token division."""
+        packed = attention.SharedCompressedPackedSequence(torch.tensor([0, 3, 8]), 0, 8, 8)
+        packed = packed.prepare(torch.device("cpu"), (1, 2))
+        selected = attention.compressed_causal_topk(
+            torch.ones(1, 8, 1, 2), torch.ones(1, 3, 2), torch.ones(1, 8, 1),
+            compress_ratio=2, sparse_count=3, query_segments=packed.indexer_segments(2),
+            minimum_key_indices=packed.minimum_key_indices(torch.device("cpu"), 2),
+        )
+        expected = torch.tensor([[[-1, -1, -1], [0, -1, -1], [0, -1, -1], [-1, -1, -1],
+                                  [1, -1, -1], [1, -1, -1], [1, 2, -1], [1, 2, -1]]], dtype=torch.int32)
+        torch.testing.assert_close(selected, expected, rtol=0, atol=0)
+
+    def test_cross_rank_block_ownership_includes_empty_owners(self):
+        """The last-token owner completes each group, even when another owner has no group."""
+        plans = [document_compression_plan((0, 3, 8), 2, 2, 4, rank) for rank in range(4)]
+        self.assertEqual(plans[0].counts, (1, 0, 1, 1))
+        expected_starts = ([0], [], [3], [5])
+        for plan, starts in zip(plans, expected_starts):
+            actual = (plan.indices(torch.device("cpu"))[1] + plan.route.global_start).tolist()
+            self.assertEqual(actual, starts)
+        for sender, source in enumerate(plans):
+            for receiver, target in enumerate(plans):
+                self.assertEqual(source.route.input_splits[receiver], target.route.output_splits[sender])
+
+    def test_fused_empty_bank_retains_the_collective_gradient(self):
+        """An all-empty prefix uses native SWA and returns an explicit zero bank gradient."""
+        contract = SimpleNamespace(device=SimpleNamespace(type="npu"), dtype=torch.bfloat16, shape=(1, 8, 1, 512))
+        self.assertTrue(attention_ops.supports_fused_attention_inputs(contract, 2, 128, 0))
+        source = _source(True)
+        source.compress_ratio = 2
+        module = attention.SharedCompressedDSAAttention(source, use_fused_ops=True)
+        query = torch.ones(1, 1, 1, 512, requires_grad=True)
+        key = torch.empty(1, 0, 512, requires_grad=True)
+        indices = torch.empty(1, 1, 0, dtype=torch.int32)
+        with patch.object(attention, "supports_fused_attention_inputs", return_value=True):
+            with patch.object(attention, "sparse_flash_mla", return_value=query.transpose(1, 2)):
+                output = module._run_sparse_attention(  # pylint: disable=protected-access
+                    query, query, key, indices, 0, 1, None, ((0, 1, 0, 0, 1),),
+                )
+        output.sum().backward()
+        self.assertIsNotNone(key.grad)
+        torch.testing.assert_close(key.grad, torch.zeros_like(key), rtol=0, atol=0)

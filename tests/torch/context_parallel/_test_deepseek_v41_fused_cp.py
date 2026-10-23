@@ -181,7 +181,7 @@ def test_native_geometry_cp8_gloo():
                       for model in (reference, candidate)]
         for step in range(2):
             torch.manual_seed(100+step)
-            boundaries = torch.tensor([0, 30 if step % 2 else 34, 78, length])
+            boundaries = torch.tensor([*range(17), 31, 79, length] if step % 2 else [0, 34, 78, length])
             source = torch.randn(1, length, 32)
             full = source.clone().requires_grad_()
             shard = source[:, rank*local:(rank+1)*local].clone().requires_grad_()
@@ -260,7 +260,7 @@ def test_native_cp8_training_smoke():
                 torch.manual_seed(200+step)
                 source = torch.randn(1, length, 64).bfloat16()
                 hidden = source[:, rank*local:(rank+1)*local].to(device).requires_grad_()
-                boundaries = torch.tensor([0, 62 if step % 2 else 66, length//2+30, length])
+                boundaries = torch.tensor([*range(33), 63, 159, length] if step % 2 else [0, 66, 158, length])
                 optimizer.zero_grad(set_to_none=True)
                 output = _forward(model, hidden, rank*local, boundaries, context, use_fused=True)
                 loss = output.float().square().sum()/(length*64)

@@ -147,7 +147,7 @@ def supports_fused_attention_inputs(query: torch.Tensor, ratio: int, window: int
         query: Main Q [batch, heads, queries, dimension].
         ratio: Model ratio, zero for a pure SWA layer.
         window: Raw attention window, including the current token.
-        topk: Logical compressed selection width, before padding.
+        topk: Logical compressed selection width, before padding; zero means no complete compressed key.
     """
     if query.device.type != "npu" or query.dtype != torch.bfloat16:
         return False
@@ -155,7 +155,7 @@ def supports_fused_attention_inputs(query: torch.Tensor, ratio: int, window: int
         return False
     if query.shape[1] not in (1, 2, 4, 8, 16, 32, 64, 128) or query.shape[2] == 0:
         return False
-    if ratio and not 1 <= topk <= 512:
+    if ratio and not 0 <= topk <= 512:
         return False
     return True
 
@@ -227,7 +227,7 @@ def _bsnd_sparse_flash_mla(
         query: torch.Tensor, raw_key: torch.Tensor, main_key: torch.Tensor | None,
         indices: torch.Tensor | None, sinks: torch.Tensor, scale: float, ratio: int,
         window: int, query_offset: int,
-        segment: tuple[int, int, int, int, int],
+        segment: tuple[int, int, int, int, int], raw_document_starts: tuple = (),
 ) -> torch.Tensor:
     """Run one document segment per batch item using the original all-gather banks.
 
@@ -253,7 +253,7 @@ def _bsnd_sparse_flash_mla(
     if query.dtype != torch.bfloat16 or query.shape[-1] != 512 or window != 128:
         raise ValueError("V4 attention requires BF16, head_dim=512, and window=128")
     start, end, key_start, key_end, residual = segment
-    document_start = key_start * max(ratio, 1)
+    document_start = dict(raw_document_starts).get(start, key_start * max(ratio, 1))
     raw_left = max(document_start, query_offset + start - window + 1)
     raw_right = query_offset + end
     raw = raw_key[:, :, raw_left:raw_right].transpose(1, 2).contiguous()
@@ -335,7 +335,7 @@ class _SparseFlashMlaTND(torch.autograd.Function):
 def sparse_flash_mla(
         query: torch.Tensor, raw_key: torch.Tensor, main_key: torch.Tensor | None,
         indices: torch.Tensor | None, sinks: torch.Tensor, scale: float, ratio: int,
-        window: int, query_offset: int, segments: tuple,
+        window: int, query_offset: int, segments: tuple, raw_document_starts: tuple = (),
 ) -> torch.Tensor:
     """Batch packed documents in native TND while preserving the all-gather banks.
 
@@ -350,6 +350,7 @@ def sparse_flash_mla(
         window: Raw sliding-window size, including the current token.
         query_offset: Global position of the first local query.
         segments: Local Q start/end, compressed document start/prefix end and residual.
+        raw_document_starts: Explicit (local Q start, raw document start) pairs for natural lengths.
 
     Returns:
         Attention output [batch, queries, heads, 512]. A single document or
@@ -359,18 +360,20 @@ def sparse_flash_mla(
     if len(segments) == 1:
         return _bsnd_sparse_flash_mla(
             query, raw_key, main_key, indices, sinks, scale, ratio, window, query_offset, segments[0],
+            raw_document_starts,
         )
     if query.shape[0] != 1:
         raise ValueError("Packed Sparse Flash MLA requires batch size one")
     if query.dtype != torch.bfloat16 or query.shape[-1] != 512 or window != 128:
         raise ValueError("V4 attention requires BF16, head_dim=512, and window=128")
+    document_starts = dict(raw_document_starts)
     output = None
     for has_keys in (True, False):
         plan = csa_tnd_plan(segments, ratio, has_keys)
         if plan is None:
             continue
         raw_ranges = tuple(
-            (max(ks * max(ratio, 1), query_offset+s-window+1), query_offset+e)
+            (max(document_starts.get(s, ks * max(ratio, 1)), query_offset+s-window+1), query_offset+e)
             for s, e, ks, _, _ in plan.segments
         )
         raw = pack_ranges(raw_key.squeeze(0).squeeze(0), raw_ranges).unsqueeze(1)

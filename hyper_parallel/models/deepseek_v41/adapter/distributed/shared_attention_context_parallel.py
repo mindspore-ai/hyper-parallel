@@ -20,6 +20,7 @@ from typing import Any
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.core.utils.communication import differentiable_all_to_all_single
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedAttentionCPContext,
     SharedCompressedAttentionTPContext,
@@ -31,6 +32,7 @@ from hyper_parallel.distributed._builder.forward_rewriter import (
 from hyper_parallel.distributed.context_parallel.collectives import (
     async_cp_allgather_launch,
 )
+from hyper_parallel.distributed.context_parallel.compressed_document import CompressionBoundaryRoute
 from hyper_parallel.distributed.recipe_spec import inner_wrapper
 
 
@@ -45,11 +47,24 @@ def _build_shared_attention_cp_context(cp_mesh: Any) -> SharedCompressedAttentio
         """Launch a differentiable KV all-gather for projection overlap."""
         return async_cp_allgather_launch(tensor, sequence_dim, cp_mesh)
 
+    def _exchange_boundary(tensor: torch.Tensor, route: CompressionBoundaryRoute) -> torch.Tensor:
+        """Complete compressor groups; autograd sends boundary gradients to their owners."""
+        local = tensor.movedim(1, 0).contiguous()
+        parts = [local.narrow(0, offset, count)
+                 for offset, count in zip(route.send_offsets, route.input_splits) if count]
+        send = torch.cat(parts, dim=0) if parts else local[:0]
+        received = differentiable_all_to_all_single(
+            send, list(route.input_splits), list(route.output_splits), group=cp_mesh.get_group(),
+        )
+        # Even empty receives must remain connected so every rank participates in backward.
+        return torch.cat((received, local), dim=0).movedim(0, 1).contiguous()
+
     return SharedCompressedAttentionCPContext(
         size=cp_mesh.size(),
         rank=cp_mesh.get_local_rank(),
         gather_sequence=_gather_sequence,
         launch_sequence=_launch_sequence,
+        exchange_boundary=_exchange_boundary,
     )
 
 
