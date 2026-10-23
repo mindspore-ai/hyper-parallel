@@ -325,6 +325,32 @@ class TestReshardStructure(unittest.TestCase):
         for node in forward_gathers:
             self.assertFalse(node.meta.get("autograd_backward", False))
 
+    def test_expert_group_is_preserved_by_backward_regather(self):
+        """Use the expert axis for both gathers and its gradient reduction."""
+        joint = trace_model_graph(
+            self.model, lambda mdl, inp: mdl(inp).square().mean(),
+            {"inp": torch.randn(4, 8, dtype=torch.float64)},
+        )
+        graph = joint.graph_module
+        live = copy.deepcopy(self.model)
+        expert_name = "layers.1.weight"
+        with _patch_dist(world_size=4) as mocked, patch(_RESOLVE_PG_PATH, side_effect=lambda name: name):
+            mocked.get_world_size.side_effect = lambda group=None: 2 if group == "edp" else 4
+            FSDPPass().run(
+                graph, PassConfig(fsdp_degree=4, fsdp_reshard_after_forward=True), model=live,
+                expert_param_names={expert_name}, expert_fsdp_group_name="edp", fsdp_group_name="fsdp",
+            )
+        graph.graph.lint()
+        backward = [node for node in graph.graph.nodes if node.meta.get("comm_type") == "fsdp_all_gather_backward"]
+        self.assertEqual([node.meta["param_name"] for node in backward], [expert_name])
+        for node in graph.graph.nodes:
+            if node.meta.get("comm_type") in ("fsdp_all_gather", "fsdp_all_gather_backward"):
+                expected = (2, "edp") if node.meta["param_name"] == expert_name else (4, "fsdp")
+                self.assertEqual(node.args[1:], expected)
+        reductions = [node for node in graph.graph.nodes if node.meta.get("comm_type") == "fsdp_reduce_scatter"]
+        self.assertEqual([node.args[3] for node in reductions].count("edp"), 1)
+        self.assertEqual(tuple(live.layers[1].weight.shape), (2, 8))
+
     def test_forward_gather_is_sunk_to_first_use(self):
         """The last layer's gather lands after earlier compute, not at the top.
 

@@ -69,6 +69,8 @@ from torch._decomp import get_decompositions
 from torch._guards import tracing, TracingContext
 from torch._subclasses import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
+from torch.fx.passes.runtime_assert import insert_deferred_runtime_asserts
 from torch.fx.traceback import preserve_node_meta
 from torch.nn.utils import stateless
 
@@ -396,7 +398,7 @@ def _fakeify_input(fake_mode: FakeTensorMode, x: Any) -> Any:
     """Convert a real tensor input into its fake counterpart."""
     if not isinstance(x, torch.Tensor):
         return x
-    return fake_mode.from_tensor(x, static_shapes=False)
+    return fake_mode.from_tensor(x, static_shapes=True)
 
 
 def _input_meta(x: Any) -> Any:
@@ -561,7 +563,7 @@ def trace_model_graph(  # pylint: disable=too-many-locals
     if symbolic:
         fake_mode, fake_args = build_symbolic_inputs(state_flat, inputs, dynamic_arg_dims)
     else:
-        fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
+        fake_mode = FakeTensorMode(allow_non_fake_inputs=True, shape_env=ShapeEnv(), static_shapes=True)
         fake_args = tuple(_fakeify_input(fake_mode, value) for value in full_args)
     num_state_inputs = len(state_flat)
 
@@ -593,6 +595,10 @@ def trace_model_graph(  # pylint: disable=too-many-locals
         traced_graph = make_fx(
             _fwd_bwd_fn, decomposition_table=decompositions, **_MAKE_FX_KWARGS
         )(*fake_args)
+
+    # EP receive lengths depend on routing values even when input shapes are fixed.
+    insert_deferred_runtime_asserts(traced_graph, fake_mode.shape_env, "joint_graph")
+    traced_graph.recompile()
 
     # Stock torch's make_fx does not tag backward nodes (no torchtitan
     # ``_patch_engine_backward`` hook), so the joint graph splits into

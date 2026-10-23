@@ -58,8 +58,10 @@ from hyper_parallel.distributed.expert_parallel.routing import (
     apply_capacity_limit,
 )
 from hyper_parallel.distributed.expert_parallel.collectives import (
+    ep_exchange_counts,
     ep_all_to_all,
     ep_all_to_all_async,
+    ep_split_sizes,
     wait_ep_all_to_all,
 )
 from hyper_parallel.distributed.expert_parallel.routing import (
@@ -488,10 +490,9 @@ def _prepare_ep_dispatch(
             receive_counts_tensor.tolist()
     else:
         send_counts_tensor = _expert_token_counts(destination_ranks, ep_size)
-        receive_counts_tensor = torch.empty_like(send_counts_tensor)
-        dist.all_to_all_single(receive_counts_tensor, send_counts_tensor, group=ep_group)
-        send_counts = send_counts_tensor.tolist()
-        receive_counts = receive_counts_tensor.tolist()
+        receive_counts_tensor = ep_exchange_counts(send_counts_tensor, ep_group)
+        send_counts = ep_split_sizes(send_counts_tensor, dispatched_states.shape[0])
+        receive_counts = ep_split_sizes(receive_counts_tensor)
         store_static_plan(
             plan_key, (send_counts, receive_counts, send_counts_tensor, receive_counts_tensor),
             f"(ep={ep_size}, tokens={token_count}, topk={experts_per_token}, "

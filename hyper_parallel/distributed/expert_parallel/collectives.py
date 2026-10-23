@@ -41,11 +41,14 @@ import threading
 from typing import Any, Optional
 import torch
 import torch.distributed as dist
+from torch import _check, _check_is_size
+from torch.distributed import _functional_collectives
 
 from hyper_parallel.core.dtensor._utils import (
     differentiable_all_to_all_single_async,
     get_device_handle,
 )
+from hyper_parallel.core.utils.communication import _is_tracing_or_compiling
 
 _UNEVEN_A2A_BACKENDS = ("nccl", "hccl")
 
@@ -82,6 +85,45 @@ _LAZY_A2A_STREAM = None
 _LAZY_A2A_READY_EVENT = None
 _LAZY_A2A_DONE_EVENT = None
 _LAZY_A2A_LOCK = threading.Lock()
+
+
+def ep_exchange_counts(counts: torch.Tensor, group: Any) -> torch.Tensor:
+    """Exchange one integer count per peer, waiting before reading the result.
+
+    Args:
+        counts: Non-differentiable send counts in process-group rank order.
+        group: Expert-parallel process group.
+
+    Returns:
+        Counts received from each peer in the same rank order.
+    """
+    if _is_tracing_or_compiling():
+        return _functional_collectives.wait_tensor(
+            _functional_collectives.all_to_all_single(counts, None, None, group)
+        )
+    received = torch.empty_like(counts)
+    dist.all_to_all_single(received, counts, group=group)
+    return received
+
+
+def ep_split_sizes(counts: torch.Tensor, total: Optional[int] = None) -> list[int]:
+    """Read per-call segment sizes, retaining data dependencies during capture.
+
+    Args:
+        counts: One-dimensional integer tensor of segment lengths.
+        total: Expected number of rows, when known from a payload's shape.
+
+    Returns:
+        Concrete eager sizes or symbolic sizes evaluated by the captured graph.
+    """
+    if not _is_tracing_or_compiling():
+        return counts.tolist()
+    sizes = counts.cpu().tolist()
+    for size in sizes:
+        _check_is_size(size)
+    if total is not None:
+        _check(sum(sizes) == total)
+    return sizes
 
 
 def _backend_supports_uneven_a2a(group) -> bool:
@@ -568,8 +610,13 @@ def ep_all_to_all(
     NCCL/HCCL -> ragged a2a (zero-padding); other backends (gloo test path) -> pad-to-max.
     With ``HP_EP_EQUAL_A2A`` on, a uniform plan is exchanged with the equal-length
     a2a instead (same rows, same order, cheaper kernel).  This entry always
-    returns a materialized tensor; :func:`ep_all_to_all_async` is the lazy one.
+    returns a materialized tensor in eager mode; graph capture records the
+    functional exchange and its consumer wait. :func:`ep_all_to_all_async`
+    provides the eager lazy entry.
     """
+    if _is_tracing_or_compiling():
+        # Keep the autograd wrapper; its first consumer inserts the stream wait.
+        return _functional_collectives.all_to_all_single_autograd(x, recv_counts, send_counts, group)
     if not _backend_supports_uneven_a2a(group):
         return _EPAllToAllPadded.apply(x, send_counts, recv_counts, group)
     rows_per_peer = _equal_a2a_rows(x, send_counts, recv_counts, group)

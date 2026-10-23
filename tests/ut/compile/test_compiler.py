@@ -135,6 +135,22 @@ class TestGraphCompilerForwardBackward(unittest.TestCase):
             "an identical second step must double the accumulated gradient",
         )
 
+    def test_gradients_match_parameter_layout(self):
+        """Preserve eager's optimizer-facing layout for dense and transposed weights."""
+        for transposed in (False, True):
+            with self.subTest(transposed=transposed):
+                model = _make_model()
+                if transposed:
+                    model.weight = nn.Parameter(model.weight.T)
+                x, y = _fixed_batch()
+                expected = torch.autograd.grad(_mse_train_fn(model, x=x, y=y), tuple(model.parameters()))
+                compiler = GraphCompiler(model, _mse_train_fn, PassConfig(fsdp_enabled=False),
+                                         device=torch.device("cpu"))
+                compiler.forward_backward(x=x, y=y)
+                for parameter, gradient in zip(model.parameters(), expected):
+                    self.assertEqual(parameter.grad.stride(), parameter.stride())
+                    torch.testing.assert_close(parameter.grad, gradient, rtol=1e-5, atol=1e-6)
+
     def test_grad_count_mismatch_raises(self):
         """Test the compiler refuses to assign on a trainable-count mismatch.
 
@@ -275,6 +291,7 @@ class TestGraphCompilerDeviceMesh(unittest.TestCase):
         }.__getitem__
 
         mesh_context = MagicMock()
+        mesh_context.ep_size = 1
         mesh_context.fsdp_non_moe_mesh = mock_non_moe
         mesh_context.device_mesh = None
 
@@ -329,6 +346,7 @@ class TestGraphCompilerDeviceMesh(unittest.TestCase):
         }.__getitem__
 
         mesh_context = MagicMock()
+        mesh_context.ep_size = 1
         mesh_context.fsdp_non_moe_mesh = None
         mesh_context.device_mesh = mock_mesh
 
@@ -501,6 +519,7 @@ class TestGraphCompilerDeviceMesh(unittest.TestCase):
             "fsdp_shard": shard_sub,
         }.__getitem__
         mesh_context = MagicMock()
+        mesh_context.ep_size = 1
         mesh_context.fsdp_non_moe_mesh = mock_non_moe
         mesh_context.device_mesh = None
         mesh_context.dp_replicate_size = 2
@@ -533,6 +552,7 @@ class TestGraphCompilerDeviceMesh(unittest.TestCase):
         mock_non_moe.mesh_dim_names = ("fsdp_replicate", "fsdp_shard", "tp")
         mock_non_moe.__getitem__.side_effect = {"fsdp_shard": shard_sub}.__getitem__
         mesh_context = MagicMock()
+        mesh_context.ep_size = 1
         mesh_context.fsdp_non_moe_mesh = mock_non_moe
         mesh_context.device_mesh = None
         mesh_context.dp_replicate_size = 1
@@ -557,6 +577,7 @@ class TestGraphCompilerDeviceMesh(unittest.TestCase):
             device=torch.device("cpu"),
         )
         mesh_context = MagicMock()
+        mesh_context.ep_size = 1
         mesh_context.fsdp_non_moe_mesh = None
         mesh_context.device_mesh = MagicMock()
         mesh_context.dp_replicate_size = 1
