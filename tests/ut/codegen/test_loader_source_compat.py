@@ -21,8 +21,10 @@ import sys
 from pathlib import Path
 
 import pytest
+from transformers.models.auto import AutoModel
 
 from hyper_parallel.codegen import loader
+from hyper_parallel.codegen.emit.modeling import rewrite_relative_imports
 from hyper_parallel.codegen.source.compat import sanitize_source_compat
 
 
@@ -91,6 +93,50 @@ def test_generated_import_resolves_remote_sibling_modules(tmp_path: Path) -> Non
     assert module.RESULT == 42
     sibling_name = module.__package__ + ".configuration_demo"
     assert sibling_name in sys.modules
+
+
+def test_generated_import_registers_synthetic_root_package(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clean interpreter can resolve the generated package hierarchy."""
+    bundle = tmp_path / "bundle"
+    _write_modeling(
+        bundle, "from .configuration_demo import VALUE\nRESULT = VALUE + 1\n"
+    )
+    (bundle / "configuration_demo.py").write_text("VALUE = 41\n", encoding="utf-8")
+    monkeypatch.delitem(sys.modules, "hyper_parallel_generated", raising=False)
+
+    module = loader.import_generated_module(str(bundle))
+
+    assert module.RESULT == 42
+    assert "hyper_parallel_generated" in sys.modules
+
+
+def test_generated_import_resolves_transformers_parent_auto(tmp_path: Path) -> None:
+    """Installed modeling sources retain their parent ``models.auto`` import."""
+    bundle = tmp_path / "bundle"
+    _write_modeling(bundle, "from ..auto import AutoModel\nRESULT = AutoModel\n")
+
+    module = loader.import_generated_module(str(bundle))
+
+    assert module.RESULT is AutoModel
+
+
+def test_rewrite_relative_imports_handles_consecutive_dot_tokens() -> None:
+    """Parent imports emitted as separate dot tokens become absolute."""
+    source = "from ..auto.modeling_auto import AutoModel\n"
+
+    rewritten = rewrite_relative_imports(
+        source, "transformers.models.qwen3_5.modeling_qwen3_5"
+    )
+
+    assert rewritten == "from transformers.models.auto.modeling_auto import AutoModel\n"
+
+    top_level = rewrite_relative_imports(
+        "from ...activations import ACT2FN\n",
+        "transformers.models.qwen3_5.modeling_qwen3_5",
+    )
+    assert top_level == "from transformers.activations import ACT2FN\n"
 
 
 def test_failed_generated_import_does_not_cache_partial_module(tmp_path: Path) -> None:

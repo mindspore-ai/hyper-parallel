@@ -74,12 +74,15 @@ def project_source_spec(config: Any) -> SourceSpec:
     we only record the identity the source resolver will key on.  The model
     Target holds its id under the key the caller actually used — most YAMLs and
     ``HyperAutoModel.from_pretrained`` use ``pretrained_model_name_or_path`` —
-    so read that first and fall back to ``model_name_or_path``.
+    so read that first, then fall back to ``model_name_or_path`` and the
+    ``config_path`` used by cropped/custom builders.
     """
     model = getattr(config, "model", None)
     model_name_or_path = getattr(model, "pretrained_model_name_or_path", None)
     if model_name_or_path is None:
         model_name_or_path = getattr(model, "model_name_or_path", None)
+    if model_name_or_path is None:
+        model_name_or_path = getattr(model, "config_path", None)
     if model_name_or_path is None:
         # Target configured without a positional model id — the HF path will
         # derive it from from_pretrained's first arg at load time.
