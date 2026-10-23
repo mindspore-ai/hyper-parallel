@@ -35,7 +35,7 @@ ensure_mindspore_platform_for_fully_shard()
 
 import mindspore as ms
 
-from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
+from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerContext, HSDPSchedulerV2
 from hyper_parallel.core.fully_shard.hsdp_utils import FSDPSchedulerState
 from hyper_parallel.platform.mindspore.fully_shard import scheduler as scheduler_mod
 from hyper_parallel.platform.mindspore.fully_shard.scheduler import MindSporeHSDPSchedulerV2
@@ -58,6 +58,8 @@ def _make_scheduler():
     scheduler.scheduler_state = FSDPSchedulerState.PRE_FORWARD
     scheduler.cell = "cell"
     scheduler._fsdp_group_post_pending = None
+    scheduler._is_root = False
+    scheduler.scheduler_ctx = HSDPSchedulerContext()
     return scheduler
 
 
@@ -265,6 +267,98 @@ class TestMindSporeScheduler(MindSporeFullyShardUnitTest):
         scheduler._hsdp_backward_hook.reset_mock()
         MindSporeHSDPSchedulerV2._backward_hook(scheduler)
         scheduler._hsdp_backward_hook.assert_not_called()
+
+    def test_nested_callback_only_finishes_its_local_unit(self):
+        """An inner backward callback must not wait outer pending reductions."""
+        outer = _make_scheduler()
+        inner = _make_scheduler()
+        inner.scheduler_ctx = outer.scheduler_ctx
+        outer._is_root = True
+        callbacks = []
+        for scheduler in (outer, inner):
+            scheduler.scheduler_state = FSDPSchedulerState.PRE_BACKWARD
+            scheduler._backward_hook = MagicMock()
+            scheduler.wait_for_pending_reductions = MagicMock()
+
+        with patch.object(scheduler_mod._pynative_executor, "queue_backward_final_callback",
+                          side_effect=callbacks.append):
+            outer._backward_pre_hook("grad")
+            inner._backward_pre_hook("grad")
+        HSDPSchedulerV2.root_bp_state = True
+        callbacks[1]()  # Reentrant child finishes before the enclosing backward task.
+        inner._backward_hook.assert_called_once_with()
+        inner.wait_for_pending_reductions.assert_not_called()
+        outer.wait_for_pending_reductions.assert_not_called()
+        self.assertTrue(outer.scheduler_ctx.post_backward_final_callback_queued)
+        self.assertTrue(HSDPSchedulerV2.root_bp_state)
+
+        callbacks[0]()
+        outer.wait_for_pending_reductions.assert_called_once_with()
+        self.assertFalse(outer.scheduler_ctx.post_backward_final_callback_queued)
+        self.assertFalse(outer.scheduler_ctx.post_backward_schedulers)
+        self.assertFalse(HSDPSchedulerV2.root_bp_state)
+
+    def test_outer_callback_finalizes_units_before_late_local_callbacks(self):
+        """Non-reentrant/fallback hooks may run after the enclosing callback."""
+        owner = _make_scheduler()
+        child = _make_scheduler()
+        child.scheduler_ctx = owner.scheduler_ctx
+        callbacks = []
+        order = []
+
+        def finish(scheduler: MindSporeHSDPSchedulerV2, label: str) -> None:
+            """Model the local post-backward state transition."""
+            scheduler.scheduler_state = FSDPSchedulerState.BACKWARD
+            order.append(label)
+
+        for scheduler, label in ((owner, "owner"), (child, "child")):
+            scheduler.scheduler_state = FSDPSchedulerState.PRE_BACKWARD
+            scheduler._hsdp_backward_hook = MagicMock(
+                side_effect=lambda *args, unit=scheduler, name=label: finish(unit, name)
+            )
+        owner.wait_for_pending_reductions = MagicMock(side_effect=lambda: order.append("drain"))
+        with patch.object(scheduler_mod._pynative_executor, "queue_backward_final_callback",
+                          side_effect=callbacks.append):
+            owner._backward_pre_hook("grad")
+            child._backward_pre_hook("grad")
+            child._backward_pre_hook("second output grad")
+
+        callbacks[0]()  # Neither local post-backward fallback has run yet.
+        self.assertEqual(order, ["owner", "child", "drain"])
+        for callback in callbacks[1:]:
+            callback()
+        self.assertEqual(order, ["owner", "child", "drain"])
+        owner.wait_for_pending_reductions.assert_called_once_with()
+
+    def test_non_root_owner_finalizes_after_local_backward_and_rearms(self):
+        """Callback ownership must not depend on root flags or BACKWARD state."""
+        scheduler = _make_scheduler()
+        scheduler.scheduler_state = FSDPSchedulerState.PRE_BACKWARD
+        scheduler.wait_for_pending_reductions = MagicMock()
+        callbacks = []
+        with patch.object(scheduler_mod._pynative_executor, "queue_backward_final_callback",
+                          side_effect=callbacks.append):
+            for _ in range(2):
+                scheduler.scheduler_state = FSDPSchedulerState.PRE_BACKWARD
+                scheduler._backward_pre_hook("grad")
+                scheduler.scheduler_state = FSDPSchedulerState.BACKWARD
+                callbacks[-1]()
+                self.assertFalse(scheduler.scheduler_ctx.post_backward_final_callback_queued)
+                self.assertFalse(scheduler.scheduler_ctx.post_backward_schedulers)
+        self.assertEqual(scheduler.wait_for_pending_reductions.call_count, 2)
+        self.assertEqual(callbacks, [scheduler._root_backward_hook, scheduler._root_backward_hook])
+
+    def test_final_callback_clears_registration_after_failure(self):
+        """A failed terminal wait must not retain scheduler references or its queued flag."""
+        scheduler = _make_scheduler()
+        scheduler.scheduler_state = FSDPSchedulerState.BACKWARD
+        scheduler.scheduler_ctx.post_backward_schedulers[scheduler] = None
+        scheduler.scheduler_ctx.post_backward_final_callback_queued = True
+        scheduler.wait_for_pending_reductions = MagicMock(side_effect=RuntimeError("communication failed"))
+        with self.assertRaisesRegex(RuntimeError, "communication failed"):
+            scheduler._root_backward_hook()
+        self.assertFalse(scheduler.scheduler_ctx.post_backward_final_callback_queued)
+        self.assertFalse(scheduler.scheduler_ctx.post_backward_schedulers)
 
     def test_terminal_wait_drains_rs_before_waiting_all_reduces(self):
         """The terminal action should launch the tail AR, then wait all ARs."""
