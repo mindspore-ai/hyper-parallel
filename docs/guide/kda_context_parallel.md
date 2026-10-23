@@ -83,13 +83,13 @@ CP8 的常用组合：
 ## 输入与 mesh 约束
 
 - 当前融合 AG 路径面向 Ascend 上的 BF16 训练，key/value head 维度为 128，使用 lower-bounded gate。
-- 各 CP rank 的本地序列长度相同，Triton 路径要求完整的 64-token chunk。
+- 各 CP rank 的本地序列长度相同；定长 Triton 路径要求完整的 64-token chunk。TND 的局部文档片段可不对齐。
 - 使用一维 CP mesh，rank 自然递增且与序列顺序一致。可以传入根 mesh 的 CP 子 mesh，例如 DP×CP；
   不要求 CP 等于 WORLD，也不要求子组的全局 rank 连续。
 - 混合方式需要保留 CP 子 mesh 与根 mesh 的关联，以便一致地创建子组；不支持任意置换 rank，
   用于拆分的最终根 mesh 必须覆盖 WORLD；仅保留一个局部 root 仍不足以安全创建所有兄弟组。
 - ShortConv 在原始 CP 序列邻居之间交换 halo，之后才执行 Ulysses，保证卷积边界不随 head 重排而改变。
-- 当前入口不支持 packed/变长序列、推理缓存或同时启用 TP 和 CP。CP 不负责参数梯度归约，
+- 连续等长分片下的 packed/TND 输入见 [TND 上下文并行](linear_attention_tnd_cp.md)。不支持推理缓存或同时启用 TP 和 CP。CP 不负责参数梯度归约，
   训练仍需使用框架相应的数据并行与梯度管理配置。
 
 ## 显存与选择建议

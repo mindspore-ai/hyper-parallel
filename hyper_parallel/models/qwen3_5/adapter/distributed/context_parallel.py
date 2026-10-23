@@ -18,6 +18,8 @@
 __all__ = [
     "qwen3_5_gdn_p2p_cp_wrapper",
     "qwen3_5_gdn_ulysses_cp_wrapper",
+    "qwen3_5_packed_decoder_wrapper",
+    "qwen3_5_gdn_packed_local_wrapper",
 ]
 
 from functools import wraps
@@ -25,6 +27,9 @@ from typing import Any, Type
 
 from torch import nn
 
+from hyper_parallel.models.qwen3_5.adapter.distributed.packed import (
+    qwen3_5_packed_decoder_wrapper, qwen3_5_gdn_packed_local_wrapper,
+)
 from hyper_parallel.distributed import inner_wrapper
 from hyper_parallel.distributed._builder.forward_rewriter import (
     _ForwardRewriteRequest,
