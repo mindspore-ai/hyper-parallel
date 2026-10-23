@@ -70,7 +70,6 @@ plan_overrides:
     replace_module:
       _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe.DeepseekV41MegaMoeExperts
       # Upper bound on actual local rows, including unequal and empty EP sources.
-      local_num_tokens: 4096
       dispatch_mode: push  # Set to pull for GET dispatch.
   # HyperMegaMhc reuses the original fn/base/scale parameters.
   # These replacements are optimizations only: the registered architecture is

@@ -107,7 +107,6 @@ def _new_layers(
     """Create reference and MegaMoe layers with identical deterministic weights."""
     common = baseline.new_common_moe(shape)
     mega = MegaMoeExperts(
-        local_num_tokens=shape.local_num_tokens,
         hidden_size=shape.hidden_size,
         intermediate_size=shape.intermediate_size,
         num_experts=shape.num_experts,
@@ -389,6 +388,14 @@ def test_swiglu_clamp_ub_scratch() -> None:
     comparisons = []
 
     def check_backward(plan: Any, saved: Any, grad_output: Any, execution: Any) -> None:
+        """Compare native clamp derivatives with the saved-input oracle after each backward launch.
+
+        Args:
+            plan: Backward task plan submitted by the executor.
+            saved: Saved input and projection tensors used by the derivative oracle.
+            grad_output: Routed upstream gradient supplied to the native launch.
+            execution: Native intermediates containing the computed SwiGLU gradient.
+        """
         nonlocal observed_calls
         original_launch(plan, saved, grad_output, execution)
         torch.npu.synchronize(baseline.DEVICE)

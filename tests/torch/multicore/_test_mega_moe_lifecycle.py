@@ -41,7 +41,6 @@ def _new_stack(shape: baseline.MoeShape, layers: int = 3) -> list[MegaMoeExperts
     """Build distinct expert layers without initializing any native resource."""
     return [
         MegaMoeExperts(
-            local_num_tokens=shape.local_num_tokens,
             hidden_size=shape.hidden_size,
             intermediate_size=shape.intermediate_size,
             num_experts=shape.num_experts,
@@ -84,7 +83,12 @@ def _stack_step(layers: list, shape: baseline.MoeShape, streams: list, replay: b
             time.sleep(0.003)
         output.backward(upstream / shape.local_num_tokens**0.5)
     torch.npu.synchronize()
-    tensors = outputs + [tensor.grad for tensor in inputs + selected]
+    return _snapshot_and_update(layers, outputs, inputs + selected, step)
+
+
+def _snapshot_and_update(layers: list, outputs: list, leaves: list, step: int) -> list:
+    """Validate every result/gradient before retaining snapshots and applying the same SGD step."""
+    tensors = outputs + [tensor.grad for tensor in leaves]
     tensors += [parameter.grad for layer in layers for parameter in layer.parameters()]
     for index, tensor in enumerate(tensors):
         assert tensor is not None, f"rank={baseline.RANK}: missing tensor {index}, expected a result or gradient."
@@ -108,6 +112,53 @@ def _ready_generations(workspace, ep_size: int) -> tuple[int, int]:
         int(events[offset:offset + 4].view(torch.int32).cpu().item())
         for events in (workspace.forward_event_counters, workspace.backward_event_counters)
     )
+
+
+def _check_resources_and_failed_launch(independent: list, shared: list, shape: baseline.MoeShape,
+                                      samples: list) -> None:
+    """Check stable allocation, sharing identity and lease release after an injected launch failure."""
+    if samples:
+        assert_stable_memory(samples)
+        allocations = [sample["shmem_allocations"] for sample in samples]
+        assert len(set(allocations)) == 1, f"rank={baseline.RANK}: unstable SHMEM allocations={allocations}"
+    # Sharing identity and numerical parity are separate contracts.
+    resources = shared[0]._resource_group.resources  # pylint: disable=protected-access
+    workspace = resources.workspace
+    shared_resources = [layer._resource_group.resources for layer in shared]  # pylint: disable=protected-access
+    assert all(resource is resources for resource in shared_resources), (
+        f"rank={baseline.RANK}: shared layers did not share the same resources"
+    )
+    # Each independent layer must retain a distinct physical allocation group.
+    independent_ids = {
+        id(layer._resource_group.resources) for layer in independent  # pylint: disable=protected-access
+    }
+    assert len(independent_ids) == 3, f"rank={baseline.RANK}: independent resource count={len(independent_ids)}"
+    source, _ = baseline.make_data(shape)
+    ids, weights, counts = baseline.make_balanced_route(shape)
+    with patch.object(
+        function_module.multicore_ops, "mega_moe",
+        side_effect=RuntimeError("injected launch error"),
+    ):
+        try:
+            shared[0](source, ids, weights, tokens_per_expert=counts)
+        except RuntimeError as error:
+            assert str(error) == "injected launch error", f"unexpected launch failure: {error}"
+        else:
+            raise AssertionError("Injected launch error was not propagated.")
+    assert not workspace.in_use, f"rank={baseline.RANK}: failed launch left lease in_use={workspace.in_use}."
+
+
+def _assert_step_parity(reference: list, actual: list, independent: list, shared: list,
+                        replay: bool, step: int) -> None:
+    """Compare the complete result/gradient snapshots and updated parameters for one step."""
+    for index, (expected, observed) in enumerate(zip(reference, actual)):
+        torch.testing.assert_close(
+            observed, expected, rtol=2e-2, atol=1e-5,
+            msg=f"rank={baseline.RANK}: replay={replay} step={step} tensor={index}",
+        )
+    for source, target in zip(independent, shared):
+        for expected, observed in zip(source.parameters(), target.parameters()):
+            baseline.assert_close("lifecycle updated parameter", observed, expected)
 
 
 def _run_lifecycle_case(alternate_streams: bool, replay: bool) -> dict:
@@ -135,14 +186,7 @@ def _run_lifecycle_case(alternate_streams: bool, replay: bool) -> dict:
                 assert fence.call_count == 0, (
                     f"rank={baseline.RANK}: steady-state Host barriers={fence.call_count}, expected 0."
                 )
-            for index, (expected, observed) in enumerate(zip(reference, actual)):
-                torch.testing.assert_close(
-                    observed, expected, rtol=2e-2, atol=1e-5,
-                    msg=f"rank={baseline.RANK}: replay={replay} step={step} tensor={index}",
-                )
-            for source, target in zip(independent, shared):
-                for expected, observed in zip(source.parameters(), target.parameters()):
-                    baseline.assert_close("lifecycle updated parameter", observed, expected)
+            _assert_step_parity(reference, actual, independent, shared, replay, step)
             if not replay and step >= 3:
                 sample = collect_memory()
                 sample["shmem_allocations"] = shmem.debug_state()["allocated_count"]
@@ -155,34 +199,7 @@ def _run_lifecycle_case(alternate_streams: bool, replay: bool) -> dict:
                 )
             generations.append(current)
 
-        if samples:
-            assert_stable_memory(samples)
-            allocations = [sample["shmem_allocations"] for sample in samples]
-            assert len(set(allocations)) == 1, f"rank={baseline.RANK}: unstable SHMEM allocations={allocations}"
-        # Sharing identity and numerical parity are separate contracts.
-        resources = shared[0]._resource_group.resources  # pylint: disable=protected-access
-        shared_resources = [layer._resource_group.resources for layer in shared]  # pylint: disable=protected-access
-        assert all(resource is resources for resource in shared_resources), (
-            f"rank={baseline.RANK}: shared layers did not share the same resources"
-        )
-        # Each independent layer must retain a distinct physical allocation group.
-        independent_ids = {
-            id(layer._resource_group.resources) for layer in independent  # pylint: disable=protected-access
-        }
-        assert len(independent_ids) == 3, f"rank={baseline.RANK}: independent resource count={len(independent_ids)}"
-        source, _ = baseline.make_data(shape)
-        ids, weights, counts = baseline.make_balanced_route(shape)
-        with patch.object(
-            function_module.multicore_ops, "mega_moe",
-            side_effect=RuntimeError("injected launch error"),
-        ):
-            try:
-                shared[0](source, ids, weights, tokens_per_expert=counts)
-            except RuntimeError as error:
-                assert str(error) == "injected launch error", f"unexpected launch failure: {error}"
-            else:
-                raise AssertionError("Injected launch error was not propagated.")
-        assert not workspace.in_use, f"rank={baseline.RANK}: failed launch left lease in_use={workspace.in_use}."
+        _check_resources_and_failed_launch(independent, shared, shape, samples)
         reference = _stack_step(independent, shape, streams, False, steps)
         actual = _stack_step(shared, shape, streams, replay, steps)
         for index, (expected, observed) in enumerate(zip(reference, actual)):

@@ -14,8 +14,11 @@
 # ============================================================================
 """Unit tests for MegaMoe workspace capacity and SHMEM Heap policy."""
 
+from __future__ import annotations
+
 import threading
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
@@ -28,7 +31,9 @@ from hyper_parallel.core.multicore.modules.mega_moe.heap_manager import (
     _HeapManager,
     _WorkspaceLayout,
     _get_heap_manager,
+    _workspace_layout,
 )
+from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_parallel.core.multicore.modules.mega_moe.workspace import (
     MegaMoeWorkspace,
     _workspace_allocation_specs,
@@ -42,6 +47,118 @@ class TestMegaMoeHeapManager(unittest.TestCase):
 
     # These tests deliberately inspect the private manager and lifecycle transaction.
     # pylint: disable=protected-access
+
+    def _automatic_workspace(self, mode: str) -> tuple:
+        """Materialize a small symmetric layout using CPU storage for restart validation."""
+        specification = {"local_num_tokens": 128, "hidden_size": 16, "intermediate_size": 8,
+                         "num_experts": 4, "top_k": 2, "ep_size": 2, "dispatch_mode": mode,
+                         "initial_capacity_factor": 1.25 if mode == "push" else None, "auto_tokens": True}
+        layout = _workspace_layout(specification, torch.bfloat16)
+        manager = self._manager_with_reservation(specification, layout)
+        spec = MegaMoeSpec(128, 16, 8, 4, 2, specification["initial_capacity_factor"],
+                           layout.receive_capacity, 2, None, 0, 24, dispatch_mode=mode,
+                           capacity_growth_factor=1.25 if mode == "push" else None, auto_tokens=True)
+        workspace = MegaMoeWorkspace(shared=True)
+        workspace.capacity_floor = manager.bind(workspace, spec, specification)
+        for name, allocation in self._allocations(spec, layout.receive_capacity):
+            setattr(workspace, name, torch.empty(allocation.shape, dtype=allocation.dtype))
+        workspace.completion_event = object()
+        return manager, workspace, spec
+
+    @staticmethod
+    def _cpu_restart(**kwargs: Any) -> _lifecycle._RestartResult:
+        """Run the real preflight then provide ordinary replacement tensors."""
+        kwargs["preflight_hook"]()
+        tensors = tuple(torch.empty(item.target.shape, dtype=item.target.dtype) for item in kwargs["replacements"])
+        return _lifecycle._RestartResult(tensors, {})
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_automatic_source_and_receive_growth_commit_together_and_reuse(self) -> None:
+        """Feature: Automatic MegaMoe token storage.
+
+        Description: Both transports grow source rows without modifying retained plans or shrinking on reuse.
+        Expectation: Source and receive capacity commit together and smaller inputs reuse the committed layout.
+        """
+        for mode in ("push", "pull"):
+            with self.subTest(mode=mode):
+                manager, workspace, retained_spec = self._automatic_workspace(mode)
+                old_routed = workspace.routed_buffer
+                with patch.object(shmem, "_restart", side_effect=self._cpu_restart) as restart:
+                    committed = manager.ensure_token_capacity(workspace, 512, 1700)
+                    self.assertEqual(restart.call_count, 1)
+                    self.assertEqual(committed.local_num_tokens, 512)
+                    self.assertEqual(workspace.routed_slots, 1024)
+                    self.assertEqual(tuple(workspace.routed_buffer.shape), (1024, 16))
+                    self.assertIsNot(workspace.routed_buffer, old_routed)
+                    if mode == "pull":
+                        self.assertEqual(tuple(workspace.source_buffer.shape), (1024, 16))
+                    else:
+                        self.assertGreaterEqual(workspace.expert_buffer.shape[0], 1700)
+                    self.assertEqual(retained_spec.local_num_tokens, 128)
+                    self.assertEqual(tuple(old_routed.shape), (256, 16))
+                    self.assertIs(manager.ensure_token_capacity(workspace, 128, 1), committed)
+                    self.assertEqual(restart.call_count, 1)
+                self.assertEqual(manager.epoch, 1)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_automatic_budget_failure_preserves_committed_source_and_receive_capacity(self) -> None:
+        """Feature: Automatic MegaMoe token storage.
+
+        Description: An over-budget source growth fails before any restart or specification mutation.
+        Expectation: A rejected layout preserves both committed capacities and the current heap state.
+        """
+        for mode in ("push", "pull"):
+            with self.subTest(mode=mode):
+                manager, workspace, spec = self._automatic_workspace(mode)
+                manager.heap_limit = manager.heap_bytes
+                original = workspace.routed_buffer
+                with (patch.object(shmem, "_restart") as restart,
+                      self.assertRaisesRegex(RuntimeError, "explicit Heap budget")):
+                    manager.ensure_token_capacity(workspace, 131072, 262144)
+                restart.assert_not_called()
+                self.assertIs(manager.entries[0].bound_spec, spec)
+                self.assertIs(workspace.routed_buffer, original)
+                self.assertEqual(manager.epoch, 0)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_automatic_growth_falls_back_to_required_rows_within_heap_budget(self) -> None:
+        """Feature: Automatic MegaMoe token storage.
+
+        Description: A geometric source reservation may exceed the budget while the actual request still fits.
+        Expectation: The required aligned layout fits without applying the larger growth factor.
+        """
+        for mode in ("push", "pull"):
+            with self.subTest(mode=mode):
+                manager, workspace, _ = self._automatic_workspace(mode)
+                with patch.object(shmem, "_restart", side_effect=self._cpu_restart):
+                    manager.ensure_token_capacity(workspace, 16384, 0)
+                    manager.heap_limit = manager.heap_bytes
+                    entry = manager.entries[0]
+                    entry.bound_spec = replace(entry.bound_spec, capacity_growth_factor=2.0)
+                    committed = manager.ensure_token_capacity(workspace, 17024, 0)
+                self.assertEqual(committed.local_num_tokens, 17024)
+                self.assertEqual(workspace.routed_slots, 34048)
+                self.assertEqual(manager.heap_bytes, manager.heap_limit)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_automatic_growth_rejects_an_active_pull_lease_before_replacement(self) -> None:
+        """Feature: Automatic MegaMoe token storage.
+
+        Description: A pull source cannot be invalidated while permutation or a kernel owns it.
+        Expectation: An active source lease rejects growth before replacing any allocation.
+        """
+        manager, workspace, spec = self._automatic_workspace("pull")
+        workspace.in_use = True
+        with (patch.object(shmem, "_restart", side_effect=self._cpu_restart),
+              patch.object(_lifecycle, "_runtime_is_healthy", return_value=True),
+              self.assertRaisesRegex(RuntimeError, "active workspace lease")):
+            manager.ensure_token_capacity(workspace, 512, 1)
+        self.assertIs(manager.entries[0].bound_spec, spec)
+        self.assertEqual(manager.state, "ready")
 
     def setUp(self) -> None:
         """Install one-rank lifecycle and configuration boundaries."""
@@ -338,8 +455,13 @@ class TestMegaMoeHeapManager(unittest.TestCase):
         self.assertEqual(manager.growth_records[-1]["stages_ms"], stages)
         self.assertEqual(manager.growth_records[-1]["total_ms"], 125.0)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_capacity_fast_path_and_explicit_limit_fallback(self) -> None:
-        """Keep sufficient capacity lock-free and fall back to the minimum within an explicit limit."""
+        """Feature: receive capacity budgeting.
+        Description: Keep the sufficient-capacity path and fall back to minimum rows within the heap limit.
+        Expectation: Reuse needs no lock; growth preserves source reservation and fits the explicit budget.
+        """
         manager = _HeapManager(self.root_group, self.reference)
         workspace = SimpleNamespace(capacity_floor=2)
         with patch.object(manager, "access") as access:
@@ -355,9 +477,10 @@ class TestMegaMoeHeapManager(unittest.TestCase):
         workspace.validate_restart_allocations.return_value = False
         manager.bind(workspace, SimpleNamespace(name="bound"), specification)
 
-        def layout(specification: dict, dtype: torch.dtype, capacity: int) -> _WorkspaceLayout:
+        def layout(specification: dict, dtype: torch.dtype, capacity: int,
+                   token_capacity: int | None) -> _WorkspaceLayout:
             """Return a capacity-dependent layout for fallback selection."""
-            del specification, dtype
+            del specification, dtype, token_capacity
             required = 3 * 1024**2 if capacity == 3 else 1024
             return self._layout(required, capacity)
 
@@ -435,59 +558,37 @@ class TestMegaMoeHeapManager(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "restart the process"), manager.access():
             self.fail("A failed SHMEM Heap allowed another operation")
 
-    def test_restart_validation_failure_is_local_and_does_not_publish(self) -> None:
-        """A local validation defect invalidates this manager without publishing business state."""
-        initial = self._layout(512, 1)
-        target = self._layout(1024, 2)
-        manager = self._manager_with_reservation({"name": "validation failure"}, initial)
-        result = _lifecycle._RestartResult((), {})
-        validation_error = RuntimeError("invalid local restart result")
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_local_restart_failures_do_not_publish_business_state(self) -> None:
+        """Feature: Local restart result commit.
+        Description: Inject validation and binding defects after the underlying SHMEM restart.
+        Expectation: Cause and local-failure diagnostics remain distinct; neither publishes layout or epoch.
+        """
+        for validation in (True, False):
+            with self.subTest(validation=validation):
+                initial, target = self._layout(512, 1), self._layout(1024, 2)
+                manager = self._manager_with_reservation({"name": "local failure"}, initial)
+                message = "invalid local restart result" if validation else "binding failed"
+                error = RuntimeError(message)
+                with (patch.object(shmem, "_restart", return_value=_lifecycle._RestartResult((), {})),
+                      patch.object(manager, "_validate_restart_result", side_effect=error if validation else None),
+                      patch.object(manager, "_bind_restart_result", side_effect=None if validation else error) as bind,
+                      self.assertRaises(RuntimeError) as raised):
+                    manager._restart([target], 2 * 1024**2)
+                text = str(raised.exception)
+                self.assertIn(message, text)
+                self.assertIn("result validation failed" if validation else "workspace binding failed", text)
+                self.assertNotIn("workspace binding failed" if validation else "result validation failed", text)
+                for fragment in (("local implementation error", "cannot be rolled back", "terminate") if validation
+                                 else ("implementation error", "terminate")):
+                    self.assertIn(fragment, text)
+                self.assertNotIn("all ranks", text)
+                self.assertIs(raised.exception.__cause__, error)
+                self.assertEqual(manager.state, "failed")
+                self.assertEqual((manager.entries[0].layout, manager.epoch, manager.growth_records), (initial, 0, []))
+                self.assertEqual(bind.call_count, int(not validation))
 
-        with (
-            patch.object(shmem, "_restart", return_value=result),
-            patch.object(manager, "_validate_restart_result", side_effect=validation_error),
-            patch.object(manager, "_bind_restart_result") as bind,
-            self.assertRaises(RuntimeError) as raised,
-        ):
-            manager._restart([target], 2 * 1024**2)
-
-        self.assertIn("invalid local restart result", str(raised.exception))
-        self.assertIn("MegaMoe restart result validation failed", str(raised.exception))
-        self.assertNotIn("workspace binding failed", str(raised.exception))
-        self.assertIn("local implementation error", str(raised.exception))
-        self.assertIn("cannot be rolled back", str(raised.exception))
-        self.assertIn("terminate", str(raised.exception))
-        self.assertNotIn("all ranks", str(raised.exception))
-        self.assertIs(raised.exception.__cause__, validation_error)
-        self.assertEqual(manager.state, "failed")
-        self.assertEqual((manager.entries[0].layout, manager.epoch, manager.growth_records), (initial, 0, []))
-        bind.assert_not_called()
-
-    def test_restart_binding_failure_is_local_and_does_not_publish(self) -> None:
-        """A binding defect invalidates the local manager without cross-rank atomicity."""
-        initial = self._layout(512, 1)
-        target = self._layout(1024, 2)
-        manager = self._manager_with_reservation({"name": "binding failure"}, initial)
-        result = _lifecycle._RestartResult((), {})
-        binding_error = RuntimeError("binding failed")
-
-        with (
-            patch.object(shmem, "_restart", return_value=result),
-            patch.object(manager, "_validate_restart_result"),
-            patch.object(manager, "_bind_restart_result", side_effect=binding_error),
-            self.assertRaises(RuntimeError) as raised,
-        ):
-            manager._restart([target], 2 * 1024**2)
-
-        self.assertIn("binding failed", str(raised.exception))
-        self.assertIn("MegaMoe workspace binding failed after SHMEM restart", str(raised.exception))
-        self.assertNotIn("result validation failed", str(raised.exception))
-        self.assertIn("implementation error", str(raised.exception))
-        self.assertIn("terminate", str(raised.exception))
-        self.assertNotIn("all ranks", str(raised.exception))
-        self.assertIs(raised.exception.__cause__, binding_error)
-        self.assertEqual(manager.state, "failed")
-        self.assertEqual((manager.entries[0].layout, manager.epoch, manager.growth_records), (initial, 0, []))
 
 if __name__ == "__main__":
     unittest.main()

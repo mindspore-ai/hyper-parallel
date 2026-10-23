@@ -22,6 +22,7 @@ from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, mock_open, patch
 
 import torch
+
 from torch.nn import functional
 
 try:
@@ -43,6 +44,7 @@ from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41Model,
     bind_shared_expert_forward,
 )
+from tests.common.mark_utils import arg_mark
 
 
 def _config() -> DeepseekV4Config:
@@ -90,6 +92,8 @@ def _native_shared_oracle(module: torch.nn.Module, states: torch.Tensor) -> torc
 class TestV41SharedExpert(unittest.TestCase):
     """Check activation precision, autograd, state compatibility, and entry points."""
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_megamoe_workspace_prepared_once_before_forward(self) -> None:
         """Prepare model-owned expert sharing before the first native submission.
 
@@ -111,7 +115,7 @@ class TestV41SharedExpert(unittest.TestCase):
                     model = DeepseekV41Model(config)
                 experts = []
                 for layer in model.layers:
-                    layer.mlp.experts = DeepseekV41MegaMoeExperts(module=layer.mlp.experts, local_num_tokens=128)
+                    layer.mlp.experts = DeepseekV41MegaMoeExperts(module=layer.mlp.experts)
                     self.addCleanup(layer.mlp.experts.close_runtime)
                     compute = deepseek_v41_megamoe_compute_fn(
                         module=layer.mlp, mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=None,

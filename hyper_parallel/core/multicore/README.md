@@ -7,8 +7,7 @@ SHMEM 由 Multicore 在内部管理，不提供独立用户接口。
 
 - [构建与交付](docs/build.md)
 - [架构设计与扩展](docs/architecture.md)
-- [MegaKernel Profiling 使用指南](../../../docs/guide/mega_kernel_profiling.md)
-- [MegaKernel Profiling 设计与实现](docs/mega_kernel_profiling_design_and_usage.md)
+- [MegaKernel Profiling 设计与使用](docs/mega_kernel_profiling.md)
 - [私有 SHMEM 生命周期](docs/shmem.md)
 - [完整 MegaMoE 样例](examples/mega_moe/README.md)
 
@@ -87,7 +86,6 @@ import torch.distributed as dist
 from hyper_parallel.core.multicore import MegaMoeExperts
 
 experts = MegaMoeExperts(
-    local_num_tokens=1024,
     hidden_size=512,
     intermediate_size=128,
     num_experts=4,
@@ -137,8 +135,8 @@ training:
 该配置对应 dense DP4、dense FSDP8 和 expert FSDP1。
 将这些字段合并到现有 DSV4.1 配置中，保留其模块替换和 compute 声明。
 长度为 4096 的序列均匀划分后，每个 rank 向 MegaMoe 提交 1024 行。
-`local_num_tokens` 仍表示经过 CP/SP 划分后的实际行数上限，要求为 128 的倍数，并覆盖最大输入。
-仅减少实际行数、保持容量配置不变，并不会缩小预留容量。
+组件使用经过 CP/SP 划分后的实际行数维护容量，不需要额外配置 token 上限。
+source/receive 容量保留历史高水位，不会因更小输入自动缩小。
 TP 不会进一步切分路由专家矩阵；本地序列变短也可能降低 MegaMoe 的执行效率。
 
 激活 NPU native payload 后，可执行以下分布式精度对齐测试矩阵：
@@ -154,15 +152,14 @@ pytest -q tests/torch/multicore/test_deepseek_v41_megamoe.py -k megamoe_parallel
 ### 输入与权重
 
 - EP 可以使用 WORLD 或子组，`E` 必须能被 EP 整除。
-  `local_num_tokens=T` 指定固定 token 数，要求 `T` 是 128 的倍数；
-  `max_local_num_tokens=T_cap` 则允许各 rank 的实际 token 数不同，也允许空输入。
-  动态模式按对齐后的上限预留存储，按实际输入长度生成调度计划。
-  这两个 token 数参数互斥；动态执行仅支持 eager 模式，不会添加填充 token。
-  包括空输入 rank 在内，所有 EP rank 必须按相同顺序进入每次正反向，并采用一致的
-  输入、专家权重和路由权重梯度参与策略。实际长度和梯度参与策略随路由计数一起交换。
-  调度范围取组内最大实际长度并向上对齐到 128；全组输入为空时，最小调度范围仍为 128。
-  每个资源组最多缓存四份调度计划；autograd 会保留每次调用所用的计划，直到对应反向完成。
-  pull模式下，空输入仍保留其对称内存基址；仅改变实际输入长度不会触发Runtime restart。
+  token 数由首次和后续 forward 的实际输入自动推断，不需要动态/静态模式开关或 token 上限。
+  允许各 rank 不等长及空输入；容量增长后保留历史高水位，不自动缩容。
+  首次绑定仅保留小容量，必要时统一调整 SHMEM；pull 在容量准备和 claim 之后才写 source。
+  动态计划按几何桶复用，最多 25 个桶，待反向图独立保留其原计划。桶不填充实际 token 激活。
+  即使输入长度不变，路由仍可变化，push 按热点接收量无损扩容。
+  初次绑定、进入新桶和扩容有额外成本；稳定容量内不重启 runtime。
+  所有 rank 须按相同顺序执行，并采用一致的梯度参与策略；当前仅支持 eager。
+  原生 INT32 限制和显式 SHMEM heap 字节预算继续生效，资源共享不共享参数或待反向激活。
 - `hidden_states` 扁平后的 token 数为 `T`，`topk_ids`、`topk_weights` 均为 `[T, K]`，
   ID 使用全局专家编号，同一个 token 的 K 个 ID 必须互不重复。
 - 可选的 `tokens_per_expert` 是同 device 上 `[E]` 的精确本 rank histogram。
@@ -276,7 +273,7 @@ SHMEM Python层以进程级引用计数统一管理Runtime生命周期。整个M
 `HYPER_PARALLEL_SHMEM_HEAP_SIZE` 等堆配置在下一生命周期首次获取引用时重新生效。
 
 完整 Qwen 接入及启动方式见 [MegaMoe 示例](examples/mega_moe/README.md)。MegaKernel 内部阶段采集方式见
-[MegaKernel Profiling 使用指南](../../../docs/guide/mega_kernel_profiling.md)。
+[MegaKernel Profiling 设计与使用](docs/mega_kernel_profiling.md)。
 
 ---
 

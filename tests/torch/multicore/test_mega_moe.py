@@ -45,9 +45,14 @@ _PERFORMANCE_WORLD_SIZE = 4
           card_mark="allcards", essential_mark="unessential")
 @pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
 def test_mega_moe_dynamic_tokens(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dispatch_mode: str) -> None:
-    """Validate EP8 unequal and zero source lengths against an independent FP32 oracle."""
+    """Feature: Automatic MegaMoe tokens.
+    Description: Run growth, ragged/empty lengths, full gradients and retained graphs in each transport.
+    Expectation: Independent numerical oracles pass while cached plans and pending backward survive growth.
+    """
     monkeypatch.setenv("HP_MEGA_MOE_DISPATCH_MODE", dispatch_mode)
-    _run_acceptance_worker(monkeypatch, tmp_path, "test_dynamic_tokens", 8, "_test_mega_moe_dynamic_tokens.py")
+    # Preserve the total deadline of the two original 420-second workers after consolidation.
+    _run_acceptance_worker(monkeypatch, tmp_path, "test_dynamic_tokens", 8,
+                           "_test_mega_moe_dynamic_tokens.py", timeout=840)
 
 
 def _prepare_torch_multicore_test_environment() -> None:
@@ -151,7 +156,7 @@ def test_mega_moe_representative_performance(monkeypatch, tmp_path: Path) -> Non
 def _run_acceptance_worker(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str, cards: int, worker: str,
     heap_bytes: int = 64 * 1024 * 1024,
-    variant: str | None = None,
+    variant: str | None = None, timeout: float = 420,
 ) -> dict:
     """Launch one real-device acceptance worker and require its rank evidence."""
     _prepare_torch_multicore_test_environment()
@@ -164,7 +169,7 @@ def _run_acceptance_worker(
     def launch(result_dir: Path) -> None:
         """Keep device setup and distributed execution outside the CPU helper."""
         with without_inherited_rank_environment(), capture_worker_logs(worker_path, case, result_dir / "worker_logs"):
-            run_multicore_case(worker_path, case, num_proc=cards)
+            run_multicore_case(worker_path, case, num_proc=cards, timeout=timeout)
 
     return run_acceptance_worker(monkeypatch, tmp_path, case, cards, launch, heap_bytes, variant)
 

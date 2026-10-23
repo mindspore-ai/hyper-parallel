@@ -45,7 +45,6 @@ _EXPECTED_CORE_RECORD_COUNTS = {"AIC": 960, "AIV": 451}
 def _build_profile_layer() -> MegaMoeExperts:
     """Construct the representative two-rank MegaMoe layer."""
     return MegaMoeExperts(
-        local_num_tokens=_PROFILE_SHAPE.local_num_tokens,
         hidden_size=_PROFILE_SHAPE.hidden_size,
         intermediate_size=_PROFILE_SHAPE.intermediate_size,
         num_experts=_PROFILE_SHAPE.num_experts,

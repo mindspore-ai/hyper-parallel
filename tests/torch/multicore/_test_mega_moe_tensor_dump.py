@@ -46,7 +46,6 @@ _DUMP_TENSORS = (
 def _build_layer(shape: common.MoeShape) -> MegaMoeExperts:
     """Construct the small representative two-rank MegaMoe layer."""
     return MegaMoeExperts(
-        local_num_tokens=shape.local_num_tokens,
         hidden_size=shape.hidden_size,
         intermediate_size=shape.intermediate_size,
         num_experts=shape.num_experts,

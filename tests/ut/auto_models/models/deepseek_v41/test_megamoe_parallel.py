@@ -114,7 +114,7 @@ class TestMegaMoeParallel(unittest.TestCase):
         torch.manual_seed(83)
         context = {'tp': tp > 1, 'cp': cp > 1, 'ep': True, 'sequence_parallel': tp > 1}
         experts = DeepseekV41MegaMoeExperts(module=_source(), context=context,
-                                          local_num_tokens=128, dispatch_mode=mode)
+                                          dispatch_mode=mode)
         self.addCleanup(experts.close_runtime)
         gate = DeepseekV41TopKRouter(SimpleNamespace(
             hidden_size=8, num_local_experts=4, num_experts_per_tok=2,

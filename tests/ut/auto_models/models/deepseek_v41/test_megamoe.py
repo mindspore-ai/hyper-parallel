@@ -69,7 +69,6 @@ plan_overrides:
     module_type: transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4Experts
     replace_module:
       _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe.DeepseekV41MegaMoeExperts
-      local_num_tokens: 4096
       dispatch_mode: push
   - match: [model.layers.*.attn_hc, model.layers.*.ffn_hc]
     module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41PipelinedHyperConnection
@@ -142,9 +141,14 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
     # White-box assertions verify executor ownership and parameter lifetimes.
     # pylint: disable=protected-access
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_ordered_ep_subgroup_binds_without_world_size_assumption(self) -> None:
-        """Expert FSDP may add ranks outside an ordered EP subgroup."""
-        experts = DeepseekV41MegaMoeExperts(module=_source(), local_num_tokens=128)
+        """Feature: DSV4.1 automatic-token integration.
+        Description: Expert FSDP may add ranks outside an ordered EP subgroup.
+        Expectation: Bind the exact subgroup and enable automatic tokens without a configured token limit.
+        """
+        experts = DeepseekV41MegaMoeExperts(module=_source())
         self.addCleanup(experts.close_runtime)
         group = object()
         mesh = MagicMock()
@@ -159,7 +163,7 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
             deepseek_v41_megamoe_compute_fn(module=module, mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=mesh)
         world_size.assert_called_once_with(group)
         self.assertIs(experts._executor._ep_group, group)
-        self.assertEqual(experts._executor.max_local_num_tokens, 128)
+        self.assertTrue(experts._executor._resource_group.specification["auto_tokens"])
 
     def test_declared_replacements_preserve_base_modules_and_precision(self) -> None:
         """Resolve text/VLM YAML fixtures with paired expert and compute targets."""
@@ -176,7 +180,6 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
                 experts = [entry for entry in mega.plan_overrides if entry.replace_module is not None
                            and entry.replace_module.callable is DeepseekV41MegaMoeExperts]
                 self.assertEqual(len(experts), 1)
-                self.assertEqual(experts[0].replace_module.local_num_tokens, 4096)
                 self.assertEqual(experts[0].replace_module.dispatch_mode, 'push')
                 compute = [entry for entry in mega.plan_overrides if entry.local_compute_fn is not None
                            and entry.local_compute_fn.callable is deepseek_v41_megamoe_compute_fn]
@@ -189,11 +192,16 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
                 self.assertFalse(mega.fsdp_config.mix_precision.cast_forward_inputs)
                 self.assertTrue(mega.optimizer.fp32_main_params)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_external_weights_preserve_gradients_and_state(self) -> None:
-        """Use current tensors across calls and never register placeholder weights."""
+        """Feature: DSV4.1 automatic-token integration.
+        Description: Use current tensors across calls and never register placeholder weights.
+        Expectation: Use current expert Parameters and preserve their gradients without registering duplicate state.
+        """
         torch.manual_seed(9)
         source = _source()
-        experts = DeepseekV41MegaMoeExperts(module=source, local_num_tokens=128)
+        experts = DeepseekV41MegaMoeExperts(module=source)
         experts.configure(None, 1, 2)
         self.addCleanup(experts.close_runtime)
         self.assertEqual(set(experts.state_dict()), {"gate_up_proj", "down_proj"})
@@ -226,9 +234,14 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
                     experts.gate_up_proj.copy_(source.gate_up_proj.transpose(1, 2))
         self.assertEqual(len(experts.make_transforms()), 2)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_exception_does_not_retain_external_parameters(self) -> None:
-        """An execution failure must not retain FSDP unsharded tensor views."""
-        experts = DeepseekV41MegaMoeExperts(module=_source(), local_num_tokens=128)
+        """Feature: DSV4.1 automatic-token integration.
+        Description: An execution failure must not retain FSDP unsharded tensor views.
+        Expectation: Release all references to unsharded expert views after an execution failure.
+        """
+        experts = DeepseekV41MegaMoeExperts(module=_source())
         experts.configure(None, 1, 2)
         self.addCleanup(experts.close_runtime)
         with patch.object(MegaMoeExperts, "forward", side_effect=RuntimeError("native failure")):
@@ -237,9 +250,14 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
         self.assertIsNone(experts._executor.gate_up_weight)
         self.assertEqual(len(list(experts.parameters())), 2)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_reject_mismatched_shared_limit_and_parallel_axes(self) -> None:
-        """Fail before native initialization when source or topology differs."""
-        experts = DeepseekV41MegaMoeExperts(module=_source(), local_num_tokens=128)
+        """Feature: DSV4.1 automatic-token integration.
+        Description: Fail before native initialization when source or topology differs.
+        Expectation: Reject incompatible clamp or parallel configuration before native initialization.
+        """
+        experts = DeepseekV41MegaMoeExperts(module=_source())
         self.addCleanup(experts.close_runtime)
         module = SimpleNamespace(is_hash=False, gate=Mock(), experts=experts, shared_experts=SimpleNamespace(limit=1.0))
         args = {"module": module, "mesh": None, "tp_mesh": None, "cp_mesh": None, "ep_mesh": None}
@@ -270,8 +288,13 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
             bind.assert_called_once_with(module, 2, use_grouped_gemm=False, apply_gate=experts._apply_gate)
             self.assertEqual(route.call_args.kwargs["ep_group"], "ep-group")
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_multimodal_router_and_shared_expert_gradients(self) -> None:
-        """Use real image/text router biases and propagate image-token gradients through variable-length experts."""
+        """Feature: DSV4.1 automatic-token integration.
+        Description: Use real image/text router biases and propagate image-token gradients through variable-length experts.
+        Expectation: Preserve text/image outputs and input, router and shared-expert gradients.
+        """
         torch.manual_seed(81)
         gate = DeepseekV41TopKRouter(SimpleNamespace(
             hidden_size=8, num_local_experts=4, num_experts_per_tok=2, scoring_func="sigmoid",
@@ -281,7 +304,7 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
             gate.weight.normal_(std=0.1)
             gate.bias.copy_(torch.tensor([2., 2., 0., 0.]))
             gate.bias_vl.copy_(torch.tensor([0., 0., 2., 2.]))
-        experts = DeepseekV41MegaMoeExperts(module=_source(), local_num_tokens=128)
+        experts = DeepseekV41MegaMoeExperts(module=_source())
         self.addCleanup(experts.close_runtime)
         shared = nn.Linear(8, 8)
         shared.limit = 10.0
@@ -310,8 +333,13 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
             torch.testing.assert_close(left, right, rtol=1e-5, atol=1e-5)
         self.assertGreater(actual_grads[0][image_mask].abs().sum().item(), 0)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_text_forward_signature_and_gradients(self) -> None:
-        """Apply the real text MoE contract and preserve routed/shared gradients."""
+        """Feature: DSV4.1 automatic-token integration.
+        Description: Apply the real text MoE contract and preserve routed/shared gradients.
+        Expectation: Retain the text forward signature and all routed/shared gradients.
+        """
         torch.manual_seed(82)
         config = DeepseekV4Config.from_dict({
             'hidden_size': 8, 'moe_intermediate_size': 4, 'num_hidden_layers': 1,
@@ -323,7 +351,7 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
         module.gate = DeepseekV41TopKRouter(config)
         for parameter in module.parameters():
             nn.init.normal_(parameter, std=0.1)
-        module.experts = DeepseekV41MegaMoeExperts(module=module.experts, local_num_tokens=128)
+        module.experts = DeepseekV41MegaMoeExperts(module=module.experts)
         self.addCleanup(module.experts.close_runtime)
         compute = deepseek_v41_megamoe_compute_fn(
             module=module, mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=None,
@@ -347,11 +375,16 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
         for left, right in zip(actual_grads, expected_grads):
             torch.testing.assert_close(left, right, rtol=1e-5, atol=1e-5)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_real_token_output_and_all_gradients(self) -> None:
-        """Real token rows reach the executor unchanged and preserve every gradient."""
+        """Feature: DSV4.1 automatic-token integration.
+        Description: Real token rows reach the executor unchanged and preserve every gradient.
+        Expectation: Pass empty, short and aligned rows unchanged and preserve every gradient.
+        """
         for tokens in (0, 7, 128):
             with self.subTest(tokens=tokens):
-                experts = DeepseekV41MegaMoeExperts(module=_source(), local_num_tokens=128)
+                experts = DeepseekV41MegaMoeExperts(module=_source())
                 experts.configure(None, 1, 2)
                 self.addCleanup(experts.close_runtime)
                 hidden = torch.randn(tokens, 8, requires_grad=True)
@@ -404,8 +437,13 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'Configure every expert'):
                     DeepseekV41MegaMoeExperts.prepare_runtime_group([model.model.layers[0].mlp.experts])
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_dispatch_transports_and_capacity_options(self) -> None:
-        """Preserve push growth settings and reject push-only factors for pull."""
+        """Feature: DSV4.1 automatic-token integration.
+        Description: Preserve push growth settings and reject push-only factors for pull.
+        Expectation: Keep push growth settings and reject explicit push-only factors for pull.
+        """
         cases = (
             ({}, ("push", 1.25, 1.25)),
             ({"dispatch_mode": "push", "initial_capacity_factor": 2.0,
@@ -414,7 +452,7 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
         )
         for options, expected in cases:
             with self.subTest(options=options):
-                experts = DeepseekV41MegaMoeExperts(module=_source(), local_num_tokens=128, **options)
+                experts = DeepseekV41MegaMoeExperts(module=_source(), **options)
                 self.addCleanup(experts.close_runtime)
                 experts.configure(None, 1, 2)
                 executor = experts._executor
@@ -424,21 +462,23 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
                 self.assertEqual(set(experts.state_dict()), {"gate_up_proj", "down_proj"})
         for option in ("initial_capacity_factor", "capacity_growth_factor"):
             with self.subTest(option=option), self.assertRaisesRegex(ValueError, "only supported for push"):
-                experts = DeepseekV41MegaMoeExperts(module=_source(), local_num_tokens=128,
+                experts = DeepseekV41MegaMoeExperts(module=_source(),
                                                    dispatch_mode="pull", **{option: 1.5})
                 experts.configure(None, 1, 2)
 
-    def test_meta_capacity_topology_and_incorrect_pairing(self) -> None:
-        """Reject invalid capacities/topology before any native resources are acquired."""
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_meta_topology_and_incorrect_pairing(self) -> None:
+        """Feature: DSV4.1 automatic-token integration.
+        Description: Materialize meta experts and check parallel topology and replacement pairing.
+        Expectation: Materialize meta expert weights without token hints and reject incompatible parallel layouts.
+        """
         with torch.device('meta'):
-            experts = DeepseekV41MegaMoeExperts(module=_source(), local_num_tokens=256)
+            experts = DeepseekV41MegaMoeExperts(module=_source())
         self.assertTrue(experts.gate_up_proj.is_meta)
         experts.to_empty(device='cpu')
         experts.reset_parameters()
         self.assertTrue(torch.isfinite(experts.gate_up_proj).all())
-        for capacity in (0, 127, -128, True):
-            with self.subTest(capacity=capacity), self.assertRaises(ValueError):
-                DeepseekV41MegaMoeExperts(module=_source(), local_num_tokens=capacity)
         for axis, message in (('tp', 'EP>1'), ('pp', 'PP=1')):
             with self.subTest(axis=axis), self.assertRaisesRegex(ValueError, message):
                 DeepseekV41MegaMoeExperts(module=_source(), context={axis: True})
@@ -446,9 +486,14 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, 'module replacement'):
             deepseek_v41_megamoe_compute_fn(module=module, mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=None)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_configured_experts_share_runtime_resources(self) -> None:
-        """Configured experts share workspace and retain explicit cleanup."""
-        model = nn.ModuleList([DeepseekV41MegaMoeExperts(module=_source(), local_num_tokens=128) for _ in range(2)])
+        """Feature: DSV4.1 automatic-token integration.
+        Description: Configured experts share workspace and retain explicit cleanup.
+        Expectation: Share compatible execution resources and close them through the existing lifecycle.
+        """
+        model = nn.ModuleList([DeepseekV41MegaMoeExperts(module=_source()) for _ in range(2)])
         for experts in model:
             self.addCleanup(experts.close_runtime)
             experts.configure(None, 1, 2)

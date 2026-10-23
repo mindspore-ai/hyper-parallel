@@ -182,7 +182,6 @@ def _pending_backward_across_restart(weights: tuple, rank: int, world: int, devi
         return
     experts, top_k = world * 6, min(world * 6, 6)
     module = MegaMoeExperts(
-        max_local_num_tokens=129,
         hidden_size=_HIDDEN,
         intermediate_size=_INTERMEDIATE,
         num_experts=experts,
@@ -261,34 +260,41 @@ def _fixed_comparison(fixed: MegaMoeExperts, weights: tuple, inputs: tuple, actu
     return report
 
 
+def _lifecycle_forward(layers: list[MegaMoeExperts], rank: int, device: torch.device,
+                       replay: bool) -> tuple:
+    """Submit the same shared-layer forwards with optional checkpoint replay."""
+    world = dist.get_world_size()
+    streams = [torch.npu.Stream() for _ in layers]
+    default_stream = torch.npu.current_stream()
+    outputs, leaves = [], []
+    for size in (1, 129):
+        inputs = _inputs([size + index for index in range(world)], layers[0].num_experts, layers[0].top_k)
+        x = inputs[0][rank].to(device).requires_grad_()
+        ids = inputs[1][rank].to(device)
+        probs = [inputs[2][rank].to(device).requires_grad_() for _ in layers]
+        dy = inputs[3][rank].to(device)
+        value, previous = x, default_stream
+        for index, layer in enumerate(layers):
+            with torch.npu.stream(streams[index]):
+                streams[index].wait_stream(previous)
+                if replay:
+                    value = checkpoint(layer, value, ids, probs[index], use_reentrant=False)
+                else:
+                    value = layer(value, ids, probs[index])
+            previous = streams[index]
+        default_stream.wait_stream(previous)
+        outputs.append((value, dy))
+        leaves.extend([x, *probs])
+    return outputs, leaves
+
+
 def _lifecycle(layers: list[MegaMoeExperts], rank: int, device: torch.device) -> None:
     """Compare shared-layer checkpoint and cross-stream gradients and an SGD update."""
-    world = dist.get_world_size()
     references = None
     for replay in (False, True):
         for layer in layers:
             layer.zero_grad(set_to_none=True)
-        streams = [torch.npu.Stream() for _ in layers]
-        default_stream = torch.npu.current_stream()
-        outputs, leaves = [], []
-        for size in (1, 129):
-            inputs = _inputs([size + index for index in range(world)], layers[0].num_experts, layers[0].top_k)
-            x = inputs[0][rank].to(device).requires_grad_()
-            ids = inputs[1][rank].to(device)
-            probs = [inputs[2][rank].to(device).requires_grad_() for _ in layers]
-            dy = inputs[3][rank].to(device)
-            value, previous = x, default_stream
-            for index, layer in enumerate(layers):
-                with torch.npu.stream(streams[index]):
-                    streams[index].wait_stream(previous)
-                    if replay:
-                        value = checkpoint(layer, value, ids, probs[index], use_reentrant=False)
-                    else:
-                        value = layer(value, ids, probs[index])
-                previous = streams[index]
-            default_stream.wait_stream(previous)
-            outputs.append((value, dy))
-            leaves.extend([x, *probs])
+        outputs, leaves = _lifecycle_forward(layers, rank, device, replay)
         for value, dy in reversed(outputs):
             (value * dy).sum().backward()
         torch.npu.synchronize()
@@ -309,19 +315,18 @@ def _lifecycle(layers: list[MegaMoeExperts], rank: int, device: torch.device) ->
 
 
 def _configuration_failures(world: int, rank: int, device: torch.device) -> None:
-    """Configuration mismatches must fail on both static and dynamic ranks before SHMEM."""
+    """Configuration mismatches must fail on every rank before SHMEM."""
     if world == 1:
         return
-    for mixed_modes in (False, True):
-        options = ({"local_num_tokens": 128} if mixed_modes and rank == 0
-                   else {"max_local_num_tokens": 128 if rank == 0 else 127})
+    for different_split in (False, True):
+        options = ({"dispatch_split": 128 if rank == 0 else 256} if different_split
+                   else {"swiglu_limit": None if rank == 0 else 10.0})
         module = MegaMoeExperts(**options, hidden_size=_HIDDEN, intermediate_size=_INTERMEDIATE,
                                num_experts=world * 6, top_k=6, ep_size=world,
                                ep_group=dist.group.WORLD,
                                dispatch_mode=os.environ.get("HP_DYNAMIC_DISPATCH", "push"),
                                ).to(device=device, dtype=torch.bfloat16)
-        lengths = [128] * world if mixed_modes else [1] * world
-        # The dynamic peer's over-limit input still reaches the configuration check first.
+        lengths = [128] * world
         try:
             _forward(module, _inputs(lengths, world * 6, 6), rank, device)
         except (RuntimeError, ValueError) as error:
@@ -333,14 +338,14 @@ def _configuration_failures(world: int, rank: int, device: torch.device) -> None
         module.close()
 
 
-def _negative_routes(mega: MegaMoeExperts, bounded: MegaMoeExperts, rank: int, device: torch.device) -> None:
+def _negative_routes(mega: MegaMoeExperts, hotspot: MegaMoeExperts, rank: int, device: torch.device) -> None:
     """Grow lossless hotspot capacity and reject inconsistent backward participation."""
     world = dist.get_world_size()
     if world == 1:
         return
-    invocation = _forward(bounded, _inputs([128] * world, mega.num_experts, mega.top_k, hot=True), rank, device)
+    invocation = _forward(hotspot, _inputs([128] * world, mega.num_experts, mega.top_k, hot=True), rank, device)
     invocation[2].sum().backward()
-    bounded.zero_grad(set_to_none=True)
+    hotspot.zero_grad(set_to_none=True)
     inputs = _inputs([1] * world, mega.num_experts, mega.top_k)
     x = inputs[0][rank].to(device).requires_grad_(rank != 0)
     try:
@@ -378,102 +383,192 @@ def _frozen_gradients(mega: MegaMoeExperts, weights: tuple, rank: int, device: t
     mega.requires_grad_(True)
 
 
+def _layer(mode: str, weights: tuple, rank: int, world: int, device: torch.device) -> MegaMoeExperts:
+    """Construct an automatic-token module without predicting input lengths."""
+    layer = MegaMoeExperts(hidden_size=_HIDDEN, intermediate_size=_INTERMEDIATE,
+                           num_experts=world * 6, top_k=6, ep_size=world,
+                           ep_group=dist.group.WORLD, dispatch_mode=mode).to(
+                               device=device, dtype=torch.bfloat16)
+    with torch.no_grad():
+        layer.gate_up_weight.copy_(weights[0][rank * 6:(rank + 1) * 6])
+        layer.down_weight.copy_(weights[1][rank * 6:(rank + 1) * 6])
+    return layer
+
+
+def _state(layer: MegaMoeExperts) -> dict:
+    """Read physical allocation sizes without synchronizing tensor contents."""
+    resources = layer._resource_group.resources  # pylint: disable=protected-access
+    workspace = resources.workspace
+    return {"routed_rows": workspace.routed_slots, "receive_rows": workspace.expert_capacity,
+            "heap_bytes": resources.heap_manager.heap_bytes, "epoch": resources.heap_manager.epoch}
+
+
+def _verify(layer: MegaMoeExperts, lengths: list[int], weights: tuple, rank: int,
+            device: torch.device, hot: bool = False) -> dict:
+    """Check the complete local output and gradient contract against the independent oracle."""
+    layer.zero_grad(set_to_none=True)
+    inputs = _inputs(lengths, layer.num_experts, layer.top_k, hot=hot)
+    expected = _rounded_oracle(weights, inputs)
+    errors = _check_gradients(layer, _forward(layer, inputs, rank, device), expected, lengths, rank)
+    return {"lengths": lengths, "hot": hot, "max_abs_error": errors, "capacity": _state(layer)}
+
+
+def _pending_growth(layer: MegaMoeExperts, weights: tuple, rank: int, world: int,
+                    device: torch.device) -> dict:
+    """Grow source storage while an earlier forward still needs backward."""
+    lengths = [1] * world
+    inputs = _inputs(lengths, layer.num_experts, layer.top_k)
+    pending = _forward(layer, inputs, rank, device)
+    before = _state(layer)
+    result = _verify(layer, [257] * world, weights, rank, device, hot=True)
+    after = _state(layer)
+    if after["epoch"] <= before["epoch"] or after["routed_rows"] <= before["routed_rows"]:
+        raise AssertionError("larger input did not grow the source allocation")
+    layer.zero_grad(set_to_none=True)
+    _check_gradients(layer, pending, _rounded_oracle(weights, inputs), lengths, rank)
+    return result
+
+
+def _pending_bucket_growth(layer: MegaMoeExperts, weights: tuple, rank: int, world: int,
+                           device: torch.device) -> dict:
+    """Replace a partial bucket while backward still retains its previous plan."""
+    lengths = [257] * world
+    inputs = _inputs(lengths, layer.num_experts, layer.top_k)
+    pending = _forward(layer, inputs, rank, device)
+    resources = layer._resource_group.resources  # pylint: disable=protected-access
+    retained = resources._plans[512]  # pylint: disable=protected-access
+    coverage = retained.spec.plan_tokens
+    result = _verify(layer, [385] * world, weights, rank, device)
+    expanded = resources._plans[512]  # pylint: disable=protected-access
+    if expanded is retained or retained.spec.plan_tokens != coverage or expanded.spec.plan_tokens < 512:
+        raise AssertionError(f"partial bucket was not replaced immutably: old={coverage}, "
+                             f"new={expanded.spec.plan_tokens}")
+    layer.zero_grad(set_to_none=True)
+    _check_gradients(layer, pending, _rounded_oracle(weights, inputs), lengths, rank)
+    return result
+
+
+def _bucket_reuse(layer: MegaMoeExperts, weights: tuple, rank: int, world: int,
+                  device: torch.device) -> dict:
+    """Cycle through more than four buckets without rebuilding stable plans or storage."""
+    lengths = (0, 1, 129, 257, 513, 1025, 2049, 4097)
+    for tokens in lengths:
+        _verify(layer, [tokens] * world, weights, rank, device)
+    resources = layer._resource_group.resources  # pylint: disable=protected-access
+    plans = dict(resources._plans)  # pylint: disable=protected-access
+    epoch = _state(layer)["epoch"]
+    if len(plans) < 7:
+        raise AssertionError(f"wide token cycle did not retain seven buckets: cached={list(plans)}")
+    errors = []
+    for tokens in lengths:
+        errors.append(_verify(layer, [tokens] * world, weights, rank, device)["max_abs_error"])
+        if _state(layer)["epoch"] != epoch:
+            raise AssertionError(f"warm token cycle restarted the heap: expected_epoch={epoch}")
+        if any(resources._plans.get(bucket) is not plan for bucket, plan in plans.items()):  # pylint: disable=protected-access
+            raise AssertionError(f"warm token cycle replaced cached plans: buckets={list(plans)}")
+    return {"buckets": sorted(plans), "epoch": epoch, "max_abs_errors": errors}
+
+
+def _other_workspace_growth(layer: MegaMoeExperts, weights: tuple, rank: int, world: int,
+                            device: torch.device) -> None:
+    """Rebuild a root containing both transports without invalidating pending graphs."""
+    lengths = [17] * world
+    inputs = _inputs(lengths, layer.num_experts, layer.top_k)
+    pending = _forward(layer, inputs, rank, device)
+    other = _layer("pull" if layer.dispatch_mode == "push" else "push", weights, rank, world, device)
+    _verify(other, [769] * world, weights, rank, device)
+    layer.zero_grad(set_to_none=True)
+    _check_gradients(layer, pending, _rounded_oracle(weights, inputs), lengths, rank)
+    other.close()
+
+
+def _run_token_matrix(mega: MegaMoeExperts, fixed: MegaMoeExperts, weights: tuple,
+                      rank: int, world: int, device: torch.device) -> tuple:
+    """Check real-shape gradients, monotonic capacity and the padded FP32 diagnostic baseline."""
+    results = []
+    fixed_reports = []
+    reference_lengths = [[224, 240, 1, 127, 128, 129, 0, 257][:world]]
+    if EXTENDED_LEVEL1:
+        reference_lengths += [[127] * world, [4096] + [1] * (world - 1)]
+    cases = _cases(world) + [([129 + index for index in range(world)], False),
+                            ([769] + [0] * (world - 1), True), ([4097] + [1] * (world - 1), False)]
+    for lengths, hot in cases:
+        inputs = _inputs(lengths, mega.num_experts, mega.top_k, hot)
+        expected = _rounded_oracle(weights, inputs)
+        mega.zero_grad(set_to_none=True)
+        previous = _state(mega)
+        resources = mega._resource_group.resources  # pylint: disable=protected-access
+        workspace = resources.workspace
+        if workspace.expert_buffer is not None:
+            workspace.wait_for_reuse()
+            workspace.expert_buffer.fill_(float("nan"))
+            workspace.routed_buffer.fill_(float("nan"))
+        invocation = _forward(mega, inputs, rank, device)
+        errors = _check_gradients(mega, invocation, expected, lengths, rank)
+        current = _state(mega)
+        required = max(lengths) * mega.top_k
+        if current["routed_rows"] < max(required, previous["routed_rows"]):
+            raise AssertionError("source capacity is insufficient or shrank")
+        if (required <= previous["routed_rows"] and not hot and max(lengths) <= 1
+                and current["epoch"] != previous["epoch"]):
+            raise AssertionError("small input unnecessarily restarted the heap")
+        if lengths in reference_lengths:
+            x, probs, output, _ = invocation
+            actual = tuple(value.detach().cpu().clone() for value in
+                           (output, x.grad, probs.grad, mega.gate_up_weight.grad, mega.down_weight.grad))
+            fixed_reports.append(_fixed_comparison(fixed, weights, inputs, actual, lengths, rank, device))
+        results.append({"lengths": lengths, "hot": hot, "max_abs_error": errors, "capacity": current})
+        print(json.dumps({"rank": rank, **results[-1]}), flush=True)
+    return results, fixed_reports
+
+
 def test_dynamic_tokens() -> None:
-    """Run the dynamic-length EP contract and full-gradient precision matrix."""
+    """Validate automatic lengths, growth, numerical oracles and retained graphs in one EP worker."""
     torch.set_num_threads(2)
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.npu.set_device(local_rank)
     dist.init_process_group("hccl")
     rank, world = dist.get_rank(), dist.get_world_size()
     device = torch.device("npu", local_rank)
+    mode = os.environ.get("HP_DYNAMIC_DISPATCH", "push")
     _configuration_failures(world, rank, device)
     start_shmem_lifetime()
-    experts, top_k = world * 6, min(world * 6, 6)
-    weights = _weights(experts)
+    weights = _weights(world * 6)
     _pending_backward_across_restart(weights, rank, world, device)
-    mega = MegaMoeExperts(max_local_num_tokens=_CAPACITY, hidden_size=_HIDDEN,
-                          intermediate_size=_INTERMEDIATE, num_experts=experts,
-                          top_k=top_k, ep_size=world,
-                          ep_group=dist.group.WORLD,
-                               dispatch_mode=os.environ.get("HP_DYNAMIC_DISPATCH", "push"),
-                               ).to(device=device, dtype=torch.bfloat16)
-    fixed = MegaMoeExperts(local_num_tokens=_CAPACITY, hidden_size=_HIDDEN,
-                           intermediate_size=_INTERMEDIATE, num_experts=experts,
-                           top_k=top_k, ep_size=world,
-                          ep_group=dist.group.WORLD,
-                               dispatch_mode=os.environ.get("HP_DYNAMIC_DISPATCH", "push"),
-                               ).to(device=device, dtype=torch.bfloat16)
-    peer = MegaMoeExperts(max_local_num_tokens=_CAPACITY, hidden_size=_HIDDEN,
-                          intermediate_size=_INTERMEDIATE, num_experts=experts,
-                          top_k=top_k, ep_size=world,
-                          ep_group=dist.group.WORLD,
-                               dispatch_mode=os.environ.get("HP_DYNAMIC_DISPATCH", "push"),
-                               ).to(device=device, dtype=torch.bfloat16)
-    bounded = MegaMoeExperts(max_local_num_tokens=128, hidden_size=_HIDDEN,
-                            intermediate_size=_INTERMEDIATE, num_experts=experts,
-                            top_k=top_k, ep_size=world,
-                            ep_group=dist.group.WORLD,
-                               dispatch_mode=os.environ.get("HP_DYNAMIC_DISPATCH", "push"),
-                               ).to(device=device, dtype=torch.bfloat16)
+    mega = _layer(mode, weights, rank, world, device)
+    peer = _layer(mode, weights, rank, world, device)
+    fixed = _layer(mode, weights, rank, world, device)
+    hotspot = _layer(mode, weights, rank, world, device)
     MegaMoeExperts.share_execution_resources([mega, peer])
-    with torch.no_grad():
-        mega.gate_up_weight.copy_(weights[0][rank * 6:(rank + 1) * 6])
-        mega.down_weight.copy_(weights[1][rank * 6:(rank + 1) * 6])
-    fixed.load_state_dict(mega.state_dict())
-    peer.load_state_dict(mega.state_dict())
-    bounded.load_state_dict(mega.state_dict())
-    _negative_routes(mega, bounded, rank, device)
-    bounded_inputs = _inputs([17] * world, experts, top_k)
-    _check_gradients(bounded, _forward(bounded, bounded_inputs, rank, device),
-                     _rounded_oracle(weights, bounded_inputs), [17] * world, rank)
-    results, fixed_reports = [], []
-    reference_lengths = [[224, 240, 1, 127, 128, 129, 0, 257][:world]]
-    if EXTENDED_LEVEL1:
-        reference_lengths += [[127] * world, [4096] + [1] * (world - 1)]
-    for lengths, hot in _cases(world):
-        inputs = _inputs(lengths, experts, top_k, hot)
-        expected = _rounded_oracle(weights, inputs)
-        mega.zero_grad(set_to_none=True)
-        # Poison private buffers to detect stale data across dynamic-token calls.
-        resources = mega._resource_group.resources  # pylint: disable=protected-access
-        if resources is not None:
-            workspace = resources.workspace
-            if workspace.expert_buffer is not None:
-                workspace.wait_for_reuse()
-                workspace.expert_buffer.fill_(float("nan"))
-                workspace.routed_buffer.fill_(float("nan"))
-        invocation = _forward(mega, inputs, rank, device)
-        errors = _check_gradients(mega, invocation, expected, lengths, rank)
-        if lengths in reference_lengths:
-            x, probs, output, _ = invocation
-            actual = tuple(value.detach().cpu().clone() for value in
-                           (output, x.grad, probs.grad, mega.gate_up_weight.grad, mega.down_weight.grad))
-            fixed_reports.append(_fixed_comparison(fixed, weights, inputs, actual, lengths, rank, device))
-        results.append({"lengths": lengths, "hot": hot, "max_abs_error": errors})
-        print(json.dumps({"rank": rank, **results[-1]}), flush=True)
+    results = [_verify(mega, [0] * world, weights, rank, device)]
+    if _state(mega)["routed_rows"] != 128 * mega.top_k:
+        raise AssertionError("empty first input reserved more than the bootstrap capacity")
+    results.append(_pending_growth(mega, weights, rank, world, device))
+    results.append(_pending_bucket_growth(mega, weights, rank, world, device))
+    _other_workspace_growth(mega, weights, rank, world, device)
+    _negative_routes(mega, hotspot, rank, device)
+    results.append(_verify(hotspot, [17] * world, weights, rank, device))
+    matrix_results, fixed_reports = _run_token_matrix(mega, fixed, weights, rank, world, device)
+    results.extend(matrix_results)
+    results.append(_verify(peer, [127] * world, weights, rank, device))
+    if mega._resource_group.resources is not peer._resource_group.resources:  # pylint: disable=protected-access
+        raise AssertionError("shared second layer acquired independent execution resources")
     _frozen_gradients(mega, weights, rank, device)
     _lifecycle([mega, peer], rank, device)
     mega.load_state_dict(fixed.state_dict())
-    # Retire the other member so closing the last owner checks pending graphs.
     peer.close()
     _deferred(mega, weights, rank, device)
-    too_long = [4097] + [0] * (world - 1)
-    try:
-        _forward(mega, _inputs(too_long, experts, top_k), rank, device)
-    except RuntimeError as error:
-        if "token capacity overflow" not in str(error):
-            raise
-    else:
-        raise AssertionError("accepted an over-capacity source")
-    mega.close()
-    peer.close()
-    fixed.close()
-    bounded.close()
+    bucket_reuse = _bucket_reuse(mega, weights, rank, world, device)
+    final_state = _state(mega)
+    for layer in (mega, fixed, hotspot):
+        layer.close()
     result = {"status": "passed", "results": results, "deferred_backward": "passed",
-              "coordinated_overflow": "passed", "fixed_reference": fixed_reports,
+              "fixed_reference": fixed_reports,
               "checkpoint_shared_stream_sgd": "passed", "frozen_policies": "passed",
-              "torch": torch.__version__, "torch_npu": torch_npu.__version__,
-              "dispatch_mode": os.environ.get("HP_DYNAMIC_DISPATCH", "push")}
+              "source_growth_pending_backward": "passed", "mixed_transport_restart": "passed",
+              "same_bucket_growth_pending_backward": "passed", "geometric_plan_reuse": bucket_reuse,
+              "final_capacity": final_state, "torch": torch.__version__, "torch_npu": torch_npu.__version__,
+              "dispatch_mode": mode}
     if os.getenv("HP_MEGA_MOE_LEVEL1_RESULT"):
         write_evidence(result)
     elif os.getenv("HP_DYNAMIC_RESULT_DIR"):

@@ -84,7 +84,7 @@ def _model(tp: int, cp: int, vision: bool, mode: str) -> nn.Module:
             block.gate.bias_vl.zero_()
             block.gate.bias_vl[-6:].fill_(2.)
     block.experts = DeepseekV41MegaMoeExperts(
-        module=block.experts, dispatch_mode=mode, local_num_tokens=256,
+        module=block.experts, dispatch_mode=mode,
         context={'tp': tp > 1, 'cp': cp > 1, 'ep': True, 'sequence_parallel': tp > 1},
     )
     block.forward = MethodType(_vision_signature if vision else _text_signature, block)

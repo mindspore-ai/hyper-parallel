@@ -235,7 +235,6 @@ class QwenMoeBlock(nn.Module):
         self.config = config
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.experts = MegaMoeExperts(
-            local_num_tokens=config.local_num_tokens,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             num_experts=config.num_experts,

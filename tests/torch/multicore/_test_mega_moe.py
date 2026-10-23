@@ -247,7 +247,6 @@ def new_layers(
     common_moe = new_common_moe(shape)
     mode = dispatch_mode or os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push")
     mega = MegaMoeExperts(
-        local_num_tokens=shape.local_num_tokens,
         hidden_size=shape.hidden_size,
         intermediate_size=shape.intermediate_size,
         num_experts=shape.num_experts,
@@ -583,7 +582,6 @@ def _new_performance_layer(
             f"HP_MEGA_MOE_PERF_BACKEND must be common or mega_moe, got {backend!r}."
         )
     return MegaMoeExperts(
-        local_num_tokens=shape.local_num_tokens,
         hidden_size=shape.hidden_size,
         intermediate_size=shape.intermediate_size,
         num_experts=shape.num_experts,

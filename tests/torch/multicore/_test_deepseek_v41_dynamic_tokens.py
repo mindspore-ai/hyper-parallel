@@ -97,7 +97,7 @@ def test_deepseek_v41_dynamic_tokens() -> None:
     dynamic.gate_up_proj = nn.Parameter(dynamic.gate_up_proj[experts].detach().npu())
     dynamic.down_proj = nn.Parameter(dynamic.down_proj[experts].detach().npu())
     dynamic.configure(dist.group.WORLD, world, 6)
-    fixed = MegaMoeExperts(local_num_tokens=4096, hidden_size=512, intermediate_size=128,
+    fixed = MegaMoeExperts(hidden_size=512, intermediate_size=128,
                            num_experts=48, top_k=6, swiglu_limit=10.0, ep_size=world,
                            ep_group=dist.group.WORLD, dispatch_mode=dispatch_mode).npu().bfloat16()
     with torch.no_grad():

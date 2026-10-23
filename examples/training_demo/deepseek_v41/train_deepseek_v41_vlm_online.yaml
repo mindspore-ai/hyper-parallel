@@ -81,7 +81,6 @@ plan_overrides:
     replace_module:
       _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe.DeepseekV41MegaMoeExperts
       # Upper bound on actual local rows; increase it for larger encoded VLM batches.
-      local_num_tokens: 4096
       dispatch_mode: push  # Set to pull for GET dispatch.
   # The registered architecture runs without replacements. When Encoder
   # Parallel is enabled, its runtime requires the ViT attention wrapper.

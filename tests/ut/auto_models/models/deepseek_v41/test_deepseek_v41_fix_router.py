@@ -184,7 +184,7 @@ local_compute_fn:
             if multimodal:
                 module.gate.bias_vl.copy_(torch.tensor([0., 0., 2., 2.]))
         reference_gate = copy.deepcopy(module.gate)
-        module.experts = DeepseekV41MegaMoeExperts(module=source, local_num_tokens=128)
+        module.experts = DeepseekV41MegaMoeExperts(module=source)
         module.shared_experts = nn.Linear(4, 4)
         module.shared_experts.limit = 1.5
         module.is_hash = False

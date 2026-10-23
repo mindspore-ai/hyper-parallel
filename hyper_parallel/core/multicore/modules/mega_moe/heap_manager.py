@@ -16,12 +16,13 @@
 
 from __future__ import annotations
 
+import math
 import os
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, NoReturn
 
 import torch
@@ -29,7 +30,13 @@ import torch
 from hyper_parallel.core.multicore import _collective, shmem
 from hyper_parallel.core.multicore.shmem import _lifecycle
 
-from .spec import MegaMoeSpec, _grow_receive_capacity, _resolve_receive_capacity
+from .spec import (
+    _DEFAULT_CAPACITY_FACTOR,
+    MegaMoeSpec,
+    _align_capacity,
+    _grow_receive_capacity,
+    _resolve_receive_capacity,
+)
 from .workspace import MegaMoeWorkspace, _spec_workspace_bytes
 
 
@@ -49,6 +56,7 @@ class _WorkspaceLayout:
     required_bytes: int
     collective_signature: tuple[Any, ...]
     receive_capacity: int
+    token_capacity: int | None = None
 
 
 @dataclass
@@ -91,19 +99,24 @@ def _workspace_layout(
     specification: Mapping[str, Any],
     dtype: torch.dtype,
     capacity: int | None = None,
+    token_capacity: int | None = None,
 ) -> _WorkspaceLayout:
     """Describe one MegaMoe symmetric workspace reservation."""
+    physical = dict(specification)
+    if token_capacity is not None:
+        physical["local_num_tokens"] = token_capacity
     if capacity is None:
         capacity = _resolve_receive_capacity(
             specification["initial_capacity_factor"],
-            specification["local_num_tokens"] * specification["top_k"],
+            physical["local_num_tokens"] * specification["top_k"],
             specification["ep_size"],
         )
     signature = tuple(sorted((key, value) for key, value in specification.items() if key != "ep_group"))
     return _WorkspaceLayout(
-        required_bytes=_spec_workspace_bytes(specification, dtype, receive_capacity=capacity),
+        required_bytes=_spec_workspace_bytes(physical, dtype, receive_capacity=capacity),
         collective_signature=signature,
         receive_capacity=capacity,
+        token_capacity=physical["local_num_tokens"] if specification.get("auto_tokens", False) else None,
     )
 
 
@@ -289,7 +302,12 @@ class _HeapManager:
             self.entries[:] = [entry for entry in self.entries if entry.workspace is not workspace]
 
     def ensure_capacity(self, workspace: MegaMoeWorkspace, maximum_received_slots: int) -> None:
-        """Grow one workspace using the existing geometric and minimum capacity policy."""
+        """Grow one workspace while preserving its committed source capacity.
+
+        Args:
+            workspace: Owner of the receive reservation.
+            maximum_received_slots: Largest current owner load in the EP group.
+        """
         if maximum_received_slots <= workspace.capacity_floor:
             return
         with self.access():
@@ -301,12 +319,57 @@ class _HeapManager:
                 entry.layout.receive_capacity,
                 maximum_received_slots,
             )
-            layout = _workspace_layout(entry.specification, self.dtype, capacity)
+            layout = _workspace_layout(entry.specification, self.dtype, capacity, entry.layout.token_capacity)
             layouts = [layout if item is entry else item.layout for item in self.entries]
             if self.heap_limit is not None and self._required_bytes(layouts) > self.heap_limit:
-                layout = _workspace_layout(entry.specification, self.dtype, minimum)
+                layout = _workspace_layout(entry.specification, self.dtype, minimum, entry.layout.token_capacity)
                 layouts = [layout if item is entry else item.layout for item in self.entries]
             self._restart(layouts, self._budget(self._required_bytes(layouts)))
+
+    def ensure_token_capacity(self, workspace: MegaMoeWorkspace, tokens: int, received: int) -> MegaMoeSpec:
+        """Grow source and destination storage in one transaction after route agreement.
+
+        Args:
+            workspace: Automatic execution resource receiving this route.
+            tokens: Group-maximum actual token rows, aligned for scheduling.
+            received: Group-maximum actual destination rows.
+
+        Returns:
+            Committed physical specification, independent of retained execution plans.
+        """
+        with self.access():
+            entry = self._entry_for_workspace(workspace)
+            spec = entry.bound_spec
+            if spec is None or not spec.auto_tokens:
+                raise RuntimeError("Automatic token growth requires an automatic workspace")
+            grow_source = tokens > spec.local_num_tokens
+            grow_receive = spec.dispatch_mode == "push" and received > entry.layout.receive_capacity
+            if not grow_source and not grow_receive:
+                return spec
+            factor = spec.capacity_growth_factor or _DEFAULT_CAPACITY_FACTOR
+            token_limit = ((2**31 - 1) // max(spec.hidden_size, spec.top_k) // 128) * 128
+            token_capacity = (_align_capacity(max(tokens, math.ceil(min(token_limit, spec.local_num_tokens * factor))))
+                              if grow_source else spec.local_num_tokens)
+            receive_capacity = entry.layout.receive_capacity
+            if grow_receive:
+                receive_capacity = _align_capacity(max(received, math.ceil(min(2**31 - 1, receive_capacity * factor))))
+            layout = _workspace_layout(entry.specification, self.dtype, receive_capacity, token_capacity)
+            layouts = [layout if item is entry else item.layout for item in self.entries]
+            if self.heap_limit is not None and self._required_bytes(layouts) > self.heap_limit:
+                layout = _workspace_layout(entry.specification, self.dtype,
+                                           max(entry.layout.receive_capacity, _align_capacity(received)),
+                                           max(spec.local_num_tokens, tokens))
+                layouts = [layout if item is entry else item.layout for item in self.entries]
+            self._restart(layouts, self._budget(self._required_bytes(layouts)))
+            return entry.bound_spec
+
+    @staticmethod
+    def _layout_spec(entry: _HeapEntry, layout: _WorkspaceLayout) -> MegaMoeSpec:
+        """Project candidate capacities without modifying a committed specification."""
+        if layout.token_capacity is None:
+            return entry.bound_spec
+        return replace(entry.bound_spec, local_num_tokens=layout.token_capacity,
+                       receive_capacity=layout.receive_capacity)
 
     @staticmethod
     def _required_bytes(layouts: list[_WorkspaceLayout]) -> int:
@@ -380,7 +443,7 @@ class _HeapManager:
             if is_bound:
                 start = len(replacements)
                 workspace_replacements = entry.workspace.describe_restart_allocations(
-                    entry.bound_spec,
+                    self._layout_spec(entry, layout),
                     self.dtype,
                     layout.receive_capacity,
                 )
@@ -441,7 +504,7 @@ class _HeapManager:
             if entry.workspace is None or entry.bound_spec is None:
                 raise RuntimeError("SHMEM Heap workspace binding changed after restart")
             entry.workspace.validate_restarted_allocations(
-                entry.bound_spec,
+                self._layout_spec(entry, layout_by_entry[id(entry)]),
                 self.dtype,
                 layout_by_entry[id(entry)].receive_capacity,
                 result.tensors[binding.start:binding.stop],
@@ -458,7 +521,7 @@ class _HeapManager:
         for binding in bindings:
             entry = binding.entry
             entry.workspace.bind_restarted_allocations(
-                entry.bound_spec,
+                self._layout_spec(entry, layout_by_entry[id(entry)]),
                 self.dtype,
                 self.device,
                 layout_by_entry[id(entry)].receive_capacity,
@@ -500,6 +563,8 @@ class _HeapManager:
 
         stages_ms = dict(result.stages_ms)
         for entry, layout in zip(self.entries, layouts):
+            if entry.bound_spec is not None:
+                entry.bound_spec = self._layout_spec(entry, layout)
             entry.layout = layout
             if entry.workspace is not None:
                 entry.workspace.capacity_floor = layout.receive_capacity
