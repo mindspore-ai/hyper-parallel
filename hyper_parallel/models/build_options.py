@@ -167,14 +167,43 @@ class FSDP2MixedPrecisionConfig:
 
     All dtypes default to None, which means no mixed precision at all;
     the core ``MixedPrecisionPolicy`` then falls back to framework
-    defaults. Dtype strings are resolved to platform dtypes when the
-    FSDP2 manager builds the core policy.
+    defaults. Dtype strings are resolved to Torch dtypes when the FSDP2 manager
+    builds the core policy. ``custom_params`` maps exact root-relative parameter
+    names to ``param_dtype`` and/or ``reduce_dtype`` overrides. Missing fields
+    inherit the policy; explicit None uses the stored compute dtype or the
+    gradient's reduction dtype instead of the corresponding policy field.
+    Names are resolved to Parameter objects before any FSDP unit is wrapped.
     """
 
     param_dtype: Optional[Literal["bfloat16", "float16", "float32"]] = None
     reduce_dtype: Optional[Literal["bfloat16", "float16", "float32"]] = None
     output_dtype: Optional[Literal["bfloat16", "float16", "float32"]] = None
     cast_forward_inputs: bool = True
+    custom_params: dict[str, dict[str, Optional[Literal["bfloat16", "float16", "float32"]]]] = field(
+        default_factory=dict
+    )
+
+    def __post_init__(self) -> None:
+        """Validate YAML overrides before model construction."""
+        self._check_custom_param()
+
+    def _check_custom_param(self) -> None:
+        """Validate parameter names and dtype strings without changing the configuration."""
+        if not isinstance(self.custom_params, Mapping):
+            raise ValueError("mix_precision.custom_params must map parameter names to dtype dictionaries")
+        for parameter_name, custom_dtypes in self.custom_params.items():
+            if not isinstance(parameter_name, str) or not parameter_name:
+                raise ValueError("mix_precision.custom_params keys must be non-empty parameter names")
+            if not isinstance(custom_dtypes, Mapping):
+                raise ValueError("mix_precision.custom_params values must be dtype dictionaries")
+            if custom_dtypes.keys() - {"param_dtype", "reduce_dtype"}:
+                raise ValueError("mix_precision.custom_params only supports param_dtype and reduce_dtype overrides")
+            for dtype_name, dtype in custom_dtypes.items():
+                if dtype not in (None, "bfloat16", "float16", "float32"):
+                    raise ValueError(
+                        f"mix_precision.custom_params[{parameter_name!r}].{dtype_name} "
+                        f"must be bfloat16, float16, float32 or None, got {dtype!r}"
+                    )
 
 
 @dataclass
