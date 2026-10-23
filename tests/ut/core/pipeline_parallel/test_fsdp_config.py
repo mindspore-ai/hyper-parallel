@@ -266,3 +266,147 @@ def test_fsdp_stage_launches_deferred_reduction_and_delegates_terminal_wait() ->
     root.hsdp_scheduler.hsdp_state.post_backward.assert_called_once_with()
     root.hsdp_scheduler.hsdp_state.reduce_params.assert_called_once_with()
     root.hsdp_scheduler.wait_for_pending_reductions.assert_called_once_with()
+
+
+@arg_mark(
+    plat_marks=["cpu_linux"],
+    level_mark="level0",
+    card_mark="onecard",
+    essential_mark="essential",
+)
+def test_fsdp_comm_first_frontloads_async_unshards_and_waits_before_first_compute() -> None:
+    """
+    Feature: Pipeline FSDP comm-first injection.
+    Description: Every managed chunk's all-gather launches at the schedule head
+        as async steps, a wait lands right before each chunk's first compute,
+        and resharding happens once at the tail.
+    Expectation: Head async unshards in first-compute order, pre-compute waits,
+        no mid-schedule reshard/unshard churn, tail reshards.
+    """
+    overlap_step = scheduler_module.MetaStep(
+        None,
+        scheduler_module.MetaStepType.OVERLAP_B_F,
+        None,
+        sub_steps=(
+            scheduler_module.MetaStep(0, scheduler_module.MetaStepType.BWD, 0),
+            scheduler_module.MetaStep(0, scheduler_module.MetaStepType.FWD, 2),
+        ),
+    )
+    actions = [
+        scheduler_module.MetaStep(0, scheduler_module.MetaStepType.FWD_RECV, 0),
+        scheduler_module.MetaStep(0, scheduler_module.MetaStepType.FWD, 0),
+        scheduler_module.MetaStep(0, scheduler_module.MetaStepType.FWD_RECV, 1),
+        scheduler_module.MetaStep(0, scheduler_module.MetaStepType.FWD, 1),
+        scheduler_module.MetaStep(0, scheduler_module.MetaStepType.FWD, 9),
+        overlap_step,
+        scheduler_module.MetaStep(0, scheduler_module.MetaStepType.FWD, 3),
+        scheduler_module.MetaStep(0, scheduler_module.MetaStepType.BWD, 3),
+    ]
+
+    result = scheduler_module.add_fsdp_comm_first(
+        actions,
+        managed_stage_indices={0, 1, 2, 3},
+    )
+
+    assert result == [
+        scheduler_module.MetaStep(None, scheduler_module.MetaStepType.FSDP_UNSHARD_ASYNC, 0),
+        scheduler_module.MetaStep(None, scheduler_module.MetaStepType.FSDP_UNSHARD_ASYNC, 1),
+        scheduler_module.MetaStep(None, scheduler_module.MetaStepType.FSDP_UNSHARD_ASYNC, 2),
+        scheduler_module.MetaStep(None, scheduler_module.MetaStepType.FSDP_UNSHARD_ASYNC, 3),
+        actions[0],
+        scheduler_module.MetaStep(None, scheduler_module.MetaStepType.FSDP_UNSHARD_WAIT, 0),
+        actions[1],
+        actions[2],
+        scheduler_module.MetaStep(None, scheduler_module.MetaStepType.FSDP_UNSHARD_WAIT, 1),
+        actions[3],
+        actions[4],
+        scheduler_module.MetaStep(None, scheduler_module.MetaStepType.FSDP_UNSHARD_WAIT, 2),
+        overlap_step,
+        scheduler_module.MetaStep(None, scheduler_module.MetaStepType.FSDP_UNSHARD_WAIT, 3),
+        actions[6],
+        actions[7],
+        scheduler_module.MetaStep(None, scheduler_module.MetaStepType.FSDP_RESHARD, 0),
+        scheduler_module.MetaStep(None, scheduler_module.MetaStepType.FSDP_RESHARD, 1),
+        scheduler_module.MetaStep(None, scheduler_module.MetaStepType.FSDP_RESHARD, 2),
+        scheduler_module.MetaStep(None, scheduler_module.MetaStepType.FSDP_RESHARD, 3),
+    ]
+
+
+@arg_mark(
+    plat_marks=["cpu_linux"],
+    level_mark="level0",
+    card_mark="onecard",
+    essential_mark="essential",
+)
+def test_fsdp_comm_first_handlers_launch_async_and_wait_on_caller_thread() -> None:
+    """
+    Feature: Pipeline FSDP comm-first control steps.
+    Description: FSDP_UNSHARD_ASYNC launches the all-gather without a host wait
+        and FSDP_UNSHARD_WAIT drains it before the first compute.
+    Expectation: unshard(async_op=True) and wait_for_unshard run on the caller
+        thread against every HSDPModule in the stage tree.
+    """
+    module = MagicMock()
+    stage = SimpleNamespace(submodule=module)
+
+    with patch.object(scheduler_module, "HSDPModule", MagicMock), patch.object(
+        scheduler_module.platform,
+        "get_cells_and_names",
+        return_value=[("", module)],
+    ):
+        scheduler_module._exec_fsdp_unshard_async(stage)
+        scheduler_module._exec_fsdp_unshard_wait(stage)
+
+    module.unshard.assert_called_once_with(async_op=True)
+    module.wait_for_unshard.assert_called_once_with()
+
+
+@arg_mark(
+    plat_marks=["cpu_linux"],
+    level_mark="level0",
+    card_mark="onecard",
+    essential_mark="essential",
+)
+def test_fsdp_comm_first_selected_via_schedule_flag() -> None:
+    """
+    Feature: Pipeline FSDP comm-first wiring.
+    Description: Setting fsdp_comm_first on the schedule switches injection to
+        the head async-unshard mode.
+    Expectation: The rewritten order starts with one FSDP_UNSHARD_ASYNC per
+        local chunk and contains no windowed FSDP_UNSHARD step.
+    """
+    stage_indices = [0, 1, 2, 3]
+    stages = [
+        SimpleNamespace(stage_index=stage_index, submodule=_FakeHSDPModule())
+        for stage_index in stage_indices
+    ]
+    schedule = object.__new__(scheduler_module.Schedule1F1B)
+    schedule.stages = stages
+    schedule._stage_to_rank_index = {stage_index: 0 for stage_index in stage_indices}
+    schedule.micro_batch_num = 2
+    schedule._fsdp_comm_first = True
+    schedule.exec_order = {
+        0: [
+            scheduler_module.MetaStep(0, scheduler_module.MetaStepType.FWD, stage_index)
+            for stage_index in stage_indices
+        ] + [
+            scheduler_module.MetaStep(0, scheduler_module.MetaStepType.BWD, stage_index)
+            for stage_index in reversed(stage_indices)
+        ]
+    }
+
+    with patch.object(scheduler_module, "HSDPModule", _FakeHSDPModule):
+        schedule._inject_local_fsdp_actions()
+
+    rewritten = schedule.exec_order[0]
+    assert [
+        (step.type, step.stage_index) for step in rewritten[:4]
+    ] == [
+        (scheduler_module.MetaStepType.FSDP_UNSHARD_ASYNC, 0),
+        (scheduler_module.MetaStepType.FSDP_UNSHARD_ASYNC, 1),
+        (scheduler_module.MetaStepType.FSDP_UNSHARD_ASYNC, 2),
+        (scheduler_module.MetaStepType.FSDP_UNSHARD_ASYNC, 3),
+    ]
+    assert all(
+        step.type != scheduler_module.MetaStepType.FSDP_UNSHARD for step in rewritten
+    )
