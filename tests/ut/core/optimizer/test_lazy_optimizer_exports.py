@@ -24,9 +24,10 @@ import unittest
 import hyper_parallel.core.optimizer as opt
 
 
-_LAZY_NAMES = ("AdamW", "Muon", "ChainedOptimizer", "detect_dtensor_backend")
+_LAZY_NAMES = ("AdamW", "Muon", "Sinkhorn", "ChainedOptimizer", "detect_dtensor_backend")
 _TORCH_ONLY_MODULES = (
     "hyper_parallel.core.optimizer.adamw",
+    "hyper_parallel.core.optimizer.sinkhorn",
     "hyper_parallel.core.optimizer.muon",
     "hyper_parallel.core.optimizer.optimizer",
     "hyper_parallel.core.optimizer.dtensor_compat",
