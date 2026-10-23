@@ -50,8 +50,9 @@ The frozen flow (single source of truth) lives in
    ```
 
 3. **Interpret the report**: every check prints `PASS`/`FAIL`; final
-   `RESULT: PASSED|FAILED` mirrors the exit code. Logs and the artifact
-   bundle land in `$VAL_ROOT/logs/` and `$VAL_ROOT/<model>/generated/`.
+   `RESULT: PASSED|FAILED` mirrors the exit code. Logs land in
+   `$VAL_ROOT/logs/`; the bundle is model-anchored at
+   `$TREE_ROOT/hyper_parallel/models/<model_type>/generated/`.
 
 ## Acceptance criteria (all three parts, per model)
 
@@ -69,8 +70,9 @@ The frozen flow (single source of truth) lives in
 
 ## Failure triage
 
-- Criteria lines missing / `reusing` → check `CLEAN_GENERATED` and
-  `$VAL_ROOT/<model>/generated/` state before the run.
+- Criteria lines missing / `reusing` → check `CLEAN_GENERATED` and the
+  model-anchored `$TREE_ROOT/hyper_parallel/models/<model_type>/generated/`
+  state before the run.
 - Part 1/2 pass but Part 3 diverges → compare
   `generated/modeling_*_gen_npu.py.diff` against the source modeling module
   to narrow down which injected rule changed numerics.
