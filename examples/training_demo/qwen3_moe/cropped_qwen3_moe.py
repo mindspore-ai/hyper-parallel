@@ -43,6 +43,8 @@ class CroppedQwen3MoeOptions:
         activation_checkpoint_selection: Trainer-injected selection of
             checkpoint-safe submodules; forwarded to the build pipeline.
         swap_inputs: Trainer-injected activation-swap input flag.
+        allow_cache_entry_mutation: Trainer-injected SAC cached-tensor
+            mutation escape hatch, forwarded to the build pipeline.
         model_init_dtype: Trainer-injected parameter initialization dtype.
         activation_swap: Activation swap mode.
         codegen: Select the codegen ``gen`` backend for this build.
@@ -61,6 +63,7 @@ class CroppedQwen3MoeOptions:
     activation_checkpoint: str | None = None
     activation_checkpoint_selection: Any | None = None
     swap_inputs: bool = False
+    allow_cache_entry_mutation: bool = False
     model_init_dtype: str | None = None
     activation_swap: str = "none"
     codegen: bool = False
@@ -156,6 +159,7 @@ def build_cropped_qwen3_moe(
         activation_checkpoint=options.activation_checkpoint,
         activation_checkpoint_selection=options.activation_checkpoint_selection,
         swap_inputs=options.swap_inputs,
+        allow_cache_entry_mutation=options.allow_cache_entry_mutation,
         activation_swap=options.activation_swap,
         model_init_dtype=options.model_init_dtype,
         codegen=options.codegen,
