@@ -97,12 +97,14 @@ render_arms() {
   fi
 }
 
-# validate_model <tag> <native_yaml> <codegen_yaml>: run both arms and check
-# all three parts. Assumes the caller already prepared data + rendered YAMLs.
+# validate_model <tag> <native_yaml> <codegen_yaml> <model_type>: run both
+# arms and check all three parts. Assumes the caller already prepared data +
+# rendered YAMLs. The codegen bundle is model-anchored:
+# <TREE_ROOT>/hyper_parallel/models/<model_type>/generated.
 validate_model() {
-  local tag="$1" native_yaml="$2" codegen_yaml="$3"
+  local tag="$1" native_yaml="$2" codegen_yaml="$3" model_type="$4"
   local gen_dir log_cg log_nat
-  gen_dir="$(dirname "$codegen_yaml")/generated"
+  gen_dir="$TREE_ROOT/hyper_parallel/models/$model_type/generated"
   log_cg="$VAL_ROOT/logs/${tag}_codegen_train.log"
   log_nat="$VAL_ROOT/logs/${tag}_native_train.log"
   mkdir -p "$VAL_ROOT/logs"
@@ -236,11 +238,13 @@ record_pass "yaml/render+diff-sanity"
 # ------------------------------------------------------------- 3-5. validate --
 if [ "$RUN_QWEN" = "1" ]; then
   validate_model qwen3_moe \
-    "$VAL_ROOT/qwen3_moe/train_native.yaml" "$VAL_ROOT/qwen3_moe/train_codegen.yaml" || true
+    "$VAL_ROOT/qwen3_moe/train_native.yaml" "$VAL_ROOT/qwen3_moe/train_codegen.yaml" \
+    qwen3_moe || true
 fi
 if [ "$RUN_DSV41" = "1" ]; then
   validate_model deepseek_v41 \
-    "$VAL_ROOT/deepseek_v41/train_native.yaml" "$VAL_ROOT/deepseek_v41/train_codegen.yaml" || true
+    "$VAL_ROOT/deepseek_v41/train_native.yaml" "$VAL_ROOT/deepseek_v41/train_codegen.yaml" \
+    deepseek_v41 || true
 fi
 
 # ---------------------------------------------------------------- 6. report --

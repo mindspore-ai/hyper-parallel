@@ -60,7 +60,7 @@ variables:
 | `TORCHRUN` | same env's `torchrun` | Launcher binary (must support `--standalone`) |
 | `NPROC` | `8` | Processes per node |
 | `TREE_ROOT` | repository root (derived from script location) | Code tree under validation |
-| `VAL_ROOT` | `/home/lxy/codegen_reval/val` | Validation workspace (YAMLs, data, logs, `generated/`) |
+| `VAL_ROOT` | `/home/lxy/codegen_reval/val` | Validation workspace (YAMLs, data, logs) |
 | `QWEN_CONFIG` | `/home/lxy/qwen3_30b_a3b_4L` | Cropped Qwen3-MoE asset dir |
 | `DSV41_CONFIG` | `/home/lxy/DeepSeek-V4.1-Flash` | DeepSeek-V4.1-Flash asset dir |
 | `RUN_QWEN` / `RUN_DSV41` | `1` | Select which models to validate |
@@ -84,7 +84,10 @@ VAL_ROOT=/data/val_qwen QWEN_CONFIG=/data/models/qwen3_30b_a3b_4L \
 
 - `$VAL_ROOT/logs/<model>_codegen_train.log` / `<model>_native_train.log` —
   full training logs (both codegen criteria and loss lines live here).
-- `$VAL_ROOT/<model>/generated/` — the codegen artifact bundle from the run.
+- `$TREE_ROOT/hyper_parallel/models/<model_type>/generated/` — the codegen
+  artifact bundle (model-anchored, one per model type; `CLEAN_GENERATED=1`
+  removes it before the run to force a fresh generation — this touches
+  tracked files in a checkout, so run the flow in a disposable worktree).
 - Terminal summary: one `PASS`/`FAIL` line per check and a final
   `RESULT: PASSED|FAILED`; the exit code mirrors the result.
 
