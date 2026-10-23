@@ -15,6 +15,12 @@
 """Architecture identity and GDN sharding rules for Qwen3.5."""
 
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
+from hyper_parallel.models.qwen3_vl.adapter.fsdp import (
+    get_fsdp_execution_order,
+    get_fsdp_excluded_subtrees,
+    get_fsdp_prefetch_groups,
+    get_fsdp_wrap_modules,
+)
 from hyper_parallel.models.qwen3_5.adapter.policies.sharding import (
     build_parameter_sharding_rules,
 )
@@ -32,6 +38,10 @@ def _load_context_parallel():
 QWEN3_5_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Qwen3_5ForConditionalGeneration",
     model_type="qwen3_5",
+    fsdp_wrap_modules=get_fsdp_wrap_modules,
+    fsdp_excluded_subtrees=get_fsdp_excluded_subtrees,
+    fsdp_execution_order=get_fsdp_execution_order,
+    fsdp_prefetch_groups=get_fsdp_prefetch_groups,
     context_parallel=_load_context_parallel,
     sharding_rules=build_parameter_sharding_rules,
 )

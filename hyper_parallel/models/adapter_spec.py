@@ -111,6 +111,9 @@ class ModelAdapterSpec:
             selected child-unit FQN, then returning their first-forward
             execution order. This lets conditional multimodal models override
             module-registration order for FSDP communication prefetching.
+        fsdp_prefetch_groups: provider accepting the built model and ordered
+            child-unit FQNs, then partitioning them into independent prefetch
+            chains. Every child unit must appear exactly once.
         recompute: provider returning normal-training activation-checkpoint
             policy. This must not depend on validation-only imports.
         validation: lazy provider returning the family's ``ModelValidationSpec``.
@@ -140,3 +143,4 @@ class ModelAdapterSpec:
     validation: Optional[Callable[..., Any]] = None
     loss: Optional[Callable[..., Any]] = None
     encoder_parallel: Optional[Callable[..., Any]] = None
+    fsdp_prefetch_groups: Optional[Callable[..., Any]] = None

@@ -537,19 +537,62 @@ class FSDP2Manager:
         return True
 
     def _configure_prefetch(self, hsdp_modules: list[HSDPModule]) -> None:
-        """Configure forward and backward prefetch targets by list depth."""
+        """Configure forward prefetch and trainable-unit backward prefetch.
+
+        Frozen units still need their parameters in forward, so they remain in
+        the forward chain. A fully frozen unit may not participate in backward
+        at all; excluding it from the explicit backward chain avoids leaving an
+        all-gather handle without a consumer. If such a unit does participate
+        in input-gradient backward, its own hook unshards it on demand.
+        """
         for module_index, hsdp_module in enumerate(hsdp_modules):
             forward_end = module_index + self.config.forward_prefetch_depth + 1
             hsdp_module.set_modules_to_forward_prefetch(
                 hsdp_modules[module_index + 1:forward_end]
             )
+            hsdp_module.set_modules_to_backward_prefetch([])
 
+        backward_prefetch_modules = [
+            module
+            for module in hsdp_modules
+            if any(parameter.requires_grad for parameter in module.parameters())
+        ]
+        for module_index, hsdp_module in enumerate(backward_prefetch_modules):
             backward_start = max(
                 0, module_index - self.config.backward_prefetch_depth
             )
             hsdp_module.set_modules_to_backward_prefetch(
-                list(reversed(hsdp_modules[backward_start:module_index]))
+                list(reversed(backward_prefetch_modules[backward_start:module_index]))
             )
+
+    def _configure_model_prefetch(
+        self,
+        model: ModuleClass,
+        ordered_modules: list[_WrapModuleInfo],
+    ) -> None:
+        """Configure adapter-owned independent chains or the default single chain."""
+        adapter_spec = self._get_model_adapter_spec(model)
+        groups_provider = getattr(adapter_spec, "fsdp_prefetch_groups", None)
+        if groups_provider is None:
+            self._configure_prefetch([entry.module for entry in ordered_modules])
+            return
+        if not callable(groups_provider):
+            raise ValueError("ModelAdapterSpec.fsdp_prefetch_groups must be callable")
+        modules_by_fqn = {entry.fqn: entry.module for entry in ordered_modules}
+        groups = groups_provider(model, tuple(modules_by_fqn))  # pylint: disable=not-callable
+        if isinstance(groups, str) or not isinstance(groups, Sequence):
+            raise ValueError("ModelAdapterSpec.fsdp_prefetch_groups must return a sequence of groups")
+        grouped_fqns = []
+        for group in groups:
+            if isinstance(group, str) or not isinstance(group, Sequence) or not group:
+                raise ValueError("FSDP prefetch groups must be non-empty sequences of module FQNs")
+            if any(not isinstance(fqn, str) for fqn in group):
+                raise ValueError("FSDP prefetch group entries must be module FQN strings")
+            grouped_fqns.extend(group)
+        if len(grouped_fqns) != len(set(grouped_fqns)) or set(grouped_fqns) != set(modules_by_fqn):
+            raise ValueError("FSDP prefetch groups must include every selected child-unit FQN exactly once")
+        for group in groups:
+            self._configure_prefetch([modules_by_fqn[fqn] for fqn in group])
 
     def _order_wrap_modules(
         self,
@@ -741,9 +784,7 @@ class FSDP2Manager:
         )
         self._log_gradient_scaling(gradient_scaled_units)
         ordered_wrap_modules = self._order_wrap_modules(model, wrap_modules)
-        self._configure_prefetch(
-            [wrap_module.module for wrap_module in ordered_wrap_modules]
-        )
+        self._configure_model_prefetch(model, ordered_wrap_modules)
         logger.info(
             "Applied FSDP2 to %d child units and the root module",
             len(wrap_modules),
