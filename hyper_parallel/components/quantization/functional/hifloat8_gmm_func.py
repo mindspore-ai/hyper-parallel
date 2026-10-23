@@ -19,9 +19,7 @@ from typing import Optional
 import torch  # pylint: disable=forbidden-backend-import
 from torch.autograd.function import once_differentiable  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.components.quantization.functional.base_gmm_func import (
-    GroupedLinear,
-)
+from hyper_parallel.components.quantization.functional.base_gmm_func import GroupedLinear
 from hyper_parallel.components.quantization.ops.npu_hifloat8 import (
     hifloat8_grouped_matmul,
 )
@@ -32,7 +30,6 @@ from hyper_parallel.components.quantization.quantizers.hifloat8 import (
 )
 from hyper_parallel.components.quantization.tensor import (
     HiFloat8Tensor,
-    QuantizedTensorStorage,
 )
 
 
@@ -104,7 +101,11 @@ class HiFloat8GroupedLinear(GroupedLinear):
         group_list: torch.Tensor,
         group_list_type: int,
     ) -> tuple[torch.Tensor, int]:
-        """Keep the caller's counts or offsets because HiFloat8 accepts both."""
+        """Preserve counts/type 1 or offsets/type 0 for HiFloat8.
+
+        Both representations are accepted by its grouped-matmul path, so the
+        tensor and its interpretation tag pass through together unchanged.
+        """
 
         return group_list, group_list_type
 
@@ -113,22 +114,10 @@ class HiFloat8GroupedLinear(GroupedLinear):
 
         return weight.shape[-2]
 
-    def weight_quantization_directions(
-        self,
-        needs_grad_input: bool,
-    ) -> tuple[bool, bool]:
-        """Build the column view for forward and row view only for dgrad."""
-
-        return needs_grad_input, True
-
-    def retain_weight_backward(
-        self,
-        weight_quant: QuantizedTensorStorage,
-        needs_grad_input: bool,
-    ) -> None:
-        """Release the forward column view and retain the dgrad row view."""
-
-        weight_quant.update_usage(rowwise=needs_grad_input, colwise=False)
+    @property
+    def weight_forward_is_rowwise(self) -> bool:
+        """Use the column-wise weight view in the forward NN GMM."""
+        return False
 
     def quantize_input(
         self,

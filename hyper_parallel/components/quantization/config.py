@@ -16,29 +16,85 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import Literal, Optional, TypeAlias, cast
 
 
-# One registry row per accepted dtype: (family, bit width, MX block check).
+MXBlockSizeValue: TypeAlias = Literal[32]
+FP4_BITS = 4
+FP8_BITS = 8
+MX_BLOCK_SIZE_32 = 32
+SUPPORTED_MX_BLOCK_SIZES = (MX_BLOCK_SIZE_32,)
+
+# MX tensor and scale layout.
+MX_SCALE_SLOTS = 2
+MX_SCALE_TILE = MX_BLOCK_SIZE_32 * MX_SCALE_SLOTS
+MXFP4_VALUES_PER_BYTE = 2
+MXFP4_NIBBLE_BITS = 4
+MXFP4_NIBBLE_MASK = (1 << MXFP4_NIBBLE_BITS) - 1
+
+# E8M0/FP8 conversion limits used by the fake-QAT path.
+E8M0_BIAS = 127.0
+E8M0_MAX_EXPONENT = 255.0
+MXFP4_MAX_VALUE = 6.0
+FP8_E4M3_MAX = 448.0
+
+# GroupedMatmul and DynamicMxQuant protocol values.
+GROUP_LIST_OFFSETS = 0
+GROUP_LIST_COUNTS = 1
+GMM_GROUP_M = 0
+GMM_GROUP_K = 2
+GMM_SPLIT_ANTIQ = 2
+GMM_SPLIT_MXFP8 = 2
+GMM_SPLIT_SCALE = 3
+MX_SCALE_ALG_OCP = 0
+MX_SCALE_ALG_CUBALS = 1
+NPU_FORMAT_FRACTAL_NZ = 29
+
+# Shape ranks used by grouped quantization contracts.
+MATRIX_NDIM = 2
+GROUPED_NDIM = 3
+SCALE_NDIM = 4
+_SUPPORTED_BLOCK_SIZE_TEXT = " or ".join(
+    str(block_size) for block_size in SUPPORTED_MX_BLOCK_SIZES
+)
+
+
+def validate_mx_block_size(block_size: int) -> MXBlockSizeValue:
+    """Validate a configured integer and preserve its numeric representation."""
+
+    if isinstance(block_size, bool) or not isinstance(block_size, int):
+        raise ValueError(
+            f"MX block_size must be {_SUPPORTED_BLOCK_SIZE_TEXT}, "
+            f"got {block_size!r}."
+        )
+    if block_size not in SUPPORTED_MX_BLOCK_SIZES:
+        raise ValueError(
+            f"MX block_size must be {_SUPPORTED_BLOCK_SIZE_TEXT}, "
+            f"got {block_size!r}."
+        )
+    return cast(MXBlockSizeValue, block_size)
+
+
+# One registry row per accepted dtype: (format family, bit width).
 # weight_format and act_format must share one family (operators never mix
 # families). The weight/activation bit widths are read directly from these
 # rows to select the native strategy (e.g. mxfp4 weight + mxfp8 act => W4A8).
 # Future dtypes (int/fp/bf, e.g. bf16) are one new row here; hif4 is
 # pre-listed as part of the hifloat family (reserved for its flow).
 _FORMAT_SPECS = {
-    "mxfp4": ("mxfp", 4, True),
-    "mxfp8": ("mxfp", 8, True),
-    "hif4": ("hifloat", 4, False),
-    "hif8": ("hifloat", 8, False),
+    "mxfp4": ("mxfp", FP4_BITS),
+    "mxfp8": ("mxfp", FP8_BITS),
+    "hif4": ("hifloat", FP4_BITS),
+    "hif8": ("hifloat", FP8_BITS),
 }
 _FORMATS = tuple(_FORMAT_SPECS)
 
 
-def _format_spec(format_name: str) -> tuple[str, int, bool]:
+def _format_spec(format_name: str) -> tuple[str, int]:
     """Look up one dtype format in ``_FORMAT_SPECS``.
 
-    Drives ``LowPrecisionDtypeScheme.__post_init__`` validation (family /
-    bit-width / MX-block rules). Raises ``ValueError`` on an unregistered
+    Drives ``LowPrecisionDtypeScheme.__post_init__`` validation (family and
+    bit width). Raises ``ValueError`` on an unregistered
     format so a bad ``weight_format``/``act_format`` fails at config time.
     """
 
@@ -75,13 +131,14 @@ class LowPrecisionDtypeScheme:
     is_fake_quantize: bool = False
     weight_format: Literal["mxfp4", "mxfp8", "hif4", "hif8"] = "mxfp8"
     act_format: Literal["mxfp4", "mxfp8", "hif4", "hif8"] = "mxfp8"
-    block_size: int = 32
+    block_size: int = MX_BLOCK_SIZE_32
 
     def __post_init__(self) -> None:
         """Validate that the scheme names a consistent native/QAT policy.
         ``weight_format``/``act_format`` must share one format family (the
         underlying operator never mixes families); their bit widths drive
-        strategy selection downstream. MX formats require a 32/128 block size.
+        strategy selection downstream. ``block_size`` must be an integer;
+        only MX formats restrict it to the currently supported block32 value.
         """
 
         if not isinstance(self.is_fake_quantize, bool):
@@ -92,29 +149,20 @@ class LowPrecisionDtypeScheme:
         if isinstance(self.block_size, bool) or not isinstance(self.block_size, int):
             raise ValueError("LowPrecisionDtypeScheme.block_size must be an integer.")
 
-        weight_family, weight_bits, weight_is_mx = _format_spec(self.weight_format)
-        act_family, act_bits, act_is_mx = _format_spec(self.act_format)
+        weight_family, _ = _format_spec(self.weight_format)
+        act_family, _ = _format_spec(self.act_format)
         if weight_family != act_family:
             raise ValueError(
                 "weight_format and act_format must belong to the same format "
                 "family (the underlying operator never mixes families); got "
                 f"weight={self.weight_format!r}/act={self.act_format!r}."
             )
-        if (weight_is_mx or act_is_mx) and self.block_size not in (32, 128):
-            raise ValueError(
-                "MX low-precision block_size must be 32 or 128, "
-                f"but got {self.block_size}."
-            )
-        if (
-            not self.is_fake_quantize
-            and weight_family == "mxfp"
-            and weight_bits == 8
-            and self.block_size != 32
-        ):
-            raise ValueError(
-                "native w8a8 mxfp8 scheme requires block_size=32 because the "
-                "current MXFP8 operator contract uses 32-element blocks."
-            )
+        if weight_family == "mxfp":
+            try:
+                block_size = validate_mx_block_size(self.block_size)
+            except ValueError as exc:
+                raise ValueError(f"LowPrecisionDtypeScheme.{exc}") from exc
+            object.__setattr__(self, "block_size", block_size)
 
 
 @dataclass
@@ -259,6 +307,10 @@ class LowPrecisionConfig:
 
 
 __all__ = [
+    "MXBlockSizeValue",
     "LowPrecisionConfig",
     "LowPrecisionDtypeScheme",
+    "MX_BLOCK_SIZE_32",
+    "SUPPORTED_MX_BLOCK_SIZES",
+    "validate_mx_block_size",
 ]

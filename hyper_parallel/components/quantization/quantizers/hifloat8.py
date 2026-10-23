@@ -18,6 +18,12 @@ from typing import Any, Optional
 
 import torch  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.components.quantization.config import (
+    GROUPED_NDIM,
+    GROUP_LIST_COUNTS,
+    GROUP_LIST_OFFSETS,
+    MATRIX_NDIM,
+)
 from hyper_parallel.components.quantization.ops.npu_hifloat8 import (
     HiFloat8NpuOps,
     _get_hifloat8_npu_ops,
@@ -77,6 +83,7 @@ class HiFloat8Quantizer(Quantizer):
         rowwise: bool,
         colwise: bool,
     ) -> None:
+        """Validate tensor dtype, rank, directions, and group metadata."""
         if not isinstance(tensor, torch.Tensor) or isinstance(
             tensor,
             QuantizedTensor,
@@ -89,7 +96,7 @@ class HiFloat8Quantizer(Quantizer):
                 "HiFloat8 current quantization requires float16 or bfloat16 "
                 f"input, got {tensor.dtype}."
             )
-        if tensor.ndim not in (2, 3):
+        if tensor.ndim not in (MATRIX_NDIM, GROUPED_NDIM):
             raise ValueError(
                 "HiFloat8 quantization requires a matrix or grouped weight, "
                 "got shape "
@@ -99,13 +106,13 @@ class HiFloat8Quantizer(Quantizer):
             raise ValueError(
                 "HiFloat8Quantizer requires rowwise=True or colwise=True."
             )
-        if group_list_type not in (0, 1):
+        if group_list_type not in (GROUP_LIST_OFFSETS, GROUP_LIST_COUNTS):
             raise ValueError(
                 "HiFloat8Quantizer group_list_type must be 0 or 1, "
                 f"got {group_list_type}."
             )
         if group_list is not None:
-            if tensor.ndim != 2:
+            if tensor.ndim != MATRIX_NDIM:
                 raise ValueError(
                     "Grouped HiFloat8 quantization requires a 2D operand."
                 )
@@ -123,7 +130,7 @@ class HiFloat8Quantizer(Quantizer):
         tensor: torch.Tensor,
         *,
         group_list: Optional[torch.Tensor] = None,
-        group_list_type: int = 0,
+        group_list_type: int = GROUP_LIST_OFFSETS,
         rowwise: bool = False,
         colwise: bool = False,
     ) -> HiFloat8Tensor:
@@ -141,7 +148,7 @@ class HiFloat8Quantizer(Quantizer):
             rowwise=rowwise,
             colwise=colwise,
         )
-        if tensor.ndim == 3:
+        if tensor.ndim == GROUPED_NDIM:
             flattened = tensor.reshape(tensor.shape[0], -1)
             data, scale = self.npu_ops.dynamic_quant(
                 flattened,

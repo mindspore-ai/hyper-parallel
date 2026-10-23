@@ -15,6 +15,7 @@
 """CPU tests for grouped-linear strategy dispatch and shared autograd."""
 
 import unittest
+from typing import Any
 from unittest import mock
 
 import torch
@@ -54,12 +55,22 @@ cpu_test = arg_mark(
 class _DenseStorage:
     """Minimal directional storage carrying high-precision CPU data."""
 
-    def __init__(self, value, *, rowwise, colwise):
+    def __init__(
+        self,
+        value: torch.Tensor,
+        *,
+        rowwise: bool,
+        colwise: bool,
+    ) -> None:
+        """Create a directional CPU storage test double."""
+
         self.value = value
         self.rowwise = rowwise
         self.colwise = colwise
+        self.initial_rowwise = rowwise
+        self.initial_colwise = colwise
 
-    def update_usage(self, rowwise=True, colwise=True):
+    def update_usage(self, rowwise: bool = True, colwise: bool = True) -> None:
         """Record which operand orientations the grouped strategy will use."""
 
         self.rowwise = self.rowwise and rowwise
@@ -71,35 +82,84 @@ class _DenseGroupedLinear(GroupedLinear):
 
     FORMAT_NAME = "DenseTest"
 
-    def normalize_group_list(self, group_list, group_list_type):
+    def __init__(self, forward_is_rowwise: bool = False) -> None:
+        """Create a dense strategy with a selectable forward weight view."""
+
+        self._forward_is_rowwise = forward_is_rowwise
+        self.weight_quant = None
+
+    def normalize_group_list(
+        self,
+        group_list: torch.Tensor,
+        group_list_type: int,
+    ) -> tuple[torch.Tensor, int]:
+        """Preserve the test double's group-list representation."""
+
         return group_list, group_list_type
 
-    def output_features(self, weight):
+    def output_features(self, weight: torch.Tensor) -> int:
+        """Return the live weight's output width."""
+
         return weight.shape[-2]
 
-    def weight_quantization_directions(self, needs_grad_input):
-        return needs_grad_input, True
+    @property
+    def weight_forward_is_rowwise(self) -> bool:
+        """Return the configured forward weight orientation."""
 
-    def retain_weight_backward(self, weight_quant, needs_grad_input):
-        weight_quant.update_usage(rowwise=needs_grad_input, colwise=False)
+        return self._forward_is_rowwise
 
     @staticmethod
-    def _store(value, rowwise, colwise):
+    def _store(
+        value: torch.Tensor,
+        rowwise: bool,
+        colwise: bool,
+    ) -> _DenseStorage:
+        """Build directional storage for one quantized operand."""
+
         return _DenseStorage(value, rowwise=rowwise, colwise=colwise)
 
-    def quantize_input(self, inputs, *, rowwise, colwise, **kwargs):
+    def quantize_input(
+        self,
+        inputs: torch.Tensor,
+        *,
+        rowwise: bool,
+        colwise: bool,
+        **kwargs: Any,
+    ) -> _DenseStorage:
+        """Store the activation views requested by the lifecycle."""
+
         del kwargs
         return self._store(inputs, rowwise, colwise)
 
-    def quantize_weight(self, weight, *, rowwise, colwise):
-        return self._store(weight, rowwise, colwise)
+    def quantize_weight(
+        self,
+        weight: torch.Tensor,
+        *,
+        rowwise: bool,
+        colwise: bool,
+    ) -> _DenseStorage:
+        """Store the weight views requested by the lifecycle."""
 
-    def quantize_grad_output(self, grad_output, *, rowwise, colwise, **kwargs):
+        self.weight_quant = self._store(weight, rowwise, colwise)
+        return self.weight_quant
+
+    def quantize_grad_output(
+        self,
+        grad_output: torch.Tensor,
+        *,
+        rowwise: bool,
+        colwise: bool,
+        **kwargs: Any,
+    ) -> _DenseStorage:
+        """Store the gradient-output views requested by the lifecycle."""
+
         del kwargs
         return self._store(grad_output, rowwise, colwise)
 
     @staticmethod
-    def _counts(group_list, group_list_type):
+    def _counts(group_list: torch.Tensor, group_list_type: int) -> list[int]:
+        """Convert counts or cumulative offsets to split sizes."""
+
         if group_list_type == 1:
             return group_list.tolist()
         boundaries = group_list.tolist()
@@ -108,15 +168,15 @@ class _DenseGroupedLinear(GroupedLinear):
 
     def grouped_matmul(
         self,
-        left,
-        right,
+        left: _DenseStorage,
+        right: _DenseStorage,
         *,
-        layout,
-        group_list,
-        group_type,
-        group_list_type,
-        output_dtype,
-    ):
+        layout: str,
+        group_list: torch.Tensor,
+        group_type: int,
+        group_list_type: int,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
         """Apply the grouped matrix product independently to each expert."""
 
         del group_type
@@ -165,7 +225,6 @@ class TestStrategyFactory(unittest.TestCase):
     def test_dispatches_w8a8_w4a8_fake_w4a8_and_hifloat8(self):
         """Supported native/fake policies choose their independent strategies."""
         aligned32 = ((2, 64, 32), (2, 32, 64))
-        aligned128 = ((2, 256, 128), (2, 128, 256))
         p_mx, p_native, p_fake, p_hif8 = self._patch_probes()
         with (
             p_mx as mx_probe,
@@ -176,9 +235,9 @@ class TestStrategyFactory(unittest.TestCase):
             w8a8 = build_low_precision_strategy(None, tile_shapes=aligned32)
             native = build_low_precision_strategy(
                 LowPrecisionDtypeScheme(
-                    weight_format="mxfp4", act_format="mxfp8", block_size=128
+                    weight_format="mxfp4", act_format="mxfp8", block_size=32
                 ),
-                tile_shapes=aligned128,
+                tile_shapes=aligned32,
             )
             fake = build_low_precision_strategy(
                 LowPrecisionDtypeScheme(
@@ -196,12 +255,16 @@ class TestStrategyFactory(unittest.TestCase):
 
         self.assertIsInstance(w8a8, MXFP8GroupedLinear)
         self.assertIsInstance(native, W4A8GroupedLinear)
-        self.assertEqual(native.block_size, 128)
+        self.assertEqual(native.block_size, 32)
         self.assertIsInstance(fake, FakeW4A8GroupedLinear)
         self.assertIsInstance(hif8, HiFloat8GroupedLinear)
+        self.assertFalse(w8a8.weight_forward_is_rowwise)
+        self.assertTrue(native.weight_forward_is_rowwise)
+        self.assertFalse(fake.weight_forward_is_rowwise)
+        self.assertFalse(hif8.weight_forward_is_rowwise)
         mx_probe.assert_called_once_with()
         native_probe.assert_called_once_with()
-        fake_probe.assert_called_once_with()
+        fake_probe.assert_called_once_with(32)
         hif8_probe.assert_called_once_with()
 
     @cpu_test
@@ -234,6 +297,35 @@ class TestStrategyFactory(unittest.TestCase):
 
 class TestGroupedLinearLifecycle(unittest.TestCase):
     """The shared autograd bridge preserves dense forward/dgrad/wgrad semantics."""
+
+    @cpu_test
+    def test_weight_direction_policy_builds_and_retains_required_views(self):
+        """One forward direction determines construction and dgrad retention."""
+        cases = (
+            (False, True, (True, True), (True, False)),
+            (False, False, (False, True), (False, False)),
+            (True, True, (True, True), (False, True)),
+            (True, False, (True, False), (False, False)),
+        )
+        for forward_is_rowwise, needs_grad_input, built, retained in cases:
+            strategy = _DenseGroupedLinear(forward_is_rowwise)
+            inputs = torch.randn(4, 3, requires_grad=needs_grad_input)
+            weight = torch.randn(2, 5, 3)
+            counts = torch.tensor([2, 2], dtype=torch.int64)
+
+            _GroupedLinearFunction.apply(inputs, weight, counts, strategy, 1)
+
+            actual = (
+                (strategy.weight_quant.initial_rowwise, strategy.weight_quant.initial_colwise),
+                (strategy.weight_quant.rowwise, strategy.weight_quant.colwise),
+            )
+            self.assertEqual(
+                actual,
+                (built, retained),
+                f"forward_is_rowwise={forward_is_rowwise}, "
+                f"needs_grad_input={needs_grad_input}: "
+                f"expected {(built, retained)}, got {actual}",
+            )
 
     @cpu_test
     def test_forward_and_both_gradients_match_dense_reference(self):

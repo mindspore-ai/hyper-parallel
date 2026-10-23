@@ -17,6 +17,7 @@
 from hyper_parallel.components.quantization.config import (
     LowPrecisionConfig,
     LowPrecisionDtypeScheme,
+    MXBlockSizeValue,
 )
 from hyper_parallel.components.quantization.functional import (
     GroupedLinear,
@@ -37,7 +38,6 @@ from hyper_parallel.components.quantization.ops import (
     hifloat8_matmul,
     mxfp8_grouped_matmul,
     mxfp8_matmul,
-    transform_grouped_scale,
     validate_fake_w4a8_gmm_runtime,
     validate_w4a8_gmm_runtime,
 )
@@ -70,6 +70,7 @@ __all__ = [
     "HiFloat8TensorStorage",
     "LowPrecisionConfig",
     "LowPrecisionDtypeScheme",
+    "MXBlockSizeValue",
     "LowPrecisionCapabilityError",
     "LinearStrategy",
     "GroupedExperts",
@@ -97,7 +98,6 @@ __all__ = [
     "hifloat8_matmul",
     "mxfp8_grouped_matmul",
     "mxfp8_matmul",
-    "transform_grouped_scale",
     "validate_w4a8_gmm_runtime",
     "validate_fake_w4a8_gmm_runtime",
 ]

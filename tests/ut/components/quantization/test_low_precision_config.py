@@ -15,6 +15,7 @@
 """CPU-only contracts for the low-precision policy catalog."""
 
 import unittest
+from typing import Any
 
 from torch import nn
 
@@ -42,7 +43,8 @@ cpu_test = arg_mark(
 class _SourceModule(nn.Module):
     """Importable source type used by the plan-override test."""
 
-    def forward(self, value):
+    def forward(self, value: Any) -> Any:
+        """Return the input unchanged for replacement matching tests."""
         return value
 
 
@@ -54,7 +56,7 @@ class TestLowPrecisionDtypeScheme(unittest.TestCase):
         """W8A8, native W4A8 and fake W4A8 policies retain typed fields."""
         w8a8 = LowPrecisionDtypeScheme()
         native = LowPrecisionDtypeScheme(
-            weight_format="mxfp4", act_format="mxfp8", block_size=128
+            weight_format="mxfp4", act_format="mxfp8", block_size=32
         )
         fake = LowPrecisionDtypeScheme(
             is_fake_quantize=True,
@@ -64,19 +66,38 @@ class TestLowPrecisionDtypeScheme(unittest.TestCase):
         )
 
         self.assertEqual((w8a8.weight_format, w8a8.act_format), ("mxfp8", "mxfp8"))
-        self.assertEqual(native.block_size, 128)
+        self.assertEqual(w8a8.block_size, 32)
+        self.assertEqual(native.block_size, 32)
         self.assertTrue(fake.is_fake_quantize)
+
+        fake_default = LowPrecisionDtypeScheme(
+            is_fake_quantize=True,
+            weight_format="mxfp4",
+            act_format="mxfp8",
+        )
+        self.assertEqual(fake_default.block_size, 32)
+
+    @cpu_test
+    def test_hifloat_scheme_does_not_apply_mx_block_size_restrictions(self):
+        """HiFloat keeps the integer field without MX-only validation."""
+        scheme = LowPrecisionDtypeScheme(
+            weight_format="hif8",
+            act_format="hif8",
+            block_size=64,
+        )
+
+        self.assertEqual(scheme.block_size, 64)
 
     @cpu_test
     def test_invalid_family_block_and_flag_fail_fast(self):
         """Cross-family formats and malformed MX policies are rejected."""
         with self.assertRaisesRegex(ValueError, "same format family"):
             LowPrecisionDtypeScheme(weight_format="mxfp4", act_format="hif8")
-        with self.assertRaisesRegex(ValueError, "block_size must be 32 or 128"):
+        with self.assertRaisesRegex(ValueError, "block_size must be 32"):
             LowPrecisionDtypeScheme(
                 weight_format="mxfp4", act_format="mxfp8", block_size=64
             )
-        with self.assertRaisesRegex(ValueError, "native w8a8.*block_size=32"):
+        with self.assertRaisesRegex(ValueError, "block_size must be 32"):
             LowPrecisionDtypeScheme(block_size=128)
         with self.assertRaisesRegex(ValueError, "is_fake_quantize must be a bool"):
             LowPrecisionDtypeScheme(is_fake_quantize=1)
@@ -100,7 +121,7 @@ class TestLowPrecisionConfig(unittest.TestCase):
                     "is_fake_quantize": True,
                     "weight_format": "mxfp4",
                     "act_format": "mxfp8",
-                    "block_size": 128,
+                    "block_size": 32,
                 },
             },
             default_dtype_scheme="native",
@@ -109,7 +130,7 @@ class TestLowPrecisionConfig(unittest.TestCase):
         self.assertIsInstance(config.dtype_schemes["native"], LowPrecisionDtypeScheme)
         self.assertIs(config.resolve_dtype_scheme(), config.dtype_schemes["native"])
         self.assertIs(config.resolve_dtype_scheme("fake"), config.dtype_schemes["fake"])
-        self.assertEqual(config.to_dict()["dtype_schemes"]["fake"]["block_size"], 128)
+        self.assertEqual(config.to_dict()["dtype_schemes"]["fake"]["block_size"], 32)
 
     @cpu_test
     def test_catalog_selection_errors_are_explicit(self):
@@ -135,6 +156,7 @@ class TestLowPrecisionConfig(unittest.TestCase):
         self.assertEqual((w8a8.weight_format, w8a8.act_format), ("mxfp8", "mxfp8"))
         self.assertEqual((w4a8.weight_format, w4a8.act_format), ("mxfp4", "mxfp8"))
         self.assertEqual((hif8.weight_format, hif8.act_format), ("hif8", "hif8"))
+        self.assertEqual((w8a8.block_size, w4a8.block_size, hif8.block_size), (32, 32, 32))
 
     @cpu_test
     def test_plan_override_injects_selected_policy_read_only(self):
@@ -142,7 +164,10 @@ class TestLowPrecisionConfig(unittest.TestCase):
         received = []
 
         @module_replacement
-        def capture(*, module, module_fqn, context):
+        def capture(
+            *, module: nn.Module, module_fqn: str, context: dict[str, Any]
+        ) -> nn.Module:
+            """Record replacement context and return the original module."""
             del module_fqn
             received.append(context)
             return module
@@ -182,7 +207,10 @@ class TestLowPrecisionConfig(unittest.TestCase):
     def test_plan_override_policy_requires_low_precision_condition(self):
         """A named policy cannot be attached to an unconditional replacement."""
         @module_replacement
-        def identity(*, module, module_fqn, context):
+        def identity(
+            *, module: nn.Module, module_fqn: str, context: dict[str, Any]
+        ) -> nn.Module:
+            """Return the original module without applying a policy."""
             del module_fqn, context
             return module
 

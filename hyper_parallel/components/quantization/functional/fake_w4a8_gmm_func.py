@@ -16,24 +16,30 @@
 
 import torch  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.components.quantization.config import (
+    GROUP_LIST_COUNTS,
+    GROUP_LIST_OFFSETS,
+    MX_BLOCK_SIZE_32,
+)
 from hyper_parallel.components.quantization.functional.base_gmm_func import GroupedLinear
 from hyper_parallel.components.quantization.quantizers.fake_w4a8 import FakeW4A8Quantizer
+from hyper_parallel.components.quantization.tensor import MXFP8Tensor
 
 
 class FakeW4A8GroupedLinear(GroupedLinear):
     """Use fake MXFP4 weights with the ordinary MXFP8 GMM contract.
 
-    The common flow still owns the three autograd phases.  The format-specific
-    hooks below only select operand directions and the two backward quantizers:
+    The common flow owns the three autograd phases. This strategy declares its
+    forward weight view and provides the two backward quantizers:
 
     * ``NN`` output and ``NT`` input-gradient (dA) use ``npu_dynamic_mx_quant``;
-    * ``TN`` weight-gradient (dX) uses grouped dynamic quantization for block32;
-    * block128 uses ordinary dynamic quantization for both backward directions.
+    * ``TN`` weight-gradient (dX) uses grouped dynamic quantization for block32.
     """
 
     FORMAT_NAME = "Fake W4A8"
 
-    def __init__(self, block_size: int = 32) -> None:
+    def __init__(self, block_size: int = MX_BLOCK_SIZE_32) -> None:
+        """Create a fake-W4A8 grouped strategy for one MX block size."""
         self.quantizer = FakeW4A8Quantizer(block_size)
         self.block_size = self.quantizer.block_size
 
@@ -42,28 +48,24 @@ class FakeW4A8GroupedLinear(GroupedLinear):
         group_list: torch.Tensor,
         group_list_type: int,
     ) -> tuple[torch.Tensor, int]:
-        if group_list_type == 1:
-            return torch.cumsum(group_list, dim=0), 0
-        return group_list, 0
+        """Return cumulative offsets/type 0 for fake-W4A8 grouped matmul.
+
+        Router output is normally per-expert counts (type 1); convert those
+        counts once and pass existing cumulative offsets (type 0) through.
+        The fake-W4A8 NPU adapter also invokes grouped matmul with type 0.
+        """
+        if group_list_type == GROUP_LIST_COUNTS:
+            return torch.cumsum(group_list, dim=0), GROUP_LIST_OFFSETS
+        return group_list, GROUP_LIST_OFFSETS
 
     def output_features(self, weight: torch.Tensor) -> int:
+        """Return the output width of a GMM-shaped ``[E,K,N]`` weight."""
         return weight.shape[-2]
 
-    def weight_quantization_directions(self, needs_grad_input: bool) -> tuple[bool, bool]:
-        if self.block_size == 128:
-            # Block-128 follows the native G-B layout: forward uses the
-            # source-direction view and dgrad uses its transposed companion.
-            return True, needs_grad_input
-        # Follow the ordinary MXFP8 GMM operand contract: forward consumes the
-        # column-wise weight view, while dgrad consumes the row-wise view after
-        # the right operand is transposed.
-        return needs_grad_input, True
-
-    def retain_weight_backward(self, weight_quant, needs_grad_input: bool) -> None:
-        if self.block_size == 128:
-            weight_quant.update_usage(rowwise=False, colwise=needs_grad_input)
-            return
-        weight_quant.update_usage(rowwise=needs_grad_input, colwise=False)
+    @property
+    def weight_forward_is_rowwise(self) -> bool:
+        """Use the column-wise weight view required by fake W4A8 GMM."""
+        return False
 
     def quantize_input(
         self,
@@ -73,7 +75,8 @@ class FakeW4A8GroupedLinear(GroupedLinear):
         colwise: bool,
         group_list: torch.Tensor,
         group_list_type: int,
-    ):
+    ) -> MXFP8Tensor:
+        """Quantize routed input activations in the requested directions."""
         return self.quantizer.quantize_activation(
             inputs,
             rowwise=rowwise,
@@ -82,7 +85,14 @@ class FakeW4A8GroupedLinear(GroupedLinear):
             group_list_type=group_list_type,
         )
 
-    def quantize_weight(self, weight: torch.Tensor, *, rowwise: bool, colwise: bool):
+    def quantize_weight(
+        self,
+        weight: torch.Tensor,
+        *,
+        rowwise: bool,
+        colwise: bool,
+    ) -> MXFP8Tensor:
+        """Quantize grouped master weights through fake MXFP4."""
         return self.quantizer.quantize_weight(
             weight,
             rowwise=rowwise,
@@ -97,7 +107,8 @@ class FakeW4A8GroupedLinear(GroupedLinear):
         colwise: bool,
         group_list: torch.Tensor,
         group_list_type: int,
-    ):
+    ) -> MXFP8Tensor:
+        """Quantize routed output gradients in the requested directions."""
         return self.quantizer.quantize_activation(
             grad_output,
             rowwise=rowwise,
@@ -108,16 +119,8 @@ class FakeW4A8GroupedLinear(GroupedLinear):
 
     @staticmethod
     def _select_operands(left, right, layout: str):
-        block128_layout = (
-            getattr(getattr(right, "quantizer", None), "block_size", None) == 128
-        )
-        if layout == "NN" and block128_layout:
-            left_data, left_scale = left.row_data, left.row_scale
-            right_data, right_scale = right.row_data, right.row_scale
-        elif layout == "NT" and block128_layout:
-            left_data, left_scale = left.row_data, left.row_scale
-            right_data, right_scale = right.col_data, right.col_scale
-        elif layout == "NN":
+        """Select directional data and scales for one GMM layout."""
+        if layout == "NN":
             left_data, left_scale = left.row_data, left.row_scale
             right_data, right_scale = right.col_data, right.col_scale
         elif layout == "NT":
@@ -140,8 +143,8 @@ class FakeW4A8GroupedLinear(GroupedLinear):
 
     def grouped_matmul(
         self,
-        left,
-        right,
+        left: MXFP8Tensor,
+        right: MXFP8Tensor,
         *,
         layout: str,
         group_list: torch.Tensor,
@@ -149,6 +152,7 @@ class FakeW4A8GroupedLinear(GroupedLinear):
         group_list_type: int,
         output_dtype: torch.dtype,
     ) -> torch.Tensor:
+        """Execute fake-W4A8 grouped matmul for NN, NT, or TN layout."""
         del group_list_type
         left_data, left_scale, right_data, right_scale = self._select_operands(
             left, right, layout

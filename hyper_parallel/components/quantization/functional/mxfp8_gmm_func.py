@@ -14,20 +14,18 @@
 # ============================================================================
 """MXFP8 format hooks for the shared native grouped-linear flow."""
 
+from typing import Optional
+
 import torch  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.components.quantization.functional.base_gmm_func import (
-    GroupedLinear,
-)
+from hyper_parallel.components.quantization.functional.base_gmm_func import GroupedLinear
 from hyper_parallel.components.quantization.ops.npu_mxfp8 import (
     mxfp8_grouped_matmul,
 )
 from hyper_parallel.components.quantization.quantizers import (
     MXFP8Quantizer,
 )
-from hyper_parallel.components.quantization.tensor import (
-    QuantizedTensorStorage,
-)
+from hyper_parallel.components.quantization.tensor import QuantizedTensor
 
 
 class MXFP8GroupedLinear(GroupedLinear):
@@ -35,12 +33,13 @@ class MXFP8GroupedLinear(GroupedLinear):
 
     FORMAT_NAME = "MXFP8"
 
-    def __init__(self, quantizer: MXFP8Quantizer | None = None) -> None:
+    def __init__(self, quantizer: Optional[MXFP8Quantizer] = None) -> None:
         """Create one reusable MXFP8 strategy and own its quantizer."""
 
         self.quantizer = quantizer if quantizer is not None else MXFP8Quantizer()
 
     def output_features(self, weight: torch.Tensor) -> int:
+        """Return the output width from the live ``[E, O, K]`` weight."""
         return weight.shape[-2]
 
     def normalize_group_list(
@@ -48,23 +47,18 @@ class MXFP8GroupedLinear(GroupedLinear):
         group_list: torch.Tensor,
         group_list_type: int,
     ) -> tuple[torch.Tensor, int]:
-        # MXFP8's operator accepts per-expert token counts as-is.
+        """Preserve counts/type 1 or offsets/type 0 for the MXFP8 path.
+
+        The quantizer derives cumulative offsets when grouped activation
+        quantization needs them; the GMM operator receives the original list
+        together with its matching type tag.
+        """
         return group_list, group_list_type
 
-    def weight_quantization_directions(
-        self,
-        needs_grad_input: bool,
-    ) -> tuple[bool, bool]:
-        # MXFP8 weights use the column-wise representation for forward GMM
-        # and the row-wise representation for dgrad.
-        return needs_grad_input, True
-
-    def retain_weight_backward(
-        self,
-        weight_quant: QuantizedTensorStorage,
-        needs_grad_input: bool,
-    ) -> None:
-        weight_quant.update_usage(rowwise=needs_grad_input, colwise=False)
+    @property
+    def weight_forward_is_rowwise(self) -> bool:
+        """Use the column-wise weight view in the forward NN GMM."""
+        return False
 
     def quantize_input(
         self,
@@ -74,7 +68,8 @@ class MXFP8GroupedLinear(GroupedLinear):
         colwise: bool,
         group_list: torch.Tensor,
         group_list_type: int,
-    ):
+    ) -> QuantizedTensor:
+        """Quantize grouped activations for the MXFP8 input role."""
         return self.quantizer.quantize(
             inputs,
             group_list=group_list,
@@ -89,7 +84,8 @@ class MXFP8GroupedLinear(GroupedLinear):
         *,
         rowwise: bool,
         colwise: bool,
-    ):
+    ) -> QuantizedTensor:
+        """Quantize expert weights for the MXFP8 weight role."""
         return self.quantizer.quantize(
             weight,
             rowwise=rowwise,
@@ -104,7 +100,8 @@ class MXFP8GroupedLinear(GroupedLinear):
         colwise: bool,
         group_list: torch.Tensor,
         group_list_type: int,
-    ):
+    ) -> QuantizedTensor:
+        """Quantize output gradients for the MXFP8 gradient role."""
         return self.quantizer.quantize(
             grad_output,
             group_list=group_list,
@@ -115,8 +112,8 @@ class MXFP8GroupedLinear(GroupedLinear):
 
     def grouped_matmul(
         self,
-        left,
-        right,
+        left: QuantizedTensor,
+        right: QuantizedTensor,
         *,
         layout: str,
         group_list: torch.Tensor,
@@ -124,6 +121,7 @@ class MXFP8GroupedLinear(GroupedLinear):
         group_list_type: int,
         output_dtype: torch.dtype,
     ) -> torch.Tensor:
+        """Execute one MXFP8 grouped matrix multiplication."""
         return mxfp8_grouped_matmul(
             left,
             right,

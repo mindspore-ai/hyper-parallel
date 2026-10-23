@@ -19,6 +19,13 @@ from typing import Any, Optional
 
 import torch  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.components.quantization.config import (
+    GMM_GROUP_K,
+    GMM_GROUP_M,
+    GMM_SPLIT_SCALE,
+    GROUP_LIST_COUNTS,
+    GROUP_LIST_OFFSETS,
+)
 from hyper_parallel.components.quantization.tensor.hifloat8_tensor import (
     HiFloat8Tensor,
 )
@@ -143,7 +150,7 @@ class HiFloat8NpuOps:
             group_list_type=group_list_type,
             x_dtype=self._torch_npu.hifloat8,
             weight_dtype=self._torch_npu.hifloat8,
-            split_item=3,
+            split_item=GMM_SPLIT_SCALE,
         )[0]
 
 
@@ -256,8 +263,8 @@ def hifloat8_grouped_matmul(
     *,
     layout: str,
     group_list: torch.Tensor,
-    group_type: int = 0,
-    group_list_type: int = 0,
+    group_type: int = GMM_GROUP_M,
+    group_list_type: int = GROUP_LIST_OFFSETS,
     output_dtype: Optional[torch.dtype] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -283,13 +290,15 @@ def hifloat8_grouped_matmul(
         raise ValueError("HiFloat8 GMM group_list must be one-dimensional.")
     if group_list.dtype != torch.int64:
         raise TypeError("HiFloat8 GMM group_list must use torch.int64.")
-    if group_type not in (0, 2):
+    if group_type not in (GMM_GROUP_M, GMM_GROUP_K):
         raise ValueError(
-            f"HiFloat8 GMM group_type must be 0 or 2, got {group_type}."
+            f"HiFloat8 GMM group_type must be {GMM_GROUP_M} or {GMM_GROUP_K}, "
+            f"got {group_type}."
         )
-    if group_list_type not in (0, 1):
+    if group_list_type not in (GROUP_LIST_OFFSETS, GROUP_LIST_COUNTS):
         raise ValueError(
-            "HiFloat8 GMM group_list_type must be 0 or 1, "
+            "HiFloat8 GMM group_list_type must be "
+            f"{GROUP_LIST_OFFSETS} or {GROUP_LIST_COUNTS}, "
             f"got {group_list_type}."
         )
 

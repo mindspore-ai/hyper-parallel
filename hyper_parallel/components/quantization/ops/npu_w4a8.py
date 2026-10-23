@@ -20,54 +20,23 @@ from typing import Optional
 
 import torch  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.components.quantization.config import (
+    GMM_SPLIT_ANTIQ,
+    GROUP_LIST_OFFSETS,
+    GROUPED_NDIM,
+    MX_BLOCK_SIZE_32,
+    MX_SCALE_ALG_OCP,
+    MX_SCALE_SLOTS,
+    MX_SCALE_TILE,
+    NPU_FORMAT_FRACTAL_NZ,
+    SCALE_NDIM,
+)
+
 _A5_DEVICE_MARKERS = ("Ascend950", "Ascend910_95")
-_SUPPORTED_BLOCK_SIZES = (32, 128)
 
 
 class W4A8CapabilityError(RuntimeError):
     """Report that the active torch_npu stack lacks native W4A8 support."""
-
-
-def transform_grouped_scale(
-    input_tensor: torch.Tensor,
-    input_scale_mxfp8: torch.Tensor,
-    group_list: torch.Tensor,
-    block_size: int,
-) -> torch.Tensor:
-    """Insert expert-boundary scale rows for block-128 grouped matmul."""
-
-    if input_scale_mxfp8.ndim != 3 or group_list.ndim != 1:
-        raise ValueError("Grouped MXFP8 scales require a 3D scale and 1D group list.")
-    if block_size not in _SUPPORTED_BLOCK_SIZES:
-        raise ValueError(f"Unsupported W4A8 block size {block_size}.")
-    indices = torch.arange(
-        group_list.shape[0],
-        dtype=group_list.dtype,
-        device=group_list.device,
-    )
-    zero_rows = group_list // (block_size // 2) + indices
-    scale_repeat = input_scale_mxfp8.reshape(-1, input_scale_mxfp8.shape[1]).repeat_interleave(4, dim=0)
-    scale_packed = scale_repeat.reshape(input_scale_mxfp8.shape[0] * 4, input_scale_mxfp8.shape[1], 2)
-    scale_shape = input_tensor.shape[0] // (block_size // 2) + group_list.shape[0]
-    all_indices = torch.arange(scale_shape, device=scale_packed.device)
-    non_zero_rows = all_indices[~torch.isin(all_indices, zero_rows)]
-    grouped_scale = torch.zeros(
-        scale_shape,
-        input_scale_mxfp8.shape[1],
-        2,
-        dtype=scale_packed.dtype,
-        device=scale_packed.device,
-    )
-    if scale_packed.shape[0] < non_zero_rows.shape[0]:
-        raise ValueError(
-            "Grouped MX scale rows do not cover all non-zero token blocks: "
-            f"required {non_zero_rows.shape[0]}, got {scale_packed.shape[0]}."
-        )
-    # A final partial 256-token source tile emits four physical rows even when
-    # the GMM contract only consumes complete 64-token rows; discard those
-    # excess rows while inserting expert-boundary zero rows.
-    grouped_scale[non_zero_rows] = scale_packed[: non_zero_rows.shape[0]]
-    return grouped_scale
 
 
 class W4A8NpuOps:
@@ -207,14 +176,14 @@ class W4A8NpuOps:
                 "group_list": group_list,
                 "group_type": group_type,
                 "output_dtype": output_dtype,
-                "group_list_type": 0,
-                "split_item": 2,
+                "group_list_type": GROUP_LIST_OFFSETS,
+                "split_item": GMM_SPLIT_ANTIQ,
                 "x_dtype": self.activation_dtype,
                 "weight_dtype": self.weight_dtype,
             }
-            # Block-32 dynamic MX quantization returns raw uint8 E8M0 scales;
-            # block-128 activation scales are converted to FP32 by the
-            # quantizer and therefore must retain the default dtype contract.
+            # Dynamic MX quantization returns raw uint8 E8M0 bytes for both
+            # block sizes.  The explicit metadata tells CANN how to decode
+            # those bytes as float8_e8m0fnu in the grouped-matmul kernel.
             if use_e8m0_scale:
                 kwargs["per_token_scale_dtype"] = self.e8m0_dtype
             return self._torch_npu.npu_grouped_matmul([left], [right], **kwargs)[0]
@@ -226,7 +195,7 @@ class W4A8NpuOps:
             "group_list": group_list,
             "group_type": group_type,
             "output_dtype": output_dtype,
-            "group_list_type": 0,
+            "group_list_type": GROUP_LIST_OFFSETS,
             "split_item": split_item,
         }
         if use_e8m0_scale:
@@ -238,7 +207,7 @@ class W4A8NpuOps:
         self,
         tensor: torch.Tensor,
         *,
-        block_size: int = 32,
+        block_size: int = MX_BLOCK_SIZE_32,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Quantize and prepare one ``[E, N, K]`` weight for A5 W4 GMM.
 
@@ -250,12 +219,12 @@ class W4A8NpuOps:
         deliberately does not materialize an intermediate MXFP8 weight.
         """
 
-        if tensor.ndim != 3:
+        if tensor.ndim != GROUPED_NDIM:
             raise ValueError(
                 "Native MXFP4 weight preparation expects [experts, rows, K], "
                 f"got shape {tuple(tensor.shape)}."
             )
-        if block_size != 32:
+        if block_size != MX_BLOCK_SIZE_32:
             raise ValueError(
                 "Native Packed MXFP4 weights use block_size=32, "
                 f"got {block_size}."
@@ -271,20 +240,20 @@ class W4A8NpuOps:
             block_size=block_size,
             quant_dtype=self.weight_dtype,
             round_mode="rint",
-            scale_alg=0,
+            scale_alg=MX_SCALE_ALG_OCP,
         )
         packed_nz = self._torch_npu.npu_format_cast(
             packed,
-            29,
+            NPU_FORMAT_FRACTAL_NZ,
             customize_dtype=self.activation_dtype,
             input_dtype=self.weight_dtype,
         ).transpose(-2, -1)
-        expected_scale_tiles = (tensor.shape[-1] + 63) // 64
+        expected_scale_tiles = (tensor.shape[-1] + MX_SCALE_TILE - 1) // MX_SCALE_TILE
         if (
-            scale.ndim != 4
+            scale.ndim != SCALE_NDIM
             or tuple(scale.shape[:2]) != tuple(tensor.shape[:2])
             or scale.shape[2] != expected_scale_tiles
-            or scale.shape[-1] != 2
+            or scale.shape[-1] != MX_SCALE_SLOTS
         ):
             raise ValueError(
                 "Native MXFP4 scale must have [E, N, ceil(K/64), 2] layout, "
@@ -315,6 +284,5 @@ def validate_w4a8_gmm_runtime() -> None:
 __all__ = [
     "W4A8CapabilityError",
     "W4A8NpuOps",
-    "transform_grouped_scale",
     "validate_w4a8_gmm_runtime",
 ]

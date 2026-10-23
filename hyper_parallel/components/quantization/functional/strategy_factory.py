@@ -19,6 +19,8 @@ from typing import Optional
 from hyper_parallel.components.quantization.config import (
     LowPrecisionConfig,
     LowPrecisionDtypeScheme,
+    MX_BLOCK_SIZE_32,
+    MX_SCALE_TILE,
     _format_family,
 )
 from hyper_parallel.components.quantization.functional.base_gmm_func import (
@@ -77,10 +79,9 @@ def build_low_precision_strategy(
         if config is not None and config.is_fake_quantize:
             if weight_format == "mxfp4" and act_format == "mxfp8":
                 tile_size = config.block_size
-                validate_fake_w4a8_gmm_runtime()
-                strategy = FakeW4A8GroupedLinear(tile_size)
                 _validate_tile_alignment("fake_w4a8", tile_size, tile_shapes)
-                return strategy
+                validate_fake_w4a8_gmm_runtime(tile_size)
+                return FakeW4A8GroupedLinear(tile_size)
             raise NotImplementedError(
                 "fake QAT currently supports only mxfp4/mxfp8 (fake W4A8); "
                 f"got weight_format={weight_format!r}/act_format={act_format!r}."
@@ -88,9 +89,9 @@ def build_low_precision_strategy(
         if weight_format == "mxfp8" and act_format == "mxfp8":
             validate_npu_gmm_runtime()
             strategy = MXFP8GroupedLinear()
-            _validate_tile_alignment("w8a8", 32, tile_shapes)
+            _validate_tile_alignment("w8a8", MX_BLOCK_SIZE_32, tile_shapes)
         elif weight_format == "mxfp4" and act_format == "mxfp8":
-            tile_size = config.block_size if config is not None else 32
+            tile_size = config.block_size if config is not None else MX_BLOCK_SIZE_32
             validate_w4a8_gmm_runtime()
             strategy = W4A8GroupedLinear(tile_size)
             _validate_tile_alignment("w4a8", tile_size, tile_shapes)
@@ -130,9 +131,10 @@ def _validate_tile_alignment(
     """Require both non-expert weight dims to be whole blocks of ``tile_size``.
 
     Live ``[E, O, K]`` weights must have their ``-2``/``-1`` dims divisible by
-    the block size (32 for MXFP8, ``config.block_size`` 32/128 for W4A8), so a
+    the block size (``MX_BLOCK_SIZE_32`` for both MXFP8 and W4A8), so a
     misaligned model fails at replacement time instead of leaving a partial
-    block for the NPU operator.
+    block for the NPU operator. Block-32 fake W4A8 also needs one matrix axis
+    divisible by 64 so the CANN converter can use it as its row axis.
     """
 
     if any(dimension % tile_size for shape in tile_shapes for dimension in shape[-2:]):
@@ -140,6 +142,18 @@ def _validate_tile_alignment(
             f"{strategy_name!r} is not aligned for block_size={tile_size}: "
             f"{tile_shapes}."
         )
+    if strategy_name == "fake_w4a8":
+        unsupported = tuple(
+            shape
+            for shape in tile_shapes
+            if all(dimension % MX_SCALE_TILE for dimension in shape[-2:])
+        )
+        if unsupported:
+            raise ValueError(
+                "'fake_w4a8' block_size=32 requires at least one matrix "
+                "dimension divisible by 64 for CANN's packed-MXFP4 "
+                f"to block-MXFP8 conversion; unsupported shapes: {unsupported}."
+            )
 
 
 __all__ = ["build_low_precision_strategy"]

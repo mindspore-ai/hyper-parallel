@@ -23,6 +23,11 @@ instance is picked exclusively in ``strategy_factory``.
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.components.quantization.config import (
+    GROUPED_NDIM,
+    GROUP_LIST_COUNTS,
+    MATRIX_NDIM,
+)
 from hyper_parallel.components.quantization.functional.base_gmm_func import (
     GroupedLinear,
     _GroupedLinearFunction,
@@ -33,6 +38,7 @@ from hyper_parallel.components.quantization.ops.npu_w4a8 import (
 )
 
 _EXPERT_PARAMETER_NAMES = ("gate_up_proj", "down_proj")
+_GATE_UP_BRANCHES = 2
 
 
 class GroupedExperts(nn.Module):
@@ -57,7 +63,11 @@ class GroupedExperts(nn.Module):
         self._validate_grouped_linear(grouped_linear)
         super().__init__()
         self.gate_up_proj = nn.Parameter(
-            torch.empty(num_experts, 2 * intermediate_dim, hidden_dim)
+            torch.empty(
+                num_experts,
+                _GATE_UP_BRANCHES * intermediate_dim,
+                hidden_dim,
+            )
         )
         self.down_proj = nn.Parameter(
             torch.empty(num_experts, hidden_dim, intermediate_dim)
@@ -102,16 +112,19 @@ class GroupedExperts(nn.Module):
         down_proj = source._parameters["down_proj"]  # pylint: disable=protected-access
         if gate_up_proj is None or down_proj is None:
             raise ValueError(f"{fqn!r} packed expert parameters cannot be None.")
-        if gate_up_proj.ndim != 3 or down_proj.ndim != 3:
+        if gate_up_proj.ndim != GROUPED_NDIM or down_proj.ndim != GROUPED_NDIM:
             raise ValueError(
                 f"{fqn!r} packed expert weights must be three-dimensional."
             )
         expected_down_shape = (
             gate_up_proj.shape[0],
             gate_up_proj.shape[2],
-            gate_up_proj.shape[1] // 2,
+            gate_up_proj.shape[1] // _GATE_UP_BRANCHES,
         )
-        if gate_up_proj.shape[1] % 2 or tuple(down_proj.shape) != expected_down_shape:
+        if (
+            gate_up_proj.shape[1] % _GATE_UP_BRANCHES
+            or tuple(down_proj.shape) != expected_down_shape
+        ):
             raise ValueError(
                 f"{fqn!r} has incompatible gate/up and down expert shapes: "
                 f"gate_up={tuple(gate_up_proj.shape)}, down={tuple(down_proj.shape)}."
@@ -137,7 +150,7 @@ class GroupedExperts(nn.Module):
 
         converted.num_experts = gate_up_proj.shape[0]
         converted.hidden_dim = gate_up_proj.shape[2]
-        converted.intermediate_dim = gate_up_proj.shape[1] // 2
+        converted.intermediate_dim = gate_up_proj.shape[1] // _GATE_UP_BRANCHES
         converted.fqn = fqn
         converted.grouped_linear = grouped_linear
         if hasattr(source, "config"):
@@ -158,16 +171,16 @@ class GroupedExperts(nn.Module):
                 self.gate_up_proj,
                 tokens_per_expert,
                 self.grouped_linear,
-                1,
+                GROUP_LIST_COUNTS,
             )
-            gate, up = gate_up.chunk(2, dim=-1)
+            gate, up = gate_up.chunk(_GATE_UP_BRANCHES, dim=-1)
             intermediate = self.act_fn(gate) * up
             return _GroupedLinearFunction.apply(
                 intermediate,
                 self.down_proj,
                 tokens_per_expert,
                 self.grouped_linear,
-                1,
+                GROUP_LIST_COUNTS,
             )
         except (LowPrecisionCapabilityError, W4A8CapabilityError) as exc:
             target = self.fqn or "<unknown>"
@@ -183,12 +196,15 @@ class GroupedExperts(nn.Module):
     ) -> torch.Tensor:
         """Sort routed tokens, execute grouped experts, and restore token order."""
 
-        if hidden_states.ndim != 2:
+        if hidden_states.ndim != MATRIX_NDIM:
             raise ValueError(
                 "Grouped experts require two-dimensional hidden_states, "
                 f"but got shape {tuple(hidden_states.shape)}."
             )
-        if top_k_index.shape != top_k_weights.shape or top_k_index.ndim != 2:
+        if (
+            top_k_index.shape != top_k_weights.shape
+            or top_k_index.ndim != MATRIX_NDIM
+        ):
             raise ValueError(
                 "top_k_index and top_k_weights must have the same two-dimensional shape."
             )
@@ -216,11 +232,15 @@ class GroupedExperts(nn.Module):
             raise ValueError(
                 f"Expert indices must be in [0, {self.num_experts})."
             )
+        # bincount returns per-expert counts, so the incoming group-list type
+        # is 1. Each grouped-linear strategy adapts this only if its backend
+        # requires cumulative offsets instead.
         sorted_outputs = self._grouped_forward(sorted_inputs, tokens_per_expert)
         sorted_weights = top_k_weights.reshape(-1)[expert_order]
         sorted_outputs = sorted_outputs * sorted_weights.unsqueeze(-1)
-        # Only HiFloat8 historically rounded each routed contribution before
-        # reduction; the MX strategies kept promotion from routing weights.
+        # CANN grouped-matmul may promote its result or routing weights may be
+        # FP32.  Low-precision strategies opt into restoring the model
+        # activation dtype before the expert reduction is returned.
         if self.grouped_linear.CAST_ROUTED_OUTPUT_TO_INPUT_DTYPE:
             sorted_outputs = sorted_outputs.to(hidden_states.dtype)
 

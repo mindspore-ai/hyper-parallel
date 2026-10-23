@@ -52,7 +52,6 @@ from hyper_parallel.components.quantization.ops.npu_mxfp8 import (
 from hyper_parallel.components.quantization.ops.npu_w4a8 import (
     W4A8CapabilityError,
     W4A8NpuOps,
-    transform_grouped_scale,
     validate_w4a8_gmm_runtime,
 )
 from hyper_parallel.components.quantization.functional.base_gmm_func import (
@@ -98,7 +97,6 @@ __all__ = [
     "FakeW4A8NpuOps",
     "build_linear_strategy",
     "build_low_precision_strategy",
-    "transform_grouped_scale",
     "validate_w4a8_gmm_runtime",
     "validate_fake_w4a8_gmm_runtime",
     "validate_hifloat8_gmm_runtime",

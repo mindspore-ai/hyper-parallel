@@ -14,7 +14,6 @@
 # ============================================================================
 """Preserve the pre-refactor precision of routed expert contributions."""
 
-from functools import partial
 import unittest
 from unittest import mock
 
@@ -116,14 +115,12 @@ class TestGroupedExpertsRoutingPrecision(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_outputs_gradients_and_update_keep_each_formats_original_precision(self) -> None:
-        """MX retains routing promotion; HiFloat8 rounds each contribution before top-k reduction."""
+        """Low-precision routed contributions return to hidden-state precision."""
         cases = (
-            ("mxfp8", MXFP8GroupedLinear, False),
+            ("mxfp8", MXFP8GroupedLinear, True),
             ("hif8", HiFloat8GroupedLinear, True),
-            ("w4a8_32", W4A8GroupedLinear, False),
-            ("w4a8_128", partial(W4A8GroupedLinear, 128), False),
-            ("fake_w4a8_32", FakeW4A8GroupedLinear, False),
-            ("fake_w4a8_128", partial(FakeW4A8GroupedLinear, 128), False),
+            ("w4a8_32", W4A8GroupedLinear, True),
+            ("fake_w4a8_32", FakeW4A8GroupedLinear, True),
         )
         for name, factory, round_routes in cases:
             for dtype in (torch.bfloat16, torch.float16):

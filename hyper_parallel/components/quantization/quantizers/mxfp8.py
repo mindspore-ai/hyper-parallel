@@ -18,6 +18,10 @@ from typing import Optional
 
 import torch  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.components.quantization.config import (
+    GROUP_LIST_COUNTS,
+    GROUP_LIST_OFFSETS,
+)
 from hyper_parallel.components.quantization.ops.npu_mxfp8 import (
     MXFP8NpuOps,
     _get_npu_ops,
@@ -56,7 +60,7 @@ class MXFP8Quantizer(Quantizer):
         tensor: torch.Tensor,
         *,
         group_list: Optional[torch.Tensor] = None,
-        group_list_type: int = 0,
+        group_list_type: int = GROUP_LIST_OFFSETS,
         rowwise: bool = False,
         colwise: bool = False,
     ) -> MXFP8Tensor:
@@ -78,7 +82,7 @@ class MXFP8Quantizer(Quantizer):
             raise ValueError(
                 "MXFP8Quantizer requires rowwise=True or colwise=True."
             )
-        if group_list_type not in (0, 1):
+        if group_list_type not in (GROUP_LIST_OFFSETS, GROUP_LIST_COUNTS):
             raise ValueError(
                 "MXFP8Quantizer group_list_type must be 0 or 1, "
                 f"but got {group_list_type}."
@@ -101,7 +105,7 @@ class MXFP8Quantizer(Quantizer):
                 )
             quant_group_list = (
                 group_list
-                if group_list_type == 0
+                if group_list_type == GROUP_LIST_OFFSETS
                 else torch.cumsum(group_list, dim=0)
             )
             if rowwise:

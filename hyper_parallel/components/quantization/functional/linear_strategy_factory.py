@@ -19,6 +19,7 @@ from typing import Optional
 from hyper_parallel.components.quantization.config import (
     LowPrecisionConfig,
     LowPrecisionDtypeScheme,
+    MX_BLOCK_SIZE_32,
 )
 from hyper_parallel.components.quantization.functional.base_linear_func import (
     LinearStrategy,
@@ -67,10 +68,11 @@ def build_linear_strategy(
         and config.weight_format == "mxfp8"
         and config.act_format == "mxfp8"
     ):
-        if in_features % 32 or out_features % 32:
+        if in_features % MX_BLOCK_SIZE_32 or out_features % MX_BLOCK_SIZE_32:
             raise ValueError(
                 "MXFP8 Linear is not tile aligned: "
-                f"shape=({out_features}, {in_features}) requires multiples of 32."
+                f"shape=({out_features}, {in_features}) requires multiples of "
+                f"{MX_BLOCK_SIZE_32}."
             )
         validate_npu_runtime()
         return MXFP8LinearStrategy()

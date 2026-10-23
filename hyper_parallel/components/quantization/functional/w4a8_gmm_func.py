@@ -16,12 +16,18 @@
 
 import torch  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.components.quantization.functional.base_gmm_func import (
-    GroupedLinear,
+from hyper_parallel.components.quantization.config import (
+    GMM_SPLIT_ANTIQ,
+    GMM_SPLIT_SCALE,
+    GROUP_LIST_COUNTS,
+    GROUP_LIST_OFFSETS,
+    MX_BLOCK_SIZE_32,
 )
+from hyper_parallel.components.quantization.functional.base_gmm_func import GroupedLinear
 from hyper_parallel.components.quantization.quantizers.w4a8 import (
     W4A8Quantizer,
 )
+from hyper_parallel.components.quantization.tensor import QuantizedTensor
 
 
 class W4A8GroupedLinear(GroupedLinear):
@@ -29,7 +35,7 @@ class W4A8GroupedLinear(GroupedLinear):
 
     FORMAT_NAME = "Native W4A8"
 
-    def __init__(self, block_size: int = 32) -> None:
+    def __init__(self, block_size: int = MX_BLOCK_SIZE_32) -> None:
         """Create one reusable W4A8 strategy and own its quantizer."""
 
         self.quantizer = W4A8Quantizer(block_size)
@@ -40,23 +46,24 @@ class W4A8GroupedLinear(GroupedLinear):
         group_list: torch.Tensor,
         group_list_type: int,
     ) -> tuple[torch.Tensor, int]:
-        if group_list_type == 1:
-            return torch.cumsum(group_list, dim=0), 0
-        return group_list, 0
+        """Return cumulative offsets/type 0 for W4A8 quantization and GMM.
+
+        Router output is normally per-expert counts (type 1), so convert it
+        once here. Existing cumulative offsets (type 0) pass through unchanged.
+        The native W4A8 grouped-matmul adapter uses the offsets contract.
+        """
+        if group_list_type == GROUP_LIST_COUNTS:
+            return torch.cumsum(group_list, dim=0), GROUP_LIST_OFFSETS
+        return group_list, GROUP_LIST_OFFSETS
 
     def output_features(self, weight: torch.Tensor) -> int:
+        """Return the output width from the live ``[E, O, K]`` weight."""
         return weight.shape[-2]
 
-    def weight_quantization_directions(
-        self,
-        needs_grad_input: bool,
-    ) -> tuple[bool, bool]:
-        # W4A8 forward consumes the row-wise view (GMM-ready ``[E, K, N]``);
-        # dgrad consumes the transposed column-wise view.
-        return True, needs_grad_input
-
-    def retain_weight_backward(self, weight_quant, needs_grad_input: bool) -> None:
-        weight_quant.update_usage(rowwise=False, colwise=needs_grad_input)
+    @property
+    def weight_forward_is_rowwise(self) -> bool:
+        """Use the row-wise weight view in the forward NN GMM."""
+        return True
 
     def quantize_input(
         self,
@@ -66,7 +73,8 @@ class W4A8GroupedLinear(GroupedLinear):
         colwise: bool,
         group_list: torch.Tensor,
         group_list_type: int,
-    ):
+    ) -> QuantizedTensor:
+        """Quantize grouped activations for the native W4A8 input role."""
         return self.quantizer.quantize_activation(
             inputs,
             rowwise=rowwise,
@@ -81,7 +89,8 @@ class W4A8GroupedLinear(GroupedLinear):
         *,
         rowwise: bool,
         colwise: bool,
-    ):
+    ) -> QuantizedTensor:
+        """Quantize expert weights for the native W4A8 weight role."""
         return self.quantizer.quantize_weight(
             weight,
             rowwise=rowwise,
@@ -96,7 +105,8 @@ class W4A8GroupedLinear(GroupedLinear):
         colwise: bool,
         group_list: torch.Tensor,
         group_list_type: int,
-    ):
+    ) -> QuantizedTensor:
+        """Quantize output gradients for the native W4A8 gradient role."""
         return self.quantizer.quantize_activation(
             grad_output,
             rowwise=rowwise,
@@ -107,6 +117,7 @@ class W4A8GroupedLinear(GroupedLinear):
 
     @staticmethod
     def _select_operands(left, right, layout: str):
+        """Select directional data and scales for one native GMM layout."""
         if layout == "NN":
             left_data, left_scale = left.row_data, left.row_scale
             right_data, right_scale = right.row_data, right.row_scale
@@ -131,8 +142,8 @@ class W4A8GroupedLinear(GroupedLinear):
 
     def grouped_matmul(
         self,
-        left,
-        right,
+        left: QuantizedTensor,
+        right: QuantizedTensor,
         *,
         layout: str,
         group_list: torch.Tensor,
@@ -140,6 +151,7 @@ class W4A8GroupedLinear(GroupedLinear):
         group_list_type: int,
         output_dtype: torch.dtype,
     ) -> torch.Tensor:
+        """Execute one native W4A8 grouped matrix multiplication."""
         del group_list_type
         left_data, left_scale, right_data, right_scale = self._select_operands(
             left,
@@ -149,7 +161,9 @@ class W4A8GroupedLinear(GroupedLinear):
         # NN/NT are native MXFP8 x Packed-MXFP4 W4A8. TN computes the dense
         # master-weight gradient and therefore remains MXFP8 x MXFP8.
         native_w4 = layout in ("NN", "NT")
-        use_e8m0_scale = self.quantizer.block_size == 32 or layout == "TN"
+        # A8W4 grouped matmul consumes E8M0 per-token scales for both MX
+        # block sizes.  The TN weight-gradient path uses the same contract.
+        use_e8m0_scale = True
         return self.quantizer.npu_ops.grouped_matmul(
             left_data,
             right_data,
@@ -159,7 +173,7 @@ class W4A8GroupedLinear(GroupedLinear):
             group_type=group_type,
             output_dtype=output_dtype,
             use_e8m0_scale=use_e8m0_scale,
-            split_item=3 if use_e8m0_scale else 2,
+            split_item=GMM_SPLIT_SCALE if use_e8m0_scale else GMM_SPLIT_ANTIQ,
             native_w4=native_w4,
         )
 

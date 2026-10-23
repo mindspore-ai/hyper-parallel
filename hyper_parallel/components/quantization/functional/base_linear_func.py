@@ -20,6 +20,7 @@ from typing import Optional
 import torch  # pylint: disable=forbidden-backend-import
 from torch.autograd.function import once_differentiable  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.components.quantization.config import MATRIX_NDIM
 from hyper_parallel.components.quantization.tensor import QuantizedTensorStorage
 from hyper_parallel.components.quantization.tensor.quantized_tensor import QuantizedTensor
 from hyper_parallel.components.quantization.functional._saved_quantized import (
@@ -31,7 +32,7 @@ from hyper_parallel.components.quantization.functional._saved_quantized import (
 def _as_matrix(tensor: torch.Tensor) -> torch.Tensor:
     """Flatten leading dimensions while preserving the contracting axis."""
 
-    if tensor.ndim == 2:
+    if tensor.ndim == MATRIX_NDIM:
         return tensor
     return tensor.reshape(-1, tensor.shape[-1])
 
@@ -131,7 +132,7 @@ class LinearStrategy(ABC):
             ctx.weight_quant = None
         else:
             ctx.input_quant, ctx.weight_quant = operands
-        if inputs.ndim != 2:
+        if inputs.ndim != MATRIX_NDIM:
             output = output.reshape(*inputs.shape[:-1], output.shape[-1])
         return output
 
@@ -165,7 +166,7 @@ class LinearStrategy(ABC):
                 layout="NN",
                 output_dtype=grad_output.dtype,
             )
-            if len(ctx.input_shape) != 2:
+            if len(ctx.input_shape) != MATRIX_NDIM:
                 grad_input = grad_input.reshape(ctx.input_shape)
         if needs_grad_weight:
             grad_weight = self.matmul(
@@ -181,11 +182,13 @@ class LinearStrategy(ABC):
         return grad_input, grad_weight
 
 
-class _LinearFunction(torch.autograd.Function):
+# PyTorch's Function base exposes variadic callbacks; this bridge intentionally
+# specializes them for the dense-linear ``apply`` contract.
+class _LinearFunction(torch.autograd.Function):  # pylint: disable=abstract-method,arguments-differ
     """Bridge PyTorch autograd callbacks to one bound Dense strategy."""
 
     @staticmethod
-    def forward(
+    def forward(  # pylint: disable=arguments-differ
         ctx: torch.autograd.function.FunctionCtx,
         inputs: torch.Tensor,
         weight: torch.Tensor,
@@ -197,7 +200,7 @@ class _LinearFunction(torch.autograd.Function):
 
     @staticmethod
     @once_differentiable
-    def backward(
+    def backward(  # pylint: disable=arguments-differ
         ctx: torch.autograd.function.FunctionCtx,
         grad_output: torch.Tensor,
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], None]:

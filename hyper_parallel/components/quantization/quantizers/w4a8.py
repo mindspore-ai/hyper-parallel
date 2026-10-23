@@ -18,8 +18,15 @@ from typing import Optional
 
 import torch  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.components.quantization.config import (
+    GROUPED_NDIM,
+    GROUP_LIST_COUNTS,
+    GROUP_LIST_OFFSETS,
+    MATRIX_NDIM,
+    MX_BLOCK_SIZE_32,
+    validate_mx_block_size,
+)
 from hyper_parallel.components.quantization.ops.npu_w4a8 import (
-    transform_grouped_scale,
     W4A8NpuOps,
     _get_w4a8_npu_ops,
 )
@@ -29,7 +36,6 @@ from hyper_parallel.components.quantization.tensor import (
     W4A8Tensor,
 )
 
-_SUPPORTED_BLOCK_SIZES = (32, 128)
 _ROLE_NAMES = ("activation", "weight")
 
 
@@ -38,15 +44,11 @@ class W4A8Quantizer(Quantizer):
 
     def __init__(
         self,
-        block_size: int = 32,
+        block_size: int = MX_BLOCK_SIZE_32,
     ) -> None:
         """Create a block-size-specific native W4A8 quantizer."""
 
-        if block_size not in _SUPPORTED_BLOCK_SIZES:
-            raise ValueError(
-                f"Native W4A8 block_size must be 32 or 128, got {block_size}."
-            )
-        self.block_size = block_size
+        self.block_size = validate_mx_block_size(block_size)
 
     @property
     def npu_ops(self) -> W4A8NpuOps:
@@ -59,7 +61,8 @@ class W4A8Quantizer(Quantizer):
         group_list: Optional[torch.Tensor],
         group_list_type: int,
     ) -> None:
-        if group_list_type not in (0, 1):
+        """Validate the grouped activation metadata representation."""
+        if group_list_type not in (GROUP_LIST_OFFSETS, GROUP_LIST_COUNTS):
             raise ValueError(
                 "W4A8 group_list_type must be 0 or 1, "
                 f"but got {group_list_type}."
@@ -76,7 +79,11 @@ class W4A8Quantizer(Quantizer):
     ) -> Optional[torch.Tensor]:
         if group_list is None:
             return None
-        return group_list if group_list_type == 0 else torch.cumsum(group_list, dim=0)
+        return (
+            group_list
+            if group_list_type == GROUP_LIST_OFFSETS
+            else torch.cumsum(group_list, dim=0)
+        )
 
     def _quantize_activation(
         self,
@@ -87,6 +94,7 @@ class W4A8Quantizer(Quantizer):
         group_list: Optional[torch.Tensor],
         group_list_type: int,
     ) -> W4A8Tensor:
+        """Quantize activations into the native W4A8 directions."""
         row_data = row_scale = col_data = col_scale = None
         boundaries = self._boundaries(group_list, group_list_type)
         if rowwise:
@@ -96,17 +104,12 @@ class W4A8Quantizer(Quantizer):
                 block_size=self.block_size,
                 quant_dtype=self.npu_ops.activation_dtype,
             )
-            if self.block_size == 128:
-                row_scale = self._scale_to_fp32(row_scale).reshape(
-                    tensor.shape[0],
-                    -1,
-                )
         if colwise:
-            if self.block_size == 32 and boundaries is not None:
+            if boundaries is not None:
                 col_data, col_scale = self.npu_ops.grouped_dynamic_mx_quant(
                     tensor,
                     boundaries,
-                    block_size=32,
+                    block_size=MX_BLOCK_SIZE_32,
                     quant_dtype=self.npu_ops.activation_dtype,
                 )
             else:
@@ -116,13 +119,6 @@ class W4A8Quantizer(Quantizer):
                     block_size=self.block_size,
                     quant_dtype=self.npu_ops.activation_dtype,
                 )
-                if boundaries is not None:
-                    col_scale = transform_grouped_scale(
-                        tensor,
-                        col_scale,
-                        boundaries,
-                        self.block_size,
-                    )
         return W4A8Tensor(
             shape=tensor.shape,
             dtype=tensor.dtype,
@@ -134,12 +130,6 @@ class W4A8Quantizer(Quantizer):
             device=tensor.device,
         )
 
-    @staticmethod
-    def _scale_to_fp32(scale: torch.Tensor) -> torch.Tensor:
-        """Convert an E8M0 exponent tensor to the block-128 FP32 contract."""
-
-        return torch.pow(2.0, scale.to(torch.float32) - 127)
-
     def _quantize_weight(
         self,
         tensor: torch.Tensor,
@@ -147,7 +137,8 @@ class W4A8Quantizer(Quantizer):
         rowwise: bool,
         colwise: bool,
     ) -> W4A8Tensor:
-        if any(dimension % 32 for dimension in tensor.shape[1:]):
+        """Pack master weights into the native MXFP4 representation."""
+        if any(dimension % MX_BLOCK_SIZE_32 for dimension in tensor.shape[1:]):
             raise ValueError(
                 "Native MXFP4 weight dimensions must be divisible by 32, "
                 f"got shape {tuple(tensor.shape)}."
@@ -158,14 +149,14 @@ class W4A8Quantizer(Quantizer):
             # live [E, N, K] source along K gives that native contract.
             row_data, row_scale = self.npu_ops.pack_mxfp4_weight(
                 tensor.transpose(-2, -1).contiguous(),
-                block_size=32,
+                block_size=MX_BLOCK_SIZE_32,
             )
         if colwise:
             # Dgrad uses the other matrix direction, so its FP4 scales must be
             # generated independently from the [E, K, N] source.
             col_data, col_scale = self.npu_ops.pack_mxfp4_weight(
                 tensor,
-                block_size=32,
+                block_size=MX_BLOCK_SIZE_32,
             )
         return W4A8Tensor(
             shape=tensor.shape,
@@ -185,7 +176,7 @@ class W4A8Quantizer(Quantizer):
         rowwise: bool = False,
         colwise: bool = False,
         group_list: Optional[torch.Tensor] = None,
-        group_list_type: int = 0,
+        group_list_type: int = GROUP_LIST_OFFSETS,
         role: str = "activation",
     ) -> W4A8Tensor:
         """Quantize an activation or target-layout expert weight.
@@ -209,7 +200,7 @@ class W4A8Quantizer(Quantizer):
             raise ValueError(f"Unsupported W4A8 quantization role {role!r}.")
         self._validate_group_list(group_list, group_list_type)
         if role == "weight":
-            if tensor.ndim != 3:
+            if tensor.ndim != GROUPED_NDIM:
                 raise ValueError(
                     "Native W4A8 weights must be three-dimensional, "
                     f"got shape {tuple(tensor.shape)}."
@@ -221,7 +212,7 @@ class W4A8Quantizer(Quantizer):
                 rowwise=rowwise,
                 colwise=colwise,
             )
-        if tensor.ndim != 2:
+        if tensor.ndim != MATRIX_NDIM:
             raise ValueError(
                 "Native W4A8 activations must be two-dimensional, "
                 f"got shape {tuple(tensor.shape)}."
@@ -241,7 +232,7 @@ class W4A8Quantizer(Quantizer):
         rowwise: bool = False,
         colwise: bool = False,
         group_list: Optional[torch.Tensor] = None,
-        group_list_type: int = 0,
+        group_list_type: int = GROUP_LIST_OFFSETS,
     ) -> W4A8Tensor:
         """Quantize an MXFP8 activation representation."""
 

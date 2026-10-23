@@ -20,15 +20,21 @@ that the all-MXFP8 GMM consumes after an on-the-fly MXFP4 quantize/dequantize
 step.
 """
 
-from typing import Optional
+from typing import Any, Optional
 
 import torch  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.components.quantization.config import (
+    GROUPED_NDIM,
+    GROUP_LIST_COUNTS,
+    GROUP_LIST_OFFSETS,
+    MATRIX_NDIM,
+    MX_BLOCK_SIZE_32,
+    MX_SCALE_ALG_OCP,
+    MX_SCALE_TILE,
+    validate_mx_block_size,
+)
 from hyper_parallel.components.quantization.ops.npu_fake_w4a8 import (
-    convert_mx_scale_to_axis2,
-    expand_scale_to_per_row,
-    fake_mxfp4_to_mxfp8,
-    transform_grouped_scale,
     _get_fake_w4a8_npu_ops,
     FakeW4A8NpuOps,
 )
@@ -36,21 +42,19 @@ from hyper_parallel.components.quantization.quantizers.base import Quantizer
 from hyper_parallel.components.quantization.tensor import MXFP8Tensor, QuantizedTensor
 
 
-_SUPPORTED_BLOCK_SIZES = (32, 128)
-
-
 class FakeW4A8Quantizer(Quantizer):
     """Build fake MXFP4 weights and MXFP8 activation/backward operands."""
 
-    def __init__(self, block_size: int = 32) -> None:
-        if block_size not in _SUPPORTED_BLOCK_SIZES:
-            raise ValueError(
-                f"Fake W4A8 block_size must be 32 or 128, got {block_size}."
-            )
-        self.block_size = block_size
+    def __init__(
+        self,
+        block_size: int = MX_BLOCK_SIZE_32,
+    ) -> None:
+        """Create a fake-W4A8 quantizer for one supported MX block size."""
+        self.block_size = validate_mx_block_size(block_size)
 
     @property
     def npu_ops(self) -> FakeW4A8NpuOps:
+        """Return the process-local fake-W4A8 NPU adapter."""
         return _get_fake_w4a8_npu_ops()
 
     @staticmethod
@@ -60,11 +64,11 @@ class FakeW4A8Quantizer(Quantizer):
     ) -> Optional[torch.Tensor]:
         if group_list is None:
             return None
-        return group_list if group_list_type == 0 else torch.cumsum(group_list, dim=0)
-
-    @staticmethod
-    def _scale_to_fp32(scale: torch.Tensor) -> torch.Tensor:
-        return torch.pow(2.0, scale.to(torch.float32) - 127.0)
+        return (
+            group_list
+            if group_list_type == GROUP_LIST_OFFSETS
+            else torch.cumsum(group_list, dim=0)
+        )
 
     def _quantize_activation(
         self,
@@ -75,46 +79,14 @@ class FakeW4A8Quantizer(Quantizer):
         group_list: Optional[torch.Tensor],
         group_list_type: int,
     ) -> MXFP8Tensor:
-        row_data = row_scale = col_data = col_scale = None
+        """Quantize an activation in the requested row/column directions."""
         boundaries = self._boundaries(group_list, group_list_type)
-        if rowwise:
-            row_data, row_scale = self.npu_ops.dynamic_mx_quant(
-                tensor,
-                axis=-1,
-                block_size=self.block_size,
-                quant_dtype=self.npu_ops.activation_dtype,
-            )
-            if self.block_size == 128:
-                row_blocks = (tensor.shape[-1] + self.block_size - 1) // self.block_size
-                row_scale = self._scale_to_fp32(row_scale)
-                row_scale = row_scale.reshape(tensor.shape[0], -1)[..., :row_blocks]
-        if colwise:
-            if self.block_size == 32 and boundaries is not None:
-                # This is the G-B grouped backward quantizer.  The operator
-                # requires int32 group indices and has no scale_alg argument.
-                col_data, col_scale = self.npu_ops.grouped_dynamic_mx_quant(
-                    tensor,
-                    boundaries,
-                    block_size=32,
-                    quant_dtype=self.npu_ops.activation_dtype,
-                )
-            else:
-                # Block-128 has no grouped_dynamic_mx_quant contract.  Quantize
-                # along the token axis and insert the expert-boundary rows in
-                # the scale tensor consumed by group_type=2 GMM.
-                col_data, col_scale = self.npu_ops.dynamic_mx_quant(
-                    tensor,
-                    axis=-2,
-                    block_size=self.block_size,
-                    quant_dtype=self.npu_ops.activation_dtype,
-                )
-                if boundaries is not None:
-                    col_scale = transform_grouped_scale(
-                        tensor,
-                        col_scale,
-                        boundaries,
-                        self.block_size,
-                    )
+        row_data, row_scale, col_data, col_scale = self._quantize_activation_block32(
+            tensor,
+            rowwise=rowwise,
+            colwise=colwise,
+            boundaries=boundaries,
+        )
         return MXFP8Tensor(
             shape=tensor.shape,
             dtype=tensor.dtype,
@@ -126,6 +98,50 @@ class FakeW4A8Quantizer(Quantizer):
             device=tensor.device,
         )
 
+    def _quantize_activation_axis(
+        self,
+        tensor: torch.Tensor,
+        *,
+        axis: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply the shared dynamic-MX activation quantization operation."""
+
+        return self.npu_ops.dynamic_mx_quant(
+            tensor,
+            axis=axis,
+            block_size=self.block_size,
+            quant_dtype=self.npu_ops.activation_dtype,
+        )
+
+    def _quantize_activation_block32(
+        self,
+        tensor: torch.Tensor,
+        *,
+        rowwise: bool,
+        colwise: bool,
+        boundaries: Optional[torch.Tensor],
+    ) -> tuple[
+        Optional[torch.Tensor], Optional[torch.Tensor],
+        Optional[torch.Tensor], Optional[torch.Tensor],
+    ]:
+        """Quantize block-32 activations, including the grouped TN wgrad view."""
+
+        row_data = row_scale = col_data = col_scale = None
+        if rowwise:
+            row_data, row_scale = self._quantize_activation_axis(tensor, axis=-1)
+        if colwise and boundaries is not None:
+            # The TN weight-gradient path needs grouped quantization here.
+            # Its block-32 operator accepts cumulative boundaries as int32.
+            col_data, col_scale = self.npu_ops.grouped_dynamic_mx_quant(
+                tensor,
+                boundaries,
+                block_size=MX_BLOCK_SIZE_32,
+                quant_dtype=self.npu_ops.activation_dtype,
+            )
+        elif colwise:
+            col_data, col_scale = self._quantize_activation_axis(tensor, axis=-2)
+        return row_data, row_scale, col_data, col_scale
+
     def _quantize_weight(
         self,
         tensor: torch.Tensor,
@@ -133,12 +149,13 @@ class FakeW4A8Quantizer(Quantizer):
         rowwise: bool,
         colwise: bool,
     ) -> MXFP8Tensor:
-        if tensor.ndim != 3:
+        """Quantize a grouped master weight through the fake W4A8 path."""
+        if tensor.ndim != GROUPED_NDIM:
             raise ValueError(
                 "Fake W4A8 GMM weights must be [experts,K,N], "
                 f"got shape {tuple(tensor.shape)}."
             )
-        if any(dimension % 32 for dimension in tensor.shape[1:]):
+        if any(dimension % MX_BLOCK_SIZE_32 for dimension in tensor.shape[1:]):
             raise ValueError(
                 "Fake MXFP4 weight dimensions must be divisible by 32, "
                 f"got shape {tuple(tensor.shape)}."
@@ -148,70 +165,18 @@ class FakeW4A8Quantizer(Quantizer):
                 "Fake MXFP8 GMM dimensions must be divisible by block_size, "
                 f"got shape {tuple(tensor.shape)}, block_size={self.block_size}."
             )
-        row_data = row_scale = col_data = col_scale = None
+        source, transposed_source = self._prepare_block32_weight_source(tensor)
 
-        def _quantize_source(source: torch.Tensor):
-            packed, packed_scale = self.npu_ops.dynamic_mx_quant(
-                source,
-                axis=-1,
-                block_size=32,
-                quant_dtype=self.npu_ops.weight_dtype,
-                round_mode="rint",
-                scale_alg=0,
-            )
-            return fake_mxfp4_to_mxfp8(
-                packed,
-                packed_scale,
-                mx8_block_h=self.block_size,
-                mx8_block_w=self.block_size,
-            )
-
-        # Block-128 uses the A5 G-B contract directly: the forward view is
-        # generated from the [E,K,N] source and dgrad consumes its transposed
-        # view.  Its FP32 square scale grid is exactly what split_item=2
-        # grouped matmul expects.
-        if self.block_size == 128:
-            fp8_data, fp8_grid = _quantize_source(tensor)
-            if rowwise:
-                row_data = fp8_data
-                row_scale = fp8_grid.to(torch.float32)
-            if colwise:
-                col_data = fp8_data.transpose(-2, -1).contiguous()
-                col_scale = fp8_grid.transpose(1, 2).contiguous().to(torch.float32)
-            return MXFP8Tensor(
-                shape=tensor.shape,
-                dtype=tensor.dtype,
-                quantizer=self,
-                row_data=row_data,
-                row_scale=row_scale,
-                col_data=col_data,
-                col_scale=col_scale,
-                device=tensor.device,
-            )
-
-        # The ordinary MXFP8 GMM contract has two directional views:
-        # row-wise data/scales for the transposed-right dgrad and column-wise
-        # data/scales for the forward NN matmul.  Quantize each view along its
-        # actual contracting axis instead of reusing a transposed scale grid;
-        # the latter makes the A5 kernel see mismatched weight/scale
-        # transposition flags for NT.
-        if rowwise:
-            row_data, row_grid = _quantize_source(tensor)
-            if self.block_size == 32:
-                row_scale = expand_scale_to_per_row(row_grid)
-            else:
-                row_scale = row_grid.to(torch.float32)
-        if colwise:
-            col_fp8, col_grid = _quantize_source(tensor.transpose(-2, -1).contiguous())
-            col_data = col_fp8.transpose(-2, -1).contiguous()
-            if self.block_size == 32:
-                col_grid = col_grid.permute(0, 2, 1).contiguous()
-                col_scale = convert_mx_scale_to_axis2(
-                    col_grid,
-                    tuple(tensor.shape),
-                )
-            else:
-                col_scale = col_grid.transpose(1, 2).contiguous().to(torch.float32)
+        # Both layouts start by generating the same packed MXFP4 representation.
+        # Only the source orientation and the following MXFP8 conversion differ.
+        packed_mxfp4, mxfp4_scale = self._quantize_mxfp4(source)
+        row_data, row_scale, col_data, col_scale = self._convert_weight_block32(
+            packed_mxfp4,
+            mxfp4_scale,
+            transposed_source=transposed_source,
+            rowwise=rowwise,
+            colwise=colwise,
+        )
         return MXFP8Tensor(
             shape=tensor.shape,
             dtype=tensor.dtype,
@@ -223,6 +188,80 @@ class FakeW4A8Quantizer(Quantizer):
             device=tensor.device,
         )
 
+    def _quantize_mxfp4(self, tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize one source orientation to packed MXFP4 and E8M0 scales."""
+
+        return self.npu_ops.dynamic_mx_quant(
+            tensor,
+            axis=-1,
+            block_size=MX_BLOCK_SIZE_32,
+            quant_dtype=self.npu_ops.weight_dtype,
+            round_mode="rint",
+            scale_alg=MX_SCALE_ALG_OCP,
+        )
+
+    def _prepare_block32_weight_source(
+        self,
+        tensor: torch.Tensor,
+    ) -> tuple[torch.Tensor, bool]:
+        """Select the MXFP4 source orientation required by the CANN converter."""
+
+        rows, cols = tensor.shape[-2:]
+        # CANN requires its penultimate axis to be 64-aligned. Prefer [E,K,N]
+        # so MXFP4 quantization stays on N; transpose only when K is misaligned.
+        transposed_source = rows % MX_SCALE_TILE != 0
+        if transposed_source and cols % MX_SCALE_TILE != 0:
+            raise ValueError(
+                "Fake W4A8 block_size=32 requires at least one of the weight "
+                "matrix dimensions to be divisible by 64 for "
+                "the CANN MXFP4-to-block-MXFP8 conversion; "
+                f"got shape {tuple(tensor.shape)}."
+            )
+        if transposed_source:
+            return tensor.transpose(-2, -1).contiguous(), True
+        return tensor, False
+
+    def _convert_weight_block32(
+        self,
+        packed_mxfp4: torch.Tensor,
+        mxfp4_scale: torch.Tensor,
+        *,
+        transposed_source: bool,
+        rowwise: bool,
+        colwise: bool,
+    ) -> tuple[
+        Optional[torch.Tensor], Optional[torch.Tensor],
+        Optional[torch.Tensor], Optional[torch.Tensor],
+    ]:
+        """Convert packed MXFP4 through CANN's block-MXFP8 operator."""
+
+        (
+            fp8_data,
+            scale1,
+            scale2,
+        ) = self.npu_ops.convert_packed_mxfp4_to_block_mxfp8(
+            packed_mxfp4,
+            mxfp4_scale,
+        )
+
+        if transposed_source:
+            # For source [E,N,K], scale1 follows K (the original contracting
+            # axis) and scale2 follows N. Map them back to [E,K,N] GMM views.
+            fp8_data = fp8_data.transpose(-2, -1).contiguous()
+            row_scale = scale2.transpose(1, 2).contiguous()
+            col_scale = scale1.transpose(1, 2).contiguous()
+        else:
+            # For source [E,K,N], scale1 is [E,K,ceil(N/64),2] and scale2 is
+            # [E,ceil(K/64),N,2], the GMM's rowwise and colwise layouts.
+            row_scale = scale1
+            col_scale = scale2
+        return (
+            fp8_data if rowwise else None,
+            row_scale if rowwise else None,
+            fp8_data if colwise else None,
+            col_scale if colwise else None,
+        )
+
     def quantize(
         self,
         tensor: torch.Tensor,
@@ -230,14 +269,15 @@ class FakeW4A8Quantizer(Quantizer):
         rowwise: bool = False,
         colwise: bool = False,
         group_list: Optional[torch.Tensor] = None,
-        group_list_type: int = 0,
+        group_list_type: int = GROUP_LIST_OFFSETS,
         role: str = "activation",
     ) -> MXFP8Tensor:
+        """Build directional fake-MX storage for an activation or weight."""
         if not isinstance(tensor, torch.Tensor) or isinstance(tensor, QuantizedTensor):
             raise TypeError("FakeW4A8Quantizer expects a high-precision Tensor.")
         if not rowwise and not colwise:
             raise ValueError("FakeW4A8Quantizer requires rowwise or colwise=True.")
-        if group_list_type not in (0, 1):
+        if group_list_type not in (GROUP_LIST_OFFSETS, GROUP_LIST_COUNTS):
             raise ValueError("Fake W4A8 group_list_type must be 0 or 1.")
         if group_list is not None and (
             not isinstance(group_list, torch.Tensor) or group_list.ndim != 1
@@ -247,7 +287,7 @@ class FakeW4A8Quantizer(Quantizer):
             if group_list is not None:
                 raise ValueError("Fake W4A8 weight quantization does not accept groups.")
             return self._quantize_weight(tensor, rowwise=rowwise, colwise=colwise)
-        if role != "activation" or tensor.ndim != 2:
+        if role != "activation" or tensor.ndim != MATRIX_NDIM:
             raise ValueError("Fake W4A8 activation quantization expects a 2D Tensor.")
         return self._quantize_activation(
             tensor,
@@ -257,10 +297,16 @@ class FakeW4A8Quantizer(Quantizer):
             group_list_type=group_list_type,
         )
 
-    def quantize_activation(self, tensor: torch.Tensor, **kwargs) -> MXFP8Tensor:
+    def quantize_activation(
+        self, tensor: torch.Tensor, **kwargs: Any
+    ) -> MXFP8Tensor:
+        """Quantize a two-dimensional activation for fake-W4A8 GMM."""
         return self.quantize(tensor, role="activation", **kwargs)
 
-    def quantize_weight(self, tensor: torch.Tensor, **kwargs) -> MXFP8Tensor:
+    def quantize_weight(
+        self, tensor: torch.Tensor, **kwargs: Any
+    ) -> MXFP8Tensor:
+        """Quantize grouped weights through the fake-MXFP4 path."""
         return self.quantize(tensor, role="weight", **kwargs)
 
 

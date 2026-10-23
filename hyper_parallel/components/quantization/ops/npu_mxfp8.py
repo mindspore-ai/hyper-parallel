@@ -19,6 +19,16 @@ from typing import Any, Optional
 
 import torch  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.components.quantization.config import (
+    GMM_GROUP_K,
+    GMM_GROUP_M,
+    GMM_SPLIT_MXFP8,
+    GROUP_LIST_COUNTS,
+    GROUP_LIST_OFFSETS,
+    MATRIX_NDIM,
+    MX_BLOCK_SIZE_32,
+    MX_SCALE_ALG_CUBALS,
+)
 from hyper_parallel.components.quantization.tensor import MXFP8Tensor
 
 _A5_DEVICE_MARKERS = ("Ascend950", "Ascend910_95")
@@ -94,7 +104,7 @@ class MXFP8NpuOps:
             tensor,
             axis=axis,
             dst_type=quant_dtype or torch.float8_e4m3fn,
-            scale_alg=1,
+            scale_alg=MX_SCALE_ALG_CUBALS,
         )
 
     def dynamic_mx_quant_dual_axis(
@@ -108,7 +118,7 @@ class MXFP8NpuOps:
         return self._torch_npu.npu_dynamic_mx_quant_with_dual_axis(
             tensor,
             dst_type=quant_dtype or torch.float8_e4m3fn,
-            scale_alg=1,
+            scale_alg=MX_SCALE_ALG_CUBALS,
         )
 
     def quant_matmul(
@@ -130,7 +140,7 @@ class MXFP8NpuOps:
             output_dtype=output_dtype,
             scale_dtype=self._torch_npu.float8_e8m0fnu,
             pertoken_scale_dtype=self._torch_npu.float8_e8m0fnu,
-            group_sizes=[1, 1, 32],
+            group_sizes=[1, 1, MX_BLOCK_SIZE_32],
         )
 
     def grouped_dynamic_mx_quant(
@@ -160,7 +170,7 @@ class MXFP8NpuOps:
             group_list.to(torch.int32),
             round_mode="rint",
             dst_type=quant_dtype or torch.float8_e4m3fn,
-            blocksize=32,
+            blocksize=MX_BLOCK_SIZE_32,
         )
 
     def quant_grouped_matmul(
@@ -199,7 +209,7 @@ class MXFP8NpuOps:
             group_list_type=group_list_type,
             scale_dtype=self._torch_npu.float8_e8m0fnu,
             per_token_scale_dtype=self._torch_npu.float8_e8m0fnu,
-            split_item=2,
+            split_item=GMM_SPLIT_MXFP8,
         )[0]
 
     def is_e8m0_dtype(self, dtype: torch.dtype) -> bool:
@@ -235,12 +245,12 @@ def validate_npu_gmm_runtime() -> None:
 def _transpose_scale(scale: torch.Tensor) -> torch.Tensor:
     """Transpose the two matrix dimensions of an MX scale tensor."""
 
-    if scale.ndim < 2:
+    if scale.ndim < MATRIX_NDIM:
         raise ValueError(
             "MXFP8 scale transpose requires at least two dimensions, got "
             f"shape {tuple(scale.shape)}."
         )
-    if scale.ndim == 2:
+    if scale.ndim == MATRIX_NDIM:
         return scale.transpose(0, 1)
     return scale.transpose(-3, -2)
 
@@ -250,6 +260,7 @@ def _left_operand(
     *,
     transpose: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the MXFP8 data and scale for the left operand orientation."""
     if transpose:
         if not tensor.is_colwise():
             raise ValueError(
@@ -271,6 +282,7 @@ def _right_operand(
     *,
     transpose: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the MXFP8 data and scale for the right operand orientation."""
     if transpose:
         if not tensor.is_rowwise():
             raise ValueError(
@@ -330,8 +342,8 @@ def mxfp8_grouped_matmul(
     *,
     layout: str,
     group_list: torch.Tensor,
-    group_type: int = 0,
-    group_list_type: int = 0,
+    group_type: int = GMM_GROUP_M,
+    group_list_type: int = GROUP_LIST_OFFSETS,
     output_dtype: Optional[torch.dtype] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -364,13 +376,15 @@ def mxfp8_grouped_matmul(
         )
     if not isinstance(group_list, torch.Tensor) or group_list.ndim != 1:
         raise ValueError("MXFP8 GMM group_list must be a one-dimensional Tensor.")
-    if group_type not in (0, 2):
+    if group_type not in (GMM_GROUP_M, GMM_GROUP_K):
         raise ValueError(
-            f"MXFP8 GMM group_type must be 0 or 2, but got {group_type}."
+            f"MXFP8 GMM group_type must be {GMM_GROUP_M} or {GMM_GROUP_K}, "
+            f"but got {group_type}."
         )
-    if group_list_type not in (0, 1):
+    if group_list_type not in (GROUP_LIST_OFFSETS, GROUP_LIST_COUNTS):
         raise ValueError(
-            "MXFP8 GMM group_list_type must be 0 or 1, "
+            "MXFP8 GMM group_list_type must be "
+            f"{GROUP_LIST_OFFSETS} or {GROUP_LIST_COUNTS}, "
             f"but got {group_list_type}."
         )
 
