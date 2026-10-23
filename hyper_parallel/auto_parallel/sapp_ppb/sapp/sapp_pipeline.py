@@ -381,7 +381,6 @@ class SappPipeline:
                     yaml_data[rec] = [yaml_data[rec]]
             interleave_num = manual.get("interleave_num",
                                         self.num_of_interleave_)
-            show = manual.get("show", False)
             file_name = manual.get("file_name")
             full_file_name = os.path.join(output_folder,
                                           file_name) if (file_name) else None
@@ -397,7 +396,7 @@ class SappPipeline:
             manual_time = self.simulate_yaml(yaml_data, False, interleave_num, full_file_name, sub_figs[1])
             logger.info("Simulation comparison: automatic time=%s, manual time=%s", automatic_time, manual_time)
             plt.savefig(os.path.join(output_folder, "Comparison_" + file_name))
-            if show:
+            if manual.get("show", False):
                 plt.show()
 
     def simulate_only_manual(self, manual_config_file: str, output_folder: str) -> None:
