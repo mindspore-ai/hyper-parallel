@@ -18,10 +18,24 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Any, Optional
 
 import torch  # pylint: disable=forbidden-backend-import
-import torch_npu
+
+
+_QUERY_LENGTH_ALIASES = (
+    ("actual_seq_len", False), ("actual_q_len", False), ("actual_seq_qlen", False),
+    ("cu_seq_lens", True), ("cu_seq_lens_q", True), ("cu_seqlens_q", True),
+)
+_KEY_LENGTH_ALIASES = (
+    ("actual_seq_len", False), ("actual_kv_len", False), ("actual_seq_kvlen", False),
+    ("cu_seq_lens", True), ("cu_seq_lens_k", True), ("cu_seq_lens_kv", True),
+    ("cu_seqlens_k", True), ("cu_seqlens_kv", True),
+)
+PACKED_SEQUENCE_ARGUMENTS = frozenset(
+    name for name, _ in _QUERY_LENGTH_ALIASES + _KEY_LENGTH_ALIASES
+) | {"packed_seq_params"}
 
 
 @dataclass
@@ -42,6 +56,7 @@ class _FusionAttentionContext:
     pre_tokens: int
     next_tokens: int
     is_packed: bool
+    valid_rows: Optional[torch.Tensor]
 
 
 def _npu_attention_mask(attention_mask: torch.Tensor) -> torch.Tensor:
@@ -77,14 +92,17 @@ def _length_list(
 ) -> list[int]:
     """Normalize one cumulative-length representation."""
     if isinstance(value, torch.Tensor):
-        lengths = [int(item) for item in value.tolist()]
-    else:
-        lengths = [int(item) for item in value]
+        if value.ndim != 1:
+            raise ValueError("packed cumulative sequence lengths must be one-dimensional")
+        value = value.tolist()
+    if any(isinstance(item, bool) or not isinstance(item, Integral) for item in value):
+        raise ValueError("packed cumulative sequence lengths must be integers")
+    lengths = [int(item) for item in value]
     if includes_zero:
         if not lengths or lengths[0] != 0:
             raise ValueError("cu_seq_lens must start with zero")
         lengths = lengths[1:]
-    if not lengths or any(left >= right for left, right in zip(lengths, lengths[1:])):
+    if not lengths or any(left >= right for left, right in zip([0] + lengths[:-1], lengths)):
         raise ValueError("packed cumulative sequence lengths must be strictly increasing")
     return lengths
 
@@ -96,11 +114,15 @@ def _coalesce_lengths(
     name: str,
 ) -> list[int] | None:
     """Read equivalent length arguments and reject conflicting values."""
-    candidates = [
-        (alias, _length_list(kwargs[alias], includes_zero=includes_zero))
-        for alias, includes_zero in aliases
-        if kwargs.get(alias) is not None
-    ]
+    candidates = []
+    sources = (("", kwargs), ("packed_seq_params.", kwargs.get("packed_seq_params")))
+    for prefix, source in sources:
+        if source is None:
+            continue
+        for alias, includes_zero in aliases:
+            value = source.get(alias) if isinstance(source, Mapping) else getattr(source, alias, None)
+            if value is not None:
+                candidates.append((prefix + alias, _length_list(value, includes_zero=includes_zero)))
     if not candidates:
         return None
     first_alias, first = candidates[0]
@@ -111,47 +133,6 @@ def _coalesce_lengths(
                 f"{first_alias!r} and {alias!r}"
             )
     return first
-
-
-def _packed_parameter_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
-    """Expose packed-sequence fields carried by a model-level parameter object."""
-    packed_seq_params = kwargs.get("packed_seq_params")
-    if packed_seq_params is None:
-        return dict(kwargs)
-
-    resolved_kwargs = dict(kwargs)
-    field_aliases = {
-        "actual_seq_len": "actual_seq_len",
-        "actual_q_len": "actual_q_len",
-        "actual_kv_len": "actual_kv_len",
-        "actual_seq_qlen": "actual_seq_qlen",
-        "actual_seq_kvlen": "actual_seq_kvlen",
-        "cu_seq_lens": "cu_seq_lens_q",
-        "cu_seq_lens_q": "cu_seq_lens_q",
-        "cu_seq_lens_k": "cu_seq_lens_k",
-        "cu_seq_lens_kv": "cu_seq_lens_k",
-        "cu_seqlens_q": "cu_seq_lens_q",
-        "cu_seqlens_k": "cu_seq_lens_k",
-        "cu_seqlens_kv": "cu_seq_lens_k",
-    }
-    found = False
-    for source_name, target_name in field_aliases.items():
-        if isinstance(packed_seq_params, Mapping):
-            value = packed_seq_params.get(source_name)
-        else:
-            value = getattr(packed_seq_params, source_name, None)
-        if value is not None:
-            found = True
-            if resolved_kwargs.get(target_name) is None:
-                resolved_kwargs[target_name] = value
-            if source_name == "cu_seq_lens":
-                if resolved_kwargs.get("cu_seq_lens_k") is None:
-                    resolved_kwargs["cu_seq_lens_k"] = value
-    if not found:
-        raise ValueError(
-            "packed_seq_params must provide cumulative query and key/value sequence lengths"
-        )
-    return resolved_kwargs
 
 
 def resolve_packed_sequence_lengths(
@@ -169,27 +150,14 @@ def resolve_packed_sequence_lengths(
     Returns:
         Cumulative query and key/value sequence ends without leading zeros.
     """
-    kwargs = _packed_parameter_kwargs(kwargs)
     query_lengths = _coalesce_lengths(
-        kwargs,
-        (
-            ("actual_seq_len", False),
-            ("actual_q_len", False),
-            ("actual_seq_qlen", False),
-            ("cu_seq_lens_q", True),
-        ),
-        name="query sequence lengths",
+        kwargs, _QUERY_LENGTH_ALIASES, name="query sequence lengths",
     )
     key_lengths = _coalesce_lengths(
-        kwargs,
-        (
-            ("actual_seq_len", False),
-            ("actual_kv_len", False),
-            ("actual_seq_kvlen", False),
-            ("cu_seq_lens_k", True),
-        ),
-        name="key/value sequence lengths",
+        kwargs, _KEY_LENGTH_ALIASES, name="key/value sequence lengths",
     )
+    if kwargs.get("packed_seq_params") is not None and query_lengths is None and key_lengths is None:
+        raise ValueError("packed_seq_params must provide cumulative query and key/value sequence lengths")
     if (query_lengths is None) != (key_lengths is None):
         raise ValueError("packed attention requires both query and key/value lengths")
     if query_lengths is not None:
@@ -205,10 +173,10 @@ def resolve_packed_sequence_lengths(
 def _attention_options(module: torch.nn.Module, kwargs: dict[str, Any]):
     """Resolve sparse-window and causal options from kwargs and the module."""
     pre_tokens = kwargs.get("pre_tokens", getattr(module, "pre_tockens", 1048576))
-    next_tokens = kwargs.get("next_tokens", getattr(module, "next_tockens", 0))
     sparse_mode = kwargs.get("sparse_mode", getattr(module, "sparse_mode", 0))
     sliding_window = kwargs.get("sliding_window")
     is_causal = kwargs.get("is_causal", getattr(module, "is_causal", True))
+    next_tokens = kwargs.get("next_tokens", getattr(module, "next_tockens", 0 if is_causal else 2147483647))
     if sliding_window is not None:
         pre_tokens = sliding_window
     return pre_tokens, next_tokens, sparse_mode, sliding_window, is_causal
@@ -237,8 +205,13 @@ def _prepare_attention_inputs(
             npu_mask = None if attention_mask is None else _npu_attention_mask(attention_mask)
         return query, key, value, "TND", npu_mask, sparse_mode
     if attention_mask is None and is_causal:
+        if query.shape[2] == key.shape[2] and sliding_window is None:
+            mask = torch.ones((2048, 2048), dtype=torch.bool, device=query.device).triu(diagonal=1)
+            return query, key, value, "BNSD", mask, 3
         return query, key, value, "BNSD", _causal_attention_mask(query, key, sliding_window), 0
     npu_mask = None if attention_mask is None else _npu_attention_mask(attention_mask)
+    if npu_mask is not None and is_causal and sparse_mode == 0:
+        npu_mask = npu_mask | _causal_attention_mask(query, key, sliding_window)
     return query, key, value, "BNSD", npu_mask, sparse_mode
 
 
@@ -267,6 +240,13 @@ def _prepare_fusion_attention_context(
         sliding_window=options[3],
         sparse_mode=options[2],
     )
+    valid_rows = None
+    if query_lengths is None and prepared[4] is not None and prepared[5] == 0:
+        mask = prepared[4]
+        valid_rows = (~mask).any(dim=-1)
+        # Give fully masked rows one finite softmax entry, then suppress their
+        # output and upstream gradient. Some NPU kernels otherwise return nonzero rows.
+        mask[..., 0] &= valid_rows
     return _FusionAttentionContext(
         *prepared[:5],
         prepared[5],
@@ -278,6 +258,7 @@ def _prepare_fusion_attention_context(
         options[0],
         options[1],
         query_lengths is not None,
+        valid_rows,
     )
 
 
@@ -318,6 +299,9 @@ def npu_fusion_attention_forward(
         ``True`` for positions that participate in attention; an additive mask
         uses zero for those positions.
     """
+    # Length parsing is also used by CPU CP validation; load the optional kernel only here.
+    import torch_npu  # pylint: disable=C0415
+
     if kwargs.get("indices") is not None:
         raise ValueError(
             "npu_fusion_attention_forward does not consume sparse attention indices; "
@@ -332,9 +316,9 @@ def npu_fusion_attention_forward(
         kwargs,
     )
     output = torch_npu.npu_fusion_attention(
-        context.query,
-        context.key,
-        context.value,
+        context.query.contiguous(),
+        context.key.contiguous(),
+        context.value.contiguous(),
         context.query.shape[1],
         context.input_layout,
         pse=None,
@@ -349,6 +333,8 @@ def npu_fusion_attention_forward(
         actual_seq_qlen=context.query_lengths,
         actual_seq_kvlen=context.key_lengths,
     )[0]
+    if context.valid_rows is not None:
+        output = output.masked_fill(~context.valid_rows.unsqueeze(-1), 0.0)
     if context.is_packed:
         output = output.reshape(
             context.batch_size,

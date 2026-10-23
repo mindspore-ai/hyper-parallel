@@ -35,11 +35,19 @@ def _load_replacements():
     return module_replacement
 
 
+def _load_context_parallel():
+    """Load the optional dense MLA CP adapter without importing kernels at discovery."""
+    from hyper_parallel.models.deepseek_v3.adapter.distributed import context_parallel  # pylint: disable=C0415
+
+    return context_parallel
+
+
 DEEPSEEK_V3_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="DeepseekV3ForCausalLM",
     model_type="deepseek_v3",
     replacements=_load_replacements,
     sharding_rules=build_parameter_sharding_rules,
+    context_parallel=_load_context_parallel,
 )
 register_model_adapter(DEEPSEEK_V3_ADAPTER_SPEC)
 
