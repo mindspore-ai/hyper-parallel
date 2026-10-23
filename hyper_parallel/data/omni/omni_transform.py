@@ -14,15 +14,60 @@
 # ============================================================================
 """Omni transform lifecycle and the default AutoProcessor implementation."""
 
-import copy
-import os
+from __future__ import annotations
+
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+import torch  # pylint: disable=forbidden-backend-import
 from transformers import AutoProcessor
 
-from hyper_parallel.data.constants import IGNORE_INDEX, OMNI_CP_TOKEN_FIELDS, ONLINE_SOURCE_PATH_KEY
+from hyper_parallel.data.constants import IGNORE_INDEX, OMNI_CP_TOKEN_FIELDS
+from hyper_parallel.data.dataset_logging import get_dataset_logger
+from hyper_parallel.data.online.format import (
+    convert_sharegpt_to_messages,
+    normalize_chat_media_fields,
+    resolve_chat_media_paths,
+    resolve_media_path,
+)
+
+logger = get_dataset_logger(__name__)
+
+
+def build_labels_from_supervised_start(
+        input_ids: torch.Tensor,
+        supervised_start: int,
+        *,
+        media_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Supervise text from a token position through the end of one sample.
+
+    Args:
+        input_ids: One encoded sample with shape [sequence].
+        supervised_start: First supervised token after the prompt or BOS.
+        media_mask: Media positions excluded from supervision.
+
+    Returns:
+        Labels retaining supervised text and masking other positions with IGNORE_INDEX.
+    """
+    if input_ids.ndim != 1:
+        raise ValueError("Omni label construction requires one-dimensional input_ids")
+
+    if not 0 <= supervised_start <= input_ids.numel():
+        raise ValueError(f"Invalid supervised start {supervised_start} for length {input_ids.numel()}")
+
+    # [prompt..., reply, EOS] -> [-100..., reply, EOS]; next-token shifting belongs to the model loss.
+    labels = input_ids.clone()
+    labels[:supervised_start] = IGNORE_INDEX
+
+    if media_mask is not None:
+        if media_mask.shape != input_ids.shape:
+            raise ValueError("media_mask must have the same shape as input_ids")
+
+        labels[media_mask.bool()] = IGNORE_INDEX
+
+    return labels
 
 
 def build_auto_processor(
@@ -49,6 +94,7 @@ def build_auto_processor(
     tokenizer = getattr(processor, "tokenizer", None)
     if tokenizer is None:
         raise ValueError("AutoProcessor must provide a tokenizer")
+
     chat_template = getattr(processor, "chat_template", None)
     if chat_template is None:
         chat_template = getattr(tokenizer, "chat_template", None)
@@ -61,42 +107,54 @@ def build_auto_processor(
 class OmniDataTransform:
     """Define model-specific sample and batch encoding hooks.
 
-    Implement ``encode_sample`` for eager encoding, ``preencode_sample`` and
-    ``postencode_sample`` for deferred encoding, or only ``postencode_sample``
-    when source samples already contain offline packing metadata. The data
-    pipeline detects the implemented hook combination automatically.
+    Eager transforms implement ``encode_sample`` to return model inputs and labels.
+    Deferred transforms provide ``preencode_sample`` and ``postencode_sample``;
+    offline metadata needs only ``postencode_sample``. The pipeline detects
+    these hook combinations automatically.
 
     Packing selection and concatenation belong to the optional packing path
     rather than this transform.
     """
 
-    def __init__(self, *, max_seq_len: int, processor: Any) -> None:
+    def __init__(
+            self, *, max_seq_len: int, processor: Any, training_mode: str = "sft",
+    ) -> None:
         """Store the sequence limit and externally built processor."""
+        if training_mode not in ("sft", "pretrain"):
+            raise ValueError(f"Unsupported Omni training mode: {training_mode!r}")
+
+        self.training_mode = training_mode
         if max_seq_len <= 0:
             raise ValueError("max_seq_len must be positive")
+
         if processor is None:
             raise ValueError("processor is required")
+
         self.max_seq_len = max_seq_len
         self.processor = processor
 
-    @staticmethod
-    def is_valid_sample(sample: Mapping[str, Any]) -> bool:
+    def is_valid_sample(self, sample: Mapping[str, Any]) -> bool:
         """Return whether one source record contains conversation messages."""
         messages = sample.get("messages")
         if not isinstance(messages, list):
             raise ValueError("Omni sample messages must be a list")
-        return bool(messages)
 
-    def encode_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
-        """Encode one source sample into one model-ready sample."""
-        raise NotImplementedError(f"{type(self).__name__} does not implement encode_sample")
+        valid_sample = bool(messages)
+        return valid_sample
+
+    def encode_sample(self, sample: dict[str, Any]) -> dict[str, Any] | None:
+        """Encode a complete sample with unshifted labels, or return None to skip it."""
+        del sample
+        raise NotImplementedError(f"{type(self).__name__} does not implement sample encoding")
 
     def preencode_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
         """Prepare metadata used by a packing selector without full encoding."""
+        del sample
         raise NotImplementedError(f"{type(self).__name__} does not implement preencode_sample")
 
     def postencode_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
         """Encode selected online or offline metadata into a model-ready sample."""
+        del sample
         raise NotImplementedError(f"{type(self).__name__} does not implement postencode_sample")
 
     def encode_batch(self, batch: Any) -> Any:
@@ -105,59 +163,49 @@ class OmniDataTransform:
 
     def prepare_messages(self, sample: dict[str, Any]) -> list[dict[str, Any]]:
         """Copy messages and resolve media paths relative to their JSONL file."""
-        messages = sample.get("messages")
-        if not isinstance(messages, list) or not messages:
-            raise ValueError("Omni sample must contain non-empty messages")
-
-        prepared_messages = copy.deepcopy(messages)
-        source_path = sample.get(ONLINE_SOURCE_PATH_KEY)
-        if source_path is None:
-            return prepared_messages
-
-        source_directory = os.path.dirname(os.path.abspath(source_path))
-        for message in prepared_messages:
-            content = message.get("content")
-            if not isinstance(content, list):
-                continue
-            for content_block in content:
-                self._resolve_media_block(content_block, source_directory)
+        prepared_messages = resolve_chat_media_paths(sample)
         return prepared_messages
-
-    @classmethod
-    def _resolve_media_block(cls, content_block: Any, source_directory: str) -> None:
-        """Resolve path-bearing fields without changing the processor's message format."""
-        if not isinstance(content_block, dict):
-            return
-
-        block_type = content_block.get("type")
-        if block_type == "image_url":
-            image_url = content_block.get("image_url")
-            if isinstance(image_url, str):
-                content_block["image_url"] = cls._resolve_media_path(image_url, source_directory)
-            elif isinstance(image_url, dict) and isinstance(image_url.get("url"), str):
-                image_url["url"] = cls._resolve_media_path(image_url["url"], source_directory)
-            return
-
-        media_field = content_block.get(block_type)
-        if block_type in ("image", "video", "audio") and isinstance(media_field, str):
-            content_block[block_type] = cls._resolve_media_path(media_field, source_directory)
 
     @staticmethod
     def _resolve_media_path(media_path: str, source_directory: str) -> str:
-        """Keep remote and absolute references, and anchor local relative paths."""
-        if os.path.isabs(media_path) or media_path.startswith(("http://", "https://", "data:")):
-            return media_path
-
-        resolved_path = os.path.normpath(os.path.join(source_directory, media_path))
+        """Delegate media path resolution for existing model adapters."""
+        resolved_path = resolve_media_path(media_path, source_directory)
         return resolved_path
 
 
 class AutoProcessorTransform(OmniDataTransform):
     """Encode a conversation and supervise only its final assistant response."""
 
+    def __init__(
+            self, *, max_seq_len: int, processor: Any, training_mode: str = "sft",
+            sample_format: str = "messages",
+    ) -> None:
+        """Select messages/OpenAI/HF or fixed ShareGPT input explicitly."""
+        super().__init__(max_seq_len=max_seq_len, processor=processor, training_mode=training_mode)
+        if sample_format not in ("messages", "openai", "hf", "sharegpt"):
+            raise ValueError(f"Unsupported AutoProcessor sample format: {sample_format!r}")
+
+        self.sample_format = sample_format
+
+    def is_valid_sample(self, sample: Mapping[str, Any]) -> bool:
+        """Filter the configured conversation column before source construction."""
+        message_key = "conversations" if self.sample_format == "sharegpt" else "messages"
+        messages = sample.get(message_key)
+        if not isinstance(messages, list):
+            raise ValueError(f"Omni {self.sample_format} sample requires a {message_key} list")
+
+        valid_sample = bool(messages)
+        return valid_sample
+
     def encode_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
         """Build model inputs and assistant-only labels from processor messages."""
-        messages = self.prepare_messages(sample)
+        if self.training_mode != "sft":
+            raise NotImplementedError("Image-caption pretraining requires a model-specific encoding method")
+
+        if self.sample_format == "sharegpt":
+            messages = convert_sharegpt_to_messages(sample)
+        else:
+            messages = normalize_chat_media_fields(sample)
         if len(messages) < 2 or messages[-1].get("role") != "assistant":
             raise ValueError("Omni training sample must end with a final assistant message")
 
@@ -168,6 +216,7 @@ class AutoProcessorTransform(OmniDataTransform):
             return_tensors="pt",
             add_generation_prompt=False,
         ))
+        # The generation prompt includes the assistant header: [user, header | reply, EOS].
         prompt_sample = self.processor.apply_chat_template(
             messages[:-1],
             tokenize=True,
@@ -182,11 +231,14 @@ class AutoProcessorTransform(OmniDataTransform):
         if prompt_length >= len(input_ids) or not input_ids[:prompt_length].equal(prompt_ids):
             raise ValueError("Assistant prompt tokens must be a prefix of the full conversation")
 
-        labels = input_ids.clone()
-        labels[:prompt_length] = IGNORE_INDEX
+        media_mask = None
         if "mm_token_type_ids" in encoded_sample:
-            labels[encoded_sample["mm_token_type_ids"].squeeze(0) != 0] = IGNORE_INDEX
+            media_mask = encoded_sample["mm_token_type_ids"].squeeze(0) != 0
+        labels = build_labels_from_supervised_start(
+            input_ids, prompt_length, media_mask=media_mask,
+        )
 
+        # Single-sample token fields: [1, L] -> [L]; media tensors keep the processor layout.
         for field in OMNI_CP_TOKEN_FIELDS.intersection(encoded_sample):
             encoded_sample[field] = encoded_sample[field].squeeze(0)
         encoded_sample["labels"] = labels
@@ -205,20 +257,23 @@ class _OmniTransformStrategy:
 
     @classmethod
     def from_transform(cls, transform: OmniDataTransform) -> "_OmniTransformStrategy":
-        """Build one strategy from Energon-style overridden hooks."""
-        encode_sample = cls._is_overridden(transform, "encode_sample")
-        preencode_sample = cls._is_overridden(transform, "preencode_sample")
-        postencode_sample = cls._is_overridden(transform, "postencode_sample")
+        """Select eager or deferred encoding from the implemented pipeline hooks."""
+        transform_type = type(transform)
+        encode_sample = transform_type.encode_sample is not OmniDataTransform.encode_sample
+        preencode_sample = transform_type.preencode_sample is not OmniDataTransform.preencode_sample
+        postencode_sample = transform_type.postencode_sample is not OmniDataTransform.postencode_sample
 
         if encode_sample and (preencode_sample or postencode_sample):
             raise TypeError(
                 f"{type(transform).__name__} cannot combine encode_sample with "
                 "preencode_sample or postencode_sample"
             )
+
         if preencode_sample and not postencode_sample:
             raise TypeError(
                 f"{type(transform).__name__} must pair preencode_sample with postencode_sample"
             )
+
         if not encode_sample and not postencode_sample:
             raise TypeError(
                 f"{type(transform).__name__} must implement encode_sample or postencode_sample"
@@ -243,21 +298,6 @@ class _OmniTransformStrategy:
         )
         return transform_strategy
 
-    @staticmethod
-    def _is_overridden(transform: OmniDataTransform, method_name: str) -> bool:
-        """Return whether a transform hook differs from its base implementation."""
-        transform_method = getattr(type(transform), method_name)
-        base_method = getattr(OmniDataTransform, method_name)
-        method_overridden = transform_method is not base_method
-        return method_overridden
-
-    def prepare_sample(self, sample: Any) -> Any:
-        """Encode a sample or attach metadata before packing selection."""
-        prepared_sample = sample
-        if self.sample_encoder is not None:
-            prepared_sample = self.sample_encoder(sample)
-        return prepared_sample
-
     def encode_selected_sample(self, sample: Any) -> Any:
         """Finish encoding a sample after packing selection."""
         encoded_sample = sample
@@ -267,9 +307,14 @@ class _OmniTransformStrategy:
 
     def prepare_samples(self, raw_sample: Any) -> list[Any]:
         """Return encoded, preencoded, or unchanged samples for candidate selection."""
-        prepared_sample = self.prepare_sample(raw_sample)
-        prepared_samples = [prepared_sample]
-        return prepared_samples
+        prepared_sample = raw_sample
+        if self.sample_encoder is not None:
+            prepared_sample = self.sample_encoder(raw_sample)
+        if prepared_sample is None:
+            logger.warning("Skipping sample rejected by transform")
+            return []
+
+        return [prepared_sample]
 
 
 __all__ = [

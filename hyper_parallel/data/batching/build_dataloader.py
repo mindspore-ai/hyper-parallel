@@ -21,8 +21,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any
 
-import torch
-from torch.utils.data import IterableDataset
+import torch  # pylint: disable=forbidden-backend-import
+from torch.utils.data import IterableDataset  # pylint: disable=forbidden-backend-import
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from hyper_parallel.data.batching.dynamic_batch import (
@@ -387,8 +387,15 @@ class _DynamicBatchLoader(ABC):
                 yield self._build_micro_batch()
 
         # Stage 3: At EOF, bypass readiness thresholds so no pulled candidate is lost.
+        logger.debug(
+            "Dynamic loader source exhausted: buffered_samples=%d buffered_tokens=%d "
+            "token_budget=%d drop_last=%s; draining remaining candidates",
+            len(self.candidate_buffer.buffer), self.candidate_buffer.buffer_token_count,
+            self.candidate_buffer.token_budget, self.drop_last, enabled=True,
+        )
         while not self.candidate_buffer.empty():
             yield self._build_micro_batch()
+        logger.debug("Dynamic loader tail drained; no candidates remain", enabled=True)
 
     @abstractmethod
     def _build_batch_pipeline(self, dataset: Any) -> _BatchPipeline:
@@ -398,6 +405,11 @@ class _DynamicBatchLoader(ABC):
     def _build_micro_batch(self) -> Mapping[str, Any]:
         """Select, finalize, collate, and encode one micro-batch."""
         selected_samples = self.candidate_buffer.get_micro_batch()
+        logger.debug(
+            "Dynamic loader selected: samples=%d token_budget=%d remaining_samples=%d remaining_tokens=%d",
+            len(selected_samples), self.candidate_buffer.token_budget, len(self.candidate_buffer.buffer),
+            self.candidate_buffer.buffer_token_count, enabled=True,
+        )
         finalized_samples = self._batch_pipeline.finalize_selected_samples(selected_samples)
 
         # build batch data
@@ -454,7 +466,7 @@ class _DynamicBatchLoader(ABC):
 class TokenBatchLoader(_DynamicBatchLoader):
     """Select fully encoded samples within one token budget."""
 
-    def _build_batch_pipeline(self, _dataset: Any) -> _BatchPipeline:
+    def _build_batch_pipeline(self, dataset: Any) -> _BatchPipeline:
         """Build token-budget batching for fully encoded Dataset samples."""
         batch_pipeline = _TokenBatchPipeline()
         return batch_pipeline

@@ -23,7 +23,7 @@ from torch import nn  # pylint: disable=forbidden-backend-import
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedAttentionCPContext,
     SharedCompressedAttentionTPContext,
-    SharedCompressedDSAAttention,
+    SharedCompressedDSAAttentionBase,
 )
 from hyper_parallel.distributed._builder.forward_rewriter import (
     _ForwardRewriteRequest,
@@ -35,22 +35,29 @@ from hyper_parallel.distributed.recipe_spec import inner_wrapper
 
 
 def _build_shared_attention_cp_context(cp_mesh: Any) -> SharedCompressedAttentionCPContext:
-    """Build V4.1's asynchronous KV-all-gather communication context."""
+    """Bind existing CP gathers to the shared compression and attention module."""
 
     def _gather_sequence(tensor: torch.Tensor, sequence_dim: int) -> torch.Tensor:
         """All-gather one sequence dimension in CP-rank order."""
-        return async_cp_allgather_launch(tensor, sequence_dim, cp_mesh).wait()
+        gather_handle = async_cp_allgather_launch(tensor, sequence_dim, cp_mesh)
+        gathered_sequence = gather_handle.wait()
+        return gathered_sequence
+
 
     def _launch_sequence(tensor: torch.Tensor, sequence_dim: int) -> Any:
         """Launch a differentiable KV all-gather for projection overlap."""
-        return async_cp_allgather_launch(tensor, sequence_dim, cp_mesh)
+        gather_handle = async_cp_allgather_launch(tensor, sequence_dim, cp_mesh)
+        return gather_handle
 
-    return SharedCompressedAttentionCPContext(
+
+    cp_context = SharedCompressedAttentionCPContext(
         size=cp_mesh.size(),
         rank=cp_mesh.get_local_rank(),
         gather_sequence=_gather_sequence,
         launch_sequence=_launch_sequence,
     )
+    return cp_context
+
 
 
 def _build_shared_attention_tp_context(tp_mesh: Any) -> SharedCompressedAttentionTPContext:
@@ -84,13 +91,16 @@ def deepseek_v41_shared_attention_parallel_wrapper(
     and index keys use asynchronous differentiable all-gather. Projection
     GEMMs overlap communication. Indexer Q/merge heads remain TP-local and
     reduce their score and KL-target contributions before global Top-K.
+    Packed compression grouping is owned by the shared module; this adapter
+    supplies communication callbacks without changing data boundaries.
+    Native and optimized attention share this context interface.
     """
     del mesh, ep_mesh
     wrapper_name = "deepseek_v41_shared_attention_parallel_wrapper"
-    if not isinstance(target_module, SharedCompressedDSAAttention):
+    if not isinstance(target_module, SharedCompressedDSAAttentionBase):
         raise TypeError(
-            f"{wrapper_name} requires SharedCompressedDSAAttention after "
-            f"module replacement, got {type(target_module).__name__}"
+            f"{wrapper_name} requires SharedCompressedDSAAttentionBase, "
+            f"got {type(target_module).__name__}"
         )
 
     original_forward = target_module.forward

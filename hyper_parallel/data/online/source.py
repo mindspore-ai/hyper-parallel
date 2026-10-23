@@ -179,7 +179,7 @@ class _OnlineLeafSourceLoader:
 
         if filter_before_ratio_split:
             filtered_dataset = loaded_dataset.filter(sample_filter)
-            split_percentages = self._parse_split_percentages(ratio_split_config)
+            split_percentages = self.parse_split_percentages(ratio_split_config)
             filtered_splits = self._split_filtered_dataset(filtered_dataset, split_percentages)
             return filtered_splits
 
@@ -352,7 +352,7 @@ class _OnlineLeafSourceLoader:
         return data_files, loader_format
 
     @staticmethod
-    def _parse_split_percentages(split: Any) -> tuple[int, int, int]:
+    def parse_split_percentages(split: Any) -> tuple[int, int, int]:
         """Parse and validate train, validation, and test percentages."""
         try:
             percentages = []
@@ -375,7 +375,7 @@ class _OnlineLeafSourceLoader:
     @classmethod
     def _parse_split_ratios(cls, split: Any) -> tuple[str | None, str | None, str | None]:
         """Translate train/valid/test percentages into ``load_dataset`` split expressions."""
-        train_percentage, valid_percentage, test_percentage = cls._parse_split_percentages(split)
+        train_percentage, valid_percentage, _ = cls.parse_split_percentages(split)
 
         train_end = train_percentage
         valid_end = train_percentage + valid_percentage

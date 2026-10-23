@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from math import lcm
 from typing import Any
 
 import torch
@@ -30,7 +29,6 @@ from hyper_parallel.data.batching.runtime_input import (
     RuntimeInputAdapter,
 )
 from hyper_parallel.data.constants import (
-    OMNI_CP_PAD_VALUES,
     OMNI_CP_TOKEN_FIELDS,
     OMNI_INTERNAL_FIELDS,
     OMNI_LOSS_INPUT_FIELDS,
@@ -47,7 +45,7 @@ logger = get_dataset_logger(__name__)
 
 
 class OmniParallelBatch:
-    """Shard Omni token fields over CP and replicate modality fields over TP."""
+    """Validate collate-aligned Omni batches, shard over CP, and broadcast over TP."""
 
     def __init__(
             self,
@@ -67,10 +65,15 @@ class OmniParallelBatch:
             runtime_input_adapter: Provider of additional forward inputs.
             data_config: Dataset cache settings used by DataLoader ownership.
         """
+        # if encoder_dp:
+        #     raise NotImplementedError("OmniParallelBatch encoder_dp image-bucket distribution is not implemented")
+
         if runtime_input_adapter is not None and not isinstance(runtime_input_adapter, RuntimeInputAdapter):
             raise TypeError("OmniParallelBatch runtime_input_adapter must be a RuntimeInputAdapter")
+
         if int(getattr(mesh_context, "pp_size", 1)) != 1 or pp_shared_data:
             raise NotImplementedError("OmniParallelBatch does not support pipeline parallelism or pp_shared_data")
+
         source_config = data_config or {}
         self.parallel_context = create_dataloader_parallel_context(
             mesh_context,
@@ -81,18 +84,13 @@ class OmniParallelBatch:
                 int(getattr(mesh_context, "tp_size", 1)) > 1 or int(getattr(mesh_context, "cp_size", 1)) > 1
         ):
             raise ValueError("OmniParallelBatch requires an initialized process group for TP or CP")
+
         self.device = device
         self.sequence_parallel = bool(mesh_context.sequence_parallel)
         self.runtime_input_adapter = runtime_input_adapter
-        token_pad_values = {field: OMNI_CP_PAD_VALUES.get(field, 0) for field in OMNI_CP_TOKEN_FIELDS}
-        cp_size = int(mesh_context.cp_size)
-        tp_parts = int(mesh_context.tp_size) if mesh_context.sequence_parallel else 1
-        alignment = lcm(2 * cp_size, cp_size * tp_parts)
-        self.cp_sharder = CPBatchSharder(
-            self.parallel_context, token_pad_values=token_pad_values,
-            required_global_alignment=alignment,
-        )
+        self.cp_sharder = CPBatchSharder(self.parallel_context, token_fields=OMNI_CP_TOKEN_FIELDS)
         self.tp_broadcaster = TPBatchBroadcaster(self.parallel_context, device)
+        self._batch_index = 0
 
     def __call__(
             self,
@@ -101,18 +99,34 @@ class OmniParallelBatch:
             external_batch: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Read on TP0, slice token fields for CP, then broadcast within TP."""
+        self._batch_index += 1
         local_batch = None
         if self.parallel_context.build_on_rank():
+            logger.debug("Omni get_batch: batch=%d source_read_begin", self._batch_index, enabled=True)
             source_batch = external_batch if external_batch is not None else next(data_iterator)
             if not isinstance(source_batch, Mapping):
                 raise TypeError("Omni DataLoader must yield a mapping batch")
+
             normalized_batch = self._normalize_source_batch(source_batch)
             local_batch = self.cp_sharder.shard(normalized_batch)
+            logger.debug(
+                "Omni get_batch: batch=%d source_ready global_shape=%s local_shape=%s tp=%d cp=%d cp_rank=%d",
+                self._batch_index, tuple(normalized_batch["input_ids"].shape),
+                tuple(local_batch["input_ids"].shape), self.parallel_context.tp_world_size,
+                self.parallel_context.cp_world_size, self.parallel_context.cp_rank, enabled=True,
+            )
 
         device_batch = self.tp_broadcaster.broadcast(local_batch, broadcast_all_fields=True)
         runtime_inputs = self._build_runtime_inputs(device_batch)
         model_inputs, loss_inputs = self._split_model_and_loss_inputs(device_batch)
         model_inputs.update(runtime_inputs)
+        # Shapes are host metadata; inspecting device tensor values here can stall collectives.
+        logger.debug(
+            "Omni get_batch: batch=%d transport_ready fields=%s runtime_fields=%s",
+            self._batch_index,
+            {field: tuple(value.shape) for field, value in device_batch.items() if torch.is_tensor(value)},
+            list(runtime_inputs), enabled=True,
+        )
 
         return model_inputs, loss_inputs
 
@@ -122,8 +136,10 @@ class OmniParallelBatch:
         batch = dict(source_batch)
         if "input_ids" not in batch:
             raise ValueError("Omni batch must contain input_ids")
+
         if "labels" not in batch:
             raise ValueError("Omni batch must contain labels")
+
         if "loss_mask" not in batch:
             batch["loss_mask"] = batch["labels"] >= 0
         if "cu_seq_lens" in batch:
@@ -134,6 +150,7 @@ class OmniParallelBatch:
         """Call the configured model hook after TP/CP batch transport."""
         if self.runtime_input_adapter is None:
             return {}
+
         runtime_inputs = self.runtime_input_adapter.build(
             batch=batch, parallel_context=self.parallel_context,
             options={"sequence_parallel": self.sequence_parallel},
@@ -144,6 +161,7 @@ class OmniParallelBatch:
                 "runtime inputs cannot replace Omni model inputs: "
                 f"{sorted(collisions)}"
             )
+
         return runtime_inputs
 
     @staticmethod
@@ -220,6 +238,7 @@ class TextParallelBatch:
                 runtime_input_adapter, RuntimeInputAdapter
         ):
             raise TypeError("TextParallelBatch runtime_input_adapter must be a RuntimeInputAdapter")
+
         self.runtime_input_adapter = runtime_input_adapter
         self._batch_flow_logged = False
 
@@ -322,6 +341,7 @@ class TextParallelBatch:
                 "model runtime inputs cannot replace common attention inputs: "
                 f"{sorted(collisions)}"
             )
+
         runtime_inputs.update(model_runtime_inputs)
         return runtime_inputs
 
@@ -463,6 +483,7 @@ class TextParallelBatch:
                 "runtime inputs cannot replace framework-owned model inputs: "
                 f"{sorted(collisions)}"
             )
+
         model_inputs.update(runtime_inputs)
 
         loss_inputs = {

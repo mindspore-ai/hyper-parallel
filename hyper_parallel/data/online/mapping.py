@@ -20,6 +20,7 @@ import glob
 import json
 import os
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import ExitStack
 from typing import Any
 
 import numpy as np
@@ -113,6 +114,10 @@ class MappingTransformDataset:
 
         raw_sample = self.source_dataset[index]
         transformed_samples = self.transform(raw_sample)
+        logger.debug(
+            "Online sample source_index=%s sample_id=%s", index, raw_sample.get("id"),
+            enabled=True,
+        )
         if not isinstance(transformed_samples, list):
             raise TypeError("Online Mapping sample transform must return a list")
 
@@ -145,6 +150,7 @@ class _JsonlMappingSource:
         self._record_start = 0
         self._record_end = 0
         self._file_handles: dict[str, Any] = {}
+        self._file_stack = ExitStack()
         self._reader_process_id = os.getpid()
 
         for data_file in data_files:
@@ -187,7 +193,11 @@ class _JsonlMappingSource:
         for percentage, (split_start, split_end) in zip(percentages, split_ranges):
             split_source = None
             if percentage > 0:
-                split_source = self._create_view(split_start, split_end)
+                split_source = self._create_view(
+                    self._record_locations,
+                    self._record_start + split_start,
+                    self._record_start + split_end,
+                )
             split_sources.append(split_source)
         jsonl_splits = (split_sources[0], split_sources[1], split_sources[2])
         return jsonl_splits
@@ -196,6 +206,7 @@ class _JsonlMappingSource:
         """Exclude process-local file handles when DataLoader workers pickle the source."""
         source_state = dict(self.__dict__)
         source_state["_file_handles"] = {}
+        source_state["_file_stack"] = ExitStack()
         source_state["_reader_process_id"] = None
         return source_state
 
@@ -219,13 +230,17 @@ class _JsonlMappingSource:
                         continue
                 self._record_locations.append((data_file, byte_offset))
 
-    def _create_view(self, start: int, end: int) -> _JsonlMappingSource:
-        """Create a zero-copy view that shares this source's record locations."""
-        split_source = self.__class__.__new__(self.__class__)
-        split_source._record_locations = self._record_locations
-        split_source._record_start = self._record_start + start
-        split_source._record_end = self._record_start + end
+    @classmethod
+    def _create_view(
+        cls, record_locations: list[tuple[str, int]], start: int, end: int,
+    ) -> _JsonlMappingSource:
+        """Create a zero-copy view over indexed records with independent readers."""
+        split_source = cls.__new__(cls)
+        split_source._record_locations = record_locations
+        split_source._record_start = start
+        split_source._record_end = end
         split_source._file_handles = {}
+        split_source._file_stack = ExitStack()
         split_source._reader_process_id = os.getpid()
         return split_source
 
@@ -238,14 +253,14 @@ class _JsonlMappingSource:
 
         file_handle = self._file_handles.get(data_file)
         if file_handle is None:
-            file_handle = open(data_file, "rb")
+            file_handle = self._file_stack.enter_context(open(data_file, "rb"))
             self._file_handles[data_file] = file_handle
         return file_handle
 
     def _close_file_handles(self) -> None:
         """Close readers inherited from another process or opened locally."""
-        for file_handle in self._file_handles.values():
-            file_handle.close()
+        self._file_stack.close()
+        self._file_stack = ExitStack()
         self._file_handles = {}
 
     @staticmethod
@@ -456,7 +471,7 @@ class _OnlineMappingSourceBuilder(_OnlineSourceBuilder):
             if jsonl_files is not None:
                 jsonl_source = _JsonlMappingSource(jsonl_files, sample_filter)
                 if split_config is not None:
-                    split_percentages = source_loader._parse_split_percentages(split_config)
+                    split_percentages = source_loader.parse_split_percentages(split_config)
                     jsonl_splits = jsonl_source.split_by_percentages(split_percentages)
                     return jsonl_splits
                 return jsonl_source

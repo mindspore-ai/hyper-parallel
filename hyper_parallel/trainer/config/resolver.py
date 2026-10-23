@@ -44,8 +44,8 @@ from hyper_parallel.trainer.config.target import Target
 from hyper_parallel.trainer.config.trainer import TrainerConfig
 
 
-_NONE_TYPE = types.NoneType  # pylint: disable=no-member
-_UNION_TYPE = types.UnionType  # pylint: disable=no-member
+_NONE_TYPE: type = types.NoneType  # pylint: disable=no-member
+_UNION_TYPE: type = types.UnionType  # pylint: disable=no-member
 
 
 class ConfigResolutionError(ValueError):
@@ -632,7 +632,8 @@ def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
 
     target_node = dict(node)
     if "dataloader_type" in target_node:
-        raise ConfigResolutionError(f"{path}.dataloader_type", "renamed to sampler_type")
+        raise _fail(f"{path}.dataloader_type", "renamed to sampler_type")
+
     if "batch_adapter" in target_node:
         raise ConfigResolutionError(
             f"{path}.batch_adapter",
@@ -640,6 +641,7 @@ def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
             "sample/batch encoding and dataloader.get_batch.runtime_input_adapter "
             "for model-owned forward metadata",
         )
+
     collate_node = target_node.pop("collate_fn", None)
     get_batch_node = target_node.pop("get_batch", None)
     sampler_type = normalize_value(
@@ -688,6 +690,10 @@ def _resolve_dataset_config(node: object, *, path: str) -> DatasetConfig:
     target_node = dict(node)
     model_assets_node = target_node.pop("model_assets", {})
     data_transform_node = target_node.pop("data_transform", None)
+    training_mode_node = target_node.pop("training_mode", None)
+    training_mode = None if training_mode_node is None else normalize_value(
+        training_mode_node, Literal["sft", "pretrain"], path=f"{path}.training_mode"
+    )
     target = _resolve_target(target_node, path=path)
     if isinstance(model_assets_node, Mapping) and "_target_" in model_assets_node:
         model_assets = _resolve_target(
@@ -712,6 +718,7 @@ def _resolve_dataset_config(node: object, *, path: str) -> DatasetConfig:
         target=target,
         model_assets=model_assets,
         data_transform=data_transform,
+        training_mode=training_mode,
     )
     return dataset_config
 

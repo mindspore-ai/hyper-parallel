@@ -722,6 +722,12 @@ position >= assistant_start and token_types == TEXT
 每个样本局部的 `image_token_starts` 加上 packed sequence offset。`cu_seq_lens` 保存样本边界，用于隔离
 packed attention。
 
+collator 可以通过 `dataloader.collate_fn.pad_to_length: 1024` 把 packing 后的全局 token 长度固定为
+1024；默认 `null` 仅按 TP × CP 对齐。目标必须是 TP × CP 的整数倍，packed 长度超过目标时报错。
+padding 的 labels 为 `-100`，并作为独立尾段追加到 `cu_seq_lens`；图片 patch、grid 和图片起点保持不变。
+`max_seq_len` 控制单样本过滤，`token_budget` 控制 packing 选择，三者相互独立。配置及 CP 切片示例见
+[固定 packing 后的输入长度](omni_online_data_guide.md#固定-packing-后的输入长度)。
+
 `encode_batch()` 再把通用图片元数据转换成 DeepSeek-V4.1 forward 所需字段：
 
 ```python

@@ -39,6 +39,7 @@ class DatasetConfig:
     target: Target[Any]
     model_assets: Union[ModelAssetsConfig, Target[Any]] = field(default_factory=ModelAssetsConfig)
     data_transform: Optional[Target[Any]] = None
+    training_mode: Optional[Literal["sft", "pretrain"]] = None
 
     def build(self, **runtime_kwargs: Any) -> Any:
         """Build the Dataset target with runtime Trainer arguments."""
@@ -54,6 +55,8 @@ class DatasetConfig:
         config = self.target.to_dict()
         config["model_assets"] = _serialize_config_value(self.model_assets)
         config["data_transform"] = _serialize_config_value(self.data_transform)
+        if self.training_mode is not None:
+            config["training_mode"] = self.training_mode
         return config
 
 
