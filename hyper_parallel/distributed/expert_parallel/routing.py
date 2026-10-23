@@ -88,9 +88,7 @@ def _softmax_topk_router(module, hidden_states):
 
 
 def _topk_router_module(module, hidden_states):
-    """Qwen2/Qwen3/Mixtral adapter: gate is a TopKRouter module (after the HF 2025
-    refactor); forward directly returns (logits, scores [T,K], indices [T,K])
-    -- take the latter two."""
+    """Adapt both tuple-returning TopKRouter and legacy linear gate modules."""
     gate = getattr(module, "gate", None)
     if gate is None:
         gate = getattr(module, "router", None)
@@ -98,9 +96,25 @@ def _topk_router_module(module, hidden_states):
     if isinstance(out, (tuple, list)) and len(out) == 3:
         _, scores, indices = out
         return indices, scores
+    if isinstance(out, torch.Tensor):
+        logits = out.reshape(-1, out.shape[-1])
+        config = getattr(module, "config", None)
+        top_k = (getattr(module, "top_k", None)
+                 or getattr(config, "num_experts_per_tok", None)
+                 or getattr(config, "top_k", None))
+        if top_k is None:
+            raise ValueError(f"{type(module).__name__}: linear router requires top_k")
+        weights = torch.softmax(logits, dim=-1, dtype=torch.float32)
+        scores, indices = weights.topk(int(top_k), dim=-1)
+        norm_topk_prob = getattr(module, "norm_topk_prob", None)
+        if norm_topk_prob is None:
+            norm_topk_prob = getattr(config, "norm_topk_prob", True)
+        if norm_topk_prob:
+            scores = scores / scores.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+        return indices, scores.to(hidden_states.dtype)
     raise TypeError(
-        f"{type(module).__name__}: TopKRouter should return (logits, scores, indices), "
-        f"got {type(out).__name__} -- use the default adapter or register a custom adapter"
+        f"{type(module).__name__}: router should return a Tensor or "
+        f"(logits, scores, indices), got {type(out).__name__}"
     )
 
 

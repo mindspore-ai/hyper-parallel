@@ -23,7 +23,7 @@ Split from ``auto_models/trainer/config.py`` in stage 7 (05 §15.2.5).
 import importlib
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from types import MappingProxyType
 from typing import Any, List, Literal, Optional, Union
 
@@ -35,12 +35,14 @@ from hyper_parallel.components.quantization.config import (
 )
 from hyper_parallel.distributed.encoder_parallel.config import EncoderParallelConfig
 from hyper_parallel.models.replacement import (
+    MethodReplacementSpec,
     ModuleReplacementFactory,
     ModuleReplacementSpec,
+    method_replacement,
     module_replacement,
 )
 
-from hyper_parallel.trainer.config.target import Target
+from hyper_parallel.trainer.config.target import Target, _serialize_config_value
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +166,61 @@ class ActivationCheckpointConfig:
                 "activation_checkpoint.allow_cache_entry_mutation must be a bool")
 
 
+def _resolve_replace_implementation(value: Union[str, Target[Any]]) -> Target[Any]:
+    """Resolve a replacement implementation without invoking its callable."""
+    if isinstance(value, Target):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        raise TypeError("replace.implementation must be a non-empty import path or Target")
+    parts = value.split(".")
+    for split_at in range(len(parts), 0, -1):
+        module_name = ".".join(parts[:split_at])
+        try:
+            symbol = importlib.import_module(module_name)
+        except ModuleNotFoundError as exc:
+            if exc.name == module_name or module_name.startswith(f"{exc.name}."):
+                continue
+            raise ValueError(f"replace.implementation {value!r} failed while importing {exc.name!r}") from exc
+        except ImportError as exc:
+            raise ValueError(f"replace.implementation {value!r} failed while importing: {exc}") from exc
+        for attribute in parts[split_at:]:
+            if not hasattr(symbol, attribute):
+                raise ValueError(f"replace.implementation {value!r} has no attribute {attribute!r}")
+            symbol = getattr(symbol, attribute)
+        if not callable(symbol):
+            raise TypeError(f"replace.implementation {value!r} must name a callable")
+        return Target(symbol, target_path=value)
+    raise ValueError(f"replace.implementation {value!r} could not be imported")
+
+
+@dataclass(frozen=True)
+class ReplaceAction:
+    """One public module or method replacement declaration."""
+
+    kind: Literal["module", "method"]
+    implementation: Union[str, Target[Any]]
+    source_type: Optional[str] = None
+    exact_type: bool = False
+
+    def __post_init__(self) -> None:
+        """Validate kind-specific fields and normalize the delayed target."""
+        if self.kind not in ("module", "method"):
+            raise ValueError("replace.kind must be 'module' or 'method'")
+        if not isinstance(self.exact_type, bool):
+            raise TypeError("replace.exact_type must be a bool")
+        if self.kind == "module":
+            if self.source_type is not None and (
+                    not isinstance(self.source_type, str) or not self.source_type.strip()):
+                raise ValueError("replace.source_type must be a non-empty import path when provided")
+            if self.exact_type and self.source_type is None:
+                raise ValueError("replace.exact_type requires replace.source_type")
+        elif self.source_type is not None or self.exact_type:
+            raise ValueError("replace.source_type and replace.exact_type are only valid for kind='module'")
+        object.__setattr__(
+            self, "implementation", _resolve_replace_implementation(self.implementation)
+        )
+
+
 @dataclass
 class PlanOverride:
     """One plan_overrides entry (YAML ``plan_overrides`` list item).
@@ -178,6 +235,14 @@ class PlanOverride:
     ``instantiate_infrastructure`` BEFORE planner construction.
 
     Fields:
+        replace: public replacement action. ``kind='module'`` requires a
+            decorated module factory at ``implementation``; optional
+            ``source_type`` checks the expected source module type;
+            ``kind='method'`` selects a literal method suffix in ``match``;
+            ``.forward`` uses the existing boundary executor and defaults to
+            ``region_dispatch=False``, while other methods use a decorated
+            ``@method_replacement`` factory before sharding. Legacy replacement
+            fields below remain accepted for compatibility.
         module_type: importable source ``nn.Module`` type required by
             ``replace_module``. The symbol is resolved but never constructed.
         exact_type: replacement type check mode. Defaults to subclass matching.
@@ -185,7 +250,8 @@ class PlanOverride:
             It receives ``module``, ``module_fqn``, and a read-only context,
             and must return a structure-preserving replacement. A list
             ``match`` is supported only for replacement-only entries.
-        match: fqn or fqn glob. Globs first merge matching planner boundaries;
+        match: module FQN/glob, or module glob plus a literal method suffix for
+            ``kind='method'``. Boundary globs first merge matching planner boundaries;
             a glob with a concrete params/I/O contract also expands against
             the final model's ``named_modules`` and creates missing boundaries.
             A merge-only glob fails if it matches a real module that has no
@@ -274,6 +340,7 @@ class PlanOverride:
     """
 
     match: Union[str, List[str]]
+    replace: Optional[ReplaceAction] = None
     when: Optional[Literal[
         "cp", "ep", "sequence_parallel", "low_precision"
     ]] = None
@@ -297,6 +364,102 @@ class PlanOverride:
     # insert mode rejects them)
     _CONTRACT_FIELDS = ("params", "in_src", "in_dst", "out_src", "out_dst")
 
+    def __post_init__(self) -> None:
+        """Lower the public replace action to the existing private execution fields."""
+        if self.replace is None:
+            return
+        if not isinstance(self.replace, ReplaceAction):
+            raise TypeError("plan_overrides.replace must be a ReplaceAction")
+        legacy = (
+            "module_type", "replace_module", "local_compute_fn",
+            "inner_target", "inner_wrapper", "inner_out_src",
+        )
+        mixed = [name for name in legacy if getattr(self, name) is not None]
+        if self.exact_type:
+            mixed.append("exact_type")
+        if mixed:
+            raise ValueError(
+                f"plan_overrides match={self.match!r}: replace cannot be mixed with legacy fields {mixed}"
+            )
+        if self.replace.kind == "module":
+            if self.when not in (None, "low_precision"):
+                raise ValueError("kind='module' only supports when='low_precision'")
+            if self.region_dispatch is not None:
+                raise ValueError("region_dispatch cannot appear with kind='module'")
+            if any(getattr(self, name) is not None for name in (
+                    "params", "in_src", "in_dst", "out_src", "out_dst", "tp_divide_attrs")):
+                raise ValueError("kind='module' must use its own plan_overrides rule")
+            self.module_type = self.replace.source_type
+            self.exact_type = self.replace.exact_type
+            self.replace_module = self.replace.implementation
+            return
+        if isinstance(self.match, list):
+            raise ValueError(f"kind={self.replace.kind!r} requires one string match per rule")
+        if self.low_precision_dtype_scheme is not None:
+            raise ValueError("low_precision_dtype_scheme is only valid for kind='module'")
+        if not isinstance(self.match, str):
+            raise TypeError("kind='method' match must be a string")
+        owner_pattern, separator, method_name = self.match.rpartition(".")
+        if (not separator or not owner_pattern or not method_name.isidentifier()
+                or (method_name.startswith("__") and method_name.endswith("__"))):
+            raise ValueError("kind='method' match must end in a literal method name")
+        if method_name != "forward":
+            if self.region_dispatch is not None or any(getattr(self, name) is not None for name in (
+                    "params", "in_src", "in_dst", "out_src", "out_dst", "tp_divide_attrs")):
+                raise ValueError("kind='method' on a non-forward method cannot declare a boundary contract")
+            if not getattr(self.replace.implementation.callable, "_hp_method_replacement", False):
+                raise TypeError("kind='method' implementation must use @method_replacement")
+            return
+        self.region_dispatch = False if self.region_dispatch is None else self.region_dispatch
+        if not isinstance(self.region_dispatch, bool):
+            raise TypeError("region_dispatch must be a bool")
+        implementation = self.replace.implementation
+        meta = getattr(implementation.callable, "_injection_meta", None)
+        if meta is None:
+            raise TypeError(
+                "kind='method' on forward implementation must use @forward_replacement, "
+                "@local_compute, or legacy @inner_wrapper"
+            )
+        if meta.kind == "local_compute":
+            self.local_compute_fn = implementation
+        elif meta.kind == "inner_wrapper":
+            # The new .forward syntax uses the same DTensor-aware adapter as legacy inner_wrapper.
+            self.inner_target = "self"
+            self.inner_wrapper = implementation
+        else:
+            raise TypeError(f"unsupported forward target metadata kind {meta.kind!r}")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the public declaration, hiding private lowered fields."""
+        if self.replace is None:
+            return {
+                config_field.name: _serialize_config_value(getattr(self, config_field.name))
+                for config_field in fields(self) if config_field.name != "replace"
+            }
+        result: dict[str, Any] = {"match": self.match}
+        if self.when is not None:
+            result["when"] = self.when
+        if self.low_precision_dtype_scheme is not None:
+            result["low_precision_dtype_scheme"] = self.low_precision_dtype_scheme
+        implementation_config = _serialize_config_value(self.replace.implementation)
+        implementation_value = (
+            implementation_config["_target_"]
+            if isinstance(implementation_config, dict) and set(implementation_config) == {"_target_"}
+            else implementation_config
+        )
+        action = {"kind": self.replace.kind, "implementation": implementation_value}
+        if self.replace.kind == "module":
+            if self.replace.source_type is not None:
+                action["source_type"] = self.replace.source_type
+            if self.replace.exact_type:
+                action["exact_type"] = True
+        result["replace"] = action
+        for name in ("region_dispatch", "params", "in_src", "in_dst", "out_src", "out_dst", "tp_divide_attrs"):
+            value = getattr(self, name)
+            if value is not None and not (name == "region_dispatch" and value is False):
+                result[name] = _serialize_config_value(value)
+        return result
+
     def to_override(self) -> "tuple[str, Any]":
         """Desugar to a ``(match, ModuleShardingSpec)`` plan_overrides entry.
 
@@ -312,6 +475,10 @@ class PlanOverride:
         from hyper_parallel.distributed.recipe_spec import (
             ModuleShardingSpec,
         )
+
+        if self.replace is not None and self.replace.kind == "method" and (
+                self.match.rpartition(".")[2] != "forward"):
+            raise ValueError("non-forward method replacements do not create planner boundaries")
 
         if not self.match:
             raise ValueError(
@@ -330,7 +497,12 @@ class PlanOverride:
             if raw is None:
                 continue
             setattr(spec, attr, self._parse_contract_field(attr, raw))
-        return self.match, spec
+        match = (
+            self.match.rpartition(".")[0]
+            if self.replace is not None and self.replace.kind == "method"
+            else self.match
+        )
+        return match, spec
 
     def _validate_tp_divide_attrs(self) -> Optional[List[str]]:
         """Validate the YAML transport shape for TP-local attributes."""
@@ -419,11 +591,11 @@ class PlanOverride:
 _WHEN_CONDITIONS = ("cp", "ep", "sequence_parallel", "low_precision")
 
 
-def _import_module_type(path: str) -> type:
+def _import_module_type(path: str, *, field_name: str = "module_type") -> type[nn.Module]:
     """Import the source module type named by a replacement YAML entry."""
 
-    if not isinstance(path, str) or not path:
-        raise ValueError("plan_overrides.module_type must be a non-empty symbol path")
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError(f"plan_overrides.{field_name} must be a non-empty symbol path")
     parts = path.split(".")
     for split_at in range(len(parts), 0, -1):
         module_name = ".".join(parts[:split_at])
@@ -433,22 +605,22 @@ def _import_module_type(path: str) -> type:
             if exc.name == module_name or module_name.startswith(f"{exc.name}."):
                 continue
             raise ValueError(
-                f"plan_overrides.module_type {path!r} failed while importing {exc.name!r}"
+                f"plan_overrides.{field_name} {path!r} failed while importing {exc.name!r}"
             ) from exc
         except ImportError as exc:
             raise ValueError(
-                f"plan_overrides.module_type {path!r} failed while importing: {exc}"
+                f"plan_overrides.{field_name} {path!r} failed while importing: {exc}"
             ) from exc
         for attribute in parts[split_at:]:
             if not hasattr(symbol, attribute):
                 raise ValueError(
-                    f"plan_overrides.module_type {path!r} has no attribute {attribute!r}"
+                    f"plan_overrides.{field_name} {path!r} has no attribute {attribute!r}"
                 )
             symbol = getattr(symbol, attribute)
-        if not isinstance(symbol, type):
-            raise TypeError(f"plan_overrides.module_type {path!r} must name a type")
+        if not isinstance(symbol, type) or not issubclass(symbol, nn.Module):
+            raise TypeError(f"plan_overrides.{field_name} {path!r} must name an nn.Module type")
         return symbol
-    raise ValueError(f"plan_overrides.module_type {path!r} could not be imported")
+    raise ValueError(f"plan_overrides.{field_name} {path!r} could not be imported")
 
 
 def _target_replacement_factory(
@@ -457,10 +629,9 @@ def _target_replacement_factory(
 ) -> ModuleReplacementFactory:
     """Bind a YAML Target's static args to the replacement factory protocol."""
 
-    if not getattr(target._target_, "_hp_module_replacement", False):  # pylint: disable=protected-access
+    if not getattr(target.callable, "_hp_module_replacement", False):
         raise TypeError(
-            "plan_overrides replace_module target must be decorated with "
-            "@module_replacement"
+            "plan_overrides replace.implementation for kind='module' must use @module_replacement"
         )
 
     @module_replacement
@@ -478,6 +649,62 @@ def _target_replacement_factory(
         return target.build(module=module, module_fqn=module_fqn, context=context)
 
     return factory
+
+
+def _target_method_factory(target: Target[Any]):
+    """Bind YAML static arguments to the method replacement factory protocol."""
+    if not getattr(target.callable, "_hp_method_replacement", False):
+        raise TypeError("plan_overrides replace.implementation for kind='method' must use @method_replacement")
+
+    @method_replacement
+    def factory(*, module: nn.Module, method_fqn: str, original_method: Any, context: Mapping[str, Any]):
+        """Build one replacement callable from the configured target."""
+        return target.build(
+            module=module, method_fqn=method_fqn, original_method=original_method, context=context,
+        )
+
+    return factory
+
+
+def entries_to_method_replacements(
+    entries: List[PlanOverride], *, cp_size: int = 1, ep_size: int = 1,
+    sequence_parallel: bool = False, low_precision_enabled: bool = False,
+) -> tuple[MethodReplacementSpec, ...]:
+    """Resolve active non-forward method actions into executable rules.
+
+    Args:
+        entries: Trainer plan override declarations.
+        cp_size: Active context parallel degree.
+        ep_size: Active expert parallel degree.
+        sequence_parallel: Whether sequence parallelism is active.
+        low_precision_enabled: Whether online low precision is enabled.
+
+    Returns:
+        Rules applied after module replacement and before sharding.
+    """
+    rules = []
+    for entry in entries:
+        if entry.replace is None or entry.replace.kind != "method":
+            continue
+        if entry.match.rpartition(".")[2] == "forward":
+            continue
+        _validate_when(entry)
+        active = {
+            None: True,
+            "cp": cp_size > 1,
+            "ep": ep_size > 1,
+            "sequence_parallel": sequence_parallel,
+            "low_precision": low_precision_enabled,
+        }[entry.when]
+        if active:
+            rules.append(MethodReplacementSpec(
+                match=entry.match,
+                factory=_target_method_factory(entry.replace.implementation),
+            ))
+        else:
+            logger.info("plan_overrides: match=%r skipped because condition %r is inactive",
+                        entry.match, entry.when)
+    return tuple(rules)
 
 
 def entries_to_module_replacements(
@@ -506,11 +733,15 @@ def entries_to_module_replacements(
         policy = None
         if entry.when == "low_precision" and effective_config is not None:
             policy = effective_config.resolve_dtype_scheme(entry.low_precision_dtype_scheme)
+        field_name = "replace.source_type" if entry.replace is not None else "module_type"
         rules.append(
             ModuleReplacementSpec(
                 match=patterns,
                 factory=_target_replacement_factory(entry.replace_module, policy),
-                module_type=_import_module_type(entry.module_type),
+                module_type=(
+                    _import_module_type(entry.module_type, field_name=field_name)
+                    if entry.module_type is not None else None
+                ),
                 exact_type=entry.exact_type,
             )
         )
@@ -519,9 +750,10 @@ def entries_to_module_replacements(
 
 def _validate_replacement_entry(entry: PlanOverride, effective_config: Optional[LowPrecisionConfig]) -> None:
     """Validate one replacement before constructing its planner rule."""
+    label = "replace.kind='module'" if entry.replace is not None else "replace_module"
     if entry.when not in (None, "low_precision"):
         raise ValueError(
-            f"plan_overrides match={entry.match!r} uses replace_module and "
+            f"plan_overrides match={entry.match!r} uses {label} and "
             "does not support 'when' values other than 'low_precision' "
             "(module replacements are not conditioned on parallel topology)"
         )
@@ -543,13 +775,14 @@ def _validate_replacement_entry(entry: PlanOverride, effective_config: Optional[
             f"plan_overrides match={entry.match!r} enables a low-precision "
             "replacement but training.low_precision is missing"
         )
-    if entry.module_type is None:
+    if entry.module_type is None and entry.replace is None:
         raise ValueError(
-            f"plan_overrides match={entry.match!r} uses replace_module but omits module_type"
+            f"plan_overrides match={entry.match!r} uses {label} but omits module_type"
         )
     if not isinstance(entry.replace_module, Target):
+        field_name = "replace.implementation" if entry.replace is not None else "replace_module"
         raise TypeError(
-            f"plan_overrides match={entry.match!r} replace_module must be a YAML Target"
+            f"plan_overrides match={entry.match!r} {field_name} must be a YAML Target"
         )
 
 
@@ -596,19 +829,25 @@ def entries_to_plan_overrides(
     """
     overrides: dict[str, Any] = {}
     for entry in entries:
+        if entry.replace is not None and entry.replace.kind == "method" and (
+                entry.match.rpartition(".")[2] != "forward"):
+            _validate_when(entry)
+            continue
         if isinstance(entry.match, list) and (
             entry.replace_module is None or _has_sharding_action(entry)
         ):
+            replacement_name = "replace.kind='module'" if entry.replace is not None else "replace_module"
             raise ValueError(
-                "plan_overrides match lists are supported only for replace_module "
+                f"plan_overrides match lists are supported only for {replacement_name} "
                 "entries; use separate string matches for sharding actions"
             )
         if entry.replace_module is not None and entry.when not in (
             None,
             "low_precision",
         ):
+            replacement_name = "replace.kind='module'" if entry.replace is not None else "replace_module"
             raise ValueError(
-                f"plan_overrides match={entry.match!r} uses replace_module and "
+                f"plan_overrides match={entry.match!r} uses {replacement_name} and "
                 "does not support 'when' values other than 'low_precision' "
                 "(module replacements are not conditioned on parallel topology)"
             )
@@ -681,6 +920,13 @@ def normalize_distributed_setup_overrides(
         entries,
         low_precision_enabled=low_precision_enabled,
         low_precision_config=getattr(distributed_setup, "low_precision_config", None),
+    )
+    distributed_setup.method_replacements = entries_to_method_replacements(
+        entries,
+        cp_size=getattr(mesh_context, "cp_size", 1),
+        ep_size=getattr(mesh_context, "ep_size", 1),
+        sequence_parallel=getattr(mesh_context, "sequence_parallel", False),
+        low_precision_enabled=low_precision_enabled,
     )
     distributed_setup.plan_overrides = (
         entries_to_plan_overrides(

@@ -44,7 +44,7 @@ if ! "${PYTHON_BIN}" -c \
     echo "The selected Python cannot import this HyperParallel checkout and " \
         "Transformers DeepSeek-V4." >&2
     echo "Transformers DeepSeek-V4 support is unavailable." >&2
-    echo "Prepare the shell with docs/guide/trainer/current_hf_model_environment.md" >&2
+    echo "Install this repository's requirements.txt (including Transformers >= 5.11.0)." >&2
     exit 1
 fi
 case "${MODE}" in

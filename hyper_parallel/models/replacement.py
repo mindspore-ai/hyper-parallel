@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import fnmatch
 import inspect
+import logging
 import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -34,6 +35,8 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
 
 
 ModuleReplacementFactory = Callable[..., nn.Module]
+MethodReplacementFactory = Callable[..., Callable[..., Any]]
+logger = logging.getLogger(__name__)
 
 
 def module_replacement(factory: ModuleReplacementFactory) -> ModuleReplacementFactory:
@@ -55,20 +58,125 @@ def module_replacement(factory: ModuleReplacementFactory) -> ModuleReplacementFa
     return factory
 
 
+def method_replacement(factory: MethodReplacementFactory) -> MethodReplacementFactory:
+    """Declare a factory that replaces one bound module method.
+
+    The factory receives the owning module, the full method FQN, the original
+    bound method, and a read-only build context. It returns a callable whose
+    arguments are the same as calls to the original bound method.
+    """
+    signature = inspect.signature(factory)
+    required = {"module", "method_fqn", "original_method", "context"}
+    missing = required - set(signature.parameters)
+    if missing:
+        raise TypeError(f"method replacement factory {factory!r} must declare {sorted(missing)}")
+    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
+        raise TypeError("method replacement factories must not declare **kwargs")
+    factory._hp_method_replacement = True  # type: ignore[attr-defined]  # pylint: disable=protected-access
+    return factory
+
+
+@dataclass(frozen=True)
+class MethodReplacementSpec:
+    """One rule selecting a named method on matching module instances."""
+
+    match: str
+    factory: MethodReplacementFactory
+
+    def __post_init__(self) -> None:
+        owner_pattern, separator, method_name = self.match.rpartition(".")
+        if (not separator or not owner_pattern or not method_name.isidentifier()
+                or (method_name.startswith("__") and method_name.endswith("__"))):
+            raise ValueError("method replacement match must end in a literal method name")
+        if method_name == "forward":
+            raise ValueError("forward replacements belong to the sharding planner")
+        if not callable(self.factory) or not getattr(self.factory, "_hp_method_replacement", False):
+            raise TypeError("method replacement factory must use @method_replacement")
+
+
+def _compile_method_replacements(model: nn.Module, specs: Iterable[MethodReplacementSpec]) -> tuple:
+    """Resolve method patterns against the finalized module tree before mutation."""
+    selected = {}
+    aliases = _all_module_aliases(model)
+    for spec in specs:
+        owner_pattern, _, method_name = spec.match.rpartition(".")
+        matched = False
+        for module_id, (module, fqns) in aliases.items():
+            matched_fqns = tuple(fqn for fqn in fqns if fnmatch.fnmatchcase(fqn, owner_pattern))
+            if not matched_fqns:
+                continue
+            matched = True
+            if (method_name in module._modules or method_name in module._parameters  # pylint: disable=protected-access
+                    or method_name in module._buffers):  # pylint: disable=protected-access
+                raise TypeError(f"method replacement {spec.match!r} selected a registered module or tensor")
+            original = getattr(module, method_name, None)
+            if not callable(original):
+                raise ValueError(f"method replacement {spec.match!r} selected {matched_fqns[0]!r} without a callable "
+                                 f"{method_name!r} method")
+            key = (module_id, method_name)
+            previous = selected.get(key)
+            if previous is not None:
+                if previous[3] is not spec:
+                    raise ValueError(f"method replacement conflict for {matched_fqns[0]}.{method_name}")
+                continue
+            method_fqns = tuple(f"{fqn}.{method_name}" for fqn in matched_fqns)
+            selected[key] = (module, method_fqns, original, spec)
+        if not matched:
+            raise ValueError(f"method replacement pattern {spec.match!r} matched no module")
+    return tuple(selected.values())
+
+
+def apply_method_replacements(
+    model: nn.Module,
+    specs: Iterable[MethodReplacementSpec],
+    *,
+    context: Mapping[str, Any] | None = None,
+) -> nn.Module:
+    """Install method replacements before the sharding planner runs.
+
+    Args:
+        model: Finalized model after structure-changing module replacements.
+        specs: Rules with a glob module path and a literal method suffix.
+        context: Build-time topology and precision values for factories.
+
+    Returns:
+        The same model with replacement callables bound to selected instances.
+    """
+    targets = _compile_method_replacements(model, specs)
+    if targets:
+        logger.info("method replacements resolved: %s", [
+            fqn for _, method_fqns, _, _ in targets for fqn in method_fqns
+        ])
+    frozen_context = MappingProxyType(dict(context or {}))
+    for module, method_fqns, original, spec in targets:
+        method_fqn = method_fqns[0]
+        replacement = spec.factory(
+            module=module, method_fqn=method_fqn, original_method=original, context=frozen_context,
+        )
+        if not callable(replacement) or isinstance(replacement, nn.Module):
+            raise TypeError(f"method replacement factory for {method_fqn!r} must return a callable")
+        _validate_callable_compatibility(original, replacement, method_fqn)
+        setattr(module, method_fqn.rpartition(".")[2], replacement)
+    return model
+
+
 @dataclass(frozen=True)
 class ModuleReplacementSpec:
     """One declarative, structure-preserving module replacement rule."""
 
     match: tuple[str, ...]
     factory: ModuleReplacementFactory
-    module_type: type[nn.Module]
+    module_type: type[nn.Module] | None = None
     exact_type: bool = False
 
     def __post_init__(self) -> None:
         if not self.match or any(not isinstance(pattern, str) or not pattern for pattern in self.match):
             raise ValueError("module replacement match must contain non-empty FQN patterns")
-        if not isinstance(self.module_type, type) or not issubclass(self.module_type, nn.Module):
+        if self.module_type is not None and (
+                not isinstance(self.module_type, type) or not issubclass(self.module_type, nn.Module)):
             raise TypeError("module_type must be an nn.Module type")
+        if self.exact_type and self.module_type is None:
+            raise ValueError("exact_type requires module_type")
         if not callable(self.factory) or not getattr(self.factory, "_hp_module_replacement", False):
             raise TypeError("module replacement factory must be decorated with @module_replacement")
 
@@ -118,6 +226,8 @@ def _validate_module_type(
     spec: ModuleReplacementSpec,
 ) -> None:
     """Validate one matched module against a replacement specification."""
+    if spec.module_type is None:
+        return
     # exact_type deliberately requires an exact type match, so the type()
     # comparison is intentional and must not become isinstance().
     type_matches = (
@@ -260,9 +370,17 @@ def _validate_forward_compatibility(
 ) -> None:
     """Ensure replacement accepts every call shape supported by source.forward."""
 
+    _validate_callable_compatibility(source.forward, replacement.forward, fqn, kind="forward")
+
+
+def _validate_callable_compatibility(
+    source: Callable, replacement: Callable, fqn: str, *, kind: str = "call",
+) -> None:
+    """Ensure a replacement callable accepts the source's supported call shapes."""
+
     try:
-        source_signature = inspect.signature(source.forward)
-        replacement_signature = inspect.signature(replacement.forward)
+        source_signature = inspect.signature(source)
+        replacement_signature = inspect.signature(replacement)
         source_parameters = tuple(source_signature.parameters.values())
         source_has_varargs = any(
             parameter.kind is inspect.Parameter.VAR_POSITIONAL
@@ -309,7 +427,7 @@ def _validate_forward_compatibility(
     except (TypeError, ValueError) as error:
         raise ValueError(
             f"replacement for {fqn!r} has an incompatible "
-            "forward signature; preserve the source call contract or add an explicit "
+            f"{kind} signature; preserve the source call contract or add an explicit "
             "model-owned wrapper"
         ) from error
 

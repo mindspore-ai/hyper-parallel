@@ -76,32 +76,35 @@ plan_overrides:
   - match:
       - "model.layers.*.attn_hc"
       - "model.layers.*.ffn_hc"
-    module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41PipelinedHyperConnection
-    replace_module:
-      _target_: hyper_parallel.components.modules.mhc.PipelinedMhcModule
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.mhc.PipelinedMhcModule
   - match: "model.layers.*.engram"
-    module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Engram
-    replace_module:
-      _target_: hyper_parallel.models.deepseek_v41.adapter.engram.host_replacement.HostEngramModule
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v41.adapter.engram.host_replacement.HostEngramModule
   - match: "model.layers.*.self_attn"
-    module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Attention
-    replace_module:
-      _target_: >-
-        hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
+    replace:
+      kind: module
+      implementation:
+        _target_: >-
+          hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
   - match: "*.self_attn"
     # num_heads is auto-derived from q_b_proj sharding; the KV-group ratio is
     # TP-invariant. Only V4.1's grouped output-projection count is custom.
     tp_divide_attrs: [num_groups]
-  - match: "*.self_attn"
+  - match: "*.self_attn.forward"
     # PanGu-style explicit parallel region: Indexer Q/merge heads are TP
     # column-sharded and all-reduce scores before Top-K; CP keeps local Q and
     # asynchronously gathers raw KV, compressed KV, and index K. The module
     # owns the communication launch/wait points.
-    region_dispatch: false
-    inner_target: self
-    inner_wrapper:
-      _target_: >-
-        hyper_parallel.models.deepseek_v41.adapter.distributed.shared_attention_context_parallel.deepseek_v41_shared_attention_parallel_wrapper
+    replace:
+      kind: method
+      implementation:
+        _target_: >-
+          hyper_parallel.models.deepseek_v41.adapter.distributed.shared_attention_context_parallel.deepseek_v41_shared_attention_parallel_wrapper
   # A fully declared glob expands against the optimized model tree and
   # creates one boundary for every mHC module, independent of model depth.
   - match: "model.layers.*.*_hc"
@@ -146,21 +149,23 @@ plan_overrides:
       k_weight: {tp: replicate}
       embed.weight: {ep: "shard(0)"}
       wkv.weight: {tp: replicate}
-  - match: "model.layers.*.engram"
+  - match: "model.layers.*.engram.forward"
     when: ep
-    region_dispatch: false
-    local_compute_fn:
-      _target_: >-
-        hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn
-  - match: "*.mlp"
+    replace:
+      kind: method
+      implementation:
+        _target_: >-
+          hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn
+  - match: "*.mlp.forward"
     when: ep
-    region_dispatch: false
-    local_compute_fn:
-      _target_: >-
-        hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
-      use_grouped_gemm: false
-      # Synthetic performance tests only; normal training keeps learned routing.
-      fix_router: false
+    replace:
+      kind: method
+      implementation:
+        _target_: >-
+          hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
+        use_grouped_gemm: false
+        # Synthetic performance tests only; normal training keeps learned routing.
+        fix_router: false
 
 mixed_precision:
   enabled: false

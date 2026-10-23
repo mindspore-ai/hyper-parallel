@@ -24,6 +24,7 @@
 | [DCP 分布式检查点](./guide/distributed_checkpoint.md) | 检查点保存/加载、异步 staging、离线转换 |
 | [自动并行](./guide/auto_parallel.md) | SAPP-ND、SAPP-PPB |
 | [LlamaFactory + HyperParallel SFT 训练](./guide/llama_factory_hyperparallel_sft_guide.md) | 基于 LlamaFactory 和 HyperParallel 的 SFT 配置、启动、精度与性能验证 |
+| [新模型接入指南](./guide/trainer/new_model_integration.md) | 选择 HF/adapter/自定义架构路径、实现接口、训练配方和验收步骤 |
 | [模型接入验证使用指南](./guide/trainer/model_integration_validation.md) | Adapter 声明、结构检查、模块对齐、精度矩阵与证据报告 |
 | [DeepSeek V4.1 Engram Host 代码阅读手册](./guide/deepseek_v41_engram_host_sparse_code_guide.md) | 原理、逐函数改动、代码示例与安全约束 |
 | [DeepSeek V4.1 Engram Host 重构设计](./guide/deepseek_v41_engram_host_sparse_refactor_plan.md) | 过度设计审查、职责收敛方案与验收约束 |

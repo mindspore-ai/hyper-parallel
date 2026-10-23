@@ -1148,6 +1148,25 @@ def test_router_and_expert_utils(tiny_hf_native_moe, tiny_hf_batched_moe):
     assert MOE_ROUTER_ADAPTERS["mixtral"] is _topk_router_module, \
         "case: topk_router_module_adapter"
 
+    # Current Qwen2-MoE can expose a Linear gate instead of TopKRouter. Match
+    # its native float32 softmax, top-k normalization, and dtype conversion.
+    linear_mlp = nn.Module()
+    linear_mlp.gate = nn.Linear(16, 4, bias=False).to(torch.bfloat16)
+    linear_mlp.top_k = 2
+    linear_mlp.norm_topk_prob = True
+    linear_hidden = hidden.to(torch.bfloat16)
+    linear_idx, linear_weights = _topk_router_module(linear_mlp, linear_hidden)
+    linear_logits = linear_mlp.gate(linear_hidden).reshape(-1, 4)
+    expected_weights, expected_idx = F.softmax(
+        linear_logits, dim=-1, dtype=torch.float32
+    ).topk(2, dim=-1)
+    expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
+    assert torch.equal(linear_idx, expected_idx), "case: linear_gate_router_adapter"
+    torch.testing.assert_close(
+        linear_weights, expected_weights.to(linear_hidden.dtype),
+        msg="case: linear_gate_router_adapter",
+    )
+
     # ── case: test_sigmoid_group_router_adapter ──
     # deepseekv3/glm4moe adapter: sigmoid + correction bias + norm + scaling
     # (n_group=1 skips the group filter), matching a hand-computed reference.

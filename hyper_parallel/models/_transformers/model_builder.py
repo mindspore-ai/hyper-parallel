@@ -72,7 +72,7 @@ from hyper_parallel.models.external_state import (
     ExternalLoadContext,
     get_model_external_state,
 )
-from hyper_parallel.models.replacement import _apply_module_replacement_actions
+from hyper_parallel.models.replacement import _apply_module_replacement_actions, apply_method_replacements
 
 logger = logging.getLogger(__name__)
 
@@ -763,6 +763,14 @@ def apply_model_infrastructure(
 
     if freeze_config is not None:
         _apply_parameter_freezing(model, freeze_config)
+
+    method_context = _build_replacement_context(distributed_setup, low_precision_config)
+    method_context["mesh_context"] = getattr(distributed_setup, "mesh_context", None)
+    apply_method_replacements(
+        model,
+        getattr(distributed_setup, "method_replacements", None) or (),
+        context=method_context,
+    )
 
     # Steps 7-8: plan and apply parameter/activation layouts.
     handled, source_shard_info = _parallelize_from_generated(

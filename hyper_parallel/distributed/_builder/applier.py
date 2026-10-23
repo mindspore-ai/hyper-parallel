@@ -135,88 +135,57 @@ def _validate_inner_wrapper_injections(plan, cp_mesh, transformers_version):
 
 
 def _validate_cp_compute_injections(plan, cp_mesh):
-    """Require an explicit CP wrapper for each active attention boundary."""
-    # Lazy import: see _validate_inner_wrapper_injections.
-    from hyper_parallel.distributed.context_parallel.wrappers import (  # pylint: disable=C0415
-        INNER_WRAPPER_REGISTRY,
-    )
-    if cp_mesh is not None and cp_mesh.size() > 1:
-        for fqn, spec in plan.modules.items():
-            if (spec.is_boundary and getattr(spec, "_needs_cp_attn", False)
-                    and getattr(spec, "inner_wrapper", None) is None):
-                raise ValueError(
-                    f"cp_size={cp_mesh.size()} is active, so attention "
-                    f"boundary {fqn!r} needs a CP-aware inner forward "
-                    "(K/V all-gather), but no inner_wrapper is declared — "
-                    "the framework no longer picks one heuristically. "
-                    "Inject explicitly:\n"
-                    "  plan_overrides:\n"
-                    "    - match: \"*.self_attn\"\n"
-                    "      when: cp\n"
-                    "      region_dispatch: false   # the wrapper contains "
-                    "communication; must not dispatch\n"
-                    "      inner_wrapper:\n"
-                    "        _target_: hyper_parallel.distributed.context_parallel."
-                    "wrappers.sdpa_hf_cp_wrapper\n"
-                    f"(the registry {sorted(INNER_WRAPPER_REGISTRY)} can be "
-                    "referenced by str name; use sdpa_qkv for the "
-                    "NeMo-style (q,k,v) signature, sdpa_hf for the "
-                    "HF-style forward(hidden_states); or provide a custom "
-                    "callable/Target implementation)")
+    """Require an explicit forward replacement for CP attention boundaries."""
+    if cp_mesh is None or cp_mesh.size() <= 1:
+        return
+    for fqn, spec in plan.modules.items():
+        if not spec.is_boundary or not getattr(spec, "_needs_cp_attn", False):
+            continue
+        if spec.inner_wrapper is not None or spec.local_compute_fn is not None:
+            continue
+        raise ValueError(
+            f"cp_size={cp_mesh.size()} is active, but attention boundary "
+            f"{fqn!r} has no CP-aware forward replacement. Declare:\n"
+            "  plan_overrides:\n"
+            f"    - match: {(fqn + '.forward')!r}\n"
+            "      when: cp\n"
+            "      replace:\n"
+            "        kind: method\n"
+            "        implementation: hyper_parallel.distributed.context_parallel."
+            "wrappers.sdpa_hf_cp_wrapper\n"
+            "Choose an implementation compatible with this attention's forward signature."
+        )
 
 
 def _validate_ep_compute_injections(plan, model):
-    """Require an explicit compute source for each active EP boundary."""
+    """Require a compute source for each active EP-sharded boundary."""
     # Lazy import: see _validate_inner_wrapper_injections.
     from hyper_parallel.distributed.expert_parallel.recipes import (  # pylint: disable=C0415
         EP_ARCHETYPE_SUGGESTIONS,
     )
     for fqn, spec in plan.modules.items():
-        if not spec.is_boundary:
+        if not spec.is_boundary or not getattr(spec, "_ep_size", 0):
             continue
-        if (getattr(spec, "_ep_size", 0)  # pylint: disable=protected-access
-                and getattr(spec, "local_compute_fn", None) is None
-                and getattr(spec, "region_dispatch", None) is not False):
-            suggestion = ""
-            if model is not None:
-                arch = _get_architecture(model)
-                archetype = EP_ARCHETYPE_SUGGESTIONS.get(arch)
-                if archetype is not None:
-                    suggestion = (
-                        f"Detected model architecture {arch!r}; the "
-                        f"matching archetype is likely {archetype!r} (a "
-                        "suggestion, not an automatic choice — confirm and "
-                        "configure it explicitly; a wrong pick fails the "
-                        "apply-time interface assertion and lists the "
-                        "module's actual submodule names).\n"
-                    )
-            raise ValueError(
-                f"ep_size={spec._ep_size} is active (parameters explicitly "  # pylint: disable=protected-access
-                f"declared with EP sharding use the virtual-EP source mesh), but boundary "
-                f"{fqn!r} has no local-region compute source — nothing "
-                "executes the corresponding local compute and all-to-all, and the "
-                "framework no longer injects any implementation "
-                "automatically. Choose one of:\n"
-                f"{suggestion}"
-                "  ① Routed MoE: pick a built-in archetype factory per the model's "
-                "behavior (full semantics: router / shared expert / gate / "
-                "merge all implemented cohesively; see the recipes.py "
-                "module docstring for the available archetypes and the "
-                "module interface each one expects):\n"
-                "     plan_overrides:\n"
-                "       - match: \"*.mlp\"\n"
-                "         when: ep\n"
-                "         region_dispatch: false   # a2a is inside the "
-                "region; must not dispatch\n"
-                "         local_compute_fn:\n"
-                "           _target_: hyper_parallel.distributed.expert_parallel."
-                "recipes.qwen2moe_ep_compute_fn   # pick per the "
-                "archetype table\n"
-                "  ② Model-specific MoE or another EP-sharded module (for "
-                "example a sparse table): provide a local_compute_fn from "
-                "models/<family>/adapter and validate its interface at build time\n"
-                "  ③ A module whose forward already owns all-to-all: declare "
-                "region_dispatch: false")
+        if spec.local_compute_fn is not None or spec.region_dispatch is False:
+            continue
+        suggestion = ""
+        if model is not None:
+            architecture = _get_architecture(model)
+            archetype = EP_ARCHETYPE_SUGGESTIONS.get(architecture)
+            if archetype is not None:
+                suggestion = f"Candidate for {architecture!r}: {archetype!r}. "
+        raise ValueError(
+            f"ep_size={spec._ep_size} is active, but boundary {fqn!r} has "
+            "no EP-aware compute source. "
+            f"{suggestion}Declare one of:\n"
+            "  - match: '*.mlp.forward'\n"
+            "    when: ep\n"
+            "    replace:\n"
+            "      kind: method\n"
+            "      implementation: <EP-aware factory import path>\n"
+            "or use a rule with region_dispatch: false when the module's "
+            "original forward already owns the EP all-to-all."
+        )
 
 
 def _preflight_compute_injection(plan, mesh, model=None):

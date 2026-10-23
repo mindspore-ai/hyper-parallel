@@ -683,7 +683,7 @@ def _apply_generation_replacements(
     model: Any,
     spec: Any,
 ) -> list[dict[str, Any]]:
-    """Apply YAML ``replace_module`` actions to the generation meta model.
+    """Apply module actions and validate method targets on the generation meta model.
 
     Generated model ``__init__`` applies module replacements before runtime
     sharding.  Generation must mirror that order: compile the raw YAML entries
@@ -692,7 +692,8 @@ def _apply_generation_replacements(
     replaced parameter tree.  Otherwise the frozen plan may reference
     pre-replacement parameters (for example ``q_proj``/``k_proj``/``v_proj``)
     that no longer exist after a generated attention module installs fused
-    ``qkv_proj`` weights.
+    ``qkv_proj`` weights. Method targets are checked after module replacement;
+    their factories run on the live generated model before sharding.
     """
     raw_entries = getattr(config, "plan_overrides", None) or []
     if not raw_entries:
@@ -700,11 +701,13 @@ def _apply_generation_replacements(
 
     from hyper_parallel.models.replacement import (
         _apply_module_replacement_actions,
+        _compile_method_replacements,
     )
     from hyper_parallel.codegen.emit.replacement import (
         compile_overrides_for_meta,
     )
     from hyper_parallel.trainer.config import (
+        entries_to_method_replacements,
         entries_to_module_replacements,
     )
 
@@ -751,6 +754,13 @@ def _apply_generation_replacements(
             },
             capture_checkpoint_metadata=False,
         )
+    method_specs = entries_to_method_replacements(
+        raw_entries,
+        cp_size=spec.parallel_dims.cp_size,
+        ep_size=spec.parallel_dims.ep_size,
+        sequence_parallel=spec.parallel_dims.sequence_parallel,
+    )
+    _compile_method_replacements(model, method_specs)
     return replace_meta
 
 

@@ -78,7 +78,9 @@ adapter thin:
   machinery live in generic components;
 - family-specific parameter mapping, router interpretation, shared-state wiring,
   mask adaptation, and combine semantics live in the adapter;
-- recipe `plan_overrides` selects the implementation and topology;
+- recipe `plan_overrides` selects the implementation and topology through
+  `match`, rule-level `when`, `replace.kind`, and `replace.implementation`;
+  `replace.source_type` is only an optional expected-type guard;
 - the reference path remains selectable for paired experiments and is removed
   only if an independent authoritative oracle remains available.
 

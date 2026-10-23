@@ -116,15 +116,20 @@ the requested validation scope.
 
 ## Local-Region Boundary Usage
 
-For a custom `local_compute_fn`, declare complete input, output, and parameter
-placements in `plan_overrides`. The callable consumes and returns plain local
+For a custom `replace.kind: method` rule matching `.forward`, declare complete input, output,
+and parameter placements in `plan_overrides`. A model-owned local factory can use
+`@forward_replacement`; existing `@local_compute` and `@inner_wrapper` factories
+remain valid targets. The callable consumes and returns plain local
 tensors in Production; `out_src` describes the logical output used for boundary
 redistribution and Validate checks. Preserve the public output structure exactly,
 including nested tuple/list results.
 
 Pair every custom local region with a strict Validate case. Production verifies
-the executable path; Validate verifies that the declared placements match the
-same mathematics.
+the executable path; Validate checks the declared boundary placements, not the
+injected forward's internal operator propagation when `region_dispatch` is omitted
+(its new default is `false`). Set `region_dispatch: true` only when the injected
+forward supports DTensor dispatch. A `replace.kind: module` rule cannot set
+`region_dispatch`; use a separate rule for forward execution.
 
 ## Context Parallel
 

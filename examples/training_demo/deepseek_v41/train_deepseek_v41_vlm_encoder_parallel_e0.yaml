@@ -74,32 +74,36 @@ plan_overrides:
   # The registered architecture runs without replacements. When Encoder
   # Parallel is enabled, its runtime requires the ViT attention wrapper.
   - match: "model.vision.blocks.*.attn"
-    module_type: hyper_parallel.models.deepseek_v41.vision.DeepseekV41VisionAttention
-    replace_module:
-      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel.replace_vision_attention
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel.replace_vision_attention
   - match:
       - "model.layers.*.attn_hc"
       - "model.layers.*.ffn_hc"
-    module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41PipelinedHyperConnection
-    replace_module:
-      _target_: hyper_parallel.components.modules.mhc.PipelinedMhcModule
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.mhc.PipelinedMhcModule
   - match: "model.layers.*.engram"
-    module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Engram
-    replace_module:
-      _target_: hyper_parallel.components.modules.engram.EngramModule
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.engram.EngramModule
   - match: "model.layers.*.self_attn"
-    module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Attention
-    replace_module:
-      _target_: >-
-        hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
+    replace:
+      kind: module
+      implementation:
+        _target_: >-
+          hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
   - match: "*.self_attn"
     tp_divide_attrs: [num_groups]
-  - match: "*.self_attn"
-    region_dispatch: false
-    inner_target: self
-    inner_wrapper:
-      _target_: >-
-        hyper_parallel.models.deepseek_v41.adapter.distributed.shared_attention_context_parallel.deepseek_v41_shared_attention_parallel_wrapper
+  - match: "*.self_attn.forward"
+    replace:
+      kind: method
+      implementation:
+        _target_: >-
+          hyper_parallel.models.deepseek_v41.adapter.distributed.shared_attention_context_parallel.deepseek_v41_shared_attention_parallel_wrapper
   # V4.1 image boundary embeddings are model-owned scalars. They stay
   # replicated over TP4 and are covered by dense FSDP.
   - match: "model"
@@ -147,20 +151,22 @@ plan_overrides:
       k_weight: {tp: replicate}
       embed.weight: {ep: "shard(0)"}
       wkv.weight: {tp: replicate}
-  - match: "model.layers.*.engram"
-    region_dispatch: false
-    local_compute_fn:
-      _target_: >-
-        hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn
-  - match: "model.layers.*.mlp"
+  - match: "model.layers.*.engram.forward"
+    replace:
+      kind: method
+      implementation:
+        _target_: >-
+          hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn
+  - match: "model.layers.*.mlp.forward"
     when: ep
-    region_dispatch: false
-    local_compute_fn:
-      _target_: >-
-        hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
-      use_grouped_gemm: false
-      # Synthetic performance tests only; normal training keeps learned routing.
-      fix_router: false
+    replace:
+      kind: method
+      implementation:
+        _target_: >-
+          hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
+        use_grouped_gemm: false
+        # Synthetic performance tests only; normal training keeps learned routing.
+        fix_router: false
 
 mixed_precision:
   enabled: false

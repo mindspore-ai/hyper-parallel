@@ -97,9 +97,9 @@ placements on every rank, including ranks with an empty uneven FSDP shard.
   forward as a Validate black box. If a native module cannot participate in
   DTensor propagation, report that module and the affected full-model Validate
   scope as unsupported; Production and native parity may still be validated.
-  `region_dispatch: false` remains valid for an explicit communication/custom
-  compute injection (`local_compute_fn` or `inner_wrapper`), but that local
-  region cannot count as internal operator-dispatch coverage.
+  A `replace.kind: method` `.forward` communication/custom compute target defaults to
+  `region_dispatch: false`, but that local region cannot count as internal
+  operator-dispatch coverage.
 - Audit ownership before accepting the integration: model-family semantics belong
   to the model adapter. A new generic framework capability must be optional and
   model-independent; a framework-side family/model-type/class/FQN special case is
@@ -139,7 +139,7 @@ rows in `comparison.json` for every formal case.
 ## Workflow
 
 1. Complete module parity first. Reuse its output directory for validation, or
-   provide the framework-generated schema-v1 `integration_handoff.yaml` with
+   provide the framework-generated schema-v2 `integration_handoff.yaml` with
    `status: PASS`. Resolve and parse every referenced structure, module-parity,
    and checkpoint-coverage artifact before accepting a split-run handoff; state
    advancement without its evidence is not a valid gate. Keep the validation
