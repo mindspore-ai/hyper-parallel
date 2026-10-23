@@ -31,6 +31,7 @@ from transformers.models.deepseek_v4.configuration_deepseek_v4 import (
 from hyper_parallel.distributed.mesh import DistributedSetup
 from hyper_parallel.models._transformers import HyperAutoModelForCausalLM, HyperAutoModelForImageTextToText
 from hyper_parallel.models.build_options import CompileConfig
+from hyper_parallel.components.checkpoint.quantized_hf_storage import validate_quantization_config
 
 
 def _scaled_dimension(value: int, divisor: int, field_name: str) -> int:
@@ -705,14 +706,38 @@ def select_layer_crop_parameters(
     return selected
 
 
+def _write_hf_crop_index(source: Path, view: Path, selected: dict[str, str], quantization: Any) -> None:
+    """Link selected source shards and record their physical tensor byte sizes."""
+    by_shard: dict[str, list[str]] = {}
+    for name, shard in selected.items():
+        by_shard.setdefault(shard, []).append(name)
+    total_size = 0
+    for number, (shard, shard_names) in enumerate(by_shard.items()):
+        path = (source / shard).resolve()
+        with safe_open(str(path), framework="pt", device="cpu") as reader:
+            for name in shard_names:
+                tensor_slice = reader.get_slice(name)
+                dtype = tensor_slice.get_dtype()
+                if not quantization and dtype not in ("BF16", "F32"):
+                    raise ValueError(f"Expected BF16/FP32 source parameter: {name}")
+                bytes_per_element = {"BF16": 2, "F32": 4}.get(dtype, 1)
+                total_size += math.prod(tensor_slice.get_shape()) * bytes_per_element
+        link = view / f"source-{number:05d}.safetensors"
+        link.symlink_to(path)
+        for name in shard_names:
+            selected[name] = link.name
+    (view / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {"total_size": total_size}, "weight_map": selected}), encoding="utf-8")
+
+
 def build_hf_layer_cropped_deepseek_v41(
         pretrained_model_name_or_path: str, *, text_layers: int = 1, vision_layers: int = 2,
         **kwargs: Any,
 ) -> Any:
-    """Build a prefix crop at runtime and load its weights from a local BF16 HF directory.
+    """Build a prefix crop and load local floating-point or native quantized HF weights.
 
     Args:
-        pretrained_model_name_or_path: Full BF16 weights with the official composite config.
+        pretrained_model_name_or_path: HF weights with the official composite config.
         text_layers: Number of decoder prefix layers to retain, without resizing parameters.
         vision_layers: Number of visual prefix layers to retain.
         **kwargs: Forwarded HyperAutoModel build and parallelization options.
@@ -721,14 +746,15 @@ def build_hf_layer_cropped_deepseek_v41(
         Parallelized model loaded through the HF checkpointer.
 
     Raises:
-        ValueError: The input is quantized or incompatible with this prefix crop.
+        ValueError: The input format or requested prefix crop is unsupported.
     """
     source = Path(pretrained_model_name_or_path).expanduser().resolve()
     official = json.loads((source / "config.json").read_text(encoding="utf-8"))
     if official.get("model_type") != "deepseek_v41" or "text_config" not in official:
         raise ValueError("Expected full HF weights with the official composite DeepSeek-V4.1 config")
-    if official.get("quantization_config"):
-        raise ValueError("Convert the input weights to BF16 before runtime layer cropping")
+    quantization = official.get("quantization_config")
+    if quantization:
+        validate_quantization_config(quantization)
     index = json.loads((source / "model.safetensors.index.json").read_text(encoding="utf-8"))
     names = select_layer_crop_parameters(list(index["weight_map"]),
                                          text_layers=text_layers, vision_layers=vision_layers)
@@ -737,27 +763,19 @@ def build_hf_layer_cropped_deepseek_v41(
     # Each rank owns a tiny temporary view; weight files remain in the original directory.
     with tempfile.TemporaryDirectory(prefix="deepseek_v41_hf_crop_") as temporary:
         view = Path(temporary)
-        build_layer_cropped_config(official, view, text_layers=text_layers, vision_layers=vision_layers)
+        config = build_layer_cropped_config(official, view, text_layers=text_layers, vision_layers=vision_layers)
+        if quantization:
+            config.quantization_config = quantization
+            config.save_pretrained(view)
         selected = {name: index["weight_map"][name] for name in names}
-        by_shard: dict[str, list[str]] = {}
-        for name, shard in selected.items():
-            by_shard.setdefault(shard, []).append(name)
-        total_size = 0
-        for number, (shard, shard_names) in enumerate(by_shard.items()):
-            path = (source / shard).resolve()
-            with safe_open(str(path), framework="pt", device="cpu") as reader:
-                for name in shard_names:
-                    tensor_slice = reader.get_slice(name)
-                    dtype = tensor_slice.get_dtype()
-                    if dtype not in ("BF16", "F32"):
-                        raise ValueError(f"Expected BF16/FP32 source parameter: {name}")
-                    total_size += math.prod(tensor_slice.get_shape()) * (2 if dtype == "BF16" else 4)
-            link = view / f"source-{number:05d}.safetensors"
-            link.symlink_to(path)
-            for name in shard_names:
-                selected[name] = link.name
-        (view / "model.safetensors.index.json").write_text(
-            json.dumps({"metadata": {"total_size": total_size}, "weight_map": selected}), encoding="utf-8")
+        if quantization:
+            for name in names:
+                if name.endswith("weight"):
+                    for suffix in ("scale", "weight_scale_inv"):
+                        scale_name = name[:-6] + suffix
+                        if scale_name in index["weight_map"]:
+                            selected[scale_name] = index["weight_map"][scale_name]
+        _write_hf_crop_index(source, view, selected, quantization)
         kwargs.setdefault("attn_implementation", "eager")
         return HyperAutoModelForImageTextToText.from_pretrained(str(view), **kwargs)
 

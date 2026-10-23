@@ -1,5 +1,6 @@
 # Validated eight-rank baseline; other training settings follow train_deepseek_v41_vlm_online.yaml.
-# Runtime layer crop: original widths, selected weights read directly from a full local BF16 HF directory.
+# Runtime layer crop: original widths, selected weights read directly from local HF weights.
+# BF16/FP32 loads directly; native FP8/FP4 is decoded to BF16 during DCP reads, without an offline copy.
 # Engram-specific overrides are omitted because the selected layer prefix has no Engram.
 # Run with run_deepseek_v41_vlm_online_load_hf.sh; baseline saves checkpoints, without resume.
 model:

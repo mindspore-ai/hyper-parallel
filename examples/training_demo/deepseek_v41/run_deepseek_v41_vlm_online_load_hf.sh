@@ -24,11 +24,11 @@ NPROC_PER_NODE=${NPROC_PER_NODE:-8}
 OUTPUT_DIR=${OUTPUT_DIR:-"${PROJECT_ROOT}/runs/deepseek_v41/${RUN_NAME}"}
 
 if [[ $# -lt 1 || ! ${RUN_NAME} =~ ^[A-Za-z0-9._-]+$ ]]; then
-    echo "Usage: $0 /path/to/full/BF16-HF [path/to/train.jsonl] [trainer overrides...]" >&2
+    echo "Usage: $0 /path/to/HF-weights [path/to/train.jsonl] [trainer overrides...]" >&2
     exit 1
 fi
 MODEL_PATH=$(cd "$1" 2>/dev/null && pwd) || {
-    echo "BF16 HF directory does not exist: $1" >&2
+    echo "HF directory does not exist: $1" >&2
     exit 1
 }
 shift
@@ -44,7 +44,7 @@ PROCESSOR_PATH=$(cd "${PROCESSOR_PATH}" 2>/dev/null && pwd) || {
 }
 for required in config.json model.safetensors.index.json tokenizer.json tokenizer_config.json; do
     if [[ ! -s "${MODEL_PATH}/${required}" ]]; then
-        echo "BF16 HF asset is missing: ${MODEL_PATH}/${required}" >&2
+        echo "HF asset is missing: ${MODEL_PATH}/${required}" >&2
         exit 1
     fi
 done

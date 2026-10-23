@@ -17,6 +17,8 @@
 Following design doc 01_hf_compatibility_layer.md §6.
 Stub — provides from_pretrained/from_config as entry points.
 """
+# Native Torch imports are required; the legacy backend lint rule predates the Torch-only runtime.
+# pylint: disable=forbidden-backend-import
 
 import logging
 from dataclasses import is_dataclass, replace
@@ -43,6 +45,7 @@ from hyper_parallel.distributed.mesh import DistributedSetup
 from hyper_parallel.codegen.modeling_backend import ModelingBackend
 from hyper_parallel.models.build_options import get_device_id, get_device_type  # pylint: disable=syntax-error
 from hyper_parallel.models.build_options import CompileConfig
+from hyper_parallel.components.checkpoint.quantized_hf_storage import supports_hf_dequantization
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +87,42 @@ def _model_init_kwargs(
         for key, value in kwargs.items()
         if key not in _CONFIG_ONLY_KWARGS
     }
+
+
+def _requires_quantized_initialization(
+    hf_config: Any,
+    explicit_quantization: Any,
+    *,
+    load_base_model: bool,
+) -> bool:
+    """Distinguish quantized model construction from DCP decoding into float parameters."""
+    stored_quantization = getattr(hf_config, "quantization_config", None) if load_base_model else None
+    quantized_init = explicit_quantization is not None or stored_quantization is not None
+    if load_base_model and quantized_init and resolve_hf_loader() == "dcp":
+        if explicit_quantization is not None or not supports_hf_dequantization(stored_quantization):
+            raise ValueError(
+                "DCP pretrained loading does not support quantized initialization; "
+                "checkpoint decoding requires a supported format in the checkpoint's own config"
+            )
+        # Storage decoding produces floating-point parameters, not quantized model modules.
+        return False
+    return quantized_init
+
+
+def _model_init_context(is_meta_device: bool) -> Any:
+    """Resolve version-dependent initialization helpers when constructing a model."""
+    # Preserve deferred imports for Transformers versions that moved no_init_weights.
+    # pylint: disable=import-outside-toplevel
+    from contextlib import nullcontext
+    from transformers.modeling_utils import ContextManagers
+    try:
+        from transformers.modeling_utils import no_init_weights
+    except ImportError:
+        from transformers.initialization import no_init_weights
+    from hyper_parallel import init_empty_weights
+    # pylint: enable=import-outside-toplevel
+
+    return ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
 
 
 def _with_codegen_model_args(
@@ -446,34 +485,18 @@ class _BaseHyperAutoModelClass:
         Step 3-12: apply_model_infrastructure (PEFT, QAT, ShardingPlan,
         activation checkpoint, FSDP2, load, layer compile)
         """
-        # Lazy imports: no_init_weights moved between transformers submodules
-        # across versions (hence the ImportError fallback).
-        # pylint: disable=import-outside-toplevel
-        from contextlib import nullcontext
-        from transformers.modeling_utils import ContextManagers
-        try:
-            from transformers.modeling_utils import no_init_weights
-        except ImportError:
-            from transformers.initialization import no_init_weights
-        from hyper_parallel import init_empty_weights
-        # pylint: enable=import-outside-toplevel
-
         # Step 1: Determine meta device (inline world-size probe: auto_models
         # must not import the trainer runtime).
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-        quantized_init = kwargs.get("quantization_config") is not None
+        quantized_init = _requires_quantized_initialization(
+            hf_config, kwargs.get("quantization_config"), load_base_model=load_base_model,
+        )
         defer_hf_load = load_base_model and not quantized_init
-        if load_base_model and quantized_init and resolve_hf_loader() == "dcp":
-            raise ValueError("DCP pretrained loading does not support quantized initialization")
         is_meta_device = (
             world_size > 1 or not is_hf_model or defer_hf_load
         ) and not quantized_init
 
-        init_ctx = (
-            ContextManagers([no_init_weights(), init_empty_weights()])
-            if is_meta_device
-            else nullcontext()
-        )
+        init_ctx = _model_init_context(is_meta_device)
 
         # Step 2: Config-first construction defers pretrained I/O until after sharding.
         init_pretrained_path = (
