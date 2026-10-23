@@ -152,9 +152,12 @@ def _bsnd_lightning_indexer(
     residue, metadata = _bsnd_indexer_metadata(
         query.device, batch, end-start, heads, dim, key_end-key_start, topk, ratio, residual,
     )
+    # Native BSND validates the batch stride even for B=1, unlike contiguous().
+    # Rebuild the view so a sliced key bank has canonical singleton strides.
+    native_key = key[:, key_start:key_end].contiguous().view(batch, key_end-key_start, 1, dim)
     with torch.autocast(device_type=query.device.type, enabled=False):
         indices, _ = indexer(
-            query[:, start:end].contiguous(), key[:, key_start:key_end].unsqueeze(2).contiguous(),
+            query[:, start:end].contiguous(), native_key,
             weights[:, start:end].float().contiguous(), topk,
             cmp_residual_k=residue, metadata=metadata,
             layout_q="BSND", layout_k="BSND", mask_mode=3, cmp_ratio=ratio,

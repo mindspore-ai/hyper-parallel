@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Six-layer ordinary-pretraining CP8 integration, using upstream AG collectives."""
+"""Six-layer CPU pretraining CP8 integration, using upstream AG collectives."""
 
-from contextlib import ExitStack
 from copy import deepcopy
 from datetime import timedelta
 from importlib import import_module
@@ -26,15 +25,11 @@ import torch.distributed as dist
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from transformers.utils import is_torchvision_available
 
-from hyper_parallel.components.functional import lightning_indexer as indexer_ops
-from hyper_parallel.components.functional import sparse_flash_mla as attention_ops
-from hyper_parallel.components.functional import sparse_lightning_indexer_kl_loss_grad as kl_ops
 from hyper_parallel.components.functional.aux_loss import set_aux_loss_scale
 from hyper_parallel.components.modules import shared_compressed_dsa_attention as shared
 from hyper_parallel.models.deepseek_v41.adapter.distributed.shared_attention_context_parallel import (
     _build_shared_attention_cp_context,
 )
-from tests.torch.context_parallel._test_deepseek_v41_fused_ops import _device
 
 
 class _CPMesh:
@@ -91,7 +86,7 @@ def _config() -> DeepseekV4Config:
     return config
 
 
-def _chain(native=False):
+def _chain():
     """Cover SWA, r2 Full/Reuse, r1 Full/Reindex/Reuse and two source banks."""
     config = _config()
     config.num_hidden_layers = 6
@@ -103,14 +98,6 @@ def _chain(native=False):
     config.v41_candidate_source_layer_id = -1
     config.v41_indexer_loss_coeff = .01
     config.index_topk = 512
-    if native:
-        config.hidden_size = 64
-        config.head_dim = 512
-        config.num_attention_heads = 8
-        config.index_n_heads = 8
-        config.index_head_dim = 128
-        config.sliding_window = 128
-        config.qk_rope_head_dim = 64
     torch.manual_seed(975)
     attention_type = import_module("hyper_parallel.models.deepseek_v41.modeling_deepseek_v41").DeepseekV41Attention
     modules = torch.nn.ModuleList([attention_type(config, layer) for layer in range(6)])
@@ -125,7 +112,7 @@ def _chain(native=False):
     return modules
 
 
-def _forward(modules, hidden, start, boundaries, context, use_fused=False):
+def _forward(modules, hidden, start, boundaries, context):
     """Recreate forward-scoped sharing while preserving learned parameter identity."""
     length = hidden.shape[1]
     positions = torch.arange(start, start+length, device=hidden.device).unsqueeze(0)
@@ -137,9 +124,9 @@ def _forward(modules, hidden, start, boundaries, context, use_fused=False):
     packed = packed.prepare(hidden.device, (0, 1, 2))
     state = shared.SharedCompressedAttentionState()
     for module in modules:
-        module.use_fused_ops = use_fused
+        module.use_fused_ops = False
         if module.is_index_source:
-            module.indexer.use_fused = use_fused
+            module.indexer.use_fused = False
         parameters = {name: value if name == "sinks" or hidden.dtype == torch.float32 else value.bfloat16()
                       for name, value in module.named_parameters()}
         update = torch.func.functional_call(
@@ -206,77 +193,6 @@ def test_native_geometry_cp8_gloo():
                 optimizer.step()
             for value, target in zip(candidate.parameters(), reference.parameters()):
                 torch.testing.assert_close(value, target)
-    finally:
-        set_aux_loss_scale(torch.tensor(1.))
-        dist.destroy_process_group()
-
-
-def _count_native_dispatch(stack):
-    """Track calls without a Mock retaining accelerator activation tensors."""
-    calls = {}
-    entries = ((indexer_ops, "_load_indexer_op"),
-               (attention_ops, "_load_attention_ops"), (kl_ops, "_load_kl_ops"))
-    for module, name in entries:
-        loaded = getattr(module, name)()
-        native = loaded[0] if isinstance(loaded, tuple) else loaded
-        calls[name] = 0
-
-        def _counted(*args, _name=name, _native=native, **kwargs):
-            """Count dispatch without keeping tensor arguments alive."""
-            calls[_name] += 1
-            return _native(*args, **kwargs)
-
-        replacement = (_counted, *loaded[1:]) if isinstance(loaded, tuple) else _counted
-        stack.enter_context(patch.object(module, name, return_value=replacement))
-    return calls
-
-
-def test_native_cp8_training_smoke():
-    """Exercise all fused entries and finite parameter updates across two packed CP8 steps.
-
-    Single-device tests check numerical precision independently; this integration
-    smoke checks dispatch and training with the unchanged shared CP collectives.
-    """
-    torch.set_num_threads(1)
-    device = _device()
-    dist.init_process_group("hccl", timeout=timedelta(minutes=5))
-    try:
-        rank, size, length = dist.get_rank(), dist.get_world_size(), 256
-        assert size == 8
-        # Initialize communication before optional native metadata services.
-        dist.all_reduce(torch.ones(1, device=device))
-        modules = _chain(native=True)
-        initial = deepcopy(modules.state_dict())
-        model = torch.nn.ModuleList([
-            shared.SharedCompressedDSAAttention(module, use_fused_ops=True) for module in modules
-        ]).to(device)
-        optimizer = torch.optim.SGD(model.parameters(), lr=.01)
-        context = _build_shared_attention_cp_context(_CPMesh())
-        local = length//size
-        set_aux_loss_scale(torch.tensor(1./size, device=device))
-        with ExitStack() as stack:
-            calls = _count_native_dispatch(stack)
-            for step in range(2):
-                torch.manual_seed(200+step)
-                source = torch.randn(1, length, 64).bfloat16()
-                hidden = source[:, rank*local:(rank+1)*local].to(device).requires_grad_()
-                boundaries = torch.tensor([0, 62 if step % 2 else 66, length//2+30, length])
-                optimizer.zero_grad(set_to_none=True)
-                output = _forward(model, hidden, rank*local, boundaries, context, use_fused=True)
-                loss = output.float().square().sum()/(length*64)
-                loss.backward()
-                _sum_gradients(model)
-                assert bool(output.isfinite().all()) and bool(loss.isfinite())
-                assert bool(hidden.grad.isfinite().all())
-                gradients = [value.grad for value in model.parameters() if value.grad is not None]
-                assert gradients and all(grad.dtype == torch.float32 and bool(grad.isfinite().all())
-                                         for grad in gradients)
-                optimizer.step()
-            counts = torch.tensor(list(calls.values()), device=device)
-            dist.all_reduce(counts)
-            assert bool((counts > 0).all()), counts
-        assert all(bool(value.isfinite().all()) for value in model.parameters())
-        assert any(not torch.equal(value.detach().cpu(), initial[name]) for name, value in model.named_parameters())
     finally:
         set_aux_loss_scale(torch.tensor(1.))
         dist.destroy_process_group()

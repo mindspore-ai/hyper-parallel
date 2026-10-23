@@ -13,7 +13,9 @@
 # limitations under the License.
 # ============================================================================
 """Thin launchers for KDA state exchange, layout and layer qualifications."""
+from importlib.util import find_spec
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -30,7 +32,9 @@ def test_kda_ag_hybrid_cpu(case: str, workers: int) -> None:
     Description: Check ordered subgroups and hybrid head/halo layout with Gloo.
     Expectation: Recurrent states and layer gradients match independent serial references.
     """
-    torchrun_case(str(Path(__file__).with_name("_test_kda_ag_state.py")), case, num_proc=workers)
+    # Gloo workers do not need accelerator extensions or an activated CANN runtime.
+    with patch.dict("os.environ", {"TORCH_DEVICE_BACKEND_AUTOLOAD": "0"}):
+        torchrun_case(str(Path(__file__).with_name("_test_kda_ag_state.py")), case, num_proc=workers)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
@@ -46,4 +50,11 @@ def test_kda_ag_hybrid_npu(worker: str, case: str, workers: int) -> None:
     Description: Check states against FP64, local-4K H96/D128 gradients, caches and three-way CP8.
     Expectation: Numerical tolerances and local-M ownership hold across backward and checkpoint replay.
     """
+    # Check package presence before worker collection imports the Triton summary.
+    # Triton-Ascend provides the Python module named "triton".
+    # Installed but incompatible backends must still fail in the worker.
+    packages = ("torch_npu", "triton", "fla") if worker == "layer" else ("torch_npu", "triton")
+    for package in packages:
+        if find_spec(package) is None:
+            pytest.skip(f"KDA {worker} NPU test requires the optional package {package!r}")
     torchrun_case(str(Path(__file__).with_name(f"_test_kda_ag_{worker}.py")), case, num_proc=workers)

@@ -13,10 +13,12 @@
 # limitations under the License.
 # ============================================================================
 """launch _test_cp_optim_state_dict.py cases for CP+FSDP optim state dict."""
+from pathlib import Path
+
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 
-_TEST_CP_SD = "_test_cp_optim_state_dict.py"
+_TEST_CP_SD = str(Path(__file__).with_name("_test_cp_optim_state_dict.py"))
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
