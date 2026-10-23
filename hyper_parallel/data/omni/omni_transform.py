@@ -349,8 +349,9 @@ class AutoProcessorTransform(OmniDataTransform):
         tokenizer = self.processor.tokenizer
         full_tail = tokenizer.decode(full_tokens[common_length:], **decode_kwargs)
         prompt_tail = tokenizer.decode(prompt_tokens[common_length:], **decode_kwargs)
-        # Reject lossy decoding rather than guessing a boundary inside UTF-8 bytes.
-        if not prompt_tail or "\ufffd" in full_tail or "\ufffd" in prompt_tail or not full_tail.startswith(prompt_tail):
+        # Only the prompt must decode losslessly to establish the supervision boundary.
+        # A literal U+FFFD in the assistant response is data, not a prompt mismatch.
+        if not prompt_tail or "\ufffd" in prompt_tail or not full_tail.startswith(prompt_tail):
             raise ValueError("Assistant prompt tokens differ beyond a lossless text boundary merge")
         for end in range(common_length + 1, len(full_tokens) + 1):
             decoded = tokenizer.decode(full_tokens[common_length:end], **decode_kwargs)
