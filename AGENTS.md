@@ -149,6 +149,7 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **add-unit-test** | How-to for `tests/ut` (procedures) | when adding UT / coverage |
 | **hf-model-integration** | Integrate HF-native or HF-component custom models through model-owned adapters | model onboarding / functional bring-up |
 | **hf-model-precision-validation** | Validate module parity and distributed numerical self-consistency | model numerical acceptance / diagnosis |
+| **codegen-precision-validation** | Frozen codegen vs native-trainer dual-arm flow (fresh generate, 10-step boot, loss alignment) | codegen artifact acceptance / divergence diagnosis |
 
 ### Commands
 
