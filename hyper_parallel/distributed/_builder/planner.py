@@ -737,9 +737,9 @@ class ShardingPlanner:
                 therefore inferred only after ALL its descendants' parameters
                 have merged into it. On ``unknown`` the whole group's
                 parameters merge upward into the parent module. If still
-                unknown after backtracking to the root, attribute the group
-                to the parameter's own module (no template will match later
-                → warning and skip).
+                unknown after backtracking to the root, scatter the
+                parameters back to each parameter's own module (no template
+                will match later → warning and skip).
 
         (Fix for the merge-ordering hazard of the former tail-enqueue work
         queue: a parent enqueued by an early child — e.g. the MoE gate —
@@ -777,11 +777,16 @@ class ShardingPlanner:
                 if parent:
                     merged[parent].extend(params)
                 else:
-                    # Still unknown after backtracking to the root:
-                    # attribute to the parameter's own module (no template
-                    # will match later → skipped)
-                    origin = ".".join(params[0][0].split(".")[:-1]) if params else mfqn
-                    groups.setdefault(origin, params)
+                    # Still unknown after backtracking to the root: scatter
+                    # each parameter back to its own module (no template
+                    # will match later → warning and skip, or an
+                    # all-Replicate fallback spec for pure-replicable
+                    # leftovers). Attributing the whole merged group to the
+                    # first parameter's module would misplace every other
+                    # parameter's relative path in the fallback spec.
+                    for param_fqn, role in params:
+                        origin = ".".join(param_fqn.split(".")[:-1])
+                        groups.setdefault(origin, []).append((param_fqn, role))
         return groups
 
     # ── Phase 3 ─────────────────────────────────────────────────────────
