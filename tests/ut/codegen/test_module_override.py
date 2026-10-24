@@ -1,6 +1,16 @@
 # Copyright 2026 Huawei Technologies Co., Ltd
 #
-# Licensed under the Apache License, Version 2.0
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # ============================================================================
 """Contract tests for generated-model ``replace_module`` handling.
 
@@ -34,7 +44,7 @@ SOURCE_TEXT = '''\
 
 from torch import nn
 
-from tests.codegen.helpers import SourceMLP
+from tests.ut.codegen.helpers import SourceMLP
 
 
 class GeneratedModel(nn.Module):
@@ -88,11 +98,11 @@ def _spec_entries():
     return [
         PlanOverride(
             match="model.0",
-            module_type="tests.codegen.helpers.SourceMLP",
+            module_type="tests.ut.codegen.helpers.SourceMLP",
             exact_type=False,
             replace_module=Target(
                 helpers._replace_mlp,
-                target_path="tests.codegen.helpers._replace_mlp",
+                target_path="tests.ut.codegen.helpers._replace_mlp",
             ),
         )
     ]
@@ -104,7 +114,7 @@ def test_g7_meta_records_match_via_desugar_path(source_path):
     records = compile_overrides_for_meta(
         _meta_model(),
         specs,
-        factory_paths=["tests.codegen.helpers._replace_mlp"],
+        factory_paths=["tests.ut.codegen.helpers._replace_mlp"],
     )
 
     assert len(records) == 1
@@ -115,8 +125,8 @@ def test_g7_meta_records_match_via_desugar_path(source_path):
     assert record["fqns"] == ["model.0"]
     assert record["fqn"] == "model.0"
     # The factory must serialize by import path (a closure is not a literal).
-    assert record["factory"] == "tests.codegen.helpers._replace_mlp"
-    assert record["module_type"] == "tests.codegen.helpers.SourceMLP"
+    assert record["factory"] == "tests.ut.codegen.helpers._replace_mlp"
+    assert record["module_type"] == "tests.ut.codegen.helpers.SourceMLP"
     assert record["exact_type"] is False
     # The factory path survives to the record (the closure serialization).
     assert record["match"] and record["fqns"]
@@ -132,11 +142,11 @@ def test_g7_nomatch_pattern_fails_fast(source_path):
     """
     spec = PlanOverride(
         match="model.99",
-        module_type="tests.codegen.helpers.SourceMLP",
+        module_type="tests.ut.codegen.helpers.SourceMLP",
         exact_type=False,
         replace_module=Target(
             helpers._replace_mlp,
-            target_path="tests.codegen.helpers._replace_mlp",
+            target_path="tests.ut.codegen.helpers._replace_mlp",
         ),
     )
     specs = entries_to_module_replacements([spec])
@@ -144,7 +154,7 @@ def test_g7_nomatch_pattern_fails_fast(source_path):
         compile_overrides_for_meta(
             _meta_model(),
             specs,
-            factory_paths=["tests.codegen.helpers._replace_mlp"],
+            factory_paths=["tests.ut.codegen.helpers._replace_mlp"],
         )
 
 
@@ -154,8 +164,8 @@ def test_g7_no_model_class_fails_fast(source_path):
         "match": ["model.0"],
         "fqn": "model.0",
         "fqns": ["model.0"],
-        "module_type": "tests.codegen.helpers.SourceMLP",
-        "factory": "tests.codegen.helpers._replace_mlp",
+        "module_type": "tests.ut.codegen.helpers.SourceMLP",
+        "factory": "tests.ut.codegen.helpers._replace_mlp",
         "exact_type": False,
     }
     meta = _meta(source_path, model_class="GeneratedModel", overrides=[record])

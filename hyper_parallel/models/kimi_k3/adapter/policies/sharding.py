@@ -26,8 +26,10 @@ def build_parameter_sharding_rules() -> list[tuple[list[str], Any]]:
     return [
         (["q_conv1d", "k_conv1d", "v_conv1d"], ParamRole.COLWISE),
         (["A_log", "dt_bias"], ParamRole.COLWISE),
+        (["kv_a_proj_with_mqa"], ParamRole.REPLICATED),
         (["f_a_proj", "g_a_proj"], ParamRole.REPLICATED),
         (["f_b_proj", "b_proj", "g_proj", "g_b_proj"], ParamRole.COLWISE),
+        (["vision_tower.", "mm_projector."], ParamRole.REPLICATED),
     ]
 
 

@@ -1,4 +1,4 @@
-﻿# Copyright 2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 # Licensed under the Apache License, Version 2.0
 # ============================================================================
 """Derive the sharding plan for a model without a live process group.
@@ -19,6 +19,7 @@ import logging
 from typing import Any, Optional
 
 from hyper_parallel.codegen.plan.offline_mesh import build_offline_mesh
+from hyper_parallel.codegen.source.compat import install_output_recorder_compat
 from hyper_parallel.codegen.spec.types import CodegenSpec
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,7 @@ def build_meta_model(
     *,
     config_overrides: Optional[dict[str, Any]] = None,
     hf_config: Any = None,
+    trust_remote_code: bool = False,
 ) -> Any:
     """Construct an empty meta-device model for the spec's source.
 
@@ -70,6 +72,10 @@ def build_meta_model(
     tree with no weights and no network; wrapping it in
     ``components.utils.model_utils.init_empty_weights`` keeps the parameters
     on the meta device so a CPU-only host never allocates the model's memory.
+
+    ``trust_remote_code`` is forwarded from the YAML ``model:`` block so
+    remote-code checkpoints (``auto_map`` + ``modeling_*.py``) can be built
+    exactly like the trainer's HF backend loads them.
 
     Returns ``None`` only when the spec carries no model identity (the caller
     then skips plan derivation entirely).  A model that *is* configured but
@@ -81,6 +87,7 @@ def build_meta_model(
         return None
     try:
         from hyper_parallel import init_empty_weights
+        install_output_recorder_compat()
 
         custom_cls = _custom_model_cls(spec, hf_config)
         if custom_cls is not None:
@@ -88,20 +95,53 @@ def build_meta_model(
             # AutoModel; build it the way the trainer's CUSTOM/GEN backends
             # do — from the resolved config, which also carries any crop.
             if hf_config is None:
-                raise ValueError(
-                    "codegen: custom-registered model "
-                    f"{spec.source.architecture or model_id!r} needs the "
-                    "resolved config (hf_config) to build the meta model; "
-                    "AutoConfig cannot load it from the model id"
+                from transformers import AutoConfig
+
+                hf_config = AutoConfig.from_pretrained(
+                    model_id,
+                    trust_remote_code=trust_remote_code,
+                    **dict(config_overrides or {}),
                 )
             with init_empty_weights():
                 return custom_cls(hf_config)
 
-        from transformers import AutoConfig, AutoModelForCausalLM
+        from transformers import (
+            AutoConfig,
+            AutoModelForCausalLM,
+            AutoModelForImageTextToText,
+        )
 
-        config = AutoConfig.from_pretrained(model_id, **dict(config_overrides or {}))
+        config = AutoConfig.from_pretrained(
+            model_id,
+            trust_remote_code=trust_remote_code,
+            **dict(config_overrides or {}),
+        )
+        # Mirror the trainer's HF-native dispatch (model_builder._init_model
+        # Path A): pick the AutoModel class whose mapping recognizes the
+        # config, so multimodal (ForConditionalGeneration) sources build the
+        # way HyperAutoModelForImageTextToText would instead of failing the
+        # hardcoded CausalLM fallback.
+        causal_keys = tuple(AutoModelForCausalLM._model_mapping.keys())
+        vl_keys = tuple(AutoModelForImageTextToText._model_mapping.keys())
+        auto_map = getattr(config, "auto_map", None) or {}
+        if trust_remote_code and "AutoModelForImageTextToText" in auto_map:
+            auto_cls = AutoModelForImageTextToText
+        elif trust_remote_code and "AutoModelForCausalLM" in auto_map:
+            auto_cls = AutoModelForCausalLM
+        elif isinstance(config, causal_keys):
+            auto_cls = AutoModelForCausalLM
+        elif isinstance(config, vl_keys):
+            auto_cls = AutoModelForImageTextToText
+        else:
+            raise ValueError(
+                "codegen: no transformers AutoModel class recognizes the "
+                f"config {type(config).__name__} for {model_id!r} "
+                f"(architectures={getattr(config, 'architectures', None)})"
+            )
         with init_empty_weights():
-            return AutoModelForCausalLM.from_config(config)
+            return auto_cls.from_config(
+                config, trust_remote_code=trust_remote_code
+            )
     except Exception as exc:  # noqa: BLE001 - fail fast: an unbuildable source must not yield a plan-less artifact
         logger.error(
             "codegen: cannot build meta model for %r (%s: %s)",

@@ -83,19 +83,23 @@ def cmd_check_all(args: argparse.Namespace) -> int:
             if not getattr(config, "codegen", False):
                 logger.info("codegen: SKIP (codegen disabled) %s", yaml_path)
                 continue
-            from hyper_parallel.codegen.manager import preflight_integrity_check
+            from hyper_parallel.codegen.manager import (
+                preflight_integrity_check,
+                resolve_layout_for_config,
+            )
 
             preflight_integrity_check(config, yaml_path)
             logger.info("codegen: PASS %s", yaml_path)
             # Drift can only be checked when an artifact already exists.
             from hyper_parallel.codegen.check.drift import verify_drift_intact
             from hyper_parallel.codegen.meta import load_codegen_meta
-            from hyper_parallel.codegen.artifact import resolve_artifact_layout
 
-            layout = resolve_artifact_layout(yaml_path)
+            layout = resolve_layout_for_config(config, yaml_path)
             meta = load_codegen_meta(layout.meta_path)
             if meta is not None:
-                drifts = verify_drift_intact(meta, yaml_path)
+                drifts = verify_drift_intact(
+                    meta, yaml_path, artifact_dir=layout.artifact_dir
+                )
                 if drifts:
                     failed = 1
                     logger.error("codegen: drift in %s: %s", yaml_path, "; ".join(drifts))

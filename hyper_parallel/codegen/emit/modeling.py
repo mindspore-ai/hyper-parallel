@@ -116,10 +116,18 @@ def rewrite_relative_imports(text: str, module_name: str) -> str:
             i += 1
             continue
         dots_tok = tokens[j]
-        dots = len(dots_tok.string)
+        dots = 0
+        while (
+                j < n
+                and tokens[j].type == tokenize.OP
+                and tokens[j].string
+                and set(tokens[j].string) == {"."}
+        ):
+            dots += len(tokens[j].string)
+            j += 1
 
         # collect the relative module path: NAME ('.' NAME)*
-        k = j + 1
+        k = j
         path: list[str] = []
         last_path_tok = None
         while k < n:

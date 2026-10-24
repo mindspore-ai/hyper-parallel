@@ -19,7 +19,7 @@
 (meta -> plan, in ``codegen/runtime.py``) both walk this table, so a spec
 field can no longer be frozen-but-never-rebuilt (or the reverse): adding a
 field to ``ModuleShardingSpec`` without classifying it here fails the
-reflection test in ``tests/codegen/test_spec_field_table.py``.
+reflection test in ``tests/ut/codegen/test_spec_field_table.py``.
 
 The table is pure data (no torch, no imports from freeze/runtime — both
 consume it, so an import here would be circular).  Each entry names the

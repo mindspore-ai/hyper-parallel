@@ -23,12 +23,15 @@ classes defined inside it.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import importlib.util
 import logging
 import os
 import sys
 from types import ModuleType
 from typing import Any, Optional
+
+from hyper_parallel.codegen.source.compat import install_output_recorder_compat
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +104,7 @@ def import_generated_module(artifact_dir: str) -> ModuleType:
     Returns:
         ModuleType: The imported (and cached) generated modeling module.
     """
+    install_output_recorder_compat()
     modeling_path = find_generated_modeling_file(artifact_dir)
     stem = os.path.splitext(os.path.basename(modeling_path))[0]
     module_name = _module_name_for(artifact_dir, stem)
@@ -158,6 +162,21 @@ def _register_synthetic_package(module_name: str, artifact_dir: str) -> None:
     under the synthetic package name so ``torch.load``/``pickle`` resolve
     classes defined in them the same way they resolve the generated module.
     """
+    root_package = sys.modules.get(_GENERATED_MODULE_PREFIX)
+    if root_package is None:
+        root_package = ModuleType(_GENERATED_MODULE_PREFIX)
+        root_package.__package__ = _GENERATED_MODULE_PREFIX
+        root_package.__path__ = []
+        root_package.__file__ = "<codegen-synthetic-root-package>"
+        sys.modules[_GENERATED_MODULE_PREFIX] = root_package
+
+    # Installed Transformers modeling modules use ``from ..auto ...``. The
+    # generated file is one package level below the synthetic root, so retain
+    # that parent dependency under the equivalent synthetic name.
+    auto_name = f"{_GENERATED_MODULE_PREFIX}.auto"
+    if auto_name not in sys.modules:
+        sys.modules[auto_name] = importlib.import_module("transformers.models.auto")
+
     package_name = _package_name_for(module_name)
     package = sys.modules.get(package_name)
     if package is None:
@@ -220,6 +239,18 @@ def resolve_generated_model_class(module: ModuleType, hf_config: Any) -> type:
     arch_name = architectures[0]
     model_cls = getattr(module, arch_name, None)
     if model_cls is None:
+        # Some upstream checkpoints name the architecture without the
+        # separators the transformers class actually uses (Kimi-K2 ships
+        # "KimiK25ForConditionalGeneration" while the class is
+        # "Kimi_K25ForConditionalGeneration"). Fall back to a normalized
+        # comparison before giving up.
+        wanted = arch_name.replace("_", "").lower()
+        for name in sorted(vars(module)):
+            value = vars(module)[name]
+            if isinstance(value, type) and name.replace("_", "").lower() == wanted:
+                model_cls = value
+                break
+    if model_cls is None:
         available = sorted(
             name for name, value in vars(module).items() if isinstance(value, type)
         )
@@ -273,6 +304,24 @@ def _register_generated_model_conversions(model: Any) -> None:
             )
 
 
+def _with_dtype_kwarg(kwargs: dict, torch_dtype: Any) -> dict:
+    """Forward the target dtype to ``_from_config`` like the native path does.
+
+    The native from-config route (``model_builder._init_model``) passes
+    ``dtype`` into ``_from_config_parent_class``; transformers >= 5.14 resolves
+    it onto the config and every subconfig before instantiation.  Without it
+    the generated model builds under the default float32 while its inputs are
+    already bfloat16, which fails the first conv2d forward with a dtype
+    mismatch.  ``"auto"``/``None`` are not forwarded (mirroring the native
+    route's ``if torch_dtype != "auto"`` guard): transformers >= 5.14 resolves
+    a string dtype via ``getattr(torch, dtype)``, which would fail on "auto".
+    """
+    from_config_kwargs = dict(kwargs)
+    if torch_dtype not in (None, "auto"):
+        from_config_kwargs["dtype"] = torch_dtype
+    return from_config_kwargs
+
+
 def _load_generated_checkpoint(
     model_cls: type,
     pretrained_path: str,
@@ -293,12 +342,23 @@ def _load_generated_checkpoint(
     ``make_transforms()`` (scoped to its FQN) and publish the *pre-replacement*
     parameter shapes, then let ``CheckpointManager`` apply the conversions
     through the replacement-conversion route.
+
+    A meta-constructed model (world_size > 1, or a non-HF family) is returned
+    without materialization or loading: materializing the full model on CPU
+    here would allocate the whole parameter set on *every* rank -- a
+    full-model checkpoint load that is large enough to OOM host memory --
+    and the weights would be discarded anyway by the infrastructure stage's
+    ``to_empty``.  ``apply_model_infrastructure`` shards first and then loads
+    through the same ``CheckpointManager`` route (driven by the transforms
+    published below) onto the already-sharded parameters.
     """
     from hyper_parallel.models._transformers.checkpoint_loader import (  # pylint: disable=import-outside-toplevel
         CheckpointManager,
     )
 
-    model = model_cls._from_config(hf_config, *model_args, **kwargs)
+    model = model_cls._from_config(
+        hf_config, *model_args, **_with_dtype_kwarg(kwargs, torch_dtype)
+    )
     _register_generated_model_conversions(model)
 
     transforms: list[Any] = []
@@ -314,12 +374,22 @@ def _load_generated_checkpoint(
         model._hp_replacement_weight_conversions = transforms  # pylint: disable=protected-access
 
     # from_pretrained materializes meta tensors internally; _from_config
-    # does not. Materialize the meta model before loading so checkpoint
-    # copy targets are real tensors (init_device: meta in the training
-    # config). Downstream infra moves it to the accelerator afterwards.
+    # does not. Meta-constructed parameters (init_device: meta in the
+    # training config) stay on the meta device so the infrastructure stage
+    # can shard first and materialize only the per-rank shard on the target
+    # device; see the docstring for why loading here would be both wasteful
+    # and an OOM risk for large models.
     if any(p.is_meta for p in model.parameters()):
-        model.to_empty(device="cpu")
+        logger.info(
+            "codegen: meta model built; deferring weight load to the "
+            "post-sharding infrastructure stage"
+        )
+        return model
 
+    # Non-meta path (single process, HF family, no quantization): the
+    # infrastructure stage moves an already-initialized model with
+    # ``model.to(device)`` and never loads it, so the checkpoint must be
+    # loaded here.
     CheckpointManager(model).load_checkpoint(pretrained_path, strict=False)
     if torch_dtype not in (None, "auto"):
         _cast_parameters_to(model, torch_dtype)
@@ -426,7 +496,9 @@ def init_generated_model(
         # canonical entry in both 5.14.x and the pinned 5.15.0; the AutoModel
         # family's ``from_config`` (which the native path borrows) is just a
         # resolver that ultimately calls ``_from_config`` anyway.
-        model = model_cls._from_config(hf_config, *model_args, **kwargs)
+        model = model_cls._from_config(
+            hf_config, *model_args, **_with_dtype_kwarg(kwargs, torch_dtype)
+        )
         _register_generated_model_conversions(model)
 
     from hyper_parallel.codegen.check.preflight import (  # pylint: disable=import-outside-toplevel

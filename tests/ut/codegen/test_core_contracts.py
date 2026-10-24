@@ -115,6 +115,7 @@ def test_external_state_classes_travel_from_structure_to_the_runtime() -> None:
     meta.source = {"architecture": "Qwen3MoeForCausalLM"}
     meta.injections = [
         {
+            "match": "model.layers.0.mlp",
             "local_compute_fn": {
                 "_target_": (
                     "hyper_parallel.models.qwen3_moe.adapter.distributed."
@@ -123,6 +124,9 @@ def test_external_state_classes_travel_from_structure_to_the_runtime() -> None:
             }
         }
     ]
+    # The block class is a per-model fact: it is derived from the frozen
+    # boundary map (FQN -> class), never from a registered literal.
+    meta.boundary_classes = {"model.layers.0.mlp": "Qwen3MoeSparseMoeBlock"}
     manager._record_inline_declarations(meta)
     assert meta.external_state_classes == ["Qwen3MoeSparseMoeBlock"]
 
@@ -223,10 +227,14 @@ def test_training_args_only_parse_config(
     assert config_parser.parse_training_args([str(yaml_path)]) is config
 
 
-def test_codegen_layout_prefers_yaml_path_and_hf_model_type(
+def test_codegen_layout_prefers_model_anchored_bundle_for_known_families(
     tmp_path: Path,
 ) -> None:
-    """YAML codegen paths and the HF model type win over defaults."""
+    """A model with a family directory anchors the bundle inside ``models/``.
+
+    The YAML stays recorded as provenance; unknown families (no directory
+    under ``hyper_parallel/models``) fall back to the YAML-anchored layout.
+    """
     yaml_path = tmp_path / "examples" / "training_demo" / "train_codegen.yaml"
     config = _TrainingConfig(codegen=True)
     config._yaml_path = str(yaml_path)  # pylint: disable=protected-access
@@ -239,8 +247,33 @@ def test_codegen_layout_prefers_yaml_path_and_hf_model_type(
         hf_config=hf_config,
     )
 
-    assert Path(layout.artifact_dir) == yaml_path.parent / "generated"
+    models_root = Path(manager.__file__).resolve().parents[1] / "models"
+    assert Path(layout.artifact_dir) == models_root / "qwen3_moe" / "generated"
     assert Path(layout.modeling_path).name == "modeling_Qwen3_Moe_gen_npu.py"
+    assert layout.yaml_path == str(yaml_path)
+
+
+def test_codegen_layout_warns_and_anchors_for_unknown_families(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A model type without a models directory warns and keeps its own dir."""
+    yaml_path = tmp_path / "examples" / "training_demo" / "train_codegen.yaml"
+    config = _TrainingConfig(codegen=True)
+    config._yaml_path = str(yaml_path)  # pylint: disable=protected-access
+    hf_config = SimpleNamespace(model_type="no_such_model_type")
+
+    with caplog.at_level("WARNING", logger="hyper_parallel.codegen.artifact"):
+        layout = manager._resolve_layout(  # pylint: disable=protected-access
+            config,
+            yaml_path=None,
+            artifact_dir=None,
+            hf_config=hf_config,
+        )
+
+    models_root = Path(manager.__file__).resolve().parents[1] / "models"
+    assert Path(layout.artifact_dir) == models_root / "no_such_model_type" / "generated"
+    assert "no_such_model_type" in caplog.text
 
 
 @pytest.mark.parametrize(("rank", "expected"), [("0", True), ("1", False)])

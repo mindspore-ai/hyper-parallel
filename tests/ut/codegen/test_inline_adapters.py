@@ -28,7 +28,8 @@ from hyper_parallel.codegen.emit.modeling import _apply_inline_modeling
 from hyper_parallel.codegen.emit.parallel import lower_forward_boundaries
 from hyper_parallel.codegen import manager
 from hyper_parallel.codegen.inline.ir import (
-    ForwardExtractPatch, InlinePatchSet, InlineRule, ModuleSnippetPatch,
+    ConstructorReplacePatch, ForwardExtractPatch, InlinePatchSet, InlineRule,
+    ModuleSnippetPatch,
 )
 from hyper_parallel.codegen.inline.framework_spec import interface_component_class
 from hyper_parallel.codegen.inline.meta_plan import normalize_inline_meta
@@ -47,6 +48,10 @@ ATTENTION = QWEN_ROOT + "conversion.module_replacement.replace_qwen3_moe_flash_a
 ATTENTION_TYPE = "transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention"
 EP = QWEN_ROOT + "distributed.expert_parallel.qwen3moe_ep_compute_fn"
 CP = QWEN_ROOT + "distributed.context_parallel.qwen3_moe_flash_attention_cp_wrapper"
+DEEPSEEK_CP = (
+    "hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel"
+    ".deepseek_v32_dsa_attention_cp_wrapper"
+)
 
 TOY_REPLACEMENTS = "hyper_parallel.models.toy.adapter.replacements"
 TOY_NORM = TOY_REPLACEMENTS + ".replace_toy_norm"
@@ -204,11 +209,197 @@ class TestInlineAdapters(unittest.TestCase):
         self.assertIs(
             legacy, replacement_spec(ATTENTION, "Qwen3MoeForCausalLM", module_type=ATTENTION_TYPE)
         )
-        self.assertEqual(strategy_spec(EP).target_class, "Qwen3MoeSparseMoeBlock")
+        # The capability spec carries no block class: the concrete class is a
+        # per-model fact derived from the frozen boundary map.
+        self.assertIsNone(strategy_spec(EP).target_class)
+        self.assertIsNotNone(strategy_spec(EP).body_template)
         # A CP wrapper is a strategy *because of its position* in the override
         # (``inner_wrapper``); the same target as a local compute fn is not one.
         self.assertIsNone(strategy_spec(CP))
         self.assertIsNone(strategy_spec(CP, inner_wrapper=True).body_template)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="onecard", essential_mark="unessential")
+    def test_deepseek_v32_cp_inline_resolves_subclass_shell_and_imports(self):
+        """DeepSeek-V3.2 CP inner wrapper resolves to an inline subclass shell.
+
+        Feature: structure-driven inline source generation.
+        Description: A family declaring ``context_parallel_inline`` gets a CP
+            dispatch subclass materialized into the generated artifact, plus
+            the helper import needed to call it.
+        Expectation: the resolved strategy spec carries a subclass shell (no
+            target class, no forward-replacing body) and the helper import.
+        """
+        spec = strategy_spec(DEEPSEEK_CP, "deepseek_v32", inner_wrapper=True)
+        self.assertIsNone(spec.target_class)
+        self.assertIsNone(spec.body_template)
+        self.assertIsNotNone(spec.subclass_shell)
+        self.assertIn("_deepseek_v32_dsa_cp_forward", spec.subclass_shell)
+        self.assertIn("if not self.cp_enable:", spec.subclass_shell)
+        self.assertEqual(spec.subclass_state_attr,
+                         "_hp_deepseek_v32_dsa_cp_mesh")
+        self.assertTrue(spec.imports)
+        import_names = [name for patch in spec.imports for name in patch.names]
+        self.assertIn("_deepseek_v32_dsa_cp_forward", import_names)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="onecard", essential_mark="unessential")
+    def test_cp_subclass_materializes_snippet_and_ctor_swap_without_forward_extract(self):
+        """The CP shell materializes per host as a subclass plus a name swap.
+
+        Feature: structure-driven inline source generation.
+        Description: A CP rule materializes one in-artifact subclass per
+            attention host — a module snippet carrying the ``_hp_inline_cp``
+            marker plus a scoped name-mode constructor swap — and the host
+            keeps its compiled boundary forward, so no forward extract exists.
+        Expectation: repeated rules re-deriving the same host add nothing, and
+            a rule selecting no boundary fails fast instead of emitting an
+            artifact that silently lost the strategy.
+        """
+        rules = (
+            InlineRule(("model.layers.0.self_attn",), inner_wrapper_target=DEEPSEEK_CP),
+            InlineRule(("model.layers.5.self_attn",), inner_wrapper_target=DEEPSEEK_CP),
+        )
+        boundary = {
+            "model.layers.0.self_attn": "DeepseekV32DSAAttention",
+            "model.layers.5.self_attn": "DeepseekV32DSAAttention",
+        }
+        patches = build_strategy_patches(rules, "deepseek_v32", boundary)
+        self.assertEqual(len(patches.module_snippets), 1)
+        snippet = patches.module_snippets[0].text
+        self.assertIn("class DeepseekV32DSAAttentionCP(DeepseekV32DSAAttention):", snippet)
+        self.assertIn("_hp_inline_cp = True", snippet)
+        self.assertIn('_hp_cp_state_attr = "_hp_deepseek_v32_dsa_cp_mesh"', snippet)
+        self.assertIn("if not self.cp_enable:", snippet)
+        self.assertIn("_deepseek_v32_dsa_cp_forward(self, *args, **kwargs)", snippet)
+        self.assertEqual(patches.constructor_replaces, [
+            ConstructorReplacePatch(
+                old_ctor="DeepseekV32DSAAttention",
+                new_ctor="DeepseekV32DSAAttentionCP",
+                mode="name",
+                scope_attrs=("self_attn",),
+            ),
+        ])
+        self.assertEqual(patches.forward_extracts, [])
+        with self.assertRaisesRegex(RuntimeError, "matched no boundary"):
+            build_strategy_patches(rules[:1], "deepseek_v32", {"model.layers.0.mlp": "MLP"})
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="onecard", essential_mark="unessential")
+    def test_one_strategy_target_materializes_across_distinct_hosts(self):
+        """One EP target serving dense and MoE layers materializes both.
+
+        Feature: structure-driven inline source generation.
+        Description: Rules sharing one strategy target may select different
+            host classes — one EP compute target serving both dense-MLP and
+            MoE layers — so every rule derives its hosts and the per-class
+            bookkeeping keeps one forward extract per host.
+        Expectation: three rules over two distinct hosts emit two extracts,
+            and a rule re-selecting an emitted host adds no third.
+        """
+        rules = (
+            InlineRule(("model.layers.3.mlp",), local_compute_target=EP),
+            InlineRule(("model.layers.1.mlp",), local_compute_target=EP),
+            InlineRule(("model.layers.7.mlp",), local_compute_target=EP),
+        )
+        boundary = {
+            "model.layers.3.mlp": "Qwen3MoeSparseMoeBlock",
+            "model.layers.1.mlp": "DenseMLP",
+            "model.layers.7.mlp": "DenseMLP",
+        }
+        patches = build_strategy_patches(rules, "qwen3_moe", boundary)
+        self.assertEqual(
+            sorted(extract.class_name for extract in patches.forward_extracts),
+            ["DenseMLP", "Qwen3MoeSparseMoeBlock"],
+        )
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="onecard", essential_mark="unessential")
+    def test_shell_hidden_arg_token_binds_to_each_hosts_first_parameter(self):
+        """The shell token resolves per host from its own forward signature.
+
+        Feature: structure-driven inline source generation.
+        Description: One strategy template carries ``__hp_hidden_arg__``
+            because its hosts name their first parameter differently (a MoE
+            block takes ``hidden_states``, a dense MLP takes ``x``); the
+            patch engine binds the token to each host's first positional
+            parameter at apply time.
+        Expectation: each host's inlined body uses its own parameter name, no
+            token survives anywhere, and a host without a positional parameter
+            fails fast.
+        """
+        source = """
+class DenseMLP:
+    def forward(self, x):
+        return x
+
+class SparseMoe:
+    def forward(self, hidden_states):
+        return hidden_states
+
+class Vararg:
+    def forward(self, *args):
+        return args
+"""
+        body = "return __hp_hidden_arg__ + 1"
+        patch_set = InlinePatchSet()
+        patch_set.forward_extracts.extend([
+            ForwardExtractPatch(class_name="DenseMLP", method_name="forward", body=body),
+            ForwardExtractPatch(class_name="SparseMoe", method_name="forward", body=body),
+        ])
+        rendered = apply_patch_set(source, patch_set)
+        self.assertIn("return x + 1", rendered)
+        self.assertIn("return hidden_states + 1", rendered)
+        self.assertNotIn("__hp_hidden_arg__", rendered)
+        ast.parse(rendered)
+        vararg_set = InlinePatchSet()
+        vararg_set.forward_extracts.append(
+            ForwardExtractPatch(class_name="Vararg", method_name="forward", body=body)
+        )
+        with self.assertRaisesRegex(RuntimeError, "no positional parameter"):
+            apply_patch_set(source, vararg_set)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="onecard", essential_mark="unessential")
+    def test_name_swap_retargets_the_callsite_a_wrap_patch_introduced(self):
+        """The CP name swap runs after the wrap, on the re-parsed text.
+
+        Feature: structure-driven inline source generation.
+        Description: The DeepSeek-V3.2 attention replacement wraps with a
+            component of the same name, so the wrap introduces a NEW outer
+            ``DeepseekV32DSAAttention(...)`` call; the CP name swap must run
+            on the re-parsed wave output to retarget that outer call —
+            applying it first would consume the wrap's call site.
+        Expectation: the assignment installs the CP subclass wrapping the
+            component, and the inner original constructor call survives.
+        """
+        source = """
+class D:
+    def __init__(self):
+        pass
+
+class DCP(D):
+    def __init__(self):
+        super().__init__()
+
+class Layer:
+    def __init__(self):
+        self.self_attn = D()
+"""
+        patch_set = InlinePatchSet()
+        patch_set.constructor_replaces.extend([
+            ConstructorReplacePatch(
+                old_ctor="D", new_ctor="D", mode="wrap_source",
+                keyword_args=("module_fqn=''",), scope_attrs=("self_attn",),
+            ),
+            ConstructorReplacePatch(
+                old_ctor="D", new_ctor="DCP", mode="name", scope_attrs=("self_attn",),
+            ),
+        ])
+        rendered = apply_patch_set(source, patch_set)
+        self.assertIn("self.self_attn = DCP(module=D(), module_fqn='')", rendered)
+        self.assertNotIn("self.self_attn = D(module=D()", rendered)
+        ast.parse(rendered)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
               card_mark="onecard", essential_mark="unessential")
@@ -348,10 +539,11 @@ class Model:
         self.attn = Qwen3MoeAttention()
 """
         meta = _meta(
-            injections=[{"local_compute_fn": EP}, {"inner_wrapper": CP}],
+            injections=[{"match": "blocks.0.mlp", "local_compute_fn": EP}, {"inner_wrapper": CP}],
             module_type="transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention",
             fqns=("blocks.0.attn",),
         )
+        meta.boundary_classes = {"blocks.0.mlp": "Qwen3MoeSparseMoeBlock"}
         expected_meta = deepcopy(meta)
         inferred = render_inline_modeling(source, meta)
         explicit = render_inline_modeling(source, expected_meta, "qwen3_moe")
@@ -554,7 +746,7 @@ class Model:
         Description: A partial method patch cannot silently count as supported.
         Expectation: the emitted artifact and metadata satisfy the assertions in this test.
         """
-        with self.assertRaisesRegex(ValueError, "provided together"):
+        with self.assertRaisesRegex(ValueError, "requires a body_template"):
             StrategySpec("invalid", (), target_class="ToyBlock")
         with self.assertRaisesRegex(ValueError, "nonempty"):
             StrategySpec("invalid", (), target_class="ToyBlock", body_template="")
