@@ -188,3 +188,27 @@ PyTorch/torch-npu `2.10.0` at these source revisions:
 | --- | --- |
 | ops-nn | `b7af75e68cc07c0912f9e020bce639e53de60700` |
 | ops-transformer | `a041b05638a5a3f94b79c97ce196a331738a56a1` |
+
+## Linear attention backends
+
+`backend="ascendc"` for local KDA/GDN and pure Ulysses requires
+[fla-npu](https://github.com/flashserve/flash-linear-attention-npu), installed with
+matching Python bindings, stable launcher and native operator libraries.
+The adapter targets commit `2bb7e74ecf4876acbc4527070e403bffeef06e75` (including #993).
+Install the wheel appropriate to the target hardware and CANN environment using
+[the upstream installation guide](https://github.com/flashserve/flash-linear-attention-npu).
+
+KDA requires `chunk_kda_fwd_prepare` save mode, `chunk_fwd_h`,
+`chunk_kda_fwd_finalize`, and `chunk_kda_bwd` with the single `layout` argument
+and `beta_eff` cache. `dO`, raw gate/beta and their gradients are token-major;
+normalized Q/K and saved Prepare caches are head-major. The native sigmoid
+backward is used where implemented; other implementations require FLA's
+`fused_beta_sigmoid_bwd`. The paired FLA source is
+`6b6f546f9bd10a97be1e8cf2f0120de70cfca482` with Triton-Ascend support.
+
+GDN requires `chunk_gated_delta_rule_fwd` and `chunk_gated_delta_rule_bwd` with
+`layout`, `cu_seqlens` and `chunk_indices`. Normalization and effective gate/beta
+remain in the caller's autograd graph. Both wrappers use per-invocation save
+mode and reject unsupported state-gradient requests. Pure Ulysses uses the
+same backend for causal convolution; Ascend C additionally requires
+`causal_conv1d` and `causal_conv1d_bwd` with the SiLU derivative included.

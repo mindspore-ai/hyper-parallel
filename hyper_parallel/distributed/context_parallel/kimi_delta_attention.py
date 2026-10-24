@@ -54,7 +54,7 @@ from hyper_parallel.distributed.context_parallel.kimi_delta_attention_state impo
 )
 
 
-_KDA_BACKENDS = frozenset({"eager", "triton"})
+_KDA_BACKENDS = frozenset({"eager", "triton", "ascendc"})
 
 
 def _run_local_kda(
@@ -74,8 +74,14 @@ def _run_local_kda(
     sequence_info: Optional[PackedSequenceInfo] = None,
 ) -> torch.Tensor:
     """Run the explicitly selected local KDA implementation."""
-    if backend == "triton" and not safe_gate:
+    if backend in ("triton", "ascendc") and not safe_gate:
         raise RuntimeError("The fused KDA backend requires the lower-bounded gate.")
+    cu_seqlens = None
+    if sequence_info is not None:
+        # Native APIs consume host metadata; do not materialize an NPU plan
+        # only to copy its offsets back to the host at every layer.
+        cu_seqlens = (sequence_info.local_offsets if backend == "ascendc" else
+                      sequence_info.materialize(query.device, chunk_size).cu_seqlens)
     output, _ = chunk_kda(
         query,
         key,
@@ -93,7 +99,7 @@ def _run_local_kda(
         use_gate_in_kernel=True,
         use_beta_sigmoid_in_kernel=True,
         backend=backend,
-        cu_seqlens=None if sequence_info is None else sequence_info.materialize(query.device, chunk_size).cu_seqlens,
+        cu_seqlens=cu_seqlens,
     )
     return output
 
@@ -837,6 +843,8 @@ class _KDAStateCP(nn.Module):
         self.cp_size = self.cp_mesh.size()
         self.cp_rank = self.cp_mesh.get_local_rank()
         self.cp_group = self.cp_mesh.get_group()
+        if backend == "ascendc" and self.cp_size != 1:
+            raise NotImplementedError("Ascend C KDA currently supports local execution and pure Ulysses only.")
         if backend != "triton" and state_cp_method != "p2p":
             raise ValueError("KDA AllGather state exchange requires backend='triton'.")
         self.state_cp = build_kda_state_cp(self.cp_mesh, state_cp_method, allgather_group_size)
@@ -1296,7 +1304,7 @@ class KimiDeltaAttentionLayerCP(nn.Module):
         num_v_heads = _num_value_heads(self.module)
         if num_v_heads % self.module.num_heads:
             raise ValueError("KDA num_v_heads must be divisible by num_heads.")
-        if self.backend == "triton" and (
+        if self.backend in ("triton", "ascendc") and (
             self.module.head_k_dim != 128 or _value_head_dim(self.module) != 128
         ):
             raise NotImplementedError(

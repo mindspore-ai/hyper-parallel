@@ -11,6 +11,7 @@ TND 将多个独立文档的 token 连续拼接。文档边界必须同时约束
 | KDA AllGather、分组 AllGather + P2P | 支持；使用 Triton-Ascend |
 | KDA Ulysses + P2P / AllGather / 分组 AllGather + P2P | 支持；保持原有并行配置入口 |
 | GDN 本地层、P2P、纯 Ulysses | 支持；可选 eager 参考与 Triton-Ascend |
+| KDA / GDN 本地算子、纯 Ulysses | 可选 Ascend C；各后端的算子能力与限制见下文及 KDA 指南 |
 
 层入口接受 `[T, hidden_size]` 或 `[1, T, hidden_size]`，输出保持输入维数。
 投影后的算子接受 `[T, H, D]` 或 `[1, T, H, D]`。TND 的批维为 1；多个文档由累计长度表示。
@@ -132,7 +133,8 @@ gdn_layer = GatedDeltaNetUlyssesCP(original_gdn_layer, cp_mesh, backend="triton"
 ```
 
 `eager` 使用 Torch 参考实现；`triton` 使用 FLA 的注意力与卷积算子，需要兼容的
-FLA / Triton-Ascend 环境。显式选择的后端不做静默回退。
+FLA / Triton-Ascend 环境。`ascendc` 使用 fla-npu 的注意力与卷积入口。
+显式选择的后端不做静默回退。
 融合卷积要求 stride=1、dilation=1、depthwise 因果零填充和 SiLU。
 
 Dense 卷积保留 `[B,S,C]` 的 batch 隔离；packed 由同一公共适配传递真实文档 offsets，
@@ -169,3 +171,28 @@ GDN 前向状态算子同时包含 key-gate 的布局和地址修复：`gk` 在�
 布局，packed 分支使用全局 token 长度和文档起点寻址；`g=None`、`save_new_value=False` 不再操作空对象。
 这项修复不改变本文常规 scalar-gate GDN 的递推算术，也不扩大公开训练接口：仅 key-gate 的完整 backward
 尚未在本特性中获得支持，不能根据前向可用推断整条训练路径可用。
+
+## GDN 的 Ascend C 后端
+
+Qwen3.5 纯 Ulysses 可选择 `backend: ascendc`，同一配置选择本地 attention 与 ShortConv。
+TND 的 decoder metadata wrapper 不变，CP1 的 packed local wrapper 也支持该后端。
+依赖与公开算子接口见 [functional 说明](../../hyper_parallel/components/functional/README.md#linear-attention-backends)。
+
+```yaml
+plan_overrides:
+  - match: "model.layers.0.linear_attn.forward"
+    when: cp
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel.qwen3_5_gdn_ulysses_cp_wrapper
+        backend: ascendc
+```
+
+当前适配输入为核外归一化的 Q/K、有效 log-decay 与 sigmoid(beta)。它们的 autograd 链保留在调用方；
+原生 GDN 前反向关闭对应的 `in_kernel` 开关，避免重复处理。
+文档 offsets 按调用保存，dense 与 packed 共用公开原生前反向入口，末块无需 64 对齐。
+
+当前不开放非零初态、最终态输出/梯度、double backward 与 Ascend C 状态 P2P。
+显式选择的后端不做静默回退。融合卷积需要宽度为 2/3/4、通道数能被 16 整除，
+输入、权重和 bias 使用相同的 BF16 或 FP16 dtype；不隐式降低参数精度。

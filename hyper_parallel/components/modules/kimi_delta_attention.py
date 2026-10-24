@@ -36,18 +36,19 @@ __all__ = [
     "torch_recurrent_kda",
 ]
 
+from collections.abc import Sequence
 from typing import Any, Optional
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
+from hyper_parallel.components.functional.kimi_delta_attention_ascendc import ascendc_chunk_kda
 from hyper_parallel.components.functional.linear_attention_packed import (
     packed_causal_conv1d, packed_reference, resolve_packed_sequence,
 )
 
-
-_KDA_BACKENDS = frozenset({"eager", "triton"})
+_KDA_BACKENDS = frozenset({"eager", "triton", "ascendc"})
 _TRITON_KDA_HEAD_DIM = 128
 _TRITON_KDA_CHUNK_SIZE = 64
 
@@ -380,6 +381,83 @@ def _inverse_unit_lower_triangular(strict_lower: torch.Tensor) -> torch.Tensor:
     return torch.stack(rows, dim=-2)
 
 
+def _prepare_kda_wy(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    chunk_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the cumulative gate, causal mask, and chunkwise WY factors."""
+    gate = gate.cumsum(dim=-2)
+    causal = torch.ones(
+        chunk_size,
+        chunk_size,
+        dtype=torch.bool,
+        device=query.device,
+    ).tril()
+    strict_causal = causal.logical_xor(
+        torch.eye(chunk_size, dtype=torch.bool, device=query.device)
+    )
+
+    gate_pair = gate.unsqueeze(-2) - gate.unsqueeze(-3)
+    key_pair = torch.einsum(
+        "...ik,...jk,...ijk->...ij",
+        key,
+        key,
+        gate_pair.exp(),
+    )
+    strict_lower = (
+        key_pair * beta.unsqueeze(-1)
+    ).masked_fill(~strict_causal, 0)
+    inverse = _inverse_unit_lower_triangular(strict_lower)
+    transform = inverse * beta.unsqueeze(-2)
+    w = transform @ (key * gate.exp())
+    u = transform @ value
+
+    return gate, causal, w, u
+
+
+def _run_kda_chunks(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    gate: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    state: torch.Tensor,
+    causal: torch.Tensor,
+    scale: float,
+    num_chunks: int,
+) -> tuple[list[torch.Tensor], torch.Tensor]:
+    """Apply chunk WY factors to the recurrent state in sequence order."""
+    output_chunks = []
+    for chunk_idx in range(num_chunks):
+        query_i = query[:, :, chunk_idx]
+        key_i = key[:, :, chunk_idx]
+        gate_i = gate[:, :, chunk_idx]
+        w_i = w[:, :, chunk_idx]
+        u_i = u[:, :, chunk_idx]
+
+        relative_gate = gate_i.unsqueeze(-2) - gate_i.unsqueeze(-3)
+        qk = torch.einsum(
+            "bhik,bhjk,bhijk->bhij",
+            query_i,
+            key_i,
+            relative_gate.exp(),
+        ).masked_fill(~causal, 0)
+        value_new = u_i - w_i @ state
+        output_inter = (query_i * gate_i.exp()) @ state
+        output_chunks.append(output_inter * scale + qk @ value_new * scale)
+
+        last_gate = gate_i[:, :, -1]
+        key_decay = key_i * (last_gate.unsqueeze(-2) - gate_i).exp()
+        state = state * last_gate.exp().unsqueeze(-1)
+        state = state + key_decay.transpose(-1, -2) @ value_new
+
+    return output_chunks, state
+
+
 def torch_chunk_kda(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -451,31 +529,7 @@ def torch_chunk_kda(
     query, key, value, gate, beta = [
         chunk_view(tensor) for tensor in (query, key, value, gate, beta)
     ]
-    gate = gate.cumsum(dim=-2)
-    causal = torch.ones(
-        chunk_size,
-        chunk_size,
-        dtype=torch.bool,
-        device=query.device,
-    ).tril()
-    strict_causal = causal.logical_xor(
-        torch.eye(chunk_size, dtype=torch.bool, device=query.device)
-    )
-
-    gate_pair = gate.unsqueeze(-2) - gate.unsqueeze(-3)
-    key_pair = torch.einsum(
-        "...ik,...jk,...ijk->...ij",
-        key,
-        key,
-        gate_pair.exp(),
-    )
-    strict_lower = (
-        key_pair * beta.unsqueeze(-1)
-    ).masked_fill(~strict_causal, 0)
-    inverse = _inverse_unit_lower_triangular(strict_lower)
-    transform = inverse * beta.unsqueeze(-2)
-    w = transform @ (key * gate.exp())
-    u = transform @ value
+    gate, causal, w, u = _prepare_kda_wy(query, key, value, gate, beta, chunk_size)
 
     state = _initial_kda_state(
         value.permute(0, 2, 3, 1, 4).reshape(
@@ -484,29 +538,7 @@ def torch_chunk_kda(
         k_head_dim,
         initial_state,
     )
-    output_chunks = []
-    for chunk_idx in range(num_chunks):
-        query_i = query[:, :, chunk_idx]
-        key_i = key[:, :, chunk_idx]
-        gate_i = gate[:, :, chunk_idx]
-        w_i = w[:, :, chunk_idx]
-        u_i = u[:, :, chunk_idx]
-
-        relative_gate = gate_i.unsqueeze(-2) - gate_i.unsqueeze(-3)
-        qk = torch.einsum(
-            "bhik,bhjk,bhijk->bhij",
-            query_i,
-            key_i,
-            relative_gate.exp(),
-        ).masked_fill(~causal, 0)
-        value_new = u_i - w_i @ state
-        output_inter = (query_i * gate_i.exp()) @ state
-        output_chunks.append(output_inter * scale + qk @ value_new * scale)
-
-        last_gate = gate_i[:, :, -1]
-        key_decay = key_i * (last_gate.unsqueeze(-2) - gate_i).exp()
-        state = state * last_gate.exp().unsqueeze(-1)
-        state = state + key_decay.transpose(-1, -2) @ value_new
+    output_chunks, state = _run_kda_chunks(query, key, gate, w, u, state, causal, scale, num_chunks)
 
     output = torch.stack(output_chunks, dim=2)
     output = output.permute(0, 2, 3, 1, 4).reshape(
@@ -519,16 +551,27 @@ def torch_chunk_kda(
     return output, state if output_final_state else None
 
 
-def _validate_triton_state_contract(initial_state, output_final_state, qk_norm, gate, beta) -> None:
+def _normalize_kda_backend(backend: str) -> str:
+    """Normalize the selected backend and reject unsupported names."""
+    backend = backend.lower()
+    if backend not in _KDA_BACKENDS:
+        raise ValueError(
+            f"unsupported KDA backend {backend!r}; "
+            f"expected one of {sorted(_KDA_BACKENDS)}."
+        )
+    return backend
+
+
+def _validate_fused_state_contract(initial_state, output_final_state, qk_norm, gate, beta, backend) -> None:
     """Keep raw-input dispatch separate from the stateful CP backend contract."""
     if initial_state is not None or output_final_state:
         raise NotImplementedError(
-            "KDA backend='triton' currently supports zero initial state without "
+            f"KDA backend={backend!r} currently supports zero initial state without "
             "returning a final state; stateful execution is owned by the CP backend."
         )
     if not (qk_norm and gate and beta):
         raise NotImplementedError(
-            "KDA backend='triton' requires fused Q/K normalization, gate activation, "
+            f"KDA backend={backend!r} requires fused Q/K normalization, gate activation, "
             "and beta sigmoid."
         )
 
@@ -551,9 +594,9 @@ def chunk_kda(
     lower_bound: Optional[float] = None,
     chunk_size: int = 64,
     backend: str = "eager",
-    cu_seqlens: Optional[torch.Tensor] = None,
+    cu_seqlens: Optional[torch.Tensor | Sequence[int]] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Dispatch KDA to an explicitly selected eager or Triton backend."""
+    """Dispatch dense or packed KDA to the explicitly selected local backend."""
     if query.ndim == 3:
         output, final = chunk_kda(
             *(tensor.unsqueeze(0) for tensor in (query, key, value, gate, beta)),
@@ -562,12 +605,7 @@ def chunk_kda(
             use_gate_in_kernel=use_gate_in_kernel, use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
             lower_bound=lower_bound, chunk_size=chunk_size, backend=backend, cu_seqlens=cu_seqlens)
         return output.squeeze(0), final
-    backend = backend.lower()
-    if backend not in _KDA_BACKENDS:
-        raise ValueError(
-            f"unsupported KDA backend {backend!r}; "
-            f"expected one of {sorted(_KDA_BACKENDS)}."
-        )
+    backend = _normalize_kda_backend(backend)
     if backend == "eager":
         return torch_chunk_kda(
             query,
@@ -587,8 +625,16 @@ def chunk_kda(
             chunk_size=chunk_size,
             cu_seqlens=cu_seqlens,
         )
-    _validate_triton_state_contract(initial_state, output_final_state, use_qk_l2norm_in_kernel,
-                                   use_gate_in_kernel, use_beta_sigmoid_in_kernel)
+    _validate_fused_state_contract(initial_state, output_final_state, use_qk_l2norm_in_kernel,
+                                  use_gate_in_kernel, use_beta_sigmoid_in_kernel, backend)
+    if backend == "ascendc":
+        output = ascendc_chunk_kda(
+            query, key, value, gate, beta,
+            a_log=a_log.float() if a_log is not None else None,
+            dt_bias=dt_bias.float() if dt_bias is not None else None,
+            scale=scale, lower_bound=lower_bound, chunk_size=chunk_size, cu_seqlens=cu_seqlens,
+        )
+        return output, None
     triton_a_log = a_log.float() if a_log is not None else None
     triton_dt_bias = dt_bias.float() if dt_bias is not None else None
     if not _is_triton_kda_input_supported(

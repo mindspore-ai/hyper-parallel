@@ -31,7 +31,7 @@ from hyper_parallel.components.functional.linear_attention_packed import (
     packed_reference,
 )
 
-_GDN_BACKENDS = frozenset({"eager", "triton"})
+_GDN_BACKENDS = frozenset({"eager", "triton", "ascendc"})
 _MIN_TRITON_ASCEND_VERSION = (3, 2, 1)
 _TRITON_GDN_HEAD_DIM = 128
 _TRITON_GDN_CHUNK_SIZE = 64
@@ -228,7 +228,7 @@ def chunk_gated_delta_rule(
     backend: str = "eager",
     cu_seqlens: Optional[torch.Tensor] = None,
 ):
-    """Dispatch GDN to an explicitly selected eager or Triton backend."""
+    """Dispatch GDN to an explicitly selected eager, Triton or Ascend C backend."""
     if query.ndim == 3:
         output, final = chunk_gated_delta_rule(
             *(tensor.unsqueeze(0) for tensor in (query, key, value, g, beta)),
@@ -255,6 +255,19 @@ def chunk_gated_delta_rule(
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             cu_seqlens=cu_seqlens,
         )
+    if backend == "ascendc":
+        if initial_state is not None or output_final_state:
+            raise NotImplementedError("GDN Ascend C currently supports zero-state local or pure Ulysses training only.")
+        if chunk_size != 64:
+            raise ValueError("GDN Ascend C requires chunk_size=64.")
+        # Preserve the existing GDN normalization graph outside the native core.
+        if use_qk_l2norm_in_kernel:
+            query, key = _l2norm(query), _l2norm(key)
+        # Keep optional native dependencies out of eager and Triton imports.
+        from hyper_parallel.components.functional.gated_delta_net_ascendc import (  # pylint: disable=import-outside-toplevel
+            chunk_gated_delta_rule_ascendc,
+        )
+        return chunk_gated_delta_rule_ascendc(query, key, value, g, beta, cu_seqlens=cu_seqlens)
     if not is_triton_gdn_available(
         query, key, value, g, beta, chunk_size=chunk_size,
     ):
