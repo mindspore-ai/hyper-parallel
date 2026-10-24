@@ -107,6 +107,13 @@ _LEAF_SEGMENT_GUARD = frozenset({
     "qkv_proj", "fused_qkv", "linear_qkv", "gate_up_proj", "query_key_value",
     "experts", "gate", "linear", "proj",
     "fc1", "fc2", "w1", "w2", "w3", "w13", "dense", "dense_h_to_4h", "dense_4h_to_h",
+    # Megatron-style fused SwiGLU leaf names (generic SwiGLUMLP replacement
+    # modules): without the guard a colwise-only linear_fc1 leaf is promoted
+    # to its own "mlp" boundary (parent-path pattern match) and consumes the
+    # group, leaving rowwise-only linear_fc2 to merge into a boundary with no
+    # matching template — the parameter then fails the plan-time coverage
+    # check (HP-PLAN-004) even though the family sharding_rules classify it.
+    "linear_fc1", "linear_fc2",
 })
 
 _ATTN_PATTERNS = ("attn", "attention")
