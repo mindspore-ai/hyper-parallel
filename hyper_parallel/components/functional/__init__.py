@@ -37,6 +37,7 @@ _EXPORT_TO_MODULE = {
     "aux_loss_auto_scale": "aux_loss",
     "aux_loss_scale_context": "aux_loss",
     "bind_aux_loss_scale": "aux_loss",
+    "block_attention_residuals": "attention_residuals",
     "dsa_indexer": "dsa_indexer",
     "dsa_kl_loss": "dsa_kl_loss",
     "dsa_sparse_attention": "dsa_sparse_attention",
@@ -55,6 +56,8 @@ _EXPORT_TO_MODULE = {
     "set_aux_loss_scale": "aux_loss",
     "sink_attention": "sink_attention",
     "sinkhorn": "sinkhorn",
+    "situ": "activation_situ",
+    "situ_packed": "activation_situ",
     "swiglu": "swiglu",
 }
 
@@ -84,6 +87,7 @@ __all__ = [
     "aux_loss_auto_scale",
     "aux_loss_scale_context",
     "bind_aux_loss_scale",
+    "block_attention_residuals",
     "dsa_indexer",
     "dsa_kl_loss",
     "dsa_sparse_attention",
@@ -102,5 +106,7 @@ __all__ = [
     "set_aux_loss_scale",
     "sink_attention",
     "sinkhorn",
+    "situ",
+    "situ_packed",
     "swiglu",
 ]
