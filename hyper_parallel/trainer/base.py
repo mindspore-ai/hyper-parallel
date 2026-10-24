@@ -106,6 +106,7 @@ from hyper_parallel.trainer.callbacks import (
     GarbageCollectionCallback,
     LoggingCallback,
     ProfilerCallback,
+    StressDetectCallback,
     TqdmCallback,
     CheckpointerCallback,
     TrainerState,
@@ -635,6 +636,9 @@ class BaseTrainer(Stateful, ABC):
             self.garbage_collection_callback,
             self.profiler_callback,
         ]
+        if self.config.stress_detect.op_stress_detect.detection_interval > 0:
+            self.stress_detect_callback = StressDetectCallback(self)
+            self._callbacks.append(self.stress_detect_callback)
         # Registered to save, to restore, or both --- the two are independent, so
         # a run that only loads an existing checkpoint still needs the callback.
         if self.config.checkpoint.save_ckpt or self.config.checkpoint.restore_from is not None:

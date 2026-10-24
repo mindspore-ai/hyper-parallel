@@ -59,7 +59,12 @@ class TestShardingConfigContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_module_sharding_spec_fields(self):
-        """ModuleShardingSpec field order and defaults stay unchanged."""
+        """ModuleShardingSpec field order and defaults stay unchanged.
+
+        Feature: Public API contracts.
+        Description: ModuleShardingSpec field order and defaults stay unchanged.
+        Expectation: Public signatures, fields and exports match their snapshots.
+        """
         self.assertEqual(
             _field_snapshot(ModuleShardingSpec),
             [
@@ -91,7 +96,12 @@ class TestShardingConfigContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_sharding_plan_fields(self):
-        """ShardingPlan field order and defaults stay unchanged."""
+        """ShardingPlan field order and defaults stay unchanged.
+
+        Feature: Public API contracts.
+        Description: ShardingPlan field order and defaults stay unchanged.
+        Expectation: Public signatures, fields and exports match their snapshots.
+        """
         self.assertEqual(
             _field_snapshot(ShardingPlan),
             [
@@ -107,7 +117,12 @@ class TestShardingConfigContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_sharding_template_fields(self):
-        """ShardingTemplate field order and defaults stay unchanged."""
+        """ShardingTemplate field order and defaults stay unchanged.
+
+        Feature: Public API contracts.
+        Description: ShardingTemplate field order and defaults stay unchanged.
+        Expectation: Public signatures, fields and exports match their snapshots.
+        """
         self.assertEqual(
             _field_snapshot(ShardingTemplate),
             [
@@ -131,7 +146,12 @@ class TestShardingConfigContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_sharding_planner_signature(self):
-        """ShardingPlanner constructor signature stays unchanged."""
+        """ShardingPlanner constructor signature stays unchanged.
+
+        Feature: Public API contracts.
+        Description: ShardingPlanner constructor signature stays unchanged.
+        Expectation: Public signatures, fields and exports match their snapshots.
+        """
         self.assertEqual(
             str(inspect.signature(ShardingPlanner.__init__)),
             "(self, plan_overrides: Optional[Dict[str, "
@@ -147,7 +167,12 @@ class TestTrainerConfigContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_accelerator_config_fields(self):
-        """AcceleratorConfig field order and defaults stay unchanged."""
+        """AcceleratorConfig field order and defaults stay unchanged.
+
+        Feature: Public API contracts.
+        Description: AcceleratorConfig field order and defaults stay unchanged.
+        Expectation: Public signatures, fields and exports match their snapshots.
+        """
         self.assertEqual(
             _field_snapshot(AcceleratorConfig),
             [
@@ -190,7 +215,12 @@ class TestTrainerConfigContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_low_precision_config_fields(self):
-        """LowPrecisionConfig field order and defaults stay unchanged."""
+        """LowPrecisionConfig field order and defaults stay unchanged.
+
+        Feature: Public API contracts.
+        Description: LowPrecisionConfig field order and defaults stay unchanged.
+        Expectation: Public signatures, fields and exports match their snapshots.
+        """
         self.assertEqual(
             _field_snapshot(LowPrecisionConfig),
             [
@@ -209,7 +239,7 @@ class TestTrainerConfigContracts(unittest.TestCase):
 
         Feature: Trainer configuration exports.
         Description: Inspect the public configuration class list.
-        Expectation: MemoryConfig and ProfilingAnalysisConfig join the existing exports.
+        Expectation: Public exports include memory, profiling and stress detection configurations.
         """
         self.assertEqual(
             trainer_config.__all__,
@@ -229,6 +259,9 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 "OptimizerSwapConfig",
                 "ProfilingAnalysisConfig",
                 "ProfilingConfig",
+                "StressDetectConfig",
+                "OpStressDetectConfig",
+                "ModelStressDetectConfig",
                 "Target",
                 "TrainerConfig",
                 "TrainingConfig",
@@ -245,7 +278,12 @@ class TestOptimizerContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_optimizer_wrapper_signatures(self):
-        """AdamW/Muon/MixedPrecisionOptimizer/MultiLRScheduler signatures stay unchanged."""
+        """AdamW/Muon/MixedPrecisionOptimizer/MultiLRScheduler signatures stay unchanged.
+
+        Feature: Public API contracts.
+        Description: AdamW/Muon/MixedPrecisionOptimizer/MultiLRScheduler signatures stay unchanged.
+        Expectation: Public signatures, fields and exports match their snapshots.
+        """
         self.assertEqual(
             str(inspect.signature(optim.AdamW.__init__)),
             "(self, adamw_config: dict, model: torch.nn.modules.module.Module, "
@@ -279,7 +317,12 @@ class TestOptimizerContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_optimizer_module_all(self):
-        """optim package and mixed_precision_optimizer ``__all__`` stay unchanged."""
+        """optim package and mixed_precision_optimizer ``__all__`` stay unchanged.
+
+        Feature: Public API contracts.
+        Description: optim package and mixed_precision_optimizer ``__all__`` stay unchanged.
+        Expectation: Public signatures, fields and exports match their snapshots.
+        """
         self.assertEqual(
             optim.__all__,
             [

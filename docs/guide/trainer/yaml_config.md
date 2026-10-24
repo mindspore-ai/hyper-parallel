@@ -45,6 +45,33 @@ accelerator:
 
 外层字段的类型注解确定嵌套 mapping 对应的 dataclass。因此根 YAML 只接受 `TrainerConfig` 声明的字段，嵌套配置也只接受对应 dataclass 声明的字段。
 
+### NPU 算子级在线压测
+
+通过与 `training` 并列的 [`StressDetectConfig`](../../../hyper_parallel/trainer/config/stress_detect.py)
+配置压测，在完整优化器 step 结束后执行：
+
+```yaml
+stress_detect:
+  op_stress_detect:
+    detection_interval: 100        # step 间隔；默认 0，不创建压测回调
+    num_detections: 3              # 每轮每种类型的检测次数，默认 1
+    detect_type: all               # aic（默认）、hccs 或 all
+    exit_training_on_sdc: false    # 精度异常时是否终止训练，默认 false
+```
+
+`aic` 检测 AI Core，`hccs` 检测节点内卡间链路；`all` 先执行 AIC，再执行 HCCS。
+每次检测返回后立即处理结果：
+
+- 精度异常：记录 ERROR；`exit_training_on_sdc: true` 时立即抛异常，终止训练及剩余检测。
+- 执行失败或未知返回值：记录 WARNING，继续训练。
+- 电压恢复失败等底层异常：直接向上传播。
+
+仅支持 NPU，需预留约 10 GB 设备内存。各 rank 应使用一致配置，HCCS 还要求已初始化分布式通信。
+其他硬件及运行约束见 [torch_npu 接口文档](https://www.hiascend.com/document/detail/zh/Pytorch/700/apiref/apilist/ptaoplist_001321.html)。
+如需查看检测开始和成功的 INFO 日志，设置 `HP_LOG_CONFIG=HP:INFO`。
+
+`model_stress_detect` 为预留配置，暂不支持启用。
+
 ## 2. Target 节点
 
 [`Target`](../../../hyper_parallel/trainer/config/target.py#L54) 是一个延迟调用 Python 类或函数的配置对象。它保存导入后的目标对象、原始导入路径和 YAML 参数；调用 `build()` 时，再合并 Trainer 提供的运行时参数并创建组件。

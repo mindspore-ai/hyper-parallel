@@ -32,6 +32,7 @@ from .garbage_collection_callback import GarbageCollectionCallback
 from .logging_callback import LoggingCallback
 from .checkpoint_callback import CheckpointerCallback
 from .profiler_callback import ProfilerCallback
+from .stress_detect_callback import StressDetectCallback
 from .tqdm_callback import TqdmCallback
 
 
@@ -43,6 +44,7 @@ __all__ = [
     "LoggingCallback",
     "CheckpointerCallback",
     "ProfilerCallback",
+    "StressDetectCallback",
     "TqdmCallback",
     "TrainerState",
 ]
