@@ -24,8 +24,15 @@ def build_parameter_sharding_rules() -> list[tuple[list[str], Any]]:
     )
 
     return [
+        # KDA gated-delta decay/bias: the Kimi checkpoints keep these in a
+        # 4-D conv-style layout, e.g. A_log (1, 1, heads, 1), so the heads sit
+        # on dim 2 and the framework's COLWISE Shard(0) is not applicable
+        # (the plan-time shard check rejects dim0=1 under TP).  Replicate is
+        # the safe semantic and matches TP=1 behavior exactly.
+        (["A_log", "dt_bias"], ParamRole.REPLICATED),
         (["q_conv1d", "k_conv1d", "v_conv1d"], ParamRole.COLWISE),
-        (["A_log", "dt_bias"], ParamRole.COLWISE),
+        (["q_a_proj"], ParamRole.REPLICATED),  # MLA down-projection, like kv_a
+        (["self_attention_res_proj", "mlp_res_proj"], ParamRole.REPLICATED),
         (["kv_a_proj_with_mqa"], ParamRole.REPLICATED),
         (["f_a_proj", "g_a_proj"], ParamRole.REPLICATED),
         (["f_b_proj", "b_proj", "g_proj", "g_b_proj"], ParamRole.COLWISE),
