@@ -32,7 +32,8 @@ def build_parameter_sharding_rules() -> list[tuple[list[str], Any]]:
         (["A_log", "dt_bias"], ParamRole.REPLICATED),
         (["q_conv1d", "k_conv1d", "v_conv1d"], ParamRole.COLWISE),
         (["q_a_proj"], ParamRole.REPLICATED),  # MLA down-projection, like kv_a
-        (["self_attention_res_proj", "mlp_res_proj"], ParamRole.REPLICATED),
+        (["self_attention_res_proj", "mlp_res_proj", "output_attn_res_proj"],
+         ParamRole.REPLICATED),
         (["kv_a_proj_with_mqa"], ParamRole.REPLICATED),
         (["f_a_proj", "g_a_proj"], ParamRole.REPLICATED),
         (["f_b_proj", "b_proj", "g_proj", "g_b_proj"], ParamRole.COLWISE),

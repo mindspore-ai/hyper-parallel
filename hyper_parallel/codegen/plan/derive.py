@@ -97,11 +97,23 @@ def build_meta_model(
             if hf_config is None:
                 from transformers import AutoConfig
 
-                hf_config = AutoConfig.from_pretrained(
-                    model_id,
-                    trust_remote_code=trust_remote_code,
-                    **dict(config_overrides or {}),
-                )
+                try:
+                    hf_config = AutoConfig.from_pretrained(
+                        model_id,
+                        trust_remote_code=trust_remote_code,
+                        **dict(config_overrides or {}),
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"codegen: cannot resolve the HF config for {model_id!r} "
+                        "via AutoConfig (architecture not known to this "
+                        "transformers build, and no remote auto_map). This "
+                        "model is custom-registered in hyper_parallel: build "
+                        "the model first and rerun through the trainer/"
+                        "HyperAutoModel flow, which passes hf_config "
+                        "(the built model's config) into codegen — or pass "
+                        "hf_config to ensure_codegen_artifact directly."
+                    ) from exc
             with init_empty_weights():
                 return custom_cls(hf_config)
 

@@ -98,7 +98,7 @@ class TestKimiFamilyShardingRules(unittest.TestCase):
         )
 
     def test_res_proj_replicated(self):
-        for leaf in ("self_attention_res_proj", "mlp_res_proj"):
+        for leaf in ("self_attention_res_proj", "mlp_res_proj", "output_attn_res_proj"):
             with self.subTest(leaf=leaf):
                 self.assertEqual(
                     self._classify(f"model.layers.0.{leaf}.weight"),
