@@ -226,6 +226,78 @@ class KDAStateRecursiveDoubling:
         plan = build_reset_plan(sequence_info.documents, sequence_info.length, self.size, self.rank)
         return _ResetRDInvocation(self, plan, state_shape)
 
+    def directional_plan(self, sequence_info: Any, local_length: int, reverse: bool = False) -> RDResetPlan:
+        """Reuse reset planning for independent forward or reverse affine maps.
+
+        Args:
+            sequence_info: Packed metadata, or None for one continuous document.
+            local_length: Equal token interval length in this state group.
+            reverse: Whether to scan fresh G/N in reverse chronological order.
+        """
+        if sequence_info is not None and sequence_info.start != self.rank * local_length:
+            raise ValueError("RD packed interval must follow the state process-group order")
+        documents = (0, self.size * local_length) if sequence_info is None else sequence_info.documents
+        return build_reset_plan(documents, local_length, self.size, self.rank, reverse=reverse)
+
+    def scan_affine(
+        self, packed: torch.Tensor | None, plan: RDResetPlan,
+        state_shape: tuple[int, ...], reverse: bool = False,
+    ) -> torch.Tensor | None:
+        """Scan independently supplied affine maps without a forward-adjoint cache.
+
+        Args:
+            packed: Immutable FP32 [B,H,128,256] S/M or G/N; absent for a dead tail.
+            plan: Directional reset plan from this invocation's metadata.
+            state_shape: B/H/K/V dimensions for receive-only fragments.
+            reverse: Map mirrored logical ranks onto the original process group.
+
+        Returns:
+            Exclusive input state, or None at a real document boundary.
+            N is already a reverse transfer and is never transposed here.
+        """
+        rank = self.size - self.rank - 1 if reverse else self.rank
+        if plan.size != self.size or plan.local_rank != rank:
+            raise ValueError("RD affine scan received another rank's directional plan")
+        rounds = plan.execution_rounds(rank)
+        destination, source = plan.shift_peers(rank)
+        if packed is None:
+            if rounds or destination is not None:
+                raise ValueError("RD affine map may be absent only without an exit consumer")
+            state = None
+        else:
+            if (packed.shape != (*state_shape[:-1], 256) or packed.dtype != torch.float32
+                    or packed.device != self.device or not packed.is_contiguous()):
+                raise ValueError("RD affine maps must be contiguous FP32 [B,H,128,256] on the protocol device")
+            with torch.autocast(device_type=packed.device.type, enabled=False):
+                state = self._scan_independent_maps(packed, plan, rounds, reverse)
+        return self._exchange_direction(state, destination, source, reverse, state_shape)
+
+    def _exchange_direction(self, payload, destination, source, reverse, receive_shape=None):
+        """Reverse only logical peers; retain the original communicator and global ranks."""
+        if reverse:
+            destination = None if destination is None else self.size - destination - 1
+            source = None if source is None else self.size - source - 1
+        return self.exchange(payload, destination, source, receive_shape=receive_shape)
+
+    def _scan_independent_maps(self, packed, plan, rounds, reverse):
+        """Use FP32 Torch GEMM/add while sharing RD transport and pruning plans."""
+        state = packed[..., :128]
+        matrix = packed[..., 128:].contiguous() if rounds else None
+        for step in rounds:
+            final = step.stage == len(plan.distances) - 1
+            payload = state.contiguous() if final else packed
+            received = self._exchange_direction(payload, step.destination, step.source, reverse)
+            if received is None:
+                continue
+            if final:
+                state = matrix @ received + state
+            else:
+                updated = matrix @ received
+                updated[..., :128].add_(state)
+                packed, state = updated, updated[..., :128]
+                matrix = updated[..., 128:].contiguous() if step.save_matrix else None
+        return state.contiguous()
+
     def _shift_peers(self, plan: RDResetPlan | None) -> tuple[int | None, int | None]:
         """Only continued documents consume the preceding rank's exit."""
         if plan is not None:

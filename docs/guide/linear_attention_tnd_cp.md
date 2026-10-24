@@ -11,14 +11,17 @@ TND 将多个独立文档的 token 连续拼接。文档边界必须同时约束
 | KDA AllGather、分组 AllGather + P2P、Recursive Doubling | 支持；使用 Triton-Ascend |
 | KDA Ulysses + P2P / AllGather / 分组 AllGather + P2P / RD | 支持；保持原有并行配置入口 |
 | GDN 本地层、P2P、纯 Ulysses | 支持；可选 eager 参考与 Triton-Ascend |
+| KDA / GDN 本地算子、纯 Ulysses | 可选 Ascend C；各后端的算子能力与限制见下文及 KDA 指南 |
+| KDA P2P、AllGather、分组 AllGather + P2P 及其 Ulysses 混合 | 另支持 Ascend C；原生摘要和独立反向接口要求见 [KDA 指南](kda_context_parallel.md#ascend-c-状态-p2pallgather-与分组混合) |
 
 层入口接受 `[T, hidden_size]` 或 `[1, T, hidden_size]`，输出保持输入维数。
 投影后的算子接受 `[T, H, D]` 或 `[1, T, H, D]`。TND 的批维为 1；多个文档由累计长度表示。
 所有 CP rank 按时间顺序持有等长、连续、非空的 token 区间。
 可在已有 DP×CP mesh 的 CP 子域中执行，不要求全局 rank 连续。Ulysses 仍要求相关 head 数能被其大小整除。
 
-融合路径沿用当前后端的 BF16 输入、FP32 gate / 状态、K=V=128 和 chunk_size=64 约束。
-TND 的真实文档和局部片段不必是 64 的倍数；末尾不足一个 chunk 的摘要使用显式零填充。
+Triton 融合路径沿用 BF16 输入、FP32 gate / 状态、K=V=128 和 chunk_size=64 约束；
+Ascend C 的原生接口 dtype 与转换见 KDA 指南及下文。
+TND 的真实文档和局部片段不必是 64 的倍数；Triton 摘要显式零填充尾块，Ascend C 由原生接口处理文档尾块。
 未提供 TND 元数据时保留定长路径；定长序列末尾同样允许不足64的 chunk。
 
 此入口不覆盖 zigzag 分片、不等长或空 rank、TP 与 CP 同时开启、推理缓存，以及任意 `seq_idx` 或
@@ -129,7 +132,8 @@ gdn_layer = GatedDeltaNetUlyssesCP(original_gdn_layer, cp_mesh, backend="triton"
 ```
 
 `eager` 使用 Torch 参考实现；`triton` 使用 FLA 的注意力与卷积算子，需要兼容的
-FLA / Triton-Ascend 环境。显式选择的后端不做静默回退。
+FLA / Triton-Ascend 环境。`ascendc` 使用 fla-npu 的注意力与卷积入口。
+显式选择的后端不做静默回退。
 融合卷积要求 stride=1、dilation=1、depthwise 因果零填充和 SiLU。
 
 Dense 卷积保留 `[B,S,C]` 的 batch 隔离；packed 由同一公共适配传递真实文档 offsets，
@@ -142,12 +146,14 @@ Dense 卷积保留 `[B,S,C]` 的 batch 隔离；packed 由同一公共适配传�
 
 - Triton P2P：真实文档边界恰好落在 rank 切口时，两侧成对跳过状态收发；内部 reset 允许先发送独立的 S/G，
   再在本地实际需要入口状态的消费者处等待。仍使用初始化时创建的 CP 通信组。
-- AllGather / 分组 AllGather：用显式零转移表示 reset，保留原有正向、逆向有序扫描。每个在途调用仅保存
+- Triton AllGather / 分组 AllGather：用显式零转移表示 reset，保留原有正向、逆向有序扫描。每个在途调用仅保存
   本地 M；收集的 S/M 不跨前反向保留。反向重新收集本地 G/M。
 - Recursive Doubling：根据真实文档边界构造不可变的逐调用计划，只执行有消费者的倍增收发与合成，
   backward 沿同一计划的反向边消费必要转移缓存。Ulysses 后先重建文档区间，再沿 state 子域规划。
   尾文档不延续到下一状态 rank 时不生产 S；只有入口会影响该出口时才生产 M。头文档延续时仍需 G，
   所以 rank 内部 reset 不等于整张卡都无需通信。没有活跃倍增轮的 rank 跳过 S/M 打包；计划不创建新通信组。
+- Ascend C KDA：前向收集 S/M、反向重新生成 G/N，不跨前反向缓存 M。普通 P2P 跳过真实文档边界，
+  分组路径用零转移隔离 reset；具体接口精度、布局和生命周期见 KDA 指南。
 - ShortConv：保留既有 halo 交换，按全局文档边界屏蔽越界 tap；该 mask 同时阻断越界的反向梯度。
 - backward：仅在内核调用处将紧凑入口状态、出口梯度展开到局部片段槽位，元数据和本地 M 由各自 autograd
   调用持有。不同 microbatch、反序 backward 和非重入 checkpoint 不共享可写通信缓冲区。
@@ -155,7 +161,7 @@ Dense 卷积保留 `[B,S,C]` 的 batch 隔离；packed 由同一公共适配传�
 剪枝只依据真实文档边界和消费者，不依据矩阵数值大小，不改变保留计算的合成或舍入顺序。
 同一元数据计划可以只读复用，各次调用的状态张量和反向缓存仍独立持有；没有活跃边不代表可以跳过本地 KDA。
 
-AG 保存的本地 M 不随文档数量线性增长；RD 缓存随实际参与轮数增长。原生 varlen 内核的临时状态槽、chunk 索引、conv 中间量和 AG 临时缓冲区
+Triton AG 保存的本地 M 不随文档数量线性增长；RD 缓存随实际参与轮数增长。原生 varlen 内核的临时状态槽、chunk 索引、conv 中间量和 AG 临时缓冲区
 仍有各自成本；不能将“仅保存一份 M”解释为整层峰值恒定。
 
 ## 数值语义
@@ -178,3 +184,28 @@ GDN 前向状态算子同时包含 key-gate 的布局和地址修复：`gk` 在�
 布局，packed 分支使用全局 token 长度和文档起点寻址；`g=None`、`save_new_value=False` 不再操作空对象。
 这项修复不改变本文常规 scalar-gate GDN 的递推算术，也不扩大公开训练接口：仅 key-gate 的完整 backward
 尚未在本特性中获得支持，不能根据前向可用推断整条训练路径可用。
+
+## GDN 的 Ascend C 后端
+
+Qwen3.5 纯 Ulysses 可选择 `backend: ascendc`，同一配置选择本地 attention 与 ShortConv。
+TND 的 decoder metadata wrapper 不变，CP1 的 packed local wrapper 也支持该后端。
+依赖与公开算子接口见 [functional 说明](../../hyper_parallel/components/functional/README.md#linear-attention-backends)。
+
+```yaml
+plan_overrides:
+  - match: "model.layers.0.linear_attn.forward"
+    when: cp
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel.qwen3_5_gdn_ulysses_cp_wrapper
+        backend: ascendc
+```
+
+当前适配输入为核外归一化的 Q/K、有效 log-decay 与 sigmoid(beta)。它们的 autograd 链保留在调用方；
+原生 GDN 前反向关闭对应的 `in_kernel` 开关，避免重复处理。
+文档 offsets 按调用保存，dense 与 packed 共用公开原生前反向入口，末块无需 64 对齐。
+
+当前不开放非零初态、最终态输出/梯度、double backward 与 Ascend C 状态 P2P。
+显式选择的后端不做静默回退。融合卷积需要宽度为 2/3/4、通道数能被 16 整除，
+输入、权重和 bias 使用相同的 BF16 或 FP16 dtype；不隐式降低参数精度。

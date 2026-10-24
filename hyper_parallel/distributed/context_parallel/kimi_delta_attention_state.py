@@ -166,6 +166,16 @@ class KDAStateAllGather:
             raise ValueError("AllGather requires a positive size and valid local rank.")
         self.group, self.rank, self.size = group, rank, size
 
+    def gather_packed(self, packed: torch.Tensor) -> torch.Tensor:
+        """Collect native [1,H,128,256] summaries without a second packing copy.
+
+        The autograd caller owns the returned storage and its reverse protocol;
+        this metadata-only executor retains no per-invocation tensors.
+        """
+        output = packed.new_empty((self.size, *packed.shape[1:]))
+        dist.all_gather_into_tensor(output, packed, group=self.group)
+        return output
+
     def forward(self, state: torch.Tensor, matrix: torch.Tensor) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         """Return the incoming state and this invocation's original local M.
 

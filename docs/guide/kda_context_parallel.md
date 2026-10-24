@@ -15,14 +15,14 @@ CP rank，并保持 CP mesh 中的 rank 顺序与全局 token 顺序一致。
 |------|----------|----------|
 | P2P | 各 rank 生成本地摘要，沿序列顺序传递边界状态；反向沿相反方向传递边界梯度。 | 通信工作区较小，依赖链随状态 CP 大小增长。 |
 | AG | 各 rank 收集状态摘要和转移矩阵，通过融合算子合并所需的前缀或反向后缀。 | 消除逐 rank 的通信依赖，临时收集缓冲区随状态 CP 大小增长。 |
-| RD | 按距离 1、2、4 等有序合成摘要，反向复用前向各轮转移。 | 长连续文档有对数依赖阶段；TND 按真实 reset 删除无消费者的通信、生产和缓存。 |
+| RD | 按距离 1、2、4 等有序合成摘要；Triton 反向复用前向转移，Ascend C 反向扫描原生 G/N。 | 长连续文档有对数依赖阶段；TND 按真实 reset 删除无消费者的通信、生产和缓存。 |
 | Ulysses | AllToAll 将序列分片转换为 head 分片，计算后恢复原序列分片。 | 减少每个 rank 的 head 数，要求 head 数能被 U 整除。 |
 | Ulysses + P2P / AG | 先在 Ulysses 组内交换序列和 head，再在状态 CP 组内执行 P2P 或 AG。 | 用 head 分工减少状态通信量，并减小状态 CP 的规模。 |
 | AG + P2P | 连续 g 个状态 rank 组内 AG，由各组最后一个 rank 组成 P2P 链，再向组内广播输入边界。 | 将 AG 临时缓冲区限制到组宽 g，保留组间的串行通信依赖。 |
 | Ulysses + AG + P2P | 先做 Ulysses，再在 R 个状态 rank 上执行组内 AG 和组间 P2P。 | 同时调整 head 分工、收集缓冲区和组间链长。 |
 
 组内 AG + 组间 P2P 的前向先收集 S/M；组 owner 接收上一组边界后，按顺序应用组内摘要并发送到下一组。
-组内各 rank 根据广播的组入口状态恢复自己的输入状态。反向收集 G/M，按相反的组和 rank 顺序执行。
+组内各 rank 根据广播的组入口状态恢复自己的输入状态。Triton 反向收集 G/M，Ascend C 反向收集原生 G/N，按相反的组和 rank 顺序执行。
 组间链有 `R/g` 个 owner，但 owner 仍需顺序应用组内摘要，不能将通信跳数的减少直接等同为计算量的减少。
 
 ## 配置入口
@@ -56,11 +56,11 @@ wrapper 及其参数写在 `replace.implementation` 下。
 CP 总大小由训练的并行配置决定。`state_cp_method` 只选择状态 CP 方式，完整方案还需结合
 `ulysses_degree` 和 `allgather_group_size` 判断；例如 `state_cp_method: p2p` 配合 `ulysses_degree: 2`
 表示 Ulysses + P2P。统一入口内部固定使用 64-token chunk，不暴露 `chunk_size` 配置；
-`eager` 和 `triton` 均采用这一大小。
+各后端均采用这一大小。
 
 | 参数 | 默认值 | 含义与约束 |
 |------|--------|------------|
-| `backend` | `triton` | 本地 KDA 后端。AG 和分组 AG 需要 `triton`；已有 P2P/Ulysses 支持 `eager`。 |
+| `backend` | `triton` | 本地 KDA 后端。P2P/Ulysses 支持 `eager`；P2P、AG、分组 AG、RD 及其 Ulysses 组合支持 `triton` 和 `ascendc`。 |
 | `state_cp_method` | `p2p` | 状态 CP 方式，可选 `p2p`、`allgather`、`grouped_allgather_p2p`、`recursive_doubling`。 |
 | `ulysses_degree` | `1` | U；正整数，必须整除 CP 大小，且 query/key head 数和 value head 数都必须能被 U 整除。 |
 | `allgather_group_size` | `1` | g；每个组内 AllGather 包含的状态 rank 数，必须整除 R。仅用于 `grouped_allgather_p2p`；纯 `allgather` 自动收集整个 R 组，此项保持1。 |
@@ -99,7 +99,7 @@ CP8 的常用组合：
 ## 显存与选择建议
 
 S 是本地零初态的输出状态，M 是本地片段的状态转移矩阵，G 是反向零边界的梯度摘要。
-AG 和分组 AG 都只为每次在途调用保留一份本地 M，反向重新收集 G 与该 M；
+Triton AG 和分组 AG 都只为每次在途调用保留一份本地 M，反向重新收集 G 与该 M；
 前向收集到的 S/M 不跨前反向缓存。融合状态合并算子只改变合并的执行方式，不改变本地 KDA 的 S/M/G 算术。
 
 以 `B=1、H=96、K=V=128` 为例，一份 FP32 状态为 6 MiB；不使用 Ulysses 时，一份 S/M 打包数据为
@@ -156,8 +156,71 @@ for layer in local_layers:
 只在每层重复传入原始 `cu_seq_lens` 仍然正确，但会重新构建快照，不能获得同批元数据复用的收益。
 CPU 计划共享不共享通信缓冲区或反向状态缓存；这些仍按调用独立持有。
 
-通信与缓存按调用隔离，支持反序 backward 和非重入 checkpoint 的验证路径。RD 缓存随轮次增长；
+通信与缓存按调用隔离，支持反序 backward 和非重入 checkpoint 的验证路径。Triton RD 转移缓存随轮次增长；
 AG 的“只留一份本地 M”不能用于估算 RD。当前不支持同时 TP、图捕获、空或不等长 rank。
 底层通信统一使用公开的 `torch.distributed.batch_isend_irecv`，由后端选择内部实现，
 框架不按版本或设备型号切换私有 coalescing API。协议资格与整层训练资格应分别判断，
 不以对数轮数承诺任意 CP 规模的性能。
+
+## Ascend C Ulysses 后端
+
+纯 Ulysses 可选择 `backend: ascendc`，同时使用 fla-npu 的本地注意力与 ShortConv。
+依赖与公开算子接口见 [functional 说明](../../hyper_parallel/components/functional/README.md#linear-attention-backends)。
+
+```yaml
+plan_overrides:
+  - match: "*.self_attn.forward"
+    when: cp
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel.kimi_delta_attention_cp_wrapper
+        ulysses_degree: 8
+        state_cp_method: p2p
+        backend: ascendc
+```
+
+`ulysses_degree` 等于 CP mesh 大小时，状态通信域大小为 1，仅进行 Ulysses AllToAll。
+Ascend C 后端还支持下节的状态 P2P、AG、分组 AG 和 RD。
+
+输入保持原始 Q/K、gate 与 beta logits，Q/K norm、gate 与 beta 的前向由 Prepare 处理。
+反向使用保存的归一化中间量；原生接口支持融合 beta 反向时直接接入，否则使用 FLA 的对应辅助算子，
+不会重复应用 sigmoid 的链式法则。前反向使用 save 模式，不暴露算子内部重计算选项。
+
+TND 调用传入全局文档 offsets，Ulysses 交换后按完整文档边界执行本地算子。
+文档末尾不要求对齐 chunk；同一公开 native 接口负责文档尾块。
+各调用独立保存中间量，支持多次前向在途及 checkpoint replay。
+初态、终态及其梯度、double backward 暂未开放，缺失能力会明确报错。
+
+## Ascend C 状态 P2P、AllGather、RD 与混合
+
+在具有原生 CP 摘要和独立反向阶段接口的未修改 fla-npu 包上，`backend: ascendc` 支持
+`state_cp_method: p2p`、`allgather`、`grouped_allgather_p2p` 和 `recursive_doubling`。
+它们均可与 `ulysses_degree` 组合；分组方式还使用 `allgather_group_size`。
+前述 CP8 配置表中的组合均可使用这一后端。
+
+本地、纯 Ulysses 和四种状态协议共用 prepare、h、finalize 及独立的 bwd_prepare、dhu、bwd_finalize。
+只有状态协议增加 S/M 与 G/N 摘要及通信；不再另设 composite backward 的本地实现。
+P2P 在收到入口状态后先计算 `S + M @ H` 并发送，再完成本地 h；反向先计算 `G + N @ D` 并发送，
+再完成本地 dhu。接收提前投递，发送缓冲按调用保活至完成，不将完整本地递推放进状态接力链。
+
+普通 AG 收集原生打包摘要，使用原生融合 merge。分组 AG 收集组内摘要，由 owner 执行组间状态接力；
+非零组入口的扫描目前使用 FP32 Torch NPU 矩阵乘和加法，不调用 Triton 摘要或扫描算子。
+状态 apply 显式关闭 autocast，避免外层 BF16 AMP 降低状态计算精度。反向直接使用原生 N，不再转置 N。
+
+RD 复用现有有序通信域、倍增收发与 reset 规划，前向扫描 S/M，反向在镜像文档顺序中扫描 G/N，
+逻辑 peer 再映射回原通信域，不新建反向通信组。N 已是反向转移，不以 M 的转置替代。
+真实 reset 删除不相关轮次，没有出口消费者的片段跳过摘要生产；仅需接收的片段仍恢复入口状态。
+本版合成使用关闭 autocast 的 FP32 矩阵乘和加法，未接入设备流水。
+
+与 Triton 的本地/各轮 M 缓存策略不同，此路径反向重新生成 G/N，因此不跨前反向缓存 M。
+组内 gather、发送状态和接收缓冲只属于当前调用；save 模式仍需保存本地 h/v_new 等激活。
+分组 AG 的临时收集规模为组宽 g，普通 AG 为状态域大小 R；这不代表完整层的峰值显存。
+
+状态路径目前要求 BF16、B=1、Q/K/V 相同 head 数、K=V=128、safe gate 与 BT64；
+支持 dense 与连续等长分片 TND，文档片段末尾可不足 64 token。
+前向只注入首文档入口，反向只注入尾文档出口梯度。普通 P2P 跳过不跨文档的邻接通信；
+分组路径将真实 reset 对应的有效转移清零，不连接不同文档。组 owner 的通信链仍按组执行。
+
+原生依赖与接口要求见 [functional 后端说明](../../hyper_parallel/components/functional/README.md)。
+缺少所需接口时明确报错，不会切换到其他后端。

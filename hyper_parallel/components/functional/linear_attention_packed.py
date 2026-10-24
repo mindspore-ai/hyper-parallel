@@ -275,6 +275,38 @@ def resolve_packed_sequence(
     return info
 
 
+class _PackedConvTap(torch.autograd.Function):
+    """Recreate a masked tap in backward instead of retaining its FP32 copy."""
+
+    @staticmethod
+    def forward(
+        ctx: Any, extended: torch.Tensor, weight: torch.Tensor, valid: torch.Tensor, offset: int, length: int,
+    ) -> torch.Tensor:
+        """Save shared input storage while preserving the eager product precision."""
+        ctx.save_for_backward(extended, weight, valid)
+        ctx.offset, ctx.length = offset, length
+        values = extended[:, offset : offset + length].to(weight.dtype)
+        values = torch.where(valid[None, :, None], values, 0.0)
+        return values * weight[None, None, :]
+
+    @staticmethod
+    def backward(
+        ctx: Any, grad_output: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, None, None, None]:
+        """Rebuild only this tap; differentiable Torch operations retain higher derivatives."""
+        extended, weight, valid = ctx.saved_tensors
+        grad_extended = grad_weight = None
+        if ctx.needs_input_grad[0]:
+            grad_values = grad_output * weight[None, None, :]
+            grad_values = torch.where(valid[None, :, None], grad_values, 0.0).to(extended.dtype)
+            grad_extended = F.pad(grad_values, (0, 0, ctx.offset, extended.shape[1] - ctx.offset - ctx.length))
+        if ctx.needs_input_grad[1]:
+            values = extended[:, ctx.offset : ctx.offset + ctx.length].to(weight.dtype)
+            values = torch.where(valid[None, :, None], values, 0.0)
+            grad_weight = (grad_output * values).sum(dim=(0, 1))
+        return grad_extended, grad_weight, None, None, None
+
+
 def packed_causal_conv1d(
     inputs: torch.Tensor,
     convolution: nn.Conv1d,
@@ -290,6 +322,8 @@ def packed_causal_conv1d(
     Vectorize over tokens rather than loop over samples. Accumulate low-precision
     products in FP32; keep FP32/FP64 reference inputs at their original precision.
     Masking taps also masks their autograd contribution to an exchanged halo.
+    Backward reconstructs each masked tap from the shared input rather than
+    retaining a full accumulation-precision input for every window position.
 
     Args:
         inputs: Local projected tokens with shape ``[1, T, C]``.
@@ -342,9 +376,7 @@ def packed_causal_conv1d(
     weights = weight[:, 0].to(dtype)
     for tap in range(width):
         valid = positions - (width - 1 - tap) * dilation >= starts
-        values = extended[:, tap * dilation : tap * dilation + info.length].to(dtype)
-        values = torch.where(valid[None, :, None], values, 0.0)
-        output = output + values * weights[None, None, :, tap]
+        output = output + _PackedConvTap.apply(extended, weights[:, tap], valid, tap * dilation, info.length)
     if bias is not None:
         output = output + bias.to(dtype)
     return F.silu(output.to(inputs.dtype))
