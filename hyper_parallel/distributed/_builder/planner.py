@@ -59,6 +59,7 @@ from hyper_parallel.distributed.recipe_spec import (
     EP,
     TP,
     ModuleShardingSpec,
+    NamedPlacement,
 )
 from hyper_parallel.distributed.tensor_parallel.param_role import (
     ParameterClassifier,
@@ -68,6 +69,7 @@ from hyper_parallel.distributed.tensor_parallel.param_role import (
 from hyper_parallel.distributed._builder.default_templates import (
     ShardingTemplate,
     TEMPLATES,
+    _multi_dim,
     _build_spec_from_template,
     _finalize_tp_local_attr_plans,
     _moe_expert_tp_placement,
@@ -245,9 +247,16 @@ class ShardingPlanner:
                 "specs (all insert mode, fully self-declared)"
             )
             return
+        parameters_by_name = dict(model.named_parameters())
         for boundary_fqn, group in boundary_groups.items():
             boundary_type = self._infer_boundary_type(boundary_fqn, group)
             if self._templates.get(boundary_type) is None:
+                fallback = self._build_replicated_fallback_spec(
+                    boundary_fqn, group, model, parameters_by_name
+                )
+                if fallback is not None:
+                    plan.modules[boundary_fqn] = fallback
+                    continue
                 logger.warning("No template for boundary_type=%s at %s", boundary_type, boundary_fqn)
                 continue
             spec = _build_spec_from_template(
@@ -268,6 +277,53 @@ class ShardingPlanner:
                     ep_extend=ep_extend, mesh=mesh, model=model, param_ndims=param_ndims,
                 )
             plan.modules[boundary_fqn] = spec
+
+    @staticmethod
+    def _build_replicated_fallback_spec(
+        boundary_fqn: str,
+        group: List[Tuple[str, ParamRole]],
+        model: Any,
+        parameters_by_name: Dict[str, Any],
+    ) -> Optional[ModuleShardingSpec]:
+        """Declare all-Replicate layouts for pure-replicable leftover groups.
+
+        A group whose roles are exclusively replicable kinds (REPLICATED /
+        NORM / BIAS) matches no communication template — typically an
+        isolated subtree the family sharding_rules mark fully replicated
+        (e.g. a vision tower, ``model.visual.*``). Such groups used to be
+        skipped here, leaving every trainable parameter inside them to fail
+        the F4b coverage check at the end of planning. Emit a non-boundary
+        spec (no I/O contract, so no communication is ever inserted) that
+        declares each parameter Replicate on all active dims, making the
+        gradient-sync semantics explicit. Groups without a single trainable
+        parameter keep the legacy skip so frozen-param plans stay unchanged.
+        """
+        del model  # parameters_by_name already carries requires_grad
+        replicable = (ParamRole.REPLICATED, ParamRole.NORM, ParamRole.BIAS)
+        if any(role not in replicable for _, role in group):
+            return None
+        params: Dict[str, NamedPlacement] = {}
+        any_trainable = False
+        for param_fqn, _role in group:
+            parameter = parameters_by_name.get(param_fqn)
+            if parameter is not None:
+                any_trainable = any_trainable or parameter.requires_grad
+            relative = (
+                param_fqn[len(boundary_fqn) + 1:] if boundary_fqn else param_fqn
+            )
+            params[relative] = _multi_dim(
+                tp=Replicate(), cp=Replicate(), ep=Replicate()
+            )
+        if not any_trainable:
+            return None
+        return ModuleShardingSpec(
+            params=params,
+            in_src={},
+            in_dst={},
+            out_src=None,
+            out_dst=None,
+            is_boundary=False,
+        )
 
     def _finalize_boundary_specs(
         self,
