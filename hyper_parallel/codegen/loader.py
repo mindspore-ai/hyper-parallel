@@ -239,6 +239,18 @@ def resolve_generated_model_class(module: ModuleType, hf_config: Any) -> type:
     arch_name = architectures[0]
     model_cls = getattr(module, arch_name, None)
     if model_cls is None:
+        # Some upstream checkpoints name the architecture without the
+        # separators the transformers class actually uses (Kimi-K2 ships
+        # "KimiK25ForConditionalGeneration" while the class is
+        # "Kimi_K25ForConditionalGeneration"). Fall back to a normalized
+        # comparison before giving up.
+        wanted = arch_name.replace("_", "").lower()
+        for name in sorted(vars(module)):
+            value = vars(module)[name]
+            if isinstance(value, type) and name.replace("_", "").lower() == wanted:
+                model_cls = value
+                break
+    if model_cls is None:
         available = sorted(
             name for name, value in vars(module).items() if isinstance(value, type)
         )
@@ -292,6 +304,24 @@ def _register_generated_model_conversions(model: Any) -> None:
             )
 
 
+def _with_dtype_kwarg(kwargs: dict, torch_dtype: Any) -> dict:
+    """Forward the target dtype to ``_from_config`` like the native path does.
+
+    The native from-config route (``model_builder._init_model``) passes
+    ``dtype`` into ``_from_config_parent_class``; transformers >= 5.14 resolves
+    it onto the config and every subconfig before instantiation.  Without it
+    the generated model builds under the default float32 while its inputs are
+    already bfloat16, which fails the first conv2d forward with a dtype
+    mismatch.  ``"auto"``/``None`` are not forwarded (mirroring the native
+    route's ``if torch_dtype != "auto"`` guard): transformers >= 5.14 resolves
+    a string dtype via ``getattr(torch, dtype)``, which would fail on "auto".
+    """
+    from_config_kwargs = dict(kwargs)
+    if torch_dtype not in (None, "auto"):
+        from_config_kwargs["dtype"] = torch_dtype
+    return from_config_kwargs
+
+
 def _load_generated_checkpoint(
     model_cls: type,
     pretrained_path: str,
@@ -326,7 +356,9 @@ def _load_generated_checkpoint(
         CheckpointManager,
     )
 
-    model = model_cls._from_config(hf_config, *model_args, **kwargs)
+    model = model_cls._from_config(
+        hf_config, *model_args, **_with_dtype_kwarg(kwargs, torch_dtype)
+    )
     _register_generated_model_conversions(model)
 
     transforms: list[Any] = []
@@ -464,7 +496,9 @@ def init_generated_model(
         # canonical entry in both 5.14.x and the pinned 5.15.0; the AutoModel
         # family's ``from_config`` (which the native path borrows) is just a
         # resolver that ultimately calls ``_from_config`` anyway.
-        model = model_cls._from_config(hf_config, *model_args, **kwargs)
+        model = model_cls._from_config(
+            hf_config, *model_args, **_with_dtype_kwarg(kwargs, torch_dtype)
+        )
         _register_generated_model_conversions(model)
 
     from hyper_parallel.codegen.check.preflight import (  # pylint: disable=import-outside-toplevel
