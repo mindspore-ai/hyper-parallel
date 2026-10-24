@@ -59,6 +59,23 @@ class AcceleratorConfig:
     loss_parallel: bool = False
     encoder_parallel: EncoderParallelConfig = field(default_factory=EncoderParallelConfig)
 
+    def __post_init__(self) -> None:
+        """Reject non-positive parallel degrees instead of silently clamping.
+
+        Downstream projections (e.g. ``codegen/spec/project.py`` deriving DP
+        from ``WORLD_SIZE``) used to coerce ``0``/negative degrees to ``1``
+        via ``max(1, ...)``, which materialized artifacts for a topology the
+        user never requested without any error. Every degree must be an
+        explicit positive integer.
+        """
+        for name in ("tp_size", "cp_size", "ep_size", "pp_size"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(
+                    f"accelerator.{name} must be a positive integer, "
+                    f"got {value!r}"
+                )
+
 
 @dataclass
 class ActivationCheckpointSelection:

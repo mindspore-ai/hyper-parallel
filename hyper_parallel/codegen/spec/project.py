@@ -153,9 +153,12 @@ def _project_dp_size(accelerator: Any) -> int:
     if explicit:
         return max(1, int(explicit))
     world_size = int(os.environ.get("WORLD_SIZE") or os.environ.get("OMPI_COMM_WORLD_SIZE") or 1)
-    tp_size = max(1, int(getattr(accelerator, "tp_size", 1)))
-    cp_size = max(1, int(getattr(accelerator, "cp_size", 1)))
-    pp_size = max(1, int(getattr(accelerator, "pp_size", 1)))
+    # AcceleratorConfig.__post_init__ already rejected non-positive degrees;
+    # no silent max(1, ...) clamp here — an invalid degree must not be
+    # papered over into a topology the user never requested.
+    tp_size = int(getattr(accelerator, "tp_size", 1))
+    cp_size = int(getattr(accelerator, "cp_size", 1))
+    pp_size = int(getattr(accelerator, "pp_size", 1))
     non_dp_size = tp_size * cp_size * pp_size
     if world_size % non_dp_size != 0:
         raise ValueError(

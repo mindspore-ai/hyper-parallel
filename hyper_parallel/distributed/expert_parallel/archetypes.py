@@ -84,6 +84,21 @@ _MOE_ARCHETYPE_BY_STRUCTURE = {
             "hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn"
         ),
     ),
+    # Gated shared expert (e.g. Qwen2Moe's ``shared_expert`` + ``shared_expert_gate``
+    # pair): the shared branch is merged as
+    # ``routed + sigmoid(shared_expert_gate(x)) * shared_expert(x)`` via the
+    # existing ``_merge_shared_gated`` adapter, so it shares the DeepSeek-V3
+    # routed compute factory. The strip patterns use the singular
+    # ``shared_expert`` attribute name this structure freezes.
+    ("topk_router_module", "gated", "batched_parameters"): MoeArchetype(
+        kind="moe_ep_routed",
+        strip_boundary_subpatterns=("experts", "experts.*", "shared_expert", "shared_expert.*"),
+        router_kind="topk_router_module",
+        shared="gated",
+        compute_factory=(
+            "hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn"
+        ),
+    ),
 }
 
 
