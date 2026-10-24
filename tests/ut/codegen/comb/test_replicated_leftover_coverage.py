@@ -99,7 +99,7 @@ class TestReplicatedLeftoverCoverage(unittest.TestCase):
             self.assertFalse(spec.is_boundary)
             for placement in spec.params.values():
                 self.assertTrue(
-                    all(p.is_replicated() for p in placement.values()),
+                    all(p.is_replicate() for p in placement.values()),
                     f"{module_fqn} params must be all-Replicate",
                 )
 
