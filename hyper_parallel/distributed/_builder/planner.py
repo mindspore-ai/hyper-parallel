@@ -145,6 +145,34 @@ def _get_architecture(model) -> str:
     return s
 
 
+def _override_declared_params(
+    plan_overrides: Dict[str, Any], model: Any
+) -> Dict[str, List[str]]:
+    """Map every override key to the full parameter FQNs it declares.
+
+    Exact keys declare the params of their own module subtree relative path
+    (``params`` keys prefixed by the module FQN). Glob keys additionally
+    cover every model module they match. Used by the pure-Replicate
+    fallback to stay off parameters a user override already owns — the
+    fallback is a leftover catcher, never a second declaring boundary.
+    """
+    from fnmatch import fnmatchcase  # pylint: disable=C0415
+
+    declared: Dict[str, List[str]] = {}
+    module_names = [name for name, _ in model.named_modules()]
+    for key, spec in (plan_overrides or {}).items():
+        fqns: List[str] = []
+        if any(ch in key for ch in "*?["):
+            fqns.extend(name for name in module_names if fnmatchcase(name, key))
+        elif key in set(module_names):
+            fqns.append(key)
+        full: List[str] = []
+        for fqn in fqns:
+            full.extend(f"{fqn}.{pname}" for pname in (spec.params or {}))
+        declared[key] = full
+    return declared
+
+
 class ShardingPlanner:
     """Automatically derive a ShardingPlan from any HF-style model (05 §3.6.6).
 
@@ -248,11 +276,13 @@ class ShardingPlanner:
             )
             return
         parameters_by_name = dict(model.named_parameters())
+        declared = _override_declared_params(self._plan_overrides, model)
         for boundary_fqn, group in boundary_groups.items():
             boundary_type = self._infer_boundary_type(boundary_fqn, group)
             if self._templates.get(boundary_type) is None:
                 fallback = self._build_replicated_fallback_spec(
-                    boundary_fqn, group, model, parameters_by_name
+                    boundary_fqn, group, model, parameters_by_name,
+                    override_declared=declared,
                 )
                 if fallback is not None:
                     plan.modules[boundary_fqn] = fallback
@@ -284,6 +314,7 @@ class ShardingPlanner:
         group: List[Tuple[str, ParamRole]],
         model: Any,
         parameters_by_name: Dict[str, Any],
+        override_declared: Optional[Dict[str, List[str]]] = None,
     ) -> Optional[ModuleShardingSpec]:
         """Declare all-Replicate layouts for pure-replicable leftover groups.
 
@@ -297,6 +328,16 @@ class ShardingPlanner:
         declares each parameter Replicate on all active dims, making the
         gradient-sync semantics explicit. Groups without a single trainable
         parameter keep the legacy skip so frozen-param plans stay unchanged.
+
+        ``override_declared`` maps every override key (exact FQN or glob) to
+        the full parameter FQNs it declares; parameters already declared by
+        a user override stay OUT of the fallback — re-declaring them here
+        would violate the one-boundary-per-parameter invariant
+        (``_check_param_uniqueness``, D-14) whenever an outer override
+        declares a nested boundary's params (DeepSeek-V4.1's official
+        ``engram`` entry declaring ``engram.wkv.weight`` /
+        ``engram.embed.weight``). A fallback stripped of every param is
+        dropped entirely — the user's declaration already owns the group.
         """
         del model  # parameters_by_name already carries requires_grad
         replicable = (ParamRole.REPLICATED, ParamRole.NORM, ParamRole.BIAS)
@@ -304,17 +345,28 @@ class ShardingPlanner:
             return None
         params: Dict[str, NamedPlacement] = {}
         any_trainable = False
+        prefix = boundary_fqn + "."
         for param_fqn, _role in group:
+            if override_declared and any(
+                param_fqn in declared
+                for declared in override_declared.values()
+            ):
+                continue
             parameter = parameters_by_name.get(param_fqn)
             if parameter is not None:
                 any_trainable = any_trainable or parameter.requires_grad
             relative = (
-                param_fqn[len(boundary_fqn) + 1:] if boundary_fqn else param_fqn
+                param_fqn[len(prefix) - 1:] if boundary_fqn else param_fqn
             )
             params[relative] = _multi_dim(
                 tp=Replicate(), cp=Replicate(), ep=Replicate()
             )
         if not any_trainable:
+            return None
+        if not params:
+            # Every param is already owned by a user override: a spec with
+            # an empty params dict would still collide on the group's FQN
+            # merge path and is pointless anyway.
             return None
         return ModuleShardingSpec(
             params=params,
