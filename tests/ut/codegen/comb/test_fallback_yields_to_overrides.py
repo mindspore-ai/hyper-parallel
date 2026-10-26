@@ -120,13 +120,12 @@ class TestFallbackYieldsToOverrides(unittest.TestCase):
             ParamRole,
         )
         model = _engram_style_model()
+        # a replicated leftover the override does NOT declare (added BEFORE
+        # the declared-map is computed, mirroring the real plan flow)
+        model.layers[0].some_leftover = nn.Linear(4, 4, bias=False)
         planner = ShardingPlanner(plan_overrides=self._override())
         parameters_by_name = dict(model.named_parameters())
         declared = _override_declared_params(planner._plan_overrides, model)
-        # a replicated leftover the override does NOT declare
-        group = [("model.layers.0.some_leftover.weight", ParamRole.REPLICATED)]
-        model.layers[0].some_leftover = nn.Linear(4, 4, bias=False)
-        parameters_by_name = dict(model.named_parameters())
         spec = planner._build_replicated_fallback_spec(
             "model.layers.0.some_leftover",
             [("model.layers.0.some_leftover.weight", ParamRole.REPLICATED)],
