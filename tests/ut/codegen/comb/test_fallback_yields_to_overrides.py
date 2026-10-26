@@ -61,7 +61,15 @@ def _engram_style_model() -> nn.Module:
             super().__init__()
             self.layers = nn.ModuleList([Layer(), Layer()])
 
-    model = Model()
+    class Wrapper(nn.Module):
+        # official HF-style root: parameters are addressed as model.layers.*
+        # (named_parameters of Model() alone would yield bare layers.* FQNs,
+        #  which no `model.layers.*` override key can ever match)
+        def __init__(self):
+            super().__init__()
+            self.model = Model()
+
+    model = Wrapper()
     return model
 
 
@@ -122,7 +130,7 @@ class TestFallbackYieldsToOverrides(unittest.TestCase):
         model = _engram_style_model()
         # a replicated leftover the override does NOT declare (added BEFORE
         # the declared-map is computed, mirroring the real plan flow)
-        model.layers[0].some_leftover = nn.Linear(4, 4, bias=False)
+        model.model.layers[0].some_leftover = nn.Linear(4, 4, bias=False)
         planner = ShardingPlanner(plan_overrides=self._override())
         parameters_by_name = dict(model.named_parameters())
         declared = _override_declared_params(planner._plan_overrides, model)
