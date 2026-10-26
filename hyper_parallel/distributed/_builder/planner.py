@@ -356,7 +356,7 @@ class ShardingPlanner:
             if parameter is not None:
                 any_trainable = any_trainable or parameter.requires_grad
             relative = (
-                param_fqn[len(prefix) - 1:] if boundary_fqn else param_fqn
+                param_fqn[len(prefix):] if boundary_fqn else param_fqn
             )
             params[relative] = _multi_dim(
                 tp=Replicate(), cp=Replicate(), ep=Replicate()
