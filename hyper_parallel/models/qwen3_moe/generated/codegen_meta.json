@@ -58,19 +58,11 @@
   ],
   "injections": [
     {
-      "ep_size": 2,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn",
-        "use_grouped_gemm": true
-      },
-      "match": "model.layers.3.mlp"
-    },
-    {
       "inner_target": "self",
       "inner_wrapper": {
-        "_target_": "hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel.qwen3_moe_flash_attention_cp_wrapper"
+        "_target_": "hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel.qwen3_moe_flash_attention_cp_mask_wrapper"
       },
-      "match": "model.layers.0.self_attn"
+      "match": "model.layers.2.self_attn"
     },
     {
       "ep_size": 2,
@@ -83,9 +75,24 @@
     {
       "inner_target": "self",
       "inner_wrapper": {
-        "_target_": "hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel.qwen3_moe_flash_attention_cp_wrapper"
+        "_target_": "hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel.qwen3_moe_flash_attention_cp_mask_wrapper"
       },
-      "match": "model.layers.3.self_attn"
+      "match": "model.layers.0.self_attn"
+    },
+    {
+      "ep_size": 2,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn",
+        "use_grouped_gemm": true
+      },
+      "match": "model.layers.0.mlp"
+    },
+    {
+      "inner_target": "self",
+      "inner_wrapper": {
+        "_target_": "hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel.qwen3_moe_flash_attention_cp_mask_wrapper"
+      },
+      "match": "model.layers.1.self_attn"
     },
     {
       "ep_size": 2,
@@ -101,21 +108,14 @@
         "_target_": "hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn",
         "use_grouped_gemm": true
       },
-      "match": "model.layers.0.mlp"
+      "match": "model.layers.3.mlp"
     },
     {
       "inner_target": "self",
       "inner_wrapper": {
-        "_target_": "hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel.qwen3_moe_flash_attention_cp_wrapper"
+        "_target_": "hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel.qwen3_moe_flash_attention_cp_mask_wrapper"
       },
-      "match": "model.layers.1.self_attn"
-    },
-    {
-      "inner_target": "self",
-      "inner_wrapper": {
-        "_target_": "hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel.qwen3_moe_flash_attention_cp_wrapper"
-      },
-      "match": "model.layers.2.self_attn"
+      "match": "model.layers.3.self_attn"
     }
   ],
   "mesh_dim_names": [
@@ -358,15 +358,15 @@
   "outputs": {
     "diff": {
       "lines": 400,
-      "sha256": "5a90c1bf6eabb3581870c37e0f4ed67cf3f239943f3797b3474c256ae41ed6b3"
+      "sha256": "64852677a2b0c7c319c9ef8c0bb8cdcf12ab02209261c46c064777a0c38106c1"
     },
     "init": {
       "lines": 6,
-      "sha256": "5ce77ce41abbf524fe03ad49c99578bd44446913ce8d64a312aeda3e8c52784b"
+      "sha256": "8f1688915df17132db0cf6ce078ee3970f10e9f1018609f50c5073ba28737e9d"
     },
     "modeling": {
       "lines": 971,
-      "sha256": "55fc0f986a4fbe885b00d1097d892ac447a7640851bf4334836730e57c9bc75a"
+      "sha256": "f9ba53acddf011dfbfc59100c7d2ee4041d9ce9889bb0734aaf39f297ca0990b"
     }
   },
   "parallel_dims": {
@@ -1467,13 +1467,13 @@
     }
   },
   "remote_siblings": [],
-  "signature": "6d545abdcbd7",
+  "signature": "162c450f022d",
   "skipped_overrides": [],
   "source": {
     "architecture": "Qwen3MoeForCausalLM",
-    "file_path": "transformers/models/qwen3_moe/modeling_qwen3_moe.py",
+    "file_path": "/home/lxy/miniforge3/envs/hyper_restructure_py311/lib/python3.11/site-packages/transformers/models/qwen3_moe/modeling_qwen3_moe.py",
     "line_count": 731,
-    "model_id": "qwen3_30b_a3b_4L",
+    "model_id": "/home/lxy/qwen3_30b_a3b_4L",
     "model_type": "qwen3_moe",
     "module_name": "transformers.models.qwen3_moe.modeling_qwen3_moe",
     "sha256": "f07ab1b3a17e27612006a447812b83667af7ab3d527afe3ebbdf89dc5dac8a90",
@@ -1492,6 +1492,6 @@
   },
   "special_handlers": {},
   "tied_pairs": [],
-  "yaml_path": "examples/training_demo/qwen3_moe/train_parallel_offline_codegen.yaml",
-  "yaml_sha256": "2557784b26ad9d5fcdb226fde356466141bc0f98f3e66d590717d220e0d63ead"
+  "yaml_path": "/home/lxy/codegen_all_3cb4e616_inputs/qwen3_moe.yaml",
+  "yaml_sha256": "3bc87e1f4b130d81e702a9d6a7f6cb7981df65b443d85772e7891bd3bc055fda"
 }

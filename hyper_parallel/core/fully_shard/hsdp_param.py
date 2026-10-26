@@ -704,8 +704,18 @@ class HSDPParamV2:
             for numel, dtype in zip(all_gather_input_numels, all_gather_input_dtypes)
         ]
 
+    @torch.no_grad()
     def init_unsharded_param(self) -> None:
-        """Initialize the stable unsharded parameter from its final output storage."""
+        """Initialize the stable unsharded parameter from its final output storage.
+
+        Runs under ``no_grad`` like its siblings (``_init_sharded_param``,
+        ``_get_unsharded_param_data``): the all-gather copy and the
+        ``as_strided`` view are pure data movement for a leaf parameter, not
+        forward computation. Without this, a view materialized inside a
+        no_grad activation-checkpoint region (or vice versa) trips autograd's
+        mixed-mode view check when the buffer has an inplace write from the
+        other mode in its history.
+        """
         if len(self.unsharded_param_buffers) != 1:
             raise AssertionError(
                 f"Expected 1 unsharded_param_buffer, got {len(self.unsharded_param_buffers)}"
@@ -1115,6 +1125,21 @@ class HSDPParamV2:
 
         self.init_unsharded_param()
         self.to_unsharded()
+
+    @torch.no_grad()
+    def discard_pending_all_gather(self) -> None:
+        """Drain and release an all-gather that will never be consumed.
+
+        Used for parameters of units that did not execute in the current
+        forward pass (e.g. a vision tower under text-only batches): the
+        ``wait_for_unshard`` that would consume this all-gather cannot fire,
+        so wait out the in-flight handle locally and drop the communication
+        buffers. The parameter stays in its sharded state.
+        """
+        if self.allgather_comm_ctx.allgather_handle is not None:
+            self.allgather_comm_ctx.allgather_handle.wait()
+            self.allgather_comm_ctx.allgather_handle = None
+        self.allgather_comm_ctx.allgather_output = None
 
     def shard(self) -> None:
         """

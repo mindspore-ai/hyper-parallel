@@ -50,15 +50,15 @@
   "outputs": {
     "diff": {
       "lines": 67,
-      "sha256": "2e8e0b335042ca64770bc7de83b46af327babb9d920515ecbcf2643cb2516bed"
+      "sha256": "7ab7819894f3563c3b20a225423dcaf0d0ac70800b6659fd16b00be6eb440db2"
     },
     "init": {
       "lines": 6,
-      "sha256": "2227316928533522450645ad4a1a034c2d5d0dcedc3a7ecb44f23b317ae464e0"
+      "sha256": "76974effeffd02338fed93c2772820cdc8199d51c33ad6d9529fad3ce8ede464"
     },
     "modeling": {
       "lines": 750,
-      "sha256": "2c5e7cf0786c522744d2892f18dd450b32423a9800850ba1ae295368f2d71c0f"
+      "sha256": "1f2598f7f70feae11a44619231ca6b5015425734bb4d16281178a1b677e3b4a9"
     }
   },
   "parallel_dims": {
@@ -1108,7 +1108,7 @@
     }
   },
   "remote_siblings": [],
-  "signature": "e0fec5e5705b",
+  "signature": "52dc7b59afae",
   "skipped_overrides": [],
   "source": {
     "architecture": null,
@@ -1132,6 +1132,6 @@
   },
   "special_handlers": {},
   "tied_pairs": [],
-  "yaml_path": "/home/lxy/hyper-parallel-genpath/examples/training_demo/qwen2_moe/train_codegen_probe.yaml",
+  "yaml_path": "/home/lxy/codegen_all_3cb4e616_inputs/qwen2_moe.yaml",
   "yaml_sha256": "9935ac544d2070941e49a0d15a23c36dd66a1351757eed9d57fc7b40b94c9e25"
 }

@@ -96,6 +96,14 @@ class HSDPSchedulerContext:
 class HSDPSchedulerV2:
     """HSDPScheduler is used to scheduler hsdp"""
 
+    # Whether this unit's forward pre-hook ran in the current forward pass.
+    # Units that never execute (e.g. a vision tower under text-only batches)
+    # must not be prefetch targets: the hooks that would consume an all-gather
+    # are registered on forward outputs never produced.  A class-level default
+    # keeps the attribute readable on partially-constructed instances (test
+    # stubs that bypass ``__init__``); ``__init__`` still resets it per unit.
+    _forward_participated = False
+
     def __init__(
         self,
         cell: Union[nn.Module, Tuple[nn.Module, ...]],
@@ -143,6 +151,7 @@ class HSDPSchedulerV2:
         self.forward_prefetch_cells = []
         self.backward_prefetch_cells = []
         self._backup_forward_fetch = None
+        self._forward_participated = False
         # Flag to identify root module.
         self._is_root = True
         # module and its all sub-modules share one same 'HSDPSchedulerContext'
@@ -276,6 +285,14 @@ class HSDPSchedulerV2:
                     submod_scheduler.hsdp_state.module_name = module_name
                     tree_ctx.all_hsdp_schedulers.append(submod_scheduler)
 
+        if self._is_root and not self.scheduler_ctx.root_bp_state:
+            # A new forward pass starts: clear per-pass participation so units
+            # that never execute in this pass (e.g. a vision tower under
+            # text-only batches) are not treated as live prefetch targets in
+            # the upcoming backward. Recompute (root_bp_state) must not reset.
+            for submod_scheduler in self.scheduler_ctx.all_hsdp_schedulers:
+                submod_scheduler._forward_participated = False  # pylint: disable=protected-access
+        self._forward_participated = True
         self.scheduler_state = FSDPSchedulerState.PRE_FORWARD
         if self._is_root and not self.scheduler_ctx.lazy_init_done:
             self._init_params_fqn()
@@ -366,7 +383,20 @@ class HSDPSchedulerV2:
                 logger.debug("hook=backward_pre action=unshard module=%s", self.hsdp_state)
                 self.hsdp_state.unshard()
         for prefetch_cell in self.backward_prefetch_cells:
-            prefetch_state = prefetch_cell.hsdp_scheduler.hsdp_state
+            prefetch_scheduler = prefetch_cell.hsdp_scheduler
+            if not prefetch_scheduler._forward_participated:  # pylint: disable=protected-access
+                # The target never executed in this forward pass (e.g. a
+                # vision tower under text-only batches), so its backward
+                # pre-hook cannot fire either and an all-gather issued now
+                # would never be consumed. Skip it; should the target run, it
+                # unshards itself synchronously in its own backward pre-hook.
+                logger.debug(
+                    "hook=backward_pre skip prefetch module=%s target=%s reason=not_executed",
+                    self.hsdp_state,
+                    prefetch_scheduler.hsdp_state,
+                )
+                continue
+            prefetch_state = prefetch_scheduler.hsdp_state
             with profiler_record(f"pre_backward prefetch:"
                                  f"{prefetch_state.module_name}"):
                 logger.debug(
@@ -549,6 +579,11 @@ class HSDPSchedulerV2:
     def check_state_prefetch_handles_consumed(self) -> None:
         """Check that all parameters in the module tree consumed their prefetch work.
 
+        A unit that never executed in the current forward pass (e.g. a vision
+        tower under text-only batches) can never consume a pending all-gather:
+        its consumer hooks are registered on forward outputs that were never
+        produced. Such handles are drained and released instead of reported.
+
         Raises:
             RuntimeError: If a parameter or fused bucket retains an all-gather
                 handle because the configured prefetch order is incorrect.
@@ -557,6 +592,13 @@ class HSDPSchedulerV2:
         for hsdp_scheduler in self.scheduler_ctx.all_hsdp_schedulers:
             hsdp_state = hsdp_scheduler.hsdp_state
             if hsdp_state is None:
+                continue
+            if not hsdp_scheduler._forward_participated:  # pylint: disable=protected-access
+                for hsdp_param in hsdp_state.hsdp_params:
+                    hsdp_param.discard_pending_all_gather()
+                if hsdp_state.param_group is not None:
+                    for bucket in hsdp_state.param_group.all_gather_buckets:
+                        bucket.discard_pending_all_gather()
                 continue
             unconsumed_param_fqns.extend(
                 str(param) for param in hsdp_state.hsdp_params

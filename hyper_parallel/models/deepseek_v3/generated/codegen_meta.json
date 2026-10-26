@@ -79,6 +79,16 @@
       "match": "model.layers.1.mlp"
     },
     {
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn",
+        "capacity_factor": null,
+        "fix_router": false,
+        "overlap_shared_expert": false,
+        "use_grouped_gemm": true
+      },
+      "match": "model.layers.2.mlp"
+    },
+    {
       "ep_size": 2,
       "local_compute_fn": {
         "_target_": "hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn",
@@ -88,16 +98,6 @@
         "use_grouped_gemm": true
       },
       "match": "model.layers.3.mlp"
-    },
-    {
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn",
-        "capacity_factor": null,
-        "fix_router": false,
-        "overlap_shared_expert": false,
-        "use_grouped_gemm": true
-      },
-      "match": "model.layers.2.mlp"
     }
   ],
   "mesh_dim_names": [
@@ -115,16 +115,16 @@
   ],
   "outputs": {
     "diff": {
-      "lines": 135,
-      "sha256": "3f7ba126946658437d8b58b5079de280ff47bac114fe1384c3ab06bdf7d13a0d"
+      "lines": 162,
+      "sha256": "1736a43776754bc50fdcd26c04e2e3d6840ea8c73d5fd02bd2a04c0f87761f27"
     },
     "init": {
       "lines": 6,
-      "sha256": "73014f4a42d2a9d03b884bd07d29e3f4dfb190b7d751fa2443a2b92a007d5ba0"
+      "sha256": "3837682d3d61de3b546df24c1aa138be8eb92254d21f1596391274bf21ead8a5"
     },
     "modeling": {
-      "lines": 774,
-      "sha256": "675b908708c62cb855f99cdc8159ad7ad59958a7bef11280d0aedb0aa49f9b30"
+      "lines": 785,
+      "sha256": "ad753d6a7d0f6d09d58877b9396e53628def35f206a71ad79124f8d13fd23458"
     }
   },
   "parallel_dims": {
@@ -1334,7 +1334,7 @@
     }
   },
   "remote_siblings": [],
-  "signature": "4b7934e7f281",
+  "signature": "c4f7a3358852",
   "skipped_overrides": [],
   "source": {
     "architecture": null,
@@ -1362,6 +1362,6 @@
   },
   "special_handlers": {},
   "tied_pairs": [],
-  "yaml_path": "/home/lxy/dsv3_codegen_ep.yaml",
+  "yaml_path": "/home/lxy/codegen_all_3cb4e616_inputs/deepseek_v3.yaml",
   "yaml_sha256": "dc6cf33947736426cf4a834383e9a5c20158960bbbe14387346b19f7453b3b5a"
 }

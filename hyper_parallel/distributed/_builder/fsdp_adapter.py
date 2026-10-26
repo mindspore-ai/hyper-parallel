@@ -536,19 +536,65 @@ class FSDP2Manager:
         hsdp_module.set_gradient_scaling_factor(1.0 / source_gradient_domain_size)
         return True
 
+    @staticmethod
+    def _participates_in_backward(hsdp_module: HSDPModule) -> bool:
+        """Return whether one FSDP unit owns a trainable parameter.
+
+        A unit whose parameters are all frozen (``requires_grad=False``,
+        e.g. a frozen vision tower) runs its forward hooks but autograd never
+        reaches it, so its backward pre-hook never fires.
+        """
+        scheduler = getattr(hsdp_module, "hsdp_scheduler", None)
+        state = getattr(scheduler, "hsdp_state", None)
+        hsdp_params = getattr(state, "hsdp_params", None) or ()
+        return any(
+            getattr(param.sharded_param, "requires_grad", False)
+            for param in hsdp_params
+        )
+
     def _configure_prefetch(self, hsdp_modules: list[HSDPModule]) -> None:
         """Configure forward and backward prefetch targets by list depth."""
+        # Forward prefetch assumes the list order matches the execution order.
+        # A frozen unit breaks that assumption: it may sit in the list at a
+        # position that does not match its execution slot (e.g. a vision
+        # attention ``proj`` listed ahead of its ``q/k/v_proj`` but executed
+        # after them), so a unit may issue a prefetch for a frozen target
+        # *after* that target's last forward. Since frozen units never run a
+        # backward pre-hook either, such a handle is never consumed. Frozen
+        # units therefore never serve as a forward prefetch target; their own
+        # forward pre-hook unshards them synchronously instead.
         for module_index, hsdp_module in enumerate(hsdp_modules):
             forward_end = module_index + self.config.forward_prefetch_depth + 1
             hsdp_module.set_modules_to_forward_prefetch(
-                hsdp_modules[module_index + 1:forward_end]
+                [
+                    target
+                    for target in hsdp_modules[module_index + 1:forward_end]
+                    if self._participates_in_backward(target)
+                ]
             )
 
+        # Backward prefetch must follow the *backward* execution order, which
+        # only visits units with trainable parameters: a frozen unit's
+        # pre-hook never fires, so an all-gather issued for it would stay
+        # unconsumed and trip the root-backward prefetch check.
+        backward_chain = [
+            hsdp_module
+            for hsdp_module in hsdp_modules
+            if self._participates_in_backward(hsdp_module)
+        ]
+        backward_index = {
+            id(hsdp_module): index for index, hsdp_module in enumerate(backward_chain)
+        }
+        for hsdp_module in hsdp_modules:
+            module_index = backward_index.get(id(hsdp_module))
+            if module_index is None:
+                hsdp_module.set_modules_to_backward_prefetch([])
+                continue
             backward_start = max(
                 0, module_index - self.config.backward_prefetch_depth
             )
             hsdp_module.set_modules_to_backward_prefetch(
-                list(reversed(hsdp_modules[backward_start:module_index]))
+                list(reversed(backward_chain[backward_start:module_index]))
             )
 
     def _order_wrap_modules(

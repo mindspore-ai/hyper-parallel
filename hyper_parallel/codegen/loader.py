@@ -232,6 +232,24 @@ def resolve_generated_model_class(module: ModuleType, hf_config: Any) -> type:
     """
     architectures = getattr(hf_config, "architectures", None) or []
     if not architectures:
+        # Configs built from cropped/probe checkpoints may omit
+        # ``architectures`` (e.g. ``AutoConfig.from_pretrained`` on a config
+        # without the field). Fall back to the architecture the model adapter
+        # registered for this ``model_type`` — the same source of truth the
+        # generation phase used to emit the module.
+        model_type = getattr(hf_config, "model_type", None)
+        if model_type:
+            from hyper_parallel.models.registry import get_model_adapter  # pylint: disable=C0415
+            spec = get_model_adapter(model_type)
+            if spec is not None and spec.architecture:
+                architectures = [spec.architecture]
+                logger.debug(
+                    "codegen: hf_config has no 'architectures'; using adapter "
+                    "architecture %r for model_type %r",
+                    spec.architecture,
+                    model_type,
+                )
+    if not architectures:
         raise ValueError(
             "codegen: hf_config has no 'architectures'; cannot pick a model "
             f"class from {module.__name__}"

@@ -241,6 +241,26 @@ class AllGatherBucket:
         all_gather_result.all_gather_output = None
         self.all_gather_result = None
 
+    @torch.no_grad()
+    def discard_pending_all_gather(self) -> None:
+        """Drain and release an all-gather that will never be consumed.
+
+        Used for buckets of units that did not execute in the current forward
+        pass (e.g. a vision tower under text-only batches): the ``copy_out``
+        that would consume this all-gather cannot fire, so wait out the
+        in-flight handle locally and drop the communication buffers. No-op
+        when the bucket has no pending result.
+        """
+        all_gather_result = self.all_gather_result
+        if all_gather_result is None:
+            return
+        if all_gather_result.handle is not None:
+            all_gather_result.handle.wait()
+            all_gather_result.handle = None
+        all_gather_result.all_gather_input = None
+        all_gather_result.all_gather_output = None
+        self.all_gather_result = None
+
 
 @dataclass
 class GradientBucketLayout:

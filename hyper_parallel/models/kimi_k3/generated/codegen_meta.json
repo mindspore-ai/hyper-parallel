@@ -10,6 +10,7 @@
     "language_model.model.layers.0.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.0.self_attention_res_proj": "Linear",
     "language_model.model.layers.0.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.0.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.1.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.1.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.1.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -21,6 +22,7 @@
     "language_model.model.layers.1.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.1.self_attention_res_proj": "Linear",
     "language_model.model.layers.1.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.1.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.10.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.10.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.10.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -32,6 +34,7 @@
     "language_model.model.layers.10.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.10.self_attention_res_proj": "Linear",
     "language_model.model.layers.10.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.10.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.11.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.11.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.11.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -57,6 +60,7 @@
     "language_model.model.layers.12.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.12.self_attention_res_proj": "Linear",
     "language_model.model.layers.12.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.12.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.13.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.13.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.13.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -68,6 +72,7 @@
     "language_model.model.layers.13.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.13.self_attention_res_proj": "Linear",
     "language_model.model.layers.13.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.13.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.14.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.14.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.14.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -79,6 +84,7 @@
     "language_model.model.layers.14.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.14.self_attention_res_proj": "Linear",
     "language_model.model.layers.14.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.14.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.15.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.15.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.15.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -104,6 +110,7 @@
     "language_model.model.layers.16.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.16.self_attention_res_proj": "Linear",
     "language_model.model.layers.16.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.16.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.17.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.17.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.17.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -115,6 +122,7 @@
     "language_model.model.layers.17.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.17.self_attention_res_proj": "Linear",
     "language_model.model.layers.17.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.17.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.18.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.18.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.18.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -126,6 +134,7 @@
     "language_model.model.layers.18.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.18.self_attention_res_proj": "Linear",
     "language_model.model.layers.18.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.18.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.19.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.19.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.19.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -151,6 +160,7 @@
     "language_model.model.layers.2.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.2.self_attention_res_proj": "Linear",
     "language_model.model.layers.2.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.2.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.20.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.20.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.20.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -162,6 +172,7 @@
     "language_model.model.layers.20.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.20.self_attention_res_proj": "Linear",
     "language_model.model.layers.20.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.20.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.21.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.21.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.21.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -173,6 +184,7 @@
     "language_model.model.layers.21.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.21.self_attention_res_proj": "Linear",
     "language_model.model.layers.21.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.21.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.22.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.22.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.22.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -184,6 +196,7 @@
     "language_model.model.layers.22.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.22.self_attention_res_proj": "Linear",
     "language_model.model.layers.22.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.22.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.23.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.23.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.23.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -209,6 +222,7 @@
     "language_model.model.layers.24.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.24.self_attention_res_proj": "Linear",
     "language_model.model.layers.24.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.24.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.25.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.25.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.25.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -220,6 +234,7 @@
     "language_model.model.layers.25.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.25.self_attention_res_proj": "Linear",
     "language_model.model.layers.25.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.25.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.26.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.26.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.26.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -231,6 +246,7 @@
     "language_model.model.layers.26.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.26.self_attention_res_proj": "Linear",
     "language_model.model.layers.26.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.26.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.27.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.27.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.27.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -256,6 +272,7 @@
     "language_model.model.layers.28.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.28.self_attention_res_proj": "Linear",
     "language_model.model.layers.28.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.28.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.29.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.29.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.29.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -267,6 +284,7 @@
     "language_model.model.layers.29.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.29.self_attention_res_proj": "Linear",
     "language_model.model.layers.29.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.29.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.3.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.3.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.3.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -292,6 +310,7 @@
     "language_model.model.layers.30.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.30.self_attention_res_proj": "Linear",
     "language_model.model.layers.30.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.30.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.31.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.31.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.31.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -317,6 +336,7 @@
     "language_model.model.layers.32.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.32.self_attention_res_proj": "Linear",
     "language_model.model.layers.32.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.32.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.33.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.33.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.33.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -328,6 +348,7 @@
     "language_model.model.layers.33.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.33.self_attention_res_proj": "Linear",
     "language_model.model.layers.33.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.33.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.34.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.34.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.34.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -339,6 +360,7 @@
     "language_model.model.layers.34.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.34.self_attention_res_proj": "Linear",
     "language_model.model.layers.34.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.34.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.35.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.35.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.35.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -364,6 +386,7 @@
     "language_model.model.layers.36.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.36.self_attention_res_proj": "Linear",
     "language_model.model.layers.36.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.36.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.37.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.37.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.37.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -375,6 +398,7 @@
     "language_model.model.layers.37.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.37.self_attention_res_proj": "Linear",
     "language_model.model.layers.37.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.37.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.38.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.38.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.38.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -386,6 +410,7 @@
     "language_model.model.layers.38.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.38.self_attention_res_proj": "Linear",
     "language_model.model.layers.38.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.38.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.39.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.39.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.39.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -411,6 +436,7 @@
     "language_model.model.layers.4.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.4.self_attention_res_proj": "Linear",
     "language_model.model.layers.4.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.4.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.40.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.40.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.40.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -422,6 +448,7 @@
     "language_model.model.layers.40.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.40.self_attention_res_proj": "Linear",
     "language_model.model.layers.40.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.40.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.41.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.41.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.41.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -433,6 +460,7 @@
     "language_model.model.layers.41.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.41.self_attention_res_proj": "Linear",
     "language_model.model.layers.41.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.41.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.42.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.42.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.42.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -444,6 +472,7 @@
     "language_model.model.layers.42.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.42.self_attention_res_proj": "Linear",
     "language_model.model.layers.42.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.42.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.43.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.43.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.43.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -469,6 +498,7 @@
     "language_model.model.layers.44.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.44.self_attention_res_proj": "Linear",
     "language_model.model.layers.44.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.44.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.45.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.45.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.45.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -480,6 +510,7 @@
     "language_model.model.layers.45.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.45.self_attention_res_proj": "Linear",
     "language_model.model.layers.45.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.45.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.46.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.46.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.46.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -491,6 +522,7 @@
     "language_model.model.layers.46.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.46.self_attention_res_proj": "Linear",
     "language_model.model.layers.46.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.46.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.47.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.47.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.47.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -516,6 +548,7 @@
     "language_model.model.layers.48.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.48.self_attention_res_proj": "Linear",
     "language_model.model.layers.48.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.48.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.49.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.49.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.49.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -527,6 +560,7 @@
     "language_model.model.layers.49.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.49.self_attention_res_proj": "Linear",
     "language_model.model.layers.49.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.49.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.5.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.5.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.5.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -538,6 +572,7 @@
     "language_model.model.layers.5.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.5.self_attention_res_proj": "Linear",
     "language_model.model.layers.5.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.5.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.50.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.50.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.50.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -549,6 +584,7 @@
     "language_model.model.layers.50.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.50.self_attention_res_proj": "Linear",
     "language_model.model.layers.50.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.50.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.51.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.51.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.51.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -574,6 +610,7 @@
     "language_model.model.layers.52.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.52.self_attention_res_proj": "Linear",
     "language_model.model.layers.52.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.52.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.53.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.53.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.53.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -585,6 +622,7 @@
     "language_model.model.layers.53.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.53.self_attention_res_proj": "Linear",
     "language_model.model.layers.53.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.53.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.54.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.54.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.54.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -596,6 +634,7 @@
     "language_model.model.layers.54.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.54.self_attention_res_proj": "Linear",
     "language_model.model.layers.54.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.54.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.55.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.55.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.55.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -621,6 +660,7 @@
     "language_model.model.layers.56.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.56.self_attention_res_proj": "Linear",
     "language_model.model.layers.56.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.56.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.57.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.57.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.57.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -632,6 +672,7 @@
     "language_model.model.layers.57.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.57.self_attention_res_proj": "Linear",
     "language_model.model.layers.57.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.57.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.58.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.58.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.58.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -643,6 +684,7 @@
     "language_model.model.layers.58.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.58.self_attention_res_proj": "Linear",
     "language_model.model.layers.58.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.58.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.59.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.59.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.59.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -668,6 +710,7 @@
     "language_model.model.layers.6.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.6.self_attention_res_proj": "Linear",
     "language_model.model.layers.6.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.6.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.60.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.60.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.60.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -679,6 +722,7 @@
     "language_model.model.layers.60.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.60.self_attention_res_proj": "Linear",
     "language_model.model.layers.60.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.60.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.61.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.61.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.61.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -690,6 +734,7 @@
     "language_model.model.layers.61.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.61.self_attention_res_proj": "Linear",
     "language_model.model.layers.61.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.61.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.62.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.62.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.62.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -701,6 +746,7 @@
     "language_model.model.layers.62.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.62.self_attention_res_proj": "Linear",
     "language_model.model.layers.62.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.62.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.63.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.63.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.63.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -726,6 +772,7 @@
     "language_model.model.layers.64.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.64.self_attention_res_proj": "Linear",
     "language_model.model.layers.64.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.64.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.65.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.65.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.65.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -737,6 +784,7 @@
     "language_model.model.layers.65.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.65.self_attention_res_proj": "Linear",
     "language_model.model.layers.65.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.65.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.66.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.66.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.66.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -748,6 +796,7 @@
     "language_model.model.layers.66.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.66.self_attention_res_proj": "Linear",
     "language_model.model.layers.66.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.66.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.67.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.67.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.67.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -773,6 +822,7 @@
     "language_model.model.layers.68.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.68.self_attention_res_proj": "Linear",
     "language_model.model.layers.68.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.68.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.69.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.69.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.69.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -784,6 +834,7 @@
     "language_model.model.layers.69.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.69.self_attention_res_proj": "Linear",
     "language_model.model.layers.69.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.69.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.7.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.7.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.7.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -809,6 +860,7 @@
     "language_model.model.layers.70.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.70.self_attention_res_proj": "Linear",
     "language_model.model.layers.70.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.70.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.71.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.71.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.71.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -834,6 +886,7 @@
     "language_model.model.layers.72.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.72.self_attention_res_proj": "Linear",
     "language_model.model.layers.72.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.72.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.73.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.73.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.73.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -845,6 +898,7 @@
     "language_model.model.layers.73.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.73.self_attention_res_proj": "Linear",
     "language_model.model.layers.73.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.73.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.74.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.74.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.74.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -856,6 +910,7 @@
     "language_model.model.layers.74.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.74.self_attention_res_proj": "Linear",
     "language_model.model.layers.74.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.74.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.75.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.75.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.75.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -881,6 +936,7 @@
     "language_model.model.layers.76.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.76.self_attention_res_proj": "Linear",
     "language_model.model.layers.76.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.76.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.77.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.77.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.77.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -892,6 +948,7 @@
     "language_model.model.layers.77.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.77.self_attention_res_proj": "Linear",
     "language_model.model.layers.77.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.77.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.78.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.78.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.78.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -903,6 +960,7 @@
     "language_model.model.layers.78.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.78.self_attention_res_proj": "Linear",
     "language_model.model.layers.78.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.78.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.79.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.79.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.79.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -928,6 +986,7 @@
     "language_model.model.layers.8.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.8.self_attention_res_proj": "Linear",
     "language_model.model.layers.8.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.8.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.80.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.80.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.80.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -939,6 +998,7 @@
     "language_model.model.layers.80.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.80.self_attention_res_proj": "Linear",
     "language_model.model.layers.80.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.80.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.81.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.81.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.81.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -950,6 +1010,7 @@
     "language_model.model.layers.81.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.81.self_attention_res_proj": "Linear",
     "language_model.model.layers.81.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.81.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.82.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.82.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.82.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -961,6 +1022,7 @@
     "language_model.model.layers.82.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.82.self_attention_res_proj": "Linear",
     "language_model.model.layers.82.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.82.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.83.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.83.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.83.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -986,6 +1048,7 @@
     "language_model.model.layers.84.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.84.self_attention_res_proj": "Linear",
     "language_model.model.layers.84.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.84.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.85.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.85.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.85.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -997,6 +1060,7 @@
     "language_model.model.layers.85.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.85.self_attention_res_proj": "Linear",
     "language_model.model.layers.85.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.85.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.86.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.86.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.86.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -1008,6 +1072,7 @@
     "language_model.model.layers.86.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.86.self_attention_res_proj": "Linear",
     "language_model.model.layers.86.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.86.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.87.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.87.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.87.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -1033,6 +1098,7 @@
     "language_model.model.layers.88.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.88.self_attention_res_proj": "Linear",
     "language_model.model.layers.88.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.88.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.89.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.89.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.89.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -1044,6 +1110,7 @@
     "language_model.model.layers.89.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.89.self_attention_res_proj": "Linear",
     "language_model.model.layers.89.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.89.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.9.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.9.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.9.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -1055,6 +1122,7 @@
     "language_model.model.layers.9.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.9.self_attention_res_proj": "Linear",
     "language_model.model.layers.9.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.9.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.90.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.90.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.90.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -1066,6 +1134,7 @@
     "language_model.model.layers.90.self_attention_res_norm": "KimiRMSNorm",
     "language_model.model.layers.90.self_attention_res_proj": "Linear",
     "language_model.model.layers.90.self_attn": "KimiDeltaAttention",
+    "language_model.model.layers.90.self_attn.o_norm": "FusedRMSNormGated",
     "language_model.model.layers.91.block_sparse_moe": "KimiSparseMoeBlock",
     "language_model.model.layers.91.block_sparse_moe.gate": "KimiMoEGate",
     "language_model.model.layers.91.block_sparse_moe.routed_expert_norm": "KimiRMSNorm",
@@ -1296,15 +1365,15 @@
     },
     "diff": {
       "lines": 20,
-      "sha256": "3b48dcbfe4f10d2cfd3c1cbf16162112ed8328fef9a8bf66cc6919de57c27aee"
+      "sha256": "aa48978b4e9a28353e2bf101f6dbffcca8eb8a5910f02bb9c5387534444eb14a"
     },
     "init": {
       "lines": 6,
-      "sha256": "9cb37362c875dbad132e2bcc9f39405f9bcb350a9d92d5eac6fcb20f034a1c09"
+      "sha256": "3b282fdb79b428980e9ecc8964e1dfcd6e4f0d49189a9459d11d69537a50209d"
     },
     "modeling": {
       "lines": 1331,
-      "sha256": "7f18bbc8f74a3438b914749af8d411524a39a3d0ba6b90386581d085fafbaf76"
+      "sha256": "fd1d641ce49dd8f9655a9ec23c78f407cd68856540701cfa171e550947e2269f"
     },
     "modeling_kimi_linear.py": {
       "lines": 1314,
@@ -1664,6 +1733,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -1672,11 +1745,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.0.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -12795,6 +12913,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -12803,11 +12925,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.1.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -23926,6 +24093,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -23934,11 +24105,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.10.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -46252,6 +46468,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -46260,11 +46480,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.12.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -57383,6 +57648,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -57391,11 +57660,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.13.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -68514,6 +68828,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -68522,11 +68840,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.14.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -90840,6 +91203,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -90848,11 +91215,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.16.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -101971,6 +102383,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -101979,11 +102395,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.17.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -113102,6 +113563,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -113110,11 +113575,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.18.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -135428,6 +135938,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -135436,11 +135950,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.2.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -146559,6 +147118,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -146567,11 +147130,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.20.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -157690,6 +158298,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -157698,11 +158310,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.21.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -168821,6 +169478,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -168829,11 +169490,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.22.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -191147,6 +191853,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -191155,11 +191865,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.24.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -202278,6 +203033,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -202286,11 +203045,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.25.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -213409,6 +214213,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -213417,11 +214225,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.26.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -235735,6 +236588,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -235743,11 +236600,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.28.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -246866,6 +247768,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -246874,11 +247780,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.29.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -269192,6 +270143,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -269200,11 +270155,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.30.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -291518,6 +292518,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -291526,11 +292530,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.32.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -302649,6 +303698,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -302657,11 +303710,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.33.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -313780,6 +314878,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -313788,11 +314890,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.34.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -336106,6 +337253,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -336114,11 +337265,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.36.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -347237,6 +348433,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -347245,11 +348445,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.37.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -358368,6 +359613,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -358376,11 +359625,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.38.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -380694,6 +381988,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -380702,11 +382000,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.4.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -391825,6 +393168,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -391833,11 +393180,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.40.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -402956,6 +404348,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -402964,11 +404360,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.41.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -414087,6 +415528,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -414095,11 +415540,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.42.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -436413,6 +437903,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -436421,11 +437915,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.44.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -447544,6 +449083,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -447552,11 +449095,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.45.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -458675,6 +460263,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -458683,11 +460275,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.46.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -481001,6 +482638,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -481009,11 +482650,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.48.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -492132,6 +493818,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -492140,11 +493830,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.49.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -503263,6 +504998,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -503271,11 +505010,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.5.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -514394,6 +516178,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -514402,11 +516190,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.50.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -536720,6 +538553,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -536728,11 +538565,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.52.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -547851,6 +549733,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -547859,11 +549745,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.53.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -558982,6 +560913,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -558990,11 +560925,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.54.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -581308,6 +583288,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -581316,11 +583300,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.56.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -592439,6 +594468,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -592447,11 +594480,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.57.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -603570,6 +605648,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -603578,11 +605660,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.58.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -625896,6 +628023,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -625904,11 +628035,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.6.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -637027,6 +639203,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -637035,11 +639215,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.60.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -648158,6 +650383,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -648166,11 +650395,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.61.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -659289,6 +661563,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -659297,11 +661575,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.62.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -681615,6 +683938,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -681623,11 +683950,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.64.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -692746,6 +695118,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -692754,11 +695130,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.65.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -703877,6 +706298,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -703885,11 +706310,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.66.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -726203,6 +728673,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -726211,11 +728685,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.68.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -737334,6 +739853,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -737342,11 +739865,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.69.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -759660,6 +762228,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -759668,11 +762240,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.70.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -781986,6 +784603,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -781994,11 +784615,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.72.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -793117,6 +795783,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -793125,11 +795795,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.73.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -804248,6 +806963,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -804256,11 +806975,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.74.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -826574,6 +829338,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -826582,11 +829350,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.76.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -837705,6 +840518,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -837713,11 +840530,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.77.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -848836,6 +851698,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -848844,11 +851710,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.78.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -871162,6 +874073,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -871170,11 +874085,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.8.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -882293,6 +885253,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -882301,11 +885265,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.80.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -893424,6 +896433,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -893432,11 +896445,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.81.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -904555,6 +907613,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -904563,11 +907625,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.82.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -926881,6 +929988,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -926889,11 +930000,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.84.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -938012,6 +941168,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -938020,11 +941180,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.85.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -949143,6 +952348,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -949151,11 +952360,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.86.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -971469,6 +974723,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -971477,11 +974735,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.88.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -982600,6 +985903,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -982608,11 +985915,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.89.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -993731,6 +997083,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -993739,11 +997095,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.9.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -1004862,6 +1008263,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -1004870,11 +1008275,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "language_model.model.layers.90.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -1030494,7 +1033944,7 @@
     "configuration_kimi_k3.py",
     "modeling_kimi_linear.py"
   ],
-  "signature": "e43c65362605",
+  "signature": "2b2de86414e7",
   "skipped_overrides": [],
   "source": {
     "architecture": "KimiK3ForConditionalGeneration",
@@ -1030509,6 +1033959,6 @@
   },
   "special_handlers": {},
   "tied_pairs": [],
-  "yaml_path": "/home/lxy/hyper-parallel-genpath/examples/training_demo/kimi_k3/train_codegen_probe.yaml",
-  "yaml_sha256": "186541f4d7045a6e796bef996062669b6422bab6b6573c607a0d1eedfc725ba4"
+  "yaml_path": "/home/lxy/codegen_all_3cb4e616_inputs/kimi_k3.yaml",
+  "yaml_sha256": "cd5a793a2e99ae3f6397ea0e59665265c56949a5ccb0b25df9eef7977fd21f81"
 }

@@ -14,6 +14,18 @@
     "model.language_model.layers.1.self_attn": "Qwen3VLMoeTextAttention",
     "model.language_model.layers.1.self_attn.k_norm": "Qwen3VLMoeTextRMSNorm",
     "model.language_model.layers.1.self_attn.q_norm": "Qwen3VLMoeTextRMSNorm",
+    "model.language_model.layers.2.input_layernorm": "Qwen3VLMoeTextRMSNorm",
+    "model.language_model.layers.2.mlp": "Qwen3VLMoeTextSparseMoeBlock",
+    "model.language_model.layers.2.post_attention_layernorm": "Qwen3VLMoeTextRMSNorm",
+    "model.language_model.layers.2.self_attn": "Qwen3VLMoeTextAttention",
+    "model.language_model.layers.2.self_attn.k_norm": "Qwen3VLMoeTextRMSNorm",
+    "model.language_model.layers.2.self_attn.q_norm": "Qwen3VLMoeTextRMSNorm",
+    "model.language_model.layers.3.input_layernorm": "Qwen3VLMoeTextRMSNorm",
+    "model.language_model.layers.3.mlp": "Qwen3VLMoeTextSparseMoeBlock",
+    "model.language_model.layers.3.post_attention_layernorm": "Qwen3VLMoeTextRMSNorm",
+    "model.language_model.layers.3.self_attn": "Qwen3VLMoeTextAttention",
+    "model.language_model.layers.3.self_attn.k_norm": "Qwen3VLMoeTextRMSNorm",
+    "model.language_model.layers.3.self_attn.q_norm": "Qwen3VLMoeTextRMSNorm",
     "model.language_model.norm": "Qwen3VLMoeTextRMSNorm",
     "model.visual.blocks.0.attn.proj": "Linear",
     "model.visual.blocks.0.attn.qkv": "Linear",
@@ -27,12 +39,27 @@
     "model.visual.blocks.1.mlp.linear_fc2": "Linear",
     "model.visual.blocks.1.norm1": "LayerNorm",
     "model.visual.blocks.1.norm2": "LayerNorm",
+    "model.visual.blocks.2.attn.proj": "Linear",
+    "model.visual.blocks.2.attn.qkv": "Linear",
+    "model.visual.blocks.2.mlp.linear_fc1": "Linear",
+    "model.visual.blocks.2.mlp.linear_fc2": "Linear",
+    "model.visual.blocks.2.norm1": "LayerNorm",
+    "model.visual.blocks.2.norm2": "LayerNorm",
+    "model.visual.blocks.3.attn.proj": "Linear",
+    "model.visual.blocks.3.attn.qkv": "Linear",
+    "model.visual.blocks.3.mlp.linear_fc1": "Linear",
+    "model.visual.blocks.3.mlp.linear_fc2": "Linear",
+    "model.visual.blocks.3.norm1": "LayerNorm",
+    "model.visual.blocks.3.norm2": "LayerNorm",
     "model.visual.deepstack_merger_list.0.linear_fc1": "Linear",
     "model.visual.deepstack_merger_list.0.linear_fc2": "Linear",
     "model.visual.deepstack_merger_list.0.norm": "LayerNorm",
     "model.visual.deepstack_merger_list.1.linear_fc1": "Linear",
     "model.visual.deepstack_merger_list.1.linear_fc2": "Linear",
     "model.visual.deepstack_merger_list.1.norm": "LayerNorm",
+    "model.visual.deepstack_merger_list.2.linear_fc1": "Linear",
+    "model.visual.deepstack_merger_list.2.linear_fc2": "Linear",
+    "model.visual.deepstack_merger_list.2.norm": "LayerNorm",
     "model.visual.merger.linear_fc1": "Linear",
     "model.visual.merger.linear_fc2": "Linear",
     "model.visual.merger.norm": "LayerNorm",
@@ -48,9 +75,7 @@
   "entrypoints": {
     "parallelize": "hp_parallelize"
   },
-  "external_state_classes": [
-    "Qwen3MoeSparseMoeBlock"
-  ],
+  "external_state_classes": [],
   "frozen_sharded_params": [
     "lm_head.weight",
     "model.language_model.embed_tokens.weight",
@@ -65,13 +90,33 @@
     "model.language_model.layers.1.self_attn.k_proj.weight",
     "model.language_model.layers.1.self_attn.o_proj.weight",
     "model.language_model.layers.1.self_attn.q_proj.weight",
-    "model.language_model.layers.1.self_attn.v_proj.weight"
+    "model.language_model.layers.1.self_attn.v_proj.weight",
+    "model.language_model.layers.2.mlp.experts.down_proj",
+    "model.language_model.layers.2.mlp.experts.gate_up_proj",
+    "model.language_model.layers.2.self_attn.k_proj.weight",
+    "model.language_model.layers.2.self_attn.o_proj.weight",
+    "model.language_model.layers.2.self_attn.q_proj.weight",
+    "model.language_model.layers.2.self_attn.v_proj.weight",
+    "model.language_model.layers.3.mlp.experts.down_proj",
+    "model.language_model.layers.3.mlp.experts.gate_up_proj",
+    "model.language_model.layers.3.self_attn.k_proj.weight",
+    "model.language_model.layers.3.self_attn.o_proj.weight",
+    "model.language_model.layers.3.self_attn.q_proj.weight",
+    "model.language_model.layers.3.self_attn.v_proj.weight"
   ],
   "injections": [
     {
       "ep_size": 2,
       "local_compute_fn": {
-        "_target_": "hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn",
+        "_target_": "hyper_parallel.models.qwen3_vl_moe.adapter.distributed.expert_parallel.qwen3_vl_moe_ep_compute_fn",
+        "use_grouped_gemm": true
+      },
+      "match": "model.language_model.layers.0.mlp"
+    },
+    {
+      "ep_size": 2,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.qwen3_vl_moe.adapter.distributed.expert_parallel.qwen3_vl_moe_ep_compute_fn",
         "use_grouped_gemm": true
       },
       "match": "model.language_model.layers.1.mlp"
@@ -79,16 +124,24 @@
     {
       "ep_size": 2,
       "local_compute_fn": {
-        "_target_": "hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn",
+        "_target_": "hyper_parallel.models.qwen3_vl_moe.adapter.distributed.expert_parallel.qwen3_vl_moe_ep_compute_fn",
         "use_grouped_gemm": true
       },
-      "match": "model.language_model.layers.0.mlp"
+      "match": "model.language_model.layers.2.mlp"
+    },
+    {
+      "ep_size": 2,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.qwen3_vl_moe.adapter.distributed.expert_parallel.qwen3_vl_moe_ep_compute_fn",
+        "use_grouped_gemm": true
+      },
+      "match": "model.language_model.layers.3.mlp"
     }
   ],
   "mesh_dim_names": [
     "tp"
   ],
-  "model_class": "Qwen3VLMoeForConditionalGeneration",
+  "model_class": null,
   "model_name": "Qwen3_Vl_Moe",
   "module_overrides": [],
   "not_covered": [
@@ -100,21 +153,21 @@
   ],
   "outputs": {
     "diff": {
-      "lines": 162,
-      "sha256": "5c9d97cf3844ed805f4d307edb9695e737ad04e2d484bddf751e5fdb8900fc5a"
+      "lines": 159,
+      "sha256": "409ee9c55c62d0220662eebc995dd98a55811511585e01dc6a8be2ba1acbc187"
     },
     "init": {
       "lines": 6,
-      "sha256": "eec282c15e250055d2a40804ed1bc1dc3ee6ba1d69cac106e57cf17c626d911c"
+      "sha256": "dee27e345c088c9f95f78caee116bf7ac68406cb8306ba32de494cc9d6cffca7"
     },
     "modeling": {
-      "lines": 1913,
-      "sha256": "c1ae3ae73f8989326d36e89d69a9223434525d424ec8dd7fd3da91647ce284bf"
+      "lines": 1909,
+      "sha256": "a09316f6c024d526966e03cf1958eb088f2fe4c370b29b9c000c3ddacbe58e54"
     }
   },
   "parallel_dims": {
     "cp_size": 1,
-    "dp_size": 1,
+    "dp_size": 4,
     "ep_size": 2,
     "loss_parallel": false,
     "pp_size": 1,
@@ -702,6 +755,510 @@
         }
       }
     },
+    "model.language_model.layers.2.input_layernorm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "R"
+        }
+      }
+    },
+    "model.language_model.layers.2.mlp": {
+      "in_dst": {
+        "x_BLD": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "x_BLD": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "experts.down_proj": {
+          "cp": "R",
+          "ep": "S(0)"
+        },
+        "experts.gate_up_proj": {
+          "cp": "R",
+          "ep": "S(0)"
+        },
+        "gate.weight": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "region_dispatch": false
+    },
+    "model.language_model.layers.2.post_attention_layernorm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "R"
+        }
+      }
+    },
+    "model.language_model.layers.2.self_attn": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "P(sum)"
+        }
+      },
+      "params": {
+        "k_proj.weight": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "S(0)"
+        },
+        "o_proj.weight": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "S(1)"
+        },
+        "q_proj.weight": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "S(0)"
+        },
+        "v_proj.weight": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "S(0)"
+        }
+      }
+    },
+    "model.language_model.layers.2.self_attn.k_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "R"
+        }
+      }
+    },
+    "model.language_model.layers.2.self_attn.q_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "R"
+        }
+      }
+    },
+    "model.language_model.layers.3.input_layernorm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "R"
+        }
+      }
+    },
+    "model.language_model.layers.3.mlp": {
+      "in_dst": {
+        "x_BLD": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "x_BLD": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "experts.down_proj": {
+          "cp": "R",
+          "ep": "S(0)"
+        },
+        "experts.gate_up_proj": {
+          "cp": "R",
+          "ep": "S(0)"
+        },
+        "gate.weight": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "region_dispatch": false
+    },
+    "model.language_model.layers.3.post_attention_layernorm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "R"
+        }
+      }
+    },
+    "model.language_model.layers.3.self_attn": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "P(sum)"
+        }
+      },
+      "params": {
+        "k_proj.weight": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "S(0)"
+        },
+        "o_proj.weight": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "S(1)"
+        },
+        "q_proj.weight": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "S(0)"
+        },
+        "v_proj.weight": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "S(0)"
+        }
+      }
+    },
+    "model.language_model.layers.3.self_attn.k_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "R"
+        }
+      }
+    },
+    "model.language_model.layers.3.self_attn.q_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "R"
+        }
+      }
+    },
     "model.language_model.norm": {
       "in_dst": {
         "hidden_states": {
@@ -824,13 +1381,9 @@
       },
       "params": {
         "bias": {
-          "cp": "R",
-          "ep": "R",
           "tp": "R"
         },
         "weight": {
-          "cp": "R",
-          "ep": "R",
           "tp": "R"
         }
       }
@@ -867,13 +1420,9 @@
       },
       "params": {
         "bias": {
-          "cp": "R",
-          "ep": "R",
           "tp": "R"
         },
         "weight": {
-          "cp": "R",
-          "ep": "R",
           "tp": "R"
         }
       }
@@ -962,13 +1511,9 @@
       },
       "params": {
         "bias": {
-          "cp": "R",
-          "ep": "R",
           "tp": "R"
         },
         "weight": {
-          "cp": "R",
-          "ep": "R",
           "tp": "R"
         }
       }
@@ -1005,13 +1550,269 @@
       },
       "params": {
         "bias": {
-          "cp": "R",
-          "ep": "R",
           "tp": "R"
         },
         "weight": {
-          "cp": "R",
+          "tp": "R"
+        }
+      }
+    },
+    "model.visual.blocks.2.attn.proj": {
+      "in_dst": {},
+      "in_src": {},
+      "is_boundary": true,
+      "params": {
+        "bias": {
+          "tp": "R"
+        },
+        "weight": {
+          "tp": "R"
+        }
+      }
+    },
+    "model.visual.blocks.2.attn.qkv": {
+      "in_dst": {},
+      "in_src": {},
+      "is_boundary": true,
+      "params": {
+        "bias": {
+          "tp": "R"
+        },
+        "weight": {
+          "tp": "R"
+        }
+      }
+    },
+    "model.visual.blocks.2.mlp.linear_fc1": {
+      "in_dst": {},
+      "in_src": {},
+      "is_boundary": true,
+      "params": {
+        "bias": {
+          "tp": "R"
+        },
+        "weight": {
+          "tp": "R"
+        }
+      }
+    },
+    "model.visual.blocks.2.mlp.linear_fc2": {
+      "in_dst": {},
+      "in_src": {},
+      "is_boundary": true,
+      "params": {
+        "bias": {
+          "tp": "R"
+        },
+        "weight": {
+          "tp": "R"
+        }
+      }
+    },
+    "model.visual.blocks.2.norm1": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
           "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "bias": {
+          "tp": "R"
+        },
+        "weight": {
+          "tp": "R"
+        }
+      }
+    },
+    "model.visual.blocks.2.norm2": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "bias": {
+          "tp": "R"
+        },
+        "weight": {
+          "tp": "R"
+        }
+      }
+    },
+    "model.visual.blocks.3.attn.proj": {
+      "in_dst": {},
+      "in_src": {},
+      "is_boundary": true,
+      "params": {
+        "bias": {
+          "tp": "R"
+        },
+        "weight": {
+          "tp": "R"
+        }
+      }
+    },
+    "model.visual.blocks.3.attn.qkv": {
+      "in_dst": {},
+      "in_src": {},
+      "is_boundary": true,
+      "params": {
+        "bias": {
+          "tp": "R"
+        },
+        "weight": {
+          "tp": "R"
+        }
+      }
+    },
+    "model.visual.blocks.3.mlp.linear_fc1": {
+      "in_dst": {},
+      "in_src": {},
+      "is_boundary": true,
+      "params": {
+        "bias": {
+          "tp": "R"
+        },
+        "weight": {
+          "tp": "R"
+        }
+      }
+    },
+    "model.visual.blocks.3.mlp.linear_fc2": {
+      "in_dst": {},
+      "in_src": {},
+      "is_boundary": true,
+      "params": {
+        "bias": {
+          "tp": "R"
+        },
+        "weight": {
+          "tp": "R"
+        }
+      }
+    },
+    "model.visual.blocks.3.norm1": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "bias": {
+          "tp": "R"
+        },
+        "weight": {
+          "tp": "R"
+        }
+      }
+    },
+    "model.visual.blocks.3.norm2": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "bias": {
+          "tp": "R"
+        },
+        "weight": {
           "tp": "R"
         }
       }
@@ -1074,13 +1875,9 @@
       },
       "params": {
         "bias": {
-          "cp": "R",
-          "ep": "R",
           "tp": "R"
         },
         "weight": {
-          "cp": "R",
-          "ep": "R",
           "tp": "R"
         }
       }
@@ -1143,13 +1940,74 @@
       },
       "params": {
         "bias": {
-          "cp": "R",
-          "ep": "R",
           "tp": "R"
         },
         "weight": {
-          "cp": "R",
+          "tp": "R"
+        }
+      }
+    },
+    "model.visual.deepstack_merger_list.2.linear_fc1": {
+      "in_dst": {},
+      "in_src": {},
+      "is_boundary": true,
+      "params": {
+        "bias": {
+          "tp": "R"
+        },
+        "weight": {
+          "tp": "R"
+        }
+      }
+    },
+    "model.visual.deepstack_merger_list.2.linear_fc2": {
+      "in_dst": {},
+      "in_src": {},
+      "is_boundary": true,
+      "params": {
+        "bias": {
+          "tp": "R"
+        },
+        "weight": {
+          "tp": "R"
+        }
+      }
+    },
+    "model.visual.deepstack_merger_list.2.norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
           "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "bias": {
+          "tp": "R"
+        },
+        "weight": {
           "tp": "R"
         }
       }
@@ -1212,13 +2070,9 @@
       },
       "params": {
         "bias": {
-          "cp": "R",
-          "ep": "R",
           "tp": "R"
         },
         "weight": {
-          "cp": "R",
-          "ep": "R",
           "tp": "R"
         }
       }
@@ -1248,13 +2102,13 @@
     }
   },
   "remote_siblings": [],
-  "signature": "e644fe71d6e4",
+  "signature": "8c3aa06c784a",
   "skipped_overrides": [],
   "source": {
-    "architecture": "Qwen3VLMoeForConditionalGeneration",
-    "file_path": "D:\\miniconda\\Lib\\site-packages\\transformers\\models\\qwen3_vl_moe\\modeling_qwen3_vl_moe.py",
+    "architecture": null,
+    "file_path": "/home/lxy/miniforge3/envs/hyper_restructure_py311/lib/python3.11/site-packages/transformers/models/qwen3_vl_moe/modeling_qwen3_vl_moe.py",
     "line_count": 1850,
-    "model_id": "C:\\Users\\Ashlee\\AppData\\Local\\Temp\\codegen_qwen3vlmoe_ep_8xe_gsao\\qwen3_vlmoe_ckpt",
+    "model_id": "/home/lxy/probe_ckpts/qwen3_vl_moe",
     "model_type": "qwen3_vl_moe",
     "module_name": "transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe",
     "sha256": "cd26d4602a3797c957bf5483bd3502b549afbe85bd0c1607ed0730df86e97ce1",
@@ -1263,6 +2117,6 @@
   },
   "special_handlers": {},
   "tied_pairs": [],
-  "yaml_path": "",
-  "yaml_sha256": "e644fe71d6e4f59f39114cfa825b9431428e0a6cd3b4159dc40c7cfc2e3d2ac1"
+  "yaml_path": "/home/lxy/qwen3vl_val/val_int/qwen3_vl_moe/train_codegen.yaml",
+  "yaml_sha256": "309a63dac3190425e41249478765aa6d03bdd08ae0f3b6799d42ec3918975f17"
 }

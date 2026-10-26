@@ -6,14 +6,17 @@
     "model.layers.0.mlp": "KimiMLP",
     "model.layers.0.post_attention_layernorm": "KimiRMSNorm",
     "model.layers.0.self_attn": "KimiDeltaAttention",
+    "model.layers.0.self_attn.o_norm": "FusedRMSNormGated",
     "model.layers.1.input_layernorm": "KimiRMSNorm",
     "model.layers.1.mlp": "KimiMLP",
     "model.layers.1.post_attention_layernorm": "KimiRMSNorm",
     "model.layers.1.self_attn": "KimiDeltaAttention",
+    "model.layers.1.self_attn.o_norm": "FusedRMSNormGated",
     "model.layers.2.input_layernorm": "KimiRMSNorm",
     "model.layers.2.mlp": "KimiMLP",
     "model.layers.2.post_attention_layernorm": "KimiRMSNorm",
     "model.layers.2.self_attn": "KimiDeltaAttention",
+    "model.layers.2.self_attn.o_norm": "FusedRMSNormGated",
     "model.layers.3.input_layernorm": "KimiRMSNorm",
     "model.layers.3.mlp": "KimiMLP",
     "model.layers.3.post_attention_layernorm": "KimiRMSNorm",
@@ -51,15 +54,15 @@
     },
     "diff": {
       "lines": 20,
-      "sha256": "c9cfd705701a32a05200be62d6082dccbf048107a5735a469d90b6610e4adfd8"
+      "sha256": "4a9751565b470603b55489f43f0c998094f7bd506c81bc24903537599e28ccdb"
     },
     "init": {
       "lines": 6,
-      "sha256": "01682017c3be2b3184f81fcd86e7ae3191bc866d003dbf519503aa927bdc4bdd"
+      "sha256": "7389880ffed45d33673e5052c8ec69ffddf7c1185146cdfc5c782dcac88eea6b"
     },
     "modeling": {
       "lines": 1115,
-      "sha256": "3008a4168a647c3a23295fa4529badfa6386697204d958d1f1800d7bf9b5f263"
+      "sha256": "49f118f14d779dbb381b0b7b0db8171896bda8ea16ed4c0591a7fbb0f9a77e8f"
     }
   },
   "parallel_dims": {
@@ -326,6 +329,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -334,11 +341,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "model.layers.0.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -524,6 +576,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -532,11 +588,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "model.layers.1.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -722,6 +823,10 @@
           "cp": "R",
           "ep": "R"
         },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "k_proj.weight": {
           "cp": "R",
           "ep": "R"
@@ -730,11 +835,56 @@
           "cp": "R",
           "ep": "R"
         },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "q_proj.weight": {
           "cp": "R",
           "ep": "R"
         },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
         "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "model.layers.2.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
           "cp": "R",
           "ep": "R"
         }
@@ -987,7 +1137,7 @@
   "remote_siblings": [
     "configuration_kimi.py"
   ],
-  "signature": "800382c5ca41",
+  "signature": "62626143cd8c",
   "skipped_overrides": [],
   "source": {
     "architecture": "KimiLinearForCausalLM",
@@ -1012,6 +1162,6 @@
   },
   "special_handlers": {},
   "tied_pairs": [],
-  "yaml_path": "/home/lxy/hyper-parallel-genpath/examples/training_demo/kimi_linear/train_codegen_probe.yaml",
-  "yaml_sha256": "5f7963facfdf9565f5e362553ac34660edc94caffc39e88fa4781adc51ebf293"
+  "yaml_path": "/home/lxy/codegen_all_3cb4e616_inputs/kimi_linear.yaml",
+  "yaml_sha256": "4fda23aeecd59d8e23944cb42bdc64a303c2f8791f1b9794335090f2ad57a90f"
 }

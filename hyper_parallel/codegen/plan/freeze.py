@@ -41,15 +41,26 @@ _PLACEMENT_SERIALIZERS: dict[type, type] = {}
 class _StridedShardSerializer:
     @staticmethod
     def to_string(p) -> str:
-        dim = p.dim if not p.uneven_shard else -p.dim - 1
-        return f"SS({dim},{p.split_factor})"
+        if p.uneven_shard:
+            raise TypeError(
+                "cannot freeze StridedShard(uneven_shard=True): uneven shards "
+                "are FSDP-internal placements and never belong to the frozen "
+                "plan (planner contracts use plain dims or negative dim "
+                "indices)"
+            )
+        return f"SS({p.dim},{p.split_factor})"
 
 
 class _ShardSerializer:
     @staticmethod
     def to_string(p) -> str:
-        dim = p.dim if not p.uneven_shard else -p.dim - 1
-        return f"S({dim})"
+        if p.uneven_shard:
+            raise TypeError(
+                "cannot freeze Shard(uneven_shard=True): uneven shards are "
+                "FSDP-internal placements and never belong to the frozen plan "
+                "(planner contracts use plain dims or negative dim indices)"
+            )
+        return f"S({p.dim})"
 
 
 class _ReplicateSerializer:
@@ -95,10 +106,13 @@ def placement_to_string(placement: Any) -> str:
     """Serialize a ``Placement`` instance to its canonical string form.
 
     Shard(dim) -> "S(dim)"; Replicate() -> "R"; Partial(reduce_op) -> "P";
-    StridedShard(dim, split_factor) -> "SS(dim,factor)".  ``uneven_shard`` is
-    encoded as a negative dim (``Shard(-dim-1)``) so it survives the
-    round-trip without an extra field.  Unknown placement types fail fast —
-    a silently dropped placement would corrupt the frozen plan.
+    StridedShard(dim, split_factor) -> "SS(dim,factor)".  The dim is stored
+    verbatim — a negative dim is the planner's own "last tensor dim" index
+    (e.g. the lm_head template's ``Shard(-1)``), so it must survive the
+    round-trip unchanged; an ``uneven_shard`` placement fails fast instead
+    (it is FSDP-internal and never part of a frozen plan).  Unknown placement
+    types fail fast — a silently dropped placement would corrupt the frozen
+    plan.
     """
     if not _PLACEMENT_SERIALIZERS:
         _register_placement_types()
@@ -141,11 +155,13 @@ def named_placement_to_dict(named: Any) -> dict[str, str]:
 def parse_placement(text: str) -> Any:
     """Inverse of :func:`placement_to_string`: canonical string -> Placement.
 
-    Compact forms: ``S(dim)`` / ``R`` / ``P(reduce_op)`` / ``SS(dim,factor)``;
-    ``uneven_shard`` is recovered from the negative-dim encoding
-    (``S(-1)`` -> ``Shard(0, uneven_shard=True)``).  Unknown or malformed
-    forms fail fast — a silently downgraded placement would corrupt the
-    frozen plan (e.g. quietly becoming ``Replicate()``).
+    Compact forms: ``S(dim)`` / ``R`` / ``P(reduce_op)`` / ``SS(dim,factor)``.
+    The dim is parsed verbatim — a negative dim is the planner's own "last
+    tensor dim" index (e.g. ``S(-1)`` -> ``Shard(-1)``, the lm_head
+    vocab-parallel output contract), matching the native runtime that also
+    treats negative dims as real dim indices.  Unknown or malformed forms
+    fail fast — a silently downgraded placement would corrupt the frozen
+    plan (e.g. quietly becoming ``Replicate()``).
     """
     from hyper_parallel.core.dtensor.placement_types import (
         Partial,
@@ -178,24 +194,22 @@ def parse_placement(text: str) -> Any:
     try:
         dim = int(parts[0])
     except (IndexError, ValueError) as exc:
-        raise ValueError(f"malformed placement {text!r}: invalid dim") from exc
-    uneven = dim < 0
-    dim = -dim - 1 if uneven else dim
+        raise ValueError(f"malformed shard placement {text!r}: invalid dim") from exc
 
     if kind == "S":
         if len(parts) != 1:
             raise ValueError(f"malformed shard placement {text!r}: too many args")
-        return Shard(dim, uneven_shard=uneven)
+        return Shard(dim)
     if kind == "SS":
         if len(parts) != 2:
-            raise ValueError(f"malformed strided shard {text!r}: expected SS(dim,factor)")
+            raise ValueError(f"malformed strided shard placement {text!r}: expected SS(dim,factor)")
         try:
             split_factor = int(parts[1])
         except ValueError as exc:
             raise ValueError(
-                f"malformed strided shard {text!r}: invalid split_factor"
+                f"malformed strided shard placement {text!r}: invalid split_factor"
             ) from exc
-        return StridedShard(dim, split_factor, uneven_shard=uneven)
+        return StridedShard(dim, split_factor)
     raise ValueError(f"unknown placement kind {kind!r} in {text!r}")
 
 
