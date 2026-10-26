@@ -33,7 +33,7 @@ from hyper_parallel.components.functional.sparse_flash_mla import (
     _device_lengths, csa_tnd_plan, pack_ranges,
 )
 from hyper_parallel.components.functional.sparse_lightning_indexer_kl_loss_grad import (
-    _load_kl_ops, _stable_prediction_log, _teacher_bank, causal_attention_teacher,
+    _SparseLightningIndexerKLLoss, _load_kl_ops, _stable_prediction_log, _teacher_bank, causal_attention_teacher,
     compressed_attention_teacher, gather_selected_keys, gather_selected_keys_fp32,
 )
 from hyper_parallel.core.activation_memory import checkpoint
@@ -208,6 +208,42 @@ class TestSparseLightningIndexerKL(unittest.TestCase):
         self.assertEqual(loader.return_value.call_args_list[0].args[0].shape[0], 8196)
         torch.testing.assert_close(actual[:, :8193], torch.zeros_like(actual[:, :8193]))
         torch.testing.assert_close(actual[:, 8193:], torch.full_like(actual[:, 8193:], 8193))
+
+    def test_indexer_and_kl_prefix_keys_have_canonical_bsnd_strides(self):
+        """Both native consumers receive canonical, value-preserving key prefixes.
+
+        Feature: BSND key layout adaptation.
+        Description: Capture LI/KL arguments for singleton and multi-batch slices.
+        Expectation: Canonical strides, unchanged values and no B=1 data copy.
+        """
+        for batch, prefix in ((1, 1), (1, 7), (2, 1), (2, 7)):
+            with self.subTest(batch=batch, prefix=prefix):
+                length = min(4, prefix)
+                query = torch.zeros(batch, length, 2, 128)
+                bank = torch.arange(batch * 64 * 128).reshape(batch, 64, 128).float()
+                weights = torch.ones(batch, length, 2)
+                selected = torch.full((batch, length, 512), -1, dtype=torch.int32)
+                selected[..., 0] = 0
+                with patch.object(indexer_ops, "_bsnd_indexer_metadata", return_value=(None, None)), \
+                        patch.object(indexer_ops, "_load_indexer_op") as loader:
+                    loader.return_value.return_value = (torch.zeros(batch, length, 1, 2, dtype=torch.int32), None)
+                    lightning_indexer(query, bank, weights, 1, 2, ((0, length, 3, 3+prefix, 0),))
+                    indexer_key = loader.return_value.call_args.args[1]
+                with patch.object(kl_ops, "_kl_metadata", return_value=({}, None)), \
+                        patch.object(kl_ops, "_load_kl_ops") as loader:
+                    kernel = loader.return_value = (unittest.mock.Mock(), None)
+                    kernel[0].return_value = (query, bank[:, 3:3+prefix].unsqueeze(2), weights,
+                                              torch.ones(batch, length, 1, 512))
+                    _SparseLightningIndexerKLLoss.apply(
+                        query, bank[:, 3:3+prefix], weights, torch.zeros(batch, 2, length, 512),
+                        torch.zeros(batch, prefix, 512), selected, torch.zeros(2), 1., 1., 4, 1, 0,
+                    )
+                    kl_key = kernel[0].call_args.args[1]
+                for native_key in (indexer_key, kl_key):
+                    self.assertEqual(native_key.stride(), (prefix * 128, 128, 128, 1))
+                    torch.testing.assert_close(native_key.squeeze(2), bank[:, 3:3+prefix], rtol=0, atol=0)
+                    if batch == 1:
+                        self.assertEqual(native_key.data_ptr(), bank[:, 3:3+prefix].data_ptr())
 
     def test_packed_snapshot_keeps_old_geometry_after_input_mutation(self):
         """Saved activations retain their own document boundaries."""

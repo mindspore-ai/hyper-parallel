@@ -196,7 +196,7 @@ class TestDeepseekV41ValidationCrop(unittest.TestCase):
 
         Feature: DeepSeek-V4.1 validation crop depth controls.
         Description: Retain released widths while selecting four text layers and one vision layer.
-        Expectation: Shared-attention, Reindex, Engram, and vision roles remain internally consistent.
+        Expectation: Released attention roles are retained without candidate-specific remapping.
         """
         with tempfile.TemporaryDirectory() as directory:
             _write_released_config(directory)
@@ -222,14 +222,21 @@ class TestDeepseekV41ValidationCrop(unittest.TestCase):
         self.assertEqual(config.hidden_size, 256)
         self.assertEqual(config.v41_vision_num_hidden_layers, 1)
         self.assertEqual(config.v41_kv_source_layer_ids, [2])
-        self.assertEqual(config.v41_index_source_layer_ids, [2, 3])
-        self.assertEqual(config.v41_candidate_source_layer_id, 2)
+        self.assertEqual(config.v41_index_source_layer_ids, [2])
+        self.assertEqual(config.v41_candidate_source_layer_id, -1)
+        self.assertEqual(config.v41_candidate_topk_blocks, 0)
+        self.assertFalse(hasattr(config, "v41_validation_reindex_remap"))
         self.assertEqual(config.v41_engram_layer_ids, [1])
         self.assertTrue(hasattr(model.model.layers[1], "engram"))
         self.assertFalse(hasattr(model.model.layers[3], "engram"))
 
     def test_default_depth_preserves_released_layer_roles(self):
-        """Omitting the new controls retains the original full-depth behavior."""
+        """Keep native Full/Reindex/Reuse roles while disabling hierarchical candidates.
+
+        Feature: Full-depth candidate policy.
+        Description: Build the default 40-layer crop.
+        Expectation: Native Full/Reindex/Reuse source layers remain while candidate fields are disabled.
+        """
         with tempfile.TemporaryDirectory() as directory:
             _write_released_config(directory)
             assets_path = _write_engram_assets(
@@ -246,9 +253,38 @@ class TestDeepseekV41ValidationCrop(unittest.TestCase):
         self.assertEqual(len(config.mlp_layer_types), 40)
         self.assertEqual(config.v41_kv_source_layer_ids, [2, 8, 14, 20])
         self.assertEqual(config.v41_index_source_layer_ids, [2, 8, 14, 20, 24, 28, 32, 36])
-        self.assertEqual(config.v41_candidate_source_layer_id, 20)
+        self.assertEqual(config.v41_candidate_source_layer_id, -1)
+        self.assertEqual(config.v41_candidate_topk_blocks, 0)
         self.assertEqual(config.v41_engram_layer_ids, [1, 14])
         self.assertFalse(hasattr(config, "v41_validation_reindex_remap"))
+
+    def test_candidate_pool_requires_explicit_opt_in(self):
+        """Opt-in preserves the historical candidate smoke remapping and full-depth source.
+
+        Feature: Explicit candidate pool selection.
+        Description: Enable candidates in shallow/full-depth crops and reject non-boolean options.
+        Expectation: Opt-in preserves historical remapping and invalid switches fail clearly.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            _write_released_config(directory)
+            assets_path = _write_engram_assets(
+                directory, num_hidden_layers=40, layer_ids=(1, 14), head_dim=8
+            )
+            for depth, source, index_layers in (
+                    (4, 2, [2, 3]), (40, 20, [2, 8, 14, 20, 24, 28, 32, 36]),
+            ):
+                with self.subTest(depth=depth):
+                    config = build_deepseek_v41_validation_config(
+                        directory, str(assets_path), num_hidden_layers=depth, enable_candidate_pool=True,
+                    )
+                    self.assertEqual(config.v41_candidate_source_layer_id, source)
+                    self.assertGreater(config.v41_candidate_topk_blocks, 0)
+                    self.assertEqual(config.v41_index_source_layer_ids, index_layers)
+            for value in ("false", 0, None):
+                with self.subTest(invalid=value), self.assertRaisesRegex(ValueError, "must be a bool"):
+                    build_deepseek_v41_validation_config(
+                        directory, str(assets_path), enable_candidate_pool=value,
+                    )
 
     def test_depth_controls_reject_out_of_range_layers(self):
         """Both optional depths must fit inside the corresponding released stack."""
@@ -274,7 +310,12 @@ class TestDeepseekV41ValidationCrop(unittest.TestCase):
                         )
 
     def test_reindex_requires_a_retained_source_and_following_layer(self):
-        """Shallow crops fail clearly when they cannot host the Reindex hierarchy."""
+        """Shallow crops fail clearly when they cannot host the Reindex hierarchy.
+
+        Feature: Candidate smoke depth validation.
+        Description: Explicitly enable the candidate exercise in two- and three-layer crops.
+        Expectation: Crops without a source or following Reindex layer are rejected.
+        """
         with tempfile.TemporaryDirectory() as directory:
             _write_released_config(directory)
             assets_path = _write_engram_assets(
@@ -287,11 +328,16 @@ class TestDeepseekV41ValidationCrop(unittest.TestCase):
                 with self.subTest(depth=depth):
                     with self.assertRaisesRegex(ValueError, expected_error):
                         build_deepseek_v41_validation_config(
-                            directory, str(assets_path), num_hidden_layers=depth
+                            directory, str(assets_path), num_hidden_layers=depth, enable_candidate_pool=True
                         )
 
     def test_disabled_validation_indexer_only_filters_retained_layers(self):
-        """Disabling the smoke indexer avoids remapping a cropped-out candidate source."""
+        """Disabling the smoke indexer avoids remapping a cropped-out candidate source.
+
+        Feature: Candidate remapping control.
+        Description: Enable candidates but disable the smoke remapping in a three-layer crop.
+        Expectation: Retained layers keep released roles without a synthetic Reindex layer.
+        """
         with tempfile.TemporaryDirectory() as directory:
             _write_released_config(directory)
             assets_path = _write_engram_assets(
@@ -299,7 +345,7 @@ class TestDeepseekV41ValidationCrop(unittest.TestCase):
             )
             config = build_deepseek_v41_validation_config(
                 directory, str(assets_path), num_hidden_layers=3,
-                exercise_post_training_indexer=False,
+                exercise_post_training_indexer=False, enable_candidate_pool=True,
             )
 
         self.assertEqual(config.v41_kv_source_layer_ids, [2])

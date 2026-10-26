@@ -118,6 +118,36 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "^native failure$"):
                     module._run_sparse_attention(query, query, None, None, 0, 2, None, ((0, 2, 0, 2, 0),))
 
+    def test_attention_prefix_banks_have_canonical_bsnd_strides(self):
+        """Check singleton stride normalization without requiring native kernels.
+
+        Feature: SMLA BSND input adaptation.
+        Description: Inspect raw/compressed prefixes for B=1/B=2 and r0/r1/r2.
+        Expectation: Strides are canonical and values are unchanged; B=1 raw shares storage.
+        """
+        for batch, ratio in ((1, 0), (1, 1), (1, 2), (2, 2)):
+            with self.subTest(batch=batch, ratio=ratio):
+                query = torch.zeros(batch, 8, 4, 512, dtype=torch.bfloat16)
+                raw = torch.arange(batch * 64 * 512).reshape(batch, 1, 64, 512).to(torch.bfloat16)
+                main = raw[:, 0, :32].contiguous()
+                indices = torch.zeros(batch, 4, 2, dtype=torch.int32)
+                prefix = 4 // max(ratio, 1)
+                with patch.object(attention_ops._SparseFlashMla, "apply") as native:
+                    attention_ops._bsnd_sparse_flash_mla(
+                        query, raw, main, indices, torch.zeros(8), 1., ratio, 128, 0,
+                        (0, 4, 0, prefix, 0),
+                    )
+                native_raw, native_main = native.call_args.args[1:3]
+                self.assertEqual(native_raw.stride(), (4 * 512, 512, 512, 1))
+                torch.testing.assert_close(native_raw.squeeze(2), raw[:, 0, :4], rtol=0, atol=0)
+                if batch == 1:
+                    self.assertEqual(native_raw.data_ptr(), raw.data_ptr())
+                if ratio:
+                    self.assertEqual(native_main.stride(), (prefix * 512, 512, 512, 1))
+                    torch.testing.assert_close(native_main.squeeze(2), main[:, :prefix], rtol=0, atol=0)
+                else:
+                    self.assertIsNone(native_main)
+
     def test_replacement_config_selects_fused_kernels(self):
         """Resolve the original baseline and fused kernels through the same replacement Target."""
         for use_fused_ops in (False, True):

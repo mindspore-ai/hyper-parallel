@@ -276,8 +276,10 @@ class _SparseLightningIndexerKLLoss(torch.autograd.Function):
             options, metadata = _kl_metadata(
                 query.device, batch, length, heads, dim, key.shape[1], indices.shape[-1], ratio, residual,
             )
+            # Match the canonical BSND key layout used by selection after slicing a bank.
+            native_key = key.contiguous().view(batch, key.shape[1], 1, dim)
             dq, dk, dw, prediction = kl_grad(
-                query.contiguous(), key.unsqueeze(2).contiguous(), weights.float().contiguous(),
+                query.contiguous(), native_key, weights.float().contiguous(),
                 indices.unsqueeze(2).int().contiguous(), target.unsqueeze(2), metadata=metadata, **options,
             )
             log_prediction = _stable_prediction_log(prediction[:, :, 0], query, key, weights, indices, chunk_size)

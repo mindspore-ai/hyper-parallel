@@ -256,11 +256,15 @@ def _bsnd_sparse_flash_mla(
     document_start = key_start * max(ratio, 1)
     raw_left = max(document_start, query_offset + start - window + 1)
     raw_right = query_offset + end
-    raw = raw_key[:, :, raw_left:raw_right].transpose(1, 2).contiguous()
+    # contiguous() may keep stale singleton strides after slicing a BSND KV bank.
+    batch, _, _, dim = query.shape
+    raw = raw_key[:, :, raw_left:raw_right]
+    raw = raw.squeeze(1).contiguous().view(batch, raw_right-raw_left, 1, dim)
     main = None
     selected = None
     if ratio and key_end > key_start:
-        main = main_key[:, key_start:key_end].unsqueeze(2).contiguous()
+        main = main_key[:, key_start:key_end]
+        main = main.contiguous().view(batch, key_end-key_start, 1, dim)
         original = indices[:, start:end]
         selected = torch.where(original >= 0, original-key_start, -1).int()
         # Backward infers the active count from this width and causality; only KL requires 512 slots.
