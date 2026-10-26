@@ -119,15 +119,37 @@ def _is_topk_call(value: ast.AST) -> bool:
             and value.func.attr == "topk")
 
 
+def _expert_projection_names(expert: Any) -> tuple[str, str, str] | None:
+    """Return the SwiGLU projection attribute triplet an expert exposes.
+
+    Recognizes both spellings the runtime weight resolver accepts
+    (``resolve_swiglu_weights``): the HF ``gate_proj/up_proj/down_proj``
+    spelling and the DeepSeek-style ``w1/w3/w2`` spelling (Kimi's
+    ``KimiBlockSparseMLP`` and friends).  Returns ``None`` when the expert
+    exposes neither triplet, so the caller can fail with an accurate message
+    instead of claiming a genuinely SwiGLU expert list is not one.
+    """
+    for gate, up, down in (("gate_proj", "up_proj", "down_proj"),
+                            ("w1", "w3", "w2")):
+        if all(hasattr(expert, name) for name in (gate, up, down)):
+            return gate, up, down
+    return None
+
+
 def detect_moe_structure(module: Any) -> MoeStructure:
     """Freeze the router, shared branch and expert parameter storage contract."""
     experts = getattr(module, "experts", None)
     if experts is None:
         raise _unsupported(module, "missing experts")
     if isinstance(experts, nn.ModuleList):
-        if not experts or not all(all(hasattr(expert, name) for name in
-                                     ("gate_proj", "up_proj", "down_proj")) for expert in experts):
-            raise _unsupported(module, "expert list is not a SwiGLU projection list")
+        if not experts or any(
+            _expert_projection_names(expert) is None for expert in experts
+        ):
+            raise _unsupported(
+                module,
+                "expert list is not a SwiGLU projection list "
+                "(gate_proj/up_proj/down_proj or w1/w3/w2)",
+            )
         storage = "module_list"
     elif all(isinstance(getattr(experts, name, None), nn.Parameter)
              and getattr(experts, name).ndim == 3 for name in ("gate_up_proj", "down_proj")):
