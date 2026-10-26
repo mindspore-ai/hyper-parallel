@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import logging
 from fnmatch import fnmatch
 from typing import Collection, Mapping
 
@@ -31,6 +32,8 @@ from hyper_parallel.codegen.inline.spec_bundle import StrategySpec
 from hyper_parallel.codegen.inline.specs import strategy_spec
 from hyper_parallel.codegen.inline.templates import cp_subclass_snippet
 
+logger = logging.getLogger(__name__)
+
 
 def rule_block_classes(
     rule: InlineRule, boundary_classes: Mapping[str, str] | None
@@ -40,6 +43,13 @@ def rule_block_classes(
     Per-model fact, derived (never registered): the frozen boundary map names
     each matched FQN's class, so any custom model class picked up by the
     pattern materializes without a framework-side registration.
+
+    Args:
+        rule: The inline rule whose match patterns select host classes.
+        boundary_classes: Frozen FQN -> class name map.
+
+    Returns:
+        The class names the rule's patterns select.
     """
     classes: set[str] = set()
     for fqn, class_name in (boundary_classes or {}).items():
@@ -53,6 +63,7 @@ def build_strategy_patches(
     model_type: str | None = None,
     boundary_classes: Mapping[str, str] | None = None,
     external_state_classes: Collection[str] | None = None,
+    source_classes: Collection[str] | None = None,
 ) -> InlinePatchSet:
     """Build inline forward patches from strategy targets.
 
@@ -79,6 +90,26 @@ def build_strategy_patches(
     and never a forward extract — the host keeps its compiled boundary.  A
     declared strategy that selects no boundary fails fast — a silently
     unmaterialized strategy is an artifact that only looks distributed.
+
+    ``source_classes`` names the classes the *main* modeling source defines.
+    A host class missing from it is a sibling-file class (a two-file model
+    whose language model lives in a copied sibling module): the forward
+    extract cannot target it, so the host is skipped and its strategy
+    resolves at install time through the runtime local-region skeleton
+    (``hp_bind_compute``), the same channel an imported-class boundary uses.
+    ``None`` (the pre-split signature) keeps the historical behavior of
+    trusting every derived host.
+
+    Args:
+        rules: Inline rules recovered from the frozen meta.
+        model_type: Model family key used to resolve framework declarations.
+        boundary_classes: Frozen FQN -> class name map.
+        external_state_classes: Classes a prior emission recorded as inline.
+        source_classes: Class names the main modeling source defines, or
+            ``None`` when the caller did not index the source.
+
+    Returns:
+        The inline patch set for the plan's strategy targets.
     """
 
     patch_set = InlinePatchSet()
@@ -105,25 +136,14 @@ def build_strategy_patches(
                 continue
             if spec.body_template is None:
                 continue
-            if spec.target_class is not None:
-                host_classes = {spec.target_class}
-            else:
-                host_classes = rule_block_classes(rule, boundary_classes)
-                if not host_classes:
-                    # Re-emission of an already-normalized meta: the boundary
-                    # entries the first pass stripped are gone, but the pass
-                    # persisted the derived classes in
-                    # ``meta.external_state_classes`` — the surviving record of
-                    # which classes an inline body replaced. (Today the EP
-                    # shell is the only body-bearing strategy, so the whole
-                    # record is this rule's host set; a second body-bearing
-                    # strategy would need a kind filter here.)
-                    host_classes = set(external_state_classes or ())
-                if not host_classes:
-                    raise _unmaterialized_strategy_error(
-                        spec.kind, target, rule, model_type
-                    )
-            for host_class in sorted(host_classes):
+            host_classes = _host_classes_for(
+                spec, rule, target, model_type,
+                boundary_classes, external_state_classes,
+            )
+            inlineable, deferred = _split_source_hosts(
+                host_classes, source_classes
+            )
+            for host_class in sorted(inlineable):
                 key = (host_class, spec.method_name)
                 if key in emitted:
                     if emitted[key] != spec.body_template:
@@ -137,7 +157,80 @@ def build_strategy_patches(
                         body=spec.body_template,
                     )
                 )
+            if deferred:
+                logger.info(
+                    "codegen: EP strategy %s host classes %s are defined in a "
+                    "sibling module, not the main modeling source; the "
+                    "forward extract is skipped and the runtime local-region "
+                    "skeleton (hp_bind_compute) carries the strategy at "
+                    "install time",
+                    target, sorted(deferred),
+                )
     return patch_set
+
+
+def _host_classes_for(
+    spec: StrategySpec,
+    rule: InlineRule,
+    target: str,
+    model_type: str | None,
+    boundary_classes: Mapping[str, str] | None,
+    external_state_classes: Collection[str] | None,
+) -> set[str]:
+    """Derive the host classes a body-bearing strategy rewrites.
+
+    A spec with a literal ``target_class`` (a framework-fixed attention host)
+    rewrites that class alone.  Otherwise the rule's match patterns select
+    hosts from the frozen boundary map; when they select none — re-emission
+    of an already-normalized meta, whose boundary entries the first pass
+    stripped — the classes a prior emission persisted in
+    ``meta.external_state_classes`` are the surviving record of which classes
+    an inline body replaced.  (Today the EP shell is the only body-bearing
+    strategy, so the whole record is this rule's host set; a second
+    body-bearing strategy would need a kind filter here.)  A declared
+    strategy that selects no host at all fails fast.
+
+    Args:
+        spec: The body-bearing strategy spec being materialized.
+        rule: The inline rule carrying the strategy's match patterns.
+        target: Dotted strategy target path, for error reporting.
+        model_type: Model family key, for error reporting.
+        boundary_classes: Frozen FQN -> class name map.
+        external_state_classes: Classes a prior emission recorded as inline.
+
+    Returns:
+        The host class names the strategy's patches rewrite.
+    """
+    if spec.target_class is not None:
+        return {spec.target_class}
+    host_classes = rule_block_classes(rule, boundary_classes)
+    if not host_classes:
+        host_classes = set(external_state_classes or ())
+    if not host_classes:
+        raise _unmaterialized_strategy_error(spec.kind, target, rule, model_type)
+    return host_classes
+
+
+def _split_source_hosts(
+    host_classes: set[str], source_classes: Collection[str] | None
+) -> tuple[set[str], set[str]]:
+    """Split derived hosts into inlineable vs sibling-module classes.
+
+    A host the main modeling source does not define is defined in a sibling
+    module the bundle copies verbatim (a two-file model whose language model
+    class tree lives in ``modeling_kimi_linear.py``).  No patch may rewrite
+    the sibling: the main file is the only file codegen edits, so such hosts
+    defer to the runtime local-region skeleton instead.  ``source_classes``
+    ``None`` means the caller did not index the source (the pre-split call
+    shape) and every host stays inlineable, preserving old behavior.
+    """
+    if source_classes is None:
+        return host_classes, set()
+    inlineable = {
+        host for host in host_classes if host in source_classes
+    }
+    deferred = host_classes - inlineable
+    return inlineable, deferred
 
 
 def _materialize_cp_subclass(

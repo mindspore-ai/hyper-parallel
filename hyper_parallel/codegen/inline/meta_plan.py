@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 from fnmatch import fnmatch
-from typing import Any
+from typing import Any, Collection
 
 from hyper_parallel.codegen.inline.ir import InlineRule
 from hyper_parallel.codegen.inline.specs import strategy_spec
@@ -27,7 +27,12 @@ from hyper_parallel.codegen.inline.strategy_pass import rule_block_classes
 logger = logging.getLogger(__name__)
 
 
-def normalize_inline_meta(meta: Any, rules: tuple[InlineRule, ...], model_type: str | None = None) -> None:
+def normalize_inline_meta(
+    meta: Any,
+    rules: tuple[InlineRule, ...],
+    model_type: str | None = None,
+    source_classes: Collection[str] | None = None,
+) -> None:
     """Align the frozen plan with the inline-generated source shape.
 
     Every stage is structure-proven: the strategy each strategy target
@@ -38,6 +43,21 @@ def normalize_inline_meta(meta: Any, rules: tuple[InlineRule, ...], model_type: 
     parallel state from install-time instance attributes.  A rendered component
     class (the fused attention) keeps the component's own forward and is not
     stripped: its boundary is emitted and compiled like any other.
+
+    ``source_classes`` names the classes the main modeling source defines; a
+    body-bearing host class missing from it is a sibling-module class whose
+    forward the artifact cannot rewrite (see ``build_strategy_patches``), so
+    its strategy runs as the runtime local-region skeleton: its boundary and
+    its sub-boundaries stay compiled, and it must not be recorded as
+    external-state.  Passing ``None`` (the pre-split signature) keeps the
+    historical behavior of trusting every derived host.
+
+    Args:
+        meta: Frozen plan metadata recorded by the generator.
+        rules: Inline rules recovered from the frozen meta.
+        model_type: Model family key used to resolve framework declarations.
+        source_classes: Class names the main modeling source defines, or
+            ``None`` when the caller did not index the source.
     """
 
     # EP strategy forwards inline the entire routed+shared path, so any
@@ -51,7 +71,24 @@ def normalize_inline_meta(meta: Any, rules: tuple[InlineRule, ...], model_type: 
     # instances inherit -- a non-boundary instance would get a boundary
     # body it cannot satisfy (no _hp_boundary installed).
     full_class_map = dict(getattr(meta, "boundary_classes", None) or {})
-    _strip_ep_sub_boundaries(meta, rules, model_type)
+    deferred = _strip_ep_sub_boundaries(meta, rules, model_type, source_classes)
+    if deferred:
+        # The freeze side (``external_state_classes_for``) recorded every
+        # body-bearing host before the source was indexed, so a
+        # sibling-module host sits in ``meta.external_state_classes`` even
+        # though its forward was NOT rewritten: the runtime skeleton keeps
+        # its compiled boundary, and an external-state record would strip
+        # it. Drop those classes here, before the strip pass reads them.
+        recorded = set(getattr(meta, "external_state_classes", None) or ())
+        dropped = recorded & deferred
+        if dropped:
+            meta.external_state_classes = sorted(recorded - dropped)
+            logger.info(
+                "codegen: host classes %s live in a sibling module; removed "
+                "from external_state_classes — their boundaries stay "
+                "compiled for the runtime local-region skeleton",
+                sorted(dropped),
+            )
     _strip_external_state_boundaries(meta)
     _mark_shared_class_boundaries(meta, full_class_map)
 
@@ -78,8 +115,11 @@ def _strip_external_state_boundaries(meta: Any) -> None:
 
 
 def _strip_ep_sub_boundaries(
-    meta: Any, rules: tuple[InlineRule, ...], model_type: str | None,
-) -> None:
+    meta: Any,
+    rules: tuple[InlineRule, ...],
+    model_type: str | None,
+    source_classes: Collection[str] | None = None,
+) -> set[str]:
     """Mark boundary entries owned by inline EP strategy forwards as non-boundary.
 
     The EP strategy forward replaces the target class's ``forward`` and calls
@@ -89,11 +129,57 @@ def _strip_ep_sub_boundaries(
     ``is_boundary: false`` so ``lower_forward_boundaries`` does not double-wrap
     them.  The param_plan entries are kept so FSDP / EP param sharding still
     applies and the preflight coverage check passes.
+
+    Args:
+        meta: Frozen plan metadata recorded by the generator.
+        rules: Inline rules recovered from the frozen meta.
+        model_type: Model family key used to resolve framework declarations.
+        source_classes: Class names the main modeling source defines, or
+            ``None`` when the caller did not index the source.
+
+    Returns:
+        The set of body-bearing host classes the main source does NOT define
+        (sibling-module classes): their forwards were left untouched (see
+        ``build_strategy_patches``), so their boundary entries must stay
+        compiled for the runtime local-region skeleton — the caller drops
+        them from the freeze-time ``external_state_classes`` record.
     """
     param_plan = getattr(meta, "param_plan", None) or {}
     boundary_classes = getattr(meta, "boundary_classes", None) or {}
+    ep_fqns, strip_patterns, deferred_hosts = _collect_ep_targets(
+        meta, rules, model_type, boundary_classes, source_classes
+    )
+    if ep_fqns:
+        _mark_ep_owned_fqns(param_plan, boundary_classes, ep_fqns, strip_patterns)
+    return deferred_hosts
+
+
+def _collect_ep_targets(
+    meta: Any,
+    rules: tuple[InlineRule, ...],
+    model_type: str | None,
+    boundary_classes: dict[str, str],
+    source_classes: Collection[str] | None,
+) -> tuple[set[str], tuple[str, ...], set[str]]:
+    """Resolve every body-bearing EP rule to its target FQNs and hosts.
+
+    Args:
+        meta: Frozen plan metadata; ``external_state_classes`` is extended
+            with the in-source host classes each rule materializes.
+        rules: Inline rules recovered from the frozen meta.
+        model_type: Model family key used to resolve framework declarations.
+        boundary_classes: Frozen FQN -> class name map.
+        source_classes: Class names the main modeling source defines, or
+            ``None`` when the caller did not index the source.
+
+    Returns:
+        ``(ep_fqns, strip_patterns, deferred_hosts)`` — the matched EP target
+        FQNs, the sub-module patterns their inline bodies own, and the
+        sibling-module host classes the runtime skeleton carries instead.
+    """
     ep_fqns: set[str] = set()
     strip_patterns: tuple[str, ...] = ()
+    deferred_hosts: set[str] = set()
     for rule in rules:
         target = rule.local_compute_target
         if target is None:
@@ -109,19 +195,60 @@ def _strip_ep_sub_boundaries(
             # The block class is a per-model fact derived from the boundary
             # map, never a registered literal (see build_strategy_patches).
             host_classes = rule_block_classes(rule, boundary_classes)
-        if host_classes:
-            # Persist the derived classes so a re-emission of this
-            # already-normalized meta (whose boundary entries the strip below
-            # consumes) can still resolve its patch hosts.
-            recorded = set(getattr(meta, "external_state_classes", None) or ())
-            meta.external_state_classes = sorted(recorded | host_classes)
+        sibling_hosts = _sibling_hosts(host_classes, source_classes)
+        if sibling_hosts:
+            deferred_hosts |= sibling_hosts
+            host_classes = host_classes - sibling_hosts
+        if not host_classes:
+            continue
+        # Persist the derived classes so a re-emission of this
+        # already-normalized meta (whose boundary entries the strip below
+        # consumes) can still resolve its patch hosts.
+        recorded = set(getattr(meta, "external_state_classes", None) or ())
+        meta.external_state_classes = sorted(recorded | host_classes)
         for fqn, cls in boundary_classes.items():
-            if cls not in host_classes:
-                continue
-            if any(fnmatch(fqn, pattern) for pattern in rule.match):
+            if cls in host_classes and any(
+                fnmatch(fqn, pattern) for pattern in rule.match
+            ):
                 ep_fqns.add(fqn)
-    if not ep_fqns:
-        return
+    return ep_fqns, strip_patterns, deferred_hosts
+
+
+def _sibling_hosts(
+    host_classes: set[str], source_classes: Collection[str] | None
+) -> set[str]:
+    """Host classes the main modeling source does not define.
+
+    A sibling module is copied verbatim into the bundle, so this host's
+    forward was NOT rewritten by an inline body: its boundary and its
+    sub-boundaries stay compiled.  The native skeleton the runtime installs
+    treats the nested experts / shared_experts boundaries exactly like the
+    native applier's Phase C (exclude_subtrees): their exits already run the
+    declared reductions.  ``source_classes`` ``None`` (the pre-split call
+    shape) trusts every host, preserving old behavior.
+    """
+    if source_classes is None:
+        return set()
+    return {host for host in host_classes if host not in source_classes}
+
+
+def _mark_ep_owned_fqns(
+    param_plan: dict[str, Any],
+    boundary_classes: dict[str, str],
+    ep_fqns: set[str],
+    strip_patterns: tuple[str, ...],
+) -> None:
+    """Strip the EP targets and the sub-boundaries their bodies own.
+
+    Args:
+        param_plan: Frozen param plan; owned entries keep their sharding but
+            are marked ``is_boundary: false``.
+        boundary_classes: Frozen FQN -> class name map; owned entries are
+            removed so no later stage source-lowers them.
+        ep_fqns: The EP target FQNs the inline bodies replaced.
+        strip_patterns: Sub-module patterns (relative to an EP target) whose
+            boundary entries the inline body owns.
+    """
     mark_fqns: set[str] = set()
     for ep_fqn in ep_fqns:
         mark_fqns.add(ep_fqn)

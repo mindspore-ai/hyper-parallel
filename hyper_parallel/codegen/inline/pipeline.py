@@ -20,6 +20,7 @@ import ast
 import importlib
 from typing import Any
 
+from hyper_parallel.codegen.astkit.index import build_source_index
 from hyper_parallel.codegen.inline.ir import InlinePatchSet
 from hyper_parallel.codegen.inline.meta_plan import normalize_inline_meta
 from hyper_parallel.codegen.inline.patch_engine import apply_patch_set, drop_shadowed_definitions
@@ -51,11 +52,18 @@ def render_inline_modeling(source_text: str, meta: Any, model_type: str | None =
         return source_text
     _require_inline_coverage(rules, model_type)
     replacement_patches = build_replacement_patches(rules, model_type)
+    # Classes the main modeling source defines.  A strategy host missing
+    # from this set is a sibling-module class (a two-file model whose
+    # language model lives in a copied sibling file): the artifact only
+    # edits the main file, so such a host defers its strategy to the
+    # runtime local-region skeleton instead of a forward extract.
+    source_classes = frozenset(build_source_index(source_text).classes)
     strategy_patches = build_strategy_patches(
         rules,
         model_type,
         getattr(meta, "boundary_classes", None),
         getattr(meta, "external_state_classes", None),
+        source_classes,
     )
     patch_set = _merge_patch_sets(replacement_patches, strategy_patches)
     rendered = apply_patch_set(source_text, patch_set)
@@ -70,7 +78,7 @@ def render_inline_modeling(source_text: str, meta: Any, model_type: str | None =
     rendered = drop_shadowed_definitions(
         rendered, _library_import_names(rendered) & _decorated_names(source_text)
     )
-    normalize_inline_meta(meta, rules, model_type)
+    normalize_inline_meta(meta, rules, model_type, source_classes)
     return rendered
 
 
