@@ -129,6 +129,9 @@ class ModelAdapterSpec:
         native_parallel: provider declaring explicit CP/EP stage protocols without replacing modules.
         codegen: lazy provider for model-owned source compatibility and source
             renderers used only while exporting a generated bundle.
+        dit: provider returning a DiT-family construction adapter. Diffusers
+            model classes remain upstream-owned; the adapter only resolves
+            config, checkpoint, and condition-model contracts.
     """
 
     architecture: str
@@ -152,3 +155,4 @@ class ModelAdapterSpec:
     codegen: Optional[Callable[..., Any]] = None
     sharding: Optional[Callable[..., Any]] = None
     native_parallel: Optional[Callable[..., Any]] = None
+    dit: Optional[Callable[..., Any]] = None
