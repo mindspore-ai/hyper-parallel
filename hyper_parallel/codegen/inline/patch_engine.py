@@ -26,7 +26,7 @@ from hyper_parallel.codegen.astkit.edits import (
     insert_after_imports,
     replace_function_body,
 )
-from hyper_parallel.codegen.astkit.index import build_source_index
+from hyper_parallel.codegen.astkit.index import FunctionInfo, build_source_index
 from hyper_parallel.codegen.inline.ir import (
     ClassRemovalPatch,
     ConstructorReplacePatch,
@@ -56,8 +56,17 @@ def apply_patch_set(source_text: str, patch_set: InlinePatchSet) -> str:
     snippet_edit = _snippet_edit(source_text, index.import_end, index.docstring_end, patch_set.module_snippets)
     if snippet_edit is not None:
         first_pass.append(snippet_edit)
-    first_pass.extend(_constructor_edits(source_text, patch_set.constructor_replaces))
+    waves = _constructor_waves(list(patch_set.constructor_replaces))
+    hits: dict[str, int] = defaultdict(int)
+    if waves:
+        first_pass.extend(_constructor_edits(source_text, waves[0], hits))
     text = apply_edits(source_text, first_pass) if first_pass else source_text
+    for wave in waves[1:]:
+        wave_edits = _constructor_edits(text, wave, hits)
+        if wave_edits:
+            text = apply_edits(text, wave_edits)
+    if patch_set.constructor_replaces:
+        _require_scoped_rewrites(patch_set.constructor_replaces, hits)
 
     if patch_set.class_removals:
         text = _apply_class_removals(text, patch_set.class_removals)
@@ -119,22 +128,68 @@ def _snippet_edit(
     )
 
 
+def _constructor_waves(
+    patch_list: list[ConstructorReplacePatch],
+) -> list[list[ConstructorReplacePatch]]:
+    """Group constructor rewrites into dependency-ordered waves.
+
+    Two compositions force a later wave, re-parsed from the previous
+    wave's output: a patch whose ``old_ctor`` another remaining patch
+    introduces (an ``A -> B`` wrap retargeted further by a ``B -> C``
+    patch), and a ``name`` retarget sharing its ``old_ctor`` with a
+    ``wrap_source`` patch — the inline CP subclass retargets the
+    *outer* wrapper call the wrap introduced, and applying the name
+    swap first would consume the call site the wrap still needs (a
+    scoped wrap with no call site fails loudly, so the order is not
+    optional).
+    """
+
+    remaining = list(patch_list)
+    waves: list[list[ConstructorReplacePatch]] = []
+    while remaining:
+        introduced = {
+            patch.new_ctor for patch in remaining if patch.new_ctor != patch.old_ctor
+        }
+        wave = [
+            patch
+            for patch in remaining
+            if patch.old_ctor not in introduced
+            and not (
+                patch.mode == "name"
+                and any(
+                    other is not patch
+                    and other.mode == "wrap_source"
+                    and other.old_ctor == patch.old_ctor
+                    for other in remaining
+                )
+            )
+        ]
+        if not wave:
+            names = sorted({patch.old_ctor for patch in remaining})
+            raise ValueError(
+                f"codegen: constructor replacement dependency cycle among {names}"
+            )
+        chosen = {id(patch) for patch in wave}
+        remaining = [patch for patch in remaining if id(patch) not in chosen]
+        waves.append(wave)
+    return waves
+
+
 def _constructor_edits(
     source_text: str,
-    patches: Iterable[ConstructorReplacePatch],
+    patches: list[ConstructorReplacePatch],
+    hits: dict[str, int],
 ) -> list[TextEdit]:
     """Build the edits that swap constructor calls per patch target."""
-    patch_list = list(patches)
     patches_by_old: dict[str, list[ConstructorReplacePatch]] = defaultdict(list)
-    for patch in patch_list:
+    for patch in patches:
         patches_by_old[patch.old_ctor].append(patch)
     if not patches_by_old:
         return []
-    scopes = _scopes_by_old_ctor(patch_list)
+    scopes = _scopes_by_old_ctor(patches)
     tree = ast.parse(source_text)
     offsets = _line_offsets(source_text)
     edits: list[TextEdit] = []
-    hits: dict[str, int] = defaultdict(int)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Assign):
             continue
@@ -163,7 +218,6 @@ def _constructor_edits(
             edits.append(TextEdit(start, end, replacement))
         else:
             raise ValueError(f"unknown constructor replacement mode: {patch.mode!r}")
-    _require_scoped_rewrites(patch_list, hits)
     return _drop_nested_edits(edits)
 
 
@@ -412,6 +466,28 @@ def _skip_trailing_blank_lines(text: str, end: int) -> int:
     return end
 
 
+_HIDDEN_ARG_TOKEN = "__hp_hidden_arg__"
+
+
+def _bind_hidden_arg(body: str, func: "FunctionInfo") -> str:
+    """Replace the strategy shell's placeholder token with the host's first arg.
+
+    One strategy template serves hosts whose first parameter name differs
+    (a MoE block takes ``hidden_states``, a dense MLP takes ``x``), so the
+    template names its input ``__hp_hidden_arg__`` and the concrete name is
+    bound here from the host method's own signature at apply time.
+    """
+
+    if _HIDDEN_ARG_TOKEN not in body:
+        return body
+    if not func.param_names:
+        raise RuntimeError(
+            f"codegen: inline strategy body references {_HIDDEN_ARG_TOKEN!r} "
+            "but the target method has no positional parameter to bind it to"
+        )
+    return body.replace(_HIDDEN_ARG_TOKEN, func.param_names[0])
+
+
 def _forward_extract_edits(
     source_text: str,
     patches: Iterable[ForwardExtractPatch],
@@ -428,7 +504,14 @@ def _forward_extract_edits(
     for patch in patches:
         cls = index.find_class(patch.class_name)
         if cls is None:
-            continue
+            # The class comes from the frozen boundary map (or an explicit
+            # spec literal), so a miss means the plan and the modeling source
+            # disagree — fail fast instead of silently dropping the strategy.
+            raise RuntimeError(
+                f"codegen: inline strategy targets class "
+                f"{patch.class_name!r} which the modeling source does not "
+                "define; the artifact would silently lose this strategy"
+            )
         func = cls.methods.get(patch.method_name)
         if func is None:
             continue
@@ -438,7 +521,8 @@ def _forward_extract_edits(
         )
         if impl is not None:
             edits.append(impl)
-        edits.extend(replace_function_body(source_text, func, patch.body, indent="        "))
+        body = _bind_hidden_arg(patch.body, func)
+        edits.extend(replace_function_body(source_text, func, body, indent="        "))
     return edits
 
 

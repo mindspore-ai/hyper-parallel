@@ -115,6 +115,7 @@ def test_external_state_classes_travel_from_structure_to_the_runtime() -> None:
     meta.source = {"architecture": "Qwen3MoeForCausalLM"}
     meta.injections = [
         {
+            "match": "model.layers.0.mlp",
             "local_compute_fn": {
                 "_target_": (
                     "hyper_parallel.models.qwen3_moe.adapter.distributed."
@@ -123,6 +124,9 @@ def test_external_state_classes_travel_from_structure_to_the_runtime() -> None:
             }
         }
     ]
+    # The block class is a per-model fact: it is derived from the frozen
+    # boundary map (FQN -> class), never from a registered literal.
+    meta.boundary_classes = {"model.layers.0.mlp": "Qwen3MoeSparseMoeBlock"}
     manager._record_inline_declarations(meta)
     assert meta.external_state_classes == ["Qwen3MoeSparseMoeBlock"]
 
@@ -470,6 +474,39 @@ def test_projected_signature_payload_includes_codegen_implementation(
 @pytest.mark.parametrize("text", ["R", "S(1)", "S(-1)", "P(sum)", "SS(0,2)"])
 def test_placement_strings_round_trip(text: str) -> None:
     assert placement_to_string(parse_placement(text)) == text
+
+
+def test_negative_dim_parses_as_real_dim_index() -> None:
+    """A negative dim in a frozen shard string is a real last-dim index.
+
+    Feature: Frozen placement round-trip.
+    Description: The frozen lm_head contract (``out_src tp: S(-1)``) used
+        to deserialize as ``Shard(0, uneven_shard=True)``, which sent the
+        runtime all-gather along dim 0 instead of the last dim and silently
+        produced a wrongly-shaped logits tensor on the codegen arm.
+    Expectation: The dim survives the freeze round-trip as a real negative
+        index with ``uneven_shard`` left False.
+    """
+    parsed = parse_placement("S(-1)")
+    assert parsed.dim == -1
+    assert parsed.uneven_shard is False
+    assert placement_to_string(parsed) == "S(-1)"
+
+
+def test_uneven_shard_placement_refuses_to_freeze() -> None:
+    """Uneven shards are FSDP-internal and never belong to a frozen plan.
+
+    Feature: Frozen placement round-trip.
+    Description: The old protocol smuggled ``uneven_shard`` through a
+        negative-dim encoding, which collided with real negative dim
+        indices (see ``test_negative_dim_parses_as_real_dim_index``).
+    Expectation: Freezing an uneven shard placement fails fast with
+        ``TypeError`` instead of silently corrupting the round-trip.
+    """
+    from hyper_parallel.core.dtensor.placement_types import Shard  # pylint: disable=import-outside-toplevel
+
+    with pytest.raises(TypeError, match="uneven_shard"):
+        placement_to_string(Shard(0, uneven_shard=True))
 
 
 @pytest.mark.parametrize("text", ["", "Shard(0)", "S(x)", "SS(0)", "P()"])

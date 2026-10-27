@@ -1,0 +1,1167 @@
+{
+  "boundary_classes": {
+    "lm_head": "Linear",
+    "model.embed_tokens": "Embedding",
+    "model.layers.0.input_layernorm": "KimiRMSNorm",
+    "model.layers.0.mlp": "KimiMLP",
+    "model.layers.0.post_attention_layernorm": "KimiRMSNorm",
+    "model.layers.0.self_attn": "KimiDeltaAttention",
+    "model.layers.0.self_attn.o_norm": "FusedRMSNormGated",
+    "model.layers.1.input_layernorm": "KimiRMSNorm",
+    "model.layers.1.mlp": "KimiMLP",
+    "model.layers.1.post_attention_layernorm": "KimiRMSNorm",
+    "model.layers.1.self_attn": "KimiDeltaAttention",
+    "model.layers.1.self_attn.o_norm": "FusedRMSNormGated",
+    "model.layers.2.input_layernorm": "KimiRMSNorm",
+    "model.layers.2.mlp": "KimiMLP",
+    "model.layers.2.post_attention_layernorm": "KimiRMSNorm",
+    "model.layers.2.self_attn": "KimiDeltaAttention",
+    "model.layers.2.self_attn.o_norm": "FusedRMSNormGated",
+    "model.layers.3.input_layernorm": "KimiRMSNorm",
+    "model.layers.3.mlp": "KimiMLP",
+    "model.layers.3.post_attention_layernorm": "KimiRMSNorm",
+    "model.layers.3.self_attn": "KimiMLAAttention",
+    "model.layers.3.self_attn.kv_a_layernorm": "KimiRMSNorm",
+    "model.norm": "KimiRMSNorm"
+  },
+  "codegen_version": "0.1.1",
+  "covered": {
+    "axes": [],
+    "module_overrides": false,
+    "sharding_plan": true
+  },
+  "entrypoints": {
+    "parallelize": "hp_parallelize"
+  },
+  "external_state_classes": [],
+  "frozen_sharded_params": [],
+  "injections": [],
+  "mesh_dim_names": null,
+  "model_class": "KimiLinearForCausalLM",
+  "model_name": "Kimi_Linear",
+  "module_overrides": [],
+  "not_covered": [
+    "mesh",
+    "fsdp2",
+    "pp",
+    "activation_checkpoint",
+    "compile"
+  ],
+  "outputs": {
+    "configuration_kimi.py": {
+      "lines": 140,
+      "sha256": "79422aca3ee6c89d201e0c15c4c9a6db517ba83d87ecdc4e41fa0f71297238d9"
+    },
+    "diff": {
+      "lines": 20,
+      "sha256": "4a9751565b470603b55489f43f0c998094f7bd506c81bc24903537599e28ccdb"
+    },
+    "init": {
+      "lines": 6,
+      "sha256": "7389880ffed45d33673e5052c8ec69ffddf7c1185146cdfc5c782dcac88eea6b"
+    },
+    "modeling": {
+      "lines": 1115,
+      "sha256": "49f118f14d779dbb381b0b7b0db8171896bda8ea16ed4c0591a7fbb0f9a77e8f"
+    }
+  },
+  "parallel_dims": {
+    "cp_size": 1,
+    "dp_size": 8,
+    "ep_size": 1,
+    "loss_parallel": false,
+    "pp_size": 1,
+    "sequence_parallel": false,
+    "tp_size": 1
+  },
+  "param_plan": {
+    "lm_head": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "S(-1)"
+        }
+      },
+      "params": {
+        "weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "model.embed_tokens": {
+      "in_dst": {
+        "input": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "input": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "P(sum)"
+        }
+      },
+      "params": {
+        "weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "model.layers.0.input_layernorm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "model.layers.0.mlp": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "P(sum)"
+        }
+      },
+      "params": {
+        "down_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "gate_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "up_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "model.layers.0.post_attention_layernorm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "model.layers.0.self_attn": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "P(sum)"
+        }
+      },
+      "params": {
+        "A_log": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "b_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "dt_bias": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "f_a_proj.weight": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "R"
+        },
+        "f_b_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "g_a_proj.weight": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "R"
+        },
+        "g_b_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "k_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "o_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "q_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "model.layers.0.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "model.layers.1.input_layernorm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "model.layers.1.mlp": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "P(sum)"
+        }
+      },
+      "params": {
+        "down_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "gate_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "up_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "model.layers.1.post_attention_layernorm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "model.layers.1.self_attn": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "P(sum)"
+        }
+      },
+      "params": {
+        "A_log": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "b_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "dt_bias": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "f_a_proj.weight": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "R"
+        },
+        "f_b_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "g_a_proj.weight": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "R"
+        },
+        "g_b_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "k_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "o_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "q_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "model.layers.1.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "model.layers.2.input_layernorm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "model.layers.2.mlp": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "P(sum)"
+        }
+      },
+      "params": {
+        "down_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "gate_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "up_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "model.layers.2.post_attention_layernorm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "model.layers.2.self_attn": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "P(sum)"
+        }
+      },
+      "params": {
+        "A_log": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "b_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "dt_bias": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "f_a_proj.weight": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "R"
+        },
+        "f_b_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "g_a_proj.weight": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "R"
+        },
+        "g_b_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "k_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "k_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "o_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "q_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "q_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "v_conv1d.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "v_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "model.layers.2.self_attn.o_norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "model.layers.3.input_layernorm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "model.layers.3.mlp": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "P(sum)"
+        }
+      },
+      "params": {
+        "down_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "gate_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "up_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "model.layers.3.post_attention_layernorm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "model.layers.3.self_attn": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "P(sum)"
+        }
+      },
+      "params": {
+        "kv_a_proj_with_mqa.weight": {
+          "cp": "R",
+          "ep": "R",
+          "tp": "R"
+        },
+        "kv_b_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "o_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        },
+        "q_proj.weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "model.layers.3.self_attn.kv_a_layernorm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    },
+    "model.norm": {
+      "in_dst": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "in_src": {
+        "hidden_states": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "is_boundary": true,
+      "out_dst": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "out_src": {
+        "output": {
+          "cp": "S(1)",
+          "ep": "R",
+          "tp": "R"
+        }
+      },
+      "params": {
+        "weight": {
+          "cp": "R",
+          "ep": "R"
+        }
+      }
+    }
+  },
+  "remote_siblings": [
+    "configuration_kimi.py"
+  ],
+  "signature": "62626143cd8c",
+  "skipped_overrides": [],
+  "source": {
+    "architecture": "KimiLinearForCausalLM",
+    "file_path": "/home/lxy/probe_ckpts/kimi_linear/modeling_kimi.py",
+    "line_count": 1101,
+    "model_id": "/home/lxy/probe_ckpts/kimi_linear",
+    "model_type": "kimi_linear",
+    "module_name": "<remote>",
+    "sha256": "d79b365e37378881b9f1585007a56e236ca27a414920943cb85d1dacb75dda99",
+    "structure": {
+      "first_k_dense_replace": 1,
+      "hidden_size": 2304,
+      "intermediate_size": 9216,
+      "moe_intermediate_size": 1024,
+      "num_attention_heads": 32,
+      "num_experts": 8,
+      "num_hidden_layers": 4,
+      "num_key_value_heads": 32,
+      "topk_group": 1
+    },
+    "transformers_version": "5.14.1"
+  },
+  "special_handlers": {},
+  "tied_pairs": [],
+  "yaml_path": "/home/lxy/codegen_all_3cb4e616_inputs/kimi_linear.yaml",
+  "yaml_sha256": "4fda23aeecd59d8e23944cb42bdc64a303c2f8791f1b9794335090f2ad57a90f"
+}

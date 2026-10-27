@@ -19,6 +19,7 @@ import logging
 from typing import Any, Optional
 
 from hyper_parallel.codegen.plan.offline_mesh import build_offline_mesh
+from hyper_parallel.codegen.source.compat import install_output_recorder_compat
 from hyper_parallel.codegen.spec.types import CodegenSpec
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,7 @@ def build_meta_model(
         return None
     try:
         from hyper_parallel import init_empty_weights
+        install_output_recorder_compat()
 
         custom_cls = _custom_model_cls(spec, hf_config)
         if custom_cls is not None:
@@ -93,11 +95,12 @@ def build_meta_model(
             # AutoModel; build it the way the trainer's CUSTOM/GEN backends
             # do — from the resolved config, which also carries any crop.
             if hf_config is None:
-                raise ValueError(
-                    "codegen: custom-registered model "
-                    f"{spec.source.architecture or model_id!r} needs the "
-                    "resolved config (hf_config) to build the meta model; "
-                    "AutoConfig cannot load it from the model id"
+                from transformers import AutoConfig
+
+                hf_config = AutoConfig.from_pretrained(
+                    model_id,
+                    trust_remote_code=trust_remote_code,
+                    **dict(config_overrides or {}),
                 )
             with init_empty_weights():
                 return custom_cls(hf_config)
@@ -120,7 +123,12 @@ def build_meta_model(
         # hardcoded CausalLM fallback.
         causal_keys = tuple(AutoModelForCausalLM._model_mapping.keys())
         vl_keys = tuple(AutoModelForImageTextToText._model_mapping.keys())
-        if isinstance(config, causal_keys):
+        auto_map = getattr(config, "auto_map", None) or {}
+        if trust_remote_code and "AutoModelForImageTextToText" in auto_map:
+            auto_cls = AutoModelForImageTextToText
+        elif trust_remote_code and "AutoModelForCausalLM" in auto_map:
+            auto_cls = AutoModelForCausalLM
+        elif isinstance(config, causal_keys):
             auto_cls = AutoModelForCausalLM
         elif isinstance(config, vl_keys):
             auto_cls = AutoModelForImageTextToText

@@ -28,6 +28,7 @@ from torch import nn
 
 from hyper_parallel.codegen import loader
 from hyper_parallel.models._transformers import checkpoint_loader
+from tests.common.mark_utils import arg_mark
 
 
 class _TinyGeneratedModel(nn.Module):
@@ -42,6 +43,8 @@ class _TinyGeneratedModel(nn.Module):
 class TestGeneratedCheckpointLoading(unittest.TestCase):
     """Generated-model loading defers to the infrastructure stage on meta."""
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_meta_model_is_not_materialized_or_loaded(self) -> None:
         """A meta model returns immediately: no to_empty, no checkpoint load."""
         model_cls = mock.Mock(spec_set=["_from_config"])
@@ -68,6 +71,8 @@ class TestGeneratedCheckpointLoading(unittest.TestCase):
         manager_cls.assert_not_called()
         manager.load_checkpoint.assert_not_called()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_real_model_still_loads_checkpoint(self) -> None:
         """A non-meta (single-process) model keeps the eager load."""
         model_cls = mock.Mock(spec_set=["_from_config"])

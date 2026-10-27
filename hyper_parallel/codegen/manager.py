@@ -278,11 +278,18 @@ def _model_type(config: Any, hf_config: Any = None) -> Optional[str]:
 
     Shares the best-effort config lookup with :func:`_model_name` (including
     the ``from_config`` ``config_path`` spelling), so the CLI generation and
-    the trainer anchor the bundle to the same family directory.
+    the trainer anchor the bundle to the same family directory. The raw HF
+    spelling is normalized through the registry family aliases (K2.6 reports
+    ``kimi_k25``; the family directory is ``kimi_k26``).
     """
     if hf_config is None:
         hf_config = _resolve_hf_config_for_layout(config)
-    return getattr(hf_config, "model_type", None)
+    model_type = getattr(hf_config, "model_type", None)
+    if not model_type:
+        return None
+    from hyper_parallel.models.registry import family_dir_for_model_type
+
+    return family_dir_for_model_type(str(model_type))
 
 
 def _model_type_to_modeling_token(model_type: str) -> str:
@@ -726,7 +733,11 @@ def _record_inline_declarations(meta: CodegenMeta) -> None:
     """
     identity = (meta.source or {}).get("architecture")
     meta.external_state_classes = list(
-        external_state_classes_for(identity, getattr(meta, "injections", None))
+        external_state_classes_for(
+            identity,
+            getattr(meta, "injections", None),
+            getattr(meta, "boundary_classes", None),
+        )
     )
 
 
@@ -1006,11 +1017,17 @@ def _import_ep_target_for(module: Any, match: str) -> "Any":
     )
     factory_path = _ep_factory_table().get(fingerprint)
     if factory_path is None:
+        from hyper_parallel.distributed.expert_parallel.archetypes import (  # pylint: disable=C0415
+            format_supported_fingerprints,
+        )
+
         raise UnsupportedModuleStructure(
             f"{match!r} matched {type(module).__name__} with structure "
-            f"{fingerprint} that has no EP compute factory. Declare an "
-            "explicit local_compute_fn._target_ to opt out of structure "
-            "detection."
+            f"{fingerprint} that has no EP compute factory. Supported "
+            f"structures: {format_supported_fingerprints()}. Implement the "
+            "missing capability (router adapter / shared mode / storage) or "
+            "declare an explicit local_compute_fn._target_ to opt out of "
+            "structure detection."
         )
     return _build_ep_target(factory_path)
 

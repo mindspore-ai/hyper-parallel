@@ -331,6 +331,12 @@ def verify_param_plan(meta: Any, model: Any) -> None:
     variant) fails fast instead of silently running with a stale sharding
     contract.  Degrades to a warning when ``model`` is not given (preflight
     without a model handle can still check the plan's internal consistency).
+
+    Args:
+        meta: Frozen ``codegen_meta`` handle carrying ``param_plan`` and
+            ``tied_pairs``.
+        model: The instantiated model to validate coverage against; may be
+            ``None`` for plan-internal checks only.
     """
     param_plan = getattr(meta, "param_plan", None) or {}
     if not param_plan:
@@ -365,16 +371,34 @@ def verify_param_plan(meta: Any, model: Any) -> None:
 
     # Every trainable model parameter must be covered by an explicit plan
     # entry (exact FQN or a leaf under a grouped key).
+    tied = _expand_tied_param_names(meta)
     uncovered = [
         fqn
         for fqn in _iter_trainable_params(model)
         if not any(fqn == key or fqn.startswith(f"{key}.") for key in planned)
+        and fqn not in tied
     ]
     if uncovered:
         raise RuntimeError(
             f"codegen preflight: {len(uncovered)} trainable parameters are "
             f"not covered by the frozen plan: {uncovered[:20]}"
         )
+
+
+def _expand_tied_param_names(meta: Any) -> set[str]:
+    """Collect the non-canonical side of every tied-weight pair in ``meta``.
+
+    A tied parameter (e.g. ``lm_head.weight`` tied to
+    ``model.language_model.embed_tokens.weight``) is the same physical tensor
+    as its canonical counterpart, which is the side the plan records.  The
+    non-canonical aliases therefore have no plan entry of their own by design
+    and must not be reported as uncovered.
+    """
+    tied: set[str] = set()
+    for pair in getattr(meta, "tied_pairs", None) or []:
+        if len(pair) >= 2:
+            tied.add(pair[1])
+    return tied
 
 
 # ---------------------------------------------------------------------------

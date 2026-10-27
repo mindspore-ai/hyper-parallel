@@ -889,14 +889,15 @@ def test_bind_inline_state_binds_the_ep_channel(monkeypatch):
         boundary / compute / inner-wrapper installers skip it; the parallel
         state that body reads (``self.ep_enable`` / ``self._hp_ep_group``)
         must come from ``hp_bind_inline_state``, bound on the instance from
-        the live expert mesh.  No TP / CP channel is bound: a class that is
-        *not* an inline strategy shell keeps the emitted boundary form, whose
-        TP operators and CP wrapper come from the shared install paths.
+        the live expert mesh.  The CP channel is bound alongside (off when
+        the active axes carry no ``cp`` axis); a class that is *not* an
+        inline strategy shell keeps the emitted boundary form, whose TP
+        operators come from the shared install paths.
     Expectation: The declared instance carries the resolved EP group with
-        ``ep_enable`` True and no ``_hp_tp`` / ``tp_enable`` /
-        ``_hp_cp_mesh`` / ``cp_enable``; an undeclared class of the same
-        generated module is left untouched, a bind without an expert mesh turns
-        the guard off, and no mesh is resolved when nothing matches.
+        ``ep_enable`` True, the CP channel bound off, and no ``_hp_tp`` /
+        ``tp_enable``; an undeclared class of the same generated module is
+        left untouched, a bind without an expert mesh turns the guard off,
+        and no mesh is resolved when nothing matches.
     """
     generated = types.ModuleType("hyper_parallel_generated.inline_state")
     declared = type(
@@ -926,8 +927,10 @@ def test_bind_inline_state_binds_the_ep_channel(monkeypatch):
 
     assert isinstance(model.declared._hp_ep_group, FakeEpGroup)
     assert model.declared.ep_enable is True
-    for absent in ("_hp_tp", "tp_enable", "_hp_cp_mesh", "cp_enable"):
+    for absent in ("_hp_tp", "tp_enable"):
         assert not hasattr(model.declared, absent)
+    assert model.declared._hp_cp_mesh is None
+    assert model.declared.cp_enable is False
     assert not hasattr(model.undeclared, "ep_enable")
     assert calls == [("mesh", ("ep",))]
 
@@ -956,6 +959,106 @@ def test_bind_inline_state_binds_the_ep_channel(monkeypatch):
         generated_module=generated,
     )
     assert not calls
+
+
+class FakeCpMesh:
+    """Sub-mesh double reporting a multi-rank context-parallel axis."""
+
+    def size(self):
+        return 2
+
+
+class FakeCpDenseMesh:
+    """Dense-mesh double exposing the ``cp`` / ``tp`` sub-meshes."""
+
+    mesh_dim_names = ("tp", "cp")
+
+    def __getitem__(self, name):
+        if name == "cp":
+            return FakeCpMesh()
+        if name == "tp":
+            return None
+        raise KeyError(name)
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_inline_cp_marker_binds_cp_channel_and_skips_inner_wrapper(monkeypatch):
+    """A generated CP dispatch shell instance: state bound, wrapper skipped.
+
+    Feature: codegen-external-state
+    Description: The inline CP subclass materializes at codegen time with
+        the ``_hp_inline_cp`` class marker; the runtime treats it as a third
+        channel — the inline-state binding resolves the cp sub-mesh and
+        binds ``cp_enable`` / ``_hp_cp_mesh`` on it, plus the family
+        companion attribute its ``_hp_cp_state_attr`` class constant
+        declares (the one the shared CP kernel reads), the inner-wrapper
+        installer skips it (the generated dispatch already owns the CP
+        path, so a second wrapper would apply CP twice), and it stays
+        outside the external-state registry so the boundary installers keep
+        installing its parent's boundary.
+    Expectation: the marked instance gets the resolved cp sub-mesh with
+        ``cp_enable`` True (EP channel off alongside) and the declared
+        companion attribute bound to the same mesh, the registered
+        sibling still binds through the external-state path,
+        ``_wrap_inner_attention`` is never called for the marked instance,
+        and ``_is_external_state_inline_module`` rejects it even after the
+        sibling registration.
+    """
+    generated = types.ModuleType("hyper_parallel_generated.inline_cp")
+    shell = type(
+        "DeepseekV32DSAAttentionCP",
+        (nn.Module,),
+        {
+            "__module__": generated.__name__,
+            "_hp_inline_cp": True,
+            "_hp_cp_state_attr": "_hp_deepseek_v32_dsa_cp_mesh",
+        },
+    )
+    sibling = type("InlineMoeShell", (nn.Module,), {"__module__": generated.__name__})
+    runtime.register_external_state_classes(generated, ("InlineMoeShell",))
+
+    monkeypatch.setattr(
+        runtime,
+        "_resolve_runtime_meshes",
+        lambda *a, **k: (FakeCpDenseMesh(), None, None, ("tp", "cp")),
+    )
+    model = nn.Module()
+    model.self_attn = shell()
+    model.mlp = sibling()
+    runtime.hp_bind_inline_state(
+        model,
+        mesh_context="mesh",
+        mesh_dim_names=("tp", "cp"),
+        generated_module=generated,
+    )
+    assert isinstance(model.self_attn._hp_cp_mesh, FakeCpMesh)
+    assert isinstance(model.self_attn._hp_deepseek_v32_dsa_cp_mesh, FakeCpMesh)
+    assert model.self_attn.cp_enable is True
+    assert model.self_attn._hp_ep_group is None
+    assert model.self_attn.ep_enable is False
+    # The registered sibling still binds through the external-state path.
+    assert model.mlp.ep_enable is False
+    assert not runtime._is_external_state_inline_module(model.self_attn, generated)
+
+    calls: list[Any] = []
+
+    def fake_wrap(module, cp_mesh, **kwargs):
+        calls.append((module, cp_mesh))
+
+    monkeypatch.setattr(
+        "hyper_parallel.distributed._builder.forward_rewriter._wrap_inner_attention",
+        fake_wrap,
+    )
+    runtime.hp_apply_inner_wrapper(
+        model,
+        [{"match": "self_attn", "inner_wrapper": "x"}],
+        "mesh",
+        ("tp", "cp"),
+        param_plan={},
+        generated_module=generated,
+    )
+    assert calls == []
 
 
 class RenderedAttention(nn.Module):
@@ -1009,6 +1112,7 @@ def _component_module():
             "match": "model.layers.0.mlp",
             "local_compute_fn": {"_target_": _QWEN_EP_FN},
         }],
+        boundary_classes={"model.layers.0.mlp": "Qwen3MoeSparseMoeBlock"},
     )
     manager._record_inline_declarations(meta)  # pylint: disable=protected-access
     assert meta.external_state_classes == ["Qwen3MoeSparseMoeBlock"]

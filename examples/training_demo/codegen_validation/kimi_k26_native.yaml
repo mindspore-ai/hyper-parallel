@@ -1,0 +1,160 @@
+# Kimi-K2.6 native arm for the 8-NPU codegen precision comparison.
+# Derived from hyper_parallel/models/kimi_k26/recipes/train.yaml with only
+# scale reductions required by the cropped validation config and one host.
+
+model:
+  _target_: hyper_parallel.models.kimi_k26.adapter.validation.cropped_model.build_cropped_kimi_vlm
+  pretrained_model_name_or_path: __KIMI_CONFIG__
+  config_path: __KIMI_CONFIG__
+  num_hidden_layers: 2
+  n_routed_experts: 8
+  trust_remote_code: false
+  local_files_only: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  validate_placement: false
+  freeze_patterns: ["model.vision_tower*"]
+
+training:
+  train_iters: 10
+  train_samples: null
+  eval_iters: 0
+  global_batch_size: 8
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: true
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 2
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 4
+  edp_shard_size: 1
+  enable_offload: false
+  replicate_params: []
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  forward_prefetch_depth: 3
+  backward_prefetch_depth: 3
+  comm_fusion: false
+
+plan_overrides:
+  - match: "model.language_model.layers.[123456789]*.mlp"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_parallel.models.kimi_k26.adapter.distributed.ep_compute.kimi_k26_ep_compute_fn
+      fix_router: false
+      use_grouped_gemm: true
+      overlap_shared_expert: true
+
+  - match: model.vision_tower.layers.*.attn.q_proj
+    params: &replicated_linear
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.*.attn.k_proj
+    params: *replicated_linear
+  - match: model.vision_tower.layers.*.attn.v_proj
+    params: *replicated_linear
+  - match: model.vision_tower.layers.*.attn.proj
+    params: *replicated_linear
+  - match: model.vision_tower.layers.*.mlp.fc1
+    params: *replicated_linear
+  - match: model.vision_tower.layers.*.mlp.fc2
+    params: *replicated_linear
+  - match: model.vision_tower.patch_embed.proj
+    params: *replicated_linear
+  - match: model.vision_tower.patch_embed.pos_emb
+    params:
+      position_embeddings: {tp: replicate}
+  - match: model.mm_projector.in_proj
+    params: *replicated_linear
+  - match: model.mm_projector.out_proj
+    params: *replicated_linear
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: full
+  swap_inputs: false
+
+activation_swap: none
+
+compile:
+  enabled: false
+  mode: default
+  fullgraph: false
+  dynamic: false
+  backend: null
+  options: {}
+  dynamo_cache_size_limit: 256
+
+dataset:
+  model_assets:
+    _target_: examples.training_demo.codegen_validation.kimi_k26_assets.build_kimi_validation_processor
+  data_transform:
+    _target_: hyper_parallel.models.kimi_k26.adapter.data.transform_fn.build_kimi_omni_transform
+    max_seq_len: 256
+    image_max_pixels: 12544
+  _target_: hyper_parallel.data.omni.build_dataset.build_online_omni_mapping_dataset
+  data_path: __VAL_ROOT__/data/kimi_k26/data.json
+  data_config:
+    filter_trainable: false
+
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_omni_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.OmniParallelBatch
+  sampler_type: single
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: true
+  prefetch_factor: 2
+
+optimizer:
+  _target_: hyper_parallel.components.optim.builders.AdamW
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.lr_scheduler.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr_warmup_steps: 1
+    min_lr: 0.0
+
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ""
+  restore_from: null
+
+debug:
+  check_nan_inf: true
+  check_dataset: null
+
+profiling:
+  enabled: false
+
+loss_fn:
+  _target_: hyper_parallel.models.kimi_k26.adapter.loss.KimiChunkedCausalLMLoss
+  chunk_size: 256

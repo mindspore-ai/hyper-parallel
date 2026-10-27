@@ -623,7 +623,9 @@ def _mesh_group(mesh: Any, name: str) -> Any:
         return mesh.get_group()
 
 
-def _install_inline_state_bindings(module: Any, expert_mesh: Any) -> None:
+def _install_inline_state_bindings(
+    module: Any, expert_mesh: Any, cp_mesh: Any, cp_state_attr: str | None = None
+) -> None:
     """Bind the instance-attribute parallel channel an inlined forward reads.
 
     The inlined EP MoE shell orchestrates through the same instance attributes
@@ -632,15 +634,21 @@ def _install_inline_state_bindings(module: Any, expert_mesh: Any) -> None:
     -> EP group) and reproduces the removed module-level state object's verdict
     exactly: ``ep_enable`` iff the resolved group spans more than one rank.
 
-    No other axis is bound here.  A class whose forward is *not* replaced by an
-    inline body keeps the emitted boundary form, and its channel comes from the
-    shared install paths: the compiled plan plus the TP operators
-    (``hp_install_boundaries``) and the declared inner wrapper
-    (``hp_apply_inner_wrapper``).
+    The inlined CP attention shell uses ``self._hp_cp_mesh`` and
+    ``self.cp_enable`` the same way: the CP sub-mesh is bound to the instance
+    and the guard is set from whether CP is actually active.  When the shell
+    declares ``_hp_cp_state_attr`` (the family kernel's companion attribute,
+    the same one the native runtime wrapper installs), the mesh is also bound
+    under that name, so the kernel — shared with the trainer — finds it under
+    either path.
     """
     ep_group = _mesh_group(expert_mesh, "ep") if expert_mesh is not None else None
     module._hp_ep_group = ep_group
     module.ep_enable = ep_group is not None and ep_group.size() > 1
+    module._hp_cp_mesh = cp_mesh
+    module.cp_enable = cp_mesh is not None and cp_mesh.size() > 1
+    if cp_state_attr and cp_mesh is not None:
+        setattr(module, cp_state_attr, cp_mesh)
 
 
 def hp_bind_inline_state(
@@ -655,13 +663,15 @@ def hp_bind_inline_state(
     A class declared in ``meta.external_state_classes`` has its ``forward``
     replaced by an inline strategy body, so the boundary / compute /
     inner-wrapper installers all skip it: its orchestration reads instance
-    attributes instead.  This walks the live model once and binds them on every
-    instance of a declared class — the same classes the installers skip, so an
-    inlined forward can never run with a partially bound channel.
+    attributes instead.  A generated CP dispatch subclass joins the same
+    target set through its ``_hp_inline_cp`` class marker.  This walks the
+    live model once and binds them on every instance of a declared or marked
+    class — the same classes the installers skip, so an inlined forward can
+    never run with a partially bound channel.
 
-    The mesh facts are resolved lazily and only when a declared class is
-    actually present, so an artifact without inlined components never touches
-    the mesh.
+    The mesh facts are resolved lazily and only when a target is actually
+    present, so an artifact without inlined components never touches the
+    mesh.
     """
     if model is None or generated_module is None:
         return
@@ -669,12 +679,26 @@ def hp_bind_inline_state(
         module
         for _, module in model.named_modules()
         if _is_external_state_inline_module(module, generated_module)
+        or _is_inline_cp_module(module)
     ]
     if not targets:
         return
-    _, _, expert_mesh, _ = _resolve_runtime_meshes(mesh_context, mesh_dim_names)
+    dense_mesh, _, expert_mesh, active_dim_names = _resolve_runtime_meshes(
+        mesh_context, mesh_dim_names
+    )
+    from hyper_parallel.distributed._builder.applier import (  # pylint: disable=C0415
+        _get_cp_submesh,
+    )
+
+    dim_names = tuple(active_dim_names) if active_dim_names else ()
+    cp_mesh = _get_cp_submesh(dense_mesh, dim_names)
     for module in targets:
-        _install_inline_state_bindings(module, expert_mesh)
+        _install_inline_state_bindings(
+            module,
+            expert_mesh,
+            cp_mesh,
+            cp_state_attr=getattr(type(module), "_hp_cp_state_attr", None),
+        )
 
 
 def register_external_state_classes(generated_module: Any, class_names: Any) -> None:
@@ -703,6 +727,21 @@ def _is_external_state_inline_module(module: Any, generated_module: Any = None) 
         return False
     cls = type(module)
     return cls.__module__ == module_name and cls.__name__ in class_names
+
+
+def _is_inline_cp_module(module: Any) -> bool:
+    """Whether this instance's class carries the generated CP dispatch marker.
+
+    The inline CP subclass materializes at codegen time with the class
+    attribute ``_hp_inline_cp``: its ``forward`` dispatches between the
+    parent's compiled boundary and the family CP helper, reading the
+    ``self.cp_enable`` / ``self._hp_cp_mesh`` attributes the inline-state
+    binding installs — plus the family companion attribute its
+    ``_hp_cp_state_attr`` class constant declares — so it needs the inline
+    channel like an external-state class, while its parent's boundary
+    keeps installing normally.
+    """
+    return bool(getattr(type(module), "_hp_inline_cp", False))
 
 
 def _install_deferred_bias_pair(module: Any, spec: Any, *, lowered: bool) -> None:
@@ -1275,6 +1314,10 @@ def hp_apply_inner_wrapper(
         spec = _FrozenBoundarySpec(entry, rule)
         module = _resolve_module(model, fqn)
         if _is_external_state_inline_module(module, generated_module):
+            continue
+        if _is_inline_cp_module(module):
+            # The generated CP dispatch shell already owns the CP path for
+            # this module; wrapping it again would apply CP twice.
             continue
         # The applier's boundary loop runs _resolve_local_compute_fn even for
         # inner-wrap boundaries, and the preflight fails fast on a missing
