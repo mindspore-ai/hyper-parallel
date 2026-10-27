@@ -86,6 +86,9 @@ compile:
   enabled: false
 
 dataset:
+  model_assets:
+    _target_: hyper_parallel.data.omni.omni_transform.build_auto_processor
+    pretrained_model_name_or_path: path/to/model_weights
   _target_: hyper_parallel.data.omni.build_dataset.build_online_omni_mapping_dataset
   # JSON/JSONL messages with image paths, or Parquet messages + images[].bytes/path.
   data_path: /home/chaoran/datasets/llava_1k_en/messages.jsonl
@@ -97,11 +100,11 @@ dataset:
 dataloader:
   _target_: hyper_parallel.data.batching.FixedBatchDataLoader
   collate_fn:
-    _target_: hyper_parallel.data.omni.collator.OmniCollator
+    _target_: hyper_parallel.data.batching.build_omni_collate_fn
   get_batch:
     _target_: hyper_parallel.models.qwen3_5_moe.vlm_cp.QwenVLMParallelBatch
     sequence_alignment: 128
-  dataloader_type: cyclic
+  sampler_type: cyclic
   data_sharding: false
   drop_last: true
   use_background_prefetcher: false
@@ -139,5 +142,5 @@ checkpoint:
 
 debug:
   check_nan_inf: false
-profiling:
-  enabled: false
+profiler:
+  enable: false

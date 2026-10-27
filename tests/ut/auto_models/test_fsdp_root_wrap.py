@@ -29,7 +29,7 @@ from hyper_parallel.core.fully_shard.api import HSDPModule
 from hyper_parallel.distributed._builder import fsdp_adapter
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 from hyper_parallel.models.build_options import FSDP2Config
-from hyper_parallel.trainer.config.manager import parse_training_args
+from hyper_parallel.trainer.config.parser import parse_training_args
 
 
 def _make_model(tied: bool = False) -> nn.Module:

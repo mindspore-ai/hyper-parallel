@@ -24,7 +24,7 @@ from typing import Any
 from unittest.mock import patch
 
 from examples.qwen3_8.tools.validate_chat_templates import main, parse_args, scan_dataset, validate_record
-from hyper_parallel.data.text.build_data_transform import TextConversationTransform
+from hyper_parallel.data.text.text_transform import TextConversationTransform
 from hyper_parallel.data.text.chat_template import TokenizerTemplate
 from tests.ut.data.conftest import FakeTokenizer, PrefixRewritingTokenizer
 

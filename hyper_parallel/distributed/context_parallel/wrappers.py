@@ -92,7 +92,7 @@ import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 import torch.nn.functional as F
 from torch.nn import Module
 
-from hyper_parallel.distributed import _collectives
+from hyper_parallel.core.utils import communication as _collectives
 from hyper_parallel.distributed._builder.forward_rewriter import (
     _ForwardRewriteRequest,
 )

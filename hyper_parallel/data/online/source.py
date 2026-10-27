@@ -16,11 +16,12 @@
 
 from __future__ import annotations
 
+import glob
 import os
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, TypeAlias
 
-from hyper_parallel.data.constants import ONLINE_FILE_FORMATS, ONLINE_SPLIT_NAMES, ONLINE_STOPPING_STRATEGIES
+from hyper_parallel.data.constants import ONLINE_FILE_FORMATS, ONLINE_SOURCE_PATH_KEY, ONLINE_SPLIT_NAMES, ONLINE_STOPPING_STRATEGIES
 
 OnlinePathSpec: TypeAlias = str | Sequence[str]
 OnlineDataPath: TypeAlias = OnlinePathSpec | Mapping[str, OnlinePathSpec]
@@ -169,13 +170,16 @@ class _OnlineLeafSourceLoader:
                     selected_splits.append(split_expression)
             selected_split = selected_splits
 
-        loaded_dataset = load_dataset(
-            load_dataset_path,
-            **load_options,
-            split=selected_split,
-            streaming=streaming,
-            cache_dir=self.data_config.get("cache_dir"),
-        )
+        if load_dataset_path == "parquet" and "data_files" in load_options and not streaming:
+            loaded_dataset = self._load_local_parquet(load_options["data_files"], selected_split)
+        else:
+            loaded_dataset = load_dataset(
+                load_dataset_path,
+                **load_options,
+                split=selected_split,
+                streaming=streaming,
+                cache_dir=self.data_config.get("cache_dir"),
+            )
 
         if filter_before_ratio_split:
             filtered_dataset = loaded_dataset.filter(sample_filter)
@@ -213,6 +217,48 @@ class _OnlineLeafSourceLoader:
 
         filtered_dataset = dataset_result.filter(sample_filter)
         return filtered_dataset
+
+    def _load_local_parquet(self, data_files: Any, selected_split: str | list[str]) -> Any:
+        """Preserve per-file media roots through filtering and split selection."""
+        from datasets import ReadInstruction, concatenate_datasets, load_dataset  # pylint: disable=C0415
+
+        files_by_split = data_files if isinstance(data_files, Mapping) else {"train": data_files}
+        if any("://" in path for paths in files_by_split.values() for path in paths):
+            return load_dataset(
+                "parquet", data_files=data_files, split=selected_split,
+                cache_dir=self.data_config.get("cache_dir"),
+            )
+        datasets_by_split = {}
+        for split_name, paths in files_by_split.items():
+            source_datasets = []
+            for path_pattern in paths:
+                matching_paths = sorted(glob.glob(path_pattern)) or [path_pattern]
+                for source_path in matching_paths:
+                    source = load_dataset(
+                        "parquet", data_files=source_path, split="train",
+                        cache_dir=self.data_config.get("cache_dir"),
+                    )
+                    if ONLINE_SOURCE_PATH_KEY in source.column_names:
+                        source = source.remove_columns(ONLINE_SOURCE_PATH_KEY)
+                    source = source.add_column(
+                        ONLINE_SOURCE_PATH_KEY, [os.path.abspath(source_path)] * len(source),
+                    )
+                    source_datasets.append(source)
+            datasets_by_split[split_name] = concatenate_datasets(source_datasets)
+
+        split_lengths = {name: len(dataset) for name, dataset in datasets_by_split.items()}
+        selections = [selected_split] if isinstance(selected_split, str) else selected_split
+        selected_datasets = []
+        for selection in selections:
+            instructions = ReadInstruction.from_spec(selection).to_absolute(split_lengths)
+            parts = []
+            for instruction in instructions:
+                source = datasets_by_split[instruction.splitname]
+                start = instruction.from_ or 0
+                end = len(source) if instruction.to is None else instruction.to
+                parts.append(source.select(range(start, end)))
+            selected_datasets.append(concatenate_datasets(parts))
+        return selected_datasets[0] if isinstance(selected_split, str) else selected_datasets
 
     def _build_load_request(
         self,

@@ -17,11 +17,11 @@
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from hyper_parallel.data.batching.build_collate_fn import DataCollator, TextPackingCollator
-from hyper_parallel.data.batching.get_batch import ParallelBatch
+from hyper_parallel.data.batching.build_collate_fn import TextPackingCollator
+from hyper_parallel.data.batching.get_batch import TextParallelBatch
 
 
-class GDNCPDataCollator(DataCollator):
+class GDNCPDataCollator:
     """Right-pad one conversation so every CP shard contains whole GDN chunks.
 
     Independent conversations cannot be packed: attention masking alone does
@@ -55,7 +55,7 @@ class GDNCPDataCollator(DataCollator):
         return batch
 
 
-class GDNCPParallelBatch(ParallelBatch):
+class GDNCPParallelBatch(TextParallelBatch):
     """Use contiguous token shards and delegate causal masking to the CP wrapper.
 
     This pairs with GDNCPDataCollator and sdpa_hf. A mask dictionary bypasses
@@ -64,9 +64,9 @@ class GDNCPParallelBatch(ParallelBatch):
     right-padded causal stream. Neither path supports cached decoding here.
     """
 
-    def _build_attention_data(self, parallel_batch: Mapping[str, Any]) -> tuple[Any, None, None]:
+    def _build_runtime_inputs(self, parallel_batch: Mapping[str, Any]) -> dict[str, Any]:
         """Reject packing and produce the two HF Qwen3.5 layer-mask entries."""
-        if self.attention_mode != "dense" or not self.causal or self.sliding_window is not None:
+        if self.attention_runtime.mode != "dense" or not self.causal or self.sliding_window is not None:
             raise ValueError("GDN P2P batches require dense full causal attention without sliding_window")
         if self.parallel_context.tp_world_size != 1:
             raise NotImplementedError("GDN P2P batches currently require tp_size=1")
@@ -74,4 +74,4 @@ class GDNCPParallelBatch(ParallelBatch):
             raise ValueError("GDN P2P batches require one conversation; use GDNCPDataCollator")
         if parallel_batch["input_ids"].shape[1] % 64:
             raise ValueError("GDN Triton CP requires local sequence length divisible by 64")
-        return {"full_attention": None, "linear_attention": None}, None, None
+        return {"attention_mask": {"full_attention": None, "linear_attention": None}}

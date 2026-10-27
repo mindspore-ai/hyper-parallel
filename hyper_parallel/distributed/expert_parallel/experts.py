@@ -850,11 +850,11 @@ def _aggregate_ep_outputs(
     )
     token_count = output_shape[0] * output_shape[1]
     topk_weights = expert_weights.view(token_count, -1)
-    output = moe_token_unpermute(
-        combined_outputs,
-        unpermute_mapping,
-        topk_weights,
-    )
+    if combined_outputs.device.type == "npu":
+        output = moe_token_unpermute(combined_outputs, unpermute_mapping, topk_weights)
+    else:
+        restored = combined_outputs[unpermute_mapping.long()].view(token_count, -1, output_shape[-1])
+        output = (restored * topk_weights.unsqueeze(-1)).sum(dim=1)
     return output.view(*output_shape)
 
 

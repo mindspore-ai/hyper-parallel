@@ -40,7 +40,7 @@ import yaml
 
 import hyper_parallel
 from hyper_parallel.data.constants import IGNORE_INDEX
-from hyper_parallel.data.text.build_data_transform import (
+from hyper_parallel.data.text.text_transform import (
     TextConversationTransform,
     _normalize_conversation,
     _normalize_tools,

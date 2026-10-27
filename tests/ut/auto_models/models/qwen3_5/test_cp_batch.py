@@ -27,7 +27,7 @@ from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.data.parallel.dataloader_parallel import DataLoaderParallelContext
 from hyper_parallel.distributed.context_parallel import wrappers
 from hyper_parallel.models.qwen3_5.cp_batch import GDNCPDataCollator, GDNCPParallelBatch
-from hyper_parallel.trainer.config.resolver import resolve_root
+from hyper_parallel.trainer.config.resolver import resolve_config
 
 
 class TestGDNCPBatch(unittest.TestCase):
@@ -109,7 +109,7 @@ class TestGDNCPBatch(unittest.TestCase):
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         # Resolve the actual CP/batch entries without loading dataset C++ helpers
         # or model assets, neither of which belongs to this CPU contract test.
-        config = resolve_root({
+        config = resolve_config({
             "model": {"_target_": "torch.nn.Identity"},
             "optimizer": {"_target_": "torch.optim.AdamW", "lr": 1e-3},
             **{name: raw[name] for name in ("training", "accelerator", "dataloader", "plan_overrides")},

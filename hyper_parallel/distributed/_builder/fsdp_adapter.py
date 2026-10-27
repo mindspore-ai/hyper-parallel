@@ -802,11 +802,11 @@ def _instantiate_fsdp2(
 
 
 def _apply_fsdp2(
-    model: "nn.Module",
+    model: ModuleClass,
     fsdp2_manager: Any,
     source_shard_info: Any,
     ignored_params: set[ParameterClass] | None = None,
-) -> "nn.Module":
+) -> ModuleClass:
     """Apply FSDP2; Torch scheduler hooks remain outside Dynamo by design.
 
     Moved from ``_transformers/infrastructure.py`` (05 §15.2.1) so the FSDP

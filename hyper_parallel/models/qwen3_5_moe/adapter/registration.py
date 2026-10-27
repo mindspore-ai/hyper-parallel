@@ -59,7 +59,6 @@ QWEN3_5_MOE_ADAPTER_SPEC = ModelAdapterSpec(
     loss=_load_vlm_loss,
     encoder_parallel=_load_encoder_parallel,
     sharding_rules=_load_sharding_rules,
-    replicated_subtrees=("model.visual",),
 )
 
 QWEN3_5_MOE_TEXT_ADAPTER_SPEC = ModelAdapterSpec(

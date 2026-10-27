@@ -21,10 +21,10 @@ from typing import Any
 
 import torch
 
-from hyper_parallel.data.text.build_data_transform import (
+from hyper_parallel.data.text.text_transform import (
     TextConversationTransform,
     TextInstructionTransform,
-    build_llm_data_transform,
+    build_text_transform,
 )
 
 
@@ -252,7 +252,7 @@ class TestTextInstructionTransform(unittest.TestCase):
     def test_invalid_instruction_configuration_and_samples_raise_value_error(self):
         """Reject missing mappings, required values, and non-string input fields."""
         with self.assertRaises(ValueError):
-            build_llm_data_transform(
+            build_text_transform(
                 "instruction",
                 chat_template=_RecordingChatTemplate(),
                 max_seq_len=32,

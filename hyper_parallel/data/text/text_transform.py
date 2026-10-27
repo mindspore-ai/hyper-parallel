@@ -180,10 +180,16 @@ class PlaintextTransform:
 
         transformed = []
         for start in range(0, len(token_ids) - 1, self.max_seq_len):
-            text = torch.tensor(
-                token_ids[start:start + self.max_seq_len + 1],
-                dtype=torch.int64,
-            )
+            window = token_ids[start:start + self.max_seq_len + 1]
+            if (self.drop_ragged_tail and start > 0
+                    and len(window) < self.max_seq_len + 1):
+                # Opt-in for models whose packed-sample boundaries must stay
+                # aligned, such as the V4.1 CSA compression ratio and the
+                # context-parallel shard size: a short tail window violates
+                # both once it lands in a batch. Off by default, so every
+                # other model keeps the trailing partial window.
+                break
+            text = torch.tensor(window, dtype=torch.long)
             model_sample = {
                 "input_ids": text[:-1],
                 "labels": text[1:],

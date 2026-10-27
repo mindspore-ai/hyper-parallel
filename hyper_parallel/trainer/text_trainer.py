@@ -222,6 +222,16 @@ class TextTrainer:
         )
 
     def forward_backward_step(
+            self, data_iterator: Any, num_micro_steps: int,
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Fetch and execute one micro-step through the existing trainer API."""
+        training_batch = self.base.get_batch(data_iterator)
+        self.base.step_token_counts = {
+            name: count * num_micro_steps for name, count in count_loss_token(training_batch[1]).items()
+        }
+        return self._forward_backward_prepared(training_batch)
+
+    def _forward_backward_prepared(
             self,
             training_batch: tuple[dict[str, Any], dict[str, Any]],
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -277,10 +287,12 @@ class TextTrainer:
                 num_micro_steps,
             )
             self.base.begin_fsdp_runtime_diagnostics(micro_step)
-            loss, loss_dict = self.forward_backward_step(
+            loss, loss_dict = self._forward_backward_prepared(
                 training_batch,
             )
 
+            training_batches[micro_step] = None
+            del training_batch
             total_loss += loss.item()
             for loss_name, loss_value in loss_dict.items():
                 total_loss_dict[loss_name] += loss_value.item()

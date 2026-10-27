@@ -24,7 +24,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from torch.utils.data import DataLoader
 
-from hyper_parallel.data.omni.build_dataset import OmniMappingDataset, build_online_omni_mapping_dataset
+from hyper_parallel.data.omni.build_dataset import build_online_omni_mapping_dataset
 from hyper_parallel.data.omni.omni_transform import OmniDataTransform
 from tests.common.mark_utils import arg_mark
 from tests.ut.data.omni.test_omni_transform import image_bytes
@@ -61,7 +61,7 @@ class TestOmniParquet(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "samples.parquet"
             pq.write_table(pa.Table.from_pylist(records), path, row_group_size=2)
-            dataset = OmniMappingDataset(str(path), PreparedTransform())
+            dataset = build_online_omni_mapping_dataset(data_path=str(path), data_config={"shuffle": False, "cache_dir": str(Path(tmp) / "cache")}, transform=PreparedTransform())
             self.assertEqual(len(dataset), 3)
             for index, source_id in ((2, 3), (0, 0), (1, 2), (-1, 3)):
                 row = dataset[index]
@@ -94,7 +94,7 @@ class TestOmniParquet(unittest.TestCase):
                         "images": [{"bytes": None, "path": "images/a.png"}]}]
             pq.write_table(pa.Table.from_pylist(records), path)
             train, valid, test = build_online_omni_mapping_dataset(
-                data_path={"train": str(path), "valid": str(path)}, transform=PreparedTransform(),
+                data_path={"train": str(path), "valid": str(path)}, data_config={"cache_dir": str(Path(tmp) / "cache")}, transform=PreparedTransform(),
             )
             self.assertIsNone(test)
             self.assertEqual(len(train), len(valid))
@@ -102,39 +102,22 @@ class TestOmniParquet(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_no_valid_rows_is_rejected(self):
+    def test_no_valid_rows_returns_empty_source(self):
         """Verify the empty-source contract.
 
         Feature: Parquet source validation.
         Description: Build a source containing only empty conversations.
-        Expectation: Construction raises a descriptive error.
+        Expectation: Construction preserves the shared source empty-dataset contract.
         """
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "empty.parquet"
             pq.write_table(pa.Table.from_pylist([{"messages": []}]), path)
-            with self.assertRaisesRegex(ValueError, "no valid records"):
-                OmniMappingDataset(str(path), PreparedTransform())
+            dataset = build_online_omni_mapping_dataset(
+                data_path=str(path), data_config={"shuffle": False, "cache_dir": str(Path(tmp) / "cache")},
+                transform=PreparedTransform(),
+            )
+            self.assertIsNone(dataset)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_index_offsets_across_batches_and_group_cache(self):
-        """Verify scan offsets and bounded caching.
-
-        Feature: Parquet row-group cache.
-        Description: Read rows across scan-batch and row-group boundaries.
-        Expectation: Indices are correct and adjacent rows reuse the cached group.
-        """
-        records = [{"id": index, "messages": [{"content": "text"}]} for index in range(600)]
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "large.parquet"
-            pq.write_table(pa.Table.from_pylist(records), path, row_group_size=400)
-            dataset = OmniMappingDataset(str(path), PreparedTransform())
-            with patch("pyarrow.parquet.ParquetFile", wraps=pq.ParquetFile) as opened:
-                self.assertEqual(dataset[300]["id"], 300)
-                self.assertEqual(dataset[399]["id"], 399)
-                self.assertEqual(opened.call_count, 1)
-                self.assertEqual(dataset[400]["id"], 400)
-                self.assertEqual(opened.call_count, 2)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -150,8 +133,38 @@ class TestOmniParquet(unittest.TestCase):
             path = Path(tmp) / "image.parquet"
             pq.write_table(pa.Table.from_pylist([record]), path)
             with patch("PIL.Image.open", side_effect=OSError("decode reached")) as decode:
-                dataset = OmniMappingDataset(str(path), PreparedTransform())
+                dataset = build_online_omni_mapping_dataset(data_path=str(path), data_config={"shuffle": False, "cache_dir": str(Path(tmp) / "cache")}, transform=PreparedTransform())
                 decode.assert_not_called()
                 with self.assertRaisesRegex(ValueError, r"images\[0\]"):
                     _ = dataset[0]
                 decode.assert_called_once()
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_multiple_file_roots_survive_ratio_split(self):
+        """Verify file provenance across source composition.
+
+        Feature: Multi-file Parquet source paths.
+        Description: Split files in different directories after filtering.
+        Expectation: Each image resolves against its own source directory.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            for name in ("a", "b"):
+                directory = Path(tmp) / name
+                directory.mkdir()
+                path = directory / "data.parquet"
+                records = [{"messages": [{"role": "user", "content": "<image>"}],
+                            "images": [{"bytes": None, "path": "image.png"}]}]
+                pq.write_table(pa.Table.from_pylist(records), path)
+                paths.append(str(path))
+            train, valid, test = build_online_omni_mapping_dataset(
+                data_path=paths,
+                data_config={"shuffle": False, "split": "50,50,0", "cache_dir": str(Path(tmp) / "cache")},
+                transform=PreparedTransform(),
+            )
+            self.assertIsNone(test)
+            for dataset, name in ((train, "a"), (valid, "b")):
+                self.assertEqual(len(dataset), 1)
+                self.assertEqual(dataset[0]["messages"][0]["content"][0]["image"],
+                                 str(Path(tmp) / name / "image.png"))

@@ -404,6 +404,8 @@ class AutoProcessorTransform(OmniDataTransform):
         # Single-sample token fields: [1, L] -> [L]; media tensors keep the processor layout.
         for field in OMNI_CP_TOKEN_FIELDS.intersection(encoded_sample):
             encoded_sample[field] = encoded_sample[field].squeeze(0)
+        if not bool(labels[1:].ne(IGNORE_INDEX).any()):
+            raise ValueError("Omni sample has no supervised assistant tokens")
         encoded_sample["labels"] = labels
         return encoded_sample
 

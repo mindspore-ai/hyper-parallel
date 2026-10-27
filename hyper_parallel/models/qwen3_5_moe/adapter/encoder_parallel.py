@@ -236,6 +236,8 @@ class QwenVisionBridge:
         @wraps(original_forward)
         def forward(*args: Any, **kwargs: Any) -> Any:
             """Run encoder work under the outer FSDP call and retain dummy gradients."""
+            if "vlm_cp_inputs" in kwargs:
+                return original_forward(*args, **kwargs)
             plan = kwargs.pop("encoder_parallel_plan", None)
             if plan is None:
                 return original_forward(*args, **kwargs)

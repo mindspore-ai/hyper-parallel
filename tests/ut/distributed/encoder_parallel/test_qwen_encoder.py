@@ -155,25 +155,24 @@ class TestQwenEncoder(unittest.TestCase):
 
     def test_default_disabled_and_visual_only_provider(self):
         """Description: default config. Expectation: visual FSDP only, no encoder runtime."""
-        config = resolve_component({}, expected_type=AcceleratorConfig, path="accelerator")
+        config = resolve_component({}, annotation=AcceleratorConfig, path="accelerator")
         self.assertFalse(config.encoder_parallel.enabled)
         enabled_config = resolve_component({"encoder_parallel": {"enabled": True, "encoder_cp_size": 2}},
-                                           expected_type=AcceleratorConfig, path="accelerator")
+                                           annotation=AcceleratorConfig, path="accelerator")
         self.assertEqual(enabled_config.encoder_parallel, EncoderParallelConfig(True, 2))
         self.assertIsNone(build_encoder_parallel_runtime(config=config.encoder_parallel, mesh_context=None,
                                                          model=None, model_adapter_spec=None, execution_options=None))
         model = make_model()
-        self.assertEqual(ShardingPlanner()._encoder_isolated_roots(model, "qwen3_5_moe"), ("model.visual",))
-        enabled = ShardingPlanner(encoder_parallel_enabled=True)
-        self.assertEqual(enabled._encoder_isolated_roots(model, "qwen3_5_moe"), ("model.visual",))
-        with self.assertRaises(ValueError):
-            enabled._encoder_isolated_roots(model, "qwen3_5_moe_text")
+        self.assertEqual(ShardingPlanner()._resolve_isolated_roots(model, "qwen3_5_moe"), ("model.visual",))
+        enabled = ShardingPlanner()
+        self.assertEqual(enabled._resolve_isolated_roots(model, "qwen3_5_moe"), ("model.visual",))
+        self.assertEqual(enabled._resolve_isolated_roots(model, "qwen3_5_moe_text"), ())
 
     def test_visual_plan_is_parameter_only(self):
         """Description: enabled visual isolation. Expectation: no decoder boundary or special handlers."""
         mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("tp",), rank_list=(0, 1), init_backend=False)
         try:
-            plan = ShardingPlanner(encoder_parallel_enabled=True).plan(make_model(), mesh, tp_size=2)
+            plan = ShardingPlanner().plan(make_model(), mesh, tp_size=2)
             self.assertEqual(set(plan.modules), {"model.visual"})
             self.assertFalse(plan.modules["model.visual"].is_boundary)
             self.assertFalse(plan.special_handlers)
@@ -229,9 +228,9 @@ class TestQwenEncoder(unittest.TestCase):
     def test_text_model_has_no_visual_isolation(self):
         """Description: text-only adapter. Expectation: no new source-layout declarations."""
         model = nn.Module()
-        self.assertEqual(ShardingPlanner()._encoder_isolated_roots(model, "qwen3_5_moe_text"), ())
-        self.assertEqual(ShardingPlanner()._encoder_isolated_roots(model, "qwen3_5_text"), ())
-        self.assertEqual(ShardingPlanner(derive=False)._encoder_isolated_roots(model, "qwen3_5_moe"), ())
+        self.assertEqual(ShardingPlanner()._resolve_isolated_roots(model, "qwen3_5_moe_text"), ())
+        self.assertEqual(ShardingPlanner()._resolve_isolated_roots(model, "qwen3_5_text"), ())
+        self.assertEqual(ShardingPlanner(derive=False)._resolve_isolated_roots(model, "qwen3_5_moe"), ())
 
     def test_forward_feature_insertion_and_context_cleanup(self):
         """Description: route features through native call site. Expectation: no rerun; graph retained."""
@@ -283,7 +282,9 @@ class TestQwenEncoder(unittest.TestCase):
             )
             batch = {"input_ids": torch.tensor([[1, 99, 2]]), "pixel_values": torch.randn(4, 8),
                      "image_grid_thw": torch.tensor([[1, 2, 2]])}
-            adapted = EncoderParallelInputAdapter(runtime).build(batch=batch, parallel_context=None)
+            adapted = EncoderParallelInputAdapter(runtime=runtime, inner=None).build(
+                batch=batch, parallel_context=SimpleNamespace(tp_rank=0, cp_rank=0, tp_world_size=1, cp_world_size=1),
+            )
             plan = adapted["encoder_parallel_plan"]
 
             def encode(inputs: dict[str, torch.Tensor], segments: tuple[EncoderSegment, ...]) -> torch.Tensor:

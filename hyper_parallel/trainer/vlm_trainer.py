@@ -146,6 +146,15 @@ class VLMTrainer:
             raise ValueError("dataloader.get_batch must define a batching runtime target")
         if getattr(config.dataloader.get_batch, "encoder_parallel", None) is not None:
             raise ValueError("encoder_parallel belongs under accelerator, not dataloader.get_batch")
+        get_batch = config.dataloader.get_batch.build(
+            mesh_context=self.base.mesh,
+            device=self.base.device,
+            data_config=getattr(config.dataset, "data_config", {}),
+            pp_shared_data=bool(getattr(config.dataloader, "pp_shared_data", False)),
+        )
+        bind_model = getattr(get_batch, "bind_model", None)
+        if callable(bind_model):
+            bind_model(self.base.model)
         encoder_runtime = build_encoder_parallel_runtime(
             config=config.accelerator.encoder_parallel,
             mesh_context=self.base.mesh,
@@ -160,19 +169,10 @@ class VLMTrainer:
                 "validate_placement": bool(getattr(config.model, "validate_placement", False)),
             },
         )
-        get_batch = config.dataloader.get_batch.build(
-            mesh_context=self.base.mesh,
-            device=self.base.device,
-            data_config=getattr(config.dataset, "data_config", {}),
-            pp_shared_data=bool(getattr(config.dataloader, "pp_shared_data", False)),
-        )
         if encoder_runtime is not None:
             if not isinstance(get_batch, OmniParallelBatch):
                 raise ValueError("encoder parallel requires OmniParallelBatch")
             get_batch.batch_transport = EncoderParallelBatchTransport(runtime=encoder_runtime)
-        bind_model = getattr(get_batch, "bind_model", None)
-        if callable(bind_model):
-            bind_model(self.base.model)
         if encoder_runtime is not None:
             install_forward = getattr(encoder_runtime.bridge, "install_forward", None)
             if callable(install_forward):

@@ -21,7 +21,7 @@ from pathlib import Path
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-from hyper_parallel.models._transformers import CheckpointManager
+from hyper_parallel.models._transformers.checkpoint_loader import CheckpointManager
 
 logger = logging.getLogger(__name__)
 

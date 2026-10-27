@@ -20,7 +20,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from hyper_parallel.components.checkpoint.config import CheckpointingConfig
 from hyper_parallel.trainer.callbacks.base import TrainerState
@@ -50,7 +50,7 @@ class TestCheckpointCallback(unittest.TestCase):
                 )
             ),
             mesh=None,
-            model=MagicMock(),
+            model=SimpleNamespace(),
         )
         with patch(
                 "hyper_parallel.trainer.callbacks.checkpoint_callback.build_checkpointer"

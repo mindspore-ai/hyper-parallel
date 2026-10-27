@@ -31,7 +31,7 @@ from typing import Any
 
 from hyper_parallel.data.dataset_logging import DatasetLogger
 from hyper_parallel.data.text import chat_template
-from hyper_parallel.data.text.build_data_transform import TextConversationTransform, _normalize_conversation
+from hyper_parallel.data.text.text_transform import TextConversationTransform, _normalize_conversation
 
 from tests.common.mark_utils import arg_mark
 from tests.ut.data.conftest import (

@@ -27,7 +27,8 @@ and :class:`CheckpointManager` exports such a model back to Transformers format.
 
 import logging
 import re
-from copy import copy
+from collections import defaultdict
+from copy import copy, deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional

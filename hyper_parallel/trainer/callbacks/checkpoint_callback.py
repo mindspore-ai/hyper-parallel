@@ -33,7 +33,7 @@ from hyper_parallel.components.checkpoint.dcp_checkpointer import (
 from hyper_parallel.components.optim.mixed_precision_optimizer import (
     MixedPrecisionOptimizer,
 )
-from hyper_parallel.models._transformers import CheckpointManager
+from hyper_parallel.models._transformers.checkpoint_loader import CheckpointManager
 from hyper_parallel.core.distributed_checkpoint.utils import flatten_state_dict
 from hyper_parallel.models._transformers.model_builder import (
     validate_model_init_dtype,

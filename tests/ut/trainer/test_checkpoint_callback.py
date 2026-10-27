@@ -382,6 +382,8 @@ def _bare_callback(trainer: SimpleNamespace) -> Any:
     callback._save_train_state = True
     callback._save_extra_state_per_rank = True
     callback._checkpoint_dir = "unused"
+    callback._save_total_limit = None
+    callback._save_hf_weights = False
     callback._restore_optimizer = True
     callback._restore_train_state = False
     callback.checkpointer = MagicMock()

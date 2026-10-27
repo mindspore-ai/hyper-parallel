@@ -31,7 +31,7 @@ class TestHuggingFaceCheckpointCallback(unittest.TestCase):
     @staticmethod
     def _build_trainer(checkpoint_config: CheckpointingConfig) -> SimpleNamespace:
         """Build the minimum Trainer surface consumed by the callback."""
-        model = MagicMock()
+        model = MagicMock(spec=["state_dict"])
         model.state_dict.return_value = {"weight": MagicMock()}
         tokenizer = MagicMock()
         return SimpleNamespace(

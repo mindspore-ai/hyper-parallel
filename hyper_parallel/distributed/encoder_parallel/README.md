@@ -1,9 +1,7 @@
 # Experimental visual encoder parallelism
 
-This selectively ports the model-neutral runtime from
-[upstream PR #1132](https://github.com/mindspore-ai/hyper-parallel/pull/1132).
-It does not include DeepSeek-V4.1, Engram, or the upstream data/trainer rewrite.
-The existing text and Omni default configurations remain disabled.
+The model-neutral runtime follows master. This branch adds the Qwen vision
+bridge and its feature/gradient tests. Encoder parallelism remains opt-in.
 
 ## Execution
 
@@ -34,8 +32,8 @@ Initial supported inputs/modes:
 
 - Images with `T=1`, positive grids divisible by `spatial_merge_size`.
 - One unpacked sample per microbatch, including multiple images or no image.
-- Decoder `CP=1`, `sequence_parallel=false`, `loss_parallel=false`, `PP=1`.
-- Encoder-CP divides decoder TP and all visual Q/K/V head counts.
+- Decoder `PP=1`; decoder CP requires the Qwen VLM batch/runtime adapter.
+- Encoder-CP divides decoder CP × TP and all visual Q/K/V head counts.
 - FSDP may wrap visual child modules and the outer model, but must not
   wrap `model.visual` or `model` as a separate unit: the bridge executes
   visual children before the native backbone forward.
@@ -44,15 +42,14 @@ Initial supported inputs/modes:
 - Requires the HF Qwen3.5-MoE vision implementation exposing
   `transformers.vision_utils` (the CPU oracle uses Transformers 5.13).
 
-This is not a claim of full-model NPU/FSDP training qualification. In
-particular, decoder CP/SP image insertion requires a separate adapter.
+This is not a claim of full-model NPU/FSDP training qualification. Decoder CP/SP image insertion is supplied by the Qwen VLM adapter.
 Do not enable this configuration for an existing long run without a
 full-model baseline comparison.
 
 ## Configuration and tests
 
-See `examples/qwen3_6_moe/train_online_vlm_encoder_parallel.yaml` for an
-independent eight-rank example. It does not replace `train_online_vlm.yaml`.
+Start with `examples/qwen3_6_moe/train_online_vlm.yaml` and explicitly enable
+encoder parallelism when the intended configuration satisfies adapter validation:
 
 ```yaml
 accelerator:
@@ -64,8 +61,9 @@ accelerator:
     encoder_cp_size: 1  # Encoder-DP=2; use 2 for Encoder-CP=2 instead
 ```
 
-The example also declares the visual attention replacement. Enabling the
-runtime without that replacement is an error, not an implicit fallback.
+Also declare the Qwen visual attention replacement from
+`hyper_parallel.models.qwen3_5_moe.adapter.encoder_parallel.replace_vision_attention`.
+Enabling the runtime without that replacement is an error.
 
 ```bash
 python -m pytest -q tests/ut/distributed/encoder_parallel

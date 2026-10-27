@@ -75,7 +75,7 @@ def _compare(encoder_parallel: bool) -> None:
                                              model=model, spec=get_encoder_parallel_spec(),
                                              execution_options={"micro_batch_size": 1})
             runtime.bridge.install_forward()
-            batcher.runtime_input_adapter = EncoderParallelInputAdapter(runtime)
+            batcher.runtime_input_adapter = EncoderParallelInputAdapter(runtime=runtime, inner=None)
         for image_start, supervised_start in ((62, 2), (5, 65)):
             model.zero_grad(set_to_none=True)
             oracle.zero_grad(set_to_none=True)
