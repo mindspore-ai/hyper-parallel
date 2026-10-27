@@ -135,7 +135,8 @@ class TestSwigluPlanCoverage(unittest.TestCase):
             with self.assertRaises(ValueError) as ctx:
                 planner.plan(model, mesh, tp_size=2, cp_size=1, ep_size=1,
                              sequence_parallel=False)
-        self.assertIn("HP-PLAN-004", str(ctx.exception))
+        self.assertIn("plan-time coverage check failed", str(ctx.exception))
+        self.assertIn("linear_fc1.weight", str(ctx.exception))
 
 
 if __name__ == "__main__":
