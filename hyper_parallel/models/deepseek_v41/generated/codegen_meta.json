@@ -380,6 +380,717 @@
     "module_overrides": true,
     "sharding_plan": true
   },
+  "emission_patches": {
+    "inner_wrappers": [],
+    "local_computes": [
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.27.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.13.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.3.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.15.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.36.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.11.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.20.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.31.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.26.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.25.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.4.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.35.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.2.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.5.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.38.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.9.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.23.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.29.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.7.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.28.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.12.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.22.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.18.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.6.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.17.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.0.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.1.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.16.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.19.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.10.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.32.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.21.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.39.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.37.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.8.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.24.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.34.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.33.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.14.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_ep_compute_fn",
+        "module_fqn": "model.layers.30.mlp",
+        "module_type": "transformers.models.deepseek_v4.modeling_deepseek_v4:DeepseekV4SparseMoeBlock",
+        "original_forward": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:_v41_sparse_moe_forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_engram_compute_fn",
+        "module_fqn": "model.layers.1.engram",
+        "module_type": "hyper_parallel.components.modules.engram:EngramModule",
+        "original_forward": "hyper_parallel.components.modules.engram:EngramModule.forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel:deepseek_v41_engram_compute_fn",
+        "module_fqn": "model.layers.14.engram",
+        "module_type": "hyper_parallel.components.modules.engram:EngramModule",
+        "original_forward": "hyper_parallel.components.modules.engram:EngramModule.forward",
+        "region_dispatch": false
+      }
+    ],
+    "module_replacements": [
+      {
+        "module_fqn": "model.layers.0.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.0.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.1.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.1.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.2.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.2.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.3.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.3.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.4.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.4.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.5.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.5.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.6.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.6.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.7.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.7.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.8.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.8.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.9.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.9.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.10.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.10.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.11.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.11.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.12.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.12.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.13.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.13.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.14.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.14.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.15.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.15.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.16.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.16.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.17.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.17.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.18.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.18.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.19.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.19.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.20.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.20.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.21.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.21.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.22.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.22.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.23.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.23.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.24.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.24.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.25.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.25.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.26.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.26.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.27.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.27.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.28.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.28.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.29.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.29.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.30.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.30.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.31.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.31.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.32.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.32.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.33.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.33.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.34.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.34.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.35.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.35.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.36.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.36.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.37.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.37.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.38.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.38.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.39.attn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.39.ffn_hc",
+        "replacement_type": "hyper_parallel.components.modules.mhc:PipelinedMhcModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41PipelinedHyperConnection"
+      },
+      {
+        "module_fqn": "model.layers.1.engram",
+        "replacement_type": "hyper_parallel.components.modules.engram:EngramModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41Engram"
+      },
+      {
+        "module_fqn": "model.layers.14.engram",
+        "replacement_type": "hyper_parallel.components.modules.engram:EngramModule",
+        "source_type": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41Engram"
+      }
+    ]
+  },
   "entrypoints": {
     "parallelize": "hp_parallelize"
   },
@@ -476,51 +1187,6 @@
         "fix_router": false,
         "use_grouped_gemm": false
       },
-      "match": "model.layers.4.mlp"
-    },
-    {
-      "ep_size": 8,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
-        "fix_router": false,
-        "use_grouped_gemm": false
-      },
-      "match": "model.layers.19.mlp"
-    },
-    {
-      "ep_size": 8,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
-        "fix_router": false,
-        "use_grouped_gemm": false
-      },
-      "match": "model.layers.32.mlp"
-    },
-    {
-      "ep_size": 8,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
-        "fix_router": false,
-        "use_grouped_gemm": false
-      },
-      "match": "model.layers.9.mlp"
-    },
-    {
-      "ep_size": 8,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
-        "fix_router": false,
-        "use_grouped_gemm": false
-      },
-      "match": "model.layers.6.mlp"
-    },
-    {
-      "ep_size": 8,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
-        "fix_router": false,
-        "use_grouped_gemm": false
-      },
       "match": "model.layers.27.mlp"
     },
     {
@@ -530,7 +1196,7 @@
         "fix_router": false,
         "use_grouped_gemm": false
       },
-      "match": "model.layers.1.mlp"
+      "match": "model.layers.13.mlp"
     },
     {
       "ep_size": 8,
@@ -539,7 +1205,7 @@
         "fix_router": false,
         "use_grouped_gemm": false
       },
-      "match": "model.layers.31.mlp"
+      "match": "model.layers.3.mlp"
     },
     {
       "ep_size": 8,
@@ -548,34 +1214,7 @@
         "fix_router": false,
         "use_grouped_gemm": false
       },
-      "match": "model.layers.21.mlp"
-    },
-    {
-      "ep_size": 8,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
-        "fix_router": false,
-        "use_grouped_gemm": false
-      },
-      "match": "model.layers.5.mlp"
-    },
-    {
-      "ep_size": 8,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
-        "fix_router": false,
-        "use_grouped_gemm": false
-      },
-      "match": "model.layers.20.mlp"
-    },
-    {
-      "ep_size": 8,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
-        "fix_router": false,
-        "use_grouped_gemm": false
-      },
-      "match": "model.layers.37.mlp"
+      "match": "model.layers.15.mlp"
     },
     {
       "ep_size": 8,
@@ -602,7 +1241,7 @@
         "fix_router": false,
         "use_grouped_gemm": false
       },
-      "match": "model.layers.28.mlp"
+      "match": "model.layers.20.mlp"
     },
     {
       "ep_size": 8,
@@ -611,106 +1250,7 @@
         "fix_router": false,
         "use_grouped_gemm": false
       },
-      "match": "model.layers.0.mlp"
-    },
-    {
-      "ep_size": 8,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
-        "fix_router": false,
-        "use_grouped_gemm": false
-      },
-      "match": "model.layers.3.mlp"
-    },
-    {
-      "ep_size": 8,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
-        "fix_router": false,
-        "use_grouped_gemm": false
-      },
-      "match": "model.layers.2.mlp"
-    },
-    {
-      "ep_size": 8,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
-        "fix_router": false,
-        "use_grouped_gemm": false
-      },
-      "match": "model.layers.14.mlp"
-    },
-    {
-      "ep_size": 8,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
-        "fix_router": false,
-        "use_grouped_gemm": false
-      },
-      "match": "model.layers.22.mlp"
-    },
-    {
-      "ep_size": 8,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
-        "fix_router": false,
-        "use_grouped_gemm": false
-      },
-      "match": "model.layers.35.mlp"
-    },
-    {
-      "ep_size": 8,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
-        "fix_router": false,
-        "use_grouped_gemm": false
-      },
-      "match": "model.layers.10.mlp"
-    },
-    {
-      "ep_size": 8,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
-        "fix_router": false,
-        "use_grouped_gemm": false
-      },
-      "match": "model.layers.12.mlp"
-    },
-    {
-      "ep_size": 8,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
-        "fix_router": false,
-        "use_grouped_gemm": false
-      },
-      "match": "model.layers.7.mlp"
-    },
-    {
-      "ep_size": 8,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
-        "fix_router": false,
-        "use_grouped_gemm": false
-      },
-      "match": "model.layers.13.mlp"
-    },
-    {
-      "ep_size": 8,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
-        "fix_router": false,
-        "use_grouped_gemm": false
-      },
-      "match": "model.layers.30.mlp"
-    },
-    {
-      "ep_size": 8,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
-        "fix_router": false,
-        "use_grouped_gemm": false
-      },
-      "match": "model.layers.18.mlp"
+      "match": "model.layers.31.mlp"
     },
     {
       "ep_size": 8,
@@ -728,51 +1268,6 @@
         "fix_router": false,
         "use_grouped_gemm": false
       },
-      "match": "model.layers.16.mlp"
-    },
-    {
-      "ep_size": 8,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
-        "fix_router": false,
-        "use_grouped_gemm": false
-      },
-      "match": "model.layers.24.mlp"
-    },
-    {
-      "ep_size": 8,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
-        "fix_router": false,
-        "use_grouped_gemm": false
-      },
-      "match": "model.layers.33.mlp"
-    },
-    {
-      "ep_size": 8,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
-        "fix_router": false,
-        "use_grouped_gemm": false
-      },
-      "match": "model.layers.8.mlp"
-    },
-    {
-      "ep_size": 8,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
-        "fix_router": false,
-        "use_grouped_gemm": false
-      },
-      "match": "model.layers.23.mlp"
-    },
-    {
-      "ep_size": 8,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
-        "fix_router": false,
-        "use_grouped_gemm": false
-      },
       "match": "model.layers.25.mlp"
     },
     {
@@ -782,7 +1277,7 @@
         "fix_router": false,
         "use_grouped_gemm": false
       },
-      "match": "model.layers.34.mlp"
+      "match": "model.layers.4.mlp"
     },
     {
       "ep_size": 8,
@@ -791,7 +1286,7 @@
         "fix_router": false,
         "use_grouped_gemm": false
       },
-      "match": "model.layers.39.mlp"
+      "match": "model.layers.35.mlp"
     },
     {
       "ep_size": 8,
@@ -800,7 +1295,16 @@
         "fix_router": false,
         "use_grouped_gemm": false
       },
-      "match": "model.layers.15.mlp"
+      "match": "model.layers.2.mlp"
+    },
+    {
+      "ep_size": 8,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
+        "fix_router": false,
+        "use_grouped_gemm": false
+      },
+      "match": "model.layers.5.mlp"
     },
     {
       "ep_size": 8,
@@ -818,7 +1322,16 @@
         "fix_router": false,
         "use_grouped_gemm": false
       },
-      "match": "model.layers.17.mlp"
+      "match": "model.layers.9.mlp"
+    },
+    {
+      "ep_size": 8,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
+        "fix_router": false,
+        "use_grouped_gemm": false
+      },
+      "match": "model.layers.23.mlp"
     },
     {
       "ep_size": 8,
@@ -828,6 +1341,204 @@
         "use_grouped_gemm": false
       },
       "match": "model.layers.29.mlp"
+    },
+    {
+      "ep_size": 8,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
+        "fix_router": false,
+        "use_grouped_gemm": false
+      },
+      "match": "model.layers.7.mlp"
+    },
+    {
+      "ep_size": 8,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
+        "fix_router": false,
+        "use_grouped_gemm": false
+      },
+      "match": "model.layers.28.mlp"
+    },
+    {
+      "ep_size": 8,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
+        "fix_router": false,
+        "use_grouped_gemm": false
+      },
+      "match": "model.layers.12.mlp"
+    },
+    {
+      "ep_size": 8,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
+        "fix_router": false,
+        "use_grouped_gemm": false
+      },
+      "match": "model.layers.22.mlp"
+    },
+    {
+      "ep_size": 8,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
+        "fix_router": false,
+        "use_grouped_gemm": false
+      },
+      "match": "model.layers.18.mlp"
+    },
+    {
+      "ep_size": 8,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
+        "fix_router": false,
+        "use_grouped_gemm": false
+      },
+      "match": "model.layers.6.mlp"
+    },
+    {
+      "ep_size": 8,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
+        "fix_router": false,
+        "use_grouped_gemm": false
+      },
+      "match": "model.layers.17.mlp"
+    },
+    {
+      "ep_size": 8,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
+        "fix_router": false,
+        "use_grouped_gemm": false
+      },
+      "match": "model.layers.0.mlp"
+    },
+    {
+      "ep_size": 8,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
+        "fix_router": false,
+        "use_grouped_gemm": false
+      },
+      "match": "model.layers.1.mlp"
+    },
+    {
+      "ep_size": 8,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
+        "fix_router": false,
+        "use_grouped_gemm": false
+      },
+      "match": "model.layers.16.mlp"
+    },
+    {
+      "ep_size": 8,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
+        "fix_router": false,
+        "use_grouped_gemm": false
+      },
+      "match": "model.layers.19.mlp"
+    },
+    {
+      "ep_size": 8,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
+        "fix_router": false,
+        "use_grouped_gemm": false
+      },
+      "match": "model.layers.10.mlp"
+    },
+    {
+      "ep_size": 8,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
+        "fix_router": false,
+        "use_grouped_gemm": false
+      },
+      "match": "model.layers.32.mlp"
+    },
+    {
+      "ep_size": 8,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
+        "fix_router": false,
+        "use_grouped_gemm": false
+      },
+      "match": "model.layers.21.mlp"
+    },
+    {
+      "ep_size": 8,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
+        "fix_router": false,
+        "use_grouped_gemm": false
+      },
+      "match": "model.layers.39.mlp"
+    },
+    {
+      "ep_size": 8,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
+        "fix_router": false,
+        "use_grouped_gemm": false
+      },
+      "match": "model.layers.37.mlp"
+    },
+    {
+      "ep_size": 8,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
+        "fix_router": false,
+        "use_grouped_gemm": false
+      },
+      "match": "model.layers.8.mlp"
+    },
+    {
+      "ep_size": 8,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
+        "fix_router": false,
+        "use_grouped_gemm": false
+      },
+      "match": "model.layers.24.mlp"
+    },
+    {
+      "ep_size": 8,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
+        "fix_router": false,
+        "use_grouped_gemm": false
+      },
+      "match": "model.layers.34.mlp"
+    },
+    {
+      "ep_size": 8,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
+        "fix_router": false,
+        "use_grouped_gemm": false
+      },
+      "match": "model.layers.33.mlp"
+    },
+    {
+      "ep_size": 8,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
+        "fix_router": false,
+        "use_grouped_gemm": false
+      },
+      "match": "model.layers.14.mlp"
+    },
+    {
+      "ep_size": 8,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn",
+        "fix_router": false,
+        "use_grouped_gemm": false
+      },
+      "match": "model.layers.30.mlp"
     },
     {
       "ep_size": 8,
@@ -846,73 +1557,25 @@
   ],
   "materialized_patches": [
     {
-      "fqn": "model.layers.4.mlp",
-      "host_class": "DeepseekV4SparseMoeBlock",
-      "kind": "local_compute",
-      "source_form": "module_forward"
-    },
-    {
-      "fqn": "model.layers.19.mlp",
-      "host_class": "DeepseekV4SparseMoeBlock",
-      "kind": "local_compute",
-      "source_form": "module_forward"
-    },
-    {
-      "fqn": "model.layers.32.mlp",
-      "host_class": "DeepseekV4SparseMoeBlock",
-      "kind": "local_compute",
-      "source_form": "module_forward"
-    },
-    {
-      "fqn": "model.layers.9.mlp",
-      "host_class": "DeepseekV4SparseMoeBlock",
-      "kind": "local_compute",
-      "source_form": "module_forward"
-    },
-    {
-      "fqn": "model.layers.6.mlp",
-      "host_class": "DeepseekV4SparseMoeBlock",
-      "kind": "local_compute",
-      "source_form": "module_forward"
-    },
-    {
       "fqn": "model.layers.27.mlp",
       "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
       "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.1.mlp",
+      "fqn": "model.layers.13.mlp",
       "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
       "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.31.mlp",
+      "fqn": "model.layers.3.mlp",
       "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
       "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.21.mlp",
-      "host_class": "DeepseekV4SparseMoeBlock",
-      "kind": "local_compute",
-      "source_form": "module_forward"
-    },
-    {
-      "fqn": "model.layers.5.mlp",
-      "host_class": "DeepseekV4SparseMoeBlock",
-      "kind": "local_compute",
-      "source_form": "module_forward"
-    },
-    {
-      "fqn": "model.layers.20.mlp",
-      "host_class": "DeepseekV4SparseMoeBlock",
-      "kind": "local_compute",
-      "source_form": "module_forward"
-    },
-    {
-      "fqn": "model.layers.37.mlp",
+      "fqn": "model.layers.15.mlp",
       "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
       "source_form": "module_forward"
@@ -930,79 +1593,13 @@
       "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.28.mlp",
+      "fqn": "model.layers.20.mlp",
       "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
       "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.0.mlp",
-      "host_class": "DeepseekV4SparseMoeBlock",
-      "kind": "local_compute",
-      "source_form": "module_forward"
-    },
-    {
-      "fqn": "model.layers.3.mlp",
-      "host_class": "DeepseekV4SparseMoeBlock",
-      "kind": "local_compute",
-      "source_form": "module_forward"
-    },
-    {
-      "fqn": "model.layers.2.mlp",
-      "host_class": "DeepseekV4SparseMoeBlock",
-      "kind": "local_compute",
-      "source_form": "module_forward"
-    },
-    {
-      "fqn": "model.layers.14.mlp",
-      "host_class": "DeepseekV4SparseMoeBlock",
-      "kind": "local_compute",
-      "source_form": "module_forward"
-    },
-    {
-      "fqn": "model.layers.22.mlp",
-      "host_class": "DeepseekV4SparseMoeBlock",
-      "kind": "local_compute",
-      "source_form": "module_forward"
-    },
-    {
-      "fqn": "model.layers.35.mlp",
-      "host_class": "DeepseekV4SparseMoeBlock",
-      "kind": "local_compute",
-      "source_form": "module_forward"
-    },
-    {
-      "fqn": "model.layers.10.mlp",
-      "host_class": "DeepseekV4SparseMoeBlock",
-      "kind": "local_compute",
-      "source_form": "module_forward"
-    },
-    {
-      "fqn": "model.layers.12.mlp",
-      "host_class": "DeepseekV4SparseMoeBlock",
-      "kind": "local_compute",
-      "source_form": "module_forward"
-    },
-    {
-      "fqn": "model.layers.7.mlp",
-      "host_class": "DeepseekV4SparseMoeBlock",
-      "kind": "local_compute",
-      "source_form": "module_forward"
-    },
-    {
-      "fqn": "model.layers.13.mlp",
-      "host_class": "DeepseekV4SparseMoeBlock",
-      "kind": "local_compute",
-      "source_form": "module_forward"
-    },
-    {
-      "fqn": "model.layers.30.mlp",
-      "host_class": "DeepseekV4SparseMoeBlock",
-      "kind": "local_compute",
-      "source_form": "module_forward"
-    },
-    {
-      "fqn": "model.layers.18.mlp",
+      "fqn": "model.layers.31.mlp",
       "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
       "source_form": "module_forward"
@@ -1014,55 +1611,31 @@
       "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.16.mlp",
-      "host_class": "DeepseekV4SparseMoeBlock",
-      "kind": "local_compute",
-      "source_form": "module_forward"
-    },
-    {
-      "fqn": "model.layers.24.mlp",
-      "host_class": "DeepseekV4SparseMoeBlock",
-      "kind": "local_compute",
-      "source_form": "module_forward"
-    },
-    {
-      "fqn": "model.layers.33.mlp",
-      "host_class": "DeepseekV4SparseMoeBlock",
-      "kind": "local_compute",
-      "source_form": "module_forward"
-    },
-    {
-      "fqn": "model.layers.8.mlp",
-      "host_class": "DeepseekV4SparseMoeBlock",
-      "kind": "local_compute",
-      "source_form": "module_forward"
-    },
-    {
-      "fqn": "model.layers.23.mlp",
-      "host_class": "DeepseekV4SparseMoeBlock",
-      "kind": "local_compute",
-      "source_form": "module_forward"
-    },
-    {
       "fqn": "model.layers.25.mlp",
       "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
       "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.34.mlp",
+      "fqn": "model.layers.4.mlp",
       "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
       "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.39.mlp",
+      "fqn": "model.layers.35.mlp",
       "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
       "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.15.mlp",
+      "fqn": "model.layers.2.mlp",
+      "host_class": "DeepseekV4SparseMoeBlock",
+      "kind": "local_compute",
+      "source_form": "module_forward"
+    },
+    {
+      "fqn": "model.layers.5.mlp",
       "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
       "source_form": "module_forward"
@@ -1074,7 +1647,13 @@
       "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.17.mlp",
+      "fqn": "model.layers.9.mlp",
+      "host_class": "DeepseekV4SparseMoeBlock",
+      "kind": "local_compute",
+      "source_form": "module_forward"
+    },
+    {
+      "fqn": "model.layers.23.mlp",
       "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
       "source_form": "module_forward"
@@ -1086,484 +1665,136 @@
       "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.0.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
+      "fqn": "model.layers.7.mlp",
+      "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
-      "source_form": "subclass_forward"
+      "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.0.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
+      "fqn": "model.layers.28.mlp",
+      "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
-      "source_form": "subclass_forward"
+      "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.1.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
+      "fqn": "model.layers.12.mlp",
+      "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
-      "source_form": "subclass_forward"
+      "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.1.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
+      "fqn": "model.layers.22.mlp",
+      "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
-      "source_form": "subclass_forward"
+      "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.2.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
+      "fqn": "model.layers.18.mlp",
+      "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
-      "source_form": "subclass_forward"
+      "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.2.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
+      "fqn": "model.layers.6.mlp",
+      "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
-      "source_form": "subclass_forward"
+      "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.3.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
+      "fqn": "model.layers.17.mlp",
+      "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
-      "source_form": "subclass_forward"
+      "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.3.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
+      "fqn": "model.layers.0.mlp",
+      "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
-      "source_form": "subclass_forward"
+      "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.4.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
+      "fqn": "model.layers.1.mlp",
+      "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
-      "source_form": "subclass_forward"
+      "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.4.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
+      "fqn": "model.layers.16.mlp",
+      "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
-      "source_form": "subclass_forward"
+      "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.5.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
+      "fqn": "model.layers.19.mlp",
+      "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
-      "source_form": "subclass_forward"
+      "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.5.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
+      "fqn": "model.layers.10.mlp",
+      "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
-      "source_form": "subclass_forward"
+      "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.6.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
+      "fqn": "model.layers.32.mlp",
+      "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
-      "source_form": "subclass_forward"
+      "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.6.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
+      "fqn": "model.layers.21.mlp",
+      "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
-      "source_form": "subclass_forward"
+      "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.7.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
+      "fqn": "model.layers.39.mlp",
+      "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
-      "source_form": "subclass_forward"
+      "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.7.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
+      "fqn": "model.layers.37.mlp",
+      "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
-      "source_form": "subclass_forward"
+      "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.8.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
+      "fqn": "model.layers.8.mlp",
+      "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
-      "source_form": "subclass_forward"
+      "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.8.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
+      "fqn": "model.layers.24.mlp",
+      "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
-      "source_form": "subclass_forward"
+      "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.9.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
+      "fqn": "model.layers.34.mlp",
+      "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
-      "source_form": "subclass_forward"
+      "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.9.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
+      "fqn": "model.layers.33.mlp",
+      "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
-      "source_form": "subclass_forward"
+      "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.10.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
+      "fqn": "model.layers.14.mlp",
+      "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
-      "source_form": "subclass_forward"
+      "source_form": "module_forward"
     },
     {
-      "fqn": "model.layers.10.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
+      "fqn": "model.layers.30.mlp",
+      "host_class": "DeepseekV4SparseMoeBlock",
       "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.11.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.11.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.12.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.12.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.13.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.13.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.14.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.14.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.15.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.15.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.16.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.16.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.17.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.17.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.18.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.18.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.19.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.19.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.20.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.20.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.21.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.21.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.22.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.22.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.23.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.23.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.24.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.24.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.25.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.25.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.26.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.26.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.27.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.27.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.28.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.28.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.29.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.29.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.30.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.30.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.31.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.31.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.32.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.32.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.33.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.33.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.34.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.34.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.35.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.35.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.36.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.36.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.37.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.37.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.38.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.38.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.39.attn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
-    },
-    {
-      "fqn": "model.layers.39.ffn_hc",
-      "host_class": "HPCodegenPipelinedMhcModule",
-      "kind": "local_compute",
-      "source_form": "subclass_forward"
+      "source_form": "module_forward"
     },
     {
       "fqn": "model.layers.1.engram",
@@ -3476,16 +3707,16 @@
   ],
   "outputs": {
     "diff": {
-      "lines": 160,
-      "sha256": "7203309eb00fd63036cd25ac98859f1859228645944565e6df88c578680b1a56"
+      "lines": 137,
+      "sha256": "912f11f00cce0c1e0455394e19edb520400d0a6e026038fdd16d12d97f6bc5e5"
     },
     "init": {
       "lines": 6,
       "sha256": "6cc33d32a8932dd34486d0b64a46560274ab35b5856878b523b14f88c346ab38"
     },
     "modeling": {
-      "lines": 1507,
-      "sha256": "be44ed109d040772c19ff4a051475e99988d24c119bd4046c41f399feb850572"
+      "lines": 1484,
+      "sha256": "8f7675d542090eef54be359d9117ef8f0ca818a445678644a60dd983e24f4275"
     }
   },
   "parallel_dims": {
@@ -21194,16 +21425,16 @@
     }
   },
   "remote_siblings": [],
-  "signature": "6bb1f79f4254",
+  "signature": "ec572548bf57",
   "skipped_overrides": [],
   "source": {
     "architecture": "DeepseekV41ForCausalLM",
-    "file_path": "/home/lxy/hyper-parallel-stage56/hyper_parallel/models/deepseek_v41/modeling_deepseek_v41.py",
+    "file_path": "/home/lxy/hyper-parallel-models-codegen/hyper_parallel/models/deepseek_v41/modeling_deepseek_v41.py",
     "line_count": 1402,
     "model_id": "/home/lxy/DeepSeek-V4.1-Flash",
     "model_type": "deepseek_v4",
     "module_name": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41",
-    "sha256": "9a65c3e826b0561a61af13975594465b92cc192afa444a60cfaa612ac7854db7",
+    "sha256": "3e196f39b636527f0e4e9539a1f263344e424ee141ebafeb05f4783654b744a4",
     "structure": {
       "hidden_size": 640,
       "intermediate_size": 288,
@@ -21220,5 +21451,5 @@
   "special_handlers": {},
   "tied_pairs": [],
   "yaml_path": "",
-  "yaml_sha256": "6bb1f79f42544105d0b4a228af05254223ece13ecdeed43a4251e052af2d63b8"
+  "yaml_sha256": "ec572548bf572fa78c93a8248f9da4789330183d4f8fe52d38b3283e0f616451"
 }

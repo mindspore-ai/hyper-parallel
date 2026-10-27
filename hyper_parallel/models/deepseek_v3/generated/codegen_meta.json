@@ -3,21 +3,25 @@
     "lm_head": "Linear",
     "model.embed_tokens": "Embedding",
     "model.layers.0.input_layernorm": "DeepseekV3RMSNorm",
+    "model.layers.0.mlp": "DeepseekV3MLP",
     "model.layers.0.post_attention_layernorm": "DeepseekV3RMSNorm",
     "model.layers.0.self_attn": "DeepseekV3Attention",
     "model.layers.0.self_attn.kv_a_layernorm": "DeepseekV3RMSNorm",
     "model.layers.0.self_attn.q_a_layernorm": "DeepseekV3RMSNorm",
     "model.layers.1.input_layernorm": "DeepseekV3RMSNorm",
+    "model.layers.1.mlp": "DeepseekV3MLP",
     "model.layers.1.post_attention_layernorm": "DeepseekV3RMSNorm",
     "model.layers.1.self_attn": "DeepseekV3Attention",
     "model.layers.1.self_attn.kv_a_layernorm": "DeepseekV3RMSNorm",
     "model.layers.1.self_attn.q_a_layernorm": "DeepseekV3RMSNorm",
     "model.layers.2.input_layernorm": "DeepseekV3RMSNorm",
+    "model.layers.2.mlp": "DeepseekV3MLP",
     "model.layers.2.post_attention_layernorm": "DeepseekV3RMSNorm",
     "model.layers.2.self_attn": "DeepseekV3Attention",
     "model.layers.2.self_attn.kv_a_layernorm": "DeepseekV3RMSNorm",
     "model.layers.2.self_attn.q_a_layernorm": "DeepseekV3RMSNorm",
     "model.layers.3.input_layernorm": "DeepseekV3RMSNorm",
+    "model.layers.3.mlp.shared_experts": "DeepseekV3MLP",
     "model.layers.3.post_attention_layernorm": "DeepseekV3RMSNorm",
     "model.layers.3.self_attn": "DeepseekV3Attention",
     "model.layers.3.self_attn.kv_a_layernorm": "DeepseekV3RMSNorm",
@@ -30,11 +34,23 @@
     "module_overrides": false,
     "sharding_plan": true
   },
+  "emission_patches": {
+    "inner_wrappers": [],
+    "local_computes": [
+      {
+        "factory": "hyper_parallel.distributed.expert_parallel.recipes:deepseekv3_ep_compute_fn",
+        "module_fqn": "model.layers.3.mlp",
+        "module_type": "transformers.models.deepseek_v3.modeling_deepseek_v3:DeepseekV3MoE",
+        "original_forward": "transformers.models.deepseek_v3.modeling_deepseek_v3:DeepseekV3MoE.forward",
+        "region_dispatch": false
+      }
+    ],
+    "module_replacements": []
+  },
   "entrypoints": {
     "parallelize": "hp_parallelize"
   },
   "external_state_classes": [
-    "DeepseekV3MLP",
     "DeepseekV3MoE"
   ],
   "frozen_sharded_params": [
@@ -69,26 +85,6 @@
   ],
   "injections": [
     {
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn",
-        "capacity_factor": null,
-        "fix_router": false,
-        "overlap_shared_expert": false,
-        "use_grouped_gemm": true
-      },
-      "match": "model.layers.1.mlp"
-    },
-    {
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn",
-        "capacity_factor": null,
-        "fix_router": false,
-        "overlap_shared_expert": false,
-        "use_grouped_gemm": true
-      },
-      "match": "model.layers.2.mlp"
-    },
-    {
       "ep_size": 2,
       "local_compute_fn": {
         "_target_": "hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn",
@@ -98,6 +94,14 @@
         "use_grouped_gemm": true
       },
       "match": "model.layers.3.mlp"
+    }
+  ],
+  "materialized_patches": [
+    {
+      "fqn": "model.layers.3.mlp",
+      "host_class": "DeepseekV3MoE",
+      "kind": "local_compute",
+      "source_form": "subclass_forward"
     }
   ],
   "mesh_dim_names": [
@@ -115,16 +119,16 @@
   ],
   "outputs": {
     "diff": {
-      "lines": 162,
-      "sha256": "1736a43776754bc50fdcd26c04e2e3d6840ea8c73d5fd02bd2a04c0f87761f27"
+      "lines": 169,
+      "sha256": "dce5f000265eed40747b0e49dc26663c87c86b7046d717ffe66b0836753518df"
     },
     "init": {
       "lines": 6,
-      "sha256": "3837682d3d61de3b546df24c1aa138be8eb92254d21f1596391274bf21ead8a5"
+      "sha256": "6cc33d32a8932dd34486d0b64a46560274ab35b5856878b523b14f88c346ab38"
     },
     "modeling": {
-      "lines": 785,
-      "sha256": "ad753d6a7d0f6d09d58877b9396e53628def35f206a71ad79124f8d13fd23458"
+      "lines": 788,
+      "sha256": "256d66ccbf9a2dadc26efc40fc3adc72f2fcd6d41bbecd1bf86a64cef9c6d697"
     }
   },
   "parallel_dims": {
@@ -266,7 +270,7 @@
           "tp": "R"
         }
       },
-      "is_boundary": false,
+      "is_boundary": true,
       "out_dst": {
         "output": {
           "cp": "S(1)",
@@ -524,7 +528,7 @@
           "tp": "R"
         }
       },
-      "is_boundary": false,
+      "is_boundary": true,
       "out_dst": {
         "output": {
           "cp": "S(1)",
@@ -555,8 +559,7 @@
           "ep": "R",
           "tp": "S(0)"
         }
-      },
-      "region_dispatch": false
+      }
     },
     "model.layers.1.post_attention_layernorm": {
       "in_dst": {
@@ -783,7 +786,7 @@
           "tp": "R"
         }
       },
-      "is_boundary": false,
+      "is_boundary": true,
       "out_dst": {
         "output": {
           "cp": "S(1)",
@@ -814,8 +817,7 @@
           "ep": "R",
           "tp": "S(0)"
         }
-      },
-      "region_dispatch": false
+      }
     },
     "model.layers.2.post_attention_layernorm": {
       "in_dst": {
@@ -1072,7 +1074,8 @@
           "tp": "R"
         }
       },
-      "region_dispatch": false
+      "region_dispatch": false,
+      "skip_source_lowering": true
     },
     "model.layers.3.mlp.shared_experts": {
       "in_dst": {
@@ -1089,7 +1092,7 @@
           "tp": "R"
         }
       },
-      "is_boundary": false,
+      "is_boundary": true,
       "out_dst": {
         "output": {
           "cp": "S(1)",
@@ -1334,7 +1337,7 @@
     }
   },
   "remote_siblings": [],
-  "signature": "c4f7a3358852",
+  "signature": "046f5b581342",
   "skipped_overrides": [],
   "source": {
     "architecture": null,
@@ -1362,6 +1365,6 @@
   },
   "special_handlers": {},
   "tied_pairs": [],
-  "yaml_path": "/home/lxy/codegen_all_3cb4e616_inputs/deepseek_v3.yaml",
-  "yaml_sha256": "dc6cf33947736426cf4a834383e9a5c20158960bbbe14387346b19f7453b3b5a"
+  "yaml_path": "",
+  "yaml_sha256": "046f5b581342d984860b0657a66ca53a105ca70064d60ccdffaab554821bc443"
 }

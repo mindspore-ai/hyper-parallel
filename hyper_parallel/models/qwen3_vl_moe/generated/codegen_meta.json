@@ -72,6 +72,40 @@
     "module_overrides": false,
     "sharding_plan": true
   },
+  "emission_patches": {
+    "inner_wrappers": [],
+    "local_computes": [
+      {
+        "factory": "hyper_parallel.models.qwen3_vl_moe.adapter.distributed.expert_parallel:qwen3_vl_moe_ep_compute_fn",
+        "module_fqn": "model.language_model.layers.2.mlp",
+        "module_type": "transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe:Qwen3VLMoeTextSparseMoeBlock",
+        "original_forward": "transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe:Qwen3VLMoeTextSparseMoeBlock.forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.qwen3_vl_moe.adapter.distributed.expert_parallel:qwen3_vl_moe_ep_compute_fn",
+        "module_fqn": "model.language_model.layers.1.mlp",
+        "module_type": "transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe:Qwen3VLMoeTextSparseMoeBlock",
+        "original_forward": "transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe:Qwen3VLMoeTextSparseMoeBlock.forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.qwen3_vl_moe.adapter.distributed.expert_parallel:qwen3_vl_moe_ep_compute_fn",
+        "module_fqn": "model.language_model.layers.0.mlp",
+        "module_type": "transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe:Qwen3VLMoeTextSparseMoeBlock",
+        "original_forward": "transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe:Qwen3VLMoeTextSparseMoeBlock.forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.qwen3_vl_moe.adapter.distributed.expert_parallel:qwen3_vl_moe_ep_compute_fn",
+        "module_fqn": "model.language_model.layers.3.mlp",
+        "module_type": "transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe:Qwen3VLMoeTextSparseMoeBlock",
+        "original_forward": "transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe:Qwen3VLMoeTextSparseMoeBlock.forward",
+        "region_dispatch": false
+      }
+    ],
+    "module_replacements": []
+  },
   "entrypoints": {
     "parallelize": "hp_parallelize"
   },
@@ -111,7 +145,7 @@
         "_target_": "hyper_parallel.models.qwen3_vl_moe.adapter.distributed.expert_parallel.qwen3_vl_moe_ep_compute_fn",
         "use_grouped_gemm": true
       },
-      "match": "model.language_model.layers.0.mlp"
+      "match": "model.language_model.layers.2.mlp"
     },
     {
       "ep_size": 2,
@@ -127,7 +161,7 @@
         "_target_": "hyper_parallel.models.qwen3_vl_moe.adapter.distributed.expert_parallel.qwen3_vl_moe_ep_compute_fn",
         "use_grouped_gemm": true
       },
-      "match": "model.language_model.layers.2.mlp"
+      "match": "model.language_model.layers.0.mlp"
     },
     {
       "ep_size": 2,
@@ -136,6 +170,32 @@
         "use_grouped_gemm": true
       },
       "match": "model.language_model.layers.3.mlp"
+    }
+  ],
+  "materialized_patches": [
+    {
+      "fqn": "model.language_model.layers.2.mlp",
+      "host_class": "Qwen3VLMoeTextSparseMoeBlock",
+      "kind": "local_compute",
+      "source_form": "subclass_forward"
+    },
+    {
+      "fqn": "model.language_model.layers.1.mlp",
+      "host_class": "Qwen3VLMoeTextSparseMoeBlock",
+      "kind": "local_compute",
+      "source_form": "subclass_forward"
+    },
+    {
+      "fqn": "model.language_model.layers.0.mlp",
+      "host_class": "Qwen3VLMoeTextSparseMoeBlock",
+      "kind": "local_compute",
+      "source_form": "subclass_forward"
+    },
+    {
+      "fqn": "model.language_model.layers.3.mlp",
+      "host_class": "Qwen3VLMoeTextSparseMoeBlock",
+      "kind": "local_compute",
+      "source_form": "subclass_forward"
     }
   ],
   "mesh_dim_names": [
@@ -154,15 +214,15 @@
   "outputs": {
     "diff": {
       "lines": 159,
-      "sha256": "409ee9c55c62d0220662eebc995dd98a55811511585e01dc6a8be2ba1acbc187"
+      "sha256": "ff57e32fdde2d8d2760b36042845e6f55db7c33905a1cda15921bcd3d84e2fe1"
     },
     "init": {
       "lines": 6,
-      "sha256": "dee27e345c088c9f95f78caee116bf7ac68406cb8306ba32de494cc9d6cffca7"
+      "sha256": "6cc33d32a8932dd34486d0b64a46560274ab35b5856878b523b14f88c346ab38"
     },
     "modeling": {
       "lines": 1909,
-      "sha256": "a09316f6c024d526966e03cf1958eb088f2fe4c370b29b9c000c3ddacbe58e54"
+      "sha256": "3957fa0b3dd7ad69c649700804acb8e7bf6405bb5d9b89b7f1ebfa8547ec78cc"
     }
   },
   "parallel_dims": {
@@ -334,7 +394,8 @@
           "tp": "R"
         }
       },
-      "region_dispatch": false
+      "region_dispatch": false,
+      "skip_source_lowering": true
     },
     "model.language_model.layers.0.post_attention_layernorm": {
       "in_dst": {
@@ -586,7 +647,8 @@
           "tp": "R"
         }
       },
-      "region_dispatch": false
+      "region_dispatch": false,
+      "skip_source_lowering": true
     },
     "model.language_model.layers.1.post_attention_layernorm": {
       "in_dst": {
@@ -838,7 +900,8 @@
           "tp": "R"
         }
       },
-      "region_dispatch": false
+      "region_dispatch": false,
+      "skip_source_lowering": true
     },
     "model.language_model.layers.2.post_attention_layernorm": {
       "in_dst": {
@@ -1090,7 +1153,8 @@
           "tp": "R"
         }
       },
-      "region_dispatch": false
+      "region_dispatch": false,
+      "skip_source_lowering": true
     },
     "model.language_model.layers.3.post_attention_layernorm": {
       "in_dst": {
@@ -2102,7 +2166,7 @@
     }
   },
   "remote_siblings": [],
-  "signature": "8c3aa06c784a",
+  "signature": "53fe3e08830d",
   "skipped_overrides": [],
   "source": {
     "architecture": null,
@@ -2117,6 +2181,6 @@
   },
   "special_handlers": {},
   "tied_pairs": [],
-  "yaml_path": "/home/lxy/qwen3vl_val/val_int/qwen3_vl_moe/train_codegen.yaml",
-  "yaml_sha256": "309a63dac3190425e41249478765aa6d03bdd08ae0f3b6799d42ec3918975f17"
+  "yaml_path": "",
+  "yaml_sha256": "53fe3e08830dac2b27b0be26ed466c2f86afa73853d00bdf62616958c6bf8469"
 }

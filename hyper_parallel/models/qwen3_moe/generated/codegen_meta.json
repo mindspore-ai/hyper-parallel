@@ -30,6 +30,151 @@
     "module_overrides": true,
     "sharding_plan": true
   },
+  "emission_patches": {
+    "inner_wrappers": [
+      {
+        "module_fqn": "model.layers.1.self_attn",
+        "target_fqn": "self",
+        "target_type": "hyper_parallel.components.modules.gqa_attention:GQAAttention",
+        "wrapper": "hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel:qwen3_moe_flash_attention_cp_mask_wrapper"
+      },
+      {
+        "module_fqn": "model.layers.0.self_attn",
+        "target_fqn": "self",
+        "target_type": "hyper_parallel.components.modules.gqa_attention:GQAAttention",
+        "wrapper": "hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel:qwen3_moe_flash_attention_cp_mask_wrapper"
+      },
+      {
+        "module_fqn": "model.layers.3.self_attn",
+        "target_fqn": "self",
+        "target_type": "hyper_parallel.components.modules.gqa_attention:GQAAttention",
+        "wrapper": "hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel:qwen3_moe_flash_attention_cp_mask_wrapper"
+      },
+      {
+        "module_fqn": "model.layers.2.self_attn",
+        "target_fqn": "self",
+        "target_type": "hyper_parallel.components.modules.gqa_attention:GQAAttention",
+        "wrapper": "hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel:qwen3_moe_flash_attention_cp_mask_wrapper"
+      }
+    ],
+    "local_computes": [
+      {
+        "factory": "hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel:qwen3moe_ep_compute_fn",
+        "module_fqn": "model.layers.1.mlp",
+        "module_type": "transformers.models.qwen3_moe.modeling_qwen3_moe:Qwen3MoeSparseMoeBlock",
+        "original_forward": "transformers.models.qwen3_moe.modeling_qwen3_moe:Qwen3MoeSparseMoeBlock.forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel:qwen3moe_ep_compute_fn",
+        "module_fqn": "model.layers.0.mlp",
+        "module_type": "transformers.models.qwen3_moe.modeling_qwen3_moe:Qwen3MoeSparseMoeBlock",
+        "original_forward": "transformers.models.qwen3_moe.modeling_qwen3_moe:Qwen3MoeSparseMoeBlock.forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel:qwen3moe_ep_compute_fn",
+        "module_fqn": "model.layers.3.mlp",
+        "module_type": "transformers.models.qwen3_moe.modeling_qwen3_moe:Qwen3MoeSparseMoeBlock",
+        "original_forward": "transformers.models.qwen3_moe.modeling_qwen3_moe:Qwen3MoeSparseMoeBlock.forward",
+        "region_dispatch": false
+      },
+      {
+        "factory": "hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel:qwen3moe_ep_compute_fn",
+        "module_fqn": "model.layers.2.mlp",
+        "module_type": "transformers.models.qwen3_moe.modeling_qwen3_moe:Qwen3MoeSparseMoeBlock",
+        "original_forward": "transformers.models.qwen3_moe.modeling_qwen3_moe:Qwen3MoeSparseMoeBlock.forward",
+        "region_dispatch": false
+      }
+    ],
+    "module_replacements": [
+      {
+        "module_fqn": "model.layers.0.input_layernorm",
+        "replacement_type": "hyper_parallel.components.modules.rms_norm:RMSNorm",
+        "source_type": "transformers.models.qwen3_moe.modeling_qwen3_moe:Qwen3MoeRMSNorm"
+      },
+      {
+        "module_fqn": "model.layers.0.post_attention_layernorm",
+        "replacement_type": "hyper_parallel.components.modules.rms_norm:RMSNorm",
+        "source_type": "transformers.models.qwen3_moe.modeling_qwen3_moe:Qwen3MoeRMSNorm"
+      },
+      {
+        "module_fqn": "model.layers.1.input_layernorm",
+        "replacement_type": "hyper_parallel.components.modules.rms_norm:RMSNorm",
+        "source_type": "transformers.models.qwen3_moe.modeling_qwen3_moe:Qwen3MoeRMSNorm"
+      },
+      {
+        "module_fqn": "model.layers.1.post_attention_layernorm",
+        "replacement_type": "hyper_parallel.components.modules.rms_norm:RMSNorm",
+        "source_type": "transformers.models.qwen3_moe.modeling_qwen3_moe:Qwen3MoeRMSNorm"
+      },
+      {
+        "module_fqn": "model.layers.2.input_layernorm",
+        "replacement_type": "hyper_parallel.components.modules.rms_norm:RMSNorm",
+        "source_type": "transformers.models.qwen3_moe.modeling_qwen3_moe:Qwen3MoeRMSNorm"
+      },
+      {
+        "module_fqn": "model.layers.2.post_attention_layernorm",
+        "replacement_type": "hyper_parallel.components.modules.rms_norm:RMSNorm",
+        "source_type": "transformers.models.qwen3_moe.modeling_qwen3_moe:Qwen3MoeRMSNorm"
+      },
+      {
+        "module_fqn": "model.layers.3.input_layernorm",
+        "replacement_type": "hyper_parallel.components.modules.rms_norm:RMSNorm",
+        "source_type": "transformers.models.qwen3_moe.modeling_qwen3_moe:Qwen3MoeRMSNorm"
+      },
+      {
+        "module_fqn": "model.layers.3.post_attention_layernorm",
+        "replacement_type": "hyper_parallel.components.modules.rms_norm:RMSNorm",
+        "source_type": "transformers.models.qwen3_moe.modeling_qwen3_moe:Qwen3MoeRMSNorm"
+      },
+      {
+        "module_fqn": "model.norm",
+        "replacement_type": "hyper_parallel.components.modules.rms_norm:RMSNorm",
+        "source_type": "transformers.models.qwen3_moe.modeling_qwen3_moe:Qwen3MoeRMSNorm"
+      },
+      {
+        "module_fqn": "model.layers.0.self_attn",
+        "replacement_type": "hyper_parallel.components.modules.gqa_attention:GQAAttention",
+        "source_type": "transformers.models.qwen3_moe.modeling_qwen3_moe:Qwen3MoeAttention"
+      },
+      {
+        "module_fqn": "model.layers.1.self_attn",
+        "replacement_type": "hyper_parallel.components.modules.gqa_attention:GQAAttention",
+        "source_type": "transformers.models.qwen3_moe.modeling_qwen3_moe:Qwen3MoeAttention"
+      },
+      {
+        "module_fqn": "model.layers.2.self_attn",
+        "replacement_type": "hyper_parallel.components.modules.gqa_attention:GQAAttention",
+        "source_type": "transformers.models.qwen3_moe.modeling_qwen3_moe:Qwen3MoeAttention"
+      },
+      {
+        "module_fqn": "model.layers.3.self_attn",
+        "replacement_type": "hyper_parallel.components.modules.gqa_attention:GQAAttention",
+        "source_type": "transformers.models.qwen3_moe.modeling_qwen3_moe:Qwen3MoeAttention"
+      },
+      {
+        "module_fqn": "model.layers.0.mlp.experts",
+        "replacement_type": "hyper_parallel.components.modules.grouped_experts:GroupedExperts",
+        "source_type": "transformers.models.qwen3_moe.modeling_qwen3_moe:Qwen3MoeExperts"
+      },
+      {
+        "module_fqn": "model.layers.1.mlp.experts",
+        "replacement_type": "hyper_parallel.components.modules.grouped_experts:GroupedExperts",
+        "source_type": "transformers.models.qwen3_moe.modeling_qwen3_moe:Qwen3MoeExperts"
+      },
+      {
+        "module_fqn": "model.layers.2.mlp.experts",
+        "replacement_type": "hyper_parallel.components.modules.grouped_experts:GroupedExperts",
+        "source_type": "transformers.models.qwen3_moe.modeling_qwen3_moe:Qwen3MoeExperts"
+      },
+      {
+        "module_fqn": "model.layers.3.mlp.experts",
+        "replacement_type": "hyper_parallel.components.modules.grouped_experts:GroupedExperts",
+        "source_type": "transformers.models.qwen3_moe.modeling_qwen3_moe:Qwen3MoeExperts"
+      }
+    ]
+  },
   "entrypoints": {
     "parallelize": "hp_parallelize"
   },
@@ -58,34 +203,13 @@
   ],
   "injections": [
     {
-      "inner_target": "self",
-      "inner_wrapper": {
-        "_target_": "hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel.qwen3_moe_flash_attention_cp_mask_wrapper"
-      },
-      "match": "model.layers.2.self_attn"
-    },
-    {
       "ep_size": 2,
       "local_compute_fn": {
         "_target_": "hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn",
+        "fix_router": false,
         "use_grouped_gemm": true
       },
       "match": "model.layers.1.mlp"
-    },
-    {
-      "inner_target": "self",
-      "inner_wrapper": {
-        "_target_": "hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel.qwen3_moe_flash_attention_cp_mask_wrapper"
-      },
-      "match": "model.layers.0.self_attn"
-    },
-    {
-      "ep_size": 2,
-      "local_compute_fn": {
-        "_target_": "hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn",
-        "use_grouped_gemm": true
-      },
-      "match": "model.layers.0.mlp"
     },
     {
       "inner_target": "self",
@@ -98,17 +222,35 @@
       "ep_size": 2,
       "local_compute_fn": {
         "_target_": "hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn",
+        "fix_router": false,
         "use_grouped_gemm": true
       },
-      "match": "model.layers.2.mlp"
+      "match": "model.layers.0.mlp"
+    },
+    {
+      "inner_target": "self",
+      "inner_wrapper": {
+        "_target_": "hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel.qwen3_moe_flash_attention_cp_mask_wrapper"
+      },
+      "match": "model.layers.0.self_attn"
     },
     {
       "ep_size": 2,
       "local_compute_fn": {
         "_target_": "hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn",
+        "fix_router": false,
         "use_grouped_gemm": true
       },
       "match": "model.layers.3.mlp"
+    },
+    {
+      "ep_size": 2,
+      "local_compute_fn": {
+        "_target_": "hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn",
+        "fix_router": false,
+        "use_grouped_gemm": true
+      },
+      "match": "model.layers.2.mlp"
     },
     {
       "inner_target": "self",
@@ -116,13 +258,172 @@
         "_target_": "hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel.qwen3_moe_flash_attention_cp_mask_wrapper"
       },
       "match": "model.layers.3.self_attn"
+    },
+    {
+      "inner_target": "self",
+      "inner_wrapper": {
+        "_target_": "hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel.qwen3_moe_flash_attention_cp_mask_wrapper"
+      },
+      "match": "model.layers.2.self_attn"
+    }
+  ],
+  "materialized_patches": [
+    {
+      "fqn": "model.layers.1.mlp",
+      "host_class": "Qwen3MoeSparseMoeBlock",
+      "kind": "local_compute",
+      "source_form": "subclass_forward"
+    },
+    {
+      "fqn": "model.layers.0.mlp",
+      "host_class": "Qwen3MoeSparseMoeBlock",
+      "kind": "local_compute",
+      "source_form": "subclass_forward"
+    },
+    {
+      "fqn": "model.layers.3.mlp",
+      "host_class": "Qwen3MoeSparseMoeBlock",
+      "kind": "local_compute",
+      "source_form": "subclass_forward"
+    },
+    {
+      "fqn": "model.layers.2.mlp",
+      "host_class": "Qwen3MoeSparseMoeBlock",
+      "kind": "local_compute",
+      "source_form": "subclass_forward"
+    },
+    {
+      "fqn": "model.layers.0.input_layernorm",
+      "host_class": "RMSNorm",
+      "kind": "module_replacement",
+      "source_form": "constructor"
+    },
+    {
+      "fqn": "model.layers.0.post_attention_layernorm",
+      "host_class": "RMSNorm",
+      "kind": "module_replacement",
+      "source_form": "constructor"
+    },
+    {
+      "fqn": "model.layers.1.input_layernorm",
+      "host_class": "RMSNorm",
+      "kind": "module_replacement",
+      "source_form": "constructor"
+    },
+    {
+      "fqn": "model.layers.1.post_attention_layernorm",
+      "host_class": "RMSNorm",
+      "kind": "module_replacement",
+      "source_form": "constructor"
+    },
+    {
+      "fqn": "model.layers.2.input_layernorm",
+      "host_class": "RMSNorm",
+      "kind": "module_replacement",
+      "source_form": "constructor"
+    },
+    {
+      "fqn": "model.layers.2.post_attention_layernorm",
+      "host_class": "RMSNorm",
+      "kind": "module_replacement",
+      "source_form": "constructor"
+    },
+    {
+      "fqn": "model.layers.3.input_layernorm",
+      "host_class": "RMSNorm",
+      "kind": "module_replacement",
+      "source_form": "constructor"
+    },
+    {
+      "fqn": "model.layers.3.post_attention_layernorm",
+      "host_class": "RMSNorm",
+      "kind": "module_replacement",
+      "source_form": "constructor"
+    },
+    {
+      "fqn": "model.norm",
+      "host_class": "RMSNorm",
+      "kind": "module_replacement",
+      "source_form": "constructor"
+    },
+    {
+      "fqn": "model.layers.0.self_attn",
+      "host_class": "GQAAttention",
+      "kind": "module_replacement",
+      "source_form": "constructor"
+    },
+    {
+      "fqn": "model.layers.1.self_attn",
+      "host_class": "GQAAttention",
+      "kind": "module_replacement",
+      "source_form": "constructor"
+    },
+    {
+      "fqn": "model.layers.2.self_attn",
+      "host_class": "GQAAttention",
+      "kind": "module_replacement",
+      "source_form": "constructor"
+    },
+    {
+      "fqn": "model.layers.3.self_attn",
+      "host_class": "GQAAttention",
+      "kind": "module_replacement",
+      "source_form": "constructor"
+    },
+    {
+      "fqn": "model.layers.0.mlp.experts",
+      "host_class": "GroupedExperts",
+      "kind": "module_replacement",
+      "source_form": "constructor"
+    },
+    {
+      "fqn": "model.layers.1.mlp.experts",
+      "host_class": "GroupedExperts",
+      "kind": "module_replacement",
+      "source_form": "constructor"
+    },
+    {
+      "fqn": "model.layers.2.mlp.experts",
+      "host_class": "GroupedExperts",
+      "kind": "module_replacement",
+      "source_form": "constructor"
+    },
+    {
+      "fqn": "model.layers.3.mlp.experts",
+      "host_class": "GroupedExperts",
+      "kind": "module_replacement",
+      "source_form": "constructor"
+    },
+    {
+      "fqn": "model.layers.1.self_attn",
+      "host_class": "GQAAttention",
+      "kind": "inner_wrapper",
+      "source_form": "replacement_forward_runtime_binding"
+    },
+    {
+      "fqn": "model.layers.0.self_attn",
+      "host_class": "GQAAttention",
+      "kind": "inner_wrapper",
+      "source_form": "replacement_forward_runtime_binding"
+    },
+    {
+      "fqn": "model.layers.3.self_attn",
+      "host_class": "GQAAttention",
+      "kind": "inner_wrapper",
+      "source_form": "replacement_forward_runtime_binding"
+    },
+    {
+      "fqn": "model.layers.2.self_attn",
+      "host_class": "GQAAttention",
+      "kind": "inner_wrapper",
+      "source_form": "replacement_forward_runtime_binding"
     }
   ],
   "mesh_dim_names": [
     "cp",
     "tp"
   ],
-  "model_class": "Qwen3MoeForCausalLM",
+  "model_class": null,
   "model_name": "Qwen3_Moe",
   "module_overrides": [
     {
@@ -357,16 +658,16 @@
   ],
   "outputs": {
     "diff": {
-      "lines": 400,
-      "sha256": "64852677a2b0c7c319c9ef8c0bb8cdcf12ab02209261c46c064777a0c38106c1"
+      "lines": 407,
+      "sha256": "6cd6c8700f8d88bf363d7409a4162424267ea273f35d3e1ee36cde60c0c792fb"
     },
     "init": {
       "lines": 6,
-      "sha256": "8f1688915df17132db0cf6ce078ee3970f10e9f1018609f50c5073ba28737e9d"
+      "sha256": "6cc33d32a8932dd34486d0b64a46560274ab35b5856878b523b14f88c346ab38"
     },
     "modeling": {
-      "lines": 971,
-      "sha256": "f9ba53acddf011dfbfc59100c7d2ee4041d9ce9889bb0734aaf39f297ca0990b"
+      "lines": 976,
+      "sha256": "cbda7e269baa8bfd5ff9dd22c187a002e7f8ac146dd6199c8009a56e4b1b7494"
     }
   },
   "parallel_dims": {
@@ -538,7 +839,8 @@
           "tp": "R"
         }
       },
-      "region_dispatch": false
+      "region_dispatch": false,
+      "skip_source_lowering": true
     },
     "model.layers.0.post_attention_layernorm": {
       "in_dst": {
@@ -781,7 +1083,8 @@
           "tp": "R"
         }
       },
-      "region_dispatch": false
+      "region_dispatch": false,
+      "skip_source_lowering": true
     },
     "model.layers.1.post_attention_layernorm": {
       "in_dst": {
@@ -1024,7 +1327,8 @@
           "tp": "R"
         }
       },
-      "region_dispatch": false
+      "region_dispatch": false,
+      "skip_source_lowering": true
     },
     "model.layers.2.post_attention_layernorm": {
       "in_dst": {
@@ -1267,7 +1571,8 @@
           "tp": "R"
         }
       },
-      "region_dispatch": false
+      "region_dispatch": false,
+      "skip_source_lowering": true
     },
     "model.layers.3.post_attention_layernorm": {
       "in_dst": {
@@ -1467,10 +1772,10 @@
     }
   },
   "remote_siblings": [],
-  "signature": "162c450f022d",
+  "signature": "4cb4efc6520c",
   "skipped_overrides": [],
   "source": {
-    "architecture": "Qwen3MoeForCausalLM",
+    "architecture": null,
     "file_path": "/home/lxy/miniforge3/envs/hyper_restructure_py311/lib/python3.11/site-packages/transformers/models/qwen3_moe/modeling_qwen3_moe.py",
     "line_count": 731,
     "model_id": "/home/lxy/qwen3_30b_a3b_4L",
@@ -1492,6 +1797,6 @@
   },
   "special_handlers": {},
   "tied_pairs": [],
-  "yaml_path": "/home/lxy/codegen_all_3cb4e616_inputs/qwen3_moe.yaml",
-  "yaml_sha256": "3bc87e1f4b130d81e702a9d6a7f6cb7981df65b443d85772e7891bd3bc055fda"
+  "yaml_path": "",
+  "yaml_sha256": "4cb4efc6520cc02824e70401483c6b98c07d8f8640d51723218add840e88b38c"
 }
