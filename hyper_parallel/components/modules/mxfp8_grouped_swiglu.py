@@ -44,6 +44,11 @@ class MXFP8GroupedSwiGLU(GroupedExperts):
     local expert, including zero-token experts. Output retains expert-major
     order. Scores are accepted by the inherited protocol; outer routing applies
     them exactly once after GMM2, with its original dtype policy.
+
+    Note:
+        EP recipes must explicitly set ``use_grouped_gemm: true`` to call this
+        module's MXFP8 computation. Omitting it or setting it to false uses the
+        existing eager expert path, which bypasses MXFP8 computation.
     """
 
     def __init__(self, *, module: nn.Module, module_fqn: str = "",
@@ -52,10 +57,8 @@ class MXFP8GroupedSwiGLU(GroupedExperts):
         context = context or {}
         self.module_fqn = module_fqn
         prefix = f"{module_fqn or '<root>'}: MXFP8GroupedSwiGLU"
-        if any(context.get(axis) for axis in ("tp", "cp", "ep", "pp")):
-            raise NotImplementedError(f"{prefix} requires TP=CP=EP=PP=1")
-        if context.get("ep_size", 1) != 1:
-            raise NotImplementedError(f"{prefix} supports only EP=1")
+        if any(context.get(axis) for axis in ("tp", "cp", "pp")):
+            raise NotImplementedError(f"{prefix} requires TP=CP=PP=1")
         try:
             super().__init__(module=module, module_fqn=module_fqn, context=context)
         except (ValueError, TypeError, KeyError) as exc:
