@@ -200,9 +200,11 @@ def _factory_arguments(
 def archetype_for_factory(factory_path: str | None) -> Any | None:
     """Reverse-lookup a MoE archetype by its compute-factory ``_target_``.
 
-    A YAML ``replace.implementation`` that names a known archetype factory
-    resolves to that archetype: the strategy kind / target class / boundary
-    sub-patterns / EP body keys are then structural, not declared per family.
+    A YAML ``local_compute_fn._target_`` that names a known archetype factory
+    resolves to that archetype: the strategy kind / boundary sub-patterns /
+    EP body keys are then structural, not declared per family. The concrete
+    block class is not part of the archetype — it is derived per artifact
+    from the frozen boundary map.
     """
     if not factory_path:
         return None

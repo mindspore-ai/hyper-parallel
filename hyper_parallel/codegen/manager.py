@@ -278,11 +278,18 @@ def _model_type(config: Any, hf_config: Any = None) -> Optional[str]:
 
     Shares the best-effort config lookup with :func:`_model_name` (including
     the ``from_config`` ``config_path`` spelling), so the CLI generation and
-    the trainer anchor the bundle to the same family directory.
+    the trainer anchor the bundle to the same family directory. The raw HF
+    spelling is normalized through the registry family aliases (K2.6 reports
+    ``kimi_k25``; the family directory is ``kimi_k26``).
     """
     if hf_config is None:
         hf_config = _resolve_hf_config_for_layout(config)
-    return getattr(hf_config, "model_type", None)
+    model_type = getattr(hf_config, "model_type", None)
+    if not model_type:
+        return None
+    from hyper_parallel.models.registry import family_dir_for_model_type
+
+    return family_dir_for_model_type(str(model_type))
 
 
 def _model_type_to_modeling_token(model_type: str) -> str:
@@ -703,7 +710,7 @@ def _fill_plan_fields(
 
     meta.module_overrides = replace_meta
     # The inline pipeline lowers the matched replacements into the generated
-    # file, so the artifact owns module replacement.  Declare coverage so the
+    # file, so the artifact owns ``replace_module``.  Declare coverage so the
     # trainer's HF replacement step is skipped on the gen path — but only when
     # something was actually matched.  ``covered`` is always a
     # COVERED_DEFAULTS copy, so the key is present either way.
@@ -726,7 +733,11 @@ def _record_inline_declarations(meta: CodegenMeta) -> None:
     """
     identity = (meta.source or {}).get("architecture")
     meta.external_state_classes = list(
-        external_state_classes_for(identity, getattr(meta, "injections", None))
+        external_state_classes_for(
+            identity,
+            getattr(meta, "injections", None),
+            getattr(meta, "boundary_classes", None),
+        )
     )
 
 
@@ -736,7 +747,7 @@ def _apply_generation_replacements(
     model: Any,
     spec: Any,
 ) -> list[dict[str, Any]]:
-    """Apply module actions and validate method targets on the generation meta model.
+    """Apply YAML ``replace_module`` actions to the generation meta model.
 
     Generated model ``__init__`` applies module replacements before runtime
     sharding.  Generation must mirror that order: compile the raw YAML entries
@@ -745,8 +756,7 @@ def _apply_generation_replacements(
     replaced parameter tree.  Otherwise the frozen plan may reference
     pre-replacement parameters (for example ``q_proj``/``k_proj``/``v_proj``)
     that no longer exist after a generated attention module installs fused
-    ``qkv_proj`` weights. Method targets are checked after module replacement;
-    their factories run on the live generated model before sharding.
+    ``qkv_proj`` weights.
     """
     raw_entries = getattr(config, "plan_overrides", None) or []
     if not raw_entries:
@@ -754,46 +764,30 @@ def _apply_generation_replacements(
 
     from hyper_parallel.models.replacement import (
         _apply_module_replacement_actions,
-        _compile_method_replacements,
     )
     from hyper_parallel.codegen.emit.replacement import (
         compile_overrides_for_meta,
     )
     from hyper_parallel.trainer.config import (
-        entries_to_method_replacements,
         entries_to_module_replacements,
     )
-    from hyper_parallel.trainer.config.replacement import ReplacementTarget  # pylint: disable=import-outside-toplevel
-    from hyper_parallel.components.modules.family import get_module_family  # pylint: disable=import-outside-toplevel
 
     specs = entries_to_module_replacements(raw_entries)
     factory_paths = []
     target_configs = []
     for entry in raw_entries:
-        action = getattr(entry, "replace", None)
-        if action is None or action.kind != "module":
+        replace_module = getattr(entry, "replace_module", None)
+        if replace_module is None:
             continue
-        implementation = action.implementation
-        if not isinstance(implementation, ReplacementTarget) and get_module_family(implementation.callable):
-            implementation = ReplacementTarget(
-                implementation.callable, target_path=implementation._target_path, **implementation._kwargs,
-            )
-        if isinstance(implementation, ReplacementTarget):
-            selected = implementation.callable
-            factory_paths.append(f"{selected.__module__}.{selected.__qualname__}")
-            static_args = {
-                name: value for name, value in implementation.to_dict().items()
-                if name not in implementation.selectors
-            }
-        else:
-            factory_paths.append(_target_path(implementation))
-            static_args = implementation.to_dict()
-        # The selected family variant is the constructor codegen must inline.
-        # Selector keywords have already been consumed by ReplacementTarget.
+        factory_paths.append(_target_path(replace_module))
+        # Capture the YAML Target's static args so the runtime can rebuild the
+        # same pre-bound factory (see ``_target_replacement_factory``) instead
+        # of importing the bare ``@module_replacement`` fn — otherwise a
+        # configured arg would fall back to its default or fail to build.
         target_configs.append(
             {
                 name: value
-                for name, value in static_args.items()
+                for name, value in replace_module.to_dict().items()
                 if name != "_target_"
             }
         )
@@ -821,13 +815,6 @@ def _apply_generation_replacements(
             },
             capture_checkpoint_metadata=False,
         )
-    method_specs = entries_to_method_replacements(
-        raw_entries,
-        cp_size=spec.parallel_dims.cp_size,
-        ep_size=spec.parallel_dims.ep_size,
-        sequence_parallel=spec.parallel_dims.sequence_parallel,
-    )
-    _compile_method_replacements(model, method_specs)
     return replace_meta
 
 
@@ -872,7 +859,7 @@ def _target_path(target: Any) -> Optional[str]:
 #:
 #: S3 maps a recognized ``MoeStructure`` (router / shared-expert branch /
 #: expert-storage) to the factory that would have been wired through a YAML
-#: ``replace.implementation``. The mapping is not duplicated here: it is the
+#: ``local_compute_fn._target_``. The mapping is not duplicated here: it is the
 #: same framework structure->archetype table the model adapters project from,
 #: so the fingerprint is the *only* discriminator and a model with the same
 #: structure is covered without new registry work. Built lazily (the archetype
@@ -905,9 +892,9 @@ def _fill_inferred_ep_targets(model: Any, plan_overrides: dict[str, Any]) -> set
 
     Every desugared plan override whose ``match`` resolves to a MoE boundary
     but which declares no explicit ``local_compute_fn`` gets its EP compute
-    factory inferred from structure (``detect_moe_structure``). Entries that
-    already carry a ``local_compute_fn`` are left untouched — the public
-    forward replacement remains the escape hatch for
+    factory inferred from structure (``detect_moe_structure``) instead of a
+    YAML ``_target_``. Entries that already carry a ``local_compute_fn`` are
+    left untouched — the explicit ``_target_`` remains the escape hatch for
     structures detection cannot cover. Ordinary (non-MoE) overrides are
     untouched. This is a no-op on a struct construct; the ``plan_overrides``
     dict's spec values are mutated in place so ``freeze_injections`` records
@@ -969,7 +956,7 @@ def _infer_ep_compute_for_match(
             raise UnsupportedModuleStructure(
                 f"{match!r} matched multiple MoE boundaries with different "
                 "EP compute factories; declare an explicit "
-                "replace.implementation in the YAML"
+                "local_compute_fn._target_ in the YAML"
             )
     return candidate
 
@@ -989,7 +976,7 @@ def _drop_inferred_ep_injections_on_non_moe(
     here, while the plan is still codegen's own, keeps the artifact coherent.
 
     Only targets the framework inferred are affected: a user-declared
-    forward replacement stays the escape hatch and is never dropped.
+    ``local_compute_fn`` stays the escape hatch and is never dropped.
     """
     if not inferred_targets:
         return
@@ -1030,11 +1017,17 @@ def _import_ep_target_for(module: Any, match: str) -> "Any":
     )
     factory_path = _ep_factory_table().get(fingerprint)
     if factory_path is None:
+        from hyper_parallel.distributed.expert_parallel.archetypes import (  # pylint: disable=C0415
+            format_supported_fingerprints,
+        )
+
         raise UnsupportedModuleStructure(
             f"{match!r} matched {type(module).__name__} with structure "
-            f"{fingerprint} that has no EP compute factory. Declare an "
-            "explicit replace.implementation to opt out of structure "
-            "detection."
+            f"{fingerprint} that has no EP compute factory. Supported "
+            f"structures: {format_supported_fingerprints()}. Implement the "
+            "missing capability (router adapter / shared mode / storage) or "
+            "declare an explicit local_compute_fn._target_ to opt out of "
+            "structure detection."
         )
     return _build_ep_target(factory_path)
 

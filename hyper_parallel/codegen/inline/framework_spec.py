@@ -18,23 +18,25 @@ This module replaces per-family ``render_spec.py`` files. Every fact a
 generated artifact needs is derived from the family's *existing runtime
 providers* plus the frozen plan, never from a family-name dispatch table:
 
-* a YAML ``replace.implementation._target_`` names the family's own
+* a YAML ``replace_module._target_`` names the family's own
   ``@module_replacement`` factory; inspecting that factory's source reveals
   which generic component it constructs (``RMSNorm`` / ``GroupedExperts`` /
   ``GQAAttention``) and, for fused attention, the kernel entry it hands over;
-* a YAML ``replace.implementation._target_`` that names a generic component class
+* a YAML ``replace_module._target_`` that names a generic component class
   directly (under ``hyper_parallel.components.``) resolves through that
   component's own wrap-style constructor -- the same declaration the native
   ``_target_replacement_factory`` builds, so no family factory is required;
-* a forward replacement implementation that names a known MoE archetype
+* a YAML ``local_compute_fn._target_`` that names a known MoE archetype
   factory resolves to that archetype's strategy kind / target class / boundary
   sub-patterns / EP body keys;
-* a CP forward replacement under the ``models/<family>/adapter``
-  convention resolves to the framework CP attention strategy (imports only).
+* a CP ``inner_wrapper`` target under the ``models/<family>/adapter``
+  convention resolves to the framework CP attention strategy — imports
+  only unless the family declares ``context_parallel_inline``, which
+  additionally materializes an in-artifact CP dispatch subclass;
 
 The source class name an artifact must model (``Qwen3MoeRMSNorm``) is not
-duplicated here either: it comes from the matched module's actual type in the
-compiled replacement record. No model-family codegen
+duplicated here either: it is read from the rule's own ``module_type``, which
+the YAML already carries for its type check. No model-family codegen
 declaration remains.
 
 Heavy resolution (importing the real generic component to render a fused
@@ -134,7 +136,7 @@ def _factory_function(target: str, model_type: str | None):
     return getattr(module, name, None)
 
 
-#: Module replacement implementations under this prefix name a generic component
+#: YAML ``replace_module`` targets under this prefix name a generic component
 #: class directly (``hyper_parallel.components.modules.engram.EngramModule``)
 #: -- the declaration the native path builds through
 #: ``_target_replacement_factory`` as ``Cls(module=..., module_fqn=...,
@@ -305,10 +307,10 @@ def replacement_spec_for(
     *,
     module_type: str | None = None,
 ) -> ReplacementSpec | None:
-    """Resolve a module replacement target to its structural component spec.
+    """Resolve a ``replace_module`` target to its structural component spec.
 
     ``module_type`` is the matched source module's dotted type path from the
-    compiled rule; the source class name (``old_ctor``) is its class name — a
+    YAML rule; the source class name (``old_ctor``) is its class name — a
     property of the matched source module, never a hand-written literal.
     """
     if target is None:
@@ -338,12 +340,13 @@ def _resolve_replacement_spec(
     Whatever component a family's factory constructs, the spec is derived from
     that factory's own source, so a new family (or a new component inside one)
     needs no codegen declaration.  A factory with no constructor call to sink --
-    or a record with no matched ``module_type`` naming the source class -- has
+    or a rule with no ``module_type`` naming the source class it replaces -- has
     no spec, and the rule is left to the native path.
     """
     del model_type, target
-    # The source class comes from the matched meta-model module. Without that
-    # recorded type there is no safe constructor call site to rewrite.
+    # The source class the constructor call replaces: without the rule's
+    # ``module_type`` there is no call site to rewrite, and guessing one would
+    # silently target the wrong class.
     old_ctor = class_name_of(module_type)
     if not old_ctor:
         return None
@@ -412,8 +415,46 @@ def _resolve_strategy_spec(
     if archetype is not None:
         return _ep_strategy_spec(archetype)
     if inner_wrapper and adapter_path_parts(target):
-        return StrategySpec(kind=CP_ATTENTION_KIND, imports=())
+        return _cp_strategy_spec(model_type)
     return None
+
+
+def _cp_strategy_spec(model_type: str | None) -> StrategySpec:
+    """Build the CP strategy spec: an inline subclass shell plus its imports.
+
+    A family that declares ``context_parallel_inline`` on its adapter spec
+    participates in inline CP: the materialization pass derives an
+    in-artifact subclass of the attention host whose forward falls back to
+    the parent when CP is disabled and delegates to the family helper when
+    active. The helper is the same kernel the runtime CP wrapper delegates
+    to (trainer and codegen share one CP implementation), and the import is
+    derived from the adapter declaration (the declaration's final segment
+    names the helper), so this module never hardcodes a family helper and
+    stays free of torch imports at resolution time.  ``subclass_state_attr``
+    carries the family kernel's companion attribute so the runtime binding
+    satisfies the identical contract the native wrapper installs.
+
+    Families without an inline helper keep the original framework CP
+    strategy (imports only), preserving the runtime wrapper path.
+    """
+    if not model_type:
+        return StrategySpec(kind=CP_ATTENTION_KIND, imports=())
+    from hyper_parallel.models.registry import get_model_adapter  # pylint: disable=C0415
+
+    adapter = get_model_adapter(model_type)
+    if adapter is None or not adapter.context_parallel_inline:
+        return StrategySpec(kind=CP_ATTENTION_KIND, imports=())
+    helper_module, _, helper_name = adapter.context_parallel_inline.rpartition(".")
+    from hyper_parallel.codegen.inline.templates import (  # pylint: disable=C0415
+        cp_dispatch_shell_body,
+    )
+
+    return StrategySpec(
+        kind=CP_ATTENTION_KIND,
+        subclass_shell=cp_dispatch_shell_body(helper_name),
+        subclass_state_attr=adapter.context_parallel_state_attr,
+        imports=(ImportPatch(helper_module, (helper_name,)),),
+    )
 
 
 def _ep_strategy_spec(archetype: Any) -> StrategySpec:
@@ -422,12 +463,17 @@ def _ep_strategy_spec(archetype: Any) -> StrategySpec:
     The inlined EP forward orchestrates through the instance-attribute channel
     (``self.ep_enable`` / ``self._hp_ep_group``) like every other generated
     forward, so it declares no module-level snippet.
+
+    The spec carries no target class on purpose: the MoE block class is a
+    per-model fact, and this spec is cached per capability target. The
+    materialization passes derive the concrete class from the frozen boundary
+    map (match pattern x class name), so a model naming its block anything at
+    all materializes without registration.
     """
     from hyper_parallel.codegen.inline.templates import moe_ep_forward_body  # pylint: disable=C0415
 
     return StrategySpec(
         kind=archetype.kind,
-        target_class=archetype.target_class,
         body_template=moe_ep_forward_body(
             router_kind=archetype.router_kind, shared=archetype.shared
         ),
@@ -461,6 +507,7 @@ def interface_component_class(model_type: str | None) -> str | None:
 def external_state_classes_for(
     model_type: str | None,
     injections: Iterable[Mapping[str, Any]] | None = None,
+    boundary_classes: Mapping[str, str] | None = None,
 ) -> tuple[str, ...]:
     """Classes whose ``forward`` an inline strategy body *replaces*.
 
@@ -470,7 +517,14 @@ def external_state_classes_for(
     orchestration body (the MoE EP shell).  Such a class owns its collectives,
     so it must keep its parameter sharding without a compiled boundary — it is
     skipped by the boundary / compute / inner-wrapper installers and reads its
-    parallel channel from install-time instance attributes instead.
+    parallel state from install-time instance attributes instead.
+
+    The class itself is a per-model fact derived from the frozen boundary map:
+    each injection records the concrete FQN it applies to, and the boundary
+    map names that FQN's class. A model naming its MoE block anything at all
+    is picked up without registration. A spec that still carries an explicit
+    ``target_class`` keeps it (literal mode, e.g. a future strategy that names
+    its own host class).
 
     A *rendered* component class (the class this family's replacement
     factories build, e.g. the fused attention) is deliberately NOT one of
@@ -483,9 +537,14 @@ def external_state_classes_for(
         spec = strategy_spec_for(
             _target_path(record.get("local_compute_fn")), model_type
         )
-        if spec is None or spec.body_template is None or spec.target_class is None:
+        if spec is None or spec.body_template is None:
             continue
-        inlined.add(spec.target_class)
+        if spec.target_class is not None:
+            inlined.add(spec.target_class)
+            continue
+        block_class = (boundary_classes or {}).get(record.get("match"))
+        if block_class is not None:
+            inlined.add(block_class)
     return tuple(sorted(inlined))
 
 
@@ -503,20 +562,20 @@ def declaration_summary(
     replacement_specs: dict[str, Any] = {}
     strategy_specs: dict[str, Any] = {}
     for entry in overrides or ():
-        action = entry.get("replace") or {}
-        target = _target_path(action.get("implementation"))
-        if target is None:
-            continue
-        if action.get("kind") == "module":
+        replace_target = _target_path(entry.get("replace_module"))
+        if replace_target is not None:
             spec = replacement_spec_for(
-                target, model_type, module_type=action.get("source_type")
+                replace_target, model_type, module_type=entry.get("module_type")
             )
-            replacement_specs[target] = asdict(spec) if spec is not None else None
-        elif action.get("kind") == "method" and entry.get("match", "").endswith(".forward"):
-            spec = strategy_spec_for(target, model_type)
-            if spec is None:
-                spec = strategy_spec_for(target, model_type, inner_wrapper=True)
-            strategy_specs[target] = asdict(spec) if spec is not None else None
+            replacement_specs[replace_target] = asdict(spec) if spec is not None else None
+        local_target = _target_path(entry.get("local_compute_fn"))
+        if local_target is not None:
+            spec = strategy_spec_for(local_target, model_type)
+            strategy_specs[local_target] = asdict(spec) if spec is not None else None
+        inner_target = _target_path(entry.get("inner_wrapper"))
+        if inner_target is not None:
+            spec = strategy_spec_for(inner_target, model_type, inner_wrapper=True)
+            strategy_specs[inner_target] = asdict(spec) if spec is not None else None
     return {"replacement_specs": replacement_specs, "strategy_specs": strategy_specs}
 
 

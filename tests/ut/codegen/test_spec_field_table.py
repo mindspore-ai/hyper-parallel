@@ -72,7 +72,10 @@ _KNOWN_REBUILD_KINDS = frozenset({
 })
 
 _S0 = Shard(0)
-_SM1 = Shard(1, uneven_shard=True)
+# A real negative-dim index (the planner's "last tensor dim" convention, as
+# produced by the lm_head template's ``Shard(-1)``) — frozen plans carry
+# these verbatim; uneven_shard placements never enter the frozen plan.
+_SM1 = Shard(-1)
 _PSUM = Partial("sum")
 _R = Replicate()
 
@@ -187,7 +190,7 @@ class TestFreezeLegacyShape(unittest.TestCase):
                     "q_proj.weight": {"tp": "S(0)"},
                     "k_proj.weight": {"tp": "S(0)"},
                 },
-                "in_src": {"hidden_states": {"tp": "S(-2)"}},
+                "in_src": {"hidden_states": {"tp": "S(-1)"}},
                 "in_dst": {"hidden_states": {"tp": "R"}},
                 "out_src": {"output": {"tp": "P(sum)"}},
                 "out_dst": {"output": {"tp": "R"}},

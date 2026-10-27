@@ -46,10 +46,12 @@ def emit_bundle(layout: ArtifactLayout, meta: Any) -> dict[str, str]:
     ``meta.covered`` is prepared by the manager before emission.
     """
     original_text = copy_original_modeling(meta.source)
-    generated_text = emit_modeling_file(meta)
+    generated_text = _strip_trailing_whitespace(emit_modeling_file(meta))
 
     modeling_name = os.path.basename(layout.modeling_path)
-    diff_text = emit_diff(original_text, generated_text, layout)
+    diff_text = _strip_trailing_whitespace(
+        emit_diff(original_text, generated_text, layout)
+    )
 
     logger.info(
         "codegen: rendered bundle %s (modeling %s, %d plan boundaries)",
@@ -62,7 +64,7 @@ def emit_bundle(layout: ArtifactLayout, meta: Any) -> dict[str, str]:
         # in a temp sibling and swaps the whole directory in.
         modeling_name: generated_text,
         os.path.basename(layout.diff_path): diff_text,
-        "__init__.py": emit_init_file(layout),
+        "__init__.py": _strip_trailing_whitespace(emit_init_file(layout)),
     }
     # A ``<remote>`` source is
     # shipped inside the checkpoint and uses single-dot relative imports
@@ -90,6 +92,11 @@ def emit_bundle(layout: ArtifactLayout, meta: Any) -> dict[str, str]:
         if siblings:
             meta.remote_siblings = sorted(siblings)
     return files
+
+
+def _strip_trailing_whitespace(text: str) -> str:
+    """Keep generated artifacts clean without changing their line structure."""
+    return "".join(f"{line.rstrip()}\n" for line in text.splitlines())
 
 
 def emit_init_file(layout: ArtifactLayout) -> str:

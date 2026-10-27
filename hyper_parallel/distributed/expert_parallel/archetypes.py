@@ -16,12 +16,17 @@
 
 The MoE dispatch is selected by *module structure* (never by model identity).
 Every ep-strategy fact the generated artifact needs -- the strategy ``kind``,
-the block ``target_class``, the ``external_state_classes``, the
-``strip_boundary_subpatterns``, the ``moe_ep_forward`` structural keys -- is
-owned here, keyed by the ``detect_moe_structure`` fingerprint. The codegen
+the ``strip_boundary_subpatterns``, the ``moe_ep_forward`` structural keys --
+is owned here, keyed by the ``detect_moe_structure`` fingerprint. The codegen
 framework projects from this table instead of hand-writing family-named
 literals; the manager reuses the same single source for the compute-factory
 ``_target_``.
+
+The table is a pure *capability* matrix: it declares what the framework can
+orchestrate for a structure, never which class carries it. The concrete block
+class (``DeepseekV3MoE``, ``DeepseekV32MoE``, any custom name) is a model
+fact the codegen pipeline derives per artifact from the frozen boundary map,
+so a new model with a known structure needs no registration here.
 """
 
 from __future__ import annotations
@@ -36,13 +41,17 @@ FINGERPRINT_STORAGE = 2
 
 @dataclass(frozen=True)
 class MoeArchetype:
-    """Inline EP declarations that structure detection proves for a MoE."""
+    """Inline EP capabilities that structure detection proves for a MoE.
+
+    Deliberately carries no target class: the concrete MoE block class is a
+    per-model fact (any custom model may name it anything) and is derived by
+    the codegen pipeline from the frozen boundary map at materialization
+    time. This table only answers "what can the framework orchestrate for
+    this structural fingerprint".
+    """
 
     #: Structure-keyed strategy ``kind`` (not a model-family dispatch literal).
     kind: str
-    #: The MoE block class name (a structural result, not a family anchor).
-    #: Its forward is fully inlined, so it is also an external-state class.
-    target_class: str
     strip_boundary_subpatterns: tuple[str, ...]
     #: Runtime router-adapter key the generic ``moe_ep_forward`` resolves
     #: through ``MOE_ROUTER_ADAPTERS``. This is the *merge contract* key and
@@ -58,7 +67,6 @@ class MoeArchetype:
 _MOE_ARCHETYPE_BY_STRUCTURE = {
     ("topk_router_module", "none", "batched_parameters"): MoeArchetype(
         kind="moe_ep_routed",
-        target_class="Qwen3MoeSparseMoeBlock",
         strip_boundary_subpatterns=(),
         router_kind="topk_router_module",
         shared="none",
@@ -69,7 +77,6 @@ _MOE_ARCHETYPE_BY_STRUCTURE = {
     ),
     ("topk_router_module", "additive", "batched_parameters"): MoeArchetype(
         kind="moe_ep_routed",
-        target_class="DeepseekV3MoE",
         strip_boundary_subpatterns=("experts.*", "shared_experts"),
         router_kind="sigmoid_group",
         shared="additive",
@@ -104,22 +111,24 @@ def ep_compute_factory_for(router: str, shared_experts: str, expert_storage: str
     return archetype.compute_factory if archetype is not None else None
 
 
-def moe_external_state_classes(router: str, shared_experts: str, expert_storage: str) -> tuple[str, ...]:
-    """Return the external-state classes structure proves for a MoE fingerprint.
+def supported_fingerprints() -> tuple[tuple[str, str, str], ...]:
+    """The structure fingerprints the framework has EP capabilities for."""
+    return tuple(sorted(_MOE_ARCHETYPE_BY_STRUCTURE))
 
-    A MoE whose forward is fully inlined takes its parallel state externally,
-    so its own block class is an external-state class. Any additional classes
-    the same inline pipeline generates (for example a replaced attention
-    component) are contributed by their own declarations, not here.
-    """
-    archetype = moe_archetype(router, shared_experts, expert_storage)
-    return (archetype.target_class,) if archetype is not None else ()
+
+def format_supported_fingerprints() -> str:
+    """Human-readable support matrix for fail-fast diagnostics."""
+    return "; ".join(
+        f"(router={router}, shared={shared}, storage={storage})"
+        for router, shared, storage in supported_fingerprints()
+    )
 
 
 __all__ = [
     "MoeArchetype",
     "ep_compute_factory_for",
+    "format_supported_fingerprints",
     "moe_archetype",
     "moe_archetypes",
-    "moe_external_state_classes",
+    "supported_fingerprints",
 ]
