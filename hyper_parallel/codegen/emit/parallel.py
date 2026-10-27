@@ -49,8 +49,8 @@ stay valid when combined with the body replacement), and the public
   the instance-bound compiled plan (``self._hp_boundary``, bound once by
   ``hp_install_boundaries``), with a declarative comment block annotating
   what each side's transitions lower to.
-- ``region`` (EP MoE local region): redistribute in,
-  ``__hp_compute__`` (bound by ``hp_parallelize``), re-wrap locals per
+- ``region`` (EP MoE local region): redistribute in, call the explicit
+  factory-named attribute bound by ``hp_parallelize``, re-wrap locals per
   ``out_src``, redistribute out.
 
 A CP inner-wrapper boundary is ``generic`` in the generated code: the wrapper
@@ -92,6 +92,7 @@ from hyper_parallel.codegen.plan.boundary_forms import (
     is_boundary_entry,
 )
 from hyper_parallel.codegen.plan.freeze import parse_placement
+from hyper_parallel.codegen.patch_plan import local_compute_binding_name
 
 #: Injection keys that describe how a boundary's compute is regioned.
 _INJECTION_KEYS = ("inner_wrapper", "inner_target", "inner_out_src", "local_compute_fn")
@@ -895,8 +896,8 @@ def _build_forward_body(
     form after the static gates).  The redistribute calls go through the
     instance-bound compiled plan (``self._hp_boundary``, installed by
     ``hp_install_boundaries``); the static ``tp_collective`` form calls bare
-    operators on ``self._hp_tp`` instead; ``__hp_compute__`` is bound by
-    ``hp_bind_compute`` for the local-region shape. Either way the class
+    operators on ``self._hp_tp`` instead; the factory-named compute attribute
+    is bound by ``hp_bind_compute`` for the local-region shape. Either way the class
     stays runtime-importable without a mesh.
 
     ``deferred_bias`` (D-22) appends the exit hook call
@@ -1148,8 +1149,8 @@ def _render_local_compute(
 ) -> str:
     """Local-region boundary (shape 2, EP MoE): compute fn on local tensors, then exit.
 
-    ``__hp_compute__`` is ``functools.partial(compute_fn, module)`` bound by
-    ``hp_parallelize``. The applier calls it as ``compute_fn(*args,
+    The factory-named attribute is ``functools.partial(compute_fn, module)``
+    bound by ``hp_parallelize``. The applier calls it as ``compute_fn(*args,
     **kwargs)`` (``_wrap_local_region_forward``), so the generated forward
     forwards its own re-distributed ``*args, **kwargs`` through.  The local
     Production keeps the compute output local so the lowered boundary
@@ -1162,6 +1163,7 @@ def _render_local_compute(
     identity in/out region emits no noise.
     """
     compute_name = _callable_name(local)
+    binding_name = local_compute_binding_name(local)
     return "\n".join([
         "        # [HYPER LOCAL REGION] boundary entry",
         *_ordered_notes(form.in_notes),
@@ -1174,7 +1176,7 @@ def _render_local_compute(
         "",
         "        # [HYPER LOCAL REGION] run the region compute fn on local tensors",
         f"        # {compute_name} is bound to self by hp_parallelize.",
-        "        outputs = self.__hp_compute__(*args, **kwargs)",
+        f"        outputs = self.{binding_name}(*args, **kwargs)",
         "",
         "        # [HYPER LOCAL REGION] boundary exit",
         *_ordered_notes(form.out_notes),
@@ -1187,7 +1189,12 @@ def _render_local_compute(
 def _callable_name(value: Any) -> str:
     """Human name for an injection's callable (dict target / string / fn)."""
     if isinstance(value, dict):
-        return value.get("name") or value.get("target") or repr(value)
+        return (
+            value.get("_target_")
+            or value.get("name")
+            or value.get("target")
+            or repr(value)
+        )
     if isinstance(value, str):
         return value
     return getattr(value, "__name__", repr(value))
