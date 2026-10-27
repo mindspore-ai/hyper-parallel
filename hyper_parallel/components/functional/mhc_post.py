@@ -18,6 +18,8 @@ from typing import Any, Tuple
 
 import torch  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.components.functional._cann_mhc import cann_mhc_post, validate_mhc_backend
+
 try:
     import omni_training_custom_ops  # noqa: F401  # pylint: disable=unused-import
 except ImportError:
@@ -69,6 +71,8 @@ def mhc_post(
     h_post: torch.Tensor,
     h_res: torch.Tensor,
     num_stream: int,
+    *,
+    backend: str = "omni",
 ) -> torch.Tensor:
     """Combine transformed and residual streams after an MHC-wrapped block.
 
@@ -78,10 +82,14 @@ def mhc_post(
         h_post: Per-stream output mixing coefficients.
         h_res: Residual stream mixing matrix.
         num_stream: Number of residual streams.
+        backend: Explicit implementation, ``"omni"`` (default) or ``"cann"``.
 
     Returns:
         Flattened mixed residual streams.
     """
+    validate_mhc_backend(backend)
+    if backend == "cann":
+        return cann_mhc_post(x, residual, h_post, h_res, num_stream)
     x_shape = x.size()
     residual = residual.reshape(x_shape[0], x_shape[1], num_stream, -1)
     if x.device.type == "npu" and omni_training_custom_ops is not None:

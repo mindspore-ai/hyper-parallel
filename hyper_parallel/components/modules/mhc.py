@@ -23,6 +23,7 @@ import torch  # pylint: disable=forbidden-backend-import
 import torch.nn.functional as F  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.components.functional._cann_mhc import validate_mhc_backend
 from hyper_parallel.components.functional.mhc_post import mhc_post
 from hyper_parallel.components.functional.mhc_pre import mhc_pre
 from hyper_parallel.components.functional.sinkhorn import sinkhorn, sinkhorn_knopps
@@ -81,6 +82,7 @@ class MhcPreModule(nn.Module):
         module: nn.Module,
         module_fqn: str = "",
         context: Mapping[str, Any] | None = None,
+        backend: str = "omni",
     ) -> None:
         """Build the high-performance MHC pre module from an existing module.
 
@@ -88,6 +90,7 @@ class MhcPreModule(nn.Module):
             module: Source MHC pre module with the existing parameter layout.
             module_fqn: Fully qualified source-module name supplied by replacement.
             context: Replacement context supplied by Trainer.
+            backend: Explicit mHC implementation, ``"omni"`` or ``"cann"``.
 
         Raises:
             TypeError: If required source attributes or settings are missing.
@@ -95,6 +98,8 @@ class MhcPreModule(nn.Module):
         """
         super().__init__()
         del module_fqn, context
+        validate_mhc_backend(backend)
+        self.backend = backend
         self.config = getattr(module, "config", None)
         self.num_stream = _num_stream(module)
         self.layer_number = getattr(module, "layer_number", 1)
@@ -150,6 +155,7 @@ class MhcPreModule(nn.Module):
             self.norm_eps,
             self.hc_eps,
             gamma,
+            backend=self.backend,
         )
 
 
@@ -163,6 +169,7 @@ class MhcPostModule(nn.Module):
         module: nn.Module,
         module_fqn: str = "",
         context: Mapping[str, Any] | None = None,
+        backend: str = "omni",
     ) -> None:
         """Build the high-performance MHC post module from an existing module.
 
@@ -170,9 +177,12 @@ class MhcPostModule(nn.Module):
             module: Source MHC post module.
             module_fqn: Fully qualified source-module name supplied by replacement.
             context: Replacement context supplied by Trainer.
+            backend: Explicit mHC implementation, ``"omni"`` or ``"cann"``.
         """
         super().__init__()
         del module_fqn, context
+        validate_mhc_backend(backend)
+        self.backend = backend
         self.config = getattr(module, "config", None)
         self.num_stream = _num_stream(module)
         self.train(module.training)
@@ -191,6 +201,7 @@ class MhcPostModule(nn.Module):
             h_post,
             h_res,
             self.num_stream,
+            backend=self.backend,
         )
 
 
