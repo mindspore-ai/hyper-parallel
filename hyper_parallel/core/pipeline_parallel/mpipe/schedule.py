@@ -102,7 +102,8 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
                  kwargs_batch_dim: "Optional[BatchDimSpec]" = None,
                  output_concat_dim: Optional[int] = None,
                  overlap_p2p: bool = False,
-                 swap: bool = False) -> None:
+                 swap: bool = False,
+                 fsdp_comm_first: bool = False) -> None:
         """Build an interleaved-1F1B schedule that transposes the preprocess block.
 
         Args:
@@ -117,6 +118,9 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
             output_concat_dim (Optional[int]): Output concatenation dim (forwarded to the base).
             overlap_p2p (bool): Whether to overlap P2P (forwarded to the base).
             swap (bool): Whether to enable activation swapping (forwarded to the base).
+            fsdp_comm_first (bool): Front-load every local chunk's HSDP all-gather
+                at the schedule head, masked by the warmup bubble (forwarded to
+                the base).
         """
         if not isinstance(num_transpose_layers, int) or num_transpose_layers < 0:
             raise ValueError(
@@ -145,7 +149,8 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
                          output_concat_dim=output_concat_dim,
                          overlap_p2p=overlap_p2p,
                          overlap_b_f=False,
-                         swap=swap)
+                         swap=swap,
+                         fsdp_comm_first=fsdp_comm_first)
         self._executor = None
         self._setup_mpipe_execution()
 
