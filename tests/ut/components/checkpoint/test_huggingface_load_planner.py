@@ -39,6 +39,7 @@ from hyper_parallel.components.checkpoint.huggingface_load_planner import (
     HFLoadPlanner,
     load_hf_checkpoint,
 )
+from hyper_parallel.models._transformers.checkpoint_loader import _build_finalize_targets
 
 _QKV_SOURCES = ["q_proj.weight", "k_proj.weight", "v_proj.weight"]
 
@@ -125,6 +126,40 @@ def _replacement_mapping() -> list[Any]:
 
 class TestHFLoadPlanner(unittest.TestCase):
     """The DCP loader has to load what the legacy loader loads."""
+
+    def test_pipeline_aliases_load_original_names_with_both_loaders(self):
+        """Both loaders resolve original HF names to stage-local parameters and buffers."""
+        weight = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        scale = torch.tensor([3.0])
+        path = str(self._checkpoint_dir({"layer.weight": weight, "layer.scale": scale}))
+        for loader in ("legacy", "dcp"):
+            with self.subTest(loader=loader):
+                stage = nn.Module()
+                stage.layer = nn.Linear(4, 2, bias=False)
+                stage.layer.register_buffer("scale", torch.zeros(1))
+                stage.layer.register_buffer("scratch", torch.zeros(1), persistent=False)
+                model = nn.Module()
+                model.parts = nn.ModuleList([stage])
+                model.checkpoint_fqn_aliases = {
+                    "layer.weight": "parts.0.layer.weight",
+                    "layer.scale": "parts.0.layer.scale",
+                    "layer.scratch": "parts.0.layer.scratch",
+                    "other_stage.weight": "parts.1.layer.weight",
+                }
+                state = {"model": model}
+
+                HuggingFaceCheckpointer(loader=loader, weights_mapping=[]).load(path, state)
+
+                torch.testing.assert_close(stage.layer.weight, weight, rtol=0, atol=0)
+                torch.testing.assert_close(stage.layer.scale, scale, rtol=0, atol=0)
+                report = state["load_report"]
+                self.assertEqual(report.missing_keys, (), f"unexpected missing targets: {report.missing_keys}")
+                self.assertEqual(report.unexpected_keys, (), f"unexpected checkpoint keys: {report.unexpected_keys}")
+                targets = _build_finalize_targets(model)
+                for name in report.loaded_keys:
+                    self.assertIn(name, targets, f"loaded key absent from finalization targets: {name}")
+                self.assertIs(targets["layer.weight"].tensor, stage.layer.weight)
+                self.assertIs(targets["layer.scale"].tensor, stage.layer.scale)
 
     def _checkpoint_dir(self, tensors: dict[str, torch.Tensor], file_name: str = "model.safetensors") -> Path:
         """A checkpoint directory holding ``tensors`` in one file, removed once the test is done."""

@@ -57,6 +57,10 @@ def _init_topology_mesh(mesh_kwargs: dict[str, Any]) -> Any:
 class MeshContext:
     """Runtime topology and the mesh domains consumed by dual-mode Trainer."""
     device_mesh: Any = None
+    # One-dimensional PP mesh for the same dense/TP/CP coordinate across
+    # stage blocks. ``device_mesh`` intentionally remains stage-local for
+    # TP/CP/FSDP planning, so PP consumers must use this explicit domain.
+    pp_mesh: Any = None
     fsdp_non_moe_mesh: Any = None
     fsdp_moe_mesh: Any = None
     dp_size: int = 1
@@ -154,21 +158,32 @@ class MeshContext:
             )
 
         init_backend = dist.is_initialized()
-        stage_rank_start = 0
         if init_backend and self.pp_size > 1:
-            stage_rank_start = (dist.get_rank() // dense_world_size) * dense_world_size
-        stage_rank_list = tuple(
-            range(stage_rank_start, stage_rank_start + dense_world_size)
-        )
-        device_mesh_kwargs = {
-            "device_type": device_type,
-            "mesh_shape": (self.dp_size, self.cp_size, self.tp_size),
-            "mesh_dim_names": ("dp", "cp", "tp"),
-            "init_backend": init_backend,
-        }
-        if init_backend:
-            device_mesh_kwargs["rank_list"] = stage_rank_list
-        self.device_mesh = _init_topology_mesh(device_mesh_kwargs)
+            # Construct one global topology first. Every rank therefore
+            # creates the same process groups in the same order. Slicing this
+            # root gives the stage-local dense mesh and the cross-stage PP
+            # line; creating two unrelated meshes here can deadlock Torch's
+            # new_group rendezvous when TP and PP are both active.
+            root_mesh = _init_topology_mesh({
+                "device_type": device_type,
+                "mesh_shape": (self.pp_size, self.dp_size, self.cp_size, self.tp_size),
+                "mesh_dim_names": ("pp", "dp", "cp", "tp"),
+                "init_backend": True,
+                "rank_list": tuple(range(world_size)),
+            })
+            self.device_mesh = root_mesh[("dp", "cp", "tp")]
+            self.pp_mesh = root_mesh["pp"]
+        else:
+            stage_rank_list = tuple(range(dense_world_size))
+            device_mesh_kwargs = {
+                "device_type": device_type,
+                "mesh_shape": (self.dp_size, self.cp_size, self.tp_size),
+                "mesh_dim_names": ("dp", "cp", "tp"),
+                "init_backend": init_backend,
+            }
+            if init_backend:
+                device_mesh_kwargs["rank_list"] = stage_rank_list
+            self.device_mesh = _init_topology_mesh(device_mesh_kwargs)
 
         dense_rank_list = (
             tuple(self.device_mesh.rank_list)
@@ -257,6 +272,7 @@ class DistributedSetup:
     mesh_context: MeshContext = field(default_factory=MeshContext)
     strategy_config: Any = None
     pipeline_config: Any = None
+    pipeline_batch_size: int | None = None
     moe_parallel_config: Any = None
     activation_checkpointing: Any = None
     # Normalized ``{match: ModuleShardingSpec}`` mapping (or None) — the

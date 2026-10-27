@@ -260,6 +260,20 @@ class TextTrainer:
 
         self.on_step_begin()
         self.base.model_integration.begin_step(self.base.state.global_step + 1)
+
+        # A pipeline model owns the complete forward/backward schedule.  The
+        # text trainer's normal path invokes ``model(**inputs)`` once per
+        # micro-batch, which is invalid for AutoPipeline (its forward is an
+        # intentional guard).  Materialize one DP-local pipeline batch through
+        # the existing batch adapter, then let the schedule split it into PP
+        # micro-batches and transport activations between stages.
+        if (
+            hasattr(self.base.model, "step")
+            and callable(self.base.model.step)
+            and getattr(self.base.model, "info", None) is not None
+        ):
+            return self._pipeline_train_step(data_iterator, num_micro_steps)
+
         synchronize()
 
         total_loss = 0.0
@@ -301,6 +315,82 @@ class TextTrainer:
             "loss": total_loss,
             "grad_norm": grad_norm_value,
         }
+
+    @staticmethod
+    def _concat_pipeline_inputs(inputs: list[dict[str, Any]]) -> dict[str, Any]:
+        """Concatenate tensor-valued batch fields along the sample dimension."""
+        if not inputs:
+            return {}
+        result = {}
+        for key in inputs[0]:
+            values = [item[key] for item in inputs if key in item]
+            if values and all(isinstance(value, torch.Tensor) for value in values):
+                result[key] = torch.cat(values, dim=0)
+            elif values:
+                # Auxiliary metadata is normally identical across the local
+                # micro-batches; retain the first value for schedule kwargs.
+                result[key] = values[0]
+        return result
+
+    def _pipeline_train_step(self, data_iterator: Any, num_micro_steps: int) -> Dict[str, float]:
+        """Run one optimizer update through AutoPipeline."""
+        model_inputs = []
+        loss_inputs = []
+        for _ in range(num_micro_steps):
+            model_batch, loss_batch = self.base.get_batch(data_iterator)
+            model_batch = self.base.preforward(model_batch)
+            loss_batch = self.base.preforward(loss_batch)
+            self.base.model_integration.record_batch(model_batch, loss_batch)
+            token_counts = count_loss_token(loss_batch)
+            self.on_micro_step_begin({
+                **model_batch, **loss_batch,
+                "token_count": token_counts["foundation_tokens"],
+            })
+            model_inputs.append(dict(model_batch))
+            loss_inputs.append(dict(loss_batch))
+
+        batch = self._concat_pipeline_inputs(model_inputs)
+        losses_batch = self._concat_pipeline_inputs(loss_inputs)
+        input_ids = batch.pop("input_ids", None)
+        labels = losses_batch.get("labels", batch.pop("labels", None))
+        self.base.step_token_counts = count_loss_token(losses_batch)
+        optimizers = self.base.optimizer if isinstance(self.base.optimizer, list) else [self.base.optimizer]
+        for optimizer in optimizers:
+            optimizer.zero_grad()
+        losses = self.base.model.step(
+            input_ids if self.base.model.info.has_first_stage else None,
+            target=labels if self.base.model.info.has_last_stage else None,
+            **batch,
+        )
+        loss = sum(losses) if losses else torch.zeros((), device=self.base.device)
+        # Only the last PP stage produces the schedule loss.  Broadcast the
+        # scalar across each PP line for consistent Trainer metrics (the loss
+        # graph has already been consumed by schedule.backward at this point).
+        metric_loss = loss.detach().clone()
+        if torch.distributed.is_initialized() and self.base.model.info.stages:
+            # Use the world group rather than a stage-local handle: every
+            # rank participates here, while only the last-stage replica(s)
+            # contribute a non-zero value.  Averaging by the number of
+            # replicas of the last stage yields one consistent scalar for
+            # rank-0 logging regardless of TP/CP/DP layout.
+            pp_size = self.base.model.pp_mesh.size()
+            torch.distributed.all_reduce(metric_loss)
+            metric_loss = metric_loss / (torch.distributed.get_world_size() / pp_size)
+        grad_norm = self.base.prepare_optimizer_step()
+        self.base.step_optimizers_and_schedulers()
+
+        self.base.state.global_step += 1
+        grad_norm_value = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
+        loss_value = metric_loss.item()
+        self.base._end_model_integration_step(  # pylint: disable=protected-access
+            {"loss": loss_value, "grad_norm": grad_norm_value}
+        )
+        self.on_step_end(
+            loss=loss_value,
+            loss_dict={"loss": loss.detach()},
+            grad_norm=grad_norm_value,
+        )
+        return {"loss": loss_value, "grad_norm": grad_norm_value}
 
     def train(self) -> None:
         """Run the configured global optimizer steps by Dataset epoch."""

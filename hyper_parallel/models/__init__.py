@@ -74,6 +74,10 @@ _LAZY_FACADE_EXPORTS = {
     "HyperAutoModelForCausalLM": "hyper_parallel.models._transformers",
     "HyperAutoModelForImageTextToText": "hyper_parallel.models._transformers",
     "HyperAutoModelForSequenceClassification": "hyper_parallel.models._transformers",
+    # AutoModel-style pipeline facade.  Keep it lazy so importing the models
+    # package remains side-effect free for config-only callers.
+    "AutoPipeline": "hyper_parallel.models._transformers",
+    "PipelineConfig": "hyper_parallel.models._transformers",
 }
 
 _LAZY_MATERIALIZATION_EXPORTS = {
@@ -102,6 +106,7 @@ __all__ = [
     "CompileConfig",
     "CheckpointValidationSpec",
     "DataValidationSpec",
+    "AutoPipeline",
     "FSDP2Config",
     "FSDP2MixedPrecisionConfig",
     "HyperAutoModelForCausalLM",
@@ -121,6 +126,7 @@ __all__ = [
     "SharedStateValidationSpec",
     "StateInvariantSpec",
     "TopologyConstraint",
+    "PipelineConfig",
     "get_model_adapter",
     "normalize_build_options",
     "rebuild_materialized_state",

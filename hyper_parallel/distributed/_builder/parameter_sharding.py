@@ -53,7 +53,16 @@ def _get_attr_by_path(model, fqn):
     """Fetch an attribute along a dotted FQN (numeric segments index into ModuleLists)."""
     obj = model
     for p in fqn.split("."):
-        obj = obj[int(p)] if p.isdigit() else getattr(obj, p)
+        if p.isdigit():
+            # ``ModuleList`` accepts integer indices while a PP stage keeps
+            # original layer keys in a ``ModuleDict`` (for FQN stability).
+            # Resolve both forms without changing the public FQN.
+            try:
+                obj = obj[int(p)]
+            except (KeyError, IndexError, TypeError):
+                obj = obj[p]
+        else:
+            obj = getattr(obj, p)
     return obj
 
 
@@ -67,7 +76,13 @@ def _set_param_by_path(model: nn.Module, fqn: str, new_param) -> None:
     *path, leaf = fqn.split(".")
     obj = model
     for p in path:
-        obj = obj[int(p)] if p.isdigit() else getattr(obj, p)
+        if p.isdigit():
+            try:
+                obj = obj[int(p)]
+            except (KeyError, IndexError, TypeError):
+                obj = obj[p]
+        else:
+            obj = getattr(obj, p)
     if hasattr(obj, "register_parameter"):
         obj.register_parameter(leaf, new_param)
     else:
@@ -88,7 +103,13 @@ def _resolve_module(model, fqn):
     if not fqn:
         return obj
     for p in fqn.split("."):
-        obj = obj[int(p)] if p.isdigit() else getattr(obj, p)
+        if p.isdigit():
+            try:
+                obj = obj[int(p)]
+            except (KeyError, IndexError, TypeError):
+                obj = obj[p]
+        else:
+            obj = getattr(obj, p)
     return obj
 
 
@@ -138,7 +159,13 @@ def _temp_local_params(module, exclude=()):
             *path, leaf = name.split(".")
             owner = module
             for part in path:
-                owner = owner[int(part)] if part.isdigit() else getattr(owner, part)
+                if part.isdigit():
+                    try:
+                        owner = owner[int(part)]
+                    except (KeyError, IndexError, TypeError):
+                        owner = owner[part]
+                else:
+                    owner = getattr(owner, part)
             owner._parameters[leaf] = param.to_local()  # pylint: disable=protected-access
     try:
         yield
@@ -162,7 +189,10 @@ def _install_stacked_expert_holders(module: nn.Module, holders: Dict[str, Dict[s
         *path, leaf = parent_path.split(".")
         obj = module
         for seg in path:
-            obj = obj[int(seg)] if seg.isdigit() else getattr(obj, seg)
+            if isinstance(obj, nn.ModuleDict):
+                obj = obj[seg]
+            else:
+                obj = obj[int(seg)] if seg.isdigit() else getattr(obj, seg)
         setattr(obj, leaf, holder)   # replace the original ModuleList (original expert params freed)
 
 

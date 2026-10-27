@@ -1008,6 +1008,46 @@ class BaseTrainer(Stateful, ABC):
         self.on_step_begin(micro_batches=micro_batches)
         self.model_integration.begin_step(self.state.global_step)
 
+        # Pipeline models own their forward/backward schedule.  The Trainer
+        # still owns gradient clipping and optimizer/scheduler lifecycle, but
+        # must not call a stage module directly or run per-microbatch FSDP
+        # controls a second time.
+        if (
+            hasattr(self.model, "step")
+            and callable(self.model.step)
+            and getattr(self.model, "info", None) is not None
+        ):
+            optimizer_list = self.optimizer if isinstance(self.optimizer, list) else [self.optimizer]
+            for optimizer in optimizer_list:
+                optimizer.zero_grad()
+            batch = {}
+            for key in micro_batches[0]:
+                values = [micro_batch[key] for micro_batch in micro_batches if key in micro_batch]
+                if not values:
+                    continue
+                if all(isinstance(value, torch.Tensor) for value in values):
+                    batch[key] = torch.cat(values, dim=0)
+                else:
+                    batch[key] = values[0]
+            input_ids = batch.pop("input_ids")
+            labels = batch.pop("labels", None)
+            losses = self.model.step(
+                input_ids if self.model.info.has_first_stage else None,
+                target=labels if self.model.info.has_last_stage else None,
+                **batch,
+            )
+            loss = sum(losses) if losses else torch.zeros((), device=self.device)
+            grad_norm = self.prepare_optimizer_step()
+            self.step_optimizers_and_schedulers()
+            grad_norm_value = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
+            self._end_model_integration_step({"loss": loss.item(), "grad_norm": grad_norm_value})
+            self.on_step_end(
+                loss=loss.item(),
+                loss_dict={"loss": loss.detach()},
+                grad_norm=grad_norm_value,
+            )
+            return {"loss": loss.item(), "grad_norm": grad_norm_value}
+
         # Forward and backward for each micro batch
         synchronize()
 

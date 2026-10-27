@@ -1,4 +1,4 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2025-2026 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -202,12 +202,16 @@ def create_distributed_setup_from_config(cfg: Any) -> DistributedSetup:
         return DistributedSetup(mesh_context=MeshContext())
 
     fsdp_config = cfg.fsdp_config
+    pipeline_config = getattr(cfg, "pipeline", None)
     dp_shard_size = max(1, fsdp_config.dp_shard_size)
     edp_shard_size = max(1, fsdp_config.edp_shard_size)
     tp_size = max(1, accel.tp_size)
     cp_size = max(1, accel.cp_size)
     pp_size = max(1, accel.pp_size)
     ep_size = max(1, accel.ep_size)
+    pipeline_enabled = pipeline_config is not None and pipeline_config.enabled
+    if pipeline_enabled != (pp_size > 1):
+        raise ValueError("pipeline.enabled must be true exactly when accelerator.pp_size > 1")
 
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     dp_size, dp_replicate_size = _resolve_data_parallel_sizes(
@@ -217,6 +221,14 @@ def create_distributed_setup_from_config(cfg: Any) -> DistributedSetup:
         pp_size,
         dp_shard_size,
     )
+    pipeline_batch_size = None
+    if pipeline_enabled:
+        global_batch_size = int(cfg.training.global_batch_size)
+        if global_batch_size % dp_size != 0:
+            raise ValueError("training.global_batch_size must be divisible by dp_size")
+        pipeline_batch_size = global_batch_size // dp_size
+        if pipeline_batch_size <= 0 or pipeline_batch_size % pipeline_config.pp_microbatch_size != 0:
+            raise ValueError("DP-local batch size must be positive and divisible by pipeline.pp_microbatch_size")
     mesh_context = MeshContext(
         dp_size=dp_size,
         dp_replicate_size=dp_replicate_size,
@@ -247,6 +259,8 @@ def create_distributed_setup_from_config(cfg: Any) -> DistributedSetup:
     return DistributedSetup(
         mesh_context=mesh_context,
         strategy_config=strategy_config,
+        pipeline_config=pipeline_config,
+        pipeline_batch_size=pipeline_batch_size,
         # plan_overrides/module_replacements stay unset here: the Trainer
         # desugars the raw YAML entries onto the setup (05 §15.2.6) before
         # model construction.

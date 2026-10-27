@@ -7,6 +7,116 @@ family:
 - `qwen3_moe/`: cropped and full-model Qwen3-MoE text demos;
 - `deepseek_v41/`: DeepSeek-V4.1 text/VLM crops and validation tooling.
 
+## Pipeline parallel training
+
+For the first dense Qwen3 PP integration, use
+`train_cropped_qwen3_pp.yaml`. It crops a local dense Qwen3 to four decoder
+layers, creates two pipeline stages, and uses GPipe with four one-sample
+micro-batches:
+
+```bash
+torchrun --standalone --nproc_per_node=2 \
+  --module examples.training_demo.train_text \
+  examples/training_demo/train_cropped_qwen3_pp.yaml \
+  --model.config_path=/path/to/Qwen3 \
+  --dataset.model_assets.tokenizer.pretrained_model_name_or_path=/path/to/Qwen3
+```
+
+The model builder also supports a self-contained tiny `Qwen3Config` when
+called with `config_path=None`, which is useful for unit tests without a
+checkpoint.
+
+For a mixed-parallel launch, keep the same model recipe and set the topology
+to a product of stage-local and cross-stage domains. For example, on 16
+devices:
+
+```yaml
+accelerator:
+  pp_size: 2
+  tp_size: 2
+  cp_size: 2
+  ep_size: 1                 # use ep_size: 2 for a Qwen3-MoE recipe
+fsdp_config:
+  dp_shard_size: 2
+pipeline:
+  enabled: true
+  schedule: 1f1b
+  pp_microbatch_size: 1
+  split: []
+  p2p_overlap: true
+  p2p_multi_stream: false
+```
+
+For Qwen3-MoE, retain the model-family CP/EP `plan_overrides` from
+`qwen3_moe/train_parallel_online.yaml`; those overrides provide the explicit CP
+attention wrapper and EP local compute factory required by AutoModel.
+
+The ready-to-run eight-device entry enables all currently composable model
+parallel modes (`PP=2`, `TP=2`, `CP=2`, `EP=2`, and FSDP over `DP*CP=2`):
+
+```bash
+bash examples/training_demo/run_parallel_pp_online.sh /path/to/Qwen3-30B-A3B
+```
+
+### PP and VPP configuration
+
+Set `pipeline.enabled: true` together with `accelerator.pp_size > 1`.
+When PP is disabled, use `pipeline.enabled: false` and `pp_size: 1`.
+`schedule` accepts `gpipe`, `1f1b`, and `interleaved1f1b`. `split` specifies Transformer layer
+counts, excluding embedding, final norm, and LM head:
+
+- `split: []` balances layers over the physical PP ranks, with one stage per rank.
+- `split: [2, 3, 3, 2]` assigns a ten-layer model to four ranks explicitly.
+- `split: [[1, 1, 1, 1], [1, 2, 2, 1]]` assigns the same ten layers to eight
+  logical stages on four ranks. Each row is one virtual chunk and each column
+  is one PP rank. Logical stages follow row order; rank `r` owns stages `r`
+  and `r + pp_size`. Nested splits are VPP and require the explicit
+  `schedule: interleaved1f1b`; ordinary `1f1b` and `gpipe` are for one-dimensional
+  splits. A nested split with an ordinary schedule is rejected.
+
+Each row must have `pp_size` positive integer counts, and all counts must sum
+to the model's layer count. Empty nested rows (`[[], []]`) are invalid. The
+first logical stage owns embedding; the last owns final norm and LM head.
+Every local chunk receives the same stage-local TP/CP/EP/FSDP transformation.
+
+For a ten-layer model on four PP ranks with two virtual chunks per rank:
+
+```yaml
+accelerator:
+  pp_size: 4
+pipeline:
+  enabled: true
+  schedule: interleaved1f1b
+  pp_microbatch_size: 1
+  split: [[1, 1, 1, 1], [1, 2, 2, 1]]
+  p2p_overlap: true
+  p2p_multi_stream: false
+```
+
+Trainer derives the DP-local batch size as `training.global_batch_size / dp_size`;
+the pipeline micro-batch count is that value divided by
+`pipeline.pp_microbatch_size`. Both divisions must be exact. The pipeline
+micro-batch size is independent of the data-loader's `training.micro_batch_size`
+and is never overwritten by it. The DP-local batch must also satisfy the normal
+data-loader batching constraints.
+
+`p2p_overlap` defaults to `true` and defers P2P waits until activation/gradient
+consumption. `p2p_multi_stream` defaults to `false`; when enabled, it uses the
+core's experimental per-peer communication groups and requires `p2p_overlap: true`.
+Both options apply to ordinary PP and VPP, and must match on all ranks.
+
+To run the four-layer dense demo with two virtual chunks on each of two ranks:
+
+```bash
+torchrun --standalone --nproc_per_node=2 \
+  --module examples.training_demo.train_text \
+  examples/training_demo/train_cropped_qwen3_pp.yaml \
+  --model.config_path=/path/to/Qwen3 \
+  --dataset.model_assets.tokenizer.pretrained_model_name_or_path=/path/to/Qwen3 \
+  --pipeline.schedule=interleaved1f1b \
+  '--pipeline.split=[[1, 1], [1, 1]]'
+```
+
 ## Qwen3-MoE cropped Hugging Face demos
 
 These examples build a layer-cropped Qwen3-30B-A3B model with
