@@ -32,6 +32,8 @@ except ImportError as exc:
     raise unittest.SkipTest(f"DeepSeek-V4 Transformers dependency unavailable: {exc}") from exc
 
 from hyper_parallel.components import functional as hp_functional
+from hyper_parallel.distributed.expert_parallel.moonep import configure_moonep
+from hyper_parallel.distributed.expert_parallel.moonep.legacy import MoonEPExecutor as LegacyMoonEPExecutor
 from hyper_parallel.distributed._builder.rule_resolver import _resolve_local_compute_fn
 from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
     _deepseek_v41_grouped_expert_forward,
@@ -387,3 +389,76 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
             module, 2, use_grouped_gemm=False,
             apply_gate=experts._apply_gate,  # pylint: disable=protected-access
         )
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_moonep_factory_matches_native_experts_and_gradients(self) -> None:
+        """用原生专家参数布局验证 MoonEP factory 的单 rank 前反向。
+
+        Example:
+            ``use_moonep=True`` 绑定脚本执行器后，输出与逐专家参考值一致。
+        """
+        torch.manual_seed(87)
+        experts = DeepseekV4Experts(_expert_config())
+        hidden = torch.randn(1, 3, 16, requires_grad=True)
+        route_weights = torch.rand(3, 2, requires_grad=True)
+        route_indices = torch.tensor([[0, 1], [2, 3], [1, 0]])
+        gate = Mock()
+        gate.num_experts = 4
+        gate.top_k = 2
+        gate.return_value = (None, route_weights, route_indices)
+        module = SimpleNamespace(
+            gate=gate, experts=experts, shared_experts=torch.nn.Identity(), is_hash=False,
+            forward=lambda hidden_states, input_ids=None: hidden_states,
+        )
+        ep_mesh = Mock()
+        ep_mesh.get_group.return_value = None
+        ep_mesh.__getitem__ = Mock(return_value=SimpleNamespace(size=lambda: 1))
+        compute = deepseek_v41_ep_compute_fn(
+            module=module, mesh=None, tp_mesh=None, cp_mesh=None,
+            ep_mesh=ep_mesh, use_moonep=True,
+        )
+        configure_moonep(experts)
+        actual = compute(module, hidden)
+        expected = torch.zeros_like(hidden.reshape(3, 16))
+        for token in range(3):
+            for slot in range(2):
+                expert = int(route_indices[token, slot])
+                gate_value, up_value = functional.linear(
+                    hidden.reshape(3, 16)[token], experts.gate_up_proj[expert],
+                ).float().chunk(2)
+                activation = functional.silu(gate_value.clamp(max=experts.limit)) * (
+                    up_value.clamp(-experts.limit, experts.limit))
+                value = functional.linear(activation.to(hidden.dtype), experts.down_proj[expert])
+                expected[token] = expected[token] + route_weights[token, slot] * value
+        expected = expected.reshape_as(hidden) + hidden
+        targets = (hidden, route_weights, experts.gate_up_proj, experts.down_proj)
+        upstream = torch.randn_like(actual)
+        actual_gradients = torch.autograd.grad(actual, targets, upstream, retain_graph=True)
+        expected_gradients = torch.autograd.grad(expected, targets, upstream)
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+        for observed, reference in zip(actual_gradients, expected_gradients):
+            torch.testing.assert_close(observed, reference, rtol=1e-5, atol=1e-5)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_moonep_legacy_factory_uses_generic_module(self) -> None:
+        """旧版对照选项从通用 MoonEP 目录绑定执行器。"""
+        experts = DeepseekV4Experts(_expert_config())
+        gate = Mock()
+        gate.num_experts = 4
+        gate.top_k = 2
+        gate.return_value = (None, torch.ones(2, 2), torch.tensor([[0, 1], [2, 3]]))
+        module = SimpleNamespace(
+            gate=gate, experts=experts, shared_experts=torch.nn.Identity(), is_hash=False,
+            forward=lambda hidden_states, input_ids=None: hidden_states,
+        )
+        ep_mesh = Mock()
+        ep_mesh.get_group.return_value = None
+        ep_mesh.__getitem__ = Mock(return_value=SimpleNamespace(size=lambda: 1))
+        compute = deepseek_v41_ep_compute_fn(
+            module=module, mesh=None, tp_mesh=None, cp_mesh=None,
+            ep_mesh=ep_mesh, use_moonep=True, moonep_lifecycle=False,
+        )
+        self.assertIsInstance(experts._moonep_executor, LegacyMoonEPExecutor)  # pylint: disable=protected-access
+        self.assertEqual(compute(module, torch.randn(1, 2, 16)).shape, (1, 2, 16))

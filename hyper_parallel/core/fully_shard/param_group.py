@@ -496,7 +496,7 @@ class HSDPParamGroup:
                 raise ValueError(
                     f"Fused all-gather expects FSDPMeshInfo, got {type(hsdp_param.mesh_info)}"
                 )
-            shard_group = hsdp_param.mesh_info.shard_process_group
+            shard_group = hsdp_param.all_gather_process_group
             communication_dtype = hsdp_param.param_dtype or hsdp_param.orig_dtype
             bucket_key = (id(shard_group), communication_dtype)
             if bucket_key not in params_by_bucket:

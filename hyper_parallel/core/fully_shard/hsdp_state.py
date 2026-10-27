@@ -19,6 +19,7 @@ from collections import defaultdict
 from typing import List, Mapping, Optional
 
 import torch
+import torch.distributed as dist
 from torch import nn
 
 from hyper_parallel.tools.logging import get_logger
@@ -555,8 +556,13 @@ class HSDPStateV2:
             param.to_sharded()
         self.is_shard = True
 
-    def unshard(self, async_op: bool = False) -> None:
-        """change parameters to unsharded state"""
+    def unshard(self, async_op: bool = False, input_buffers: dict | None = None) -> None:
+        """恢复完整参数，可借用调用方保证生命周期的 AG 输入切片。
+
+        Example:
+            gate/down 分别借 FP32→BF16 工作区的不同切片，全部 AG 等待后，
+            调用方才复用该工作区；无借用输入时沿用原 FSDP 路径。
+        """
         logger.debug(
             "action=unshard module=%s async_op=%s params=%s",
             self,
@@ -567,10 +573,16 @@ class HSDPStateV2:
             return
 
         if self.comm_fusion_policy.enable_comm_fusion and self.param_group is not None:
+            if input_buffers:
+                raise ValueError("融合 AG 不支持逐参数借用输入")
             self.param_group.unshard(async_op)
         else:
             for param in self.hsdp_params:
-                param.unshard(async_op)
+                buffer = input_buffers.get(id(param)) if input_buffers else None
+                if buffer is None:
+                    param.unshard(async_op)
+                else:
+                    param.unshard(async_op, input_buffer=buffer)
         if not async_op:
             self.wait_for_unshard()
 
@@ -582,6 +594,28 @@ class HSDPStateV2:
             self.hsdp_params,
         )
         self.unshard(async_op=True)
+
+    def set_all_gather_process_group(self, group: dist.ProcessGroup) -> None:
+        """单独设置参数 AG 通道，梯度 RS 仍使用原分片组。
+
+        Args:
+            group: 与原分片组成员及 rank 顺序相同的新通信组。
+
+        Example:
+            EFS 组 [0,4] 用新组提前恢复权重，梯度仍经原 [0,4] 组归约。
+        """
+        if self.param_group is not None and self.param_group.all_gather_buckets:
+            raise RuntimeError("必须在 FSDP 融合 AG bucket 初始化之前设置通信通道")
+        expected = dist.get_process_group_ranks(group)
+        for param in self.hsdp_params:
+            if param.shard_world_size <= 1:
+                continue
+            original = getattr(param.mesh_info, "shard_process_group", None)
+            if original is None or dist.get_process_group_ranks(original) != expected:
+                raise ValueError("AG 新组必须与原 FSDP 分片组保持相同成员及rank顺序")
+        for param in self.hsdp_params:
+            if param.shard_world_size > 1:
+                param.all_gather_process_group = group
 
     def wait_for_unshard(self) -> None:
         """wait for all unshard parameters"""

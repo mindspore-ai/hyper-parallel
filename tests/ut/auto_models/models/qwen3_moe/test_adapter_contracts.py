@@ -486,16 +486,17 @@ class TestEpFactoryContract(unittest.TestCase):
         self.assertEqual(
             [param.name for param in parameters],
             ["module", "mesh", "tp_mesh", "cp_mesh", "ep_mesh", "use_grouped_gemm",
-             "fix_router"],
+             "fix_router", "use_moonep", "moonep_replica_capacity", "moonep_prefetch_depth"],
         )
         for param in parameters:
             self.assertIs(param.kind, inspect.Parameter.KEYWORD_ONLY)
-        for param in parameters[:-2]:
+        for param in parameters[:5]:
             self.assertIs(param.default, inspect.Parameter.empty)
-        # Both switches are opt-in: an existing recipe keeps the real router and the
-        # eager per-expert loop unless it asks otherwise.
-        self.assertIs(parameters[-2].default, False)
-        self.assertIs(parameters[-1].default, False)
+        self.assertEqual({param.name: param.default for param in parameters[5:]}, {
+            "use_grouped_gemm": False, "fix_router": False, "use_moonep": False,
+            "moonep_replica_capacity": None,
+            "moonep_prefetch_depth": 1,
+        })
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

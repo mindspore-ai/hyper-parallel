@@ -106,7 +106,9 @@ def get_extra_requires() -> dict[str, list[str]]:
         "torch26": list(TORCH26_REQUIRES),
         "torch27": list(TORCH27_REQUIRES),
         "torch29": list(TORCH29_REQUIRES),
-        "all": list(TORCH29_REQUIRES),
+        # 容量难例需要证明全局最优，默认导入路径不加载求解器。
+        "moonep": ["scipy>=1.9,<2"],
+        "all": list(TORCH29_REQUIRES) + ["scipy>=1.9,<2"],
     }
 
 
