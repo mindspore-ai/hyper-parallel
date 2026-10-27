@@ -425,6 +425,31 @@ def _verify_recorded_patch_materialization(
             ),
             None,
         )
+        source_form = "subclass_forward"
+        if subclass is None:
+            # A replacement component can expose the wrapper's mutation point
+            # directly from its own generated source.  GQAAttention is the
+            # canonical shape: its forward calls ``self.attention_interface``
+            # and the native inner wrapper swaps that companion attribute at
+            # install time.  Requiring another no-op subclass would make the
+            # artifact look explicit without owning any additional behavior.
+            # Accept this form only when the builder recorded the same FQN as
+            # an actual replacement and the emitted component carries both
+            # its implementation and the boundary wrapper around it.
+            host_class = classes.get(host_name)
+            replacement_backed = any(
+                replacement.module_fqn == record.module_fqn
+                and replacement.replacement_type is target_type
+                for replacement in replacement_records
+            )
+            methods = {
+                child.name
+                for child in (host_class.body if host_class is not None else ())
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            if replacement_backed and {"_forward_impl", "forward"} <= methods:
+                subclass = host_class
+                source_form = "replacement_forward_runtime_binding"
         if subclass is None:
             missing.append(
                 f"{target_fqn} "
@@ -435,7 +460,7 @@ def _verify_recorded_patch_materialization(
                 "fqn": target_fqn,
                 "host_class": host_name,
                 "kind": "inner_wrapper",
-                "source_form": "subclass_forward",
+                "source_form": source_form,
             })
     if missing:
         raise RuntimeError(

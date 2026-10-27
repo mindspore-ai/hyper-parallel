@@ -44,6 +44,19 @@
     "module_overrides": false,
     "sharding_plan": true
   },
+  "emission_patches": {
+    "inner_wrappers": [],
+    "local_computes": [
+      {
+        "factory": "hyper_parallel.models.kimi_k26.adapter.distributed.ep_compute:kimi_k26_ep_compute_fn",
+        "module_fqn": "model.language_model.layers.1.mlp",
+        "module_type": "transformers.models.deepseek_v3.modeling_deepseek_v3:DeepseekV3MoE",
+        "original_forward": "transformers.models.deepseek_v3.modeling_deepseek_v3:DeepseekV3MoE.forward",
+        "region_dispatch": false
+      }
+    ],
+    "module_replacements": []
+  },
   "entrypoints": {
     "parallelize": "hp_parallelize"
   },
@@ -83,7 +96,7 @@
       "fqn": "model.language_model.layers.1.mlp",
       "host_class": "HPCodegenDeepseekV3MoE",
       "kind": "local_compute",
-      "source_form": "subclass_forward"
+      "source_form": "subclass_fqn_binding"
     }
   ],
   "mesh_dim_names": [
@@ -101,16 +114,16 @@
   ],
   "outputs": {
     "diff": {
-      "lines": 120,
-      "sha256": "58916e731ec23fb12aff1577349d5d9570c1abb8cdd2d6f9719603f9938f48bf"
+      "lines": 111,
+      "sha256": "c71b77a252d9b404bc596af7507943e496db9333e2155adaf4da70333670d9fc"
     },
     "init": {
       "lines": 6,
-      "sha256": "04512108f960b48fe75d146e9382bd2ea3ca2b80e568d49a275850473aa2e014"
+      "sha256": "6cc33d32a8932dd34486d0b64a46560274ab35b5856878b523b14f88c346ab38"
     },
     "modeling": {
-      "lines": 962,
-      "sha256": "662a7ef60a00bd23827485d7387a639ca186b57e34d6d1bb5742898cdec86324"
+      "lines": 960,
+      "sha256": "5a3d29e611117afd2d92f300d17868240f54ecfb3747a54c3f41f1a0c29419b2"
     }
   },
   "parallel_dims": {
@@ -1227,7 +1240,7 @@
     }
   },
   "remote_siblings": [],
-  "signature": "d1bcc2a8e725",
+  "signature": "723f03347732",
   "skipped_overrides": [],
   "source": {
     "architecture": "KimiK25ForConditionalGeneration",
@@ -1247,6 +1260,6 @@
       "lm_head.weight"
     ]
   ],
-  "yaml_path": "/home/lxy/kimi_builder_codegen.yaml",
-  "yaml_sha256": "b9e543acb50aff64ecd4aeaf62f9a675c572f2f24a1f139c7b5686977b513c80"
+  "yaml_path": "",
+  "yaml_sha256": "723f03347732a069d4b63b9437e245ad8c360049aa8fbf59d139d8e05a016fdd"
 }

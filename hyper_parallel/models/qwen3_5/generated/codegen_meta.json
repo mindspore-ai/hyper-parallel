@@ -178,6 +178,11 @@
     "module_overrides": false,
     "sharding_plan": true
   },
+  "emission_patches": {
+    "inner_wrappers": [],
+    "local_computes": [],
+    "module_replacements": []
+  },
   "entrypoints": {
     "parallelize": "hp_parallelize"
   },
@@ -507,6 +512,7 @@
     "model.layers.9.mlp.up_proj.weight"
   ],
   "injections": [],
+  "materialized_patches": [],
   "mesh_dim_names": [
     "tp"
   ],
@@ -523,15 +529,15 @@
   "outputs": {
     "diff": {
       "lines": 192,
-      "sha256": "2a7df90a67bf688b202cdbc5dd532b38c2073f18bae483256f6e200e5c925c02"
+      "sha256": "2587d76b39854416926e857ab438a88f7ec8742207b53a9b5dfe8f348cae30f8"
     },
     "init": {
       "lines": 6,
-      "sha256": "88c037c01ee5a2c072ec323d3a1f8215fd6ef1c5cd8d836b5bd4de1dcb6b39ed"
+      "sha256": "6cc33d32a8932dd34486d0b64a46560274ab35b5856878b523b14f88c346ab38"
     },
     "modeling": {
       "lines": 2178,
-      "sha256": "7338908593f9e07defe26b11bc6304e6640c43fc2dc30363e1377719fbb44278"
+      "sha256": "d976506437e90f7b63e0113ae46b37a6148b7245089af5b9689fa1891a542bae"
     }
   },
   "parallel_dims": {
@@ -8324,7 +8330,7 @@
     }
   },
   "remote_siblings": [],
-  "signature": "530b866083ac",
+  "signature": "72f1132c012c",
   "skipped_overrides": [],
   "source": {
     "architecture": null,
@@ -8339,6 +8345,6 @@
   },
   "special_handlers": {},
   "tied_pairs": [],
-  "yaml_path": "/home/lxy/codegen_all_3cb4e616_inputs/qwen3_5.yaml",
-  "yaml_sha256": "dea423c5fd83f6cc71b2a2ebba95f501586a8f683bade86a7868aff71299b034"
+  "yaml_path": "",
+  "yaml_sha256": "72f1132c012cb21a84cec9ade99802bf0a6252a375c5522aa6916af22c5b73e2"
 }

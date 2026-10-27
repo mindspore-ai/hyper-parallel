@@ -1341,12 +1341,18 @@
     "module_overrides": false,
     "sharding_plan": true
   },
+  "emission_patches": {
+    "inner_wrappers": [],
+    "local_computes": [],
+    "module_replacements": []
+  },
   "entrypoints": {
     "parallelize": "hp_parallelize"
   },
   "external_state_classes": [],
   "frozen_sharded_params": [],
   "injections": [],
+  "materialized_patches": [],
   "mesh_dim_names": null,
   "model_class": "KimiK3ForConditionalGeneration",
   "model_name": "Kimi_K3",
@@ -1365,15 +1371,15 @@
     },
     "diff": {
       "lines": 20,
-      "sha256": "aa48978b4e9a28353e2bf101f6dbffcca8eb8a5910f02bb9c5387534444eb14a"
+      "sha256": "7a9ab00577e1542fc46ed3bb9c1cc8c6a03c70e2e1818d955ff366d162588a2e"
     },
     "init": {
       "lines": 6,
-      "sha256": "3b282fdb79b428980e9ecc8964e1dfcd6e4f0d49189a9459d11d69537a50209d"
+      "sha256": "6cc33d32a8932dd34486d0b64a46560274ab35b5856878b523b14f88c346ab38"
     },
     "modeling": {
       "lines": 1331,
-      "sha256": "fd1d641ce49dd8f9655a9ec23c78f407cd68856540701cfa171e550947e2269f"
+      "sha256": "f5614908c9396f1129b38ffdbe00079d945f7bac369c09b151fe2ef1629525dc"
     },
     "modeling_kimi_linear.py": {
       "lines": 1314,
@@ -1033944,7 +1033950,7 @@
     "configuration_kimi_k3.py",
     "modeling_kimi_linear.py"
   ],
-  "signature": "2b2de86414e7",
+  "signature": "02e66ab60579",
   "skipped_overrides": [],
   "source": {
     "architecture": "KimiK3ForConditionalGeneration",
@@ -1033959,6 +1033965,6 @@
   },
   "special_handlers": {},
   "tied_pairs": [],
-  "yaml_path": "/home/lxy/codegen_all_3cb4e616_inputs/kimi_k3.yaml",
-  "yaml_sha256": "cd5a793a2e99ae3f6397ea0e59665265c56949a5ccb0b25df9eef7977fd21f81"
+  "yaml_path": "",
+  "yaml_sha256": "02e66ab605797cee4978bbeed8c19d8db661f024c12a612f4c714a63417c2bda"
 }
