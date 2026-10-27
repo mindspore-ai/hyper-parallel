@@ -242,7 +242,7 @@ def _splice(text: str, edits: list[tuple[tuple[int, int], tuple[int, int], str]]
 # file assembly
 # ---------------------------------------------------------------------------
 
-def emit_modeling_file(meta: Any) -> str:
+def emit_modeling_file(meta: Any, *, patch_plan: Any = None) -> str:
     """Assemble the full generated modeling file text.
 
     Returns the text (not written to disk) so the caller can compute a diff
@@ -265,18 +265,23 @@ def emit_modeling_file(meta: Any) -> str:
         else getattr(meta.source, "module_name", "")
     )
     text = rewrite_relative_imports(text, module_name)
-    text = _apply_inline_modeling(text, meta)
+    text = _apply_inline_modeling(text, meta, patch_plan=patch_plan)
     from hyper_parallel.codegen.emit.recorded import materialize_recorded_forwards
 
-    text = materialize_recorded_forwards(text, meta)
+    text = materialize_recorded_forwards(text, meta, patch_plan=patch_plan)
     text = _lower_forward_boundaries(text, meta, module_name)
-    _verify_recorded_patch_materialization(text, meta)
+    _verify_recorded_patch_materialization(text, meta, patch_plan=patch_plan)
     return _banner(meta) + text
 
 
-def _verify_recorded_patch_materialization(text: str, meta: Any) -> None:
+def _verify_recorded_patch_materialization(
+    text: str,
+    meta: Any,
+    *,
+    patch_plan: Any = None,
+) -> None:
     """Require every trainer-installed source-visible patch to be materialized."""
-    patches = getattr(meta, "_build_patches", None)
+    patches = patch_plan if patch_plan is not None else getattr(meta, "_build_patches", None)
     local_records = (
         getattr(patches, "local_computes", ()) if patches is not None else ()
     )
@@ -384,7 +389,12 @@ def _verify_recorded_patch_materialization(text: str, meta: Any) -> None:
                 "source_form": "constructor",
             })
     for record in wrapper_records:
-        host_name = type(record.request.target).__name__
+        target_type = getattr(record, "target_type", None)
+        host_name = (
+            target_type.__name__
+            if target_type is not None
+            else type(record.request.target).__name__
+        )
         target_fqn = (
             record.module_fqn
             if record.target_fqn == "self"
@@ -425,7 +435,12 @@ def _verify_recorded_patch_materialization(text: str, meta: Any) -> None:
         )
 
 
-def _apply_inline_modeling(text: str, meta: Any) -> str:
+def _apply_inline_modeling(
+    text: str,
+    meta: Any,
+    *,
+    patch_plan: Any = None,
+) -> str:
     """Render the artifact through the adapter-driven inline source pipeline."""
 
     from hyper_parallel.codegen.inline import render_inline_modeling
@@ -433,7 +448,12 @@ def _apply_inline_modeling(text: str, meta: Any) -> str:
     source = getattr(meta, "source", None)
     architecture = source.get("architecture") if isinstance(source, dict) else getattr(source, "architecture", None)
     model_type = getattr(meta, "model_class", None) or architecture
-    return render_inline_modeling(text, meta, model_type=model_type)
+    return render_inline_modeling(
+        text,
+        meta,
+        model_type=model_type,
+        patch_plan=patch_plan,
+    )
 
 
 def _lower_forward_boundaries(text: str, meta: Any, module_name: str) -> str:

@@ -66,7 +66,6 @@ from hyper_parallel.distributed._builder.rule_resolver import (
 from hyper_parallel.distributed.tensor_parallel.head_count import (
     maybe_update_head_counts,
 )
-from hyper_parallel.models.build_trace import record_inner_wrapper
 
 logger = logging.getLogger(__name__)
 
@@ -1121,13 +1120,6 @@ def _apply_resolved_inner_wrapper(module, resolved, spec, mesh, mesh_dim_names,
             )
             wrapper = INNER_WRAPPER_REGISTRY.get(wrapper, wrapper)
         request = primary or _ForwardRewriteRequest(target, new_forward)
-        record_inner_wrapper(
-            module_fqn=module_fqn,
-            target_fqn=target_fqn,
-            wrapper=wrapper,
-            request=request,
-            secondary_requests=secondary_requests,
-        )
     return name, target
 
 

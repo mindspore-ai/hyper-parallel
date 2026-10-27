@@ -60,9 +60,11 @@ class CodegenMeta:
     #: is what lets the trainer skip its own HF replacement step
     #: (``covered["module_overrides"]``).
     module_overrides: list[dict[str, Any]] = field(default_factory=list)
-    #: Audit-only source materializations produced from the builder recorder.
+    #: Audit-only source materializations produced from builder observations.
     #: This never participates in runtime strategy selection.
     materialized_patches: list[dict[str, str]] = field(default_factory=list)
+    #: JSON-safe source-emission descriptors observed around the native builder.
+    emission_patches: dict[str, Any] = field(default_factory=dict)
     #: Entry model class name (the architecture name, e.g. ``AnthropicV3ForCausalLM``).
     #: The inline pipeline resolves the model's adapter from it.
     model_class: Optional[str] = None
@@ -184,6 +186,8 @@ def validate_meta_schema(data: dict[str, Any]) -> None:
             raise TypeError(
                 "codegen_meta field 'module_overrides' must be a list[dict]"
             )
+    if "emission_patches" in data and not isinstance(data["emission_patches"], dict):
+        raise TypeError("codegen_meta field 'emission_patches' must be a dict")
     if "remote_siblings" in data:
         siblings = data["remote_siblings"]
         if not isinstance(siblings, list) or not all(
