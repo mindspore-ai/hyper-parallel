@@ -962,9 +962,11 @@ def hp_install_boundaries(
     after the vocab-parallel-embedding wrap, mirroring the previous runtime
     behavior.  An imported-class boundary whose frozen injection declares a
     ``local_compute_fn`` gets no plain wrapper here: ``hp_bind_compute``
-    installs the native local-region skeleton against the compiled boundary,
-    so the injected compute — not the original forward — runs inside the
-    region. A statically lowered ``tp_collective`` forward additionally gets
+    first binds the generated module's explicit recorded-FQN forward and,
+    only for a host no binder covers, installs the native local-region
+    skeleton against the compiled boundary — so the injected compute, not
+    the original forward, runs inside the region. A statically lowered
+    ``tp_collective`` forward additionally gets
     its bare operators bound (``module._hp_tp``) only after the live-mesh
     re-validation in :func:`_install_static_tp_operators`; a mismatch replaces
     the forward with the generic engine.
@@ -1193,10 +1195,16 @@ def hp_bind_compute(
     ``region_dispatch`` / ``ep_size`` for the factory's mesh context, exactly
     as the applier reads them off a live spec.
 
+    When the generated module defines ``hp_bind_recorded_forwards`` — the
+    explicit FQN binder emitted for imported-subtree hosts — it is invoked
+    once before the per-rule loop, binding each builder-recorded module's
+    ``_forward_impl`` / ``forward`` pair by its recorded path so the
+    lowered-forward detection below sees it.
+
     An imported-class boundary (the class is not defined in the generated
-    file) has no emitted forward that could call ``__hp_compute__``; for
-    those the native local-region skeleton is installed instead
-    (:func:`_install_runtime_region_forward`).
+    file) with no recorded binding has no emitted forward that could call
+    ``__hp_compute__``; for those the native local-region skeleton is
+    installed instead (:func:`_install_runtime_region_forward`).
     """
     from hyper_parallel.distributed._builder.rule_resolver import (
         _resolve_local_compute_fn,
@@ -1212,6 +1220,11 @@ def hp_bind_compute(
         )
     if not injections:
         return
+    # Builder-recorded forward patches on imported-subtree hosts are bound by
+    # the generated module's explicit FQN binder — no type lookup here.
+    recorded_binder = getattr(generated_module, "hp_bind_recorded_forwards", None)
+    if recorded_binder is not None:
+        recorded_binder(model)
     for rule in injections:
         if rule.get("local_compute_fn") is None:
             continue

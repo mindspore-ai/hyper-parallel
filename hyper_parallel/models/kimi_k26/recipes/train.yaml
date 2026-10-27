@@ -102,6 +102,7 @@ plan_overrides:
       # 2SN 参考数值是在共享专家重叠下测的：关掉会让 routed 分支暴露整段交换
       # （GBS 256 实测 +2.28 GB 峰值、步时 +22%）。
       overlap_shared_expert: true
+      capacity_factor: null
 
   # 视觉塔 27 层 × 6 个模块在 TP 下全部 replicate：用 glob 收敛，等价于逐层展开的 162 条。
   # 本模型 FQN 空间里 layers.<i> 下只有 attn.* / mlp.*，`*` 跨点号不会命中别的子模块。
