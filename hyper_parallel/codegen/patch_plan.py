@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import fnmatch
 import importlib
+import keyword
 from dataclasses import dataclass
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, Iterable, Mapping, Optional
@@ -167,7 +168,6 @@ def serialize_patch_emission_plan(plan: PatchEmissionPlan) -> dict[str, Any]:
                 "module_fqn": record.module_fqn,
                 "source_type": _symbol_path(record.source_type),
                 "replacement_type": _symbol_path(record.replacement_type),
-                "factory": _symbol_path(record.factory),
             }
             for record in plan.module_replacements
         ],
@@ -202,7 +202,10 @@ def deserialize_patch_emission_plan(data: Mapping[str, Any]) -> PatchEmissionPla
             module_fqn=item["module_fqn"],
             source_type=_resolve_symbol(item["source_type"]),
             replacement_type=_resolve_symbol(item["replacement_type"]),
-            factory=_resolve_symbol(item["factory"]),
+            # The YAML resolver may produce a configured closure here. Source
+            # emission and drift verification need the observed replacement
+            # type, not the generation-only factory object.
+            factory=None,
             factory_kwargs=MappingProxyType({}),
         )
         for item in data.get("module_replacements", ())
@@ -237,6 +240,23 @@ def patch_emission_plan_from_meta(meta: Any) -> Optional[PatchEmissionPlan]:
     """Return the persisted emission plan, or ``None`` for legacy artifacts."""
     data = getattr(meta, "emission_patches", None)
     return deserialize_patch_emission_plan(data) if data else None
+
+
+def local_compute_binding_name(target: Any) -> str:
+    """Return the explicit instance attribute used for one compute factory."""
+    if isinstance(target, Mapping):
+        target = target.get("_target_") or target.get("target") or target.get("name")
+    else:
+        target = getattr(target, "_target_", target)
+    if isinstance(target, str):
+        name = target.rsplit(":", 1)[-1].rsplit(".", 1)[-1]
+    else:
+        name = getattr(target, "__name__", "")
+    if not name or not name.isidentifier() or keyword.iskeyword(name):
+        raise ValueError(
+            f"codegen: local-compute target {target!r} has no valid binding name"
+        )
+    return name
 
 
 def _replacement_patches(
@@ -303,6 +323,7 @@ __all__ = [
     "PatchEmissionPlan",
     "build_patch_emission_plan",
     "deserialize_patch_emission_plan",
+    "local_compute_binding_name",
     "patch_emission_plan_from_meta",
     "serialize_patch_emission_plan",
     "snapshot_modules",

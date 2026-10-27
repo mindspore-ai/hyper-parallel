@@ -1177,10 +1177,10 @@ def hp_bind_compute(
     param_plan: Optional[dict[str, Any]] = None,
     generated_module: Any = None,
 ) -> None:
-    """Bind ``module.__hp_compute__`` for every local-region boundary.
+    """Bind the explicit factory-named attribute for each local region.
 
     A generated local-compute forward calls
-    ``self.__hp_compute__(*args, **kwargs)`` on the redistributed inputs.
+    ``self.<factory_name>(*args, **kwargs)`` on the redistributed inputs.
     The bound callable is the applier's local-compute resolution
     (``_resolve_local_compute_fn`` → ``functools.partial(compute_fn, module)``),
     so the compute function's first argument is the boundary module and the
@@ -1203,13 +1203,16 @@ def hp_bind_compute(
 
     An imported-class boundary (the class is not defined in the generated
     file) with no recorded binding has no emitted forward that could call
-    ``__hp_compute__``; for those the native local-region skeleton is
+    the factory-named compute attribute; for those the native local-region skeleton is
     installed instead (:func:`_install_runtime_region_forward`).
     """
     from hyper_parallel.distributed._builder.rule_resolver import (
         _resolve_local_compute_fn,
     )
     from hyper_parallel.distributed._builder.parameter_sharding import _resolve_module
+    from hyper_parallel.codegen.patch_plan import (  # pylint: disable=import-outside-toplevel
+        local_compute_binding_name,
+    )
 
     dense_mesh, _, expert_mesh, active_dim_names = (
         _resolve_runtime_meshes(mesh_context, mesh_dim_names)
@@ -1239,7 +1242,7 @@ def hp_bind_compute(
         compute_fn = _resolve_local_compute_fn(
             module, spec, dense_mesh, active_dim_names, expert_mesh)
         # External-state inline modules (e.g. Qwen3MoeSparseMoeBlock) carry an
-        # inlined forward and must not receive __hp_compute__, but the local
+        # inlined forward and must not receive a named compute binding, but the local
         # compute factory above still has to run: it installs companion state
         # such as ``experts.local_expert_count`` and the bound experts.forward
         # that the inlined forward relies on.
@@ -1248,14 +1251,15 @@ def hp_bind_compute(
         # _resolve_local_compute_fn returns module.forward for the
         # region_dispatch=False gate; that path is not a bound compute (the
         # generated forward already calls _forward_impl), so it must not be
-        # bound as __hp_compute__.
+        # bound as a generated-model compute attribute.
         if compute_fn is None or compute_fn is module.forward:
             continue
         if _has_lowered_forward(module, generated_module):
-            module.__hp_compute__ = compute_fn
+            binding_name = local_compute_binding_name(rule["local_compute_fn"])
+            setattr(module, binding_name, compute_fn)
             continue
         # An imported-class boundary has no emitted forward that could call
-        # ``__hp_compute__``: install the native local-region skeleton
+        # a named compute target: install the native local-region skeleton
         # instead (boundary entry -> injected compute -> boundary exit), the
         # same code path the native applier runs for this boundary.
         _install_runtime_region_forward(

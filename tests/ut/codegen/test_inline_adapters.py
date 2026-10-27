@@ -168,7 +168,11 @@ class TestInlineAdapters(unittest.TestCase):
             module_type=type("ExternalMoe", (), {}),
         )
         meta = SimpleNamespace(
-            _build_patches=SimpleNamespace(local_computes=(record,))
+            _build_patches=SimpleNamespace(local_computes=(record,)),
+            injections=[{
+                "match": record.module_fqn,
+                "local_compute_fn": "example.compute",
+            }],
         )
         with self.assertRaisesRegex(RuntimeError, "model.layers.0.mlp"):
             _verify_recorded_patch_materialization(SOURCE, meta)
@@ -180,12 +184,16 @@ class TestInlineAdapters(unittest.TestCase):
             module_type=type("ExternalMoe", (), {}),
         )
         meta = SimpleNamespace(
-            _build_patches=SimpleNamespace(local_computes=(record,))
+            _build_patches=SimpleNamespace(local_computes=(record,)),
+            injections=[{
+                "match": record.module_fqn,
+                "local_compute_fn": "example.compute",
+            }],
         )
         source = """
 class ExternalMoe:
     def forward(self, hidden_states):
-        return self.__hp_compute__(hidden_states)
+        return self.compute(hidden_states)
 """
         _verify_recorded_patch_materialization(source, meta)
 
@@ -232,7 +240,7 @@ class Model:
         rendered = materialize_recorded_forwards(source, meta)
         ast.parse(rendered)
         self.assertIn("def source_forward_hp_impl", rendered)
-        self.assertIn("self.__hp_compute__", rendered)
+        self.assertIn("self.compute", rendered)
         self.assertIn("self.layer._forward_impl = MethodType", rendered)
 
     def test_recorded_imported_subtree_host_emits_explicit_fqn_bindings(self):
@@ -533,6 +541,43 @@ class OuterModel:
                 NoScanModel(), injections, mesh_context=None,
                 generated_module=None,
             )
+
+    def test_hp_bind_compute_uses_explicit_factory_name(self):
+        """The runtime binding has the same visible name as the YAML target."""
+        from hyper_parallel.codegen import runtime as codegen_runtime
+
+        module = SimpleNamespace(
+            _forward_impl=lambda: None,
+            forward=lambda: None,
+        )
+
+        def compute(value):
+            return value
+
+        injections = [{
+            "match": "model.layers.0.mlp",
+            "local_compute_fn": {"_target_": "example.deepseek_ep_compute_fn"},
+        }]
+        with patch.object(
+            codegen_runtime, "_resolve_runtime_meshes",
+            return_value=(object(), object(), object(), ()),
+        ), patch.object(
+            codegen_runtime, "_injection_target",
+            return_value=compute,
+        ), patch(
+            "hyper_parallel.distributed._builder.rule_resolver."
+            "_resolve_local_compute_fn",
+            return_value=compute,
+        ), patch(
+            "hyper_parallel.distributed._builder.parameter_sharding._resolve_module",
+            return_value=module,
+        ):
+            codegen_runtime.hp_bind_compute(
+                SimpleNamespace(), injections, mesh_context=None,
+            )
+
+        self.assertIs(module.deepseek_ep_compute_fn, compute)
+        self.assertFalse(hasattr(module, "__hp_compute__"))
 
     def test_recorded_imported_subtree_binding_passes_materialization_audit(self):
         """The audit sees the runtime-bound form and keeps the FQN binding."""

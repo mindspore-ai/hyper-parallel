@@ -36,6 +36,8 @@ import os
 import tokenize
 from typing import Any
 
+from hyper_parallel.codegen.patch_plan import local_compute_binding_name
+
 # ---------------------------------------------------------------------------
 # source copy
 # ---------------------------------------------------------------------------
@@ -334,10 +336,17 @@ def _verify_recorded_patch_materialization(
                 ),
                 forward,
             )
-        required_attr = (
-            "__hp_compute__" if getattr(record, "factory", True) is not None
-            else "_forward_impl"
-        )
+        if getattr(record, "factory", True) is not None:
+            injection = next(
+                item
+                for item in (getattr(meta, "injections", None) or ())
+                if item.get("match") == record.module_fqn
+            )
+            required_attr = local_compute_binding_name(
+                injection["local_compute_fn"]
+            )
+        else:
+            required_attr = "_forward_impl"
         is_materialized = forward is not None and any(
             isinstance(node, ast.Attribute) and node.attr == required_attr
             for node in ast.walk(forward)

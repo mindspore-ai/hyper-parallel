@@ -94,6 +94,18 @@ def test_prepare_codegen_build_uses_builder_replacement_events():
     assert result.sharding_plan is plan
     assert isinstance(result.transformed_model.model[0], helpers.ReplacementMLP)
     assert len(result.patch_plan.module_replacements) == 1
+    persisted = serialize_patch_emission_plan(result.patch_plan)
+    assert persisted["module_replacements"] == [{
+        "module_fqn": "model.0",
+        "source_type": "tests.ut.codegen.helpers:SourceMLP",
+        "replacement_type": "tests.ut.codegen.helpers:ReplacementMLP",
+    }]
+    assert (
+        deserialize_patch_emission_plan(persisted)
+        .module_replacements[0]
+        .replacement_type
+        is helpers.ReplacementMLP
+    )
     assert result.module_overrides == (
         {
             "match": ["model.0"],
