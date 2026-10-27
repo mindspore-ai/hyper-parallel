@@ -960,7 +960,10 @@ class HSDPParamV2:
         actual_shard_length = self.sharded_size[shard_dim]
         if self.sharded_size == self.padded_sharded_param_size:
             local_tensor = local_tensor.contiguous()
-            self._sharded_param_data = local_tensor.view(-1)
+            # The local parameter gains requires_grad below. Keep communication
+            # storage off-graph so later initialization cannot invalidate a
+            # no-grad view before the first single-rank unshard.
+            self._sharded_param_data = local_tensor.view(-1).detach()
             local_view = local_tensor
         else:
             padded_local_tensor = local_tensor.new_zeros(self.padded_sharded_param_size)
