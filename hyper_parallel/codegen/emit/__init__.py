@@ -4,7 +4,7 @@
 """Emit a codegen artifact bundle from a frozen plan.
 
 The only public entry is :func:`emit_bundle` — the manager calls it as
-``emit_bundle(layout, meta)`` (manager.py).  The helper functions are the
+``emit_bundle(layout, meta, patch_plan=...)`` (manager.py).  The helpers are the
 building blocks that ``emit_bundle`` composes.
 """
 from hyper_parallel.codegen.emit.bundle import (

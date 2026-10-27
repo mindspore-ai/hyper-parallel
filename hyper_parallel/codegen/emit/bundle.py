@@ -34,7 +34,12 @@ from hyper_parallel.codegen.emit.modeling import (
 logger = logging.getLogger(__name__)
 
 
-def emit_bundle(layout: ArtifactLayout, meta: Any) -> dict[str, str]:
+def emit_bundle(
+    layout: ArtifactLayout,
+    meta: Any,
+    *,
+    patch_plan: Any = None,
+) -> dict[str, str]:
     """Render the artifact bundle for one frozen ``meta``.
 
     Manager-facing entry point.  Returns a ``filename -> content`` dict
@@ -45,8 +50,14 @@ def emit_bundle(layout: ArtifactLayout, meta: Any) -> dict[str, str]:
 
     ``meta.covered`` is prepared by the manager before emission.
     """
+    if patch_plan is None:
+        from hyper_parallel.codegen.patch_plan import patch_emission_plan_from_meta
+
+        patch_plan = patch_emission_plan_from_meta(meta)
     original_text = copy_original_modeling(meta.source)
-    generated_text = _strip_trailing_whitespace(emit_modeling_file(meta))
+    generated_text = _strip_trailing_whitespace(
+        emit_modeling_file(meta, patch_plan=patch_plan)
+    )
 
     modeling_name = os.path.basename(layout.modeling_path)
     diff_text = _strip_trailing_whitespace(

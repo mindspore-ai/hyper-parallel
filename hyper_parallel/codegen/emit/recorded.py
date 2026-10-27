@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Materialize builder-recorded forward patches into generated model source."""
+"""Materialize builder-observed forward patches into generated model source."""
 
 from __future__ import annotations
 
@@ -41,9 +41,14 @@ from hyper_parallel.codegen.plan.boundary_forms import (
 )
 
 
-def materialize_recorded_forwards(source_text: str, meta: Any) -> str:
-    """Lower recorded local-compute decisions without model-specific tables."""
-    patches = getattr(meta, "_build_patches", None)
+def materialize_recorded_forwards(
+    source_text: str,
+    meta: Any,
+    *,
+    patch_plan: Any = None,
+) -> str:
+    """Lower observed local-compute decisions without model-specific tables."""
+    patches = patch_plan if patch_plan is not None else getattr(meta, "_build_patches", None)
     records = getattr(patches, "local_computes", ()) if patches is not None else ()
     if not records:
         return source_text

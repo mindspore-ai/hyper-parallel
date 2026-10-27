@@ -21,11 +21,16 @@ from torch import nn
 
 from hyper_parallel.codegen import manager
 from hyper_parallel.codegen.plan.offline_mesh import OfflineMesh
+from hyper_parallel.codegen.patch_plan import (
+    build_patch_emission_plan,
+    deserialize_patch_emission_plan,
+    serialize_patch_emission_plan,
+    snapshot_modules,
+)
 from hyper_parallel.codegen.spec.types import CodegenSpec, ParallelDimsSpec, SourceSpec
 from hyper_parallel.distributed.apply import apply_forward_patches
 from hyper_parallel.distributed.plan import ShardingPlan
 from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec, local_compute
-from hyper_parallel.models.build_trace import record_model_patches
 from hyper_parallel.trainer.config import PlanOverride, Target
 
 from . import helpers
@@ -88,7 +93,7 @@ def test_prepare_codegen_build_uses_builder_replacement_events():
 
     assert result.sharding_plan is plan
     assert isinstance(result.transformed_model.model[0], helpers.ReplacementMLP)
-    assert len(result.patches.module_replacements) == 1
+    assert len(result.patch_plan.module_replacements) == 1
     assert result.module_overrides == (
         {
             "match": ["model.0"],
@@ -125,10 +130,35 @@ def test_offline_phase_c_records_after_installing_local_region_forward():
     mesh = OfflineMesh(("tp",), (2,))
     assert mesh.get_group() is None
 
-    with record_model_patches() as recorder:
-        apply_forward_patches(model, plan, mesh, validate_mode=True)
+    before_phase_c = snapshot_modules(model)
+    apply_forward_patches(model, plan, mesh, validate_mode=True)
+    patch_plan = build_patch_emission_plan(
+        model,
+        plan,
+        (),
+        before_phase_c,
+        before_phase_c,
+        snapshot_modules(model),
+    )
 
-    records = recorder.freeze().local_computes
-    assert len(records) == 1
-    assert records[0].module_fqn == "region"
+    assert len(patch_plan.local_computes) == 1
+    assert patch_plan.local_computes[0].module_fqn == "region"
     assert model.region.forward is not original_forward
+
+    persisted = serialize_patch_emission_plan(patch_plan)
+    restored = deserialize_patch_emission_plan(persisted)
+    assert persisted["local_computes"] == [{
+        "module_fqn": "region",
+        "module_type": (
+            "tests.ut.codegen.test_builder_driven_manager:_LocalRegion"
+        ),
+        "factory": (
+            "tests.ut.codegen.test_builder_driven_manager:_local_compute_factory"
+        ),
+        "region_dispatch": False,
+        "original_forward": (
+            "tests.ut.codegen.test_builder_driven_manager:_LocalRegion.forward"
+        ),
+    }]
+    assert restored.local_computes[0].module_type is _LocalRegion
+    assert restored.local_computes[0].factory is _local_compute_factory

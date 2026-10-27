@@ -30,7 +30,13 @@ from hyper_parallel.codegen.inline.strategy_pass import build_strategy_patches
 from hyper_parallel.codegen.inline.yaml_rules import collect_inline_rules
 
 
-def render_inline_modeling(source_text: str, meta: Any, model_type: str | None = None) -> str:
+def render_inline_modeling(
+    source_text: str,
+    meta: Any,
+    model_type: str | None = None,
+    *,
+    patch_plan: Any = None,
+) -> str:
     """Render the inline-patched modeling file for a frozen plan.
 
     This is the only artifact route. A YAML target with no adapter declaration
@@ -50,7 +56,7 @@ def render_inline_modeling(source_text: str, meta: Any, model_type: str | None =
     rules = collect_inline_rules(meta)
     if not rules:
         return source_text
-    patches = getattr(meta, "_build_patches", None)
+    patches = patch_plan if patch_plan is not None else getattr(meta, "_build_patches", None)
     recorded_local_compute = bool(
         getattr(patches, "local_computes", ()) if patches is not None else ()
     )

@@ -62,7 +62,6 @@ from hyper_parallel.distributed._builder.tp_collective_lowering import (
 from hyper_parallel.distributed.tensor_parallel.head_count import (
     maybe_update_head_counts,
 )
-from hyper_parallel.models.build_trace import record_local_compute
 
 logger = logging.getLogger(__name__)
 
@@ -472,7 +471,6 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
         compute_fn = _resolve_local_compute_fn(
             module, spec, mesh, mesh_dim_names, expert_mesh)
         if compute_fn is not None:
-            original_forward = module.forward
             if validate_mode:
                 # D-17: inside the local region the module sees local
                 # tensors in both modes -- validate rewrites cached head
@@ -500,21 +498,6 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
                 module, boundary, spec, mesh, mesh_dim_names,
                 validate_mode=validate_mode, compute_fn=compute_fn,
                 exclude_subtrees=nested)
-            declared_compute = getattr(spec, "local_compute_fn", None)
-            factory = getattr(declared_compute, "_target_", declared_compute)
-            configured = getattr(declared_compute, "_kwargs", None)
-            record_local_compute(
-                module_fqn=module_fqn,
-                module=module,
-                factory=factory,
-                factory_kwargs=configured,
-                resolved_compute=compute_fn,
-                region_dispatch=getattr(spec, "region_dispatch", None),
-                original_forward=original_forward,
-                installed_forward=module.forward,
-                boundary=boundary,
-                excluded_subtrees=tuple(nested),
-            )
         elif validate_mode:
             _wrap_validate_forward(
                 module,
