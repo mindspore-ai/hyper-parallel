@@ -25,6 +25,7 @@ from typing import Any
 from hyper_parallel.codegen.astkit.edits import (
     TextEdit,
     apply_edits,
+    insert_after_imports,
     replace_function_body,
 )
 from hyper_parallel.codegen.astkit.index import FunctionInfo, build_source_index
@@ -53,6 +54,7 @@ def materialize_recorded_forwards(source_text: str, meta: Any) -> str:
         groups[(record.module_type, _source_function_name(original))].append(record)
 
     rendered = source_text
+    bindings: dict[str, list[str]] = {}
     for (host_type, source_function), group in sorted(
         groups.items(), key=lambda item: (item[0][0].__name__, item[0][1])
     ):
@@ -69,7 +71,18 @@ def materialize_recorded_forwards(source_text: str, meta: Any) -> str:
             for record in group:
                 _entry_for_record(meta, record)["skip_source_lowering"] = True
             continue
-        rendered = _materialize_imported_host(rendered, host_type, group[0], meta)
+        rendered, constructor_replaced = _materialize_imported_host(
+            rendered, host_type, group[0], meta
+        )
+        if not constructor_replaced:
+            # The host is instantiated by an imported subtree (no source-level
+            # constructor call to retarget): every recorded module reaches the
+            # generated subclass only through the explicit FQN binder below.
+            bindings.setdefault(host_type.__name__, []).extend(
+                record.module_fqn for record in group
+            )
+    if bindings:
+        rendered = _emit_recorded_forward_bindings(rendered, bindings)
     return _add_runtime_helper_import(rendered)
 
 
@@ -259,16 +272,32 @@ def _materialize_imported_host(
     host_type: type,
     record: Any,
     meta: Any,
-) -> str:
-    """Generate a source-owned subclass and replace its constructor calls."""
+) -> tuple[str, bool]:
+    """Generate a source-owned subclass and retarget its construction sites.
+
+    Returns ``(rendered, constructor_replaced)``.  The subclass and its host
+    import are always emitted (the host class lives in an imported module —
+    the recorded ``__module__`` is the only source of truth for the import).
+    ``constructor_replaced`` is ``False`` when the host is instantiated by an
+    imported subtree, so no source-level constructor call exists to retarget;
+    the caller then binds the recorded FQNs through the explicit binder.
+    """
     host_name = host_type.__name__
     generated_name = f"HPCodegen{host_name}"
     if f"class {generated_name}(" in source_text:
-        return source_text
+        return source_text, f"{generated_name}(" in source_text
+    host_module = getattr(host_type, "__module__", None)
+    if not host_module or host_module == "__main__":
+        raise RuntimeError(
+            f"codegen: recorded host {host_name!r} has no importable module"
+        )
+    rendered = _ensure_import(
+        source_text, f"from {host_module} import {host_name}", host_name
+    )
     signature = inspect.signature(_unbound(record.original_forward))
     info = _signature_info(signature)
     call = _render_super_call(signature)
-    body = _recorded_body(source_text, info, record, meta)
+    body = _recorded_body(rendered, info, record, meta)
     snippet = "\n".join([
         f"class {generated_name}({host_name}):",
         "    \"\"\"Source-owned form of the forward patch installed by the trainer.\"\"\"",
@@ -280,8 +309,99 @@ def _materialize_imported_host(
         body,
         "",
     ])
-    rendered = _insert_before_first_class(source_text, snippet)
+    rendered = _insert_before_first_class(rendered, snippet)
     return _replace_constructor_calls(rendered, host_name, generated_name)
+
+
+def _emit_recorded_forward_bindings(
+    source_text: str,
+    bindings: dict[str, list[str]],
+) -> str:
+    """Emit one reviewable binder that binds each recorded FQN explicitly.
+
+    ``bindings`` maps an imported host class name to the module FQNs the
+    builder actually patched.  The host instances are created by an imported
+    subtree (``AutoModel.from_config``-style construction), so the generated
+    module reaches them only through the recorded paths — one explicit
+    ``MethodType`` binding per FQN, no type registry and no scanning.
+    """
+    lines = [
+        "def hp_bind_recorded_forwards(model):",
+        "    \"\"\"Bind builder-recorded forward patches onto their recorded modules.\"\"\"",
+    ]
+    for host_name in sorted(bindings):
+        generated_name = f"HPCodegen{host_name}"
+        for fqn in sorted(bindings[host_name], key=_fqn_sort_key):
+            accessor = _fqn_accessor(fqn)
+            lines.extend([
+                f"    module = {accessor}",
+                f"    module._forward_impl = MethodType({generated_name}._forward_impl, module)",
+                f"    module.forward = MethodType({generated_name}.forward, module)",
+            ])
+    rendered = _ensure_import(
+        source_text, "from types import MethodType", "MethodType"
+    )
+    return rendered.rstrip() + "\n\n\n" + "\n".join(lines) + "\n"
+
+
+def _fqn_accessor(fqn: str) -> str:
+    """Render a plan FQN as a Python accessor expression rooted at ``model``.
+
+    Mirrors the runtime ``_resolve_module`` semantics segment by segment:
+    numeric segments index a module list, every other segment is a plain
+    attribute (the first FQN segment names the root's submodule).
+    """
+    accessor = "model"
+    for segment in fqn.split("."):
+        if segment.isdigit():
+            accessor += f"[{segment}]"
+        else:
+            accessor += f".{segment}"
+    return accessor
+
+
+def _fqn_sort_key(fqn: str) -> tuple[tuple[int, int, str], ...]:
+    """Natural sort key for plan FQNs — layer indices order by value.
+
+    A plain lexical sort renders ``layers.10`` before ``layers.2``; the binder
+    stays reviewable only when recorded layer paths appear in numeric order.
+    """
+    return tuple(
+        (0, int(segment), "") if segment.isdigit() else (1, 0, segment)
+        for segment in fqn.split(".")
+    )
+
+
+def _ensure_import(source_text: str, import_line: str, symbol: str) -> str:
+    """Insert ``import_line`` after the import block unless ``symbol`` is bound."""
+    if _imports_symbol(source_text, symbol):
+        return source_text
+    index = build_source_index(source_text)
+    edit = insert_after_imports(
+        source_text,
+        index.import_end,
+        import_line,
+        default_offset=index.docstring_end or 0,
+    )
+    return apply_edits(source_text, [edit]) if edit is not None else source_text
+
+
+def _imports_symbol(source_text: str, symbol: str) -> bool:
+    """Return whether a top-level import already binds ``symbol``."""
+    for node in ast.parse(source_text).body:
+        if isinstance(node, ast.Import) and any(
+            alias.asname == symbol
+            or (alias.asname is None and alias.name == symbol)
+            for alias in node.names
+        ):
+            return True
+        if isinstance(node, ast.ImportFrom) and any(
+            alias.asname == symbol
+            or (alias.asname is None and alias.name == symbol)
+            for alias in node.names
+        ):
+            return True
+    return False
 
 
 def _signature_info(signature: inspect.Signature) -> FunctionInfo:
@@ -325,11 +445,22 @@ def _insert_before_first_class(source_text: str, snippet: str) -> str:
     if first is None:
         raise RuntimeError("codegen: generated model source defines no class")
     lines = source_text.splitlines(keepends=True)
-    offset = sum(len(line) for line in lines[:first.lineno - 1])
+    # A decorated class's ``lineno`` is the ``class`` line itself; anchor on
+    # the first decorator instead so the insertion cannot steal the target's
+    # decorator block.
+    first_line = min([first.lineno, *(item.lineno for item in first.decorator_list)])
+    offset = sum(len(line) for line in lines[:first_line - 1])
     return apply_edits(source_text, [TextEdit(offset, offset, snippet + "\n\n")])
 
 
-def _replace_constructor_calls(source_text: str, old_name: str, new_name: str) -> str:
+def _replace_constructor_calls(
+    source_text: str, old_name: str, new_name: str
+) -> tuple[str, bool]:
+    """Retarget every source-level ``old_name(...)`` construction to ``new_name``.
+
+    Returns ``(rendered, replaced)``; ``replaced`` is ``False`` when the host
+    has no source-level construction site (imported-subtree instantiation).
+    """
     tree = ast.parse(source_text)
     lines = source_text.splitlines(keepends=True)
     offsets = [0]
@@ -341,10 +472,8 @@ def _replace_constructor_calls(source_text: str, old_name: str, new_name: str) -
             start = offsets[node.func.lineno - 1] + node.func.col_offset
             edits.append(TextEdit(start, start + len(old_name), new_name))
     if not edits:
-        raise RuntimeError(
-            f"codegen: imported recorded host {old_name!r} has no constructor call to replace"
-        )
-    return apply_edits(source_text, edits)
+        return source_text, False
+    return apply_edits(source_text, edits), True
 
 
 __all__ = ["materialize_recorded_forwards"]

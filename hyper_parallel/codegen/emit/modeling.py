@@ -288,6 +288,8 @@ def _verify_recorded_patch_materialization(text: str, meta: Any) -> None:
     )
     if not local_records and not replacement_records and not wrapper_records:
         return
+    from hyper_parallel.codegen.emit.recorded import _fqn_accessor
+
     tree = ast.parse(text)
     classes = {
         node.name: node
@@ -335,16 +337,35 @@ def _verify_recorded_patch_materialization(text: str, meta: Any) -> None:
             isinstance(node, ast.Attribute) and node.attr == required_attr
             for node in ast.walk(forward)
         )
+        # An imported host (its class is not defined in this file) reaches its
+        # instances only through the construction sites: either the source
+        # calls were retargeted to the generated subclass, or the explicit FQN
+        # binder must reference this record's module path.
+        runtime_bound = False
+        if class_node is not None and class_name not in classes:
+            retargeted = any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == generated_class_name
+                for node in ast.walk(tree)
+            )
+            runtime_bound = not retargeted
+            if not retargeted and _fqn_accessor(record.module_fqn) not in text:
+                is_materialized = False
         if not is_materialized:
             missing.append(f"{record.module_fqn} ({class_name})")
         elif isinstance(materialized, list):
+            if "." not in source_name:
+                source_form = "module_forward"
+            elif runtime_bound:
+                source_form = "subclass_fqn_binding"
+            else:
+                source_form = "subclass_forward"
             materialized.append({
                 "fqn": record.module_fqn,
                 "host_class": class_node.name if class_node is not None else class_name,
                 "kind": "local_compute",
-                "source_form": (
-                    "module_forward" if "." not in source_name else "subclass_forward"
-                ),
+                "source_form": source_form,
             })
     bound_names = {
         node.id for node in ast.walk(tree) if isinstance(node, ast.Name)

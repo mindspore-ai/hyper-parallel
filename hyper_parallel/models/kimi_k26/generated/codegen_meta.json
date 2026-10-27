@@ -78,6 +78,14 @@
       "match": "model.language_model.layers.1.mlp"
     }
   ],
+  "materialized_patches": [
+    {
+      "fqn": "model.language_model.layers.1.mlp",
+      "host_class": "HPCodegenDeepseekV3MoE",
+      "kind": "local_compute",
+      "source_form": "subclass_forward"
+    }
+  ],
   "mesh_dim_names": [
     "tp"
   ],
@@ -93,16 +101,16 @@
   ],
   "outputs": {
     "diff": {
-      "lines": 64,
-      "sha256": "e9d4f24a41c23d4859e90e382b8af75d3f3c88f33ff07aad53b696033fb79255"
+      "lines": 120,
+      "sha256": "58916e731ec23fb12aff1577349d5d9570c1abb8cdd2d6f9719603f9938f48bf"
     },
     "init": {
       "lines": 6,
-      "sha256": "a640c2af02bca16c44da7819436d764b003122f6905254aed41258cc80e2ea53"
+      "sha256": "04512108f960b48fe75d146e9382bd2ea3ca2b80e568d49a275850473aa2e014"
     },
     "modeling": {
-      "lines": 918,
-      "sha256": "f981c27dbd6b4fadd6fcfe1cea843e47fe7bbd913cf0b36cda1b52aaa7caad1b"
+      "lines": 962,
+      "sha256": "662a7ef60a00bd23827485d7387a639ca186b57e34d6d1bb5742898cdec86324"
     }
   },
   "parallel_dims": {
@@ -1219,7 +1227,7 @@
     }
   },
   "remote_siblings": [],
-  "signature": "bd6f04ee4ff3",
+  "signature": "d1bcc2a8e725",
   "skipped_overrides": [],
   "source": {
     "architecture": "KimiK25ForConditionalGeneration",
@@ -1239,6 +1247,6 @@
       "lm_head.weight"
     ]
   ],
-  "yaml_path": "/home/lxy/codegen_all_3cb4e616_inputs/kimi_k26.yaml",
-  "yaml_sha256": "609ac2f2e63159b721d605ab3e16101ec7df67a3fa956db74d731ef196ccd085"
+  "yaml_path": "/home/lxy/kimi_builder_codegen.yaml",
+  "yaml_sha256": "b9e543acb50aff64ecd4aeaf62f9a675c572f2f24a1f139c7b5686977b513c80"
 }
