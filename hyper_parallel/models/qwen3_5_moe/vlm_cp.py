@@ -88,8 +88,17 @@ def install_qwen_vlm_cp_forward(model: Any) -> None:
             return original_forward(*args, **kwargs)
         if args or kwargs.get("use_cache") or kwargs.get("past_key_values") is not None:
             raise ValueError("Qwen VLM CP supports keyword-only uncached training")
-        if kwargs.get("output_router_logits"):
+        router_enabled = kwargs.get("output_router_logits")
+        if router_enabled is None:
+            router_enabled = getattr(getattr(model.config, "text_config", model.config), "output_router_logits", False)
+        if router_enabled:
             raise NotImplementedError("Qwen VLM CP does not yet aggregate router auxiliary loss")
+        if kwargs.get("return_dict") is False:
+            raise ValueError("Qwen VLM CP requires return_dict=True")
+        logits_to_keep = kwargs.get("logits_to_keep", 0)
+        if isinstance(logits_to_keep, torch.Tensor) or logits_to_keep != 0:
+            raise ValueError("Qwen VLM CP requires logits_to_keep=0")
+        kwargs["use_cache"] = False
         input_ids = kwargs.pop("input_ids")
         kwargs.pop("labels", None)
         kwargs.pop("mm_token_type_ids", None)
@@ -152,6 +161,8 @@ class QwenVLMParallelBatch(OmniParallelBatch, RuntimeInputAdapter):
         """Use the same global tail alignment for the baseline and CP comparisons."""
         if mesh_context.tp_size != 1 or mesh_context.sequence_parallel:
             raise NotImplementedError("Qwen VLM P2P CP currently requires TP=1 and SP=false")
+        if isinstance(sequence_alignment, bool) or not isinstance(sequence_alignment, int) or sequence_alignment <= 0:
+            raise ValueError("sequence_alignment must be a positive integer")
         if sequence_alignment % (64 * mesh_context.cp_size):
             raise ValueError("sequence_alignment must be divisible by 64 * cp_size")
         self.model = None
@@ -205,11 +216,15 @@ class QwenVLMParallelBatch(OmniParallelBatch, RuntimeInputAdapter):
         if self.model is None:
             raise RuntimeError("bind_model must run before reading a Qwen VLM CP batch")
         source = external_batch if external_batch is not None else next(data_iterator)
-        batch = self.tp_broadcaster.broadcast(self._pad(self._normalize_source_batch(source)), broadcast_all_fields=True)
+        batch = self.tp_broadcaster.broadcast(
+            self._pad(self._normalize_source_batch(source)), broadcast_all_fields=True,
+        )
         images = self.bridge.parse_images(batch)
         cp_size = self.parallel_context.cp_world_size
         if cp_size == 1:
+            runtime_inputs = self._build_runtime_inputs(batch)
             model_inputs, loss_inputs = self._split_model_and_loss_inputs(batch)
+            model_inputs.update(runtime_inputs)
             if getattr(self.model, "_hp_qwen_vlm_chunk_loss_bound", False):
                 targets = functional.pad(batch["labels"], (0, 1), value=-100)[:, 1:].contiguous()
                 self._add_chunk_targets(model_inputs, loss_inputs, targets)

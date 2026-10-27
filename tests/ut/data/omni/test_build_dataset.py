@@ -14,6 +14,7 @@
 # ============================================================================
 """Real Parquet source tests, including embedded image bytes and worker replay."""
 
+import json
 import pickle
 import tempfile
 import unittest
@@ -168,3 +169,22 @@ class TestOmniParquet(unittest.TestCase):
                 self.assertEqual(len(dataset), 1)
                 self.assertEqual(dataset[0]["messages"][0]["content"][0]["image"],
                                  str(Path(tmp) / name / "image.png"))
+
+    def test_json_image_paths_use_source_directory(self) -> None:
+        """Feature: Local JSON media provenance.
+
+        Description: Read relative image paths from a JSON file outside the working directory.
+        Expectation: Resolve against the record file, matching JSONL and Parquet.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "samples.json"
+            path.write_text(json.dumps([{
+                "messages": [{"role": "user", "content": "<image>"}],
+                "images": [{"path": "images/a.png"}],
+            }]), encoding="utf-8")
+            dataset = build_online_omni_mapping_dataset(
+                data_path=str(path), data_config={"cache_dir": str(Path(tmp) / "cache")},
+                transform=PreparedTransform(),
+            )
+            self.assertEqual(dataset[0]["messages"][0]["content"][0]["image"],
+                             str(Path(tmp) / "images/a.png"))

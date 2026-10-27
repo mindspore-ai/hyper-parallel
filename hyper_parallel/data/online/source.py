@@ -21,7 +21,9 @@ import os
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, TypeAlias
 
-from hyper_parallel.data.constants import ONLINE_FILE_FORMATS, ONLINE_SOURCE_PATH_KEY, ONLINE_SPLIT_NAMES, ONLINE_STOPPING_STRATEGIES
+from hyper_parallel.data.constants import (
+    ONLINE_FILE_FORMATS, ONLINE_SOURCE_PATH_KEY, ONLINE_SPLIT_NAMES, ONLINE_STOPPING_STRATEGIES,
+)
 
 OnlinePathSpec: TypeAlias = str | Sequence[str]
 OnlineDataPath: TypeAlias = OnlinePathSpec | Mapping[str, OnlinePathSpec]
@@ -170,8 +172,8 @@ class _OnlineLeafSourceLoader:
                     selected_splits.append(split_expression)
             selected_split = selected_splits
 
-        if load_dataset_path == "parquet" and "data_files" in load_options and not streaming:
-            loaded_dataset = self._load_local_parquet(load_options["data_files"], selected_split)
+        if load_dataset_path in ("json", "parquet") and "data_files" in load_options and not streaming:
+            loaded_dataset = self._load_local_files(load_dataset_path, load_options["data_files"], selected_split)
         else:
             loaded_dataset = load_dataset(
                 load_dataset_path,
@@ -218,14 +220,15 @@ class _OnlineLeafSourceLoader:
         filtered_dataset = dataset_result.filter(sample_filter)
         return filtered_dataset
 
-    def _load_local_parquet(self, data_files: Any, selected_split: str | list[str]) -> Any:
+    def _load_local_files(self, file_format: str, data_files: Any, selected_split: str | list[str]) -> Any:
         """Preserve per-file media roots through filtering and split selection."""
+        # datasets remains optional for Indexed-only installations.
         from datasets import ReadInstruction, concatenate_datasets, load_dataset  # pylint: disable=C0415
 
         files_by_split = data_files if isinstance(data_files, Mapping) else {"train": data_files}
         if any("://" in path for paths in files_by_split.values() for path in paths):
             return load_dataset(
-                "parquet", data_files=data_files, split=selected_split,
+                file_format, data_files=data_files, split=selected_split,
                 cache_dir=self.data_config.get("cache_dir"),
             )
         datasets_by_split = {}
@@ -235,7 +238,7 @@ class _OnlineLeafSourceLoader:
                 matching_paths = sorted(glob.glob(path_pattern)) or [path_pattern]
                 for source_path in matching_paths:
                     source = load_dataset(
-                        "parquet", data_files=source_path, split="train",
+                        file_format, data_files=source_path, split="train",
                         cache_dir=self.data_config.get("cache_dir"),
                     )
                     if ONLINE_SOURCE_PATH_KEY in source.column_names:

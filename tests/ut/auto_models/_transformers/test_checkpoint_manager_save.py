@@ -208,6 +208,18 @@ class TestCheckpointManagerSave(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "expert shapes"):
             CheckpointManager(model)._normalize_dcp_export_layout(wrong, "auto")  # pylint: disable=W0212
 
+    def test_dcp_missing_parameters_are_rejected(self) -> None:
+        """Feature: Complete offline HF export.
+
+        Description: Supply a shape-correct checkpoint missing one model parameter.
+        Expectation: Reject instead of producing a checkpoint that reloads random weights.
+        """
+        model = torch.nn.Linear(4, 2, device="meta")
+        with self.assertRaisesRegex(ValueError, "missing.*bias"):
+            CheckpointManager(model)._normalize_dcp_export_layout(
+                {"weight": torch.empty(2, 4)}, "auto",
+            )
+
     def test_dcp_dense_shape_mismatch_is_rejected(self) -> None:
         """Configuration validation also covers non-expert parameters."""
         model = torch.nn.Linear(4, 2, bias=False, device="meta")

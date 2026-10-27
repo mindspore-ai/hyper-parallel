@@ -12,7 +12,7 @@ Qwen 图文训练所需的图片绑定与监督边界处理。通用数据读取
 `build_online_omni_mapping_dataset`、`build_auto_processor` 和
 `hyper_parallel.data.batching.build_omni_collate_fn`。
 
-本地 JSONL 和 Parquet 样本保留来源路径，图片相对路径以源文件目录为基准。
+本地 JSON、JSONL 和 Parquet 样本保留来源路径，图片相对路径以源文件目录为基准。
 Parquet 使用 Hugging Face datasets 读取、过滤和划分，需安装 datasets 与 pyarrow；
 图片解码留到 transform 访问样本时执行。空数据源遵循共享 builder 的 None 返回约定。
 

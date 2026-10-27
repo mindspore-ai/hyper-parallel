@@ -301,3 +301,25 @@ class TestQwenEncoder(unittest.TestCase):
             self.assertIsNotNone(model.model.visual.blocks[0].attn.qkv.weight.grad)
         finally:
             _DEVICE_MESH_MAP.clear()
+
+    def test_chunk_loss_anchor_and_cleanup(self) -> None:
+        """Feature: Encoder plus chunk loss.
+
+        Description: Route visual features into a loss_sum output.
+        Expectation: Both routed features and dummy anchor retain gradients.
+        """
+        model = make_model()
+        model.model.visual.forward = lambda pixels, **kwargs: SimpleNamespace(pooler_output=pixels)
+        model.forward = lambda pixel_values, **kwargs: SimpleNamespace(
+            loss_sum=model.model.visual(pixel_values).pooler_output.square().sum(), logits=None,
+        )
+        bridge = QwenVisionBridge(model)
+        bridge.install_forward()
+        routed = torch.randn(2, 8, requires_grad=True)
+        anchor_source = torch.ones(1, requires_grad=True)
+        plan = SimpleNamespace(encode_and_route=lambda _: ([(item(0, 2), routed)], anchor_source.sum() * 0))
+        output = model(pixel_values=torch.zeros_like(routed), encoder_parallel_plan=plan)
+        output.loss_sum.backward()
+        torch.testing.assert_close(routed.grad, 2 * routed)
+        torch.testing.assert_close(anchor_source.grad, torch.zeros(1))
+        self.assertIsNone(bridge.feature_context.get())

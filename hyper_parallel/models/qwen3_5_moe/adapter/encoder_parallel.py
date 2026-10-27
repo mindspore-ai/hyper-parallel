@@ -249,9 +249,12 @@ class QwenVisionBridge:
             finally:
                 self.feature_context.reset(token)
             if anchor is not None:
-                if getattr(output, "loss", None) is None:
-                    raise ValueError("Qwen encoder training requires a ModelOutput with loss")
-                output.loss = output.loss + anchor
+                if getattr(output, "loss_sum", None) is not None:
+                    output.loss_sum = output.loss_sum + anchor
+                elif getattr(output, "loss", None) is not None:
+                    output.loss = output.loss + anchor
+                else:
+                    raise ValueError("Qwen encoder training requires a ModelOutput with loss or loss_sum")
             return output
 
         self.vision.forward = visual_forward

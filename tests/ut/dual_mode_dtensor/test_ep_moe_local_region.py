@@ -1252,6 +1252,7 @@ def test_router_and_expert_utils(
     output = _aggregate_ep_outputs(
         combined_outputs,
         expert_weights,
+        torch.arange(3).repeat_interleave(2),
         dispatch_order,
         (1, 3, 2),
     )

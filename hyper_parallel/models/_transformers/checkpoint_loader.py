@@ -188,6 +188,9 @@ class CheckpointManager:
         if getattr(self.model, "_hp_used_replacement_weight_conversions", None):
             raise ValueError("DCP layout normalization requires an unreplaced Hugging Face model")
         expected = self.model.state_dict()
+        missing = sorted(set(expected) - set(state_dict))
+        if missing:
+            raise ValueError(f"DCP checkpoint is missing HF model parameters or buffers: {missing}")
         result = dict(state_dict)
         expert_groups: dict[str, list[str]] = defaultdict(list)
         for name in state_dict:

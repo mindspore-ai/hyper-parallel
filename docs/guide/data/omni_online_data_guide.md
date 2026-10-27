@@ -96,8 +96,8 @@ print(encoded_sample["input_ids"].shape, encoded_sample["labels"].shape)
 配置 ratio split 或预分割路径后，Dataset builder 返回 `(train, valid, test)`，其中不存在的 split 为
 `None`。`transform.is_valid_sample` 会自动作为原始记录过滤器传入 source builder；无需再手动传一次。
 
-`max_seq_len` 目前仅保存在 `AutoProcessorTransform` 中，**不会自动截断或填充样本**；
-`token_budget` 决定一次 packing 尽量选择多少 token，也不是硬性的单样本截断上限。
+`AutoProcessorTransform` 会拒绝超过 `max_seq_len` 的样本，**不会截断或填充媒体序列**；
+`token_budget` 决定一次 packing 尽量选择多少 token，不是单样本截断上限。
 接入较长样本时，应在模型专用 transform 中明确实现截断及图像 patch/grid 同步处理，或提前清洗数据。
 
 ### 固定 packing 后的输入长度
@@ -149,7 +149,9 @@ JSON/JSONL record
 1. 完整对话，`add_generation_prompt=False`，得到 `input_ids`、`attention_mask`、图片字段等模型输入；
 2. 去掉最后的 assistant 回复，`add_generation_prompt=True`，得到包含 assistant 起始标记的 prompt 长度。
 
-它检查 prompt token 是否为完整对话的前缀，然后复制 `input_ids` 得到 `labels`：prompt 区间以及
+它首先检查 prompt token 是否为完整对话的前缀；若仅发生模板边界的 token 合并，则验证
+解码文本与公共 token 前缀，保守屏蔽边界 token。无法确认边界的模板重写会报错。
+完整输入 token 不会被重新拼接。随后复制 `input_ids` 得到 `labels`：prompt 区间以及
 `mm_token_type_ids != 0` 的多模态位置设为 `-100`，最后的 assistant 文本保留 token ID。例如：
 
 ```text
@@ -161,7 +163,7 @@ processor 本身不会自动生成训练 `labels`。此处标签与 `input_ids` 
 Qwen2-VL Causal LM 在计算 loss 时处理位移。transform 返回单条样本的一维 token 字段，以及完整的
 `pixel_values`、`image_grid_thw` 等模态字段；`OmniParallelBatch` 要求 batch 中已有 `labels`，并在缺少
 `loss_mask` 时由 `labels >= 0` 推导。不要让所有 token 都保留为有效标签，否则用户提示和图像占位符
-也会参与监督。
+也会参与监督。没有剩余监督 token 的样本会报错。
 
 默认非 encoder-DP 路径中，`OmniParallelBatch` 只对 token 字段做 CP 分片；图像等模态字段不按 CP
 切分，而是在 TP×CP 坐标上保持完整，供各 rank 的视觉分支使用。`encoder_dp: true` 的图像 bucket

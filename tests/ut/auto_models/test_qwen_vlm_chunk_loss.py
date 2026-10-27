@@ -17,6 +17,7 @@
 import copy
 from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock
 
 import torch
 from torch.nn import functional
@@ -24,8 +25,9 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5Moe
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeForConditionalGeneration
 
 from hyper_parallel.components.losses import ChunkedCausalLMLoss
+from hyper_parallel.data.batching.runtime_input import RuntimeInputAdapter
 from hyper_parallel.models.qwen3_5_moe.adapter.vlm_chunk_loss import bind_chunk_loss
-from hyper_parallel.models.qwen3_5_moe.vlm_cp import QwenVLMParallelBatch
+from hyper_parallel.models.qwen3_5_moe.vlm_cp import QwenVLMParallelBatch, install_qwen_vlm_cp_forward
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from tests.common.mark_utils import arg_mark
 
@@ -151,3 +153,52 @@ class TestQwenVLMChunkLoss(unittest.TestCase):
         self.assertEqual(int(count_loss_token(loss_inputs)["foundation_tokens"]), int(expected.ne(-100).sum()))
         output = model(**objective.prepare_model_inputs(inputs, loss_inputs), use_cache=False)
         self.assertIsNone(output.logits)
+
+    def test_cp1_calls_runtime_adapter(self) -> None:
+        """Feature: CP=1 encoder/runtime composition.
+
+        Description: Supply a runtime extension to the Qwen batch adapter.
+        Expectation: Its plan reaches model inputs but not loss inputs.
+        """
+        model = make_model()
+        context = SimpleNamespace(cp_size=1, tp_size=1, pp_size=1, dp_size=1, dp_rank=0,
+                                  cp_rank=0, tp_rank=0, sequence_parallel=False, loss_parallel=False)
+        extension = Mock(spec=RuntimeInputAdapter)
+        plan = object()
+        extension.build.return_value = {"encoder_parallel_plan": plan}
+        batcher = QwenVLMParallelBatch(mesh_context=context, device=torch.device("cpu"),
+                                      runtime_input_adapter=extension)
+        batcher.bind_model(model)
+        inputs, loss_inputs = batcher(None, external_batch=make_batch())
+        extension.build.assert_called_once()
+        self.assertIs(inputs["encoder_parallel_plan"], plan)
+        self.assertNotIn("encoder_parallel_plan", loss_inputs)
+
+    def test_invalid_alignment_is_rejected(self) -> None:
+        """Feature: Alignment boundary validation.
+
+        Description: Configure zero, negative, fractional, or boolean alignment.
+        Expectation: Reject at construction before padding or communication.
+        """
+        context = SimpleNamespace(cp_size=1, tp_size=1, sequence_parallel=False)
+        for alignment in (0, -64, 64.0, True):
+            with self.subTest(alignment=alignment), self.assertRaisesRegex(ValueError, "positive integer"):
+                QwenVLMParallelBatch(mesh_context=context, device=torch.device("cpu"),
+                                     sequence_alignment=alignment)
+
+    def test_cp_rejects_implicit_router_loss_and_partial_logits(self) -> None:
+        """Feature: CP forward contract.
+
+        Description: Exercise config-default router output and incompatible HF output options.
+        Expectation: Reject before encoder work or decoder execution.
+        """
+        model = make_model()
+        install_qwen_vlm_cp_forward(model)
+        model.config.text_config.output_router_logits = True
+        with self.assertRaisesRegex(NotImplementedError, "router auxiliary loss"):
+            model(vlm_cp_inputs=object())
+        for options, message in (({"return_dict": False}, "return_dict"),
+                                 ({"logits_to_keep": 1}, "logits_to_keep"),
+                                 ({"logits_to_keep": torch.tensor([0])}, "logits_to_keep")):
+            with self.subTest(options=options), self.assertRaisesRegex(ValueError, message):
+                model(vlm_cp_inputs=object(), output_router_logits=False, **options)
