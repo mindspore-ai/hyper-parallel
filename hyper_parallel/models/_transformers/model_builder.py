@@ -690,6 +690,32 @@ def _maybe_apply_module_replacements(
     )
 
 
+def _tie_model_weights_before_parallelism(model: nn.Module) -> None:
+    """Establish declared parameter aliases before distributed wrapping.
+
+    Args:
+        model: Constructed model whose static tied-weight mapping is available.
+
+    Raises:
+        ValueError: If the model cannot establish its declared parameter aliases.
+    """
+    tied_mapping = getattr(model, "all_tied_weights_keys", None) or {}
+    if not tied_mapping:
+        return
+    tie_weights = getattr(model, "tie_weights", None)
+    if not callable(tie_weights):
+        raise ValueError("Model declares tied weights but has no callable tie_weights()")
+    tie_weights(recompute_mapping=False)
+    for target_name, source_name in tied_mapping.items():
+        target = model.get_parameter_or_buffer(target_name)
+        source = model.get_parameter_or_buffer(source_name)
+        if target is not source:
+            raise ValueError(
+                "Model tie_weights() did not establish parameter identity for "
+                f"{target_name} and {source_name}"
+            )
+
+
 def _apply_fsdp2_with_external(
     model: nn.Module,
     fsdp2_manager: Optional[FSDP2Manager],
@@ -760,6 +786,8 @@ def apply_model_infrastructure(
     )
     if is_meta_device:
         _apply_materialization_adapter(model)
+
+    _tie_model_weights_before_parallelism(model)
 
     if freeze_config is not None:
         _apply_parameter_freezing(model, freeze_config)
