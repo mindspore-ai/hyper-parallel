@@ -38,7 +38,50 @@ def _make_scheduler_stub() -> HSDPSchedulerV2:
     """Create a minimal HSDPSchedulerV2 stub that can call _register_post_backward_hook."""
     scheduler = object.__new__(HSDPSchedulerV2)
     scheduler.scheduler_ctx = HSDPSchedulerContext()
+    scheduler._param_grad_gate = False
+    scheduler._param_grad_expected = set()
+    scheduler._param_grad_ready = set()
+    scheduler._param_grad_handles = {}
+    scheduler._param_grad_input_done = False
+    scheduler._all_gather_extension = None
     return scheduler
+
+
+class TestAllGatherExtension(unittest.TestCase):
+    """确认外部扩展仅在显式恢复请求中运行，FSDP 仍持有 AG 句柄。"""
+
+    def test_pre_and_post_hooks_wrap_fsdp_restore(self) -> None:
+        """借用输入经 FSDP 使用，完成后才返回视图；例如两个专家分片合为完整表。"""
+        scheduler = _make_scheduler_stub()
+        events = []
+        borrowed = torch.ones(2, dtype=torch.bfloat16)
+        scheduler.hsdp_state = SimpleNamespace(
+            is_shard=True,
+            unshard=lambda **kwargs: events.append(("gather", kwargs["input_buffers"][7])),
+            wait_for_unshard=lambda: events.append(("wait", None)),
+        )
+
+        class Extension:
+            """测试用参数扩展；例如前置返回池切片、后置确认 AG 已结束。"""
+
+            def fsdp_pre_all_gather(self, _scheduler: HSDPSchedulerV2, context: str) -> dict[int, torch.Tensor]:
+                """提供借用输入；例如槽 0 请求参数 7 的两个 BF16 元素。"""
+                events.append(("pre", context))
+                return {7: borrowed}
+
+            def fsdp_post_all_gather(self, _scheduler: HSDPSchedulerV2, context: str) -> tuple[str, torch.Tensor]:
+                """输出完整参数视图；例如槽 0 在等待之后才能读取。"""
+                self.events_at_post = list(events)
+                return context, borrowed
+
+        extension = Extension()
+        scheduler.register_all_gather_extension(extension)
+        result = scheduler.restore_with_all_gather_extension("slot0")
+
+        self.assertEqual([name for name, _ in events], ["pre", "gather", "wait"])
+        self.assertEqual(result[0], "slot0")
+        self.assertIs(result[1], borrowed)
+        self.assertEqual(extension.events_at_post, events)
 
 
 def _make_prefetch_param(fqn: str, handle=None) -> HSDPParamV2:
@@ -519,6 +562,17 @@ class TestRootBackwardCallback(unittest.TestCase):
         scheduler._finalize_comm_fusion_reductions.assert_called_once_with()
         scheduler._finalize_per_param_reductions.assert_called_once_with()
         scheduler.launch_tp_replicate_reduce_and_apply.assert_called_once_with()
+
+    def test_root_backward_forces_only_opted_in_param_grad_gate(self) -> None:
+        """仅开启门控的单元需要强制收尾；例如含未使用参数的专家单元不能一直等待。"""
+        scheduler = _make_prefetch_scheduler()
+        child = _make_prefetch_scheduler(scheduler_ctx=scheduler.scheduler_ctx)
+        child._param_grad_gate = True
+
+        scheduler._root_backward_hook()
+
+        scheduler._backward_hook.assert_called_once_with()
+        child._backward_hook.assert_called_once_with(force=True)
 
 
 class TestRecomputeForwardPrefetchGuard(unittest.TestCase):

@@ -38,6 +38,8 @@ from hyper_parallel.core.activation_memory.swap import (
 )
 from hyper_parallel.models.adapter_spec import RecomputePolicy
 from hyper_parallel.models.registry import get_model_adapter
+from hyper_parallel.distributed.expert_parallel.moonep.checkpoint import checkpoint_context_factory, wrap_moonep_checkpoint
+from hyper_parallel.distributed.expert_parallel.moonep.runtime import has_moonep
 
 logger = logging.getLogger(__name__)
 
@@ -671,7 +673,11 @@ def apply_submodule_checkpointing(
     checkpoint_kwargs = {} if enable_compile else _eager_checkpoint_kwargs(swap_inputs)
 
     def submodule_checkpoint_wrapper(module: nn.Module) -> nn.Module:
-        """Wrap one selected layer submodule with checkpointing."""
+        """包装选中的子模块；例如KV共享模型的MoE区域复用MoonEP执行键。"""
+        if has_moonep(module):
+            if enable_compile or swap_inputs:
+                raise ValueError("MoonEP子模块重算要求eager执行且关闭input swap")
+            return wrap_moonep_checkpoint(module)
         return checkpoint_wrapper(module, **checkpoint_kwargs)
 
     wrapped_count = 0
@@ -1053,7 +1059,11 @@ def _wrap_region_roots(model: nn.Module, module_by_fqn: dict, roots: list, check
             continue
         parent_fqn, child_name = module_fqn.rsplit(".", 1)
         parent = module_by_fqn[parent_fqn] if parent_fqn else model
-        setattr(parent, child_name, checkpoint_wrapper(module, **checkpoint_kwargs))
+        region_kwargs = dict(checkpoint_kwargs)
+        if has_moonep(module):
+            region_kwargs.update(use_reentrant=False, early_stop=False,
+                                 context_fn=checkpoint_context_factory(module))
+        setattr(parent, child_name, checkpoint_wrapper(module, **region_kwargs))
         wrapped_count += 1
     if wrapped_count == 0:
         raise ValueError("model adapter recompute matched no region to wrap")
@@ -1178,6 +1188,11 @@ def _apply_full_checkpointing(
         implementation was enabled instead, in which case no per-layer wrapping
         happened and swap prefetch chains must not be registered.
     """
+    if has_moonep(model) and not has_kv_sharing:
+        return _wrap_layer_containers(
+            containers, lambda layer: wrap_moonep_checkpoint(layer) if has_moonep(layer)
+            else checkpoint_wrapper(layer, **_eager_checkpoint_kwargs(swap_inputs)),
+        )
     if not has_kv_sharing and _should_use_hf_native_gradient_checkpointing(
         model,
         ac_layers,
@@ -1229,6 +1244,8 @@ def _apply_activation_checkpointing(
         swap_inputs,
         enable_compile,
     )
+    if has_moonep(model) and (enable_compile or activation_checkpoint == "selective" or swap_inputs):
+        raise ValueError("MoonEP生命周期首版支持eager full非重入重计算，不支持compile/SAC/input swap")
     containers = _resolve_activation_checkpoint_containers(model)
     ac_layers = _flatten_layer_container_infos(containers)
     has_kv_sharing = _detect_kv_sharing_and_maybe_disable_cache(model)

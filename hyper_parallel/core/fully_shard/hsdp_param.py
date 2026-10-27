@@ -201,6 +201,8 @@ class HSDPParamV2:
         self._param_fqn: Optional[str] = None
         self.unsharded_param_buffers: List[torch.Tensor] = []
         self.allgather_comm_ctx = AllGatherCommCtx()
+        # 参数 AG 可走独立通信组；梯度 RS 仍沿用原分片组。
+        self.all_gather_process_group = getattr(self.mesh_info, "shard_process_group", None)
         self._post_load_hook_handle = (
             module_info.module.register_load_state_dict_post_hook(
                 lambda *args, **kwargs: self.reset_sharded_param()
@@ -1040,19 +1042,26 @@ class HSDPParamV2:
             torch._C._swap_tensor_impl(self.sharded_param, local_tensor_data)  # pylint: disable=W0212
 
     @torch.no_grad()
-    def _get_unsharded_param_data(self, async_op: bool = False) -> None:
+    def _get_unsharded_param_data(self, async_op: bool = False,
+                                 input_buffer: Optional[torch.Tensor] = None) -> None:
         """
         Perform all-gather to get unsharded parameter data.
 
         Args:
             async_op: Whether to execute asynchronously.
+            input_buffer: 可选的借用转换输入；例如 BF16 共享发送区中的连续切片。
 
         The output buffer and optional asynchronous handle are stored in the
         parameter communication context.
         """
-        all_gather_input = self.all_gather_inputs[0]
+        if input_buffer is None:
+            all_gather_input = self.all_gather_inputs[0]
+        else:
+            if self.shard_world_size <= 1 or self.all_gather_process_group is None:
+                raise ValueError("借用 AG 输入只支持实际执行 all-gather 的分片参数")
+            all_gather_input = self.copy_all_gather_input(input_buffer)
 
-        if self.shard_world_size <= 1 or self.mesh_info.shard_process_group is None:
+        if self.shard_world_size <= 1 or self.all_gather_process_group is None:
             if len(self.unsharded_param_buffers) == 0:
                 self.unsharded_param_buffers = [all_gather_input]
             elif self.unsharded_param_buffers[0] is not all_gather_input:
@@ -1085,7 +1094,7 @@ class HSDPParamV2:
             self.allgather_comm_ctx.allgather_handle = dist.all_gather_into_tensor(
                 self.allgather_comm_ctx.allgather_output,
                 all_gather_input,
-                group=self.mesh_info.shard_process_group,
+                group=self.all_gather_process_group,
                 async_op=async_op,
             )
 
@@ -1093,16 +1102,48 @@ class HSDPParamV2:
             self.allgather_comm_ctx.allgather_output = None
 
 
-    def unshard(self, async_op: bool = False) -> None:
-        """Start gathering the full parameter when no gather is already pending.
+    @torch.no_grad()
+    def copy_all_gather_input(self, buffer: torch.Tensor) -> torch.Tensor:
+        """将本地分片写入借用的 AG 输入，不改变完整参数的存储。
 
         Args:
-            async_op: Whether to launch the all-gather asynchronously.
+            buffer: 与本地分片同形状、计算 dtype、同设备的连续存储。
+
+        Returns:
+            已填充的原 buffer；AG 读取结束前调用方不能覆盖。
+
+        Example:
+            FP32 分片 [1,2] 复制到 BF16 池的 [0,2)；另一参数借不重叠切片，
+            两个 AG 都等待完毕后才可复用整个池。
+        """
+        self._assert_in_states(ShardedState.SHARDED)
+        source = self._sharded_param_data
+        dtype = self.param_dtype if self.param_dtype is not None else source.dtype
+        if (self.offload_to_cpu or buffer.shape != source.shape or buffer.dtype != dtype
+                or buffer.device != source.device or not buffer.is_contiguous()
+                or buffer.requires_grad):
+            raise ValueError("借用的 AG 输入必须匹配无 offload 分片的 shape、dtype 和 device 且连续")
+        buffer.copy_(source)
+        return buffer
+
+    def unshard(self, async_op: bool = False,
+                input_buffer: Optional[torch.Tensor] = None) -> None:
+        """没有在途 AG 时恢复完整参数，可使用借用的转换输入。
+
+        Args:
+            async_op: 是否异步发起 AG。
+            input_buffer: 借用输入，AG 完成前由调用方保活。
+
+        Example:
+            两层顺序借同一 BF16 池；先等待上一层 AG，再覆盖池中分片。
         """
         if self.allgather_comm_ctx.allgather_handle is not None:
             # Already triggered by HSDPState.prefetch(), so return directly.
             return  # no-op
-        self._get_unsharded_param_data(async_op=async_op)
+        if input_buffer is None:
+            self._get_unsharded_param_data(async_op=async_op)
+        else:
+            self._get_unsharded_param_data(async_op=async_op, input_buffer=input_buffer)
 
 
     def wait_for_unshard(self) -> None:

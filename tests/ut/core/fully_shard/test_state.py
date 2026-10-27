@@ -174,6 +174,7 @@ def _new_state(hsdp_params=None, replicate_params=None, *, comm_fusion=False, of
 def _new_root_scheduler(state):
     """Create a root scheduler double that finalizes one state."""
     scheduler = object.__new__(HSDPSchedulerV2)
+    scheduler._param_grad_gate = False
     scheduler.hsdp_state = state
     scheduler.scheduler_ctx = state.scheduler_ctx
     scheduler.scheduler_ctx.all_hsdp_schedulers = [scheduler]
@@ -236,6 +237,52 @@ class TestToDtypeIfNeeded(unittest.TestCase):
         # Act & Assert (None has no .dtype attribute)
         with self.assertRaises(AttributeError):
             _to_dtype_if_needed(None, torch.float32)
+
+class TestIndependentAllGatherRoute(unittest.TestCase):
+    """独立AG通道不改变分片布局、RS通道或仅复制参数的默认路径。"""
+
+    @patch("hyper_parallel.core.fully_shard.hsdp_state.dist.get_process_group_ranks")
+    def test_set_ag_group_preserves_rs_and_skips_replicated_parameters(self, mock_ranks):
+        """相同成员顺序可换AG组；例如[0,4]的RS仍走旧组，复制参数保持None。"""
+        old_group, new_group = object(), object()
+        mock_ranks.side_effect = lambda _group: [0, 4]
+        sharded = SimpleNamespace(
+            shard_world_size=2, mesh_info=SimpleNamespace(shard_process_group=old_group),
+            all_gather_process_group=old_group,
+        )
+        replicated = SimpleNamespace(
+            shard_world_size=1, mesh_info=object.__new__(DDPMeshInfo), all_gather_process_group=None,
+        )
+        state = _new_state([sharded, replicated])
+
+        state.set_all_gather_process_group(new_group)
+
+        self.assertIs(sharded.all_gather_process_group, new_group)
+        self.assertIs(sharded.mesh_info.shard_process_group, old_group)
+        self.assertIsNone(replicated.all_gather_process_group)
+
+    @patch("hyper_parallel.core.fully_shard.hsdp_state.dist.get_process_group_ranks")
+    def test_set_ag_group_rejects_different_rank_order_atomically(self, mock_ranks):
+        """同成员不同顺序也必须拒绝；例如把[0,4]换成[4,0]会交换分片含义。"""
+        old_group, new_group = object(), object()
+        mock_ranks.side_effect = lambda group: [0, 4] if group is old_group else [4, 0]
+        param = SimpleNamespace(
+            shard_world_size=2, mesh_info=SimpleNamespace(shard_process_group=old_group),
+            all_gather_process_group=old_group,
+        )
+        state = _new_state([param])
+
+        with self.assertRaisesRegex(ValueError, "成员及rank顺序"):
+            state.set_all_gather_process_group(new_group)
+        self.assertIs(param.all_gather_process_group, old_group)
+
+    def test_set_ag_group_rejects_initialized_fused_bucket(self):
+        """缓存bucket形成后禁止换组；例如不能让metadata仍引用旧AG通道。"""
+        state = _new_state([])
+        state.param_group = SimpleNamespace(all_gather_buckets=[object()])
+        with self.assertRaisesRegex(RuntimeError, "bucket 初始化之前"):
+            state.set_all_gather_process_group(object())
+
 
 class TestUnifiedParamTransitionState(unittest.TestCase):
     """Minimal state-machine coverage for unified managed parameters."""

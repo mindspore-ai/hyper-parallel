@@ -75,13 +75,8 @@ fsdp_config:
   comm_fusion: false
 
 plan_overrides:
-  # MegaMoe supports CP and TP+SP with EP>1; PP=1. Pair this replacement with its compute target below.
-  - match: "model.layers.*.mlp.experts"
-    replace:
-      kind: module
-      implementation:
-        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe.DeepseekV41MegaMoeExperts
-        dispatch_mode: push  # Set to pull for GET dispatch.
+  # MoonEP 沿用原专家参数布局；性能基线为 use_grouped_gemm: true 的 all-to-all EP。
+  # 若切换到 MegaMoe，需同时替换 experts 模块和下方 mlp.forward 的计算目标。
   # The registered architecture runs without replacements. When Encoder
   # Parallel is enabled, its runtime requires the ViT attention wrapper.
   - match: "model.vision.blocks.*.attn"
@@ -180,14 +175,17 @@ plan_overrides:
       implementation:
         _target_: >-
           hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn
-  # Native alternative: remove the MegaMoe expert replacement above and select
-  # deepseek_v41_ep_compute_fn with use_grouped_gemm: true.
   - match: "model.layers.*.mlp.forward"
     replace:
       kind: method
       implementation:
         _target_: >-
-          hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_megamoe_compute_fn
+          hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
+        use_moonep: true
+        # 共享权重表：副本容量默认不超过一个rank；反向提前一层恢复EFS与EP权重。
+        moonep_lifecycle: true
+        moonep_replica_capacity: null
+        moonep_prefetch_depth: 1
         # Synthetic performance tests only; normal training keeps learned routing.
         fix_router: false
 
