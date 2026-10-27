@@ -207,18 +207,28 @@ def build_pad_ns_inputs(
         comm_params: List[torch.Tensor],
         param_to_ns_input: Dict[torch.Tensor, torch.Tensor],
         param_shard_metadata: Optional[Dict[torch.Tensor, ParamShardMeta]] = None,
+        *,
+        dtype: Optional[torch.dtype] = None,
 ) -> List[torch.Tensor]:
-    """Build aligned local NS inputs for all communication params."""
+    """Build aligned local NS inputs, including ranks without local gradients.
+
+    An explicit dtype keeps empty ranks in the same collective dtype as ranks
+    that have momentum-derived inputs. Otherwise infer the dtype as before.
+    """
     if not comm_params:
         return []
 
     ref_tensor = next(iter(param_to_ns_input.values()), None)
-    default_dtype = ref_tensor.dtype if ref_tensor is not None else to_local_if_dtensor(comm_params[0].data).dtype
+    default_dtype = dtype
+    if default_dtype is None:
+        default_dtype = ref_tensor.dtype if ref_tensor is not None else to_local_if_dtensor(comm_params[0].data).dtype
     local_inputs: List[torch.Tensor] = []
 
     for param in comm_params:
         ns_input = param_to_ns_input.get(param)
         if ns_input is not None:
+            if ns_input.dtype != default_dtype:
+                raise ValueError("NS inputs must have the same dtype as the collective buffer")
             local_inputs.append(ns_input)
             continue
 
