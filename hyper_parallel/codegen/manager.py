@@ -734,7 +734,11 @@ def _prepare_codegen_build(model: Any, config: Any, spec: Any) -> CodegenBuildIn
     from hyper_parallel.distributed.apply import apply_forward_patches
     from hyper_parallel.distributed._builder.planner import ShardingPlanner
     from hyper_parallel.distributed.mesh import DistributedSetup, MeshContext
-    from hyper_parallel.models._transformers.model_builder import prepare_parallel_model
+    from hyper_parallel.models._transformers.model_builder import (
+        _apply_materialization_adapter,
+        _maybe_apply_module_replacements,
+        get_model_conversion_mapping,
+    )
     from hyper_parallel.trainer.config import entries_to_module_replacements
     # pylint: enable=import-outside-toplevel
 
@@ -758,35 +762,43 @@ def _prepare_codegen_build(model: Any, config: Any, spec: Any) -> CodegenBuildIn
         module_replacements=replacement_specs,
     )
     planner = ShardingPlanner(plan_overrides=setup.plan_overrides)
+    source_model = model
     before_builder = snapshot_modules(model)
-    result = prepare_parallel_model(
+    model, _ = _maybe_apply_module_replacements(
         model,
-        mesh=mesh,
-        sharding_planner=planner,
-        is_meta_device=True,
-        distributed_setup=setup,
-        parallel_plan_mode="plan_only",
+        None,
+        setup,
+        None,
+        False,
+        get_model_conversion_mapping(model),
     )
-    before_phase_c = snapshot_modules(result.model)
-    if result.sharding_plan is not None:
-        expert_mesh = (
-            OfflineMesh(("ep",), (dims.ep_size,))
-            if dims.ep_size > 1
-            else None
-        )
-        apply_forward_patches(
-            result.model,
-            result.sharding_plan,
-            mesh.device_mesh,
-            validate_mode=True,
-            expert_mesh=expert_mesh,
-        )
-    if result.sharding_plan is None:
-        raise RuntimeError("codegen: shared model builder produced no sharding plan")
-    after_phase_c = snapshot_modules(result.model)
+    _apply_materialization_adapter(model)
+    sharding_plan = planner.plan(
+        model,
+        mesh.device_mesh,
+        tp_size=mesh.tp_size,
+        cp_size=mesh.cp_size,
+        ep_size=mesh.ep_size,
+        sequence_parallel=mesh.sequence_parallel,
+        loss_parallel=mesh.loss_parallel,
+    )
+    before_phase_c = snapshot_modules(model)
+    expert_mesh = (
+        OfflineMesh(("ep",), (dims.ep_size,))
+        if dims.ep_size > 1
+        else None
+    )
+    apply_forward_patches(
+        model,
+        sharding_plan,
+        mesh.device_mesh,
+        validate_mode=True,
+        expert_mesh=expert_mesh,
+    )
+    after_phase_c = snapshot_modules(model)
     patch_plan = build_patch_emission_plan(
-        result.model,
-        result.sharding_plan,
+        model,
+        sharding_plan,
         replacement_specs,
         before_builder,
         before_phase_c,
@@ -798,9 +810,9 @@ def _prepare_codegen_build(model: Any, config: Any, spec: Any) -> CodegenBuildIn
         patch_plan.module_replacements,
     )
     return CodegenBuildInput(
-        source_model=model,
-        transformed_model=result.model,
-        sharding_plan=result.sharding_plan,
+        source_model=source_model,
+        transformed_model=model,
+        sharding_plan=sharding_plan,
         patch_plan=patch_plan,
         module_overrides=module_overrides,
     )

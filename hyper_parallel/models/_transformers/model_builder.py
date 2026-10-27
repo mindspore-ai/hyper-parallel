@@ -72,7 +72,7 @@ from hyper_parallel.models.external_state import (
     ExternalLoadContext,
     get_model_external_state,
 )
-from hyper_parallel.models.replacement import _apply_module_replacement_actions, apply_method_replacements
+from hyper_parallel.models.replacement import _apply_module_replacement_actions
 
 logger = logging.getLogger(__name__)
 
@@ -764,14 +764,6 @@ def apply_model_infrastructure(
     if freeze_config is not None:
         _apply_parameter_freezing(model, freeze_config)
 
-    method_context = _build_replacement_context(distributed_setup, low_precision_config)
-    method_context["mesh_context"] = getattr(distributed_setup, "mesh_context", None)
-    apply_method_replacements(
-        model,
-        getattr(distributed_setup, "method_replacements", None) or (),
-        context=method_context,
-    )
-
     # Steps 7-8: plan and apply parameter/activation layouts.
     handled, source_shard_info = _parallelize_from_generated(
         model,
@@ -884,16 +876,6 @@ def _refresh_hsdp_precision_state(model: nn.Module) -> None:
             hsdp_param.init_dtype_attrs(hsdp_state.mp_policy)
 
 
-def _model_fp32_parameter_ids(model: nn.Module) -> set[int]:
-    """Collect parameters declared by modules through local ``fp32_parameter_names``."""
-    return {
-        id(parameter)
-        for module in model.modules()
-        for name, parameter in module.named_parameters(recurse=False, remove_duplicate=False)
-        if name in getattr(module, "fp32_parameter_names", ())
-    }
-
-
 def _validate_model_state_dtype(
         model: nn.Module,
         target_dtype: torch.dtype,
@@ -901,12 +883,10 @@ def _validate_model_state_dtype(
     """Validate floating model parameters and buffers against a resolved dtype."""
     external = get_model_external_state(model)
     external_ids = {id(parameter) for parameter in external.parameters.values()} if external is not None else set()
-    fp32_ids = _model_fp32_parameter_ids(model)
     mismatched = [
         name
         for name, tensor in model.named_parameters(remove_duplicate=False)
-        if id(tensor) not in external_ids and (tensor.is_floating_point() or id(tensor) in fp32_ids)
-        and tensor.dtype != (torch.float32 if id(tensor) in fp32_ids else target_dtype)
+        if id(tensor) not in external_ids and tensor.is_floating_point() and tensor.dtype != target_dtype
     ]
     mismatched.extend(
         name for name, tensor in model.named_buffers(remove_duplicate=False)

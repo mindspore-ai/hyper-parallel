@@ -1057,15 +1057,8 @@ def _prepare_inner_rewrite(target, apply_fn, name):
         _rollback_inner_rewrite(
             target, saved_state, committed_secondaries)
         raise
-    return (
-        orig_forward,
-        new_forward,
-        replaced,
-        saved_state,
-        committed_secondaries,
-        primary,
-        tuple(secondaries),
-    )
+    return (orig_forward, new_forward, replaced, saved_state,
+            committed_secondaries)
 
 
 def _apply_resolved_inner_wrapper(module, resolved, spec, mesh, mesh_dim_names,
@@ -1084,7 +1077,7 @@ def _apply_resolved_inner_wrapper(module, resolved, spec, mesh, mesh_dim_names,
             mesh_dim_names,
         )
     (orig_forward, new_forward, replaced, saved_state,
-     committed_secondaries, primary, secondary_requests) = _prepare_inner_rewrite(
+     committed_secondaries) = _prepare_inner_rewrite(
          target, apply_fn, name)
     try:
         if replaced:
@@ -1105,21 +1098,6 @@ def _apply_resolved_inner_wrapper(module, resolved, spec, mesh, mesh_dim_names,
         _rollback_inner_rewrite(
             target, saved_state, committed_secondaries)
         raise
-    if replaced:
-        target_name = _inner_target_name(module, target)
-        target_fqn = (
-            module_fqn
-            if target_name == "self"
-            else ".".join(part for part in (module_fqn, target_name) if part)
-        )
-        declared_wrapper = getattr(spec, "inner_wrapper", None)
-        wrapper = getattr(declared_wrapper, "_target_", declared_wrapper)
-        if isinstance(wrapper, str):
-            from hyper_parallel.distributed.context_parallel.wrappers import (  # pylint: disable=C0415
-                INNER_WRAPPER_REGISTRY,
-            )
-            wrapper = INNER_WRAPPER_REGISTRY.get(wrapper, wrapper)
-        request = primary or _ForwardRewriteRequest(target, new_forward)
     return name, target
 
 
