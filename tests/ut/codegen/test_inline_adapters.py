@@ -443,6 +443,63 @@ class OuterModel:
         with self.assertRaises(AttributeError):
             binder(bad_model)
 
+    def test_recorded_host_with_digit_leading_module_imports_via_importlib(self):
+        """An identifier-unsafe host module imports through a string literal.
+
+        HF remote-code cache hashes can start with a digit
+        (``transformers_modules.kimi_k3.7dc8....modeling_kimi_linear``); a
+        ``from`` statement over that path is a syntax error, so the host must
+        be bound through ``importlib.import_module`` instead.
+        """
+        class ExternalMoe:
+            def forward(self, hidden_states):
+                return hidden_states
+
+        ExternalMoe.__module__ = (
+            "transformers_modules.kimi_k3.7dc8cececbd11535.modeling_kimi_linear")
+        record = SimpleNamespace(
+            module_fqn="model.language_model.layers.1.mlp",
+            module_type=ExternalMoe,
+            factory=lambda: None,
+            original_forward=ExternalMoe.forward,
+        )
+        meta = SimpleNamespace(
+            _build_patches=SimpleNamespace(local_computes=(record,)),
+            param_plan={
+                record.module_fqn: {
+                    "is_boundary": True,
+                    "in_src": {"hidden_states": {}},
+                    "in_dst": {"hidden_states": {}},
+                    "out_src": {"output": {}},
+                    "out_dst": {"output": {}},
+                }
+            },
+            injections=[{
+                "match": record.module_fqn,
+                "local_compute_fn": {"_target_": "example.compute"},
+            }],
+            mesh_dim_names=[],
+        )
+        source = """
+class OuterModel:
+    def __init__(self, language_model):
+        self.language_model = language_model
+"""
+
+        rendered = materialize_recorded_forwards(source, meta)
+
+        ast.parse(rendered)
+        self.assertNotIn(
+            "from transformers_modules.kimi_k3.7dc8", rendered)
+        self.assertIn("import importlib as _hp_importlib", rendered)
+        self.assertIn(
+            'ExternalMoe = getattr(_hp_importlib.import_module('
+            '"transformers_modules.kimi_k3.7dc8cececbd11535.modeling_kimi_linear"'
+            '), "ExternalMoe")',
+            rendered,
+        )
+        self.assertIn("class HPCodegenExternalMoe(ExternalMoe)", rendered)
+
     def test_hp_bind_compute_delegates_to_recorded_binder_without_type_scan(self):
         """The runtime binds recorded hosts through the generated binder only."""
         from hyper_parallel.codegen import runtime as codegen_runtime
