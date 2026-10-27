@@ -25,7 +25,6 @@ AutoModels objects and never imports trainer config (05 §15.2.6).
 
 import fnmatch
 import logging
-from dataclasses import dataclass
 from typing import Any, Dict, Literal, Optional, Union
 
 import torch
@@ -76,30 +75,6 @@ from hyper_parallel.models.external_state import (
 from hyper_parallel.models.replacement import _apply_module_replacement_actions
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class ParallelModelBuildResult:
-    """Model state after replacement and parallel-plan application.
-
-    This is the reusable boundary between model parallelization and the
-    execution-only build stages (activation features, external state, FSDP,
-    materialization/loading, dtype conversion, and compilation).
-
-    Attributes:
-        model: Model after replacements and sharding-plan application.
-        sharding_plan: Native planner result, or ``None`` when no native plan
-            was built (including generated-model parallelization).
-        source_shard_info: Parameter source-layout metadata produced while
-            applying the parallel plan.
-        weights_mapping: Checkpoint conversion mapping updated by module
-            replacements and consumed by the later loading stage.
-    """
-
-    model: nn.Module
-    sharding_plan: Optional[Any]
-    source_shard_info: Optional[dict]
-    weights_mapping: Any
 
 
 def instantiate_infrastructure(
@@ -295,14 +270,8 @@ def _plan_and_apply_sharding(
     sharding_planner,
     is_hf_model: bool,
     validate_placement: bool,
-    parallel_plan_mode: Literal["full", "plan_only"] = "full",
-) -> tuple[nn.Module, Optional[dict], Optional[Any]]:
+) -> tuple[nn.Module, Optional[dict]]:
     """Plan parameter layouts and apply dual-mode sharding when requested."""
-    if parallel_plan_mode not in ("full", "plan_only"):
-        raise ValueError(
-            "parallel_plan_mode must be 'full' or 'plan_only', got "
-            f"{parallel_plan_mode!r}"
-        )
     model_sharding_requested = (
         mesh is not None
         and any(size > 1 for size in (mesh.tp_size, mesh.cp_size, mesh.ep_size))
@@ -312,10 +281,10 @@ def _plan_and_apply_sharding(
         or mesh is None
         or (is_hf_model and not model_sharding_requested)
     ):
-        return model, None, None
+        return model, None
     if mesh.device_mesh is None:
         logger.warning("MeshContext has no device_mesh; skipping sharding")
-        return model, None, None
+        return model, None
 
     logger.info(
         "Running ShardingPlanner.plan(tp=%d, cp=%d, ep=%d, "
@@ -335,8 +304,6 @@ def _plan_and_apply_sharding(
         sequence_parallel=mesh.sequence_parallel,
         loss_parallel=mesh.loss_parallel,
     )
-    if parallel_plan_mode == "plan_only":
-        return model, None, plan
     model, source_shard_info = apply_sharding_plan(
         model,
         plan,
@@ -344,7 +311,7 @@ def _plan_and_apply_sharding(
         validate_mode=validate_placement,
     )
     logger.info("Sharding plan applied; source_shard_info keys=%d", len(source_shard_info or {}))
-    return model, source_shard_info, plan
+    return model, source_shard_info
 
 
 def _parallelize_from_generated(
@@ -744,98 +711,6 @@ def _apply_fsdp2_with_external(
     return model
 
 
-def prepare_parallel_model(
-    model: nn.Module,
-    mesh: Optional[MeshContext] = None,
-    sharding_planner: Optional[ShardingPlanner] = None,
-    peft_config: Optional[Any] = None,
-    qat_config: Optional[Any] = None,
-    fp8_config: Optional[Any] = None,
-    freeze_config: Optional[Any] = None,
-    is_meta_device: bool = False,
-    is_hf_model: bool = False,
-    load_base_model: bool = False,
-    validate_placement: bool = False,
-    low_precision_config: Optional[Any] = None,
-    codegen_artifact_dir: Optional[str] = None,
-    distributed_setup: Optional[Any] = None,
-    hf_config: Optional[Any] = None,
-    parallel_plan_mode: Literal["full", "plan_only"] = "full",
-) -> ParallelModelBuildResult:
-    """Apply model replacements and the resolved parallel plan.
-
-    This function defines the build boundary shared by the complete AutoModel
-    path and tooling that needs the exact model the trainer would parallelize,
-    without entering execution-only setup such as activation wrappers, FSDP,
-    checkpoint loading, dtype conversion, or compilation.
-
-    Args:
-        model: Constructed native, custom, or generated model.
-        mesh: Resolved mesh context used for parallel planning and application.
-        sharding_planner: Native sharding planner.
-        peft_config: Optional pre-sharding PEFT configuration.
-        qat_config: Optional pre-sharding QAT configuration.
-        fp8_config: Optional pre-sharding FP8 configuration.
-        freeze_config: Optional parameter-freezing configuration.
-        is_meta_device: Whether the model was constructed on the meta device.
-        is_hf_model: Whether the model uses the native Transformers path.
-        load_base_model: Whether a pretrained checkpoint will be loaded later.
-        validate_placement: Whether sharding applies placement validation.
-        low_precision_config: Replacement-time low-precision configuration.
-        codegen_artifact_dir: Generated-model artifact directory, when used.
-        distributed_setup: Normalized distributed setup containing replacement
-            actions and their construction context.
-        hf_config: Model configuration used to verify generated artifacts.
-        parallel_plan_mode: ``"full"`` applies the complete trainer plan;
-            ``"plan_only"`` stops after the shared planner decision so
-            tooling can run selected apply phases explicitly.
-
-    Returns:
-        The parallel-model-ready model and continuation state required by the
-        remaining AutoModel infrastructure stages.
-    """
-    _apply_pre_sharding_features(peft_config, qat_config, fp8_config)
-
-    weights_mapping = get_model_conversion_mapping(model)
-    model, weights_mapping = _maybe_apply_module_replacements(
-        model,
-        codegen_artifact_dir,
-        distributed_setup,
-        low_precision_config,
-        load_base_model,
-        weights_mapping,
-    )
-    if is_meta_device:
-        _apply_materialization_adapter(model)
-
-    if freeze_config is not None:
-        _apply_parameter_freezing(model, freeze_config)
-
-    handled, source_shard_info = _parallelize_from_generated(
-        model,
-        mesh,
-        codegen_artifact_dir,
-        hf_config=hf_config,
-    )
-    sharding_plan = None
-    if not handled:
-        model, source_shard_info, sharding_plan = _plan_and_apply_sharding(
-            model,
-            mesh,
-            sharding_planner,
-            is_hf_model,
-            validate_placement,
-            parallel_plan_mode,
-        )
-
-    return ParallelModelBuildResult(
-        model=model,
-        sharding_plan=sharding_plan,
-        source_shard_info=source_shard_info,
-        weights_mapping=weights_mapping,
-    )
-
-
 def apply_model_infrastructure(
     model: nn.Module,
     mesh: Optional[MeshContext] = None,
@@ -875,26 +750,35 @@ def apply_model_infrastructure(
     compile_config, compile_for_execution = _resolve_compile_config(
         compile_config, validate_placement, fsdp2_manager
     )
-    parallel_result = prepare_parallel_model(
+    _apply_pre_sharding_features(peft_config, qat_config, fp8_config)
+
+    # Step 5.5: structure-preserving replacement before plan derivation.
+    weights_mapping = get_model_conversion_mapping(model)
+    model, weights_mapping = _maybe_apply_module_replacements(
+        model, codegen_artifact_dir, distributed_setup, low_precision_config,
+        load_base_model, weights_mapping,
+    )
+    if is_meta_device:
+        _apply_materialization_adapter(model)
+
+    if freeze_config is not None:
+        _apply_parameter_freezing(model, freeze_config)
+
+    # Steps 7-8: plan and apply parameter/activation layouts.
+    handled, source_shard_info = _parallelize_from_generated(
         model,
-        mesh=mesh,
-        sharding_planner=sharding_planner,
-        peft_config=peft_config,
-        qat_config=qat_config,
-        fp8_config=fp8_config,
-        freeze_config=freeze_config,
-        is_meta_device=is_meta_device,
-        is_hf_model=is_hf_model,
-        load_base_model=load_base_model,
-        validate_placement=validate_placement,
-        low_precision_config=low_precision_config,
-        codegen_artifact_dir=codegen_artifact_dir,
-        distributed_setup=distributed_setup,
+        mesh,
+        codegen_artifact_dir,
         hf_config=kwargs.get("hf_config"),
     )
-    model = parallel_result.model
-    source_shard_info = parallel_result.source_shard_info
-    weights_mapping = parallel_result.weights_mapping
+    if not handled:
+        model, source_shard_info = _plan_and_apply_sharding(
+            model,
+            mesh,
+            sharding_planner,
+            is_hf_model,
+            validate_placement,
+        )
 
     model = _apply_activation_features(
         model,
