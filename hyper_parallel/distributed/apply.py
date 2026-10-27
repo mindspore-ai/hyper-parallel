@@ -153,3 +153,43 @@ def apply_sharding_plan(
         _replicate_tied_weights(part, tied_pairs)
 
     return model, source_shard_info
+
+
+def apply_forward_patches(
+    model: Any,
+    plan: ShardingPlan,
+    mesh: Any,
+    *,
+    validate_mode: bool = False,
+    expert_mesh: Any = None,
+) -> Any:
+    """Apply the trainer's Phase C forward mutations without sharding parameters.
+
+    This is the shared cutoff used by source generation after planning.  It
+    deliberately excludes parameter sharding, special handlers, checkpoint
+    loading, FSDP, and compilation while preserving the exact forward-wrapper
+    logic used by :func:`apply_sharding_plan`.
+
+    Args:
+        model: A model, or a list of pipeline-part models, to mutate.
+        plan: The already-derived sharding plan.
+        mesh: The active device mesh.  An offline mesh is accepted when the
+            caller is recording build mutations instead of executing them.
+        validate_mode: Forwarded unchanged to the trainer Phase C logic.
+        expert_mesh: Optional expert-parallel submesh.
+
+    Returns:
+        The input ``model`` after its planned forward patches are installed.
+    """
+    for spec in plan.modules.values():
+        _normalize_out_fields(spec)
+    models = model if isinstance(model, list) else [model]
+    for part in models:
+        _apply_phase_c(
+            part,
+            plan,
+            mesh,
+            validate_mode,
+            expert_mesh=expert_mesh,
+        )
+    return model

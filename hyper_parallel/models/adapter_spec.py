@@ -92,17 +92,6 @@ class ModelAdapterSpec:
             deterministic derived buffers or state hooks before sharding and
             ``to_empty()``. This supports unmodified native HF model classes.
         context_parallel: provider returning the family's CP wrappers.
-        context_parallel_inline: dotted path of the family's CP forward
-            helper that an inline codegen artifact's CP dispatch shell calls —
-            the same kernel the runtime CP wrapper delegates to, so codegen and
-            trainer never carry two CP implementations. A family declaring it
-            participates in inline CP (the shell is emitted into the
-            artifact), while families without it keep the runtime CP
-            wrapper path.
-        context_parallel_state_attr: instance attribute the family's CP
-            helper reads for its sub-mesh; the inline-state binding sets it on
-            marked classes exactly like the runtime wrapper's companion
-            attrs, so the shared kernel finds the mesh under either path.
         expert_parallel: provider returning the family's EP compute
             factories.
         sharding_rules: provider returning the family's planner naming-rule
@@ -142,8 +131,6 @@ class ModelAdapterSpec:
     materialization: Optional[Callable[..., Any]] = None
     external_state: Optional[Callable[..., Any]] = None
     context_parallel: Optional[Callable[..., Any]] = None
-    context_parallel_inline: Optional[str] = None
-    context_parallel_state_attr: Optional[str] = None
     expert_parallel: Optional[Callable[..., Any]] = None
     sharding_rules: Optional[Callable[..., Any]] = None
     fsdp_wrap_modules: Optional[Callable[..., Any]] = None

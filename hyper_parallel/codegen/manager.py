@@ -23,9 +23,10 @@ and whether it passes preflight before training starts.
 from __future__ import annotations
 
 import hashlib
-from fnmatch import fnmatchcase
 import logging
 import os
+from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from typing import Any, Optional
 
 from hyper_parallel.codegen.artifact import (
@@ -51,6 +52,17 @@ from hyper_parallel.codegen.meta import (
 logger = logging.getLogger(__name__)
 
 CODEGEN_VERSION = "0.1.1"
+
+
+@dataclass(frozen=True)
+class CodegenBuildInput:
+    """Builder-owned model, plan, and patch decisions used by emitters."""
+
+    source_model: Any
+    transformed_model: Any
+    sharding_plan: Any
+    patches: Any
+    module_overrides: tuple[dict[str, Any], ...]
 
 
 def ensure_codegen_artifact(
@@ -656,11 +668,7 @@ def _fill_plan_fields(
     ``param_plan``), so this stage raises and generation fails instead of
     silently continuing.
     """
-    from hyper_parallel.codegen.plan.derive import (
-        build_meta_model,
-        build_plan_overrides,
-        derive_sharding_plan,
-    )
+    from hyper_parallel.codegen.plan.derive import build_meta_model
     from hyper_parallel.codegen.plan.freeze import freeze_plan
     from hyper_parallel.codegen.source.resolver import _trust_remote_code
     from hyper_parallel.codegen.spec.project import project_codegen_spec
@@ -678,21 +686,8 @@ def _fill_plan_fields(
             "model identity to build the meta model from; fix the model "
             "source in the YAML"
         )
-    replace_meta = _apply_generation_replacements(meta, config, model, spec)
-    plan_overrides = build_plan_overrides(config, spec)
-    # S3: a plan override whose matched MoE boundary carries no explicit
-    # ``local_compute_fn`` has its EP compute factory inferred from structure
-    # (never by model name) and written into the spec so it lands in
-    # ``meta.injections``. An explicit ``_target_`` stays the opt-out escape
-    # hatch and is never overwritten.
-    inferred_ep_targets = _fill_inferred_ep_targets(model, plan_overrides)
-    plan = derive_sharding_plan(
-        model,
-        spec,
-        plan_overrides=plan_overrides,
-    )
-    _drop_inferred_ep_injections_on_non_moe(plan, model, inferred_ep_targets)
-    frozen = freeze_plan(plan, model)
+    build_input = _prepare_codegen_build(model, config, spec)
+    frozen = freeze_plan(build_input.sharding_plan, build_input.transformed_model)
     if not frozen.param_plan:
         raise RuntimeError(
             "codegen: plan derivation produced an empty param plan for "
@@ -708,18 +703,148 @@ def _fill_plan_fields(
     meta.boundary_classes = frozen.boundary_classes
     meta.mesh_dim_names = list(frozen.mesh_dim_names) or None
 
-    meta.module_overrides = replace_meta
+    meta.module_overrides = list(build_input.module_overrides)
+    # Ephemeral generation input. ``CodegenMeta`` serializes dataclass fields
+    # only, so resolved callables never leak into codegen_meta.json.
+    meta._build_patches = build_input.patches  # pylint: disable=protected-access
     # The inline pipeline lowers the matched replacements into the generated
     # file, so the artifact owns ``replace_module``.  Declare coverage so the
     # trainer's HF replacement step is skipped on the gen path — but only when
     # something was actually matched.  ``covered`` is always a
     # COVERED_DEFAULTS copy, so the key is present either way.
-    meta.covered["module_overrides"] = bool(replace_meta)
+    meta.covered["module_overrides"] = bool(build_input.module_overrides)
 
     # A non-empty frozen plan is the artifact's full parallel logic; the
     # runtime shards from ``codegen_meta.json``.  ``covered`` is always a
     # COVERED_DEFAULTS copy, so the key is present either way.
     meta.covered["sharding_plan"] = True
+
+
+def _prepare_codegen_build(model: Any, config: Any, spec: Any) -> CodegenBuildInput:
+    """Run the shared pre-runtime builder against an offline topology."""
+    # Lazy imports preserve the manager's import-light CLI boundary.
+    # pylint: disable=import-outside-toplevel
+    from hyper_parallel.codegen.plan.derive import build_plan_overrides
+    from hyper_parallel.codegen.plan.offline_mesh import build_offline_mesh
+    from hyper_parallel.codegen.plan.offline_mesh import OfflineMesh
+    from hyper_parallel.distributed.apply import apply_forward_patches
+    from hyper_parallel.distributed._builder.planner import ShardingPlanner
+    from hyper_parallel.distributed.mesh import DistributedSetup, MeshContext
+    from hyper_parallel.models._transformers.model_builder import prepare_parallel_model
+    from hyper_parallel.models.build_trace import record_model_patches
+    from hyper_parallel.trainer.config import entries_to_module_replacements
+    # pylint: enable=import-outside-toplevel
+
+    dims = spec.parallel_dims
+    mesh = MeshContext(
+        device_mesh=build_offline_mesh(dims),
+        dp_size=dims.dp_size,
+        tp_size=dims.tp_size,
+        cp_size=dims.cp_size,
+        pp_size=dims.pp_size,
+        ep_size=dims.ep_size,
+        sequence_parallel=dims.sequence_parallel,
+        loss_parallel=dims.loss_parallel,
+    )
+    replacement_specs = entries_to_module_replacements(
+        getattr(config, "plan_overrides", None) or []
+    )
+    setup = DistributedSetup(
+        mesh_context=mesh,
+        plan_overrides=build_plan_overrides(config, spec),
+        module_replacements=replacement_specs,
+    )
+    planner = ShardingPlanner(plan_overrides=setup.plan_overrides)
+    with record_model_patches() as recorder:
+        result = prepare_parallel_model(
+            model,
+            mesh=mesh,
+            sharding_planner=planner,
+            is_meta_device=True,
+            distributed_setup=setup,
+            parallel_plan_mode="plan_only",
+        )
+        if result.sharding_plan is not None:
+            expert_mesh = (
+                OfflineMesh(("ep",), (dims.ep_size,))
+                if dims.ep_size > 1
+                else None
+            )
+            apply_forward_patches(
+                result.model,
+                result.sharding_plan,
+                mesh.device_mesh,
+                validate_mode=True,
+                expert_mesh=expert_mesh,
+            )
+    if result.sharding_plan is None:
+        raise RuntimeError("codegen: shared model builder produced no sharding plan")
+    patches = recorder.freeze()
+    module_overrides = _replacement_records_for_meta(
+        config,
+        replacement_specs,
+        patches.module_replacements,
+    )
+    return CodegenBuildInput(
+        source_model=model,
+        transformed_model=result.model,
+        sharding_plan=result.sharding_plan,
+        patches=patches,
+        module_overrides=module_overrides,
+    )
+
+
+def _replacement_records_for_meta(
+    config: Any,
+    specs: Any,
+    records: Any,
+) -> tuple[dict[str, Any], ...]:
+    """Serialize successful builder replacement events for existing emitters."""
+    entries = [
+        entry
+        for entry in (getattr(config, "plan_overrides", None) or [])
+        if getattr(entry, "replace_module", None) is not None
+        and getattr(entry, "when", None) in (None,)
+    ]
+    if len(entries) != len(specs):
+        raise RuntimeError(
+            "codegen: normalized replacement specs cannot be paired with their YAML declarations"
+        )
+    metadata_by_factory = {
+        id(rule.factory): (rule, entry)
+        for rule, entry in zip(specs, entries)
+    }
+    serialized = []
+    for record in records:
+        rule_entry = metadata_by_factory.get(id(record.factory))
+        if rule_entry is None:
+            raise RuntimeError(
+                f"codegen: builder replacement at {record.module_fqn!r} has no YAML declaration"
+            )
+        rule, entry = rule_entry
+        target = entry.replace_module
+        factory_path = _target_path(target)
+        if factory_path is None:
+            raise TypeError(
+                f"codegen: replacement factory for {rule.match!r} has no serializable import path"
+            )
+        item = {
+            "match": list(rule.match),
+            "fqn": record.module_fqn,
+            "fqns": [record.module_fqn],
+            "module_type": f"{record.source_type.__module__}.{record.source_type.__qualname__}",
+            "factory": factory_path,
+            "exact_type": bool(rule.exact_type),
+        }
+        target_config = {
+            name: value
+            for name, value in target.to_dict().items()
+            if name != "_target_"
+        }
+        if target_config:
+            item["target_config"] = target_config
+        serialized.append(item)
+    return tuple(serialized)
 
 
 def _record_inline_declarations(meta: CodegenMeta) -> None:
@@ -742,7 +867,7 @@ def _record_inline_declarations(meta: CodegenMeta) -> None:
 
 
 def _apply_generation_replacements(
-    meta: CodegenMeta,
+    _meta: CodegenMeta,
     config: Any,
     model: Any,
     spec: Any,

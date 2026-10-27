@@ -24,7 +24,11 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from hyper_parallel.codegen.emit.modeling import _apply_inline_modeling
+from hyper_parallel.codegen.emit.modeling import (
+    _apply_inline_modeling,
+    _verify_recorded_patch_materialization,
+)
+from hyper_parallel.codegen.emit.recorded import materialize_recorded_forwards
 from hyper_parallel.codegen.emit.parallel import lower_forward_boundaries
 from hyper_parallel.codegen import manager
 from hyper_parallel.codegen.inline.ir import (
@@ -35,6 +39,7 @@ from hyper_parallel.codegen.inline.framework_spec import interface_component_cla
 from hyper_parallel.codegen.inline.meta_plan import normalize_inline_meta
 from hyper_parallel.codegen.inline.patch_engine import apply_patch_set
 from hyper_parallel.codegen.inline.pipeline import render_inline_modeling
+from hyper_parallel.codegen.inline.recognition import inner_wrapper_target
 from hyper_parallel.codegen.inline.spec_bundle import StrategySpec
 from hyper_parallel.codegen.inline.specs import replacement_spec, strategy_spec
 from hyper_parallel.codegen.inline.strategy_pass import build_strategy_patches
@@ -155,6 +160,117 @@ def _execute_source(source):
 class TestInlineAdapters(unittest.TestCase):
     """Exercise structural resolution, coverage enforcement and model-independent emission."""
 
+    def test_recorded_local_compute_requires_generated_forward(self):
+        """A trainer-installed local compute cannot remain metadata-only."""
+        record = SimpleNamespace(
+            module_fqn="model.layers.0.mlp",
+            module_type=type("ExternalMoe", (), {}),
+        )
+        meta = SimpleNamespace(
+            _build_patches=SimpleNamespace(local_computes=(record,))
+        )
+        with self.assertRaisesRegex(RuntimeError, "model.layers.0.mlp"):
+            _verify_recorded_patch_materialization(SOURCE, meta)
+
+    def test_recorded_local_compute_accepts_explicit_generated_forward(self):
+        """The audit accepts a source forward that calls the bound compute."""
+        record = SimpleNamespace(
+            module_fqn="model.layers.0.mlp",
+            module_type=type("ExternalMoe", (), {}),
+        )
+        meta = SimpleNamespace(
+            _build_patches=SimpleNamespace(local_computes=(record,))
+        )
+        source = """
+class ExternalMoe:
+    def forward(self, hidden_states):
+        return self.__hp_compute__(hidden_states)
+"""
+        _verify_recorded_patch_materialization(source, meta)
+
+    def test_recorded_module_function_materializes_region_forward(self):
+        """An instance-bound source function becomes impl plus EP boundary."""
+        def source_forward(self, hidden_states):
+            return hidden_states
+
+        record = SimpleNamespace(
+            module_fqn="model.layers.0.mlp",
+            module_type=type("ExternalMoe", (), {}),
+            factory=lambda: None,
+            original_forward=source_forward,
+        )
+        record.original_forward.__qualname__ = "source_forward"
+        meta = SimpleNamespace(
+            _build_patches=SimpleNamespace(local_computes=(record,)),
+            param_plan={
+                record.module_fqn: {
+                    "is_boundary": True,
+                    "in_src": {"hidden_states": {}},
+                    "in_dst": {"hidden_states": {}},
+                    "out_src": {"output": {}},
+                    "out_dst": {"output": {}},
+                }
+            },
+            injections=[{
+                "match": record.module_fqn,
+                "local_compute_fn": "example.compute",
+            }],
+            mesh_dim_names=[],
+        )
+        source = """
+from types import MethodType
+
+def source_forward(self, hidden_states):
+    return hidden_states
+
+class Model:
+    def __init__(self, layer):
+        self.layer = layer
+        self.layer.forward = MethodType(source_forward, self.layer)
+"""
+        rendered = materialize_recorded_forwards(source, meta)
+        ast.parse(rendered)
+        self.assertIn("def source_forward_hp_impl", rendered)
+        self.assertIn("self.__hp_compute__", rendered)
+        self.assertIn("self.layer._forward_impl = MethodType", rendered)
+
+    def test_recorded_patch_audit_covers_replacement_and_inner_wrapper(self):
+        """The audit manifest includes every builder-recorded patch kind."""
+        host_type = type("Host", (), {})
+        replacement_type = type("Replacement", (), {})
+        patches = SimpleNamespace(
+            local_computes=(),
+            module_replacements=(SimpleNamespace(
+                module_fqn="model.proj",
+                replacement_type=replacement_type,
+            ),),
+            inner_wrappers=(SimpleNamespace(
+                module_fqn="model.attn",
+                target_fqn="self",
+                request=SimpleNamespace(target=host_type()),
+            ),),
+        )
+        meta = SimpleNamespace(_build_patches=patches, materialized_patches=[])
+        source = """
+class Host:
+    def forward(self, value):
+        return value
+
+class HostCP(Host):
+    def forward(self, value):
+        return super().forward(value)
+
+class Replacement:
+    pass
+
+replacement = Replacement()
+"""
+        _verify_recorded_patch_materialization(source, meta)
+        self.assertEqual(
+            {entry["kind"] for entry in meta.materialized_patches},
+            {"module_replacement", "inner_wrapper"},
+        )
+
     def setUp(self):
         """Warm the lazy family-provider discovery before any test runs.
 
@@ -220,13 +336,17 @@ class TestInlineAdapters(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
               card_mark="onecard", essential_mark="unessential")
+    def test_cp_wrapper_with_only_closure_forward_is_not_inlined(self):
+        """A closure-only CP forward must not become an invalid import."""
+        self.assertIsNone(inner_wrapper_target(CP))
+
     def test_deepseek_v32_cp_inline_resolves_subclass_shell_and_imports(self):
         """DeepSeek-V3.2 CP inner wrapper resolves to an inline subclass shell.
 
         Feature: structure-driven inline source generation.
-        Description: A family declaring ``context_parallel_inline`` gets a CP
-            dispatch subclass materialized into the generated artifact, plus
-            the helper import needed to call it.
+        Description: A recognizable CP wrapper factory gets a dispatch
+            subclass materialized into the generated artifact without an
+            adapter-side codegen registration, plus the helper import.
         Expectation: the resolved strategy spec carries a subclass shell (no
             target class, no forward-replacing body) and the helper import.
         """
@@ -539,11 +659,17 @@ class Model:
         self.attn = Qwen3MoeAttention()
 """
         meta = _meta(
-            injections=[{"match": "blocks.0.mlp", "local_compute_fn": EP}, {"inner_wrapper": CP}],
+            injections=[
+                {"match": "blocks.0.mlp", "local_compute_fn": EP},
+                {"match": "blocks.0.attn", "inner_wrapper": CP},
+            ],
             module_type="transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention",
             fqns=("blocks.0.attn",),
         )
-        meta.boundary_classes = {"blocks.0.mlp": "Qwen3MoeSparseMoeBlock"}
+        meta.boundary_classes = {
+            "blocks.0.attn": "Qwen3MoeAttention",
+            "blocks.0.mlp": "Qwen3MoeSparseMoeBlock",
+        }
         expected_meta = deepcopy(meta)
         inferred = render_inline_modeling(source, meta)
         explicit = render_inline_modeling(source, expected_meta, "qwen3_moe")

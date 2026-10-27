@@ -58,6 +58,51 @@ class OfflineMesh:
                 f"{self.mesh_shape!r} must have the same length"
             )
 
+    def __getitem__(self, dim_names: str | tuple[str, ...]) -> "OfflineMesh":
+        """Return a topology-only submesh without creating process groups."""
+        names = (dim_names,) if isinstance(dim_names, str) else tuple(dim_names)
+        unknown = [name for name in names if name not in self.mesh_dim_names]
+        if unknown:
+            raise KeyError(f"offline mesh has no dimensions {unknown!r}")
+        sizes = tuple(
+            self.mesh_shape[self.mesh_dim_names.index(name)] for name in names
+        )
+        return OfflineMesh(names, sizes)
+
+    @property
+    def ndim(self) -> int:
+        """Number of topology dimensions."""
+        return len(self.mesh_shape)
+
+    def size(self, mesh_dim: int | str | None = None) -> int:
+        """Return total size or one named/indexed dimension size."""
+        if mesh_dim is None:
+            size = 1
+            for value in self.mesh_shape:
+                size *= value
+            return size
+        index = (
+            self.mesh_dim_names.index(mesh_dim)
+            if isinstance(mesh_dim, str)
+            else mesh_dim
+        )
+        return self.mesh_shape[index]
+
+    def get_local_rank(self, mesh_dim: int | str | None = None) -> int:
+        """Return the deterministic rank used only while resolving patches."""
+        del mesh_dim
+        return 0
+
+    def get_group(self, mesh_dim: int | str | None = None) -> None:
+        """Return no process group while factories record their group wiring.
+
+        Phase C factories may capture a mesh group in the installed forward,
+        but source generation never executes that forward.  The real trainer
+        rebuilds the same factory with a real ``DeviceMesh`` before execution.
+        """
+        del mesh_dim
+        return None
+
 
 def build_offline_mesh(parallel_dims: ParallelDimsSpec) -> OfflineMesh:
     """Build the static mesh for the projected parallel dims.
