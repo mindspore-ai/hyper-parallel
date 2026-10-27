@@ -78,6 +78,18 @@ class _FakeMoeBlock:
 class TestQwen35MoeAdapterContracts(unittest.TestCase):
     """Pin the outer and text configuration registration aliases."""
 
+    def test_vlm_fsdp_order_follows_embedding_vision_decoder_execution(self) -> None:
+        """Cross-branch prefetch follows execution even though vision registers before text."""
+        spec = get_model_adapter("Qwen3_5MoeForConditionalGeneration")
+        visual = ("model.visual.blocks.0", "model.visual.merger.linear_fc2")
+        embedding = "model.language_model.embed_tokens"
+        decoder = ("model.language_model.layers.0", "model.language_model.layers.0.mlp.experts")
+        self.assertEqual(
+            spec.fsdp_execution_order(None, visual + (embedding,) + decoder),
+            (embedding,) + visual + decoder,
+        )
+        self.assertEqual(spec.fsdp_execution_order(None, visual + decoder), visual + decoder)
+
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_registration_resolves_outer_and_text_identities(self):

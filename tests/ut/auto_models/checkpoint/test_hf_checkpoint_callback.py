@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from hyper_parallel.components.checkpoint.config import CheckpointingConfig
+from hyper_parallel.data.text.build_tokenizer import AutoTokenizer
 from hyper_parallel.trainer.callbacks.checkpoint_callback import CheckpointerCallback
 from hyper_parallel.trainer.state import TrainerState
 
@@ -119,6 +120,30 @@ class TestHuggingFaceCheckpointCallback(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not yet support PEFT"):
             CheckpointerCallback(trainer)
         build_checkpointer.assert_not_called()
+
+    @patch("hyper_parallel.trainer.callbacks.checkpoint_callback.CheckpointManager")
+    @patch("hyper_parallel.trainer.callbacks.checkpoint_callback.build_checkpointer")
+    def test_pretokenized_dataset_exports_weights_without_tokenizer_assets(
+            self, build_checkpointer: MagicMock, checkpoint_manager: MagicMock
+    ) -> None:
+        """Offline token IDs need no tokenizer files, but must still allow HF weight export."""
+        checkpoint_manager.return_value.save_pretrained.return_value = True
+        with tempfile.TemporaryDirectory() as checkpoint_dir:
+            config = CheckpointingConfig(
+                save_ckpt=False, save_hf_weights=True, checkpoint_dir=checkpoint_dir,
+            )
+            trainer = self._build_trainer(config)
+            trainer.tokenizer = AutoTokenizer.from_pretrained(
+                "offline", tokenizer_type="pretokenized", vocab_size=64, eod_token_id=2,
+            )
+            callback = CheckpointerCallback(trainer)
+            state = TrainerState(global_step=2)
+            callback.on_train_end(state)
+            callback.on_train_end(state)
+            checkpoint_manager.return_value.save_pretrained.assert_called_once_with(
+                os.path.join(checkpoint_dir, "global_step_2", "hf_ckpt")
+            )
+            build_checkpointer.return_value.save.assert_not_called()
 
 
 if __name__ == "__main__":

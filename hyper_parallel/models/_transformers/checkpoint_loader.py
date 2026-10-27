@@ -36,7 +36,6 @@ from typing import Any, Optional
 import torch
 from torch import nn
 from torch.distributed import is_available, is_initialized
-from transformers import PreTrainedModel
 from hyper_parallel.core.distributed_checkpoint import (
     FileSystemReader,
     TensorStorageMetadata,
@@ -163,6 +162,9 @@ class CheckpointManager:
 
     def _hf_export_model(self) -> nn.Module:
         """Create a metadata-only HF view without modifying the live training model."""
+        # Callback imports must not initialize the optional Transformers model runtime.
+        from transformers import PreTrainedModel  # pylint: disable=C0415
+
         if not isinstance(self.model, PreTrainedModel):
             return self.model
         export_model = copy(self.model)

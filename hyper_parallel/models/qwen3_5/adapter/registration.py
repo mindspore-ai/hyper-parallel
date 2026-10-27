@@ -15,6 +15,7 @@
 """Architecture identity and GDN sharding rules for Qwen3.5."""
 
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
+from hyper_parallel.models.qwen3_5.adapter.materialization import register_rotary_materialization
 from hyper_parallel.models.qwen3_5.adapter.policies.sharding import (
     build_parameter_sharding_rules,
 )
@@ -36,6 +37,7 @@ def _load_loss():
 
 
 QWEN3_5_ADAPTER_SPEC = ModelAdapterSpec(
+    materialization=register_rotary_materialization,
     architecture="Qwen3_5ForConditionalGeneration",
     model_type="qwen3_5",
     context_parallel=_load_context_parallel,
@@ -43,6 +45,7 @@ QWEN3_5_ADAPTER_SPEC = ModelAdapterSpec(
 )
 
 QWEN3_5_TEXT_ADAPTER_SPEC = ModelAdapterSpec(
+    materialization=register_rotary_materialization,
     architecture="Qwen3_5ForCausalLM",
     model_type="qwen3_5_text",
     loss=_load_loss,

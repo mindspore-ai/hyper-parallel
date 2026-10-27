@@ -15,6 +15,8 @@
 """Architecture and sharding contracts for Qwen3.5-MoE and Qwen3.6."""
 
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
+from hyper_parallel.models.qwen3_5.adapter.materialization import register_rotary_materialization
+from hyper_parallel.models.qwen3_5_moe.adapter.policies.sharding import get_fsdp_execution_order
 from hyper_parallel.models.registry import register_model_adapter
 
 
@@ -54,14 +56,17 @@ def _load_encoder_parallel():
 
 
 QWEN3_5_MOE_ADAPTER_SPEC = ModelAdapterSpec(
+    materialization=register_rotary_materialization,
     architecture="Qwen3_5MoeForConditionalGeneration",
     model_type="qwen3_5_moe",
     loss=_load_vlm_loss,
     encoder_parallel=_load_encoder_parallel,
     sharding_rules=_load_sharding_rules,
+    fsdp_execution_order=get_fsdp_execution_order,
 )
 
 QWEN3_5_MOE_TEXT_ADAPTER_SPEC = ModelAdapterSpec(
+    materialization=register_rotary_materialization,
     architecture="Qwen3_5MoeForCausalLM",
     model_type="qwen3_5_moe_text",
     loss=_load_loss,

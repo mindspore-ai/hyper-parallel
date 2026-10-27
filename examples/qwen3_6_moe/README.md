@@ -35,6 +35,16 @@ python3 -m pip install \
   triton-ascend==3.2.1
 ```
 
+图文配置还需要 Torchvision，`AutoProcessor` 初始化其视频处理器时也会检查该依赖，
+即使训练样本只有图片。对上述 PyTorch 2.9.0 环境安装对应的 CPU wheel：
+
+```bash
+python3 -m pip install --no-deps torchvision==0.24.0 \
+  --index-url=https://download.pytorch.org/whl/cpu
+```
+
+版本对应关系见 [PyTorch 官方安装说明](https://pytorch.org/get-started/previous-versions/#v290)。
+
 ## 2. 模型与数据
 
 准备 Hugging Face 格式的 `Qwen/Qwen3.6-35B-A3B` 权重，以及 conversation JSONL 数据。每行至少包含
@@ -130,5 +140,9 @@ bash examples/qwen3_6_moe/launch_1node_8dies.sh \
 ```bash
 python -m pip install -e .
 python -m pip install pyarrow Pillow
-bash examples/qwen3_6_moe/launch_vlm_1node_8dies.sh
+export MODEL_DIR=/path/to/Qwen3.6-35B-A3B
+bash examples/qwen3_6_moe/launch_vlm_1node_8dies.sh \
+  --model.pretrained_model_name_or_path="$MODEL_DIR" \
+  --dataset.model_assets.pretrained_model_name_or_path="$MODEL_DIR" \
+  --dataset.data_path=/path/to/messages.jsonl
 ```

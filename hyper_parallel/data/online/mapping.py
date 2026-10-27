@@ -406,6 +406,14 @@ class _OnlineMappingSourceBuilder(_OnlineSourceBuilder):
             source_result = self._build_leaf_source(source_loader, sample_filter)
             source_results.append(source_result)
 
+        # Ordinary sources retain their full order; the batch sampler owns
+        # epoch shuffling so changing the training horizon preserves its prefix.
+        if len(source_results) == 1 and not self.data_config.get("sources"):
+            source = source_results[0]
+            if isinstance(source, tuple):
+                return tuple(split if split is not None and len(split) else None for split in source)
+            return source if len(source) else None
+
         # Example: source A returns Dataset, while source B returns (train, valid, test).
         # The combined result follows B's split structure, and A contributes only to train.
         has_split_result = False

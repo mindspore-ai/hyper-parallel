@@ -586,7 +586,14 @@ class CheckpointerCallback(Callback):
 
         tokenizer = getattr(self.trainer, "tokenizer", None)
         if tokenizer is not None:
-            tokenizer.save_pretrained(hf_dir)
+            save_tokenizer = getattr(tokenizer, "save_pretrained", None)
+            if callable(save_tokenizer):
+                save_tokenizer(hf_dir)
+            else:
+                logger.warning(
+                    "Tokenizer %s has no exportable assets; HF weights were saved without tokenizer files.",
+                    type(tokenizer).__name__,
+                )
 
     # ------------------------------------------------------------------
     # Load / restore
