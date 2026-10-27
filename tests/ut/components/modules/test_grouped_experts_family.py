@@ -24,7 +24,6 @@ from hyper_parallel.components.modules.grouped_experts import GroupedExperts
 from hyper_parallel.components.modules.mxfp8_grouped_swiglu import MXFP8GroupedSwiGLU, FusedMXFP8GroupedSwiGLU
 from hyper_parallel.trainer.config.resolver import ConfigResolutionError
 from tests.common.grouped_experts_family import TinyMoE, family_config, replace_experts
-from tests.common.mark_utils import arg_mark
 
 
 class TestGroupedExpertsFamily(unittest.TestCase):
@@ -37,7 +36,6 @@ class TestGroupedExpertsFamily(unittest.TestCase):
             device_check.start()
             self.addCleanup(device_check.stop)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_selection_and_layout(self) -> None:
         """
         Feature: GroupedExperts Family.
@@ -59,7 +57,6 @@ class TestGroupedExpertsFamily(unittest.TestCase):
                 torch.testing.assert_close(expert.gate_up_proj, source.mlp.experts.gate_up_proj.transpose(-2, -1))
                 torch.testing.assert_close(expert.down_proj, source.mlp.experts.down_proj.transpose(-2, -1))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_invalid_selectors(self) -> None:
         """
         Feature: GroupedExperts Family.
@@ -71,18 +68,21 @@ class TestGroupedExpertsFamily(unittest.TestCase):
             with self.subTest(selectors=selectors), self.assertRaises(ConfigResolutionError):
                 family_config(**selectors)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_unsupported_parallelism(self) -> None:
         """
         Feature: GroupedExperts Family scope.
         Description: Parallel compute is not silently enabled by local low-precision selection.
         Expectation: Unsupported contexts fail with the module FQN during replacement.
         """
-        for context in ({"ep": True}, {"ep_size": 2}, {"tp": True}, {"cp": True}, {"pp": True}):
-            with self.subTest(context=context), self.assertRaisesRegex(NotImplementedError, "mlp.experts"):
-                replace_experts(TinyMoE(), family_config(use_mxfp8=True), context=context)
+        for fused in (False, True):
+            for axis in ("tp", "cp", "pp"):
+                for ep in (False, True):
+                    context = {axis: True, "ep": ep}
+                    with self.subTest(fused=fused, context=context):
+                        with self.assertRaisesRegex(NotImplementedError, "mlp.experts"):
+                            replace_experts(TinyMoE(), family_config(
+                                use_mxfp8=True, use_fused_mxfp8=fused), context=context)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_meta_and_canonical_weights(self) -> None:
         """
         Feature: GroupedExperts initialization.
