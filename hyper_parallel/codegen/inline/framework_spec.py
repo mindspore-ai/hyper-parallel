@@ -31,8 +31,8 @@ providers* plus the frozen plan, never from a family-name dispatch table:
   sub-patterns / EP body keys;
 * a CP ``inner_wrapper`` target under the ``models/<family>/adapter``
   convention resolves to the framework CP attention strategy — imports
-  only unless the family declares ``context_parallel_inline``, which
-  additionally materializes an in-artifact CP dispatch subclass;
+  and a recognizable inner forward rewrite additionally materializes an
+  in-artifact CP dispatch subclass;
 
 The source class name an artifact must model (``Qwen3MoeRMSNorm``) is not
 duplicated here either: it is read from the rule's own ``module_type``, which
@@ -61,6 +61,7 @@ from hyper_parallel.codegen.inline.recognition import (
     archetype_for_factory,
     class_name_of,
     family_from_target,
+    inner_wrapper_target,
     replacement_target,
 )
 from hyper_parallel.codegen.inline.spec_bundle import ReplacementSpec, StrategySpec
@@ -415,21 +416,21 @@ def _resolve_strategy_spec(
     if archetype is not None:
         return _ep_strategy_spec(archetype)
     if inner_wrapper and adapter_path_parts(target):
-        return _cp_strategy_spec(model_type)
+        return _cp_strategy_spec(target)
     return None
 
 
-def _cp_strategy_spec(model_type: str | None) -> StrategySpec:
+def _cp_strategy_spec(target: str) -> StrategySpec:
     """Build the CP strategy spec: an inline subclass shell plus its imports.
 
-    A family that declares ``context_parallel_inline`` on its adapter spec
-    participates in inline CP: the materialization pass derives an
+    A recognizable inner forward rewrite participates in inline CP: the
+    materialization pass derives an
     in-artifact subclass of the attention host whose forward falls back to
     the parent when CP is disabled and delegates to the family helper when
     active. The helper is the same kernel the runtime CP wrapper delegates
     to (trainer and codegen share one CP implementation), and the import is
-    derived from the adapter declaration (the declaration's final segment
-    names the helper), so this module never hardcodes a family helper and
+    derived from the wrapper factory source, so this module never hardcodes a
+    family helper and
     stays free of torch imports at resolution time.  ``subclass_state_attr``
     carries the family kernel's companion attribute so the runtime binding
     satisfies the identical contract the native wrapper installs.
@@ -437,23 +438,18 @@ def _cp_strategy_spec(model_type: str | None) -> StrategySpec:
     Families without an inline helper keep the original framework CP
     strategy (imports only), preserving the runtime wrapper path.
     """
-    if not model_type:
+    resolved = inner_wrapper_target(target)
+    if resolved is None:
         return StrategySpec(kind=CP_ATTENTION_KIND, imports=())
-    from hyper_parallel.models.registry import get_model_adapter  # pylint: disable=C0415
-
-    adapter = get_model_adapter(model_type)
-    if adapter is None or not adapter.context_parallel_inline:
-        return StrategySpec(kind=CP_ATTENTION_KIND, imports=())
-    helper_module, _, helper_name = adapter.context_parallel_inline.rpartition(".")
     from hyper_parallel.codegen.inline.templates import (  # pylint: disable=C0415
         cp_dispatch_shell_body,
     )
 
     return StrategySpec(
         kind=CP_ATTENTION_KIND,
-        subclass_shell=cp_dispatch_shell_body(helper_name),
-        subclass_state_attr=adapter.context_parallel_state_attr,
-        imports=(ImportPatch(helper_module, (helper_name,)),),
+        subclass_shell=cp_dispatch_shell_body(resolved.helper_name),
+        subclass_state_attr=resolved.state_attr,
+        imports=(ImportPatch(resolved.helper_module, (resolved.helper_name,)),),
     )
 
 

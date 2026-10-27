@@ -51,6 +51,13 @@ plan_overrides:
     replace_module:
       _target_: >-
         hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_grouped_experts
+  - match: "*.mlp"
+    module_type: transformers.models.deepseek_v32.modeling_deepseek_v32.DeepseekV32MoE
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn
+      use_grouped_gemm: true
   - match: "*.self_attn"
     when: cp
     region_dispatch: false

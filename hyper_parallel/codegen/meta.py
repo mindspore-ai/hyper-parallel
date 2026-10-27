@@ -60,6 +60,9 @@ class CodegenMeta:
     #: is what lets the trainer skip its own HF replacement step
     #: (``covered["module_overrides"]``).
     module_overrides: list[dict[str, Any]] = field(default_factory=list)
+    #: Audit-only source materializations produced from the builder recorder.
+    #: This never participates in runtime strategy selection.
+    materialized_patches: list[dict[str, str]] = field(default_factory=list)
     #: Entry model class name (the architecture name, e.g. ``AnthropicV3ForCausalLM``).
     #: The inline pipeline resolves the model's adapter from it.
     model_class: Optional[str] = None

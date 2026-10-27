@@ -30,6 +30,7 @@ remains importable in the training environment.
 """
 from __future__ import annotations
 
+import ast
 import io
 import os
 import tokenize
@@ -265,8 +266,142 @@ def emit_modeling_file(meta: Any) -> str:
     )
     text = rewrite_relative_imports(text, module_name)
     text = _apply_inline_modeling(text, meta)
+    from hyper_parallel.codegen.emit.recorded import materialize_recorded_forwards
+
+    text = materialize_recorded_forwards(text, meta)
     text = _lower_forward_boundaries(text, meta, module_name)
+    _verify_recorded_patch_materialization(text, meta)
     return _banner(meta) + text
+
+
+def _verify_recorded_patch_materialization(text: str, meta: Any) -> None:
+    """Require every trainer-installed source-visible patch to be materialized."""
+    patches = getattr(meta, "_build_patches", None)
+    local_records = (
+        getattr(patches, "local_computes", ()) if patches is not None else ()
+    )
+    replacement_records = (
+        getattr(patches, "module_replacements", ()) if patches is not None else ()
+    )
+    wrapper_records = (
+        getattr(patches, "inner_wrappers", ()) if patches is not None else ()
+    )
+    if not local_records and not replacement_records and not wrapper_records:
+        return
+    tree = ast.parse(text)
+    classes = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+    }
+    missing: list[str] = []
+    materialized = getattr(meta, "materialized_patches", None)
+    if isinstance(materialized, list):
+        materialized.clear()
+    for record in local_records:
+        class_name = record.module_type.__name__
+        generated_class_name = f"HPCodegen{class_name}"
+        class_node = classes.get(generated_class_name) or classes.get(class_name)
+        forward = (
+            next(
+                (
+                    node
+                    for node in class_node.body
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == "forward"
+                ),
+                None,
+            )
+            if class_node is not None
+            else None
+        )
+        recorded_original = getattr(record, "original_forward", None)
+        original = getattr(recorded_original, "__func__", recorded_original)
+        source_name = getattr(original, "__qualname__", "")
+        if "." not in source_name:
+            forward = next(
+                (
+                    node for node in tree.body
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == source_name
+                ),
+                forward,
+            )
+        required_attr = (
+            "__hp_compute__" if getattr(record, "factory", True) is not None
+            else "_forward_impl"
+        )
+        is_materialized = forward is not None and any(
+            isinstance(node, ast.Attribute) and node.attr == required_attr
+            for node in ast.walk(forward)
+        )
+        if not is_materialized:
+            missing.append(f"{record.module_fqn} ({class_name})")
+        elif isinstance(materialized, list):
+            materialized.append({
+                "fqn": record.module_fqn,
+                "host_class": class_node.name if class_node is not None else class_name,
+                "kind": "local_compute",
+                "source_form": (
+                    "module_forward" if "." not in source_name else "subclass_forward"
+                ),
+            })
+    bound_names = {
+        node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
+    } | set(classes)
+    for record in replacement_records:
+        replacement_name = record.replacement_type.__name__
+        if replacement_name not in bound_names:
+            missing.append(
+                f"{record.module_fqn} (replacement {replacement_name})"
+            )
+        elif isinstance(materialized, list):
+            materialized.append({
+                "fqn": record.module_fqn,
+                "host_class": replacement_name,
+                "kind": "module_replacement",
+                "source_form": "constructor",
+            })
+    for record in wrapper_records:
+        host_name = type(record.request.target).__name__
+        target_fqn = (
+            record.module_fqn
+            if record.target_fqn == "self"
+            else f"{record.module_fqn}.{record.target_fqn}"
+        )
+        subclass = next(
+            (
+                node
+                for node in classes.values()
+                if any(
+                    isinstance(base, ast.Name) and base.id == host_name
+                    for base in node.bases
+                )
+                and any(
+                    isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and child.name == "forward"
+                    for child in node.body
+                )
+            ),
+            None,
+        )
+        if subclass is None:
+            missing.append(
+                f"{target_fqn} "
+                f"(inner wrapper for {host_name})"
+            )
+        elif isinstance(materialized, list):
+            materialized.append({
+                "fqn": target_fqn,
+                "host_class": host_name,
+                "kind": "inner_wrapper",
+                "source_form": "subclass_forward",
+            })
+    if missing:
+        raise RuntimeError(
+            "codegen: trainer-installed source-visible patches were not "
+            "materialized in the generated model source: " + ", ".join(missing)
+        )
 
 
 def _apply_inline_modeling(text: str, meta: Any) -> str:

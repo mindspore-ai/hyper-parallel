@@ -24,13 +24,14 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Callable, Iterable
 
-from torch import nn
+from torch import nn  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.checkpoint.weight_conversion import (
     WeightConverter,
     WeightRenaming,
     get_model_conversion_mapping,
 )
+from hyper_parallel.models.build_trace import record_module_replacement
 
 
 ModuleReplacementFactory = Callable[..., nn.Module]
@@ -448,6 +449,18 @@ def _install_replacement_target(
     for fqn in target.module_fqns:
         parent, name = _parent_and_name(model, fqn)
         parent._modules[name] = replacement  # pylint: disable=protected-access
+    factory_kwargs = {
+        "module_fqn": target.module_fqns[0],
+        "context": context,
+    }
+    for fqn in target.module_fqns:
+        record_module_replacement(
+            module_fqn=fqn,
+            source=source,
+            replacement=replacement,
+            factory=target.spec.factory,
+            factory_kwargs=factory_kwargs,
+        )
 
 
 def apply_module_replacements(

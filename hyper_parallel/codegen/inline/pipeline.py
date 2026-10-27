@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import replace
 import importlib
 from typing import Any
 
@@ -49,10 +50,19 @@ def render_inline_modeling(source_text: str, meta: Any, model_type: str | None =
     rules = collect_inline_rules(meta)
     if not rules:
         return source_text
-    _require_inline_coverage(rules, model_type)
+    patches = getattr(meta, "_build_patches", None)
+    recorded_local_compute = bool(
+        getattr(patches, "local_computes", ()) if patches is not None else ()
+    )
+    strategy_rules = (
+        tuple(replace(rule, local_compute_target=None) for rule in rules)
+        if recorded_local_compute
+        else rules
+    )
+    _require_inline_coverage(strategy_rules, model_type)
     replacement_patches = build_replacement_patches(rules, model_type)
     strategy_patches = build_strategy_patches(
-        rules,
+        strategy_rules,
         model_type,
         getattr(meta, "boundary_classes", None),
         getattr(meta, "external_state_classes", None),
@@ -70,7 +80,7 @@ def render_inline_modeling(source_text: str, meta: Any, model_type: str | None =
     rendered = drop_shadowed_definitions(
         rendered, _library_import_names(rendered) & _decorated_names(source_text)
     )
-    normalize_inline_meta(meta, rules, model_type)
+    normalize_inline_meta(meta, strategy_rules, model_type)
     return rendered
 
 
