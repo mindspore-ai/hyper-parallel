@@ -291,9 +291,11 @@ def _materialize_imported_host(
         raise RuntimeError(
             f"codegen: recorded host {host_name!r} has no importable module"
         )
-    rendered = _ensure_import(
-        source_text, f"from {host_module} import {host_name}", host_name
-    )
+    rendered = source_text
+    for import_line in _host_import_lines(host_module, host_name):
+        if import_line in rendered:
+            continue
+        rendered = _ensure_import(rendered, import_line, host_name)
     signature = inspect.signature(_unbound(record.original_forward))
     info = _signature_info(signature)
     call = _render_super_call(signature)
@@ -369,6 +371,23 @@ def _fqn_sort_key(fqn: str) -> tuple[tuple[int, int, str], ...]:
     return tuple(
         (0, int(segment), "") if segment.isdigit() else (1, 0, segment)
         for segment in fqn.split(".")
+    )
+
+
+def _host_import_lines(host_module: str, host_name: str) -> tuple[str, ...]:
+    """Import lines binding ``host_name`` from the recorded ``host_module``.
+
+    HF remote-code cache paths can contain hash components that start with a
+    digit (``transformers_modules.kimi_k3.7dc8....modeling_kimi_linear``); a
+    ``from`` statement over such a path is a syntax error, so identifier-unsafe
+    modules import through ``importlib.import_module`` with the path as a
+    string literal instead.
+    """
+    if all(part.isidentifier() for part in host_module.split(".")):
+        return (f"from {host_module} import {host_name}",)
+    return (
+        "import importlib as _hp_importlib",
+        f'{host_name} = getattr(_hp_importlib.import_module("{host_module}"), "{host_name}")',
     )
 
 
