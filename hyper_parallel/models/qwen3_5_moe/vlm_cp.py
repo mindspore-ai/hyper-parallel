@@ -186,8 +186,8 @@ class QwenVLMParallelBatch(OmniParallelBatch, RuntimeInputAdapter):
         Args:
             model: Qwen multimodal conditional-generation model.
         """
-        if model.config.model_type != "qwen3_5_moe":
-            raise ValueError("QwenVLMParallelBatch requires the conditional-generation Qwen MoE model")
+        if model.config.model_type not in ("qwen3_5", "qwen3_5_moe"):
+            raise ValueError("QwenVLMParallelBatch requires the conditional-generation Qwen Dense or MoE model")
         self.model, self.bridge = model, QwenVisionBridge(model)
         if self.parallel_context.cp_world_size > 1:
             install_qwen_vlm_cp_forward(model)

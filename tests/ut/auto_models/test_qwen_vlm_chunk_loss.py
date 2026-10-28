@@ -21,25 +21,31 @@ from unittest.mock import Mock
 
 import torch
 from torch.nn import functional
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeForConditionalGeneration
 
 from hyper_parallel.components.losses import ChunkedCausalLMLoss
 from hyper_parallel.data.batching.runtime_input import RuntimeInputAdapter
+from hyper_parallel.models.qwen3_5.adapter.registration import QWEN3_5_ADAPTER_SPEC
 from hyper_parallel.models.qwen3_5_moe.adapter.vlm_chunk_loss import bind_chunk_loss
 from hyper_parallel.models.qwen3_5_moe.vlm_cp import QwenVLMParallelBatch, install_qwen_vlm_cp_forward
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from tests.common.mark_utils import arg_mark
 
 
-def make_model() -> Qwen3_5MoeForConditionalGeneration:
+def make_model(dense: bool = False) -> torch.nn.Module:
     """Build a tiny real multimodal decoder with both GDN and full attention."""
-    config = Qwen3_5MoeConfig(
+    config_class = Qwen3_5Config if dense else Qwen3_5MoeConfig
+    model_class = Qwen3_5ForConditionalGeneration if dense else Qwen3_5MoeForConditionalGeneration
+    config = config_class(
         image_token_id=99, video_token_id=98, vision_start_token_id=97,
         text_config={"vocab_size": 128, "hidden_size": 32, "num_hidden_layers": 2,
                      "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
                      "num_experts": 4, "num_experts_per_tok": 2, "moe_intermediate_size": 16,
-                     "shared_expert_intermediate_size": 16, "layer_types": ["linear_attention", "full_attention"],
+                     "intermediate_size": 64, "shared_expert_intermediate_size": 16,
+                     "layer_types": ["linear_attention", "full_attention"],
                      "linear_num_key_heads": 2, "linear_num_value_heads": 4,
                      "linear_key_head_dim": 8, "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4,
                      "rope_parameters": {"rope_type": "default", "rope_theta": 10000,
@@ -49,7 +55,7 @@ def make_model() -> Qwen3_5MoeForConditionalGeneration:
                        "temporal_patch_size": 2, "num_position_embeddings": 16},
     )
     config._attn_implementation = "sdpa"
-    return Qwen3_5MoeForConditionalGeneration(config)
+    return model_class(config)
 
 
 def make_batch(image_start: int = 62, supervised_start: int = 2) -> dict:
@@ -65,6 +71,8 @@ def make_batch(image_start: int = 62, supervised_start: int = 2) -> dict:
 
 class TestQwenVLMChunkLoss(unittest.TestCase):
     """Compare loss and every gradient against a full-logits HF oracle on CPU."""
+
+    dense = False
 
     def setUp(self) -> None:
         """Use a fixed seed and one CPU thread for the small numerical oracle."""
@@ -86,7 +94,7 @@ class TestQwenVLMChunkLoss(unittest.TestCase):
         """
         for empty in (False, True):
             with self.subTest(empty=empty):
-                model = make_model()
+                model = make_model(dense=self.dense)
                 reference = copy.deepcopy(model)
                 batch = make_batch()
                 targets = functional.pad(batch["labels"], (0, 1), value=-100)[:, 1:]
@@ -119,7 +127,7 @@ class TestQwenVLMChunkLoss(unittest.TestCase):
         Description: Bind twice, run native inference, and reject a text-model facade.
         Expectation: Native logits remain identical and text model binding raises TypeError.
         """
-        model = make_model()
+        model = make_model(dense=self.dense)
         batch = make_batch()
         expected = model(**batch, use_cache=False).logits
         bind_chunk_loss(model)
@@ -138,7 +146,7 @@ class TestQwenVLMChunkLoss(unittest.TestCase):
         Description: Prepare image/text labels with right padding and chunk loss enabled.
         Expectation: Targets shift once, masks/counts align, and no logits are materialized.
         """
-        model = make_model()
+        model = make_model(dense=self.dense)
         objective = ChunkedCausalLMLoss(chunk_size=17)
         objective.bind_model(model)
         context = SimpleNamespace(cp_size=1, tp_size=1, pp_size=1, dp_size=1, dp_rank=0,
@@ -160,7 +168,7 @@ class TestQwenVLMChunkLoss(unittest.TestCase):
         Description: Supply a runtime extension to the Qwen batch adapter.
         Expectation: Its plan reaches model inputs but not loss inputs.
         """
-        model = make_model()
+        model = make_model(dense=self.dense)
         context = SimpleNamespace(cp_size=1, tp_size=1, pp_size=1, dp_size=1, dp_rank=0,
                                   cp_rank=0, tp_rank=0, sequence_parallel=False, loss_parallel=False)
         extension = Mock(spec=RuntimeInputAdapter)
@@ -192,7 +200,7 @@ class TestQwenVLMChunkLoss(unittest.TestCase):
         Description: Exercise config-default router output and incompatible HF output options.
         Expectation: Reject before encoder work or decoder execution.
         """
-        model = make_model()
+        model = make_model(dense=self.dense)
         install_qwen_vlm_cp_forward(model)
         model.config.text_config.output_router_logits = True
         with self.assertRaisesRegex(NotImplementedError, "router auxiliary loss"):
@@ -202,3 +210,19 @@ class TestQwenVLMChunkLoss(unittest.TestCase):
                                  ({"logits_to_keep": torch.tensor([0])}, "logits_to_keep")):
             with self.subTest(options=options), self.assertRaisesRegex(ValueError, message):
                 model(vlm_cp_inputs=object(), output_router_logits=False, **options)
+
+
+class TestQwenDenseVLMChunkLoss(TestQwenVLMChunkLoss):
+    """Exercise the same image/text loss and batch contracts on the Dense HF model."""
+
+    dense = True
+
+    def test_visual_ownership(self) -> None:
+        """Keep every visual parameter inside the adapter-owned encoder subtree."""
+        model = make_model(dense=True)
+        spec = QWEN3_5_ADAPTER_SPEC.encoder_parallel()
+        self.assertEqual(spec.isolated_subtrees, ("model.visual",))
+        self.assertIs(model.get_submodule(spec.isolated_subtrees[0]), model.model.visual)
+        fqns = ("model.visual", "model.language_model.embed_tokens", "model.language_model.layers.0")
+        self.assertEqual(QWEN3_5_ADAPTER_SPEC.fsdp_execution_order(model, fqns),
+                         (fqns[1], fqns[0], fqns[2]))

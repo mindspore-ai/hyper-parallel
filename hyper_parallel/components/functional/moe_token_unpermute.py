@@ -34,7 +34,7 @@ def moe_token_unpermute(
     Returns:
         Restored token-major output with repeated token routes accumulated.
     """
-    # NPU kernels are optional on CPU/GPU hosts.
+    # CPU model imports must not require the optional NPU runtime.
     import torch_npu  # pylint: disable=C0415
 
     return torch_npu.npu_moe_token_unpermute(permuted_tokens, sorted_indices, probs)

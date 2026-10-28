@@ -70,8 +70,8 @@ def bind_chunk_loss(model: nn.Module) -> None:
     """
     if getattr(model, "_hp_qwen_vlm_chunk_loss_bound", False):
         return
-    if getattr(getattr(model, "config", None), "model_type", None) != "qwen3_5_moe":
-        raise TypeError("Qwen VLM Chunk Loss requires model_type='qwen3_5_moe'")
+    if getattr(getattr(model, "config", None), "model_type", None) not in ("qwen3_5", "qwen3_5_moe"):
+        raise TypeError("Qwen VLM Chunk Loss requires model_type='qwen3_5' or 'qwen3_5_moe'")
     if not isinstance(getattr(model, "model", None), nn.Module):
         raise TypeError("Qwen VLM Chunk Loss requires the multimodal base at model.model")
     head = getattr(model, "lm_head", None)
