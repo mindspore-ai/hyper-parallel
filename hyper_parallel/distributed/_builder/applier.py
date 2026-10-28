@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-# pylint: disable=missing-apache-license-header
 """applier: apply-phase orchestration — injection preflight (fail-fast before
 any mutation), apply-stage mesh selection, special-handler dispatch, and the
 Phase C per-boundary driving loop.
