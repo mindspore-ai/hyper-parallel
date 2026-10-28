@@ -25,7 +25,6 @@ PROJECT_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd)
 MASTER_PORT=${MASTER_PORT:-29500}
 RDZV_ID=${RDZV_ID:-qwen3_8_32nodes_256dies}
 
-export HYPER_PARALLEL_PLATFORM=${HYPER_PARALLEL_PLATFORM:-torch}
 export PYTORCH_NPU_ALLOC_CONF=${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}
 export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-1800}
@@ -39,7 +38,7 @@ torchrun \
     --rdzv_id="${RDZV_ID}" \
     --rdzv_backend=c10d \
     --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
-    --module examples.qwen3_8.train_text \
+    --module scripts.train_lm \
     "${SCRIPT_DIR}/train_online.yaml" \
     --fsdp_config.dp_shard_size=256 \
     --accelerator.cp_size=4 \

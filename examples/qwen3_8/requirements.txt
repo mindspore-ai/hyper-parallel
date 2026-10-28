@@ -1,5 +1,5 @@
-# Install from this directory with:
-# python -m pip install -r requirements.txt
+# Follow the staged installation in README.md (Triton-Ascend pins psutil==6.0.0;
+# this measured environment installs psutil==7.2.2 separately with --no-deps).
 # Requires Python 3.10-3.12 and a matching Ascend driver and toolkit installation.
 
 torch==2.9.0

@@ -27,6 +27,7 @@ from examples.qwen3_8.tools.validate_chat_templates import main, parse_args, sca
 from hyper_parallel.data.text.text_transform import TextConversationTransform
 from hyper_parallel.data.text.chat_template import TokenizerTemplate
 from tests.ut.data.conftest import FakeTokenizer, PrefixRewritingTokenizer
+from tests.common.mark_utils import arg_mark
 
 
 class TestValidateChatTemplates(unittest.TestCase):
@@ -58,6 +59,30 @@ class TestValidateChatTemplates(unittest.TestCase):
         self.assertEqual(result["tool_count"], 1)
         expected_tokens = len(tokenizer.encode(result["template_text"], add_special_tokens=False)) - 1
         self.assertEqual(result["train_tokens"], expected_tokens)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_zero_supervision_is_filtered_without_error(self) -> None:
+        """Feature: training filter parity.
+
+        Description: Scan a conversation whose assistant loss is disabled.
+        Expectation: Report filtering separately from failures and retained samples.
+        """
+        self.record["messages"][1]["loss_mask"] = 0
+        line = json.dumps(self.record)
+        self.assertEqual(self.transform(self.record), [])
+        result = validate_record(line, 1, self.transform)
+        self.assertEqual(result["stage"], "filtered")
+        self.assertNotIn("error", result)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = root / "input.jsonl"
+            data.write_text(line + "\n", encoding="utf-8")
+            report = scan_dataset(data, root / "results", self.transform, {}, progress_every=0)
+            self.assertEqual(report["filtered"], 1)
+            self.assertEqual(report["training_passed"], 0)
+            self.assertEqual(report["failed"], 0)
+            self.assertTrue(report["all_passed"])
 
     def test_render_success_does_not_hide_training_prefix_failure(self):
         """A whole conversation can render while its incremental mask cannot be built."""

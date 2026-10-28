@@ -1,7 +1,7 @@
 # Qwen3.8-27B on Ascend：FSDP / CP / 高性能融合算子
 
 本目录使用 Hugging Face 的 Qwen3.8-27B 模型、HyperParallel 的 FSDP/CP，以及仓库内的高性能
-GDN 融合算子。两个训练 YAML 通过 `plan_overrides[*].replace_module` 选择
+GDN 融合算子。三份训练 YAML 通过 `plan_overrides[*].replace_module` 选择
 [`TritonGDN`](../../hyper_parallel/components/modules/gdn_triton.py) 模块映射，把原模型的
 `chunk_gated_delta_rule` 绑定到仓库内的
 [`components/functional/gated_delta_net.py`](../../hyper_parallel/components/functional/gated_delta_net.py)。
@@ -13,6 +13,11 @@ GDN 融合算子。两个训练 YAML 通过 `plan_overrides[*].replace_module` �
   `torchrun` 启动。
 - [`train_online.yaml`](train_online.yaml) 是 online conversation 配置，默认 FSDP+CP=2、每条样本最多
   4096 token、`micro_batch_size=1`，**不做跨样本 packing**。
+
+- [`train_online_p2p_kv_allgather.yaml`](train_online_p2p_kv_allgather.yaml) 使用 GDN 状态 P2P 和
+  attention KV all-gather；批处理会按 CP 大小和 64-token chunk 对齐。
+
+三份配置均通过 `scripts.train_lm` 启动。
 
 ## 1. 实测环境与安装
 
@@ -43,7 +48,6 @@ PyTorch、torch-npu、算子编译依赖及本仓库。版本组合见
 ```bash
 cd /path/to/hyper-parallel
 source /home/chaoran/cann/cann-9.1.0/set_env.sh
-export HYPER_PARALLEL_PLATFORM=torch
 
 python3 -m pip download --no-deps \
   --index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi \
@@ -58,7 +62,7 @@ python3 -m pip install -e . --no-deps
 `requirements.txt` 固定了 PyTorch 2.9.0、torch-npu 2.9.0.post6、Triton-Ascend 3.2.2、
 Transformers 5.13.0 等 Python 依赖。`pip install -e . --no-deps` 安装当前仓库，避免根目录可选
 `[torch]` extra 的不同 PyTorch 版本覆盖本示例的版本组合。融合算子源码已在
-[`components/functional/_gdn_triton`](../../hyper_parallel/components/functional/_gdn_triton)；不需要另装 FLA、
+[`components/functional/_triton/gated_delta_net`](../../hyper_parallel/components/functional/_triton/gated_delta_net)；不需要另装 FLA、
 AscendC GDN 扩展或 `causal-conv1d`。Triton-Ascend 与普通 Triton 共用 `triton` 包路径，安装后不要再
 单独升级普通 Triton；相关说明见[官方安装指南](https://github.com/triton-lang/triton-ascend/blob/main/docs/en/installation_guide.md)。
 分阶段安装 psutil 是因为成功实验使用 7.2.2，而 Triton-Ascend 3.2.2 的依赖声明固定为 6.0.0。
@@ -72,10 +76,9 @@ python3 -c 'import triton.backends.ascend, importlib.metadata as m; print("trito
 python3 -c 'import hyper_parallel; from hyper_parallel.components.functional.gated_delta_net import chunk_gated_delta_rule; print(hyper_parallel.__file__, chunk_gated_delta_rule.__module__)'
 ```
 
-导入成功只说明 Python 模块可加载，**不代表融合算子已在 NPU 上执行**。`train.yaml` 和
-`train_online.yaml` 都以 `*.linear_attn` 匹配 Hugging Face 的 `Qwen3_5GatedDeltaNet`，通过
+导入成功只说明 Python 模块可加载，**不代表融合算子已在 NPU 上执行**。三份 YAML 都以 `*.linear_attn` 匹配 Hugging Face 的 `Qwen3_5GatedDeltaNet`，通过
 `plan_overrides[*].replace_module` 启用高性能 GDN 融合算子。模型模块类型或名称不匹配时，
-替换阶段会报错；使用这两个 YAML 跑完首个训练 step（可将 `--training.train_iters` 设为 1），
+替换阶段会报错；使用对应 YAML 跑完首个训练 step（可将 `--training.train_iters` 设为 1），
 才能同时验证算子的编译及反向计算。首次启动包含算子编译，耗时不要计入稳定步时。
 
 ## 2. Online conversation：启动脚本
@@ -114,10 +117,11 @@ python examples/qwen3_8/tools/analyze_decif_lengths.py \
 
 脚本生成 `decif_length_distribution.png`、逐样本 CSV 和汇总 JSON。`--max-seq-len` 必须与实际训练
 覆盖值一致；默认使用 `enable_thinking=true` 和 `reasoning_effort=medium`。绘图环境缺少 Matplotlib 时，
-先执行 `python -m pip install matplotlib`。
+先执行 `python -m pip install matplotlib`。统计保留零监督样本并单独计数；当前训练 transform 会过滤
+这类样本，因此源数据长度分布不等于训练实际采样后的分布。
 
 脚本默认使用 8 张 NPU、`MASTER_ADDR=127.0.0.1`、`MASTER_PORT=29500`；可用同名环境变量覆盖。
-它还设置 `HYPER_PARALLEL_PLATFORM=torch`、`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7`
+它还设置 `ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7`
 以及 HCCL 超时变量；均可在启动前用环境变量覆盖。YAML 中 FSDP shard size=8、CP=2、TP=1、
 global batch=8。Online 的 `max_seq_len: 4096` 是**单条样本的截断上限**，不是固定 4096 token；
 标签右移后模型输入最多 4095 token，`micro_batch_size=1` 时每次只有一条样本。
@@ -166,11 +170,10 @@ python3 -m hyper_parallel.data.tools.offline_preparation \
 ```bash
 export OFFLINE_PREFIX=/path/to/parallel_offline_text_document
 export MODEL_DIR=/path/to/Qwen3.8-27B
-export HYPER_PARALLEL_PLATFORM=torch
 
 # 纯 FSDP：8 卡、CP=1。
 torchrun --standalone --nproc_per_node=8 \
-  -m examples.qwen3_8.train_text examples/qwen3_8/train.yaml \
+  -m scripts.train_lm examples/qwen3_8/train.yaml \
   --training.train_iters=100 --accelerator.cp_size=1 \
   --model.pretrained_model_name_or_path="$MODEL_DIR" \
   --dataset.model_assets.tokenizer.pretrained_model_name_or_path="$MODEL_DIR" \
@@ -178,14 +181,16 @@ torchrun --standalone --nproc_per_node=8 \
 
 # FSDP+CP：8 卡、CP=2。上一组退出后再启动；不要同时占用同一批 NPU。
 torchrun --standalone --nproc_per_node=8 \
-  -m examples.qwen3_8.train_text examples/qwen3_8/train.yaml \
+  -m scripts.train_lm examples/qwen3_8/train.yaml \
   --training.train_iters=100 --accelerator.cp_size=2 \
   --model.pretrained_model_name_or_path="$MODEL_DIR" \
   --dataset.model_assets.tokenizer.pretrained_model_name_or_path="$MODEL_DIR" \
   --dataset.data_path="$OFFLINE_PREFIX"
 ```
 
-## 4. Offline 4096 训练结果
+## 4. 历史 Offline 4096 训练结果
+
+以下曲线与步时来自 rebase 前的实验，不代表当前提交已完成 100-step 验证。
 
 ![FSDP 与 FSDP+CP 的 seq length 4K loss 曲线](offline_4k_loss.png)
 
@@ -197,13 +202,13 @@ torchrun --standalone --nproc_per_node=8 \
 
 ## 5. A3 训练镜像
 
-[`docker/Dockerfile.qwen3_8-a3`](../../docker/Dockerfile.qwen3_8-a3) 以 CANN 9.1.0 A3、Python 3.11
+[`docker/Dockerfile.models-npu-a3`](../../docker/Dockerfile.models-npu-a3) 以 CANN 9.1.0 A3、Python 3.11
 为基础，固定了上述 FSDP+CP 实验的 PyTorch、torch-npu、高性能算子及数据处理依赖，并安装当前仓库源码。
 镜像构建时还会编译 offline Indexed Dataset 使用的 C++ 索引模块。
 在 ARM64 构建机的仓库根目录执行：
 
 ```bash
-docker build -f docker/Dockerfile.qwen3_8-a3 -t hyper-parallel:qwen3_8-a3 .
+docker build -f docker/Dockerfile.models-npu-a3 -t hyper-parallel-a3 .
 ```
 
 镜像不包含模型权重、Indexed Dataset 或输出目录；在 A3 训练节点启动容器时挂载这些目录，

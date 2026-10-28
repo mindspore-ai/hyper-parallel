@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Qwen3.8 FSDP + CP + high-performance GDN, targeting Ascend A3 (ARM64).
+# HyperParallel NPU training environment, targeting Ascend A3 (ARM64).
 FROM quay.io/ascend/cann:9.1.0-a3-ubuntu22.04-py3.11
 
-ENV HYPER_PARALLEL_PLATFORM=torch \
-    PYTHONUNBUFFERED=1 \
+ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     BUILD_MULTICORE_EXTENSION=off \
     BUILD_SHMEM_EXTENSION=off

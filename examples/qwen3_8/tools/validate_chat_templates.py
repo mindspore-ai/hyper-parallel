@@ -15,7 +15,7 @@
 """Scan JSONL with a local tokenizer; render templates and exercise training masks.
 
 Run from an editable HyperParallel installation, without torchrun or model weights:
-    HYPER_PARALLEL_PLATFORM=torch python -m examples.qwen3_8.tools.validate_chat_templates \
+    python -m examples.qwen3_8.tools.validate_chat_templates \
         --data-path /path/to/data.jsonl --tokenizer-path /path/to/model \
         --tools-key tools --max-seq-len 4096 --output-dir outputs/template_check
 
@@ -79,7 +79,12 @@ def validate_record(line: str, line_number: int, transform: TextConversationTran
         )
         result["render_ok"] = True
         result["stage"] = "training_encode"
-        sample = transform(record)[0]
+        samples = transform(record)
+        if not samples:
+            result.update(training_ok=True, stage="filtered", filtered=True,
+                          zero_supervision=True, supervised_tokens=0)
+            return result
+        sample = samples[0]
         input_ids, labels = sample["input_ids"], sample["labels"]
         if input_ids.shape != labels.shape or input_ids.numel() == 0:
             raise ValueError(f"Invalid shifted shapes: input_ids={input_ids.shape}, labels={labels.shape}")
@@ -116,7 +121,7 @@ def scan_dataset(
         raise FileNotFoundError(data_path)
     output_dir.mkdir(parents=True, exist_ok=False)
     summary = {"configuration": metadata, "checked": 0, "blank_lines": 0, "render_passed": 0,
-               "training_passed": 0, "failed": 0, "zero_supervision": 0}
+               "training_passed": 0, "filtered": 0, "failed": 0, "zero_supervision": 0}
     with data_path.open(encoding="utf-8") as source, \
             (output_dir / "templates.jsonl").open("x", encoding="utf-8") as rendered, \
             (output_dir / "errors.jsonl").open("x", encoding="utf-8") as errors:
@@ -128,7 +133,8 @@ def scan_dataset(
             rendered.write(json.dumps(result, ensure_ascii=False) + "\n")
             summary["checked"] += 1
             summary["render_passed"] += int(result["render_ok"])
-            summary["training_passed"] += int(result["training_ok"])
+            summary["training_passed"] += int(result["training_ok"] and not result.get("filtered", False))
+            summary["filtered"] += int(result.get("filtered", False))
             summary["zero_supervision"] += int(result.get("zero_supervision", False))
             if not result["training_ok"]:
                 summary["failed"] += 1
