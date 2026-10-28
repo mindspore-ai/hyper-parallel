@@ -18,7 +18,6 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from hyper_parallel.codegen.plan.offline_mesh import build_offline_mesh
 from hyper_parallel.codegen.source.compat import install_output_recorder_compat
 from hyper_parallel.codegen.spec.types import CodegenSpec
 
@@ -170,42 +169,7 @@ def build_plan_overrides(config: Any, spec: CodegenSpec) -> dict[str, Any]:
     )
 
 
-def derive_sharding_plan(
-    model: Any, spec: CodegenSpec, *, plan_overrides: Optional[dict[str, Any]] = None,
-) -> Any:
-    """Run ``ShardingPlanner.plan`` over the offline mesh for ``spec``.
-
-    Returns the planner's ``ShardingPlan``.  A planner failure raises — the
-    manager's ``_fill_plan_fields`` turns a None plan into an empty frozen
-    plan, which is exactly the silent-degradation path that must not survive
-    (a plan-less artifact passing preflight).  ``model`` is the meta-device
-    model from :func:`build_meta_model`; the mesh is the static offline mesh,
-    so no process group is needed.
-
-    ``plan_overrides`` is the desugared override dict — the planner's native
-    interface — normally produced by :func:`build_plan_overrides` from the
-    live config.  ``allow_uncovered_params`` stays at its default (False):
-    the F4b fail-fast guard must fire here, at generation time, not silently
-    inside the trainer.
-    """
-    parallel_dims = spec.parallel_dims
-    mesh = build_offline_mesh(parallel_dims)
-    from hyper_parallel.distributed._builder.planner import ShardingPlanner
-
-    planner = ShardingPlanner(plan_overrides=dict(plan_overrides or {}))
-    return planner.plan(
-        model,
-        mesh,
-        tp_size=parallel_dims.tp_size,
-        cp_size=parallel_dims.cp_size,
-        ep_size=parallel_dims.ep_size,
-        sequence_parallel=parallel_dims.sequence_parallel,
-        loss_parallel=parallel_dims.loss_parallel,
-    )
-
-
 __all__ = [
     "build_meta_model",
     "build_plan_overrides",
-    "derive_sharding_plan",
 ]

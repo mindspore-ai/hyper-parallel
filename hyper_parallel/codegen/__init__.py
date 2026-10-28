@@ -11,8 +11,8 @@ Public manager helpers:
 
 Planning and validation APIs:
 
-- :func:`derive_sharding_plan` / :func:`freeze_plan` — run the planner over
-  an offline mesh and freeze the plan into JSON-safe structures.
+- :func:`freeze_plan` — freeze the builder-produced plan into JSON-safe
+  structures.
 - :func:`verify_signature` / :func:`verify_output_hashes` / ... — per-zone
   preflight verifiers.
 """
