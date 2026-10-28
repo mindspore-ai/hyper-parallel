@@ -7,12 +7,22 @@ Python or declaratively replace existing model modules through Trainer YAML.
 
 | Category | Modules |
 | --- | --- |
-| Attention | `GQAAttention`, `GatedGQAAttention`, `MLAAttention`, `DSAAttention`, `DeepseekV32DSAAttention` |
-| MoE and MLP | `GroupedExperts`, `SharedExpert`, `SwiGLUMLP` |
+| Attention | `GQAAttention`, `GatedGQAAttention`, `MLAAttention`, `DSAAttention`, `DeepseekV32DSAAttention`, `DeepseekV41SparsePrefillAttention`, `DeepseekV41SparseDecodeAttention`, `DeepSelectSharedCompressedDSAAttention`, `FlashMLASharedCompressedDSAAttention` |
+| MoE and MLP | `GroupedExperts`, `SharedExpert`, `SwiGLUMLP`, `TileKernelsV41TopKRouter` |
 | Normalization | `RMSNorm`, `OffsetRMSNorm` |
-| MHC | `MhcPreModule`, `MhcPostModule` |
+| MHC | `MhcPreModule`, `MhcPostModule`, `TileKernelsV41MhcModule` |
+| Engram | `TileKernelsEngramModule` |
 
 Reusable high-performance functions are provided separately in [`hyper_parallel.components.functional`](../functional/README.md).
+
+The two DeepSeek V4.1 sparse-attention modules are optional adapters over FlashMLA's Ascend backend. FlashMLA must be built
+separately in the active PyTorch, torch-npu, and CANN environment. See the
+[DeepSeek Ascend installation guide](../../../docs/guide/deepseek_ascend_ops.md) for dependency requirements,
+installation commands, and supported operators.
+
+The TileKernels replacements preserve the V4.1 parameter layout and training contracts.
+`DeepSelectSharedCompressedDSAAttention` replaces only Indexer Top-K; attention and Indexer KL use PyTorch.
+`FlashMLASharedCompressedDSAAttention` uses FlashMLA prefill and requires inference without autograd.
 
 Modules can also be constructed directly:
 

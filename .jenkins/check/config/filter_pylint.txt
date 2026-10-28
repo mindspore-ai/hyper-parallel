@@ -219,3 +219,6 @@
 # Linear replacements must preserve forward(input=...) for keyword calls and
 # the existing replacement executor's signature validation.
 "hyper-parallel/tests/ut/trainer/test_module_family_replacement.py" "redefined-builtin"
+
+# Router replacement adopts source state without allocating new native parameters.
+"hyper-parallel/hyper_parallel/components/modules/tile_kernels.py" "non-parent-init-called"

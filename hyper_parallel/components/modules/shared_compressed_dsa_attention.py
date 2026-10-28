@@ -43,6 +43,11 @@ from hyper_parallel.components.functional.sparse_flash_mla import (
 from hyper_parallel.components.functional.sparse_lightning_indexer_kl_loss_grad import (
     gather_selected_keys, sparse_lightning_indexer_kl_loss, validate_fused_kl_inputs,
 )
+from hyper_parallel.components.functional.deepseek_ascend import (
+    deepseek_flash_mla_sparse_prefill,
+    deepseek_select_stride_requirement,
+    deepseek_select_topk,
+)
 from hyper_parallel.core.activation_memory.wrapper import checkpoint_exclude_wrapper
 from hyper_parallel.core.activation_memory.recompute_state import is_recomputing
 from hyper_parallel.models.replacement import module_replacement
@@ -438,6 +443,64 @@ def _run_lightning_indexer(
     return lightning_indexer(query, key, merge_weight, compress_ratio, top_k, query_segments)
 
 
+def _prepare_deepselect_input(
+        scores: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Convert scores to DeepSelect's BF16, aligned two-dimensional layout."""
+    flattened = scores.reshape(-1, scores.shape[-1]).to(torch.bfloat16).contiguous()
+    input_alignment, _ = deepseek_select_stride_requirement()
+    if input_alignment <= 0:
+        raise ValueError(
+            f"DeepSelect input alignment must be positive, got {input_alignment}"
+        )
+    element_size = flattened.element_size()
+    aligned_row_bytes = (
+        (flattened.shape[1] * element_size + input_alignment - 1)
+        // input_alignment
+        * input_alignment
+    )
+    aligned_width = aligned_row_bytes // element_size
+    if aligned_width == flattened.shape[1]:
+        return flattened, None
+    original_width = flattened.shape[1]
+    padded = flattened.new_full((flattened.shape[0], aligned_width), float("-inf"))
+    padded[:, :original_width].copy_(flattened)
+    end = torch.full(
+        (flattened.shape[0],),
+        original_width,
+        dtype=torch.int32,
+        device=flattened.device,
+    )
+    return padded, end
+
+
+def _indexer_topk(
+        scores: torch.Tensor,
+        top_k: int,
+        *,
+        use_deepselect: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return Top-K values and indices through torch or DeepSelect."""
+    if not use_deepselect:
+        result = scores.topk(top_k, dim=-1, sorted=False)
+        return result.values, result.indices
+    if scores.device.type != "npu":
+        raise ValueError("DeepSelect Indexer Top-K requires NPU score tensors")
+    flattened, end = _prepare_deepselect_input(scores)
+    values, indices = deepseek_select_topk(
+        flattened,
+        top_k,
+        sorted=False,
+        end=end,
+        sorted_index=True,
+        indices_type=torch.int32,
+    )
+    if values is None:
+        raise RuntimeError("DeepSelect did not return Top-K values")
+    output_shape = (*scores.shape[:-1], top_k)
+    return values.reshape(output_shape), indices.reshape(output_shape)
+
+
 @torch.no_grad()
 def compressed_causal_topk(
         query: torch.Tensor,
@@ -452,6 +515,7 @@ def compressed_causal_topk(
         minimum_key_indices: torch.Tensor | None = None,
         query_segments: tuple[tuple[int, int, int, int, int], ...] | None = None,
         use_fused: bool = False,
+        use_deepselect: bool = False,
 ) -> torch.Tensor:
     """Select compressed positions with V4.1's ratio-aware causal rule.
 
@@ -464,7 +528,11 @@ def compressed_causal_topk(
         query_segments: Local Q intersections and global compressed K prefixes.
         use_fused: Select LI V2 and raise if a nonempty call is unsupported.
             False explicitly selects the numerical reference.
+        use_deepselect: Select DeepSelect Top-K instead of Torch Top-K.
+            Cannot be combined with the fused LightningIndexer backend.
     """
+    if use_fused and use_deepselect:
+        raise ValueError("use_fused and use_deepselect select mutually exclusive Indexer backends")
     if compress_ratio <= 0:
         raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
     if query_chunk_size <= 0:
@@ -516,8 +584,8 @@ def compressed_causal_topk(
         if minimum_key_indices is not None:
             minimum = minimum_key_indices[:, start:end].unsqueeze(-1)
             scores.masked_fill_(key_positions < minimum, float("-inf"))
-        top = scores.topk(top_k, dim=-1, sorted=False)
-        indices = top.indices.masked_fill(~torch.isfinite(top.values), compressed_length)
+        values, indices = _indexer_topk(scores, top_k, use_deepselect=use_deepselect)
+        indices = indices.masked_fill(~torch.isfinite(values), compressed_length)
         indices = sort_key_indices(indices, compressed_length)
         indices = indices.masked_fill(indices == compressed_length, -1)
         selected_chunks.append(indices.to(torch.int32))
@@ -650,6 +718,7 @@ def compressed_causal_topk_and_candidates(
         query_chunk_size: int = 256,
         reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None = None,
         minimum_key_indices: torch.Tensor | None = None,
+        use_deepselect: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select Full-layer Top-K and candidate blocks from one score pass."""
     if compress_ratio <= 0:
@@ -696,8 +765,8 @@ def compressed_causal_topk_and_candidates(
         if minimum_key_indices is not None:
             minimum = minimum_key_indices[:, start:end].unsqueeze(-1)
             scores.masked_fill_(key_positions < minimum, float("-inf"))
-        top = scores.topk(top_k, dim=-1, sorted=False)
-        indices = top.indices.masked_fill(~torch.isfinite(top.values), compressed_length)
+        values, indices = _indexer_topk(scores, top_k, use_deepselect=use_deepselect)
+        indices = indices.masked_fill(~torch.isfinite(values), compressed_length)
         indices = indices.sort(dim=-1).values
         selected_chunks.append(indices.masked_fill(indices == compressed_length, -1).to(torch.int32))
         candidate_chunks.append(
@@ -724,6 +793,7 @@ def compressed_candidate_topk(
         query_chunk_size: int = 256,
         reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None = None,
         minimum_key_indices: torch.Tensor | None = None,
+        use_deepselect: bool = False,
 ) -> torch.Tensor:
     """Score only hierarchical candidate blocks and return global key ids."""
     if compress_ratio <= 0:
@@ -787,9 +857,9 @@ def compressed_candidate_topk(
         if reduce_sum is not None:
             scores = reduce_sum(scores)
         scores.masked_fill_(~valid, float("-inf"))
-        top = scores.topk(top_k, dim=-1, sorted=False)
-        selected = positions.gather(-1, top.indices)
-        selected.masked_fill_(~torch.isfinite(top.values), compressed_length)
+        values, indices = _indexer_topk(scores, top_k, use_deepselect=use_deepselect)
+        selected = positions.gather(-1, indices.long())
+        selected.masked_fill_(~torch.isfinite(values), compressed_length)
         selected = selected.sort(dim=-1).values
         selected.masked_fill_(selected == compressed_length, -1)
         selected_chunks.append(selected.to(torch.int32))
@@ -977,7 +1047,7 @@ class SharedCompressedDSAIndexer(nn.Module):
     # out of ``modules()`` and the state dict.
     _selection_region: Callable[..., Any] | None = None
 
-    def __init__(self, module: nn.Module) -> None:
+    def __init__(self, module: nn.Module, *, use_deepselect: bool = False) -> None:
         """Transfer the source projections without changing checkpoint names."""
         super().__init__()
         required = ("q_b_proj", "weights_proj")
@@ -1000,6 +1070,7 @@ class SharedCompressedDSAIndexer(nn.Module):
         self.candidate_block_size = module.candidate_block_size
         self.loss_coeff = module.loss_coeff
         self.query_chunk_size = int(getattr(module, "query_chunk_size", 256))
+        self.use_deepselect = bool(use_deepselect)
         self.train(module.training)
 
     def _project_index_key(
@@ -1116,6 +1187,7 @@ class SharedCompressedDSAIndexer(nn.Module):
                 query_chunk_size=self.query_chunk_size,
                 reduce_sum=reduce_sum,
                 minimum_key_indices=minimum_key_indices,
+                use_deepselect=self.use_deepselect,
             )
         elif self.uses_candidates:
             if candidate_blocks is None:
@@ -1132,6 +1204,7 @@ class SharedCompressedDSAIndexer(nn.Module):
                 query_chunk_size=self.query_chunk_size,
                 reduce_sum=reduce_sum,
                 minimum_key_indices=minimum_key_indices,
+                use_deepselect=self.use_deepselect,
             )
         else:
             candidate_blocks = None
@@ -1147,6 +1220,7 @@ class SharedCompressedDSAIndexer(nn.Module):
                 minimum_key_indices=minimum_key_indices,
                 query_segments=query_segments,
                 use_fused=self.use_fused,
+                use_deepselect=self.use_deepselect,
             )
         return topk_indices, candidate_blocks
 
@@ -1205,6 +1279,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             *,
             replace_indexer: bool,
             use_fused_ops: bool,
+            use_deepselect_indexer: bool = False,
     ) -> None:
         """Transfer source state and configure the execution implementation."""
         super().__init__()
@@ -1218,7 +1293,12 @@ class SharedCompressedDSAAttentionBase(nn.Module):
                 and indexer is not None
                 and not isinstance(indexer, SharedCompressedDSAIndexer)
         ):
-            self.indexer = SharedCompressedDSAIndexer(indexer)
+            self.indexer = SharedCompressedDSAIndexer(
+                indexer,
+                use_deepselect=use_deepselect_indexer,
+            )
+        if replace_indexer and isinstance(getattr(self, "indexer", None), SharedCompressedDSAIndexer):
+            self.indexer.use_deepselect = use_deepselect_indexer
         self.config = module.config
         self.layer_idx = module.layer_idx
         self.num_heads = module.num_heads
@@ -1691,7 +1771,98 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
         )
 
 
+@module_replacement
+class DeepSelectSharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
+    """A5 training attention using DeepSelect for Lightning Indexer Top-K."""
+
+    def __init__(
+            self,
+            module: nn.Module,
+            module_fqn: str = "",
+            context: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Transfer source state and enable DeepSelect for Indexer Top-K."""
+        del module_fqn, context
+        super().__init__(
+            module,
+            replace_indexer=True,
+            use_fused_ops=False,
+            use_deepselect_indexer=True,
+        )
+
+
+@module_replacement
+class FlashMLASharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
+    """V4.1 shared compressed attention using FlashMLA sparse prefill."""
+
+    def __init__(
+            self,
+            module: nn.Module,
+            module_fqn: str = "",
+            context: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Transfer source state and select the external FlashMLA backend."""
+        del module_fqn, context
+        super().__init__(
+            module,
+            replace_indexer=True,
+            use_fused_ops=False,
+            use_deepselect_indexer=False,
+        )
+        if self.head_dim != 512:
+            raise ValueError(f"FlashMLA V4.1 requires value_head_dim=512, got {self.head_dim}")
+
+    def _run_sparse_attention(
+            self, query: torch.Tensor, key_value: torch.Tensor, compressed_kv: torch.Tensor | None,
+            topk_indices: torch.Tensor | None, query_offset: int, global_sequence_length: int,
+            segment_starts: torch.Tensor | None, query_segments: tuple,
+    ) -> torch.Tensor:
+        """Translate batched HyperParallel tensors to FlashMLA's TND contract."""
+        del query_segments
+        if torch.is_grad_enabled() and (
+                self.training or query.requires_grad or key_value.requires_grad or self.sinks.requires_grad
+                or (compressed_kv is not None and compressed_kv.requires_grad)
+        ):
+            raise RuntimeError(
+                "FlashMLA sparse prefill does not provide an Ascend training backward; "
+                "use DeepSelectSharedCompressedDSAAttention for training"
+            )
+        combined_key_value, sparse_indices = self._build_sparse_indices(
+            key_value, compressed_kv, topk_indices, query.shape[2], query_offset,
+            global_sequence_length, segment_starts,
+        )
+        if query.device.type != "npu":
+            return reference_sparse_attention(
+                query,
+                combined_key_value,
+                sparse_indices,
+                self.sinks,
+                self.scaling,
+            )
+        outputs = []
+        for batch_index in range(query.shape[0]):
+            key_length = combined_key_value.shape[2]
+            indices = sparse_indices[batch_index].masked_fill(sparse_indices[batch_index] < 0, key_length)
+            indices = sort_key_indices(indices, key_length)
+            indices = indices.masked_fill(indices == key_length, -1)
+            indices = indices.to(torch.int32).contiguous()
+            topk_length = indices.ge(0).sum(dim=-1).to(torch.int32)
+            output, _, _ = deepseek_flash_mla_sparse_prefill(
+                query[batch_index].transpose(0, 1).contiguous(),
+                combined_key_value[batch_index].transpose(0, 1).contiguous(),
+                indices.unsqueeze(1),
+                softmax_scale=self.scaling,
+                value_head_dim=self.head_dim,
+                attention_sink=self.sinks,
+                topk_length=topk_length,
+            )
+            outputs.append(output)
+        return torch.stack(outputs)
+
+
 __all__ = [
+    "DeepSelectSharedCompressedDSAAttention",
+    "FlashMLASharedCompressedDSAAttention",
     "SharedCompressedAttentionCPContext",
     "SharedCompressedAttentionState",
     "SharedCompressedPackedSequence",

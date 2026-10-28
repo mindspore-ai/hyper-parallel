@@ -102,3 +102,14 @@ plan_overrides:
 raises on missing entries or unsupported inputs, without automatic fallback.
 The fused path supports ordinary causal CSA with compression ratio 1 or 2;
 candidate-pool selection is not supported.
+
+## Optional DeepSeek Ascend operators
+
+DeepGEMM-Ascend, DeepEP-Ascend, DeepSelect, FlashMLA, and TileKernels are available through
+lazy optional adapters. They are not imported by a plain HyperParallel import
+and must be built separately for the active PyTorch, torch-npu, and CANN
+environment. See the [DeepSeek Ascend operator guide](../../../docs/guide/deepseek_ascend_ops.md).
+
+Common GEMM, quantization, SwiGLU, MoE routing, RoPE, and Engram paths have
+explicit public functions. Generic dispatch remains available for additional
+public production operators as upstream packages evolve.
