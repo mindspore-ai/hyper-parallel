@@ -19,7 +19,6 @@ from hyper_parallel.codegen.plan.boundary_forms import (
 from hyper_parallel.codegen.plan.derive import (
     build_meta_model,
     build_plan_overrides,
-    derive_sharding_plan,
 )
 from hyper_parallel.codegen.plan.freeze import (
     FrozenPlan,
@@ -46,7 +45,6 @@ __all__ = [
     "build_offline_mesh",
     "build_plan_overrides",
     "classify_boundary_form",
-    "derive_sharding_plan",
     "expand_frozen_sharded_params",
     "freeze_injections",
     "freeze_param_plan",
