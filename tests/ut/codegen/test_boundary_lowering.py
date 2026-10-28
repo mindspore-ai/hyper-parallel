@@ -22,6 +22,8 @@ the identical byte string.
 
 from __future__ import annotations
 
+import pytest
+
 from hyper_parallel.codegen.emit.parallel import lower_forward_boundaries
 from tests.common.mark_utils import arg_mark
 
@@ -188,37 +190,23 @@ def _single_plan(entry: dict) -> tuple[dict, dict]:
 
 @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
           card_mark="onecard", essential_mark="unessential")
-def test_local_region_lowering_imports_its_runtime_helper():
-    """The local-region template must bring its own runtime import.
-
-    ``_render_local_compute`` calls ``hp_to_local_if_dtensor``, a helper that
-    no declaration contributes: it is a dependency of the *template*. Without the
-    lowerer registering it the artifact raises ``NameError`` at the first forward
-    call. Regression: only a non-inlined boundary carrying ``local_compute_fn``
-    renders this template — the Qwen3-MoE block is inlined whole as external
-    state, so DeepSeek-V3's dense MLP was the first to reach it.
+def test_local_region_lowering_requires_builder_recording():
+    """A local-compute boundary cannot fall back to an equivalent source rewrite.
 
     Feature: codegen-lowering
     Description: A boundary whose frozen injection declares ``local_compute_fn``
-        is lowered through ``lower_forward_boundaries``.
-    Expectation: The region body is rendered and the runtime helper is imported;
-        re-lowering the imported text does not duplicate the import.
+        reaches ``lower_forward_boundaries`` without the recorder's
+        ``skip_source_lowering`` marker.
+    Expectation: Generation fails instead of cloning native Phase C and changing
+        the numerical execution order.
     """
     plan, classes = _single_plan(_identity_entry())
     plan["injections"] = [
         {"match": "blocks.alpha", "local_compute_fn": {"_target_": "some.factory"}},
     ]
 
-    text = lower_forward_boundaries(SOURCE_TEXT, plan, boundary_classes=classes)
-
-    assert "HYPER LOCAL REGION" in text, "the region template must have run"
-    assert (
-        "from hyper_parallel.codegen.runtime import hp_to_local_if_dtensor"
-        in text
-    ), "the region template's runtime helper must be imported"
-
-    again = lower_forward_boundaries(text, plan, boundary_classes=classes)
-    assert again.count("import hp_to_local_if_dtensor") == 1
+    with pytest.raises(RuntimeError, match="builder recording"):
+        lower_forward_boundaries(SOURCE_TEXT, plan, boundary_classes=classes)
 
 
 @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
@@ -466,15 +454,13 @@ def test_tp_collective_deferred_bias_hook_renders_after_exit_ops():
 
 @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
           card_mark="onecard", essential_mark="unessential")
-def test_local_region_deferred_bias_hook_renders():
-    """D-22: the local-region template carries the hook through its exit block.
+def test_local_region_deferred_bias_still_requires_native_phase_c():
+    """D-22 does not permit a local-region source rewrite.
 
     Feature: codegen-lowering
-    Description: A region boundary (``local_compute_fn``) whose entry carries
-        deferred bias params embeds the shared output-redistribute block, so
-        the hook line must appear there too.
-    Expectation: The region body contains the hook line after the
-        ``hp_to_local_if_dtensor`` unwrap.
+    Description: A region boundary with deferred bias reaches source lowering.
+    Expectation: Generation fails so native Phase C owns both the region and
+        its deferred-bias ordering.
     """
     entry = _identity_entry()
     entry["deferred_bias_params"] = ["o_proj.bias"]
@@ -483,11 +469,8 @@ def test_local_region_deferred_bias_hook_renders():
         {"match": "blocks.alpha", "local_compute_fn": {"_target_": "some.factory"}},
     ]
 
-    text = lower_forward_boundaries(SOURCE_TEXT, plan, boundary_classes=classes)
-
-    assert "HYPER LOCAL REGION" in text
-    hook_at = text.index(_HOOK_LINE)
-    assert hook_at > text.index("hp_to_local_if_dtensor(outputs)")
+    with pytest.raises(RuntimeError, match="native Phase C wrapper"):
+        lower_forward_boundaries(SOURCE_TEXT, plan, boundary_classes=classes)
 
 
 @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",

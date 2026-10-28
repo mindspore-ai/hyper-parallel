@@ -19,7 +19,6 @@ from __future__ import annotations
 import ast
 import inspect
 import textwrap
-from collections import defaultdict
 from typing import Any
 
 from hyper_parallel.codegen.astkit.edits import (
@@ -47,7 +46,14 @@ def materialize_recorded_forwards(
     *,
     patch_plan: Any = None,
 ) -> str:
-    """Lower observed local-compute decisions without model-specific tables."""
+    """Declare observed local-compute decisions without cloning Phase C.
+
+    Local-region wrappers are numerically sensitive: an equivalent source
+    rewrite can change the order in which bfloat16 values cross the boundary.
+    The generated model therefore records every concrete patch for review,
+    while :func:`hyper_parallel.codegen.runtime.hp_bind_compute` installs the
+    trainer's native ``_wrap_local_region_forward`` at startup.
+    """
     patches = patch_plan if patch_plan is not None else getattr(meta, "_build_patches", None)
     records = getattr(patches, "local_computes", ()) if patches is not None else ()
     if not records:
@@ -55,42 +61,40 @@ def materialize_recorded_forwards(
 
     _restore_recorded_boundary_ownership(meta, records)
 
-    groups: dict[tuple[type, str], list[Any]] = defaultdict(list)
-    for record in records:
-        original = _unbound(record.original_forward)
-        groups[(record.module_type, _source_function_name(original))].append(record)
+    declarations = []
+    for record in sorted(records, key=lambda item: _fqn_sort_key(item.module_fqn)):
+        entry = _entry_for_record(meta, record)
+        entry["is_boundary"] = True
+        entry["skip_source_lowering"] = True
+        injection = _injection_for_record(meta, record)
+        if injection is None or injection.get("local_compute_fn") is None:
+            raise RuntimeError(
+                f"codegen: recorded local-compute patch {record.module_fqn!r} "
+                "has no frozen local_compute_fn"
+            )
+        declarations.append({
+            "module_fqn": record.module_fqn,
+            "host_class": record.module_type.__name__,
+            "target": injection["local_compute_fn"],
+            "region_dispatch": entry.get("region_dispatch"),
+        })
+    return _emit_native_local_compute_declarations(source_text, declarations)
 
-    rendered = source_text
-    bindings: dict[str, list[str]] = {}
-    for (host_type, source_function), group in sorted(
-        groups.items(), key=lambda item: (item[0][0].__name__, item[0][1])
-    ):
-        _require_one_contract(group, meta)
-        if source_function and _has_module_function(rendered, source_function):
-            rendered = _materialize_bound_module_function(
-                rendered, source_function, group[0], meta
-            )
-            continue
-        if _has_source_class(rendered, host_type.__name__):
-            rendered = _materialize_source_class(
-                rendered, host_type.__name__, group[0], meta
-            )
-            for record in group:
-                _entry_for_record(meta, record)["skip_source_lowering"] = True
-            continue
-        rendered, constructor_replaced = _materialize_imported_host(
-            rendered, host_type, group[0], meta
-        )
-        if not constructor_replaced:
-            # The host is instantiated by an imported subtree (no source-level
-            # constructor call to retarget): every recorded module reaches the
-            # generated subclass only through the explicit FQN binder below.
-            bindings.setdefault(host_type.__name__, []).extend(
-                record.module_fqn for record in group
-            )
-    if bindings:
-        rendered = _emit_recorded_forward_bindings(rendered, bindings)
-    return _add_runtime_helper_import(rendered)
+
+def _emit_native_local_compute_declarations(
+    source_text: str,
+    declarations: list[dict[str, Any]],
+) -> str:
+    """Append the concrete native Phase C patches to the generated model."""
+    lines = [
+        "def hp_recorded_local_compute_patches():",
+        '    """Return builder-recorded patches installed by native trainer Phase C."""',
+        "    return (",
+    ]
+    for declaration in declarations:
+        lines.append(f"        {declaration!r},")
+    lines.extend(["    )", ""])
+    return source_text.rstrip() + "\n\n\n" + "\n".join(lines)
 
 
 def _restore_recorded_boundary_ownership(meta: Any, records: Any) -> None:
