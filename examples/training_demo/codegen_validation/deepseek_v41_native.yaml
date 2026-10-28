@@ -153,7 +153,7 @@ dataset:
     # and the context-parallel shard size once it lands in a batch.
     drop_ragged_tail: true
   _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
-  data_path: __VAL_ROOT__/data/online_1k.jsonl
+  data_path: __VAL_ROOT__/data/deepseek_v41_online_1k.jsonl
   data_config:
     # Emit compact sample boundaries through the V4.1 runtime adapter. A dense
     # [S,S] mask would be infeasible at the report's 64K/1M training lengths.

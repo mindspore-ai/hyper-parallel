@@ -213,14 +213,17 @@ record_pass "preflight/env"
 # ------------------------------------------------------- 1. data assets ------
 echo "== [1] data assets (idempotent) =="
 mkdir -p "$VAL_ROOT/data"
-if [ "$RUN_QWEN" = "1" ] && [ ! -s "$VAL_ROOT/data/parallel_online.jsonl" ]; then
+if [ "$RUN_QWEN" = "1" ] \
+  && { [ ! -s "$VAL_ROOT/data/parallel_offline_text_document.idx" ] \
+    || [ ! -s "$VAL_ROOT/data/parallel_offline_text_document.bin" ]; }; then
   (cd "$TREE_ROOT" && "$PYTHON" -m examples.training_demo.qwen3_moe.prepare_parallel_data \
     --output-dir "$VAL_ROOT/data" --num-samples 128 --seq-length 128)
 fi
 if [ "$RUN_DSV41" = "1" ]; then
-  if [ ! -s "$VAL_ROOT/data/online_1k.jsonl" ]; then
+  if [ ! -s "$VAL_ROOT/data/deepseek_v41_online_1k.jsonl" ]; then
     (cd "$TREE_ROOT" && "$PYTHON" -m examples.training_demo.deepseek_v41.prepare_deepseek_v41_online_data \
-      --output "$VAL_ROOT/data/online_1k.jsonl" --num-samples 128 --sequence-length 1024)
+      --output "$VAL_ROOT/data/deepseek_v41_online_1k.jsonl" \
+      --num-samples 128 --sequence-length 1024)
   fi
   if [ ! -s "$VAL_ROOT/data/engram_depth_preserving_d8.json" ]; then
     (cd "$TREE_ROOT" && "$PYTHON" -m examples.training_demo.deepseek_v41.prepare_deepseek_v41_assets \

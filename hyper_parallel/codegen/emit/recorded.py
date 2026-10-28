@@ -53,6 +53,8 @@ def materialize_recorded_forwards(
     if not records:
         return source_text
 
+    _restore_recorded_boundary_ownership(meta, records)
+
     groups: dict[tuple[type, str], list[Any]] = defaultdict(list)
     for record in records:
         original = _unbound(record.original_forward)
@@ -89,6 +91,36 @@ def materialize_recorded_forwards(
     if bindings:
         rendered = _emit_recorded_forward_bindings(rendered, bindings)
     return _add_runtime_helper_import(rendered)
+
+
+def _restore_recorded_boundary_ownership(meta: Any, records: Any) -> None:
+    """Make recorded local-region forwards runtime-owned boundaries again.
+
+    The generic inline pass initially classifies known EP strategy targets as
+    external-state classes. When builder recording supplies the actual forward,
+    this emitter materializes a compiled-boundary local region instead of that
+    generic inline body. Restore the matching frozen entries so runtime binding
+    installs ``_hp_boundary`` and the recorded compute method they reference.
+
+    Args:
+        meta: Mutable generation metadata.
+        records: Builder-recorded local-compute patches.
+    """
+    param_plan = getattr(meta, "param_plan", None)
+    boundary_classes = getattr(meta, "boundary_classes", None)
+    external_classes = set(getattr(meta, "external_state_classes", None) or ())
+    recorded_classes: set[str] = set()
+    for record in records:
+        class_name = record.module_type.__name__
+        recorded_classes.add(class_name)
+        if isinstance(param_plan, dict):
+            entry = param_plan.get(record.module_fqn)
+            if isinstance(entry, dict):
+                entry["is_boundary"] = True
+        if isinstance(boundary_classes, dict):
+            boundary_classes[record.module_fqn] = class_name
+    if hasattr(meta, "external_state_classes"):
+        meta.external_state_classes = sorted(external_classes - recorded_classes)
 
 
 def _unbound(value: Any) -> Any:

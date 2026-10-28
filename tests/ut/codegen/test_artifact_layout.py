@@ -128,6 +128,15 @@ class TestResolveLayoutPriority:
         # The YAML stays recorded as provenance.
         assert layout.yaml_path == os.path.abspath(str(tmp_path / "train.yaml"))
 
+    def test_deepseek_v4_uses_v41_family_directory(self):
+        """The upstream V4 config identity resolves to the V4.1 adapter home."""
+        layout = manager._resolve_layout(
+            self._config(), None, None, hf_config=_hf("deepseek_v4")
+        )
+        assert layout.artifact_dir == os.path.join(
+            str(MODELS_ROOT), "deepseek_v41", "generated"
+        )
+
     def test_unknown_model_type_still_model_anchored(self, tmp_path, caplog):
         """A model type without a models/ directory warns and keeps its own
         model-anchored home instead of silently drifting to <yaml_dir>."""

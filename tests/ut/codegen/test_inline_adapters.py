@@ -197,6 +197,48 @@ class ExternalMoe:
 """
         _verify_recorded_patch_materialization(source, meta)
 
+    def test_recorded_local_compute_restores_compiled_boundary_ownership(self):
+        """A recorded region must not retain generic external-state ownership."""
+        class RecordedMoe:
+            def forward(self, hidden_states):
+                return hidden_states
+
+        record = SimpleNamespace(
+            module_fqn="model.layers.0.mlp",
+            module_type=RecordedMoe,
+            factory=lambda: None,
+            original_forward=RecordedMoe.forward,
+        )
+        meta = SimpleNamespace(
+            _build_patches=SimpleNamespace(local_computes=(record,)),
+            param_plan={record.module_fqn: {
+                "is_boundary": False,
+                "in_src": {"hidden_states": {}},
+                "in_dst": {"hidden_states": {}},
+                "out_src": {"output": {}},
+                "out_dst": {"output": {}},
+            }},
+            boundary_classes={},
+            external_state_classes=["RecordedMoe"],
+            injections=[{
+                "match": record.module_fqn,
+                "local_compute_fn": "example.compute",
+            }],
+            mesh_dim_names=[],
+        )
+        source = """
+class RecordedMoe:
+    def forward(self, hidden_states):
+        return hidden_states
+"""
+
+        rendered = materialize_recorded_forwards(source, meta)
+
+        self.assertIn("self._hp_boundary.redistribute_inputs", rendered)
+        self.assertTrue(meta.param_plan[record.module_fqn]["is_boundary"])
+        self.assertEqual(meta.boundary_classes, {record.module_fqn: "RecordedMoe"})
+        self.assertEqual(meta.external_state_classes, [])
+
     def test_recorded_module_function_materializes_region_forward(self):
         """An instance-bound source function becomes impl plus EP boundary."""
         def source_forward(self, hidden_states):
@@ -579,6 +621,45 @@ class OuterModel:
         self.assertIs(module.deepseek_ep_compute_fn, compute)
         self.assertFalse(hasattr(module, "__hp_compute__"))
 
+    def test_hp_bind_compute_rejects_missing_materialized_forward(self):
+        """A source-owned patch must never fall back to runtime re-patching."""
+        from hyper_parallel.codegen import runtime as codegen_runtime
+
+        module = SimpleNamespace(forward=lambda: None)
+
+        def compute(value):
+            return value
+
+        injections = [{
+            "match": "model.layers.0.mlp",
+            "local_compute_fn": {"_target_": "example.deepseek_ep_compute_fn"},
+        }]
+        materialized = [{
+            "fqn": "model.layers.0.mlp",
+            "kind": "local_compute",
+            "host_class": "ExternalMoe",
+            "source_form": "module_forward",
+        }]
+        with patch.object(
+            codegen_runtime, "_resolve_runtime_meshes",
+            return_value=(object(), object(), object(), ()),
+        ), patch.object(
+            codegen_runtime, "_injection_target",
+            return_value=compute,
+        ), patch(
+            "hyper_parallel.distributed._builder.rule_resolver."
+            "_resolve_local_compute_fn",
+            return_value=compute,
+        ), patch(
+            "hyper_parallel.distributed._builder.parameter_sharding._resolve_module",
+            return_value=module,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "regenerate the artifact"):
+                codegen_runtime.hp_bind_compute(
+                    SimpleNamespace(), injections, mesh_context=None,
+                    materialized_patches=materialized,
+                )
+
     def test_recorded_imported_subtree_binding_passes_materialization_audit(self):
         """The audit sees the runtime-bound form and keeps the FQN binding."""
         class ExternalMoe:
@@ -709,6 +790,42 @@ replacement = Replacement()
         self.assertEqual(
             {entry["kind"] for entry in meta.materialized_patches},
             {"module_replacement", "inner_wrapper"},
+        )
+
+    def test_recorded_wrapper_accepts_replacement_component_mutation_surface(self):
+        """A generated replacement can expose the native wrapper binding surface."""
+        component_type = type("GQAAttention", (), {})
+        patches = SimpleNamespace(
+            local_computes=(),
+            module_replacements=(SimpleNamespace(
+                module_fqn="model.layers.0.self_attn",
+                replacement_type=component_type,
+            ),),
+            inner_wrappers=(SimpleNamespace(
+                module_fqn="model.layers.0.self_attn",
+                target_fqn="self",
+                target_type=component_type,
+                request=SimpleNamespace(target=component_type()),
+            ),),
+        )
+        meta = SimpleNamespace(_build_patches=patches, materialized_patches=[])
+        source = """
+class GQAAttention:
+    def _forward_impl(self, value):
+        return self.attention_interface(value)
+
+    def forward(self, value):
+        return self._forward_impl(value)
+"""
+
+        _verify_recorded_patch_materialization(source, meta)
+
+        wrapper = next(
+            entry for entry in meta.materialized_patches
+            if entry["kind"] == "inner_wrapper"
+        )
+        self.assertEqual(
+            wrapper["source_form"], "replacement_forward_runtime_binding"
         )
 
     def setUp(self):
