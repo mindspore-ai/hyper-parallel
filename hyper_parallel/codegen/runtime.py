@@ -33,7 +33,7 @@ import functools
 import inspect
 import logging
 import os
-from typing import Any, Optional
+from typing import Any, Callable, Optional, cast
 
 from hyper_parallel.codegen.loader import import_generated_module
 from hyper_parallel.codegen.meta import (
@@ -42,6 +42,7 @@ from hyper_parallel.codegen.meta import (
     meta_to_dict,
     validate_meta_schema,
 )
+from hyper_parallel.codegen.patch_plan import local_compute_binding_name
 # Shared boundary-form classifier (module-level imports are stdlib-only, so
 # this stays importable without torch).  The EP-dependence criterion must be
 # the same one generation used to pick the boundary's forward form: an entry
@@ -1139,6 +1140,11 @@ def _install_runtime_region_forward(
         _wrap_local_region_forward,
     )
 
+    if getattr(module, "_hp_native_local_region_installed", False):
+        raise RuntimeError(
+            "codegen: native local-region forward is already installed on "
+            f"{type(module).__name__}; refusing to wrap it twice"
+        )
     installed = getattr(module, "_hp_boundary", None)
     if installed is None:
         raise RuntimeError(
@@ -1154,6 +1160,7 @@ def _install_runtime_region_forward(
             return _maybe_add_deferred_biases(module, spec, output)
 
         module.forward = runtime_region_forward
+        module._hp_native_local_region_installed = True
         return
     _wrap_local_region_forward(
         module,
@@ -1164,6 +1171,7 @@ def _install_runtime_region_forward(
         validate_mode=False,
         compute_fn=compute_fn,
     )
+    module._hp_native_local_region_installed = True
 
 
 def hp_bind_compute(
@@ -1209,10 +1217,6 @@ def hp_bind_compute(
         _resolve_local_compute_fn,
     )
     from hyper_parallel.distributed._builder.parameter_sharding import _resolve_module
-    from hyper_parallel.codegen.patch_plan import (  # pylint: disable=import-outside-toplevel
-        local_compute_binding_name,
-    )
-
     dense_mesh, _, expert_mesh, active_dim_names = (
         _resolve_runtime_meshes(mesh_context, mesh_dim_names)
     )
@@ -1222,16 +1226,46 @@ def hp_bind_compute(
         )
     if not injections:
         return
-    # Builder-recorded forward patches on imported-subtree hosts are bound by
-    # the generated module's explicit FQN binder — no type lookup here.
-    recorded_binder = getattr(generated_module, "hp_bind_recorded_forwards", None)
-    if recorded_binder is not None:
-        recorded_binder(model)
-    materialized_fqns = {
+    native_phase_c_fqns = {
         patch.get("fqn")
         for patch in materialized_patches or ()
-        if patch.get("kind") == "local_compute" and patch.get("fqn")
+        if patch.get("kind") == "local_compute"
+        and patch.get("source_form") == "native_phase_c"
+        and patch.get("fqn")
     }
+    declaration_fn = cast(
+        Optional[Callable[[], Any]],
+        getattr(generated_module, "hp_recorded_local_compute_patches", None),
+    )
+    if declaration_fn is not None and not callable(declaration_fn):
+        raise RuntimeError(
+            "codegen: hp_recorded_local_compute_patches is not callable; "
+            "regenerate the artifact"
+        )
+    declarations = (
+        tuple(_invoke_patch_declaration(cast(Callable[[], Any], declaration_fn)))
+        if declaration_fn is not None else ()
+    )
+    if any(not isinstance(patch, dict) for patch in declarations):
+        raise RuntimeError(
+            "codegen: local-compute declarations must be dictionaries; "
+            "regenerate the artifact"
+        )
+    declared_by_fqn = {
+        patch.get("module_fqn"): patch
+        for patch in declarations if patch.get("module_fqn")
+    }
+    if len(declared_by_fqn) != len(declarations):
+        raise RuntimeError(
+            "codegen: local-compute declarations contain a missing or duplicate "
+            "module_fqn; regenerate the artifact"
+        )
+    declared_fqns = set(declared_by_fqn)
+    if native_phase_c_fqns != declared_fqns:
+        raise RuntimeError(
+            "codegen: generated local-compute declarations do not match meta; "
+            "regenerate the artifact"
+        )
     for rule in injections:
         if rule.get("local_compute_fn") is None:
             continue
@@ -1241,16 +1275,32 @@ def hp_bind_compute(
                 f"hp_bind_compute: injection rule {rule!r} has no 'match' FQN"
             )
         entry = (param_plan or {}).get(fqn, {})
+        if fqn in native_phase_c_fqns:
+            declaration = declared_by_fqn[fqn]
+            if (
+                declaration.get("target") != rule["local_compute_fn"]
+                or declaration.get("region_dispatch") != entry.get("region_dispatch")
+            ):
+                raise RuntimeError(
+                    "codegen: generated local-compute declaration drifted from "
+                    f"meta for {fqn!r}; regenerate the artifact"
+                )
         spec = _FrozenBoundarySpec(entry, rule)
         module = _resolve_module(model, fqn)
         compute_fn = _resolve_local_compute_fn(
             module, spec, dense_mesh, active_dim_names, expert_mesh)
+        source_uses_native_phase_c = fqn in native_phase_c_fqns
         # External-state inline modules (e.g. Qwen3MoeSparseMoeBlock) carry an
         # inlined forward and must not receive a named compute binding, but the local
         # compute factory above still has to run: it installs companion state
         # such as ``experts.local_expert_count`` and the bound experts.forward
         # that the inlined forward relies on.
         if _is_external_state_inline_module(module, generated_module):
+            if source_uses_native_phase_c:
+                raise RuntimeError(
+                    "codegen: a recorded native Phase C patch cannot also own "
+                    f"an inline forward: {fqn!r}"
+                )
             continue
         # _resolve_local_compute_fn returns module.forward for the
         # region_dispatch=False gate; that path is not a bound compute (the
@@ -1258,14 +1308,17 @@ def hp_bind_compute(
         # bound as a generated-model compute attribute.
         if compute_fn is None or compute_fn is module.forward:
             continue
-        source_owns_forward = fqn in materialized_fqns
         has_lowered_forward = _has_lowered_forward(module, generated_module)
-        if source_owns_forward and not has_lowered_forward:
-            raise RuntimeError(
-                "codegen: generated source declares a materialized local-compute "
-                f"patch for {fqn!r}, but the constructed module has no lowered "
-                "forward; regenerate the artifact instead of applying the patch twice"
+        if source_uses_native_phase_c:
+            if has_lowered_forward:
+                raise RuntimeError(
+                    "codegen: a native Phase C local-compute patch still has a "
+                    f"source-lowered forward: {fqn!r}; regenerate the artifact"
+                )
+            _install_runtime_region_forward(
+                module, spec, compute_fn, dense_mesh, active_dim_names
             )
+            continue
         if has_lowered_forward:
             binding_name = local_compute_binding_name(rule["local_compute_fn"])
             setattr(module, binding_name, compute_fn)
@@ -1277,6 +1330,11 @@ def hp_bind_compute(
         _install_runtime_region_forward(
             module, spec, compute_fn, dense_mesh, active_dim_names
         )
+
+
+def _invoke_patch_declaration(declaration_fn: Callable[[], Any]) -> Any:
+    """Invoke a generated declaration after its callable boundary check."""
+    return declaration_fn()
 
 
 def hp_apply_inner_wrapper(

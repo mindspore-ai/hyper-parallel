@@ -18,10 +18,9 @@ import ast
 from copy import deepcopy
 import importlib.util
 from pathlib import Path
-import sys
 from tempfile import TemporaryDirectory
 import types
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -177,8 +176,8 @@ class TestInlineAdapters(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "model.layers.0.mlp"):
             _verify_recorded_patch_materialization(SOURCE, meta)
 
-    def test_recorded_local_compute_accepts_explicit_generated_forward(self):
-        """The audit accepts a source forward that calls the bound compute."""
+    def test_recorded_local_compute_rejects_handwritten_generated_forward(self):
+        """A handwritten equivalent forward is not a native Phase C patch."""
         record = SimpleNamespace(
             module_fqn="model.layers.0.mlp",
             module_type=type("ExternalMoe", (), {}),
@@ -195,7 +194,8 @@ class ExternalMoe:
     def forward(self, hidden_states):
         return self.compute(hidden_states)
 """
-        _verify_recorded_patch_materialization(source, meta)
+        with self.assertRaisesRegex(RuntimeError, record.module_fqn):
+            _verify_recorded_patch_materialization(source, meta)
 
     def test_recorded_local_compute_restores_compiled_boundary_ownership(self):
         """A recorded region must not retain generic external-state ownership."""
@@ -234,13 +234,15 @@ class RecordedMoe:
 
         rendered = materialize_recorded_forwards(source, meta)
 
-        self.assertIn("self._hp_boundary.redistribute_inputs", rendered)
+        self.assertIn("def hp_recorded_local_compute_patches", rendered)
+        self.assertNotIn("self._hp_boundary.redistribute_inputs", rendered)
         self.assertTrue(meta.param_plan[record.module_fqn]["is_boundary"])
+        self.assertTrue(meta.param_plan[record.module_fqn]["skip_source_lowering"])
         self.assertEqual(meta.boundary_classes, {record.module_fqn: "RecordedMoe"})
         self.assertEqual(meta.external_state_classes, [])
 
-    def test_recorded_module_function_materializes_region_forward(self):
-        """An instance-bound source function becomes impl plus EP boundary."""
+    def test_recorded_module_function_declares_native_phase_c_patch(self):
+        """An instance-bound source function remains untouched for native Phase C."""
         def source_forward(self, hidden_states):
             return hidden_states
 
@@ -281,12 +283,12 @@ class Model:
 """
         rendered = materialize_recorded_forwards(source, meta)
         ast.parse(rendered)
-        self.assertIn("def source_forward_hp_impl", rendered)
-        self.assertIn("self.compute", rendered)
-        self.assertIn("self.layer._forward_impl = MethodType", rendered)
+        self.assertNotIn("def source_forward_hp_impl", rendered)
+        self.assertIn("'module_fqn': 'model.layers.0.mlp'", rendered)
+        self.assertIn("'target': 'example.compute'", rendered)
 
-    def test_recorded_imported_subtree_host_emits_explicit_fqn_bindings(self):
-        """An imported host with no constructor call binds by recorded FQN."""
+    def test_recorded_imported_subtree_host_declares_explicit_native_patch(self):
+        """An imported host records its FQN and complete factory configuration."""
         class ExternalMoe:
             def forward(self, hidden_states):
                 return hidden_states
@@ -330,24 +332,10 @@ class OuterModel:
         rendered = materialize_recorded_forwards(source, meta)
 
         ast.parse(rendered)
-        # The host import is emitted from the recorded class, never assumed.
-        self.assertIn("import ExternalMoe", rendered)
-        self.assertIn("class HPCodegenExternalMoe(ExternalMoe)", rendered)
-        # The insertion must not steal the first class's decorator block.
+        self.assertNotIn("class HPCodegenExternalMoe", rendered)
         self.assertIn("@dataclass\nclass OuterModel", rendered)
-        self.assertNotIn("@dataclass\nclass HPCodegenExternalMoe", rendered)
-        # One explicit binding per recorded FQN — no type registry.
-        self.assertIn("def hp_bind_recorded_forwards(model):", rendered)
-        self.assertIn(
-            "module = model.model.language_model.layers[1].mlp", rendered)
-        self.assertIn(
-            "module._forward_impl = MethodType("
-            "HPCodegenExternalMoe._forward_impl, module)", rendered)
-        self.assertIn(
-            "module.forward = MethodType(HPCodegenExternalMoe.forward, module)",
-            rendered)
-        self.assertIn("from types import MethodType", rendered)
-        self.assertNotIn("_HP_RECORDED_FORWARD_TYPES", rendered)
+        self.assertIn("def hp_recorded_local_compute_patches", rendered)
+        self.assertIn(f"'module_fqn': '{record.module_fqn}'", rendered)
         # The four EP factory parameters keep their resolved values — the
         # builder's actual local-compute config, never a YAML re-read.
         for name, value in (
@@ -355,8 +343,8 @@ class OuterModel:
                 ("overlap_shared_expert", "True"), ("capacity_factor", "None")):
             self.assertIn(f"'{name}': {value}", rendered)
 
-    def test_recorded_imported_subtree_multi_layer_bindings_are_explicit(self):
-        """Each recorded MoE layer becomes its own explicit binding target."""
+    def test_recorded_imported_subtree_multi_layer_declarations_are_explicit(self):
+        """Each recorded MoE layer becomes its own ordered native patch declaration."""
         class ExternalMoe:
             def forward(self, hidden_states):
                 return hidden_states
@@ -403,21 +391,10 @@ class OuterModel:
         rendered = materialize_recorded_forwards(source, meta)
 
         ast.parse(rendered)
-        # One subclass and one binder carry every recorded layer explicitly.
         self.assertEqual(
-            rendered.count("class HPCodegenExternalMoe(ExternalMoe)"), 1)
-        self.assertEqual(
-            rendered.count("def hp_bind_recorded_forwards(model):"), 1)
-        self.assertEqual(
-            rendered.count(
-                "module.forward = MethodType(HPCodegenExternalMoe.forward, module)"
-            ),
-            len(fqns),
-        )
-        # Recorded layer paths appear in numeric order, keeping the binder
-        # reviewable (a lexical sort would render layers.10 before layers.2).
+            rendered.count("def hp_recorded_local_compute_patches"), 1)
         positions = [
-            rendered.index(f"module = model.model.language_model.layers[{index}].mlp")
+            rendered.index(f"'module_fqn': 'model.language_model.layers.{index}.mlp'")
             for index in layer_indices
         ]
         self.assertEqual(positions, sorted(positions))
@@ -428,18 +405,12 @@ class OuterModel:
             sorted(fqns),
         )
 
-    def test_recorded_binder_binds_matching_model_and_fails_on_missing_fqn(self):
-        """The explicit binder resolves real paths and raises on absent FQNs."""
-        host_module = types.ModuleType("hp_recorded_binder_host")
-        sys.modules[host_module.__name__] = host_module
-        self.addCleanup(sys.modules.pop, host_module.__name__, None)
-
+    def test_recorded_declaration_is_executable_and_preserves_target(self):
+        """The generated declaration is executable and preserves its target."""
         class ExternalMoe:
             def forward(self, hidden_states):
                 return hidden_states
 
-        ExternalMoe.__module__ = host_module.__name__
-        host_module.ExternalMoe = ExternalMoe
         record = SimpleNamespace(
             module_fqn="model.language_model.layers.1.mlp",
             module_type=ExternalMoe,
@@ -471,36 +442,13 @@ class OuterModel:
 
         rendered = materialize_recorded_forwards(source, meta)
         namespace = _execute_source(rendered)
-        binder = namespace["hp_bind_recorded_forwards"]
+        declarations = namespace["hp_recorded_local_compute_patches"]()
+        self.assertEqual(declarations[0]["module_fqn"], record.module_fqn)
+        self.assertEqual(
+            declarations[0]["target"], {"_target_": "example.compute"})
 
-        # A model matching the recorded FQN gets both MethodType bindings.
-        good_model = SimpleNamespace(
-            model=SimpleNamespace(
-                language_model=SimpleNamespace(
-                    layers=[None, SimpleNamespace(mlp=SimpleNamespace())]
-                )
-            )
-        )
-        binder(good_model)
-        mlp = good_model.model.language_model.layers[1].mlp
-        self.assertIsInstance(mlp.forward, MethodType)
-        self.assertIsInstance(mlp._forward_impl, MethodType)
-        self.assertIs(
-            mlp.forward.__func__, namespace["HPCodegenExternalMoe"].forward)
-        self.assertIsNot(mlp.forward.__func__, ExternalMoe.forward)
-        # A missing recorded path must fail loudly, never silently skip.
-        bad_model = SimpleNamespace(model=SimpleNamespace())
-        with self.assertRaises(AttributeError):
-            binder(bad_model)
-
-    def test_recorded_host_with_digit_leading_module_imports_via_importlib(self):
-        """An identifier-unsafe host module imports through a string literal.
-
-        HF remote-code cache hashes can start with a digit
-        (``transformers_modules.kimi_k3.7dc8....modeling_kimi_linear``); a
-        ``from`` statement over that path is a syntax error, so the host must
-        be bound through ``importlib.import_module`` instead.
-        """
+    def test_recorded_host_needs_no_import_for_native_phase_c(self):
+        """A native Phase C declaration does not import or subclass its host."""
         class ExternalMoe:
             def forward(self, hidden_states):
                 return hidden_states
@@ -541,20 +489,13 @@ class OuterModel:
         ast.parse(rendered)
         self.assertNotIn(
             "from transformers_modules.kimi_k3.7dc8", rendered)
-        self.assertIn("import importlib as _hp_importlib", rendered)
-        self.assertIn(
-            'ExternalMoe = getattr(_hp_importlib.import_module('
-            '"transformers_modules.kimi_k3.7dc8cececbd11535.modeling_kimi_linear"'
-            '), "ExternalMoe")',
-            rendered,
-        )
-        self.assertIn("class HPCodegenExternalMoe(ExternalMoe)", rendered)
+        self.assertNotIn("import importlib as _hp_importlib", rendered)
+        self.assertNotIn("class HPCodegenExternalMoe", rendered)
+        self.assertIn(f"'module_fqn': '{record.module_fqn}'", rendered)
 
-    def test_hp_bind_compute_delegates_to_recorded_binder_without_type_scan(self):
-        """The runtime binds recorded hosts through the generated binder only."""
+    def test_hp_bind_compute_accepts_empty_native_declaration_set(self):
+        """Rules without local compute require no generated declaration."""
         from hyper_parallel.codegen import runtime as codegen_runtime
-
-        bound = []
 
         class NoScanModel:
             """A model whose module tree must never be walked by type."""
@@ -564,9 +505,8 @@ class OuterModel:
                     "hp_bind_compute must not scan model.modules() by type"
                 )
 
-        model = NoScanModel()
         generated_module = SimpleNamespace(
-            hp_bind_recorded_forwards=lambda target: bound.append(target)
+            hp_recorded_local_compute_patches=lambda: ()
         )
         injections = [{"match": "model.language_model.layers.1.mlp"}]
         with patch.object(
@@ -574,14 +514,8 @@ class OuterModel:
             return_value=(object(), object(), object(), ()),
         ):
             codegen_runtime.hp_bind_compute(
-                model, injections, mesh_context=None,
-                generated_module=generated_module,
-            )
-            self.assertEqual(bound, [model])
-            # Without a binder the per-rule loop is a no-op — no type lookup.
-            codegen_runtime.hp_bind_compute(
                 NoScanModel(), injections, mesh_context=None,
-                generated_module=None,
+                generated_module=generated_module,
             )
 
     def test_hp_bind_compute_uses_explicit_factory_name(self):
@@ -621,8 +555,8 @@ class OuterModel:
         self.assertIs(module.deepseek_ep_compute_fn, compute)
         self.assertFalse(hasattr(module, "__hp_compute__"))
 
-    def test_hp_bind_compute_rejects_missing_materialized_forward(self):
-        """A source-owned patch must never fall back to runtime re-patching."""
+    def test_hp_bind_compute_installs_recorded_native_phase_c_forward(self):
+        """A recorded patch uses the trainer's native local-region wrapper."""
         from hyper_parallel.codegen import runtime as codegen_runtime
 
         module = SimpleNamespace(forward=lambda: None)
@@ -638,8 +572,14 @@ class OuterModel:
             "fqn": "model.layers.0.mlp",
             "kind": "local_compute",
             "host_class": "ExternalMoe",
-            "source_form": "module_forward",
+            "source_form": "native_phase_c",
         }]
+        generated_module = SimpleNamespace(
+            hp_recorded_local_compute_patches=lambda: ({
+                "module_fqn": "model.layers.0.mlp",
+                "target": {"_target_": "example.deepseek_ep_compute_fn"},
+            },)
+        )
         with patch.object(
             codegen_runtime, "_resolve_runtime_meshes",
             return_value=(object(), object(), object(), ()),
@@ -653,12 +593,50 @@ class OuterModel:
         ), patch(
             "hyper_parallel.distributed._builder.parameter_sharding._resolve_module",
             return_value=module,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "regenerate the artifact"):
-                codegen_runtime.hp_bind_compute(
-                    SimpleNamespace(), injections, mesh_context=None,
-                    materialized_patches=materialized,
-                )
+        ), patch.object(
+            codegen_runtime, "_install_runtime_region_forward"
+        ) as install:
+            codegen_runtime.hp_bind_compute(
+                SimpleNamespace(), injections, mesh_context=None,
+                generated_module=generated_module,
+                materialized_patches=materialized,
+            )
+        install.assert_called_once()
+
+    def test_runtime_region_forward_uses_native_wrapper_once(self):
+        """Codegen delegates to trainer Phase C and rejects a second install."""
+        from hyper_parallel.codegen import runtime as codegen_runtime
+
+        boundary = object()
+        module = SimpleNamespace(
+            forward=lambda value: value,
+            _hp_boundary=SimpleNamespace(noop=False, _boundary=boundary),
+        )
+        spec = SimpleNamespace()
+        compute = lambda value: value
+
+        with patch(
+            "hyper_parallel.distributed._builder.forward_rewriter."
+            "_wrap_local_region_forward"
+        ) as native_wrapper:
+            codegen_runtime._install_runtime_region_forward(
+                module, spec, compute, mesh="mesh", mesh_dim_names=("tp",)
+            )
+
+        native_wrapper.assert_called_once_with(
+            module,
+            boundary,
+            spec,
+            "mesh",
+            ("tp",),
+            validate_mode=False,
+            compute_fn=compute,
+        )
+        self.assertTrue(module._hp_native_local_region_installed)
+        with self.assertRaisesRegex(RuntimeError, "refusing to wrap it twice"):
+            codegen_runtime._install_runtime_region_forward(
+                module, spec, compute, mesh="mesh", mesh_dim_names=("tp",)
+            )
 
     def test_recorded_imported_subtree_binding_passes_materialization_audit(self):
         """The audit sees the runtime-bound form and keeps the FQN binding."""
@@ -701,13 +679,13 @@ class OuterModel:
         _verify_recorded_patch_materialization(rendered, meta)
         self.assertEqual(meta.materialized_patches, [{
             "fqn": record.module_fqn,
-            "host_class": "HPCodegenExternalMoe",
+            "host_class": "ExternalMoe",
             "kind": "local_compute",
-            "source_form": "subclass_fqn_binding",
+            "source_form": "native_phase_c",
         }])
-        # A materialization without the explicit FQN binding must fail fast.
+        # A declaration without the recorded FQN must fail fast.
         broken = rendered.replace(
-            "module = model.model.language_model.layers[1].mlp", "module = model")
+            record.module_fqn, "model.language_model.layers.9.mlp")
         with self.assertRaisesRegex(RuntimeError, record.module_fqn):
             _verify_recorded_patch_materialization(broken, meta)
 
@@ -749,11 +727,11 @@ class HostContainer:
 
         rendered = materialize_recorded_forwards(source, meta)
 
-        self.assertIn("self.moe = HPCodegenExternalMoe()", rendered)
+        self.assertIn("self.moe = ExternalMoe()", rendered)
         self.assertNotIn("hp_bind_recorded_forwards", rendered)
         _verify_recorded_patch_materialization(rendered, meta)
         self.assertEqual(
-            meta.materialized_patches[0]["source_form"], "subclass_forward")
+            meta.materialized_patches[0]["source_form"], "native_phase_c")
 
     def test_recorded_patch_audit_covers_replacement_and_inner_wrapper(self):
         """The audit manifest includes every builder-recorded patch kind."""

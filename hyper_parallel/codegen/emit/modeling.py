@@ -36,8 +36,6 @@ import os
 import tokenize
 from typing import Any
 
-from hyper_parallel.codegen.patch_plan import local_compute_binding_name
-
 # ---------------------------------------------------------------------------
 # source copy
 # ---------------------------------------------------------------------------
@@ -295,8 +293,6 @@ def _verify_recorded_patch_materialization(
     )
     if not local_records and not replacement_records and not wrapper_records:
         return
-    from hyper_parallel.codegen.emit.recorded import _fqn_accessor
-
     tree = ast.parse(text)
     classes = {
         node.name: node
@@ -307,79 +303,30 @@ def _verify_recorded_patch_materialization(
     materialized = getattr(meta, "materialized_patches", None)
     if isinstance(materialized, list):
         materialized.clear()
+    declaration_fn = next(
+        (
+            node for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "hp_recorded_local_compute_patches"
+        ),
+        None,
+    )
+    declared_strings = {
+        node.value
+        for node in ast.walk(declaration_fn) if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+    } if declaration_fn is not None else set()
     for record in local_records:
         class_name = record.module_type.__name__
-        generated_class_name = f"HPCodegen{class_name}"
-        class_node = classes.get(generated_class_name) or classes.get(class_name)
-        forward = (
-            next(
-                (
-                    node
-                    for node in class_node.body
-                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and node.name == "forward"
-                ),
-                None,
-            )
-            if class_node is not None
-            else None
-        )
-        recorded_original = getattr(record, "original_forward", None)
-        original = getattr(recorded_original, "__func__", recorded_original)
-        source_name = getattr(original, "__qualname__", "")
-        if "." not in source_name:
-            forward = next(
-                (
-                    node for node in tree.body
-                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and node.name == source_name
-                ),
-                forward,
-            )
-        if getattr(record, "factory", True) is not None:
-            injection = next(
-                item
-                for item in (getattr(meta, "injections", None) or ())
-                if item.get("match") == record.module_fqn
-            )
-            required_attr = local_compute_binding_name(
-                injection["local_compute_fn"]
-            )
-        else:
-            required_attr = "_forward_impl"
-        is_materialized = forward is not None and any(
-            isinstance(node, ast.Attribute) and node.attr == required_attr
-            for node in ast.walk(forward)
-        )
-        # An imported host (its class is not defined in this file) reaches its
-        # instances only through the construction sites: either the source
-        # calls were retargeted to the generated subclass, or the explicit FQN
-        # binder must reference this record's module path.
-        runtime_bound = False
-        if class_node is not None and class_name not in classes:
-            retargeted = any(
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == generated_class_name
-                for node in ast.walk(tree)
-            )
-            runtime_bound = not retargeted
-            if not retargeted and _fqn_accessor(record.module_fqn) not in text:
-                is_materialized = False
+        is_materialized = record.module_fqn in declared_strings
         if not is_materialized:
             missing.append(f"{record.module_fqn} ({class_name})")
         elif isinstance(materialized, list):
-            if "." not in source_name:
-                source_form = "module_forward"
-            elif runtime_bound:
-                source_form = "subclass_fqn_binding"
-            else:
-                source_form = "subclass_forward"
             materialized.append({
                 "fqn": record.module_fqn,
-                "host_class": class_node.name if class_node is not None else class_name,
+                "host_class": class_name,
                 "kind": "local_compute",
-                "source_form": source_form,
+                "source_form": "native_phase_c",
             })
     bound_names = {
         node.id for node in ast.walk(tree) if isinstance(node, ast.Name)

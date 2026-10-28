@@ -913,7 +913,11 @@ def _build_forward_body(
 
     local = injection.get("local_compute_fn") if injection else None
     if local is not None:
-        return _render_local_compute(local, input_redist, out_redist, form)
+        raise RuntimeError(
+            "codegen: local_compute_fn reached source boundary lowering; "
+            "builder recording must mark it skip_source_lowering so runtime "
+            "can install the trainer's native Phase C wrapper"
+        )
     # A generic boundary (including an inner-wrapper one — the CP wrapper is
     # installed at runtime by ``hp_apply_inner_wrapper`` and weaves into
     # this forward) redistributes through the compiled plan, annotated with
