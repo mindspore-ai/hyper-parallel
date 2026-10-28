@@ -882,10 +882,9 @@ class GQAAttention:
         self.assertIs(
             legacy, replacement_spec(ATTENTION, "Qwen3MoeForCausalLM", module_type=ATTENTION_TYPE)
         )
-        # The capability spec carries no block class: the concrete class is a
-        # per-model fact derived from the frozen boundary map.
-        self.assertIsNone(strategy_spec(EP).target_class)
-        self.assertIsNotNone(strategy_spec(EP).body_template)
+        # EP forward ownership comes from the native Phase C recorder; the
+        # inline declaration layer must not infer another implementation.
+        self.assertIsNone(strategy_spec(EP))
         # A CP wrapper is a strategy *because of its position* in the override
         # (``inner_wrapper``); the same target as a local compute fn is not one.
         self.assertIsNone(strategy_spec(CP))
@@ -960,35 +959,6 @@ class GQAAttention:
         self.assertEqual(patches.forward_extracts, [])
         with self.assertRaisesRegex(RuntimeError, "matched no boundary"):
             build_strategy_patches(rules[:1], "deepseek_v32", {"model.layers.0.mlp": "MLP"})
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-              card_mark="onecard", essential_mark="unessential")
-    def test_one_strategy_target_materializes_across_distinct_hosts(self):
-        """One EP target serving dense and MoE layers materializes both.
-
-        Feature: structure-driven inline source generation.
-        Description: Rules sharing one strategy target may select different
-            host classes — one EP compute target serving both dense-MLP and
-            MoE layers — so every rule derives its hosts and the per-class
-            bookkeeping keeps one forward extract per host.
-        Expectation: three rules over two distinct hosts emit two extracts,
-            and a rule re-selecting an emitted host adds no third.
-        """
-        rules = (
-            InlineRule(("model.layers.3.mlp",), local_compute_target=EP),
-            InlineRule(("model.layers.1.mlp",), local_compute_target=EP),
-            InlineRule(("model.layers.7.mlp",), local_compute_target=EP),
-        )
-        boundary = {
-            "model.layers.3.mlp": "Qwen3MoeSparseMoeBlock",
-            "model.layers.1.mlp": "DenseMLP",
-            "model.layers.7.mlp": "DenseMLP",
-        }
-        patches = build_strategy_patches(rules, "qwen3_moe", boundary)
-        self.assertEqual(
-            sorted(extract.class_name for extract in patches.forward_extracts),
-            ["DenseMLP", "Qwen3MoeSparseMoeBlock"],
-        )
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
               card_mark="onecard", essential_mark="unessential")
@@ -1192,154 +1162,6 @@ class Layer:
         self.assertEqual(len(rules), 5)
         self.assertEqual(patches.module_snippets, [snippet])
         self.assertEqual(len(patches.forward_extracts), 1)
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-              card_mark="onecard", essential_mark="unessential")
-    def test_qwen_metadata_and_source_remain_compatible(self):
-        """QKV expansion is scoped, independent and stable across re-emission.
-
-        Feature: structure-driven inline source generation.
-        Description: QKV expansion is scoped, independent and stable across re-emission.
-        Expectation: the emitted artifact and metadata satisfy the assertions in this test.
-        """
-        source = """
-class Qwen3MoeAttention:
-    def forward(self, value):
-        return value
-
-class Qwen3MoeSparseMoeBlock:
-    def forward(self, hidden_states):
-        return hidden_states
-
-class Model:
-    def __init__(self):
-        self.attn = Qwen3MoeAttention()
-"""
-        meta = _meta(
-            injections=[
-                {"match": "blocks.0.mlp", "local_compute_fn": EP},
-                {"match": "blocks.0.attn", "inner_wrapper": CP},
-            ],
-            module_type="transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention",
-            fqns=("blocks.0.attn",),
-        )
-        meta.boundary_classes = {
-            "blocks.0.attn": "Qwen3MoeAttention",
-            "blocks.0.mlp": "Qwen3MoeSparseMoeBlock",
-        }
-        expected_meta = deepcopy(meta)
-        inferred = render_inline_modeling(source, meta)
-        explicit = render_inline_modeling(source, expected_meta, "qwen3_moe")
-        self.assertEqual(inferred, explicit)
-        self.assertEqual(vars(meta), vars(expected_meta))
-        self.assertIn("class GQAAttention", explicit)
-        self.assertIn("def _forward_impl", explicit)
-        # The removed module-level parallel-state accessor must be gone
-        # everywhere: the inlined attention forward and the EP shell read the
-        # instance channel the runtime binds at install time.
-        self.assertNotIn("get_parallel_state", explicit)
-        self.assertNotIn(
-            "get_parallel_state", strategy_spec(EP, "qwen3_moe").body_template
-        )
-        # S4: the decoder-layer call wraps the source attention module with the
-        # generated class's keyword-only ctor (matching the real component /
-        # runtime replacement), so the source class is kept as the wrapper input.
-        self.assertNotIn("self.attn = GQAAttention()", explicit)
-        self.assertIn(
-            "GQAAttention(module=Qwen3MoeAttention(), module_fqn='', context=None, "
-            "attention_interface=run_qwen3_moe_flash_attention)",
-            explicit,
-        )
-        self.assertIn("class Qwen3MoeAttention", explicit)
-        # S4: the attention class is generated from the real component — the
-        # kernel entry is inlined and the construction keeps the fused QKV
-        # layout (no independent q/k/v projection).
-        self.assertIn("def run_qwen3_moe_flash_attention", explicit)
-        self.assertIn("torch_npu.npu_fusion_attention", explicit)
-        self.assertIn("self.linear_qkv", explicit)
-        self.assertIn("InterleaveQKV", explicit)
-        self.assertNotIn("self.q_proj =", explicit)
-        ast.parse(explicit)
-        # The generated class name comes from the factory's component, not a table.
-        self.assertIn(f"class {interface_component_class('qwen3_moe')}", explicit)
-        # The fused GQA model exposes the real param ``linear_qkv`` (not the
-        # source q/k/v), so the frozen plan anchors on it; checkpoint loading
-        # maps source q/k/v into it via make_transforms.
-        params = meta.param_plan["blocks.0.proj"]["params"]
-        self.assertEqual(set(params), {"linear_qkv.weight"})
-        self.assertEqual(meta.frozen_sharded_params, [
-            "blocks.0.proj.linear_qkv.weight", "embedding.weight",
-        ])
-        self.assertEqual(render_inline_modeling(source, meta, "qwen3_moe"), explicit)
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-              card_mark="onecard", essential_mark="unessential")
-    def test_rendered_component_boundary_is_emitted_while_the_ep_shell_stays_inline(self):
-        """Only the class whose forward an inline body replaced is stripped.
-
-        Feature: structure-driven inline source generation.
-        Description: The rendered component class (the fused attention) is not
-            an external-state class, so ``normalize_inline_meta`` keeps its
-            boundary entry and the lowerer rewrites its forward into the
-            emitted boundary form around ``_forward_impl``.  The EP shell, whose
-            forward the inline strategy body replaced, is still stripped and
-            keeps that body verbatim.
-        Expectation: The emitted file carries exactly one boundary rewrite (the
-            rendered component's) plus the shell's intact inline orchestration.
-        """
-        source = """
-class Qwen3MoeAttention:
-    def forward(self, value):
-        return value
-
-class Qwen3MoeSparseMoeBlock:
-    def forward(self, hidden_states):
-        return hidden_states
-
-class Model:
-    def __init__(self):
-        self.attn = Qwen3MoeAttention()
-        self.mlp = Qwen3MoeSparseMoeBlock()
-"""
-        boundary_entry = {
-            "is_boundary": True,
-            "in_src": {"hidden_states": {"tp": "S(1)"}},
-            "in_dst": {"hidden_states": {"tp": "R"}},
-            "out_src": {"output": {"tp": "P(sum)"}},
-            "out_dst": {"output": {"tp": "S(1)"}},
-        }
-        meta = _meta(
-            injections=[
-                {"local_compute_fn": EP, "match": "blocks.0.mlp"},
-                {"inner_wrapper": CP, "match": "blocks.0.attn"},
-            ],
-            module_type=ATTENTION_TYPE,
-            fqns=("blocks.0.attn",),
-        )
-        meta.external_state_classes = ["Qwen3MoeSparseMoeBlock"]
-        meta.boundary_classes = {
-            "blocks.0.attn": "GQAAttention",
-            "blocks.0.mlp": "Qwen3MoeSparseMoeBlock",
-        }
-        meta.param_plan = {
-            "blocks.0.attn": dict(boundary_entry),
-            "blocks.0.mlp": dict(boundary_entry),
-        }
-        meta.mesh_dim_names = ["tp"]
-
-        rendered = render_inline_modeling(source, meta, "qwen3_moe")
-        lowered = lower_forward_boundaries(
-            rendered, meta, boundary_classes=meta.boundary_classes,
-        )
-
-        ast.parse(lowered)
-        # The rendered component carries the emitted boundary form.
-        self.assertEqual(lowered.count("self._hp_boundary.redistribute_inputs"), 1)
-        self.assertIn("class GQAAttention", lowered)
-        self.assertEqual(lowered.count("def _forward_impl"), 2)
-        # The EP shell keeps the inline strategy body (and its own channel).
-        self.assertIn("if not self.ep_enable:", lowered)
-        self.assertIn("moe_ep_forward(", lowered)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
               card_mark="onecard", essential_mark="unessential")

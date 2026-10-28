@@ -28,7 +28,6 @@ from hyper_parallel.codegen.patch_plan import (
     snapshot_modules,
 )
 from hyper_parallel.codegen.spec.types import CodegenSpec, ParallelDimsSpec, SourceSpec
-from hyper_parallel.distributed.apply import apply_forward_patches
 from hyper_parallel.distributed.plan import ShardingPlan
 from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec, local_compute
 from hyper_parallel.trainer.config import PlanOverride, Target
@@ -87,7 +86,7 @@ def test_prepare_codegen_build_uses_builder_replacement_events():
     ), patch(
         "hyper_parallel.models._transformers.model_builder.apply_sharding_plan"
     ) as apply_plan, patch(
-        "hyper_parallel.distributed.apply.apply_forward_patches"
+        "hyper_parallel.codegen.manager._apply_recorded_phase_c"
     ) as apply_phase_c:
         result = manager._prepare_codegen_build(helpers.MetaModel(), config, spec)
 
@@ -143,7 +142,7 @@ def test_offline_phase_c_records_after_installing_local_region_forward():
     assert mesh.get_group() is None
 
     before_phase_c = snapshot_modules(model)
-    apply_forward_patches(model, plan, mesh, validate_mode=True)
+    manager._apply_recorded_phase_c(model, plan, mesh)
     patch_plan = build_patch_emission_plan(
         model,
         plan,

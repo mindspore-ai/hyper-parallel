@@ -93,78 +93,6 @@ def _bundle_files(layout: object) -> dict[str, str]:
     }
 
 
-def test_external_state_classes_travel_from_structure_to_the_runtime() -> None:
-    """The runtime reads the artifact's record, not a hardcoded class list.
-
-    Feature: codegen-external-state
-    Description: ``meta.external_state_classes`` is derived from structure at
-        generation time (the block class of the EP archetypes this plan
-        injects); ``runtime`` records it per generated module and consults that
-        record when deciding whether a generated class's forward was replaced
-        by an inline strategy body.  A rendered component class (the fused
-        attention the family's factories build) keeps the component's own
-        forward plus the emitted boundary form, so it is NOT external state.
-    Expectation: The derived classes are recognised, the rendered component
-        class and an undeclared sibling of the same generated module are not, a
-        same-named class defined outside the generated file is not, an artifact
-        that declares nothing recognises nothing, and a non-list meta value
-        fails schema validation.
-    """
-    # pylint: disable=protected-access
-    meta = _meta()
-    meta.source = {"architecture": "Qwen3MoeForCausalLM"}
-    meta.injections = [
-        {
-            "match": "model.layers.0.mlp",
-            "local_compute_fn": {
-                "_target_": (
-                    "hyper_parallel.models.qwen3_moe.adapter.distributed."
-                    "expert_parallel.qwen3moe_ep_compute_fn"
-                )
-            }
-        }
-    ]
-    # The block class is a per-model fact: it is derived from the frozen
-    # boundary map (FQN -> class), never from a registered literal.
-    meta.boundary_classes = {"model.layers.0.mlp": "Qwen3MoeSparseMoeBlock"}
-    manager._record_inline_declarations(meta)
-    assert meta.external_state_classes == ["Qwen3MoeSparseMoeBlock"]
-
-    generated = types.ModuleType("hyper_parallel_generated.external_state")
-    declared = type("Qwen3MoeSparseMoeBlock", (), {"__module__": generated.__name__})
-    sibling = type("UndeclaredBlock", (), {"__module__": generated.__name__})
-    rendered = type("GQAAttention", (), {"__module__": generated.__name__})
-    foreign = type(
-        "Qwen3MoeSparseMoeBlock",
-        (),
-        {"__module__": "transformers.models.qwen3_moe.modeling_qwen3_moe"},
-    )
-
-    runtime.register_external_state_classes(generated, meta.external_state_classes)
-    assert runtime._is_external_state_inline_module(declared(), generated)
-    # A rendered component keeps its own forward plus a compiled boundary.
-    assert not runtime._is_external_state_inline_module(rendered(), generated)
-    assert not runtime._is_external_state_inline_module(sibling(), generated)
-    # A same-named class defined outside the generated file is never external.
-    assert not runtime._is_external_state_inline_module(foreign(), generated)
-
-    untouched = types.ModuleType("hyper_parallel_generated.undeclared")
-    runtime.register_external_state_classes(untouched, [])
-    scoped = type("Qwen3MoeSparseMoeBlock", (), {"__module__": untouched.__name__})
-    assert not runtime._is_external_state_inline_module(scoped(), untouched)
-
-    with pytest.raises(TypeError):
-        validate_meta_schema(
-            {
-                "codegen_version": "3",
-                "signature": "sig",
-                "yaml_path": "train.yaml",
-                "yaml_sha256": "yaml-sha",
-                "external_state_classes": {"Qwen3MoeSparseMoeBlock": True},
-            }
-        )
-
-
 def test_artifact_layout_uses_example_generated_dir_and_safe_model_name(
     tmp_path: Path,
 ) -> None:
@@ -662,7 +590,6 @@ def test_generate_path_crosses_rendezvous_barrier(
     barriers = _patch_entry_dependencies(monkeypatch, layout, meta_signature="sig-old")
     monkeypatch.setattr(manager, "_build_meta", lambda *_args, **_kwargs: _meta("sig-new"))
     monkeypatch.setattr(manager, "_fill_plan_fields", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(manager, "_record_inline_declarations", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(manager, "emit_bundle", lambda *_args, **_kwargs: {"f.py": "x"})
     monkeypatch.setattr(manager, "write_bundle_atomic", lambda *_args, **_kwargs: None)
 

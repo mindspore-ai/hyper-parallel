@@ -208,27 +208,6 @@ def _factory_arguments(
     return tuple(arguments)
 
 
-def archetype_for_factory(factory_path: str | None) -> Any | None:
-    """Reverse-lookup a MoE archetype by its compute-factory ``_target_``.
-
-    A YAML ``local_compute_fn._target_`` that names a known archetype factory
-    resolves to that archetype: the strategy kind / boundary sub-patterns /
-    EP body keys are then structural, not declared per family. The concrete
-    block class is not part of the archetype — it is derived per artifact
-    from the frozen boundary map.
-    """
-    if not factory_path:
-        return None
-    from hyper_parallel.distributed.expert_parallel.archetypes import (  # pylint: disable=C0415
-        moe_archetypes,
-    )
-
-    for archetype in moe_archetypes().values():
-        if archetype.compute_factory == factory_path:
-            return archetype
-    return None
-
-
 def inner_wrapper_target(factory_path: str | None) -> InnerWrapperTarget | None:
     """Recover an inner wrapper's emitted helper contract from its source."""
     if not factory_path:
@@ -327,7 +306,6 @@ __all__ = [
     "ReplacementArgument",
     "ReplacementTarget",
     "adapter_path_parts",
-    "archetype_for_factory",
     "class_name_of",
     "family_from_target",
     "inner_wrapper_target",

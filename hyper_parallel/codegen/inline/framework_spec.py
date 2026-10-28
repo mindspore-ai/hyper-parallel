@@ -26,9 +26,6 @@ providers* plus the frozen plan, never from a family-name dispatch table:
   directly (under ``hyper_parallel.components.``) resolves through that
   component's own wrap-style constructor -- the same declaration the native
   ``_target_replacement_factory`` builds, so no family factory is required;
-* a YAML ``local_compute_fn._target_`` that names a known MoE archetype
-  factory resolves to that archetype's strategy kind / target class / boundary
-  sub-patterns / EP body keys;
 * a CP ``inner_wrapper`` target under the ``models/<family>/adapter``
   convention resolves to the framework CP attention strategy — imports
   and a recognizable inner forward rewrite additionally materializes an
@@ -58,7 +55,6 @@ from hyper_parallel.codegen.inline.recognition import (
     ReplacementArgument,
     ReplacementTarget,
     adapter_path_parts,
-    archetype_for_factory,
     class_name_of,
     family_from_target,
     inner_wrapper_target,
@@ -68,11 +64,6 @@ from hyper_parallel.codegen.inline.spec_bundle import ReplacementSpec, StrategyS
 
 #: The framework CP attention strategy kind (structure-keyed, not family-named).
 CP_ATTENTION_KIND = "cp_attention"
-
-_EP_IMPORTS = (
-    ImportPatch("hyper_parallel.distributed.expert_parallel.experts", ("moe_ep_forward",)),
-)
-
 
 def _target_path(value: Any) -> str | None:
     """Return the dotted ``_target_`` of a projected override value."""
@@ -393,10 +384,10 @@ def strategy_spec_for(
 ) -> StrategySpec | None:
     """Resolve a strategy target from structure.
 
-    A known MoE archetype factory (EP) resolves to its structural strategy; a
-    CP ``inner_wrapper`` target under the adapter convention resolves to the
-    framework CP attention strategy (imports only). Anything else is
-    unresolvable and yields ``None`` — recognition never guesses a strategy.
+    A CP ``inner_wrapper`` target under the adapter convention resolves to the
+    framework CP attention strategy (imports only). EP mutations come from the
+    builder recorder instead of secondary structural inference. Anything else
+    is unresolvable and yields ``None`` — recognition never guesses a strategy.
     """
     if target is None:
         return None
@@ -412,9 +403,6 @@ def strategy_spec_for(
 def _resolve_strategy_spec(
     target: str, model_type: str | None, inner_wrapper: bool
 ) -> StrategySpec | None:
-    archetype = archetype_for_factory(target)
-    if archetype is not None:
-        return _ep_strategy_spec(archetype)
     if inner_wrapper and adapter_path_parts(target):
         return _cp_strategy_spec(target)
     return None
@@ -453,39 +441,13 @@ def _cp_strategy_spec(target: str) -> StrategySpec:
     )
 
 
-def _ep_strategy_spec(archetype: Any) -> StrategySpec:
-    """Build the EP strategy spec: the inlined forward plus its imports.
-
-    The inlined EP forward orchestrates through the instance-attribute channel
-    (``self.ep_enable`` / ``self._hp_ep_group``) like every other generated
-    forward, so it declares no module-level snippet.
-
-    The spec carries no target class on purpose: the MoE block class is a
-    per-model fact, and this spec is cached per capability target. The
-    materialization passes derive the concrete class from the frozen boundary
-    map (match pattern x class name), so a model naming its block anything at
-    all materializes without registration.
-    """
-    from hyper_parallel.codegen.inline.templates import moe_ep_forward_body  # pylint: disable=C0415
-
-    return StrategySpec(
-        kind=archetype.kind,
-        body_template=moe_ep_forward_body(
-            router_kind=archetype.router_kind, shared=archetype.shared
-        ),
-        imports=_EP_IMPORTS,
-        strip_boundary_subpatterns=archetype.strip_boundary_subpatterns,
-    )
-
-
 def interface_component_class(model_type: str | None) -> str | None:
     """The class this family's factories render, because one hands over an interface.
 
     Structural: the component is named by the replacement factory itself, so
     codegen carries no fused-attention class literal.  A rendered component
     keeps the component's own ``forward`` and therefore takes a *compiled
-    boundary* (``hp_install_boundaries``) rather than external state — see
-    :func:`external_state_classes_for`.
+    boundary* (``hp_install_boundaries``) rather than inferred external state.
     """
     module = _family_provider(model_type, "replacements")
     if module is None:
@@ -498,50 +460,6 @@ def interface_component_class(model_type: str | None) -> str | None:
         if target is not None and target.interface:
             return target.component
     return None
-
-
-def external_state_classes_for(
-    model_type: str | None,
-    injections: Iterable[Mapping[str, Any]] | None = None,
-    boundary_classes: Mapping[str, str] | None = None,
-) -> tuple[str, ...]:
-    """Classes whose ``forward`` an inline strategy body *replaces*.
-
-    Structure-proven, not declared: every strategy target this plan injects is
-    resolved to its :class:`StrategySpec`, and a spec that carries a
-    ``body_template`` rewrites that class's whole ``forward`` with an inline
-    orchestration body (the MoE EP shell).  Such a class owns its collectives,
-    so it must keep its parameter sharding without a compiled boundary — it is
-    skipped by the boundary / compute / inner-wrapper installers and reads its
-    parallel state from install-time instance attributes instead.
-
-    The class itself is a per-model fact derived from the frozen boundary map:
-    each injection records the concrete FQN it applies to, and the boundary
-    map names that FQN's class. A model naming its MoE block anything at all
-    is picked up without registration. A spec that still carries an explicit
-    ``target_class`` keeps it (literal mode, e.g. a future strategy that names
-    its own host class).
-
-    A *rendered* component class (the class this family's replacement
-    factories build, e.g. the fused attention) is deliberately NOT one of
-    these: its forward is the component's own plus the emitted boundary form,
-    so the shared compiled-boundary path
-    (``hp_install_boundaries`` / ``hp_apply_inner_wrapper``) owns it.
-    """
-    inlined: set[str] = set()
-    for record in injections or ():
-        spec = strategy_spec_for(
-            _target_path(record.get("local_compute_fn")), model_type
-        )
-        if spec is None or spec.body_template is None:
-            continue
-        if spec.target_class is not None:
-            inlined.add(spec.target_class)
-            continue
-        block_class = (boundary_classes or {}).get(record.get("match"))
-        if block_class is not None:
-            inlined.add(block_class)
-    return tuple(sorted(inlined))
 
 
 def declaration_summary(
@@ -578,7 +496,6 @@ def declaration_summary(
 __all__ = [
     "CP_ATTENTION_KIND",
     "declaration_summary",
-    "external_state_classes_for",
     "interface_component_class",
     "replacement_spec_for",
     "strategy_spec_for",

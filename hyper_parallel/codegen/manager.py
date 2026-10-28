@@ -26,7 +26,6 @@ import hashlib
 import logging
 import os
 from dataclasses import dataclass
-from fnmatch import fnmatchcase
 from typing import Any, Optional
 
 from hyper_parallel.codegen.artifact import (
@@ -40,14 +39,13 @@ from hyper_parallel.codegen.artifact import (
 )
 from hyper_parallel.codegen.emit import emit_bundle
 from hyper_parallel.codegen.hash import canonical_json, sha256_file, signature_from_spec
-from hyper_parallel.codegen.inline.framework_spec import (
-    declaration_summary,
-    external_state_classes_for,
-)
+from hyper_parallel.codegen.inline.framework_spec import declaration_summary
 from hyper_parallel.codegen.meta import (
     CodegenMeta,
     load_codegen_meta,
 )
+from hyper_parallel.distributed._builder.applier import _apply_phase_c
+from hyper_parallel.distributed.recipe_spec import _normalize_out_fields
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +125,6 @@ def ensure_codegen_artifact(
     )
     meta = _build_meta(config, layout, signature, hf_config=hf_config)
     patch_plan = _fill_plan_fields(meta, config, layout, hf_config=hf_config)
-    _record_inline_declarations(meta)
     files = emit_bundle(layout, meta, patch_plan=patch_plan)
     write_bundle_atomic(layout, files, meta)
     barrier_after_artifact()
@@ -731,7 +728,6 @@ def _prepare_codegen_build(model: Any, config: Any, spec: Any) -> CodegenBuildIn
         build_patch_emission_plan,
         snapshot_modules,
     )
-    from hyper_parallel.distributed.apply import apply_forward_patches
     from hyper_parallel.distributed._builder.planner import ShardingPlanner
     from hyper_parallel.distributed.mesh import DistributedSetup, MeshContext
     from hyper_parallel.models._transformers.model_builder import (
@@ -788,12 +784,8 @@ def _prepare_codegen_build(model: Any, config: Any, spec: Any) -> CodegenBuildIn
         if dims.ep_size > 1
         else None
     )
-    apply_forward_patches(
-        model,
-        sharding_plan,
-        mesh.device_mesh,
-        validate_mode=True,
-        expert_mesh=expert_mesh,
+    _apply_recorded_phase_c(
+        model, sharding_plan, mesh.device_mesh, expert_mesh=expert_mesh,
     )
     after_phase_c = snapshot_modules(model)
     patch_plan = build_patch_emission_plan(
@@ -816,6 +808,16 @@ def _prepare_codegen_build(model: Any, config: Any, spec: Any) -> CodegenBuildIn
         patch_plan=patch_plan,
         module_overrides=module_overrides,
     )
+
+
+def _apply_recorded_phase_c(
+    model: Any, plan: Any, mesh: Any, *, expert_mesh: Any = None,
+) -> Any:
+    """Run trainer Phase C at the codegen recording cutoff."""
+    for module_spec in plan.modules.values():
+        _normalize_out_fields(module_spec)
+    _apply_phase_c(model, plan, mesh, True, expert_mesh=expert_mesh)
+    return model
 
 
 def _replacement_records_for_meta(
@@ -869,25 +871,6 @@ def _replacement_records_for_meta(
             item["target_config"] = target_config
         serialized.append(item)
     return tuple(serialized)
-
-
-def _record_inline_declarations(meta: CodegenMeta) -> None:
-    """Record the facts the *runtime* also needs, derived from structure.
-
-    The class names whose ``forward`` an inline strategy body replaces (the EP
-    MoE shell selected by the compute factories this plan injects) are proven
-    by the injected targets' own resolved specs.  Recording them in ``meta``
-    (the file the runtime loads at training time) is what keeps the runtime
-    from carrying its own copy that drifts when a family adds a model.
-    """
-    identity = (meta.source or {}).get("architecture")
-    meta.external_state_classes = list(
-        external_state_classes_for(
-            identity,
-            getattr(meta, "injections", None),
-            getattr(meta, "boundary_classes", None),
-        )
-    )
 
 
 def _apply_generation_replacements(
@@ -1002,205 +985,6 @@ def _target_path(target: Any) -> Optional[str]:
         return None
     data = target.to_dict()
     return data.get("_target_") if isinstance(data, dict) else None
-
-
-#: Structure fingerprint -> model-family MoE EP compute factory.
-#:
-#: S3 maps a recognized ``MoeStructure`` (router / shared-expert branch /
-#: expert-storage) to the factory that would have been wired through a YAML
-#: ``local_compute_fn._target_``. The mapping is not duplicated here: it is the
-#: same framework structure->archetype table the model adapters project from,
-#: so the fingerprint is the *only* discriminator and a model with the same
-#: structure is covered without new registry work. Built lazily (the archetype
-#: table lives in the distributed package) and cached for the module lifetime.
-_EP_FACTORY_BY_STRUCTURE: dict[tuple[str, str, str], str] | None = None
-
-
-def _build_ep_factory_table() -> dict[tuple[str, str, str], str]:
-    """Project the framework archetype table into a fingerprint->path map."""
-    from hyper_parallel.distributed.expert_parallel.archetypes import (  # pylint: disable=C0415
-        moe_archetypes,
-    )
-
-    return {
-        fingerprint: archetype.compute_factory
-        for fingerprint, archetype in moe_archetypes().items()
-    }
-
-
-def _ep_factory_table() -> dict[tuple[str, str, str], str]:
-    """Return the cached fingerprint->factory ``_target_`` map."""
-    global _EP_FACTORY_BY_STRUCTURE  # pylint: disable=global-statement
-    if _EP_FACTORY_BY_STRUCTURE is None:
-        _EP_FACTORY_BY_STRUCTURE = _build_ep_factory_table()
-    return _EP_FACTORY_BY_STRUCTURE
-
-
-def _fill_inferred_ep_targets(model: Any, plan_overrides: dict[str, Any]) -> set[str]:
-    """S3: fill a missing ``local_compute_fn`` on MoE EP overrides.
-
-    Every desugared plan override whose ``match`` resolves to a MoE boundary
-    but which declares no explicit ``local_compute_fn`` gets its EP compute
-    factory inferred from structure (``detect_moe_structure``) instead of a
-    YAML ``_target_``. Entries that already carry a ``local_compute_fn`` are
-    left untouched — the explicit ``_target_`` remains the escape hatch for
-    structures detection cannot cover. Ordinary (non-MoE) overrides are
-    untouched. This is a no-op on a struct construct; the ``plan_overrides``
-    dict's spec values are mutated in place so ``freeze_injections`` records
-    the inferred factory in ``meta.injections``.
-
-    Returns:
-        The factory paths that were inferred. They identify the injections the
-        framework chose itself, which the plan build must keep off boundaries
-        that cannot host experts (see
-        ``_drop_inferred_ep_injections_on_non_moe``).
-    """
-    inferred: set[str] = set()
-    for match, spec in plan_overrides.items():
-        if getattr(spec, "local_compute_fn", None) is not None:
-            continue
-        target = _infer_ep_compute_for_match(model, match)
-        if target is not None:
-            spec.local_compute_fn = target
-            path = _target_path(target)
-            if path:
-                inferred.add(path)
-    return inferred
-
-
-def _infer_ep_compute_for_match(
-    model: Any, match: str
-) -> Optional["Any"]:
-    """Return the EP compute ``_target_`` covering every MoE block ``match`` hits.
-
-    Resolves ``match`` (an FQN or FQN glob, ``fnmatchcase``) against the meta
-    model's module tree. Returns a ``Target`` for the structure-inferred EP
-    factory when at least one matched module is a MoE boundary; ``None`` when
-    ``match`` touches no MoE boundary (an ordinary sharding override needs no
-    compute injection). An unrecognized MoE structure raises
-    ``UnsupportedModuleStructure`` so the artifact never silently picks a wrong
-    strategy — the escape-hatch text points the user at writing an explicit
-    ``_target_``.
-    """
-    candidate = None
-    candidate_path = None
-    for fqn, module in model.named_modules():
-        if not fnmatchcase(fqn, match):
-            continue
-        if not _looks_like_moe_boundary(module):
-            continue
-        target = _import_ep_target_for(module, match)
-        # Compare the serialized factory path, never the Target objects: every
-        # ``_build_ep_target`` call wraps a fresh closure and ``Target`` defines no
-        # equality, so identity would make any model with two MoE boundaries look
-        # ambiguous even when they share one factory.
-        path = _target_path(target)
-        if candidate is None:
-            candidate, candidate_path = target, path
-        elif path != candidate_path:
-            from hyper_parallel.distributed.expert_parallel.structure import (  # pylint: disable=C0415
-                UnsupportedModuleStructure,
-            )
-
-            raise UnsupportedModuleStructure(
-                f"{match!r} matched multiple MoE boundaries with different "
-                "EP compute factories; declare an explicit "
-                "local_compute_fn._target_ in the YAML"
-            )
-    return candidate
-
-
-def _drop_inferred_ep_injections_on_non_moe(
-    plan: Any, model: Any, inferred_targets: set[str]
-) -> None:
-    """Keep an *inferred* EP injection off boundaries that cannot host experts.
-
-    The S3 inference fills the factory once per ``match``; the planner's glob
-    merge then hands that spec to every matched boundary, including boundaries
-    with no experts to shard (DeepSeek-V3's dense ``first_k_dense_replace``
-    MLPs). Such a boundary cannot be an expert-parallel region — there is nothing
-    to all-to-all — and the artifact would render a local-region forward whose
-    compute the runtime never binds (the applier resolves an EP factory against a
-    non-MoE module and fails its interface assertion). Dropping the injection
-    here, while the plan is still codegen's own, keeps the artifact coherent.
-
-    Only targets the framework inferred are affected: a user-declared
-    ``local_compute_fn`` stays the escape hatch and is never dropped.
-    """
-    if not inferred_targets:
-        return
-    for fqn, spec in (getattr(plan, "modules", {}) or {}).items():
-        injection = getattr(spec, "local_compute_fn", None)
-        if injection is None or _target_path(injection) not in inferred_targets:
-            continue
-        module = model.get_submodule(fqn) if model is not None else None
-        if module is None or _looks_like_moe_boundary(module):
-            continue
-        logger.info(
-            "codegen: inferred EP injection dropped on %s — %s carries no "
-            "experts/router, so it cannot be an expert-parallel region",
-            fqn, type(module).__name__)
-        spec.local_compute_fn = None
-        spec.region_dispatch = None
-
-
-def _looks_like_moe_boundary(module: Any) -> bool:
-    """Cheap gate: does the module carry an expert plus a router gate?"""
-    return hasattr(module, "experts") and (
-        hasattr(module, "gate") or hasattr(module, "router")
-    )
-
-
-def _import_ep_target_for(module: Any, match: str) -> "Any":
-    """Import the delayed target bound to the structure-inferred factory."""
-    from hyper_parallel.distributed.expert_parallel.structure import (  # pylint: disable=C0415
-        UnsupportedModuleStructure,
-        detect_moe_structure,
-    )
-
-    structure = detect_moe_structure(module)
-    fingerprint = (
-        structure.router,
-        structure.shared_experts,
-        structure.expert_storage,
-    )
-    factory_path = _ep_factory_table().get(fingerprint)
-    if factory_path is None:
-        from hyper_parallel.distributed.expert_parallel.archetypes import (  # pylint: disable=C0415
-            format_supported_fingerprints,
-        )
-
-        raise UnsupportedModuleStructure(
-            f"{match!r} matched {type(module).__name__} with structure "
-            f"{fingerprint} that has no EP compute factory. Supported "
-            f"structures: {format_supported_fingerprints()}. Implement the "
-            "missing capability (router adapter / shared mode / storage) or "
-            "declare an explicit local_compute_fn._target_ to opt out of "
-            "structure detection."
-        )
-    return _build_ep_target(factory_path)
-
-
-def _build_ep_target(factory_path: str) -> "Any":
-    """Build a delayed ``Target`` for the EP factory at ``factory_path``.
-
-    ``local_compute_fn`` is a *factory* Target — the framework calls
-    ``build()`` (which resolves the import) only at apply time, never during
-    generation. So the callable here resolves lazily; generation serializes
-    only the ``_target_`` path into meta, and the runtime re-resolves it from
-    that path. Deferring the import keeps codegen free of a hard dependency on
-    any concrete model package.
-    """
-    from hyper_parallel.trainer.config.target import Target  # pylint: disable=C0415
-
-    def _factory(**kwargs: Any) -> Any:
-        import importlib  # pylint: disable=C0415
-
-        module_path, _, attr = factory_path.rpartition(".")
-        fn = getattr(importlib.import_module(module_path), attr)
-        return fn(**kwargs)
-
-    return Target(_factory, target_path=factory_path)
 
 
 def _gen_backend(config: Any) -> bool:

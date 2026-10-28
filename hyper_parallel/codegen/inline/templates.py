@@ -19,53 +19,6 @@ from __future__ import annotations
 import textwrap
 
 
-#: Bare parallel operators for the generated forwards.  The generated file no
-#: longer embeds its own operator class or a module-level state accessor:
-#: ``runtime.TPOperators`` (wrapping the native
-#: ``create_tp_collective_lowerer``) is bound to the instance as ``_hp_tp``
-#: at install time by the boundary install path, next to the
-#: ``{tp,cp,ep}_enable`` guards — so a boundary-lowered forward and a switch
-#: (toggle) forward dispatch through one production collective path.  An inline
-#: *strategy* body (the shell below) reads only the EP channel
-#: (``self.ep_enable`` / ``self._hp_ep_group``), which
-#: ``hp_bind_inline_state`` binds.
-MOE_EP_FORWARD_SHELL = '''"""Inline EP routed MoE forward (framework generic)."""
-if not self.ep_enable:
-    return self._forward_impl(__hp_hidden_arg__)
-
-return moe_ep_forward(
-    self,
-    __hp_hidden_arg__,
-    router_kind={router_kind!r},
-    shared={shared!r},
-    ep_group=self._hp_ep_group,
-)
-'''
-
-
-def moe_ep_forward_body(router_kind: str, shared: str) -> str:
-    """Return the thin inline EP forward body for the given structural keys.
-
-    A single shared body referenced by every MoE render spec. The only
-    inputs are the structure-selected router kind and shared merge mode, so
-    no model-family EP dispatch literal remains in any adapter.
-
-    ``__hp_hidden_arg__`` is a placeholder for the host forward's first
-    positional parameter name: the patch engine substitutes the concrete
-    host's spelling when applying the body (a MoE host names it
-    ``hidden_states``, a dense MLP host may name it ``x``), so one shared
-    shell binds whichever argument the host actually receives.
-
-    Args:
-        router_kind: Structural key selecting the router implementation.
-        shared: Structural key selecting the shared-expert merge mode.
-
-    Returns:
-        The rendered forward body source.
-    """
-    return MOE_EP_FORWARD_SHELL.format(router_kind=router_kind, shared=shared)
-
-
 #: Inline CP dispatch body for the generated CP subclass forward.
 #:
 #: The body is argument-shape agnostic (``*args`` / ``**kwargs``
