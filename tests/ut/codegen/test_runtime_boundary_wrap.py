@@ -1061,162 +1061,206 @@ def test_inline_cp_marker_binds_cp_channel_and_skips_inner_wrapper(monkeypatch):
     assert calls == []
 
 
-class RenderedAttention(nn.Module):
-    """Rendered component class: the emitted boundary form owns its forward."""
-
-    def _forward_impl(self, hidden_states):
-        return hidden_states, None
-
-    def forward(self, hidden_states):
-        return self._forward_impl(hidden_states)
-
-
-class Qwen3MoeSparseMoeBlock(nn.Module):
-    """Inline strategy shell: its forward was replaced by the inline EP body.
-
-    The class name is the EP archetype's block class — the structural fact the
-    artifact's ``external_state_classes`` record carries (see
-    :func:`_component_module`), not a convenience label.
-    """
-
-    def _forward_impl(self, hidden_states):
-        return hidden_states
-
-    def forward(self, hidden_states):
-        if not self.ep_enable:
-            return self._forward_impl(hidden_states)
-        return hidden_states
-
-
-#: The EP compute factory whose archetype names the inline shell class.
-_QWEN_EP_FN = (
-    "hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel."
-    "qwen3moe_ep_compute_fn"
-)
-
-
-def _component_module():
-    """A generated module carrying one rendered component and one EP shell.
-
-    The artifact's own record of which class takes its state externally is
-    derived the way generation derives it (the injections' resolved strategy
-    specs), so the rendered component's absence from that record is the
-    production fact these tests exercise.
-    """
-    generated = types.ModuleType("hyper_parallel_generated.rendered_component")
-    for cls in (RenderedAttention, Qwen3MoeSparseMoeBlock):
-        cls.__module__ = generated.__name__
-    meta = SimpleNamespace(
-        source={"architecture": "Qwen3MoeForCausalLM"},
-        injections=[{
-            "match": "model.layers.0.mlp",
-            "local_compute_fn": {"_target_": _QWEN_EP_FN},
-        }],
-        boundary_classes={"model.layers.0.mlp": "Qwen3MoeSparseMoeBlock"},
-    )
-    manager._record_inline_declarations(meta)  # pylint: disable=protected-access
-    assert meta.external_state_classes == ["Qwen3MoeSparseMoeBlock"]
-    runtime.register_external_state_classes(generated, meta.external_state_classes)
-    return generated
-
-
-_WRAPPED_TARGETS: list[str] = []
-
-
-@inner_wrapper
-def _recording_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh):
-    """In-place inner-wrapper double recording the module it is applied to."""
-    del mesh, tp_mesh, cp_mesh, ep_mesh
-    _WRAPPED_TARGETS.append(type(target_module).__name__)
-
-
 @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
           card_mark="onecard", essential_mark="unessential")
-def test_rendered_component_reuses_the_compiled_boundary(monkeypatch):
-    """A rendered component is compiled like any other boundary.
+def test_install_deferred_bias_pair_on_imported_class(monkeypatch):
+    """Imported-class boundaries suppress inside and re-add after the exit.
 
-    Feature: codegen-external-state
-    Description: The rendered component class (the fused attention the family's
-        factories build) is not an external-state class, so
-        ``hp_install_boundaries`` treats it like any other source-lowered
-        boundary: it compiles and binds ``_hp_boundary`` without adding a
-        second forward wrapper.  The inline EP shell of the same artifact is
-        still skipped.
-    Expectation: The rendered component owns a compiled boundary; the shell
-        carries none; the component's lowered forward is left in place.
+    Feature: boundary-install-d22
+    Description: An entry with ``deferred_bias_params`` installs the native
+        suppression on the child owner (an instance-level ``o_proj.forward``)
+        plus the ``_hp_deferred_bias`` exit hook; the boundary forward
+        wrapper applies the hook after ``redistribute_outputs``.
+    Expectation: The child runs bias-free inside the region (the exit sees
+        ``[[2,2]]``), the returned output carries the bias exactly once
+        (``[[7,9]]``), and the child's bias Parameter is restored.
     """
-    generated = _component_module()
-    monkeypatch.setattr(runtime, "InstalledBoundary", TagBoundary)
-
     model = nn.Module()
-    model.self_attn = RenderedAttention()
-    model.mlp = Qwen3MoeSparseMoeBlock()
+    model.self_attn = BiasedLeaf()
+    monkeypatch.setattr(runtime, "InstalledBoundary", BiasExitBoundary)
+
     runtime.hp_install_boundaries(
         model,
-        {"self_attn": _entry(), "mlp": _entry()},
+        {"self_attn": _deferred_entry()},
         mesh_context="mesh",
         mesh_dim_names=("tp",),
-        generated_module=generated,
     )
 
-    assert isinstance(model.self_attn._hp_boundary, TagBoundary)
-    assert model.self_attn._hp_boundary.module is model.self_attn
-    # The emitted forward already redistributes; no second wrapper is added.
-    assert not hasattr(model.self_attn, "_codegen_boundary_wrapped")
-    # The inline shell keeps its own channel instead of a compiled boundary.
-    assert not hasattr(model.mlp, "_hp_boundary")
+    assert model.self_attn._codegen_boundary_wrapped is True
+    assert callable(model.self_attn._hp_deferred_bias)
+    out = model.self_attn(torch.tensor([[1.0, 1.0]]))
+    assert torch.equal(out, torch.tensor([[7.0, 9.0]]))
+    installed = model.self_attn._hp_boundary
+    assert installed.sides == ["in", "out"]
+    assert torch.equal(installed.seen_at_exit, torch.tensor([[2.0, 2.0]]))
+    # The suppression wrapped the child owner's forward; the bias Parameter
+    # survived the call untouched.
+    assert "forward" in model.self_attn.o_proj.__dict__
+    assert torch.equal(model.self_attn.o_proj.bias, torch.tensor([5.0, 7.0]))
 
 
 @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
           card_mark="onecard", essential_mark="unessential")
-def test_apply_inner_wrapper_carries_cp_to_the_rendered_component(monkeypatch):
-    """CP is installed by the shared inner-wrapper chain, not a codegen copy.
+def test_install_deferred_bias_pair_on_lowered_boundary(monkeypatch):
+    """Source-lowered boundaries rely on the emitted hook line, not a wrapper.
 
-    Feature: codegen-inner-wrapper
-    Description: The rendered component class is not an external-state class,
-        so ``hp_apply_inner_wrapper`` reaches it and applies the declared CP
-        wrapper through the applier's own resolution chain
-        (``_wrap_inner_attention`` → ``_resolve_inner_wrapper`` →
-        ``_apply_custom_inner_wrapper``).  The inline EP shell of the same
-        artifact is still skipped.
-    Expectation: The declared wrapper runs for the rendered component only.
+    Feature: boundary-install-d22
+    Description: A lowered boundary (``_forward_impl``) with a deferred child
+        bias only binds ``_hp_boundary`` and the suppression pair — the
+        emitted forward's own ``self._hp_deferred_bias`` line performs the
+        re-add after the exit redistribution.
+    Expectation: No second forward wrapper is installed; the exit sees the
+        bias-free ``[[2,2]]`` and the module returns ``[[7,9]]``.
     """
-    generated = _component_module()
-    monkeypatch.setattr(
-        runtime,
-        "_resolve_runtime_meshes",
-        lambda *args, **kwargs: (object(), None, None, ()),
+    model = nn.Module()
+    model.self_attn = LoweredBiased()
+    monkeypatch.setattr(runtime, "InstalledBoundary", BiasExitBoundary)
+
+    runtime.hp_install_boundaries(
+        model,
+        {"self_attn": _deferred_entry()},
+        mesh_context="mesh",
+        mesh_dim_names=("tp",),
     )
-    _WRAPPED_TARGETS.clear()
+
+    assert not hasattr(model.self_attn, "_codegen_boundary_wrapped")
+    assert isinstance(model.self_attn._hp_boundary, BiasExitBoundary)
+    out = model.self_attn(torch.tensor([[1.0, 1.0]]))
+    assert torch.equal(out, torch.tensor([[7.0, 9.0]]))
+    installed = model.self_attn._hp_boundary
+    assert installed.sides == ["in", "out"]
+    assert torch.equal(installed.seen_at_exit, torch.tensor([[2.0, 2.0]]))
+    # The child owner's forward is the suppressed one.
+    assert "forward" in model.self_attn.o_proj.__dict__
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_install_deferred_bias_self_owned_wraps_impl_not_forward(monkeypatch):
+    """A dotless deferred path wraps ``_forward_impl``, never ``forward``.
+
+    Feature: boundary-install-d22
+    Description: When the boundary's OWN bias is deferred, a source-lowered
+        boundary must wrap the extracted ``_forward_impl`` the rewritten
+        forward calls.  Wrapping ``forward`` instead (the native placement)
+        would keep the bias hidden while the emitted
+        ``self._hp_deferred_bias(outputs)`` reads it at the exit — the
+        bias would be suppressed and never re-added.
+    Expectation: The instance carries a wrapped ``_forward_impl`` and no
+        instance ``forward``; the output still carries the bias exactly once.
+    """
+    model = nn.Module()
+    model.self_attn = SelfBiasedLowered()
+    monkeypatch.setattr(runtime, "InstalledBoundary", BiasExitBoundary)
+
+    runtime.hp_install_boundaries(
+        model,
+        {"self_attn": _deferred_entry(self_owned=True)},
+        mesh_context="mesh",
+        mesh_dim_names=("tp",),
+    )
+
+    # The one codegen-specific deviation from the native placement, locked.
+    assert "_forward_impl" in model.self_attn.__dict__
+    assert "forward" not in model.self_attn.__dict__
+    out = model.self_attn(torch.tensor([[1.0, 1.0]]))
+    assert torch.equal(out, torch.tensor([[7.0, 9.0]]))
+    assert torch.equal(model.self_attn.bias, torch.tensor([5.0, 7.0]))
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_static_tp_fallback_preserves_deferred_bias(monkeypatch):
+    """The generic fallback keeps the D-22 exit the static template carried.
+
+    Feature: boundary-install-d22
+    Description: When the live mesh rejects the static ``tp_collective``
+        forward (no lowerer), the fallback replaces the forward with the
+        generic redistribute engine — which would orphan the emitted
+        ``self._hp_deferred_bias`` line.  The suppression pair is
+        installed before the fallback wraps, so the fallback re-applies the
+        hook after its exit redistribution.
+    Expectation: ``_hp_tp`` is not bound, the forward is replaced, and the
+        output still carries the bias exactly once (``[[7,9]]``, with the
+        exit having seen the bias-free ``[[2,2]]``).
+    """
+    from hyper_parallel.distributed._builder import tp_collective_lowering
+
+    monkeypatch.setattr(
+        tp_collective_lowering, "create_tp_collective_lowerer", lambda mesh, dims: None
+    )
+    monkeypatch.setattr(runtime, "InstalledBoundary", BiasExitBoundary)
 
     model = nn.Module()
-    model.self_attn = RenderedAttention()
-    model.mlp = Qwen3MoeSparseMoeBlock()
-    runtime.hp_apply_inner_wrapper(
+    model.self_attn = StaticBiasedLeaf()
+    runtime.hp_install_boundaries(
         model,
-        [
-            {"match": "self_attn", "inner_target": "self",
-             "inner_wrapper": _recording_cp_wrapper},
-            {"match": "mlp", "inner_target": "self",
-             "inner_wrapper": _recording_cp_wrapper},
-        ],
-        mesh_context="mesh",
-        mesh_dim_names=(),
-        param_plan={
-            "self_attn": {"region_dispatch": False},
-            "mlp": {"region_dispatch": False},
-        },
-        generated_module=generated,
+        {"self_attn": _deferred_entry()},
+        mesh_context=FakeDenseMesh(),
+        mesh_dim_names=("tp",),
     )
 
-    assert _WRAPPED_TARGETS == ["RenderedAttention"]
+    assert not hasattr(model.self_attn, "_hp_tp")
+    assert "forward" in model.self_attn.__dict__
+    out = model.self_attn(torch.tensor([[1.0, 1.0]]))
+    assert torch.equal(out, torch.tensor([[7.0, 9.0]]))
+    installed = model.self_attn._hp_boundary
+    assert installed.sides == ["in", "out"]
+    assert torch.equal(installed.seen_at_exit, torch.tensor([[2.0, 2.0]]))
 
 
-# ---------------------------------------------------------------------------
-# D-22 deferred bias: install-time suppression / re-add pair
-# ---------------------------------------------------------------------------
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_generated_parallelization_rejects_second_application():
+    """A generated model cannot receive its frozen patch plan twice."""
+    model = nn.Module()
+    model._hp_codegen_parallelized = True
+
+    with pytest.raises(RuntimeError, match="more than once"):
+        runtime._parallelize_via_native_apply(  # pylint: disable=protected-access
+            model,
+            mesh_context=None,
+            meta=SimpleNamespace(),
+            generated_module=SimpleNamespace(),
+        )
 
 
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_generated_replacement_ownership_is_verified():
+    """Metadata cannot suppress a trainer replacement missing from source."""
+    model = nn.Module()
+    model.proj = nn.Identity()
+    meta = SimpleNamespace(emission_patches={
+        "module_replacements": [{
+            "module_fqn": "proj",
+            "replacement_type": "torch.nn.modules.linear:Linear",
+        }],
+    })
+
+    with pytest.raises(RuntimeError, match="did not materialize"):
+        runtime._verify_materialized_replacements(  # pylint: disable=protected-access
+            model, meta, SimpleNamespace(__name__="generated_model"),
+        )
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_generated_replacement_accepts_emitted_equivalent_type():
+    """A copied generated component is equivalent without sharing type identity."""
+    generated_type = type("Linear", (nn.Module,), {"__module__": "generated_model"})
+    model = nn.Module()
+    model.proj = generated_type()
+    meta = SimpleNamespace(emission_patches={
+        "module_replacements": [{
+            "module_fqn": "proj",
+            "replacement_type": "torch.nn.modules.linear:Linear",
+        }],
+    })
+
+    runtime._verify_materialized_replacements(  # pylint: disable=protected-access
+        model, meta, SimpleNamespace(__name__="generated_model"),
+    )
 class RowwiseLinear(nn.Module):
     """Rowwise-sharded projection (weight ``S(ndim-1)``) carrying a full bias.
 
@@ -1348,233 +1392,3 @@ def _deferred_entry(*, self_owned: bool = False) -> dict:
     entry = _entry()
     entry["deferred_bias_params"] = ["bias"] if self_owned else ["o_proj.bias"]
     return entry
-
-
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
-def test_install_deferred_bias_pair_on_imported_class(monkeypatch):
-    """Imported-class boundaries suppress inside and re-add after the exit.
-
-    Feature: boundary-install-d22
-    Description: An entry with ``deferred_bias_params`` installs the native
-        suppression on the child owner (an instance-level ``o_proj.forward``)
-        plus the ``_hp_deferred_bias`` exit hook; the boundary forward
-        wrapper applies the hook after ``redistribute_outputs``.
-    Expectation: The child runs bias-free inside the region (the exit sees
-        ``[[2,2]]``), the returned output carries the bias exactly once
-        (``[[7,9]]``), and the child's bias Parameter is restored.
-    """
-    model = nn.Module()
-    model.self_attn = BiasedLeaf()
-    monkeypatch.setattr(runtime, "InstalledBoundary", BiasExitBoundary)
-
-    runtime.hp_install_boundaries(
-        model,
-        {"self_attn": _deferred_entry()},
-        mesh_context="mesh",
-        mesh_dim_names=("tp",),
-    )
-
-    assert model.self_attn._codegen_boundary_wrapped is True
-    assert callable(model.self_attn._hp_deferred_bias)
-    out = model.self_attn(torch.tensor([[1.0, 1.0]]))
-    assert torch.equal(out, torch.tensor([[7.0, 9.0]]))
-    installed = model.self_attn._hp_boundary
-    assert installed.sides == ["in", "out"]
-    assert torch.equal(installed.seen_at_exit, torch.tensor([[2.0, 2.0]]))
-    # The suppression wrapped the child owner's forward; the bias Parameter
-    # survived the call untouched.
-    assert "forward" in model.self_attn.o_proj.__dict__
-    assert torch.equal(model.self_attn.o_proj.bias, torch.tensor([5.0, 7.0]))
-
-
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
-def test_install_deferred_bias_pair_on_lowered_boundary(monkeypatch):
-    """Source-lowered boundaries rely on the emitted hook line, not a wrapper.
-
-    Feature: boundary-install-d22
-    Description: A lowered boundary (``_forward_impl``) with a deferred child
-        bias only binds ``_hp_boundary`` and the suppression pair — the
-        emitted forward's own ``self._hp_deferred_bias`` line performs the
-        re-add after the exit redistribution.
-    Expectation: No second forward wrapper is installed; the exit sees the
-        bias-free ``[[2,2]]`` and the module returns ``[[7,9]]``.
-    """
-    model = nn.Module()
-    model.self_attn = LoweredBiased()
-    monkeypatch.setattr(runtime, "InstalledBoundary", BiasExitBoundary)
-
-    runtime.hp_install_boundaries(
-        model,
-        {"self_attn": _deferred_entry()},
-        mesh_context="mesh",
-        mesh_dim_names=("tp",),
-    )
-
-    assert not hasattr(model.self_attn, "_codegen_boundary_wrapped")
-    assert isinstance(model.self_attn._hp_boundary, BiasExitBoundary)
-    out = model.self_attn(torch.tensor([[1.0, 1.0]]))
-    assert torch.equal(out, torch.tensor([[7.0, 9.0]]))
-    installed = model.self_attn._hp_boundary
-    assert installed.sides == ["in", "out"]
-    assert torch.equal(installed.seen_at_exit, torch.tensor([[2.0, 2.0]]))
-    # The child owner's forward is the suppressed one.
-    assert "forward" in model.self_attn.o_proj.__dict__
-
-
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
-def test_install_deferred_bias_self_owned_wraps_impl_not_forward(monkeypatch):
-    """A dotless deferred path wraps ``_forward_impl``, never ``forward``.
-
-    Feature: boundary-install-d22
-    Description: When the boundary's OWN bias is deferred, a source-lowered
-        boundary must wrap the extracted ``_forward_impl`` the rewritten
-        forward calls.  Wrapping ``forward`` instead (the native placement)
-        would keep the bias hidden while the emitted
-        ``self._hp_deferred_bias(outputs)`` reads it at the exit — the
-        bias would be suppressed and never re-added.
-    Expectation: The instance carries a wrapped ``_forward_impl`` and no
-        instance ``forward``; the output still carries the bias exactly once.
-    """
-    model = nn.Module()
-    model.self_attn = SelfBiasedLowered()
-    monkeypatch.setattr(runtime, "InstalledBoundary", BiasExitBoundary)
-
-    runtime.hp_install_boundaries(
-        model,
-        {"self_attn": _deferred_entry(self_owned=True)},
-        mesh_context="mesh",
-        mesh_dim_names=("tp",),
-    )
-
-    # The one codegen-specific deviation from the native placement, locked.
-    assert "_forward_impl" in model.self_attn.__dict__
-    assert "forward" not in model.self_attn.__dict__
-    out = model.self_attn(torch.tensor([[1.0, 1.0]]))
-    assert torch.equal(out, torch.tensor([[7.0, 9.0]]))
-    assert torch.equal(model.self_attn.bias, torch.tensor([5.0, 7.0]))
-
-
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
-def test_install_rejects_deferred_bias_on_external_state_inline(monkeypatch):
-    """An external-state inline boundary cannot run the D-22 exit hook.
-
-    Feature: boundary-install-d22
-    Description: A class declared in ``meta.external_state_classes`` has its
-        forward replaced by the inline strategy body — the boundary exit (and
-        with it the deferred-bias re-add) never runs there, so a deferred
-        bias would be suppressed and silently dropped from every forward.
-    Expectation: ``hp_install_boundaries`` fails fast with a
-        ``NotImplementedError`` naming the deferred params.
-    """
-    generated = _component_module()
-    monkeypatch.setattr(runtime, "InstalledBoundary", BiasExitBoundary)
-    model = nn.Module()
-    model.mlp = Qwen3MoeSparseMoeBlock()
-
-    with pytest.raises(NotImplementedError, match="defers bias params"):
-        runtime.hp_install_boundaries(
-            model,
-            {"mlp": _deferred_entry()},
-            mesh_context="mesh",
-            mesh_dim_names=("tp",),
-            generated_module=generated,
-        )
-
-
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
-def test_static_tp_fallback_preserves_deferred_bias(monkeypatch):
-    """The generic fallback keeps the D-22 exit the static template carried.
-
-    Feature: boundary-install-d22
-    Description: When the live mesh rejects the static ``tp_collective``
-        forward (no lowerer), the fallback replaces the forward with the
-        generic redistribute engine — which would orphan the emitted
-        ``self._hp_deferred_bias`` line.  The suppression pair is
-        installed before the fallback wraps, so the fallback re-applies the
-        hook after its exit redistribution.
-    Expectation: ``_hp_tp`` is not bound, the forward is replaced, and the
-        output still carries the bias exactly once (``[[7,9]]``, with the
-        exit having seen the bias-free ``[[2,2]]``).
-    """
-    from hyper_parallel.distributed._builder import tp_collective_lowering
-
-    monkeypatch.setattr(
-        tp_collective_lowering, "create_tp_collective_lowerer", lambda mesh, dims: None
-    )
-    monkeypatch.setattr(runtime, "InstalledBoundary", BiasExitBoundary)
-
-    model = nn.Module()
-    model.self_attn = StaticBiasedLeaf()
-    runtime.hp_install_boundaries(
-        model,
-        {"self_attn": _deferred_entry()},
-        mesh_context=FakeDenseMesh(),
-        mesh_dim_names=("tp",),
-    )
-
-    assert not hasattr(model.self_attn, "_hp_tp")
-    assert "forward" in model.self_attn.__dict__
-    out = model.self_attn(torch.tensor([[1.0, 1.0]]))
-    assert torch.equal(out, torch.tensor([[7.0, 9.0]]))
-    installed = model.self_attn._hp_boundary
-    assert installed.sides == ["in", "out"]
-    assert torch.equal(installed.seen_at_exit, torch.tensor([[2.0, 2.0]]))
-
-
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
-def test_generated_parallelization_rejects_second_application():
-    """A generated model cannot receive its frozen patch plan twice."""
-    model = nn.Module()
-    model._hp_codegen_parallelized = True
-
-    with pytest.raises(RuntimeError, match="more than once"):
-        runtime._parallelize_via_native_apply(  # pylint: disable=protected-access
-            model,
-            mesh_context=None,
-            meta=SimpleNamespace(),
-            generated_module=SimpleNamespace(),
-        )
-
-
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
-def test_generated_replacement_ownership_is_verified():
-    """Metadata cannot suppress a trainer replacement missing from source."""
-    model = nn.Module()
-    model.proj = nn.Identity()
-    meta = SimpleNamespace(emission_patches={
-        "module_replacements": [{
-            "module_fqn": "proj",
-            "replacement_type": "torch.nn.modules.linear:Linear",
-        }],
-    })
-
-    with pytest.raises(RuntimeError, match="did not materialize"):
-        runtime._verify_materialized_replacements(  # pylint: disable=protected-access
-            model, meta, SimpleNamespace(__name__="generated_model"),
-        )
-
-
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
-def test_generated_replacement_accepts_emitted_equivalent_type():
-    """A copied generated component is equivalent without sharing type identity."""
-    generated_type = type("Linear", (nn.Module,), {"__module__": "generated_model"})
-    model = nn.Module()
-    model.proj = generated_type()
-    meta = SimpleNamespace(emission_patches={
-        "module_replacements": [{
-            "module_fqn": "proj",
-            "replacement_type": "torch.nn.modules.linear:Linear",
-        }],
-    })
-
-    runtime._verify_materialized_replacements(  # pylint: disable=protected-access
-        model, meta, SimpleNamespace(__name__="generated_model"),
-    )

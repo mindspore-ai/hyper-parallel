@@ -24,7 +24,6 @@ recipe input contract (``ModuleShardingSpec`` / ``NamedPlacement`` /
 """
 
 from hyper_parallel.distributed.apply import (
-    apply_forward_patches,
     apply_sharding_plan,
 )
 from hyper_parallel.distributed.plan import ShardingPlan
@@ -83,7 +82,6 @@ __all__ = [
     "parse_named_placement",
     "parse_placement",
     "resolve_placements",
-    "apply_forward_patches",
     "apply_sharding_plan",
     "validate_model_compatibility",
     "_apply_activation_checkpointing",
