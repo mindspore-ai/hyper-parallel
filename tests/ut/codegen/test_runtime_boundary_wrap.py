@@ -1524,3 +1524,57 @@ def test_static_tp_fallback_preserves_deferred_bias(monkeypatch):
     installed = model.self_attn._hp_boundary
     assert installed.sides == ["in", "out"]
     assert torch.equal(installed.seen_at_exit, torch.tensor([[2.0, 2.0]]))
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_generated_parallelization_rejects_second_application():
+    """A generated model cannot receive its frozen patch plan twice."""
+    model = nn.Module()
+    model._hp_codegen_parallelized = True
+
+    with pytest.raises(RuntimeError, match="more than once"):
+        runtime._parallelize_via_native_apply(  # pylint: disable=protected-access
+            model,
+            mesh_context=None,
+            meta=SimpleNamespace(),
+            generated_module=SimpleNamespace(),
+        )
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_generated_replacement_ownership_is_verified():
+    """Metadata cannot suppress a trainer replacement missing from source."""
+    model = nn.Module()
+    model.proj = nn.Identity()
+    meta = SimpleNamespace(emission_patches={
+        "module_replacements": [{
+            "module_fqn": "proj",
+            "replacement_type": "torch.nn.modules.linear:Linear",
+        }],
+    })
+
+    with pytest.raises(RuntimeError, match="did not materialize"):
+        runtime._verify_materialized_replacements(  # pylint: disable=protected-access
+            model, meta, SimpleNamespace(__name__="generated_model"),
+        )
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_generated_replacement_accepts_emitted_equivalent_type():
+    """A copied generated component is equivalent without sharing type identity."""
+    generated_type = type("Linear", (nn.Module,), {"__module__": "generated_model"})
+    model = nn.Module()
+    model.proj = generated_type()
+    meta = SimpleNamespace(emission_patches={
+        "module_replacements": [{
+            "module_fqn": "proj",
+            "replacement_type": "torch.nn.modules.linear:Linear",
+        }],
+    })
+
+    runtime._verify_materialized_replacements(  # pylint: disable=protected-access
+        model, meta, SimpleNamespace(__name__="generated_model"),
+    )

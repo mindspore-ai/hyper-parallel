@@ -20,11 +20,9 @@ recorded in ``codegen_meta.json``.  Execution is **convergent with the native
 applier**: parameter sharding (Phase A ``_shard_planned_parameters``), special
 handlers (Phase B) and tied weights (Phase D) run against a live
 ``ShardingPlan`` rebuilt from the meta (:func:`_rebuild_live_plan_from_meta`),
-so codegen no longer keeps a second literal sharding implementation.  Only the
-forward assembly (the codegen Phase C helpers ``hp_install_boundaries`` /
-``hp_bind_compute`` / ``hp_apply_inner_wrapper``) stays literal, because
-the generated file pre-rewrites forward and the native Phase C would
-double-wrap that redistribution.
+so codegen no longer keeps a second literal sharding implementation.  Before
+the native applier runs, emitted display forwards are restored to their
+unwrapped implementations; the trainer then owns Phase C as well as A/B/D.
 
 Helpers fail fast: any unknown placement form, missing entrypoint, or absent
 meta errors instead of silently degrading to a ``Replicate()`` no-op.
@@ -1176,6 +1174,7 @@ def hp_bind_compute(
     *,
     param_plan: Optional[dict[str, Any]] = None,
     generated_module: Any = None,
+    materialized_patches: Optional[list[dict[str, str]]] = None,
 ) -> None:
     """Bind the explicit factory-named attribute for each local region.
 
@@ -1228,6 +1227,11 @@ def hp_bind_compute(
     recorded_binder = getattr(generated_module, "hp_bind_recorded_forwards", None)
     if recorded_binder is not None:
         recorded_binder(model)
+    materialized_fqns = {
+        patch.get("fqn")
+        for patch in materialized_patches or ()
+        if patch.get("kind") == "local_compute" and patch.get("fqn")
+    }
     for rule in injections:
         if rule.get("local_compute_fn") is None:
             continue
@@ -1254,7 +1258,15 @@ def hp_bind_compute(
         # bound as a generated-model compute attribute.
         if compute_fn is None or compute_fn is module.forward:
             continue
-        if _has_lowered_forward(module, generated_module):
+        source_owns_forward = fqn in materialized_fqns
+        has_lowered_forward = _has_lowered_forward(module, generated_module)
+        if source_owns_forward and not has_lowered_forward:
+            raise RuntimeError(
+                "codegen: generated source declares a materialized local-compute "
+                f"patch for {fqn!r}, but the constructed module has no lowered "
+                "forward; regenerate the artifact instead of applying the patch twice"
+            )
+        if has_lowered_forward:
             binding_name = local_compute_binding_name(rule["local_compute_fn"])
             setattr(module, binding_name, compute_fn)
             continue
@@ -1497,11 +1509,8 @@ def parallelize_from_generated(
 def _parallelize_inline_from_meta(model: Any, mesh_context: Any, meta: CodegenMeta, generated_module: Any) -> dict:
     """Parallelize a clean inline artifact whose model file carries no plan globals.
 
-    Execution is convergent with the native applier (see
-    :func:`_parallelize_via_native_apply`): Phase A parameter sharding /
-    B special handlers / D tied weights run against a live ``ShardingPlan``
-    rebuilt from the frozen meta; Phase C forward assembly stays codegen-owned
-    because the generated file pre-rewrites forward.
+    The frozen metadata is rebuilt as a live plan and executed by the native
+    trainer applier; codegen does not maintain a separate Phase C path.
     """
     return _parallelize_via_native_apply(model, mesh_context, meta, generated_module)
 
@@ -1617,101 +1626,77 @@ def _parallelize_via_native_apply(
     meta: CodegenMeta,
     generated_module: Any,
 ) -> dict:
-    """Reuse the native execution body for a codegen artifact.
+    """Apply the frozen plan through the trainer's complete A/B/C/D path.
 
-    Rebuilds a live ``ShardingPlan`` from the frozen meta
-    (:func:`_rebuild_live_plan_from_meta`) and runs native Phase A
-    (``_shard_planned_parameters``) / B (``_apply_plan_special_handlers``) /
-    D (``_replicate_tied_weights``) against it.  This is the converging
-    execution path: codegen no longer maintains a second literal
-    parameter-sharding replay.
-
-    Phase C forward assembly is deliberately NOT reused: the generated file
-    has already rewritten every boundary's ``forward`` into the
-    redistribute-in / ``_forward_impl`` / redistribute-out form (resolved at
-    runtime against the ``_hp_boundary`` / ``__hp_compute__`` bound
-    here). Native ``_apply_phase_c`` captures the *current* forward as its
-    ``original_forward`` and wraps it in ANOTHER
-    ``redistribute_inputs -> original -> redistribute_outputs`` — running it
-    on a codegen artifact double-wraps the redistribution (double TP/EP
-    communication) because no native branch skips the wrap.  So full
-    ``apply_sharding_plan`` reuse is not viable; A/B/D reuse with codegen-owned
-    Phase C is the minimum viable convergence.
-
-    MoE/EP artifacts are supported: native Phase A applies the same
-    ``_stack_moe_experts`` step here as it does for a planner-produced plan, so
-    dense and MoE topologies share this one reuse path.
+    Generated source keeps each unwrapped implementation in ``_forward_impl``.
+    Restoring it before the native apply avoids wrapping the emitted display
+    shell and leaves Phase C with exactly one execution wrapper.
     """
-    from hyper_parallel.distributed.mesh import MeshContext  # pylint: disable=C0415
-    from hyper_parallel.distributed._builder.applier import (  # pylint: disable=C0415
-        _apply_plan_special_handlers,
-        _get_active_mesh,
-        _get_tp_submesh,
-    )
-    from hyper_parallel.distributed._builder.parameter_sharding import (  # pylint: disable=C0415
-        _replicate_tied_weights,
-        _resolve_parameter_source_meshes,
-        _shard_planned_parameters,
-        detect_tied_weights,
-    )
+    from hyper_parallel.distributed.apply import apply_sharding_plan  # pylint: disable=C0415
 
-    plan = _rebuild_live_plan_from_meta(meta)
-    mesh_dim_names = plan.mesh_dim_names
-    param_plan = meta.param_plan or {}
-    injections = hp_expand_injections(meta.injections or [])
-
-    mc = mesh_context if isinstance(mesh_context, MeshContext) else None
-    device_mesh = mc.device_mesh if mc is not None else mesh_context
-    if device_mesh is None:
-        raise ValueError(
-            "native A/B/D reuse requires a DeviceMesh / MeshContext"
+    if getattr(model, "_hp_codegen_parallelized", False):
+        raise RuntimeError(
+            "codegen: generated model parallelization was requested more than once; "
+            "the frozen plan and its runtime bindings must be applied exactly once"
         )
-    mesh = _get_active_mesh(device_mesh, mesh_dim_names)
-    tp_mesh = _get_tp_submesh(mesh, mesh_dim_names)
-    expert_mesh, dense_source_mesh, expert_source_mesh = (
-        _resolve_parameter_source_meshes(plan, mesh_context, device_mesh, tp_mesh)
+
+    _verify_materialized_replacements(model, meta, generated_module)
+    plan = _rebuild_live_plan_from_meta(meta)
+    del generated_module
+    _restore_native_phase_c_inputs(model, plan)
+
+    _, source_shard_info = apply_sharding_plan(
+        model, plan, mesh_context, validate_mode=False,
+    )
+    model._hp_codegen_parallelized = True
+    return source_shard_info or {}
+
+
+def _restore_native_phase_c_inputs(model: Any, plan: Any) -> None:
+    """Remove emitted boundary shells before native Phase C wraps forwards."""
+    from hyper_parallel.distributed._builder.parameter_sharding import (  # pylint: disable=C0415
+        _resolve_module,
     )
 
-    # Native A / B / D are executed against the reconstructed live plan.
-    _shard_planned_parameters([model], plan, mesh, expert_mesh, validate_mode=False)
-    _apply_plan_special_handlers([model], plan, mesh)
-    _replicate_tied_weights(model, list(plan.tied_pairs) or detect_tied_weights(model))
+    for module_fqn, spec in plan.modules.items():
+        if not spec.is_boundary:
+            continue
+        module = _resolve_module(model, module_fqn)
+        forward_impl = getattr(module, "_forward_impl", None)
+        if forward_impl is not None:
+            module.forward = forward_impl
 
-    # Native C is not reusable (see docstring) — keep the codegen forward
-    # assembly that matches the pre-rewritten generated file.
-    hp_install_boundaries(
-        model,
-        param_plan,
-        mesh_context,
-        mesh_dim_names,
-        injections=injections,
-        generated_module=generated_module,
+
+def _verify_materialized_replacements(
+    model: Any, meta: CodegenMeta, generated_module: Any,
+) -> None:
+    """Require every replacement owned by generated source to be present."""
+    from hyper_parallel.codegen.patch_plan import _resolve_symbol  # pylint: disable=C0415
+    from hyper_parallel.distributed._builder.parameter_sharding import (  # pylint: disable=C0415
+        _resolve_module,
     )
-    hp_bind_inline_state(
-        model,
-        mesh_context,
-        mesh_dim_names,
-        generated_module=generated_module,
-    )
-    hp_bind_compute(
-        model,
-        injections,
-        mesh_context,
-        mesh_dim_names,
-        param_plan=param_plan,
-        generated_module=generated_module,
-    )
-    hp_apply_inner_wrapper(
-        model,
-        injections,
-        mesh_context,
-        mesh_dim_names,
-        param_plan=param_plan,
-        generated_module=generated_module,
-    )
-    return hp_build_tp_grad_info(
-        model, plan, dense_source_mesh, expert_source_mesh
-    )
+
+    replacements = (meta.emission_patches or {}).get("module_replacements", ())
+    for replacement in replacements:
+        module_fqn = replacement.get("module_fqn")
+        replacement_path = replacement.get("replacement_type")
+        if not module_fqn or not replacement_path:
+            raise RuntimeError(
+                "codegen: malformed materialized module replacement in codegen_meta.json"
+            )
+        module = _resolve_module(model, module_fqn)
+        replacement_type = _resolve_symbol(replacement_path)
+        module_type = type(module)
+        generated_equivalent = (
+            module_type.__name__ == replacement_type.__name__
+            and module_type.__module__ == generated_module.__name__
+        )
+        if not isinstance(module, replacement_type) and not generated_equivalent:
+            raise RuntimeError(
+                f"codegen: generated source did not materialize {module_fqn!r} as "
+                f"{replacement_path}; regenerate the artifact instead of applying "
+                "the trainer replacement again"
+            )
 
 
 __all__ = [

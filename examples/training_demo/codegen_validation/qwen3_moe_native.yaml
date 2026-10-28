@@ -86,27 +86,31 @@ dataset:
       _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
       pretrained_model_name_or_path: __QWEN_CONFIG__
       local_files_only: true
-      use_fast: true
-      trust_remote_code: false
-  data_transform:
-    _target_: hyper_parallel.data.text.text_transform.build_text_transform
-    data_type: plaintext
-    text_keys: text
-    max_seq_len: 128
-  _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
-  data_path: __VAL_ROOT__/data/parallel_online.jsonl
+      tokenizer_type: pretokenized
+      vocab_size: 151936
+      eod_token_id: 151645
+  _target_: hyper_parallel.data.text.build_dataset.build_indexed_text_dataset
+  data_path: __VAL_ROOT__/data/parallel_offline_text_document
   data_config:
-    create_attention_mask_in_dataloader: true
+    seq_length: 128
+    split: "1, 0, 0"
+    mock_data: false
+    distributed_walk: true
+    is_dataset_from_mr: false
+    simple_blend: "no"
+    data_lazy_load: true
+    skip_data_check: true
     labels_are_shifted: true
+    create_attention_mask_in_dataloader: false
+    create_ltor_fields_in_dataloader: false
 
 dataloader:
-  _target_: hyper_parallel.data.batching.TokenBatchLoader
-  min_buffered_samples: 8
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
   collate_fn:
-    _target_: hyper_parallel.data.batching.build_online_text_collate_fn
+    _target_: hyper_parallel.data.batching.build_indexed_collate_fn
   get_batch:
     _target_: hyper_parallel.data.batching.TextParallelBatch
-    source_type: online
+    source_type: indexed
     attention_mode: dense
   sampler_type: single
   data_rearrange_map: null
