@@ -70,6 +70,41 @@ def _causal_attention_mask(
     return torch.logical_not(allowed)
 
 
+# Side length of the placeholder mask the NPU causal sparse modes expect. The
+# kernel reads it as a compressed description of the causal pattern, not as a
+# per-position mask, so the value does not track the sequence length -- the same
+# constant is what the packed branch below has always used.
+_COMPRESSED_CAUSAL_MASK_SIZE = 2048
+_COMPRESSED_CAUSAL_MASKS: dict[torch.device, torch.Tensor] = {}
+
+
+def _compressed_causal_mask(device: torch.device) -> torch.Tensor:
+    """Return the cached placeholder for the NPU left-up causal sparse modes.
+
+    One tensor per device, built once and shared by every layer and step. The
+    kernel only reads it, so the same instance can back every call.
+
+    Args:
+        device: Device the placeholder must live on.
+
+    Returns:
+        The shared ``[_COMPRESSED_CAUSAL_MASK_SIZE]``-square upper-triangular
+        bool placeholder for ``device``.
+    """
+    mask = _COMPRESSED_CAUSAL_MASKS.get(device)
+    if mask is None:
+        mask = torch.triu(
+            torch.ones(
+                (_COMPRESSED_CAUSAL_MASK_SIZE, _COMPRESSED_CAUSAL_MASK_SIZE),
+                dtype=torch.bool,
+                device=device,
+            ),
+            diagonal=1,
+        )
+        _COMPRESSED_CAUSAL_MASKS[device] = mask
+    return mask
+
+
 def _length_list(
     value: torch.Tensor | Sequence[int],
     *,
@@ -231,12 +266,20 @@ def _prepare_attention_inputs(
         key = key.transpose(1, 2).reshape(-1, key.shape[1], key.shape[-1])
         value = value.transpose(1, 2).reshape(-1, value.shape[1], value.shape[-1])
         if attention_mask is None and is_causal:
-            npu_mask = torch.ones((2048, 2048), dtype=torch.bool, device=query.device).triu(diagonal=1)
+            npu_mask = _compressed_causal_mask(query.device)
             sparse_mode = 3
         else:
             npu_mask = None if attention_mask is None else _npu_attention_mask(attention_mask)
         return query, key, value, "TND", npu_mask, sparse_mode
     if attention_mask is None and is_causal:
+        # Training (q_len == k_len, no window): the right-aligned mask built
+        # below degenerates to the left-up triangle, so the kernel's own causal
+        # path produces it directly -- sparse_mode=2 with the cached
+        # placeholder, instead of a [S, S] mask rebuilt for every layer and
+        # every step. Decoding (q_len < k_len, causally shifted right) and
+        # sliding windows are not that triangle and keep the materialised mask.
+        if sliding_window is None and query.shape[2] == key.shape[2]:
+            return query, key, value, "BNSD", _compressed_causal_mask(query.device), 2
         return query, key, value, "BNSD", _causal_attention_mask(query, key, sliding_window), 0
     npu_mask = None if attention_mask is None else _npu_attention_mask(attention_mask)
     return query, key, value, "BNSD", npu_mask, sparse_mode
