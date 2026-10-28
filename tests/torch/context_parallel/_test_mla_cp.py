@@ -43,7 +43,7 @@ from hyper_parallel.models.deepseek_v3.adapter.distributed.context_parallel impo
 from hyper_parallel.trainer.config import Target
 from hyper_parallel.trainer.runtime.metrics import mean_global_loss
 from tests.common.mla_cp_utils import (
-    attention_options, make_mla, position_embeddings,
+    attention_options, install_mla_cp, make_mla, position_embeddings,
     make_deepseek_model, replace_and_load_mla,
 )
 
@@ -512,3 +512,126 @@ def test_mla_model_dp2_tp2_cp2_fsdp() -> None:
     Expectation: Full logical gradients and global losses agree with the non-CP model within BF16 tolerances.
     """
     _run_fsdp(2)
+
+
+def _overlap_graph_nodes(output: torch.Tensor) -> list[str]:
+    """Check that a numerical pass actually used the requested scheduled adjoints."""
+    pending, seen, names = [output.grad_fn], set(), []
+    while pending:
+        node = pending.pop()
+        if node is None or node in seen:
+            continue
+        seen.add(node)
+        names.append(type(node).__name__)
+        pending.extend(child for child, _ in node.next_functions)
+    return names
+
+
+def _overlap_snapshot(module, mesh, strategy, packed, gated, overlap, degree):
+    """Keep two forward states alive before backward, then inspect local accumulated gradients."""
+    install_mla_cp(module, mesh, strategy, overlap=overlap, ulysses_degree=degree)
+    rank, world = mesh.get_local_rank(), mesh.size()
+    batch, local = (1 if packed else 2), 64
+    sequence, hidden = local * world, module.linear_qkv.in_features
+    device, dtype = module.linear_qkv.weight.device, module.linear_qkv.weight.dtype
+    metadata = attention_options((37, sequence // 2 + 3, sequence) if packed else None)
+    positions = position_embeddings(sequence, module.qk_rope_head_dim, metadata, dtype=dtype, device=device)
+    options = dict(metadata, position_embeddings=tuple(part[:, rank * local:(rank + 1) * local] for part in positions))
+    inputs, outputs, losses = [], [], []
+
+    def forward(value: torch.Tensor) -> torch.Tensor:
+        """Use one callable for direct and non-reentrant checkpoint execution."""
+        result = module(value, **options)
+        return result if gated else result[0]
+
+    for microbatch in range(2):
+        generator = torch.Generator().manual_seed(821 + microbatch)
+        full_input = torch.randn(batch, sequence, hidden, generator=generator, dtype=dtype)
+        probe = torch.randn(batch, sequence, hidden, generator=generator).to(device)
+        value = full_input[:, rank * local:(rank + 1) * local].to(device).clone().requires_grad_()
+        output = checkpoint(forward, value, use_reentrant=False) if packed else forward(value)
+        nodes = _overlap_graph_nodes(output)
+        consumer = "_GatedExpandedInputA2AWaitBackward" if gated else "_ExpandedInputA2AWaitBackward"
+        if strategy == "latent_kv_head":
+            consumer = "_LatentInputA2AWaitBackward"
+        output_node = "_GatedOutputProjectionBackward" if gated else "_OutputProjectionBackward"
+        expected_input = int(overlap and degree == world)
+        assert nodes.count(consumer) == expected_input, (
+            f"Input adjoint count: expected={expected_input}, actual={nodes.count(consumer)}"
+        )
+        assert nodes.count(output_node) == int(overlap), (
+            f"Output adjoint count: expected={int(overlap)}, actual={nodes.count(output_node)}"
+        )
+        inputs.append(value)
+        outputs.append(output)
+        losses.append((output.float() * probe[:, rank * local:(rank + 1) * local]).sum() / (full_input.numel() * 2))
+    # Reusing state across forward calls or dropping dG would corrupt this accumulation.
+    for loss in losses:
+        loss.backward()
+    result = {"output": torch.cat([value.detach().cpu().flatten() for value in outputs]),
+              "input_gradient": torch.cat([value.grad.detach().cpu().flatten() for value in inputs])}
+    for name, parameter in module.named_parameters():
+        assert parameter.grad is not None, f"Missing accumulated gradient: parameter={name}, expected=Tensor"
+        result[name] = parameter.grad.detach().cpu().clone()
+    return result
+
+
+def _check_overlap_snapshot(actual: dict, expected: dict) -> float:
+    """Compare each gradient before any parameter AllReduce can hide a local error."""
+    maximum = 0.0
+    for name, reference in expected.items():
+        value, reference = actual[name].double(), reference.double()
+        torch.testing.assert_close(
+            value, reference, atol=1e-7, rtol=0.015, msg=lambda message, label=name: f"{label}: {message}",
+        )
+        relative = ((value - reference).norm() / reference.norm().clamp_min(1e-12)).item()
+        assert relative < 0.015, f"{name} relative L2: expected<0.015, actual={relative}"
+        maximum = max(maximum, relative)
+    return maximum
+
+
+def test_mla_overlap_npu_bfloat16() -> None:
+    """
+    Feature: Actual paired MLA input and output adjoints, including gated NoPE MLA.
+    Description: Use real HCCL for U4/U2AG2 and compare accumulated gradients with overlap off.
+    Expectation: All gradients are present and both schedules agree within BF16 tolerance.
+    """
+    device = _npu_device()
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    hccl_deterministic = os.environ.get("HCCL_DETERMINISTIC")
+    # Isolate scheduling regressions from the default HCCL reduction-order variation.
+    os.environ["HCCL_DETERMINISTIC"] = "true"
+    torch.use_deterministic_algorithms(True)
+    try:
+        dist.init_process_group("hccl", timeout=timedelta(seconds=180))
+        world = dist.get_world_size()
+        assert world == 4, f"MLA overlap regression expects CP4, actual CP={world}"
+        mesh = init_device_mesh(device.type, (world,), mesh_dim_names=("cp",))
+        dimensions = MLADimensions(8, 32, 32, 128, 64, 128)
+        maximum = 0.0
+        for gated in (False, True):
+            torch.manual_seed(419)
+            module = make_mla(dimensions, dtype=torch.bfloat16, interleaved=True, gated=gated).to(device)
+            for strategy in MLA_CP_STRATEGIES:
+                for packed, degree in ((False, world), (True, world), (False, 2)):
+                    expected = _overlap_snapshot(deepcopy(module), mesh, strategy, packed, gated, False, degree)
+                    actual = _overlap_snapshot(deepcopy(module), mesh, strategy, packed, gated, True, degree)
+                    relative = _check_overlap_snapshot(actual, expected)
+                    maximum = max(maximum, relative)
+                    if dist.get_rank() == 0:
+                        print(json.dumps({"gated": gated, "strategy": strategy, "packed": packed,
+                                          "ulysses": degree, "cp": world, "backward_passes": 2,
+                                          "max_relative_l2": relative}), flush=True)
+        global_maximum = torch.tensor(maximum, device=device)
+        dist.all_reduce(global_maximum, op=dist.ReduceOp.MAX)
+        if dist.get_rank() == 0:
+            print(json.dumps({"configurations": 12, "ranks": world,
+                              "global_max_relative_l2": global_maximum.item()}), flush=True)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        torch.use_deterministic_algorithms(deterministic)
+        if hccl_deterministic is None:
+            os.environ.pop("HCCL_DETERMINISTIC", None)
+        else:
+            os.environ["HCCL_DETERMINISTIC"] = hccl_deterministic

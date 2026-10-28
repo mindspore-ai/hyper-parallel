@@ -33,6 +33,7 @@ from hyper_parallel.distributed._builder.forward_rewriter import (
 )
 from hyper_parallel.distributed.context_parallel.mla_context_parallel import MLADimensions
 from hyper_parallel.models.deepseek_v3.adapter.distributed.context_parallel import mla_cp_wrapper
+from hyper_parallel.models.kimi_k3.adapter.mla import KimiMLAAttention
 from hyper_parallel.models.replacement import (
     ModuleReplacementSpec, apply_module_replacements, compile_module_replacements,
 )
@@ -88,6 +89,7 @@ def make_mla(
     interleaved: bool = False,
     bias: bool = True,
     hidden_dim: int | None = None,
+    gated: bool = False,
 ) -> MLAAttention:
     """Build the replacement and explicitly load its declared fused down-projection weights."""
     dims = dimensions or MLADimensions(4, 5, 6, 3, 2, 4)
@@ -106,8 +108,13 @@ def make_mla(
     source.o_proj = nn.Linear(dims.heads * dims.value_dim, hidden_dim, bias=bias)
     source.scaling = dims.qk_dim**-0.5 * 0.73
     source.rotary_interleaved = interleaved
+    if gated:
+        source.use_nope = True
+        source.use_output_gate = True
+        source.g_proj = nn.Linear(hidden_dim, dims.heads * dims.value_dim, bias=bias)
     source = source.to(dtype=dtype)
-    result = MLAAttention(module=source)
+    replacement = KimiMLAAttention if gated else MLAAttention
+    result = replacement(module=source)
     with torch.no_grad():
         result.linear_qkv.weight.copy_(torch.cat((source.q_a_proj.weight, source.kv_a_proj_with_mqa.weight)))
         if bias:
@@ -117,7 +124,14 @@ def make_mla(
 
 def install_mla_cp(module: MLAAttention, mesh: TestCPMesh, strategy: str, **options: Any) -> None:
     """Commit the same adapter requests as the recipe rewriter, for isolated tests."""
-    requests = mla_cp_wrapper(module, None, None, mesh, None, strategy=strategy, **options)
+    wrapper = mla_cp_wrapper
+    if isinstance(module, KimiMLAAttention):
+        # Kimi CP also imports optional KDA kernels; keep ordinary CPU fixtures independent.
+        from hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel import (  # pylint: disable=C0415
+            kimi_mla_cp_wrapper,
+        )
+        wrapper = kimi_mla_cp_wrapper
+    requests = wrapper(module, None, None, mesh, None, strategy=strategy, **options)
     for request in requests:
         validate_wrapped_forward(request.target.forward, request.forward, owner="MLA CP test")
     for request in requests:

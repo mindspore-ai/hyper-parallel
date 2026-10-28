@@ -65,3 +65,14 @@ def test_mla_local_callbacks_npu_4_cards() -> None:
     Expectation: Local callbacks preserve the unsharded output and gradient contract.
     """
     torchrun_case(_WORKER, "test_mla_local_callbacks_npu_bfloat16", num_proc=4)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+          card_mark="allcards", essential_mark="essential")
+def test_mla_overlap_npu_4_cards() -> None:
+    """
+    Feature: Ordinary and gated MLA forward/backward overlap on four NPUs.
+    Description: Compare both strategies with B2, packed checkpointing and two-microbatch accumulation.
+    Expectation: Scheduled gradient nodes execute and outputs/gradients match overlap-disabled execution.
+    """
+    torchrun_case(_WORKER, "test_mla_overlap_npu_bfloat16", num_proc=4)
