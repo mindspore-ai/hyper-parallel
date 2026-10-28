@@ -86,7 +86,9 @@ class ToolOnlyThinkingTokenizer(MultiTurnThinkingTokenizer):
         super().__init__()
         self.vocab.update({"\n\n": 6, "\n": 7})
 
-    def apply_chat_template(self, messages, **kwargs):
+    def apply_chat_template(
+            self, messages, tokenize=True, add_generation_prompt=False, return_dict=True, **kwargs,
+    ):
         """Keep tool-call serialization in the native template, not the training encoder."""
         rendered_messages = []
         for message in messages:
@@ -96,7 +98,10 @@ class ToolOnlyThinkingTokenizer(MultiTurnThinkingTokenizer):
             for call in message.get("tool_calls", []):
                 rendered["content"] += "<tool_call>" + json.dumps(call, ensure_ascii=False) + "</tool_call>"
             rendered_messages.append(rendered)
-        return super().apply_chat_template(rendered_messages, **kwargs)
+        return super().apply_chat_template(
+            rendered_messages, tokenize=tokenize, add_generation_prompt=add_generation_prompt,
+            return_dict=return_dict, **kwargs,
+        )
 
 
 class TestChatTemplateGoldens(unittest.TestCase):
@@ -438,11 +443,17 @@ class TestChatTemplateGoldens(unittest.TestCase):
         class RewritingToolTokenizer(ToolOnlyThinkingTokenizer):
             """Change a historical tool argument after a response arrives."""
 
-            def apply_chat_template(self, messages, **kwargs):
+            def apply_chat_template(
+                    self, messages, tokenize=True, add_generation_prompt=False, return_dict=True, **kwargs,
+            ):
+                """Rewrite historical arguments while retaining rendering options."""
                 changed = json.loads(json.dumps(messages))
                 if len(changed) >= 3:
                     changed[1]["tool_calls"][0]["function"]["arguments"] = {"query": "rewritten"}
-                return super().apply_chat_template(changed, **kwargs)
+                return super().apply_chat_template(
+                    changed, tokenize=tokenize, add_generation_prompt=add_generation_prompt,
+                    return_dict=return_dict, **kwargs,
+                )
 
         messages = [{"role": "user", "content": "Question"},
                     {"role": "assistant", "content": "", "reasoning_content": "",
@@ -464,12 +475,18 @@ class TestChatTemplateGoldens(unittest.TestCase):
         class HistoryRewritingTokenizer(MultiTurnThinkingTokenizer):
             """Emulate a native template that removes historical reasoning."""
 
-            def apply_chat_template(self, messages: Any, **kwargs: Any) -> Any:
+            def apply_chat_template(
+                    self, messages: Any, tokenize: bool = True, add_generation_prompt: bool = False,
+                    return_dict: bool = True, **kwargs: Any,
+            ) -> Any:
                 """Remove historical reasoning only when preservation is not enabled."""
                 modified = [dict(message) for message in messages]
                 if len(modified) >= 3 and not kwargs.get("preserve_thinking", False):
                     modified[1]["reasoning_content"] = ""
-                return super().apply_chat_template(modified, **kwargs)
+                return super().apply_chat_template(
+                    modified, tokenize=tokenize, add_generation_prompt=add_generation_prompt,
+                    return_dict=return_dict, **kwargs,
+                )
 
         messages = [
             {"role": "user", "content": "Question"},

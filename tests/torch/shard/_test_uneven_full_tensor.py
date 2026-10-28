@@ -43,7 +43,8 @@ def _check_export(full, mesh, placements):
         output = tensor.full_tensor()
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
     assert not output.requires_grad, f"Unexpected export requires_grad={output.requires_grad}"
-    assert output._base is None, f"Export must own storage, got base={output._base}"
+    # Exercise the shared internal integration contract; no public equivalent exists.
+    assert output._base is None, f"Export must own storage, got base={output._base}"  # pylint: disable=protected-access
     assert output.untyped_storage().nbytes() == output.numel() * output.element_size(), (
         f"Storage is not compact: bytes={output.untyped_storage().nbytes()}, numel={output.numel()}"
     )

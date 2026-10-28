@@ -43,7 +43,8 @@ def _compare(encoder_cp_size: int) -> None:
         config = Qwen3_5MoeVisionConfig(hidden_size=16, intermediate_size=32, num_heads=4, depth=2,
                                        out_hidden_size=16, patch_size=2, spatial_merge_size=2,
                                        temporal_patch_size=2, num_position_embeddings=16)
-        config._attn_implementation = "sdpa"
+        # Exercise the shared internal integration contract; no public equivalent exists.
+        config._attn_implementation = "sdpa"  # pylint: disable=protected-access
         model = nn.Module()
         model.config = SimpleNamespace(model_type="qwen3_5_moe", image_token_id=99)
         model.model = nn.Module()
@@ -80,7 +81,7 @@ def _compare(encoder_cp_size: int) -> None:
                     raise AssertionError(f"Missing gradient: {name}")
                 dist.all_reduce(parameter.grad)
                 torch.testing.assert_close(parameter.grad, reference[name].grad, rtol=2e-4, atol=2e-5,
-                                           msg=lambda message: f"{name}: {message}")
+                                           msg=lambda message, name=name: f"{name}: {message}")
     finally:
         dist.destroy_process_group()
 

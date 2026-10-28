@@ -1453,20 +1453,18 @@ def gdn_ulysses_cp_wrapper(
                 return _gdn_cp_conv1d_module(
                     original_conv_forward, conv_module, cp_mesh, hidden_states)
 
-        wrapped_rules = {}
-        for name, original_rule in original_rules.items():
-            wrapped_rule = make_cp_rule(original_rule)
-
+        def count_rule(wrapped_rule):
             @functools.wraps(wrapped_rule)
-            def counted_rule(
-                *rule_args: Any,
-                __wrapped_rule: Callable[..., Any] = wrapped_rule,
-                **rule_kwargs: Any,
-            ) -> Any:
+            def counted_rule(*rule_args: Any, **rule_kwargs: Any) -> Any:
                 fired["rule"] += 1
-                return __wrapped_rule(*rule_args, **rule_kwargs)
+                return wrapped_rule(*rule_args, **rule_kwargs)
 
-            wrapped_rules[name] = counted_rule
+            return counted_rule
+
+        wrapped_rules = {
+            name: count_rule(make_cp_rule(original_rule))
+            for name, original_rule in original_rules.items()
+        }
 
         if use_fused_conv:
             replace_primitive(conv_owner, conv_name, cp_conv)

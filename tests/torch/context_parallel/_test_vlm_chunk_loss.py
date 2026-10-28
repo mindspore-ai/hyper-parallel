@@ -40,7 +40,7 @@ def _compare_gradients(candidate: torch.nn.Module, reference: torch.nn.Module) -
         dist.all_reduce(param.grad)
         dist.all_reduce(ref.grad)
         torch.testing.assert_close(param.grad, ref.grad, atol=3e-6, rtol=3e-4,
-                                   msg=lambda message: f"{name}: {message}")
+                                   msg=lambda message, name=name: f"{name}: {message}")
 
 
 def test_chunk_loss_cp() -> None:
@@ -55,49 +55,54 @@ def test_chunk_loss_cp() -> None:
                  (qwen3_5_gdn_p2p_cp_wrapper, sdpa_hf_cp_wrapper))
         for gdn_wrapper, attention_wrapper in modes:
             for bind_first in (True, False):
-                torch.manual_seed(42)
-                reference = make_model()
-                candidate = copy.deepcopy(reference)
-                objective = ChunkedCausalLMLoss(chunk_size=17)
-                batchers = []
-                for model in (reference, candidate):
-                    layers = model.model.language_model.layers
-                    _commit_forward_rewrite(gdn_wrapper(layers[0].linear_attn, mesh, mesh["tp"], mesh["cp"], None))
-                    attention = layers[1].self_attn
-                    _commit_forward_rewrite(_ForwardRewriteRequest(
-                        attention, attention_wrapper(attention, mesh, mesh["tp"], mesh["cp"], None)))
-                    if model is candidate and bind_first:
-                        objective.bind_model(model)
-                    batcher = QwenVLMParallelBatch(mesh_context=context, device=torch.device("cpu"))
-                    batcher.bind_model(model)
-                    if model is candidate and not bind_first:
-                        objective.bind_model(model)
-                    batchers.append(batcher)
-                for image_start, supervised_start in ((62, 2), (5, 65), (5, 100)):
-                    batch = make_batch(image_start, supervised_start)
-                    losses = []
-                    for model, batcher in zip((reference, candidate), batchers):
-                        model.zero_grad(set_to_none=True)
-                        inputs, loss_inputs = batcher(None, external_batch=batch)
-                        count = count_loss_token(loss_inputs)["foundation_tokens"]
-                        total = count.clone()
-                        dist.all_reduce(total)
-                        if model is candidate:
-                            torch.testing.assert_close(inputs["shift_labels"], inputs["vlm_cp_inputs"].targets)
-                            output = model(**objective.prepare_model_inputs(inputs, loss_inputs), use_cache=False)
-                            if output.logits is not None:
-                                raise AssertionError("Chunk path materialized logits")
-                            loss = objective(model_output=output, labels=None)
-                        else:
-                            loss = model(**inputs, use_cache=False).loss
-                        scaled = loss * count / total.clamp_min(1)
-                        reduced = scaled.detach().clone()
-                        dist.all_reduce(reduced)
-                        losses.append(reduced)
-                        scaled.backward()
-                    torch.testing.assert_close(losses[0], losses[1], atol=1e-6, rtol=1e-6)
-                    _compare_gradients(candidate, reference)
-                if dist.get_rank() == 0:
-                    print(f"PASS {gdn_wrapper.__name__} bind_first={bind_first}", flush=True)
+                _check_chunk_loss_mode(mesh, context, gdn_wrapper, attention_wrapper, bind_first)
     finally:
         dist.destroy_process_group()
+
+
+def _check_chunk_loss_mode(mesh, context, gdn_wrapper, attention_wrapper, bind_first):
+    """Compare all image boundaries for one wrapper and binding order."""
+    torch.manual_seed(42)
+    reference = make_model()
+    candidate = copy.deepcopy(reference)
+    objective = ChunkedCausalLMLoss(chunk_size=17)
+    batchers = []
+    for model in (reference, candidate):
+        layers = model.model.language_model.layers
+        _commit_forward_rewrite(gdn_wrapper(layers[0].linear_attn, mesh, mesh["tp"], mesh["cp"], None))
+        attention = layers[1].self_attn
+        _commit_forward_rewrite(_ForwardRewriteRequest(
+            attention, attention_wrapper(attention, mesh, mesh["tp"], mesh["cp"], None)))
+        if model is candidate and bind_first:
+            objective.bind_model(model)
+        batcher = QwenVLMParallelBatch(mesh_context=context, device=torch.device("cpu"))
+        batcher.bind_model(model)
+        if model is candidate and not bind_first:
+            objective.bind_model(model)
+        batchers.append(batcher)
+    for image_start, supervised_start in ((62, 2), (5, 65), (5, 100)):
+        batch = make_batch(image_start, supervised_start)
+        losses = []
+        for model, batcher in zip((reference, candidate), batchers):
+            model.zero_grad(set_to_none=True)
+            inputs, loss_inputs = batcher(None, external_batch=batch)
+            count = count_loss_token(loss_inputs)["foundation_tokens"]
+            total = count.clone()
+            dist.all_reduce(total)
+            if model is candidate:
+                torch.testing.assert_close(inputs["shift_labels"], inputs["vlm_cp_inputs"].targets)
+                output = model(**objective.prepare_model_inputs(inputs, loss_inputs), use_cache=False)
+                if output.logits is not None:
+                    raise AssertionError("Chunk path materialized logits")
+                loss = objective(model_output=output, labels=None)
+            else:
+                loss = model(**inputs, use_cache=False).loss
+            scaled = loss * count / total.clamp_min(1)
+            reduced = scaled.detach().clone()
+            dist.all_reduce(reduced)
+            losses.append(reduced)
+            scaled.backward()
+        torch.testing.assert_close(losses[0], losses[1], atol=1e-6, rtol=1e-6)
+        _compare_gradients(candidate, reference)
+    if dist.get_rank() == 0:
+        print(f"PASS {gdn_wrapper.__name__} bind_first={bind_first}", flush=True)

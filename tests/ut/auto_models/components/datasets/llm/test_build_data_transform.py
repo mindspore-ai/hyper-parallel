@@ -69,7 +69,7 @@ class _ToolsRecordingChatTemplate(_RecordingChatTemplate):
             self,
             messages: Sequence[Mapping[str, Any]],
             max_seq_len: int,
-            tools: Sequence[Mapping[str, Any]],
+            tools: Sequence[Mapping[str, Any]] = (),
     ) -> dict[str, list[int]]:
         """Record configured tools before encoding the conversation."""
         self.tools = [dict(tool) for tool in tools]

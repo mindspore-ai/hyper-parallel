@@ -201,27 +201,7 @@ class CheckpointManager:
         for prefix, names in expert_groups.items():
             if any(name not in expected or state_dict[name].ndim != 3 for name in names):
                 raise ValueError(f"Unsupported DCP expert parameters under {prefix}; expected batched HF weights")
-            hf_matches = all(state_dict[name].shape == expected[name].shape for name in names)
-            transposed_matches = all(
-                state_dict[name].transpose(-2, -1).shape == expected[name].shape for name in names
-            )
-            if layout == "auto" and hf_matches and transposed_matches:
-                raise ValueError(
-                    f"Ambiguous expert layout under {prefix}; explicitly select hf or grouped_gemm"
-                )
-            transpose = layout == "grouped_gemm" or (layout == "auto" and not hf_matches)
-            if transpose and not transposed_matches:
-                raise ValueError(
-                    f"DCP expert shapes under {prefix} do not match the requested HF layout: "
-                    + ", ".join(
-                        f"{name}: DCP {tuple(state_dict[name].shape)}, HF {tuple(expected[name].shape)}"
-                        for name in names
-                    )
-                )
-            if transpose:
-                for name in names:
-                    result[name] = state_dict[name].transpose(-2, -1).contiguous()
-                logger.info("Restored HF expert layout for %s", prefix)
+            self._restore_expert_group(state_dict, expected, result, prefix, names, layout)
         for name, tensor in result.items():
             target = expected.get(name)
             if target is None:
@@ -232,6 +212,31 @@ class CheckpointManager:
                     f"but HF expects {tuple(target.shape)}; check model config and expert layout"
                 )
         return result
+
+    @staticmethod
+    def _restore_expert_group(state_dict, expected, result, prefix, names, layout):
+        """Restore one expert group while rejecting ambiguous or incompatible layouts."""
+        hf_matches = all(state_dict[name].shape == expected[name].shape for name in names)
+        transposed_matches = all(
+            state_dict[name].transpose(-2, -1).shape == expected[name].shape for name in names
+        )
+        if layout == "auto" and hf_matches and transposed_matches:
+            raise ValueError(
+                f"Ambiguous expert layout under {prefix}; explicitly select hf or grouped_gemm"
+            )
+        transpose = layout == "grouped_gemm" or (layout == "auto" and not hf_matches)
+        if transpose and not transposed_matches:
+            raise ValueError(
+                f"DCP expert shapes under {prefix} do not match the requested HF layout: "
+                + ", ".join(
+                    f"{name}: DCP {tuple(state_dict[name].shape)}, HF {tuple(expected[name].shape)}"
+                    for name in names
+                )
+            )
+        if transpose:
+            for name in names:
+                result[name] = state_dict[name].transpose(-2, -1).contiguous()
+            logger.info("Restored HF expert layout for %s", prefix)
 
     @staticmethod
     def _model_key_from_dcp(

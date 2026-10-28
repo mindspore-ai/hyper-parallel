@@ -26,7 +26,9 @@ Only utility imports are redirected; existing Hyper backend kernels are unchange
 import os
 from typing import Optional
 
-# Preserve upstream Triton signatures, including launch metadata unused by some kernels.
+# Preserve upstream Triton argument names and constexpr/heuristic keys for kernel compatibility.
+# Naming exemption matches the existing _triton/gated_delta_net kernels.
+# pylint: disable=invalid-name
 # pylint: disable=missing-public-type-hints,missing-public-docstring,unused-argument
 # This optional implementation is PyTorch/NPU-specific.
 import torch  # pylint: disable=forbidden-backend-import
@@ -56,6 +58,7 @@ def solve_tril_16x16_kernel(
     IS_VARLEN: tl.constexpr,
     DOT_PRECISION: tl.constexpr
 ):
+    """Invert each 16-by-16 unit lower-triangular block."""
     pid_t, pid_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = pid_bh // H, pid_bh % H
 
@@ -70,7 +73,6 @@ def solve_tril_16x16_kernel(
         bos, eos = i_b * T, i_b * T + T
         T_eff = T
 
-    o_i = tl.arange(0, 16)
     o_i_fp32 = tl.arange(0, 16).to(tl.float32)
     m_A = o_i_fp32[:, None] > o_i_fp32[None, :]
     m_I = o_i_fp32[:, None] == o_i_fp32[None, :]
@@ -131,6 +133,7 @@ def merge_16x16_to_32x32_inverse_kernel(
     IS_VARLEN: tl.constexpr,
     DOT_PRECISION: tl.constexpr
 ):
+    """Merge 16-by-16 inverse blocks into a 32-by-32 inverse."""
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
@@ -207,6 +210,7 @@ def solve_tril_64x64_kernel(
     IS_VARLEN: tl.constexpr,
     DOT_PRECISION: tl.constexpr
 ):
+    """Invert each 64-by-64 unit lower-triangular block."""
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:

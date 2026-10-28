@@ -133,21 +133,14 @@ class QwenVisionBridge:
         tokens = batch.get("vlm_global_input_ids", batch["input_ids"])
         if tokens.ndim != 2 or tokens.shape[0] != 1:
             raise ValueError("Qwen encoder parallel requires a single unpacked sample")
-        boundaries = batch.get("cu_seq_lens")
-        if boundaries is not None and boundaries.numel() > 2:
-            raise NotImplementedError("Qwen encoder parallel does not support multi-sample packing")
-        if batch.get("pixel_values_videos") is not None or batch.get("video_grid_thw") is not None:
-            raise NotImplementedError("Qwen encoder parallel currently supports images, not videos")
+        self._validate_image_batch(batch)
         positions = (tokens[0] == self.image_token_id).nonzero().flatten().tolist()
         pixels, grids = (batch.get(name) for name in self.input_fields)
         if pixels is None and grids is None:
             if positions:
                 raise ValueError("Image tokens are present without image tensors")
             return ()
-        if not torch.is_tensor(pixels) or not torch.is_tensor(grids) or pixels.ndim != 2:
-            raise ValueError("Qwen image tensors must contain flattened patches and grid_thw")
-        if grids.ndim != 2 or grids.shape[1] != 3 or grids.dtype not in (torch.int32, torch.int64):
-            raise ValueError("image_grid_thw must be an integer [images, 3] tensor")
+        self._validate_image_payload(pixels, grids)
         items, offset, token_offset = [], 0, 0
         for index, (temporal, height, width) in enumerate(grids.tolist()):
             if temporal != 1 or min(height, width) <= 0 or height % self.merge_size or width % self.merge_size:
@@ -164,6 +157,23 @@ class QwenVisionBridge:
         if offset != pixels.shape[0] or token_offset != len(positions):
             raise ValueError("Image payload/token count does not match image_grid_thw")
         return tuple(items)
+
+    @staticmethod
+    def _validate_image_batch(batch: Mapping[str, Any]) -> None:
+        """Reject unsupported packed samples and video inputs."""
+        boundaries = batch.get("cu_seq_lens")
+        if boundaries is not None and boundaries.numel() > 2:
+            raise NotImplementedError("Qwen encoder parallel does not support multi-sample packing")
+        if batch.get("pixel_values_videos") is not None or batch.get("video_grid_thw") is not None:
+            raise NotImplementedError("Qwen encoder parallel currently supports images, not videos")
+
+    @staticmethod
+    def _validate_image_payload(pixels: torch.Tensor, grids: torch.Tensor) -> None:
+        """Check flattened image patches and integer grid metadata."""
+        if not torch.is_tensor(pixels) or not torch.is_tensor(grids) or pixels.ndim != 2:
+            raise ValueError("Qwen image tensors must contain flattened patches and grid_thw")
+        if grids.ndim != 2 or grids.shape[1] != 3 or grids.dtype not in (torch.int32, torch.int64):
+            raise ValueError("image_grid_thw must be an integer [images, 3] tensor")
 
     def _local_inputs(self, batch: Mapping[str, Any], segments: tuple[EncoderSegment, ...]) -> tuple:
         """Reuse native HF position formulas and select local patches before embedding."""

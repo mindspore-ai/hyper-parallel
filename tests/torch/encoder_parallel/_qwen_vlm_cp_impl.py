@@ -57,7 +57,8 @@ def _compare(encoder_parallel: bool) -> None:
                            "out_hidden_size": 32, "patch_size": 2, "spatial_merge_size": 2,
                            "temporal_patch_size": 2, "num_position_embeddings": 16},
         )
-        config._attn_implementation = "sdpa"
+        # Exercise the shared internal integration contract; no public equivalent exists.
+        config._attn_implementation = "sdpa"  # pylint: disable=protected-access
         model = Qwen3_5MoeForConditionalGeneration(config)
         oracle = copy.deepcopy(model)
         mesh = init_device_mesh("cpu", (1, 2, 1), mesh_dim_names=("dp", "cp", "tp"))
@@ -86,7 +87,8 @@ def _compare(encoder_parallel: bool) -> None:
             labels[ids == 99] = -100
             batch = {"input_ids": ids, "labels": labels, "mm_token_type_ids": ids.eq(99).long(),
                      "pixel_values": torch.randn(16, 24), "image_grid_thw": torch.tensor([[1, 4, 4]])}
-            full = batcher._pad(batch)
+            # Exercise the shared internal integration contract; no public equivalent exists.
+            full = batcher._pad(batch)  # pylint: disable=protected-access
             full.pop("loss_mask")
             expected = oracle(**full, use_cache=False)
             inputs, loss_inputs = batcher(None, external_batch=batch)
@@ -109,7 +111,7 @@ def _compare(encoder_parallel: bool) -> None:
                     raise AssertionError(f"Missing gradient: {name}")
                 dist.all_reduce(parameter.grad)
                 torch.testing.assert_close(parameter.grad, reference[name].grad, rtol=3e-4, atol=3e-5,
-                                           msg=lambda message: f"{name}: {message}")
+                                           msg=lambda message, name=name: f"{name}: {message}")
     finally:
         dist.destroy_process_group()
 

@@ -89,7 +89,7 @@ class TestGDNCPBatch(unittest.TestCase):
         split_inputs = [tensor.detach().clone().requires_grad_() for tensor in inputs]
         outputs = []
         for rank in range(4):
-            mesh = SimpleNamespace(size=lambda: 4, get_local_rank=lambda: rank)
+            mesh = SimpleNamespace(size=lambda: 4, get_local_rank=lambda rank=rank: rank)
             with patch.object(wrappers, "flex_cp_allgather", return_value=tuple(split_inputs[1:])):
                 outputs.append(wrappers._cp_sdpa_call(
                     F.scaled_dot_product_attention, mesh,

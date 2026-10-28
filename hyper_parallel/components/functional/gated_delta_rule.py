@@ -72,14 +72,7 @@ def chunk_gated_delta_rule(
         raise ValueError("AscendC GDN variable-length sequences are not supported yet")
     if chunk_size != 64:
         raise ValueError("AscendC GDN currently requires chunk_size=64")
-    if q.dtype not in (torch.bfloat16, torch.float16) or q.dtype != k.dtype or k.dtype != v.dtype:
-        raise ValueError("AscendC GDN requires matching BF16/FP16 q, k and v")
-    if q.ndim != 4 or k.shape != q.shape or v.ndim != 4 or v.shape[:3] != q.shape[:3]:
-        raise ValueError("Expected sequence-first q/k/v with matching batch, sequence and heads")
-    if g.shape != q.shape[:3] or beta.shape != g.shape:
-        raise ValueError("Expected g and beta with shape [batch, sequence, heads]")
-    if any(tensor.device != q.device for tensor in (k, v, g, beta)):
-        raise ValueError("All GDN inputs must be on the same NPU")
+    _validate_gdn_tensors(q, k, v, g, beta)
     # Import only on an active NPU: the optional kernel queries device properties.
     try:
         kernel = import_module(
@@ -97,3 +90,15 @@ def chunk_gated_delta_rule(
                 "for auxiliary kernels; it does not use the forward-only torch_npu GDN API"
             ) from exc
         raise
+
+
+def _validate_gdn_tensors(q, k, v, g, beta):
+    """Validate the tensor layout, dtype and device contract before dispatch."""
+    if q.dtype not in (torch.bfloat16, torch.float16) or q.dtype != k.dtype or k.dtype != v.dtype:
+        raise ValueError("AscendC GDN requires matching BF16/FP16 q, k and v")
+    if q.ndim != 4 or k.shape != q.shape or v.ndim != 4 or v.shape[:3] != q.shape[:3]:
+        raise ValueError("Expected sequence-first q/k/v with matching batch, sequence and heads")
+    if g.shape != q.shape[:3] or beta.shape != g.shape:
+        raise ValueError("Expected g and beta with shape [batch, sequence, heads]")
+    if any(tensor.device != q.device for tensor in (k, v, g, beta)):
+        raise ValueError("All GDN inputs must be on the same NPU")

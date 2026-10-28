@@ -24,7 +24,9 @@ The sequence-first helper used by other Hyper backends is intentionally unchange
 
 from typing import Optional
 
-# Preserve upstream Triton signatures, including launch metadata unused by some kernels.
+# Preserve upstream Triton argument names and constexpr/heuristic keys for kernel compatibility.
+# Naming exemption matches the existing _triton/gated_delta_net kernels.
+# pylint: disable=invalid-name
 # pylint: disable=missing-public-type-hints,missing-public-docstring,unused-argument
 # This optional implementation is PyTorch/NPU-specific.
 import torch  # pylint: disable=forbidden-backend-import
@@ -55,6 +57,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     B,
     TOTAL_TASKS,
 ):
+    """Compute chunkwise scaled key-key products with optional decay."""
     core_id = tl.program_id(0)
     num_blocks = tl.num_programs(0)
     T_max = T
@@ -159,6 +162,7 @@ def chunk_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
     NC: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
+    """Compute off-diagonal sub-blocks of the chunkwise key-key products."""
     i_t, i_c, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_i, i_j = i_c // NC, i_c % NC
 
@@ -234,6 +238,7 @@ def chunk_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
+    """Compute diagonal sub-blocks of the chunkwise key-key products."""
     i_t, i_i, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
 
     for i_h in range(H):
@@ -245,7 +250,7 @@ def chunk_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
             bos, eos = i_b * T, i_b * T + T
             T_val = T
 
-        should_compute = (i_t * BT + i_i * BC < T_val)
+        should_compute = i_t * BT + i_i * BC < T_val
 
         if should_compute:
             o_i = tl.arange(0, BC)

@@ -242,6 +242,7 @@ class _JsonlMappingSource:
         split_source._file_handles = {}
         split_source._file_stack = ExitStack()
         split_source._reader_process_id = os.getpid()
+        # pylint: enable=protected-access
         return split_source
 
     def _get_file_handle(self, data_file: str) -> Any:

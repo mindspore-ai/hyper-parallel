@@ -291,7 +291,8 @@ class OmniDataTransform:
         return resolved_path
 
 
-class AutoProcessorTransform(OmniDataTransform):
+# Omni hooks are alternatives: eager encoding intentionally leaves deferred hooks unimplemented.
+class AutoProcessorTransform(OmniDataTransform):  # pylint: disable=abstract-method
     """Encode a conversation and supervise only its final assistant response."""
 
     def __init__(

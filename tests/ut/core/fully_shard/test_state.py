@@ -464,7 +464,7 @@ class TestHSDPStateV2(unittest.TestCase):
             output = torch.tensor(values)
             param.reduce_scatter_comm_ctx.reduce_scatter_output = output
 
-            def wait_output():
+            def wait_output(output=output):
                 events.append("wait")
                 return output
 

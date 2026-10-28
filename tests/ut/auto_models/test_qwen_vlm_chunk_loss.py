@@ -109,7 +109,7 @@ class TestQwenVLMChunkLoss(unittest.TestCase):
                 for (name, parameter), ref in zip(model.named_parameters(), reference.parameters()):
                     self.assertIsNotNone(parameter.grad, name)
                     torch.testing.assert_close(parameter.grad, ref.grad, atol=2e-6, rtol=2e-4,
-                                               msg=lambda message: f"{name}: {message}")
+                                               msg=lambda message, name=name: f"{name}: {message}")
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")

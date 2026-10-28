@@ -74,7 +74,8 @@ def validate_record(line: str, line_number: int, transform: TextConversationTran
         result.update(message_count=len(messages), tool_count=len(tools or []))
         result["stage"] = "render"
         # This is the same native-template invocation as the training encoder, without truncation.
-        result["template_text"] = transform.chat_template._apply_chat_template(
+        # Exercise the shared internal integration contract; no public equivalent exists.
+        result["template_text"] = transform.chat_template._apply_chat_template(  # pylint: disable=protected-access
             messages, tokenize=False, return_dict=False, tools=tools,
         )
         result["render_ok"] = True

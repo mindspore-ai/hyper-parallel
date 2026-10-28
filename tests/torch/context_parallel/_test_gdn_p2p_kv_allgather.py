@@ -138,7 +138,7 @@ def run_case(mesh, device, backend, recompute):
             if parameter.grad is None or reference_parameter.grad is None:
                 raise AssertionError(f"Missing gradient for {name}")
             dist.all_reduce(parameter.grad, group=mesh.get_group())
-            torch.testing.assert_close(parameter.grad, reference_parameter.grad, msg=lambda msg: f"{name}: {msg}",
+            torch.testing.assert_close(parameter.grad, reference_parameter.grad, msg=lambda msg, name=name: f"{name}: {msg}",
                                        **tolerance)
     if dist.get_rank() == 0:
         print(f"PASS mixed CP={mesh.size()} backend={backend} recompute={recompute}", flush=True)

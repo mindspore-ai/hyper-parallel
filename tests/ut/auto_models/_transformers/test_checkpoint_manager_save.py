@@ -230,8 +230,9 @@ class TestCheckpointManagerSave(unittest.TestCase):
             )
 
     @patch.object(CheckpointManager, "_is_main_process", return_value=True)
-    def test_offline_save_passes_restored_experts_to_hf(self, _is_main: MagicMock) -> None:
+    def test_offline_save_passes_restored_experts_to_hf(self, unused_is_main: MagicMock) -> None:
         """Read a real DCP snapshot and pass restored expert values to HF saving."""
+        del unused_is_main
         model = self._expert_export_model()
         model.save_pretrained = MagicMock()
         original = {name: torch.randn(tensor.shape) for name, tensor in model.state_dict().items()}
@@ -277,9 +278,10 @@ class TestCheckpointManagerSave(unittest.TestCase):
     def test_save_pretrained_uses_dcp_on_main_rank(
         self,
         load_dcp_state: MagicMock,
-        _is_main_process: MagicMock,
+        unused_is_main_process: MagicMock,
     ) -> None:
         """Rank 0 should export the persisted snapshot instead of the live model."""
+        del unused_is_main_process
         state_dict = {"model.weight": torch.ones(2)}
         load_dcp_state.return_value = state_dict
         model = MagicMock()
@@ -306,9 +308,10 @@ class TestCheckpointManagerSave(unittest.TestCase):
     @patch.object(CheckpointManager, "_is_main_process", return_value=False)
     def test_non_main_rank_does_not_read_dcp(
         self,
-        _is_main_process: MagicMock,
+        unused_is_main_process: MagicMock,
     ) -> None:
         """Non-writing ranks should wait in the callback without loading shards."""
+        del unused_is_main_process
         model = MagicMock()
         manager = CheckpointManager(model)
         manager._load_model_state_dict_from_dcp = MagicMock()  # pylint: disable=W0212

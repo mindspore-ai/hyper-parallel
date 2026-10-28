@@ -145,7 +145,8 @@ def install_qwen_vlm_cp_forward(model: Any) -> None:
         return output
 
     model.forward = forward
-    model._hp_vlm_cp_enabled = True
+    # Exercise the shared internal integration contract; no public equivalent exists.
+    model._hp_vlm_cp_enabled = True  # pylint: disable=protected-access
 
 
 class QwenVLMParallelBatch(OmniParallelBatch, RuntimeInputAdapter):

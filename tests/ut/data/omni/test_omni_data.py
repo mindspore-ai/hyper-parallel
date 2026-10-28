@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""CPU regression tests for the opt-in multimodal data path."""
-
 """Qwen processor supervision boundaries on the shared Omni pipeline."""
 
 import unittest

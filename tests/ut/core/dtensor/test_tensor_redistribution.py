@@ -117,66 +117,71 @@ class TestUnevenShardRedistribution(unittest.TestCase):
     def _check_full_tensor(self, full, mesh_shape, placements, ranks):
         """Compare all simulated ranks with the same unsharded reference."""
         for rank in ranks:
-            _DEVICE_MESH_MAP.clear()
-            _LAYOUT_CACHE.clear()
-            with patch("hyper_parallel.core.dtensor.device_mesh.dist") as mesh_dist:
-                mesh_dist.get_rank.return_value = rank
-                source = self._layout(mesh_shape, placements, full.ndim, ranks)
-            mappings = list(source.tensor_map)
+            self._check_rank_full_tensor(full, mesh_shape, placements, ranks, rank)
 
-            def _slice_for(peer):
-                """Construct the reference shard for a peer."""
-                area = infer_slice_area_by_rank(
-                    mesh_shape, mappings, ranks.index(peer), full.shape, source.uneven_shard_mesh_dims,
-                )
-                return full[tuple(slice(start, end) for start, end in area)].clone()
+    def _check_rank_full_tensor(self, full, mesh_shape, placements, ranks, rank):
+        """Check one rank with independent layout and collective mock state."""
+        _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
+        with patch("hyper_parallel.core.dtensor.device_mesh.dist") as mesh_dist:
+            mesh_dist.get_rank.return_value = rank
+            source = self._layout(mesh_shape, placements, full.ndim, ranks)
+        mappings = list(source.tensor_map)
 
-            local = _slice_for(rank).requires_grad_()
-            dtensor = DTensor.from_local_with_layout(local, source, shape=tuple(full.shape))
-            original_map = source.tensor_map
-            original_placements = source.placements
+        def _slice_for(peer):
+            """Construct the reference shard for a peer."""
+            area = infer_slice_area_by_rank(
+                mesh_shape, mappings, ranks.index(peer), full.shape, source.uneven_shard_mesh_dims,
+            )
+            return full[tuple(slice(start, end) for start, end in area)].clone()
 
-            def _current_group():
-                """Find the group for the next shard axis being gathered."""
-                dim = next(index for index, mapping in enumerate(mappings) if mapping != -1)
-                axes = mappings[dim] if isinstance(mappings[dim], tuple) else (mappings[dim],)
-                return source.mesh.get_devices_for_axis(len(mesh_shape) - 1 - axes[-1], rank)
+        local = _slice_for(rank).requires_grad_()
+        dtensor = DTensor.from_local_with_layout(local, source, shape=tuple(full.shape))
+        original_map = source.tensor_map
+        original_placements = source.placements
 
-            def _gather(outputs, padded, group):
-                """Mock rank-ordered communication without replacing layout logic."""
-                self.assertEqual(group, "mock_group")
-                dim = next(index for index, mapping in enumerate(mappings) if mapping != -1)
-                rank_list = sorted(_current_group())
-                self.assertEqual(len(outputs), len(rank_list))
-                for output, peer in zip(outputs, rank_list):
-                    value = _slice_for(peer)
-                    buffer = value.new_zeros(padded.shape)
-                    buffer.narrow(dim, 0, value.shape[dim]).copy_(value)
-                    if peer == rank:
-                        torch.testing.assert_close(padded, buffer, rtol=0, atol=0)
-                    output.copy_(buffer)
-                axes = list(mappings[dim] if isinstance(mappings[dim], tuple) else (mappings[dim],))
-                axes.pop()
-                mappings[dim] = tuple(axes) if axes else -1
+        def _current_group():
+            """Find the group for the next shard axis being gathered."""
+            dim = next(index for index, mapping in enumerate(mappings) if mapping != -1)
+            axes = mappings[dim] if isinstance(mappings[dim], tuple) else (mappings[dim],)
+            return source.mesh.get_devices_for_axis(len(mesh_shape) - 1 - axes[-1], rank)
 
-            with patch("hyper_parallel.core.dtensor.tensor_redistribution._utils.create_group",
-                       return_value="mock_group"), patch(
-                           "hyper_parallel.core.dtensor.tensor_redistribution.dist.all_gather",
-                           side_effect=_gather,
-                       ), patch(
-                           "hyper_parallel.core.dtensor.tensor_redistribution.dist.get_process_group_ranks",
-                           side_effect=lambda group: sorted(_current_group()),
-                       ), torch.no_grad():
-                result = dtensor.full_tensor()
-            torch.testing.assert_close(result, full, rtol=0, atol=0)
-            self.assertFalse(result.requires_grad)
-            self.assertIsNone(result.grad_fn)
-            self.assertIsNone(result._base)
-            self.assertIsNone(local.grad)
-            self.assertEqual(result.untyped_storage().nbytes(), result.numel() * result.element_size())
-            self.assertEqual(source.tensor_map, original_map)
-            self.assertEqual(source.placements, original_placements)
-            self.assertEqual(tuple(dtensor.shape), tuple(full.shape))
+        def _gather(outputs, padded, group):
+            """Mock rank-ordered communication without replacing layout logic."""
+            self.assertEqual(group, "mock_group")
+            dim = next(index for index, mapping in enumerate(mappings) if mapping != -1)
+            rank_list = sorted(_current_group())
+            self.assertEqual(len(outputs), len(rank_list))
+            for output, peer in zip(outputs, rank_list):
+                value = _slice_for(peer)
+                buffer = value.new_zeros(padded.shape)
+                buffer.narrow(dim, 0, value.shape[dim]).copy_(value)
+                if peer == rank:
+                    torch.testing.assert_close(padded, buffer, rtol=0, atol=0)
+                output.copy_(buffer)
+            axes = list(mappings[dim] if isinstance(mappings[dim], tuple) else (mappings[dim],))
+            axes.pop()
+            mappings[dim] = tuple(axes) if axes else -1
+
+        with patch("hyper_parallel.core.dtensor.tensor_redistribution._utils.create_group",
+                   return_value="mock_group"), patch(
+                       "hyper_parallel.core.dtensor.tensor_redistribution.dist.all_gather",
+                       side_effect=_gather,
+                   ), patch(
+                       "hyper_parallel.core.dtensor.tensor_redistribution.dist.get_process_group_ranks",
+                       side_effect=lambda group: sorted(_current_group()),
+                   ), torch.no_grad():
+            result = dtensor.full_tensor()
+        torch.testing.assert_close(result, full, rtol=0, atol=0)
+        self.assertFalse(result.requires_grad)
+        self.assertIsNone(result.grad_fn)
+        # Verify the gather owns storage instead of returning a view.
+        self.assertIsNone(result._base)  # pylint: disable=protected-access
+        self.assertIsNone(local.grad)
+        self.assertEqual(result.untyped_storage().nbytes(), result.numel() * result.element_size())
+        self.assertEqual(source.tensor_map, original_map)
+        self.assertEqual(source.placements, original_placements)
+        self.assertEqual(tuple(dtensor.shape), tuple(full.shape))
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_full_tensor_ceil_shards_and_empty_ranks(self):
@@ -221,9 +226,9 @@ class TestUnevenShardRedistribution(unittest.TestCase):
         options = SimpleNamespace(full_state_dict=True, cpu_offload=True,
                                   ignore_frozen_params=False, broadcast_from_rank0=False)
 
-        def _gather(outputs, _padded, group):
+        def _gather(outputs, unused_padded, group):
             """Populate ordinary all-gather output buffers in place."""
-            del group
+            del group, unused_padded
             for output, values in zip(outputs, ([0., 1.], [2., 3.], [4., 0.], [0., 0.])):
                 output.copy_(torch.tensor(values))
 
@@ -302,7 +307,8 @@ class TestUnevenShardRedistribution(unittest.TestCase):
         torch.testing.assert_close(result, torch.arange(1., 6.), rtol=0, atol=0)
         self.assertTrue(all(reference() is None for reference in references))
         self.assertFalse(result.requires_grad)
-        self.assertIsNone(result._base)
+        # Verify the gather owns storage instead of returning a view.
+        self.assertIsNone(result._base)  # pylint: disable=protected-access
         single = TensorRedistribution._padded_all_gather(local, [2], 0, [0])
         self.assertNotEqual(single.data_ptr(), local.data_ptr())
         with torch.no_grad():
@@ -360,7 +366,6 @@ class TestConstructAllSplit(_MockedTestCase):
     def test_basic(self):
         """Test basic."""
         from hyper_parallel.core.dtensor import tensor_redistribution as tr_mod
-        from hyper_parallel.core.dtensor.tensor_redistribution import TensorRedistribution
         tr = TensorRedistribution()
         tr.rank_id = 0
         x = torch.arange(16).reshape(2, 8)
