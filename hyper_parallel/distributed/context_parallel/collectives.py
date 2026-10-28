@@ -251,14 +251,24 @@ class _AsyncAllGatherWait(torch.autograd.Function):
         ctx: Any,
         grad_output: Tensor,
     ) -> tuple[Tensor, None, None, None, None, None]:
-        """Reduce and select this rank's input-gradient sequence shard."""
-        grad = grad_output.contiguous().clone()
-        work = dist.all_reduce(grad, group=ctx.group, async_op=True)
+        """Sum consumer gradients directly into the original source shard.
+
+        Args:
+            ctx: Gather dimension, group and group size saved by forward.
+            grad_output: Contributions for the complete gathered tensor.
+
+        Returns:
+            Summed local input gradient and empty gradients for metadata.
+        """
+        send = _move_dim_to_front(grad_output, ctx.gather_dim)
+        shape = list(send.shape)
+        shape[0] //= ctx.world_size
+        receive = send.new_empty(shape)
+        work = dist.reduce_scatter_tensor(
+            receive, send, op=dist.ReduceOp.SUM, group=ctx.group, async_op=True,
+        )
         work.wait()
-        rank = dist.get_rank(ctx.group)
-        local = torch.chunk(
-            grad, ctx.world_size, dim=ctx.gather_dim
-        )[rank].contiguous()
+        local = _move_dim_from_front(receive, ctx.gather_dim)
         return (
             local,
             None,
