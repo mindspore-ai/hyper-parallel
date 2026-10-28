@@ -34,7 +34,7 @@ from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 from hyper_parallel.distributed._builder.planner import ShardingPlanner
 from hyper_parallel.distributed.apply import apply_sharding_plan
 from hyper_parallel.distributed.context_parallel.mla_context_parallel import (
-    MLADimensions, MLA_CP_STRATEGIES, _apply_mla_rope,
+    MLADimensions, MLA_CP_STRATEGIES, apply_mla_rope,
 )
 from hyper_parallel.distributed.mesh import MeshContext
 from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
@@ -149,7 +149,7 @@ def _check_npu_rope(device: torch.device) -> None:
                            if interleaved else reference)
                 first, second = ordered.chunk(2, -1)
                 expected.append(ordered * cos + torch.cat((-second, first), -1) * sin)
-            actual = tuple(_apply_mla_rope(tensor, positions, interleaved=interleaved) for tensor in inputs)
+            actual = tuple(apply_mla_rope(tensor, positions, interleaved=interleaved) for tensor in inputs)
             for name, tensor, reference, source, source_reference in zip(
                     ("Q", "K"), actual, expected, inputs, references):
                 _compare(tensor, reference, dtype, f"fused RoPE {name}")
