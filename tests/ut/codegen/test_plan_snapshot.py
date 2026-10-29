@@ -148,6 +148,7 @@ def test_plan_application_freezes_source_mesh_without_runtime_objects():
 def test_native_auto_build_attaches_finished_snapshot(monkeypatch):
     model = nn.Module()
     config = SimpleNamespace(model_type="toy", architectures=["ToyModel"])
+    session = CodegenBuildSession()
 
     monkeypatch.setattr(auto_model, "_model_init_context", lambda _is_meta: nullcontext())
     monkeypatch.setattr(
@@ -183,9 +184,47 @@ def test_native_auto_build_attaches_finished_snapshot(monkeypatch):
         attn_implementation="sdpa",
         validate_placement=False,
         load_base_model=False,
+        codegen_session=session,
     )
 
     snapshot = result._hp_codegen_snapshot
     assert snapshot.status is CodegenStatus.NOT_REQUIRED
     assert snapshot.reason == "pure_data_parallel"
     assert snapshot.to_dict()["source"]["model_class"].endswith(":Module")
+
+
+def test_native_auto_build_does_not_collect_without_explicit_session(monkeypatch):
+    model = nn.Module()
+    config = SimpleNamespace(model_type="toy", architectures=["ToyModel"])
+
+    monkeypatch.setattr(auto_model, "_model_init_context", lambda _is_meta: nullcontext())
+    monkeypatch.setattr(
+        auto_model,
+        "_init_model",
+        lambda *args, **kwargs: (False, model),
+    )
+    monkeypatch.setattr(auto_model, "_current_device", lambda: None)
+    monkeypatch.setattr(
+        auto_model.torch.distributed,
+        "is_initialized",
+        lambda: False,
+    )
+    infrastructure = lambda built_model, **kwargs: built_model
+    monkeypatch.setattr(auto_model, "apply_model_infrastructure", infrastructure)
+
+    result = auto_model._BaseHyperAutoModelClass._build_model(
+        None,
+        is_hf_model=True,
+        hf_config=config,
+        mesh=None,
+        sharding_planner=None,
+        fsdp2_manager=None,
+        backend=ModelingBackend.HF,
+        peft_config=None,
+        torch_dtype="auto",
+        attn_implementation="sdpa",
+        validate_placement=False,
+        load_base_model=False,
+    )
+
+    assert not hasattr(result, "_hp_codegen_snapshot")
