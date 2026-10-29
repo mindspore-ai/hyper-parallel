@@ -14,14 +14,21 @@
 # limitations under the License.
 # ============================================================================
 
-# Container startup mounts the checkout read-only. Build the plugin package in
-# temporary storage while PYTHONPATH continues to select the mounted source.
+# Reuse the common plugin installer and the dependency fixes accepted by the Qwen3 recipe.
 set -euo pipefail
-
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-rl_source_root=$(cd -- "${script_dir}/../../.." && pwd)
-rl_install_dir=$(mktemp -d /tmp/hyper-rl-install.XXXXXX)
-cp "${rl_source_root}/pyproject.toml" "${rl_install_dir}/"
-cp -r "${rl_source_root}/rl" "${rl_install_dir}/rl"
-python -m pip install --no-deps --no-build-isolation "${rl_install_dir}"
-python -c 'from importlib.metadata import entry_points; assert any(e.value == "rl.roles.rollout.vllm_plugin:register_hyper_models" for e in entry_points(group="vllm.general_plugins")), "Hyper-RL vLLM plugin is not installed"'
+rl_root=$(cd -- "$script_dir/../../.." && pwd)
+bash "$rl_root/docker/install_runtime.sh"
+
+apply_runtime_patch() {
+    local target=$1
+    local patch_file=$2
+    if patch --batch --fuzz=0 --forward --dry-run -d "$target" -p1 < "$patch_file" >/dev/null; then
+        patch --batch --fuzz=0 --forward -d "$target" -p1 < "$patch_file"
+    elif ! patch --batch --fuzz=0 --dry-run -R -d "$target" -p1 < "$patch_file" >/dev/null; then
+        echo "Runtime patch does not match the installed dependency: $patch_file" >&2
+        exit 1
+    fi
+}
+apply_runtime_patch /vllm-workspace/vllm-ascend "$rl_root/docker/patches/ascend-sampler-record-stream.patch"
+apply_runtime_patch /vllm-workspace/vllm "$rl_root/docker/patches/vllm-dp-coordinator-timeout.patch"

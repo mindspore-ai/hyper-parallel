@@ -176,6 +176,7 @@ class _ProgramRolloutManager:
             settings=settings,
             engine=runtime.engine,
             sample_index_offset=sample_index_offset,
+            max_concurrent_programs=runtime.config.get("max_concurrent_episodes_per_rank", 8),
         )
 
     def generate(
@@ -194,9 +195,13 @@ class _ProgramRolloutManager:
                 f"requested={policy_version}, served={version_before}"
             )
         self.runtime.bind_episode_version(version_before)
+        if self.display_name == "Codex" and self.runtime.config.get("overlap_preparation", False):
+            self.runtime.set_admission_policy(version_before)
         try:
             result = self.agent_runner.rollout(prompt_records, policy_version)
         finally:
+            if self.display_name == "Codex" and self.runtime.config.get("overlap_preparation", False):
+                self.runtime.set_admission_policy(None)
             self.runtime.clear_episode_version()
         version_after = self.runtime.engine.generation_policy_version()
         if version_after != version_before:
@@ -208,7 +213,10 @@ class _ProgramRolloutManager:
 
     def close(self) -> None:
         """Release the node-level gateway owned by this manager."""
-        self.runtime.close()
+        try:
+            self.agent_runner.close()
+        finally:
+            self.runtime.close()
 
 
 class CodexRolloutManager(_ProgramRolloutManager):
@@ -216,6 +224,22 @@ class CodexRolloutManager(_ProgramRolloutManager):
 
     program_factory = CodexProgramFactory
     display_name = "Codex"
+
+    @property
+    def preparation_enabled(self) -> bool:
+        """Whether this manager may launch one future CPU batch behind the policy gate."""
+        return bool(self.runtime.config.get("overlap_preparation", False))
+
+    def prepare(self, prompt_records: Sequence[PromptRecord], policy_version: int) -> None:
+        """Prepare a single batch without backend calls or background collectives."""
+        if not self.preparation_enabled:
+            return
+        self.runtime.ensure_preparation_started()
+        self.agent_runner.prepare(
+            prompt_records, policy_version, self.agent_runner.program_factory.create_prepared,
+            cpu_fraction=self.runtime.config.get("preparation_cpu_fraction", 0.5),
+            max_cpus=self.runtime.config.get("preparation_max_cpus"),
+        )
 
 
 class DeepSeekRolloutManager(_ProgramRolloutManager):

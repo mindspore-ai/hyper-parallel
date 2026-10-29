@@ -20,7 +20,9 @@ from typing import Any
 import yaml
 
 
-_OPTIONAL_OVERRIDE_PATHS = frozenset(("rollout.vllm.visible_devices",))
+_OPTIONAL_OVERRIDE_PATHS = frozenset((
+    "rollout.vllm.visible_devices", "train.token_log_probs_mode", "train.token_log_probs_chunk_size",
+))
 
 
 def _parse_override_value(raw_value: str) -> Any:

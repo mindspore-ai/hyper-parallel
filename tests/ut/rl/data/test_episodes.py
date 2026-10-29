@@ -153,3 +153,28 @@ def test_episode_targets_reject_reward_tensor_drift() -> None:
     batch = _batch()
     with pytest.raises(ValueError, match="reward tensor must match"):
         _prepare(replace(batch, rewards=torch.ones_like(batch.rewards)))
+
+
+def test_precomputed_episode_targets_survive_split_before_role_outputs() -> None:
+    """A destination with an incomplete episode receives its original full-group target."""
+    rollout = replace(_batch(), old_log_probs=None)
+    preparer = ExperiencePreparer(build_algorithm({"name": "grpo", "loss_aggregation": "token-mean"}))
+    prepared = preparer.prepare_targets(rollout)
+    # Keep only the second call of the losing episode, as a cross-rank transfer can do.
+    selected = replace(
+        prepared, trajectories=(prepared.trajectories[2],), sequences=prepared.sequences[2:3],
+        attention_mask=prepared.attention_mask[2:3], action_mask=prepared.action_mask[2:3],
+        rewards=prepared.rewards[2:3], responses=prepared.responses[2:3],
+        advantages=prepared.advantages[2:3], rollout_log_probs=prepared.rollout_log_probs[2:3],
+    )
+    with pytest.raises(ValueError):
+        preparer.prepare_targets(selected)
+    anchors = torch.full_like(selected.advantages, -0.4, requires_grad=True)
+    actual = preparer.attach_role_outputs(replace(selected, old_log_probs=anchors.detach()),
+                                         reference_log_probs=anchors)
+    torch.testing.assert_close(actual.advantages, prepared.advantages[2:3], rtol=0, atol=0)
+    assert not actual.reference_log_probs.requires_grad
+    assert prepared.old_log_probs is None
+    assert not prepared.advantages.requires_grad
+    with pytest.raises(ValueError, match="log-probabilities"):
+        preparer.attach_role_outputs(selected, reference_log_probs=anchors)

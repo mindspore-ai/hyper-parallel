@@ -88,7 +88,7 @@ agentic:
     max_inflight_requests: 4
     session_root: /results/codex-trajectories
     workspace_callable: examples.search_r1.workspace:build_search_workspace
-    execution_callable: examples.search_r1.container_execution:request_container_execution
+    execution_callable: examples.search_r1.container_runtime:request_container_execution
     program_callable: examples.search_r1.agent:SearchR1Program
     reward_callable: examples.search_r1.reward:score_hotpotqa_answer
     instruction_template: |-

@@ -15,8 +15,6 @@
 """Config-switchable single-turn and tool-assisted GSM8K agent example."""
 
 import json
-import re
-from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Awaitable, Optional, Union
 
 from rl.agentic.core.chat_template import CHAT_TEMPLATE_MESSAGES
@@ -25,6 +23,7 @@ from rl.agentic.core.types import (
 )
 from rl.agentic.envs.environment import ENVIRONMENTS, ToolEnvironment
 from rl.agentic.tools import INTERACTION_PROTOCOLS, ToolExecutor
+from rl.algorithm.reward import extract_answer
 from rl.dataset.contracts import PromptRecord, Trajectory
 
 from examples.gsm8k.tools import build_calculator_registry
@@ -33,49 +32,24 @@ from examples.gsm8k.tools import build_calculator_registry
 if TYPE_CHECKING:
     from rl.reward_model.client import RewardModelClient
 
-_NUMERIC_PATTERN = re.compile(r"\s*\$?\s*([+-]?(?:[0-9]+(?:,[0-9]{3})*(?:\.[0-9]*)?|\.[0-9]+))\s*\$?\s*")
-_REWARD_WINDOW = 300
 PROMPT_INSTRUCTION = 'Let\'s think step by step and output the final answer after "####".'
 _MULTI_TURN_PROMPT = """Solve the math problem carefully. You may call the calculator.
 For a tool call, emit JSON with tool_calls and calculator arguments.
-When finished, emit JSON exactly as {"final_answer":"NUMBER"}."""
-
-
-def normalize_answer(value: str) -> str:
-    """Remove display-only characters from a numeric GSM8K answer."""
-    if "####" in value:
-        value = value.rsplit("####", maxsplit=1)[-1]
-    cleaned = value.replace(",", "").replace("$", "").strip()
-    try:
-        number = Decimal(cleaned)
-    except InvalidOperation:
-        return cleaned
-    if not number.is_finite():
-        return cleaned
-    if number == 0:
-        return "0"
-    normalized = format(number, "f")
-    return normalized.rstrip("0").rstrip(".") if "." in normalized else normalized
-
-
-def extract_answer(solution: str) -> Optional[str]:
-    """Extract a strict final answer from a response or tool final-answer value."""
-    window = solution[-_REWARD_WINDOW:]
-    if "####" in window:
-        final = window.rsplit("####", maxsplit=1)[-1].lstrip().splitlines()
-        candidate = final[0] if final else ""
-    else:
-        candidate = solution
-    direct = _NUMERIC_PATTERN.fullmatch(candidate)
-    return None if direct is None else normalize_answer(direct.group(1))
+When finished, emit JSON exactly as {"final_answer":"#### NUMBER"}."""
 
 
 def compute_gsm8k_reward(solution: str, ground_truth: str) -> float:
-    """Return numeric exact-match reward for one response."""
+    """Apply verl's strict GSM8K rule to the last 300 characters of a response.
+
+    Args:
+        solution: Complete model response containing a ``#### NUMBER`` answer.
+        ground_truth: Canonical answer string, compared without numeric normalization.
+
+    Returns:
+        One for an exact extracted match, otherwise zero.
+    """
     predicted = extract_answer(solution)
-    return float(
-        predicted is not None and predicted == normalize_answer(str(ground_truth))
-    )
+    return float(predicted is not None and predicted == str(ground_truth))
 
 
 async def compute_gsm8k_model_reward(
@@ -230,7 +204,7 @@ class GSM8KSingleTurnEnvironment(_GSM8KRewardScorer):
             info={
                 "reward_components": {} if deferred else {"correctness": reward},
                 "extracted_answer": extract_answer(action.content),
-                "expected_answer": normalize_answer(str(self.prompt.ground_truth)),
+                "expected_answer": str(self.prompt.ground_truth),
                 "reward_scorer": None if deferred else f"{__name__}.compute_gsm8k_reward",
             },
         )

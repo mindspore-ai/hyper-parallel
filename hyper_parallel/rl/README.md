@@ -22,7 +22,7 @@ HyperParallel-RL 是面向 LLM、VLM、世界模型、具身智能和 Agentic AI
 
 用户通过 Python 定义任务、交互、工具与奖励，基础策略优化与多轮 Agent 交互复用同一训练链路。HyperParallel 承载并行训练，vLLM 承载采样，HyperParallel-RL 通过显式编排、统一轨迹与策略发布连接两者。
 
-> **实验版本**：当前验证范围为单节点 Ascend NPU、Qwen3 dense 的同步 GRPO/PPO 配方，以及 Qwen3-30B-A3B 的已验证 GRPO 配方。单节点 rayless 异步 GRPO 已有实验实现，Codex 多轮异步仍需真实 NPU 验收；多模态、世界模型与具身智能尚未提供端到端训练。具体能力与验证状态见[支持范围](#支持范围)。
+> **实验版本**：同步训练与单节点 rayless 异步 GRPO 均有实现，模型、算法和拓扑分别验收；具体范围见[支持说明](#支持范围)。
 
 **开始使用**：[安装环境](#安装与环境) → [运行一个训练步](#快速开始)　｜　**开始定制**：[替换奖励函数](#替换奖励函数)
 
@@ -123,6 +123,14 @@ npu-smi info
 <a id="快速开始"></a>
 
 ## 🚀 快速开始
+
+八卡单轮GSM8K完整训练默认使用[50步配方与直接运行命令](examples/gsm8k/README.md#默认八卡-50-步训练)。
+相同6400训练题、500验证题、128题×8候选/步；默认开启生成阶段卸载及0.8/256推理加速。
+最新8×32GiB单轮/Codex均完成50步，严格验证reward分别为94.4%/93.0%。
+历史8×64GiB verl为91.4%，早于采样修复且硬件/运行时不同，不能据此归因同配置性能差异。
+结果摘要及比较边界见[GSM8K 示例](examples/gsm8k/README.md#最终结果)；当前32GiB verl固化配方仍缺完整验收。
+
+以下单步入口用于功能检查，保持各自设备数和短程预算。
 
 完成[环境准备](#安装与环境)后，从仓库根目录运行以下任一示例。替换宿主机路径，使用完整 Qwen3-4B checkpoint 与 tokenizer，并通过 `npu-smi info` 选择空闲、健康的设备；共用设备时依次运行。
 
@@ -248,7 +256,7 @@ def build_environment(context: EpisodeContext) -> GSM8KMultiTurnEnvironment:
     return env
 ```
 
-在完整训练 YAML 中使用 [GSM8K 多轮配置](examples/gsm8k/README.md#内部多轮参数)的 `agentic` 设置，并将 `module_path` 改为 `examples.gsm8k.custom_reward`、`environment` 改为 `custom_gsm8k`。该示例只替换多轮任务的终局评分，不修改 Trainer 或权重发布流程。
+在完整训练 YAML 中使用 [GSM8K 多轮配置](examples/gsm8k/README.md#其他功能)的 `agentic` 设置，并将 `module_path` 改为 `examples.gsm8k.custom_reward`、`environment` 改为 `custom_gsm8k`。该示例只替换多轮任务的终局评分，不修改 Trainer 或权重发布流程。
 
 GSM8K 的规则评分与模型评分都在 [agent.py](examples/gsm8k/agent.py)。不配置顶层 `reward_model` 时使用规则奖励；
 使用[模型评分配方](examples/gsm8k/configs/qwen3_4b_gsm8k_model_reward.yaml)并设置
@@ -279,7 +287,7 @@ GSM8K 的规则评分与模型评分都在 [agent.py](examples/gsm8k/agent.py)�
 | **权重同步与运行保障** | ✅ | 流式 full-gather / 显式 direct-reshard、IPC/HCCL、策略发布校验、checkpoint 恢复及 console / W&B 指标；见[架构合同](docs/architecture.md) |
 | **Bit-Exact 校验** | ✅ | 可选更新前 logprob 校验，仅限 Qwen3 dense + Hyper-vLLM matched TP1/TP2，见[完整条件](docs/qwen3_training_inference_consistency.md) |
 | **PPO / GAE / Critic** | ✅ | Dense Qwen3 内部 runner 已完成两卡 Actor/Critic 两步更新与发布；外部 harness 分段轨迹、MoE PPO 不支持 |
-| **单节点异步 GRPO** | ◐ | Qwen3 dense 的 internal GSM8K、Codex Search/SWE-Smith 两步 NPU 流程通过，Search 覆盖跨版本 episode；SWE 零奖励未验证学习收益，见[异步合同](docs/architecture.md#codex-multi-turn-publication) |
+| **单节点异步 GRPO** | ◐ | Qwen3 dense 的 internal GSM8K、Codex Search/SWE-Smith 两步 NPU 流程通过，Search 覆盖跨版本 episode；SWE 零奖励未验证学习收益，见[异步合同](docs/architecture.md#rayless-asynchronous-grpo) |
 | **多节点异步训练** | ○ | 扩展多节点采样、发布和恢复 |
 | **多模态训练与交互** | ○ | 视觉 RL、媒体与动作对齐、多模态 Agent |
 
@@ -322,9 +330,9 @@ Qwen3-MoE 的具体配置与同步边界见 [vLLM Rollout](docs/vllm_rollout.md#
 
 ## 📌 当前边界
 
-- **运行范围**：当前为单节点 Ascend 同步 RL；模型与拓扑以[支持范围](#支持范围)为准。MoE 暂不支持分离部署与专家内部 TP；PPO / Critic 的 dense 内部 runner 两卡配方已验收，其他组合不能据此外推。
+- **运行范围**：同步 RL 与实验性 rayless 异步 GRPO 均限定单节点 Ascend；模型与拓扑以[支持范围](#支持范围)为准。MoE 暂不支持分离部署与专家内部 TP；PPO / Critic 的 dense 内部 runner 两卡配方已验收，其他组合不能据此外推。
 - **验证范围**：功能运行通过不等于长期学习收益已验证。Bit-Exact 仅覆盖指定 Qwen3 dense + Hyper-vLLM 配置的更新前 logprobs，不代表梯度、更新后参数或收敛保证，详见[一致性文档](docs/qwen3_training_inference_consistency.md)。
-- **恢复与计数**：已有检查点恢复实现，但样本/token 消费计数尚未在训练步累加，不应据此统计实际训练量。见[状态与恢复边界](docs/architecture.md#状态所有权)。
+- **恢复与计数**：已有检查点恢复实现；同步路径的样本/token 消费计数尚未逐步累加，不应据此统计实际训练量。异步路径按已消费组和有效token单独计数。见[状态与恢复边界](docs/architecture.md#状态所有权)。
 - **部署要求**：vLLM 的 RLHF/refit 开发接口仅用于受信任、隔离的训练网络；环境与驱动要求见[运行镜像](docker/README.md)。
 
 ---

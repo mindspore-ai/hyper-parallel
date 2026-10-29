@@ -34,6 +34,8 @@ from urllib.parse import urlparse
 
 from rl.agentic.codex.gateway import CodexGateway
 from rl.agentic.core.program_runner import (
+    AgentProgram,
+    GatewayTransportError,
     HarnessProgramFactory,
     HarnessRuntime,
     build_harness_call_trajectories,
@@ -72,6 +74,19 @@ class _CompletionBudgetExit(RuntimeError):
         super().__init__("Codex stopped after a structured completion budget response")
         self.limit = limit
         self.url = url
+
+
+class _MissingFinalMessage(RuntimeError):
+    """A successful CLI process ended without a final answer, pending capture validation."""
+
+    def __init__(self, message: str, turn_completed: bool) -> None:
+        """Keep the CLI terminal evidence separate from the missing-answer diagnostic."""
+        super().__init__(message)
+        self.turn_completed = turn_completed
+
+
+class _CodexExecutionFailure(RuntimeError):
+    """A timeout or abnormal process exit cannot be replaced by a sampled model outcome."""
 
 
 def build_codex_trajectory(
@@ -131,8 +146,14 @@ def build_codex_call_trajectories(
 
 def _codex_call_status(traces: Sequence[Mapping[str, Any]],
                        metadata: Mapping[str, Any]) -> tuple[bool, str] | None:
-    """Mark calls in controller-validated text or repository budget episodes as truncated."""
+    """Preserve the verified model terminal or budget status for each call."""
     del traces
+    if metadata.get("failure_reason") == "context_budget_exhausted":
+        return True, "max_context_tokens"
+    if metadata.get("failure_reason") == "output_budget_exhausted":
+        return True, "max_output_tokens"
+    if metadata.get("failure_reason") == "reasoning_only_eos":
+        return False, "reasoning_only_eos"
     if metadata.get("repository_budget_truncated") is True or metadata.get("completion_budget_truncated") is True:
         return True, "max_completions"
     return None
@@ -230,6 +251,7 @@ class CodexRuntime(HarnessRuntime):
         """Bind the runtime to the existing shared rollout engine."""
         gateway_options = {
             "max_inflight_requests": int(config.get("max_inflight_requests", 1)),
+            "policy_gate": bool(config.get("overlap_preparation", False)),
         }
         if getattr(engine, "asynchronous", False) is True:
             gateway_options["async_training"] = True
@@ -245,6 +267,15 @@ class CodexRuntime(HarnessRuntime):
             engine, config, CodexGateway, "Codex", 8200,
             gateway_options=gateway_options,
         )
+
+    def ensure_preparation_started(self) -> None:
+        """Bring up the gated CPU endpoint while model startup or training is still pending."""
+        self._ensure_gateway(self.engine.configured_inference_base_url, self.engine.inference_model_name)
+
+    def set_admission_policy(self, version: int | None) -> None:
+        """Change admission on the gateway owner after the main-thread version barrier."""
+        if self._gateway is not None:
+            self._gateway.set_policy(version)
 
 
 class CodexAgentProgram:
@@ -278,8 +309,12 @@ class CodexAgentProgram:
 
     async def run(self) -> tuple[Trajectory, ...]:
         """Run Codex, freeze and score its output, then construct call trajectories."""
+        started_at = time.time()
         session_id = uuid.uuid4().hex
         artifact_dir, workspace_dir, codex_home = self._prepare_directories(session_id)
+        _performance_event(artifact_dir, "program.prepared", started_at=started_at,
+                           prompt_id=self.prompt.prompt_id, sample_index=self.sample_index,
+                           policy_version=self.policy_version)
         timeout = float(self.config.get("request_timeout", 600.0))
         try:
             await self._admin_request("POST", "/internal/sessions", {
@@ -292,11 +327,19 @@ class CodexAgentProgram:
                 "instructions_override": self.config.get("system_instructions"),
                 "enable_thinking": self.config.get("enable_thinking"),
                 "compact_harness_context": self.config.get("compact_harness_context", False),
+                "preserve_environment_context": self.config.get("preserve_environment_context", False),
+                "allowed_tools": self.config.get("allowed_tools"),
                 "exec_command_yield_time_ms": self.config.get("exec_command_yield_time_ms"),
             }, timeout)
+            _performance_event(artifact_dir, "session.registered")
             return await self._run_registered(
                 session_id, artifact_dir, workspace_dir, codex_home, timeout
             )
+        except BaseException as error:
+            _performance_event(artifact_dir, "program.failed", error_type=type(error).__name__, error=str(error))
+            _LOGGER.exception("Codex program failed: session=%s prompt=%s sample=%d",
+                              session_id, self.prompt.prompt_id, self.sample_index)
+            raise
         finally:
             original_error = sys.exc_info()[1]
             try:
@@ -305,6 +348,8 @@ class CodexAgentProgram:
                 if original_error is None:
                     raise
                 _LOGGER.exception("Codex session cleanup failed while preserving original failure")
+            finally:
+                _performance_event(artifact_dir, "program.finished")
 
     def _session_settings(self) -> dict[str, Any]:
         """Allow a trusted program to opt into additional gateway protocol checks."""
@@ -313,6 +358,22 @@ class CodexAgentProgram:
     async def _admin_request(self, method: str, path: str, payload: Mapping | None,
                              timeout: float) -> dict[str, Any]:
         """Settle an in-flight controller request before cancellation cleanup."""
+        retryable = (method == "POST" and path == "/internal/sessions") or method == "DELETE"
+        if method == "POST" and path == "/internal/sessions":
+            # Registration is a small local control request, not a model-generation deadline.
+            timeout = min(timeout, 30.0)
+        for attempt in range(3 if retryable else 1):
+            try:
+                return await self._admin_request_once(method, path, payload, timeout)
+            except GatewayTransportError:
+                if not retryable or attempt == 2:
+                    raise
+                await asyncio.sleep(0.1 * 2**attempt)
+        raise RuntimeError("Management request retry loop exhausted")
+
+    async def _admin_request_once(self, method: str, path: str, payload: Mapping | None,
+                                  timeout: float) -> dict[str, Any]:
+        """Await the result of one HTTP operation before retry or cancellation cleanup."""
         options = {}
         arguments = (method, self.admin_url + path, payload, timeout)
         if self.admin_token is not None:
@@ -364,6 +425,94 @@ class CodexAgentProgram:
         return dict(termination)
 
 
+    def _missing_final_record(self, captured: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        """Select the last completion only from a contiguous, trainable captured session."""
+        records = captured.get("completions", [])
+        if (captured.get("failure") is not None or not isinstance(records, list) or not records
+                or len(records) > int(self.config["max_turns"])
+                or any(not isinstance(record, Mapping) or record.get("ordinal") != index
+                       or isinstance(record.get("ordinal"), bool)
+                       or record.get("metadata", {}).get("trainable") is not True
+                       for index, record in enumerate(records))):
+            return None
+        return records[-1]
+
+    @staticmethod
+    def _reasoning_only_choice(record: Mapping[str, Any]) -> tuple[Mapping[str, Any], list, int] | None:
+        """Require a bounded token response containing reasoning but no answer or tool calls."""
+        limit = record.get("request", {}).get("max_tokens")
+        choices = record.get("response", {}).get("choices", [])
+        if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], Mapping):
+            return None
+        choice = choices[0]
+        message = choice.get("message", {})
+        tokens = choice.get("token_ids")
+        if (not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0
+                or not isinstance(tokens, list) or not tokens or len(tokens) > limit
+                or not isinstance(message, Mapping) or message.get("content") or message.get("tool_calls")
+                or not isinstance(message.get("reasoning_content", message.get("reasoning")), str)
+                or not message.get("reasoning_content", message.get("reasoning"))):
+            return None
+        return choice, tokens, limit
+
+    def _captured_missing_final(self, captured: Mapping[str, Any],
+                                execution_error: Exception | None) -> RewardResult | None:
+        """Recognize a clean reasoning-only turn ending at the token cap or sampled EOS."""
+        if not isinstance(execution_error, _MissingFinalMessage) or not execution_error.turn_completed:
+            return None
+        record = self._missing_final_record(captured)
+        if record is None:
+            return None
+        completion = self._reasoning_only_choice(record)
+        if completion is None:
+            return None
+        choice, tokens, limit = completion
+        if (choice.get("finish_reason") == "stop" and self.end_of_turn_token_id is not None
+                and tokens[-1] == self.end_of_turn_token_id):
+            return RewardResult(0.0, {"outcome": 0.0}, {
+                "failure_origin": "model", "failure_reason": "reasoning_only_eos", "trainable": True,
+            })
+        if choice.get("finish_reason") != "length" or len(tokens) != limit:
+            return None
+        return RewardResult(0.0, {"outcome": 0.0}, {
+            "failure_origin": "model", "failure_reason": "output_budget_exhausted", "trainable": True,
+            "output_budget": {"limit": limit, "completed": len(tokens), "ordinal": record["ordinal"]},
+        })
+
+    def resolve_execution_outcome(self, captured: Mapping[str, Any], execution_error: Exception | None,
+                                  final_answer: str) -> RewardResult | None:
+        """Resolve shared model terminals; reject unexplained exits before task-specific scoring.
+
+        Args:
+            captured: Gateway capture for this policy version, including all completed calls.
+            execution_error: Original CLI exception, if any; unknown failures are never inferred as budgets.
+            final_answer: Actual CLI final text, without synthesizing an answer for truncated output.
+
+        Returns:
+            Zero reward and terminal metadata for verified model failure, or None for normal task scoring.
+        """
+        if isinstance(execution_error, _CodexExecutionFailure):
+            raise execution_error
+        reward_result = self._captured_failure(captured, execution_error)
+        budget = self._captured_budget(captured)
+        if reward_result is None and not final_answer:
+            reward_result = self._captured_missing_final(captured, execution_error)
+        if reward_result is None and budget is not None and not final_answer:
+            if execution_error is not None:
+                if not isinstance(execution_error, _CompletionBudgetExit):
+                    raise execution_error
+                if (execution_error.limit, execution_error.url) != (
+                    budget["limit"], self.gateway_url + "/responses",
+                ):
+                    raise execution_error
+            reward_result = RewardResult(0.0, {"outcome": 0.0}, {
+                "completion_budget_truncated": True, "budget_termination": budget,
+            })
+        if reward_result is None and execution_error is not None:
+            raise execution_error
+        return reward_result
+
+
     async def _run_registered(
         self,
         session_id: str,
@@ -374,7 +523,9 @@ class CodexAgentProgram:
     ) -> tuple[Trajectory, ...]:
         """Execute and materialize one already registered Codex session."""
         self._write_codex_config(codex_home, session_id)
+        _performance_event(artifact_dir, "version_check.started")
         await self._validate_version()
+        _performance_event(artifact_dir, "version_check.finished")
         started = time.perf_counter()
         execution_error = None
         final_answer, diagnostics = "", []
@@ -387,28 +538,18 @@ class CodexAgentProgram:
         except RuntimeError as error:
             execution_error = error
         captured = await self._admin_request("GET", f"/internal/sessions/{session_id}", None, timeout)
-        reward_result = self._captured_failure(captured, execution_error)
-        budget = self._captured_budget(captured)
-        if budget is not None and not final_answer:
-            if execution_error is not None:
-                if not isinstance(execution_error, _CompletionBudgetExit):
-                    raise execution_error
-                if (getattr(execution_error, "limit", None), getattr(execution_error, "url", None)) != (
-                    budget["limit"], self.gateway_url + "/responses",
-                ):
-                    raise execution_error
-            reward_result = RewardResult(0.0, {"outcome": 0.0}, {
-                "completion_budget_truncated": True, "budget_termination": budget,
-            })
+        _performance_event(artifact_dir, "capture.finished")
+        reward_result = self.resolve_execution_outcome(captured, execution_error, final_answer)
         if reward_result is None:
-            if execution_error is not None:
-                raise execution_error
             reward_result = self.reward_callable(final_answer, self.prompt)
             if not isinstance(reward_result, RewardResult):
                 reward_value = float(reward_result)
                 reward_result = RewardResult(reward_value, {"outcome": reward_value})
-        return self._build_rows(session_id, artifact_dir, workspace_dir, started, final_answer,
+        _performance_event(artifact_dir, "trajectory_build.started")
+        rows = self._build_rows(session_id, artifact_dir, workspace_dir, started, final_answer,
                                 diagnostics, captured, reward_result)
+        _performance_event(artifact_dir, "trajectory_build.finished", rows=len(rows), reward=reward_result.value)
+        return rows
 
     def _build_rows(self, session_id: str, artifact_dir: Path, workspace_dir: Path, started: float,
                     final_answer: str, diagnostics: list, captured: Mapping,
@@ -623,6 +764,7 @@ class CodexAgentProgram:
             command, cwd, environment = self.execution_callable(
                 command, workspace_dir, codex_home, environment
             )
+        _performance_event(artifact_dir, "cli_spawn.started")
         process = await asyncio.create_subprocess_exec(
             *command,
             cwd=cwd,
@@ -632,8 +774,10 @@ class CodexAgentProgram:
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
+        _performance_event(artifact_dir, "cli_spawn.finished", pid=process.pid)
         timeout = float(self.config.get("timeout_seconds", 1800.0))
         stdout_lines, stderr_lines = await _collect_codex_output(process, artifact_dir, timeout)
+        _performance_event(artifact_dir, "cli_collect.finished", return_code=process.returncode)
         return_code = int(process.returncode or 0)
         final_answer, diagnostic_events = _interpret_codex_output(
             stdout_lines, stderr_lines, return_code, artifact_dir,
@@ -678,9 +822,18 @@ async def _drain_codex_stream(
                 break
             decoded = line.decode("utf-8", errors="replace")
             text = decoded.rstrip("\r\n")
+            if normalize_newlines:
+                _performance_event(path.parent, "cli_stdout.received", line_index=len(lines))
             lines.append(text)
             stream.write(text + "\n" if normalize_newlines else decoded)
             stream.flush()
+
+
+def _performance_event(artifact_dir: Path, event: str, **fields: Any) -> None:
+    """Record receipt times separately so the original CLI and model payloads remain unchanged."""
+    record = {"event": event, "timestamp": time.time(), "monotonic_ns": time.perf_counter_ns(), **fields}
+    with (artifact_dir / "performance.jsonl").open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 async def _collect_codex_output(
@@ -700,7 +853,7 @@ async def _collect_codex_output(
     try:
         await asyncio.wait_for(_wait_for_process_exit(process), timeout)
     except asyncio.TimeoutError as error:
-        raise RuntimeError(f"Codex episode timed out after {timeout} seconds") from error
+        raise _CodexExecutionFailure(f"Codex episode timed out after {timeout} seconds") from error
     finally:
         # Descendants may keep stdout open after the harness exits.
         await _stop_process_group(process)
@@ -743,7 +896,8 @@ def _interpret_codex_output(
             raise _CompletionBudgetExit(*budgets[0])
     if return_code != 0:
         detail = f"; stderr tail:\n{stderr_tail}" if stderr_tail else ""
-        raise RuntimeError(f"Codex exited with status {return_code}{detail}; {artifact_hint}")
+        error_type = RuntimeError if return_code == 1 else _CodexExecutionFailure
+        raise error_type(f"Codex exited with status {return_code}{detail}; {artifact_hint}")
     if failed_events:
         detail = f"; stderr tail:\n{stderr_tail}" if stderr_tail else ""
         raise RuntimeError(
@@ -758,9 +912,10 @@ def _interpret_codex_output(
         if stderr_tail:
             details.append(f"stderr tail:\n{stderr_tail}")
         suffix = f"; {'; '.join(details)}" if details else ""
-        raise RuntimeError(
+        raise _MissingFinalMessage(
             "Codex JSONL did not contain a final agent message"
-            f"{suffix}; {artifact_hint}"
+            f"{suffix}; {artifact_hint}",
+            turn_completed=_has_completed_codex_turn("\n".join(stdout_lines)),
         )
     return final_answer, diagnostic_events
 
@@ -771,6 +926,12 @@ class CodexProgramFactory(HarnessProgramFactory):
     program_type = CodexAgentProgram
     label = "Codex"
     include_admin_url = True
+
+    def create_prepared(self, prompt: PromptRecord, policy_version: int, sample_index: int) -> AgentProgram:
+        """Create a future-version CPU session; its gateway must enforce policy admission."""
+        if not self.runtime.config.get("overlap_preparation", False):
+            raise RuntimeError("Codex preparation requires version-gated overlap")
+        return self._build_program(prompt, policy_version, sample_index)
 
     def __init__(
         self, runtime: CodexRuntime, end_of_turn_token_id: int | None, generation_config: Mapping[str, Any]
@@ -815,6 +976,8 @@ def _mcp_environment(server):
 def _codex_environment(gateway_url, codex_home, session_id):
     """Build isolated child credentials and loopback proxy exclusions."""
     environment = os.environ.copy()
+    # portable-pty 0.9.0 otherwise uses non-thread-safe getpwuid during parallel PTY creation.
+    environment.setdefault("SHELL", "/bin/bash")
     for name in tuple(environment):
         if name.startswith(("CODEX_", "OPENAI_")):
             environment.pop(name)

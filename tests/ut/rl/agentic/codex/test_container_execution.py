@@ -21,6 +21,8 @@ from importlib.util import find_spec
 import json
 import os
 from pathlib import Path
+import subprocess
+import tempfile
 import socket
 import struct
 import sys
@@ -32,7 +34,7 @@ from urllib.parse import urlparse
 import pytest
 
 from rl.agentic.envs.docker_workspace import DockerWorkspace, acquire_workspace_slot
-from examples.swe_smith import container_execution
+from rl.agentic.codex import container_execution
 
 
 def _local_endpoint(monkeypatch: pytest.MonkeyPatch) -> list:
@@ -92,7 +94,11 @@ def test_relay_binds_route_and_session_and_denies_admin(monkeypatch: pytest.Monk
                                           request_timeout=2, max_request_bytes=1024, max_response_bytes=1024)
         try:
             endpoint = await relay.start()
-            forbidden = await _request(endpoint, "/internal/sessions")
+            idle = socket.create_connection((urlparse(endpoint).hostname, urlparse(endpoint).port))
+            try:
+                forbidden = await _request(endpoint, "/internal/sessions")
+            finally:
+                idle.close()
             assert b" 403 " in forbidden.split(b"\r\n")[0]
             body = json.dumps({"input": [], "url": "http://attacker.invalid"}).encode()
             response = await _request(endpoint, "/v1/responses", body)
@@ -338,5 +344,122 @@ def test_relay_rejects_oversized_candidate_before_upstream(monkeypatch: pytest.M
             await relay.close()
         assert len(failures) == 1
         assert relay._process.returncode is not None
+
+    asyncio.run(scenario())
+
+
+def test_unix_relay_requires_session_token_and_delivers_terminal_marker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The host bridge and in-container HTTP endpoint preserve Search's request boundary."""
+    failures = _local_endpoint(monkeypatch)
+
+    async def scenario() -> None:
+        """Check a long Unix address and a token-bound real HTTP endpoint."""
+        with tempfile.TemporaryDirectory(prefix="hp-relay-") as directory:
+            socket_dir = Path(directory) / ("long-artifact-path-" * 8)
+            socket_dir.mkdir()
+            socket_path = socket_dir / "model.sock"
+            terminal = Path(directory) / "terminal"
+            requests = []
+
+            async def upstream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+                """Return one explicit terminal response through the Unix bridge."""
+                headers = await reader.readuntil(b"\r\n\r\n")
+                requests.append(headers)
+                await reader.readexactly(2)
+                writer.write(b'HTTP/1.0 409 Conflict\r\nX-Search-Terminal: budget_exhausted\r\n'
+                             b'Content-Length: 2\r\n\r\n{}')
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+
+            listener = socket.socket(socket.AF_UNIX)
+            directory_fd = os.open(socket_dir, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                listener.bind(f"/proc/self/fd/{directory_fd}/model.sock")
+            finally:
+                os.close(directory_fd)
+            server = await asyncio.start_unix_server(upstream, sock=listener)
+            relay = container_execution.CandidateRelay(
+                DockerWorkspace("task-image"), "http://localhost", "bound", unix_socket=socket_path,
+                require_token=True, terminal_header="X-Search-Terminal", terminal_file=str(terminal),
+                request_timeout=2,
+            )
+            try:
+                endpoint = await relay.start()
+                denied = await _request(endpoint, "/responses")
+                assert b" 403 " in denied.split(b"\r\n")[0]
+                assert not requests
+                parsed = urlparse(endpoint)
+                reader, writer = await asyncio.open_connection(parsed.hostname, parsed.port)
+                writer.write(b'POST /responses HTTP/1.0\r\nAuthorization: Bearer bound\r\n'
+                             b'Content-Length: 2\r\n\r\n{}')
+                await writer.drain()
+                response = await asyncio.wait_for(reader.read(), 3)
+                writer.close()
+                await writer.wait_closed()
+                assert b" 409 " in response.split(b"\r\n")[0]
+                await relay.close()
+                assert terminal.exists()
+                assert len(requests) == 1
+                assert b"Authorization: Bearer bound" in requests[0]
+            finally:
+                await relay.close()
+                server.close()
+                await server.wait_closed()
+        assert not failures
+
+    asyncio.run(scenario())
+
+
+def test_container_cli_supervisor_retains_signal_and_raw_evidence(tmp_path: Path) -> None:
+    """An actual child signal must remain fatal and be visible in saved diagnostics."""
+    async def execute(argv: list[str], **kwargs: Any) -> Any:
+        """Run the actual supervisor locally without Docker or accelerator devices."""
+        result = await asyncio.to_thread(
+            subprocess.run, argv, env={**os.environ, **kwargs["env"]}, capture_output=True, text=True, check=False,
+        )
+        return SimpleNamespace(returncode=result.returncode, stdout=result.stdout, stderr=result.stderr)
+
+    workspace = SimpleNamespace(exec=execute)
+    command = [sys.executable, "-c", "import os,signal,resource; "
+               "resource.setrlimit(resource.RLIMIT_CORE,(0,0)); os.kill(os.getpid(),signal.SIGSEGV)"]
+    result = asyncio.run(container_execution.run_container_codex(
+        workspace, command, tmp_path, environment={}, timeout=5, python_executable=sys.executable,
+    ))
+    assert result.returncode == 139
+    assert "SIGSEGV" in (tmp_path / "codex-stderr.log").read_text()
+    assert "returncode=-11" in result.stderr
+    assert (tmp_path / "codex-events.jsonl").exists()
+
+
+def test_aborted_relay_does_not_wait_for_model_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An execution cancellation promptly reaps the endpoint while an upstream call is pending."""
+    failures = _local_endpoint(monkeypatch)
+
+    async def scenario() -> None:
+        """Abort a real endpoint with a blocked model exchange."""
+        entered = asyncio.Event()
+        relay = container_execution.CandidateRelay(DockerWorkspace("task-image"), "http://localhost", "bound")
+
+        async def blocked(body: bytes) -> dict:
+            """Represent a model request that has not returned."""
+            del body
+            entered.set()
+            await asyncio.Event().wait()
+            return {}
+
+        relay._exchange = blocked
+        endpoint = await relay.start()
+        request = asyncio.create_task(_request(endpoint, "/responses"))
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            with pytest.raises(container_execution.RelayError, match="aborted"):
+                await asyncio.wait_for(relay.close(abort=True), 3)
+            assert relay._process.returncode is not None
+            assert relay._closed
+        finally:
+            request.cancel()
+            await asyncio.gather(request, return_exceptions=True)
+        assert len(failures) == 1
 
     asyncio.run(scenario())

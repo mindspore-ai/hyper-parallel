@@ -158,9 +158,16 @@ class Evaluator:
         batch = self.collate_fn([self.dataset[sample_index] for sample_index, _ in entries])
         input_ids = batch["input_ids"].to(self.device, non_blocking=True)
         attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
+        identity_rank = rank if self.data_parallel_rank is None else self.data_parallel_rank
         prompts = tuple(
-            replace(prompt, metadata={**prompt.metadata, "phase": "evaluation"})
-            for prompt in build_prompt_records(batch, input_ids, attention_mask)
+            replace(
+                prompt,
+                # Padding IDs must be unique within a DP shard and identical across its TP ranks.
+                prompt_id=(prompt.prompt_id if entries[index][1]
+                           else f"{prompt.prompt_id}:eval-padding:{identity_rank}:{index}"),
+                metadata={**prompt.metadata, "phase": "evaluation"},
+            )
+            for index, prompt in enumerate(build_prompt_records(batch, input_ids, attention_mask))
         )
         rollout = self.rollout_manager.generate(prompt_records=prompts, policy_version=step)
         if self.score_batch is not None:

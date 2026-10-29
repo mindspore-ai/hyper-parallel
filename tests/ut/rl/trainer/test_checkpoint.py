@@ -437,10 +437,22 @@ def _qwen35_export_actor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tup
     registration = resolve_model(options)
     # Explicit placement keeps the real public loader hardware-independent.
     monkeypatch.setattr(auto_model_backend, "_current_device", lambda: torch.device("cpu"))
-    actor = HyperAutoModelForCausalLM.from_pretrained(
-        str(source), torch_dtype=torch.float32, attn_implementation="eager", force_hf=True,
-        local_files_only=True, trust_remote_code=False,
-    )
+    from_config = HyperAutoModelForCausalLM._from_config_parent_class
+
+    def from_text_config(config: Any, **kwargs: Any) -> Any:
+        """Keep export fixtures independent of HF composite-config normalization."""
+        model_class = AutoModelForCausalLM._model_mapping[type(config)]
+        text_config_class = config.sub_configs.get("text_config")
+        if text_config_class is not None and model_class.config_class is text_config_class:
+            config = config.get_text_config()
+        return from_config(config, **kwargs)
+
+    with monkeypatch.context() as loader_patch:
+        loader_patch.setattr(HyperAutoModelForCausalLM, "_from_config_parent_class", staticmethod(from_text_config))
+        actor = HyperAutoModelForCausalLM.from_pretrained(
+            str(source), torch_dtype=torch.float32, attn_implementation="eager", force_hf=True,
+            local_files_only=True, trust_remote_code=False,
+        )
     actor.config.rms_norm_eps = 2e-6
     actor.__class__ = type("HSDPQwen3_5ForCausalLM", (type(actor),), {})
     with torch.no_grad():

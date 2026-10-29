@@ -126,7 +126,7 @@ train:
     betas: [0.9, 0.999]
     foreach: null
   checkpoint:
-    output_dir: /results/qwen3_4b_gsm8k_vllm_production/checkpoints
+    output_dir: /results/qwen3_4b_opd/checkpoints
     save_steps: 250
     save_final: true
     verify_reload: true
@@ -134,13 +134,13 @@ train:
 logging:
   backends: [console, wandb]
   project_name: hyper-rl
-  experiment_name: qwen3_4b_gsm8k_vllm_production
+  experiment_name: qwen3_4b_opd
   log_steps: 1
   log_samples: 2
   wandb:
     mode: online
     entity: null
-    directory: /results/qwen3_4b_gsm8k_vllm_production/wandb
+    directory: /results/qwen3_4b_opd/wandb
 
 distillation:
   enabled: true
