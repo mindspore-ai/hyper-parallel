@@ -17,6 +17,7 @@
 import pytest
 
 from hyper_parallel.codegen import manager
+from hyper_parallel.codegen.artifact import ArtifactLayout
 from hyper_parallel.codegen.check import verify_snapshot_contract, verify_snapshot_drift
 from hyper_parallel.codegen.emit import replacement
 from hyper_parallel.codegen.plan import derive, offline_mesh
@@ -287,3 +288,115 @@ def test_snapshot_drift_uses_snapshot_signature(tmp_path):
     verify_snapshot_drift(matching, snapshot)
     with pytest.raises(RuntimeError, match="snapshot signature mismatch"):
         verify_snapshot_drift(stale, snapshot)
+
+
+def test_snapshot_emission_patches_include_resolved_phase_c_injections():
+    payload = {
+        "source": {"module_name": "transformers.models.toy.modeling_toy"},
+        "replacements": {
+            "applications": [{
+                "primary_fqn": "model.attn",
+                "source_type": "transformers.models.toy.modeling_toy:ToyAttention",
+                "replacement_type": "hyper_parallel.components:ToyAttention",
+            }],
+        },
+        "plan": {
+            "boundary_classes": {
+                "model.mlp": "ToyMoeBlock",
+                "model.attn": "ToyAttention",
+            },
+            "param_plan": {
+                "model.mlp": {"region_dispatch": False},
+                "model.attn": {},
+            },
+            "injections": [],
+        },
+        "plan_application": {
+            "resolved_injections": [
+                {
+                    "match": "model.mlp",
+                    "local_compute_fn": {
+                        "_target_": "hyper_parallel.models.toy.ep.toy_compute"
+                    },
+                },
+                {
+                    "match": "model.attn",
+                    "inner_target": "self",
+                    "inner_wrapper": {
+                        "_target_": "hyper_parallel.models.toy.cp:toy_wrapper"
+                    },
+                },
+            ],
+        },
+    }
+
+    patches = manager._snapshot_emission_patches(payload)
+
+    expected_local = [{
+        "module_fqn": "model.mlp",
+        "module_type": "transformers.models.toy.modeling_toy:ToyMoeBlock",
+        "factory": "hyper_parallel.models.toy.ep:toy_compute",
+        "region_dispatch": False,
+        "original_forward": (
+            "transformers.models.toy.modeling_toy:ToyMoeBlock.forward"
+        ),
+    }]
+    expected_wrappers = [{
+        "module_fqn": "model.attn",
+        "target_fqn": "self",
+        "wrapper": "hyper_parallel.models.toy.cp:toy_wrapper",
+        "target_type": "hyper_parallel.components:ToyAttention",
+    }]
+    assert patches["local_computes"] == expected_local, (
+        "snapshot local-compute patch mismatch: "
+        f"expected={expected_local}, got={patches['local_computes']}"
+    )
+    assert patches["inner_wrappers"] == expected_wrappers, (
+        "snapshot inner-wrapper patch mismatch: "
+        f"expected={expected_wrappers}, got={patches['inner_wrappers']}"
+    )
+
+
+def test_snapshot_manager_normalizes_deepseek_v4_family(monkeypatch, tmp_path):
+    source = tmp_path / "modeling_deepseek_v4.py"
+    source.write_text("class DeepseekV4:\n    pass\n", encoding="utf-8")
+    session = CodegenBuildSession()
+    session.record_source({
+        "model_type": "deepseek_v4",
+        "architecture": "DeepseekV4",
+        "file_path": str(source),
+        "is_hf_model": False,
+    })
+    session.record_replacements()
+    session.record_plan({"param_plan": {"model": {"params": {}}}})
+    session.record_plan_application({"applied_boundaries": ["model"]})
+    snapshot = session.finish()
+    signature = manager.signature_from_snapshot(snapshot)
+    layout = ArtifactLayout.build_default(
+        str(tmp_path / "deepseek_v41" / "generated"),
+        "DeepseekV4",
+    )
+    captured = {}
+
+    def resolve(model_type, **_kwargs):
+        captured["model_type"] = model_type
+        return layout
+
+    monkeypatch.setattr(manager, "resolve_model_artifact_layout", resolve)
+    monkeypatch.setattr(manager, "ensure_artifact_dir", lambda _layout: None)
+    monkeypatch.setattr(manager, "clean_temp_artifacts", lambda _layout: None)
+    monkeypatch.setattr(manager, "_is_rank0", lambda: True)
+    monkeypatch.setattr(
+        manager,
+        "load_codegen_meta",
+        lambda _path: type("Meta", (), {"signature": signature})(),
+    )
+    monkeypatch.setattr(manager, "barrier_after_artifact", lambda: None)
+
+    result = manager.ensure_codegen_artifact_from_snapshot(snapshot)
+
+    assert result is layout, f"snapshot manager returned wrong layout: got={result}"
+    assert captured["model_type"] == "deepseek_v41", (
+        "DeepSeek family alias mismatch: "
+        f"expected=deepseek_v41, got={captured['model_type']}"
+    )
