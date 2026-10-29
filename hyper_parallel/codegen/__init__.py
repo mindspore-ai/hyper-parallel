@@ -34,6 +34,7 @@ from hyper_parallel.codegen.snapshot import CodegenSnapshot, CodegenStatus
 from hyper_parallel.codegen.plan.freeze import (
     FrozenPlan,
     freeze_plan,
+    freeze_plan_application,
     freeze_param_plan,
     named_placement_to_dict,
     placement_to_string,
@@ -50,6 +51,7 @@ __all__ = [
     "ensure_codegen_artifact",
     "freeze_param_plan",
     "freeze_plan",
+    "freeze_plan_application",
     "named_placement_to_dict",
     "placement_to_string",
     "preflight_integrity_check",
