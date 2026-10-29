@@ -89,7 +89,7 @@ def build_online_text_mapping_dataset(
         data_path: Optional local source path, ordered paths, or pre-split
             train/valid/test path mapping. Use ``data_config.sources`` for
             multiple sources.
-        transform: Plaintext or conversation sample transform.
+        transform: Plaintext, conversation or pretokenized sample transform.
         training_config: Training plan providing the random seed and split sizes.
 
     Returns:
@@ -99,7 +99,7 @@ def build_online_text_mapping_dataset(
         ValueError: If no Online text transform is configured.
     """
     if transform is None:
-        raise ValueError("Online Dataset requires a plaintext or conversation data_transform")
+        raise ValueError("Online Dataset requires a plaintext, conversation or pretokenized data_transform")
 
     dataset_config = dict(data_config)
     training_seed = getattr(training_config, "seed", None)
@@ -133,7 +133,7 @@ def build_online_iterable_dataset(
         data_config: Online Iterable source options.
         data_path: Optional local source path, ordered paths, or Hub Dataset
             ID. Use ``data_config.sources`` for multiple sources.
-        transform: Plaintext or conversation sample transform.
+        transform: Plaintext, conversation or pretokenized sample transform.
         dataloader_context: Optional explicit DataLoader ownership context.
         mesh_context: Runtime mesh used to derive Iterable source ownership.
         training_config: Training plan providing the shuffle seed.
@@ -145,7 +145,7 @@ def build_online_iterable_dataset(
         ValueError: If no Online text transform is configured.
     """
     if transform is None:
-        raise ValueError("Online Dataset requires a plaintext or conversation data_transform")
+        raise ValueError("Online Dataset requires a plaintext, conversation or pretokenized data_transform")
 
     dataset_config = dict(data_config)
     training_seed = getattr(training_config, "seed", None)

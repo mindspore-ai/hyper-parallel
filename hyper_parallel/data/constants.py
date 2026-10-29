@@ -21,6 +21,7 @@ TEXT_LAZY_EXPORTS = {
     "AutoTokenizer": "hyper_parallel.data.text.build_tokenizer",
     "ChatTemplate": "hyper_parallel.data.text.chat_template",
     "IdentityDataTransform": "hyper_parallel.data.text.text_transform",
+    "PreTokenizedTransform": "hyper_parallel.data.text.text_transform",
     "PlaintextTransform": "hyper_parallel.data.text.text_transform",
     "TextConversationTransform": "hyper_parallel.data.text.text_transform",
     "build_chat_template": "hyper_parallel.data.text.chat_template",

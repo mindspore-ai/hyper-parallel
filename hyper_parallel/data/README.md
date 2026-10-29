@@ -454,3 +454,11 @@ enable_dataset_logging("debug", ranks=None)
 ```
 
 日志覆盖 source、split/blend、Dataset、Sampler、DataLoader 和 parallel batch 形状，不记录样本文本内容。
+
+### 预处理 token/label 数据记录
+
+`PreTokenizedTransform` 接收已完成标签对齐的预训练/SFT 数据记录，以及可选的记录内部文档边界，
+不再进行分词或标签移位。预处理数据的组批器将记录拼成 `[1,S]` 的 batch，
+保留记录内部文档边界，尾部补齐位置的 labels 为 -100，不参与 loss。
+严格校验、字段映射、padding 和运行时配置详见
+[预处理数据约定与 JT 迁移说明](../../docs/guide/pretokenized_data.md)。

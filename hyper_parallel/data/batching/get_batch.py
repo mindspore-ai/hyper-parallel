@@ -194,7 +194,9 @@ class TextParallelBatch:
             tokenizer: Tokenizer providing EOD and padding token semantics.
             data_config: Dataset options used to build runtime LTR fields.
             pp_shared_data: Whether pipeline stages share the prepared batch.
-            source_type: ``online`` or ``indexed`` DataLoader batch contract.
+            source_type: ``online``, ``indexed`` or ``pretokenized`` batch contract.
+                Pretokenized batches carry authoritative labels, internal
+                boundaries, independent of EOD token IDs.
             attention_mode: ``dense`` or ``compressed`` attention representation.
             causal: Whether attention uses left-to-right causal semantics.
             sliding_window: Sliding-window size, or ``None`` for full attention.
@@ -223,7 +225,7 @@ class TextParallelBatch:
         self.runtime_input_adapter = runtime_input_adapter
         self._batch_flow_logged = False
 
-        if source_type == "online":
+        if source_type in ("online", "pretokenized"):
             self.boundary_resolver = OnlineBoundaryResolver()
             self.source_input_field = "input_ids"
         elif source_type == "indexed":
@@ -241,19 +243,31 @@ class TextParallelBatch:
         self.cp_sharder = CPBatchSharder(self.parallel_context)
         self.tp_broadcaster = TPBatchBroadcaster(self.parallel_context, device)
 
-        self.reset_position_ids = reset_position_ids or bool(self.data_config.get("reset_position_ids", False))
+        self.reset_position_ids = (
+            reset_position_ids or bool(self.data_config.get("reset_position_ids", False))
+            or source_type == "pretokenized"
+        )
         resolved_reset_attention_mask = (
             reset_attention_mask
             or bool(self.data_config.get("reset_attention_mask", False))
-            or source_type == "online"
+            or source_type in ("online", "pretokenized")
         )
         self.eod_mask_loss = eod_mask_loss or bool(self.data_config.get("eod_mask_loss", False))
+        self._validate_prepared_options(attention_mode, create_attention_mask)
         self.attention_runtime = AttentionRuntime(
             mode=attention_mode,
             create_mask=create_attention_mask,
             reset_mask=resolved_reset_attention_mask,
             sliding_window=sliding_window,
         )
+
+    def _validate_prepared_options(self, attention_mode: str, create_attention_mask: bool) -> None:
+        if self.source_type != "pretokenized":
+            return
+        if not self.labels_are_shifted or self.eod_mask_loss or not self.causal:
+            raise ValueError("Pretokenized batches require shifted labels, causal attention and eod_mask_loss=False")
+        if (attention_mode == "compressed" or not create_attention_mask) and self.runtime_input_adapter is None:
+            raise ValueError("Pretokenized batches without a dense mask require a boundary-aware runtime adapter")
 
     def __call__(
             self,
@@ -371,8 +385,32 @@ class TextParallelBatch:
         canonical_batch = dict(source_batch)
         if self.source_input_field != "input_ids":
             canonical_batch["input_ids"] = canonical_batch.pop(self.source_input_field)
+        if self.source_type == "pretokenized":
+            self._validate_prepared_batch(canonical_batch)
 
         return canonical_batch
+
+    @staticmethod
+    def _validate_prepared_batch(batch: Mapping[str, Any]) -> None:
+        """Check authoritative layout metadata on the CPU before distribution."""
+        required = ("input_ids", "labels", "cu_seq_lens")
+        if any(key not in batch for key in required):
+            raise ValueError("Pretokenized batches require input_ids, labels and cu_seq_lens")
+        tokens, labels, boundaries = (batch[key] for key in required)
+        if any(not isinstance(value, torch.Tensor) for value in (tokens, labels, boundaries)):
+            raise ValueError("Pretokenized batch fields must be tensors")
+        if tokens.ndim != 2 or not tokens.numel():
+            raise ValueError("Pretokenized tokens must be nonempty [B,S]")
+        expected = (
+            (tokens, torch.int64, tokens.shape), (labels, torch.int64, tokens.shape),
+            (boundaries, torch.int32, (boundaries.numel(),)),
+        )
+        for value, dtype, shape in expected:
+            if value.dtype != dtype or value.shape != shape:
+                raise ValueError("Invalid pretokenized batch shapes or dtypes")
+        if (boundaries.numel() < 2 or boundaries[0] != 0 or boundaries[-1] != tokens.numel()
+                or torch.any(boundaries[1:] <= boundaries[:-1])):
+            raise ValueError("Invalid cumulative document boundaries")
 
     def _resolve_sequence_boundaries(
             self,

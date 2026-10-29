@@ -20,6 +20,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
+import numpy as np
 import torch
 
 from hyper_parallel.data.constants import IGNORE_INDEX
@@ -148,6 +149,104 @@ class TextConversationTransform:
         messages = _get_record_value(sample, self.text_keys)
         is_valid = bool(messages)
         return is_valid
+
+
+@dataclass
+class PreTokenizedTransform:
+    """Validate prepared pretraining or SFT records without changing targets.
+
+    Inputs are unpadded one-dimensional integer arrays. Labels already contain
+    the next-token target at each input position. No tokenization, EOS insertion,
+    shift, truncation or window sampling is performed here.
+
+    Args:
+        input_ids_key: Source token field.
+        labels_key: Source next-token target field; -100 means ignored.
+        boundaries_key: Source cumulative document boundaries, including zero.
+            If absent, treat the complete record as one document.
+        loss_mask_key: Optional binary mask, folded into an owned labels array.
+        empty_target_policy: Reject empty supervision by default; ``drop`` keeps
+            the historical JT filtering behavior before sampling.
+        labels_alignment: Must be ``next_token``; unshifted targets require an
+            upstream, per-document conversion, never a batch-wide shift.
+        vocab_size: Optional exclusive vocabulary bound for token validation.
+    """
+
+    input_ids_key: str = "input_ids"
+    labels_key: str = "labels"
+    boundaries_key: str = "boundaries"
+    loss_mask_key: str = "loss_mask"
+    empty_target_policy: str = "error"
+    labels_alignment: str = "next_token"
+    vocab_size: int | None = None
+
+    def __post_init__(self) -> None:
+        """Reject ambiguous target conventions and unsupported filtering modes."""
+        if self.labels_alignment != "next_token":
+            raise ValueError("PreTokenizedTransform requires labels_alignment='next_token'")
+        if self.empty_target_policy not in ("error", "drop"):
+            raise ValueError("empty_target_policy must be 'error' or 'drop'")
+        if self.vocab_size is not None and self.vocab_size <= 0:
+            raise ValueError("vocab_size must be positive")
+
+    def _read_record(self, sample: Mapping[str, Any]) -> tuple[np.ndarray, ...] | None:
+        tokens = np.asarray(sample[self.input_ids_key])
+        labels = np.asarray(sample[self.labels_key])
+        boundaries = np.asarray(sample.get(self.boundaries_key, [0, tokens.size]))
+        self._validate_arrays(tokens, labels, boundaries)
+        valid_targets = labels != IGNORE_INDEX
+        if self.loss_mask_key in sample:
+            mask = np.asarray(sample[self.loss_mask_key])
+            if mask.shape != labels.shape or not np.isin(mask, (0, 1)).all():
+                raise ValueError("loss_mask must be binary and match labels")
+            valid_targets &= mask != 0
+        if not valid_targets.any():
+            if self.empty_target_policy == "error":
+                raise ValueError("Prepared record has no effective targets")
+            return None
+        return tokens, labels, boundaries, valid_targets
+
+    def _validate_arrays(self, tokens: np.ndarray, labels: np.ndarray, boundaries: np.ndarray) -> None:
+        if any(value.ndim != 1 or value.dtype.kind not in "iu" for value in (tokens, labels, boundaries)):
+            raise ValueError("Prepared fields must be one-dimensional integer arrays")
+        if tokens.size == 0 or tokens.shape != labels.shape:
+            raise ValueError("Tokens and next-token labels must have matching nonempty shapes")
+        upper_bound = np.iinfo(np.int32).max + 1
+        if self.vocab_size is not None:
+            upper_bound = min(upper_bound, self.vocab_size)
+        if (np.any(tokens < 0) or np.any(tokens >= upper_bound)
+                or np.any((labels < 0) & (labels != IGNORE_INDEX)) or np.any(labels >= upper_bound)):
+            raise ValueError("Token IDs must fit the vocabulary/int32 range; ignored labels must equal -100")
+        if (tokens.size > np.iinfo(np.int32).max or len(boundaries) < 2
+                or boundaries[0] != 0 or boundaries[-1] != tokens.size
+                or np.any(boundaries[1:] <= boundaries[:-1])):
+            raise ValueError("Document boundaries must strictly increase from zero to token count")
+
+    def is_valid_sample(self, sample: Mapping[str, Any]) -> bool:
+        """Validate a source record before sampling.
+
+        Args:
+            sample: Prepared source fields before any tensor conversion.
+
+        Returns:
+            Whether the record has supervision; strict mode raises instead of dropping.
+        """
+        return self._read_record(sample) is not None
+
+    def __call__(self, sample: Mapping[str, Any]) -> list[dict[str, torch.Tensor]]:
+        """Return one complete record in the canonical training field format."""
+        record = self._read_record(sample)
+        if record is None:
+            return []
+        tokens, labels, boundaries, valid_targets = record
+        # Arrow and mmap arrays may be read-only or shared with other records.
+        labels = labels.astype(np.int64, copy=True)
+        labels[~valid_targets] = IGNORE_INDEX
+        return [{
+            "input_ids": torch.tensor(tokens, dtype=torch.long),
+            "labels": torch.from_numpy(labels),
+            "cu_seq_lens": torch.tensor(boundaries, dtype=torch.int32),
+        }]
 
 
 def build_text_transform(
