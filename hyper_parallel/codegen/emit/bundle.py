@@ -55,6 +55,9 @@ def emit_bundle(
         snapshot_payload = snapshot.to_dict()
         if getattr(meta, "snapshot_status", None) != snapshot_payload["status"]:
             raise ValueError("bundle meta and snapshot status do not match")
+    if getattr(meta, "snapshot_status", None) == "not_required":
+        logger.info("codegen: rendered audit-only bundle %s", layout.artifact_dir)
+        return {"__init__.py": _strip_trailing_whitespace(emit_init_file(layout))}
     if patch_plan is None:
         from hyper_parallel.codegen.patch_plan import patch_emission_plan_from_meta
 

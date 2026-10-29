@@ -140,6 +140,7 @@ class CodegenBuildSession:
             CodegenStatus.COLLECTING,
             CodegenStatus.DERIVED,
             CodegenStatus.GENERATING,
+            CodegenStatus.NOT_REQUIRED,
         )
         self._failure = FailureSnapshot.from_data(stage, reason, details)
         self._status = CodegenStatus.FAILED
@@ -175,10 +176,10 @@ class CodegenBuildSession:
         if self._status == CodegenStatus.GENERATING:
             raise RuntimeError("codegen session is still generating")
         if self._status == CodegenStatus.DERIVED and generator is not None:
-            derived_snapshot = self._build_snapshot(CodegenStatus.DERIVED)
+            publish_snapshot = self._build_snapshot(CodegenStatus.DERIVED)
             self.mark_generating()
             try:
-                generator(derived_snapshot)
+                generator(publish_snapshot)
             except Exception as exc:  # Generation must not invalidate native build.
                 self.mark_failed(
                     "generation",
@@ -187,6 +188,16 @@ class CodegenBuildSession:
                 )
             else:
                 self.mark_generated()
+        elif self._status == CodegenStatus.NOT_REQUIRED and generator is not None:
+            publish_snapshot = self._build_snapshot(CodegenStatus.NOT_REQUIRED)
+            try:
+                generator(publish_snapshot)
+            except Exception as exc:  # Publication must not invalidate native build.
+                self.mark_failed(
+                    "generation",
+                    str(exc) or type(exc).__name__,
+                    {"exception_type": type(exc).__name__},
+                )
         self._snapshot = self._build_snapshot(self._status)
         self._finished = True
         return self._snapshot

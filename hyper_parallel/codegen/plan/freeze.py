@@ -497,7 +497,7 @@ def freeze_injections(plan: Any) -> list[dict[str, Any]]:
     """
     modules = getattr(plan, "modules", {}) or {}
     injections: list[dict[str, Any]] = []
-    for fqn, spec in modules.items():
+    for fqn, spec in sorted(modules.items()):
         entry: dict[str, Any] = {}
         for spec_field in INJECTION_SPEC_FIELDS:
             frozen = _freeze_spec_field(spec_field, getattr(spec, spec_field.name, None))

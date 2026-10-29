@@ -62,7 +62,12 @@ def verify_output_hashes(meta: Any, layout: Any) -> None:
         "diff": layout.diff_path,
         "init": layout.init_path,
     }
-    for key in core_paths:
+    required_outputs = (
+        ("init",)
+        if getattr(meta, "snapshot_status", None) == CodegenStatus.NOT_REQUIRED.value
+        else tuple(core_paths)
+    )
+    for key in required_outputs:
         if key not in meta.outputs:
             raise RuntimeError(f"codegen preflight: missing {key} output hash in meta")
 
@@ -147,6 +152,27 @@ def verify_snapshot_contract(meta: Any) -> None:
         raise RuntimeError(
             "codegen preflight: snapshot provenance must include both "
             "snapshot_schema_version and snapshot_status"
+        )
+    if status == CodegenStatus.NOT_REQUIRED.value:
+        if not getattr(meta, "snapshot_reason", None):
+            raise RuntimeError(
+                "codegen preflight: not_required snapshot is missing its reason"
+            )
+        if (
+            getattr(meta, "param_plan", None)
+            or getattr(meta, "injections", None)
+            or getattr(meta, "plan_application", None)
+            or (getattr(meta, "entrypoints", None) or {}).get("parallelize")
+            or (getattr(meta, "covered", None) or {}).get("sharding_plan")
+        ):
+            raise RuntimeError(
+                "codegen preflight: not_required snapshot contains executable plan data"
+            )
+        return
+    if status == CodegenStatus.FAILED.value:
+        raise RuntimeError(
+            "codegen preflight: snapshot generation failed: "
+            f"{getattr(meta, 'snapshot_failure', None)!r}"
         )
     if status != CodegenStatus.DERIVED.value:
         raise RuntimeError(
@@ -453,10 +479,6 @@ def meta_to_dict(meta: Any) -> dict[str, Any]:
 
 def _iter_trainable_params(model: Any):
     """Yield ``fqn`` for every trainable parameter of ``model`` (or its config)."""
-    try:
-        import torch  # pylint: disable=unused-import
-    except ImportError:
-        return
     seen: set[int] = set()
     for module_name, module in model.named_modules():
         for param_name, param in module.named_parameters(recurse=False):

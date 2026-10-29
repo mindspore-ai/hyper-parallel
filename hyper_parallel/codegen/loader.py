@@ -31,6 +31,8 @@ import sys
 from types import ModuleType
 from typing import Any, Optional
 
+from hyper_parallel.codegen.meta import load_codegen_meta as _load_codegen_meta
+from hyper_parallel.codegen.snapshot import CodegenStatus
 from hyper_parallel.codegen.source.compat import install_output_recorder_compat
 
 logger = logging.getLogger(__name__)
@@ -104,6 +106,14 @@ def import_generated_module(artifact_dir: str) -> ModuleType:
     Returns:
         ModuleType: The imported (and cached) generated modeling module.
     """
+    meta = _load_codegen_meta(os.path.join(artifact_dir, "codegen_meta.json"))
+    if meta is not None and meta.snapshot_status == CodegenStatus.NOT_REQUIRED.value:
+        raise RuntimeError(
+            "codegen: not_required artifact is audit-only and has no generated model"
+        )
+    if meta is not None and meta.snapshot_status == CodegenStatus.FAILED.value:
+        raise RuntimeError("codegen: failed snapshot artifact has no generated model")
+
     install_output_recorder_compat()
     modeling_path = find_generated_modeling_file(artifact_dir)
     stem = os.path.splitext(os.path.basename(modeling_path))[0]

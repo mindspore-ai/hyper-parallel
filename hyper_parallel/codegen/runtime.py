@@ -42,6 +42,7 @@ from hyper_parallel.codegen.meta import (
     meta_to_dict,
     validate_meta_schema,
 )
+from hyper_parallel.codegen.snapshot import CodegenStatus
 from hyper_parallel.codegen.patch_plan import local_compute_binding_name
 # Shared boundary-form classifier (module-level imports are stdlib-only, so
 # this stays importable without torch).  The EP-dependence criterion must be
@@ -94,6 +95,7 @@ def verify_codegen_signature(meta: CodegenMeta, hf_config: Any = None) -> None:
       different model class).
     """
     validate_meta_schema(meta_to_dict(meta))
+    _require_parallelizable_snapshot(meta)
     covered = meta.covered or {}
     if not isinstance(covered.get("sharding_plan"), bool):
         raise TypeError(
@@ -1550,6 +1552,7 @@ def parallelize_from_generated(
             f"codegen: no meta at {os.path.join(artifact_dir, 'codegen_meta.json')}; "
             "cannot parallelize from the generated module"
         )
+    _require_parallelizable_snapshot(meta)
     if hf_config is not None:
         verify_codegen_signature(meta, hf_config)
     module = import_generated_module(artifact_dir)
@@ -1562,6 +1565,17 @@ def parallelize_from_generated(
     if entry is not None:
         return entry(model, mesh_context)
     return _parallelize_inline_from_meta(model, mesh_context, meta, module)
+
+
+def _require_parallelizable_snapshot(meta: CodegenMeta) -> None:
+    """Reject snapshot states that intentionally carry no executable plan."""
+    status = getattr(meta, "snapshot_status", None)
+    if status == CodegenStatus.NOT_REQUIRED.value:
+        raise RuntimeError(
+            "codegen: not_required artifact has no generated parallelize entrypoint"
+        )
+    if status == CodegenStatus.FAILED.value:
+        raise RuntimeError("codegen: failed snapshot artifact cannot be parallelized")
 
 
 def _parallelize_inline_from_meta(model: Any, mesh_context: Any, meta: CodegenMeta, generated_module: Any) -> dict:

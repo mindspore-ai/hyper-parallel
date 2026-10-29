@@ -122,6 +122,8 @@ def lower_forward_boundaries(
     / ``_hp_tp`` instance attributes that ``hp_install_boundaries`` binds
     at runtime — no per-boundary global constant is emitted.
     """
+    if _plan_field(frozen_plan, "snapshot_status") == "not_required":
+        raise ValueError("codegen emit: not_required snapshot has no parallel boundaries")
     edits: list[TextEdit] = []
     needs_runtime_helper_import = False
     for class_name, form, emitted, func, injection, deferred_bias in iter_emitted_forms(
