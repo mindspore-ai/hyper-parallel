@@ -211,6 +211,48 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
             hsdp_param.reset_sharded_param()
         swap_tensor_impl.assert_not_called()
 
+    def test_materialized_single_rank_storage_survives_initialization(self):
+        """A communication alias must survive native initialization before first unshard."""
+        module = torch.nn.Module()
+        module.weight = torch.nn.Parameter(torch.empty(4, device="meta"))
+        module_info = ParamModuleInfo(module, "weight", [], [])
+        mesh_info = object.__new__(FSDPMeshInfo)
+        with patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0):
+            mesh_info.mesh = DeviceMesh("cpu", [0], mesh_dim_names=("fsdp",), _init_backend=False)
+        mesh_info.shard_mesh_dim = 0
+        mesh_info.replicate_mesh_dim = None
+        mesh_info.shard_mesh_rank = 0
+        mesh_info.shard_mesh_size = 1
+        mesh_info.shard_process_group = None
+        hsdp_param = HSDPParamV2(
+            module.weight, module_info, mesh_info,
+            mp_policy=MixedPrecisionPolicy(param_dtype=torch.float32), device=torch.device("cpu"),
+        )
+
+        with torch.no_grad():
+            module.to_empty(device="cpu")
+            hsdp_param.reset_sharded_param()
+            module.weight.fill_(2)
+        local = hsdp_param.sharded_param.to_local()
+        storage = hsdp_param._sharded_param_data
+        self.assertIs(module.weight, hsdp_param.sharded_param)
+        hsdp_param._get_unsharded_param_data()
+        hsdp_param.init_unsharded_param()
+        self.assertFalse(storage.requires_grad)
+        self.assertEqual(storage.untyped_storage().data_ptr(), local.untyped_storage().data_ptr())
+        parameter = hsdp_param.unsharded_param
+        parameter.square().sum().backward()
+        torch.testing.assert_close(parameter.grad, torch.full((4,), 4.0))
+
+        with torch.no_grad():
+            local.fill_(3)
+        parameter.grad = None
+        hsdp_param.init_unsharded_param()
+        self.assertIs(hsdp_param.unsharded_param, parameter)
+        torch.testing.assert_close(parameter, torch.full((4,), 3.0))
+        parameter.square().sum().backward()
+        torch.testing.assert_close(parameter.grad, torch.full((4,), 6.0))
+
     def test_dim0_smaller_than_world_size_preserves_empty_actual_shape(self):
         """Ranks past the last logical row should expose ``(0, *rest)`` over padded storage."""
         module = torch.nn.Module()
