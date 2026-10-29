@@ -2485,30 +2485,177 @@ def add_fsdp_unshard_reshard(actions, managed_stage_indices, max_active_stages=3
     return fsdp_actions
 
 
-def add_fsdp_reduce_grad(actions, managed_stage_indices, micro_batch_num):
-    """Launch reduction after each final backward and drain after all local stages."""
-    if not managed_stage_indices:
-        return actions
+def _is_stage_fsdp_action(action, stage_index, step_type):
+    """Whether the action is the stage's FSDP lifecycle step of ``step_type``."""
+    return (
+        action is not None
+        and action.type == step_type
+        and action.stage_index == stage_index
+    )
 
-    fsdp_actions = []
-    last_reduced_stage_index = None
-    for action in actions:
-        fsdp_actions.append(action)
-        reduced_stage_indices = []
+
+def _fsdp_reduce_launch_points(actions, managed_stage_indices, last_micro):
+    """Scan for each managed stage's reduce point and its original launch point.
+
+    The reduce point is the action index AFTER which the stage's
+    ``FSDP_REDUCE_GRAD`` is inserted — one past the action holding the last
+    of the stage's final backward (``BWD`` / ``BWD_WEIGHT``) and final grad
+    send (``BWD_SEND``). The launch point is the original placement: one past
+    the final backward leaf alone.
+
+    Args:
+        actions: Annotated action list from the previous schedule pass.
+        managed_stage_indices: Stage indices this rank launches reductions for.
+        last_micro: Micro index whose backward triggers the reduction.
+
+    Returns:
+        ``(stage_order, reduce_points, launch_points)``: stages in the order
+        their first final-micro backward leaf appears, then per-stage maps of
+        action index AFTER which the step is inserted.
+    """
+    reduce_points = {}
+    launch_points = {}
+    stage_order = []
+    for action_index, action in enumerate(actions):
         for leaf_step in iter_leaf_meta_steps(action):
             if leaf_step.stage_index not in managed_stage_indices:
                 continue
-            if leaf_step.type not in (MetaStepType.BWD, MetaStepType.BWD_WEIGHT):
+            if leaf_step.micro_index != last_micro:
                 continue
-            if leaf_step.micro_index != micro_batch_num - 1:
+            is_backward_leaf = leaf_step.type in (
+                MetaStepType.BWD,
+                MetaStepType.BWD_WEIGHT,
+            )
+            is_grad_send_leaf = leaf_step.type == MetaStepType.BWD_SEND
+            if not (is_backward_leaf or is_grad_send_leaf):
                 continue
-            if leaf_step.stage_index not in reduced_stage_indices:
-                reduced_stage_indices.append(leaf_step.stage_index)
-        for stage_index in reduced_stage_indices:
+            stage_index = leaf_step.stage_index
+            if stage_index not in reduce_points:
+                if not is_backward_leaf:
+                    # A lone final BWD_SEND cannot create a reduce point —
+                    # its backward leaf either already registered one or is
+                    # still ahead of it in the scan.
+                    continue
+                stage_order.append(stage_index)
+                reduce_points[stage_index] = action_index + 1
+                launch_points[stage_index] = action_index + 1
+            else:
+                reduce_points[stage_index] = max(
+                    reduce_points[stage_index], action_index + 1
+                )
+                if is_backward_leaf:
+                    launch_points[stage_index] = max(
+                        launch_points[stage_index], action_index + 1
+                    )
+    return stage_order, reduce_points, launch_points
+
+
+def _relocate_window_reshards(actions, stage_order, reduce_points, launch_points):
+    """Keep each deferred window off the stage's unshard/reshard lifecycle.
+
+    Deferring past the final ``BWD_SEND`` must not cross the stage's own
+    unshard/reshard lifecycle: a reshard inside the window would leave the
+    launch reading sharded parameters, and an unshard means the tail
+    refetched parameters (not a final unsharded span). Windows that hold a
+    reshard carry it along (replayed after the reduce by the caller); windows
+    that hold an unshard fall back to the original placement by rewriting
+    ``reduce_points`` in place.
+
+    Args:
+        actions: Annotated action list from the previous schedule pass.
+        stage_order: Managed stages in first-final-backward order.
+        reduce_points: Per-stage deferred insertion point; modified in place
+            for the fallback cases.
+        launch_points: Per-stage original insertion point.
+
+    Returns:
+        ``(relocated_reshards, skipped_action_indices)``: per-stage original
+        indices of reshards to replay after the reduce, and the set of those
+        indices to drop from the emitted list.
+    """
+    relocated_reshards = {}
+    skipped_action_indices = set()
+    for stage_index in stage_order:
+        launch_point = launch_points[stage_index]
+        deferred_point = reduce_points[stage_index]
+        if deferred_point <= launch_point:
+            continue
+        window = range(launch_point, deferred_point)
+        reshard_indices = [
+            index
+            for index in window
+            if _is_stage_fsdp_action(
+                actions[index], stage_index, MetaStepType.FSDP_RESHARD
+            )
+        ]
+        if any(
+            _is_stage_fsdp_action(
+                actions[index], stage_index, MetaStepType.FSDP_UNSHARD
+            )
+            for index in window
+        ):
+            reduce_points[stage_index] = launch_point
+            continue
+        if reshard_indices:
+            relocated_reshards[stage_index] = reshard_indices
+            skipped_action_indices.update(reshard_indices)
+    return relocated_reshards, skipped_action_indices
+
+
+def add_fsdp_reduce_grad(actions, managed_stage_indices, micro_batch_num):
+    """Launch reduction after each final backward and drain after all local stages.
+
+    The launch point defers past the stage's final ``BWD_SEND`` when that send
+    executes after the final backward (e.g. the 1F1B cooldown tail):
+    ``launch_reduce_grad`` issues every HSDP module's reduce-scatter / fused
+    all-reduce on the caller thread, so a launch placed between the final
+    ``BWD`` and its ``BWD_SEND`` makes the downstream stage's drain wait one
+    reduce-launch's dispatch latency per boundary. The input-grad send and the
+    weight-grad reduction touch disjoint tensors, so sending first is safe.
+
+    ``add_fsdp_unshard_reshard`` evicts a finished stage by inserting its
+    ``FSDP_RESHARD`` right before the trailing ``BWD_SEND`` (the send leaves
+    the stage with no upcoming compute, so its next-active window is empty).
+    The reduce launch must find the stage's parameters still unsharded, so
+    each stage ``FSDP_RESHARD`` between the final backward and the deferred
+    launch is replayed after the ``FSDP_REDUCE_GRAD``. The launch's
+    post-backward reshard already flipped the state and ``HSDPState.shard``
+    is idempotent, so the replayed reshard is a no-op — the same
+    reduce-then-reshard order the original placement produced. Windows that
+    hold a stage ``FSDP_UNSHARD`` (a refetch) keep the original placement.
+
+    Schedules without a trailing ``BWD_SEND`` (first stage, dxdw-split orders
+    that send before ``BWD_WEIGHT``) keep the inject-right-after-backward
+    placement.
+    """
+    if not managed_stage_indices:
+        return actions
+
+    stage_order, reduce_points, launch_points = _fsdp_reduce_launch_points(
+        actions, managed_stage_indices, micro_batch_num - 1
+    )
+    if not reduce_points:
+        return actions
+
+    relocated_reshards, skipped_action_indices = _relocate_window_reshards(
+        actions, stage_order, reduce_points, launch_points
+    )
+
+    fsdp_actions = []
+    last_reduced_stage_index = None
+    for action_index, action in enumerate(actions):
+        if action_index in skipped_action_indices:
+            continue
+        fsdp_actions.append(action)
+        for stage_index in stage_order:
+            if reduce_points.get(stage_index) != action_index + 1:
+                continue
             fsdp_actions.append(
                 MetaStep(None, MetaStepType.FSDP_REDUCE_GRAD, stage_index)
             )
             last_reduced_stage_index = stage_index
+            for reshard_index in relocated_reshards.get(stage_index, []):
+                fsdp_actions.append(actions[reshard_index])
     if last_reduced_stage_index is not None:
         fsdp_actions.append(
             MetaStep(
