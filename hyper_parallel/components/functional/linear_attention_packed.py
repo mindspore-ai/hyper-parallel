@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
@@ -43,6 +43,29 @@ class PackedChunkPlan:
         return {"cu_seqlens": self.cu_seqlens, "chunk_indices": self.chunk_indices}
 
 
+@dataclass(frozen=True, eq=False)
+class PackedDocumentInfo:
+    """Validated immutable document snapshot shared by a batch's interval views.
+
+    Identity hashing lets bounded CPU-plan caches reuse this snapshot without
+    hashing every document offset at every layer. Cache keys retain the object,
+    so distinct batches cannot collide through reuse of a Python object ID.
+    """
+
+    offsets: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        offsets = tuple(self.offsets)
+        if (
+            len(offsets) < 2
+            or offsets[0] != 0
+            or any(not isinstance(value, int) or isinstance(value, bool) for value in offsets)
+            or any(left >= right for left, right in zip(offsets, offsets[1:]))
+        ):
+            raise ValueError("Packed sample offsets must be strictly increasing integers starting at zero.")
+        object.__setattr__(self, "offsets", offsets)
+
+
 @dataclass(frozen=True)
 class PackedSequenceInfo:
     """Own immutable sample offsets and a contiguous physical token interval.
@@ -53,10 +76,13 @@ class PackedSequenceInfo:
     it consumes so that ordinary autograd version checks remain effective.
     """
 
-    global_offsets: tuple[int, ...]
+    global_offsets: tuple[int, ...] | PackedDocumentInfo
     start: int
     end: int
     local_offsets: tuple[int, ...] = field(init=False)
+    documents: PackedDocumentInfo = field(init=False, repr=False, compare=False, hash=False)
+    _head_index: int = field(init=False, repr=False, compare=False, hash=False)
+    _tail_index: int = field(init=False, repr=False, compare=False, hash=False)
     _plans: dict[tuple[torch.device, int], PackedChunkPlan] = field(
         default_factory=dict, init=False, repr=False, compare=False, hash=False
     )
@@ -65,23 +91,23 @@ class PackedSequenceInfo:
     )
 
     def __post_init__(self) -> None:
-        offsets = tuple(self.global_offsets)
-        if (
-            len(offsets) < 2
-            or offsets[0] != 0
-            or any(not isinstance(x, int) or isinstance(x, bool) for x in offsets)
-            or any(left >= right for left, right in zip(offsets, offsets[1:]))
-        ):
-            raise ValueError("Packed sample offsets must be strictly increasing integers starting at zero.")
+        documents = (self.global_offsets if isinstance(self.global_offsets, PackedDocumentInfo)
+                     else PackedDocumentInfo(self.global_offsets))
+        offsets = documents.offsets
         if (
             not isinstance(self.start, int) or isinstance(self.start, bool)
             or not isinstance(self.end, int) or isinstance(self.end, bool)
             or not 0 <= self.start < self.end <= offsets[-1]
         ):
             raise ValueError("Packed token interval must be nonempty and covered by global sample offsets.")
-        local = (0, *(x - self.start for x in offsets if self.start < x < self.end), self.end - self.start)
+        head = bisect_right(offsets, self.start) - 1
+        tail = bisect_left(offsets, self.end) - 1
+        local = (0, *(value - self.start for value in offsets[head + 1:tail + 1]), self.end - self.start)
         object.__setattr__(self, "global_offsets", offsets)
         object.__setattr__(self, "local_offsets", local)
+        object.__setattr__(self, "documents", documents)
+        object.__setattr__(self, "_head_index", head)
+        object.__setattr__(self, "_tail_index", tail)
 
     @property
     def length(self) -> int:
@@ -96,12 +122,12 @@ class PackedSequenceInfo:
     @property
     def continues_previous(self) -> bool:
         """Whether the first fragment consumes the preceding interval's state."""
-        return self.start not in self.global_offsets
+        return self.start != self.global_offsets[self._head_index]
 
     @property
     def continues_next(self) -> bool:
         """Whether the last fragment feeds the following interval's state."""
-        return self.end not in self.global_offsets
+        return self.end != self.global_offsets[self._tail_index + 1]
 
     @property
     def transfer_active(self) -> bool:
@@ -121,8 +147,7 @@ class PackedSequenceInfo:
     @property
     def preceding_sample_tokens(self) -> int:
         """Return how many earlier tokens belong to the first local sample."""
-        index = bisect_right(self.global_offsets, self.start) - 1
-        return self.start - self.global_offsets[index]
+        return self.start - self.global_offsets[self._head_index]
 
     def interval(self, start: int, end: int) -> PackedSequenceInfo:
         """Describe another contiguous interval without retaining artificial cuts."""
@@ -130,7 +155,11 @@ class PackedSequenceInfo:
         if key == (self.start, self.end):
             return self
         if key not in self._intervals:
-            self._intervals[key] = PackedSequenceInfo(self.global_offsets, start, end)
+            # Only a few interval layouts are normally used by one batch. Bound
+            # retained views even when callers explore many layouts explicitly.
+            if len(self._intervals) == 32:
+                self._intervals.pop(next(iter(self._intervals)))
+            self._intervals[key] = PackedSequenceInfo(self.documents, start, end)
         return self._intervals[key]
 
     def ulysses(self, degree: int, local_rank: int) -> PackedSequenceInfo:
@@ -197,7 +226,9 @@ def _global_offsets(info: PackedSequenceInfo | None, aliases: list) -> tuple[int
     if info is not None and not isinstance(info, PackedSequenceInfo):
         raise TypeError("packed_sequence_info must be PackedSequenceInfo.")
     offsets = info.global_offsets if info is not None else _offset_tuple(aliases[0])
-    if any(_offset_tuple(value) != offsets for value in aliases):
+    # Runtime q/k aliases share this immutable tuple; comparing the same tuple
+    # still walks its elements in Python, so skip only exact object identity.
+    if any(_offset_tuple(value) != offsets for value in aliases if value is not offsets):
         raise ValueError("Packed sequence aliases disagree; provide one consistent set of global sample offsets.")
     return offsets
 

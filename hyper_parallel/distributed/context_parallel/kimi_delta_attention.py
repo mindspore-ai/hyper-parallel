@@ -810,7 +810,7 @@ class KimiDeltaAttentionUlyssesCP(nn.Module):
 
 
 class _KDAStateCP(nn.Module):
-    """Run local KDA with the configured P2P or gathered state exchange."""
+    """Run local KDA with the configured state exchange."""
 
     def __init__(
         self,
@@ -838,7 +838,7 @@ class _KDAStateCP(nn.Module):
         self.cp_rank = self.cp_mesh.get_local_rank()
         self.cp_group = self.cp_mesh.get_group()
         if backend != "triton" and state_cp_method != "p2p":
-            raise ValueError("KDA AllGather state exchange requires backend='triton'.")
+            raise ValueError("KDA non-P2P state exchange requires backend='triton'.")
         self.state_cp = build_kda_state_cp(self.cp_mesh, state_cp_method, allgather_group_size)
         self.prev_rank = _global_peer_rank(
             self.cp_mesh,
@@ -1430,10 +1430,10 @@ class KimiDeltaAttentionCoreCP(nn.Module):
         """Build all communication groups once, before forward or checkpoint replay."""
         super().__init__()
         device_mesh = _ensure_1d(device_mesh)
-        if state_cp_method not in ("p2p", "allgather", "grouped_allgather_p2p"):
+        if state_cp_method not in ("p2p", "allgather", "grouped_allgather_p2p", "recursive_doubling"):
             raise ValueError("KDA requires a supported state_cp_method.")
         if backend.lower() != "triton" and state_cp_method != "p2p":
-            raise ValueError("KDA AllGather states require backend='triton'.")
+            raise ValueError("KDA non-P2P state exchange requires backend='triton'.")
         _validate_cp_degrees(device_mesh.size(), ulysses_degree, allgather_group_size)
         if state_cp_method != "grouped_allgather_p2p" and allgather_group_size != 1:
             raise ValueError("allgather_group_size is only valid for grouped_allgather_p2p.")

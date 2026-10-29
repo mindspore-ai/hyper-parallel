@@ -8,8 +8,8 @@ TND 将多个独立文档的 token 连续拼接。文档边界必须同时约束
 | 层与执行方式 | TND 支持 |
 |---|---|
 | KDA 本地层、P2P、纯 Ulysses | 支持；可选 eager 参考与 Triton-Ascend |
-| KDA AllGather、分组 AllGather + P2P | 支持；使用 Triton-Ascend |
-| KDA Ulysses + P2P / AllGather / 分组 AllGather + P2P | 支持；保持原有并行配置入口 |
+| KDA AllGather、分组 AllGather + P2P、Recursive Doubling | 支持；使用 Triton-Ascend |
+| KDA Ulysses + P2P / AllGather / 分组 AllGather + P2P / RD | 支持；保持原有并行配置入口 |
 | GDN 本地层、P2P、纯 Ulysses | 支持；可选 eager 参考与 Triton-Ascend |
 
 层入口接受 `[T, hidden_size]` 或 `[1, T, hidden_size]`，输出保持输入维数。
@@ -147,17 +147,29 @@ Dense 卷积保留 `[B,S,C]` 的 batch 隔离；packed 由同一公共适配传�
   再在本地实际需要入口状态的消费者处等待。仍使用初始化时创建的 CP 通信组。
 - AllGather / 分组 AllGather：用显式零转移表示 reset，保留原有正向、逆向有序扫描。每个在途调用仅保存
   本地 M；收集的 S/M 不跨前反向保留。反向重新收集本地 G/M。
+- Recursive Doubling：根据真实文档边界构造不可变的逐调用计划，只执行有消费者的倍增收发与合成，
+  backward 沿同一计划的反向边消费必要转移缓存。Ulysses 后先重建文档区间，再沿 state 子域规划。
+  尾文档不延续到下一状态 rank 时不生产 S；只有入口会影响该出口时才生产 M。头文档延续时仍需 G，
+  所以 rank 内部 reset 不等于整张卡都无需通信。没有活跃倍增轮的 rank 跳过 S/M 打包；计划不创建新通信组。
 - ShortConv：保留既有 halo 交换，按全局文档边界屏蔽越界 tap；该 mask 同时阻断越界的反向梯度。
 - backward：仅在内核调用处将紧凑入口状态、出口梯度展开到局部片段槽位，元数据和本地 M 由各自 autograd
   调用持有。不同 microbatch、反序 backward 和非重入 checkpoint 不共享可写通信缓冲区。
 
-保存的 M 不随文档数量线性增长，但原生 varlen 内核的临时状态槽、chunk 索引、conv 中间量和 AG 临时缓冲区
+剪枝只依据真实文档边界和消费者，不依据矩阵数值大小，不改变保留计算的合成或舍入顺序。
+同一元数据计划可以只读复用，各次调用的状态张量和反向缓存仍独立持有；没有活跃边不代表可以跳过本地 KDA。
+
+AG 保存的本地 M 不随文档数量线性增长；RD 缓存随实际参与轮数增长。原生 varlen 内核的临时状态槽、chunk 索引、conv 中间量和 AG 临时缓冲区
 仍有各自成本；不能将“仅保存一份 M”解释为整层峰值恒定。
 
 ## 数值语义
 
 本特性要求不同文档之间的导数严格为零，并保持同一 CP 配置在重算和多个在途调用下的一致性。
 FP64 / eager 对照用于检查分段、halo 和通信语义；NPU 对照还需覆盖实际低精度内核及反向。
+
+RD 可通过既有 `state_cp_method: recursive_doubling` 选择，`allgather_group_size` 必须为 1。
+当前限制为 Triton-Ascend、固定 K=V128、等长连续分片；不扩展 GDN 的协议范围。
+此组合沿用 dense RD 的有限精度合成顺序，不承诺不同协议逐位一致。RD 需显式选择；
+多文档 reset 用例与单篇跨域长文档须分别验收，当前不据此启用自动协议选择或宣称完整模型训练收敛。
 
 KDA 状态摘要沿用已有的有限精度数值契约；GDN 的 G 将每个 chunk 的有符号更新先相减、再加到状态，
 与同库原生 dhu 的舍入位置配对。此处实数公式不变，定长 GDN 也使用这一配对顺序。带 BF16 舍入的原生状态反馈不是严格仿射程序，因此换 CP 切分或
