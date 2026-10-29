@@ -769,6 +769,7 @@ def _maybe_apply_module_replacements(
     low_precision_config: Optional[Any],
     load_base_model: bool,
     weights_mapping: Any,
+    codegen_session: Optional[Any] = None,
 ) -> tuple:
     """Apply structure-preserving replacements unless codegen already did."""
     if _module_replacements_covered_by_generated(codegen_artifact_dir):
@@ -789,6 +790,9 @@ def _maybe_apply_module_replacements(
         weights_mapping=weights_mapping,
         context=_build_replacement_context(distributed_setup, low_precision_config),
         capture_checkpoint_metadata=load_base_model,
+        observation_callback=(
+            None if codegen_session is None else codegen_session.record_replacements
+        ),
     )
 
 
@@ -837,6 +841,7 @@ def apply_model_infrastructure(
     low_precision_config: Optional[Any] = None,
     model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
     codegen_artifact_dir: Optional[str] = None,
+    codegen_session: Optional[Any] = None,
     **kwargs: Any,
 ) -> nn.Module:
     """Apply sharding, activation wrappers, FSDP2, initialization and compilation.
@@ -858,7 +863,7 @@ def apply_model_infrastructure(
     weights_mapping = get_model_conversion_mapping(model)
     model, weights_mapping = _maybe_apply_module_replacements(
         model, codegen_artifact_dir, distributed_setup, low_precision_config,
-        load_base_model, weights_mapping,
+        load_base_model, weights_mapping, codegen_session,
     )
     if codegen_artifact_dir:
         from hyper_parallel.codegen.check.preflight import (  # pylint: disable=import-outside-toplevel

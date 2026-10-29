@@ -141,4 +141,42 @@ def _type_path(module_type: type) -> str:
     return f"{module_type.__module__}.{module_type.__qualname__}"
 
 
-__all__ = ["compile_overrides_for_meta"]
+def replacement_records_from_snapshot(snapshot: Any) -> tuple[dict[str, Any], ...]:
+    """Translate native replacement observations to the legacy emitter shape.
+
+    This is a transition-only adapter. It consumes immutable snapshot data and
+    never recompiles rules or inspects a live model.
+    """
+    payload = snapshot.to_dict() if hasattr(snapshot, "to_dict") else snapshot
+    if not isinstance(payload, dict):
+        raise TypeError("replacement snapshot must be a CodegenSnapshot or dict")
+    replacements = payload.get("replacements", {})
+    declarations = replacements.get("declarations", ())
+    applications = replacements.get("applications", ())
+    declarations_by_id = {item["rule_id"]: item for item in declarations}
+    if len(declarations_by_id) != len(declarations):
+        raise ValueError("replacement snapshot contains duplicate rule_id values")
+    records = []
+    for application in applications:
+        rule_id = application.get("rule_id")
+        declaration = declarations_by_id.get(rule_id)
+        if declaration is None:
+            raise ValueError(
+                f"replacement application references unknown rule_id {rule_id!r}"
+            )
+        source_type = declaration["source_type"].replace(":", ".", 1)
+        record = {
+            "match": list(declaration["match"]),
+            "fqn": application["primary_fqn"],
+            "fqns": list(application["module_fqns"]),
+            "module_type": source_type,
+            "factory": declaration["replacement_target"],
+            "exact_type": bool(declaration["exact_type"]),
+        }
+        if declaration.get("static_arguments"):
+            record["target_config"] = dict(declaration["static_arguments"])
+        records.append(record)
+    return tuple(records)
+
+
+__all__ = ["compile_overrides_for_meta", "replacement_records_from_snapshot"]

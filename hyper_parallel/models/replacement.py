@@ -23,7 +23,7 @@ import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Optional
 
 from torch import nn  # pylint: disable=forbidden-backend-import
 
@@ -36,6 +36,19 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
 ModuleReplacementFactory = Callable[..., nn.Module]
 MethodReplacementFactory = Callable[..., Callable[..., Any]]
 logger = logging.getLogger(__name__)
+
+
+class ModuleReplacementMatchError(ValueError):
+    """A required replacement pattern did not match the final model tree."""
+
+    def __init__(self, unmatched: tuple[dict[str, str], ...]) -> None:
+        self.unmatched = unmatched
+        patterns = [item["pattern"] for item in unmatched]
+        super().__init__(
+            "module replacement pattern(s) matched no final module: "
+            f"{patterns}. Inspect the finalized module inventory and update the "
+            "adapter pattern; do not silently skip a required replacement."
+        )
 
 
 def module_replacement(factory: ModuleReplacementFactory) -> ModuleReplacementFactory:
@@ -167,6 +180,9 @@ class ModuleReplacementSpec:
     factory: ModuleReplacementFactory
     module_type: type[nn.Module] | None = None
     exact_type: bool = False
+    declaration_id: str = ""
+    replacement_target: Optional[str] = None
+    static_arguments: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not self.match or any(not isinstance(pattern, str) or not pattern for pattern in self.match):
@@ -178,6 +194,12 @@ class ModuleReplacementSpec:
             raise ValueError("exact_type requires module_type")
         if not callable(self.factory) or not getattr(self.factory, "_hp_module_replacement", False):
             raise TypeError("module replacement factory must be decorated with @module_replacement")
+        if not isinstance(self.declaration_id, str):
+            raise TypeError("module replacement declaration_id must be a string")
+        if self.replacement_target is not None and not isinstance(self.replacement_target, str):
+            raise TypeError("module replacement replacement_target must be a string or None")
+        if self.static_arguments is not None and not isinstance(self.static_arguments, Mapping):
+            raise TypeError("module replacement static_arguments must be a mapping or None")
 
 
 @dataclass(frozen=True)
@@ -202,6 +224,7 @@ class ModuleReplacementPlan:
     """Immutable result of matching replacement rules against one model tree."""
 
     targets: tuple[ModuleReplacementTarget, ...]
+    specs: tuple[ModuleReplacementSpec, ...] = ()
 
 
 def _all_module_aliases(model: nn.Module) -> dict[int, tuple[nn.Module, tuple[str, ...]]]:
@@ -244,6 +267,7 @@ def _validate_module_type(
 
 def _select_replacement_spec(
     spec: ModuleReplacementSpec,
+    spec_index: int,
     aliases: dict[int, tuple[nn.Module, tuple[str, ...]]],
     selected: dict[int, ModuleReplacementTarget],
 ) -> None:
@@ -269,10 +293,15 @@ def _select_replacement_spec(
         pattern for pattern, matched_ids in matched_ids_by_pattern.items() if not matched_ids
     ]
     if unmatched_patterns:
-        raise ValueError(
-            "module replacement pattern(s) matched no final module: "
-            f"{unmatched_patterns}. Inspect the finalized module inventory and update the "
-            "adapter pattern; do not silently skip a required replacement."
+        raise ModuleReplacementMatchError(
+            tuple(
+                {
+                    "rule_id": _replacement_rule_id(spec, spec_index),
+                    "pattern": pattern,
+                    "reason": "matched_no_final_module",
+                }
+                for pattern in unmatched_patterns
+            )
         )
 
 
@@ -296,16 +325,46 @@ def compile_module_replacements(
 
     specs = tuple(specs)
     if not specs:
-        return ModuleReplacementPlan(())
+        return ModuleReplacementPlan((), specs)
 
     aliases = _all_module_aliases(model)
     selected: dict[int, ModuleReplacementTarget] = {}
-    for spec in specs:
-        _select_replacement_spec(spec, aliases, selected)
+    for spec_index, spec in enumerate(specs):
+        _select_replacement_spec(spec, spec_index, aliases, selected)
 
     targets = tuple(selected.values())
     _validate_non_nested_targets(targets)
-    return ModuleReplacementPlan(targets)
+    return ModuleReplacementPlan(targets, specs)
+
+
+def _symbol_path(symbol: Any) -> str:
+    """Return a stable import-like identity without retaining the symbol."""
+    return f"{symbol.__module__}:{symbol.__qualname__}"
+
+
+def _replacement_rule_id(spec: ModuleReplacementSpec, index: int) -> str:
+    """Return the declared rule id or a stable fallback for Python callers."""
+    if spec.declaration_id:
+        return spec.declaration_id
+    return f"python-replacement-{index:04d}"
+
+
+def describe_replacement_declarations(
+    specs: Iterable[ModuleReplacementSpec],
+) -> tuple[dict[str, Any], ...]:
+    """Project normalized replacement rules to JSON-safe declarations."""
+    return tuple(
+        {
+            "rule_id": _replacement_rule_id(spec, index),
+            "match": list(spec.match),
+            "source_type": _symbol_path(spec.module_type),
+            "exact_type": spec.exact_type,
+            "replacement_target": spec.replacement_target or _symbol_path(spec.factory),
+            "static_arguments": dict(spec.static_arguments or {}),
+            "order": index,
+        }
+        for index, spec in enumerate(specs)
+    )
 
 
 def _parent_and_name(model: nn.Module, fqn: str) -> tuple[nn.Module, str]:
@@ -487,6 +546,7 @@ def _apply_module_replacement_actions(
     weights_mapping: list[WeightRenaming | WeightConverter] | None = None,
     context: Mapping[str, Any] | None = None,
     capture_checkpoint_metadata: bool = True,
+    observation_callback: Optional[Callable[..., None]] = None,
 ) -> tuple[nn.Module, list[WeightRenaming | WeightConverter] | None]:
     """Apply normalized replacement rules before sharding sees the model.
 
@@ -511,13 +571,24 @@ def _apply_module_replacement_actions(
             "Low-precision online training currently requires TP=CP=EP=PP=1; "
             f"active axes: {active_model_parallel_axes}."
         )
-    plan = compile_module_replacements(model, tuple(replacement_rules or ()))
+    specs = tuple(replacement_rules or ())
+    try:
+        plan = compile_module_replacements(model, specs)
+    except ModuleReplacementMatchError as exc:
+        if observation_callback is not None:
+            observation_callback(
+                declarations=describe_replacement_declarations(specs),
+                applications=(),
+                unmatched=exc.unmatched,
+            )
+        raise
     return apply_module_replacements(
         model,
         plan,
         weights_mapping=weights_mapping,
         context=context,
         capture_checkpoint_metadata=capture_checkpoint_metadata,
+        observation_callback=observation_callback,
     )
 
 
@@ -527,7 +598,8 @@ def _install_replacement_target(
     context: Mapping[str, Any],
     extra_transforms: list[WeightRenaming | WeightConverter],
     weights_mapping: list[WeightRenaming | WeightConverter] | None,
-) -> None:
+    rule_id: str,
+) -> dict[str, Any]:
     """Build, validate, and install one replacement target in place."""
     source = target.source
     replacement = target.spec.factory(
@@ -565,6 +637,14 @@ def _install_replacement_target(
     for fqn in target.module_fqns:
         parent, name = _parent_and_name(model, fqn)
         parent._modules[name] = replacement  # pylint: disable=protected-access
+    return {
+        "rule_id": rule_id,
+        "module_fqns": list(target.module_fqns),
+        "primary_fqn": target.module_fqns[0],
+        "source_type": _symbol_path(type(source)),
+        "replacement_type": _symbol_path(type(replacement)),
+        "weight_transforms": [_symbol_path(type(transform)) for transform in transforms],
+    }
 
 
 def apply_module_replacements(
@@ -574,6 +654,7 @@ def apply_module_replacements(
     weights_mapping: list[WeightRenaming | WeightConverter] | None = None,
     context: Mapping[str, Any] | None = None,
     capture_checkpoint_metadata: bool = True,
+    observation_callback: Optional[Callable[..., None]] = None,
 ) -> tuple[nn.Module, list[WeightRenaming | WeightConverter] | None]:
     """Build, validate, and install one target at a time to bound live storage.
 
@@ -585,13 +666,24 @@ def apply_module_replacements(
     context = MappingProxyType(dict(context or {}))
     source_shapes = _named_tensor_shapes(model) if plan.targets and capture_checkpoint_metadata else None
     extra_transforms: list[WeightRenaming | WeightConverter] = []
+    ordered_specs = plan.specs or tuple(
+        target.spec
+        for index, target in enumerate(plan.targets)
+        if id(target.spec) not in {id(previous.spec) for previous in plan.targets[:index]}
+    )
+    spec_indexes = {id(spec): index for index, spec in enumerate(ordered_specs)}
+    applications = []
     for target in plan.targets:
-        _install_replacement_target(
-            model,
-            target,
-            context,
-            extra_transforms,
-            weights_mapping,
+        spec_index = spec_indexes.get(id(target.spec), 0)
+        applications.append(
+            _install_replacement_target(
+                model,
+                target,
+                context,
+                extra_transforms,
+                weights_mapping,
+                _replacement_rule_id(target.spec, spec_index),
+            )
         )
     if extra_transforms:
         if capture_checkpoint_metadata:
@@ -607,4 +699,10 @@ def apply_module_replacements(
     model._hp_replaced_module_fqns = tuple(  # pylint: disable=protected-access
         dict.fromkeys((*previous_replacements, *current_replacements))
     )
+    if observation_callback is not None:
+        observation_callback(
+            declarations=describe_replacement_declarations(ordered_specs),
+            applications=tuple(applications),
+            unmatched=(),
+        )
     return model, weights_mapping
