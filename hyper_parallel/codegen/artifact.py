@@ -28,12 +28,16 @@ half-written bundle can never be imported.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from dataclasses import dataclass
+import hashlib
 import logging
 import os
+from pathlib import Path
 import shutil
 import tempfile
-from dataclasses import dataclass
-from pathlib import Path
+import time
+from typing import Iterator
 
 # Bundle directory name shared by every layout constructor.
 _GENERATED_DIR = "generated"
@@ -342,10 +346,80 @@ def clean_temp_artifacts(layout: ArtifactLayout) -> None:
             shutil.rmtree(os.path.join(parent, name), ignore_errors=True)
 
 
+def artifact_failure_path(layout: ArtifactLayout, signature: str) -> str:
+    """Return the rank-coordination marker for one failed publication."""
+    if not isinstance(signature, str) or not signature:
+        raise ValueError("codegen signature must be a non-empty string")
+    parent = os.path.dirname(layout.artifact_dir) or "."
+    bundle_name = os.path.basename(layout.artifact_dir.rstrip(os.sep)) or "generated"
+    marker_id = hashlib.sha256(signature.encode("utf-8")).hexdigest()
+    return os.path.join(parent, f".{bundle_name}.codegen_failed_{marker_id}")
+
+
+def publish_artifact_failure(
+    layout: ArtifactLayout,
+    signature: str,
+    reason: str,
+) -> None:
+    """Atomically notify waiting ranks that the owner failed generation."""
+    path = artifact_failure_path(layout, signature)
+    parent = os.path.dirname(path) or "."
+    Path(parent).mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".codegen_failure_", dir=parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(reason)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def clear_artifact_failure(layout: ArtifactLayout, signature: str) -> None:
+    """Remove a failure marker after every rank has observed the outcome."""
+    path = artifact_failure_path(layout, signature)
+    if os.path.isfile(path):
+        os.unlink(path)
+
+
+@contextmanager
+def artifact_generation_lock(
+    layout: ArtifactLayout,
+    *,
+    timeout_s: float = 600.0,
+) -> Iterator[None]:
+    """Serialize independent owners publishing into the same bundle path."""
+    parent = os.path.dirname(layout.artifact_dir) or "."
+    bundle_name = os.path.basename(layout.artifact_dir.rstrip(os.sep)) or "generated"
+    lock_path = os.path.join(parent, f".{bundle_name}.codegen.lock")
+    deadline = time.monotonic() + timeout_s
+    descriptor = None
+    while descriptor is None:
+        try:
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"codegen: timed out waiting for artifact lock {lock_path}"
+                ) from None
+            time.sleep(0.1)
+    try:
+        os.write(descriptor, str(os.getpid()).encode("ascii"))
+        yield
+    finally:
+        os.close(descriptor)
+        if os.path.isfile(lock_path):
+            os.unlink(lock_path)
+
+
 __all__ = [
     "ArtifactLayout",
+    "artifact_failure_path",
+    "artifact_generation_lock",
+    "clear_artifact_failure",
     "clean_temp_artifacts",
     "ensure_artifact_dir",
+    "publish_artifact_failure",
     "resolve_default_artifact_layout",
     "resolve_model_artifact_layout",
     "resolve_artifact_layout",

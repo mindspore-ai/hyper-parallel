@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from hyper_parallel.codegen.snapshot import (
     CodegenSnapshot,
@@ -144,8 +144,19 @@ class CodegenBuildSession:
         self._failure = FailureSnapshot.from_data(stage, reason, details)
         self._status = CodegenStatus.FAILED
 
-    def finish(self) -> CodegenSnapshot:
-        """Seal and return the immutable snapshot.
+    def finish(
+        self,
+        generator: Optional[Callable[[CodegenSnapshot], Any]] = None,
+    ) -> CodegenSnapshot:
+        """Seal the session, optionally publishing a derived snapshot.
+
+        ``generator`` is invoked only for a fully derived native build. Its
+        failure is recorded as codegen-owned state and deliberately does not
+        escape into the caller's already successful model build.
+
+        Args:
+            generator: Optional side-effecting publisher that consumes the
+                immutable derived snapshot.
 
         Returns:
             The same snapshot instance on repeated calls.
@@ -163,8 +174,27 @@ class CodegenBuildSession:
             raise RuntimeError("derived codegen session is missing plan application")
         if self._status == CodegenStatus.GENERATING:
             raise RuntimeError("codegen session is still generating")
-        self._snapshot = CodegenSnapshot(
-            status=self._status,
+        if self._status == CodegenStatus.DERIVED and generator is not None:
+            derived_snapshot = self._build_snapshot(CodegenStatus.DERIVED)
+            self.mark_generating()
+            try:
+                generator(derived_snapshot)
+            except Exception as exc:  # Generation must not invalidate native build.
+                self.mark_failed(
+                    "generation",
+                    str(exc) or type(exc).__name__,
+                    {"exception_type": type(exc).__name__},
+                )
+            else:
+                self.mark_generated()
+        self._snapshot = self._build_snapshot(self._status)
+        self._finished = True
+        return self._snapshot
+
+    def _build_snapshot(self, status: CodegenStatus) -> CodegenSnapshot:
+        """Build an immutable view without sealing the session."""
+        return CodegenSnapshot(
+            status=status,
             source=self._source,
             replacements=self._replacements,
             plan=self._plan,
@@ -173,8 +203,6 @@ class CodegenBuildSession:
             reason=self._reason,
             failure=self._failure,
         )
-        self._finished = True
-        return self._snapshot
 
     def _require_open(self, *statuses: CodegenStatus) -> None:
         if self._finished:
