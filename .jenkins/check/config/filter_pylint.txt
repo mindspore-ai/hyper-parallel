@@ -136,6 +136,8 @@
 # 24. DSA functional exports are resolved lazily by components.functional;
 #     pylint cannot infer that the exported operator proxies are callable.
 "hyper-parallel/hyper_parallel/components/modules/dsa_attention.py"        "not-callable"
+# Chunk MLP uses the same lazy functional export mechanism for SwiGLU.
+"hyper-parallel/hyper_parallel/components/modules/chunked_swiglu_mlp.py"     "not-callable"
 
 # 25. Codegen package — importing hyper_parallel.codegen must not pull
 #     torch/transformers (import-time isolation), so backend imports stay
