@@ -47,8 +47,12 @@ from hyper_parallel.codegen.hash import file_line_count, sha256_file
 from hyper_parallel.codegen.manager import ensure_codegen_artifact_from_snapshot
 from hyper_parallel.codegen.session import CodegenBuildSession
 from hyper_parallel.codegen.snapshot import CodegenStatus
-from hyper_parallel.models.build_options import get_device_id, get_device_type  # pylint: disable=syntax-error
-from hyper_parallel.models.build_options import CompileConfig
+from hyper_parallel.models.build_options import (  # pylint: disable=syntax-error
+    CompileConfig,
+    get_device_id,
+    get_device_type,
+    get_torch_device,
+)
 from hyper_parallel.components.checkpoint.quantized_hf_storage import supports_hf_dequantization
 
 logger = logging.getLogger(__name__)
