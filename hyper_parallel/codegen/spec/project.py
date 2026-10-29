@@ -150,12 +150,16 @@ def _model_name(config: Any) -> Optional[str]:
 def _project_dp_size(accelerator: Any) -> int:
     """Derive runtime DP size from ``WORLD_SIZE`` and non-DP topology."""
     explicit = getattr(accelerator, "dp_size", None)
-    if explicit:
-        return max(1, int(explicit))
+    if explicit is not None:
+        if isinstance(explicit, bool) or not isinstance(explicit, int) or explicit < 1:
+            raise ValueError(
+                f"accelerator.dp_size must be a positive integer, got {explicit!r}"
+            )
+        return explicit
     world_size = int(os.environ.get("WORLD_SIZE") or os.environ.get("OMPI_COMM_WORLD_SIZE") or 1)
-    tp_size = max(1, int(getattr(accelerator, "tp_size", 1)))
-    cp_size = max(1, int(getattr(accelerator, "cp_size", 1)))
-    pp_size = max(1, int(getattr(accelerator, "pp_size", 1)))
+    tp_size = int(getattr(accelerator, "tp_size", 1))
+    cp_size = int(getattr(accelerator, "cp_size", 1))
+    pp_size = int(getattr(accelerator, "pp_size", 1))
     non_dp_size = tp_size * cp_size * pp_size
     if world_size % non_dp_size != 0:
         raise ValueError(

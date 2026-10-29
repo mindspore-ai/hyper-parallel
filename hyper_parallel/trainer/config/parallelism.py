@@ -59,6 +59,15 @@ class AcceleratorConfig:
     loss_parallel: bool = False
     encoder_parallel: EncoderParallelConfig = field(default_factory=EncoderParallelConfig)
 
+    def __post_init__(self) -> None:
+        """Reject invalid parallel degrees before topology projection."""
+        for name in ("tp_size", "cp_size", "ep_size", "pp_size"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(
+                    f"accelerator.{name} must be a positive integer, got {value!r}"
+                )
+
 
 @dataclass
 class ActivationCheckpointSelection:
