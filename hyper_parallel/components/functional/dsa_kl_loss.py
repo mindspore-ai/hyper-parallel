@@ -17,7 +17,8 @@
 from typing import Any, Tuple
 
 import torch  # pylint: disable=forbidden-backend-import
-import omni_training_custom_ops  # noqa: F401  # pylint: disable=unused-import
+
+from hyper_parallel.components.functional.dsa_ops import _cann_dsa_sparse_indexer_kl_loss_grad
 
 
 class _DSAKLLoss(torch.autograd.Function):
@@ -43,24 +44,21 @@ class _DSAKLLoss(torch.autograd.Function):
     ) -> torch.Tensor:
         """Compute the KL loss and save its precomputed indexer gradients."""
         grad_index_query, grad_index_key, grad_merge_weight, inner_loss = (
-            torch.ops.custom.npu_sparse_lightning_indexer_grad_kl_loss_enhance(
-                query=query,
-                key=key,
-                query_index=index_query,
-                key_index=index_key,
-                weights=merge_weight,
-                sparse_indices=topk_indices,
-                softmax_max=softmax_max,
-                softmax_sum=softmax_sum,
-                scale_value=scale,
+            _cann_dsa_sparse_indexer_kl_loss_grad(
+                query,
+                key,
+                index_query,
+                index_key,
+                merge_weight,
+                topk_indices,
+                softmax_max,
+                softmax_sum,
+                scale,
                 query_rope=query_rope,
                 key_rope=key_rope,
                 actual_seq_qlen=actual_seq_qlen,
                 actual_seq_klen=actual_seq_kvlen,
                 layout="TND",
-                sparse_mode=3,
-                deterministic=torch.are_deterministic_algorithms_enabled(),
-                sparse_block_size=1,
             )
         )
         divisor = query.size(0)
@@ -124,3 +122,6 @@ def dsa_kl_loss(
         scale,
         loss_coeff,
     )
+
+
+__all__ = ["dsa_kl_loss"]

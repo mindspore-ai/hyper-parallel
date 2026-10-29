@@ -215,6 +215,9 @@ class DeepseekV32DSAAttention(nn.Module):
         )
         self.dsa_loss_coeff = getattr(config, "dsa_loss_coeff", 0.0)
         self.freeze_dsa = bool(getattr(config, "freeze_DSA", getattr(config, "freeze_dsa", False)))
+        self.dsa_dense_warm_up = bool(
+            getattr(module, "dsa_dense_warm_up", getattr(config, "dsa_dense_warm_up", False))
+        )
         if getattr(module, "param_sink_number", 0) > 0:
             raise ValueError("DeepseekV32DSAAttention does not support the parameter-sink path")
         if getattr(module, "use_mome", False):
