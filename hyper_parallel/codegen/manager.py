@@ -667,7 +667,10 @@ def _fill_plan_fields(
     """
     from hyper_parallel.codegen.plan.derive import build_meta_model
     from hyper_parallel.codegen.plan.freeze import freeze_plan
-    from hyper_parallel.codegen.patch_plan import serialize_patch_emission_plan
+    from hyper_parallel.codegen.patch_plan import (
+        PatchEmissionPlan,
+        serialize_patch_emission_plan,
+    )
     from hyper_parallel.codegen.source.resolver import _trust_remote_code
     from hyper_parallel.codegen.spec.project import project_codegen_spec
 
@@ -701,20 +704,47 @@ def _fill_plan_fields(
     meta.boundary_classes = frozen.boundary_classes
     meta.mesh_dim_names = list(frozen.mesh_dim_names) or None
 
-    meta.module_overrides = list(build_input.module_overrides)
     meta.emission_patches = serialize_patch_emission_plan(build_input.patch_plan)
-    # The inline pipeline lowers the matched replacements into the generated
-    # file, so the artifact owns ``replace_module``.  Declare coverage so the
-    # trainer's HF replacement step is skipped on the gen path — but only when
-    # something was actually matched.  ``covered`` is always a
-    # COVERED_DEFAULTS copy, so the key is present either way.
-    meta.covered["module_overrides"] = bool(build_input.module_overrides)
+    from hyper_parallel.models.registry import (  # pylint: disable=import-outside-toplevel
+        _resolve_custom_model_cls,
+    )
+
+    runtime_owned_custom_model = _resolve_custom_model_cls(meta.model_class or "") is not None
+    if not runtime_owned_custom_model:
+        # HF-only models still rely on inline source emission for state bound
+        # by their replacement/forward patches (for example Qwen3-MoE's
+        # ``ep_enable``). Preserve that established generated-source contract.
+        meta.module_overrides = list(build_input.module_overrides)
+        meta.covered["module_overrides"] = bool(build_input.module_overrides)
+        meta.covered["model_class"] = True
+        meta.covered["sharding_plan"] = True
+        return build_input.patch_plan
+
+    # ``emission_patches`` retains the observed replacements for drift audit.
+    # ``module_overrides`` is emitter ownership and must stay empty when the
+    # live Trainer owns replacement application.
+    meta.module_overrides = []
+    # Replacements on the temporary model are planning observations, not
+    # generated-source ownership. Trainer must apply them to the live model so
+    # native and codegen modes share the replacement/FSDP/optimizer lifecycle.
+    meta.covered["module_overrides"] = False
+    # The emitted file is an audit copy when it owns no source patches.  For
+    # registered custom models the live Trainer must instantiate the native
+    # class as well as apply the native replacements; otherwise Python sees a
+    # second, synthetic class hierarchy even though the source text is equal.
+    meta.covered["model_class"] = False
 
     # A non-empty frozen plan is the artifact's full parallel logic; the
     # runtime shards from ``codegen_meta.json``.  ``covered`` is always a
     # COVERED_DEFAULTS copy, so the key is present either way.
     meta.covered["sharding_plan"] = True
-    return build_input.patch_plan
+    # Phase C is also runtime-owned.  Emitting its observed forward patches
+    # creates a second implementation that the runtime later tries to undo
+    # before applying the native boundary wrappers.  That extra bind/restore
+    # cycle changes DeepSeek-V4.1's backward graph even when its first forward
+    # losses match.  Keep the observations only in metadata for drift audit;
+    # the generated modeling source must remain structurally native here.
+    return PatchEmissionPlan()
 
 
 def _prepare_codegen_build(model: Any, config: Any, spec: Any) -> CodegenBuildInput:

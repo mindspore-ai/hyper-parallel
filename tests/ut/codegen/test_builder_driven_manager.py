@@ -20,8 +20,10 @@ from unittest.mock import patch
 from torch import nn
 
 from hyper_parallel.codegen import manager
+from hyper_parallel.codegen.meta import CodegenMeta
 from hyper_parallel.codegen.plan.offline_mesh import OfflineMesh
 from hyper_parallel.codegen.patch_plan import (
+    PatchEmissionPlan,
     build_patch_emission_plan,
     deserialize_patch_emission_plan,
     serialize_patch_emission_plan,
@@ -118,6 +120,55 @@ def test_prepare_codegen_build_uses_builder_replacement_events():
     planner.assert_called_once()
     apply_plan.assert_not_called()
     apply_phase_c.assert_called_once()
+
+
+def test_fill_plan_fields_keeps_builder_patches_runtime_owned():
+    """Do not lower planning-time builder mutations into generated source."""
+    replacement = SimpleNamespace(module_fqn="model.0")
+    local_compute_patch = SimpleNamespace(module_fqn="model.0")
+    patch_plan = PatchEmissionPlan(
+        module_replacements=(replacement,),
+        local_computes=(local_compute_patch,),
+    )
+    build_input = manager.CodegenBuildInput(
+        source_model=object(),
+        transformed_model=object(),
+        sharding_plan=object(),
+        patch_plan=patch_plan,
+        module_overrides=({"fqn": "model.0"},),
+    )
+    frozen = SimpleNamespace(
+        param_plan={"model.0": {}}, frozen_sharded_params=[], injections=[],
+        tied_pairs=[], special_handlers=[], boundary_classes={}, mesh_dim_names=("tp",),
+    )
+    meta = CodegenMeta(
+        codegen_version="test", signature="test", yaml_path="test.yaml",
+        yaml_sha256="test", source={}, parallel_dims={}, model_class="ToyCustomModel",
+    )
+
+    with patch(
+        "hyper_parallel.codegen.spec.project.project_codegen_spec",
+        return_value=SimpleNamespace(source=SimpleNamespace(model_name_or_path="unused")),
+    ), patch(
+        "hyper_parallel.codegen.plan.derive.build_meta_model", return_value=object(),
+    ), patch(
+        "hyper_parallel.codegen.manager._prepare_codegen_build", return_value=build_input,
+    ), patch(
+        "hyper_parallel.codegen.plan.freeze.freeze_plan", return_value=frozen,
+    ), patch(
+        "hyper_parallel.codegen.patch_plan.serialize_patch_emission_plan",
+        return_value={"module_replacements": [{"module_fqn": "model.0"}]},
+    ), patch(
+        "hyper_parallel.models.registry._resolve_custom_model_cls",
+        return_value=object(),
+    ):
+        emitted = manager._fill_plan_fields(meta, SimpleNamespace(), SimpleNamespace())
+
+    assert meta.covered["module_overrides"] is False
+    assert meta.module_overrides == []
+    assert meta.emission_patches["module_replacements"] == [{"module_fqn": "model.0"}]
+    assert emitted.module_replacements == ()
+    assert emitted.local_computes == ()
 
 
 def test_offline_phase_c_records_after_installing_local_region_forward():
