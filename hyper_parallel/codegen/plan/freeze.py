@@ -17,7 +17,7 @@ torch or the training stack.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from hyper_parallel.codegen.plan.spec_fields import (
@@ -280,6 +280,10 @@ class FrozenPlan:
     boundary_classes: dict[str, str] = field(default_factory=dict)
     mesh_dim_names: tuple[str, ...] = ()
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return the JSON representation consumed by build snapshots."""
+        return asdict(self)
+
 
 def freeze_plan(plan: Any, model: Any) -> FrozenPlan:
     """Freeze a planner ``ShardingPlan`` into a ``FrozenPlan``.
@@ -301,6 +305,83 @@ def freeze_plan(plan: Any, model: Any) -> FrozenPlan:
         boundary_classes=_freeze_boundary_classes(plan, model),
         mesh_dim_names=tuple(getattr(plan, "mesh_dim_names", ()) or ()),
     )
+
+
+def freeze_plan_application(
+    plan: Any,
+    source_shard_info: Any,
+    *,
+    validate_mode: bool,
+) -> dict[str, Any]:
+    """Freeze facts resolved by the native sharding applier.
+
+    This observes the existing plan and apply return value only. It does not
+    inspect parameters, rebuild meshes, or invoke planner/applier helpers.
+    """
+    modules = getattr(plan, "modules", {}) or {}
+    return {
+        "validate_mode": bool(validate_mode),
+        "applied_boundaries": sorted(modules),
+        "source_shard_info": _freeze_source_shard_info(source_shard_info),
+        "resolved_injections": freeze_injections(plan),
+        "tied_pairs": freeze_tied_pairs(plan),
+        "special_handlers": dict(getattr(plan, "special_handlers", {}) or {}),
+        "ep_bindings": _freeze_ep_bindings(plan),
+        "resolved_wrappers": _freeze_resolved_wrappers(plan),
+    }
+
+
+def _freeze_source_shard_info(source_shard_info: Any) -> dict[str, Any]:
+    """Serialize FQN-keyed source placements without retaining DeviceMesh."""
+    if not source_shard_info:
+        return {}
+    result = {}
+    for fqn, value in sorted(source_shard_info.items()):
+        if not isinstance(value, tuple) or len(value) != 2:
+            raise TypeError(
+                f"source_shard_info[{fqn!r}] must be a (placements, mesh) pair"
+            )
+        placements, mesh = value
+        mesh_dim_names = tuple(getattr(mesh, "mesh_dim_names", ()) or ())
+        shape = tuple(int(size) for size in (getattr(mesh, "shape", ()) or ()))
+        result[fqn] = {
+            "placements": [placement_to_string(item) for item in placements],
+            "mesh_dim_names": list(mesh_dim_names),
+            "mesh_shape": list(shape),
+        }
+    return result
+
+
+def _freeze_ep_bindings(plan: Any) -> list[dict[str, Any]]:
+    """Record boundaries whose native plan resolved an active EP contract."""
+    result = []
+    for fqn, spec in sorted((getattr(plan, "modules", {}) or {}).items()):
+        ep_size = int(getattr(spec, "_ep_size", 0) or 0)
+        if ep_size <= 0:
+            continue
+        result.append({
+            "fqn": fqn,
+            "ep_size": ep_size,
+            "ep_stack": _value_to_dict(getattr(spec, "_ep_stack", {}) or {}),
+            "local_compute_fn": _value_to_dict(
+                getattr(spec, "local_compute_fn", None)
+            ),
+            "inner_target": getattr(spec, "inner_target", None),
+            "inner_wrapper": _value_to_dict(getattr(spec, "inner_wrapper", None)),
+        })
+    return result
+
+
+def _freeze_resolved_wrappers(plan: Any) -> list[dict[str, Any]]:
+    """Record the inner-wrapper identities written back by native apply."""
+    result = []
+    for fqn, spec in sorted((getattr(plan, "modules", {}) or {}).items()):
+        wrapper = getattr(spec, "_resolved_inner_wrapper", None)
+        target = getattr(spec, "_resolved_inner_target", None)
+        if wrapper is None and target is None:
+            continue
+        result.append({"fqn": fqn, "wrapper": wrapper, "target": target})
+    return result
 
 
 def _freeze_boundary_classes(plan: Any, model: Any) -> dict[str, str]:
@@ -498,6 +579,7 @@ __all__ = [
     "freeze_injections",
     "freeze_param_plan",
     "freeze_plan",
+    "freeze_plan_application",
     "freeze_tied_pairs",
     "named_placement_to_dict",
     "parse_named_placement",

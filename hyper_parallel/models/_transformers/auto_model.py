@@ -41,6 +41,7 @@ from hyper_parallel.models._transformers.model_builder import (
 from hyper_parallel.models._transformers.config_resolver import get_hf_config, get_is_hf_model
 from hyper_parallel.distributed.mesh import DistributedSetup
 from hyper_parallel.codegen.modeling_backend import ModelingBackend
+from hyper_parallel.codegen.session import CodegenBuildSession
 from hyper_parallel.models.build_options import get_device_id, get_device_type  # pylint: disable=syntax-error
 from hyper_parallel.models.build_options import CompileConfig
 from hyper_parallel.components.checkpoint.quantized_hf_storage import supports_hf_dequantization
@@ -518,6 +519,29 @@ class _BaseHyperAutoModelClass:
                 **init_kwargs,
             )
 
+        codegen_session = None
+        if backend != ModelingBackend.GEN:
+            codegen_session = CodegenBuildSession()
+            model_type = type(model)
+            codegen_session.record_source({
+                "model_type": getattr(hf_config, "model_type", None),
+                "architectures": list(
+                    getattr(hf_config, "architectures", None) or ()
+                ),
+                "model_class": f"{model_type.__module__}:{model_type.__qualname__}",
+                "pretrained_model_name_or_path": (
+                    None
+                    if pretrained_model_name_or_path is None
+                    else str(pretrained_model_name_or_path)
+                ),
+                "is_hf_model": bool(is_hf_model),
+                "backend": (
+                    backend.value
+                    if isinstance(backend, ModelingBackend)
+                    else str(backend or "native")
+                ),
+            })
+
         # Step 3-12: Apply infrastructure
         model = apply_model_infrastructure(
             model,
@@ -545,8 +569,14 @@ class _BaseHyperAutoModelClass:
             codegen_artifact_dir=(
                 codegen_artifact_dir if backend is ModelingBackend.GEN else None
             ),
+            codegen_session=codegen_session,
             hf_config=hf_config,
         )
+
+        if codegen_session is not None:
+            model._hp_codegen_snapshot = (  # pylint: disable=protected-access
+                codegen_session.finish()
+            )
 
         model.train()
         return model

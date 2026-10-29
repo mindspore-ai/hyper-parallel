@@ -67,6 +67,7 @@ from hyper_parallel.distributed.mesh import DistributedSetup, MeshContext
 from hyper_parallel.distributed.apply import apply_sharding_plan
 from hyper_parallel.distributed._builder.planner import ShardingPlanner
 from hyper_parallel.codegen.modeling_backend import ModelingBackend
+from hyper_parallel.codegen.plan.freeze import freeze_plan, freeze_plan_application
 from hyper_parallel.models.registry import _resolve_custom_model_cls, get_model_adapter
 from hyper_parallel.models.external_state import (
     ExternalBuildContext,
@@ -274,20 +275,29 @@ def _plan_and_apply_sharding(
     sharding_planner,
     is_hf_model: bool,
     validate_placement: bool,
+    codegen_session: Optional[Any] = None,
 ) -> tuple[nn.Module, Optional[dict]]:
     """Plan parameter layouts and apply dual-mode sharding when requested."""
     model_sharding_requested = (
         mesh is not None
         and any(size > 1 for size in (mesh.tp_size, mesh.cp_size, mesh.ep_size))
     )
-    if (
-        sharding_planner is None
-        or mesh is None
-        or (is_hf_model and not model_sharding_requested)
-    ):
+    if sharding_planner is None:
+        if codegen_session is not None:
+            codegen_session.mark_not_required("planner_unavailable")
+        return model, None
+    if mesh is None:
+        if codegen_session is not None:
+            codegen_session.mark_not_required("mesh_unavailable")
+        return model, None
+    if is_hf_model and not model_sharding_requested:
+        if codegen_session is not None:
+            codegen_session.mark_not_required("pure_data_parallel")
         return model, None
     if mesh.device_mesh is None:
         logger.warning("MeshContext has no device_mesh; skipping sharding")
+        if codegen_session is not None:
+            codegen_session.mark_not_required("device_mesh_unavailable")
         return model, None
 
     logger.info(
@@ -308,12 +318,22 @@ def _plan_and_apply_sharding(
         sequence_parallel=mesh.sequence_parallel,
         loss_parallel=mesh.loss_parallel,
     )
+    if codegen_session is not None:
+        codegen_session.record_plan(freeze_plan(plan, model).to_dict())
     model, source_shard_info = apply_sharding_plan(
         model,
         plan,
         mesh,
         validate_mode=validate_placement,
     )
+    if codegen_session is not None:
+        codegen_session.record_plan_application(
+            freeze_plan_application(
+                plan,
+                source_shard_info,
+                validate_mode=validate_placement,
+            )
+        )
     logger.info("Sharding plan applied; source_shard_info keys=%d", len(source_shard_info or {}))
     return model, source_shard_info
 
@@ -900,6 +920,7 @@ def apply_model_infrastructure(
             sharding_planner,
             is_hf_model,
             validate_placement,
+            codegen_session,
         )
 
     model = _apply_activation_features(
