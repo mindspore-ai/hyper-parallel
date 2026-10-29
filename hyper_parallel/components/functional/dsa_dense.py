@@ -19,7 +19,6 @@ from __future__ import annotations
 from typing import Any, Tuple
 
 import torch  # pylint: disable=forbidden-backend-import
-from torch.autograd.function import once_differentiable  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.functional.dsa_ops import (
     _cann_dsa_dense_indexer_kl_loss_grad,
@@ -95,7 +94,6 @@ class _DenseIndexerKLLoss(torch.autograd.Function):
         return loss.squeeze() / token_count * loss_coefficient
 
     @staticmethod
-    @once_differentiable
     def backward(ctx: Any, grad_loss: torch.Tensor) -> Tuple:
         """Route scaled gradients only to indexer query, key, and weights."""
         grad_query, grad_key, grad_weights = ctx.saved_tensors

@@ -47,7 +47,7 @@ def dsa_sparse_attention(
 
     Returns:
         Attention output in BSND layout, followed by the softmax maximum and
-        sum required by :func:`dsa_sparse_indexer_kl_loss`. The output head dimension contains
+        sum required by :func:`dsa_kl_loss`. The output head dimension contains
         the compressed-KV dimension followed by zero padding for the RoPE
         dimension required by the sparse-attention backward operator.
     """

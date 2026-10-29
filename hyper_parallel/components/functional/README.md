@@ -61,7 +61,7 @@ OPP before importing or calling these NPU-only functions.
 | --- | --- | --- | --- |
 | `dsa_indexer` | `index_query, index_key, merge_weight, actual_seq_qlen, actual_seq_kvlen, sparse_count` | none | `lightning_indexer` |
 | `dsa_sparse_attention` | `query_nope, compressed_kv, query_rope, key_rope, topk_indices, scale, actual_seq_qlen, actual_seq_kvlen` | none | `sparse_flash_attention`, `sparse_flash_attention_grad` |
-| `dsa_sparse_indexer_kl_loss` | `index_query, index_key, merge_weight, query, key, topk_indices, softmax_max, softmax_sum, query_rope, key_rope, actual_seq_qlen, actual_seq_kvlen, scale, loss_coeff` | none | `sparse_lightning_indexer_kl_loss_grad` + metadata |
+| `dsa_kl_loss` | `index_query, index_key, merge_weight, query, key, topk_indices, softmax_max, softmax_sum, query_rope, key_rope, actual_seq_qlen, actual_seq_kvlen, scale, loss_coeff` | none | `sparse_lightning_indexer_kl_loss_grad` + metadata |
 | `dsa_dense_indexer_lse` | `index_query, index_key, head_weights` | `query_lengths=None, key_lengths=None, layout="TND"` | `dense_lightning_indexer_softmax_lse` + metadata |
 | `dsa_dense_indexer_kl_loss` | `index_query, index_key, head_weights, teacher_probabilities, indexer_lse` | `query_lengths=None, key_lengths=None, layout="TND", loss_coefficient=1.0` | `dense_lightning_indexer_kl_loss_grad` + metadata |
 
@@ -115,7 +115,7 @@ preserve their output contracts. For example, with model tensors already on NPU:
 import torch
 
 from hyper_parallel.components.functional.dsa_indexer import dsa_indexer
-from hyper_parallel.components.functional.dsa_kl_loss import dsa_sparse_indexer_kl_loss
+from hyper_parallel.components.functional.dsa_kl_loss import dsa_kl_loss
 from hyper_parallel.components.functional.dsa_sparse_attention import dsa_sparse_attention
 
 # q_idx/k_idx: BSND indexer tensors; weights: BSN; q/kv: absorbed MLA BSND.
@@ -124,7 +124,7 @@ ends_npu = ends_cpu.to(device=q.device, dtype=torch.int32)
 indices, iq, ik, iw = dsa_indexer(q_idx, k_idx, weights, ends_npu, ends_npu, 2048)
 output, maximum, total = dsa_sparse_attention(
     q, kv, q_rope, k_rope, indices, scale, ends_npu, ends_npu)
-aux_loss = dsa_sparse_indexer_kl_loss(
+aux_loss = dsa_kl_loss(
     iq, ik, iw, q.flatten(0, 1), kv.flatten(0, 1), indices, maximum, total,
     q_rope.flatten(0, 1), k_rope.flatten(0, 1), ends_cpu, ends_cpu, scale, loss_coeff)
 (task_loss(output) + aux_loss).backward()

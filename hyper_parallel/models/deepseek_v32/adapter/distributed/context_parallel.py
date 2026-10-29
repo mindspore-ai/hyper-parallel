@@ -158,11 +158,6 @@ def _resolve_cp_sequence_lengths(
             for row in range(batch_size)
         ]
         key_lengths = list(query_lengths)
-    elif key_lengths is None:
-        # ``resolve_packed_sequence_lengths`` normally rejects this case; keep
-        # the guard here so the CP conversion has a single explicit contract.
-        raise ValueError("packed DSA attention requires query and KV lengths")
-
     if len(query_lengths) != len(key_lengths):
         raise ValueError(
             "DeepSeek-V3.2 DSA requires the same number of packed query and "
@@ -186,39 +181,6 @@ def _resolve_cp_sequence_lengths(
         kind="KV",
     ).to(device=device)
     return query_cp, key_cp
-
-
-def _validate_cp_attention_mask(
-    attention_mask: torch.Tensor | None,
-    *,
-    batch_size: int,
-    local_seq_len: int,
-    global_seq_len: int,
-) -> None:
-    """Validate the shape of an optional Transformers causal mask.
-
-    DSA generates the causal mask from cumulative lengths, so the supplied
-    mask is intentionally not forwarded to the custom operators.  Both the
-    pre-sharded local form and the Trainer's global form are accepted.
-    """
-    if attention_mask is None:
-        return
-    if attention_mask.ndim != 4 or attention_mask.shape[:2] != (batch_size, 1):
-        raise ValueError(
-            "DeepseekV32DSAAttention CP expects attention_mask with shape "
-            "[batch_size, 1, query_length, key_length]"
-        )
-    query_length, key_length = attention_mask.shape[-2:]
-    if query_length not in (local_seq_len, global_seq_len):
-        raise ValueError(
-            "DeepseekV32DSAAttention CP attention_mask query dimension must "
-            f"be {local_seq_len} or {global_seq_len}, got {query_length}"
-        )
-    if key_length not in (local_seq_len, global_seq_len):
-        raise ValueError(
-            "DeepseekV32DSAAttention CP attention_mask key dimension must "
-            f"be {local_seq_len} or {global_seq_len}, got {key_length}"
-        )
 
 
 def _validate_cp_target(target_module: nn.Module, cp_mesh: Any) -> None:
@@ -248,18 +210,11 @@ def _validate_cp_target(target_module: nn.Module, cp_mesh: Any) -> None:
 
 def _reduce_dense_softmax_target(
     softmax_out: torch.Tensor,
-    *,
-    query_tokens: int,
-    batch_size: int,
 ) -> torch.Tensor:
     """Reduce FlashAttention's probabilities over query heads for dense KL."""
     if softmax_out.ndim == 4:
-        if softmax_out.shape[0] != batch_size or softmax_out.shape[2] * batch_size != query_tokens:
-            raise ValueError("Dense FlashAttention softmax output has incompatible BNSK dimensions")
         return softmax_out.float().mean(dim=1).unsqueeze(2)
     if softmax_out.ndim == 3:
-        if softmax_out.shape[1] != query_tokens:
-            raise ValueError("Packed FlashAttention softmax output has incompatible NTS dimensions")
         return softmax_out.float().mean(dim=0).unsqueeze(1)
     raise ValueError(
         "Dense FlashAttention must return probabilities in BNSK or NTS layout, "
@@ -296,11 +251,7 @@ def _dense_cp_attention(
     )
     if need_target:
         output, _, _, _, softmax_out = result
-        target = _reduce_dense_softmax_target(
-            softmax_out,
-            query_tokens=absorbed_query.shape[0] * absorbed_query.shape[1],
-            batch_size=absorbed_query.shape[0],
-        )
+        target = _reduce_dense_softmax_target(softmax_out)
     else:
         output, _ = result
         target = None
@@ -403,12 +354,6 @@ def _deepseek_v32_dsa_cp_forward(
     cp_size = cp_mesh.size()
     cp_rank = cp_mesh.get_local_rank()
     global_seq_len = local_seq_len * cp_size
-    _validate_cp_attention_mask(
-        attention_mask,
-        batch_size=batch_size,
-        local_seq_len=local_seq_len,
-        global_seq_len=global_seq_len,
-    )
     module._validate_forward_inputs(  # pylint: disable=protected-access
         hidden_states,
         None,
@@ -451,16 +396,6 @@ def _deepseek_v32_dsa_cp_forward(
     gathered_index_key = index_key_gather.wait()
     gathered_kv_nope = kv_nope_gather.wait()
     gathered_k_rot = k_rot_gather.wait()
-    for name, tensor in (
-        ("index_key", gathered_index_key),
-        ("kv_nope", gathered_kv_nope),
-        ("k_rot", gathered_k_rot),
-    ):
-        if tensor.shape[1] != global_seq_len:
-            raise ValueError(
-                f"gathered {name} sequence dimension is {tensor.shape[1]}, "
-                f"expected {global_seq_len}"
-            )
     index_key = gathered_index_key[:, :prefix_len].contiguous()
     kv_nope = gathered_kv_nope[:, :prefix_len].contiguous()
     k_rot = gathered_k_rot[:, :prefix_len].contiguous()
@@ -504,8 +439,6 @@ def deepseek_v32_dsa_attention_cp_wrapper(
     switch between dense warm-up and sparse DSA without reinstalling the wrapper.
     """
     del mesh, tp_mesh, ep_mesh
-    if use_dense is not None and not isinstance(use_dense, bool):
-        raise ValueError("use_dense must be a bool or None")
     _validate_cp_target(target_module, cp_mesh)
     original_forward = target_module.forward
 

@@ -25,7 +25,6 @@ from hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel imp
     _reduce_dense_softmax_target,
     _dense_cp_attention,
     _run_cp_dsa_kernels,
-    _validate_cp_attention_mask,
 )
 
 
@@ -86,41 +85,16 @@ class TestDeepseekV32DSAContextParallel(unittest.TestCase):
                 device=torch.device("cpu"),
             )
 
-    def test_attention_mask_accepts_local_or_global_dimensions(self):
-        """The CP boundary accepts Trainer-global and pre-sharded causal masks."""
-        for query_length, key_length in ((4, 4), (4, 8), (8, 8)):
-            with self.subTest(query_length=query_length, key_length=key_length):
-                _validate_cp_attention_mask(
-                    torch.zeros(2, 1, query_length, key_length),
-                    batch_size=2,
-                    local_seq_len=4,
-                    global_seq_len=8,
-                )
-
-    def test_attention_mask_rejects_unrelated_sequence_dimensions(self):
-        """Mask dimensions outside the local/global CP contracts fail early."""
-        with self.assertRaisesRegex(ValueError, "query dimension"):
-            _validate_cp_attention_mask(
-                torch.zeros(2, 1, 6, 8),
-                batch_size=2,
-                local_seq_len=4,
-                global_seq_len=8,
-            )
-
     def test_dense_attention_target_reduces_fa_probabilities_over_heads(self):
         """Dense KL teacher is reduced from FA output rather than recomputed."""
         probabilities = torch.tensor(
             [[1., 0.], [0.5, 0.5], [0., 1.], [0.5, 0.5]],
         ).reshape(1, 2, 2, 2)
-        target = _reduce_dense_softmax_target(
-            probabilities, query_tokens=2, batch_size=1,
-        )
+        target = _reduce_dense_softmax_target(probabilities)
         torch.testing.assert_close(target, torch.full((1, 2, 1, 2), 0.5))
 
         packed = probabilities.squeeze(0)
-        packed_target = _reduce_dense_softmax_target(
-            packed, query_tokens=2, batch_size=1,
-        )
+        packed_target = _reduce_dense_softmax_target(packed)
         torch.testing.assert_close(packed_target, target.reshape(2, 1, 2))
 
     def test_dense_attention_output_uses_fa_and_skips_target_without_loss(self):

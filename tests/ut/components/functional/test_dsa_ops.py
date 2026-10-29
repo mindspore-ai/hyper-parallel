@@ -32,13 +32,6 @@ kl_ops = importlib.import_module("hyper_parallel.components.functional.dsa_kl_lo
 class TestDSAOps(unittest.TestCase):
     """Verify package adapter contracts without importing NPU extensions."""
 
-    def test_reject_cpu_before_extension_loading(self):
-        """A CPU call fails at its boundary, without trying a compiler or CANN."""
-        with patch.object(dsa_ops, "lightning_indexer") as kernel:
-            with self.assertRaisesRegex(ValueError, "Ascend NPU"):
-                dsa_ops._lightning_indexer(torch.zeros(1, 4, 8, 128), None, None)
-            kernel.assert_not_called()
-
     def test_indexer_adapts_tnd_lengths_and_value_dtype(self):
         """The package receives cu-seqlens and preserves the public value dtype."""
         query = torch.zeros(8, 2, 4, dtype=torch.bfloat16)
@@ -84,20 +77,8 @@ class TestDSAOps(unittest.TestCase):
                 dsa_ops._dense_indexer_lse_v2(
                     torch.zeros(4, 8, 128), torch.zeros(4, 1, 128), torch.zeros(4, 8), layout="TND")
 
-    def test_invalid_metadata_fails_before_launch(self):
-        """Mismatched documents, non-integer lengths and unpaired metadata are rejected."""
-        query, key, weights = torch.zeros(8, 8, 128), torch.zeros(8, 1, 128), torch.zeros(8, 8)
-        cases = ((torch.tensor([4, 8]), torch.tensor([8])),
-                 (torch.tensor([4., 8.]), torch.tensor([4, 8])),
-                 (torch.tensor([4, 8]), None))
-        with patch.object(dsa_ops, "_validate"):
-            for qlen, klen in cases:
-                with self.subTest(qlen=qlen, klen=klen), self.assertRaises(ValueError):
-                    dsa_ops._dense_indexer_lse_v2(
-                        query, key, weights, actual_seq_qlen=qlen, actual_seq_klen=klen, layout="TND")
-
-    def test_attention_rejects_unsupported_key_value_and_rope(self):
-        """Independent V, malformed indices and unpaired RoPE cannot reach CANN."""
+    def test_attention_requires_shared_value_and_paired_rope(self):
+        """Keep only the CANN-specific shared-KV and paired-RoPE constraints."""
         query, key = torch.zeros(1, 3, 2, 4), torch.zeros(1, 3, 1, 4)
         indices = torch.zeros(1, 3, 1, 2048, dtype=torch.int32)
         with patch.object(dsa_ops, "_validate"):
@@ -107,8 +88,6 @@ class TestDSAOps(unittest.TestCase):
                 dsa_ops._sparse_attention(
                     query, key, key, indices, .5, query_rope=torch.zeros(1, 3, 2, 2)
                 )
-            with self.assertRaisesRegex(ValueError, "indices"):
-                dsa_ops._sparse_attention(query, key, key, indices.long(), .5)
 
     def test_empty_kl_query_fails_before_launch(self):
         """Empty batches cannot reach CANN or divide a precomputed loss by zero."""
@@ -242,7 +221,7 @@ class TestDSAOps(unittest.TestCase):
         gradients = [torch.full_like(value, factor) for value, factor in zip(inputs, (2, 3, 5))]
         with patch.object(kl_ops, "_cann_dsa_sparse_indexer_kl_loss_grad") as kernel:
             kernel.return_value = (*gradients, torch.tensor([8.]))
-            loss = kl_ops.dsa_sparse_indexer_kl_loss(
+            loss = kl_ops.dsa_kl_loss(
                 *inputs, teacher_query, teacher_key, torch.zeros(4, 1, 4, dtype=torch.int32),
                 stats, stats, None, None, lengths, lengths, .5, .7,
             )

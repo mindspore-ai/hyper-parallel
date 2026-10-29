@@ -44,7 +44,7 @@ def dsa_indexer(
         Top-k indices in ``[T, N_kv, K]`` int32 layout, followed by the query,
         key, and merge-weight tensors in TND, TND, and TN layouts. Positions
         without enough causal candidates are filled with ``-1``. The flattened
-        tensors can be passed directly to :func:`dsa_sparse_indexer_kl_loss`.
+        tensors can be passed directly to :func:`dsa_kl_loss`.
     """
     index_query_tnd = rearrange(index_query, "b s n d -> (b s) n d")
     index_key_tnd = rearrange(index_key, "b s n d -> (b s) n d")

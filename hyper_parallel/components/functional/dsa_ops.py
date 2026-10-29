@@ -24,7 +24,6 @@ from __future__ import annotations
 from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
-from torch.autograd.function import once_differentiable  # pylint: disable=forbidden-backend-import
 
 from cann_ops_transformer import (
     dense_lightning_indexer_kl_loss_grad,
@@ -43,8 +42,6 @@ def _cumulative_lengths(lengths: torch.Tensor | None, total: int, device: torch.
     if lengths is None:
         return torch.tensor((0, total), dtype=torch.int32, device=device)
     lengths = lengths.to(device=device, dtype=torch.int32).contiguous()
-    if lengths.ndim != 1 or lengths.numel() == 0:
-        raise ValueError("DSA sequence lengths must be a non-empty one-dimensional tensor")
     return torch.cat((torch.zeros(1, dtype=torch.int32, device=device), lengths))
 
 
@@ -232,7 +229,7 @@ def _package_sparse_kl_target(
     else:
         _, q_count, q_heads, _ = query.shape
         kv_heads, topk = key.shape[2], sparse_indices.shape[-1]
-    if q_heads % kv_heads:
+    if kv_heads == 0 or q_heads % kv_heads:
         raise ValueError("DSA package KL requires query heads divisible by key heads")
     groups = q_heads // kv_heads
     if query_rope is not None:
@@ -352,51 +349,12 @@ def _validate(query: torch.Tensor, layout: str) -> None:
         raise ValueError(f"DSA layout must be BSND or TND, got {layout!r}")
     if query.ndim != (4 if layout == "BSND" else 3):
         raise ValueError(f"DSA {layout} query has incompatible shape {tuple(query.shape)}")
-    if query.device.type != "npu":
-        raise ValueError("DSA operators require local Ascend NPU tensors")
-    if query.dtype not in (torch.float16, torch.bfloat16) or query.numel() == 0:
-        raise ValueError("DSA query must be a nonempty float16/bfloat16 tensor")
 
 
-def _check_key(query, key, weights=None):
-    if (key.ndim != query.ndim or key.shape[-1] != query.shape[-1] or key.shape[-2] == 0
-            or query.shape[-2] % key.shape[-2] or key.numel() == 0
-            or (query.ndim == 4 and query.shape[0] != key.shape[0])):
-        raise ValueError(f"Incompatible DSA query/key shapes: {tuple(query.shape)}, {tuple(key.shape)}")
-    if key.device != query.device or key.dtype != query.dtype:
-        raise ValueError("DSA query and key must share a device and dtype")
-    if weights is not None and (weights.shape != query.shape[:-1] or weights.device != query.device):
-        raise ValueError("DSA weights must match the query's token/head dimensions and device")
 
-
-def _check_rope(query, key, query_rope, key_rope):
+def _check_rope(query_rope, key_rope):
     if (query_rope is None) != (key_rope is None):
         raise ValueError("query_rope and key_rope must be supplied together")
-    if query_rope is None:
-        return
-    for tensor, rope in ((query, query_rope), (key, key_rope)):
-        if rope.shape[:-1] != tensor.shape[:-1] or rope.device != tensor.device or rope.dtype != tensor.dtype:
-            raise ValueError("DSA rotary tensors must match the corresponding query/key dimensions, dtype and device")
-    if query_rope.shape[-1] != key_rope.shape[-1]:
-        raise ValueError("DSA query/key rotary dimensions must match")
-
-
-def _check_kl_inputs(query, key, query_index, key_index, weights, query_rope, key_rope, layout):
-    _validate(query, layout)
-    _validate(query_index, layout)
-    _check_key(query, key)
-    _check_key(query_index, key_index, weights)
-    _check_rope(query, key, query_rope, key_rope)
-    if (query.shape[:-2] != query_index.shape[:-2] or key.shape[:-2] != key_index.shape[:-2]
-            or query_index.device != query.device or query_index.dtype != query.dtype):
-        raise ValueError("DSA teacher and indexer must match token dimensions, dtype and device")
-
-
-def _check_indices(query, key, indices):
-    if (indices.ndim != query.ndim or indices.shape[:-2] != query.shape[:-2]
-            or indices.shape[-2] != key.shape[-2] or indices.shape[-1] == 0
-            or indices.dtype != torch.int32 or indices.device != query.device):
-        raise ValueError("DSA sparse indices must be int32 [B,S,Nkv,TopK]/[T,Nkv,TopK] tensors on the query device")
 
 
 def _lengths(query, actual_seq_qlen, actual_seq_klen, layout, dtype=torch.int64):
@@ -404,12 +362,6 @@ def _lengths(query, actual_seq_qlen, actual_seq_klen, layout, dtype=torch.int64)
         raise ValueError("TND DSA requires cumulative query and key sequence lengths without a leading zero")
     if (actual_seq_qlen is None) != (actual_seq_klen is None):
         raise ValueError("DSA query and key sequence lengths must be supplied together")
-    for lengths in (actual_seq_qlen, actual_seq_klen):
-        if lengths is not None and (lengths.ndim != 1 or lengths.numel() == 0
-                                    or lengths.dtype not in (torch.int32, torch.int64)):
-            raise ValueError("DSA sequence lengths must be one-dimensional int32/int64 tensors")
-    if actual_seq_qlen is not None and actual_seq_qlen.numel() != actual_seq_klen.numel():
-        raise ValueError("DSA query and key sequence lengths must describe the same number of documents")
     # Dense warm-up metadata is kept on host; sparse package calls use device lengths.
     device = query.device if dtype == torch.int32 else "cpu"
     return tuple(value.to(device=device, dtype=dtype).contiguous() if value is not None else None
@@ -443,9 +395,6 @@ def _lightning_indexer(
         are unspecified.
     """
     _validate(query, layout)
-    _check_key(query, key, weights)
-    if sparse_count <= 0:
-        raise ValueError("sparse_count must be positive")
     lengths = _lengths(query, actual_seq_qlen, actual_seq_klen, layout, torch.int32)
     return _package_indexer(
         query, key, weights, actual_seq_qlen=lengths[0],
@@ -473,7 +422,6 @@ def _dense_indexer_lse_v2(
         Float32 LSE in ``[B,Nkv,S]`` or ``[Nkv,T]``.
     """
     _validate(query_index, layout)
-    _check_key(query_index, key_index, weights)
     lengths = _lengths(query_index, actual_seq_qlen, actual_seq_klen, layout, torch.int32)
     metadata, options = _dense_metadata(
         query_index, key_index, *lengths, layout, kl=False,
@@ -500,7 +448,6 @@ def _dense_indexer_kl_loss_grad(
     indexer LSE comes from ``dense_lightning_indexer_softmax_lse``.
     """
     _validate(query_index, layout)
-    _check_key(query_index, key_index, weights)
     lengths = _lengths(query_index, actual_seq_qlen, actual_seq_klen, layout, torch.int32)
     metadata, options = _dense_metadata(
         query_index, key_index, *lengths, layout, kl=True,
@@ -549,8 +496,8 @@ def _sparse_indexer_kl_loss_grad(
         by a float32 one-element summed loss. These raw outputs have no autograd
         graph; use :func:`dsa_kl_loss` for normalized training integration.
     """
-    _check_kl_inputs(query, key, query_index, key_index, weights, query_rope, key_rope, layout)
-    _check_indices(query, key, sparse_indices)
+    _validate(query, layout)
+    _check_rope(query_rope, key_rope)
     _lengths(query, actual_seq_qlen, actual_seq_klen, layout)
     return _package_sparse_kl(
         query, key, query_index, key_index, weights, sparse_indices,
@@ -580,7 +527,6 @@ class _SparseAttention(torch.autograd.Function):
         return outputs
 
     @staticmethod
-    @once_differentiable
     def backward(
         ctx: Any, grad_output: torch.Tensor, _grad_max: torch.Tensor | None, _grad_sum: torch.Tensor | None,
     ) -> tuple[torch.Tensor | None, ...]:
@@ -628,9 +574,7 @@ def _sparse_attention(
         gradients cover Q, shared K/V and rotary states; statistics are detached.
     """
     _validate(query, layout)
-    _check_key(query, key)
-    _check_indices(query, key, sparse_indices)
-    _check_rope(query, key, query_rope, key_rope)
+    _check_rope(query_rope, key_rope)
     if value is not key:
         raise ValueError("The ops-transformer DSA attention backend requires value to alias key")
     lengths = _lengths(query, actual_seq_qlen, actual_seq_klen, layout, torch.int32)

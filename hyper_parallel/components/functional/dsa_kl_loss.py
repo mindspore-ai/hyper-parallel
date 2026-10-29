@@ -81,7 +81,7 @@ class _DSAKLLoss(torch.autograd.Function):
         )
 
 
-def dsa_sparse_indexer_kl_loss(
+def dsa_kl_loss(
     index_query: torch.Tensor,
     index_key: torch.Tensor,
     merge_weight: torch.Tensor,
@@ -124,4 +124,4 @@ def dsa_sparse_indexer_kl_loss(
     )
 
 
-__all__ = ["dsa_sparse_indexer_kl_loss"]
+__all__ = ["dsa_kl_loss"]
