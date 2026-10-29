@@ -59,6 +59,7 @@ from hyper_parallel.distributed.recipe_spec import (
     EP,
     TP,
     ModuleShardingSpec,
+    NamedPlacement,
 )
 from hyper_parallel.distributed.tensor_parallel.param_role import (
     ParameterClassifier,
@@ -106,7 +107,8 @@ _LEAF_SEGMENT_GUARD = frozenset({
     "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj",
     "qkv_proj", "fused_qkv", "linear_qkv", "gate_up_proj", "query_key_value",
     "experts", "gate", "linear", "proj",
-    "fc1", "fc2", "w1", "w2", "w3", "w13", "dense", "dense_h_to_4h", "dense_4h_to_h",
+    "fc1", "fc2", "linear_fc1", "linear_fc2", "w1", "w2", "w3", "w13",
+    "dense", "dense_h_to_4h", "dense_4h_to_h",
 })
 
 _ATTN_PATTERNS = ("attn", "attention")
@@ -134,6 +136,26 @@ def _get_architecture(model) -> str:
         if s.endswith(suffix):
             s = s[: -len(suffix)]
     return s
+
+
+def _override_declared_params(
+    plan_overrides: Dict[str, Any], model: Any,
+) -> set[str]:
+    """Return full parameter FQNs already owned by exact or glob overrides."""
+    from fnmatch import fnmatchcase  # pylint: disable=import-outside-toplevel
+
+    module_names = tuple(name for name, _ in model.named_modules())
+    declared = set()
+    for key, spec in plan_overrides.items():
+        matches = (
+            (name for name in module_names if fnmatchcase(name, key))
+            if any(char in key for char in "*?[")
+            else (key,)
+        )
+        for module_fqn in matches:
+            prefix = f"{module_fqn}." if module_fqn else ""
+            declared.update(prefix + name for name in (spec.params or {}))
+    return declared
 
 
 class ShardingPlanner:
@@ -238,9 +260,20 @@ class ShardingPlanner:
                 "specs (all insert mode, fully self-declared)"
             )
             return
+        parameters_by_name = dict(model.named_parameters())
+        override_declared = _override_declared_params(self._plan_overrides, model)
         for boundary_fqn, group in boundary_groups.items():
             boundary_type = self._infer_boundary_type(boundary_fqn, group)
             if self._templates.get(boundary_type) is None:
+                fallback = self._build_replicated_fallback_spec(
+                    boundary_fqn,
+                    group,
+                    parameters_by_name,
+                    override_declared,
+                )
+                if fallback is not None:
+                    plan.modules[boundary_fqn] = fallback
+                    continue
                 logger.warning("No template for boundary_type=%s at %s", boundary_type, boundary_fqn)
                 continue
             spec = _build_spec_from_template(
@@ -261,6 +294,41 @@ class ShardingPlanner:
                     ep_extend=ep_extend, mesh=mesh, model=model, param_ndims=param_ndims,
                 )
             plan.modules[boundary_fqn] = spec
+
+    @staticmethod
+    def _build_replicated_fallback_spec(
+        boundary_fqn: str,
+        group: List[Tuple[str, ParamRole]],
+        parameters_by_name: Dict[str, Any],
+        override_declared: set[str],
+    ) -> Optional[ModuleShardingSpec]:
+        """Declare a communication-free spec for replicated leftover params."""
+        replicable = (ParamRole.REPLICATED, ParamRole.NORM, ParamRole.BIAS)
+        if any(role not in replicable for _, role in group):
+            return None
+
+        prefix = f"{boundary_fqn}." if boundary_fqn else ""
+        params: Dict[str, NamedPlacement] = {}
+        for param_fqn, _ in group:
+            parameter = parameters_by_name.get(param_fqn)
+            if (
+                parameter is None
+                or not parameter.requires_grad
+                or param_fqn in override_declared
+            ):
+                continue
+            relative = param_fqn[len(prefix):] if prefix else param_fqn
+            params[relative] = _multi_dim(
+                tp=Replicate(), cp=Replicate(), ep=Replicate()
+            )
+        if not params:
+            return None
+        return ModuleShardingSpec(
+            params=params,
+            in_src={},
+            in_dst={},
+            is_boundary=False,
+        )
 
     def _finalize_boundary_specs(
         self,
@@ -674,9 +742,9 @@ class ShardingPlanner:
                 therefore inferred only after ALL its descendants' parameters
                 have merged into it. On ``unknown`` the whole group's
                 parameters merge upward into the parent module. If still
-                unknown after backtracking to the root, attribute the group
-                to the parameter's own module (no template will match later
-                → warning and skip).
+                unknown after backtracking to the root, scatter each parameter
+                back to its own module (no template will match later, so the
+                replicated fallback or warning path handles it).
 
         (Fix for the merge-ordering hazard of the former tail-enqueue work
         queue: a parent enqueued by an early child — e.g. the MoE gate —
@@ -714,11 +782,11 @@ class ShardingPlanner:
                 if parent:
                     merged[parent].extend(params)
                 else:
-                    # Still unknown after backtracking to the root:
-                    # attribute to the parameter's own module (no template
-                    # will match later → skipped)
-                    origin = ".".join(params[0][0].split(".")[:-1]) if params else mfqn
-                    groups.setdefault(origin, params)
+                    # Still unknown after backtracking to the root: preserve
+                    # each parameter's real owner so relative paths stay valid.
+                    for param_fqn, role in params:
+                        origin = ".".join(param_fqn.split(".")[:-1])
+                        groups.setdefault(origin, []).append((param_fqn, role))
         return groups
 
     # ── Phase 3 ─────────────────────────────────────────────────────────
