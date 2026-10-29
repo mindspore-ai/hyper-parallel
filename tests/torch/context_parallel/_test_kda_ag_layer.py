@@ -62,7 +62,7 @@ def _saved_transfers(outputs):
             continue
         seen.add(node)
         if type(node).__name__ == "_KDAStateP2PFunctionBackward" and node.state_cp is not None:
-            matrix = node.saved_tensors[11]
+            matrix = node.saved_tensors[12]
             size = matrix.numel() * matrix.element_size()
             if matrix.ndim != 4 or matrix.untyped_storage().nbytes() != size:
                 raise AssertionError("State transfer cache retains more than one local M")

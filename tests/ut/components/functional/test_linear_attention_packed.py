@@ -14,6 +14,7 @@
 # ============================================================================
 """Packed linear-attention sample isolation and layout regression tests."""
 
+from dataclasses import FrozenInstanceError
 from typing import Any
 import unittest
 
@@ -22,6 +23,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from hyper_parallel.components.functional.linear_attention_packed import (
+    PackedDocumentInfo,
     PackedSequenceInfo,
     packed_causal_conv1d,
     packed_reference,
@@ -52,6 +54,33 @@ class TestLinearAttentionPacked(unittest.TestCase):
         plan = info.materialize(torch.device("cpu"), 64)
         self.assertEqual(plan.chunk_offsets.tolist(), [0, 30, 65])
         self.assertIs(info.materialize(torch.device("cpu"), 64), plan)
+
+    def test_interval_views_share_snapshot_and_preserve_reset_edges(self):
+        """All local cuts preserve document identity without sharing mutable states."""
+        offsets = [0, 3, 8, 13, 20]
+        documents = PackedDocumentInfo(offsets)
+        root = PackedSequenceInfo(documents, 0, 20)
+        offsets[1] = 2
+        self.assertEqual(root.global_offsets, (0, 3, 8, 13, 20))
+        with self.assertRaises(FrozenInstanceError):
+            documents.offsets = (0, 20)
+        for start in range(20):
+            for end in range(start + 1, 21):
+                view = root.interval(start, end)
+                self.assertIs(view.documents, documents)
+                self.assertEqual(view.local_offsets,
+                                 (0, *(x - start for x in documents.offsets if start < x < end), end - start))
+                self.assertEqual(view.continues_previous, start not in documents.offsets)
+                self.assertEqual(view.continues_next, end not in documents.offsets)
+                self.assertEqual(view.preceding_sample_tokens,
+                                 start - max(x for x in documents.offsets if x <= start))
+        first = root.interval(5, 10)
+        expanded = first.ulysses(2, 1)
+        self.assertIs(expanded.documents, documents)
+        self.assertEqual(expanded.local_offsets, (0, 3, 8, 10))
+        self.assertIs(root.interval(5, 10), first)
+        self.assertIsNot(first.materialize(torch.device("cpu"), 64),
+                         expanded.materialize(torch.device("cpu"), 64))
 
     def test_aliases_fail_instead_of_silently_disagreeing(self):
         """Conflicting or ambiguous metadata is rejected before any communication."""
