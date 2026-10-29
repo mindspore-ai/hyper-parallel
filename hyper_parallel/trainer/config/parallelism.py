@@ -514,7 +514,7 @@ def entries_to_module_replacements(
 
     effective_config = low_precision_config if low_precision_enabled else None
     rules = []
-    for entry in entries:
+    for entry_index, entry in enumerate(entries):
         if entry.replace_module is None:
             continue
         if entry.when == "low_precision" and not low_precision_enabled:
@@ -524,12 +524,20 @@ def entries_to_module_replacements(
         policy = None
         if entry.when == "low_precision" and effective_config is not None:
             policy = effective_config.resolve_dtype_scheme(entry.low_precision_dtype_scheme)
+        serialized_target = entry.replace_module.to_dict()
         rules.append(
             ModuleReplacementSpec(
                 match=patterns,
                 factory=_target_replacement_factory(entry.replace_module, policy),
                 module_type=_import_module_type(entry.module_type),
                 exact_type=entry.exact_type,
+                declaration_id=f"plan_override:{entry_index}:replace_module",
+                replacement_target=serialized_target["_target_"],
+                static_arguments={
+                    key: value
+                    for key, value in serialized_target.items()
+                    if key != "_target_"
+                },
             )
         )
     return tuple(rules)
