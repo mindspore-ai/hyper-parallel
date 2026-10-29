@@ -29,6 +29,8 @@ from hyper_parallel.codegen.manager import (
     ensure_codegen_artifact,
     preflight_integrity_check,
 )
+from hyper_parallel.codegen.session import CodegenBuildSession
+from hyper_parallel.codegen.snapshot import CodegenSnapshot, CodegenStatus
 from hyper_parallel.codegen.plan.freeze import (
     FrozenPlan,
     freeze_plan,
@@ -41,6 +43,9 @@ from hyper_parallel.codegen.plan.offline_mesh import OfflineMesh, build_offline_
 __all__ = [
     "FrozenPlan",
     "OfflineMesh",
+    "CodegenBuildSession",
+    "CodegenSnapshot",
+    "CodegenStatus",
     "build_offline_mesh",
     "ensure_codegen_artifact",
     "freeze_param_plan",
