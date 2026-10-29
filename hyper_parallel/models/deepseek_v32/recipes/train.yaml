@@ -57,6 +57,9 @@ plan_overrides:
     inner_target: self
     inner_wrapper:
       _target_: hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper
+      # Use the source module's dsa_dense_warm_up stage flag by default.
+      # Set true/false here only to force one path for the full run.
+      use_dense: null
 
 mixed_precision:
   enabled: false

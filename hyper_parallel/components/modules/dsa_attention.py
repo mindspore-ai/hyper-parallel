@@ -32,7 +32,7 @@ from hyper_parallel.components.functional import aggregate_hidden, aux_loss_auto
 from hyper_parallel.components.functional import apply_rotary_pos_emb, apply_rotary_pos_emb_interleave
 from hyper_parallel.components.functional import (
     dsa_indexer,
-    dsa_kl_loss,
+    dsa_sparse_indexer_kl_loss,
     dsa_sparse_attention,
     dsa_sparse_attention_rescale,
 )
@@ -215,6 +215,9 @@ class DeepseekV32DSAAttention(nn.Module):
         )
         self.dsa_loss_coeff = getattr(config, "dsa_loss_coeff", 0.0)
         self.freeze_dsa = bool(getattr(config, "freeze_DSA", getattr(config, "freeze_dsa", False)))
+        self.dsa_dense_warm_up = bool(
+            getattr(module, "dsa_dense_warm_up", getattr(config, "dsa_dense_warm_up", False))
+        )
         if getattr(module, "param_sink_number", 0) > 0:
             raise ValueError("DeepseekV32DSAAttention does not support the parameter-sink path")
         if getattr(module, "use_mome", False):
@@ -437,7 +440,7 @@ class DeepseekV32DSAAttention(nn.Module):
             tensor.reshape(-1, tensor.shape[2], tensor.shape[3])
             for tensor in attention_states
         )
-        aux_loss = dsa_kl_loss(  # pylint: disable=not-callable
+        aux_loss = dsa_sparse_indexer_kl_loss(  # pylint: disable=not-callable
             *index_states, query_tnd, key_tnd,
             topk_indices, *softmax_stats, q_rot_tnd, k_rot_tnd,
             actual_q_len, actual_kv_len, self.scaling, self.dsa_loss_coeff,
@@ -787,7 +790,7 @@ class DSAAttention(nn.Module):
             tensor.reshape(-1, tensor.shape[2], tensor.shape[3])
             for tensor in attention_states
         )
-        aux_loss = dsa_kl_loss(  # pylint: disable=not-callable
+        aux_loss = dsa_sparse_indexer_kl_loss(  # pylint: disable=not-callable
             *index_states, query_tnd, key_tnd,
             topk_indices, *softmax_stats, q_rot_tnd, k_rot_tnd,
             actual_q_len, actual_kv_len, self.qk_head_dim**-0.5, self.dsa_loss_coeff,
