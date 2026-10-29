@@ -1,5 +1,5 @@
 ascend910b:
-  activation_checkpoint: 1200
+  activation_memory: 2400
   shard: 2400
   distributed_checkpoint: 960
   accuracy: 960
@@ -17,5 +17,4 @@ ascend910b:
   swap_optimizer: 2400
   optimizer: 2400
   multicore: 960
-  activation_memory: 960
   auto_models: 1200

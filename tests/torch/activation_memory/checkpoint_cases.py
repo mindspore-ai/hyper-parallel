@@ -17,7 +17,6 @@
 import contextlib
 import importlib
 import inspect
-import os
 import unittest
 from typing import Callable, List
 from unittest.mock import patch
@@ -648,23 +647,3 @@ class TestScheduledRecomputation(unittest.TestCase):
         )
 
         output.sum().backward()
-
-
-def run_checkpoint_cases() -> None:
-    """Run all checkpoint cases on NPU."""
-    loader = unittest.TestLoader()
-    suite = unittest.TestSuite(
-        (
-            loader.loadTestsFromTestCase(TestCheckpoint),
-            loader.loadTestsFromTestCase(TestScheduledRecomputation),
-        )
-    )
-    result = unittest.TextTestRunner(verbosity=2).run(suite)
-    if not result.wasSuccessful():
-        raise AssertionError(
-            f"Checkpoint NPU suite failed with {len(result.failures)} failures and {len(result.errors)} errors."
-        )
-
-
-if __name__ == "__main__":
-    run_checkpoint_cases()

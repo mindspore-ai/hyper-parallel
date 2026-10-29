@@ -113,11 +113,16 @@ def recompute_policy(ctx, op, *args, **kwargs):
 
 model.layers[1] = checkpoint_wrapper(model.layers[1], policy_fn=recompute_policy)
 
-# 连续 SAVE 区域只保留链尾输出；两个区域内部为 backward 保存的激活不受影响。
-model.expensive_a = checkpoint_exclude_wrapper(model.expensive_a, save_output=False)
+# SAVE 区域始终缓存输出；swap=True 时可将输出和不可重建的内部激活卸载到 CPU。
+model.expensive_a = checkpoint_exclude_wrapper(
+    model.expensive_a,
+    swap=True,
+    group_swap=True,
+)
 model.expensive_b = checkpoint_exclude_wrapper(model.expensive_b)
+SwapManager().set_forward_prefetch_layer(model.expensive_a, model.expensive_b)
 
-# PyTorch eager 使用该配置及边界语义。
+# 外层没有 active checkpoint 时 checkpoint_exclude_wrapper 完全透传，swap 配置不生效。
 
 # 用 swap_wrapper 替换模块：模块 forward 中保存的中间激活会按策略 offload 到 CPU
 def tensor_swap_policy(tensor):
