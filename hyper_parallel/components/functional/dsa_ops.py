@@ -38,9 +38,6 @@ from cann_ops_transformer import (
     sparse_lightning_indexer_kl_loss_grad_metadata,
 )
 
-from hyper_parallel.core.dtensor.dtensor_base import DTensorBase
-
-
 def _cumulative_lengths(lengths: torch.Tensor | None, total: int, device: torch.device) -> torch.Tensor:
     """Convert the existing TND end offsets to the package's cu-seqlens form."""
     if lengths is None:
@@ -48,8 +45,6 @@ def _cumulative_lengths(lengths: torch.Tensor | None, total: int, device: torch.
     lengths = lengths.to(device=device, dtype=torch.int32).contiguous()
     if lengths.ndim != 1 or lengths.numel() == 0:
         raise ValueError("DSA sequence lengths must be a non-empty one-dimensional tensor")
-    if bool((lengths[1:] < lengths[:-1]).any()):
-        raise ValueError("DSA cumulative sequence lengths must be non-decreasing")
     return torch.cat((torch.zeros(1, dtype=torch.int32, device=device), lengths))
 
 
@@ -147,10 +142,9 @@ def _package_indexer(
             kwargs["seqused_q"] = actual_seq_qlen.to(device=query.device, dtype=torch.int32).contiguous()
         if actual_seq_klen is not None:
             kwargs["seqused_k"] = actual_seq_klen.to(device=query.device, dtype=torch.int32).contiguous()
-    with torch.autocast(device_type=query.device.type, enabled=False):
-        indices, values = lightning_indexer(
-            query.contiguous(), key.contiguous(), weights.float().contiguous(), sparse_count, **kwargs,
-        )
+    indices, values = lightning_indexer(
+        query.contiguous(), key.contiguous(), weights.float().contiguous(), sparse_count, **kwargs,
+    )
     return indices, values.to(dtype=query.dtype)
 
 
@@ -181,10 +175,9 @@ def _package_sparse_attention(
         value = key
     else:
         value = value.contiguous()
-    with torch.autocast(device_type=query.device.type, enabled=False):
-        return sparse_flash_attention(
-            query.contiguous(), key, value, indices.contiguous(), scale, **kwargs,
-        )
+    return sparse_flash_attention(
+        query.contiguous(), key, value, indices.contiguous(), scale, **kwargs,
+    )
 
 
 def _package_sparse_attention_grad(
@@ -355,8 +348,6 @@ def _package_sparse_kl(
 
 
 def _validate(query: torch.Tensor, layout: str) -> None:
-    if isinstance(query, DTensorBase):
-        raise ValueError("DSA operators require local tensors; finish CP/TP communication before this boundary")
     if layout not in ("BSND", "TND"):
         raise ValueError(f"DSA layout must be BSND or TND, got {layout!r}")
     if query.ndim != (4 if layout == "BSND" else 3):
@@ -639,12 +630,6 @@ def _sparse_attention(
     _validate(query, layout)
     _check_key(query, key)
     _check_indices(query, key, sparse_indices)
-    if value is not key and (value.device != key.device or value.dtype != key.dtype
-                            or value.shape != key.shape or value.stride() != key.stride()
-                            or value.data_ptr() != key.data_ptr()):
-        raise ValueError(
-            "DSA MLA attention requires value to alias the key tensor"
-        )
     _check_rope(query, key, query_rope, key_rope)
     if value is not key:
         raise ValueError("The ops-transformer DSA attention backend requires value to alias key")

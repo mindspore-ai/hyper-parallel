@@ -270,8 +270,9 @@ def npu_fusion_attention_forward(
     attention_mask: Optional[torch.Tensor],
     dropout: float = 0.0,
     scaling: Optional[float] = None,
+    return_softmax_stats: bool = False,
     **kwargs: Any,
-) -> tuple[torch.Tensor, None]:
+) -> tuple[torch.Tensor, None] | tuple[torch.Tensor, None, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute NPU fusion attention using the Transformers AttentionInterface contract.
 
     Args:
@@ -282,6 +283,8 @@ def npu_fusion_attention_forward(
         attention_mask: Attention mask using the Transformers mask convention.
         dropout: Dropout probability.
         scaling: Attention score scaling factor.
+        return_softmax_stats: Also return detached max, sum, and softmax output
+            from the same FlashAttention invocation.
         **kwargs: Additional attention arguments.
 
     Returns:
@@ -315,7 +318,7 @@ def npu_fusion_attention_forward(
         attention_mask,
         kwargs,
     )
-    output = torch_npu.npu_fusion_attention(
+    outputs = torch_npu.npu_fusion_attention(
         context.query.contiguous(),
         context.key.contiguous(),
         context.value.contiguous(),
@@ -332,7 +335,8 @@ def npu_fusion_attention_forward(
         sparse_mode=context.sparse_mode,
         actual_seq_qlen=context.query_lengths,
         actual_seq_kvlen=context.key_lengths,
-    )[0]
+    )
+    output = outputs[0]
     if context.valid_rows is not None:
         output = output.masked_fill(~context.valid_rows.unsqueeze(-1), 0.0)
     if context.is_packed:
@@ -342,5 +346,8 @@ def npu_fusion_attention_forward(
             output.shape[1],
             output.shape[2],
         )
-        return output, None
-    return output.transpose(1, 2), None
+    else:
+        output = output.transpose(1, 2)
+    if return_softmax_stats:
+        return output, None, outputs[1].detach(), outputs[2].detach(), outputs[3].detach()
+    return output, None

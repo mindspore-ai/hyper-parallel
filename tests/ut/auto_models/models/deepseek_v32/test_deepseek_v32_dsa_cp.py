@@ -22,7 +22,7 @@ import torch
 
 from hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel import (
     _resolve_cp_sequence_lengths,
-    _dense_attention_target,
+    _reduce_dense_softmax_target,
     _dense_cp_attention,
     _run_cp_dsa_kernels,
     _validate_cp_attention_mask,
@@ -107,22 +107,21 @@ class TestDeepseekV32DSAContextParallel(unittest.TestCase):
                 global_seq_len=8,
             )
 
-    def test_dense_attention_target_uses_each_query_causal_prefix(self):
-        """Dense target probabilities use each query's causal prefix."""
-        query = torch.zeros(1, 2, 2, 2)
-        query_rope = torch.zeros(1, 2, 2, 1)
-        values = torch.tensor([1.0, 2.0, 3.0, 4.0]).view(1, 4, 1, 1).expand(1, 4, 1, 2)
-        key_rope = torch.zeros(1, 4, 1, 1)
-        target = _dense_attention_target(
-            (query, values, query_rope, key_rope),
-            (torch.tensor([2]), torch.tensor([4])),
-            1.0,
+    def test_dense_attention_target_reduces_fa_probabilities_over_heads(self):
+        """Dense KL teacher is reduced from FA output rather than recomputed."""
+        probabilities = torch.tensor(
+            [[1., 0.], [0.5, 0.5], [0., 1.], [0.5, 0.5]],
+        ).reshape(1, 2, 2, 2)
+        target = _reduce_dense_softmax_target(
+            probabilities, query_tokens=2, batch_size=1,
         )
+        torch.testing.assert_close(target, torch.full((1, 2, 1, 2), 0.5))
 
-        torch.testing.assert_close(target[:, 0], torch.tensor([
-            [1 / 3, 1 / 3, 1 / 3, 0],
-            [0.25, 0.25, 0.25, 0.25],
-        ]))
+        packed = probabilities.squeeze(0)
+        packed_target = _reduce_dense_softmax_target(
+            packed, query_tokens=2, batch_size=1,
+        )
+        torch.testing.assert_close(packed_target, target.reshape(2, 1, 2))
 
     def test_dense_attention_output_uses_fa_and_skips_target_without_loss(self):
         """The dense attention result uses FA; inference does not build dense targets."""
@@ -135,18 +134,37 @@ class TestDeepseekV32DSAContextParallel(unittest.TestCase):
         with patch(
             "hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.npu_fusion_attention_forward",
             return_value=(expected, None),
-        ) as fa, patch(
-            "hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel._dense_attention_target",
-        ) as target:
+        ) as fa:
             output, probabilities = _dense_cp_attention(
                 module, states, lengths, 0.5, need_target=False,
             )
 
         self.assertIs(output, expected)
         self.assertIsNone(probabilities)
-        target.assert_not_called()
         self.assertEqual(fa.call_args.args[1].shape, (1, 2, 2, 4))
         self.assertEqual(fa.call_args.kwargs["sparse_mode"], 3)
+        self.assertFalse(fa.call_args.kwargs["return_softmax_stats"])
+
+    def test_dense_attention_reuses_flash_attention_softmax_output(self):
+        """Training requests probabilities from the same FA invocation."""
+        module = SimpleNamespace()
+        states = tuple(torch.zeros(1, seq, heads, dim) for seq, heads, dim in (
+            (2, 2, 3), (2, 1, 3), (2, 2, 1), (2, 1, 1),
+        ))
+        lengths = (torch.tensor([2]), torch.tensor([2]))
+        expected_output = torch.ones(1, 2, 2, 3)
+        softmax_out = torch.tensor(
+            [[1., 0.], [0.5, 0.5], [0., 1.], [0.5, 0.5]],
+        ).reshape(1, 2, 2, 2)
+        with patch(
+            "hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.npu_fusion_attention_forward",
+            return_value=(expected_output, None, None, None, softmax_out),
+        ) as fa:
+            output, target = _dense_cp_attention(module, states, lengths, 0.5, need_target=True)
+
+        self.assertIs(output, expected_output)
+        torch.testing.assert_close(target, torch.full((1, 2, 1, 2), 0.5))
+        self.assertTrue(fa.call_args.kwargs["return_softmax_stats"])
 
     def test_dense_cp_branch_uses_dense_ops_without_sparse_indexer(self):
         """The wrapper's dense selection bypasses sparse indexer/attention calls."""

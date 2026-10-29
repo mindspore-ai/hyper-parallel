@@ -246,42 +246,25 @@ def _validate_cp_target(target_module: nn.Module, cp_mesh: Any) -> None:
         )
 
 
-@torch.no_grad()
-def _dense_attention_target(
-    attention_states: tuple[torch.Tensor, ...],
-    sequence_lengths: tuple[torch.Tensor, torch.Tensor],
-    scale: float,
+def _reduce_dense_softmax_target(
+    softmax_out: torch.Tensor,
+    *,
+    query_tokens: int,
+    batch_size: int,
 ) -> torch.Tensor:
-    """Materialize detached dense teacher probabilities for the KL loss."""
-    absorbed_query, kv_nope, query_rope, key_rope = attention_states
-    query_lengths, key_lengths = sequence_lengths
-    query = torch.cat((absorbed_query, query_rope), dim=-1).reshape(-1, absorbed_query.shape[2],
-                                                                    absorbed_query.shape[-1] + query_rope.shape[-1])
-    key = torch.cat((kv_nope, key_rope), dim=-1).reshape(-1, 1, kv_nope.shape[-1] + key_rope.shape[-1])
-    value = kv_nope.reshape(-1, kv_nope.shape[-1])
-    query_ends = [0, *query_lengths.tolist()]
-    key_ends = [0, *key_lengths.tolist()]
-    key_sizes = [right - left for left, right in zip(key_ends[:-1], key_ends[1:])]
-    max_key_size = max(key_sizes, default=0)
-    targets = []
-
-    for q_start, q_end, k_start, k_end in zip(
-        query_ends[:-1], query_ends[1:], key_ends[:-1], key_ends[1:]
-    ):
-        q_len, k_len = q_end - q_start, k_end - k_start
-        if not q_len:
-            continue
-        q = query[q_start:q_end].float()
-        k = key[k_start:k_end, 0].float()
-        scores = torch.einsum("qhd,kd->hqk", q, k).mul(scale)
-        causal_lengths = torch.arange(k_len - q_len + 1, k_len + 1, device=query.device)
-        key_positions = torch.arange(k_len, device=query.device)
-        probabilities = scores.masked_fill(key_positions >= causal_lengths[:, None], -torch.inf).softmax(-1)
-        padded_target = torch.zeros((q_len, 1, max_key_size), device=query.device, dtype=torch.float32)
-        padded_target[:, 0, :k_len] = probabilities.mean(0)
-        targets.append(padded_target)
-
-    return torch.cat(targets, dim=0)
+    """Reduce FlashAttention's probabilities over query heads for dense KL."""
+    if softmax_out.ndim == 4:
+        if softmax_out.shape[0] != batch_size or softmax_out.shape[2] * batch_size != query_tokens:
+            raise ValueError("Dense FlashAttention softmax output has incompatible BNSK dimensions")
+        return softmax_out.float().mean(dim=1).unsqueeze(2)
+    if softmax_out.ndim == 3:
+        if softmax_out.shape[1] != query_tokens:
+            raise ValueError("Packed FlashAttention softmax output has incompatible NTS dimensions")
+        return softmax_out.float().mean(dim=0).unsqueeze(1)
+    raise ValueError(
+        "Dense FlashAttention must return probabilities in BNSK or NTS layout, "
+        f"got shape {tuple(softmax_out.shape)}"
+    )
 
 
 def _dense_cp_attention(
@@ -292,13 +275,13 @@ def _dense_cp_attention(
     *,
     need_target: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Use FA for dense attention; materialize probabilities only for dense KL."""
+    """Use FA for dense attention and reuse its probabilities for dense KL."""
     absorbed_query, kv_nope, query_rope, key_rope = attention_states
     query_lengths, key_lengths = sequence_lengths
     query = torch.cat((absorbed_query, query_rope), dim=-1).transpose(1, 2).contiguous()
     key = torch.cat((kv_nope, key_rope), dim=-1).transpose(1, 2).contiguous()
     value = kv_nope.transpose(1, 2).contiguous()
-    output, _ = npu_fusion_attention_forward(
+    result = npu_fusion_attention_forward(
         module,
         query,
         key,
@@ -309,8 +292,18 @@ def _dense_cp_attention(
         actual_seq_kvlen=key_lengths,
         is_causal=True,
         sparse_mode=3,
+        return_softmax_stats=need_target,
     )
-    target = _dense_attention_target(attention_states, sequence_lengths, scale) if need_target else None
+    if need_target:
+        output, _, _, _, softmax_out = result
+        target = _reduce_dense_softmax_target(
+            softmax_out,
+            query_tokens=absorbed_query.shape[0] * absorbed_query.shape[1],
+            batch_size=absorbed_query.shape[0],
+        )
+    else:
+        output, _ = result
+        target = None
     return output, target
 
 
