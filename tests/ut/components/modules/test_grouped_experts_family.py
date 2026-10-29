@@ -46,7 +46,8 @@ class TestGroupedExpertsFamily(unittest.TestCase):
         """
         source = TinyMoE()
         for selectors, expected in (({}, GroupedExperts), ({"use_mxfp8": True}, MXFP8GroupedSwiGLU),
-                                    ({"use_mxfp8": True, "use_fused_mxfp8": True}, FusedMXFP8GroupedSwiGLU)):
+                                    ({"use_mxfp8": True, "use_fused_mxfp8": True}, FusedMXFP8GroupedSwiGLU),
+                                    ({"use_mxfp8": True, "fused": True}, FusedMXFP8GroupedSwiGLU)):
             with self.subTest(selectors=selectors):
                 model = copy.deepcopy(source)
                 replace_experts(model, family_config(**selectors))
@@ -66,7 +67,9 @@ class TestGroupedExpertsFamily(unittest.TestCase):
         Description: Reject fusion without MXFP8, nonboolean selectors and constructor typos.
         Expectation: Configuration fails before any NPU constructor runs.
         """
-        for selectors in ({"use_fused_mxfp8": True}, {"use_mxfp8": 1}, {"unknown": True},
+        for selectors in ({"use_fused_mxfp8": True}, {"fused": True}, {"fused": 1},
+                          {"use_mxfp8": True, "fused": False, "use_fused_mxfp8": True},
+                          {"use_mxfp8": 1}, {"unknown": True},
                           {"use_mxfp8": True, "unknown": True}):
             with self.subTest(selectors=selectors), self.assertRaises(ConfigResolutionError):
                 family_config(**selectors)
