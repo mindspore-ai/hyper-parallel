@@ -30,6 +30,7 @@ from typing import Any, Optional
 
 from hyper_parallel.codegen.artifact import ArtifactLayout
 from hyper_parallel.codegen.hash import file_line_count, sha256_file
+from hyper_parallel.codegen.snapshot import CodegenStatus
 
 
 @dataclass
@@ -90,6 +91,10 @@ class CodegenMeta:
     #: resolve against.  Empty for installed transformers sources (they use
     #: absolute imports) and for artifacts generated before this field existed.
     remote_siblings: list[str] = field(default_factory=list)
+    #: Future snapshot provenance. Both remain absent from emitted metadata
+    #: until the snapshot-driven manager is enabled.
+    snapshot_schema_version: Optional[int] = None
+    snapshot_status: Optional[str] = None
 
 
 #: Stages the generated artifact declares it covers.  ``sharding_plan`` starts
@@ -119,7 +124,11 @@ NOT_COVERED_DEFAULT = [
 
 def meta_to_dict(meta: CodegenMeta) -> dict[str, Any]:
     """Serialize a CodegenMeta to a JSON-friendly dict."""
-    return asdict(meta)
+    data = asdict(meta)
+    for key in ("snapshot_schema_version", "snapshot_status"):
+        if data[key] is None:
+            data.pop(key)
+    return data
 
 
 def meta_from_dict(data: dict[str, Any]) -> CodegenMeta:
@@ -158,6 +167,19 @@ def validate_meta_schema(data: dict[str, Any]) -> None:
     for key in ("source", "parallel_dims", "outputs"):
         if key in data and not isinstance(data[key], dict):
             raise TypeError(f"codegen_meta field {key!r} must be a dict")
+    if "snapshot_schema_version" in data:
+        version = data["snapshot_schema_version"]
+        if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+            raise TypeError(
+                "codegen_meta field 'snapshot_schema_version' must be a positive int"
+            )
+    if "snapshot_status" in data:
+        try:
+            CodegenStatus(data["snapshot_status"])
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                "codegen_meta field 'snapshot_status' must be a known codegen status"
+            ) from exc
     if "entrypoints" in data:
         entrypoints = data["entrypoints"]
         if not isinstance(entrypoints, dict) or not all(
