@@ -39,6 +39,7 @@ def emit_bundle(
     meta: Any,
     *,
     patch_plan: Any = None,
+    snapshot: Any = None,
 ) -> dict[str, str]:
     """Render the artifact bundle for one frozen ``meta``.
 
@@ -50,6 +51,10 @@ def emit_bundle(
 
     ``meta.covered`` is prepared by the manager before emission.
     """
+    if snapshot is not None:
+        snapshot_payload = snapshot.to_dict()
+        if getattr(meta, "snapshot_status", None) != snapshot_payload["status"]:
+            raise ValueError("bundle meta and snapshot status do not match")
     if patch_plan is None:
         from hyper_parallel.codegen.patch_plan import patch_emission_plan_from_meta
 

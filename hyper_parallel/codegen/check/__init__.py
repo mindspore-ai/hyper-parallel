@@ -6,6 +6,7 @@
 Per-zone verifiers composed by ``preflight_integrity_check`` (manager) and
 callable individually by the CLI.
 """
+from hyper_parallel.codegen.check.drift import verify_snapshot_drift
 from hyper_parallel.codegen.check.preflight import (
     verify_boundary_forms,
     verify_generated_import,
@@ -13,6 +14,7 @@ from hyper_parallel.codegen.check.preflight import (
     verify_output_hashes,
     verify_param_plan,
     verify_signature,
+    verify_snapshot_contract,
     warn_skipped_overrides,
 )
 
@@ -23,5 +25,7 @@ __all__ = [
     "verify_output_hashes",
     "verify_param_plan",
     "verify_signature",
+    "verify_snapshot_contract",
+    "verify_snapshot_drift",
     "warn_skipped_overrides",
 ]

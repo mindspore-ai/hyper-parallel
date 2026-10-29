@@ -18,6 +18,7 @@ Following design doc 01_hf_compatibility_layer.md §6.
 Stub — provides from_pretrained/from_config as entry points.
 """
 
+import inspect
 import logging
 from dataclasses import is_dataclass, replace
 from types import SimpleNamespace
@@ -41,6 +42,7 @@ from hyper_parallel.models._transformers.model_builder import (
 from hyper_parallel.models._transformers.config_resolver import get_hf_config, get_is_hf_model
 from hyper_parallel.distributed.mesh import DistributedSetup
 from hyper_parallel.codegen.modeling_backend import ModelingBackend
+from hyper_parallel.codegen.hash import file_line_count, sha256_file
 from hyper_parallel.codegen.snapshot import CodegenStatus
 from hyper_parallel.models.build_options import get_device_id, get_device_type  # pylint: disable=syntax-error
 from hyper_parallel.models.build_options import CompileConfig
@@ -528,12 +530,20 @@ class _BaseHyperAutoModelClass:
             codegen_session = None
         if codegen_session is not None:
             model_type = type(model)
+            source_path = inspect.getsourcefile(model_type)
+            architectures = list(
+                getattr(hf_config, "architectures", None) or ()
+            )
+            architecture = architectures[0] if architectures else model_type.__name__
             codegen_session.record_source({
                 "model_type": getattr(hf_config, "model_type", None),
-                "architectures": list(
-                    getattr(hf_config, "architectures", None) or ()
-                ),
+                "architecture": architecture,
+                "architectures": architectures,
                 "model_class": f"{model_type.__module__}:{model_type.__qualname__}",
+                "module_name": model_type.__module__,
+                "file_path": source_path,
+                "sha256": sha256_file(source_path) if source_path else None,
+                "line_count": file_line_count(source_path) if source_path else None,
                 "pretrained_model_name_or_path": (
                     None
                     if pretrained_model_name_or_path is None

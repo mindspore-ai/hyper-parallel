@@ -38,12 +38,24 @@ from hyper_parallel.codegen.artifact import (
     write_bundle_atomic,
 )
 from hyper_parallel.codegen.emit import emit_bundle
-from hyper_parallel.codegen.hash import canonical_json, sha256_file, signature_from_spec
+from hyper_parallel.codegen.emit.replacement import replacement_records_from_snapshot
+from hyper_parallel.codegen.hash import (
+    canonical_json,
+    canonical_snapshot_payload,
+    sha256_file,
+    sha256_text,
+    signature_from_snapshot,
+    signature_from_spec,
+)
 from hyper_parallel.codegen.inline.framework_spec import declaration_summary
 from hyper_parallel.codegen.meta import (
+    COVERED_DEFAULTS,
+    NOT_COVERED_DEFAULT,
     CodegenMeta,
     load_codegen_meta,
 )
+from hyper_parallel.codegen.patch_plan import PatchEmissionPlan
+from hyper_parallel.codegen.snapshot import CodegenSnapshot, CodegenStatus
 from hyper_parallel.distributed._builder.applier import _apply_phase_c
 from hyper_parallel.distributed.recipe_spec import _normalize_out_fields
 
@@ -131,6 +143,130 @@ def ensure_codegen_artifact(
     return layout
 
 
+def ensure_codegen_artifact_from_snapshot(
+    snapshot: CodegenSnapshot,
+    artifact_dir: str,
+) -> ArtifactLayout:
+    """Generate or reuse a bundle using only frozen native-build data.
+
+    This entry must remain independent of config projection, meta-model
+    construction, offline meshes, replacement matching, and planner calls.
+    """
+    if not isinstance(snapshot, CodegenSnapshot):
+        raise TypeError("snapshot must be a CodegenSnapshot")
+    if snapshot.status is not CodegenStatus.DERIVED:
+        raise ValueError(
+            "snapshot-driven generation currently requires status 'derived', "
+            f"got {snapshot.status.value!r}"
+        )
+    payload = snapshot.to_dict()
+    source = payload["source"]
+    if not source.get("file_path"):
+        raise ValueError("snapshot source must include a modeling file_path")
+    model_name = source.get("architecture") or source.get("model_type")
+    layout = resolve_default_artifact_layout(
+        artifact_dir,
+        model_name=str(model_name) if model_name else None,
+    )
+    ensure_artifact_dir(layout)
+    is_rank0 = _is_rank0()
+    if is_rank0:
+        clean_temp_artifacts(layout)
+
+    signature = signature_from_snapshot(snapshot)
+    existing = load_codegen_meta(layout.meta_path)
+    if existing is not None and not should_regenerate(existing, signature):
+        if is_rank0:
+            logger.info(
+                "codegen: reuse snapshot artifact %s (signature %s)",
+                layout.artifact_dir,
+                signature,
+            )
+        barrier_after_artifact()
+        return layout
+    if not is_rank0:
+        wait_for_rank0_artifact(layout, signature)
+        barrier_after_artifact()
+        return layout
+
+    logger.info(
+        "codegen: generating snapshot artifact %s (signature %s)",
+        layout.artifact_dir,
+        signature,
+    )
+    meta = _build_meta_from_snapshot(snapshot, layout, signature)
+    patch_plan = None
+    if not meta.covered.get("model_class", True):
+        patch_plan = PatchEmissionPlan()
+    files = emit_bundle(
+        layout,
+        meta,
+        patch_plan=patch_plan,
+        snapshot=snapshot,
+    )
+    write_bundle_atomic(layout, files, meta)
+    barrier_after_artifact()
+    return layout
+
+
+def _build_meta_from_snapshot(
+    snapshot: CodegenSnapshot,
+    layout: ArtifactLayout,
+    signature: str,
+) -> CodegenMeta:
+    """Map immutable snapshot fields into the existing emitter metadata."""
+    payload = snapshot.to_dict()
+    source = dict(payload["source"])
+    frozen_plan = dict(payload["plan"] or {})
+    application = dict(payload["plan_application"] or {})
+    module_overrides = list(replacement_records_from_snapshot(snapshot))
+    trainer_owns_model = not bool(source.get("is_hf_model", True))
+    covered = dict(COVERED_DEFAULTS)
+    covered["sharding_plan"] = True
+    covered["module_overrides"] = bool(module_overrides) and not trainer_owns_model
+    covered["model_class"] = not trainer_owns_model
+    applications = payload["replacements"]["applications"]
+    emission_patches = {
+        "module_replacements": [
+            {
+                "module_fqn": item["primary_fqn"],
+                "source_type": item["source_type"],
+                "replacement_type": item["replacement_type"],
+            }
+            for item in applications
+        ],
+        "local_computes": [],
+        "inner_wrappers": [],
+    }
+    return CodegenMeta(
+        codegen_version=CODEGEN_VERSION,
+        signature=signature,
+        yaml_path=layout.yaml_path,
+        yaml_sha256=sha256_text(canonical_snapshot_payload(snapshot)),
+        source=source,
+        parallel_dims=dict(frozen_plan.get("parallel_dims") or {}),
+        model_name=source.get("model_type"),
+        model_class=source.get("architecture"),
+        injections=list(frozen_plan.get("injections") or ()),
+        param_plan=dict(frozen_plan.get("param_plan") or {}),
+        frozen_sharded_params=list(frozen_plan.get("frozen_sharded_params") or ()),
+        tied_pairs=list(frozen_plan.get("tied_pairs") or ()),
+        special_handlers=dict(frozen_plan.get("special_handlers") or {}),
+        boundary_classes=dict(frozen_plan.get("boundary_classes") or {}),
+        mesh_dim_names=list(frozen_plan.get("mesh_dim_names") or ()) or None,
+        module_overrides=[] if trainer_owns_model else module_overrides,
+        emission_patches=emission_patches,
+        covered=covered,
+        not_covered=list(NOT_COVERED_DEFAULT),
+        entrypoints={"parallelize": "hp_parallelize"},
+        snapshot_schema_version=payload["schema_version"],
+        snapshot_status=payload["status"],
+        snapshot_reason=payload.get("reason"),
+        snapshot_failure=payload.get("failure"),
+        plan_application=application,
+    )
+
+
 def preflight_integrity_check(
     config: Any,
     yaml_path: str | None = None,
@@ -156,6 +292,7 @@ def preflight_integrity_check(
         verify_output_hashes,
         verify_param_plan,
         verify_signature,
+        verify_snapshot_contract,
         warn_skipped_overrides,
     )
 
@@ -168,6 +305,7 @@ def preflight_integrity_check(
             f"codegen preflight: missing meta at {layout.meta_path}; run generate first"
         )
     verify_meta_required_fields(meta)
+    verify_snapshot_contract(meta)
     signature = _compute_signature(config, layout, hf_config=hf_config)
     verify_signature(meta, signature)
     verify_output_hashes(meta, layout)
@@ -1053,6 +1191,7 @@ __all__ = [
     "CODEGEN_VERSION",
     "barrier_after_artifact",
     "ensure_codegen_artifact",
+    "ensure_codegen_artifact_from_snapshot",
     "preflight_integrity_check",
     "should_regenerate",
     "wait_for_rank0_artifact",
