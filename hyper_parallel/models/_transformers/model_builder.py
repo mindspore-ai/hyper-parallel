@@ -25,6 +25,7 @@ AutoModels objects and never imports trainer config (05 §15.2.6).
 
 import fnmatch
 import logging
+from dataclasses import replace
 from typing import Any, Dict, Literal, Optional, Union
 
 import torch
@@ -72,7 +73,10 @@ from hyper_parallel.models.external_state import (
     ExternalLoadContext,
     get_model_external_state,
 )
-from hyper_parallel.models.replacement import _apply_module_replacement_actions
+from hyper_parallel.models.replacement import (
+    ModuleReplacementSpec,
+    _apply_module_replacement_actions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -363,6 +367,98 @@ def _module_replacements_covered_by_generated(
 
     meta = load_codegen_meta(codegen_artifact_dir)
     return meta is not None and bool((meta.covered or {}).get("module_overrides"))
+
+
+def _symbol_path(symbol: type) -> str:
+    """Return the stable path used by codegen replacement metadata."""
+    return f"{symbol.__module__}:{symbol.__qualname__}"
+
+
+def _rebind_codegen_replacement_specs(
+    model: nn.Module,
+    specs: Optional[tuple[ModuleReplacementSpec, ...]],
+    codegen_artifact_dir: Optional[str],
+) -> Optional[tuple[ModuleReplacementSpec, ...]]:
+    """Bind native replacement rules to copied classes in generated source.
+
+    A generated modeling file owns class definitions but no longer owns module
+    replacement execution.  Consequently its source modules have the same
+    qualified names as the native classes recorded by YAML, but different
+    Python identities.  The signed generation observations provide the exact
+    FQNs at which that identity translation is valid; no name-only fallback is
+    allowed outside those observations.
+    """
+    if not specs or not codegen_artifact_dir:
+        return specs
+
+    # Runtime-owned custom-model artifacts instantiate the registered native
+    # class. Their replacement specs already target the live module identities;
+    # rebinding is only needed for copied classes from generated source.
+    if not type(model).__module__.startswith("hyper_parallel_generated."):
+        return specs
+
+    from hyper_parallel.codegen.runtime import load_codegen_meta  # pylint: disable=import-outside-toplevel
+
+    meta = load_codegen_meta(codegen_artifact_dir)
+    records = ((meta.emission_patches or {}).get("module_replacements", ()) if meta else ())
+    if not records:
+        return specs
+
+    generated_module = type(model).__module__
+    rebound = []
+    consumed_fqns = set()
+    for spec in specs:
+        source_path = _symbol_path(spec.module_type)
+        matching = [record for record in records if record.get("source_type") == source_path]
+        if not matching:
+            raise RuntimeError(
+                f"codegen: replacement rule for {source_path} has no generation observation; "
+                "regenerate the artifact instead of guessing a copied class by name"
+            )
+
+        observed_types = set()
+        for record in matching:
+            module_fqn = record.get("module_fqn")
+            if not module_fqn or not any(
+                fnmatch.fnmatchcase(module_fqn, pattern) for pattern in spec.match
+            ):
+                raise RuntimeError(
+                    f"codegen: replacement observation {module_fqn!r} does not match "
+                    f"the configured rule {spec.match}"
+                )
+            try:
+                module = model.get_submodule(module_fqn)
+            except AttributeError as exc:
+                raise RuntimeError(
+                    f"codegen: replacement observation {module_fqn!r} is absent from "
+                    "the generated model; regenerate the artifact"
+                ) from exc
+            module_type = type(module)
+            if (
+                module_type.__module__ != generated_module
+                or module_type.__qualname__ != spec.module_type.__qualname__
+            ):
+                raise RuntimeError(
+                    f"codegen: {module_fqn!r} resolved to {_symbol_path(module_type)}, "
+                    f"not the generated equivalent of {source_path}"
+                )
+            observed_types.add(module_type)
+            consumed_fqns.add(module_fqn)
+
+        if len(observed_types) != 1:
+            raise RuntimeError(
+                f"codegen: replacement rule for {source_path} resolved to multiple "
+                "generated source types"
+            )
+        rebound.append(replace(spec, module_type=observed_types.pop()))
+
+    recorded_fqns = {record.get("module_fqn") for record in records}
+    if consumed_fqns != recorded_fqns:
+        extra = sorted(recorded_fqns - consumed_fqns, key=str)
+        raise RuntimeError(
+            f"codegen: replacement observations do not map to configured rules: {extra}"
+        )
+    return tuple(rebound)
 
 
 def _move_model_to_device(
@@ -681,9 +777,15 @@ def _maybe_apply_module_replacements(
             "skipping native module replacement"
         )
         return model, weights_mapping
+    replacement_specs = tuple(getattr(distributed_setup, "module_replacements", None) or ())
+    replacement_specs = _rebind_codegen_replacement_specs(
+        model,
+        replacement_specs,
+        codegen_artifact_dir,
+    )
     return _apply_module_replacement_actions(
         model,
-        getattr(distributed_setup, "module_replacements", None),
+        replacement_specs,
         weights_mapping=weights_mapping,
         context=_build_replacement_context(distributed_setup, low_precision_config),
         capture_checkpoint_metadata=load_base_model,
@@ -758,6 +860,21 @@ def apply_model_infrastructure(
         model, codegen_artifact_dir, distributed_setup, low_precision_config,
         load_base_model, weights_mapping,
     )
+    if codegen_artifact_dir:
+        from hyper_parallel.codegen.check.preflight import (  # pylint: disable=import-outside-toplevel
+            verify_param_plan,
+        )
+        from hyper_parallel.codegen.runtime import (  # pylint: disable=import-outside-toplevel
+            load_codegen_meta,
+        )
+
+        codegen_meta = load_codegen_meta(codegen_artifact_dir)
+        if codegen_meta is None:
+            raise FileNotFoundError(
+                f"codegen: missing metadata in {codegen_artifact_dir}; "
+                "regenerate the artifact"
+            )
+        verify_param_plan(codegen_meta, model)
     if is_meta_device:
         _apply_materialization_adapter(model)
 

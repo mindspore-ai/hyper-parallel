@@ -283,6 +283,34 @@ def resolve_generated_model_class(module: ModuleType, hf_config: Any) -> type:
     return model_cls
 
 
+def _resolve_runtime_model_class(
+    module: ModuleType,
+    hf_config: Any,
+    meta: Any,
+) -> type:
+    """Resolve generated or native class according to explicit ownership."""
+    model_cls = resolve_generated_model_class(module, hf_config)
+    covered = meta.covered or {}
+    if covered.get("model_class") is not False or "model_class" not in covered:
+        return model_cls
+
+    from hyper_parallel.models.registry import (  # pylint: disable=import-outside-toplevel
+        _resolve_custom_model_cls,
+    )
+
+    architectures = getattr(hf_config, "architectures", None) or []
+    architecture = architectures[0] if architectures else meta.model_class
+    native_model_cls = _resolve_custom_model_cls(architecture or "")
+    if native_model_cls is None:
+        return model_cls
+    logger.info(
+        "codegen: using registered native model class %s; generated source "
+        "is audit-only",
+        architecture,
+    )
+    return native_model_cls
+
+
 def _register_generated_model_conversions(model: Any) -> None:
     """Let the generated model share the library's native weight conversions.
 
@@ -495,9 +523,41 @@ def init_generated_model(
         Any: The instantiated model with converted weights loaded.
     """
     module = import_generated_module(artifact_dir)
-    model_cls = resolve_generated_model_class(module, hf_config)
 
-    if pretrained_model_name_or_path is not None:
+    from hyper_parallel.codegen.meta import (  # pylint: disable=import-outside-toplevel
+        load_codegen_meta,
+    )
+
+    meta_path = os.path.join(artifact_dir, "codegen_meta.json")
+    meta = load_codegen_meta(meta_path)
+    if meta is None:
+        raise FileNotFoundError(
+            f"codegen: missing or invalid meta at {meta_path}; "
+            "the bundle is incomplete — regenerate the artifact"
+        )
+
+    model_cls = _resolve_runtime_model_class(module, hf_config, meta)
+    # New runtime-owned artifacts keep the generated source as an auditable
+    # snapshot, but custom model execution must retain the registered native
+    # class identity.  DeepSeek-V4.1 has native initialization and replacement
+    # dispatch keyed by those identities; mixing copied source classes with
+    # native wrappers changes its initialized training state.  The explicit
+    # key preserves legacy inline artifacts, where the generated class still
+    # owns source patches.  HF-only architectures have no registered custom
+    # class and continue to execute the generated class.
+
+    native_custom_model = not model_cls.__module__.startswith(
+        f"{_GENERATED_MODULE_PREFIX}."
+    )
+    if pretrained_model_name_or_path is not None and native_custom_model:
+        model = model_cls.from_pretrained(
+            pretrained_model_name_or_path,
+            *model_args,
+            config=hf_config,
+            torch_dtype=torch_dtype,
+            **kwargs,
+        )
+    elif pretrained_model_name_or_path is not None:
         model = _load_generated_checkpoint(
             model_cls,
             pretrained_model_name_or_path,
@@ -506,6 +566,11 @@ def init_generated_model(
             torch_dtype,
             kwargs,
         )
+    elif native_custom_model:
+        # Match model_builder's native custom-model path exactly.  Calling the
+        # Transformers private constructor here bypasses model-owned setup;
+        # DeepSeek-V4.1 exposes this public constructor for that reason.
+        model = model_cls.from_config(hf_config, *model_args, **kwargs)
     else:
         # transformers >= 5.14 removed ``PreTrainedModel.from_config`` in
         # favour of ``_from_config`` (a classmethod on the concrete model
@@ -519,20 +584,6 @@ def init_generated_model(
         )
         _register_generated_model_conversions(model)
 
-    from hyper_parallel.codegen.check.preflight import (  # pylint: disable=import-outside-toplevel
-        verify_param_plan,
-    )
-    from hyper_parallel.codegen.meta import (  # pylint: disable=import-outside-toplevel
-        load_codegen_meta,
-    )
-
-    meta = load_codegen_meta(os.path.join(artifact_dir, "codegen_meta.json"))
-    if meta is None:
-        raise FileNotFoundError(
-            f"codegen: missing meta at {os.path.join(artifact_dir, 'codegen_meta.json')}; "
-            "the bundle is incomplete — regenerate the artifact"
-        )
-    verify_param_plan(meta, model)
     return model
 
 

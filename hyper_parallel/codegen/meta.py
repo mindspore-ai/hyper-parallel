@@ -54,11 +54,8 @@ class CodegenMeta:
     #: groups boundary FQNs by this to rewrite one ``class.forward`` per class.
     boundary_classes: dict[str, str] = field(default_factory=dict)
     entrypoints: dict[str, str] = field(default_factory=dict)
-    #: Sunk ``replace_module`` overrides: one JSON-safe record per
-    #: matched target, ``{match, fqn, fqns, module_type, factory, exact_type}``.
-    #: The inline pipeline lowers them into the generated file, and the record
-    #: is what lets the trainer skip its own HF replacement step
-    #: (``covered["module_overrides"]``).
+    #: Replacements owned by generated source. Runtime-owned replacement
+    #: observations live in ``emission_patches`` instead, leaving this empty.
     module_overrides: list[dict[str, Any]] = field(default_factory=list)
     #: Audit-only source materializations produced from builder observations.
     #: This never participates in runtime strategy selection.
@@ -106,6 +103,7 @@ class CodegenMeta:
 COVERED_DEFAULTS = {
     "sharding_plan": False,
     "module_overrides": False,
+    "model_class": True,
     "axes": [],
 }
 
