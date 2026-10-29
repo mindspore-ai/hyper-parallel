@@ -20,6 +20,7 @@ Stub — provides from_pretrained/from_config as entry points.
 
 import inspect
 import logging
+import random
 from dataclasses import is_dataclass, replace
 from types import SimpleNamespace
 from typing import Any, Literal, Optional, Union
@@ -43,6 +44,8 @@ from hyper_parallel.models._transformers.config_resolver import get_hf_config, g
 from hyper_parallel.distributed.mesh import DistributedSetup
 from hyper_parallel.codegen.modeling_backend import ModelingBackend
 from hyper_parallel.codegen.hash import file_line_count, sha256_file
+from hyper_parallel.codegen.manager import ensure_codegen_artifact_from_snapshot
+from hyper_parallel.codegen.session import CodegenBuildSession
 from hyper_parallel.codegen.snapshot import CodegenStatus
 from hyper_parallel.models.build_options import get_device_id, get_device_type  # pylint: disable=syntax-error
 from hyper_parallel.models.build_options import CompileConfig
@@ -231,6 +234,39 @@ def _prepare_codegen_artifact(
     return layout.artifact_dir
 
 
+def _configured_codegen_artifact_dir(config: Any) -> Optional[str]:
+    """Return the optional sidecar output directory from a trainer config."""
+    model = getattr(config, "model", None)
+    return getattr(model, "codegen_artifact_dir", None)
+
+
+def _finish_codegen_sidecar(
+    session: CodegenBuildSession,
+    artifact_dir: Optional[str],
+):
+    """Seal native observations and isolate sidecar publication failures."""
+    cpu_rng_state = torch.get_rng_state()
+    python_rng_state = random.getstate()
+
+    def publish(snapshot):
+        device_rng_state = None
+        set_device_rng_state = None
+        try:
+            device_module = get_torch_device()
+            get_device_rng_state = getattr(device_module, "get_rng_state", None)
+            set_device_rng_state = getattr(device_module, "set_rng_state", None)
+            if get_device_type() != "cpu" and callable(get_device_rng_state):
+                device_rng_state = get_device_rng_state()
+            ensure_codegen_artifact_from_snapshot(snapshot, artifact_dir)
+        finally:
+            torch.set_rng_state(cpu_rng_state)
+            random.setstate(python_rng_state)
+            if device_rng_state is not None and callable(set_device_rng_state):
+                set_device_rng_state(device_rng_state)
+
+    return session.finish(publish)
+
+
 class _BaseHyperAutoModelClass:
     """Shared from_pretrained / from_config logic.
 
@@ -322,18 +358,10 @@ class _BaseHyperAutoModelClass:
         # ④ Determine model path
         is_hf_model = get_is_hf_model(hf_config, force_hf)
 
-        # codegen sidecar: an explicit gen backend bypasses the HF/custom
-        # dispatch above; the master wiring stays as-is for everything else.
-        if codegen and not force_hf:
-            backend = ModelingBackend.GEN
-            if codegen_artifact_dir is None:
-                codegen_artifact_dir = _prepare_codegen_artifact(
-                    codegen_config,
-                    pretrained_model_name_or_path=pretrained_model_name_or_path,
-                    codegen_artifact_dir=codegen_artifact_dir,
-                    config_overrides=config_overrides,
-                    hf_config=hf_config,
-                )
+        if codegen and codegen_session is None:
+            codegen_session = CodegenBuildSession()
+        if codegen_artifact_dir is None:
+            codegen_artifact_dir = _configured_codegen_artifact_dir(codegen_config)
 
         # ⑤ Build model
         return cls._build_model(
@@ -362,6 +390,7 @@ class _BaseHyperAutoModelClass:
             model_init_dtype=model_init_dtype,
             codegen_artifact_dir=codegen_artifact_dir,
             codegen_session=codegen_session,
+            publish_codegen=codegen,
             **kwargs,
         )
 
@@ -395,10 +424,9 @@ class _BaseHyperAutoModelClass:
 
         Following design doc 01 §6.1.
 
-        ``codegen`` selects the ``gen`` backend exactly as in
-        :meth:`from_pretrained`: the artifact bundle is prepared here from the
-        config's source identity.  No checkpoint is loaded either way, so the
-        from-config random initialization path is preserved.
+        ``codegen`` records the native build and publishes an artifact sidecar
+        after infrastructure completes. No checkpoint is loaded either way,
+        so the from-config random initialization path is preserved.
         """
         if distributed_setup is None:
             distributed_setup = DistributedSetup()
@@ -411,17 +439,9 @@ class _BaseHyperAutoModelClass:
         )
         is_hf_model = get_is_hf_model(config, force_hf=False)
 
-        # codegen sidecar (same shape as from_pretrained's)
-        codegen_artifact_dir = None
-        if codegen:
-            backend = ModelingBackend.GEN
-            codegen_artifact_dir = _prepare_codegen_artifact(
-                codegen_config,
-                pretrained_model_name_or_path=_config_source_id(config),
-                codegen_artifact_dir=None,
-                config_overrides=None,
-                hf_config=config,
-            )
+        if codegen and codegen_session is None:
+            codegen_session = CodegenBuildSession()
+        codegen_artifact_dir = _configured_codegen_artifact_dir(codegen_config)
 
         return cls._build_model(
             None,
@@ -449,6 +469,7 @@ class _BaseHyperAutoModelClass:
             model_init_dtype=model_init_dtype,
             codegen_artifact_dir=codegen_artifact_dir,
             codegen_session=codegen_session,
+            publish_codegen=codegen,
             **kwargs,
         )
 
@@ -481,6 +502,7 @@ class _BaseHyperAutoModelClass:
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
         codegen_artifact_dir: Optional[str] = None,
         codegen_session: Optional[Any] = None,
+        publish_codegen: bool = False,
         **kwargs,
     ) -> PreTrainedModel:
         """Core model building orchestration.
@@ -591,9 +613,17 @@ class _BaseHyperAutoModelClass:
         if codegen_session is not None:
             if codegen_session.status is CodegenStatus.COLLECTING:
                 codegen_session.mark_skipped("infrastructure_collection_unavailable")
-            model._hp_codegen_snapshot = (  # pylint: disable=protected-access
-                codegen_session.finish()
+            snapshot = (
+                _finish_codegen_sidecar(codegen_session, codegen_artifact_dir)
+                if publish_codegen
+                else codegen_session.finish()
             )
+            model._hp_codegen_snapshot = snapshot  # pylint: disable=protected-access
+            if snapshot.status is CodegenStatus.FAILED:
+                logger.warning(
+                    "codegen sidecar generation failed after native model build: %s",
+                    snapshot.failure.reason,
+                )
 
         model.train()
         return model

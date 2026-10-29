@@ -24,7 +24,11 @@ import pytest
 
 from hyper_parallel.codegen.artifact import (
     ArtifactLayout,
+    artifact_failure_path,
+    artifact_generation_lock,
+    clear_artifact_failure,
     ensure_artifact_dir,
+    publish_artifact_failure,
     resolve_model_artifact_layout,
 )
 from hyper_parallel.codegen import manager
@@ -187,6 +191,37 @@ class TestEnsureArtifactDirGuard:
         monkeypatch.setattr(Path, "mkdir", _raise_unwritable)
         with pytest.raises(RuntimeError, match="pip install -e ."):
             ensure_artifact_dir(layout)
+
+
+class TestArtifactCoordination:
+    """Owner publication coordination leaves no stale process-local state."""
+
+    def test_failure_marker_round_trip(self, tmp_path):
+        """Failure markers atomically expose and clear the owner's reason."""
+        layout = ArtifactLayout.build_default(str(tmp_path / "generated"))
+
+        publish_artifact_failure(layout, "abc123", "render failed")
+
+        marker = Path(artifact_failure_path(layout, "abc123"))
+        marker_text = marker.read_text(encoding="utf-8")
+        assert marker_text == "render failed", (
+            f"failure marker mismatch: expected=render failed, got={marker_text}"
+        )
+        clear_artifact_failure(layout, "abc123")
+        assert not marker.exists(), f"failure marker was not removed: path={marker}"
+
+    def test_generation_lock_rejects_concurrent_owner_and_cleans_up(self, tmp_path):
+        """Only one owner publishes and releasing it removes the lock."""
+        layout = ArtifactLayout.build_default(str(tmp_path / "generated"))
+        Path(layout.artifact_dir).parent.mkdir(parents=True, exist_ok=True)
+
+        with artifact_generation_lock(layout):
+            with pytest.raises(TimeoutError, match="artifact lock"):
+                with artifact_generation_lock(layout, timeout_s=0):
+                    pass
+
+        with artifact_generation_lock(layout, timeout_s=0):
+            pass
 
 
 def _hf(model_type):

@@ -30,8 +30,12 @@ from typing import Any, Optional
 
 from hyper_parallel.codegen.artifact import (
     ArtifactLayout,
+    artifact_failure_path,
+    artifact_generation_lock,
+    clear_artifact_failure,
     clean_temp_artifacts,
     ensure_artifact_dir,
+    publish_artifact_failure,
     resolve_default_artifact_layout,
     resolve_model_artifact_layout,
     resolve_artifact_layout,
@@ -145,7 +149,9 @@ def ensure_codegen_artifact(
 
 def ensure_codegen_artifact_from_snapshot(
     snapshot: CodegenSnapshot,
-    artifact_dir: str,
+    artifact_dir: Optional[str] = None,
+    *,
+    timeout_s: float = 600.0,
 ) -> ArtifactLayout:
     """Generate or reuse a bundle using only frozen native-build data.
 
@@ -164,10 +170,16 @@ def ensure_codegen_artifact_from_snapshot(
     if not source.get("file_path"):
         raise ValueError("snapshot source must include a modeling file_path")
     model_name = source.get("architecture") or source.get("model_type")
-    layout = resolve_default_artifact_layout(
-        artifact_dir,
-        model_name=str(model_name) if model_name else None,
-    )
+    if artifact_dir is None and source.get("model_type"):
+        layout = resolve_model_artifact_layout(
+            str(source["model_type"]),
+            model_name=str(model_name) if model_name else None,
+        )
+    else:
+        layout = resolve_default_artifact_layout(
+            artifact_dir,
+            model_name=str(model_name) if model_name else None,
+        )
     ensure_artifact_dir(layout)
     is_rank0 = _is_rank0()
     if is_rank0:
@@ -185,28 +197,40 @@ def ensure_codegen_artifact_from_snapshot(
         barrier_after_artifact()
         return layout
     if not is_rank0:
-        wait_for_rank0_artifact(layout, signature)
-        barrier_after_artifact()
-        return layout
+        try:
+            wait_for_rank0_artifact(layout, signature, timeout_s=timeout_s)
+            return layout
+        finally:
+            barrier_after_artifact()
 
-    logger.info(
-        "codegen: generating snapshot artifact %s (signature %s)",
-        layout.artifact_dir,
-        signature,
-    )
-    meta = _build_meta_from_snapshot(snapshot, layout, signature)
-    patch_plan = None
-    if not meta.covered.get("model_class", True):
-        patch_plan = PatchEmissionPlan()
-    files = emit_bundle(
-        layout,
-        meta,
-        patch_plan=patch_plan,
-        snapshot=snapshot,
-    )
-    write_bundle_atomic(layout, files, meta)
-    barrier_after_artifact()
-    return layout
+    try:
+        with artifact_generation_lock(layout, timeout_s=timeout_s):
+            existing = load_codegen_meta(layout.meta_path)
+            if existing is not None and not should_regenerate(existing, signature):
+                return layout
+            logger.info(
+                "codegen: generating snapshot artifact %s (signature %s)",
+                layout.artifact_dir,
+                signature,
+            )
+            meta = _build_meta_from_snapshot(snapshot, layout, signature)
+            patch_plan = None
+            if not meta.covered.get("model_class", True):
+                patch_plan = PatchEmissionPlan()
+            files = emit_bundle(
+                layout,
+                meta,
+                patch_plan=patch_plan,
+                snapshot=snapshot,
+            )
+            write_bundle_atomic(layout, files, meta)
+        return layout
+    except Exception as exc:
+        publish_artifact_failure(layout, signature, str(exc) or type(exc).__name__)
+        raise
+    finally:
+        barrier_after_artifact()
+        clear_artifact_failure(layout, signature)
 
 
 def _build_meta_from_snapshot(
@@ -340,6 +364,14 @@ def wait_for_rank0_artifact(
 
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
+        failure_path = artifact_failure_path(layout, current_signature)
+        if os.path.isfile(failure_path):
+            with open(failure_path, "r", encoding="utf-8") as handle:
+                reason = handle.read().strip()
+            raise RuntimeError(
+                "codegen: rank0 artifact generation failed"
+                + (f": {reason}" if reason else "")
+            )
         meta = load_codegen_meta(layout.meta_path)
         if meta is not None and meta.signature == current_signature:
             return

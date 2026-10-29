@@ -47,9 +47,8 @@ class CroppedQwen3MoeOptions:
             mutation escape hatch, forwarded to the build pipeline.
         model_init_dtype: Trainer-injected parameter initialization dtype.
         activation_swap: Activation swap mode.
-        codegen: Select the codegen ``gen`` backend for this build.
-        codegen_config: Trainer config carrying the codegen settings; forwarded
-            so the artifact bundle can be prepared from the config identity.
+        codegen: Publish a codegen sidecar from the completed native build.
+        codegen_config: Trainer config carrying the sidecar output settings.
     """
 
     num_hidden_layers: int = 4
