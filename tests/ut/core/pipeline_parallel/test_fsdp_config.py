@@ -226,6 +226,165 @@ def test_fsdp_reduce_grad_launches_after_overlap_b_f_on_caller() -> None:
     card_mark="onecard",
     essential_mark="essential",
 )
+def test_fsdp_reduce_grad_defers_past_final_bwd_send() -> None:
+    """A trailing final grad send should launch before the HSDP collectives."""
+    last_micro = 3
+    actions = [
+        scheduler_module.MetaStep(last_micro, scheduler_module.MetaStepType.BWD, 8),
+        scheduler_module.MetaStep(last_micro, scheduler_module.MetaStepType.BWD_SEND, 8),
+        scheduler_module.MetaStep(last_micro, scheduler_module.MetaStepType.BWD, 0),
+    ]
+
+    result = scheduler_module.add_fsdp_reduce_grad(
+        actions,
+        managed_stage_indices={0, 8},
+        micro_batch_num=last_micro + 1,
+    )
+
+    assert [
+        None if step is None else step.type
+        for step in result
+    ] == [
+        scheduler_module.MetaStepType.BWD,
+        scheduler_module.MetaStepType.BWD_SEND,
+        scheduler_module.MetaStepType.FSDP_REDUCE_GRAD,
+        scheduler_module.MetaStepType.BWD,
+        scheduler_module.MetaStepType.FSDP_REDUCE_GRAD,
+        scheduler_module.MetaStepType.FSDP_WAIT_REDUCE_GRAD,
+    ]
+    assert [
+        None if step is None else step.stage_index
+        for step in result
+    ] == [8, 8, 8, 0, 0, 0]
+
+
+@arg_mark(
+    plat_marks=["cpu_linux"],
+    level_mark="level0",
+    card_mark="onecard",
+    essential_mark="essential",
+)
+def test_fsdp_reduce_grad_after_send_composes_with_unshard_reshard() -> None:
+    """A deferred launch must not run after the eviction reshard sharded the stage.
+
+    add_fsdp_unshard_reshard evicts a finished stage right before its final
+    BWD_SEND, so the annotated cooldown tail is BWD -> FSDP_RESHARD ->
+    BWD_SEND. Deferring the reduce past the send has to replay that reshard
+    after the FSDP_REDUCE_GRAD: the launch issues reduce-scatter from the
+    unsharded parameters and would otherwise hit sharded ones.
+    """
+    micro_batch_num = 8
+    last_micro = micro_batch_num - 1
+    rank = 1
+    schedule = object.__new__(scheduler_module.Schedule1F1B)
+    # pylint: disable=protected-access
+    schedule.real_stage_num = 6
+    schedule._stage_num = 6
+    schedule.n_local_stages = 1
+    schedule.micro_batch_num = micro_batch_num
+    schedule._overlap_b_f = True
+    schedule._enable_dxdw_split = False
+    schedule.exec_order = {}
+    scheduler_module.Schedule1F1B.construct_exec_order(schedule)
+
+    managed = {rank}
+    annotated = scheduler_module.add_fsdp_unshard_reshard(
+        list(schedule.exec_order[rank]), managed
+    )
+    # The eviction precondition this test guards: a stage reshard sits between
+    # the final backward and its trailing send.
+    tail_types = [step.type for step in annotated if step is not None]
+    assert tail_types[-3:] == [
+        scheduler_module.MetaStepType.BWD,
+        scheduler_module.MetaStepType.FSDP_RESHARD,
+        scheduler_module.MetaStepType.BWD_SEND,
+    ]
+
+    result = scheduler_module.add_fsdp_reduce_grad(annotated, managed, micro_batch_num)
+
+    def positions(step_type, stage_index=rank, micro_index=last_micro):
+        return [
+            index
+            for index, step in enumerate(result)
+            if step is not None
+            and step.type == step_type
+            and step.stage_index == stage_index
+            and step.micro_index == micro_index
+        ]
+
+    final_bwd = max(positions(scheduler_module.MetaStepType.BWD))
+    final_send = max(positions(scheduler_module.MetaStepType.BWD_SEND))
+    reduce_grad = [
+        index
+        for index, step in enumerate(result)
+        if step is not None
+        and step.type == scheduler_module.MetaStepType.FSDP_REDUCE_GRAD
+        and step.stage_index == rank
+    ][0]
+    reshard_after_reduce = [
+        index
+        for index, step in enumerate(result)
+        if step is not None
+        and step.type == scheduler_module.MetaStepType.FSDP_RESHARD
+        and step.stage_index == rank
+        and index > reduce_grad
+    ]
+
+    assert final_bwd < final_send < reduce_grad
+    # No stage reshard between the final backward and the launch — the launch
+    # must still find the parameters unsharded.
+    assert not [
+        index
+        for index, step in enumerate(result)
+        if step is not None
+        and step.type == scheduler_module.MetaStepType.FSDP_RESHARD
+        and step.stage_index == rank
+        and final_bwd < index < reduce_grad
+    ]
+    # The evicted reshard is replayed right after the launch (idempotent
+    # no-op once the launch's post-backward reshard ran).
+    assert reshard_after_reduce == [reduce_grad + 1]
+
+
+@arg_mark(
+    plat_marks=["cpu_linux"],
+    level_mark="level0",
+    card_mark="onecard",
+    essential_mark="essential",
+)
+def test_fsdp_reduce_grad_dxdw_send_before_weight_keeps_after_weight() -> None:
+    """A dxdw-split send ahead of BWD_WEIGHT must not lose or hoist its reduce."""
+    last_micro = 3
+    actions = [
+        scheduler_module.MetaStep(last_micro, scheduler_module.MetaStepType.BWD_INPUT, 8),
+        scheduler_module.MetaStep(last_micro, scheduler_module.MetaStepType.BWD_SEND, 8),
+        scheduler_module.MetaStep(last_micro, scheduler_module.MetaStepType.BWD_WEIGHT, 8),
+    ]
+
+    result = scheduler_module.add_fsdp_reduce_grad(
+        actions,
+        managed_stage_indices={8},
+        micro_batch_num=last_micro + 1,
+    )
+
+    assert [
+        None if step is None else step.type
+        for step in result
+    ] == [
+        scheduler_module.MetaStepType.BWD_INPUT,
+        scheduler_module.MetaStepType.BWD_SEND,
+        scheduler_module.MetaStepType.BWD_WEIGHT,
+        scheduler_module.MetaStepType.FSDP_REDUCE_GRAD,
+        scheduler_module.MetaStepType.FSDP_WAIT_REDUCE_GRAD,
+    ]
+
+
+@arg_mark(
+    plat_marks=["cpu_linux"],
+    level_mark="level0",
+    card_mark="onecard",
+    essential_mark="essential",
+)
 def test_fsdp_control_handlers_launch_and_wait_on_caller_thread() -> None:
     """FSDP control actions should launch and drain backend work."""
     stage = SimpleNamespace(
