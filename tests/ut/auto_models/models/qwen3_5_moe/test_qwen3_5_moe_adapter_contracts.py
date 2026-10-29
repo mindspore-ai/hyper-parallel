@@ -14,14 +14,10 @@
 # ============================================================================
 """CPU contracts for the Qwen3.5-MoE adapter used by Qwen3.6."""
 
-import os
 import unittest
 from unittest.mock import patch
 
 import torch
-
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
-os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 
 from hyper_parallel.models.registry import get_model_adapter
 from hyper_parallel.models.qwen3_5_moe.adapter.distributed import expert_parallel

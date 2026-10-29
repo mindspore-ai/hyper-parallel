@@ -15,7 +15,7 @@
 """Scan JSONL with a local tokenizer; render templates and exercise training masks.
 
 Run from an editable HyperParallel installation, without torchrun or model weights:
-    python -m examples.qwen3_8.tools.validate_chat_templates \
+    python examples/qwen3_8/tools/validate_chat_templates.py \
         --data-path /path/to/data.jsonl --tokenizer-path /path/to/model \
         --tools-key tools --max-seq-len 4096 --output-dir outputs/template_check
 

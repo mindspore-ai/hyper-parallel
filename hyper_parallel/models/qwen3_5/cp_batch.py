@@ -37,7 +37,7 @@ class GDNCPDataCollator:
             raise ValueError("cp_size and chunk_size must be positive")
         if tp_size != 1:
             raise NotImplementedError("The GDN P2P batch path currently requires tp_size=1")
-        self.collator = TextPackingCollator(sequence_parallel_size=cp_size * chunk_size)
+        self.collator = TextPackingCollator(alignment_size=cp_size * chunk_size)
 
     def __call__(self, model_samples: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
         """Collate exactly one nonempty conversation, including its ignored tail."""
