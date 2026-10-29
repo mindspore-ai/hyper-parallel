@@ -28,6 +28,7 @@ import os
 from typing import Any
 
 from hyper_parallel.codegen.hash import sha256_file
+from hyper_parallel.codegen.snapshot import CodegenStatus
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +123,41 @@ def verify_meta_required_fields(meta: Any) -> None:
     from hyper_parallel.codegen.meta import validate_meta_schema
 
     validate_meta_schema(meta_to_dict(meta))
+
+
+def verify_snapshot_contract(meta: Any) -> None:
+    """Validate snapshot provenance when an artifact declares it.
+
+    Legacy artifacts carry neither snapshot field and remain valid during the
+    staged migration. Snapshot-driven artifacts must identify both their
+    schema and terminal status, and only a fully derived snapshot may own a
+    generated sharding plan.
+
+    Args:
+        meta: Loaded codegen metadata.
+
+    Raises:
+        RuntimeError: If snapshot provenance is partial or not derived.
+    """
+    schema_version = getattr(meta, "snapshot_schema_version", None)
+    status = getattr(meta, "snapshot_status", None)
+    if schema_version is None and status is None:
+        return
+    if schema_version is None or status is None:
+        raise RuntimeError(
+            "codegen preflight: snapshot provenance must include both "
+            "snapshot_schema_version and snapshot_status"
+        )
+    if status != CodegenStatus.DERIVED.value:
+        raise RuntimeError(
+            "codegen preflight: generated artifact requires a derived snapshot, "
+            f"got {status!r}"
+        )
+    if not getattr(meta, "plan_application", None):
+        raise RuntimeError(
+            "codegen preflight: derived snapshot artifact is missing the native "
+            "plan application record"
+        )
 
 
 def warn_skipped_overrides(meta: Any) -> None:
@@ -451,5 +487,6 @@ __all__ = [
     "verify_output_hashes",
     "verify_param_plan",
     "verify_signature",
+    "verify_snapshot_contract",
     "warn_skipped_overrides",
 ]

@@ -319,7 +319,17 @@ def _plan_and_apply_sharding(
         loss_parallel=mesh.loss_parallel,
     )
     if codegen_session is not None:
-        codegen_session.record_plan(freeze_plan(plan, model).to_dict())
+        frozen_plan = freeze_plan(plan, model).to_dict()
+        frozen_plan["parallel_dims"] = {
+            "dp_size": getattr(mesh, "dp_size", 1),
+            "tp_size": mesh.tp_size,
+            "cp_size": mesh.cp_size,
+            "pp_size": getattr(mesh, "pp_size", 1),
+            "ep_size": mesh.ep_size,
+            "sequence_parallel": mesh.sequence_parallel,
+            "loss_parallel": mesh.loss_parallel,
+        }
+        codegen_session.record_plan(frozen_plan)
     model, source_shard_info = apply_sharding_plan(
         model,
         plan,

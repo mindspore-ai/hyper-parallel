@@ -95,6 +95,9 @@ class CodegenMeta:
     #: until the snapshot-driven manager is enabled.
     snapshot_schema_version: Optional[int] = None
     snapshot_status: Optional[str] = None
+    snapshot_reason: Optional[str] = None
+    snapshot_failure: Optional[dict[str, Any]] = None
+    plan_application: dict[str, Any] = field(default_factory=dict)
 
 
 #: Stages the generated artifact declares it covers.  ``sharding_plan`` starts
@@ -125,9 +128,16 @@ NOT_COVERED_DEFAULT = [
 def meta_to_dict(meta: CodegenMeta) -> dict[str, Any]:
     """Serialize a CodegenMeta to a JSON-friendly dict."""
     data = asdict(meta)
-    for key in ("snapshot_schema_version", "snapshot_status"):
+    for key in (
+        "snapshot_schema_version",
+        "snapshot_status",
+        "snapshot_reason",
+        "snapshot_failure",
+    ):
         if data[key] is None:
             data.pop(key)
+    if not data["plan_application"]:
+        data.pop("plan_application")
     return data
 
 
@@ -180,6 +190,12 @@ def validate_meta_schema(data: dict[str, Any]) -> None:
             raise TypeError(
                 "codegen_meta field 'snapshot_status' must be a known codegen status"
             ) from exc
+    if "snapshot_reason" in data and not isinstance(data["snapshot_reason"], str):
+        raise TypeError("codegen_meta field 'snapshot_reason' must be a string")
+    if "snapshot_failure" in data and not isinstance(data["snapshot_failure"], dict):
+        raise TypeError("codegen_meta field 'snapshot_failure' must be a dict")
+    if "plan_application" in data and not isinstance(data["plan_application"], dict):
+        raise TypeError("codegen_meta field 'plan_application' must be a dict")
     if "entrypoints" in data:
         entrypoints = data["entrypoints"]
         if not isinstance(entrypoints, dict) or not all(

@@ -24,8 +24,31 @@ from hyper_parallel.codegen.artifact import (
     resolve_artifact_layout,
     resolve_default_artifact_layout,
 )
+from hyper_parallel.codegen.hash import signature_from_snapshot
+from hyper_parallel.codegen.snapshot import CodegenSnapshot
 
 logger = logging.getLogger(__name__)
+
+
+def verify_snapshot_drift(meta: Any, snapshot: CodegenSnapshot) -> None:
+    """Reject a bundle whose signature differs from its immutable snapshot.
+
+    Args:
+        meta: Loaded codegen metadata.
+        snapshot: Native-build snapshot used as the current source of truth.
+
+    Raises:
+        TypeError: If ``snapshot`` is not a :class:`CodegenSnapshot`.
+        RuntimeError: If the artifact was generated from another snapshot.
+    """
+    if not isinstance(snapshot, CodegenSnapshot):
+        raise TypeError("snapshot must be a CodegenSnapshot")
+    current_signature = signature_from_snapshot(snapshot)
+    if meta.signature != current_signature:
+        raise RuntimeError(
+            "codegen drift: snapshot signature mismatch "
+            f"(stored {meta.signature}, current {current_signature}); regenerate"
+        )
 
 
 def verify_drift_intact(
@@ -76,4 +99,5 @@ def _model_name(meta: Any) -> Optional[str]:
 
 __all__ = [
     "verify_drift_intact",
+    "verify_snapshot_drift",
 ]
