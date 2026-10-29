@@ -30,3 +30,15 @@ def test_rank0_generation_failure_releases_non_owner():
     """Rank 0 failure must release the waiting peer without a long timeout."""
     worker = str(Path(__file__).with_name("_test_snapshot_failure_coordination.py"))
     torchrun_case(worker, "test_rank0_generation_failure_releases_non_owner", num_proc=2)
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level1",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+def test_snapshot_signature_mismatch_fails_all_ranks_fast():
+    """Rank-local snapshot drift must fail before artifact polling begins."""
+    worker = str(Path(__file__).with_name("_test_snapshot_failure_coordination.py"))
+    torchrun_case(worker, "test_snapshot_signature_mismatch_fails_all_ranks_fast", num_proc=2)

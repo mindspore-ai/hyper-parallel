@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+import time
 
 import torch.distributed as dist
 
@@ -72,6 +73,62 @@ def test_rank0_generation_failure_releases_non_owner(monkeypatch):
     assert snapshot.status is CodegenStatus.FAILED, (
         f"rank {rank} should observe failed sidecar publication, got={snapshot.status}"
     )
+    dist.barrier()
+    if rank == 0:
+        shutil.rmtree(shared_root)
+    dist.destroy_process_group()
+
+
+def test_snapshot_signature_mismatch_fails_all_ranks_fast():
+    """Every rank must reject rank-local snapshot identity before polling."""
+    dist.init_process_group("gloo")
+    rank = dist.get_rank()
+    shared_root = Path(tempfile.gettempdir()) / (
+        f"hp_codegen_signature_mismatch_{os.environ['MASTER_PORT']}"
+    )
+    source = shared_root / "modeling_toy.py"
+    artifact_dir = shared_root / "generated"
+    if rank == 0:
+        shared_root.mkdir(parents=True, exist_ok=True)
+        source.write_text("class ToyModel:\n    pass\n", encoding="utf-8")
+    dist.barrier()
+
+    session = CodegenBuildSession()
+    session.record_source({
+        "model_type": "toy",
+        "architecture": "ToyModel",
+        "file_path": str(source),
+        "is_hf_model": True,
+    })
+    session.record_replacements()
+    session.record_plan({
+        "param_plan": {"block": {"params": {}}},
+        "parallel_dims": {"tp_size": rank + 1},
+    })
+    session.record_plan_application({"applied_boundaries": ["block"]})
+
+    started_at = time.monotonic()
+    snapshot = session.finish(
+        lambda derived: manager.ensure_codegen_artifact_from_snapshot(
+            derived,
+            str(artifact_dir),
+            timeout_s=10.0,
+        )
+    )
+    elapsed = time.monotonic() - started_at
+
+    assert snapshot.status is CodegenStatus.FAILED, (
+        f"rank {rank} should reject signature drift: "
+        f"expected={CodegenStatus.FAILED}, got={snapshot.status}"
+    )
+    assert "snapshot signature mismatch across ranks" in snapshot.failure.reason, (
+        f"rank {rank} failure reason mismatch: "
+        f"expected=signature mismatch, got={snapshot.failure.reason!r}"
+    )
+    assert elapsed < 5.0, (
+        f"rank {rank} signature mismatch was not fail-fast: expected<5.0s, got={elapsed:.3f}s"
+    )
+
     dist.barrier()
     if rank == 0:
         shutil.rmtree(shared_root)

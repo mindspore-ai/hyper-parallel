@@ -97,6 +97,7 @@ class CodegenMeta:
     snapshot_status: Optional[str] = None
     snapshot_reason: Optional[str] = None
     snapshot_failure: Optional[dict[str, Any]] = None
+    snapshot_replacements: dict[str, Any] = field(default_factory=dict)
     plan_application: dict[str, Any] = field(default_factory=dict)
 
 
@@ -196,6 +197,10 @@ def validate_meta_schema(data: dict[str, Any]) -> None:
         raise TypeError("codegen_meta field 'snapshot_failure' must be a dict")
     if "plan_application" in data and not isinstance(data["plan_application"], dict):
         raise TypeError("codegen_meta field 'plan_application' must be a dict")
+    if "snapshot_replacements" in data and not isinstance(
+        data["snapshot_replacements"], dict
+    ):
+        raise TypeError("codegen_meta field 'snapshot_replacements' must be a dict")
     if "entrypoints" in data:
         entrypoints = data["entrypoints"]
         if not isinstance(entrypoints, dict) or not all(
@@ -238,6 +243,63 @@ def validate_meta_schema(data: dict[str, Any]) -> None:
             raise TypeError(
                 "codegen_meta field 'external_state_classes' must be a list[str]"
             )
+    validate_snapshot_state_contract(data)
+
+
+def validate_snapshot_state_contract(data: dict[str, Any]) -> None:
+    """Validate state-specific fields for snapshot-backed metadata."""
+    version = data.get("snapshot_schema_version")
+    status = data.get("snapshot_status")
+    if version is None and status is None:
+        return
+    if version is None or status is None:
+        raise ValueError(
+            "snapshot metadata must include snapshot_schema_version and snapshot_status"
+        )
+
+    plan_fields = (
+        "param_plan",
+        "injections",
+        "frozen_sharded_params",
+        "tied_pairs",
+        "special_handlers",
+        "boundary_classes",
+        "mesh_dim_names",
+    )
+    has_plan_data = any(data.get(name) for name in plan_fields)
+    plan_application = data.get("plan_application") or {}
+    covered = data.get("covered") or {}
+    parallelize = (data.get("entrypoints") or {}).get("parallelize")
+
+    if status == CodegenStatus.DERIVED.value:
+        if not data.get("param_plan") or not plan_application:
+            raise ValueError(
+                "derived snapshot metadata requires a non-empty param_plan and plan_application"
+            )
+        if covered.get("sharding_plan") is not True or not parallelize:
+            raise ValueError(
+                "derived snapshot metadata must own sharding_plan and parallelize"
+            )
+        return
+    if status == CodegenStatus.NOT_REQUIRED.value:
+        if not data.get("snapshot_reason"):
+            raise ValueError("not_required snapshot metadata requires snapshot_reason")
+        if has_plan_data or plan_application:
+            raise ValueError("not_required snapshot metadata must not contain plan data")
+        if covered.get("sharding_plan") is not False or parallelize:
+            raise ValueError(
+                "not_required snapshot metadata must not own sharding_plan or parallelize"
+            )
+        return
+    if status == CodegenStatus.FAILED.value:
+        if not data.get("snapshot_failure"):
+            raise ValueError("failed snapshot metadata requires snapshot_failure")
+        if has_plan_data or plan_application or parallelize:
+            raise ValueError("failed snapshot metadata must not contain executable plan data")
+        return
+    raise ValueError(
+        f"snapshot metadata status {status!r} is not publishable"
+    )
 
 
 def record_output_hashes(
@@ -287,6 +349,7 @@ __all__ = [
     "meta_from_dict",
     "meta_to_dict",
     "record_output_hashes",
+    "validate_snapshot_state_contract",
     "validate_meta_schema",
     "write_codegen_meta",
 ]

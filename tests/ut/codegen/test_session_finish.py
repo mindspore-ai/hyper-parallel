@@ -70,8 +70,8 @@ def test_finish_isolates_generation_failure():
     )
 
 
-def test_finish_does_not_publish_not_required_snapshot():
-    """A native guard result seals without invoking the publisher."""
+def test_finish_publishes_not_required_snapshot_without_changing_status():
+    """A native guard result publishes audit data and preserves its status."""
     session = CodegenBuildSession()
     session.record_source({"model_type": "toy"})
     session.record_replacements()
@@ -83,4 +83,7 @@ def test_finish_does_not_publish_not_required_snapshot():
     assert snapshot.status is CodegenStatus.NOT_REQUIRED, (
         f"not-required status should be preserved, got={snapshot.status}"
     )
-    assert published == [], f"not-required session must not publish, got={published}"
+    assert published == [snapshot], (
+        f"not-required session should publish its audit snapshot: "
+        f"expected={[snapshot]}, got={published}"
+    )

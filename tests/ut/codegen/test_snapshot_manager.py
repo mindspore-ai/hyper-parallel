@@ -172,6 +172,33 @@ def test_snapshot_manager_reuses_matching_signature(monkeypatch, tmp_path):
     assert calls == {"barrier": 1}
 
 
+def test_snapshot_signature_validation_rejects_rank_mismatch(monkeypatch):
+    monkeypatch.setattr(manager.dist, "is_available", lambda: True)
+    monkeypatch.setattr(manager.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(manager.dist, "get_world_size", lambda: 3)
+
+    def gather(signatures, _signature):
+        signatures[:] = ["rank-zero", "rank-one", "rank-zero"]
+
+    monkeypatch.setattr(manager.dist, "all_gather_object", gather)
+
+    with pytest.raises(RuntimeError, match="snapshot signature mismatch across ranks"):
+        manager.validate_snapshot_signature("rank-zero")
+
+
+def test_artifact_barrier_propagates_collective_failure(monkeypatch):
+    monkeypatch.setattr(manager.dist, "is_available", lambda: True)
+    monkeypatch.setattr(manager.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        manager.dist,
+        "barrier",
+        lambda: (_ for _ in ()).throw(RuntimeError("injected barrier failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="injected barrier failure"):
+        manager.barrier_after_artifact()
+
+
 def test_snapshot_manager_maps_observed_replacement_without_rematching(
     monkeypatch,
     tmp_path,
@@ -213,17 +240,53 @@ def test_snapshot_manager_maps_observed_replacement_without_rematching(
     }]
 
 
-def test_snapshot_manager_rejects_not_required_snapshot(tmp_path):
+def test_snapshot_manager_emits_not_required_audit_bundle(monkeypatch, tmp_path):
     session = CodegenBuildSession()
     session.record_source({"file_path": str(tmp_path / "modeling.py")})
-    session.record_replacements()
+    session.record_replacements(
+        declarations=[{
+            "rule_id": "replace:0",
+            "match": ["block"],
+            "source_type": "tests.toy:Block",
+            "replacement_target": "tests.toy:replace_block",
+            "exact_type": True,
+            "static_arguments": {},
+        }],
+    )
     session.mark_not_required("pure_data_parallel")
 
-    with pytest.raises(ValueError, match="requires status 'derived'"):
-        manager.ensure_codegen_artifact_from_snapshot(
-            session.finish(),
-            str(tmp_path / "artifact"),
-        )
+    monkeypatch.setattr(manager, "_is_rank0", lambda: True)
+    monkeypatch.setattr(manager, "barrier_after_artifact", lambda: None)
+
+    layout = manager.ensure_codegen_artifact_from_snapshot(
+        session.finish(),
+        str(tmp_path / "artifact"),
+    )
+    meta = manager.load_codegen_meta(layout.meta_path)
+
+    assert meta.snapshot_status == "not_required"
+    assert meta.snapshot_reason == "pure_data_parallel"
+    assert meta.param_plan == {}
+    assert meta.entrypoints == {}
+    assert meta.covered["sharding_plan"] is False
+    assert meta.snapshot_replacements == {
+        "declarations": [{
+            "rule_id": "replace:0",
+            "match": ["block"],
+            "source_type": "tests.toy:Block",
+            "replacement_target": "tests.toy:replace_block",
+            "exact_type": True,
+            "static_arguments": {},
+        }],
+        "applications": [],
+        "unmatched": [],
+    }
+    assert set(meta.outputs) == {"init"}
+    verify_snapshot_contract(meta)
+    assert sorted(path.name for path in tmp_path.joinpath("artifact").iterdir()) == [
+        "__init__.py",
+        "codegen_meta.json",
+    ]
 
 
 def test_snapshot_contract_accepts_legacy_and_complete_snapshot_meta():

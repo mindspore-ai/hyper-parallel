@@ -28,6 +28,8 @@ import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
+import torch.distributed as dist
+
 from hyper_parallel.codegen.artifact import (
     ArtifactLayout,
     artifact_failure_path,
@@ -161,9 +163,9 @@ def ensure_codegen_artifact_from_snapshot(
     """
     if not isinstance(snapshot, CodegenSnapshot):
         raise TypeError("snapshot must be a CodegenSnapshot")
-    if snapshot.status is not CodegenStatus.DERIVED:
+    if snapshot.status not in (CodegenStatus.DERIVED, CodegenStatus.NOT_REQUIRED):
         raise ValueError(
-            "snapshot-driven generation currently requires status 'derived', "
+            "snapshot-driven generation requires status 'derived' or 'not_required', "
             f"got {snapshot.status.value!r}"
         )
     payload = snapshot.to_dict()
@@ -187,6 +189,7 @@ def ensure_codegen_artifact_from_snapshot(
         clean_temp_artifacts(layout)
 
     signature = signature_from_snapshot(snapshot)
+    validate_snapshot_signature(signature)
     existing = load_codegen_meta(layout.meta_path)
     if existing is not None and not should_regenerate(existing, signature):
         if is_rank0:
@@ -242,15 +245,19 @@ def _build_meta_from_snapshot(
     """Map immutable snapshot fields into the existing emitter metadata."""
     payload = snapshot.to_dict()
     source = dict(payload["source"])
+    status = snapshot.status
     frozen_plan = dict(payload["plan"] or {})
     application = dict(payload["plan_application"] or {})
     module_overrides = list(replacement_records_from_snapshot(snapshot))
     trainer_owns_model = not bool(source.get("is_hf_model", True))
     covered = dict(COVERED_DEFAULTS)
-    covered["sharding_plan"] = True
-    covered["module_overrides"] = bool(module_overrides) and not trainer_owns_model
-    covered["model_class"] = not trainer_owns_model
-    emission_patches = _snapshot_emission_patches(payload)
+    is_derived = status is CodegenStatus.DERIVED
+    covered["sharding_plan"] = is_derived
+    covered["module_overrides"] = (
+        is_derived and bool(module_overrides) and not trainer_owns_model
+    )
+    covered["model_class"] = is_derived and not trainer_owns_model
+    emission_patches = _snapshot_emission_patches(payload) if is_derived else {}
     return CodegenMeta(
         codegen_version=CODEGEN_VERSION,
         signature=signature,
@@ -267,15 +274,22 @@ def _build_meta_from_snapshot(
         special_handlers=dict(frozen_plan.get("special_handlers") or {}),
         boundary_classes=dict(frozen_plan.get("boundary_classes") or {}),
         mesh_dim_names=list(frozen_plan.get("mesh_dim_names") or ()) or None,
-        module_overrides=[] if trainer_owns_model else module_overrides,
+        module_overrides=(
+            [] if trainer_owns_model or not is_derived else module_overrides
+        ),
         emission_patches=emission_patches,
         covered=covered,
-        not_covered=list(NOT_COVERED_DEFAULT),
-        entrypoints={"parallelize": "hp_parallelize"},
+        not_covered=(
+            list(NOT_COVERED_DEFAULT)
+            if is_derived
+            else [*NOT_COVERED_DEFAULT, "sharding_plan", "module_overrides", "model_class"]
+        ),
+        entrypoints={"parallelize": "hp_parallelize"} if is_derived else {},
         snapshot_schema_version=payload["schema_version"],
         snapshot_status=payload["status"],
         snapshot_reason=payload.get("reason"),
         snapshot_failure=payload.get("failure"),
+        snapshot_replacements=dict(payload["replacements"]),
         plan_application=application,
     )
 
@@ -404,6 +418,8 @@ def preflight_integrity_check(
     signature = _compute_signature(config, layout, hf_config=hf_config)
     verify_signature(meta, signature)
     verify_output_hashes(meta, layout)
+    if meta.snapshot_status == CodegenStatus.NOT_REQUIRED.value:
+        return
     verify_generated_import(layout)
     verify_boundary_forms(meta, layout)
     verify_param_plan(meta, model=None)
@@ -471,13 +487,35 @@ def barrier_after_artifact() -> None:
     ``trainer._setup`` before the codegen manager runs); a no-op without a
     live process group.
     """
-    try:
-        import torch.distributed as dist
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
 
-        if dist.is_initialized():
-            dist.barrier()
-    except Exception:  # pragma: no cover - best-effort without a process group
-        pass
+
+def validate_snapshot_signature(signature: str) -> None:
+    """Fail every rank together when snapshot artifact identities diverge.
+
+    File polling cannot coordinate rank-local signatures: each non-owner would
+    otherwise wait for an artifact rank 0 can never publish under its identity.
+    The collective runs only for snapshot sidecar generation and completes
+    before any rank enters artifact reuse, generation, or polling.
+
+    Args:
+        signature: This rank's canonical snapshot signature.
+
+    Raises:
+        RuntimeError: If initialized ranks computed different signatures.
+    """
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    signatures: list[Optional[str]] = [None] * dist.get_world_size()
+    dist.all_gather_object(signatures, signature)
+    if any(item != signatures[0] for item in signatures[1:]):
+        raise RuntimeError(
+            "codegen: snapshot signature mismatch across ranks: "
+            + ", ".join(
+                f"rank{rank}={item}" for rank, item in enumerate(signatures)
+            )
+        )
 
 
 # ---------------------------------------------------------------------------

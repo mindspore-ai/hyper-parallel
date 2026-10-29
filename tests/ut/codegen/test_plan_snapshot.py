@@ -23,7 +23,7 @@ import torch
 from torch import nn
 
 from hyper_parallel.codegen.modeling_backend import ModelingBackend
-from hyper_parallel.codegen.plan.freeze import freeze_plan_application
+from hyper_parallel.codegen.plan.freeze import freeze_plan, freeze_plan_application
 from hyper_parallel.codegen.session import CodegenBuildSession
 from hyper_parallel.codegen.snapshot import CodegenStatus
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
@@ -147,6 +147,34 @@ def test_plan_application_freezes_source_mesh_without_runtime_objects():
     }
 
 
+def test_frozen_injections_are_stable_across_module_insertion_order():
+    specs = {
+        "block.0": SimpleNamespace(local_compute_fn={"_target_": "example.compute_zero"}),
+        "block.1": SimpleNamespace(local_compute_fn={"_target_": "example.compute_one"}),
+    }
+    forward_plan = SimpleNamespace(
+        modules=dict(specs.items()),
+        tied_pairs=[],
+        special_handlers={},
+        mesh_dim_names=("ep",),
+    )
+    reverse_plan = SimpleNamespace(
+        modules=dict(reversed(specs.items())),
+        tied_pairs=[],
+        special_handlers={},
+        mesh_dim_names=("ep",),
+    )
+
+    forward_frozen = freeze_plan(forward_plan, model=None).to_dict()
+    reverse_frozen = freeze_plan(reverse_plan, model=None).to_dict()
+    forward_application = freeze_plan_application(forward_plan, None, validate_mode=False)
+    reverse_application = freeze_plan_application(reverse_plan, None, validate_mode=False)
+
+    assert forward_frozen == reverse_frozen
+    assert forward_application == reverse_application
+    assert [item["match"] for item in forward_frozen["injections"]] == ["block.0", "block.1"]
+
+
 def test_native_auto_build_attaches_finished_snapshot(monkeypatch):
     model = nn.Module()
     config = SimpleNamespace(model_type="toy", architectures=["ToyModel"])
@@ -211,7 +239,10 @@ def test_native_auto_build_does_not_collect_without_explicit_session(monkeypatch
         "is_initialized",
         lambda: False,
     )
-    infrastructure = lambda built_model, **kwargs: built_model
+    def infrastructure(built_model, **kwargs):
+        del kwargs
+        return built_model
+
     monkeypatch.setattr(auto_model, "apply_model_infrastructure", infrastructure)
 
     result = auto_model._BaseHyperAutoModelClass._build_model(
