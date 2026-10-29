@@ -62,6 +62,7 @@ from hyper_parallel.codegen.patch_plan import PatchEmissionPlan
 from hyper_parallel.codegen.snapshot import CodegenSnapshot, CodegenStatus
 from hyper_parallel.distributed._builder.applier import _apply_phase_c
 from hyper_parallel.distributed.recipe_spec import _normalize_out_fields
+from hyper_parallel.models.registry import family_dir_for_model_type
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +173,7 @@ def ensure_codegen_artifact_from_snapshot(
     model_name = source.get("architecture") or source.get("model_type")
     if artifact_dir is None and source.get("model_type"):
         layout = resolve_model_artifact_layout(
-            str(source["model_type"]),
+            family_dir_for_model_type(str(source["model_type"])),
             model_name=str(model_name) if model_name else None,
         )
     else:
@@ -249,19 +250,7 @@ def _build_meta_from_snapshot(
     covered["sharding_plan"] = True
     covered["module_overrides"] = bool(module_overrides) and not trainer_owns_model
     covered["model_class"] = not trainer_owns_model
-    applications = payload["replacements"]["applications"]
-    emission_patches = {
-        "module_replacements": [
-            {
-                "module_fqn": item["primary_fqn"],
-                "source_type": item["source_type"],
-                "replacement_type": item["replacement_type"],
-            }
-            for item in applications
-        ],
-        "local_computes": [],
-        "inner_wrappers": [],
-    }
+    emission_patches = _snapshot_emission_patches(payload)
     return CodegenMeta(
         codegen_version=CODEGEN_VERSION,
         signature=signature,
@@ -289,6 +278,88 @@ def _build_meta_from_snapshot(
         snapshot_failure=payload.get("failure"),
         plan_application=application,
     )
+
+
+def _snapshot_emission_patches(payload: dict[str, Any]) -> dict[str, Any]:
+    """Translate resolved native observations into the legacy emitter DTO."""
+    applications = payload["replacements"]["applications"]
+    replacements = [
+        {
+            "module_fqn": item["primary_fqn"],
+            "source_type": item["source_type"],
+            "replacement_type": item["replacement_type"],
+        }
+        for item in applications
+    ]
+    replacement_types = {
+        module_fqn: item["replacement_type"]
+        for item in applications
+        for module_fqn in item.get("module_fqns", (item["primary_fqn"],))
+    }
+    source = payload["source"]
+    plan = payload.get("plan") or {}
+    application = payload.get("plan_application") or {}
+    injections = application.get("resolved_injections") or plan.get("injections") or ()
+    boundary_classes = plan.get("boundary_classes") or {}
+    param_plan = plan.get("param_plan") or {}
+    module_name = source.get("module_name")
+    local_computes = []
+    inner_wrappers = []
+    for injection in injections:
+        module_fqn = injection.get("match")
+        class_name = boundary_classes.get(module_fqn)
+        module_type = (
+            f"{module_name}:{class_name}" if module_name and class_name else None
+        )
+        local_compute = injection.get("local_compute_fn")
+        if local_compute is not None:
+            if module_type is None:
+                raise ValueError(
+                    "snapshot local_compute_fn requires a source module and "
+                    f"boundary class for {module_fqn!r}"
+                )
+            local_computes.append({
+                "module_fqn": module_fqn,
+                "module_type": module_type,
+                "factory": _snapshot_target_path(local_compute),
+                "region_dispatch": (param_plan.get(module_fqn) or {}).get(
+                    "region_dispatch"
+                ),
+                "original_forward": f"{module_type}.forward",
+            })
+        inner_wrapper = injection.get("inner_wrapper")
+        if inner_wrapper is not None:
+            target_type = replacement_types.get(module_fqn) or module_type
+            if target_type is None:
+                raise ValueError(
+                    "snapshot inner_wrapper requires an observed replacement or "
+                    f"boundary class for {module_fqn!r}"
+                )
+            inner_wrappers.append({
+                "module_fqn": module_fqn,
+                "target_fqn": injection.get("inner_target") or "self",
+                "wrapper": _snapshot_target_path(inner_wrapper),
+                "target_type": target_type,
+            })
+    return {
+        "module_replacements": replacements,
+        "local_computes": local_computes,
+        "inner_wrappers": inner_wrappers,
+    }
+
+
+def _snapshot_target_path(target: Any) -> str:
+    """Return an importable ``module:qualname`` from a frozen Target value."""
+    if isinstance(target, dict):
+        target = target.get("_target_") or target.get("target")
+    if not isinstance(target, str) or not target:
+        raise ValueError(f"snapshot injection target is not importable: {target!r}")
+    if ":" in target:
+        return target
+    module_name, separator, name = target.rpartition(".")
+    if not separator or not module_name or not name:
+        raise ValueError(f"snapshot injection target is not importable: {target!r}")
+    return f"{module_name}:{name}"
 
 
 def preflight_integrity_check(
@@ -466,8 +537,6 @@ def _model_type(config: Any, hf_config: Any = None) -> Optional[str]:
     model_type = getattr(hf_config, "model_type", None)
     if not model_type:
         return None
-    from hyper_parallel.models.registry import family_dir_for_model_type
-
     return family_dir_for_model_type(str(model_type))
 
 
