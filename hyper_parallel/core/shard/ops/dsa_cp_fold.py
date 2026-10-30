@@ -21,7 +21,7 @@ An optional immutable per-microbatch pair plan replaces the fixed chunk assignme
 TND can additionally trim each KV prefix to its first active document, using host
 metadata attached once at model entry; the saved backward restores the folded layout.
 
-For sparse TND calls, global sequence-length tensors may carry two immutable host
+For TND DSA calls, global sequence-length tensors may carry two immutable host
 attributes: _hp_fold_pairs is a tuple of per-rank natural chunk-ID pairs, and
 _hp_compact_ends is a tuple of global cumulative document ends. The caller
 selects the matching Q chunks before model execution. Q/K metadata must describe
@@ -47,7 +47,6 @@ Ported from the static-graph implementation (MindFormers ``dsa_lb_stage1``,
 ``training_graph/transformer/dsa/utils.py``); the chunk convention is the same one the
 generic head-tail flash-attention load balance in ``context_parallel.py`` uses.
 """
-from bisect import bisect_left, bisect_right
 from collections import OrderedDict
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -57,6 +56,9 @@ from typing import Any, Callable, Iterator, Optional, Sequence, Tuple
 import numpy as np
 
 from hyper_parallel.platform import get_platform
+from .tnd_kv_compact import (
+    plan_tnd_kv, select_kv_intervals, restore_kv_gradients,
+)
 
 platform = get_platform()
 
@@ -255,21 +257,13 @@ def _index_tensor(values: Sequence[int], ref):
 @lru_cache(maxsize=256)
 def _compact_plan(ends, full_len, rank, shards, pairs):
     """Host-only active-document intervals and compact cumulative lengths."""
-    if (not ends or ends[-1] != full_len or any(a > b for a, b in zip((0,) + ends, ends))
-            or full_len % (2 * shards)):
-        raise ValueError("Compact TND KV requires monotonic document ends covering the folded full sequence.")
-    ends = tuple(dict.fromkeys(end for end in ends if end > 0))
+    if full_len % (2 * shards):
+        raise ValueError("Compact TND KV requires a complete folded sequence.")
     width = full_len // (2 * shards)
     chunks = pairs[rank] if pairs is not None else (2 * rank, 2 * shards - 1 - 2 * rank)
-    result = []
-    for chunk in chunks:
-        start, stop = chunk * width, (chunk + 1) * width
-        first, last = bisect_right(ends, start), bisect_left(ends, stop)
-        origin = ends[first - 1] if first else 0
-        selected = tuple(min(end, stop) for end in ends[first:last + 1])
-        result.append(((origin, stop), tuple(end - start for end in selected),
-                       tuple(end - origin for end in selected)))
-    return tuple(result)
+    queries = tuple((chunk * width, (chunk + 1) * width) for chunk in chunks)
+    return tuple((block.key_interval, block.query_ends, block.key_ends)
+                 for block in plan_tnd_kv(ends, full_len, queries))
 
 
 def _current_compact_plan(full_len, rank, shards):
@@ -278,64 +272,100 @@ def _current_compact_plan(full_len, rank, shards):
     return None if ends is None else _compact_plan(ends, full_len, rank, shards, _PAIRING.get())
 
 
-def _interval_select(x, interval, order):
-    """Gather only intersecting natural chunks, then trim the partial first chunk."""
-    start, stop = interval
-    width = x.shape[0] // len(order)
-    first, last = start // width, (stop + width - 1) // width
-    chunks = x.reshape((len(order), width) + tuple(x.shape[1:]))
-    selected = chunks.index_select(0, _index_tensor(order[first:last], x))
-    selected = selected.reshape(((last - first) * width,) + tuple(x.shape[1:]))
-    return selected.narrow(0, start - first * width, stop - start)
+def tnd_compact_enabled(*metadata: Any) -> bool:
+    """Whether explicit global document metadata requests local KV compaction."""
+    return any(getattr(value, "_hp_compact_ends", None) is not None for value in metadata)
 
 
-def _zero_tokens(ref, length):
-    """Allocate a zero token span matching the reference tensor."""
-    return platform.zeros((length,) + tuple(ref.shape[1:]), dtype=ref.dtype, device=ref.device)
+_TND_KERNEL_SCHEMAS = {
+    "indexer": ((1,), None, ("actual_seq_lengths_query", "actual_seq_lengths_key")),
+    "sfa": ((1, 2), None, ("actual_seq_lengths_query", "actual_seq_lengths_kv")),
+    "dense_lse": ((1,), (3, 4), ("actual_seq_qlen", "actual_seq_klen")),
+    "sparse_kl": ((1, 3, 10), (11, 12), ("actual_seq_qlen", "actual_seq_klen")),
+    "dense_kl": ((1, 3, 11), (12, 13), ("actual_seq_qlen", "actual_seq_klen")),
+}
+
+
+def _slice_tnd_keys(args, kwargs, slots, interval):
+    """Replace only key-side inputs, preserving query-side tensors and options."""
+    call, options = list(args), dict(kwargs)
+    for slot in slots:
+        if call[slot] is not None:
+            call[slot] = select_kv_intervals(call[slot], (interval,))[0]
+    if options.get("key_rope") is not None:
+        options["key_rope"] = select_kv_intervals(options["key_rope"], (interval,))[0]
+    return call, options
+
+
+def _rewrite_tnd_lengths(call, options, schema, block, query_interval):
+    """Restate cumulative document ends at the final local-kernel boundary."""
+    start, stop = query_interval
+    for index in (0, 1):
+        slot = schema[1][index] if schema[1] is not None and len(call) > schema[1][index] else None
+        name = schema[2][index]
+        reference = call[slot] if slot is not None else options[name]
+        if block is not None:
+            values = block.query_ends if index == 0 else block.key_ends
+            updated = _index_tensor(values, reference)
+        else:
+            updated = (reference - start).clamp(0, stop - start) if index == 0 else reference.clamp(0, stop)
+            updated = platform.tensor_type_cast(updated, 'int32')
+        if slot is not None:
+            call[slot] = updated
+        else:
+            options[name] = updated
+
+
+def _prepare_tnd_kernel_inputs(args, kwargs, rank, shards, variant, trim_documents):
+    """Build a contiguous query's causal prefix or active-document window."""
+    if variant not in _TND_KERNEL_SCHEMAS:
+        raise ValueError(f"Unknown compact TND kernel variant: {variant}.")
+    schema = _TND_KERNEL_SCHEMAS[variant]
+    if variant.endswith("kl") and (kwargs or len(args) <= schema[1][1]):
+        raise NotImplementedError("Compact TND KL currently requires the MindSpore positional kernel signature.")
+    full_len, query_len = args[1].shape[0], args[0].shape[0]
+    if not 0 <= rank < shards or query_len * shards != full_len:
+        raise ValueError("Compact TND query must be one complete contiguous shard of gathered KV.")
+    start, stop = rank * query_len, (rank + 1) * query_len
+    block = plan_tnd_kv(_COMPACT_ENDS.get(), full_len, ((start, stop),))[0] if trim_documents else None
+    # Even without document trimming, keeping a future physical tail in the
+    # final document would right-align Q against the wrong K suffix.
+    interval = block.key_interval if block is not None else (0, stop)
+    call, options = _slice_tnd_keys(args, kwargs, schema[0], interval)
+    _rewrite_tnd_lengths(call, options, schema, block, (start, stop))
+    return call, options, interval
+
+
+@_with_tensor_pairing
+def compact_tnd_call(func: Callable, rank: int, shards: int, *args: Any,
+                     variant: str, trim_documents: bool = True, **kwargs: Any) -> Any:
+    """Run one contiguous TND Q shard against its matching causal KV window.
+
+    Args:
+        func: Local kernel callable after distributed layout expansion.
+        rank: Query shard's natural sequence position.
+        shards: Number of sequence shards, excluding replicated DP dimensions.
+        args: Local kernel inputs; token axes must be leading dimensions.
+        variant: indexer, sfa, dense_lse, sparse_kl or dense_kl.
+        trim_documents: Remove inactive leading documents when True. Otherwise
+            retain the complete causal prefix, excluding the future tail.
+        kwargs: Local kernel keyword arguments.
+
+    Returns:
+        Kernel outputs; explicit KL key gradients are restored to full length.
+    """
+    call, options, interval = _prepare_tnd_kernel_inputs(args, kwargs, rank, shards, variant, trim_documents)
+    result = func(*call, **options)
+    if variant.endswith("kl"):
+        return (result[0], restore_kv_gradients((result[1],), (interval,), (0,), args[1].shape[0]),
+                result[2], result[3])
+    return result
+
 
 
 def compact_pair_grad(grad0: Any, grad1: Any, intervals: tuple, order: tuple, full_len: int) -> Any:
-    """Merge overlapping document intervals and invert the folded gather once.
-
-    Uses chunk gathers and BF16 adds, avoiding a token index_add that promotes
-    full-length gradients to FP32 on Ascend. Inputs and saved plans are immutable.
-    """
-    gradients = (grad0, grad1)
-    active = [(interval, grad) for interval, grad in zip(intervals, gradients) if grad is not None]
-    if not active:
-        return None
-    ref = active[0][1]
-    width = full_len // len(order)
-    first = min(interval[0] for interval, _ in active) // width
-    last = (max(interval[1] for interval, _ in active) + width - 1) // width
-    edges = sorted({first * width, last * width, *(edge for interval, _ in active for edge in interval)})
-    parts = []
-    for start, stop in zip(edges[:-1], edges[1:]):
-        slices = [grad.narrow(0, start - interval[0], stop - start)
-                  for interval, grad in active if interval[0] <= start and stop <= interval[1]]
-        parts.append(slices[0] + slices[1] if len(slices) == 2 else
-                     slices[0] if slices else _zero_tokens(ref, stop - start))
-    parts.append(_zero_tokens(ref, width))
-    merged = platform.cat(parts, dim=0).reshape((last - first + 1, width) + tuple(ref.shape[1:]))
-    inverse = [last - first] * len(order)
-    for chunk in range(first, last):
-        inverse[order[chunk]] = chunk - first
-    return merged.index_select(0, _index_tensor(inverse, ref)).reshape((full_len,) + tuple(ref.shape[1:]))
-
-
-class _CompactPrefixPair(platform.Function):
-    """Differentiable active-document KV intervals with a saved per-forward layout."""
-
-    @staticmethod
-    def forward(ctx: Any, x: Any, intervals: tuple, order: tuple) -> tuple:  # pylint: disable=arguments-differ
-        """Gather active KV intervals and save their immutable mapping."""
-        ctx.compact_args = (intervals, order, x.shape[0])
-        return tuple(_interval_select(x, interval, order) for interval in intervals)
-
-    @staticmethod
-    def backward(ctx: Any, grad0: Any, grad1: Any) -> Any:  # pylint: disable=arguments-differ
-        """Restore both compact interval gradients to the saved folded layout."""
-        return compact_pair_grad(grad0, grad1, *ctx.compact_args), None, None
+    """Restore the two folded KV gradients through the general interval adjoint."""
+    return restore_kv_gradients((grad0, grad1), intervals, order, full_len)
 
 
 def _chunked_shape(shape: tuple, seq_dim: int, chunks: int) -> tuple:
@@ -371,7 +401,8 @@ class _UnfoldPrefix(platform.Function):
     """
 
     @staticmethod
-    def forward(ctx: Any, x: Any, seq_shard_id: Any, seq_shards: Any, block_id: Any, seq_dim: Any) -> Any:  # pylint: disable=arguments-differ
+    def forward(  # pylint: disable=arguments-differ
+            ctx: Any, x: Any, seq_shard_id: Any, seq_shards: Any, block_id: Any, seq_dim: Any) -> Any:
         """One folded block's causal key prefix."""
         ctx.fold_pairs = _PAIRING.get()
         ctx.fold_args = (seq_shard_id, seq_shards, block_id, x.shape[seq_dim], seq_dim)
@@ -416,7 +447,8 @@ class _UnfoldPrefixPair(platform.Function):
     """
 
     @staticmethod
-    def forward(ctx: Any, x: Any, seq_shard_id: Any, seq_shards: Any, seq_dim: Any) -> Any:  # pylint: disable=arguments-differ
+    def forward(  # pylint: disable=arguments-differ
+            ctx: Any, x: Any, seq_shard_id: Any, seq_shards: Any, seq_dim: Any) -> Any:
         """Both folded blocks' causal key prefixes, gathered in one pass."""
         ctx.fold_pairs = _PAIRING.get()
         full_len = x.shape[seq_dim]
@@ -473,7 +505,7 @@ def unfold_prefix_pair(x: Any, seq_shard_id: int, seq_shards: int, seq_dim: int 
         )
     plan = _current_compact_plan(x.shape[seq_dim], seq_shard_id, seq_shards) if seq_dim == 0 else None
     if plan is not None:
-        return _CompactPrefixPair.apply(x, tuple(item[0] for item in plan), tuple(build_fold_order(seq_shards)))
+        return select_kv_intervals(x, tuple(item[0] for item in plan), tuple(build_fold_order(seq_shards)))
     return _UnfoldPrefixPair.apply(x, seq_shard_id, seq_shards, seq_dim)
 
 
@@ -834,6 +866,9 @@ def natural_prefix(x: Any, seq_shard_id: int, seq_shards: int, block_id: int, se
             f"DSA CP fold needs the key sequence ({x.shape[seq_dim]}) to be a multiple of 2 * cp ({twon})."
         )
     sf = x.shape[seq_dim] // twon
+    plan = _current_compact_plan(x.shape[seq_dim], seq_shard_id, seq_shards) if seq_dim == 0 else None
+    if plan is not None:
+        return select_kv_intervals(x, (plan[block_id][0],))[0]
     return x.narrow(seq_dim, 0, balanced_prefix_chunks(seq_shard_id, seq_shards, block_id) * sf)
 
 
@@ -859,6 +894,7 @@ _DENSE_LSE_ACTUAL_SEQ_QLEN_IDX = 3
 _DENSE_LSE_ACTUAL_SEQ_KLEN_IDX = 4
 
 
+@_with_tensor_pairing
 def fold_dense_lightning_indexer_softmax_lse(func: Callable, seq_shard_id: int, seq_shards: int, *args: Any,
                                              fold_layout: str = "BSND", **kwargs: Any) -> Any:
     """Dense (stage-1) indexer softmax statistics per block.
@@ -913,6 +949,7 @@ _DENSE_KL_ACTUAL_SEQ_QLEN_IDX = 12
 _DENSE_KL_ACTUAL_SEQ_KLEN_IDX = 13
 
 
+@_with_tensor_pairing
 def fold_dense_indexer_kl_loss(func: Callable, seq_shard_id: int, seq_shards: int, *args: Any,
                                fold_layout: str = "BSND") -> Any:
     """Dense (stage-1) indexer KL loss per block, MindSpore positional form (18 args).
@@ -956,7 +993,11 @@ def fold_dense_indexer_kl_loss(func: Callable, seq_shard_id: int, seq_shards: in
 
     d_qi0, d_ki0, d_w0, loss0 = _block(0)
     d_qi1, d_ki1, d_w1, loss1 = _block(1)
-    d_key_index = (natural_prefix_grad(d_ki0, full_len, seq_dim)
-                   + natural_prefix_grad(d_ki1, full_len, seq_dim))
+    plan = _current_compact_plan(full_len, seq_shard_id, seq_shards) if tnd else None
+    if plan is not None:
+        d_key_index = restore_kv_gradients((d_ki0, d_ki1), tuple(item[0] for item in plan), (0,), full_len)
+    else:
+        d_key_index = (natural_prefix_grad(d_ki0, full_len, seq_dim)
+                       + natural_prefix_grad(d_ki1, full_len, seq_dim))
     return (_cat_pair(d_qi0, d_qi1, seq_dim), d_key_index,
             _cat_pair(d_w0, d_w1, seq_dim), loss0 + loss1)

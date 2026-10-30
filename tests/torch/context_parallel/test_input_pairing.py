@@ -14,12 +14,16 @@
 # ============================================================================
 """Input-layout pairing: natural prefixes, kernel metadata and saved backward plans."""
 from typing import Any
+from types import SimpleNamespace
 import unittest
 
 import torch
 
 from hyper_parallel.core.shard.ops import dsa_cp_fold as fold
 from hyper_parallel.core.context_parallel.dynamic_pairing import paired_owners
+from hyper_parallel.core.shard.ops.tnd_kv_compact import plan_tnd_kv, select_kv_intervals
+from hyper_parallel.core.shard.ops.parallel_lightning_indexer import LightningIndexerDistributedOp
+from hyper_parallel.core.shard.ops.parallel_npu_sparse_flash_attention import SparseFlashAttentionDistributedOp
 
 
 def attention(query: Any, key: Any, value: Any, indices: Any, scale: Any, **kwargs: Any) -> Any:
@@ -135,6 +139,122 @@ class TestInputPairing(unittest.TestCase):
 
 class TestCompactIntervals(unittest.TestCase):
     """Validate compact document coordinates and their inverse gradients."""
+
+    def test_general_plan_and_arbitrary_interval_gradients(self):
+        """Planning has no equal-shard assumption and sums three overlapping gradients."""
+        blocks = plan_tnd_kv((0, 5, 5, 9, 24, 24), 24, ((6, 8), (8, 13), (17, 24)))
+        self.assertEqual([block.key_interval for block in blocks], [(5, 8), (5, 13), (9, 24)])
+        self.assertEqual(blocks[1].query_ends, (1, 5))
+        self.assertEqual(blocks[1].key_ends, (4, 8))
+        value = torch.randn(24, 3, requires_grad=True)
+        intervals = ((1, 9), (5, 15), (8, 24))
+        outputs = select_kv_intervals(value, intervals)
+        sum((i + 1) * out.square().sum() for i, out in enumerate(outputs)).backward()
+        expected = torch.zeros_like(value)
+        for i, (start, stop) in enumerate(intervals):
+            expected[start:stop] += 2 * (i + 1) * value.detach()[start:stop]
+        torch.testing.assert_close(value.grad, expected)
+        for ends, queries in (((5, 23), ((0, 8),)), ((5, 4, 24), ((0, 8),)),
+                              ((5, 24), ((8, 8),)), ((5, 24), ((-1, 4),))):
+            with self.assertRaises(ValueError):
+                plan_tnd_kv(ends, 24, queries)
+
+    def test_contiguous_attention_interleaved_backward(self):
+        """Natural KV with one block per rank matches full document attention."""
+        torch.manual_seed(12)
+        losses, expected_losses, tensors = [], [], []
+        for documents in ((0, 5, 5, 9, 24, 24), (8, 12, 17, 24)):
+            ends = torch.tensor(documents, dtype=torch.int32)
+            setattr(ends, '_hp_compact_ends', documents)
+            q, k, v = [torch.randn(24, heads, 4, requires_grad=True) for heads in (2, 1, 1)]
+            rq, rk, rv = [x.detach().clone().requires_grad_() for x in (q, k, v)]
+            reference = attention(rq, rk, rv, None, .5,
+                                  actual_seq_lengths_query=ends, actual_seq_lengths_kv=ends)[0]
+            local_losses = []
+            for rank in range(4):
+                output = fold.compact_tnd_call(
+                    attention, rank, 4, q[rank*6:(rank+1)*6], k, v, None, .5, variant='sfa',
+                    actual_seq_lengths_query=ends, actual_seq_lengths_kv=ends)
+                torch.testing.assert_close(output[0], reference[rank*6:(rank+1)*6])
+                local_losses.append(output[0].square().sum())
+            losses.append(sum(local_losses))
+            expected_losses.append(reference.square().sum())
+            tensors.append(((q, k, v), (rq, rk, rv)))
+        sum(losses).backward()
+        sum(expected_losses).backward()
+        for actual, reference in tensors:
+            for left, right in zip(actual, reference):
+                torch.testing.assert_close(left.grad, right.grad, atol=2e-5, rtol=2e-5)
+
+    def test_contiguous_last_document_prefix_without_compaction(self):
+        """A Q block ending inside the final document must not attend its future tail."""
+        fold.set_dsa_cp_fold(False)
+        torch.manual_seed(17)
+        ends = torch.tensor([5, 9, 24], dtype=torch.int32)
+        q, k, v = [torch.randn(24, heads, 4) for heads in (2, 1, 1)]
+        reference = attention(q, k, v, None, .5,
+                              actual_seq_lengths_query=ends, actual_seq_lengths_kv=ends)[0]
+        query_layout = SimpleNamespace(get_split_id=lambda dim: 2, get_dim_split_num=lambda dim: 4)
+        key_layout = SimpleNamespace(get_dim_split_num=lambda dim: 1)
+        op = SparseFlashAttentionDistributedOp('sparse_flash_attention')
+        expanded = op.get_expand_impl(attention, None,
+                                      [query_layout, key_layout, key_layout, query_layout, 'TND'])
+        output = expanded(q[12:18], k, v, None, .5,
+                          actual_seq_lengths_query=ends, actual_seq_lengths_kv=ends)[0]
+        torch.testing.assert_close(output, reference[12:18])
+
+    def test_indexer_dispatch_selects_compaction_without_fold(self):
+        """The real distributed indexer adapter must reach compaction, not only a helper."""
+        fold.set_dsa_cp_fold(False)
+        ends = torch.tensor([5, 9, 24], dtype=torch.int32)
+        setattr(ends, '_hp_compact_ends', (5, 9, 24))
+        query_layout = SimpleNamespace(get_split_id=lambda dim: 1, get_dim_split_num=lambda dim: 4)
+        key_layout = SimpleNamespace(get_dim_split_num=lambda dim: 1)
+        seen = []
+
+        def kernel(query, key, weights, **kwargs):
+            """Expose the exact local metadata and physical K length."""
+            del query, weights
+            seen.append((key.shape[0], kwargs['actual_seq_lengths_query'].tolist(),
+                         kwargs['actual_seq_lengths_key'].tolist()))
+            return key
+
+        op = LightningIndexerDistributedOp('lightning_indexer')
+        expanded = op.get_expand_impl(kernel, None, [query_layout, key_layout, query_layout, 'TND'])
+        result = expanded(torch.ones(6, 1, 1), torch.arange(24.).reshape(24, 1, 1), torch.ones(6, 1),
+                          actual_seq_lengths_query=ends, actual_seq_lengths_key=ends)
+        torch.testing.assert_close(result.flatten(), torch.arange(5., 12.))
+        self.assertEqual(seen, [(7, [3, 6], [4, 7])])
+
+    def test_dense_lse_and_both_kl_paths_share_contiguous_coordinates(self):
+        """Nonattention DSA kernels use the same interval and restore full dK_index."""
+        ends = torch.tensor([5, 9, 24], dtype=torch.int32)
+        setattr(ends, '_hp_compact_ends', (5, 9, 24))
+        q, k = torch.ones(6, 1, 2), torch.ones(24, 1, 2)
+        seen = []
+
+        def lse(query, key, weights, qends, kends):
+            """Record dense statistics input alignment."""
+            del query, weights
+            seen.append((key.shape[0], qends.tolist(), kends.tolist()))
+            return key.sum()
+
+        fold.compact_tnd_call(lse, 1, 4, q, k, q[:, :, 0], ends, ends, variant='dense_lse')
+        for variant, qslot, kslot, ropeslot in [('sparse_kl', 11, 12, 10), ('dense_kl', 12, 13, 11)]:
+            args = [q, k, q, k, q] + [None] * (kslot - 4)
+            args[ropeslot] = k
+            args[qslot], args[kslot] = ends, ends
+
+            def kl(*call):
+                """Return simple gradients whose natural support is unambiguous."""
+                seen.append((call[1].shape[0], call[qslot].tolist(), call[kslot].tolist()))
+                return q, torch.ones_like(call[3]), q, q.sum()
+
+            result = fold.compact_tnd_call(kl, 1, 4, *args, variant=variant)
+            expected = torch.zeros_like(k)
+            expected[5:12] = 1
+            torch.testing.assert_close(result[1], expected)
+        self.assertEqual(seen, [(7, [3, 6], [4, 7])] * 3)
 
     def test_interval_merge_and_missing_gradients(self):
         """Disjoint, touching, overlapping and nested intervals invert the gather."""
