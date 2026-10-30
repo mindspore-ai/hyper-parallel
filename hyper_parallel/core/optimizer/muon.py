@@ -230,7 +230,8 @@ class Muon(BaseDistributedOptimizer):
             post_update_fn: Optional callback applied after a parameter update.
             zero_rms_scale_mode: Scaling behavior when matched AdamW RMS is zero.
             apply_lr_in_update: Whether the update callback applies the learning rate.
-            hsdp_replica_count: Optional optimizer-state replica group size.
+            hsdp_replica_count: Optimizer-state replica group size. None uses
+                automatic topology selection; explicit sizes survive cache rebuilds.
         """
         advanced = _resolve_muon_advanced_options(advanced_options)
         if ns_variant not in ("legacy", "asym5", "custom"):
@@ -265,6 +266,7 @@ class Muon(BaseDistributedOptimizer):
             "apply_lr_in_update": advanced.apply_lr_in_update,
         }
         super().__init__(params, defaults, is_muon=True, hsdp_replica_count=hsdp_replica_count)
+        self._hsdp_replica_count_is_explicit = hsdp_replica_count is not None
         self.reshape_fn = advanced.reshape_fn
         self.zeropower_fn = advanced.zeropower_fn
         self.momentum_update_fn = advanced.momentum_update_fn
@@ -276,11 +278,12 @@ class Muon(BaseDistributedOptimizer):
         """Rebuild all parameter-identity caches from current param groups."""
         self._group_dtensor_by_mesh()
         self._build_param_shard_metadata()
-        deduced_count = self._auto_deduce_replica_count()
-        if deduced_count is None:
-            self.hsdp_replica_count = None
-        elif self.hsdp_replica_count is None:
-            self.hsdp_replica_count = deduced_count
+        if not self._hsdp_replica_count_is_explicit:
+            deduced_count = self._auto_deduce_replica_count()
+            if deduced_count is None:
+                self.hsdp_replica_count = None
+            elif self.hsdp_replica_count is None:
+                self.hsdp_replica_count = deduced_count
         self._split_replicate_groups()
         self._build_hsdp_batch()
         self._build_param_broadcast_info()
