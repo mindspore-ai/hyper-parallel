@@ -49,6 +49,7 @@ class ModelBuildObservation:
     observer: ModelBuildObserver
     artifact_dir: Optional[str] = None
     publish: bool = True
+    observation_only: bool = False
     artifact_layout: Optional[Any] = None
 
 

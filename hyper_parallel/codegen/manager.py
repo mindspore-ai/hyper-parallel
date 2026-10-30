@@ -474,14 +474,9 @@ def _is_rank0() -> bool:
             return int(rank) == 0
         except ValueError as exc:
             raise ValueError(f"codegen: invalid RANK value {rank!r}") from exc
-    try:
-        from hyper_parallel.trainer.runtime.distributed import (
-            get_global_rank_safe,
-        )
-
-        return get_global_rank_safe() == 0
-    except Exception:
-        return True
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank() == 0
+    return True
 
 
 def _model_name(config: Any, hf_config: Any = None) -> Optional[str]:

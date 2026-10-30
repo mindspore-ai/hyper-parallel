@@ -12,23 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Build-only orchestration for snapshot-driven code generation."""
+"""Device-free orchestration for snapshot-driven code generation."""
 
 from typing import Any, Optional
 
 from hyper_parallel.codegen.artifact import ArtifactLayout
+from hyper_parallel.codegen.offline_build import create_offline_distributed_setup
 from hyper_parallel.codegen.session import CodegenBuildSession
 from hyper_parallel.models.build_observer import (
     ModelBuildObservation,
     use_model_build_observation,
 )
 from hyper_parallel.trainer.config import normalize_distributed_setup_overrides
-from hyper_parallel.trainer.runtime.distributed import (
-    create_distributed_setup_from_config,
-    destroy_process_group,
-    initialize_distributed,
-)
-from hyper_parallel.trainer.runtime.random import set_seed
 
 
 def generate_from_native_build(
@@ -36,10 +31,10 @@ def generate_from_native_build(
     *,
     artifact_dir: Optional[str] = None,
 ) -> ArtifactLayout:
-    """Build the configured native model and publish its frozen snapshot.
+    """Observe the configured model on meta and publish its frozen snapshot.
 
     Args:
-        config: Resolved TrainerConfig. Only model and model-build settings are
+        config: Resolved TrainerConfig. Only model and planning settings are
             consumed; data, optimizer, scheduler, and training loops are never built.
         artifact_dir: Optional explicit bundle output directory.
 
@@ -49,24 +44,18 @@ def generate_from_native_build(
     Raises:
         RuntimeError: If the native model does not publish a complete artifact.
     """
-    backend = getattr(config.training, "backend", "nccl")
-    initialize_distributed(backend=backend)
-    try:
-        return _build_and_publish(config, artifact_dir)
-    finally:
-        destroy_process_group()
+    return _build_and_publish(config, artifact_dir)
 
 
 def _build_and_publish(config: Any, artifact_dir: Optional[str]) -> ArtifactLayout:
-    """Build and publish after the CLI has initialized distributed state."""
-    distributed_setup = create_distributed_setup_from_config(config)
+    """Build and publish from a process-group-free planning topology."""
+    distributed_setup = create_offline_distributed_setup(config)
     normalize_distributed_setup_overrides(distributed_setup, config)
-    seed = config.training.seed if config.training.seed is not None else 42
-    set_seed(seed, config.training.enable_full_determinism)
 
     observation = ModelBuildObservation(
         observer=CodegenBuildSession(),
         artifact_dir=artifact_dir,
+        observation_only=True,
     )
     with use_model_build_observation(observation):
         config.model.build(

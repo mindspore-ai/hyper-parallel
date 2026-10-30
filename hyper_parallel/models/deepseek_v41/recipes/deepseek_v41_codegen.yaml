@@ -1,0 +1,116 @@
+model:
+  _target_: hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model.build_cropped_deepseek_v41
+  config_path: /home/lxy/DeepSeek-V4.1-Flash
+  engram_assets_path: /home/lxy/codegen_reval/val/data/engram_depth_preserving_d8.json
+  text_parameter_divisor: 8
+  num_routed_experts: 16
+  exercise_post_training_indexer: true
+  indexer_loss_coeff: 0.001
+  torch_dtype: bfloat16
+  validate_placement: false
+
+model_init_dtype: float32
+
+training:
+  train_iters: 1
+  global_batch_size: 1
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  seed: 42
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 8
+  pp_size: 1
+  sequence_parallel: false
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: "off"
+
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    lr: 1.0e-5
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr: 1.0e-5
+    lr_warmup_steps: 1
+    min_lr: 0.0
+
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ""
+  restore_from: null
+
+plan_overrides:
+plan_overrides:
+  # These replacements are optimizations only: the registered architecture is
+  # executable before the Trainer applies any of them.
+  - match:
+      - "model.layers.*.attn_hc"
+      - "model.layers.*.ffn_hc"
+    module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41PipelinedHyperConnection
+    replace_module:
+      _target_: hyper_parallel.components.modules.mhc.PipelinedMhcModule
+  - match: "model.layers.*.engram"
+    module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Engram
+    replace_module:
+      _target_: hyper_parallel.components.modules.engram.EngramModule
+  # NOTE: the self_attn replace_module (SharedCompressedDSAAttention) and its
+  # bound *.self_attn wrapper/attr entries are intentionally dropped on a
+  # validation host without the omni kernel: the replacement's NPU
+  # sparse-attention kernel needs the internal omni_training_custom_ops
+  # package, and the CP wrapper type-checks for that replacement class. With
+  # tp_size=1 and cp_size=1 those entries are inactive anyway; the native
+  # DeepseekV41Attention carries the same semantics and the active parallel
+  # axes on such a host are EP + FSDP only.
+  - match: "model.layers.*.*_hc"
+    region_dispatch: false
+    params:
+      fn: {tp: replicate}
+      base: {tp: replicate}
+      scale: {tp: replicate}
+    in_src:
+      hidden_streams: {tp: replicate, cp: "shard(1)", ep: replicate}
+    in_dst:
+      hidden_streams: {tp: replicate, cp: "shard(1)", ep: replicate}
+    out_src:
+      pre: {tp: replicate, cp: "shard(1)", ep: replicate}
+      post: {tp: replicate, cp: "shard(1)", ep: replicate}
+      residual: {tp: replicate, cp: "shard(1)", ep: replicate}
+    out_dst:
+      pre: {tp: replicate, cp: "shard(1)", ep: replicate}
+      post: {tp: replicate, cp: "shard(1)", ep: replicate}
+      residual: {tp: replicate, cp: "shard(1)", ep: replicate}
+  - match: "model.layers.*.engram"
+    params:
+      q_weight: {tp: replicate}
+      k_weight: {tp: replicate}
+      embed.weight: {ep: "shard(0)"}
+      wkv.weight: {tp: replicate}
+  - match: "model.layers.*.engram"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: >-
+        hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn
+  - match: "*.mlp"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: >-
+        hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
+      use_grouped_gemm: false

@@ -37,6 +37,7 @@ from hyper_parallel.models._transformers.model_builder import (
     _init_model,
     apply_model_infrastructure,
     instantiate_infrastructure,
+    observe_model_infrastructure,
 )
 from hyper_parallel.models._transformers.config_resolver import get_hf_config, get_is_hf_model
 from hyper_parallel.distributed.mesh import DistributedSetup
@@ -105,6 +106,7 @@ def _model_init_kwargs(
     kwargs: dict[str, Any],
     *,
     load_base_model: bool,
+    preserve_trust_remote_code: bool = False,
 ) -> dict[str, Any]:
     """Drop config/download-only kwargs when constructing directly from config."""
     if load_base_model:
@@ -113,6 +115,7 @@ def _model_init_kwargs(
         key: value
         for key, value in kwargs.items()
         if key not in _CONFIG_ONLY_KWARGS
+        or (preserve_trust_remote_code and key == "trust_remote_code")
     }
 
 
@@ -201,6 +204,27 @@ def _finish_codegen_sidecar(
     return session.finish(publish)
 
 
+def _finish_offline_observation(
+    session: CodegenBuildSession,
+    artifact_dir: Optional[str],
+    on_published: Optional[Any] = None,
+):
+    """Publish an offline snapshot without querying accelerator state."""
+    cpu_rng_state = torch.get_rng_state()
+    python_rng_state = random.getstate()
+
+    def publish(snapshot: Any) -> None:
+        try:
+            layout = ensure_codegen_artifact_from_snapshot(snapshot, artifact_dir)
+            if on_published is not None:
+                on_published(layout)
+        finally:
+            torch.set_rng_state(cpu_rng_state)
+            random.setstate(python_rng_state)
+
+    return session.finish(publish)
+
+
 class _BaseHyperAutoModelClass:
     """Shared from_pretrained / from_config logic.
 
@@ -221,7 +245,15 @@ class _BaseHyperAutoModelClass:
     @classmethod
     def _from_config_parent_class(cls, *args, **kwargs):
         """Delegate to the parent Hugging Face AutoModel ``from_config`` path."""
-        return super().from_config(*args, **kwargs)  # pylint: disable=no-member
+        parent_classes = (
+            AutoModelForCausalLM,
+            AutoModelForImageTextToText,
+            AutoModelForSequenceClassification,
+        )
+        for parent_class in parent_classes:
+            if issubclass(cls, parent_class):
+                return parent_class.from_config(*args, **kwargs)
+        raise TypeError(f"{cls.__name__} has no supported Hugging Face AutoModel parent")
 
     @classmethod
     def from_pretrained(
@@ -278,7 +310,11 @@ class _BaseHyperAutoModelClass:
         # ② Instantiate infrastructure
         sharding_planner, fsdp2_manager = instantiate_infrastructure(
             distributed_setup=distributed_setup,
-            device=_current_device(),
+            device=(
+                torch.device("meta")
+                if observation is not None and observation.observation_only
+                else _current_device()
+            ),
             compile_config=compile_config,
         )
 
@@ -362,7 +398,11 @@ class _BaseHyperAutoModelClass:
 
         sharding_planner, fsdp2_manager = instantiate_infrastructure(
             distributed_setup=distributed_setup,
-            device=_current_device(),
+            device=(
+                torch.device("meta")
+                if observation is not None and observation.observation_only
+                else _current_device()
+            ),
             compile_config=compile_config,
         )
         is_hf_model = get_is_hf_model(config, force_hf=False)
@@ -446,7 +486,10 @@ class _BaseHyperAutoModelClass:
             hf_config, kwargs.get("quantization_config"), load_base_model=load_base_model,
         )
         defer_hf_load = load_base_model and not quantized_init
-        is_meta_device = (
+        observation_only = bool(
+            observation is not None and observation.observation_only
+        )
+        is_meta_device = observation_only or (
             world_size > 1 or not is_hf_model or defer_hf_load
         ) and not quantized_init
 
@@ -459,6 +502,7 @@ class _BaseHyperAutoModelClass:
         init_kwargs = _model_init_kwargs(
             dict(kwargs),
             load_base_model=init_pretrained_path is not None,
+            preserve_trust_remote_code=observation_only,
         )
         with init_ctx:
             _, model = _init_model(
@@ -499,32 +543,48 @@ class _BaseHyperAutoModelClass:
             })
 
         # Step 3-12: Apply infrastructure
-        model = apply_model_infrastructure(
-            model,
-            mesh=mesh,
-            sharding_planner=sharding_planner,
-            fsdp2_manager=fsdp2_manager,
-            peft_config=peft_config,
-            qat_config=qat_config,
-            fp8_config=fp8_config,
-            freeze_config=freeze_config,
-            compile_config=compile_config,
-            is_meta_device=is_meta_device,
-            is_hf_model=is_hf_model,
-            device=_current_device(),
-            load_base_model=load_base_model,
-            pretrained_path=pretrained_model_name_or_path,
-            validate_placement=validate_placement,
-            distributed_setup=distributed_setup,
-            activation_checkpoint=activation_checkpoint,
-            activation_checkpoint_selection=activation_checkpoint_selection,
-            swap_inputs=swap_inputs,
-            allow_cache_entry_mutation=allow_cache_entry_mutation,
-            activation_swap=activation_swap,
-            model_init_dtype=model_init_dtype,
-            build_observer=build_observer,
-            hf_config=hf_config,
-        )
+        if observation_only:
+            model = observe_model_infrastructure(
+                model,
+                mesh=mesh,
+                sharding_planner=sharding_planner,
+                distributed_setup=distributed_setup,
+                build_observer=build_observer,
+                is_hf_model=is_hf_model,
+                peft_config=peft_config,
+                qat_config=qat_config,
+                fp8_config=fp8_config,
+                freeze_config=freeze_config,
+                low_precision_config=getattr(distributed_setup, "low_precision_config", None),
+                load_base_model=load_base_model,
+            )
+        else:
+            model = apply_model_infrastructure(
+                model,
+                mesh=mesh,
+                sharding_planner=sharding_planner,
+                fsdp2_manager=fsdp2_manager,
+                peft_config=peft_config,
+                qat_config=qat_config,
+                fp8_config=fp8_config,
+                freeze_config=freeze_config,
+                compile_config=compile_config,
+                is_meta_device=is_meta_device,
+                is_hf_model=is_hf_model,
+                device=_current_device(),
+                load_base_model=load_base_model,
+                pretrained_path=pretrained_model_name_or_path,
+                validate_placement=validate_placement,
+                distributed_setup=distributed_setup,
+                activation_checkpoint=activation_checkpoint,
+                activation_checkpoint_selection=activation_checkpoint_selection,
+                swap_inputs=swap_inputs,
+                allow_cache_entry_mutation=allow_cache_entry_mutation,
+                activation_swap=activation_swap,
+                model_init_dtype=model_init_dtype,
+                build_observer=build_observer,
+                hf_config=hf_config,
+            )
 
         if build_observer is not None:
             if build_observer.status is CodegenStatus.COLLECTING:
@@ -532,15 +592,20 @@ class _BaseHyperAutoModelClass:
             on_published = None
             if observation is not None:
                 on_published = lambda layout: setattr(observation, "artifact_layout", layout)
-            snapshot = (
-                _finish_codegen_sidecar(
+            if publish_codegen and observation_only:
+                snapshot = _finish_offline_observation(
                     build_observer,
                     observation_artifact_dir,
                     on_published,
                 )
-                if publish_codegen
-                else build_observer.finish()
-            )
+            elif publish_codegen:
+                snapshot = _finish_codegen_sidecar(
+                    build_observer,
+                    observation_artifact_dir,
+                    on_published,
+                )
+            else:
+                snapshot = build_observer.finish()
             model._hp_codegen_snapshot = snapshot  # pylint: disable=protected-access
             if snapshot.status is CodegenStatus.FAILED:
                 logger.warning(

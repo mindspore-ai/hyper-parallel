@@ -51,7 +51,12 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 
 def cmd_generate(args: argparse.Namespace) -> int:
-    """Build the native model and generate or reuse its snapshot bundle."""
+    """Observe a meta model and generate or reuse its snapshot bundle."""
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        raise RuntimeError(
+            "codegen generate is a single-process CPU/meta command; "
+            "run it with python instead of torchrun"
+        )
     config = _load_config(args.config, _cli_overrides(args))
     layout = generate_from_native_build(config, artifact_dir=args.output)
     meta = load_codegen_meta(layout.meta_path)
@@ -136,7 +141,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--verbose", action="store_true", help="verbose logging")
     subparsers = parser.add_subparsers(dest="command")
 
-    generate = subparsers.add_parser("generate", help="build the native model and generate its bundle")
+    generate = subparsers.add_parser(
+        "generate",
+        help="observe the model on meta and generate its bundle",
+    )
     generate.add_argument("--config", required=True, help="path to the training YAML")
     generate.add_argument("--output", help="explicit artifact output directory")
     generate.set_defaults(func=cmd_generate)

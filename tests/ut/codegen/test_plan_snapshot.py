@@ -96,6 +96,39 @@ def test_native_plan_and_apply_are_each_called_once(monkeypatch):
     assert snapshot.to_dict()["plan_application"]["validate_mode"] is False
 
 
+def test_observation_only_plans_without_applying_sharding(monkeypatch):
+    """Offline observation freezes plan facts without DTensor or collectives."""
+    plan = _plan()
+
+    class Planner:
+        @staticmethod
+        def plan(*_args, **_kwargs):
+            return plan
+
+    monkeypatch.setattr(
+        model_builder,
+        "apply_sharding_plan",
+        lambda *_args, **_kwargs: pytest.fail("offline observation applied sharding"),
+    )
+    session = _session()
+
+    model, source_shard_info = model_builder._plan_and_apply_sharding(
+        nn.Module(),
+        _mesh(),
+        Planner(),
+        is_hf_model=True,
+        validate_placement=False,
+        build_observer=session,
+        apply_plan=False,
+    )
+    snapshot = session.finish()
+
+    assert isinstance(model, nn.Module)
+    assert source_shard_info is None
+    assert snapshot.status is CodegenStatus.DERIVED
+    assert snapshot.to_dict()["plan_application"]["source_shard_info"] == {}
+
+
 @pytest.mark.parametrize(
     ("planner", "mesh", "is_hf_model", "reason"),
     (
@@ -263,6 +296,59 @@ def test_native_auto_build_does_not_collect_without_explicit_session(monkeypatch
     assert not hasattr(result, "_hp_codegen_snapshot")
 
 
+def test_offline_auto_build_uses_observation_infrastructure(monkeypatch):
+    """Offline mode never enters the native infrastructure execution path."""
+    model = nn.Module()
+    config = SimpleNamespace(model_type="toy", architectures=["ToyModel"])
+    session = CodegenBuildSession()
+    observation = ModelBuildObservation(
+        session,
+        publish=False,
+        observation_only=True,
+    )
+
+    monkeypatch.setattr(auto_model, "_model_init_context", lambda is_meta: nullcontext())
+    monkeypatch.setattr(auto_model, "_init_model", lambda *args, **kwargs: (False, model))
+    monkeypatch.setattr(auto_model.torch.distributed, "is_initialized", lambda: False)
+    monkeypatch.setattr(
+        auto_model,
+        "_current_device",
+        lambda: pytest.fail("offline observation queried the accelerator"),
+    )
+    monkeypatch.setattr(
+        auto_model,
+        "apply_model_infrastructure",
+        lambda *_args, **_kwargs: pytest.fail("native infrastructure was applied"),
+    )
+
+    def observe(built_model, **kwargs):
+        active_session = kwargs["build_observer"]
+        active_session.record_replacements()
+        active_session.mark_not_required("pure_data_parallel")
+        return built_model
+
+    monkeypatch.setattr(auto_model, "observe_model_infrastructure", observe)
+
+    result = auto_model._BaseHyperAutoModelClass._build_model(
+        None,
+        is_hf_model=True,
+        hf_config=config,
+        mesh=None,
+        sharding_planner=None,
+        fsdp2_manager=None,
+        backend=None,
+        peft_config=None,
+        torch_dtype="auto",
+        attn_implementation="sdpa",
+        validate_placement=False,
+        load_base_model=False,
+        build_observer=session,
+        observation=observation,
+    )
+
+    assert result._hp_codegen_snapshot.status is CodegenStatus.NOT_REQUIRED
+
+
 def test_native_auto_build_finishes_sidecar_after_infrastructure_before_train(
     monkeypatch,
 ):
@@ -370,11 +456,23 @@ def test_from_config_consumes_internal_build_observation(monkeypatch):
     """The CLI-only context reaches private build orchestration without public kwargs."""
     config = SimpleNamespace(model_type="toy", architectures=["ToyModel"])
     distributed_setup = SimpleNamespace(mesh_context=object())
-    observation = ModelBuildObservation(CodegenBuildSession(), artifact_dir="bundle")
+    observation = ModelBuildObservation(
+        CodegenBuildSession(),
+        artifact_dir="bundle",
+        observation_only=True,
+    )
     captured = {}
 
-    monkeypatch.setattr(auto_model, "instantiate_infrastructure", lambda **_kwargs: ("planner", "fsdp"))
-    monkeypatch.setattr(auto_model, "_current_device", lambda: None)
+    def instantiate(**kwargs):
+        captured["infrastructure_device"] = kwargs["device"]
+        return "planner", "fsdp"
+
+    monkeypatch.setattr(auto_model, "instantiate_infrastructure", instantiate)
+    monkeypatch.setattr(
+        auto_model,
+        "_current_device",
+        lambda: pytest.fail("offline observation queried the accelerator"),
+    )
     monkeypatch.setattr(auto_model, "get_is_hf_model", lambda *_args, **_kwargs: True)
 
     def _build_model(_cls, *_args, **kwargs):
@@ -393,6 +491,7 @@ def test_from_config_consumes_internal_build_observation(monkeypatch):
     assert captured["observation_artifact_dir"] == "bundle"
     assert captured["publish_codegen"] is True
     assert captured["observation"] is observation
+    assert captured["infrastructure_device"].type == "meta"
 
 
 def test_codegen_sidecar_restores_training_rng_state(monkeypatch):

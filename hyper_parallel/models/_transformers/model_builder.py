@@ -252,6 +252,7 @@ def _plan_and_apply_sharding(
     is_hf_model: bool,
     validate_placement: bool,
     build_observer: Optional[ModelBuildObserver] = None,
+    apply_plan: bool = True,
 ) -> tuple[nn.Module, Optional[dict]]:
     """Plan parameter layouts and apply dual-mode sharding when requested."""
     model_sharding_requested = (
@@ -296,6 +297,14 @@ def _plan_and_apply_sharding(
     )
     if build_observer is not None:
         build_observer.observe_plan(plan, model, mesh)
+    if not apply_plan:
+        if build_observer is not None:
+            build_observer.observe_plan_application(
+                plan,
+                None,
+                validate_mode=False,
+            )
+        return model, None
     model, source_shard_info = apply_sharding_plan(
         model,
         plan,
@@ -755,6 +764,68 @@ def apply_model_infrastructure(
     if compile_for_execution:
         model = apply_compile(model, compile_config)
 
+    return model
+
+
+def observe_model_infrastructure(
+    model: nn.Module,
+    *,
+    mesh: Optional[MeshContext],
+    sharding_planner: Optional[ShardingPlanner],
+    distributed_setup: Optional[DistributedSetup],
+    build_observer: ModelBuildObserver,
+    is_hf_model: bool,
+    peft_config: Optional[Any] = None,
+    qat_config: Optional[Any] = None,
+    fp8_config: Optional[Any] = None,
+    freeze_config: Optional[Any] = None,
+    low_precision_config: Optional[Any] = None,
+    load_base_model: bool = False,
+) -> nn.Module:
+    """Observe replacement and planning facts without executing infrastructure.
+
+    This is the Codegen-facing, side-effect-free counterpart to
+    :func:`apply_model_infrastructure`. It deliberately stops before DTensor,
+    FSDP, activation wrappers, materialization, loading and compilation.
+
+    Args:
+        model: Meta model whose structure is being observed.
+        mesh: Pure-data planning topology wrapped in MeshContext.
+        sharding_planner: Native planner instance.
+        distributed_setup: Normalized replacement and plan declarations.
+        build_observer: Collector receiving immutable planning facts.
+        is_hf_model: Whether the model follows the HF-native path.
+        peft_config: Optional structure-changing PEFT configuration.
+        qat_config: Optional structure-changing QAT configuration.
+        fp8_config: Optional structure-changing FP8 configuration.
+        freeze_config: Optional parameter-freezing configuration.
+        low_precision_config: Optional replacement policy.
+        load_base_model: Whether the source configuration requested weights.
+
+    Returns:
+        The observed meta model, without runtime infrastructure applied.
+    """
+    _apply_pre_sharding_features(peft_config, qat_config, fp8_config)
+    weights_mapping = get_model_conversion_mapping(model)
+    model, _ = _maybe_apply_module_replacements(
+        model,
+        distributed_setup,
+        low_precision_config,
+        load_base_model,
+        weights_mapping,
+        build_observer,
+    )
+    if freeze_config is not None:
+        _apply_parameter_freezing(model, freeze_config)
+    model, _ = _plan_and_apply_sharding(
+        model,
+        mesh,
+        sharding_planner,
+        is_hf_model,
+        False,
+        build_observer,
+        apply_plan=False,
+    )
     return model
 
 

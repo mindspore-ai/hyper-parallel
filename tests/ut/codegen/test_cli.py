@@ -61,6 +61,20 @@ def test_generate_uses_native_build_and_typed_overrides(monkeypatch):
     }
 
 
+def test_generate_rejects_torchrun_environment(monkeypatch):
+    """Multiple CLI ranks fail before parsing config or touching devices."""
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.setattr(
+        cli.config_parser,
+        "load_training_config",
+        lambda *_args, **_kwargs: pytest.fail("config was loaded under torchrun"),
+    )
+
+    result = cli.main(["generate", "--config", "train.yaml"])
+
+    assert result == 1
+
+
 def test_native_build_orchestration_builds_only_model(monkeypatch):
     """Build-only generation never constructs training-owned components."""
     events = []
@@ -90,22 +104,19 @@ def test_native_build_orchestration_builds_only_model(monkeypatch):
         model_init_dtype=None,
     )
     setup = object()
-    monkeypatch.setattr(build, "initialize_distributed", lambda **kwargs: events.append(("dist", kwargs)))
-    monkeypatch.setattr(build, "create_distributed_setup_from_config", lambda _config: setup)
+    monkeypatch.setattr(build, "create_offline_distributed_setup", lambda _config: setup)
     monkeypatch.setattr(
         build,
         "normalize_distributed_setup_overrides",
         lambda received_setup, received_config: events.append(("normalize", received_setup, received_config)),
     )
-    monkeypatch.setattr(build, "set_seed", lambda *args: events.append(("seed", args)))
-    monkeypatch.setattr(build, "destroy_process_group", lambda: events.append(("destroy",)))
-
     result = build.generate_from_native_build(config, artifact_dir="bundle")
 
     assert result is layout
-    assert [event[0] for event in events] == ["dist", "normalize", "seed", "model", "destroy"]
-    observation = events[-2][2]
+    assert [event[0] for event in events] == ["normalize", "model"]
+    observation = events[-1][2]
     assert observation.artifact_dir == "bundle"
+    assert observation.observation_only is True
     assert current_model_build_observation() is None
 
 
@@ -120,11 +131,8 @@ def test_native_build_requires_published_artifact(monkeypatch):
         compile=None,
         model_init_dtype=None,
     )
-    monkeypatch.setattr(build, "initialize_distributed", lambda **_kwargs: None)
-    monkeypatch.setattr(build, "create_distributed_setup_from_config", lambda _config: object())
+    monkeypatch.setattr(build, "create_offline_distributed_setup", lambda _config: object())
     monkeypatch.setattr(build, "normalize_distributed_setup_overrides", lambda *_args: None)
-    monkeypatch.setattr(build, "set_seed", lambda *_args: None)
-    monkeypatch.setattr(build, "destroy_process_group", lambda: None)
 
     with pytest.raises(RuntimeError, match="without publishing"):
         build.generate_from_native_build(config)
