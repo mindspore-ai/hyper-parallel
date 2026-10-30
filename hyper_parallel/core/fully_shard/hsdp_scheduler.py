@@ -77,6 +77,8 @@ class HSDPSchedulerContext:
         # Compile tracing may enter the root more than once; initialize shared
         # parameter state only on the first real forward.
         self.lazy_init_done: bool = False
+        # The first participating unit queues the tree finalizer and owns
+        # this flag until backward communication and gradient application finish.
         self.root_bp_state = False
         # all_hsdp_schedulers (for one module tree structure), deduplicated at
         # registration time because ``fully_shard`` may be given a module list
@@ -522,9 +524,12 @@ class HSDPSchedulerV2:
         """Execute backward pre hook."""
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
             return grad
-        if self._is_root:
-            Variable._execution_engine.queue_callback(self._root_backward_hook)
-        self.scheduler_ctx.root_bp_state = True
+        # A backward may enter through a nested unit without traversing the
+        # root's outputs. The shared context owns one finalizer for the tree.
+        if not self.scheduler_ctx.root_bp_state:
+            root_scheduler = self.scheduler_ctx.root_module.hsdp_scheduler
+            Variable._execution_engine.queue_callback(root_scheduler._root_backward_hook)
+            self.scheduler_ctx.root_bp_state = True
         self._hsdp_backward_pre_hook(self.cell, None)
         return grad
 
@@ -536,7 +541,6 @@ class HSDPSchedulerV2:
         for hsdp_scheduler in self.scheduler_ctx.all_hsdp_schedulers:
             # let modules which are not triggered backward_hook launch backward communication.
             hsdp_scheduler._backward_hook()
-        self.scheduler_ctx.root_bp_state = False
         with torch.profiler.record_function(f"root_backward reduce:{self.hsdp_state.module_name}"):
             logger.debug(
                 "hook=root_backward_hook action=final_reduce module=%s",
@@ -545,6 +549,12 @@ class HSDPSchedulerV2:
             self._finalize_comm_fusion_reductions()
             self._finalize_per_param_reductions()
             self.launch_tp_replicate_reduce_and_apply()
+        self.scheduler_ctx.root_bp_state = False
+        # BACKWARD deduplicates hooks within one autograd execution. Inactive
+        # children must not carry it into the next backward; their no-sync
+        # gradients have a separate lifetime and must remain accumulated.
+        for scheduler in self.scheduler_ctx.all_hsdp_schedulers:
+            scheduler.scheduler_state = None
 
     def check_state_prefetch_handles_consumed(self) -> None:
         """Check that all parameters in the module tree consumed their prefetch work.

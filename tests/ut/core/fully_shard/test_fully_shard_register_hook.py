@@ -330,15 +330,17 @@ class TestRegisterPostBackwardHook(unittest.TestCase):
 
 
 class TestRootBackwardCallback(unittest.TestCase):
-    """Unit tests for root-only backward finalizer registration."""
+    """Unit tests for one finalizer per shared module-tree backward."""
 
     @patch("hyper_parallel.core.fully_shard.hsdp_scheduler.Variable")
     def test_root_backward_pre_hook_queues_finalizer(self, mock_variable):
-        """Only the root scheduler should queue the end-of-backward callback."""
+        """A root pre-hook queues the tree's end-of-backward callback."""
         scheduler = _make_scheduler_stub()
         scheduler.scheduler_state = FSDPSchedulerState.FORWARD
         scheduler._is_root = True
         scheduler.cell = MagicMock()
+        scheduler.cell.hsdp_scheduler = scheduler
+        scheduler.scheduler_ctx.root_module = scheduler.cell
         scheduler._hsdp_backward_pre_hook = MagicMock()
         grad = torch.ones(1)
 
@@ -351,18 +353,27 @@ class TestRootBackwardCallback(unittest.TestCase):
         scheduler._hsdp_backward_pre_hook.assert_called_once_with(scheduler.cell, None)
 
     @patch("hyper_parallel.core.fully_shard.hsdp_scheduler.Variable")
-    def test_non_root_backward_pre_hook_does_not_queue_finalizer(self, mock_variable):
-        """A child scheduler should run its pre-hook without queuing root finalization."""
+    def test_child_backward_pre_hook_queues_root_finalizer_once(self, mock_variable):
+        """A child can schedule root finalization; later siblings must not duplicate it."""
         scheduler = _make_scheduler_stub()
         scheduler.scheduler_state = FSDPSchedulerState.FORWARD
         scheduler._is_root = False
         scheduler.cell = MagicMock()
         scheduler._hsdp_backward_pre_hook = MagicMock()
+        root = _make_scheduler_stub()
+        root.cell = MagicMock()
+        root.cell.hsdp_scheduler = root
+        root.scheduler_ctx = scheduler.scheduler_ctx
+        root.scheduler_ctx.root_module = root.cell
+        root.scheduler_state = FSDPSchedulerState.FORWARD
+        root._hsdp_backward_pre_hook = MagicMock()
 
         scheduler._backward_pre_hook(torch.ones(1))
+        root._backward_pre_hook(torch.ones(1))
 
-        mock_variable._execution_engine.queue_callback.assert_not_called()
+        mock_variable._execution_engine.queue_callback.assert_called_once_with(root._root_backward_hook)
         scheduler._hsdp_backward_pre_hook.assert_called_once_with(scheduler.cell, None)
+        root._hsdp_backward_pre_hook.assert_called_once_with(root.cell, None)
 
     @patch("hyper_parallel.core.fully_shard.hsdp_scheduler.Variable")
     def test_repeated_backward_pre_hook_does_not_queue_again(self, mock_variable):
@@ -510,15 +521,43 @@ class TestRootBackwardCallback(unittest.TestCase):
         scheduler = _make_prefetch_scheduler([_make_prefetch_param("root.weight")])
         child = _make_prefetch_scheduler([_make_prefetch_param("layers.0.weight")], scheduler_ctx=scheduler.scheduler_ctx)
         scheduler.scheduler_ctx.root_bp_state = True
+        scheduler.scheduler_state = FSDPSchedulerState.BACKWARD
+        child.scheduler_state = FSDPSchedulerState.BACKWARD
+        pending_grad = torch.ones(1)
+        child.hsdp_state.hsdp_params[0].unsharded_accumulated_grad = pending_grad
+
+        def check_before_apply() -> None:
+            """Keep execution state active until communication results are applied."""
+            self.assertEqual(child.scheduler_state, FSDPSchedulerState.BACKWARD)
+            self.assertTrue(scheduler.scheduler_ctx.root_bp_state)
+
+        scheduler.launch_tp_replicate_reduce_and_apply.side_effect = check_before_apply
 
         scheduler._root_backward_hook()
 
         self.assertFalse(scheduler.scheduler_ctx.root_bp_state)
+        self.assertIsNone(scheduler.scheduler_state)
+        self.assertIsNone(child.scheduler_state)
+        self.assertIs(child.hsdp_state.hsdp_params[0].unsharded_accumulated_grad, pending_grad)
         scheduler._backward_hook.assert_called_once_with()
         child._backward_hook.assert_called_once_with()
         scheduler._finalize_comm_fusion_reductions.assert_called_once_with()
         scheduler._finalize_per_param_reductions.assert_called_once_with()
         scheduler.launch_tp_replicate_reduce_and_apply.assert_called_once_with()
+
+    def test_failed_finalization_does_not_mark_the_tree_idle(self) -> None:
+        """A failed drain must not expose an apparently reusable backward context."""
+        scheduler = _make_prefetch_scheduler()
+        scheduler.scheduler_ctx.root_bp_state = True
+        scheduler.scheduler_state = FSDPSchedulerState.BACKWARD
+        scheduler._finalize_per_param_reductions.side_effect = RuntimeError("reduction failed")
+
+        with self.assertRaisesRegex(RuntimeError, "reduction failed"):
+            scheduler._root_backward_hook()
+
+        self.assertTrue(scheduler.scheduler_ctx.root_bp_state)
+        self.assertEqual(scheduler.scheduler_state, FSDPSchedulerState.BACKWARD)
+        scheduler.launch_tp_replicate_reduce_and_apply.assert_not_called()
 
 
 class TestRecomputeForwardPrefetchGuard(unittest.TestCase):

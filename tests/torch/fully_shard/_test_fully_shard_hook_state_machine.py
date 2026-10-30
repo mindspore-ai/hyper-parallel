@@ -157,7 +157,7 @@ def test_torch_fully_shard_hook_state_machine() -> None:
             ("backward_pre", "FORWARD", "PRE_BACKWARD"),
             ("root_backward_enter", "PRE_BACKWARD", "PRE_BACKWARD"),
             ("backward", "PRE_BACKWARD", "BACKWARD"),
-            ("root_backward_exit", "PRE_BACKWARD", "BACKWARD"),
+            ("root_backward_exit", "PRE_BACKWARD", "NONE"),
         ],
         "non_reentrant": [
             ("forward_pre", "NONE", "PRE_FORWARD"),
@@ -166,7 +166,7 @@ def test_torch_fully_shard_hook_state_machine() -> None:
             ("forward_pre", "PRE_BACKWARD", "PRE_BACKWARD"),
             ("root_backward_enter", "PRE_BACKWARD", "PRE_BACKWARD"),
             ("backward", "PRE_BACKWARD", "BACKWARD"),
-            ("root_backward_exit", "PRE_BACKWARD", "BACKWARD"),
+            ("root_backward_exit", "PRE_BACKWARD", "NONE"),
         ],
         "reentrant": [
             ("forward_pre", "NONE", "PRE_FORWARD"),
@@ -176,7 +176,7 @@ def test_torch_fully_shard_hook_state_machine() -> None:
             ("backward_pre", "FORWARD", "PRE_BACKWARD"),
             ("root_backward_enter", "PRE_BACKWARD", "PRE_BACKWARD"),
             ("backward", "PRE_BACKWARD", "BACKWARD"),
-            ("root_backward_exit", "PRE_BACKWARD", "BACKWARD"),
+            ("root_backward_exit", "PRE_BACKWARD", "NONE"),
         ],
     }
 
