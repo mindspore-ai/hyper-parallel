@@ -22,6 +22,7 @@ from typing import Any
 
 from hyper_parallel.trainer.runtime.distributed import get_world_size_safe
 from hyper_parallel.trainer.runtime.distributed import all_reduce
+from hyper_parallel.trainer.runtime.flops import estimate_flops_per_token
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.trainer.runtime.device import get_device_type, get_torch_device
 
@@ -336,5 +337,25 @@ class EnvironMeterCallback(Callback):
             "data/consumed_samples": float(self._consumed_samples),
             **self._memory_metrics(),
         }
+
+        training_config = getattr(getattr(self.trainer, "config", None), "training", None)
+        model_config = getattr(self.trainer, "model_config", None)
+        if (
+            getattr(training_config, "log_tflops", False)
+            and model_config is not None
+            and global_samples > 0
+            and global_tokens > 0
+            and global_step_time > 0
+        ):
+            flops_per_token = estimate_flops_per_token(
+                model_config, global_tokens / global_samples
+            )
+            if flops_per_token is not None:
+                env_metrics["performance/tflops_per_device"] = (
+                    global_tokens * flops_per_token
+                    / (global_step_time * get_world_size_safe())
+                    / 1e12
+                )
+
         self.trainer.step_train_metrics = train_metrics
         self.trainer.step_env_metrics = env_metrics

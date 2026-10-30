@@ -44,6 +44,13 @@ class TrainingConfig:
     eval_steps: int = 0
     eval_epochs: int = 0
     logging_steps: int = 1
+    log_tflops: bool = False
+    """Publish analytical per-device model FLOPs throughput.
+
+    When enabled, the environment meter adds
+    ``performance/tflops_per_device`` (TFLOP/s, cluster average per device)
+    to each step's metrics.
+    """
     low_precision: LowPrecisionConfig = field(default_factory=LowPrecisionConfig)
 
 
