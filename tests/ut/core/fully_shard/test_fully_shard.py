@@ -702,6 +702,13 @@ class TestHSDPParamV2(unittest.TestCase):
     def test_to_accumulated_grad_if_needed_preserves_grad_without_reduce_dtype(self):
         """Verify no-sync paths still move local grad into accumulated buffer even without dtype conversion."""
         param_v2 = object.__new__(HSDPParamV2)
+        previous_grad = torch.full((2, 2), 2.0)
+        param_v2.unsharded_accumulated_grad = previous_grad
+
+        HSDPParamV2.accumulate_unsharded_grad_if_needed(param_v2)
+        HSDPParamV2.to_accumulated_grad_if_needed(param_v2)
+        self.assertIs(param_v2.unsharded_accumulated_grad, previous_grad)
+
         grad = torch.ones(2, 2, dtype=torch.float32)
         param_v2._unsharded_param = MagicMock()
         param_v2._unsharded_param.grad = grad
@@ -712,6 +719,13 @@ class TestHSDPParamV2(unittest.TestCase):
 
         self.assertIsNone(param_v2._unsharded_param.grad)
         self.assertTrue(torch.equal(param_v2.unsharded_accumulated_grad, grad))
+
+        next_grad = torch.full((2, 2), 3.0)
+        param_v2._unsharded_param.grad = next_grad
+        HSDPParamV2.accumulate_unsharded_grad_if_needed(param_v2)
+
+        self.assertIsNone(param_v2._unsharded_param.grad)
+        torch.testing.assert_close(param_v2.unsharded_accumulated_grad, torch.full((2, 2), 4.0))
 
 
 class TestFullyShardMeshUtils(unittest.TestCase):

@@ -808,7 +808,7 @@ class HSDPParamV2:
 
     def to_accumulated_grad_if_needed(self) -> None:
         """Move the current unsharded gradient into the accumulation buffer."""
-        if self._unsharded_param.grad is None:
+        if not hasattr(self, "_unsharded_param") or self._unsharded_param.grad is None:
             return
         # Keep local gradients alive across no-sync / delayed-sync steps even
         # after the parameter transitions back to the sharded view.
@@ -823,6 +823,8 @@ class HSDPParamV2:
 
     def accumulate_unsharded_grad_if_needed(self) -> None:
         """Add the current unsharded gradient to an existing accumulation buffer."""
+        if not hasattr(self, "_unsharded_param"):
+            return
         if (
             self.unsharded_accumulated_grad is not None
             and self.unsharded_param.grad is not None
