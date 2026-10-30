@@ -21,7 +21,6 @@ from unittest.mock import patch
 import torch
 from transformers import BertConfig, BertForSequenceClassification
 
-from hyper_parallel.codegen.modeling_backend import ModelingBackend
 from hyper_parallel.models._transformers.auto_model import (
     HyperAutoModelForImageTextToText, HyperAutoModelForSequenceClassification,
 )
@@ -43,7 +42,7 @@ class TestDeferredPretrained(unittest.TestCase):
         Expectation: Both loaders construct on meta without a checkpoint path and load after sharding.
         """
         for loader in ("dcp", "legacy"):
-            for is_hf_model, backend in ((True, None), (False, None), (True, ModelingBackend.GEN)):
+            for is_hf_model, backend in ((True, None), (False, None)):
                 with self.subTest(loader=loader, is_hf_model=is_hf_model, backend=backend):
                     model = torch.nn.Linear(2, 2)
                     with patch.dict(os.environ, {"HYPER_PARALLEL_HF_LOADER": loader}), \

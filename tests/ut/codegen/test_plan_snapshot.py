@@ -22,12 +22,12 @@ import pytest
 import torch
 from torch import nn
 
-from hyper_parallel.codegen.modeling_backend import ModelingBackend
 from hyper_parallel.codegen.plan.freeze import freeze_plan, freeze_plan_application
 from hyper_parallel.codegen.session import CodegenBuildSession
 from hyper_parallel.codegen.snapshot import CodegenStatus
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.models._transformers import auto_model, model_builder
+from hyper_parallel.models.build_observer import ModelBuildObservation, use_model_build_observation
 
 
 def _plan():
@@ -84,7 +84,7 @@ def test_native_plan_and_apply_are_each_called_once(monkeypatch):
         Planner(),
         is_hf_model=True,
         validate_placement=False,
-        codegen_session=session,
+        build_observer=session,
     )
     snapshot = session.finish()
 
@@ -119,7 +119,7 @@ def test_native_plan_guards_record_stable_not_required_reason(
         planner,
         is_hf_model=is_hf_model,
         validate_placement=False,
-        codegen_session=session,
+        build_observer=session,
     )
     snapshot = session.finish()
 
@@ -194,7 +194,7 @@ def test_native_auto_build_attaches_finished_snapshot(monkeypatch):
     )
 
     def apply_infrastructure(built_model, **kwargs):
-        session = kwargs["codegen_session"]
+        session = kwargs["build_observer"]
         session.record_replacements()
         session.mark_not_required("pure_data_parallel")
         return built_model
@@ -208,13 +208,13 @@ def test_native_auto_build_attaches_finished_snapshot(monkeypatch):
         mesh=None,
         sharding_planner=None,
         fsdp2_manager=None,
-        backend=ModelingBackend.HF,
+        backend=None,
         peft_config=None,
         torch_dtype="auto",
         attn_implementation="sdpa",
         validate_placement=False,
         load_base_model=False,
-        codegen_session=session,
+        build_observer=session,
     )
 
     snapshot = result._hp_codegen_snapshot
@@ -252,7 +252,7 @@ def test_native_auto_build_does_not_collect_without_explicit_session(monkeypatch
         mesh=None,
         sharding_planner=None,
         fsdp2_manager=None,
-        backend=ModelingBackend.HF,
+        backend=None,
         peft_config=None,
         torch_dtype="auto",
         attn_implementation="sdpa",
@@ -279,13 +279,13 @@ def test_native_auto_build_finishes_sidecar_after_infrastructure_before_train(
 
     def apply_infrastructure(built_model, **kwargs):
         events.append("infrastructure")
-        active_session = kwargs["codegen_session"]
+        active_session = kwargs["build_observer"]
         active_session.record_replacements()
         active_session.mark_not_required("pure_data_parallel")
         return built_model
 
-    def finish_sidecar(active_session, artifact_dir):
-        del artifact_dir
+    def finish_sidecar(active_session, artifact_dir, on_published=None):
+        del artifact_dir, on_published
         events.append("finish")
         return active_session.finish()
 
@@ -304,13 +304,13 @@ def test_native_auto_build_finishes_sidecar_after_infrastructure_before_train(
         mesh=None,
         sharding_planner=None,
         fsdp2_manager=None,
-        backend=ModelingBackend.HF,
+        backend=None,
         peft_config=None,
         torch_dtype="auto",
         attn_implementation="sdpa",
         validate_placement=False,
         load_base_model=False,
-        codegen_session=session,
+        build_observer=session,
         publish_codegen=True,
     )
 
@@ -342,13 +342,13 @@ def test_native_infrastructure_failure_is_not_treated_as_codegen_failure(monkeyp
             mesh=None,
             sharding_planner=None,
             fsdp2_manager=None,
-            backend=ModelingBackend.HF,
+            backend=None,
             peft_config=None,
             torch_dtype="auto",
             attn_implementation="sdpa",
             validate_placement=False,
             load_base_model=False,
-            codegen_session=session,
+            build_observer=session,
             publish_codegen=True,
         )
 
@@ -358,46 +358,41 @@ def test_native_infrastructure_failure_is_not_treated_as_codegen_failure(monkeyp
     )
 
 
-def test_from_config_codegen_creates_session_without_selecting_gen_backend(monkeypatch):
-    """The codegen flag selects native collection rather than the GEN backend."""
+def test_from_config_rejects_removed_training_codegen_switch():
+    """Training callers must migrate artifact generation to the codegen CLI."""
     config = SimpleNamespace(model_type="toy", architectures=["ToyModel"])
-    captured = {}
-    distributed_setup = SimpleNamespace(mesh_context=object())
 
-    monkeypatch.setattr(
-        auto_model,
-        "instantiate_infrastructure",
-        lambda **_kwargs: ("planner", "fsdp"),
-    )
+    with pytest.raises(TypeError, match="training-side codegen arguments were removed"):
+        auto_model._BaseHyperAutoModelClass.from_config(config, codegen=True)
+
+
+def test_from_config_consumes_internal_build_observation(monkeypatch):
+    """The CLI-only context reaches private build orchestration without public kwargs."""
+    config = SimpleNamespace(model_type="toy", architectures=["ToyModel"])
+    distributed_setup = SimpleNamespace(mesh_context=object())
+    observation = ModelBuildObservation(CodegenBuildSession(), artifact_dir="bundle")
+    captured = {}
+
+    monkeypatch.setattr(auto_model, "instantiate_infrastructure", lambda **_kwargs: ("planner", "fsdp"))
     monkeypatch.setattr(auto_model, "_current_device", lambda: None)
     monkeypatch.setattr(auto_model, "get_is_hf_model", lambda *_args, **_kwargs: True)
 
-    def build_model(_cls, *_args, **kwargs):
+    def _build_model(_cls, *_args, **kwargs):
         captured.update(kwargs)
         return object()
 
-    monkeypatch.setattr(
-        auto_model._BaseHyperAutoModelClass,
-        "_build_model",
-        classmethod(build_model),
-    )
+    monkeypatch.setattr(auto_model._BaseHyperAutoModelClass, "_build_model", classmethod(_build_model))
 
-    auto_model._BaseHyperAutoModelClass.from_config(
-        config,
-        distributed_setup=distributed_setup,
-        codegen=True,
-    )
+    with use_model_build_observation(observation):
+        auto_model._BaseHyperAutoModelClass.from_config(
+            config,
+            distributed_setup=distributed_setup,
+        )
 
-    assert captured["backend"] is None, (
-        f"codegen sidecar must keep native backend selection, got={captured['backend']}"
-    )
-    assert isinstance(captured["codegen_session"], CodegenBuildSession), (
-        "codegen sidecar should create a build session, "
-        f"got={type(captured['codegen_session'])}"
-    )
-    assert captured["publish_codegen"] is True, (
-        f"codegen publication flag mismatch: expected=True, got={captured['publish_codegen']}"
-    )
+    assert captured["build_observer"] is observation.observer
+    assert captured["observation_artifact_dir"] == "bundle"
+    assert captured["publish_codegen"] is True
+    assert captured["observation"] is observation
 
 
 def test_codegen_sidecar_restores_training_rng_state(monkeypatch):

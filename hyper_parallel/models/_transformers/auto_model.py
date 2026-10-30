@@ -21,8 +21,6 @@ Stub — provides from_pretrained/from_config as entry points.
 import inspect
 import logging
 import random
-from dataclasses import is_dataclass, replace
-from types import SimpleNamespace
 from typing import Any, Literal, Optional, Union
 
 import torch
@@ -42,7 +40,6 @@ from hyper_parallel.models._transformers.model_builder import (
 )
 from hyper_parallel.models._transformers.config_resolver import get_hf_config, get_is_hf_model
 from hyper_parallel.distributed.mesh import DistributedSetup
-from hyper_parallel.codegen.modeling_backend import ModelingBackend
 from hyper_parallel.codegen.hash import file_line_count, sha256_file
 from hyper_parallel.codegen.manager import ensure_codegen_artifact_from_snapshot
 from hyper_parallel.codegen.session import CodegenBuildSession
@@ -53,9 +50,31 @@ from hyper_parallel.models.build_options import (  # pylint: disable=syntax-erro
     get_device_type,
     get_torch_device,
 )
+from hyper_parallel.models.build_observer import current_model_build_observation
 from hyper_parallel.components.checkpoint.quantized_hf_storage import supports_hf_dequantization
 
 logger = logging.getLogger(__name__)
+
+_REMOVED_CODEGEN_KWARGS = frozenset({"codegen", "codegen_config", "codegen_artifact_dir", "codegen_session"})
+
+
+def _reject_removed_codegen_kwargs(kwargs: dict[str, Any]) -> None:
+    """Reject removed training-side codegen controls before model dispatch."""
+    removed = sorted(_REMOVED_CODEGEN_KWARGS.intersection(kwargs))
+    if removed:
+        raise TypeError(
+            f"training-side codegen arguments were removed: {removed}; "
+            "use the codegen CLI to build or inspect artifacts"
+        )
+
+
+def _reject_generated_backend(backend: Any) -> None:
+    """Reject the removed generated-model training backend."""
+    if getattr(backend, "value", backend) == "gen":
+        raise ValueError(
+            "the generated-model training backend was removed; "
+            "training always builds the native HF or custom model"
+        )
 
 
 def _current_device() -> torch.device:
@@ -133,58 +152,6 @@ def _model_init_context(is_meta_device: bool) -> Any:
     return ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
 
 
-def _with_codegen_model_args(
-    config: Any,
-    *,
-    pretrained_model_name_or_path: str,
-    codegen_artifact_dir: Optional[str],
-    config_overrides: Optional[dict[str, Any]],
-) -> Any:
-    """Return a config-like object carrying model args needed by generation."""
-    yaml_path = getattr(config, "_yaml_path", None)
-    model_changes: dict[str, Any] = {
-        "pretrained_model_name_or_path": pretrained_model_name_or_path,
-    }
-    if codegen_artifact_dir is not None:
-        model_changes["codegen_artifact_dir"] = codegen_artifact_dir
-    if config_overrides is not None:
-        model_changes["config_overrides"] = config_overrides
-
-    if config is None:
-        result = SimpleNamespace(
-            codegen=True,
-            model=SimpleNamespace(**model_changes),
-        )
-        if yaml_path is not None:
-            result._yaml_path = yaml_path  # pylint: disable=protected-access
-        return result
-
-    model = getattr(config, "model", None)
-    if hasattr(model, "replace"):
-        model = model.replace(**model_changes)
-    else:
-        model = SimpleNamespace(**model_changes)
-
-    if is_dataclass(config):
-        result = replace(
-            config,
-            model=model,
-            codegen=True,
-        )
-        if yaml_path is not None:
-            result._yaml_path = yaml_path  # pylint: disable=protected-access
-        return result
-    values = dict(vars(config))
-    values.update(
-        model=model,
-        codegen=True,
-    )
-    result = SimpleNamespace(**values)
-    if yaml_path is not None:
-        result._yaml_path = yaml_path  # pylint: disable=protected-access
-    return result
-
-
 def _config_source_id(config: Any) -> str:
     """Source identity of a config-only build, for codegen artifact resolution.
 
@@ -203,56 +170,17 @@ def _config_source_id(config: Any) -> str:
     return source_id
 
 
-def _prepare_codegen_artifact(
-    config: Any,
-    *,
-    pretrained_model_name_or_path: str,
-    codegen_artifact_dir: Optional[str],
-    config_overrides: Optional[dict[str, Any]],
-    hf_config: Any,
-) -> str:
-    """Generate or reuse the artifact bundle for the gen backend."""
-    from hyper_parallel.codegen.manager import (  # pylint: disable=import-outside-toplevel
-        ensure_codegen_artifact,
-        preflight_integrity_check,
-    )
-
-    codegen_config = _with_codegen_model_args(
-        config,
-        pretrained_model_name_or_path=pretrained_model_name_or_path,
-        codegen_artifact_dir=codegen_artifact_dir,
-        config_overrides=config_overrides,
-    )
-    layout = ensure_codegen_artifact(
-        codegen_config,
-        artifact_dir=codegen_artifact_dir,
-        hf_config=hf_config,
-    )
-    if layout is None:
-        raise RuntimeError("codegen is enabled but no artifact layout was produced")
-    preflight_integrity_check(
-        codegen_config,
-        artifact_dir=layout.artifact_dir,
-        hf_config=hf_config,
-    )
-    return layout.artifact_dir
-
-
-def _configured_codegen_artifact_dir(config: Any) -> Optional[str]:
-    """Return the optional sidecar output directory from a trainer config."""
-    model = getattr(config, "model", None)
-    return getattr(model, "codegen_artifact_dir", None)
-
-
 def _finish_codegen_sidecar(
     session: CodegenBuildSession,
     artifact_dir: Optional[str],
+    on_published: Optional[Any] = None,
 ):
     """Seal native observations and isolate sidecar publication failures."""
     cpu_rng_state = torch.get_rng_state()
     python_rng_state = random.getstate()
 
-    def publish(snapshot):
+    def publish(snapshot: Any) -> None:
+        """Publish one immutable snapshot while preserving training RNG state."""
         device_rng_state = None
         set_device_rng_state = None
         try:
@@ -261,7 +189,9 @@ def _finish_codegen_sidecar(
             set_device_rng_state = getattr(device_module, "set_rng_state", None)
             if get_device_type() != "cpu" and callable(get_device_rng_state):
                 device_rng_state = get_device_rng_state()
-            ensure_codegen_artifact_from_snapshot(snapshot, artifact_dir)
+            layout = ensure_codegen_artifact_from_snapshot(snapshot, artifact_dir)
+            if on_published is not None:
+                on_published(layout)
         finally:
             torch.set_rng_state(cpu_rng_state)
             random.setstate(python_rng_state)
@@ -314,12 +244,8 @@ class _BaseHyperAutoModelClass:
         allow_cache_entry_mutation: bool = False,
         activation_swap: str = "none",
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
-        codegen_artifact_dir: Optional[str] = None,
-        codegen: bool = False,
         config_overrides: Optional[dict[str, Any]] = None,
         load_base_model: bool = True,
-        codegen_config: Optional[Any] = None,
-        codegen_session: Optional[Any] = None,
         **kwargs: Any,
     ) -> PreTrainedModel:
         """HF-compatible from_pretrained entry point.
@@ -342,6 +268,9 @@ class _BaseHyperAutoModelClass:
         ④ get_is_hf_model → custom/HF path
         ⑤ _build_model → meta + shard + load
         """
+        _reject_removed_codegen_kwargs(kwargs)
+        _reject_generated_backend(backend)
+        observation = current_model_build_observation()
         if distributed_setup is None:
             distributed_setup = DistributedSetup()
         mesh = distributed_setup.mesh_context
@@ -361,11 +290,6 @@ class _BaseHyperAutoModelClass:
         )
         # ④ Determine model path
         is_hf_model = get_is_hf_model(hf_config, force_hf)
-
-        if codegen and codegen_session is None:
-            codegen_session = CodegenBuildSession()
-        if codegen_artifact_dir is None:
-            codegen_artifact_dir = _configured_codegen_artifact_dir(codegen_config)
 
         # ⑤ Build model
         return cls._build_model(
@@ -392,9 +316,10 @@ class _BaseHyperAutoModelClass:
             allow_cache_entry_mutation=allow_cache_entry_mutation,
             activation_swap=activation_swap,
             model_init_dtype=model_init_dtype,
-            codegen_artifact_dir=codegen_artifact_dir,
-            codegen_session=codegen_session,
-            publish_codegen=codegen,
+            build_observer=None if observation is None else observation.observer,
+            observation_artifact_dir=None if observation is None else observation.artifact_dir,
+            publish_codegen=False if observation is None else observation.publish,
+            observation=observation,
             **kwargs,
         )
 
@@ -419,19 +344,18 @@ class _BaseHyperAutoModelClass:
         allow_cache_entry_mutation: bool = False,
         activation_swap: str = "none",
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
-        codegen: bool = False,
-        codegen_config: Optional[Any] = None,
-        codegen_session: Optional[Any] = None,
         **kwargs: Any,
     ) -> PreTrainedModel:
         """Build model from PretrainedConfig (no weight loading).
 
         Following design doc 01 §6.1.
 
-        ``codegen`` records the native build and publishes an artifact sidecar
-        after infrastructure completes. No checkpoint is loaded either way,
-        so the from-config random initialization path is preserved.
+        No checkpoint is loaded, so the from-config random initialization path
+        is preserved.
         """
+        _reject_removed_codegen_kwargs(kwargs)
+        _reject_generated_backend(backend)
+        observation = current_model_build_observation()
         if distributed_setup is None:
             distributed_setup = DistributedSetup()
         mesh = distributed_setup.mesh_context
@@ -442,10 +366,6 @@ class _BaseHyperAutoModelClass:
             compile_config=compile_config,
         )
         is_hf_model = get_is_hf_model(config, force_hf=False)
-
-        if codegen and codegen_session is None:
-            codegen_session = CodegenBuildSession()
-        codegen_artifact_dir = _configured_codegen_artifact_dir(codegen_config)
 
         return cls._build_model(
             None,
@@ -471,9 +391,10 @@ class _BaseHyperAutoModelClass:
             allow_cache_entry_mutation=allow_cache_entry_mutation,
             activation_swap=activation_swap,
             model_init_dtype=model_init_dtype,
-            codegen_artifact_dir=codegen_artifact_dir,
-            codegen_session=codegen_session,
-            publish_codegen=codegen,
+            build_observer=None if observation is None else observation.observer,
+            observation_artifact_dir=None if observation is None else observation.artifact_dir,
+            publish_codegen=False if observation is None else observation.publish,
+            observation=observation,
             **kwargs,
         )
 
@@ -504,9 +425,10 @@ class _BaseHyperAutoModelClass:
         allow_cache_entry_mutation: bool = False,
         activation_swap: str = "none",
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
-        codegen_artifact_dir: Optional[str] = None,
-        codegen_session: Optional[Any] = None,
+        build_observer: Optional[Any] = None,
+        observation_artifact_dir: Optional[str] = None,
         publish_codegen: bool = False,
+        observation: Optional[Any] = None,
         **kwargs,
     ) -> PreTrainedModel:
         """Core model building orchestration.
@@ -548,20 +470,17 @@ class _BaseHyperAutoModelClass:
                 is_hf_model,
                 *model_args,
                 backend=backend,
-                codegen_artifact_dir=codegen_artifact_dir,
                 **init_kwargs,
             )
 
-        if backend == ModelingBackend.GEN:
-            codegen_session = None
-        if codegen_session is not None:
+        if build_observer is not None:
             model_type = type(model)
             source_path = inspect.getsourcefile(model_type)
             architectures = list(
                 getattr(hf_config, "architectures", None) or ()
             )
             architecture = architectures[0] if architectures else model_type.__name__
-            codegen_session.record_source({
+            build_observer.record_source({
                 "model_type": getattr(hf_config, "model_type", None),
                 "architecture": architecture,
                 "architectures": architectures,
@@ -576,11 +495,7 @@ class _BaseHyperAutoModelClass:
                     else str(pretrained_model_name_or_path)
                 ),
                 "is_hf_model": bool(is_hf_model),
-                "backend": (
-                    backend.value
-                    if isinstance(backend, ModelingBackend)
-                    else str(backend or "native")
-                ),
+                "backend": str(getattr(backend, "value", backend) or "native"),
             })
 
         # Step 3-12: Apply infrastructure
@@ -607,20 +522,24 @@ class _BaseHyperAutoModelClass:
             allow_cache_entry_mutation=allow_cache_entry_mutation,
             activation_swap=activation_swap,
             model_init_dtype=model_init_dtype,
-            codegen_artifact_dir=(
-                codegen_artifact_dir if backend is ModelingBackend.GEN else None
-            ),
-            codegen_session=codegen_session,
+            build_observer=build_observer,
             hf_config=hf_config,
         )
 
-        if codegen_session is not None:
-            if codegen_session.status is CodegenStatus.COLLECTING:
-                codegen_session.mark_skipped("infrastructure_collection_unavailable")
+        if build_observer is not None:
+            if build_observer.status is CodegenStatus.COLLECTING:
+                build_observer.mark_skipped("infrastructure_collection_unavailable")
+            on_published = None
+            if observation is not None:
+                on_published = lambda layout: setattr(observation, "artifact_layout", layout)
             snapshot = (
-                _finish_codegen_sidecar(codegen_session, codegen_artifact_dir)
+                _finish_codegen_sidecar(
+                    build_observer,
+                    observation_artifact_dir,
+                    on_published,
+                )
                 if publish_codegen
-                else codegen_session.finish()
+                else build_observer.finish()
             )
             model._hp_codegen_snapshot = snapshot  # pylint: disable=protected-access
             if snapshot.status is CodegenStatus.FAILED:

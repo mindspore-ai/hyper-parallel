@@ -50,11 +50,10 @@ def materialize_recorded_forwards(
 
     Local-region wrappers are numerically sensitive: an equivalent source
     rewrite can change the order in which bfloat16 values cross the boundary.
-    The generated model therefore records every concrete patch for review,
-    while :func:`hyper_parallel.codegen.runtime.hp_bind_compute` installs the
-    trainer's native ``_wrap_local_region_forward`` at startup.
+    The generated artifact therefore materializes every concrete patch for
+    review without installing it into the native training model.
     """
-    patches = patch_plan if patch_plan is not None else getattr(meta, "_build_patches", None)
+    patches = patch_plan
     records = getattr(patches, "local_computes", ()) if patches is not None else ()
     if not records:
         return source_text

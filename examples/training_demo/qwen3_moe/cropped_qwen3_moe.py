@@ -47,8 +47,6 @@ class CroppedQwen3MoeOptions:
             mutation escape hatch, forwarded to the build pipeline.
         model_init_dtype: Trainer-injected parameter initialization dtype.
         activation_swap: Activation swap mode.
-        codegen: Publish a codegen sidecar from the completed native build.
-        codegen_config: Trainer config carrying the sidecar output settings.
     """
 
     num_hidden_layers: int = 4
@@ -65,8 +63,6 @@ class CroppedQwen3MoeOptions:
     allow_cache_entry_mutation: bool = False
     model_init_dtype: str | None = None
     activation_swap: str = "none"
-    codegen: bool = False
-    codegen_config: Any | None = None
 
 
 def _resolve_build_options(
@@ -161,6 +157,4 @@ def build_cropped_qwen3_moe(
         allow_cache_entry_mutation=options.allow_cache_entry_mutation,
         activation_swap=options.activation_swap,
         model_init_dtype=options.model_init_dtype,
-        codegen=options.codegen,
-        codegen_config=options.codegen_config,
     )

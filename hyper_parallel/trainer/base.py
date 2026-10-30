@@ -382,13 +382,9 @@ class BaseTrainer(Stateful, ABC):
                 self.config.activation_checkpoint, "allow_cache_entry_mutation", False),
             activation_swap=self.config.activation_swap,
             compile_config=self.config.compile,
-            # AutoModel keeps this build on the native path and publishes the
-            # snapshot sidecar only after infrastructure has completed.
-            codegen=self.config.codegen,
             # The final dtype is applied inside the atomic build (05 stage-5
             # item 5); the Trainer no longer patches it afterwards.
             model_init_dtype=self.config.model_init_dtype,
-            codegen_config=self.config,
         )
         _validate_optimize_dtype(
             self.model,

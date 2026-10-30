@@ -21,12 +21,10 @@ appended layers:
 * the adapter-driven inline patch — replaced modules and the TP / CP / EP
   strategies lowered into the copied source at their semantic sites.
 
-Boundary forwards are then lowered at the boundary classes.  The artifact
-publishes no plan globals: the runtime reads the frozen plan from
-``codegen_meta.json`` and shards from it (``runtime.parallelize_from_generated``
-falls back to ``_parallelize_inline_from_meta`` when the module defines no
-``hp_parallelize``).  The preflight import checks that the assembled module
-remains importable in the training environment.
+Boundary forwards are then lowered at the boundary classes. The artifact is
+an auditable source export of the frozen native-build decisions; it is not a
+training backend. Preflight validates its syntax and recorded contract without
+importing generated classes into the training process.
 """
 from __future__ import annotations
 
@@ -281,7 +279,7 @@ def _verify_recorded_patch_materialization(
     patch_plan: Any = None,
 ) -> None:
     """Require every trainer-installed source-visible patch to be materialized."""
-    patches = patch_plan if patch_plan is not None else getattr(meta, "_build_patches", None)
+    patches = patch_plan
     local_records = (
         getattr(patches, "local_computes", ()) if patches is not None else ()
     )

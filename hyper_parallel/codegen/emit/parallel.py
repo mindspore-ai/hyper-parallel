@@ -50,7 +50,7 @@ stay valid when combined with the body replacement), and the public
   ``hp_install_boundaries``), with a declarative comment block annotating
   what each side's transitions lower to.
 - ``region`` (EP MoE local region): redistribute in, call the explicit
-  factory-named attribute bound by ``hp_parallelize``, re-wrap locals per
+  factory-named attribute materialized by source emission, re-wrap locals per
   ``out_src``, redistribute out.
 
 A CP inner-wrapper boundary is ``generic`` in the generated code: the wrapper
@@ -92,7 +92,7 @@ from hyper_parallel.codegen.plan.boundary_forms import (
     is_boundary_entry,
 )
 from hyper_parallel.codegen.plan.freeze import parse_placement
-from hyper_parallel.codegen.patch_plan import local_compute_binding_name
+from hyper_parallel.codegen.emit.patches import local_compute_binding_name
 
 #: Injection keys that describe how a boundary's compute is regioned.
 _INJECTION_KEYS = ("inner_wrapper", "inner_target", "inner_out_src", "local_compute_fn")
@@ -186,7 +186,8 @@ def lower_forward_boundaries(
 #: this constant) must stay in sync — see ``_render_local_compute`` and
 #: ``_render_output_redistribute``.
 _RUNTIME_HELPER_IMPORT = (
-    "from hyper_parallel.codegen.runtime import hp_to_local_if_dtensor"
+    "from hyper_parallel.codegen.generated_support import "
+    "to_local_if_dtensor as hp_to_local_if_dtensor"
 )
 
 
@@ -1156,7 +1157,7 @@ def _render_local_compute(
     """Local-region boundary (shape 2, EP MoE): compute fn on local tensors, then exit.
 
     The factory-named attribute is ``functools.partial(compute_fn, module)``
-    bound by ``hp_parallelize``. The applier calls it as ``compute_fn(*args,
+    bound by the emitted constructor patch. The applier calls it as ``compute_fn(*args,
     **kwargs)`` (``_wrap_local_region_forward``), so the generated forward
     forwards its own re-distributed ``*args, **kwargs`` through.  The local
     Production keeps the compute output local so the lowered boundary
@@ -1181,7 +1182,7 @@ def _render_local_compute(
         "        }",
         "",
         "        # [HYPER LOCAL REGION] run the region compute fn on local tensors",
-        f"        # {compute_name} is bound to self by hp_parallelize.",
+        f"        # {compute_name} is bound to self by generated source.",
         f"        outputs = self.{binding_name}(*args, **kwargs)",
         "",
         "        # [HYPER LOCAL REGION] boundary exit",

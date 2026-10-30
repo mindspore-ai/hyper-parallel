@@ -1,7 +1,6 @@
 # Cropped Qwen3-30B-A3B from_config example with Offline Indexed Dataset input.
-# codegen 唯一示例：与 train_parallel_offline.yaml 完全同构，
-# 唯一差异是打开 codegen（codegen: true）并关闭 force_hf
-# （force_hf: false），让并行策略由 codegen 生成的 artifact 显式下沉。
+# Legacy filename retained for migration. Training now always uses the native
+# model and sharding path; artifact generation is owned by the codegen CLI.
 
 model:
   _target_: examples.training_demo.qwen3_moe.cropped_qwen3_moe.build_cropped_qwen3_moe
@@ -158,6 +157,3 @@ checkpoint:
 debug:
   check_nan_inf: false
   check_dataset: null
-
-# codegen 控制字段：与 native 臂（train_parallel_offline.yaml）唯一的差异点。
-codegen: true

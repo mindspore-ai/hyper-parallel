@@ -1,10 +1,21 @@
 # Copyright 2026 Huawei Technologies Co., Ltd
-# Licensed under the Apache License, Version 2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # ============================================================================
 """Bundle emission: the entry the codegen manager calls to produce an artifact.
 
 ``emit_bundle`` is what the manager calls: it is invoked as
-``emit_bundle(layout, meta)`` (manager.ensure_codegen_artifact) after the plan has
+``emit_bundle(layout, meta)`` after the native plan has
 been derived and frozen into ``meta``.  So this layer never derives anything —
 it renders the already-frozen contract into a ``files`` dict
 (filename -> content), and the manager stages + atomically swaps the whole
@@ -59,9 +70,9 @@ def emit_bundle(
         logger.info("codegen: rendered audit-only bundle %s", layout.artifact_dir)
         return {"__init__.py": _strip_trailing_whitespace(emit_init_file(layout))}
     if patch_plan is None:
-        from hyper_parallel.codegen.patch_plan import patch_emission_plan_from_meta
+        from hyper_parallel.codegen.emit.patches import emission_patches_from_meta
 
-        patch_plan = patch_emission_plan_from_meta(meta)
+        patch_plan = emission_patches_from_meta(meta)
     original_text = copy_original_modeling(meta.source)
     generated_text = _strip_trailing_whitespace(
         emit_modeling_file(meta, patch_plan=patch_plan)
@@ -121,16 +132,14 @@ def _strip_trailing_whitespace(text: str) -> str:
 def emit_init_file(layout: ArtifactLayout) -> str:
     """Render the bundle's ``__init__.py`` text.
 
-    The bundle is imported by file location (loader.import_generated_module),
-    not as a package, so this file carries no re-exports — it only marks the
-    directory and records what the bundle is for a reader who opens it.
+    The bundle is an audit/export artifact, so this file carries no re-exports.
     """
     return (
         '"""Generated codegen bundle — DO NOT EDIT MANUALLY.\n'
         "\n"
         f"Generated from: {layout.yaml_path}\n"
-        "Regenerate by re-running training with ``codegen: true``; the bundle\n"
-        "is rebuilt whenever the codegen signature changes.\n"
+        "Regenerate with ``python -m hyper_parallel.codegen generate``; the\n"
+        "bundle is rebuilt whenever the snapshot signature changes.\n"
         '"""\n'
     )
 

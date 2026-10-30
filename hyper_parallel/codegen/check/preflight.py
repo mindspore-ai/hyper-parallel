@@ -104,19 +104,17 @@ def verify_output_hashes(meta: Any, layout: Any) -> None:
             )
 
 
-def verify_generated_import(layout: Any) -> None:
-    """Fail fast when the generated modeling file cannot be imported.
+def verify_generated_source(layout: Any) -> None:
+    """Fail fast when the generated modeling file is not valid Python.
 
-    Importing the generated module is the strongest single check that the
-    bundle is usable: it exercises the module's own imports (runtime, torch,
-    transformers) and top-level class definitions.  The module is cached in
-    ``sys.modules`` by the loader, so preflight and the later build reuse the
-    same import. A minimal placeholder also imports because preflight checks
-    bundle structure, while the emit layer owns lowering completeness.
+    Generated artifacts are audit/export outputs, not a training-time module
+    backend. Preflight therefore validates syntax without importing or
+    registering generated classes in the current process.
     """
-    from hyper_parallel.codegen.loader import import_generated_module
-
-    import_generated_module(layout.artifact_dir)
+    modeling_path = layout.modeling_path
+    with open(modeling_path, "r", encoding="utf-8") as handle:
+        source = handle.read()
+    compile(source, modeling_path, "exec")
 
 
 def verify_meta_required_fields(meta: Any) -> None:
@@ -133,10 +131,8 @@ def verify_meta_required_fields(meta: Any) -> None:
 def verify_snapshot_contract(meta: Any) -> None:
     """Validate snapshot provenance when an artifact declares it.
 
-    Legacy artifacts carry neither snapshot field and remain valid during the
-    staged migration. Snapshot-driven artifacts must identify both their
-    schema and terminal status, and only a fully derived snapshot may own a
-    generated sharding plan.
+    Artifacts must identify both their snapshot schema and terminal status;
+    legacy planner-produced bundles are no longer accepted.
 
     Args:
         meta: Loaded codegen metadata.
@@ -147,7 +143,10 @@ def verify_snapshot_contract(meta: Any) -> None:
     schema_version = getattr(meta, "snapshot_schema_version", None)
     status = getattr(meta, "snapshot_status", None)
     if schema_version is None and status is None:
-        return
+        raise RuntimeError(
+            "codegen preflight: legacy artifact has no snapshot provenance; "
+            "regenerate it with the native-build CLI"
+        )
     if schema_version is None or status is None:
         raise RuntimeError(
             "codegen preflight: snapshot provenance must include both "
@@ -504,7 +503,7 @@ def _get_parameter(model: Any, fqn: str) -> Any:
 
 __all__ = [
     "verify_boundary_forms",
-    "verify_generated_import",
+    "verify_generated_source",
     "verify_meta_required_fields",
     "verify_output_hashes",
     "verify_param_plan",

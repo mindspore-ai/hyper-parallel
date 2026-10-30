@@ -56,7 +56,7 @@ def render_inline_modeling(
     rules = collect_inline_rules(meta)
     if not rules:
         return source_text
-    patches = patch_plan if patch_plan is not None else getattr(meta, "_build_patches", None)
+    patches = patch_plan
     recorded_local_compute = bool(
         getattr(patches, "local_computes", ()) if patches is not None else ()
     )

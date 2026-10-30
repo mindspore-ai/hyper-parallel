@@ -29,7 +29,6 @@ _PRIMITIVE_PREFIXES = (
     "hyper_parallel.components.modules",
     "hyper_parallel.distributed.expert_parallel.experts",
     "hyper_parallel.distributed.context_parallel.collectives",
-    "hyper_parallel.codegen.runtime",
 )
 
 

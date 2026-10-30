@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, Callable, Optional
 
+from hyper_parallel.codegen.plan.freeze import freeze_plan, freeze_plan_application
 from hyper_parallel.codegen.snapshot import (
     CodegenSnapshot,
     CodegenStatus,
@@ -33,6 +34,7 @@ class CodegenBuildSession:
     """Collect native build observations without influencing the build."""
 
     def __init__(self) -> None:
+        """Initialize an empty collection session."""
         self._status = CodegenStatus.COLLECTING
         self._source = FrozenMapping()
         self._replacements = ReplacementSnapshot()
@@ -92,6 +94,36 @@ class CodegenBuildSession:
         if self._plan_application is not None:
             raise RuntimeError("codegen plan application has already been recorded")
         self._plan_application = self._as_mapping(application, "plan_application")
+
+    def observe_plan(self, plan: Any, model: Any, mesh: Any) -> None:
+        """Freeze a native planner result without exposing codegen to the builder."""
+        frozen_plan = freeze_plan(plan, model).to_dict()
+        frozen_plan["parallel_dims"] = {
+            "dp_size": getattr(mesh, "dp_size", 1),
+            "tp_size": mesh.tp_size,
+            "cp_size": mesh.cp_size,
+            "pp_size": getattr(mesh, "pp_size", 1),
+            "ep_size": mesh.ep_size,
+            "sequence_parallel": mesh.sequence_parallel,
+            "loss_parallel": mesh.loss_parallel,
+        }
+        self.record_plan(frozen_plan)
+
+    def observe_plan_application(
+        self,
+        plan: Any,
+        source_shard_info: Any,
+        *,
+        validate_mode: bool,
+    ) -> None:
+        """Freeze the native plan application behind the observation seam."""
+        self.record_plan_application(
+            freeze_plan_application(
+                plan,
+                source_shard_info,
+                validate_mode=validate_mode,
+            )
+        )
 
     def record_diagnostics(self, diagnostics: Mapping[str, Any]) -> None:
         """Record optional JSON-safe counters and audit facts once."""

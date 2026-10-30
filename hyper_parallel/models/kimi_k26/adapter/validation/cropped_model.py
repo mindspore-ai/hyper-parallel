@@ -91,8 +91,6 @@ def build_cropped_kimi_vlm(
         swap_inputs: bool = False,
         freeze_patterns: list[str] | None = None,
         load_pretrained: bool = False,
-        codegen: bool = False,
-        codegen_config: Any | None = None,
 ) -> PreTrainedModel:
     """Create a Kimi-K2.5/K2.6 VLM with a cropped text tower.
 
@@ -148,13 +146,6 @@ def build_cropped_kimi_vlm(
             media tower, e.g. ``["model.vision_tower*"]``, also removes its
             backward pass and saved activations, which is what makes a
             like-for-like comparison against a pipeline that freezes it.
-        codegen: Build the model from the code-generated modeling bundle (the
-            ``generated/`` artifact) instead of the registry modeling path. Must
-            be declared here because :meth:`Target.build` filters unknown
-            runtime kwargs against the target signature, which would otherwise
-            silently drop the trainer's ``codegen=True``.
-        codegen_config: Trainer configuration object forwarded to the codegen
-            artifact pipeline when ``codegen`` is set.
 
     Returns:
         A parallelized ``KimiK25ForConditionalGeneration``, loaded from
@@ -176,7 +167,7 @@ def build_cropped_kimi_vlm(
     model = _build_cropped_kimi_model(
         config, attn_implementation, distributed_setup, peft_config, torch_dtype, validate_placement,
         compile_config, activation_checkpoint, activation_swap, swap_inputs, freeze_patterns,
-        codegen, codegen_config)
+    )
 
     _maybe_load_pretrained(model, model_dir, load_pretrained)
     _bind_kimi_context_parallel(model, distributed_setup)
@@ -302,8 +293,6 @@ def _build_cropped_kimi_model(
         activation_swap: str,
         swap_inputs: bool,
         freeze_patterns: list[str] | None,
-        codegen: bool,
-        codegen_config: Any | None,
 ) -> PreTrainedModel:
     """Instantiate the parallelized model under the vision-init monkey patch."""
     from transformers.models.kimi_k25 import (  # pylint: disable=C0415
@@ -319,9 +308,6 @@ def _build_cropped_kimi_model(
             # The vision position embeddings use trunc_normal_, whose erfinv_ has no
             # HyperParallel DTensor layout-inference registration; swap in the
             # equivalent normal_ initialisation so the random init stays supported.
-            # The class-name check (not isinstance) also matches the codegen
-            # artifact's independent copy of the family, whose classes are
-            # distinct definitions from the native module's.
             if type(module).__name__ == "Kimi_K25VisionPositionEmbeddings":
                 module.position_embeddings.data.normal_(mean=0.0, std=0.02)
                 return None
@@ -331,34 +317,6 @@ def _build_cropped_kimi_model(
 
     _patched = _make_patched_init_weights(orig_init_weights)
     _kimi_mod.Kimi_K25PreTrainedModel._init_weights = _patched  # pylint: disable=protected-access
-
-    # The codegen arm imports an independent modeling copy from the generated
-    # bundle; its Kimi_K25PreTrainedModel carries the same trunc_normal_ init,
-    # which the native-class patch above cannot reach. Wrap the loader's import
-    # so the substitution is applied to the generated module as well, keeping
-    # both arms' random initialization identical.
-    restore_loader = None
-    if codegen:
-        from hyper_parallel.codegen import (  # pylint: disable=C0415
-            loader as _codegen_loader,
-        )
-
-        orig_import = _codegen_loader.import_generated_module
-
-        def _import_with_init_patch(artifact_dir):  # noqa: ANN001
-            module = orig_import(artifact_dir)
-            generated_base = getattr(module, "Kimi_K25PreTrainedModel", None)
-            if generated_base is not None:
-                generated_orig = generated_base._init_weights  # pylint: disable=protected-access
-                generated_base._init_weights = _make_patched_init_weights(generated_orig)  # pylint: disable=protected-access
-            return module
-
-        _codegen_loader.import_generated_module = _import_with_init_patch
-
-        def _restore_loader() -> None:
-            _codegen_loader.import_generated_module = orig_import
-
-        restore_loader = _restore_loader
 
     try:
         return HyperAutoModelForImageTextToText.from_config(
@@ -373,13 +331,9 @@ def _build_cropped_kimi_model(
             activation_swap=activation_swap,
             swap_inputs=swap_inputs,
             freeze_config=freeze_patterns,
-            codegen=codegen,
-            codegen_config=codegen_config,
         )
     finally:
         _kimi_mod.Kimi_K25PreTrainedModel._init_weights = orig_init_weights  # pylint: disable=protected-access
-        if restore_loader is not None:
-            restore_loader()
 
 
 def _maybe_load_pretrained(model: PreTrainedModel, model_dir: str, load_pretrained: bool) -> None:

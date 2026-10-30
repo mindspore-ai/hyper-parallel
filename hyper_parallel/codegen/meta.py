@@ -101,18 +101,13 @@ class CodegenMeta:
     plan_application: dict[str, Any] = field(default_factory=dict)
 
 
-#: Stages the generated artifact declares it covers.  ``sharding_plan`` starts
-#: as the default here (False, kept for metas that predate the field), but
-#: ``_fill_plan_fields`` (manager.py) sets it True once the plan is frozen:
-#: the artifact carries the parallel logic and the runtime shards from
-#: ``codegen_meta.json``.  When True, the trainer short-circuits the
-#: planner+applier and runs the artifact's own parallelize step.
-#: ``module_overrides`` turns True once generation sunk module replacements, so
-#: the trainer's HF replacement step is skipped.
+#: Native-build facts represented by the artifact. ``sharding_plan`` means
+#: the frozen metadata contains the complete observed native plan; it does not
+#: transfer training ownership to the artifact.
 COVERED_DEFAULTS = {
     "sharding_plan": False,
     "module_overrides": False,
-    "model_class": True,
+    "model_class": False,
     "axes": [],
 }
 
@@ -276,9 +271,11 @@ def validate_snapshot_state_contract(data: dict[str, Any]) -> None:
             raise ValueError(
                 "derived snapshot metadata requires a non-empty param_plan and plan_application"
             )
-        if covered.get("sharding_plan") is not True or not parallelize:
+        if covered.get("sharding_plan") is not True:
+            raise ValueError("derived snapshot metadata must cover sharding_plan")
+        if parallelize:
             raise ValueError(
-                "derived snapshot metadata must own sharding_plan and parallelize"
+                "derived snapshot metadata must not expose a training parallelize entrypoint"
             )
         return
     if status == CodegenStatus.NOT_REQUIRED.value:

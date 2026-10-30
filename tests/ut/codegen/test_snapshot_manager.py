@@ -20,7 +20,6 @@ from hyper_parallel.codegen import manager
 from hyper_parallel.codegen.artifact import ArtifactLayout
 from hyper_parallel.codegen.check import verify_snapshot_contract, verify_snapshot_drift
 from hyper_parallel.codegen.emit import replacement
-from hyper_parallel.codegen.plan import derive, offline_mesh
 from hyper_parallel.codegen.session import CodegenBuildSession
 from hyper_parallel.distributed._builder import planner
 
@@ -101,12 +100,10 @@ def test_snapshot_manager_uses_no_legacy_derivation(monkeypatch, tmp_path):
         del args, kwargs
         raise AssertionError("snapshot manager called a legacy derivation path")
 
-    monkeypatch.setattr(manager, "_fill_plan_fields", forbidden)
-    monkeypatch.setattr(manager, "_prepare_codegen_build", forbidden)
-    monkeypatch.setattr(derive, "build_meta_model", forbidden)
-    monkeypatch.setattr(offline_mesh, "build_offline_mesh", forbidden)
+    assert not hasattr(manager, "_fill_plan_fields")
+    assert not hasattr(manager, "_prepare_codegen_build")
     monkeypatch.setattr(planner.ShardingPlanner, "plan", forbidden)
-    monkeypatch.setattr(replacement, "compile_overrides_for_meta", forbidden)
+    assert not hasattr(replacement, "compile_overrides_for_meta")
     monkeypatch.setattr(manager, "_is_rank0", lambda: True)
     monkeypatch.setattr(manager, "load_codegen_meta", lambda _path: None)
     monkeypatch.setattr(manager, "clean_temp_artifacts", lambda _layout: None)
@@ -289,7 +286,7 @@ def test_snapshot_manager_emits_not_required_audit_bundle(monkeypatch, tmp_path)
     ]
 
 
-def test_snapshot_contract_accepts_legacy_and_complete_snapshot_meta():
+def test_snapshot_contract_rejects_legacy_and_accepts_complete_snapshot_meta():
     legacy = type(
         "LegacyMeta",
         (),
@@ -305,7 +302,8 @@ def test_snapshot_contract_accepts_legacy_and_complete_snapshot_meta():
         },
     )()
 
-    verify_snapshot_contract(legacy)
+    with pytest.raises(RuntimeError, match="legacy artifact"):
+        verify_snapshot_contract(legacy)
     verify_snapshot_contract(complete)
 
 
@@ -353,9 +351,17 @@ def test_snapshot_drift_uses_snapshot_signature(tmp_path):
         verify_snapshot_drift(stale, snapshot)
 
 
-def test_snapshot_emission_patches_include_resolved_phase_c_injections():
+def test_snapshot_emission_patches_include_resolved_phase_c_injections(tmp_path):
+    source = tmp_path / "modeling_toy.py"
+    source.write_text(
+        "class ToyMoeBlock:\n    pass\n\nclass ToyAttention:\n    pass\n",
+        encoding="utf-8",
+    )
     payload = {
-        "source": {"module_name": "transformers.models.toy.modeling_toy"},
+        "source": {
+            "module_name": "transformers.models.toy.modeling_toy",
+            "file_path": str(source),
+        },
         "replacements": {
             "applications": [{
                 "primary_fqn": "model.attn",
@@ -420,6 +426,36 @@ def test_snapshot_emission_patches_include_resolved_phase_c_injections():
     )
 
 
+def test_snapshot_emission_skips_local_compute_for_imported_class(tmp_path):
+    source = tmp_path / "modeling_deepseek_v41.py"
+    source.write_text("class DeepseekV41Model:\n    pass\n", encoding="utf-8")
+    payload = {
+        "source": {
+            "module_name": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41",
+            "file_path": str(source),
+        },
+        "replacements": {"applications": []},
+        "plan": {
+            "boundary_classes": {
+                "model.layers.0.mlp": "DeepseekV4SparseMoeBlock",
+            },
+            "param_plan": {"model.layers.0.mlp": {"region_dispatch": False}},
+        },
+        "plan_application": {
+            "resolved_injections": [{
+                "match": "model.layers.0.mlp",
+                "local_compute_fn": {
+                    "_target_": "hyper_parallel.models.deepseek_v41:ep_compute",
+                },
+            }],
+        },
+    }
+
+    patches = manager._snapshot_emission_patches(payload)
+
+    assert not patches["local_computes"]
+
+
 def test_snapshot_manager_normalizes_deepseek_v4_family(monkeypatch, tmp_path):
     source = tmp_path / "modeling_deepseek_v4.py"
     source.write_text("class DeepseekV4:\n    pass\n", encoding="utf-8")
@@ -441,11 +477,12 @@ def test_snapshot_manager_normalizes_deepseek_v4_family(monkeypatch, tmp_path):
     )
     captured = {}
 
-    def resolve(model_type, **_kwargs):
+    def _resolve(model_type, **_kwargs):
         captured["model_type"] = model_type
+        captured["model_name"] = _kwargs.get("model_name")
         return layout
 
-    monkeypatch.setattr(manager, "resolve_model_artifact_layout", resolve)
+    monkeypatch.setattr(manager, "resolve_model_artifact_layout", _resolve)
     monkeypatch.setattr(manager, "ensure_artifact_dir", lambda _layout: None)
     monkeypatch.setattr(manager, "clean_temp_artifacts", lambda _layout: None)
     monkeypatch.setattr(manager, "_is_rank0", lambda: True)
@@ -463,3 +500,45 @@ def test_snapshot_manager_normalizes_deepseek_v4_family(monkeypatch, tmp_path):
         "DeepSeek family alias mismatch: "
         f"expected=deepseek_v41, got={captured['model_type']}"
     )
+    assert captured["model_name"] == "Deepseek_V4"
+
+
+def test_snapshot_layout_uses_model_type_token_instead_of_architecture(
+    monkeypatch, tmp_path
+):
+    source = tmp_path / "modeling_qwen3_moe.py"
+    source.write_text("class Qwen3MoeForCausalLM:\n    pass\n", encoding="utf-8")
+    snapshot = _snapshot(source)
+    payload = snapshot.to_dict()
+    payload["source"]["model_type"] = "qwen3_moe"
+    payload["source"]["architecture"] = "Qwen3MoeForCausalLM"
+    snapshot = type(snapshot).from_dict(payload)
+    captured = {}
+
+    def _resolve(model_type, **kwargs):
+        captured.update(model_type=model_type, model_name=kwargs.get("model_name"))
+        return ArtifactLayout.build_default(
+            str(tmp_path / "generated"), kwargs.get("model_name")
+        )
+
+    monkeypatch.setattr(manager, "resolve_model_artifact_layout", _resolve)
+    monkeypatch.setattr(manager, "ensure_artifact_dir", lambda _layout: None)
+    monkeypatch.setattr(manager, "clean_temp_artifacts", lambda _layout: None)
+    monkeypatch.setattr(manager, "_is_rank0", lambda: True)
+    monkeypatch.setattr(
+        manager,
+        "load_codegen_meta",
+        lambda _path: type(
+            "Meta", (), {"signature": manager.signature_from_snapshot(snapshot)}
+        )(),
+    )
+    monkeypatch.setattr(manager, "barrier_after_artifact", lambda: None)
+
+    layout = manager.ensure_codegen_artifact_from_snapshot(snapshot)
+
+    assert captured == {"model_type": "qwen3_moe", "model_name": "Qwen3_Moe"}
+    assert layout.diff_path.endswith("modeling_Qwen3_Moe_gen_npu.py.diff")
+    meta = manager._build_meta_from_snapshot(
+        snapshot, layout, manager.signature_from_snapshot(snapshot)
+    )
+    assert meta.model_name == "Qwen3_Moe"

@@ -93,3 +93,15 @@ fusion_result.json
 /hyper_parallel/rl/examples/swe_smith/docker/
 # Codegen demo artifact (machine-generated next to the training YAML)
 examples/training_demo/qwen3_moe/generated/
+
+# Codegen generated bundles (machine-generated, do not commit)
+hyper_parallel/models/*/generated/
+
+# Codegen validation scripts (local-only, do not commit)
+examples/training_demo/codegen_validation/
+
+# Local verification docs and temp
+.tmp/
+docs/codegen-*-verification.md
+docs/codegen-full-regeneration-*.md
+issue_hsdp_prefetch/

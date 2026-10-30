@@ -20,9 +20,7 @@ import pytest
 
 from hyper_parallel.codegen.check.preflight import verify_snapshot_contract
 from hyper_parallel.codegen.emit.parallel import lower_forward_boundaries
-from hyper_parallel.codegen.loader import import_generated_module
-from hyper_parallel.codegen.meta import CodegenMeta, validate_meta_schema, write_codegen_meta
-from hyper_parallel.codegen.runtime import verify_codegen_signature
+from hyper_parallel.codegen.meta import CodegenMeta, validate_meta_schema
 
 
 def _not_required_meta() -> CodegenMeta:
@@ -78,14 +76,7 @@ def test_not_required_meta_rejects_executable_plan_fields(field, value):
         })
 
 
-def test_not_required_runtime_and_emitter_reject_execution(tmp_path):
-    meta = _not_required_meta()
-    write_codegen_meta(meta, str(tmp_path / "codegen_meta.json"))
-
-    with pytest.raises(RuntimeError, match="not_required artifact"):
-        verify_codegen_signature(meta)
-    with pytest.raises(RuntimeError, match="audit-only"):
-        import_generated_module(str(tmp_path))
+def test_not_required_emitter_rejects_parallel_lowering():
     with pytest.raises(ValueError, match="no parallel boundaries"):
         lower_forward_boundaries(
             "class Block:\n    pass\n",

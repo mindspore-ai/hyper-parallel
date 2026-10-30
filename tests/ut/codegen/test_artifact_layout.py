@@ -161,6 +161,44 @@ class TestResolveLayoutPriority:
         layout = manager._resolve_layout(config, yaml_path, None, hf_config=None)
         assert layout.artifact_dir == os.path.join(str(tmp_path), "generated")
 
+    def test_custom_builder_check_reuses_model_anchored_snapshot_identity(
+        self, monkeypatch, tmp_path
+    ):
+        """A custom model builder resolves check to its published bundle."""
+        generated = tmp_path / "models" / "deepseek_v41" / "generated"
+        calls = []
+
+        def _resolve(model_type, model_name=None, yaml_path=None):
+            calls.append((model_type, model_name, yaml_path))
+            return ArtifactLayout.build_default(str(generated), model_name)
+
+        monkeypatch.setattr(manager, "resolve_model_artifact_layout", _resolve)
+        monkeypatch.setattr(
+            manager,
+            "load_codegen_meta",
+            lambda _path: SimpleNamespace(model_name="Deepseek_V4"),
+        )
+        def _custom_builder():
+            return None
+
+        config = self._config(
+            _target_=_custom_builder,
+            _target_path=(
+                "hyper_parallel.models.deepseek_v41.adapter.validation."
+                "cropped_model.build_cropped_deepseek_v41"
+            )
+        )
+        yaml_path = str(tmp_path / "validation" / "deepseek_v41_native.yaml")
+
+        layout = manager._resolve_layout(config, yaml_path, None, hf_config=None)
+
+        assert layout.artifact_dir == str(generated)
+        assert Path(layout.diff_path).name == "modeling_Deepseek_V4_gen_npu.py.diff"
+        assert calls == [
+            ("deepseek_v41", None, None),
+            ("deepseek_v41", "Deepseek_V4", yaml_path),
+        ]
+
     def test_from_config_path_anchors_like_the_trainer(self, monkeypatch, tmp_path):
         """CLI chain on a ``from_config`` YAML (``config_path`` spelling)
         resolves the model type and anchors to the same family directory the

@@ -25,7 +25,6 @@ AutoModels objects and never imports trainer config (05 §15.2.6).
 
 import fnmatch
 import logging
-from dataclasses import replace
 from typing import Any, Dict, Literal, Optional, Union
 
 import torch
@@ -43,6 +42,7 @@ from hyper_parallel.models._transformers.checkpoint_loader import (
     _finalize_model_loading,
 )
 from hyper_parallel.models.build_options import CompileConfig
+from hyper_parallel.models.build_observer import ModelBuildObserver
 from hyper_parallel.models.materialization import (
     MaterializationContext,
     rebuild_materialized_state,
@@ -66,8 +66,6 @@ from hyper_parallel.distributed._builder.fsdp_adapter import (
 from hyper_parallel.distributed.mesh import DistributedSetup, MeshContext
 from hyper_parallel.distributed.apply import apply_sharding_plan
 from hyper_parallel.distributed._builder.planner import ShardingPlanner
-from hyper_parallel.codegen.modeling_backend import ModelingBackend
-from hyper_parallel.codegen.plan.freeze import freeze_plan, freeze_plan_application
 from hyper_parallel.models.registry import _resolve_custom_model_cls, get_model_adapter
 from hyper_parallel.models.external_state import (
     ExternalBuildContext,
@@ -75,7 +73,6 @@ from hyper_parallel.models.external_state import (
     get_model_external_state,
 )
 from hyper_parallel.models.replacement import (
-    ModuleReplacementSpec,
     _apply_module_replacement_actions,
 )
 
@@ -155,7 +152,6 @@ def _init_model(
     is_hf_model: bool,
     *model_args,
     backend=None,
-    codegen_artifact_dir: Optional[str] = None,
     **kwargs,
 ) -> tuple[bool, nn.Module]:
     """Initialize model — dispatching to custom or HF path.
@@ -170,9 +166,7 @@ def _init_model(
         torch_dtype: "auto" / "bfloat16" / etc.
         is_hf_model: True = HF native, False = custom implementation.
         *model_args: Extra positional args for model constructor.
-        backend: Backend selector; only ``ModelingBackend.GEN`` (codegen) is
-            consulted, the native ``is_hf_model`` dispatch handles the rest.
-        codegen_artifact_dir: Artifact directory for the gen backend (codegen).
+        backend: Reserved native backend selector.
         **kwargs: Extra keyword args.
 
     Returns:
@@ -181,25 +175,7 @@ def _init_model(
     architectures = getattr(hf_config, "architectures", []) or []
     arch_name = architectures[0] if architectures else ""
 
-    # codegen sidecar: the gen backend bypasses the HF/custom dispatch
-    # below; the native is_hf_model wiring stays as-is for everything else.
-    if backend is ModelingBackend.GEN:
-        if codegen_artifact_dir is None:
-            raise ValueError(
-                "the gen backend requires codegen_artifact_dir; "
-                "from_pretrained() must prepare it via ensure_codegen_artifact()"
-            )
-        from hyper_parallel.codegen.loader import init_generated_model  # pylint: disable=import-outside-toplevel
-
-        model = init_generated_model(
-            codegen_artifact_dir,
-            pretrained_model_name_or_path,
-            hf_config,
-            *model_args,
-            torch_dtype=torch_dtype,
-            **kwargs,
-        )
-        return False, model
+    del backend
 
     # ── Path A: HF native ──
     if is_hf_model:
@@ -275,7 +251,7 @@ def _plan_and_apply_sharding(
     sharding_planner,
     is_hf_model: bool,
     validate_placement: bool,
-    codegen_session: Optional[Any] = None,
+    build_observer: Optional[ModelBuildObserver] = None,
 ) -> tuple[nn.Module, Optional[dict]]:
     """Plan parameter layouts and apply dual-mode sharding when requested."""
     model_sharding_requested = (
@@ -283,21 +259,21 @@ def _plan_and_apply_sharding(
         and any(size > 1 for size in (mesh.tp_size, mesh.cp_size, mesh.ep_size))
     )
     if sharding_planner is None:
-        if codegen_session is not None:
-            codegen_session.mark_not_required("planner_unavailable")
+        if build_observer is not None:
+            build_observer.mark_not_required("planner_unavailable")
         return model, None
     if mesh is None:
-        if codegen_session is not None:
-            codegen_session.mark_not_required("mesh_unavailable")
+        if build_observer is not None:
+            build_observer.mark_not_required("mesh_unavailable")
         return model, None
     if is_hf_model and not model_sharding_requested:
-        if codegen_session is not None:
-            codegen_session.mark_not_required("pure_data_parallel")
+        if build_observer is not None:
+            build_observer.mark_not_required("pure_data_parallel")
         return model, None
     if mesh.device_mesh is None:
         logger.warning("MeshContext has no device_mesh; skipping sharding")
-        if codegen_session is not None:
-            codegen_session.mark_not_required("device_mesh_unavailable")
+        if build_observer is not None:
+            build_observer.mark_not_required("device_mesh_unavailable")
         return model, None
 
     logger.info(
@@ -318,177 +294,22 @@ def _plan_and_apply_sharding(
         sequence_parallel=mesh.sequence_parallel,
         loss_parallel=mesh.loss_parallel,
     )
-    if codegen_session is not None:
-        frozen_plan = freeze_plan(plan, model).to_dict()
-        frozen_plan["parallel_dims"] = {
-            "dp_size": getattr(mesh, "dp_size", 1),
-            "tp_size": mesh.tp_size,
-            "cp_size": mesh.cp_size,
-            "pp_size": getattr(mesh, "pp_size", 1),
-            "ep_size": mesh.ep_size,
-            "sequence_parallel": mesh.sequence_parallel,
-            "loss_parallel": mesh.loss_parallel,
-        }
-        codegen_session.record_plan(frozen_plan)
+    if build_observer is not None:
+        build_observer.observe_plan(plan, model, mesh)
     model, source_shard_info = apply_sharding_plan(
         model,
         plan,
         mesh,
         validate_mode=validate_placement,
     )
-    if codegen_session is not None:
-        codegen_session.record_plan_application(
-            freeze_plan_application(
-                plan,
-                source_shard_info,
-                validate_mode=validate_placement,
-            )
+    if build_observer is not None:
+        build_observer.observe_plan_application(
+            plan,
+            source_shard_info,
+            validate_mode=validate_placement,
         )
     logger.info("Sharding plan applied; source_shard_info keys=%d", len(source_shard_info or {}))
     return model, source_shard_info
-
-
-def _parallelize_from_generated(
-    model: nn.Module,
-    mesh,
-    codegen_artifact_dir: Optional[str],
-    hf_config=None,
-) -> tuple[bool, Optional[dict]]:
-    """Let a generated artifact own sharding when its metadata says so."""
-    if not codegen_artifact_dir:
-        return False, None
-    if mesh is None:
-        return False, None
-    if not any(
-        getattr(mesh, name, 1) > 1 for name in ("tp_size", "cp_size", "ep_size")
-    ):
-        from hyper_parallel.codegen.runtime import publish_codegen_mesh_context  # pylint: disable=import-outside-toplevel
-
-        publish_codegen_mesh_context(codegen_artifact_dir, mesh)
-        return False, None
-
-    from hyper_parallel.codegen.runtime import (  # pylint: disable=import-outside-toplevel
-        load_codegen_meta,
-        parallelize_from_generated,
-        verify_codegen_signature,
-    )
-
-    meta = load_codegen_meta(codegen_artifact_dir)
-    if meta is None or not (meta.covered or {}).get("sharding_plan"):
-        return False, None
-
-    verify_codegen_signature(meta, hf_config)
-    source_shard_info = parallelize_from_generated(model, mesh, codegen_artifact_dir)
-    logger.info(
-        "codegen: sharding applied by the generated module; source_shard_info keys=%d",
-        len(source_shard_info or {}),
-    )
-    return True, source_shard_info
-
-
-def _module_replacements_covered_by_generated(
-    codegen_artifact_dir: Optional[str],
-) -> bool:
-    """Return whether generated model initialization already applied replacements."""
-    if not codegen_artifact_dir:
-        return False
-
-    from hyper_parallel.codegen.runtime import load_codegen_meta  # pylint: disable=import-outside-toplevel
-
-    meta = load_codegen_meta(codegen_artifact_dir)
-    return meta is not None and bool((meta.covered or {}).get("module_overrides"))
-
-
-def _symbol_path(symbol: type) -> str:
-    """Return the stable path used by codegen replacement metadata."""
-    return f"{symbol.__module__}:{symbol.__qualname__}"
-
-
-def _rebind_codegen_replacement_specs(
-    model: nn.Module,
-    specs: Optional[tuple[ModuleReplacementSpec, ...]],
-    codegen_artifact_dir: Optional[str],
-) -> Optional[tuple[ModuleReplacementSpec, ...]]:
-    """Bind native replacement rules to copied classes in generated source.
-
-    A generated modeling file owns class definitions but no longer owns module
-    replacement execution.  Consequently its source modules have the same
-    qualified names as the native classes recorded by YAML, but different
-    Python identities.  The signed generation observations provide the exact
-    FQNs at which that identity translation is valid; no name-only fallback is
-    allowed outside those observations.
-    """
-    if not specs or not codegen_artifact_dir:
-        return specs
-
-    # Runtime-owned custom-model artifacts instantiate the registered native
-    # class. Their replacement specs already target the live module identities;
-    # rebinding is only needed for copied classes from generated source.
-    if not type(model).__module__.startswith("hyper_parallel_generated."):
-        return specs
-
-    from hyper_parallel.codegen.runtime import load_codegen_meta  # pylint: disable=import-outside-toplevel
-
-    meta = load_codegen_meta(codegen_artifact_dir)
-    records = ((meta.emission_patches or {}).get("module_replacements", ()) if meta else ())
-    if not records:
-        return specs
-
-    generated_module = type(model).__module__
-    rebound = []
-    consumed_fqns = set()
-    for spec in specs:
-        source_path = _symbol_path(spec.module_type)
-        matching = [record for record in records if record.get("source_type") == source_path]
-        if not matching:
-            raise RuntimeError(
-                f"codegen: replacement rule for {source_path} has no generation observation; "
-                "regenerate the artifact instead of guessing a copied class by name"
-            )
-
-        observed_types = set()
-        for record in matching:
-            module_fqn = record.get("module_fqn")
-            if not module_fqn or not any(
-                fnmatch.fnmatchcase(module_fqn, pattern) for pattern in spec.match
-            ):
-                raise RuntimeError(
-                    f"codegen: replacement observation {module_fqn!r} does not match "
-                    f"the configured rule {spec.match}"
-                )
-            try:
-                module = model.get_submodule(module_fqn)
-            except AttributeError as exc:
-                raise RuntimeError(
-                    f"codegen: replacement observation {module_fqn!r} is absent from "
-                    "the generated model; regenerate the artifact"
-                ) from exc
-            module_type = type(module)
-            if (
-                module_type.__module__ != generated_module
-                or module_type.__qualname__ != spec.module_type.__qualname__
-            ):
-                raise RuntimeError(
-                    f"codegen: {module_fqn!r} resolved to {_symbol_path(module_type)}, "
-                    f"not the generated equivalent of {source_path}"
-                )
-            observed_types.add(module_type)
-            consumed_fqns.add(module_fqn)
-
-        if len(observed_types) != 1:
-            raise RuntimeError(
-                f"codegen: replacement rule for {source_path} resolved to multiple "
-                "generated source types"
-            )
-        rebound.append(replace(spec, module_type=observed_types.pop()))
-
-    recorded_fqns = {record.get("module_fqn") for record in records}
-    if consumed_fqns != recorded_fqns:
-        extra = sorted(recorded_fqns - consumed_fqns, key=str)
-        raise RuntimeError(
-            f"codegen: replacement observations do not map to configured rules: {extra}"
-        )
-    return tuple(rebound)
 
 
 def _move_model_to_device(
@@ -794,26 +615,14 @@ def _create_external_state(model: nn.Module, mesh: Optional[MeshContext],
 
 def _maybe_apply_module_replacements(
     model: nn.Module,
-    codegen_artifact_dir: Optional[str],
     distributed_setup: Optional[Any],
     low_precision_config: Optional[Any],
     load_base_model: bool,
     weights_mapping: Any,
-    codegen_session: Optional[Any] = None,
+    build_observer: Optional[ModelBuildObserver] = None,
 ) -> tuple:
-    """Apply structure-preserving replacements unless codegen already did."""
-    if _module_replacements_covered_by_generated(codegen_artifact_dir):
-        logger.info(
-            "codegen: module overrides already applied by the generated __init__; "
-            "skipping native module replacement"
-        )
-        return model, weights_mapping
+    """Apply native structure-preserving replacements."""
     replacement_specs = tuple(getattr(distributed_setup, "module_replacements", None) or ())
-    replacement_specs = _rebind_codegen_replacement_specs(
-        model,
-        replacement_specs,
-        codegen_artifact_dir,
-    )
     return _apply_module_replacement_actions(
         model,
         replacement_specs,
@@ -821,7 +630,7 @@ def _maybe_apply_module_replacements(
         context=_build_replacement_context(distributed_setup, low_precision_config),
         capture_checkpoint_metadata=load_base_model,
         observation_callback=(
-            None if codegen_session is None else codegen_session.record_replacements
+            None if build_observer is None else build_observer.record_replacements
         ),
     )
 
@@ -870,8 +679,7 @@ def apply_model_infrastructure(
     validate_placement: bool = False,
     low_precision_config: Optional[Any] = None,
     model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
-    codegen_artifact_dir: Optional[str] = None,
-    codegen_session: Optional[Any] = None,
+    build_observer: Optional[ModelBuildObserver] = None,
     **kwargs: Any,
 ) -> nn.Module:
     """Apply sharding, activation wrappers, FSDP2, initialization and compilation.
@@ -892,24 +700,9 @@ def apply_model_infrastructure(
     # Step 5.5: structure-preserving replacement before plan derivation.
     weights_mapping = get_model_conversion_mapping(model)
     model, weights_mapping = _maybe_apply_module_replacements(
-        model, codegen_artifact_dir, distributed_setup, low_precision_config,
-        load_base_model, weights_mapping, codegen_session,
+        model, distributed_setup, low_precision_config,
+        load_base_model, weights_mapping, build_observer,
     )
-    if codegen_artifact_dir:
-        from hyper_parallel.codegen.check.preflight import (  # pylint: disable=import-outside-toplevel
-            verify_param_plan,
-        )
-        from hyper_parallel.codegen.runtime import (  # pylint: disable=import-outside-toplevel
-            load_codegen_meta,
-        )
-
-        codegen_meta = load_codegen_meta(codegen_artifact_dir)
-        if codegen_meta is None:
-            raise FileNotFoundError(
-                f"codegen: missing metadata in {codegen_artifact_dir}; "
-                "regenerate the artifact"
-            )
-        verify_param_plan(codegen_meta, model)
     if is_meta_device:
         _apply_materialization_adapter(model)
 
@@ -917,21 +710,14 @@ def apply_model_infrastructure(
         _apply_parameter_freezing(model, freeze_config)
 
     # Steps 7-8: plan and apply parameter/activation layouts.
-    handled, source_shard_info = _parallelize_from_generated(
+    model, source_shard_info = _plan_and_apply_sharding(
         model,
         mesh,
-        codegen_artifact_dir,
-        hf_config=kwargs.get("hf_config"),
+        sharding_planner,
+        is_hf_model,
+        validate_placement,
+        build_observer,
     )
-    if not handled:
-        model, source_shard_info = _plan_and_apply_sharding(
-            model,
-            mesh,
-            sharding_planner,
-            is_hf_model,
-            validate_placement,
-            codegen_session,
-        )
 
     model = _apply_activation_features(
         model,

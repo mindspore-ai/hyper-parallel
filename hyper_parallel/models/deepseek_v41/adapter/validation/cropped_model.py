@@ -386,7 +386,6 @@ def build_deepseek_v41_validation_config(
         vision_parameter_divisor: int = 4,
         num_routed_experts: int = 16,
         exercise_post_training_indexer: bool = True,
-        enable_candidate_pool: bool = False,
         indexer_loss_coeff: float = 1.0e-3,
         router_aux_loss_coeff: float = 1.0e-4,
         router_bias_update_rate: float = 1.0e-3,
@@ -414,10 +413,6 @@ def build_deepseek_v41_validation_config(
         num_routed_experts: Routed-expert count for the crop; routing top-k and every MoE layer are retained.
         exercise_post_training_indexer: Bound the candidate pool so a 4K smoke
             exercises candidate selection before the released Reindex layers.
-            Only applies when enable_candidate_pool is True.
-        enable_candidate_pool: Retain hierarchical candidates when True. Defaults to False, which
-            disables candidate-specific crop remapping and preserves the
-            retained released Full/Reindex/Reuse roles with full-range causal indexing.
         indexer_loss_coeff: Sparse-stage Indexer KL coefficient.
         router_aux_loss_coeff: Sequence balancing coefficient; zero disables it.
         router_bias_update_rate: Per-step text/image correction-bias update speed; zero disables it.
@@ -432,22 +427,25 @@ def build_deepseek_v41_validation_config(
     Raises:
         ValueError: If the source, parameter crop, or assets are inconsistent.
     """
-    if not isinstance(enable_candidate_pool, bool):
-        raise ValueError(f"enable_candidate_pool must be a bool, got {enable_candidate_pool!r}")
     source, text, assets, assets_path, released_hidden_layers = _load_validation_sources(
         config_path, engram_assets_path
     )
     resolved_hidden_layers = _resolve_crop_depth(num_hidden_layers, released_hidden_layers, "num_hidden_layers")
     resolved_routed_experts = _resolve_routed_experts(text, num_routed_experts)
     dimensions = _scale_text_dimensions(text, text_parameter_divisor, assets)
-    config = _build_text_config(source, text, dimensions, resolved_hidden_layers, resolved_routed_experts)
-    _apply_v41_extension_fields(
-        config, source, text, assets, assets_path, resolved_hidden_layers,
-        exercise_post_training_indexer and enable_candidate_pool, indexer_loss_coeff,
+    config = _build_text_config(
+        source, text, dimensions, resolved_hidden_layers, resolved_routed_experts
     )
-    if not enable_candidate_pool:
-        config.v41_candidate_source_layer_id = -1
-        config.v41_candidate_topk_blocks = 0
+    _apply_v41_extension_fields(
+        config,
+        source,
+        text,
+        assets,
+        assets_path,
+        resolved_hidden_layers,
+        exercise_post_training_indexer,
+        indexer_loss_coeff,
+    )
     config.router_aux_loss_coef = float(router_aux_loss_coeff)
     config.router_bias_update_rate = float(router_bias_update_rate)
     _apply_v41_vision_fields(
@@ -465,8 +463,11 @@ def build_deepseek_v41_validation_config(
         dspark_confidence_coeff,
     )
     _apply_engram_host_fields(
-        config, engram_storage_backend, engram_max_pending_entries,
-        engram_max_sparse_rows_per_step, engram_sparse_adam_config,
+        config,
+        engram_storage_backend,
+        engram_max_pending_entries,
+        engram_max_sparse_rows_per_step,
+        engram_sparse_adam_config,
     )
     config._attn_implementation = "eager"  # pylint: disable=protected-access
     # Record the source identity the way AutoConfig.from_pretrained does; the
@@ -506,9 +507,6 @@ def build_cropped_deepseek_v41(
         swap_inputs: bool = False,
         activation_swap: str = "none",
         model_init_dtype: str = "float32",
-        codegen: bool = False,
-        codegen_config: Any | None = None,
-        enable_candidate_pool: bool = False,
 ) -> PreTrainedModel:
     """Build and parallelize a configurable V4.1 validation crop.
 
@@ -516,10 +514,8 @@ def build_cropped_deepseek_v41(
         config_path: Local DeepSeek-V4.1 repository.
         engram_assets_path: Prepared scaled-Engram JSON file.
         num_routed_experts: Routed-expert count for the parameter crop.
-        exercise_post_training_indexer: Bound candidates and remap shallow crops for Reindex testing.
-            Only applies when enable_candidate_pool is True.
-        enable_candidate_pool: Enable hierarchical candidates. Defaults to False, which disables
-            candidate-specific remapping and preserves the retained released layer roles.
+        exercise_post_training_indexer: Exercise the Full/Reindex hierarchy at
+            native layer indices.
         indexer_loss_coeff: Sparse-stage Indexer KL coefficient.
         router_aux_loss_coeff: Sequence balancing coefficient; zero disables it.
         router_bias_update_rate: Per-step text/image correction-bias update speed; zero disables it.
@@ -538,23 +534,24 @@ def build_cropped_deepseek_v41(
         swap_inputs: Trainer-injected activation-swap input flag.
         activation_swap: Activation-swap mode.
         model_init_dtype: Final parameter initialization dtype.
-        codegen: Select the codegen ``gen`` backend for this build.
-        codegen_config: Optional codegen backend configuration.
     """
     config = build_deepseek_v41_validation_config(
-        config_path, engram_assets_path,
+        config_path,
+        engram_assets_path,
         num_hidden_layers=num_hidden_layers,
         text_parameter_divisor=text_parameter_divisor,
-        enable_vision=enable_vision, vision_num_hidden_layers=vision_num_hidden_layers,
+        enable_vision=enable_vision,
+        vision_num_hidden_layers=vision_num_hidden_layers,
         vision_parameter_divisor=vision_parameter_divisor,
         num_routed_experts=num_routed_experts,
         exercise_post_training_indexer=exercise_post_training_indexer,
-        enable_candidate_pool=enable_candidate_pool,
         indexer_loss_coeff=indexer_loss_coeff,
         router_aux_loss_coeff=router_aux_loss_coeff,
         router_bias_update_rate=router_bias_update_rate,
-        dspark_depth=dspark_depth, dspark_target_layer_ids=dspark_target_layer_ids,
-        dspark_loss_coeff=dspark_loss_coeff, dspark_confidence_coeff=dspark_confidence_coeff,
+        dspark_depth=dspark_depth,
+        dspark_target_layer_ids=dspark_target_layer_ids,
+        dspark_loss_coeff=dspark_loss_coeff,
+        dspark_confidence_coeff=dspark_confidence_coeff,
         engram_storage_backend=engram_storage_backend,
         engram_max_pending_entries=engram_max_pending_entries,
         engram_max_sparse_rows_per_step=engram_max_sparse_rows_per_step,
@@ -572,8 +569,6 @@ def build_cropped_deepseek_v41(
         swap_inputs=swap_inputs,
         activation_swap=activation_swap,
         model_init_dtype=model_init_dtype,
-        codegen=codegen,
-        codegen_config=codegen_config,
     )
 
 
@@ -590,8 +585,6 @@ def _run_validation_model_builder(
         swap_inputs: bool,
         activation_swap: str,
         model_init_dtype: str,
-        codegen: bool,
-        codegen_config: Any | None,
 ) -> PreTrainedModel:
     """Invoke the model builder with the trainer wiring."""
     return HyperAutoModelForCausalLM.from_config(
@@ -607,8 +600,6 @@ def _run_validation_model_builder(
         swap_inputs=swap_inputs,
         activation_swap=activation_swap,
         model_init_dtype=model_init_dtype,
-        codegen=codegen,
-        codegen_config=codegen_config,
     )
 
 
