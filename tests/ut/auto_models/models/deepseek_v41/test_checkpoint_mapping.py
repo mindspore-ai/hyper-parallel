@@ -39,6 +39,7 @@ class _RouterModel(nn.Module):
     base_model_prefix = "model"
 
     def __init__(self) -> None:
+        """Create router parameters and aliases exercised by the HF loaders."""
         super().__init__()
         layer = nn.Module()
         layer.mlp = nn.Module()
@@ -93,6 +94,7 @@ class TestCheckpointMapping(unittest.TestCase):
             observed_views = []
 
             def load(view: str, **kwargs: object) -> str:
+                """Inspect the selected index while its temporary view exists."""
                 del kwargs
                 observed_views.append(Path(view))
                 files, metadata = get_checkpoint_shard_files(
@@ -106,8 +108,12 @@ class TestCheckpointMapping(unittest.TestCase):
                                  f"unused key found in {metadata['weight_map']}")
                 return "loaded"
 
-            with patch.object(cropped_model, "build_layer_cropped_config"), patch.object(
-                    cropped_model.HyperAutoModelForImageTextToText, "from_pretrained", side_effect=load):
-                result = cropped_model.build_hf_layer_cropped_deepseek_v41(str(source))
+            config = unittest.mock.MagicMock()
+            config.v41_vision_enabled = True
+            config.v41_vision_num_hidden_layers = 2
+            config.num_hidden_layers = 1
+            with patch.object(cropped_model, "_validate_pretrained_dimensions"), patch.object(
+                    cropped_model.HyperAutoModelForCausalLM, "from_pretrained", side_effect=load):
+                result = cropped_model._load_validation_hf_weights(config, str(source))
             self.assertEqual(result, "loaded", f"result={result}, expected=loaded")
             self.assertFalse(observed_views[0].exists(), f"temporary view remains: {observed_views[0]}")
