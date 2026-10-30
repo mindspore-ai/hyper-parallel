@@ -17,70 +17,29 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import http.client
 import json
+import logging
 import os
-import re
-import shlex
 from pathlib import Path
-import socket
 import socketserver
-import signal
 import subprocess
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse
+
+from rl.agentic.codex.container_execution import CandidateRelay, run_container_codex
+from rl.agentic.envs.docker_workspace import DockerWorkspace
+
+
+_LOGGER = logging.getLogger(__name__)
+
 
 class SearchBudgetExceeded(ValueError):
     """A terminal local policy outcome, not a retryable upstream failure."""
-
-
-def _simple_shell_command(command: str) -> tuple[list[str], bool]:
-    """Tokenize shell punctuation while preserving punctuation inside quotes."""
-    try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;<>")
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        tokens = list(lexer)
-    except ValueError:
-        return [], False
-    controls = {"|", "||", "&", "&&", ";", ";;", "<", "<<", ">", ">>"}
-    simple = bool(tokens) and not any(token in controls for token in tokens)
-    # Command substitution remains out of scope; quoted pipes are already handled by shlex.
-    if "`" in command or "$(" in command or "\n" in command:
-        simple = False
-    return tokens, simple
-
-
-def classify_command_result(command: str, output: str) -> dict:
-    """Conservatively classify explicit execution status, not arbitrary shell semantics."""
-    match = re.search(r"^(?:Process exited with code|exit code[:=]?)\s*(\d+)\s*$", output, re.I | re.M)
-    if not match or int(match[1]) == 0:
-        return {"failure_origin": None, "failure_reason": None, "trainable": True}
-    code = int(match[1])
-    args, simple = _simple_shell_command(command)
-    program = args[0] if args else ""
-    if code in (126, 127, 137, 143) or any(marker in output.lower() for marker in (
-        "input/output error", "cannot allocate memory", "transport endpoint", "no space left on device",
-    )):
-        return {"failure_origin": "infrastructure", "failure_reason": "execution_environment", "trainable": False}
-    if simple and program == "rg" and code == 1:
-        return {"failure_origin": "model", "failure_reason": "no_match", "trainable": True}
-    lowered = output.lower()
-    if code == 2 and "bash: -c:" in lowered and any(
-        marker in lowered for marker in ("syntax error", "unexpected eof")
-    ):
-        return {"failure_origin": "model", "failure_reason": "invalid_command", "trainable": True}
-    if simple and program in ("rg", "sed", "cat", "head", "tail", "ls") and any(
-        marker in lowered for marker in ("unrecognized", "invalid option", "regex parse error", "no such file")
-    ):
-        return {"failure_origin": "model", "failure_reason": "invalid_command", "trainable": True}
-    # Anything not proven to be a model action is conservatively infrastructure.
-    # This keeps the runtime decision binary and prevents uncertain failures from
-    # entering reward normalization.
-    return {"failure_origin": "infrastructure", "failure_reason": "execution_environment", "trainable": False}
 
 
 def is_context_overflow(status: int, body: bytes) -> bool:
@@ -105,34 +64,21 @@ def is_context_overflow(status: int, body: bytes) -> bool:
 
 
 class SearchFeedback:
-    """Append control feedback before forwarding; leave tool outputs unchanged."""
+    """Record citation observations and reserve the final answer call."""
 
     def __init__(self, artifact: Path, max_calls: int = 10) -> None:
+        """Initialize episode-local observations and the model-call limit."""
         if max_calls < 2:
             raise ValueError("Search needs at least two model calls")
         self.artifact = artifact
         self.max_calls = max_calls
         self.calls = 0
         self.seen = set()
-        self.failed_commands = {}
         self.visible_outputs = []
-        self.recovery_note = ""
-        self.consecutive_failures = 0
-        self.commands = {}
-        self.workdirs = {}
 
-    def _process_inputs(self, items: list[dict]) -> list[str]:
-        """Record new tool observations and build recovery feedback."""
-        notes = []
-        commands = self.commands
+    def _record_observations(self, items: list[dict]) -> None:
+        """Keep tool observations for citation checks without interpreting shell results."""
         for item in items:
-            if item.get("type") == "function_call":
-                try:
-                    arguments = json.loads(item.get("arguments", "{}"))
-                    commands[item.get("call_id")] = arguments.get("cmd", arguments.get("command", ""))
-                    self.workdirs[item.get("call_id")] = arguments.get("workdir", "/work")
-                except (ValueError, AttributeError):
-                    continue
             if item.get("type") != "function_call_output":
                 continue
             key = item.get("call_id") or json.dumps(item, sort_keys=True)
@@ -146,33 +92,6 @@ class SearchFeedback:
             (self.artifact / "search-observations.json").write_text(
                 json.dumps(self.visible_outputs, ensure_ascii=False)
             )
-            command = commands.get(item.get("call_id"), "")
-            classification = classify_command_result(command, output)
-            with (self.artifact / "tool-outcomes.jsonl").open("a") as stream:
-                stream.write(json.dumps({"call_id": key, "command": command,
-                    "workdir": self.workdirs.get(key), **classification}) + "\n")
-            if not classification["trainable"]:
-                self.stop(classification["failure_reason"], classification["failure_origin"])
-            if classification["failure_reason"]:
-                self.consecutive_failures += 1
-                if command:
-                    identity = (self.workdirs.get(key), command)
-                    count = self.failed_commands.get(identity, 0) + 1
-                    self.failed_commands[identity] = count
-                    if count >= 3:
-                        self.stop("repeated_tool_failure")
-                self.recovery_note = self.recovery(command)
-                if classification["failure_reason"] == "no_match":
-                    self.recovery_note = ("Search completed with no matches (rg exit 1), not an environment failure. "
-                                          + self.recovery_note)
-            elif re.search(r"(?:exited with code|exit code[:=]?)\s*0\b", output, re.I):
-                self.consecutive_failures = 0
-                self.recovery_note = ""
-            if "No such file" in output:
-                notes.append("The article title is NOT a filename. Use rg '^TITLE:' articles to obtain a real path.")
-            if "truncated" in output.lower() or "truncation" in output.lower():
-                notes.append("Output was truncated. Read a smaller range; omitted text is not evidence.")
-        return notes
 
     def prepare(self, body: bytes) -> bytes:
         """Annotate new observations, reserving the final call for an answer."""
@@ -182,10 +101,9 @@ class SearchFeedback:
         items = payload.get("input", [])
         if not isinstance(items, list):
             raise ValueError("Search-R1 requires explicit Responses input history")
-        notes = self._process_inputs(items)
+        self._record_observations(items)
+        notes = []
         self.calls += 1
-        if self.recovery_note:
-            notes.append(self.recovery_note)
         if self.calls == self.max_calls:
             payload.update(tools=[], tool_choice="none")
             notes.append("FINAL MODEL CALL: do not call tools. Answer with verified REF citations, "
@@ -197,23 +115,6 @@ class SearchFeedback:
         with (self.artifact / "search-feedback.jsonl").open("a") as stream:
             stream.write(json.dumps({"call": self.calls, "notes": notes}, ensure_ascii=False) + "\n")
         return json.dumps(payload, ensure_ascii=False).encode()
-
-    def recovery(self, command: str) -> str:
-        """Suggest a command derived only from the failed query, never from gold labels."""
-        fallback = "rg '^TITLE:' articles"
-        try:
-            arguments = shlex.split(command)
-        except ValueError:
-            arguments = []
-        if self.consecutive_failures == 1 and "--" in arguments:
-            query_index = arguments.index("--") + 1
-            if query_index < len(arguments):
-                words = re.findall(r"[^\W\d_]+", arguments[query_index], re.UNICODE)
-                if words:
-                    fallback = "rg -i -F -m 5 -- " + shlex.quote(words[0]) + " articles"
-        return ("Previous command failed. Do not repeat it. Next use exec_command with cmd="
-                + json.dumps(fallback) + ". Execute this yourself; no search has been performed for you. "
-                "Use returned filenames, not article titles, for the following read.")
 
     def stop(self, reason: str, origin: str = "model") -> None:
         """Persist a classified failure without inventing an assistant action."""
@@ -233,23 +134,15 @@ class SearchFeedback:
         (self.artifact / "search-terminal.json").write_text(json.dumps(record))
 
 
+CANDIDATE_IMAGE = "hyper-rl-codex:0.152.1-arm64"
+
 IMAGE = "swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:v0.23.0.post1-code-agent-arm64"
 
 
-def _configure_search_tool_path() -> None:
-    """Expose the pinned CLI's bundled search tools only inside the candidate container."""
-    tools = Path("/opt/codex/codex-path")
-    if tools.is_dir():
-        os.environ["PATH"] = str(tools) + os.pathsep + os.environ.get("PATH", os.defpath)
-
-
 PROBE = r'''
-import importlib.util, json, os, pathlib, socket, shutil
-spec = importlib.util.spec_from_file_location("relay", "/runtime/relay.py")
-relay = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(relay)
-relay._configure_search_tool_path()
-checks = {}
+import http.client, json, os, pathlib, socket, shutil
+from urllib.parse import urlparse
+checks = {"non_root": os.geteuid() != 0}
 checks["search_tools_available"] = all(shutil.which(name) for name in ("rg", "sed", "cat", "codex"))
 corpus = pathlib.Path("/work/articles")
 document = next(path for path in corpus.iterdir() if path.is_file())
@@ -278,7 +171,8 @@ for label, method, path, token in (
     ("administration_blocked", "GET", "/internal/sessions/anything", os.environ["OPENAI_API_KEY"]),
     ("cross_session_blocked", "POST", "/responses", "another-session"),
 ):
-    connection = relay.UnixConnection("/bridge/responses.sock", timeout=3)
+    endpoint = urlparse(os.environ["HYPER_CODEX_ENDPOINT"])
+    connection = http.client.HTTPConnection(endpoint.hostname, endpoint.port, timeout=3)
     connection.request(method, path, b"{}", {"Authorization": "Bearer " + token})
     response = connection.getresponse()
     checks[label] = response.status == 403
@@ -289,103 +183,139 @@ raise SystemExit(0 if all(checks.values()) else 1)
 '''
 
 
-def docker(arguments: list, **kwargs) -> subprocess.CompletedProcess:
+def docker(arguments: list, **kwargs: object) -> subprocess.CompletedProcess:
     """Execute Docker without a shell so model arguments cannot affect the host."""
     return subprocess.run(["docker", *arguments], text=True, check=True, **kwargs)
 
 
-def episode_options(request: dict, output: Path, image: str, name: str) -> list:
-    """Build an unprivileged, networkless container exposing one episode only."""
+def episode_workspace(request: dict, output: Path, image: str, prefix: str) -> DockerWorkspace:
+    """Mount only this candidate's files into the shared read-only workspace backend."""
     def host_path(value: str) -> Path:
+        """Resolve a controller-created artifact path within this run."""
         relative = Path(value).relative_to("/results")
-        resolved = (output / relative).resolve()
+        resolved = (output / relative).resolve(strict=True)
         if not resolved.is_relative_to(output.resolve()):
             raise ValueError("Episode mount escapes the result directory")
         return resolved
 
     workspace = host_path(request["workspace"])
-    codex_home = host_path(request["codex_home"])
-    bridge = host_path(request["bridge"])
-    script = Path(__file__).with_name("container_execution.py").resolve()
-    options = [
-        "--name", name, "--network", "none", "--read-only", "--cap-drop", "ALL",
-        "--security-opt", "no-new-privileges", "--user", f"{os.getuid()}:{os.getgid()}",
-        "--pids-limit", "128", "--memory", "2g", "--cpus", "2",
-        "--tmpfs", "/tmp:rw,nosuid,nodev,size=256m,mode=1777",
-        "-v", f"{workspace}:/work:rw", "-v", f"{codex_home}:/codex-home:rw",
-        "-v", f"{bridge}:/bridge:ro", "-v", f"{script}:/runtime/relay.py:ro",
-        "-e", "HOME=/codex-home", "-e", "CODEX_HOME=/codex-home", "-e", "PYTHONPATH=",
-        "-e", f"OPENAI_API_KEY={request['session_id']}", "-w", "/work", "--entrypoint", "python",
-    ]
-    for directory in ("/home", "/root", "/workspace", "/data", "/models", "/results"):
-        options.extend(("--tmpfs", f"{directory}:rw,nosuid,nodev,size=1m,mode=755"))
-    corpus_name = "articles" if (workspace / "articles").is_dir() else "corpus"
-    options.extend(("-v", f"{workspace / corpus_name}:/work/{corpus_name}:ro", image))
-    return options
+    home = host_path(request["codex_home"])
+    return DockerWorkspace(
+        image, name_prefix=prefix, user=f"{os.getuid()}:{os.getgid()}", read_only=True, runtime="runc",
+        memory="2g", cpus=2, pids_limit=128,
+        mounts=((workspace, "/work", False), (workspace / "articles", "/work/articles", True),
+                (home, "/codex-home", False)),
+    )
 
 
-def execute_episode(request_file: Path, output: Path, image: str, prefix: str,
-                    stop: threading.Event | None = None) -> None:
-    """Probe the exact container boundary, execute Codex, and retain its events."""
-    request = json.loads(request_file.read_text())
+async def _execute_episode(request_file: Path, output: Path, image: str, prefix: str,
+                           stop: threading.Event | None) -> None:
+    """Run one isolated episode and persist its result and transport evidence."""
+    request = json.loads(request_file.read_text(encoding="utf-8"))
     artifact = request_file.parent
-    name = prefix + "-agent"
-    options = episode_options(request, output, image, name)
-    if stop is not None and stop.is_set():
-        return
-    command = ["run", *options, "/runtime/relay.py", "--", *request["command"]]
+    workspace = episode_workspace(request, output, image, prefix)
+    socket_path = (output / Path(request["bridge"]).relative_to("/results") / "responses.sock").resolve()
+    if not socket_path.is_relative_to(output.resolve()):
+        raise ValueError("Episode bridge escapes the result directory")
+    terminal_file = "/tmp/codex-terminal"
+    relay = CandidateRelay(
+        workspace, "http://localhost", request["session_id"], unix_socket=socket_path,
+        require_token=True, terminal_header="X-Search-Terminal", terminal_file=terminal_file,
+        python_executable="python3",
+    )
+    timing = {"queued_seconds": max(0.0, time.time() - request_file.stat().st_mtime)}
+    started = time.perf_counter()
+    result = None
     try:
-        probe = subprocess.run(["docker", "run", "--rm", *options, "-c", PROBE],
-                               capture_output=True, text=True, timeout=30, check=False)
+        phase = time.perf_counter()
+        await workspace.start()
+        timing["container_start_seconds"] = time.perf_counter() - phase
+        (artifact / "candidate-container.json").write_text(json.dumps({"name": workspace.name}))
+        phase = time.perf_counter()
+        endpoint = await relay.start()
+        timing["relay_start_seconds"] = time.perf_counter() - phase
+        environment = {
+            "HOME": "/codex-home", "CODEX_HOME": "/codex-home", "SHELL": "/bin/bash",
+            "OPENAI_API_KEY": request["session_id"], "HYPER_CODEX_ENDPOINT": endpoint,
+            "PATH": "/opt/codex/bin:/opt/codex/codex-path:/usr/local/bin:/usr/bin:/bin",
+        }
+        phase = time.perf_counter()
+        probe = await workspace.exec(["python3", "-I", "-c", PROBE], cwd="/work", env=environment)
         (artifact / "isolation.json").write_text(probe.stdout)
         (artifact / "isolation-stderr.log").write_text(probe.stderr)
         if probe.returncode:
             raise RuntimeError(f"Isolation probe failed; see {artifact / 'isolation-stderr.log'}")
-        if stop is not None and stop.is_set():
-            return
-        with (artifact / "container-events.jsonl").open("w") as stdout:
-            with (artifact / "container-stderr.log").open("w") as stderr:
-                with subprocess.Popen(["docker", *command], stdout=stdout, stderr=stderr) as process:
-                    deadline = time.monotonic() + 850
-                    try:
-                        while process.poll() is None:
-                            if stop is not None and stop.is_set():
-                                raise RuntimeError("Episode cancelled by host shutdown")
-                            if time.monotonic() >= deadline:
-                                raise TimeoutError("Episode execution deadline exceeded")
-                            time.sleep(0.2)
-                    finally:
-                        if process.poll() is None:
-                            process.terminate()
-                            try:
-                                process.wait(timeout=5)
-                            except subprocess.TimeoutExpired:
-                                process.kill()
-                                process.wait(timeout=5)
-        inspected = json.loads(docker(["inspect", name], capture_output=True).stdout)[0]
+        timing["isolation_seconds"] = time.perf_counter() - phase
+        command = list(request["command"])
+        for index, value in enumerate(command):
+            if value.startswith("model_providers.hyper_rl.base_url="):
+                command[index] = f"model_providers.hyper_rl.base_url={json.dumps(endpoint)}"
+        phase = time.perf_counter()
+        # The controller owns its stdout files; the host broker must write separate raw evidence.
+        execution_artifacts = artifact / "container"
+        execution_artifacts.mkdir(exist_ok=True)
+        execution = asyncio.create_task(run_container_codex(
+            workspace, command, execution_artifacts, environment=environment, timeout=850, cwd="/work",
+            terminal_file=terminal_file, python_executable="python3",
+        ))
+        try:
+            while not execution.done():
+                relay.raise_if_failed()
+                if stop is not None and stop.is_set():
+                    raise RuntimeError("Episode cancelled by host shutdown")
+                await asyncio.wait((execution,), timeout=0.2)
+            result = await execution
+        finally:
+            if not execution.done():
+                execution.cancel()
+                await asyncio.gather(execution, return_exceptions=True)
+        timing["cli_seconds"] = time.perf_counter() - phase
+        phase = time.perf_counter()
+        await relay.close()
+        timing["relay_close_seconds"] = time.perf_counter() - phase
+        inspected = await workspace.inspect()
         (artifact / "container-boundary.json").write_text(json.dumps({
-            "HostConfig": inspected["HostConfig"], "Mounts": inspected["Mounts"],
+            key: inspected[key] for key in ("HostConfig", "Mounts", "State")
         }, indent=2))
-        result = {"returncode": process.returncode}
+    except BaseException as error:
+        pending = artifact / "execution-result.tmp"
+        pending.write_text(json.dumps({"returncode": 1, "error": str(error)}))
+        pending.replace(artifact / "execution-result.json")
+        raise
     finally:
-        subprocess.run(["docker", "rm", "-f", name], capture_output=True, check=False)
+        primary_error = sys.exc_info()[1]
+        phase = time.perf_counter()
+        try:
+            await relay.close(abort=primary_error is not None)
+        except Exception:  # pylint: disable=broad-exception-caught
+            if primary_error is None:
+                raise
+            _LOGGER.exception("Candidate relay cleanup failed after an execution error")
+        finally:
+            try:
+                await workspace.close()
+            except Exception:  # pylint: disable=broad-exception-caught
+                if primary_error is None:
+                    raise
+                _LOGGER.exception("Candidate workspace cleanup failed after an execution error")
+            timing["cleanup_seconds"] = time.perf_counter() - phase
+            timing["total_seconds"] = time.perf_counter() - started
+            (artifact / "execution-timing.json").write_text(json.dumps(timing, indent=2))
     pending = artifact / "execution-result.tmp"
-    pending.write_text(json.dumps(result))
+    pending.write_text(json.dumps({"returncode": result.returncode}))
     pending.replace(artifact / "execution-result.json")
+
+
+def execute_episode(request_file: Path, output: Path, image: str, prefix: str,
+                    stop: threading.Event | None = None) -> None:
+    """Run one candidate using the common workspace, relay and CLI execution lifecycle."""
+    if stop is not None and stop.is_set():
+        return
+    asyncio.run(_execute_episode(request_file, output, image, prefix, stop))
 
 
 _BRIDGES = []
 _BRIDGES_LOCK = threading.Lock()
-
-
-class UnixConnection(http.client.HTTPConnection):
-    """Send HTTP over the only socket exposed to an agent container."""
-
-    def connect(self) -> None:
-        """Connect without granting the container a network interface."""
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.settimeout(self.timeout)
-        self.sock.connect(self.host)
 
 
 class UnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
@@ -562,10 +492,9 @@ def request_container_execution(
 
 
 def main() -> None:
-    """Run the private client relay or await a host-broker completion."""
+    """Wait for the host broker and forward its retained execution evidence."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--wait", type=Path)
-    parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.wait:
         result_path = args.wait / "execution-result.json"
@@ -575,32 +504,14 @@ def main() -> None:
                 raise TimeoutError("Host container broker did not finish the episode")
             time.sleep(0.2)
         result = json.loads(result_path.read_text(encoding="utf-8"))
-        sys.stdout.write((args.wait / "container-events.jsonl").read_text(encoding="utf-8"))
-        sys.stderr.write((args.wait / "container-stderr.log").read_text(encoding="utf-8"))
+        for name, stream in (("codex-events.jsonl", sys.stdout), ("codex-stderr.log", sys.stderr)):
+            path = args.wait / "container" / name
+            if path.exists():
+                stream.write(path.read_text(encoding="utf-8"))
+        if result.get("error"):
+            sys.stderr.write("Candidate execution failed: " + result["error"] + "\n")
         raise SystemExit(result["returncode"])
-    _configure_search_tool_path()
-    server = ThreadingHTTPServer(("127.0.0.1", 8200), RelayHandler)
-    server.session_id = os.environ["OPENAI_API_KEY"]
-    server.connection_factory = lambda: UnixConnection("/bridge/responses.sock", timeout=600)
-    server.terminal_event = threading.Event()
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    command = args.command[1:] if args.command[:1] == ["--"] else args.command
-    try:
-        with subprocess.Popen(command, start_new_session=True) as process:
-            while process.poll() is None:
-                if server.terminal_event.wait(0.05):
-                    os.killpg(process.pid, signal.SIGTERM)
-                    try:
-                        process.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        os.killpg(process.pid, signal.SIGKILL)
-                        process.wait()
-                    raise SystemExit(75)
-            raise SystemExit(process.returncode)
-    finally:
-        server.shutdown()
-        server.server_close()
+    parser.error("Only --wait is supported; candidates use the shared Codex executor")
 
 
 if __name__ == "__main__":

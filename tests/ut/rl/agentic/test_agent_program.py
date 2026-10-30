@@ -159,11 +159,14 @@ class TestAgentProgram(unittest.IsolatedAsyncioTestCase):
     async def test_batch_waits_for_siblings_before_reporting_failure(self) -> None:
         """One failed episode cannot leave siblings issuing requests after error synchronization."""
         completed = []
+        sibling_started = asyncio.Event()
 
         async def run(index: int) -> tuple:
-            """Fail one sample while the sibling records successful settlement."""
+            """Fail one sample after the sibling has actually been admitted."""
             if index == 0:
+                await sibling_started.wait()
                 raise RuntimeError("first episode failed")
+            sibling_started.set()
             await asyncio.sleep(0.02)
             completed.append(index)
             return ()
@@ -175,7 +178,7 @@ class TestAgentProgram(unittest.IsolatedAsyncioTestCase):
 
         settings = GenerationSettings(8, 1.0, 1.0, 0, True, 0, 9, True)
         runner = ProgramAgentRunner(factory, 2, settings)
-        with self.assertRaisesRegex(RuntimeError, "draining all samples"):
+        with self.assertRaisesRegex(RuntimeError, "draining admitted samples"):
             await runner._run([_arguments()["prompt"]], 3)
         self.assertEqual(completed, [1])
 

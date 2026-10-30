@@ -802,6 +802,12 @@ class VLLMGenerationEngine:
         return self._trainer_tp_rank == 0
 
     @property
+    def configured_inference_base_url(self) -> str:
+        """Resolve the CPU gateway target without starting the distributed model service."""
+        _, host, port = self._server_endpoint()
+        return f"http://{host}:{port}"
+
+    @property
     def inference_base_url(self) -> str:
         """Return the sole shared vLLM endpoint used by protocol adapters."""
         client = self._ensure_client()
@@ -919,6 +925,7 @@ class VLLMGenerationEngine:
             ("trust_remote_code", True),
             ("enable_expert_parallel", False),
             ("enforce_eager", True),
+            ("disable_log_stats", False),
             ("enable_prompt_tokens_details", False),
             ("skip_mm_profiling", False),
             ("enable_auto_tool_choice", False),
@@ -955,6 +962,7 @@ class VLLMGenerationEngine:
             ("max_num_batched_tokens", "--max-num-batched-tokens"),
             ("block_size", "--block-size"),
             ("logprobs_mode", "--logprobs-mode"),
+            ("seed", "--seed"),
         ):
             if key in self._config:
                 command.extend((option, str(self._config[key])))
@@ -983,6 +991,7 @@ class VLLMGenerationEngine:
             }
         )
         for config_key, environment_key in (
+            ("task_queue_enable", "TASK_QUEUE_ENABLE"),
             ("server_hccl_if_base_port", "HCCL_IF_BASE_PORT"),
             (
                 "server_hccl_npu_socket_port_range",

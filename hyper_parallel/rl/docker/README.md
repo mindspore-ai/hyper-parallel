@@ -2,7 +2,7 @@
 
 ARM64 的普通 RL、MoE R3、Codex Agent、DeepSeek Harness 及 Qwen3.5/3.8 controller 统一使用
 `swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:v0.23.0.post1-code-agent-arm64`。
-GSM8K 启动脚本、Search-R1 的训练与候选容器、RL 系统测试均默认使用此镜像，仍保留显式镜像覆盖接口。
+GSM8K 启动脚本、Search-R1 的训练容器、RL 系统测试均默认使用此镜像，仍保留显式镜像覆盖接口。
 
 ## 下载与校验
 
@@ -37,12 +37,34 @@ python -c "import deepseek_harness; from importlib.metadata import version; prin
 
 ## Search-R1 的独立 Codex 候选容器
 
-训练/推理容器与候选容器使用同一镜像，但权限和职责独立。
-候选容器只运行 Codex CLI 0.152.1、Python 标准库请求转发程序，以及 Bash、`rg`、`sed`、`cat` 等搜索工具；
-不加载 vLLM、Torch、CANN 或模型权重，不分配 NPU，也不挂载 Docker socket。
-候选启动器将镜像已有的 `/opt/codex/codex-path` 加入自己的 `PATH`，以使用随 CLI 打包的 `rg`；
-不安装额外软件，也不修改宿主或训练进程的工具路径。
-保留无外网、只读根目录、候选文章只读及会话隔离的原边界。
+训练/推理仍使用上面的运行镜像。Search-R1候选使用独立的`hyper-rl-codex:0.152.1-arm64`，
+仅包含原版Codex二进制、Python、Bash、Git和必要搜索工具；不包含Torch、vLLM、CANN或模型权重。
+该标签是本地构建产物，不是已发布的镜像地址。在候选执行宿主构建：
+
+```bash
+docker build --network host -f hyper_parallel/rl/docker/Dockerfile.codex \
+  -t hyper-rl-codex:0.152.1-arm64 hyper_parallel/rl/docker
+```
+
+构建文件固定基础镜像与Codex来源，并校验CLI二进制SHA256和版本。已有离线镜像可通过
+`BASE_IMAGE`、`AGENT_IMAGE`构建参数指定；须记录实际Image ID，不将不同来源视作同一构建。
+`--network host`仅用于镜像构建，候选运行时仍是`network=none`。
+启动器的`--image`选择训练镜像，`--candidate-image`选择候选镜像；启动训练前单独核验候选工具，
+将Image ID、大小和版本写入`candidate-runtime.json`，本次所有候选使用解析后的不可变ID。
+镜像构建时预编译Python标准库，避免只读候选在每次启动时重复编译模块。
+
+候选使用与仓库任务共用的`DockerWorkspace`及Codex执行中继；每个episode仍创建干净容器，
+不使用容器池。不挂载NPU或Docker socket，仅挂载本题工作目录、独立Codex home和只读文章。
+CPU候选显式使用`runc`，避免继承宿主的加速器运行时；训练/推理容器继续使用其原有运行时。
+由宿主中继通过当前会话的Unix socket转发模型请求；容器不能访问训练管理接口或外部网络。
+隔离探针在正式候选容器内执行，不再另建探针容器；仍逐题检查文件范围、只读文章和非root身份。
+`execution-timing.json`记录排队、容器启动、中继、隔离检查、CLI执行和清理耗时。
+宿主执行器将原始输出写入会话的`container/`目录，再由控制器收集；两者不共用可写日志文件。
+
+候选启动环境显式设置`SHELL=/bin/bash`。固定CLI依赖的`portable-pty 0.9.0`在缺少`SHELL`时，
+会使用非线程安全的`getpwuid`查询默认shell；并发TTY创建可能触发原生崩溃。
+通用Codex启动器保留已有`SHELL`设置，候选执行器补齐缺失值；不改写工具参数或关闭TTY。
+进程被信号终止时保留信号名和负退出码，返回`128 + signal`；容器边界记录保留Docker `State`。
 
 R3 采集与模型计算发生在训练/推理容器中，见 [MoE R3](../docs/moe_code_agent.md#moe-r3)。
 无模型隔离测试 `tests/st/search_r1_isolation.py` 验证工具和请求转发边界，不代替 NPU 训练验收。
@@ -98,6 +120,9 @@ docker image inspect --format '{{.Id}} {{.Os}}/{{.Architecture}} {{json .RepoDig
 容器入口加载 CANN，启动脚本调用 `docker/install_runtime.sh` 安装 RL 包并注册 vLLM 插件。
 手动 `docker exec` 或覆盖 `PYTHONPATH` 后，须在启动模型的同一 shell 中重新执行
 `source /usr/local/Ascend/ascend-toolkit/set_env.sh`，保留 CANN Python 路径，确保 `import acl` 可用。
+`docker/patches/patch_sampler.py` 为已验证的 vLLM-Ascend 版本应用采样张量的 `record_stream` 修补，
+校验修改前后源码哈希、支持重复执行并记录结果，未知版本拒绝修改。GSM8K 启动器在容器内调用该工具。
+
 `docker/patches/vllm-dp-coordinator-timeout.patch` 将 vLLM DP Coordinator 的启动等待时间从 30 秒延长到 120 秒；
 GSM8K 的 TP 与一致性启动脚本会在容器中应用它。更新 vLLM 后应先确认补丁仍适用。
 具体运行步骤见 [Hyper-RL README](../README.md)，系统测试见 [ST 指南](../README.md#系统测试)。

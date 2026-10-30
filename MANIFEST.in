@@ -4,11 +4,13 @@ include README.en.md
 include LICENSE
 include build.sh
 include hyper_parallel/rl/pyproject.toml
+include hyper_parallel/rl/docker/patches/patch_sampler.py
 include hyper_parallel/data/indexed/csrc/Makefile
 include hyper_parallel/components/functional/_triton/gated_delta_net/GDN_LICENSE
 include hyper_parallel/components/functional/_triton/kimi_delta_attention/KDA_README.md
 recursive-include scripts *.py *.sh *.json
 recursive-include hyper_parallel *.sh *.bash *.cpp *.cc *.h *.hpp *.cmake CMakeLists.txt *.patch *.json *.yaml *.ini *.md *.txt
+prune hyper_parallel/rl/output
 prune hyper_parallel/rl/tests
 prune build
 prune dist

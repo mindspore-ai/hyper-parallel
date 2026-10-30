@@ -17,6 +17,7 @@
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -26,53 +27,62 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch, Mock
 
-from examples.search_r1 import launcher
+import torch
+import yaml
+
+from rl.algorithm import build_algorithm
+from rl.agentic.codex.protocol import CodexResponsesProtocol
+from rl.agentic.core.program_runner import audit_training_rows
+from rl.config import resolve_vllm_automatic_limits, validate_config
+
+from examples.search_r1 import container_runtime, launcher
 from examples.search_r1.agent import repair_request, validate_citations
-from examples.search_r1.container_execution import (
-    RelayHandler, SearchBudgetExceeded, SearchFeedback, classify_command_result, request_container_execution,
+from examples.search_r1.container_runtime import (
+    RelayHandler, SearchBudgetExceeded, SearchFeedback, request_container_execution,
 )
 from examples.search_r1.launcher import training_command, verify_artifacts, verify_training
 from examples.search_r1.workspace import build_search_workspace
-from rl.agentic.core.program_runner import audit_training_rows
 
 
 class EchoHandler(BaseHTTPRequestHandler):
     """Minimal real upstream used to verify authorized forwarding."""
 
-    def do_POST(self):  # pylint: disable=invalid-name
+    def do_POST(self) -> None:  # pylint: disable=invalid-name
         """Echo a bounded request body."""
         body = self.rfile.read(int(self.headers["Content-Length"]))
         self.send_response(200)
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, format, *args):  # pylint: disable=redefined-builtin
+    def log_message(self, format: str, *args: object) -> None:  # pylint: disable=redefined-builtin
         """Suppress test transport logs."""
 
 
 class SearchR1Tests(unittest.TestCase):
     """Verify data exposure and enforcement at the transport boundary."""
 
-    def test_bash_syntax_error_is_a_trainable_model_command(self):
-        """A malformed model command does not become an infrastructure failure."""
-        output = (
-            "Process exited with code 2\n"
-            "/usr/bin/bash: -c: line 1: unexpected EOF while looking for matching quote\n"
-            "/usr/bin/bash: -c: line 2: syntax error: unexpected end of file\n"
-        )
-        result = classify_command_result("rg -i -F -- 'unfinished articles", output)
-        self.assertEqual(result, {
-            "failure_origin": "model", "failure_reason": "invalid_command", "trainable": True,
-        })
+    def test_candidate_workspace_preserves_isolation(self):
+        """The common backend retains non-root execution and read-only article input."""
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            (output / "workspace/articles").mkdir(parents=True)
+            (output / "home").mkdir()
+            request = {"workspace": "/results/workspace", "codex_home": "/results/home",
+                       "bridge": "/results/bridge", "session_id": "test-session"}
+            workspace = container_runtime.episode_workspace(request, output, "test-image", "test-agent")
+        self.assertTrue(workspace.read_only)
+        self.assertEqual(workspace.user, f"{os.getuid()}:{os.getgid()}")
+        self.assertEqual(workspace.network, "none")
+        self.assertIn((output / "workspace/articles", "/work/articles", True), workspace.mounts)
 
     def test_host_and_standalone_relay_are_standard_library_only(self):
         """Host launcher and mounted relay must not load the training stack."""
         script = (
             "import importlib.util, sys; "
-            "from examples.search_r1 import launcher, container_execution; "
-            "spec = importlib.util.spec_from_file_location('isolated_relay', container_execution.__file__); "
+            "from examples.search_r1 import launcher, container_runtime; "
+            "spec = importlib.util.spec_from_file_location('isolated_relay', container_runtime.__file__); "
             "relay = importlib.util.module_from_spec(spec); spec.loader.exec_module(relay); "
-            "blocked = set(sys.modules) & {'torch', 'mindspore', 'hyper_parallel', 'rl'}; "
+            "blocked = set(sys.modules) & {'torch', 'mindspore', 'hyper_parallel'}; "
             "print(sorted(blocked)); sys.exit(bool(blocked))"
         )
         root = Path(launcher.__file__).resolve().parents[2]
@@ -91,10 +101,40 @@ class SearchR1Tests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, f"Expected exit=0, got={result.returncode}: {result.stderr}")
         self.assertIn("--devices", result.stdout)
 
+    def test_eight_card_recipe_uses_official_data_and_existing_acceleration(self) -> None:
+        """Validate the real recipe and keep long calls within the probability budget."""
+        recipe = Path(launcher.__file__).parent / "configs/qwen3_4b_search_r1.yaml"
+        config = resolve_vllm_automatic_limits(yaml.safe_load(recipe.read_text(encoding="utf-8")))
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "config.json").write_text(json.dumps({
+                "model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"], "tie_word_embeddings": True,
+            }), encoding="utf-8")
+            config["model"]["weights_path"] = directory
+            config["model"]["tokenizer_path"] = directory
+            for split in ("train", "test"):
+                path = Path(directory) / f"{split}.parquet"
+                path.touch()
+                config["data"][f"{split}_path"] = str(path)
+            with patch.dict(os.environ, {"ASCEND_RT_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7", "LOCAL_RANK": "0"}), \
+                    patch.object(torch.accelerator, "current_accelerator", return_value=torch.device("npu")):
+                validate_config(config, build_algorithm(config["algorithm"]))
+        self.assertIn("supporting_facts_json", config["data"]["metadata_columns"])
+        self.assertEqual(config["agentic"]["codex"]["reward_callable"],
+                         "examples.search_r1.reward:score_hotpotqa_answer")
+        self.assertEqual(config["train"]["accelerator"]["dp_shard"], 8)
+        self.assertEqual(config["train"]["response_mini_batch_size"],
+                         config["train"]["prompt_batch_size"] * config["rollout"]["num_return_sequences"]
+                         * config["agentic"]["max_turns"])
+        self.assertEqual(config["train"]["max_tokens_per_micro_batch"], config["rollout"]["vllm"]["max_model_len"])
+        self.assertFalse(config["agentic"]["codex"]["overlap_preparation"])
+        self.assertTrue(config["agentic"]["codex"]["preserve_environment_context"])
+        self.assertEqual(config["rollout"]["vllm"]["reasoning_parser"], "qwen3")
+
     def test_training_entry_and_optimizer_gate(self):
         """The launcher uses the real trainer and rejects rollout-only or zero-gradient runs."""
         command = training_command(2)
         self.assertIn("train_rl.py", command)
+        self.assertIn("--nproc_per_node=8", command)
         self.assertIn("--master_addr=127.0.0.1", command)
         self.assertNotIn("--standalone", command)
         self.assertIn("examples/search_r1/configs/qwen3_4b_search_r1.yaml", command)
@@ -220,10 +260,10 @@ class SearchR1Tests(unittest.TestCase):
             environment = {"OPENAI_API_KEY": "session", "HYPER_CODEX_GATEWAY_URL": "http://127.0.0.1:8413",
                            "HYPER_CODEX_MAX_CALLS": "7"}
             with patch.dict("os.environ", {"HYPER_SEARCH_CONTAINER_BROKER": "1", "PHASE_UID": "1", "PHASE_GID": "1"}), \
-                    patch("examples.search_r1.container_execution.UnixServer") as server_class, \
-                    patch("examples.search_r1.container_execution.threading.Thread"), \
-                    patch("examples.search_r1.container_execution.os.chown"), \
-                    patch("examples.search_r1.container_execution._BRIDGES", []):
+                    patch("examples.search_r1.container_runtime.UnixServer") as server_class, \
+                    patch("examples.search_r1.container_runtime.threading.Thread"), \
+                    patch("examples.search_r1.container_runtime.os.chown"), \
+                    patch("examples.search_r1.container_runtime._BRIDGES", []):
                 request_container_execution(["codex", "exec", "--", "question"], workspace, home, environment)
                 server = server_class.return_value
                 upstream = server.connection_factory()
@@ -338,48 +378,55 @@ class SearchR1Tests(unittest.TestCase):
                  "output": "Process exited with code 1\nFinal output:"},
             ]
             result = json.loads(policy.prepare(json.dumps({"input": items}).encode()))
-            self.assertEqual(result["input"][:2], items)
-            self.assertIn("Do not repeat", result["input"][-1]["content"])
-            self.assertEqual(result["input"][-1]["type"], "message")
+            self.assertEqual(result["input"], items)
             result = json.loads(policy.prepare(json.dumps({"input": items}).encode()))
             self.assertIn("FINAL MODEL CALL", result["input"][-1]["content"])
             self.assertEqual(result["tools"], [])
             self.assertEqual(result["tool_choice"], "none")
-            self.assertEqual(policy.failed_commands[("/work", "rg X articles")], 1)
+            self.assertEqual(policy.visible_outputs, [items[-1]["output"]])
             with self.assertRaisesRegex(SearchBudgetExceeded, "budget_exhausted"):
                 policy.prepare(b'{"input": []}')
             self.assertTrue((Path(temporary) / "search-terminal.json").exists())
 
-    def test_recovery_survives_requests_without_new_output(self):
-        """Intermediate model messages cannot erase the pending recovery instruction."""
-        with tempfile.TemporaryDirectory() as temporary:
-            policy = SearchFeedback(Path(temporary))
-            items = [
-                {"type": "function_call", "call_id": "1",
-                 "arguments": json.dumps({"cmd": "rg -F -- 'Alpha–Beta Commission' articles"})},
-                {"type": "function_call_output", "call_id": "1", "output": "Process exited with code 1"},
-            ]
-            first = json.loads(policy.prepare(json.dumps({"input": items}).encode()))
-            second = json.loads(policy.prepare(json.dumps({"input": items}).encode()))
-            self.assertEqual(first["input"][-1], second["input"][-1])
-            self.assertIn("-- Alpha articles", second["input"][-1]["content"])
-            items.extend([
-                {"type": "function_call_output", "call_id": "2", "output": "Process exited with code 0\nEvidence"},
-            ])
-            third = json.loads(policy.prepare(json.dumps({"input": items}).encode()))
-            self.assertEqual(third["input"], items)
+    def test_command_results_are_forwarded_without_classification_or_recovery(self) -> None:
+        """Nonzero shell results reach the model unchanged, including repeated failures."""
+        cases = [
+            ("grep -r X /work/articles", "Process exited with code 1\nOutput:"),
+            ("grep X /work/articles", "Process exited with code 2\ngrep: /work/articles: Is a directory"),
+            ("cd /work && rg X missing articles", "Process exited with code 2\nrg: missing: No such file"),
+            ("rg 'unfinished", "Process exited with code 2\nbash: -c: unexpected EOF"),
+            ("unknown-tool", "Process exited with code 127\ncommand not found"),
+            ("python task.py", "Process exited with code 137\nKilled"),
+        ]
+        for command, output in cases:
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as temporary:
+                artifact = Path(temporary)
+                policy = SearchFeedback(artifact)
+                for index in range(4):
+                    items = [
+                        {"type": "function_call", "call_id": str(index), "arguments": json.dumps({"cmd": command})},
+                        {"type": "function_call_output", "call_id": str(index), "output": output},
+                    ]
+                    body = {"input": items, "tools": [{"type": "function", "name": "exec_command"}],
+                            "tool_choice": "auto"}
+                    self.assertEqual(json.loads(policy.prepare(json.dumps(body).encode())), body)
+                self.assertFalse((artifact / "search-terminal.json").exists())
+                self.assertFalse((artifact / "tool-outcomes.jsonl").exists())
+                self.assertEqual(json.loads((artifact / "search-observations.json").read_text()), [output] * 4)
+                self.assertEqual(json.loads(policy.prepare(json.dumps(body).encode())), body)
+                self.assertEqual(len(policy.visible_outputs), 4)
 
-    def test_repeated_failed_commands_stop(self):
-        """Distinct observations of the same failed command terminate bounded retries."""
+    def test_final_and_repair_requests_pass_tool_allowlist(self) -> None:
+        """Both task-owned no-tool branches reach sampling with the original history intact."""
         with tempfile.TemporaryDirectory() as temporary:
-            policy = SearchFeedback(Path(temporary))
-            for index in range(3):
-                items = [
-                    {"type": "function_call", "call_id": str(index), "arguments": '{"cmd":"rg X articles"}'},
-                    {"type": "function_call_output", "call_id": str(index), "output": "Process exited with code 1"},
-                ]
-                if index < 2:
-                    policy.prepare(json.dumps({"input": items}).encode())
-                else:
-                    with self.assertRaisesRegex(SearchBudgetExceeded, "repeated_tool_failure"):
-                        policy.prepare(json.dumps({"input": items}).encode())
+            policy = SearchFeedback(Path(temporary), max_calls=2)
+            body = {"input": [{"type": "message", "role": "user", "content": "Question"}],
+                    "tools": [{"type": "function", "name": name} for name in ("exec_command", "write_stdin")]}
+            policy.prepare(json.dumps(body).encode())
+            final = json.loads(policy.prepare(json.dumps(body).encode()))
+            repair = repair_request(body, "ANSWER: X\nSOURCES: bad", ["unknown_reference:bad"])
+            for request in (final, repair):
+                transformed = CodexResponsesProtocol().transform_request(
+                    request, "qwen3", allowed_tools=["exec_command", "write_stdin"])
+                self.assertNotIn("tools", transformed)
+                self.assertEqual(transformed["messages"][0], {"role": "user", "content": "Question"})

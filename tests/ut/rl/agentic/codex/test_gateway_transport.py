@@ -571,3 +571,28 @@ def test_repository_format_resampling_keeps_its_existing_terminal_attribution(re
             assert session.termination is None
             assert session.failure["failure_reason"] == "tool_format_budget_exhausted"
     assert len(session.completions) == session.max_completions
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_completion_timing_preserves_payload_and_releases_slots(failed: bool) -> None:
+    """Success and failure both release admission; timing must not mutate model evidence."""
+    handler = _handler()
+    response = {"choices": [{"token_ids": [3, 9], "finish_reason": "stop",
+                             "message": {"role": "assistant", "content": "answer"}}]}
+    expected = json.loads(json.dumps(response))
+    with patch.object(handler, "_backend_request", side_effect=RuntimeError("failed") if failed else None,
+                      return_value=response), patch(
+        "rl.agentic.codex.gateway.time.perf_counter", side_effect=[1., 3., 8.],
+    ):
+        if failed:
+            with pytest.raises(RuntimeError, match="failed"):
+                handler._model_completion("s", {}, {})
+            assert handler.server.state.get("s").completions == []
+        else:
+            delivered, _, record = handler._model_completion("s", {}, {})
+            assert delivered == expected
+            assert record["timing"]["queue_seconds"] == 2.
+            assert record["timing"]["backend_seconds"] == 5.
+    assert handler.server.state.get("s").reserved_completions == 0
+    assert handler.server.state.backend_slots.acquire(blocking=False)
+    handler.server.state.backend_slots.release()

@@ -20,10 +20,9 @@ import asyncio
 import hashlib
 import importlib
 import json
+import logging
 import math
 import time
-import urllib.error
-import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Optional, Protocol, Sequence
@@ -31,14 +30,20 @@ from typing import Any, Callable, Optional, Protocol, Sequence
 import torch
 import torch.distributed as dist
 
+from rl.agentic.core.prepared_batch import PreparedProgramBatch
 from rl.dataset.batch_builder import build_experience_batch
 from rl.dataset.contracts import ExperienceBatch, PromptRecord, Trajectory, Turn
 from rl.dataset.episodes import episode_rows
+# Preserve the public imports while host executors use the dependency-free transport module.
+from rl.agentic.core.gateway_transport import (  # pylint: disable=unused-import,useless-import-alias
+    GatewayTransportError as GatewayTransportError, request_gateway_json as request_gateway_json,
+)
 from rl.roles.rollout.base import GenerationSettings
 from rl.roles.rollout.router_capture import router_trace_from_capture, router_trace_from_wire, router_trace_to_wire
 from rl.tool_protocol import validate_trainability
 
 _NATURAL_STOPS = frozenset({"stop", "tool_calls", "stop_sequence"})
+_LOGGER = logging.getLogger(__name__)
 StatusResolver = Callable[[Sequence[Mapping[str, Any]], Mapping[str, Any]], tuple[bool, str]]
 
 
@@ -425,42 +430,6 @@ def build_harness_call_trajectories(
     return tuple(results)
 
 
-def request_gateway_json(
-    label: str,
-    method: str,
-    url: str,
-    payload: Mapping[str, Any] | None,
-    timeout: float,
-    admin_token: str | None = None,
-    max_response_bytes: int | None = None,
-) -> dict[str, Any]:
-    """Exchange one JSON object with an external harness gateway."""
-    data = None if payload is None else json.dumps(dict(payload)).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
-    if admin_token:
-        headers["Authorization"] = f"Bearer {admin_token}"
-    request = urllib.request.Request(url, data=data, headers=headers, method=method)
-    open_request = (urllib.request.build_opener(urllib.request.ProxyHandler({})).open
-                    if admin_token is not None else urllib.request.urlopen)
-    try:
-        with open_request(request, timeout=timeout) as response:
-            content = response.read() if max_response_bytes is None else response.read(max_response_bytes + 1)
-    except urllib.error.HTTPError as error:
-        detail = error.read(4096).decode("utf-8", errors="replace")
-        raise RuntimeError(f"{label} gateway HTTP {error.code}: {detail}") from error
-    except urllib.error.URLError as error:
-        raise RuntimeError(f"{label} gateway request failed: {error.reason}") from error
-    if max_response_bytes is not None and len(content) > max_response_bytes:
-        raise RuntimeError(f"{label} gateway response exceeded its byte limit")
-    try:
-        decoded = json.loads(content)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise RuntimeError(f"{label} gateway returned invalid JSON") from error
-    if not isinstance(decoded, dict):
-        raise RuntimeError(f"{label} gateway returned a non-object response")
-    return decoded
-
-
 def load_reward_callable(value: Any, config_path: str, label: str) -> Callable[..., Any]:
     """Load a configured external-harness reward callback."""
     if not isinstance(value, str) or ":" not in value:
@@ -532,6 +501,10 @@ class HarnessRuntime:
         # must finish it before the coordinator enters gateway-only work.
         backend_url = self.engine.inference_base_url
         model_name = self.engine.inference_model_name
+        self._ensure_gateway(backend_url, model_name)
+
+    def _ensure_gateway(self, backend_url: str, model_name: str) -> None:
+        """Start the CPU gateway collectively, independently of backend readiness."""
         local_error = None
         asynchronous = getattr(self.engine, "asynchronous", False) is True
         owner = asynchronous or dist.get_rank() == 0
@@ -612,6 +585,10 @@ class HarnessProgramFactory:
                 f"{self.label} requested policy version does not match the served policy: "
                 f"requested={policy_version}, served={served_version}"
             )
+        return self._build_program(prompt, policy_version, sample_index)
+
+    def _build_program(self, prompt: PromptRecord, policy_version: int, sample_index: int) -> AgentProgram:
+        """Construct a session whose actual model admission is owned by the runtime."""
         urls = {"gateway_url": self.runtime.gateway_url}
         if self.include_admin_url:
             urls["admin_url"] = self.runtime.admin_url
@@ -651,46 +628,37 @@ class ProgramAgentRunner:
         settings: GenerationSettings,
         engine: Optional[Any] = None,
         sample_index_offset: int = 0,
+
+        max_concurrent_programs: int = 8,
     ) -> None:
         """Initialize the runner with a program factory and sampling policy."""
         if num_samples <= 0:
             raise ValueError("num_samples must be positive")
         self.sample_index_offset = sample_index_offset
+
+        if (isinstance(max_concurrent_programs, bool) or not isinstance(max_concurrent_programs, int)
+                or max_concurrent_programs <= 0):
+            raise ValueError("max_concurrent_programs must be a positive integer")
         self.program_factory = program_factory
         self.num_samples = num_samples
         self.settings = settings
         self.engine = engine
+        self.max_concurrent_programs = max_concurrent_programs
+        self._prepared: PreparedProgramBatch | None = None
 
     async def _run(
         self,
         prompt_records: Sequence[PromptRecord],
         policy_version: int,
+        programs: Sequence[AgentProgram] | None = None,
     ) -> tuple[Trajectory, ...]:
-        """Run every sampled user program concurrently on one event loop."""
-        programs = [
-            self.program_factory(prompt, policy_version, self.sample_index_offset + sample_index)
+        """Bound live programs, stop admitting after failure, and retain submitted row order."""
+        jobs = [
+            (prompt, self.sample_index_offset + sample_index)
             for prompt in prompt_records
             for sample_index in range(self.num_samples)
         ]
-        tasks = [asyncio.create_task(program.run()) for program in programs]
-        cancellation = None
-        if getattr(self.engine, "asynchronous", False) is True:
-            cancellation = asyncio.create_task(self._watch_shutdown(tasks))
-        try:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-        finally:
-            if cancellation is not None:
-                cancellation.cancel()
-                await asyncio.gather(cancellation, return_exceptions=True)
-        errors = [result for result in results if isinstance(result, BaseException)]
-        if errors:
-            details = [f"{type(error).__name__}: {error}" for error in errors]
-            if getattr(self.engine, "asynchronous", False) is True:
-                contracts = [error for error in errors if isinstance(error, (ValueError, TypeError))]
-                if contracts:
-                    message = f"Agent program contract failed after draining all samples: {details}"
-                    raise ValueError(message) from contracts[0]
-            raise RuntimeError(f"Agent program group failed after draining all samples: {details}")
+        results = await self._run_bounded(jobs, policy_version, programs)
         expected_prompts = [prompt.prompt_id for prompt in prompt_records for _ in range(self.num_samples)]
         trajectories = self._program_rows(results, expected_prompts)
         self._validate_trajectories(trajectories, prompt_records, policy_version)
@@ -704,6 +672,60 @@ class ProgramAgentRunner:
             await asyncio.sleep(.05)
         for task in tasks:
             task.cancel()
+
+    async def _run_bounded(self, jobs: Sequence[tuple[PromptRecord, int]], policy_version: int,
+                           programs: Sequence[AgentProgram] | None = None) -> list[Any]:
+        """Drain only admitted programs after a failure, before the rank error collective."""
+        pending = iter(enumerate(jobs))
+        results: list[Any] = [None] * len(jobs)
+        failures: list[Exception] = []
+
+        async def worker() -> None:
+            """Pull the next job only while the group remains valid."""
+            while not failures:
+                item = next(pending, None)
+                if item is None:
+                    return
+                index, (prompt, sample_index) = item
+                try:
+                    program = (programs[index] if programs is not None
+                               else self.program_factory(prompt, policy_version, sample_index))
+                    results[index] = await program.run()
+                except Exception as error:  # pylint: disable=broad-exception-caught
+                    failures.append(error)
+                    _LOGGER.exception("Agent program failed: prompt=%s sample=%d policy_version=%d; "
+                                      "stopping local admission", prompt.prompt_id, sample_index, policy_version)
+
+        tasks = [asyncio.create_task(worker()) for _ in range(min(len(jobs), self.max_concurrent_programs))]
+        cancellation = None
+        if getattr(self.engine, "asynchronous", False) is True:
+            cancellation = asyncio.create_task(self._watch_shutdown(tasks))
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException as error:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if (isinstance(error, asyncio.CancelledError)
+                    and getattr(self.engine, "asynchronous", False) is True
+                    and getattr(self.engine, "closed", False) is True):
+                raise RuntimeError("Agent producer stopped after draining admitted samples") from error
+            raise
+        finally:
+            if cancellation is not None:
+                cancellation.cancel()
+                await asyncio.gather(cancellation, return_exceptions=True)
+        if failures:
+            details = [f"{type(error).__name__}: {error}" for error in failures]
+            if getattr(self.engine, "asynchronous", False) is True:
+                contracts = [error for error in failures if isinstance(error, (ValueError, TypeError))]
+                if contracts:
+                    message = f"Agent program contract failed after draining admitted samples: {details}"
+                    raise ValueError(message) from contracts[0]
+            raise RuntimeError(
+                f"Agent program group failed after draining admitted samples: {details}"
+            ) from failures[0]
+        return results
 
     @staticmethod
     def _program_rows(results, expected_prompts: Sequence[str]) -> tuple[Trajectory, ...]:
@@ -721,6 +743,29 @@ class ProgramAgentRunner:
             trajectories.extend(rows)
         return tuple(trajectories)
 
+    def prepare(self, prompt_records: Sequence[PromptRecord], policy_version: int,
+                factory: AgentProgramFactory, *, cpu_fraction: float | None = None,
+                max_cpus: int | None = None) -> None:
+        """Start only CPU episode work; the caller must keep model admission closed."""
+        if self._prepared is not None:
+            raise RuntimeError("An agent batch is already prepared")
+        if not bool(getattr(self.engine, "is_request_owner", True)):
+            return
+        programs = [factory(prompt, policy_version, index)
+                    for prompt in prompt_records for index in range(self.num_samples)]
+        self._prepared = PreparedProgramBatch(
+            prompt_records, policy_version, lambda: self._run(prompt_records, policy_version, programs),
+            cpu_fraction=cpu_fraction, max_cpus=max_cpus,
+        )
+
+    def close(self) -> None:
+        """Cancel and join any CPU preparation before closing its gateway."""
+        if self._prepared is not None:
+            try:
+                self._prepared.close()
+            finally:
+                self._prepared = None
+
     def rollout(
         self,
         prompt_records: Sequence[PromptRecord],
@@ -736,7 +781,12 @@ class ProgramAgentRunner:
         synchronize_payload = getattr(self.engine, "synchronize_agent_payload", None)
         if bool(getattr(self.engine, "is_request_owner", True)):
             try:
-                trajectories = asyncio.run(self._run(prompt_records, policy_version))
+                if self._prepared is None:
+                    trajectories = asyncio.run(self._run(prompt_records, policy_version))
+                else:
+                    trajectories = self._prepared.result(prompt_records, policy_version)
+                    self._prepared.close()
+                    self._prepared = None
                 if callable(synchronize_payload):
                     payload = self._serialize_trajectories(trajectories)
             except Exception as error:  # pylint: disable=broad-exception-caught

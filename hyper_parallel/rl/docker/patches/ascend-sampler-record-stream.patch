@@ -1,0 +1,6 @@
+--- a/vllm_ascend/sample/sampler.py
++++ b/vllm_ascend/sample/sampler.py
+@@ -42,2 +42,3 @@
+     torch.npu.current_stream().wait_stream(global_stream())
++    q.record_stream(torch.npu.current_stream())
+     return probs.div_(q).argmax(dim=-1).view(-1)

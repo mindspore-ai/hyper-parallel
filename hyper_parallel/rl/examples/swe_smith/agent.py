@@ -30,11 +30,10 @@ from rl.agentic.codex.gateway import CompletionBudgetExhausted
 from rl.agentic.codex.cli_contract import ISOLATED_COMPACT_PROMPT
 from rl.agentic.core.types import RewardResult
 from rl.agentic.envs.docker_workspace import (
-    DockerWorkspace, InvalidSubmissionError, WorkspaceOutputLimitError,
-    WorkspaceTimeoutError, acquire_workspace_slot,
+    DockerWorkspace, InvalidSubmissionError, acquire_workspace_slot,
 )
 from rl.dataset.contracts import Trajectory
-from examples.swe_smith.container_execution import CandidateRelay
+from rl.agentic.codex.container_execution import CandidateRelay, run_container_codex
 from examples.swe_smith.reward import SWESmithTask
 
 
@@ -230,17 +229,12 @@ class SWESmithProgram(CodexAgentProgram):
         environment = {"HOME": "/opt/hyper-codex-home", "CODEX_HOME": "/opt/hyper-codex-home",
                        "OPENAI_API_KEY": session_id, "PYTHONDONTWRITEBYTECODE": "1",
                        "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"}
-        try:
-            result = await workspace.exec(
-                self._codex_command(), env=environment,
-                timeout=float(self.config.get("timeout_seconds", 1800)),
-                output_limit_bytes=int(self.config["workspace"].get("output_limit_bytes", 4 * 1024 * 1024)),
-                controller_stop=expected_stop,
-            )
-        except (WorkspaceOutputLimitError, WorkspaceTimeoutError) as error:
-            self._save_container_output(artifact_dir, error.result)
-            raise
-        self._save_container_output(artifact_dir, result)
+        result = await run_container_codex(
+            workspace, self._codex_command(), artifact_dir, environment=environment,
+            timeout=float(self.config.get("timeout_seconds", 1800)),
+            output_limit_bytes=int(self.config["workspace"].get("output_limit_bytes", 4 * 1024 * 1024)),
+            controller_stop=expected_stop,
+        )
         final_answer, diagnostics, failures = _classify_codex_events(result.stdout.splitlines())
         if expected_stop is not None and expected_stop.is_set() and result.returncode in (137, 143):
             if expected_budget:
@@ -256,8 +250,3 @@ class SWESmithProgram(CodexAgentProgram):
         if result.returncode or failures or not _has_completed_codex_turn(result.stdout):
             raise _ExecutionError(f"Container Codex did not complete cleanly; see {artifact_dir}")
         return final_answer, diagnostics
-
-    @staticmethod
-    def _save_container_output(artifact_dir: Path, result: Any) -> None:
-        (artifact_dir / "codex-events.jsonl").write_text(result.stdout, encoding="utf-8")
-        (artifact_dir / "codex-stderr.log").write_text(result.stderr, encoding="utf-8")

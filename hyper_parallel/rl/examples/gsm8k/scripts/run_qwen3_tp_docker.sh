@@ -222,7 +222,7 @@ if [[ -n "${requested_devices}" ]]; then
     fi
     resolved_rollout_devices=$(IFS=','; printf '%s' "${rollout_device_list[*]}")
 fi
-config_path=${repo_root}/hyper_parallel/rl/examples/gsm8k/configs/qwen3_4b_gsm8k_vllm_production.yaml
+config_path=${repo_root}/hyper_parallel/rl/examples/gsm8k/configs/qwen3_4b_gsm8k_base.yaml
 mkdir -p "${result_root}"
 result_root=$(cd -- "${result_root}" && pwd)
 

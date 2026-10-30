@@ -86,8 +86,10 @@ Problem: {prompt}""",
 
 
 def prepare_config(case: Case, phase: int, ports: tuple[int, int], devices: list[int]) -> dict:
-    """Derive a bounded ST workload from the shipped production YAML."""
-    if case.runner != "internal":
+    """Derive a bounded ST workload from the shipped base recipe."""
+    if case.runner == "codex":
+        recipe = EXAMPLES / "gsm8k/configs/qwen3_4b_gsm8k_codex_50step.yaml"
+    elif case.runner != "internal":
         recipe = EXAMPLES / f"gsm8k/configs/{case.runner}_multi_turn.yaml"
     elif case.algorithm == "ppo":
         recipe = EXAMPLES / "gsm8k/configs/qwen3_4b_gsm8k_ppo.yaml"
@@ -96,7 +98,7 @@ def prepare_config(case: Case, phase: int, ports: tuple[int, int], devices: list
     elif case.algorithm == "gspo":
         recipe = EXAMPLES / "gsm8k/configs/qwen3_4b_gsm8k_gspo.yaml"
     else:
-        recipe = EXAMPLES / "gsm8k/configs/qwen3_4b_gsm8k_vllm_production.yaml"
+        recipe = EXAMPLES / "gsm8k/configs/qwen3_4b_gsm8k_base.yaml"
     config = yaml.safe_load(recipe.read_text())
     config["model"].update(weights_path="/model", tokenizer_path="/model")
     config["consistency"]["enabled"] = case.exact
@@ -114,6 +116,9 @@ def prepare_config(case: Case, phase: int, ports: tuple[int, int], devices: list
                 model_implementation="native" if case.runner != "internal" else "hyper",
                 enforce_eager=True, batch_invariant=case.exact,
                 max_num_seqs=4)
+    if case.runner == "codex":
+        # Keep the small ST reservation independent of the full-run KV allocation.
+        vllm.update(gpu_memory_utilization=0.35, kv_cache_memory_bytes=8589934592)
     vllm["weight_sync"].update(strategy=case.strategy, bucket_size_mb=128)
     if case.disjoint:
         vllm["visible_devices"] = ",".join(map(str, devices[case.world:]))

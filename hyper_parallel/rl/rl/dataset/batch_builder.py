@@ -278,11 +278,21 @@ class ExperiencePreparer:
         values: Optional[Any] = None,
         bootstrap_values: Optional[Any] = None,
     ) -> ExperienceBatch:
-        """Validate role outputs and build algorithm-specific training targets."""
-        if rollout.metadata.get("reward_status") == "pending":
-            raise ValueError("Pending model rewards cannot be used for training targets")
-        _validate_trajectory_rows(rollout.trajectories)
-        episode_level = _uses_episode_targets(self.algorithm, rollout, values, bootstrap_values)
+        """Build targets from complete groups, then attach required role outputs."""
+        prepared = self.prepare_targets(rollout, values=values, bootstrap_values=bootstrap_values)
+        return self.attach_role_outputs(
+            prepared, reference_log_probs=reference_log_probs, values=values, bootstrap_values=bootstrap_values,
+        )
+
+    def attach_role_outputs(
+        self,
+        rollout: ExperienceBatch,
+        *,
+        reference_log_probs: Optional[Any] = None,
+        values: Optional[Any] = None,
+        bootstrap_values: Optional[Any] = None,
+    ) -> ExperienceBatch:
+        """Attach detached model outputs without recomputing redistributed group targets."""
         requirements = self.algorithm.requirements.data
         required_inputs = (
             (requirements.rollout_log_probs, rollout.old_log_probs, "rollout log-probabilities"),
@@ -292,6 +302,30 @@ class ExperiencePreparer:
         for required, value, label in required_inputs:
             if required and value is None:
                 raise ValueError(f"Algorithm '{self.algorithm.name}' requires {label}")
+        return replace(
+            rollout, reference_log_probs=_detached(reference_log_probs), values=_detached(values),
+            bootstrap_values=_detached(bootstrap_values),
+        )
+
+    def prepare_targets(
+        self,
+        rollout: ExperienceBatch,
+        *,
+        values: Optional[Any] = None,
+        bootstrap_values: Optional[Any] = None,
+    ) -> ExperienceBatch:
+        """Build immutable advantages while complete reward groups and episodes remain local.
+
+        Probability anchors are not target-estimator inputs. They may be attached after
+        redistribution; target estimation must not be repeated on partial groups.
+        """
+        if rollout.metadata.get("reward_status") == "pending":
+            raise ValueError("Pending model rewards cannot be used for training targets")
+        _validate_trajectory_rows(rollout.trajectories)
+        episode_level = _uses_episode_targets(self.algorithm, rollout, values, bootstrap_values)
+        requirements = self.algorithm.requirements.data
+        if requirements.values and values is None:
+            raise ValueError(f"Algorithm '{self.algorithm.name}' requires critic values")
         detached_values = _detached(values)
         group_ids = (
             tuple(trajectory.group_id for trajectory in rollout.trajectories)
@@ -321,7 +355,6 @@ class ExperiencePreparer:
             )
         return replace(
             rollout,
-            reference_log_probs=_detached(reference_log_probs),
             values=detached_values,
             bootstrap_values=_detached(bootstrap_values),
             advantages=advantages,

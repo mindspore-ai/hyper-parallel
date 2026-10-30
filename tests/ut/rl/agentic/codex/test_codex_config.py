@@ -14,19 +14,36 @@
 # ============================================================================
 """Repository configuration and distributed controller-credential contracts."""
 
+from __future__ import annotations
+
 from copy import deepcopy
+import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from rl.agentic.core import program_runner
+from rl.agentic.codex import harness
 from rl.config import _validate_codex_agentic, _validate_external_agentic_rollout
 
 
 _CONFIG = {"version": "0.152.1", "executable": "codex", "session_root": "/tmp/repository-contract",
            "gateway_port": 8200, "timeout_seconds": 30, "request_timeout": 10, "model_context_window": 40960,
            "reward_callable": "examples.swe_smith.reward:score_submission", "admin_auth": True}
+
+
+@pytest.mark.parametrize("shell", [None, "/bin/zsh"])
+def test_codex_child_has_explicit_shell_without_mutating_parent(
+        monkeypatch: pytest.MonkeyPatch, shell: str | None) -> None:
+    """Parallel PTYs must not fall back to libc user lookup in a minimal environment."""
+    monkeypatch.delenv("SHELL", raising=False)
+    if shell is not None:
+        monkeypatch.setenv("SHELL", shell)
+    environment = harness._codex_environment("http://localhost:8200", Path("/tmp/codex-test"), "session")
+    assert environment["SHELL"] == (shell or "/bin/bash")
+    assert os.environ.get("SHELL") == shell
 
 
 def test_custom_program_and_existing_text_configs_share_the_reward_extension() -> None:

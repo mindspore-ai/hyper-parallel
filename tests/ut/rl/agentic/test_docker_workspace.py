@@ -97,6 +97,44 @@ class TestSnapshot(unittest.TestCase):
 class TestBoundedCommand(unittest.IsolatedAsyncioTestCase):
     """Use actual short CPU subprocesses to exercise pipe cleanup."""
 
+    async def test_runtime_selection_preserves_default_and_isolation(self) -> None:
+        """CPU tasks can select runc without changing callers that inherit the daemon default."""
+        for runtime in (None, "runc"):
+            with self.subTest(runtime=runtime):
+                workspace = DockerWorkspace("sha256:" + "a" * 64, read_only=True, runtime=runtime)
+                workspace._docker = AsyncMock(return_value=(CommandResult(0, "", ""), b""))
+                await workspace.start()
+                create = workspace._docker.await_args_list[0].args
+                if runtime is None:
+                    self.assertNotIn("--runtime", create)
+                else:
+                    self.assertEqual(create[create.index("--runtime") + 1], runtime)
+                self.assertIn("--read-only", create)
+                self.assertEqual(create[create.index("--network") + 1], "none")
+                self.assertEqual(create[create.index("--cap-drop") + 1], "ALL")
+        for runtime in ("", "runc --privileged", "/usr/bin/runc", 1):
+            with self.subTest(invalid_runtime=runtime), self.assertRaises(ValueError):
+                DockerWorkspace("task-image", runtime=runtime)
+
+    async def test_readonly_candidate_profile_keeps_mounts_and_numeric_identity(self) -> None:
+        """A host broker can use a pinned image without changing repository workspace defaults."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = DockerWorkspace("sha256:" + "a" * 64, user="1005:1001", read_only=True,
+                                        mounts=((root, "/work", False), (root, "/work/articles", True)))
+            workspace._docker = AsyncMock(return_value=(CommandResult(0, "", ""), b""))
+            await workspace.start()
+        create = workspace._docker.await_args_list[0].args
+        self.assertEqual(create[0], "create")
+        self.assertIn("--read-only", create)
+        self.assertIn("1005:1001", create)
+        self.assertIn(f"{root}:/work/articles:ro", create)
+        self.assertNotIn("--privileged", create)
+        self.assertEqual(len(workspace._docker.await_args_list), 2)
+        for user in (":", "user:group", "0", "-1:0"):
+            with self.subTest(user=user), self.assertRaises(ValueError):
+                DockerWorkspace("task-image", user=user)
+
     async def test_remote_endpoint_is_used_without_local_fallback(self) -> None:
         """Remote management errors propagate without consulting the local daemon."""
         workspace = DockerWorkspace("task-image", docker_host="ssh://user@127.0.0.1:2233")

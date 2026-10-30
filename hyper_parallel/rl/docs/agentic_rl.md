@@ -20,7 +20,7 @@ Agentic 决定模型如何与任务环境交互；Hyper-RL 决定这些交互数
 | Rollout | 提供共享 vLLM 推理端点，返回 token ID、raw logprob 和策略身份 | 任务语义和奖励规则 |
 | Hyper-RL Trainer | 构建 prompt、选择 runner、准备训练 batch、更新 Actor、发布策略并记录指标 | 具体工具如何实现 |
 
-`SyncTrainer` 是唯一的顶层编排者。它在 `rl/trainer.py` 中创建 rollout engine，再根据 `agentic.runner` 选择对应的
+同步模式由 `SyncTrainer` 编排。它在 `rl/trainer.py` 中创建 rollout engine，再根据 `agentic.runner` 选择对应的
 rollout manager。Agentic 不绕过 Trainer，也不直接更新模型参数。
 
 ## 三种执行路径
@@ -67,26 +67,106 @@ dummy 输出会被丢弃，不进入训练。
 
 1. manager 启动本节点的 Gateway，并读取 vLLM 当前整数 `policy_version`。
 2. runtime 将该策略身份绑定到本次 episode。
-3. `ProgramAgentRunner` 只在 Trainer TP 组的 request-owner rank 启动外部 program。
+3. `ProgramAgentRunner` 只在 Trainer TP 组的 request-owner rank 启动外部 program，并按本地容量逐个派发。
 4. Gateway 把 Codex Responses 或 DeepSeek Chat 请求转换为 vLLM 的 `/v1/chat/completions` 请求。
 5. Gateway 记录模型返回的 token ID、raw sampled-token logprob、工具调用和策略身份。
 6. harness 的 trajectory builder 将记录转换为标准 `Trajectory`。
 7. request-owner 将 trajectory 序列化，并通过 `synchronize_agent_payload()` 同步给同 TP 组的 sibling ranks。
 8. manager 再次读取策略身份；episode 执行期间发生版本变化会直接报错。
 
+`agentic.codex.max_concurrent_episodes_per_rank` / `agentic.deepseek.max_concurrent_episodes_per_rank`
+默认8，限制每个request-owner rank的活跃program；TP1/DP8时合计最多64个，不改变训练题数或每题候选数。
+程序按提交顺序回填结果，保持题组、调用身份与损失语义。一个program失败时立即记录原始异常，
+停止该rank继续派发待运行候选，等待已经派发的program清理后再同步跨rank错误；不是跨rank即时取消。
+调用方取消会取消并等待本地worker清理，不把部分成功轨迹交给训练。
+
+Codex管理面注册支持同一session ID、完全相同payload的幂等重试；身份或配置冲突、已封闭/释放的会话仍拒绝。
+删除不存在的session成功返回并保留释放标记，避免晚到注册重新创建会话。
+只有注册和删除在明确连接错误时最多尝试3次，注册每次最多30秒；HTTP拒绝不重试，模型生成不使用此重试机制。
+`program.failed`将原始错误写入session性能记录，即使清理失败也不会丢失首个原因。
+
 Codex Gateway 按 `agentic.max_turns` 预留模型调用额度，成功、失败和取消路径均释放预留；
 `agentic.codex.max_inflight_requests` 限制共享后端的同时请求数，默认 1。
 最后一次调用仍保留原工具选择，额度用尽不会改写模型动作来强制答案。
+普通文本任务与自定义Search-R1程序共用`CodexAgentProgram.resolve_execution_outcome`核验终态。
+CLI正常退出并发出`turn.completed`、却没有最终消息时，只有最后一次调用确为reasoning-only、
+`finish_reason=length`且真实token数等于该请求的`max_tokens`，才记为`output_budget_exhausted`。
+还须核验策略版本、连续调用序号、可训练采样证据及无Gateway故障；缺失证据仍报错。
+该终态保留所有真实调用、token、mask和log-prob，以零奖励及`max_output_tokens`截断标记进入轨迹，
+不伪造最终答案、不追加修正调用、不提高预算。已有最终文本的length输出仍按任务规则评分。
+正常完成的 reasoning-only 调用若以采样到的模型结束 token 终止（`finish_reason=stop`），
+且没有正式答案或工具调用，则记为模型失败 `reasoning_only_eos` 并给零奖励，保留全部真实调用。
+该终态不标为预算截断，不提取 reasoning 中的答案、不追加调用；没有结束 token、缺失采样证据或进程异常仍拒绝训练。
+进程超时和异常退出不能被已有模型失败或预算记录覆盖；退出码为零本身也不代表任务成功。
 普通文本任务在调用额度内未完成最终答案，且 CLI 与 Gateway 均确认完整调用后的预算终止时，
 该候选记零奖励并标记 `truncated/max_completions`，保留所有已采样调用参与 episode 分组与训练。
 额度耗尽不增加调用次数，也不改写最后一次工具动作；此行为与 R3 开关无关。
+已至少完成一次采样调用后，若vLLM返回匹配已验证格式的HTTP 400上下文长度拒绝，
+保留所有已采样调用，以 `context_budget_exhausted` / `max_context_tokens` 标记零奖励预算终止。
+被拒绝的请求没有生成动作，不创建训练行或重新生成；初始请求超限、未知400或不完整采样证据仍拒绝训练。
+此路径不截断真实prompt，不扩展上下文或生成上限。
 通信故障、未知 CLI 错误或不完整轨迹仍拒绝训练，不能仅凭调用数达到上限降为零奖励。
 终态读取 session 先封闭新请求，再等待在途请求排空；释放 session 同样排空。
 整组 program 收尾后再同步跨 rank 错误。
 标准 `tools` 与 input 中 `additional_tools` 共用工具名称映射，未知声明明确报错。
 
+任务可以用 `agentic.codex.model_instructions` 替换CLI自带模型指令，
+用 `compact_harness_context: true` 在生成前移除带已知标记的技能、权限和环境说明消息；
+这会改变模型输入，只适合已确认这些说明不属于任务语义的配方，不能用于训练后的单独删减。
+文件操作任务可同时设置`preserve_environment_context: true`，保留环境与权限消息，
+仅过滤技能说明；默认false保持既有精简行为，未开启compact时不做过滤。
+`agentic.codex.allowed_tools` 默认null，保持全部声明；显式列表只向模型公开指定工具，
+空列表不公开工具。普通函数写工具名，namespace成员写`namespace.function`。
+白名单名称在请求中不存在、重复/非法配置或强制tool_choice选择被排除的工具均报错，
+不静默回退。显式`tool_choice: none`的终答/修正请求允许省略白名单中的工具声明，
+仍保留历史工具调用与观察，不放开普通请求的名称校验。保留工具的参数、历史及响应名称映射不变；原始CLI请求和实际vLLM请求分别记录，
+训练使用后者对应的真实tokens。该开关限定模型可见工具，不改变CLI执行环境的权限。
+
+Codex 性能记录与原始协议内容分开保存。Gateway 的 `completion.queued` / `completion.admitted`
+事件用于观察在途排队；成功的 `completion.recorded.payload.timing` 包含墙钟起止点、
+单调时钟测得的 `queue_seconds` 和 `backend_seconds`。后者包含HTTP传输及后端完整请求，
+不能直接作为纯模型计算、prefill或decode耗时。
+每个session的 `performance.jsonl` 记录CLI启动、版本检查、轨迹构建及stdout接收时间，
+`cli_stdout.received.line_index` 与原始 `codex-events.jsonl` 的零基行号对应。
+工具开始/结束事件可用于估计工具区间，但这是父进程接收时间，不是工具内部精确计时；
+各session并发区间不可相加当作整个rollout墙钟时间。原始CLI事件、token和概率证据保持原样。
+
+`agentic.codex.overlap_preparation`通用默认关闭，Qwen3-4B GSM8K Codex配方显式开启。开启后，Trainer只提前一批CPU会话：
+第一批可与vLLM冷启动重叠，后续批次在上一轮Actor更新前启动。Codex CLI、shell快照和独立工作目录保持原样。
+`preparation_cpu_fraction`默认0.5，范围为(0,1]。它按训练进程可用的逻辑CPU集合，均匀选择一个子集，
+仅绑定Linux准备线程及其继承的CLI/工具子进程；不修改训练主线程亲和性，也不设置Codex线程数或关闭其功能。
+`preparation_max_cpus`默认null，可设正整数作为额外的逻辑CPU数量上限；两项取更严格的限制。
+最终数量为`min(max(1, floor(可用逻辑CPU数 × preparation_cpu_fraction)), preparation_max_cpus)`，
+其中null表示不施加额外数量上限。例如192个可用逻辑CPU、比例0.5时使用96个；再设上限64则使用64个。
+同一宿主上可用CPU集合相同的rank选择同一子集，共享该预算，不是每个rank独占这么多CPU；
+若各rank原本绑定不同集合，则限制分别生效，不代表宿主全局总量上限。
+这是CPU亲和性范围，不是主机CPU利用率百分比、CPU时间配额或资源预留；不限制Gateway等其他线程。
+预算持续作用于整个episode，CPU密集工具的执行速度也会受影响；比例设为1且数量上限为null可恢复全部可用CPU。
+关闭重叠时不使用这两项准备预算。
+后台事件循环不启动模型、不调用分布式collective；Gateway按session的目标policy version挂起模型请求，
+主线程完成权重发布、推理唤醒和版本核查后才放行。`completion.policy_ready`及
+`timing.policy_ready_at`给出放行等待结束的时间；`queue_seconds`包含该策略等待，
+不能把它解释为后端缺少并发槽位。实际后端接收仍以`completion.admitted`为参考。
+
+准备批次只可按原顺序、原问题内容和目标版本消费；取消时先停止后台程序及其子进程，再关闭Gateway。
+epoch结束、验证和checkpoint边界不提前读取下一批，避免改变数据恢复或评估顺序。
+当前只支持原生本地CLI路径，配置`program_callable`或`execution_callable`时拒绝开启；
+自定义工作目录准备函数仍须遵守CPU准备合同。会话总超时和HTTP超时包含等待策略发布的时间，
+必须覆盖重叠的训练或首次服务启动窗口，超时属于基础设施错误，不能转成零奖励。
+本功能不代表异步RL：所有训练回答仍来自对应的同一已发布版本。
+
 Codex 可按配置启动 MCP stdio server。`rl/agentic/mcp_server.py` 只是把现有 `ToolRegistry` 暴露为 MCP
 `tools/list` 和 `tools/call`，不会复制或改写工具实现。
+
+### 共用容器执行
+
+Search-R1与SWE-Smith复用`DockerWorkspace`和`codex/container_execution.py`中的候选中继、CLI执行及输出记录。
+容器只提供当前会话的模型请求通道，Codex内部的多轮shell/PTY行为保持原样；任务准备、终态评分和grader仍由示例持有。
+Search-R1保留宿主broker，通过Unix socket访问训练容器内的任务反馈服务；SWE-Smith保留controller的Docker连接方式。
+公共中继只转发固定模型路由，不根据任务名选择奖励；任务终止头由调用方显式传入。
+非root、只读根目录及文章绑定由工作区执行参数声明，不改变SWE-Smith原有仓库写入要求。
+HTTP管理请求被提取到标准库模块`core/gateway_transport.py`，旧`program_runner`导入路径继续导出同一函数和异常。
+Codex公共导出按需加载，以便宿主执行器导入容器能力时不加载Torch或推理依赖。
 
 ### 仓库型 Codex Code Agent
 
@@ -201,8 +281,8 @@ agentic:
 
 仓库中的 [GSM8K 环境](../examples/gsm8k/agent.py)提供单轮问答和组合 calculator 的多轮任务，
 两条路径都通过同一个 `ENVIRONMENTS` registry 接入 Trainer。上面的 YAML 是 `agentic` 片段；
-完整训练配置见 [单轮配置](../examples/gsm8k/configs/qwen3_4b_gsm8k_vllm_production.yaml)和
-[多轮配置](../examples/gsm8k/README.md#内部多轮参数)，训练入口为 [train_rl.py](../train_rl.py)。
+基础训练配置见 [GRPO 基础配方](../examples/gsm8k/configs/qwen3_4b_gsm8k_base.yaml)和
+[多轮配置](../examples/gsm8k/README.md#其他功能)，训练入口为 [train_rl.py](../train_rl.py)。
 
 ### GSM8K 数值奖励
 
@@ -227,7 +307,7 @@ Codex 和 DeepSeek 除各自子配置外，还必须满足以下共享约束：
 
 完整配置以以下文件为准：
 
-- [Codex 多轮配置](../examples/gsm8k/configs/codex_multi_turn.yaml)
+- [Codex 多轮配置](../examples/gsm8k/configs/qwen3_4b_gsm8k_codex_50step.yaml)
 - [Qwen3-30B-A3B Codex 四卡配置与 R3 示例](../examples/gsm8k/README.md)
 - [DeepSeek 多轮配置](../examples/gsm8k/configs/deepseek_multi_turn.yaml)
 
@@ -236,7 +316,7 @@ Codex 和 DeepSeek 除各自子配置外，还必须满足以下共享约束：
 | 关注点 | 文件 |
 | --- | --- |
 | 配置与 runner 约束 | `rl/config.py` |
-| 唯一训练编排入口 | `rl/trainer.py` |
+| 同步训练编排入口 | `rl/trainer.py` |
 | 三种 rollout manager | `rl/roles/rollout/worker.py` |
 | Internal episode 循环 | `rl/agentic/core/trajectory_runner.py`、`session.py` |
 | 外部 program 数据面 | `rl/agentic/core/program_runner.py` |
@@ -270,4 +350,4 @@ Gloo 验证不需要模型；真实训练须显式配置 CLI/SDK、模型、数�
 异步入口复用现有 Codex 程序，支持 Qwen3 dense 的 Search/SWE-Smith 多轮候选。
 模型调用按实际提交版本记录，允许一个 episode 的不同调用跨版本；同步路径仍检查整个 episode 版本一致。
 权重发布等待活跃模型调用结束，工具执行继续，checkpoint 边界则排空完整任务。
-配置、重试、版本滞后及验证边界见[异步运行合同](architecture.md#codex-multi-turn-publication)。
+配置、重试、版本滞后及验证边界见[异步运行合同](architecture.md#rayless-asynchronous-grpo)。

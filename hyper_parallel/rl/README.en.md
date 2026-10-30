@@ -22,7 +22,7 @@ HyperParallel-RL is a reinforcement learning framework for LLMs, VLMs, world mod
 
 Users define tasks, interactions, tools, and rewards in Python. Basic policy optimization and multi-turn agent interactions share a training pipeline. HyperParallel handles parallel training, vLLM handles sampling, and HyperParallel-RL connects them through explicit orchestration, shared trajectories, and policy publication.
 
-> **Experimental:** Current validation covers single-node Ascend NPUs, synchronous GRPO, Qwen3 dense, and selected MoE paths. End-to-end asynchronous, multimodal, world-model, and embodied-intelligence training is not yet available. See [supported capabilities](#supported-capabilities) for scope and validation status.
+> **Experimental:** Synchronous training and single-node rayless asynchronous GRPO are implemented; model, algorithm and topology acceptance remain separate. See [supported capabilities](#supported-capabilities).
 
 **Get started:** [Install](#installation-and-environment) → [Run one training step](#quick-start) · **Customize:** [Replace the reward function](#replace-the-reward-function)
 
@@ -149,23 +149,9 @@ export HYPER_QWEN3_TP_MAX_STEPS=1
 
 ### Example 2: Agentic multi-turn interaction
 
-**Qwen3-4B + Search-R1, two retrieval-QA steps on two NPUs.** The model uses a local retrieval tool and continues answering from observations; no external agent CLI is required. Prepare `train.parquet` with `prompt` and `answer` columns and `corpus.jsonl` using the [data preparation script](https://atomgit.com/mindspore/hyper-parallel/blob/f9f2696341c631327524ea37b6b2ca328076980a/hyper_parallel/rl/examples/agents/search_R1/prepare_search_r1_data.py).
-
-```bash
-export HYPER_VLLM_IMAGE=swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:v0.23.0.post1-code-agent-arm64
-export HYPER_VLLM_MODEL_ROOT=/absolute/path/to/Qwen3-4B
-export HYPER_VLLM_DATA_ROOT=/absolute/path/to/hotpotqa
-export HYPER_VLLM_RESULT_ROOT=/absolute/path/to/results/search-r1
-export HYPER_VLLM_VISIBLE_DEVICES=0,1
-export HYPER_VLLM_MODEL_IMPLEMENTATION=native
-export HYPER_AGENTIC_TASK=search_r1
-
-./hyper_parallel/rl/examples/gsm8k/scripts/run_qwen3_4b_agentic_docker.sh
-```
-
-**Success:** Exit code 0, `train/global_step=2` and `policy/version=2` in the results directory’s `train.log`, and a `checkpoints/step_2/checkpoint_complete.json` file. Inspect logged samples for actual tool interaction.
-
-Both examples validate execution, not learning gains. For full training, use the [training entry point](train_rl.py) with the [GSM8K](examples/gsm8k/configs/qwen3_4b_gsm8k_vllm_production.yaml) or [Search-R1](https://atomgit.com/mindspore/hyper-parallel/blob/f9f2696341c631327524ea37b6b2ca328076980a/hyper_parallel/rl/examples/agents/search_R1/configs/multi_turn.yaml) configuration, adjusting the training budget, evaluation, and saving instead of using the launchers’ fixed-step checks.
+**Qwen3-4B + Search-R1.** Codex searches per-question HotpotQA article files in isolated workspaces.
+Follow the [Search-R1 instructions](docs/search_r1.md) for data preparation and execution.
+For the completed single-turn and Codex GSM8K runs, use the [50-step recipes](examples/gsm8k/README.md).
 
 Other entry points: [Programmatic agents](docs/agentic_rl.md) · [Deployment and sampling](docs/vllm_rollout.md) · [Bit-Exact checks](docs/qwen3_training_inference_consistency.md) · [MoE models](https://atomgit.com/mindspore/hyper-parallel/blob/f9f2696341c631327524ea37b6b2ca328076980a/hyper_parallel/rl/docs/moe_models.md).
 
@@ -211,7 +197,7 @@ def build_environment(context: EpisodeContext) -> GSM8KMultiTurnEnvironment:
     return env
 ```
 
-In the full training YAML, use the `agentic` settings from the [GSM8K multi-turn configuration](examples/gsm8k/README.md#内部多轮参数), change `module_path` to `examples.gsm8k.custom_reward`, and set `environment` to `custom_gsm8k`. This replaces only terminal scoring for the multi-turn task; it does not modify the Trainer or weight publication.
+In the full training YAML, use the `agentic` settings from the [GSM8K multi-turn configuration](examples/gsm8k/README.md#其他功能), change `module_path` to `examples.gsm8k.custom_reward`, and set `environment` to `custom_gsm8k`. This replaces only terminal scoring for the multi-turn task; it does not modify the Trainer or weight publication.
 
 GSM8K rule and model scorers both live in [agent.py](examples/gsm8k/agent.py). Omit the top-level `reward_model`
 section for rule rewards. To score with an RM after generation, use the
@@ -242,7 +228,7 @@ Currently validated on **single-node Ascend 910B3**; see the [runtime image](doc
 | **Weight synchronization and runtime support** | ✅ | Streaming full-gather / explicit direct-reshard, IPC/HCCL, publication checks, checkpoint recovery, and console / W&B metrics. See [architecture contracts](docs/architecture.md) |
 | **Bit-Exact checks** | ✅ | Optional pre-update logprob checks, limited to Qwen3 dense + Hyper-vLLM matched TP1/TP2. See [full conditions](docs/qwen3_training_inference_consistency.md) |
 | **PPO / GAE / Critic** | ✅ | Dense Qwen3 internal runner validated with two-device Actor/Critic updates and publication; segmented external-agent trajectories and MoE PPO are unsupported |
-| **Asynchronous and multi-node training** | ○ | Ray-based sampling/learning overlap, policy lag, and recovery; extensions to multiple nodes and long-running agents |
+| **Single-node asynchronous GRPO** | ◐ | Rayless Qwen3 dense implementation with disjoint vLLM, bounded policy lag and recovery; see [scope](docs/architecture.md#rayless-asynchronous-grpo). Multi-node support remains planned |
 | **Multimodal training and interaction** | ○ | Visual RL, media/action alignment, and multimodal agents |
 
 ### Representative models
@@ -265,7 +251,7 @@ See [MoE and agent validation](docs/moe_code_agent.md), [Code Agent scope](docs/
 
 ## 🗺️ Planned directions
 
-- **Asynchronous training at scale:** Use Ray to overlap sampling and learning, validate single-node asynchronous execution first, then multi-node training with the full DeepSeek-V3 model.
+- **Asynchronous training at scale:** Extend the rayless runtime to larger workloads and multiple nodes; validate complete-model training and learning separately.
 - **Multimodal training:** Establish visual RL with Qwen2.5-VL-7B-Instruct on image-based math questions, then validate multimodal agent interactions.
 - **Agent learning and asynchronous execution:** Refine existing multi-turn environments and programmatic integration, validate learning on tool and stateful code tasks, and extend asynchronous execution to long-running tasks.
 
@@ -278,9 +264,9 @@ Each direction requires complete recipes, learning results, and resource-cost co
 
 ## 📌 Current limitations
 
-- **Runtime scope:** Current execution is single-node Ascend synchronous GRPO, limited to the models and topologies in [supported capabilities](#supported-capabilities). Dense GSPO has CPU coverage and an NPU acceptance recipe; real NPU acceptance has not been run. MoE does not yet support disjoint deployment or intra-expert TP. Dense internal-runner PPO has two-device acceptance; other combinations require independent validation.
+- **Runtime scope:** Synchronous RL and experimental rayless asynchronous GRPO target single-node Ascend, within the models and topologies in [supported capabilities](#supported-capabilities). Dense GSPO has CPU coverage and an NPU acceptance recipe; real NPU acceptance has not been run. MoE does not yet support disjoint deployment or intra-expert TP. Dense internal-runner PPO has two-device acceptance; other combinations require independent validation.
 - **Validation scope:** Functional success does not establish long-term learning gains. Bit-Exact covers pre-update logprobs only in specified Qwen3 dense + Hyper-vLLM configurations; it does not guarantee gradients, updated parameters, or convergence. See [consistency documentation](docs/qwen3_training_inference_consistency.md).
-- **Recovery and counters:** Checkpoint recovery is implemented, but sample/token consumption counters are not yet incremented during training steps and must not be used to measure actual training volume. See [state and recovery boundaries](docs/architecture.md#状态所有权).
+- **Recovery and counters:** Checkpoint recovery is implemented. Synchronous sample/token counters are not incremented per update and must not measure training volume; asynchronous execution separately counts consumed groups and valid tokens. See [state and recovery boundaries](docs/architecture.md#状态所有权).
 - **Deployment requirements:** vLLM RLHF/refit development endpoints are intended only for trusted, isolated training networks. See the [runtime image](docker/README.md) for environment and driver requirements.
 
 ---

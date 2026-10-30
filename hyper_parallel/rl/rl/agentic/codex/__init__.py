@@ -12,28 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Codex CLI black-box rollout integration."""
+"""Codex CLI contracts; host-side execution stays standard-library only."""
 
-import sys
-
-from rl.agentic.codex import harness as _harness
-from rl.agentic.codex.gateway import CodexGateway
-from rl.agentic.codex.harness import (
-    CodexAgentProgram,
-    CodexProgramFactory,
-    CodexRuntime,
-    build_codex_trajectory,
-)
-from rl.agentic.codex.protocol import CodexResponsesProtocol
+from importlib import import_module
+from typing import Any
 
 
-sys.modules.setdefault(f"{__name__}.trajectory", _harness)
+_EXPORTS = {
+    "CodexAgentProgram": ("harness", "CodexAgentProgram"),
+    "CodexGateway": ("gateway", "CodexGateway"),
+    "CodexProgramFactory": ("harness", "CodexProgramFactory"),
+    "CodexResponsesProtocol": ("protocol", "CodexResponsesProtocol"),
+    "CodexRuntime": ("harness", "CodexRuntime"),
+    "build_codex_trajectory": ("harness", "build_codex_trajectory"),
+}
+__all__ = list(_EXPORTS)
 
-__all__ = [
-    "CodexAgentProgram",
-    "CodexGateway",
-    "CodexProgramFactory",
-    "CodexResponsesProtocol",
-    "CodexRuntime",
-    "build_codex_trajectory",
-]
+
+def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
+    """Load training dependencies only when a public harness contract is requested."""
+    if name not in _EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module, attribute = _EXPORTS[name]
+    value = getattr(import_module(f"{__name__}.{module}"), attribute)
+    globals()[name] = value
+    return value

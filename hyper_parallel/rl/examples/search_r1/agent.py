@@ -20,14 +20,14 @@ import re
 from pathlib import Path
 import urllib.request
 
-from rl.agentic.codex.harness import CodexAgentProgram, build_codex_call_trajectories
+from rl.agentic.codex.harness import CodexAgentProgram, DEFAULT_CODEX_VERSION, build_codex_call_trajectories
 from rl.tool_diagnostics import summarize_tool_protocol
 from rl.tool_protocol import InfrastructureRolloutError
 from rl.agentic.core.program_runner import audit_training_rows, request_gateway_json
-from examples.search_r1.container_execution import close_bridges
+from examples.search_r1.container_runtime import close_bridges
 
 
-TASK_FAILURES = {"budget_exhausted", "repeated_tool_failure", "tool_format_budget_exhausted"}
+TASK_FAILURES = {"budget_exhausted", "tool_format_budget_exhausted"}
 
 
 def repair_request(payload: dict, answer: str, errors: list[str]) -> dict:
@@ -113,28 +113,32 @@ class SearchR1Program(CodexAgentProgram):
         finally:
             await asyncio.to_thread(close_bridges, session_id)
 
+    async def _validate_version(self) -> None:
+        """Check the host's immutable candidate-image preflight instead of spawning a controller CLI."""
+        root = Path(self.config.get("session_root", "/results/jobs")).parent
+        runtime = json.loads((root / "candidate-runtime.json").read_text(encoding="utf-8"))
+        expected = "codex-cli " + str(self.config.get("version", DEFAULT_CODEX_VERSION))
+        executable = str(self.config.get("executable", "codex"))
+        if (runtime.get("version") != expected or not str(runtime.get("image_id", "")).startswith("sha256:")
+                or executable not in ("codex", runtime.get("tools", {}).get("codex"))):
+            raise RuntimeError("Codex configuration differs from the candidate-image preflight")
+
     async def _execute_search_process(self, session_id, artifact_dir, workspace_dir, codex_home):
         """Run Codex and classify a trainable task terminal."""
-        self._write_codex_config(codex_home, session_id)
+        self._write_codex_config(codex_home, session_id, runtime_home=Path("/codex-home"))
         await self._validate_version()
         answer = ""
         outcome = "completed"
         diagnostics = []
+        execution_error = None
         try:
             answer, return_code, diagnostics = await self._run_codex(
                 session_id, artifact_dir, workspace_dir, codex_home
             )
             if return_code != 0:
                 raise RuntimeError(f"Codex exited with status {return_code}; see {artifact_dir}")
-        except RuntimeError:
-            terminal_path = artifact_dir / "search-terminal.json"
-            if not terminal_path.exists():
-                raise
-            terminal = json.loads(terminal_path.read_text())
-            outcome = terminal.get("reason")
-            if (outcome not in TASK_FAILURES or terminal.get("failure_origin") != "model"
-                    or terminal.get("trainable") is not True):
-                raise
+        except RuntimeError as error:
+            execution_error = error
         # Codex may return normally after receiving an HTTP error; process success is not rollout success.
         terminal_path = artifact_dir / "search-terminal.json"
         if terminal_path.exists():
@@ -146,11 +150,18 @@ class SearchR1Program(CodexAgentProgram):
         execution_path = artifact_dir / "execution-result.json"
         if execution_path.exists() and json.loads(execution_path.read_text()).get("returncode") not in (0, 75):
             raise RuntimeError("Agent container failed independently of the task outcome")
-        return answer, outcome, diagnostics
+        return answer, outcome, diagnostics, execution_error
 
-    async def _check_search_citations(self, session_id, artifact_dir, workspace_dir, timeout, answer, outcome):
+    async def _check_search_citations(self, session_id, artifact_dir, workspace_dir, timeout, answer, outcome,
+                                      execution_error=None):
         """Validate visible citations and make at most one correction call."""
         captured = await self._capture(session_id, timeout)
+        terminal_reward = self.resolve_execution_outcome(
+            captured, None if outcome in TASK_FAILURES else execution_error, answer,
+        )
+        terminal_metadata = dict(terminal_reward.metadata) if terminal_reward is not None else {}
+        if terminal_reward is not None:
+            outcome = terminal_metadata.get("failure_reason", "budget_exhausted")
         observations_path = artifact_dir / "search-observations.json"
         observations = json.loads(observations_path.read_text()) if observations_path.exists() else []
         citation = validate_citations(answer, workspace_dir, observations)
@@ -169,15 +180,15 @@ class SearchR1Program(CodexAgentProgram):
                 outcome = "invalid_citation"
         if not captured.get("completions"):
             raise RuntimeError("No sampled actions available; this is not a trainable task failure")
-        return captured, citation, answer, outcome, repaired
+        return captured, citation, answer, outcome, repaired, terminal_metadata
 
     async def _run_search(self, session_id, artifact_dir, workspace_dir, codex_home, timeout):
         """Run one isolated search episode and record its trainable trajectories."""
-        answer, outcome, diagnostics = await self._execute_search_process(
+        answer, outcome, diagnostics, execution_error = await self._execute_search_process(
             session_id, artifact_dir, workspace_dir, codex_home
         )
-        captured, citation, answer, outcome, repaired = await self._check_search_citations(
-            session_id, artifact_dir, workspace_dir, timeout, answer, outcome
+        captured, citation, answer, outcome, repaired, terminal_metadata = await self._check_search_citations(
+            session_id, artifact_dir, workspace_dir, timeout, answer, outcome, execution_error,
         )
         scored = self.reward_callable(answer, self.prompt) if outcome == "completed" else None
         reward = scored.value if scored else 0.0
@@ -193,6 +204,7 @@ class SearchR1Program(CodexAgentProgram):
             "task_success": bool(scored is not None and scored.value > 0),
             "reward_evaluated": scored is not None, "reward": reward,
             "training_rows_emitted": len(captured["completions"]),
+            **terminal_metadata,
         }
         summary = summarize_tool_protocol(captured["completions"], metadata)
         metadata["tool_protocol_metrics"] = {key: value for key, value in summary.items() if key != "events"}

@@ -9,13 +9,14 @@
 | 位置 | 职责 |
 | --- | --- |
 | `examples/swe_smith/agent.py` | 仓库准备、Codex 生命周期、调用预算、冻结提交、评分和逐调用轨迹 |
-| `workspace.py`、`container_execution.py` | 固定问题分支、可信测试恢复和容器内会话中继 |
+| `workspace.py` | 固定问题分支和可信测试恢复 |
+| `rl/agentic/codex/container_execution.py` | 与Search-R1共用的容器内会话中继、CLI执行和输出记录 |
 | `artifacts.py`、`reward.py` | 源码补丁投影、保护测试/配置、独立 pytest 评分与失败归因 |
 | `prepare_data.py`、`prepare_images.py` | 子集/全量转换、任务镜像映射、架构和身份核验 |
 | `infer.py`、`configs/` | 无训练的推理入口、模型配方及固定九例的镜像/任务身份 |
 | `launch.py`、`run_config.py` | 本地或 SSH 沙盒选择、路径和数据/镜像身份核验、可信 controller 生命周期 |
 | `rl/agentic/codex/`、`rl/agentic/envs/docker_workspace.py` | 通用 Codex 协议、原始采样证据、本地/远端工作区 |
-| `models/qwen3_5/adapter/selected_log_probs.py` | 模型侧动作位置概率、分块词表投影与重计算 |
+| `rl/roles/policy/token_log_probs_adapter.py` | RL侧动作位置概率、分块词表投影与重计算 |
 | `rl/roles/`、`rl/weight_sync/`、`rl/checkpoint.py` | 训练构造、流式发布、图刷新及完整恢复 |
 
 ## 任务与评分合同

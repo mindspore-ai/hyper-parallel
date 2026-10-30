@@ -26,7 +26,7 @@ import pytest
 import torch
 from torch.utils.checkpoint import DefaultDeviceType
 
-from hyper_parallel.models.qwen3_5.adapter.selected_log_probs import bind_token_log_probs
+from rl.roles.policy.token_log_probs_adapter import bind_token_log_probs
 
 pytest.importorskip("transformers", minversion="5.5.4")
 
@@ -34,7 +34,7 @@ pytest.importorskip("transformers", minversion="5.5.4")
 with patch("transformers.utils.is_torch_npu_available", return_value=False), patch(
     "transformers.utils.import_utils.is_torch_npu_available", return_value=False
 ):
-    from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
+    from transformers import Qwen3ForCausalLM, Qwen3Config, Qwen3_5ForCausalLM, Qwen3_5TextConfig
 
 
 def _model() -> Qwen3_5ForCausalLM:
@@ -61,6 +61,11 @@ def _dense(model: torch.nn.Module, ids: torch.Tensor, mask: torch.Tensor) -> tor
 class TestSelectedLogProbs(unittest.TestCase):
     """Verify the vector chain rule, real decoder recomputation and normal HF compatibility."""
 
+    @staticmethod
+    def make_model() -> torch.nn.Module:
+        """Build the original hybrid text family for the shared acceptance suite."""
+        return _model()
+
     def setUp(self) -> None:
         """Use deterministic CPU tensors and restore thread/RNG/checkpoint defaults afterwards."""
         previous_threads = torch.get_num_threads()
@@ -78,7 +83,7 @@ class TestSelectedLogProbs(unittest.TestCase):
 
     def test_full_vector_gradients_match_dense_with_and_without_decoder_checkpointing(self) -> None:
         """Compare every real parameter under signed token gradients and a nonlinear clipped objective."""
-        template = _model()
+        template = self.make_model()
         for full_ac in (False, True):
             for nonlinear in (False, True):
                 with self.subTest(full_ac=full_ac, nonlinear=nonlinear):
@@ -125,7 +130,7 @@ class TestSelectedLogProbs(unittest.TestCase):
 
     def test_normal_forward_and_parameter_identity_are_unchanged(self) -> None:
         """Normal HF output stays exact and rebinding does not replace the model or its parameters."""
-        model = _model().eval()
+        model = self.make_model().eval()
         parameters = {name: id(value) for name, value in model.named_parameters()}
         modules = {name: id(value) for name, value in model.named_modules()}
         with torch.no_grad():
@@ -140,12 +145,12 @@ class TestSelectedLogProbs(unittest.TestCase):
             torch.testing.assert_close(chosen, _dense(model, self.ids, self.mask), rtol=2e-5, atol=2e-6)
         self.assertEqual(parameters, {name: id(value) for name, value in model.named_parameters()})
         self.assertEqual(modules, {name: id(value) for name, value in model.named_modules()})
-        project = inspect.getclosurevars(model.forward).nonlocals["project"]
+        project = model.forward
         self.assertFalse(any(torch.is_tensor(value) for value in inspect.getclosurevars(project).nonlocals.values()))
 
     def test_action_projection_preserves_all_gradients_including_zero_action_padding(self) -> None:
         """Masked nonlinear losses match dense HF, including every prompt-context gradient."""
-        template = _model()
+        template = self.make_model()
         for full_ac in (False, True):
             for empty in (False, True):
                 with self.subTest(full_ac=full_ac, empty=empty):
@@ -183,7 +188,7 @@ class TestSelectedLogProbs(unittest.TestCase):
 
     def test_head_checkpoint_removes_saved_vocabulary_matrices(self) -> None:
         """Contrast real plain chunks with checkpointed chunks and count actual head recomputation."""
-        model = _model().train()
+        model = self.make_model().train()
 
         def record(tensor: torch.Tensor) -> torch.Tensor:
             """Keep metadata only while autograd owns the saved tensor."""
@@ -220,17 +225,20 @@ class TestSelectedLogProbs(unittest.TestCase):
 
     def test_rejects_cache_partial_positions_and_unsafe_head_boundaries(self) -> None:
         """Fail before selected forward bypasses the complete-sequence or root-collective contract."""
-        model = _model()
+        model = self.make_model()
         for bound in (0, 513, True):
             with self.subTest(chunk_size=bound), self.assertRaisesRegex(ValueError, "chunk_size"):
                 bind_token_log_probs(model, chunk_size=bound)
-        with patch("hyper_parallel.models.qwen3_5.adapter.selected_log_probs.get_hsdp_state", return_value=object()):
+        with patch("rl.roles.policy.token_log_probs_adapter.get_hsdp_state", return_value=object()):
             with self.assertRaisesRegex(ValueError, "independently sharded lm_head"):
                 bind_token_log_probs(model)
         model.hsdp_scheduler = SimpleNamespace(reshard_after_forward=True)
-        with patch("hyper_parallel.models.qwen3_5.adapter.selected_log_probs.get_hsdp_state",
+        with patch("rl.roles.policy.token_log_probs_adapter.get_hsdp_state",
                    side_effect=lambda module: object() if module is model else None):
-            with self.assertRaisesRegex(ValueError, "root reshard_after_forward"):
+            if model.config.model_type == "qwen3_5_text":
+                with self.assertRaisesRegex(ValueError, "root reshard_after_forward"):
+                    bind_token_log_probs(model)
+            else:
                 bind_token_log_probs(model)
         bind_token_log_probs(model)
         for overrides in ({"use_cache": True}, {"past_key_values": object()}, {"logits_to_keep": 1}):
@@ -241,3 +249,16 @@ class TestSelectedLogProbs(unittest.TestCase):
                 model(input_ids=self.ids, return_token_log_probs=True, token_log_probs_mask=invalid)
         with self.assertRaisesRegex(ValueError, "requires return_token_log_probs"):
             model(input_ids=self.ids, token_log_probs_mask=torch.ones(2, 8, dtype=torch.bool))
+
+
+class TestQwen3TokenLogProbs(TestSelectedLogProbs):
+    """Run the same value, clipped-objective, gradient and identity checks on tied Qwen3."""
+
+    @staticmethod
+    def make_model() -> torch.nn.Module:
+        """Use a real Qwen3 decoder with tied embedding and head parameters."""
+        config = Qwen3Config(vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=2,
+                             num_attention_heads=2, num_key_value_heads=1, head_dim=16, pad_token_id=0,
+                             max_position_embeddings=128, use_cache=False, tie_word_embeddings=True)
+        config._attn_implementation = "eager"  # pylint: disable=protected-access
+        return Qwen3ForCausalLM(config).to(device="cpu", dtype=torch.float32)

@@ -151,6 +151,12 @@ class HSDPModule:
         with torch.no_grad():
             for hsdp_param in hsdp_state.hsdp_params:
                 hsdp_param.reset_sharded_param()
+            if hsdp_state.param_group is not None:
+                for bucket in hsdp_state.param_group.all_gather_buckets:
+                    # Conversion rebinds shards; an obsolete zero-copy buffer
+                    # must not keep the previous device allocation resident.
+                    if not bucket.is_flat_buffer_valid():
+                        bucket.flat_param_buffer = None
         return result
 
     def hsdp_init(self, module, mesh, reshard_after_forward,

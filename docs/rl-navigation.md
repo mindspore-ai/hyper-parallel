@@ -6,20 +6,19 @@
 路径约定：`rl/`、`examples/` 相对 `hyper_parallel/rl/`；`tests/`、`hyper_parallel/` 相对仓库根目录。
 `文件.py::Class.method` 或 `文件.py::function` 指明实现符号。测试列是代表覆盖，不是所有场景均已通过的声明。
 UT 包含 CPU 计算与 mock；真实模型、通信和数值效果需执行对应 ST。
-目录校验器只校验 AGENTS 清单，本文的路径、符号和语义需另外核查。
 
 ## 1. 配置、模型与支持范围
 
 | 功能 | 配置或入口 | 实现分支 | 数据或指标 | 代表测试 |
 | --- | --- | --- | --- | --- |
-| 运行镜像 | 统一 v0.23 Code Agent 镜像；启动脚本及 `RL_ST_*_IMAGE` 可覆盖 | [镜像下载与校验](../hyper_parallel/rl/docker/README.md) | Search-R1 训练与候选容器共用镜像、保留独立权限；包含 RL 基础依赖、Codex CLI 和 DeepSeek Harness | `hyper_parallel/rl/tests/st/search_r1_isolation.py` |
+| 运行镜像 | 统一 v0.23 Code Agent 镜像；启动脚本及 `RL_ST_*_IMAGE` 可覆盖 | [镜像下载与校验](../hyper_parallel/rl/docker/README.md) | Search-R1 训练镜像与精简Codex候选镜像分离、保留独立权限；包含 RL 基础依赖、Codex CLI 和 DeepSeek Harness | `hyper_parallel/rl/tests/st/search_r1_isolation.py` |
 | 配置校验与运行配置 | YAML 顶层字段 | `rl/config.py::validate_config`、`rl/config.py::build_runtime_config` | 主项目 `TrainerConfig` | `tests/ut/rl/trainer/test_config_runtime.py` |
 | 模型身份与 Qwen3 加载 | `model.registry_name`、`model.name`、`model.weights_path` | `rl/roles/model_setup.py::resolve_model`、`hyper_parallel/rl/rl/roles/qwen3_builder.py::Qwen3AutoModel` | `ModelRegistration`；dense 使用原有 builder；MoE 使用公共 AutoModel 与 MoE recipe | `tests/ut/rl/trainer/test_qwen3_master.py`、`tests/ut/rl/trainer/test_config_runtime.py::test_removed_model_families_fail_before_runtime_construction` |
 | Dense 训练拓扑边界 | `train.accelerator.dp_shard`、`tp`、`dp_replicate`、`cp`、`pp`、`ep`、`edp_shard` | `rl/config.py::_trainer_topology`、`rl/config.py::_validate_trainer_ep` | TP1/TP2；正整数 FSDP 分片数；其余维度固定为 1 | `tests/ut/rl/trainer/test_config_runtime.py::test_training_topology_is_checked_for_all_engines`、`tests/ut/rl/trainer/test_config_runtime.py::test_dense_runtime_rejects_expert_parallelism` |
 | MoE R3 | `train.router_replay.mode: disabled/R3`；[四卡 Codex 配方与示例](../hyper_parallel/rl/examples/gsm8k/README.md) | `rl/config.py::resolve_router_replay_config`、`rl/router_replay.py`、`rl/roles/policy/router_adapter.py`、`rl/roles/rollout/router_capture.py` | 输入位置 trace、Actor 前向/反向重放、Reference 隔离；internal 前缀检查、Codex 逐调用 trace；不保证训推概率一致 | `tests/ut/rl/policy/test_router_replay.py`、`tests/ut/rl/rollout/test_router_capture.py`；[验证入口](../hyper_parallel/rl/docs/moe_code_agent.md#单元测试) |
 | Qwen3-30B-A3B 接入 | `examples/gsm8k/configs/qwen3_30b_a3b_gsm8k_vllm.yaml`；`train.accelerator.ep`、`edp_shard` | `rl/config.py::_validate_model_scope`、`rl/config.py::_validate_moe_parallelism`、`rl/config.py::_model_plan_overrides` | 仅 GRPO、colocated native vLLM、consistency off、EPLB off；TP1/TP2，EP/EDP 整除训练规模，EP 整除专家数 | `tests/ut/rl/trainer/test_moe_config.py`；支持范围见 [MoE 指南](../hyper_parallel/rl/docs/moe_code_agent.md#功能与支持边界) |
-
-| Qwen3.5-9B / Qwen3.8-27B 文本 RL | `examples/swe_smith/configs/qwen3_5_9b.yaml`、`qwen3_8_27b.yaml` | `rl/config.py::_validate_qwen3_5_scope`、`rl/roles/model_setup.py::build_role_model`、`rl/weight_sync/vllm_worker.py` | GRPO、FSDP TP=CP=1、共卡 native-vLLM、完整文本策略发布；模型能力在 `models/qwen3_5/adapter/selected_log_probs.py` | `tests/ut/rl/trainer/test_qwen3_5_runtime.py`、`test_code_agent_recipes.py` |
+| Qwen3.5-9B / Qwen3.8-27B 文本 RL | `examples/swe_smith/configs/qwen3_5_9b.yaml`、`qwen3_8_27b.yaml` | `rl/config.py::_validate_qwen3_5_scope`、`rl/roles/model_setup.py::build_role_model`、`rl/weight_sync/vllm_worker.py` | GRPO、FSDP TP=CP=1、共卡 native-vLLM、完整文本策略发布；模型能力在 `rl/roles/policy/token_log_probs_adapter.py` | `tests/ut/rl/trainer/test_qwen3_5_runtime.py`、`tests/ut/rl/trainer/test_code_agent_recipes.py` |
+| 异步 GRPO | `async_training.*`、`examples/async_training/launch.py` | `rl/config.py::validate_async_config`、`rl/async_training/` | Qwen3 dense、disjoint、完整组消费与策略滞后；[异步合同](../hyper_parallel/rl/docs/architecture.md#rayless-asynchronous-grpo) | `tests/ut/rl/async_training/` |
 
 ## 2. 算法、目标与策略角色
 
@@ -29,33 +28,45 @@ UT 包含 CPU 计算与 mock；真实模型、通信和数值效果需执行对�
 | 共卡 RM | 可选 `reward_model.scorer`、`model_path`、`scoring`、TP/DP；内部 Qwen3 Dense | `rl/reward_model/client.py::RewardModelClient`、`rl/reward_model/scoring.py::score_model_batch`、`examples/gsm8k/agent.py::score_gsm8k_environment_reward`、`rl/trainer.py::SyncTrainer._score_model_rollout` | 生成后评分；`reward/scored_sequences`、`reward/request_count`；无正确率时不输出 accuracy | `tests/ut/rl/reward_model/test_model_reward.py`；NPU case `reward-model-*` 待运行 |
 | GSPO | `algorithm.name=gspo`、`algorithm.loss_aggregation=seq-mean-token-mean`；Qwen3 dense 配方 | `rl/algorithm/loss.py::GSPOAlgorithm.compute_actor_loss`、`rl/roles/policy/actor.py::Actor.update` | 分组优势；等权序列平均；`train/valid_sequences`、`train/sequence_clip_fraction` | `tests/ut/rl/algorithm/test_gspo.py`；真实 NPU case `gspo-*` 待运行 |
 | PPO | `algorithm.name=ppo`、`algorithm.gamma`、`algorithm.gae_lambda` | `rl/algorithm/loss.py::PPOAlgorithm.build_targets`、`rl/algorithm/loss.py::PPOAlgorithm.compute_actor_loss`、`rl/algorithm/loss.py::PPOAlgorithm.compute_critic_loss` | advantages、returns；`critic/value_loss` | `tests/ut/rl/algorithm/test_algorithm_loss.py`、`tests/ut/rl/trainer/test_ppo_targets.py` |
+| OPD / MOPD | `distillation.*`、[蒸馏配方](../hyper_parallel/rl/examples/distillation/README.md) | `rl/distillation/`、`rl/algorithm/distillation.py`、`rl/trainer.py` | 原始采样概率、Actor anchor、冻结 Teacher 概率分离；不发布教师权重 | `tests/ut/rl/distillation/` |
 | 分组优势与 GAE | 由算法选择 estimator | `rl/algorithm/advantage.py::GroupRelativeAdvantageEstimator.estimate`、`rl/algorithm/advantage.py::GAEAdvantageEstimator.estimate` | `TargetOutput` | `tests/ut/rl/algorithm/test_algorithm_advantage.py` |
 | PPO bootstrap 与优势归一化 | rollout 终止状态、Critic 最后一个 token 的值 | `rl/dataset/batch_builder.py::get_bootstrap_values`、`rl/dataset/batch_builder.py::ExperiencePreparer.prepare` | 冻结的旧 values、bootstrap、returns、loss mask | `tests/ut/rl/trainer/test_ppo_targets.py::TestPPOTargets.test_gae_bootstrap_and_observation_gap`、`tests/ut/rl/data/test_experience_preparer.py` |
-| Actor 重算 | 日志诊断或 `consistency.enabled=true` | `rl/trainer.py::SyncTrainer._prepare_experience`、`rl/roles/policy/actor.py::Actor.compute_log_probs` | Actor logprobs 用于诊断；训练 old_log_probs 保持 rollout 来源 | `tests/ut/rl/policy/test_policy_compute.py`、`tests/ut/rl/consistency/test_consistency.py` |
+| Actor 重算 | `train.old_log_prob_source=rollout/actor`；`rollout.collect_log_probs`；日志诊断或 consistency | `rl/trainer.py::SyncTrainer._prepare_experience`、`rl/roles/policy/actor.py::Actor.compute_log_probs` | 默认保留 rollout anchor；actor 模式强制更新前重算并 detach，默认独立保留 rollout_log_probs；内部 actor-anchor 可关闭采样概率及其差异诊断；OPD 仍重算 anchor | `tests/ut/rl/trainer/test_trainer_orchestration.py`、`tests/ut/rl/policy/test_policy_compute.py` |
 | Actor 更新 | `train.micro_batch_size`、`train.response_mini_batch_size`、`train.policy_update_epochs` | `rl/roles/policy/actor.py::Actor.update`、`rl/roles/policy/actor.py::Actor.forward_backward` | `ActorUpdateMetrics`；`train/gradient_norm`、`train/optimizer_steps` | `tests/ut/rl/policy/test_policy_update.py` |
-| 长轨迹概率与梯度累积 | `return_token_log_probs=True`、可选 `token_log_probs_mask`；外部 runner 的 `response_mini_batch_size` | `hyper_parallel/models/qwen3_5/adapter/selected_log_probs.py::bind_token_log_probs`、`rl/roles/policy/actor.py::Actor._experience_log_probs`、`Actor._set_gradient_sync` | 保留全部调用；真实 action 投影；CPU offload 逐微批归约后累积分片 | `tests/ut/auto_models/models/qwen3_5/test_selected_log_probs.py`、`tests/ut/rl/policy/test_policy_update.py` |
+| Actor 动态 token 分批 | 可选 `train.max_tokens_per_micro_batch`；默认 null | `rl/roles/policy/dynamic_batch.py`、`Actor._plan_dynamic_update`；复用共享 `FirstFitPackingSelector` | dense Qwen3 TP1 GRPO；预算含 padding；超预算完整序列单独成批；DP 调用次数对齐；`train/micro_batches_per_rank`、`train/padding_fraction`；不改变 old/reference 前向分批 | `tests/ut/rl/policy/test_dynamic_batch.py` |
+| Actor DP 负载均衡 | 可选 `train.balance_dp_tokens`，默认 false；要求 Actor 动态分批 | `rl/roles/policy/dp_balance.py`、`Actor.balance_rollout`、`SyncTrainer._prepare_experience`、`ExperiencePreparer.prepare_targets/attach_role_outputs` | 完整组优势先算；同一全局 mini-batch 内交换完整行后计算 old/ref；Actor 更新不再重分配；普通微批预算与超长单样本规则/offload 保留；`timing_s/balance` 计入训练总时间 | `tests/ut/rl/policy/test_dp_balance.py`、`tests/ut/rl/data/test_episodes.py`、`tests/ut/rl/trainer/test_trainer_orchestration.py` |
+| old/reference 动态前向 | 可选 `train.old_log_prob_max_tokens_per_micro_batch` / `train.reference_log_prob_max_tokens_per_micro_batch`；默认 null | `Actor.compute_log_probs`、`rl/roles/policy/dynamic_batch.py`；复用共享 selector | dense Qwen3 TP1 GRPO；完整上下文、普通微批矩形预算、超长单样本、DP 调用次数对齐、原样本顺序恢复；保留 offload | `tests/ut/rl/policy/test_dynamic_batch.py`、`tests/ut/rl/trainer/test_trainer_orchestration.py` |
+| 长轨迹概率与梯度累积 | `train.token_log_probs_mode`、`token_log_probs_chunk_size`；`return_token_log_probs=True`、可选 `token_log_probs_mask` | `rl/roles/policy/token_log_probs.py::chunked_token_log_probs`、`token_log_probs_adapter.py::bind_token_log_probs`、`actor.py::Actor._experience_log_probs` | Qwen3/Qwen3.5统一RL概率；完整上下文、动作位置投影、分块重算；保留完整概率诊断 | `tests/ut/rl/policy/test_token_log_probs.py`、`tests/ut/rl/policy/test_token_log_probs_adapter.py`、`hyper_parallel/rl/tests/st/_token_log_probs.py` |
 | Reference | GRPO/PPO/GSPO 均按 `algorithm.kl_coef > 0` 请求 Reference；GSPO 默认零 KL | `rl/trainer.py::SyncTrainer._build_models_and_optimizers`、`rl/roles/policy/actor.py::Actor.__init__` | 冻结模型；`ExperienceBatch.reference_log_probs` | `tests/ut/rl/policy/test_actor_roles.py`、`tests/ut/rl/trainer/test_trainer_orchestration.py` |
 | PPO Critic | `train.critic.weights_path`、`optimizer`、`micro_batch_size`、`response_mini_batch_size`、`update_epochs` | `rl/roles/policy/critic.py::build_value_model`、`rl/roles/policy/critic.py::Critic.compute_values`、`rl/roles/policy/critic.py::Critic.update` | 价值头已接入；`CriticUpdateMetrics`、`critic/value_loss`、`critic/optimizer_steps` | `tests/ut/rl/trainer/test_ppo_value_model.py`、`tests/ut/rl/policy/test_policy_update.py` |
+| 训练角色驻留 | `train.accelerator.cpu_offload`、`reference_cpu_offload`、`comm_fusion_zero_copy` | `rl/config.py::build_runtime_config`、`rl/trainer.py::SyncTrainer._build_models_and_optimizers`、`_release_training_state_for_rollout` | 复用共享 FSDP policy；共卡常驻要求 GRPO、consistency off；独立 Reference 卸载有模型/TP限制；发布前检查驻留 | `tests/ut/rl/trainer/test_config_runtime.py::test_role_offload_reuses_shared_fsdp_config`、`tests/ut/rl/trainer/test_phase_offload.py::TestResidentOptimizer` |
+| 生成阶段训练状态卸载 | `train.accelerator.offload_during_rollout` | `rl/roles/phase_offload.py::TrainingStateOffload`、`rl/trainer.py::SyncTrainer._move_training_state` | 独立于训练 CPU policy；先睡眠推理再恢复训练，发布后卸载再唤醒 KV；保留对象身份与原设备 | `tests/ut/rl/trainer/test_phase_offload.py`、`hyper_parallel/rl/tests/st/_phase_offload.py`；共享转换回归 `tests/ut/core/fully_shard/test_module_conversion.py` |
+| 梯度归约时机 | `train.gradient_sync_each_micro_batch` | `rl/roles/policy/actor.py::Actor._set_gradient_sync` | offload 始终逐 microbatch；常驻可选择末尾归约，优化器更新次数不变 | `tests/ut/rl/policy/test_policy_update.py::test_resident_actor_can_select_existing_gradient_sync_policy` |
+| 公共训练统计 | 每次日志采样；采样 log-prob 可关闭 | `rl/utils/monitoring/metrics.py::summarize_training_diagnostics` | 有效 token、优势/价值分布独立于概率诊断；缺少比较输入时 `training/rollout_probs_diff_valid=0` | `tests/ut/rl/utils/test_monitoring_metrics.py`、`tests/ut/rl/trainer/test_trainer_orchestration.py` |
 
 ## 3. Rollout 与 Agentic
 
 | 功能 | 配置或入口 | 实现分支 | 数据或指标 | 代表测试 |
 | --- | --- | --- | --- | --- |
-| vLLM 生成 | `rollout.engine=vllm` | `rl/roles/rollout/registry.py::build_rollout_engine`、`rl/roles/rollout/vllm.py::VLLMGenerationEngine.generate` | `GenerationResult`；`rollout/generated_tokens`、`rollout/tokens_per_second` | `tests/ut/rl/rollout/test_vllm_runtime.py` |
+| vLLM 生成 | `rollout.engine=vllm`；`rollout.vllm.seed`、`disable_log_stats`、`task_queue_enable` | `rl/roles/rollout/registry.py::build_rollout_engine`、`rl/roles/rollout/vllm.py::VLLMGenerationEngine.generate` | `GenerationResult`；`rollout/generated_tokens`、`rollout/tokens_per_second` | `tests/ut/rl/rollout/test_vllm_runtime.py` |
 | Native / Hyper Qwen3 dense | `rollout.vllm.model_implementation` 为 `native` 或 `hyper` | `rl/roles/model_setup.py::resolve_vllm_model`、`rl/roles/rollout/vllm_plugin.py::register_hyper_models`、`rl/roles/rollout/consistency_models/qwen3/model.py::HyperQwen3ForCausalLM` | 两种模型实现共享生成及权重更新控制合同 | `tests/ut/rl/rollout/test_qwen3_adapter.py`、`tests/ut/rl/rollout/test_vllm_plugin.py` |
 | Native Qwen3-MoE | `rollout.vllm.enable_expert_parallel`、`model_implementation=native` | `rl/roles/model_setup.py::resolve_vllm_model`、`rl/roles/rollout/vllm.py::VLLMGenerationEngine._server_command` | 专家并行启动参数；MoE 不支持 Hyper 实现或 EPLB | `tests/ut/rl/trainer/test_moe_config.py`；`hyper_parallel/rl/tests/st/_moe_train.py` |
 | 服务拓扑与设备 | `rollout.vllm.deployment`、`data_parallel_size`、`tensor_parallel_size`、`visible_devices` | `rl/config.py::_validate_vllm_basics`、`rl/roles/rollout/topology.py::resolve_vllm_rollout_topology` | 共享服务；colocated/disjoint 的设备与训练规模约束 | `tests/ut/rl/rollout/test_rollout_topology.py`、`tests/ut/rl/trainer/test_config_runtime.py` |
 | 运行容量 | `rollout.vllm.max_model_len`、`max_num_seqs`、`max_num_batched_tokens` | `rl/config.py::resolve_vllm_automatic_limits`、`rl/config.py::_validate_vllm_limits` | 自动解析容量并校验约束 | `tests/ut/rl/trainer/test_config_runtime.py` |
-| Qwen3.5 家族 decode 图发布 | `enforce_eager=false`、`compilation_config`；仅 rollout DP=1、固定 0.23.0.post1 | `rl/config.py::_validate_qwen3_5_graphs`、`rl/weight_sync/vllm_worker.py::_refresh_ascend_decode_graphs` | KV 唤醒后、开放采样前重新捕获；失败不提交版本；9B FSDP2/TP2、27B FSDP4/TP4 完整发布已验收 | `tests/ut/rl/weight_sync/test_decode_graphs.py` |
-| GSM8K 环境与奖励 | `agentic.module_path=examples.gsm8k.agent`、`agentic.environment=gsm8k_tools` | `rl/agentic/envs/environment.py::load_agentic_module`、`examples/gsm8k/agent.py::build_gsm8k_environment`、`examples/gsm8k/agent.py::compute_gsm8k_reward` | `Trajectory.reward`；`reward/mean`、`reward/accuracy` | `tests/ut/rl/agentic/agentic_ut.py` 验证通用合同；真实 GSM8K 奖励/学习证据见 `hyper_parallel/rl/tests/st/test_rl_st.py` |
+| Qwen3.5 家族 decode 图发布 | `enforce_eager=false`、`compilation_config`；仅 rollout DP=1、固定 0.23.0.post1 | `rl/config.py::_validate_qwen3_5_graphs`、`rl/weight_sync/vllm_worker.py::_refresh_ascend_decode_graphs` | KV 唤醒后、开放采样前刷新图；失败不提交版本；[验证范围](../hyper_parallel/rl/examples/swe_smith/README.md#图执行与验证范围) | `tests/ut/rl/weight_sync/test_decode_graphs.py` |
+| GSM8K 环境与奖励 | `agentic.module_path=examples.gsm8k.agent`、`agentic.environment=gsm8k_tools` | `rl/agentic/envs/environment.py::load_agentic_module`、`examples/gsm8k/agent.py::build_gsm8k_environment`、`examples/gsm8k/agent.py::compute_gsm8k_reward` | 末尾300字符的 verl 严格规则；单轮及外部 harness 共用 | `tests/ut/rl/agentic/test_gsm8k_reward.py` |
 | 单轮 Python code | `agentic.module_path=examples.code.agent`、`agentic.environment=code_stdio`、`agentic.code.*` | `examples/code/agent.py::CodeEnvironment`、`examples/code/judge.py::judge_stdio`、`examples/code/client.py::SandboxFusionExecutor` | 全测二值奖励；私有测试不进 prompt；任务失败与服务故障分开，后者上抛 | `tests/ut/rl/agentic/test_code_judge.py`、`hyper_parallel/rl/tests/st/test_feature_st.py::test_code_sandbox`；[独立沙箱镜像](../hyper_parallel/rl/docker/README.md#单轮-code-的-sandboxfusion-镜像)；[部署与数据审核](../hyper_parallel/rl/examples/code/README.md)；[四卡 Docker 启动](../hyper_parallel/rl/examples/code/scripts/run_qwen3_4b_code_docker.sh) |
 | Internal TP 单一环境执行 | internal runner 的 request owner；`GenerationResult.finish_reasons` | `rl/agentic/core/trajectory_runner.py::AgentRunner._run_environment_batch`、`rl/agentic/core/session.py::AgentSession` | owner 执行、同组重放；原始 token/logprob 保留；finish reason 与截断状态传递 | `tests/ut/rl/agentic/test_code_runner.py` |
 | 内部交互与工具 | `agentic.runner=internal`、`agentic.max_turns` | `rl/agentic/core/session.py::AgentSession`、`rl/agentic/tools/executor.py::ToolExecutor` | 带版本的 EpisodeContext、Trajectory 与工具结果 | `tests/ut/rl/agentic/agentic_ut.py`、`tests/ut/rl/rollout/test_worker.py` |
-| Codex 程序 | `agentic.runner=codex`、`agentic.codex.*` | `rl/roles/rollout/worker.py::CodexRolloutManager`、`rl/agentic/codex/`、`rl/agentic/core/program_runner.py` | 逐调用真实轨迹、episode GRPO；标准与 additional_tools、调用限流及排空 | `tests/ut/rl/agentic/agentic_ut.py`；NPU case `codex-agent` |
-| Search-R1 HotpotQA | `examples/search_r1/configs/qwen3_4b_search_r1.yaml`, `examples/search_r1/scripts/run_search_r1.sh` | `examples/search_r1/agent.py`, `workspace.py`, `container_execution.py`, `reward.py` | Isolated article search, citation repair, protocol diagnostics, and episode reward | `tests/ut/rl/agentic/test_search_r1.py`, `hyper_parallel/rl/tests/st/search_r1_isolation.py` |
+| Codex 程序 | `agentic.runner=codex`、`agentic.codex.*` | `rl/roles/rollout/worker.py::CodexRolloutManager`、`rl/agentic/codex/`、`rl/agentic/core/program_runner.py` | 逐调用真实轨迹、episode GRPO；共享`resolve_execution_outcome`预算及reasoning-only EOS终态；标准与 additional_tools、调用限流及排空；`model_instructions`/`compact_harness_context`/`preserve_environment_context`/`allowed_tools`见[输入精简合同](../hyper_parallel/rl/docs/agentic_rl.md#codex-与-deepseek外部-harness-交互) | `tests/ut/rl/agentic/agentic_ut.py`、`tests/ut/rl/agentic/codex/test_tool_allowlist.py`、`tests/ut/rl/agentic/codex/test_output_budget.py`；NPU case `codex-agent` |
+| Search-R1 HotpotQA | `examples/search_r1/configs/qwen3_4b_search_r1.yaml`, `examples/search_r1/scripts/run_search_r1.sh` | `examples/search_r1/agent.py`, `workspace.py`, `container_runtime.py`, `reward.py` | 原版 HotpotQA Distractor；混合奖励、引用检查、候选隔离与阶段计时；[任务合同](../hyper_parallel/rl/docs/search_r1.md) | `tests/ut/rl/agentic/test_search_r1.py`, `hyper_parallel/rl/tests/st/search_r1_isolation.py` |
+| 仓库型 Code Agent | `examples/swe_smith/launch.py`、`agentic.codex.program_callable` | `examples/swe_smith/agent.py`、`run_config.py`、`rl/agentic/codex/container_execution.py` | 独立grader、冻结产物、逐调用GRPO；[配方与运行](../hyper_parallel/rl/examples/swe_smith/README.md)、[验收边界](../hyper_parallel/rl/docs/swe_smith.md) | `tests/ut/rl/agentic/swe_smith/` |
 | DeepSeek 程序 | `agentic.runner=deepseek`、`agentic.deepseek.*` | `rl/roles/rollout/worker.py::DeepSeekRolloutManager`、`rl/agentic/ds_harness/`、`rl/agentic/core/program_runner.py` | 自有协议下逐调用真实轨迹与 episode GRPO；分段 PPO 拒绝 | `tests/ut/rl/agentic/agentic_ut.py`；NPU case `deepseek-agent` |
 | Episode GRPO 与 DP 补齐 | 外部 program 返回完整逐调用轨迹 | `rl/dataset/episodes.py::episode_rows`、`rl/dataset/batch_builder.py::pad_agent_call_batch_for_dp` | episode 计奖、call 训练；padding 零损失且不计统计 | `tests/ut/rl/data/test_episodes.py`、`hyper_parallel/rl/tests/st/_agent_dp.py` |
-| 工具失败证据 | 外部 harness + Hermes，固定 vLLM 版本 | `rl/tool_protocol.py::inspect_tool_response`、`rl/agentic/codex/gateway.py`、`rl/agentic/ds_harness/gateway.py` | 原始 token/解析证据；模型、基础设施、未知归因；非法组拒绝 | `tests/ut/rl/agentic/test_agent_protocol.py` |
+| Codex CPU准备重叠 | `agentic.codex.overlap_preparation`，通用默认false、GSM8K Codex配方true；`preparation_cpu_fraction`默认0.5、`preparation_max_cpus`默认null | `rl/trainer.py::_prepare_next_rollout`、`rl/agentic/core/prepared_batch.py`、`rl/agentic/codex/gateway.py` | 一批CPU会话提前启动，模型请求等待目标策略；验证/checkpoint/epoch边界不预取；原生本地CLI范围 | `tests/ut/rl/agentic/test_prepared_batch.py`、`tests/ut/rl/agentic/codex/test_gateway.py`、`tests/ut/rl/trainer/test_trainer_orchestration.py` |
+| 外部program有界调度 | `agentic.codex/deepseek.max_concurrent_episodes_per_rank`（默认8） | `rl/agentic/core/program_runner.py`、`codex/harness.py`、`codex/gateway.py` | 顺序回填、失败停止本地派发；Codex幂等注册/删除与预算耗尽归因 | `tests/ut/rl/agentic/test_program_admission.py`、`tests/ut/rl/agentic/codex/test_gateway.py`、`tests/ut/rl/agentic/codex/test_output_budget.py` |
+| Codex性能诊断 | [GSM8K Codex50步配置](../hyper_parallel/rl/examples/gsm8k/configs/qwen3_4b_gsm8k_codex_50step.yaml) | `rl/agentic/codex/gateway.py`、`harness.py` | 后端排队/请求时间、CLI事件接收与生命周期；完整实验结果见配方文档 | `tests/ut/rl/agentic/codex/test_gateway_transport.py` |
+| 工具失败证据 | 外部 harness + 固定模型族解析器 | `rl/tool_protocol.py::inspect_tool_response`、`rl/agentic/codex/gateway.py`、`rl/agentic/ds_harness/gateway.py` | 原始 token/解析证据；模型、基础设施、未知归因；非法组拒绝 | `tests/ut/rl/agentic/test_agent_protocol.py` |
 | Agent 编排与收尾 | program TP owner、final checkpoint | `rl/agentic/core/program_runner.py::ProgramAgentRunner`、`rl/trainer.py` | 全程序组排空、跨 rank 错误同步、checkpoint 前释放服务 | `tests/ut/rl/agentic/test_agent_program.py`、`tests/ut/rl/trainer/test_agent_integration.py` |
 
 ## 4. 权重同步与发布
@@ -83,66 +94,27 @@ UT 包含 CPU 计算与 mock；真实模型、通信和数值效果需执行对�
 | 功能 | 配置或入口 | 实现分支 | 数据或指标 | 代表测试 |
 | --- | --- | --- | --- | --- |
 | 同步主循环 | `train.max_steps` | `rl/trainer.py::SyncTrainer.train`、`rl/trainer.py::SyncTrainer._train_step` | `RLTrainerState`；`train/global_step` | `tests/ut/rl/trainer/test_trainer_orchestration.py` |
-| 退出与初始化失败清理 | Trainer 初始化失败或训练退出 | `rl/utils/process_cleanup.py::cleanup_processes`、`rl/utils/process_cleanup.py::destroy_process_group` | 服务关闭、生命周期状态复位、进程组与缓存释放 | `tests/ut/rl/trainer/test_process_cleanup.py`、`tests/ut/rl/trainer/test_trainer_orchestration.py` |
+| 退出与初始化失败清理 | Trainer 初始化失败或训练退出；可选 `HYPER_RL_FAILURE_DIR` | `rl/utils/process_cleanup.py::cleanup_processes`、`rl/utils/process_cleanup.py::destroy_process_group`、`rl/utils/failure_reporting.py::report_failure` | 清理前记录原始异常；实验宿主监督器限时停止本任务容器；服务关闭与缓存释放 | `tests/ut/rl/trainer/test_process_cleanup.py`、`tests/ut/rl/trainer/test_trainer_orchestration.py`、`tests/ut/rl/trainer/test_failure_reporting.py` |
 | 模型初始化 CPU 线程 | `train.model_init_cpu_threads`，省略/null 保持原设置 | `rl/config.py::validate_config`、`rl/roles/model_setup.py::build_role_model`、`rl/trainer.py::SyncTrainer._build_models_and_optimizers` | 可选正整数；仅模型构建期间调整 intra-op，finally 恢复；优化器与 rollout 不变 | `tests/ut/rl/policy/test_actor_roles.py`、`tests/ut/rl/trainer/test_config_runtime.py`；[用法](../hyper_parallel/rl/README.md#模型初始化-cpu-线程)；[验证入口](../hyper_parallel/rl/docs/moe_code_agent.md#单元测试) |
 | Parquet prompt 数据 | `data.train_path`、`data.test_path` | `rl/dataset/data_source.py::PromptDataset`、`rl/dataset/data_source.py::build_prompt_records` | `PromptRecord` 与批次 | `tests/ut/rl/data/test_data_source.py` |
 | 结构化任务数据 | `data.row_adapter=module:function`；与列名/指令覆盖互斥 | `rl/dataset/data_source.py::PromptDataset._adapt_sample`、`examples/code/prepare_data.py::adapt_row` | 原始 messages、稳定 ID、metadata、结构化 ground truth；超长消息报错 | `tests/ut/rl/data/test_code_data.py` |
 | 经验与目标 | rollout 结果、Reference、可选 Critic | `rl/dataset/batch_builder.py::build_experience_batch`、`rl/dataset/batch_builder.py::ExperiencePreparer.prepare` | `ExperienceBatch` 的 mask、old_log_probs、advantages、returns | `tests/ut/rl/data/test_contracts.py`、`tests/ut/rl/data/test_experience_preparer.py` |
 | 保存与恢复 | `train.checkpoint.save_steps`、`save_final`、`load_path` | `rl/checkpoint.py::RLCheckpointManager`、`rl/trainer.py::SyncTrainer.train` | 角色模型/优化器/调度器、数据进度、global_step、RNG；恢复后重新发布策略 | `tests/ut/rl/trainer/test_checkpoint.py`、`tests/ut/rl/trainer/test_ppo_targets.py::TestPPOCheckpoint.test_both_roles_survive_resume` |
-| 评估 | `evaluation.enabled`；保存边界和最终保存调度 | `rl/evaluation.py::Evaluator.run`、`rl/trainer.py::SyncTrainer._complete_step` | `validation/` 指标及样本表 | `tests/ut/rl/utils/test_evaluation.py`、`tests/ut/rl/trainer/test_trainer_orchestration.py` |
+| 评估 | `evaluation.enabled`；`before_train` / `every_n_steps` / `at_end`；省略间隔沿用保存边界 | `rl/evaluation.py::Evaluator.run`、`rl/trainer.py::SyncTrainer._train_and_checkpoint` | `validation/` 指标及样本表；at_end 不要求保存 checkpoint | `tests/ut/rl/utils/test_evaluation.py`、`tests/ut/rl/trainer/test_trainer_orchestration.py` |
 | 指标与记录 | `logging.backends`、`logging.log_steps`、`logging.wandb.*` | `rl/utils/monitoring/metrics.py::build_training_metrics`、`rl/utils/monitoring/tracker.py` | `train/`、`critic/`、`reward/`、`rollout/`、`policy/`、`weight_sync/` | `tests/ut/rl/utils/test_monitoring_metrics.py`、`tests/ut/rl/utils/test_monitoring_tracker.py` |
 | Code 奖励与状态观测 | code 环境返回的 success/status/finish_reason | `rl/utils/monitoring/metrics.py::summarize_rollout`、`rl/evaluation.py::Evaluator` | `reward/accuracy`、`rollout/status/*`、`rollout/truncated_ratio`；评估成功率与样本状态 | `tests/ut/rl/agentic/test_code_runner.py`；`hyper_parallel/rl/tests/st/_code_train.py` |
 | 学习证据门 | `train.learning_gate.enabled` | `rl/utils/monitoring/metrics.py::enforce_learning_gate` | 奖励差异、有限且非零的梯度等检查；不保证算法收敛 | `tests/ut/rl/utils/test_monitoring_metrics.py` |
 
-## 7. ST 配方与覆盖边界
+## 7. 运行与验证入口
 
-`tests/common/rl_st_cases.py` 中的 `CASES` 和 `prepare_config` 是 UT/ST 共用的配置来源。
-`tests/ut/rl/trainer/test_config_runtime.py::test_all_st_recipes_pass_production_validation` 只证明配方通过配置校验，
-不证明训练已执行。`hyper_parallel/rl/tests/st/test_rl_st.py::test_rl_system` 才是实际 NPU 入口，
-`hyper_parallel/rl/tests/st/st_runtime.py` 负责运行和恢复阶段，`hyper_parallel/rl/tests/st/st_evidence.py` 检查结果。
-
-| 配方组 | case 名称 | 关注内容 |
+| 用途 | 入口 | 说明 |
 | --- | --- | --- |
-| Dense GRPO | `dense-tp2-direct` | 训练、Actor 发布、拓扑与传输 |
-| 一致性 | `dense-tp2-consistency-full` | 指定配方下的更新前一致性与版本 |
-| 程序 Agent | `codex-agent`、`deepseek-agent` | 外部程序轨迹与训练衔接 |
-| 保存恢复 | `checkpoint-resume` | 分阶段保存、恢复与继续训练 |
-| PPO | `ppo-tp1-full` | Actor/Critic 更新 |
-| Dense GSPO | `gspo-tp1-full`、`gspo-tp2-consistency-full`、`gspo-checkpoint-resume` | 序列归一化、训推一致性与恢复；真实 NPU 待运行 |
-| 共卡 RM | `reward-model-tp1`、`reward-model-tp2`、`reward-model-resume` | 服务切换、模型打分、发布与恢复；真实 NPU 待运行 |
+| GSM8K 正式训练 | [GSM8K README](../hyper_parallel/rl/examples/gsm8k/README.md)、`examples/gsm8k/scripts/run_50step_docker.sh` | `hyper` / `codex`；默认配置、结果摘要及比较边界由示例维护 |
+| 基础 GRPO / TP / 一致性 | `examples/gsm8k/configs/qwen3_4b_gsm8k_base.yaml`、`examples/gsm8k/scripts/run_qwen3_tp_docker.sh`、`examples/gsm8k/scripts/run_qwen3_consistency_docker.sh` | 功能测试基础配方，与50步性能配方分开 |
+| 设备监控与依赖修补 | `examples/gsm8k/scripts/monitor_8npu_run.py`、`docker/patches/patch_sampler.py` | 八卡运行守护与已知版本修补；`tests/ut/rl/trainer/test_failure_reporting.py` |
+| 同步 ST | `tests/common/rl_st_cases.py`、`hyper_parallel/rl/tests/st/test_rl_st.py`、`hyper_parallel/rl/tests/st/test_feature_st.py` | 配方定义和实际运行分开；[ST 操作](../hyper_parallel/rl/README.md#系统测试) |
+| 异步验证 | `tests/ut/rl/async_training/`、`hyper_parallel/rl/tests/st/test_async_training.py`、`hyper_parallel/rl/tests/st/test_async_core_budget.py` | CPU/Gloo 合同与 NPU/任务学习验收分开 |
 
-真实 RL ST 保留在 RL 子项目中，暂不由主项目 `tests/torch/` 门禁收集；需显式执行并准备模型、数据、镜像和设备。
-运行条件见 [ST 说明](../hyper_parallel/rl/README.md#系统测试)，PPO 验证边界见
-[算法与支持范围](../hyper_parallel/rl/README.md#支持范围)，bit-exact 的条件见
-[训练推理一致性](../hyper_parallel/rl/docs/qwen3_training_inference_consistency.md)。
-MoE、code 与外部 agent 的扩展 UT 已归入 `tests/ut/rl/` 对应模块。
-`hyper_parallel/rl/tests/st/test_feature_st.py` 提供 CPU/Gloo、真实沙箱和显式训练入口；
-其 worker 保留参数更新、策略版本及真实补齐检查，与原 dense/一致性/PPO 配方分别验收。
-测试配置与未运行项口径见 [功能与验证说明](../hyper_parallel/rl/docs/moe_code_agent.md)。
-
-## 仓库型 Code Agent
-
-[本地与远端统一运行入口](../hyper_parallel/rl/examples/swe_smith/README.md#本地与远端统一运行入口)
-为 `examples/swe_smith/launch.py`；宿主入口通过 `run_config.py` 核对 prepared 数据/镜像身份，
-填写绝对路径并启动 Ascend controller。本地显式连接 Unix socket，远端通过 SSH endpoint 选择任务 daemon；
-相同短配方覆盖推理、训练一步和新进程恢复，调用预算与真实评分不变。
-代表 CPU 测试位于 `tests/ut/rl/agentic/swe_smith/test_run_config.py` 和 `test_launch.py`。
-此入口的本地硬件运行结果单独记录，不由脚本或 CPU UT 通过推导。
-
-[本地 ARM64 九例镜像](../hyper_parallel/rl/examples/swe_smith/README.md#本地-arm64-九例镜像)
-从华为云 `huawei-hyper-rl/swe-smith` 下载；`configs/images_arm64.json` 固定镜像身份，
-`configs/selected_ids.txt` 固定六个训练用例和三个验证用例。下载后使用现有数据准备和统一运行入口。
-这三个镜像仅用于 ARM64；远端 amd64 须使用该架构对应的任务镜像及清单。
-
-[运行合同与配方](../hyper_parallel/rl/examples/swe_smith/README.md)覆盖 SWE 独立判题、
-调用预算终止、冻结产物、逐调用 GRPO，以及 Qwen3.5/3.8 的支持边界。
-任务入口为 `examples/swe_smith/agent.py`，通过 `program_callable` 复用通用 Codex 网关；
-CPU 合同位于 `tests/ut/rl/agentic/swe_smith/`、`agentic/codex/` 和 `agentic/test_docker_workspace.py`，模型数学合同位于 `tests/ut/auto_models/models/qwen3_5/`。
-既有文本网关的配置覆盖和工具恢复诊断保留；9B/27B 短预算配方开启 thinking。
-
-图模式及真实验收范围见
-[Code Agent 验证指南](../hyper_parallel/rl/examples/swe_smith/README.md#图执行与验证范围)。
-
-[实现与验证边界](../hyper_parallel/rl/docs/swe_smith.md)维护模块职责、评分合同和验证范围。
-短预算闭环通过不代表已获得非零学习信号；跨训练 DP 的会话分发、长轨迹训练和全量数据效果
-须分别验收，不能从单次推理结果推导。
+UT 在 `tests/ut/rl/`，实际 ST 在 RL 子项目且须显式运行；配置校验通过不代表训练、通信或收敛通过。
+支持范围和未验收组合见[README](../hyper_parallel/rl/README.md#支持范围)与各功能文档，导航不重复记录实验过程。
+历史基线、详细曲线及辅助脚本保存在忽略的 `output/`；主仓入口不得依赖它。

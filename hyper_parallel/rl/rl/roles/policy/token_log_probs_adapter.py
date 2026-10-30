@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Bounded terminal projection for complete Qwen3.5 text next-token probabilities."""
+"""Instance-local Qwen3-family probability adapters used only by RL roles."""
 
 from functools import wraps
 from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
-from torch.utils.checkpoint import checkpoint  # pylint: disable=forbidden-backend-import
+from rl.roles.policy.token_log_probs import chunked_token_log_probs
 
 from hyper_parallel.core.fully_shard.hsdp_utils import get_hsdp_state
 from hyper_parallel.distributed._builder.forward_rewriter import (  # pylint: disable=protected-access
@@ -31,15 +31,15 @@ from hyper_parallel.distributed._builder.forward_rewriter import (  # pylint: di
 def _probability_inputs(args: tuple, kwargs: dict, position_mask: Any) -> torch.Tensor:
     """Validate complete text inputs before invoking the decoder."""
     if args:
-        raise TypeError("Qwen3.5 token probability inputs must be passed by keyword")
+        raise TypeError("RL token probability inputs must be passed by keyword")
     tokens = kwargs.get("input_ids")
     if (not isinstance(tokens, torch.Tensor) or tokens.ndim != 2
             or tokens.dtype != torch.long or tokens.shape[0] == 0 or tokens.shape[1] < 2):
-        raise ValueError("Qwen3.5 token probabilities require nonempty int64 [batch, length>=2] input_ids")
+        raise ValueError("RL token probabilities require nonempty int64 [batch, length>=2] input_ids")
     if kwargs.get("use_cache") or kwargs.get("past_key_values") is not None:
-        raise ValueError("Qwen3.5 token probabilities require complete cache-free sequences")
+        raise ValueError("RL token probabilities require complete cache-free sequences")
     if kwargs.get("labels") is not None or kwargs.get("inputs_embeds") is not None:
-        raise ValueError("Qwen3.5 token probabilities require input_ids without labels or inputs_embeds")
+        raise ValueError("RL token probabilities require input_ids without labels or inputs_embeds")
     if position_mask is not None and (
             not isinstance(position_mask, torch.Tensor) or position_mask.dtype != torch.bool
             or position_mask.device != tokens.device
@@ -59,7 +59,7 @@ def bind_token_log_probs(model: nn.Module, *, chunk_size: int = 512) -> None:
     projection are required; vocabulary-sharded training is outside this adapter's scope.
 
     Args:
-        model: Finalized Qwen3.5 text causal LM, including its existing distributed hooks.
+        model: Finalized Qwen3 or Qwen3.5 text causal LM, including existing distributed hooks.
         chunk_size: Maximum total token rows per head call, bounded by 512.
 
     Raises:
@@ -67,28 +67,25 @@ def bind_token_log_probs(model: nn.Module, *, chunk_size: int = 512) -> None:
         TypeError: The model does not expose the expected decoder and output head.
     """
     if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or not 0 < chunk_size <= 512:
-        raise ValueError("Qwen3.5 token probability chunk_size must be an integer between 1 and 512")
+        raise ValueError("RL token probability chunk_size must be an integer between 1 and 512")
     if getattr(model, "supports_token_log_probs", False):
         return
-    if getattr(getattr(model, "config", None), "model_type", None) != "qwen3_5_text":
-        raise ValueError("Qwen3.5 token probabilities require config.model_type='qwen3_5_text'")
+    model_type = getattr(getattr(model, "config", None), "model_type", None)
+    if model_type not in ("qwen3", "qwen3_5_text"):
+        raise ValueError("RL token probabilities require Qwen3 or Qwen3.5 text")
     if not isinstance(getattr(model, "model", None), nn.Module):
-        raise TypeError("Qwen3.5 token probabilities require a decoder at model.model")
+        raise TypeError("RL token probabilities require a decoder at model.model")
     if not isinstance(getattr(model, "lm_head", None), nn.Linear):
-        raise TypeError("Qwen3.5 token probabilities require a Linear lm_head")
+        raise TypeError("RL token probabilities require a Linear lm_head")
     # Unequal sequence lengths imply unequal chunk counts across DP ranks.
     # Only the outer root may introduce HSDP collectives around these head calls.
     if get_hsdp_state(model.lm_head) is not None:
-        raise ValueError("Qwen3.5 token probabilities do not support an independently sharded lm_head")
-    if get_hsdp_state(model) is not None and model.hsdp_scheduler.reshard_after_forward:
+        raise ValueError("RL token probabilities do not support an independently sharded lm_head")
+    if (model_type == "qwen3_5_text" and get_hsdp_state(model) is not None
+            and model.hsdp_scheduler.reshard_after_forward):
         raise ValueError("Qwen3.5 token probabilities require root reshard_after_forward=False")
 
     original_forward = model.forward
-
-    def project(hidden: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """Use the currently installed head parameters on forward and recomputation."""
-        logits = model.lm_head(hidden)
-        return logits.float().log_softmax(dim=-1).gather(-1, targets.unsqueeze(-1)).squeeze(-1)
 
     @wraps(original_forward)
     def token_log_probs_forward(*args: Any, **kwargs: Any) -> Any:
@@ -104,41 +101,17 @@ def bind_token_log_probs(model: nn.Module, *, chunk_size: int = 512) -> None:
         tokens = _probability_inputs(args, kwargs, position_mask)
         logits_to_keep = kwargs.pop("logits_to_keep", 0)
         if isinstance(logits_to_keep, bool) or not isinstance(logits_to_keep, int) or logits_to_keep != 0:
-            raise ValueError("Qwen3.5 token probabilities cannot select a subset of sequence positions")
+            raise ValueError("RL token probabilities cannot select a subset of sequence positions")
         kwargs.pop("labels", None)
         kwargs.pop("return_dict", None)
         kwargs["use_cache"] = False
         hidden = model.model(**kwargs, return_dict=True).last_hidden_state[:, :-1, :]
         targets = tokens[:, 1:]
         if hidden.shape[:2] != targets.shape:
-            raise ValueError("Qwen3.5 decoder hidden positions do not align with next-token targets")
-        hidden_flat = hidden.reshape(-1, hidden.shape[-1])
-        target_flat = targets.reshape(-1)
-        indices = None
-        if position_mask is not None:
-            indices = position_mask.reshape(-1).nonzero(as_tuple=True)[0]
-            # A zero-action DP row must still participate in decoder/head backward.
-            # One dummy projection keeps every parameter's zero gradient connected.
-            if indices.numel() == 0:
-                indices = torch.zeros(1, dtype=torch.long, device=tokens.device)
-            hidden_flat = hidden_flat.index_select(0, indices)
-            target_flat = target_flat.index_select(0, indices)
-        chunks = []
-        for start in range(0, target_flat.numel(), chunk_size):
-            hidden_chunk = hidden_flat[start:start + chunk_size]
-            target_chunk = target_flat[start:start + chunk_size]
-            # Plain chunks retain every vocabulary-sized softmax for backward.
-            # Resolve the live head module during recomputation, never an old weight view.
-            if torch.is_grad_enabled():
-                chosen = checkpoint(project, hidden_chunk, target_chunk, use_reentrant=False, preserve_rng_state=True)
-            else:
-                chosen = project(hidden_chunk, target_chunk)
-            chunks.append(chosen)
-        values = torch.cat(chunks)
-        if indices is None:
-            return values.reshape(targets.shape)
-        values = values * position_mask.reshape(-1).index_select(0, indices)
-        return values.new_zeros(targets.numel()).scatter(0, indices, values).reshape(targets.shape)
+            raise ValueError("Decoder hidden positions do not align with next-token targets")
+        return chunked_token_log_probs(
+            hidden, targets, model.lm_head, position_mask=position_mask, chunk_size=chunk_size,
+        )
 
     _commit_forward_rewrite(_ForwardRewriteRequest(
         model, token_log_probs_forward,

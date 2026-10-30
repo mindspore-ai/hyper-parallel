@@ -107,11 +107,14 @@ class CodexResponsesProtocol:
         instructions_override: str | None = None,
         enable_thinking: bool | None = None,
         compact_harness_context: bool = False,
+        preserve_environment_context: bool = False,
+        allowed_tools: list[str] | None = None,
     ) -> dict[str, Any]:
         """Convert one Codex Responses request into a non-streaming vLLM request."""
         if not isinstance(body, dict):
             raise ValueError("Responses request must be a JSON object")
-        tools, namespace_aliases, _ = self._tools(self._request_tools(body))
+        tools, namespace_aliases, alias_namespaces = self._tools(self._request_tools(body))
+        tools = self._filter_allowed_tools(body, tools, alias_namespaces, allowed_tools)
         messages: list[dict[str, Any]] = []
         instructions = instructions_override if instructions_override is not None else body.get("instructions")
         if isinstance(instructions, str) and instructions:
@@ -121,7 +124,8 @@ class CodexResponsesProtocol:
             messages.append({"role": "user", "content": input_data})
         elif isinstance(input_data, list):
             if compact_harness_context:
-                input_data = [item for item in input_data if not self._is_harness_context(item)]
+                input_data = [item for item in input_data
+                              if not self._is_harness_context(item, preserve_environment_context)]
             messages.extend(self._input_messages(input_data, namespace_aliases))
         else:
             raise ValueError("Responses input must be text or an item list")
@@ -141,18 +145,52 @@ class CodexResponsesProtocol:
         ):
             if body.get(source) is not None:
                 request[target] = body[source]
-        if tools:
-            request["tools"] = tools
-            request["tool_choice"] = self._tool_choice(
-                body.get("tool_choice", "auto"),
-                namespace_aliases,
-            )
+        self._apply_tool_choice(request, body, tools, namespace_aliases, allowed_tools)
         reasoning = body.get("reasoning")
         if enable_thinking is not None:
             request["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
         elif isinstance(reasoning, dict) and reasoning.get("effort") not in {None, "none"}:
             request["chat_template_kwargs"] = {"enable_thinking": True}
         return request
+
+    def _apply_tool_choice(self, request: dict[str, Any], body: dict[str, Any], tools: list[dict[str, Any]],
+                           namespace_aliases: dict, allowed_tools: list[str] | None) -> None:
+        """Reject forced choices outside the allowlist before adding tool request fields."""
+        if tools or allowed_tools is not None:
+            choice = self._tool_choice(body.get("tool_choice", "auto"), namespace_aliases)
+            if allowed_tools is not None:
+                selected = choice.get("function", {}).get("name") if isinstance(choice, dict) else None
+                if (selected is not None and selected not in {tool["function"]["name"] for tool in tools}
+                        or choice == "required" and not tools):
+                    raise ValueError("Codex tool_choice requires a tool excluded by allowed_tools")
+            if tools:
+                request["tools"] = tools
+                request["tool_choice"] = choice
+
+    def _filter_allowed_tools(self, body: dict[str, Any], tools: list[dict[str, Any]],
+                              alias_namespaces: dict, allowed_tools: list[str] | None) -> list[dict[str, Any]]:
+        """Filter advertised tools by logical namespace names without changing request input."""
+        self.validate_allowed_tools(allowed_tools)
+        if allowed_tools is not None:
+            logical_names = {
+                tool["function"]["name"]: ".".join(alias_namespaces[tool["function"]["name"]])
+                if tool["function"]["name"] in alias_namespaces else tool["function"]["name"]
+                for tool in tools
+            }
+            missing = set(allowed_tools) - set(logical_names.values())
+            if missing and body.get("tool_choice") != "none":
+                raise ValueError(f"Codex allowed_tools are not advertised by this request: {sorted(missing)}")
+            tools = [tool for tool in tools if logical_names[tool["function"]["name"]] in allowed_tools]
+        return tools
+
+    @staticmethod
+    def validate_allowed_tools(value: Any) -> None:
+        """Validate an optional allowlist of function or namespace.function names."""
+        if value is not None and (
+                not isinstance(value, list)
+                or any(not isinstance(name, str) or not name.strip() or name != name.strip() for name in value)
+                or len(set(value)) != len(value)):
+            raise ValueError("Codex allowed_tools must be null or a list of unique non-empty tool names")
 
     def transform_response(
         self,
@@ -410,10 +448,11 @@ class CodexResponsesProtocol:
         return ([{"role": "system", "content": "\n\n".join(system)}] if system else []) + remaining
 
     @staticmethod
-    def _is_harness_context(item: Any) -> bool:
+    def _is_harness_context(item: Any, preserve_environment_context: bool = False) -> bool:
         if not isinstance(item, dict) or item.get("type") != "message":
             return False
-        return _content_text(item.get("content")).lstrip().startswith(_HARNESS_CONTEXT_MARKERS)
+        markers = ("<skills_instructions>",) if preserve_environment_context else _HARNESS_CONTEXT_MARKERS
+        return _content_text(item.get("content")).lstrip().startswith(markers)
 
     @staticmethod
     def _message_items(items: list[Any]) -> Iterable[dict[str, Any]]:

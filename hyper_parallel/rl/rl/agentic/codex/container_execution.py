@@ -19,10 +19,18 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
+import os
+from pathlib import Path
 from urllib.parse import urlparse
 
-from rl.agentic.core.program_runner import request_gateway_json
-from rl.agentic.envs.docker_workspace import DockerWorkspace
+from rl.agentic.core.gateway_transport import request_gateway_json
+from rl.agentic.envs.docker_workspace import (
+    CommandResult, DockerWorkspace, WorkspaceOutputLimitError, WorkspaceTimeoutError,
+)
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 # This stdlib-only endpoint runs inside the candidate. Only the controller knows
@@ -30,12 +38,17 @@ from rl.agentic.envs.docker_workspace import DockerWorkspace
 _ENDPOINT = r'''
 import base64
 import json
-import select
+import queue
+import threading
 import sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 request_limit, response_limit, timeout = int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3])
+session_id, terminal_file = sys.argv[4:6]
 paths = ("/responses", "/v1/responses")
+replies = queue.Queue()
+exchange_lock = threading.Lock()
 
 class Handler(BaseHTTPRequestHandler):
     def setup(self):
@@ -43,7 +56,11 @@ class Handler(BaseHTTPRequestHandler):
         self.connection.settimeout(timeout)
 
     def do_POST(self):
-        if self.path not in paths:
+        with exchange_lock:
+            self.forward_request()
+
+    def forward_request(self):
+        if self.path not in paths or (session_id and self.headers.get("Authorization") != "Bearer " + session_id):
             self.send_error(403)
             return
         try:
@@ -54,7 +71,7 @@ class Handler(BaseHTTPRequestHandler):
             if len(body) != length:
                 raise ValueError("Incomplete request")
             print(json.dumps({"body": base64.b64encode(body).decode()}), flush=True)
-            line = sys.stdin.buffer.readline(response_limit * 2 + 4096)
+            line = replies.get(timeout=timeout)
             reply = json.loads(line)
             payload = base64.b64decode(reply["body"], validate=True)
             if len(payload) > response_limit:
@@ -70,20 +87,32 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             return
         print(json.dumps({"delivered": True}), flush=True)
+        if terminal_file and reply.get("terminal"):
+            Path(terminal_file).touch()
+
+    def do_GET(self):
+        self.send_error(403)
+
+    def do_DELETE(self):
+        self.send_error(403)
 
     def log_message(self, *args):
         pass
 
-server = HTTPServer(("127.0.0.1", 0), Handler)
-server.timeout = 0.1
+server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+thread.start()
 print(json.dumps({"port": server.server_port}), flush=True)
 try:
     while True:
-        if select.select([sys.stdin.buffer], [], [], 0)[0]:
+        line = sys.stdin.buffer.readline(response_limit * 2 + 4096)
+        if not line or json.loads(line).get("close"):
             break
-        server.handle_request()
+        replies.put(line)
 finally:
+    server.shutdown()
     server.server_close()
+
 '''
 
 
@@ -121,11 +150,18 @@ class CandidateRelay:
     def __init__(self, workspace: DockerWorkspace, gateway_url: str, session_id: str,
                  request_timeout: float = 600, max_request_bytes: int = 8 * 1024 * 1024,
                  max_response_bytes: int = 32 * 1024 * 1024, *,
-                 admin_url: str | None = None, admin_token: str | None = None) -> None:
+                 admin_url: str | None = None, admin_token: str | None = None,
+                 unix_socket: Path | None = None, require_token: bool = False,
+                 terminal_header: str | None = None, terminal_file: str = "",
+                 python_executable: str = "/usr/local/python3.12.13/bin/python") -> None:
         """Bind the target outside the candidate, excluding candidate headers and routing."""
         parsed = urlparse(gateway_url)
         if parsed.scheme != "http" or not parsed.hostname or parsed.username or parsed.query or parsed.fragment:
             raise ValueError("Candidate relay requires a fixed local HTTP gateway URL")
+        self.unix_socket = unix_socket
+        self.require_token = require_token
+        self.terminal_header, self.terminal_file = terminal_header, terminal_file
+        self.python_executable = python_executable
         self.workspace = workspace
         self.target = parsed
         self.session_id = session_id
@@ -149,8 +185,9 @@ class CandidateRelay:
             raise RuntimeError("Candidate relay already started")
         creation = asyncio.create_task(asyncio.create_subprocess_exec(
             *self.workspace.docker_command("exec", "-i", self.workspace.name),
-            "/usr/local/python3.12.13/bin/python", "-I", "-u", "-c", _ENDPOINT,
+            self.python_executable, "-I", "-u", "-c", _ENDPOINT,
             str(self.request_limit), str(self.response_limit), str(self.timeout),
+            self.session_id if self.require_token else "", self.terminal_file,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             limit=max(self.request_limit * 2 + 4096, 65536),
         ))
@@ -184,9 +221,24 @@ class CandidateRelay:
                 self._failure = RelayError("Candidate relay diagnostics exceeded their byte limit")
                 return
 
+    async def _open_gateway_connection(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """Connect to the bound Gateway over TCP or a bounded Unix socket path."""
+        if self.unix_socket is None:
+            reader, writer = await asyncio.open_connection(self.target.hostname, self.target.port or 80)
+        else:
+            # Artifact paths can exceed sockaddr_un's limit; a directory FD keeps the address short.
+            directory = os.open(self.unix_socket.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                reader, writer = await asyncio.open_unix_connection(
+                    f"/proc/self/fd/{directory}/{self.unix_socket.name}"
+                )
+            finally:
+                os.close(directory)
+        return reader, writer
+
     async def _exchange(self, body: bytes) -> dict:
         """Exchange one bounded HTTP response under an overall caller deadline."""
-        reader, writer = await asyncio.open_connection(self.target.hostname, self.target.port or 80)
+        reader, writer = await self._open_gateway_connection()
         try:
             path = self.target.path.rstrip("/") + "/responses"
             header = (f"POST {path} HTTP/1.0\r\nHost: {self.target.netloc}\r\n"
@@ -198,6 +250,7 @@ class CandidateRelay:
             status = int(status_line.split()[1])
             header_bytes = len(status_line)
             content_type, content_length = "application/json", None
+            terminal = False
             while True:
                 line = await reader.readline()
                 header_bytes += len(line)
@@ -206,7 +259,9 @@ class CandidateRelay:
                 if line == b"\r\n":
                     break
                 key, value = line.decode("ascii").split(":", 1)
-                if key.lower() == "content-type":
+                if self.terminal_header and key.lower() == self.terminal_header.lower():
+                    terminal = True
+                elif key.lower() == "content-type":
                     content_type = value.strip()
                 elif key.lower() == "content-length":
                     content_length = int(value)
@@ -225,7 +280,7 @@ class CandidateRelay:
             if content_length is not None and len(payload) != content_length:
                 raise RelayError("Incomplete gateway response")
             return {"status": status, "content_type": content_type,
-                    "body": base64.b64encode(payload).decode("ascii")}
+                    "body": base64.b64encode(payload).decode("ascii"), "terminal": terminal}
         finally:
             writer.close()
             await asyncio.wait_for(writer.wait_closed(), 2)
@@ -263,12 +318,28 @@ class CandidateRelay:
         except Exception as error:  # pylint: disable=broad-exception-caught
             self._failure = RelayError(f"Candidate model transport failed ({type(error).__name__}): {str(error)[:300]}")
             self._idle.set()
+            _LOGGER.error("%s", self._failure)
 
-    async def close(self) -> None:
+    def raise_if_failed(self) -> None:
+        """Fail the owning execution promptly when its model channel has broken."""
+        if self._failure is not None:
+            raise self._failure
+
+    async def close(self, *, abort: bool = False) -> None:
         """Drain delivery, stop the relay and invalidate incomplete Gateway evidence."""
         process = self._process
         if process is None or self._closed:
             return
+        if abort:
+            self._closing = True
+            self._failure = self._failure or RelayError("Candidate execution aborted")
+            self._idle.set()
+            if self._pump_task is not None:
+                self._pump_task.cancel()
+                await asyncio.gather(self._pump_task, return_exceptions=True)
+            if process.returncode is None:
+                process.kill()
+                await asyncio.wait_for(process.wait(), 3)
         try:
             await asyncio.wait_for(self._idle.wait(), self.timeout)
         except asyncio.TimeoutError:
@@ -292,9 +363,68 @@ class CandidateRelay:
             await asyncio.gather(*tasks, return_exceptions=True)
             self._closed = True
         if self._failure is not None:
-            await asyncio.to_thread(
-                request_gateway_json, "Codex", "POST",
-                f"{self.admin_url}/internal/sessions/{self.session_id}/failure",
-                {"reason": "Candidate model transport failed"}, min(self.timeout, 10), self.admin_token,
-            )
+            if self.unix_socket is None:
+                await asyncio.to_thread(
+                    request_gateway_json, "Codex", "POST",
+                    f"{self.admin_url}/internal/sessions/{self.session_id}/failure",
+                    {"reason": "Candidate model transport failed"}, min(self.timeout, 10), self.admin_token,
+                )
             raise self._failure
+
+
+_SUPERVISOR = r'''
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+terminal_file = sys.argv[1]
+with subprocess.Popen(sys.argv[2:], start_new_session=True) as process:
+    while process.poll() is None:
+        if terminal_file and Path(terminal_file).exists():
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            raise SystemExit(75)
+        time.sleep(0.05)
+    if process.returncode < 0:
+        number = -process.returncode
+        sys.stderr.write(f"Codex terminated by {signal.Signals(number).name} (signal={number}, returncode={process.returncode})\n")
+        raise SystemExit(128 + number)
+    raise SystemExit(process.returncode)
+'''
+
+
+async def run_container_codex(
+    workspace: DockerWorkspace, command: list[str], artifact_dir: Path, *,
+    environment: dict[str, str], timeout: float, output_limit_bytes: int = 4 * 1024 * 1024,
+    cwd: str = "/workspace", controller_stop: asyncio.Event | None = None,
+    terminal_file: str = "", python_executable: str = "/usr/local/python3.12.13/bin/python",
+) -> CommandResult:
+    """Run the original CLI and save raw evidence; task owners interpret completion and reward."""
+    environment = dict(environment)
+    environment.setdefault("SHELL", "/bin/bash")
+    try:
+        result = await workspace.exec(
+            [python_executable, "-I", "-u", "-c", _SUPERVISOR, terminal_file, *command],
+            env=environment, cwd=cwd, timeout=timeout, output_limit_bytes=output_limit_bytes,
+            controller_stop=controller_stop,
+        )
+    except (WorkspaceTimeoutError, WorkspaceOutputLimitError) as error:
+        _save_output(artifact_dir, error.result)
+        raise
+    _save_output(artifact_dir, result)
+    return result
+
+
+def _save_output(artifact_dir: Path, result: CommandResult) -> None:
+    (artifact_dir / "codex-events.jsonl").write_text(result.stdout, encoding="utf-8")
+    (artifact_dir / "codex-stderr.log").write_text(result.stderr, encoding="utf-8")

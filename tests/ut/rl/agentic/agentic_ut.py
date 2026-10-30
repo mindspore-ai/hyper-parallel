@@ -117,7 +117,10 @@ def test_public_exports_and_value_contracts() -> None:
         importlib.import_module("rl.agentic.tools.protocol").InteractionProtocol
         is modules.executor.InteractionProtocol
     )
-    assert importlib.import_module("rl.agentic.codex.trajectory").build_codex_trajectory
+    assert (
+        importlib.import_module("rl.agentic.codex").build_codex_trajectory
+        is modules.codex_harness.build_codex_trajectory
+    )
     assert importlib.import_module("rl.agentic.ds_harness.trajectory").build_deepseek_trajectory
     with pytest.raises(AttributeError):
         getattr(modules.agentic, "missing_export")
@@ -535,28 +538,29 @@ def test_harness_http_helpers_and_runtime(
     modules = _modules()
     harness = getattr(modules, harness_name)
     shared = importlib.import_module("rl.agentic.core.program_runner")
+    transport = importlib.import_module("rl.agentic.core.gateway_transport")
     monkeypatch.setattr(
-        shared.urllib.request,
+        transport.urllib.request,
         "urlopen",
         lambda *_args, **_kwargs: _HTTPResponse(b'{"ok":true}'),
     )
     assert harness._http_json("GET", "http://local", None, 1)["ok"]
     monkeypatch.setattr(
-        shared.urllib.request,
+        transport.urllib.request,
         "urlopen",
         lambda *_args, **_kwargs: _HTTPResponse(b"[]"),
     )
     with pytest.raises(RuntimeError, match="non-object"):
         harness._http_json("GET", "http://local", None, 1)
     monkeypatch.setattr(
-        shared.urllib.request,
+        transport.urllib.request,
         "urlopen",
         lambda *_args, **_kwargs: _HTTPResponse(b"bad"),
     )
     with pytest.raises(RuntimeError, match="invalid JSON"):
         harness._http_json("GET", "http://local", None, 1)
     monkeypatch.setattr(
-        shared.urllib.request,
+        transport.urllib.request,
         "urlopen",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(URLError("down")),
     )
@@ -645,8 +649,14 @@ def test_gateway_session_state_lifecycle(
     assert record["ordinal"] == 0
     event_lines = (tmp_path / "gateway-events.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(event_lines) == 2
-    with pytest.raises(ValueError, match="already exists"):
+    if label == "Codex":
         state.register("session", payload)
+        assert len(state.get("session").completions) == 1
+        with pytest.raises(ValueError, match="registration conflicts"):
+            state.register("session", {**payload, "policy_version": 4})
+    else:
+        with pytest.raises(ValueError, match="already exists"):
+            state.register("session", payload)
     state.remove("session")
     with pytest.raises(ValueError, match=f"Unknown {label} session"):
         state.get("session")
@@ -763,7 +773,7 @@ def test_gateway_http_routes_and_lifecycle(gateway_module: str) -> None:
         assert request("POST", proxy_path, {"messages": []} if is_deepseek else {"input": "q"})[0] == 502
         assert request("GET", "/internal/sessions/session")[1]["policy_version"] == 2
         assert request("DELETE", "/unknown")[0] == 404
-        assert request("DELETE", "/internal/sessions/missing")[0] == 404
+        assert request("DELETE", "/internal/sessions/missing")[0] == (404 if is_deepseek else 200)
         assert request("DELETE", "/internal/sessions/session")[0] == 200
     finally:
         server.close()

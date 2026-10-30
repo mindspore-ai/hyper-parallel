@@ -19,6 +19,7 @@
 
 import asyncio
 import json
+import os
 import sys
 from types import SimpleNamespace
 from typing import Any
@@ -458,6 +459,9 @@ def test_shared_server_builds_command_and_isolated_environment(
         "enable_prompt_tokens_details": True,
         "skip_mm_profiling": True,
         "profiler_config": {"profiler": "none"},
+        "seed": 42,
+        "disable_log_stats": True,
+        "task_queue_enable": 2,
         "batch_invariant": True,
         "server_hccl_if_base_port": 65000,
         "server_hccl_npu_socket_port_range": "65000-65010",
@@ -476,11 +480,16 @@ def test_shared_server_builds_command_and_isolated_environment(
     )
     engine = vllm_module.build_vllm_engine({"vllm": vllm_config}, _model())
     monkeypatch.setenv("RANK", "9")
+    monkeypatch.setenv("TASK_QUEUE_ENABLE", "1")
     command = engine._server_command("127.0.0.1", 8100)
     environment = engine._server_environment("0,1,2,3")
+    assert environment["TASK_QUEUE_ENABLE"] == "2"
+    assert os.environ["TASK_QUEUE_ENABLE"] == "1"
 
     assert engine._weight_sync._weight_transfer is transfer
     assert command[command.index("--data-parallel-size") + 1] == "2"
+    assert command[command.index("--seed") + 1] == "42"
+    assert "--disable-log-stats" in command
     assert command[command.index("--tensor-parallel-size") + 1] == "2"
     assert "--no-enable-prefix-caching" in command
     assert "--enable-chunked-prefill" in command

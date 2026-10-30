@@ -143,7 +143,7 @@ def test_r3_supports_internal_and_codex_multiturn(
     moe_config["agentic"].update(max_turns=3, interaction_mode="multi_turn")
     validate_config(resolve_vllm_automatic_limits(moe_config), build_algorithm(moe_config["algorithm"]))
 
-    recipe = Path(rl.__file__).resolve().parent.parent / "examples/gsm8k/configs/codex_multi_turn.yaml"
+    recipe = Path(rl.__file__).resolve().parent.parent / "examples/gsm8k/configs/qwen3_30b_a3b_codex_multi_turn.yaml"
     moe_config["agentic"] = yaml.safe_load(recipe.read_text(encoding="utf-8"))["agentic"]
     moe_config["rollout"]["vllm"].update(enable_auto_tool_choice=True, tool_call_parser="hermes")
     resolved = resolve_vllm_automatic_limits(resolve_router_replay_config(moe_config))

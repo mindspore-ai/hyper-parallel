@@ -36,9 +36,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 if __package__:
-    from .container_execution import IMAGE, docker, execute_episode
+    from .container_runtime import CANDIDATE_IMAGE, IMAGE, docker, execute_episode
 else:
-    from container_execution import IMAGE, docker, execute_episode
+    from container_runtime import CANDIDATE_IMAGE, IMAGE, docker, execute_episode
 
 
 TRAINER_HCCL_ENV = {"HCCL_IF_BASE_PORT": "62800", "HCCL_NPU_SOCKET_PORT_RANGE": "62800-62900"}
@@ -47,7 +47,7 @@ TRAINER_HCCL_ENV = {"HCCL_IF_BASE_PORT": "62800", "HCCL_NPU_SOCKET_PORT_RANGE": 
 def training_command(steps: int, resume: bool = False, overrides: list[str] | None = None,
                      fully_async: bool = False, rollout_devices: str = "2,3") -> list[str]:
     """Use the real trainer and search task program, not the frozen comparison worker."""
-    processes = len(rollout_devices.split(",")) if fully_async else 2
+    processes = len(rollout_devices.split(",")) if fully_async else 8
     command = [
         "python", "-m", "torch.distributed.run", "--nnodes=1", "--node_rank=0",
         "--master_addr=127.0.0.1", "--master_port=29500", f"--nproc_per_node={processes}", "train_rl.py",
@@ -197,9 +197,15 @@ def _parse_training_args():
     parser.add_argument("--steps", type=int, default=2)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--image", default=IMAGE)
+    parser.add_argument("--candidate-image", default=CANDIDATE_IMAGE,
+                        help="Prebuilt Codex-only image used by isolated candidates")
     parser.add_argument("--data", type=Path, required=True, help="Prepared HotpotQA dataset directory")
-    parser.add_argument("--model", type=Path, default=Path("/home/mwl/ckpt/qwen3-4b"))
+    parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--backend-privileged", action="store_true")
+    parser.add_argument("--agent-workers", type=int, default=128,
+                        help="Maximum simultaneous isolated candidate containers (each capped at 2 CPUs/2 GiB)")
+    parser.add_argument("--strict-acceptance", action="store_true",
+                        help="Also require strict probability checks, final evaluation and checkpoint reload")
     parser.add_argument("--resume", type=Path, help="Completed distributed checkpoint directory")
     args, overrides = parser.parse_known_args()
     for override in overrides:
@@ -207,12 +213,12 @@ def _parse_training_args():
             parser.error(f"Invalid training override {override!r}; expected --section.field=value")
     args.overrides = overrides
     devices = args.devices.split(",")
-    expected = (4, 8) if args.fully_async else (2,)
+    expected = (4, 8) if args.fully_async else (8,)
     if len(devices) not in expected or len(set(devices)) != len(devices) or any(
             value not in map(str, range(8)) for value in devices):
         raise ValueError(f"Expected {expected} distinct Ascend device IDs")
-    if args.steps < 1:
-        raise ValueError("Steps must be positive")
+    if args.steps < 1 or args.agent_workers < 1:
+        raise ValueError("Steps and agent-workers must be positive")
     if args.resume and not (args.resume / "checkpoint_complete.json").is_file():
         raise ValueError("Resume requires a completed checkpoint")
     for path in (args.data / "train.parquet", args.data / "test.parquet", args.model / "config.json"):
@@ -225,7 +231,7 @@ def _parse_training_args():
 def _start_trainer(args, output: Path, devices: list[str]) -> tuple[str, str]:
     """Build and start the isolated trainer container."""
     repo = Path(__file__).resolve().parents[4]
-    split = len(devices) // 2 if args.fully_async else 2
+    split = len(devices) // 2 if args.fully_async else len(devices)
     prefix = "search-r1-train-" + uuid.uuid4().hex[:10]
     worker = prefix + "-worker"
     launch = ["run", "-d", "--name", worker, "--hostname", worker, "--add-host", f"{worker}:127.0.0.1",
@@ -238,7 +244,7 @@ def _start_trainer(args, output: Path, devices: list[str]) -> tuple[str, str]:
         launch.extend(("-v", f"{args.resume.resolve()}:/resume:ro"))
     for device in ("davinci_manager", "devmm_svm", "hisi_hdc"):
         launch.extend(("--device", "/dev/" + device))
-    for path in ("/usr/local/Ascend/driver/lib64", "/usr/local/dcmi", "/usr/local/bin/npu-smi",
+    for path in ("/usr/local/Ascend/driver", "/usr/local/dcmi", "/usr/local/bin/npu-smi",
                  "/usr/local/Ascend/driver/version.info", "/etc/ascend_install.info"):
         launch.extend(("-v", f"{path}:{path}:ro"))
     for source, target, mode in ((repo, "/repo", "rw"), (args.data.resolve(), "/data", "ro"),
@@ -246,14 +252,17 @@ def _start_trainer(args, output: Path, devices: list[str]) -> tuple[str, str]:
         launch.extend(("-v", f"{source}:{target}:{mode}"))
     environment = {
         **TRAINER_HCCL_ENV,
-        "ASCEND_RT_VISIBLE_DEVICES": ",".join(devices[:split]), "HYPER_PARALLEL_PLATFORM": "torch",
+        "ASCEND_RT_VISIBLE_DEVICES": ",".join(devices[:split]), "TASK_QUEUE_ENABLE": "2",
+        "HYPER_RL_FAILURE_DIR": "/results", "TOKENIZERS_PARALLELISM": "false", "OMP_NUM_THREADS": "4",
+        "VLLM_ASCEND_ENABLE_NZ": "0", "VLLM_SERVER_DEV_MODE": "1", "VLLM_BATCH_INVARIANT": "0",
         "VLLM_WORKER_MULTIPROC_METHOD": "spawn", "VLLM_HOST_IP": "127.0.0.1", "GLOO_SOCKET_IFNAME": "lo",
         "HYPER_SEARCH_CONTAINER_BROKER": "1", "PHASE_UID": str(os.getuid()), "PHASE_GID": str(os.getgid()),
     }
     for name, value in environment.items():
         launch.extend(("-e", f"{name}={value}"))
     command = (
-        "set -euo pipefail; export PYTHONPATH=/repo/hyper_parallel/rl:/repo:${PYTHONPATH:-}; "
+        "set -eo pipefail; source /usr/local/Ascend/ascend-toolkit/set_env.sh; set -u; "
+        "export PYTHONPATH=/repo/hyper_parallel/rl:/repo:${PYTHONPATH:-}; "
         "python -c 'import socket; print(socket.gethostbyname(socket.gethostname()))'; "
         "git config --global --add safe.directory /repo; "
         "python -m pip install --no-deps --no-build-isolation -e /repo; "
@@ -267,27 +276,69 @@ def _start_trainer(args, output: Path, devices: list[str]) -> tuple[str, str]:
     return worker, prefix
 
 
+def validate_candidate_image(image: str) -> dict:
+    """Resolve and verify the immutable CLI image once before any training starts."""
+    identity = json.loads(docker(["image", "inspect", image], capture_output=True).stdout)[0]
+    image_id = identity["Id"]
+    check = (
+        "import json, shutil, subprocess; "
+        "version=subprocess.check_output(['codex','--version'],text=True).strip(); "
+        "tools={x:shutil.which(x) for x in ('codex','bash','rg','sed','cat','git','python3')}; "
+        "print(json.dumps({'version':version,'tools':tools})); "
+        "assert version=='codex-cli 0.152.1' and all(tools.values())"
+    )
+    result = docker(["run", "--rm", "--runtime", "runc", "--network", "none", "--read-only", "--cap-drop", "ALL",
+                     "--security-opt", "no-new-privileges", "--user", "65534:65534",
+                     "--tmpfs", "/tmp:rw,nosuid,nodev,size=32m,mode=1777",
+                     "-e", "PATH=/opt/codex/bin:/opt/codex/codex-path:/usr/local/bin:/usr/bin:/bin",
+                     "--entrypoint", "python3", image_id, "-I", "-c", check], capture_output=True)
+    return {"image_id": image_id, "size_bytes": identity["Size"], **json.loads(result.stdout)}
+
+
+def _verify_training_completion(args: argparse.Namespace, output: Path) -> None:
+    """Validate completed steps, checkpoint markers and isolated episode artifacts."""
+    verify_training((output / "train.log").read_text(), args.steps,
+                    strict=args.strict_acceptance, fully_async=args.fully_async)
+    checkpoint = output / "checkpoints" / f"step_{args.steps}" / "checkpoint_complete.json"
+    if args.strict_acceptance and (
+            not checkpoint.is_file() or json.loads(checkpoint.read_text()).get("step") != args.steps):
+        raise RuntimeError("Final checkpoint completion marker is missing or stale")
+    if args.fully_async and not (checkpoint.parent / "async_complete.json").is_file():
+        raise RuntimeError("Final asynchronous checkpoint completion marker is missing")
+    audit = verify_artifacts(output)
+    (output / "training-acceptance.json").write_text(json.dumps({
+        "steps": args.steps, "optimizer_gate": "passed", "strict_acceptance": args.strict_acceptance, **audit,
+    }))
+
+
 def main() -> None:
-    """Launch a two-device trainer and service concurrent episode requests on the host."""
+    """Launch an eight-device trainer and bounded, isolated episode containers."""
     args, devices, manifest = _parse_training_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     (output / "data-source.json").write_text(json.dumps({
         "directory": str(args.data.resolve()), "max_train_samples": None,
-        "manifest": manifest,
+        "manifest": manifest, "agent_workers": args.agent_workers,
     }, indent=2))
     (output / "private-canary.txt").write_text("Agent containers must not read this file.\n")
+    candidate = validate_candidate_image(args.candidate_image)
+    (output / "candidate-runtime.json").write_text(json.dumps(candidate, indent=2))
     worker, prefix = _start_trainer(args, output, devices)
+    identity = docker(["inspect", "--format", "{{.Id}}", worker], capture_output=True).stdout.strip()
+    (output / "container.json").write_text(json.dumps({"name": worker, "id": identity, "started": time.time()}))
     futures = {}
     stop = threading.Event()
-    executor = ThreadPoolExecutor(max_workers=8)
+    executor = ThreadPoolExecutor(max_workers=args.agent_workers)
     previous_termination = signal.signal(signal.SIGTERM, _interrupt_host)
     try:
         deadline = time.monotonic() + max(3600, args.steps * 1200)
         while True:
+            failures = sorted(output.glob("failure-rank-*.json"))
+            if failures:
+                raise RuntimeError(f"Training failure recorded in {failures[0].name}")
             for request in output.glob("jobs/*/execution-request.json"):
                 if request not in futures:
-                    futures[request] = executor.submit(execute_episode, request, output, args.image,
+                    futures[request] = executor.submit(execute_episode, request, output, candidate["image_id"],
                                                        prefix + "-" + request.parent.name[:12], stop)
             for future in futures.values():
                 if future.done():
@@ -300,16 +351,7 @@ def main() -> None:
             if time.monotonic() > deadline:
                 raise TimeoutError("Search-R1 training exceeded its overall deadline")
             time.sleep(1)
-        verify_training((output / "train.log").read_text(), args.steps, strict=True, fully_async=args.fully_async)
-        checkpoint = output / "checkpoints" / f"step_{args.steps}" / "checkpoint_complete.json"
-        if not checkpoint.is_file() or json.loads(checkpoint.read_text()).get("step") != args.steps:
-            raise RuntimeError("Final checkpoint completion marker is missing or stale")
-        if args.fully_async and not (checkpoint.parent / "async_complete.json").is_file():
-            raise RuntimeError("Final asynchronous checkpoint completion marker is missing")
-        audit = verify_artifacts(output)
-        (output / "training-acceptance.json").write_text(json.dumps({
-            "steps": args.steps, "optimizer_gate": "passed", **audit,
-        }))
+        _verify_training_completion(args, output)
     finally:
         stop.set()
         for future in futures.values():
@@ -319,8 +361,11 @@ def main() -> None:
         subprocess.run(["docker", "rm", "-f", worker], capture_output=True, check=False)
         executor.shutdown(wait=True, cancel_futures=True)
         for request in futures:
-            name = prefix + "-" + request.parent.name[:12] + "-agent"
-            subprocess.run(["docker", "rm", "-f", name], capture_output=True, check=False)
+            identity = request.parent / "candidate-container.json"
+            if identity.exists():
+                name = json.loads(identity.read_text())["name"]
+                if name.startswith(prefix + "-"):
+                    subprocess.run(["docker", "rm", "-f", name], capture_output=True, check=False)
         signal.signal(signal.SIGTERM, previous_termination)
 
 

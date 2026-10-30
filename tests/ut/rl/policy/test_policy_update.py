@@ -461,3 +461,20 @@ def test_context_trimming_preserves_legacy_and_consistency_inputs(monkeypatch, m
     actor = Actor(model, build_algorithm({"name": "grpo", "loss_aggregation": "token-mean"}), micro_batch_size=1)
     actor.compute_log_probs(experience)
     assert model.lengths == [8, 8, 8, 8], f"Legacy input lengths changed: actual={model.lengths}, expected={[8] * 4}"
+
+
+@pytest.mark.parametrize("force_sync", [False, True])
+def test_resident_actor_can_select_existing_gradient_sync_policy(monkeypatch, force_sync):
+    """Explicit per-microbatch synchronization keeps offload ablations independent."""
+    sync, last = [], []
+    model = torch.nn.Linear(2, 2)
+    model.hsdp_scheduler = SimpleNamespace(offload_policy=object())
+    model.set_requires_gradient_sync = sync.append
+    model.set_is_last_backward = last.append
+    monkeypatch.setattr(actor_module, "HSDPModule", torch.nn.Linear)
+    actor = Actor(model, build_algorithm({"name": "grpo", "loss_aggregation": "token-mean"}),
+                  micro_batch_size=1, gradient_sync_each_micro_batch=force_sync)
+    actor._set_gradient_sync(False)
+    actor._set_gradient_sync(True)
+    assert sync == [force_sync, True]
+    assert last == [False, True]

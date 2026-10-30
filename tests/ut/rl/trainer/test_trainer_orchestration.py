@@ -20,10 +20,12 @@ from __future__ import annotations
 # pylint: disable=forbidden-backend-import,missing-public-docstring,protected-access,unnecessary-lambda
 
 import gc
+import unittest
 import weakref
+from dataclasses import replace
 from types import MethodType, SimpleNamespace
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -41,6 +43,7 @@ from rl.roles import Actor
 from rl.trainer import SyncTrainer
 from rl.utils.monitoring.metrics import ActorUpdateMetrics
 
+from hyper_parallel.distributed.mesh import DistributedSetup
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.fully_shard.api import HSDPModule
 from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
@@ -169,7 +172,8 @@ def test_trainer_builds_independent_trainable_and_reference_roles(
     monkeypatch.setattr(
         trainer_module,
         "build_role_model",
-        lambda unused_runtime, unused_setup, *, frozen, cpu_threads=None: reference_model if frozen else actor_model,
+        lambda unused_runtime, unused_setup, *, frozen, cpu_threads=None, **_options:
+        reference_model if frozen else actor_model,
     )
     monkeypatch.setattr(
         trainer_module,
@@ -213,6 +217,7 @@ def test_trainer_step_orchestrates_required_role_outputs_in_order(
     trainer._dp_group_info = SimpleNamespace(group=None, rank_size=1)
     trainer._release_training_state_for_rollout = lambda: calls.append("release")
     trainer._reshard_model = lambda _model: calls.append("reshard")
+    trainer._move_training_state = lambda *, offload: calls.append("offload" if offload else "restore")
     trainer.model_registration = SimpleNamespace(name="qwen")
     rollout = _rollout()
     actor_log_probs = rollout.old_log_probs.clone()
@@ -317,6 +322,7 @@ def test_trainer_step_orchestrates_required_role_outputs_in_order(
     assert calls == [
         "rollout",
         "prepare-training",
+        "restore",
         "forward-contract",
         "actor-logprobs",
         "exact-gate",
@@ -332,6 +338,8 @@ def test_trainer_step_orchestrates_required_role_outputs_in_order(
         "reshard",
         "release",
         "update-weights",
+        "release",
+        "offload",
         "prepare-rollout",
         "complete",
     ]
@@ -355,9 +363,27 @@ def test_trainer_publication_releases_training_state_before_rollout_wake(
     )
     monkeypatch.setattr(trainer_module, "hsdp_sync_stream", lambda: calls.append("stream"))
 
+    trainer._move_training_state = lambda *, offload: calls.append("offload" if offload else "restore")
     trainer._publish_policy(2)
 
-    assert calls == ["stream", "reshard", "release", "update", "wake"]
+    assert calls == ["stream", "reshard", "release", "update", "release", "offload", "wake"]
+
+
+def test_post_publication_release_failure_does_not_wake_rollout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed cache release must not expose the pending policy or allocate rollout KV memory."""
+    trainer = object.__new__(SyncTrainer)
+    trainer.actor = SimpleNamespace(actor_model=object())
+    trainer.model_registration = SimpleNamespace(name="qwen")
+    trainer._reshard_model = Mock()
+    trainer._release_training_state_for_rollout = Mock(side_effect=[None, RuntimeError("cache release failed")])
+    trainer.rollout_engine = SimpleNamespace(update_weights=Mock(), prepare_for_rollout=Mock())
+    monkeypatch.setattr(trainer_module, "hsdp_sync_stream", lambda: None)
+
+    with pytest.raises(RuntimeError, match="cache release failed"):
+        trainer._publish_policy(2)
+
+    trainer.rollout_engine.update_weights.assert_called_once()
+    trainer.rollout_engine.prepare_for_rollout.assert_not_called()
 
 
 def test_trainer_completes_metrics_and_evaluation_after_published_step(
@@ -418,14 +444,17 @@ def test_trainer_completes_metrics_and_evaluation_after_published_step(
     assert calls == ["summarize", "metrics", "gate", "evaluate:1", "log:1"]
 
 
+@pytest.mark.parametrize("omit_sampling_probabilities", [False, True])
 def test_trainer_runs_one_complete_synchronous_training_step(
     monkeypatch: pytest.MonkeyPatch,
+    omit_sampling_probabilities: bool,
 ) -> None:
     """Production train and step methods complete one strongly synchronous publication."""
     calls: list[str] = []
     trainer = object.__new__(SyncTrainer)
     trainer.distillation_config = DistillationConfig()
     trainer._consistency_profile = "off"
+    trainer._old_log_prob_source = "actor" if omit_sampling_probabilities else "rollout"
     trainer.algorithm = build_algorithm({"name": "grpo", "loss_aggregation": "token-mean"})
     trainer.state = SimpleNamespace(global_step=0, max_steps=1, epoch=0)
     trainer.resolved_config = {
@@ -451,6 +480,9 @@ def test_trainer_runs_one_complete_synchronous_training_step(
     }
     trainer.train_dataloader = [batch]
     rollout = _rollout()
+    recomputed_log_probs = rollout.old_log_probs.clone()
+    if omit_sampling_probabilities:
+        rollout = replace(rollout, old_log_probs=None, rollout_log_probs=None)
     trainer.rollout_manager = SimpleNamespace(
         generate=lambda **_kwargs: calls.append("rollout") or rollout
     )
@@ -489,12 +521,18 @@ def test_trainer_runs_one_complete_synchronous_training_step(
         def compute_log_probs(experience: ExperienceBatch) -> torch.Tensor:
             """Return scripted policy probabilities."""
             calls.append("actor-logprobs")
-            return experience.old_log_probs.clone()
+            assert experience.sequences is rollout.sequences
+            return recomputed_log_probs.clone()
 
         @staticmethod
         def update(experience: ExperienceBatch) -> ActorUpdateMetrics:
-            """Record one policy or value update."""
-            assert experience is rollout
+            """Record the optimizer update without executing distributed training."""
+            if omit_sampling_probabilities:
+                assert experience.rollout_log_probs is None
+                assert rollout.old_log_probs is None
+                torch.testing.assert_close(experience.old_log_probs, recomputed_log_probs)
+            else:
+                assert experience is rollout
             calls.append("actor-update")
             return ActorUpdateMetrics(0.1, 0.1, 0.0, 0.0, 0.0, 0.0, 1.0, 0.01, 1, 1)
 
@@ -503,7 +541,7 @@ def test_trainer_runs_one_complete_synchronous_training_step(
         def compute_log_probs(experience: ExperienceBatch) -> torch.Tensor:
             """Return scripted policy probabilities."""
             calls.append("reference")
-            return torch.zeros_like(experience.old_log_probs)
+            return torch.zeros_like(experience.sequences[:, 1:], dtype=torch.float32)
 
     class Preparer:
         @staticmethod
@@ -1126,8 +1164,12 @@ def test_initial_rollout_release_retains_cpu_offload_validation(
         SyncTrainer._reshard_model(model)
 
 
+@pytest.mark.parametrize("reference_offload", [None, False, True])
+@pytest.mark.parametrize("token_budget", [None, 3000])
 def test_trainer_builds_required_models_optimizers_and_role_runtime(
     monkeypatch: pytest.MonkeyPatch,
+    reference_offload: bool | None,
+    token_budget: int | None,
 ) -> None:
     """GRPO construction creates independent trainable/reference models and Actor roles."""
     trainer = object.__new__(SyncTrainer)
@@ -1141,21 +1183,34 @@ def test_trainer_builds_required_models_optimizers_and_role_runtime(
             "micro_batch_size": 1,
             "response_mini_batch_size": 2,
             "policy_update_epochs": 3,
+            "max_tokens_per_micro_batch": token_budget,
+            "old_log_prob_max_tokens_per_micro_batch": 4096,
+            "reference_log_prob_max_tokens_per_micro_batch": 8192,
         }
     }
     trainer.device = torch.device("cpu")
     trainer._dp_group_info = "dp-group"
     trainer.parallel_dims = SimpleNamespace(dp_size=2)
-    trainer.runtime_config = object()
-    trainer.distributed_setup = object()
+    trainer.runtime_config = SimpleNamespace(fsdp_config=SimpleNamespace(enable_offload=False))
+    trainer.distributed_setup = DistributedSetup(strategy_config=trainer.runtime_config.fsdp_config)
+    reference_runtime = SimpleNamespace(fsdp_config=SimpleNamespace(enable_offload=reference_offload))
+    if reference_offload is not None:
+        trainer.resolved_config["train"]["accelerator"] = {"reference_cpu_offload": reference_offload}
+    runtime_builder = Mock(return_value=reference_runtime)
+    monkeypatch.setattr(trainer_module, "build_runtime_config", runtime_builder)
+    setups = []
     trainable_model = torch.nn.Linear(2, 2)
     reference_model = torch.nn.Linear(2, 2)
     models = iter((trainable_model, reference_model))
     frozen_flags = []
 
-    def build_model(unused_runtime: Any, unused_setup: Any, *, frozen: bool, cpu_threads: Any = None) -> Any:
-        """Construct the configured model fixture."""
-        del unused_runtime, unused_setup, cpu_threads
+    def build_model(unused_runtime: Any, unused_setup: Any, *, frozen: bool, cpu_threads: Any = None,
+                    **options: Any) -> Any:
+        """Record model construction requests and return the test model."""
+        del unused_runtime, cpu_threads
+        if options:
+            assert options == {"token_log_probs_mode": "auto", "token_log_probs_chunk_size": 512}
+        setups.append(unused_setup)
         frozen_flags.append(frozen)
         return next(models)
 
@@ -1183,6 +1238,16 @@ def test_trainer_builds_required_models_optimizers_and_role_runtime(
     trainer._build_models_and_optimizers()
 
     assert frozen_flags == [False, True]
+    assert setups[0] is trainer.distributed_setup
+    assert trainer.distributed_setup.strategy_config.enable_offload is False
+    assert setups[1].mesh_context is trainer.distributed_setup.mesh_context
+    if reference_offload is not None:
+        runtime_builder.assert_called_once_with(trainer.resolved_config, reference=True)
+        assert setups[1].strategy_config is reference_runtime.fsdp_config
+        assert setups[1] is not setups[0]
+    else:
+        runtime_builder.assert_not_called()
+        assert setups[1] is setups[0]
     assert actor_calls[0] == {
         "actor_model": trainable_model,
         "optimizer": optimizer,
@@ -1193,12 +1258,19 @@ def test_trainer_builds_required_models_optimizers_and_role_runtime(
         "response_mini_batch_size": 2,
         "update_epochs": 3,
         "max_grad_norm": 2.0,
+        "gradient_sync_each_micro_batch": False,
+        "max_tokens_per_micro_batch": token_budget,
+        "balance_dp_tokens": False,
+        "log_prob_max_tokens_per_micro_batch": 4096,
         "distillation": None,
         "algorithm": trainer.algorithm,
         "micro_batch_size": 1,
     }
     assert actor_calls[1] == {
         "actor_model": reference_model,
+        "dp_group_info": "dp-group",
+        "dp_size": 2,
+        "log_prob_max_tokens_per_micro_batch": 8192,
         "algorithm": trainer.algorithm,
         "micro_batch_size": 1,
     }
@@ -1302,6 +1374,7 @@ def test_trainer_complete_step_coordinates_colocated_checkpoint_residency(
         prepare_for_rollout=lambda: calls.append("rollout"),
     )
     trainer._release_training_state_for_rollout = lambda: calls.append("release")
+    trainer._move_training_state = lambda *, offload: calls.append("offload" if offload else "restore")
     monkeypatch.setattr(trainer_module, "uses_colocated_vllm", lambda _config: True)
     monkeypatch.setattr(trainer_module, "summarize_rollout", lambda *_args, **_kwargs: ({}, []))
     monkeypatch.setattr(trainer_module, "build_training_metrics", lambda **_kwargs: {})
@@ -1323,9 +1396,11 @@ def test_trainer_complete_step_coordinates_colocated_checkpoint_residency(
         "evaluate:1",
         "log",
         "training",
+        "restore",
         "release",
         "checkpoint",
         "release",
+        "offload",
         "rollout",
     ]
 
@@ -1429,3 +1504,161 @@ def _configure_rollout_test(trainer, runner):
             "progress_steps": 1,
         },
     }
+
+
+def test_balance_prepares_groups_before_anchor_forward_without_rebuilding_targets() -> None:
+    """Complete-group targets are calculated once and carried through redistribution to both anchors."""
+    trainer = object.__new__(SyncTrainer)
+    trainer._balance_dp_tokens = True
+    trainer._old_log_prob_source = "actor"
+    trainer._consistency_profile = "off"
+    trainer.algorithm = SimpleNamespace(name="grpo", requirements=SimpleNamespace(
+        data=SimpleNamespace(reference_log_probs=True, values=False)))
+    trainer._run_rank_synchronized = lambda _label, fn: fn()
+    raw = replace(_rollout(), old_log_probs=None)
+    targeted = replace(raw, advantages=torch.ones((1, 1)))
+    moved = replace(targeted, sequences=torch.tensor([[3, 4]]))
+    old, reference = torch.full((1, 1), -0.2), torch.full((1, 1), -0.3)
+    trainer.actor = Mock(balance_rollout=Mock(return_value=moved), compute_log_probs=Mock(return_value=old))
+    trainer.reference_actor = Mock(compute_log_probs=Mock(return_value=reference))
+    trainer.experience_preparer = Mock(prepare_targets=Mock(return_value=targeted))
+    trainer.experience_preparer.attach_role_outputs.side_effect = lambda batch, **kw: replace(
+        batch, reference_log_probs=kw["reference_log_probs"])
+    actual, _ = trainer._prepare_experience(raw, False, {})
+    trainer.experience_preparer.prepare_targets.assert_called_once_with(raw)
+    trainer.actor.balance_rollout.assert_called_once_with(targeted)
+    trainer.actor.compute_log_probs.assert_called_once_with(moved)
+    trainer.reference_actor.compute_log_probs.assert_called_once_with(moved)
+    assert actual.advantages is targeted.advantages
+    assert raw.old_log_probs is None and raw.advantages is None
+    torch.testing.assert_close(actual.old_log_probs, old)
+    torch.testing.assert_close(actual.reference_log_probs, reference)
+
+
+class TestTrainingContracts(unittest.TestCase):
+    """Policy anchors and validation scheduling remain independent of optional diagnostics."""
+
+    def test_probability_source_and_diagnostics_are_independent(self) -> None:
+        """Diagnostics alone must not change anchors; actor selection forces inference."""
+        for source, diagnostics, sampled_present in (("rollout", False, True), ("rollout", True, True),
+                                                     ("actor", False, True), ("actor", True, False)):
+            with self.subTest(source=source, diagnostics=diagnostics, sampled_present=sampled_present):
+                sampled = torch.full((1, 1), -2.0) if sampled_present else None
+                rollout = replace(_rollout(), old_log_probs=sampled,
+                                  rollout_log_probs=sampled.clone() if sampled_present else None)
+                recomputed = torch.full((1, 1), -1.5, requires_grad=True)
+                trainer = SyncTrainer.__new__(SyncTrainer)
+                trainer._old_log_prob_source = source
+                trainer._consistency_profile = "off"
+                trainer.algorithm = SimpleNamespace(
+                    name="grpo",
+                    requirements=SimpleNamespace(data=SimpleNamespace(reference_log_probs=False, values=False)),
+                )
+                trainer.actor = Mock()
+                trainer.actor.compute_log_probs.return_value = recomputed
+                trainer._run_rank_synchronized = lambda _operation, callback: callback()
+                trainer.experience_preparer = Mock()
+                trainer.experience_preparer.prepare.side_effect = lambda batch, **_kwargs: batch
+                timings = {}
+                with patch("rl.trainer.summarize_training_diagnostics", return_value={}) as summary:
+                    prepared, _ = trainer._prepare_experience(rollout, diagnostics, timings)
+                self.assertEqual(summary.call_count, int(diagnostics))
+                expected = recomputed.detach() if source == "actor" else sampled
+                torch.testing.assert_close(prepared.old_log_probs, expected)
+                if sampled_present:
+                    torch.testing.assert_close(prepared.rollout_log_probs, sampled)
+                    torch.testing.assert_close(rollout.old_log_probs, sampled)
+                else:
+                    self.assertIsNone(prepared.rollout_log_probs)
+                    self.assertIsNone(rollout.old_log_probs)
+                self.assertFalse(prepared.old_log_probs.requires_grad)
+                self.assertEqual(trainer.actor.compute_log_probs.call_count, int(diagnostics or source == "actor"))
+                self.assertEqual("old_log_prob" in timings, diagnostics or source == "actor")
+
+    def test_evaluation_schedule_without_checkpoint_and_without_final_duplicate(self) -> None:
+        """Evaluate the initial and published final policy once with saving disabled."""
+        for last_step in (5, 6):
+            with self.subTest(last_step=last_step):
+                trainer = SyncTrainer.__new__(SyncTrainer)
+                trainer.resolved_config = {
+                    "train": {"checkpoint": {"save_final": False}},
+                    "evaluation": {"before_train": True, "every_n_steps": 5, "at_end": True},
+                }
+                trainer.state = SimpleNamespace(global_step=0, max_steps=last_step)
+                trainer.checkpoints = Mock()
+                trainer.checkpoints.will_save.return_value = False
+                trainer.rollout_engine = SimpleNamespace(policy_version=0)
+                trainer._release_training_state_for_rollout = Mock()
+                trainer.rollout_manager = SimpleNamespace(preparation_enabled=False)
+                trainer.train_dataloader = [object()] * last_step
+                trainer.evaluator = Mock(last_step=-1)
+                calls = []
+
+                def evaluate(step: int, *, trainer=trainer, record_call=calls.append) -> tuple[dict[str, float], list]:
+                    """Record the exact published policy version."""
+                    record_call(step)
+                    self.assertEqual(trainer.state.global_step, step)
+                    trainer.evaluator.last_step = step
+                    return {"validation/accuracy": 0.5}, []
+
+                def train_step(batch: object, *, trainer=trainer) -> None:
+                    """Advance a simulated successful publication."""
+                    del batch
+                    trainer.state.global_step += 1
+                    trainer.rollout_engine.policy_version = trainer.state.global_step
+                    if trainer._evaluation_due(trainer.state.global_step):
+                        trainer.evaluator.run(trainer.state.global_step)
+
+                trainer.evaluator.run.side_effect = evaluate
+                trainer._tracker = Mock()
+                trainer._next_batch = lambda iterator: (next(iterator), iterator)
+                trainer._train_step = train_step
+                self.assertTrue(trainer._train_and_checkpoint())
+                self.assertEqual(calls, [0, 5] if last_step == 5 else [0, 5, 6])
+                trainer.checkpoints.will_save.assert_not_called()
+
+    def test_periodic_evaluation_preserves_legacy_schedule_when_unspecified(self) -> None:
+        """An explicit interval overrides saving; omitted intervals retain existing behavior."""
+        trainer = SyncTrainer.__new__(SyncTrainer)
+        trainer.evaluator = Mock()
+        trainer.checkpoints = Mock()
+        trainer.checkpoints.will_save.return_value = True
+        for interval, expected in ((None, True), (0, False), (5, True), (3, False)):
+            with self.subTest(interval=interval):
+                trainer.resolved_config = {"evaluation": {"every_n_steps": interval}}
+                self.assertEqual(trainer._evaluation_due(5), expected)
+                self.assertFalse(trainer._evaluation_due(0))
+        trainer.evaluator = None
+        self.assertFalse(trainer._evaluation_due(5))
+
+
+class TestCodexPreparation(unittest.TestCase):
+    """Lookahead preserves order and never crosses evaluation, save or epoch boundaries."""
+
+    def test_preparation_and_boundaries(self) -> None:
+        """Only a normal step consumes the next batch, using CPU inputs and its target policy."""
+        for boundary in ("normal", "evaluation", "checkpoint", "last_step", "disabled", "empty"):
+            with self.subTest(boundary=boundary):
+                trainer = object.__new__(SyncTrainer)
+                trainer.state = SimpleNamespace(global_step=0, max_steps=3, epoch=4)
+                trainer.rollout_manager = SimpleNamespace(preparation_enabled=boundary != "disabled", prepare=Mock())
+                trainer._evaluation_due = lambda step, boundary=boundary: boundary == "evaluation"
+                trainer.checkpoints = SimpleNamespace(will_save=lambda step, boundary=boundary: boundary == "checkpoint")
+                trainer._run_rank_synchronized = lambda _name, operation: operation()
+                trainer._prefetched_batch = None
+                batch = {"sample_indices": [1], "input_ids": torch.tensor([[1, 2]]),
+                         "attention_mask": torch.ones(1, 2, dtype=torch.bool),
+                         "prompts": ["question"], "ground_truths": ["42"]}
+                trainer._prefetch_iterator = iter([] if boundary == "empty" else [batch])
+                trainer._prepare_next_rollout(3 if boundary == "last_step" else 1)
+                self.assertEqual(trainer.state.epoch, 4)
+                if boundary == "normal":
+                    self.assertIs(trainer._prefetched_batch, batch)
+                    prompts, version = trainer.rollout_manager.prepare.call_args.args
+                    self.assertEqual((prompts[0].prompt_id, version), ("1", 1))
+                    self.assertEqual(prompts[0].metadata["input_ids"].device.type, "cpu")
+                    self.assertIsNone(next(trainer._prefetch_iterator, None))
+                else:
+                    trainer.rollout_manager.prepare.assert_not_called()
+                    self.assertIsNone(trainer._prefetched_batch)
+                    self.assertIs(next(trainer._prefetch_iterator, None), None if boundary == "empty" else batch)

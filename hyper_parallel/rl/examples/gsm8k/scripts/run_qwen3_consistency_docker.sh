@@ -254,7 +254,7 @@ max_train_samples=${HYPER_QWEN3_MAX_TRAIN_SAMPLES:-${global_prompt_count}}
     exit 1
 }
 response_mini_batch_size=$((prompt_batch_size * num_return_sequences))
-config_name=qwen3_4b_gsm8k_vllm_production.yaml
+config_name=qwen3_4b_gsm8k_base.yaml
 printf '%s\n' \
     "image=${image}" \
     "deployment=${deployment}" \

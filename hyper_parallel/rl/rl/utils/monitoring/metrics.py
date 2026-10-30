@@ -22,8 +22,6 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional
 import torch
 import torch.distributed as dist
 
-from rl.dataset.episodes import episode_rows, generation_finish_reason
-
 if TYPE_CHECKING:
     from rl.dataset.contracts import ExperienceBatch
 
@@ -57,6 +55,9 @@ class ActorUpdateMetrics:
     optimizer_steps: int
     valid_sequences: Optional[int] = None
     sequence_clip_fraction: Optional[float] = None
+    micro_batches: Optional[int] = None
+    input_tokens: Optional[int] = None
+    padded_input_tokens: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -203,6 +204,11 @@ def build_training_metrics(
         "train/optimizer_steps": float(actor_update.optimizer_steps),
     }
     metrics.update(rollout_metrics)
+    if actor_update.micro_batches is not None:
+        metrics["train/micro_batches_per_rank"] = float(actor_update.micro_batches)
+        metrics["train/input_tokens"] = float(actor_update.input_tokens)
+        metrics["train/padded_input_tokens"] = float(actor_update.padded_input_tokens)
+        metrics["train/padding_fraction"] = 1.0 - actor_update.input_tokens / actor_update.padded_input_tokens
     if actor_update.valid_sequences is not None:
         metrics["train/valid_sequences"] = float(actor_update.valid_sequences)
     if actor_update.sequence_clip_fraction is not None:
@@ -315,6 +321,25 @@ def _local_training_diagnostics(
     actor_log_probs: Any,
 ) -> dict[str, Any]:
     """Build mergeable pre-update probability and target statistics."""
+    mask = experience.loss_action_mask.bool()
+    return_errors = (
+        None
+        if experience.returns is None or experience.values is None
+        else experience.returns - experience.values
+    )
+    record = {
+        "advantages": _masked_statistics(experience.advantages, mask),
+        "returns": _masked_statistics(experience.returns, mask),
+        "values": _masked_statistics(experience.values, mask),
+        "return_errors": _masked_statistics(return_errors, mask),
+        "action_tokens": int(mask.flatten().sum(dim=0).item()),
+        "total_tokens": int(experience.attention_mask[
+            [index for index, row in enumerate(experience.trajectories) if not row.metadata.get("dp_padding", False)]
+            if experience.trajectories else slice(None)
+        ].flatten().sum(dim=0).item()),
+    }
+    if actor_log_probs is None:
+        return record
     rollout_log_probs = getattr(experience, "rollout_log_probs", None)
     if rollout_log_probs is None:
         rollout_log_probs = experience.old_log_probs
@@ -326,7 +351,6 @@ def _local_training_diagnostics(
             "Actor and rollout log-probabilities must align: "
             f"actor={tuple(actor_log_probs.shape)}, rollout={expected_shape}"
         )
-    mask = experience.loss_action_mask.bool()
     if tuple(mask.shape) != expected_shape:
         raise ValueError(
             f"Action mask must align with log-probabilities: mask={tuple(mask.shape)}, "
@@ -336,12 +360,7 @@ def _local_training_diagnostics(
     rollout = rollout_log_probs.detach().float().masked_select(mask)
     actor_probabilities = actor.exp()
     rollout_probabilities = rollout.exp()
-    return_errors = (
-        None
-        if experience.returns is None or experience.values is None
-        else experience.returns - experience.values
-    )
-    return {
+    record.update({
         "actor_log": _local_statistics(actor),
         "rollout_log": _local_statistics(rollout),
         "absolute_log_diff": _local_statistics((actor - rollout).abs()),
@@ -354,16 +373,8 @@ def _local_training_diagnostics(
         "probability_cross_sum": float(
             (actor_probabilities * rollout_probabilities).sum(dim=0).item()
         ),
-        "advantages": _masked_statistics(experience.advantages, mask),
-        "returns": _masked_statistics(experience.returns, mask),
-        "values": _masked_statistics(experience.values, mask),
-        "return_errors": _masked_statistics(return_errors, mask),
-        "action_tokens": int(mask.flatten().sum(dim=0).item()),
-        "total_tokens": int(experience.attention_mask[
-            [index for index, row in enumerate(experience.trajectories) if not row.metadata.get("dp_padding", False)]
-            if experience.trajectories else slice(None)
-        ].flatten().sum(dim=0).item()),
-    }
+    })
+    return record
 
 
 def _gather_diagnostic_records(local: dict[str, Any]) -> list[dict[str, Any]]:
@@ -405,7 +416,6 @@ def _probability_diagnostic_metrics(
         float(record["probability_cross_sum"]) for record in records
     )
     action_tokens = sum(int(record["action_tokens"]) for record in records)
-    total_tokens = sum(int(record["total_tokens"]) for record in records)
     return {
         "training/rollout_probs_diff_valid": 1.0,
         "training/rollout_probs_diff_max": probability_diff["max"],
@@ -424,8 +434,6 @@ def _probability_diagnostic_metrics(
         "training/actor_log_probs_mean": actor_log["mean"],
         "training/rollout_actor_kl": rollout_log["mean"] - actor_log["mean"],
         "training/log_probs_valid_tokens": float(action_tokens),
-        "training/total_tokens": float(total_tokens),
-        "training/action_token_fraction": action_tokens / max(total_tokens, 1),
     }
 
 
@@ -464,11 +472,12 @@ def _add_target_diagnostics(
 
 def summarize_training_diagnostics(
     experience: ExperienceBatch,
-    actor_log_probs: Any,
+    actor_log_probs: Any = None,
 ) -> dict[str, float]:
-    """Compare rollout and pre-update Actor probabilities across DP ranks.
+    """Summarize targets and tokens, optionally comparing pre-update probabilities.
 
     The supplied Actor log-probabilities must be computed before optimization.
+    Pass None when no independent probability comparison is available.
     This function only reads detached tensors and never changes training inputs.
     """
     records = _gather_diagnostic_records(
@@ -476,9 +485,15 @@ def summarize_training_diagnostics(
     )
     if dist.get_rank() != 0:
         return {}
-    metrics = _probability_diagnostic_metrics(records)
-    if metrics is None:
-        return {"training/rollout_probs_diff_valid": 0.0}
+    total_tokens = sum(int(record["total_tokens"]) for record in records)
+    action_tokens = sum(int(record["action_tokens"]) for record in records)
+    metrics = {
+        "training/total_tokens": float(total_tokens),
+        "training/action_token_fraction": action_tokens / max(total_tokens, 1),
+        "training/rollout_probs_diff_valid": 0.0,
+    }
+    if actor_log_probs is not None:
+        metrics.update(_probability_diagnostic_metrics(records) or {})
     _add_target_diagnostics(metrics, records)
     return metrics
 
@@ -515,6 +530,9 @@ def _rollout_samples(
     sample_limit: int,
 ) -> list[dict[str, Any]]:
     """Render bounded episode samples without counting each model call as a candidate."""
+    # The dataset package eagerly imports Actor, which itself imports these metrics.
+    from rl.dataset.episodes import generation_finish_reason  # pylint: disable=C0415
+
     batch_rows = {
         str(prompt_id): row
         for row, prompt_id in enumerate(batch.get("prompt_ids", batch["sample_indices"]))
@@ -567,6 +585,9 @@ def _local_rollout_record(
     sample_limit: int,
 ) -> dict[str, Any]:
     """Build mergeable rollout statistics and bounded local samples."""
+    # Defer the dataset package cycle until Actor and its metrics are initialized.
+    from rl.dataset.episodes import episode_rows  # pylint: disable=C0415
+
     metadata = getattr(rollout, "metadata", {})
     if metadata.get("reward_status") == "pending":
         raise ValueError("Pending model rewards cannot be reported as rollout metrics")
