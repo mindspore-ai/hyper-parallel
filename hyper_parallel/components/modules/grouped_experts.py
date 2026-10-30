@@ -23,6 +23,7 @@ from typing import Any
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 from transformers.activations import ACT2FN
+
 from hyper_parallel.components.checkpoint.weight_conversion import (
     Transpose,
     WeightConverter,
@@ -388,23 +389,39 @@ class GroupedExperts(nn.Module):
         return transforms
 
     def _grouped_gemm_expert_forward(
-        self, gate_up_proj, down_proj, permuted, tokens_per_expert, permuted_probs
+        self, gate_up_proj, down_proj, permuted, tokens_per_expert, permuted_probs,
+        expert_parameters: Mapping[str, torch.Tensor] | None = None,
+        expert_gradient_targets: Mapping[str, Any] | None = None,
     ):
         """GroupGemm expert computation (NPU-only)."""
+        local_experts = tokens_per_expert.shape[0]
         self._tokens_per_expert_gmm = tokens_per_expert.to(device=permuted.device)
         self._group_list = self._tokens_per_expert_gmm.cumsum(dim=0)
 
         if self.use_2d_experts:
-            gate_up_proj = gate_up_proj.view(self.num_local_experts, self.hidden_size, -1)
+            gate_up_proj = gate_up_proj.view(local_experts, self.hidden_size, -1)
 
+        up_options, down_options = {}, {}
+        if expert_gradient_targets is not None:
+            up_target = expert_gradient_targets.get("gate_up_proj" if self.has_gate else "up_proj")
+            down_target = expert_gradient_targets.get("down_proj")
+            up_options = {} if up_target is None else up_target.gmm_arguments(gate_up_proj)
+            down_shape = down_proj.view(local_experts, -1, self.hidden_size) if self.use_2d_experts else down_proj
+            down_options = {} if down_target is None else down_target.gmm_arguments(down_shape)
         # up
         if permuted.nelement() != 0:
             fc1_output = grouped_matmul(  # pylint: disable=not-callable
                 permuted, gate_up_proj, bias=None, group_list=self._group_list, group_type=0, group_list_type=0,
+                **up_options,
             )
             if self.add_bias:
-                b1 = self.bias1.view(self.num_local_experts, -1)
-                fc1_output = fc1_output + torch.repeat_interleave(b1, self._tokens_per_expert_gmm, dim=0)
+                bias1 = self.bias1 if expert_parameters is None else expert_parameters["bias1"]
+                b1 = bias1.view(local_experts, -1)
+                bias_target = None if expert_gradient_targets is None else expert_gradient_targets.get("bias1")
+                if bias_target is None:
+                    fc1_output = fc1_output + torch.repeat_interleave(b1, self._tokens_per_expert_gmm, dim=0)
+                else:
+                    fc1_output = bias_target.add_bias(fc1_output, b1, self._tokens_per_expert_gmm)
         else:
             gate_up_proj_2d = gate_up_proj.view(self.hidden_size, -1)
             fc1_output = torch.matmul(permuted, gate_up_proj_2d)
@@ -419,17 +436,23 @@ class GroupedExperts(nn.Module):
             fc1_output = self.activation_func(fc1_output)
 
         if self.use_2d_experts:
-            down_proj = down_proj.view(self.num_local_experts, -1, self.hidden_size)
+            down_proj = down_proj.view(local_experts, -1, self.hidden_size)
 
         if fc1_output.nelement() != 0:
             fc2_output = grouped_matmul(  # pylint: disable=not-callable
                 fc1_output, down_proj, bias=None, group_list=self._group_list, group_type=0, group_list_type=0,
+                **down_options,
             )
             if self.add_bias:
-                b2 = self.bias2.view(self.num_local_experts, -1)
-                fc2_output = fc2_output + torch.repeat_interleave(
-                    b2, self._tokens_per_expert_gmm, dim=0,
-                )
+                bias2 = self.bias2 if expert_parameters is None else expert_parameters["bias2"]
+                b2 = bias2.view(local_experts, -1)
+                bias_target = None if expert_gradient_targets is None else expert_gradient_targets.get("bias2")
+                if bias_target is None:
+                    fc2_output = fc2_output + torch.repeat_interleave(
+                        b2, self._tokens_per_expert_gmm, dim=0,
+                    )
+                else:
+                    fc2_output = bias_target.add_bias(fc2_output, b2, self._tokens_per_expert_gmm)
         else:
             down_proj_2d = down_proj.view(-1, self.hidden_size)
             fc2_output = torch.matmul(fc1_output, down_proj_2d)
@@ -441,6 +464,9 @@ class GroupedExperts(nn.Module):
         x: torch.Tensor,
         num_tokens_per_expert: torch.Tensor,
         scores: torch.Tensor | None = None,
+        *,
+        expert_parameters: Mapping[str, torch.Tensor] | None = None,
+        expert_gradient_targets: Mapping[str, Any] | None = None,
     ) -> torch.Tensor:
         """Run grouped experts on expert-major routed tokens.
 
@@ -448,10 +474,19 @@ class GroupedExperts(nn.Module):
             x: Expert-major input with shape ``[tokens, hidden_size]``.
             num_tokens_per_expert: Token count for every local expert.
             scores: Optional routing weight for every routed token.
+            expert_parameters: Per-call expert tensors, resolved after FSDP unshard.
+            expert_gradient_targets: Optional per-invocation gradient accumulators exposing
+                ``gmm_arguments`` and ``add_bias``; no expert-placement backend is required.
 
         Returns:
             Expert-major output with shape ``[tokens, hidden_size]``.
         """
+        if expert_parameters is not None:
+            return self._grouped_gemm_expert_forward(
+                expert_parameters["gate_up_proj" if self.has_gate else "up_proj"],
+                expert_parameters["down_proj"], x, num_tokens_per_expert, scores, expert_parameters,
+                expert_gradient_targets,
+            )
         gate_up_proj = self.gate_up_proj if self.has_gate else self.up_proj
         down_proj = self.down_proj
         self.num_local_experts = num_tokens_per_expert.shape[0]

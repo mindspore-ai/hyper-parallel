@@ -183,6 +183,30 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
         self.assertIs(experts._executor._ep_group, group)
         self.assertTrue(experts._executor._resource_group.specification["auto_tokens"])
 
+    def test_optional_moonep_preserves_parameter_and_forward_contract(self) -> None:
+        """MoonEP selection must retain checkpoint names and current FSDP parameter views."""
+        from hyper_parallel.core.expert_parallel.moonep.mega_moe import MoonEPMegaMoeExperts
+
+        for enabled in (False, True):
+            with self.subTest(enable_moonep=enabled):
+                experts = DeepseekV41MegaMoeExperts(module=_source(), enable_moonep=enabled)
+                self.addCleanup(experts.close_runtime)
+                parameters = tuple(experts.parameters())
+                experts.configure(None, 1, 2)
+                self.assertIs(type(experts._executor), MoonEPMegaMoeExperts if enabled else MegaMoeExperts)
+                self.assertEqual(tuple(experts.parameters()), parameters)
+                self.assertEqual(set(experts.state_dict()), {"gate_up_proj", "down_proj"})
+                self.assertIsNone(experts._executor.gate_up_weight)
+                self.assertIsNone(experts._executor.down_weight)
+                inputs = torch.zeros(3, 8)
+                indices = torch.zeros(3, 2, dtype=torch.int32)
+                probabilities = torch.ones(3, 2)
+                with patch.object(type(experts._executor), "forward", return_value=inputs) as forward:
+                    self.assertIs(experts(inputs, indices, probabilities), inputs)
+                self.assertIs(forward.call_args.kwargs["expert_weights"][0], parameters[0])
+                self.assertIs(forward.call_args.kwargs["expert_weights"][1], parameters[1])
+                self.assertEqual(len(experts.make_transforms()), 2)
+
     def test_declared_replacements_preserve_base_modules_and_precision(self) -> None:
         """Resolve text/VLM YAML fixtures with paired expert and compute targets."""
         for multimodal in (False, True):

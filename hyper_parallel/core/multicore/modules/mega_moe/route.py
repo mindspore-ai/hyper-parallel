@@ -20,7 +20,7 @@ from array import array
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from itertools import accumulate
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 import torch.distributed as dist
@@ -41,6 +41,8 @@ _HOST_DESCRIPTOR_MAX_COUNTS = 1024
 _ROUTE_CACHE_REPROBE_STEPS = 8
 _METADATA_ALIGNMENT = 512
 _PULL_STAGING_MAX_BYTES = 64 * 1024 * 1024
+
+RouteSelector = Callable[[torch.Tensor, int, int, Optional[int]], bool]
 
 
 @dataclass(frozen=True)
@@ -401,6 +403,7 @@ def prepare_topk_route(
     *,
     autograd_mask: int = 0,
     prepare_workspace: Callable[[int, int], None] | None = None,
+    select_route: RouteSelector | None = None,
 ) -> PreparedTopKRoute:
     """Overlap Top-K permutation with count exchange and build route metadata.
 
@@ -413,7 +416,9 @@ def prepare_topk_route(
         workspace: Optional workspace ordered before the count exchange. Pull
             requires a lease acquired by the caller or the automatic-capacity callback.
         autograd_mask: Group-consistent gradient participation flags in dynamic mode.
-        prepare_workspace: Automatic-capacity callback, run after count agreement and before pull permutation.
+        prepare_workspace: Capacity callback, run before pull publication.
+        select_route: Optional placement decision after count agreement. Returning False
+            keeps the original route in ordinary memory without growing its workspace.
 
     Returns:
         Permuted tokens and exact native route metadata.
@@ -421,11 +426,11 @@ def prepare_topk_route(
     flat_ids = _validate_topk_inputs(hidden_states, topk_ids, topk_weights)
     if spec.dynamic_tokens:
         return _prepare_dynamic_route(hidden_states, topk_ids, flat_ids, spec, tokens_per_expert,
-                                      workspace, autograd_mask, prepare_workspace)
+                                      workspace, autograd_mask, prepare_workspace, select_route)
     counts = _resolve_counts(flat_ids, tokens_per_expert, spec)
     permutation_output = None
     if workspace is not None:
-        if spec.dispatch_mode == "pull":
+        if spec.dispatch_mode == "pull" and select_route is None:
             if not workspace.in_use or workspace.source_buffer is None:
                 raise RuntimeError("Pull permutation requires an initialized, claimed workspace.")
             permutation_output = workspace.source_buffer
@@ -438,19 +443,24 @@ def prepare_topk_route(
         routed_tokens, unpermute_mapping = _permute_topk_input_out(hidden_states, topk_ids, permutation_output)
     received_counts = _finish_count_gather(counts_by_source, count_work, spec)
     expert_capacity, maximum_received_slots = _expert_capacity(counts_by_source, spec)
+    if select_route is not None:
+        selected = select_route(counts_by_source, spec.plan_tokens, maximum_received_slots,
+                                spec.local_num_tokens * spec.ep_size * spec.top_k)
+        if selected and prepare_workspace is not None:
+            prepare_workspace(spec.plan_tokens, maximum_received_slots)
+            if spec.dispatch_mode == "pull":
+                routed_tokens, unpermute_mapping = _publish_staged_pull(
+                    (routed_tokens, unpermute_mapping), hidden_states, spec, workspace)
+    metadata = _compute_route_metadata(counts, counts_by_source, received_counts, spec, expert_capacity)
+    if select_route is not None:
+        metadata = replace(metadata, local_num_tokens=hidden_states.shape[0], plan_tokens=spec.plan_tokens)
     return PreparedTopKRoute(
         routed_tokens=routed_tokens,
         unpermute_mapping=unpermute_mapping,
         tokens_per_expert=counts,
         received_counts=received_counts,
         maximum_received_slots=maximum_received_slots,
-        metadata=_compute_route_metadata(
-            counts,
-            counts_by_source,
-            received_counts,
-            spec,
-            expert_capacity,
-        ),
+        metadata=metadata,
     )
 
 
@@ -689,6 +699,7 @@ def _prepare_dynamic_route(
     hidden_states: torch.Tensor, topk_ids: torch.Tensor, flat_ids: torch.Tensor, spec: MegaMoeSpec,
     supplied_counts: torch.Tensor | None, workspace: MegaMoeWorkspace | None, autograd_mask: int,
     prepare_workspace: Callable[[int, int], None] | None = None,
+    select_route: RouteSelector | None = None,
 ) -> PreparedTopKRoute:
     """Exchange variable-length metadata without adding a token-count collective."""
     tokens = hidden_states.shape[0]
@@ -700,17 +711,22 @@ def _prepare_dynamic_route(
     # Ordinary storage remains valid if count agreement triggers a SHMEM restart.
     permuted = _stage_dynamic_permutation(hidden_states, topk_ids, spec, invalid, workspace)
     summary, host_rows, metadata = None, None, None
-    if spec.auto_tokens:
+    selected = True
+    if spec.auto_tokens or select_route is not None:
         if work is not None:
             work.wait()
             work = None
         summary, host_rows, metadata = _read_cached_route(gathered, spec, workspace, hidden_states.device)
-        if prepare_workspace is None:
-            raise RuntimeError("Automatic MegaMoe routes require workspace capacity preparation")
-        prepare_workspace(summary[1], summary[2])
+        if select_route is not None:
+            total = sum(row[1] for row in host_rows) * spec.top_k if host_rows is not None else None
+            selected = select_route(gathered[:, 3:], summary[1], summary[2], total)
+        if selected:
+            if prepare_workspace is None:
+                raise RuntimeError("Automatic MegaMoe routes require workspace capacity preparation")
+            prepare_workspace(summary[1], summary[2])
     if invalid:
         permuted = None
-    elif spec.dispatch_mode == "pull":
+    elif spec.dispatch_mode == "pull" and selected:
         permuted = (_permute_dynamic_pull(hidden_states, topk_ids, spec, workspace) if permuted is None else
                     _publish_staged_pull(permuted, hidden_states, spec, workspace))
     elif permuted is None:

@@ -46,6 +46,9 @@ def _deepseek_v41_grouped_expert_forward(
         experts: torch.nn.Module,
         hidden_states: torch.Tensor,
         tokens_per_expert: torch.Tensor,
+        *,
+        expert_parameters: dict[str, torch.Tensor] | None = None,
+        expert_gradient_targets: dict[str, Any] | None = None,
 ) -> torch.Tensor:
     """Run FP32 clamped SwiGLU between two grouped GEMMs.
 
@@ -57,28 +60,40 @@ def _deepseek_v41_grouped_expert_forward(
     # The shared primitive imports optional torch_npu; keep CPU/GPU imports lazy.
     from hyper_parallel.components.functional import grouped_matmul  # pylint: disable=C0415
 
+    gate_up_proj = experts.gate_up_proj if expert_parameters is None else expert_parameters["gate_up_proj"]
+    down_proj = experts.down_proj if expert_parameters is None else expert_parameters["down_proj"]
+    gate_options, down_options = {}, {}
+    if expert_gradient_targets is not None:
+        gate_target = expert_gradient_targets.get("gate_up_proj")
+        down_target = expert_gradient_targets.get("down_proj")
+        if gate_target is not None:
+            gate_options = gate_target.gmm_arguments(gate_up_proj.transpose(1, 2), transpose=True)
+        if down_target is not None:
+            down_options = down_target.gmm_arguments(down_proj.transpose(1, 2), transpose=True)
     group_list = torch.cumsum(
         tokens_per_expert.to(device=hidden_states.device, dtype=torch.int64),
         dim=0,
     )
     gate_up = grouped_matmul(  # pylint: disable=not-callable
         hidden_states,
-        experts.gate_up_proj.transpose(1, 2),
+        gate_up_proj.transpose(1, 2),
         bias=None,
         group_list=group_list,
         group_type=0,
         group_list_type=0,
+        **gate_options,
     )
     # Cast the packed projections once; the shared helper's casts are then no-ops.
     gate, up = gate_up.float().chunk(2, dim=-1)
     intermediate = deepseek_v41_swiglu(gate, up, experts.limit)
     return grouped_matmul(  # pylint: disable=not-callable
         intermediate.to(hidden_states.dtype),
-        experts.down_proj.transpose(1, 2),
+        down_proj.transpose(1, 2),
         bias=None,
         group_list=group_list,
         group_type=0,
         group_list_type=0,
+        **down_options,
     )
 
 
@@ -139,8 +154,10 @@ def _routed_and_shared_forward(
         *,
         ep_size: int,
         fix_router: bool = False,
+        enable_moonep: bool = False,
 ) -> torch.Tensor:
     """Dispatch routed experts and add the V4.1 shared expert branch."""
+    moon_options = {"enable_moonep": True} if enable_moonep else {}
     def router_fn(target: Any, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Route with statistics over the current token partitions."""
         return _router(
@@ -151,6 +168,7 @@ def _routed_and_shared_forward(
     routed = ep_routed_forward(
         module, hidden_states,
         router_fn=_resolve_router(router_fn, ep_size=ep_size, fix_router=fix_router), ep_group=ep_group,
+        **moon_options,
     )
     return routed + module.shared_experts(hidden_states)
 
@@ -197,6 +215,7 @@ def deepseek_v41_ep_compute_fn(
         ep_mesh: Any,
         use_grouped_gemm: bool = False,
         fix_router: bool = False,
+        enable_moonep: bool = False,
 ) -> Callable:
     """Build V4.1 routed/shared computation with training-aware routing.
 
@@ -212,6 +231,8 @@ def deepseek_v41_ep_compute_fn(
         cp_mesh: Context-parallel mesh supplying token-partition statistics groups.
         ep_mesh: Expert-parallel mesh owning the routed experts.
         use_grouped_gemm: Use the existing V4.1 clamped grouped-GEMM expert path.
+        enable_moonep: Borrow experts through the native EP dispatcher and differentiable HCCL.
+            Disabled by default; independent of the MegaMoE replacement.
         fix_router: Enable benchmark-only balanced destinations while retaining
             learned Top-K weights and their gradients. Normal training and
             correctness runs keep this disabled.
@@ -224,6 +245,9 @@ def deepseek_v41_ep_compute_fn(
         raise ValueError("DeepSeek-V4.1 EP forward requires an active ep_mesh")
     if module.is_hash:
         raise ValueError("DeepSeek-V4.1 validation layers must use learned routing")
+    if not isinstance(enable_moonep, bool):
+        raise ValueError("enable_moonep must be a boolean")
+    moon_options = {"enable_moonep": True} if enable_moonep else {}
     if not isinstance(fix_router, bool):
         raise ValueError("fix_router must be a boolean")
     sequence_groups = _configure_router_statistics(module.gate, mesh, tp_mesh, cp_mesh)
@@ -270,7 +294,7 @@ def deepseek_v41_ep_compute_fn(
             router_token_mask=_local_router_metadata(router_token_mask, hidden_states, tp_mesh),
             router_sequence_ids=_local_router_metadata(router_sequence_ids, hidden_states, tp_mesh),
             router_num_sequences=router_num_sequences, sequence_partition_groups=sequence_groups,
-            ep_size=ep_size, fix_router=fix_router,
+            ep_size=ep_size, fix_router=fix_router, **moon_options,
         )
 
     if "router_token_mask" in inspect.signature(module.forward).parameters:
@@ -291,7 +315,8 @@ def deepseek_v41_ep_compute_fn(
             """
             del input_ids
             return _routed_and_shared_forward(
-                module, hidden_states, None, ep_group, ep_size=ep_size, fix_router=fix_router,
+                module, hidden_states, None, ep_group, ep_size=ep_size,
+                fix_router=fix_router, **moon_options,
             )
 
         return text_compute_fn
@@ -315,7 +340,8 @@ def deepseek_v41_ep_compute_fn(
             image_mask, hidden_states, tp_rank=tp_rank, tp_size=tp_size,
         )
         return _routed_and_shared_forward(
-            module, hidden_states, local_image_mask, ep_group, ep_size=ep_size, fix_router=fix_router,
+            module, hidden_states, local_image_mask, ep_group, ep_size=ep_size,
+            fix_router=fix_router, **moon_options,
         )
 
     return multimodal_compute_fn

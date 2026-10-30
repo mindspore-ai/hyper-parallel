@@ -152,6 +152,8 @@ class _MegaMoeExecutionResources:
                 self.workspace = MegaMoeWorkspace(shared=shared)
                 self.workspace.capacity_floor = self.heap_manager.bind(self.workspace, self.spec, specification)
                 self.workspace.heap_manager = self.heap_manager
+                self.spec = self.heap_manager.workspace_spec(self.workspace)
+                self._token_capacity = self.spec.local_num_tokens
 
             _collective.collective_call(
                 construct, stage="MegaMoe resource construction", group=self.heap_manager.root_group,
