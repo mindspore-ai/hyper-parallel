@@ -36,14 +36,17 @@ def _reduce_weighted_loss(cur_loss, cur_token_len, all_reduced_len, loss_name, d
     """Reduce a token-weighted loss while preserving the local backward graph."""
     if all_reduced_len != 0:
         local_weighted_loss = cur_loss * cur_token_len
-        backward_loss = local_weighted_loss / all_reduced_len * device_mesh.dp_size * device_mesh.cp_size
+        # Form the scale outside the loss graph so GA=1 has an exact unit
+        # gradient, rather than the rounded product count * (1 / count).
+        loss_scale = cur_token_len / all_reduced_len * device_mesh.dp_size * device_mesh.cp_size
+        backward_loss = cur_loss * loss_scale
         global_weighted_loss = all_reduce(
             local_weighted_loss.detach().item(),
             op="sum",
             group=dp_cp_group,
         )
         global_mean = cur_loss.new_tensor(global_weighted_loss / all_reduced_len)
-        return backward_loss + global_mean - backward_loss.detach()
+        return (backward_loss - backward_loss.detach()) + global_mean
 
     if not torch.allclose(cur_loss, torch.zeros_like(cur_loss)):
         raise ValueError(f"The all_reduced_len for {loss_name}_tokens is 0, but the cur_loss is not 0: {cur_loss}")
@@ -102,6 +105,12 @@ def mean_global_loss(
             else:
                 cur_token_len = all_reduce(cur_token_len.item(), op="sum", group=sequence_parallel_group)
 
+        cur_token_len = torch.as_tensor(
+            cur_token_len,
+            dtype=torch.promote_types(cur_loss.dtype, torch.float32),
+            device=cur_loss.device,
+        )
+
         if _is_tracing_or_compiling():
             # Graph-traced variant of the aggregation below: identical math
             # expressed with tensor collectives so the static-shape tracer can
@@ -112,13 +121,17 @@ def mean_global_loss(
             step_len = differentiable_all_reduce(
                 step_token_counts[f"{loss_name}_tokens"], "sum", dp_cp_group
             )
+            # Empty objectives have a zero local loss and zero scale. Avoid
+            # dividing by zero without introducing a data-dependent graph branch.
+            step_len = step_len.clamp_min(1)
             local_weighted_loss = cur_loss * cur_token_len
-            backward_loss = local_weighted_loss / step_len * device_mesh.dp_size * device_mesh.cp_size
+            loss_scale = cur_token_len / step_len * device_mesh.dp_size * device_mesh.cp_size
+            backward_loss = cur_loss * loss_scale
             global_weighted_loss = differentiable_all_reduce(
                 local_weighted_loss.detach(), "sum", dp_cp_group
             )
             global_mean = global_weighted_loss / step_len
-            cur_loss = backward_loss + global_mean - backward_loss.detach()
+            cur_loss = (backward_loss - backward_loss.detach()) + global_mean
             if sequence_parallel:
                 cur_loss = cur_loss / sequence_parallel_size
             loss_dict[key] = cur_loss

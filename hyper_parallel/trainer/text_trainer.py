@@ -217,24 +217,23 @@ class TextTrainer:
 
     def forward_backward_step(
             self,
-            data_iterator: Any,
-            num_micro_steps: int,
+            model_inputs: dict[str, Any],
+            loss_inputs: dict[str, Any],
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Fetch and execute one forward-backward micro-step.
+        """Execute one prepared forward-backward micro-step.
 
         Args:
-            data_iterator: Iterator providing one raw FB batch per call.
-            num_micro_steps: Number of FB steps in the current optimizer step.
+            model_inputs: Model inputs that ``get_batch`` prepared for this micro-step.
+            loss_inputs: Loss-only labels and masks prepared for this micro-step.
 
         Returns:
             Loss tensor and named loss tensors for this FB step.
+
+        Note:
+            ``base.step_token_counts`` must already hold the valid-target totals of the whole
+            optimizer step; ``train_step`` sets them before its first micro-step.
         """
-        model_inputs, loss_inputs = self.base.get_batch(data_iterator)
         self.base.current_token_counts = count_loss_token(loss_inputs)
-        self.base.step_token_counts = {
-            name: token_count * num_micro_steps
-            for name, token_count in self.base.current_token_counts.items()
-        }
         metric_inputs = {
             **model_inputs,
             **loss_inputs,
@@ -254,6 +253,12 @@ class TextTrainer:
 
         Returns:
             Aggregated loss and gradient norm for the completed step.
+
+        Note:
+            Prepared input batches are retained until their forward-backward
+            pass so the whole step's token count is known before backward.
+            Input storage grows with gradient accumulation; activation graphs
+            are still created and released one micro-step at a time.
         """
         memory_profiler.step()
         num_micro_steps = self.base.num_micro_batches
@@ -261,6 +266,14 @@ class TextTrainer:
         self.on_step_begin()
         self.base.model_integration.begin_step(self.base.state.global_step + 1)
         synchronize()
+
+        micro_batches = [self.base.get_batch(data_iterator) for _ in range(num_micro_steps)]
+        # Every micro-step must divide by the valid targets of the whole optimizer step.
+        # One micro-batch's count times num_micro_steps weights all micro-batches equally,
+        # so the objective would change with how the DP/CP layout splits the global batch.
+        self.base.step_token_counts = count_loss_token(
+            [loss_inputs for _, loss_inputs in micro_batches]
+        )
 
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
@@ -272,10 +285,12 @@ class TextTrainer:
                 num_micro_steps,
             )
             self.base.begin_fsdp_runtime_diagnostics(micro_step)
-            loss, loss_dict = self.forward_backward_step(
-                data_iterator,
-                num_micro_steps,
-            )
+            model_inputs, loss_inputs = micro_batches[micro_step]
+            # Release each prefetched device batch once its backward completes instead of
+            # pinning the whole step until the optimizer update.
+            micro_batches[micro_step] = None
+            loss, loss_dict = self.forward_backward_step(model_inputs, loss_inputs)
+            del model_inputs, loss_inputs
 
             total_loss += loss.item()
             for loss_name, loss_value in loss_dict.items():

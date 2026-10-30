@@ -23,8 +23,17 @@ from hyper_parallel.data.constants import IGNORE_INDEX
 def count_loss_token(
     batches: Union[list[dict[str, torch.Tensor]], dict[str, torch.Tensor]],
 ) -> dict[str, torch.Tensor]:
-    # FIXME: VeOmni version -> AutoModels version
-    """Calculate the total number of text_tokens/image_tokens/** for loss in a global batch, or one micro batch."""
+    """Count valid targets for each local loss objective across micro-batches.
+
+    Args:
+        batches: Loss fields for one micro-batch or a list of micro-batches.
+            Already aligned ``shift_labels`` take precedence over ``labels``;
+            otherwise labels and an optional loss mask are shifted together.
+
+    Returns:
+        Per-objective token counts summed over the supplied local batches.
+        Distributed reduction is performed by the loss aggregation runtime.
+    """
     if isinstance(batches, dict):
         batches = [batches]
     token_len: dict[str, torch.Tensor] = {}
@@ -59,7 +68,9 @@ def count_loss_token(
             for key in obj.keys():
                 if key.endswith("_labels") and key != "shift_labels":
                     token_name = key.split("_labels")[0]
-                    token_len[f"{token_name}_tokens"] = torch.sum(obj[key] != IGNORE_INDEX)  # image generation tokens
+                    count_name = f"{token_name}_tokens"
+                    token_count = torch.sum(obj[key] != IGNORE_INDEX)
+                    token_len[count_name] = token_len.get(count_name, 0) + token_count
 
             if "image_output_mask" in obj:
                 image_decoder_tokens = torch.sum(obj["image_output_mask"])
