@@ -87,6 +87,31 @@ native 组件失败会记录 warning 并继续组包；此时 wheel 生成不代
 - [ ] 所选组件的缺失依赖、环境未激活和 ABI 错误诊断符合各自契约
 - [ ] 目标 glibc 基线检查通过；910B/910C native 构建与用例通过，不支持的 SoC 返回明确 reason code
 
+## 安装包验证
+
+[Package installation check](../../.github/workflows/package-install-check.yml) 在提交到 `master` 的 PR
+创建、更新或重开时运行，也在 `master` 更新时运行，并提供手动运行和可复用工作流入口。
+它构建当前源码的 wheel，不向 PyPI 或 TestPyPI 上传包。
+
+验证步骤：
+
+1. 在 Linux x86_64 / Python 3.12 的 `py312` Conda 环境中执行
+   `bash build.sh --multicore off --strict on --jobs 2`，包含基础 indexed Dataset C++ helper。
+2. 检查 wheel 元数据，在另一个全新 `py312` Conda 环境安装 PyTorch 2.9.1 CPU 和该 wheel。
+   正常解析 wheel 声明的依赖，并运行 `pip check`；不使用 editable 安装或 `--no-deps`。
+3. 在源码目录外使用隔离解释器 `python -I` 运行[安装态检查](../../.github/scripts/validate_installed_package.py)，
+   核对安装位置和 wheel 版本，拒绝从源码路径或 editable 安装导入。
+4. 检查算子、模型配方和自动并行相关 YAML 文件的打包内容；验证空权重初始化、CPU 前向/反向与参数更新。
+5. 直接加载已安装的 indexed Dataset C++ 扩展并检查其结果，避免缺失二进制时的即时编译掩盖打包问题。
+
+PR 使用只读权限的 `pull_request` 事件和 GitHub 托管 Runner；Fork PR 可能需要维护者首次批准运行。
+检查名称为 `package-install-check`。工作流合入后需完成一次真实运行，再按目标分支策略将该名称配置为必需检查；
+添加工作流本身不会修改 Ruleset。
+
+此检查覆盖 CPU 可运行的安装包基线，不代表 Multicore、CANN、GPU/NPU 多卡功能、其他 Python ABI 或
+目标 glibc 基线已经验证。正式发布仍须对实际交付的最终 wheel，在对应设备和环境中完成上述组件验收。
+手动重跑会重新构建当前选择的版本，不会自动验证某个已经上传的远端安装包。
+
 ## 版本历史
 
 | 版本 | 日期 | 说明 |
