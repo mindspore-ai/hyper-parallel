@@ -40,6 +40,7 @@ from hyper_parallel.models.deepseek_v41.adapter.distributed.host_sparse_grad imp
 )
 from hyper_parallel.models.external_state import (
     CheckpointRuntime,
+    CheckpointTensorShard,
     ExternalBuildContext,
     ExternalLoadContext,
     ExternalMaterializationResult,
@@ -94,6 +95,19 @@ class DeepseekV41HostState:
         return {
             fqn: hashlib.sha256(memoryview(parameter.detach().contiguous().numpy()).cast("B")).hexdigest()
             for fqn, parameter in self.parameters.items()
+        }
+
+    def checkpoint_tensor_shards(self) -> dict[str, CheckpointTensorShard]:
+        """Expose owner-local rows and padding to checkpoint verification tools."""
+        self.check_identities()
+        return {
+            f"{fqn}.weight": CheckpointTensorShard(
+                tensor=table.weight,
+                global_shape=(table.physical_rows, table.width),
+                offsets=(table.global_row_start, 0),
+                logical_shape=(table.logical_rows, table.width),
+            )
+            for fqn, table in self.tables.items()
         }
 
     def materialize(self, context: ExternalLoadContext) -> ExternalMaterializationResult:

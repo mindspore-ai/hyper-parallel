@@ -50,7 +50,11 @@ from hyper_parallel.core.distributed_checkpoint.api import load
 from hyper_parallel.components.checkpoint.hf_storage import HuggingFaceStorageReader
 from hyper_parallel.core.distributed_checkpoint.metadata import Metadata, TensorStorageMetadata
 from hyper_parallel.components.checkpoint.remap_planner import DeferredRead, RemapBlock, RemapLoadPlanner
-from hyper_parallel.core.distributed_checkpoint.utils import all_gather_object, str_to_dtype
+from hyper_parallel.core.distributed_checkpoint.utils import (
+    all_gather_object,
+    create_chunk_list_for_tensor,
+    str_to_dtype,
+)
 from hyper_parallel.components.checkpoint.quantized_hf_storage import build_quantized_hf_reader
 from hyper_parallel.components.checkpoint.load_groups import (
     LoadGroup,
@@ -65,6 +69,8 @@ from hyper_parallel.components.checkpoint.load_groups import (
     copy_into_target,
     first_tensor,
     local_target_tensor,
+    checkpoint_logical_shapes,
+    checkpoint_padding_boxes,
     reject_partial_layout,
     resolve_checkpoint_location,
     select_unique_converter,
@@ -174,6 +180,7 @@ def _complete_conversion(
         conversion: _Conversion,
         claims: Sequence[tuple[str, str]],
         targets: Mapping[str, torch.Tensor],
+        logical_shapes: Mapping[str, tuple[int, ...]],
         fetched: Mapping[str, torch.Tensor],
 ) -> None:
     """
@@ -183,11 +190,14 @@ def _complete_conversion(
         conversion (_Conversion): The conversion.
         claims (Sequence[tuple[str, str]]): ``(output name, model tensor name)`` of every output to copy.
         targets (Mapping[str, torch.Tensor]): Model tensors by name.
+        logical_shapes: Model-declared unpadded checkpoint shapes.
         fetched (Mapping[str, torch.Tensor]): The whole checkpoint tensors the conversion reads.
     """
     outputs = _run_real(conversion, fetched, {})
     for output_name, target_name in claims:
-        copy_into_target(target_name, first_tensor(outputs[output_name]), targets[target_name])
+        copy_into_target(
+            target_name, first_tensor(outputs[output_name]), targets[target_name], logical_shapes.get(target_name),
+        )
 
 
 def _dcp_view(target: torch.Tensor) -> Any:
@@ -287,6 +297,11 @@ class HFLoadPlanner(RemapLoadPlanner):
         self.strict = strict
         self.report: Optional[LoadReport] = None
         targets = build_load_targets(model)
+        logical_shapes = checkpoint_logical_shapes(model)
+        self._logical_shapes = {
+            name: logical_shapes[name] for name in targets if name in logical_shapes
+        }
+        self._padded_targets: dict[int, tuple[str, tuple[int, ...]]] = {}
         if not external_target_fqns <= targets.keys():
             raise ValueError("External target is absent from the model")
         self._targets = {key: value for key, value in targets.items() if key not in external_target_fqns}
@@ -408,12 +423,33 @@ class HFLoadPlanner(RemapLoadPlanner):
         if self.report is None:
             raise RuntimeError("HFLoadPlanner.finish() needs a load planned with this planner first")
         for target in self._targets.values():
+            padded = self._padded_targets.get(id(target))
+            if padded is not None:
+                self._zero_padding(padded[0], target, padded[1])
             if id(target) in self._loaded_ids:
                 target._is_hf_initialized = True  # pylint: disable=protected-access
         self.apply_used_conversions(self.model)
         validate_load_result(self.report.missing_keys, self.report.unexpected_keys, strict=False)
         logger.info("Loaded %d model tensors from %s", len(self.report.loaded_keys), pretrained_path)
         return self.report
+
+    @staticmethod
+    def _zero_padding(name: str, target: torch.Tensor, logical_shape: tuple[int, ...]) -> None:
+        """Zero local padding beyond the declared logical checkpoint shape."""
+        view = _dcp_view(target)
+        chunks = create_chunk_list_for_tensor(view)
+        if not chunks:
+            return
+        if len(chunks) != 1:
+            raise ValueError(f"Expected one rectangular local padded parameter shard for {name}")
+        chunk = chunks[0]
+        local = local_target_tensor(target)
+        if tuple(local.shape) != tuple(chunk.sizes):
+            raise ValueError(f"Local padded parameter storage does not match its shard metadata: {name}")
+        with torch.no_grad():
+            for offsets, lengths in checkpoint_padding_boxes(logical_shape, tuple(chunk.offsets), tuple(local.shape)):
+                slices = tuple(slice(start, start + size) for start, size in zip(offsets, lengths))
+                local[slices].zero_()
 
     def apply_used_conversions(self, model: nn.Module) -> None:
         """
@@ -574,7 +610,11 @@ class HFLoadPlanner(RemapLoadPlanner):
         target_id = id(target)
         if target_id not in plan.loaded_ids:
             key = self._state_keys[target_id]
-            self._check_target(name, target, self._load_state[key], value)
+            logical_shape = self._logical_shapes.get(name)
+            self._check_target(name, target, self._load_state[key], value, logical_shape)
+            if logical_shape is not None and tuple(value.shape) == logical_shape:
+                if tuple(self._load_state[key].shape) != logical_shape:
+                    self._padded_targets[target_id] = (name, logical_shape)
             if isinstance(value, RegionTensor):
                 plan.table[key] = value.remap_blocks()
             else:
@@ -583,16 +623,25 @@ class HFLoadPlanner(RemapLoadPlanner):
         plan.loaded_keys.update(self._aliases[target_id])
 
     @staticmethod
-    def _check_target(name: str, target: torch.Tensor, view: Any, value: Any) -> None:
+    def _check_target(
+            name: str, target: torch.Tensor, view: Any, value: Any,
+            logical_shape: tuple[int, ...] | None = None,
+    ) -> None:
         """Refuse a model tensor that cannot take ``value``, as the legacy loader refuses it."""
         if local_target_tensor(target).is_meta:
             raise ValueError(f"Target must be materialized before loading: {name}")
         layout = target_layout(target)
         if layout is not None:
             reject_partial_layout(name, layout)
-        if tuple(value.shape) != tuple(view.shape):
+        target_shape = tuple(view.shape)
+        value_shape = tuple(value.shape)
+        if value_shape != target_shape and not (
+                logical_shape is not None
+                and value_shape == logical_shape
+                and len(logical_shape) == len(target_shape)
+                and all(logical <= physical for logical, physical in zip(logical_shape, target_shape))):
             raise ValueError(
-                f"Shape mismatch for {name}: checkpoint {tuple(value.shape)} vs target {tuple(view.shape)}"
+                f"Shape mismatch for {name}: checkpoint {value_shape} vs target {target_shape}"
             )
 
     def _adopt(self, plan: _Plan) -> None:
@@ -602,7 +651,7 @@ class HFLoadPlanner(RemapLoadPlanner):
         validate_load_result(missing, (), self.strict)
         deferred = []
         for conversion, claims in plan.deferred.values():
-            complete = partial(_complete_conversion, conversion, tuple(claims), self._targets)
+            complete = partial(_complete_conversion, conversion, tuple(claims), self._targets, self._logical_shapes)
             sources = tuple(sorted(conversion.sources()))
             if sources:
                 deferred.append(DeferredRead(sources, complete))

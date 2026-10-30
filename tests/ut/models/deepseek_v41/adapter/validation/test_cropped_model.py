@@ -18,11 +18,19 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
+import torch
+from safetensors.torch import save_file
+
+from hyper_parallel.components.checkpoint.quantized_hf_storage import build_quantized_hf_reader
+from hyper_parallel.models.deepseek_v41.adapter.validation import cropped_model
 from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import (
+    build_cropped_deepseek_v41,
     build_deepseek_v41_validation_config,
 )
-from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41ForCausalLM
+from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41Engram, DeepseekV41ForCausalLM
 from tests.common.mark_utils import arg_mark
 
 
@@ -138,6 +146,107 @@ def _write_released_config(directory: str) -> Path:
           card_mark="allcards", essential_mark="essential")
 class TestDeepseekV41ValidationCrop(unittest.TestCase):
     """Depth crops preserve retained model roles and reject inconsistent layouts."""
+
+    def test_pretrained_builder_preserves_config_and_decodes_native_weights(self):
+        """Retain training options and decode selected FP8 weights with their scales."""
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = _write_released_config(directory)
+            assets_path = _write_engram_assets(directory, 40, (1, 14), 32)
+            assets = json.loads(assets_path.read_text(encoding="utf-8"))
+            source = json.loads(config_path.read_text(encoding="utf-8"))
+            source["text_config"].update(engram_num_embeddings=assets["num_embeddings"], engram_vocab_size=16)
+            source["quantization_config"] = {"quant_method": "fp8", "weight_block_size": [2, 2]}
+            config_path.write_text(json.dumps(source), encoding="utf-8")
+            weight = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float8_e4m3fn)
+            tensors = {
+                "layers.0.attn.wq_a.weight": weight,
+                "layers.0.attn.wq_a.weight_scale_inv": torch.tensor([[2.0]]),
+                "hc_head_fn": torch.ones(4),
+                "layers.0.ffn.gate.bias_vl": torch.zeros(384),
+                "vision.blocks.0.attn.weight": torch.ones(2, 2),
+            }
+            root = Path(directory)
+            save_file(tensors, root / "weights.safetensors")
+            (root / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": dict.fromkeys(tensors, "weights.safetensors")}), encoding="utf-8")
+            setup = SimpleNamespace(mesh_context=SimpleNamespace(ep_size=128))
+
+            def load(view: str, **kwargs: object) -> str:
+                """Inspect the finalized config and decode the selected source region."""
+                translated = json.loads((Path(view) / "config.json").read_text(encoding="utf-8"))
+                self.assertEqual(translated["hidden_size"], 256)
+                self.assertEqual(translated["num_hidden_layers"], 40)
+                self.assertEqual(translated["v41_candidate_source_layer_id"], -1)
+                self.assertEqual(translated["v41_candidate_topk_blocks"], 0)
+                self.assertEqual(translated["engram_storage_backend"], "host")
+                self.assertEqual(translated["v41_engram_table_pad_multiple"], 128)
+                self.assertEqual(translated["v41_engram_num_embeddings"], assets["num_embeddings"])
+                self.assertIs(kwargs["distributed_setup"], setup)
+                self.assertEqual(kwargs["model_init_dtype"], "bfloat16")
+                self.assertEqual(kwargs["activation_checkpoint"], "full")
+                self.assertNotIn("local_files_only", kwargs)
+                self.assertEqual(kwargs["verify_hf_weights"], str(root / "report"))
+                reader = build_quantized_hf_reader(view)
+                keys = reader.load_metadata().state_dict_metadata
+                self.assertIn("hc_head_fn", keys)
+                self.assertNotIn("layers.0.ffn.gate.bias_vl", keys)
+                self.assertNotIn("vision.blocks.0.attn.weight", keys)
+                self.assertNotIn("layers.0.attn.wq_a.weight_scale_inv", keys)
+                decoded = reader.read_region("layers.0.attn.wq_a.weight", (0, 0), (2, 2))
+                torch.testing.assert_close(decoded, (weight.float() * 2).bfloat16(), rtol=0, atol=0)
+                return "loaded"
+
+            with patch.object(cropped_model.HyperAutoModelForCausalLM, "from_pretrained", side_effect=load):
+                result = build_cropped_deepseek_v41(
+                    directory, str(assets_path), load_base_model=True, text_parameter_divisor=1,
+                    num_routed_experts=384, exercise_post_training_indexer=False, enable_candidate_pool=False,
+                    engram_storage_backend="host", distributed_setup=setup, model_init_dtype="bfloat16",
+                    activation_checkpoint="full",
+                    verify_hf_weights=str(root / "report"),
+                )
+            self.assertEqual(result, "loaded")
+
+    def test_host_table_padding_preserves_released_hash_space(self):
+        """Feature: EP padding; Description: Align physical tables; Expectation: Preserve logical rows and hashes."""
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = _write_released_config(directory)
+            assets_path = _write_engram_assets(directory, 40, (1, 14), 32)
+            assets = json.loads(assets_path.read_text(encoding="utf-8"))
+            assets["padded_num_embeddings"] = [128, 256]
+            assets_path.write_text(json.dumps(assets), encoding="utf-8")
+            source = json.loads(config_path.read_text(encoding="utf-8"))
+            source["text_config"].update(engram_num_embeddings=assets["num_embeddings"], engram_vocab_size=16)
+            validated = cropped_model._released_engram_assets(source, str(assets_path), allow_padding=True)
+            self.assertEqual(validated["primes"], assets["primes"])
+            config = build_deepseek_v41_validation_config(
+                directory, str(assets_path), text_parameter_divisor=1, engram_storage_backend="host",
+            )
+            setup = SimpleNamespace(mesh_context=SimpleNamespace(ep_size=128))
+            cropped_model._align_host_engram_config(config, setup)
+            for layer_id, logical, physical in zip(assets["layer_ids"], assets["num_embeddings"], (128, 256)):
+                table = DeepseekV41Engram(config, layer_id, assets)
+                self.assertEqual(table.logical_num_embeddings, logical)
+                self.assertEqual(table.embed.weight.shape[0], physical)
+            assets.pop("padded_num_embeddings")
+            table = DeepseekV41Engram(config, 1, assets)
+            self.assertEqual(table.logical_num_embeddings, assets["num_embeddings"][0])
+            self.assertEqual(table.embed.weight.shape[0], 128)
+
+    def test_pretrained_builder_rejects_incompatible_assets_before_loading(self):
+        """Reject mismatched Engram rows rather than dropping or truncating weights."""
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = _write_released_config(directory)
+            assets_path = _write_engram_assets(directory, 40, (1, 14), 32)
+            source = json.loads(config_path.read_text(encoding="utf-8"))
+            source["text_config"].update(engram_num_embeddings=[1000, 2000], engram_vocab_size=100)
+            config_path.write_text(json.dumps(source), encoding="utf-8")
+            with patch.object(cropped_model.HyperAutoModelForCausalLM, "from_pretrained") as load:
+                with self.assertRaisesRegex(ValueError, "Released Engram assets mismatch for num_embeddings"):
+                    build_cropped_deepseek_v41(
+                        directory, str(assets_path), load_base_model=True, text_parameter_divisor=1,
+                        num_routed_experts=384, exercise_post_training_indexer=False,
+                    )
+                load.assert_not_called()
 
     def test_depth_crop_retains_dspark_and_vision_configuration(self):
         """Combine depth controls with the upstream DSpark configuration.

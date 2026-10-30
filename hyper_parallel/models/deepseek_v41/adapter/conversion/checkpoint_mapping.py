@@ -38,7 +38,7 @@ _V41_RENAMES = (
     ('^layers\\.(\\d+)\\.attn\\.', 'layers.\\1.self_attn.'),
     ('^layers\\.(\\d+)\\.ffn\\.', 'layers.\\1.mlp.'),
     ('^layers\\.(\\d+)\\.self_attn\\.attn_sink$', 'layers.\\1.self_attn.sinks'),
-    ('^layers\\.(\\d+)\\.self_attn\\.(.*?)\\.wq_b\\.', 'layers.\\1.self_attn.\\2.q_b_proj.'),
+    ('^layers\\.(\\d+)\\.self_attn\\.indexer\\.wq_b\\.', 'layers.\\1.self_attn.indexer.q_b_proj.'),
     ('^layers\\.(\\d+)\\.self_attn\\.wq_a\\.', 'layers.\\1.self_attn.q_a_proj.'),
     ('^layers\\.(\\d+)\\.self_attn\\.wq_b\\.', 'layers.\\1.self_attn.q_b_proj.'),
     ('^layers\\.(\\d+)\\.self_attn\\.wkv\\.', 'layers.\\1.self_attn.kv_proj.'),

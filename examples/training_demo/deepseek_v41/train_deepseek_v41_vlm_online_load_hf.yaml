@@ -5,16 +5,24 @@
 # Host table plus SparseAdam moments require approximately 1.1 TiB of CPU memory across eight ranks.
 # Run with run_deepseek_v41_vlm_online_load_hf.sh; baseline saves checkpoints, without resume.
 model:
-  _target_: hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model.build_hf_layer_cropped_deepseek_v41
-  pretrained_model_name_or_path: /path/to/DeepSeek-V4.1-Flash-BF16
-  text_layers: 2
-  vision_layers: 2
+  _target_: hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model.build_cropped_deepseek_v41
+  config_path: /path/to/DeepSeek-V4.1-Flash-BF16
+  num_hidden_layers: 2
+  text_parameter_divisor: 1
+  enable_vision: true
+  vision_num_hidden_layers: 2
+  vision_parameter_divisor: 1
+  num_routed_experts: 384
+  exercise_post_training_indexer: false
+  enable_candidate_pool: true
+  router_aux_loss_coeff: 0.001
   engram_assets_path: /path/to/generated/engram_assets.json
   engram_storage_backend: host
   load_base_model: true
+  # Verify all loaded shards, including CPU Host Engram, before the first forward.
+  verify_hf_weights: ./output/training_demo/deepseek_v41/hf_weight_check
   torch_dtype: bfloat16
   validate_placement: false
-  local_files_only: true
 model_init_dtype: float32
 training:
   train_iters: 10
@@ -217,7 +225,7 @@ dataset:
     _target_: hyper_parallel.models.deepseek_v41.adapter.data.transform_fn.build_deepseek_v41_omni_transform
     max_seq_len: 4096
     sample_format: messages
-    sample_alignment_size: 1
+    sample_alignment_size: 4
   _target_: hyper_parallel.data.omni.build_dataset.build_online_omni_mapping_dataset
   data_path: /path/to/train.jsonl
   data_config: {}

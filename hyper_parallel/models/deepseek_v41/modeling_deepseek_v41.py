@@ -125,6 +125,8 @@ class DeepseekV41Engram(nn.Module):
         padded_sizes = assets.get("padded_num_embeddings")
         if padded_sizes is None:
             pad_multiple = int(getattr(config, "v41_engram_table_pad_multiple", 1))
+            if pad_multiple < 1:
+                raise ValueError("Engram table padding multiple must be positive")
             logical_size = int(assets["num_embeddings"][layer_index])
             self.padded_num_embeddings = (
                 (logical_size + pad_multiple - 1) // pad_multiple * pad_multiple
@@ -139,6 +141,10 @@ class DeepseekV41Engram(nn.Module):
         self.wkv = nn.Linear(hash_columns * head_dim, self.hidden_size * (self.hc_mult + 1), bias=False)
         self.q_weight = nn.Parameter(torch.ones(self.hc_mult, self.hidden_size))
         self.k_weight = nn.Parameter(torch.ones(self.hc_mult, self.hidden_size))
+
+    def checkpoint_logical_shapes(self) -> dict[str, tuple[int, ...]]:
+        """Declare Engram embedding logical dimensions for padded HF loading."""
+        return {"embed.weight": (int(self.logical_num_embeddings), self.embed.embedding_dim)}
 
     def forward(
             self,
