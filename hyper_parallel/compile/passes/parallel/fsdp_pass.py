@@ -60,6 +60,7 @@ from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 import torch
 import torch.distributed as dist
 from torch import fx, nn
+from torch._subclasses import FakeTensor
 from torch.distributed.distributed_c10d import _resolve_process_group
 from torch.fx.node import _side_effectful_functions
 from torch.ops import _c10d_functional
@@ -91,7 +92,9 @@ def tag_gradient_identity(wait: fx.Node, param_name: str, state_idx: int) -> Non
         state_idx: Position in the traced state inputs.
     """
     node = wait
-    while node.op == "call_function" and str(node.target).startswith("_c10d_functional."):
+    while node.op == "call_function" and str(node.target).startswith(
+        "_c10d_functional."
+    ):
         node.meta.update(param_name=param_name, state_idx=state_idx)
         if not node.args or not isinstance(node.args[0], fx.Node):
             break
@@ -108,16 +111,24 @@ def _annotate_rs_spec(node: fx.Node, degree: int) -> None:
     value = source.meta.get("val")
     spec = source.meta.get("fsdp_padded_input_spec")
     if spec is None and value is not None and hasattr(value, "shape"):
-        spec = {"shape": tuple(value.shape), "dtype": value.dtype, "device": str(value.device)}
+        spec = {
+            "shape": tuple(value.shape),
+            "dtype": value.dtype,
+            "device": str(value.device),
+        }
     if spec is None:
         return
     shape = spec["shape"]
-    static = shape and all(isinstance(dim, int) and not isinstance(dim, bool) and dim > 0 for dim in shape)
+    static = shape and all(
+        isinstance(dim, int) and not isinstance(dim, bool) and dim > 0 for dim in shape
+    )
     if not static or shape[0] % degree:
         return
     node.meta["fsdp_bucket_spec"] = {
-        "input_shape": tuple(shape), "output_shape": (shape[0] // degree, *shape[1:]),
-        "dtype": spec["dtype"], "device": spec["device"],
+        "input_shape": tuple(shape),
+        "output_shape": (shape[0] // degree, *shape[1:]),
+        "dtype": spec["dtype"],
+        "device": spec["device"],
     }
 
 
@@ -127,11 +138,15 @@ def _annotate_ag_spec(node: fx.Node, degree: int, params: dict) -> None:
     if param is None:
         return
     shape = tuple(param.shape)
-    if not shape or any(not isinstance(dim, int) or isinstance(dim, bool) or dim <= 0 for dim in shape):
+    if not shape or any(
+        not isinstance(dim, int) or isinstance(dim, bool) or dim <= 0 for dim in shape
+    ):
         return
     node.meta["fsdp_bucket_spec"] = {
-        "input_shape": shape, "output_shape": (shape[0] * degree, *shape[1:]),
-        "dtype": param.dtype, "device": str(param.device),
+        "input_shape": shape,
+        "output_shape": (shape[0] * degree, *shape[1:]),
+        "dtype": param.dtype,
+        "device": str(param.device),
     }
 
 
@@ -145,7 +160,11 @@ def annotate_fsdp_bucket_specs(graph_module: fx.GraphModule, model: nn.Module) -
     params = dict(model.named_parameters())
     for node in graph_module.graph.nodes:
         kind = node.meta.get("comm_type")
-        if kind not in ("fsdp_all_gather", "fsdp_all_gather_backward", "fsdp_reduce_scatter"):
+        if kind not in (
+            "fsdp_all_gather",
+            "fsdp_all_gather_backward",
+            "fsdp_reduce_scatter",
+        ):
             continue
         degree = node.meta.get("fsdp_degree")
         if (not isinstance(degree, int) or isinstance(degree, bool)) or degree <= 1:
@@ -165,6 +184,10 @@ def _free_tensor_storage(tensor: torch.Tensor) -> None:
     whole joint graph. Returns ``None``; the node exists only for its effect.
     Mirrors ``fully_shard``'s ``free_unsharded_param`` storage release.
     """
+    # FakeTensorProp (InductorPass shape propagation) executes this node on
+    # fake values whose storage cannot be resized; there is nothing to free.
+    if isinstance(tensor, FakeTensor):
+        return
     if isinstance(tensor, torch.Tensor) and tensor.untyped_storage().size() > 0:
         tensor.untyped_storage().resize_(0)
 
@@ -435,10 +458,13 @@ class FSDPPass(GraphPass):
         self._fsdp_degree = configured if configured else dist.get_world_size()
         self._fsdp_group_name = kwargs.get("fsdp_group_name", self._fsdp_group_name)
         self._expert_param_names = set(kwargs.get("expert_param_names", ()))
-        self._expert_fsdp_group_name = kwargs.get("expert_fsdp_group_name", self._expert_fsdp_group_name)
+        self._expert_fsdp_group_name = kwargs.get(
+            "expert_fsdp_group_name", self._expert_fsdp_group_name
+        )
         self._expert_fsdp_degree = (
             dist.get_world_size(_resolve_process_group(self._expert_fsdp_group_name))
-            if self._expert_param_names else None
+            if self._expert_param_names
+            else None
         )
         self._dp_replicate_group_name = kwargs.get(
             "dp_replicate_group_name", self._dp_replicate_group_name
@@ -584,9 +610,14 @@ class FSDPPass(GraphPass):
         )
 
         for idx in range(num_state_inputs):
-            fqn = state_fqns[idx]
-            param = param_lookup.get(fqn)
-            if self._skip_dp_param(idx, fqn, param, model, state_is_param):
+            fqn, param, skip = self._resolve_dp_param(
+                idx, state_fqns, state_is_param, param_lookup, model
+            )
+            if skip:
+                continue
+
+            _, degree = self._param_group(fqn)
+            if fqn in self._expert_param_names and degree == 1:
                 continue
 
             fallback = self._unmarked_disposition(fqn, param, model)
@@ -600,48 +631,61 @@ class FSDPPass(GraphPass):
                 replicated_indices.add(idx)
                 continue
 
-            _, degree = self._param_group(fqn)
-            node = placeholders[idx]
-            node.meta["state_idx"] = idx
-            node.meta["param_name"] = fqn
-            node.meta["fsdp_degree"] = degree
-            node.meta["is_param"] = True
-            sharded_nodes.append(node)
-            # Record the TP-local, unsharded size before live-model FSDP slicing.
-            # Newly inserted collective nodes have no shape-propagated ``val``.
-            value = param if param is not None else node.meta.get("val")
-            if isinstance(value, torch.Tensor) and isinstance(value.numel(), int):
-                node.meta["fsdp_unsharded_nbytes"] = value.numel() * value.element_size()
-            self._fsdp_modules.add(self._get_parent_module_fqn(fqn))
+            sharded_nodes.append(
+                self._mark_sharded_param(idx, fqn, degree, placeholders[idx], param)
+            )
 
         return _DpParamClassification(
             sharded_nodes, replicated_indices, unmarked_trainable
         )
 
-    def _skip_dp_param(
+    def _resolve_dp_param(
+        self,
+        idx: int,
+        state_fqns: List[str],
+        state_is_param: Optional[List[bool]],
+        param_lookup: Dict[str, nn.Parameter],
+        model: Optional[nn.Module],
+    ) -> Tuple[Optional[str], Optional[nn.Parameter], bool]:
+        """Resolve one state placeholder to ``(fqn, param, skip)``.
+
+        Buffers and frozen parameters are skipped: the tracer omits them from
+        the gradient list and the live-model sharder leaves them full-size.
+        """
+        if state_is_param is not None and not state_is_param[idx]:
+            # Buffer, not a parameter -> never FSDP-sharded.
+            return None, None, True
+
+        fqn = state_fqns[idx]
+        param = param_lookup.get(fqn)
+        if model is not None and param is None:
+            return None, None, True
+
+        if param is not None and not param.requires_grad:
+            _LOG.info("Skip %s: requires_grad=False (frozen)", fqn)
+            return None, None, True
+        return fqn, param, False
+
+    def _mark_sharded_param(
         self,
         idx: int,
         fqn: str,
+        degree: int,
+        node: fx.Node,
         param: Optional[nn.Parameter],
-        model: Optional[nn.Module],
-        state_is_param: Optional[List[bool]],
-    ) -> bool:
-        """Return True when this state input must not be FSDP-sharded."""
-        if state_is_param is not None and not state_is_param[idx]:
-            # Buffer, not a parameter -> never FSDP-sharded.
-            return True
-        if model is not None and param is None:
-            return True
-        if param is not None and not param.requires_grad:
-            # Frozen params are not trainable: the tracer omits them from the
-            # gradient list and ``_shard_live_model_params`` leaves them
-            # full-size, so there is no gradient to classify.
-            _LOG.info("Skip %s: requires_grad=False (frozen)", fqn)
-            return True
-        _, degree = self._param_group(fqn)
-        if fqn in self._expert_param_names and degree == 1:
-            return True
-        return False
+    ) -> fx.Node:
+        """Tag a DP-sharded placeholder and record its live-model shard size."""
+        node.meta["state_idx"] = idx
+        node.meta["param_name"] = fqn
+        node.meta["fsdp_degree"] = degree
+        node.meta["is_param"] = True
+        # Record the TP-local, unsharded size before live-model FSDP slicing.
+        # Newly inserted collective nodes have no shape-propagated ``val``.
+        value = param if param is not None else node.meta.get("val")
+        if isinstance(value, torch.Tensor) and isinstance(value.numel(), int):
+            node.meta["fsdp_unsharded_nbytes"] = value.numel() * value.element_size()
+        self._fsdp_modules.add(self._get_parent_module_fqn(fqn))
+        return node
 
     def _unmarked_disposition(
         self,
@@ -768,7 +812,9 @@ class FSDPPass(GraphPass):
                 continue
 
             if group_name not in group_ranks:
-                group_ranks[group_name] = dist.get_rank(group=_resolve_process_group(group_name))
+                group_ranks[group_name] = dist.get_rank(
+                    group=_resolve_process_group(group_name)
+                )
             rank = group_ranks[group_name]
 
             # Pad-shard a non-divisible param (recorded by
@@ -885,7 +931,9 @@ class FSDPPass(GraphPass):
                 continue
             anchor = self._first_user(param_node) if sink else None
 
-            group_name, degree = self._param_group(param_node.meta.get("param_name", ""))
+            group_name, degree = self._param_group(
+                param_node.meta.get("param_name", "")
+            )
 
             # AllGather + immediate wait for correctness; FsdpOverlapPass may
             # sink the wait past independent compute later.
@@ -900,7 +948,9 @@ class FSDPPass(GraphPass):
                 ag_node.meta["param_name"] = param_node.meta.get("param_name")
                 ag_node.meta["state_idx"] = param_node.meta.get("state_idx")
                 ag_node.meta["fsdp_degree"] = degree
-                ag_node.meta["fsdp_unsharded_nbytes"] = param_node.meta.get("fsdp_unsharded_nbytes")
+                ag_node.meta["fsdp_unsharded_nbytes"] = param_node.meta.get(
+                    "fsdp_unsharded_nbytes"
+                )
 
             # Insert the wait in its own block: a wait placed in the same block
             # as the gather would land *before* the gather it depends on (the
@@ -1047,8 +1097,12 @@ class FSDPPass(GraphPass):
             group_name, degree = self._param_group(state_fqns[state_idx])
             with graph.inserting_before(output_node):
                 new_returned[i] = self._build_grad_reduction_nodes(
-                    graph, grad_node, replicated=replicated, pad_info=pad_info,
-                    group_name=group_name, degree=degree,
+                    graph,
+                    grad_node,
+                    replicated=replicated,
+                    pad_info=pad_info,
+                    group_name=group_name,
+                    degree=degree,
                 )
                 tag_gradient_identity(new_returned[i], state_fqns[state_idx], state_idx)
 
@@ -1101,7 +1155,8 @@ class FSDPPass(GraphPass):
             if value is not None and hasattr(value, "shape"):
                 reduced.meta["fsdp_padded_input_spec"] = {
                     "shape": (pad_info.n_pad, *value.shape[1:]),
-                    "dtype": value.dtype, "device": str(value.device),
+                    "dtype": value.dtype,
+                    "device": str(value.device),
                 }
         if replicated:
             # Replicated parameter (a 0-dim scalar, or a partial-plan leftover
@@ -1318,7 +1373,9 @@ class FSDPPass(GraphPass):
         self, graph: fx.Graph, record: _UnshardedParam, anchor: fx.Node
     ) -> fx.Node:
         """Insert the backward all_gather + wait pair before ``anchor``."""
-        group_name, degree = self._param_group(record.param_node.meta.get("param_name", ""))
+        group_name, degree = self._param_group(
+            record.param_node.meta.get("param_name", "")
+        )
         with graph.inserting_before(anchor):
             ag_node = graph.call_function(
                 _c10d_functional.all_gather_into_tensor,
@@ -1330,7 +1387,9 @@ class FSDPPass(GraphPass):
             ag_node.meta["param_name"] = record.param_node.meta.get("param_name")
             ag_node.meta["state_idx"] = record.param_node.meta.get("state_idx")
             ag_node.meta["fsdp_degree"] = degree
-            ag_node.meta["fsdp_unsharded_nbytes"] = record.param_node.meta.get("fsdp_unsharded_nbytes")
+            ag_node.meta["fsdp_unsharded_nbytes"] = record.param_node.meta.get(
+                "fsdp_unsharded_nbytes"
+            )
             # This gather lives in the backward half; tag it so downstream
             # passes (e.g. PpPass phase classification) do not mistake it and
             # its remat clones for forward nodes — their only arg is a forward
