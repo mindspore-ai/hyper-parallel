@@ -164,6 +164,10 @@ def grouped_matmul(
     Returns:
         The grouped matrix multiplication output.
     """
+    # The legacy List overload does not forward grouping parameters to CANN.
+    if isinstance(group_list, (list, tuple)):
+        group_list = torch.tensor(group_list, device=x.device, dtype=torch.int64)
+
     group_list_data_type = 1 if isinstance(group_list, torch.Tensor) else 0
     group_args = (group_list, group_type, gemm_fusion, group_list_type, group_list_data_type)
 
