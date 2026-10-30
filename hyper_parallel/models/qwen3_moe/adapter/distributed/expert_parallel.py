@@ -28,6 +28,7 @@ from typing import Any, Callable
 
 import torch
 
+from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.distributed._builder.forward_rewriter import _install_bound_forward
 from hyper_parallel.distributed.expert_parallel.moonep import MoonEPExecutor
 from hyper_parallel.distributed.expert_parallel.moonep.checkpoint import checkpoint_route_ids
@@ -58,6 +59,8 @@ def qwen3moe_ep_compute_fn(
     use_grouped_gemm: bool = False,
     fix_router: bool = False,
     use_moonep: bool = False,
+    use_megamoe: bool = False,
+    megamoe_migration: bool = False,
     moonep_replica_capacity: int | None = None,
     moonep_prefetch_depth: int = 1,
 ) -> Callable:
@@ -71,7 +74,9 @@ def qwen3moe_ep_compute_fn(
         ep_mesh: 实际专家分发域。
         use_grouped_gemm: 普通EP基线是否采用grouped GEMM。
         fix_router: 普通EP基线是否采用仅供性能测试的均衡路由。
-        use_moonep: 是否启用始终采用grouped GEMM的MoonEP。
+        use_moonep: 是否启用MoonEP的动态专家放置。
+        use_megamoe: 使用MegaMoE专家计算；与MoonEP组合时只接管专家计算。
+        megamoe_migration: 使用完整专家迁移和MegaMoE原生单次分发的实验路径。
         moonep_replica_capacity: 不同远程专家数上限；None取E/EP。
         moonep_prefetch_depth: 0按需恢复，1在本层反向时恢复前一层。
 
@@ -82,6 +87,8 @@ def qwen3moe_ep_compute_fn(
         use_moonep=True、E=128、EP=4时，每卡默认至多32份远程专家，整网共享两个表槽。
     """
     del mesh, tp_mesh, cp_mesh
+    if megamoe_migration and not (use_moonep and use_megamoe):
+        raise ValueError("Qwen MegaMoE完整专家迁移需要同时启用MoonEP和MegaMoE")
     if use_moonep:
         if fix_router:
             raise ValueError("Qwen MoonEP不支持仅供性能测试的均衡路由，请使用自然路由")
@@ -94,8 +101,25 @@ def qwen3moe_ep_compute_fn(
             num_experts=module.gate.num_experts, top_k=module.gate.top_k,
             replica_capacity=moonep_replica_capacity, activation="swiglu",
             prefetch_depth=moonep_prefetch_depth,
+            compute_backend=("megamoe_migrate" if megamoe_migration else
+                             "megamoe" if use_megamoe else "gmm"),
         )
         _install_bound_forward(experts, _qwen_moonep_experts)
+        _install_bound_forward(module.gate, _qwen_moonep_router)
+        return _qwen_moonep_compute
+    if use_megamoe:
+        if fix_router:
+            raise ValueError("Qwen MegaMoE不支持仅供性能测试的均衡路由")
+        if ep_mesh is None:
+            raise ValueError("Qwen MegaMoE需要显式EP mesh")
+        experts = module.experts
+        # Native executor has no parameters; the original expert module remains the FSDP owner.
+        object.__setattr__(experts, "_qwen_mega_executor", MegaMoeExperts(
+            hidden_size=experts.hidden_size, intermediate_size=experts.intermediate_size,
+            num_experts=module.gate.num_experts, top_k=module.gate.top_k,
+            ep_group=ep_mesh.get_group("ep"), create_parameters=False, swiglu_limit=None,
+        ))
+        _install_bound_forward(experts, _qwen_megamoe_experts)
         _install_bound_forward(module.gate, _qwen_moonep_router)
         return _qwen_moonep_compute
     return build_ep_compute(
@@ -122,6 +146,14 @@ def _qwen_moonep_experts(experts: Any, hidden: torch.Tensor, ids: torch.Tensor,
                          scores: torch.Tensor) -> torch.Tensor:
     """在experts模块/FSDP边界内计算；例如EP4只持有32个home专家的参数边。"""
     return experts._moonep_executor(  # pylint: disable=protected-access
+        hidden, ids, scores, expert_weights=_qwen_expert_weights(experts),
+    )
+
+
+def _qwen_megamoe_experts(experts: Any, hidden: torch.Tensor, ids: torch.Tensor,
+                          scores: torch.Tensor) -> torch.Tensor:
+    """保留Qwen专家参数的FSDP归属，使用完整MegaMoE路由和计算。"""
+    return experts._qwen_mega_executor(  # pylint: disable=protected-access
         hidden, ids, scores, expert_weights=_qwen_expert_weights(experts),
     )
 

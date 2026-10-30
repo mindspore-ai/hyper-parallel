@@ -486,7 +486,8 @@ class TestEpFactoryContract(unittest.TestCase):
         self.assertEqual(
             [param.name for param in parameters],
             ["module", "mesh", "tp_mesh", "cp_mesh", "ep_mesh", "use_grouped_gemm",
-             "fix_router", "use_moonep", "moonep_replica_capacity", "moonep_prefetch_depth"],
+             "fix_router", "use_moonep", "use_megamoe", "megamoe_migration",
+             "moonep_replica_capacity", "moonep_prefetch_depth"],
         )
         for param in parameters:
             self.assertIs(param.kind, inspect.Parameter.KEYWORD_ONLY)
@@ -494,6 +495,7 @@ class TestEpFactoryContract(unittest.TestCase):
             self.assertIs(param.default, inspect.Parameter.empty)
         self.assertEqual({param.name: param.default for param in parameters[5:]}, {
             "use_grouped_gemm": False, "fix_router": False, "use_moonep": False,
+            "use_megamoe": False, "megamoe_migration": False,
             "moonep_replica_capacity": None,
             "moonep_prefetch_depth": 1,
         })

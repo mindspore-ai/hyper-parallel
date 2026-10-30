@@ -49,6 +49,8 @@ class ExecutionPlan:
     used_fallback: bool
     weight_ranges: tuple[tuple[int, int] | None, ...]
     home_dense: bool
+    source_counts: torch.Tensor | None = None
+    migration_virtual_ids: torch.Tensor | None = None
 
 
 def _stable_order(ids: torch.Tensor) -> torch.Tensor:
@@ -280,6 +282,62 @@ def select_allocation(counts: torch.Tensor, capacity: int) -> tuple[torch.Tensor
     return cpu, torch.from_numpy(candidates[fallback].copy()), True
 
 
+def select_migration_allocation(counts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Balance MegaMoE by swapping whole experts without adding virtual slots.
+
+    Each rank retains exactly ``E / EP`` weight slots. A bounded sequence of
+    deterministic pair swaps reduces the largest token load while exchanging
+    at most two weight rows per swap. Uneven final token counts are valid.
+
+    Args:
+        counts: Source token counts with shape ``[EP, E]`` and int64 dtype.
+
+    Returns:
+        The CPU source counts and a whole-expert allocation ``[E, EP]``.
+    """
+    if counts.ndim != 2 or counts.dtype != torch.int64:
+        raise ValueError("MoonEP迁移规划要求int64[R,E]计数表")
+    ranks, experts = counts.shape
+    if ranks < 1 or experts < 1 or experts % ranks:
+        raise ValueError("MoonEP迁移规划要求专家数能被正的EP卡数整除")
+    cpu = counts.cpu()
+    _checked_count_rows(cpu)
+    totals = cpu.numpy().sum(axis=0)
+    home_count = experts // ranks
+    slots = np.arange(experts, dtype=np.int64).reshape(ranks, home_count).copy()
+    loads = totals[slots].sum(axis=1)
+    target = float(totals.sum()) / ranks
+    # A fixed bound keeps the planner's worst-case work independent of token count.
+    for _ in range(ranks):
+        source = int(loads.argmax())
+        if loads[source] <= 1.05 * target:
+            break
+        choice = None
+        best_value = float("inf")
+        for destination in range(ranks):
+            if destination == source or loads[destination] >= target:
+                continue
+            difference = totals[slots[destination]][None, :] - totals[slots[source]][:, None]
+            new_source = loads[source] + difference
+            new_destination = loads[destination] - difference
+            feasible = np.maximum(new_source, new_destination) < loads[source]
+            candidate_load = np.where(feasible, np.maximum(new_source, new_destination), np.inf)
+            indices = np.unravel_index(candidate_load.argmin(), candidate_load.shape)
+            value = candidate_load[indices]
+            if np.isfinite(value) and value < best_value:
+                best_value = value
+                choice = (value, destination, *indices, new_source[indices], new_destination[indices])
+        if choice is None:
+            break
+        _, destination, source_slot, destination_slot, new_source_load, new_destination_load = choice
+        slots[source, source_slot], slots[destination, destination_slot] = (
+            slots[destination, destination_slot], slots[source, source_slot])
+        loads[source], loads[destination] = new_source_load, new_destination_load
+    allocation = np.zeros((experts, ranks), dtype=np.int64)
+    allocation[slots.reshape(-1), np.repeat(np.arange(ranks), home_count)] = totals[slots.reshape(-1)]
+    return cpu, torch.from_numpy(allocation)
+
+
 def _receive_order_metadata(receive_counts: torch.Tensor | np.ndarray) -> tuple[list[int], list[int]]:
     """把CPU接收小表转换成分段平移量，设备无需再排序每一条token选择。
 
@@ -305,7 +363,7 @@ def _receive_order_metadata(receive_counts: torch.Tensor | np.ndarray) -> tuple[
 
 
 def compile_plan(counts: torch.Tensor, allocation: torch.Tensor, ids: torch.Tensor,
-                 rank: int, used_fallback: bool = False) -> ExecutionPlan:
+                 rank: int, used_fallback: bool = False, allow_uneven: bool = False) -> ExecutionPlan:
     """将小规划编译成设备索引和HCCL split，反向/重算直接复用。
 
     Example:
@@ -340,7 +398,12 @@ def compile_plan(counts: torch.Tensor, allocation: torch.Tensor, ids: torch.Tens
     group_counts = tuple(allocation_rows[e][rank] for e in active)
     # 计数与分配已经在CPU；批量 NumPy 指标代替逐专家 Python 循环。
     # 例如 E128/R8 的指标计算约由 0.24 ms 降为 0.08 ms，不再逐项转换计数列表。
-    metrics = tuple(_cpu_candidate_metrics(allocation_array[None], counts_array.sum(0), experts)[0].tolist())
+    metrics = _cpu_candidate_metrics(allocation_array[None], counts_array.sum(0), experts)[0].tolist()
+    if allow_uneven:
+        # Whole-expert swaps intentionally retain slight rank-load differences.
+        metrics[0] = int((allocation_array >= 0).all()
+                         and np.array_equal(allocation_array.sum(axis=1), counts_array.sum(axis=0)))
+        metrics[5] = 0
 
     # 所有短索引和路由前缀只传一次；这些 CPU 元数据本来就用于 HCCL 的动态 split。
     metadata_rows = [list(accumulate(group_counts)), send_ids, local_positions,
@@ -370,12 +433,28 @@ def compile_plan(counts: torch.Tensor, allocation: torch.Tensor, ids: torch.Tens
     route_metadata, receive_offsets_device, repeat_counts = pieces[-3:]
     # 已知每段源/目标起点，只展开平移量；output_size避免动态尺寸读取设备。
     received = sum(token_recv)
-    sort_order = torch.arange(received, device=device) + torch.repeat_interleave(
-        receive_offsets_device, repeat_counts, output_size=received)
+    if allow_uneven:
+        # Whole-expert placement has one virtual slot per routed expert. The
+        # native permutation/unpermutation replaces both large index maps.
+        if (np.any((allocation_array > 0).sum(axis=1) > 1)
+                or np.any((allocation_array > 0).sum(axis=0) > home_count)):
+            raise ValueError("whole-expert migration requires one owner and bounded local slots")
+        virtual_ids = np.zeros(experts, dtype=np.int64)
+        for target in range(ranks):
+            assigned = np.flatnonzero(allocation_array[:, target] > 0)
+            virtual_ids[assigned] = target * home_count + np.arange(len(assigned))
+        migration_virtual_ids = torch.from_numpy(virtual_ids).to(device)
+        dispatch_order = ids.new_empty(0)
+        sort_order = ids.new_empty(0)
+    else:
+        migration_virtual_ids = None
+        dispatch_order = _entry_order(counts, allocation, rank, ids, route_metadata)
+        sort_order = torch.arange(received, device=device) + torch.repeat_interleave(
+            receive_offsets_device, repeat_counts, output_size=received)
     return ExecutionPlan(
-        allocation, _entry_order(counts, allocation, rank, ids, route_metadata), sort_order,
+        allocation, dispatch_order, sort_order,
         boundaries, group_counts, token_send, token_recv, weight_send, weight_recv, sent_ids, weight_spans,
         home_positions, home_rows, remote_positions_device, remote_rows,
         home_count, any(bool(entries) for entries in remote), tuple(metrics), used_fallback, tuple(ranges),
-        home_dense,
+        home_dense, counts, migration_virtual_ids,
     )

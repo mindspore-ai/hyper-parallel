@@ -26,16 +26,23 @@ import torch
 import torch.distributed as dist
 from torch.autograd.function import once_differentiable
 
+from hyper_parallel.core.multicore import MegaMoeExperts
+from hyper_parallel.core.multicore.modules.mega_moe.function import RematerializedMegaMoeState
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.distributed.expert_parallel.collectives import ep_all_to_all
 from hyper_parallel.distributed.expert_parallel.moonep.checkpoint import bind_execution, is_replaying
 from hyper_parallel.distributed.expert_parallel.moonep.fsdp_hooks import (
     MoonEPAllGatherExtension, MoonEPGradientExtension,
 )
+from hyper_parallel.distributed.expert_parallel.moonep.megamoe_adapter import (
+    execute_external_route, pad_expert_weights, permute_migration_input, restore_migration_output,
+)
 from hyper_parallel.distributed.expert_parallel.moonep.numerics import (
     ExpertSaved, expert_backward_values, expert_forward_values, grouped_values, grouped_weight_grad,
 )
-from hyper_parallel.distributed.expert_parallel.moonep.planning import ExecutionPlan, compile_plan, select_allocation
+from hyper_parallel.distributed.expert_parallel.moonep.planning import (
+    ExecutionPlan, compile_plan, select_allocation, select_migration_allocation,
+)
 
 
 @dataclass(frozen=True)
@@ -695,6 +702,94 @@ class _ExpertFunction(torch.autograd.Function):
         return dx, hg, hd, None, None
 
 
+def _megamoe_local_forward(executor: Any, x: torch.Tensor, gate: torch.Tensor,
+                           down: torch.Tensor, plan: ExecutionPlan, *,
+                           on_forward_state: Callable[[RematerializedMegaMoeState], None] | None = None,
+                           ) -> torch.Tensor:
+    """Pass MoonEP's sorted rows and dynamic expert boundaries to MegaMoE."""
+    active = len(plan.group_counts)
+    capacity = executor.compute_slots
+    if active < capacity:
+        gate = torch.cat((gate, gate.new_zeros((capacity - active, *gate.shape[1:]))))
+        down = torch.cat((down, down.new_zeros((capacity - active, *down.shape[1:]))))
+        boundaries = torch.cat((plan.boundaries, plan.boundaries.new_full((capacity - active,), x.shape[0])))
+    else:
+        boundaries = plan.boundaries
+    return executor.mega_executor.forward_expert_major(
+        x, boundaries, expert_weights=(gate, down), on_forward_state=on_forward_state,
+    )
+
+
+class _MegaExpertFunction(torch.autograd.Function):
+    """Use MegaMoE for local experts while MoonEP owns replicas and FSDP gradients."""
+
+    @staticmethod
+    def forward(ctx: Any, x: torch.Tensor, home_gate: torch.Tensor, home_down: torch.Tensor,
+                key: ExecutionKey, runtime: MoonEPRuntime) -> torch.Tensor:
+        """Run one expert batch using the current MoonEP placement and weight table."""
+        executor, plan = runtime.executions[key]
+        gate, down = runtime.consume(key)
+        ctx.native_state = None
+
+        def capture(state: RematerializedMegaMoeState) -> None:
+            """Keep native activations across MoonEP's shared-weight slot release."""
+            ctx.native_state = state
+
+        with torch.profiler.record_function("moonep::megamoe_forward"):
+            if executor.compute_backend in ("megamoe_fused", "megamoe_migrate"):
+                output = execute_external_route(executor, x, gate, down, plan, on_forward_state=capture)
+            else:
+                output = _megamoe_local_forward(executor, x, gate, down, plan, on_forward_state=capture)
+        ctx.save_for_backward(*ctx.native_state.take_activations())
+        ctx.key, ctx.runtime = key, runtime
+        ctx.shapes = home_gate.shape, home_down.shape
+        if not is_replaying():
+            runtime.release(key)
+        return output
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, None]:
+        """Rematerialize replica weights and run native backward from saved activations."""
+        runtime, key = ctx.runtime, ctx.key
+        executor, plan = runtime.executions[key]
+        runtime.prepare(key)
+        gate, down = runtime.consume(key)
+        scheduler = getattr(executor.owner, "hsdp_scheduler", None)
+        if scheduler is None:
+            runtime.prefetch_previous(key)
+        home_gradients = None
+
+        def on_weight_gradients(gate_gradient: torch.Tensor, down_gradient: torch.Tensor) -> None:
+            """Start replica return after both native dW outputs are enqueued."""
+            nonlocal home_gradients
+            active = len(plan.group_counts)
+            home_gradients = scheduler.launch_gradient_extension(
+                (gate_gradient[:active], down_gradient[:active], plan))
+
+        with torch.profiler.record_function("moonep::megamoe_backward"):
+            callback = (on_weight_gradients if executor.compute_backend in ("megamoe_fused", "megamoe_migrate")
+                        and scheduler is not None else None)
+            padded_gate, padded_down = pad_expert_weights(executor, gate, down, plan)
+            ctx.native_state.restore_activations(ctx.saved_tensors)
+            dx, dg, dd = ctx.native_state.backward(
+                grad_output, padded_gate, padded_down, on_weight_gradients=callback,
+            )
+            active = len(plan.group_counts)
+            dg, dd = dg[:active], dd[:active]
+            ctx.native_state = None
+        runtime.release(key)
+        if scheduler is None:
+            hg, hd = return_home_gradients(dg, dd, plan, executor.gradient_group)
+        else:
+            hg, hd = (home_gradients if home_gradients is not None else
+                      scheduler.launch_gradient_extension((dg, dd, plan)))
+        if (hg.shape, hd.shape) != ctx.shapes:
+            raise RuntimeError("MoonEP/MegaMoE归属梯度与真实参数输入形状不一致")
+        runtime.complete(key)
+        return dx, hg, hd, None, None
+
+
 class MoonEPExecutor:
     """接收原始router结果，在实际experts模块边界内执行脚本MoonEP。"""
 
@@ -703,7 +798,8 @@ class MoonEPExecutor:
                  activation: str = "clipped", swiglu_limit: float = 0.0,
                  prefetch_depth: int = 1,
                  gradient_compact_home: bool = False,
-                 retain_weight_workspace: bool = False) -> None:
+                 retain_weight_workspace: bool = False,
+                 compute_backend: str = "gmm") -> None:
         """绑定布局读取器；例如 EP=4 时按规划同步分发并回传 token。"""
         if ep_size < 1 or num_experts < 1 or num_experts % ep_size or not 0 < top_k <= num_experts:
             raise ValueError("非法EP、专家数或top-k")
@@ -719,6 +815,15 @@ class MoonEPExecutor:
         self.prefetch_depth = prefetch_depth
         self.gradient_compact_home = gradient_compact_home
         self.retain_weight_workspace = retain_weight_workspace
+        if compute_backend not in ("gmm", "megamoe", "megamoe_fused", "megamoe_migrate"):
+            raise ValueError("MoonEP专家计算后端必须是gmm或支持的MegaMoE后端")
+        if compute_backend != "gmm" and not (
+                activation == "swiglu" or activation == "clipped" and swiglu_limit > 0):
+            raise ValueError("MoonEP/MegaMoE需要SwiGLU，限幅模式还需要正的限幅值")
+        self.compute_backend = compute_backend
+        self.compute_slots = (self.home_count if compute_backend == "megamoe_migrate"
+                              else self.home_count + self.replica_capacity)
+        self.mega_executor = None
         self.runtime = None
         self.layer = -1
         self.weight_group, self.gradient_group = ep_group, ep_group
@@ -727,18 +832,26 @@ class MoonEPExecutor:
 
     def _plan(self, ids: torch.Tensor) -> ExecutionPlan:
         """只为原始前向规划；例如重算命中原计划，免除再次同步小表。"""
-        local = torch.zeros(self.experts, device=ids.device, dtype=torch.int64)
-        local.scatter_add_(0, ids, torch.ones_like(ids))
-        if self.ranks > 1:
-            counts = local.new_empty(self.ranks * self.experts)
-            dist.all_gather_into_tensor(counts, local, group=self.group)
-            counts = counts.reshape(self.ranks, self.experts)
-        else:
-            counts = local.unsqueeze(0)
-        counts_cpu, allocation, used_fallback = select_allocation(counts, self.replica_capacity)
+        with torch.profiler.record_function("moonep::plan::counts"):
+            local = torch.zeros(self.experts, device=ids.device, dtype=torch.int64)
+            local.scatter_add_(0, ids, torch.ones_like(ids))
+            if self.ranks > 1:
+                counts = local.new_empty(self.ranks * self.experts)
+                dist.all_gather_into_tensor(counts, local, group=self.group)
+                counts = counts.reshape(self.ranks, self.experts)
+            else:
+                counts = local.unsqueeze(0)
+        with torch.profiler.record_function("moonep::plan::allocation"):
+            if self.compute_backend == "megamoe_migrate":
+                counts_cpu, allocation = select_migration_allocation(counts)
+                used_fallback = False
+            else:
+                counts_cpu, allocation, used_fallback = select_allocation(counts, self.replica_capacity)
         self.runtime.statistics["plans"] += 1
         self.runtime.statistics["planner_fallbacks"] += int(used_fallback)
-        plan = compile_plan(counts_cpu, allocation, ids, self.rank, used_fallback)
+        with torch.profiler.record_function("moonep::plan::compile"):
+            plan = compile_plan(counts_cpu, allocation, ids, self.rank, used_fallback,
+                                allow_uneven=self.compute_backend == "megamoe_migrate")
         self.runtime.statistics["moved_entries"] += plan.metrics[1]
         self.runtime.statistics["peak_copies"] = max(self.runtime.statistics["peak_copies"], plan.metrics[2])
         self.runtime.statistics["remote_experts_max"] = max(
@@ -761,26 +874,39 @@ class MoonEPExecutor:
         # 权重预取可由上一单元的 FSDP hook 提前触发；这里复用已有租约，
         # 未命中时才按需提交，随后使用同一同步 token 通信路径。
         self.runtime.prepare(key)
-        source_rows = plan.dispatch_order // self.top_k
-        payload = hidden.reshape(-1, hidden.shape[-1]).index_select(0, source_rows)
-        if self.ranks > 1:
-            with torch.profiler.record_function("moonep::all_to_all_v::token_dispatch"):
-                received = ep_all_to_all(payload, plan.token_send, plan.token_recv, self.group)
+        if self.compute_backend == "megamoe_migrate":
+            with torch.profiler.record_function("moonep::native_token_permute"):
+                payload, inverse = permute_migration_input(hidden, ids, plan)
         else:
-            received = payload
-        sorted_x = received.index_select(0, plan.sort_order)
-        computed = _ExpertFunction.apply(sorted_x, *weights, key, self.runtime)
-        # sort_order是无重复的完整排列；索引赋值的反向只保存索引，避免index_copy额外保留[C,H]输出。
-        restored = torch.empty_like(computed)
-        restored[plan.sort_order] = computed
-        if self.ranks > 1:
-            with torch.profiler.record_function("moonep::all_to_all_v::token_return"):
-                returned = ep_all_to_all(restored, plan.token_recv, plan.token_send, self.group)
+            source_rows = plan.dispatch_order // self.top_k
+            payload = hidden.reshape(-1, hidden.shape[-1]).index_select(0, source_rows)
+        if self.compute_backend in ("megamoe_fused", "megamoe_migrate"):
+            with torch.profiler.record_function("moonep::megamoe_external_route"):
+                returned = _MegaExpertFunction.apply(payload, *weights, key, self.runtime)
+            computed = returned
         else:
-            returned = restored
+            if self.ranks > 1:
+                with torch.profiler.record_function("moonep::all_to_all_v::token_dispatch"):
+                    received = ep_all_to_all(payload, plan.token_send, plan.token_recv, self.group)
+            else:
+                received = payload
+            sorted_x = received.index_select(0, plan.sort_order)
+            expert_function = _MegaExpertFunction if self.compute_backend == "megamoe" else _ExpertFunction
+            computed = expert_function.apply(sorted_x, *weights, key, self.runtime)
+            # sort_order是无重复的完整排列；索引赋值的反向只保存索引，避免index_copy额外保留[C,H]输出。
+            restored = torch.empty_like(computed)
+            restored[plan.sort_order] = computed
+            if self.ranks > 1:
+                with torch.profiler.record_function("moonep::all_to_all_v::token_return"):
+                    returned = ep_all_to_all(restored, plan.token_recv, plan.token_send, self.group)
+            else:
+                returned = restored
         # 评估没有专家反向来完成key；例如no_grad验证后继续训练不会残留旧轨迹。
         if not torch.is_grad_enabled() or not computed.requires_grad:
             self.runtime.complete(key)
+        if self.compute_backend == "megamoe_migrate":
+            with torch.profiler.record_function("moonep::native_token_unpermute"):
+                return restore_migration_output(returned, inverse, scores).reshape_as(hidden)
         # 与普通EP采用相同类型提升规则，避免额外FP32乘加改变Qwen的BF16舍入。
         selected_scores = scores.reshape(-1).index_select(0, plan.dispatch_order).to(returned.dtype)
         weighted = returned * selected_scores[:, None]
@@ -820,6 +946,29 @@ def configure_moonep(model: torch.nn.Module, *, prefetch_depth: int | None = Non
             raise ValueError("无 FSDP 路径的预取配置必须是非负整数")
         standalone_prefetch = bool(prefetch_depth)
     runtime = MoonEPRuntime(executors, standalone_prefetch=standalone_prefetch)
+    mega_executors = [executor for executor in executors if executor.compute_backend != "gmm"]
+    if mega_executors:
+        local_executors = [executor for executor in mega_executors if executor.compute_backend == "megamoe"]
+        if local_executors and dist.is_initialized() and dist.get_world_size() > 1:
+            local_rank = dist.get_rank()
+            singleton_groups = [dist.new_group(ranks=[rank]) for rank in range(dist.get_world_size())]
+            local_group = singleton_groups[local_rank]
+        else:
+            local_group = None
+        for executor in mega_executors:
+            gate, down = executor.read_weights()
+            fused = executor.compute_backend in ("megamoe_fused", "megamoe_migrate")
+            executor.mega_executor = MegaMoeExperts(
+                hidden_size=gate.shape[1], intermediate_size=down.shape[1],
+                num_experts=(executor.ranks if fused else 1) * executor.compute_slots,
+                top_k=1, ep_group=executor.group if fused else local_group, create_parameters=False,
+                swiglu_limit=executor.limit if executor.activation == "clipped" else None,
+                external_route_top_k=executor.top_k if fused else None,
+            )
+        for backend in ("megamoe", "megamoe_fused", "megamoe_migrate"):
+            peers = [executor.mega_executor for executor in mega_executors if executor.compute_backend == backend]
+            if peers:
+                MegaMoeExperts.share_execution_resources(peers)
     model._moonep_runtime = runtime  # pylint: disable=protected-access
     return runtime
 

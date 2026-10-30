@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
@@ -89,6 +89,89 @@ class _BackwardExecution:
     gmm_workspace: Any
     swiglu_workspace: Any
     intermediates: _BackwardIntermediates
+
+
+@dataclass(eq=False)
+class RematerializedMegaMoeState:
+    """Retain one push-route forward's activations for a single backward call.
+
+    The caller owns expert weights separately and may release or rematerialize them
+    between forward and backward. The retained state does not keep weight tensors.
+    """
+
+    plan: MegaMoePlan
+    workspace: MegaMoeWorkspace
+    dispatch: torch.Tensor | None
+    up_proj: torch.Tensor | None
+    activation: torch.Tensor | None
+    metadata: RouteMetadata
+    source_rows: int
+    _used: bool = False
+
+    def take_activations(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Transfer activation ownership to an outer autograd save hook.
+
+        Returns:
+            Dispatch, projection, and SwiGLU tensors for ``ctx.save_for_backward``.
+        """
+        if self.dispatch is None or self.up_proj is None or self.activation is None:
+            raise RuntimeError("MegaMoe forward activations have already been transferred")
+        activations = self.dispatch, self.up_proj, self.activation
+        self.dispatch = self.up_proj = self.activation = None
+        return activations
+
+    def restore_activations(self, activations: tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> None:
+        """Restore activations supplied by the active autograd checkpoint context."""
+        if self.dispatch is not None or self.up_proj is not None or self.activation is not None:
+            raise RuntimeError("MegaMoe forward activations are already present")
+        self.dispatch, self.up_proj, self.activation = activations
+
+    def backward(
+        self,
+        grad_output: torch.Tensor,
+        weight1: torch.Tensor,
+        weight2: torch.Tensor,
+        on_weight_gradients: Callable[[torch.Tensor, torch.Tensor], None] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run native backward with fresh weights and the retained forward activations.
+
+        Args:
+            grad_output: Gradient for the expert-major source rows.
+            weight1: Rematerialized gate and up-projection weights.
+            weight2: Rematerialized down-projection weights.
+            on_weight_gradients: Optional callback after both weight gradients are enqueued.
+
+        Returns:
+            Owned input gradient and both local-slot weight gradients.
+        """
+        if self.plan.spec.dispatch_mode != "push":
+            raise ValueError("Rematerialized MegaMoe backward requires push dispatch")
+        if self._used:
+            raise RuntimeError("Rematerialized MegaMoe state can run backward only once")
+        if self.dispatch is None or self.up_proj is None or self.activation is None:
+            raise RuntimeError("Rematerialized MegaMoe backward requires restored activations")
+        if grad_output.shape != (self.source_rows, self.plan.spec.hidden_size):
+            raise ValueError("Rematerialized MegaMoe output gradient has an unexpected shape")
+        saved = _SavedBackwardState(
+            self.dispatch, self.up_proj, self.activation,
+            _native_weight_operand(weight1, self.plan), _native_weight_operand(weight2, self.plan),
+            self.metadata.group_list, self.metadata.dispatch_src_off, self.metadata.dispatch_target_off,
+            self.metadata.dispatch_size, self.metadata.combine_src_off, self.metadata.combine_target_off,
+            self.metadata.combine_size,
+        )
+        self.workspace.claim()
+        self._used = True
+        try:
+            execution = _prepare_backward_execution(self.workspace, self.plan, saved, grad_output)
+            _launch_backward_kernel(self.plan, saved, grad_output, execution)
+            gradients = execution.intermediates
+            if on_weight_gradients is not None:
+                on_weight_gradients(gradients.grad_weight1, gradients.grad_weight2)
+            grad_input = execution.grad_x[:self.source_rows].clone()
+            return grad_input, gradients.grad_weight1, gradients.grad_weight2
+        finally:
+            self.workspace.release()
+            self.workspace.release_graph(self)
 
 
 def _workspace_tensor(tensor: Any | None, name: str) -> Any:
@@ -476,6 +559,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
         permutation: tuple[Any, Any, Any] | None,
         topk_weights: torch.Tensor | None,
         workspace_claimed: bool,
+        on_weight_gradients: Callable[[torch.Tensor, torch.Tensor], None] | None,
+        on_forward_state: Callable[[RematerializedMegaMoeState], None] | None,
     ) -> Any:
         """Launch the legacy forward op and save owned backward inputs.
 
@@ -505,6 +590,7 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             if ctx.needs_input_grad[0] or topk_weights is not None:
                 permutation_inputs = (unpermute_mapping,)
         ctx.source_rows = routed_tokens.shape[0]
+        ctx.on_weight_gradients = on_weight_gradients
         ctx.token_rows = ctx.source_rows // spec.top_k
         ctx.has_permutation = permutation is not None
         ctx.has_unpermute = topk_weights is not None
@@ -546,18 +632,25 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 permutation_inputs += (output, probs)
                 output = (load_torch_npu().npu_moe_token_unpermute(output, unpermute_mapping, probs=probs)
                           if ctx.source_rows else output[:0])
-            _save_forward_state(
-                ctx,
-                plan,
-                workspace,
-                saved_dispatch,
-                execution.intermediates.up_proj,
-                execution.intermediates.activation,
-                weight1,
-                weight2,
-                metadata,
-                permutation_inputs,
-            )
+            if on_forward_state is None:
+                _save_forward_state(
+                    ctx, plan, workspace, saved_dispatch,
+                    execution.intermediates.up_proj, execution.intermediates.activation,
+                    weight1, weight2, metadata, permutation_inputs,
+                )
+            else:
+                if permutation is not None or topk_weights is not None or spec.dispatch_mode != "push":
+                    raise ValueError("Forward state capture requires a detached expert-major call")
+                state = RematerializedMegaMoeState(
+                    plan, workspace, saved_dispatch, execution.intermediates.up_proj,
+                    execution.intermediates.activation, metadata, ctx.source_rows,
+                )
+                workspace.track_graph(state)
+                try:
+                    on_forward_state(state)
+                except Exception:
+                    workspace.release_graph(state)
+                    raise
             return output
         finally:
             if not workspace_claimed:
@@ -599,6 +692,9 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 source,
                 execution,
             )
+            if ctx.on_weight_gradients is not None:
+                ctx.on_weight_gradients(execution.intermediates.grad_weight1,
+                                        execution.intermediates.grad_weight2)
             # Release ordinary scratch before allocating the owned token gradient;
             # SHMEM remains leased until the current-stream work is recorded.
             execution = replace(execution, dispatch=None, intermediates=_BackwardIntermediates(
@@ -618,6 +714,8 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 None,
                 grad_topk_weights,
                 None,
+                None,
+                None,
             )
         finally:
             workspace.release()
@@ -630,6 +728,9 @@ def execute_mega_moe(
     route: RouteMetadata,
     plan: MegaMoePlan,
     workspace: MegaMoeWorkspace,
+    *,
+    on_weight_gradients: Callable[[torch.Tensor, torch.Tensor], None] | None = None,
+    on_forward_state: Callable[[RematerializedMegaMoeState], None] | None = None,
 ) -> Any:
     """Execute expert-major rows through the differentiable legacy kernels.
 
@@ -640,12 +741,20 @@ def execute_mega_moe(
         route: Route offsets, sizes and group metadata.
         plan: Shape-specific forward and backward descriptors.
         workspace: Reusable directional execution buffers.
+        on_forward_state: Optional callback receiving forward activations for
+            a caller-managed backward with rematerialized weights. Requires
+            ``torch.no_grad()`` and push dispatch.
 
     Returns:
         Expert-major output rows with independent storage.
     """
     # Historical input-output views are materialized outside Function.forward so
     # gradients reach the caller's original weights. Output-input storage is native.
+    if on_forward_state is not None:
+        if torch.is_grad_enabled():
+            raise ValueError("Forward state capture requires torch.no_grad() around the expert call")
+        if on_weight_gradients is not None:
+            raise ValueError("Captured forward state owns its backward gradient callback")
     return _MegaMoeFunction.apply(
         routed_tokens,
         _native_weight_operand(weight1, plan),
@@ -656,6 +765,8 @@ def execute_mega_moe(
         None,
         None,
         False,
+        on_weight_gradients,
+        on_forward_state,
     )
 
 
@@ -699,4 +810,6 @@ def execute_mega_moe_with_permutation(
         (route.routed_tokens, topk_ids, route.unpermute_mapping),
         topk_weights,
         workspace_claimed,
+        None,
+        None,
     )
