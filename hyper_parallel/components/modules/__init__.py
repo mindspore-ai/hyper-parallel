@@ -25,9 +25,11 @@ import importlib
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from hyper_parallel.components.modules.chunked_swiglu_mlp import ChunkedSwiGLUMLP, chunked_swiglu
     from hyper_parallel.components.modules.dsa_attention import DSAAttention, DeepseekV32DSAAttention
     from hyper_parallel.components.modules.gqa_attention import GatedGQAAttention, GQAAttention
     from hyper_parallel.components.modules.grouped_experts import GroupedExperts
+    from hyper_parallel.components.modules.head_chunk_gqa_attention import HeadChunkGQAAttention
     from hyper_parallel.components.modules.mhc import MhcPostModule, MhcPreModule
     from hyper_parallel.components.modules.mla_attention import MLAAttention
     from hyper_parallel.components.modules.rms_norm import OffsetRMSNorm, RMSNorm
@@ -35,12 +37,14 @@ if TYPE_CHECKING:
     from hyper_parallel.components.modules.swiglu_mlp import SwiGLUMLP
 
 _EXPORT_TO_MODULE = {
+    "ChunkedSwiGLUMLP": "chunked_swiglu_mlp",
     "DeepseekV32DSAAttention": "dsa_attention",
     "DSAAttention": "dsa_attention",
     "GQAAttention": "gqa_attention",
     "GatedGQAAttention": "gqa_attention",
     "EngramModule": "engram",
     "GroupedExperts": "grouped_experts",
+    "HeadChunkGQAAttention": "head_chunk_gqa_attention",
     "KimiDeltaAttention": "kimi_delta_attention",
     "KimiRMSNormGated": "kimi_delta_attention",
     "MhcPostModule": "mhc",
@@ -58,6 +62,7 @@ _EXPORT_TO_MODULE = {
     "SharedCompressedDSAAttention": "shared_compressed_dsa_attention",
     "SharedCompressedDSAIndexer": "shared_compressed_dsa_attention",
     "SwiGLUMLP": "swiglu_mlp",
+    "chunked_swiglu": "chunked_swiglu_mlp",
 }
 __all__.extend(_EXPORT_TO_MODULE)
 

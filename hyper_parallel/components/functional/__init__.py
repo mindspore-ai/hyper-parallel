@@ -56,6 +56,7 @@ _EXPORT_TO_MODULE = {
     "sink_attention": "sink_attention",
     "sinkhorn": "sinkhorn",
     "swiglu": "swiglu",
+    "swiglu_backward": "swiglu",
 }
 
 
@@ -69,9 +70,12 @@ def __getattr__(name: str) -> Any:
     module = importlib.import_module(
         f"hyper_parallel.components.functional.{submodule}"
     )
-    value = getattr(module, name)
-    globals()[name] = value
-    return value
+    # Importing a child also binds its module on this package. Cache sibling
+    # exports together so backward-first imports still expose callable swiglu.
+    for export, owner in _EXPORT_TO_MODULE.items():
+        if owner == submodule:
+            globals()[export] = getattr(module, export)
+    return globals()[name]
 
 
 __all__ = [
@@ -103,4 +107,5 @@ __all__ = [
     "sink_attention",
     "sinkhorn",
     "swiglu",
+    "swiglu_backward",
 ]
