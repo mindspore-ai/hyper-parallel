@@ -303,20 +303,17 @@ def _build_cropped_kimi_model(
     # the native class is patched for the duration of the build, then restored.
     orig_init_weights = _kimi_mod.Kimi_K25PreTrainedModel._init_weights  # pylint: disable=protected-access
 
-    def _make_patched_init_weights(orig):  # noqa: ANN001
-        def _patched_init_weights(self, module):  # noqa: ANN001
-            # The vision position embeddings use trunc_normal_, whose erfinv_ has no
-            # HyperParallel DTensor layout-inference registration; swap in the
-            # equivalent normal_ initialisation so the random init stays supported.
-            if type(module).__name__ == "Kimi_K25VisionPositionEmbeddings":
-                module.position_embeddings.data.normal_(mean=0.0, std=0.02)
-                return None
-            orig(self, module)
+    def _patched_init_weights(self, module):  # noqa: ANN001
+        # The vision position embeddings use trunc_normal_, whose erfinv_ has no
+        # HyperParallel DTensor layout-inference registration; swap in the
+        # equivalent normal_ initialisation so the random init stays supported.
+        if isinstance(module, _kimi_mod.Kimi_K25VisionPositionEmbeddings):
+            module.position_embeddings.data.normal_(mean=0.0, std=0.02)
             return None
-        return _patched_init_weights
+        orig_init_weights(self, module)
+        return None
 
-    _patched = _make_patched_init_weights(orig_init_weights)
-    _kimi_mod.Kimi_K25PreTrainedModel._init_weights = _patched  # pylint: disable=protected-access
+    _kimi_mod.Kimi_K25PreTrainedModel._init_weights = _patched_init_weights  # pylint: disable=protected-access
 
     try:
         return HyperAutoModelForImageTextToText.from_config(

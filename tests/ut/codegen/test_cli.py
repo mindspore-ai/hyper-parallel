@@ -14,13 +14,13 @@
 # ============================================================================
 """Codegen CLI and build-only orchestration contracts."""
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from hyper_parallel.codegen import build, cli
-from hyper_parallel.models.build_observer import current_model_build_observation
 
 
 def test_generate_uses_native_build_and_typed_overrides(monkeypatch):
@@ -116,11 +116,15 @@ def test_native_build_orchestration_builds_only_model(monkeypatch):
     class ModelTarget:
         @staticmethod
         def build(**kwargs: Any) -> object:
-            """Capture build-only arguments and emulate artifact publication."""
-            observation = current_model_build_observation()
-            events.append(("model", kwargs, observation))
-            observation.artifact_layout = layout
+            """Capture build-only arguments."""
+            events.append(("model", kwargs))
             return object()
+
+    @contextmanager
+    def _model_overlay(_session, received_artifact_dir):
+        """Provide the artifact normally populated by the overlay."""
+        assert received_artifact_dir == "bundle"
+        yield SimpleNamespace(artifact_layout=layout)
 
     config = SimpleNamespace(
         training=SimpleNamespace(backend="gloo", seed=7, enable_full_determinism=False),
@@ -138,6 +142,7 @@ def test_native_build_orchestration_builds_only_model(monkeypatch):
     )
     setup = object()
     monkeypatch.setattr(build, "create_offline_distributed_setup", lambda _config: setup)
+    monkeypatch.setattr(build, "use_codegen_model_build_overlay", _model_overlay)
     monkeypatch.setattr(
         build,
         "normalize_distributed_setup_overrides",
@@ -147,10 +152,6 @@ def test_native_build_orchestration_builds_only_model(monkeypatch):
 
     assert result is layout
     assert [event[0] for event in events] == ["normalize", "model"]
-    observation = events[-1][2]
-    assert observation.artifact_dir == "bundle"
-    assert observation.observation_only is True
-    assert current_model_build_observation() is None
 
 
 def test_native_build_requires_published_artifact(monkeypatch):

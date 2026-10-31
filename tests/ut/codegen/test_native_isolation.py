@@ -45,13 +45,6 @@ def test_trainer_config_removes_codegen_switch_with_migration_error():
         resolve_config({"codegen": True})
 
 
-def test_auto_model_rejects_removed_generated_backend():
-    """The legacy gen selector must not silently fall back to native training."""
-    config = SimpleNamespace(model_type="toy", architectures=["ToyModel"])
-    with pytest.raises(ValueError, match="generated-model training backend was removed"):
-        auto_model._BaseHyperAutoModelClass.from_config(config, backend="gen")
-
-
 def test_native_from_config_does_not_create_observer_or_touch_rng(monkeypatch):
     """The default native path must remain free of codegen lifecycle work."""
     captured = {}
@@ -86,15 +79,14 @@ def test_native_from_config_does_not_create_observer_or_touch_rng(monkeypatch):
         distributed_setup=distributed_setup,
     )
 
-    assert captured["build_observer"] is None
-    assert captured["publish_codegen"] is False
-    assert captured["observation"] is None
+    assert "build_observer" not in captured
+    assert "publish_codegen" not in captured
+    assert "observation" not in captured
 
 
-def test_native_builder_has_no_concrete_codegen_session_dependency():
-    """Native planning consumes only the optional observer seam."""
-    source = inspect.getsource(model_builder)
-    assert "CodegenBuildSession" not in source
-    assert "codegen.plan.freeze" not in source
-    assert "codegen.loader" not in source
-    assert "parallelize_from_generated" not in source
+def test_native_model_build_has_no_codegen_dependency():
+    """Native AutoModel and model-builder sources remain codegen-agnostic."""
+    source = inspect.getsource(auto_model) + inspect.getsource(model_builder)
+    assert "codegen" not in source.lower()
+    assert "observer" not in source.lower()
+    assert "observation" not in source.lower()

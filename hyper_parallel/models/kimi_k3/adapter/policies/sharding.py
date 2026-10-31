@@ -24,6 +24,7 @@ def build_parameter_sharding_rules() -> list[tuple[list[str], Any]]:
     )
 
     return [
+        (["block_sparse_moe.gate"], ParamRole.MOE_GATE),
         (["A_log", "dt_bias"], ParamRole.REPLICATED),
         (["q_conv1d", "k_conv1d", "v_conv1d"], ParamRole.COLWISE),
         (["q_a_proj", "kv_a_proj_with_mqa"], ParamRole.REPLICATED),

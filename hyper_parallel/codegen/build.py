@@ -17,12 +17,10 @@
 from typing import Any, Optional
 
 from hyper_parallel.codegen.artifact import ArtifactLayout
+from hyper_parallel.codegen.model_build_overlay import use_codegen_model_build_overlay
 from hyper_parallel.codegen.offline_build import create_offline_distributed_setup
+from hyper_parallel.codegen.planner_overlay import use_codegen_planner_overlay
 from hyper_parallel.codegen.session import CodegenBuildSession
-from hyper_parallel.models.build_observer import (
-    ModelBuildObservation,
-    use_model_build_observation,
-)
 from hyper_parallel.trainer.config import normalize_distributed_setup_overrides
 
 
@@ -52,12 +50,8 @@ def _build_and_publish(config: Any, artifact_dir: Optional[str]) -> ArtifactLayo
     distributed_setup = create_offline_distributed_setup(config)
     normalize_distributed_setup_overrides(distributed_setup, config)
 
-    observation = ModelBuildObservation(
-        observer=CodegenBuildSession(),
-        artifact_dir=artifact_dir,
-        observation_only=True,
-    )
-    with use_model_build_observation(observation):
+    session = CodegenBuildSession()
+    with use_codegen_model_build_overlay(session, artifact_dir) as result, use_codegen_planner_overlay():
         config.model.build(
             distributed_setup=distributed_setup,
             peft_config=config.peft,
@@ -74,9 +68,9 @@ def _build_and_publish(config: Any, artifact_dir: Optional[str]) -> ArtifactLayo
             model_init_dtype=config.model_init_dtype,
         )
 
-    if observation.artifact_layout is None:
+    if result.artifact_layout is None:
         raise RuntimeError("native model build completed without publishing a codegen artifact")
-    return observation.artifact_layout
+    return result.artifact_layout
 
 
 __all__ = ["generate_from_native_build"]

@@ -42,7 +42,6 @@ from hyper_parallel.models._transformers.checkpoint_loader import (
     _finalize_model_loading,
 )
 from hyper_parallel.models.build_options import CompileConfig
-from hyper_parallel.models.build_observer import ModelBuildObserver
 from hyper_parallel.models.materialization import (
     MaterializationContext,
     rebuild_materialized_state,
@@ -251,30 +250,20 @@ def _plan_and_apply_sharding(
     sharding_planner,
     is_hf_model: bool,
     validate_placement: bool,
-    build_observer: Optional[ModelBuildObserver] = None,
-    apply_plan: bool = True,
 ) -> tuple[nn.Module, Optional[dict]]:
     """Plan parameter layouts and apply dual-mode sharding when requested."""
     model_sharding_requested = (
         mesh is not None
         and any(size > 1 for size in (mesh.tp_size, mesh.cp_size, mesh.ep_size))
     )
-    if sharding_planner is None:
-        if build_observer is not None:
-            build_observer.mark_not_required("planner_unavailable")
-        return model, None
-    if mesh is None:
-        if build_observer is not None:
-            build_observer.mark_not_required("mesh_unavailable")
-        return model, None
-    if is_hf_model and not model_sharding_requested:
-        if build_observer is not None:
-            build_observer.mark_not_required("pure_data_parallel")
+    if (
+        sharding_planner is None
+        or mesh is None
+        or (is_hf_model and not model_sharding_requested)
+    ):
         return model, None
     if mesh.device_mesh is None:
         logger.warning("MeshContext has no device_mesh; skipping sharding")
-        if build_observer is not None:
-            build_observer.mark_not_required("device_mesh_unavailable")
         return model, None
 
     logger.info(
@@ -295,28 +284,12 @@ def _plan_and_apply_sharding(
         sequence_parallel=mesh.sequence_parallel,
         loss_parallel=mesh.loss_parallel,
     )
-    if build_observer is not None:
-        build_observer.observe_plan(plan, model, mesh)
-    if not apply_plan:
-        if build_observer is not None:
-            build_observer.observe_plan_application(
-                plan,
-                None,
-                validate_mode=False,
-            )
-        return model, None
     model, source_shard_info = apply_sharding_plan(
         model,
         plan,
         mesh,
         validate_mode=validate_placement,
     )
-    if build_observer is not None:
-        build_observer.observe_plan_application(
-            plan,
-            source_shard_info,
-            validate_mode=validate_placement,
-        )
     logger.info("Sharding plan applied; source_shard_info keys=%d", len(source_shard_info or {}))
     return model, source_shard_info
 
@@ -628,19 +601,14 @@ def _maybe_apply_module_replacements(
     low_precision_config: Optional[Any],
     load_base_model: bool,
     weights_mapping: Any,
-    build_observer: Optional[ModelBuildObserver] = None,
 ) -> tuple:
     """Apply native structure-preserving replacements."""
-    replacement_specs = tuple(getattr(distributed_setup, "module_replacements", None) or ())
     return _apply_module_replacement_actions(
         model,
-        replacement_specs,
+        getattr(distributed_setup, "module_replacements", None),
         weights_mapping=weights_mapping,
         context=_build_replacement_context(distributed_setup, low_precision_config),
         capture_checkpoint_metadata=load_base_model,
-        observation_callback=(
-            None if build_observer is None else build_observer.record_replacements
-        ),
     )
 
 
@@ -688,7 +656,6 @@ def apply_model_infrastructure(
     validate_placement: bool = False,
     low_precision_config: Optional[Any] = None,
     model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
-    build_observer: Optional[ModelBuildObserver] = None,
     **kwargs: Any,
 ) -> nn.Module:
     """Apply sharding, activation wrappers, FSDP2, initialization and compilation.
@@ -710,7 +677,7 @@ def apply_model_infrastructure(
     weights_mapping = get_model_conversion_mapping(model)
     model, weights_mapping = _maybe_apply_module_replacements(
         model, distributed_setup, low_precision_config,
-        load_base_model, weights_mapping, build_observer,
+        load_base_model, weights_mapping,
     )
     if is_meta_device:
         _apply_materialization_adapter(model)
@@ -725,7 +692,6 @@ def apply_model_infrastructure(
         sharding_planner,
         is_hf_model,
         validate_placement,
-        build_observer,
     )
 
     model = _apply_activation_features(
@@ -764,68 +730,6 @@ def apply_model_infrastructure(
     if compile_for_execution:
         model = apply_compile(model, compile_config)
 
-    return model
-
-
-def observe_model_infrastructure(
-    model: nn.Module,
-    *,
-    mesh: Optional[MeshContext],
-    sharding_planner: Optional[ShardingPlanner],
-    distributed_setup: Optional[DistributedSetup],
-    build_observer: ModelBuildObserver,
-    is_hf_model: bool,
-    peft_config: Optional[Any] = None,
-    qat_config: Optional[Any] = None,
-    fp8_config: Optional[Any] = None,
-    freeze_config: Optional[Any] = None,
-    low_precision_config: Optional[Any] = None,
-    load_base_model: bool = False,
-) -> nn.Module:
-    """Observe replacement and planning facts without executing infrastructure.
-
-    This is the Codegen-facing, side-effect-free counterpart to
-    :func:`apply_model_infrastructure`. It deliberately stops before DTensor,
-    FSDP, activation wrappers, materialization, loading and compilation.
-
-    Args:
-        model: Meta model whose structure is being observed.
-        mesh: Pure-data planning topology wrapped in MeshContext.
-        sharding_planner: Native planner instance.
-        distributed_setup: Normalized replacement and plan declarations.
-        build_observer: Collector receiving immutable planning facts.
-        is_hf_model: Whether the model follows the HF-native path.
-        peft_config: Optional structure-changing PEFT configuration.
-        qat_config: Optional structure-changing QAT configuration.
-        fp8_config: Optional structure-changing FP8 configuration.
-        freeze_config: Optional parameter-freezing configuration.
-        low_precision_config: Optional replacement policy.
-        load_base_model: Whether the source configuration requested weights.
-
-    Returns:
-        The observed meta model, without runtime infrastructure applied.
-    """
-    _apply_pre_sharding_features(peft_config, qat_config, fp8_config)
-    weights_mapping = get_model_conversion_mapping(model)
-    model, _ = _maybe_apply_module_replacements(
-        model,
-        distributed_setup,
-        low_precision_config,
-        load_base_model,
-        weights_mapping,
-        build_observer,
-    )
-    if freeze_config is not None:
-        _apply_parameter_freezing(model, freeze_config)
-    model, _ = _plan_and_apply_sharding(
-        model,
-        mesh,
-        sharding_planner,
-        is_hf_model,
-        False,
-        build_observer,
-        apply_plan=False,
-    )
     return model
 
 
