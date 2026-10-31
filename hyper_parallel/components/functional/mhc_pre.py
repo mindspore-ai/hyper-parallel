@@ -23,7 +23,7 @@ try:
 except ImportError:
     omni_training_custom_ops = None
 
-from hyper_parallel.components.functional.sinkhorn import sinkhorn
+from hyper_parallel.components.functional.sinkhorn import sinkhorn, sinkhorn_knopps
 
 
 def _mhc_pre_backward(ctx, dh_in, dh_post, dh_res, dh_x):
@@ -90,6 +90,34 @@ class _MhcPre(torch.autograd.Function):
         return tuple(grads)
 
 
+def _mhc_pre_reference(
+    x: torch.Tensor,
+    phi: torch.Tensor,
+    branch_alpha: torch.Tensor,
+    branch_beta: torch.Tensor,
+    num_stream: int,
+    sinkhorn_iters: int,
+    norm_eps: float,
+    hc_eps: float,
+    gamma: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute :func:`mhc_pre` with portable PyTorch operators, in FP32 as the NPU operator."""
+    streams = x.float()
+    normed = streams * torch.rsqrt(streams.square().mean(dim=-1, keepdim=True) + norm_eps)
+    if gamma is not None:
+        normed = normed * gamma.float().reshape(-1)
+    pre, post, res = torch.nn.functional.linear(normed, phi.float()).split(  # pylint: disable=not-callable
+        (num_stream, num_stream, num_stream * num_stream), dim=-1)
+    alpha = branch_alpha.float()
+    pre_beta, post_beta, res_beta = branch_beta.float().split((num_stream, num_stream, num_stream * num_stream))
+    h_pre = torch.sigmoid(pre * alpha[0] + pre_beta) + hc_eps
+    h_post = 2.0 * torch.sigmoid(post * alpha[1] + post_beta)
+    h_res = sinkhorn_knopps((res * alpha[2] + res_beta).unflatten(-1, (num_stream, num_stream)),
+                            sinkhorn_iters, hc_eps)
+    y = (h_pre.unsqueeze(-1) * streams.unflatten(-1, (num_stream, -1))).sum(dim=2).to(x.dtype)
+    return y, h_post, h_res, x
+
+
 def mhc_pre(
     x: torch.Tensor,
     phi: torch.Tensor,
@@ -100,6 +128,7 @@ def mhc_pre(
     norm_eps: float = 1e-6,
     hc_eps: float = 1e-6,
     gamma: Optional[torch.Tensor] = None,
+    use_fused: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Prepare an input and its mixing coefficients for an MHC-wrapped block.
 
@@ -113,10 +142,18 @@ def mhc_pre(
         norm_eps: RMS normalization epsilon.
         hc_eps: Hyper-connection numerical stability epsilon.
         gamma: Optional RMS normalization scale.
+        use_fused: Allow the fused NPU implementation when available.
 
     Returns:
         Block input, post coefficients, residual coefficients, and residual buffer.
+
+    Note:
+        NPU inputs run the AscendC operator when ``omni_training_custom_ops`` is
+        installed; other inputs run the same computation with PyTorch operators.
     """
+    if not use_fused or x.device.type != "npu" or omni_training_custom_ops is None:
+        return _mhc_pre_reference(x, phi, branch_alpha, branch_beta, num_stream, sinkhorn_iters, norm_eps,
+                                  hc_eps, gamma)
     shape = x.size()
     x = x.reshape(shape[0], shape[1], num_stream, -1)
     if gamma is not None:
