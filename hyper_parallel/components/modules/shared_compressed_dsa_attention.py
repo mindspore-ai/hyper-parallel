@@ -38,6 +38,7 @@ from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
 from hyper_parallel.components.functional.lightning_indexer import (
     lightning_indexer, sort_key_indices, validate_indexer_tensors,
 )
+from hyper_parallel.components.functional.partial_rotary_mul import partial_rotary_mul
 from hyper_parallel.components.functional.sparse_flash_mla import (
     supports_fused_attention_inputs, sparse_flash_mla,
 )
@@ -470,8 +471,12 @@ def _apply_v41_rope(
         cos: torch.Tensor,
         sin: torch.Tensor,
         unsqueeze_dim: int = 1,
+        *,
+        use_fused_rope: bool = False,
 ) -> torch.Tensor:
     """Apply V4 interleaved RoPE to the trailing rotary channels."""
+    if use_fused_rope:
+        return partial_rotary_mul(tensor, cos, sin, unsqueeze_dim)
     cos = cos.repeat_interleave(2, dim=-1).unsqueeze(unsqueeze_dim)
     sin = sin.repeat_interleave(2, dim=-1).unsqueeze(unsqueeze_dim)
     rope_dim = cos.shape[-1]
@@ -1104,6 +1109,7 @@ class SharedCompressedDSAIndexer(nn.Module):
         for name, parameter in module._parameters.items():  # pylint: disable=protected-access
             self.register_parameter(name, parameter)
         self.use_fused = False
+        self.use_fused_rope = False
         self.compress_ratio = module.compress_ratio
         self.global_num_heads = module.num_heads
         self.head_dim = module.head_dim
@@ -1129,8 +1135,10 @@ class SharedCompressedDSAIndexer(nn.Module):
             )
         query = query.view(*query_residual.shape[:2], -1, self.head_dim)
         if sequence_major:
-            return _apply_v41_rope(query, cos, sin, unsqueeze_dim=2)
-        return _apply_v41_rope(query.transpose(1, 2), cos, sin).transpose(1, 2)
+            return _apply_v41_rope(query, cos, sin, unsqueeze_dim=2, use_fused_rope=self.use_fused_rope)
+        return _apply_v41_rope(
+            query.transpose(1, 2), cos, sin, use_fused_rope=self.use_fused_rope,
+        ).transpose(1, 2)
 
     @torch.no_grad()
     def _project_worker_index_query(
@@ -1173,7 +1181,7 @@ class SharedCompressedDSAIndexer(nn.Module):
             query[:, start:end].copy_(projected[:, :end - start])
             del projected, chunk
         query = query.view(batch, length, query.shape[-1] // self.head_dim, self.head_dim)
-        return _apply_v41_rope(query, cos, sin, unsqueeze_dim=2)
+        return _apply_v41_rope(query, cos, sin, unsqueeze_dim=2, use_fused_rope=self.use_fused_rope)
 
     def _project_index_key(
             self,
@@ -1196,7 +1204,9 @@ class SharedCompressedDSAIndexer(nn.Module):
                 key_sin = sin[:, :compressed_length * self.compress_ratio:self.compress_ratio]
             else:
                 key_cos, key_sin = key_position_embeddings
-            key = _apply_v41_rope(key.unsqueeze(1), key_cos, key_sin).squeeze(1)
+            key = _apply_v41_rope(
+                key.unsqueeze(1), key_cos, key_sin, use_fused_rope=self.use_fused_rope,
+            ).squeeze(1)
             key_handle = None
             if cp_context is not None:
                 key_handle = (cp_context.launch(key, 1) if block_plan is None
@@ -1498,6 +1508,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             *,
             replace_indexer: bool,
             use_fused_ops: bool,
+            use_fused_rope: bool = False,
     ) -> None:
         """Transfer source state and configure the execution implementation."""
         super().__init__()
@@ -1528,8 +1539,12 @@ class SharedCompressedDSAAttentionBase(nn.Module):
         self.sliding_window = module.sliding_window
         self.scaling = module.scaling
         self.use_fused_ops = use_fused_ops
+        self.use_fused_rope = use_fused_rope
         if self.is_index_source:
             self.indexer.use_fused = use_fused_ops
+            self.indexer.use_fused_rope = use_fused_rope
+        if self.is_kv_source and getattr(self, "compressor", None) is not None:
+            self.compressor.use_fused_rope = use_fused_rope
         self.train(module.training)
 
     @staticmethod
@@ -1562,7 +1577,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
     ) -> tuple[torch.Tensor | None, SequenceGatherHandle | None]:
         """Project raw K=V and launch CP communication before query GEMMs."""
         key_value = self.kv_norm(self.kv_proj(hidden_states)).unsqueeze(1)
-        key_value = _apply_v41_rope(key_value, cos, sin)
+        key_value = _apply_v41_rope(key_value, cos, sin, use_fused_rope=self.use_fused_rope)
         if cp_context is None:
             return key_value, None
         if raw_route is not None:
@@ -1583,7 +1598,9 @@ class SharedCompressedDSAAttentionBase(nn.Module):
         """Expand main heads after low-rank query inputs have been dispatched."""
         query = self.q_b_proj(query_residual).view(*query_residual.shape[:2], -1, self.head_dim)
         # Preserve sequence-major storage for sparse attention while keeping the head-major API.
-        return _apply_v41_rope(query, cos, sin, unsqueeze_dim=2).transpose(1, 2)
+        return _apply_v41_rope(
+            query, cos, sin, unsqueeze_dim=2, use_fused_rope=self.use_fused_rope,
+        ).transpose(1, 2)
 
     @staticmethod
     def _validate_forward_inputs(
@@ -1958,7 +1975,9 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             sequence_length: int,
     ) -> torch.Tensor:
         """Undo RoPE and apply the grouped low-rank output projection."""
-        attention_output = _apply_v41_rope(attention_output, cos, -sin, unsqueeze_dim=2)
+        attention_output = _apply_v41_rope(
+            attention_output, cos, -sin, unsqueeze_dim=2, use_fused_rope=self.use_fused_rope,
+        )
         grouped = attention_output.reshape(batch_size, sequence_length, self.num_groups, -1)
         hidden_per_group = grouped.shape[-1]
         output_per_group = self.o_a_proj.weight.shape[0] // self.num_groups
@@ -2079,6 +2098,7 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
         context: Mapping[str, Any] | None = None,
         *,
         use_fused_ops: bool = False,
+        use_fused_rope: bool = False,
         indexer_load_balance: str = "none",
         main_kv_comm: str = "all_gather",
         indexer_balance_block_size: int | None = None,
@@ -2095,6 +2115,9 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
                 raising on unsupported calls without automatic fallback.
                 False selects eager PyTorch attention, Indexer and KL on every
                 device, without loading optional operator extensions.
+            use_fused_rope: Use partial interleaved RoPE with a fused forward and
+                reference-compatible backward. Independent of use_fused_ops; defaults
+                to False. True requires NPU and the optional partial-RoPE extension.
             indexer_load_balance: 'none', 'zigzag', 'greedy' or 'hybrid' query-task allocation.
                 Selection exchanges low-rank qr, merge weights and rotary embeddings;
                 attention and KL retain the original owner and autograd graph.
@@ -2123,6 +2146,8 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
         """
         if not isinstance(use_fused_ops, bool):
             raise ValueError(f"use_fused_ops must be a bool, got {use_fused_ops!r}")
+        if not isinstance(use_fused_rope, bool):
+            raise ValueError(f"use_fused_rope must be a bool, got {use_fused_rope!r}")
         if main_kv_comm not in ("all_gather", "all_to_all_v"):
             raise ValueError("main_kv_comm must be 'all_gather' or 'all_to_all_v'")
         indexer_balance_block_size = resolve_indexer_balance_block_size(
@@ -2136,6 +2161,7 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
             module,
             replace_indexer=True,
             use_fused_ops=use_fused_ops,
+            use_fused_rope=use_fused_rope,
         )
         self.indexer_load_balance = indexer_load_balance
         self.indexer_balance_block_size = indexer_balance_block_size

@@ -66,6 +66,28 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
         self.weights = torch.ones(1, 2, 8)
         self.indices = torch.tensor([[[0, -1], [0, 1]]], dtype=torch.int32)
 
+    def test_partial_rope_switch_is_independent_of_attention_fusion(self):
+        """Forward an explicit RoPE choice to all shared projection owners.
+
+        Feature: Independent partial-RoPE selection.
+        Description: Construct replacements with either attention implementation.
+        Expectation: RoPE is opt-in and reaches each projection owner.
+        """
+        for native_attention in (False, True):
+            with self.subTest(use_fused_ops=native_attention):
+                source = _source(index_source=True)
+                source.compressor = nn.Module()
+                module = attention.SharedCompressedDSAAttention(
+                    source, use_fused_ops=native_attention, use_fused_rope=True,
+                )
+                self.assertTrue(module.use_fused_rope)
+                self.assertTrue(module.indexer.use_fused_rope)
+                self.assertTrue(module.compressor.use_fused_rope)
+                self.assertEqual(module.use_fused_ops, native_attention)
+        self.assertFalse(attention.SharedCompressedDSAAttention(_source()).use_fused_rope)
+        with self.assertRaisesRegex(ValueError, "use_fused_rope must be a bool"):
+            attention.SharedCompressedDSAAttention(_source(), use_fused_rope="true")
+
     def test_indexer_requires_native_when_explicitly_selected(self):
         """Unsupported CPU inputs cannot silently satisfy native mode."""
         kwargs = {"compress_ratio": 1, "sparse_count": 2}
