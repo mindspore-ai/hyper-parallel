@@ -229,6 +229,65 @@ def build_load_targets(model: nn.Module) -> dict[str, torch.Tensor]:
     return targets
 
 
+def checkpoint_logical_shapes(model: nn.Module) -> dict[str, tuple[int, ...]]:
+    """Collect model-declared logical parameter shapes for trailing padding on any dimensions.
+
+    Modules may expose ``checkpoint_logical_shapes()`` returning logical shapes
+    keyed by parameter names relative to that module. Undeclared parameters keep
+    the normal strict checkpoint shape checks.
+
+    Args:
+        model: Model whose modules declare logical checkpoint shapes.
+
+    Returns:
+        Logical shapes keyed by fully qualified model parameter names.
+    """
+    shapes = {}
+    for module_name, module in model.named_modules():
+        provider = getattr(module, "checkpoint_logical_shapes", None)
+        if not callable(provider):
+            continue
+        declared = provider()
+        if not isinstance(declared, dict):
+            raise ValueError(f"Invalid checkpoint padding declaration on {module_name}")
+        for parameter_name, shape in declared.items():
+            parameter = module.get_parameter(parameter_name)
+            if (not isinstance(shape, tuple) or len(shape) != parameter.ndim
+                    or any(not isinstance(size, int) or isinstance(size, bool) or size < 0 for size in shape)):
+                raise ValueError(f"Invalid logical checkpoint shape on {module_name}: {shape}")
+            name = join_fqn(module_name, parameter_name)
+            if name in shapes and shapes[name] != shape:
+                raise ValueError(f"Conflicting logical checkpoint shapes for {name}")
+            shapes[name] = shape
+    return shapes
+
+
+def checkpoint_padding_boxes(
+        logical_shape: tuple[int, ...], offsets: tuple[int, ...], sizes: tuple[int, ...],
+) -> list[tuple[tuple[int, ...], tuple[int, ...]]]:
+    """Partition a local shard's trailing padding into disjoint local boxes.
+
+    Args:
+        logical_shape: Unpadded global checkpoint dimensions.
+        offsets: Global origin of this rank's rectangular shard.
+        sizes: Dimensions of this rank's local shard.
+
+    Returns:
+        Local offsets and dimensions of non-overlapping padding boxes.
+    """
+    if len(logical_shape) != len(offsets) or len(offsets) != len(sizes):
+        raise ValueError("Logical shape and local shard must have the same number of dimensions")
+    valid = tuple(max(0, min(size, logical - offset))
+                  for logical, offset, size in zip(logical_shape, offsets, sizes))
+    boxes = []
+    for axis, (length, size) in enumerate(zip(valid, sizes)):
+        lengths = valid[:axis] + (size - length,) + sizes[axis + 1:]
+        if all(lengths):
+            starts = (0,) * axis + (length,) + (0,) * (len(sizes) - axis - 1)
+            boxes.append((starts, lengths))
+    return boxes
+
+
 def make_tensor_loader(index: CheckpointIndex, source_key: str) -> Callable[[], torch.Tensor]:
     """A loader reading one checkpoint tensor when a conversion asks for it."""
     return lambda: index.load_tensor(source_key)
@@ -501,8 +560,20 @@ def shard_for_target(target_name: str, full_tensor: torch.Tensor, target: torch.
     return local_dtensor.to_local()
 
 
-def copy_into_target(target_name: str, full_tensor: torch.Tensor, target: torch.Tensor) -> None:
+def copy_into_target(
+        target_name: str, full_tensor: torch.Tensor, target: torch.Tensor,
+        logical_shape: tuple[int, ...] | None = None,
+) -> None:
     """Copy a checkpoint tensor into its materialized local target."""
+    layout = target_layout(target)
+    target_shape = tuple(getattr(layout, "tensor_shape", None) or target.shape)
+    if logical_shape is not None and tuple(full_tensor.shape) == logical_shape and target_shape != logical_shape:
+        if (len(logical_shape) != len(target_shape)
+                or any(logical > physical for logical, physical in zip(logical_shape, target_shape))):
+            raise ValueError(f"Invalid checkpoint padding shape for {target_name}")
+        padded = full_tensor.new_zeros(target_shape)
+        padded[tuple(slice(0, size) for size in logical_shape)].copy_(full_tensor)
+        full_tensor = padded
     local_tensor = shard_for_target(target_name, full_tensor, target)
     destination = local_target_tensor(target)
     if destination.is_meta:

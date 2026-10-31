@@ -51,6 +51,20 @@ class ExternalMaterializationResult:
 
 
 @dataclass(frozen=True)
+class CheckpointTensorShard:
+    """Describe live local storage for checking a logical checkpoint tensor.
+
+    External-state providers may expose ``checkpoint_tensor_shards()`` returning
+    these descriptors by model FQN. ``logical_shape`` excludes storage padding.
+    """
+
+    tensor: torch.Tensor
+    global_shape: tuple[int, ...]
+    offsets: tuple[int, ...]
+    logical_shape: tuple[int, ...] | None = None
+
+
+@dataclass(frozen=True)
 class GradientPreparation:
     """Combined gradient norm and clipping result."""
 

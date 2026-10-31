@@ -16,6 +16,7 @@
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -29,6 +30,25 @@ from tests.common.mark_utils import arg_mark
 
 
 _TARGET = "hyper_parallel.models._transformers.auto_model"
+
+
+def _make_check_callbacks(test_case, events, model, failed):
+    """Create loader and verifier callbacks bound to one test scenario."""
+    def build(*_args, **kwargs):
+        test_case.assertNotIn("verify_hf_weights", kwargs)
+        events.append("loaded")
+        return model
+
+    def check(actual, source, output, *, phase):
+        test_case.assertIs(actual, model)
+        test_case.assertEqual(events, ["loaded"])
+        test_case.assertEqual((source, output, phase),
+                              ("/weights", "/report", "after_load_before_first_forward"))
+        events.append("checked")
+        if failed:
+            raise RuntimeError("weight mismatch")
+
+    return build, check
 
 
 class TestDeferredPretrained(unittest.TestCase):
@@ -152,3 +172,47 @@ class TestDeferredPretrained(unittest.TestCase):
                     self.assertEqual(model._hp_checkpoint_load_report.missing_keys, ())
                     for name, expected in source.state_dict().items():
                         torch.testing.assert_close(model.state_dict()[name], expected, rtol=0, atol=0)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_public_pretrained_checks_finalized_model_and_propagates_failure(self):
+        """Feature: generic weight checking.
+
+        Description: Request verification through the public loader for two model families.
+        Expectation: Only the finalized model is checked and failures prevent returning it.
+        """
+        for auto_class in (HyperAutoModelForImageTextToText, HyperAutoModelForSequenceClassification):
+            for enabled, failed in ((False, False), (True, False), (True, True)):
+                with self.subTest(auto_class=auto_class, enabled=enabled, failed=failed):
+                    events = []
+                    model = torch.nn.Linear(2, 2)
+                    build_callback, check_callback = _make_check_callbacks(self, events, model, failed)
+
+                    with patch(_TARGET + ".instantiate_infrastructure", return_value=(None, None)), \
+                            patch(_TARGET + "._current_device", return_value=torch.device("cpu")), \
+                            patch(_TARGET + ".get_hf_config", return_value=BertConfig()), \
+                            patch(_TARGET + ".get_is_hf_model", return_value=True), \
+                            patch.object(auto_class, "_build_model", side_effect=build_callback), \
+                            patch(_TARGET + ".check_hf_weights", side_effect=check_callback) as verifier:
+                        options = {"distributed_setup": SimpleNamespace(mesh_context=None),
+                                   "verify_hf_weights": "/report" if enabled else None}
+                        if failed:
+                            with self.assertRaisesRegex(RuntimeError, "weight mismatch"):
+                                auto_class.from_pretrained("/weights", **options)
+                        else:
+                            self.assertIs(auto_class.from_pretrained("/weights", **options), model)
+                        self.assertEqual(verifier.call_count, int(enabled))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_public_pretrained_rejects_check_without_loading(self):
+        """Feature: weight-check preconditions.
+
+        Description: Disable loading while requesting weight verification.
+        Expectation: Fail before constructing model infrastructure.
+        """
+        with patch(_TARGET + ".instantiate_infrastructure") as infrastructure:
+            with self.assertRaisesRegex(ValueError, "load_base_model=True"):
+                HyperAutoModelForSequenceClassification.from_pretrained(
+                    "/weights", load_base_model=False, verify_hf_weights="/report")
+        infrastructure.assert_not_called()

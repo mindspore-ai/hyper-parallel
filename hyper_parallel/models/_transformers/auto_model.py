@@ -33,6 +33,7 @@ from transformers import (
 )
 
 from hyper_parallel.components.checkpoint.huggingface_checkpointer import resolve_hf_loader
+from hyper_parallel.components.checkpoint.weight_verifier import verify_hf_weights as check_hf_weights
 from hyper_parallel.models._transformers.model_builder import (
     _init_model,
     apply_model_infrastructure,
@@ -228,6 +229,25 @@ def _prepare_codegen_artifact(
     return layout.artifact_dir
 
 
+def _load_pretrained_config(
+        pretrained_model_name_or_path: str,
+        attn_implementation: str,
+        torch_dtype: Union[str, torch.dtype],
+        config_overrides: Optional[dict[str, Any]],
+        kwargs: dict[str, Any],
+) -> PretrainedConfig:
+    """Load the HF configuration with call-time overrides."""
+    config_kwargs = dict(kwargs)
+    config_kwargs.update(config_overrides or {})
+    return get_hf_config(pretrained_model_name_or_path, attn_implementation, torch_dtype, **config_kwargs)
+
+
+def _validate_weight_check_options(verify_hf_weights: Optional[str], load_base_model: bool) -> None:
+    """Require pretrained loading when verification is requested."""
+    if verify_hf_weights is not None and not load_base_model:
+        raise ValueError("verify_hf_weights requires load_base_model=True")
+
+
 class _BaseHyperAutoModelClass:
     """Shared from_pretrained / from_config logic.
 
@@ -252,31 +272,18 @@ class _BaseHyperAutoModelClass:
 
     @classmethod
     def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: str,
-        *model_args: Any,
-        distributed_setup: Optional[DistributedSetup] = None,
-        backend: Optional[Any] = None,
-        peft_config: Optional[Any] = None,
-        torch_dtype: Union[str, torch.dtype] = "auto",
-        attn_implementation: str = "sdpa",
-        force_hf: bool = False,
-        validate_placement: bool = False,
-        qat_config: Optional[Any] = None,
-        fp8_config: Optional[Any] = None,
-        compile_config: Optional[Union[CompileConfig, dict]] = None,
-        freeze_config: Optional[Any] = None,
-        activation_checkpoint: Optional[str] = None,
-        swap_inputs: bool = False,
-        allow_cache_entry_mutation: bool = False,
-        activation_swap: str = "none",
+        cls, pretrained_model_name_or_path: str, *model_args: Any,
+        distributed_setup: Optional[DistributedSetup] = None, backend: Optional[Any] = None,
+        peft_config: Optional[Any] = None, torch_dtype: Union[str, torch.dtype] = "auto",
+        attn_implementation: str = "sdpa", force_hf: bool = False,
+        validate_placement: bool = False, qat_config: Optional[Any] = None, fp8_config: Optional[Any] = None,
+        compile_config: Optional[Union[CompileConfig, dict]] = None, freeze_config: Optional[Any] = None,
+        activation_checkpoint: Optional[str] = None, swap_inputs: bool = False,
+        allow_cache_entry_mutation: bool = False, activation_swap: str = "none",
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
-        codegen_artifact_dir: Optional[str] = None,
-        codegen: bool = False,
-        config_overrides: Optional[dict[str, Any]] = None,
-        load_base_model: bool = True,
-        codegen_config: Optional[Any] = None,
-        **kwargs: Any,
+        codegen_artifact_dir: Optional[str] = None, codegen: bool = False,
+        config_overrides: Optional[dict[str, Any]] = None, load_base_model: bool = True,
+        verify_hf_weights: Optional[str] = None, codegen_config: Optional[Any] = None, **kwargs: Any,
     ) -> PreTrainedModel:
         """HF-compatible from_pretrained entry point.
 
@@ -286,6 +293,8 @@ class _BaseHyperAutoModelClass:
         Args:
             pretrained_model_name_or_path: HF checkpoint path or model identifier.
             *model_args: Positional arguments for model construction.
+            verify_hf_weights: Optional report directory for checking all loaded shards
+                against a local HF checkpoint before the first forward. All ranks must opt in.
             **kwargs: Additional model construction and HF configuration arguments.
 
         Returns:
@@ -298,6 +307,7 @@ class _BaseHyperAutoModelClass:
         ④ get_is_hf_model → custom/HF path
         ⑤ _build_model → meta + shard + load
         """
+        _validate_weight_check_options(verify_hf_weights, load_base_model)
         if distributed_setup is None:
             distributed_setup = DistributedSetup()
         mesh = distributed_setup.mesh_context
@@ -310,10 +320,8 @@ class _BaseHyperAutoModelClass:
         )
 
         # ③ Get HF config
-        config_kwargs = dict(kwargs)
-        config_kwargs.update(config_overrides or {})
-        hf_config = get_hf_config(
-            pretrained_model_name_or_path, attn_implementation, torch_dtype, **config_kwargs
+        hf_config = _load_pretrained_config(
+            pretrained_model_name_or_path, attn_implementation, torch_dtype, config_overrides, kwargs,
         )
         # ④ Determine model path
         is_hf_model = get_is_hf_model(hf_config, force_hf)
@@ -332,7 +340,7 @@ class _BaseHyperAutoModelClass:
                 )
 
         # ⑤ Build model
-        return cls._build_model(
+        model = cls._build_model(
             pretrained_model_name_or_path,
             *model_args,
             is_hf_model=is_hf_model,
@@ -359,6 +367,10 @@ class _BaseHyperAutoModelClass:
             codegen_artifact_dir=codegen_artifact_dir,
             **kwargs,
         )
+        if verify_hf_weights is not None:
+            check_hf_weights(model, pretrained_model_name_or_path, verify_hf_weights,
+                             phase="after_load_before_first_forward")
+        return model
 
     @classmethod
     def from_config(  # pylint: disable=unused-argument
