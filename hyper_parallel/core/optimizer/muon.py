@@ -78,6 +78,9 @@ class MuonPostUpdateContext:
 _MUON_ADVANCED_DEFAULTS: Dict[str, Any] = {
     "ns_coefficients": None,
     "ns_epsilon": 1e-10,
+    "ns_input_dtype": "bfloat16",
+    "ns_compute_dtype": None,
+    "ns_epsilon_mode": "add",
     "zeropower_fn": None,
     "momentum_update_fn": None,
     "reshape_fn": None,
@@ -94,6 +97,9 @@ class _MuonAdvancedOptions:
 
     ns_coefficients: Optional[Sequence[Tuple[float, float, float]]]
     ns_epsilon: float
+    ns_input_dtype: str
+    ns_compute_dtype: Optional[str]
+    ns_epsilon_mode: str
     zeropower_fn: Optional[Callable[..., torch.Tensor]]
     momentum_update_fn: Optional[Callable[..., torch.Tensor]]
     reshape_fn: Optional[Callable[..., Any]]
@@ -114,6 +120,7 @@ def _resolve_muon_advanced_options(options: Dict[str, Any]) -> _MuonAdvancedOpti
 
 
 _TransformNSState = Dict[str, Any]
+_NS_DTYPES = {"bfloat16": torch.bfloat16, "float32": torch.float32}
 
 
 def zeropower_via_newtonschulz5(
@@ -122,15 +129,36 @@ def zeropower_via_newtonschulz5(
         ns_variant: str = "asym5",
         epsilon: float = 1e-10,
         ns_coefficients: Optional[Sequence[Tuple[float, float, float]]] = None,
+        compute_dtype: Optional[torch.dtype] = None,
+        epsilon_mode: str = "add",
 ) -> torch.Tensor:
-    """Newton-Schulz orthogonalization with preallocated matmul buffers."""
+    """Normalize in the input dtype and iterate and return in ``compute_dtype``.
+
+    Args:
+        ns_inputs: One matrix or a batch of logical matrices.
+        steps: Number of polynomial iterations.
+        ns_variant: Built-in or custom coefficient schedule.
+        epsilon: Stability term for each matrix's Frobenius norm.
+        ns_coefficients: Coefficients for the custom schedule.
+        compute_dtype: Iteration dtype; None retains the normalization dtype.
+        epsilon_mode: Add epsilon to the norm, or clamp the norm from below.
+
+    Returns:
+        The orthogonalized direction in the input shape and iteration dtype.
+    """
+    if epsilon_mode not in ("add", "clamp"):
+        raise ValueError(f"epsilon_mode must be 'add' or 'clamp', got {epsilon_mode!r}")
     mat_x = ns_inputs
     transposed = ns_inputs.size(-2) > ns_inputs.size(-1)
     if transposed:
         mat_x = mat_x.mT
 
     # Normalize input before Newton-Schulz iteration.
-    mat_x = mat_x / (mat_x.norm(dim=(-2, -1), keepdim=True) + epsilon)
+    norm = mat_x.norm(dim=(-2, -1), keepdim=True)
+    denominator = norm + epsilon if epsilon_mode == "add" else norm.clamp_min(epsilon)
+    mat_x = mat_x / denominator
+    if compute_dtype is not None:
+        mat_x = mat_x.to(compute_dtype)
 
     n_size = mat_x.size(-2)
     buf_a = torch.empty(mat_x.shape[:-2] + (n_size, n_size), dtype=mat_x.dtype, device=mat_x.device)
@@ -223,6 +251,12 @@ class Muon(BaseDistributedOptimizer):
             ns_variant: Newton-Schulz coefficient variant.
             ns_coefficients: Optional custom Newton-Schulz coefficients.
             ns_epsilon: Numerical stability term used during normalization.
+            ns_input_dtype: Dtype of momentum-derived NS inputs, normalization,
+                and the buffers used to restore and communicate updates.
+            ns_compute_dtype: Dtype of built-in NS iterations; None uses the
+                input dtype. Shape and optional learning-rate scaling use the
+                iteration dtype before copying into the NS input buffers.
+            ns_epsilon_mode: Add epsilon to the norm or clamp it from below.
             zeropower_fn: Optional Newton-Schulz implementation override.
             momentum_update_fn: Optional momentum update implementation override.
             reshape_fn: Optional logical-matrix reshape function.
@@ -239,6 +273,16 @@ class Muon(BaseDistributedOptimizer):
             )
         if advanced.ns_epsilon < 0.0 or not math.isfinite(advanced.ns_epsilon):
             raise ValueError(f"ns_epsilon must be a finite non-negative value, got {advanced.ns_epsilon}")
+        if advanced.ns_input_dtype not in _NS_DTYPES:
+            raise ValueError(f"ns_input_dtype must be bfloat16 or float32, got {advanced.ns_input_dtype!r}")
+        if advanced.ns_compute_dtype is not None and advanced.ns_compute_dtype not in _NS_DTYPES:
+            raise ValueError(f"ns_compute_dtype must be bfloat16, float32 or None, got {advanced.ns_compute_dtype!r}")
+        if advanced.ns_epsilon_mode not in ("add", "clamp"):
+            raise ValueError(f"ns_epsilon_mode must be 'add' or 'clamp', got {advanced.ns_epsilon_mode!r}")
+        if advanced.zeropower_fn is not None and (
+                advanced.ns_input_dtype != "bfloat16" or advanced.ns_compute_dtype is not None
+                or advanced.ns_epsilon_mode != "add"):
+            raise ValueError("Explicit NS precision and epsilon mode require the built-in zeropower function")
         if advanced.zero_rms_scale_mode not in ("zero", "use_lr"):
             raise ValueError(
                 "zero_rms_scale_mode must be 'zero' or 'use_lr', "
@@ -261,6 +305,9 @@ class Muon(BaseDistributedOptimizer):
             "ns_variant": ns_variant,
             "ns_coefficients": normalized_coefficients,
             "ns_epsilon": advanced.ns_epsilon,
+            "ns_input_dtype": advanced.ns_input_dtype,
+            "ns_compute_dtype": advanced.ns_compute_dtype,
+            "ns_epsilon_mode": advanced.ns_epsilon_mode,
             "zero_rms_scale_mode": advanced.zero_rms_scale_mode,
             "apply_lr_in_update": advanced.apply_lr_in_update,
         }
@@ -493,7 +540,8 @@ class Muon(BaseDistributedOptimizer):
             group: Dict[str, Any],
             params: List[torch.Tensor],
     ) -> Dict[torch.nn.Parameter, torch.Tensor]:
-        """Compute first-order momentum and return bfloat16 NS inputs."""
+        """Compute first-order momentum before casting to the selected NS input dtype."""
+        input_dtype = _NS_DTYPES[group.get("ns_input_dtype", "bfloat16")]
         momentum = group["momentum"]
         if not isinstance(momentum, (list, tuple)):
             momentum = [momentum]
@@ -526,7 +574,7 @@ class Muon(BaseDistributedOptimizer):
                     "momentum_update_fn must return one update tensor per input gradient, "
                     f"got {len(custom_updates)} updates for {len(valid_params)} gradients"
                 )
-            custom_updates = [update.to(torch.bfloat16) for update in custom_updates]
+            custom_updates = [update.to(input_dtype) for update in custom_updates]
             param_updates = dict(zip(valid_params, custom_updates))
             return param_updates
 
@@ -543,8 +591,7 @@ class Muon(BaseDistributedOptimizer):
             torch._foreach_mul_(local_us, momentum1)
             torch._foreach_add_(local_us, grads)
 
-        if local_us[0].dtype != torch.bfloat16:
-            local_us = [update.to(torch.bfloat16) for update in local_us]
+        local_us = [update.to(input_dtype) for update in local_us]
 
         param_updates = dict(zip(valid_params, local_us))
         return param_updates
@@ -624,6 +671,7 @@ class Muon(BaseDistributedOptimizer):
             valid_params,
             param_to_ns_input,
             self._param_shard_metadata,
+            dtype=_NS_DTYPES[group.get("ns_input_dtype", "bfloat16")],
         )
         param_shard_metadata = [self._param_shard_metadata.get(p) for p in valid_params]
         gathered_list = fused_allgather_dtensor_params(
@@ -822,6 +870,8 @@ class Muon(BaseDistributedOptimizer):
             ns_variant: str = "asym5",
             ns_coefficients: Optional[Sequence[Tuple[float, float, float]]] = None,
             ns_epsilon: float = 1e-10,
+            ns_compute_dtype: Optional[str] = None,
+            ns_epsilon_mode: str = "add",
     ) -> List[torch.Tensor]:
         """Run batched NS on mixed-shape tensors and restore their original shapes."""
 
@@ -864,6 +914,8 @@ class Muon(BaseDistributedOptimizer):
                 ns_variant=ns_variant,
                 epsilon=ns_epsilon,
                 ns_coefficients=ns_coefficients,
+                compute_dtype=_NS_DTYPES[ns_compute_dtype] if ns_compute_dtype is not None else None,
+                epsilon_mode=ns_epsilon_mode,
             )
         else:
             merged_update = self.zeropower_fn(merged_input, steps=ns_steps)
@@ -963,7 +1015,9 @@ class Muon(BaseDistributedOptimizer):
                 )
         for tensor_list in state["reshape_groups"].values():
             updates = self._compute_batched_ns_outputs_for_tensors(
-                tensor_list, group["ns_steps"], group["ns_variant"], group["ns_coefficients"], group["ns_epsilon"]
+                tensor_list, group["ns_steps"], group["ns_variant"], group["ns_coefficients"], group["ns_epsilon"],
+                ns_compute_dtype=group.get("ns_compute_dtype"),
+                ns_epsilon_mode=group.get("ns_epsilon_mode", "add"),
             )
             for reshaped_input, update in zip(tensor_list, updates):
                 scale = compute_muon_slice_scale(
@@ -1029,6 +1083,8 @@ class Muon(BaseDistributedOptimizer):
                 ns_variant=group["ns_variant"],
                 ns_coefficients=group["ns_coefficients"],
                 ns_epsilon=group["ns_epsilon"],
+                ns_compute_dtype=group.get("ns_compute_dtype"),
+                ns_epsilon_mode=group.get("ns_epsilon_mode", "add"),
             )
 
             # Scale updates.
@@ -1082,7 +1138,8 @@ class Muon(BaseDistributedOptimizer):
         all_update_shards: List[torch.Tensor] = []
 
         alignment_bytes = 512
-        element_size = torch.empty(0, dtype=torch.bfloat16, device=device).element_size()
+        update_dtype = _NS_DTYPES[group.get("ns_input_dtype", "bfloat16")]
+        element_size = torch.empty(0, dtype=update_dtype, device=device).element_size()
         alignment_elements = max(1, alignment_bytes // element_size)
 
         pack_buffers: Dict[Tuple[int, ...], torch.Tensor] = {}
@@ -1100,7 +1157,7 @@ class Muon(BaseDistributedOptimizer):
                 total_padded_numel += padded_numel
 
             coord_param_offsets[coord] = param_offsets
-            pack_buffer = torch.empty(total_padded_numel, dtype=torch.bfloat16, device=device)
+            pack_buffer = torch.empty(total_padded_numel, dtype=update_dtype, device=device)
 
             if is_compute_rank:
                 for p, (offset, actual_numel, padded_numel) in zip(coord_params, param_offsets):
