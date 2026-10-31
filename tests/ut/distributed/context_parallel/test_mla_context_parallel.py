@@ -97,8 +97,41 @@ class TestMLAContextParallel(unittest.TestCase):
         query = torch.empty(1, 2, 4096, 8)
         context = _prepare_fusion_attention_context(torch.nn.Module(), query, query, query, None, {})
         self.assertEqual(context.attention_mask.shape, (2048, 2048))
-        self.assertEqual(context.sparse_mode, 3)
+        self.assertEqual(context.sparse_mode, 2)
         self.assertIsNone(context.valid_rows)
+
+    def test_padding_mask_broadcasts_in_window_fallback(self) -> None:
+        """Keep batch and key axes distinct when padding cannot use the TND path."""
+        query = torch.empty(2, 2, 4, 8)
+        padding = torch.tensor([[1, 0, 1, 0], [1, 1, 0, 0]])
+        for options in ({"sliding_window": 2}, {"pre_tokens": 2}, {"is_causal": False}):
+            for dtype in (torch.bool, torch.int64):
+                with self.subTest(options=options, dtype=dtype):
+                    context = _prepare_fusion_attention_context(
+                        torch.nn.Module(), query, query, query, padding.to(dtype), options,
+                    )
+                    allowed = padding.bool()[:, None, None, :].expand(-1, 1, 4, -1)
+                    if options.get("is_causal", True):
+                        causal = torch.ones(4, 4, dtype=torch.bool).tril()
+                        if "sliding_window" in options:
+                            causal &= torch.ones(4, 4, dtype=torch.bool).triu(diagonal=-1)
+                        elif "pre_tokens" in options:
+                            causal &= torch.ones(4, 4, dtype=torch.bool).triu(diagonal=-2)
+                        allowed = allowed & causal
+                    torch.testing.assert_close(context.valid_rows, allowed.any(dim=-1))
+                    blocked = ~allowed
+                    blocked[..., 0] &= context.valid_rows
+                    torch.testing.assert_close(context.attention_mask, blocked)
+                    self.assertEqual(context.input_layout, "BNSD")
+                    self.assertEqual(context.sparse_mode, 0)
+        for options in ({"pre_tokens": 2}, {"sliding_window": 3}):
+            without_mask = _prepare_fusion_attention_context(torch.nn.Module(), query, query, query, None, options)
+            all_valid = _prepare_fusion_attention_context(
+                torch.nn.Module(), query, query, query, torch.ones_like(padding), options,
+            )
+            torch.testing.assert_close(
+                without_mask.attention_mask.expand_as(all_valid.attention_mask), all_valid.attention_mask,
+            )
 
     def test_projection_preserves_module_hooks_and_parameter_identity(self) -> None:
         """
