@@ -532,10 +532,12 @@ class HSDPSchedulerV2:
     def _root_backward_hook(self):
         """Drain all DP pipelines, then run final TP reduction and apply gradients."""
         logger.debug("hook=root_backward_hook enter module=%s", self.hsdp_state)
-        self.check_state_prefetch_handles_consumed()
         for hsdp_scheduler in self.scheduler_ctx.all_hsdp_schedulers:
             # let modules which are not triggered backward_hook launch backward communication.
             hsdp_scheduler._backward_hook()
+        # Keep pending gradient reductions in flight while unused parameter
+        # prefetches finish, rather than delaying their launch on those waits.
+        self._finalize_unused_prefetches()
         self.scheduler_ctx.root_bp_state = False
         with torch.profiler.record_function(f"root_backward reduce:{self.hsdp_state.module_name}"):
             logger.debug(
@@ -545,6 +547,41 @@ class HSDPSchedulerV2:
             self._finalize_comm_fusion_reductions()
             self._finalize_per_param_reductions()
             self.launch_tp_replicate_reduce_and_apply()
+
+    def _finalize_unused_prefetches(self) -> None:
+        """Wait and release unused all-gathers after autograd has finished.
+
+        A module used in forward need not participate in this backward. Its
+        speculative prefetch may therefore have no pre-backward consumer.
+        """
+        for scheduler in self.scheduler_ctx.all_hsdp_schedulers:
+            state = scheduler.hsdp_state
+            if state is None:
+                continue
+            for param in state.hsdp_params:
+                context = param.allgather_comm_ctx
+                if context.allgather_handle is None and context.allgather_output is None:
+                    continue
+                with profiler_record(f"finalize_unused_prefetch param:{param}"):
+                    if context.allgather_handle is not None:
+                        context.allgather_handle.wait()
+                        context.allgather_handle = None
+                    context.allgather_output = None
+                    if state.is_shard and param.shard_world_size > 1:
+                        param.free_unsharded_param()
+            if state.param_group is not None:
+                for bucket in state.param_group.all_gather_buckets:
+                    result = bucket.all_gather_result
+                    if result is None:
+                        continue
+                    param_fqns = ", ".join(str(param) for param in bucket.hsdp_params)
+                    with profiler_record(f"finalize_unused_prefetch bucket:{state.module_name}:{param_fqns}"):
+                        if result.handle is not None:
+                            result.handle.wait()
+                            result.handle = None
+                        result.all_gather_input = None
+                        result.all_gather_output = None
+                        bucket.all_gather_result = None
 
     def check_state_prefetch_handles_consumed(self) -> None:
         """Check that all parameters in the module tree consumed their prefetch work.
