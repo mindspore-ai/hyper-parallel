@@ -58,11 +58,11 @@ from hyper_parallel.codegen.meta import (
 )
 from hyper_parallel.codegen.snapshot import CodegenSnapshot, CodegenStatus
 from hyper_parallel.codegen.source.resolver import resolve_remote_siblings
-from hyper_parallel.models.registry import family_dir_for_model_type
+from hyper_parallel.models.registry import artifact_model_type, family_dir_for_model_type
 
 logger = logging.getLogger(__name__)
 
-CODEGEN_VERSION = "0.1.1"
+CODEGEN_VERSION = "0.1.2"
 
 
 def ensure_codegen_artifact_from_snapshot(
@@ -88,8 +88,9 @@ def ensure_codegen_artifact_from_snapshot(
     if not source.get("file_path"):
         raise ValueError("snapshot source must include a modeling file_path")
     model_type = source.get("model_type")
+    public_model_type = artifact_model_type(str(model_type)) if model_type else None
     model_name = (
-        _model_type_to_modeling_token(str(model_type))
+        _model_type_to_modeling_token(str(public_model_type))
         if model_type
         else source.get("architecture")
     )
@@ -181,7 +182,7 @@ def _build_meta_from_snapshot(
         source=source,
         parallel_dims=dict(frozen_plan.get("parallel_dims") or {}),
         model_name=(
-            _model_type_to_modeling_token(str(source["model_type"]))
+            _model_type_to_modeling_token(artifact_model_type(str(source["model_type"])))
             if source.get("model_type")
             else source.get("architecture")
         ),
@@ -192,6 +193,8 @@ def _build_meta_from_snapshot(
         tied_pairs=list(frozen_plan.get("tied_pairs") or ()),
         special_handlers=dict(frozen_plan.get("special_handlers") or {}),
         boundary_classes=dict(frozen_plan.get("boundary_classes") or {}),
+        boundary_types=dict(frozen_plan.get("boundary_types") or {}),
+        nested_components=list(frozen_plan.get("nested_components") or ()),
         mesh_dim_names=list(frozen_plan.get("mesh_dim_names") or ()) or None,
         module_overrides=(module_overrides if is_derived else []),
         emission_patches=emission_patches,
@@ -232,6 +235,7 @@ def _snapshot_emission_patches(payload: dict[str, Any]) -> dict[str, Any]:
     application = payload.get("plan_application") or {}
     injections = application.get("resolved_injections") or plan.get("injections") or ()
     boundary_classes = plan.get("boundary_classes") or {}
+    boundary_types = plan.get("boundary_types") or {}
     param_plan = plan.get("param_plan") or {}
     local_computes = []
     inner_wrappers = []
@@ -243,6 +247,14 @@ def _snapshot_emission_patches(payload: dict[str, Any]) -> dict[str, Any]:
             f"{module_name}:{class_name}" if module_name and class_name else None
         )
         source_module_type = _source_type_identity(source, class_name)
+        observed_boundary_type = boundary_types.get(module_fqn)
+        if (
+            source_module_type is None
+            and isinstance(observed_boundary_type, str)
+            and not observed_boundary_type.startswith("hyper_parallel.")
+            and not observed_boundary_type.startswith("torch.")
+        ):
+            source_module_type = observed_boundary_type
         bound_forward = _bound_forward_identity(source, module_fqn)
         local_compute = injection.get("local_compute_fn")
         if local_compute is not None:
@@ -513,7 +525,10 @@ def preflight_integrity_check(
 
 def should_regenerate(meta: CodegenMeta, signature: str) -> bool:
     """Whether the stored meta no longer matches the current signature."""
-    return meta.signature != signature
+    return (
+        meta.signature != signature
+        or getattr(meta, "codegen_version", None) != CODEGEN_VERSION
+    )
 
 
 def wait_for_rank0_artifact(
@@ -545,7 +560,7 @@ def wait_for_rank0_artifact(
                 + (f": {reason}" if reason else "")
             )
         meta = load_codegen_meta(layout.meta_path)
-        if meta is not None and meta.signature == current_signature:
+        if meta is not None and not should_regenerate(meta, current_signature):
             return
         time.sleep(0.5)
     raise TimeoutError(

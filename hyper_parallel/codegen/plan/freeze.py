@@ -278,6 +278,8 @@ class FrozenPlan:
     special_handlers: dict[str, str] = field(default_factory=dict)
     frozen_sharded_params: list[str] = field(default_factory=list)
     boundary_classes: dict[str, str] = field(default_factory=dict)
+    boundary_types: dict[str, str] = field(default_factory=dict)
+    nested_components: list[dict[str, str]] = field(default_factory=list)
     mesh_dim_names: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
@@ -303,6 +305,8 @@ def freeze_plan(plan: Any, model: Any) -> FrozenPlan:
         special_handlers=dict(getattr(plan, "special_handlers", {}) or {}),
         frozen_sharded_params=expand_frozen_sharded_params(plan),
         boundary_classes=_freeze_boundary_classes(plan, model),
+        boundary_types=_freeze_boundary_types(plan, model),
+        nested_components=_freeze_nested_components(plan, model),
         mesh_dim_names=tuple(getattr(plan, "mesh_dim_names", ()) or ()),
     )
 
@@ -401,6 +405,66 @@ def _freeze_boundary_classes(plan: Any, model: Any) -> dict[str, str]:
         cls = type(model.get_submodule(fqn)).__name__
         result[fqn] = cls
     return result
+
+
+def _freeze_boundary_types(plan: Any, model: Any) -> dict[str, str]:
+    """Map every boundary FQN to its importable ``module:qualname`` identity.
+
+    Class names are enough only while every boundary is defined by the primary
+    modeling source. Multimodal models may construct a nested text model via
+    ``AutoModel``; preserving the defining module lets artifact emission find
+    and materialize that source without teaching the generic planner about the
+    model family.
+    """
+    if model is None:
+        return {}
+    result: dict[str, str] = {}
+    for fqn in (getattr(plan, "modules", {}) or {}):
+        module_type = type(model.get_submodule(fqn))
+        result[fqn] = f"{module_type.__module__}:{module_type.__qualname__}"
+    return result
+
+
+def _freeze_nested_components(plan: Any, model: Any) -> list[dict[str, str]]:
+    """Record external model roots that own planned boundary implementations.
+
+    A Kimi-style multimodal model may construct its language model through
+    ``AutoModel``. The shallowest ancestor sharing a boundary's defining
+    module is the nested source root that artifact emission must inline.
+    Ordinary framework containers between that root and the boundary do not
+    affect the choice.
+    """
+    if model is None:
+        return []
+    root_type = type(model)
+    root_module = root_type.__module__
+    components: dict[tuple[str, str], dict[str, str]] = {}
+    for boundary_fqn in (getattr(plan, "modules", {}) or {}):
+        boundary_type = type(model.get_submodule(boundary_fqn))
+        owner_module = boundary_type.__module__
+        if (
+            owner_module == root_module
+            or owner_module.startswith("torch.")
+            or owner_module.startswith("hyper_parallel.")
+        ):
+            continue
+        parts = boundary_fqn.split(".")
+        candidates = []
+        for index in range(1, len(parts) + 1):
+            ancestor_fqn = ".".join(parts[:index])
+            ancestor_type = type(model.get_submodule(ancestor_fqn))
+            if ancestor_type.__module__ == owner_module:
+                candidates.append((ancestor_fqn, ancestor_type))
+        if not candidates:
+            continue
+        component_fqn, component_type = candidates[0]
+        identity = f"{component_type.__module__}:{component_type.__qualname__}"
+        components[(component_fqn, identity)] = {
+            "fqn": component_fqn,
+            "type": identity,
+            "owner_module": owner_module,
+        }
+    return [components[key] for key in sorted(components)]
 
 
 def freeze_param_plan(plan: Any) -> dict[str, dict[str, Any]]:

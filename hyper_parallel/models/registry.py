@@ -127,6 +127,13 @@ _FAMILY_DIR_ALIASES = {
     "kimik25": "kimi_k26",
 }
 
+# A provider directory normally does not rename the copied upstream modeling
+# source. K2.6 is the exception: the checkpoint intentionally retains the K2.5
+# protocol, while the exported artifact represents the K2.6 family.
+_ARTIFACT_MODEL_TYPE_ALIASES = {
+    "kimik25": "kimi_k26",
+}
+
 
 def family_dir_for_model_type(model_type: str) -> str:
     """Map an HF ``model_type`` onto the library family directory name.
@@ -140,6 +147,12 @@ def family_dir_for_model_type(model_type: str) -> str:
     """
     key = str(model_type).replace("_", "").replace("-", "").lower()
     return _FAMILY_DIR_ALIASES.get(key, model_type)
+
+
+def artifact_model_type(model_type: str) -> str:
+    """Return the public model identity used in generated artifact filenames."""
+    key = str(model_type).replace("_", "").replace("-", "").lower()
+    return _ARTIFACT_MODEL_TYPE_ALIASES.get(key, model_type)
 
 # normalized family directory name → registration module path; built lazily.
 _DISCOVERED_PROVIDERS: Optional[Dict[str, str]] = None

@@ -34,6 +34,8 @@ import os
 import tokenize
 from typing import Any
 
+from hyper_parallel.codegen.source.composition import compose_nested_model_sources
+
 # ---------------------------------------------------------------------------
 # source copy
 # ---------------------------------------------------------------------------
@@ -263,6 +265,7 @@ def emit_modeling_file(meta: Any, *, patch_plan: Any = None) -> str:
         else getattr(meta.source, "module_name", "")
     )
     text = rewrite_relative_imports(text, module_name)
+    text = compose_nested_model_sources(text, meta)
     text = _apply_inline_modeling(text, meta, patch_plan=patch_plan)
     from hyper_parallel.codegen.emit.recorded import materialize_recorded_forwards
 
@@ -275,7 +278,11 @@ def emit_modeling_file(meta: Any, *, patch_plan: Any = None) -> str:
         text,
         meta,
         patch_plan=patch_plan,
-        source_path=source_path,
+        source_path=(
+            None
+            if getattr(meta, "nested_components", None)
+            else source_path
+        ),
     )
     text = _lower_forward_boundaries(text, meta, module_name)
     _verify_recorded_patch_materialization(text, meta, patch_plan=patch_plan)

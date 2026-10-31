@@ -171,7 +171,11 @@ def test_snapshot_manager_reuses_matching_signature(monkeypatch, tmp_path):
     source.write_text("class ToyModel:\n    pass\n", encoding="utf-8")
     snapshot = _snapshot(source)
     signature = manager.signature_from_snapshot(snapshot)
-    existing = type("Meta", (), {"signature": signature})()
+    existing = type(
+        "Meta",
+        (),
+        {"signature": signature, "codegen_version": manager.CODEGEN_VERSION},
+    )()
     calls = {"barrier": 0}
 
     monkeypatch.setattr(manager, "_is_rank0", lambda: True)
@@ -544,7 +548,11 @@ def test_snapshot_manager_normalizes_deepseek_v4_family(monkeypatch, tmp_path):
     monkeypatch.setattr(
         manager,
         "load_codegen_meta",
-        lambda _path: type("Meta", (), {"signature": signature})(),
+        lambda _path: type(
+            "Meta",
+            (),
+            {"signature": signature, "codegen_version": manager.CODEGEN_VERSION},
+        )(),
     )
     monkeypatch.setattr(manager, "barrier_after_artifact", lambda: None)
 
@@ -584,7 +592,12 @@ def test_snapshot_layout_uses_model_type_token_instead_of_architecture(
         manager,
         "load_codegen_meta",
         lambda _path: type(
-            "Meta", (), {"signature": manager.signature_from_snapshot(snapshot)}
+            "Meta",
+            (),
+            {
+                "signature": manager.signature_from_snapshot(snapshot),
+                "codegen_version": manager.CODEGEN_VERSION,
+            },
         )(),
     )
     monkeypatch.setattr(manager, "barrier_after_artifact", lambda: None)

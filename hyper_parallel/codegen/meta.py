@@ -54,6 +54,11 @@ class CodegenMeta:
     #: FQN -> owning class name for every boundary. The emitter
     #: groups boundary FQNs by this to rewrite one ``class.forward`` per class.
     boundary_classes: dict[str, str] = field(default_factory=dict)
+    #: FQN -> importable ``module:qualname`` identity. Unlike the short class
+    #: map, this can locate boundaries owned by a nested AutoModel source.
+    boundary_types: dict[str, str] = field(default_factory=dict)
+    #: Nested model roots whose owning source contains planned boundaries.
+    nested_components: list[dict[str, str]] = field(default_factory=list)
     entrypoints: dict[str, str] = field(default_factory=dict)
     #: Replacements owned by generated source. Runtime-owned replacement
     #: observations live in ``emission_patches`` instead, leaving this empty.
@@ -230,6 +235,19 @@ def validate_meta_schema(data: dict[str, Any]) -> None:
             isinstance(item, str) for item in siblings
         ):
             raise TypeError("codegen_meta field 'remote_siblings' must be a list[str]")
+    if "boundary_types" in data:
+        boundary_types = data["boundary_types"]
+        if not isinstance(boundary_types, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in boundary_types.items()
+        ):
+            raise TypeError("codegen_meta field 'boundary_types' must be a dict[str, str]")
+    if "nested_components" in data:
+        components = data["nested_components"]
+        if not isinstance(components, list) or not all(
+            isinstance(item, dict) for item in components
+        ):
+            raise TypeError("codegen_meta field 'nested_components' must be a list[dict]")
     if "external_state_classes" in data:
         class_names = data["external_state_classes"]
         if not isinstance(class_names, list) or not all(
@@ -259,6 +277,8 @@ def validate_snapshot_state_contract(data: dict[str, Any]) -> None:
         "tied_pairs",
         "special_handlers",
         "boundary_classes",
+        "boundary_types",
+        "nested_components",
         "mesh_dim_names",
     )
     has_plan_data = any(data.get(name) for name in plan_fields)

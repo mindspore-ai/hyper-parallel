@@ -118,7 +118,7 @@ class _TrainingConfig:
 
 def _meta(signature: str = "sig-current") -> CodegenMeta:
     return CodegenMeta(
-        codegen_version="3",
+        codegen_version=manager.CODEGEN_VERSION,
         signature=signature,
         yaml_path="train.yaml",
         yaml_sha256="yaml-sha",
