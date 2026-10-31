@@ -69,6 +69,7 @@ def mhc_post(
     h_post: torch.Tensor,
     h_res: torch.Tensor,
     num_stream: int,
+    use_fused: bool = True,
 ) -> torch.Tensor:
     """Combine transformed and residual streams after an MHC-wrapped block.
 
@@ -78,13 +79,14 @@ def mhc_post(
         h_post: Per-stream output mixing coefficients.
         h_res: Residual stream mixing matrix.
         num_stream: Number of residual streams.
+        use_fused: Allow the fused NPU implementation when available.
 
     Returns:
         Flattened mixed residual streams.
     """
     x_shape = x.size()
     residual = residual.reshape(x_shape[0], x_shape[1], num_stream, -1)
-    if x.device.type == "npu" and omni_training_custom_ops is not None:
+    if use_fused and x.device.type == "npu" and omni_training_custom_ops is not None:
         return _MhcPost.apply(residual, h_res, x, h_post).flatten(2)
     output = h_post.unsqueeze(-1) * x.unsqueeze(-2)
     output = output + torch.sum(
