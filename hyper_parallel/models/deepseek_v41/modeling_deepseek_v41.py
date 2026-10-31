@@ -418,6 +418,7 @@ class DeepseekV41Compressor(nn.Module):
         if compress_ratio < 1:
             raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
         self.compress_ratio = compress_ratio
+        self.use_fused_rope = False
         self.wkv = nn.Linear(config.hidden_size, config.head_dim, bias=False)
         if compress_ratio > 1:
             self.wgate = nn.Linear(config.hidden_size, config.head_dim, bias=False)
@@ -442,14 +443,16 @@ class DeepseekV41Compressor(nn.Module):
         if self.compress_ratio == 1:
             latent = self.norm(self.wkv(hidden_states))
             cos, sin = compress_position_embeddings
-            rotated = _apply_v41_rope(latent.unsqueeze(1), cos, sin).squeeze(1)
+            rotated = _apply_v41_rope(
+                latent.unsqueeze(1), cos, sin, use_fused_rope=self.use_fused_rope,
+            ).squeeze(1)
             return latent, rotated
 
         if block_plan is not None:
             latent = self.norm(block_plan.pool(self.wkv(hidden_states), self.wgate(hidden_states), cp_context))
             cos, sin = compress_position_embeddings
             return latent, _apply_v41_rope(
-                latent.unsqueeze(1), cos, sin,
+                latent.unsqueeze(1), cos, sin, use_fused_rope=self.use_fused_rope,
             ).squeeze(1)
 
         usable = sequence_length - sequence_length % self.compress_ratio
@@ -461,7 +464,9 @@ class DeepseekV41Compressor(nn.Module):
         cos, sin = compress_position_embeddings
         cos = cos[:, :usable:self.compress_ratio]
         sin = sin[:, :usable:self.compress_ratio]
-        rotated = _apply_v41_rope(latent.unsqueeze(1), cos, sin).squeeze(1)
+        rotated = _apply_v41_rope(
+            latent.unsqueeze(1), cos, sin, use_fused_rope=self.use_fused_rope,
+        ).squeeze(1)
         return latent, rotated
 
 

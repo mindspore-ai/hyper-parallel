@@ -19,10 +19,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import torch
+
 from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import (
     build_deepseek_v41_validation_config,
 )
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41ForCausalLM
+from hyper_parallel.tools.model_integration.integration_validator import resolve_model_validation_spec
 from tests.common.mark_utils import arg_mark
 
 
@@ -257,6 +260,70 @@ class TestDeepseekV41ValidationCrop(unittest.TestCase):
         self.assertEqual(config.v41_candidate_topk_blocks, 0)
         self.assertEqual(config.v41_engram_layer_ids, [1, 14])
         self.assertFalse(hasattr(config, "v41_validation_reindex_remap"))
+
+    def test_shared_state_requirements_follow_retained_layer_roles(self):
+        """Resolve shared-state requirements from actual cropped model roles.
+
+        Feature: Runtime shared-state contracts for configurable depth crops.
+        Description: Resolve real meta models with SWA, Full, Reuse, and Reindex layers.
+        Expectation: Each crop requires only the producer and consumer roles it retains.
+        """
+        full_keys = ("compressed_kv", "index_key", "topk_indices")
+        reuse_keys = ("compressed_kv", "topk_indices")
+        candidate_keys = full_keys + ("candidate_blocks",)
+        cases = (
+            (2, False, (), ()),
+            (4, False, full_keys, reuse_keys),
+            (24, True, candidate_keys, reuse_keys),
+            (40, False, full_keys, full_keys),
+            (40, True, candidate_keys, candidate_keys),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            _write_released_config(directory)
+            assets_path = _write_engram_assets(
+                directory, num_hidden_layers=40, layer_ids=(1,), head_dim=8
+            )
+            for depth, candidates, producer_keys, consumer_keys in cases:
+                with self.subTest(depth=depth, candidates=candidates):
+                    config = build_deepseek_v41_validation_config(
+                        directory, str(assets_path), num_hidden_layers=depth,
+                        text_parameter_divisor=4, exercise_post_training_indexer=False,
+                        enable_candidate_pool=candidates,
+                    )
+                    # Engram hashing reads tensor values during initialization, which meta tensors cannot supply.
+                    config.v41_engram_layer_ids = []
+                    with torch.device("meta"):
+                        model = DeepseekV41ForCausalLM(config)
+
+                    shared_state = resolve_model_validation_spec(model).shared_state
+
+                    self.assertEqual(shared_state.producer_keys, producer_keys)
+                    self.assertEqual(shared_state.consumer_keys, consumer_keys)
+
+    def test_shared_state_requirements_reject_missing_configured_indexer(self):
+        """Reject missing model roles before collecting runtime trace evidence.
+
+        Feature: Runtime shared-state contract integrity.
+        Description: Remove the configured Full-layer Indexer from a real four-layer model.
+        Expectation: Resolution fails instead of dropping the missing producer requirements.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            _write_released_config(directory)
+            assets_path = _write_engram_assets(
+                directory, num_hidden_layers=40, layer_ids=(1,), head_dim=8
+            )
+            config = build_deepseek_v41_validation_config(
+                directory, str(assets_path), num_hidden_layers=4,
+                text_parameter_divisor=4, exercise_post_training_indexer=False,
+            )
+            # Engram hashing reads tensor values during initialization, which meta tensors cannot supply.
+            config.v41_engram_layer_ids = []
+            with torch.device("meta"):
+                model = DeepseekV41ForCausalLM(config)
+            model.model.layers[2].self_attn.indexer = None
+
+            with self.assertRaisesRegex(ValueError, r"Indexer presence at model\.layers\.2\.self_attn"):
+                resolve_model_validation_spec(model)
 
     def test_candidate_pool_requires_explicit_opt_in(self):
         """Opt-in preserves the historical candidate smoke remapping and full-depth source.

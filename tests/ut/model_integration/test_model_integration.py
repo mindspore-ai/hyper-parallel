@@ -73,6 +73,7 @@ from hyper_parallel.tools.model_integration.schemas import (
     ModelIntegrationFinding,
 )
 from hyper_parallel.tools.model_integration.integration_validator import (
+    resolve_model_validation_spec,
     validate_final_model,
     validate_state_invariants,
 )
@@ -86,6 +87,7 @@ from hyper_parallel.models.validation_spec import (
     ModelValidationSpec,
     ModuleParityCase,
     ObservationSpec,
+    SharedStateValidationSpec,
     StateInvariantSpec,
 )
 from hyper_parallel.tools.model_integration import cli as model_integration_cli
@@ -93,6 +95,7 @@ from hyper_parallel.tools.model_integration.cli import main as model_integration
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.trainer.config.parallelism import ActivationCheckpointSelection
 from hyper_parallel.trainer.config.training import ModelIntegrationConfig
+from hyper_parallel.trainer.runtime.model_integration import TrainerModelIntegrationSession
 
 
 class _ReferenceLinear(nn.Module):
@@ -1284,6 +1287,81 @@ class TestModelIntegrationContracts(unittest.TestCase):
         )
         self.assertFalse(findings)
         self.assertEqual(coverage["intentional_training_only"], 1)
+
+    def test_shared_state_requirements_resolve_before_tracing(self) -> None:
+        """Resolve model-owned keys without changing legacy static contracts.
+
+        Feature: Model-dependent shared-state validation.
+        Description: Resolve a provider with and without a model callback.
+        Expectation: Only the callback provider specializes its required keys.
+        """
+        model = SimpleNamespace(config=SimpleNamespace(model_type="test"))
+        static = ModelValidationSpec(shared_state=SharedStateValidationSpec(
+            producer_keys=("compressed_kv", "candidate_blocks"),
+            consumer_keys=("compressed_kv", "candidate_blocks"),
+        ))
+        callback = mock.Mock(return_value=(("compressed_kv",), ("compressed_kv",)))
+        dynamic = ModelValidationSpec(shared_state=SharedStateValidationSpec(
+            producer_keys=static.shared_state.producer_keys,
+            consumer_keys=static.shared_state.consumer_keys,
+            required_keys_for_model=callback,
+        ))
+        for declared in (static, dynamic):
+            with self.subTest(dynamic=declared is dynamic), mock.patch(
+                "hyper_parallel.tools.model_integration.integration_validator.get_model_adapter",
+                return_value=SimpleNamespace(validation=lambda: declared),
+            ):
+                resolved = resolve_model_validation_spec(model)
+                expected = ("compressed_kv",) if declared is dynamic else static.shared_state.producer_keys
+                self.assertEqual(resolved.shared_state.producer_keys, expected)
+                self.assertEqual(resolved.shared_state.consumer_keys, expected)
+        callback.assert_called_once_with(model)
+        self.assertIn("candidate_blocks", dynamic.shared_state.producer_keys)
+
+    def test_runtime_shared_state_checks_preserve_real_failures(self) -> None:
+        """Accept Full/Reuse traces while retaining dependency and replay checks.
+
+        Feature: Runtime shared-state contracts for cropped models.
+        Description: Check a valid candidate-free trace and corrupt its events.
+        Expectation: Missing required keys, missing sources and replay still fail.
+        """
+        producer_keys = ("compressed_kv", "index_key", "topk_indices")
+        consumer_keys = ("compressed_kv", "topk_indices")
+        published = tuple(
+            {"action": "publish", "state_id": 0, "key": key, "source_layer": 2}
+            for key in producer_keys
+        )
+        consumed = tuple(
+            {"action": "consume", "state_id": 0, "key": key,
+             "source_layer": 2, "consumer_layer": layer}
+            for layer in (2, 3) for key in consumer_keys
+        )
+        valid = published + consumed
+        cases = (
+            ("valid", valid, None),
+            ("missing_key", tuple(event for event in valid if event["key"] != "topk_indices"),
+             "missing_producers=.*topk_indices"),
+            ("missing_consumer", published, "missing_consumers=.*compressed_kv"),
+            ("missing_source", consumed + published, "missing_sources=\\[\\{"),
+            ("replayed", valid + published[:1], "producer replayed"),
+        )
+        for name, events, error in cases:
+            with self.subTest(name=name):
+                session = TrainerModelIntegrationSession.__new__(TrainerModelIntegrationSession)
+                session.global_rank = 1
+                session._shared_trace_token = object()  # pylint: disable=protected-access
+                session.validation_spec = ModelValidationSpec(shared_state=SharedStateValidationSpec(
+                    producer_keys=producer_keys,
+                    consumer_keys=consumer_keys,
+                    begin_trace=mock.Mock(),
+                    finish_trace=mock.Mock(return_value=events),
+                ))
+                if error is None:
+                    session._finish_shared_state_trace()  # pylint: disable=protected-access
+                else:
+                    with self.assertRaisesRegex(RuntimeError, error):
+                        session._finish_shared_state_trace()  # pylint: disable=protected-access
+                self.assertIsNone(session._shared_trace_token)  # pylint: disable=protected-access
 
     def test_shared_state_trace_records_producer_consumer_identity(self) -> None:
         """Expose CSA2 cross-layer dependencies without retaining tensor values."""
