@@ -314,7 +314,7 @@ def test_swap_muon_hsdp_checkpoint_8p() -> None:
     ]
     assert momentum, "HSDP checkpoint must contain replicated Muon momentum"
     assert all(tensor.device.type == "cpu" for tensor in momentum)
-    assert all(torch.count_nonzero(tensor) > 0 for tensor in momentum)
+    assert all(torch.count_nonzero(to_local_if_dtensor(tensor)) > 0 for tensor in momentum)
 
     slots = tuple(optimizer.adapter.all_slots())
     assert slots, "owner ranks must retain local momentum slots"
