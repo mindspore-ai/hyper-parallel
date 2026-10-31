@@ -158,6 +158,7 @@ class GraphCompiler:
             **inputs: Model inputs, forwarded to ``train_fn`` as keyword
                 arguments and used to trace the joint graph
         """
+        self.pass_config.validate()
         if (
             self.dynamic or self.dynamic_arg_dims is not None
         ) and self.pass_config.pp_enabled:

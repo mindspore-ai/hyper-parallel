@@ -21,6 +21,7 @@ Execution Order:
 1. Basic optimization: DeadCodeElimination, CanonicalizeGraph
 2. Execution layer:
    - FSDPPass (FSDP)
+   - FsdpBucketingPass (opt-in AG/RS fusion; supports FSDP with PP disabled).
    - PpPass (pipeline-parallel stage split) — runs AFTER FSDPPass: the FSDP
      collectives are value-level FX nodes that follow the data flow, so the
      stage slices inherit this stage's all_gather/reduce_scatter untouched
@@ -46,6 +47,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 from ..pass_config import PassConfig
 from .base import GraphPass
+from .bucketing.bucketing_pass import FsdpBucketingPass
 from .overlap.schedule import AutoOverlapPass, FsdpOverlapPass
 from .parallel.fsdp_pass import FSDPPass
 from .parallel.pp_pass import PpPass
@@ -86,6 +88,10 @@ class PassPipeline:
         # 2. Execution layer: Parallel dimension partitioning
         if getattr(self.config, "fsdp_enabled", False):
             self.passes.append(FSDPPass(parallel_plan=self.parallel_plan))
+        if self.config.fsdp_bucketing:
+            self.passes.append(FsdpBucketingPass())
+        if getattr(self.config, "pp_enabled", False):
+            self.passes.append(PpPass(parallel_plan=self.parallel_plan))
 
         # 3. Communication-compute overlap optimization
         if getattr(self.config, "enable_overlap", False):

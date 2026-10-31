@@ -85,6 +85,12 @@ class PassConfig:
     Attributes:
         enable_overlap: Drive ``AutoOverlapPass`` to move ``wait_tensor`` for
             communication/compute overlap.
+        fsdp_bucketing: Fuse compatible FSDP all-gathers and reduce-scatters before
+            overlap. Python-only, disabled by default; configure before compilation.
+        fsdp_bucket_modules: Optional module FQN groups, produced by
+            ``build_module_bucket_plans`` or supplied as a list of paths/groups.
+            None groups by immediate parameter parents; an empty list selects nothing.
+            All ranks in each FSDP group must use the same configuration.
         fsdp_allgather_prefetch: Prefetch forward/backward FSDP all-gathers
             and delay their wait/view nodes independently of enable_overlap.
         fsdp_overlap_grad_reduce: Advance backward reduce-scatter launches and
@@ -188,6 +194,8 @@ class PassConfig:
     pp_chunks: int = 1
     pp_microbatch_size: int = 1
     pp_schedule: str = "gpipe"
+    fsdp_bucketing: bool = False
+    fsdp_bucket_modules: Optional[list[str | list[str]] | tuple[tuple[str, ...], ...]] = None
     fsdp_allgather_prefetch: bool = True
     fsdp_overlap_grad_reduce: bool = True
     max_in_flight_gb: float = 0.25
@@ -212,10 +220,12 @@ class PassConfig:
 
     def _validate_flags(self) -> None:
         """Validate boolean flags and the overlap memory budget."""
-        for name in ("fsdp_allgather_prefetch", "fsdp_overlap_grad_reduce"):
+        for name in ("fsdp_bucketing", "fsdp_allgather_prefetch", "fsdp_overlap_grad_reduce"):
             value = getattr(self, name)
             if not isinstance(value, bool):
                 raise ValueError(f"{name} must be a bool")
+        if self.fsdp_bucket_modules is not None and not isinstance(self.fsdp_bucket_modules, (list, tuple)):
+            raise ValueError("fsdp_bucket_modules must be None or a list/tuple of module groups")
         value = self.max_in_flight_gb
         if (
             isinstance(value, bool)
