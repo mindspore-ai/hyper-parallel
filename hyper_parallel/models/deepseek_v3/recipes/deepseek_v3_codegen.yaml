@@ -15,13 +15,13 @@ training:
 
 accelerator:
   tp_size: 1
-  cp_size: 1
+  cp_size: 4
   ep_size: 1
   pp_size: 1
   sequence_parallel: false
 
 fsdp_config:
-  dp_shard_size: 8
+  dp_shard_size: 2
 
 mixed_precision:
   enabled: false
@@ -53,6 +53,14 @@ checkpoint:
   restore_from: null
 
 plan_overrides:
-  - match: "*.mlp"
-    when: ep
+  - match: "model.layers.*.self_attn"
+    module_type: transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3Attention
+    replace_module:
+      _target_: hyper_parallel.components.modules.mla_attention.MLAAttention
+  - match: "model.layers.*.self_attn"
     region_dispatch: false
+    inner_target: self
+    inner_wrapper:
+      _target_: hyper_parallel.models.deepseek_v3.adapter.distributed.context_parallel.mla_cp_wrapper
+      strategy: expanded_ulysses
+      overlap: false

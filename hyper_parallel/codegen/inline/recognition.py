@@ -229,8 +229,17 @@ def inner_wrapper_target(factory_path: str | None) -> InnerWrapperTarget | None:
     )
     if factory_node is None:
         return None
-    replacement_name = _rewrite_request_callable(factory_node)
-    helper_name = _forward_helper_name(factory_node, replacement_name) if replacement_name else None
+    request_owner = _request_owner(factory_node, tree)
+    replacement_name = (
+        _rewrite_request_callable(request_owner)
+        if request_owner is not None
+        else None
+    )
+    helper_name = (
+        _forward_helper_name(request_owner, replacement_name)
+        if request_owner is not None and replacement_name
+        else None
+    )
     module_functions = {
         node.name
         for node in tree.body
@@ -243,6 +252,26 @@ def inner_wrapper_target(factory_path: str | None) -> InnerWrapperTarget | None:
         helper_name=helper_name,
         state_attr=_cp_mesh_companion_attr(tree),
     )
+
+
+def _request_owner(factory_node: ast.AST, tree: ast.Module) -> ast.AST | None:
+    """Return the factory or its module-level delegate that builds the request."""
+    if _rewrite_request_callable(factory_node) is not None:
+        return factory_node
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    for node in ast.walk(factory_node):
+        if not isinstance(node, ast.Return) or not isinstance(node.value, ast.Call):
+            continue
+        if not isinstance(node.value.func, ast.Name):
+            continue
+        delegate = functions.get(node.value.func.id)
+        if delegate is not None and _rewrite_request_callable(delegate) is not None:
+            return delegate
+    return None
 
 
 def _module_source_tree(module_name: str) -> ast.Module | None:

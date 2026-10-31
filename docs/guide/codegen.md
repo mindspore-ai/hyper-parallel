@@ -1,7 +1,7 @@
 # Codegen 使用指南
 
-Codegen 根据训练 YAML 中的模型和并行配置生成模型代码及差异文件，方便检查并行配置对模型代码的影响。
-生成过程独立于训练，可在启动训练前单独完成。
+Codegen 根据模型配置和并行策略生成可审阅的模型源码。生成过程与训练分离：无需启动训练，
+也不需要使用 `torchrun`。
 
 ## 准备环境
 
@@ -12,59 +12,72 @@ pip install -e .
 python -c "import hyper_parallel; print(hyper_parallel.__file__)"
 ```
 
-准备一份可正常解析的训练 YAML。YAML 引用的模型配置、模型源码和其他结构文件需要在当前机器上可访问。生成过程不会加载训练数据、优化器或模型权重。
+生成时需要能够访问 YAML 引用的模型 config、模型源码及其结构文件，但不会加载模型权重、
+训练数据或优化器状态。
 
-## 生成代码
-
-使用 Python 单进程运行：
-
-```bash
-python -m hyper_parallel.codegen --verbose generate \
-  --config path/to/train.yaml
-```
-
-Codegen 会读取 YAML 中的模型结构、模块替换和 TP、CP、EP 等并行配置。
-
-生成成功后，命令返回 `0`；失败时返回非零状态，并在日志中说明原因。
-
-### 指定输出目录
-
-```bash
-python -m hyper_parallel.codegen --verbose generate \
-  --config path/to/train.yaml \
-  --output /path/to/generated
-```
-
-未指定 `--output` 时，已支持的模型通常写入：
+仓库提供的 Codegen 配置统一位于模型自己的 `recipes` 目录：
 
 ```text
-hyper_parallel/models/<model_family>/generated/
+hyper_parallel/models/<model_name>/recipes/<model_name>_codegen.yaml
 ```
 
 例如：
 
 ```text
-hyper_parallel/models/qwen3_moe/generated/
-hyper_parallel/models/deepseek_v41/generated/
+hyper_parallel/models/kimi_k3/recipes/kimi_k3_codegen.yaml
+hyper_parallel/models/deepseek_v32/recipes/deepseek_v32_codegen.yaml
+hyper_parallel/models/qwen3_5/recipes/qwen3_5_codegen.yaml
 ```
 
-如果无法识别模型类型，则写入训练 YAML 所在目录下的 `generated/`。
+## 生成模型代码
+
+使用单个 Python 进程运行：
+
+```bash
+python -m hyper_parallel.codegen --verbose generate \
+  --config hyper_parallel/models/kimi_k3/recipes/kimi_k3_codegen.yaml
+```
+
+Codegen 会读取 YAML 中的模型结构和 TP、CP、EP 等并行配置，在 meta device 上构造模型并
+生成代码。命令成功时返回 `0`，失败时返回非零状态并在日志中说明原因。
+
+不要使用 `torchrun` 启动 Codegen。Codegen 不创建分布式进程组，也不占用 NPU/GPU 进行训练。
+
+### 指定输出目录
+
+```bash
+python -m hyper_parallel.codegen --verbose generate \
+  --config path/to/model_codegen.yaml \
+  --output /path/to/generated
+```
+
+未指定 `--output` 时，已支持的模型写入：
+
+```text
+hyper_parallel/models/<model_name>/generated/
+```
 
 ## 检查生成结果
 
-生成完成后，使用相同的 YAML 和配置覆盖参数执行检查：
+使用生成时相同的 YAML 执行检查：
 
 ```bash
 python -m hyper_parallel.codegen check \
-  --config path/to/train.yaml
+  --config hyper_parallel/models/kimi_k3/recipes/kimi_k3_codegen.yaml
 ```
 
-检查成功时返回 `0`；文件缺失、内容被修改或配置不匹配时返回非零状态。
+检查会验证产物是否完整、源码是否可编译、文件哈希和生成签名是否与当前配置一致。检查成功
+返回 `0`；文件缺失、内容被修改或配置发生变化时返回非零状态。
 
+检查仓库内发现的全部 Codegen 配置：
+
+```bash
+python -m hyper_parallel.codegen check --all --root .
+```
 
 ## 产物说明
 
-典型生成目录如下：
+典型产物目录如下：
 
 ```text
 generated/
@@ -74,62 +87,53 @@ generated/
 └── modeling_<Model>_gen_npu.py.diff
 ```
 
-- `modeling_*_gen_npu.py`：生成后的模型源码。
-- `modeling_*_gen_npu.py.diff`：生成源码相对于原始源码的差异。
-- `codegen_meta.json`：本次生成使用的模型来源、并行配置和文件校验信息。
+- `modeling_*_gen_npu.py`：应用并行策略后的模型源码。
+- `modeling_*_gen_npu.py.diff`：生成源码相对于原始源码的差异，便于代码审阅。
+- `codegen_meta.json`：模型来源、并行配置、生成签名和文件校验信息。
 - `__init__.py`：生成目录的 Python 包标识。
 
-某些配置不需要改写模型源码，此时生成目录可能只有配置记录和包文件。这并不一定是错误，可查看 `codegen_meta.json` 和命令日志确认结果。
+如果模型的官方 remote code 本身由多个 modeling 文件组成，Codegen 会保留这种结构。例如
+Kimi K3 的多模态入口和语言模型分别位于两个 modeling 文件，因此会生成两份对应源码和 diff。
+这些文件共同组成一个 Kimi K3 bundle，并不是两个独立模型。
 
-## 复用已有结果
+Bundle 还可能包含 `configuration_*.py` 等官方源码依赖。生成后的 modeling 文件使用 bundle 内
+相对导入，可以在新的 Python 进程中加载，不依赖 Hugging Face 动态模块缓存中的包名。
 
-模型源码、模型结构和并行配置均未变化时，Codegen 会复用已有结果。以下变化会触发重新生成：
+## 修改并行配置
 
-- 模型源码或模型 config 变化；
-- 模块替换规则变化；
-- TP、CP、EP 等并行配置变化；
-- 生成器版本或产物格式变化。
+如需尝试其他并行组合，复制模型目录中的 Codegen recipe，再调整 TP、CP、EP、PP、FSDP 及
+`plan_overrides`。建议让文件名继续以 `_codegen.yaml` 结尾，便于识别和批量检查。
 
-需要重新生成时，建议先备份并移走整个 `generated/` 目录，再运行 `generate`。不要只删除目录中的单个文件，以免新旧产物混在一起。
+模型源码、模型 config、并行策略或生成器版本变化后，应重新运行 `generate`。Codegen 会根据
+生成签名复用一致的产物；签名变化时会原子更新整个 bundle，避免新旧文件混合。
 
 ## 与训练的关系
 
-生成代码和训练是两个独立操作。先运行 Codegen，再按项目现有方式启动训练即可：
-
-```bash
-# 生成并检查代码，不占用训练设备
-python -m hyper_parallel.codegen generate \
-  --config path/to/train.yaml
-
-# 启动训练；具体命令以项目的训练入口为准
-torchrun --standalone --nproc_per_node=8 path/to/train_entry.py \
-  path/to/train.yaml
-```
-
-普通训练不会读取或执行 Codegen 产物。生成目录缺失、损坏或过期也不会改变训练行为。
+Codegen 和训练是独立操作。普通 Trainer 不读取或执行 `generated/` 中的文件，生成目录缺失、
+损坏或过期也不会改变原生训练流程。需要训练时，仍按模型原有的训练入口和配置启动。
 
 ## 常见问题
 
-### 生成需要 NPU/GPU 吗？
+### 是否需要 NPU/GPU？
 
-不需要。Codegen 使用单个 CPU 进程读取模型结构，不会初始化 NPU/GPU 通信，也不会创建分布式进程组。
+不需要。Codegen 使用 CPU/meta 模型收集结构和并行计划，不会执行训练计算或建立 HCCL/NCCL
+通信。
 
-### 生成需要使用 `torchrun` 吗？
+### 是否需要模型权重或训练数据？
 
-不需要。请直接使用 `python -m hyper_parallel.codegen generate`。如果使用 `torchrun`，命令会提示改用单进程方式，避免多个进程同时写入同一目录。
-
-### 生成需要模型权重或训练数据吗？
-
-不需要加载模型权重或训练数据。模型配置、模型源码，以及构建模型结构时引用的文件仍需在当前机器上可访问。
+不需要加载模型权重和训练数据。模型 config、模型源码以及构造模型时引用的结构文件必须可访问。
 
 ### `check` 提示找不到 `codegen_meta.json`
 
-确认 `generate` 已成功完成，并且检查时使用了相同的 YAML 和配置覆盖参数。如果生成时指定了 `--output`，请确认该目录存在且包含完整产物。
+确认 `generate` 已成功完成，并且检查时使用了相同的 YAML 和配置覆盖参数。如果生成时指定了
+`--output`，检查和产物管理也应使用对应目录。
 
 ### `check` 提示 hash drift
 
-生成后的文件被修改、缺失，或者目录中混入了旧文件。请先备份并移走整个 `generated/` 目录，然后重新运行 `generate`。
+产物文件可能被修改、缺失，或者目录中混入了旧文件。请重新运行 `generate`，不要手工修改
+generated 文件。
 
-### 生成成功但没有 modeling 文件
+### 为什么一个模型有多个 modeling 文件？
 
-当前配置可能不需要改写模型源码。查看命令日志和 `codegen_meta.json`；如果生成和检查命令都成功，该结果可以正常使用。
+部分官方模型将顶层模型和语言模型拆在不同源码文件中。Codegen 保留官方依赖关系，并对每个
+被修改的 modeling 文件生成对应 diff；它们仍属于同一个模型 bundle。

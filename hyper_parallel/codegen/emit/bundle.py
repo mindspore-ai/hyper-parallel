@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any
 
 from hyper_parallel.codegen.artifact import ArtifactLayout
@@ -40,6 +41,7 @@ from hyper_parallel.codegen.emit.diff import unified_diff
 from hyper_parallel.codegen.emit.modeling import (
     copy_original_modeling,
     emit_modeling_file,
+    verify_recorded_patch_bundle,
 )
 
 logger = logging.getLogger(__name__)
@@ -106,22 +108,122 @@ def emit_bundle(
     # record what was copied so preflight/loader can tell a stale bundle.
     siblings: dict[str, str] = {}
     source_obj = meta.source
-    source_module = (
-        source_obj.get("module_name") if isinstance(source_obj, dict)
-        else getattr(source_obj, "module_name", None)
-    )
-    if source_module == "<remote>":
-        from hyper_parallel.codegen.source.resolver import resolve_remote_siblings
+    from hyper_parallel.codegen.source.resolver import resolve_remote_siblings
 
-        resolved = resolve_remote_siblings(source_obj)
+    resolved = resolve_remote_siblings(source_obj)
+    if resolved:
+        bundled_siblings: dict[str, str] = {}
+        original_siblings: dict[str, tuple[str, str]] = {}
+        sibling_diffs: dict[str, str] = {}
         for path in resolved.values():
             basename = os.path.basename(path)
             with open(path, "r", encoding="utf-8", errors="replace") as handle:
-                siblings[basename] = handle.read()
+                original_sibling = handle.read()
+            generated_sibling = _strip_trailing_whitespace(
+                _materialize_sibling(
+                    original_sibling,
+                    meta,
+                    patch_plan,
+                    source_path=path,
+                )
+            )
+            if generated_sibling != _strip_trailing_whitespace(original_sibling):
+                output_name = _generated_sibling_name(basename)
+            else:
+                output_name = basename
+            bundled_siblings[basename] = output_name
+            siblings[output_name] = generated_sibling
+            original_siblings[output_name] = (basename, original_sibling)
+        if bundled_siblings:
+            files[modeling_name] = _rewrite_sibling_imports(files[modeling_name], bundled_siblings)
+            files[os.path.basename(layout.diff_path)] = _strip_trailing_whitespace(
+                emit_diff(original_text, files[modeling_name], layout)
+            )
+            siblings = {
+                name: _rewrite_sibling_imports(text, bundled_siblings)
+                for name, text in siblings.items()
+            }
+            for output_name, rendered_sibling in siblings.items():
+                basename, original_sibling = original_siblings[output_name]
+                if rendered_sibling == _strip_trailing_whitespace(original_sibling):
+                    continue
+                sibling_diffs[f"{output_name}.diff"] = _strip_trailing_whitespace(
+                    unified_diff(
+                        original_sibling,
+                        rendered_sibling,
+                        fromfile=f"a/{basename}",
+                        tofile=f"b/{output_name}",
+                    )
+                )
         files.update(siblings)
+        files.update(sibling_diffs)
         if siblings:
             meta.remote_siblings = sorted(siblings)
+    verify_recorded_patch_bundle(files, patch_plan=patch_plan)
     return files
+
+
+def _materialize_sibling(
+    source_text: str,
+    meta: Any,
+    patch_plan: Any,
+    *,
+    source_path: str,
+) -> str:
+    """Apply source-owned strategy and recorded patches to one sibling."""
+    from hyper_parallel.codegen.emit.recorded import materialize_recorded_forwards
+    from hyper_parallel.codegen.inline.pipeline import (
+        render_inline_strategies_for_source_unit,
+    )
+
+    source = getattr(meta, "source", None)
+    architecture = (
+        source.get("architecture")
+        if isinstance(source, dict)
+        else getattr(source, "architecture", None)
+    )
+    model_type = getattr(meta, "model_class", None) or architecture
+    rendered = render_inline_strategies_for_source_unit(
+        source_text,
+        meta,
+        model_type=model_type,
+        patch_plan=patch_plan,
+    )
+    return materialize_recorded_forwards(
+        rendered,
+        meta,
+        patch_plan=patch_plan,
+        source_path=source_path,
+    )
+
+
+def _generated_sibling_name(basename: str) -> str:
+    stem, extension = os.path.splitext(basename)
+    return f"{stem}_gen_npu{extension}"
+
+
+def _rewrite_sibling_imports(
+    source_text: str,
+    bundled_siblings: dict[str, str],
+) -> str:
+    """Retarget sibling imports to source units shipped in the bundle."""
+    rendered = source_text
+    for original, generated in sorted(bundled_siblings.items()):
+        original_module = os.path.splitext(original)[0]
+        generated_module = os.path.splitext(generated)[0]
+        rendered = re.sub(
+            rf"(?m)^(\s*from\s+\.+){re.escape(original_module)}(\s+import\s+)",
+            rf"\g<1>{generated_module}\g<2>",
+            rendered,
+        )
+        rendered = re.sub(
+            rf"(?m)^(\s*from\s+)"
+            rf"transformers_modules(?:\.[A-Za-z_][A-Za-z0-9_]*)+\."
+            rf"{re.escape(original_module)}(\s+import\s+)",
+            rf"\g<1>.{generated_module}\g<2>",
+            rendered,
+        )
+    return rendered
 
 
 def _strip_trailing_whitespace(text: str) -> str:

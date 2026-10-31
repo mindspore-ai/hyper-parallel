@@ -75,6 +75,39 @@ def test_generate_rejects_torchrun_environment(monkeypatch):
     assert result == 1
 
 
+def test_verbose_cli_logs_traceback(monkeypatch):
+    """Verbose failures retain their traceback for remote generation diagnosis."""
+    captured = {}
+
+    def _exception(message, error):
+        captured["message"] = message
+        captured["error"] = error
+
+    monkeypatch.setattr(cli.logger, "exception", _exception)
+    monkeypatch.setattr(
+        cli,
+        "cmd_generate",
+        lambda _args: (_ for _ in ()).throw(RuntimeError("broken model build")),
+    )
+
+    result = cli.main([
+        "--verbose",
+        "generate",
+        "--config",
+        "train.yaml",
+    ])
+
+    assert result == 1, f"Expected verbose CLI failure rc=1, got rc={result}"
+    assert captured["message"] == "codegen: %s", (
+        f"Expected exception log format 'codegen: %s', "
+        f"got message={captured['message']!r}"
+    )
+    assert str(captured["error"]) == "broken model build", (
+        f"Expected original exception in verbose log, "
+        f"got error={captured['error']!r}"
+    )
+
+
 def test_native_build_orchestration_builds_only_model(monkeypatch):
     """Build-only generation never constructs training-owned components."""
     events = []

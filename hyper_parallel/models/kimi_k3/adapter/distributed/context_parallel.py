@@ -38,6 +38,14 @@ from hyper_parallel.distributed.context_parallel.kimi_delta_attention import (
 )
 
 
+def kimi_delta_attention_cp_forward(
+    target_module: nn.Module, *args: Any, **kwargs: Any
+) -> Any:
+    """Run the KDA context-parallel executor selected by the wrapper."""
+    executor = getattr(target_module, "_hp_kda_cp_executor")
+    return executor(*args, **kwargs)
+
+
 def _build_kda_cp_rewrite(
     target_module: nn.Module,
     cp_mesh: Any,
@@ -79,12 +87,13 @@ def _build_kda_cp_rewrite(
         Args:
             kwargs: Additional model arguments, including global packed sample metadata.
         """
-        return executor(*args, **kwargs)
+        return kimi_delta_attention_cp_forward(target_module, *args, **kwargs)
 
     return _ForwardRewriteRequest(
         target_module,
         cp_forward,
         companion_attrs={
+            "_hp_kda_cp_executor": executor,
             "_hp_kda_cp_config": {
                 "mode": mode,
                 "backend": backend,

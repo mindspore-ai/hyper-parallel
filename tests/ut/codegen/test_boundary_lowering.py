@@ -1,6 +1,16 @@
 # Copyright 2026 Huawei Technologies Co., Ltd
 #
-# Licensed under the Apache License, Version 2.0
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # ============================================================================
 """Contract tests for deterministic ``lower_forward_boundaries`` rewrites.
 
@@ -22,9 +32,22 @@ the identical byte string.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
+from hyper_parallel.codegen.emit.modeling import _verify_recorded_patch_materialization
 from hyper_parallel.codegen.emit.parallel import lower_forward_boundaries
+from hyper_parallel.codegen.emit.recorded import materialize_recorded_forwards
+from hyper_parallel.codegen.inline.ir import (
+    ForwardExtractPatch,
+    ImportPatch,
+    InlinePatchSet,
+)
+from hyper_parallel.codegen.inline.patch_engine import apply_patch_set
+from hyper_parallel.codegen.inline.pipeline import _materialize_imported_forward_hosts
+from hyper_parallel.codegen.inline.recognition import inner_wrapper_target
+from hyper_parallel.codegen.inline.templates import cp_dispatch_shell_body
 from tests.common.mark_utils import arg_mark
 
 SOURCE_TEXT = '''\
@@ -45,6 +68,36 @@ class Beta(nn.Module):
     def forward(self, x):
         return x + 1
 '''
+
+
+@pytest.mark.parametrize(
+    ("factory", "helper"),
+    (
+        (
+            "hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel."
+            "kimi_delta_attention_ulysses_cp_wrapper",
+            "kimi_delta_attention_cp_forward",
+        ),
+        (
+            "hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel."
+            "qwen3_5_gdn_ulysses_cp_wrapper",
+            "qwen3_5_gdn_cp_forward",
+        ),
+        (
+            "hyper_parallel.models.deepseek_v3.adapter.distributed.context_parallel."
+            "mla_cp_wrapper",
+            "mla_cp_forward",
+        ),
+    ),
+)
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_delegating_cp_wrapper_exposes_source_visible_helper(factory, helper):
+    """Delegating wrappers retain a module-level helper for code generation."""
+    target = inner_wrapper_target(factory)
+
+    assert target is not None
+    assert target.helper_name == helper
 
 VARIADIC_SOURCE_TEXT = '''\
 import torch
@@ -88,6 +141,11 @@ def _boundary(fqn: str, class_name: str) -> tuple[str, dict]:
         "params": {"weight": {"tp": "S(0)", "ep": "R", "cp": "R"}},
     }
     return [fqn], {fqn: entry}, {fqn: class_name}
+
+
+def _recorded_alpha_forward(self, x):
+    del self
+    return x * 2
 
 
 def _plan(*, alpha_first: bool) -> dict:
@@ -207,6 +265,204 @@ def test_local_region_lowering_requires_builder_recording():
 
     with pytest.raises(RuntimeError, match="builder recording"):
         lower_forward_boundaries(SOURCE_TEXT, plan, boundary_classes=classes)
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_runtime_only_local_compute_does_not_poison_shared_source_class():
+    """A skipped local-compute injection must not affect another class instance."""
+    entry = _identity_entry()
+    skipped = {**_identity_entry(), "skip_source_lowering": True}
+    plan = {
+        "param_plan": {"blocks.alpha": entry, "blocks.runtime": skipped},
+        "injections": [{
+            "match": "blocks.runtime",
+            "local_compute_fn": {"_target_": "some.factory"},
+        }],
+        "mesh_dim_names": ("tp",),
+    }
+    classes = {"blocks.alpha": "Alpha", "blocks.runtime": "Alpha"}
+
+    assert lower_forward_boundaries(
+        SOURCE_TEXT, plan, boundary_classes=classes
+    ) == SOURCE_TEXT
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_recorded_local_compute_rewrites_same_class_with_ep_toggle():
+    """A recorded EP patch keeps the original class and forward implementation."""
+    alpha_type = type("Alpha", (), {"forward": _recorded_alpha_forward})
+    record = SimpleNamespace(
+        module_fqn="blocks.alpha",
+        module_type=alpha_type,
+        original_forward=alpha_type.forward,
+        factory="demo.ep.factory",
+    )
+    meta = SimpleNamespace(
+        param_plan={"blocks.alpha": _identity_entry()},
+        boundary_classes={"blocks.alpha": "Alpha"},
+        external_state_classes=[],
+        mesh_dim_names=("ep",),
+        injections=[{
+            "match": "blocks.alpha",
+            "local_compute_fn": {"_target_": "demo.ep.compute"},
+        }],
+    )
+    patches = SimpleNamespace(local_computes=(record,))
+
+    rendered = materialize_recorded_forwards(
+        SOURCE_TEXT, meta, patch_plan=patches
+    )
+
+    expected_tokens = (
+        "class Alpha(nn.Module):",
+        "ep_enable = False",
+        "def _forward_impl(self, x):",
+        "if self.ep_enable:",
+    )
+    for token in expected_tokens:
+        assert token in rendered, (
+            f"Expected generated EP source to contain {token!r}, "
+            f"got source={rendered!r}"
+        )
+    for token in ("HPCodegen", "hp_recorded_local_compute_patches"):
+        assert token not in rendered, (
+            f"Expected generated EP source to omit {token!r}, "
+            f"got source={rendered!r}"
+        )
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_frozen_local_compute_rewrites_class_without_live_record():
+    """Explicit frozen injections remain visible in offline-only snapshots."""
+    meta = SimpleNamespace(
+        param_plan={"blocks.alpha": _identity_entry()},
+        boundary_classes={"blocks.alpha": "Alpha"},
+        mesh_dim_names=("ep",),
+        materialized_patches=[],
+        injections=[{
+            "match": "blocks.alpha",
+            "local_compute_fn": {"_target_": "demo.ep.compute"},
+        }],
+    )
+
+    rendered = materialize_recorded_forwards(
+        SOURCE_TEXT,
+        meta,
+        patch_plan=SimpleNamespace(local_computes=()),
+    )
+
+    assert "ep_enable = False" in rendered
+    assert "def _forward_impl(self, x):" in rendered
+    assert "if self.ep_enable:" in rendered
+    assert meta.materialized_patches == [{
+        "fqn": "blocks.alpha",
+        "host_class": "Alpha",
+        "kind": "local_compute",
+        "source_form": "same_class_toggle_forward",
+    }]
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_cp_dispatch_rewrites_same_class_without_constructor_swap():
+    """CP dispatch is an in-place forward rewrite with the original signature."""
+    patches = InlinePatchSet(
+        forward_extracts=[
+            ForwardExtractPatch(
+                class_name="Alpha",
+                method_name="forward",
+                body=cp_dispatch_shell_body("kimi_cp_forward"),
+            )
+        ]
+    )
+
+    rendered = apply_patch_set(SOURCE_TEXT, patches)
+
+    expected_tokens = (
+        "class Alpha(nn.Module):",
+        "cp_enable = False",
+        "def _forward_impl(self, x):",
+        "return self._forward_impl(x)",
+        "return kimi_cp_forward(self, x)",
+    )
+    for token in expected_tokens:
+        assert token in rendered, (
+            f"Expected generated CP source to contain {token!r}, "
+            f"got source={rendered!r}"
+        )
+    for token in ("class AlphaCP", "HPCodegen"):
+        assert token not in rendered, (
+            f"Expected generated CP source to omit {token!r}, "
+            f"got source={rendered!r}"
+        )
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_same_class_cp_toggle_satisfies_inner_wrapper_verification():
+    """The verifier accepts the same-class CP form used by generated models."""
+    alpha_type = type("Alpha", (), {})
+    wrapper = SimpleNamespace(
+        module_fqn="blocks.alpha",
+        target_fqn="self",
+        target_type=alpha_type,
+        request=SimpleNamespace(target=object()),
+    )
+    patches = SimpleNamespace(
+        local_computes=(),
+        module_replacements=(),
+        inner_wrappers=(wrapper,),
+    )
+    meta = SimpleNamespace(materialized_patches=[])
+    rendered = apply_patch_set(
+        SOURCE_TEXT,
+        InlinePatchSet(
+            forward_extracts=[
+                ForwardExtractPatch(
+                    class_name="Alpha",
+                    method_name="forward",
+                    body=cp_dispatch_shell_body("kimi_cp_forward"),
+                )
+            ]
+        ),
+    )
+
+    _verify_recorded_patch_materialization(rendered, meta, patch_plan=patches)
+
+    assert meta.materialized_patches == [{
+        "fqn": "blocks.alpha",
+        "host_class": "Alpha",
+        "kind": "inner_wrapper",
+        "source_form": "same_class_toggle_forward",
+    }]
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_imported_cp_host_is_rendered_as_same_name_class():
+    """An imported replacement gets a visible same-name CP class."""
+    patches = InlinePatchSet(
+        imports=[ImportPatch("demo.components", ("MLAAttention",))],
+        forward_extracts=[
+            ForwardExtractPatch(
+                class_name="MLAAttention",
+                method_name="forward",
+                body=cp_dispatch_shell_body("mla_cp_forward"),
+            )
+        ],
+    )
+
+    _materialize_imported_forward_hosts(SOURCE_TEXT, patches)
+    rendered = apply_patch_set(SOURCE_TEXT, patches)
+
+    assert "from demo.components import MLAAttention as _MLAAttentionBase" in rendered
+    assert "class MLAAttention(_MLAAttentionBase):" in rendered
+    assert "class HPCodegen" not in rendered
+    assert "if self.cp_enable:" in rendered
+    assert "return self._forward_impl(*args, **kwargs)" in rendered
 
 
 @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",

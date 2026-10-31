@@ -39,6 +39,14 @@ from hyper_parallel.distributed.context_parallel.gated_delta_net import (
 )
 
 
+def qwen3_5_gdn_cp_forward(
+    target_module: nn.Module, *args: Any, **kwargs: Any
+) -> Any:
+    """Run the GDN context-parallel executor selected by the wrapper."""
+    executor = getattr(target_module, "_hp_gdn_cp_executor")
+    return executor(*args, **kwargs)
+
+
 def _build_gdn_cp_rewrite(
     target_module: nn.Module,
     cp_mesh: Any,
@@ -73,12 +81,13 @@ def _build_gdn_cp_rewrite(
     @wraps(original_forward)
     def cp_forward(*args: Any, **kwargs: Any) -> Any:
         """Execute the selected full-layer GDN Context Parallel algorithm."""
-        return executor(*args, **kwargs)
+        return qwen3_5_gdn_cp_forward(target_module, *args, **kwargs)
 
     return _ForwardRewriteRequest(
         target_module,
         cp_forward,
         companion_attrs={
+            "_hp_gdn_cp_executor": executor,
             "_hp_gdn_cp_config": {
                 "mode": mode,
                 "backend": backend,

@@ -266,7 +266,17 @@ def emit_modeling_file(meta: Any, *, patch_plan: Any = None) -> str:
     text = _apply_inline_modeling(text, meta, patch_plan=patch_plan)
     from hyper_parallel.codegen.emit.recorded import materialize_recorded_forwards
 
-    text = materialize_recorded_forwards(text, meta, patch_plan=patch_plan)
+    source_path = (
+        meta.source.get("file_path")
+        if isinstance(meta.source, dict)
+        else getattr(meta.source, "file_path", None)
+    )
+    text = materialize_recorded_forwards(
+        text,
+        meta,
+        patch_plan=patch_plan,
+        source_path=source_path,
+    )
     text = _lower_forward_boundaries(text, meta, module_name)
     _verify_recorded_patch_materialization(text, meta, patch_plan=patch_plan)
     return _banner(meta) + text
@@ -301,22 +311,31 @@ def _verify_recorded_patch_materialization(
     materialized = getattr(meta, "materialized_patches", None)
     if isinstance(materialized, list):
         materialized.clear()
-    declaration_fn = next(
-        (
-            node for node in tree.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == "hp_recorded_local_compute_patches"
-        ),
-        None,
-    )
-    declared_strings = {
-        node.value
-        for node in ast.walk(declaration_fn) if isinstance(node, ast.Constant)
-        and isinstance(node.value, str)
-    } if declaration_fn is not None else set()
     for record in local_records:
         class_name = record.module_type.__name__
-        is_materialized = record.module_fqn in declared_strings
+        host_class = classes.get(class_name)
+        methods = {
+            child.name
+            for child in (host_class.body if host_class is not None else ())
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        is_materialized = {"_forward_impl", "forward"} <= methods and any(
+            isinstance(child, (ast.Assign, ast.AnnAssign))
+            and any(
+                isinstance(target, ast.Name) and target.id == "ep_enable"
+                for target in (
+                    child.targets
+                    if isinstance(child, ast.Assign)
+                    else (child.target,)
+                )
+            )
+            for child in (host_class.body if host_class is not None else ())
+        )
+        if host_class is None:
+            # Remote-code hosts are materialized in their owning sibling by
+            # ``emit_bundle``. Bundle-level verification checks the complete
+            # source-unit set after those files have been rewritten.
+            continue
         if not is_materialized:
             missing.append(f"{record.module_fqn} ({class_name})")
         elif isinstance(materialized, list):
@@ -324,7 +343,7 @@ def _verify_recorded_patch_materialization(
                 "fqn": record.module_fqn,
                 "host_class": class_name,
                 "kind": "local_compute",
-                "source_form": "native_phase_c",
+                "source_form": "same_class_toggle_forward",
             })
     bound_names = {
         node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
@@ -354,6 +373,37 @@ def _verify_recorded_patch_materialization(
             if record.target_fqn == "self"
             else f"{record.module_fqn}.{record.target_fqn}"
         )
+        if host_name not in classes:
+            # The target may live in a copied remote-code sibling. The bundle
+            # verifier checks it after every source unit has been emitted.
+            continue
+        host_class = classes[host_name]
+        host_methods = {
+            child.name
+            for child in host_class.body
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        host_state_names = {
+            target.id
+            for child in host_class.body
+            if isinstance(child, (ast.Assign, ast.AnnAssign))
+            for target in (
+                child.targets if isinstance(child, ast.Assign) else (child.target,)
+            )
+            if isinstance(target, ast.Name)
+        }
+        if (
+            {"_forward_impl", "forward"} <= host_methods
+            and "cp_enable" in host_state_names
+        ):
+            if isinstance(materialized, list):
+                materialized.append({
+                    "fqn": target_fqn,
+                    "host_class": host_name,
+                    "kind": "inner_wrapper",
+                    "source_form": "same_class_toggle_forward",
+                })
+            continue
         subclass = next(
             (
                 node
@@ -381,7 +431,6 @@ def _verify_recorded_patch_materialization(
             # Accept this form only when the builder recorded the same FQN as
             # an actual replacement and the emitted component carries both
             # its implementation and the boundary wrapper around it.
-            host_class = classes.get(host_name)
             replacement_backed = any(
                 replacement.module_fqn == record.module_fqn
                 and replacement.replacement_type is target_type
@@ -389,7 +438,7 @@ def _verify_recorded_patch_materialization(
             )
             methods = {
                 child.name
-                for child in (host_class.body if host_class is not None else ())
+                for child in host_class.body
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
             }
             if replacement_backed and {"_forward_impl", "forward"} <= methods:
@@ -411,6 +460,126 @@ def _verify_recorded_patch_materialization(
         raise RuntimeError(
             "codegen: trainer-installed source-visible patches were not "
             "materialized in the generated model source: " + ", ".join(missing)
+        )
+
+
+def verify_recorded_patch_bundle(
+    files: dict[str, str],
+    *,
+    patch_plan: Any = None,
+) -> None:
+    """Verify recorded local-compute patches across all generated source units."""
+    records = (
+        getattr(patch_plan, "local_computes", ())
+        if patch_plan is not None
+        else ()
+    )
+    wrappers = (
+        getattr(patch_plan, "inner_wrappers", ())
+        if patch_plan is not None
+        else ()
+    )
+    trees = {
+        name: ast.parse(text)
+        for name, text in files.items()
+        if name.endswith(".py")
+    }
+    missing = []
+    for record in records:
+        class_name = record.module_type.__name__
+        matched = False
+        for tree in trees.values():
+            host = next(
+                (
+                    node for node in tree.body
+                    if isinstance(node, ast.ClassDef) and node.name == class_name
+                ),
+                None,
+            )
+            if host is None:
+                continue
+            methods = {
+                child.name
+                for child in host.body
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            state_names = {
+                target.id
+                for child in host.body
+                if isinstance(child, (ast.Assign, ast.AnnAssign))
+                for target in (
+                    child.targets if isinstance(child, ast.Assign) else (child.target,)
+                )
+                if isinstance(target, ast.Name)
+            }
+            matched = (
+                {"_forward_impl", "forward"} <= methods
+                and "ep_enable" in state_names
+            )
+            if matched:
+                break
+        if not matched:
+            missing.append(f"{record.module_fqn} ({class_name})")
+    if missing:
+        raise RuntimeError(
+            "codegen: recorded local-compute patches were not materialized "
+            "in their owning source units: " + ", ".join(missing)
+        )
+    missing_wrappers = []
+    for record in wrappers:
+        target_type = getattr(record, "target_type", None)
+        class_name = (
+            target_type.__name__
+            if target_type is not None
+            else type(record.request.target).__name__
+        )
+        matched = False
+        for tree in trees.values():
+            host = next(
+                (
+                    node for node in tree.body
+                    if isinstance(node, ast.ClassDef) and node.name == class_name
+                ),
+                None,
+            )
+            if host is None:
+                continue
+            methods = {
+                child.name
+                for child in host.body
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            state_names = {
+                target.id
+                for child in host.body
+                if isinstance(child, (ast.Assign, ast.AnnAssign))
+                for target in (
+                    child.targets if isinstance(child, ast.Assign) else (child.target,)
+                )
+                if isinstance(target, ast.Name)
+            }
+            matched = {"_forward_impl", "forward"} <= methods and (
+                "cp_enable" in state_names
+                or any(
+                    replacement.module_fqn == record.module_fqn
+                    and replacement.replacement_type is target_type
+                    for replacement in getattr(
+                        patch_plan, "module_replacements", ()
+                    )
+                )
+            )
+            if matched:
+                break
+        if not matched:
+            missing_wrappers.append(f"{record.module_fqn} ({class_name})")
+    if missing_wrappers:
+        raise RuntimeError(
+            "codegen: recorded inner-wrapper patches were not materialized "
+            "in their owning source units: " + ", ".join(missing_wrappers)
+        )
+    if any("HPCodegen" in text for text in files.values()):
+        raise RuntimeError(
+            "codegen: generated bundle contains forbidden HPCodegen class names"
         )
 
 

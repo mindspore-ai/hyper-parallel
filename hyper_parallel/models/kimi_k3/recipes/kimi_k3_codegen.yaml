@@ -16,14 +16,14 @@ training:
   seed: 42
 
 accelerator:
-  tp_size: 1
-  cp_size: 1
-  ep_size: 1
+  tp_size: 2
+  cp_size: 2
+  ep_size: 2
   pp_size: 1
   sequence_parallel: false
 
 fsdp_config:
-  dp_shard_size: 8
+  dp_shard_size: 2
 
 mixed_precision:
   enabled: false

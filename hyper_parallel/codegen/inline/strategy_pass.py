@@ -20,16 +20,12 @@ from fnmatch import fnmatch
 from typing import Collection, Mapping
 
 from hyper_parallel.codegen.inline.ir import (
-    ConstructorReplacePatch,
     ForwardExtractPatch,
     InlinePatchSet,
     InlineRule,
-    ModuleSnippetPatch,
 )
-from hyper_parallel.codegen.inline.replacement_pass import _scope_attrs
 from hyper_parallel.codegen.inline.spec_bundle import StrategySpec
 from hyper_parallel.codegen.inline.specs import strategy_spec
-from hyper_parallel.codegen.inline.templates import cp_subclass_snippet
 
 
 def rule_block_classes(
@@ -98,7 +94,7 @@ def build_strategy_patches(
                 patch_set.imports.extend(spec.imports)
                 patch_set.module_snippets.extend(spec.snippets)
             if spec.subclass_shell is not None:
-                _materialize_cp_subclass(
+                _materialize_cp_forward(
                     patch_set, spec, rule, target, model_type,
                     boundary_classes, subclassed,
                 )
@@ -140,7 +136,7 @@ def build_strategy_patches(
     return patch_set
 
 
-def _materialize_cp_subclass(
+def _materialize_cp_forward(
     patch_set: InlinePatchSet,
     spec: StrategySpec,
     rule: InlineRule,
@@ -149,19 +145,7 @@ def _materialize_cp_subclass(
     boundary_classes: Mapping[str, str] | None,
     subclassed: set[str],
 ) -> None:
-    """Materialize the in-artifact CP dispatch subclass for one rule's hosts.
-
-    The subclass is emitted once per host class (the plan carries one rule
-    per matched FQN, so repeated rules re-derive the same host): a
-    ``ModuleSnippetPatch`` with the full class source — carrying the
-    ``_hp_inline_cp`` marker the runtime installers read and, when the
-    family declares one, the ``_hp_cp_state_attr`` companion contract its
-    shared CP kernel reads — plus a scoped ``name``-mode constructor swap
-    that retargets the matched assignments to
-    the subclass.  No forward extract is produced: the host keeps its
-    compiled boundary, and the subclass dispatches to the parent or the
-    family helper inside it.
-    """
+    """Materialize CP dispatch in the original host class exactly once."""
     host_classes = rule_block_classes(rule, boundary_classes)
     if not host_classes:
         raise _unmaterialized_strategy_error(spec.kind, target, rule, model_type)
@@ -172,24 +156,14 @@ def _materialize_cp_subclass(
             f"import for its subclass shell; got {helper_names}"
         )
     for host_class in sorted(host_classes):
-        subclass_name = f"{host_class}CP"
-        if subclass_name in subclassed:
+        if host_class in subclassed:
             continue
-        subclassed.add(subclass_name)
-        patch_set.module_snippets.append(
-            ModuleSnippetPatch(
-                cp_subclass_snippet(
-                    subclass_name, host_class, helper_names[0],
-                    spec.subclass_state_attr,
-                )
-            )
-        )
-        patch_set.constructor_replaces.append(
-            ConstructorReplacePatch(
-                old_ctor=host_class,
-                new_ctor=subclass_name,
-                mode="name",
-                scope_attrs=_scope_attrs(rule),
+        subclassed.add(host_class)
+        patch_set.forward_extracts.append(
+            ForwardExtractPatch(
+                class_name=host_class,
+                method_name=spec.method_name,
+                body=spec.subclass_shell,
             )
         )
 

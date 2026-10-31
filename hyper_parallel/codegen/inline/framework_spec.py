@@ -409,12 +409,12 @@ def _resolve_strategy_spec(
 
 
 def _cp_strategy_spec(target: str) -> StrategySpec:
-    """Build the CP strategy spec: an inline subclass shell plus its imports.
+    """Build the CP strategy spec: an in-place dispatch shell plus imports.
 
     A recognizable inner forward rewrite participates in inline CP: the
     materialization pass derives an
-    in-artifact subclass of the attention host whose forward falls back to
-    the parent when CP is disabled and delegates to the family helper when
+    in-artifact rewrite of the attention host whose forward falls back to
+    ``_forward_impl`` when CP is disabled and delegates to the helper when
     active. The helper is the same kernel the runtime CP wrapper delegates
     to (trainer and codegen share one CP implementation), and the import is
     derived from the wrapper factory source, so this module never hardcodes a

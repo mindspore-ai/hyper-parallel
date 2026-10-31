@@ -33,6 +33,7 @@ from hyper_parallel.codegen.artifact import (
     write_bundle_atomic,
 )
 from hyper_parallel.codegen.check.preflight import verify_output_hashes
+from hyper_parallel.codegen.emit.bundle import _rewrite_sibling_imports
 from hyper_parallel.codegen.hash import canonical_json, signature_from_spec
 from hyper_parallel.codegen.meta import (
     CodegenMeta,
@@ -42,7 +43,58 @@ from hyper_parallel.codegen.plan.freeze import (
     parse_placement,
     placement_to_string,
 )
+from hyper_parallel.codegen.source.resolver import resolve_remote_siblings
 from hyper_parallel.trainer.config import parser as config_parser
+
+
+def test_dynamic_module_source_resolves_remote_siblings(tmp_path: Path) -> None:
+    """HF dynamic modules retain the same sibling closure as remote sources."""
+    modeling = tmp_path / "modeling_demo.py"
+    configuration = tmp_path / "configuration_demo.py"
+    modeling.write_text(
+        "from .configuration_demo import DemoConfig\n", encoding="utf-8"
+    )
+    configuration.write_text("class DemoConfig:\n    pass\n", encoding="utf-8")
+    source = SimpleNamespace(
+        module_name="transformers_modules.demo.digest.modeling_demo",
+        file_path=str(modeling),
+    )
+
+    siblings = resolve_remote_siblings(source)
+
+    assert siblings == {str(configuration.resolve()): str(configuration.resolve())}
+
+
+def test_dynamic_module_import_retargets_generated_sibling() -> None:
+    """An absolute HF cache import resolves to its generated bundle sibling."""
+    source = (
+        "from transformers_modules.kimi_k3.digest.modeling_kimi_linear "
+        "import KimiLinearForCausalLM\n"
+    )
+
+    rendered = _rewrite_sibling_imports(
+        source,
+        {"modeling_kimi_linear.py": "modeling_kimi_linear_gen_npu.py"},
+    )
+
+    assert rendered == (
+        "from .modeling_kimi_linear_gen_npu import KimiLinearForCausalLM\n"
+    )
+
+
+def test_dynamic_module_import_retargets_copied_configuration() -> None:
+    """An unchanged configuration sibling is imported from the bundle."""
+    source = (
+        "from transformers_modules.kimi_k3.digest.configuration_kimi_k3 "
+        "import KimiK3Config\n"
+    )
+
+    rendered = _rewrite_sibling_imports(
+        source,
+        {"configuration_kimi_k3.py": "configuration_kimi_k3.py"},
+    )
+
+    assert rendered == "from .configuration_kimi_k3 import KimiK3Config\n"
 
 
 @dataclass

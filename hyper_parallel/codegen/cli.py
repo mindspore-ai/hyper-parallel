@@ -46,7 +46,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         return args.func(args)
     except Exception as exc:  # A CLI reports failures without a traceback by default.
-        logger.error("codegen: %s", exc)
+        if getattr(args, "verbose", False):
+            logger.exception("codegen: %s", exc)
+        else:
+            logger.error("codegen: %s", exc)
         return 1
 
 

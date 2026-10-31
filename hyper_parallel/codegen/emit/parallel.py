@@ -254,7 +254,9 @@ def iter_emitted_forms(
     index = build_source_index(source_text)
     param_plan = _plan_field(frozen_plan, "param_plan") or {}
     injections = _plan_field(frozen_plan, "injections") or []
-    injection_by_class = _index_injections_by_class(injections, boundary_classes, index)
+    injection_by_class = _index_injections_by_class(
+        injections, boundary_classes, index, param_plan
+    )
     mesh_dim_names = tuple(_plan_field(frozen_plan, "mesh_dim_names") or ())
 
     groups = _group_boundaries_by_class(
@@ -513,6 +515,7 @@ def _index_injections_by_class(
     injections: list[dict[str, Any]],
     boundary_classes: Optional[dict[str, str]],
     index: SourceIndex,
+    param_plan: Optional[dict[str, Any]] = None,
 ) -> dict[str, dict[str, Any]]:
     """Fold a class's injection declarations (inner wrapper / local compute).
 
@@ -525,6 +528,9 @@ def _index_injections_by_class(
     for rule in injections:
         match = rule.get("match")
         if not isinstance(match, str) or not match:
+            continue
+        entry = (param_plan or {}).get(match) or {}
+        if entry.get("skip_source_lowering"):
             continue
         class_name = _class_for_fqn(match, boundary_classes, index, "")
         if class_name is None:

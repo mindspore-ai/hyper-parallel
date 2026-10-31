@@ -19,9 +19,14 @@ from __future__ import annotations
 import ast
 from dataclasses import replace
 import importlib
+import textwrap
 from typing import Any
 
-from hyper_parallel.codegen.inline.ir import InlinePatchSet
+from hyper_parallel.codegen.inline.ir import (
+    ImportPatch,
+    InlinePatchSet,
+    ModuleSnippetPatch,
+)
 from hyper_parallel.codegen.inline.meta_plan import normalize_inline_meta
 from hyper_parallel.codegen.inline.patch_engine import apply_patch_set, drop_shadowed_definitions
 from hyper_parallel.codegen.inline.replacement_pass import build_replacement_patches
@@ -74,6 +79,7 @@ def render_inline_modeling(
         getattr(meta, "external_state_classes", None),
     )
     patch_set = _merge_patch_sets(replacement_patches, strategy_patches)
+    _materialize_imported_forward_hosts(source_text, patch_set)
     rendered = apply_patch_set(source_text, patch_set)
     # The copied modeling source brings its own decorated helpers that share
     # names with the library functions the artifact imports, and a local
@@ -88,6 +94,106 @@ def render_inline_modeling(
     )
     normalize_inline_meta(meta, strategy_rules, model_type)
     return rendered
+
+
+def _materialize_imported_forward_hosts(
+    source_text: str, patch_set: InlinePatchSet
+) -> None:
+    """Render same-name subclasses when a strategy host is an imported component."""
+    source_classes = {
+        node.name
+        for node in ast.parse(source_text).body
+        if isinstance(node, ast.ClassDef)
+    }
+    remaining = []
+    rendered: set[str] = set()
+    for patch in patch_set.forward_extracts:
+        if patch.class_name in source_classes:
+            remaining.append(patch)
+            continue
+        import_index = next(
+            (
+                index
+                for index, item in enumerate(patch_set.imports)
+                if not item.raw and patch.class_name in item.names
+            ),
+            None,
+        )
+        if import_index is None:
+            remaining.append(patch)
+            continue
+        if patch.class_name in rendered:
+            continue
+        rendered.add(patch.class_name)
+        imported = patch_set.imports[import_index]
+        other_names = tuple(name for name in imported.names if name != patch.class_name)
+        alias = f"_{patch.class_name}Base"
+        replacement_imports = []
+        if other_names:
+            replacement_imports.append(ImportPatch(imported.module, other_names))
+        replacement_imports.append(ImportPatch(
+            module="",
+            names=(),
+            raw=f"from {imported.module} import {patch.class_name} as {alias}",
+        ))
+        patch_set.imports[import_index:import_index + 1] = replacement_imports
+        body = patch.body.replace("__hp_forward_args__", "*args, **kwargs")
+        snippet = (
+            f"class {patch.class_name}({alias}):\n"
+            "    \"\"\"Generated source-visible parallel form.\"\"\"\n\n"
+            "    cp_enable = False\n\n"
+            "    def _forward_impl(self, *args, **kwargs):\n"
+            "        return super().forward(*args, **kwargs)\n\n"
+            "    def forward(self, *args, **kwargs):\n"
+            f"{textwrap.indent(body.strip(), '        ')}\n"
+        )
+        patch_set.module_snippets.append(ModuleSnippetPatch(snippet))
+    patch_set.forward_extracts = remaining
+
+
+def render_inline_strategies_for_source_unit(
+    source_text: str,
+    meta: Any,
+    model_type: str | None = None,
+    *,
+    patch_plan: Any = None,
+) -> str:
+    """Render only strategy forwards owned by one sibling source unit."""
+    rules = collect_inline_rules(meta)
+    if not rules:
+        return source_text
+    recorded_local_compute = bool(
+        getattr(patch_plan, "local_computes", ())
+        if patch_plan is not None
+        else ()
+    )
+    strategy_rules = (
+        tuple(replace(rule, local_compute_target=None) for rule in rules)
+        if recorded_local_compute
+        else rules
+    )
+    _require_inline_coverage(strategy_rules, model_type)
+    patches = build_strategy_patches(
+        strategy_rules,
+        model_type,
+        getattr(meta, "boundary_classes", None),
+        getattr(meta, "external_state_classes", None),
+    )
+    source_classes = {
+        node.name
+        for node in ast.parse(source_text).body
+        if isinstance(node, ast.ClassDef)
+    }
+    patches.forward_extracts = [
+        patch for patch in patches.forward_extracts
+        if patch.class_name in source_classes
+    ]
+    if not patches.forward_extracts:
+        return source_text
+    patches.module_snippets.clear()
+    patches.constructor_replaces.clear()
+    patches.class_removals.clear()
+    return apply_patch_set(source_text, patches)
 
 
 def _library_import_names(text: str) -> set[str]:

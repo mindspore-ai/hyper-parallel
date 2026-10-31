@@ -488,6 +488,20 @@ def _bind_hidden_arg(body: str, func: "FunctionInfo") -> str:
     return body.replace(_HIDDEN_ARG_TOKEN, func.param_names[0])
 
 
+def _bind_forward_args(body: str, func: "FunctionInfo") -> str:
+    """Bind a dispatch shell's argument token to the original signature."""
+    token = "__hp_forward_args__"
+    if token not in body:
+        return body
+    args = list(func.param_names)
+    if func.vararg_name:
+        args.append(f"*{func.vararg_name}")
+    args.extend(f"{name}={name}" for name in func.kwonly_names)
+    if func.kwarg_name:
+        args.append(f"**{func.kwarg_name}")
+    return body.replace(token, ", ".join(args))
+
+
 def _forward_extract_edits(
     source_text: str,
     patches: Iterable[ForwardExtractPatch],
@@ -504,24 +518,23 @@ def _forward_extract_edits(
     for patch in patches:
         cls = index.find_class(patch.class_name)
         if cls is None:
-            # The class comes from the frozen boundary map (or an explicit
-            # spec literal), so a miss means the plan and the modeling source
-            # disagree — fail fast instead of silently dropping the strategy.
-            raise RuntimeError(
-                f"codegen: inline strategy targets class "
-                f"{patch.class_name!r} which the modeling source does not "
-                "define; the artifact would silently lose this strategy"
-            )
+            # Multi-file remote models may define the target in a sibling.
+            # Bundle-level verification requires one source unit to consume
+            # every recorded patch, so this unit can safely leave it alone.
+            continue
         func = cls.methods.get(patch.method_name)
         if func is None:
             continue
-        impl = _build_forward_impl_edit(
-            source_text,
-            func,
-        )
+        body = _bind_forward_args(_bind_hidden_arg(patch.body, func), func)
+        state_lines = [
+            f"    {axis}_enable = False"
+            for axis in ("tp", "cp", "ep")
+            if f"self.{axis}_enable" in body
+        ]
+        prefix = "\n".join(state_lines) + "\n\n" if state_lines else ""
+        impl = _build_forward_impl_edit(source_text, func, prefix=prefix)
         if impl is not None:
             edits.append(impl)
-        body = _bind_hidden_arg(patch.body, func)
         edits.extend(replace_function_body(source_text, func, body, indent="        "))
     return edits
 

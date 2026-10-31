@@ -18,13 +18,15 @@ from __future__ import annotations
 
 import ast
 import inspect
+import os
 import textwrap
+from collections import defaultdict
+from types import SimpleNamespace
 from typing import Any
 
 from hyper_parallel.codegen.astkit.edits import (
     TextEdit,
     apply_edits,
-    insert_after_imports,
     replace_function_body,
 )
 from hyper_parallel.codegen.astkit.index import FunctionInfo, build_source_index
@@ -32,6 +34,10 @@ from hyper_parallel.codegen.emit.parallel import (
     _add_runtime_helper_import,
     _build_forward_impl_edit,
     _build_forward_body,
+    _render_forward_call,
+    _render_input_redistribute,
+    _render_local_compute,
+    _render_output_redistribute,
 )
 from hyper_parallel.codegen.plan.boundary_forms import (
     FORM_GENERIC,
@@ -45,55 +51,106 @@ def materialize_recorded_forwards(
     meta: Any,
     *,
     patch_plan: Any = None,
+    source_path: str | None = None,
 ) -> str:
-    """Declare observed local-compute decisions without cloning Phase C.
-
-    Local-region wrappers are numerically sensitive: an equivalent source
-    rewrite can change the order in which bfloat16 values cross the boundary.
-    The generated artifact therefore materializes every concrete patch for
-    review without installing it into the native training model.
-    """
+    """Lower observed local-compute decisions into their source-owned classes."""
     patches = patch_plan
     records = getattr(patches, "local_computes", ()) if patches is not None else ()
     if not records:
-        return source_text
+        return _materialize_declared_local_computes(source_text, meta)
 
     _restore_recorded_boundary_ownership(meta, records)
 
-    declarations = []
-    for record in sorted(records, key=lambda item: _fqn_sort_key(item.module_fqn)):
-        entry = _entry_for_record(meta, record)
-        entry["is_boundary"] = True
-        entry["skip_source_lowering"] = True
-        injection = _injection_for_record(meta, record)
-        if injection is None or injection.get("local_compute_fn") is None:
-            raise RuntimeError(
-                f"codegen: recorded local-compute patch {record.module_fqn!r} "
-                "has no frozen local_compute_fn"
+    groups: dict[tuple[type, str], list[Any]] = defaultdict(list)
+    for record in records:
+        if source_path is not None and not _record_belongs_to_source(
+            record, source_path
+        ):
+            continue
+        original = _unbound(record.original_forward)
+        groups[(record.module_type, _source_function_name(original))].append(record)
+
+    rendered = source_text
+    materialized = False
+    for (host_type, source_function), group in sorted(
+        groups.items(), key=lambda item: (item[0][0].__name__, item[0][1])
+    ):
+        _require_one_contract(group, meta)
+        if source_function and _has_module_function(rendered, source_function):
+            rendered = _materialize_bound_module_function(
+                rendered, source_function, group[0], meta
             )
-        declarations.append({
-            "module_fqn": record.module_fqn,
-            "host_class": record.module_type.__name__,
-            "target": injection["local_compute_fn"],
-            "region_dispatch": entry.get("region_dispatch"),
-        })
-    return _emit_native_local_compute_declarations(source_text, declarations)
+            materialized = True
+            continue
+        if not _has_source_class(rendered, host_type.__name__):
+            continue
+        rendered = _materialize_source_class(
+            rendered, host_type.__name__, group[0], meta
+        )
+        materialized = True
+        for record in group:
+            _entry_for_record(meta, record)["skip_source_lowering"] = True
+    return _add_runtime_helper_import(rendered) if materialized else rendered
 
 
-def _emit_native_local_compute_declarations(
-    source_text: str,
-    declarations: list[dict[str, Any]],
-) -> str:
-    """Append the concrete native Phase C patches to the generated model."""
-    lines = [
-        "def hp_recorded_local_compute_patches():",
-        '    """Return builder-recorded patches installed by native trainer Phase C."""',
-        "    return (",
-    ]
-    for declaration in declarations:
-        lines.append(f"        {declaration!r},")
-    lines.extend(["    )", ""])
-    return source_text.rstrip() + "\n\n\n" + "\n".join(lines)
+def _materialize_declared_local_computes(source_text: str, meta: Any) -> str:
+    """Lower explicit frozen local-compute injections when no live record exists."""
+    boundary_classes = getattr(meta, "boundary_classes", None) or {}
+    injections = getattr(meta, "injections", None) or ()
+    source_classes = {
+        node.name
+        for node in ast.parse(source_text).body
+        if isinstance(node, ast.ClassDef)
+    }
+    grouped: dict[str, list[Any]] = defaultdict(list)
+    for injection in injections:
+        local = injection.get("local_compute_fn")
+        module_fqn = injection.get("match")
+        class_name = boundary_classes.get(module_fqn)
+        if local is None or not module_fqn or class_name not in source_classes:
+            continue
+        grouped[class_name].append(SimpleNamespace(
+            module_fqn=module_fqn,
+            factory=_callable_identity(local),
+        ))
+    rendered = source_text
+    materialized = getattr(meta, "materialized_patches", None)
+    for class_name, records in sorted(grouped.items()):
+        _require_one_contract(records, meta)
+        rendered = _materialize_source_class(
+            rendered, class_name, records[0], meta
+        )
+        for record in records:
+            _entry_for_record(meta, record)["skip_source_lowering"] = True
+            if isinstance(materialized, list):
+                materialized.append({
+                    "fqn": record.module_fqn,
+                    "host_class": class_name,
+                    "kind": "local_compute",
+                    "source_form": "same_class_toggle_forward",
+                })
+    return _add_runtime_helper_import(rendered) if grouped else rendered
+
+
+def _callable_identity(value: Any) -> str:
+    """Return a stable identity for a frozen callable declaration."""
+    if isinstance(value, dict):
+        return str(value.get("_target_") or value.get("target") or value.get("name"))
+    return str(value)
+
+
+def _record_belongs_to_source(record: Any, source_path: str) -> bool:
+    """Return whether a recorded host is defined by this source unit."""
+    candidates = (
+        inspect.getsourcefile(record.module_type),
+        inspect.getsourcefile(_unbound(record.original_forward)),
+    )
+    expected = os.path.normcase(os.path.abspath(source_path))
+    return any(
+        candidate is not None
+        and os.path.normcase(os.path.abspath(candidate)) == expected
+        for candidate in candidates
+    )
 
 
 def _restore_recorded_boundary_ownership(meta: Any, records: Any) -> None:
@@ -221,7 +278,23 @@ def _recorded_body(source_text: str, func: FunctionInfo, record: Any, meta: Any)
         injection,
     )
     emitted = FORM_REGION if record.factory is not None else FORM_GENERIC
-    return _build_forward_body(source_text, injection, func, form, emitted)
+    local = injection.get("local_compute_fn") if injection else None
+    if local is not None:
+        body = _render_local_compute(
+            local,
+            _render_input_redistribute(func),
+            _render_output_redistribute(),
+            form,
+        )
+    else:
+        body = _build_forward_body(source_text, injection, func, form, emitted)
+    fallback = _render_forward_call(func).replace("outputs =", "return", 1)
+    return "\n".join([
+        "        if self.ep_enable:",
+        textwrap.indent(body, "    "),
+        "",
+        fallback,
+    ])
 
 
 def _materialize_bound_module_function(
@@ -265,7 +338,11 @@ def _materialize_source_class(
             f"codegen: recorded source host {class_name!r} defines no forward"
         )
     body = _recorded_body(source_text, func, record, meta)
-    impl = _build_forward_impl_edit(source_text, func)
+    impl = _build_forward_impl_edit(
+        source_text,
+        func,
+        prefix="    ep_enable = False\n\n",
+    )
     edits = list(replace_function_body(source_text, func, body, indent=""))
     if impl is not None:
         edits.append(impl)
@@ -307,101 +384,6 @@ def _bind_module_impl(source_text: str, wrapper_name: str, impl_name: str) -> st
     return apply_edits(source_text, edits)
 
 
-def _materialize_imported_host(
-    source_text: str,
-    host_type: type,
-    record: Any,
-    meta: Any,
-) -> tuple[str, bool]:
-    """Generate a source-owned subclass and retarget its construction sites.
-
-    Returns ``(rendered, constructor_replaced)``.  The subclass and its host
-    import are always emitted (the host class lives in an imported module —
-    the recorded ``__module__`` is the only source of truth for the import).
-    ``constructor_replaced`` is ``False`` when the host is instantiated by an
-    imported subtree, so no source-level constructor call exists to retarget;
-    the caller then binds the recorded FQNs through the explicit binder.
-    """
-    host_name = host_type.__name__
-    generated_name = f"HPCodegen{host_name}"
-    if f"class {generated_name}(" in source_text:
-        return source_text, f"{generated_name}(" in source_text
-    host_module = getattr(host_type, "__module__", None)
-    if not host_module or host_module == "__main__":
-        raise RuntimeError(
-            f"codegen: recorded host {host_name!r} has no importable module"
-        )
-    rendered = source_text
-    for import_line in _host_import_lines(host_module, host_name):
-        if import_line in rendered:
-            continue
-        rendered = _ensure_import(rendered, import_line, host_name)
-    signature = inspect.signature(_unbound(record.original_forward))
-    info = _signature_info(signature)
-    call = _render_super_call(signature)
-    body = _recorded_body(rendered, info, record, meta)
-    snippet = "\n".join([
-        f"class {generated_name}({host_name}):",
-        "    \"\"\"Source-owned form of the forward patch installed by the trainer.\"\"\"",
-        "",
-        f"    def _forward_impl{signature}:",
-        f"        return super().forward({call})",
-        "",
-        f"    def forward{signature}:",
-        body,
-        "",
-    ])
-    rendered = _insert_before_first_class(rendered, snippet)
-    return _replace_constructor_calls(rendered, host_name, generated_name)
-
-
-def _emit_recorded_forward_bindings(
-    source_text: str,
-    bindings: dict[str, list[str]],
-) -> str:
-    """Emit one reviewable binder that binds each recorded FQN explicitly.
-
-    ``bindings`` maps an imported host class name to the module FQNs the
-    builder actually patched.  The host instances are created by an imported
-    subtree (``AutoModel.from_config``-style construction), so the generated
-    module reaches them only through the recorded paths — one explicit
-    ``MethodType`` binding per FQN, no type registry and no scanning.
-    """
-    lines = [
-        "def hp_bind_recorded_forwards(model):",
-        "    \"\"\"Bind builder-recorded forward patches onto their recorded modules.\"\"\"",
-    ]
-    for host_name in sorted(bindings):
-        generated_name = f"HPCodegen{host_name}"
-        for fqn in sorted(bindings[host_name], key=_fqn_sort_key):
-            accessor = _fqn_accessor(fqn)
-            lines.extend([
-                f"    module = {accessor}",
-                f"    module._forward_impl = MethodType({generated_name}._forward_impl, module)",
-                f"    module.forward = MethodType({generated_name}.forward, module)",
-            ])
-    rendered = _ensure_import(
-        source_text, "from types import MethodType", "MethodType"
-    )
-    return rendered.rstrip() + "\n\n\n" + "\n".join(lines) + "\n"
-
-
-def _fqn_accessor(fqn: str) -> str:
-    """Render a plan FQN as a Python accessor expression rooted at ``model``.
-
-    Mirrors the runtime ``_resolve_module`` semantics segment by segment:
-    numeric segments index a module list, every other segment is a plain
-    attribute (the first FQN segment names the root's submodule).
-    """
-    accessor = "model"
-    for segment in fqn.split("."):
-        if segment.isdigit():
-            accessor += f"[{segment}]"
-        else:
-            accessor += f".{segment}"
-    return accessor
-
-
 def _fqn_sort_key(fqn: str) -> tuple[tuple[int, int, str], ...]:
     """Natural sort key for plan FQNs — layer indices order by value.
 
@@ -412,127 +394,6 @@ def _fqn_sort_key(fqn: str) -> tuple[tuple[int, int, str], ...]:
         (0, int(segment), "") if segment.isdigit() else (1, 0, segment)
         for segment in fqn.split(".")
     )
-
-
-def _host_import_lines(host_module: str, host_name: str) -> tuple[str, ...]:
-    """Import lines binding ``host_name`` from the recorded ``host_module``.
-
-    HF remote-code cache paths can contain hash components that start with a
-    digit (``transformers_modules.kimi_k3.7dc8....modeling_kimi_linear``); a
-    ``from`` statement over such a path is a syntax error, so identifier-unsafe
-    modules import through ``importlib.import_module`` with the path as a
-    string literal instead.
-    """
-    if all(part.isidentifier() for part in host_module.split(".")):
-        return (f"from {host_module} import {host_name}",)
-    return (
-        "import importlib as _hp_importlib",
-        f'{host_name} = getattr(_hp_importlib.import_module("{host_module}"), "{host_name}")',
-    )
-
-
-def _ensure_import(source_text: str, import_line: str, symbol: str) -> str:
-    """Insert ``import_line`` after the import block unless ``symbol`` is bound."""
-    if _imports_symbol(source_text, symbol):
-        return source_text
-    index = build_source_index(source_text)
-    edit = insert_after_imports(
-        source_text,
-        index.import_end,
-        import_line,
-        default_offset=index.docstring_end or 0,
-    )
-    return apply_edits(source_text, [edit]) if edit is not None else source_text
-
-
-def _imports_symbol(source_text: str, symbol: str) -> bool:
-    """Return whether a top-level import already binds ``symbol``."""
-    for node in ast.parse(source_text).body:
-        if isinstance(node, ast.Import) and any(
-            alias.asname == symbol
-            or (alias.asname is None and alias.name == symbol)
-            for alias in node.names
-        ):
-            return True
-        if isinstance(node, ast.ImportFrom) and any(
-            alias.asname == symbol
-            or (alias.asname is None and alias.name == symbol)
-            for alias in node.names
-        ):
-            return True
-    return False
-
-
-def _signature_info(signature: inspect.Signature) -> FunctionInfo:
-    positional = []
-    keyword_only = []
-    vararg = None
-    kwarg = None
-    for parameter in signature.parameters.values():
-        if parameter.name in ("self", "module"):
-            continue
-        if parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD):
-            positional.append(parameter.name)
-        elif parameter.kind == parameter.KEYWORD_ONLY:
-            keyword_only.append(parameter.name)
-        elif parameter.kind == parameter.VAR_POSITIONAL:
-            vararg = parameter.name
-        elif parameter.kind == parameter.VAR_KEYWORD:
-            kwarg = parameter.name
-    return FunctionInfo("forward", 0, 0, 0, positional, keyword_only, vararg, kwarg)
-
-
-def _render_super_call(signature: inspect.Signature) -> str:
-    args = []
-    for parameter in signature.parameters.values():
-        if parameter.name in ("self", "module"):
-            continue
-        if parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD):
-            args.append(parameter.name)
-        elif parameter.kind == parameter.VAR_POSITIONAL:
-            args.append(f"*{parameter.name}")
-        elif parameter.kind == parameter.KEYWORD_ONLY:
-            args.append(f"{parameter.name}={parameter.name}")
-        elif parameter.kind == parameter.VAR_KEYWORD:
-            args.append(f"**{parameter.name}")
-    return ", ".join(args)
-
-
-def _insert_before_first_class(source_text: str, snippet: str) -> str:
-    tree = ast.parse(source_text)
-    first = next((node for node in tree.body if isinstance(node, ast.ClassDef)), None)
-    if first is None:
-        raise RuntimeError("codegen: generated model source defines no class")
-    lines = source_text.splitlines(keepends=True)
-    # A decorated class's ``lineno`` is the ``class`` line itself; anchor on
-    # the first decorator instead so the insertion cannot steal the target's
-    # decorator block.
-    first_line = min([first.lineno, *(item.lineno for item in first.decorator_list)])
-    offset = sum(len(line) for line in lines[:first_line - 1])
-    return apply_edits(source_text, [TextEdit(offset, offset, snippet + "\n\n")])
-
-
-def _replace_constructor_calls(
-    source_text: str, old_name: str, new_name: str
-) -> tuple[str, bool]:
-    """Retarget every source-level ``old_name(...)`` construction to ``new_name``.
-
-    Returns ``(rendered, replaced)``; ``replaced`` is ``False`` when the host
-    has no source-level construction site (imported-subtree instantiation).
-    """
-    tree = ast.parse(source_text)
-    lines = source_text.splitlines(keepends=True)
-    offsets = [0]
-    for line in lines:
-        offsets.append(offsets[-1] + len(line))
-    edits = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == old_name:
-            start = offsets[node.func.lineno - 1] + node.func.col_offset
-            edits.append(TextEdit(start, start + len(old_name), new_name))
-    if not edits:
-        return source_text, False
-    return apply_edits(source_text, edits), True
 
 
 __all__ = ["materialize_recorded_forwards"]

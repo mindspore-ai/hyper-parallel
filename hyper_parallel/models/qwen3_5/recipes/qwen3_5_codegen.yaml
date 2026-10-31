@@ -1,7 +1,7 @@
-# codegen combination-test case: qwen3_5 tp=1 cp=1 ep=1 pp=1
+# codegen combination-test case: qwen3_5_text tp=2 cp=4 ep=1 pp=1
 model:
-  _target_: hyper_parallel.models.HyperAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: /home/lxy/probe_ckpts/qwen3_5
+  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /home/lxy/codegen_reval/stage10_all_models_offline/assets/qwen3_5_text
   torch_dtype: bfloat16
   attn_implementation: eager
   force_hf: false
@@ -15,13 +15,13 @@ training:
   seed: 42
 
 accelerator:
-  tp_size: 1
-  cp_size: 1
+  tp_size: 2
+  cp_size: 4
   ep_size: 1
   pp_size: 1
 
 fsdp_config:
-  dp_shard_size: 8
+  dp_shard_size: 1
 
 mixed_precision:
   enabled: false
