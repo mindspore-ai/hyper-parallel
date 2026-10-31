@@ -24,6 +24,8 @@ def run_generated_training(
     namespace: Mapping[str, Any],
     architecture: str,
     argv: Sequence[str] | None = None,
+    *,
+    model_class_name: str | None = None,
 ) -> None:
     """Load the training-only entry lazily and run a generated model."""
     # Generated sources import this module for inspection too; defer the
@@ -32,6 +34,6 @@ def run_generated_training(
         run_generated_training as run,
     )
 
-    run(namespace, architecture, argv)
+    run(namespace, architecture, argv, model_class_name=model_class_name)
 
 __all__ = ["run_generated_training"]

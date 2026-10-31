@@ -180,6 +180,7 @@ def _make_primary_executable(
     """Add direct-file package setup and the standard training footer."""
     if not architecture:
         return source_text
+    entry_class = _resolve_entry_class(source_text, architecture)
     family = os.path.basename(os.path.dirname(os.path.normpath(artifact_dir)))
     package = f"hyper_parallel.models.{family}.generated"
     tree = ast.parse(source_text)
@@ -205,9 +206,39 @@ def _make_primary_executable(
         "if __name__ == \"__main__\":",
         "    from hyper_parallel.models._generated import run_generated_training",
         "",
-        f"    run_generated_training(globals(), {architecture!r})",
+        "    run_generated_training(",
+        f"        globals(), {architecture!r}, model_class_name={entry_class!r},",
+        "    )",
     ]
     return "\n".join([*lines, *footer])
+
+
+def _resolve_entry_class(source_text: str, architecture: str) -> str:
+    """Resolve the emitted entry class without model-family name checks."""
+    classes = [
+        node.name
+        for node in ast.parse(source_text).body
+        if isinstance(node, ast.ClassDef)
+    ]
+    if architecture in classes:
+        return architecture
+    task_suffixes = (
+        "ForConditionalGeneration",
+        "ForImageTextToText",
+        "ForSequenceClassification",
+        "ForCausalLM",
+    )
+    suffix = next(
+        (candidate for candidate in task_suffixes if architecture.endswith(candidate)),
+        None,
+    )
+    matches = [name for name in classes if suffix is not None and name.endswith(suffix)]
+    if len(matches) == 1:
+        return matches[0]
+    raise RuntimeError(
+        "codegen: generated primary source does not expose a unique training "
+        f"entry for architecture {architecture!r}; candidates={matches!r}"
+    )
 
 
 def _materialize_sibling(

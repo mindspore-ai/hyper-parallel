@@ -45,15 +45,19 @@ def run_generated_training(
     namespace: Mapping[str, Any],
     architecture: str,
     argv: Sequence[str] | None = None,
+    *,
+    model_class_name: str | None = None,
 ) -> None:
     """Run standard training with the model class from a generated source.
 
     Args:
         namespace: Generated module globals.
-        architecture: Entry architecture class emitted into that module.
+        architecture: Architecture identity stored in the training config.
         argv: Standard training CLI arguments excluding the program name.
+        model_class_name: Emitted entry class when its public artifact name
+            differs from the upstream architecture identity.
     """
-    model_class = _entry_model_class(namespace, architecture)
+    model_class = _entry_model_class(namespace, model_class_name or architecture)
     config = parse_training_args(argv)
     trainer_class = _trainer_type(config)
     with generated_model_build(model_class, architecture):

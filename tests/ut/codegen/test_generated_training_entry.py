@@ -43,7 +43,22 @@ def test_primary_generated_source_is_directly_executable() -> None:
 
     compile(rendered, "modeling_future_gen_npu.py", "exec")
     assert "__package__ = 'hyper_parallel.models.future_model.generated'" in rendered
-    assert "run_generated_training(globals(), 'FutureArchitecture')" in rendered
+    assert (
+        "globals(), 'FutureArchitecture', "
+        "model_class_name='FutureArchitecture',"
+    ) in rendered
+
+
+def test_primary_entry_resolves_renamed_model_by_task_contract() -> None:
+    source = "class FutureV2ForConditionalGeneration:\n    pass\n"
+
+    rendered = _make_primary_executable(
+        source,
+        architecture="FutureV1ForConditionalGeneration",
+        artifact_dir="/repo/hyper_parallel/models/future_v2/generated",
+    )
+
+    assert "model_class_name='FutureV2ForConditionalGeneration'" in rendered
 
 
 def test_generated_build_overlay_restores_native_hooks_on_error() -> None:
