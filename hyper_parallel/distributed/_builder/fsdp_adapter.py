@@ -25,6 +25,7 @@ Trainer step runtime); ``FSDP2Manager`` / ``_instantiate_fsdp2`` and the
 
 from __future__ import annotations
 
+import fnmatch
 import logging
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
@@ -53,6 +54,43 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_custom_params(
+    model: ModuleClass,
+    custom_params: Mapping[str, Mapping[str, Any]],
+    dtype_by_name: Mapping[Any, Any],
+) -> dict[ParameterClass, dict[str, Any]]:
+    """Resolve ``custom_params`` keys to Parameter-keyed dtype overrides.
+
+    A key is an exact root-relative parameter name or an ``fnmatch.fnmatchcase`` pattern over those
+    names, as the plan_overrides ``match`` patterns.
+
+    Args:
+        model: Root module whose ``named_parameters`` define the names, before any FSDP wrapping.
+        custom_params: Parameter names or patterns mapped to YAML dtype overrides.
+        dtype_by_name: YAML dtype string to dtype mapping.
+
+    Returns:
+        Every matched Parameter mapped to its resolved dtype overrides.
+
+    Raises:
+        ValueError: If a key matches no parameter, or one Parameter gets different overrides.
+    """
+    parameters_by_fqn = dict(model.named_parameters(remove_duplicate=False))
+    resolved = {}
+    for key, custom_dtypes in custom_params.items():
+        fqns = [key] if key in parameters_by_fqn else [
+            fqn for fqn in parameters_by_fqn if fnmatch.fnmatchcase(fqn, key)]
+        if not fqns:
+            raise ValueError(f"mix_precision.custom_params matches no parameter: {key}")
+        resolved_dtypes = {name: dtype_by_name[dtype] for name, dtype in custom_dtypes.items()}
+        for fqn in fqns:
+            parameter = parameters_by_fqn[fqn]
+            if parameter in resolved and resolved[parameter] != resolved_dtypes:
+                raise ValueError(f"mix_precision.custom_params has conflicting overrides for {fqn}")
+            resolved[parameter] = resolved_dtypes
+    return resolved
 
 
 @dataclass(frozen=True)
@@ -168,8 +206,8 @@ class FSDP2Manager:
             return dense_mesh
         return self._build_compatibility_fsdp_mesh()
 
-    def _build_mixed_precision_policy(self) -> fully_shard_utils.MixedPrecisionPolicy:
-        """Resolve the configured dtype strings to torch dtypes.
+    def _build_mixed_precision_policy(self, model: ModuleClass) -> fully_shard_utils.MixedPrecisionPolicy:
+        """Resolve dtype strings and parameter names before FSDP replaces weights.
 
         Dtype strings stay YAML-friendly; ``float32`` resolves to the
         framework's ``float32`` dtype object. Fully-sharded params without an
@@ -182,12 +220,17 @@ class FSDP2Manager:
             "float16": torch.float16,
             "float32": torch.float32,
         }
+        custom_params = (
+            _resolve_custom_params(model, mix_precision.custom_params, dtype_by_name)
+            if mix_precision.custom_params else {}
+        )
         return fully_shard_utils.MixedPrecisionPolicy(
             param_dtype=dtype_by_name[mix_precision.param_dtype],
             reduce_dtype=dtype_by_name[mix_precision.reduce_dtype],
             output_dtype=dtype_by_name[mix_precision.output_dtype],
             cast_forward_inputs=mix_precision.cast_forward_inputs,
             apply_grad_on_fp32_main_grad=self.fp32_main_params,
+            custom_params=custom_params if custom_params else None,
         )
 
     def _build_offload_policy(self) -> fully_shard_utils.OffloadPolicy:
@@ -199,9 +242,9 @@ class FSDP2Manager:
     def _build_fully_shard_kwargs(
         self,
         fsdp_mesh: DeviceMesh,
+        mp_policy: fully_shard_utils.MixedPrecisionPolicy,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Build shared sublayer kwargs and the root-specialized copy."""
-        mp_policy = self._build_mixed_precision_policy()
         offload_policy = self._build_offload_policy()
 
         fsdp_sublayer_kwargs = {
@@ -625,7 +668,7 @@ class FSDP2Manager:
                 if self.mesh_context.fsdp_moe_mesh is None:
                     raise ValueError("Expert TP metadata requires MeshContext.fsdp_moe_mesh")
                 fsdp_sublayer_kwargs, _ = self._build_fully_shard_kwargs(
-                    self._build_fsdp_actual_mesh(expert=True)
+                    self._build_fsdp_actual_mesh(expert=True), dense_fsdp_kwargs["mp_policy"]
                 )
             fully_shard(  # pylint: disable=unexpected-keyword-arg
                 wrap_module.module,
@@ -716,11 +759,12 @@ class FSDP2Manager:
             source_shard_info,
         )
         replicate_params = self._resolve_replicate_params(model)
+        mp_policy = self._build_mixed_precision_policy(model)
 
         wrap_modules = self._find_wrap_modules(model, metadata_by_parameter)
         owner_by_parameter = self._resolve_parameter_owners(model, wrap_modules)
         dense_fsdp_kwargs, dense_root_kwargs = self._build_fully_shard_kwargs(
-            self._build_fsdp_actual_mesh()
+            self._build_fsdp_actual_mesh(), mp_policy
         )
 
         gradient_scaled_units = self._parallelize_child_units(
