@@ -151,3 +151,48 @@ def test_async_hierarchical_broadcast_waits_between_mesh_dimensions():
     first_work.wait.assert_called_once_with()
     final_work.wait.assert_not_called()
     assert handles == [final_work]
+
+
+@pytest.mark.parametrize("replica_count", [1, 2])
+def test_muon_preserves_explicit_replica_count_across_cache_rebuilds(replica_count: int) -> None:
+    """An explicit subgroup size must not be replaced by the topology heuristic."""
+    parameter = torch.nn.Parameter(torch.ones(2, 2, device="cpu"))
+    with patch.object(Muon, "_auto_deduce_replica_count", return_value=None) as deduce:
+        optimizer = Muon([parameter], hsdp_replica_count=replica_count)
+        assert optimizer.hsdp_replica_count == replica_count, (
+            f"expected explicit size={replica_count}, got={optimizer.hsdp_replica_count}"
+        )
+        optimizer.load_state_dict(optimizer.state_dict())
+        optimizer.reset_optimizer_parameters()
+        assert optimizer.hsdp_replica_count == replica_count, (
+            f"expected explicit size={replica_count}, got={optimizer.hsdp_replica_count}"
+        )
+    deduce.assert_not_called()
+
+
+def test_muon_without_explicit_replica_count_keeps_automatic_selection() -> None:
+    """An omitted size still follows automatic selection when caches are rebuilt."""
+    parameter = torch.nn.Parameter(torch.ones(2, 2, device="cpu"))
+    with patch.object(Muon, "_auto_deduce_replica_count", side_effect=[None, 2, None]) as deduce:
+        optimizer = Muon([parameter])
+        assert optimizer.hsdp_replica_count is None, (
+            f"expected automatic full replica group, got={optimizer.hsdp_replica_count}"
+        )
+        optimizer.reset_optimizer_parameters()
+        assert optimizer.hsdp_replica_count == 2, (
+            f"expected automatic size=2, got={optimizer.hsdp_replica_count}"
+        )
+        optimizer.reset_optimizer_parameters()
+        assert optimizer.hsdp_replica_count is None, (
+            f"expected automatic full replica group, got={optimizer.hsdp_replica_count}"
+        )
+    assert deduce.call_count == 3, f"expected three automatic selections, got={deduce.call_count}"
+
+
+@pytest.mark.parametrize("replica_count", [0, -1])
+def test_muon_validates_explicit_replica_count_before_topology_selection(replica_count: int) -> None:
+    """Invalid explicit sizes must reach the existing subgroup validation."""
+    parameter = torch.nn.Parameter(torch.ones(2, 2, device="cpu"))
+    with patch.object(Muon, "_auto_deduce_replica_count", return_value=None):
+        with pytest.raises(ValueError, match="must be positive"):
+            Muon([parameter], hsdp_replica_count=replica_count)
