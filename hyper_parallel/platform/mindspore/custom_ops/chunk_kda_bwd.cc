@@ -49,12 +49,16 @@ std::vector<ms::Tensor> npu_chunk_kda_bwd(
   const std::string layout = layout_opt.value_or("BNSD");
   ValidateShapeAccess(q);
   const bool varlen = q.shape().size() == 3U;
+  if (!use_gate_in_kernel || !safe_gate || !raw_g_opt.has_value() || !a_log_opt.has_value() ||
+      !dt_bias_opt.has_value()) {
+    MS_LOG(EXCEPTION) << "Current KDA backward requires fused safe gate with raw gate, A_log and dt_bias.";
+  }
 
-  ms::Tensor dq(ms::TypeId::kNumberTypeFloat32, q.shape());
-  ms::Tensor dk(ms::TypeId::kNumberTypeFloat32, k.shape());
+  ms::Tensor dq(q.data_type(), q.shape());
+  ms::Tensor dk(k.data_type(), k.shape());
   ms::Tensor dv(v.data_type(), v.shape());
   ms::Tensor db(ms::TypeId::kNumberTypeFloat32, beta.shape());
-  ms::Tensor dg(ms::TypeId::kNumberTypeFloat32, gk.shape());
+  ms::Tensor dg(raw_g_opt.value().data_type(), raw_g_opt.value().shape());
   const int64_t heads = varlen ? q.shape()[0] : q.shape()[1];
   ms::Tensor d_a(ms::TypeId::kNumberTypeFloat32, {heads});
   ms::Tensor d_bias(ms::TypeId::kNumberTypeFloat32, {heads, 128});
@@ -68,7 +72,8 @@ std::vector<ms::Tensor> npu_chunk_kda_bwd(
   const std::optional<ms::Tensor> d_bias_opt = dt_bias_opt.has_value() ? std::optional<ms::Tensor>(d_bias) : empty;
   MS_DISPATCH_ACLNN(aclnnChunkKdaBwd, q, k, v, beta, gk, aqk, akk, w, qg, kg, v_new, h, d_o, raw_g_opt, a_log_opt,
                     dt_bias_opt, empty, empty, OptionalIntArray(cu_seqlens_opt), OptionalIntArray(chunk_indices_opt),
-                    scale, chunk_size, safe_gate, use_gate_in_kernel, lower_bound, true, true, false, dq, dk, dv, db,
+                    scale, chunk_size, safe_gate, use_gate_in_kernel, lower_bound, true, true, false,
+                    empty, empty, empty, layout, false, false, dq, dk, dv, db,
                     dg, empty, d_a_opt, d_bias_opt);
   return {dq, dk, dv, db, dg, d_a, d_bias};
 }

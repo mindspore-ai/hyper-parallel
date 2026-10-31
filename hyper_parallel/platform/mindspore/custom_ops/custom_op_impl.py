@@ -1184,7 +1184,7 @@ def _run_chunk_kda_fwd(q, k, v, g, beta, scale, chunk_size, layout,
     result = _custom_ops.npu_chunk_kda_fwd(
         q_head, k_head, v_head, g_head, beta_head, scale, chunk_size,
         canonical_layout, True, safe_gate, lower_bound,
-        use_gate_in_kernel, a_log, dt_bias, initial_state, cu_seqlens,
+        use_gate_in_kernel, a_log, None if dt_bias is None else dt_bias.reshape(-1), initial_state, cu_seqlens,
         chunk_indices, state_v_first
     )
     canonical_inputs = (q_head, k_head, v_head, g_head, beta_head)
@@ -1197,6 +1197,8 @@ def _run_chunk_kda_bwd(q, k, v, beta, gk, aqk, akk, w, qg, kg, v_new, h,
                        chunk_indices=None, safe_gate=False,
                        use_gate_in_kernel=False, lower_bound=-5.0):
     """Run backward after canonicalizing layout and adapting GQA heads."""
+    if not use_gate_in_kernel or not safe_gate or any(value is None for value in (raw_g, a_log, dt_bias)):
+        raise ValueError("Current ChunkKdaBwd requires fused safe gate with raw_g, a_log and dt_bias.")
     zero_gate = ms.ops.zeros_like(gk)
     q, k, v, raw_head, beta = _canonicalize_chunk_kda_inputs(
         q, k, v, raw_g if raw_g is not None else zero_gate, beta, layout
@@ -1215,14 +1217,23 @@ def _run_chunk_kda_bwd(q, k, v, beta, gk, aqk, akk, w, qg, kg, v_new, h,
     q_kernel = q if ratio == 1 else ms.ops.repeat_interleave(q, ratio, axis=head_axis).contiguous()
     k_kernel = k if ratio == 1 else ms.ops.repeat_interleave(k, ratio, axis=head_axis).contiguous()
     bias_head = None if dt_bias is None else dt_bias.reshape((value_heads, 128))
+    # Latest upstream backward uses token-major raw gate/beta/dout and dg/db;
+    # q/k/v and saved caches remain in the canonical head-major layout.
+    token_perm = (1, 0, 2) if canonical_layout == "NTD" else (0, 2, 1, 3)
+    beta_perm = (1, 0) if canonical_layout == "NTD" else (0, 2, 1)
+    raw_token = ms.ops.transpose(raw_head, token_perm).contiguous()
+    beta_token = ms.ops.transpose(beta, beta_perm).contiguous()
+    dout_token = ms.ops.transpose(d_o, token_perm).contiguous()
     outputs = _custom_ops.npu_chunk_kda_bwd(
-        q_kernel, k_kernel, v, beta, gk, aqk, akk, w, qg, kg, v_new, h,
-        d_o, raw_head if use_gate_in_kernel else None,
+        q_kernel, k_kernel, v, beta_token, gk, aqk, akk, w, qg, kg, v_new, h,
+        dout_token, raw_token if use_gate_in_kernel else None,
         a_log if use_gate_in_kernel else None, bias_head,
         cu_seqlens, chunk_indices, scale, chunk_size, safe_gate,
         use_gate_in_kernel, lower_bound, canonical_layout
     )
     dq, dk, dv, db, dg, d_a, d_bias = outputs
+    db = ms.ops.transpose(db, beta_perm).contiguous()
+    dg = ms.ops.transpose(dg, token_perm).contiguous()
     if ratio != 1:
         if canonical_layout == "BNSD":
             batch, _, tokens, dim = dq.shape
