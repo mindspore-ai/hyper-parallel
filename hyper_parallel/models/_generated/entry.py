@@ -20,7 +20,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from hyper_parallel.models._generated.build_overlay import generated_model_build
-from hyper_parallel.trainer.config import parse_training_args
+from hyper_parallel.trainer.config.parser import parse_training_args
 from hyper_parallel.trainer.text_trainer import TextTrainer
 from hyper_parallel.trainer.vlm_trainer import VLMTrainer
 
