@@ -30,7 +30,7 @@ Provider fields stay ``None`` until the family's adapter modules land
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 
 @dataclass(frozen=True)
@@ -94,6 +94,9 @@ class ModelAdapterSpec:
         context_parallel: provider returning the family's CP wrappers.
         expert_parallel: provider returning the family's EP compute
             factories.
+        expert_parallel_options: provider accepting a MoE owner and returning
+            model-owned router/combine options for a Module Family EP factory.
+            Required for automatic EP binding after an Experts replacement.
         sharding_rules: provider returning the family's planner naming-rule
             overrides — ``[(pattern | [patterns], ParamRole), ...]`` checked
             before the default naming rules in Phase 1 (e.g. DeepSeek MLA's
@@ -140,3 +143,4 @@ class ModelAdapterSpec:
     validation: Optional[Callable[..., Any]] = None
     loss: Optional[Callable[..., Any]] = None
     encoder_parallel: Optional[Callable[..., Any]] = None
+    expert_parallel_options: Optional[Callable[[Any], Mapping[str, Any]]] = None

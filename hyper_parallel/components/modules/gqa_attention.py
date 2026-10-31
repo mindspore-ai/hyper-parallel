@@ -26,6 +26,7 @@ from torch import nn
 from hyper_parallel.components.checkpoint.weight_conversion import WeightConverter
 
 from hyper_parallel.components.checkpoint import InterleaveGateQKV, InterleaveQKV
+from hyper_parallel.components.modules.family import ModuleFamily, register_module_family
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.components.functional import (
     apply_rotary_pos_emb,
@@ -525,3 +526,21 @@ class GatedGQAAttention(nn.Module):
         attn_output = attn_output * torch.sigmoid(gate)
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
+
+
+register_module_family(ModuleFamily(
+    name="grouped_query_attention",
+    baseline=GQAAttention,
+    variants={},
+    parallel_adapters={
+        "cp": "hyper_parallel.distributed.context_parallel.gqa_attention.gqa_attention_cp_wrapper",
+    },
+))
+register_module_family(ModuleFamily(
+    name="gated_grouped_query_attention",
+    baseline=GatedGQAAttention,
+    variants={},
+    parallel_adapters={
+        "cp": "hyper_parallel.distributed.context_parallel.gqa_attention.gqa_attention_cp_wrapper",
+    },
+))

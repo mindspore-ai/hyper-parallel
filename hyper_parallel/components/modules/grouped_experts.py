@@ -497,6 +497,9 @@ class GroupedExperts(nn.Module):
 register_module_family(ModuleFamily(
     name="grouped_experts",
     baseline=GroupedExperts,
+    parallel_adapters={
+        "ep": "hyper_parallel.distributed.expert_parallel.grouped_experts.grouped_experts_ep_compute_fn",
+    },
     variants={
         "mxfp8": "hyper_parallel.components.modules.mxfp8_grouped_swiglu.MXFP8GroupedSwiGLU",
         "fused_mxfp8": "hyper_parallel.components.modules.mxfp8_grouped_swiglu.FusedMXFP8GroupedSwiGLU",

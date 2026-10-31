@@ -47,6 +47,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from torch import nn
 
+from hyper_parallel.components.modules.family import get_family_parallel_adapter
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.placement_types import (
     Partial,
@@ -169,6 +170,11 @@ class ShardingPlanner:
     planner is constructed — the planner itself has exactly one override
     interface.
 
+    After explicit overrides are merged, registered Module Families can fill
+    missing CP/EP injections on the final replaced modules. EP additionally
+    requires model-owned routing options from ``ModelAdapterSpec``. This does
+    not infer adapters for unregistered types or change parameter ownership.
+
     ``derive=False`` turns the planner into a pure declaration assembler:
     template derivation (Phases 2-4) is skipped and the plan contains ONLY
     the ``plan_overrides`` specs — every key is insert mode and must be
@@ -275,10 +281,69 @@ class ShardingPlanner:
         """Normalize overrides and finish placement-dependent boundary metadata."""
         _merge_plan_overrides(self._plan_overrides, plan, model, derive=self._derive)
         _normalize_contract_fields(plan)
+        if self._derive:
+            for fqn, spec in plan.modules.items():
+                self._bind_family_parallel_adapter(
+                    model, fqn, spec, cp_active="cp" in mesh_dim_names, ep_size=ep_size,
+                )
         self._mark_virtual_ep_parameters(plan, ep_size, mesh)
         _finalize_tp_local_attr_plans(plan, model, tp_size=tp_size, mesh_dim_names=mesh_dim_names)
         self._finalize_deferred_biases(plan, model, mesh_dim_names)
         self._finalize_fused_expert_tp_guard(plan, tp_size=tp_size)
+
+    @staticmethod
+    def _bind_family_parallel_adapter(
+        model: Any, fqn: str, spec: ModuleShardingSpec, *, cp_active: bool, ep_size: int,
+    ) -> None:
+        """Fill missing compute injections from final, replaced module types.
+
+        Explicit plan injections and instance forward replacements own execution.
+        Family defaults reuse the already derived boundary and parameter layout.
+        """
+        if not spec.is_boundary or (not cp_active and ep_size <= 1):
+            return
+        if spec.local_compute_fn is not None or spec.inner_wrapper is not None or spec.inner_target is not None:
+            return
+        module = model.get_submodule(fqn)
+        if "forward" in vars(module):
+            logger.info("Keep explicit forward replacement at %s; skip Family parallel binding", fqn)
+            return
+        if cp_active and spec._needs_cp_attn:  # pylint: disable=protected-access
+            wrapper = get_family_parallel_adapter(type(module), "cp")
+            if wrapper is not None:
+                if spec.region_dispatch is True:
+                    raise ValueError(f"{fqn}: Family CP requires region_dispatch=False")
+                spec.inner_target = "self"
+                spec.inner_wrapper = wrapper
+                spec.region_dispatch = False
+                logger.info("Bind Family CP adapter at %s: %s", fqn, wrapper.__name__)
+        experts = getattr(module, "experts", None)
+        if ep_size <= 1 or experts is None or not any(
+            isinstance(placement.get(EP), Shard) for placement in spec.params.values()
+        ):
+            return
+        factory = get_family_parallel_adapter(type(experts), "ep")
+        if factory is None:
+            return
+        # Both registries/config reference the planner; resolve only after
+        # module initialization to avoid circular imports.
+        from hyper_parallel.models.registry import get_model_adapter  # pylint: disable=C0415
+        from hyper_parallel.trainer.config.target import Target  # pylint: disable=C0415
+
+        adapter = get_model_adapter(_get_architecture(model))
+        provider = None if adapter is None else adapter.expert_parallel_options
+        if provider is None:
+            raise ValueError(
+                f"{fqn}: automatic Family EP requires model adapter expert_parallel_options; "
+                "register model routing/combine semantics or provide an explicit local_compute_fn"
+            )
+        if spec.inner_wrapper is not None or spec.region_dispatch is True:
+            raise ValueError(f"{fqn}: Family EP conflicts with the configured compute injection")
+        spec.local_compute_fn = Target(
+            factory, target_path=f"{factory.__module__}.{factory.__name__}", **provider(module),
+        )
+        spec.region_dispatch = False
+        logger.info("Bind Family EP adapter at %s: %s", fqn, factory.__name__)
 
     @staticmethod
     def _log_explanation(plan: ShardingPlan, enabled: bool) -> None:

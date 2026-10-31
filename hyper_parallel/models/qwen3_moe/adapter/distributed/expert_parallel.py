@@ -39,6 +39,16 @@ from hyper_parallel.distributed.recipe_spec import (
 )
 
 
+def grouped_experts_ep_options(module: Any) -> dict[str, Any]:
+    """Supply Qwen3-MoE routing semantics to the selected Experts Family."""
+    if not callable(getattr(module, "gate", None)):
+        raise ValueError("Qwen3-MoE EP requires a callable gate on the MoE owner")
+    return {
+        "router_fn": MOE_ROUTER_ADAPTERS["qwen3moe"],
+        "combine": SHARED_MERGE_MODES["none"],
+    }
+
+
 @local_compute
 def qwen3moe_ep_compute_fn(
     *,
@@ -72,5 +82,6 @@ def qwen3moe_ep_compute_fn(
 
 
 __all__ = [
+    "grouped_experts_ep_options",
     "qwen3moe_ep_compute_fn",
 ]

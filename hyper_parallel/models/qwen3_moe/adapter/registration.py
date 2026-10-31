@@ -18,6 +18,8 @@ Providers remain lazy so registry discovery does not import model
 implementations, trainer/data modules, or backend dependencies.
 """
 
+from typing import Any
+
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 from hyper_parallel.models.registry import register_model_adapter
 
@@ -62,6 +64,11 @@ def _load_loss():
     return chunked_loss
 
 
+def _expert_parallel_options(module: Any) -> dict[str, Any]:
+    """Resolve model routing lazily when a replaced Experts needs EP."""
+    return _load_expert_parallel().grouped_experts_ep_options(module)
+
+
 QWEN3_MOE_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Qwen3MoeForCausalLM",
     model_type="qwen3_moe",
@@ -69,6 +76,7 @@ QWEN3_MOE_ADAPTER_SPEC = ModelAdapterSpec(
     attention=_load_attention,
     context_parallel=_load_context_parallel,
     expert_parallel=_load_expert_parallel,
+    expert_parallel_options=_expert_parallel_options,
     loss=_load_loss,
 )
 

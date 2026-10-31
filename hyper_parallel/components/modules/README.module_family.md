@@ -2,7 +2,7 @@
 
 Module Family 在构建阶段为同一种模块选择具体实现。用户通过统一的 replacement 入口填写选择参数，框架根据模块族声明的白名单规则选出实现，再复用现有的 Module Replacement 完成模型层匹配和实例安装。
 
-当前内置 `GroupedExperts` Family，提供默认高性能实现、MXFP8 和融合 MXFP8。更多模块可通过注册自己的 Family 接入。
+当前内置 `GroupedExperts` Family（默认实现、MXFP8 和融合 MXFP8）以及 GQA/gated-GQA 的并行声明。更多模块可通过注册自己的 Family 接入。
 
 ## 使用 GroupedExperts Family
 
@@ -210,3 +210,82 @@ plan_overrides:
 | [MXFP8 单设备测试](../../../tests/torch/expert_parallel/test_family_mxfp8_local.py) | 非融合与融合的设备计算验证 |
 
 通用高性能模块的安装与替换说明见 [modules README](README.md)。
+
+
+## Family 的 CP / EP 适配声明
+
+`ModuleFamily.parallel_adapters` 将具体类型绑定到适配函数的导入路径。Family 保留选型与绑定声明，
+适配实现按职责放在现有 `distributed/context_parallel/` 和 `distributed/expert_parallel/` 目录。
+它们采用与模型 adapter 相同的 wrapper / factory 格式，不依赖某个具体模型的 adapter。
+
+| Family | 声明位置 | 适配入口 | 复用能力 |
+| --- | --- | --- | --- |
+| GQAAttention / GatedGQAAttention | `gqa_attention.py` 文件末尾 | `context_parallel/gqa_attention.py::gqa_attention_cp_wrapper` | 已有 `_cp_sdpa_call`、K/V all-gather、mask 处理、forward rewriter |
+| GroupedExperts | 原有 Family 声明 | `expert_parallel/grouped_experts.py::grouped_experts_ep_compute_fn` | 已有 `build_ep_compute`、dispatch/combine、分块及本地专家入口 |
+
+例如原有 GroupedExperts Family 增加：
+
+```python
+parallel_adapters={
+    "ep": "hyper_parallel.distributed.expert_parallel.grouped_experts.grouped_experts_ep_compute_fn",
+}
+```
+
+在构建阶段按最终具体类型查询；查询时才导入适配实现。注册过程不导入 CP/EP 实现，不创建通信组。
+变体不自动继承 baseline 的并行能力；MXFP8 的现有限制不变。导入或执行错误直接抛出，不自动 fallback。
+
+```python
+from hyper_parallel.components.modules.family import get_family_parallel_adapter
+
+cp_wrapper = get_family_parallel_adapter(type(attention), "cp")
+ep_factory = get_family_parallel_adapter(type(moe.experts), "ep")
+```
+
+查询到的 CP wrapper 按已有 `inner_wrapper` / `inner_target="self"` 方式注入。
+GQA adapter 保留模块选定的 `attention_interface` 和投影/归一化/RoPE/输出流程，仅适配 BNSD/BSND 接口。
+首版使用已有 all-gather 策略；外部 mask 须覆盖全局 K/V 并已包含模型所需的因果限制。
+cache、packed sequence、sliding window 和 attention weights 输出暂不支持。
+其他 CP 策略应另行验证，不能因注册了 CP adapter 就视为全部支持。
+
+EP factory 与当前模型 EP factory 一样作用于 **MoE owner**；`router_fn`、`combine` 和可选的 `overlap_fn`
+由模型适配层显式提供，Family 不猜测模型语义：
+
+```python
+compute = ep_factory(
+    module=moe, mesh=mesh, tp_mesh=tp_mesh, cp_mesh=cp_mesh, ep_mesh=ep_mesh,
+    router_fn=model_router, combine=model_combine, overlap_fn=model_shared_branch,
+)
+```
+
+Family EP factory 显式传入 `use_grouped_gemm=True`，进入已有 expert-major 分支，
+由最终模块的 `forward_expert_major` 执行计算，保留其权重布局、激活与选定实现。
+适配层先检查该方法存在，实际计算不会切换到原生 GMM；通用 `expert_parallel/experts.py` 保持原样。
+路由权重仍由原有 combine 应用一次。
+模块替换完成后，现有 Planner 在合并用户配置后，根据最终模块类型和激活的并行轴自动补齐适配：
+
+- GQA/gated-GQA 的 attention 边界在 `cp_size > 1` 时绑定 CP wrapper。
+- `GroupedExperts` 所在 MoE 边界在 `ep_size > 1` 且专家权重声明为 EP 分片时绑定 EP factory。
+  模型通过 `ModelAdapterSpec.expert_parallel_options(moe)` 提供路由、combine 和可选共享分支配置；
+  首版接入 Qwen3-MoE。其他模型须补齐此声明或显式提供 `local_compute_fn`，缺失时构建报错。
+- 已有的显式 `local_compute_fn`、`inner_wrapper`、`inner_target` 或实例 `forward` 替换优先，避免重复包装。
+  Family 通信适配与 `region_dispatch=True` 冲突时明确报错。
+- 并行度为 1 时不绑定。未注册的模块沿用已有流程；`derive=False` 仍由用户完整声明方案。
+
+支持的组合只需声明 module replacement 和并行度，不需要再手动查询 getter 或配置 CP/EP factory。
+查询示例仍可用于检查声明或自行组合。自动绑定复用原有边界、参数布局和 apply 流程；
+通用 CP wrappers、EP experts.py 和参数归属保持原样，不增加第二套注册表或 dispatcher。
+Experts 通信边界迁移仍是 #793 的后续工作。
+
+验证入口：
+
+```bash
+python -m pytest -q tests/ut/components/modules/test_family_parallel_adapters.py
+python -m pytest -q tests/ut/dual_mode_dtensor/test_ep_moe_local_region.py
+python -m pytest -q tests/torch/expert_parallel/test_module_parallel_adapters.py
+```
+
+测试使用实际 GQAAttention / GroupedExperts，设备 GMM 和 attention 采用 CPU 计算。
+新增真实两进程 builder → Planner → apply 检查，自动绑定 CP/EP 并由已有 apply 切分专家参数；
+另外的执行矩阵显式切分参数以单独验证通信。
+覆盖输出/梯度、原生/替换模块、不均匀/空路由、同步/分离 dispatch、1/2 个 chunk 及模块 hooks。
+真实 Ulysses 通信、设备异步重叠、完整 HF 模型训练/checkpoint/FSDP 与 NPU/GPU 整模精度性能仍待验证。

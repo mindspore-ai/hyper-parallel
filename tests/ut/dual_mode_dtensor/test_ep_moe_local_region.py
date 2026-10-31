@@ -17,13 +17,18 @@ assertions carrying a case-identification message; atomic assertions
 # and these tests directly validate private planner metadata.
 # pylint: disable=unused-argument,protected-access
 
+from copy import deepcopy
 import functools
+import unittest
 from unittest import mock
+from unittest.mock import patch
 
 import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
+from tests.common.module_parallel_utils import PackedExperts, cpu_grouped_matmul, make_grouped_experts
+
 from hyper_parallel.distributed.expert_parallel import recipes as ep_compute
 from hyper_parallel.distributed.expert_parallel.recipes import routed_only_ep_compute_fn
 from hyper_parallel.distributed.expert_parallel.routing import (
@@ -33,6 +38,7 @@ from hyper_parallel.distributed.expert_parallel.routing import (
     _topk_router_module,
 )
 from hyper_parallel.distributed.expert_parallel.experts import (
+    bind_local_expert_forward,
     _local_swiglu_expert_forward,
     resolve_swiglu_weights,
 )
@@ -1360,3 +1366,38 @@ def test_planner_ep_extend_contracts(tiny_hf_native_moe, tiny_hf_batched_moe,
     # Non-divisible -> error
     with pytest.raises(ValueError, match="must divide"):
         _expert_mesh_layout(mesh, ("dp", "tp"), 3)
+
+
+class TestReplacementExpertCompute(unittest.TestCase):
+    """Replacement and native experts share the existing local EP entry."""
+
+    def test_existing_grouped_entry_preserves_selected_computation(self):
+        torch.manual_seed(19)
+        source = PackedExperts()
+        module = make_grouped_experts(source)
+        reference = deepcopy(source)
+        owner = torch.nn.Module()
+        owner.experts = module
+        bind_local_expert_forward(owner, 1, use_grouped_gemm=True)
+        states = torch.randn(5, 4, dtype=torch.float64, requires_grad=True)
+        indices = torch.tensor([3, 0, 3, 1, 0])
+        hook = unittest.mock.Mock(return_value=None)
+        module.register_forward_pre_hook(hook)
+        with patch("hyper_parallel.components.modules.grouped_experts.grouped_matmul",
+                   side_effect=cpu_grouped_matmul), patch.object(
+                   module, "forward_expert_major", wraps=module.forward_expert_major) as compute:
+            actual = module(states, indices)
+        expected = reference(states, indices[:, None], torch.ones(5, 1, dtype=states.dtype))
+        torch.testing.assert_close(actual, expected)
+        actual.sum().backward()
+        expected.sum().backward()
+        torch.testing.assert_close(module.gate_up_proj.grad.transpose(-1, -2), reference.gate_up_proj.grad)
+        torch.testing.assert_close(module.down_proj.grad.transpose(-1, -2), reference.down_proj.grad)
+        self.assertEqual(compute.call_count, 1)
+        self.assertEqual(hook.call_count, 1)
+
+    def test_custom_gate_cannot_override_selected_module_computation(self):
+        owner = torch.nn.Module()
+        owner.experts = make_grouped_experts(PackedExperts())
+        with self.assertRaisesRegex(ValueError, "custom expert gate"):
+            bind_local_expert_forward(owner, 1, use_grouped_gemm=True, apply_gate=torch.tanh)

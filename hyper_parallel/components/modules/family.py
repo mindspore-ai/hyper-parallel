@@ -40,13 +40,18 @@ class VariantRule:
 
 @dataclass(frozen=True)
 class ModuleFamily:
-    """One baseline and explicitly allowed construction-time alternatives."""
+    """Construction-time variants and declared parallel adapter bindings.
+
+    Parallel declarations name existing wrapper/factory contracts. They do not
+    implement execution or choose a backend.
+    """
 
     name: str
     baseline: Callable
     variants: Mapping[str, str]
     selector_specs: Mapping[str, SelectorSpec] = field(default_factory=dict)
     variant_rules: tuple[VariantRule, ...] = ()
+    parallel_adapters: Mapping[str, str] = field(default_factory=dict)
 
 
 # Keep the baseline in the value so its identity cannot be reused while registered.
@@ -116,7 +121,7 @@ def register_module_family(family: ModuleFamily) -> None:
     """Register a checked snapshot for an exact baseline callable.
 
     Args:
-        family: Scalar selector schema, complete rules and lazy variant paths.
+        family: Selector schema, variant rules and lazy parallel adapter declarations.
     """
     if not isinstance(family.name, str) or not family.name.strip():
         raise ValueError("ModuleFamily name must be a non-empty string")
@@ -125,9 +130,17 @@ def register_module_family(family: ModuleFamily) -> None:
     if id(family.baseline) in _FAMILIES:
         raise ValueError(f"Module family already registered: {family.name}")
     _validate_family_rules(family)
+    if not isinstance(family.parallel_adapters, Mapping):
+        raise TypeError("ModuleFamily parallel_adapters must be a mapping")
+    for axis, path in family.parallel_adapters.items():
+        if axis not in ("cp", "ep") or not isinstance(path, str) or "." not in path:
+            raise ValueError(f"ModuleFamily {family.name}: invalid parallel adapter {axis!r}: {path!r}")
+        if not all(part.isidentifier() for part in path.split(".")):
+            raise ValueError(f"ModuleFamily {family.name}: invalid parallel adapter path {path!r}")
     snapshot = replace(
         family,
         variants=MappingProxyType(dict(family.variants)),
+        parallel_adapters=MappingProxyType(dict(family.parallel_adapters)),
         selector_specs=MappingProxyType(dict(family.selector_specs)),
         variant_rules=tuple(
             VariantRule(MappingProxyType(dict(rule.when)), rule.variant) for rule in family.variant_rules
@@ -146,6 +159,30 @@ def get_module_family(target: Callable) -> Optional[ModuleFamily]:
         Registered declaration, or None for an ordinary callable.
     """
     return _FAMILIES.get(id(target))
+
+
+def get_family_parallel_adapter(target: Callable, axis: str) -> Optional[Callable]:
+    """Resolve a registered concrete type's adapter only when it is requested.
+
+    Args:
+        target: Final module type; variants do not inherit baseline adapters.
+        axis: Parallel execution contract, ``cp`` or ``ep``.
+
+    Returns:
+        Existing wrapper/factory callable, or None if the type has no binding.
+        Import failures propagate; no alternative implementation is selected.
+    """
+    if axis not in ("cp", "ep"):
+        raise ValueError(f"Unknown parallel axis {axis!r}; expected cp or ep")
+    family = get_module_family(target)
+    path = family.parallel_adapters.get(axis) if family is not None else None
+    if path is None:
+        return None
+    module_path, _, name = path.rpartition(".")
+    adapter = getattr(import_module(module_path), name)
+    if not callable(adapter):
+        raise TypeError(f"ModuleFamily {family.name}: parallel adapter {path!r} is not callable")
+    return adapter
 
 
 def get_family_selector_specs(target: Callable) -> Mapping[str, SelectorSpec]:
