@@ -54,14 +54,20 @@ plan_overrides:
       - "*.input_layernorm"
       - "*.post_attention_layernorm"
       - "model.norm"
-    module_type: transformers.models.qwen3.modeling_qwen3.Qwen3RMSNorm
-    replace_module:
-      _target_: hyper_parallel.models.qwen3.adapter.conversion.module_replacement.replace_qwen3_rms_norm
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3.modeling_qwen3.Qwen3RMSNorm
+      implementation:
+        _target_: hyper_parallel.models.qwen3.adapter.conversion.module_replacement.replace_qwen3_rms_norm
   - match: "*.self_attn"
-    module_type: transformers.models.qwen3.modeling_qwen3.Qwen3Attention
-    replace_module:
-      _target_: hyper_parallel.models.qwen3.adapter.conversion.module_replacement.replace_qwen3_flash_attention
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3.modeling_qwen3.Qwen3Attention
+      implementation:
+        _target_: hyper_parallel.models.qwen3.adapter.conversion.module_replacement.replace_qwen3_flash_attention
   - match: "*.mlp"
-    module_type: transformers.models.qwen3.modeling_qwen3.Qwen3MLP
-    replace_module:
-      _target_: hyper_parallel.models.qwen3.adapter.conversion.module_replacement.replace_qwen3_swiglu_mlp
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3.modeling_qwen3.Qwen3MLP
+      implementation:
+        _target_: hyper_parallel.models.qwen3.adapter.conversion.module_replacement.replace_qwen3_swiglu_mlp

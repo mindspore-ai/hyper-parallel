@@ -53,9 +53,9 @@ checkpoint:
   restore_from: null
 
 plan_overrides:
-  - match: "*.self_attn"
+  - match: "*.self_attn.forward"
     when: cp
-    region_dispatch: false
-    inner_target: self
-    inner_wrapper:
-      _target_: hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel.qwen3_5_gdn_ulysses_cp_wrapper
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel.qwen3_5_gdn_ulysses_cp_wrapper

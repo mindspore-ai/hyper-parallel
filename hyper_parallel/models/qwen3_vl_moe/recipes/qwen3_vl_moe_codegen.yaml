@@ -53,15 +53,16 @@ checkpoint:
   restore_from: null
 
 plan_overrides:
-  - match: "model.language_model.*.mlp"
+  - match: "model.language_model.*.mlp.forward"
     when: ep
-    region_dispatch: false
-    local_compute_fn:
-      _target_: hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn
-      use_grouped_gemm: true
-  - match: "model.language_model.*.self_attn"
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn
+        use_grouped_gemm: true
+  - match: "model.language_model.*.self_attn.forward"
     when: cp
-    region_dispatch: false
-    inner_target: self
-    inner_wrapper:
-      _target_: hyper_parallel.models.qwen3_vl_moe.adapter.distributed.context_parallel.qwen3_vl_moe_async_ulysses_cp_wrapper
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.qwen3_vl_moe.adapter.distributed.context_parallel.qwen3_vl_moe_async_ulysses_cp_wrapper

@@ -54,13 +54,16 @@ checkpoint:
 
 plan_overrides:
   - match: "model.layers.*.self_attn"
-    module_type: transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3Attention
-    replace_module:
-      _target_: hyper_parallel.components.modules.mla_attention.MLAAttention
-  - match: "model.layers.*.self_attn"
-    region_dispatch: false
-    inner_target: self
-    inner_wrapper:
-      _target_: hyper_parallel.models.deepseek_v3.adapter.distributed.context_parallel.mla_cp_wrapper
-      strategy: expanded_ulysses
-      overlap: false
+    replace:
+      kind: module
+      source_type: transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3Attention
+      implementation:
+        _target_: hyper_parallel.components.modules.mla_attention.MLAAttention
+  - match: "model.layers.*.self_attn.forward"
+    when: cp
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v3.adapter.distributed.context_parallel.mla_cp_wrapper
+        strategy: expanded_ulysses
+        overlap: false

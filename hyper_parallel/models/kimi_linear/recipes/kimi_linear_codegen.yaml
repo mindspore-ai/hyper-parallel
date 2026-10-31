@@ -55,9 +55,9 @@ checkpoint:
   restore_from: null
 
 plan_overrides:
-  - match: "model.layers.*.self_attn"
+  - match: "model.layers.*.self_attn.forward"
     when: cp
-    region_dispatch: false
-    inner_target: self
-    inner_wrapper:
-      _target_: hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel.kimi_delta_attention_ulysses_cp_wrapper
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel.kimi_delta_attention_ulysses_cp_wrapper
