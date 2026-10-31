@@ -83,6 +83,8 @@ class _EPDispatch:
     expert_indices: torch.Tensor
     send_counts: list[int]
     receive_counts: list[int]
+    unpermute_indices: Optional[torch.Tensor] = None
+    routing_weights: Optional[torch.Tensor] = None
 
 
 def resolve_swiglu_weights(
@@ -433,6 +435,7 @@ def _prepare_ep_dispatch(
     ep_size: int,
     ep_group: Any,
     keep: Optional[torch.Tensor] = None,
+    use_fused_moe_token_permute_and_unpermute: bool = False,
 ) -> _EPDispatch:
     """Sort routed tokens and exchange per-rank dispatch counts.
 
@@ -459,11 +462,30 @@ def _prepare_ep_dispatch(
         source_indices = _routed_slot_token_ids(
             token_count, experts_per_token, flattened_states.device)[flat_keep]
     destination_ranks = torch.div(expert_indices, local_expert_count, rounding_mode="floor")
-    dispatch_order = _argsort_keys(
-        destination_ranks * global_expert_count + expert_indices,
-        bound=ep_size * global_expert_count,
+    use_fused_moe_token_permute_and_unpermute = (
+        use_fused_moe_token_permute_and_unpermute and flattened_states.device.type == "npu" and keep is None
     )
-    dispatched_states = flattened_states[source_indices[dispatch_order]].contiguous()
+    unpermute_indices = None
+    if use_fused_moe_token_permute_and_unpermute:
+        # Keep optional NPU dependencies out of the generic dispatch path.
+        from hyper_parallel.components.functional.moe_token_permute import (  # pylint: disable=C0415
+            moe_token_permute,
+        )
+
+        dispatched_states, unpermute_indices = moe_token_permute(
+            flattened_states, topk_indices.to(torch.int32),
+        )
+        dispatch_order = torch.empty_like(unpermute_indices, dtype=torch.int64)
+        dispatch_order.scatter_(
+            0, unpermute_indices.to(torch.int64),
+            torch.arange(unpermute_indices.numel(), device=unpermute_indices.device),
+        )
+    else:
+        dispatch_order = _argsort_keys(
+            destination_ranks * global_expert_count + expert_indices,
+            bound=ep_size * global_expert_count,
+        )
+        dispatched_states = flattened_states[source_indices[dispatch_order]].contiguous()
     dispatched_indices = expert_indices[dispatch_order].unsqueeze(-1).contiguous()
     # The counts exchange is a host-serialising step: a synchronous all-to-all followed
     # by two ``.tolist()`` drains, and a drain waits for everything already enqueued on
@@ -506,6 +528,8 @@ def _prepare_ep_dispatch(
         expert_indices=dispatched_indices,
         send_counts=send_counts,
         receive_counts=receive_counts,
+        unpermute_indices=unpermute_indices,
+        routing_weights=topk_weights if use_fused_moe_token_permute_and_unpermute else None,
     )
 
 
@@ -840,8 +864,17 @@ def _aggregate_ep_outputs(
     source_indices: torch.Tensor,
     dispatch_order: torch.Tensor,
     output_shape: tuple[int, int, int],
+    unpermute_indices: Optional[torch.Tensor] = None,
+    routing_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Undo expert-major routing and aggregate weighted top-k outputs."""
+    if unpermute_indices is not None:
+        # Keep optional NPU dependencies out of the generic aggregation path.
+        from hyper_parallel.components.functional.moe_token_unpermute import (  # pylint: disable=C0415
+            moe_token_unpermute,
+        )
+
+        return moe_token_unpermute(combined_outputs, unpermute_indices, routing_weights).view(*output_shape)
     weighted_outputs = combined_outputs * expert_weights[dispatch_order].unsqueeze(-1)
     output = torch.zeros(
         output_shape[0] * output_shape[1],
@@ -1010,6 +1043,7 @@ def ep_routed_forward(
     *,
     router_fn: Callable,
     ep_group: Any,
+    use_fused_moe_token_permute_and_unpermute: bool = True,
 ) -> torch.Tensor:
     """Routed-experts pipeline: SP-in (local chunk) -> all communication
     inside -> SP-out. **Routed branch only.**
@@ -1020,17 +1054,10 @@ def ep_routed_forward(
     accuracy_fix_plan.md §3). There is no ``tp_group`` parameter: if the
     caller invokes a nested-boundary submodule (e.g. ``module.shared_expert``),
     that submodule's own boundary performs its TP communication — the
-    **nested-boundary call contract**:
-
-    1. the input is the parent local region's current logical local layout;
-    2. the nested boundary exclusively owns its parameter layout and its TP
-       communication (entry/exit via its own PrecompiledBoundary);
-    3. the return value is already the nested boundary's out_dst logical
-       layout (e.g. under SP: the complete per-token values of the local
-       sequence chunk);
-    4. the caller MUST NOT repeat any compensating collective
-       (all-reduce / reduce-scatter / all-gather) on the returned value
-       over the nested boundary's mesh.
+    **nested-boundary call contract**: the nested boundary receives the
+    parent's local layout, exclusively owns its parameter layout and TP
+    communication, and returns its declared out_dst layout. The caller MUST
+    NOT repeat a compensating collective over the nested boundary's mesh.
 
     Communication flow (isomorphic to Megatron token_dispatcher.py
     MoEAlltoAllTokenDispatcher):
@@ -1051,6 +1078,11 @@ def ep_routed_forward(
     grouping of the experts' GEMM, and the routed all-to-all -- the one
     collective of the step with no independent work to hide behind -- gets the
     chunk GEMMs to overlap with.  Default 1 keeps the unchunked schedule.
+
+    ``use_fused_moe_token_permute_and_unpermute`` replaces the generic sort/index-add routing
+    with NPU token permute/unpermute. It defaults to enabled on NPU and does
+    not require grouped GEMM. CPU/GPU, chunked dispatch and capacity-limited
+    dispatch retain the generic permutation path.
 
     Extended EP group = the ep axis of the derived expert mesh (flatten
     ep_size consecutive ranks: first span the TP group, then extend to
@@ -1078,6 +1110,10 @@ def ep_routed_forward(
         global_expert_count=global_expert_count,
         ep_size=ep_size,
         ep_group=ep_group,
+        use_fused_moe_token_permute_and_unpermute=(
+            use_fused_moe_token_permute_and_unpermute
+            and chunk_count == 1 and _resolve_capacity_factor(module) is None
+        ),
     )
     if chunk_count > 1:
         return _chunked_ep_forward(
@@ -1099,6 +1135,8 @@ def ep_routed_forward(
         dispatch.source_indices,
         dispatch.dispatch_order,
         output_shape,
+        unpermute_indices=dispatch.unpermute_indices,
+        routing_weights=dispatch.routing_weights,
     )
 
 

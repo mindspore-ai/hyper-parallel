@@ -91,12 +91,12 @@ def _rescale_sparse_outputs(
     return (output * output_scale + sink_output * sink_scale).to(dtype=output.dtype), output_scale, sink_scale
 
 
-def _sparse_attention_backward(ctx, grad_rescaled_output):
+def _sparse_attention_backward(ctx, grad_rescaled_output, saved_tensors):
     """Compute sparse gradients and restore their BSND layout."""
     (
         query_nope, compressed_kv, query_rope, key_rope, sink_key, _, topk_indices,
         softmax_max, softmax_sum, _, _, rescaled_output, output_scale, _,
-    ) = ctx.saved_tensors
+    ) = saved_tensors
     query_nope, compressed_kv, query_rope, key_rope = [
         rearrange(tensor, "b s n d -> (b s) n d")
         for tensor in (query_nope, compressed_kv, query_rope, key_rope)
@@ -125,12 +125,12 @@ def _sparse_attention_backward(ctx, grad_rescaled_output):
     )
 
 
-def _sink_attention_backward(ctx, grad_rescaled_output):
+def _sink_attention_backward(ctx, grad_rescaled_output, saved_tensors):
     """Compute sink gradients and restore their BSND layout."""
     (
         query_nope, _, query_rope, _, sink_key, sink_value, _, _, _,
         sink_softmax_max, sink_softmax_sum, rescaled_output, _, sink_scale,
-    ) = ctx.saved_tensors
+    ) = saved_tensors
     query = rearrange(torch.cat([query_nope, query_rope], dim=-1), "b s n d -> s b (n d)")
     grad_output = rearrange(sink_scale * grad_rescaled_output, "b s n d -> s b (n d)")
     grad_query, grad_key, grad_value = torch_npu.npu_fusion_attention_grad(
@@ -224,15 +224,25 @@ class _SparseAttentionRescale(torch.autograd.Function):
         grad_softmax_max: torch.Tensor,
         grad_softmax_sum: torch.Tensor,
     ) -> tuple:
-        """Run the explicit sparse- and fusion-attention backward operators."""
+        """Run the explicit sparse- and fusion-attention backward operators.
+
+        Args:
+            ctx: Autograd context containing the saved forward tensors.
+            grad_rescaled_output: Gradient of the rescaled attention output.
+            grad_softmax_max: Unused gradient of the sparse softmax maximum.
+            grad_softmax_sum: Unused gradient of the sparse softmax sum.
+        """
         del grad_softmax_max, grad_softmax_sum
+        saved_tensors = ctx.saved_tensors
         grad_query_nope, grad_key, grad_value, grad_query_rope, grad_key_rope = _sparse_attention_backward(
-            ctx, grad_rescaled_output,
+            ctx, grad_rescaled_output, saved_tensors,
         )
-        sink_grad_query, sink_grad_key, sink_grad_value = _sink_attention_backward(ctx, grad_rescaled_output)
+        sink_grad_query, sink_grad_key, sink_grad_value = _sink_attention_backward(
+            ctx, grad_rescaled_output, saved_tensors,
+        )
         sink_grad_query_nope, sink_grad_query_rope = torch.split(
             sink_grad_query,
-            [ctx.saved_tensors[0].size(-1), ctx.saved_tensors[2].size(-1)],
+            [saved_tensors[0].size(-1), saved_tensors[2].size(-1)],
             dim=-1,
         )
         return (
