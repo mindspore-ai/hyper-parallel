@@ -84,7 +84,7 @@ import bisect
 import itertools
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Type
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type
 
 import torch
 import torch.distributed as dist
@@ -199,6 +199,18 @@ class PipelineScheduleBase(nn.Module):
             NotImplementedError: Always; concrete schedules override this.
         """
         raise NotImplementedError
+
+    def map_stage_graphs(self, fn: Callable[[nn.Module], nn.Module]) -> None:
+        """Apply ``fn`` to each owned stage subgraph and store the result.
+
+        Terminal backend compilation (``InductorPass``) runs after ``PpPass``
+        replaced the joint graph with this schedule stub: the stage subgraphs
+        — not the stub — carry the FX compute, so the pass compiles each of
+        them through this hook and writes the returned module back (in-place
+        compilers may return the same object).
+        """
+        self.fwd_gm = fn(self.fwd_gm)
+        self.bwd_gm = fn(self.bwd_gm)
 
     # ------------------------------------------------------------------
     # Input / microbatch resolution
@@ -1113,6 +1125,11 @@ class ScheduleInterleaved1F1B(PipelineScheduleBase):
         self.num_state = sum(self.num_states)
         self._owned_pos = {v: i for i, v in enumerate(self.stage_indices)}
         self._pending_sends: Dict[Any, List[Tuple[Any, torch.Tensor]]] = {}
+
+    def map_stage_graphs(self, fn: Callable[[nn.Module], nn.Module]) -> None:
+        """Apply ``fn`` to every virtual stage's fwd and bwd subgraph."""
+        self.fwd_gms = nn.ModuleList([fn(gm) for gm in self.fwd_gms])
+        self.bwd_gms = nn.ModuleList([fn(gm) for gm in self.bwd_gms])
 
     def _resolve_num_microbatches(self, user_inputs: Sequence[Any]) -> int:
         """Derive the microbatch count from the first tensor model input."""

@@ -34,6 +34,7 @@ Note:
 __all__ = [
     "PassConfig",
     "PP_SCHEDULES",
+    "INDUCTOR_MODES",
     "DP_MODES",
     "normalize_dp_mode",
     "build_pass_config_from_trainer_config",
@@ -41,13 +42,20 @@ __all__ = [
 
 import math
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 
 # Pipeline schedule names accepted by ``pp_schedule``. Kept torch-free here so
 # the config dataclass stays importable anywhere; ``pp_schedule``'s registry
 # (which does import torch) must expose exactly these keys.
 PP_SCHEDULES = ("gpipe", "1f1b", "interleaved_1f1b", "vpp")
+
+# Backend compilation modes for the terminal ``InductorPass``:
+#   "off"      - no Inductor compilation (graph runs as plain FX nodes)
+#   "regional" - compile tagged compute regions; collectives and
+#                side-effectful nodes stay eager (see InductorPass)
+#   "full"     - compile the whole joint graph as one Inductor region
+INDUCTOR_MODES = ("off", "regional", "full")
 
 # Schedule names that can drive multiple virtual stages per physical rank.
 _INTERLEAVED_SCHEDULES = ("interleaved_1f1b", "vpp")
@@ -169,6 +177,23 @@ class PassConfig:
             classic interleaved-1F1B warmup / steady / cooldown order.
             ``PpPass`` resolves the name to a schedule class via
             ``pp_schedule.get_schedule_class``.
+        inductor_mode: Terminal backend compilation for the joint graph, one
+            of ``INDUCTOR_MODES``. ``"off"`` (default) runs the graph as
+            plain FX nodes; ``"regional"`` compiles tagged compute regions
+            with TorchInductor while keeping communication collectives and
+            side-effectful nodes (e.g. the FSDP reshard storage free) eager;
+            ``"full"`` compiles the whole joint graph as one region. Both
+            compiling modes force ``eager_numerics.division_rounding`` so
+            compiled code stays bitwise-equal to eager, and restore the
+            positional calling convention afterwards. Requires a torch with
+            Inductor. With pipeline parallel enabled, ``PpPass`` runs first
+            and this pass compiles each stage's forward/backward subgraph
+            independently (both modes); cross-stage fusion is inherently
+            impossible because the schedule's P2P sits between the stages.
+        inductor_configs: Optional Inductor config overrides passed to the
+            compiled regions (keys validated by ``torch._inductor.config``),
+            e.g. ``{"reorder_for_peak_memory": True}``. ``"full"`` mode
+            always sets ``reorder_for_peak_memory=True`` unless overridden.
 
     Note:
         ``fsdp_enabled`` / ``pp_enabled`` no longer probe
@@ -191,6 +216,8 @@ class PassConfig:
     fsdp_allgather_prefetch: bool = True
     fsdp_overlap_grad_reduce: bool = True
     max_in_flight_gb: float = 0.25
+    inductor_mode: str = "off"
+    inductor_configs: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         self.dp_mode = normalize_dp_mode(self.dp_mode)
@@ -224,6 +251,28 @@ class PassConfig:
             or value < 0
         ):
             raise ValueError("max_in_flight_gb must be a finite non-negative number")
+        self._validate_inductor()
+
+    def _validate_inductor(self) -> None:
+        """Validate the Inductor compilation mode and config overrides."""
+        if not isinstance(self.inductor_mode, str) or (
+            self.inductor_mode.lower() not in INDUCTOR_MODES
+        ):
+            raise ValueError(
+                f"inductor_mode must be one of {INDUCTOR_MODES}, "
+                f"got {self.inductor_mode!r}"
+            )
+        # Canonicalize to one spelling so the pass's mode dispatch cannot be
+        # defeated by an accepted-but-unnormalized value like "FULL".
+        self.inductor_mode = self.inductor_mode.lower()
+        if self.inductor_configs is not None and (
+            not isinstance(self.inductor_configs, dict)
+            or not all(isinstance(key, str) for key in self.inductor_configs)
+        ):
+            raise ValueError(
+                "inductor_configs must be None or a dict of "
+                "torch._inductor.config option names (str) to values"
+            )
 
     def _validate_dp(self) -> None:
         """Validate the tensor-parallel and data-parallel degrees."""

@@ -29,15 +29,18 @@ Execution Order:
      breaking its grad-index contract.
 3. Communication-compute overlap: AutoOverlapPass, then FsdpOverlapPass
    (independent FSDP all-gather prefetch and gradient overlap).
-4. Pipeline split: PpPass runs last, after every graph-level pass. It
-   replaces the joint graph with a schedule stub, moving the collectives
-   into the schedule's per-stage submodules where a graph-level pass can
-   no longer reach them. Running it last keeps the non-PP pass order
-   untouched and still lets FsdpOverlapPass reorder the FSDP collectives
-   before the split.
-
-The backend compilation slot (InductorPass) is intentionally not wired yet;
-add it here when an inductor backend integration lands.
+4. Pipeline split: PpPass runs last among the graph-level passes, after
+   every graph-level pass. It replaces the joint graph with a schedule stub,
+   moving the collectives into the schedule's per-stage submodules where a
+   graph-level pass can no longer reach them. Running it last keeps the
+   non-PP pass order untouched and still lets FsdpOverlapPass reorder the
+   FSDP collectives before the split.
+5. Backend compilation: InductorPass is TERMINAL (``inductor_mode`` != off).
+   It lowers the graph — or its tagged compute regions — to TorchInductor
+   kernels; afterwards the FX graph is a wrapper around the compiled callable
+   and no further FX-graph-level pass may run. When PpPass already split the
+   graph, the pass compiles each per-stage forward/backward subgraph owned by
+   the installed schedule instead of the (compute-less) stub.
 """
 
 __all__ = ["PassPipeline"]
@@ -46,6 +49,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 from ..pass_config import PassConfig
 from .base import GraphPass
+from .inductor_pass import InductorPass
 from .overlap.schedule import AutoOverlapPass, FsdpOverlapPass
 from .parallel.fsdp_pass import FSDPPass
 from .parallel.pp_pass import PpPass
@@ -99,6 +103,11 @@ class PassPipeline:
         # therefore see the collectives before the split.
         if getattr(self.config, "pp_enabled", False):
             self.passes.append(PpPass(parallel_plan=self.parallel_plan))
+
+        # 5. Terminal backend compilation: after this the FX graph wraps the
+        # compiled callable and no further FX-graph-level pass may run.
+        if self.config.inductor_mode != "off":
+            self.passes.append(InductorPass())
 
         return self
 
