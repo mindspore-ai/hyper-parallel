@@ -107,43 +107,6 @@ class TestTextTrainer(unittest.TestCase):
             f"expected foundation loss 1.0, got={float(loss_dict['foundation_loss'])}",
         )
 
-    def test_unequal_microbatch_token_counts_use_step_total(self) -> None:
-        """Feature: Token-weighted gradient accumulation.
-
-        Description: Accumulate batches with one, three, and zero supervised tokens.
-        Expectation: Every backward uses the complete step count and matches one weighted update.
-        """
-        parameter = torch.nn.Parameter(torch.tensor(2.0))
-        batches = [({}, {"shift_labels": torch.tensor([[1, -100, -100]])}),
-                   ({}, {"shift_labels": torch.tensor([[1, 2, 3]])}),
-                   ({}, {"shift_labels": torch.tensor([[-100, -100, -100]])})]
-        base = Mock(num_micro_batches=3, state=SimpleNamespace(global_step=0))
-        base.get_batch.side_effect = batches
-        base.prepare_optimizer_step.return_value = 0.0
-        observed_counts = []
-        targets = iter((1.0, 3.0, 7.0))
-
-        def backward(model_inputs, loss_inputs):
-            """Apply one token-weighted local objective using trainer counts."""
-            del model_inputs, loss_inputs
-            denominator = base.step_token_counts["foundation_tokens"]
-            observed_counts.append(int(denominator))
-            numerator = base.current_token_counts["foundation_tokens"]
-            loss = (parameter - next(targets)).square() * numerator / denominator
-            loss.backward()
-            return loss.detach(), {"foundation_loss": loss.detach()}
-
-        base.forward_backward_step.side_effect = backward
-        trainer = TextTrainer.__new__(TextTrainer)
-        trainer.base = base
-        with patch("hyper_parallel.trainer.text_trainer.synchronize"), \
-                patch("hyper_parallel.trainer.text_trainer.memory_profiler.step"):
-            trainer.train_step(iter(()))
-        self.assertEqual(observed_counts, [4, 4, 4])
-        torch.testing.assert_close(parameter.grad, torch.tensor(-1.0))
-        self.assertEqual(base.state.global_step, 1)
-        self.assertEqual(base.on_micro_step_begin.call_count, 3)
-
 
 if __name__ == "__main__":
     unittest.main()

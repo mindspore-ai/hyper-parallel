@@ -173,10 +173,6 @@ class VLMTrainer:
             if not isinstance(get_batch, OmniParallelBatch):
                 raise ValueError("encoder parallel requires OmniParallelBatch")
             get_batch.batch_transport = EncoderParallelBatchTransport(runtime=encoder_runtime)
-        if encoder_runtime is not None:
-            install_forward = getattr(encoder_runtime.bridge, "install_forward", None)
-            if callable(install_forward):
-                install_forward()
         self.base.get_batch = get_batch
 
     @property

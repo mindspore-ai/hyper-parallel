@@ -32,6 +32,7 @@ from hyper_parallel.distributed.encoder_parallel.runtime import EncoderParallelR
 from hyper_parallel.models.qwen3_5_moe.adapter.encoder_parallel import (
     get_encoder_parallel_spec, replace_vision_attention,
 )
+from hyper_parallel.models.qwen3_5_moe.adapter.vlm import install_qwen_vlm_cp_forward
 from hyper_parallel.models.qwen3_5_moe.vlm_cp import QwenVLMParallelBatch
 from hyper_parallel.models.replacement import (
     ModuleReplacementSpec, apply_module_replacements, compile_module_replacements,
@@ -67,6 +68,7 @@ def _compare(encoder_parallel: bool) -> None:
         attention = model.model.language_model.layers[0].self_attn
         attention.forward = sdpa_hf_cp_wrapper(attention, mesh, mesh["tp"], mesh["cp"], None)
         batcher = QwenVLMParallelBatch(mesh_context=context, device=torch.device("cpu"))
+        install_qwen_vlm_cp_forward(model)
         batcher.bind_model(model)
         if encoder_parallel:
             rule = ModuleReplacementSpec(("model.visual.blocks.*.attn",), replace_vision_attention,

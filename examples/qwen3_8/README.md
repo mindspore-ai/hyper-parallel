@@ -1,7 +1,7 @@
 # Qwen3.8-27B on Ascend：FSDP / CP / 高性能融合算子
 
 本目录使用 Hugging Face 的 Qwen3.8-27B 模型、HyperParallel 的 FSDP/CP，以及仓库内的高性能
-GDN 融合算子。三份训练 YAML 通过 `plan_overrides[*].replace_module` 选择
+GDN 融合算子。三份训练 YAML 通过 `plan_overrides[*].replace.implementation` 选择
 [`TritonGDN`](../../hyper_parallel/components/modules/gdn_triton.py) 模块映射，把原模型的
 `chunk_gated_delta_rule` 绑定到仓库内的
 [`components/functional/gated_delta_net.py`](../../hyper_parallel/components/functional/gated_delta_net.py)。
@@ -77,7 +77,7 @@ python3 -c 'import hyper_parallel; from hyper_parallel.components.functional.gat
 ```
 
 导入成功只说明 Python 模块可加载，**不代表融合算子已在 NPU 上执行**。三份 YAML 都以 `*.linear_attn` 匹配 Hugging Face 的 `Qwen3_5GatedDeltaNet`，通过
-`plan_overrides[*].replace_module` 启用高性能 GDN 融合算子。模型模块类型或名称不匹配时，
+`plan_overrides[*].replace.implementation` 启用高性能 GDN 融合算子。模型模块类型或名称不匹配时，
 替换阶段会报错；使用对应 YAML 跑完首个训练 step（可将 `--training.train_iters` 设为 1），
 才能同时验证算子的编译及反向计算。首次启动包含算子编译，耗时不要计入稳定步时。
 

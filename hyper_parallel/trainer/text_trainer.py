@@ -222,29 +222,25 @@ class TextTrainer:
         )
 
     def forward_backward_step(
-            self, data_iterator: Any, num_micro_steps: int,
-    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Fetch and execute one micro-step through the existing trainer API."""
-        training_batch = self.base.get_batch(data_iterator)
-        self.base.step_token_counts = {
-            name: count * num_micro_steps for name, count in count_loss_token(training_batch[1]).items()
-        }
-        return self._forward_backward_prepared(training_batch)
-
-    def _forward_backward_prepared(
             self,
-            training_batch: tuple[dict[str, Any], dict[str, Any]],
+            data_iterator: Any,
+            num_micro_steps: int,
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Execute one prepared forward-backward micro-step.
+        """Fetch and execute one forward-backward micro-step.
 
         Args:
-            training_batch: Model and loss inputs for one micro-batch.
+            data_iterator: Iterator providing one raw FB batch per call.
+            num_micro_steps: Number of FB steps in the current optimizer step.
 
         Returns:
             Loss tensor and named loss tensors for this FB step.
         """
-        model_inputs, loss_inputs = training_batch
+        model_inputs, loss_inputs = self.base.get_batch(data_iterator)
         self.base.current_token_counts = count_loss_token(loss_inputs)
+        self.base.step_token_counts = {
+            name: token_count * num_micro_steps
+            for name, token_count in self.base.current_token_counts.items()
+        }
         metric_inputs = {
             **model_inputs,
             **loss_inputs,
@@ -267,11 +263,6 @@ class TextTrainer:
         """
         memory_profiler.step()
         num_micro_steps = self.base.num_micro_batches
-        training_batches = [self.base.get_batch(data_iterator) for _ in range(num_micro_steps)]
-        self.base.step_token_counts = defaultdict(int)
-        for _, loss_inputs in training_batches:
-            for name, token_count in count_loss_token(loss_inputs).items():
-                self.base.step_token_counts[name] += token_count
 
         self.on_step_begin()
         self.base.model_integration.begin_step(self.base.state.global_step + 1)
@@ -280,19 +271,18 @@ class TextTrainer:
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
 
-        for micro_step, training_batch in enumerate(training_batches):
+        for micro_step in range(num_micro_steps):
             self.base.model_reshard(micro_step, num_micro_steps)
             self.base.configure_fsdp_gradient_sync(
                 micro_step,
                 num_micro_steps,
             )
             self.base.begin_fsdp_runtime_diagnostics(micro_step)
-            loss, loss_dict = self._forward_backward_prepared(
-                training_batch,
+            loss, loss_dict = self.forward_backward_step(
+                data_iterator,
+                num_micro_steps,
             )
 
-            training_batches[micro_step] = None
-            del training_batch
             total_loss += loss.item()
             for loss_name, loss_value in loss_dict.items():
                 total_loss_dict[loss_name] += loss_value.item()

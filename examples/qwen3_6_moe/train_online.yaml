@@ -51,31 +51,36 @@ fsdp_config:
 
 plan_overrides:
   - match: "*.linear_attn"
-    module_type: transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeGatedDeltaNet
-    exact_type: true
-    replace_module:
-      _target_: hyper_parallel.components.modules.TritonGDN
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeGatedDeltaNet
+      exact_type: true
+      implementation:
+        _target_: hyper_parallel.components.modules.TritonGDN
   - match: "*.mlp.experts"
-    module_type: transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeExperts
-    exact_type: true
-    replace_module:
-      _target_: hyper_parallel.components.modules.GroupedExperts
-  - match: "*.mlp"
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeExperts
+      exact_type: true
+      implementation:
+        _target_: hyper_parallel.components.modules.GroupedExperts
+  - match: "*.mlp.forward"
     when: ep
-    region_dispatch: false
-    local_compute_fn:
-      _target_: hyper_parallel.models.qwen3_5_moe.adapter.distributed.expert_parallel.qwen3_5_moe_ep_compute_fn
-      use_grouped_gemm: true
-  - match: "*.linear_attn"
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.qwen3_5_moe.adapter.distributed.expert_parallel.qwen3_5_moe_ep_compute_fn
+        use_grouped_gemm: true
+  - match: "*.linear_attn.forward"
     when: cp
-    inner_target: self
-    inner_wrapper: gdn_ulysses
-    region_dispatch: false
-  - match: "*.self_attn"
+    replace:
+      kind: method
+      implementation: hyper_parallel.distributed.context_parallel.wrappers.gdn_ulysses_cp_wrapper
+  - match: "*.self_attn.forward"
     when: cp
-    inner_target: self
-    inner_wrapper: sdpa_hf_ulysses
-    region_dispatch: false
+    replace:
+      kind: method
+      implementation: hyper_parallel.distributed.context_parallel.wrappers.sdpa_hf_ulysses_cp_wrapper
 
 mixed_precision:
   enabled: false

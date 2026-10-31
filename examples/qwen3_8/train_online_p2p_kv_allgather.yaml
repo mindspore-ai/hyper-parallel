@@ -47,23 +47,25 @@ fsdp_config:
 plan_overrides:
   # Use the high-performance fused GDN forward/backward path.
   - match: "*.linear_attn"
-    module_type: transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5GatedDeltaNet
-    exact_type: true
-    replace_module:
-      _target_: hyper_parallel.components.modules.TritonGDN
-  - match: "*.linear_attn"
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5GatedDeltaNet
+      exact_type: true
+      implementation:
+        _target_: hyper_parallel.components.modules.TritonGDN
+  - match: "*.linear_attn.forward"
     when: cp
-    inner_target: self
-    inner_wrapper:
-      _target_: hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel.qwen3_5_gdn_p2p_cp_wrapper
-      backend: triton
-      chunk_size: 64
-    region_dispatch: false
-  - match: "*.self_attn"
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel.qwen3_5_gdn_p2p_cp_wrapper
+        backend: triton
+        chunk_size: 64
+  - match: "*.self_attn.forward"
     when: cp
-    inner_target: self
-    inner_wrapper: sdpa_hf
-    region_dispatch: false
+    replace:
+      kind: method
+      implementation: hyper_parallel.distributed.context_parallel.wrappers.sdpa_hf_cp_wrapper
 
 mixed_precision:
   enabled: false

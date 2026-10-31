@@ -41,9 +41,6 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from hyper_parallel.components.functional.moe_token_unpermute import (
-    moe_token_unpermute,
-)
 from hyper_parallel.components.functional.npu_grouped_swiglu import (
     npu_grouped_swiglu,
 )
@@ -843,24 +840,16 @@ def _aggregate_ep_outputs(
     source_indices: torch.Tensor,
     dispatch_order: torch.Tensor,
     output_shape: tuple[int, int, int],
-    *,
-    use_fused_unpermute: bool = False,
 ) -> torch.Tensor:
-    """Aggregate arbitrary routed slots, optionally fusing a complete top-k map."""
-    token_count = output_shape[0] * output_shape[1]
-    if use_fused_unpermute and token_count > 0 and combined_outputs.device.type == "npu":
-        unpermute_mapping = torch.empty_like(dispatch_order, dtype=torch.int32)
-        unpermute_mapping[dispatch_order] = torch.arange(
-            dispatch_order.numel(), dtype=torch.int32, device=dispatch_order.device,
-        )
-        topk_weights = expert_weights.view(token_count, -1)
-        output = moe_token_unpermute(combined_outputs, unpermute_mapping, topk_weights)
-    else:
-        # Capacity-limited and asynchronous dispatch retain master's explicit
-        # source mapping; empty ranks also preserve both autograd paths.
-        weighted_outputs = combined_outputs * expert_weights[dispatch_order].unsqueeze(-1)
-        output = weighted_outputs.new_zeros((token_count, output_shape[-1]))
-        output.index_add_(0, source_indices[dispatch_order], weighted_outputs)
+    """Undo expert-major routing and aggregate weighted top-k outputs."""
+    weighted_outputs = combined_outputs * expert_weights[dispatch_order].unsqueeze(-1)
+    output = torch.zeros(
+        output_shape[0] * output_shape[1],
+        output_shape[-1],
+        dtype=weighted_outputs.dtype,
+        device=weighted_outputs.device,
+    )
+    output.index_add_(0, source_indices[dispatch_order], weighted_outputs)
     return output.view(*output_shape)
 
 
@@ -1110,7 +1099,6 @@ def ep_routed_forward(
         dispatch.source_indices,
         dispatch.dispatch_order,
         output_shape,
-        use_fused_unpermute=True,
     )
 
 

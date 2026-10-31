@@ -3,7 +3,7 @@
 # Launch from the repository root with the NPU environment and editable install ready:
 # torchrun --standalone --nproc_per_node=8 --module scripts.train_vl examples/qwen3_8/train_online_vlm.yaml
 model:
-  _target_: hyper_parallel.models.HyperAutoModelForImageTextToText.from_pretrained
+  _target_: hyper_parallel.models.qwen3_5_moe.adapter.vlm.build_qwen_vlm
   pretrained_model_name_or_path: path/to/model_weights
   torch_dtype: bfloat16
   attn_implementation: sdpa
@@ -47,20 +47,22 @@ fsdp_config:
 
 plan_overrides:
   - match: "model.language_model.layers.*.linear_attn"
-    module_type: transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5GatedDeltaNet
-    exact_type: true
-    replace_module:
-      _target_: hyper_parallel.components.modules.TritonGDN
-  - match: "model.language_model.layers.*.linear_attn"
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5GatedDeltaNet
+      exact_type: true
+      implementation:
+        _target_: hyper_parallel.components.modules.TritonGDN
+  - match: "model.language_model.layers.*.linear_attn.forward"
     when: cp
-    inner_target: self
-    inner_wrapper: gdn_ulysses
-    region_dispatch: false
-  - match: "model.language_model.layers.*.self_attn"
+    replace:
+      kind: method
+      implementation: hyper_parallel.distributed.context_parallel.wrappers.gdn_ulysses_cp_wrapper
+  - match: "model.language_model.layers.*.self_attn.forward"
     when: cp
-    inner_target: self
-    inner_wrapper: sdpa_hf_ulysses
-    region_dispatch: false
+    replace:
+      kind: method
+      implementation: hyper_parallel.distributed.context_parallel.wrappers.sdpa_hf_ulysses_cp_wrapper
 
 mixed_precision:
   enabled: false

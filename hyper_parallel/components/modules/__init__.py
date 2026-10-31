@@ -35,7 +35,6 @@ if TYPE_CHECKING:
     from hyper_parallel.components.modules.swiglu_mlp import SwiGLUMLP
 
 _EXPORT_TO_MODULE = {
-    "AscendCGDN": "gdn_ascendc",
     "TritonGDN": "gdn_triton",
     "DeepseekV32DSAAttention": "dsa_attention",
     "DSAAttention": "dsa_attention",

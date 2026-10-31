@@ -17,7 +17,7 @@
 import copy
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 from torch.nn import functional
@@ -30,7 +30,8 @@ from hyper_parallel.components.losses import ChunkedCausalLMLoss
 from hyper_parallel.data.batching.runtime_input import RuntimeInputAdapter
 from hyper_parallel.models.qwen3_5.adapter.registration import QWEN3_5_ADAPTER_SPEC
 from hyper_parallel.models.qwen3_5_moe.adapter.vlm_chunk_loss import bind_chunk_loss
-from hyper_parallel.models.qwen3_5_moe.vlm_cp import QwenVLMParallelBatch, install_qwen_vlm_cp_forward
+from hyper_parallel.models.qwen3_5_moe.vlm_cp import QwenVLMParallelBatch
+from hyper_parallel.models.qwen3_5_moe.adapter.vlm import build_qwen_vlm, install_qwen_vlm_cp_forward
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from tests.common.mark_utils import arg_mark
 
@@ -73,6 +74,29 @@ class TestQwenVLMChunkLoss(unittest.TestCase):
     """Compare loss and every gradient against a full-logits HF oracle on CPU."""
 
     dense = False
+
+    def test_model_builder_owns_cp_forward_installation(self) -> None:
+        """Only the model adapter installs CP; binding batch metadata is read-only."""
+        for cp_size in (1, 2):
+            with self.subTest(cp_size=cp_size):
+                model = make_model(dense=self.dense)
+                original_forward = model.forward
+                setup = SimpleNamespace(mesh_context=SimpleNamespace(cp_size=cp_size))
+                with patch(
+                    "hyper_parallel.models.qwen3_5_moe.adapter.vlm.HyperAutoModelForImageTextToText.from_pretrained",
+                    return_value=model,
+                ) as factory:
+                    result = build_qwen_vlm("local-model", distributed_setup=setup, force_hf=True)
+                self.assertIs(result, model)
+                factory.assert_called_once_with("local-model", distributed_setup=setup, force_hf=True)
+                self.assertEqual(bool(getattr(model, "_hp_vlm_cp_enabled", False)), cp_size > 1)
+                if cp_size == 1:
+                    self.assertEqual(model.forward, original_forward)
+                installed_forward = model.forward
+                batcher = QwenVLMParallelBatch.__new__(QwenVLMParallelBatch)
+                batcher.bind_model(model)
+                self.assertEqual(model.forward, installed_forward)
+                self.assertIs(batcher.model, model)
 
     def setUp(self) -> None:
         """Use a fixed seed and one CPU thread for the small numerical oracle."""

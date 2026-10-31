@@ -17,6 +17,7 @@
 from typing import Optional
 
 import torch  # pylint: disable=forbidden-backend-import
+import torch_npu
 
 
 def moe_token_unpermute(
@@ -34,7 +35,4 @@ def moe_token_unpermute(
     Returns:
         Restored token-major output with repeated token routes accumulated.
     """
-    # CPU model imports must not require the optional NPU runtime.
-    import torch_npu  # pylint: disable=C0415
-
     return torch_npu.npu_moe_token_unpermute(permuted_tokens, sorted_indices, probs)
