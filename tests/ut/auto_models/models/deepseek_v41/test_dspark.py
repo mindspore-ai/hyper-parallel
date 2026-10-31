@@ -21,6 +21,7 @@ import json
 import re
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -28,6 +29,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
+from tests.common.deepseek_v41_mhc_stubs import stub_mhc_for_cpu
 from tests.common.mark_utils import arg_mark
 
 from hyper_parallel import init_empty_weights
@@ -105,6 +107,13 @@ def _batch(config: SimpleNamespace, batch: int = 2, seq: int = 10):
 
 class DSparkComponentTest(unittest.TestCase):
     """Validate structure, gradient isolation, and target alignment."""
+
+    def setUp(self) -> None:
+        """Keep mHC stubs active through checkpoint recomputation in backward."""
+        super().setUp()
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(stub_mhc_for_cpu())
 
     def test_forward_produces_finite_losses_and_metrics(self):
         """A full forward returns finite loss values and metric entries."""

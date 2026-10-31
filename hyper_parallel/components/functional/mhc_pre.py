@@ -116,7 +116,13 @@ def mhc_pre(
 
     Returns:
         Block input, post coefficients, residual coefficients, and residual buffer.
+
+    Raises:
+        ValueError: If the input is not an NPU tensor.
+        ImportError: If the Omni training custom operators are unavailable.
     """
+    if x.device.type != "npu":
+        raise ValueError("mhc_pre requires an NPU input and the fused MHC operators")
     shape = x.size()
     x = x.reshape(shape[0], shape[1], num_stream, -1)
     if gamma is not None:

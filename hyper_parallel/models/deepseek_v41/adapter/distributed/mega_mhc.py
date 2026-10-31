@@ -23,7 +23,6 @@ from typing import Any
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.components.modules.mhc import pipelined_mhc_post
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41PipelinedHyperConnection,
 )
@@ -36,30 +35,6 @@ def _rms_norm_eps(module: nn.Module) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
         raise ValueError("DeepSeek-V4.1 mHC input_norm must expose a finite positive epsilon")
     return float(value)
-
-
-def _reference_shifted_boundary(
-        module: DeepseekV41PipelinedHyperConnection,
-        previous_output: torch.Tensor,
-        residual: torch.Tensor,
-        previous_pre_mix: torch.Tensor,
-        previous_post_mix: torch.Tensor,
-        previous_residual_mix: torch.Tensor,
-        norm_weight: torch.Tensor,
-        norm_eps: float,
-) -> tuple[torch.Tensor, ...]:
-    """Execute the shifted protocol with ordinary Torch operations for CPU tests."""
-    new_residual = pipelined_mhc_post(
-        previous_output,
-        residual,
-        previous_post_mix,
-        previous_residual_mix,
-    )
-    next_pre, next_post, next_residual_mix = module(new_residual)
-    mixed_input = (previous_pre_mix.unsqueeze(-1) * new_residual.float()).sum(dim=2)
-    reciprocal_std = torch.rsqrt(mixed_input.square().mean(dim=-1, keepdim=True) + norm_eps)
-    block_input = (mixed_input * reciprocal_std).to(residual.dtype) * norm_weight
-    return new_residual, next_pre, next_post, next_residual_mix, block_input
 
 
 @module_replacement
@@ -99,17 +74,6 @@ class DeepseekV41HyperMegaMhc(DeepseekV41PipelinedHyperConnection):
             norm_weight: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
         """Advance one shifted mHC boundary and predict the next mappings."""
-        if residual.device.type == "cpu":
-            return _reference_shifted_boundary(
-                self,
-                previous_output,
-                residual,
-                previous_pre_mix,
-                previous_post_mix,
-                previous_residual_mix,
-                norm_weight,
-                self.norm_eps,
-            )
         if residual.device.type != "npu":
             raise TypeError("DeepSeek-V4.1 HyperMegaMhc supports only NPU execution")
         # Multicore is an optional native dependency unless this replacement is selected.

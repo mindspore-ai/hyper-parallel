@@ -46,6 +46,7 @@ from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41Model,
     bind_shared_expert_forward,
 )
+from tests.common.deepseek_v41_mhc_stubs import stub_mhc_for_cpu
 from tests.common.mark_utils import arg_mark
 
 
@@ -131,7 +132,7 @@ class TestV41SharedExpert(unittest.TestCase):
         """Prepare model-owned expert sharing before the first native submission.
 
         Feature: DSV4.1-owned MegaMoe workspace preparation.
-        Description: Run text/VLM backbones twice with two configured expert layers.
+        Description: Run text/VLM backbones twice with two expert layers and shape-preserving mHC stubs.
         Expectation: The first expert call sees shared resources, prepared only once.
         """
         for vision_enabled in (False, True):
@@ -164,7 +165,8 @@ class TestV41SharedExpert(unittest.TestCase):
                                   expert_group[1]._executor._resource_group)  # pylint: disable=protected-access
                     return torch.zeros_like(hidden_states)
 
-                with (patch.object(DeepseekV41MegaMoeExperts, 'prepare_runtime_group',
+                with (stub_mhc_for_cpu(),
+                      patch.object(DeepseekV41MegaMoeExperts, 'prepare_runtime_group',
                                    wraps=DeepseekV41MegaMoeExperts.prepare_runtime_group) as prepare,
                       patch.object(MegaMoeExperts, 'forward', side_effect=execute) as forward):
                     for _ in range(2):
@@ -173,12 +175,12 @@ class TestV41SharedExpert(unittest.TestCase):
                 prepare.assert_called_once_with(experts)
                 self.assertEqual(forward.call_count, 4)
 
-    def test_shifted_mhc_preserves_dspark_targets_and_backbone_gradients(self) -> None:
-        """Keep DSpark targets and backbone training equivalent after mHC replacement.
+    def test_shifted_protocol_preserves_dspark_targets_and_backbone_gradients(self) -> None:
+        """Keep DSpark targets and gradients through a stubbed shifted protocol.
 
-        Feature: Single-pass mHC and DSpark backbone integration.
-        Description: Compare two real backbone layers with ordinary and shifted mHC.
-        Expectation: Outputs, detached DSpark targets, and parameter gradients match.
+        Feature: Shifted DSpark backbone integration with mHC isolated.
+        Description: Compare ordinary and shifted scheduling with shape-preserving mHC stubs.
+        Expectation: Outputs, detached DSpark targets, and non-mHC parameter gradients match.
         """
         torch.manual_seed(94)
         config = _config()
@@ -206,19 +208,20 @@ class TestV41SharedExpert(unittest.TestCase):
             global_sequence_length=4,
         )
 
-        expected = reference(input_ids=input_ids, packed_seq_params=packed).last_hidden_state
-        actual = shifted(input_ids=input_ids, packed_seq_params=packed).last_hidden_state
+        with stub_mhc_for_cpu():
+            expected = reference(input_ids=input_ids, packed_seq_params=packed).last_hidden_state
+            actual = shifted(input_ids=input_ids, packed_seq_params=packed).last_hidden_state
 
-        torch.testing.assert_close(actual, expected)
-        for layer, expected_layer in zip(shifted.layers, reference.layers):
-            torch.testing.assert_close(layer.mlp.gate.last_aux_loss, expected_layer.mlp.gate.last_aux_loss)
-        self.assertEqual(len(shifted.dspark_target_hiddens), 2)
-        for target, expected_target in zip(shifted.dspark_target_hiddens, reference.dspark_target_hiddens):
-            torch.testing.assert_close(target, expected_target)
-            self.assertFalse(target.requires_grad)
-        self.assertFalse(shifted.dspark_inputs_embeds.requires_grad)
-        expected.square().sum().backward()
-        actual.square().sum().backward()
+            torch.testing.assert_close(actual, expected)
+            for layer, expected_layer in zip(shifted.layers, reference.layers):
+                torch.testing.assert_close(layer.mlp.gate.last_aux_loss, expected_layer.mlp.gate.last_aux_loss)
+            self.assertEqual(len(shifted.dspark_target_hiddens), 2)
+            for target, expected_target in zip(shifted.dspark_target_hiddens, reference.dspark_target_hiddens):
+                torch.testing.assert_close(target, expected_target)
+                self.assertFalse(target.requires_grad)
+            self.assertFalse(shifted.dspark_inputs_embeds.requires_grad)
+            expected.square().sum().backward()
+            actual.square().sum().backward()
         for name, parameter in shifted.named_parameters():
             expected_grad = reference.get_parameter(name).grad
             if expected_grad is None:
