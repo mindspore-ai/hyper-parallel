@@ -16,12 +16,14 @@
 
 from hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel import (
     kimi_delta_attention_cp_wrapper,
+    kimi_mla_cp_wrapper,
     kimi_delta_attention_p2p_cp_wrapper,
     kimi_delta_attention_ulysses_cp_wrapper,
 )
 
 __all__ = [
     "kimi_delta_attention_cp_wrapper",
+    "kimi_mla_cp_wrapper",
     "kimi_delta_attention_p2p_cp_wrapper",
     "kimi_delta_attention_ulysses_cp_wrapper",
 ]
