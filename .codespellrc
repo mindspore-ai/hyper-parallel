@@ -1,2 +1,3 @@
 [codespell]
-ignore-words-list = cann,tbe,enque
+# HF processors and Omni records use the public field name "medias".
+ignore-words-list = cann,tbe,enque,medias

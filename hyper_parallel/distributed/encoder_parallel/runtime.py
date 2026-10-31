@@ -87,14 +87,19 @@ def validate_attention_replacement(model: nn.Module, spec: EncoderParallelAdapte
         model: Final model after module replacements.
         spec: Model-owned attention matching and replacement contract.
     """
-    expected = frozenset(name for name, _ in model.named_modules()
-                         if fnmatch.fnmatchcase(name, spec.attention_pattern))
+    # Activation wrappers expose the original module under its canonical FQN
+    # during traversal; get_submodule would instead return the outer wrapper.
+    module_by_fqn = dict(model.named_modules())
+    expected = frozenset(name for name, module in module_by_fqn.items()
+                         if fnmatch.fnmatchcase(name, spec.attention_pattern)
+                         and (spec.source_attention_type is None
+                              or isinstance(module, spec.source_attention_type)))
     recorded = set(getattr(model, "_hp_replaced_module_fqns", ()) or ())
     recorded_visual = {name for name in recorded if fnmatch.fnmatchcase(name, spec.attention_pattern)}
     missing = sorted(expected - recorded_visual)
     unexpected = sorted(recorded_visual - expected)
     wrong_type = sorted(name for name in expected
-                        if not isinstance(model.get_submodule(name), spec.replacement_attention_type))
+                        if not isinstance(module_by_fqn[name], spec.replacement_attention_type))
     if not expected or missing or unexpected or wrong_type:
         raise RuntimeError(
             "incomplete vision attention replacement: "
@@ -143,6 +148,25 @@ class EncoderParallelPlan:
             gathered.append(full if segment.is_dummy else full[:segment.item.sequence_length])
         return tuple(gathered)
 
+    def _project_slots(self, hidden: torch.Tensor, full_features: tuple[torch.Tensor, ...]
+                       ) -> tuple[tuple[EncoderWorkItem | None, ...], tuple[torch.Tensor, ...]]:
+        """Use a bridge's batched FSDP entry when supplied, preserving legacy calls."""
+        bridge = self.runtime.bridge
+        items, projection_inputs = [], []
+        for slot in range(self.k_fsdp_max):
+            segment = self.local_segments[slot] if slot < len(self.local_segments) else None
+            real = segment is not None and not segment.is_dummy and self.runtime.encoder_cp_rank == 0
+            items.append(segment.item if real else None)
+            projection_inputs.append(full_features[slot] if real else hidden)
+        project_many = getattr(bridge, "project_many", None)
+        if callable(project_many):
+            features = tuple(project_many(tuple(projection_inputs), tuple(items)))
+            if len(features) != self.k_fsdp_max:
+                raise ValueError("batched aligner must return one feature tensor per planned slot")
+        else:
+            features = tuple(bridge.project(value, item) for value, item in zip(projection_inputs, items))
+        return tuple(items), features
+
     def _execute_local(self, image_inputs: Mapping[str, Any] | EncoderLocalInputs
                        ) -> tuple[tuple[EncoderFeature, ...], torch.Tensor, torch.Tensor]:
         """Run the local ViT pass and build routed feature records."""
@@ -159,25 +183,21 @@ class EncoderParallelPlan:
         full_features = self._gather_features(hidden)
         records = []
         anchors = [feature.sum() * 0.0 for feature in full_features]
-        prototype = None
-        for slot in range(self.k_fsdp_max):
-            segment = self.local_segments[slot] if slot < len(self.local_segments) else None
-            real = segment is not None and not segment.is_dummy and self.runtime.encoder_cp_rank == 0
-            if real:
-                feature = bridge.project(full_features[slot], segment.item)
-                if feature.ndim != 2 or feature.shape[0] != segment.item.output_rows:
+        items, features = self._project_slots(hidden, full_features)
+        for item, feature in zip(items, features):
+            if item is not None:
+                if feature.ndim != 2 or feature.shape[0] != item.output_rows:
                     raise ValueError(
                         "aligner output does not match planned rows; "
-                        f"item_id={segment.item.item_id}; actual_shape={tuple(feature.shape)}; "
-                        f"expected_rows={segment.item.output_rows}"
+                        f"item_id={item.item_id}; actual_shape={tuple(feature.shape)}; "
+                        f"expected_rows={item.output_rows}"
                     )
-                records.append((segment.item, feature))
+                records.append((item, feature))
             else:
-                feature = bridge.project(hidden, None)
                 anchors.append(feature.sum() * 0.0)
-            prototype = feature
-        if prototype is None:
+        if not features:
             raise RuntimeError("active plan must have an aligner slot")
+        prototype = features[-1]
         anchor = torch.stack(anchors).sum() if anchors else prototype.sum() * 0.0
         return tuple(records), prototype, anchor
 

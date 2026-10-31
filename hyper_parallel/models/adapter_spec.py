@@ -63,12 +63,18 @@ class RecomputePolicy:
     path cannot express, such as "keep the attention of every role that does not
     recompute out of the region". It receives ``(module_fqn, module)`` and is
     evaluated together with ``exclude_patterns``.
+
+    ``swap_input_keep_indices`` identifies positional checkpoint inputs whose
+    storage must remain resident during input swap, including aliases. Shared
+    masks or position tables may outlive a single layer; all other inputs keep
+    the default swap policy. The indices apply only when input swap is enabled.
     """
 
     region_patterns: tuple[str, ...]
     exclude_patterns: tuple[str, ...] = ()
     exclude_predicate: Optional[Callable[[str, Any], bool]] = None
     on_applied: Optional[Callable[[Any], None]] = None
+    swap_input_keep_indices: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)

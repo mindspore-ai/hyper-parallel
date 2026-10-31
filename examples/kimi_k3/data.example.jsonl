@@ -1,0 +1,2 @@
+{"messages":[{"role":"user","content":[{"type":"image","image":"images/example.jpg"},{"type":"text","text":"描述图像中的场景。"}]},{"role":"assistant","content":"请将这里替换为这张真实图像对应的训练文本。"}]}
+{"messages":[{"role":"user","content":"什么是因果语言建模？"},{"role":"assistant","content":"使用当前位置及之前的上下文预测后续 token。"}]}

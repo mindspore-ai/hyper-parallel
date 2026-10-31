@@ -16,6 +16,7 @@
 # pylint: disable=forbidden-backend-import
 
 import fnmatch
+import inspect
 import logging
 import weakref
 from collections.abc import Callable
@@ -780,6 +781,12 @@ def _validate_activation_checkpoint_config(
         )
 
 
+def _invoke_recompute_provider(provider: Callable[..., RecomputePolicy], model: nn.Module) -> RecomputePolicy:
+    """Support both static policies and policies derived from the final model."""
+    kwargs = {"model": model} if "model" in inspect.signature(provider).parameters else {}
+    return provider(**kwargs)
+
+
 def _adapter_recompute_spec(model: nn.Module, *, required: bool = True):
     """Resolve a model-owned recompute declaration without family branches."""
     config = getattr(model, "config", None)
@@ -800,7 +807,7 @@ def _adapter_recompute_spec(model: nn.Module, *, required: bool = True):
             "activation_checkpoint.selection.source=model_adapter_safe_regions "
             "requires ModelAdapterSpec.recompute"
         )
-    recompute_policy = provider()  # pylint: disable=not-callable
+    recompute_policy = _invoke_recompute_provider(provider, model)
     if not isinstance(recompute_policy, RecomputePolicy):
         raise TypeError("ModelAdapterSpec.recompute must return RecomputePolicy")
     return recompute_policy
@@ -1007,6 +1014,8 @@ def _apply_model_adapter_regions_checkpointing(
     if hasattr(model, "gradient_checkpointing_disable"):
         model.gradient_checkpointing_disable()
     checkpoint_kwargs = {"swap_inputs": swap_inputs} if not enable_compile else {}
+    if swap_inputs and not enable_compile and recompute_spec.swap_input_keep_indices:
+        checkpoint_kwargs["swap_input_keep_indices"] = recompute_spec.swap_input_keep_indices
 
     module_by_fqn = dict(model.named_modules())
     roots = _select_layer_region_roots(module_by_fqn, selected_layer_fqns, recompute_spec)

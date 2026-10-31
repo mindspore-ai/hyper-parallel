@@ -1,0 +1,228 @@
+# Explicit scratch pretraining; local configuration and processor assets are required.
+model:
+  _target_: hyper_parallel.models.kimi_k3.adapter.construction.build_kimi_k3_training_model
+  config_path: /path/to/k3-training-config.json
+  strip_inference_quantization: false
+  torch_dtype: bfloat16
+model_init_dtype: float32
+loss_fn:
+  _target_: hyper_parallel.models.kimi_k3.adapter.loss.KimiK3ChunkedCausalLMLoss
+  chunk_size: 128
+  ignore_index: -100
+training:
+  train_iters: 10
+  eval_iters: 0
+  global_batch_size: 4
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: true
+accelerator:
+  tp_size: 1
+  cp_size: 2
+  ep_size: 2
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+  encoder_parallel:
+    enabled: true
+    encoder_cp_size: 2
+fsdp_config:
+  dp_shard_size: 4
+  edp_shard_size: 2
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    cast_forward_inputs: false
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+plan_overrides:
+- match:
+  - language_model.model.layers.3.self_attn
+  - language_model.model.layers.7.self_attn
+  - language_model.model.layers.11.self_attn
+  - language_model.model.layers.15.self_attn
+  - language_model.model.layers.19.self_attn
+  - language_model.model.layers.23.self_attn
+  - language_model.model.layers.27.self_attn
+  - language_model.model.layers.31.self_attn
+  - language_model.model.layers.35.self_attn
+  - language_model.model.layers.39.self_attn
+  - language_model.model.layers.43.self_attn
+  - language_model.model.layers.47.self_attn
+  - language_model.model.layers.51.self_attn
+  - language_model.model.layers.55.self_attn
+  - language_model.model.layers.59.self_attn
+  - language_model.model.layers.63.self_attn
+  - language_model.model.layers.67.self_attn
+  - language_model.model.layers.71.self_attn
+  - language_model.model.layers.75.self_attn
+  - language_model.model.layers.79.self_attn
+  - language_model.model.layers.83.self_attn
+  - language_model.model.layers.87.self_attn
+  - language_model.model.layers.91.self_attn
+  - language_model.model.layers.92.self_attn
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.models.kimi_k3.adapter.mla.KimiMLAAttention
+- match: language_model.model.layers.*.self_attn.forward
+  when: cp
+  replace:
+    kind: method
+    implementation:
+      _target_: hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel.kimi_k3_attention_cp_wrapper
+      kda_strategy: ulysses
+      kda_backend: triton
+      mla_strategy: expanded_ulysses
+      mla_overlap: false
+      mla_backward_overlap: false
+- match: language_model.model.layers.*.block_sparse_moe
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.models.kimi_k3.adapter.distributed.expert_parallel.replace_kimi_k3_ep_moe
+      ep_backend: standard
+      overlap_shared_expert: false
+- match: language_model.model.layers.*.block_sparse_moe
+  region_dispatch: false
+  in_src:
+    hidden_states:
+      tp: replicate
+      cp: shard(1)
+    valid_token_mask:
+      tp: replicate
+      cp: shard(1)
+  in_dst:
+    hidden_states:
+      tp: replicate
+      cp: shard(1)
+    valid_token_mask:
+      tp: replicate
+      cp: shard(1)
+  out_src:
+    output:
+      tp: replicate
+      cp: shard(1)
+  out_dst:
+    output:
+      tp: replicate
+      cp: shard(1)
+- match: language_model.model.layers.*.block_sparse_moe.forward
+  when: ep
+  replace:
+    kind: method
+    implementation:
+      _target_: hyper_parallel.models.kimi_k3.adapter.distributed.expert_parallel.kimi_k3_ep_compute_fn
+- match:
+  - vision_tower.encoder.blocks.0
+  - vision_tower.encoder.blocks.1
+  - vision_tower.encoder.blocks.2
+  - vision_tower.encoder.blocks.3
+  - vision_tower.encoder.blocks.4
+  - vision_tower.encoder.blocks.5
+  - vision_tower.encoder.blocks.6
+  - vision_tower.encoder.blocks.7
+  - vision_tower.encoder.blocks.8
+  - vision_tower.encoder.blocks.9
+  - vision_tower.encoder.blocks.10
+  - vision_tower.encoder.blocks.11
+  - vision_tower.encoder.blocks.12
+  - vision_tower.encoder.blocks.13
+  - vision_tower.encoder.blocks.14
+  - vision_tower.encoder.blocks.15
+  - vision_tower.encoder.blocks.16
+  - vision_tower.encoder.blocks.17
+  - vision_tower.encoder.blocks.18
+  - vision_tower.encoder.blocks.19
+  - vision_tower.encoder.blocks.20
+  - vision_tower.encoder.blocks.21
+  - vision_tower.encoder.blocks.22
+  - vision_tower.encoder.blocks.23
+  - vision_tower.encoder.blocks.24
+  - vision_tower.encoder.blocks.25
+  - vision_tower.encoder.blocks.26
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.models.kimi_k3.adapter.distributed.encoder_parallel.replace_vision_encoder_layer
+mixed_precision:
+  enabled: false
+activation_checkpoint:
+  mode: 'off'
+activation_swap: none
+compile:
+  enabled: false
+dataset:
+  _target_: hyper_parallel.data.omni.build_online_omni_mapping_dataset
+  data_path: /path/to/train.jsonl
+  data_config: {}
+  model_assets:
+    _target_: hyper_parallel.data.omni.build_auto_processor
+    pretrained_model_name_or_path: /path/to/local/Kimi-K3-processor
+    local_files_only: true
+    trust_remote_code: true
+  data_transform:
+    _target_: hyper_parallel.models.kimi_k3.adapter.data.transform_fn.build_kimi_k3_omni_transform
+    max_seq_len: 2048
+    label_policy: all_text
+    pixel_dtype: float32
+    patch_size: 14
+    media_token_id: 163605
+    media_begin_id: 163602
+    media_end_id: 163604
+  training_mode: pretrain
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.models.kimi_k3.adapter.data.collate.build_kimi_k3_collate_fn
+    pad_token_id: 163839
+    pad_to_multiple_of: 128
+    pre_shift_labels: true
+    max_seq_len: 2048
+  get_batch:
+    _target_: hyper_parallel.data.batching.OmniParallelBatch
+    prefetch_step_on_cpu: true
+    runtime_input_adapter:
+      _target_: hyper_parallel.models.kimi_k3.adapter.data.runtime.build_kimi_k3_runtime_input_adapter
+  sampler_type: cyclic
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+  fp32_main_params: true
+  no_decay_params:
+  - bias
+  - norm
+  - ln_
+  adamw_config:
+    adamw_lr: 1.0e-05
+    adamw_weight_decay: 0.1
+    adamw_betas:
+    - 0.9
+    - 0.95
+    adamw_eps: 1.0e-08
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr_warmup_steps: 1
+    min_lr: 0.0
+checkpoint:
+  save_ckpt: false
+  restore_from: null
+  checkpoint_dir: ./output/kimi_k3/checkpoints
+model_integration:
+  mode: runtime
+debug:
+  check_nan_inf: true
+  check_dataset: null

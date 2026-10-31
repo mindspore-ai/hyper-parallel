@@ -175,6 +175,7 @@ class _ModelStrictLoadPlanner(StandardLoadPlanner):
         """Load partially, optionally demanding every requested model key."""
         super().__init__(allow_partial_load=True)
         self.strict_model = strict_model
+        self.persisted_optimizer_keys: Optional[frozenset[str]] = None
 
     def configure_planner(
             self,
@@ -182,7 +183,22 @@ class _ModelStrictLoadPlanner(StandardLoadPlanner):
             metadata: Any,
             **kwargs: Any,
     ) -> None:
-        """Normalize optional optimizer state before flattening the load skeleton."""
+        """Normalize optional optimizer state before flattening the load skeleton.
+
+        Args:
+            state_dict: Destination payload whose optimizer skeleton may be adjusted
+                in place to match the checkpoint's FP32 main-parameter layout.
+            metadata: Checkpoint metadata describing the persisted state-dict keys.
+            **kwargs: Planner configuration options forwarded to the base planner.
+
+        Note:
+            Records persisted optimizer keys without their ``optimizer.`` prefix
+            so restore can discard states created only to initialize the skeleton.
+        """
+        self.persisted_optimizer_keys = frozenset(
+            key.removeprefix("optimizer.") for key in metadata.state_dict_metadata
+            if key.startswith("optimizer.")
+        )
         _prepare_main_param_state_for_dcp_load(
             state_dict,
             set(metadata.state_dict_metadata),
@@ -387,6 +403,7 @@ class DistributedCheckpointer(CheckpointerBase):
         """Select the ``extra_state`` layout used by :meth:`save`."""
         self.extra_state_per_rank = extra_state_per_rank
         self._async_save_response: Optional[Any] = None
+        self.persisted_optimizer_keys: Optional[frozenset[str]] = None
 
     # ------------------------------------------------------------------
     # Layout helpers
@@ -494,6 +511,12 @@ class DistributedCheckpointer(CheckpointerBase):
         copied in by hand, are still found by scanning the directory. A
         checkpoint interrupted mid-save has no DCP metadata and is skipped by
         both paths, so resume never lands on a half-written one.
+
+        Args:
+            checkpoint_dir: Directory containing saved checkpoint steps.
+
+        Returns:
+            The newest complete checkpoint path, or None if none is available.
         """
         from_pointer = self._read_latest_pointer(checkpoint_dir)
         if from_pointer is not None:
@@ -596,7 +619,14 @@ class DistributedCheckpointer(CheckpointerBase):
         global_step: int,
         save_async: bool = False,
     ) -> None:
-        """Write ``state`` into ``path``; see :meth:`CheckpointerBase.save`."""
+        """Write training state into a checkpoint directory.
+
+        Args:
+            path: Destination checkpoint directory.
+            state: Model, optimizer and auxiliary training state to save.
+            global_step: Training step used when publishing the checkpoint.
+            save_async: Whether to persist the checkpoint asynchronously.
+        """
         # Never let two saves overlap: they would compete for host memory and,
         # in async mode, race on the checkpoint directory.
         self.maybe_wait_for_async_save()
@@ -653,7 +683,26 @@ class DistributedCheckpointer(CheckpointerBase):
         strict_model: bool = True,
         extra_state_skeleton: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Fill ``state`` from ``path``; see :meth:`CheckpointerBase.load`."""
+        """Fill the supplied state skeleton from a distributed checkpoint.
+
+        Args:
+            path: Directory containing the distributed checkpoint.
+            state: Destination payload filled in place; its keys define the entries
+                requested from the checkpoint.
+            strict_model: Require every requested model key to exist. Missing
+                optimizer entries retain their initialized skeleton values.
+            extra_state_skeleton: Expected training-state structure. When supplied,
+                restore it from the rank-local file or the embedded DCP payload;
+                otherwise omit the separate training-state restoration step.
+
+        Returns:
+            The same ``state`` dictionary after all ranks have completed loading.
+
+        Note:
+            ``persisted_optimizer_keys`` is cleared before loading and published
+            only after success, for removal of unpersisted optimizer skeleton state.
+        """
+        self.persisted_optimizer_keys = None
         self.maybe_wait_for_async_save()
 
         # Auto-detect the layout the checkpoint was written with, so the
@@ -666,11 +715,12 @@ class DistributedCheckpointer(CheckpointerBase):
             skeleton[_STEP_KEY] = _UNRESTORED_STEP
             state["extra_state"] = skeleton
 
+        planner = _ModelStrictLoadPlanner(strict_model=strict_model)
         try:
             dcp_load(
                 state,
                 checkpoint_id=path,
-                planner=_ModelStrictLoadPlanner(strict_model=strict_model),
+                planner=planner,
             )
         except Exception:
             logger.exception("Failed to load checkpoint from %s", path)
@@ -684,6 +734,7 @@ class DistributedCheckpointer(CheckpointerBase):
         # Hold every rank here until all of them have finished reading, so no
         # rank starts training against a checkpoint others are still loading.
         _barrier()
+        self.persisted_optimizer_keys = planner.persisted_optimizer_keys
         return state
 
     def _read_extra_state(

@@ -396,12 +396,17 @@ class CheckpointerCallback(Callback):
     def _load_optimizer_payload(self, checkpoint_state: Dict[str, Any], optimizers: List[Any],
                                 persisted_keys: Optional[frozenset[str]]) -> None:
         """Restore dense optimizer leaves or reload dense main parameters."""
-        optimizer_sds = _as_list(checkpoint_state.get("optimizer"))
-        for optimizer, optimizer_sd in zip(optimizers, optimizer_sds):
+        optimizer_payload = checkpoint_state.get("optimizer")
+        optimizer_sds = _as_list(optimizer_payload)
+        for index, (optimizer, optimizer_sd) in enumerate(zip(optimizers, optimizer_sds)):
             optimizer.load_state_dict(optimizer_sd)
             drop_primed = getattr(optimizer, "drop_unpersisted_dense_state", None)
             if drop_primed is not None and persisted_keys is not None:
-                drop_primed(persisted_keys)
+                keys = persisted_keys
+                if isinstance(optimizer_payload, list):
+                    prefix = f"{index}."
+                    keys = frozenset(key.removeprefix(prefix) for key in keys if key.startswith(prefix))
+                drop_primed(keys)
         if not optimizers:
             for optimizer in _as_list(self.trainer.optimizer):
                 if isinstance(optimizer, MixedPrecisionOptimizer):
@@ -427,7 +432,8 @@ class CheckpointerCallback(Callback):
             self.trainer.model,
             self.trainer.config.model_init_dtype,
         )
-        persisted_keys = load_plan.persisted_optimizer_keys if load_plan is not None else None
+        persisted_keys = (load_plan.persisted_optimizer_keys if load_plan is not None
+                          else getattr(self.checkpointer, "persisted_optimizer_keys", None))
         self._load_optimizer_payload(checkpoint_state, optimizers, persisted_keys)
 
         if self._restore_train_state:

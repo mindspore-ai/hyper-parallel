@@ -26,6 +26,7 @@ from hyper_parallel.core.optimizer.dtensor_compat import (
     to_local_if_dtensor,
 )
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
+from hyper_parallel.core.optimizer.swap_optimizer import is_swap_optimizer
 
 
 MIXED_PRECISION_OPTIMIZER_STATE_KEY = "_mixed_precision_optimizer"
@@ -320,6 +321,43 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             FP32_MAIN_PARAM_STATE_KEY: dict(self._main_param_by_fqn),
         }
         return state_dict
+
+    def drop_unpersisted_dense_state(self, persisted_keys: frozenset[str]) -> None:
+        """Remove restore-only state absent from authoritative checkpoint metadata.
+
+        Args:
+            persisted_keys: Complete DCP leaf keys relative to this optimizer,
+                after loading its state. Any persisted state leaf preserves the
+                parameter's entire state, including zero-valued and empty shards.
+
+        Note:
+            FP32 main weights and parameter groups remain unchanged. This method
+            runs only at an idle restore boundary; it does not inspect moment
+            values or perform distributed communication.
+        """
+        parameters = {
+            name: self.optimizer_param_by_model_param.get(parameter, parameter)
+            for name, parameter in self.model.named_parameters(remove_duplicate=False)
+        }
+        saved_parameters = set()
+        for key in persisted_keys:
+            if not key.startswith("state."):
+                continue
+            name = key.removeprefix("state.")
+            while name:
+                if name in parameters:
+                    saved_parameters.add(parameters[name])
+                    break
+                name = name.rpartition(".")[0]
+        unsaved_parameters = set(parameters.values()) - saved_parameters
+        for optimizer in self.chained_optimizers:
+            removed = False
+            for parameter in unsaved_parameters:
+                if parameter in optimizer.state:
+                    optimizer.state.pop(parameter)
+                    removed = True
+            if removed and is_swap_optimizer(optimizer):
+                optimizer.reset_optimizer_parameters()
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Restore optimizer moments and explicit fp32 main weights.

@@ -72,6 +72,7 @@ def _run_local_kda(
     safe_gate: bool,
     backend: str,
     sequence_info: Optional[PackedSequenceInfo] = None,
+    use_qk_l2norm_in_kernel: bool = True,
 ) -> torch.Tensor:
     """Run the explicitly selected local KDA implementation."""
     if backend == "triton" and not safe_gate:
@@ -89,7 +90,7 @@ def _run_local_kda(
         chunk_size=chunk_size,
         initial_state=None,
         output_final_state=False,
-        use_qk_l2norm_in_kernel=True,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         use_gate_in_kernel=True,
         use_beta_sigmoid_in_kernel=True,
         backend=backend,
@@ -865,6 +866,7 @@ class _KDAStateCP(nn.Module):
         dt_bias: torch.Tensor,
         scale: Optional[float] = None,
         sequence_info: Optional[PackedSequenceInfo] = None,
+        use_qk_l2norm_in_kernel: bool = True,
     ) -> torch.Tensor:
         """Run one local KDA segment and propagate its recurrent state.
 
@@ -877,7 +879,12 @@ class _KDAStateCP(nn.Module):
             a_log: Decay parameter with one value per value head.
             dt_bias: Learned bias with one value per gate channel.
             scale: Optional attention scaling factor.
+            use_qk_l2norm_in_kernel: False accepts caller-normalized Q/K on the fused path.
         """
+        if not isinstance(use_qk_l2norm_in_kernel, bool):
+            raise ValueError("use_qk_l2norm_in_kernel must be bool")
+        if self.backend == "eager" and not use_qk_l2norm_in_kernel and self.cp_size > 1:
+            raise ValueError("Caller-normalized state CP currently requires backend=triton")
         if self.cp_size == 1:
             return _run_local_kda(
                 query,
@@ -893,6 +900,7 @@ class _KDAStateCP(nn.Module):
                 safe_gate=self.safe_gate,
                 backend=self.backend,
                 sequence_info=sequence_info,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             )
         if self.backend == "eager":
             return _eager_kda_state_p2p(
@@ -936,6 +944,7 @@ class _KDAStateCP(nn.Module):
             safe_gate=self.safe_gate,
             state_cp=self.state_cp,
             sequence_info=sequence_info,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         )
 
 
@@ -1095,6 +1104,10 @@ class KimiDeltaAttentionLayerUlyssesCP(KimiDeltaAttentionUlyssesCP):
         packed = self._seq_to_head(torch.cat(rank_major, dim=-1).contiguous())
         return torch.split(packed, split_sizes, dim=-1)
 
+    def _run_local_attention(self, *args: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        """Run the shared kernel while allowing model-owned normalization semantics."""
+        return _run_local_kda(*args, **kwargs)
+
     def _local_short_conv(
         self,
         projected: torch.Tensor,
@@ -1208,7 +1221,7 @@ class KimiDeltaAttentionLayerUlyssesCP(KimiDeltaAttentionUlyssesCP):
             self.cp_rank,
             self.cp_size,
         )
-        output = _run_local_kda(
+        output = self._run_local_attention(
             query,
             key,
             value,
@@ -1457,7 +1470,8 @@ class KimiDeltaAttentionCoreCP(nn.Module):
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                 gate: torch.Tensor, beta: torch.Tensor, *, a_log: torch.Tensor,
                 dt_bias: torch.Tensor, scale: float | None = None,
-                sequence_info: Optional[PackedSequenceInfo] = None) -> torch.Tensor:
+                sequence_info: Optional[PackedSequenceInfo] = None,
+                use_qk_l2norm_in_kernel: bool = True) -> torch.Tensor:
         """Run state CP with optional token/head redistribution.
 
         Args:
@@ -1469,14 +1483,18 @@ class KimiDeltaAttentionCoreCP(nn.Module):
             a_log: Learned decay parameter with one entry per value head.
             dt_bias: Learned gate bias with HV times K entries.
             scale: Attention scaling factor; None selects the local default.
+            use_qk_l2norm_in_kernel: Normalize internally or accept caller-normalized Q/K.
 
         Returns:
             Output restored to this rank's original token/head layout.
         """
-        is_flat_input = query.ndim == 3
-        if is_flat_input:
+        if not isinstance(use_qk_l2norm_in_kernel, bool):
+            raise ValueError("use_qk_l2norm_in_kernel must be bool")
+        is_tnd = query.ndim == 3
+        if is_tnd:
             output = self.forward(*(tensor.unsqueeze(0) for tensor in (query, key, value, gate, beta)),
-                                  a_log=a_log, dt_bias=dt_bias, scale=scale, sequence_info=sequence_info)
+                                  a_log=a_log, dt_bias=dt_bias, scale=scale, sequence_info=sequence_info,
+                                  use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel)
             return output.squeeze(0)
         if sequence_info is not None:
             if query.shape[0] != 1:
@@ -1485,7 +1503,8 @@ class KimiDeltaAttentionCoreCP(nn.Module):
                                     cp_rank=self.cp_rank, cp_size=self.cp_size)
         if self.ulysses_mesh is None:
             return self.state(query, key, value, gate, beta, a_log=a_log, dt_bias=dt_bias, scale=scale,
-                              sequence_info=sequence_info)
+                              sequence_info=sequence_info,
+                              use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel)
         _validate_projected_inputs(self.ulysses_degree, query, key, value, gate, beta, a_log, dt_bias)
         heads, key_dim = value.shape[2], query.shape[-1]
         inputs = self._exchange_inputs((query, key, value, gate, beta))
@@ -1493,7 +1512,8 @@ class KimiDeltaAttentionCoreCP(nn.Module):
         local_bias = _slice_local_heads(dt_bias.reshape(heads, key_dim), self.ulysses_rank, self.ulysses_degree)
         exchanged_info = None if sequence_info is None else sequence_info.ulysses(
             self.ulysses_degree, self.ulysses_rank)
-        output = self.state(*inputs, a_log=local_a, dt_bias=local_bias, scale=scale, sequence_info=exchanged_info)
+        output = self.state(*inputs, a_log=local_a, dt_bias=local_bias, scale=scale, sequence_info=exchanged_info,
+                            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel)
         return _differentiable_all_to_all_shard(output, self.ulysses_mesh, split_dim=1, concat_dim=2)
 
     def _exchange_inputs(self, inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:

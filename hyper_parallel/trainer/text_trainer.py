@@ -17,7 +17,7 @@
 __all__ = ["TextTrainer"]
 
 from collections import defaultdict
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch  # pylint: disable=forbidden-backend-import
 
@@ -219,22 +219,34 @@ class TextTrainer:
             self,
             data_iterator: Any,
             num_micro_steps: int,
+            *,
+            prepared_batch: Optional[tuple[dict[str, Any], dict[str, Any]]] = None,
+            step_token_counts: Optional[dict[str, torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Fetch and execute one forward-backward micro-step.
+        """Execute one micro-step using the actual optimizer-step token totals.
 
         Args:
             data_iterator: Iterator providing one raw FB batch per call.
             num_micro_steps: Number of FB steps in the current optimizer step.
+            prepared_batch: Inputs already read for this micro-step, if available.
+            step_token_counts: Actual local token totals over all micro-steps.
+                Required when num_micro_steps exceeds one; DP/CP aggregation
+                remains owned by the shared loss runtime.
 
         Returns:
             Loss tensor and named loss tensors for this FB step.
         """
-        model_inputs, loss_inputs = self.base.get_batch(data_iterator)
+        if num_micro_steps < 1:
+            raise ValueError("num_micro_steps must be positive")
+        if num_micro_steps > 1 and step_token_counts is None:
+            raise ValueError("Accumulated text training requires actual step_token_counts; use train_step")
+        model_inputs, loss_inputs = (self.base.get_batch(data_iterator)
+                                     if prepared_batch is None else prepared_batch)
         self.base.current_token_counts = count_loss_token(loss_inputs)
-        self.base.step_token_counts = {
-            name: token_count * num_micro_steps
-            for name, token_count in self.base.current_token_counts.items()
-        }
+        if step_token_counts is None:
+            self.base.step_token_counts = self.base.current_token_counts
+        else:
+            self.base.step_token_counts = step_token_counts
         metric_inputs = {
             **model_inputs,
             **loss_inputs,
@@ -262,10 +274,16 @@ class TextTrainer:
         self.base.model_integration.begin_step(self.base.state.global_step + 1)
         synchronize()
 
+        # A padded/packed micro-batch need not have the same token count as its
+        # neighbors. Read only prepared inputs before backward so every micro-step
+        # uses the exact optimizer-step denominator, independent of DP/CP layout.
+        prepared_batches = [self.base.get_batch(data_iterator) for _ in range(num_micro_steps)]
+        self.base.step_token_counts = count_loss_token([loss_inputs for _, loss_inputs in prepared_batches])
+        step_token_counts = self.base.step_token_counts
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
 
-        for micro_step in range(num_micro_steps):
+        for micro_step, prepared_batch in enumerate(prepared_batches):
             self.base.model_reshard(micro_step, num_micro_steps)
             self.base.configure_fsdp_gradient_sync(
                 micro_step,
@@ -275,7 +293,10 @@ class TextTrainer:
             loss, loss_dict = self.forward_backward_step(
                 data_iterator,
                 num_micro_steps,
+                prepared_batch=prepared_batch,
+                step_token_counts=step_token_counts,
             )
+            prepared_batches[micro_step] = None
 
             total_loss += loss.item()
             for loss_name, loss_value in loss_dict.items():
