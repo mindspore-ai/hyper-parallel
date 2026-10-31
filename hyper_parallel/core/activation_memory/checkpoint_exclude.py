@@ -154,6 +154,14 @@ class _ExcludeCacheEntry:
     input_bindings: List[_InputBinding]
     output_tensor_count: int = 1
     rng_state: Optional[_RNGStateSnapshot] = None
+    tape: Any = None
+
+    def release(self) -> None:
+        """Release cached output and any retained local backward graph."""
+        self.output = None
+        self.input_bindings.clear()
+        if self.tape is not None:
+            self.tape.release()
 
 
 class _ExcludeCache:
@@ -162,11 +170,14 @@ class _ExcludeCache:
     def __init__(self) -> None:
         """Initialize an empty per-checkpoint output cache."""
         self._entries: Dict[int, Deque[_ExcludeCacheEntry]] = defaultdict(deque)
+        self._retained_entries: List[_ExcludeCacheEntry] = []
         self._save_output_storages: Set[Any] = set()
 
     def save(self, wrapper_id: int, entry: _ExcludeCacheEntry) -> None:
         """Save one call entry produced by a checkpoint-excluded region."""
         self._entries[wrapper_id].append(entry)
+        if entry.tape is not None:
+            self._retained_entries.append(entry)
 
     def pop(self, wrapper_id: int) -> _ExcludeCacheEntry:
         """Return the matching forward call entry during recomputation."""
@@ -178,10 +189,24 @@ class _ExcludeCache:
             self._entries.pop(wrapper_id)
         return entry
 
-    def clear(self) -> None:
-        """Release outputs not consumed because recomputation stopped early."""
+    def clear(self, release_retained: bool = False) -> None:
+        """Release queued outputs and optionally graphs consumed during replay."""
+        released = set()
+        for entries in self._entries.values():
+            for entry in entries:
+                if id(entry) in released:
+                    continue
+                entry.release()
+                released.add(id(entry))
         self._entries.clear()
         self._save_output_storages.clear()
+        if release_retained:
+            for entry in self._retained_entries:
+                if id(entry) in released:
+                    continue
+                entry.release()
+                released.add(id(entry))
+            self._retained_entries.clear()
 
     def register_save_outputs(self, output: Any) -> None:
         """Record storage produced by this invocation's SAVE regions."""

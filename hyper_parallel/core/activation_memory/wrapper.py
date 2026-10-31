@@ -31,6 +31,7 @@ from hyper_parallel.core.activation_memory.policy import CheckpointPolicy
 from hyper_parallel.core.activation_memory.recompute_state import get_recompute_state
 from hyper_parallel.core.activation_memory.swap import SwapManager, SwapTensor, Storage
 from . import checkpoint_exclude as _checkpoint_exclude
+from . import reentrant_exclude as _reentrant_exclude
 
 
 _SWAP_WRAPPED_MODULE = "_swap_wrapped_module"
@@ -518,7 +519,7 @@ def ckpt_wrapper(module: Union[nn.Module, Callable], **checkpoint_kwargs: Any) -
 
 
 class CheckpointExcludeWrapper(ActivationWrapper):
-    """Exclude a callable region from checkpoint recomputation."""
+    """Exclude a callable region from non-reentrant or reentrant recomputation."""
 
     def __init__(self, module: Callable[..., Any], *, save_output: bool = True) -> None:
         """Initialize a checkpoint exclusion wrapper for a PyTorch module or function."""
@@ -528,10 +529,22 @@ class CheckpointExcludeWrapper(ActivationWrapper):
             raise ValueError(f"save_output must be a bool, got {type(save_output).__name__}")
         super().__init__(module, track_overlaps=False)
         self.save_output = save_output
+        self.save_rng_state = True
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
-        """Execute normally outside recompute and return the cached output in recompute."""
+        """Execute normally outside checkpointing and reuse cached output during replay."""
         wrapped_module = cast(Callable[..., Any], self._wrapped_module)
+        reentrant_state = _reentrant_exclude.get_current_execution_state()
+        if reentrant_state is not None:
+            return _reentrant_exclude.run_reentrant_exclude(
+                id(self),
+                wrapped_module,
+                reentrant_state,
+                args,
+                kwargs,
+                save_rng_state=self.save_rng_state,
+                save_output=self.save_output,
+            )
         state = get_recompute_state()
         if state is None:
             return wrapped_module(*args, **kwargs)
@@ -608,8 +621,7 @@ def checkpoint_exclude_wrapper(
         forward output while replaying a non-reentrant checkpoint.
 
     Note:
-        This feature requires eager mode and a surrounding HyperParallel
-        checkpoint configured with ``use_reentrant=False``. Nested checkpoint
-        exclusion wrappers are not supported.
+        This wrapper supports eager HyperParallel non-reentrant and reentrant
+        checkpointing. Nested checkpoint exclusion wrappers are not supported.
     """
     return CheckpointExcludeWrapper(module, save_output=save_output)
