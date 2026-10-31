@@ -99,6 +99,8 @@ hyper_parallel/models/*/generated/
 
 # Codegen validation scripts (local-only, do not commit)
 examples/training_demo/codegen_validation/
+tests/torch/codegen/kimi_k26/
+tests/torch/codegen/qwen3_vl_moe/
 
 # Local verification docs and temp
 .tmp/
