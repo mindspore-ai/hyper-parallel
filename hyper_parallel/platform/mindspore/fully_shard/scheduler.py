@@ -122,7 +122,7 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
             return
         self._register_backward_pre_hook(outputs)
-        if HSDPSchedulerV2.root_bp_state:
+        if HSDPSchedulerV2.root_bp_state and not self.isolated_backward:
             self._restore_forward_prefetch_after_recompute()
             return
         return self._hsdp_forward_hook(cell, inputs, outputs)
@@ -133,7 +133,8 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
         _pynative_executor.queue_backward_final_callback(self._root_backward_hook)
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
             return grad
-        HSDPSchedulerV2.root_bp_state = True
+        if not self.isolated_backward:
+            HSDPSchedulerV2.root_bp_state = True
         self._hsdp_backward_pre_hook(self.cell, None)
         return grad
 
@@ -162,7 +163,7 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
         module's own hook, keyed on ``_is_root``.
         """
         self._backward_hook()
-        if self._is_root:
+        if self._is_root and not self.isolated_backward:
             HSDPSchedulerV2.root_bp_state = False
         self.wait_for_pending_reductions()
 
