@@ -56,7 +56,6 @@ checkpoint:
   restore_from: null
 
 plan_overrides:
-plan_overrides:
   # These replacements are optimizations only: the registered architecture is
   # executable before the Trainer applies any of them.
   - match:
@@ -105,7 +104,7 @@ plan_overrides:
       k_weight: {tp: replicate}
       embed.weight: {ep: "shard(0)"}
       wkv.weight: {tp: replicate}
-  - match: "model.layers.*.engram"
+  - match: "model.layers.*.engram.forward"
     when: ep
     replace:
       kind: method
