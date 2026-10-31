@@ -44,6 +44,7 @@ class HSDPSchedulerContext:
 class HSDPSchedulerV2:
     """HSDPScheduler is used to scheduler hsdp"""
     root_bp_state = False
+    isolated_backward: bool = False
 
 
     def __init__(self, cell: Union[platform.Module, Tuple[platform.Module, ...]], mesh,
@@ -165,7 +166,7 @@ class HSDPSchedulerV2:
         """Forward pre hook to unsharded parameter for forward process."""
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
             return args, kwargs
-        if HSDPSchedulerV2.root_bp_state:
+        if HSDPSchedulerV2.root_bp_state and not self.isolated_backward:
             self._disable_forward_prefetch_for_recompute()
         if self.scheduler_ctx.root_module is None:
             self.scheduler_ctx.root_module = self.cell
