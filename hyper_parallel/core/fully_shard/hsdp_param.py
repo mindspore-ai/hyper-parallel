@@ -703,7 +703,8 @@ class HSDPParamV2:
             torch.empty(torch.Size([numel * world_size]), dtype=dtype, device=device)
             for numel, dtype in zip(all_gather_input_numels, all_gather_input_dtypes)
         ]
-
+        
+    @torch.no_grad()
     def init_unsharded_param(self) -> None:
         """Initialize the stable unsharded parameter from its final output storage."""
         if len(self.unsharded_param_buffers) != 1:
