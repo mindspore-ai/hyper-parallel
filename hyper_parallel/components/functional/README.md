@@ -105,6 +105,28 @@ raises on missing entries or unsupported inputs, without automatic fallback.
 The fused path supports ordinary causal CSA with compression ratio 1 or 2;
 candidate-pool selection is not supported.
 
+### Optional V4.1 partial RoPE
+
+Set `use_fused_rope: true` in the same attention replacement to enable partial
+interleaved RoPE for main Q, output inverse RoPE, raw/compressed KV, and owner/worker
+Indexer projections. It defaults to `false` and is independent of `use_fused_ops`
+and `indexer_load_balance`.
+
+This path additionally requires the native `inplace_partial_rotary_mul` operator
+and its matching `cann_ops_transformer.inplace_partial_rotary_mul` Python entry.
+Use the official build instructions above; add `inplace_partial_rotary_mul` to
+your native operator build selection and load its custom-operator environment
+before initializing the NPU. No local build paths are set by HyperParallel.
+See the [operator interface](https://gitcode.com/cann/ops-transformer/blob/master/posembedding/inplace_partial_rotary_mul/docs/torchapi_inplace_partial_rotary_mul.md)
+for hardware and shape constraints.
+
+The adapter uses BSND storage, rotates the trailing channels, and accepts FP32
+cos/sin constants. It clones the output before the in-place native call, keeping
+caller tensors and checkpoint caches intact. Backward uses Torch operations with
+the reference's separate low-precision branch casts; the native partial-RoPE
+backward is not required. Unsupported inputs and missing entries raise errors.
+Empty tensors retain connected gradients without launching a native kernel.
+
 ## SiTU and block attention residuals
 
 These shared functions support `backend="eager"` (default, Torch reference with FP32

@@ -46,6 +46,95 @@ from hyper_parallel.models.validation_spec import (
 )
 
 
+def _unwrap_validation_module(module: Any) -> Any:
+    """Inspect the module beneath activation-checkpoint or swap wrappers."""
+    while module is not None:
+        wrapped = getattr(module, "_wrapped_module", None)
+        if wrapped is None or wrapped is module:
+            break
+        module = wrapped
+    return module
+
+
+def _require_shared_state_roles(module: Any, expected: dict[str, Any], module_fqn: str) -> None:
+    """Reject missing or changed roles instead of weakening trace requirements."""
+    module = _unwrap_validation_module(module)
+    for name, value in expected.items():
+        actual = getattr(module, name, None)
+        if actual != value:
+            raise ValueError(
+                f"DeepSeek-V4.1 shared-state role mismatch at {module_fqn}.{name}: "
+                f"expected {value!r} from config, got {actual!r}"
+            )
+
+
+def _validate_shared_attention_roles(layers, ratios, kv_sources, index_sources, candidate_source) -> None:
+    """Validate configured producer/consumer roles against executable modules."""
+    for layer_id, layer in enumerate(layers):
+        attention = _unwrap_validation_module(getattr(layer, "self_attn", None))
+        module_fqn = f"model.layers.{layer_id}.self_attn"
+        _require_shared_state_roles(
+            attention,
+            {
+                "layer_idx": layer_id,
+                "compress_ratio": ratios[layer_id],
+                "is_kv_source": layer_id in kv_sources,
+                "is_index_source": layer_id in index_sources,
+            },
+            module_fqn,
+        )
+        indexer = getattr(attention, "indexer", None)
+        if (indexer is not None) != (layer_id in index_sources):
+            raise ValueError(f"DeepSeek-V4.1 Indexer presence at {module_fqn} does not match config")
+        if indexer is not None:
+            _require_shared_state_roles(
+                indexer,
+                {
+                    "owns_key": layer_id in kv_sources,
+                    "is_candidate_source": layer_id == candidate_source,
+                    "uses_candidates": 0 <= candidate_source < layer_id,
+                },
+                f"{module_fqn}.indexer",
+            )
+
+
+def _required_shared_state_keys(model: Any) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Derive trace requirements from final configured roles before execution."""
+    config = model.config
+    layers = getattr(getattr(model, "model", None), "layers", ())
+    ratios = tuple(config.v41_compress_ratios)
+    if len(layers) != config.num_hidden_layers or len(ratios) != len(layers):
+        raise ValueError(
+            "DeepSeek-V4.1 shared-state validation requires the final backbone depth "
+            "and v41_compress_ratios to match config.num_hidden_layers"
+        )
+    kv_sources = set(config.v41_kv_source_layer_ids)
+    index_sources = set(config.v41_index_source_layer_ids)
+    candidate_source = int(getattr(config, "v41_candidate_source_layer_id", -1))
+    compressed_layers = {layer_id for layer_id, ratio in enumerate(ratios) if ratio > 0}
+    if not kv_sources <= index_sources <= compressed_layers:
+        raise ValueError("DeepSeek-V4.1 shared-state sources must be retained compressed-attention layers")
+    if candidate_source >= 0 and candidate_source not in index_sources:
+        raise ValueError("DeepSeek-V4.1 candidate source must be a retained Indexer layer")
+    _validate_shared_attention_roles(layers, ratios, kv_sources, index_sources, candidate_source)
+    producer_roles = {
+        "compressed_kv": bool(kv_sources),
+        "index_key": bool(kv_sources),
+        "topk_indices": bool(index_sources),
+        "candidate_blocks": candidate_source >= 0,
+    }
+    consumer_roles = {
+        "compressed_kv": bool(compressed_layers),
+        "index_key": bool(index_sources - kv_sources),
+        "topk_indices": bool(compressed_layers),
+        "candidate_blocks": candidate_source >= 0 and any(layer_id > candidate_source for layer_id in index_sources),
+    }
+    return (
+        tuple(key for key, required in producer_roles.items() if required),
+        tuple(key for key, required in consumer_roles.items() if required),
+    )
+
+
 def _validate_engram_scratch_state(model: Any, context: Any) -> dict[str, Any] | None:
     """Require official q/k initialization on the final replaced scratch model."""
     if getattr(getattr(model, "config", None), "v41_model_mode", "full") != "validation_crop":
@@ -78,7 +167,7 @@ def _validate_canonical_module_tree(model: Any, context: Any) -> dict[str, Any] 
         f"model.layers.{layer_index}.self_attn"
         for layer_index, layer in enumerate(layers)
         if not isinstance(
-            getattr(layer, "self_attn", None),
+            _unwrap_validation_module(getattr(layer, "self_attn", None)),
             (DeepseekV41Attention, SharedCompressedDSAAttention),
         )
     ]
@@ -91,7 +180,7 @@ def _validate_canonical_module_tree(model: Any, context: Any) -> dict[str, Any] 
         for layer_id in engram_layer_ids
         if layer_id >= len(layers)
         or not isinstance(
-            getattr(layers[layer_id], "engram", None),
+            _unwrap_validation_module(getattr(layers[layer_id], "engram", None)),
             (DeepseekV41Engram, EngramModule),
         )
     ]
@@ -206,6 +295,7 @@ def get_validation_spec() -> ModelValidationSpec:
             consumer_keys=("compressed_kv", "index_key", "topk_indices", "candidate_blocks"),
             begin_trace=begin_shared_state_trace,
             finish_trace=finish_shared_state_trace,
+            required_keys_for_model=_required_shared_state_keys,
         ),
         data=DataValidationSpec(
             required_forward_fields=("input_ids", "labels"),
