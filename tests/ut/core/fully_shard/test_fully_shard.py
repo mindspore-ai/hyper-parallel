@@ -62,6 +62,7 @@ from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPStateV2
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
 from hyper_parallel.distributed._builder.source_shard import _source_infos_for_fully_shard
+from tests.common.mark_utils import arg_mark
 
 
 Tensor = torch.Tensor
@@ -1172,8 +1173,13 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         )
         self.assertIs(result, mock_ddp_mesh_info.return_value)
 
-    def test_state_init_mp_dtypes_initializes_replicate_params_independently(self):
-        """Verify _init_mp_dtypes leaves dtype ownership with each managed parameter."""
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_state_init_mp_dtypes_initializes_replicate_params_independently(self) -> None:
+        """Feature: Replicated parameter precision refresh.
+        Description: Refresh a replicated parameter with a parameter-owned precision policy.
+        Expectation: The parameter receives its resolved policy independently of other managed parameters.
+        """
         state = object.__new__(HSDPStateV2)
         state.hsdp_params = []
         state.replicate_params = []
@@ -1186,6 +1192,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
 
         replicate_param = MagicMock()
         replicate_param.sharded_param.requires_grad = True
+        replicate_param.mp_policy = state.mp_policy
         replicate_param.orig_dtype = torch.float16
         replicate_param.reduce_dtype = torch.bfloat16
         replicate_param.init_dtype_attrs = MagicMock()
@@ -1193,7 +1200,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
 
         HSDPStateV2._init_mp_dtypes(state)
 
-        replicate_param.init_dtype_attrs.assert_called_once_with(state.mp_policy)
+        replicate_param.init_dtype_attrs.assert_called_once_with(replicate_param.mp_policy)
 
     def test_state_init_mp_dtypes_accepts_mixed_managed_dtypes(self):
         """Verify _init_mp_dtypes accepts mixed dtypes across managed parameters."""

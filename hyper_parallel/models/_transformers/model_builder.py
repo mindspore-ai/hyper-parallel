@@ -881,7 +881,7 @@ def _refresh_hsdp_precision_state(model: nn.Module) -> None:
         visited_states.add(id(hsdp_state))
         for hsdp_param in hsdp_state.hsdp_params:
             hsdp_param.reset_sharded_param()
-            hsdp_param.init_dtype_attrs(hsdp_state.mp_policy)
+            hsdp_param.init_dtype_attrs(hsdp_param.mp_policy)
 
 
 def _model_fp32_parameter_ids(model: nn.Module) -> set[int]:
