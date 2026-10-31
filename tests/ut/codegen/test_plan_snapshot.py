@@ -198,6 +198,19 @@ def test_model_build_overlay_restores_native_classmethod():
 
 @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
           card_mark="onecard", essential_mark="unessential")
+def test_codegen_model_init_context_places_parameters_and_buffers_on_meta():
+    """The CLI observation model owns no CPU parameter or buffer storage."""
+    with model_build_overlay._codegen_model_init_context():
+        module = nn.Module()
+        module.register_parameter("weight", nn.Parameter(torch.ones(4)))
+        module.register_buffer("inv_freq", torch.ones(4), persistent=False)
+
+    assert module.weight.is_meta
+    assert module.inv_freq.is_meta
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
 def test_offline_publication_restores_rng(monkeypatch):
     """Snapshot publication cannot advance host RNG state.
 

@@ -31,12 +31,14 @@ passing separate copies would create a second source of truth.
 """
 from __future__ import annotations
 
+import ast
 import logging
 import os
 import re
 from typing import Any
 
 from hyper_parallel.codegen.artifact import ArtifactLayout
+from hyper_parallel.codegen.check.structure import verify_generated_source_structure
 from hyper_parallel.codegen.emit.diff import unified_diff
 from hyper_parallel.codegen.emit.modeling import (
     copy_original_modeling,
@@ -81,6 +83,11 @@ def emit_bundle(
     )
 
     modeling_name = os.path.basename(layout.modeling_path)
+    generated_text = _make_primary_executable(
+        generated_text,
+        architecture=getattr(meta, "model_class", None),
+        artifact_dir=layout.artifact_dir,
+    )
     diff_text = _strip_trailing_whitespace(
         emit_diff(original_text, generated_text, layout)
     )
@@ -159,8 +166,48 @@ def emit_bundle(
         files.update(sibling_diffs)
         if siblings:
             meta.remote_siblings = sorted(siblings)
+    verify_generated_source_structure(files)
     verify_recorded_patch_bundle(files, patch_plan=patch_plan)
     return files
+
+
+def _make_primary_executable(
+    source_text: str,
+    *,
+    architecture: str | None,
+    artifact_dir: str,
+) -> str:
+    """Add direct-file package setup and the standard training footer."""
+    if not architecture:
+        return source_text
+    family = os.path.basename(os.path.dirname(os.path.normpath(artifact_dir)))
+    package = f"hyper_parallel.models.{family}.generated"
+    tree = ast.parse(source_text)
+    insertion_line = 0
+    if tree.body and isinstance(tree.body[0], ast.Expr) and isinstance(
+            tree.body[0].value, ast.Constant) and isinstance(tree.body[0].value.value, str):
+        insertion_line = tree.body[0].end_lineno or 0
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+            insertion_line = max(insertion_line, node.end_lineno or 0)
+    lines = source_text.splitlines()
+    bootstrap = [
+        "",
+        "# Direct execution keeps bundled relative imports in their package.",
+        "if __name__ == \"__main__\" and __package__ is None:",
+        f"    __package__ = {package!r}",
+        "",
+    ]
+    lines[insertion_line:insertion_line] = bootstrap
+    footer = [
+        "",
+        "",
+        "if __name__ == \"__main__\":",
+        "    from hyper_parallel.models._generated import run_generated_training",
+        "",
+        f"    run_generated_training(globals(), {architecture!r})",
+    ]
+    return "\n".join([*lines, *footer])
 
 
 def _materialize_sibling(

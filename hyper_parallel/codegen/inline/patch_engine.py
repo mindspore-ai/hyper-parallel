@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ast
 from collections import defaultdict
+import textwrap
 from typing import Iterable
 
 from hyper_parallel.codegen.astkit.edits import (
@@ -532,11 +533,42 @@ def _forward_extract_edits(
             if f"self.{axis}_enable" in body
         ]
         prefix = "\n".join(state_lines) + "\n\n" if state_lines else ""
+        if patch.merge_original_body:
+            fallback = _forward_impl_fallback(func)
+            if fallback not in body:
+                raise RuntimeError(
+                    f"codegen: merged strategy for {patch.class_name}."
+                    f"{patch.method_name} has no original-forward fallback"
+                )
+            dispatch = body.replace(fallback, "", 1).rstrip()
+            original = textwrap.dedent(
+                source_text[func.body_start:func.body_end]
+            ).rstrip()
+            merged = f"{dispatch}\n\n{original}"
+            if prefix:
+                edits.append(TextEdit(func.def_offset, func.def_offset, prefix))
+            edits.extend(
+                replace_function_body(
+                    source_text, func, merged, indent="        "
+                )
+            )
+            continue
         impl = _build_forward_impl_edit(source_text, func, prefix=prefix)
         if impl is not None:
             edits.append(impl)
         edits.extend(replace_function_body(source_text, func, body, indent="        "))
     return edits
+
+
+def _forward_impl_fallback(func: FunctionInfo) -> str:
+    """Render the dispatch-shell fallback that calls the extracted method."""
+    args = list(func.param_names)
+    if func.vararg_name:
+        args.append(f"*{func.vararg_name}")
+    args.extend(f"{name}={name}" for name in func.kwonly_names)
+    if func.kwarg_name:
+        args.append(f"**{func.kwarg_name}")
+    return f"return self._forward_impl({', '.join(args)})"
 
 
 def _call_name(node: ast.AST) -> str | None:

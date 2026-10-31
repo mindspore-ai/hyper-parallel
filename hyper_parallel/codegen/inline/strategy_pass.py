@@ -164,6 +164,7 @@ def _materialize_cp_forward(
                 class_name=host_class,
                 method_name=spec.method_name,
                 body=spec.subclass_shell,
+                merge_original_body=True,
             )
         )
 

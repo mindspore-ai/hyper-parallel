@@ -137,13 +137,14 @@ def _materialize_imported_forward_hosts(
             raw=f"from {imported.module} import {patch.class_name} as {alias}",
         ))
         patch_set.imports[import_index:import_index + 1] = replacement_imports
-        body = patch.body.replace("__hp_forward_args__", "*args, **kwargs")
+        body = patch.body.replace(
+            "return self._forward_impl(__hp_forward_args__)",
+            "return super().forward(__hp_forward_args__)",
+        ).replace("__hp_forward_args__", "*args, **kwargs")
         snippet = (
             f"class {patch.class_name}({alias}):\n"
             "    \"\"\"Generated source-visible parallel form.\"\"\"\n\n"
             "    cp_enable = False\n\n"
-            "    def _forward_impl(self, *args, **kwargs):\n"
-            "        return super().forward(*args, **kwargs)\n\n"
             "    def forward(self, *args, **kwargs):\n"
             f"{textwrap.indent(body.strip(), '        ')}\n"
         )

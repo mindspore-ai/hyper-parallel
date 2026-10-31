@@ -32,6 +32,7 @@ the identical byte string.
 
 from __future__ import annotations
 
+import ast
 from types import SimpleNamespace
 
 import pytest
@@ -335,6 +336,63 @@ def test_recorded_local_compute_rewrites_same_class_with_ep_toggle():
 
 @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
           card_mark="onecard", essential_mark="unessential")
+def test_recorded_ep_toggle_prevents_second_same_class_boundary_lowering():
+    """One class-level EP toggle excludes all its FQNs from later lowering."""
+    alpha_type = type("Alpha", (), {"forward": _recorded_alpha_forward})
+    record = SimpleNamespace(
+        module_fqn="blocks.alpha",
+        module_type=alpha_type,
+        original_forward=alpha_type.forward,
+        factory="demo.ep.factory",
+    )
+    meta = SimpleNamespace(
+        param_plan={
+            "blocks.alpha": _identity_entry(),
+            "blocks.other_alpha": _boundary("unused", "Alpha")[1]["unused"],
+        },
+        boundary_classes={
+            "blocks.alpha": "Alpha",
+            "blocks.other_alpha": "Alpha",
+        },
+        external_state_classes=[],
+        mesh_dim_names=("cp", "ep"),
+        injections=[{
+            "match": "blocks.alpha",
+            "local_compute_fn": {"_target_": "demo.ep.compute"},
+        }],
+    )
+
+    rendered = materialize_recorded_forwards(
+        SOURCE_TEXT,
+        meta,
+        patch_plan=SimpleNamespace(local_computes=(record,)),
+    )
+    lowered = lower_forward_boundaries(
+        rendered, meta, boundary_classes=meta.boundary_classes
+    )
+    tree = ast.parse(lowered)
+    host = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "Alpha"
+    )
+    methods = [
+        node.name
+        for node in host.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+    assert all(
+        entry["skip_source_lowering"]
+        for entry in meta.param_plan.values()
+    )
+    assert methods.count("_forward_impl") == 1
+    assert methods.count("forward") == 1
+    assert lowered == rendered
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
 def test_frozen_local_compute_rewrites_class_without_live_record():
     """Explicit frozen injections remain visible in offline-only snapshots."""
     meta = SimpleNamespace(
@@ -402,6 +460,50 @@ def test_cp_dispatch_rewrites_same_class_without_constructor_swap():
 
 @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
           card_mark="onecard", essential_mark="unessential")
+def test_same_class_cp_and_boundary_merge_into_one_forward_impl():
+    """A source-owned CP host keeps one method after boundary lowering."""
+    patches = InlinePatchSet(
+        forward_extracts=[
+            ForwardExtractPatch(
+                class_name="Alpha",
+                method_name="forward",
+                body=cp_dispatch_shell_body("kimi_cp_forward"),
+                merge_original_body=True,
+            )
+        ]
+    )
+    rendered = apply_patch_set(SOURCE_TEXT, patches)
+    _, entries, classes = _boundary("blocks.alpha", "Alpha")
+    plan = {
+        "param_plan": entries,
+        "injections": [],
+        "mesh_dim_names": ("cp", "tp"),
+    }
+
+    rendered = lower_forward_boundaries(
+        rendered, plan, boundary_classes=classes
+    )
+    tree = ast.parse(rendered)
+    host = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "Alpha"
+    )
+    methods = [
+        node.name
+        for node in host.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+    assert methods.count("_forward_impl") == 1
+    assert methods.count("forward") == 1
+    assert "return kimi_cp_forward(self, x)" in rendered
+    assert "return self._forward_impl(x)" not in rendered
+    assert "return x * 2" in rendered
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
 def test_same_class_cp_toggle_satisfies_inner_wrapper_verification():
     """The verifier accepts the same-class CP form used by generated models."""
     alpha_type = type("Alpha", (), {})
@@ -425,9 +527,20 @@ def test_same_class_cp_toggle_satisfies_inner_wrapper_verification():
                     class_name="Alpha",
                     method_name="forward",
                     body=cp_dispatch_shell_body("kimi_cp_forward"),
+                    merge_original_body=True,
                 )
             ]
         ),
+    )
+    _, entries, classes = _boundary("blocks.alpha", "Alpha")
+    rendered = lower_forward_boundaries(
+        rendered,
+        {
+            "param_plan": entries,
+            "injections": [],
+            "mesh_dim_names": ("cp", "tp"),
+        },
+        boundary_classes=classes,
     )
 
     _verify_recorded_patch_materialization(rendered, meta, patch_plan=patches)
@@ -540,7 +653,55 @@ def test_imported_cp_host_is_rendered_as_same_name_class():
     assert "class MLAAttention(_MLAAttentionBase):" in rendered
     assert "class HPCodegen" not in rendered
     assert "if self.cp_enable:" in rendered
-    assert "return self._forward_impl(*args, **kwargs)" in rendered
+    assert "return super().forward(*args, **kwargs)" in rendered
+    assert "def _forward_impl" not in rendered
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_imported_cp_host_and_boundary_share_one_forward_impl():
+    """CP dispatch and boundary lowering compose into one implementation."""
+    patches = InlinePatchSet(
+        imports=[ImportPatch("demo.components", ("MLAAttention",))],
+        forward_extracts=[
+            ForwardExtractPatch(
+                class_name="MLAAttention",
+                method_name="forward",
+                body=cp_dispatch_shell_body("mla_cp_forward"),
+            )
+        ],
+    )
+    _materialize_imported_forward_hosts(SOURCE_TEXT, patches)
+    rendered = apply_patch_set(SOURCE_TEXT, patches)
+    _, entries, classes = _boundary(
+        "model.layers.0.self_attn", "MLAAttention"
+    )
+    plan = {
+        "param_plan": entries,
+        "injections": [],
+        "mesh_dim_names": ("cp", "tp"),
+    }
+
+    rendered = lower_forward_boundaries(
+        rendered, plan, boundary_classes=classes
+    )
+    tree = ast.parse(rendered)
+    host = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "MLAAttention"
+    )
+    methods = [
+        node.name
+        for node in host.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+    assert methods.count("_forward_impl") == 1
+    assert methods.count("forward") == 1
+    assert "return mla_cp_forward(self, *args, **kwargs)" in rendered
+    assert "return super().forward(*args, **kwargs)" in rendered
+    assert "return self._forward_impl(*args, **kwargs)" not in rendered
 
 
 @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",

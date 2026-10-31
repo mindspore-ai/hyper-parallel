@@ -88,8 +88,7 @@ def materialize_recorded_forwards(
             rendered, host_type.__name__, group[0], meta
         )
         materialized = True
-        for record in group:
-            _entry_for_record(meta, record)["skip_source_lowering"] = True
+        _mark_class_source_lowering_skipped(meta, host_type.__name__)
     return _add_runtime_helper_import(rendered) if materialized else rendered
 
 
@@ -120,8 +119,8 @@ def _materialize_declared_local_computes(source_text: str, meta: Any) -> str:
         rendered = _materialize_source_class(
             rendered, class_name, records[0], meta
         )
+        _mark_class_source_lowering_skipped(meta, class_name)
         for record in records:
-            _entry_for_record(meta, record)["skip_source_lowering"] = True
             if isinstance(materialized, list):
                 materialized.append({
                     "fqn": record.module_fqn,
@@ -130,6 +129,25 @@ def _materialize_declared_local_computes(source_text: str, meta: Any) -> str:
                     "source_form": "same_class_toggle_forward",
                 })
     return _add_runtime_helper_import(rendered) if grouped else rendered
+
+
+def _mark_class_source_lowering_skipped(meta: Any, class_name: str) -> None:
+    """Keep generic boundary lowering off a source class with an EP toggle.
+
+    A source-visible local-compute patch rewrites the class method, not just
+    one module instance. Every boundary instance of that class must therefore
+    use the runtime per-instance boundary wrapper. Lowering another instance's
+    boundary into the shared method would extract a second ``_forward_impl``
+    and wrap the EP toggle a second time.
+    """
+    param_plan = getattr(meta, "param_plan", None) or {}
+    boundary_classes = getattr(meta, "boundary_classes", None) or {}
+    for module_fqn, owner_class in boundary_classes.items():
+        if owner_class != class_name:
+            continue
+        entry = param_plan.get(module_fqn)
+        if isinstance(entry, dict) and entry.get("is_boundary"):
+            entry["skip_source_lowering"] = True
 
 
 def _callable_identity(value: Any) -> str:

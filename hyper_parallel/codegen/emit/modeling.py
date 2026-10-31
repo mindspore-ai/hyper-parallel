@@ -22,9 +22,9 @@ appended layers:
   strategies lowered into the copied source at their semantic sites.
 
 Boundary forwards are then lowered at the boundary classes. The artifact is
-an auditable source export of the frozen native-build decisions; it is not a
-training backend. Preflight validates its syntax and recorded contract without
-importing generated classes into the training process.
+both an auditable source export and a directly executable model training entry.
+Training still derives its live plan from the supplied YAML through the native
+Trainer; preflight validates syntax and the recorded generation contract.
 """
 from __future__ import annotations
 
@@ -414,8 +414,9 @@ def _verify_recorded_patch_materialization(
             if isinstance(target, ast.Name)
         }
         if (
-            {"_forward_impl", "forward"} <= host_methods
+            "forward" in host_methods
             and "cp_enable" in host_state_names
+            and _class_dispatch_reads_state(host_class, "cp_enable")
         ):
             if isinstance(materialized, list):
                 materialized.append({
@@ -591,15 +592,18 @@ def verify_recorded_patch_bundle(
                 )
                 if isinstance(target, ast.Name)
             }
-            matched = {"_forward_impl", "forward"} <= methods and (
-                "cp_enable" in state_names
-                or any(
+            matched = "forward" in methods and (
+                (
+                    "cp_enable" in state_names
+                    and _class_dispatch_reads_state(host, "cp_enable")
+                )
+                or ({"_forward_impl", "forward"} <= methods and any(
                     replacement.module_fqn == record.module_fqn
                     and replacement.replacement_type is target_type
                     for replacement in getattr(
                         patch_plan, "module_replacements", ()
                     )
-                )
+                ))
             )
             if matched:
                 break
@@ -614,6 +618,24 @@ def verify_recorded_patch_bundle(
         raise RuntimeError(
             "codegen: generated bundle contains forbidden HPCodegen class names"
         )
+
+
+def _class_dispatch_reads_state(host: ast.ClassDef, state_name: str) -> bool:
+    """Return whether a class dispatches on one state flag in either layer."""
+    methods = (
+        child
+        for child in host.body
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and child.name in {"forward", "_forward_impl"}
+    )
+    return any(
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+        and node.attr == state_name
+        for method in methods
+        for node in ast.walk(method)
+    )
 
 
 def _bound_function_patch_materialized(tree: ast.AST, record: Any) -> bool:
@@ -747,8 +769,8 @@ def _banner(meta: Any) -> str:
         f"#   injections   : {len(getattr(meta, 'injections', []) or [])} rule(s)",
         "#   runtime      : mesh / FSDP2 / PP / AC / compile still handled by runtime",
         "#",
-        "# [HYPER PLAN] the frozen sharding plan travels in codegen_meta.json;",
-        "# the runtime shards from it.  Regenerate to change.",
+        "# [HYPER PLAN] training derives a live plan from its YAML and this model;",
+        "# codegen_meta.json is generation provenance, not a training input.",
         "#",
         "",
     ]

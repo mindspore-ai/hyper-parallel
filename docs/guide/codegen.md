@@ -87,7 +87,7 @@ generated/
 └── modeling_<Model>_gen_npu.py.diff
 ```
 
-- `modeling_*_gen_npu.py`：应用并行策略后的模型源码。
+- `modeling_*_gen_npu.py`：应用并行策略后的模型源码，也可直接作为训练入口。
 - `modeling_*_gen_npu.py.diff`：生成源码相对于原始源码的差异，便于代码审阅。
 - `codegen_meta.json`：模型来源、并行配置、生成签名和文件校验信息。
 - `__init__.py`：生成目录的 Python 包标识。
@@ -110,7 +110,28 @@ Bundle 还可能包含 `configuration_*.py` 等官方源码依赖。生成后的
 ## 与训练的关系
 
 Codegen 和训练是独立操作。普通 Trainer 不读取或执行 `generated/` 中的文件，生成目录缺失、
-损坏或过期也不会改变原生训练流程。需要训练时，仍按模型原有的训练入口和配置启动。
+损坏或过期也不会改变原生训练流程。
+
+如果需要训练生成后的模型，直接执行该模型 bundle 中的主 `*_gen_npu.py` 文件，并传入普通训练
+YAML。YAML 不负责定位 `generated/`，也不需要增加 Codegen 专属字段；训练入口就是当前执行的
+模型文件。例如单进程启动：
+
+```bash
+python hyper_parallel/models/deepseek_v41/generated/modeling_Deepseek_V4_gen_npu.py \
+  path/to/train.yaml
+```
+
+多卡训练仍使用标准 `torchrun`：
+
+```bash
+torchrun --standalone --nproc_per_node=8 \
+  hyper_parallel/models/deepseek_v41/generated/modeling_Deepseek_V4_gen_npu.py \
+  path/to/train.yaml
+```
+
+生成文件只提供已经写入源码的模型结构和 forward 改写。设备 mesh、实时并行计划、参数分片、
+FSDP、PP、优化器和数据流程仍由 HyperParallel 原生 Trainer 根据训练 YAML 构建。
+`codegen_meta.json` 用于记录生成来源和校验产物，不作为训练计划输入。
 
 ## 常见问题
 
