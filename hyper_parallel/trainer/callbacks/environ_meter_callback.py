@@ -22,7 +22,7 @@ from typing import Any
 
 from hyper_parallel.trainer.runtime.distributed import get_world_size_safe
 from hyper_parallel.trainer.runtime.distributed import all_reduce
-from hyper_parallel.trainer.runtime.flops import estimate_flops_per_token
+from hyper_parallel.trainer.runtime.flops import estimate_step_flops
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.trainer.runtime.device import get_device_type, get_torch_device
 
@@ -46,6 +46,8 @@ class EnvironMeterCallback(Callback):
         super().__init__(trainer)
         self._step_start_time = 0.0
         self._local_step_tokens: Any = None
+        self._local_step_input_tokens: Any = None
+        self._local_step_seq_len_sq: Any = None
         self._local_step_samples = 0
         self._consumed_tokens = 0
         self._consumed_samples = 0
@@ -108,6 +110,46 @@ class EnvironMeterCallback(Callback):
             return input_numel
         return 0
 
+    @classmethod
+    def _batch_input_geometry(cls, batch: Mapping[str, Any]) -> tuple[Any, Any] | None:
+        """Return model-input tokens and the sum of squared sequence lengths.
+
+        The loss token count drops masked prompt tokens, but the model still
+        runs attention and the FFN over them, so FLOPs need their own count:
+        the tokens that reach attention plus ``sum(S ** 2)`` over the real
+        attention boundaries.
+
+        Args:
+            batch: One micro-batch mapping.
+
+        Returns:
+            ``(input_tokens, sum_seq_len_sq)`` for the sequences that reach
+            attention, or ``None`` when the batch exposes no input geometry.
+        """
+        cu_seq_lens = batch.get("cu_seq_lens")
+        if cu_seq_lens is not None and callable(getattr(cu_seq_lens, "diff", None)):
+            if int(getattr(cu_seq_lens, "numel", lambda: 0)()) >= 2:
+                lengths = cu_seq_lens.diff()
+                return lengths.sum(), (lengths * lengths).sum()
+
+        attention_mask = batch.get("attention_mask")
+        if (
+            attention_mask is not None
+            and len(getattr(attention_mask, "shape", ())) == 2
+            and callable(getattr(attention_mask, "sum", None))
+        ):
+            lengths = attention_mask.sum(dim=-1)
+            return lengths.sum(), (lengths * lengths).sum()
+
+        shape = getattr(batch.get("input_ids"), "shape", None)
+        if shape is None or len(shape) < 2:
+            return None
+        rows = int(shape[0])
+        seq_length = int(shape[-1])
+        if rows <= 0 or seq_length <= 0:
+            return None
+        return rows * seq_length, rows * seq_length * seq_length
+
     @staticmethod
     def _batch_samples(batch: Mapping[str, Any]) -> int:
         """Count logical samples in one micro-batch."""
@@ -163,25 +205,49 @@ class EnvironMeterCallback(Callback):
         reduced = all_reduce(value, op=op, group=self._metric_group())
         return float(reduced)
 
+    @staticmethod
+    def _accumulate_scalar(current: Any, value: Any) -> Any:
+        """Add one batch scalar to a running per-step total.
+
+        Args:
+            current: Running total, or ``None`` before the first batch.
+            value: Batch value to add; may be a device scalar.
+
+        Returns:
+            Updated running total that never aliases the batch tensor.
+        """
+        detached = value.detach() if callable(getattr(value, "detach", None)) else value
+        if current is None:
+            return detached.clone() if callable(getattr(detached, "clone", None)) else detached
+        return current + detached
+
     def _accumulate_batches(self, value: Any) -> None:
         """Accumulate batch metrics without retaining input tensor references."""
         for batch in self._micro_batches(value):
-            token_count = self._batch_tokens(batch)
-            if callable(getattr(token_count, "detach", None)):
-                token_count = token_count.detach()
-            if self._local_step_tokens is None:
-                if callable(getattr(token_count, "clone", None)):
-                    token_count = token_count.clone()
-                self._local_step_tokens = token_count
-            else:
-                self._local_step_tokens = self._local_step_tokens + token_count
+            self._local_step_tokens = self._accumulate_scalar(
+                self._local_step_tokens, self._batch_tokens(batch)
+            )
+            geometry = self._batch_input_geometry(batch)
+            if geometry is not None:
+                input_tokens, seq_len_sq = geometry
+                self._local_step_input_tokens = self._accumulate_scalar(
+                    self._local_step_input_tokens, input_tokens
+                )
+                self._local_step_seq_len_sq = self._accumulate_scalar(
+                    self._local_step_seq_len_sq, seq_len_sq
+                )
             self._local_step_samples += self._batch_samples(batch)
 
-    def _global_samples(self) -> int:
-        """Reduce samples across DP+CP while removing CP replicas."""
+    def _cp_size(self) -> int:
+        """Return the validated context-parallel size of the trainer mesh."""
         cp_size = int(getattr(self.trainer.mesh, "cp_size", 1))
         if cp_size < 1:
             raise ValueError(f"mesh.cp_size must be positive, but got {cp_size}")
+        return cp_size
+
+    def _global_samples(self) -> int:
+        """Reduce samples across DP+CP while removing CP replicas."""
+        cp_size = self._cp_size()
         reduced_samples = self._reduce(self._local_step_samples, op="sum")
         global_samples = reduced_samples / cp_size
         if not global_samples.is_integer():
@@ -269,6 +335,8 @@ class EnvironMeterCallback(Callback):
         """
         del state, kwargs
         self._local_step_tokens = None
+        self._local_step_input_tokens = None
+        self._local_step_seq_len_sq = None
         self._local_step_samples = 0
         self._step_start_time = time.perf_counter()
         self._accumulate_batches(micro_batches)
@@ -312,7 +380,23 @@ class EnvironMeterCallback(Callback):
         local_step_tokens = 0 if self._local_step_tokens is None else self._local_step_tokens
         global_tokens = int(self._reduce(local_step_tokens, op="sum"))
         global_samples = self._global_samples()
+        cp_size = self._cp_size()
+        local_input_tokens = (
+            0 if self._local_step_input_tokens is None else self._local_step_input_tokens
+        )
+        local_seq_len_sq = (
+            0 if self._local_step_seq_len_sq is None else self._local_step_seq_len_sq
+        )
+        # Context parallelism slices a sequence along its length, so each rank
+        # only sees ``(S / cp) ** 2`` while the real attention cost is ``S ** 2``.
+        # Summing over DP+CP therefore needs one factor of ``cp_size`` to
+        # restore the per-sequence square. Input tokens need no correction
+        # because the slices add back up to ``S``.
+        global_input_tokens = self._reduce(local_input_tokens, op="sum")
+        global_seq_len_sq = self._reduce(local_seq_len_sq, op="sum") * cp_size
         self._local_step_tokens = None
+        self._local_step_input_tokens = None
+        self._local_step_seq_len_sq = None
         self._local_step_samples = 0
         self._consumed_tokens += global_tokens
         self._consumed_samples += global_samples
@@ -343,18 +427,15 @@ class EnvironMeterCallback(Callback):
         if (
             getattr(training_config, "log_tflops", False)
             and model_config is not None
-            and global_samples > 0
-            and global_tokens > 0
+            and global_input_tokens > 0
             and global_step_time > 0
         ):
-            flops_per_token = estimate_flops_per_token(
-                model_config, global_tokens / global_samples
+            step_flops = estimate_step_flops(
+                model_config, global_input_tokens, global_seq_len_sq
             )
-            if flops_per_token is not None:
+            if step_flops is not None:
                 env_metrics["performance/tflops_per_device"] = (
-                    global_tokens * flops_per_token
-                    / (global_step_time * get_world_size_safe())
-                    / 1e12
+                    step_flops / (global_step_time * get_world_size_safe()) / 1e12
                 )
 
         self.trainer.step_train_metrics = train_metrics

@@ -49,7 +49,9 @@ class TrainingConfig:
 
     When enabled, the environment meter adds
     ``performance/tflops_per_device`` (TFLOP/s, cluster average per device)
-    to each step's metrics.
+    to each step's metrics. The estimate charges every model-input token,
+    including prompt tokens masked out of the loss, and accumulates causal
+    attention over the real sequence boundaries.
     """
     low_precision: LowPrecisionConfig = field(default_factory=LowPrecisionConfig)
 

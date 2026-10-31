@@ -22,6 +22,7 @@ import torch
 
 import hyper_parallel.trainer.callbacks.environ_meter_callback as environ_meter_module
 from hyper_parallel.trainer.callbacks.environ_meter_callback import EnvironMeterCallback
+from hyper_parallel.trainer.runtime.flops import estimate_step_flops
 from hyper_parallel.trainer.state import TrainerState
 from tests.common.mark_utils import arg_mark
 
@@ -192,6 +193,335 @@ class TestEnvironMeterCallback(unittest.TestCase):
             metrics["data/step_samples"],
             4.0,
             f"expected CP replicas removed from samples, got={metrics['data/step_samples']}",
+        )
+
+    @staticmethod
+    def _build_tflops_model_config() -> SimpleNamespace:
+        """Build a miniature Qwen3-MoE config so the estimator returns a value."""
+        return SimpleNamespace(
+            model_type="qwen3_moe",
+            hidden_size=8,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=4,
+            intermediate_size=16,
+            moe_intermediate_size=4,
+            num_experts=4,
+            num_experts_per_tok=1,
+            vocab_size=32,
+            hidden_act="silu",
+            mlp_only_layers=[],
+            decoder_sparse_step=1,
+        )
+
+    @patch.object(environ_meter_module, "get_device_type", return_value="cpu")
+    @patch.object(environ_meter_module, "get_world_size_safe", return_value=1)
+    @patch.object(environ_meter_module.time, "perf_counter", side_effect=(10.0, 12.0))
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="essential",
+    )
+    def test_tflops_metric_stays_opt_in(
+            self,
+            mock_time: Mock,
+            mock_world_size: Mock,
+            mock_device_type: Mock,
+    ) -> None:
+        """Keep the throughput metric absent unless the switch is enabled.
+
+        Feature: Optional per-device TFLOP/s metrics.
+        Description: Complete one step on a supported model with ``log_tflops`` unset.
+        Expectation: No ``performance/tflops_per_device`` key is published.
+        """
+        del mock_time, mock_world_size, mock_device_type
+        trainer = self._build_trainer()
+        trainer.config = SimpleNamespace(training=SimpleNamespace())
+        trainer.model_config = self._build_tflops_model_config()
+        callback = EnvironMeterCallback(trainer)
+        state = TrainerState(global_step=1, epoch=0)
+
+        callback.on_step_begin(state)
+        callback.on_micro_step_begin(
+            state,
+            {"input_ids": torch.ones(2, 4), "token_count": torch.tensor(6)},
+        )
+        callback.on_step_end(state, loss=1.0, loss_dict=None, grad_norm=0.5)
+
+        metrics = trainer.step_env_metrics
+        self.assertNotIn(
+            "performance/tflops_per_device",
+            metrics,
+            f"tflops reporting must be opt-in, got keys={sorted(metrics)}",
+        )
+
+    @patch.object(environ_meter_module, "get_device_type", return_value="cpu")
+    @patch.object(environ_meter_module, "get_world_size_safe", return_value=4)
+    @patch.object(environ_meter_module, "all_reduce")
+    @patch.object(environ_meter_module.time, "perf_counter", side_effect=(10.0, 12.0))
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="essential",
+    )
+    def test_tflops_metric_divides_global_work_by_devices(
+            self,
+            mock_time: Mock,
+            mock_all_reduce: Mock,
+            mock_world_size: Mock,
+            mock_device_type: Mock,
+    ) -> None:
+        """Publish cluster work per device using reduced input tokens and step time.
+
+        Feature: Optional per-device TFLOP/s metrics.
+        Description: Complete one step of a two-layer Qwen3-MoE across four mocked devices.
+        Expectation: The metric equals step FLOPs / (step_time * world_size) / 1e12.
+        """
+        del mock_time, mock_world_size, mock_device_type
+        mock_all_reduce.side_effect = lambda value, op, group: float(value) * 4 if op == "sum" else float(value)
+        model_config = self._build_tflops_model_config()
+        trainer = self._build_trainer()
+        trainer.config = SimpleNamespace(training=SimpleNamespace(log_tflops=True))
+        trainer.model_config = model_config
+        callback = EnvironMeterCallback(trainer)
+        state = TrainerState(global_step=1, epoch=0)
+
+        callback.on_step_begin(state)
+        callback.on_micro_step_begin(
+            state,
+            {"input_ids": torch.ones(2, 4), "token_count": torch.tensor(6)},
+        )
+        callback.on_step_end(state, loss=1.0, loss_dict=None, grad_norm=0.5)
+
+        # ``input_ids`` covers 2*4 tokens whose two sequences are four long, so
+        # each of the four ranks contributes (8, 32) before the DP+CP reduction.
+        expected_flops = estimate_step_flops(model_config, 4 * 8.0, 4 * 32.0)
+        expected = expected_flops / (2.0 * 4) / 1e12
+        metrics = trainer.step_env_metrics
+        self.assertIn(
+            "performance/tflops_per_device",
+            metrics,
+            f"enabled tflops reporting must publish a metric, got keys={sorted(metrics)}",
+        )
+        self.assertAlmostEqual(
+            metrics["performance/tflops_per_device"],
+            expected,
+            delta=expected * 1e-9,
+            msg=(
+                "expected cluster work divided by step time and devices, "
+                f"got={metrics['performance/tflops_per_device']}, expected={expected}"
+            ),
+        )
+
+    @patch.object(environ_meter_module, "get_device_type", return_value="cpu")
+    @patch.object(environ_meter_module, "get_world_size_safe", return_value=1)
+    @patch.object(environ_meter_module, "all_reduce")
+    @patch.object(environ_meter_module.time, "perf_counter", side_effect=(10.0, 12.0))
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="essential",
+    )
+    def test_tflops_metric_counts_prompt_tokens_excluded_from_loss(
+            self,
+            mock_time: Mock,
+            mock_all_reduce: Mock,
+            mock_world_size: Mock,
+            mock_device_type: Mock,
+    ) -> None:
+        """Charge FLOPs for masked prompt tokens that the loss token count drops.
+
+        Feature: Optional per-device TFLOP/s metrics.
+        Description: Feed one length-8 sequence whose loss token count is only 2.
+        Expectation: FLOPs use all eight input tokens while throughput keeps the loss count.
+        """
+        del mock_time, mock_all_reduce, mock_world_size, mock_device_type
+        model_config = self._build_tflops_model_config()
+        trainer = self._build_trainer()
+        trainer.config = SimpleNamespace(training=SimpleNamespace(log_tflops=True))
+        trainer.model_config = model_config
+        callback = EnvironMeterCallback(trainer)
+        state = TrainerState(global_step=1, epoch=0)
+
+        callback.on_step_begin(state)
+        callback.on_micro_step_begin(
+            state,
+            {"input_ids": torch.ones(1, 8), "token_count": torch.tensor(2)},
+        )
+        callback.on_step_end(state, loss=1.0, loss_dict=None, grad_norm=0.5)
+
+        expected = estimate_step_flops(model_config, 8.0, 64.0) / 2.0 / 1e12
+        metrics = trainer.step_env_metrics
+        self.assertAlmostEqual(
+            metrics["performance/tflops_per_device"],
+            expected,
+            delta=expected * 1e-9,
+            msg=(
+                "prompt tokens masked out of the loss still consume model FLOPs, "
+                f"got={metrics['performance/tflops_per_device']}, expected={expected}"
+            ),
+        )
+        self.assertEqual(
+            metrics["data/step_tokens"],
+            2.0,
+            f"loss token accounting must stay unchanged, got={metrics['data/step_tokens']}",
+        )
+        self.assertEqual(
+            metrics["performance/tokens_per_second"],
+            1.0,
+            "tokens per second must keep using loss tokens, "
+            f"got={metrics['performance/tokens_per_second']}",
+        )
+
+    @patch.object(environ_meter_module, "get_device_type", return_value="cpu")
+    @patch.object(environ_meter_module, "get_world_size_safe", return_value=1)
+    @patch.object(environ_meter_module, "all_reduce")
+    @patch.object(environ_meter_module.time, "perf_counter", side_effect=(10.0, 12.0))
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="essential",
+    )
+    def test_tflops_metric_accumulates_squared_sequence_lengths(
+            self,
+            mock_time: Mock,
+            mock_all_reduce: Mock,
+            mock_world_size: Mock,
+            mock_device_type: Mock,
+    ) -> None:
+        """Accumulate every sequence's attention boundary instead of a mean length.
+
+        Feature: Optional per-device TFLOP/s metrics.
+        Description: Stream two micro-batches whose attention masks keep 4 and 2 tokens.
+        Expectation: FLOPs use sum(S)=6 and sum(S**2)=20, above the mean-length value.
+        """
+        del mock_time, mock_all_reduce, mock_world_size, mock_device_type
+        model_config = self._build_tflops_model_config()
+        trainer = self._build_trainer()
+        trainer.config = SimpleNamespace(training=SimpleNamespace(log_tflops=True))
+        trainer.model_config = model_config
+        callback = EnvironMeterCallback(trainer)
+        state = TrainerState(global_step=1, epoch=0)
+
+        callback.on_step_begin(state)
+        callback.on_micro_step_begin(
+            state,
+            {
+                "input_ids": torch.ones(1, 4),
+                "attention_mask": torch.ones(1, 4, dtype=torch.int32),
+            },
+        )
+        callback.on_micro_step_begin(
+            state,
+            {
+                "input_ids": torch.ones(1, 4),
+                "attention_mask": torch.tensor([[1, 1, 0, 0]], dtype=torch.int32),
+            },
+        )
+        callback.on_step_end(state, loss=1.0, loss_dict=None, grad_norm=0.5)
+
+        expected = estimate_step_flops(model_config, 6.0, 20.0) / 2.0 / 1e12
+        mean_length_only = estimate_step_flops(model_config, 6.0, 6.0 * 3.0) / 2.0 / 1e12
+        metrics = trainer.step_env_metrics
+        self.assertAlmostEqual(
+            metrics["performance/tflops_per_device"],
+            expected,
+            delta=expected * 1e-9,
+            msg=(
+                "expected sum(S**2) attention work, "
+                f"got={metrics['performance/tflops_per_device']}, expected={expected}"
+            ),
+        )
+        self.assertGreater(
+            metrics["performance/tflops_per_device"],
+            mean_length_only,
+            "averaging the sequence lengths must underestimate attention work, "
+            f"got={metrics['performance/tflops_per_device']} against {mean_length_only}",
+        )
+
+    @patch.object(environ_meter_module, "get_device_type", return_value="cpu")
+    @patch.object(environ_meter_module, "get_world_size_safe", return_value=1)
+    @patch.object(environ_meter_module.time, "perf_counter", side_effect=(10.0, 12.0))
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="essential",
+    )
+    def test_tflops_metric_skips_unsupported_models(
+            self,
+            mock_time: Mock,
+            mock_world_size: Mock,
+            mock_device_type: Mock,
+    ) -> None:
+        """Skip models the estimator does not support instead of guessing.
+
+        Feature: Optional per-device TFLOP/s metrics.
+        Description: Enable ``log_tflops`` for a configuration declaring ``model_type='llama'``.
+        Expectation: The step publishes no FLOPs metric.
+        """
+        del mock_time, mock_world_size, mock_device_type
+        trainer = self._build_trainer()
+        trainer.config = SimpleNamespace(training=SimpleNamespace(log_tflops=True))
+        trainer.model_config = SimpleNamespace(model_type="llama")
+        callback = EnvironMeterCallback(trainer)
+        state = TrainerState(global_step=1, epoch=0)
+
+        callback.on_step_begin(state)
+        callback.on_micro_step_begin(
+            state,
+            {"input_ids": torch.ones(2, 4), "token_count": torch.tensor(6)},
+        )
+        callback.on_step_end(state, loss=1.0, loss_dict=None, grad_norm=0.5)
+
+        metrics = trainer.step_env_metrics
+        self.assertNotIn(
+            "performance/tflops_per_device",
+            metrics,
+            f"unsupported models must not report FLOPs, got keys={sorted(metrics)}",
+        )
+
+    @patch.object(environ_meter_module, "get_device_type", return_value="cpu")
+    @patch.object(environ_meter_module, "get_world_size_safe", return_value=1)
+    @patch.object(environ_meter_module.time, "perf_counter", side_effect=(10.0, 12.0))
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="essential",
+    )
+    def test_tflops_metric_requires_tokens(
+            self,
+            mock_time: Mock,
+            mock_world_size: Mock,
+            mock_device_type: Mock,
+    ) -> None:
+        """Avoid publishing a throughput for a step that consumed no tokens.
+
+        Feature: Optional per-device TFLOP/s metrics.
+        Description: Enable ``log_tflops`` and complete a step without any micro-batch.
+        Expectation: The step publishes no FLOPs metric instead of zero or NaN.
+        """
+        del mock_time, mock_world_size, mock_device_type
+        trainer = self._build_trainer()
+        trainer.config = SimpleNamespace(training=SimpleNamespace(log_tflops=True))
+        trainer.model_config = self._build_tflops_model_config()
+        callback = EnvironMeterCallback(trainer)
+        state = TrainerState(global_step=1, epoch=0)
+
+        callback.on_step_begin(state)
+        callback.on_step_end(state, loss=1.0, loss_dict=None, grad_norm=0.5)
+
+        metrics = trainer.step_env_metrics
+        self.assertNotIn(
+            "performance/tflops_per_device",
+            metrics,
+            f"a token-free step must not report FLOPs, got keys={sorted(metrics)}",
         )
 
 
