@@ -23,6 +23,35 @@ def future_compute_factory() -> None:
     """Supply a stable emitted helper name for the binding probe."""
 
 
+def test_generated_boundary_adapts_packed_input_contract(monkeypatch) -> None:
+    calls = []
+
+    class CompiledBoundary:
+        def redistribute_inputs(self, args: tuple, kwargs: dict) -> tuple:
+            """Record and return redistributed inputs."""
+            calls.append((args, kwargs))
+            return args, kwargs
+
+        def redistribute_outputs(self, outputs: object) -> object:
+            """Return redistributed outputs."""
+            return outputs
+
+    monkeypatch.setattr(
+        phase_c,
+        "_rewrap_local_outputs",
+        lambda outputs, spec, mesh, names, label: outputs,
+    )
+    boundary = phase_c._GeneratedBoundary(  # pylint: disable=protected-access
+        CompiledBoundary(), object(), object(), ("tp",), "future.block",
+    )
+
+    args, kwargs = boundary.redistribute_inputs((("value",), {"flag": True}))
+
+    assert args == ("value",)
+    assert kwargs == {"flag": True}
+    assert calls == [(("value",), {"flag": True})]
+
+
 def test_generated_phase_c_binds_state_without_rewriting_forward(monkeypatch) -> None:
     def _original_forward(value):
         return value
@@ -55,7 +84,7 @@ def test_generated_phase_c_binds_state_without_rewriting_forward(monkeypatch) ->
     monkeypatch.setattr(phase_c, "_resolve_local_compute_fn", lambda *args: _compute)
     monkeypatch.setattr(phase_c, "_resolve_inner_target", lambda target, target_spec: target)
 
-    def install_inner(target, *args, **kwargs) -> None:
+    def install_inner(target: SimpleNamespace, *args: object, **kwargs: object) -> None:
         """Simulate native companion-state installation and forward replacement."""
         del args, kwargs
         target.forward = _compute
@@ -65,7 +94,7 @@ def test_generated_phase_c_binds_state_without_rewriting_forward(monkeypatch) ->
     phase_c.apply_generated_phase_c(object(), plan, object(), False)
 
     assert module.forward is _original_forward
-    assert module._hp_boundary is boundary
+    assert module._hp_boundary.compiled is boundary
     assert module.future_compute_factory is _compute
     assert module.ep_enable is True
     assert module.cp_enable is True

@@ -31,6 +31,7 @@ from hyper_parallel.distributed._builder.forward_rewriter import (
     _is_vocab_parallel_embed,
     _keep_loss_parallel_output,
     _maybe_add_deferred_biases,
+    _rewrap_local_outputs,
     _wrap_inner_attention,
     _wrap_local_region_forward,
     _wrap_production_forward,
@@ -75,6 +76,49 @@ class _GeneratedTPOperators:
             raise RuntimeError(f"generated TP operation {kind!r} requires an active tp mesh")
         operation = self._lowerer.execution_op(kind, tensor_dim=tensor_dim)
         return operation.execute(tensor)
+
+
+class _GeneratedBoundary:
+    """Adapt emitted boundary calls to the native compiled boundary API."""
+
+    def __init__(
+        self,
+        compiled: PrecompiledBoundary,
+        spec: Any,
+        mesh: Any,
+        mesh_dim_names: Any,
+        label: str,
+    ) -> None:
+        """Store the live-plan objects used by emitted boundary operations."""
+        self.compiled = compiled
+        self._spec = spec
+        self._mesh = mesh
+        self._mesh_dim_names = mesh_dim_names
+        self._label = label
+
+    def redistribute_inputs(
+        self,
+        args: Any,
+        kwargs: dict[str, Any] | None = None,
+    ) -> tuple[Any, dict[str, Any]]:
+        """Accept the emitted packed call and delegate native redistribution."""
+        if kwargs is None:
+            args, kwargs = args
+        return self.compiled.redistribute_inputs(args, kwargs)
+
+    def rewrap_outputs(self, outputs: Any) -> Any:
+        """Rewrap local outputs with their live-plan source placements."""
+        return _rewrap_local_outputs(
+            outputs,
+            self._spec,
+            self._mesh,
+            self._mesh_dim_names,
+            self._label,
+        )
+
+    def redistribute_outputs(self, outputs: Any) -> Any:
+        """Delegate output redistribution to the native compiled boundary."""
+        return self.compiled.redistribute_outputs(outputs)
 
 
 _MISSING = object()
@@ -176,7 +220,9 @@ def apply_generated_phase_c(
         module = _resolve_module(model, module_fqn)
         boundary = PrecompiledBoundary(spec, mesh, mesh_dim_names, op_lowerer=lowerer)
         _bind_input_indices(boundary, module)
-        module._hp_boundary = boundary  # pylint: disable=protected-access
+        module._hp_boundary = _GeneratedBoundary(  # pylint: disable=protected-access
+            boundary, spec, mesh, mesh_dim_names, module_fqn,
+        )
         module._hp_tp = tp_operators  # pylint: disable=protected-access
         if spec._deferred_bias_params:  # pylint: disable=protected-access
             _install_bias_suppression(module, spec)
