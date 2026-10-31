@@ -23,6 +23,7 @@ try:
 except ImportError:
     omni_training_custom_ops = None
 
+from hyper_parallel.components.functional._cann_mhc import cann_mhc_pre, validate_mhc_backend
 from hyper_parallel.components.functional.sinkhorn import sinkhorn
 
 
@@ -100,6 +101,8 @@ def mhc_pre(
     norm_eps: float = 1e-6,
     hc_eps: float = 1e-6,
     gamma: Optional[torch.Tensor] = None,
+    *,
+    backend: str = "omni",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Prepare an input and its mixing coefficients for an MHC-wrapped block.
 
@@ -113,10 +116,18 @@ def mhc_pre(
         norm_eps: RMS normalization epsilon.
         hc_eps: Hyper-connection numerical stability epsilon.
         gamma: Optional RMS normalization scale.
+        backend: Explicit implementation, ``"omni"`` (default) or ``"cann"``.
+            The CANN A2 path supports four streams, 0 < D < 100000 divisible by 128,
+            20 Sinkhorn iterations, BF16/FP16 activations and no gamma.
 
     Returns:
         Block input, post coefficients, residual coefficients, and residual buffer.
     """
+    validate_mhc_backend(backend)
+    if backend == "cann":
+        return cann_mhc_pre(
+            x, phi, branch_alpha, branch_beta, num_stream, sinkhorn_iters, norm_eps, hc_eps, gamma,
+        )
     shape = x.size()
     x = x.reshape(shape[0], shape[1], num_stream, -1)
     if gamma is not None:
