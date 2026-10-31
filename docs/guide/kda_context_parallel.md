@@ -15,6 +15,7 @@ CP rank，并保持 CP mesh 中的 rank 顺序与全局 token 顺序一致。
 |------|----------|----------|
 | P2P | 各 rank 生成本地摘要，沿序列顺序传递边界状态；反向沿相反方向传递边界梯度。 | 通信工作区较小，依赖链随状态 CP 大小增长。 |
 | AG | 各 rank 收集状态摘要和转移矩阵，通过融合算子合并所需的前缀或反向后缀。 | 消除逐 rank 的通信依赖，临时收集缓冲区随状态 CP 大小增长。 |
+| RD | 按距离 1、2、4 等有序合成摘要，反向复用前向各轮转移。 | 长连续文档有对数依赖阶段；TND 按真实 reset 删除无消费者的通信、生产和缓存。 |
 | Ulysses | AllToAll 将序列分片转换为 head 分片，计算后恢复原序列分片。 | 减少每个 rank 的 head 数，要求 head 数能被 U 整除。 |
 | Ulysses + P2P / AG | 先在 Ulysses 组内交换序列和 head，再在状态 CP 组内执行 P2P 或 AG。 | 用 head 分工减少状态通信量，并减小状态 CP 的规模。 |
 | AG + P2P | 连续 g 个状态 rank 组内 AG，由各组最后一个 rank 组成 P2P 链，再向组内广播输入边界。 | 将 AG 临时缓冲区限制到组宽 g，保留组间的串行通信依赖。 |
@@ -32,6 +33,7 @@ CP rank，并保持 CP mesh 中的 rank 顺序与全局 token 顺序一致。
 plan_overrides:
   - match: "*.self_attn.forward"
     when: cp
+    region_dispatch: false
     replace:
       kind: method
       implementation:
@@ -59,7 +61,7 @@ CP 总大小由训练的并行配置决定。`state_cp_method` 只选择状态 C
 | 参数 | 默认值 | 含义与约束 |
 |------|--------|------------|
 | `backend` | `triton` | 本地 KDA 后端。AG 和分组 AG 需要 `triton`；已有 P2P/Ulysses 支持 `eager`。 |
-| `state_cp_method` | `p2p` | 状态 CP 方式，可选 `p2p`、`allgather`、`grouped_allgather_p2p`。 |
+| `state_cp_method` | `p2p` | 状态 CP 方式，可选 `p2p`、`allgather`、`grouped_allgather_p2p`、`recursive_doubling`。 |
 | `ulysses_degree` | `1` | U；正整数，必须整除 CP 大小，且 query/key head 数和 value head 数都必须能被 U 整除。 |
 | `allgather_group_size` | `1` | g；每个组内 AllGather 包含的状态 rank 数，必须整除 R。仅用于 `grouped_allgather_p2p`；纯 `allgather` 自动收集整个 R 组，此项保持1。 |
 
@@ -71,6 +73,8 @@ CP8 的常用组合：
 | AG | `allgather` | 1 | 1 |
 | Ulysses + P2P | `p2p` | 2 | 1 |
 | Ulysses + AG | `allgather` | 2 | 1 |
+| RD | `recursive_doubling` | 1 | 1 |
+| Ulysses + RD | `recursive_doubling` | 2 | 1 |
 | AG + P2P | `grouped_allgather_p2p` | 1 | 2 |
 | Ulysses + AG + P2P | `grouped_allgather_p2p` | 2 | 2 |
 | 纯 Ulysses | `p2p` | 8 | 1 |
@@ -124,3 +128,35 @@ S/G 配对参照的是 Ascend 本地 h/dhu，FLA 通用 CP 摘要的舍入组织
 
 纯 P2P 且初态为零时，第一个状态 rank 不生成或保存没有后续读者的 M；AG 和分组 AG 仍为每个 rank
 保存本地 M。状态缓存按调用独立持有，以支持多个在途 forward、逆序 backward 与 checkpoint 重算。
+
+## Recursive Doubling 与 TND
+
+`state_cp_method: recursive_doubling` 使用有序递归倍增传播状态摘要，并按前向缓存的转移计算反向状态梯度。
+可与 `ulysses_degree` 组合，`allgather_group_size` 固定为 1；它不使用组内 AllGather。
+该选项复用相同的 Triton 本地算子，支持 dense 以及本文关联的
+[TND 连续分片](linear_attention_tnd_cp.md)。真实 reset 使用零有效转移，不传播跨文档状态。
+TND 入口据此裁剪没有消费者的收发、摘要生产和缓存；无需额外配置，也不改变已有进程组。
+
+规划只读取 CPU 上的真实文档边界。每个 rank 定位尾部文档覆盖的 rank 区间，再保留该区间内有消费者的
+倍增轮次及相邻入口交接；反向沿同一计划逆向执行。没有消费者时不生成摘要，也不分配整块零状态占位。
+首文档接收和尾文档发送分别判断，rank 内部 reset 不会误删仍然需要的首文档入口。
+
+多层调用应复用同一个 `PackedSequenceInfo`：它的 interval/Ulysses 视图共享一次校验的不可变文档快照，
+RD 在有限的 CPU 缓存中复用该快照对应的计划。已有 Kimi runtime adapter 每个 batch 构建一次该对象。
+手动调用时可按下面的方式复用；每个新 batch 需构建自己的元数据，不要修改已交给 backward 的索引。
+
+```python
+from hyper_parallel.components.functional.linear_attention_packed import PackedSequenceInfo
+
+info = PackedSequenceInfo(global_offsets, cp_rank * local_tokens, (cp_rank + 1) * local_tokens)
+for layer in local_layers:
+    local_hidden = layer(local_hidden, packed_sequence_info=info)
+```
+
+只在每层重复传入原始 `cu_seq_lens` 仍然正确，但会重新构建快照，不能获得同批元数据复用的收益。
+CPU 计划共享不共享通信缓冲区或反向状态缓存；这些仍按调用独立持有。
+
+通信与缓存按调用隔离，支持反序 backward 和非重入 checkpoint 的验证路径。RD 缓存随轮次增长；
+AG 的“只留一份本地 M”不能用于估算 RD。当前不支持同时 TP、图捕获、空或不等长 rank。
+底层通信默认使用公开 batch P2P；仅在已验证的 Torch/Torch-NPU/CANN/SoC 组合中选用 eager coalescing，
+该选择不改变矩阵运算顺序。协议资格与整层训练资格应分别判断，不以对数轮数承诺任意 CP 规模的性能。
