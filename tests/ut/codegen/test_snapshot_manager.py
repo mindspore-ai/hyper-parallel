@@ -90,6 +90,36 @@ def _snapshot(source_path, *, with_replacement=False):
     return session.finish()
 
 
+def test_snapshot_class_resolves_to_defining_remote_sibling(tmp_path):
+    """Resolve an imported patch host to the sibling source that defines it."""
+    main = tmp_path / "modeling_kimi_k3.py"
+    sibling = tmp_path / "modeling_kimi_linear.py"
+    main.write_text(
+        "from .modeling_kimi_linear import KimiDeltaAttention\n\n"
+        "class KimiK3ForCausalLM:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    sibling.write_text(
+        "class KimiDeltaAttention:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    source = {
+        "module_name": "transformers_modules.kimi.modeling_kimi_k3",
+        "file_path": str(main),
+    }
+
+    identity = manager._source_type_identity(  # pylint: disable=protected-access
+        source,
+        "KimiDeltaAttention",
+    )
+
+    assert identity == (
+        "transformers_modules.kimi.modeling_kimi_linear:KimiDeltaAttention"
+    )
+
+
 def test_snapshot_manager_uses_no_legacy_derivation(monkeypatch, tmp_path):
     source = tmp_path / "modeling_toy.py"
     source.write_text("class ToyModel:\n    pass\n", encoding="utf-8")

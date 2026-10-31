@@ -56,6 +56,7 @@ from hyper_parallel.codegen.meta import (
     load_codegen_meta,
 )
 from hyper_parallel.codegen.snapshot import CodegenSnapshot, CodegenStatus
+from hyper_parallel.codegen.source.resolver import resolve_remote_siblings
 from hyper_parallel.models.registry import family_dir_for_model_type
 
 logger = logging.getLogger(__name__)
@@ -234,38 +235,42 @@ def _snapshot_emission_patches(payload: dict[str, Any]) -> dict[str, Any]:
     injections = application.get("resolved_injections") or plan.get("injections") or ()
     boundary_classes = plan.get("boundary_classes") or {}
     param_plan = plan.get("param_plan") or {}
-    module_name = source.get("module_name")
-    source_classes = _source_class_names(source)
     local_computes = []
     inner_wrappers = []
     for injection in injections:
         module_fqn = injection.get("match")
         class_name = boundary_classes.get(module_fqn)
-        module_type = (
+        module_name = source.get("module_name")
+        declared_module_type = (
             f"{module_name}:{class_name}" if module_name and class_name else None
         )
+        source_module_type = _source_type_identity(source, class_name)
         local_compute = injection.get("local_compute_fn")
         if local_compute is not None:
-            if module_type is None:
+            if declared_module_type is None:
                 raise ValueError(
                     "snapshot local_compute_fn requires a source module and "
                     f"boundary class for {module_fqn!r}"
                 )
             # Imported boundary classes remain plan audit data; only classes
             # with a body in this source can receive a source patch.
-            if class_name in source_classes:
+            if source_module_type is not None:
                 local_computes.append({
                     "module_fqn": module_fqn,
-                    "module_type": module_type,
+                    "module_type": source_module_type,
                     "factory": _snapshot_target_path(local_compute),
                     "region_dispatch": (param_plan.get(module_fqn) or {}).get(
                         "region_dispatch"
                     ),
-                    "original_forward": f"{module_type}.forward",
+                    "original_forward": f"{source_module_type}.forward",
                 })
         inner_wrapper = injection.get("inner_wrapper")
         if inner_wrapper is not None:
-            target_type = replacement_types.get(module_fqn) or module_type
+            target_type = (
+                replacement_types.get(module_fqn)
+                or source_module_type
+                or declared_module_type
+            )
             if target_type is None:
                 raise ValueError(
                     "snapshot inner_wrapper requires an observed replacement or "
@@ -299,6 +304,33 @@ def _source_class_names(source: dict[str, Any]) -> set[str]:
         for node in tree.body
         if isinstance(node, ast.ClassDef)
     }
+
+
+def _source_type_identity(source: dict[str, Any], class_name: Optional[str]) -> Optional[str]:
+    """Resolve a class to the remote source unit that actually defines it."""
+    if not class_name:
+        return None
+    module_name = source.get("module_name")
+    if not isinstance(module_name, str) or not module_name:
+        return None
+    if class_name in _source_class_names(source):
+        return f"{module_name}:{class_name}"
+
+    package, separator, _ = module_name.rpartition(".")
+    candidates = []
+    for path in resolve_remote_siblings(source).values():
+        sibling_source = {"file_path": path}
+        if class_name not in _source_class_names(sibling_source):
+            continue
+        stem = os.path.splitext(os.path.basename(path))[0]
+        sibling_module = f"{package}.{stem}" if separator else stem
+        candidates.append(f"{sibling_module}:{class_name}")
+    if len(candidates) > 1:
+        raise ValueError(
+            f"snapshot class {class_name!r} is defined by multiple bundled source units: "
+            f"{sorted(candidates)}"
+        )
+    return candidates[0] if candidates else None
 
 
 def _snapshot_target_path(target: Any) -> str:

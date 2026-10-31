@@ -49,12 +49,12 @@ def create_offline_distributed_setup(config: Any) -> DistributedSetup:
     """
     accelerator = config.accelerator
     fsdp_config = config.fsdp_config
-    tp_size = max(1, int(accelerator.tp_size))
-    cp_size = max(1, int(accelerator.cp_size))
-    pp_size = max(1, int(accelerator.pp_size))
-    ep_size = max(1, int(accelerator.ep_size))
-    dp_shard_size = max(1, int(fsdp_config.dp_shard_size))
-    edp_shard_size = max(1, int(fsdp_config.edp_shard_size))
+    tp_size = _positive_degree(accelerator.tp_size, "accelerator.tp_size")
+    cp_size = _positive_degree(accelerator.cp_size, "accelerator.cp_size")
+    pp_size = _positive_degree(accelerator.pp_size, "accelerator.pp_size")
+    ep_size = _positive_degree(accelerator.ep_size, "accelerator.ep_size")
+    dp_shard_size = _positive_degree(fsdp_config.dp_shard_size, "fsdp_config.dp_shard_size")
+    edp_shard_size = _positive_degree(fsdp_config.edp_shard_size, "fsdp_config.edp_shard_size")
 
     dense_size = lcm(
         tp_size * cp_size,
@@ -87,6 +87,13 @@ def create_offline_distributed_setup(config: Any) -> DistributedSetup:
         low_precision_config=getattr(config.training, "low_precision", None),
         fp32_main_params=bool(getattr(config.optimizer, "fp32_main_params", False)),
     )
+
+
+def _positive_degree(value: Any, field: str) -> int:
+    """Validate one offline planning degree without silently changing it."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{field} must be a positive integer, got {value!r}")
+    return value
 
 
 __all__ = ["PlanningTopology", "create_offline_distributed_setup"]

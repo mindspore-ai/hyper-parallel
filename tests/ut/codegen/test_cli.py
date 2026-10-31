@@ -170,3 +170,38 @@ def test_native_build_requires_published_artifact(monkeypatch):
 
     with pytest.raises(RuntimeError, match="without publishing"):
         build.generate_from_native_build(config)
+
+
+def test_native_build_reports_isolated_publication_failure(monkeypatch):
+    """The standalone CLI surfaces the publication reason retained by its session."""
+    config = SimpleNamespace(
+        training=SimpleNamespace(backend="gloo", seed=7, enable_full_determinism=False),
+        model=SimpleNamespace(build=lambda **_kwargs: object()),
+        peft=None,
+        activation_checkpoint=SimpleNamespace(mode="none", selection=None),
+        activation_swap="none",
+        compile=None,
+        model_init_dtype=None,
+    )
+
+    @contextmanager
+    def _failed_overlay(_session, _artifact_dir):
+        yield SimpleNamespace(
+            artifact_layout=None,
+            snapshot=SimpleNamespace(
+                failure=SimpleNamespace(
+                    stage="generation",
+                    reason="recorded patch target was not found",
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(build, "create_offline_distributed_setup", lambda _config: object())
+    monkeypatch.setattr(build, "normalize_distributed_setup_overrides", lambda *_args: None)
+    monkeypatch.setattr(build, "use_codegen_model_build_overlay", _failed_overlay)
+
+    with pytest.raises(
+        RuntimeError,
+        match="codegen generation failed: recorded patch target was not found",
+    ):
+        build.generate_from_native_build(config)

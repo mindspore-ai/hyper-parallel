@@ -69,6 +69,11 @@ def _build_and_publish(config: Any, artifact_dir: Optional[str]) -> ArtifactLayo
         )
 
     if result.artifact_layout is None:
+        failure = getattr(result.snapshot, "failure", None)
+        if failure is not None:
+            raise RuntimeError(
+                f"codegen {failure.stage} failed: {failure.reason}"
+            )
         raise RuntimeError("native model build completed without publishing a codegen artifact")
     return result.artifact_layout
 

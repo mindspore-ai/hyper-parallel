@@ -36,6 +36,7 @@ class CodegenModelBuildResult:
     """Result populated by one scoped offline model observation."""
 
     artifact_layout: Optional[Any] = None
+    snapshot: Optional[Any] = None
 
 
 def _record_source(
@@ -235,6 +236,7 @@ def _codegen_build_model(session: CodegenBuildSession, artifact_dir: Optional[st
             )
         _observe_plan(model, mesh, sharding_planner, is_hf_model, session)
         snapshot = _publish_session(session, artifact_dir, result)
+        result.snapshot = snapshot
         model._hp_codegen_snapshot = snapshot  # pylint: disable=protected-access
         model.train()
         return model
