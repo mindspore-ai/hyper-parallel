@@ -75,7 +75,14 @@ class _PrecomputedChunkLoss(torch.autograd.Function):
     ) -> torch.Tensor:
         """Compute the loss sum and retain accumulated first-order gradients."""
         grad_hidden = torch.empty_like(hidden_states)
-        grad_weight = torch.zeros_like(head_weight)
+        # The same head receives a contribution from every sequence chunk.
+        # Accumulate low-precision chunk gradients in FP32 before applying the
+        # upstream loss scale and casting once at the input gradient boundary.
+        accumulation_dtype = (
+            torch.float32 if head_weight.dtype in (torch.float16, torch.bfloat16)
+            else head_weight.dtype
+        )
+        grad_weight = torch.zeros_like(head_weight, dtype=accumulation_dtype)
         loss_sum = torch.zeros((), dtype=torch.float32, device=hidden_states.device)
 
         grad_and_value = torch.func.grad_and_value(
@@ -100,6 +107,7 @@ class _PrecomputedChunkLoss(torch.autograd.Function):
             del chunk_grad_hidden, chunk_grad_weight, chunk_loss
 
         ctx.save_for_backward(grad_hidden, grad_weight)
+        ctx.weight_dtype = head_weight.dtype
         return loss_sum
 
     @staticmethod
@@ -111,7 +119,7 @@ class _PrecomputedChunkLoss(torch.autograd.Function):
         grad_hidden, grad_weight = ctx.saved_tensors
         return (
             grad_hidden * grad_loss_sum,
-            grad_weight * grad_loss_sum,
+            (grad_weight * grad_loss_sum).to(ctx.weight_dtype),
             None,
             None,
             None,
