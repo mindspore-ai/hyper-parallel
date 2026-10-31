@@ -313,6 +313,15 @@ def _verify_recorded_patch_materialization(
         materialized.clear()
     for record in local_records:
         class_name = record.module_type.__name__
+        if _bound_function_patch_materialized(tree, record):
+            if isinstance(materialized, list):
+                materialized.append({
+                    "fqn": record.module_fqn,
+                    "host_class": class_name,
+                    "kind": "local_compute",
+                    "source_form": "bound_method_toggle_forward",
+                })
+            continue
         host_class = classes.get(class_name)
         methods = {
             child.name
@@ -350,7 +359,12 @@ def _verify_recorded_patch_materialization(
     } | set(classes)
     for record in replacement_records:
         replacement_name = record.replacement_type.__name__
-        if replacement_name not in bound_names:
+        constructor_visible = any(
+            isinstance(node, ast.Call)
+            and _call_name(node.func) == replacement_name
+            for node in ast.walk(tree)
+        )
+        if replacement_name not in bound_names or not constructor_visible:
             missing.append(
                 f"{record.module_fqn} (replacement {replacement_name})"
             )
@@ -463,6 +477,15 @@ def _verify_recorded_patch_materialization(
         )
 
 
+def _call_name(node: ast.AST) -> str | None:
+    """Return the terminal name of a constructor call expression."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
 def verify_recorded_patch_bundle(
     files: dict[str, str],
     *,
@@ -489,6 +512,9 @@ def verify_recorded_patch_bundle(
         class_name = record.module_type.__name__
         matched = False
         for tree in trees.values():
+            if _bound_function_patch_materialized(tree, record):
+                matched = True
+                break
             host = next(
                 (
                     node for node in tree.body
@@ -581,6 +607,43 @@ def verify_recorded_patch_bundle(
         raise RuntimeError(
             "codegen: generated bundle contains forbidden HPCodegen class names"
         )
+
+
+def _bound_function_patch_materialized(tree: ast.AST, record: Any) -> bool:
+    """Return whether a ``MethodType`` forward has an explicit EP toggle."""
+    function_name = getattr(record.original_forward, "__name__", "")
+    if not function_name:
+        return False
+    impl_name = f"{function_name}_hp_impl"
+    functions = {
+        node.name: node
+        for node in getattr(tree, "body", ())
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    wrapper = functions.get(function_name)
+    if wrapper is None or impl_name not in functions:
+        return False
+    has_toggle = any(
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+        and node.attr == "ep_enable"
+        for node in ast.walk(wrapper)
+    )
+    has_binding = any(
+        isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Attribute) and target.attr == "_forward_impl"
+            for target in node.targets
+        )
+        and isinstance(node.value, ast.Call)
+        and _call_name(node.value.func) == "MethodType"
+        and node.value.args
+        and isinstance(node.value.args[0], ast.Name)
+        and node.value.args[0].id == impl_name
+        for node in ast.walk(tree)
+    )
+    return has_toggle and has_binding
 
 
 def _apply_inline_modeling(

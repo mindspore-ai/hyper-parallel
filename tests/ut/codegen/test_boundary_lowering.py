@@ -442,6 +442,84 @@ def test_same_class_cp_toggle_satisfies_inner_wrapper_verification():
 
 @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
           card_mark="onecard", essential_mark="unessential")
+def test_replacement_verifier_requires_constructor_call():
+    """An imported replacement symbol alone is not a materialized replacement."""
+    source_type = type("SourceBlock", (), {})
+    replacement_type = type("ReplacementBlock", (), {})
+    record = SimpleNamespace(
+        module_fqn="blocks.alpha",
+        source_type=source_type,
+        replacement_type=replacement_type,
+    )
+    patches = SimpleNamespace(
+        local_computes=(),
+        module_replacements=(record,),
+        inner_wrappers=(),
+    )
+    meta = SimpleNamespace(materialized_patches=[])
+    imported_only = "from demo import ReplacementBlock\n"
+
+    with pytest.raises(RuntimeError, match="were not materialized"):
+        _verify_recorded_patch_materialization(
+            imported_only, meta, patch_plan=patches
+        )
+
+    rendered = imported_only + "\nblock = ReplacementBlock(source)\n"
+    _verify_recorded_patch_materialization(rendered, meta, patch_plan=patches)
+
+    assert meta.materialized_patches == [{
+        "fqn": "blocks.alpha",
+        "host_class": "ReplacementBlock",
+        "kind": "module_replacement",
+        "source_form": "constructor",
+    }]
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
+def test_bound_method_local_compute_satisfies_verification():
+    """A model-owned MethodType wrapper is a visible local-compute patch."""
+    module_type = type("ImportedMoe", (), {})
+
+    def source_forward(self, hidden_states):
+        return hidden_states
+
+    record = SimpleNamespace(
+        module_fqn="blocks.alpha.mlp",
+        module_type=module_type,
+        original_forward=source_forward,
+    )
+    patches = SimpleNamespace(
+        local_computes=(record,),
+        module_replacements=(),
+        inner_wrappers=(),
+    )
+    meta = SimpleNamespace(materialized_patches=[])
+    rendered = """
+def source_forward_hp_impl(self, hidden_states):
+    return hidden_states
+
+def source_forward(self, hidden_states):
+    if self.ep_enable:
+        return self.__hp_compute__(hidden_states)
+    return self._forward_impl(hidden_states)
+
+owner._forward_impl = MethodType(source_forward_hp_impl, owner)
+owner.forward = MethodType(source_forward, owner)
+"""
+
+    _verify_recorded_patch_materialization(rendered, meta, patch_plan=patches)
+
+    assert meta.materialized_patches == [{
+        "fqn": "blocks.alpha.mlp",
+        "host_class": "ImportedMoe",
+        "kind": "local_compute",
+        "source_form": "bound_method_toggle_forward",
+    }]
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+          card_mark="onecard", essential_mark="unessential")
 def test_imported_cp_host_is_rendered_as_same_name_class():
     """An imported replacement gets a visible same-name CP class."""
     patches = InlinePatchSet(

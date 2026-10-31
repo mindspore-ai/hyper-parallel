@@ -23,6 +23,7 @@ and whether it passes preflight before training starts.
 from __future__ import annotations
 
 import ast
+import importlib
 import logging
 import os
 from typing import Any, Optional
@@ -164,7 +165,6 @@ def _build_meta_from_snapshot(
     frozen_plan = dict(payload["plan"] or {})
     application = dict(payload["plan_application"] or {})
     module_overrides = list(replacement_records_from_snapshot(snapshot))
-    trainer_owns_model = not bool(source.get("is_hf_model", True))
     covered = dict(COVERED_DEFAULTS)
     is_derived = status is CodegenStatus.DERIVED
     covered["sharding_plan"] = is_derived
@@ -193,9 +193,7 @@ def _build_meta_from_snapshot(
         special_handlers=dict(frozen_plan.get("special_handlers") or {}),
         boundary_classes=dict(frozen_plan.get("boundary_classes") or {}),
         mesh_dim_names=list(frozen_plan.get("mesh_dim_names") or ()) or None,
-        module_overrides=(
-            [] if trainer_owns_model or not is_derived else module_overrides
-        ),
+        module_overrides=(module_overrides if is_derived else []),
         emission_patches=emission_patches,
         covered=covered,
         not_covered=(
@@ -245,6 +243,7 @@ def _snapshot_emission_patches(payload: dict[str, Any]) -> dict[str, Any]:
             f"{module_name}:{class_name}" if module_name and class_name else None
         )
         source_module_type = _source_type_identity(source, class_name)
+        bound_forward = _bound_forward_identity(source, module_fqn)
         local_compute = injection.get("local_compute_fn")
         if local_compute is not None:
             if declared_module_type is None:
@@ -252,17 +251,25 @@ def _snapshot_emission_patches(payload: dict[str, Any]) -> dict[str, Any]:
                     "snapshot local_compute_fn requires a source module and "
                     f"boundary class for {module_fqn!r}"
                 )
-            # Imported boundary classes remain plan audit data; only classes
-            # with a body in this source can receive a source patch.
-            if source_module_type is not None:
+            if source_module_type is not None or bound_forward is not None:
+                module_type = (
+                    _imported_type_identity(source, class_name)
+                    if bound_forward is not None
+                    else source_module_type
+                ) or (
+                    source_module_type
+                    or declared_module_type
+                )
                 local_computes.append({
                     "module_fqn": module_fqn,
-                    "module_type": source_module_type,
+                    "module_type": module_type,
                     "factory": _snapshot_target_path(local_compute),
                     "region_dispatch": (param_plan.get(module_fqn) or {}).get(
                         "region_dispatch"
                     ),
-                    "original_forward": f"{source_module_type}.forward",
+                    "original_forward": (
+                        bound_forward or f"{source_module_type}.forward"
+                    ),
                 })
         inner_wrapper = injection.get("inner_wrapper")
         if inner_wrapper is not None:
@@ -331,6 +338,114 @@ def _source_type_identity(source: dict[str, Any], class_name: Optional[str]) -> 
             f"{sorted(candidates)}"
         )
     return candidates[0] if candidates else None
+
+
+def _bound_forward_identity(
+    source: dict[str, Any], module_fqn: Optional[str]
+) -> Optional[str]:
+    """Resolve a model-owned function installed through ``MethodType``.
+
+    Custom models can import a boundary class but replace an instance forward
+    in their constructor.  The installed module-level function, rather than the
+    imported class body, is the source unit codegen must rewrite.
+    """
+    file_path = source.get("file_path")
+    module_name = source.get("module_name")
+    if not file_path or not module_name or not module_fqn:
+        return None
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as handle:
+            tree = ast.parse(handle.read(), filename=file_path)
+    except (OSError, SyntaxError):
+        return None
+
+    boundary_name = module_fqn.rsplit(".", 1)[-1]
+    candidates = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        call = node.value
+        if (
+            not isinstance(target, ast.Attribute)
+            or target.attr != "forward"
+            or not isinstance(target.value, ast.Attribute)
+            or target.value.attr != boundary_name
+            or not isinstance(call, ast.Call)
+            or _ast_name(call.func) != "MethodType"
+            or not call.args
+            or not isinstance(call.args[0], ast.Name)
+        ):
+            continue
+        candidates.add(call.args[0].id)
+    if len(candidates) > 1:
+        raise ValueError(
+            f"snapshot boundary {module_fqn!r} has multiple MethodType forwards: "
+            f"{sorted(candidates)}"
+        )
+    return f"{module_name}:{next(iter(candidates))}" if candidates else None
+
+
+def _imported_type_identity(
+    source: dict[str, Any], class_name: Optional[str]
+) -> Optional[str]:
+    """Resolve an imported boundary class from modules referenced by the source."""
+    file_path = source.get("file_path")
+    if not file_path or not class_name:
+        return None
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as handle:
+            tree = ast.parse(handle.read(), filename=file_path)
+    except (OSError, SyntaxError):
+        return None
+
+    explicit_modules = {
+        node.module
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+        and node.level == 0
+        and node.module
+        and any(
+            alias.name == class_name and (alias.asname or alias.name) == class_name
+            for alias in node.names
+        )
+    }
+    if len(explicit_modules) > 1:
+        raise ValueError(
+            f"snapshot class {class_name!r} is imported from multiple modules: "
+            f"{sorted(explicit_modules)}"
+        )
+    if explicit_modules:
+        return f"{next(iter(explicit_modules))}:{class_name}"
+
+    modules = {
+        node.module
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module
+    }
+    candidates = []
+    for module_name in sorted(modules):
+        try:
+            module = importlib.import_module(module_name)
+        except (ImportError, AttributeError):
+            continue
+        if hasattr(module, class_name):
+            candidates.append(f"{module_name}:{class_name}")
+    if len(candidates) > 1:
+        raise ValueError(
+            f"snapshot class {class_name!r} is exported by multiple imported modules: "
+            f"{candidates}"
+        )
+    return candidates[0] if candidates else None
+
+
+def _ast_name(node: ast.AST) -> Optional[str]:
+    """Return the terminal name of a callable expression."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
 
 
 def _snapshot_target_path(target: Any) -> str:

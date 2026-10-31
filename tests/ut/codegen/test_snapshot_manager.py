@@ -456,9 +456,19 @@ def test_snapshot_emission_patches_include_resolved_phase_c_injections(tmp_path)
     )
 
 
-def test_snapshot_emission_skips_local_compute_for_imported_class(tmp_path):
+def test_snapshot_emission_uses_model_owned_method_type_forward(tmp_path):
+    """An imported boundary uses the model-owned forward installed on it."""
     source = tmp_path / "modeling_deepseek_v41.py"
-    source.write_text("class DeepseekV41Model:\n    pass\n", encoding="utf-8")
+    source.write_text(
+        "from types import MethodType\n\n"
+        "from tests.ut.codegen.helpers import SourceMLP\n\n"
+        "def _v41_sparse_moe_forward(self, hidden_states):\n"
+        "    return hidden_states\n\n"
+        "class DeepseekV41Model:\n"
+        "    def __init__(self, layer):\n"
+        "        layer.mlp.forward = MethodType(_v41_sparse_moe_forward, layer.mlp)\n",
+        encoding="utf-8",
+    )
     payload = {
         "source": {
             "module_name": "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41",
@@ -467,7 +477,7 @@ def test_snapshot_emission_skips_local_compute_for_imported_class(tmp_path):
         "replacements": {"applications": []},
         "plan": {
             "boundary_classes": {
-                "model.layers.0.mlp": "DeepseekV4SparseMoeBlock",
+                "model.layers.0.mlp": "SourceMLP",
             },
             "param_plan": {"model.layers.0.mlp": {"region_dispatch": False}},
         },
@@ -483,7 +493,22 @@ def test_snapshot_emission_skips_local_compute_for_imported_class(tmp_path):
 
     patches = manager._snapshot_emission_patches(payload)
 
-    assert not patches["local_computes"]
+    expected = [{
+        "module_fqn": "model.layers.0.mlp",
+        "module_type": (
+            "tests.ut.codegen.helpers:SourceMLP"
+        ),
+        "factory": "hyper_parallel.models.deepseek_v41:ep_compute",
+        "region_dispatch": False,
+        "original_forward": (
+            "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:"
+            "_v41_sparse_moe_forward"
+        ),
+    }]
+    assert patches["local_computes"] == expected, (
+        f"Expected model-owned MethodType forward patch {expected}, "
+        f"got {patches['local_computes']}"
+    )
 
 
 def test_snapshot_manager_normalizes_deepseek_v4_family(monkeypatch, tmp_path):
