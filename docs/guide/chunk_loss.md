@@ -10,6 +10,8 @@ Chunk Loss 用于降低大词表语言模型在输出投影和交叉熵阶段的
 - `ChunkedCausalLMLoss` 和 Trainer 接线：负责标签交接、局部归一化与模型绑定；
 - `models/qwen3_moe/adapter/runtime/chunked_loss.py`：Qwen3-MoE 在完整 LM Head 之前的专用适配。
 
+另外提供 `projected_cross_entropy` 作为保留原输出层 TP/SP 行为的公共接口，见文末。
+
 ## 1. 为什么必须在模型 forward 内接入
 
 普通 causal-LM 前向先执行：
@@ -173,3 +175,48 @@ reduce-scatter/reshard，不复制参数，也不绕开 FSDP 的梯度管理。
 
 较小的 `chunk_size` 降低块级 logits 峰值，但增加 LM Head、交叉熵和 Python 调度次数；较大的值
 通常更快但峰值更高。建议从 1024 开始，再按词表大小、本地序列长度和设备实测选择。
+
+## 9. 保留 TP/SP 的分块输出投影
+
+当输出层已经配置 TP/SP 时，可在模型 forward 中使用 `projected_cross_entropy`。
+它逐块调用原来的输出层和 CE，通过非重入 checkpoint 避免前向保留全部 logits，
+不直接读取本地权重计算梯度，也不替换输出层已有的并行通信。反向会重算投影和 CE，
+因此可能增加通信和计算开销；不能据此保证加速。
+
+```python
+from hyper_parallel.components.losses import projected_cross_entropy
+
+loss = projected_cross_entropy(
+    hidden_states,
+    shift_labels,
+    head=lm_head,
+    loss_fn=causal_loss_fn,
+    vocab_size=vocab_size,
+    chunk_size=1024,
+    sequence_parallel_size=sp_size,
+    tp_mesh=loss_tp_mesh,
+)
+```
+
+- `hidden_states` 是本地普通张量 `[B, S_local, H]`；输出层负责已有的 TP/SP 包装。
+- `shift_labels` 是已对齐、无需再次移位的 `torch.long` 标签，形状为
+  `[B, S_local * sp_size]`，按 SP rank 的连续序列分片顺序排列。
+- `chunk_size` 表示每行在 SP 汇聚后的最大序列块长，必须能被 `sp_size` 整除。
+  各 rank 每次取 `chunk_size / sp_size` 个位置；所有参与 rank 必须执行相同的块数。
+- 输出层必须逐位置计算，SP 汇聚顺序必须为 rank 顺序。例如两张卡分别持有
+  `[A, B, C]`、`[D, E, F]`，`chunk_size=4` 时两轮对应 `[A, B, D, E]`、`[C, F]`；
+  接口按同样顺序重排标签。
+- `loss_fn` 接收 Transformers 风格的 `logits`、`shift_labels`、`vocab_size`、
+  `ignore_index` 和 `num_items_in_batch`，必须计算 CE 总和再除以传入分母。
+  所有块共享整份输入标签的有效 token 数，不能各自取均值；全部忽略时返回可导零。
+- 完整词表 CE 可使用 Transformers 的 `ForCausalLMLoss`，此时 `tp_mesh=None`。
+  对于词表分片 logits，应传入支持词表并行的 CE，例如现有模型适配函数
+  `causal_lm_loss_parallel`，并设置对应 TP mesh。接口在前向及反向重算时均进入
+  `loss_parallel` 上下文；不会自动把普通 CE 转换成词表并行 CE。
+
+返回值为所提供标签范围内的 token 平均 loss。此接口不做 DP/CP 或梯度累加窗口的归一化，
+也不包含 JT 的 LM/MTP/aux 策略。调用者仍负责外层训练协议，避免重复加权。
+
+这是独立公共接口，不自动切换前述 `ChunkedCausalLMLoss` 或现有模型 adapter 的实现，
+也不移除它们的 TP/PP 限制。模型需要在生成完整 logits 之前显式接入。
+FSDP 包装下的 checkpoint 重算、实际加速器显存及整网性能需结合调用方单独验证。

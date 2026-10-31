@@ -14,9 +14,9 @@
 # ============================================================================
 """Memory-efficient chunked output projection and cross-entropy.
 
-The full ``[batch, sequence, vocabulary]`` logits tensor is never
-materialized. Output projection, FP32 cross-entropy, and first-order
-gradients are evaluated one local sequence chunk at a time.
+``chunked_cross_entropy`` precomputes first-order gradients from a local
+weight and returns a loss sum. ``projected_cross_entropy`` checkpoints a
+caller-owned head and loss, preserving TP/SP wrappers, and returns a token mean.
 """
 
 from __future__ import annotations
@@ -25,9 +25,11 @@ __all__ = [
     "ChunkedCausalLMLoss",
     "ChunkedCausalLMOutput",
     "chunked_cross_entropy",
+    "projected_cross_entropy",
 ]
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -39,7 +41,10 @@ import torch
 from torch import nn
 from torch.autograd.function import once_differentiable
 from torch.nn import functional
+from torch.utils.checkpoint import checkpoint
 from transformers.utils import ModelOutput
+
+from hyper_parallel.core.tensor_parallel.loss_parallel import loss_parallel
 
 
 def _linear_cross_entropy_chunk(
@@ -73,7 +78,16 @@ class _PrecomputedChunkLoss(torch.autograd.Function):
         chunk_size: int,
         ignore_index: int,
     ) -> torch.Tensor:
-        """Compute the loss sum and retain accumulated first-order gradients."""
+        """Compute the loss sum and retain accumulated first-order gradients.
+
+        Args:
+            ctx: Autograd context used to save the precomputed gradients.
+            hidden_states: Local hidden activations.
+            head_weight: Complete output projection weight.
+            targets: Pre-shifted local target labels.
+            chunk_size: Maximum local sequence positions per chunk.
+            ignore_index: Target value excluded from cross-entropy.
+        """
         grad_hidden = torch.empty_like(hidden_states)
         grad_weight = torch.zeros_like(head_weight)
         loss_sum = torch.zeros((), dtype=torch.float32, device=hidden_states.device)
@@ -105,7 +119,12 @@ class _PrecomputedChunkLoss(torch.autograd.Function):
     @staticmethod
     @once_differentiable
     def backward(ctx: Any, grad_loss_sum: torch.Tensor | None) -> tuple:
-        """Replay private gradients with the Trainer's upstream scale."""
+        """Replay private gradients with the Trainer's upstream scale.
+
+        Args:
+            ctx: Autograd context holding precomputed gradients.
+            grad_loss_sum: Upstream loss gradient, or None for an unused output.
+        """
         if grad_loss_sum is None:
             return None, None, None, None, None
         grad_hidden, grad_weight = ctx.saved_tensors
@@ -218,6 +237,112 @@ def chunked_cross_entropy(
     )
 
 
+def _validate_projected_targets(
+    hidden_states: torch.Tensor,
+    targets: torch.Tensor,
+    sequence_parallel_size: int,
+) -> None:
+    """Require aligned rank-order targets on the local hidden device.
+
+    Args:
+        hidden_states: Local hidden activations with batch and sequence axes.
+        targets: Pre-shifted labels covering all sequence-parallel shards.
+        sequence_parallel_size: Validated positive number of sequence shards.
+    """
+    if (hidden_states.ndim != 3 or targets.ndim != 2 or hidden_states.shape[0] != targets.shape[0]
+            or hidden_states.shape[1] == 0
+            or hidden_states.shape[1] * sequence_parallel_size != targets.shape[1]):
+        raise ValueError("Hidden sequence shards must evenly partition aligned global targets")
+    if targets.dtype != torch.long:
+        raise TypeError("targets must have dtype torch.long")
+    if hidden_states.device != targets.device:
+        raise ValueError("hidden_states and targets must be on the same device")
+
+
+def projected_cross_entropy(
+    hidden_states: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    head: Callable[[torch.Tensor], torch.Tensor],
+    loss_fn: Callable[..., torch.Tensor],
+    vocab_size: int,
+    chunk_size: int,
+    sequence_parallel_size: int = 1,
+    tp_mesh: Any = None,
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    """Return token-mean CE without materializing or retaining full-sequence logits.
+
+    This TP/SP variant of ``chunked_cross_entropy`` checkpoints the caller-owned
+    head and CE instead of precomputing gradients from a local weight directly.
+    The ordinary head and loss keep ownership of vocabulary sharding and gradient
+    communication. With sequence parallelism, the head gathers rank-local chunks
+    in rank order; targets are rearranged into exactly that same order. All chunks
+    share the valid-target count of the supplied targets, including empty chunks.
+    This helper performs no DP/CP or gradient-accumulation
+    normalization; the caller owns those boundaries.
+
+    Args:
+        hidden_states: Local hidden activations in [batch, local_sequence, hidden].
+        targets: Pre-shifted labels in [batch, local_sequence * sequence_parallel_size], in rank order.
+        head: Position-wise output projection, including its existing parallel boundary wrappers.
+        loss_fn: Transformers-compatible CE accepting num_items_in_batch.
+        vocab_size: Global vocabulary size.
+        chunk_size: Maximum gathered token positions per row projected at once;
+            must be divisible by sequence_parallel_size.
+        sequence_parallel_size: Number of contiguous equal sequence shards.
+        tp_mesh: Loss-parallel mesh, re-entered during checkpoint recomputation.
+        ignore_index: Label value excluded from both loss and token count.
+
+    Returns:
+        Scalar token mean, or differentiable zero when all labels are ignored.
+
+    Note:
+        ``head`` must be position-wise and preserve rank-order SP gathering.
+        ``loss_fn`` must compute summed CE divided by ``num_items_in_batch``;
+        it must not shift labels or normalize each chunk independently.
+        Every participating rank must run the same chunk schedule. Checkpoint
+        recomputation repeats head/CE communication and trades compute for memory.
+    """
+    if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
+        raise ValueError("chunk_size must be a positive integer")
+    if (isinstance(sequence_parallel_size, bool) or not isinstance(sequence_parallel_size, int)
+            or sequence_parallel_size <= 0 or chunk_size % sequence_parallel_size):
+        raise ValueError("chunk_size must be divisible by a positive sequence_parallel_size")
+    _validate_projected_targets(hidden_states, targets, sequence_parallel_size)
+    denominator = (targets != ignore_index).sum().clamp_min(1)
+    local_length = hidden_states.shape[1]
+    local_chunk_size = chunk_size // sequence_parallel_size
+
+    def project_and_score(states: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Re-enter the parallel loss context during forward and recomputation.
+
+        Args:
+            states: Current local hidden chunk.
+            labels: Targets in the output head's gathered token order.
+        """
+        context = nullcontext() if tp_mesh is None else loss_parallel(mesh=tp_mesh)
+        with context:
+            logits = head(states)
+            if logits.shape[:-1] != labels.shape:
+                raise ValueError("Output head must gather sequence shards in rank order")
+            return loss_fn(logits=logits, labels=None, vocab_size=vocab_size, shift_labels=labels,
+                           num_items_in_batch=denominator, ignore_index=ignore_index).reshape(())
+
+    total = torch.zeros((), device=hidden_states.device, dtype=torch.float32)
+    for start in range(0, local_length, local_chunk_size):
+        stop = min(start + local_chunk_size, local_length)
+        states = hidden_states[:, start:stop]
+        if sequence_parallel_size == 1:
+            # Transformers flattens labels with view; single-row slices need no copy.
+            labels = targets[:, start:stop].contiguous()
+        else:
+            labels = torch.cat([targets[:, rank * local_length + start:rank * local_length + stop]
+                                for rank in range(sequence_parallel_size)], dim=1)
+        total = total + checkpoint(project_and_score, states, labels, use_reentrant=False)
+    return total
+
+
 def _get_output_value(model_output: Any, name: str) -> Any:
     """Read one optional value from a mapping or Transformers output."""
     if isinstance(model_output, Mapping):
@@ -289,14 +414,14 @@ class ChunkedCausalLMLoss(nn.Module):
 
         tp_size = self._parallel_size(distributed_setup, "tp_size")
         pp_size = self._parallel_size(distributed_setup, "pp_size")
-        loss_parallel = bool(
+        use_loss_parallel = bool(
             getattr(getattr(distributed_setup, "mesh_context", None), "loss_parallel", False)
         )
-        if tp_size != 1 or pp_size != 1 or loss_parallel:
+        if tp_size != 1 or pp_size != 1 or use_loss_parallel:
             raise NotImplementedError(
                 "ChunkedCausalLMLoss currently requires tp_size=1, pp_size=1, "
                 f"and loss_parallel=false; got tp_size={tp_size}, "
-                f"pp_size={pp_size}, loss_parallel={loss_parallel}"
+                f"pp_size={pp_size}, loss_parallel={use_loss_parallel}"
             )
 
         # Lazy imports keep generic loss-package import independent of concrete
@@ -329,7 +454,12 @@ class ChunkedCausalLMLoss(nn.Module):
         model_inputs: Mapping[str, Any],
         loss_inputs: Mapping[str, Any],
     ) -> dict[str, Any]:
-        """Move labels to the model-family no-full-logits protocol."""
+        """Move labels to the model-family no-full-logits protocol.
+
+        Args:
+            model_inputs: Prepared inputs passed to the model adapter.
+            loss_inputs: Pre-shifted targets and optional supervision mask.
+        """
         if not self._model_is_bound:
             raise RuntimeError("ChunkedCausalLMLoss must be bound before model forward")
         targets = loss_inputs.get("shift_labels")
