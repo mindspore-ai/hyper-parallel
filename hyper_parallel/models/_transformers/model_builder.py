@@ -378,8 +378,38 @@ def _move_model_to_device(
         logger.info("Model moved to %s", device)
         return model
 
-    model.to_empty(device=device)
+    _to_empty_preserving_nonpersistent_buffers(model, device)
     return model
+
+
+def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: torch.device) -> None:
+    """Materialize parameters without discarding config-derived buffers."""
+    snapshots = []
+    for module in model.modules():
+        for name in module._non_persistent_buffers_set:  # pylint: disable=W0212
+            buffer = module._buffers.get(name)  # pylint: disable=W0212
+            if buffer is None:
+                continue
+            if isinstance(buffer, DTensor):
+                logger.warning(
+                    "Non-persistent DTensor buffer %s on %s cannot be preserved across materialization",
+                    name,
+                    type(module).__name__,
+                )
+                continue
+            if buffer.is_meta:
+                logger.warning(
+                    "Non-persistent buffer %s on %s is on meta and cannot be preserved across materialization",
+                    name,
+                    type(module).__name__,
+                )
+                continue
+            snapshots.append((module, name, buffer.detach().clone()))
+
+    model.to_empty(device=device)
+    for module, name, buffer in snapshots:
+        current = module._buffers[name]  # pylint: disable=W0212
+        module._buffers[name] = buffer.to(device=current.device)  # pylint: disable=W0212
 
 
 def _initialize_model_weights(model: nn.Module) -> None:
@@ -902,16 +932,18 @@ def _validate_model_state_dtype(
     external = get_model_external_state(model)
     external_ids = {id(parameter) for parameter in external.parameters.values()} if external is not None else set()
     fp32_ids = _model_fp32_parameter_ids(model)
+    preserved_buffers = _nonpersistent_buffer_names(model)
     mismatched = [
         name
-        for name, tensor in model.named_parameters(remove_duplicate=False)
-        if id(tensor) not in external_ids and (tensor.is_floating_point() or id(tensor) in fp32_ids)
+        for name, tensor in (
+            list(model.named_parameters(remove_duplicate=False))
+            + list(model.named_buffers(remove_duplicate=False))
+        )
+        if id(tensor) not in external_ids
+        and (tensor.is_floating_point() or id(tensor) in fp32_ids)
         and tensor.dtype != (torch.float32 if id(tensor) in fp32_ids else target_dtype)
+        and name not in preserved_buffers
     ]
-    mismatched.extend(
-        name for name, tensor in model.named_buffers(remove_duplicate=False)
-        if tensor.is_floating_point() and tensor.dtype != target_dtype
-    )
     if mismatched:
         raise RuntimeError(
             "Model initialization dtype validation failed for: "
@@ -940,6 +972,39 @@ def validate_model_init_dtype(
     _validate_model_state_dtype(model, target_dtype)
 
 
+def _snapshot_nonpersistent_buffers(model: nn.Module) -> list[tuple[nn.Module, str, torch.Tensor]]:
+    """Clone config-derived buffers before global dtype conversion."""
+    snapshots = []
+    for module in model.modules():
+        for name in module._non_persistent_buffers_set:  # pylint: disable=W0212
+            buffer = module._buffers.get(name)  # pylint: disable=W0212
+            if buffer is None or isinstance(buffer, DTensor) or buffer.is_meta:
+                continue
+            snapshots.append((module, name, buffer.detach().clone()))
+    return snapshots
+
+
+def _restore_nonpersistent_buffers(
+        snapshots: list[tuple[nn.Module, str, torch.Tensor]],
+) -> None:
+    """Restore non-persistent buffers with their original values and dtypes."""
+    for module, name, buffer in snapshots:
+        current = module._buffers.get(name)  # pylint: disable=W0212
+        device = buffer.device if current is None or current.is_meta else current.device
+        module._buffers[name] = buffer.to(device=device)  # pylint: disable=W0212
+
+
+def _nonpersistent_buffer_names(model: nn.Module) -> set[str]:
+    """Return fully qualified names of non-persistent buffers."""
+    names = set()
+    for module_name, module in model.named_modules(remove_duplicate=False):
+        for tensor_name in module._non_persistent_buffers_set:  # pylint: disable=W0212
+            if module._buffers.get(tensor_name) is None:  # pylint: disable=W0212
+                continue
+            names.add(f"{module_name}.{tensor_name}" if module_name else tensor_name)
+    return names
+
+
 def apply_model_init_dtype(
         model: nn.Module,
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]],
@@ -960,12 +1025,14 @@ def apply_model_init_dtype(
 
     identities_before = _model_tensor_identities(model)
     layouts_before = _dtensor_layouts(model)
+    nonpersistent_buffers = _snapshot_nonpersistent_buffers(model)
     swap_on_conversion = torch.__future__.get_swap_module_params_on_conversion()
     torch.__future__.set_swap_module_params_on_conversion(True)
     try:
         model.to(dtype=target_dtype)
     finally:
         torch.__future__.set_swap_module_params_on_conversion(swap_on_conversion)
+    _restore_nonpersistent_buffers(nonpersistent_buffers)
 
     if _model_tensor_identities(model) != identities_before:
         raise RuntimeError(

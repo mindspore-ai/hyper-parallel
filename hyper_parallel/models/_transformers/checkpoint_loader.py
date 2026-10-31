@@ -310,8 +310,13 @@ def _adjust_loading_keys(
     )
 
 
-def _prepare_initialization_targets(targets: list[_FinalizeTarget]) -> None:
-    """Clear stale initialization flags only for state that must be rebuilt."""
+def _prepare_initialization_targets(
+    model: nn.Module,
+    targets: list[_FinalizeTarget],
+) -> None:
+    """Reopen only modules that own missing or non-persistent state."""
+    for module in model.modules():
+        module._is_hf_initialized = True  # pylint: disable=W0212
     owner_modules = {}
     for target in targets:
         target.tensor._is_hf_initialized = False  # pylint: disable=W0212
@@ -409,7 +414,7 @@ def _finalize_model_loading(
     ]
     _validate_missing_initialization_targets(initialization_targets, missing_keys)
     _validate_materialized(initialization_targets)
-    _prepare_initialization_targets(initialization_targets)
+    _prepare_initialization_targets(model, initialization_targets)
     if initialization_targets:
         _initialize_model_state_after_loading(model)
         for target in initialization_targets:

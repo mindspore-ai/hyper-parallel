@@ -18,6 +18,7 @@ Following design doc 01_hf_compatibility_layer.md §6.
 Stub — provides from_pretrained/from_config as entry points.
 """
 
+import importlib
 import logging
 from dataclasses import is_dataclass, replace
 from types import SimpleNamespace
@@ -44,6 +45,7 @@ from hyper_parallel.codegen.modeling_backend import ModelingBackend
 from hyper_parallel.models.build_options import get_device_id, get_device_type  # pylint: disable=syntax-error
 from hyper_parallel.models.build_options import CompileConfig
 from hyper_parallel.components.checkpoint.quantized_hf_storage import supports_hf_dequantization
+from hyper_parallel.models.registry import get_model_adapter
 
 logger = logging.getLogger(__name__)
 
@@ -565,3 +567,180 @@ class HyperAutoModelForImageTextToText(_BaseHyperAutoModelClass, AutoModelForIma
 
 class HyperAutoModelForSequenceClassification(_BaseHyperAutoModelClass, AutoModelForSequenceClassification):
     """Hyper-Parallel SequenceClassification."""
+
+
+def _resolve_dit_provider(provider: Any = None, model_type: Optional[str] = None) -> Any:
+    """Resolve a DiT provider from an explicit path or model-family spec."""
+    if provider is None:
+        if not model_type:
+            raise ValueError("DiT AutoModel requires model_type or model_provider")
+        adapter_spec = get_model_adapter(model_type)
+        if adapter_spec is None or adapter_spec.dit is None:
+            raise ValueError(f"No DiT provider registered for model_type={model_type!r}")
+        return adapter_spec.dit()
+    if isinstance(provider, str):
+        parts = provider.split(".")
+        for split_at in range(len(parts), 0, -1):
+            try:
+                value = importlib.import_module(".".join(parts[:split_at]))
+            except ModuleNotFoundError as exc:
+                if exc.name == ".".join(parts[:split_at]) or ".".join(parts[:split_at]).startswith(f"{exc.name}."):
+                    continue
+                raise
+            for attribute in parts[split_at:]:
+                value = getattr(value, attribute)
+            return value
+        raise ImportError(f"Unable to import DiT model provider {provider!r}")
+    return provider
+
+
+resolve_dit_provider = _resolve_dit_provider
+
+
+class HyperAutoModelForDiT(_BaseHyperAutoModelClass):
+    """Generic AutoModel facade for Diffusers-style DiT families.
+
+    A family-specific provider owns config/checkpoint format and model class;
+    this facade owns only the shared HyperParallel build lifecycle.
+    """
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: Optional[str] = None,
+        *,
+        model_provider: Any = None,
+        model_type: Optional[str] = None,
+        distributed_setup: Optional[DistributedSetup] = None,
+        peft_config: Optional[Any] = None,
+        torch_dtype: Union[str, torch.dtype] = "bfloat16",
+        attn_implementation: str = "sdpa",
+        activation_checkpoint: Optional[str] = None,
+        swap_inputs: bool = False,
+        activation_swap: str = "none",
+        compile_config: Optional[Union[CompileConfig, dict]] = None,
+        model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
+        validate_placement: bool = False,
+        transformer_subfolder: Optional[str] = "transformer",
+        config_path: Optional[str] = None,
+        task: str = "t2v",
+        **kwargs: Any,
+    ) -> torch.nn.Module:
+        """Resolve a provider and run the common DiT construction pipeline."""
+        provider = _resolve_dit_provider(model_provider, model_type)
+        if distributed_setup is None:
+            raise ValueError("DiT AutoModel requires distributed_setup from BaseTrainer")
+        prepare = getattr(provider, "prepare", None)
+        if callable(prepare):
+            prepare(distributed_setup, peft_config=peft_config, **kwargs)
+        config, checkpoint_path = provider.resolve_pretrained(
+            pretrained_model_name_or_path,
+            transformer_subfolder=transformer_subfolder,
+            config_path=config_path,
+            task=task,
+            torch_dtype=torch_dtype,
+            attn_implementation=attn_implementation,
+            **kwargs,
+        )
+        planner, fsdp = instantiate_infrastructure(
+            distributed_setup=distributed_setup, device=_current_device()
+        )
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        is_meta_device = checkpoint_path is not None or world_size > 1
+        from contextlib import nullcontext
+        from transformers.modeling_utils import ContextManagers
+        try:
+            from transformers.modeling_utils import no_init_weights
+        except ImportError:
+            from transformers.initialization import no_init_weights
+        from hyper_parallel import init_empty_weights
+        init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
+        with init_ctx:
+            if checkpoint_path is not None:
+                model = provider.build_model(config)
+            else:
+                build_from_config = getattr(provider, "build_from_config", provider.build_model)
+                model = build_from_config(config)
+        model = apply_model_infrastructure(
+            model,
+            mesh=distributed_setup.mesh_context,
+            sharding_planner=planner,
+            fsdp2_manager=fsdp,
+            peft_config=peft_config,
+            compile_config=compile_config,
+            is_meta_device=is_meta_device,
+            is_hf_model=True,
+            device=_current_device(),
+            load_base_model=checkpoint_path is not None,
+            pretrained_path=checkpoint_path,
+            validate_placement=validate_placement,
+            distributed_setup=distributed_setup,
+            activation_checkpoint=activation_checkpoint,
+            swap_inputs=swap_inputs,
+            activation_swap=activation_swap,
+            model_init_dtype=model_init_dtype,
+        )
+        model.train()
+        return model
+
+    @classmethod
+    def from_config(
+        cls,
+        config: Any,
+        *,
+        model_provider: Any = None,
+        model_type: Optional[str] = None,
+        distributed_setup: Optional[DistributedSetup] = None,
+        peft_config: Optional[Any] = None,
+        compile_config: Optional[Union[CompileConfig, dict]] = None,
+        activation_checkpoint: Optional[str] = None,
+        swap_inputs: bool = False,
+        activation_swap: str = "none",
+        model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
+        validate_placement: bool = False,
+        **kwargs: Any,
+    ) -> torch.nn.Module:
+        """Build a DiT model from a provider-owned config."""
+        provider = _resolve_dit_provider(model_provider, model_type)
+        if distributed_setup is None:
+            raise ValueError("DiT AutoModel requires distributed_setup from BaseTrainer")
+        prepare = getattr(provider, "prepare", None)
+        if callable(prepare):
+            prepare(distributed_setup, peft_config=peft_config, **kwargs)
+        planner, fsdp = instantiate_infrastructure(
+            distributed_setup=distributed_setup, device=_current_device()
+        )
+        is_meta_device = (
+            torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        ) > 1
+        from contextlib import nullcontext
+        from transformers.modeling_utils import ContextManagers
+        try:
+            from transformers.modeling_utils import no_init_weights
+        except ImportError:
+            from transformers.initialization import no_init_weights
+        from hyper_parallel import init_empty_weights
+        init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
+        with init_ctx:
+            build_from_config = getattr(provider, "build_from_config", provider.build_model)
+            model = build_from_config(config, **kwargs)
+        model = apply_model_infrastructure(
+            model,
+            mesh=distributed_setup.mesh_context,
+            sharding_planner=planner,
+            fsdp2_manager=fsdp,
+            peft_config=peft_config,
+            compile_config=compile_config,
+            is_meta_device=is_meta_device,
+            is_hf_model=True,
+            device=_current_device(),
+            load_base_model=False,
+            validate_placement=validate_placement,
+            distributed_setup=distributed_setup,
+            activation_checkpoint=activation_checkpoint,
+            swap_inputs=swap_inputs,
+            activation_swap=activation_swap,
+            model_init_dtype=model_init_dtype,
+        )
+        model.train()
+        return model

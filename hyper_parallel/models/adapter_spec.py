@@ -121,6 +121,9 @@ class ModelAdapterSpec:
         encoder_parallel: lazy provider returning construction-time visual
             replacement/isolation rules and a factory for a model-bound
             Encoder-DP/Encoder-CP bridge.
+        dit: provider returning a DiT-family construction adapter. Diffusers
+            model classes remain upstream-owned; the adapter only resolves
+            config, checkpoint, and condition-model contracts.
     """
 
     architecture: str
@@ -140,3 +143,4 @@ class ModelAdapterSpec:
     validation: Optional[Callable[..., Any]] = None
     loss: Optional[Callable[..., Any]] = None
     encoder_parallel: Optional[Callable[..., Any]] = None
+    dit: Optional[Callable[..., Any]] = None

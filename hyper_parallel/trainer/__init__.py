@@ -24,6 +24,7 @@ __all__ = [
     "BaseTrainer",
     "TextTrainer",
     "VLMTrainer",
+    "DiTTrainer",
     "TrainerState",
 ]
 
@@ -31,6 +32,7 @@ _LAZY_EXPORTS = {
     "BaseTrainer": "hyper_parallel.trainer.base",
     "TextTrainer": "hyper_parallel.trainer.text_trainer",
     "VLMTrainer": "hyper_parallel.trainer.vlm_trainer",
+    "DiTTrainer": "hyper_parallel.trainer.dit_trainer",
     "TrainerState": "hyper_parallel.trainer.state",
 }
 

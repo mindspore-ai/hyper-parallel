@@ -45,6 +45,8 @@ logger = logging.getLogger(__name__)
 
 SAFE_WEIGHTS_NAME = "model.safetensors"
 SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
+DIFFUSERS_SAFE_WEIGHTS_NAME = "diffusion_pytorch_model.safetensors"
+DIFFUSERS_SAFE_WEIGHTS_INDEX_NAME = "diffusion_pytorch_model.safetensors.index.json"
 _SNAPSHOT_PATTERNS = ("*.safetensors", "*.safetensors.index.json", "engram_host_rows.json")
 
 # Picks the converter a checkpoint key matched by ``source pattern`` belongs to, for the model tensor
@@ -195,15 +197,19 @@ def resolve_checkpoint_index(pretrained_path: str) -> CheckpointIndex:
     if location.is_file():
         return _index_single_file(location)
 
-    index_path = location / SAFE_WEIGHTS_INDEX_NAME
-    if index_path.is_file():
-        return _index_sharded_checkpoint(location, index_path)
+    for index_name in (SAFE_WEIGHTS_INDEX_NAME, DIFFUSERS_SAFE_WEIGHTS_INDEX_NAME):
+        index_path = location / index_name
+        if index_path.is_file():
+            return _index_sharded_checkpoint(location, index_path)
 
-    single_file = location / SAFE_WEIGHTS_NAME
-    if single_file.is_file():
-        return _index_single_file(single_file)
+    for weights_name in (SAFE_WEIGHTS_NAME, DIFFUSERS_SAFE_WEIGHTS_NAME):
+        single_file = location / weights_name
+        if single_file.is_file():
+            return _index_single_file(single_file)
     raise ValueError(
-        "MVP requires model.safetensors or model.safetensors.index.json under "
+        "MVP requires model.safetensors, model.safetensors.index.json, "
+        "diffusion_pytorch_model.safetensors, or "
+        "diffusion_pytorch_model.safetensors.index.json under "
         f"{location}"
     )
 

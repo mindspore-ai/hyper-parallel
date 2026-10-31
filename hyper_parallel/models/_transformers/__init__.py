@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from hyper_parallel.models._transformers.auto_model import (
         HyperAutoModelForCausalLM,
+        HyperAutoModelForDiT,
+        resolve_dit_provider,
         HyperAutoModelForImageTextToText,
         HyperAutoModelForSequenceClassification,
     )
@@ -29,6 +31,8 @@ if TYPE_CHECKING:
 # ``config_resolver``.
 _LAZY_EXPORTS = {
     "HyperAutoModelForCausalLM": ".auto_model",
+    "HyperAutoModelForDiT": ".auto_model",
+    "resolve_dit_provider": ".auto_model",
     "HyperAutoModelForImageTextToText": ".auto_model",
     "HyperAutoModelForSequenceClassification": ".auto_model",
 }
@@ -52,6 +56,8 @@ def __dir__():  # pylint: disable=invalid-name
 
 __all__ = [
     "HyperAutoModelForCausalLM",
+    "HyperAutoModelForDiT",
+    "resolve_dit_provider",
     "HyperAutoModelForImageTextToText",
     "HyperAutoModelForSequenceClassification",
 ]

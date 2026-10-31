@@ -67,10 +67,11 @@ class DataLoaderConfig:
     target: Target[Any]
     collate_fn: Optional[Target[Any]] = None
     get_batch: Optional[Target[Any]] = None
-    sampler_type: Literal["single", "cyclic"] = "single"
+    sampler_type: Literal["single", "cyclic", "distributed"] = "single"
     data_rearrange_map: Any = None
     data_sharding: bool = False
     use_background_prefetcher: bool = False
+    shuffle: bool = True
 
     def build(self, **runtime_kwargs: Any) -> Any:
         """Build the DataLoader target with runtime Dataset arguments."""
@@ -89,4 +90,5 @@ class DataLoaderConfig:
         config["data_rearrange_map"] = _serialize_config_value(self.data_rearrange_map)
         config["data_sharding"] = self.data_sharding
         config["use_background_prefetcher"] = self.use_background_prefetcher
+        config["shuffle"] = self.shuffle
         return config
