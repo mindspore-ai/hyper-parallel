@@ -51,7 +51,7 @@ from hyper_parallel.components.modules.gated_delta_net import (
 from hyper_parallel.core.utils import communication
 
 
-_GDN_BACKENDS = frozenset({"eager", "triton"})
+_GDN_BACKENDS = frozenset({"eager", "triton", "ascendc"})
 
 
 def _global_peer_rank(cp_mesh: DeviceMesh, local_rank: int) -> int:
@@ -723,6 +723,7 @@ class _GDNStateP2PTritonFunction(torch.autograd.Function):
 
         if send_handle is not None:
             send_handle.wait()
+        del send_buffer
 
         empty = query.new_empty(0)
         ctx.save_for_backward(
@@ -1019,7 +1020,7 @@ class GatedDeltaNetUlyssesCP(nn.Module):
     def __init__(
         self,
         module: nn.Module,
-        device_mesh: DeviceMesh,
+        device_mesh: Optional[DeviceMesh],
         *,
         backend: str = "eager",
         chunk_size: int = 64,
@@ -1035,13 +1036,13 @@ class GatedDeltaNetUlyssesCP(nn.Module):
             )
         if chunk_size <= 0:
             raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
-        if backend == "triton" and chunk_size != 64:
-            raise NotImplementedError("GDN Triton backend requires chunk_size=64.")
+        if backend in ("triton", "ascendc") and chunk_size != 64:
+            raise NotImplementedError("Fused GDN backends require chunk_size=64.")
         self.gdn_backend = backend
         self.chunk_size = chunk_size
-        self.cp_mesh = _ensure_1d(device_mesh)
-        self.cp_size = self.cp_mesh.size()
-        self.cp_rank = self.cp_mesh.get_local_rank()
+        self.cp_mesh = None if device_mesh is None else _ensure_1d(device_mesh)
+        self.cp_size = 1 if self.cp_mesh is None else self.cp_mesh.size()
+        self.cp_rank = 0 if self.cp_mesh is None else self.cp_mesh.get_local_rank()
         self.seq_dim = 1
         self.head_dim = 2
         self._validate_module()
@@ -1063,8 +1064,6 @@ class GatedDeltaNetUlyssesCP(nn.Module):
                 "Qwen3.5 GDN layer is missing required attributes: "
                 + ", ".join(missing)
             )
-        if self.cp_size <= 1:
-            return
         if self.module.num_k_heads % self.cp_size != 0:
             raise ValueError(
                 f"linear attention num_k_heads ({self.module.num_k_heads}) must be "
@@ -1089,8 +1088,9 @@ class GatedDeltaNetUlyssesCP(nn.Module):
         if convolution.padding != (convolution.kernel_size[0] - 1,) or convolution.padding_mode != "zeros":
             raise ValueError("GDN fused convolution requires causal zero padding.")
 
-
     def _seq_to_head(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.cp_size == 1:
+            return tensor
         return _differentiable_all_to_all_shard(
             tensor,
             self.cp_mesh,
@@ -1099,6 +1099,8 @@ class GatedDeltaNetUlyssesCP(nn.Module):
         )
 
     def _head_to_seq(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.cp_size == 1:
+            return tensor
         return _differentiable_all_to_all_shard(
             tensor,
             self.cp_mesh,
@@ -1195,7 +1197,6 @@ class GatedDeltaNetUlyssesCP(nn.Module):
         )
         return F.silu(conv_out[:, :, :full_seq_len]).transpose(1, 2)
 
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1269,6 +1270,10 @@ class GatedDeltaNetUlyssesCP(nn.Module):
             query = query.repeat_interleave(kv_groups, dim=2)
             key = key.repeat_interleave(kv_groups, dim=2)
 
+        cu_seqlens = None
+        if exchanged_info is not None:
+            cu_seqlens = (exchanged_info.local_offsets if self.gdn_backend == "ascendc" else
+                          exchanged_info.materialize(query.device, self.chunk_size).cu_seqlens)
         core_attn_out, _ = chunk_gated_delta_rule(
             query,
             key,
@@ -1280,9 +1285,7 @@ class GatedDeltaNetUlyssesCP(nn.Module):
             chunk_size=self.chunk_size,
             use_qk_l2norm_in_kernel=True,
             backend=self.gdn_backend,
-            cu_seqlens=(
-                None if exchanged_info is None else exchanged_info.materialize(query.device, self.chunk_size).cu_seqlens
-            ),
+            cu_seqlens=cu_seqlens,
         )
 
         core_attn_out = self._head_to_seq(core_attn_out)
@@ -1310,6 +1313,8 @@ class GatedDeltaNetP2PCP(nn.Module):
         super().__init__()
         self.module = module
         backend = backend.lower()
+        if backend == "ascendc":
+            raise NotImplementedError("GDN Ascend C state P2P is not supported; select the pure Ulysses wrapper.")
         if backend not in _GDN_BACKENDS:
             raise ValueError(
                 f"unsupported GDN backend {backend!r}; "

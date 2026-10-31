@@ -58,3 +58,15 @@ def test_kda_ag_hybrid_npu(worker: str, case: str, workers: int) -> None:
         if find_spec(package) is None:
             pytest.skip(f"KDA {worker} NPU test requires the optional package {package!r}")
     torchrun_case(str(Path(__file__).with_name(f"_test_kda_ag_{worker}.py")), case, num_proc=workers)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_kda_ascendc_ulysses_npu() -> None:
+    """Feature: Ascend C KDA Ulysses with dense and packed inputs.
+
+    Description: Compare native core gradients and packed layer checkpoint replay.
+    Expectation: Distributed results and independent invocation lifetimes are preserved.
+    """
+    torchrun_case(str(Path(__file__).with_name("_test_kda_ascendc.py")),
+                  "test_kda_ascendc_ulysses", num_proc=2)

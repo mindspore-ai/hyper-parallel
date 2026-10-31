@@ -54,11 +54,11 @@ plan_overrides:
 CP 总大小由训练的并行配置决定。`state_cp_method` 只选择状态 CP 方式，完整方案还需结合
 `ulysses_degree` 和 `allgather_group_size` 判断；例如 `state_cp_method: p2p` 配合 `ulysses_degree: 2`
 表示 Ulysses + P2P。统一入口内部固定使用 64-token chunk，不暴露 `chunk_size` 配置；
-`eager` 和 `triton` 均采用这一大小。
+各后端均采用这一大小。
 
 | 参数 | 默认值 | 含义与约束 |
 |------|--------|------------|
-| `backend` | `triton` | 本地 KDA 后端。AG 和分组 AG 需要 `triton`；已有 P2P/Ulysses 支持 `eager`。 |
+| `backend` | `triton` | 本地 KDA 后端。AG 和分组 AG 需要 `triton`；P2P/Ulysses 支持 `eager`；纯 Ulysses 另支持 `ascendc`。 |
 | `state_cp_method` | `p2p` | 状态 CP 方式，可选 `p2p`、`allgather`、`grouped_allgather_p2p`。 |
 | `ulysses_degree` | `1` | U；正整数，必须整除 CP 大小，且 query/key head 数和 value head 数都必须能被 U 整除。 |
 | `allgather_group_size` | `1` | g；每个组内 AllGather 包含的状态 rank 数，必须整除 R。仅用于 `grouped_allgather_p2p`；纯 `allgather` 自动收集整个 R 组，此项保持1。 |
@@ -124,3 +124,33 @@ S/G 配对参照的是 Ascend 本地 h/dhu，FLA 通用 CP 摘要的舍入组织
 
 纯 P2P 且初态为零时，第一个状态 rank 不生成或保存没有后续读者的 M；AG 和分组 AG 仍为每个 rank
 保存本地 M。状态缓存按调用独立持有，以支持多个在途 forward、逆序 backward 与 checkpoint 重算。
+
+## Ascend C Ulysses 后端
+
+纯 Ulysses 可选择 `backend: ascendc`，同时使用 fla-npu 的本地注意力与 ShortConv。
+依赖与公开算子接口见 [functional 说明](../../hyper_parallel/components/functional/README.md#linear-attention-backends)。
+
+```yaml
+plan_overrides:
+  - match: "*.self_attn.forward"
+    when: cp
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel.kimi_delta_attention_cp_wrapper
+        ulysses_degree: 8
+        state_cp_method: p2p
+        backend: ascendc
+```
+
+`ulysses_degree` 等于 CP mesh 大小时，状态通信域大小为 1，仅进行 Ulysses AllToAll。
+Ascend C 后端当前支持本地完整序列的训练，不开放状态 P2P、AG 或 RD。
+
+输入保持原始 Q/K、gate 与 beta logits，Q/K norm、gate 与 beta 的前向由 Prepare 处理。
+反向使用保存的归一化中间量；原生接口支持融合 beta 反向时直接接入，否则使用 FLA 的对应辅助算子，
+不会重复应用 sigmoid 的链式法则。前反向使用 save 模式，不暴露算子内部重计算选项。
+
+TND 调用传入全局文档 offsets，Ulysses 交换后按完整文档边界执行本地算子。
+文档末尾不要求对齐 chunk；同一公开 native 接口负责文档尾块。
+各调用独立保存中间量，支持多次前向在途及 checkpoint replay。
+初态、终态及其梯度、double backward 暂未开放，缺失能力会明确报错。

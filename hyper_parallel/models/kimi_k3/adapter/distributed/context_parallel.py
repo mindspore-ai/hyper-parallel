@@ -113,7 +113,7 @@ def kimi_delta_attention_ulysses_cp_wrapper(
         tp_mesh: Tensor-parallel mesh; simultaneous TP/CP is unsupported.
         cp_mesh: Chronologically ordered context-parallel mesh.
         ep_mesh: Expert-parallel context, unused by KDA.
-        backend: Local KDA implementation: eager or triton.
+        backend: Local KDA implementation: eager, triton or ascendc.
         chunk_size: Tokens per local recurrence chunk.
     """
     del mesh, ep_mesh
@@ -146,7 +146,7 @@ def kimi_delta_attention_p2p_cp_wrapper(
         tp_mesh: Tensor-parallel mesh; simultaneous TP/CP is unsupported.
         cp_mesh: Chronologically ordered context-parallel mesh.
         ep_mesh: Expert-parallel context, unused by KDA.
-        backend: Local KDA implementation: eager or triton.
+        backend: Local KDA implementation: eager, triton or ascendc.
         chunk_size: Tokens per local recurrence chunk.
     """
     del mesh, ep_mesh
@@ -175,7 +175,7 @@ def kimi_delta_attention_cp_wrapper(
 ) -> _ForwardRewriteRequest:
     """Install KDA state CP, optionally combined with Ulysses and group-local AG.
 
-    This unified entry uses 64-token local chunks for both backends.
+    This unified entry uses 64-token local chunks for all backends.
 
     Args:
         target_module: Training-time KDA layer, retaining its parameter ownership.
@@ -183,7 +183,7 @@ def kimi_delta_attention_cp_wrapper(
         tp_mesh: Simultaneous TP and CP is currently unsupported.
         cp_mesh: Chronological CP mesh, retaining its root for hybrid splitting.
         ep_mesh: Unused expert-parallel context.
-        backend: Local backend; gathers require triton.
+        backend: Local backend; gathers require triton and ascendc requires pure Ulysses.
         state_cp_method: State CP method: p2p, allgather, or grouped_allgather_p2p.
         ulysses_degree: Consecutive ranks exchanging token/head shards.
         allgather_group_size: AG width along state CP, only for grouped_allgather_p2p.

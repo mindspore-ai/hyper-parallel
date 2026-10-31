@@ -212,7 +212,8 @@ def qwen3_5_gdn_packed_local_wrapper(
         raise NotImplementedError("Packed local GDN with TP is not qualified.")
     if getattr(target_module, "_hp_gdn_cp_config", None) is not None:
         raise RuntimeError("A GDN execution wrapper is already installed.")
-    executor = GatedDeltaNetP2PCP(target_module, None, backend=backend, chunk_size=chunk_size)
+    executor_class = GatedDeltaNetUlyssesCP if backend.lower() == "ascendc" else GatedDeltaNetP2PCP
+    executor = executor_class(target_module, None, backend=backend, chunk_size=chunk_size)
     original_forward = target_module.forward
 
     @wraps(original_forward)

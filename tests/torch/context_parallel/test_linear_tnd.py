@@ -33,3 +33,10 @@ def test_linear_tnd_npu(workers, monkeypatch):
     """Feature: TND CP. Description: Kernels, protocols and replay. Expectation: Finite, isolated, identical replay."""
     monkeypatch.setenv("HCCL_DETERMINISTIC", "true")
     torchrun_case(str(Path(__file__).with_name("_test_linear_tnd.py")), "test_linear_tnd_npu", num_proc=workers)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_gdn_ascendc_npu(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Feature: Native GDN. Description: Dense/TND Ulysses and replay. Expectation: Exact core and reset parity."""
+    monkeypatch.setenv("HCCL_DETERMINISTIC", "true")
+    torchrun_case(str(Path(__file__).with_name("_test_gdn_ascendc.py")), "test_gdn_ascendc_ulysses", num_proc=4)
