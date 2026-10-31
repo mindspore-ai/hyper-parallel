@@ -24,6 +24,7 @@ Trainer step runtime); ``FSDP2Manager`` / ``_instantiate_fsdp2`` and the
 
 from __future__ import annotations
 
+import fnmatch
 import logging
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
@@ -52,6 +53,43 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_custom_params(
+    model: ModuleClass,
+    custom_params: Mapping[str, Mapping[str, Any]],
+    dtype_by_name: Mapping[Any, Any],
+) -> dict[ParameterClass, dict[str, Any]]:
+    """Resolve ``custom_params`` keys to Parameter-keyed dtype overrides.
+
+    A key is an exact root-relative parameter name or an ``fnmatch.fnmatchcase`` pattern over those
+    names, as the plan_overrides ``match`` patterns.
+
+    Args:
+        model: Root module whose ``named_parameters`` define the names, before any FSDP wrapping.
+        custom_params: Parameter names or patterns mapped to YAML dtype overrides.
+        dtype_by_name: YAML dtype string to dtype mapping.
+
+    Returns:
+        Every matched Parameter mapped to its resolved dtype overrides.
+
+    Raises:
+        ValueError: If a key matches no parameter, or one Parameter gets different overrides.
+    """
+    parameters_by_fqn = dict(model.named_parameters(remove_duplicate=False))
+    resolved = {}
+    for key, custom_dtypes in custom_params.items():
+        fqns = [key] if key in parameters_by_fqn else [
+            fqn for fqn in parameters_by_fqn if fnmatch.fnmatchcase(fqn, key)]
+        if not fqns:
+            raise ValueError(f"mix_precision.custom_params matches no parameter: {key}")
+        resolved_dtypes = {name: dtype_by_name[dtype] for name, dtype in custom_dtypes.items()}
+        for fqn in fqns:
+            parameter = parameters_by_fqn[fqn]
+            if parameter in resolved and resolved[parameter] != resolved_dtypes:
+                raise ValueError(f"mix_precision.custom_params has conflicting overrides for {fqn}")
+            resolved[parameter] = resolved_dtypes
+    return resolved
 
 
 @dataclass(frozen=True)
@@ -181,17 +219,10 @@ class FSDP2Manager:
             "float16": torch.float16,
             "float32": torch.float32,
         }
-        custom_params = {}
-        if mix_precision.custom_params:
-            parameters_by_fqn = dict(model.named_parameters(remove_duplicate=False))
-            for parameter_fqn, custom_dtypes in mix_precision.custom_params.items():
-                parameter = parameters_by_fqn.get(parameter_fqn)
-                if parameter is None:
-                    raise ValueError(f"mix_precision.custom_params contains unknown parameter FQN: {parameter_fqn}")
-                resolved_dtypes = {name: dtype_by_name[dtype] for name, dtype in custom_dtypes.items()}
-                if parameter in custom_params and custom_params[parameter] != resolved_dtypes:
-                    raise ValueError(f"mix_precision.custom_params has conflicting overrides for {parameter_fqn}")
-                custom_params[parameter] = resolved_dtypes
+        custom_params = (
+            _resolve_custom_params(model, mix_precision.custom_params, dtype_by_name)
+            if mix_precision.custom_params else {}
+        )
         return fully_shard_utils.MixedPrecisionPolicy(
             param_dtype=dtype_by_name[mix_precision.param_dtype],
             reduce_dtype=dtype_by_name[mix_precision.reduce_dtype],

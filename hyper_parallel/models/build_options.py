@@ -160,10 +160,12 @@ class FSDP2MixedPrecisionConfig:
     the core ``MixedPrecisionPolicy`` then falls back to framework
     defaults. Dtype strings are resolved to Torch dtypes when the FSDP2 manager
     builds the core policy. ``custom_params`` maps exact root-relative parameter
-    names to ``param_dtype`` and/or ``reduce_dtype`` overrides. Missing fields
+    names, or ``fnmatch`` patterns over them (``'*norm.weight'``), to
+    ``param_dtype`` and/or ``reduce_dtype`` overrides. Missing fields
     inherit the policy; explicit None uses the stored compute dtype or the
     gradient's reduction dtype instead of the corresponding policy field.
-    Names are resolved to Parameter objects before any FSDP unit is wrapped.
+    Names are resolved to Parameter objects before any FSDP unit is wrapped;
+    every key must match a parameter, and keys matching one parameter must agree.
     """
 
     param_dtype: Optional[Literal["bfloat16", "float16", "float32"]] = None
@@ -184,7 +186,7 @@ class FSDP2MixedPrecisionConfig:
             raise ValueError("mix_precision.custom_params must map parameter names to dtype dictionaries")
         for parameter_name, custom_dtypes in self.custom_params.items():
             if not isinstance(parameter_name, str) or not parameter_name:
-                raise ValueError("mix_precision.custom_params keys must be non-empty parameter names")
+                raise ValueError("mix_precision.custom_params keys must be non-empty parameter names or patterns")
             if not isinstance(custom_dtypes, Mapping):
                 raise ValueError("mix_precision.custom_params values must be dtype dictionaries")
             if custom_dtypes.keys() - {"param_dtype", "reduce_dtype"}:

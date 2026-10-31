@@ -132,7 +132,8 @@ fsdp_config:
             self.assertTrue(state.mp_policy.apply_grad_on_fp32_main_grad)
             expected_dtype = torch.bfloat16 if module is model.layers[1] else torch.float32
             self.assertEqual(state.hsdp_params[0].all_gather_inputs[0].dtype, expected_dtype)
-            self.assertEqual(state.hsdp_params[0].reduce_comm_dtype(torch.ones(4, dtype=expected_dtype)), expected_dtype)
+            self.assertEqual(state.hsdp_params[0].reduce_comm_dtype(torch.ones(4, dtype=expected_dtype)),
+                             expected_dtype)
         self.assertTrue(all(parameter_ref() is None for parameter_ref in parameter_refs))
         self.assertIsInstance(root_state.mp_policy.custom_params, WeakIdKeyDictionary)
         self.assertEqual(len(root_state.mp_policy.custom_params), 0)
@@ -151,7 +152,7 @@ fsdp_config:
         ))
         manager = FSDP2Manager(config, MeshContext())
 
-        with self.assertRaisesRegex(ValueError, "unknown parameter FQN: layers.9.weight"):
+        with self.assertRaisesRegex(ValueError, "matches no parameter: layers.9.weight"):
             manager.parallelize(model)
 
         self.assertIs(model.layers[0].weight, weight)
@@ -217,6 +218,39 @@ fsdp_config:
         self.assertEqual(policy.custom_params[model.weight], {"param_dtype": torch.float32})
         precision.custom_params["tied_weight"] = {"param_dtype": "float16"}
         with self.assertRaisesRegex(ValueError, "conflicting overrides for tied_weight"):
+            manager._build_mixed_precision_policy(model)  # pylint: disable=protected-access
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_patterns_select_parameters_by_name(self) -> None:
+        """Feature: Pattern keys in custom precision overrides.
+        Description: Resolve an fnmatch key beside an exact name, an overlapping equal key, a conflicting key
+            and a key matching nothing.
+        Expectation: The pattern overrides every matching parameter and only those; equal overlaps coalesce;
+            a conflicting overlap or an unmatched pattern raises ValueError.
+        """
+        model = _DecoderModel()
+        precision = FSDP2MixedPrecisionConfig(custom_params={
+            "layers.*.weight": {"param_dtype": "float32"},
+            "layers.1.weight": {"param_dtype": "float32"},
+            "head.bias": {"reduce_dtype": "float32"},
+        })
+        manager = FSDP2Manager(FSDP2Config(mix_precision=precision), MeshContext())
+
+        policy = manager._build_mixed_precision_policy(model)  # pylint: disable=protected-access
+
+        overridden = {name: policy.custom_params[parameter] for name, parameter in model.named_parameters()
+                      if parameter in policy.custom_params}
+        self.assertEqual(overridden, {
+            "layers.0.weight": {"param_dtype": torch.float32},
+            "layers.1.weight": {"param_dtype": torch.float32},
+            "head.bias": {"reduce_dtype": torch.float32},
+        }, f"resolved overrides: {overridden}")
+        precision.custom_params["layers.1.weight"] = {"param_dtype": "float16"}
+        with self.assertRaisesRegex(ValueError, "conflicting overrides for layers.1.weight"):
+            manager._build_mixed_precision_policy(model)  # pylint: disable=protected-access
+        precision.custom_params = {"*.gate.weight": {"param_dtype": "float32"}}
+        with self.assertRaisesRegex(ValueError, r"matches no parameter: \*\.gate\.weight"):
             manager._build_mixed_precision_policy(model)  # pylint: disable=protected-access
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
