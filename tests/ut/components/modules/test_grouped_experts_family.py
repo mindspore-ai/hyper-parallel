@@ -78,9 +78,14 @@ class TestGroupedExpertsFamily(unittest.TestCase):
         Description: Parallel compute is not silently enabled by local low-precision selection.
         Expectation: Unsupported contexts fail with the module FQN during replacement.
         """
-        for context in ({"ep": True}, {"ep_size": 2}, {"tp": True}, {"cp": True}, {"pp": True}):
-            with self.subTest(context=context), self.assertRaisesRegex(NotImplementedError, "mlp.experts"):
-                replace_experts(TinyMoE(), family_config(use_mxfp8=True), context=context)
+        for fused in (False, True):
+            for axis in ("tp", "cp", "pp"):
+                for ep in (False, True):
+                    context = {axis: True, "ep": ep}
+                    with self.subTest(fused=fused, context=context):
+                        with self.assertRaisesRegex(NotImplementedError, "mlp.experts"):
+                            replace_experts(TinyMoE(), family_config(
+                                use_mxfp8=True, use_fused_mxfp8=fused), context=context)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_meta_and_canonical_weights(self) -> None:
