@@ -603,6 +603,49 @@ class TestEnvironMeterCallback(unittest.TestCase):
         card_mark="onecard",
         essential_mark="essential",
     )
+    def test_tflops_metric_ignores_empty_input_geometry(
+            self,
+            mock_time: Mock,
+            mock_world_size: Mock,
+            mock_device_type: Mock,
+    ) -> None:
+        """Treat a batch with no tokens as having no geometry to charge.
+
+        Feature: Optional per-device TFLOP/s metrics.
+        Description: Stream a micro-batch whose ``input_ids`` has an empty row.
+        Expectation: Nothing is charged, so the step publishes no FLOPs metric.
+        """
+        del mock_time, mock_world_size, mock_device_type
+        trainer = self._build_trainer()
+        trainer.config = SimpleNamespace(training=SimpleNamespace(log_tflops=True))
+        trainer.model_config = self._build_tflops_model_config()
+        callback = EnvironMeterCallback(trainer)
+        state = TrainerState(global_step=1, epoch=0)
+
+        callback.on_step_begin(state)
+        callback.on_micro_step_begin(state, {"input_ids": torch.ones(0, 4)})
+        callback.on_step_end(state, loss=1.0, loss_dict=None, grad_norm=0.5)
+
+        self.assertIsNone(
+            callback._batch_input_geometry({"input_ids": torch.ones(0, 4)}),
+            "an empty input must not produce geometry",
+        )
+        metrics = trainer.step_env_metrics
+        self.assertNotIn(
+            "performance/tflops_per_device",
+            metrics,
+            f"a token-free step must not report FLOPs, got keys={sorted(metrics)}",
+        )
+
+    @patch.object(environ_meter_module, "get_device_type", return_value="cpu")
+    @patch.object(environ_meter_module, "get_world_size_safe", return_value=1)
+    @patch.object(environ_meter_module.time, "perf_counter", side_effect=(10.0, 12.0))
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="essential",
+    )
     def test_tflops_metric_requires_tokens(
             self,
             mock_time: Mock,
