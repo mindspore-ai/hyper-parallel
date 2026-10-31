@@ -88,6 +88,7 @@ def _new_param():
     hsdp_param.reduce_partial_output = None
     hsdp_param.mesh_info = object.__new__(HSDPMeshInfo)
     hsdp_param.mesh_info.shard_process_group = None
+    hsdp_param.all_gather_process_group = None
     hsdp_param.mesh_info.replicate_process_group = None
     hsdp_param.sharded_state = ShardedState.SHARDED
     return hsdp_param
@@ -123,6 +124,74 @@ def _new_materialized_single_shard_param(model_dtype=torch.bfloat16):
 
 class TestTorchHSDPParamHelpers(unittest.TestCase):
     """Cover parameter helper behavior without constructing real device meshes."""
+
+    @patch("hyper_parallel.core.fully_shard.hsdp_param.dist.all_gather_into_tensor")
+    def test_borrowed_all_gather_input_reuses_latest_shard(self, collective):
+        """共享输入逐层写最新分片；例如更新后[11,12]不能仍发出旧[1,2]。"""
+        parameter = _new_param()
+        parameter.param_dtype = torch.bfloat16
+        parameter.all_gather_process_group = "test-group"
+        storage = torch.empty(4, dtype=torch.bfloat16)
+        borrowed = storage[:2]
+        address = storage.data_ptr()
+
+        def gather(output, source, **_kwargs):
+            """模拟两份分片；例如本地[1,2]得到[1,2,1,2]。"""
+            output.copy_(source.repeat(2))
+            return MagicMock()
+
+        collective.side_effect = gather
+        for offset in (0, 10):
+            parameter._sharded_param_data.copy_(torch.tensor([1.0, 2.0]) + offset)
+            parameter.unshard(async_op=True, input_buffer=borrowed)
+            torch.testing.assert_close(parameter.unsharded_param_buffers[0],
+                                       (torch.tensor([1.0, 2.0]).repeat(2) + offset).bfloat16())
+            self.assertEqual(collective.call_args.args[1].data_ptr(), address)
+            parameter.allgather_comm_ctx.allgather_handle.wait()
+            parameter.allgather_comm_ctx.allgather_handle = None
+            parameter.free_unsharded_param()
+            self.assertEqual(storage.untyped_storage().nbytes(), 8)
+        self.assertEqual(collective.call_count, 2)
+
+    def test_borrowed_all_gather_input_rejects_invalid_storage(self):
+        """不能借用错误dtype或shape；例如两个BF16元素不能由FP32池冒充。"""
+        parameter = _new_param()
+        parameter.param_dtype = torch.bfloat16
+        for buffer in [torch.empty(2), torch.empty(3, dtype=torch.bfloat16),
+                       torch.empty(4, dtype=torch.bfloat16)[::2]]:
+            with self.assertRaisesRegex(ValueError, "借用的 AG 输入"):
+                parameter.copy_all_gather_input(buffer)
+
+    def test_borrowed_all_gather_input_rejects_no_collective_alias(self):
+        """无AG时不能让参数接管借用池；例如单卡reshard不可清零外部共享storage。"""
+        for world_size, group in [(1, "group"), (2, None)]:
+            parameter = _new_param()
+            parameter.param_dtype = torch.bfloat16
+            parameter.shard_world_size = world_size
+            parameter.all_gather_process_group = group
+            buffer = torch.empty(2, dtype=torch.bfloat16)
+            with self.assertRaisesRegex(ValueError, "实际执行 all-gather"):
+                parameter.unshard(input_buffer=buffer)
+            self.assertEqual(buffer.untyped_storage().nbytes(), 4)
+            self.assertEqual(parameter.unsharded_param_buffers, [])
+
+
+
+    @patch("hyper_parallel.core.fully_shard.hsdp_param.dist.reduce_scatter_tensor")
+    @patch("hyper_parallel.core.fully_shard.hsdp_param.dist.all_gather_into_tensor")
+    def test_independent_ag_route_preserves_original_rs_group(self, mock_all_gather, mock_reduce_scatter):
+        """非融合AG使用独立通道，RS保持原组；例如两个矩阵可分别发AG而不改梯度归属。"""
+        param = _new_param()
+        param.param_dtype = None
+        param.mesh_info.shard_process_group = "original-rs"
+        param.all_gather_process_group = "prefetch-ag"
+
+        param._get_unsharded_param_data(async_op=True)
+        param._unsharded_param.grad = torch.ones(4)
+        param.reduce_scatter_grad(async_op=True)
+
+        self.assertEqual(mock_all_gather.call_args.kwargs["group"], "prefetch-ag")
+        self.assertEqual(mock_reduce_scatter.call_args.kwargs["group"], "original-rs")
 
     def test_reduce_comm_dtype_prefers_parameter_policy_and_falls_back_to_grad(self):
         """Effective reduction dtype should be resolved entirely by the parameter."""

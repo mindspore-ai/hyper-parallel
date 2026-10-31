@@ -313,7 +313,12 @@ class DeepseekV41TopKRouter(nn.Module):
                     self.bias_vl.unsqueeze(0),
                     self.bias.unsqueeze(0),
                 )
-        indices = torch.topk(scores + correction_bias, self.top_k, dim=-1, sorted=False).indices
+        # 可选选择器只固定离散路由；例如MoonEP重算复用原ID，下面仍从新scores可微取权重。
+        selector = getattr(self, "route_indices_selector", None)
+        if selector is None:
+            indices = torch.topk(scores + correction_bias, self.top_k, dim=-1, sorted=False).indices
+        else:
+            indices = selector(self, scores + correction_bias, self.top_k, sorted=False)
         weights = scores.gather(1, indices)
         if self.top_k > 1:
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1.0e-20)

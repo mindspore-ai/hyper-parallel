@@ -71,11 +71,11 @@ _EQUAL_A2A_RAW = os.environ.get("HP_EP_EQUAL_A2A", "0")
 # ``dist.all_to_all`` with per-peer tensors, which HCCL serves through
 # alltoallv; ``HP_EP_A2A_SINGLE=1`` issues the identical exchange as one
 # ``all_to_all_single`` with split sizes, the form the micro benchmark
-# measures at ~2x the bandwidth (106.4 vs 52.9 GB/s). Default off.  Scope: this
-# only affects THIS synchronous entry; the training MoE path calls
-# ``ep_all_to_all_async``, whose ``_AsyncA2ALazyBwd`` already issues the split-sized
-# ``all_to_all_single``, so the knob is a no-op there (measured: neutral).
-_A2A_SINGLE = os.environ.get("HP_EP_A2A_SINGLE", "0") == "1"
+# measures at ~2x the bandwidth (106.4 vs 52.9 GB/s). The synchronous MoonEP
+# token path also benefits from this form in the 16-card training benchmark.
+# Other training EP paths call ``ep_all_to_all_async``, which already issues
+# split-sized ``all_to_all_single``. Keep the list form as an explicit fallback.
+_A2A_SINGLE = os.environ.get("HP_EP_A2A_SINGLE", "1") == "1"
 
 # Lazily created, then reused for every lazy exchange (see
 # :func:`_lazy_a2a_resources`): the stream the split-free collective is issued

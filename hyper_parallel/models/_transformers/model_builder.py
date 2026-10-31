@@ -73,6 +73,7 @@ from hyper_parallel.models.external_state import (
     get_model_external_state,
 )
 from hyper_parallel.models.replacement import _apply_module_replacement_actions, apply_method_replacements
+from hyper_parallel.distributed.expert_parallel.moonep.runtime import configure_moonep, has_moonep
 
 logger = logging.getLogger(__name__)
 
@@ -819,6 +820,11 @@ def apply_model_infrastructure(
     apply_model_init_dtype(model, model_init_dtype)
     if external is not None:
         external.check_identities()
+
+    if has_moonep(model):
+        if compile_for_execution:
+            raise ValueError("MoonEP生命周期首版需要eager执行以保持通信与租约次序")
+        configure_moonep(model)
 
     # Step 13: compile only the execution model, after FSDP and loading.
     if compile_for_execution:
