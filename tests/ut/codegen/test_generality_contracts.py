@@ -28,6 +28,7 @@ from hyper_parallel.codegen.session import CodegenBuildSession
 from hyper_parallel.models._transformers import auto_model
 from hyper_parallel.trainer.config import (
     PlanOverride,
+    ReplaceAction,
     Target,
     entries_to_module_replacements,
     entries_to_plan_overrides,
@@ -135,8 +136,11 @@ class TestStrategyReplacementMatrix(unittest.TestCase):
             ),
             PlanOverride(
                 match=["model.layers.0.mlp", "model.layers.1.mlp"],
-                module_type="tests.ut.codegen.helpers.SourceMLP",
-                replace_module=replacement,
+                replace=ReplaceAction(
+                    kind="module",
+                    implementation=replacement,
+                    source_type="tests.ut.codegen.helpers.SourceMLP",
+                ),
             ),
         ]
 
@@ -171,8 +175,11 @@ class TestStrategyReplacementMatrix(unittest.TestCase):
             PlanOverride(match="moe", when="ep", params={"weight": {"ep": "replicate"}}),
             PlanOverride(
                 match="mlp",
-                module_type="tests.ut.codegen.helpers.SourceMLP",
-                replace_module=replacement,
+                replace=ReplaceAction(
+                    kind="module",
+                    implementation=replacement,
+                    source_type="tests.ut.codegen.helpers.SourceMLP",
+                ),
             ),
         ]
 

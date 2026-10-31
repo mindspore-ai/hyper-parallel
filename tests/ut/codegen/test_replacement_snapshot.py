@@ -27,7 +27,12 @@ from hyper_parallel.models.replacement import (
     compile_module_replacements,
     module_replacement,
 )
-from hyper_parallel.trainer.config import PlanOverride, Target, entries_to_module_replacements
+from hyper_parallel.trainer.config import (
+    PlanOverride,
+    ReplaceAction,
+    Target,
+    entries_to_module_replacements,
+)
 
 
 class _SourceBlock(nn.Module):
@@ -154,9 +159,12 @@ def test_yaml_replacement_preserves_declaration_order_and_static_arguments():
         PlanOverride(match="ignored", params={}),
         PlanOverride(
             match="block",
-            module_type=f"{_SourceBlock.__module__}.{_SourceBlock.__qualname__}",
-            exact_type=True,
-            replace_module=target,
+            replace=ReplaceAction(
+                kind="module",
+                implementation=target,
+                source_type=f"{_SourceBlock.__module__}.{_SourceBlock.__qualname__}",
+                exact_type=True,
+            ),
         ),
     ]
 
