@@ -12,4 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Model-owned packed linear-attention runtime inputs."""
+"""Kimi K3 image/text pretraining data adapters."""
+
+from hyper_parallel.models.kimi_k3.adapter.data.collate import KimiK3Collator, build_kimi_k3_collate_fn
+from hyper_parallel.models.kimi_k3.adapter.data.runtime import (
+    KimiK3PackedRuntime,
+    KimiK3RuntimeInputAdapter,
+    build_kimi_k3_runtime_input_adapter,
+)
+from hyper_parallel.models.kimi_k3.adapter.data.transform_fn import (
+    KimiK3OmniTransform,
+    build_kimi_k3_omni_transform,
+    expand_media_tokens,
+)
+
+__all__ = [
+    "KimiK3Collator",
+    "KimiK3PackedRuntime",
+    "KimiK3OmniTransform",
+    "KimiK3RuntimeInputAdapter",
+    "build_kimi_k3_collate_fn",
+    "build_kimi_k3_omni_transform",
+    "build_kimi_k3_runtime_input_adapter",
+    "expand_media_tokens",
+]

@@ -279,6 +279,19 @@ class MLAAttention(nn.Module):
             value_states,
         )
 
+    def project_output(self, attention_output: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project local attention output; model adapters may apply their output gate.
+
+        Args:
+            attention_output: Flattened local-token attention output.
+            hidden_states: Original local-token input, available to gated variants.
+
+        Returns:
+            Projected local hidden states.
+        """
+        del hidden_states
+        return self.o_proj(attention_output)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -321,5 +334,5 @@ class MLAAttention(nn.Module):
             **kwargs,
         )
         attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
+        attn_output = self.project_output(attn_output, hidden_states)
         return attn_output, attn_weights

@@ -1,0 +1,21 @@
+# Local module gates only. This is not a full distributed precision matrix.
+schema_version: 2
+model:
+  adapter: kimi_linear
+  id_or_path: /local/k3-validation-config
+  builder:
+    _target_: hyper_parallel.models.kimi_k3.adapter.validation.model_builder.build_validation_model
+    config_path: /local/k3-validation-config/config.json
+    dtype: float32
+    device: cpu
+    seed: 0
+reference:
+  source_path: /local/Kimi-K3-source
+  revision: f831ab66814297da540d832a5235f8e904f29d06
+acceptance:
+  parameters:
+    module_parity:
+      max_abs: 1.0e-5
+      rtol: 1.0e-5
+      relative_l2: 1.0e-5
+output_dir: /local/k3-module-evidence

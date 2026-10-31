@@ -380,6 +380,35 @@ def _inverse_unit_lower_triangular(strict_lower: torch.Tensor) -> torch.Tensor:
     return torch.stack(rows, dim=-2)
 
 
+def _evaluate_kda_chunks(query, key, gate, w, u, state, causal, scale):
+    """Propagate the reference chunk recurrence without changing its operation order."""
+    output_chunks = []
+    for chunk_idx in range(query.shape[2]):
+        query_i = query[:, :, chunk_idx]
+        key_i = key[:, :, chunk_idx]
+        gate_i = gate[:, :, chunk_idx]
+        w_i = w[:, :, chunk_idx]
+        u_i = u[:, :, chunk_idx]
+
+        relative_gate = gate_i.unsqueeze(-2) - gate_i.unsqueeze(-3)
+        qk = torch.einsum(
+            "bhik,bhjk,bhijk->bhij",
+            query_i,
+            key_i,
+            relative_gate.masked_fill(~causal.unsqueeze(-1), 0).exp(),
+        ).masked_fill(~causal, 0)
+        value_new = u_i - w_i @ state
+        output_inter = (query_i * gate_i.exp()) @ state
+        output_chunks.append(output_inter * scale + qk @ value_new * scale)
+
+        last_gate = gate_i[:, :, -1]
+        key_decay = key_i * (last_gate.unsqueeze(-2) - gate_i).exp()
+        state = state * last_gate.exp().unsqueeze(-1)
+        state = state + key_decay.transpose(-1, -2) @ value_new
+
+    return torch.stack(output_chunks, dim=2), state
+
+
 def torch_chunk_kda(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -404,6 +433,27 @@ def torch_chunk_kda(
     This implementation is algebraically independent from
     :func:`torch_recurrent_kda`; comparing the two catches errors in the
     chunk transform that a second token loop would hide.
+
+    Args:
+        query: Query tensor in BTHK layout, or THK with packed offsets.
+        key: Key tensor matching the query head dimensions.
+        value: Value tensor with the configured value heads.
+        gate: Per-channel decay logits or activated log-decays.
+        beta: Per-head beta logits or activated update weights.
+        a_log: Optional learned log decay rates.
+        dt_bias: Optional learned gate bias.
+        scale: Query scaling; defaults to the inverse square root of the key width.
+        initial_state: Optional entry state for the local sequence.
+        output_final_state: Return the exit state when the selected backend supports it.
+        use_qk_l2norm_in_kernel: Normalize Q/K inside this operation when True.
+        use_gate_in_kernel: Activate gate logits using a_log and dt_bias when True.
+        use_beta_sigmoid_in_kernel: Apply sigmoid to beta logits when True.
+        lower_bound: Optional lower bound for the activated gate.
+        chunk_size: Tokens per recurrent chunk.
+        cu_seqlens: Optional cumulative packed document offsets, including zero.
+
+    Returns:
+        Token outputs and an optional final recurrent state.
     """
     if cu_seqlens is not None:
         return packed_reference(
@@ -467,7 +517,7 @@ def torch_chunk_kda(
         "...ik,...jk,...ijk->...ij",
         key,
         key,
-        gate_pair.exp(),
+        gate_pair.masked_fill(~strict_causal.unsqueeze(-1), 0).exp(),
     )
     strict_lower = (
         key_pair * beta.unsqueeze(-1)
@@ -484,31 +534,7 @@ def torch_chunk_kda(
         k_head_dim,
         initial_state,
     )
-    output_chunks = []
-    for chunk_idx in range(num_chunks):
-        query_i = query[:, :, chunk_idx]
-        key_i = key[:, :, chunk_idx]
-        gate_i = gate[:, :, chunk_idx]
-        w_i = w[:, :, chunk_idx]
-        u_i = u[:, :, chunk_idx]
-
-        relative_gate = gate_i.unsqueeze(-2) - gate_i.unsqueeze(-3)
-        qk = torch.einsum(
-            "bhik,bhjk,bhijk->bhij",
-            query_i,
-            key_i,
-            relative_gate.exp(),
-        ).masked_fill(~causal, 0)
-        value_new = u_i - w_i @ state
-        output_inter = (query_i * gate_i.exp()) @ state
-        output_chunks.append(output_inter * scale + qk @ value_new * scale)
-
-        last_gate = gate_i[:, :, -1]
-        key_decay = key_i * (last_gate.unsqueeze(-2) - gate_i).exp()
-        state = state * last_gate.exp().unsqueeze(-1)
-        state = state + key_decay.transpose(-1, -2) @ value_new
-
-    output = torch.stack(output_chunks, dim=2)
+    output, state = _evaluate_kda_chunks(query, key, gate, w, u, state, causal, scale)
     output = output.permute(0, 2, 3, 1, 4).reshape(
         batch_size,
         num_chunks * chunk_size,
@@ -519,16 +545,16 @@ def torch_chunk_kda(
     return output, state if output_final_state else None
 
 
-def _validate_triton_state_contract(initial_state, output_final_state, qk_norm, gate, beta) -> None:
+def _validate_triton_state_contract(initial_state, output_final_state, gate, beta) -> None:
     """Keep raw-input dispatch separate from the stateful CP backend contract."""
     if initial_state is not None or output_final_state:
         raise NotImplementedError(
             "KDA backend='triton' currently supports zero initial state without "
             "returning a final state; stateful execution is owned by the CP backend."
         )
-    if not (qk_norm and gate and beta):
+    if not (gate and beta):
         raise NotImplementedError(
-            "KDA backend='triton' requires fused Q/K normalization, gate activation, "
+            "KDA backend='triton' requires fused gate activation, "
             "and beta sigmoid."
         )
 
@@ -553,7 +579,30 @@ def chunk_kda(
     backend: str = "eager",
     cu_seqlens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Dispatch KDA to an explicitly selected eager or Triton backend."""
+    """Dispatch KDA to an explicitly selected eager or Triton backend.
+
+    Args:
+        query: Query tensor in BTHK layout, or THK with packed offsets.
+        key: Key tensor matching the query head dimensions.
+        value: Value tensor with the configured value heads.
+        gate: Per-channel decay logits or activated log-decays.
+        beta: Per-head beta logits or activated update weights.
+        a_log: Optional learned log decay rates.
+        dt_bias: Optional learned gate bias.
+        scale: Query scaling; defaults to the inverse square root of the key width.
+        initial_state: Optional entry state for the local sequence.
+        output_final_state: Return the exit state when the selected backend supports it.
+        use_qk_l2norm_in_kernel: Normalize Q/K inside this operation when True.
+        use_gate_in_kernel: Activate gate logits using a_log and dt_bias when True.
+        use_beta_sigmoid_in_kernel: Apply sigmoid to beta logits when True.
+        lower_bound: Optional lower bound for the activated gate.
+        chunk_size: Tokens per recurrent chunk.
+        backend: Explicit eager or Triton backend selection.
+        cu_seqlens: Optional cumulative packed document offsets, including zero.
+
+    Returns:
+        Token outputs and an optional final recurrent state.
+    """
     if query.ndim == 3:
         output, final = chunk_kda(
             *(tensor.unsqueeze(0) for tensor in (query, key, value, gate, beta)),
@@ -587,7 +636,7 @@ def chunk_kda(
             chunk_size=chunk_size,
             cu_seqlens=cu_seqlens,
         )
-    _validate_triton_state_contract(initial_state, output_final_state, use_qk_l2norm_in_kernel,
+    _validate_triton_state_contract(initial_state, output_final_state,
                                    use_gate_in_kernel, use_beta_sigmoid_in_kernel)
     triton_a_log = a_log.float() if a_log is not None else None
     triton_dt_bias = dt_bias.float() if dt_bias is not None else None
@@ -625,6 +674,7 @@ def chunk_kda(
         chunk_size=chunk_size,
         safe_gate=True,
         cu_seqlens=cu_seqlens,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
     return output, None
 
@@ -682,6 +732,24 @@ def torch_kda_state_summary(
     ``[B, HV, K, K]``. Query is accepted to share KDA input preprocessing and
     grouped-value validation; the state transition itself is independent of
     query and output scale.
+
+    Args:
+        query: Query tensor in BTHK layout, or THK with packed offsets.
+        key: Key tensor matching the query head dimensions.
+        value: Value tensor with the configured value heads.
+        gate: Per-channel decay logits or activated log-decays.
+        beta: Per-head beta logits or activated update weights.
+        a_log: Optional learned log decay rates.
+        dt_bias: Optional learned gate bias.
+        scale: Query scaling; defaults to the inverse square root of the key width.
+        use_qk_l2norm_in_kernel: Normalize Q/K inside this operation when True.
+        use_gate_in_kernel: Activate gate logits using a_log and dt_bias when True.
+        use_beta_sigmoid_in_kernel: Apply sigmoid to beta logits when True.
+        lower_bound: Optional lower bound for the activated gate.
+        chunk_size: Tokens per recurrent chunk.
+
+    Returns:
+        Affine state output and transition tensors.
     """
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
@@ -718,7 +786,7 @@ def torch_kda_state_summary(
         "...ik,...jk,...ijk->...ij",
         key,
         key,
-        gate_pair.exp(),
+        gate_pair.masked_fill(~strict_causal.unsqueeze(-1), 0).exp(),
     )
     strict_lower = (key_pair * beta.unsqueeze(-1)).masked_fill(
         ~strict_causal,

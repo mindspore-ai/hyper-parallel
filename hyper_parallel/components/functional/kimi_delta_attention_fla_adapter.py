@@ -259,8 +259,36 @@ def run_fla_chunk_kda(
     chunk_size: int = 64,
     safe_gate: bool = True,
     cu_seqlens: Optional[torch.Tensor] = None,
+    use_qk_l2norm_in_kernel: bool = True,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Run FLA's public KDA API with the validated Kimi K3 fused contract."""
+    """Run FLA's public KDA API with the validated Kimi K3 fused contract.
+
+    Args:
+        query: Queries with shape ``[B, T, H_k, D_k]``.
+        key: Keys with the same shape as ``query``.
+        value: Values with shape ``[B, T, H_v, D_v]``.
+        gate: Raw decay logits with shape ``[B, T, H_v, D_k]``; gate activation
+            is always delegated to the fused runtime.
+        beta: Raw update logits with shape ``[B, T, H_v]``; the runtime applies sigmoid.
+        a_log: Logarithmic gate scales containing one value per value head.
+        dt_bias: Gate biases containing ``H_v * D_k`` values.
+        scale: Output attention scale; None uses ``D_k ** -0.5``.
+        initial_state: Optional incoming state ``[N, H_v, D_k, D_v]``, where N
+            is the batch size or the number of packed sequences.
+        output_final_state: Whether to request the runtime's final state.
+        lower_bound: Negative lower bound supplied to the gate activation.
+        chunk_size: Chunk width forwarded to the runtime; the validated K3 path uses 64.
+        safe_gate: Enable the runtime's bounded safe-gate mode using ``lower_bound``.
+        cu_seqlens: Optional cumulative offsets ``[N + 1]`` for packed sequences
+            in a batch-one flattened token stream.
+        use_qk_l2norm_in_kernel: Normalize Q/K in the runtime when True; otherwise
+            the caller owns normalization.
+
+    Returns:
+        The runtime's attention output ``[B, T, H_v, D_v]`` and optional final
+        state ``[N, H_v, D_k, D_v]``. This adapter forwards state options without
+        adding state-gradient support to the selected native backend.
+    """
     runtime = _require_fla_kda_runtime()
     return runtime.chunk_kda(
         q=query,
@@ -273,7 +301,7 @@ def run_fla_chunk_kda(
         scale=scale,
         initial_state=initial_state,
         output_final_state=output_final_state,
-        use_qk_l2norm_in_kernel=True,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         use_gate_in_kernel=True,
         use_beta_sigmoid_in_kernel=True,
         safe_gate=safe_gate,

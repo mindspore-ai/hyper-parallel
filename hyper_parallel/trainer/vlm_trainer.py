@@ -47,6 +47,7 @@ class VLMTrainer:
         """Build the VLM Trainer in the same explicit order as VeOmni."""
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.config = config
+        self._prepared_step_token_counts = None
 
         self.base._setup()
         memory_profiler.reset(
@@ -246,8 +247,10 @@ class VLMTrainer:
             Loss tensor and named loss tensors for this FB step.
         """
         model_inputs, loss_inputs = self.base.get_batch(data_iterator)
-        self.base.current_token_counts = count_loss_token(loss_inputs)
-        self.base.step_token_counts = {
+        count_inputs = {**loss_inputs, "labels_are_shifted": model_inputs.get("labels_are_shifted", False)}
+        self.base.current_token_counts = count_loss_token(count_inputs)
+        prepared_counts = getattr(self, "_prepared_step_token_counts", None)
+        self.base.step_token_counts = prepared_counts if prepared_counts is not None else {
             name: token_count * num_micro_steps
             for name, token_count in self.base.current_token_counts.items()
         }
@@ -272,6 +275,11 @@ class VLMTrainer:
         self.base.model_integration.begin_step(self.base.state.global_step + 1)
         synchronize()
 
+        self._prepared_step_token_counts = None
+        if getattr(self.base.get_batch, "prefetch_step_on_cpu", False) is True:
+            data_iterator, self._prepared_step_token_counts = self.base.get_batch.prepare_step(
+                data_iterator, num_micro_steps, count_loss_token,
+            )
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
 
