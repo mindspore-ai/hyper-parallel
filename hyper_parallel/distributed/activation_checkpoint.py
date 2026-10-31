@@ -81,6 +81,8 @@ _SELECTIVE_AC_MATMUL_OPS = _existing_ops(
     _resolve_torch_op("aten.linear"),
     _resolve_torch_op("aten._grouped_mm"),
     _resolve_torch_op("aten._scaled_grouped_mm"),
+    _resolve_torch_op("npu.npu_grouped_matmul"),
+    _resolve_torch_op("npu.npu_grouped_matmul.List"),
 )
 
 # Some model implementations mutate these operator outputs in-place. Keeping
@@ -127,6 +129,7 @@ _SELECTIVE_AC_COMPUTE_OP_NAMES = (
     "aten._scaled_dot_product_flash_attention_for_cpu",
     "aten._scaled_dot_product_fused_attention_overrideable",
     "aten.scaled_dot_product_attention",
+    "npu.npu_fusion_attention",
     "npu.npu_fusion_attention_v3",
     "aten._flex_attention",
     "aten.topk",
