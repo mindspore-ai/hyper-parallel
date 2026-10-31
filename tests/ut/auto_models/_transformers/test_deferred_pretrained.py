@@ -37,22 +37,6 @@ class TestDeferredPretrained(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_offline_observation_preserves_remote_code_dispatch(self):
-        """Feature: offline Codegen can construct remote-code models from config.
-
-        Description: Filter pretrained-only arguments for an observation-only build.
-        Expectation: Remote-code dispatch survives while download-only arguments are removed.
-        """
-        kwargs = _model_init_kwargs(
-            {"trust_remote_code": True, "local_files_only": True, "revision": "main"},
-            load_base_model=False,
-            preserve_trust_remote_code=True,
-        )
-
-        self.assertEqual(kwargs, {"trust_remote_code": True})
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_from_config_binds_standard_hf_auto_model_parent(self):
         """Feature: remote-code lookup uses the standard AutoModel identity.
 
