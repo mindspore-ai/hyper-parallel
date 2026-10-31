@@ -14,10 +14,15 @@
 # ============================================================================
 """Multi-Token-Prediction auxiliary loss objective."""
 
-__all__ = ["calculate_mtp_loss"]
+__all__ = ["calculate_mtp_loss", "deepseek_v3_mtp_loss"]
+
+import math
+from collections.abc import Sequence
+from typing import Literal
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 def calculate_mtp_loss(  # pylint: disable=unused-argument
@@ -51,3 +56,57 @@ def calculate_mtp_loss(  # pylint: disable=unused-argument
         )
         total_mtp_loss = total_mtp_loss + depth_loss
     return total_mtp_loss
+
+
+def deepseek_v3_mtp_loss(
+    per_depth_logits: Sequence[torch.Tensor],
+    next_token_labels: torch.Tensor,
+    *,
+    loss_factor: float = 0.3,
+    normalization: Literal["sequence", "valid_tokens"] = "sequence",
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    """Compute loss_factor / D times the sum of per-depth cross-entropies.
+
+    Args:
+        per_depth_logits: Full-vocabulary logits, depth k shaped [B, S-k, V].
+        next_token_labels: ALREADY shifted main-LM targets [B, S]. If input_ids
+            are [t0, t1, t2, t3], these labels are [t1, t2, t3, t4]; if t4 is
+            unavailable, use ignore_index. Depth 1 scores [t2, t3, t4].
+        loss_factor: Nonnegative finite weight for the MTP objective.
+        normalization: 'sequence' divides each depth's loss sum by B*S, matching
+            the original-T denominator in DeepSeek-V3 paper Eq. 24. 'valid_tokens'
+            divides by each depth's unmasked target count. The choice changes
+            gradient scaling and is explicit; neither is a claim about unpublished
+            DeepSeek training code. Empty valid-target sets contribute zero.
+        ignore_index: Label excluded from cross-entropy.
+
+    Returns:
+        Scalar FP32 weighted MTP loss, connected to every depth's logits.
+
+    Note:
+        No DP/CP/global accumulation normalization or vocabulary-sharded CE is
+        performed here. Distributed adapters own those reductions. The existing
+        calculate_mtp_loss API is intentionally unchanged.
+    """
+    if not per_depth_logits:
+        raise ValueError("per_depth_logits must contain at least one prediction depth")
+    if next_token_labels.ndim != 2 or next_token_labels.numel() == 0:
+        raise ValueError("next_token_labels must be nonempty [B, S]")
+    if next_token_labels.dtype != torch.long:
+        raise ValueError("next_token_labels must have dtype torch.long")
+    if normalization not in ("sequence", "valid_tokens"):
+        raise ValueError("normalization must be 'sequence' or 'valid_tokens'")
+    if not math.isfinite(loss_factor) or loss_factor < 0:
+        raise ValueError("loss_factor must be finite and nonnegative")
+    total = torch.zeros((), device=next_token_labels.device, dtype=torch.float32)
+    for depth, logits in enumerate(per_depth_logits, start=1):
+        targets = next_token_labels[:, depth:]
+        if targets.shape[1] == 0 or logits.ndim != 3 or logits.shape[:2] != targets.shape:
+            raise ValueError("Depth k logits must have shape [B, S-k, V] for next_token_labels [B, S]")
+        loss_sum = F.cross_entropy(logits.float().reshape(-1, logits.shape[-1]), targets.reshape(-1),
+                                   ignore_index=ignore_index, reduction="sum")
+        denominator = (next_token_labels.numel() if normalization == "sequence"
+                       else (targets != ignore_index).sum().clamp_min(1))
+        total = total + loss_sum / denominator
+    return total * (loss_factor / len(per_depth_logits))

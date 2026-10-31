@@ -22,7 +22,7 @@ from hyper_parallel.components.losses.chunked_cross_entropy import (
 )
 from hyper_parallel.components.losses.masked_ce import MaskedCrossEntropy
 from hyper_parallel.components.losses.model_output import ModelOutputLoss
-from hyper_parallel.components.losses.mtp import calculate_mtp_loss
+from hyper_parallel.components.losses.mtp import calculate_mtp_loss, deepseek_v3_mtp_loss
 
 # FusedLinearCrossEntropy — optional, requires cut_cross_entropy
 try:
@@ -39,4 +39,5 @@ __all__ = [
     "calculate_loss",
     "chunked_cross_entropy",
     "calculate_mtp_loss",
+    "deepseek_v3_mtp_loss",
 ]
