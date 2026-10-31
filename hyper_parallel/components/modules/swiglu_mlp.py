@@ -31,7 +31,7 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
 
 from hyper_parallel.components.checkpoint import ConcatenateWithSections
 from hyper_parallel.models.replacement import module_replacement
-from hyper_parallel.components.functional import swiglu
+from hyper_parallel.components.functional.swiglu import swiglu
 
 
 @module_replacement

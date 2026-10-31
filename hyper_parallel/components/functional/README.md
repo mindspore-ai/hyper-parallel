@@ -1,7 +1,8 @@
 # High-performance functions
 
 `hyper_parallel.components.functional` provides reusable high-performance functions for Ascend NPU. CPU and GPU fallback implementations
-are not included.
+are not included, except for `mhc_pre` and `mhc_post`, which run the same computation with PyTorch operators when the
+input is not on NPU or `omni_training_custom_ops` is not installed.
 
 ```python
 from hyper_parallel.components.functional import rms_norm

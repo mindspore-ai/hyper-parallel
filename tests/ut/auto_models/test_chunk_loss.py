@@ -82,6 +82,25 @@ class TestChunkedCrossEntropy(unittest.TestCase):
         torch.testing.assert_close(hidden.grad, torch.zeros_like(hidden))
         torch.testing.assert_close(weight.grad, torch.zeros_like(weight))
 
+    def test_low_precision_head_preserves_small_cross_chunk_contributions(self) -> None:
+        """Cancellation must retain a representable small gradient before upstream scaling."""
+        for dtype in (torch.bfloat16, torch.float16):
+            with self.subTest(dtype=dtype):
+                hidden = torch.tensor([[[256.0], [0.015625], [-256.0], [0.0]]], dtype=dtype)
+                hidden = hidden.repeat(4, 1, 1).requires_grad_()
+                weight = torch.zeros(2, 1, dtype=dtype, requires_grad=True)
+                targets = torch.zeros(4, 4, dtype=torch.long)
+
+                loss = chunked_cross_entropy(hidden, targets, weight, chunk_size=1)
+                (loss / (targets.numel() * 128)).backward()
+
+                # Zero logits give probabilities 1/2. Each row sums to 1/64,
+                # so dW is +/- (4 * 1/64 * 1/2) / (16 * 128) = +/- 2**-16.
+                expected = torch.tensor([[-2.0**-16], [2.0**-16]], dtype=dtype)
+                torch.testing.assert_close(weight.grad, expected, rtol=0, atol=0)
+                torch.testing.assert_close(hidden.grad, torch.zeros_like(hidden), rtol=0, atol=0)
+                self.assertEqual(weight.grad.dtype, dtype)
+
     def test_rejects_invalid_core_inputs(self) -> None:
         """Reject invalid chunk size, target shape, and target dtype."""
         hidden = torch.randn(1, 3, 4)

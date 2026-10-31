@@ -5,7 +5,8 @@ recipes, data preparation, launchers, and validation manifests are grouped by
 family:
 
 - `qwen3_moe/`: cropped and full-model Qwen3-MoE text demos;
-- `deepseek_v41/`: DeepSeek-V4.1 text/VLM crops and validation tooling.
+- `deepseek_v41/`: DeepSeek-V4.1 text/VLM crops and validation tooling;
+- `xing40/`: Xing4.0-29B launcher.
 
 ## Qwen3-MoE cropped Hugging Face demos
 
@@ -196,3 +197,39 @@ only after all 16 ranks complete. Use
 [`deepseek_v41_validation.yaml`](deepseek_v41/deepseek_v41_validation.yaml) to
 generate reproducible structure, module-parity, precision, checkpoint, and
 performance evidence for the selected local environment.
+
+## Xing4.0-29B
+
+The recipe [`train.yaml`](../../hyper_parallel/models/xing40/recipes/train.yaml)
+trains Xing4.0-29B, a 40-layer, 64-expert DeepSeek-V3-architecture model with four
+mHC residual streams and one MTP depth, on eight NPUs with FSDP. The model computes
+the LM loss, the MTP loss and the router balance loss itself (`ModelOutputLoss`).
+Its attention, router, experts, MLP and norms are the Transformers DeepSeek-V3
+modules. On NPU the recipe swaps in the framework's modules through `plan_overrides`:
+`MLAAttention` (as `adapter/conversion/module_replacement.py`'s
+`Xing40MLAAttention`, which keeps the MindFormers FP32 RoPE and records
+the logit maxima QK clipping consumes), `GroupedExperts` and `RMSNorm`. The mHC
+modules call the framework's `mhc_pre`/`mhc_post`, the fused AscendC operators of
+the MindFormers production configuration, which need the omni custom operators on
+NPU and run PyTorch operators elsewhere. As in MindFormers, FSDP computes the router, mHC,
+RMSNorm and embedding table parameters in FP32 and the rest in BF16
+(`fsdp_config.mix_precision.custom_params`); the model unconditionally casts the
+embedding lookup output to BF16 before it expands into the mHC residual streams
+(`Xing40Model.embed_inputs`), the one cast MindFormers itself makes here.
+
+```bash
+bash examples/training_demo/xing40/run_train.sh /path/to/text_document
+```
+
+The recipe holds the whole model configuration; `adapter/builder.py` turns it into
+the model's configuration and builds the model with
+`HyperAutoModelForCausalLM.from_config`. The model is randomly initialized unless
+`--checkpoint.restore_from=/path/to/checkpoint` restores a checkpoint, which by
+default also restores the optimizer and training state; add
+`--checkpoint.restore_optimizer=false --checkpoint.restore_train_state=false` to
+restore only weights. Append `--accelerator.ep_size=8` for expert parallelism, and
+`--model.config.num_nextn_predict_layers=0` to train without MTP like the
+MindFormers 29B reference.
+
+For the pinned three-layer single-NPU and four-NPU FSDP/CP/EP/selective-checkpoint recipes, see the
+[Chinese step-by-step reproduction guide](xing40/README.md).
