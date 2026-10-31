@@ -170,7 +170,7 @@ def test_yaml_replacement_preserves_declaration_order_and_static_arguments():
 
     spec = entries_to_module_replacements(entries)[0]
 
-    assert spec.declaration_id == "plan_override:1:replace_module"
+    assert spec.declaration_id == "plan_override:1:replace"
     assert spec.replacement_target == "tests.replace_source_block"
     assert spec.static_arguments == {"mode": "pipelined"}
 
