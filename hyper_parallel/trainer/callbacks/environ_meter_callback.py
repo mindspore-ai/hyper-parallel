@@ -119,6 +119,9 @@ class EnvironMeterCallback(Callback):
         the tokens that reach attention plus ``sum(S ** 2)`` over the real
         attention boundaries.
 
+        Every returned quantity is local to this rank, because
+        :meth:`on_step_end` reduces them over DP+CP itself.
+
         Args:
             batch: One micro-batch mapping.
 
@@ -128,8 +131,14 @@ class EnvironMeterCallback(Callback):
         """
         cu_seq_lens = batch.get("cu_seq_lens")
         if cu_seq_lens is not None and callable(getattr(cu_seq_lens, "diff", None)):
-            if int(getattr(cu_seq_lens, "numel", lambda: 0)()) >= 2:
-                lengths = cu_seq_lens.diff()
+            local_tokens = cls._tensor_numel(batch.get("input_ids"))
+            lengths = cu_seq_lens.diff()
+            covered = int(lengths.sum())
+            # Packed boundaries are only usable when they describe the tokens
+            # this rank actually holds. Under context parallelism the packed
+            # boundaries may still span the global sequence, and then the local
+            # ``input_ids`` fallbacks below are the honest answer.
+            if covered > 0 and (local_tokens is None or covered == local_tokens):
                 return lengths.sum(), (lengths * lengths).sum()
 
         attention_mask = batch.get("attention_mask")

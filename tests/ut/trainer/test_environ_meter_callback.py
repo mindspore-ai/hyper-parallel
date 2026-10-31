@@ -453,6 +453,114 @@ class TestEnvironMeterCallback(unittest.TestCase):
         card_mark="onecard",
         essential_mark="essential",
     )
+    def test_tflops_metric_uses_packed_sequence_boundaries(
+            self,
+            mock_time: Mock,
+            mock_world_size: Mock,
+            mock_device_type: Mock,
+    ) -> None:
+        """Use ``cu_seq_lens`` boundaries when a row packs several sequences.
+
+        Feature: Optional per-device TFLOP/s metrics.
+        Description: Pack two sequences of length 2 and 4 into one length-6 row.
+        Expectation: FLOPs use sum(S)=6 and sum(S**2)=20 instead of 6**2.
+        """
+        del mock_time, mock_world_size, mock_device_type
+        model_config = self._build_tflops_model_config()
+        trainer = self._build_trainer()
+        trainer.config = SimpleNamespace(training=SimpleNamespace(log_tflops=True))
+        trainer.model_config = model_config
+        callback = EnvironMeterCallback(trainer)
+        state = TrainerState(global_step=1, epoch=0)
+
+        callback.on_step_begin(state)
+        callback.on_micro_step_begin(
+            state,
+            {
+                "input_ids": torch.ones(1, 6),
+                "cu_seq_lens": torch.tensor([0, 2, 6], dtype=torch.int32),
+            },
+        )
+        callback.on_step_end(state, loss=1.0, loss_dict=None, grad_norm=0.5)
+
+        expected = estimate_step_flops(model_config, 6.0, 20.0) / 2.0 / 1e12
+        metrics = trainer.step_env_metrics
+        self.assertAlmostEqual(
+            metrics["performance/tflops_per_device"],
+            expected,
+            delta=expected * 1e-9,
+            msg=(
+                "packed rows must charge each segment, "
+                f"got={metrics['performance/tflops_per_device']}, expected={expected}"
+            ),
+        )
+
+    @patch.object(environ_meter_module, "get_device_type", return_value="cpu")
+    @patch.object(environ_meter_module, "get_world_size_safe", return_value=2)
+    @patch.object(environ_meter_module, "all_reduce")
+    @patch.object(environ_meter_module.time, "perf_counter", side_effect=(10.0, 12.0))
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="essential",
+    )
+    def test_tflops_metric_restores_context_parallel_sequence_length(
+            self,
+            mock_time: Mock,
+            mock_all_reduce: Mock,
+            mock_world_size: Mock,
+            mock_device_type: Mock,
+    ) -> None:
+        """Restore ``S ** 2`` after summing sequence squares over DP+CP shards.
+
+        Feature: Optional per-device TFLOP/s metrics.
+        Description: Hold one half of a CP-split length-12 sequence on each rank.
+        Expectation: cp_size=2 turns the per-rank 6**2 into the real 12**2.
+        """
+        del mock_time, mock_world_size, mock_device_type
+        mock_all_reduce.side_effect = lambda value, op, group: float(value) * 2 if op == "sum" else float(value)
+        model_config = self._build_tflops_model_config()
+        mesh = SimpleNamespace(dp_cp_mesh=None, cp_size=2)
+        trainer = self._build_trainer(mesh=mesh)
+        trainer.config = SimpleNamespace(training=SimpleNamespace(log_tflops=True))
+        trainer.model_config = model_config
+        callback = EnvironMeterCallback(trainer)
+        state = TrainerState(global_step=1, epoch=0)
+
+        callback.on_step_begin(state)
+        callback.on_micro_step_begin(
+            state,
+            {
+                "input_ids": torch.ones(1, 6),
+                # Global boundaries that still span both CP shards: the helper
+                # must ignore them and keep the local sequence geometry.
+                "cu_seq_lens": torch.tensor([0, 4, 12], dtype=torch.int32),
+            },
+        )
+        callback.on_step_end(state, loss=1.0, loss_dict=None, grad_norm=0.5)
+
+        expected = estimate_step_flops(model_config, 12.0, 144.0) / 2.0 / 2 / 1e12
+        metrics = trainer.step_env_metrics
+        self.assertAlmostEqual(
+            metrics["performance/tflops_per_device"],
+            expected,
+            delta=expected * 1e-9,
+            msg=(
+                "context parallelism must restore the per-sequence square, "
+                f"got={metrics['performance/tflops_per_device']}, expected={expected}"
+            ),
+        )
+
+    @patch.object(environ_meter_module, "get_device_type", return_value="cpu")
+    @patch.object(environ_meter_module, "get_world_size_safe", return_value=1)
+    @patch.object(environ_meter_module.time, "perf_counter", side_effect=(10.0, 12.0))
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="essential",
+    )
     def test_tflops_metric_skips_unsupported_models(
             self,
             mock_time: Mock,
