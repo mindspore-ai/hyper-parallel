@@ -1,5 +1,16 @@
 # Copyright 2026 Huawei Technologies Co., Ltd
-# Licensed under the Apache License, Version 2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # ============================================================================
 """Locate the real modeling source file for a model id.
 
@@ -408,7 +419,8 @@ def _model_path_of(config: Any) -> str:
 
     Same key order as ``project_source_spec``: most YAMLs and
     ``HyperAutoModel.from_pretrained`` configure the id under
-    ``pretrained_model_name_or_path``, with ``model_name_or_path`` as fallback.
+    ``pretrained_model_name_or_path``, with ``model_name_or_path`` and the
+    cropped/custom-builder ``config_path`` spelling as fallbacks.
     """
     model = getattr(config, "model", None)
     if model is None:
@@ -417,7 +429,10 @@ def _model_path_of(config: Any) -> str:
     if path is None:
         path = getattr(model, "model_name_or_path", None)
     if path is None:
-        path = getattr(model, "_kwargs", {}).get("pretrained_model_name_or_path", "")
+        path = getattr(model, "config_path", None)
+    if path is None:
+        kwargs = getattr(model, "_kwargs", {})
+        path = kwargs.get("pretrained_model_name_or_path") or kwargs.get("config_path", "")
     return path or ""
 
 
@@ -466,9 +481,10 @@ def resolve_remote_siblings(source: ResolvedSource) -> dict[str, str]:
     A trust-remote-code modeling file is compiled as the top-level module of a
     synthetic package (loader.import_generated_module), so its single-dot
     relative imports must resolve against *siblings in the same directory*.
-    ``source.module_name == "<remote>"`` marks exactly this case; for an
-    installed transformers module the source uses absolute imports and this
-    returns empty.
+    ``source.module_name == "<remote>"`` or the Hugging Face dynamic-module
+    namespace ``transformers_modules.*`` marks this case; for an installed
+    transformers module the source uses absolute imports and this returns
+    empty.
 
     Returns ``{basename: absolute_path}`` for every sibling reachable through
     the source's relative-import closure, e.g. a ``configuration_deepseek.py``
@@ -482,7 +498,11 @@ def resolve_remote_siblings(source: ResolvedSource) -> dict[str, str]:
     else:
         module_name = getattr(source, "module_name", None)
         file_path = getattr(source, "file_path", None)
-    if module_name != "<remote>" or not file_path:
+    is_remote = module_name == "<remote>" or (
+        isinstance(module_name, str)
+        and module_name.startswith("transformers_modules.")
+    )
+    if not is_remote or not file_path:
         return {}
     base_dir = os.path.dirname(os.path.abspath(file_path))
     seen: dict[str, str] = {}

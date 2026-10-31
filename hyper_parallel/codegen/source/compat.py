@@ -58,6 +58,31 @@ _FALLBACK = (
 )
 
 
+def install_output_recorder_compat() -> None:
+    """Restore the lightweight remote-source descriptor removed in v5.
+
+    Some Moonshot modeling sources declare optional recorded outputs at class
+    definition time. Newer Transformers releases no longer export the small
+    descriptor they import, although ordinary training does not consume that
+    metadata. Recreate its data-only contract so the source remains importable.
+    """
+    # Transformers is optional until codegen resolves or imports an HF source.
+    from transformers.utils import generic  # pylint: disable=import-outside-toplevel
+
+    if hasattr(generic, "OutputRecorder"):
+        return
+
+    class OutputRecorder:  # pylint: disable=too-few-public-methods
+        """Compatibility descriptor for legacy remote modeling sources."""
+
+        def __init__(self, target_class: type, index: int = 0) -> None:
+            """Record the output class and tuple index expected by the source."""
+            self.target_class = target_class
+            self.index = index
+
+    generic.OutputRecorder = OutputRecorder
+
+
 @dataclass
 class _Stmt:
     """One ``from`` import statement, resolved to byte spans and symbol names."""

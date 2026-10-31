@@ -1,0 +1,86 @@
+# codegen combination-test case: qwen3_moe tp=1 cp=1 ep=8 pp=1
+model:
+  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /home/lxy/probe_ckpts/qwen3_moe
+  torch_dtype: bfloat16
+  attn_implementation: eager
+  force_hf: false
+
+training:
+  train_iters: 1
+  global_batch_size: 1
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  seed: 42
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 8
+  pp_size: 1
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: "off"
+
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    lr: 1.0e-5
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr: 1.0e-5
+    lr_warmup_steps: 1
+    min_lr: 0.0
+
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ""
+  restore_from: null
+
+plan_overrides:
+  - match:
+      - "*.input_layernorm"
+      - "*.post_attention_layernorm"
+      - "model.norm"
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm
+      implementation:
+        _target_: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_rms_norm
+  - match: "*.self_attn"
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention
+      implementation:
+        _target_: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_flash_attention
+  - match: "*.mlp.experts"
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts
+      implementation:
+        _target_: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_grouped_experts
+  - match: "*.self_attn.forward"
+    when: cp
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel.qwen3_moe_flash_attention_cp_wrapper
+  - match: "*.mlp.forward"
+    when: ep
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn
+        use_grouped_gemm: true

@@ -49,8 +49,8 @@ stay valid when combined with the body replacement), and the public
   the instance-bound compiled plan (``self._hp_boundary``, bound once by
   ``hp_install_boundaries``), with a declarative comment block annotating
   what each side's transitions lower to.
-- ``region`` (EP MoE local region): redistribute in,
-  ``__hp_compute__`` (bound by ``hp_parallelize``), re-wrap locals per
+- ``region`` (EP MoE local region): redistribute in, call the explicit
+  factory-named attribute materialized by source emission, re-wrap locals per
   ``out_src``, redistribute out.
 
 A CP inner-wrapper boundary is ``generic`` in the generated code: the wrapper
@@ -92,6 +92,7 @@ from hyper_parallel.codegen.plan.boundary_forms import (
     is_boundary_entry,
 )
 from hyper_parallel.codegen.plan.freeze import parse_placement
+from hyper_parallel.codegen.emit.patches import local_compute_binding_name
 
 #: Injection keys that describe how a boundary's compute is regioned.
 _INJECTION_KEYS = ("inner_wrapper", "inner_target", "inner_out_src", "local_compute_fn")
@@ -121,6 +122,8 @@ def lower_forward_boundaries(
     / ``_hp_tp`` instance attributes that ``hp_install_boundaries`` binds
     at runtime — no per-boundary global constant is emitted.
     """
+    if _plan_field(frozen_plan, "snapshot_status") == "not_required":
+        raise ValueError("codegen emit: not_required snapshot has no parallel boundaries")
     edits: list[TextEdit] = []
     needs_runtime_helper_import = False
     for class_name, form, emitted, func, injection, deferred_bias in iter_emitted_forms(
@@ -183,7 +186,8 @@ def lower_forward_boundaries(
 #: this constant) must stay in sync — see ``_render_local_compute`` and
 #: ``_render_output_redistribute``.
 _RUNTIME_HELPER_IMPORT = (
-    "from hyper_parallel.codegen.runtime import hp_to_local_if_dtensor"
+    "from hyper_parallel.codegen.generated_support import "
+    "to_local_if_dtensor as hp_to_local_if_dtensor"
 )
 
 
@@ -250,7 +254,9 @@ def iter_emitted_forms(
     index = build_source_index(source_text)
     param_plan = _plan_field(frozen_plan, "param_plan") or {}
     injections = _plan_field(frozen_plan, "injections") or []
-    injection_by_class = _index_injections_by_class(injections, boundary_classes, index)
+    injection_by_class = _index_injections_by_class(
+        injections, boundary_classes, index, param_plan
+    )
     mesh_dim_names = tuple(_plan_field(frozen_plan, "mesh_dim_names") or ())
 
     groups = _group_boundaries_by_class(
@@ -509,6 +515,7 @@ def _index_injections_by_class(
     injections: list[dict[str, Any]],
     boundary_classes: Optional[dict[str, str]],
     index: SourceIndex,
+    param_plan: Optional[dict[str, Any]] = None,
 ) -> dict[str, dict[str, Any]]:
     """Fold a class's injection declarations (inner wrapper / local compute).
 
@@ -521,6 +528,9 @@ def _index_injections_by_class(
     for rule in injections:
         match = rule.get("match")
         if not isinstance(match, str) or not match:
+            continue
+        entry = (param_plan or {}).get(match) or {}
+        if entry.get("skip_source_lowering"):
             continue
         class_name = _class_for_fqn(match, boundary_classes, index, "")
         if class_name is None:
@@ -895,8 +905,8 @@ def _build_forward_body(
     form after the static gates).  The redistribute calls go through the
     instance-bound compiled plan (``self._hp_boundary``, installed by
     ``hp_install_boundaries``); the static ``tp_collective`` form calls bare
-    operators on ``self._hp_tp`` instead; ``__hp_compute__`` is bound by
-    ``hp_bind_compute`` for the local-region shape. Either way the class
+    operators on ``self._hp_tp`` instead; the factory-named compute attribute
+    is bound by ``hp_bind_compute`` for the local-region shape. Either way the class
     stays runtime-importable without a mesh.
 
     ``deferred_bias`` (D-22) appends the exit hook call
@@ -912,7 +922,11 @@ def _build_forward_body(
 
     local = injection.get("local_compute_fn") if injection else None
     if local is not None:
-        return _render_local_compute(local, input_redist, out_redist, form)
+        raise RuntimeError(
+            "codegen: local_compute_fn reached source boundary lowering; "
+            "builder recording must mark it skip_source_lowering so runtime "
+            "can install the trainer's native Phase C wrapper"
+        )
     # A generic boundary (including an inner-wrapper one — the CP wrapper is
     # installed at runtime by ``hp_apply_inner_wrapper`` and weaves into
     # this forward) redistributes through the compiled plan, annotated with
@@ -1148,8 +1162,8 @@ def _render_local_compute(
 ) -> str:
     """Local-region boundary (shape 2, EP MoE): compute fn on local tensors, then exit.
 
-    ``__hp_compute__`` is ``functools.partial(compute_fn, module)`` bound by
-    ``hp_parallelize``. The applier calls it as ``compute_fn(*args,
+    The factory-named attribute is ``functools.partial(compute_fn, module)``
+    bound by the emitted constructor patch. The applier calls it as ``compute_fn(*args,
     **kwargs)`` (``_wrap_local_region_forward``), so the generated forward
     forwards its own re-distributed ``*args, **kwargs`` through.  The local
     Production keeps the compute output local so the lowered boundary
@@ -1162,6 +1176,7 @@ def _render_local_compute(
     identity in/out region emits no noise.
     """
     compute_name = _callable_name(local)
+    binding_name = local_compute_binding_name(local)
     return "\n".join([
         "        # [HYPER LOCAL REGION] boundary entry",
         *_ordered_notes(form.in_notes),
@@ -1173,8 +1188,8 @@ def _render_local_compute(
         "        }",
         "",
         "        # [HYPER LOCAL REGION] run the region compute fn on local tensors",
-        f"        # {compute_name} is bound to self by hp_parallelize.",
-        "        outputs = self.__hp_compute__(*args, **kwargs)",
+        f"        # {compute_name} is bound to self by generated source.",
+        f"        outputs = self.{binding_name}(*args, **kwargs)",
         "",
         "        # [HYPER LOCAL REGION] boundary exit",
         *_ordered_notes(form.out_notes),
@@ -1187,7 +1202,12 @@ def _render_local_compute(
 def _callable_name(value: Any) -> str:
     """Human name for an injection's callable (dict target / string / fn)."""
     if isinstance(value, dict):
-        return value.get("name") or value.get("target") or repr(value)
+        return (
+            value.get("_target_")
+            or value.get("name")
+            or value.get("target")
+            or repr(value)
+        )
     if isinstance(value, str):
         return value
     return getattr(value, "__name__", repr(value))

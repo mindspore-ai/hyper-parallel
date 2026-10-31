@@ -1,0 +1,63 @@
+model:
+  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /home/lxy/codegen_reval/stage10_all_models_offline/assets/kimi_linear
+  load_base_model: false
+  torch_dtype: bfloat16
+  attn_implementation: eager
+  force_hf: false
+  trust_remote_code: true
+
+training:
+  train_iters: 1
+  global_batch_size: 1
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  seed: 42
+
+accelerator:
+  tp_size: 2
+  cp_size: 2
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+
+fsdp_config:
+  dp_shard_size: 2
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: "off"
+
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    lr: 1.0e-5
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr: 1.0e-5
+    lr_warmup_steps: 1
+    min_lr: 0.0
+
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ""
+  restore_from: null
+
+plan_overrides:
+  - match: "model.layers.*.self_attn.forward"
+    when: cp
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel.kimi_delta_attention_ulysses_cp_wrapper

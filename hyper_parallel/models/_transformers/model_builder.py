@@ -65,14 +65,16 @@ from hyper_parallel.distributed._builder.fsdp_adapter import (
 from hyper_parallel.distributed.mesh import DistributedSetup, MeshContext
 from hyper_parallel.distributed.apply import apply_sharding_plan
 from hyper_parallel.distributed._builder.planner import ShardingPlanner
-from hyper_parallel.codegen.modeling_backend import ModelingBackend
 from hyper_parallel.models.registry import _resolve_custom_model_cls, get_model_adapter
 from hyper_parallel.models.external_state import (
     ExternalBuildContext,
     ExternalLoadContext,
     get_model_external_state,
 )
-from hyper_parallel.models.replacement import _apply_module_replacement_actions, apply_method_replacements
+from hyper_parallel.models.replacement import (
+    _apply_module_replacement_actions,
+    apply_method_replacements,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +152,6 @@ def _init_model(
     is_hf_model: bool,
     *model_args,
     backend=None,
-    codegen_artifact_dir: Optional[str] = None,
     **kwargs,
 ) -> tuple[bool, nn.Module]:
     """Initialize model — dispatching to custom or HF path.
@@ -165,9 +166,7 @@ def _init_model(
         torch_dtype: "auto" / "bfloat16" / etc.
         is_hf_model: True = HF native, False = custom implementation.
         *model_args: Extra positional args for model constructor.
-        backend: Backend selector; only ``ModelingBackend.GEN`` (codegen) is
-            consulted, the native ``is_hf_model`` dispatch handles the rest.
-        codegen_artifact_dir: Artifact directory for the gen backend (codegen).
+        backend: Reserved native backend selector.
         **kwargs: Extra keyword args.
 
     Returns:
@@ -176,25 +175,7 @@ def _init_model(
     architectures = getattr(hf_config, "architectures", []) or []
     arch_name = architectures[0] if architectures else ""
 
-    # codegen sidecar: the gen backend bypasses the HF/custom dispatch
-    # below; the native is_hf_model wiring stays as-is for everything else.
-    if backend is ModelingBackend.GEN:
-        if codegen_artifact_dir is None:
-            raise ValueError(
-                "the gen backend requires codegen_artifact_dir; "
-                "from_pretrained() must prepare it via ensure_codegen_artifact()"
-            )
-        from hyper_parallel.codegen.loader import init_generated_model  # pylint: disable=import-outside-toplevel
-
-        model = init_generated_model(
-            codegen_artifact_dir,
-            pretrained_model_name_or_path,
-            hf_config,
-            *model_args,
-            torch_dtype=torch_dtype,
-            **kwargs,
-        )
-        return False, model
+    del backend
 
     # ── Path A: HF native ──
     if is_hf_model:
@@ -312,57 +293,6 @@ def _plan_and_apply_sharding(
     )
     logger.info("Sharding plan applied; source_shard_info keys=%d", len(source_shard_info or {}))
     return model, source_shard_info
-
-
-def _parallelize_from_generated(
-    model: nn.Module,
-    mesh,
-    codegen_artifact_dir: Optional[str],
-    hf_config=None,
-) -> tuple[bool, Optional[dict]]:
-    """Let a generated artifact own sharding when its metadata says so."""
-    if not codegen_artifact_dir:
-        return False, None
-    if mesh is None:
-        return False, None
-    if not any(
-        getattr(mesh, name, 1) > 1 for name in ("tp_size", "cp_size", "ep_size")
-    ):
-        from hyper_parallel.codegen.runtime import publish_codegen_mesh_context  # pylint: disable=import-outside-toplevel
-
-        publish_codegen_mesh_context(codegen_artifact_dir, mesh)
-        return False, None
-
-    from hyper_parallel.codegen.runtime import (  # pylint: disable=import-outside-toplevel
-        load_codegen_meta,
-        parallelize_from_generated,
-        verify_codegen_signature,
-    )
-
-    meta = load_codegen_meta(codegen_artifact_dir)
-    if meta is None or not (meta.covered or {}).get("sharding_plan"):
-        return False, None
-
-    verify_codegen_signature(meta, hf_config)
-    source_shard_info = parallelize_from_generated(model, mesh, codegen_artifact_dir)
-    logger.info(
-        "codegen: sharding applied by the generated module; source_shard_info keys=%d",
-        len(source_shard_info or {}),
-    )
-    return True, source_shard_info
-
-
-def _module_replacements_covered_by_generated(
-    codegen_artifact_dir: Optional[str],
-) -> bool:
-    """Return whether generated model initialization already applied replacements."""
-    if not codegen_artifact_dir:
-        return False
-
-    from hyper_parallel.codegen.runtime import load_codegen_meta  # pylint: disable=import-outside-toplevel
-
-    meta = load_codegen_meta(codegen_artifact_dir)
-    return meta is not None and bool((meta.covered or {}).get("module_overrides"))
 
 
 def _move_model_to_device(
@@ -668,19 +598,12 @@ def _create_external_state(model: nn.Module, mesh: Optional[MeshContext],
 
 def _maybe_apply_module_replacements(
     model: nn.Module,
-    codegen_artifact_dir: Optional[str],
     distributed_setup: Optional[Any],
     low_precision_config: Optional[Any],
     load_base_model: bool,
     weights_mapping: Any,
 ) -> tuple:
-    """Apply structure-preserving replacements unless codegen already did."""
-    if _module_replacements_covered_by_generated(codegen_artifact_dir):
-        logger.info(
-            "codegen: module overrides already applied by the generated __init__; "
-            "skipping native module replacement"
-        )
-        return model, weights_mapping
+    """Apply native structure-preserving replacements."""
     return _apply_module_replacement_actions(
         model,
         getattr(distributed_setup, "module_replacements", None),
@@ -734,7 +657,6 @@ def apply_model_infrastructure(
     validate_placement: bool = False,
     low_precision_config: Optional[Any] = None,
     model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
-    codegen_artifact_dir: Optional[str] = None,
     **kwargs: Any,
 ) -> nn.Module:
     """Apply sharding, activation wrappers, FSDP2, initialization and compilation.
@@ -755,7 +677,7 @@ def apply_model_infrastructure(
     # Step 5.5: structure-preserving replacement before plan derivation.
     weights_mapping = get_model_conversion_mapping(model)
     model, weights_mapping = _maybe_apply_module_replacements(
-        model, codegen_artifact_dir, distributed_setup, low_precision_config,
+        model, distributed_setup, low_precision_config,
         load_base_model, weights_mapping,
     )
     if is_meta_device:
@@ -773,20 +695,13 @@ def apply_model_infrastructure(
     )
 
     # Steps 7-8: plan and apply parameter/activation layouts.
-    handled, source_shard_info = _parallelize_from_generated(
+    model, source_shard_info = _plan_and_apply_sharding(
         model,
         mesh,
-        codegen_artifact_dir,
-        hf_config=kwargs.get("hf_config"),
+        sharding_planner,
+        is_hf_model,
+        validate_placement,
     )
-    if not handled:
-        model, source_shard_info = _plan_and_apply_sharding(
-            model,
-            mesh,
-            sharding_planner,
-            is_hf_model,
-            validate_placement,
-        )
 
     model = _apply_activation_features(
         model,

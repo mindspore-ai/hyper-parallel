@@ -854,6 +854,11 @@ def resolve_config(raw: object) -> TrainerConfig:
     """
     if not isinstance(raw, Mapping):
         raise ConfigResolutionError("$", "YAML root must be a mapping")
+    if "codegen" in raw:
+        raise ConfigResolutionError(
+            "$.codegen",
+            "the training-side codegen switch was removed; use the codegen CLI to build artifacts",
+        )
 
     root_fields = {field.name: field for field in fields(TrainerConfig)}
     unknown = sorted(set(raw) - set(root_fields))

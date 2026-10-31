@@ -18,23 +18,22 @@ This module replaces per-family ``render_spec.py`` files. Every fact a
 generated artifact needs is derived from the family's *existing runtime
 providers* plus the frozen plan, never from a family-name dispatch table:
 
-* a YAML ``replace.implementation._target_`` names the family's own
+* a YAML ``replace_module._target_`` names the family's own
   ``@module_replacement`` factory; inspecting that factory's source reveals
   which generic component it constructs (``RMSNorm`` / ``GroupedExperts`` /
   ``GQAAttention``) and, for fused attention, the kernel entry it hands over;
-* a YAML ``replace.implementation._target_`` that names a generic component class
+* a YAML ``replace_module._target_`` that names a generic component class
   directly (under ``hyper_parallel.components.``) resolves through that
   component's own wrap-style constructor -- the same declaration the native
   ``_target_replacement_factory`` builds, so no family factory is required;
-* a forward replacement implementation that names a known MoE archetype
-  factory resolves to that archetype's strategy kind / target class / boundary
-  sub-patterns / EP body keys;
-* a CP forward replacement under the ``models/<family>/adapter``
-  convention resolves to the framework CP attention strategy (imports only).
+* a CP ``inner_wrapper`` target under the ``models/<family>/adapter``
+  convention resolves to the framework CP attention strategy — imports
+  and a recognizable inner forward rewrite additionally materializes an
+  in-artifact CP dispatch subclass;
 
 The source class name an artifact must model (``Qwen3MoeRMSNorm``) is not
-duplicated here either: it comes from the matched module's actual type in the
-compiled replacement record. No model-family codegen
+duplicated here either: it is read from the rule's own ``module_type``, which
+the YAML already carries for its type check. No model-family codegen
 declaration remains.
 
 Heavy resolution (importing the real generic component to render a fused
@@ -56,20 +55,15 @@ from hyper_parallel.codegen.inline.recognition import (
     ReplacementArgument,
     ReplacementTarget,
     adapter_path_parts,
-    archetype_for_factory,
     class_name_of,
     family_from_target,
+    inner_wrapper_target,
     replacement_target,
 )
 from hyper_parallel.codegen.inline.spec_bundle import ReplacementSpec, StrategySpec
 
 #: The framework CP attention strategy kind (structure-keyed, not family-named).
 CP_ATTENTION_KIND = "cp_attention"
-
-_EP_IMPORTS = (
-    ImportPatch("hyper_parallel.distributed.expert_parallel.experts", ("moe_ep_forward",)),
-)
-
 
 def _target_path(value: Any) -> str | None:
     """Return the dotted ``_target_`` of a projected override value."""
@@ -134,7 +128,7 @@ def _factory_function(target: str, model_type: str | None):
     return getattr(module, name, None)
 
 
-#: Module replacement implementations under this prefix name a generic component
+#: YAML ``replace_module`` targets under this prefix name a generic component
 #: class directly (``hyper_parallel.components.modules.engram.EngramModule``)
 #: -- the declaration the native path builds through
 #: ``_target_replacement_factory`` as ``Cls(module=..., module_fqn=...,
@@ -305,10 +299,10 @@ def replacement_spec_for(
     *,
     module_type: str | None = None,
 ) -> ReplacementSpec | None:
-    """Resolve a module replacement target to its structural component spec.
+    """Resolve a ``replace_module`` target to its structural component spec.
 
     ``module_type`` is the matched source module's dotted type path from the
-    compiled rule; the source class name (``old_ctor``) is its class name — a
+    YAML rule; the source class name (``old_ctor``) is its class name — a
     property of the matched source module, never a hand-written literal.
     """
     if target is None:
@@ -338,12 +332,13 @@ def _resolve_replacement_spec(
     Whatever component a family's factory constructs, the spec is derived from
     that factory's own source, so a new family (or a new component inside one)
     needs no codegen declaration.  A factory with no constructor call to sink --
-    or a record with no matched ``module_type`` naming the source class -- has
+    or a rule with no ``module_type`` naming the source class it replaces -- has
     no spec, and the rule is left to the native path.
     """
     del model_type, target
-    # The source class comes from the matched meta-model module. Without that
-    # recorded type there is no safe constructor call site to rewrite.
+    # The source class the constructor call replaces: without the rule's
+    # ``module_type`` there is no call site to rewrite, and guessing one would
+    # silently target the wrong class.
     old_ctor = class_name_of(module_type)
     if not old_ctor:
         return None
@@ -389,10 +384,10 @@ def strategy_spec_for(
 ) -> StrategySpec | None:
     """Resolve a strategy target from structure.
 
-    A known MoE archetype factory (EP) resolves to its structural strategy; a
-    CP ``inner_wrapper`` target under the adapter convention resolves to the
-    framework CP attention strategy (imports only). Anything else is
-    unresolvable and yields ``None`` — recognition never guesses a strategy.
+    A CP ``inner_wrapper`` target under the adapter convention resolves to the
+    framework CP attention strategy (imports only). EP mutations come from the
+    builder recorder instead of secondary structural inference. Anything else
+    is unresolvable and yields ``None`` — recognition never guesses a strategy.
     """
     if target is None:
         return None
@@ -408,31 +403,41 @@ def strategy_spec_for(
 def _resolve_strategy_spec(
     target: str, model_type: str | None, inner_wrapper: bool
 ) -> StrategySpec | None:
-    archetype = archetype_for_factory(target)
-    if archetype is not None:
-        return _ep_strategy_spec(archetype)
     if inner_wrapper and adapter_path_parts(target):
-        return StrategySpec(kind=CP_ATTENTION_KIND, imports=())
+        return _cp_strategy_spec(target)
     return None
 
 
-def _ep_strategy_spec(archetype: Any) -> StrategySpec:
-    """Build the EP strategy spec: the inlined forward plus its imports.
+def _cp_strategy_spec(target: str) -> StrategySpec:
+    """Build the CP strategy spec: an in-place dispatch shell plus imports.
 
-    The inlined EP forward orchestrates through the instance-attribute channel
-    (``self.ep_enable`` / ``self._hp_ep_group``) like every other generated
-    forward, so it declares no module-level snippet.
+    A recognizable inner forward rewrite participates in inline CP: the
+    materialization pass derives an
+    in-artifact rewrite of the attention host whose forward falls back to
+    ``_forward_impl`` when CP is disabled and delegates to the helper when
+    active. The helper is the same kernel the runtime CP wrapper delegates
+    to (trainer and codegen share one CP implementation), and the import is
+    derived from the wrapper factory source, so this module never hardcodes a
+    family helper and
+    stays free of torch imports at resolution time.  ``subclass_state_attr``
+    carries the family kernel's companion attribute so the runtime binding
+    satisfies the identical contract the native wrapper installs.
+
+    Families without an inline helper keep the original framework CP
+    strategy (imports only), preserving the runtime wrapper path.
     """
-    from hyper_parallel.codegen.inline.templates import moe_ep_forward_body  # pylint: disable=C0415
+    resolved = inner_wrapper_target(target)
+    if resolved is None:
+        return StrategySpec(kind=CP_ATTENTION_KIND, imports=())
+    from hyper_parallel.codegen.inline.templates import (  # pylint: disable=C0415
+        cp_dispatch_shell_body,
+    )
 
     return StrategySpec(
-        kind=archetype.kind,
-        target_class=archetype.target_class,
-        body_template=moe_ep_forward_body(
-            router_kind=archetype.router_kind, shared=archetype.shared
-        ),
-        imports=_EP_IMPORTS,
-        strip_boundary_subpatterns=archetype.strip_boundary_subpatterns,
+        kind=CP_ATTENTION_KIND,
+        subclass_shell=cp_dispatch_shell_body(resolved.helper_name),
+        subclass_state_attr=resolved.state_attr,
+        imports=(ImportPatch(resolved.helper_module, (resolved.helper_name,)),),
     )
 
 
@@ -442,8 +447,7 @@ def interface_component_class(model_type: str | None) -> str | None:
     Structural: the component is named by the replacement factory itself, so
     codegen carries no fused-attention class literal.  A rendered component
     keeps the component's own ``forward`` and therefore takes a *compiled
-    boundary* (``hp_install_boundaries``) rather than external state — see
-    :func:`external_state_classes_for`.
+    boundary* (``hp_install_boundaries``) rather than inferred external state.
     """
     module = _family_provider(model_type, "replacements")
     if module is None:
@@ -456,37 +460,6 @@ def interface_component_class(model_type: str | None) -> str | None:
         if target is not None and target.interface:
             return target.component
     return None
-
-
-def external_state_classes_for(
-    model_type: str | None,
-    injections: Iterable[Mapping[str, Any]] | None = None,
-) -> tuple[str, ...]:
-    """Classes whose ``forward`` an inline strategy body *replaces*.
-
-    Structure-proven, not declared: every strategy target this plan injects is
-    resolved to its :class:`StrategySpec`, and a spec that carries a
-    ``body_template`` rewrites that class's whole ``forward`` with an inline
-    orchestration body (the MoE EP shell).  Such a class owns its collectives,
-    so it must keep its parameter sharding without a compiled boundary — it is
-    skipped by the boundary / compute / inner-wrapper installers and reads its
-    parallel channel from install-time instance attributes instead.
-
-    A *rendered* component class (the class this family's replacement
-    factories build, e.g. the fused attention) is deliberately NOT one of
-    these: its forward is the component's own plus the emitted boundary form,
-    so the shared compiled-boundary path
-    (``hp_install_boundaries`` / ``hp_apply_inner_wrapper``) owns it.
-    """
-    inlined: set[str] = set()
-    for record in injections or ():
-        spec = strategy_spec_for(
-            _target_path(record.get("local_compute_fn")), model_type
-        )
-        if spec is None or spec.body_template is None or spec.target_class is None:
-            continue
-        inlined.add(spec.target_class)
-    return tuple(sorted(inlined))
 
 
 def declaration_summary(
@@ -503,27 +476,26 @@ def declaration_summary(
     replacement_specs: dict[str, Any] = {}
     strategy_specs: dict[str, Any] = {}
     for entry in overrides or ():
-        action = entry.get("replace") or {}
-        target = _target_path(action.get("implementation"))
-        if target is None:
-            continue
-        if action.get("kind") == "module":
+        replace_target = _target_path(entry.get("replace_module"))
+        if replace_target is not None:
             spec = replacement_spec_for(
-                target, model_type, module_type=action.get("source_type")
+                replace_target, model_type, module_type=entry.get("module_type")
             )
-            replacement_specs[target] = asdict(spec) if spec is not None else None
-        elif action.get("kind") == "method" and entry.get("match", "").endswith(".forward"):
-            spec = strategy_spec_for(target, model_type)
-            if spec is None:
-                spec = strategy_spec_for(target, model_type, inner_wrapper=True)
-            strategy_specs[target] = asdict(spec) if spec is not None else None
+            replacement_specs[replace_target] = asdict(spec) if spec is not None else None
+        local_target = _target_path(entry.get("local_compute_fn"))
+        if local_target is not None:
+            spec = strategy_spec_for(local_target, model_type)
+            strategy_specs[local_target] = asdict(spec) if spec is not None else None
+        inner_target = _target_path(entry.get("inner_wrapper"))
+        if inner_target is not None:
+            spec = strategy_spec_for(inner_target, model_type, inner_wrapper=True)
+            strategy_specs[inner_target] = asdict(spec) if spec is not None else None
     return {"replacement_specs": replacement_specs, "strategy_specs": strategy_specs}
 
 
 __all__ = [
     "CP_ATTENTION_KIND",
     "declaration_summary",
-    "external_state_classes_for",
     "interface_component_class",
     "replacement_spec_for",
     "strategy_spec_for",

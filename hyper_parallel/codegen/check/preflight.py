@@ -28,6 +28,7 @@ import os
 from typing import Any
 
 from hyper_parallel.codegen.hash import sha256_file
+from hyper_parallel.codegen.snapshot import CodegenStatus
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +62,12 @@ def verify_output_hashes(meta: Any, layout: Any) -> None:
         "diff": layout.diff_path,
         "init": layout.init_path,
     }
-    for key in core_paths:
+    required_outputs = (
+        ("init",)
+        if getattr(meta, "snapshot_status", None) == CodegenStatus.NOT_REQUIRED.value
+        else tuple(core_paths)
+    )
+    for key in required_outputs:
         if key not in meta.outputs:
             raise RuntimeError(f"codegen preflight: missing {key} output hash in meta")
 
@@ -98,19 +104,17 @@ def verify_output_hashes(meta: Any, layout: Any) -> None:
             )
 
 
-def verify_generated_import(layout: Any) -> None:
-    """Fail fast when the generated modeling file cannot be imported.
+def verify_generated_source(layout: Any) -> None:
+    """Fail fast when the generated modeling file is not valid Python.
 
-    Importing the generated module is the strongest single check that the
-    bundle is usable: it exercises the module's own imports (runtime, torch,
-    transformers) and top-level class definitions.  The module is cached in
-    ``sys.modules`` by the loader, so preflight and the later build reuse the
-    same import. A minimal placeholder also imports because preflight checks
-    bundle structure, while the emit layer owns lowering completeness.
+    Generated artifacts are audit/export outputs, not a training-time module
+    backend. Preflight therefore validates syntax without importing or
+    registering generated classes in the current process.
     """
-    from hyper_parallel.codegen.loader import import_generated_module
-
-    import_generated_module(layout.artifact_dir)
+    modeling_path = layout.modeling_path
+    with open(modeling_path, "r", encoding="utf-8") as handle:
+        source = handle.read()
+    compile(source, modeling_path, "exec")
 
 
 def verify_meta_required_fields(meta: Any) -> None:
@@ -122,6 +126,63 @@ def verify_meta_required_fields(meta: Any) -> None:
     from hyper_parallel.codegen.meta import validate_meta_schema
 
     validate_meta_schema(meta_to_dict(meta))
+
+
+def verify_snapshot_contract(meta: Any) -> None:
+    """Validate snapshot provenance when an artifact declares it.
+
+    Artifacts must identify both their snapshot schema and terminal status;
+    legacy planner-produced bundles are no longer accepted.
+
+    Args:
+        meta: Loaded codegen metadata.
+
+    Raises:
+        RuntimeError: If snapshot provenance is partial or not derived.
+    """
+    schema_version = getattr(meta, "snapshot_schema_version", None)
+    status = getattr(meta, "snapshot_status", None)
+    if schema_version is None and status is None:
+        raise RuntimeError(
+            "codegen preflight: legacy artifact has no snapshot provenance; "
+            "regenerate it with the native-build CLI"
+        )
+    if schema_version is None or status is None:
+        raise RuntimeError(
+            "codegen preflight: snapshot provenance must include both "
+            "snapshot_schema_version and snapshot_status"
+        )
+    if status == CodegenStatus.NOT_REQUIRED.value:
+        if not getattr(meta, "snapshot_reason", None):
+            raise RuntimeError(
+                "codegen preflight: not_required snapshot is missing its reason"
+            )
+        if (
+            getattr(meta, "param_plan", None)
+            or getattr(meta, "injections", None)
+            or getattr(meta, "plan_application", None)
+            or (getattr(meta, "entrypoints", None) or {}).get("parallelize")
+            or (getattr(meta, "covered", None) or {}).get("sharding_plan")
+        ):
+            raise RuntimeError(
+                "codegen preflight: not_required snapshot contains executable plan data"
+            )
+        return
+    if status == CodegenStatus.FAILED.value:
+        raise RuntimeError(
+            "codegen preflight: snapshot generation failed: "
+            f"{getattr(meta, 'snapshot_failure', None)!r}"
+        )
+    if status != CodegenStatus.DERIVED.value:
+        raise RuntimeError(
+            "codegen preflight: generated artifact requires a derived snapshot, "
+            f"got {status!r}"
+        )
+    if not getattr(meta, "plan_application", None):
+        raise RuntimeError(
+            "codegen preflight: derived snapshot artifact is missing the native "
+            "plan application record"
+        )
 
 
 def warn_skipped_overrides(meta: Any) -> None:
@@ -331,6 +392,12 @@ def verify_param_plan(meta: Any, model: Any) -> None:
     variant) fails fast instead of silently running with a stale sharding
     contract.  Degrades to a warning when ``model`` is not given (preflight
     without a model handle can still check the plan's internal consistency).
+
+    Args:
+        meta: Frozen ``codegen_meta`` handle carrying ``param_plan`` and
+            ``tied_pairs``.
+        model: The instantiated model to validate coverage against; may be
+            ``None`` for plan-internal checks only.
     """
     param_plan = getattr(meta, "param_plan", None) or {}
     if not param_plan:
@@ -365,16 +432,34 @@ def verify_param_plan(meta: Any, model: Any) -> None:
 
     # Every trainable model parameter must be covered by an explicit plan
     # entry (exact FQN or a leaf under a grouped key).
+    tied = _expand_tied_param_names(meta)
     uncovered = [
         fqn
         for fqn in _iter_trainable_params(model)
         if not any(fqn == key or fqn.startswith(f"{key}.") for key in planned)
+        and fqn not in tied
     ]
     if uncovered:
         raise RuntimeError(
             f"codegen preflight: {len(uncovered)} trainable parameters are "
             f"not covered by the frozen plan: {uncovered[:20]}"
         )
+
+
+def _expand_tied_param_names(meta: Any) -> set[str]:
+    """Collect the non-canonical side of every tied-weight pair in ``meta``.
+
+    A tied parameter (e.g. ``lm_head.weight`` tied to
+    ``model.language_model.embed_tokens.weight``) is the same physical tensor
+    as its canonical counterpart, which is the side the plan records.  The
+    non-canonical aliases therefore have no plan entry of their own by design
+    and must not be reported as uncovered.
+    """
+    tied: set[str] = set()
+    for pair in getattr(meta, "tied_pairs", None) or []:
+        if len(pair) >= 2:
+            tied.add(pair[1])
+    return tied
 
 
 # ---------------------------------------------------------------------------
@@ -393,10 +478,6 @@ def meta_to_dict(meta: Any) -> dict[str, Any]:
 
 def _iter_trainable_params(model: Any):
     """Yield ``fqn`` for every trainable parameter of ``model`` (or its config)."""
-    try:
-        import torch  # pylint: disable=unused-import
-    except ImportError:
-        return
     seen: set[int] = set()
     for module_name, module in model.named_modules():
         for param_name, param in module.named_parameters(recurse=False):
@@ -422,10 +503,11 @@ def _get_parameter(model: Any, fqn: str) -> Any:
 
 __all__ = [
     "verify_boundary_forms",
-    "verify_generated_import",
+    "verify_generated_source",
     "verify_meta_required_fields",
     "verify_output_hashes",
     "verify_param_plan",
     "verify_signature",
+    "verify_snapshot_contract",
     "warn_skipped_overrides",
 ]

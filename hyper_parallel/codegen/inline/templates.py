@@ -16,43 +16,31 @@
 
 from __future__ import annotations
 
+#: Inline CP dispatch body for the generated host class forward.
+#:
+#: The body is argument-shape agnostic (``*args`` / ``**kwargs``
+#: passthrough): generated decoder layers call their attention by keyword,
+#: and both the parent forward and the family CP helper accept the full
+#: call, so the shell never restates a signature that could drift from the
+#: host it dispatches for.
+CP_DISPATCH_SHELL = '''if self.cp_enable:
+    return {helper_name}(self, __hp_forward_args__)
 
-#: Bare parallel operators for the generated forwards.  The generated file no
-#: longer embeds its own operator class or a module-level state accessor:
-#: ``runtime.TPOperators`` (wrapping the native
-#: ``create_tp_collective_lowerer``) is bound to the instance as ``_hp_tp``
-#: at install time by the boundary install path, next to the
-#: ``{tp,cp,ep}_enable`` guards — so a boundary-lowered forward and a switch
-#: (toggle) forward dispatch through one production collective path.  An inline
-#: *strategy* body (the shell below) reads only the EP channel
-#: (``self.ep_enable`` / ``self._hp_ep_group``), which
-#: ``hp_bind_inline_state`` binds.
-MOE_EP_FORWARD_SHELL = '''"""Inline EP routed MoE forward (framework generic)."""
-if not self.ep_enable:
-    return self._forward_impl(hidden_states)
-
-return moe_ep_forward(
-    self,
-    hidden_states,
-    router_kind={router_kind!r},
-    shared={shared!r},
-    ep_group=self._hp_ep_group,
-)
+return self._forward_impl(__hp_forward_args__)
 '''
 
 
-def moe_ep_forward_body(router_kind: str, shared: str) -> str:
-    """Return the thin inline EP forward body for the given structural keys.
+def cp_dispatch_shell_body(helper_name: str) -> str:
+    """Return the CP dispatch body installed into the original host class.
 
-    A single shared body referenced by every MoE render spec. The only
-    inputs are the structure-selected router kind and shared merge mode, so
-    no model-family EP dispatch literal remains in any adapter.
+    When CP is disabled the shell defers to the extracted original
+    forward; when active it hands the module over to the family helper,
+    which owns the CP all-gather and the sparse attention kernels.
 
     Args:
-        router_kind: Structural key selecting the router implementation.
-        shared: Structural key selecting the shared-expert merge mode.
+        helper_name: Family CP helper the dispatch delegates to when active.
 
     Returns:
-        The rendered forward body source.
+        The rendered forward method body source.
     """
-    return MOE_EP_FORWARD_SHELL.format(router_kind=router_kind, shared=shared)
+    return CP_DISPATCH_SHELL.format(helper_name=helper_name)

@@ -64,9 +64,6 @@ from hyper_parallel.distributed.expert_parallel.collectives import (
     ep_split_sizes,
     wait_ep_all_to_all,
 )
-from hyper_parallel.distributed.expert_parallel.routing import (
-    MOE_ROUTER_ADAPTERS,
-)
 
 
 logger = logging.getLogger(__name__)
@@ -1422,58 +1419,12 @@ def _merge_shared_gated(
     return routed + gate * shared
 
 
-# The three shared-branch merges for the codegen inline EP body
-# (``moe_ep_forward``), keyed by STRUCTURAL mode.  They mirror the combine
-# closures the native archetype factories in ``recipes.py`` define inline;
-# codegen imports callable-free plans, so the generated body selects the
-# composition here by string key.
+# Shared-branch merges used by model adapters and native EP recipes.
 SHARED_MERGE_MODES: dict[str, Callable[[Any, torch.Tensor, torch.Tensor], torch.Tensor]] = {
     "none": _merge_shared_none,
     "additive": _merge_shared_additive,
     "gated": _merge_shared_gated,
 }
-
-
-def moe_ep_forward(
-    module: Any,
-    hidden_states: torch.Tensor,
-    *,
-    router_kind: str,
-    shared: str = "none",
-    ep_group: Any,
-) -> torch.Tensor:
-    """Shared routed-MoE forward surfaced to generated inline EP artifacts.
-
-    The single framework-generic EP body used across model families in
-    place of per-family strategy strings: runs the routed branch and merges
-    the shared branch according to ``shared``. Router semantics are selected
-    by ``router_kind`` — a STRUCTURAL key (``softmax_topk`` /
-    ``topk_router_module`` / ``sigmoid_group``), never a model name.
-
-    ``shared`` selects an entry of :data:`SHARED_MERGE_MODES`, mirroring
-    the combine closures the native archetype factories define inline:
-      * ``"none"``     — routed output only.
-      * ``"additive"`` — ``routed + module.shared_experts(x)``
-                         (DeepSeek-V3 / GLM-4-MoE).
-      * ``"gated"``    — ``routed + sigmoid(module.shared_expert_gate(x)) *
-                         module.shared_expert(x)`` (Qwen2-MoE).
-
-    Keeps the same numeric contract as ``ep_routed_forward`` plus the
-    ``combine`` step of the runtime EP recipes.
-    """
-    merge = SHARED_MERGE_MODES.get(shared)
-    if merge is None:
-        raise ValueError(
-            f"moe_ep_forward: unknown shared merge mode {shared!r} "
-            f"(expected one of {sorted(SHARED_MERGE_MODES)})"
-        )
-    routed = ep_routed_forward(
-        module,
-        hidden_states,
-        router_fn=MOE_ROUTER_ADAPTERS[router_kind],
-        ep_group=ep_group,
-    )
-    return merge(module, hidden_states, routed)
 
 
 def require_attrs(module: Any, *names: str, owner: str = "") -> None:

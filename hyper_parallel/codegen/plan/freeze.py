@@ -17,7 +17,7 @@ torch or the training stack.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from hyper_parallel.codegen.plan.spec_fields import (
@@ -41,15 +41,26 @@ _PLACEMENT_SERIALIZERS: dict[type, type] = {}
 class _StridedShardSerializer:
     @staticmethod
     def to_string(p) -> str:
-        dim = p.dim if not p.uneven_shard else -p.dim - 1
-        return f"SS({dim},{p.split_factor})"
+        if p.uneven_shard:
+            raise TypeError(
+                "cannot freeze StridedShard(uneven_shard=True): uneven shards "
+                "are FSDP-internal placements and never belong to the frozen "
+                "plan (planner contracts use plain dims or negative dim "
+                "indices)"
+            )
+        return f"SS({p.dim},{p.split_factor})"
 
 
 class _ShardSerializer:
     @staticmethod
     def to_string(p) -> str:
-        dim = p.dim if not p.uneven_shard else -p.dim - 1
-        return f"S({dim})"
+        if p.uneven_shard:
+            raise TypeError(
+                "cannot freeze Shard(uneven_shard=True): uneven shards are "
+                "FSDP-internal placements and never belong to the frozen plan "
+                "(planner contracts use plain dims or negative dim indices)"
+            )
+        return f"S({p.dim})"
 
 
 class _ReplicateSerializer:
@@ -95,10 +106,13 @@ def placement_to_string(placement: Any) -> str:
     """Serialize a ``Placement`` instance to its canonical string form.
 
     Shard(dim) -> "S(dim)"; Replicate() -> "R"; Partial(reduce_op) -> "P";
-    StridedShard(dim, split_factor) -> "SS(dim,factor)".  ``uneven_shard`` is
-    encoded as a negative dim (``Shard(-dim-1)``) so it survives the
-    round-trip without an extra field.  Unknown placement types fail fast —
-    a silently dropped placement would corrupt the frozen plan.
+    StridedShard(dim, split_factor) -> "SS(dim,factor)".  The dim is stored
+    verbatim — a negative dim is the planner's own "last tensor dim" index
+    (e.g. the lm_head template's ``Shard(-1)``), so it must survive the
+    round-trip unchanged; an ``uneven_shard`` placement fails fast instead
+    (it is FSDP-internal and never part of a frozen plan).  Unknown placement
+    types fail fast — a silently dropped placement would corrupt the frozen
+    plan.
     """
     if not _PLACEMENT_SERIALIZERS:
         _register_placement_types()
@@ -141,11 +155,13 @@ def named_placement_to_dict(named: Any) -> dict[str, str]:
 def parse_placement(text: str) -> Any:
     """Inverse of :func:`placement_to_string`: canonical string -> Placement.
 
-    Compact forms: ``S(dim)`` / ``R`` / ``P(reduce_op)`` / ``SS(dim,factor)``;
-    ``uneven_shard`` is recovered from the negative-dim encoding
-    (``S(-1)`` -> ``Shard(0, uneven_shard=True)``).  Unknown or malformed
-    forms fail fast — a silently downgraded placement would corrupt the
-    frozen plan (e.g. quietly becoming ``Replicate()``).
+    Compact forms: ``S(dim)`` / ``R`` / ``P(reduce_op)`` / ``SS(dim,factor)``.
+    The dim is parsed verbatim — a negative dim is the planner's own "last
+    tensor dim" index (e.g. ``S(-1)`` -> ``Shard(-1)``, the lm_head
+    vocab-parallel output contract), matching the native runtime that also
+    treats negative dims as real dim indices.  Unknown or malformed forms
+    fail fast — a silently downgraded placement would corrupt the frozen
+    plan (e.g. quietly becoming ``Replicate()``).
     """
     from hyper_parallel.core.dtensor.placement_types import (
         Partial,
@@ -178,24 +194,22 @@ def parse_placement(text: str) -> Any:
     try:
         dim = int(parts[0])
     except (IndexError, ValueError) as exc:
-        raise ValueError(f"malformed placement {text!r}: invalid dim") from exc
-    uneven = dim < 0
-    dim = -dim - 1 if uneven else dim
+        raise ValueError(f"malformed shard placement {text!r}: invalid dim") from exc
 
     if kind == "S":
         if len(parts) != 1:
             raise ValueError(f"malformed shard placement {text!r}: too many args")
-        return Shard(dim, uneven_shard=uneven)
+        return Shard(dim)
     if kind == "SS":
         if len(parts) != 2:
-            raise ValueError(f"malformed strided shard {text!r}: expected SS(dim,factor)")
+            raise ValueError(f"malformed strided shard placement {text!r}: expected SS(dim,factor)")
         try:
             split_factor = int(parts[1])
         except ValueError as exc:
             raise ValueError(
-                f"malformed strided shard {text!r}: invalid split_factor"
+                f"malformed strided shard placement {text!r}: invalid split_factor"
             ) from exc
-        return StridedShard(dim, split_factor, uneven_shard=uneven)
+        return StridedShard(dim, split_factor)
     raise ValueError(f"unknown placement kind {kind!r} in {text!r}")
 
 
@@ -264,7 +278,13 @@ class FrozenPlan:
     special_handlers: dict[str, str] = field(default_factory=dict)
     frozen_sharded_params: list[str] = field(default_factory=list)
     boundary_classes: dict[str, str] = field(default_factory=dict)
+    boundary_types: dict[str, str] = field(default_factory=dict)
+    nested_components: list[dict[str, str]] = field(default_factory=list)
     mesh_dim_names: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the JSON representation consumed by build snapshots."""
+        return asdict(self)
 
 
 def freeze_plan(plan: Any, model: Any) -> FrozenPlan:
@@ -285,8 +305,87 @@ def freeze_plan(plan: Any, model: Any) -> FrozenPlan:
         special_handlers=dict(getattr(plan, "special_handlers", {}) or {}),
         frozen_sharded_params=expand_frozen_sharded_params(plan),
         boundary_classes=_freeze_boundary_classes(plan, model),
+        boundary_types=_freeze_boundary_types(plan, model),
+        nested_components=_freeze_nested_components(plan, model),
         mesh_dim_names=tuple(getattr(plan, "mesh_dim_names", ()) or ()),
     )
+
+
+def freeze_plan_application(
+    plan: Any,
+    source_shard_info: Any,
+    *,
+    validate_mode: bool,
+) -> dict[str, Any]:
+    """Freeze facts resolved by the native sharding applier.
+
+    This observes the existing plan and apply return value only. It does not
+    inspect parameters, rebuild meshes, or invoke planner/applier helpers.
+    """
+    modules = getattr(plan, "modules", {}) or {}
+    return {
+        "validate_mode": bool(validate_mode),
+        "applied_boundaries": sorted(modules),
+        "source_shard_info": _freeze_source_shard_info(source_shard_info),
+        "resolved_injections": freeze_injections(plan),
+        "tied_pairs": freeze_tied_pairs(plan),
+        "special_handlers": dict(getattr(plan, "special_handlers", {}) or {}),
+        "ep_bindings": _freeze_ep_bindings(plan),
+        "resolved_wrappers": _freeze_resolved_wrappers(plan),
+    }
+
+
+def _freeze_source_shard_info(source_shard_info: Any) -> dict[str, Any]:
+    """Serialize FQN-keyed source placements without retaining DeviceMesh."""
+    if not source_shard_info:
+        return {}
+    result = {}
+    for fqn, value in sorted(source_shard_info.items()):
+        if not isinstance(value, tuple) or len(value) != 2:
+            raise TypeError(
+                f"source_shard_info[{fqn!r}] must be a (placements, mesh) pair"
+            )
+        placements, mesh = value
+        mesh_dim_names = tuple(getattr(mesh, "mesh_dim_names", ()) or ())
+        shape = tuple(int(size) for size in (getattr(mesh, "shape", ()) or ()))
+        result[fqn] = {
+            "placements": [placement_to_string(item) for item in placements],
+            "mesh_dim_names": list(mesh_dim_names),
+            "mesh_shape": list(shape),
+        }
+    return result
+
+
+def _freeze_ep_bindings(plan: Any) -> list[dict[str, Any]]:
+    """Record boundaries whose native plan resolved an active EP contract."""
+    result = []
+    for fqn, spec in sorted((getattr(plan, "modules", {}) or {}).items()):
+        ep_size = int(getattr(spec, "_ep_size", 0) or 0)
+        if ep_size <= 0:
+            continue
+        result.append({
+            "fqn": fqn,
+            "ep_size": ep_size,
+            "ep_stack": _value_to_dict(getattr(spec, "_ep_stack", {}) or {}),
+            "local_compute_fn": _value_to_dict(
+                getattr(spec, "local_compute_fn", None)
+            ),
+            "inner_target": getattr(spec, "inner_target", None),
+            "inner_wrapper": _value_to_dict(getattr(spec, "inner_wrapper", None)),
+        })
+    return result
+
+
+def _freeze_resolved_wrappers(plan: Any) -> list[dict[str, Any]]:
+    """Record the inner-wrapper identities written back by native apply."""
+    result = []
+    for fqn, spec in sorted((getattr(plan, "modules", {}) or {}).items()):
+        wrapper = getattr(spec, "_resolved_inner_wrapper", None)
+        target = getattr(spec, "_resolved_inner_target", None)
+        if wrapper is None and target is None:
+            continue
+        result.append({"fqn": fqn, "wrapper": wrapper, "target": target})
+    return result
 
 
 def _freeze_boundary_classes(plan: Any, model: Any) -> dict[str, str]:
@@ -306,6 +405,66 @@ def _freeze_boundary_classes(plan: Any, model: Any) -> dict[str, str]:
         cls = type(model.get_submodule(fqn)).__name__
         result[fqn] = cls
     return result
+
+
+def _freeze_boundary_types(plan: Any, model: Any) -> dict[str, str]:
+    """Map every boundary FQN to its importable ``module:qualname`` identity.
+
+    Class names are enough only while every boundary is defined by the primary
+    modeling source. Multimodal models may construct a nested text model via
+    ``AutoModel``; preserving the defining module lets artifact emission find
+    and materialize that source without teaching the generic planner about the
+    model family.
+    """
+    if model is None:
+        return {}
+    result: dict[str, str] = {}
+    for fqn in (getattr(plan, "modules", {}) or {}):
+        module_type = type(model.get_submodule(fqn))
+        result[fqn] = f"{module_type.__module__}:{module_type.__qualname__}"
+    return result
+
+
+def _freeze_nested_components(plan: Any, model: Any) -> list[dict[str, str]]:
+    """Record external model roots that own planned boundary implementations.
+
+    A Kimi-style multimodal model may construct its language model through
+    ``AutoModel``. The shallowest ancestor sharing a boundary's defining
+    module is the nested source root that artifact emission must inline.
+    Ordinary framework containers between that root and the boundary do not
+    affect the choice.
+    """
+    if model is None:
+        return []
+    root_type = type(model)
+    root_module = root_type.__module__
+    components: dict[tuple[str, str], dict[str, str]] = {}
+    for boundary_fqn in (getattr(plan, "modules", {}) or {}):
+        boundary_type = type(model.get_submodule(boundary_fqn))
+        owner_module = boundary_type.__module__
+        if (
+            owner_module == root_module
+            or owner_module.startswith("torch.")
+            or owner_module.startswith("hyper_parallel.")
+        ):
+            continue
+        parts = boundary_fqn.split(".")
+        candidates = []
+        for index in range(1, len(parts) + 1):
+            ancestor_fqn = ".".join(parts[:index])
+            ancestor_type = type(model.get_submodule(ancestor_fqn))
+            if ancestor_type.__module__ == owner_module:
+                candidates.append((ancestor_fqn, ancestor_type))
+        if not candidates:
+            continue
+        component_fqn, component_type = candidates[0]
+        identity = f"{component_type.__module__}:{component_type.__qualname__}"
+        components[(component_fqn, identity)] = {
+            "fqn": component_fqn,
+            "type": identity,
+            "owner_module": owner_module,
+        }
+    return [components[key] for key in sorted(components)]
 
 
 def freeze_param_plan(plan: Any) -> dict[str, dict[str, Any]]:
@@ -402,7 +561,7 @@ def freeze_injections(plan: Any) -> list[dict[str, Any]]:
     """
     modules = getattr(plan, "modules", {}) or {}
     injections: list[dict[str, Any]] = []
-    for fqn, spec in modules.items():
+    for fqn, spec in sorted(modules.items()):
         entry: dict[str, Any] = {}
         for spec_field in INJECTION_SPEC_FIELDS:
             frozen = _freeze_spec_field(spec_field, getattr(spec, spec_field.name, None))
@@ -484,6 +643,7 @@ __all__ = [
     "freeze_injections",
     "freeze_param_plan",
     "freeze_plan",
+    "freeze_plan_application",
     "freeze_tied_pairs",
     "named_placement_to_dict",
     "parse_named_placement",

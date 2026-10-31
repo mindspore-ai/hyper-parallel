@@ -1,0 +1,89 @@
+model:
+  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /home/lxy/probe_ckpts/deepseek_v32
+  torch_dtype: bfloat16
+  attn_implementation: eager
+  force_hf: false
+
+training:
+  train_iters: 1
+  global_batch_size: 1
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  seed: 42
+
+accelerator:
+  tp_size: 2
+  cp_size: 2
+  ep_size: 2
+  pp_size: 1
+  sequence_parallel: false
+
+fsdp_config:
+  dp_shard_size: 2
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: "off"
+
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    lr: 1.0e-5
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr: 1.0e-5
+    lr_warmup_steps: 1
+    min_lr: 0.0
+
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ""
+  restore_from: null
+
+plan_overrides:
+  - match:
+      - "*.input_layernorm"
+      - "*.post_attention_layernorm"
+      - model.norm
+    replace:
+      kind: module
+      source_type: transformers.models.deepseek_v32.modeling_deepseek_v32.DeepseekV32RMSNorm
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_rms_norm
+  - match: "*.self_attn"
+    replace:
+      kind: module
+      source_type: transformers.models.deepseek_v32.modeling_deepseek_v32.DeepseekV32Attention
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_dsa_attention
+  - match: "*.mlp.experts"
+    replace:
+      kind: module
+      source_type: transformers.models.deepseek_v32.modeling_deepseek_v32.DeepseekV32Experts
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement.replace_deepseek_v32_grouped_experts
+  - match: "*.self_attn.forward"
+    when: cp
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper
+  - match: "*.mlp.forward"
+    when: ep
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn
+        use_grouped_gemm: true

@@ -117,12 +117,42 @@ _FAMILY_ALIASES: Dict[str, str] = {}
 # (Qwen3.5 text reuses the Qwen3.5 family adapter).
 _FAMILY_DIR_ALIASES = {
     "deepseekv2": "deepseek_v3",
+    # DeepSeek-V4.1 keeps the upstream Transformers ``deepseek_v4`` config
+    # identity while HyperParallel owns it under ``models/deepseek_v41/``.
+    "deepseekv4": "deepseek_v41",
     "qwen35text": "qwen3_5",
     # Kimi-K2.6: the K2.6 checkpoint keeps the native Transformers
     # ``model_type``/architecture spelling (kimi_k25) while the family is
     # registered from ``models/kimi_k26/``.
     "kimik25": "kimi_k26",
 }
+
+# A provider directory normally does not rename the copied upstream modeling
+# source. K2.6 is the exception: the checkpoint intentionally retains the K2.5
+# protocol, while the exported artifact represents the K2.6 family.
+_ARTIFACT_MODEL_TYPE_ALIASES = {
+    "kimik25": "kimi_k26",
+}
+
+
+def family_dir_for_model_type(model_type: str) -> str:
+    """Map an HF ``model_type`` onto the library family directory name.
+
+    Checkpoints may keep an upstream Transformers spelling that differs from
+    the library family directory (e.g. K2.6 reports ``kimi_k25`` while the
+    family lives under ``models/kimi_k26``). Consumers that anchor per-model
+    assets to the family directory — the codegen bundle layout in
+    particular — must normalize through this mapping so the CLI and the
+    trainer agree on one location.
+    """
+    key = str(model_type).replace("_", "").replace("-", "").lower()
+    return _FAMILY_DIR_ALIASES.get(key, model_type)
+
+
+def artifact_model_type(model_type: str) -> str:
+    """Return the public model identity used in generated artifact filenames."""
+    key = str(model_type).replace("_", "").replace("-", "").lower()
+    return _ARTIFACT_MODEL_TYPE_ALIASES.get(key, model_type)
 
 # normalized family directory name → registration module path; built lazily.
 _DISCOVERED_PROVIDERS: Optional[Dict[str, str]] = None

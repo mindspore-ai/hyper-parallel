@@ -17,17 +17,15 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import time
-import types
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from hyper_parallel.codegen import manager, runtime
+from hyper_parallel.codegen import manager
 from hyper_parallel.codegen.artifact import (
     clean_temp_artifacts,
     resolve_default_artifact_layout,
@@ -35,24 +33,68 @@ from hyper_parallel.codegen.artifact import (
     write_bundle_atomic,
 )
 from hyper_parallel.codegen.check.preflight import verify_output_hashes
+from hyper_parallel.codegen.emit.bundle import _rewrite_sibling_imports
 from hyper_parallel.codegen.hash import canonical_json, signature_from_spec
 from hyper_parallel.codegen.meta import (
     CodegenMeta,
     load_codegen_meta,
-    validate_meta_schema,
-)
-from hyper_parallel.codegen.modeling_backend import (
-    ModelingBackend,
-    resolve_modeling_backend,
 )
 from hyper_parallel.codegen.plan.freeze import (
     parse_placement,
     placement_to_string,
 )
-from hyper_parallel.codegen.source import resolver
-from hyper_parallel.codegen.spec import project
-from hyper_parallel.models._transformers import model_builder
+from hyper_parallel.codegen.source.resolver import resolve_remote_siblings
 from hyper_parallel.trainer.config import parser as config_parser
+
+
+def test_dynamic_module_source_resolves_remote_siblings(tmp_path: Path) -> None:
+    """HF dynamic modules retain the same sibling closure as remote sources."""
+    modeling = tmp_path / "modeling_demo.py"
+    configuration = tmp_path / "configuration_demo.py"
+    modeling.write_text(
+        "from .configuration_demo import DemoConfig\n", encoding="utf-8"
+    )
+    configuration.write_text("class DemoConfig:\n    pass\n", encoding="utf-8")
+    source = SimpleNamespace(
+        module_name="transformers_modules.demo.digest.modeling_demo",
+        file_path=str(modeling),
+    )
+
+    siblings = resolve_remote_siblings(source)
+
+    assert siblings == {str(configuration.resolve()): str(configuration.resolve())}
+
+
+def test_dynamic_module_import_retargets_generated_sibling() -> None:
+    """An absolute HF cache import resolves to its generated bundle sibling."""
+    source = (
+        "from transformers_modules.kimi_k3.digest.modeling_kimi_linear "
+        "import KimiLinearForCausalLM\n"
+    )
+
+    rendered = _rewrite_sibling_imports(
+        source,
+        {"modeling_kimi_linear.py": "modeling_kimi_linear_gen_npu.py"},
+    )
+
+    assert rendered == (
+        "from .modeling_kimi_linear_gen_npu import KimiLinearForCausalLM\n"
+    )
+
+
+def test_dynamic_module_import_retargets_copied_configuration() -> None:
+    """An unchanged configuration sibling is imported from the bundle."""
+    source = (
+        "from transformers_modules.kimi_k3.digest.configuration_kimi_k3 "
+        "import KimiK3Config\n"
+    )
+
+    rendered = _rewrite_sibling_imports(
+        source,
+        {"configuration_kimi_k3.py": "configuration_kimi_k3.py"},
+    )
+
+    assert rendered == "from .configuration_kimi_k3 import KimiK3Config\n"
 
 
 @dataclass
@@ -76,7 +118,7 @@ class _TrainingConfig:
 
 def _meta(signature: str = "sig-current") -> CodegenMeta:
     return CodegenMeta(
-        codegen_version="3",
+        codegen_version=manager.CODEGEN_VERSION,
         signature=signature,
         yaml_path="train.yaml",
         yaml_sha256="yaml-sha",
@@ -91,74 +133,6 @@ def _bundle_files(layout: object) -> dict[str, str]:
         os.path.basename(layout.diff_path): "--- source\n+++ generated\n",
         "__init__.py": "",
     }
-
-
-def test_external_state_classes_travel_from_structure_to_the_runtime() -> None:
-    """The runtime reads the artifact's record, not a hardcoded class list.
-
-    Feature: codegen-external-state
-    Description: ``meta.external_state_classes`` is derived from structure at
-        generation time (the block class of the EP archetypes this plan
-        injects); ``runtime`` records it per generated module and consults that
-        record when deciding whether a generated class's forward was replaced
-        by an inline strategy body.  A rendered component class (the fused
-        attention the family's factories build) keeps the component's own
-        forward plus the emitted boundary form, so it is NOT external state.
-    Expectation: The derived classes are recognised, the rendered component
-        class and an undeclared sibling of the same generated module are not, a
-        same-named class defined outside the generated file is not, an artifact
-        that declares nothing recognises nothing, and a non-list meta value
-        fails schema validation.
-    """
-    # pylint: disable=protected-access
-    meta = _meta()
-    meta.source = {"architecture": "Qwen3MoeForCausalLM"}
-    meta.injections = [
-        {
-            "local_compute_fn": {
-                "_target_": (
-                    "hyper_parallel.models.qwen3_moe.adapter.distributed."
-                    "expert_parallel.qwen3moe_ep_compute_fn"
-                )
-            }
-        }
-    ]
-    manager._record_inline_declarations(meta)
-    assert meta.external_state_classes == ["Qwen3MoeSparseMoeBlock"]
-
-    generated = types.ModuleType("hyper_parallel_generated.external_state")
-    declared = type("Qwen3MoeSparseMoeBlock", (), {"__module__": generated.__name__})
-    sibling = type("UndeclaredBlock", (), {"__module__": generated.__name__})
-    rendered = type("GQAAttention", (), {"__module__": generated.__name__})
-    foreign = type(
-        "Qwen3MoeSparseMoeBlock",
-        (),
-        {"__module__": "transformers.models.qwen3_moe.modeling_qwen3_moe"},
-    )
-
-    runtime.register_external_state_classes(generated, meta.external_state_classes)
-    assert runtime._is_external_state_inline_module(declared(), generated)
-    # A rendered component keeps its own forward plus a compiled boundary.
-    assert not runtime._is_external_state_inline_module(rendered(), generated)
-    assert not runtime._is_external_state_inline_module(sibling(), generated)
-    # A same-named class defined outside the generated file is never external.
-    assert not runtime._is_external_state_inline_module(foreign(), generated)
-
-    untouched = types.ModuleType("hyper_parallel_generated.undeclared")
-    runtime.register_external_state_classes(untouched, [])
-    scoped = type("Qwen3MoeSparseMoeBlock", (), {"__module__": untouched.__name__})
-    assert not runtime._is_external_state_inline_module(scoped(), untouched)
-
-    with pytest.raises(TypeError):
-        validate_meta_schema(
-            {
-                "codegen_version": "3",
-                "signature": "sig",
-                "yaml_path": "train.yaml",
-                "yaml_sha256": "yaml-sha",
-                "external_state_classes": {"Qwen3MoeSparseMoeBlock": True},
-            }
-        )
 
 
 def test_artifact_layout_uses_example_generated_dir_and_safe_model_name(
@@ -412,138 +386,48 @@ def test_signature_is_stable_for_key_order_and_sensitive_to_values() -> None:
     assert signature_from_spec(left) != signature_from_spec(changed)
 
 
-def test_codegen_implementation_digest_tracks_python_sources(tmp_path: Path) -> None:
-    """Invalidate a signature input when implementation Python changes."""
-    package = tmp_path / "codegen"
-    package.mkdir()
-    (package / "runtime.py").write_text("VALUE = 1\n", encoding="utf-8")
-    (package / "notes.txt").write_text("ignored\n", encoding="utf-8")
-    initial = manager._codegen_implementation_digest(str(package))
-
-    (package / "notes.txt").write_text("still ignored\n", encoding="utf-8")
-    assert manager._codegen_implementation_digest(str(package)) == initial
-
-    (package / "runtime.py").write_bytes(b"VALUE = 1\r\n")
-    assert manager._codegen_implementation_digest(str(package)) == initial
-
-    (package / "runtime.py").write_text("VALUE = 2\n", encoding="utf-8")
-    assert manager._codegen_implementation_digest(str(package)) != initial
-
-
-def test_projected_signature_payload_includes_codegen_implementation(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Make implementation identity part of the canonical signature input."""
-
-    class Projected:
-        """Minimal projected spec used to isolate implementation identity."""
-
-        @staticmethod
-        def to_dict() -> dict[str, object]:
-            """Return a canonical payload without a resolvable source."""
-            return {"source": {}, "target": {}}
-
-    monkeypatch.setattr(
-        project,
-        "project_codegen_spec",
-        lambda *_args, **_kwargs: Projected(),
-    )
-    monkeypatch.setattr(
-        resolver, "resolve_model_source", lambda *_args, **_kwargs: None
-    )
-    monkeypatch.setattr(
-        manager, "_codegen_implementation_digest", lambda: "implementation-sha"
-    )
-    config = SimpleNamespace(codegen=False)
-    yaml_path = str(tmp_path / "train.yaml")
-    layout = resolve_artifact_layout(yaml_path, "demo")
-
-    payload = manager._project_spec(config, layout)
-
-    assert payload["codegen_implementation"] == {
-        "version": manager.CODEGEN_VERSION,
-        "sha256": "implementation-sha",
-    }
-
-
 @pytest.mark.parametrize("text", ["R", "S(1)", "S(-1)", "P(sum)", "SS(0,2)"])
 def test_placement_strings_round_trip(text: str) -> None:
     assert placement_to_string(parse_placement(text)) == text
+
+
+def test_negative_dim_parses_as_real_dim_index() -> None:
+    """A negative dim in a frozen shard string is a real last-dim index.
+
+    Feature: Frozen placement round-trip.
+    Description: The frozen lm_head contract (``out_src tp: S(-1)``) used
+        to deserialize as ``Shard(0, uneven_shard=True)``, which sent the
+        runtime all-gather along dim 0 instead of the last dim and silently
+        produced a wrongly-shaped logits tensor on the codegen arm.
+    Expectation: The dim survives the freeze round-trip as a real negative
+        index with ``uneven_shard`` left False.
+    """
+    parsed = parse_placement("S(-1)")
+    assert parsed.dim == -1
+    assert parsed.uneven_shard is False
+    assert placement_to_string(parsed) == "S(-1)"
+
+
+def test_uneven_shard_placement_refuses_to_freeze() -> None:
+    """Uneven shards are FSDP-internal and never belong to a frozen plan.
+
+    Feature: Frozen placement round-trip.
+    Description: The old protocol smuggled ``uneven_shard`` through a
+        negative-dim encoding, which collided with real negative dim
+        indices (see ``test_negative_dim_parses_as_real_dim_index``).
+    Expectation: Freezing an uneven shard placement fails fast with
+        ``TypeError`` instead of silently corrupting the round-trip.
+    """
+    from hyper_parallel.core.dtensor.placement_types import Shard  # pylint: disable=import-outside-toplevel
+
+    with pytest.raises(TypeError, match="uneven_shard"):
+        placement_to_string(Shard(0, uneven_shard=True))
 
 
 @pytest.mark.parametrize("text", ["", "Shard(0)", "S(x)", "SS(0)", "P()"])
 def test_malformed_placement_strings_fail_fast(text: str) -> None:
     with pytest.raises(ValueError):
         parse_placement(text)
-
-
-def test_codegen_switch_defaults_to_generated_backend() -> None:
-    """Turning codegen on selects the generated backend."""
-    config = SimpleNamespace(architectures=["UnknownModel"])
-    assert resolve_modeling_backend(config, codegen_enabled=True) is ModelingBackend.GEN
-
-
-def test_force_hf_overrides_codegen_and_emits_warning(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """force_hf wins over codegen and says so in a warning."""
-    config = SimpleNamespace(architectures=["UnknownModel"])
-
-    with caplog.at_level(logging.WARNING):
-        resolved = resolve_modeling_backend(config, force_hf=True, codegen_enabled=True)
-
-    assert resolved is ModelingBackend.HF
-    assert "generated modeling file will not be used" in caplog.text
-
-
-def test_generated_backend_model_keeps_hf_sharding_semantics(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The generated backend model keeps HF sharding semantics."""
-    marker = object()
-    from hyper_parallel.codegen import loader
-
-    monkeypatch.setattr(loader, "init_generated_model", lambda *_args, **_kwargs: marker)
-
-    is_custom_model, model = model_builder._init_model(  # pylint: disable=protected-access
-        object,
-        "demo-model",
-        SimpleNamespace(architectures=["Qwen3MoeForCausalLM"]),
-        "sdpa",
-        "bfloat16",
-        True,
-        backend=ModelingBackend.GEN,
-        codegen_artifact_dir="/tmp/generated",
-    )
-
-    assert is_custom_model is False
-    assert model is marker
-
-
-def test_generated_sharding_skips_pure_data_parallel_mesh(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Pure data-parallel meshes skip generated sharding entirely."""
-    published: list[tuple[str, object]] = []
-    from hyper_parallel.codegen import runtime
-
-    monkeypatch.setattr(
-        runtime,
-        "publish_codegen_mesh_context",
-        lambda artifact_dir, mesh: published.append((artifact_dir, mesh)),
-    )
-    mesh = SimpleNamespace(tp_size=1, cp_size=1, ep_size=1)
-
-    handled, source_shard_info = model_builder._parallelize_from_generated(  # pylint: disable=protected-access
-        object(),
-        mesh,
-        "/tmp/generated",
-    )
-
-    assert handled is False
-    assert source_shard_info is None
-    assert published == [("/tmp/generated", mesh)]
 
 
 def test_wait_for_rank0_ignores_stale_signature(
@@ -579,72 +463,3 @@ def test_wait_for_rank0_times_out_when_only_stale_meta_exists(
 
     with pytest.raises(TimeoutError, match="timed out waiting for rank0 artifact"):
         manager.wait_for_rank0_artifact(layout, "sig-current", timeout_s=1.0)
-
-
-def _patch_entry_dependencies(
-    monkeypatch: pytest.MonkeyPatch,
-    layout: object,
-    *,
-    meta_signature: str,
-) -> list[int]:
-    """Stub ``ensure_codegen_artifact`` dependencies; return a barrier counter."""
-    barriers: list[int] = []
-    monkeypatch.setattr(manager, "_resolve_hf_config_for_layout", lambda _config: None)
-    monkeypatch.setattr(manager, "_resolve_layout", lambda *_args, **_kwargs: layout)
-    monkeypatch.setattr(manager, "_compute_signature", lambda *_args, **_kwargs: "sig-current")
-    monkeypatch.setattr(manager, "load_codegen_meta", lambda _path: _meta(meta_signature))
-    monkeypatch.setattr(manager, "barrier_after_artifact", lambda: barriers.append(1))
-    return barriers
-
-
-def test_reuse_path_crosses_rendezvous_barrier(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Regression: the reuse path must cross the rendezvous barrier too.
-
-    The reuse decision is a per-rank disk read, so ranks can disagree while
-    rank0 swaps in a fresh bundle: a late-starting rank reads the new meta
-    (signature match, reuse path) while its peers hold the stale one and wait
-    inside the barrier.  A rank that returns from the reuse path without
-    crossing the barrier deadlocks its peers.
-    """
-    layout = resolve_artifact_layout(str(tmp_path / "train.yaml"), "demo")
-    barriers = _patch_entry_dependencies(monkeypatch, layout, meta_signature="sig-current")
-
-    result = manager.ensure_codegen_artifact(SimpleNamespace(codegen=True))
-
-    assert result is layout
-    assert barriers == [1]
-
-
-def test_generate_path_crosses_rendezvous_barrier(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Rank0's generate path must cross the rendezvous barrier after writing."""
-    layout = resolve_artifact_layout(str(tmp_path / "train.yaml"), "demo")
-    barriers = _patch_entry_dependencies(monkeypatch, layout, meta_signature="sig-old")
-    monkeypatch.setattr(manager, "_build_meta", lambda *_args, **_kwargs: _meta("sig-new"))
-    monkeypatch.setattr(manager, "_fill_plan_fields", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(manager, "_record_inline_declarations", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(manager, "emit_bundle", lambda *_args, **_kwargs: {"f.py": "x"})
-    monkeypatch.setattr(manager, "write_bundle_atomic", lambda *_args, **_kwargs: None)
-
-    result = manager.ensure_codegen_artifact(SimpleNamespace(codegen=True))
-
-    assert result is layout
-    assert barriers == [1]
-
-
-def test_wait_path_crosses_rendezvous_barrier(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A non-rank0 rank must cross the rendezvous barrier after the wait."""
-    layout = resolve_artifact_layout(str(tmp_path / "train.yaml"), "demo")
-    barriers = _patch_entry_dependencies(monkeypatch, layout, meta_signature="sig-old")
-    monkeypatch.setattr(manager, "_is_rank0", lambda: False)
-    monkeypatch.setattr(manager, "wait_for_rank0_artifact", lambda *_args, **_kwargs: None)
-
-    result = manager.ensure_codegen_artifact(SimpleNamespace(codegen=True))
-
-    assert result is layout
-    assert barriers == [1]

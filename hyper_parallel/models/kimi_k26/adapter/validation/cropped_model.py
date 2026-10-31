@@ -166,7 +166,8 @@ def build_cropped_kimi_vlm(
         model_dir, local_files_only, num_hidden_layers, n_routed_experts, attn_implementation)
     model = _build_cropped_kimi_model(
         config, attn_implementation, distributed_setup, peft_config, torch_dtype, validate_placement,
-        compile_config, activation_checkpoint, activation_swap, swap_inputs, freeze_patterns)
+        compile_config, activation_checkpoint, activation_swap, swap_inputs, freeze_patterns,
+    )
 
     _maybe_load_pretrained(model, model_dir, load_pretrained)
     _bind_kimi_context_parallel(model, distributed_setup)
@@ -179,6 +180,45 @@ def _validate_cropped_geometry(num_hidden_layers: int, n_routed_experts: int) ->
         raise ValueError("num_hidden_layers must be positive")
     if n_routed_experts <= 0:
         raise ValueError("n_routed_experts must be positive")
+
+
+def crop_moe_group_geometry(
+        n_routed_experts: int,
+        n_group: int,
+        topk_group: int,
+        num_experts_per_tok: int,
+) -> tuple[int, int]:
+    """Shrink ``(n_group, topk_group)`` to stay legal under a cropped expert count.
+
+    The native ``DeepseekV3MoEGate`` ranks each group by the sum of its top-2
+    expert scores, so once ``n_routed_experts`` drops below ``2 * n_group`` the
+    per-group ``topk(2)`` addresses a size-1 dimension and the NPU kernel
+    rejects it (ACL EZ1001). The crop keeps the largest group count that
+    divides the expert count with at least two experts per group, preserves the
+    selected-group fraction, then widens the selection until the surviving
+    experts can still feed ``num_experts_per_tok``.
+
+    Args:
+        n_routed_experts: Routed experts after cropping.
+        n_group: Group count from the source configuration.
+        topk_group: Groups each token may draw experts from.
+        num_experts_per_tok: Experts routed to per token.
+
+    Returns:
+        The cropped ``(n_group, topk_group)`` pair.
+    """
+    if n_group <= 1:
+        return 1, max(1, topk_group)
+    cropped_group = min(n_group, n_routed_experts // 2)
+    while cropped_group > 1 and n_routed_experts % cropped_group != 0:
+        cropped_group -= 1
+    if cropped_group <= 1:
+        return 1, 1
+    group_size = n_routed_experts // cropped_group
+    selected = max(1, min(cropped_group, topk_group * cropped_group // n_group))
+    while selected * group_size < num_experts_per_tok and selected < cropped_group:
+        selected += 1
+    return cropped_group, selected
 
 
 def _resolve_cropped_model_dir(config_path: str | None, pretrained_model_name_or_path: str | None) -> str:
@@ -217,6 +257,14 @@ def _load_cropped_kimi_config(
     # configuration class, so this builder never rewrites the model structure.
     text_cfg.num_hidden_layers = num_hidden_layers
     text_cfg.n_routed_experts = n_routed_experts
+    # The native sigmoid-group gate assumes >=2 experts per group; shrink the
+    # group geometry alongside the expert count so the group top-2 stays legal.
+    text_cfg.n_group, text_cfg.topk_group = crop_moe_group_geometry(
+        n_routed_experts,
+        int(getattr(text_cfg, "n_group", 1) or 1),
+        int(getattr(text_cfg, "topk_group", 1) or 1),
+        int(getattr(text_cfg, "num_experts_per_tok", 2) or 2),
+    )
     text_cfg.use_cache = False
     text_cfg.quantization_config = None
     # nn.Embedding uses config.pad_token_id as padding_idx; the HF generic
@@ -266,6 +314,7 @@ def _build_cropped_kimi_model(
         return None
 
     _kimi_mod.Kimi_K25PreTrainedModel._init_weights = _patched_init_weights  # pylint: disable=protected-access
+
     try:
         return HyperAutoModelForImageTextToText.from_config(
             config,

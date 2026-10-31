@@ -144,8 +144,8 @@ class TestKimiK3AdapterRegistration(unittest.TestCase):
         classifier = ParameterClassifier()
         expected = {
             "self_attn.q_conv1d.weight": ParamRole.COLWISE,
-            "self_attn.A_log": ParamRole.COLWISE,
-            "self_attn.dt_bias": ParamRole.COLWISE,
+            "self_attn.A_log": ParamRole.REPLICATED,
+            "self_attn.dt_bias": ParamRole.REPLICATED,
             "self_attn.f_a_proj.weight": ParamRole.REPLICATED,
             "self_attn.g_a_proj.weight": ParamRole.REPLICATED,
             "self_attn.f_b_proj.weight": ParamRole.COLWISE,

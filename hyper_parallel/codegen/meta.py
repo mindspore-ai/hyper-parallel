@@ -30,6 +30,7 @@ from typing import Any, Optional
 
 from hyper_parallel.codegen.artifact import ArtifactLayout
 from hyper_parallel.codegen.hash import file_line_count, sha256_file
+from hyper_parallel.codegen.snapshot import CodegenStatus
 
 
 @dataclass
@@ -53,13 +54,20 @@ class CodegenMeta:
     #: FQN -> owning class name for every boundary. The emitter
     #: groups boundary FQNs by this to rewrite one ``class.forward`` per class.
     boundary_classes: dict[str, str] = field(default_factory=dict)
+    #: FQN -> importable ``module:qualname`` identity. Unlike the short class
+    #: map, this can locate boundaries owned by a nested AutoModel source.
+    boundary_types: dict[str, str] = field(default_factory=dict)
+    #: Nested model roots whose owning source contains planned boundaries.
+    nested_components: list[dict[str, str]] = field(default_factory=list)
     entrypoints: dict[str, str] = field(default_factory=dict)
-    #: Sunk ``replace_module`` overrides: one JSON-safe record per
-    #: matched target, ``{match, fqn, fqns, module_type, factory, exact_type}``.
-    #: The inline pipeline lowers them into the generated file, and the record
-    #: is what lets the trainer skip its own HF replacement step
-    #: (``covered["module_overrides"]``).
+    #: Replacements owned by generated source. Runtime-owned replacement
+    #: observations live in ``emission_patches`` instead, leaving this empty.
     module_overrides: list[dict[str, Any]] = field(default_factory=list)
+    #: Audit-only source materializations produced from builder observations.
+    #: This never participates in runtime strategy selection.
+    materialized_patches: list[dict[str, str]] = field(default_factory=list)
+    #: JSON-safe source-emission descriptors observed around the native builder.
+    emission_patches: dict[str, Any] = field(default_factory=dict)
     #: Entry model class name (the architecture name, e.g. ``AnthropicV3ForCausalLM``).
     #: The inline pipeline resolves the model's adapter from it.
     model_class: Optional[str] = None
@@ -88,19 +96,23 @@ class CodegenMeta:
     #: resolve against.  Empty for installed transformers sources (they use
     #: absolute imports) and for artifacts generated before this field existed.
     remote_siblings: list[str] = field(default_factory=list)
+    #: Future snapshot provenance. Both remain absent from emitted metadata
+    #: until the snapshot-driven manager is enabled.
+    snapshot_schema_version: Optional[int] = None
+    snapshot_status: Optional[str] = None
+    snapshot_reason: Optional[str] = None
+    snapshot_failure: Optional[dict[str, Any]] = None
+    snapshot_replacements: dict[str, Any] = field(default_factory=dict)
+    plan_application: dict[str, Any] = field(default_factory=dict)
 
 
-#: Stages the generated artifact declares it covers.  ``sharding_plan`` starts
-#: as the default here (False, kept for metas that predate the field), but
-#: ``_fill_plan_fields`` (manager.py) sets it True once the plan is frozen:
-#: the artifact carries the parallel logic and the runtime shards from
-#: ``codegen_meta.json``.  When True, the trainer short-circuits the
-#: planner+applier and runs the artifact's own parallelize step.
-#: ``module_overrides`` turns True once generation sunk module replacements, so
-#: the trainer's HF replacement step is skipped.
+#: Native-build facts represented by the artifact. ``sharding_plan`` means
+#: the frozen metadata contains the complete observed native plan; it does not
+#: transfer training ownership to the artifact.
 COVERED_DEFAULTS = {
     "sharding_plan": False,
     "module_overrides": False,
+    "model_class": False,
     "axes": [],
 }
 
@@ -116,7 +128,18 @@ NOT_COVERED_DEFAULT = [
 
 def meta_to_dict(meta: CodegenMeta) -> dict[str, Any]:
     """Serialize a CodegenMeta to a JSON-friendly dict."""
-    return asdict(meta)
+    data = asdict(meta)
+    for key in (
+        "snapshot_schema_version",
+        "snapshot_status",
+        "snapshot_reason",
+        "snapshot_failure",
+    ):
+        if data[key] is None:
+            data.pop(key)
+    if not data["plan_application"]:
+        data.pop("plan_application")
+    return data
 
 
 def meta_from_dict(data: dict[str, Any]) -> CodegenMeta:
@@ -155,6 +178,29 @@ def validate_meta_schema(data: dict[str, Any]) -> None:
     for key in ("source", "parallel_dims", "outputs"):
         if key in data and not isinstance(data[key], dict):
             raise TypeError(f"codegen_meta field {key!r} must be a dict")
+    if "snapshot_schema_version" in data:
+        version = data["snapshot_schema_version"]
+        if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+            raise TypeError(
+                "codegen_meta field 'snapshot_schema_version' must be a positive int"
+            )
+    if "snapshot_status" in data:
+        try:
+            CodegenStatus(data["snapshot_status"])
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                "codegen_meta field 'snapshot_status' must be a known codegen status"
+            ) from exc
+    if "snapshot_reason" in data and not isinstance(data["snapshot_reason"], str):
+        raise TypeError("codegen_meta field 'snapshot_reason' must be a string")
+    if "snapshot_failure" in data and not isinstance(data["snapshot_failure"], dict):
+        raise TypeError("codegen_meta field 'snapshot_failure' must be a dict")
+    if "plan_application" in data and not isinstance(data["plan_application"], dict):
+        raise TypeError("codegen_meta field 'plan_application' must be a dict")
+    if "snapshot_replacements" in data and not isinstance(
+        data["snapshot_replacements"], dict
+    ):
+        raise TypeError("codegen_meta field 'snapshot_replacements' must be a dict")
     if "entrypoints" in data:
         entrypoints = data["entrypoints"]
         if not isinstance(entrypoints, dict) or not all(
@@ -181,12 +227,27 @@ def validate_meta_schema(data: dict[str, Any]) -> None:
             raise TypeError(
                 "codegen_meta field 'module_overrides' must be a list[dict]"
             )
+    if "emission_patches" in data and not isinstance(data["emission_patches"], dict):
+        raise TypeError("codegen_meta field 'emission_patches' must be a dict")
     if "remote_siblings" in data:
         siblings = data["remote_siblings"]
         if not isinstance(siblings, list) or not all(
             isinstance(item, str) for item in siblings
         ):
             raise TypeError("codegen_meta field 'remote_siblings' must be a list[str]")
+    if "boundary_types" in data:
+        boundary_types = data["boundary_types"]
+        if not isinstance(boundary_types, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in boundary_types.items()
+        ):
+            raise TypeError("codegen_meta field 'boundary_types' must be a dict[str, str]")
+    if "nested_components" in data:
+        components = data["nested_components"]
+        if not isinstance(components, list) or not all(
+            isinstance(item, dict) for item in components
+        ):
+            raise TypeError("codegen_meta field 'nested_components' must be a list[dict]")
     if "external_state_classes" in data:
         class_names = data["external_state_classes"]
         if not isinstance(class_names, list) or not all(
@@ -195,6 +256,67 @@ def validate_meta_schema(data: dict[str, Any]) -> None:
             raise TypeError(
                 "codegen_meta field 'external_state_classes' must be a list[str]"
             )
+    validate_snapshot_state_contract(data)
+
+
+def validate_snapshot_state_contract(data: dict[str, Any]) -> None:
+    """Validate state-specific fields for snapshot-backed metadata."""
+    version = data.get("snapshot_schema_version")
+    status = data.get("snapshot_status")
+    if version is None and status is None:
+        return
+    if version is None or status is None:
+        raise ValueError(
+            "snapshot metadata must include snapshot_schema_version and snapshot_status"
+        )
+
+    plan_fields = (
+        "param_plan",
+        "injections",
+        "frozen_sharded_params",
+        "tied_pairs",
+        "special_handlers",
+        "boundary_classes",
+        "boundary_types",
+        "nested_components",
+        "mesh_dim_names",
+    )
+    has_plan_data = any(data.get(name) for name in plan_fields)
+    plan_application = data.get("plan_application") or {}
+    covered = data.get("covered") or {}
+    parallelize = (data.get("entrypoints") or {}).get("parallelize")
+
+    if status == CodegenStatus.DERIVED.value:
+        if not data.get("param_plan") or not plan_application:
+            raise ValueError(
+                "derived snapshot metadata requires a non-empty param_plan and plan_application"
+            )
+        if covered.get("sharding_plan") is not True:
+            raise ValueError("derived snapshot metadata must cover sharding_plan")
+        if parallelize:
+            raise ValueError(
+                "derived snapshot metadata must not expose a training parallelize entrypoint"
+            )
+        return
+    if status == CodegenStatus.NOT_REQUIRED.value:
+        if not data.get("snapshot_reason"):
+            raise ValueError("not_required snapshot metadata requires snapshot_reason")
+        if has_plan_data or plan_application:
+            raise ValueError("not_required snapshot metadata must not contain plan data")
+        if covered.get("sharding_plan") is not False or parallelize:
+            raise ValueError(
+                "not_required snapshot metadata must not own sharding_plan or parallelize"
+            )
+        return
+    if status == CodegenStatus.FAILED.value:
+        if not data.get("snapshot_failure"):
+            raise ValueError("failed snapshot metadata requires snapshot_failure")
+        if has_plan_data or plan_application or parallelize:
+            raise ValueError("failed snapshot metadata must not contain executable plan data")
+        return
+    raise ValueError(
+        f"snapshot metadata status {status!r} is not publishable"
+    )
 
 
 def record_output_hashes(
@@ -244,6 +366,7 @@ __all__ = [
     "meta_from_dict",
     "meta_to_dict",
     "record_output_hashes",
+    "validate_snapshot_state_contract",
     "validate_meta_schema",
     "write_codegen_meta",
 ]

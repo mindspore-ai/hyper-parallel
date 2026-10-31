@@ -5,20 +5,20 @@
 
 Public manager helpers:
 
-- :func:`ensure_codegen_artifact` — generate/reuse the bundle for a YAML.
+- :func:`ensure_codegen_artifact_from_snapshot` — publish a frozen native build.
 - :func:`preflight_integrity_check` — fail-fast drift detection before train.
 - :func:`resolve_artifact_layout` — map a YAML path to its bundle paths.
 
 Planning and validation APIs:
 
-- :func:`derive_sharding_plan` / :func:`freeze_plan` — run the planner over
-  an offline mesh and freeze the plan into JSON-safe structures.
+- :func:`freeze_plan` — freeze the builder-produced plan into JSON-safe
+  structures.
 - :func:`verify_signature` / :func:`verify_output_hashes` / ... — per-zone
   preflight verifiers.
 """
 from hyper_parallel.codegen.artifact import resolve_artifact_layout
 from hyper_parallel.codegen.check.preflight import (
-    verify_generated_import,
+    verify_generated_source,
     verify_meta_required_fields,
     verify_output_hashes,
     verify_param_plan,
@@ -26,30 +26,34 @@ from hyper_parallel.codegen.check.preflight import (
     warn_skipped_overrides,
 )
 from hyper_parallel.codegen.manager import (
-    ensure_codegen_artifact,
+    ensure_codegen_artifact_from_snapshot,
     preflight_integrity_check,
 )
+from hyper_parallel.codegen.session import CodegenBuildSession
+from hyper_parallel.codegen.snapshot import CodegenSnapshot, CodegenStatus
 from hyper_parallel.codegen.plan.freeze import (
     FrozenPlan,
     freeze_plan,
+    freeze_plan_application,
     freeze_param_plan,
     named_placement_to_dict,
     placement_to_string,
 )
-from hyper_parallel.codegen.plan.offline_mesh import OfflineMesh, build_offline_mesh
 
 __all__ = [
     "FrozenPlan",
-    "OfflineMesh",
-    "build_offline_mesh",
-    "ensure_codegen_artifact",
+    "CodegenBuildSession",
+    "CodegenSnapshot",
+    "CodegenStatus",
+    "ensure_codegen_artifact_from_snapshot",
     "freeze_param_plan",
     "freeze_plan",
+    "freeze_plan_application",
     "named_placement_to_dict",
     "placement_to_string",
     "preflight_integrity_check",
     "resolve_artifact_layout",
-    "verify_generated_import",
+    "verify_generated_source",
     "verify_meta_required_fields",
     "verify_output_hashes",
     "verify_param_plan",

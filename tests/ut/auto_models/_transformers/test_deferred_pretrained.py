@@ -19,11 +19,12 @@ import unittest
 from unittest.mock import patch
 
 import torch
-from transformers import BertConfig, BertForSequenceClassification
+from transformers import AutoModelForCausalLM, BertConfig, BertForSequenceClassification
 
-from hyper_parallel.codegen.modeling_backend import ModelingBackend
 from hyper_parallel.models._transformers.auto_model import (
-    HyperAutoModelForImageTextToText, HyperAutoModelForSequenceClassification,
+    HyperAutoModelForCausalLM, HyperAutoModelForImageTextToText,
+    HyperAutoModelForSequenceClassification,
+    _model_init_kwargs,
 )
 from tests.common.mark_utils import arg_mark
 
@@ -36,6 +37,25 @@ class TestDeferredPretrained(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_from_config_binds_standard_hf_auto_model_parent(self):
+        """Feature: remote-code lookup uses the standard AutoModel identity.
+
+        Description: Delegate a HyperAutoModel config-only construction to Hugging Face.
+        Expectation: The standard parent receives the config and remote-code switch.
+        """
+        config = object()
+        model = object()
+        with patch.object(AutoModelForCausalLM, "from_config", return_value=model) as parent:
+            result = HyperAutoModelForCausalLM._from_config_parent_class(
+                config,
+                trust_remote_code=True,
+            )
+
+        self.assertIs(result, model)
+        parent.assert_called_once_with(config, trust_remote_code=True)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_loader_selects_initial_construction_and_preserves_final_load(self):
         """Feature: automatic deferred HF loading.
 
@@ -43,7 +63,7 @@ class TestDeferredPretrained(unittest.TestCase):
         Expectation: Both loaders construct on meta without a checkpoint path and load after sharding.
         """
         for loader in ("dcp", "legacy"):
-            for is_hf_model, backend in ((True, None), (False, None), (True, ModelingBackend.GEN)):
+            for is_hf_model, backend in ((True, None), (False, None)):
                 with self.subTest(loader=loader, is_hf_model=is_hf_model, backend=backend):
                     model = torch.nn.Linear(2, 2)
                     with patch.dict(os.environ, {"HYPER_PARALLEL_HF_LOADER": loader}), \

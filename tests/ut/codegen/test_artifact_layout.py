@@ -24,7 +24,11 @@ import pytest
 
 from hyper_parallel.codegen.artifact import (
     ArtifactLayout,
+    artifact_failure_path,
+    artifact_generation_lock,
+    clear_artifact_failure,
     ensure_artifact_dir,
+    publish_artifact_failure,
     resolve_model_artifact_layout,
 )
 from hyper_parallel.codegen import manager
@@ -128,6 +132,15 @@ class TestResolveLayoutPriority:
         # The YAML stays recorded as provenance.
         assert layout.yaml_path == os.path.abspath(str(tmp_path / "train.yaml"))
 
+    def test_deepseek_v4_uses_v41_family_directory(self):
+        """The upstream V4 config identity resolves to the V4.1 adapter home."""
+        layout = manager._resolve_layout(
+            self._config(), None, None, hf_config=_hf("deepseek_v4")
+        )
+        assert layout.artifact_dir == os.path.join(
+            str(MODELS_ROOT), "deepseek_v41", "generated"
+        )
+
     def test_unknown_model_type_still_model_anchored(self, tmp_path, caplog):
         """A model type without a models/ directory warns and keeps its own
         model-anchored home instead of silently drifting to <yaml_dir>."""
@@ -147,6 +160,44 @@ class TestResolveLayoutPriority:
         yaml_path = str(tmp_path / "train.yaml")
         layout = manager._resolve_layout(config, yaml_path, None, hf_config=None)
         assert layout.artifact_dir == os.path.join(str(tmp_path), "generated")
+
+    def test_custom_builder_check_reuses_model_anchored_snapshot_identity(
+        self, monkeypatch, tmp_path
+    ):
+        """A custom model builder resolves check to its published bundle."""
+        generated = tmp_path / "models" / "deepseek_v41" / "generated"
+        calls = []
+
+        def _resolve(model_type, model_name=None, yaml_path=None):
+            calls.append((model_type, model_name, yaml_path))
+            return ArtifactLayout.build_default(str(generated), model_name)
+
+        monkeypatch.setattr(manager, "resolve_model_artifact_layout", _resolve)
+        monkeypatch.setattr(
+            manager,
+            "load_codegen_meta",
+            lambda _path: SimpleNamespace(model_name="Deepseek_V4"),
+        )
+        def _custom_builder():
+            return None
+
+        config = self._config(
+            _target_=_custom_builder,
+            _target_path=(
+                "hyper_parallel.models.deepseek_v41.adapter.validation."
+                "cropped_model.build_cropped_deepseek_v41"
+            )
+        )
+        yaml_path = str(tmp_path / "validation" / "deepseek_v41_native.yaml")
+
+        layout = manager._resolve_layout(config, yaml_path, None, hf_config=None)
+
+        assert layout.artifact_dir == str(generated)
+        assert Path(layout.diff_path).name == "modeling_Deepseek_V4_gen_npu.py.diff"
+        assert calls == [
+            ("deepseek_v41", None, None),
+            ("deepseek_v41", "Deepseek_V4", yaml_path),
+        ]
 
     def test_from_config_path_anchors_like_the_trainer(self, monkeypatch, tmp_path):
         """CLI chain on a ``from_config`` YAML (``config_path`` spelling)
@@ -178,6 +229,37 @@ class TestEnsureArtifactDirGuard:
         monkeypatch.setattr(Path, "mkdir", _raise_unwritable)
         with pytest.raises(RuntimeError, match="pip install -e ."):
             ensure_artifact_dir(layout)
+
+
+class TestArtifactCoordination:
+    """Owner publication coordination leaves no stale process-local state."""
+
+    def test_failure_marker_round_trip(self, tmp_path):
+        """Failure markers atomically expose and clear the owner's reason."""
+        layout = ArtifactLayout.build_default(str(tmp_path / "generated"))
+
+        publish_artifact_failure(layout, "abc123", "render failed")
+
+        marker = Path(artifact_failure_path(layout, "abc123"))
+        marker_text = marker.read_text(encoding="utf-8")
+        assert marker_text == "render failed", (
+            f"failure marker mismatch: expected=render failed, got={marker_text}"
+        )
+        clear_artifact_failure(layout, "abc123")
+        assert not marker.exists(), f"failure marker was not removed: path={marker}"
+
+    def test_generation_lock_rejects_concurrent_owner_and_cleans_up(self, tmp_path):
+        """Only one owner publishes and releasing it removes the lock."""
+        layout = ArtifactLayout.build_default(str(tmp_path / "generated"))
+        Path(layout.artifact_dir).parent.mkdir(parents=True, exist_ok=True)
+
+        with artifact_generation_lock(layout):
+            with pytest.raises(TimeoutError, match="artifact lock"):
+                with artifact_generation_lock(layout, timeout_s=0):
+                    pass
+
+        with artifact_generation_lock(layout, timeout_s=0):
+            pass
 
 
 def _hf(model_type):

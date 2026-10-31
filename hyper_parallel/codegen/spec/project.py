@@ -74,12 +74,15 @@ def project_source_spec(config: Any) -> SourceSpec:
     we only record the identity the source resolver will key on.  The model
     Target holds its id under the key the caller actually used — most YAMLs and
     ``HyperAutoModel.from_pretrained`` use ``pretrained_model_name_or_path`` —
-    so read that first and fall back to ``model_name_or_path``.
+    so read that first, then fall back to ``model_name_or_path`` and the
+    ``config_path`` used by cropped/custom builders.
     """
     model = getattr(config, "model", None)
     model_name_or_path = getattr(model, "pretrained_model_name_or_path", None)
     if model_name_or_path is None:
         model_name_or_path = getattr(model, "model_name_or_path", None)
+    if model_name_or_path is None:
+        model_name_or_path = getattr(model, "config_path", None)
     if model_name_or_path is None:
         # Target configured without a positional model id — the HF path will
         # derive it from from_pretrained's first arg at load time.
@@ -147,12 +150,16 @@ def _model_name(config: Any) -> Optional[str]:
 def _project_dp_size(accelerator: Any) -> int:
     """Derive runtime DP size from ``WORLD_SIZE`` and non-DP topology."""
     explicit = getattr(accelerator, "dp_size", None)
-    if explicit:
-        return max(1, int(explicit))
+    if explicit is not None:
+        if isinstance(explicit, bool) or not isinstance(explicit, int) or explicit < 1:
+            raise ValueError(
+                f"accelerator.dp_size must be a positive integer, got {explicit!r}"
+            )
+        return explicit
     world_size = int(os.environ.get("WORLD_SIZE") or os.environ.get("OMPI_COMM_WORLD_SIZE") or 1)
-    tp_size = max(1, int(getattr(accelerator, "tp_size", 1)))
-    cp_size = max(1, int(getattr(accelerator, "cp_size", 1)))
-    pp_size = max(1, int(getattr(accelerator, "pp_size", 1)))
+    tp_size = int(getattr(accelerator, "tp_size", 1))
+    cp_size = int(getattr(accelerator, "cp_size", 1))
+    pp_size = int(getattr(accelerator, "pp_size", 1))
     non_dp_size = tp_size * cp_size * pp_size
     if world_size % non_dp_size != 0:
         raise ValueError(

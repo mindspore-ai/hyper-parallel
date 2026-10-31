@@ -143,15 +143,6 @@ SPEC_FIELDS: tuple[SpecField, ...] = (
     #   ``init=False`` on the dataclass — rebuilt via setattr (post_init).
     SpecField("_deferred_bias_params", "deferred_bias_params", GROUP_PARAM_PLAN,
               freeze="name_list", rebuild="tuple_empty", post_init=True),
-    # skip_source_lowering: codegen opt-out of the class-level source
-    #   forward rewrite — set by meta normalization after freeze
-    #   (inline/meta_plan._mark_shared_class_boundaries) when the class is
-    #   shared between boundary and non-boundary instances.  The
-    #   int_truthy freeze kind keeps unmarked artifacts byte-stable (only
-    #   an explicit True is written); opt_scalar rebuild restores it onto
-    #   the spec so freeze(rebuild(meta)) stays symmetric.
-    SpecField("skip_source_lowering", "skip_source_lowering", GROUP_PARAM_PLAN,
-              freeze="int_truthy", rebuild="opt_scalar"),
     # ── Frozen into meta.injections rules ──
     SpecField("inner_wrapper", "inner_wrapper", GROUP_INJECTIONS,
               freeze="value_to_dict", rebuild="injection_target"),

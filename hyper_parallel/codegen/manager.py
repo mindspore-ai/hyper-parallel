@@ -22,104 +22,456 @@ and whether it passes preflight before training starts.
 
 from __future__ import annotations
 
-import hashlib
-from fnmatch import fnmatchcase
+import ast
+import importlib
 import logging
 import os
 from typing import Any, Optional
 
+import torch.distributed as dist
+
 from hyper_parallel.codegen.artifact import (
     ArtifactLayout,
+    artifact_failure_path,
+    artifact_generation_lock,
+    clear_artifact_failure,
     clean_temp_artifacts,
     ensure_artifact_dir,
+    publish_artifact_failure,
     resolve_default_artifact_layout,
     resolve_model_artifact_layout,
     resolve_artifact_layout,
     write_bundle_atomic,
 )
 from hyper_parallel.codegen.emit import emit_bundle
-from hyper_parallel.codegen.hash import canonical_json, sha256_file, signature_from_spec
-from hyper_parallel.codegen.inline.framework_spec import (
-    declaration_summary,
-    external_state_classes_for,
+from hyper_parallel.codegen.emit.replacement import replacement_records_from_snapshot
+from hyper_parallel.codegen.hash import (
+    canonical_snapshot_payload,
+    sha256_text,
+    signature_from_snapshot,
 )
 from hyper_parallel.codegen.meta import (
+    COVERED_DEFAULTS,
+    NOT_COVERED_DEFAULT,
     CodegenMeta,
     load_codegen_meta,
 )
+from hyper_parallel.codegen.snapshot import CodegenSnapshot, CodegenStatus
+from hyper_parallel.codegen.source.resolver import resolve_remote_siblings
+from hyper_parallel.models.registry import artifact_model_type, family_dir_for_model_type
 
 logger = logging.getLogger(__name__)
 
-CODEGEN_VERSION = "0.1.1"
+CODEGEN_VERSION = "0.1.2"
 
 
-def ensure_codegen_artifact(
-    config: Any,
-    yaml_path: str | None = None,
+def ensure_codegen_artifact_from_snapshot(
+    snapshot: CodegenSnapshot,
+    artifact_dir: Optional[str] = None,
     *,
-    artifact_dir: str | None = None,
-    hf_config: Any = None,
-) -> Optional[ArtifactLayout]:
-    """Ensure an up-to-date artifact bundle.
+    timeout_s: float = 600.0,
+) -> ArtifactLayout:
+    """Generate or reuse a bundle using only frozen native-build data.
 
-    Returns the layout when codegen is active, ``None`` otherwise.  If the
-    signature hits an existing bundle it is reused; otherwise ``emit_bundle``
-    is called to produce the bundle.
-
-    ``hf_config`` is the resolved HuggingFace config of the model; when given,
-    it is folded into the signature and meta ``source`` (so a transformers
-    modeling-file change regenerates).  When omitted, the source identity is
-    resolved from the model id alone.
-
-    Rank rendezvous: every path out of this function — reuse, wait, and
-    generate — must cross exactly one ``barrier_after_artifact`` call.  The
-    reuse decision is a per-rank disk read, so ranks can disagree while rank0
-    swaps in a fresh bundle (a late-starting rank reads the new meta and takes
-    the reuse path while its peers hold the stale one and take the wait path);
-    a rank that skips the barrier on reuse deadlocks the whole run.
+    This entry must remain independent of config projection, meta-model
+    construction, offline meshes, replacement matching, and planner calls.
     """
-    if not getattr(config, "codegen", False):
-        return None
-
-    if hf_config is None:
-        hf_config = _resolve_hf_config_for_layout(config)
-    layout = _resolve_layout(config, yaml_path, artifact_dir, hf_config=hf_config)
+    if not isinstance(snapshot, CodegenSnapshot):
+        raise TypeError("snapshot must be a CodegenSnapshot")
+    if snapshot.status not in (CodegenStatus.DERIVED, CodegenStatus.NOT_REQUIRED):
+        raise ValueError(
+            "snapshot-driven generation requires status 'derived' or 'not_required', "
+            f"got {snapshot.status.value!r}"
+        )
+    payload = snapshot.to_dict()
+    source = payload["source"]
+    if not source.get("file_path"):
+        raise ValueError("snapshot source must include a modeling file_path")
+    model_type = source.get("model_type")
+    public_model_type = artifact_model_type(str(model_type)) if model_type else None
+    model_name = (
+        _model_type_to_modeling_token(str(public_model_type))
+        if model_type
+        else source.get("architecture")
+    )
+    if artifact_dir is None and source.get("model_type"):
+        layout = resolve_model_artifact_layout(
+            family_dir_for_model_type(str(source["model_type"])),
+            model_name=str(model_name) if model_name else None,
+        )
+    else:
+        layout = resolve_default_artifact_layout(
+            artifact_dir,
+            model_name=str(model_name) if model_name else None,
+        )
     ensure_artifact_dir(layout)
     is_rank0 = _is_rank0()
     if is_rank0:
         clean_temp_artifacts(layout)
 
-    signature = _compute_signature(config, layout, hf_config=hf_config)
+    signature = signature_from_snapshot(snapshot)
+    validate_snapshot_signature(signature)
     existing = load_codegen_meta(layout.meta_path)
-
     if existing is not None and not should_regenerate(existing, signature):
         if is_rank0:
             logger.info(
-                "codegen: reuse artifact %s (signature %s)",
+                "codegen: reuse snapshot artifact %s (signature %s)",
                 layout.artifact_dir,
                 signature,
             )
-        # Ranks can disagree on reuse while rank0 swaps the bundle in; this
-        # path must cross the barrier too, or the peers deadlock inside theirs.
         barrier_after_artifact()
         return layout
-
     if not is_rank0:
-        wait_for_rank0_artifact(layout, signature)
-        barrier_after_artifact()
-        return layout
+        try:
+            wait_for_rank0_artifact(layout, signature, timeout_s=timeout_s)
+            return layout
+        finally:
+            barrier_after_artifact()
 
-    # rank0 generates.
-    logger.info(
-        "codegen: generating artifact %s (signature %s)", layout.artifact_dir, signature
+    try:
+        with artifact_generation_lock(layout, timeout_s=timeout_s):
+            existing = load_codegen_meta(layout.meta_path)
+            if existing is not None and not should_regenerate(existing, signature):
+                return layout
+            logger.info(
+                "codegen: generating snapshot artifact %s (signature %s)",
+                layout.artifact_dir,
+                signature,
+            )
+            meta = _build_meta_from_snapshot(snapshot, layout, signature)
+            files = emit_bundle(
+                layout,
+                meta,
+                snapshot=snapshot,
+            )
+            write_bundle_atomic(layout, files, meta)
+        return layout
+    except Exception as exc:
+        publish_artifact_failure(layout, signature, str(exc) or type(exc).__name__)
+        raise
+    finally:
+        barrier_after_artifact()
+        clear_artifact_failure(layout, signature)
+
+
+def _build_meta_from_snapshot(
+    snapshot: CodegenSnapshot,
+    layout: ArtifactLayout,
+    signature: str,
+) -> CodegenMeta:
+    """Map immutable snapshot fields into the existing emitter metadata."""
+    payload = snapshot.to_dict()
+    source = dict(payload["source"])
+    status = snapshot.status
+    frozen_plan = dict(payload["plan"] or {})
+    application = dict(payload["plan_application"] or {})
+    module_overrides = list(replacement_records_from_snapshot(snapshot))
+    covered = dict(COVERED_DEFAULTS)
+    is_derived = status is CodegenStatus.DERIVED
+    covered["sharding_plan"] = is_derived
+    # Bundles are audit/export artifacts. They describe source rewrites but do
+    # not take model-construction or replacement ownership from native training.
+    covered["module_overrides"] = False
+    covered["model_class"] = False
+    emission_patches = _snapshot_emission_patches(payload) if is_derived else {}
+    return CodegenMeta(
+        codegen_version=CODEGEN_VERSION,
+        signature=signature,
+        yaml_path=layout.yaml_path,
+        yaml_sha256=sha256_text(canonical_snapshot_payload(snapshot)),
+        source=source,
+        parallel_dims=dict(frozen_plan.get("parallel_dims") or {}),
+        model_name=(
+            _model_type_to_modeling_token(artifact_model_type(str(source["model_type"])))
+            if source.get("model_type")
+            else source.get("architecture")
+        ),
+        model_class=source.get("architecture"),
+        injections=list(frozen_plan.get("injections") or ()),
+        param_plan=dict(frozen_plan.get("param_plan") or {}),
+        frozen_sharded_params=list(frozen_plan.get("frozen_sharded_params") or ()),
+        tied_pairs=list(frozen_plan.get("tied_pairs") or ()),
+        special_handlers=dict(frozen_plan.get("special_handlers") or {}),
+        boundary_classes=dict(frozen_plan.get("boundary_classes") or {}),
+        boundary_types=dict(frozen_plan.get("boundary_types") or {}),
+        nested_components=list(frozen_plan.get("nested_components") or ()),
+        mesh_dim_names=list(frozen_plan.get("mesh_dim_names") or ()) or None,
+        module_overrides=(module_overrides if is_derived else []),
+        emission_patches=emission_patches,
+        covered=covered,
+        not_covered=(
+            list(NOT_COVERED_DEFAULT)
+            if is_derived
+            else [*NOT_COVERED_DEFAULT, "sharding_plan", "module_overrides", "model_class"]
+        ),
+        entrypoints={},
+        snapshot_schema_version=payload["schema_version"],
+        snapshot_status=payload["status"],
+        snapshot_reason=payload.get("reason"),
+        snapshot_failure=payload.get("failure"),
+        snapshot_replacements=dict(payload["replacements"]),
+        plan_application=application,
     )
-    meta = _build_meta(config, layout, signature, hf_config=hf_config)
-    _fill_plan_fields(meta, config, layout, hf_config=hf_config)
-    _record_inline_declarations(meta)
-    files = emit_bundle(layout, meta)
-    write_bundle_atomic(layout, files, meta)
-    barrier_after_artifact()
-    return layout
+
+
+def _snapshot_emission_patches(payload: dict[str, Any]) -> dict[str, Any]:
+    """Translate resolved native observations into the legacy emitter DTO."""
+    applications = payload["replacements"]["applications"]
+    replacements = [
+        {
+            "module_fqn": item["primary_fqn"],
+            "source_type": item["source_type"],
+            "replacement_type": item["replacement_type"],
+        }
+        for item in applications
+    ]
+    replacement_types = {
+        module_fqn: item["replacement_type"]
+        for item in applications
+        for module_fqn in item.get("module_fqns", (item["primary_fqn"],))
+    }
+    source = payload["source"]
+    plan = payload.get("plan") or {}
+    application = payload.get("plan_application") or {}
+    injections = application.get("resolved_injections") or plan.get("injections") or ()
+    boundary_classes = plan.get("boundary_classes") or {}
+    boundary_types = plan.get("boundary_types") or {}
+    param_plan = plan.get("param_plan") or {}
+    local_computes = []
+    inner_wrappers = []
+    for injection in injections:
+        module_fqn = injection.get("match")
+        class_name = boundary_classes.get(module_fqn)
+        module_name = source.get("module_name")
+        declared_module_type = (
+            f"{module_name}:{class_name}" if module_name and class_name else None
+        )
+        source_module_type = _source_type_identity(source, class_name)
+        observed_boundary_type = boundary_types.get(module_fqn)
+        if (
+            source_module_type is None
+            and isinstance(observed_boundary_type, str)
+            and not observed_boundary_type.startswith("hyper_parallel.")
+            and not observed_boundary_type.startswith("torch.")
+        ):
+            source_module_type = observed_boundary_type
+        bound_forward = _bound_forward_identity(source, module_fqn)
+        local_compute = injection.get("local_compute_fn")
+        if local_compute is not None:
+            if declared_module_type is None:
+                raise ValueError(
+                    "snapshot local_compute_fn requires a source module and "
+                    f"boundary class for {module_fqn!r}"
+                )
+            if source_module_type is not None or bound_forward is not None:
+                module_type = (
+                    _imported_type_identity(source, class_name)
+                    if bound_forward is not None
+                    else source_module_type
+                ) or (
+                    source_module_type
+                    or declared_module_type
+                )
+                local_computes.append({
+                    "module_fqn": module_fqn,
+                    "module_type": module_type,
+                    "factory": _snapshot_target_path(local_compute),
+                    "region_dispatch": (param_plan.get(module_fqn) or {}).get(
+                        "region_dispatch"
+                    ),
+                    "original_forward": (
+                        bound_forward or f"{source_module_type}.forward"
+                    ),
+                })
+        inner_wrapper = injection.get("inner_wrapper")
+        if inner_wrapper is not None:
+            target_type = (
+                replacement_types.get(module_fqn)
+                or source_module_type
+                or declared_module_type
+            )
+            if target_type is None:
+                raise ValueError(
+                    "snapshot inner_wrapper requires an observed replacement or "
+                    f"boundary class for {module_fqn!r}"
+                )
+            inner_wrappers.append({
+                "module_fqn": module_fqn,
+                "target_fqn": injection.get("inner_target") or "self",
+                "wrapper": _snapshot_target_path(inner_wrapper),
+                "target_type": target_type,
+            })
+    return {
+        "module_replacements": replacements,
+        "local_computes": local_computes,
+        "inner_wrappers": inner_wrappers,
+    }
+
+
+def _source_class_names(source: dict[str, Any]) -> set[str]:
+    """Return classes defined by the snapshot's modeling source file."""
+    file_path = source.get("file_path")
+    if not file_path:
+        return set()
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as handle:
+            tree = ast.parse(handle.read(), filename=file_path)
+    except (OSError, SyntaxError):
+        return set()
+    return {
+        node.name
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+    }
+
+
+def _source_type_identity(source: dict[str, Any], class_name: Optional[str]) -> Optional[str]:
+    """Resolve a class to the remote source unit that actually defines it."""
+    if not class_name:
+        return None
+    module_name = source.get("module_name")
+    if not isinstance(module_name, str) or not module_name:
+        return None
+    if class_name in _source_class_names(source):
+        return f"{module_name}:{class_name}"
+
+    package, separator, _ = module_name.rpartition(".")
+    candidates = []
+    for path in resolve_remote_siblings(source).values():
+        sibling_source = {"file_path": path}
+        if class_name not in _source_class_names(sibling_source):
+            continue
+        stem = os.path.splitext(os.path.basename(path))[0]
+        sibling_module = f"{package}.{stem}" if separator else stem
+        candidates.append(f"{sibling_module}:{class_name}")
+    if len(candidates) > 1:
+        raise ValueError(
+            f"snapshot class {class_name!r} is defined by multiple bundled source units: "
+            f"{sorted(candidates)}"
+        )
+    return candidates[0] if candidates else None
+
+
+def _bound_forward_identity(
+    source: dict[str, Any], module_fqn: Optional[str]
+) -> Optional[str]:
+    """Resolve a model-owned function installed through ``MethodType``.
+
+    Custom models can import a boundary class but replace an instance forward
+    in their constructor.  The installed module-level function, rather than the
+    imported class body, is the source unit codegen must rewrite.
+    """
+    file_path = source.get("file_path")
+    module_name = source.get("module_name")
+    if not file_path or not module_name or not module_fqn:
+        return None
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as handle:
+            tree = ast.parse(handle.read(), filename=file_path)
+    except (OSError, SyntaxError):
+        return None
+
+    boundary_name = module_fqn.rsplit(".", 1)[-1]
+    candidates = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        call = node.value
+        if (
+            not isinstance(target, ast.Attribute)
+            or target.attr != "forward"
+            or not isinstance(target.value, ast.Attribute)
+            or target.value.attr != boundary_name
+            or not isinstance(call, ast.Call)
+            or _ast_name(call.func) != "MethodType"
+            or not call.args
+            or not isinstance(call.args[0], ast.Name)
+        ):
+            continue
+        candidates.add(call.args[0].id)
+    if len(candidates) > 1:
+        raise ValueError(
+            f"snapshot boundary {module_fqn!r} has multiple MethodType forwards: "
+            f"{sorted(candidates)}"
+        )
+    return f"{module_name}:{next(iter(candidates))}" if candidates else None
+
+
+def _imported_type_identity(
+    source: dict[str, Any], class_name: Optional[str]
+) -> Optional[str]:
+    """Resolve an imported boundary class from modules referenced by the source."""
+    file_path = source.get("file_path")
+    if not file_path or not class_name:
+        return None
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as handle:
+            tree = ast.parse(handle.read(), filename=file_path)
+    except (OSError, SyntaxError):
+        return None
+
+    explicit_modules = {
+        node.module
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+        and node.level == 0
+        and node.module
+        and any(
+            alias.name == class_name and (alias.asname or alias.name) == class_name
+            for alias in node.names
+        )
+    }
+    if len(explicit_modules) > 1:
+        raise ValueError(
+            f"snapshot class {class_name!r} is imported from multiple modules: "
+            f"{sorted(explicit_modules)}"
+        )
+    if explicit_modules:
+        return f"{next(iter(explicit_modules))}:{class_name}"
+
+    modules = {
+        node.module
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module
+    }
+    candidates = []
+    for module_name in sorted(modules):
+        try:
+            module = importlib.import_module(module_name)
+        except (ImportError, AttributeError):
+            continue
+        if hasattr(module, class_name):
+            candidates.append(f"{module_name}:{class_name}")
+    if len(candidates) > 1:
+        raise ValueError(
+            f"snapshot class {class_name!r} is exported by multiple imported modules: "
+            f"{candidates}"
+        )
+    return candidates[0] if candidates else None
+
+
+def _ast_name(node: ast.AST) -> Optional[str]:
+    """Return the terminal name of a callable expression."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _snapshot_target_path(target: Any) -> str:
+    """Return an importable ``module:qualname`` from a frozen Target value."""
+    if isinstance(target, dict):
+        target = target.get("_target_") or target.get("target")
+    if not isinstance(target, str) or not target:
+        raise ValueError(f"snapshot injection target is not importable: {target!r}")
+    if ":" in target:
+        return target
+    module_name, separator, name = target.rpartition(".")
+    if not separator or not module_name or not name:
+        raise ValueError(f"snapshot injection target is not importable: {target!r}")
+    return f"{module_name}:{name}"
 
 
 def preflight_integrity_check(
@@ -131,22 +483,18 @@ def preflight_integrity_check(
 ) -> None:
     """Validate the existing bundle before training starts; fail fast on drift.
 
-    Composes the check-layer per-zone verifiers: signature, output hashes,
-    importability, meta schema, boundary-form structure, and a warning for
-    skipped overrides.  The frozen ``param_plan`` is verified for internal
-    consistency (an empty plan fails — generation always freezes a derived
-    plan); full model-side coverage against the live parameter tree runs
-    later in :func:`init_generated_model`, where a model handle exists.
+    Composes the check-layer per-zone verifiers: snapshot signature, output
+    hashes, source syntax, meta schema, boundary-form structure, and skipped
+    override warnings. The frozen ``param_plan`` is checked for internal
+    consistency without importing generated code.
     """
-    if not getattr(config, "codegen", False):
-        return
     from hyper_parallel.codegen.check.preflight import (
         verify_boundary_forms,
-        verify_generated_import,
+        verify_generated_source,
         verify_meta_required_fields,
         verify_output_hashes,
         verify_param_plan,
-        verify_signature,
+        verify_snapshot_contract,
         warn_skipped_overrides,
     )
 
@@ -159,10 +507,17 @@ def preflight_integrity_check(
             f"codegen preflight: missing meta at {layout.meta_path}; run generate first"
         )
     verify_meta_required_fields(meta)
-    signature = _compute_signature(config, layout, hf_config=hf_config)
-    verify_signature(meta, signature)
+    verify_snapshot_contract(meta)
+    if meta.snapshot_schema_version is None:
+        raise RuntimeError(
+            "codegen preflight: legacy artifacts are no longer supported; "
+            "regenerate with 'python -m hyper_parallel.codegen generate'"
+        )
+    validate_snapshot_signature(meta.signature)
     verify_output_hashes(meta, layout)
-    verify_generated_import(layout)
+    if meta.snapshot_status == CodegenStatus.NOT_REQUIRED.value:
+        return
+    verify_generated_source(layout)
     verify_boundary_forms(meta, layout)
     verify_param_plan(meta, model=None)
     warn_skipped_overrides(meta)
@@ -170,7 +525,10 @@ def preflight_integrity_check(
 
 def should_regenerate(meta: CodegenMeta, signature: str) -> bool:
     """Whether the stored meta no longer matches the current signature."""
-    return meta.signature != signature
+    return (
+        meta.signature != signature
+        or getattr(meta, "codegen_version", None) != CODEGEN_VERSION
+    )
 
 
 def wait_for_rank0_artifact(
@@ -193,8 +551,16 @@ def wait_for_rank0_artifact(
 
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
+        failure_path = artifact_failure_path(layout, current_signature)
+        if os.path.isfile(failure_path):
+            with open(failure_path, "r", encoding="utf-8") as handle:
+                reason = handle.read().strip()
+            raise RuntimeError(
+                "codegen: rank0 artifact generation failed"
+                + (f": {reason}" if reason else "")
+            )
         meta = load_codegen_meta(layout.meta_path)
-        if meta is not None and meta.signature == current_signature:
+        if meta is not None and not should_regenerate(meta, current_signature):
             return
         time.sleep(0.5)
     raise TimeoutError(
@@ -206,7 +572,7 @@ def barrier_after_artifact() -> None:
     """Rejoin all ranks after the artifact is ready.
 
     Every rank must call it exactly once on the way out of
-    ``ensure_codegen_artifact``, on every path: rank0 after writing the
+    ``ensure_codegen_artifact_from_snapshot``, on every path: rank0 after writing the
     bundle, each other rank right after ``wait_for_rank0_artifact`` returns,
     and every rank that takes the reuse path (the reuse decision is a per-rank
     disk read, so ranks can disagree while rank0 swaps in a fresh bundle — a
@@ -221,13 +587,35 @@ def barrier_after_artifact() -> None:
     ``trainer._setup`` before the codegen manager runs); a no-op without a
     live process group.
     """
-    try:
-        import torch.distributed as dist
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
 
-        if dist.is_initialized():
-            dist.barrier()
-    except Exception:  # pragma: no cover - best-effort without a process group
-        pass
+
+def validate_snapshot_signature(signature: str) -> None:
+    """Fail every rank together when snapshot artifact identities diverge.
+
+    File polling cannot coordinate rank-local signatures: each non-owner would
+    otherwise wait for an artifact rank 0 can never publish under its identity.
+    The collective runs only for snapshot sidecar generation and completes
+    before any rank enters artifact reuse, generation, or polling.
+
+    Args:
+        signature: This rank's canonical snapshot signature.
+
+    Raises:
+        RuntimeError: If initialized ranks computed different signatures.
+    """
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    signatures: list[Optional[str]] = [None] * dist.get_world_size()
+    dist.all_gather_object(signatures, signature)
+    if any(item != signatures[0] for item in signatures[1:]):
+        raise RuntimeError(
+            "codegen: snapshot signature mismatch across ranks: "
+            + ", ".join(
+                f"rank{rank}={item}" for rank, item in enumerate(signatures)
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -248,14 +636,9 @@ def _is_rank0() -> bool:
             return int(rank) == 0
         except ValueError as exc:
             raise ValueError(f"codegen: invalid RANK value {rank!r}") from exc
-    try:
-        from hyper_parallel.trainer.runtime.distributed import (
-            get_global_rank_safe,
-        )
-
-        return get_global_rank_safe() == 0
-    except Exception:
-        return True
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank() == 0
+    return True
 
 
 def _model_name(config: Any, hf_config: Any = None) -> Optional[str]:
@@ -278,11 +661,39 @@ def _model_type(config: Any, hf_config: Any = None) -> Optional[str]:
 
     Shares the best-effort config lookup with :func:`_model_name` (including
     the ``from_config`` ``config_path`` spelling), so the CLI generation and
-    the trainer anchor the bundle to the same family directory.
+    the trainer anchor the bundle to the same family directory. The raw HF
+    spelling is normalized through the registry family aliases (K2.6 reports
+    ``kimi_k25``; the family directory is ``kimi_k26``).
     """
     if hf_config is None:
         hf_config = _resolve_hf_config_for_layout(config)
-    return getattr(hf_config, "model_type", None)
+    model_type = getattr(hf_config, "model_type", None)
+    if model_type:
+        return family_dir_for_model_type(str(model_type))
+    return _model_family_from_target(config)
+
+
+def _model_family_from_target(config: Any) -> Optional[str]:
+    """Infer a registered model family from a custom builder target path."""
+    model = getattr(config, "model", None)
+    target_path = getattr(model, "_target_path", None)
+    target = getattr(model, "_target_", None)
+    if not isinstance(target_path, str) and isinstance(target, str):
+        target_path = target
+    if not isinstance(target_path, str) and callable(target):
+        module_name = getattr(target, "__module__", None)
+        qualname = getattr(target, "__qualname__", None)
+        if module_name and qualname:
+            target_path = f"{module_name}.{qualname}"
+    if not isinstance(target_path, str):
+        return None
+    prefix = "hyper_parallel.models."
+    if not target_path.startswith(prefix):
+        return None
+    family, separator, _ = target_path[len(prefix):].partition(".")
+    if not separator or not family:
+        return None
+    return family_dir_for_model_type(family)
 
 
 def _model_type_to_modeling_token(model_type: str) -> str:
@@ -296,17 +707,11 @@ def _model_type_to_modeling_token(model_type: str) -> str:
 def _model_class(config: Any, hf_config: Any = None) -> Optional[str]:
     """The entry model class name the override rewrite targets in ``__init__``.
 
-    The HF config's ``architectures`` list is the lookup key the loader uses to
-    pick the class from the generated file, so it is the architecture's class
-    name (e.g. ``AnthropicV3ForCausalLM``).  Falls back to the loaded config's
-    own attribute when ``hf_config`` was not passed in.
+    The HF config's ``architectures`` list supplies the emitted entry class
+    name (for example ``AnthropicV3ForCausalLM``).
 
-    ``ensure_codegen_artifact`` is reached from config preparation and the CLI,
-    neither of which has a resolved ``hf_config`` in hand (the model resolves
-    it only inside ``from_pretrained``, after generation).  So when
-    neither ``hf_config`` nor ``config`` exposes ``architectures``, resolve the
-    model path with the same rule ``spec/project`` uses and load the config —
-    lazily, to keep this module importable without ``transformers``.
+    When neither ``hf_config`` nor ``config`` exposes ``architectures``, the
+    layout resolver loads the model config lazily.
     """
     for candidate in (
         getattr(hf_config, "architectures", None),
@@ -360,6 +765,13 @@ def _resolve_layout(
     model_type = _model_type(config, hf_config)
     if model_type:
         source_yaml = yaml_path or getattr(config, "_yaml_path", None)
+        # A custom builder may not expose an HF config until native build.
+        # Reuse the published snapshot's filename identity instead of the
+        # builder function name so check resolves exactly the generate layout.
+        probe = resolve_model_artifact_layout(str(model_type), model_name=None)
+        published = load_codegen_meta(probe.meta_path)
+        if published is not None and published.model_name:
+            model_name = published.model_name
         return resolve_model_artifact_layout(
             str(model_type),
             model_name=model_name,
@@ -442,661 +854,10 @@ def _hf_config_kwargs(model: Any) -> dict[str, Any]:
     return kwargs
 
 
-def _compute_signature(
-    config: Any,
-    layout: ArtifactLayout,
-    *,
-    hf_config: Any = None,
-) -> str:
-    """Canonical signature over the projected spec, parallel dims, overrides,
-    codegen switches, and the resolved modeling source.
-
-    The full ``project_codegen_spec`` projection ensures the digest
-    covers the same fields the plan/emit layers consume.  The YAML file bytes
-    are deliberately excluded (see ``_project_spec``).
-    """
-    spec = _project_spec(config, layout, hf_config=hf_config)
-    return signature_from_spec(spec)
-
-
-def _project_spec(
-    config: Any,
-    layout: ArtifactLayout,
-    *,
-    hf_config: Any = None,
-) -> dict:
-    """CodegenSpec canonical dict used for the signature.
-
-    The payload covers the projected CodegenSpec plus the resolved modeling
-    source (installed transformers module or remote code), ``sha256`` included
-    — a change to the HF modeling file changes the signature and regenerates
-    the bundle.  The YAML file bytes are intentionally NOT hashed: the spec
-    projection already captures every codegen-affecting field, so an unrelated
-    YAML edit (comment, logging, optimizer tweak) must not invalidate a
-    bundle.
-    """
-    from hyper_parallel.codegen.spec.project import project_codegen_spec
-    from hyper_parallel.codegen.source.resolver import resolve_model_source
-
-    payload = project_codegen_spec(config, layout=layout).to_dict()
-    model_id = payload.get("source", {}).get("model_name_or_path") or ""
-    is_gen = _gen_backend(config)
-
-    source = resolve_model_source(config, model_id, hf_config=hf_config)
-    if source is not None:
-        # Replace the SourceSpec projection with the resolved file identity;
-        # the sha256 here is what makes a modeling-file change regenerate.
-        # ``transformers_version`` is a SourceSpec field the pure projection
-        # leaves empty; record the actual env version whenever we resolved a
-        # real file (an environment upgrade that changes the modeling file's
-        # behavior must regenerate, not silently reuse).
-        resolved = source.to_dict()
-        # ``SourceSpec.to_dict`` keeps only architecture / model_type / sha256 —
-        # neither the checkpoint identity nor its structural config.  Without
-        # them, two checkpoints that share a modeling file but differ in shape
-        # (e.g. the same architecture at different layer counts) would produce
-        # the same signature and silently reuse a frozen per-layer plan written
-        # for the other shape.  Fold the model id and a structural-config digest
-        # back in so a shape change invalidates the bundle.
-        resolved["model_id"] = model_id
-        if hf_config is not None:
-            resolved["structure"] = _structure_summary(hf_config)
-        payload["source"] = resolved
-        payload["source"]["transformers_version"] = _transformers_version()
-    elif is_gen:
-        # codegen=True resolves to the ``gen`` backend, whose whole point is
-        # producing an artifact FROM the original modeling file.  A bundle
-        # generated from a guessed/unresolved source would be silently wrong,
-        # so fail fast instead of degrading — the user must fix the model id,
-        # install transformers, or make the checkpoint reachable.
-        raise RuntimeError(
-            f"codegen: cannot resolve modeling source for {model_id!r} — no "
-            "AutoConfig, no installed transformers module, no remote code.  "
-            "The gen backend generates the artifact from the original "
-            "modeling file; fix the model id, install transformers, or make "
-            "the checkpoint reachable"
-        )
-
-    payload["codegen_implementation"] = {
-        "version": CODEGEN_VERSION,
-        "sha256": _codegen_implementation_digest(),
-    }
-    identity = payload.get("source", {}).get("architecture")
-    # The declarations a target resolves to are derived from structure (the
-    # family's runtime factories + the framework archetype table), which live
-    # outside the codegen implementation tree; summarizing them here folds
-    # their content into the signature so a change to a factory's component or
-    # a strategy's body still regenerates an artifact.
-    payload["inline_declarations"] = {
-        "specs": declaration_summary(identity, payload.get("overrides")),
-    }
-
-    return payload
-
-
-_STRUCTURE_FIELDS = (
-    # Architectural (shape-defining) config fields.  A change in any of these
-    # — most importantly the layer/experts counts a per-layer sharding plan is
-    # expanded against — must invalidate a generated bundle even when the
-    # underlying modeling file is unchanged.
-    "num_hidden_layers",
-    "num_layers",
-    "hidden_size",
-    "intermediate_size",
-    "num_attention_heads",
-    "num_key_value_heads",
-    "num_experts",
-    "num_local_experts",
-    "n_routed_experts",
-    "first_k_dense_replace",
-    "moe_intermediate_size",
-    "n_group",
-    "topk_group",
-    "num_experts_per_tok",
-    "top_k",
-)
-
-
-def _structure_summary(hf_config: Any) -> dict[str, Any]:
-    """A stable digest of the config fields that define the model's structure."""
-    return {
-        name: getattr(hf_config, name)
-        for name in _STRUCTURE_FIELDS
-        if getattr(hf_config, name, None) is not None
-    }
-
-
-def _codegen_implementation_digest(package_dir: Optional[str] = None) -> str:
-    """Hash the Python implementation that can affect generated bundles.
-
-    The relative path is part of the digest so moving content between modules
-    is treated as an implementation change. Non-Python files and bytecode
-    caches are excluded because they do not define codegen semantics.
-    """
-    root = os.path.abspath(package_dir or os.path.dirname(__file__))
-    digest = hashlib.sha256()
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(name for name in dirnames if name != "__pycache__")
-        for filename in sorted(filenames):
-            if not filename.endswith(".py"):
-                continue
-            path = os.path.join(dirpath, filename)
-            relative = os.path.relpath(path, root).replace(os.sep, "/")
-            digest.update(relative.encode("utf-8"))
-            digest.update(b"\0")
-            with open(path, "r", encoding="utf-8", newline=None) as handle:
-                digest.update(handle.read().encode("utf-8"))
-            digest.update(b"\0")
-    return digest.hexdigest()
-
-
-def _build_meta(
-    config: Any,
-    layout: ArtifactLayout,
-    signature: str,
-    *,
-    hf_config: Any = None,
-) -> CodegenMeta:
-    """Build the meta record from the same projection the signature used.
-
-    ``meta.source`` is taken verbatim from the signature payload's ``source``
-    (resolved ``ResolvedSource`` dict, or the ``SourceSpec`` projection when
-    nothing resolved) so the recorded identity always matches what the
-    signature covers.
-    """
-    spec = _project_spec(config, layout, hf_config=hf_config)
-    from hyper_parallel.codegen.meta import (
-        COVERED_DEFAULTS,
-        NOT_COVERED_DEFAULT,
-    )
-
-    return CodegenMeta(
-        codegen_version=CODEGEN_VERSION,
-        signature=signature,
-        yaml_path=layout.yaml_path,
-        yaml_sha256=_config_sha256(spec, layout),
-        source=dict(spec.get("source") or {}),
-        parallel_dims=spec.get("parallel_dims", {}),
-        model_name=_model_name(config, hf_config),
-        model_class=_model_class(config, hf_config),
-        # COVERED_DEFAULTS is the starting copy; _fill_plan_fields sets
-        # covered.sharding_plan True once the plan is frozen, so a real
-        # artifact short-circuits the planner and the runtime shards it.  The
-        # entrypoint name is the contract the runtime dispatches on; an inline
-        # artifact that defines no such function is parallelized from meta by
-        # ``runtime._parallelize_inline_from_meta``.
-        covered=dict(COVERED_DEFAULTS),
-        not_covered=list(NOT_COVERED_DEFAULT),
-        entrypoints={"parallelize": "hp_parallelize"},
-    )
-
-
-def _fill_plan_fields(
-    meta: CodegenMeta,
-    config: Any,
-    layout: ArtifactLayout,
-    *,
-    hf_config: Any = None,
-) -> None:
-    """Derive + freeze the sharding plan into ``meta``'s plan slots.
-
-    Generation-time pipeline: build the meta-device model, run the real
-    ``ShardingPlanner`` over the offline mesh, and freeze the result into the
-    ``param_plan`` / ``frozen_sharded_params`` / ``injections`` /
-    ``tied_pairs`` / ``mesh_dim_names`` fields.  Derivation failures are NOT
-    degraded: a None plan or an empty frozen plan would produce a plan-less
-    artifact that still passes preflight (nothing verifies an empty
-    ``param_plan``), so this stage raises and generation fails instead of
-    silently continuing.
-    """
-    from hyper_parallel.codegen.plan.derive import (
-        build_meta_model,
-        build_plan_overrides,
-        derive_sharding_plan,
-    )
-    from hyper_parallel.codegen.plan.freeze import freeze_plan
-    from hyper_parallel.codegen.source.resolver import _trust_remote_code
-    from hyper_parallel.codegen.spec.project import project_codegen_spec
-
-    spec = project_codegen_spec(config, layout=layout)
-    model = build_meta_model(
-        spec,
-        config_overrides=_config_overrides(config),
-        hf_config=hf_config,
-        trust_remote_code=_trust_remote_code(config),
-    )
-    if model is None:
-        raise RuntimeError(
-            "codegen: cannot derive a sharding plan — the spec carries no "
-            "model identity to build the meta model from; fix the model "
-            "source in the YAML"
-        )
-    replace_meta = _apply_generation_replacements(meta, config, model, spec)
-    plan_overrides = build_plan_overrides(config, spec)
-    # S3: a plan override whose matched MoE boundary carries no explicit
-    # ``local_compute_fn`` has its EP compute factory inferred from structure
-    # (never by model name) and written into the spec so it lands in
-    # ``meta.injections``. An explicit ``_target_`` stays the opt-out escape
-    # hatch and is never overwritten.
-    inferred_ep_targets = _fill_inferred_ep_targets(model, plan_overrides)
-    plan = derive_sharding_plan(
-        model,
-        spec,
-        plan_overrides=plan_overrides,
-    )
-    _drop_inferred_ep_injections_on_non_moe(plan, model, inferred_ep_targets)
-    frozen = freeze_plan(plan, model)
-    if not frozen.param_plan:
-        raise RuntimeError(
-            "codegen: plan derivation produced an empty param plan for "
-            f"{spec.source.model_name_or_path!r} — the artifact would carry "
-            "no sharding contract and pass preflight; check the generation "
-            "logs for the planner failure and regenerate"
-        )
-    meta.param_plan = frozen.param_plan
-    meta.frozen_sharded_params = frozen.frozen_sharded_params
-    meta.injections = frozen.injections
-    meta.tied_pairs = frozen.tied_pairs
-    meta.special_handlers = frozen.special_handlers
-    meta.boundary_classes = frozen.boundary_classes
-    meta.mesh_dim_names = list(frozen.mesh_dim_names) or None
-
-    meta.module_overrides = replace_meta
-    # The inline pipeline lowers the matched replacements into the generated
-    # file, so the artifact owns module replacement.  Declare coverage so the
-    # trainer's HF replacement step is skipped on the gen path — but only when
-    # something was actually matched.  ``covered`` is always a
-    # COVERED_DEFAULTS copy, so the key is present either way.
-    meta.covered["module_overrides"] = bool(replace_meta)
-
-    # A non-empty frozen plan is the artifact's full parallel logic; the
-    # runtime shards from ``codegen_meta.json``.  ``covered`` is always a
-    # COVERED_DEFAULTS copy, so the key is present either way.
-    meta.covered["sharding_plan"] = True
-
-
-def _record_inline_declarations(meta: CodegenMeta) -> None:
-    """Record the facts the *runtime* also needs, derived from structure.
-
-    The class names whose ``forward`` an inline strategy body replaces (the EP
-    MoE shell selected by the compute factories this plan injects) are proven
-    by the injected targets' own resolved specs.  Recording them in ``meta``
-    (the file the runtime loads at training time) is what keeps the runtime
-    from carrying its own copy that drifts when a family adds a model.
-    """
-    identity = (meta.source or {}).get("architecture")
-    meta.external_state_classes = list(
-        external_state_classes_for(identity, getattr(meta, "injections", None))
-    )
-
-
-def _apply_generation_replacements(
-    meta: CodegenMeta,
-    config: Any,
-    model: Any,
-    spec: Any,
-) -> list[dict[str, Any]]:
-    """Apply module actions and validate method targets on the generation meta model.
-
-    Generated model ``__init__`` applies module replacements before runtime
-    sharding.  Generation must mirror that order: compile the raw YAML entries
-    against the original meta model to record serializable FQNs, apply the same
-    replacements to the meta model, then derive the sharding plan from the
-    replaced parameter tree.  Otherwise the frozen plan may reference
-    pre-replacement parameters (for example ``q_proj``/``k_proj``/``v_proj``)
-    that no longer exist after a generated attention module installs fused
-    ``qkv_proj`` weights. Method targets are checked after module replacement;
-    their factories run on the live generated model before sharding.
-    """
-    raw_entries = getattr(config, "plan_overrides", None) or []
-    if not raw_entries:
-        return []
-
-    from hyper_parallel.models.replacement import (
-        _apply_module_replacement_actions,
-        _compile_method_replacements,
-    )
-    from hyper_parallel.codegen.emit.replacement import (
-        compile_overrides_for_meta,
-    )
-    from hyper_parallel.trainer.config import (
-        entries_to_method_replacements,
-        entries_to_module_replacements,
-    )
-    from hyper_parallel.trainer.config.replacement import ReplacementTarget  # pylint: disable=import-outside-toplevel
-    from hyper_parallel.components.modules.family import get_module_family  # pylint: disable=import-outside-toplevel
-
-    specs = entries_to_module_replacements(raw_entries)
-    factory_paths = []
-    target_configs = []
-    for entry in raw_entries:
-        action = getattr(entry, "replace", None)
-        if action is None or action.kind != "module":
-            continue
-        implementation = action.implementation
-        if not isinstance(implementation, ReplacementTarget) and get_module_family(implementation.callable):
-            implementation = ReplacementTarget(
-                implementation.callable, target_path=implementation._target_path, **implementation._kwargs,
-            )
-        if isinstance(implementation, ReplacementTarget):
-            selected = implementation.callable
-            factory_paths.append(f"{selected.__module__}.{selected.__qualname__}")
-            static_args = {
-                name: value for name, value in implementation.to_dict().items()
-                if name not in implementation.selectors
-            }
-        else:
-            factory_paths.append(_target_path(implementation))
-            static_args = implementation.to_dict()
-        # The selected family variant is the constructor codegen must inline.
-        # Selector keywords have already been consumed by ReplacementTarget.
-        target_configs.append(
-            {
-                name: value
-                for name, value in static_args.items()
-                if name != "_target_"
-            }
-        )
-    records = compile_overrides_for_meta(
-        model,
-        specs,
-        factory_paths=factory_paths,
-        configs_by_spec={
-            id(spec): config for spec, config in zip(specs, target_configs)
-        },
-    )
-    # ``compile_overrides_for_meta`` already raised on any no-match rule (a
-    # configuration error); every returned record here matched a live module.
-    replace_meta = list(records)
-    if replace_meta:
-        model, _ = _apply_module_replacement_actions(
-            model,
-            specs,
-            context={
-                "low_precision": None,
-                "tp": spec.parallel_dims.tp_size > 1,
-                "cp": spec.parallel_dims.cp_size > 1,
-                "ep": spec.parallel_dims.ep_size > 1,
-                "pp": spec.parallel_dims.pp_size > 1,
-            },
-            capture_checkpoint_metadata=False,
-        )
-    method_specs = entries_to_method_replacements(
-        raw_entries,
-        cp_size=spec.parallel_dims.cp_size,
-        ep_size=spec.parallel_dims.ep_size,
-        sequence_parallel=spec.parallel_dims.sequence_parallel,
-    )
-    _compile_method_replacements(model, method_specs)
-    return replace_meta
-
-
-_STRUCTURAL_CONFIG_KEYS = ("num_hidden_layers", "num_layers", "use_cache")
-
-
-def _config_overrides(config: Any) -> dict[str, Any]:
-    """Return config-only kwargs passed to AutoConfig for generated models.
-
-    ``from_pretrained`` configs carry these explicitly under
-    ``model.config_overrides``.  A ``from_config`` builder instead declares its
-    structure as model-target kwargs (e.g. ``num_hidden_layers``), so when
-    ``config_overrides`` is absent the recognized structural keys are folded in
-    — otherwise the frozen plan would be derived at the source checkpoint's
-    shape and disagree with the (cropped) model the builder constructs.
-    """
-    model = getattr(config, "model", None)
-    overrides = getattr(model, "config_overrides", None)
-    if overrides is None:
-        overrides = {
-            key: getattr(model, key)
-            for key in _STRUCTURAL_CONFIG_KEYS
-            if getattr(model, key, None) is not None
-        }
-    if not isinstance(overrides, dict):
-        raise TypeError(
-            "codegen: model.config_overrides must be a mapping of "
-            f"AutoConfig keyword arguments, got {type(overrides).__name__}"
-        )
-    return dict(overrides)
-
-
-def _target_path(target: Any) -> Optional[str]:
-    """Return the serialized target path for a YAML Target-like object."""
-    if target is None or not hasattr(target, "to_dict"):
-        return None
-    data = target.to_dict()
-    return data.get("_target_") if isinstance(data, dict) else None
-
-
-#: Structure fingerprint -> model-family MoE EP compute factory.
-#:
-#: S3 maps a recognized ``MoeStructure`` (router / shared-expert branch /
-#: expert-storage) to the factory that would have been wired through a YAML
-#: ``replace.implementation``. The mapping is not duplicated here: it is the
-#: same framework structure->archetype table the model adapters project from,
-#: so the fingerprint is the *only* discriminator and a model with the same
-#: structure is covered without new registry work. Built lazily (the archetype
-#: table lives in the distributed package) and cached for the module lifetime.
-_EP_FACTORY_BY_STRUCTURE: dict[tuple[str, str, str], str] | None = None
-
-
-def _build_ep_factory_table() -> dict[tuple[str, str, str], str]:
-    """Project the framework archetype table into a fingerprint->path map."""
-    from hyper_parallel.distributed.expert_parallel.archetypes import (  # pylint: disable=C0415
-        moe_archetypes,
-    )
-
-    return {
-        fingerprint: archetype.compute_factory
-        for fingerprint, archetype in moe_archetypes().items()
-    }
-
-
-def _ep_factory_table() -> dict[tuple[str, str, str], str]:
-    """Return the cached fingerprint->factory ``_target_`` map."""
-    global _EP_FACTORY_BY_STRUCTURE  # pylint: disable=global-statement
-    if _EP_FACTORY_BY_STRUCTURE is None:
-        _EP_FACTORY_BY_STRUCTURE = _build_ep_factory_table()
-    return _EP_FACTORY_BY_STRUCTURE
-
-
-def _fill_inferred_ep_targets(model: Any, plan_overrides: dict[str, Any]) -> set[str]:
-    """S3: fill a missing ``local_compute_fn`` on MoE EP overrides.
-
-    Every desugared plan override whose ``match`` resolves to a MoE boundary
-    but which declares no explicit ``local_compute_fn`` gets its EP compute
-    factory inferred from structure (``detect_moe_structure``). Entries that
-    already carry a ``local_compute_fn`` are left untouched — the public
-    forward replacement remains the escape hatch for
-    structures detection cannot cover. Ordinary (non-MoE) overrides are
-    untouched. This is a no-op on a struct construct; the ``plan_overrides``
-    dict's spec values are mutated in place so ``freeze_injections`` records
-    the inferred factory in ``meta.injections``.
-
-    Returns:
-        The factory paths that were inferred. They identify the injections the
-        framework chose itself, which the plan build must keep off boundaries
-        that cannot host experts (see
-        ``_drop_inferred_ep_injections_on_non_moe``).
-    """
-    inferred: set[str] = set()
-    for match, spec in plan_overrides.items():
-        if getattr(spec, "local_compute_fn", None) is not None:
-            continue
-        target = _infer_ep_compute_for_match(model, match)
-        if target is not None:
-            spec.local_compute_fn = target
-            path = _target_path(target)
-            if path:
-                inferred.add(path)
-    return inferred
-
-
-def _infer_ep_compute_for_match(
-    model: Any, match: str
-) -> Optional["Any"]:
-    """Return the EP compute ``_target_`` covering every MoE block ``match`` hits.
-
-    Resolves ``match`` (an FQN or FQN glob, ``fnmatchcase``) against the meta
-    model's module tree. Returns a ``Target`` for the structure-inferred EP
-    factory when at least one matched module is a MoE boundary; ``None`` when
-    ``match`` touches no MoE boundary (an ordinary sharding override needs no
-    compute injection). An unrecognized MoE structure raises
-    ``UnsupportedModuleStructure`` so the artifact never silently picks a wrong
-    strategy — the escape-hatch text points the user at writing an explicit
-    ``_target_``.
-    """
-    candidate = None
-    candidate_path = None
-    for fqn, module in model.named_modules():
-        if not fnmatchcase(fqn, match):
-            continue
-        if not _looks_like_moe_boundary(module):
-            continue
-        target = _import_ep_target_for(module, match)
-        # Compare the serialized factory path, never the Target objects: every
-        # ``_build_ep_target`` call wraps a fresh closure and ``Target`` defines no
-        # equality, so identity would make any model with two MoE boundaries look
-        # ambiguous even when they share one factory.
-        path = _target_path(target)
-        if candidate is None:
-            candidate, candidate_path = target, path
-        elif path != candidate_path:
-            from hyper_parallel.distributed.expert_parallel.structure import (  # pylint: disable=C0415
-                UnsupportedModuleStructure,
-            )
-
-            raise UnsupportedModuleStructure(
-                f"{match!r} matched multiple MoE boundaries with different "
-                "EP compute factories; declare an explicit "
-                "replace.implementation in the YAML"
-            )
-    return candidate
-
-
-def _drop_inferred_ep_injections_on_non_moe(
-    plan: Any, model: Any, inferred_targets: set[str]
-) -> None:
-    """Keep an *inferred* EP injection off boundaries that cannot host experts.
-
-    The S3 inference fills the factory once per ``match``; the planner's glob
-    merge then hands that spec to every matched boundary, including boundaries
-    with no experts to shard (DeepSeek-V3's dense ``first_k_dense_replace``
-    MLPs). Such a boundary cannot be an expert-parallel region — there is nothing
-    to all-to-all — and the artifact would render a local-region forward whose
-    compute the runtime never binds (the applier resolves an EP factory against a
-    non-MoE module and fails its interface assertion). Dropping the injection
-    here, while the plan is still codegen's own, keeps the artifact coherent.
-
-    Only targets the framework inferred are affected: a user-declared
-    forward replacement stays the escape hatch and is never dropped.
-    """
-    if not inferred_targets:
-        return
-    for fqn, spec in (getattr(plan, "modules", {}) or {}).items():
-        injection = getattr(spec, "local_compute_fn", None)
-        if injection is None or _target_path(injection) not in inferred_targets:
-            continue
-        module = model.get_submodule(fqn) if model is not None else None
-        if module is None or _looks_like_moe_boundary(module):
-            continue
-        logger.info(
-            "codegen: inferred EP injection dropped on %s — %s carries no "
-            "experts/router, so it cannot be an expert-parallel region",
-            fqn, type(module).__name__)
-        spec.local_compute_fn = None
-        spec.region_dispatch = None
-
-
-def _looks_like_moe_boundary(module: Any) -> bool:
-    """Cheap gate: does the module carry an expert plus a router gate?"""
-    return hasattr(module, "experts") and (
-        hasattr(module, "gate") or hasattr(module, "router")
-    )
-
-
-def _import_ep_target_for(module: Any, match: str) -> "Any":
-    """Import the delayed target bound to the structure-inferred factory."""
-    from hyper_parallel.distributed.expert_parallel.structure import (  # pylint: disable=C0415
-        UnsupportedModuleStructure,
-        detect_moe_structure,
-    )
-
-    structure = detect_moe_structure(module)
-    fingerprint = (
-        structure.router,
-        structure.shared_experts,
-        structure.expert_storage,
-    )
-    factory_path = _ep_factory_table().get(fingerprint)
-    if factory_path is None:
-        raise UnsupportedModuleStructure(
-            f"{match!r} matched {type(module).__name__} with structure "
-            f"{fingerprint} that has no EP compute factory. Declare an "
-            "explicit replace.implementation to opt out of structure "
-            "detection."
-        )
-    return _build_ep_target(factory_path)
-
-
-def _build_ep_target(factory_path: str) -> "Any":
-    """Build a delayed ``Target`` for the EP factory at ``factory_path``.
-
-    ``local_compute_fn`` is a *factory* Target — the framework calls
-    ``build()`` (which resolves the import) only at apply time, never during
-    generation. So the callable here resolves lazily; generation serializes
-    only the ``_target_`` path into meta, and the runtime re-resolves it from
-    that path. Deferring the import keeps codegen free of a hard dependency on
-    any concrete model package.
-    """
-    from hyper_parallel.trainer.config.target import Target  # pylint: disable=C0415
-
-    def _factory(**kwargs: Any) -> Any:
-        import importlib  # pylint: disable=C0415
-
-        module_path, _, attr = factory_path.rpartition(".")
-        fn = getattr(importlib.import_module(module_path), attr)
-        return fn(**kwargs)
-
-    return Target(_factory, target_path=factory_path)
-
-
-def _gen_backend(config: Any) -> bool:
-    """Whether the codegen pipeline is active for this config.
-
-    ``codegen=True`` drives artifact generation regardless of the modeling
-    backend (a ``force_hf`` run still generates), so this is simply the
-    codegen switch — and those are exactly the runs that must fail fast
-    when the modeling source cannot be resolved.
-    """
-    return bool(getattr(config, "codegen", False))
-
-
-def _transformers_version() -> str:
-    """Installed transformers version, or ``""`` when not importable.
-
-    Folded into the signature/meta so an environment upgrade that changes the
-    modeling file's behavior regenerates instead of silently reusing.
-    """
-    try:
-        import transformers
-
-        return getattr(transformers, "__version__", "")
-    except ImportError:
-        return ""
-
-
-def _config_sha256(spec: dict, layout: ArtifactLayout) -> str:
-    """Return YAML file hash when available, otherwise hash the projected spec."""
-    if layout.yaml_path:
-        return sha256_file(layout.yaml_path)
-    return hashlib.sha256(canonical_json(spec).encode("utf-8")).hexdigest()
-
-
 __all__ = [
     "CODEGEN_VERSION",
     "barrier_after_artifact",
-    "ensure_codegen_artifact",
+    "ensure_codegen_artifact_from_snapshot",
     "preflight_integrity_check",
     "should_regenerate",
     "wait_for_rank0_artifact",
