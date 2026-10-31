@@ -46,7 +46,8 @@ class DeepseekV41MegaMoeExperts(nn.Module):
     def __init__(self, *, module: nn.Module, module_fqn: str = "",
                  context: Mapping[str, Any] | None = None,
                  dispatch_mode: str = "push", initial_capacity_factor: float | None = None,
-                 capacity_growth_factor: float | None = None, initializer_range: float = 0.02) -> None:
+                 capacity_growth_factor: float | None = None, initializer_range: float = 0.02,
+                 enable_moonep: bool = False) -> None:
         """Convert a full HF holder before EP partitioning and FSDP construction.
 
         Args:
@@ -57,6 +58,7 @@ class DeepseekV41MegaMoeExperts(nn.Module):
             initial_capacity_factor: Push initial receive capacity; None uses the executor default.
             capacity_growth_factor: Push capacity growth multiplier; omit for pull.
             initializer_range: Standard deviation used for meta-model random initialization.
+            enable_moonep: Use optional MoonEP placement while retaining native expert parameters.
         """
         super().__init__()
         del module_fqn
@@ -71,6 +73,7 @@ class DeepseekV41MegaMoeExperts(nn.Module):
         self.dispatch_mode = dispatch_mode
         self.initial_capacity_factor = initial_capacity_factor
         self.capacity_growth_factor = capacity_growth_factor
+        self.enable_moonep = enable_moonep
         source_limit = _swiglu_limit(module.limit)
         if not isinstance(module.act_fn, (nn.SiLU, type(ACT2FN["silu"]))):
             raise ValueError("MegaMoe Trainer replacement requires SiLU")
@@ -111,7 +114,14 @@ class DeepseekV41MegaMoeExperts(nn.Module):
         # Multicore is optional for the default native-EP replacement provider.
         from hyper_parallel.core.multicore import MegaMoeExperts  # pylint: disable=C0415
 
-        self._executor = MegaMoeExperts(
+        executor_type = MegaMoeExperts
+        if self.enable_moonep:
+            from hyper_parallel.core.expert_parallel.moonep.mega_moe import (  # pylint: disable=C0415
+                MoonEPMegaMoeExperts,
+            )
+            executor_type = MoonEPMegaMoeExperts
+
+        self._executor = executor_type(
             hidden_size=self.hidden_size,
             intermediate_size=self.intermediate_size, num_experts=self.global_experts,
             top_k=top_k, ep_group=ep_group, ep_size=ep_size,

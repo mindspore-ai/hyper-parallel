@@ -33,9 +33,10 @@ def _get_npu_grouped_matmul() -> Any:
         """Autograd wrapper around ``torch_npu.npu_grouped_matmul``."""
 
         @staticmethod
-        def forward(ctx: Any, inputs: Any, weight: Any, group_list: Any) -> Any:
+        def forward(ctx: Any, inputs: Any, weight: Any, group_list: Any, gradient_target: Any = None) -> Any:
             """Run one grouped matrix multiplication and retain backward inputs."""
             ctx.save_for_backward(inputs, weight, group_list)
+            ctx.gradient_target = gradient_target
             return torch_npu.npu_grouped_matmul(
                 x=[inputs],
                 weight=[weight],
@@ -60,12 +61,20 @@ def _get_npu_grouped_matmul() -> Any:
                 group_type=0,
                 group_list_type=0,
             )[0]
+            if ctx.gradient_target is not None and ctx.gradient_target.skip_weight_gradient:
+                return grad_inputs, None, None, None
             numel = inputs.numel()
             if (
                 not torch.compiler.is_compiling()
                 and isinstance(numel, int)
                 and numel == 0
             ):
+                grad_weight = torch.zeros_like(weight)
+            elif ctx.gradient_target is not None:
+                buffer = ctx.gradient_target.main_grad
+                torch_npu.npu_grouped_matmul_add_(
+                    buffer.reshape(-1, buffer.shape[-1]), inputs, grad_output, group_list,
+                    transpose_x=True, transpose_weight=False, group_type=2)
                 grad_weight = torch.zeros_like(weight)
             else:
                 grad_weight = torch_npu.npu_grouped_matmul(
@@ -77,7 +86,9 @@ def _get_npu_grouped_matmul() -> Any:
                     group_type=2,
                     group_list_type=0,
                 )[0]
-            return grad_inputs, grad_weight, None
+            if ctx.gradient_target is None:
+                return grad_inputs, grad_weight, None
+            return grad_inputs, grad_weight, None, None
 
     _NPU_GROUPED_MATMUL = _NPUGroupedMatmul
     return _NPU_GROUPED_MATMUL
@@ -88,6 +99,7 @@ def npu_grouped_swiglu(
     gate_up_weight: Any,
     down_weight: Any,
     tokens_per_expert: Any,
+    gradient_targets: Any = None,
 ) -> Any:
     """Run packed local SwiGLU experts with two grouped GEMMs.
 
@@ -115,14 +127,18 @@ def npu_grouped_swiglu(
 
     grouped_matmul = _get_npu_grouped_matmul()
     group_list = torch.cumsum(tokens_per_expert.to(torch.int64), dim=0)
+    gate_options = () if gradient_targets is None or gradient_targets[0] is None else (gradient_targets[0],)
+    down_options = () if gradient_targets is None or gradient_targets[1] is None else (gradient_targets[1],)
     gate_up = grouped_matmul.apply(
         inputs,
         gate_up_weight.transpose(1, 2),
         group_list,
+        *gate_options,
     )
     intermediate = torch_npu.npu_swiglu(gate_up, dim=-1)
     return grouped_matmul.apply(
         intermediate,
         down_weight.transpose(1, 2),
         group_list,
+        *down_options,
     )

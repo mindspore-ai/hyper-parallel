@@ -39,6 +39,62 @@ class TestMegaMoeRoute(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_placement_selection_precedes_growth_and_pull_publication(self) -> None:
+        """Select borrowing before committing symmetric capacity for the original route."""
+        for mode in ("push", "pull"):
+            for selected in (False, True):
+                with self.subTest(mode=mode, selected=selected):
+                    self._selection_precedes_growth(mode, selected)
+
+    def _selection_precedes_growth(self, mode: str, selected: bool) -> None:
+        """Keep the routing table and permutation unchanged across selection decisions."""
+        spec = replace(self._spec(ep_size=2), auto_tokens=True, dispatch_mode=mode)
+        hidden = torch.arange(257 * 4, dtype=torch.float32).reshape(257, 4)
+        ids = torch.tensor([[0, 1]] * 257, dtype=torch.int32)
+        probs = torch.ones(257, 2)
+        payload = torch.tensor([[0, 257, 15, 257, 257, 0, 0], [0, 0, 15, 0, 0, 0, 0]])
+        workspace = Mock(in_use=False, source_buffer=None)
+        staged = hidden.repeat_interleave(2, dim=0)
+        mapping = torch.arange(514, dtype=torch.int32)
+        order = []
+
+        def gather(output: Any, unused_value: Any, **_kwargs: Any) -> Mock:
+            output.copy_(payload.flatten())
+            return Mock(wait=lambda: order.append("wait"))
+
+        def choose(counts: torch.Tensor, tokens: int, maximum: int, total: int | None) -> bool:
+            self.assertEqual(order, ["wait"])
+            torch.testing.assert_close(counts, payload[:, 3:].to(torch.int32))
+            self.assertEqual((tokens, maximum, total), (384, 514, 514))
+            self.assertIsNone(workspace.source_buffer)
+            order.append("choose")
+            return selected
+
+        def grow(tokens: int, received: int) -> None:
+            self.assertEqual(order, ["wait", "choose"])
+            self.assertEqual((tokens, received), (384, 514))
+            workspace.source_buffer = torch.empty(tokens * 2, 4)
+            workspace.in_use = mode == "pull"
+            order.append("grow")
+
+        with (patch.object(route_module.dist, "all_gather_into_tensor", side_effect=gather) as exchange,
+              patch.object(route_module, "_stage_dynamic_permutation", return_value=None),
+              patch.object(route_module, "_permute_topk_input", return_value=(staged, mapping)),
+              patch.object(route_module, "_permute_topk_input_out", return_value=(staged, mapping))):
+            result = prepare_topk_route(
+                hidden, ids, probs, spec, None, workspace, autograd_mask=15,
+                prepare_workspace=grow, select_route=choose,
+            )
+        self.assertEqual(exchange.call_count, 1)
+        self.assertEqual(order, ["wait", "choose", "grow"] if selected else ["wait", "choose"])
+        torch.testing.assert_close(result.routed_tokens, staged)
+        self.assertEqual(result.metadata.plan_tokens, 384)
+        if not selected:
+            self.assertIsNone(workspace.source_buffer)
+            self.assertFalse(workspace.in_use)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_automatic_route_grows_before_writing_pull_source(self) -> None:
         """Feature: MegaMoe route preparation.
 

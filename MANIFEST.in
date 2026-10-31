@@ -27,3 +27,5 @@ global-exclude *.dll
 global-exclude .git*
 global-exclude .gitignore
 global-exclude .commit_id
+
+recursive-include hyper_parallel/core/expert_parallel/moonep *.asc

@@ -160,6 +160,47 @@ class TestMegaMoeHeapManager(unittest.TestCase):
         self.assertIs(manager.entries[0].bound_spec, spec)
         self.assertEqual(manager.state, "ready")
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_prereserved_automatic_rows_bind_without_redundant_growth(self) -> None:
+        """A lazy virtual owner honors its final route capacity at the first bind."""
+        for mode in ("push", "pull"):
+            with self.subTest(mode=mode):
+                specification = {"local_num_tokens": 128, "hidden_size": 16, "intermediate_size": 8,
+                                 "num_experts": 4, "top_k": 2, "ep_size": 2, "dispatch_mode": mode,
+                                 "initial_capacity_factor": None, "auto_tokens": True}
+                layout = _workspace_layout(specification, torch.bfloat16, capacity=1792, token_capacity=512)
+                manager = self._manager_with_reservation(specification, layout)
+                original = MegaMoeSpec(128, 16, 8, 4, 2, None, 256, 2, None, 0, 24,
+                                       dispatch_mode=mode, auto_tokens=True)
+                workspace = MegaMoeWorkspace(shared=True)
+                workspace.capacity_floor = manager.bind(workspace, original, specification)
+                committed = manager.workspace_spec(workspace)
+                self.assertEqual((committed.local_num_tokens, committed.receive_capacity), (512, 1792))
+                self.assertEqual(original.local_num_tokens, 128)
+                with patch.object(shmem, "_restart", side_effect=self._cpu_restart) as restart:
+                    for tokens, received in ((128, 1), (512, 1792), (128, 0), (512, 1792)):
+                        self.assertIs(manager.ensure_token_capacity(workspace, tokens, received), committed)
+                    restart.assert_not_called()
+                self.assertEqual(manager.epoch, 0)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_new_virtual_workspace_and_bank_reserve_in_one_restart(self) -> None:
+        """Reserve both cold owners atomically and reuse their identities afterwards."""
+        ordinary, virtual, bank = {}, {}, {"kind": "expert_bank"}
+        manager = self._manager_with_reservation(ordinary, self._layout(1024, 128, "ordinary"))
+        manager._runtime_attached = True
+        reservations = ((virtual, self._layout(4 * 1024**2, 512, "virtual")),
+                        (bank, self._layout(4 * 1024**2, 2, "bank")))
+        with patch.object(shmem, "_restart", side_effect=self._cpu_restart) as restart:
+            manager.reserve(reservations, allow_resize=True)
+            self.assertEqual(restart.call_count, 1)
+            self.assertEqual(len(manager.entries), 3)
+            manager.reserve(reservations, allow_resize=True)
+            self.assertEqual(restart.call_count, 1)
+        self.assertEqual(manager.epoch, 1)
+
     def setUp(self) -> None:
         """Install one-rank lifecycle and configuration boundaries."""
         self.reference = SimpleNamespace(

@@ -292,8 +292,20 @@ class _HeapManager:
                         raise RuntimeError("SHMEM Heap owner is already bound")
                     entry.workspace = workspace
                     entry.bound_spec = bound_spec
+                    if entry.layout.token_capacity is not None and (
+                            entry.layout.token_capacity != bound_spec.local_num_tokens
+                            or entry.layout.receive_capacity != bound_spec.receive_capacity):
+                        entry.bound_spec = self._layout_spec(entry, entry.layout)
                     return entry.layout.receive_capacity
         raise RuntimeError("SHMEM Heap owner was not reserved")
+
+    def workspace_spec(self, workspace: MegaMoeWorkspace) -> MegaMoeSpec:
+        """Return the physical specification committed for a bound workspace."""
+        with self._lock:
+            spec = self._entry_for_workspace(workspace).bound_spec
+            if spec is None:
+                raise RuntimeError("SHMEM Heap workspace has no bound MegaMoe specification")
+            return spec
 
     def close_workspace(self, workspace: MegaMoeWorkspace) -> None:
         """Close and remove one bound workspace without releasing the Runtime user."""

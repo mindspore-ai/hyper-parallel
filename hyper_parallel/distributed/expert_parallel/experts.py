@@ -36,10 +36,12 @@ import logging
 import math
 import os
 from dataclasses import dataclass
-from typing import Any, Callable, NamedTuple, Optional
+from typing import Any, Callable, NamedTuple, Optional, Union
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+
+from hyper_parallel.core.expert_parallel.moonep.precision import expert_linear
 
 from hyper_parallel.components.functional.npu_grouped_swiglu import (
     npu_grouped_swiglu,
@@ -83,10 +85,18 @@ class _EPDispatch:
     expert_indices: torch.Tensor
     send_counts: list[int]
     receive_counts: list[int]
+    moon_selection: Optional[Any] = None
+
+
+def _expert_parameter(experts: Any, name: str,
+                      parameters: Optional[dict[str, torch.Tensor]]) -> Optional[torch.Tensor]:
+    """Resolve functional weights without replacing a registered Parameter."""
+    return getattr(experts, name, None) if parameters is None else parameters.get(name)
 
 
 def resolve_swiglu_weights(
     experts: Any,
+    expert_parameters: Optional[dict[str, torch.Tensor]] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
     """Resolve SwiGLU weights from the stacked holder (three layouts).
 
@@ -98,19 +108,19 @@ def resolve_swiglu_weights(
       down_proj); w_up=None marks the fused case (the compute side chunks
       out gate/up).
     """
-    w_fused = getattr(experts, "gate_up_proj", None)
+    w_fused = _expert_parameter(experts, "gate_up_proj", expert_parameters)
     if w_fused is None:
-        w_fused = getattr(experts, "gate_and_up_projs", None)
-    w_down = getattr(experts, "down_proj", None)
-    w_down = w_down if w_down is not None else getattr(experts, "down_projs", None)
-    w_down = w_down if w_down is not None else getattr(experts, "w2", None)
+        w_fused = _expert_parameter(experts, "gate_and_up_projs", expert_parameters)
+    w_down = _expert_parameter(experts, "down_proj", expert_parameters)
+    w_down = w_down if w_down is not None else _expert_parameter(experts, "down_projs", expert_parameters)
+    w_down = w_down if w_down is not None else _expert_parameter(experts, "w2", expert_parameters)
     if w_fused is not None and w_down is not None:
         return w_fused, None, w_down
 
-    w_gate = getattr(experts, "gate_proj", None)
-    w_gate = w_gate if w_gate is not None else getattr(experts, "w1", None)
-    w_up = getattr(experts, "up_proj", None)
-    w_up = w_up if w_up is not None else getattr(experts, "w3", None)
+    w_gate = _expert_parameter(experts, "gate_proj", expert_parameters)
+    w_gate = w_gate if w_gate is not None else _expert_parameter(experts, "w1", expert_parameters)
+    w_up = _expert_parameter(experts, "up_proj", expert_parameters)
+    w_up = w_up if w_up is not None else _expert_parameter(experts, "w3", expert_parameters)
     if w_gate is None or w_up is None or w_down is None:
         raise NotImplementedError(
             f"{type(experts).__name__}: only SwiGLU experts are supported "
@@ -213,7 +223,8 @@ def _expert_token_counts(indices: torch.Tensor, num_experts: int) -> torch.Tenso
     return counts.scatter_add_(0, flat, torch.ones_like(flat))
 
 
-def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indices):
+def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indices, *,
+                                 moon_placement: Optional[Any] = None):
     """Compute dispatched tokens with the local stacked SwiGLU experts.
 
     This function is installed as ``experts.forward`` for the HF-native EP
@@ -221,45 +232,73 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
     the parent MoE forward, allows nested FSDP forward hooks to unshard and
     reshard expert parameters around the local computation.
     """
+    local_expert_count = experts.local_expert_count
+    expert_parameters = None
+    expert_gradient_targets = None
+    if moon_placement is not None:
+        # The real experts Module's FSDP forward hooks have already run.
+        expert_parameters, expert_gradient_targets = moon_placement.parameters(experts)
+        local_expert_count *= 2
     token_order = _argsort_keys(
-        local_expert_indices, bound=experts.local_expert_count)
+        local_expert_indices, bound=local_expert_count)
     sorted_states = dispatched_states[token_order]
     local_expert_counts = _expert_token_counts(
-        local_expert_indices, experts.local_expert_count)
+        local_expert_indices, local_expert_count)
     if getattr(experts, "_ep_use_grouped_gemm", False):
         grouped_forward = getattr(experts, "forward_expert_major", None)
         if callable(grouped_forward):
-            sorted_output = grouped_forward(sorted_states, local_expert_counts)
+            if expert_parameters is None:
+                sorted_output = grouped_forward(sorted_states, local_expert_counts)
+            else:
+                options = {"expert_parameters": expert_parameters}
+                if expert_gradient_targets is not None:
+                    options["expert_gradient_targets"] = expert_gradient_targets
+                sorted_output = grouped_forward(sorted_states, local_expert_counts, **options)
         else:
-            gate_weight, up_weight, down_weight = resolve_swiglu_weights(experts)
+            gate_weight, up_weight, down_weight = resolve_swiglu_weights(experts, expert_parameters)
             if up_weight is not None:
                 raise ValueError(
                     "EP grouped GEMM currently requires packed gate_up_proj weights"
                 )
+            grouped_options = {}
+            if expert_gradient_targets is not None:
+                targets_by_id = {id(expert_parameters[name]): target
+                                 for name, target in expert_gradient_targets.items()}
+                gate_target = targets_by_id.get(id(gate_weight))
+                down_target = targets_by_id.get(id(down_weight))
+                if gate_target is not None:
+                    gate_target.configure(tuple(gate_weight.transpose(1, 2).shape), True)
+                if down_target is not None:
+                    down_target.configure(tuple(down_weight.transpose(1, 2).shape), True)
+                grouped_options['gradient_targets'] = (gate_target, down_target)
             sorted_output = npu_grouped_swiglu(
-                sorted_states,
-                gate_weight,
-                down_weight,
-                local_expert_counts,
-            )
+                sorted_states, gate_weight, down_weight, local_expert_counts, **grouped_options)
+        if expert_parameters is not None and sorted_states.shape[0] == 0:
+            control = next((parameter for parameter in expert_parameters.values() if parameter.requires_grad), None)
+            if control is not None:
+                sorted_output = sorted_output + control.reshape(-1)[:0].sum().to(sorted_output.dtype)
         output = torch.empty_like(sorted_output)
         output[token_order] = sorted_output
         return output
 
-    gate_weight, up_weight, down_weight = resolve_swiglu_weights(experts)
+    gate_weight, up_weight, down_weight = resolve_swiglu_weights(experts, expert_parameters)
     # The eager path needs host ints: read them in one transfer rather than
     # draining the queue once per local expert.
+    gate_target = up_target = down_target = None
+    if expert_gradient_targets is not None:
+        targets_by_id = {id(expert_parameters[name]): target for name, target in expert_gradient_targets.items()}
+        gate_target = targets_by_id.get(id(gate_weight))
+        up_target = targets_by_id.get(id(up_weight))
+        down_target = targets_by_id.get(id(down_weight))
     expert_token_counts = local_expert_counts.tolist()
     sorted_outputs = []
     token_start = 0
-    for local_expert_index in range(experts.local_expert_count):
+    for local_expert_index in range(local_expert_count):
         expert_token_count = expert_token_counts[local_expert_index]
         expert_states = sorted_states[token_start:token_start + expert_token_count]
         if up_weight is None:
-            gate_up_states = F.linear(  # pylint: disable=not-callable
-                expert_states,
-                gate_weight[local_expert_index],
-            )
+            gate_up_states = (F.linear(expert_states, gate_weight[local_expert_index]) if gate_target is None
+                              else expert_linear(expert_states, gate_weight, local_expert_index, gate_target))
             apply_gate = getattr(experts, "_ep_apply_gate", None)
             if apply_gate is None:
                 gate_states, up_states = gate_up_states.chunk(2, dim=-1)
@@ -268,20 +307,15 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
             else:
                 activated_states = apply_gate(gate_up_states)
         else:
-            gate_states = F.linear(  # pylint: disable=not-callable
-                expert_states, gate_weight[local_expert_index]
-            )
-            up_states = F.linear(  # pylint: disable=not-callable
-                expert_states, up_weight[local_expert_index]
-            )
+            gate_states = (F.linear(expert_states, gate_weight[local_expert_index]) if gate_target is None
+                           else expert_linear(expert_states, gate_weight, local_expert_index, gate_target))
+            up_states = (F.linear(expert_states, up_weight[local_expert_index]) if up_target is None
+                         else expert_linear(expert_states, up_weight, local_expert_index, up_target))
             activation = getattr(experts, "_ep_act_fn", F.silu)
             activated_states = activation(gate_states) * up_states
         sorted_outputs.append(
-            F.linear(  # pylint: disable=not-callable
-                activated_states,
-                down_weight[local_expert_index],
-            )
-        )
+            F.linear(activated_states, down_weight[local_expert_index]) if down_target is None
+            else expert_linear(activated_states, down_weight, local_expert_index, down_target))
         token_start += expert_token_count
 
     sorted_output = torch.cat(sorted_outputs)
@@ -433,6 +467,7 @@ def _prepare_ep_dispatch(
     ep_size: int,
     ep_group: Any,
     keep: Optional[torch.Tensor] = None,
+    moonep_experts: Optional[Any] = None,
 ) -> _EPDispatch:
     """Sort routed tokens and exchange per-rank dispatch counts.
 
@@ -465,6 +500,17 @@ def _prepare_ep_dispatch(
     )
     dispatched_states = flattened_states[source_indices[dispatch_order]].contiguous()
     dispatched_indices = expert_indices[dispatch_order].unsqueeze(-1).contiguous()
+    if moonep_experts is not None:
+        selection = _select_moonep_route(
+            moonep_experts, dispatched_states, dispatched_indices, global_expert_count, ep_group)
+        if selection.invocation is not None:
+            order = _argsort_keys(selection.virtual_ids.reshape(-1), bound=2 * global_expert_count)
+            dispatched_states = dispatched_states[order].contiguous()
+            dispatched_indices = selection.virtual_ids[order].contiguous()
+            dispatch_order = dispatch_order[order]
+        return _EPDispatch(
+            source_indices, expert_weights, dispatch_order, dispatched_states, dispatched_indices,
+            selection.send_counts, selection.receive_counts, selection)
     # The counts exchange is a host-serialising step: a synchronous all-to-all followed
     # by two ``.tolist()`` drains, and a drain waits for everything already enqueued on
     # the stream, so the token all-to-all cannot be enqueued until the counts land.  When
@@ -642,6 +688,43 @@ def _ep_dispatch_chunks(
     return _EPDispatchChunks(send_plan, recv_plan, row_ranges)
 
 
+def _call_ep_experts(module: Any, states: torch.Tensor, indices: torch.Tensor,
+                     selection: Optional[Any] = None, expected_rows: Optional[int] = None) -> torch.Tensor:
+    """Keep the actual experts Module boundary and its FSDP forward hooks."""
+    if selection is not None and expected_rows is not None and states.shape[0] != expected_rows:
+        raise ValueError("MoonEP received token rows differ from its selected count table")
+    if selection is None or selection.invocation is None:
+        return module.experts(states, indices)
+    return module.experts(states, indices, moon_placement=selection.invocation)
+
+
+def _select_moonep_route(experts: Any, states: torch.Tensor, expert_indices: torch.Tensor,
+                         global_experts: int, ep_group: Any) -> Any:
+    """Select owners and reuse the global table instead of another count exchange."""
+    # Keep the optional MoonEP planner out of the disabled native import path.
+    from hyper_parallel.core.expert_parallel.moonep.native import prepare_native_placement  # pylint: disable=C0415
+
+    local_experts = experts.local_expert_count
+    hidden = states.shape[-1]
+    intermediate = getattr(experts, "intermediate_size", getattr(experts, "intermediate_dim", None))
+    if intermediate is None:
+        raise ValueError("MoonEP native experts must expose their intermediate dimension")
+    # The HP scheduler exposes compute dtype without unsharding or reading values.
+    scheduler = getattr(experts, "hsdp_scheduler", None)
+    forward_dtype = None if scheduler is None else scheduler.mp_policy.param_dtype
+    element_size = max((forward_dtype or parameter.dtype).itemsize
+                       for parameter in experts.parameters(recurse=False))
+    projections = 3 if getattr(experts, "has_gate", True) else 2
+    weight_bytes = local_experts * hidden * intermediate * projections * element_size
+    if getattr(experts, "add_bias", False):
+        weight_bytes += local_experts * ((projections - 1) * intermediate + hidden) * element_size
+    return prepare_native_placement(
+        states, expert_indices, _expert_token_counts(expert_indices.reshape(-1), global_experts),
+        ep_group=ep_group, hidden_size=hidden, intermediate_size=intermediate,
+        cube_cores=torch.npu.get_device_limit(states.device.index)["cube_core_num"], weight_bytes=weight_bytes,
+        projection_flops=2 * projections)
+
+
 def _run_ep_local_experts(
     module: Any,
     dispatched_states: torch.Tensor,
@@ -650,13 +733,18 @@ def _run_ep_local_experts(
     receive_counts: list[int],
     ep_group: Any,
     expert_offset: int,
+    moon_selection: Optional[Any] = None,
 ) -> torch.Tensor:
     """Dispatch tokens, run local experts, and return combined expert outputs."""
     received_states = ep_all_to_all(dispatched_states, send_counts, receive_counts, ep_group)
     received_indices = ep_all_to_all(
         dispatched_indices, send_counts, receive_counts, ep_group
     ).squeeze(-1)
-    local_outputs = module.experts(received_states, received_indices - expert_offset)
+    if moon_selection is None:
+        local_outputs = module.experts(received_states, received_indices - expert_offset)
+    else:
+        local_outputs = _call_ep_experts(
+            module, received_states, received_indices - expert_offset, moon_selection, sum(receive_counts))
     return ep_all_to_all(local_outputs.contiguous(), receive_counts, send_counts, ep_group)
 
 
@@ -905,6 +993,7 @@ def _run_ep_local_experts_chunked(
     dispatched_indices: torch.Tensor,
     ep_group: Any,
     expert_offset: int,
+    moon_selection: Optional[Any] = None,
 ) -> list[torch.Tensor]:
     """Dispatch, run the local experts and combine, one chunk at a time.
 
@@ -956,9 +1045,15 @@ def _run_ep_local_experts_chunked(
         # their GEMM overlaps.
         following = issue(chunk + 1) if chunk + 1 < chunk_count else None
         received_states, received_indices = incoming
-        local_outputs = module.experts(
-            wait_ep_all_to_all(received_states),
-            wait_ep_all_to_all(received_indices) - expert_offset)
+        if moon_selection is None:
+            local_outputs = module.experts(
+                wait_ep_all_to_all(received_states),
+                wait_ep_all_to_all(received_indices) - expert_offset)
+        else:
+            local_outputs = _call_ep_experts(
+                module, wait_ep_all_to_all(received_states),
+                wait_ep_all_to_all(received_indices) - expert_offset,
+                moon_selection, sum(plan.recv_counts[chunk]))
         combined_chunks.append(ep_all_to_all_async(
             local_outputs.contiguous(),
             plan.recv_counts[chunk],
@@ -993,6 +1088,7 @@ def _chunked_ep_forward(
         dispatch.expert_indices,
         ep_group,
         expert_offset,
+        dispatch.moon_selection,
     )
     return _aggregate_ep_chunks(
         combined_chunks,
@@ -1010,6 +1106,7 @@ def ep_routed_forward(
     *,
     router_fn: Callable,
     ep_group: Any,
+    enable_moonep: bool = False,
 ) -> torch.Tensor:
     """Routed-experts pipeline: SP-in (local chunk) -> all communication
     inside -> SP-out. **Routed branch only.**
@@ -1078,7 +1175,10 @@ def ep_routed_forward(
         global_expert_count=global_expert_count,
         ep_size=ep_size,
         ep_group=ep_group,
+        moonep_experts=module.experts if enable_moonep else None,
     )
+    if dispatch.moon_selection is not None and dispatch.moon_selection.invocation is not None:
+        expert_offset *= 2
     if chunk_count > 1:
         return _chunked_ep_forward(
             module, dispatch, ep_group, ep_size, ep_rank, chunk_count, expert_offset,
@@ -1092,6 +1192,7 @@ def ep_routed_forward(
         dispatch.receive_counts,
         ep_group,
         expert_offset,
+        dispatch.moon_selection,
     )
     return _aggregate_ep_outputs(
         combined_expert_outputs,
@@ -1115,6 +1216,7 @@ class _EPRoutedChunks(NamedTuple):
     received_states: list
     received_indices: list
 
+    moon_selection: Optional[Any] = None
 
 class EPRoutedState(NamedTuple):
     """Pending routed-experts state between dispatch and experts+combine.
@@ -1144,6 +1246,19 @@ class EPRoutedState(NamedTuple):
     receive_counts: list
     output_shape: tuple
     chunks: Optional[_EPRoutedChunks] = None
+
+
+@dataclass(frozen=True)
+class _MoonEPRoutedState:
+    """Keep opt-in flat dispatch context outside the public nine-field state.
+
+    Attributes:
+        original: The unchanged HP pending exchange and combine metadata.
+        selection: Per-forward virtual ownership and weight transport context.
+    """
+
+    original: EPRoutedState
+    selection: Any
 
 
 def _capacity_limited_slots(
@@ -1214,7 +1329,7 @@ def _issue_chunked_dispatch(
         dispatch.send_counts,
         dispatch.receive_counts,
         (batch_size, sequence_length, hidden_size),
-        _EPRoutedChunks(plan, chunk_states, chunk_indices),
+        _EPRoutedChunks(plan, chunk_states, chunk_indices, dispatch.moon_selection),
     )
 
 
@@ -1224,7 +1339,8 @@ def ep_routed_dispatch(
     *,
     router_fn: Callable,
     ep_group: Any,
-) -> EPRoutedState:
+    enable_moonep: bool = False,
+) -> Union[EPRoutedState, _MoonEPRoutedState]:
     """Route locally and **launch** the token exchange without waiting.
 
     Same routing/dispatch preparation as :func:`ep_routed_forward`, but the two
@@ -1254,7 +1370,7 @@ def ep_routed_dispatch(
         ep_group: Extended EP process group.
 
     Returns:
-        The pending :class:`EPRoutedState` to hand to
+        The unchanged EPRoutedState, or an opt-in flat MoonEP context wrapper, to hand to
         :func:`ep_routed_experts_and_combine`.
     """
     ep_size = ep_group.size()
@@ -1279,6 +1395,7 @@ def ep_routed_dispatch(
         global_expert_count=global_expert_count,
         ep_size=ep_size,
         ep_group=ep_group,
+        moonep_experts=module.experts if enable_moonep else None,
         keep=keep,
     )
     source_token_indices = dispatch.source_indices
@@ -1307,7 +1424,7 @@ def ep_routed_dispatch(
         # squeeze is a view, so the wait stays deferred until the experts read it.
         received_indices = ep_all_to_all_async(
             dispatched_expert_indices, send_counts, receive_counts, ep_group).squeeze(-1)
-    return EPRoutedState(
+    state = EPRoutedState(
         source_token_indices,
         flattened_expert_weights,
         dispatch_order,
@@ -1318,10 +1435,13 @@ def ep_routed_dispatch(
         (batch_size, sequence_length, hidden_size),
     )
 
+    if dispatch.moon_selection is not None:
+        return _MoonEPRoutedState(state, dispatch.moon_selection)
+    return state
 
 def ep_routed_experts_and_combine(
     module: Any,
-    state: EPRoutedState,
+    state: Union[EPRoutedState, _MoonEPRoutedState],
     ep_group: Any,
 ) -> torch.Tensor:
     """Run the local experts on a dispatched state and exchange the outputs back.
@@ -1347,15 +1467,28 @@ def ep_routed_experts_and_combine(
     Returns:
         The routed branch output, shape ``state.output_shape``.
     """
+    moon_selection = None
+    if isinstance(state, _MoonEPRoutedState):
+        moon_selection, state = state.selection, state.original
+    elif state.chunks is not None:
+        moon_selection = state.chunks.moon_selection
     expert_offset = dist.get_rank(group=ep_group) * module.experts.local_expert_count
+    if moon_selection is not None and moon_selection.invocation is not None:
+        expert_offset *= 2
     if state.chunks is not None:
         plan = state.chunks.plan
         combined_chunks = []
         for chunk, (received_states, received_indices) in enumerate(
                 zip(state.chunks.received_states, state.chunks.received_indices)):
-            local_outputs = module.experts(
-                wait_ep_all_to_all(received_states),
-                wait_ep_all_to_all(received_indices) - expert_offset)
+            if moon_selection is None:
+                local_outputs = module.experts(
+                    wait_ep_all_to_all(received_states),
+                    wait_ep_all_to_all(received_indices) - expert_offset)
+            else:
+                local_outputs = _call_ep_experts(
+                    module, wait_ep_all_to_all(received_states),
+                    wait_ep_all_to_all(received_indices) - expert_offset,
+                    moon_selection, sum(plan.recv_counts[chunk]))
             combined_chunks.append(ep_all_to_all_async(
                 local_outputs.contiguous(),
                 plan.recv_counts[chunk],
@@ -1370,9 +1503,15 @@ def ep_routed_experts_and_combine(
             state.dispatch_order,
             state.output_shape,
         )
-    local_outputs = module.experts(
-        wait_ep_all_to_all(state.received_states),
-        wait_ep_all_to_all(state.received_indices) - expert_offset)
+    if moon_selection is None:
+        local_outputs = module.experts(
+            wait_ep_all_to_all(state.received_states),
+            wait_ep_all_to_all(state.received_indices) - expert_offset)
+    else:
+        local_outputs = _call_ep_experts(
+            module, wait_ep_all_to_all(state.received_states),
+            wait_ep_all_to_all(state.received_indices) - expert_offset,
+            moon_selection, sum(state.receive_counts))
     combined_expert_outputs = ep_all_to_all_async(
         local_outputs.contiguous(), state.receive_counts, state.send_counts, ep_group)
     return _aggregate_ep_outputs(

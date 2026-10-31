@@ -28,7 +28,7 @@ class GMMFunction(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx: Any,
-        original_weight: torch.Tensor,
+        original_weight: Any,
         x: torch.Tensor,
         weight: torch.Tensor,
         bias: Optional[torch.Tensor],
@@ -90,6 +90,9 @@ class GMMFunction(torch.autograd.Function):
         )
         dx = dx_list[0]
 
+        if getattr(original_weight, "skip_weight_gradient", False):
+            return None, dx, None, None, None
+
         grad_weight = None
         use_fusion = False
         if ctx.gemm_fusion:
@@ -111,7 +114,7 @@ class GMMFunction(torch.autograd.Function):
                 group_type=2
             )
 
-            if getattr(weight, 'zero_out_wgrad', False):
+            if getattr(original_weight, 'zero_out_wgrad', False) or getattr(weight, 'zero_out_wgrad', False):
                 grad_weight = torch.zeros_like(weight)
             else:
                 grad_weight = torch.empty_like(weight)
@@ -147,7 +150,7 @@ def grouped_matmul(
     group_type: int = 0,
     group_list_type: int = 0,
     gemm_fusion: bool = False,
-    original_weight: Optional[torch.Tensor] = None,
+    original_weight: Any = None,
 ) -> torch.Tensor:
     """Apply NPU grouped matrix multiplication.
 
@@ -159,7 +162,8 @@ def grouped_matmul(
         group_type: Grouping axis accepted by ``npu_grouped_matmul``.
         group_list_type: Group-list representation accepted by the NPU kernel.
         gemm_fusion: Whether to accumulate the weight gradient into ``main_grad``.
-        original_weight: Parameter that owns ``main_grad``. Defaults to ``weight``.
+        original_weight: Parameter or explicit invocation accumulator owning ``main_grad``.
+            Defaults to ``weight``.
 
     Returns:
         The grouped matrix multiplication output.
