@@ -65,10 +65,12 @@ plan_overrides:
   - match:
       - "blocks.*.attn1"
       - "blocks.*.attn2"
-    module_type: diffusers.models.transformers.transformer_wan.WanAttention
-    replace_module:
-      _target_: hyper_parallel.models.wan.adapter.replacements.replace_wan_attention_backend
-      backend: _native_npu
+    replace:
+      kind: module
+      source_type: diffusers.models.transformers.transformer_wan.WanAttention
+      implementation:
+        _target_: hyper_parallel.models.wan.adapter.replacements.replace_wan_attention_backend
+        backend: _native_npu
 
 mixed_precision:
   enabled: false
