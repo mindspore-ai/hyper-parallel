@@ -13,13 +13,19 @@
 # limitations under the License.
 # ============================================================================
 """Launch MindSpore reentrant-checkpoint validation on one Ascend device."""
+from pathlib import Path
+
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, MindSporeCase
 
 
-_CASE_FILE = "reentrant_checkpoint.py"
+_CASE_FILE = str(Path(__file__).with_name("reentrant_checkpoint.py"))
 _CASES = (
     "test_reentrant_exclude_result_correctness",
+    "test_reentrant_exclude_rebuilds_saved_input_from_replay",
+    "test_reentrant_exclude_repeated_calls_correctness",
+    "test_reentrant_prefired_recompute_supports_dxdw_split",
+    "test_reentrant_external_cell_parameter_gets_gradient",
     "test_reentrant_checkpoint_device_peak_memory",
     "test_reentrant_checkpoint_host_dispatch_performance",
     "test_reentrant_checkpoint_device_memory_no_leak",

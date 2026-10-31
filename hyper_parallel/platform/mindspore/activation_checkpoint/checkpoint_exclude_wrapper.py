@@ -13,11 +13,12 @@
 # limitations under the License.
 # ============================================================================
 """MindSpore wrapper for regions that should be saved instead of recomputed."""
+import contextlib
 from collections import defaultdict, deque
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import cached_property, lru_cache
-from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import mindspore as ms
 from mindspore.common._grad_function import _Function
@@ -125,14 +126,41 @@ class _PackState:
 _ACTIVE_PACK_STATE: ContextVar[Any] = ContextVar(
     "hyper_parallel_checkpoint_exclude_pack_state", default=None
 )
+_CURRENT_REENTRANT_EXCLUDE_RUNNER: ContextVar[Any] = ContextVar(
+    "hyper_parallel_reentrant_exclude_runner", default=None
+)
+
+
+@contextlib.contextmanager
+def reentrant_exclude_runner_ctx(runner: Any) -> Iterator[None]:
+    """Install the reentrant exclude runner for the current checkpoint phase.
+
+    Args:
+        runner: Callable handling one shared exclusion wrapper call.
+    """
+    token = _CURRENT_REENTRANT_EXCLUDE_RUNNER.set(runner)
+    try:
+        yield
+    finally:
+        _CURRENT_REENTRANT_EXCLUDE_RUNNER.reset(token)
 
 
 @dataclass
 class _ExcludeCacheEntry:
-    """Store one excluded call's output and deferred input bindings."""
+    """Store one excluded call's output, deferred inputs, and replay state."""
 
     output: Any
     input_bindings: List[_InputBinding]
+    parameter_count: int = 0
+    rng_state: Any = None
+    tape: Any = None
+
+    def release(self) -> None:
+        """Release cached output and any retained local backward graph."""
+        self.output = None
+        self.input_bindings.clear()
+        if self.tape is not None:
+            self.tape.release()
 
 
 class _ExcludeCache:
@@ -141,13 +169,25 @@ class _ExcludeCache:
     def __init__(self) -> None:
         """Initialize an empty per-checkpoint output cache."""
         self._entries: Dict[int, Deque[_ExcludeCacheEntry]] = defaultdict(deque)
+        self._retained_entries: List[_ExcludeCacheEntry] = []
 
     def save(self, wrapper_id: int, entry: _ExcludeCacheEntry) -> None:
-        """Save one call entry produced by a checkpoint-excluded region."""
+        """Save one call entry produced by a checkpoint-excluded region.
+
+        Args:
+            wrapper_id: Identity of the exclusion wrapper.
+            entry: Cached output and replay bindings for one call.
+        """
         self._entries[wrapper_id].append(entry)
+        if entry.tape is not None:
+            self._retained_entries.append(entry)
 
     def pop(self, wrapper_id: int) -> _ExcludeCacheEntry:
-        """Return the matching forward call entry during recomputation."""
+        """Return the matching forward call entry during recomputation.
+
+        Args:
+            wrapper_id: Identity of the exclusion wrapper.
+        """
         entries = self._entries.get(wrapper_id)
         if not entries:
             raise RuntimeError("No cached forward output is available for this checkpoint exclusion wrapper")
@@ -156,9 +196,27 @@ class _ExcludeCache:
             self._entries.pop(wrapper_id)
         return entry
 
-    def clear(self) -> None:
-        """Release outputs not consumed because recomputation stopped early."""
+    def clear(self, release_retained: bool = False) -> None:
+        """Release queued outputs and optionally graphs consumed during replay.
+
+        Args:
+            release_retained: Release entries already consumed by reentrant replay.
+        """
+        released = set()
+        for entries in self._entries.values():
+            for entry in entries:
+                if id(entry) in released:
+                    continue
+                entry.release()
+                released.add(id(entry))
         self._entries.clear()
+        if release_retained:
+            for entry in self._retained_entries:
+                if id(entry) in released:
+                    continue
+                entry.release()
+                released.add(id(entry))
+            self._retained_entries.clear()
 
 
 def _canonical_input_tensor(tensor: Any) -> Any:
@@ -368,9 +426,16 @@ def _capture_recompute_inputs(
     kwargs: Dict[str, Any],
 ) -> Tuple[_InputInfo, ...]:
     """Capture canonical local input storage/layout without retaining tensors."""
+    return _capture_recompute_inputs_from_leaves(_collect_tensor_inputs(args, kwargs))
+
+
+def _capture_recompute_inputs_from_leaves(
+    tensor_inputs: Sequence[_TensorInput],
+) -> Tuple[_InputInfo, ...]:
+    """Capture input metadata from already collected path/tensor leaves."""
     inputs = []
     seen_tensor_ids = set()
-    for path, tensor in _collect_tensor_inputs(args, kwargs):
+    for path, tensor in tensor_inputs:
         if isinstance(tensor, ms.Parameter):
             continue
         canonical = _canonical_input_tensor(tensor)
@@ -491,7 +556,7 @@ def _apply_recompute_boundary(output: Any, input_bindings: List[_InputBinding]) 
 
 
 class CheckpointExcludeWrapper(ActivationWrapper):
-    """Exclude a callable region from checkpoint recomputation."""
+    """Exclude a callable region from non-reentrant or reentrant recomputation."""
 
     def __init__(
         self, module: Callable[..., Any], *, preserve_inputs: bool = False,
@@ -506,10 +571,19 @@ class CheckpointExcludeWrapper(ActivationWrapper):
             raise ValueError("exclude_single_op must be a bool or None")
         super().__init__(module, track_overlaps=False)
         self.preserve_inputs = preserve_inputs
+        self.save_rng_state = True
         self.exclude_single_op = not isinstance(module, ms.nn.Cell) if exclude_single_op is None else exclude_single_op
 
     def construct(self, *args: Any, **kwargs: Any) -> Any:
-        """Execute normally outside recompute and return the cached output in recompute."""
+        """Execute normally outside recompute and return the cached output in recompute.
+
+        Args:
+            *args: Positional arguments forwarded to the excluded callable.
+            **kwargs: Keyword arguments forwarded to the excluded callable.
+        """
+        reentrant_runner = _CURRENT_REENTRANT_EXCLUDE_RUNNER.get()
+        if reentrant_runner is not None:
+            return reentrant_runner(self, args, kwargs)
         state = get_recompute_state()
         if state is None:
             return self._ckpt_wrapped_module(*args, **kwargs)
@@ -569,9 +643,8 @@ def checkpoint_exclude_wrapper(
         In local-op mode the callable and its expansion helpers run during replay;
         only local kernel calls are cached. preserve_inputs controls saved input
         retention independently of the exclusion scope.
-        This feature requires MindSpore PyNative mode and a surrounding
-        HyperParallel checkpoint configured with ``use_reentrant=False``.
-        Nested checkpoint exclusion wrappers are not supported.
+        This wrapper supports MindSpore PyNative non-reentrant and reentrant
+        checkpointing. Nested checkpoint exclusion wrappers are not supported.
         The excluded callable must not mutate its tensor inputs in place. The
         backward-compatibility layer may deliberately preserve version counters,
         so not every in-place write can be detected from ``Tensor._version``.

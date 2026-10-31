@@ -22,6 +22,11 @@ from mindspore.common.api import _pynative_executor, _GradientEdge
 from mindspore._c_expression import run_backward
 from mindspore.common.tensor import Tensor
 from mindspore import ops
+from hyper_parallel.platform.mindspore.reentrant_mode import (
+    ReentrantBackwardMode,
+    reentrant_backward_mode,
+    reentrant_parameter_exposure_ctx,
+)
 
 
 def _fill_grads(output_tensor):
@@ -467,6 +472,7 @@ class GradFunction:
                     grads[input_size:])
         return grads[:input_size], grads[input_size:]
 
+    @reentrant_backward_mode(ReentrantBackwardMode.NORMAL)
     def accumulate_grad(self, sens=None, keep_graph=False):
         """
         Compute gradients and let MindSpore autograd accumulate them on leaf tensors.
@@ -498,6 +504,7 @@ class GradFunction:
             return ()
         return self._format_input_grads(input_grads, input_size)
 
+    @reentrant_backward_mode(ReentrantBackwardMode.DX)
     def compute_input_grad(self, sens=None):
         """
         Compute gradients with respect to inputs only (dx).
@@ -554,6 +561,7 @@ class GradFunction:
 
         return self._format_input_grads(input_grads, input_size)
 
+    @reentrant_backward_mode(ReentrantBackwardMode.DW)
     def compute_weight_grad(self, keep_graph=False):
         """
         Compute gradients with respect to weights only (dw).
@@ -701,7 +709,8 @@ def forward_and_gradfn(fn, *inputs, weights=None, has_aux=False, grad_position=-
     prev_grad_flag = _pynative_executor.grad_flag()
     _pynative_executor.set_grad_flag(True)
     try:
-        res = fn(*inputs, **kwargs)
+        with reentrant_parameter_exposure_ctx():
+            res = fn(*inputs, **kwargs)
     except Exception as e:
         _pynative_executor.clear_res()
         raise e
