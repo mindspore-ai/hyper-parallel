@@ -38,7 +38,7 @@ def test_primary_generated_source_is_directly_executable() -> None:
     rendered = _make_primary_executable(
         source,
         architecture="FutureArchitecture",
-        artifact_dir="/repo/hyper_parallel/models/future_model/generated",
+        model_type="future_model",
     )
 
     compile(rendered, "modeling_future_gen_npu.py", "exec")
@@ -55,7 +55,7 @@ def test_primary_entry_resolves_renamed_model_by_task_contract() -> None:
     rendered = _make_primary_executable(
         source,
         architecture="FutureV1ForConditionalGeneration",
-        artifact_dir="/repo/hyper_parallel/models/future_v2/generated",
+        model_type="future_v2",
     )
 
     assert "model_class_name='FutureV2ForConditionalGeneration'" in rendered

@@ -45,6 +45,7 @@ from hyper_parallel.codegen.emit.modeling import (
     emit_modeling_file,
     verify_recorded_patch_bundle,
 )
+from hyper_parallel.models.registry import family_dir_for_model_type
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +87,7 @@ def emit_bundle(
     generated_text = _make_primary_executable(
         generated_text,
         architecture=getattr(meta, "model_class", None),
-        artifact_dir=layout.artifact_dir,
+        model_type=_source_model_type(getattr(meta, "source", None)),
     )
     diff_text = _strip_trailing_whitespace(
         emit_diff(original_text, generated_text, layout)
@@ -175,13 +176,17 @@ def _make_primary_executable(
     source_text: str,
     *,
     architecture: str | None,
-    artifact_dir: str,
+    model_type: str | None,
 ) -> str:
     """Add direct-file package setup and the standard training footer."""
     if not architecture:
         return source_text
+    if not model_type:
+        raise RuntimeError(
+            "codegen: executable generated source requires a resolved model_type"
+        )
     entry_class = _resolve_entry_class(source_text, architecture)
-    family = os.path.basename(os.path.dirname(os.path.normpath(artifact_dir)))
+    family = family_dir_for_model_type(model_type)
     package = f"hyper_parallel.models.{family}.generated"
     tree = ast.parse(source_text)
     insertion_line = 0
@@ -211,6 +216,13 @@ def _make_primary_executable(
         "    )",
     ]
     return "\n".join([*lines, *footer])
+
+
+def _source_model_type(source: Any) -> str | None:
+    """Read the resolved model identity independently of output layout."""
+    if isinstance(source, dict):
+        return source.get("model_type")
+    return getattr(source, "model_type", None)
 
 
 def _resolve_entry_class(source_text: str, architecture: str) -> str:
