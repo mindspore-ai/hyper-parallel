@@ -1,8 +1,7 @@
 # Qwen3-30B-A3B 完整训练配方（唯一对外交付的 Qwen3-MoE recipe）。
 #
 # 预期资源：单机 8 卡 Ascend NPU（hccl backend）；更大的 CP/EP 拓扑通过
-# 下方 plan_overrides 的 `when: cp` / `when: ep` 条件声明自动生效，无需
-# 维护第二份配置。
+# 下方 CP 条件声明与 GroupedExperts 的自动 EP 绑定生效，无需维护第二份配置。
 #
 # 默认加载公开 Hugging Face 资源（模型、tokenizer、dataset）。本地或离线
 # 资源用命令行覆盖，例如：
@@ -80,14 +79,6 @@ plan_overrides:
       kind: method
       implementation:
         _target_: hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel.qwen3_moe_flash_attention_cp_mask_wrapper
-  # EP conditional override: Qwen3-MoE TopKRouter archetype compute.
-  - match: "*.mlp.forward"
-    when: ep
-    replace:
-      kind: method
-      implementation:
-        _target_: hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn
-        use_grouped_gemm: true
 
 mixed_precision:
   enabled: false

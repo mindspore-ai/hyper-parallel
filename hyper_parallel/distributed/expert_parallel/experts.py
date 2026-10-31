@@ -24,6 +24,8 @@
   ``resolve_swiglu_weights``): installs ``experts.forward`` (via the forward
   rewriter's bound-forward install point, 05 §15.2.3) so nested FSDP hooks
   unshard/reshard around the local SwiGLU.
+- Experts contracts and automatic binding (``experts_ep_compute_fn``):
+  attach the shared EP execution to declared native/replacement Experts.
 - Interface helpers (``require_attrs`` / ``describe_moe_module``):
   build-time interface assertions with teaching errors, and a structural
   diagnostic for mapping a concrete MoE module to an archetype.
@@ -36,10 +38,14 @@ import logging
 import math
 import os
 from dataclasses import dataclass
-from typing import Any, Callable, NamedTuple, Optional
+from math import prod
+from typing import Any, Callable, Mapping, NamedTuple, Optional
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+
+from hyper_parallel.components.modules.family import get_family_parallel_adapter
+from hyper_parallel.distributed.recipe_spec import local_compute as local_compute_factory
 
 from hyper_parallel.components.functional.npu_grouped_swiglu import (
     npu_grouped_swiglu,
@@ -674,13 +680,16 @@ def _run_ep_local_experts(
     receive_counts: list[int],
     ep_group: Any,
     expert_offset: int,
+    *, expert_compute: Optional[Callable] = None,
 ) -> torch.Tensor:
     """Dispatch tokens, run local experts, and return combined expert outputs."""
+    if expert_compute is None:
+        expert_compute = module.experts
     received_states = ep_all_to_all(dispatched_states, send_counts, receive_counts, ep_group)
     received_indices = ep_all_to_all(
         dispatched_indices, send_counts, receive_counts, ep_group
     ).squeeze(-1)
-    local_outputs = module.experts(received_states, received_indices - expert_offset)
+    local_outputs = expert_compute(received_states, received_indices - expert_offset)
     return ep_all_to_all(local_outputs.contiguous(), receive_counts, send_counts, ep_group)
 
 
@@ -863,7 +872,7 @@ def _aggregate_ep_outputs(
     expert_weights: torch.Tensor,
     source_indices: torch.Tensor,
     dispatch_order: torch.Tensor,
-    output_shape: tuple[int, int, int],
+    output_shape: tuple[int, ...],
     unpermute_indices: Optional[torch.Tensor] = None,
     routing_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -877,7 +886,7 @@ def _aggregate_ep_outputs(
         return moe_token_unpermute(combined_outputs, unpermute_indices, routing_weights).view(*output_shape)
     weighted_outputs = combined_outputs * expert_weights[dispatch_order].unsqueeze(-1)
     output = torch.zeros(
-        output_shape[0] * output_shape[1],
+        prod(output_shape[:-1]),
         output_shape[-1],
         dtype=weighted_outputs.dtype,
         device=weighted_outputs.device,
@@ -892,7 +901,7 @@ def _aggregate_ep_chunks(
     expert_weights: torch.Tensor,
     source_indices: torch.Tensor,
     dispatch_order: torch.Tensor,
-    output_shape: tuple[int, int, int],
+    output_shape: tuple[int, ...],
 ) -> torch.Tensor:
     """Aggregate the per-chunk combine outputs into the routed output.
 
@@ -918,7 +927,7 @@ def _aggregate_ep_chunks(
     """
     reference = combined_chunks[0]
     output = torch.zeros(
-        output_shape[0] * output_shape[1],
+        prod(output_shape[:-1]),
         output_shape[-1],
         dtype=reference.dtype,
         device=reference.device,
@@ -938,6 +947,7 @@ def _run_ep_local_experts_chunked(
     dispatched_indices: torch.Tensor,
     ep_group: Any,
     expert_offset: int,
+    *, expert_compute: Optional[Callable] = None,
 ) -> list[torch.Tensor]:
     """Dispatch, run the local experts and combine, one chunk at a time.
 
@@ -962,6 +972,8 @@ def _run_ep_local_experts_chunked(
     Returns:
         One combine output per chunk, in plan order (their wait is pending).
     """
+    if expert_compute is None:
+        expert_compute = module.experts
     chunk_count = len(plan.row_ranges)
 
     def issue(chunk: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -989,7 +1001,7 @@ def _run_ep_local_experts_chunked(
         # their GEMM overlaps.
         following = issue(chunk + 1) if chunk + 1 < chunk_count else None
         received_states, received_indices = incoming
-        local_outputs = module.experts(
+        local_outputs = expert_compute(
             wait_ep_all_to_all(received_states),
             wait_ep_all_to_all(received_indices) - expert_offset)
         combined_chunks.append(ep_all_to_all_async(
@@ -1010,7 +1022,8 @@ def _chunked_ep_forward(
     ep_rank: int,
     chunk_count: int,
     expert_offset: int,
-    output_shape: tuple[int, int, int],
+    output_shape: tuple[int, ...],
+    *, expert_compute: Optional[Callable] = None,
 ) -> torch.Tensor:
     """Run the routed forward as ``HP_EP_DISPATCH_CHUNKS`` software-pipelined slices.
 
@@ -1025,7 +1038,7 @@ def _chunked_ep_forward(
         dispatch.states,
         dispatch.expert_indices,
         ep_group,
-        expert_offset,
+        expert_offset, expert_compute=expert_compute,
     )
     return _aggregate_ep_chunks(
         combined_chunks,
@@ -1091,9 +1104,29 @@ def ep_routed_forward(
     expert dim -- each rank holds num_experts/ep_size complete experts, so
     there is no all_gather/reduce_scatter pair.
     """
+    topk_indices, topk_weights = router_fn(module, hidden_states)
+    return ep_experts_forward(
+        hidden_states, topk_indices, topk_weights,
+        expert_compute=module.experts, local_expert_count=module.experts.local_expert_count,
+        ep_group=ep_group, capacity_factor=_resolve_capacity_factor(module),
+        use_fused_moe_token_permute_and_unpermute=use_fused_moe_token_permute_and_unpermute,
+    )
+
+
+def ep_experts_forward(
+    hidden_states: torch.Tensor, topk_indices: torch.Tensor, topk_weights: torch.Tensor,
+    *, expert_compute: Callable, local_expert_count: int, ep_group: Any,
+    capacity_factor: Optional[float] = None,
+    use_fused_moe_token_permute_and_unpermute: bool = True,
+) -> torch.Tensor:
+    """Dispatch existing routing results, run local experts and combine once.
+
+    The caller owns routing and model output semantics. ``expert_compute``
+    receives exchanged tokens and local expert indices inside the managed
+    Experts forward; the existing schedules own all communication.
+    """
     ep_size = ep_group.size()
     ep_rank = dist.get_rank(group=ep_group)
-    local_expert_count = module.experts.local_expert_count
     global_expert_count = local_expert_count * ep_size
     expert_offset = ep_rank * local_expert_count
     # Resolved before the dispatch preparation so a mistyped knob fails before
@@ -1101,7 +1134,6 @@ def ep_routed_forward(
     chunk_count = _resolve_dispatch_chunks(ep_size)
 
     output_shape = tuple(hidden_states.shape)
-    topk_indices, topk_weights = router_fn(module, hidden_states)  # [T, K]
     dispatch = _prepare_ep_dispatch(
         hidden_states,
         topk_indices,
@@ -1112,22 +1144,22 @@ def ep_routed_forward(
         ep_group=ep_group,
         use_fused_moe_token_permute_and_unpermute=(
             use_fused_moe_token_permute_and_unpermute
-            and chunk_count == 1 and _resolve_capacity_factor(module) is None
+            and chunk_count == 1 and capacity_factor is None
         ),
     )
     if chunk_count > 1:
         return _chunked_ep_forward(
-            module, dispatch, ep_group, ep_size, ep_rank, chunk_count, expert_offset,
-            output_shape,
+            None, dispatch, ep_group, ep_size, ep_rank, chunk_count, expert_offset,
+            output_shape, expert_compute=expert_compute,
         )
     combined_expert_outputs = _run_ep_local_experts(
-        module,
+        None,
         dispatch.states,
         dispatch.expert_indices,
         dispatch.send_counts,
         dispatch.receive_counts,
         ep_group,
-        expert_offset,
+        expert_offset, expert_compute=expert_compute,
     )
     return _aggregate_ep_outputs(
         combined_expert_outputs,
@@ -1565,3 +1597,115 @@ def describe_moe_module(module: Any) -> str:
         )
     report = "\n".join(lines)
     return report
+
+
+# Experts contracts and binding reuse the EP execution above.
+@dataclass(frozen=True)
+class ExpertsContract:
+    """Parameter ownership and local dispatched-token computation, without routing."""
+
+    parameter_axes: Mapping[str, int]
+    num_global_experts: int
+    local_compute: Callable
+    use_grouped_gemm: bool = False
+
+
+_NATIVE_EXPERT_CONTRACTS: dict[type, Callable] = {}
+
+
+def register_experts_contract(module_type: type, provider: Callable) -> None:
+    """Declare an exact native module type's contract without a Module Family."""
+    if not isinstance(module_type, type) or not callable(provider):
+        raise TypeError("Experts registration requires a module type and contract provider")
+    if module_type in _NATIVE_EXPERT_CONTRACTS:
+        raise ValueError(f"Experts contract already registered for {module_type.__name__}")
+    _NATIVE_EXPERT_CONTRACTS[module_type] = provider
+
+
+def get_experts_contract(module: Any, *, ep_size: int = 1) -> Optional[ExpertsContract]:
+    """Resolve an explicitly declared contract for the final concrete module."""
+    provider = get_family_parallel_adapter(type(module), "ep")
+    if provider is None:
+        provider = _NATIVE_EXPERT_CONTRACTS.get(type(module))
+    if provider is None:
+        return None
+    contract = provider(module)
+    if not isinstance(contract, ExpertsContract) or not callable(contract.local_compute):
+        raise TypeError("Experts provider must return an ExpertsContract with local computation")
+    if type(contract.num_global_experts) is not int or contract.num_global_experts <= 0:  # pylint: disable=unidiomatic-typecheck
+        raise ValueError("Experts contract requires a positive global expert count")
+    params = dict(module.named_parameters())
+    if set(params) != set(contract.parameter_axes):
+        raise ValueError("Experts contract must declare every parameter exactly once")
+    for name, axis in contract.parameter_axes.items():
+        if type(axis) is not int or axis < 0 or axis >= params[name].ndim:  # pylint: disable=unidiomatic-typecheck
+            raise ValueError(f"Invalid expert axis for {name}")
+        parameter = params[name]
+        local_parameter = parameter.to_local() if ep_size > 1 and hasattr(parameter, "to_local") else parameter
+        expected_count = contract.num_global_experts // ep_size
+        if contract.num_global_experts % ep_size or local_parameter.shape[axis] != expected_count:
+            raise ValueError(f"{name}: expert dimension must match the declared expert partition")
+    return contract
+
+
+def grouped_experts_contract(module: Any) -> ExpertsContract:
+    """Describe the packed replacement; numerical variants declare their own support."""
+    if not callable(getattr(module, "forward_expert_major", None)):
+        raise ValueError("GroupedExperts EP requires forward_expert_major")
+    if getattr(module, "use_2d_experts", False) or getattr(module, "add_bias", False):
+        raise ValueError("GroupedExperts EP currently requires 3D packed weights without bias")
+    return ExpertsContract(
+        {"gate_up_proj": 0, "down_proj": 0}, module.num_experts,
+        _local_swiglu_expert_forward, use_grouped_gemm=True,
+    )
+
+
+def packed_swiglu_experts_contract(module: Any) -> ExpertsContract:
+    """Describe a declared native packed SwiGLU type using existing local math.
+
+    Register only types whose forward applies activation(gate) * up followed
+    by the down projection and output routing weights. This provider is an
+    explicit semantic declaration, not structural auto-detection.
+    """
+    if not callable(getattr(module, "act_fn", None)):
+        raise ValueError("Native packed Experts must declare their activation")
+    gate, down = module.gate_up_proj, module.down_proj
+    if gate.ndim != 3 or down.ndim != 3 or gate.shape[1] != 2 * down.shape[2] or gate.shape[2] != down.shape[1]:
+        raise ValueError("Native packed Experts require [E,2I,H] and [E,H,I] weights")
+    return ExpertsContract({"gate_up_proj": 0, "down_proj": 0}, module.num_experts, _local_swiglu_expert_forward)
+
+
+@local_compute_factory
+def experts_ep_compute_fn(
+    *, module: Any, mesh: Any, tp_mesh: Any, cp_mesh: Any, ep_mesh: Any,
+) -> Callable:
+    """Bind EP inside the Experts forward, preserving the original model owner."""
+    del mesh, tp_mesh, cp_mesh
+    if ep_mesh is None:
+        raise ValueError("Experts EP requires an expert mesh")
+    ep_group = ep_mesh.get_group("ep")
+    contract = get_experts_contract(module, ep_size=ep_group.size())
+    if contract is None:
+        raise ValueError("Experts EP requires an explicitly declared contract")
+    local_compute = contract.local_compute
+    module.local_expert_count = contract.num_global_experts // ep_group.size()
+    if local_compute is _local_swiglu_expert_forward:
+        # Retain the existing EP local-compute protocol and grouped dispatch.
+        module._ep_use_grouped_gemm = contract.use_grouped_gemm  # pylint: disable=protected-access
+        module._ep_apply_gate = None  # pylint: disable=protected-access
+        if not contract.use_grouped_gemm:
+            module._ep_act_fn = module.act_fn  # pylint: disable=protected-access
+
+    def compute(experts: Any, hidden_states: torch.Tensor, top_k_index: torch.Tensor,
+                top_k_weights: torch.Tensor) -> torch.Tensor:
+        """Use model-provided routing results, applying their weights once."""
+        def local(states: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+            """Run inside this Experts module's active forward/FSDP hooks."""
+            return local_compute(experts, states, indices)
+
+        return ep_experts_forward(
+            hidden_states, top_k_index, top_k_weights, expert_compute=local,
+            local_expert_count=experts.local_expert_count, ep_group=ep_group,
+        )
+
+    return compute

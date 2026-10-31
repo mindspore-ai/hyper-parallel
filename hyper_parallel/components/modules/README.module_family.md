@@ -2,7 +2,7 @@
 
 Module Family 在构建阶段为同一种模块选择具体实现。用户通过统一的 replacement 入口填写选择参数，框架根据模块族声明的白名单规则选出实现，再复用现有的 Module Replacement 完成模型层匹配和实例安装。
 
-当前内置 `GroupedExperts` Family，提供默认高性能实现、MXFP8 和融合 MXFP8。更多模块可通过注册自己的 Family 接入。
+当前内置 `GroupedExperts` Family（默认实现、MXFP8 和融合 MXFP8）以及 GQA/gated-GQA 的并行声明。更多模块可通过注册自己的 Family 接入。
 
 ## 使用 GroupedExperts Family
 
@@ -210,3 +210,70 @@ plan_overrides:
 | [MXFP8 单设备测试](../../../tests/torch/expert_parallel/test_family_mxfp8_local.py) | 非融合与融合的设备计算验证 |
 
 通用高性能模块的安装与替换说明见 [modules README](README.md)。
+
+
+## Family 的 CP / EP 适配声明
+
+`ModuleFamily.parallel_adapters` 将具体类型绑定到适配函数的导入路径。Family 保留选型与绑定声明，
+适配实现按职责放在现有 `distributed/context_parallel/` 和 `distributed/expert_parallel/` 目录。
+它们采用与模型 adapter 相同的 wrapper / factory 格式，不依赖某个具体模型的 adapter。
+
+| Family | 适配入口 | 复用能力 |
+| --- | --- | --- |
+| GQAAttention / GatedGQAAttention | `context_parallel/gqa_attention.py::gqa_attention_cp_wrapper` | 已有 CP 通信、mask 处理与 forward rewriter |
+| GroupedExperts | `expert_parallel/experts.py::grouped_experts_contract` | 已有 EP dispatch/combine、分块和本地专家计算 |
+
+Family 的 `parallel_adapters` 按最终具体类型查询，查询时才导入实现。CP 返回 wrapper，
+EP 返回 Experts 契约提供者。变体不自动继承 baseline 的并行能力；缺少依赖或不满足支持条件时明确报错。
+
+CP 通过已有 `inner_wrapper` / `inner_target="self"` 注入 GQA 边界，保留选定的
+`attention_interface` 以及投影、归一化、RoPE 和输出流程。首版使用已有 all-gather 策略；
+外部 mask 须覆盖全局 K/V 并包含模型所需的因果限制。
+cache、packed sequence、sliding window 和 attention weights 输出暂不支持。
+显式 CP wrapper 优先；与 `region_dispatch=True` 冲突时报错。
+
+EP 契约声明专家参数轴、全局专家数和本地计算入口。原生和 GroupedExperts 复用已有
+`_local_swiglu_expert_forward`，GroupedExperts 沿其已有分支调用 `forward_expert_major`。现有 Planner 在已有 MoE
+边界内将专家参数归属到 `.experts` 子边界，复用参数切分、forward 安装和通信流程。
+`Experts.forward(hidden_states, top_k_index, top_k_weights)` 接收原模型的路由结果；
+父级 MoE 保留原有 Router、共享专家、辅助输出和返回协议，无需增加模型专属 Router/combine 回调。
+路由权重由现有 combine 应用一次。本地计算在 Experts 自己的受管理 forward 内执行，
+保留模块调用 hooks；不会递归调用自身 forward。
+
+替换后的 GroupedExperts 通过现有 Family 声明契约。未加入 Family 的原生 Experts 可以显式注册：
+
+```python
+from hyper_parallel.distributed.expert_parallel.experts import (
+    register_experts_contract, packed_swiglu_experts_contract,
+)
+
+register_experts_contract(MyPackedExperts, packed_swiglu_experts_contract)
+```
+
+此示例仅适用于明确采用 `activation(gate) * up`、down 投影后应用路由权重的原生实现，
+权重布局分别为 `[E, 2I, H]` 和 `[E, H, I]`，入口参数需与上述 Experts 接口一致。
+注册是语义声明，不通过参数形状猜测模型行为。不同契约应提供自己的 `ExpertsContract`。
+当前替换契约仅支持三维 packed 权重且无 bias；不扩展 MXFP8 等数值变体。
+原生注册按具体类型匹配，不自动继承。
+
+当 `ep_size > 1` 且 Experts 已声明契约时自动绑定。父级 MoE 的旧 EP factory、实例 forward
+替换或通信 dispatcher 会与 Experts EP 冲突，构建时明确报错，避免重复通信。
+未声明契约的模块仍沿用已有模型适配路径；并行度为 1 时不绑定。
+`derive=False` 仍由用户完整声明方案。Qwen3-MoE 的 grouped-experts 训练配置移除旧父级 EP 注入。
+
+验证入口：
+
+```bash
+python -m pytest -q tests/ut/components/modules/test_family_parallel_adapters.py
+python -m pytest -q tests/ut/core/expert_parallel/test_ep_npu_token_dispatch.py tests/ut/core/expert_parallel/test_ep_dispatch_chunks.py
+python -m pytest -q tests/ut/dual_mode_dtensor/test_ep_moe_local_region.py
+python -m pytest -q tests/torch/expert_parallel/test_module_parallel_adapters.py
+```
+
+测试使用实际 GQAAttention / GroupedExperts，设备 GMM 和 attention 采用 CPU 计算。
+两进程 builder → Planner → apply 检查覆盖 CP、原生/替换 Experts 自动 EP、二维/三维输入，
+并比较输出与输入、路由器、共享专家及专家参数梯度；覆盖 production/validate、辅助输出和 hooks。
+EP-only 且无活跃 dense 轴时，普通子边界沿用本地执行，避免普通参数与 DTensor 输入混用。
+原有模型级 EP 路径另行覆盖不均匀/空路由、
+同步/分离 dispatch、1/2 个 chunk 和模块 hooks。
+真实 Ulysses 通信、设备异步重叠、完整 HF 模型训练/checkpoint/FSDP 与 NPU/GPU 整模精度性能仍待验证。

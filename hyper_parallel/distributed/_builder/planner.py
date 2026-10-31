@@ -47,11 +47,15 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from torch import nn
 
+from hyper_parallel.components.modules.family import get_family_parallel_adapter
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.placement_types import (
     Partial,
     Replicate,
     Shard,
+)
+from hyper_parallel.distributed.expert_parallel.experts import (
+    experts_ep_compute_fn, get_experts_contract,
 )
 from hyper_parallel.distributed.plan import ShardingPlan
 from hyper_parallel.distributed.recipe_spec import (
@@ -169,6 +173,11 @@ class ShardingPlanner:
     planner is constructed — the planner itself has exactly one override
     interface.
 
+    After explicit overrides are merged, registered Module Families can fill
+    missing CP injections on final replaced modules. Declared Experts contracts
+    derive their own parameter and EP compute boundaries; routing and model
+    output composition stay in the original parent forward.
+
     ``derive=False`` turns the planner into a pure declaration assembler:
     template derivation (Phases 2-4) is skipped and the plan contains ONLY
     the ``plan_overrides`` specs — every key is insert mode and must be
@@ -260,7 +269,36 @@ class ShardingPlanner:
                     spec, group, boundary_fqn, self._templates.get(boundary_type), mesh_dim_names, arch,
                     ep_extend=ep_extend, mesh=mesh, model=model, param_ndims=param_ndims,
                 )
+            if boundary_type == "moe_mlp" and ep_extend > 1:
+                self._derive_experts_boundary(plan, model, boundary_fqn, spec, ep_extend)
             plan.modules[boundary_fqn] = spec
+
+    @staticmethod
+    def _derive_experts_boundary(
+        plan: ShardingPlan, model: Any, parent_fqn: str, parent_spec: ModuleShardingSpec, ep_size: int,
+    ) -> None:
+        """Assign declared expert parameters and communication to their own boundary."""
+        owner = model.get_submodule(parent_fqn)
+        experts = getattr(owner, "experts", None)
+        contract = get_experts_contract(experts) if experts is not None else None
+        if contract is None:
+            return
+        if contract.num_global_experts % ep_size:
+            raise ValueError(f"{parent_fqn}.experts: global expert count must be divisible by EP size")
+        if "forward" in vars(experts):
+            raise ValueError(f"{parent_fqn}.experts: remove the existing forward replacement before automatic EP")
+        child_params = {}
+        for name, axis in contract.parameter_axes.items():
+            parent_spec.params.pop("experts." + name)
+            child_params[name] = {EP: Shard(axis)}
+        ShardingPlanner._set_extended_ep_contract(parent_spec, ep_size)
+        parent_spec._ep_size = 0  # pylint: disable=protected-access
+        parent_spec.region_dispatch = False
+        plan.modules[parent_fqn + ".experts"] = ModuleShardingSpec(
+            params=child_params, in_src={}, in_dst={}, out_src=None, out_dst=None,
+            region_dispatch=False,
+            local_compute_fn=experts_ep_compute_fn,
+        )
 
     def _finalize_boundary_specs(
         self,
@@ -275,10 +313,65 @@ class ShardingPlanner:
         """Normalize overrides and finish placement-dependent boundary metadata."""
         _merge_plan_overrides(self._plan_overrides, plan, model, derive=self._derive)
         _normalize_contract_fields(plan)
+        if self._derive:
+            for fqn, spec in plan.modules.items():
+                self._bind_family_parallel_adapter(
+                    model, fqn, spec, cp_active="cp" in mesh_dim_names, ep_size=ep_size,
+                )
+        self._validate_experts_boundary_injections(plan, model)
         self._mark_virtual_ep_parameters(plan, ep_size, mesh)
         _finalize_tp_local_attr_plans(plan, model, tp_size=tp_size, mesh_dim_names=mesh_dim_names)
         self._finalize_deferred_biases(plan, model, mesh_dim_names)
         self._finalize_fused_expert_tp_guard(plan, tp_size=tp_size)
+
+    @staticmethod
+    def _bind_family_parallel_adapter(
+        model: Any, fqn: str, spec: ModuleShardingSpec, *, cp_active: bool, ep_size: int,
+    ) -> None:
+        """Fill missing compute injections from final, replaced module types.
+
+        Explicit plan injections and instance forward replacements own execution.
+        Family defaults reuse the already derived boundary and parameter layout.
+        """
+        if not spec.is_boundary or (not cp_active and ep_size <= 1):
+            return
+        if spec.local_compute_fn is not None or spec.inner_wrapper is not None or spec.inner_target is not None:
+            return
+        module = model.get_submodule(fqn)
+        if "forward" in vars(module):
+            logger.info("Keep explicit forward replacement at %s; skip Family parallel binding", fqn)
+            return
+        if cp_active and spec._needs_cp_attn:  # pylint: disable=protected-access
+            wrapper = get_family_parallel_adapter(type(module), "cp")
+            if wrapper is not None:
+                if spec.region_dispatch is True:
+                    raise ValueError(f"{fqn}: Family CP requires region_dispatch=False")
+                spec.inner_target = "self"
+                spec.inner_wrapper = wrapper
+                spec.region_dispatch = False
+                logger.info("Bind Family CP adapter at %s: %s", fqn, wrapper.__name__)
+
+    @staticmethod
+    def _validate_experts_boundary_injections(plan: ShardingPlan, model: Any) -> None:
+        """Reject parent MoE injection when a declared Experts boundary owns EP."""
+        for fqn, spec in plan.modules.items():
+            parent_fqn, _, name = fqn.rpartition(".")
+            if name != "experts" or not any(isinstance(p.get(EP), Shard) for p in spec.params.values()):
+                continue
+            if get_experts_contract(model.get_submodule(fqn)) is None:
+                continue
+            parent = plan.modules.get(parent_fqn)
+            if parent is None:
+                continue
+            owner = model.get_submodule(parent_fqn)
+            if (parent.local_compute_fn is not None or parent.inner_wrapper is not None
+                    or parent.inner_target is not None or "forward" in vars(owner)):
+                raise ValueError(
+                    f"{parent_fqn}: parent MoE injection conflicts with Experts-owned EP; "
+                    "remove the parent wrapper/factory and retain the original model forward"
+                )
+            if parent.region_dispatch is True or spec.region_dispatch is True:
+                raise ValueError(f"{fqn}: Experts EP requires local-region execution")
 
     @staticmethod
     def _log_explanation(plan: ShardingPlan, enabled: bool) -> None:
