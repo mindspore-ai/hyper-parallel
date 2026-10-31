@@ -99,21 +99,33 @@ def noop_context_fn():
     return _torch_noop_context_fn
 
 
-def checkpoint_exclude_wrapper(module: Any, *, save_output: bool = True) -> Any:
+def checkpoint_exclude_wrapper(  # pylint: disable=redefined-outer-name
+    module: Any,
+    *,
+    swap: bool = False,
+    group_swap: bool = False,
+    cpu_pool: Any = None,
+) -> Any:
     """Wrap a callable whose region is excluded from activation recomputation.
 
     Args:
         module: The module or callable to exclude from recomputation.
-        save_output: Whether to retain the region output for checkpoint replay.
-            Set this to ``False`` only when the output is passed directly as one
-            argument to another excluded region. Default: ``True``.
+        swap: Whether eligible outputs and non-recomputable saved tensors should
+            use the active activation-swap group. Default: ``False``.
+        group_swap: Whether swapped tensors participate in group copy fusion.
+        cpu_pool: Optional pinned-memory pool used for swapped tensors.
 
     Returns:
         The checkpoint exclusion wrapper.
     """
     # pylint: disable=C0415
     from .wrapper import checkpoint_exclude_wrapper as _wrapper
-    return _wrapper(module, save_output=save_output)
+    return _wrapper(
+        module,
+        swap=swap,
+        group_swap=group_swap,
+        cpu_pool=cpu_pool,
+    )
 
 
 def checkpoint_wrapper(module, **checkpoint_kwargs):

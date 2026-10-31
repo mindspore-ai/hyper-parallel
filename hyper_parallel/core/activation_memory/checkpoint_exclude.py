@@ -18,7 +18,7 @@ from collections import defaultdict, deque
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import cached_property, lru_cache
-from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import torch
 
@@ -106,6 +106,7 @@ class _SavedTensorData:
 
     tensor: torch.Tensor
     version: int
+    swap_hooks: Optional[Any] = None
 
 
 @dataclass(frozen=True)
@@ -122,6 +123,7 @@ class _PackState:
 
     inputs: Tuple[_InputInfo, ...]
     bindings: List[_InputBinding]
+    swap_hooks: Optional[Any] = None
 
 
 _ACTIVE_PACK_STATE: ContextVar[Any] = ContextVar(
@@ -152,7 +154,6 @@ class _ExcludeCacheEntry:
 
     output: Any
     input_bindings: List[_InputBinding]
-    output_tensor_count: int = 1
     rng_state: Optional[_RNGStateSnapshot] = None
 
 
@@ -162,7 +163,6 @@ class _ExcludeCache:
     def __init__(self) -> None:
         """Initialize an empty per-checkpoint output cache."""
         self._entries: Dict[int, Deque[_ExcludeCacheEntry]] = defaultdict(deque)
-        self._save_output_storages: Set[Any] = set()
 
     def save(self, wrapper_id: int, entry: _ExcludeCacheEntry) -> None:
         """Save one call entry produced by a checkpoint-excluded region."""
@@ -181,23 +181,6 @@ class _ExcludeCache:
     def clear(self) -> None:
         """Release outputs not consumed because recomputation stopped early."""
         self._entries.clear()
-        self._save_output_storages.clear()
-
-    def register_save_outputs(self, output: Any) -> None:
-        """Record storage produced by this invocation's SAVE regions."""
-        for tensor in _iter_tensor_leaves(output):
-            metadata = _tensor_metadata(_canonical_input_tensor(tensor))
-            if metadata is not None:
-                self._save_output_storages.add(metadata.storage_ref)
-
-    def is_save_output(self, tensor: Any) -> bool:
-        """Return whether a tensor aliases an output from this invocation."""
-        metadata = _tensor_metadata(_canonical_input_tensor(tensor))
-        return metadata is not None and metadata.storage_ref in self._save_output_storages
-
-    def contains_save_output_storage(self, storage_ref: Any) -> bool:
-        """Return whether one captured input aliases a SAVE output."""
-        return storage_ref in self._save_output_storages
 
 
 @lru_cache(maxsize=1)
@@ -399,6 +382,13 @@ def _pack_saved_tensor(tensor: Any) -> Any:
             handle = _RecomputedInputHandle(recipe)
             pack_state.bindings.append(_InputBinding(input_info.path, handle))
             return handle
+        if pack_state.swap_hooks is not None:
+            detached = pack_state.swap_hooks.pack_hook(tensor)
+            return _SavedTensorData(
+                detached,
+                tensor._version,  # pylint: disable=protected-access
+                pack_state.swap_hooks,
+            )
     return _SavedTensorData(tensor.detach(), tensor._version)  # pylint: disable=protected-access
 
 
@@ -407,9 +397,12 @@ def _unpack_saved_tensor(value: Any) -> Any:
     if isinstance(value, _RecomputedInputHandle):
         return value.get_recomputed_tensor()
     if isinstance(value, _SavedTensorData):
-        if value.tensor._version != value.version:  # pylint: disable=protected-access
+        tensor = value.tensor
+        if value.swap_hooks is not None:
+            tensor = value.swap_hooks.unpack_hook(tensor)
+        if tensor._version != value.version:  # pylint: disable=protected-access
             raise RuntimeError("Checkpoint-excluded saved tensor was modified in-place after it was saved")
-        return value.tensor
+        return tensor
     return value
 
 
@@ -477,7 +470,7 @@ def _capture_recompute_inputs(
         if id(canonical) in seen_tensor_ids:
             continue
         metadata = _tensor_metadata(canonical)
-        if metadata is None or cache.contains_save_output_storage(metadata.storage_ref):
+        if metadata is None:
             continue
         inputs.append(_InputInfo(path, metadata))
         seen_tensor_ids.add(id(canonical))
@@ -610,22 +603,6 @@ def _restore_rng_state(snapshot: Optional[_RNGStateSnapshot]) -> None:
 
 
 @lru_cache(maxsize=1)
-def _get_replay_placeholder() -> Any:
-    """Create a zero-element placeholder returned by an elided SAVE replay."""
-    return torch.empty(0, device="cpu")
-
-
-def _make_replay_placeholder_output(tensor_count: int) -> Any:
-    """Create one placeholder leaf for each forward output tensor."""
-    if tensor_count == 0:
-        return ()
-    placeholder = _get_replay_placeholder()
-    if tensor_count == 1:
-        return placeholder
-    return (placeholder,) * tensor_count
-
-
-@lru_cache(maxsize=1)
 def _get_recompute_trigger() -> Any:
     """Create the differentiable zero-element input used by recompute boundaries."""
     return torch.empty(0, device="cpu", requires_grad=True)
@@ -655,24 +632,21 @@ def _get_recompute_boundary() -> Any:
 def _finalize_save_outputs_impl(
     output: Any,
     add_recompute_boundary: bool,
-    tensor_leaf_count: Optional[List[int]],
     tensor_type: type,
 ) -> Any:
     """Recursively finalize SAVE output leaves."""
     if isinstance(output, tensor_type):
-        if tensor_leaf_count is not None:
-            tensor_leaf_count[0] += 1
         if add_recompute_boundary:
             output = _get_recompute_boundary().apply(output, _get_recompute_trigger())
         return output
     if isinstance(output, list):
         return [
-            _finalize_save_outputs_impl(item, add_recompute_boundary, tensor_leaf_count, tensor_type)
+            _finalize_save_outputs_impl(item, add_recompute_boundary, tensor_type)
             for item in output
         ]
     if isinstance(output, tuple):
         items = [
-            _finalize_save_outputs_impl(item, add_recompute_boundary, tensor_leaf_count, tensor_type)
+            _finalize_save_outputs_impl(item, add_recompute_boundary, tensor_type)
             for item in output
         ]
         if hasattr(output, "_fields"):
@@ -682,7 +656,7 @@ def _finalize_save_outputs_impl(
         return type(output)(
             (
                 key,
-                _finalize_save_outputs_impl(value, add_recompute_boundary, tensor_leaf_count, tensor_type),
+                _finalize_save_outputs_impl(value, add_recompute_boundary, tensor_type),
             )
             for key, value in output.items()
         )
@@ -692,12 +666,10 @@ def _finalize_save_outputs_impl(
 def _finalize_save_outputs(
     output: Any,
     add_recompute_boundary: bool,
-    tensor_leaf_count: Optional[List[int]] = None,
 ) -> Any:
-    """Apply the required replay boundary and count output tensor leaves."""
+    """Apply the required replay boundary to tensor output leaves."""
     return _finalize_save_outputs_impl(
         output,
         add_recompute_boundary,
-        tensor_leaf_count,
         torch.Tensor,
     )

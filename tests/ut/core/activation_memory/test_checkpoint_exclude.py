@@ -19,7 +19,7 @@ from collections import OrderedDict
 import importlib
 from typing import NamedTuple
 import unittest
-from unittest.mock import sentinel
+from unittest.mock import MagicMock, sentinel
 
 import torch
 from torch.utils.checkpoint import DefaultDeviceType
@@ -90,17 +90,15 @@ class _RngBoundaryBlock(torch.nn.Module):
 
 
 class _CheckpointExcludeTestCase(unittest.TestCase):
-    """Base class that isolates cached placeholder and boundary objects."""
+    """Base class that isolates cached checkpoint-boundary objects."""
 
     def setUp(self) -> None:
-        """Start each test with empty helper caches."""
-        _checkpoint_exclude._get_replay_placeholder.cache_clear()
+        """Start each test with empty checkpoint-boundary caches."""
         _checkpoint_exclude._get_recompute_trigger.cache_clear()
         _checkpoint_exclude._get_recompute_boundary.cache_clear()
 
     def tearDown(self) -> None:
         """Release helper cache references after each test."""
-        _checkpoint_exclude._get_replay_placeholder.cache_clear()
         _checkpoint_exclude._get_recompute_trigger.cache_clear()
         _checkpoint_exclude._get_recompute_boundary.cache_clear()
 
@@ -168,17 +166,14 @@ class TestExcludeCache(_CheckpointExcludeTestCase):
                 with self.assertRaisesRegex(RuntimeError, "No cached forward output"):
                     cache.pop(wrapper_id)
 
-    def test_cache_clear_releases_entries_and_output_index(self):
-        """Cleanup should release entries and storage provenance for every wrapper."""
+    def test_cache_clear_releases_entries(self):
+        """Cleanup should release cached outputs for every wrapper."""
         cache = _checkpoint_exclude._ExcludeCache()
-        tensor = torch.arange(4.0, requires_grad=True)
         cache.save(1, self._entry(sentinel.first))
-        cache.register_save_outputs(tensor)
 
         cache.clear()
 
         self.assertEqual(cache._entries, {})
-        self.assertEqual(cache._save_output_storages, set())
 
 
 class TestSavedTensorHooks(_CheckpointExcludeTestCase):
@@ -223,6 +218,66 @@ class TestSavedTensorHooks(_CheckpointExcludeTestCase):
         self.assertIsInstance(packed, _checkpoint_exclude._RecomputedInputHandle)
         self.assertTrue(packed.recipe.exact_input)
         self.assertEqual(len(bindings), 1)
+
+    def test_pack_recomputed_input_bypasses_swap_hooks(self):
+        """Replayable input aliases should remain handles instead of entering swap."""
+        tensor = torch.arange(4.0, requires_grad=True)
+        inputs = _checkpoint_exclude._capture_recompute_inputs(
+            _checkpoint_exclude._ExcludeCache(),
+            (tensor,),
+            {},
+        )
+        bindings = []
+        swap_hooks = MagicMock()
+        token = _checkpoint_exclude._ACTIVE_PACK_STATE.set(
+            _checkpoint_exclude._PackState(inputs, bindings, swap_hooks=swap_hooks)
+        )
+        try:
+            packed = _checkpoint_exclude._pack_saved_tensor(tensor)
+        finally:
+            _checkpoint_exclude._ACTIVE_PACK_STATE.reset(token)
+
+        self.assertIsInstance(packed, _checkpoint_exclude._RecomputedInputHandle)
+        swap_hooks.pack_hook.assert_not_called()
+
+    def test_pack_parameter_and_view_bypass_swap_hooks(self):
+        """Parameters and their views should remain local version-checked saves."""
+        parameter = torch.nn.Parameter(torch.arange(4.0))
+        swap_hooks = MagicMock()
+        token = _checkpoint_exclude._ACTIVE_PACK_STATE.set(
+            _checkpoint_exclude._PackState((), [], swap_hooks=swap_hooks)
+        )
+        try:
+            packed_parameter = _checkpoint_exclude._pack_saved_tensor(parameter)
+            packed_view = _checkpoint_exclude._pack_saved_tensor(parameter[:2])
+        finally:
+            _checkpoint_exclude._ACTIVE_PACK_STATE.reset(token)
+
+        self.assertIsNone(packed_parameter.swap_hooks)
+        self.assertIsNone(packed_view.swap_hooks)
+        swap_hooks.pack_hook.assert_not_called()
+
+    def test_pack_and_unpack_real_save_use_swap_hooks(self):
+        """Non-recomputable saves should use the invocation-local swap hooks."""
+        tensor = torch.arange(4.0, requires_grad=True)
+        detached = tensor.detach()
+        swap_hooks = MagicMock()
+        swap_hooks.pack_hook.return_value = detached
+        swap_hooks.unpack_hook.return_value = detached
+        token = _checkpoint_exclude._ACTIVE_PACK_STATE.set(
+            _checkpoint_exclude._PackState((), [], swap_hooks=swap_hooks)
+        )
+        try:
+            packed = _checkpoint_exclude._pack_saved_tensor(tensor)
+        finally:
+            _checkpoint_exclude._ACTIVE_PACK_STATE.reset(token)
+
+        unpacked = _checkpoint_exclude._unpack_saved_tensor(packed)
+
+        swap_hooks.pack_hook.assert_called_once_with(tensor)
+        swap_hooks.unpack_hook.assert_called_once_with(detached)
+        self.assertIs(packed.swap_hooks, swap_hooks)
+        self.assertIs(unpacked, detached)
 
     def test_pack_saved_view_uses_relative_layout_recipe(self):
         """A different tensor object sharing input storage should still be optimized."""
@@ -328,24 +383,23 @@ class TestInputBindings(_CheckpointExcludeTestCase):
             ],
         )
 
-    def test_capture_skips_parameters_duplicates_and_save_outputs(self):
-        """Only replay-produced activation inputs should be captured."""
+    def test_capture_skips_parameters_and_duplicates(self):
+        """All unique activation inputs should be captured when outputs are cached."""
         cache = _checkpoint_exclude._ExcludeCache()
         activation = torch.arange(4.0, requires_grad=True)
         keyword_activation = torch.arange(4.0, 8.0, requires_grad=True)
         parameter = torch.nn.Parameter(torch.arange(3.0))
-        saved_output = torch.arange(8.0, 12.0, requires_grad=True)
-        cache.register_save_outputs(saved_output.view(2, 2))
+        prior_output = torch.arange(8.0, 12.0, requires_grad=True)
 
         inputs = _checkpoint_exclude._capture_recompute_inputs(
             cache,
-            (activation, [activation, parameter, saved_output]),
+            (activation, [activation, parameter, prior_output]),
             {"keyword": keyword_activation},
         )
 
         self.assertEqual(
             [input_info.path for input_info in inputs],
-            [((("arg", 0),)), ((("kwarg", "keyword"),))],
+            [((("arg", 0),)), ((("arg", 1), ("index", 2))), ((("kwarg", "keyword"),))],
         )
 
     def test_resolve_input_follows_positional_and_keyword_paths(self):
@@ -434,18 +488,7 @@ class TestInputBindings(_CheckpointExcludeTestCase):
 
 
 class TestReplayOutputs(_CheckpointExcludeTestCase):
-    """Unit tests for replay placeholders, RNG recovery, and SAVE output finalization."""
-
-    def test_replay_placeholder_output_matches_tensor_leaf_count(self):
-        """Output elision should preserve the number of tensor leaves seen in forward."""
-        empty = _checkpoint_exclude._make_replay_placeholder_output(0)
-        single = _checkpoint_exclude._make_replay_placeholder_output(1)
-        multiple = _checkpoint_exclude._make_replay_placeholder_output(3)
-
-        self.assertEqual(empty, ())
-        self.assertIs(single, _checkpoint_exclude._get_replay_placeholder())
-        self.assertEqual(len(multiple), 3)
-        self.assertTrue(all(item is single for item in multiple))
+    """Unit tests for RNG recovery and SAVE output finalization."""
 
     def test_recompute_boundary_saves_trigger_and_passes_gradient(self):
         """The boundary should expose only its zero-size dependency to outer hooks."""
@@ -483,8 +526,8 @@ class TestReplayOutputs(_CheckpointExcludeTestCase):
 
         torch.testing.assert_close(torch.rand(4), expected)
 
-    def test_finalize_outputs_preserves_nested_container_types_and_counts_tensors(self):
-        """Finalization should recursively preserve list, tuple, named tuple, and mapping structure."""
+    def test_finalize_outputs_preserves_nested_container_types_and_tensors(self):
+        """Finalization should preserve containers and tensor identity without boundaries."""
         first = torch.tensor([1.0], requires_grad=True)
         second = torch.tensor([2.0])
         output = OrderedDict(
@@ -494,9 +537,7 @@ class TestReplayOutputs(_CheckpointExcludeTestCase):
                 ("tuple", (second, 7)),
             ]
         )
-        tensor_leaf_count = [0]
-
-        finalized = _checkpoint_exclude._finalize_save_outputs(output, False, tensor_leaf_count)
+        finalized = _checkpoint_exclude._finalize_save_outputs(output, False)
 
         self.assertIsInstance(finalized, OrderedDict)
         self.assertIsInstance(finalized["list"], list)
@@ -504,9 +545,9 @@ class TestReplayOutputs(_CheckpointExcludeTestCase):
         self.assertIsInstance(finalized["pair"].right, dict)
         self.assertIsInstance(finalized["tuple"], tuple)
         self.assertIs(finalized["list"][0], first)
+        self.assertIs(finalized["pair"].right["leaf"], second)
         self.assertEqual(finalized["list"][1], "plain")
         self.assertEqual(finalized["tuple"][1], 7)
-        self.assertEqual(tensor_leaf_count, [4])
 
 
 class TestCheckpointExcludeIntegration(_CheckpointExcludeTestCase):

@@ -18,6 +18,7 @@
 # pylint: disable=wrong-import-position,import-outside-toplevel,unused-argument
 import contextlib
 import importlib
+import inspect
 import os
 import unittest
 from unittest.mock import MagicMock, patch, sentinel
@@ -204,16 +205,48 @@ class TestLazyApiDelegates(unittest.TestCase):
         self.assertIs(result, sentinel.noop_context_fn)
 
     def test_checkpoint_exclude_wrapper_forwards_arguments(self):
-        """Test checkpoint-exclusion wrapper forwards its output-retention flag."""
+        """Test checkpoint-exclusion wrapper forwards all swap options."""
         with patch.object(
             _wrapper_impl,
             "checkpoint_exclude_wrapper",
             return_value=sentinel.wrapper,
         ) as mock_wrapper:
-            result = checkpoint_exclude_wrapper(sentinel.module, save_output=False)
+            result = checkpoint_exclude_wrapper(
+                sentinel.module,
+                swap=True,
+                group_swap=True,
+                cpu_pool=sentinel.cpu_pool,
+            )
 
         self.assertIs(result, sentinel.wrapper)
-        mock_wrapper.assert_called_once_with(sentinel.module, save_output=False)
+        mock_wrapper.assert_called_once_with(
+            sentinel.module,
+            swap=True,
+            group_swap=True,
+            cpu_pool=sentinel.cpu_pool,
+        )
+
+    def test_checkpoint_exclude_wrapper_forwards_defaults(self):
+        """Test checkpoint-exclusion defaults are explicit at the facade boundary."""
+        with patch.object(
+            _wrapper_impl,
+            "checkpoint_exclude_wrapper",
+            return_value=sentinel.wrapper,
+        ) as mock_wrapper:
+            result = checkpoint_exclude_wrapper(sentinel.module)
+
+        self.assertIs(result, sentinel.wrapper)
+        mock_wrapper.assert_called_once_with(
+            sentinel.module,
+            swap=False,
+            group_swap=False,
+            cpu_pool=None,
+        )
+
+    def test_checkpoint_exclude_wrapper_rejects_removed_save_output_argument(self):
+        """Test the removed output-elision option is no longer accepted."""
+        with self.assertRaisesRegex(TypeError, "unexpected keyword argument 'save_output'"):
+            inspect.signature(checkpoint_exclude_wrapper).bind(sentinel.module, save_output=True)
 
     def test_checkpoint_wrapper_forwards_keyword_arguments(self):
         """Test checkpoint wrapper delegates all checkpoint options."""

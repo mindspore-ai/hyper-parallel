@@ -18,7 +18,7 @@ import importlib
 import os
 import threading
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, sentinel
 
 import torch
 
@@ -983,6 +983,21 @@ class TestSwapGroup(unittest.TestCase):
         self.mock_plat.tree_map = _build_mock_platform().tree_map
         sg.protect_alias_tensors(t)
         self.assertTrue(st._keep_on_device)
+
+    def test_protect_alias_tensors_keeps_all_output_aliases(self):
+        """Every registered tensor aliasing a layer output should stay on device."""
+        group = SwapGroup("group0")
+        storage = MagicMock()
+        group._storages.append(storage)
+
+        with patch.object(
+            swap_module,
+            "_collect_device_storage_ptrs",
+            return_value={1, 2, 3},
+        ):
+            group.protect_alias_tensors(sentinel.output)
+
+        storage.protect_alias_storage_ptrs.assert_called_once_with({1, 2, 3})
 
     def test_collect_packable_tensors_empty(self):
         """Test _collect_packable_tensors returns 0 when no tensors are packable."""

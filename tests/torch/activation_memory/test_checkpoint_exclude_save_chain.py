@@ -28,25 +28,57 @@ from tests.torch.activation_memory.checkpoint_exclude_matmul import (
     card_mark="onecard",
     essential_mark="essential",
 )
-def test_adjacent_save_regions_elide_intermediate_output() -> None:
-    """A four-SAVE chain should elide two non-activation intermediate outputs."""
-    optimized = _run_mode_in_subprocess("save_chain")
-    legacy = _run_mode_in_subprocess("legacy_save_chain")
+def test_adjacent_save_regions_execute_once_and_replay_cached_outputs() -> None:
+    """A four-SAVE chain should execute each excluded region only once."""
+    result = _run_mode_in_subprocess("save_chain")
 
-    assert optimized["loss"] == legacy["loss"]
-    assert optimized["input_grad"] == legacy["input_grad"]
-    assert optimized["first_calls"] == 1
-    assert optimized["second_calls"] == 1
-    assert optimized["third_calls"] == 1
-    assert optimized["fourth_calls"] == 1
-    assert legacy["first_calls"] == 1
-    assert legacy["second_calls"] == 1
-    assert legacy["third_calls"] == 1
-    assert legacy["fourth_calls"] == 1
+    assert result["first_calls"] == 1
+    assert result["second_calls"] == 1
+    assert result["third_calls"] == 1
+    assert result["fourth_calls"] == 1
+    assert result["forward_bytes"] > _TOKEN_NUM * _HIDDEN_SIZE * 2
 
-    # The first output is already a ReLU backward activation. The second and
-    # third outputs account for two extra allocations in the legacy mode.
-    expected_gap = 2 * _TOKEN_NUM * _HIDDEN_SIZE * 2
-    tolerance = expected_gap // 4
-    forward_gap = legacy["forward_bytes"] - optimized["forward_bytes"]
-    assert abs(forward_gap - expected_gap) <= tolerance
+
+def _assert_swap_save_chain_matches_baseline(baseline: dict, actual: dict) -> None:
+    """Validate numerical parity, exclusion behavior, and swap storage cleanup."""
+    loss_tolerance = max(1e-4, abs(baseline["loss"]) * 1e-6)
+    grad_tolerance = max(1e-5, abs(baseline["input_grad"]) * 1e-5)
+    assert abs(actual["loss"] - baseline["loss"]) <= loss_tolerance
+    assert abs(actual["input_grad"] - baseline["input_grad"]) <= grad_tolerance
+    assert baseline["calls"] == [1, 1, 1, 1]
+    assert actual["calls"] == [1, 1, 1, 1]
+    assert actual["registered_storage_count"] > 0
+    assert actual["offloaded_tensor_count"] > 0
+    assert actual["remaining_storage_count"] == 0
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="onecard",
+    essential_mark="essential",
+)
+def test_checkpoint_exclude_save_chain_swap() -> None:
+    """checkpoint_exclude_wrapper(swap=True) should offload and restore SAVE activations."""
+    baseline = _run_mode_in_subprocess("swap_save_chain_baseline")
+    swapped = _run_mode_in_subprocess("swap_save_chain")
+
+    _assert_swap_save_chain_matches_baseline(baseline, swapped)
+    assert swapped["group_managed_tensor_count"] == 0
+    assert swapped["pool_allocated_bytes"] == 0
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="onecard",
+    essential_mark="essential",
+)
+def test_checkpoint_exclude_save_chain_group_swap_cpu_pool() -> None:
+    """Group swap should fuse SAVE tensors and allocate their host buffers from the explicit pool."""
+    baseline = _run_mode_in_subprocess("swap_save_chain_baseline")
+    pooled = _run_mode_in_subprocess("group_swap_pool_save_chain")
+
+    _assert_swap_save_chain_matches_baseline(baseline, pooled)
+    assert pooled["group_managed_tensor_count"] > 0
+    assert 0 < pooled["pool_allocated_bytes"] <= pooled["pool_capacity_bytes"]
