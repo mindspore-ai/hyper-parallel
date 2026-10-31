@@ -1,0 +1,37 @@
+name: Sync CLA labels
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+  status:
+  schedule:
+    - cron: '19 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: cla-labels-${{ github.event.pull_request.head.sha || github.event.sha || 'sweep' }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: >-
+      github.repository == 'mindspore-ai/hyper-parallel' &&
+      (github.event_name != 'status' || github.event.context == 'license/cla')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # A write token must never execute a fork PR's code or downloaded artifacts.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Query the PR creator and synchronize CLA labels
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CLA_ASSISTANT_TOKEN: ${{ secrets.CLA_ASSISTANT_TOKEN }}
+        run: node .github/scripts/cla-label-sync.mjs --write
