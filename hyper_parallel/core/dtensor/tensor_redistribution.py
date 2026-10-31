@@ -26,7 +26,8 @@ from hyper_parallel.core.dtensor._ragged_utils import (
     _compute_ragged_splits,
 )
 from hyper_parallel.core.dtensor.dtensor import DTensor
-from hyper_parallel.core.dtensor.layout import Layout, RaggedShardInfo
+from hyper_parallel.core.dtensor.layout import Layout, RaggedShardInfo, infer_slice_area_by_rank
+from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.core.dtensor.redistribute_infer import RedistributionOperatorInfer
 
 logger = logging.getLogger(__name__)
@@ -267,9 +268,21 @@ class TensorRedistribution:
             normal = self._redistribution_normal(normal, target_normal_layout)
         return self.normal_to_ragged(normal, to_layout)
 
-    def redistribution(self, input_x, to_layout):
-        """tensor redistribution"""
+    def redistribution(self, input_x: DTensor, to_layout: Layout) -> DTensor:
+        """Redistribute a tensor to the requested layout.
+
+        Args:
+            input_x: Distributed input tensor.
+            to_layout: Requested output layout on the same rank list.
+        """
         x_layout = input_x.layout
+        if (x_layout.has_uneven_shard
+                and not isinstance(x_layout.ragged_shard, RaggedShardInfo)
+                and not isinstance(to_layout.ragged_shard, RaggedShardInfo)):
+            # Validate the export-only path before any collective or layout rewrite.
+            if x_layout.rank_list != to_layout.rank_list:
+                raise ValueError("Uneven redistribution requires the same rank list")
+            return self._gather_uneven_to_replicate(input_x, to_layout)
         x = input_x
         if input_x.layout.is_partial():
             # Solve partial status first
@@ -287,11 +300,96 @@ class TensorRedistribution:
         ):
             return self._redistribute_ragged(x, to_layout)
         if from_layout.has_uneven_shard or to_layout.has_uneven_shard:
-            # FSDP uneven shard/unshard uses its private padded collectives.
-            raise NotImplementedError(
-                "DTensor redistribution does not support uneven chunk-sharded layouts."
-            )
+            return self._gather_uneven_to_replicate(x, to_layout)
         return self._redistribution_normal(x, to_layout)
+
+    @staticmethod
+    @torch.no_grad()
+    def _padded_all_gather(local_tensor, sizes, tensor_dim, rank_list):
+        """Gather export buffers; return independent storage without padding."""
+        if len(rank_list) == 1:
+            return local_tensor.detach().clone()
+        max_size = max(sizes)
+        if tensor_dim != 0 and any(size != max_size for size in sizes):
+            raise NotImplementedError("Uneven export communication only supports dim=0")
+        padded = local_tensor.detach().contiguous()
+        if tensor_dim == 0 and local_tensor.shape[0] != max_size:
+            padded_shape = (max_size, *local_tensor.shape[1:])
+            padded = local_tensor.new_zeros(padded_shape)
+            padded[:local_tensor.shape[0]].copy_(local_tensor)
+        if padded.numel() == 0:
+            output_shape = list(padded.shape)
+            output_shape[tensor_dim] = sum(sizes)
+            return padded.new_empty(output_shape)
+        group = _utils.create_group(rank_list)
+        group_ranks = dist.get_process_group_ranks(group)
+        gathered = [torch.empty_like(padded) for _ in group_ranks]
+        dist.all_gather(gathered, padded, group=group)
+        group_indices = {rank: index for index, rank in enumerate(group_ranks)}
+        # cat copies every trimmed shard into owned storage. Returning a view
+        # (or contiguous(), which may be a no-op) would retain padded buffers.
+        return torch.cat([
+            gathered[group_indices[rank]].narrow(tensor_dim, 0, size)
+            for rank, size in zip(rank_list, sizes)
+        ], dim=tensor_dim)
+
+    @staticmethod
+    def _validate_uneven_local_shape(input_x: DTensor) -> None:
+        """Reject padded storage masquerading as a true local shard."""
+        source = input_x.layout
+        area = infer_slice_area_by_rank(
+            source.mesh_shape, source.tensor_map, source.rank_list.index(source.mesh.rank),
+            tuple(input_x.shape), source.uneven_shard_mesh_dims,
+        )
+        expected_shape = tuple(end - start for start, end in area)
+        local_shape = tuple(input_x.to_local().shape)
+        if local_shape != expected_shape:
+            raise ValueError(f"Uneven shard local shape {local_shape} does not match logical slice {expected_shape}")
+
+    @staticmethod
+    def _gather_uneven_to_replicate(input_x: DTensor, to_layout: Layout) -> DTensor:
+        """Reconstruct detached FSDP weights, including empty dim-zero shards.
+
+        Undo each tensor dimension's sharding from innermost to outermost.
+        This respects both ceil-chunk FSDP shards and balanced TP shards,
+        including the effective ordering encoded for StridedShard layouts.
+        This is an export-only path, not a differentiable redistribution.
+        Uneven nonzero axes and Partial placements remain unsupported.
+        """
+        source = input_x.layout
+        if (source.mesh_shape != to_layout.mesh_shape
+                or not all(isinstance(placement, Replicate) for placement in to_layout.placements)):
+            raise NotImplementedError(
+                "Uneven chunk-sharded redistribution only supports a fully replicated target on the same mesh."
+            )
+        full_shape = tuple(input_x.shape)
+        rank = source.mesh.rank
+        tensor_map = list(source.tensor_map)
+        uneven_dims = source.uneven_shard_mesh_dims
+        local_tensor = input_x.to_local()
+        if source.is_partial():
+            raise NotImplementedError("Uneven FSDP weight export does not support Partial placements")
+        if any(source.placements[axis].dim != 0 for axis in uneven_dims):
+            raise NotImplementedError("Uneven FSDP weight export only supports dim=0")
+        if torch.is_grad_enabled() and local_tensor.requires_grad:
+            raise RuntimeError("Uneven FSDP weight export is not differentiable; use torch.no_grad() or detach()")
+        TensorRedistribution._validate_uneven_local_shape(input_x)
+        for tensor_dim, mapping in enumerate(source.tensor_map):
+            axes = list(mapping if isinstance(mapping, tuple) else (mapping,))
+            axes = [axis for axis in axes if axis != -1]
+            while axes:
+                mesh_dim = len(source.mesh_shape) - 1 - axes[-1]
+                ranks = source.mesh.get_devices_for_axis(mesh_dim, rank)
+                areas = [
+                    infer_slice_area_by_rank(
+                        source.mesh_shape, tensor_map, source.rank_list.index(peer), full_shape, uneven_dims,
+                    ) for peer in ranks
+                ]
+                sizes = [area[tensor_dim][1] - area[tensor_dim][0] for area in areas]
+                local_tensor = TensorRedistribution._padded_all_gather(local_tensor, sizes, tensor_dim, ranks)
+                axes.pop()
+                tensor_map[tensor_dim] = tuple(axes) if axes else -1
+        return DTensor.from_local_with_layout(local_tensor, to_layout, shape=full_shape)
 
     def _redistribution_normal(self, input_x: DTensor, to_layout: Layout) -> DTensor:
         """Run the existing redistribution path for normal layouts."""

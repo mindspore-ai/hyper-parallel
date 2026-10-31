@@ -31,7 +31,7 @@ _to_fn = DTensor.__dict__["to"]
 _float_fn = DTensor.__dict__["float"]
 _type_as_fn = DTensor.__dict__["type_as"]
 _alias_placements_fn = DTensor.__dict__["_alias_placements"]
-_from_converted_local_fn = DTensor.__dict__["_from_converted_local"]
+_new_with_same_layout_fn = DTensor.__dict__["_new_with_same_layout"]
 
 # The platform Tensor alias used by the public DTensor module.
 _Tensor = dtensor_mod.Tensor
@@ -81,7 +81,7 @@ def _make_mock_dtensor(mesh="fake_mesh", placements=None, alias_placements=None,
         """Plain Python class — records constructor calls, no Tensor baggage."""
 
         _alias_placements = _alias_placements_fn
-        _from_converted_local = _from_converted_local_fn
+        _new_with_same_layout = _new_with_same_layout_fn
 
         def __init__(self, local_tensor=None, device_mesh=None, placements=None):
             calls.append({
@@ -165,7 +165,7 @@ def test_to_falls_back_to_placements_when_no_layout():
 
     class _Recorder:
         _alias_placements = _alias_placements_fn
-        _from_converted_local = _from_converted_local_fn
+        _new_with_same_layout = _new_with_same_layout_fn
 
         def __init__(self, local_tensor=None, device_mesh=None, placements=None):
             calls.append({
@@ -221,7 +221,7 @@ def _make_parameter_dtensor(monkeypatch, mesh="fake_mesh", placements=None):
 
     class _ParameterDTensor(_FakeParameter):
         _alias_placements = _alias_placements_fn
-        _from_converted_local = _from_converted_local_fn
+        _new_with_same_layout = _new_with_same_layout_fn
 
         def __init__(self, *args, **kwargs):
             raise AssertionError("ParameterDTensor constructor should not be used")
@@ -482,7 +482,7 @@ def test_type_as_output_dtype_matches_other():
     Feature: DTensor.type_as() output dtype verification
     Description: self=float16, other=float32.
     Expectation: _local_tensor.to(dtype=torch.float32) is called and its
-        return value is forwarded to _from_converted_local.
+        return value is forwarded to _new_with_same_layout.
     """
     fake, mock_local, calls = _make_mock_dtensor(dtype=torch.float16)
     other = torch.empty((), dtype=torch.float32)
@@ -496,5 +496,5 @@ def test_type_as_output_dtype_matches_other():
     # The local_tensor passed to the constructor must be the result of .to().
     new_local = mock_local.to.return_value
     assert calls[0]["local_tensor"] is new_local, (
-        "_from_converted_local should receive the output of _local_tensor.to()"
+        "_new_with_same_layout should receive the output of _local_tensor.to()"
     )

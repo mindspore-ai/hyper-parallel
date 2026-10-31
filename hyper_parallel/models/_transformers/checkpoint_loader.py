@@ -27,13 +27,22 @@ and :class:`CheckpointManager` exports such a model back to Transformers format.
 
 import logging
 import re
+from collections import defaultdict
+from copy import copy, deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import torch
 from torch import nn
 from torch.distributed import is_available, is_initialized
+from hyper_parallel.core.distributed_checkpoint import (
+    FileSystemReader,
+    TensorStorageMetadata,
+    load as load_dcp_state,
+)
+from hyper_parallel.core.distributed_checkpoint.utils import str_to_dtype
+from hyper_parallel.core.fully_shard.api import HSDPModule
 
 from hyper_parallel import DTensor
 from hyper_parallel.components.checkpoint.huggingface_checkpointer import (
@@ -70,44 +79,78 @@ class CheckpointManager:
         self,
         save_directory: str | Path,
         *,
+        dcp_checkpoint: str | Path | None = None,
+        dcp_expert_layout: Optional[str] = None,
         max_shard_size: int | str = "5GB",
         save_original_format: bool = True,
         **kwargs: Any,
     ) -> bool:
         """Gather model weights and save a Transformers-compatible checkpoint.
 
-        All distributed ranks must call this method. Collectives produce each
-        full tensor on every rank, but only rank 0 retains CPU weights and
-        writes files.
+        When ``dcp_checkpoint`` is provided, rank 0 reconstructs model weights
+        from the completed distributed checkpoint while the other ranks return
+        immediately. This avoids running full-model collectives against the
+        live training parameters. Without a DCP source, all distributed ranks
+        must call this method so the live sharded weights can be gathered.
+
+        Args:
+            save_directory: Destination Hugging Face checkpoint directory.
+            dcp_checkpoint: Optional completed DCP directory containing the
+                model shards to export.
+            dcp_expert_layout: For an unreplaced HF model, normalize DCP expert
+                weights using ``auto``, ``hf``, or ``grouped_gemm`` layout.
+                None preserves the live model's registered conversions.
+            max_shard_size: Maximum size of each Hugging Face weight shard.
+            save_original_format: Whether to reverse registered weight
+                conversions before saving. Qwen3.5 dense/MoE text models always
+                use their native text namespace, not the source VLM namespace.
+            **kwargs: Additional arguments forwarded to ``save_pretrained``.
 
         Returns:
             True on the writing rank and False on all other ranks.
         """
         save_method = getattr(self.model, "save_pretrained", None)
+        if dcp_expert_layout is not None and dcp_checkpoint is None:
+            raise ValueError("dcp_expert_layout requires a DCP checkpoint")
         if not callable(save_method):
             raise TypeError("CheckpointManager.save_pretrained requires a Transformers model")
         is_main_process = self._is_main_process()
-        state_dict = self._gather_full_state_dict(keep_state_dict=is_main_process)
+        if dcp_checkpoint is not None:
+            if not is_main_process:
+                return False
+            state_dict = self._load_model_state_dict_from_dcp(dcp_checkpoint)
+            if dcp_expert_layout is not None:
+                state_dict = self._normalize_dcp_export_layout(state_dict, dcp_expert_layout)
+        else:
+            state_dict = self._gather_full_state_dict(keep_state_dict=is_main_process)
         if not is_main_process:
             return False
+        export_model = self._hf_export_model()
+        canonical_text = getattr(getattr(export_model, "config", None), "model_type", None) in (
+            "qwen3_5_text", "qwen3_5_moe_text",
+        )
         used_base = getattr(
             self.model, "_hp_used_base_weight_conversions", None
         )
         used_replacements = getattr(
             self.model, "_hp_used_replacement_weight_conversions", None
         )
-        if save_original_format and used_replacements:
-            original_mapping = getattr(self.model, "_weight_conversions", None)
+        if (save_original_format or canonical_text) and used_replacements:
+            original_mapping = getattr(export_model, "_weight_conversions", None)
             try:
-                self.model._weight_conversions = used_replacements  # pylint: disable=protected-access
-                state_dict = revert_weight_conversion(self.model, state_dict)
-                if used_base:
-                    self.model._weight_conversions = used_base  # pylint: disable=protected-access
-                    state_dict = revert_weight_conversion(self.model, state_dict)
+                export_model._weight_conversions = used_replacements  # pylint: disable=protected-access
+                state_dict = revert_weight_conversion(export_model, state_dict)
+                if used_base and not canonical_text:
+                    export_model._weight_conversions = used_base  # pylint: disable=protected-access
+                    state_dict = revert_weight_conversion(export_model, state_dict)
             finally:
-                self.model._weight_conversions = original_mapping  # pylint: disable=protected-access
+                export_model._weight_conversions = original_mapping  # pylint: disable=protected-access
             save_original_format = False
-        save_method(
+        if canonical_text:
+            # Loading a text model from VLM weights records a PrefixChange.
+            # Reversing it would export VLM keys with a text-only config.
+            save_original_format = False
+        export_model.save_pretrained(
             save_directory,
             state_dict=state_dict,
             is_main_process=True,
@@ -117,6 +160,146 @@ class CheckpointManager:
         )
         return True
 
+    def _hf_export_model(self) -> nn.Module:
+        """Create a metadata-only HF view without modifying the live training model."""
+        # Callback imports must not initialize the optional Transformers model runtime.
+        from transformers import PreTrainedModel  # pylint: disable=C0415
+
+        if not isinstance(self.model, PreTrainedModel):
+            return self.model
+        export_model = copy(self.model)
+        model_class = type(self.model)
+        if HSDPModule in model_class.__bases__:
+            model_class = next(base for base in model_class.__bases__ if base is not HSDPModule)
+        export_model.__class__ = model_class
+        # HF overwrites architectures/dtype during saving. The shallow module
+        # copy shares parameters without allocating weights, but not metadata.
+        export_model.config = deepcopy(self.model.config)
+        if getattr(self.model, "generation_config", None) is not None:
+            export_model.generation_config = deepcopy(self.model.generation_config)
+        return export_model
+
+    def _normalize_dcp_export_layout(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        layout: str,
+    ) -> dict[str, torch.Tensor]:
+        """Restore batched expert layout against an unreplaced HF model."""
+        if layout not in ("auto", "hf", "grouped_gemm"):
+            raise ValueError(f"Unsupported DCP expert layout: {layout}")
+        if getattr(self.model, "_hp_used_replacement_weight_conversions", None):
+            raise ValueError("DCP layout normalization requires an unreplaced Hugging Face model")
+        expected = self.model.state_dict()
+        missing = sorted(set(expected) - set(state_dict))
+        if missing:
+            raise ValueError(f"DCP checkpoint is missing HF model parameters or buffers: {missing}")
+        result = dict(state_dict)
+        expert_groups: dict[str, list[str]] = defaultdict(list)
+        for name in state_dict:
+            if re.search(r"(?:^|\.)experts\.(?:gate_up_proj|up_proj|down_proj)$", name):
+                expert_groups[name.rsplit(".", 1)[0]].append(name)
+        for prefix, names in expert_groups.items():
+            if any(name not in expected or state_dict[name].ndim != 3 for name in names):
+                raise ValueError(f"Unsupported DCP expert parameters under {prefix}; expected batched HF weights")
+            self._restore_expert_group(state_dict, expected, result, prefix, names, layout)
+        for name, tensor in result.items():
+            target = expected.get(name)
+            if target is None:
+                raise ValueError(f"DCP parameter {name!r} is absent from the HF model; check --model-dir")
+            if tensor.shape != target.shape:
+                raise ValueError(
+                    f"DCP parameter {name!r} has shape {tuple(tensor.shape)}, "
+                    f"but HF expects {tuple(target.shape)}; check model config and expert layout"
+                )
+        return result
+
+    @staticmethod
+    def _restore_expert_group(state_dict, expected, result, prefix, names, layout):
+        """Restore one expert group while rejecting ambiguous or incompatible layouts."""
+        hf_matches = all(state_dict[name].shape == expected[name].shape for name in names)
+        transposed_matches = all(
+            state_dict[name].transpose(-2, -1).shape == expected[name].shape for name in names
+        )
+        if layout == "auto" and hf_matches and transposed_matches:
+            raise ValueError(
+                f"Ambiguous expert layout under {prefix}; explicitly select hf or grouped_gemm"
+            )
+        transpose = layout == "grouped_gemm" or (layout == "auto" and not hf_matches)
+        if transpose and not transposed_matches:
+            raise ValueError(
+                f"DCP expert shapes under {prefix} do not match the requested HF layout: "
+                + ", ".join(
+                    f"{name}: DCP {tuple(state_dict[name].shape)}, HF {tuple(expected[name].shape)}"
+                    for name in names
+                )
+            )
+        if transpose:
+            for name in names:
+                result[name] = state_dict[name].transpose(-2, -1).contiguous()
+            logger.info("Restored HF expert layout for %s", prefix)
+
+    @staticmethod
+    def _model_key_from_dcp(
+        fqn: str,
+        planner_data: dict[str, tuple[Any, ...]] | None,
+    ) -> str | None:
+        """Return the model-local key for one flattened DCP entry."""
+        path = planner_data.get(fqn) if planner_data is not None else None
+        if path is not None:
+            if len(path) < 2 or path[0] != "model":
+                return None
+            return ".".join(str(part) for part in path[1:])
+        if fqn.startswith("model."):
+            return fqn[len("model."):]
+        return None
+
+    def _load_model_state_dict_from_dcp(
+        self,
+        checkpoint_id: str | Path,
+    ) -> dict[str, torch.Tensor]:
+        """Reconstruct only model tensors from a completed DCP on rank 0."""
+        reader = FileSystemReader(checkpoint_id)
+        metadata = reader.load_metadata()
+        planner_data = metadata.planner_data
+        if planner_data is not None and not isinstance(planner_data, dict):
+            raise TypeError("DCP planner_data must be a mapping for Hugging Face export")
+
+        dcp_state: dict[str, torch.Tensor] = {}
+        model_keys: dict[str, str] = {}
+        seen_model_keys: set[str] = set()
+        for fqn, storage_metadata in metadata.state_dict_metadata.items():
+            model_key = self._model_key_from_dcp(fqn, planner_data)
+            if model_key is None:
+                continue
+            if not isinstance(storage_metadata, TensorStorageMetadata):
+                raise TypeError(
+                    f"DCP model entry {fqn!r} is not a tensor and cannot be exported"
+                )
+            if model_key in seen_model_keys:
+                raise ValueError(f"Duplicate model key {model_key!r} in DCP checkpoint")
+            dcp_state[fqn] = torch.empty(
+                storage_metadata.size,
+                dtype=str_to_dtype(storage_metadata.properties.dtype),
+                device="cpu",
+            )
+            model_keys[fqn] = model_key
+            seen_model_keys.add(model_key)
+
+        if not dcp_state:
+            raise ValueError(f"No model tensors found in DCP checkpoint {checkpoint_id}")
+
+        load_dcp_state(
+            dcp_state,
+            checkpoint_id=checkpoint_id,
+            no_dist=True,
+            broadcast_replicated_tensors=False,
+        )
+        return {
+            model_keys[fqn]: tensor.detach()
+            for fqn, tensor in dcp_state.items()
+        }
+
+    @torch.no_grad()
     def _gather_full_state_dict(self, *, keep_state_dict: bool) -> dict[str, Any]:
         """Gather sharded model tensors into a full CPU state dictionary."""
 

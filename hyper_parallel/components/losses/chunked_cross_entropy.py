@@ -41,6 +41,8 @@ from torch.autograd.function import once_differentiable
 from torch.nn import functional
 from transformers.utils import ModelOutput
 
+from hyper_parallel.core.fully_shard.api import HSDPModule
+
 
 def _linear_cross_entropy_chunk(
     hidden_chunk: torch.Tensor,
@@ -297,6 +299,14 @@ class ChunkedCausalLMLoss(nn.Module):
                 "ChunkedCausalLMLoss currently requires tp_size=1, pp_size=1, "
                 f"and loss_parallel=false; got tp_size={tp_size}, "
                 f"pp_size={pp_size}, loss_parallel={loss_parallel}"
+            )
+
+        # Direct weight access bypasses an independently wrapped head's forward
+        # hooks, so its sharded weight would not be gathered for the projection.
+        if isinstance(getattr(model, "lm_head", None), HSDPModule):
+            raise NotImplementedError(
+                "ChunkedCausalLMLoss does not support an independently FSDP-wrapped lm_head; "
+                "remove lm_head from fsdp_config.root_wrap_modules or disable chunk loss"
             )
 
         # Lazy imports keep generic loss-package import independent of concrete

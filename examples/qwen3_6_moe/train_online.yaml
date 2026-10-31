@@ -1,0 +1,194 @@
+# Eight-rank Qwen3.6-35B-A3B online conversation training with FSDP, CP,
+# EP, high-performance fused GDN, and grouped routed experts.
+
+model:
+  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /home/chaoran/models/Qwen3.6-35B-A3B
+  ignore_mismatched_sizes: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  force_hf: true
+
+training:
+  train_iters: 100
+  train_samples: null
+  global_batch_size: 8
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: true
+
+accelerator:
+  tp_size: 1
+  cp_size: 2
+  # Split the 256 routed experts across two ranks in each EP group.
+  ep_size: 2
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 8
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
+  # The eight-rank expert domain becomes EDP=4 x EP=2. Shard each EP
+  # partition across all four EDP ranks, leaving no replicated EDP axis.
+  edp_shard_size: 4
+  replicate_params: []
+  root_wrap_modules:
+    - model.embed_tokens
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
+
+plan_overrides:
+  - match: "*.linear_attn"
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeGatedDeltaNet
+      exact_type: true
+      implementation:
+        _target_: hyper_parallel.components.modules.TritonGDN
+  - match: "*.mlp.experts"
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeExperts
+      exact_type: true
+      implementation:
+        _target_: hyper_parallel.components.modules.GroupedExperts
+  - match: "*.mlp.forward"
+    when: ep
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.qwen3_5_moe.adapter.distributed.expert_parallel.qwen3_5_moe_ep_compute_fn
+        use_grouped_gemm: true
+  - match: "*.linear_attn.forward"
+    when: cp
+    replace:
+      kind: method
+      implementation: hyper_parallel.distributed.context_parallel.wrappers.gdn_ulysses_cp_wrapper
+  - match: "*.self_attn.forward"
+    when: cp
+    replace:
+      kind: method
+      implementation: hyper_parallel.distributed.context_parallel.wrappers.sdpa_hf_ulysses_cp_wrapper
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: full
+
+activation_swap: none
+
+compile:
+  enabled: false
+  mode: default
+  fullgraph: false
+  dynamic: false
+  backend: null
+  options: {}
+  dynamo_cache_size_limit: 256
+
+dataset:
+  model_assets:
+    chat_template: tokenizer
+    chat_template_kwargs:
+      enable_thinking: true
+      reasoning_effort: medium
+      # Keep historical reasoning so incremental loss-mask boundaries remain stable.
+      preserve_thinking: true
+    log_first_chat_template: true
+    tokenizer:
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: /home/chaoran/models/Qwen3.6-35B-A3B
+      local_files_only: true
+      use_fast: true
+      trust_remote_code: false
+  data_transform:
+    _target_: hyper_parallel.data.text.text_transform.build_text_transform
+    data_type: conversation
+    text_keys: messages
+    max_seq_len: 4096
+  _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
+  data_path: /home/chaoran/datasets/decif-30k.jsonl
+  data_config:
+    dataset_type: mapping
+    hf_dataset_name: null
+    create_attention_mask_in_dataloader: false
+    labels_are_shifted: true
+
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_online_text_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.TextParallelBatch
+    source_type: online
+    attention_mode: dense
+  sampler_type: cyclic
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+
+loss_fn:
+  _target_: hyper_parallel.components.losses.ChunkedCausalLMLoss
+  chunk_size: 1024
+
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+  fp32_main_params: true
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.95]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr: 1.0e-5
+    lr_warmup_steps: 0
+    min_lr: 1.0e-6
+
+checkpoint:
+  save_ckpt: false
+  save_hf_weights: false
+  checkpoint_dir: ./outputs/qwen3_6_moe/checkpoints
+  save_steps: 10
+  save_epochs: 1
+  is_async: false
+  save_optimizer: true
+  save_train_state: true
+  save_extra_state_per_rank: false
+  restore_from: null
+  restore_optimizer: true
+  restore_train_state: true
+
+debug:
+  check_nan_inf: false
+  check_dataset: null
+
+profiler:
+  enable: false
+  start_step: 3
+  stop_step: 4
+  output_path: ./outputs/qwen3_6_moe/profiling
+  memory: false
+  with_stack: false
+  rank_ids: [0]

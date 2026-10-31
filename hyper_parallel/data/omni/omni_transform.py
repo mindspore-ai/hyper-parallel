@@ -11,11 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# ============================================================================
+# =====================================================================
 """Omni transform lifecycle and the default AutoProcessor implementation."""
 
 from __future__ import annotations
 
+import copy
+import io
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -23,12 +26,11 @@ from typing import Any
 import torch  # pylint: disable=forbidden-backend-import
 from transformers import AutoProcessor
 
-from hyper_parallel.data.constants import IGNORE_INDEX, OMNI_CP_TOKEN_FIELDS
+from hyper_parallel.data.constants import IGNORE_INDEX, OMNI_CP_TOKEN_FIELDS, ONLINE_SOURCE_PATH_KEY
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 from hyper_parallel.data.online.format import (
     convert_sharegpt_to_messages,
     normalize_chat_media_fields,
-    resolve_chat_media_paths,
     resolve_media_path,
 )
 
@@ -158,13 +160,129 @@ class OmniDataTransform:
         raise NotImplementedError(f"{type(self).__name__} does not implement postencode_sample")
 
     def encode_batch(self, batch: Any) -> Any:
-        """Apply an optional model-specific batch encoding stage."""
+        """Apply an optional model-specific batch encoding stage.
+
+        Args:
+            batch: Collated model inputs.
+        """
         return batch
 
     def prepare_messages(self, sample: dict[str, Any]) -> list[dict[str, Any]]:
-        """Copy messages and resolve media paths relative to their JSONL file."""
-        prepared_messages = resolve_chat_media_paths(sample)
+        """Bind external images in placeholder order and resolve source-relative paths.
+
+        Args:
+            sample: Messages, optional external images, and source path metadata.
+        """
+        messages = sample.get("messages")
+        if not isinstance(messages, list) or not messages:
+            raise ValueError("Omni sample must contain non-empty messages")
+
+        prepared_messages = copy.deepcopy(messages)
+        self._bind_external_images(prepared_messages, sample.get("images"))
+        source_path = sample.get(ONLINE_SOURCE_PATH_KEY)
+        if source_path is None:
+            return prepared_messages
+
+        source_directory = os.path.dirname(os.path.abspath(source_path))
+        for message in prepared_messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for content_block in content:
+                self._resolve_media_block(content_block, source_directory)
         return prepared_messages
+
+    def _bind_external_images(self, messages: list, images: Any) -> None:
+        """Consume external images only after checking the complete placeholder count."""
+        if images is None:
+            images = []
+        if not isinstance(images, list):
+            raise TypeError("Omni sample images must be a list")
+        placeholders = []
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, str) and (images or "<image>" in content):
+                content = [{"type": "text", "text": content}]
+            if isinstance(content, list):
+                message["content"] = self._expand_image_placeholders(content, placeholders)
+        if len(placeholders) != len(images):
+            raise ValueError(f"Image placeholder count {len(placeholders)} does not match images count {len(images)}")
+        for index, (block, image) in enumerate(zip(placeholders, images)):
+            block["image"] = self._decode_external_image(image, index)
+
+    @staticmethod
+    def _expand_image_placeholders(content: list, placeholders: list) -> list:
+        """Preserve text around each placeholder and leave explicit media untouched."""
+        expanded = []
+        for block in content:
+            if not isinstance(block, dict):
+                expanded.append(block)
+                continue
+            text_content = block.get("text")
+            if (block.get("type") == "text"
+                    and isinstance(text_content, str) and "<image>" in text_content):
+                for index, text in enumerate(block["text"].split("<image>")):
+                    if index:
+                        image_block = {"type": "image"}
+                        expanded.append(image_block)
+                        placeholders.append(image_block)
+                    if text:
+                        expanded.append({**block, "text": text})
+            else:
+                expanded.append(block)
+                if block.get("type") == "image":
+                    # Arrow structs can materialize absent source fields as nulls.
+                    source_fields = ("image", "url", "path", "base64")
+                    for field in source_fields:
+                        if block.get(field) is None:
+                            block.pop(field, None)
+                    if not any(field in block for field in source_fields):
+                        placeholders.append(block)
+        return expanded
+
+    @staticmethod
+    def _decode_external_image(image: Any, index: int) -> Any:
+        """Prefer embedded bytes over path, returning a fully loaded RGB image."""
+        if isinstance(image, str) and image:
+            return image
+        if isinstance(image, Mapping):
+            payload = image.get("bytes")
+            if payload is not None:
+                if not isinstance(payload, (bytes, bytearray, memoryview)):
+                    raise TypeError(f"images[{index}].bytes must be binary image data")
+                # Pillow is optional for configurations that only use text/path messages.
+                from PIL import Image  # pylint: disable=C0415
+
+                try:
+                    with io.BytesIO(payload) as buffer, Image.open(buffer) as decoded:
+                        return decoded.convert("RGB")
+                except (OSError, ValueError) as error:
+                    raise ValueError(f"Cannot decode images[{index}].bytes") from error
+            path = image.get("path")
+            if isinstance(path, str) and path:
+                return path
+        raise ValueError(f"images[{index}] must be a path or a mapping with bytes/path")
+
+    @classmethod
+    def _resolve_media_block(cls, content_block: Any, source_directory: str) -> None:
+        """Resolve path-bearing fields without changing the processor's message format."""
+        if not isinstance(content_block, dict):
+            return
+
+        block_type = content_block.get("type")
+        if block_type == "image_url":
+            image_url = content_block.get("image_url")
+            if isinstance(image_url, str):
+                content_block["image_url"] = cls._resolve_media_path(image_url, source_directory)
+            elif isinstance(image_url, dict) and isinstance(image_url.get("url"), str):
+                image_url["url"] = cls._resolve_media_path(image_url["url"], source_directory)
+            return
+
+        if block_type in ("image", "video", "audio"):
+            for field in (block_type, "url", "path"):
+                media_field = content_block.get(field)
+                if isinstance(media_field, str):
+                    content_block[field] = cls._resolve_media_path(media_field, source_directory)
 
     @staticmethod
     def _resolve_media_path(media_path: str, source_directory: str) -> str:
@@ -173,7 +291,8 @@ class OmniDataTransform:
         return resolved_path
 
 
-class AutoProcessorTransform(OmniDataTransform):
+# Omni hooks are alternatives: eager encoding intentionally leaves deferred hooks unimplemented.
+class AutoProcessorTransform(OmniDataTransform):  # pylint: disable=abstract-method
     """Encode a conversation and supervise only its final assistant response."""
 
     def __init__(
@@ -197,6 +316,50 @@ class AutoProcessorTransform(OmniDataTransform):
         valid_sample = bool(messages)
         return valid_sample
 
+    def _assistant_prompt_length(self, messages: list, input_ids: Any, prompt_ids: Any) -> int:
+        """Locate the prompt in processor output without retokenizing media spans.
+
+        A token crossing the source/target character boundary is masked in full.
+        This preserves native processor inputs, unlike separately encoding and
+        concatenating the source and target, which changes sequence-aligned fields.
+        """
+        if len(prompt_ids) < len(input_ids) and input_ids[:len(prompt_ids)].equal(prompt_ids):
+            return len(prompt_ids)
+
+        full_text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False,
+        )
+        prompt_text = self.processor.apply_chat_template(
+            messages[:-1], tokenize=False, add_generation_prompt=True,
+        )
+        if not full_text.startswith(prompt_text):
+            raise ValueError("Assistant generation prompt must be a text prefix of the full conversation")
+
+        full_tokens = input_ids.tolist()
+        prompt_tokens = prompt_ids.tolist()
+        common_length = 0
+        for full_token, prompt_token in zip(full_tokens, prompt_tokens):
+            if full_token != prompt_token:
+                break
+            common_length += 1
+        return self._merged_prompt_length(full_tokens, prompt_tokens, common_length)
+
+    def _merged_prompt_length(self, full_tokens: list[int], prompt_tokens: list[int], common_length: int) -> int:
+        """Accept only text-equivalent retokenization after the shared token prefix."""
+        decode_kwargs = {"skip_special_tokens": False, "clean_up_tokenization_spaces": False}
+        tokenizer = self.processor.tokenizer
+        full_tail = tokenizer.decode(full_tokens[common_length:], **decode_kwargs)
+        prompt_tail = tokenizer.decode(prompt_tokens[common_length:], **decode_kwargs)
+        # Only the prompt must decode losslessly to establish the supervision boundary.
+        # A literal U+FFFD in the assistant response is data, not a prompt mismatch.
+        if not prompt_tail or "\ufffd" in prompt_tail or not full_tail.startswith(prompt_tail):
+            raise ValueError("Assistant prompt tokens differ beyond a lossless text boundary merge")
+        for end in range(common_length + 1, len(full_tokens) + 1):
+            decoded = tokenizer.decode(full_tokens[common_length:end], **decode_kwargs)
+            if full_tail.startswith(decoded) and decoded.startswith(prompt_tail):
+                return end
+        raise ValueError("Cannot locate assistant supervision boundary in processor tokens")
+
     def encode_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
         """Build model inputs and assistant-only labels from processor messages."""
         if self.training_mode != "sft":
@@ -205,7 +368,8 @@ class AutoProcessorTransform(OmniDataTransform):
         if self.sample_format == "sharegpt":
             messages = convert_sharegpt_to_messages(sample)
         else:
-            messages = normalize_chat_media_fields(sample)
+            prepared_sample = dict(sample, messages=self.prepare_messages(sample))
+            messages = normalize_chat_media_fields(prepared_sample)
         if len(messages) < 2 or messages[-1].get("role") != "assistant":
             raise ValueError("Omni training sample must end with a final assistant message")
 
@@ -227,9 +391,9 @@ class AutoProcessorTransform(OmniDataTransform):
 
         input_ids = encoded_sample["input_ids"].squeeze(0)
         prompt_ids = prompt_sample["input_ids"].squeeze(0)
-        prompt_length = len(prompt_ids)
-        if prompt_length >= len(input_ids) or not input_ids[:prompt_length].equal(prompt_ids):
-            raise ValueError("Assistant prompt tokens must be a prefix of the full conversation")
+        if len(input_ids) > self.max_seq_len:
+            raise ValueError("Omni sample exceeds max_seq_len; refusing to truncate a possible media span")
+        prompt_length = self._assistant_prompt_length(messages, input_ids, prompt_ids)
 
         media_mask = None
         if "mm_token_type_ids" in encoded_sample:
@@ -241,6 +405,8 @@ class AutoProcessorTransform(OmniDataTransform):
         # Single-sample token fields: [1, L] -> [L]; media tensors keep the processor layout.
         for field in OMNI_CP_TOKEN_FIELDS.intersection(encoded_sample):
             encoded_sample[field] = encoded_sample[field].squeeze(0)
+        if not bool(labels[1:].ne(IGNORE_INDEX).any()):
+            raise ValueError("Omni sample has no supervised assistant tokens")
         encoded_sample["labels"] = labels
         return encoded_sample
 
@@ -299,7 +465,11 @@ class _OmniTransformStrategy:
         return transform_strategy
 
     def encode_selected_sample(self, sample: Any) -> Any:
-        """Finish encoding a sample after packing selection."""
+        """Finish encoding a sample after packing selection.
+
+        Args:
+            sample: Selected candidate.
+        """
         encoded_sample = sample
         if self.selected_sample_encoder is not None:
             encoded_sample = self.selected_sample_encoder(sample)

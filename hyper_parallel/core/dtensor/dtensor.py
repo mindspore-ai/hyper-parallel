@@ -431,9 +431,14 @@ class DTensor(DTensorBase):
             return self._layout.alias_placements
         return self._placements
 
-    def _from_converted_local(self, local_tensor: Tensor) -> 'DTensor':
-        """Rebuild converted DTensor data without preserving Parameter identity."""
-        cls = DTensor if isinstance(self, torch.nn.Parameter) else self.__class__
+    def _new_with_same_layout(self, local_tensor: Tensor) -> 'DTensor':
+        """Create a DTensor from a local shard while retaining the logical layout.
+
+        The shard must retain its logical shape. Layout metadata is copied so
+        updating its dtype cannot mutate the source. Parameter inputs produce
+        plain DTensors. This method does not copy tensor data or communicate.
+        """
+        tensor_type = DTensor if isinstance(self, torch.nn.Parameter) else self.__class__
         if not isinstance(self._layout, Layout):
             constructor_kwargs = {
                 "device_mesh": self._device_mesh,
@@ -441,7 +446,7 @@ class DTensor(DTensorBase):
             }
             if hasattr(self, "_global_shape"):
                 constructor_kwargs["shape"] = self._global_shape
-            return cls(local_tensor, **constructor_kwargs)
+            return tensor_type(local_tensor, **constructor_kwargs)
         layout = cp.deepcopy(self._layout)
         if layout.tensor_shape is not None:
             layout.set_tensor_meta(
@@ -449,13 +454,24 @@ class DTensor(DTensorBase):
                 layout.tensor_stride,
                 local_tensor.dtype,
             )
-        return cls(
+        return tensor_type(
             local_tensor,
             device_mesh=self._device_mesh,
             placements=layout.placements,
             layout=layout,
-            shape=getattr(self, "_global_shape", None),
+            shape=self._global_shape,
         )
+
+    def detach(self) -> "DTensor":
+        """Detach autograd while retaining the complete logical layout.
+
+        The result shares local storage and owns its layout metadata so dtype
+        conversions cannot change the source. Uneven shards need this metadata
+        when optimizer moments are initialized with ``zeros_like`` during resume.
+        """
+        if self.layout is None:
+            return super().detach()
+        return self._new_with_same_layout(self._local_tensor.detach())
 
     def to(self, *args, **kwargs):
         """Move the DTensor to a different device or dtype.
@@ -473,7 +489,7 @@ class DTensor(DTensorBase):
             DTensor: A new DTensor with the converted local tensor.
         """
         new_local = self._local_tensor.to(*args, **kwargs)
-        return self._from_converted_local(new_local)
+        return self._new_with_same_layout(new_local)
 
     def float(self):
         """Convert the DTensor to float dtype.
@@ -482,7 +498,7 @@ class DTensor(DTensorBase):
             DTensor: A new DTensor with float32 local tensor.
         """
         new_local = self._local_tensor.float()
-        return self._from_converted_local(new_local)
+        return self._new_with_same_layout(new_local)
 
     def type_as(self, other: Tensor) -> "DTensor":
         """Cast this DTensor to the dtype of ``other``.
@@ -549,7 +565,7 @@ class DTensor(DTensorBase):
         if self.dtype == target_dtype:
             return self
         new_local = self._local_tensor.to(dtype=target_dtype)
-        return self._from_converted_local(new_local)
+        return self._new_with_same_layout(new_local)
 
     def _validate_factory_device(self, device: Any) -> None:
         """Raise :class:`ValueError` if ``device`` does not match the DTensor's device."""

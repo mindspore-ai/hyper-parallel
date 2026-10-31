@@ -47,6 +47,7 @@ from hyper_parallel.models.qwen3_5.adapter.distributed import (
 from hyper_parallel.models.registry import get_model_adapter
 from hyper_parallel.trainer.config import entries_to_plan_overrides
 from hyper_parallel.trainer.config.parser import parse_training_args
+from tests.common.mark_utils import arg_mark
 from tests.ut.auto_models.distributed.conftest import FakeDeviceMesh
 
 
@@ -205,6 +206,44 @@ plan_overrides:
         self.assertEqual(set(spec.params), expected_params)
         for placements in spec.params.values():
             self.assertEqual(placements[CP], Replicate())
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_native_planner_covers_gdn_for_all_qwen_identities(self) -> None:
+        """Feature: adapter-owned GDN roles.
+
+        Description: Build CP plans for dense/MoE text and multimodal identities.
+        Expectation: Every GDN parameter is declared without special TP handlers.
+        """
+        for architecture in (
+            "Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForCausalLM", "Qwen3_5MoeForConditionalGeneration",
+        ):
+            for cp_size in (1, 4):
+                with self.subTest(architecture=architecture, cp_size=cp_size):
+                    model = _TinyQwen35Model()
+                    model.config.architectures = [architecture]
+                    plan = ShardingPlanner().plan(
+                        model, FakeDeviceMesh((cp_size,), ("cp",)), cp_size=cp_size,
+                    )
+                    covered = {
+                        f"{fqn}.{name}" for fqn, spec in plan.modules.items() for name in spec.params
+                    }
+                    self.assertEqual(covered, set(dict(model.named_parameters())))
+                    self.assertFalse(plan.special_handlers)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_pure_cp_rejects_undeclared_qwen_parameter(self) -> None:
+        """Feature: planner coverage validation.
+
+        Description: Add an unclassified trainable parameter to the Qwen facade.
+        Expectation: Pure CP reports the missing declaration instead of bypassing validation.
+        """
+        model = _TinyQwen35Model()
+        model.unclassified_weight = nn.Parameter(torch.ones(3))
+        with self.assertRaisesRegex(ValueError, "unclassified_weight"):
+            ShardingPlanner().plan(model, FakeDeviceMesh((4,), ("cp",)), cp_size=4)
 
     def test_wrapper_is_atomic_and_rejects_invalid_composition(self):
         """Return an atomic rewrite and reject duplicate or TP+CP wrapping."""

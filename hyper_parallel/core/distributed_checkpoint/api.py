@@ -504,9 +504,15 @@ def load(
     # Set up planner
     planner = StandardLoadPlanner() if planner is None else planner
 
-    # Get rank and coordinator info
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    # ``no_dist`` must also work in a plain Python process. Keep the real rank
+    # when a process group exists so rank-local checkpoint metadata still
+    # resolves correctly for callers inside distributed jobs.
+    if no_dist and not dist.is_initialized():
+        rank = 0
+        world_size = 1
+    else:
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
     is_coordinator = rank == 0
 
     # Open the checkpoint. One saved without collectives has no shared metadata to plan

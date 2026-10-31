@@ -21,8 +21,22 @@ Canonical merge (05 §11.3) of the former
 ``IGNORE_INDEX`` shared from the constants module.
 """
 
+import os
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, MutableMapping, Optional, Sequence, Type, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    MutableMapping,
+    Optional,
+    Sequence,
+    Type,
+    Union,
+)
 
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.data.dataset_logging import get_dataset_logger
@@ -184,17 +198,36 @@ def _janus_labels(content_ids: List[int], image_token_id: int, loss_mask: int, t
     return content_ids
 
 
-def build_chat_template(template_name: str, tokenizer: "PreTrainedTokenizer") -> "ChatTemplate":
+def build_chat_template(
+        template_name: str,
+        tokenizer: "PreTrainedTokenizer",
+        *,
+        chat_template_kwargs: Optional[Dict[str, Any]] = None,
+        log_first_rendered_template: bool = False,
+) -> "ChatTemplate":
     """Build the registered chat template for a tokenizer.
 
     Args:
         template_name: Registry key of the chat template implementation.
         tokenizer: Hugging Face tokenizer used for encoding and special tokens.
+        chat_template_kwargs: Optional keyword arguments forwarded to the tokenizer's native chat template.
+        log_first_rendered_template: Whether the native tokenizer template logs its first rendered conversation.
 
     Returns:
         The configured chat template instance.
+
+    Raises:
+        ValueError: If native-template options are requested for a non-tokenizer template.
     """
-    return CHAT_TEMPLATE_REGISTRY[template_name](tokenizer)
+    if template_name != "tokenizer":
+        if chat_template_kwargs or log_first_rendered_template:
+            raise ValueError("Native chat-template options require chat_template='tokenizer'")
+        return CHAT_TEMPLATE_REGISTRY[template_name](tokenizer)
+    return CHAT_TEMPLATE_REGISTRY[template_name](
+        tokenizer,
+        chat_template_kwargs=chat_template_kwargs,
+        log_first_rendered_template=log_first_rendered_template,
+    )
 
 
 class ChatTemplate(ABC):
@@ -275,6 +308,102 @@ class DefaultTemplate(ChatTemplate):
 class TokenizerTemplate(ChatTemplate):
     """Use the tokenizer's native chat template and train only selected messages."""
 
+    _RESERVED_TEMPLATE_KWARGS = frozenset({"messages", "tools", "tokenize", "add_generation_prompt", "return_dict"})
+    _REASONING_EFFORTS = frozenset({"low", "medium", "xhigh"})
+
+    def __init__(
+            self,
+            tokenizer: Any,
+            chat_template_kwargs: Optional[Dict[str, Any]] = None,
+            log_first_rendered_template: bool = False,
+    ) -> None:
+        """Initialize the native tokenizer template wrapper.
+
+        Args:
+            tokenizer: Tokenizer providing the native Jinja chat template.
+            chat_template_kwargs: Keyword arguments forwarded to every native chat-template rendering.
+            log_first_rendered_template: Whether to log the first input messages and their fully rendered template.
+
+        Raises:
+            ValueError: If a reserved argument is configured or a known reasoning option is invalid.
+        """
+        super().__init__(tokenizer)
+        self.chat_template_kwargs = dict(chat_template_kwargs or {})
+        self._validate_chat_template_kwargs()
+        self.log_first_rendered_template = log_first_rendered_template
+        self._has_logged_first_rendered_template = False
+
+    def _validate_chat_template_kwargs(self) -> None:
+        """Validate Trainer-owned arguments and known Qwen reasoning options."""
+        reserved_kwargs = self._RESERVED_TEMPLATE_KWARGS.intersection(self.chat_template_kwargs)
+        if reserved_kwargs:
+            raise ValueError(
+                "chat_template_kwargs cannot override Trainer-owned arguments: "
+                f"{sorted(reserved_kwargs)!r}"
+            )
+
+        enable_thinking = self.chat_template_kwargs.get("enable_thinking")
+        if enable_thinking is not None and not isinstance(enable_thinking, bool):
+            raise ValueError("chat_template_kwargs.enable_thinking must be a bool")
+
+        preserve_thinking = self.chat_template_kwargs.get("preserve_thinking")
+        if preserve_thinking is not None and not isinstance(preserve_thinking, bool):
+            raise ValueError("chat_template_kwargs.preserve_thinking must be a bool")
+
+        reasoning_effort = self.chat_template_kwargs.get("reasoning_effort")
+        if reasoning_effort is not None and reasoning_effort not in self._REASONING_EFFORTS:
+            raise ValueError(
+                "chat_template_kwargs.reasoning_effort must be one of "
+                f"{sorted(self._REASONING_EFFORTS)!r}"
+            )
+
+    def _apply_chat_template(
+            self,
+            messages: Sequence[Mapping[str, Any]],
+            *,
+            tokenize: bool,
+            return_dict: bool,
+            add_generation_prompt: bool = False,
+            tools: Optional[Sequence[Mapping[str, Any]]] = None,
+    ) -> Any:
+        """Render messages with one consistent set of native-template arguments."""
+        template_kwargs = dict(self.chat_template_kwargs)
+        if tools:
+            template_kwargs["tools"] = tools
+        return self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+            return_dict=return_dict,
+            **template_kwargs,
+        )
+
+    def _log_first_template(
+            self,
+            messages: Sequence[Mapping[str, Any]],
+            tools: Optional[Sequence[Mapping[str, Any]]] = None,
+    ) -> None:
+        """Log the first raw conversation and native-template rendering once."""
+        if not self.log_first_rendered_template or self._has_logged_first_rendered_template:
+            return
+        if os.environ.get("RANK", "0") != "0":
+            self._has_logged_first_rendered_template = True
+            return
+
+        rendered_template = self._apply_chat_template(
+            messages,
+            tokenize=False,
+            return_dict=False,
+            tools=tools,
+        )
+        logger.info("First chat-template input messages: %r", messages)
+        template_kwargs = dict(self.chat_template_kwargs)
+        if tools:
+            template_kwargs["tools"] = tools
+        logger.info("First chat-template kwargs: %r", template_kwargs)
+        logger.info("First rendered chat template:\n%s", rendered_template)
+        self._has_logged_first_rendered_template = True
+
     def _update_prefix_labels(
             self,
             previous_ids: List[int],
@@ -291,51 +420,143 @@ class TokenizerTemplate(ChatTemplate):
                 "the generic tokenizer template requires prefix-stable rendering."
             )
 
+    def _encode_text_continuation(
+            self,
+            text: str,
+            previous_text: str,
+            previous_ids: List[int],
+    ) -> List[int]:
+        """Keep earlier source/target token boundaries when the rendered text extends history."""
+        if text.startswith(previous_text):
+            # Re-encoding history can merge tokens across a masked source/target boundary
+            # (e.g. the two newlines in empty reasoning), invalidating earlier labels.
+            return previous_ids + self.tokenizer.encode(text[len(previous_text):], add_special_tokens=False)
+        # Actual template rewrites still go through the strict prefix validator, including
+        # the explicitly supported GPT-OSS terminal-token substitution.
+        return self.tokenizer.encode(text, add_special_tokens=False)
+
+    def _encode_assistant_source_target(
+            self,
+            messages: Sequence[Mapping[str, Any]],
+            previous_text: str,
+            previous_ids: List[int],
+            tools: Optional[Sequence[Mapping[str, Any]]] = None,
+    ) -> tuple[List[int], List[int], str]:
+        """Encode history plus the prefilled header separately from the current assistant target.
+
+        ``messages`` ends at the assistant being supervised. The source includes
+        earlier assistant targets, whose labels must be preserved by the caller;
+        only newly appended source tokens should receive ``IGNORE_INDEX``.
+        """
+        completed_text = self._apply_chat_template(
+            messages, tokenize=False, return_dict=False, tools=tools,
+        )
+        source_text = self._apply_chat_template(
+            messages[:-1], tokenize=False, return_dict=False, add_generation_prompt=True, tools=tools,
+        )
+        if not completed_text.startswith(source_text):
+            raise ValueError(
+                "The tokenizer generation prompt is not a text prefix of the completed assistant message; "
+                "training and inference assistant headers would be inconsistent."
+            )
+        # Separate encoding prevents BPE from merging a prefilled header token with the first target token.
+        source_ids = self._encode_text_continuation(source_text, previous_text, previous_ids)
+        target_ids = self.tokenizer.encode(completed_text[len(source_text):], add_special_tokens=False)
+        return source_ids, target_ids, completed_text
+
     def encode_messages(
             self,
-            messages: Sequence[Dict[str, str]],
+            messages: Sequence[Mapping[str, Any]],
             max_seq_len: int = 8192,
+            tools: Optional[Sequence[Mapping[str, Any]]] = None,
     ) -> Dict[str, List[int]]:
         """Encode messages with the tokenizer chat template and mask non-assistant loss.
 
-        Each message is appended incrementally so token boundaries follow the
-        tokenizer's own prefix-stable rendering.
+        Single-turn and multi-turn conversations share the same traversal. Each
+        supervised assistant uses its generation prompt as the source/target
+        boundary, preserving tokens and labels from previous turns. Only newly
+        appended text is encoded, so BPE cannot merge across earlier loss boundaries.
+        Rendering must remain prefix-stable. Leading system messages are
+        first rendered together with the following non-system message because
+        some native templates reject a system-only conversation prefix.
 
         Args:
             messages: Conversation records with ``role``, ``content``, and optional ``loss_mask``.
             max_seq_len: Maximum sequence length kept from the end of the encoding.
+            tools: Optional tool definitions forwarded to the native tokenizer template.
 
         Returns:
             Model inputs with input_ids, attention_mask, and labels.
 
         Raises:
-            ValueError: If the template rewrites or shortens an earlier conversation prefix.
+            ValueError: If the template rewrites or shortens an earlier conversation prefix, or if leading
+                system messages cannot be grouped without changing the configured loss mask.
         """
+        self._log_first_template(messages, tools)
         input_ids: List[int] = []
         labels: List[int] = []
         previous_length = 0
+        previous_text = ""
 
+        has_pending_system_messages = False
         for end, message in enumerate(messages, start=1):
-            encoded = self.tokenizer.apply_chat_template(
-                messages[:end],
-                tokenize=True,
-                add_generation_prompt=False,
-                return_dict=True,
-            )
-            current_ids = encoded["input_ids"]
-            current_length = len(current_ids)
+            loss_mask = message.get("loss_mask", 1 if message["role"] == "assistant" else 0)
+            if previous_length == 0 and message["role"] == "system":
+                if loss_mask == 1:
+                    raise ValueError(
+                        "A leading system message with loss enabled cannot be grouped with the first user message."
+                    )
+                has_pending_system_messages = True
+                continue
+            if has_pending_system_messages and previous_length == 0 and loss_mask == 1:
+                raise ValueError(
+                    "The first message after leading system messages must have loss disabled so their token "
+                    "boundaries can be grouped safely."
+                )
+
+            supervise_assistant = message["role"] == "assistant" and loss_mask == 1
+            if supervise_assistant:
+                source_ids, target_ids, rendered_text = self._encode_assistant_source_target(
+                    messages[:end], previous_text, input_ids, tools,
+                )
+                rendered_conversation_ids = source_ids + target_ids
+            else:
+                rendered_text = self._apply_chat_template(
+                    messages[:end],
+                    tokenize=False,
+                    return_dict=False,
+                    tools=tools,
+                )
+                rendered_conversation_ids = self._encode_text_continuation(rendered_text, previous_text, input_ids)
+            current_length = len(rendered_conversation_ids)
             if current_length < previous_length:
                 raise ValueError(
                     "The tokenizer chat template shortened the conversation after adding a message; "
                     "assistant-only loss masking requires monotonic message boundaries."
                 )
 
-            self._update_prefix_labels(input_ids, current_ids, labels)
-            loss_mask = message.get("loss_mask", 1 if message["role"] == "assistant" else 0)
-            new_ids = current_ids[previous_length:]
-            labels.extend(new_ids if loss_mask == 1 else [IGNORE_INDEX] * len(new_ids))
-            input_ids = current_ids
+            self._update_prefix_labels(input_ids, rendered_conversation_ids, labels)
+            if supervise_assistant:
+                if (
+                        len(source_ids) < previous_length
+                        or source_ids[:previous_length] != input_ids
+                ):
+                    raise ValueError(
+                        "The tokenizer generation prompt structurally rewrote the conversation prefix; "
+                        "assistant-header loss masking requires the inference prompt to extend the training history."
+                    )
+                # History contains supervised targets from earlier turns: mask only the new source suffix.
+                labels.extend([IGNORE_INDEX] * (len(source_ids) - previous_length))
+                labels.extend(target_ids)
+            else:
+                new_ids = rendered_conversation_ids[previous_length:]
+                labels.extend(new_ids if loss_mask == 1 else [IGNORE_INDEX] * len(new_ids))
+            input_ids = rendered_conversation_ids
             previous_length = current_length
+            previous_text = rendered_text
+
+        if has_pending_system_messages and previous_length == 0:
+            raise ValueError("A conversation containing only system messages cannot be rendered for training.")
 
         input_ids = input_ids[-max_seq_len:]
         labels = labels[-max_seq_len:]
