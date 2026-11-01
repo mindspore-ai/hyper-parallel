@@ -482,6 +482,7 @@ def _equal_a2a_scope(dist_double: Any, knob: str, streams: _FakeStreams):
     """
     with mock.patch.object(ep_collectives, "dist", dist_double), \
             mock.patch.object(ep_collectives, "_EQUAL_A2A_RAW", knob), \
+            mock.patch.object(ep_collectives, "_A2A_SINGLE", False), \
             mock.patch.multiple(ep_collectives,
                                 _record_stream=streams.record_stream,
                                 _LAZY_A2A_STREAM=None,
@@ -565,6 +566,23 @@ class TestEqualA2ADispatch(unittest.TestCase):
     def _uniform_plan() -> List[List[int]]:
         """The balanced-router shape: every peer gets the same row count."""
         return [[_UNIFORM_ROWS] * _EP_SIZE for _ in range(_EP_SIZE)]
+
+    @arg_mark(**_CPU_MARKS)
+    def test_ragged_single_passes_the_planned_split_sizes(self):
+        """The default synchronous kernel passes uneven counts to all_to_all_single."""
+        world = _VirtualEpGroup(0, 2)
+        payload = torch.arange(3, dtype=torch.float32).unsqueeze(1)
+        dist_double = mock.Mock()
+        dist_double.get_backend.return_value = _HCCL
+        dist_double.all_to_all_single.side_effect = lambda output, source, **kwargs: output.copy_(source)
+        with mock.patch.object(ep_collectives, "dist", dist_double), \
+                mock.patch.object(ep_collectives, "_EQUAL_A2A_RAW", "0"), \
+                mock.patch.object(ep_collectives, "_A2A_SINGLE", True):
+            result = ep_collectives.ep_all_to_all(payload, [2, 1], [2, 1], world)
+        self.assertTrue(torch.equal(result, payload))
+        self.assertEqual(dist_double.all_to_all_single.call_args.kwargs, {
+            "output_split_sizes": [2, 1], "input_split_sizes": [2, 1], "group": world,
+        })
 
     def _assert_matches_reference(self, outputs: dict, send_plan: List[List[int]],
                                   label: str) -> None:
@@ -678,7 +696,8 @@ class TestEqualA2ADispatch(unittest.TestCase):
         payload = torch.zeros(5, _HIDDEN)
         world = _VirtualEpWorld(1)
         with mock.patch.object(ep_collectives, "dist", _VirtualEpDist(world)), \
-                mock.patch.object(ep_collectives, "_EQUAL_A2A_RAW", "1"):
+                mock.patch.object(ep_collectives, "_EQUAL_A2A_RAW", "1"), \
+                mock.patch.object(ep_collectives, "_A2A_SINGLE", False):
             self.assertIsNone(
                 ep_collectives._equal_a2a_rows(
                     payload, [3], [3], _VirtualEpGroup(0, 1)),

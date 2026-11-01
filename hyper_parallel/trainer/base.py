@@ -943,6 +943,13 @@ class BaseTrainer(Stateful, ABC):
 
     def step_optimizers_and_schedulers(self) -> None:
         """Step every optimizer and scheduler, then expose the final state."""
+        # 在任一参数更新前检查专家临时表已全部归还；例如两个累积微批完成后才切换版本。
+        seen_runtimes = set()
+        for part in self.model_parts or [self.model]:
+            runtime = getattr(part, "_moonep_runtime", None)
+            if runtime is not None and id(runtime) not in seen_runtimes:
+                runtime.finish_step()
+                seen_runtimes.add(id(runtime))
         optimizers = self.optimizer if isinstance(self.optimizer, list) else [self.optimizer]
         for optimizer in optimizers:
             # Keep zeros_like dispatched so lazily created optimizer states retain DTensor metadata.

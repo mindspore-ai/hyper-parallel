@@ -196,3 +196,34 @@ class TestBaseTrainerExternalState(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMoonEPOptimizerBoundary(unittest.TestCase):
+    """确认真实Trainer优化器入口检查专家生命周期。"""
+
+    def test_unfinished_runtime_prevents_optimizer_update(self) -> None:
+        """未完成反向不能更新参数；例如残留一个预取票据时optimizer.step不会执行。"""
+        trainer = object.__new__(base_module.BaseTrainer)
+        runtime = MagicMock()
+        runtime.finish_step.side_effect = RuntimeError('unfinished MoonEP')
+        trainer.model_parts = [SimpleNamespace(_moonep_runtime=runtime)]
+        trainer.optimizer = MagicMock()
+        with self.assertRaisesRegex(RuntimeError, 'unfinished MoonEP'):
+            trainer.step_optimizers_and_schedulers()
+        trainer.optimizer.step.assert_not_called()
+
+    def test_shared_runtime_finishes_once_before_update(self) -> None:
+        """同一运行时只推进一次版本；例如两个model_parts引用同一个专家池。"""
+        trainer = object.__new__(base_module.BaseTrainer)
+        ordering = []
+        runtime = MagicMock()
+        runtime.finish_step.side_effect = lambda: ordering.append('finish')
+        trainer.model_parts = [SimpleNamespace(_moonep_runtime=runtime)] * 2
+        trainer.optimizer = MagicMock()
+        trainer.optimizer.step.side_effect = lambda: ordering.append('optimizer')
+        trainer.moe_monitor = None
+        trainer.model_integration = SimpleNamespace(after_optimizer=MagicMock())
+        trainer.lr_scheduler = None
+        trainer.step_optimizers_and_schedulers()
+        self.assertEqual(ordering, ['finish', 'optimizer'])
+        runtime.finish_step.assert_called_once()

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import inspect
+from functools import partial
 from types import MethodType
 from typing import Any, Callable
 
@@ -24,6 +25,7 @@ import torch  # pylint: disable=forbidden-backend-import
 import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.modules.engram import local_token_mask
+from hyper_parallel.distributed._builder.forward_rewriter import _install_bound_forward
 from hyper_parallel.distributed.expert_parallel.experts import (
     bind_local_expert_forward,
     ep_routed_forward,
@@ -33,6 +35,10 @@ from hyper_parallel.distributed.recipe_spec import local_compute
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import (
     DeepseekV41MegaMoeExperts, _swiglu_limit,
 )
+from hyper_parallel.distributed.expert_parallel.moonep import MoonEPExecutor as LifecycleMoonEPExecutor
+from hyper_parallel.distributed.expert_parallel.moonep.checkpoint import checkpoint_route_ids
+from hyper_parallel.distributed.expert_parallel.moonep.legacy import MoonEPExecutor as LegacyMoonEPExecutor
+from hyper_parallel.distributed.expert_parallel.moonep.runtime import local_tensor
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import deepseek_v41_swiglu
 
 
@@ -80,6 +86,37 @@ def _deepseek_v41_grouped_expert_forward(
         group_type=0,
         group_list_type=0,
     )
+
+
+def _deepseek_v41_moonep_expert_forward(
+        experts: torch.nn.Module, hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor, top_k_weights: torch.Tensor,
+) -> torch.Tensor:
+    """在专家子模块的 FSDP 钩子内执行 MoonEP，并沿用 HF 参数布局。
+
+    Args:
+        experts: 拥有本 rank 专家参数的 DeepSeek 专家模块。
+        hidden_states: 分发前的本地 token。
+        top_k_index: 每 token 的全局专家编号。
+        top_k_weights: 路由权重，保持可微。
+
+    Returns:
+        与 ``hidden_states`` 同形状的 routed 分支输出。
+
+    Example:
+        ``experts(hidden, ids, scores)`` 会先按 MoonEP 迁移条目和权重，
+        再用昇腾 GMM 执行本 rank 获得的专家。
+    """
+    return experts._moonep_executor(  # pylint: disable=protected-access
+        hidden_states, top_k_index, top_k_weights,
+        expert_weights=_deepseek_moonep_weights(experts),
+    )
+
+
+def _deepseek_moonep_weights(experts: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    """从稳定home参数取得GMM视图；例如[P,2I,H]转为[P,H,2I]且保留参数梯度边。"""
+    return (local_tensor(experts.gate_up_proj).transpose(1, 2),
+            local_tensor(experts.down_proj).transpose(1, 2))
 
 
 def _local_router_metadata(tensor: torch.Tensor | None, states: torch.Tensor, tp_mesh: Any) -> torch.Tensor | None:
@@ -139,8 +176,14 @@ def _routed_and_shared_forward(
         *,
         ep_size: int,
         fix_router: bool = False,
+        use_moonep: bool = False,
 ) -> torch.Tensor:
-    """Dispatch routed experts and add the V4.1 shared expert branch."""
+    """分发 routed experts 并叠加 V4.1 共享专家分支。
+
+    Example:
+        ``use_moonep=True`` 时，路由后的 token 交给已绑定的 MoonEP 专家模块；
+        默认值继续执行原 all-to-all EP 路径。
+    """
     def router_fn(target: Any, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Route with statistics over the current token partitions."""
         return _router(
@@ -148,10 +191,12 @@ def _routed_and_shared_forward(
             router_num_sequences, sequence_partition_groups=sequence_partition_groups,
         )
 
-    routed = ep_routed_forward(
-        module, hidden_states,
-        router_fn=_resolve_router(router_fn, ep_size=ep_size, fix_router=fix_router), ep_group=ep_group,
-    )
+    resolved_router = _resolve_router(router_fn, ep_size=ep_size, fix_router=fix_router)
+    if use_moonep:
+        indices, weights = resolved_router(module, hidden_states)
+        routed = module.experts(hidden_states, indices, weights)
+    else:
+        routed = ep_routed_forward(module, hidden_states, router_fn=resolved_router, ep_group=ep_group)
     return routed + module.shared_experts(hidden_states)
 
 
@@ -197,6 +242,10 @@ def deepseek_v41_ep_compute_fn(
         ep_mesh: Any,
         use_grouped_gemm: bool = False,
         fix_router: bool = False,
+        use_moonep: bool = False,
+        moonep_lifecycle: bool = True,
+        moonep_replica_capacity: int | None = None,
+        moonep_prefetch_depth: int = 1,
 ) -> Callable:
     """Build V4.1 routed/shared computation with training-aware routing.
 
@@ -212,12 +261,20 @@ def deepseek_v41_ep_compute_fn(
         cp_mesh: Context-parallel mesh supplying token-partition statistics groups.
         ep_mesh: Expert-parallel mesh owning the routed experts.
         use_grouped_gemm: Use the existing V4.1 clamped grouped-GEMM expert path.
+        use_moonep: 使用脚本版MoonEP动态均衡及GMM；与基线use_grouped_gemm互斥。
+        moonep_lifecycle: 默认True启用共享表、前向释放与反向预取；False保留初版对照。
+        moonep_replica_capacity: 每卡不同远程专家上限B；None默认本rank专家数。
+        moonep_prefetch_depth: 1提前一层恢复EFS/EP权重，0反向按需恢复并只分配一个表槽。
         fix_router: Enable benchmark-only balanced destinations while retaining
             learned Top-K weights and their gradients. Normal training and
             correctness runs keep this disabled.
 
     Returns:
         The source-compatible local compute callable.
+
+    Example:
+        ``deepseek_v41_ep_compute_fn(..., use_moonep=True)`` 绑定脚本版 MoonEP；
+        ``use_grouped_gemm=True`` 绑定原 all-to-all 加昇腾 GMM 基线。
     """
     require_attrs(module, "gate", "experts", "shared_experts", owner="DeepSeek-V4.1 EP")
     if ep_mesh is None:
@@ -226,6 +283,8 @@ def deepseek_v41_ep_compute_fn(
         raise ValueError("DeepSeek-V4.1 validation layers must use learned routing")
     if not isinstance(fix_router, bool):
         raise ValueError("fix_router must be a boolean")
+    if use_moonep and use_grouped_gemm:
+        raise ValueError("use_moonep 与 use_grouped_gemm 分别选择两条 EP 路径，不能同时启用")
     sequence_groups = _configure_router_statistics(module.gate, mesh, tp_mesh, cp_mesh)
     ep_group = ep_mesh.get_group("ep")
     ep_size = ep_mesh["ep"].size()
@@ -235,14 +294,33 @@ def deepseek_v41_ep_compute_fn(
         module.experts._apply_gate  # pylint: disable=protected-access
         if module.experts.limit > 0 else _deepseek_v41_unclamped_gate
     )
-    if use_grouped_gemm:
+    if use_moonep:
+        if moonep_lifecycle:
+            module.gate.route_indices_selector = checkpoint_route_ids
+            module.experts._moonep_executor = LifecycleMoonEPExecutor(  # pylint: disable=protected-access
+                module.experts, partial(_deepseek_moonep_weights, module.experts),
+                ep_group=ep_group, ep_size=ep_size, num_experts=module.experts.num_experts,
+                top_k=module.gate.top_k, replica_capacity=moonep_replica_capacity,
+                swiglu_limit=module.experts.limit,
+                prefetch_depth=moonep_prefetch_depth,
+            )
+        else:
+            module.experts._moonep_executor = LegacyMoonEPExecutor(  # pylint: disable=protected-access
+                ep_group=ep_group, ep_size=ep_size, num_experts=module.experts.num_experts,
+                top_k=module.gate.top_k, max_local_num_tokens=None,
+                swiglu_limit=module.experts.limit,
+            )
+        _install_bound_forward(module.experts, _deepseek_v41_moonep_expert_forward)
+    elif use_grouped_gemm:
         module.experts.forward_expert_major = MethodType(
             _deepseek_v41_grouped_expert_forward, module.experts,
         )
-    bind_local_expert_forward(
-        module, ep_size, use_grouped_gemm=use_grouped_gemm,
-        apply_gate=None if use_grouped_gemm else apply_gate,
-    )
+    if not use_moonep:
+        bind_local_expert_forward(
+            module, ep_size, use_grouped_gemm=use_grouped_gemm,
+            apply_gate=None if use_grouped_gemm else apply_gate,
+        )
+    moonep_kwargs = {"use_moonep": True} if use_moonep else {}
 
     def auxiliary_compute_fn(
             module: Any,
@@ -270,7 +348,7 @@ def deepseek_v41_ep_compute_fn(
             router_token_mask=_local_router_metadata(router_token_mask, hidden_states, tp_mesh),
             router_sequence_ids=_local_router_metadata(router_sequence_ids, hidden_states, tp_mesh),
             router_num_sequences=router_num_sequences, sequence_partition_groups=sequence_groups,
-            ep_size=ep_size, fix_router=fix_router,
+            ep_size=ep_size, fix_router=fix_router, **moonep_kwargs,
         )
 
     if "router_token_mask" in inspect.signature(module.forward).parameters:
@@ -292,6 +370,7 @@ def deepseek_v41_ep_compute_fn(
             del input_ids
             return _routed_and_shared_forward(
                 module, hidden_states, None, ep_group, ep_size=ep_size, fix_router=fix_router,
+                **moonep_kwargs,
             )
 
         return text_compute_fn
@@ -316,6 +395,7 @@ def deepseek_v41_ep_compute_fn(
         )
         return _routed_and_shared_forward(
             module, hidden_states, local_image_mask, ep_group, ep_size=ep_size, fix_router=fix_router,
+            **moonep_kwargs,
         )
 
     return multimodal_compute_fn
