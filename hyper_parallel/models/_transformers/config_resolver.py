@@ -69,5 +69,8 @@ def get_hf_config(
     config_kwargs = dict(kwargs)
     config_kwargs.setdefault("attn_implementation", attn_implementation)
     if torch_dtype != "auto":
-        config_kwargs.setdefault("torch_dtype", torch_dtype)
+        # `dtype` is the name Transformers >= 5 uses for this argument; passing
+        # `torch_dtype` here still works but logs a deprecation warning on every
+        # load.
+        config_kwargs.setdefault("dtype", torch_dtype)
     return AutoConfig.from_pretrained(path, **config_kwargs)
