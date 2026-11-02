@@ -95,8 +95,14 @@ from unittest.mock import MagicMock, patch
 import torch
 from torch import fx, nn
 
+from tests.ut.compile.inductor_stub import install_regional_inductor_stub
+
+# Older supported torch builds (2.6/2.7/2.9) have no regional_inductor; install
+# the executable test double so the numeric Inductor check still runs.
+install_regional_inductor_stub()
 
 from hyper_parallel.compile.pass_config import PP_SCHEDULES, PassConfig  # pylint: disable=C0413
+from hyper_parallel.compile.passes.inductor_pass import InductorPass  # pylint: disable=C0413
 from hyper_parallel.compile.passes.parallel.pp_pass import (  # pylint: disable=C0413
     PpPass,
     _auto_stage_split,
@@ -376,6 +382,10 @@ def _build_pp_stages(
         model = model_factory()
         with _patch_dist(world_size=pp_degree, rank=rank):
             PpPass(parallel_plan=plan).run(jg.graph_module, cfg, model=model)
+        # Terminal backend compilation runs AFTER PpPass and compiles the
+        # schedule's per-stage subgraphs (cfg.inductor_mode == "off" is a
+        # no-op). Keep it inside the loop so each rank's schedule is compiled.
+        InductorPass().run(jg.graph_module, cfg)
         models[rank] = model
         scheds[rank] = jg.graph_module.pp_schedule
     return models, scheds
@@ -1112,6 +1122,53 @@ class TestScheduleGradEquivalence(unittest.TestCase):
             **_stage_grads_by_fqn(models[1], grads[1]),
         }
         _assert_grads_match(self, pp_by_fqn, ref_by_fqn)
+
+    def test_pp_grads_match_full_batch_mean_with_inductor(self):
+        """Test PP stage subgraphs compiled by Inductor keep the same grads."""
+        for inductor_mode in ("regional", "full"):
+            with self.subTest(inductor_mode=inductor_mode):
+                plan = GraphParallelPlan()
+                plan.pp_stage(0, ["embed", "lin0"])
+                plan.pp_stage(1, ["lin1", "head"])
+                cfg = PassConfig(
+                    fsdp_enabled=False,
+                    pp_enabled=True,
+                    pp_degree=2,
+                    pp_microbatch_size=2,
+                    inductor_mode=inductor_mode,
+                )
+
+                ref_jg, ref_model, x, y = _tiny_lm_joint_graph(batch=4)
+                ref_by_fqn = _reference_grads_by_fqn(
+                    ref_jg, ref_model, {"x": x, "y": y}
+                )
+
+                models, scheds = _build_pp_stages(
+                    lambda: _tiny_lm_joint_graph(batch=2)[0],
+                    _tiny_lm_stage_model,
+                    plan,
+                    cfg,
+                )
+                for sched in scheds.values():
+                    self.assertEqual(
+                        sched.fwd_gm.meta.get("inductor_compiled"), inductor_mode
+                    )
+                    self.assertEqual(
+                        sched.bwd_gm.meta.get("inductor_compiled"), inductor_mode
+                    )
+                grads = self._sweeps(
+                    models,
+                    scheds,
+                    [x],
+                    [y],
+                    x.shape[0] // scheds[0].microbatch_size,
+                )
+
+                pp_by_fqn = {
+                    **_stage_grads_by_fqn(models[0], grads[0]),
+                    **_stage_grads_by_fqn(models[1], grads[1]),
+                }
+                _assert_grads_match(self, pp_by_fqn, ref_by_fqn)
 
     def test_pp_grads_match_full_batch_mean_multi_input(self):
         """Test 3-input routing (two -> stage 0, one -> last) keeps grads.

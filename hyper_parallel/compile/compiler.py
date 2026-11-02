@@ -189,6 +189,9 @@ class GraphCompiler:
         pipeline = PassPipeline.from_config(self.pass_config, self.parallel_plan)
 
         pass_kwargs = self._build_pass_kwargs()
+        # Terminal backend compilation (InductorPass) sizes its regions from
+        # the tracer's fake example inputs; every other pass ignores them.
+        pass_kwargs["example_inputs"] = joint_graph.example_inputs
 
         # Passes mutate ``graph_module`` in place and return it, so the
         # transformed graph lives on ``joint_graph`` for ``forward_backward``.
