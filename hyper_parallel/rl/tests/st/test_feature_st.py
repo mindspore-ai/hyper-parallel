@@ -29,6 +29,23 @@ from tests.common.mark_utils import arg_mark
 HERE = Path(__file__).resolve().parent
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards",
+          essential_mark="essential")
+def test_selected_token_log_probs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Feature: chunked RL probabilities under real HSDP.
+
+    Description: compare dense and selected gradients with tied weights and unequal rank chunks.
+    Expectation: FP32/BF16 probabilities, gradients and updates agree with root reshard enabled.
+    """
+    world = int(os.environ.get("RL_ST_WORLD_SIZE", "0"))
+    if world < 2:
+        pytest.skip("Set RL_ST_WORLD_SIZE>=2 with allocated NPU devices")
+    output = _result_directory(tmp_path, monkeypatch)
+    monkeypatch.setenv("HYPER_RL_FAILURE_DIR", str(output))
+    torchrun_case(str(HERE / "_token_log_probs.py"), "test_token_probabilities", num_proc=world, master_port=29638)
+    assert json.loads((output / "measurement.json").read_text())["status"] == "passed"
+
+
 def _result_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Keep rank logs and completion evidence under one caller-owned directory."""
     output = Path(os.environ.get("RL_ST_RESULT_DIR", str(tmp_path))).resolve()
@@ -96,3 +113,22 @@ def test_code_sandbox() -> None:
         pytest.skip(f"Configure the real sandbox first: {missing}")
     subprocess.run([sys.executable, "-m", "pytest", "-q", str(HERE / "_code_sandbox.py") + "::test_contract"],
                    check=True)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards",
+          essential_mark="essential")
+def test_training_phase_offload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Feature: stage-only training state offload.
+
+    Description: compare real HSDP state roundtrips and next updates for both CPU policies.
+    Expectation: all device storage releases, tensor values and next updates match exactly.
+    """
+    world = int(os.environ.get("RL_ST_WORLD_SIZE", "0"))
+    if world < 2:
+        pytest.skip("Set RL_ST_WORLD_SIZE>=2 for phase-offload device acceptance")
+    monkeypatch.setenv("HYPER_COMPARISON_OUTPUT", str(tmp_path))
+    torchrun_case(str(HERE / "_phase_offload.py"), "main", num_proc=world)
+    for rank in range(world):
+        results = json.loads((tmp_path / f"roundtrip-rank-{rank}.json").read_text())
+        assert len(results) == 2
+        assert all(row["state_roundtrip_exact"] and row["next_update_exact"] for row in results)

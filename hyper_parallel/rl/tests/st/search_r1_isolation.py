@@ -22,8 +22,8 @@ from pathlib import Path
 import threading
 import uuid
 
-from examples.search_r1 import container_execution as relay
-from examples.search_r1.container_execution import IMAGE, execute_episode
+from examples.search_r1 import container_runtime as relay
+from examples.search_r1.container_runtime import CANDIDATE_IMAGE, execute_episode
 
 
 def isolation_smoke(output: Path, image: str) -> None:
@@ -58,7 +58,7 @@ def isolation_smoke(output: Path, image: str) -> None:
         execute_episode(request_file, output, image, "hotpot-isolation-" + session_id[:10])
         result = json.loads((artifact / "execution-result.json").read_text())
         if result["returncode"] != 0:
-            raise RuntimeError("Codex startup failed; inspect container-stderr.log")
+            raise RuntimeError("Codex startup failed; inspect container/codex-stderr.log")
     finally:
         server.shutdown()
         server.server_close()
@@ -69,7 +69,7 @@ def isolation_smoke(output: Path, image: str) -> None:
 def main() -> None:
     """Run on the host from the RL root; never allocate accelerator devices."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--image", default=IMAGE)
+    parser.add_argument("--image", default=CANDIDATE_IMAGE)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     output = args.output.resolve()

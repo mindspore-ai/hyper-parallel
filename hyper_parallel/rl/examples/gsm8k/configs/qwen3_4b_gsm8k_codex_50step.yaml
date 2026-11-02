@@ -1,0 +1,190 @@
+model:
+  registry_name: qwen3_4b
+  name: qwen3
+  weights_path: /models/Qwen3-4B
+  tokenizer_path: /models/Qwen3-4B
+  config_overrides: null
+consistency:
+  enabled: false
+data:
+  train_path: /data/train.parquet
+  test_path: /data/test.parquet
+  prompt_column: prompt
+  answer_column: extra_info
+  prompt_instruction: Let's think step by step and output the final answer after "####".
+  max_prompt_length: 1024
+  max_train_samples: 6400
+  shuffle: false
+  num_workers: 0
+  prefetch_factor: null
+  pin_memory: true
+rollout:
+  engine: vllm
+  num_return_sequences: 8
+  max_new_tokens: 1024
+  ignore_eos: false
+  temperature: 1.0
+  top_p: 1.0
+  top_k: -1
+  seed: null
+  vllm:
+    sleep_level: 1
+    deployment: colocated
+    data_parallel_size: 4
+    port: 18500
+    model_implementation: native
+    tensor_parallel_size: 2
+    weight_sync:
+      strategy: full_gather
+      bucket_size_mb: 512
+    dtype: bfloat16
+    trust_remote_code: false
+    enforce_eager: false
+    batch_invariant: false
+    enable_prefix_caching: true
+    enable_chunked_prefill: true
+    gpu_memory_utilization: 0.8
+    max_model_len: 3096
+    block_size: 128
+    max_num_seqs: 256
+    max_num_batched_tokens: 8192
+    logprobs_mode: raw_logprobs
+    startup_timeout: 1200
+    request_timeout: 7200
+    enable_prompt_tokens_details: false
+    server_hccl_if_base_port: 62600
+    server_hccl_npu_socket_port_range: 62600-62799
+    seed: 17
+    disable_log_stats: true
+    task_queue_enable: 1
+    enable_auto_tool_choice: true
+    tool_call_parser: hermes
+  collect_log_probs: true
+agentic:
+  runner: codex
+  module_path: examples.gsm8k.agent
+  environment: gsm8k_tools
+  interaction_mode: multi_turn
+  protocol: json_function_call
+  apply_chat_template: true
+  max_turns: 2
+  max_observation_tokens: 0
+  max_episode_tokens: 3096
+  codex:
+    executable: codex
+    version: 0.152.1
+    model: qwen3
+    reasoning_effort: low
+    sandbox: danger-full-access
+    gateway_host: 127.0.0.1
+    gateway_public_host: 127.0.0.1
+    gateway_port: 18200
+    timeout_seconds: 7200
+    request_timeout: 7200
+    session_root: /results/codex-trajectories
+    reward_callable: examples.gsm8k.agent:score_codex_gsm8k_answer
+    instruction_template: '{prompt}'
+    model_instructions: >-
+      You are a helpful assistant. Follow the user's task and requested answer format.
+      A terminal is available for calculations when needed.
+    compact_harness_context: true
+    allowed_tools:
+    - exec_command
+    - write_stdin
+    max_inflight_requests: 1024
+    max_concurrent_episodes_per_rank: 128
+    overlap_preparation: true
+    preparation_cpu_fraction: 0.5
+    preparation_max_cpus: null
+evaluation:
+  enabled: true
+  batch_size: 64
+  max_samples: 500
+  max_new_tokens: 1024
+  temperature: 0.0
+  top_p: 1.0
+  top_k: -1
+  do_sample: false
+  log_samples: 500
+  progress_steps: 1
+  at_end: true
+  before_train: true
+  every_n_steps: 10
+algorithm:
+  name: grpo
+  advantage_epsilon: 1.0e-06
+  clip_ratio_low: 0.2
+  clip_ratio_high: 0.2
+  clip_ratio_c: 3.0
+  kl_coef: 0.001
+  kl_type: low_var_kl
+  loss_aggregation: token-mean
+train:
+  token_log_probs_mode: dense
+  model_init_cpu_threads: 8
+  max_steps: 50
+  seed: 42
+  prompt_batch_size: 16
+  micro_batch_size: 2
+  response_mini_batch_size: 256
+  policy_update_epochs: 1
+  init_device: meta
+  comm_backend: hccl
+  learning_gate:
+    enabled: false
+    min_gradient_norm: 0.0
+    require_mixed_rewards: false
+  accelerator:
+    dp_replicate: 1
+    dp_shard: 8
+    tp: 1
+    cp: 1
+    pp: 1
+    reshard_after_forward: true
+    comm_fusion: true
+    cpu_offload: false
+    activation_checkpoint: full
+    reference_cpu_offload: true
+    offload_during_rollout: true
+  mixed_precision:
+    enabled: true
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: null
+  optimizer:
+    lr: 1.0e-06
+    lr_min: 0.0
+    lr_decay_style: constant
+    lr_warmup_ratio: 0.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    eps: 1.0e-08
+    betas:
+    - 0.9
+    - 0.999
+    foreach: null
+    fp32_main_params: true
+    no_decay_params: []
+  checkpoint:
+    load_path: null
+    output_dir: /results/checkpoints
+    save_steps: 5
+    save_final: false
+    verify_reload: false
+  old_log_prob_source: actor
+  gradient_sync_each_micro_batch: true
+  max_tokens_per_micro_batch: 2048
+  old_log_prob_max_tokens_per_micro_batch: 2048
+  reference_log_prob_max_tokens_per_micro_batch: 2048
+  balance_dp_tokens: false
+logging:
+  backends:
+  - console
+  project_name: hyper-rl
+  experiment_name: qwen3_4b_gsm8k_codex_50step
+  log_steps: 1
+  log_samples: 1024
+  wandb:
+    mode: disabled
+    entity: null
+    directory: /results/wandb

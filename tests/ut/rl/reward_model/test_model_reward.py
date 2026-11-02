@@ -49,7 +49,7 @@ def _batch() -> tuple[tuple[PromptRecord, ...], object]:
         attention_mask=torch.tensor([True, True, True]), action_mask=torch.tensor([False, True, True]),
         rollout_log_probs=torch.tensor([-1.0, -1.0]), reward=0.0, reward_components={},
         done=True, truncated=False, terminal_reason="completed", worker_policy_version=0,
-    ) for index, answer in enumerate(("####42", "####41")))
+    ) for index, answer in enumerate(("#### 42", "#### 41")))
     settings = GenerationSettings(max_new_tokens=2, temperature=1.0, top_p=1.0, top_k=0,
                                   do_sample=True, pad_token_id=0, eos_token_id=3, collect_log_probs=True)
     metadata = {"reward_status": "pending", "interaction_mode": "single_turn"}
@@ -76,7 +76,7 @@ class _FakeClient:
         if self.response is not None:
             return self.response
         candidate = json.loads(payload["messages"][-1]["content"])["candidate"]
-        score = 1 if "####42" in candidate else 0
+        score = 1 if "#### 42" in candidate else 0
         return {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps({"score": score})}}]}
 
     async def close_connection(self) -> None:
@@ -90,7 +90,7 @@ class TestModelReward(unittest.TestCase):
     def test_gsm8k_environment_defers_only_in_model_mode(self) -> None:
         """The same completed answer remains available while rule scoring stays unchanged."""
         prompt = PromptRecord("p", (Message("user", "What is 6 times 7?"),), "42")
-        action = Action("####42", torch.tensor([2]))
+        action = Action("#### 42", torch.tensor([2]))
         for deferred, expected in ((False, 1.0), (True, 0.0)):
             with self.subTest(deferred=deferred):
                 context = EpisodeContext(prompt, 0, 0, 1, settings={"defer_reward_model": deferred})
@@ -114,8 +114,8 @@ class TestModelReward(unittest.TestCase):
         try:
             with patch.object(GSM8KMultiTurnEnvironment, "score_reward",
                               wraps=GSM8KMultiTurnEnvironment.score_reward) as rule_scorer:
-                self.assertEqual(environment.reward_function("####42", prompt), 1.0)
-                rule_scorer.assert_called_once_with(prompt, answer="####42")
+                self.assertEqual(environment.reward_function("#### 42", prompt), 1.0)
+                rule_scorer.assert_called_once_with(prompt, answer="#### 42")
         finally:
             asyncio.run(environment.close())
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import re
 import secrets
 import threading
 import time
@@ -58,6 +59,38 @@ class CompletionBudgetExhausted(RuntimeError):
         self.termination = dict(termination)
 
 
+class ContextBudgetExceeded(RuntimeError):
+    """Retain a verified vLLM rejection before any token was sampled."""
+
+    def __init__(self, limit: int, output: int, prompt: int) -> None:
+        """Keep the explicit lower bound reported by the pinned backend validator."""
+        super().__init__(f"Context budget exceeded: {prompt} input + {output} output > {limit}")
+        self.details = {"context_limit": limit, "requested_output_tokens": output, "minimum_prompt_tokens": prompt}
+
+
+def _context_budget_error(status: int, detail: str) -> Optional[ContextBudgetExceeded]:
+    """Recognize only the pinned structured token-limit rejection, not arbitrary HTTP 400s."""
+    if status != 400:
+        return None
+    try:
+        error = json.loads(detail)["error"]
+        if (error.get("type"), error.get("param"), error.get("code")) != ("BadRequestError", "input_tokens", 400):
+            return None
+        match = re.match(
+            r"This model's maximum context length is (\d+) tokens\. However, you requested (\d+) output tokens "
+            r"and your prompt contains at least (\d+) input tokens, for a total of at least (\d+) tokens\.",
+            error["message"],
+        )
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+    if match is None:
+        return None
+    limit, output, prompt, total = map(int, match.groups())
+    if min(limit, output, prompt) <= 0 or prompt + output != total or total <= limit:
+        return None
+    return ContextBudgetExceeded(limit, output, prompt)
+
+
 @dataclass
 class _Session:
     """Mutable state for one gateway session and its sampled completions."""
@@ -65,9 +98,12 @@ class _Session:
     artifact_dir: Optional[Path]
     max_completions: int
     generation: dict[str, Any]
+    registration: dict[str, Any] = field(default_factory=dict)
     instructions_override: Optional[str] = None
     enable_thinking: Optional[bool] = None
     compact_harness_context: bool = False
+    preserve_environment_context: bool = False
+    allowed_tools: Optional[list[str]] = None
     exec_command_yield_time_ms: Optional[int] = None
     isolated_cli: bool = False
     max_observation_chars: Optional[int] = None
@@ -77,6 +113,7 @@ class _Session:
     closing: bool = False
     failure: Optional[dict[str, Any]] = None
     termination: Optional[dict[str, Any]] = None
+    event_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
 
 def _completion_outcome(session: _Session, response: dict, transformed: dict, request_kind: str) -> dict:
@@ -106,7 +143,8 @@ def _completion_outcome(session: _Session, response: dict, transformed: dict, re
 class _State:
     """Own registered gateway sessions and captured completion events."""
     def __init__(self, backend_url: str, model_name: str, request_timeout: float,
-                 max_inflight_requests: int = 1, async_training: bool = False) -> None:
+                 max_inflight_requests: int = 1, async_training: bool = False, *,
+                 policy_gate: bool = False) -> None:
         """Initialize shared admission limits and trace storage."""
         if (isinstance(max_inflight_requests, bool) or not isinstance(max_inflight_requests, int)
                 or max_inflight_requests <= 0):
@@ -127,6 +165,34 @@ class _State:
         self.sessions: dict[str, _Session] = {}
         self.released_sessions: set[str] = set()
         self.closing = False
+        self.policy_gate = policy_gate
+        self.active_policy_version: int | None = None
+
+    def set_policy(self, version: int | None) -> None:
+        """Open only the verified policy, or close admission while training owns the devices."""
+        with self.idle:
+            if version is not None and (isinstance(version, bool) or not isinstance(version, int) or version < 0):
+                raise ValueError("Gateway policy version must be a non-negative integer")
+            self.active_policy_version = version
+            self.idle.notify_all()
+
+    def wait_for_policy(self, session: _Session) -> None:
+        """Park prepared CPU sessions without touching the sleeping or unpublished backend."""
+        if not self.policy_gate:
+            return
+        with self.idle:
+            ready = self.idle.wait_for(
+                lambda: self.closing or session.closing or session.failure is not None
+                or (self.active_policy_version is not None
+                    and self.active_policy_version >= session.policy_version),
+                timeout=self.request_timeout,
+            )
+            if not ready:
+                raise RuntimeError("Timed out waiting for the session policy to be published")
+            if self.closing or session.closing or session.failure is not None:
+                raise RuntimeError("Prepared Codex session was cancelled before policy admission")
+            if self.active_policy_version != session.policy_version:
+                raise RuntimeError("Prepared Codex session belongs to a stale policy version")
 
     @staticmethod
     def _generation_settings(payload: dict[str, Any]) -> dict[str, Any]:
@@ -159,6 +225,11 @@ class _State:
         compact_harness_context = payload.get("compact_harness_context", False)
         if not isinstance(compact_harness_context, bool):
             raise ValueError("Codex session compact_harness_context must be a boolean")
+        preserve_environment_context = payload.get("preserve_environment_context", False)
+        if not isinstance(preserve_environment_context, bool):
+            raise ValueError("Codex session preserve_environment_context must be a boolean")
+        allowed_tools = payload.get("allowed_tools")
+        CodexResponsesProtocol.validate_allowed_tools(allowed_tools)
         command_yield = payload.get("exec_command_yield_time_ms")
         if command_yield is not None and (
             not isinstance(command_yield, int) or isinstance(command_yield, bool) or command_yield <= 0
@@ -166,7 +237,9 @@ class _State:
             raise ValueError("Codex session exec_command_yield_time_ms must be positive or null")
         return {"generation": dict(generation), "instructions_override": instructions_override,
                 "enable_thinking": enable_thinking, "compact_harness_context": compact_harness_context,
-                "exec_command_yield_time_ms": command_yield}
+                "preserve_environment_context": preserve_environment_context,
+                "exec_command_yield_time_ms": command_yield,
+                "allowed_tools": None if allowed_tools is None else list(allowed_tools)}
 
     def _new_session(self, payload: dict[str, Any], artifact_dir: Path | None) -> _Session:
         """Validate sampling identity and isolated CLI limits before publishing a session."""
@@ -189,6 +262,7 @@ class _State:
             policy_version=policy_version,
             artifact_dir=artifact_dir,
             max_completions=max_completions,
+            registration=json.loads(json.dumps(payload)),
             **settings,
             isolated_cli=isolated_cli,
             max_observation_chars=observation_limit,
@@ -210,7 +284,10 @@ class _State:
             if session_id in self.released_sessions:
                 raise ValueError("Session was already released")
             if session_id in self.sessions:
-                raise ValueError(f"Codex session already exists: {session_id}")
+                previous = self.sessions[session_id]
+                if previous.closing or previous.registration != session.registration:
+                    raise ValueError(f"Codex session registration conflicts: {session_id}")
+                return
             self.sessions[session_id] = session
         self.event(session_id, "session.registered", payload)
 
@@ -230,6 +307,7 @@ class _State:
                 return
             session = self.get(session_id)
             session.closing = True
+            self.idle.notify_all()
             if not self.idle.wait_for(lambda: session.inflight_requests == 0, timeout=self.request_timeout):
                 raise RuntimeError(f"Timed out draining Codex session: {session_id}")
             self.event(session_id, "session.released", {})
@@ -240,6 +318,7 @@ class _State:
         with self.idle:
             session = self.get(session_id)
             session.closing = True
+            self.idle.notify_all()
             if not self.idle.wait_for(lambda: session.inflight_requests == 0, timeout=self.request_timeout):
                 raise RuntimeError(f"Timed out reading in-flight Codex session: {session_id}")
             result = {"policy_version": session.policy_version, "completions": list(session.completions),
@@ -283,6 +362,7 @@ class _State:
             self.closing = True
             for session in self.sessions.values():
                 session.closing = True
+            self.idle.notify_all()
             if not self.idle.wait_for(lambda: all(session.inflight_requests == 0 for session in self.sessions.values()),
                                       timeout=self.request_timeout):
                 raise RuntimeError("Timed out draining Codex gateway requests")
@@ -322,6 +402,20 @@ class _State:
             session.completions.append(record)
         self.event(session_id, "completion.recorded", record)
 
+    def complete_reservation(self, session_id: str, record: dict[str, Any] | None) -> None:
+        """Atomically settle one reserved call before persisting its sampled evidence."""
+        with self.idle:
+            session = self.get(session_id)
+            if session.reserved_completions <= 0:
+                raise RuntimeError("Codex completion reservation underflow")
+            if record is not None:
+                record["ordinal"] = len(session.completions)
+                session.completions.append(record)
+            session.reserved_completions -= 1
+            self.idle.notify_all()
+        if record is not None:
+            self.event(session_id, "completion.recorded", record)
+
     def mark_protocol_recovery(
         self, session_id: str, records: list[dict[str, Any]],
         recovery_ordinal: int, valid_tool_call: bool,
@@ -348,16 +442,25 @@ class _State:
             return
         if session.artifact_dir is None:
             return
+        # Recovery mutates completion metadata; sampled inputs and responses are
+        # already finalized before this call. Snapshot the mutable part only.
+        with self.lock:
+            snapshot = dict(payload)
+            if isinstance(payload.get("metadata"), dict):
+                snapshot["metadata"] = dict(payload["metadata"])
         event = {
             "type": event_type,
             "timestamp": time.time(),
             "session_id": session_id,
-            "payload": payload,
+            "payload": snapshot,
         }
-        with self.lock:
+        serialized = json.dumps(event, ensure_ascii=False) + "\n"
+        # Neither large token traces nor slow storage should hold the global
+        # admission lock; independent session files only need local ordering.
+        with session.event_lock:
             event_path = session.artifact_dir / "gateway-events.jsonl"
             with event_path.open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+                stream.write(serialized)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -456,8 +559,6 @@ class _Handler(BaseHTTPRequestHandler):
             return
         session_id = unquote(path[len(prefix):])
         try:
-            if not self.server.require_admin_auth:
-                self.server.state.get(session_id)
             self.server.state.remove(session_id)
         except ValueError as error:
             self._error(HTTPStatus.NOT_FOUND, str(error))
@@ -504,12 +605,33 @@ class _Handler(BaseHTTPRequestHandler):
         state = self.server.state
         session = state.reserve_completion(session_id)
         record = None
+        queued_at = time.time()
+        queued = time.perf_counter()
         try:
+            state.event(session_id, "completion.queued", {"queued_at": queued_at})
+            state.wait_for_policy(session)
+            policy_ready_at = time.time()
+            state.event(session_id, "completion.policy_ready", {"policy_ready_at": policy_ready_at,
+                                                               "policy_version": session.policy_version})
             if not state.backend_slots.acquire(timeout=state.request_timeout):
                 raise RuntimeError("Timed out waiting for Codex backend admission")
+            admitted_at = time.time()
+            admitted = time.perf_counter()
             try:
-                response = self._backend_request(transformed)
+                state.event(session_id, "completion.admitted", {"queued_at": queued_at,
+                                                              "admitted_at": admitted_at})
+                try:
+                    response = self._backend_request(transformed)
+                except ContextBudgetExceeded as error:
+                    if not session.completions:
+                        raise
+                    raise ToolProtocolFailure({
+                        "failure_origin": "model", "failure_reason": "context_budget_exhausted", "trainable": True,
+                        "model_calls": len(session.completions), **error.details,
+                    }) from error
             finally:
+                backend_finished = time.perf_counter()
+                backend_finished_at = time.time()
                 state.backend_slots.release()
             call_version = response.pop("hyper_policy_version",
                 None if state.async_training else session.policy_version)
@@ -529,6 +651,10 @@ class _Handler(BaseHTTPRequestHandler):
                 and len(session.completions) + 1 < session.max_completions
             )
             record = {"timestamp": time.time(), "original_request": original, "request": transformed,
+                      "timing": {"queued_at": queued_at, "policy_ready_at": policy_ready_at, "admitted_at": admitted_at,
+                                 "backend_finished_at": backend_finished_at,
+                                 "queue_seconds": admitted - queued,
+                                 "backend_seconds": backend_finished - admitted},
                       "response": response, "metadata": {"policy_version": call_version,
                                                           **({"async_training": True} if state.async_training else {}),
                                                           "session_id": session_id,
@@ -543,12 +669,7 @@ class _Handler(BaseHTTPRequestHandler):
                 record["routed_experts"] = route_payload
             return response, outcome, record
         finally:
-            with state.lock:
-                try:
-                    if record is not None:
-                        state.save_completion(session_id, record)
-                finally:
-                    state.release_completion(session)
+            state.complete_reservation(session_id, record)
 
     def _respond_to_session(self, session_id: str, session: _Session, original: dict) -> None:
         """Keep rejected model actions intact while allowing explicitly budgeted resampling."""
@@ -558,6 +679,8 @@ class _Handler(BaseHTTPRequestHandler):
             instructions_override=session.instructions_override,
             enable_thinking=session.enable_thinking,
             compact_harness_context=session.compact_harness_context,
+            preserve_environment_context=session.preserve_environment_context,
+            allowed_tools=session.allowed_tools,
         )
         request_kind = prepare_isolated_request(original, transformed) if session.isolated_cli else "turn"
         if session.max_observation_chars is not None:
@@ -646,6 +769,9 @@ class _Handler(BaseHTTPRequestHandler):
                                   if self.server.state.async_training else None)
         except urllib.error.HTTPError as error:
             detail = self._read_backend(error).decode("utf-8", errors="replace")[:4096]
+            context_error = _context_budget_error(error.code, detail)
+            if context_error is not None:
+                raise context_error from error
             raise RuntimeError(
                 f"vLLM chat completion failed with HTTP {error.code}: {detail}"
             ) from error
@@ -770,6 +896,9 @@ class _GatewayServer(ThreadingHTTPServer):
     """Serve authenticated controller requests and session-bound model requests."""
     daemon_threads = True
     allow_reuse_address = True
+    # Episode registration and model requests arrive in bursts across ranks.
+    # A small TCP backlog causes retransmission before backend admission can run.
+    request_queue_size = 1024
 
     def __init__(self, address: tuple[str, int], state: _State, admin_token: str | None,
                  max_request_bytes: int | None, max_response_bytes: int | None,
@@ -805,6 +934,7 @@ class CodexGateway:
         max_response_bytes: int | None = None,
         router_capture_spec: Mapping[str, Any] | None = None,
         async_training: bool = False,
+        policy_gate: bool = False,
     ) -> None:
         """Initialize an unstarted gateway."""
         if not host:
@@ -813,7 +943,8 @@ class CodexGateway:
             raise ValueError("Codex gateway port must be in [0, 65535]")
         self._server = _GatewayServer(
             (host, port),
-            _State(backend_url, model_name, request_timeout, max_inflight_requests, async_training),
+            _State(backend_url, model_name, request_timeout, max_inflight_requests, async_training,
+                   policy_gate=policy_gate),
             admin_token, max_request_bytes, max_response_bytes, router_capture_spec,
         )
         self._thread: Optional[threading.Thread] = None
@@ -828,6 +959,10 @@ class CodexGateway:
         """Return the bound gateway address."""
         host, port = self._server.server_address[:2]
         return str(host), int(port)
+
+    def set_policy(self, version: int | None) -> None:
+        """Control model admission without recreating the persistent gateway."""
+        self._server.state.set_policy(version)
 
     def start(self) -> None:
         """Start request serving on a daemon thread."""

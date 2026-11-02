@@ -17,6 +17,7 @@
 # pylint: disable=forbidden-backend-import,missing-public-docstring
 
 import math
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -90,6 +91,15 @@ def test_actor_metrics_aggregate_by_global_valid_tokens(
     assert metrics["policy/version"] == 3.0
     assert metrics["weight_sync/configured_direct_reshard"] == 1.0
     assert metrics["weight_sync/last_direct_reshard"] == 1.0
+    dynamic_metrics = build_training_metrics(
+        step=3, actor_update=replace(actor_update, micro_batches=3, input_tokens=18, padded_input_tokens=24),
+        rollout_metrics={},
+    )
+    assert dynamic_metrics["train/micro_batches_per_rank"] == 3.0
+    assert dynamic_metrics["train/input_tokens"] == 18.0
+    assert dynamic_metrics["train/padded_input_tokens"] == 24.0
+    assert dynamic_metrics["train/padding_fraction"] == 0.25
+    assert "train/padding_fraction" not in metrics
 
 
 def _trajectory(
@@ -206,6 +216,23 @@ def test_rollout_and_training_diagnostics_use_global_masked_statistics(
     assert diagnostic_metrics["training/rollout_log_probs_diff_mean"] == pytest.approx(0.2)
     assert diagnostic_metrics["train/advantage_mean"] == 2.0
     assert mismatch_metrics["training/post_update_old_policy_mismatch_count"] == 3.0
+
+    without_probabilities = summarize_training_diagnostics(rollout)
+    assert without_probabilities["training/total_tokens"] == 14.0
+    assert without_probabilities["train/advantage_mean"] == 2.0
+    assert without_probabilities["training/rollout_probs_diff_valid"] == 0.0
+    assert "training/rollout_log_probs_diff_mean" not in without_probabilities
+
+    padding_mask = action_mask.clone()
+    padding_mask[1] = False
+    padded = replace(rollout, action_mask=padding_mask, old_log_probs=None, rollout_log_probs=None,
+                     trajectories=(rollout.trajectories[0],
+                                   replace(rollout.trajectories[1], metadata={"dp_padding": True})))
+    padding_metrics = summarize_training_diagnostics(padded)
+    assert padding_metrics["training/total_tokens"] == 8.0
+    assert padding_metrics["training/action_token_fraction"] == 0.5
+    assert padding_metrics["train/advantage_mean"] == 1.5
+
 
 
 def test_learning_gate_accepts_valid_learning_evidence(

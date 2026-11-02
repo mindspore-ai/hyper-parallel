@@ -44,7 +44,6 @@ from transformers import AutoTokenizer
 
 from hyper_parallel import HSDPModule
 from hyper_parallel.components.optim.mixed_precision_optimizer import Float16OptimizerWithFloat16Params
-from hyper_parallel.models.qwen3_5.adapter.selected_log_probs import bind_token_log_probs
 
 _TRANSFORMERS_BUILTIN_ATTENTION = "transformers_builtin"
 
@@ -176,8 +175,11 @@ def resolve_vllm_model(
 
 def build_role_model(
     runtime_config: object, distributed_setup: object, *, frozen: bool, cpu_threads: Optional[int] = None,
+    token_log_probs_mode: str = "auto", token_log_probs_chunk_size: int = 512,
 ) -> torch.nn.Module:
     """Build one finalized role, optionally changing intra-op threads only during model construction."""
+    if token_log_probs_mode not in ("auto", "dense", "selected_chunked"):
+        raise ValueError("Unknown token_log_probs_mode")
     if cpu_threads is not None and (
         not isinstance(cpu_threads, int) or isinstance(cpu_threads, bool) or cpu_threads <= 0
     ):
@@ -195,8 +197,12 @@ def build_role_model(
     finally:
         if previous_threads is not None:
             torch.set_num_threads(previous_threads)
-    if getattr(getattr(model, "config", None), "model_type", None) == "qwen3_5_text":
-        bind_token_log_probs(model)
+    model_type = getattr(getattr(model, "config", None), "model_type", None)
+    if token_log_probs_mode == "selected_chunked" or (token_log_probs_mode == "auto" and model_type == "qwen3_5_text"):
+        # policy exports Actor, whose rollout imports this module during package initialization.
+        from rl.roles.policy.token_log_probs_adapter import bind_token_log_probs  # pylint: disable=C0415
+
+        bind_token_log_probs(model, chunk_size=token_log_probs_chunk_size)
     if frozen:
         for parameter in model.parameters():
             parameter.requires_grad_(False)

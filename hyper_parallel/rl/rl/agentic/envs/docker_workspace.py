@@ -14,6 +14,8 @@
 # ============================================================================
 """Bounded Docker workspaces and stopped-container artifact collection."""
 
+from __future__ import annotations
+
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -272,11 +274,12 @@ async def _command(argv: Sequence[str], *, stdin: Optional[bytes] = None,
 
 
 class DockerWorkspace:
-    """Own one container without host mounts, devices, or privileged execution."""
+    """Own one container with bounded input mounts, no devices and no privileged execution."""
 
     def __init__(self, image: str, *, network: str = "none", memory: str = "1g", cpus: float = 1.0,
                  pids_limit: int = 64, name_prefix: str = "hyper-workspace", run_id: Optional[str] = None,
-                 docker_host: Optional[str] = None) -> None:
+                 docker_host: Optional[str] = None, user: str = "0:0", read_only: bool = False,
+                 mounts: Sequence[tuple[Path, str, bool]] = (), runtime: Optional[str] = None) -> None:
         """Record trusted settings; resolve the image on the selected daemon at start."""
         if not image or not network or not memory or not math.isfinite(cpus) or cpus <= 0 or pids_limit <= 0:
             raise ValueError("Workspace image, network and positive resource limits are required")
@@ -284,18 +287,51 @@ class DockerWorkspace:
             raise ValueError("Invalid workspace name prefix")
         if network == "host" or network.startswith("container:"):
             raise ValueError("Workspace requires an isolated Docker network")
-        if docker_host is not None and (not isinstance(docker_host, str) or not docker_host
-                                        or any(char.isspace() for char in docker_host)):
-            raise ValueError("docker_host must be a nonempty Docker endpoint without whitespace")
+        self._validate_execution_options(docker_host, runtime, user, read_only)
         self.docker_host = docker_host
+        self.runtime = runtime
         self.run_id = run_id or uuid4().hex
         self.image = image
         self.name = f"{name_prefix}-{uuid4().hex}"
         self.network, self.memory, self.cpus, self.pids_limit = network, memory, cpus, pids_limit
+        self.user, self.read_only = user, read_only
+        self.mounts = self._validate_mounts(mounts)
         self._created = False
         self._running = False
         self._lock = asyncio.Lock()
         self._stop_task: asyncio.Task | None = None
+
+    @staticmethod
+    def _validate_execution_options(docker_host: Optional[str], runtime: Optional[str],
+                                    user: str, read_only: bool) -> None:
+        """Validate trusted daemon/runtime options and the container user boundary."""
+        if docker_host is not None and (not isinstance(docker_host, str) or not docker_host
+                                        or any(char.isspace() for char in docker_host)):
+            raise ValueError("docker_host must be a nonempty Docker endpoint without whitespace")
+        if runtime is not None and (not isinstance(runtime, str) or not runtime
+                                    or any(not (char.isascii() and (char.isalnum() or char in "_.-"))
+                                           for char in runtime)):
+            raise ValueError("Workspace runtime must be a registered Docker runtime name")
+        if not isinstance(read_only, bool):
+            raise ValueError("Workspace read_only must be a boolean")
+        if not isinstance(user, str) or len(user.split(":")) != 2 or not all(
+                part.isdigit() for part in user.split(":")):
+            raise ValueError("Workspace user must be a numeric uid:gid")
+
+    @staticmethod
+    def _validate_mounts(mounts: Sequence[tuple[Path, str, bool]]) -> list[tuple[Path, str, bool]]:
+        """Resolve mount sources and restrict destinations to candidate directories."""
+        validated = []
+        for source, target, readonly in mounts:
+            source = Path(source).resolve(strict=True)
+            destination = PurePosixPath(target)
+            in_workspace = any(target == root or target.startswith(root + "/")
+                               for root in ("/work", "/workspace", "/codex-home"))
+            if (":" in str(source) or not isinstance(readonly, bool) or not in_workspace
+                    or ".." in destination.parts or str(destination) != target):
+                raise ValueError("Input mounts must stay within workspace or candidate-home directories")
+            validated.append((source, target, readonly))
+        return validated
 
     async def _cleanup_after_error(self, *, remove: bool = False) -> bool:
         """Complete bounded cleanup without replacing the original failure."""
@@ -332,20 +368,31 @@ class DockerWorkspace:
         """Create the fixed-image workspace; never implicitly pull an image."""
         if self._created:
             raise RuntimeError("Workspace has already been started")
-        result, _ = await self._docker("image", "inspect", "--format", "{{.Id}}", self.image)
-        self.image = result.stdout.strip()
-        if not self.image.startswith("sha256:"):
-            raise RuntimeError("Docker did not resolve a local image ID")
+        if not (self.image.startswith("sha256:") and len(self.image) == 71
+                and all(value in "0123456789abcdef" for value in self.image[7:])):
+            result, _ = await self._docker("image", "inspect", "--format", "{{.Id}}", self.image)
+            self.image = result.stdout.strip()
+            if not self.image.startswith("sha256:"):
+                raise RuntimeError("Docker did not resolve a local image ID")
         self._created = True
         try:
             labels = ["--label", "hyper-rl.owner=code-agent", "--label", f"hyper-rl.run-id={self.run_id}"]
-            await self._docker("create", "--name", self.name, *labels, "--network", self.network,
+            options = []
+            if self.runtime is not None:
+                options.extend(("--runtime", self.runtime))
+            if self.read_only:
+                options.extend(("--read-only", "--tmpfs", "/tmp:rw,nosuid,nodev,size=256m,mode=1777"))
+            for source, target, readonly in self.mounts:
+                options.extend(("-v", f"{source}:{target}:{'ro' if readonly else 'rw'}"))
+            await self._docker("create", "--name", self.name, *labels, *options, "--network", self.network,
                                "--memory", self.memory, "--memory-swap", self.memory,
                                "--cpus", str(self.cpus), "--pids-limit", str(self.pids_limit),
                                "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-                               "--user", "0:0", "--entrypoint", "/bin/sleep", self.image, "infinity")
+                               "--user", self.user, "--entrypoint", "/bin/sleep", self.image, "infinity")
             await self._docker("start", self.name)
             self._running = True
+            if self.read_only:
+                return
             result = await self.exec(["rm", "-rf", "--", "/workspace"], cwd="/")
             if result.returncode:
                 raise RuntimeError("Cannot clear image workspace contents")
@@ -355,6 +402,11 @@ class DockerWorkspace:
         except BaseException:
             await self._cleanup_after_error(remove=True)
             raise
+
+    async def inspect(self) -> dict:
+        """Read the owned container's state and boundary before removal."""
+        result, _ = await self._docker("inspect", self.name)
+        return json.loads(result.stdout)[0]
 
     async def copy_in(self, source: Path, destination: str = "/workspace") -> None:
         """Copy trusted repository or session configuration into fixed directories."""

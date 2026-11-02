@@ -139,7 +139,8 @@ def test_adapter_must_resolve_to_callable(task_data: tuple) -> None:
 def test_external_runner_does_not_require_internal_environment(runner: str) -> None:
     """External harness configuration remains independent of internal environments."""
     config_dir = Path(rl.__file__).resolve().parent.parent / "examples/gsm8k/configs"
-    agentic = yaml.safe_load((config_dir / f"{runner}_multi_turn.yaml").read_text())["agentic"]
+    recipe = "qwen3_4b_gsm8k_codex_50step.yaml" if runner == "codex" else "deepseek_multi_turn.yaml"
+    agentic = yaml.safe_load((config_dir / recipe).read_text())["agentic"]
     agentic.pop("environment")
     agentic.pop("module_path")
     config_module._validate_agentic(agentic)  # pylint: disable=protected-access

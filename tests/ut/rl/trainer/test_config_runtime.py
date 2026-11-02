@@ -52,12 +52,37 @@ def _validated_recipe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
     ("path", "value", "error"),
     [
         (("train", "max_steps"), 0, "max_steps must be positive"),
+        (("train", "token_log_probs_mode"), "invalid", "token_log_probs_mode"),
+        (("train", "token_log_probs_chunk_size"), 0, "token_log_probs_chunk_size"),
+        (("train", "token_log_probs_chunk_size"), 513, "token_log_probs_chunk_size"),
+        (("train", "old_log_prob_source"), "invalid", "old_log_prob_source"),
+        (("train", "gradient_sync_each_micro_batch"), "true", "must be a boolean"),
+        (("train", "accelerator", "reference_cpu_offload"), "false", "must be a boolean"),
+        (("train", "accelerator", "offload_during_rollout"), "false", "must be a boolean"),
+        (("train", "accelerator", "comm_fusion_zero_copy"), "false", "must be a boolean or null"),
+        (("train", "optimizer", "no_decay_params"), "norm", "no_decay_params"),
+        (("evaluation", "at_end"), "true", "at_end must be a boolean"),
+        (("evaluation", "before_train"), "true", "before_train must be a boolean"),
+        (("evaluation", "every_n_steps"), -1, "every_n_steps"),
+        (("evaluation", "every_n_steps"), True, "every_n_steps"),
         (("train", "optimizer", "fp32_main_params"), "true", "must be a boolean"),
         (("train", "micro_batch_size"), 0, "micro_batch_size must be positive"),
+        (("train", "balance_dp_tokens"), "true", "balance_dp_tokens"),
+        (("train", "balance_dp_tokens"), True, "requires train.max_tokens_per_micro_batch"),
+        (("train", "max_tokens_per_micro_batch"), 0, "max_tokens_per_micro_batch"),
+        (("train", "old_log_prob_max_tokens_per_micro_batch"), True, "old_log_prob_max_tokens_per_micro_batch"),
+        (("train", "reference_log_prob_max_tokens_per_micro_batch"), 0,
+         "reference_log_prob_max_tokens_per_micro_batch"),
+        (("train", "max_tokens_per_micro_batch"), True, "max_tokens_per_micro_batch"),
         (("train", "response_mini_batch_size"), 3, "cannot exceed the local rollout"),
         (("train", "policy_update_epochs"), 0, "policy_update_epochs must be positive"),
         (("rollout", "num_return_sequences"), 1, "at least 2"),
         (("rollout", "ignore_eos"), "false", "ignore_eos must be a boolean"),
+        (("rollout", "collect_log_probs"), "false", "collect_log_probs must be a boolean"),
+        (("rollout", "collect_log_probs"), False, "requires train.old_log_prob_source=actor"),
+        (("rollout", "vllm", "seed"), -1, "seed must be a non-negative integer"),
+        (("rollout", "vllm", "disable_log_stats"), "true", "disable_log_stats must be a boolean"),
+        (("rollout", "vllm", "task_queue_enable"), 3, "task_queue_enable must be 1 or 2"),
         (("train", "accelerator", "cp"), 2, "invalid topology"),
         (("train", "accelerator", "pp"), 2, "invalid topology"),
         (("train", "accelerator", "tp"), 4, "invalid topology"),
@@ -93,6 +118,18 @@ def test_fp32_main_parameter_policy_reaches_runtime_and_rejects_low_precision_re
     assert build_runtime_config(validated_recipe).optimizer.fp32_main_params
     validated_recipe["train"]["mixed_precision"]["reduce_dtype"] = "bfloat16"
     with pytest.raises(ValueError, match="float32 gradient reduction"):
+        validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
+
+
+def test_actor_anchor_can_disable_sampling_probabilities(validated_recipe) -> None:
+    """The internal actor-anchor path can omit optional sampling evidence."""
+    validated_recipe["train"]["old_log_prob_source"] = "actor"
+    validated_recipe["rollout"]["collect_log_probs"] = False
+    validated_recipe["rollout"]["seed"] = None
+    validated_recipe["rollout"]["vllm"]["seed"] = 42
+    validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
+    validated_recipe["consistency"] = {"enabled": True}
+    with pytest.raises(ValueError, match="Consistency and distillation require rollout"):
         validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
 
 
@@ -477,3 +514,77 @@ def _training_config(tmp_path):
             "verify_reload": False,
         },
     }
+
+
+@pytest.mark.parametrize("actor_offload,reference_offload", [(True, False), (False, True), (False, False)])
+def test_role_offload_reuses_shared_fsdp_config(validated_recipe, actor_offload, reference_offload):
+    """Reference overrides must not mutate Actor residency or the caller configuration."""
+    accelerator = validated_recipe["train"]["accelerator"]
+    accelerator.update(cpu_offload=actor_offload, reference_cpu_offload=reference_offload, comm_fusion_zero_copy=True)
+    validated_recipe["train"]["max_tokens_per_micro_batch"] = 3000
+    validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
+    actor = build_runtime_config(validated_recipe)
+    reference = build_runtime_config(validated_recipe, reference=True)
+    assert actor.fsdp_config.enable_offload is actor_offload
+    assert actor.fsdp_config.comm_fusion_zero_copy is True
+    assert reference.fsdp_config.enable_offload is reference_offload
+    assert accelerator["cpu_offload"] is actor_offload
+    if actor_offload or reference_offload:
+        assert "cpu:gloo" in actor.training.backend
+    with pytest.raises(ValueError, match="both Critic and Reference"):
+        build_runtime_config(validated_recipe, critic=True, reference=True)
+
+
+def test_dynamic_actor_rejects_unvalidated_tensor_parallel_scope(validated_recipe: dict) -> None:
+    """The first dynamic Actor integration has an explicit dense TP1 boundary."""
+    validated_recipe["train"]["max_tokens_per_micro_batch"] = 3000
+    validated_recipe["train"]["accelerator"]["tp"] = 2
+    with pytest.raises(ValueError, match="Dynamic Actor batching requires"):
+        validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
+
+
+def test_colocated_resident_dense_grpo_retains_topology_guards(validation_config):
+    """Only the accepted TP1 dense colocated configuration gains device residency."""
+    accelerator = validation_config["train"]["accelerator"]
+    accelerator.update(cpu_offload=False, reference_cpu_offload=True, tp=1)
+    rollout = validation_config["rollout"]["vllm"]
+    rollout.update(deployment="colocated", tensor_parallel_size=1, data_parallel_size=2)
+    rollout.pop("visible_devices", None)
+    validate_config(validation_config, build_algorithm(validation_config["algorithm"]))
+    accelerator["tp"] = 2
+    with pytest.raises(ValueError, match="dense.*TP1"):
+        validate_config(validation_config, build_algorithm(validation_config["algorithm"]))
+
+
+@pytest.mark.parametrize("training_offload", [False, True])
+def test_rollout_offload_keeps_training_offload_independent(validation_config, training_offload):
+    """Stage residency does not rewrite the selected training CPU policy."""
+    accelerator = validation_config["train"]["accelerator"]
+    accelerator.update(offload_during_rollout=True, cpu_offload=training_offload, tp=1)
+    validation_config["rollout"]["vllm"].update(deployment="colocated", tensor_parallel_size=1, data_parallel_size=2)
+    validation_config["rollout"]["vllm"].pop("visible_devices", None)
+    validate_config(validation_config, build_algorithm(validation_config["algorithm"]))
+    assert accelerator["cpu_offload"] is training_offload
+
+
+def test_rollout_offload_rejects_disjoint_inference(validated_recipe):
+    """The initial stage-offload contract targets colocated dense GRPO only."""
+    validated_recipe["train"]["accelerator"]["offload_during_rollout"] = True
+    validated_recipe["rollout"]["vllm"]["deployment"] = "disjoint"
+    with pytest.raises(ValueError, match="offload_during_rollout requires"):
+        validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
+
+
+def test_selected_token_probabilities_validate_supported_scope(validated_recipe: dict) -> None:
+    """The opt-in adapter preserves default behavior and rejects unsupported algorithms."""
+    config = validated_recipe
+    config["train"]["token_log_probs_mode"] = "selected_chunked"
+    validate_config(config, build_algorithm(config["algorithm"]))
+    with pytest.raises(ValueError, match="selected_chunked requires"):
+        config_module._validate_token_log_probs(
+            config, config_module.build_model_registration(config), SimpleNamespace(name="ppo"),
+        )
+    config["train"]["accelerator"]["tp"] = 2
+    with pytest.raises(ValueError, match="selected_chunked requires"):
+        config_module._validate_token_log_probs(config, config_module.build_model_registration(config),
+                                              build_algorithm(config["algorithm"]))

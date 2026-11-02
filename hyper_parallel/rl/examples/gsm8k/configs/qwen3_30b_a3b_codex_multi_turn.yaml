@@ -1,4 +1,4 @@
-# Four-card Qwen3-30B-A3B Codex recipe; task budgets match codex_multi_turn.yaml.
+# Four-card Qwen3-30B-A3B Codex recipe with optional router replay.
 model:
   registry_name: qwen3_30b_a3b
   name: qwen3_moe

@@ -2,8 +2,8 @@
 set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "${script_dir}/../../.."
-devices=${1:-2,3}
-steps=${2:-50}
+devices=${1:-0,1,2,3,4,5,6,7}
+steps=${2:-2}
 data_dir=${3:-}
 if [[ -z "$data_dir" ]]; then
     echo "Usage: $0 DEVICE_IDS STEPS DATA_DIRECTORY [LAUNCHER_OPTIONS|--section.field=value ...]" >&2
