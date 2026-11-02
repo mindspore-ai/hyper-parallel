@@ -190,6 +190,11 @@ class CompileConfig:
 class FSDP2MixedPrecisionConfig:
     """FSDP2 mixed-precision policy expressed in YAML-friendly strings.
 
+    The eager Trainer also applies explicitly selected dtypes with one
+    initialized CUDA/NPU rank, keeping full parameter storage. Default dtypes
+    remain disabled on one rank; CPU and the joint graph-compiler path do not
+    support this single-rank FSDP policy.
+
     All dtypes default to None, which means no mixed precision at all;
     the core ``MixedPrecisionPolicy`` then falls back to framework
     defaults. Dtype strings are resolved to platform dtypes when the

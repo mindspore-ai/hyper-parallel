@@ -349,7 +349,8 @@ class BaseTrainer(Stateful, ABC):
         # Register distributed_setup; the Trainer-side desugar fills its
         # normalized plan_overrides/module_replacements (05 §15.2.6) so the
         # AutoModels build pipeline never sees raw YAML PlanOverride DTOs.
-        self.distributed_setup = create_distributed_setup_from_config(self.config)
+        self.distributed_setup = create_distributed_setup_from_config(
+            self.config, allow_single_rank_precision=True)
         normalize_distributed_setup_overrides(self.distributed_setup, self.config)
         self.mesh = self.distributed_setup.mesh_context
         self.device_mesh = self.mesh.device_mesh

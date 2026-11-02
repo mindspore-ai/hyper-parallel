@@ -1,4 +1,4 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2025-2026 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -195,8 +195,17 @@ def _populate_mesh_ranks(mesh_context: MeshContext, dp_shard_size: int) -> None:
     )
 
 
-def create_distributed_setup_from_config(cfg: Any) -> DistributedSetup:
-    """Create DistributedSetup and build the configured mesh domains."""
+def create_distributed_setup_from_config(
+    cfg: Any, *, allow_single_rank_precision: bool = False,
+) -> DistributedSetup:
+    """Build mesh domains, optionally applying eager precision on a single rank.
+
+    Single-rank FSDP keeps full parameter storage while applying the configured
+    compute and reduction dtypes. It requires an initialized CUDA/NPU process
+    group; the graph-compiler model path does not consume this strategy. Callers
+    must opt in because other runtimes populate dtype defaults without asking
+    for single-rank FSDP.
+    """
     accel = cfg.accelerator if cfg is not None and hasattr(cfg, "accelerator") else None
     if accel is None:
         return DistributedSetup(mesh_context=MeshContext())
@@ -210,6 +219,18 @@ def create_distributed_setup_from_config(cfg: Any) -> DistributedSetup:
     ep_size = max(1, accel.ep_size)
 
     world_size = dist.get_world_size() if dist.is_initialized() else 1
+    precision = fsdp_config.mix_precision
+    single_rank_precision = allow_single_rank_precision and world_size == 1 and (
+        precision.param_dtype is not None or precision.reduce_dtype is not None
+        or precision.output_dtype is not None
+        or bool(getattr(precision, "custom_params", None))
+    )
+    if dist.is_initialized() and single_rank_precision:
+        if get_device_type() not in ("cuda", "npu"):
+            raise ValueError("Single-rank FSDP mixed precision requires CUDA or NPU")
+        compile_config = getattr(cfg, "compile", None)
+        if compile_config is not None and compile_config.selects_graph_compiler():
+            raise ValueError("Single-rank FSDP mixed precision requires the eager model construction path")
     dp_size, dp_replicate_size = _resolve_data_parallel_sizes(
         world_size,
         tp_size,
@@ -241,7 +262,7 @@ def create_distributed_setup_from_config(cfg: Any) -> DistributedSetup:
     _populate_mesh_ranks(mesh_context, dp_shard_size)
 
     fsdp_enabled = dist.is_initialized() and (
-        dp_shard_size > 1 or dp_replicate_size > 1 or edp_shard_size > 1
+        dp_shard_size > 1 or dp_replicate_size > 1 or edp_shard_size > 1 or single_rank_precision
     )
     strategy_config = fsdp_config if fsdp_enabled else None
     return DistributedSetup(

@@ -24,6 +24,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from hyper_parallel.distributed.mesh import MeshContext
+from hyper_parallel.trainer.runtime import distributed
 import rl.config as config_module
 from rl.algorithm import build_algorithm
 from rl.config import (
@@ -94,6 +96,20 @@ def test_fp32_main_parameter_policy_reaches_runtime_and_rejects_low_precision_re
     validated_recipe["train"]["mixed_precision"]["reduce_dtype"] = "bfloat16"
     with pytest.raises(ValueError, match="float32 gradient reduction"):
         validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
+
+
+def test_rl_dtype_defaults_do_not_enable_single_rank_fsdp(validated_recipe, monkeypatch) -> None:
+    """The shared setup factory preserves RL's existing single-rank execution path."""
+    validated_recipe["train"]["mixed_precision"] = {}
+    config = build_runtime_config(validated_recipe)
+    assert config.fsdp_config.mix_precision.param_dtype == "bfloat16"
+    assert config.fsdp_config.mix_precision.reduce_dtype == "float32"
+    monkeypatch.setattr(distributed.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(distributed.dist, "get_world_size", lambda: 1)
+    monkeypatch.setattr(distributed, "_build_device_mesh_from_accelerator", lambda *_args: (MeshContext(), None))
+    for device in ("cpu", "cuda", "npu"):
+        monkeypatch.setattr(distributed, "get_device_type", lambda selected=device: selected)
+        assert distributed.create_distributed_setup_from_config(config).strategy_config is None
 
 
 def test_actor_critic_precision_policy_cannot_differ(validated_recipe) -> None:
