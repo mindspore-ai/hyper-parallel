@@ -24,23 +24,9 @@ SHMEM构建使用锁定的上游Git源码，并仅在隔离副本应用经过SHA
 私有SDK。缺失必需符号会导致构建或初始化失败。
 
 主入口调用本目录的 `build.sh` 并统一组包。业务入口负责私有 SHMEM、Torch adapter
-和正反向 vendor，以及独立的 routed-expert kernels / Torch adapter；外部依赖版本固定在
-`_build/dependencies.lock.json`。
+和正反向 vendor；依赖版本固定在 `_build/dependencies.lock.json`。
 默认目标是 `ascend910b,ascend910_93`；可以通过 `--soc-list` 选择其中的目标。
-当前私有 SHMEM 源码及 routed-expert kernels 支持这两个目标；选择 `ascend950` 时构建入口报错。
 不同 Python、CPU、Torch/PTA 或 CANN 构建环境的制品不能默认互换。
-
-Routed-expert 的两个 CMake target 由 `_build/routed_experts.sh` 顺序构建，使用私有 SHMEM SDK、
-当前 CANN 和 Torch/PTA，不需要 Mega vendor 的头文件、图定义或算子库。标准流程将两个产物安装至
-组件 staging 目录的 `lib/framework/torch/`：
-
-- `libhyper_parallel_routed_experts_kernels.so`
-- `libhyper_parallel_routed_experts_torch.so`
-
-这两个库随组件整体进入 payload 和 wheel，无需手工运行 CMake 或复制库。构建工作目录按 Python、
-Torch/PTA 与 SHMEM toolchain 身份隔离；每次重新配置这两个 target，避免沿用旧编译环境。
-新库会校验 SONAME、adapter 到 kernels 及 kernels 到私有 SHMEM 的依赖，并拒绝直接依赖
-Mega vendor/adapter 或通用 SHMEM SONAME。
 
 组件会在生成私有 SHMEM、复用缓存、生成单 SoC vendor、合并多 SoC vendor 和安装 Torch adapter 后校验
 最终制品。校验覆盖 ACLNN API、kernel object/metadata、ELF 架构、私有 SONAME、运行时依赖及共享库安全

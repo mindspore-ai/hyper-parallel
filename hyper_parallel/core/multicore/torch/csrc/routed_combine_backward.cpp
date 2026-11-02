@@ -61,8 +61,8 @@ bool Overlaps(const at::Tensor &left, const at::Tensor &right) {
 void CheckCombineBackwardMatrices(const at::Tensor &dy, const at::Tensor &values, const at::Tensor &scores) {
   TORCH_CHECK(dy.device().type() == c10::DeviceType::PrivateUse1 && dy.dim() == 2 && values.dim() == 2 &&
                 scores.dim() == 2 && dy.scalar_type() == at::kBFloat16 && values.scalar_type() == at::kBFloat16 &&
-                scores.scalar_type() == at::kBFloat16,
-              "routed combine backward requires BF16 NPU dy [N,H], values [N*K,H], and scores [N,K]");
+                (scores.scalar_type() == at::kBFloat16 || scores.scalar_type() == at::kFloat),
+              "routed combine backward requires BF16 NPU dy [N,H], values [N*K,H], and BF16/FP32 scores [N,K]");
 }
 
 void CheckCombineBackwardExtents(int64_t hidden, int64_t tokens, int64_t top_k, int64_t cores) {
@@ -96,8 +96,8 @@ void CombineBackward(const at::Tensor &dy, const at::Tensor &values, const at::T
                 order.dim() == 1 && order.scalar_type() == at::kLong && order.numel() == selections,
               "routed combine backward requires values [N*K,H] and int64 order [N*K] mapping into scores [N,K]");
   TORCH_CHECK(dv.scalar_type() == at::kBFloat16 && dv.sizes() == values.sizes() &&
-                ds.scalar_type() == at::kBFloat16 && ds.sizes() == scores.sizes(),
-              "routed combine backward outputs must be BF16 dv [N*K,H] and ds [N,K]");
+                ds.scalar_type() == scores.scalar_type() && ds.sizes() == scores.sizes(),
+              "routed combine backward outputs must be BF16 dv [N*K,H] and matching-dtype ds [N,K]");
   const std::array<at::Tensor, 6> arguments{dy, values, order, scores, dv, ds};
   for (const auto &argument : arguments) {
     CheckStorage(argument, dy.device());
@@ -119,7 +119,7 @@ void CombineBackward(const at::Tensor &dy, const at::Tensor &values, const at::T
   at_npu::native::OpCommand::RunOpApi("RoutedExpertsCombineBackward", [=]() -> int {
     return RoutedExpertsCombineBackward(stream.stream(false), dy.data_ptr(), values.data_ptr(), order.data_ptr(),
       scores.data_ptr(), dv.data_ptr(), ds.data_ptr(), tokens, selections, static_cast<int32_t>(hidden),
-      static_cast<int32_t>(top_k), static_cast<int32_t>(cores));
+      static_cast<int32_t>(top_k), static_cast<int32_t>(cores), scores.scalar_type() == at::kFloat);
   });
 }
 

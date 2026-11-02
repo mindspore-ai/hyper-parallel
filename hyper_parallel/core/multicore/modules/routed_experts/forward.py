@@ -145,7 +145,7 @@ class ForwardPipeline:
     """Prepare one full-N row pipeline using a shared bounded vector service stream."""
 
     def __init__(self, boundaries: tuple[int, ...], device: torch.device, vector_stream: Any = None,
-                 vector_workers: int = 8) -> None:
+                 vector_workers: int = 8, swiglu_limit: float | None = None) -> None:
         """Retain immutable host boundaries; defer device resources to phase admission."""
         if isinstance(vector_workers, bool) or vector_workers not in (0, 8):
             raise ValueError("forward service must be disabled or have eight available vector workers")
@@ -153,6 +153,7 @@ class ForwardPipeline:
         self.boundaries = boundaries
         self.device = device
         self.vector_stream = vector_stream
+        self.swiglu_limit = swiglu_limit
         self.metadata: dict[tuple, tuple] = {}
 
     @staticmethod
@@ -292,7 +293,8 @@ class ForwardPipeline:
             work.vector_stream.wait_event(work.ready.poll_after.event)
             torch.ops.hyper_parallel.routed_experts_forward_vector(
                 work.z, work.activation, work.tasks, work.mailboxes, len(self.boundaries),
-                _TILE_ROWS, work.cores, min(8, work.cores), _WATCHDOG)
+                _TILE_ROWS, work.cores, min(8, work.cores), _WATCHDOG,
+                0.0 if self.swiglu_limit is None else self.swiglu_limit)
             work.vector_complete.record(work.vector_stream)
         torch.ops.hyper_parallel.routed_experts_forward_cube(
             work.inputx, work.gate, work.down, work.gate_table, work.down_table, work.tasks, work.z,

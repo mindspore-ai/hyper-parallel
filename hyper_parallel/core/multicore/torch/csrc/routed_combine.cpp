@@ -88,8 +88,9 @@ void Combine(const at::Tensor &values, const at::Tensor &inverse_order, const st
               "routed combine inverse order must be int64 [N*K] or [N,K] and values must contain N*K rows");
   std::vector<at::Tensor> inputs{values, inverse_order};
   if (scores.has_value()) {
-    TORCH_CHECK(scores->scalar_type() == at::kBFloat16 && scores->sizes() == at::IntArrayRef({tokens, top_k}),
-                "routed combine scores must be BF16 [N,K]");
+    TORCH_CHECK((scores->scalar_type() == at::kBFloat16 || scores->scalar_type() == at::kFloat) &&
+                  scores->sizes() == at::IntArrayRef({tokens, top_k}),
+                "routed combine scores must be BF16 or FP32 [N,K]");
     inputs.push_back(*scores);
   }
   CheckStorage(output, values.device());
@@ -114,7 +115,8 @@ void Combine(const at::Tensor &values, const at::Tensor &inverse_order, const st
   at_npu::native::OpCommand::RunOpApi("RoutedExpertsCombine", [=]() -> int {
     return RoutedExpertsCombine(stream.stream(false), values.data_ptr(), inverse_order.data_ptr(),
       scores.has_value() ? scores->data_ptr() : nullptr, output.data_ptr(), tokens, selections,
-      static_cast<int32_t>(hidden), static_cast<int32_t>(top_k), static_cast<int32_t>(cores));
+      static_cast<int32_t>(hidden), static_cast<int32_t>(top_k), static_cast<int32_t>(cores),
+      scores.has_value() && scores->scalar_type() == at::kFloat);
   });
 }
 

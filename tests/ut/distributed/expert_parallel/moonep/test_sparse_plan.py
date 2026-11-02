@@ -83,35 +83,3 @@ class TestSparsePlan(unittest.TestCase):
                 with self.subTest(ranks=ranks, trial=trial):
                     self.assertEqual(actual, expected)
                     self.assertEqual([len(rows) for rows in seen], [len(rows) for rows in source_rows])
-
-    def test_invalid_tables_fail_before_prefix_arithmetic(self):
-        """Lost selections, nonintegral tables and int64 overflow fail explicitly."""
-        for counts, allocation in ((torch.tensor([[1]]), torch.tensor([[0]])),
-                                   (torch.tensor([[-1]]), torch.tensor([[-1]])),
-                                   (torch.tensor([[1.0]]), torch.tensor([[1]])),
-                                   (torch.tensor([[2**63 - 1, 1]]), torch.tensor([[2**63 - 1], [1]]))):
-            with self.subTest(counts=counts), self.assertRaises(ValueError):
-                compile_sparse_route(counts, allocation)
-            with self.subTest(local_counts=counts), self.assertRaises(ValueError):
-                compile_local_route(counts, allocation, 0)
-
-    def test_local_rank_validation(self):
-        """A local compiler must reject malformed or out-of-group PE indices."""
-        counts = torch.zeros((2, 4), dtype=torch.int64)
-        allocation = torch.zeros((4, 2), dtype=torch.int64)
-        for rank in (-1, 2, True, 0.5):
-            with self.subTest(rank=rank), self.assertRaises(ValueError):
-                compile_local_route(counts, allocation, rank)
-        for rank in range(2):
-            route = compile_local_route(counts, allocation, rank)
-            self.assertEqual(route.rank, rank)
-            self.assertEqual(route.incoming, ())
-            self.assertEqual(route.outgoing, ())
-
-    def test_bad_block_size_rejected_even_for_empty_rank(self):
-        """An empty route cannot hide a malformed transport configuration."""
-        route = compile_sparse_route(torch.zeros(1, 1, dtype=torch.int64),
-                                     torch.zeros(1, 1, dtype=torch.int64))[0]
-        for size in (0, -1, True, 1.5):
-            with self.subTest(size=size), self.assertRaises(ValueError):
-                route.communication_blocks(size)

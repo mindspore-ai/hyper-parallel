@@ -296,7 +296,7 @@ class SparseMoonEPRuntime:
         try:
             transport_workers = 2 * executor.ranks if executor.ranks <= 24 else executor.ranks
             self.forward_vector_workers = forward_vector_budget(transport_workers)
-            if (executor.swiglu_limit is not None or shapes != ((2048, 1536), (768, 2048))
+            if (shapes != ((2048, 1536), (768, 2048))
                     or transposed[0] != transposed[1]):
                 self.forward_vector_workers = 0
             if self.forward_vector_workers:
@@ -731,8 +731,9 @@ class SparseMoonEPExecutor:
                 or hidden.device != home[0].device or ids.ndim != 2 or ids.shape != scores.shape
                 or ids.shape[1] != self.top_k or ids.shape[0] != hidden.numel() // hidden.shape[-1]
                 or ids.device != hidden.device or scores.device != hidden.device
-                or ids.dtype != torch.int64 or scores.dtype != torch.bfloat16 or not scores.is_contiguous()):
-            raise ValueError("sparse token, expert ID and BF16 score arguments violate the admitted contract")
+                or ids.dtype != torch.int64 or scores.dtype not in (torch.bfloat16, torch.float32)
+                or not scores.is_contiguous()):
+            raise ValueError("sparse token, expert ID and BF16/FP32 score arguments violate the admitted contract")
 
     def __call__(self, hidden: torch.Tensor, ids: torch.Tensor, scores: torch.Tensor, *,
                  expert_weights: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:

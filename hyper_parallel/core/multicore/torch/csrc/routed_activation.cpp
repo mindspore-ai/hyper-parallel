@@ -13,10 +13,14 @@
 #include <ATen/MemoryOverlap.h>
 #include <torch/library.h>
 #include <array>
+#include <cmath>
+#include <limits>
 
+#include "activation.h"
 #include "torch_npu/csrc/core/npu/NPUGuard.h"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
+#include "torch_npu/csrc/framework/OpCommand.h"
 #include "cached_op_api.h"
 
 namespace {
@@ -71,14 +75,60 @@ void Backward(const at::Tensor &gradient, const at::Tensor &input, at::Tensor ou
   }
 }
 
+void CheckClipped(const at::Tensor &input, const at::Tensor &output, double limit, bool backward) {
+  CheckActivation(input, output, backward);
+  TORCH_CHECK(input.size(0) <= (1LL << 20) && input.size(1) / 2 <= 32768 &&
+                std::isfinite(limit) && limit > 0 && limit <= std::numeric_limits<float>::max(),
+              "clipped routed activation requires at most 2**20 rows, inner width at most 32768, "
+              "and a finite positive float32 limit");
+}
+
+void ClippedForward(const at::Tensor &input, at::Tensor output, double limit) {
+  CheckClipped(input, output, limit, false);
+  const c10_npu::NPUGuard guard(input.device());
+  Record(input, input);
+  Record(output, input);
+  if (input.numel()) {
+    const auto stream = c10_npu::getCurrentNPUStream(input.device().index());
+    at_npu::native::OpCommand::RunOpApi("RoutedExpertsClippedSwiGlu", [=]() -> int {
+      return RoutedExpertsClippedSwiGlu(stream.stream(false), input.data_ptr(), nullptr,
+                                        output.data_ptr(), input.size(0), input.size(1) / 2,
+                                        static_cast<float>(limit), 48);
+    });
+  }
+}
+
+void ClippedBackward(const at::Tensor &gradient, const at::Tensor &input, at::Tensor output, double limit) {
+  CheckClipped(input, output, limit, true);
+  TORCH_CHECK(gradient.sizes() == at::IntArrayRef({input.size(0), input.size(1) / 2}),
+              "clipped routed activation derivative has an invalid extent");
+  at::assert_no_overlap(gradient, output);
+  const c10_npu::NPUGuard guard(input.device());
+  Record(input, input);
+  Record(gradient, input);
+  Record(output, input);
+  if (input.numel()) {
+    const auto stream = c10_npu::getCurrentNPUStream(input.device().index());
+    at_npu::native::OpCommand::RunOpApi("RoutedExpertsClippedSwiGluBackward", [=]() -> int {
+      return RoutedExpertsClippedSwiGlu(stream.stream(false), input.data_ptr(), gradient.data_ptr(),
+                                        output.data_ptr(), input.size(0), input.size(1) / 2,
+                                        static_cast<float>(limit), 48);
+    });
+  }
+}
+
 }  // namespace
 
 TORCH_LIBRARY_FRAGMENT(hyper_parallel, m) {
   m.def("routed_experts_swiglu(Tensor input, Tensor(a!) output) -> ()");
   m.def("routed_experts_swiglu_backward(Tensor gradient, Tensor input, Tensor(a!) output) -> ()");
+  m.def("routed_experts_clipped_swiglu(Tensor input, Tensor(a!) output, float limit) -> ()");
+  m.def("routed_experts_clipped_swiglu_backward(Tensor gradient, Tensor input, Tensor(a!) output, float limit) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(hyper_parallel, PrivateUse1, m) {
   m.impl("routed_experts_swiglu", &Forward);
   m.impl("routed_experts_swiglu_backward", &Backward);
+  m.impl("routed_experts_clipped_swiglu", &ClippedForward);
+  m.impl("routed_experts_clipped_swiglu_backward", &ClippedBackward);
 }

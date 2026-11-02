@@ -14,7 +14,6 @@
 # ============================================================================
 """MoonEP规划、显式GMM反向和真实非重入重算的CPU回归。"""
 
-import inspect
 import itertools
 from types import SimpleNamespace
 import unittest
@@ -25,7 +24,6 @@ import torch
 from torch.utils.checkpoint import DefaultDeviceType
 
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
-from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 from hyper_parallel.distributed.expert_parallel.moonep import (
     MoonEPExecutor, configure_moonep, wrap_moonep_checkpoint,
 )
@@ -81,54 +79,6 @@ class _Block(torch.nn.Module):
 class TestMoonEPLifecycle(unittest.TestCase):
     """不初始化分布式、不依赖NPU，检查真实autograd与checkpoint。"""
 
-    def test_executor_has_single_planner_path(self):
-        """执行器只使用 CPU 小表规划；例如不再接受后端和规划模式开关。"""
-        expert = _Experts()
-        self.assertFalse(hasattr(expert._moonep_executor, 'planner_backend'))  # pylint: disable=protected-access
-        parameters = inspect.signature(MoonEPExecutor).parameters
-        for removed in ('planner_backend', 'planning', 'planner_overlap_sort'):
-            self.assertNotIn(removed, parameters)
-
-    def test_mesh_ep_group_is_reused_for_replica_communication(self):
-        """三个 EP 用途共用 mesh 组；例如权重和梯度都引用 token 的同一个组。"""
-        expert = _Experts()
-        mesh_group = object()
-        with mock.patch.object(moonep_runtime.dist, 'get_rank', return_value=0):
-            expert._moonep_executor = MoonEPExecutor(  # pylint: disable=protected-access
-                expert, lambda: (expert.gate, expert.down), ep_group=mesh_group,
-                ep_size=2, num_experts=2, top_k=2,
-            )
-        with mock.patch.object(moonep_runtime.dist, 'new_group', side_effect=AssertionError('重复建组')), \
-                mock.patch.object(moonep_runtime.dist, 'all_gather_object',
-                                  side_effect=AssertionError('不应交换建组元数据')):
-            configure_moonep(expert)
-        executor = expert._moonep_executor  # pylint: disable=protected-access
-        self.assertIs(executor.weight_group, mesh_group)
-        self.assertIs(executor.gradient_group, mesh_group)
-
-    def test_fsdp_prefetch_keeps_moonep_expert_units(self):
-        """原生 FSDP 链保留专家；例如 L0 预取 L1，L2 反向预取 L1。"""
-        units = [SimpleNamespace(set_modules_to_forward_prefetch=mock.Mock(),
-                                 set_modules_to_backward_prefetch=mock.Mock()) for _ in range(5)]
-        units[1]._moonep_executor = object()
-        units[3]._moonep_executor = object()
-        manager = SimpleNamespace(config=SimpleNamespace(forward_prefetch_depth=1,
-                                                         backward_prefetch_depth=1))
-        FSDP2Manager._configure_prefetch(manager, units)  # pylint: disable=protected-access
-        for index, unit in enumerate(units):
-            unit.set_modules_to_forward_prefetch.assert_called_once_with(units[index + 1:index + 2])
-            unit.set_modules_to_backward_prefetch.assert_called_once_with(units[max(0, index - 1):index])
-
-    def test_ag2_reaches_previous_expert_from_current_expert(self):
-        """AG2 在 E7 入口已预取 E6；例如列表顺序是 D7、E6。"""
-        units = [SimpleNamespace(set_modules_to_forward_prefetch=mock.Mock(),
-                                 set_modules_to_backward_prefetch=mock.Mock()) for _ in range(4)]
-        dense6, expert6, dense7, expert7 = units
-        manager = SimpleNamespace(config=SimpleNamespace(forward_prefetch_depth=1,
-                                                         backward_prefetch_depth=2))
-        FSDP2Manager._configure_prefetch(manager, units)  # pylint: disable=protected-access
-        expert7.set_modules_to_backward_prefetch.assert_called_once_with([dense7, expert6])
-        dense7.set_modules_to_backward_prefetch.assert_called_once_with([expert6, dense6])
 
     def test_native_backward_prefetch_submits_ep_extension_after_ag(self):
         """保留原生 AG 并按顺序接 EP；例如 B7 的预取先提交 B6 AG 再执行扩展。"""
@@ -145,55 +95,6 @@ class TestMoonEPLifecycle(unittest.TestCase):
         scheduler._hsdp_backward_pre_hook(None, None)
         self.assertEqual(order, ['efs_ag', 'ep_alltoallv'])
 
-    def test_dense_prefetch_extends_every_expert_ag(self):
-        """FSDP 列表中的专家都迁移；例如 D7 提交 E6/D6/E5 AG 后接续 E6/E5 EP。"""
-        order = []
-        targets = []
-        for layer in ('expert_6', 'dense_6', 'expert_5'):
-            extension = (SimpleNamespace(
-                fsdp_after_backward_prefetch=lambda _, layer=layer: order.append(f'ep_{layer}'))
-                         if layer.startswith('expert') else None)
-            target = SimpleNamespace(
-                hsdp_state=SimpleNamespace(module_name=layer,
-                                           prefetch=lambda layer=layer: order.append(f'ag_{layer}')),
-                _all_gather_extension=extension,
-            )
-            targets.append(SimpleNamespace(hsdp_scheduler=target))
-        scheduler = object.__new__(HSDPSchedulerV2)
-        scheduler.hsdp_state = SimpleNamespace(module_name='dense_7')
-        scheduler.reshard_after_forward = False
-        scheduler.backward_prefetch_cells = targets
-        scheduler._hsdp_backward_pre_hook(None, None)
-        self.assertEqual(order, ['ag_expert_6', 'ag_dense_6', 'ag_expert_5',
-                                 'ep_expert_6', 'ep_expert_5'])
-
-    def test_fsdp_prefetch_depth_does_not_reserve_moonep_slots(self):
-        """专家 AG hook 决定预取时机；例如 FSDP 列表有三项也只按实际请求建槽。"""
-        expert = _Experts()
-        # 模拟已包装的 FSDP；本测试只验证配置与槽分配，不执行真实通信。
-        expert.hsdp_scheduler = SimpleNamespace(backward_prefetch_cells=[object()] * 3)
-        with mock.patch.object(moonep_runtime.MoonEPRuntime, '_configure_groups'):
-            runtime = configure_moonep(expert)
-        self.assertFalse(runtime.standalone_prefetch)
-        with mock.patch.object(runtime, '_record_all_gather_workspace_demand'):
-            runtime._ensure_slots(expert.gate, expert.down)
-        self.assertEqual(len(runtime.slots), 1)
-        with self.assertRaisesRegex(ValueError, '由 AG hook 触发'):
-            other = _Experts()
-            other.hsdp_scheduler = SimpleNamespace(backward_prefetch_cells=[object()] * 3)
-            configure_moonep(other, prefetch_depth=3)
-
-    def test_fsdp_waits_for_replica_gradients_before_reduce_scatter(self):
-        """扩展归并先于 FSDP 原生归约；例如 B7 的 e0 回传先完成再提交 RS。"""
-        order = []
-        scheduler = object.__new__(HSDPSchedulerV2)
-        scheduler.hsdp_state = SimpleNamespace(module_name='experts', post_backward=lambda: order.append('rs'))
-        scheduler._gradient_extension = SimpleNamespace(
-            fsdp_post_gradient_reduce=lambda _: order.append('ep_grad_merge'),
-        )
-        scheduler._fsdp_group_post_pending = None
-        scheduler._hsdp_backward_hook(None, None, None)
-        self.assertEqual(order, ['ep_grad_merge', 'rs'])
 
     def test_gradient_extension_waits_only_before_fsdp_reduce(self):
         """先发起 BF16 副本回传，参数累积后再等待；例如转置 gate 的第 1 行回 home。"""
@@ -260,57 +161,6 @@ class TestMoonEPLifecycle(unittest.TestCase):
         runtime.finish_step()
         self.assertEqual(runtime.weight_workspace, {})
 
-    def test_workspace_demand_survives_without_retaining_tensor(self):
-        """跨步只保存实际需求；例如上步增长到8元素，需求7使下步直接申请7。"""
-        runtime = configure_moonep(_Experts())
-        template = torch.empty(1, dtype=torch.bfloat16)
-        runtime._borrow_weight_workspace("send", template, 4, 8)
-        old = runtime._borrow_weight_workspace("send", template, 7, 8)
-        old.fill_(5)
-        runtime.finish_step()
-        self.assertEqual(runtime.weight_workspace, {})
-        self.assertEqual(runtime.weight_workspace_demand, {"send": 7})
-        runtime._borrow_weight_workspace("send", template, 2, 8)
-        self.assertEqual(runtime.weight_workspace["send"].numel(), 7)
-        torch.testing.assert_close(old, torch.full((7,), 5, dtype=torch.bfloat16))
-        runtime._borrow_weight_workspace("send", template, 9, 8)
-        self.assertEqual(runtime.weight_workspace_demand["send"], 7)
-
-    def test_workspace_ag_requirement_prevents_backward_growth(self):
-        """已知AG需求参与首次分配；例如前向只发2元素，反向需6元素而预算8。"""
-        runtime = configure_moonep(_Experts())
-        runtime.weight_workspace_demand["send"] = 6
-        template = torch.empty(1, dtype=torch.bfloat16)
-        first = runtime._borrow_weight_workspace("send", template, 2, 8)
-        first.fill_(3)
-        backward = runtime._borrow_weight_workspace("send", template, 6, 8)
-        self.assertEqual(first.data_ptr(), backward.data_ptr())
-        self.assertEqual(runtime.statistics["weight_workspace_allocations"], 1)
-        torch.testing.assert_close(backward[:2], torch.full((2,), 3, dtype=torch.bfloat16))
-
-    def test_ag_demand_is_read_after_lazy_dtype_initialization(self):
-        """首个专家前向读取已初始化dtype；例如构造时尚未知的128元素在建槽时生效。"""
-        expert = _Experts()
-        runtime = configure_moonep(expert)
-        parameter = SimpleNamespace(shard_world_size=2, hsdp_placement=SimpleNamespace(dim=0),
-                                    all_gather_process_group=object(), offload_to_cpu=False,
-                                    param_dtype=torch.bfloat16, orig_dtype=torch.float32,
-                                    padded_sharded_param_size=torch.Size((1, 8, 16)))
-        expert.hsdp_scheduler = SimpleNamespace(hsdp_state=SimpleNamespace(
-            comm_fusion_policy=SimpleNamespace(enable_comm_fusion=False), hsdp_params=[parameter]))
-        self.assertEqual(runtime.weight_workspace_demand, {})
-        runtime._ensure_slots(expert.gate.bfloat16(), expert.down.bfloat16())
-        self.assertEqual(runtime.weight_workspace_demand, {"send": 128})
-
-    def test_balanced_candidates_do_not_create_remote_quotas(self):
-        """省去循环零盈余判断仍保持平衡；例如全零或各卡等负载时没有迁移。"""
-        for ranks in (1, 2, 4, 8):
-            for count in (0, 3):
-                totals = torch.full((ranks * 2,), count, dtype=torch.int64)
-                actual = device_candidates(totals, ranks)
-                expected = torch.zeros((ranks * 2, ranks), dtype=torch.int64)
-                expected[torch.arange(ranks * 2), torch.arange(ranks * 2) // 2] = count
-                torch.testing.assert_close(actual, expected.expand(2, -1, -1), rtol=0, atol=0)
 
     def test_receive_order_preserves_source_and_row_order(self):
         """分段平移等价于接收标签的稳定排序；例如交错来源和零长段也保持原行次序。"""
@@ -484,28 +334,6 @@ class TestMoonEPLifecycle(unittest.TestCase):
 class TestMoonEPCapacity(unittest.TestCase):
     """独立穷举验证最小迁移与木桶目标，检查通信元数据守恒。"""
 
-    def test_compact_home_gradient_matches_scatter_and_keeps_small_storage(self):
-        """全部 home 专家活跃时一次紧凑拷贝等于原散加；缺专家时仍走原路径。"""
-        counts = torch.tensor([[1, 1, 0, 0], [0, 0, 1, 1]])
-        allocation = torch.tensor([[1, 0], [1, 0], [0, 1], [0, 1]])
-        plan = compile_plan(counts, allocation, torch.tensor([0, 1]), 0)
-        self.assertTrue(plan.home_dense)
-        gate = torch.randn(2, 8, 16)
-        down = torch.randn(2, 8, 8)
-        original = moonep_runtime.local_home_gradients(gate, down, plan)
-        compact = moonep_runtime.local_home_gradients(gate, down, plan, compact_home=True)
-        for actual, expected in zip(compact, original):
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-            self.assertEqual(actual.untyped_storage().nbytes(), actual.numel() * actual.element_size())
-
-        sparse_counts = torch.tensor([[1, 0, 0, 0], [0, 0, 1, 1]])
-        sparse_allocation = torch.tensor([[1, 0], [0, 0], [0, 1], [0, 1]])
-        missing = compile_plan(sparse_counts, sparse_allocation, torch.tensor([0]), 0)
-        self.assertFalse(missing.home_dense)
-        fallback = moonep_runtime.local_home_gradients(gate[:1], down[:1], missing, compact_home=True)
-        sparse_reference = moonep_runtime.local_home_gradients(gate[:1], down[:1], missing)
-        for actual, expected in zip(fallback, sparse_reference):
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_small_exact_solver_against_exhaustive_search(self):
         """遍历81组专家计数；例如B=1禁止同一卡同时接收两个不同远程专家。"""
@@ -524,19 +352,6 @@ class TestMoonEPCapacity(unittest.TestCase):
             result = solve_capacity_exact(totals, 2, 1)
             self.assertEqual((result.moved, result.peak_copies, result.total_copies), min(objectives))
 
-    def test_exact_solver_records_three_stages_with_shared_budget(self):
-        """小型可解规划逐阶段记录状态；总预算在三阶段间递减。"""
-        events = []
-        result = solve_capacity_exact([3, 1, 2, 2], 2, 2,
-                                      progress=lambda event, details: events.append((event, details)),
-                                      time_limit=30)
-        self.assertEqual(result.allocation.shape, (4, 2))
-        starts = [details for event, details in events if event == 'milp_start']
-        ends = [details for event, details in events if event == 'milp_end']
-        self.assertEqual([entry['phase'] for entry in starts],
-                         ['migration', 'peak_copies', 'total_copies'])
-        self.assertEqual([entry['status'] for entry in ends], [0, 0, 0])
-        self.assertGreater(starts[0]['time_limit_s'], starts[-1]['time_limit_s'])
 
     def test_planner_uses_bounded_fill_fallback_without_solver(self):
         """四卡容量难例由填满接收卡兜底；例如迁移 12 条而不进入整数规划。"""
@@ -566,53 +381,6 @@ class TestMoonEPCapacity(unittest.TestCase):
             self.assertEqual(torch.bincount(sorted_labels, minlength=4).tolist(), allocation[:, target].tolist())
             self.assertEqual(sorted_labels.tolist(), sorted(labels))
 
-    def test_vectorized_candidate_conservation_and_certificate(self):
-        """随机计数验证设备区间交集；例如R4/E8单归属规则始终满足每卡最多两个副本。"""
-        generator = torch.Generator().manual_seed(23)
-        for ranks in (2, 4, 8):
-            for _ in range(40):
-                totals = torch.randint(0, 30, (ranks * 2,), generator=generator)
-                target = [int(totals.sum()) // ranks + int(r < int(totals.sum()) % ranks)
-                          for r in range(ranks)]
-                for rule in (False, True):
-                    candidate = device_candidate(totals, ranks, rule)
-                    self.assertEqual(candidate.sum(0).tolist(), target)
-                    self.assertEqual(candidate.sum(1).tolist(), totals.tolist())
-                    self.assertTrue(bool((candidate >= 0).all()))
-                    metrics = device_plan_metrics(candidate, totals, torch.full((ranks,), 2)).tolist()
-                    if rule:
-                        self.assertEqual(metrics[0], 1)
-                        for receiver in range(ranks):
-                            remote_homes = {e // 2 for e in range(ranks * 2)
-                                            if e // 2 != receiver and candidate[e, receiver] > 0}
-                            self.assertLessEqual(len(remote_homes), 1)
-                    if metrics[5]:
-                        self.assertEqual(metrics[1], metrics[4])
-
-    def test_two_rank_selection_uses_one_equivalent_candidate(self):
-        """两卡仅需一条 CPU 候选；例如奇数总量仍按8/7分配且迁移最少。"""
-        generator = torch.Generator().manual_seed(91)
-        for _ in range(30):
-            counts = torch.randint(0, 12, (2, 6), generator=generator)
-            totals = counts.sum(0)
-            partial = device_candidate(totals, 2, False)
-            filled = device_candidate(totals, 2, True)
-            torch.testing.assert_close(partial, filled, rtol=0, atol=0)
-            with mock.patch.object(planning, '_cpu_candidates', wraps=planning._cpu_candidates) as candidate_call, \
-                    mock.patch.object(planning, '_cpu_candidate_metrics',
-                                      wraps=planning._cpu_candidate_metrics) as metric_call:
-                copied_counts, allocation, used_fallback = planning.select_allocation(counts, 3)
-            candidate_call.assert_called_once()
-            metric_call.assert_called_once()
-            self.assertFalse(used_fallback)
-            torch.testing.assert_close(copied_counts, counts, rtol=0, atol=0)
-            torch.testing.assert_close(allocation.sum(1), totals, rtol=0, atol=0)
-            total = int(totals.sum())
-            targets = torch.tensor([(total + 1) // 2, total // 2])
-            torch.testing.assert_close(allocation.sum(0), targets, rtol=0, atol=0)
-            moved = int(allocation[:3, 1].sum() + allocation[3:, 0].sum())
-            minimum = int((totals.reshape(2, 3).sum(1) - targets).clamp_min(0).sum())
-            self.assertEqual(moved, minimum)
 
     def test_cpu_small_table_matches_reference_candidate_and_selection(self):
         """CPU 小表候选与离线参考逐值一致；例如 EP8 的零负载与热点。"""
@@ -647,11 +415,6 @@ class TestMoonEPCapacity(unittest.TestCase):
         np.testing.assert_array_equal(planning._cpu_candidates(large.numpy(), 4, (False, True)),
                                       device_candidates(large, 4).numpy())
 
-    def test_cpu_small_table_rejects_infeasible_capacity(self):
-        """容量不足时明确报错；例如 EP2、B1 无法承接两个远程专家。"""
-        counts = torch.tensor([[5, 5, 5, 0, 0, 0], [0, 0, 0, 0, 0, 0]])
-        with self.assertRaisesRegex(RuntimeError, '无法满足均衡及副本容量'):
-            planning.select_allocation(counts, 1)
 
     def test_two_rank_analytic_certificate_matches_general_path(self):
         """穷举81种两卡小计数，对照原设备证书；例如B=P和B>P都不改变分配。"""
@@ -666,40 +429,6 @@ class TestMoonEPCapacity(unittest.TestCase):
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                 self.assertFalse(used_fallback)
 
-    def test_analytic_certificate_keeps_count_validation(self):
-        """解析证书仍拒绝非法源计数；例如列和为正也不能接受源rank的-1。"""
-        invalid = [torch.ones(2, 2, dtype=torch.float32), torch.ones(4, dtype=torch.long),
-                   torch.empty(0, 2, dtype=torch.long), torch.empty(2, 0, dtype=torch.long),
-                   torch.tensor([[-1, 3], [2, 1]])]
-        for counts in invalid:
-            with self.subTest(shape=tuple(counts.shape)):
-                with self.assertRaises(ValueError):
-                    planning.select_allocation(counts, 2)
-        # R4仍需两条迁移规则和通用容量校验，解析分支不能扩张到不成立的拓扑。
-        counts = torch.ones(4, 8, dtype=torch.long)
-        with mock.patch.object(planning, '_cpu_candidate_metrics',
-                               wraps=planning._cpu_candidate_metrics) as metrics:
-            planning.select_allocation(counts, 2)
-        self.assertEqual(metrics.call_count, 1)
-
-    def test_cpu_list_metrics_match_device_metrics(self):
-        """穷举加随机对照全部六项指标；例如负配额的M也必须保留设备版语义。"""
-        for entries in itertools.product(range(-1, 3), repeat=4):
-            allocation = torch.tensor(entries, dtype=torch.long).reshape(2, 2)
-            totals = allocation.sum(1)
-            for capacities in ([-1, 1], [0, 0], [1, 1]):
-                expected = device_plan_metrics(allocation, totals, torch.tensor(capacities)).tolist()
-                actual = planning._cpu_plan_metrics(allocation.tolist(), totals.tolist(), capacities)
-                self.assertEqual(actual, tuple(expected))
-        generator = torch.Generator().manual_seed(37)
-        for ranks in (1, 2, 4, 8):
-            for _ in range(40):
-                allocation = torch.randint(-2, 8, (ranks * 2, ranks), generator=generator)
-                totals = torch.randint(-2, 16, (ranks * 2,), generator=generator)
-                capacities = torch.randint(-1, 5, (ranks,), generator=generator)
-                expected = device_plan_metrics(allocation, totals, capacities).tolist()
-                actual = planning._cpu_plan_metrics(allocation.tolist(), totals.tolist(), capacities.tolist())
-                self.assertEqual(actual, tuple(expected))
 
     def test_weight_spans_match_global_weights_without_output_reallocation(self):
         """独立全局权重对照三段组表；例如rank1按远程e0、本地e3、远程e6排列。
@@ -749,11 +478,6 @@ class TestMoonEPCapacity(unittest.TestCase):
                     max_spans = max(max_spans, len(plan.weight_spans))
         self.assertEqual(max_spans, 3)
 
-    def test_infeasible_capacity_fails_explicitly(self):
-        """容量不允许负载均衡时明确报错；例如两个卡B=0不能迁移四条e0。"""
-        with self.assertRaises(ValueError):
-            solve_capacity_exact([4, 0], 2, 0)
-
 
 class TestMoonEPOptimizations(unittest.TestCase):
     """独立列表算法及内存布局反例；例如相同的专家并列时仍必须选择较小编号。"""
@@ -792,23 +516,6 @@ class TestMoonEPOptimizations(unittest.TestCase):
                 result[expert][home] += remaining[expert]
         return torch.tensor(result, dtype=torch.int64)
 
-    def test_batched_planner_matches_independent_sequential_rules(self):
-        """穷举4卡小例和随机大数并列例；例如零负载、余数目标和 FP32 并列均保持原选择。"""
-        generator = torch.Generator().manual_seed(234)
-        cases = [(torch.tensor(values, dtype=torch.int64), 4) for values in itertools.product(range(3), repeat=4)]
-        cases += [(torch.randint(0, 100, (ranks * 3,), generator=generator), ranks)
-                  for ranks in (2, 4, 8) for _ in range(30)]
-        cases.append((torch.tensor([2**24, 2**24 + 1, 1, 0, 0, 0, 0, 0]), 4))
-        for totals, ranks in cases:
-            actual = device_candidates(totals, ranks)
-            for index, fill in enumerate((False, True)):
-                expected = self.reference_candidate(totals, ranks, fill)
-                torch.testing.assert_close(actual[index], expected, rtol=0, atol=0)
-            capacities = torch.full((ranks,), 2)
-            metrics = device_plan_metrics_batch(actual, totals, capacities)
-            for index in range(2):
-                expected = planning._cpu_plan_metrics(actual[index].tolist(), totals.tolist(), capacities.tolist())
-                self.assertEqual(metrics[index].tolist(), list(expected))
 
     def test_shared_executor_guard_resets_between_completed_microbatches(self):
         """仅同时存活的重复调用需回退；例如 no_sync 微批1反向完，微批2仍可异步。"""

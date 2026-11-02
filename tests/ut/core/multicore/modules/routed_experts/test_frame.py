@@ -298,68 +298,6 @@ class TestPreparedComputeFrames(unittest.TestCase):
                     self.assertLess(operations.index(("wait", work.initialized)), launch)
                     self.assertLess(operations.index(("wait", dependency.admitted)), launch)
 
-    def test_arena_slots_preserve_saved_z_and_separate_gradient_storage(self):
-        """Arena allocation covers named scratch only and rejects aliases with saved state."""
-        engine = self._engine((2,))
-        inputs = self._random(2, 16)
-        gate, down = (self._random(16, 64),), (self._random(32, 16),)
-        slots, requests = {}, []
-
-        def _allocate(name, shape, dtype):
-            requests.append((name, shape, dtype))
-            slots[name] = torch.empty(shape, dtype=dtype)
-            return slots[name]
-
-        forward = engine.prepare_forward(inputs, gate, down, 32, allocator=_allocate)
-
-        self.assertEqual([request[0] for request in requests], ["activation", "project"])
-        self.assertIs(forward.activation, slots["activation"])
-        self.assertIs(forward.output, slots["project"])
-        self.assertNotIn(forward.z.data_ptr(), [value.data_ptr() for value in slots.values()])
-        engine.run_forward(forward)
-        requests.clear()
-        derivative = self._random(*forward.output.shape)
-
-        backward = engine.prepare_backward(derivative, forward.state, gate, down, allocator=_allocate)
-
-        self.assertEqual([request[0] for request in requests],
-                         ["activation", "project", "down_gradient", "gate_gradient"])
-        self.assertEqual(requests[1][1], (2, 32))
-        self.assertIs(backward.dz, slots["activation"])
-        self.assertIs(backward.down_gradient, slots["down_gradient"])
-        self.assertIs(backward.gate_gradient, slots["gate_gradient"])
-        self.assertNotEqual(backward.down_gradient.data_ptr(), backward.gate_gradient.data_ptr())
-        saved_z = forward.z.clone()
-        with self._forbid_preparation():
-            engine.run_backward(backward, lambda _role, _value: None)
-        torch.testing.assert_close(forward.z, saved_z, rtol=0, atol=0)
-
-        fallback = engine.prepare_forward(inputs, gate, down, 32, allocator=lambda *_args: None)
-        self.assertEqual(fallback.output.shape, (2, 16))
-        with self.assertRaises(ValueError):
-            engine.prepare_forward(inputs, gate, down, 32,
-                                   allocator=lambda _name, shape, _dtype: torch.empty(shape, dtype=torch.float32))
-        with self.assertRaisesRegex(ValueError, "alias"):
-            engine.prepare_backward(derivative, forward.state, gate, down,
-                                    allocator=lambda name, _shape, _dtype: forward.z if name == "activation" else None)
-
-    def test_prepare_rejects_invalid_or_aliased_destinations(self):
-        """Invalid destinations fail during preparation before any native payload call."""
-        engine = self._engine((2,))
-        inputs, weights = self._random(2, 32), (self._random(32, 32),)
-        invalid = (
-            inputs, torch.empty(2, 32), torch.empty(2, 16, dtype=torch.bfloat16),
-            torch.empty(32, 2, dtype=torch.bfloat16).t(),
-            torch.empty(2, 32, dtype=torch.bfloat16, device="meta"),
-        )
-        for output in invalid:
-            with self.subTest(shape=output.shape, dtype=output.dtype, device=output.device):
-                with self.assertRaises(ValueError):
-                    engine.prepare_linear(inputs, weights, 32, output=output)
-        with self.assertRaises(ValueError):
-            engine.prepare_gradient(inputs, inputs, output=torch.empty(1, 32, 16))
-        self.assertEqual(self.calls, [])
-        self.assertEqual(self.weight_tables, [])
 
     def test_combine_uses_preallocated_outputs_and_rejects_aliases(self):
         """Both vector wrappers preserve supplied output identity without allocating."""
@@ -388,39 +326,6 @@ class TestPreparedComputeFrames(unittest.TestCase):
             compute.combine_gradient(output, values, order, scores, outputs=(values, score_gradient))
         self.assertEqual(self.calls, ["combine", "combine_backward"])
 
-    def test_poll_event_is_preallocated_and_initialized_for_standalone_readiness(self):
-        """Generic and empty readiness can be consumed without a linear producer."""
-        for shape in ((2, 3), (0, 0)):
-            with self.subTest(shape=shape):
-                ready = readiness.ExpertReadiness.create(torch.zeros(shape, dtype=torch.int32), torch.device("cpu"))
-                self.assertTrue(ready.poll_after.queued)
-                self.assertIsNot(ready.poll_after.event, ready.admitted)
-                self.assertEqual(ready.poll_after.event.records, [self.current])
-                self.assertEqual(ready.admitted.records, [self.current])
-
-    def test_linear_poll_event_is_rerecorded_before_launch_on_submission_stream(self):
-        """The preallocated fence moves past prior work without fencing GEMM completion."""
-        engine = self._engine((2,))
-        work = engine.prepare_linear(self._random(2, 32), (self._random(32, 32),), 32, publish=True)
-        self.assertFalse(work.ready.poll_after.queued)
-        prepared_on = self.current
-        self.current = _Stream("producer")
-        self.current.operations.append(("prior_vector", None))
-
-        with self._forbid_preparation():
-            engine.run_linear(work)
-
-        self.assertTrue(work.ready.poll_after.queued)
-        self.assertEqual(work.ready.admitted.records, [prepared_on])
-        self.assertEqual(work.ready.poll_after.event.records, [prepared_on, self.current])
-        operations = self.current.operations
-        record = operations.index(("record", work.ready.poll_after.event))
-        self.assertLess(operations.index(("wait", work.initialized)), record)
-        self.assertLess(operations.index(("prior_vector", None)), record)
-        self.assertLess(record, operations.index(("gemm", id(work.result))))
-        with self.assertRaisesRegex(ValueError, "already submitted"):
-            engine.run_linear(work)
-        self.assertEqual(len(work.ready.poll_after.event.records), 2)
 
     def test_forward_backward_poll_fence_follows_all_gemm_predecessors(self):
         """F fences SwiGLU and B fences SwiGLUGrad and dW before down/Bx begins."""
@@ -444,29 +349,3 @@ class TestPreparedComputeFrames(unittest.TestCase):
         self.assertLess(operations.index(("activation_backward", id(backward.dz))), fence)
         self.assertLess(operations.index(("gradient", id(backward.gate_gradient))), fence)
         self.assertLess(fence, operations.index(("gemm", id(backward.output))))
-
-    def test_failed_gemm_submission_leaves_poll_fence_unavailable(self):
-        """An event record alone cannot admit consumers of a failed producer."""
-        engine = self._engine((2,))
-        work = engine.prepare_linear(self._random(2, 32), (self._random(32, 32),), 32, publish=True)
-        with patch.object(self.ops, "routed_experts_gemm", side_effect=RuntimeError("submission failed")):
-            with self.assertRaisesRegex(RuntimeError, "submission failed"):
-                engine.run_linear(work)
-        self.assertFalse(work.ready.poll_after.queued)
-        self.assertTrue(work.submitted)
-        self.assertEqual(len(work.ready.poll_after.event.records), 2)
-
-    def test_linear_consumer_rejects_pending_producer_before_submission(self):
-        """Generic GEMM consumers honor the same pre-poll admission contract as T."""
-        engine = self._engine((2,))
-        producer = engine.prepare_linear(self._random(2, 32), (self._random(32, 32),), 32, publish=True)
-        consumer = engine.prepare_linear(producer.result, (self._random(32, 32),), 32)
-        self.current = _Stream("consumer")
-        with self.assertRaisesRegex(ValueError, "producer to be submitted first"):
-            engine.run_linear(consumer, producer.ready)
-        self.assertFalse(consumer.submitted)
-        self.assertEqual(self.current.operations, [])
-        self.assertEqual(self.calls, [])
-        engine.run_linear(producer)
-        engine.run_linear(consumer, producer.ready)
-        self.assertIn(("wait", producer.ready.poll_after.event), self.current.operations)

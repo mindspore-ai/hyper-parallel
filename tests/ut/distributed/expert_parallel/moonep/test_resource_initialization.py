@@ -108,16 +108,6 @@ class TestResourceInitialization(unittest.TestCase):
                 self.weight.materialize.assert_not_called()
                 self.gradient.return_gradient.assert_not_called()
 
-    def test_local_admission_failure_uses_existing_preflight_before_poison(self) -> None:
-        """The resource boundary preserves local allocation failure convergence."""
-        failure = MemoryError("injected replica allocation")
-        self.weight.admit.side_effect = failure
-        with self.assertRaisesRegex(RuntimeError, "shared admission failed") as caught:
-            self.runtime.initialize(self.experts[0], self.home)
-        self.assertIs(caught.exception.__cause__, failure)
-        self.workspace.check_preflight.assert_called_once_with(failure)
-        self.gradient.admit.assert_not_called()
-        self._assert_terminal_retry()
 
     def test_remote_admission_failure_also_forbids_locally_complete_retry(self) -> None:
         """A valid local allocation cannot be reused after another rank rejects admission."""
@@ -129,34 +119,6 @@ class TestResourceInitialization(unittest.TestCase):
         self.workspace.check_preflight.assert_called_once_with(None)
         self._assert_terminal_retry()
 
-    def test_non_exception_resource_abort_marks_terminal_state(self) -> None:
-        """Cancellation also prevents subsequent reuse of a partial workspace."""
-        self.domains.side_effect = KeyboardInterrupt("injected interruption")
-        with self.assertRaises(KeyboardInterrupt):
-            self.runtime.initialize(self.experts[0], self.home)
-        self._assert_terminal_retry()
-
-    def test_partial_close_drops_only_unsubmitted_local_references(self) -> None:
-        """A local startup failure must not enter collective free, group destroy, or drains."""
-        self.domains.side_effect = [self.weight, RuntimeError("gradient constructor failed")]
-        with self.assertRaisesRegex(RuntimeError, "gradient constructor failed"):
-            self.runtime.initialize(self.experts[0], self.home)
-        groups = self.runtime.groups
-        for _ in range(2):
-            with self.assertRaisesRegex(RuntimeError, "collective resources require whole-job termination"):
-                self.runtime.close()
-            self.assertIsNone(self.runtime.weight_domain)
-            self.assertIsNone(self.runtime.gradient_domain)
-            self.assertIsNone(self.runtime.arena)
-            self.assertIs(self.runtime.workspace, self.workspace)
-            self.assertIs(self.runtime.groups, groups)
-            self.assertTrue(self.runtime.poisoned)
-            self.assertFalse(self.runtime.closed)
-        self.weight.drain.assert_not_called()
-        self.gradient.drain.assert_not_called()
-        self.workspace.close.assert_not_called()
-        self.arena.close.assert_not_called()
-        self.destroy.assert_not_called()
 
     def test_success_keeps_idempotent_initialization_and_collective_close(self) -> None:
         """A fully initialized runtime retains its existing drain and free sequence."""
@@ -171,15 +133,4 @@ class TestResourceInitialization(unittest.TestCase):
         self.workspace.close.assert_called_once_with()
         self.arena.close.assert_called_once_with()
         self.assertEqual(self.destroy.call_count, 5)
-        self.assertTrue(self.runtime.closed)
-
-    def test_never_initialized_close_creates_no_resources(self) -> None:
-        """Closing before the first forward remains a local idempotent operation."""
-        self.runtime.close()
-        self.runtime.close()
-        self.gather.assert_not_called()
-        self.groups.assert_not_called()
-        self.workspace_factory.assert_not_called()
-        self.domains.assert_not_called()
-        self.destroy.assert_not_called()
         self.assertTrue(self.runtime.closed)

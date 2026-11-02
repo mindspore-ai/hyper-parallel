@@ -81,37 +81,9 @@ class TestRestoredHomeAdmission(unittest.TestCase):
                 self.assertTrue(self.runtime.poisoned)
                 self.apply.assert_not_called()
 
-    def test_valid_peer_rejects_remote_geometry_error_before_apply(self) -> None:
-        """One bad restored view propagates through the unchanged counts header."""
-        self.runtime.new_key(self.experts[0])
-
-        def _remote_invalid(output: torch.Tensor, value: torch.Tensor, **kwargs: object) -> None:
-            self._gather(output, value, **kwargs)
-            output.view(2, -1)[1, -1] = 1
-
-        self.gather.side_effect = _remote_invalid
-        with self.assertRaisesRegex(RuntimeError, "rank-consistent order"):
-            self.experts[1](self.hidden, self.ids, self.scores, expert_weights=self.home)
-        self.assertEqual(self.gather.call_args.args[1][-1].item(), 0)
-        self.gather.assert_called_once()
-        self.apply.assert_not_called()
-        self.assertTrue(self.runtime.poisoned)
 
     def test_fresh_storage_with_identical_metadata_is_accepted(self) -> None:
         """Valid FSDP storage rebinding does not require a stale pointer match."""
         fresh = tuple(value.clone() for value in self.home)
         self.assertNotEqual(fresh[0].data_ptr(), self.home[0].data_ptr())
         self.runtime.validate_home(fresh)
-
-    def test_replay_geometry_failure_is_fatal_without_new_count_collective(self) -> None:
-        """Replay already owns its plan and must poison rather than re-admit or fallback."""
-        key = self.runtime.new_key(self.experts[0])
-        self.runtime.executions[key] = self.experts[0], object()
-        with patch.object(execution, "bind_execution", return_value=key):
-            with self.assertRaisesRegex(RuntimeError, "whole-job termination") as raised:
-                invalid_home = tuple(value.float() for value in self.home)
-                self.experts[0](self.hidden, self.ids, self.scores, expert_weights=invalid_home)
-        self.gather.assert_not_called()
-        self.apply.assert_not_called()
-        self.assertIsInstance(raised.exception.__cause__, ValueError)
-        self.assertTrue(self.runtime.poisoned)

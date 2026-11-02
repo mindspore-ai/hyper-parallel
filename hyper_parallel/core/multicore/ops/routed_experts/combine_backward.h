@@ -12,10 +12,11 @@
 
 #include <cstdint>
 
-// Payloads are contiguous BF16: dy [N,H], unweighted values/dv [N*K,H],
-// scores/ds [N,K]. INT64 order [N*K] maps each value row to token*K+slot.
+// dy, values and dv are BF16; scores/ds are matching BF16 or FP32.
+// INT64 order [N*K] maps each value row to token*K+slot.
 // The host plan guarantees a bijection; the kernel checks each index range.
-// dscore rounds each dy*value product to BF16 before its FP32 reduction.
+// BF16 scores retain the legacy product rounding; FP32 scores use FP32 reduction.
 extern "C" int RoutedExpertsCombineBackward(void *stream, void *dy, void *values, void *order, void *scores,
                                             void *dv, void *ds, int64_t tokens, int64_t selections,
-                                            int32_t hidden, int32_t top_k, int32_t cores);
+                                            int32_t hidden, int32_t top_k, int32_t cores,
+                                            bool score_is_fp32);

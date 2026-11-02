@@ -57,6 +57,7 @@ class TokenDedup:
     backward_lookup: torch.Tensor
     source_choices: torch.Tensor
     width: int
+    score_lanes: int
     group: Any
     target_hidden_rows: torch.Tensor
     target_score_elements: torch.Tensor
@@ -89,7 +90,7 @@ class TokenDedup:
         return torch.cat((vectors, score_rows), dim=0).index_select(0, pack_order)
 
     def dispatch_with_scores(self, hidden: torch.Tensor, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Pack hidden and scores by peer, then exchange full-width rows."""
+        """Pack vectors and lossless BF16/FP32 score lanes by peer."""
         self._check_width(hidden)
         return _DispatchWithScores.apply(hidden, scores, self)
 
@@ -108,11 +109,18 @@ class _DispatchWithScores(torch.autograd.Function):
         """Send unique hidden vectors and every expert's router score."""
         ctx.plan, ctx.hidden_shape, ctx.score_shape, ctx.score_dtype = plan, hidden.shape, scores.shape, scores.dtype
         vectors = hidden.index_select(0, plan.unique_tokens)
-        selected_scores = scores.reshape(-1).index_select(0, plan.source_choices).to(hidden.dtype)
+        if scores.dtype not in (torch.bfloat16, torch.float32) or max(
+                1, scores.element_size() // hidden.element_size()) != plan.score_lanes:
+            raise ValueError("dedup score dtype differs from the compiled peer layout")
+        ctx.transport_score_dtype = hidden.dtype if scores.element_size() < hidden.element_size() else scores.dtype
+        selected_scores = scores.reshape(-1).index_select(0, plan.source_choices).contiguous()
+        selected_scores = (selected_scores.to(hidden.dtype) if scores.element_size() < hidden.element_size()
+                           else selected_scores.view(hidden.dtype))
         payload = plan._pack(vectors, selected_scores, plan.source_pack_order, plan.source_score_pad)
         received = ep_all_to_all(payload, list(plan.source_split_rows), list(plan.target_split_rows), plan.group)
         return (received.index_select(0, plan.target_hidden_rows),
-                received.reshape(-1).index_select(0, plan.target_score_elements))
+                received.reshape(-1).index_select(
+                    0, plan.target_score_elements).contiguous().view(ctx.transport_score_dtype))
 
     @staticmethod
     @once_differentiable
@@ -122,15 +130,17 @@ class _DispatchWithScores(torch.autograd.Function):
         plan = ctx.plan
         compact = grad_hidden.new_zeros((sum(plan.backward_recv), plan.width))
         compact.index_add_(0, plan.backward_lookup, grad_hidden)
-        payload = plan._pack(compact, grad_scores.reshape(-1).to(grad_hidden.dtype),
+        score_lanes = grad_scores.reshape(-1).contiguous().view(grad_hidden.dtype)
+        payload = plan._pack(compact, score_lanes,
                              plan.backward_target_pack_order, plan.backward_target_score_pad)
         returned = ep_all_to_all(payload, list(plan.backward_target_split_rows),
                                  list(plan.backward_source_split_rows), plan.group)
         vector_gradients = returned.index_select(0, plan.backward_source_vector_rows)
-        score_gradients = returned.reshape(-1).index_select(0, plan.backward_source_score_elements)
+        score_gradients = returned.reshape(-1).index_select(
+            0, plan.backward_source_score_elements).contiguous().view(ctx.transport_score_dtype)
         hidden_gradient = grad_hidden.new_zeros(ctx.hidden_shape)
         hidden_gradient.index_add_(0, plan.backward_tokens, vector_gradients)
-        score_gradient = grad_scores.new_empty(ctx.score_shape).reshape(-1)
+        score_gradient = torch.empty(ctx.score_shape, dtype=ctx.score_dtype, device=grad_scores.device).reshape(-1)
         score_gradient.index_copy_(0, plan.source_choices, score_gradients.to(ctx.score_dtype))
         return hidden_gradient, score_gradient.reshape(ctx.score_shape), None
 
@@ -290,10 +300,12 @@ def failed_local_dedup(token_send: Sequence[int], token_recv: Sequence[int]) -> 
 
 
 def finish_dedup(local: LocalDedup, group: Any, *, device: torch.device, width: int,
-                 backward_ratio: float = 1.0) -> TokenDedup:
+                 backward_ratio: float = 1.0, score_lanes: int = 1) -> TokenDedup:
     """Exchange raw indices once and compile independent forward and backward splits."""
     if not 0.0 <= backward_ratio <= 1.0:
         raise ValueError("backward dedup ratio must be between zero and one")
+    if score_lanes not in (1, 2):
+        raise ValueError("dedup score payload requires one or two vector-element lanes per score")
     packet = local.packet.to(device)
     received = torch.empty(sum(local.packet_recv), dtype=torch.int32, device=device)
     if len(local.unique_send) == 1:
@@ -325,17 +337,19 @@ def finish_dedup(local: LocalDedup, group: Any, *, device: torch.device, width: 
     backward_lookup = backward_offsets[peers] + np.where(backward_compressed[peers], raw_slots, dense_slots)
     unique_recv = tuple(forward_counts.tolist())
     backward_recv = tuple(backward_counts.tolist())
-    source_counts = tuple(count - 1 for count in local.packet_send)
-    target_counts = tuple(count - 1 for count in local.packet_recv)
+    source_rows = tuple(count - 1 for count in local.packet_send)
+    target_rows = tuple(count - 1 for count in local.packet_recv)
+    source_score_lanes = tuple(count * score_lanes for count in source_rows)
+    target_score_lanes = tuple(count * score_lanes for count in target_rows)
     _, _, source_split_rows, source_pack_order, source_score_pad = _layout_indices(
-        local.unique_send, source_counts, width)
+        local.unique_send, source_score_lanes, width)
     target_vector_rows, target_score_elements, target_split_rows, _, _ = _layout_indices(
-        unique_recv, target_counts, width, include_pack=False)
+        unique_recv, target_score_lanes, width, include_pack=False)
     target_hidden_rows = np.asarray(target_vector_rows, dtype=np.int64)[lookup]
     backward_source_vector_rows, backward_source_score_elements, backward_source_split_rows, _, _ = _layout_indices(
-        local.backward_send, source_counts, width, include_pack=False)
+        local.backward_send, source_score_lanes, width, include_pack=False)
     _, _, backward_target_split_rows, backward_target_pack_order, backward_target_score_pad = _layout_indices(
-        backward_recv, target_counts, width)
+        backward_recv, target_score_lanes, width)
     indices = (local.unique_tokens.numpy(), local.backward_tokens.numpy(), local.source_choices.numpy(),
                lookup, backward_lookup, target_hidden_rows, target_score_elements,
                source_pack_order, source_score_pad, backward_source_vector_rows,
@@ -349,9 +363,10 @@ def finish_dedup(local: LocalDedup, group: Any, *, device: torch.device, width: 
      backward_target_score_pad_device) = torch.from_numpy(packed).to(device).split(lengths)
     return TokenDedup(
         unique_tokens=unique_tokens, unique_send=local.unique_send, unique_recv=unique_recv,
-        original_send_rows=sum(source_counts), receive_lookup=receive_lookup,
+        original_send_rows=sum(source_rows), receive_lookup=receive_lookup,
         backward_tokens=backward_tokens, backward_send=local.backward_send, backward_recv=backward_recv,
-        backward_lookup=backward_lookup_device, source_choices=source_choices, width=width, group=group,
+        backward_lookup=backward_lookup_device, source_choices=source_choices, width=width,
+        score_lanes=score_lanes, group=group,
         target_hidden_rows=target_hidden_rows_device, target_score_elements=target_score_elements_device,
         source_split_rows=source_split_rows, target_split_rows=target_split_rows,
         source_pack_order=source_pack_order_device, source_score_pad=source_score_pad_device,

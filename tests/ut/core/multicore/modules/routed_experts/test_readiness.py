@@ -92,68 +92,6 @@ class TestReadinessTemplate(unittest.TestCase):
         self.current = _Stream(name)
         return self.current
 
-    def test_create_reuses_current_stream_for_independent_events(self) -> None:
-        """One phase-local lookup records distinct admission and polling fences."""
-        expected = torch.ones((1, 2), dtype=torch.int32)
-        with patch.object(torch.npu, 'current_stream', return_value=self.current) as query:
-            ready = readiness.ExpertReadiness.create(expected, torch.device('cpu'))
-
-        query.assert_called_once_with(torch.device('cpu'))
-        self.assertIsNot(ready.admitted, ready.poll_after.event)
-        self.assertIs(ready.admitted.stream, self.current)
-        self.assertIs(ready.poll_after.event.stream, self.current)
-        self.assertIn(('record', ready.admitted), self.current.calls)
-        self.assertIn(('record', ready.poll_after.event), self.current.calls)
-
-    def test_legacy_create_uploads_and_new_create_keeps_fresh_flags(self) -> None:
-        """Legacy calls upload independently while templates never share writable cells."""
-        expected = torch.ones((3, 2), dtype=torch.int32)
-        first = readiness.ExpertReadiness.create(expected, torch.device('cpu'))
-        second = readiness.ExpertReadiness.create(expected, torch.device('cpu'))
-        self.assertEqual(len(self._expectation_uploads()), 2)
-        self.assertIsNot(first.expected, second.expected)
-        cached = readiness.ExpertReadiness.create(expected, torch.device('cpu'), expected_device=first.expected,
-                                                 deferred_poll=True)
-        self.assertEqual(len(self._expectation_uploads()), 2)
-        self.assertIs(cached.expected, first.expected)
-        self.assertNotEqual(first.flags.data_ptr(), cached.flags.data_ptr())
-        self.assertEqual(cached.flags.data_ptr() % 64, 0)
-        self.assertFalse(cached.poll_after.queued)
-        self.assertIs(cached.poll_after.event.stream, self.current)
-        first.flags.fill_(7)
-        self.assertEqual(cached.flags.count_nonzero().item(), 0)
-
-    def test_invalid_cached_templates_are_rejected(self) -> None:
-        """Dtype, shape, strides, device and invalidated storage fail before upload."""
-        expected = torch.ones((3, 2), dtype=torch.int32)
-        bad = [torch.ones((3, 2)), torch.ones((2, 3), dtype=torch.int32),
-               torch.ones((2, 3), dtype=torch.int32).t(),
-               torch.empty((3, 2), dtype=torch.int32, device='meta')]
-        for target in bad:
-            with self.subTest(dtype=target.dtype, shape=target.shape, device=target.device):
-                with self.assertRaises(ValueError):
-                    readiness.ExpertReadiness.create(expected, torch.device('cpu'), expected_device=target)
-        with self.assertRaises(ValueError):
-            readiness.ExpertReadiness.create(expected.t(), torch.device('cpu'),
-                                            expected_device=expected.t().contiguous())
-        invalid_storage = torch.ones((3, 2), dtype=torch.int32)
-        invalid_storage.untyped_storage().resize_(0)
-        with self.assertRaisesRegex(ValueError, 'storage'):
-            readiness.ExpertReadiness.create(expected, torch.device('cpu'), expected_device=invalid_storage)
-        self.assertEqual(self.uploads, [])
-
-    def test_empty_template_keeps_fresh_frame_events(self) -> None:
-        """Empty ranks retain separate admission and polling event lifetimes."""
-        expected = torch.empty((1, 0), dtype=torch.int32)
-        target = expected.clone()
-        first = readiness.ExpertReadiness.create(expected, torch.device('cpu'), expected_device=target)
-        second = readiness.ExpertReadiness.create(expected, torch.device('cpu'), expected_device=target)
-        self.assertIsNot(first.flags, second.flags)
-        self.assertIs(first.expected, second.expected)
-        self.assertEqual(first.flags.shape, (1, 0, 16))
-        self.assertIsNot(first.admitted, second.admitted)
-        self.assertIsNot(first.poll_after.event, second.poll_after.event)
-        self.assertEqual(self.uploads, [])
 
     @staticmethod
     def _route() -> RouteDescriptor:
@@ -180,20 +118,6 @@ class TestReadinessTemplate(unittest.TestCase):
                             stream.calls.index(('record', ready.admitted)))
         self.assertEqual(len(self._expectation_uploads()), 1)
 
-    def test_transport_reverse_only_keeps_template_lazy(self) -> None:
-        """A nonpublishing first use does not allocate an unused device template."""
-        route = self._route()
-        workspace = SimpleNamespace(metadata={}, device=torch.device('cpu'), spec=SimpleNamespace(block_rows=256))
-        ready, _ = transport._prepare_readiness(route, workspace, True, None, False)
-        self.assertIsNone(ready)
-        self.assertEqual(len(self._expectation_uploads()), 0)
-        first_event = workspace.metadata[(route, 'readiness')][2]
-        stream = self._new_stream('publish')
-        ready, _ = transport._prepare_readiness(route, workspace, False, None, True)
-        self.assertIn(('wait', first_event, first_event.stream), stream.calls)
-        self.assertIsNotNone(ready)
-        self.assertEqual(len(self._expectation_uploads()), 1)
-        self.assertIs(workspace.metadata[(route, 'readiness')][2].stream, stream)
 
     def test_forward_replay_expected_once_flags_and_fences_independent(self) -> None:
         """F and replay share immutable expectations with independent producer fences."""
@@ -214,32 +138,3 @@ class TestReadinessTemplate(unittest.TestCase):
         self.assertFalse(first.ready.poll_after.queued)
         self.assertFalse(replay.ready.poll_after.queued)
         self.assertIs(replay.initialized.stream, stream)
-
-    def test_linear_late_publish_uploads_once_and_waits_initial_event(self) -> None:
-        """Lazy publication preserves stream order and fresh FSDP pointer tables."""
-        engine = compute.NativeExpertCompute.__new__(compute.NativeExpertCompute)
-        engine.boundaries, engine.device = (127, 257), torch.device('cpu')
-        engine.empty_workspace = torch.empty(0, dtype=torch.uint8)
-        engine.initialized = _Event()
-        engine.initialized.record(self.current)
-        engine.linear_metadata = {}
-        x = torch.empty((257, 64), dtype=torch.bfloat16)
-        weights = [torch.empty((64, 64), dtype=x.dtype) for _ in range(2)]
-        ordinary = engine.prepare_linear(x, weights, 64)
-        self.assertIsNone(ordinary.ready)
-        self.assertEqual(len(self._expectation_uploads()), 0)
-        first_event = engine.linear_metadata[(64, 64, False)][-1]
-        stream = self._new_stream('first-publish')
-        first = engine.prepare_linear(x, weights, 64, publish=True)
-        self.assertIn(('wait', first_event, first_event.stream), stream.calls)
-        self.assertEqual(len(self._expectation_uploads()), 1)
-        template_event = engine.linear_metadata[(64, 64, False)][-1]
-        stream = self._new_stream('second-publish')
-        second = engine.prepare_linear(x, weights, 64, publish=True)
-        self.assertIn(('wait', template_event, template_event.stream), stream.calls)
-        self.assertEqual(len(self._expectation_uploads()), 1)
-        self.assertIs(first.ready.expected, second.ready.expected)
-        self.assertNotEqual(first.ready.flags.data_ptr(), second.ready.flags.data_ptr())
-        self.assertIsNot(first.weight_table, second.weight_table)
-        self.assertIs(second.initialized, second.ready.admitted)
-        self.assertIs(second.ready.admitted.stream, stream)

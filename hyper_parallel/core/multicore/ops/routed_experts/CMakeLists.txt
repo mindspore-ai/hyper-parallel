@@ -18,7 +18,7 @@ set(SDK_ROOT $ENV{SHMEM_HOME_PATH})
 
 add_library(hyper_parallel_routed_experts_kernels SHARED
     transport.cpp gemm.cpp gemm_host.cpp gradient.cpp gradient_host.cpp combine.cpp combine_backward.cpp
-    forward.cpp forward_vector.cpp forward_host.cpp)
+    forward.cpp forward_vector.cpp forward_host.cpp activation.cpp)
 set_source_files_properties(gemm.cpp gradient.cpp forward.cpp PROPERTIES COMPILE_OPTIONS
     "--cce-aicore-arch=dav-c220-cube;-DASCENDC_CUBE_ONLY")
 target_compile_options(hyper_parallel_routed_experts_kernels PRIVATE

@@ -172,7 +172,7 @@ class NativeExpertCompute:
         self.linear_metadata: dict[tuple, tuple] = {}
         self.gradient_metadata: dict[tuple, tuple] = {}
         self.forward_pipeline = ForwardPipeline(
-            boundaries, device, vector_stream, 0 if self.swiglu_limit is not None else vector_workers)
+            boundaries, device, vector_stream, vector_workers, self.swiglu_limit)
 
     def _activate(self, preact: torch.Tensor, output: torch.Tensor) -> None:
         """Fill the admitted activation buffer using the model's SwiGLU rule."""
@@ -180,10 +180,13 @@ class NativeExpertCompute:
         if limit is None:
             torch.ops.hyper_parallel.routed_experts_swiglu(preact, output)
             return
-        gate, up = preact.chunk(2, dim=-1)
-        gate = gate.float().clamp_(max=limit)
-        up = up.float().clamp_(min=-limit, max=limit)
-        output.copy_((torch.nn.functional.silu(gate) * up).to(output.dtype))
+        if preact.device.type != "npu":
+            gate, up = preact.chunk(2, dim=-1)
+            gate = gate.float().clamp_(max=limit)
+            up = up.float().clamp_(min=-limit, max=limit)
+            output.copy_((torch.nn.functional.silu(gate) * up).to(output.dtype))
+            return
+        torch.ops.hyper_parallel.routed_experts_clipped_swiglu(preact, output, limit)
 
     def _activation_gradient(self, derivative: torch.Tensor, preact: torch.Tensor,
                              output: torch.Tensor) -> None:
@@ -192,17 +195,20 @@ class NativeExpertCompute:
         if limit is None:
             torch.ops.hyper_parallel.routed_experts_swiglu_backward(derivative, preact, output)
             return
-        raw_gate, raw_up = preact.chunk(2, dim=-1)
-        gate = raw_gate.float().clamp_(max=limit)
-        up = raw_up.float().clamp_(min=-limit, max=limit)
-        sigmoid = gate.sigmoid()
-        silu = gate * sigmoid
-        dy = derivative.float()
-        middle = raw_gate.shape[-1]
-        output[:, :middle].copy_((dy * up * sigmoid * (1 + gate * (1 - sigmoid))
-                                   * (raw_gate <= limit)).to(output.dtype))
-        output[:, middle:].copy_((dy * silu * (raw_up >= -limit)
-                                   * (raw_up <= limit)).to(output.dtype))
+        if preact.device.type != "npu":
+            raw_gate, raw_up = preact.chunk(2, dim=-1)
+            gate = raw_gate.float().clamp_(max=limit)
+            up = raw_up.float().clamp_(min=-limit, max=limit)
+            sigmoid = gate.sigmoid()
+            silu = gate * sigmoid
+            dy = derivative.float()
+            middle = raw_gate.shape[-1]
+            output[:, :middle].copy_((dy * up * sigmoid * (1 + gate * (1 - sigmoid))
+                                       * (raw_gate <= limit)).to(output.dtype))
+            output[:, middle:].copy_((dy * silu * (raw_up >= -limit)
+                                       * (raw_up <= limit)).to(output.dtype))
+            return
+        torch.ops.hyper_parallel.routed_experts_clipped_swiglu_backward(derivative, preact, output, limit)
 
     def _check_input(self, value: torch.Tensor, name: str) -> None:
         """Check one packed matrix without reading device contents."""
@@ -524,7 +530,7 @@ class NativeExpertCompute:
 
 def combine(values: torch.Tensor, inverse_order: torch.Tensor, scores: torch.Tensor | None,
             tokens: int, top_k: int, *, output: torch.Tensor | None = None) -> torch.Tensor:
-    """Sum original top-k slots, optionally into an admitted output allocation."""
+    """Sum top-k slots into BF16 output, retaining FP32 score products when supplied."""
     _load_native()
     if values.ndim != 2:
         raise ValueError("combine values must be a packed matrix")
@@ -537,7 +543,7 @@ def combine(values: torch.Tensor, inverse_order: torch.Tensor, scores: torch.Ten
 
 def combine_gradient(dy: torch.Tensor, values: torch.Tensor, order: torch.Tensor, scores: torch.Tensor, *,
                      outputs: tuple[torch.Tensor, torch.Tensor] | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute source derivatives, optionally using admitted value/score outputs."""
+    """Compute BF16 value and score-matched gradients into admitted outputs."""
     _load_native()
     if outputs is None:
         dv, ds = torch.empty_like(values), torch.empty_like(scores)

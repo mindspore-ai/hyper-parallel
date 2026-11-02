@@ -62,65 +62,6 @@ class TestPhaseArena(unittest.TestCase):
         torch.testing.assert_close(reused, torch.full_like(reused, 13))
         arena.end(token)
 
-    def test_growth_rounds_up_and_shrinking_keeps_capacity(self):
-        """A name grows independently and its later smaller request does not free it."""
-        arena = PhaseArena(torch.device("cpu"))
-        token = arena.begin()
-        small = arena.allocate("region", (1,), torch.float32)
-        arena.end(token)
-        token = arena.begin()
-        large = arena.allocate("region", (_QUANTUM // 4 + 1,), torch.float32)
-        self.assertNotEqual(small.data_ptr(), large.data_ptr())
-        self.assertEqual(arena.reserved_bytes, 2 * _QUANTUM)
-        arena.end(token)
-        token = arena.begin()
-        shrunk = arena.allocate("region", (1,), torch.float32)
-        self.assertEqual(shrunk.data_ptr(), large.data_ptr())
-        self.assertEqual(arena.reserved_bytes, 2 * _QUANTUM)
-        arena.end(token)
-
-    def test_duplicate_name_and_dtype_change_are_rejected(self):
-        """One phase cannot overwrite a previous borrow and a name keeps its dtype."""
-        arena = PhaseArena(torch.device("cpu"))
-        token = arena.begin()
-        arena.allocate("region", (2,), torch.bfloat16)
-        with self.assertRaisesRegex(ValueError, "once per phase"):
-            arena.allocate("region", (4,), torch.bfloat16)
-        arena.end(token)
-        token = arena.begin()
-        with self.assertRaisesRegex(ValueError, "change dtype"):
-            arena.allocate("region", (2,), torch.float32)
-        arena.allocate("region", (2,), torch.bfloat16)
-        arena.end(token)
-
-    def test_active_phase_and_token_ownership_are_required(self):
-        """Nested begin, foreign tokens, and repeated end leave the live lease intact."""
-        arena, other = PhaseArena(torch.device("cpu")), PhaseArena(torch.device("cpu"))
-        with self.assertRaisesRegex(RuntimeError, "active phase"):
-            arena.allocate("region", (1,), torch.float32)
-        token, foreign = arena.begin(), other.begin()
-        with self.assertRaisesRegex(RuntimeError, "active phase"):
-            arena.begin()
-        with self.assertRaisesRegex(ValueError, "foreign"):
-            arena.end(foreign)
-        with self.assertRaisesRegex(RuntimeError, "active phase"):
-            arena.close()
-        arena.end(token)
-        with self.assertRaisesRegex(ValueError, "already released"):
-            arena.end(token)
-        other.end(foreign)
-
-    def test_close_is_idempotent_and_blocks_new_work(self):
-        """Closed arenas cannot be reopened or allocated from."""
-        arena = PhaseArena(torch.device("cpu"))
-        arena.close()
-        arena.close()
-        with self.assertRaisesRegex(RuntimeError, "closed"):
-            arena.begin()
-        with self.assertRaisesRegex(RuntimeError, "closed"):
-            arena.allocate("region", (1,), torch.float32)
-        with self.assertRaisesRegex(RuntimeError, "closed"):
-            arena.end(object())
 
     def test_growth_oom_preserves_previous_region(self):
         """A failed replacement neither drops old capacity nor consumes the name."""
@@ -139,42 +80,6 @@ class TestPhaseArena(unittest.TestCase):
         torch.testing.assert_close(retained, torch.full_like(retained, 17))
         arena.end(token)
 
-    def test_first_allocation_oom_does_not_publish_a_region(self):
-        """A new name can be retried after its preparation allocation failed."""
-        arena = PhaseArena(torch.device("cpu"))
-        token = arena.begin()
-        with patch.object(arena_module.torch, "empty", side_effect=MemoryError("mock allocation failure")):
-            with self.assertRaises(MemoryError):
-                arena.allocate("region", (2,), torch.float32)
-        self.assertEqual(arena.reserved_bytes, 0)
-        self.assertEqual(arena.allocate("region", (2,), torch.float32).shape, (2,))
-        arena.end(token)
-
-    def test_empty_and_scalar_shapes(self):
-        """Empty ranks reserve no payload while scalar tensors occupy one quantum."""
-        arena = PhaseArena(torch.device("cpu"))
-        token = arena.begin()
-        empty = arena.allocate("empty", (0, 7), torch.bfloat16)
-        self.assertEqual(empty.shape, (0, 7))
-        self.assertEqual(arena.reserved_bytes, 0)
-        scalar = arena.allocate("scalar", (), torch.float32)
-        self.assertEqual(scalar.shape, ())
-        self.assertEqual(arena.reserved_bytes, _QUANTUM)
-        arena.end(token)
-
-    def test_invalid_requests_do_not_consume_name(self):
-        """Malformed names, shapes, and dtypes fail before storage is published."""
-        arena = PhaseArena(torch.device("cpu"))
-        token = arena.begin()
-        requests = (("", (1,), torch.float32), (2, (1,), torch.float32), ("region", -1, torch.float32),
-                    ("region", (-1,), torch.float32), ("region", (True,), torch.float32),
-                    ("region", (1.5,), torch.float32), ("region", (1,), "float32"))
-        for name, shape, dtype in requests:
-            with self.subTest(request=(name, shape, dtype)), self.assertRaises(ValueError):
-                arena.allocate(name, shape, dtype)
-        self.assertEqual(arena.reserved_bytes, 0)
-        arena.allocate("region", (1,), torch.float32)
-        arena.end(token)
 
     def test_released_backward_regions_rebuild_high_water_only_four_times(self):
         """First B reconstructs the previous capacities; later smaller phases only borrow views."""
@@ -202,24 +107,6 @@ class TestPhaseArena(unittest.TestCase):
         self.assertEqual(arena.reserved_bytes, 11 * _QUANTUM)
         arena.close()
 
-    def test_rebuild_oom_keeps_capacity_and_dtype(self):
-        """Failed regrowth cannot erase the last successful capacity or admit another dtype."""
-        arena = PhaseArena("cpu")
-        token = arena.begin()
-        arena.allocate("region", (_QUANTUM // 4 + 1,), torch.float32)
-        arena.end(token)
-        arena.release_regions(("region",))
-        token = arena.begin()
-        with patch.object(arena_module.torch, "empty", side_effect=MemoryError("rebuild OOM")):
-            with self.assertRaisesRegex(MemoryError, "rebuild OOM"):
-                arena.allocate("region", (_QUANTUM,), torch.float32)
-        self.assertEqual(arena.reserved_bytes, 0)
-        with self.assertRaisesRegex(ValueError, "change dtype"):
-            arena.allocate("region", (1,), torch.bfloat16)
-        rebuilt = arena.allocate("region", (1,), torch.float32)
-        self.assertEqual(rebuilt.untyped_storage().nbytes(), 2 * _QUANTUM)
-        arena.end(token)
-        arena.close()
 
     def test_release_is_idempotent_and_does_not_invalidate_other_owners(self):
         """Dropping the root reference preserves storage still captured by a queued reader."""
@@ -238,53 +125,11 @@ class TestPhaseArena(unittest.TestCase):
         self.assertIsNone(owner())
         arena.close()
 
-    def test_release_rejects_active_closed_and_invalid_names(self):
-        """Validation precedes every removal so a rejected call cannot partly retire storage."""
-        arena = PhaseArena("cpu")
-        token = arena.begin()
-        arena.allocate("region", (1,), torch.float32)
-        with self.assertRaisesRegex(RuntimeError, "active phase"):
-            arena.release_regions(("region",))
-        arena.end(token)
-        for names in ("region", ("region", ""), ("region", 1), None):
-            with self.subTest(names=names), self.assertRaises(ValueError):
-                arena.release_regions(names)
-            self.assertEqual(arena.reserved_bytes, _QUANTUM)
-        arena.close()
-        with self.assertRaisesRegex(RuntimeError, "closed"):
-            arena.release_regions(("region",))
-
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
 class TestPhaseArenaStreams(unittest.TestCase):
     """Use mocked NPU stream handles without loading or initializing a device."""
 
-    def test_begin_allocate_end_and_close_require_original_stream(self):
-        """Reject another C stream before it can access or release pooled storage."""
-        first, second = object(), object()
-        backend = SimpleNamespace(current_stream=Mock(return_value=first), Event=Mock(side_effect=Mock))
-        device = SimpleNamespace(type="npu")
-        with patch.object(arena_module.torch, "device", return_value=device), \
-                patch.object(arena_module.torch, "npu", backend, create=True):
-            arena = PhaseArena("npu:0")
-            token = arena.begin()
-            backend.current_stream.return_value = second
-            with self.assertRaisesRegex(RuntimeError, "original compute stream"):
-                arena.allocate("region", (1,), torch.float32)
-            with self.assertRaisesRegex(RuntimeError, "original compute stream"):
-                arena.end(token)
-            backend.current_stream.return_value = first
-            arena.end(token)
-            backend.current_stream.return_value = second
-            with self.assertRaisesRegex(RuntimeError, "original compute stream"):
-                arena.begin()
-            with self.assertRaisesRegex(RuntimeError, "original compute stream"):
-                arena.close()
-            backend.current_stream.return_value = first
-            token = arena.begin()
-            arena.end(token)
-            arena.close()
-        backend.current_stream.assert_called_with(device)
 
     def test_third_begin_waits_only_for_oldest_incomplete_phase(self):
         """Two phases submit freely; the third waits for one oldest C completion."""

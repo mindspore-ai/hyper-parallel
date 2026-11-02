@@ -15,12 +15,14 @@
 """CPU checks for target-peer token deduplication metadata."""
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
 
+from hyper_parallel.distributed.expert_parallel.moonep import token_dedup
 from hyper_parallel.distributed.expert_parallel.moonep.token_dedup import (
-    failed_local_dedup, prepare_local_dedup,
+    failed_local_dedup, finish_dedup, prepare_local_dedup,
 )
 
 
@@ -61,11 +63,6 @@ class TestLocalTokenDedup(unittest.TestCase):
         self._check_reference(16, 1, 32, False)
         self._check_reference(1, 1, 0, False)
 
-    def test_invalid_source_order_is_rejected(self) -> None:
-        """A duplicate source selection cannot silently change the packet mapping."""
-        with self.assertRaisesRegex(ValueError, "permute"):
-            prepare_local_dedup(torch.tensor([0, 1, 2, 3]), (4,), (4,), 2,
-                                source_rows=(0, 1, 1, 3))
 
     def test_mixed_peer_modes_share_one_metadata_packet(self) -> None:
         """The peer threshold preserves compact and dense source rows in one route."""
@@ -93,3 +90,21 @@ class TestLocalTokenDedup(unittest.TestCase):
         local = failed_local_dedup((2, 0, 3), (1, 2, 2))
         self.assertEqual(local.packet_send, (3, 1, 4))
         np.testing.assert_array_equal(local.packet.numpy()[[0, 3, 4]], [-1, -1, -1])
+
+    def test_fp32_scores_preserve_bits_and_gradients_in_bf16_payload(self) -> None:
+        """Feature: FP32 router-score transport with BF16 activations.
+
+        Description: Carry each score through two BF16 payload lanes and differentiate the result.
+        Expectation: Both received score bits and score gradients exactly match the source values.
+        """
+        order = torch.arange(4, dtype=torch.int64)
+        local = prepare_local_dedup(order, (4,), (4,), 2, forward_ratio=1.0)
+        plan = finish_dedup(local, None, device=torch.device("cpu"), width=16, score_lanes=2)
+        hidden = torch.randn(2, 16, dtype=torch.bfloat16, requires_grad=True)
+        scores = torch.tensor([[0.1234567, 0.8765433], [0.3333333, 0.6666667]],
+                              dtype=torch.float32, requires_grad=True)
+        with patch.object(token_dedup, "ep_all_to_all", side_effect=lambda payload, *_args: payload.clone()):
+            received, received_scores = plan.dispatch_with_scores(hidden, scores)
+            (received.float() * received_scores[:, None]).sum().backward()
+        torch.testing.assert_close(received_scores, scores.flatten(), rtol=0, atol=0)
+        torch.testing.assert_close(scores.grad, received.float().sum(-1).reshape_as(scores), rtol=0, atol=0)

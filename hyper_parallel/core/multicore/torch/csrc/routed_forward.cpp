@@ -15,6 +15,8 @@
 
 #include <ATen/ATen.h>
 #include <torch/library.h>
+#include <cmath>
+#include <limits>
 #include <vector>
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUGuard.h"
@@ -219,7 +221,11 @@ void Cube(const at::Tensor &x, at::TensorList gate, at::TensorList down,
 }
 
 void Vector(const at::Tensor &z, at::Tensor activation, const at::Tensor &tasks, at::Tensor mailboxes,
-            int64_t experts, int64_t tile_rows, int64_t cores, int64_t vector_cores, int64_t watchdog) {
+            int64_t experts, int64_t tile_rows, int64_t cores, int64_t vector_cores, int64_t watchdog,
+            double clamp_limit) {
+  TORCH_CHECK(std::isfinite(clamp_limit) && clamp_limit >= 0 &&
+              clamp_limit <= std::numeric_limits<float>::max(),
+              "forward activation clamp limit must be zero or a finite positive float32 value");
   const auto keepalive = CheckVector(z, activation, tasks, mailboxes, experts, tile_rows,
                                      cores, vector_cores, watchdog);
   const c10_npu::NPUGuard guard(z.device());
@@ -231,7 +237,8 @@ void Vector(const at::Tensor &z, at::Tensor activation, const at::Tensor &tasks,
   at_npu::native::OpCommand::RunOpApi("RoutedExpertsForwardVector", [=]() -> int {
     static_cast<void>(keepalive);
     return RoutedExpertsForwardVector(stream.stream(false), z.data_ptr(), activation.data_ptr(), tasks.data_ptr(),
-      mailboxes.data_ptr(), z.size(0), experts, 768, tasks.size(0), tile_rows, cores, vector_cores, watchdog);
+      mailboxes.data_ptr(), z.size(0), experts, 768, tasks.size(0), tile_rows, cores, vector_cores, watchdog,
+      static_cast<float>(clamp_limit));
   });
 }
 
@@ -248,5 +255,6 @@ TORCH_LIBRARY_FRAGMENT(hyper_parallel, library) {
               "Tensor config, Tensor(d!) mailboxes, int tile_rows, bool transpose, int cores, int watchdog, "
               "Tensor? input_ready=None, Tensor? input_expected=None, Tensor(e!)? output_ready=None) -> ()", &Cube);
   library.def("routed_experts_forward_vector(Tensor z, Tensor(a!) activation, Tensor tasks, Tensor(b!) mailboxes, "
-              "int experts, int tile_rows, int cores, int vector_cores, int watchdog) -> ()", &Vector);
+              "int experts, int tile_rows, int cores, int vector_cores, int watchdog, "
+              "float clamp_limit=0.0) -> ()", &Vector);
 }

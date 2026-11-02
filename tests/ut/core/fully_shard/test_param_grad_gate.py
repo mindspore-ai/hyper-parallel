@@ -29,8 +29,6 @@ from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
 from hyper_parallel.core.fully_shard.hsdp_utils import FSDPSchedulerState
 
 
-
-
 @pytest.fixture(autouse=True)
 def cpu_checkpoint_device():
     """固定 CPU 回归的重计算设备；例如安装 torch_npu 时也不触发设备初始化。"""
@@ -184,17 +182,6 @@ def test_param_grad_gate_preserves_no_sync_accumulation(checkpoint_enabled: bool
     assert len(scheduler._param_grad_handles) == 2
 
 
-
-
-
-
-
-
-
-
-
-
-
 def test_backward_pre_hook_rearms_gate_once_per_backward():
     """两次独立反向不复用旧ready；例如 B2 完成后 B1 仍须等待本次两个 AccumulateGrad。"""
     scheduler = object.__new__(HSDPSchedulerV2)
@@ -205,7 +192,7 @@ def test_backward_pre_hook_rearms_gate_once_per_backward():
     scheduler._param_grad_input_done = True
     scheduler._is_root = False
     scheduler.cell = None
-    scheduler.scheduler_ctx = types.SimpleNamespace(root_bp_state=False)
+    scheduler.scheduler_ctx = types.SimpleNamespace(root_bp_state=False, post_backward_final_callback_queued=True)
     scheduler._hsdp_backward_pre_hook = lambda *_args: setattr(
         scheduler, 'scheduler_state', FSDPSchedulerState.PRE_BACKWARD)
     gradient = torch.ones(1)

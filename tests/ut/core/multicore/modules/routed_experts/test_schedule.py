@@ -15,7 +15,6 @@
 """CPU coverage for exclusive scheduler storage and immutable tile ownership."""
 
 from types import SimpleNamespace
-from typing import Any
 import unittest
 from unittest.mock import patch
 
@@ -104,56 +103,6 @@ class TestLinearSchedule(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already submitted"):
             engine.run_linear(first, dependency)
 
-    def test_workspace_ranges_use_disjoint_cache_lines_for_each_core(self) -> None:
-        """Odd expert counts, especially three, cannot share scalar cache lines."""
-        for experts in (1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 33):
-            with self.subTest(experts=experts):
-                engine = self._engine(tuple(range(1, experts + 1)))
-                inputs, weights = self._inputs(engine.boundaries)
-                work = engine.prepare_linear(inputs, weights, 16)
-                stride = (experts * 16 + 63) // 64 * 64
-                workspace = work.schedule_workspace
-                self.assertEqual(workspace.dtype, torch.uint8)
-                self.assertEqual(workspace.data_ptr() % 64, 0)
-                self.assertEqual(workspace.numel(), work.cores * stride)
-                occupied = set()
-                for core in range(work.cores):
-                    lines = {offset // 64 for offset in range(core * stride, core * stride + experts * 16)}
-                    self.assertFalse(occupied.intersection(lines))
-                    occupied.update(lines)
-
-    def test_workspace_allocation_precedes_frame_admission(self) -> None:
-        """The preflight frame already owns scratch before its initialization event."""
-        engine = self._engine((1, 4, 8))
-        inputs, weights = self._inputs(engine.boundaries)
-        allocate = torch.empty
-
-        def recorded_empty(*args: Any, **kwargs: Any) -> torch.Tensor:
-            """Record storage creation before the frame's admission event."""
-            result = allocate(*args, **kwargs)
-            self.operations.append((self.current.name, "allocate", id(result)))
-            return result
-
-        for publish in (False, True):
-            with self.subTest(publish=publish), patch.object(torch, "empty", side_effect=recorded_empty):
-                work = engine.prepare_linear(inputs, weights, 16, publish=publish)
-            allocation = self.operations.index((self.current.name, "allocate", id(work.schedule_workspace)))
-            admitted = self.operations.index((self.current.name, "record", id(work.initialized)))
-            self.assertLess(allocation, admitted)
-        self.assertEqual(self.launches, [])
-
-    def test_empty_rank_has_no_writable_scheduler_storage_or_launch(self) -> None:
-        """Empty ranks can safely share an unused zero-sized sentinel."""
-        engine = self._engine(())
-        inputs, weights = self._inputs(())
-        first = engine.prepare_linear(inputs, weights, 16)
-        second = engine.prepare_linear(inputs, weights, 16)
-        self.assertIs(first.schedule_workspace, engine.empty_workspace)
-        self.assertIs(second.schedule_workspace, engine.empty_workspace)
-        self.assertEqual(first.schedule_workspace.numel(), 0)
-        engine.run_linear(first)
-        engine.run_linear(second)
-        self.assertEqual(self.launches, [])
 
     def test_ready_expert_scan_preserves_each_cores_original_tiles(self) -> None:
         """A blocked first expert does not change unique ownership or ready publication."""

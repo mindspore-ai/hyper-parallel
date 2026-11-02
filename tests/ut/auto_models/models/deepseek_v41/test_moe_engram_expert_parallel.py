@@ -480,7 +480,7 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
                                  ((4, 16, 48), (4, 24, 16)))
                 with patch.object(SparseMoonEPExecutor, "__call__", return_value=torch.zeros(1, 2, 16)) as invoke:
                     compute(module, torch.randn(1, 2, 16, dtype=torch.bfloat16))
-                self.assertEqual(invoke.call_args.args[2].dtype, torch.bfloat16)
+                self.assertEqual(invoke.call_args.args[2].dtype, torch.float32)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")

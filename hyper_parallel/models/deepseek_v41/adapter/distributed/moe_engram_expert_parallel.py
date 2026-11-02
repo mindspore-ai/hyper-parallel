@@ -110,8 +110,8 @@ def _deepseek_v41_moonep_expert_forward(
     """
     executor = experts._moonep_executor  # pylint: disable=protected-access
     if isinstance(executor, SparseMoonEPExecutor):
-        # The native combine follows lifecycle MoonEP's BF16 weighted-return rule.
-        top_k_weights = top_k_weights.to(hidden_states.dtype).contiguous()
+        # Keep router precision for the fused combine and its score gradient.
+        top_k_weights = top_k_weights.contiguous()
     return executor(
         hidden_states, top_k_index, top_k_weights,
         expert_weights=_deepseek_moonep_weights(experts),

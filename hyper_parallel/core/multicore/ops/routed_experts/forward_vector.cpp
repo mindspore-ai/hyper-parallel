@@ -16,6 +16,7 @@
 #include "forward_common.h"
 #include "forward.h"
 #include "acl/acl.h"
+#include <cmath>
 #include <initializer_list>
 
 namespace {
@@ -38,8 +39,9 @@ inline bool InvalidVectorStorage(std::initializer_list<const void *> operands, v
 
 class ActivationWorker {
  public:
-  __aicore__ inline void Init(GM_ADDR z, GM_ADDR activation, int32_t inner) {
+  __aicore__ inline void Init(GM_ADDR z, GM_ADDR activation, int32_t inner, float clamp_limit) {
     inner_ = inner;
+    clamp_limit_ = clamp_limit;
     source_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(z));
     destination_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(activation));
     destination_.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
@@ -73,6 +75,10 @@ class ActivationWorker {
         WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
         Cast(source_float, gate, RoundMode::CAST_NONE, elements);
         PipeBarrier<PIPE_V>();
+        if (clamp_limit_ > 0.0F) {
+          Mins(source_float, source_float, clamp_limit_, elements);
+          PipeBarrier<PIPE_V>();
+        }
         Muls(result_float, source_float, -1.0F, elements);
         PipeBarrier<PIPE_V>();
         Exp(result_float, result_float, elements);
@@ -83,6 +89,12 @@ class ActivationWorker {
         PipeBarrier<PIPE_V>();
         Cast(source_float, value, RoundMode::CAST_NONE, elements);
         PipeBarrier<PIPE_V>();
+        if (clamp_limit_ > 0.0F) {
+          Mins(source_float, source_float, clamp_limit_, elements);
+          PipeBarrier<PIPE_V>();
+          Maxs(source_float, source_float, -clamp_limit_, elements);
+          PipeBarrier<PIPE_V>();
+        }
         Mul(result_float, result_float, source_float, elements);
         PipeBarrier<PIPE_V>();
         Cast(result, result_float, RoundMode::CAST_RINT, elements);
@@ -108,13 +120,14 @@ class ActivationWorker {
   TBuf<TPosition::VECCALC> source_float_buffer_, result_float_buffer_;
   GlobalTensor<bfloat16_t> source_, destination_;
   int32_t inner_ = 0;
+  float clamp_limit_ = 0;
 };
 
 __global__ __aicore__ void VectorKernel(GM_ADDR z, GM_ADDR activation, GM_ADDR tasks, GM_ADDR mailboxes,
                                         int32_t rows, int32_t experts, int32_t inner, int32_t task_count,
-                                        int32_t tile_rows, int32_t cores, int64_t watchdog) {
+                                        int32_t tile_rows, int32_t cores, int64_t watchdog, float clamp_limit) {
   ActivationWorker worker;
-  worker.Init(z, activation, inner);
+  worker.Init(z, activation, inner, clamp_limit);
   const auto *descriptors = reinterpret_cast<__gm__ int64_t *>(tasks);
   auto *cells = reinterpret_cast<__gm__ int32_t *>(mailboxes);
   int32_t completed[24] = {};
@@ -162,8 +175,12 @@ __global__ __aicore__ void VectorKernel(GM_ADDR z, GM_ADDR activation, GM_ADDR t
 
 extern "C" int RoutedExpertsForwardVector(void *stream, void *z, void *activation, void *tasks, void *mailboxes,
                                 int32_t rows, int32_t experts, int32_t inner, int32_t task_count,
-                                int32_t tile_rows, int32_t cores, int32_t vector_cores, int64_t watchdog) {
+                                int32_t tile_rows, int32_t cores, int32_t vector_cores, int64_t watchdog,
+                                float clamp_limit) {
   if (InvalidVectorGeometry(rows, experts, inner, task_count, tile_rows, cores, vector_cores, watchdog)) {
+    return -1;
+  }
+  if (!std::isfinite(clamp_limit) || clamp_limit < 0.0F) {
     return -1;
   }
   if (rows == 0) {
@@ -181,6 +198,6 @@ extern "C" int RoutedExpertsForwardVector(void *stream, void *z, void *activatio
   }
   VectorKernel<<<vector_cores, nullptr, stream>>>(static_cast<uint8_t *>(z), static_cast<uint8_t *>(activation),
     static_cast<uint8_t *>(tasks), static_cast<uint8_t *>(mailboxes), rows, experts, inner, task_count,
-    tile_rows, cores, watchdog);
+    tile_rows, cores, watchdog, clamp_limit);
   return static_cast<int>(aclrtGetLastError(ACL_RT_THREAD_LEVEL));
 }

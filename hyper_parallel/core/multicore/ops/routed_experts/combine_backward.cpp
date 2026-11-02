@@ -22,13 +22,17 @@ namespace {
 class CombineBackwardWorker {
  public:
   __aicore__ inline void Init(GM_ADDR dy, GM_ADDR values, GM_ADDR order, GM_ADDR scores, GM_ADDR dv, GM_ADDR ds,
-                              int64_t tokens, int64_t selections, int32_t hidden, int32_t top_k) {
+                              int64_t tokens, int64_t selections, int32_t hidden, int32_t top_k,
+                              bool score_is_fp32) {
     dy_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(dy), tokens * hidden);
     values_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(values), selections * hidden);
     dv_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(dv), selections * hidden);
     ds_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(ds), selections);
+    ds_fp32_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(ds), selections);
     order_ = reinterpret_cast<__gm__ int64_t *>(order);
     scores_ = reinterpret_cast<__gm__ uint16_t *>(scores);
+    scores_fp32_ = reinterpret_cast<__gm__ float *>(scores);
+    score_is_fp32_ = score_is_fp32;
     selections_ = selections;
     hidden_ = hidden;
     top_k_ = top_k;
@@ -46,6 +50,7 @@ class CombineBackwardWorker {
     value_input_ = value_input_buffer_.Get<bfloat16_t>();
     rounded_ = output_buffer_.Get<bfloat16_t>();
     score_output_ = score_output_buffer_.Get<bfloat16_t>();
+    score_output_fp32_ = score_output_buffer_.Get<float>();
     dy_float_ = dy_float_buffer_.Get<float>();
     product_ = product_buffer_.Get<float>();
     reduce_scratch_ = reduce_scratch_buffer_.Get<float>();
@@ -146,25 +151,37 @@ class CombineBackwardWorker {
       PipeBarrier<PIPE_V>();
       Mul(product_, product_, dy_float_, count);
       PipeBarrier<PIPE_V>();
-      Cast(rounded, product_, RoundMode::CAST_RINT, count);
-      PipeBarrier<PIPE_V>();
-      Cast(product_, rounded, RoundMode::CAST_NONE, count);
-      PipeBarrier<PIPE_V>();
+      if (!score_is_fp32_) {
+        Cast(rounded, product_, RoundMode::CAST_RINT, count);
+        PipeBarrier<PIPE_V>();
+        Cast(product_, rounded, RoundMode::CAST_NONE, count);
+        PipeBarrier<PIPE_V>();
+      }
       // Grouping independent rows preserves each original tile reduction and
       // the ascending-column FP32 additions within that row.
       ReduceSum(tile_sum_, product_, reduce_scratch_, count);
       PipeBarrier<PIPE_V>();
       Add(row_sum, row_sum, tile_sum_, 1);
       PipeBarrier<PIPE_V>();
-      const uint32_t score_bits = static_cast<uint32_t>(scores_[selection_[bank][index]]) << 16;
-      const float score = __builtin_bit_cast(float, score_bits);
+      float score;
+      if (score_is_fp32_) {
+        score = scores_fp32_[selection_[bank][index]];
+      } else {
+        const uint32_t score_bits = static_cast<uint32_t>(scores_[selection_[bank][index]]) << 16;
+        score = __builtin_bit_cast(float, score_bits);
+      }
       Muls(product_, dy_float_, score, count);
       PipeBarrier<PIPE_V>();
       Cast(rounded, product_, RoundMode::CAST_RINT, count);
       PipeBarrier<PIPE_V>();
       if (stage % tiles_ + 1 == tiles_) {
-        Cast(score_output_[(bank * kGroupRows + index) * (kBlockBytes / sizeof(bfloat16_t))],
-              row_sum, RoundMode::CAST_RINT, 1);
+        if (score_is_fp32_) {
+          Adds(score_output_fp32_[(bank * kGroupRows + index) * (kBlockBytes / sizeof(float))],
+               row_sum, 0.0F, 1);
+        } else {
+          Cast(score_output_[(bank * kGroupRows + index) * (kBlockBytes / sizeof(bfloat16_t))],
+               row_sum, RoundMode::CAST_RINT, 1);
+        }
         PipeBarrier<PIPE_V>();
       }
     }
@@ -175,7 +192,6 @@ class CombineBackwardWorker {
     WaitFlag<HardEvent::V_MTE3>(bank);
     const int32_t column = (stage % tiles_) * kTileColumns;
     const DataCopyExtParams copy{1, Count(stage) * static_cast<uint32_t>(sizeof(bfloat16_t)), 0, 0, 0};
-    const DataCopyExtParams scalar_copy{1, sizeof(bfloat16_t), 0, 0, 0};
     for (int32_t index = 0; index < kGroupRows; ++index) {
       const int64_t row = Row(stage, index);
       if (row >= selections_) {
@@ -183,8 +199,15 @@ class CombineBackwardWorker {
       }
       DataCopyPad(dv_[row * hidden_ + column], rounded_[(bank * kGroupRows + index) * kTileColumns], copy);
       if (stage % tiles_ + 1 == tiles_) {
-        DataCopyPad(ds_[selection_[bank][index]],
-          score_output_[(bank * kGroupRows + index) * (kBlockBytes / sizeof(bfloat16_t))], scalar_copy);
+        if (score_is_fp32_) {
+          const DataCopyExtParams scalar_copy{1, sizeof(float), 0, 0, 0};
+          DataCopyPad(ds_fp32_[selection_[bank][index]],
+            score_output_fp32_[(bank * kGroupRows + index) * (kBlockBytes / sizeof(float))], scalar_copy);
+        } else {
+          const DataCopyExtParams scalar_copy{1, sizeof(bfloat16_t), 0, 0, 0};
+          DataCopyPad(ds_[selection_[bank][index]],
+            score_output_[(bank * kGroupRows + index) * (kBlockBytes / sizeof(bfloat16_t))], scalar_copy);
+        }
       }
     }
     SetFlag<HardEvent::MTE3_V>(bank);
@@ -197,10 +220,14 @@ class CombineBackwardWorker {
   TBuf<TPosition::VECCALC> dy_float_buffer_, product_buffer_, reduce_scratch_buffer_;
   TBuf<TPosition::VECCALC> tile_sum_buffer_, row_sum_buffer_;
   LocalTensor<bfloat16_t> dy_input_, value_input_, rounded_, score_output_;
+  LocalTensor<float> score_output_fp32_;
   LocalTensor<float> dy_float_, product_, reduce_scratch_, tile_sum_, row_sum_;
   GlobalTensor<bfloat16_t> dy_, values_, dv_, ds_;
+  GlobalTensor<float> ds_fp32_;
   __gm__ int64_t *order_ = nullptr;
   __gm__ uint16_t *scores_ = nullptr;
+  __gm__ float *scores_fp32_ = nullptr;
+  bool score_is_fp32_ = false;
   int64_t selections_ = 0;
   int32_t hidden_ = 0, top_k_ = 0, tiles_ = 0;
   int64_t selection_[kBanks][kGroupRows] = {};
@@ -210,9 +237,9 @@ class CombineBackwardWorker {
 
 __global__ __aicore__ void CombineBackwardKernel(GM_ADDR dy, GM_ADDR values, GM_ADDR order, GM_ADDR scores,
                                                 GM_ADDR dv, GM_ADDR ds, int64_t tokens, int64_t selections,
-                                                int32_t hidden, int32_t top_k) {
+                                                int32_t hidden, int32_t top_k, bool score_is_fp32) {
   CombineBackwardWorker worker;
-  worker.Init(dy, values, order, scores, dv, ds, tokens, selections, hidden, top_k);
+  worker.Init(dy, values, order, scores, dv, ds, tokens, selections, hidden, top_k, score_is_fp32);
   worker.Run();
 }
 
@@ -220,7 +247,8 @@ __global__ __aicore__ void CombineBackwardKernel(GM_ADDR dy, GM_ADDR values, GM_
 
 extern "C" int RoutedExpertsCombineBackward(void *stream, void *dy, void *values, void *order, void *scores,
                                             void *dv, void *ds, int64_t tokens, int64_t selections,
-                                            int32_t hidden, int32_t top_k, int32_t cores) {
+                                            int32_t hidden, int32_t top_k, int32_t cores,
+                                            bool score_is_fp32) {
   if (tokens == 0) {
     return 0;
   }
@@ -230,6 +258,6 @@ extern "C" int RoutedExpertsCombineBackward(void *stream, void *dy, void *values
   }
   CombineBackwardKernel<<<cores, nullptr, stream>>>(static_cast<uint8_t *>(dy), static_cast<uint8_t *>(values),
     static_cast<uint8_t *>(order), static_cast<uint8_t *>(scores), static_cast<uint8_t *>(dv),
-    static_cast<uint8_t *>(ds), tokens, selections, hidden, top_k);
+    static_cast<uint8_t *>(ds), tokens, selections, hidden, top_k, score_is_fp32);
   return static_cast<int>(aclrtGetLastError(ACL_RT_THREAD_LEVEL));
 }

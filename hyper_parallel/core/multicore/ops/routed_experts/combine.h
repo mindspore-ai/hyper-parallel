@@ -12,9 +12,9 @@
 
 #include <cstdint>
 
-// The caller validates contiguous BF16 payloads and INT64 inverse indices.
+// The caller validates BF16 values/output, BF16 or FP32 scores, and INT64 indices.
 // A null scores address selects unweighted dx accumulation. Every output tile
 // has one writer, and top-k slots are accumulated in ascending order.
 extern "C" int RoutedExpertsCombine(void *stream, void *values, void *inverse_order, void *scores,
                                     void *output, int64_t tokens, int64_t selections, int32_t hidden,
-                                    int32_t top_k, int32_t cores);
+                                    int32_t top_k, int32_t cores, bool score_is_fp32);

@@ -24,7 +24,8 @@ extern "C" int RoutedExpertsForwardCube(void *stream, void *x, void *gate, void 
                               int32_t expected_columns);
 extern "C" int RoutedExpertsForwardVector(void *stream, void *z, void *activation, void *tasks, void *mailboxes,
                                 int32_t rows, int32_t experts, int32_t inner, int32_t task_count,
-                                int32_t tile_rows, int32_t cores, int32_t vector_cores, int64_t watchdog);
+                                int32_t tile_rows, int32_t cores, int32_t vector_cores, int64_t watchdog,
+                                float clamp_limit);
 extern "C" uint64_t RoutedExpertsForwardConfigBytes();
 extern "C" int RoutedExpertsForwardConfig(void *output, uint64_t capacity, int32_t tile_rows, int32_t hidden,
                                 bool transpose);

@@ -22,11 +22,14 @@ namespace {
 class CombineWorker {
  public:
   __aicore__ inline void Init(GM_ADDR values, GM_ADDR inverse_order, GM_ADDR scores, GM_ADDR output,
-                              int64_t tokens, int64_t selections, int32_t hidden, int32_t top_k) {
+                              int64_t tokens, int64_t selections, int32_t hidden, int32_t top_k,
+                              bool score_is_fp32) {
     values_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(values), selections * hidden);
     output_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(output), tokens * hidden);
     inverse_ = reinterpret_cast<__gm__ int64_t *>(inverse_order);
     scores_ = reinterpret_cast<__gm__ uint16_t *>(scores);
+    scores_fp32_ = reinterpret_cast<__gm__ float *>(scores);
+    score_is_fp32_ = score_is_fp32;
     tokens_ = tokens;
     selections_ = selections;
     hidden_ = hidden;
@@ -128,17 +131,24 @@ class CombineWorker {
     for (int32_t slot = 0; slot < kGroupSlots && first_slot + slot < top_k_; ++slot) {
       Cast(value_, input_[(bank * kGroupSlots + slot) * kTileColumns], RoundMode::CAST_NONE, count);
       PipeBarrier<PIPE_V>();
-      // Preserve BF16 product rounding before ascending-slot FP32 additions.
+      // BF16 scores retain legacy product rounding; FP32 scores retain their mantissa.
       if (scores_ != nullptr) {
         const int64_t selection = token * top_k_ + first_slot + slot;
-        const uint32_t score_bits = static_cast<uint32_t>(scores_[selection]) << 16;
-        const float score = __builtin_bit_cast(float, score_bits);
+        float score;
+        if (score_is_fp32_) {
+          score = scores_fp32_[selection];
+        } else {
+          const uint32_t score_bits = static_cast<uint32_t>(scores_[selection]) << 16;
+          score = __builtin_bit_cast(float, score_bits);
+        }
         Muls(value_, value_, score, count);
         PipeBarrier<PIPE_V>();
-        Cast(rounded, value_, RoundMode::CAST_RINT, count);
-        PipeBarrier<PIPE_V>();
-        Cast(value_, rounded, RoundMode::CAST_NONE, count);
-        PipeBarrier<PIPE_V>();
+        if (!score_is_fp32_) {
+          Cast(rounded, value_, RoundMode::CAST_RINT, count);
+          PipeBarrier<PIPE_V>();
+          Cast(value_, rounded, RoundMode::CAST_NONE, count);
+          PipeBarrier<PIPE_V>();
+        }
       }
       Add(sum_, sum_, value_, count);
       PipeBarrier<PIPE_V>();
@@ -163,6 +173,8 @@ class CombineWorker {
   GlobalTensor<bfloat16_t> values_, output_;
   __gm__ int64_t *inverse_ = nullptr;
   __gm__ uint16_t *scores_ = nullptr;
+  __gm__ float *scores_fp32_ = nullptr;
+  bool score_is_fp32_ = false;
   int64_t tokens_ = 0, selections_ = 0, groups_ = 0;
   int32_t hidden_ = 0, top_k_ = 0, tiles_ = 0;
   bool input_used_[kBanks] = {};
@@ -170,9 +182,10 @@ class CombineWorker {
 };
 
 __global__ __aicore__ void CombineKernel(GM_ADDR values, GM_ADDR inverse_order, GM_ADDR scores, GM_ADDR output,
-                                        int64_t tokens, int64_t selections, int32_t hidden, int32_t top_k) {
+                                        int64_t tokens, int64_t selections, int32_t hidden, int32_t top_k,
+                                        bool score_is_fp32) {
   CombineWorker worker;
-  worker.Init(values, inverse_order, scores, output, tokens, selections, hidden, top_k);
+  worker.Init(values, inverse_order, scores, output, tokens, selections, hidden, top_k, score_is_fp32);
   worker.Run();
 }
 
@@ -180,7 +193,7 @@ __global__ __aicore__ void CombineKernel(GM_ADDR values, GM_ADDR inverse_order, 
 
 extern "C" int RoutedExpertsCombine(void *stream, void *values, void *inverse_order, void *scores,
                                     void *output, int64_t tokens, int64_t selections, int32_t hidden,
-                                    int32_t top_k, int32_t cores) {
+                                    int32_t top_k, int32_t cores, bool score_is_fp32) {
   if (tokens == 0) {
     return 0;
   }
@@ -189,6 +202,7 @@ extern "C" int RoutedExpertsCombine(void *stream, void *values, void *inverse_or
     return static_cast<int>(previous_error);
   }
   CombineKernel<<<cores, nullptr, stream>>>(static_cast<uint8_t *>(values), static_cast<uint8_t *>(inverse_order),
-    static_cast<uint8_t *>(scores), static_cast<uint8_t *>(output), tokens, selections, hidden, top_k);
+    static_cast<uint8_t *>(scores), static_cast<uint8_t *>(output), tokens, selections, hidden, top_k,
+    score_is_fp32);
   return static_cast<int>(aclrtGetLastError(ACL_RT_THREAD_LEVEL));
 }

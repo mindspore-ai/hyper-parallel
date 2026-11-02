@@ -258,6 +258,44 @@ class TestSparseOverlap(unittest.TestCase):
         self.runtime.release.assert_called_once_with(self.key)
         self.assertLess(self.operations.index(("combine",)), self.operations.index(("release",)))
 
+    def test_native_keepalives_do_not_retain_graphs_and_manual_gradients_reach_inputs(self) -> None:
+        """Feature: Async sparse-expert autograd ownership.
+
+        Description: Retain transport, router-score, and output aliases like native handlers.
+        Expectation: Aliases share storage without history; gradients reach both original leaves.
+        """
+        hidden_leaf = torch.ones_like(self.hidden, requires_grad=True)
+        score_leaf = torch.ones(self.scores.shape, dtype=torch.float32, requires_grad=True)
+        hidden, scores = hidden_leaf * 2, score_leaf * 3
+        retained = {}
+
+        def _combine(values, inverse, probabilities, tokens, top_k, *, output):
+            retained.update(scores=probabilities, output=output)
+            return self._combine(values, inverse, probabilities, tokens, top_k, output=output)
+
+        def _backward(_context, _derivative):
+            return torch.ones_like(hidden), torch.ones_like(scores), None, None, None, None
+
+        with patch.object(sparse_autograd, "combine", side_effect=_combine), \
+                patch.object(sparse_autograd.SparseExpertFunction, "backward", new=staticmethod(_backward)):
+            result = sparse_autograd.SparseExpertFunction.apply(
+                hidden, scores, *self.home, self.key, self.runtime)
+
+            source = self.prepared[0].source
+            for value in (source, retained["scores"], retained["output"]):
+                self.assertFalse(value.requires_grad)
+                self.assertIsNone(value.grad_fn)
+            self.assertEqual(source.data_ptr(), hidden.data_ptr())
+            self.assertEqual(retained["scores"].data_ptr(), scores.data_ptr())
+            self.assertEqual(retained["output"].data_ptr(), result.data_ptr())
+            self.assertTrue(result.requires_grad)
+            self.assertIsNotNone(result.grad_fn)
+
+            result.backward(torch.ones_like(result))
+
+        torch.testing.assert_close(hidden_leaf.grad, torch.full_like(hidden_leaf, 2))
+        torch.testing.assert_close(score_leaf.grad, torch.full_like(score_leaf, 3))
+
     def test_replay_submits_tokens_then_waits_without_releasing_the_weight_ticket(self):
         """Replay uses the same safe event order and retains weights for its backward."""
         self.replaying.return_value = True

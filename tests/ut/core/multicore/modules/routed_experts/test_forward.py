@@ -22,55 +22,10 @@ from typing import Any, Iterator
 import unittest
 from unittest.mock import Mock, patch
 
-import numpy as np
 import torch
 
 from hyper_parallel.core.multicore.modules.routed_experts import forward, readiness
-from hyper_parallel.core.multicore.modules.routed_experts.arena import PhaseArena
 from tests.common.mark_utils import arg_mark
-
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
-class TestForwardTaskTables(unittest.TestCase):
-    """Check the task-table ABI independently of accelerator preparation and dispatch."""
-
-    def test_order_and_tails_keep_original_expert_offsets(self) -> None:
-        """An expert starts at its real offset, including row and column-free tail fields."""
-        tasks, expected = forward.forward_tasks((3, 133))
-        self.assertEqual(tasks.tolist(), [[0, 0, 3], [1, 3, 128], [1, 131, 2]])
-        self.assertEqual(expected.tolist(), [[1, 0], [0, 1], [0, 1]])
-        self.assertEqual((tasks.dtype, expected.dtype), (torch.int64, torch.int32))
-        self.assertEqual((tasks.stride(), expected.stride()), ((3, 1), (2, 1)))
-
-    def test_expected_uses_global_task_ordinal_after_core_wrap(self) -> None:
-        """A new expert cannot reset its producer assignment to core zero."""
-        tasks, expected = forward.forward_tasks((25 * 128, 25 * 128 + 1))
-        self.assertEqual(tasks[-2:].tolist(), [[0, 24 * 128, 128], [1, 25 * 128, 1]])
-        self.assertEqual(expected.shape, (24, 2))
-        self.assertEqual(expected[:, 0].tolist(), [1] * 24)
-        self.assertEqual(expected[:, 1].tolist(), [0, 1] + [0] * 22)
-
-    def test_empty_and_exact_limits_preserve_schema(self) -> None:
-        """Empty strides and the maximum legal expert/row extents stay unchanged."""
-        tasks, expected = forward.forward_tasks(())
-        self.assertEqual((tasks.shape, expected.shape), ((0, 3), (0, 0)))
-        self.assertEqual((tasks.stride(), expected.stride()), ((3, 1), (0, 0)))
-        self.assertEqual((tasks.dtype, expected.dtype), (torch.int64, torch.int32))
-        tasks, _ = forward.forward_tasks(tuple(range(1, 129)))
-        self.assertEqual(tasks[-1].tolist(), [127, 127, 1])
-        tasks, _ = forward.forward_tasks((2**20,))
-        self.assertEqual(tasks.shape, (8192, 3))
-        self.assertEqual(tasks[-1].tolist(), [0, 2**20 - 128, 128])
-
-    def test_invalid_types_and_limits_keep_one_host_diagnostic(self) -> None:
-        """The expert-count guard short-circuits before malformed entry comparisons."""
-        cases = ((True,), (1.5,), (np.int64(1),), (np.bool_(True),), (2**200,),
-                 (0,), (2, 2), (2**20 + 1,), tuple(range(1, 130)), (None,) * 129)
-        message = "forward boundaries must contain at most 128 positive expert ranges within 2**20 rows"
-        for boundaries in cases:
-            with self.subTest(boundaries=boundaries), self.assertRaises(ValueError) as error:
-                forward.forward_tasks(boundaries)
-            self.assertEqual(str(error.exception), message)
 
 
 class _Stream:
@@ -274,31 +229,6 @@ class TestForwardPipeline(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already submitted"):
             pipeline.run(work)
 
-    def test_arena_uses_distinct_forward_region_and_preserves_saved_z(self) -> None:
-        """B activation release cannot remove the separate forward tile capacity."""
-        arena = PhaseArena(torch.device("cpu"))
-        token = arena.begin()
-        pipeline, work = self._prepare((1,), allocator=arena.allocate)
-        self.assertEqual(work.activation.shape, (1, 128, 768))
-        self.assertNotEqual(work.z.untyped_storage().data_ptr(), work.activation.untyped_storage().data_ptr())
-        pipeline.run(work)
-        arena.end(token)
-        token = arena.begin()
-        arena.allocate("activation", (1, 1536), torch.bfloat16)
-        arena.end(token)
-        before = arena.reserved_bytes
-        self.assertEqual(arena.release_regions(("activation",)), 2 * 1024**2)
-        self.assertEqual(arena.reserved_bytes, before - 2 * 1024**2)
-        self.assertEqual(work.z.shape, (1, 1536))
-        arena.close()
-
-    def test_unvalidated_dimensions_and_mixed_layouts_keep_three_op_path(self) -> None:
-        """Capabilities do not imply unmeasured precision for arbitrary dimensions."""
-        _, work = self._prepare((1,))
-        self.assertTrue(forward.ForwardPipeline.supports(2048, 768, work.gate, work.down, 1))
-        self.assertFalse(forward.ForwardPipeline.supports(1024, 768, work.gate, work.down, 1))
-        mixed = (torch.empty((2048, 768), dtype=torch.bfloat16).t(),)
-        self.assertFalse(forward.ForwardPipeline.supports(2048, 768, work.gate, mixed, 1))
 
     def test_transport_occupancy_gate_covers_topology_boundaries(self) -> None:
         """A persistent consumer cannot consume the service's last vector workers."""

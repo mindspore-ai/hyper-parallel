@@ -122,7 +122,24 @@ class SparseExpertFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx: Any, hidden: torch.Tensor, scores: torch.Tensor, home_gate: torch.Tensor,
                 home_down: torch.Tensor, key: Any, runtime: Any) -> torch.Tensor:
-        """Dispatch original tokens, evaluate actual experts, and combine once."""
+        """Dispatch original tokens, evaluate actual experts, and combine once.
+
+        Args:
+            ctx: Autograd context retaining explicit backward state.
+            hidden: Original BF16 token rows with their upstream gradient edge.
+            scores: Differentiable BF16 or FP32 Top-K router weights.
+            home_gate: FSDP-owned gate/up input for expert gradient attribution.
+            home_down: FSDP-owned down input for expert gradient attribution.
+            key: Planned execution identifying this layer and micro-batch.
+            runtime: Shared weight, transport, and scratch lifecycle manager.
+
+        Returns:
+            Combined token rows whose history is owned by this autograd function.
+        """
+        # Queued native handlers retain their tensor arguments. Storage-sharing
+        # aliases keep those references from retaining the checkpoint replay graph;
+        # Function.apply still owns the original input edges for explicit backward.
+        hidden, scores = hidden.detach(), scores.detach()
         executor, plan = runtime.executions[key]
         try:
             gate, down, weight_ready = runtime.consume(key)
@@ -142,7 +159,9 @@ class SparseExpertFunction(torch.autograd.Function):
             ctx.tokens = hidden.shape[0]
             if not is_replaying():
                 runtime.release(key)
-            return result
+            # Autograd must attach output history to a different TensorImpl from
+            # the buffer retained by the queued combine handler.
+            return result.detach()
         except BaseException:
             runtime.poisoned = True
             raise

@@ -45,6 +45,24 @@ from hyper_parallel.distributed.expert_parallel.moonep.token_dedup import (
 )
 
 
+def _combine_returned_tokens(hidden: torch.Tensor, returned: torch.Tensor, scores: torch.Tensor,
+                             plan: ExecutionPlan, source_rows: torch.Tensor) -> torch.Tensor:
+    """Restore original token order while preserving FP32 router-weight gradients."""
+    if hidden.device.type == "npu" and returned.numel():
+        # torch_npu is optional on non-Ascend hosts, so import only for this native route.
+        from hyper_parallel.components.functional.moe_token_unpermute import (  # pylint: disable=C0415
+            moe_token_unpermute,
+        )
+
+        return moe_token_unpermute(
+            returned, plan.unpermute_indices, scores.float().contiguous(),
+        ).reshape_as(hidden)
+    selected_scores = scores.reshape(-1).index_select(0, plan.dispatch_order)
+    weighted = returned * selected_scores[:, None]
+    result = torch.zeros_like(hidden.reshape(-1, hidden.shape[-1]), dtype=weighted.dtype)
+    return result.index_add(0, source_rows, weighted).to(hidden.dtype).reshape_as(hidden)
+
+
 @dataclass(frozen=True)
 class ExecutionKey:
     """原始专家调用的唯一键；例如(layer7,调用42,版本3)不会与另一微批混用。"""
@@ -802,7 +820,8 @@ class MoonEPExecutor:
                     local = failed_local_dedup(base_plan.token_send, base_plan.token_recv)
                 try:
                     dedup = finish_dedup(local, self.group, device=ids.device, width=hidden.shape[-1],
-                                         backward_ratio=self.backward_ratio)
+                                         backward_ratio=self.backward_ratio,
+                                         score_lanes=max(1, scores.element_size() // hidden.element_size()))
                 except Exception as exc:
                     raise RuntimeError("nonfused dedup metadata exchange failed on an EP rank") from (
                         local_error if local_error is not None else exc)
@@ -821,12 +840,12 @@ class MoonEPExecutor:
             computed = _ExpertFunction.apply(sorted_x, *weights, key, self.runtime)
             restored = torch.empty_like(computed)
             restored[plan.sort_order] = computed
-            weighted = restored * received_scores[:, None].to(restored.dtype)
+            weighted = restored * received_scores[:, None]
             result = plan.dedup.return_vectors(weighted, hidden.numel() // hidden.shape[-1])
             if not torch.is_grad_enabled() or not computed.requires_grad:
                 self.runtime.complete(key)
             self.runtime.statistics["dedup_saved_rows"] += plan.dedup.saved_rows
-            return result.reshape_as(hidden)
+            return result.to(hidden.dtype).reshape_as(hidden)
         source_rows = plan.dispatch_order // self.top_k
         payload = hidden.reshape(-1, hidden.shape[-1]).index_select(0, source_rows)
         if self.ranks > 1:
@@ -846,11 +865,7 @@ class MoonEPExecutor:
         # 评估没有专家反向来完成key；例如no_grad验证后继续训练不会残留旧轨迹。
         if not torch.is_grad_enabled() or not computed.requires_grad:
             self.runtime.complete(key)
-        # 与普通EP采用相同类型提升规则，避免额外FP32乘加改变Qwen的BF16舍入。
-        selected_scores = scores.reshape(-1).index_select(0, plan.dispatch_order).to(returned.dtype)
-        weighted = returned * selected_scores[:, None]
-        result = torch.zeros_like(hidden.reshape(-1, hidden.shape[-1]), dtype=weighted.dtype)
-        return result.index_add(0, source_rows, weighted).reshape_as(hidden)
+        return _combine_returned_tokens(hidden, returned, scores, plan, source_rows)
 
 
 def _configure_legacy_prefetch(model: torch.nn.Module, executors: list, prefetch_depth: int | None) -> bool:

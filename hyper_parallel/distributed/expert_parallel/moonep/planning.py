@@ -32,6 +32,7 @@ class ExecutionPlan:
 
     allocation: torch.Tensor
     dispatch_order: torch.Tensor
+    unpermute_indices: torch.Tensor
     sort_order: torch.Tensor
     boundaries: torch.Tensor
     group_counts: tuple[int, ...]
@@ -368,10 +369,14 @@ def compile_plan(counts: torch.Tensor, allocation: torch.Tensor, ids: torch.Tens
     # 已知每段源/目标起点，只展开平移量；output_size避免动态尺寸读取设备。
     received = sum(token_recv)
     dispatch_order = _entry_order(counts, allocation, rank, ids, route_metadata)
+    unpermute_indices = torch.empty(ids.numel(), dtype=torch.int32, device=device)
+    unpermute_indices.scatter_(
+        0, dispatch_order, torch.arange(ids.numel(), dtype=torch.int32, device=device),
+    )
     sort_order = torch.arange(received, device=device) + torch.repeat_interleave(
         receive_offsets_device, repeat_counts, output_size=received)
     return ExecutionPlan(
-        allocation, dispatch_order, sort_order,
+        allocation, dispatch_order, unpermute_indices, sort_order,
         boundaries, group_counts, token_send, token_recv, weight_send, weight_recv, sent_ids, weight_spans,
         home_positions, home_rows, remote_positions_device, remote_rows,
         home_count, any(bool(entries) for entries in remote), tuple(metrics), used_fallback, tuple(ranges),
