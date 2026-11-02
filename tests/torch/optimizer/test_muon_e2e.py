@@ -16,6 +16,7 @@
 from pathlib import Path
 
 from tests.common.mark_utils import arg_mark
+from tests.common.distributed_launcher import torchrun_case
 from tests.common.parallel_case import parallel_run, TorchCase
 
 _TEST_MUON_E2E = str(Path(__file__).resolve().parent / "_test_muon_e2e.py")
@@ -97,3 +98,28 @@ def test_muon_e2e_callbacks():
         TorchCase(_TEST_MUON_E2E, "test_muon_ns_transform_fn_qkv_split_parity", None, 1),
         TorchCase(_TEST_MUON_E2E, "test_muon_post_update_fn_context", None, 1),
     ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_muon_e2e_overlap_8p():
+    """
+    Feature: Muon optimizer correctness.
+    Description: Validate pipeline parity and real forward/backward on an eight-card FSDP mesh.
+    Expectation: Values and execution order match the reference.
+    """
+    for case_name in ("test_muon_e2e_overlap_full_shard_8p", "test_muon_e2e_overlap_forward_backward_8p"):
+        parallel_run([TorchCase(_TEST_MUON_E2E, case_name, None, 8)])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_muon_e2e_overlap_custom_zeropower_4p():
+    """
+    Feature: Muon overlap with a custom Newton-Schulz implementation.
+    Description: Compare serial and pipelined callbacks on a non-default stream, including state restoration.
+    Expectation: Parameters and momentum match exactly while every pipeline bucket executes.
+    """
+    torchrun_case(
+        file_name=str(Path(__file__).with_name("_test_muon_overlap.py")),
+        case_name="test_muon_overlap_custom_zeropower_4p",
+        num_proc=4,
+    )
