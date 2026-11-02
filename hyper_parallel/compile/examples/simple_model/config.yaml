@@ -10,6 +10,8 @@ model:
   _target_: hyper_parallel.compile.examples.simple_model.model.build_model
   vocab_size: 128256
   dim: 256
+  hidden_dim: 512
+  num_layers: 4
   max_seq_len: 128
 
 optimizer:
@@ -48,6 +50,19 @@ fsdp_config:
 compile:
   enabled: true
   use_joint_graph: true
+
+# Graph-mode activation checkpointing (recompute). The pass runs on the joint
+# fwd+bwd graph before FSDPPass; the model's repeated `layers` blocks (with the
+# `gradient_checkpointing` marker) define the recompute scope.
+activation_checkpoint:
+  # off       - save every activation (no recompute pass)
+  # full      - recompute every op in the discovered blocks
+  # selective - save matmul/attention/communication ops, recompute the rest
+  mode: full
+  selection:
+    # Omit both selectors to recompute every block. Real HF models may set
+    # source: model_adapter_safe_regions with layer_count / layer_indices.
+    source: default
 
 dataset:
   _target_: hyper_parallel.compile.examples.simple_model.data.build_dataset

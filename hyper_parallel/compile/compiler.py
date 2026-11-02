@@ -48,6 +48,7 @@ from .pass_config import (
 )
 from .graph_parallel_plan import GraphParallelPlan
 from .passes.pipeline import PassPipeline
+from .passes.activation_checkpoint import prepare_activation_checkpoint
 from .tracer.dynamic_shapes import normalize_dynamic_arg_dims
 from .tracer.graph_tracer import run_traced_graph, trace_model_graph
 
@@ -176,6 +177,13 @@ class GraphCompiler:
             # runs as plain graph mode without sharding.
             self._init_device_mesh(self._mesh_context)
 
+        # Activation checkpointing must resolve its scope and run the adapter's
+        # runtime hook BEFORE tracing: the hook configures state the model's
+        # forward reads. The pass receives the same scope so the hook runs once.
+        ac_scope = None
+        if self.pass_config.ac_mode != "off":
+            ac_scope = prepare_activation_checkpoint(self.model, self.pass_config)
+
         trace_kwargs = {}
         if self.dynamic or self.dynamic_arg_dims is not None:
             trace_kwargs = {
@@ -192,6 +200,8 @@ class GraphCompiler:
         # Terminal backend compilation (InductorPass) sizes its regions from
         # the tracer's fake example inputs; every other pass ignores them.
         pass_kwargs["example_inputs"] = joint_graph.example_inputs
+        if ac_scope is not None:
+            pass_kwargs["ac_scope"] = ac_scope
 
         # Passes mutate ``graph_module`` in place and return it, so the
         # transformed graph lives on ``joint_graph`` for ``forward_backward``.
