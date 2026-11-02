@@ -35,55 +35,49 @@ export function validate_policy(policy, repository) {
   if (typeof policy.auto_merge !== 'boolean') {
     throw new Error('auto_merge must be a boolean.');
   }
+  if (!Number.isSafeInteger(policy.minimum_approvals) || policy.minimum_approvals < 1) {
+    throw new Error('minimum_approvals must be a positive integer.');
+  }
   return policy;
 }
 
 /** Evaluate each person's latest effective decision against the current PR head. */
-export function evaluate_reviews(pull, reviews) {
+export function evaluate_reviews(pull, reviews, minimum_approvals = 2) {
   const author = pull.user.login.toLowerCase();
   const requested = new Set((pull.requested_reviewers ?? []).map(user => user.login.toLowerCase()));
-  const reviewers = new Map((pull.requested_reviewers ?? []).map(user => [user.login.toLowerCase(), user.login]));
   const latest = new Map();
-  // Requested reviewers disappear from requested_reviewers after submitting a
-  // review. Include submitted reviewers to reconstruct the PR sidebar roster.
-  for (const review of reviews) {
-    if (review.user?.login && review.submitted_at) {
-      reviewers.set(review.user.login.toLowerCase(), review.user.login);
-    }
-  }
-  reviewers.delete(author);
-  const required = [...reviewers.values()];
-  const pending_teams = (pull.requested_teams ?? []).map(team => team.slug);
   // Comments and unsubmitted reviews do not replace a submitted decision.
   // A dismissed decision does replace it; an older approval must not revive.
   for (const review of [...reviews].sort((left, right) => left.id - right.id)) {
-    if (review.user?.login && review.submitted_at && DECISION_STATES.has(review.state)) {
+    if (review.user?.login && review.user.type !== 'Bot' && !review.user.login.toLowerCase().endsWith('[bot]') &&
+        review.user.login.toLowerCase() !== author && review.submitted_at && DECISION_STATES.has(review.state)) {
       latest.set(review.user.login.toLowerCase(), review);
     }
   }
-  const missing = required.filter(login => {
-    const review = latest.get(login.toLowerCase());
-    return requested.has(login.toLowerCase()) || review?.state !== 'APPROVED' ||
-      review.commit_id !== pull.head.sha;
-  });
+  const approved = [...latest.values()].filter(review => review.state === 'APPROVED' &&
+    review.commit_id === pull.head.sha && !requested.has(review.user.login.toLowerCase()))
+    .map(review => review.user.login);
+  const changes_requested = [...latest.values()].filter(review => review.state === 'CHANGES_REQUESTED')
+    .map(review => review.user.login);
   return {
     number: pull.number,
     sha: pull.head.sha,
-    required,
-    missing,
-    pending_teams,
-    ready: pull.state === 'open' && !pull.draft && required.length > 0 &&
-      missing.length === 0 && pending_teams.length === 0,
+    minimum_approvals,
+    approved,
+    changes_requested,
+    ready: pull.state === 'open' && !pull.draft && approved.length >= minimum_approvals &&
+      changes_requested.length === 0,
   };
 }
 
 /** Keep automatic merges behind enforced GitHub rules, including stale review dismissal. */
-export function permits_auto_merge(rules) {
+export function permits_auto_merge(rules, minimum_approvals = 2) {
   const has_gate = rules.some(rule => rule.type === 'required_status_checks' &&
     rule.parameters.required_status_checks.some(check =>
       check.context === CHECK_CONTEXT && check.integration_id === ACTIONS_APP_ID));
   const has_reviews = rules.some(rule => rule.type === 'pull_request' &&
-    rule.parameters.dismiss_stale_reviews_on_push && rule.parameters.required_approving_review_count >= 1);
+    rule.parameters.dismiss_stale_reviews_on_push &&
+    rule.parameters.required_approving_review_count >= minimum_approvals);
   return has_gate && has_reviews && !rules.some(rule => rule.type === 'merge_queue');
 }
 
@@ -183,12 +177,12 @@ export function reconcile(client, policy, options = {}) {
           previous = client.publish(sha, 'pending', 'Rechecking current reviewer approvals.', target_url);
         }
       }
-      let results = group.map(pull => evaluate_reviews(pull, client.get_reviews(pull.number)));
+      let results = group.map(pull => evaluate_reviews(pull, client.get_reviews(pull.number), policy.minimum_approvals));
       if (write && results.every(result => result.ready)) {
         // Check again before publishing success: a push, retarget, draft change,
         // review dismissal or policy change may have happened during API reads.
         const fresh = group.map(pull => client.api(`pulls/${pull.number}`));
-        results = fresh.map(pull => evaluate_reviews(pull, client.get_reviews(pull.number)));
+        results = fresh.map(pull => evaluate_reviews(pull, client.get_reviews(pull.number), policy.minimum_approvals));
         const sharing = client.list_pulls().filter(pull =>
           policy.base_branches.includes(pull.base.ref) && pull.head.sha === sha);
         if (!fresh.every((pull, index) => same_snapshot(group[index], pull)) ||
@@ -199,8 +193,8 @@ export function reconcile(client, policy, options = {}) {
       }
       const ready = results.every(result => result.ready);
       const state = ready ? 'success' : 'pending';
-      const description = ready ? 'Every required reviewer approved the current commit.' :
-        'Waiting for all required reviewers to approve the current non-draft PR.';
+      const description = ready ? `At least ${policy.minimum_approvals} reviewers approved the current commit.` :
+        `Waiting for ${policy.minimum_approvals} current approvals, resolved change requests, and a non-draft PR.`;
       if (write && (previous?.state !== state || previous?.description !== description)) {
         client.publish(sha, state, description, target_url);
       }
@@ -213,7 +207,7 @@ export function reconcile(client, policy, options = {}) {
             branch_rules.set(pull.base.ref, client.api(
               `rules/branches/${encodeURIComponent(pull.base.ref)}?per_page=100`, { paginate: true }));
           }
-          if (permits_auto_merge(branch_rules.get(pull.base.ref)) && !pull.auto_merge) {
+          if (permits_auto_merge(branch_rules.get(pull.base.ref), policy.minimum_approvals) && !pull.auto_merge) {
             client.enable_auto_merge(pull);
           }
         }
@@ -264,8 +258,8 @@ function main() {
   const result = reconcile(client, policy, { write, only_pr, target_url, policy_sha: policy_blob_sha(source) });
   const lines = result.reports.map(report =>
     `PR #${report.number}: ${report.ready ? 'approved' : 'waiting'}; ` +
-    `missing: ${report.missing.join(', ') || '(none)'}; ` +
-    `pending teams: ${report.pending_teams.join(', ') || '(none)'}; head: ${report.sha}`);
+    `approvals: ${report.approved.length}/${report.minimum_approvals} (${report.approved.join(', ') || 'none'}); ` +
+    `changes requested: ${report.changes_requested.join(', ') || '(none)'}; head: ${report.sha}`);
   console.log(`${write ? 'Live reconciliation' : 'Read-only evaluation'}\n${lines.join('\n')}`);
   if (process.env.GITHUB_STEP_SUMMARY) {
     appendFileSync(process.env.GITHUB_STEP_SUMMARY,

@@ -19,13 +19,13 @@ import {
 } from './reviewer-approval-gate.mjs';
 
 const POLICY = {
-  repository: 'example/repo', base_branches: ['master'], auto_merge: true,
+  repository: 'example/repo', base_branches: ['master'], auto_merge: true, minimum_approvals: 2,
 };
 const RULES = [
   { type: 'required_status_checks', parameters: {
     required_status_checks: [{ context: CHECK_CONTEXT, integration_id: 15368 }],
   } },
-  { type: 'pull_request', parameters: { dismiss_stale_reviews_on_push: true, required_approving_review_count: 1 } },
+  { type: 'pull_request', parameters: { dismiss_stale_reviews_on_push: true, required_approving_review_count: 2 } },
 ];
 
 function pull(overrides = {}) {
@@ -81,31 +81,49 @@ function run_live(client, policy = POLICY) {
   return reconcile(client, policy, { write: true, policy_sha: 'policy-sha' });
 }
 
-test('every requested reviewer must approve; another reviewer cannot replace one', () => {
-  const result = evaluate_reviews(pull({ requested_reviewers: [{ login: 'bob' }] }),
-    [review('alice'), review('outsider')]);
-  assert.equal(result.ready, false);
-  assert.deepEqual(result.missing, ['bob']);
-});
-
-test('author is exempt and logins are case insensitive', () => {
-  const result = evaluate_reviews(pull({ user: { login: 'ALICE' } }), [review('alice'), review('BOB')]);
+test('two approvals pass even when other reviewers or teams have not reviewed', () => {
+  const result = evaluate_reviews(pull({ requested_reviewers: [{ login: 'carol' }],
+    requested_teams: [{ slug: 'maintainers' }] }), [review('alice'), review('bob')]);
   assert.equal(result.ready, true);
-  assert.deepEqual(result.required, ['BOB']);
+  assert.deepEqual(result.approved, ['alice', 'bob']);
 });
 
-test('an empty independent reviewer set never passes', () => {
-  assert.equal(evaluate_reviews(pull({ user: { login: 'alice' } }), [review('ALICE')]).ready, false);
-  assert.equal(evaluate_reviews(pull(), []).ready, false);
+test('zero or one approval is insufficient; two or more distinct people pass', () => {
+  for (const count of [0, 1, 2, 3]) {
+    const reviews = ['alice', 'bob', 'carol'].slice(0, count).map(login => review(login));
+    assert.equal(evaluate_reviews(pull(), reviews).ready, count >= 2);
+  }
+});
+
+test('author and bots are excluded; duplicate and case-varied logins count once', () => {
+  const result = evaluate_reviews(pull({ user: { login: 'ALICE' } }), [review('alice'), review('BOB'),
+    review('bob', { id: 2 }), review('assistant[bot]'),
+    review('service', { user: { login: 'service', type: 'Bot' } })]);
+  assert.equal(result.ready, false);
+  assert.deepEqual(result.approved, ['bob']);
+  assert.equal(evaluate_reviews(pull(), [review('ALICE'), review('alice', { id: 2 })]).ready, false);
 });
 
 for (const state of ['CHANGES_REQUESTED', 'DISMISSED']) {
-  test(`a later ${state} blocks an earlier approval`, () => {
+  test(`a later ${state} invalidates an earlier approval`, () => {
     const result = evaluate_reviews(pull(), [review('alice', { id: 9, state }),
       review('bob'), review('alice', { id: 2 })]);
-    assert.deepEqual(result.missing, ['alice']);
+    assert.deepEqual(result.approved, ['bob']);
+    assert.equal(result.ready, false);
   });
 }
+
+test('outstanding changes requested still block even with two other approvals', () => {
+  const result = evaluate_reviews(pull(), [review('alice'), review('bob'),
+    review('carol', { state: 'CHANGES_REQUESTED', commit_id: 'old-head' })]);
+  assert.equal(result.ready, false);
+  assert.deepEqual(result.changes_requested, ['carol']);
+});
+
+test('a dismissed third review does not block two valid approvals', () => {
+  assert.equal(evaluate_reviews(pull(), [review('alice'), review('bob'),
+    review('carol', { state: 'DISMISSED' })]).ready, true);
+});
 
 test('a comment or unsubmitted review does not erase approval', () => {
   assert.equal(evaluate_reviews(pull(), [review('alice'), review('bob'),
@@ -115,7 +133,7 @@ test('a comment or unsubmitted review does not erase approval', () => {
 
 test('approval of an older SHA is insufficient after a push', () => {
   assert.deepEqual(evaluate_reviews(pull(), [review('alice', { commit_id: 'old-head' }),
-    review('bob')]).missing, ['alice']);
+    review('bob')]).approved, ['bob']);
 });
 
 test('a later current-head approval resolves a change request', () => {
@@ -134,6 +152,7 @@ test('invalid policies and fixed reviewer rosters are rejected', () => {
   for (const changes of [
     { reviewers: ['alice', 'bob'] }, { committers: ['alice'] },
     { base_branches: [] }, { auto_merge: 'true' }, { repository: 'wrong/repo' },
+    ...[undefined, 0, -1, 1.5, '2', null].map(minimum_approvals => ({ minimum_approvals })),
   ]) {
     assert.throws(() => validate_policy({ ...POLICY, ...changes }, POLICY.repository));
   }
@@ -144,10 +163,18 @@ test('the checked-in policy is valid and has no fixed personnel list', () => {
   validate_policy(policy, policy.repository);
   assert.equal('reviewers' in policy, false);
   assert.equal('committers' in policy, false);
+  assert.equal(policy.minimum_approvals, 2);
 });
 
 test('auto-merge requires this check from GitHub Actions and stale approval dismissal', () => {
   assert.equal(permits_auto_merge(RULES), true);
+  const insufficient = structuredClone(RULES);
+  insufficient[1].parameters.required_approving_review_count = 1;
+  assert.equal(permits_auto_merge(insufficient), false);
+  assert.equal(permits_auto_merge(RULES, 3), false);
+  const stale = structuredClone(RULES);
+  stale[1].parameters.dismiss_stale_reviews_on_push = false;
+  assert.equal(permits_auto_merge(stale), false);
   assert.equal(permits_auto_merge([]), false);
   assert.equal(permits_auto_merge([RULES[0]]), false);
   const wrong_source = structuredClone(RULES);
@@ -156,7 +183,7 @@ test('auto-merge requires this check from GitHub Actions and stale approval dism
   assert.equal(permits_auto_merge([...RULES, { type: 'merge_queue' }]), false);
 });
 
-test('dry-run has no writes, even when every reviewer has approved', () => {
+test('dry-run has no writes, even when enough reviewers have approved', () => {
   const client = new FakeGitHub();
   assert.equal(reconcile(client, POLICY).reports[0].ready, true);
   assert.deepEqual(client.statuses, []);
@@ -185,9 +212,8 @@ test('missing approvals block merging and an unchanged pending status is not dup
 
 test('shared head statuses require approval for every PR and author exemption', () => {
   const client = new FakeGitHub([pull({ user: { login: 'alice' } }),
-    pull({ number: 2, requested_reviewers: [{ login: 'alice' }] })]);
-  client.reviews = [review('bob')];
-  assert.deepEqual(run_live(client).reports.map(result => result.ready), [true, false]);
+    pull({ number: 2 })]);
+  assert.deepEqual(run_live(client).reports.map(result => result.ready), [false, true]);
   assert.ok(client.statuses.every(status => status.state !== 'success'));
   assert.deepEqual(client.merges, []);
 });
@@ -281,46 +307,55 @@ test('policy fingerprint uses Git blob encoding', () => {
   assert.equal(policy_blob_sha(''), 'e69de29bb2d1d6434b8b29ae775ad8c2e48c5391');
 });
 
-test('the roster follows requested and submitted reviewers throughout the PR lifecycle', () => {
-  let current = pull({ requested_reviewers: [{ login: 'alice' }, { login: 'bob' }] });
-  assert.deepEqual(evaluate_reviews(current, []).missing, ['alice', 'bob']);
-  current = pull({ requested_reviewers: [{ login: 'bob' }] });
-  assert.deepEqual(evaluate_reviews(current, [review('alice')]).missing, ['bob']);
-  const result = evaluate_reviews(pull(), [review('alice'), review('bob')]);
+test('comment-only reviewers and pending teams do not raise the approval threshold', () => {
+  const result = evaluate_reviews(pull({ requested_teams: [{ slug: 'maintainers' }] }),
+    [review('alice'), review('bob'), review('carol', { state: 'COMMENTED' }),
+      review('assistant[bot]', { state: 'COMMENTED' })]);
   assert.equal(result.ready, true);
-  assert.deepEqual(result.required, ['alice', 'bob']);
+  assert.deepEqual(result.approved, ['alice', 'bob']);
 });
 
-test('removing an unsubmitted review request removes that person from the roster', () => {
-  const before = pull({ requested_reviewers: [{ login: 'bob' }] });
-  assert.equal(evaluate_reviews(before, [review('alice')]).ready, false);
-  const after = evaluate_reviews(pull(), [review('alice')]);
-  assert.equal(after.ready, true);
-  assert.deepEqual(after.required, ['alice']);
+test('removing an unsubmitted reviewer does not turn one approval into two', () => {
+  assert.equal(evaluate_reviews(pull({ requested_reviewers: [{ login: 'bob' }] }), [review('alice')]).ready, false);
+  assert.equal(evaluate_reviews(pull(), [review('alice')]).ready, false);
 });
 
-test('a comment-only reviewer must explicitly approve, including review bots', () => {
-  for (const login of ['bob', 'review-bot[bot]']) {
-    const result = evaluate_reviews(pull(), [review('alice'), review(login, { state: 'COMMENTED' })]);
-    assert.deepEqual(result.missing, [login]);
-    assert.equal(result.ready, false);
-  }
+test('re-requesting one approval does not prevent two other approvals from passing', () => {
+  const result = evaluate_reviews(pull({ requested_reviewers: [{ login: 'carol' }] }),
+    [review('alice'), review('bob'), review('carol')]);
+  assert.equal(result.ready, true);
+  assert.deepEqual(result.approved, ['alice', 'bob']);
 });
 
-test('pending teams block without expanding the entire team into mandatory reviewers', () => {
-  const result = evaluate_reviews(pull({ requested_teams: [{ slug: 'maintainers' }] }), [review('alice')]);
-  assert.deepEqual(result.required, ['alice']);
-  assert.deepEqual(result.pending_teams, ['maintainers']);
-  assert.equal(result.ready, false);
-  assert.equal(evaluate_reviews(pull(), [review('alice')]).ready, true);
-});
-
-test('a newly requested reviewer between API reads prevents success', () => {
+test('a new pending reviewer between API reads does not block two approvals', () => {
   const client = new FakeGitHub();
   client.fresh_pull = pull({ requested_reviewers: [{ login: 'carol' }] });
   const result = run_live(client);
   assert.equal(result.errors, 0);
-  assert.deepEqual(result.reports[0].missing, ['carol']);
+  assert.equal(result.reports[0].ready, true);
+  assert.equal(client.statuses.at(-1).state, 'success');
+  assert.deepEqual(client.merges, [1]);
+});
+
+test('a new change request between reads prevents success despite two approvals', () => {
+  const client = new FakeGitHub();
+  let calls = 0;
+  client.get_reviews = () => ++calls === 1 ? client.reviews :
+    [...client.reviews, review('carol', { state: 'CHANGES_REQUESTED' })];
+  assert.equal(run_live(client).reports[0].ready, false);
   assert.ok(client.statuses.every(status => status.state !== 'success'));
   assert.deepEqual(client.merges, []);
+});
+
+test('the trusted policy threshold controls reconciliation and native rule requirements', () => {
+  const client = new FakeGitHub();
+  const policy = { ...POLICY, minimum_approvals: 3 };
+  assert.equal(run_live(client, policy).reports[0].ready, false);
+  client.reviews.push(review('carol'));
+  assert.equal(run_live(client, policy).reports[0].ready, true);
+  assert.deepEqual(client.merges, []);
+  client.rules = structuredClone(RULES);
+  client.rules[1].parameters.required_approving_review_count = 3;
+  run_live(client, policy);
+  assert.deepEqual(client.merges, [1]);
 });

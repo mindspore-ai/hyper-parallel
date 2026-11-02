@@ -1,37 +1,37 @@
-# GitHub：Reviewers 全员批准后自动合并
+# GitHub：至少两人批准后自动合并
 
 中文 | [English](github_auto_merge.md)
 
-此功能按每个 PR 侧栏的 **Reviewers** 确定必审人员，不要求仓库维护团队全员参与。
-代码合入默认分支并完成下述仓库设置后才生效；添加工作流文件本身不会修改远端规则。
+此功能要求至少 **2 位不同的真人评审**批准 PR 的当前提交；其他尚未评审的人或团队不会增加批准人数要求。
+已有必需检查和仓库合入规则仍须通过。新审批逻辑在代码合入默认分支并完成下述仓库设置后生效，
+添加工作流文件本身不会修改远端规则。
 
 ## 审批规则
 
-必需状态名为 `all-reviewers-approved`，结果写到 PR 当前 head SHA。
+保留必需状态名 `all-reviewers-approved`，兼容已有 Ruleset 绑定。
+其含义改为**至少两份有效批准**，不再要求全员批准；结果写到 PR 当前 head SHA。
+人数阈值由可信策略中的 `minimum_approvals: 2` 配置。
 
-GitHub 的 `requested_reviewers` 只包含尚待评审的人；提交评审后，此人从该数组移到 reviews。
-因此检查合并两个来源：当前请求评审的用户，以及已经提交正式 review 的用户。
-普通 PR Conversation 评论不属于正式 review，不会增加必审人员。
-参考 [GitHub Review Requests API](https://docs.github.com/en/rest/pulls/review-requests)。
+- 每人只计一次，GitHub 登录名不区分大小写，以最新有效评审结论为准。
+- 批准必须是针对当前 head SHA 的 `APPROVED`；推送新提交后需要重新批准。
+- PR 作者和机器人不计入批准人数。
+- 已撤销的批准不再计数。仍有效的 `CHANGES_REQUESTED` 会阻塞，包括旧提交上的请求修改，
+  直到该评审人改为批准，或该请求修改被撤销。
+- 批准后的普通 review 评论不会取消批准；仅评论和未提交的草稿 review 不算批准。
+- 对已经批准的人重新请求评审，会暂停计入此人的批准，直到再次批准；其他两人的有效批准仍可满足人数要求。
+- 新增或移除其他待审人员、仅评论的评审人、待审团队，不会阻塞已有的两份有效批准。
+- Draft 和关闭的 PR 不通过。多个开放 PR 共用 head SHA 时，各 PR 都须满足条件才能发布共同的成功状态。
 
-- 每位评审人的有效结论都必须是针对当前 head SHA 的 `APPROVED`。
-- `CHANGES_REQUESTED`、被撤销的批准、仅 `COMMENTED`、仍被请求重新评审，均不通过。
-- 批准后的普通 review 评论不会取消批准；未提交的草稿 review 不参与判断。
-- 尚未评审的人被移出 Reviewers 后，不再必审。已提交 review 的人仍参与检查。
-- 新增评审人后，必须等此人批准。推送新提交后，旧 SHA 上的批准不再满足本检查。
-- PR 作者不参与自己的审批；没有任何独立评审人时不通过，避免空列表被视为全员批准。
-- 团队仍出现在 `requested_teams` 时等待其评审请求被 GitHub 满足；不展开为团队全员。
-- 机器人如果出现在正式 Reviewers 中，同样必须批准；仅发表评论的机器人不会自动视为批准。
-- Draft PR 不通过。多个 PR 共用同一个 head SHA 时，所有相关 PR 都满足条件才发布成功。
-
-例如：Reviewers 为 Alice、Bob、Carol 时，只需这三人批准。Alice 批准后，即使
-`requested_reviewers` 只剩 Bob、Carol，Alice 仍保留在本次检查的人员集合中。
+例如：Reviewers 为 Alice、Bob、Carol，Alice 和 Bob 批准当前提交后，即使 Carol 尚未评审，本检查也通过。
+若 Carol 请求修改，则仍需先解决该请求。GitHub 会独立执行评审权限、Code Owner、最近推送独立批准、
+讨论解决及其他已配置的合入规则；两人批准不会绕过这些要求。
+参考 [GitHub 审批规则](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets)。
 
 ## 文件和触发方式
 
 | 文件 | 用途 |
 | --- | --- |
-| [策略配置](../../.github/reviewer-approval-policy.json) | 仓库、目标分支和自动合并开关；不保存人员名单 |
+| [策略配置](../../.github/reviewer-approval-policy.json) | 仓库、目标分支、最低批准人数和自动合并开关 |
 | [检查逻辑](../../.github/scripts/reviewer-approval-gate.mjs) | 读取实时审批、发布必需状态、开启自动合并 |
 | [检查工作流](../../.github/workflows/reviewer-approval-gate.yml) | 在可信的默认分支上下文执行 |
 | [评审事件转接](../../.github/workflows/reviewer-approval-signal.yml) | 将 Fork 上的只读评审事件交给可信工作流处理 |
@@ -58,14 +58,14 @@ signal 不执行 PR 代码、不下载产物、不使用密钥；后续工作流
 3. 在保护目标分支的 **active Ruleset** 中，把 `all-reviewers-approved` 添加到
    **Require status checks to pass before merging**，来源选择 **GitHub Actions**（App ID `15368`）。
    保留已有 `label-check` 及其他质量检查。
-4. 保留 **Require a pull request before merging**、至少 1 个批准，以及
+4. 保留 **Require a pull request before merging**、**2 个必需批准**，以及
    **Dismiss stale pull request approvals when new commits are pushed**。
    现有 Code Owner、最近推送独立批准和讨论解决规则继续生效。
 5. 在 **Settings → General → Pull Requests** 勾选 **Allow auto-merge**。
-6. 用一个测试 PR 验收：两位 Reviewers 中只有一人批准时仍等待；第二人批准且其他必需检查通过后自动合并。
-   再分别验证新增/移除待审人员、撤销批准和推送新提交。
+6. 用有三位 Reviewers 的 PR 验收：只有一人批准时等待；两人批准且其他必需检查通过后，
+   即使第三人尚未评审，也可自动合并。再验证请求修改、撤销批准和推送新提交。
 
-检查通过后，脚本核对目标分支的实际生效规则。只有本检查绑定 GitHub Actions、要求审批并撤销旧批准，
+检查通过后，脚本核对目标分支的实际生效规则。只有本检查绑定 GitHub Actions、原生最低批准人数不低于策略阈值、要求撤销旧批准，
 且仓库开启 Auto-merge，才执行带 `--auto --merge --match-head-commit` 的合并命令。
 采用仓库当前允许的 Merge commit 方式，不使用 `--admin` 绕过规则。
 仓库开关或上述条件未配置时，只发布审批检查，不自动合并。
@@ -99,9 +99,9 @@ conda run -n py312 python .agent/scripts/check_agents_catalog.py
 工作流排队、API 不可用和 GitHub 定时任务延迟都可能延长它。
 脚本在发布成功前复查提交、目标分支、人员和审批，发生 API 错误时尽量把旧成功改成阻塞状态，
 但外部必需检查与 GitHub 合并动作不是同一个原子事务，不能保证零时间窗口。
-原生审批规则仍须保留；不能把本检查描述成 GitHub 平台内置的“全员审批原子校验”。
+仍须保留 GitHub 原生的至少两人批准和旧批准失效规则，在实际合入时执行平台审批检查。
 
-运行日志和 Actions Summary 会列出仍待批准的人及团队；PR 上的状态链接指向发布结果的工作流。
+运行日志和 Actions Summary 会列出批准人数、阈值、已批准人员及仍有效的请求修改；PR 上的状态链接指向发布结果的工作流。
 正式启用前还需在 GitHub 上验收事件触发、令牌权限、必需检查绑定和实际自动合并；本地测试不能替代这些验收。
 
 ## CI 通过标签的 24 小时有效期
