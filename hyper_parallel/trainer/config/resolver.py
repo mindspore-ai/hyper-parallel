@@ -687,7 +687,7 @@ def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
 
     target_node = dict(node)
     if "dataloader_type" in target_node:
-        raise _fail(f"{path}.dataloader_type", "renamed to sampler_type")
+        raise ConfigResolutionError(f"{path}.dataloader_type", "renamed to sampler_type")
 
     if "batch_adapter" in target_node:
         raise ConfigResolutionError(
@@ -699,6 +699,13 @@ def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
 
     collate_node = target_node.pop("collate_fn", None)
     get_batch_node = target_node.pop("get_batch", None)
+    policy_nodes = {name: target_node.pop(name, None) for name in ("cost_model", "balancing_algorithm")}
+    load_balance = None
+    if "load_balance" in target_node:
+        balance_node = target_node.pop("load_balance")
+        load_balance = normalize_value(
+            {} if balance_node is None else balance_node, dict[str, Any], path=f"{path}.load_balance",
+        )
     sampler_type = normalize_value(
         target_node.pop("sampler_type", "single"),
         Literal["single", "cyclic"],
@@ -730,6 +737,11 @@ def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
         target=target,
         collate_fn=collate_fn,
         get_batch=get_batch,
+        load_balance=load_balance,
+        **{
+            name: None if value is None else _resolve_target(value, path=f"{path}.{name}")
+            for name, value in policy_nodes.items()
+        },
         sampler_type=sampler_type,
         data_rearrange_map=data_rearrange_map,
         data_sharding=data_sharding,

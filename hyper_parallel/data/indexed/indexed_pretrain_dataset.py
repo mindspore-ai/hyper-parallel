@@ -296,7 +296,7 @@ class MockGPTDataset(_MockDataset):
         labels = sample[1:]
 
         raw_sample = {
-            "tokens": tokens,
+            "input_ids": tokens,
             "labels": labels,
         }
         raw_sample.update(self._build_ltor_fields(tokens, labels))
@@ -313,6 +313,31 @@ class GPTDataset(_IndexedPretrainDataset):
             raise ValueError("GPTDataset requires a low-level Dataset and split indices")
 
         self.document_index, self.sample_index, self.shuffle_index = self._build_document_sample_shuffle_indices()
+
+    def _plan_epochs(self, num_tokens_per_epoch: int) -> tuple[int, bool, int]:
+        """Choose the epoch count and whether to shuffle a short final epoch separately."""
+        num_epochs = 0
+        accumulated_tokens = 0
+        extra_token = int(self.config.add_extra_token_to_sequence)
+        requested_tokens = self.num_samples * self.config.sequence_length + extra_token
+        while accumulated_tokens < requested_tokens:
+            num_epochs += 1
+            accumulated_tokens += num_tokens_per_epoch
+
+        if num_epochs == 1:
+            separate_final_epoch = False
+            samples_without_final_epoch = 0
+        else:
+            samples_without_final_epoch = (
+                (num_epochs - 1) * num_tokens_per_epoch - extra_token
+            ) // self.config.sequence_length
+            samples_from_final_epoch = self.num_samples - samples_without_final_epoch
+            samples_per_epoch = (num_tokens_per_epoch - extra_token) // self.config.sequence_length
+
+            # Keep a small final epoch separate from the main shuffled range.
+            threshold = 0.80
+            separate_final_epoch = samples_from_final_epoch < int(threshold * samples_per_epoch)
+        return num_epochs, separate_final_epoch, samples_without_final_epoch
 
     def _build_document_sample_shuffle_indices(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Build or load the document, sample, and shuffle indices.
@@ -367,29 +392,7 @@ class GPTDataset(_IndexedPretrainDataset):
         if num_tokens_per_epoch <= 1:
             raise ValueError("The selected indexed split must contain at least two tokens")
 
-        # repeate documents for multi-epcho
-        num_epochs = 0
-        accumulated_tokens = 0
-        extra_token = int(self.config.add_extra_token_to_sequence)
-        requested_tokens = self.num_samples * self.config.sequence_length + extra_token
-        while accumulated_tokens < requested_tokens:
-            num_epochs += 1
-            accumulated_tokens += num_tokens_per_epoch
-
-        if num_epochs == 1:
-            separate_final_epoch = False
-            samples_without_final_epoch = 0
-        else:
-            samples_without_final_epoch = (
-                (num_epochs - 1) * num_tokens_per_epoch - extra_token
-            ) // self.config.sequence_length
-            samples_from_final_epoch = self.num_samples - samples_without_final_epoch
-            samples_per_epoch = (num_tokens_per_epoch - extra_token) // self.config.sequence_length
-
-            # Keep a small final epoch separate from the main shuffled range.
-            threshold = 0.80
-            separate_final_epoch = samples_from_final_epoch < int(threshold * samples_per_epoch)
-
+        num_epochs, separate_final_epoch, samples_without_final_epoch = self._plan_epochs(num_tokens_per_epoch)
         random_state = RandomState(self.config.random_seed)
 
         # Shuffle the repeated document IDs, optionally isolating the final epoch.
@@ -468,7 +471,7 @@ class GPTDataset(_IndexedPretrainDataset):
             raise ValueError("An input token is out of bounds of the tokenizer vocabulary")
 
         raw_sample = {
-            "tokens": tokens,
+            "input_ids": tokens,
             "labels": labels,
         }
         raw_sample.update(ltor_fields)
@@ -631,7 +634,7 @@ class GPTFromMRDataset(_IndexedPretrainDataset):
         labels[labels == self._pad_token_id] = 0
 
         raw_sample = {
-            "tokens": tokens,
+            "input_ids": tokens,
             "labels": labels,
         }
         raw_sample.update(ltor_fields)
@@ -762,7 +765,7 @@ class SFTFromMRDataset:
             labels[mask == 0] = IGNORE_INDEX
         if not np.any(labels != IGNORE_INDEX):
             raise ValueError("Prepared record has no effective targets")
-        return {"tokens": tokens.astype(np.int64), "labels": labels,
+        return {"input_ids": tokens.astype(np.int64), "labels": labels,
                 "cu_seq_lens": boundaries.astype(np.int32)}
 
     def _validate_record_layout(

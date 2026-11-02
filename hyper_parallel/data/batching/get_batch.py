@@ -56,6 +56,7 @@ class OmniParallelBatch:
             device: Any,
             pp_shared_data: bool = False,
             runtime_input_adapter: RuntimeInputAdapter | None = None,
+            dataloader_context: DataLoaderParallelContext | None = None,
             data_config: Mapping[str, Any] | None = None,
     ) -> None:
         """Create the DataLoader ownership and TP/CP transport context.
@@ -66,6 +67,7 @@ class OmniParallelBatch:
             pp_shared_data: Whether pipeline stages share the source batch.
             runtime_input_adapter: Provider of additional forward inputs.
             data_config: Dataset cache settings used by DataLoader ownership.
+            dataloader_context: Shared ownership and transport policy from the Trainer.
         """
         # if encoder_dp:
         #     raise NotImplementedError("OmniParallelBatch encoder_dp image-bucket distribution is not implemented")
@@ -77,7 +79,7 @@ class OmniParallelBatch:
             raise NotImplementedError("OmniParallelBatch does not support pipeline parallelism or pp_shared_data")
 
         source_config = data_config or {}
-        self.parallel_context = create_dataloader_parallel_context(
+        self.parallel_context = dataloader_context or create_dataloader_parallel_context(
             mesh_context,
             data_index_cache=bool(source_config.get("data_index_cache", False)),
             shared_storage=not bool(source_config.get("no_shared_storage", False)),
@@ -101,7 +103,7 @@ class OmniParallelBatch:
             *,
             external_batch: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Read on TP0, slice token fields for CP, then broadcast within TP."""
+        """Read on source owners, slice for CP, and distribute only if needed."""
         self._batch_index += 1
         local_batch = None
         if self.parallel_context.build_on_rank():
@@ -213,6 +215,7 @@ class TextParallelBatch:
             reset_attention_mask: bool = False,
             eod_mask_loss: bool = False,
             runtime_input_adapter: RuntimeInputAdapter | None = None,
+            dataloader_context: DataLoaderParallelContext | None = None,
     ) -> None:
         """Initialize the batch runtime and its parallel execution context.
 
@@ -222,7 +225,8 @@ class TextParallelBatch:
             tokenizer: Tokenizer providing EOD and padding token semantics.
             data_config: Dataset options used to build runtime LTR fields.
             pp_shared_data: Whether pipeline stages share the prepared batch.
-            source_type: ``online`` or ``indexed`` DataLoader batch contract.
+            source_type: ``online``, ``indexed``, or ``packed_text`` batch contract.
+                Packed text provides input_ids, shifted labels, and explicit cu_seq_lens.
             attention_mode: ``dense`` or ``compressed`` attention representation.
             causal: Whether attention uses left-to-right causal semantics.
             sliding_window: Sliding-window size, or ``None`` for full attention.
@@ -230,10 +234,11 @@ class TextParallelBatch:
             reset_attention_mask: Whether EOD starts an independent attention sequence.
             eod_mask_loss: Whether EOD tokens are excluded from the loss.
             runtime_input_adapter: Optional model-owned forward-input extension.
+            dataloader_context: Shared ownership and transport policy from the Trainer.
         """
         # pylint: disable=too-many-locals
 
-        self.parallel_context: DataLoaderParallelContext = create_dataloader_parallel_context(
+        self.parallel_context = dataloader_context or create_dataloader_parallel_context(
             mesh_context,
             data_index_cache=bool(data_config.get("data_index_cache", False)),
             shared_storage=not bool(data_config.get("no_shared_storage", False)),
@@ -255,42 +260,59 @@ class TextParallelBatch:
         self.runtime_input_adapter = runtime_input_adapter
         self._batch_flow_logged = False
 
-        if source_type == "online":
-            self.boundary_resolver = OnlineBoundaryResolver()
-            self.source_input_field = "input_ids"
-        elif source_type == "indexed":
-            eod_token_id = getattr(tokenizer, "eod", None)
-            self.boundary_resolver = IndexedBoundaryResolver(eod_token_id)
-            self.source_input_field = "tokens"
-        else:
-            raise ValueError(f"Unsupported batch source type: {source_type!r}")
+        self.boundary_resolver = self._build_boundary_resolver(source_type, tokenizer)
 
         self.pp_shared_data = pp_shared_data
         self.labels_are_shifted = bool(self.data_config.get("labels_are_shifted", True))
         create_attention_mask = bool(
             self.data_config.get("create_attention_mask_in_dataloader", attention_mode == "dense")
         )
+        self.eod_mask_loss = eod_mask_loss or bool(self.data_config.get("eod_mask_loss", False))
+        self._validate_attention_inputs(attention_mode, create_attention_mask)
         self.cp_sharder = CPBatchSharder(self.parallel_context)
         self.tp_broadcaster = TPBatchBroadcaster(self.parallel_context, device)
 
-        self.reset_position_ids = reset_position_ids or bool(self.data_config.get("reset_position_ids", False))
+        self.reset_position_ids = (
+            reset_position_ids or bool(self.data_config.get("reset_position_ids", False))
+            or source_type == "packed_text"
+        )
         resolved_reset_attention_mask = (
             reset_attention_mask
             or bool(self.data_config.get("reset_attention_mask", False))
-            or source_type == "online" or self.is_sft_dataset
+            or source_type in {"online", "packed_text"}
+            or self.is_sft_dataset
         )
-        self.eod_mask_loss = eod_mask_loss or bool(self.data_config.get("eod_mask_loss", False))
-        if self.is_sft_dataset:
-            if not self.labels_are_shifted or self.eod_mask_loss or not self.causal:
-                raise ValueError("Prepared records require shifted labels, causal attention and eod_mask_loss=False")
-            if (attention_mode == "compressed" or not create_attention_mask) and runtime_input_adapter is None:
-                raise ValueError("Prepared records without a dense mask require a boundary-aware runtime adapter")
         self.attention_runtime = AttentionRuntime(
             mode=attention_mode,
             create_mask=create_attention_mask,
             reset_mask=resolved_reset_attention_mask,
             sliding_window=sliding_window,
         )
+
+    @staticmethod
+    def _build_boundary_resolver(source_type: str, tokenizer: Any) -> OnlineBoundaryResolver | IndexedBoundaryResolver:
+        """Select sequence-boundary handling for the source's input_ids batch."""
+        if source_type in {"online", "packed_text"}:
+            return OnlineBoundaryResolver()
+        if source_type == "indexed":
+            return IndexedBoundaryResolver(getattr(tokenizer, "eod", None))
+        raise ValueError(f"Unsupported batch source type: {source_type!r}")
+
+    def _validate_attention_inputs(self, attention_mode: str, create_attention_mask: bool) -> None:
+        """Require shifted labels and document isolation for prepared text records."""
+        if self.source_type == "packed_text":
+            if not self.labels_are_shifted:
+                raise ValueError("Packed text batches require shifted labels; labels_are_shifted must be True")
+            if not create_attention_mask or (attention_mode == "compressed" and self.runtime_input_adapter is None):
+                raise ValueError(
+                    "Packed text batches require document-boundary attention: enable "
+                    "create_attention_mask_in_dataloader and supply a runtime_input_adapter for compressed attention"
+                )
+        if self.is_sft_dataset:
+            if not self.labels_are_shifted or self.eod_mask_loss or not self.causal:
+                raise ValueError("Prepared records require shifted labels, causal attention and eod_mask_loss=False")
+            if (attention_mode == "compressed" or not create_attention_mask) and self.runtime_input_adapter is None:
+                raise ValueError("Prepared records without a dense mask require a boundary-aware runtime adapter")
 
     def __call__(
             self,
@@ -304,8 +326,7 @@ class TextParallelBatch:
         Returns:
             Model inputs and loss inputs for one forward-backward step.
         """
-        source_batch = self._read_source_batch(data_iterator)
-        canonical_batch = self._normalize_source_batch(source_batch)
+        canonical_batch = self._read_source_batch(data_iterator)
         cu_seq_lens = self._resolve_sequence_boundaries(canonical_batch)
         cp_local_batch = self.cp_sharder.shard(canonical_batch)
         parallel_batch = self.tp_broadcaster.broadcast(
@@ -390,27 +411,13 @@ class TextParallelBatch:
             self._batch_flow_logged = True
 
     def _read_source_batch(self, data_iterator: Any) -> Mapping[str, Any] | None:
-        """Read one complete batch on TP rank zero of each CP coordinate."""
+        """Advance the source only on ranks selected by the shared context."""
         if self.parallel_context.build_on_rank():
             source_batch = next(data_iterator)
         else:
             source_batch = None
 
         return source_batch
-
-    def _normalize_source_batch(
-            self,
-            source_batch: Mapping[str, Any] | None,
-    ) -> Mapping[str, Any] | None:
-        """Normalize Indexed and Online token fields before parallel processing."""
-        if source_batch is None:
-            return None
-
-        canonical_batch = dict(source_batch)
-        if self.source_input_field != "input_ids":
-            canonical_batch["input_ids"] = canonical_batch.pop(self.source_input_field)
-
-        return canonical_batch
 
     def _resolve_sequence_boundaries(
             self,

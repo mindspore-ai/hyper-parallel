@@ -22,6 +22,7 @@ from hyper_parallel.data.batching.build_collate_fn import (
     build_online_text_collate_fn,
 )
 from hyper_parallel.data.batching.build_dataloader import (
+    DynamicBatchDataLoader,
     FixedBatchDataLoader,
     OmniPackingLoader,
     TokenBatchLoader,
@@ -41,6 +42,7 @@ from hyper_parallel.data.batching.runtime_input import (
 
 __all__ = [
     "FirstFitPackingSelector",
+    "DynamicBatchDataLoader",
     "FixedBatchDataLoader",
     "OmniParallelBatch",
     "OmniPackingLoader",

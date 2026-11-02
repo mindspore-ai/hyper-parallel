@@ -43,7 +43,9 @@ class DataLoaderParallelContext:
 
     ``dp_rank`` and ``dp_world_size`` are consumed only by online iterable
     sources. Mapping sources leave DP sample ownership to their batch sampler.
-    Every CP coordinate uses its TP rank zero as the DataLoader source rank.
+    Native loading reads on ``tp_source_rank`` at every CP coordinate.
+    With ``tp_source_rank=None``, the loader distributes batches itself and
+    every model rank advances it; no additional TP broadcast is needed.
     """
 
     build_on_rank: Callable[[], bool] = _always_build
@@ -51,6 +53,7 @@ class DataLoaderParallelContext:
     barrier: Callable[[], None] = _no_barrier
     distributed_enabled: bool = False
     data_index_cache: bool = False
+    tp_source_rank: int | None = 0
     dp_rank: int = 0
     dp_world_size: int = 1
     tp_rank: int = 0
@@ -61,10 +64,10 @@ class DataLoaderParallelContext:
     cp_mesh: Any = None
 
 
-def _is_dataloader_rank(mesh_context: Any) -> bool:
+def _is_dataloader_rank(mesh_context: Any, source_rank: int) -> bool:
     """Return whether this CP coordinate owns its DataLoader input."""
     tp_rank = int(getattr(mesh_context, "tp_rank", 0))
-    owns_dataloader = tp_rank == 0
+    owns_dataloader = tp_rank == source_rank
     return owns_dataloader
 
 
@@ -85,6 +88,7 @@ def create_dataloader_parallel_context(
         mesh_context: Any,
         *,
         data_index_cache: bool = False,
+        tp_source_rank: int | None = 0,
         shared_storage: bool = True,
         barrier: Callable[[], None] | None = None,
 ) -> DataLoaderParallelContext:
@@ -93,6 +97,8 @@ def create_dataloader_parallel_context(
     Args:
         mesh_context: Trainer mesh state that provides TP, CP, and DP ranks.
         data_index_cache: Whether every Dataset rank may consume an existing index cache.
+        tp_source_rank: TP-local source rank, or ``None`` when the loader already
+            distributes batches to all model ranks.
         shared_storage: Whether Dataset index caches are visible to every process.
         barrier: Optional Dataset-specific long-wait synchronization callback.
 
@@ -106,11 +112,19 @@ def create_dataloader_parallel_context(
         world_size = 1
     distributed_enabled = device_mesh is not None and world_size > 1
     if not distributed_enabled:
-        dataloader_context = DataLoaderParallelContext(data_index_cache=data_index_cache)
+        dataloader_context = DataLoaderParallelContext(
+            data_index_cache=data_index_cache,
+            tp_source_rank=tp_source_rank,
+        )
         logger.debug("Created standalone DataLoader context: data_index_cache=%s", data_index_cache)
         return dataloader_context
 
-    build_on_rank = partial(_is_dataloader_rank, mesh_context)
+    tp_size = int(getattr(mesh_context, "tp_size", 1))
+    if tp_source_rank is not None and not 0 <= tp_source_rank < tp_size:
+        raise ValueError("tp_source_rank must be a rank within the TP group or None")
+    build_on_rank = _always_build if tp_source_rank is None else partial(
+        _is_dataloader_rank, mesh_context, tp_source_rank,
+    )
     build_cache_on_rank = partial(_is_global_cache_builder_rank, shared_storage)
     mesh_dim_names = tuple(getattr(device_mesh, "mesh_dim_names", ()) or ())
     tp_mesh = device_mesh["tp"] if "tp" in mesh_dim_names else None
@@ -121,6 +135,7 @@ def create_dataloader_parallel_context(
         barrier=barrier or dist.barrier,
         distributed_enabled=True,
         data_index_cache=data_index_cache,
+        tp_source_rank=tp_source_rank,
         dp_rank=int(getattr(mesh_context, "dp_rank", 0)),
         dp_world_size=int(getattr(mesh_context, "dp_size", 1)),
         tp_rank=int(getattr(mesh_context, "tp_rank", 0)),
@@ -191,7 +206,10 @@ def build_dataset_for_dataloader(
 
     local_dataset = None
     builds_cache_first = dataloader_context.build_cache_on_rank()
-    owns_dataset = dataloader_context.data_index_cache or dataloader_context.build_on_rank()
+    owns_dataset = (
+        dataloader_context.data_index_cache
+        or dataloader_context.build_on_rank()
+    )
     logger.debug(
         "DataLoader Dataset synchronization: owns_dataset=%s, builds_cache_first=%s",
         owns_dataset,
