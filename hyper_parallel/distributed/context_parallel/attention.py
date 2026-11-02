@@ -157,6 +157,12 @@ def _mla_cp_alltoall(attention_functions, context):
     attention_functions["npu_fa_rescale"] = mla_with_sequence_head_exchange
 
 
+def _gather_dsa_teacher_heads(tensor: Tensor, head_dim: int, context: Any) -> Tensor:
+    """Restore all teacher heads without adding an auxiliary gradient path."""
+    return torch.cat(
+        differentiable_all_gather(tensor.detach().contiguous(), group=context.group), dim=head_dim)
+
+
 def _dsa_cp_alltoall(attention_module, attention_functions, context):
     """Configure CP all-to-all for the DSA indexer, attention, and KL loss."""
     original_indexer = attention_module.dsa_lightning_indexer_forward
@@ -169,10 +175,9 @@ def _dsa_cp_alltoall(attention_module, attention_functions, context):
                 module: Any, index_query: Tensor, index_key: Tensor,
                 merge_weight: Tensor,
                 actual_q_len: Any, actual_kv_len: Any) -> Any:
-            """Run the DSA indexer on the CP-exchanged sequence layout."""
-            index_query = _sequence_to_head(index_query, context)
-            merge_weight = _sequence_to_head(
-                merge_weight.unsqueeze(-1), context).squeeze(-1)
+            """Keep the full head reduction before the non-linear top-k."""
+            index_query = _gather_sequence(index_query, context)
+            merge_weight = _gather_sequence(merge_weight, context)
             index_key = _gather_sequence(index_key, context)
             length = index_query.size(1)
             return original_indexer(
@@ -243,10 +248,12 @@ def _dsa_cp_alltoall(attention_module, attention_functions, context):
                     _dsa_tensor_context.set(None)
                     length = saved.query.size(1)
                     arguments.update(
-                        query=saved.query.flatten(0, 1),
+                        query=_gather_dsa_teacher_heads(saved.query, 2, context).flatten(0, 1),
                         key=saved.key.flatten(0, 1),
-                        query_rope=saved.q_pe.flatten(0, 1),
+                        query_rope=_gather_dsa_teacher_heads(saved.q_pe, 2, context).flatten(0, 1),
                         key_rope=saved.k_pe.flatten(0, 1),
+                        softmax_max=_gather_dsa_teacher_heads(arguments["softmax_max"], -1, context),
+                        softmax_sum=_gather_dsa_teacher_heads(arguments["softmax_sum"], -1, context),
                         actual_seq_qlen=_global_seq_len(
                             arguments["actual_seq_qlen"], length, saved.query.device),
                         actual_seq_klen=_global_seq_len(
