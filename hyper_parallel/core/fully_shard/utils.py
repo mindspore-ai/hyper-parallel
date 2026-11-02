@@ -23,12 +23,14 @@ directly.
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass, fields, replace
 from typing import Any, Callable, Dict, Optional
 
 import torch
 from torch import Tensor, nn
 from torch.nn.utils.rnn import PackedSequence
+from torch.utils.weak import WeakIdKeyDictionary
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.placement_types import Placement
@@ -256,12 +258,52 @@ class MixedPrecisionPolicy:
         param_dtype: Data type for parameter computation. If None, uses original dtype.
         reduce_dtype: Data type for gradient reduction. If None, uses param_dtype.
         output_dtype: Data type for module outputs. If None, no casting applied.
+        custom_params: Mapping from original Parameter objects to dictionaries
+            containing ``param_dtype`` and/or ``reduce_dtype`` overrides. Each
+            provided field takes precedence over the corresponding policy field;
+            an omitted field inherits it. Explicit None preserves the parameter's
+            stored dtype for computation or its gradient dtype for reduction.
+            Keys are held weakly and compared by identity, so the policy does not
+            retain original parameters after fully_shard replaces them. Pass the
+            policy to each fully_shard call that owns an overridden parameter.
+
+    Note:
+        Overrides are captured when fully_shard constructs each parameter's state.
+        They do not change sharded storage, input casting, or output casting.
+        Forward operands must support the overridden compute dtype; set
+        ``cast_forward_inputs=False`` when the model handles input casting itself.
     """
     param_dtype: Optional[DType] = None
     reduce_dtype: Optional[DType] = None
     output_dtype: Optional[DType] = None
     cast_forward_inputs: bool = True
     apply_grad_on_fp32_main_grad: bool = False
+    custom_params: Optional[Mapping[nn.Parameter, Mapping[str, Optional[DType]]]] = None
+
+    def __post_init__(self) -> None:
+        """Validate overrides and replace strong parameter keys with weak keys."""
+        if self.custom_params is None:
+            return
+        self._check_custom_param()
+        self.custom_params = WeakIdKeyDictionary({
+            parameter: dict(custom_dtypes)
+            for parameter, custom_dtypes in self.custom_params.items()
+        })
+
+    def _check_custom_param(self) -> None:
+        """Validate configured parameter keys and dtype values without changing the mapping."""
+        if not isinstance(self.custom_params, Mapping):
+            raise ValueError("custom_params must map Parameter objects to dtype dictionaries")
+        for parameter, custom_dtypes in self.custom_params.items():
+            if not isinstance(parameter, nn.Parameter):
+                raise ValueError("custom_params keys must be Parameter objects")
+            if not isinstance(custom_dtypes, Mapping):
+                raise ValueError("custom_params values must be dtype dictionaries")
+            if custom_dtypes.keys() - {"param_dtype", "reduce_dtype"}:
+                raise ValueError("custom_params only supports param_dtype and reduce_dtype overrides")
+            for dtype_name, dtype in custom_dtypes.items():
+                if dtype is not None and not isinstance(dtype, torch.dtype):
+                    raise ValueError(f"custom_params {dtype_name} must be torch.dtype or None, got {dtype!r}")
 
 
 @dataclass
