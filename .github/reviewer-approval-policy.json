@@ -1,5 +1,6 @@
 {
   "repository": "mindspore-ai/hyper-parallel",
   "base_branches": ["master", "r1.0.0", "r1.1.0"],
-  "auto_merge": true
+  "auto_merge": true,
+  "minimum_approvals": 2
 }
