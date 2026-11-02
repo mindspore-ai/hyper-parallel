@@ -58,7 +58,7 @@ _EXPORT_TO_MODULE = {
     "sinkhorn": "sinkhorn",
     "situ": "activation_situ",
     "situ_packed": "activation_situ",
-    "swiglu": "swiglu",
+    "swiglu": "activation_swiglu",
 }
 
 
