@@ -422,6 +422,8 @@ class MLAContextParallel:
             cp_mesh: Framework-owned CP mesh, or None for degree one.
             rotary_fn: Optional local rotary callback; None uses generic RoPE.
             attention_interface: Optional attention callback; None uses generic NPU attention.
+                It also receives ``mla_head_offset`` and ``mla_local_heads``: the position of its
+                heads among the TP-local heads, which Ulysses splits across CP ranks.
         """
         if (1 if cp_mesh is None else cp_mesh.size()) != plan.cp_degree:
             raise ValueError("MLACPPlan degree must match the CP mesh")
@@ -487,6 +489,7 @@ class MLAContextParallel:
             module, query, key, value, attention_mask, scaling=module.scaling,
             is_causal=causal, actual_seq_qlen=lengths, actual_seq_kvlen=key_lengths,
             pre_tokens=2147483647, next_tokens=0 if causal else 2147483647,
+            mla_head_offset=self.head_rank * self.plan.compute_heads, mla_local_heads=self.plan.local_heads,
         )[0]
         if self.plan.ulysses_degree > 1:
             output = ulysses_head_to_seq(output, 1, 2, self.ulysses_mesh)
