@@ -11,6 +11,8 @@
   <p>
     <a href="#-快速开始">快速开始</a>
     &emsp;·&emsp;
+    <a href="#supported-models">支持模型</a>
+    &emsp;·&emsp;
     <a href="docs/index.md">文档中心</a>
     &emsp;·&emsp;
     <a href="docs/api/api_reference.md">API 参考</a>
@@ -51,9 +53,7 @@ HyperParallel 面向昇腾超节点提供分布式并行加速能力。针对资
 
 > [HyperParallel 模型](hyper_parallel/models/README.md) 面向训练用户，通过 YAML 配置 Hugging Face 模型、数据、优化器、并行策略以及保存与恢复方式。
 >
-> **支持模型**
->
-> - [Qwen3-30B-A3B](hyper_parallel/models/qwen3_moe/recipes/train.yaml)
+> 已支持的模型与配置入口见[支持模型](#supported-models)。
 
 ### HyperParallel Core
 
@@ -82,6 +82,25 @@ HyperParallel 面向昇腾超节点提供分布式并行加速能力。针对资
 > <summary><strong>未来计划</strong></summary>
 >
 > </details>
+
+---
+
+<a id="supported-models"></a>
+
+## 支持模型
+
+详细能力与在研进展见[模型路线图](https://github.com/mindspore-ai/hyper-parallel/issues/1305)。
+
+| 模型 | 示例配置 / 文档 |
+|---|---|
+| Qwen3 | [模型入口](hyper_parallel/models/qwen3/) |
+| Qwen3-MoE | [recipes](hyper_parallel/models/qwen3_moe/recipes/) |
+| Qwen3-VL-MoE | [模型适配](hyper_parallel/models/qwen3_vl_moe/) |
+| Qwen3.5 Dense | [模型入口](hyper_parallel/models/qwen3_5/) |
+| DeepSeek-V3 | [recipes](hyper_parallel/models/deepseek_v3/recipes/) |
+| DeepSeek-V3.2 | [recipes](hyper_parallel/models/deepseek_v32/recipes/) |
+| DeepSeek-V4.1 | [文本配置](examples/training_demo/deepseek_v41/train_deepseek_v41_online.yaml) · [多模态配置](examples/training_demo/deepseek_v41/train_deepseek_v41_vlm_online.yaml) |
+| Kimi-K2.6 | [recipes](hyper_parallel/models/kimi_k26/recipes/) |
 
 ---
 
@@ -173,6 +192,15 @@ TP、CP、EP、PP 等组合方式见 [特性使用指南](docs/guide/)，公开�
 - HyperParallel-MoE: Multi-Core Interleaved Scheduling for Fast MoE Training on Ascend NPUs [[paper](https://arxiv.org/abs/2605.23764)]
 - HyperParallel: A Supernode-Affinity AI Framework [[paper](https://arxiv.org/abs/2603.03731)]
 - HyperOffload: Graph-Driven Hierarchical Memory Management for Large Language Models on SuperNode Architectures [[paper](https://arxiv.org/abs/2602.00748)]
+
+---
+
+## 致谢
+
+感谢以下合作伙伴与项目的出色工作和支持：
+
+- [Pengcheng Laboratory](https://www.pcl.ac.cn/)
+- [LlamaFactory](https://github.com/hiyouga/LlamaFactory)
 
 ---
 

@@ -67,15 +67,22 @@ through certain syntax constraints, utilising advanced graph optimisation capabi
 - Remote Tensor Prefetching and Caching, Full Model Offload: DDP/HSDP+Offload replaces complex parallel modes such as
   DP/TP/PP/CP/SP/EP, simplifying system design and improving performance;
 
-## Key Features
+## Supported Models
 
-- Models
-    - [x] DeepSeekV3
-    - [x] Qwen3.5-0.8B-Base
-    - [x] Qwen3.5-35B-A3B-Base (MoE)
-    - [x] Qwen3-VL-30B-A3B-Instruct (MoE)
-    - [ ] DeepSeekV3.2
-    - [ ] Qwen3-Omni
+See the [Models Roadmap](https://github.com/mindspore-ai/hyper-parallel/issues/1305) for supported features and ongoing work.
+
+| Model | Example configuration / Guide |
+|---|---|
+| Qwen3 | [Model adapter](hyper_parallel/models/qwen3/) |
+| Qwen3-MoE | [recipes](hyper_parallel/models/qwen3_moe/recipes/) |
+| Qwen3-VL-MoE | [Model adapter](hyper_parallel/models/qwen3_vl_moe/) |
+| Qwen3.5 Dense | [Model adapter](hyper_parallel/models/qwen3_5/) |
+| DeepSeek-V3 | [recipes](hyper_parallel/models/deepseek_v3/recipes/) |
+| DeepSeek-V3.2 | [recipes](hyper_parallel/models/deepseek_v32/recipes/) |
+| DeepSeek-V4.1 | [Text configuration](examples/training_demo/deepseek_v41/train_deepseek_v41_online.yaml) · [Multimodal configuration](examples/training_demo/deepseek_v41/train_deepseek_v41_vlm_online.yaml) |
+| Kimi-K2.6 | [recipes](hyper_parallel/models/kimi_k26/recipes/) |
+
+## Key Features
 
 - HyperShard
     - DTensor
@@ -352,6 +359,13 @@ model.layers[1] = swap_wrapper(model.layers[1])
 If you have any suggestions for HyperParallel, please contact us through issues and we will address them promptly.
 If you are interested in HyperParallel's technology or would like to contribute code, you are welcome to join
 the [Parallel Training System SIG](https://www.mindspore.cn/sig/Parallel%20Training%20System).
+
+## Acknowledgements
+
+Thanks to the following partners and projects for their excellent work and support:
+
+- [Pengcheng Laboratory](https://www.pcl.ac.cn/)
+- [LlamaFactory](https://github.com/hiyouga/LlamaFactory)
 
 ## License
 
