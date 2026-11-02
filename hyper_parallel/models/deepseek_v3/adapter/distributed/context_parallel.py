@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from functools import wraps
 from typing import Any, Literal
 
@@ -84,66 +84,9 @@ def _validate_up_projections(target_module: MLAAttention, plan: MLACPPlan) -> No
             raise ValueError("MLA CP must be installed before other up-projection forward adapters")
 
 
-@inner_wrapper
-def mla_cp_wrapper(
-    target_module: nn.Module,
-    mesh: Any,
-    tp_mesh: Any,
-    cp_mesh: Any,
-    ep_mesh: Any,
-    *,
-    strategy: MLACPStrategy = "expanded_ulysses",
-    overlap: bool = False,
-    ulysses_degree: int | None = None,
-    kv_exchange: Literal["all_gather", "all_to_all_v"] = "all_gather",
-) -> list[_ForwardRewriteRequest]:
-    """Install NPU MLA CP after replacement and TP sharding, before FSDP.
-
-    The generic attention boundary owns the TP output reduction. Parameter
-    gradients follow the source-layout reducer: up/Wo shards sum over CP,
-    replicated down/Norm parameters additionally sum the TP contributions.
-    No TP activation reduction is inserted inside this runtime.
-
-    Args:
-        target_module: The MLAAttention replacement with TP-local projections.
-        mesh: Full framework mesh, supplied by the recipe rewriter.
-        tp_mesh: TP axis or None when degree one is omitted by the builder.
-        cp_mesh: CP axis or None when degree one is omitted by the builder.
-        ep_mesh: Unused expert axis supplied by the recipe rewriter.
-        strategy: Expanded QKV Ulysses or expanded Q with latent KV AllGather.
-        overlap: Overlap forward input communication with independent MLA projections.
-        ulysses_degree: Defaults to CP size; at TP1, one selects KV AllGather,
-            and intermediate CP divisors select Ulysses x AllGather.
-        kv_exchange: Full KV collection or selective causal-prefix distribution.
-
-    Returns:
-        Atomic forward rewrites preserving projection parameters and hooks.
-    """
-    del mesh, ep_mesh
-    if not isinstance(target_module, MLAAttention):
-        raise ValueError("mla_cp_wrapper requires the MLAAttention replacement")
-    for name, axis in (("TP", tp_mesh), ("CP", cp_mesh)):
-        if axis is not None and (axis.size() < 1 or getattr(axis, "ndim", 1) != 1):
-            raise ValueError(f"mla_cp_wrapper requires a one-dimensional {name} mesh")
-    cp_degree = 1 if cp_mesh is None else cp_mesh.size()
-    tp_degree = 1 if tp_mesh is None else tp_mesh.size()
-    if getattr(target_module, "mla_cp_runtime", None) is not None:
-        raise ValueError("MLA CP is already configured on this module")
-    if target_module.attention_dropout != 0 or target_module.sliding_window is not None:
-        raise ValueError("MLA CP requires dropout=0 and no implicit sliding_window; use a supported boolean mask")
-    dimensions = MLADimensions(
-        heads=target_module.config.num_attention_heads, q_rank=target_module.q_lora_rank,
-        kv_rank=target_module.kv_lora_rank, nope_dim=target_module.qk_nope_head_dim,
-        rope_dim=target_module.qk_rope_head_dim, value_dim=target_module.v_head_dim,
-    )
-    plan = MLACPPlan(
-        dimensions=dimensions, cp_degree=cp_degree, strategy=strategy,
-        tp_degree=tp_degree, overlap=overlap, ulysses_degree=ulysses_degree, kv_exchange=kv_exchange,
-    )
-    plan.validate_scale(target_module.scaling)
-    _validate_up_projections(target_module, plan)
+def _make_cp_forward(target_module: MLAAttention, runtime: MLAContextParallel) -> Callable:
+    """Build the original forward contract around one explicit CP runtime."""
     original = target_module.forward
-    runtime = MLAContextParallel(plan, cp_mesh)
 
     @wraps(original)
     def cp_forward(
@@ -177,6 +120,75 @@ def mla_cp_wrapper(
         )
         attn_output = attn_output.reshape(batch_size, sequence_length, -1).contiguous()
         return target_module.o_proj(attn_output), attn_weights
+
+    return cp_forward
+
+
+@inner_wrapper
+def mla_cp_wrapper(
+    target_module: nn.Module,
+    mesh: Any,
+    tp_mesh: Any,
+    cp_mesh: Any,
+    ep_mesh: Any,
+    *,
+    strategy: MLACPStrategy = "expanded_ulysses",
+    overlap: bool = False,
+    ulysses_degree: int | None = None,
+    kv_exchange: Literal["all_gather", "all_to_all_v"] = "all_gather",
+    rotary_fn: Callable[..., torch.Tensor] | None = None,
+    attention_interface: Callable[..., tuple[torch.Tensor, Any]] | None = None,
+) -> list[_ForwardRewriteRequest]:
+    """Install NPU MLA CP after replacement and TP sharding, before FSDP.
+
+    The generic attention boundary owns the TP output reduction. Parameter
+    gradients follow the source-layout reducer: up/Wo shards sum over CP,
+    replicated down/Norm parameters additionally sum the TP contributions.
+    No TP activation reduction is inserted inside this runtime.
+
+    Args:
+        target_module: The MLAAttention replacement with TP-local projections.
+        mesh: Full framework mesh, supplied by the recipe rewriter.
+        tp_mesh: TP axis or None when degree one is omitted by the builder.
+        cp_mesh: CP axis or None when degree one is omitted by the builder.
+        ep_mesh: Unused expert axis supplied by the recipe rewriter.
+        strategy: Expanded QKV Ulysses or expanded Q with latent KV AllGather.
+        overlap: Overlap forward input communication with independent MLA projections.
+        ulysses_degree: Defaults to CP size; at TP1, one selects KV AllGather,
+            and intermediate CP divisors select Ulysses x AllGather.
+        kv_exchange: Full KV collection or selective causal-prefix distribution.
+        rotary_fn: Optional local rotary callback; None retains the generic implementation.
+        attention_interface: Optional attention callback; None retains the generic NPU path.
+
+    Returns:
+        Atomic forward rewrites preserving projection parameters and hooks.
+    """
+    del mesh, ep_mesh
+    if not isinstance(target_module, MLAAttention):
+        raise ValueError("mla_cp_wrapper requires the MLAAttention replacement")
+    for name, axis in (("TP", tp_mesh), ("CP", cp_mesh)):
+        if axis is not None and (axis.size() < 1 or getattr(axis, "ndim", 1) != 1):
+            raise ValueError(f"mla_cp_wrapper requires a one-dimensional {name} mesh")
+    cp_degree = 1 if cp_mesh is None else cp_mesh.size()
+    tp_degree = 1 if tp_mesh is None else tp_mesh.size()
+    if getattr(target_module, "mla_cp_runtime", None) is not None:
+        raise ValueError("MLA CP is already configured on this module")
+    if target_module.attention_dropout != 0 or target_module.sliding_window is not None:
+        raise ValueError("MLA CP requires dropout=0 and no implicit sliding_window; use a supported boolean mask")
+    dimensions = MLADimensions(
+        heads=target_module.config.num_attention_heads, q_rank=target_module.q_lora_rank,
+        kv_rank=target_module.kv_lora_rank, nope_dim=target_module.qk_nope_head_dim,
+        rope_dim=target_module.qk_rope_head_dim, value_dim=target_module.v_head_dim,
+    )
+    plan = MLACPPlan(
+        dimensions=dimensions, cp_degree=cp_degree, strategy=strategy,
+        tp_degree=tp_degree, overlap=overlap, ulysses_degree=ulysses_degree, kv_exchange=kv_exchange,
+    )
+    plan.validate_scale(target_module.scaling)
+    _validate_up_projections(target_module, plan)
+    runtime = MLAContextParallel(plan, cp_mesh, rotary_fn=rotary_fn, attention_interface=attention_interface)
+
+    cp_forward = _make_cp_forward(target_module, runtime)
 
     requests = [_ForwardRewriteRequest(
         target_module, cp_forward,

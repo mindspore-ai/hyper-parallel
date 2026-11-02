@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 import math
@@ -348,12 +348,13 @@ def _query(
     latent: torch.Tensor,
     positions: tuple[torch.Tensor, torch.Tensor] | None,
     heads: int,
+    rotary_fn=_apply_mla_rope,
 ) -> torch.Tensor:
     """Expand and rotate the query through the managed TP-local projection module."""
     projected = module.q_b_proj(latent)
     projected = projected.view(*latent.shape[:2], heads, module.qk_head_dim)
     content, rotary = projected.split((module.qk_nope_head_dim, module.qk_rope_head_dim), dim=-1)
-    rotary = _apply_mla_rope(rotary, positions, interleaved=module.rotary_interleaved)
+    rotary = rotary_fn(rotary, positions, interleaved=module.rotary_interleaved)
     return torch.cat((content, rotary), dim=-1).transpose(1, 2)
 
 
@@ -411,11 +412,26 @@ def _validate_state(module: nn.Module, plan: MLACPPlan, state: MLAState) -> None
 class MLAContextParallel:
     """Run CP over normalized latents; parameter-gradient reduction belongs to the trainer."""
 
-    def __init__(self, plan: MLACPPlan, cp_mesh: Any) -> None:
-        """Bind a validated execution plan to the framework-owned CP mesh."""
+    def __init__(self, plan: MLACPPlan, cp_mesh: Any, *,
+                 rotary_fn: Callable[..., torch.Tensor] | None = None,
+                 attention_interface: Callable[..., tuple[torch.Tensor, Any]] | None = None) -> None:
+        """Bind a validated execution plan to the framework-owned CP mesh.
+
+        Args:
+            plan: Validated MLA CP communication and head plan.
+            cp_mesh: Framework-owned CP mesh, or None for degree one.
+            rotary_fn: Optional local rotary callback; None uses generic RoPE.
+            attention_interface: Optional attention callback; None uses generic NPU attention.
+        """
         if (1 if cp_mesh is None else cp_mesh.size()) != plan.cp_degree:
             raise ValueError("MLACPPlan degree must match the CP mesh")
+        if rotary_fn is not None and not callable(rotary_fn):
+            raise TypeError("rotary_fn must be callable")
+        if attention_interface is not None and not callable(attention_interface):
+            raise TypeError("attention_interface must be callable")
         self.plan = plan
+        self.rotary_fn = _apply_mla_rope if rotary_fn is None else rotary_fn
+        self.attention_interface = npu_fusion_attention_forward if attention_interface is None else attention_interface
         self.cp_mesh = cp_mesh
         rank = 0 if cp_mesh is None else cp_mesh.get_local_rank()
         self.query_rank, self.head_rank = divmod(rank, plan.ulysses_degree)
@@ -463,19 +479,11 @@ class MLAContextParallel:
             lengths, key_lengths = partition.query_lengths, partition.key_lengths
         positions = _positions(position_embeddings, state, dimensions.rope_dim)
         _validate_state(module, self.plan, state)
-        rotated_key = _apply_mla_rope(
+        rotated_key = self.rotary_fn(
             state.key_rope.unsqueeze(2), positions, interleaved=module.rotary_interleaved,
         ).squeeze(2)
-        if self.plan.overlap and degree > 1:
-            prepare = self._expanded_overlap if self.plan.strategy == "expanded_ulysses" else self._latent_overlap
-            query, key, value = prepare(module, state, positions, rotated_key, partition)
-        else:
-            query = _query(module, state.query_latent, positions, self.plan.local_heads)
-            if self.plan.strategy == "expanded_ulysses" or degree == 1:
-                query, key, value = self._expanded(module, state, query, rotated_key, partition)
-            else:
-                query, key, value = self._latent(module, state, query, rotated_key, partition)
-        output = npu_fusion_attention_forward(
+        query, key, value = self._attention_inputs(module, state, positions, rotated_key, partition)
+        output = self.attention_interface(
             module, query, key, value, attention_mask, scaling=module.scaling,
             is_causal=causal, actual_seq_qlen=lengths, actual_seq_kvlen=key_lengths,
             pre_tokens=2147483647, next_tokens=0 if causal else 2147483647,
@@ -486,6 +494,19 @@ class MLAContextParallel:
         if tuple(output.shape) != expected:
             raise RuntimeError(f"MLA CP output has shape {tuple(output.shape)}, expected {expected}")
         return output, None
+
+    def _attention_inputs(self, module, state, positions, rotated_key, partition):
+        """Select one existing QKV preparation schedule before invoking local attention."""
+        if self.plan.overlap and self.plan.cp_degree > 1:
+            prepare = self._expanded_overlap if self.plan.strategy == "expanded_ulysses" else self._latent_overlap
+            query, key, value = prepare(module, state, positions, rotated_key, partition)
+        else:
+            query = _query(module, state.query_latent, positions, self.plan.local_heads, self.rotary_fn)
+            if self.plan.strategy == "expanded_ulysses" or self.plan.cp_degree == 1:
+                query, key, value = self._expanded(module, state, query, rotated_key, partition)
+            else:
+                query, key, value = self._latent(module, state, query, rotated_key, partition)
+        return query, key, value
 
     def _expanded(self, module, state, query, key_rope, partition=None):
         """Pack unequal-width QKV into one sequence-to-head exchange."""
@@ -537,7 +558,7 @@ class MLAContextParallel:
             pending_kv = async_ulysses_seq_to_head_launch(payload, 1, 2, self.ulysses_mesh)
         else:
             pending_kv = self._expanded_kv_launch(payload, partition)
-        query = _query(module, state.query_latent, positions, self.plan.local_heads)
+        query = _query(module, state.query_latent, positions, self.plan.local_heads, self.rotary_fn)
         pending_query = (async_ulysses_seq_to_head_launch(query.transpose(1, 2), 1, 2, self.ulysses_mesh)
                          if use_ulysses else None)
         payload = pending_kv.wait()
@@ -564,7 +585,7 @@ class MLAContextParallel:
             partition = None
         else:
             pending_kv = async_cp_allgather_launch(payload, 1, self.cp_mesh)
-        query = _query(module, state.query_latent, positions, self.plan.local_heads)
+        query = _query(module, state.query_latent, positions, self.plan.local_heads, self.rotary_fn)
         payload = pending_kv.wait()
         pending_query = (async_ulysses_seq_to_head_launch(query.transpose(1, 2), 1, 2, self.ulysses_mesh)
                          if self.plan.ulysses_degree > 1 else None)
