@@ -77,6 +77,15 @@ class TestSparseConfiguration(unittest.TestCase):
         self.assertEqual(nonfused.forward_ratio, 0.5)
         self.assertEqual(nonfused.backward_ratio, 0.9)
 
+    def test_small_experts_do_not_reserve_large_replica_staging(self) -> None:
+        """Keep the original 64 MiB quota for production shapes and shrink tiny crops."""
+        small_gate = torch.empty((4, 128, 512), device="meta")
+        small_down = torch.empty((4, 256, 128), device="meta")
+        large_gate = torch.empty((8, 2048, 1536), device="meta")
+        large_down = torch.empty((8, 768, 2048), device="meta")
+        self.assertEqual(sparse._transfer_quota_bytes(small_gate, small_down, 4), 2 * 1024 * 1024)
+        self.assertEqual(sparse._transfer_quota_bytes(large_gate, large_down, 8), 64 * 1024 * 1024)
+
     def test_sparse_explicit_depth_fails_before_runtime_or_hook_binding(self) -> None:
         """Zero, positive and invalid values cannot be silently accepted in either mode."""
         for fsdp in (False, True):

@@ -267,3 +267,28 @@ class TestLinearConfig(unittest.TestCase):
         event.record.assert_not_called()
         native.routed_experts_weight_table.assert_not_called()
         native.routed_experts_gemm.assert_not_called()
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+class TestClippedActivation(unittest.TestCase):
+    """Keep DeepSeek's FP32 clamp semantics through the native expert buffers."""
+
+    def test_forward_and_gradient_match_autograd(self) -> None:
+        """Both projected halves and their clamp derivatives match PyTorch."""
+        for limit in (0.5, 1.5):
+            with self.subTest(limit=limit):
+                torch.manual_seed(17)
+                preact = torch.randn(32, 64, dtype=torch.bfloat16, requires_grad=True)
+                derivative = torch.randn(32, 32, dtype=torch.bfloat16)
+                gate, up = preact.float().chunk(2, dim=-1)
+                expected = (torch.nn.functional.silu(gate.clamp(max=limit))
+                            * up.clamp(min=-limit, max=limit)).to(torch.bfloat16)
+                expected.backward(derivative)
+                engine = compute.NativeExpertCompute.__new__(compute.NativeExpertCompute)
+                engine.swiglu_limit = limit
+                actual = torch.empty_like(expected)
+                gradient = torch.empty_like(preact)
+                engine._activate(preact.detach(), actual)
+                engine._activation_gradient(derivative, preact.detach(), gradient)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                torch.testing.assert_close(gradient, preact.grad, rtol=0, atol=0)

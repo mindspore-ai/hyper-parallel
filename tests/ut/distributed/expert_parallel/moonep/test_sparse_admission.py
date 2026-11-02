@@ -40,7 +40,9 @@ class TestSparseAdmission(unittest.TestCase):
                 torch.nn.Module(), Mock(), ep_group=self.group, ep_size=2, num_experts=4, top_k=2)
                 for _ in range(2)]
         self.runtime = execution.SparseMoonEPRuntime(self.executors)
-        self.runtime.weight_domain = SimpleNamespace(parked=False, retire_storage=Mock(return_value=0))
+        self.runtime.weight_domain = SimpleNamespace(parked=False, retire_storage=Mock(return_value=0),
+                                                     quota_elements=32 * 1024 * 1024)
+        self.runtime.gradient_domain = SimpleNamespace(quota_elements=16 * 1024 * 1024)
         self.runtime.workspace = SimpleNamespace(control_group=object(), metadata={},
                                                  spec=SimpleNamespace(block_rows=256))
         for expert in self.executors:

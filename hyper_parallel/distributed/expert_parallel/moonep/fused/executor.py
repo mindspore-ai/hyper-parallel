@@ -19,10 +19,11 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from datetime import timedelta
+import math
 from typing import Any, Callable
 
-import torch
-import torch.distributed as dist
+import torch  # pylint: disable=forbidden-backend-import
+import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.core.multicore.modules.routed_experts.arena import PhaseArena
 from hyper_parallel.core.multicore.modules.routed_experts.descriptor import RouteDescriptor
@@ -38,6 +39,15 @@ from hyper_parallel.distributed.expert_parallel.moonep.fused.pool import check_d
 from hyper_parallel.distributed.expert_parallel.moonep.fused.transfers import TransferRound, compile_transfer_rounds
 from hyper_parallel.distributed.expert_parallel.moonep.fused.weights import TransferDomain, WeightLease
 from hyper_parallel.distributed.expert_parallel.moonep.planning import select_allocation
+
+
+def _transfer_quota_bytes(gate: torch.Tensor, down: torch.Tensor, replica_capacity: int) -> int:
+    """Avoid a 256 MiB staging floor when every small replica fits in 2 MiB."""
+    role_elements = gate.shape[1] * gate.shape[2] + down.shape[1] * down.shape[2]
+    small_quota = 2 * 1024 * 1024
+    if replica_capacity == 0 or role_elements * replica_capacity * 4 <= small_quota:
+        return small_quota
+    return 64 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -185,6 +195,9 @@ class SparseMoonEPRuntime:
             self._validate_peer_topology(peer, configuration, expected_members, world_size, world_rank)
             if peer.token_dedup != root.token_dedup:
                 raise ValueError("all sparse experts must use the same device-counted transport mode")
+            if (peer.forward_ratio, peer.backward_ratio, peer.swiglu_limit) != (
+                    root.forward_ratio, root.backward_ratio, root.swiglu_limit):
+                raise ValueError("all sparse experts must share compact ratios and activation semantics")
             scheduler = getattr(peer.owner, "hsdp_scheduler", None)
             if scheduler is not None and any(parameter.shard_world_size != 1
                                              for parameter in scheduler.hsdp_state.hsdp_params):
@@ -217,7 +230,8 @@ class SparseMoonEPRuntime:
             raise ValueError("sparse home weights must have positive [home,H,2I] and [home,I,H] shapes")
         manifest = (executor.ranks, executor.experts, executor.top_k, executor.replica_capacity,
                     gate_shape, down_shape, gate.stride(), down.stride(), len(self.executors),
-                    executor.token_dedup)
+                    executor.token_dedup, executor.forward_ratio, executor.backward_ratio,
+                    executor.swiglu_limit)
         validate_parameter_ownership(tuple(peer.owner for peer in self.executors))
         return manifest
 
@@ -271,17 +285,19 @@ class SparseMoonEPRuntime:
         self.workspace = RingWorkspace(RingSpec(executor.ranks, gate.shape[1]), executor.group,
                                        control_group=control_groups[0])
         self.arena = PhaseArena(gate.device)
+        quota_bytes = _transfer_quota_bytes(gate, down, executor.replica_capacity)
         self.weight_domain = TransferDomain(payload_groups[0], executor.rank, gate.device,
-                                            control_group=control_groups[1])
+                                            quota_bytes=quota_bytes, control_group=control_groups[1])
         self.gradient_domain = TransferDomain(payload_groups[1], executor.rank, gate.device, dtype=torch.float32,
-                                              control_group=control_groups[2])
+                                              quota_bytes=quota_bytes, control_group=control_groups[2])
         shapes = tuple(gate.shape[1:]), tuple(down.shape[1:])
         transposed = gate.stride(-2) == 1, down.stride(-2) == 1
         error = None
         try:
             transport_workers = 2 * executor.ranks if executor.ranks <= 24 else executor.ranks
             self.forward_vector_workers = forward_vector_budget(transport_workers)
-            if shapes != ((2048, 1536), (768, 2048)) or transposed[0] != transposed[1]:
+            if (executor.swiglu_limit is not None or shapes != ((2048, 1536), (768, 2048))
+                    or transposed[0] != transposed[1]):
                 self.forward_vector_workers = 0
             if self.forward_vector_workers:
                 self.activation_stream = torch.npu.Stream(device=gate.device)
@@ -613,7 +629,8 @@ class SparseMoonEPExecutor:
                  num_experts: int, top_k: int, replica_capacity: int | None = None,
                  token_dedup: bool = False,
                  forward_ratio: float | None = None,
-                 backward_ratio: float | None = None) -> None:
+                 backward_ratio: float | None = None,
+                 swiglu_limit: float | None = None) -> None:
         """Bind the existing expert owner without registering any replacement parameters."""
         if ep_size < 1 or num_experts % ep_size or not 0 < top_k <= num_experts:
             raise ValueError("invalid expert partition or top-k")
@@ -626,6 +643,11 @@ class SparseMoonEPExecutor:
         self.backward_ratio = float(1.0 if backward_ratio is None else backward_ratio)
         if not (0.0 <= self.forward_ratio <= 1.0 and 0.0 <= self.backward_ratio <= 1.0):
             raise ValueError("MoonEP compact unique ratios must be between zero and one")
+        if swiglu_limit is not None and (isinstance(swiglu_limit, bool)
+                                         or not isinstance(swiglu_limit, (int, float))
+                                         or not math.isfinite(swiglu_limit) or swiglu_limit <= 0):
+            raise ValueError("swiglu_limit must be a finite positive number or None")
+        self.swiglu_limit = None if swiglu_limit is None else float(swiglu_limit)
         self.rank, self.home_count = dist.get_rank(ep_group), num_experts // ep_size
         self.replica_capacity = self.home_count if replica_capacity is None else replica_capacity
         if (isinstance(self.replica_capacity, bool) or not isinstance(self.replica_capacity, int)
@@ -675,7 +697,8 @@ class SparseMoonEPExecutor:
             inverse_order = torch.empty_like(order)
             inverse_order.scatter_(0, order, torch.arange(order.numel(), dtype=order.dtype, device=order.device))
             compute = NativeExpertCompute(route.boundaries, ids.device, vector_stream=self.runtime.activation_stream,
-                                          vector_workers=self.runtime.forward_vector_workers)
+                                          vector_workers=self.runtime.forward_vector_workers,
+                                          swiglu_limit=self.swiglu_limit)
             # The existing count-header admission already rejects missing geometry on every rank.
             gate, down = tuple(self.shapes)
             role_sizes = (("gate", gate[0] * gate[1]), ("down", down[0] * down[1]))
@@ -684,12 +707,14 @@ class SparseMoonEPExecutor:
             source_rows = int(source.sum(axis=1).max())
             if source_rows % self.top_k:
                 raise ValueError("source selection rows must be a multiple of top-k")
+            weight_quota = self.runtime.weight_domain.quota_elements
+            gradient_quota = self.runtime.gradient_domain.quota_elements
             return SparseExecution(route, order, inverse_order, compute, source_rows // self.top_k,
-                                   compile_transfer_rounds(allocation, role_sizes),
+                                   compile_transfer_rounds(allocation, role_sizes, quota_elements=weight_quota),
                                    compile_transfer_rounds(allocation, role_sizes[:1], reverse=True,
-                                                           quota_elements=16 * 1024 * 1024),
+                                                           quota_elements=gradient_quota),
                                    compile_transfer_rounds(allocation, role_sizes[1:], reverse=True,
-                                                           quota_elements=16 * 1024 * 1024))
+                                                           quota_elements=gradient_quota))
         except BaseException as exc:
             self.runtime.poisoned = True
             raise RuntimeError(

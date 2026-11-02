@@ -857,7 +857,8 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
         if self._megamoe_runtime_prepared:
             return
         experts = [layer.mlp.experts for layer in self.layers
-                   if isinstance(layer.mlp.experts, DeepseekV41MegaMoeExperts)]
+                   if isinstance(layer.mlp.experts, DeepseekV41MegaMoeExperts)
+                   and getattr(layer.mlp.experts, "_moonep_executor", None) is None]
         DeepseekV41MegaMoeExperts.prepare_runtime_group(experts)
         self._megamoe_runtime_prepared = True
 

@@ -33,12 +33,15 @@ except ImportError as exc:
 
 from hyper_parallel.components import functional as hp_functional
 from hyper_parallel.distributed.expert_parallel.moonep import configure_moonep
+from hyper_parallel.distributed.expert_parallel.moonep.fused.executor import SparseMoonEPExecutor
 from hyper_parallel.distributed.expert_parallel.moonep.legacy import MoonEPExecutor as LegacyMoonEPExecutor
 from hyper_parallel.distributed._builder.rule_resolver import _resolve_local_compute_fn
 from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
+    _deepseek_moonep_weights,
     _deepseek_v41_grouped_expert_forward,
     deepseek_v41_ep_compute_fn,
 )
+from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
 from hyper_parallel.trainer.config.parallelism import PlanOverride, entries_to_plan_overrides
 from hyper_parallel.trainer.config.resolver import resolve_component
 from tests.common.mark_utils import arg_mark
@@ -439,6 +442,45 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
         torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
         for observed, reference in zip(actual_gradients, expected_gradients):
             torch.testing.assert_close(observed, reference, rtol=1e-5, atol=1e-5)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_sparse_moonep_factory_preserves_clamp_and_score_dtype(self) -> None:
+        """HF and native-layout owners both preserve the clamp and FP32 router edge."""
+        for native_layout in (False, True):
+            with self.subTest(native_layout=native_layout):
+                experts = DeepseekV4Experts(_expert_config())
+                if native_layout:
+                    experts = DeepseekV41MegaMoeExperts(module=experts)
+                gate = Mock()
+                gate.num_experts = 4
+                gate.top_k = 2
+                gate.return_value = (None, torch.ones(2, 2, dtype=torch.float32),
+                                     torch.tensor([[0, 1], [2, 3]]))
+                module = SimpleNamespace(
+                    gate=gate, experts=experts, shared_experts=torch.nn.Identity(), is_hash=False,
+                    forward=lambda hidden_states, input_ids=None: hidden_states,
+                )
+                ep_mesh = Mock()
+                ep_mesh.get_group.return_value = None
+                ep_mesh.__getitem__ = Mock(return_value=SimpleNamespace(size=lambda: 1))
+                with patch("hyper_parallel.distributed.expert_parallel.moonep.fused.executor.dist.get_rank",
+                           return_value=0):
+                    compute = deepseek_v41_ep_compute_fn(
+                        module=module, mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=ep_mesh,
+                        use_moonep=True, use_megamoe=True, megamoe_fused=True, moonep_token_dedup=True,
+                        moonep_fwd_ratio=0.6, moonep_bwd_ratio=0.9,
+                    )
+                executor = experts._moonep_executor  # pylint: disable=protected-access
+                self.assertIsInstance(executor, SparseMoonEPExecutor)
+                self.assertEqual((executor.swiglu_limit, executor.forward_ratio, executor.backward_ratio),
+                                 (1.5, 0.6, 0.9))
+                gate_view, down_view = _deepseek_moonep_weights(experts)
+                self.assertEqual((tuple(gate_view.shape), tuple(down_view.shape)),
+                                 ((4, 16, 48), (4, 24, 16)))
+                with patch.object(SparseMoonEPExecutor, "__call__", return_value=torch.zeros(1, 2, 16)) as invoke:
+                    compute(module, torch.randn(1, 2, 16, dtype=torch.bfloat16))
+                self.assertEqual(invoke.call_args.args[2].dtype, torch.bfloat16)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")

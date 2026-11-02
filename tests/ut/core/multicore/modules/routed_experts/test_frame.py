@@ -94,6 +94,7 @@ class TestPreparedComputeFrames(unittest.TestCase):
         engine = compute.NativeExpertCompute.__new__(compute.NativeExpertCompute)
         engine.boundaries = boundaries
         engine.device = torch.device("cpu")
+        engine.swiglu_limit = None
         engine.prefix = torch.tensor((0, *boundaries), dtype=torch.int64)
         engine.empty_workspace = torch.empty(0, dtype=torch.uint8)
         engine.initialized = _Event()

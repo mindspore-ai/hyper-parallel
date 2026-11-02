@@ -64,6 +64,7 @@ class _Context:
         self.operations = operations
         self.saved = ()
         self.target_tokens = None
+        self.group_metadata = None
 
     def save_for_backward(self, *values: torch.Tensor) -> None:
         """Retain CPU tensors exactly as the custom forward requests."""
@@ -111,9 +112,11 @@ class TestSparseOverlap(unittest.TestCase):
             (2, "gate"): torch.empty((16, 32), dtype=torch.bfloat16),
             (2, "down"): torch.empty((16, 16), dtype=torch.bfloat16)})
         self.expert = SimpleNamespace(top_k=1, home_count=2, rank=0, owner=SimpleNamespace(), token_dedup=False,
+                                      forward_ratio=0.75, backward_ratio=1.0,
                                       read_weights=Mock(side_effect=self._read_weights))
         self.compute = SimpleNamespace(prepare_forward=self._prepare_forward, run_forward=self._run_forward,
-                                       prepare_backward=self._prepare_backward, run_backward=self._run_backward)
+                                       prepare_backward=self._prepare_backward, run_backward=self._run_backward,
+                                       forward_pipeline=SimpleNamespace(enabled=False))
         self.plan = SimpleNamespace(route=self.route, order=torch.arange(3), inverse_order=torch.arange(3),
                                     max_source_tokens=3, compute=self.compute)
         self.runtime = SimpleNamespace(workspace=self.workspace, executions={self.key: (self.expert, self.plan)},

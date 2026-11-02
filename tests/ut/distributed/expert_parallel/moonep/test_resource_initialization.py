@@ -34,7 +34,9 @@ class TestResourceInitialization(unittest.TestCase):
     def setUp(self) -> None:
         """Create metadata-only admitted owners and trap every real device operation."""
         self.experts = [SimpleNamespace(owner=torch.nn.Linear(4, 4, bias=False), ranks=2, experts=4,
-                                       home_count=2, top_k=2, replica_capacity=2, rank=0, group=object())]
+                                       home_count=2, top_k=2, replica_capacity=2, rank=0, group=object(),
+                                       token_dedup=False, forward_ratio=0.75, backward_ratio=1.0,
+                                       swiglu_limit=None)]
         self.home = tuple(SimpleNamespace(dtype=torch.bfloat16, device=torch.device("npu"),
                                           shape=shape, stride=Mock(return_value=stride))
                           for shape, stride in (((2, 16, 32), (512, 32, 1)), ((2, 16, 16), (256, 16, 1))))

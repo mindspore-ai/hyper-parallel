@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from functools import lru_cache
+import math
 from typing import Any, Optional
 
 import numpy as np
@@ -148,7 +149,8 @@ class NativeExpertCompute:
     """Own one execution's small tile descriptors, without expert weights or payload pools."""
 
     def __init__(self, boundaries: tuple[int, ...], device: torch.device, *,
-                 vector_stream: Any = None, vector_workers: int = 8) -> None:
+                 vector_stream: Any = None, vector_workers: int = 8,
+                 swiglu_limit: float | None = None) -> None:
         """Freeze strictly nonempty active ranges that cover the packed expert input."""
         if any(isinstance(end, bool) or not isinstance(end, int) or end <= begin
                for begin, end in zip((0, *boundaries[:-1]), boundaries)):
@@ -157,14 +159,50 @@ class NativeExpertCompute:
             raise ValueError("native compute supports at most 2**20 packed token selections")
         if device.type != "npu":
             raise ValueError("native routed experts require an NPU device")
+        if swiglu_limit is not None and (isinstance(swiglu_limit, bool)
+                                         or not isinstance(swiglu_limit, (int, float))
+                                         or not math.isfinite(swiglu_limit) or swiglu_limit <= 0):
+            raise ValueError("swiglu_limit must be a finite positive number or None")
         self.boundaries, self.device = boundaries, device
+        self.swiglu_limit = None if swiglu_limit is None else float(swiglu_limit)
         self.prefix = upload_metadata(torch.tensor((0, *boundaries), dtype=torch.int64), device)
         self.empty_workspace = torch.empty(0, dtype=torch.uint8, device=device)
         self.initialized = torch.npu.Event()
         self.initialized.record(torch.npu.current_stream(device))
         self.linear_metadata: dict[tuple, tuple] = {}
         self.gradient_metadata: dict[tuple, tuple] = {}
-        self.forward_pipeline = ForwardPipeline(boundaries, device, vector_stream, vector_workers)
+        self.forward_pipeline = ForwardPipeline(
+            boundaries, device, vector_stream, 0 if self.swiglu_limit is not None else vector_workers)
+
+    def _activate(self, preact: torch.Tensor, output: torch.Tensor) -> None:
+        """Fill the admitted activation buffer using the model's SwiGLU rule."""
+        limit = self.swiglu_limit
+        if limit is None:
+            torch.ops.hyper_parallel.routed_experts_swiglu(preact, output)
+            return
+        gate, up = preact.chunk(2, dim=-1)
+        gate = gate.float().clamp_(max=limit)
+        up = up.float().clamp_(min=-limit, max=limit)
+        output.copy_((torch.nn.functional.silu(gate) * up).to(output.dtype))
+
+    def _activation_gradient(self, derivative: torch.Tensor, preact: torch.Tensor,
+                             output: torch.Tensor) -> None:
+        """Differentiate the FP32 clipped activation before BF16 projection gradients."""
+        limit = self.swiglu_limit
+        if limit is None:
+            torch.ops.hyper_parallel.routed_experts_swiglu_backward(derivative, preact, output)
+            return
+        raw_gate, raw_up = preact.chunk(2, dim=-1)
+        gate = raw_gate.float().clamp_(max=limit)
+        up = raw_up.float().clamp_(min=-limit, max=limit)
+        sigmoid = gate.sigmoid()
+        silu = gate * sigmoid
+        dy = derivative.float()
+        middle = raw_gate.shape[-1]
+        output[:, :middle].copy_((dy * up * sigmoid * (1 + gate * (1 - sigmoid))
+                                   * (raw_gate <= limit)).to(output.dtype))
+        output[:, middle:].copy_((dy * silu * (raw_up >= -limit)
+                                   * (raw_up <= limit)).to(output.dtype))
 
     def _check_input(self, value: torch.Tensor, name: str) -> None:
         """Check one packed matrix without reading device contents."""
@@ -407,7 +445,7 @@ class NativeExpertCompute:
             return self.forward_pipeline.run(work, dependency)
         self._consume(work)
         self.run_linear(work.up, dependency)
-        torch.ops.hyper_parallel.routed_experts_swiglu(work.z, work.activation)
+        self._activate(work.z, work.activation)
         self.run_linear(work.down)
         return work.output, work.state, work.ready
 
@@ -467,10 +505,10 @@ class NativeExpertCompute:
         """
         self._consume(work)
         self.run_linear(work.da_work, dependency)
-        torch.ops.hyper_parallel.routed_experts_swiglu(work.state.preact, work.activation)
+        self._activate(work.state.preact, work.activation)
         self.run_gradient(work.down_work)
         publish("down", work.down_gradient)
-        torch.ops.hyper_parallel.routed_experts_swiglu_backward(work.da, work.state.preact, work.dz)
+        self._activation_gradient(work.da, work.state.preact, work.dz)
         self.run_gradient(work.gate_work)
         publish("gate", work.gate_gradient)
         self.run_linear(work.dx_work)

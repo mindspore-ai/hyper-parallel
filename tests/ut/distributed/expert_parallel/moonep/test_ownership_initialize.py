@@ -35,7 +35,9 @@ class TestOwnershipInitialization(unittest.TestCase):
         """Install metadata-only home tensors and fake communication resource factories."""
         owners = [torch.nn.Linear(4, 4, bias=False) for _ in range(2)]
         self.experts = [SimpleNamespace(owner=owner, ranks=2, experts=4, top_k=2,
-                                        replica_capacity=2, home_count=2, rank=0, group=object()) for owner in owners]
+                                        replica_capacity=2, home_count=2, rank=0, group=object(),
+                                        token_dedup=False, forward_ratio=0.75, backward_ratio=1.0,
+                                        swiglu_limit=None) for owner in owners]
         self.runtime = execution.SparseMoonEPRuntime(self.experts)
         self.home = tuple(SimpleNamespace(dtype=torch.bfloat16, device=torch.device("npu"),
                                            shape=shape, stride=Mock(return_value=stride))
@@ -181,7 +183,8 @@ class TestOwnershipInitialization(unittest.TestCase):
         expert = self.experts[0]
         valid_manifest = (expert.ranks, expert.experts, expert.top_k, expert.replica_capacity,
                           tuple(self.home[0].shape), tuple(self.home[1].shape),
-                          self.home[0].stride(), self.home[1].stride(), len(self.experts))
+                          self.home[0].stride(), self.home[1].stride(), len(self.experts),
+                          False, 0.75, 1.0, None)
         batch = []
 
         def bad_rank(output: list, value: Any, **_kwargs: Any) -> None:
@@ -236,7 +239,8 @@ class TestOwnershipInitialization(unittest.TestCase):
         expert = self.experts[0]
         valid_manifest = (expert.ranks, expert.experts, expert.top_k, expert.replica_capacity,
                           tuple(self.home[0].shape), tuple(self.home[1].shape),
-                          self.home[0].stride(), self.home[1].stride(), len(self.experts))
+                          self.home[0].stride(), self.home[1].stride(), len(self.experts),
+                          False, 0.75, 1.0, None)
         for gate_shape, down_shape in shapes:
             with self.subTest(gate=gate_shape, down=down_shape):
                 home = tuple(SimpleNamespace(dtype=torch.bfloat16, device=torch.device("npu"),
