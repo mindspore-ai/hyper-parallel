@@ -28,19 +28,18 @@ def xing40_moe_cp_wrapper(target_module: Xing40MoE, mesh: Any, tp_mesh: Any,
     Args:
         target_module: Xing40 MoE whose sequence statistics need the CP group.
         mesh: Unused full mesh.
-        tp_mesh: Tensor-parallel mesh or None.
-        cp_mesh: Two-rank context-parallel mesh.
-        ep_mesh: Expert-parallel mesh or None.
+        tp_mesh: Unused tensor-parallel mesh.
+        cp_mesh: Context-parallel mesh.
+        ep_mesh: Unused expert-parallel mesh.
 
     Returns:
         An empty list because no forward rewrite is needed.
     """
-    del mesh
+    del mesh, tp_mesh, ep_mesh
     if not isinstance(target_module, Xing40MoE):
         raise TypeError('Xing40 MoE required')
-    if (cp_mesh is None or cp_mesh.size() != 2 or (tp_mesh is not None and tp_mesh.size() != 1)
-            or (ep_mesh is not None and ep_mesh.size() != 1)):
-        raise ValueError('Xing40 initial CP adapter requires CP2, TP1 and EP1')
+    if cp_mesh is None:
+        raise ValueError('Xing40 CP adapter requires a CP mesh')
     if target_module.aux_loss_cp_group is not None:
         raise ValueError('Xing40 MoE CP group already configured')
     target_module.aux_loss_cp_group = cp_mesh.get_group()

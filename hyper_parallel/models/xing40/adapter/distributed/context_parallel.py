@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Xing40 CP2 adapters. Opt-in; no effect on non-CP attention or router."""
+"""Xing40 context-parallel adapters. Opt-in; no effect on non-CP attention or router."""
 from __future__ import annotations
 
 from typing import Any
@@ -94,13 +94,13 @@ def xing40_cp_attention(module: torch.nn.Module, query: torch.Tensor, key: torch
 @inner_wrapper
 def xing40_mla_cp_wrapper(target_module: torch.nn.Module, mesh: Any, tp_mesh: Any,
                             cp_mesh: Any, ep_mesh: Any) -> list:
-    """Install the explicit CP2, TP1, EP1 attention path.
+    """Install the KV AllGather attention path; the framework plan validates the CP and TP degrees.
 
     Args:
         target_module: Xing40 MLA module being wrapped.
         mesh: Full mesh, passed to the generic wrapper.
         tp_mesh: Tensor-parallel mesh or None.
-        cp_mesh: Two-rank context-parallel mesh.
+        cp_mesh: Context-parallel mesh.
         ep_mesh: Expert-parallel mesh or None.
 
     Returns:
@@ -108,9 +108,8 @@ def xing40_mla_cp_wrapper(target_module: torch.nn.Module, mesh: Any, tp_mesh: An
     """
     if not isinstance(target_module, Xing40MLAAttention):
         raise TypeError('Xing40 MLA replacement required')
-    if (cp_mesh is None or cp_mesh.size() != 2 or (tp_mesh is not None and tp_mesh.size() != 1)
-            or (ep_mesh is not None and ep_mesh.size() != 1)):
-        raise ValueError('Xing40 initial CP adapter requires CP2, TP1 and EP1')
+    if cp_mesh is None:
+        raise ValueError('Xing40 CP adapter requires a CP mesh')
     return mla_cp_wrapper(target_module, mesh, tp_mesh, cp_mesh, ep_mesh,
                           strategy='expanded_ulysses', ulysses_degree=1, kv_exchange='all_gather',
                           rotary_fn=xing40_rotary, attention_interface=xing40_cp_attention)
