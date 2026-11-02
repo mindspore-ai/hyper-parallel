@@ -423,10 +423,19 @@ class TestReduceBuckets(unittest.TestCase):
         mock_apply_scaling,
     ):
         """Building reduce-scatter buckets should not launch communication."""
-        hsdp_param = _fake_param([1.0, 2.0])
+        mesh_info = _mesh_info()
+        hsdp_param = _fake_param([1.0, 2.0], mesh_info=mesh_info)
         unsharded_grad = torch.arange(4, dtype=torch.float32)
         _set_unsharded_grad(hsdp_param, unsharded_grad)
-        param_group = HSDPParamGroup([hsdp_param], device=torch.device("cpu"))
+        uninitialized = _fake_param([3.0, 4.0], mesh_info=mesh_info)
+        del uninitialized._unsharded_param
+        del uninitialized.unsharded_param
+        uninitialized.unsharded_param_buffers = [torch.empty(4)]
+        accumulated = _fake_param([5.0, 6.0], mesh_info=mesh_info)
+        accumulated_grad = torch.ones(4)
+        accumulated.unsharded_accumulated_grad = accumulated_grad
+        accumulated.unsharded_accumulated_grad_data = accumulated_grad
+        param_group = HSDPParamGroup([uninitialized, hsdp_param, accumulated], device=torch.device("cpu"))
 
         reduce_scatter_buckets = param_group._build_reduce_scatter_buckets(dist.ReduceOp.SUM)
 
@@ -436,6 +445,9 @@ class TestReduceBuckets(unittest.TestCase):
         self.assertIsNone(reduce_scatter_bucket.reduce_scatter_output)
         self.assertIsNone(reduce_scatter_bucket.handle)
         self.assertIs(hsdp_param.unsharded_param.grad, unsharded_grad)
+        self.assertEqual(reduce_scatter_bucket.hsdp_params, [hsdp_param, accumulated])
+        self.assertIs(reduce_scatter_bucket.unsharded_grads[0], unsharded_grad)
+        self.assertIs(reduce_scatter_bucket.unsharded_grads[1], accumulated_grad)
         mock_apply_scaling.assert_not_called()
         mock_reduce_scatter.assert_not_called()
 

@@ -32,6 +32,7 @@ from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo
 from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy, DDPMeshInfo, HSDPMeshInfo
 from hyper_parallel.core.fully_shard.api import HSDPModule, _extend_module_with_hsdp_interface
 from hyper_parallel.core.fully_shard import hsdp_state as state_mod
+from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
 from hyper_parallel.core.fully_shard.param_group import AllReduceParamGroup
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPStateV2, _to_dtype_if_needed
 
@@ -492,7 +493,9 @@ class TestHSDPStateV2(unittest.TestCase):
     def test_post_backward_no_reduce_accumulates_and_reshards(self):
         """Post-backward without reduction should accumulate grads and reshard."""
         param = _FakeHSDPParam()
-        state = _new_state([param])
+        uninitialized = object.__new__(HSDPParamV2)
+        uninitialized.unsharded_accumulated_grad = torch.ones(2)
+        state = _new_state([param, uninitialized])
         state.reduce_grads = False
         state.shard = MagicMock()
 
@@ -500,20 +503,31 @@ class TestHSDPStateV2(unittest.TestCase):
 
         param.accumulate_unsharded_grad_if_needed.assert_called_once()
         param.to_accumulated_grad_if_needed.assert_called_once()
+        torch.testing.assert_close(uninitialized.unsharded_accumulated_grad, torch.ones(2))
         state.shard.assert_called_once()
 
     def test_post_backward_groups_sharded_and_replicated_params_by_process_group(self):
         """Post-backward should route sharded and replicated params through the unified pipeline."""
+        uninitialized = _FakeHSDPParam()
+        del uninitialized._unsharded_param
+        uninitialized.unsharded_param_buffers = [torch.empty(4)]
+        uninitialized.allgather_comm_ctx.allgather_handle = MagicMock()
         sharded = _FakeHSDPParam(unsharded_grad=torch.ones(2), shard_size=2)
         replicated = _FakeHSDPParam(unsharded_grad=torch.ones(2), shard_size=1)
-        state = _new_state([sharded, replicated])
+        accumulated = _FakeHSDPParam(accumulated_grad=torch.full((2,), 2.0))
+        accumulated.mesh_info.replicate_process_group = sharded.mesh_info.replicate_process_group
+        state = _new_state([uninitialized, sharded, replicated, accumulated])
         state.shard = MagicMock()
 
         HSDPStateV2.post_backward(state)
 
+        uninitialized.accumulate_unsharded_grad_if_needed.assert_called_once()
+        uninitialized.reduce_scatter_grad.assert_not_called()
         sharded.reduce_scatter_grad.assert_called_once()
         replicated.reduce_scatter_grad.assert_called_once()
+        accumulated.reduce_scatter_grad.assert_called_once()
         self.assertEqual(len(state.scheduler_ctx.pre_all_reduce_groups), 2)
+        self.assertIsNotNone(uninitialized.allgather_comm_ctx.allgather_handle)
         state.shard.assert_called_once()
 
     def test_post_backward_for_comm_fusion_drains_context_and_launches_param_group(self):
