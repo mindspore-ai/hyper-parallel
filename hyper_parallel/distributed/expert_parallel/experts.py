@@ -44,6 +44,7 @@ import torch.nn.functional as F
 from hyper_parallel.components.functional.npu_grouped_swiglu import (
     npu_grouped_swiglu,
 )
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.distributed._builder.forward_rewriter import (
     _install_bound_forward,
 )
@@ -120,6 +121,30 @@ def resolve_swiglu_weights(
             "w1/w2/w3 three-matrix layouts); use an EP-aware MoE module instead"
         )
     return w_gate, w_up, w_down
+
+
+def apply_expert_projection(
+    states: torch.Tensor,
+    weight: torch.Tensor,
+    transposed: bool,
+) -> torch.Tensor:
+    """Apply one expert projection in the holder's weight layout.
+
+    The generic ``GroupedExperts`` replacement transposes both projections to
+    ``[in, out]`` (``is_transposed = True``) so the grouped GEMM can run them as
+    ``x @ w``; a Hugging Face holder keeps ``[out, in]`` and wants
+    ``F.linear``.  The two layouts are indistinguishable whenever ``in == out``,
+    so the holder's flag decides instead of the shapes.
+
+    Args:
+        states: ``[rows, in]`` expert input.
+        weight: ``[in, out]`` or ``[out, in]`` expert projection.
+        transposed: Whether ``weight`` is stored as ``[in, out]``.
+
+    Returns:
+        ``[rows, out]`` projection output.
+    """
+    return states @ weight if transposed else F.linear(states, weight)
 
 
 # ``ArgSort`` has no int32/int64 AICore kernel and silently falls back to
@@ -249,6 +274,14 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
         return output
 
     gate_weight, up_weight, down_weight = resolve_swiglu_weights(experts)
+    # EP/TP sharding keeps the expert table as a DTensor while the dispatched
+    # activations are plain local rows.  Localize first: an ``F.linear`` whose
+    # weight is a DTensor and whose input is not goes through the shard-op
+    # dispatcher, which expects both operands to be distributed.
+    gate_weight = gate_weight.to_local() if isinstance(gate_weight, DTensor) else gate_weight
+    up_weight = up_weight.to_local() if isinstance(up_weight, DTensor) else up_weight
+    down_weight = down_weight.to_local() if isinstance(down_weight, DTensor) else down_weight
+    transposed = bool(getattr(experts, "is_transposed", False))
     # The eager path needs host ints: read them in one transfer rather than
     # draining the queue once per local expert.
     expert_token_counts = local_expert_counts.tolist()
@@ -258,10 +291,8 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
         expert_token_count = expert_token_counts[local_expert_index]
         expert_states = sorted_states[token_start:token_start + expert_token_count]
         if up_weight is None:
-            gate_up_states = F.linear(  # pylint: disable=not-callable
-                expert_states,
-                gate_weight[local_expert_index],
-            )
+            gate_up_states = apply_expert_projection(
+                expert_states, gate_weight[local_expert_index], transposed)
             apply_gate = getattr(experts, "_ep_apply_gate", None)
             if apply_gate is None:
                 gate_states, up_states = gate_up_states.chunk(2, dim=-1)
@@ -270,19 +301,15 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
             else:
                 activated_states = apply_gate(gate_up_states)
         else:
-            gate_states = F.linear(  # pylint: disable=not-callable
-                expert_states, gate_weight[local_expert_index]
-            )
-            up_states = F.linear(  # pylint: disable=not-callable
-                expert_states, up_weight[local_expert_index]
-            )
+            gate_states = apply_expert_projection(
+                expert_states, gate_weight[local_expert_index], transposed)
+            up_states = apply_expert_projection(
+                expert_states, up_weight[local_expert_index], transposed)
             activation = getattr(experts, "_ep_act_fn", F.silu)
             activated_states = activation(gate_states) * up_states
         sorted_outputs.append(
-            F.linear(  # pylint: disable=not-callable
-                activated_states,
-                down_weight[local_expert_index],
-            )
+            apply_expert_projection(
+                activated_states, down_weight[local_expert_index], transposed)
         )
         token_start += expert_token_count
 

@@ -47,9 +47,14 @@ from hyper_parallel.core.fully_shard.utils import (
 
 
 def _copy_without_bumping_version(dst: torch.Tensor, src: torch.Tensor) -> None:
-    """Copy into ``dst`` while preserving its autograd version counter."""
+    """Copy into ``dst`` while preserving its autograd version counter.
+
+    ``dst`` is a storage buffer, not a graph node: the unsharded parameter is a
+    separate view created later, and torch 2.9 rejects that view once the base
+    was written in-place under grad mode, so the copy runs outside autograd.
+    """
     # pylint: disable=W0212
-    with torch.autograd._unsafe_preserve_version_counter(dst):
+    with torch.no_grad(), torch.autograd._unsafe_preserve_version_counter(dst):
         dst.copy_(src)
 
 
@@ -711,6 +716,25 @@ class HSDPParamV2:
                 f"Expected 1 unsharded_param_buffer, got {len(self.unsharded_param_buffers)}"
             )
 
+        if (self.shard_world_size <= 1
+                and not isinstance(self.sharded_param, DTensor)
+                and self.unsharded_param_buffers[0] is self._sharded_param_data):
+            # Nothing to gather: the shard is the whole parameter (EP leaves the
+            # experts on a single-rank FSDP group, for example).  Exposing it
+            # directly avoids a second view of storage that was written under
+            # grad, which torch rejects ("view created in no_grad mode").  The
+            # Native DTensors use the layout-preserving path below.
+            param = self.sharded_param
+            local = param
+            if not hasattr(self, "_unsharded_param"):
+                self._unsharded_param = nn.Parameter(
+                    local, requires_grad=param.requires_grad)
+            else:
+                # Storage can change after checkpoint restore or conversion.
+                with torch.no_grad():
+                    self._unsharded_param.data = local.detach()
+            return
+
         if self.allgather_comm_ctx.allgather_output is not None:
             packed_shape = list(self.sharded_size)
             packed_shape[0] *= self.shard_world_size
@@ -720,7 +744,13 @@ class HSDPParamV2:
                 dim=0,
             )
             # pylint: disable=W0212
-            with torch.autograd._unsafe_preserve_version_counter(
+            # The buffer is pure storage: ``_unsharded_param`` is the tensor the
+            # graph uses, and it is created below as its own view.  Writing the
+            # gathered chunks must therefore happen outside autograd -- torch
+            # rejects an in-place write under grad mode once a view of the same
+            # storage was created under ``no_grad`` (the parameter view created on
+            # the first unshard), which is exactly the second unshard onwards.
+            with torch.no_grad(), torch.autograd._unsafe_preserve_version_counter(
                 self.unsharded_param_buffers[0]
             ):
                 torch.cat(
@@ -809,12 +839,13 @@ class HSDPParamV2:
 
     def to_accumulated_grad_if_needed(self) -> None:
         """Move the current unsharded gradient into the accumulation buffer."""
-        if self._unsharded_param.grad is None:
+        param = self.unsharded_param
+        if param.grad is None:
             return
         # Keep local gradients alive across no-sync / delayed-sync steps even
         # after the parameter transitions back to the sharded view.
-        unsharded_grad = self._unsharded_param.grad
-        self._unsharded_param.grad = None
+        unsharded_grad = param.grad
+        param.grad = None
         if self.reduce_dtype is not None and unsharded_grad.dtype != self.reduce_dtype:
             unsharded_grad = unsharded_grad.to(self.reduce_dtype)
         if self.unsharded_accumulated_grad is None:
@@ -867,15 +898,23 @@ class HSDPParamV2:
 
     @property
     def unsharded_param(self) -> nn.Parameter:
-        """Return the full unsharded parameter after all-gather."""
-        return self._unsharded_param
+        """Return the full unsharded parameter after all-gather.
+
+        A unit whose forward never ran (the MoonEP EP path reads expert weights
+        through its own gather instead of calling the expert module) has no
+        unsharded view; its sharded parameter is what the backward cleanup and
+        reduce-scatter paths must look at.
+        """
+        if hasattr(self, "_unsharded_param"):
+            return self._unsharded_param
+        return self.sharded_param
 
     @property
     def unsharded_grad_data(self) -> torch.Tensor:
         """
         Get the unsharded gradient data as a local tensor.
         """
-        return self._unsharded_param.grad
+        return self.unsharded_param.grad
 
     @property
     def unsharded_accumulated_grad_data(self) -> torch.Tensor:
@@ -1082,7 +1121,12 @@ class HSDPParamV2:
                 self.unsharded_param_buffers[0]
             )
         # pylint: disable=W0212
-        with torch.autograd._unsafe_preserve_version_counter(
+        # The gather writes storage that ``init_unsharded_param`` later exposes
+        # as a view; torch rejects that view once the base was written under grad
+        # mode (``_unsharded_param`` is created inside ``no_grad``), so the
+        # collective stays outside autograd.  Gradients travel through the
+        # parameter hooks, not through this collective.
+        with torch.no_grad(), torch.autograd._unsafe_preserve_version_counter(
             self.allgather_comm_ctx.allgather_output
         ):
             self.allgather_comm_ctx.allgather_handle = dist.all_gather_into_tensor(

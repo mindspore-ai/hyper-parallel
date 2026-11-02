@@ -750,6 +750,48 @@ class MoE(nn.Module):
         )
         return token_indices, top_scores_sorted, num_tokens_per_expert
 
+    def _routed_experts(
+        self,
+        x_flat: torch.Tensor,
+        top_scores: torch.Tensor,
+        selected_experts: torch.Tensor,
+        num_tokens: int,
+        dim: int,
+    ) -> torch.Tensor:
+        """Run the routed experts and return their output in token-major order.
+
+        This is the seam between the router (above) and the shared expert
+        (below): the default implementation permutes tokens into expert-major
+        order, runs the local experts and scatters back.  Subclasses that own
+        the token movement - a wider EP mesh, or an external transport such as
+        MoonEP - override it; the router, auxiliary loss and shared expert are
+        shared either way.
+
+        Args:
+            x_flat: Input hidden states, ``[num_tokens, dim]``.
+            top_scores: Routing scores, ``[num_tokens, top_k]``.
+            selected_experts: Expert ids, ``[num_tokens, top_k]``.
+            num_tokens: Number of tokens.
+            dim: Hidden dimension.
+
+        Returns:
+            ``[num_tokens, dim]`` expert output, already scattered back to
+            token-major order.
+        """
+        token_indices, top_scores_sorted, num_tokens_per_expert = self.permutation(
+            selected_experts, top_scores
+        )
+        # Gather routed tokens in expert-major order.
+        routed_x = x_flat[token_indices]  # [num_tokens * top_k, dim]
+
+        if self.score_before_experts:
+            routed_x = routed_x * top_scores_sorted.unsqueeze(1)
+            expert_out = self.experts(routed_x, num_tokens_per_expert, scores=None)
+        else:
+            expert_out = self.experts(routed_x, num_tokens_per_expert, scores=top_scores_sorted)
+
+        return self.unpermutation(expert_out, token_indices, num_tokens, dim)
+
     def unpermutation(
         self,
         expert_out: torch.Tensor,
@@ -826,29 +868,14 @@ class MoE(nn.Module):
             lb_loss = None
             self.last_aux_loss = None
 
-        # --- Token permutation: token-major → expert-major ---
-        token_indices, top_scores_sorted, num_tokens_per_expert = self.permutation(
-            selected_experts, top_scores
-        )
-
-        # Gather routed tokens in expert-major order.
-        routed_x = x_flat[token_indices]  # [num_tokens * top_k, dim]
-
-        # --- Expert computation ---
-        if self.score_before_experts:
-            routed_x = routed_x * top_scores_sorted.unsqueeze(1)
-            expert_out = self.experts(routed_x, num_tokens_per_expert, scores=None)
-        else:
-            expert_out = self.experts(routed_x, num_tokens_per_expert, scores=top_scores_sorted)
+        # --- Routed experts (permutation → experts → back to token order) ---
+        out = self._routed_experts(x_flat, top_scores, selected_experts, num_tokens, dim)
 
         # --- Shared expert (parallel with routed experts) ---
         shared_out = None
         if self.shared_expert is not None:
             shared_out = self.shared_expert(x_flat)
 
-
-        # --- Scatter expert outputs back to token order ---
-        out = self.unpermutation(expert_out, token_indices, num_tokens, dim)
 
         if shared_out is not None:
             out = out + shared_out

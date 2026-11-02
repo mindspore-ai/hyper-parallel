@@ -101,6 +101,10 @@ from hyper_parallel.distributed.expert_parallel.experts import (
     ep_routed_forward,
     require_attrs,
 )
+from hyper_parallel.distributed.expert_parallel.moonep_forward import (
+    moonep_ep_enabled,
+    moonep_routed_forward,
+)
 from hyper_parallel.distributed.recipe_spec import (
     local_compute,
 )
@@ -196,7 +200,40 @@ def build_ep_compute(
         # so the busiest rank's buffers cannot blow up under a skewed real router.
         module.experts.capacity_factor = float(capacity_factor)
 
-    if overlap_fn is None:
+    if moonep_ep_enabled():
+        original_expert_forward = module.experts.forward
+
+        def expert_forward_with_transport(
+                *args: Any, _moonep_compute: Callable | None = None,
+                **kwargs: Any) -> torch.Tensor:
+            """Keep MoonEP computation inside the expert module hooks."""
+            if _moonep_compute is not None:
+                return _moonep_compute()
+            return original_expert_forward(*args, **kwargs)
+
+        module.experts.forward = expert_forward_with_transport
+
+        def routed_with_expert_hooks(
+                expert_module: Any, hidden_states: torch.Tensor) -> torch.Tensor:
+            """Enter the expert owner so parameter hooks run on every step."""
+            return expert_module.experts(
+                hidden_states,
+                _moonep_compute=lambda: moonep_routed_forward(
+                    expert_module, hidden_states, router_fn=router_fn, ep_group=ep_group),
+            )
+
+        if overlap_fn is None:
+            def compute_fn(module: Any, hidden_states: torch.Tensor) -> torch.Tensor:
+                """Run the routed branch through MoonEP."""
+                routed = routed_with_expert_hooks(module, hidden_states)
+                return combine(module, hidden_states, routed)
+        else:
+            def compute_fn(module: Any, hidden_states: torch.Tensor) -> torch.Tensor:
+                """Evaluate the overlap branch, then route through MoonEP."""
+                overlapped = overlap_fn(module, hidden_states)
+                routed = routed_with_expert_hooks(module, hidden_states)
+                return combine(module, hidden_states, routed, overlapped)
+    elif overlap_fn is None:
         def compute_fn(module: Any, hidden_states: torch.Tensor) -> torch.Tensor:
             """Run the routed branch and compose the MoE block output."""
             routed = ep_routed_forward(
