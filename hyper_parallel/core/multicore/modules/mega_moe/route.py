@@ -60,19 +60,6 @@ class RouteMetadata:
 
 
 @dataclass(frozen=True)
-class ExternalMegaMoeRoute:
-    """A caller-owned route for already sorted rows and dynamic local expert slots.
-
-    ``counts_by_source[source, target * slots_per_rank + slot]`` assigns each
-    contiguous source range to one destination slot. ``group_boundaries`` lists
-    cumulative receive-row ends for this rank's slots, including empty slots.
-    """
-
-    counts_by_source: torch.Tensor
-    group_boundaries: torch.Tensor
-
-
-@dataclass(frozen=True)
 class PreparedTopKRoute:
     """Permuted payload and exact metadata for one Router decision."""
 
@@ -352,50 +339,6 @@ def _host_route_metadata(
     ]
     wide = (dispatch_source, dispatch_target, target_offsets, source_offsets, groups)
     return _pack_host_route(wide, (dispatch_sizes, received), capacity, device)
-
-
-def prepare_external_route_metadata(
-    route: ExternalMegaMoeRoute, spec: MegaMoeSpec, source_rows: int, device: Any,
-) -> tuple[RouteMetadata, int, int]:
-    """Compile a caller-provided placement table into native dispatch descriptors.
-
-    Args:
-        route: CPU source-by-virtual-expert counts and device receive boundaries.
-        spec: Bound MegaMoE topology. Virtual expert IDs encode target and slot.
-        source_rows: Number of already sorted rows on the current source rank.
-        device: Device receiving the native descriptors.
-
-    Returns:
-        Route metadata, group-wide schedule rows, and maximum receive rows.
-    """
-    counts = route.counts_by_source
-    boundaries = route.group_boundaries
-    if (counts.device.type != "cpu" or counts.shape != (spec.ep_size, spec.num_experts)
-            or counts.dtype not in (torch.int32, torch.int64)):
-        raise ValueError("external route counts must be a CPU INT32/INT64 [EP, experts] table")
-    if (boundaries.shape != (spec.local_experts,) or boundaries.dtype != torch.int64
-            or boundaries.device != torch.device(device)):
-        raise ValueError("external receive boundaries must be device INT64 [local experts]")
-    rows = counts.tolist()
-    if any(count < 0 for row in rows for count in row):
-        raise ValueError("external route counts must be nonnegative")
-    if spec.external_route_top_k is not None:
-        # The legacy schedule budgets at most one selection per original token
-        # for each virtual expert. Check the necessary per-slot count bound.
-        top_k = spec.external_route_top_k
-        if any(sum(row) % top_k or max(row) > sum(row) // top_k for row in rows):
-            raise ValueError("external route top-k exceeds the per-slot token bound")
-    if sum(rows[spec.rank_id]) != source_rows:
-        raise ValueError("external route source counts must match the supplied sorted rows")
-    maximum_source = max(sum(row) for row in rows)
-    received = [sum(sum(row[target * spec.local_experts:(target + 1) * spec.local_experts])
-                    for row in rows) for target in range(spec.ep_size)]
-    maximum_received = max(received)
-    plan_tokens = max(128, _align_capacity(maximum_source))
-    raw = [[0, sum(row), 0, *row] for row in rows]
-    metadata = _host_route_metadata(raw, spec, max(1, received[spec.rank_id]), device)
-    return replace(metadata, group_list=boundaries, local_num_tokens=source_rows,
-                   plan_tokens=plan_tokens), plan_tokens, maximum_received
 
 
 def _host_route_prefixes(

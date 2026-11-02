@@ -243,11 +243,12 @@ def deepseek_v41_ep_compute_fn(
         use_grouped_gemm: bool = False,
         fix_router: bool = False,
         use_moonep: bool = False,
-        use_megamoe: bool = False,
-        megamoe_fused: bool = False,
         moonep_lifecycle: bool = True,
         moonep_replica_capacity: int | None = None,
         moonep_prefetch_depth: int = 1,
+        moonep_token_dedup: bool = False,
+        moonep_fwd_ratio: float | None = None,
+        moonep_bwd_ratio: float | None = None,
 ) -> Callable:
     """Build V4.1 routed/shared computation with training-aware routing.
 
@@ -263,12 +264,13 @@ def deepseek_v41_ep_compute_fn(
         cp_mesh: Context-parallel mesh supplying token-partition statistics groups.
         ep_mesh: Expert-parallel mesh owning the routed experts.
         use_grouped_gemm: Use the existing V4.1 clamped grouped-GEMM expert path.
-        use_moonep: 使用脚本版MoonEP动态均衡；与基线use_grouped_gemm互斥。
-        use_megamoe: 在MoonEP动态均衡和FSDP副本生命周期内用MegaMoE计算本地专家。
-        megamoe_fused: 让MegaMoE按MoonEP的外部放置元数据完成唯一一次跨卡token分发。
+        use_moonep: 使用脚本版MoonEP动态均衡及GMM；与基线use_grouped_gemm互斥。
         moonep_lifecycle: 默认True启用共享表、前向释放与反向预取；False保留初版对照。
         moonep_replica_capacity: 每卡不同远程专家上限B；None默认本rank专家数。
         moonep_prefetch_depth: 1提前一层恢复EFS/EP权重，0反向按需恢复并只分配一个表槽。
+        moonep_token_dedup: 是否在 MoonEP token 传输中启用按目标 rank 去重。
+        moonep_fwd_ratio: 前向向量压缩的最大唯一率；None 使用默认值 0.75。
+        moonep_bwd_ratio: 反向 dX 压缩的唯一率界限；None 使用默认值 1.0。
         fix_router: Enable benchmark-only balanced destinations while retaining
             learned Top-K weights and their gradients. Normal training and
             correctness runs keep this disabled.
@@ -287,12 +289,12 @@ def deepseek_v41_ep_compute_fn(
         raise ValueError("DeepSeek-V4.1 validation layers must use learned routing")
     if not isinstance(fix_router, bool):
         raise ValueError("fix_router must be a boolean")
+    if not isinstance(moonep_token_dedup, bool):
+        raise ValueError("moonep_token_dedup must be a boolean")
+    if moonep_token_dedup and (not use_moonep or not moonep_lifecycle):
+        raise ValueError("moonep_token_dedup requires lifecycle MoonEP")
     if use_moonep and use_grouped_gemm:
         raise ValueError("use_moonep 与 use_grouped_gemm 分别选择两条 EP 路径，不能同时启用")
-    if use_megamoe and (not use_moonep or not moonep_lifecycle):
-        raise ValueError("MoonEP/MegaMoE组合需要启用MoonEP生命周期")
-    if megamoe_fused and not use_megamoe:
-        raise ValueError("MegaMoE外部放置路径需要启用use_megamoe")
     sequence_groups = _configure_router_statistics(module.gate, mesh, tp_mesh, cp_mesh)
     ep_group = ep_mesh.get_group("ep")
     ep_size = ep_mesh["ep"].size()
@@ -311,8 +313,9 @@ def deepseek_v41_ep_compute_fn(
                 top_k=module.gate.top_k, replica_capacity=moonep_replica_capacity,
                 swiglu_limit=module.experts.limit,
                 prefetch_depth=moonep_prefetch_depth,
-                compute_backend=("megamoe_fused" if megamoe_fused else
-                                 "megamoe" if use_megamoe else "gmm"),
+                token_dedup=moonep_token_dedup,
+                forward_ratio=moonep_fwd_ratio,
+                backward_ratio=moonep_bwd_ratio,
             )
         else:
             module.experts._moonep_executor = LegacyMoonEPExecutor(  # pylint: disable=protected-access

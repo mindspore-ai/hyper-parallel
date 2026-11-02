@@ -22,7 +22,7 @@ import math
 import struct
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
@@ -30,11 +30,10 @@ import torch.distributed as dist
 from hyper_parallel.core.multicore import _collective, shmem
 
 from ..module import MulticoreModule
-from .function import RematerializedMegaMoeState, execute_mega_moe, execute_mega_moe_with_permutation
+from .function import execute_mega_moe_with_permutation
 from .heap_manager import _get_heap_manager, _workspace_layout
 from .plan import build_mega_moe_plan
-from .route import (ExternalMegaMoeRoute, RouteMetadata, prepare_external_route_metadata,
-                    prepare_topk_route, restore_topk_output)
+from .route import prepare_topk_route, restore_topk_output
 from .spec import (
     _COMMUNICATION_SPLIT,
     _resolve_capacity_factors,
@@ -178,7 +177,6 @@ class _MegaMoeExecutionResources:
         return (
             "mega_moe", self.spec.local_num_tokens, self.spec.hidden_size,
             self.spec.intermediate_size, self.spec.num_experts, self.spec.top_k,
-            self.spec.external_route_top_k,
             self.spec.receive_capacity, self.spec.ep_size, self.spec.dispatch_mode,
             self.spec.expert_weight_layout,
             self.spec.initial_capacity_factor, self.spec.capacity_growth_factor,
@@ -209,8 +207,7 @@ class _MegaMoeExecutionResources:
             return
         fields = ("local_num_tokens", "max_local_num_tokens", "hidden_size", "intermediate_size",
                   "num_experts", "top_k", "initial_capacity_factor", "capacity_growth_factor", "dispatch_mode",
-                  "dispatch_split", "combine_split", "swiglu_limit", "expert_weight_layout", "ep_size", "auto_tokens",
-                  "external_route_top_k")
+                  "dispatch_split", "combine_split", "swiglu_limit", "expert_weight_layout", "ep_size", "auto_tokens")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v3", "bfloat16",
                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications))
@@ -237,10 +234,6 @@ class _MegaMoeExecutionResources:
         plan = self._plans.get(bucket)
         if plan is None or plan.spec.plan_tokens < tokens:
             schedule_tokens = min(bucket, self._token_capacity)
-            if self.spec.external_route_top_k is not None:
-                top_k = self.spec.external_route_top_k
-                aligned_capacity = self._token_capacity // top_k * top_k
-                schedule_tokens = min((schedule_tokens + top_k - 1) // top_k * top_k, aligned_capacity)
             plan = build_mega_moe_plan(replace(self.spec, schedule_tokens=schedule_tokens), device)
             # INT32 route bounds allow at most 25 buckets starting at 128 rows.
             # A growing partial bucket replaces its plan; backward keeps the old object.
@@ -333,7 +326,6 @@ class MegaMoeExperts(MulticoreModule):
         intermediate_size: int,
         num_experts: int,
         top_k: int,
-        external_route_top_k: int | None = None,
         swiglu_limit: float | None = None,
         ep_size: int | None = None,
         ep_group: Any | None = None,
@@ -352,9 +344,6 @@ class MegaMoeExperts(MulticoreModule):
             intermediate_size: SwiGLU intermediate dimension per expert.
             num_experts: Global routed-expert count.
             top_k: Experts selected for every token.
-            external_route_top_k: Original top-k before an external caller expands
-                source tokens into sorted rows. The caller must use distinct virtual
-                expert IDs for each token; only the native task bounds change.
             initial_capacity_factor: Push initial receive rows as a multiple of local routed rows.
                 Defaults to 1.25 for push; omitted for pull. Must be finite and at least 1.0.
             capacity_growth_factor: Push capacity multiplier on overflow, defaulting to 1.25.
@@ -380,17 +369,12 @@ class MegaMoeExperts(MulticoreModule):
                 Disjoint PP/DP groups bootstrap independently. Only one ordered EP membership
                 can be active in SHMEM per process.
         """
-        if external_route_top_k is not None and (
-                isinstance(external_route_top_k, bool) or not isinstance(external_route_top_k, int)
-                or not 0 < external_route_top_k <= num_experts or top_k != 1 or dispatch_mode != "push"):
-            raise ValueError("external_route_top_k requires push external routing with top_k=1")
         specification = {
             "local_num_tokens": _COMMUNICATION_SPLIT,
             "hidden_size": hidden_size,
             "intermediate_size": intermediate_size,
             "num_experts": num_experts,
             "top_k": top_k,
-            "external_route_top_k": external_route_top_k,
             "initial_capacity_factor": initial_capacity_factor,
             "swiglu_limit": swiglu_limit,
             "ep_size": _resolve_ep_size(ep_size, ep_group),
@@ -420,7 +404,6 @@ class MegaMoeExperts(MulticoreModule):
         self.intermediate_size = specification["intermediate_size"]
         self.num_experts = specification["num_experts"]
         self.top_k = specification["top_k"]
-        self.external_route_top_k = specification["external_route_top_k"]
         self.expert_weight_layout = specification["expert_weight_layout"]
         self.initial_capacity_factor = specification["initial_capacity_factor"]
         self.capacity_growth_factor = specification["capacity_growth_factor"]
@@ -623,8 +606,6 @@ class MegaMoeExperts(MulticoreModule):
             The steady-state path validates metadata but deliberately does not
             rebuild and compare the histogram.
         """
-        if self.external_route_top_k is not None:
-            raise ValueError("external_route_top_k executor only supports forward_external_route")
         weights = ((self.gate_up_weight, self.down_weight) if expert_weights is None else expert_weights)
         hidden_flat = self._validate_forward_inputs(
             hidden_states,
@@ -698,104 +679,6 @@ class MegaMoeExperts(MulticoreModule):
             topk_weights,
         )
         return output.reshape(hidden_states.shape)
-
-    def forward_expert_major(
-        self, hidden_states: torch.Tensor, group_boundaries: torch.Tensor, *,
-        expert_weights: tuple[torch.Tensor, torch.Tensor],
-        on_forward_state: Callable[[RematerializedMegaMoeState], None] | None = None,
-    ) -> torch.Tensor:
-        """Compute an already dispatched expert-major batch with external weights.
-
-        Args:
-            hidden_states: Local rows grouped by the current expert slots.
-            group_boundaries: Cumulative end offsets for all local slots, including empty slots.
-                The final offset must equal the row count; callers provide trusted contents.
-            expert_weights: Current dynamic expert table in the configured weight layout.
-            on_forward_state: Optional callback that retains native activations
-                for one caller-managed backward with rematerialized expert weights.
-
-        Returns:
-            Expert-major outputs in the original row order.
-
-        Note:
-            This path uses identity local dispatch and combine descriptors. It leaves
-            cross-rank token routing and expert placement to the caller.
-        """
-        if self.external_route_top_k is not None:
-            raise ValueError("external_route_top_k executor only supports forward_external_route")
-        if self.ep_size != 1 or self.top_k != 1 or self.dispatch_mode != "push":
-            raise ValueError("expert-major execution requires EP=1, top_k=1 and push dispatch")
-        if hidden_states.ndim != 2:
-            raise ValueError("expert-major hidden states must have shape [rows, hidden_size]")
-        if (group_boundaries.shape != (self.local_experts,) or group_boundaries.dtype != torch.int64
-                or group_boundaries.device != hidden_states.device):
-            raise ValueError("expert-major boundaries must be an INT64 tensor for all local slots")
-        self._validate_tensors(hidden_states, expert_weights)
-        if torch.npu.is_current_stream_capturing():
-            raise RuntimeError("MegaMoe dynamic expert-major execution does not support graph capture")
-        rows = hidden_states.shape[0]
-        resources = self._get_execution_resources(hidden_states)
-        plan_tokens = max(128, (rows + 127) // 128 * 128)
-        resources.prepare_auto_workspace(plan_tokens, max(1, rows), hidden_states)
-        starts = torch.cat((group_boundaries.new_zeros(1), group_boundaries[:-1]))
-        counts = (group_boundaries - starts).to(torch.int32)
-        metadata = RouteMetadata(
-            dispatch_src_off=starts, dispatch_target_off=starts, dispatch_size=counts,
-            combine_src_off=starts, combine_target_off=starts, combine_size=counts,
-            group_list=group_boundaries, expert_capacity=max(1, rows),
-            local_num_tokens=rows, plan_tokens=plan_tokens,
-        )
-        plan = resources.plan_for_tokens(plan_tokens, hidden_states.device)
-        return execute_mega_moe(hidden_states, *expert_weights, metadata, plan, resources.workspace,
-                                on_forward_state=on_forward_state)
-
-    def forward_external_route(
-        self, sorted_rows: torch.Tensor, route: ExternalMegaMoeRoute, *,
-        expert_weights: tuple[torch.Tensor, torch.Tensor],
-        on_weight_gradients: Callable[[torch.Tensor, torch.Tensor], None] | None = None,
-        on_forward_state: Callable[[RematerializedMegaMoeState], None] | None = None,
-    ) -> torch.Tensor:
-        """Dispatch, compute and return rows according to an external expert placement.
-
-        Args:
-            sorted_rows: Source rows sorted by virtual expert ID, where
-                ``virtual_id = target_rank * local_experts + local_slot``.
-            route: Exact per-source virtual-expert counts and local receive boundaries.
-            expert_weights: Dynamic local-slot weights, supplied by the caller.
-            on_weight_gradients: Optional callback after the native backward launch
-                has enqueued both local-slot weight gradients on the current stream.
-            on_forward_state: Optional callback that retains native activations
-                for one caller-managed backward with rematerialized expert weights.
-
-        Returns:
-            Expert outputs in the same source-row order as ``sorted_rows``.
-
-        Note:
-            The route contains all ranks' counts, so this call does not gather a
-            second histogram. Gradients for both weight operands are returned by
-            the native autograd function in local-slot order.
-        """
-        if self.dispatch_mode != "push" or self.top_k != 1:
-            raise ValueError("external route execution requires push dispatch and top_k=1")
-        if sorted_rows.ndim != 2:
-            raise ValueError("external route rows must have shape [rows, hidden_size]")
-        self._validate_tensors(sorted_rows, expert_weights)
-        if torch.npu.is_current_stream_capturing():
-            raise RuntimeError("MegaMoe external route execution does not support graph capture")
-        resources = self._get_execution_resources(sorted_rows)
-        metadata, plan_tokens, maximum_received = prepare_external_route_metadata(
-            route, resources.spec, sorted_rows.shape[0], sorted_rows.device,
-        )
-        if self.external_route_top_k is not None:
-            if sorted_rows.shape[0] % self.external_route_top_k:
-                raise ValueError("external route rows must contain complete top-k selections")
-            alignment = math.lcm(self.dispatch_split, self.combine_split, self.external_route_top_k)
-            plan_tokens = (plan_tokens + alignment - 1) // alignment * alignment
-            metadata = replace(metadata, plan_tokens=plan_tokens)
-        resources.prepare_auto_workspace(plan_tokens, maximum_received, sorted_rows)
-        plan = resources.plan_for_tokens(plan_tokens, sorted_rows.device)
-        return execute_mega_moe(sorted_rows, *expert_weights, metadata, plan, resources.workspace,
-                                on_weight_gradients=on_weight_gradients, on_forward_state=on_forward_state)
 
     def _create_execution_resources(
         self,

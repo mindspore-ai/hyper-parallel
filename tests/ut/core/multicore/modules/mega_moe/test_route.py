@@ -39,51 +39,6 @@ class TestMegaMoeRoute(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_external_route_uses_exact_source_counts_and_receive_boundaries(self) -> None:
-        """External placement compiles a ragged round trip without a second histogram."""
-        counts = torch.tensor([[2, 1, 0, 1], [0, 2, 1, 0]], dtype=torch.int32)
-        for rank, boundaries, source_rows in ((0, [2, 5], 4), (1, [1, 2], 3)):
-            with self.subTest(rank=rank):
-                spec = replace(self._spec(ep_size=2, rank_id=rank), top_k=1)
-                route = route_module.ExternalMegaMoeRoute(counts, torch.tensor(boundaries, dtype=torch.int64))
-                metadata, plan_tokens, maximum_received = route_module.prepare_external_route_metadata(
-                    route, spec, source_rows, torch.device("cpu"),
-                )
-                self.assertEqual((plan_tokens, maximum_received), (128, 5))
-                self.assertEqual(metadata.local_num_tokens, source_rows)
-                self.assertEqual(metadata.group_list.tolist(), boundaries)
-                self.assertEqual(metadata.dispatch_size.tolist(), counts[rank].tolist())
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_external_route_rejects_inconsistent_source_length(self) -> None:
-        """A wrong source row count fails before the native collective is launched."""
-        spec = replace(self._spec(ep_size=2), top_k=1)
-        route = route_module.ExternalMegaMoeRoute(
-            torch.tensor([[2, 0, 0, 0], [0, 0, 1, 0]], dtype=torch.int32),
-            torch.tensor([2, 2], dtype=torch.int64),
-        )
-        with self.assertRaisesRegex(ValueError, "source counts"):
-            route_module.prepare_external_route_metadata(route, spec, 3, torch.device("cpu"))
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_external_route_topk_rejects_oversubscribed_slot(self) -> None:
-        """Feature: External Top-K schedule bounds.
-
-        Description: One virtual slot receives more rows than original tokens.
-        Expectation: Route validation rejects the count table before native launch.
-        """
-        spec = replace(self._spec(ep_size=2), top_k=1, external_route_top_k=2)
-        route = route_module.ExternalMegaMoeRoute(
-            torch.tensor([[3, 1, 0, 0], [0, 0, 2, 2]], dtype=torch.int32),
-            torch.tensor([3, 3], dtype=torch.int64),
-        )
-        with self.assertRaisesRegex(ValueError, "per-slot token bound"):
-            route_module.prepare_external_route_metadata(route, spec, 4, torch.device("cpu"))
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_automatic_route_grows_before_writing_pull_source(self) -> None:
         """Feature: MegaMoe route preparation.
 
@@ -747,10 +702,8 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         with (patch.object(route_module.dist, "all_gather_into_tensor", side_effect=gather) as exchange,
               patch.object(route_module, "_permute_topk_input", side_effect=permute),
               patch.object(route_module, "_permute_topk_input_out", side_effect=permute),
-              patch.object(route_module, "_dynamic_route_metadata",
-                           wraps=route_module._dynamic_route_metadata) as build,
-              patch.object(route_module, "_host_route_metadata",
-                           wraps=route_module._host_route_metadata) as host_build,
+              patch.object(route_module, "_dynamic_route_metadata", wraps=route_module._dynamic_route_metadata) as build,
+              patch.object(route_module, "_host_route_metadata", wraps=route_module._host_route_metadata) as host_build,
               patch.object(route_module, "_compute_route_metadata", wraps=route_module._compute_route_metadata)
               as device_build):
             first = prepare_topk_route(hidden, ids, probabilities, spec, None, workspace,

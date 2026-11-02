@@ -241,8 +241,8 @@ class TestMegaMoeExperts(unittest.TestCase):
                 self.assertIs(kwargs["group"], resources.spec.ep_group)
                 if kind == "layout":
                     peer_specification = list(value[2][0])
-                    layout_index = peer_specification.index("EOI")
-                    peer_specification[layout_index] = "EIO"
+                    self.assertEqual(peer_specification[-3], "EOI")
+                    peer_specification[-3] = "EIO"
                     peer = (value[0], value[1], (tuple(peer_specification),))
                 else:
                     peer = ("dynamic_tokens_v1", *value[1:]) if kind == "wire" else ("different",)

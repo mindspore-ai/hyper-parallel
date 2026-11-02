@@ -13,6 +13,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 PROJECT_ROOT=$(cd "${SCRIPT_DIR}/../../.." && pwd)
 source "${PROJECT_ROOT}/scripts/native/cann_version.sh"
+source "${SCRIPT_DIR}/_build/routed_experts.sh"
 HP_MINIMUM_CANN_VERSION="9.1.0"
 BUILD_DIR="${PROJECT_ROOT}/build"
 NATIVE_ROOT="${BUILD_DIR}/native"
@@ -342,7 +343,7 @@ if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
         "The selected Python executable is unavailable: ${PYTHON_BIN}." 4
 fi
 PYTHON_BIN=$(command -v "${PYTHON_BIN}")
-required_tools=(awk asc_opc bash cmake find gcc g++ git grep ld ldd make nm readelf readlink)
+required_tools=(awk asc_opc bash bisheng cmake find gcc g++ git grep ld ldd make nm readelf readlink)
 required_tools+=(sed sha256sum sort tee)
 for required_tool in "${required_tools[@]}"; do
     if ! command -v "${required_tool}" >/dev/null 2>&1; then
@@ -410,6 +411,7 @@ mkdir -p "${WORK_ROOT}/logs"
 
 export ASCEND_SHMEM_HOME_PATH="${SHMEM_INSTALL_ROOT}"
 export SHMEM_HOME_PATH="${SHMEM_INSTALL_ROOT}"
+export SHMEM_SOURCE_DIR="${SHMEM_INSTALL_ROOT}/shmem"
 export PIP_NO_BUILD_ISOLATION=false
 export PIP_NO_INDEX=1
 
@@ -613,7 +615,21 @@ if [[ ! -s "${TORCH_OUTPUT}/libhyper_parallel_mega_gate_torch.so" ]]; then
         "Missing MegaGate Torch adapter: ${TORCH_OUTPUT}/libhyper_parallel_mega_gate_torch.so" 12
 fi
 
+CURRENT_REASON_CODE="ROUTED_EXPERTS_BUILD_FAILED"
+require_cache_key "SHMEM toolchain" "${HP_SHMEM_TOOLCHAIN_KEY}"
+ROUTED_BUILD="${FRAMEWORK_WORK_ROOT}/routed-${TORCH_CACHE_KEY}-${HP_SHMEM_TOOLCHAIN_KEY}"
+echo "INFO: building independent routed-expert kernels and Torch adapter"
+hp_build_routed_experts "${SCRIPT_DIR}" "${ROUTED_BUILD}" "${TORCH_OUTPUT}" \
+    "${PYTHON_BIN}" "${NATIVE_JOBS}" "${BUILD_TYPE}"
+CURRENT_REASON_CODE="ROUTED_EXPERTS_ELF_VALIDATION_FAILED"
+hp_validate_routed_experts_library "${TORCH_OUTPUT}/libhyper_parallel_routed_experts_kernels.so" \
+    "libhyper_parallel_shmem.so"
+hp_validate_routed_experts_library "${TORCH_OUTPUT}/libhyper_parallel_routed_experts_torch.so" \
+    "libhyper_parallel_routed_experts_kernels.so"
+
 CURRENT_REASON_CODE="HOST_ELF_VALIDATION_FAILED"
+HOST_ELF_LIBRARY_PATH="${TORCH_OUTPUT}:${COMPONENT_ROOT}/core/multicore/shmem/lib"
+HOST_ELF_LIBRARY_PATH+=":${COMPONENT_ROOT}/core/multicore/shmem/lib/shmem${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 case "$(uname -m)" in
     aarch64|arm64)
         EXPECTED_ELF_MACHINE="AArch64"
@@ -641,7 +657,8 @@ while IFS= read -r adapter_library; do
         fail "GENERIC_VENDOR_DT_NEEDED_FOUND" \
             "Host adapter directly depends on generic libcust_opapi.so: ${adapter_library}." 18
     fi
-    mapfile -t unresolved_libraries < <(ldd "${adapter_library}" | awk '/not found/{print $1}')
+    ldd_output=$(LD_LIBRARY_PATH="${HOST_ELF_LIBRARY_PATH}" ldd "${adapter_library}")
+    mapfile -t unresolved_libraries < <(awk '/not found/{print $1}' <<< "${ldd_output}")
     for unresolved_library in "${unresolved_libraries[@]}"; do
         case "${unresolved_library}" in
             libtorch*.so|libc10*.so)

@@ -18,30 +18,30 @@ from __future__ import annotations
 
 from collections import Counter
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from numbers import Integral
 from typing import Any, Callable
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch.autograd.function import once_differentiable
 
-from hyper_parallel.core.multicore import MegaMoeExperts
-from hyper_parallel.core.multicore.modules.mega_moe.function import RematerializedMegaMoeState
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.distributed.expert_parallel.collectives import ep_all_to_all
 from hyper_parallel.distributed.expert_parallel.moonep.checkpoint import bind_execution, is_replaying
 from hyper_parallel.distributed.expert_parallel.moonep.fsdp_hooks import (
     MoonEPAllGatherExtension, MoonEPGradientExtension,
 )
-from hyper_parallel.distributed.expert_parallel.moonep.megamoe_adapter import (
-    execute_external_route, pad_expert_weights, permute_migration_input, restore_migration_output,
-)
+from hyper_parallel.distributed.expert_parallel.moonep.fused.executor import SparseMoonEPExecutor, SparseMoonEPRuntime
 from hyper_parallel.distributed.expert_parallel.moonep.numerics import (
     ExpertSaved, expert_backward_values, expert_forward_values, grouped_values, grouped_weight_grad,
 )
 from hyper_parallel.distributed.expert_parallel.moonep.planning import (
-    ExecutionPlan, compile_plan, select_allocation, select_migration_allocation,
+    ExecutionPlan, compile_plan, select_allocation,
+)
+from hyper_parallel.distributed.expert_parallel.moonep.token_dedup import (
+    failed_local_dedup, finish_dedup, prepare_local_dedup,
 )
 
 
@@ -702,94 +702,6 @@ class _ExpertFunction(torch.autograd.Function):
         return dx, hg, hd, None, None
 
 
-def _megamoe_local_forward(executor: Any, x: torch.Tensor, gate: torch.Tensor,
-                           down: torch.Tensor, plan: ExecutionPlan, *,
-                           on_forward_state: Callable[[RematerializedMegaMoeState], None] | None = None,
-                           ) -> torch.Tensor:
-    """Pass MoonEP's sorted rows and dynamic expert boundaries to MegaMoE."""
-    active = len(plan.group_counts)
-    capacity = executor.compute_slots
-    if active < capacity:
-        gate = torch.cat((gate, gate.new_zeros((capacity - active, *gate.shape[1:]))))
-        down = torch.cat((down, down.new_zeros((capacity - active, *down.shape[1:]))))
-        boundaries = torch.cat((plan.boundaries, plan.boundaries.new_full((capacity - active,), x.shape[0])))
-    else:
-        boundaries = plan.boundaries
-    return executor.mega_executor.forward_expert_major(
-        x, boundaries, expert_weights=(gate, down), on_forward_state=on_forward_state,
-    )
-
-
-class _MegaExpertFunction(torch.autograd.Function):
-    """Use MegaMoE for local experts while MoonEP owns replicas and FSDP gradients."""
-
-    @staticmethod
-    def forward(ctx: Any, x: torch.Tensor, home_gate: torch.Tensor, home_down: torch.Tensor,
-                key: ExecutionKey, runtime: MoonEPRuntime) -> torch.Tensor:
-        """Run one expert batch using the current MoonEP placement and weight table."""
-        executor, plan = runtime.executions[key]
-        gate, down = runtime.consume(key)
-        ctx.native_state = None
-
-        def capture(state: RematerializedMegaMoeState) -> None:
-            """Keep native activations across MoonEP's shared-weight slot release."""
-            ctx.native_state = state
-
-        with torch.profiler.record_function("moonep::megamoe_forward"):
-            if executor.compute_backend in ("megamoe_fused", "megamoe_migrate"):
-                output = execute_external_route(executor, x, gate, down, plan, on_forward_state=capture)
-            else:
-                output = _megamoe_local_forward(executor, x, gate, down, plan, on_forward_state=capture)
-        ctx.save_for_backward(*ctx.native_state.take_activations())
-        ctx.key, ctx.runtime = key, runtime
-        ctx.shapes = home_gate.shape, home_down.shape
-        if not is_replaying():
-            runtime.release(key)
-        return output
-
-    @staticmethod
-    @once_differentiable
-    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, None]:
-        """Rematerialize replica weights and run native backward from saved activations."""
-        runtime, key = ctx.runtime, ctx.key
-        executor, plan = runtime.executions[key]
-        runtime.prepare(key)
-        gate, down = runtime.consume(key)
-        scheduler = getattr(executor.owner, "hsdp_scheduler", None)
-        if scheduler is None:
-            runtime.prefetch_previous(key)
-        home_gradients = None
-
-        def on_weight_gradients(gate_gradient: torch.Tensor, down_gradient: torch.Tensor) -> None:
-            """Start replica return after both native dW outputs are enqueued."""
-            nonlocal home_gradients
-            active = len(plan.group_counts)
-            home_gradients = scheduler.launch_gradient_extension(
-                (gate_gradient[:active], down_gradient[:active], plan))
-
-        with torch.profiler.record_function("moonep::megamoe_backward"):
-            callback = (on_weight_gradients if executor.compute_backend in ("megamoe_fused", "megamoe_migrate")
-                        and scheduler is not None else None)
-            padded_gate, padded_down = pad_expert_weights(executor, gate, down, plan)
-            ctx.native_state.restore_activations(ctx.saved_tensors)
-            dx, dg, dd = ctx.native_state.backward(
-                grad_output, padded_gate, padded_down, on_weight_gradients=callback,
-            )
-            active = len(plan.group_counts)
-            dg, dd = dg[:active], dd[:active]
-            ctx.native_state = None
-        runtime.release(key)
-        if scheduler is None:
-            hg, hd = return_home_gradients(dg, dd, plan, executor.gradient_group)
-        else:
-            hg, hd = (home_gradients if home_gradients is not None else
-                      scheduler.launch_gradient_extension((dg, dd, plan)))
-        if (hg.shape, hd.shape) != ctx.shapes:
-            raise RuntimeError("MoonEP/MegaMoE归属梯度与真实参数输入形状不一致")
-        runtime.complete(key)
-        return dx, hg, hd, None, None
-
-
 class MoonEPExecutor:
     """接收原始router结果，在实际experts模块边界内执行脚本MoonEP。"""
 
@@ -799,7 +711,9 @@ class MoonEPExecutor:
                  prefetch_depth: int = 1,
                  gradient_compact_home: bool = False,
                  retain_weight_workspace: bool = False,
-                 compute_backend: str = "gmm") -> None:
+                 token_dedup: bool = False,
+                 forward_ratio: float | None = None,
+                 backward_ratio: float | None = None) -> None:
         """绑定布局读取器；例如 EP=4 时按规划同步分发并回传 token。"""
         if ep_size < 1 or num_experts < 1 or num_experts % ep_size or not 0 < top_k <= num_experts:
             raise ValueError("非法EP、专家数或top-k")
@@ -815,15 +729,13 @@ class MoonEPExecutor:
         self.prefetch_depth = prefetch_depth
         self.gradient_compact_home = gradient_compact_home
         self.retain_weight_workspace = retain_weight_workspace
-        if compute_backend not in ("gmm", "megamoe", "megamoe_fused", "megamoe_migrate"):
-            raise ValueError("MoonEP专家计算后端必须是gmm或支持的MegaMoE后端")
-        if compute_backend != "gmm" and not (
-                activation == "swiglu" or activation == "clipped" and swiglu_limit > 0):
-            raise ValueError("MoonEP/MegaMoE需要SwiGLU，限幅模式还需要正的限幅值")
-        self.compute_backend = compute_backend
-        self.compute_slots = (self.home_count if compute_backend == "megamoe_migrate"
-                              else self.home_count + self.replica_capacity)
-        self.mega_executor = None
+        if not isinstance(token_dedup, bool):
+            raise ValueError("token_dedup must be a boolean")
+        self.token_dedup = token_dedup
+        self.forward_ratio = 0.75 if forward_ratio is None else float(forward_ratio)
+        self.backward_ratio = 1.0 if backward_ratio is None else float(backward_ratio)
+        if not (0.0 <= self.forward_ratio <= 1.0 and 0.0 <= self.backward_ratio <= 1.0):
+            raise ValueError("MoonEP dedup ratios must be between zero and one")
         self.runtime = None
         self.layer = -1
         self.weight_group, self.gradient_group = ep_group, ep_group
@@ -833,25 +745,31 @@ class MoonEPExecutor:
     def _plan(self, ids: torch.Tensor) -> ExecutionPlan:
         """只为原始前向规划；例如重算命中原计划，免除再次同步小表。"""
         with torch.profiler.record_function("moonep::plan::counts"):
-            local = torch.zeros(self.experts, device=ids.device, dtype=torch.int64)
-            local.scatter_add_(0, ids, torch.ones_like(ids))
+            valid_extent = ids.numel() <= 2**20 and self.experts <= 2**20
+            if valid_extent:
+                # Fixed bins avoid scatter-add's contended atomics. At this
+                # bound both bin labels and counts are exactly representable.
+                local = torch.histc(ids.float(), bins=self.experts,
+                                    min=-0.5, max=self.experts - 0.5).long()
+            else:
+                local = torch.zeros(self.experts, device=ids.device, dtype=torch.int64)
+            payload = torch.cat((local, local.new_full((1,), ids.numel() if valid_extent else -1)))
             if self.ranks > 1:
-                counts = local.new_empty(self.ranks * self.experts)
-                dist.all_gather_into_tensor(counts, local, group=self.group)
-                counts = counts.reshape(self.ranks, self.experts)
+                gathered = payload.new_empty(self.ranks * payload.numel())
+                dist.all_gather_into_tensor(gathered, payload, group=self.group)
+                gathered = gathered.reshape(self.ranks, self.experts + 1)
             else:
-                counts = local.unsqueeze(0)
+                gathered = payload.unsqueeze(0)
+            host = gathered.cpu()
+            observed = host.numpy()
+            if np.any(observed[:, -1] < 0) or np.any(observed[:, :-1].sum(axis=1) != observed[:, -1]):
+                raise ValueError("MoonEP路由包含越界专家号或超出精确计数范围")
         with torch.profiler.record_function("moonep::plan::allocation"):
-            if self.compute_backend == "megamoe_migrate":
-                counts_cpu, allocation = select_migration_allocation(counts)
-                used_fallback = False
-            else:
-                counts_cpu, allocation, used_fallback = select_allocation(counts, self.replica_capacity)
+            counts_cpu, allocation, used_fallback = select_allocation(host[:, :-1], self.replica_capacity)
         self.runtime.statistics["plans"] += 1
         self.runtime.statistics["planner_fallbacks"] += int(used_fallback)
         with torch.profiler.record_function("moonep::plan::compile"):
-            plan = compile_plan(counts_cpu, allocation, ids, self.rank, used_fallback,
-                                allow_uneven=self.compute_backend == "megamoe_migrate")
+            plan = compile_plan(counts_cpu, allocation, ids, self.rank, used_fallback)
         self.runtime.statistics["moved_entries"] += plan.metrics[1]
         self.runtime.statistics["peak_copies"] = max(self.runtime.statistics["peak_copies"], plan.metrics[2])
         self.runtime.statistics["remote_experts_max"] = max(
@@ -869,44 +787,65 @@ class MoonEPExecutor:
         if key not in self.runtime.executions:
             with torch.profiler.record_function("moonep::plan"):
                 self.runtime.executions[key] = self, self._plan(ids.reshape(-1).long())
+            if self.token_dedup and (self.forward_ratio > 0.0 or self.backward_ratio > 0.0):
+                # Start replica materialization before the metadata exchange so W can cover it.
+                self.runtime.prepare(key)
+                _, base_plan = self.runtime.executions[key]
+                local_error = None
+                try:
+                    local = prepare_local_dedup(base_plan.dispatch_order, base_plan.token_send,
+                                                base_plan.token_recv, self.top_k,
+                                                forward_ratio=self.forward_ratio,
+                                                backward_ratio=self.backward_ratio)
+                except Exception as exc:
+                    local_error = exc
+                    local = failed_local_dedup(base_plan.token_send, base_plan.token_recv)
+                try:
+                    dedup = finish_dedup(local, self.group, device=ids.device, width=hidden.shape[-1],
+                                         backward_ratio=self.backward_ratio)
+                except Exception as exc:
+                    raise RuntimeError("nonfused dedup metadata exchange failed on an EP rank") from (
+                        local_error if local_error is not None else exc)
+                self.runtime.executions[key] = self, replace(base_plan, dedup=dedup)
+                self.runtime.statistics["dedup_route_samples"] += 1
+                self.runtime.statistics["dedup_dense_fallbacks"] += int(dedup.saved_rows == 0)
         _, plan = self.runtime.executions[key]
         weights = expert_weights if expert_weights is not None else self.read_weights()
         # 权重预取可由上一单元的 FSDP hook 提前触发；这里复用已有租约，
         # 未命中时才按需提交，随后使用同一同步 token 通信路径。
         self.runtime.prepare(key)
-        if self.compute_backend == "megamoe_migrate":
-            with torch.profiler.record_function("moonep::native_token_permute"):
-                payload, inverse = permute_migration_input(hidden, ids, plan)
-        else:
-            source_rows = plan.dispatch_order // self.top_k
-            payload = hidden.reshape(-1, hidden.shape[-1]).index_select(0, source_rows)
-        if self.compute_backend in ("megamoe_fused", "megamoe_migrate"):
-            with torch.profiler.record_function("moonep::megamoe_external_route"):
-                returned = _MegaExpertFunction.apply(payload, *weights, key, self.runtime)
-            computed = returned
-        else:
-            if self.ranks > 1:
-                with torch.profiler.record_function("moonep::all_to_all_v::token_dispatch"):
-                    received = ep_all_to_all(payload, plan.token_send, plan.token_recv, self.group)
-            else:
-                received = payload
+        if plan.dedup is not None:
+            received, received_scores = plan.dedup.dispatch_with_scores(
+                hidden.reshape(-1, hidden.shape[-1]), scores.reshape(-1, self.top_k))
             sorted_x = received.index_select(0, plan.sort_order)
-            expert_function = _MegaExpertFunction if self.compute_backend == "megamoe" else _ExpertFunction
-            computed = expert_function.apply(sorted_x, *weights, key, self.runtime)
-            # sort_order是无重复的完整排列；索引赋值的反向只保存索引，避免index_copy额外保留[C,H]输出。
+            computed = _ExpertFunction.apply(sorted_x, *weights, key, self.runtime)
             restored = torch.empty_like(computed)
             restored[plan.sort_order] = computed
-            if self.ranks > 1:
-                with torch.profiler.record_function("moonep::all_to_all_v::token_return"):
-                    returned = ep_all_to_all(restored, plan.token_recv, plan.token_send, self.group)
-            else:
-                returned = restored
+            weighted = restored * received_scores[:, None].to(restored.dtype)
+            result = plan.dedup.return_vectors(weighted, hidden.numel() // hidden.shape[-1])
+            if not torch.is_grad_enabled() or not computed.requires_grad:
+                self.runtime.complete(key)
+            self.runtime.statistics["dedup_saved_rows"] += plan.dedup.saved_rows
+            return result.reshape_as(hidden)
+        source_rows = plan.dispatch_order // self.top_k
+        payload = hidden.reshape(-1, hidden.shape[-1]).index_select(0, source_rows)
+        if self.ranks > 1:
+            with torch.profiler.record_function("moonep::all_to_all_v::token_dispatch"):
+                received = ep_all_to_all(payload, plan.token_send, plan.token_recv, self.group)
+        else:
+            received = payload
+        sorted_x = received.index_select(0, plan.sort_order)
+        computed = _ExpertFunction.apply(sorted_x, *weights, key, self.runtime)
+        restored = torch.empty_like(computed)
+        restored[plan.sort_order] = computed
+        if self.ranks > 1:
+            with torch.profiler.record_function("moonep::all_to_all_v::token_return"):
+                returned = ep_all_to_all(restored, plan.token_recv, plan.token_send, self.group)
+        else:
+            returned = restored
         # 评估没有专家反向来完成key；例如no_grad验证后继续训练不会残留旧轨迹。
         if not torch.is_grad_enabled() or not computed.requires_grad:
             self.runtime.complete(key)
-        if self.compute_backend == "megamoe_migrate":
-            with torch.profiler.record_function("moonep::native_token_unpermute"):
-                return restore_migration_output(returned, inverse, scores).reshape_as(hidden)
         # 与普通EP采用相同类型提升规则，避免额外FP32乘加改变Qwen的BF16舍入。
         selected_scores = scores.reshape(-1).index_select(0, plan.dispatch_order).to(returned.dtype)
         weighted = returned * selected_scores[:, None]
@@ -914,20 +853,8 @@ class MoonEPExecutor:
         return result.index_add(0, source_rows, weighted).reshape_as(hidden)
 
 
-def configure_moonep(model: torch.nn.Module, *, prefetch_depth: int | None = None) -> MoonEPRuntime:
-    """在模型物化与FSDP包装之后建立运行时；例如48层只按实际并发共享表槽。
-
-    Args:
-        model: 已绑定专家执行器的完整模型。
-        prefetch_depth: 仅无 FSDP 脚本路径的兼容参数；FSDP 模式不接受此参数。
-
-    Returns:
-        运行时统计及finish_step接口；训练每步梯度收尾后、optimizer更新前调用finish_step。
-    """
-    executors = [module._moonep_executor for module in model.modules()  # pylint: disable=protected-access
-                 if isinstance(getattr(module, "_moonep_executor", None), MoonEPExecutor)]
-    if any(executor.runtime is not None for executor in executors):
-        raise ValueError("同一模型不能重复配置MoonEP运行时")
+def _configure_legacy_prefetch(model: torch.nn.Module, executors: list, prefetch_depth: int | None) -> bool:
+    """Resolve only legacy standalone prefetch after sparse dispatch has returned."""
     # FSDP 决定何时对专家发起 AG；扩展 hook 随之触发 EP 通信，不读取预取深度。
     schedulers = [module.hsdp_scheduler for module in model.modules()
                   if getattr(module, "hsdp_scheduler", None) is not None]
@@ -945,34 +872,44 @@ def configure_moonep(model: torch.nn.Module, *, prefetch_depth: int | None = Non
                 or prefetch_depth < 0):
             raise ValueError("无 FSDP 路径的预取配置必须是非负整数")
         standalone_prefetch = bool(prefetch_depth)
+    return standalone_prefetch
+
+
+def configure_moonep(model: torch.nn.Module, *,
+                     prefetch_depth: int | None = None) -> MoonEPRuntime | SparseMoonEPRuntime:
+    """在模型物化与FSDP包装之后建立运行时；例如48层只按实际并发共享表槽。
+
+    Args:
+        model: 已绑定专家执行器的完整模型。
+        prefetch_depth: 仅旧 MoonEP 无 FSDP 脚本路径的兼容参数；稀疏路径与 FSDP 模式不接受此参数。
+
+    Returns:
+        旧 MoonEP 或独立稀疏运行时；每次 optimizer 更新前调用 finish_step()。
+
+    Note:
+        稀疏路径要求所有 rank 在完整顺序前向后调用 runtime.backward(loss)，
+        且 retain_graph=False、create_graph=False；不能直接调用 loss.backward()。
+        旧路径仍可使用普通 loss.backward()。所有图和流结束后，各 rank 一起调用 close()。
+    """
+    executors = [module._moonep_executor for module in model.modules()  # pylint: disable=protected-access
+                 if isinstance(getattr(module, "_moonep_executor", None), (MoonEPExecutor, SparseMoonEPExecutor))]
+    if any(executor.runtime is not None for executor in executors):
+        raise ValueError("同一模型不能重复配置MoonEP运行时")
+    if any(isinstance(executor, SparseMoonEPExecutor) for executor in executors):
+        if not all(isinstance(executor, SparseMoonEPExecutor) for executor in executors):
+            raise ValueError("一个模型不能混用稀疏融合与普通MoonEP执行器")
+        if prefetch_depth is not None:
+            raise ValueError("稀疏 MoonEP 不接受 prefetch_depth；FSDP 通知决定预取，无 FSDP 脚本按需恢复")
+        runtime = SparseMoonEPRuntime(executors)
+        model._moonep_runtime = runtime  # pylint: disable=protected-access
+        return runtime
+    standalone_prefetch = _configure_legacy_prefetch(model, executors, prefetch_depth)
     runtime = MoonEPRuntime(executors, standalone_prefetch=standalone_prefetch)
-    mega_executors = [executor for executor in executors if executor.compute_backend != "gmm"]
-    if mega_executors:
-        local_executors = [executor for executor in mega_executors if executor.compute_backend == "megamoe"]
-        if local_executors and dist.is_initialized() and dist.get_world_size() > 1:
-            local_rank = dist.get_rank()
-            singleton_groups = [dist.new_group(ranks=[rank]) for rank in range(dist.get_world_size())]
-            local_group = singleton_groups[local_rank]
-        else:
-            local_group = None
-        for executor in mega_executors:
-            gate, down = executor.read_weights()
-            fused = executor.compute_backend in ("megamoe_fused", "megamoe_migrate")
-            executor.mega_executor = MegaMoeExperts(
-                hidden_size=gate.shape[1], intermediate_size=down.shape[1],
-                num_experts=(executor.ranks if fused else 1) * executor.compute_slots,
-                top_k=1, ep_group=executor.group if fused else local_group, create_parameters=False,
-                swiglu_limit=executor.limit if executor.activation == "clipped" else None,
-                external_route_top_k=executor.top_k if fused else None,
-            )
-        for backend in ("megamoe", "megamoe_fused", "megamoe_migrate"):
-            peers = [executor.mega_executor for executor in mega_executors if executor.compute_backend == backend]
-            if peers:
-                MegaMoeExperts.share_execution_resources(peers)
     model._moonep_runtime = runtime  # pylint: disable=protected-access
     return runtime
 
 
 def has_moonep(module: torch.nn.Module) -> bool:
     """检查是否含生命周期执行器；例如普通EP模型返回False，保持已有构建行为。"""
-    return any(isinstance(getattr(child, "_moonep_executor", None), MoonEPExecutor) for child in module.modules())
+    return any(isinstance(getattr(child, "_moonep_executor", None), (MoonEPExecutor, SparseMoonEPExecutor))
+               for child in module.modules())

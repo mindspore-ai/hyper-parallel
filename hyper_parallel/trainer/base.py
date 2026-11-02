@@ -857,7 +857,11 @@ class BaseTrainer(Stateful, ABC):
 
                 # Backward pass
                 with self.model_bwd_context:
-                    loss.backward()
+                    runtime = getattr(self.model, "_moonep_runtime", None)
+                    if runtime is not None and getattr(runtime, "controlled_backward", False):
+                        runtime.backward(loss)
+                    else:
+                        loss.backward()
 
             del micro_batch
             return loss, loss_dict

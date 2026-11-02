@@ -120,18 +120,12 @@ def _build_task_values(spec: MegaMoeSpec) -> TaskSplitValue:
     Returns:
         Scheduler values whose single partition is the rank-local input.
     """
-    schedule_top_k = spec.top_k if spec.external_route_top_k is None else spec.external_route_top_k
-    schedule_tokens = spec.plan_tokens
-    if spec.external_route_top_k is not None:
-        if schedule_tokens % schedule_top_k:
-            raise ValueError("MegaMoe schedule rows must be divisible by external route top-k")
-        schedule_tokens //= schedule_top_k
     return TaskSplitValue(
         tp=1,
         ep=spec.ep_size,
-        seq_size=schedule_tokens,
+        seq_size=spec.plan_tokens,
         all_expert_num=spec.num_experts,
-        top_k=schedule_top_k,
+        top_k=spec.top_k,
         dispatch_mode=spec.dispatch_mode,
     )
 

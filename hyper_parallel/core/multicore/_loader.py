@@ -102,6 +102,16 @@ def get_multicore_paths() -> tuple[Path, Path]:
     return get_multicore_adapter_path("hyper_parallel_mega_moe_torch")
 
 
+def get_routed_experts_paths() -> tuple[Path, Path]:
+    """Resolve independent routed-expert libraries without requiring a MegaMoE vendor."""
+    directory = _component_root() / "framework" / "torch"
+    paths = tuple(directory / f"libhyper_parallel_routed_experts_{name}.so" for name in ("kernels", "torch"))
+    for path in paths:
+        if not path.is_file():
+            raise NativeComponentUnavailableError(f"Independent routed-expert component is not built: {path}")
+    return paths
+
+
 def preload_vendor_library(vendor_root: Path) -> None:
     """Load the exact ACLNN library without exposing its dependency symbols globally."""
     library_path = vendor_root / "op_api" / "lib" / "libcust_opapi.so"
