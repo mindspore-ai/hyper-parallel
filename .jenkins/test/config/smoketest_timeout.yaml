@@ -8,7 +8,7 @@ ascend910b:
   tensor_parallel: 2400
   context_parallel: 960
   clip_grad: 960
-  expert_parallel: 960
+  expert_parallel: 1600
   trainer: 960
   fully_shard: 4800
   init_weights: 950
