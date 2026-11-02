@@ -31,7 +31,7 @@ from torch import fx
 from torch.ops import _c10d_functional, aten
 
 from ...pass_config import PassConfig
-from .utils import is_barrier, is_collective, is_op, is_view
+from .utils import bucket_preparation, is_barrier, is_collective, is_op, is_view, rs_layout_preparation
 
 _LOG = logging.getLogger(__name__)
 _PARAM_GATHERS = ("fsdp_all_gather", "fsdp_all_gather_backward")
@@ -50,25 +50,6 @@ class _Reduction:
 
 def _is_contiguous_method(node: fx.Node) -> bool:
     return node.op == "call_method" and node.target == "contiguous"
-
-
-def _layout_preparation(launch: fx.Node) -> list[fx.Node]:
-    """Recognize private FSDP contiguous inputs without requiring emitter tags."""
-    inputs = launch.all_input_nodes
-    if len(inputs) != 1:
-        return []
-    source = inputs[0]
-    if set(source.users) != {launch} or source.meta.get("autograd_backward") is False:
-        return []
-    owner = source.meta.get("fsdp_reduce_scatter_prepare")
-    if owner is not None and owner != launch.name:
-        return []
-    if _is_contiguous_method(source):
-        if len(source.args) == 1 and isinstance(source.args[0], fx.Node) and not source.kwargs:
-            return [source]
-    if is_op(source, aten.contiguous) and owner == launch.name:
-        return [source]
-    return []
 
 
 def _alias_ancestors(inputs: list[fx.Node]) -> set[fx.Node]:
@@ -115,7 +96,7 @@ def _collect_reductions(graph: fx.Graph) -> tuple[list[_Reduction], int]:
                 if is_view(user) and user not in realization:
                     realization.add(user)
                     stack.append(user)
-        preparation = _layout_preparation(launch)
+        preparation = bucket_preparation(launch, order) or rs_layout_preparation(launch)
         for source in preparation:
             if source.op == "call_method":
                 # Only a matched backward RS owns this default Tensor method.
@@ -124,8 +105,10 @@ def _collect_reductions(graph: fx.Graph) -> tuple[list[_Reduction], int]:
                 source.target = aten.contiguous.default
                 source.meta.update(autograd_backward=True, fsdp_reduce_scatter_prepare=launch.name)
                 normalized += 1
+        external = [arg for node in [*preparation, launch] for arg in node.all_input_nodes
+                    if arg not in preparation]
         matches.append(_Reduction(launch, sorted(realization, key=order.get),
-                                  _alias_ancestors(launch.all_input_nodes), preparation))
+                                  _alias_ancestors([*external, *launch.all_input_nodes]), preparation))
     return matches, normalized
 
 
@@ -196,12 +179,17 @@ def _sink_waits(graph: fx.Graph, matches: list[_Reduction]) -> int:
     for match in sorted(matches, key=lambda item: order[item.launch]):
         # Moving each branch separately preserves early consumers of a
         # branched view and the mandatory RS-wait-AR dependency in HSDP.
+        next_realization = None
         for node in reversed(match.realization):
             if not node.users:
                 continue
             nodes = list(graph.nodes)
             positions = {item: index for index, item in enumerate(nodes)}
-            target = min(node.users, key=positions.get)
+            # Keep independent unpack branches stable across repeated scheduling.
+            successors = list(node.users)
+            if next_realization is not None:
+                successors.append(next_realization)
+            target = min(successors, key=positions.get)
             for between in nodes[positions[node] + 1:positions[target]]:
                 if is_barrier(between) or _is_input_release(between, match) or (
                     between.op != "output" and not between.meta.get("autograd_backward", False)
@@ -211,6 +199,7 @@ def _sink_waits(graph: fx.Graph, matches: list[_Reduction]) -> int:
             if positions[target] > positions[node] + 1:
                 target.prepend(node)
                 changed += 1
+            next_realization = node
     return changed
 
 
@@ -234,12 +223,21 @@ def overlap_grad_comm(graph_module: fx.GraphModule, pass_config: PassConfig) -> 
         return graph_module
     graph = graph_module.graph
     graph.lint()
+    before = {node: index for index, node in enumerate(graph.nodes)} if _LOG.isEnabledFor(logging.DEBUG) else {}
     matches, normalized = _collect_reductions(graph)
     advanced = _advance_launches(graph, matches)
     sunk = _sink_waits(graph, matches)
     graph.lint()
     if normalized or advanced or sunk:
         graph_module.recompile()
+    if _LOG.isEnabledFor(logging.DEBUG):
+        after = {node: index for index, node in enumerate(graph.nodes)}
+        for match in matches:
+            launch, wait = match.launch, match.realization[0]
+            _LOG.debug("FSDP gradient overlap completed: bucket=%s launch=%s index_before=%s index_after=%s "
+                       "wait=%s wait_before=%s wait_after=%s",
+                       launch.meta.get("fsdp_bucket_id"), launch.name, before.get(launch), after[launch],
+                       wait.name, before.get(wait), after[wait])
     graph_module.meta["fsdp_grad_overlap"] = {
         "matched": len(matches), "launches_advanced": advanced, "wait_view_nodes_sunk": sunk,
     }

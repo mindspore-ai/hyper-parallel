@@ -28,11 +28,12 @@ __all__ = ["overlap_param_gather"]
 import logging
 from dataclasses import dataclass
 
+import torch
 from torch import fx
 from torch.ops import _c10d_functional
 
 from ...pass_config import PassConfig
-from .utils import is_barrier, is_op, is_view
+from .utils import bucket_preparation, is_barrier, is_op, is_view
 
 _LOG = logging.getLogger(__name__)
 _GATHER_TYPES = ("fsdp_all_gather", "fsdp_all_gather_backward")
@@ -71,7 +72,7 @@ def _is_heavy(node: fx.Node) -> bool:
 
 
 def _collect_gathers(graph: fx.Graph) -> list[_Gather]:
-    """Collect tagged parameter gathers, wait/alias DAGs, and first consumers."""
+    """Find real consumers through views and the bucket's explicit copy-out nodes."""
     order = _indices(graph)
     matches = []
     for launch in graph.nodes:
@@ -88,7 +89,10 @@ def _collect_gathers(graph: fx.Graph) -> list[_Gather]:
         while stack:
             current = stack.pop()
             for user in current.users:
-                if is_view(user):
+                copy_out = (launch.meta.get("fsdp_bucket_id") is not None
+                            and user.meta.get("fsdp_bucket_copy_out") == launch.meta["fsdp_bucket_id"]
+                            and user.target is torch.ops.aten.clone.default)
+                if is_view(user) or copy_out:
                     if user not in realization:
                         realization.add(user)
                         stack.append(user)
@@ -100,7 +104,9 @@ def _collect_gathers(graph: fx.Graph) -> list[_Gather]:
 
 
 def _launch_chain(launch: fx.Node) -> list[fx.Node]:
-    """A private shard cast may move with the launch, as in the reference PR."""
+    """Move the private bucket pack DAG or an original private shard cast."""
+    if launch.meta.get("fsdp_bucket_id"):
+        return [*bucket_preparation(launch, _indices(launch.graph)), launch]
     shard = launch.args[0]
     if isinstance(shard, fx.Node) and len(shard.users) == 1 and shard.op == "call_function":
         schema = getattr(shard.target, "_schema", None)
@@ -195,7 +201,8 @@ def _launch_constraints(graph: fx.Graph) -> dict[fx.Node, list[fx.Node]]:
     frees = {}
     for node in graph.nodes:
         if node.meta.get("comm_type") in _GATHER_TYPES:
-            predecessors = [previous_effect, frees.get(node.meta.get("param_name"))]
+            names = node.meta.get("fsdp_bucket_members", (node.meta.get("param_name"),))
+            predecessors = [previous_effect, *(frees.get(name) for name in names)]
             constraints[node] = [item for item in predecessors if item is not None]
         if is_barrier(node):
             previous_effect = node
@@ -245,12 +252,18 @@ def _sink_realization(graph: fx.Graph, matches: list[_Gather]) -> int:
     """Sink every branch in reverse topological order, keeping all users valid."""
     changed = 0
     for match in matches:
+        next_realization = None
         for node in reversed(match.realization):
             if not node.users:
                 continue
             nodes = list(graph.nodes)
             order = {item: index for index, item in enumerate(nodes)}
-            target = min(node.users, key=order.get)
+            # Preserve independent branch order, including copy-outs sharing a
+            # consumer; otherwise reverse traversal flips them on every run.
+            successors = list(node.users)
+            if next_realization is not None:
+                successors.append(next_realization)
+            target = min(successors, key=order.get)
             # Other parameter frees may be crossed, but this storage's free
             # is already a user of its realization and bounds the sinking.
             for between in nodes[order[node] + 1:order[target]]:
@@ -263,6 +276,7 @@ def _sink_realization(graph: fx.Graph, matches: list[_Gather]) -> int:
             if order[target] > order[node] + 1:
                 target.prepend(node)
                 changed += 1
+            next_realization = node
     return changed
 
 
