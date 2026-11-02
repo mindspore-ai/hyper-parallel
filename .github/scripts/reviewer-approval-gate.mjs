@@ -15,6 +15,7 @@ import { appendFileSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// Keep the existing required status context so the active Rulesets continue to enforce this check.
 export const CHECK_CONTEXT = 'all-reviewers-approved';
 export const POLICY_PATH = '.github/reviewer-approval-policy.json';
 const ACTIONS_APP_ID = 15368;
@@ -38,21 +39,21 @@ export function validate_policy(policy, repository) {
   return policy;
 }
 
-/** Evaluate each person's latest effective decision against the current PR head. */
+/** Evaluate the existing reviewer set against the current PR head. */
 export function evaluate_reviews(pull, reviews) {
   const author = pull.user.login.toLowerCase();
   const requested = new Set((pull.requested_reviewers ?? []).map(user => user.login.toLowerCase()));
-  const reviewers = new Map((pull.requested_reviewers ?? []).map(user => [user.login.toLowerCase(), user.login]));
+  const reviewer_map = new Map((pull.requested_reviewers ?? []).map(user => [user.login.toLowerCase(), user.login]));
   const latest = new Map();
   // Requested reviewers disappear from requested_reviewers after submitting a
   // review. Include submitted reviewers to reconstruct the PR sidebar roster.
   for (const review of reviews) {
     if (review.user?.login && review.submitted_at) {
-      reviewers.set(review.user.login.toLowerCase(), review.user.login);
+      reviewer_map.set(review.user.login.toLowerCase(), review.user.login);
     }
   }
-  reviewers.delete(author);
-  const required = [...reviewers.values()];
+  reviewer_map.delete(author);
+  const reviewers = [...reviewer_map.values()];
   const pending_teams = (pull.requested_teams ?? []).map(team => team.slug);
   // Comments and unsubmitted reviews do not replace a submitted decision.
   // A dismissed decision does replace it; an older approval must not revive.
@@ -61,19 +62,27 @@ export function evaluate_reviews(pull, reviews) {
       latest.set(review.user.login.toLowerCase(), review);
     }
   }
-  const missing = required.filter(login => {
+  const missing = reviewers.filter(login => {
     const review = latest.get(login.toLowerCase());
     return requested.has(login.toLowerCase()) || review?.state !== 'APPROVED' ||
       review.commit_id !== pull.head.sha;
   });
+  const changes_requested_by = [...latest.values()]
+    .filter(review => review.user.login.toLowerCase() !== author && review.state === 'CHANGES_REQUESTED')
+    .map(review => review.user.login);
+  const approval_count = reviewers.length - missing.length;
+  const approval_threshold = reviewers.length >= 2 ? 2 : 1;
   return {
     number: pull.number,
     sha: pull.head.sha,
-    required,
+    reviewers,
     missing,
+    approval_count,
+    approval_threshold,
+    changes_requested_by,
     pending_teams,
-    ready: pull.state === 'open' && !pull.draft && required.length > 0 &&
-      missing.length === 0 && pending_teams.length === 0,
+    ready: pull.state === 'open' && !pull.draft && approval_count >= approval_threshold &&
+      changes_requested_by.length === 0 && pending_teams.length === 0,
   };
 }
 
@@ -156,6 +165,15 @@ function same_snapshot(before, after) {
     before.base.sha === after.base.sha && before.user.login === after.user.login;
 }
 
+function same_review_requests(before, after) {
+  const users = pull => (pull.requested_reviewers ?? [])
+    .map(user => `${user.login.toLowerCase()}:${user.type ?? ''}`).sort();
+  const teams = pull => (pull.requested_teams ?? []).map(team => team.slug.toLowerCase()).sort();
+  return before.state === after.state && before.draft === after.draft &&
+    JSON.stringify(users(before)) === JSON.stringify(users(after)) &&
+    JSON.stringify(teams(before)) === JSON.stringify(teams(after));
+}
+
 /** Reconcile live API state. Dry runs never publish checks or enable merging. */
 export function reconcile(client, policy, options = {}) {
   const { write = false, policy_sha, target_url, only_pr } = options;
@@ -191,16 +209,21 @@ export function reconcile(client, policy, options = {}) {
         results = fresh.map(pull => evaluate_reviews(pull, client.get_reviews(pull.number)));
         const sharing = client.list_pulls().filter(pull =>
           policy.base_branches.includes(pull.base.ref) && pull.head.sha === sha);
+        const sharing_by_number = new Map(sharing.map(pull => [pull.number, pull]));
         if (!fresh.every((pull, index) => same_snapshot(group[index], pull)) ||
             sharing.length !== group.length || sharing.some(pull => !group.some(old => old.number === pull.number)) ||
+            !fresh.every(pull => {
+              const current = sharing_by_number.get(pull.number);
+              return current && same_snapshot(pull, current) && same_review_requests(pull, current);
+            }) ||
             !policy_is_current(client, policy_sha, repository.default_branch)) {
           throw new Error('The PR or trusted policy changed during evaluation; retry with fresh state.');
         }
       }
       const ready = results.every(result => result.ready);
       const state = ready ? 'success' : 'pending';
-      const description = ready ? 'Every required reviewer approved the current commit.' :
-        'Waiting for all required reviewers to approve the current non-draft PR.';
+      const description = ready ? 'Approval quorum met for the current commit.' :
+        'Waiting for the approval quorum or blocking review requirements.';
       if (write && (previous?.state !== state || previous?.description !== description)) {
         client.publish(sha, state, description, target_url);
       }
@@ -264,7 +287,9 @@ function main() {
   const result = reconcile(client, policy, { write, only_pr, target_url, policy_sha: policy_blob_sha(source) });
   const lines = result.reports.map(report =>
     `PR #${report.number}: ${report.ready ? 'approved' : 'waiting'}; ` +
-    `missing: ${report.missing.join(', ') || '(none)'}; ` +
+    `approvals: ${report.approval_count}/${report.approval_threshold}; ` +
+    `pending reviewers: ${report.missing.join(', ') || '(none)'}; ` +
+    `changes requested by: ${report.changes_requested_by.join(', ') || '(none)'}; ` +
     `pending teams: ${report.pending_teams.join(', ') || '(none)'}; head: ${report.sha}`);
   console.log(`${write ? 'Live reconciliation' : 'Read-only evaluation'}\n${lines.join('\n')}`);
   if (process.env.GITHUB_STEP_SUMMARY) {
