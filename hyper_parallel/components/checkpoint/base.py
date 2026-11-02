@@ -110,6 +110,15 @@ class CheckpointerBase(ABC):
         """
         return
 
+    def is_async_save_complete(self) -> bool:
+        """Report whether asynchronous persistence has finished without waiting.
+
+        A backend that can observe completion overrides this method. The
+        conservative default leaves deferred resource cleanup to an explicit
+        :meth:`maybe_wait_for_async_save` call.
+        """
+        return False
+
     def find_latest_checkpoint(self, checkpoint_dir: str) -> Optional[str]:
         """Return the newest resumable checkpoint under ``checkpoint_dir``.
 

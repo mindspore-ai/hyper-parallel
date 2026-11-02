@@ -16,12 +16,24 @@
 
 import tempfile
 import unittest
+import weakref
+from concurrent.futures import Future
 from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from hyper_parallel.components.checkpoint.config import CheckpointingConfig
-from hyper_parallel.trainer.callbacks.checkpoint_callback import CheckpointerCallback
+from hyper_parallel.components.checkpoint.dcp_checkpointer import (
+    DistributedCheckpointer,
+    cleanup_synced_optimizer_state,
+)
+from hyper_parallel.components.optim.mixed_precision_optimizer import Float16OptimizerWithFloat16Params
+from hyper_parallel.core.optimizer.muon import Muon
+from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
+from hyper_parallel.core.optimizer.sharding_category import HSDPGroupAssignment, ParamRecord
+from hyper_parallel.trainer.callbacks.checkpoint_callback import CheckpointerCallback, _state_leaf_keys
 from hyper_parallel.trainer.state import TrainerState
 from tests.common.mark_utils import arg_mark
 
@@ -384,6 +396,7 @@ def _bare_callback(trainer: SimpleNamespace) -> Any:
     callback._checkpoint_dir = "unused"
     callback._restore_optimizer = True
     callback._restore_train_state = False
+    callback._pending_synced_optimizers = []
     callback.checkpointer = MagicMock()
     return callback
 
@@ -444,8 +457,6 @@ class TestStateLeafKeys(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     def test_nested_optimizer_state_flattens_to_leaf_keys(self) -> None:
         """DCP traversal lists every persisted dense optimizer leaf."""
-        from hyper_parallel.trainer.callbacks.checkpoint_callback import _state_leaf_keys
-
         keys = _state_leaf_keys({"state": {"w": {"exp_avg": 1}}, "param_groups": []})
         self.assertEqual(keys, frozenset({"state.w.exp_avg", "param_groups"}))
 
@@ -585,7 +596,7 @@ class TestApplyRestoredPayloadExternal(unittest.TestCase):
 class TestLoadCheckpointExternal(unittest.TestCase):
     """External load plan validation inside the restore flow."""
 
-    def _callback_with_skeleton(self, external: _FakeExternalState,
+    def _callback_with_skeleton(self, _external: _FakeExternalState,
                                 optimizer_keys: frozenset) -> Any:
         """Build a callback whose restore skeleton carries the given keys."""
         callback = _bare_callback(_external_trainer(CheckpointingConfig()))
@@ -631,6 +642,274 @@ class TestLoadCheckpointExternal(unittest.TestCase):
                 patch(f"{_CALLBACK_MODULE}.logger"):
             with self.assertRaisesRegex(RuntimeError, "lost persisted keys"):
                 callback._load_checkpoint()
+
+
+def _replica_muon(optimizer_type=Muon):
+    """Provide one authoritative and one checkpoint-only momentum copy."""
+    owner = torch.nn.Parameter(torch.ones(2, 2))
+    replica = torch.nn.Parameter(torch.ones(2, 2))
+    optimizer = optimizer_type([owner, replica])
+    records = [ParamRecord(0, owner), ParamRecord(1, replica)]
+    assignment = HSDPGroupAssignment(
+        owned_records=records[:1], all_records=records,
+        owner_by_index={0: (0,), 1: (1,)},
+        replicate_group_ranks=(0,), replicate_sizes=(2,),
+    )
+    optimizer._hsdp_assignment_batches = {
+        0: {"batch_groups": [{"sub_batches": [assignment]}]},
+    }
+    optimizer.state[owner]["momentum_buffer"] = torch.ones_like(owner)
+    optimizer.state[replica]["momentum_buffer"] = torch.full_like(replica, 2)
+    return optimizer, owner, replica, assignment
+
+
+def _callback(optimizer):
+    """Isolate checkpoint lifecycle methods from unrelated trainer setup."""
+    callback = CheckpointerCallback.__new__(CheckpointerCallback)
+    callback._pending_synced_optimizers = []
+    callback._save_steps = 0
+    callback._checkpoint_dir = "unused"
+    callback._is_async = False
+    callback._save_extra_state_per_rank = True
+    callback._save_optimizer = True
+    callback._save_train_state = False
+    callback._restore_optimizer = True
+    callback._restore_train_state = False
+    callback._is_peft = False
+    callback.trainer = SimpleNamespace(
+        optimizer=optimizer, model=object(), model_integration=None,
+        mesh=None, state=TrainerState(),
+    )
+    callback._model_state_dict = lambda: {}
+    callback.checkpointer = MagicMock()
+    return callback
+
+
+def _pending_callback(optimizer, future):
+    """Use the real DCP completion and error handling with a controlled future."""
+    callback = _callback(optimizer)
+    callback._pending_synced_optimizers = [optimizer]
+    callback.checkpointer = DistributedCheckpointer(extra_state_per_rank=False)
+    callback.checkpointer._async_save_response = SimpleNamespace(persist_completion=future)
+    return callback
+
+
+@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+          card_mark="onecard", essential_mark="essential")
+class TestMuonCheckpointState(unittest.TestCase):
+    """Release only known non-owner copies after successful I/O."""
+
+    def test_sync_save_releases_payload_before_cleanup(self) -> None:
+        """The writer sees all copies; cleanup starts after its payload is gone."""
+        optimizer, owner, replica, _ = _replica_muon()
+        callback = _callback(optimizer)
+        callback._model_state_dict = lambda: {"ephemeral": torch.ones(2)}
+        payload_ref = []
+
+        def _write(_path: str, payload: Dict[str, Any], **_kwargs: Any) -> None:
+            """Observe all device copies while persistence owns the payload."""
+            self.assertIn(replica, optimizer.state)
+            payload_ref.append(weakref.ref(payload["model"]["ephemeral"]))
+
+        callback.checkpointer = SimpleNamespace(
+            save=_write, maybe_wait_for_async_save=lambda: None,
+        )
+
+        def _cleanup(target: Any) -> None:
+            """Ensure the save frame released its transient payload first."""
+            self.assertIsNone(payload_ref[0]())
+            cleanup_synced_optimizer_state(target)
+
+        with patch(f"{_CALLBACK_MODULE}.get_model_external_state", return_value=None), \
+                patch(f"{_CALLBACK_MODULE}.cleanup_synced_optimizer_state", side_effect=_cleanup):
+            callback._save_checkpoint(TrainerState(global_step=3))
+        self.assertIn(owner, optimizer.state)
+        self.assertNotIn(replica, optimizer.state)
+
+    def test_async_save_retains_copies_until_successful_completion(self) -> None:
+        """Step polling never frees copies while persistence is pending."""
+        optimizer, owner, replica, _ = _replica_muon()
+        future = Future()
+        callback = _pending_callback(optimizer, future)
+        momentum = optimizer.state[replica]["momentum_buffer"]
+        callback.on_step_end(TrainerState(global_step=1))
+        self.assertIs(optimizer.state[replica]["momentum_buffer"], momentum)
+        future.set_result(None)
+        callback.on_step_end(TrainerState(global_step=2))
+        self.assertIn(owner, optimizer.state)
+        self.assertNotIn(replica, optimizer.state)
+        self.assertEqual(callback._pending_synced_optimizers, [])
+
+    def test_failed_future_is_not_reinterpreted_as_a_successful_wait(self) -> None:
+        """Either failure-reporting entry point leaves the actual state intact."""
+        for poll in (True, False):
+            with self.subTest(poll=poll):
+                optimizer, owner, replica, _ = _replica_muon()
+                future = Future()
+                callback = _pending_callback(optimizer, future)
+                future.set_exception(OSError("persist failed"))
+                with self.assertRaisesRegex(OSError, "persist failed"):
+                    if poll:
+                        callback.on_step_end(TrainerState(global_step=2))
+                    else:
+                        callback.wait_for_pending_save()
+                self.assertEqual(callback._pending_synced_optimizers, [])
+                callback.wait_for_pending_save()
+                self.assertIn(owner, optimizer.state)
+                self.assertIn(replica, optimizer.state)
+
+    def test_interrupted_wait_preserves_state_after_backend_consumes_response(self) -> None:
+        """An interrupted pending future must not cause premature later cleanup."""
+        optimizer, _, replica, _ = _replica_muon()
+        future = Future()
+        callback = _pending_callback(optimizer, future)
+        response = callback.checkpointer._async_save_response
+        with patch.object(future, "result", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                callback.wait_for_pending_save()
+        self.assertFalse(future.done())
+        self.assertIs(callback.checkpointer._async_save_response, response)
+        self.assertEqual(callback._pending_synced_optimizers, [])
+        future.set_result(None)
+        callback.wait_for_pending_save()
+        self.assertIn(replica, optimizer.state)
+
+    def test_previous_save_drains_before_another_payload_is_exported(self) -> None:
+        """A new snapshot cannot keep an old writer's cleanup pending."""
+        optimizer, _, replica, _ = _replica_muon()
+        future = Future()
+        future.set_result(None)
+        callback = _pending_callback(optimizer, future)
+
+        def _export() -> Dict[str, Any]:
+            """Check previous-writer cleanup before another snapshot begins."""
+            self.assertNotIn(replica, optimizer.state)
+            return {}
+
+        callback._model_state_dict = _export
+        with patch(f"{_CALLBACK_MODULE}.get_model_external_state", return_value=None), \
+                patch.object(callback.checkpointer, "save"):
+            callback._save_checkpoint(TrainerState(global_step=3))
+
+    def test_failed_save_does_not_release_exported_state(self) -> None:
+        """Writer failure does not establish a safe cleanup boundary."""
+        optimizer, _, replica, _ = _replica_muon()
+        callback = _callback(optimizer)
+        callback.checkpointer.save.side_effect = OSError("save failed")
+        with patch(f"{_CALLBACK_MODULE}.get_model_external_state", return_value=None):
+            with self.assertRaisesRegex(OSError, "save failed"):
+                callback._save_checkpoint(TrainerState(global_step=3))
+        self.assertIn(replica, optimizer.state)
+
+    def test_restore_cleans_after_apply_and_uses_the_external_dense_target(self) -> None:
+        """Both ordinary and host-coordinated restore clean the actual dense leaf."""
+        for external_state in (False, True):
+            with self.subTest(external_state=external_state):
+                optimizer, owner, replica, _ = _replica_muon()
+                outer = SimpleNamespace() if external_state else optimizer
+                callback = _callback(outer)
+                callback._resolve_restore_path = lambda: "ckpt"
+                callback._build_restore_skeleton = lambda *_args: ({"model": {}}, [outer])
+                callback._resume_position = lambda: (0, 0)
+                external = SimpleNamespace(
+                    optimizer_for_dcp=lambda: optimizer,
+                    before_checkpoint_load=lambda _runtime: None,
+                ) if external_state else None
+
+                def _apply(*_args: Any) -> None:
+                    """Observe the restored state before the cleanup boundary."""
+                    self.assertIn(replica, optimizer.state)
+
+                callback._apply_restored_payload = _apply
+                with patch(f"{_CALLBACK_MODULE}.get_model_external_state", return_value=external), \
+                        patch(f"{_CALLBACK_MODULE}.empty_cache"):
+                    callback._load_checkpoint()
+                self.assertIn(owner, optimizer.state)
+                self.assertNotIn(replica, optimizer.state)
+
+    def test_external_save_cleans_the_actual_dense_target(self) -> None:
+        """An opaque host coordinator does not hide its ordinary dense Muon."""
+        optimizer, owner, replica, _ = _replica_muon()
+        outer = SimpleNamespace(state_dict=optimizer.state_dict)
+        callback = _callback(outer)
+        external = SimpleNamespace(
+            optimizer_for_dcp=lambda: optimizer, before_checkpoint_save=MagicMock(),
+        )
+        with patch(f"{_CALLBACK_MODULE}.get_model_external_state", return_value=external):
+            callback._save_checkpoint(TrainerState(global_step=3))
+        self.assertIn(owner, optimizer.state)
+        self.assertNotIn(replica, optimizer.state)
+
+    def test_failed_restore_does_not_cleanup_partially_loaded_state(self) -> None:
+        """Loading or applying an incomplete checkpoint preserves state for diagnosis."""
+        for stage in ("load", "apply"):
+            with self.subTest(stage=stage):
+                optimizer, _, replica, _ = _replica_muon()
+                callback = _callback(optimizer)
+                callback._resolve_restore_path = lambda: "ckpt"
+                callback._build_restore_skeleton = lambda *_args: ({"model": {}}, [optimizer])
+                callback._apply_restored_payload = MagicMock()
+                target = callback.checkpointer.load if stage == "load" else callback._apply_restored_payload
+                target.side_effect = OSError("restore failed")
+                with patch(f"{_CALLBACK_MODULE}.get_model_external_state", return_value=None):
+                    with self.assertRaisesRegex(OSError, "restore failed"):
+                        callback._load_checkpoint()
+                self.assertIn(replica, optimizer.state)
+
+    def test_unknown_ownership_and_extended_state_are_retained(self) -> None:
+        """Never invoke a whole-leaf cleanup when ownership or state is ambiguous."""
+        for case in ("frozen", "owner_bounds", "local_bounds", "extended"):
+            with self.subTest(case=case):
+                optimizer, owner, replica, assignment = _replica_muon()
+                if case == "frozen":
+                    owner.requires_grad_(False)
+                    assignment.owner_by_index.pop(0)
+                elif case == "owner_bounds":
+                    assignment.owner_by_index[1] = (2,)
+                elif case == "local_bounds":
+                    assignment.replicate_group_ranks = (2,)
+                else:
+                    optimizer.state[replica]["extension"] = torch.ones(1)
+                before = optimizer.state[owner]["momentum_buffer"]
+                cleanup_synced_optimizer_state(optimizer)
+                self.assertIs(optimizer.state[owner]["momentum_buffer"], before)
+                self.assertIn(replica, optimizer.state)
+
+    def test_subclass_and_swap_lifecycles_are_not_changed(self) -> None:
+        """Only the ordinary native Muon lifecycle is handled here."""
+        class ExtendedMuon(Muon):
+            """A custom optimizer may attach different state lifetimes."""
+
+        for optimizer_type in (Muon, ExtendedMuon):
+            with self.subTest(optimizer_type=optimizer_type):
+                optimizer, _, replica, _ = _replica_muon(optimizer_type)
+                if optimizer_type is Muon:
+                    optimizer._prepare_swap_checkpoint = lambda: None
+                cleanup_synced_optimizer_state(optimizer)
+                self.assertIn(replica, optimizer.state)
+
+    def test_mixed_precision_chain_preserves_owner_and_adam_state(self) -> None:
+        """Unwrap supported wrappers without dropping unrelated optimizer state."""
+        optimizer, owner, replica, _ = _replica_muon()
+        model = torch.nn.Module()
+        model.register_parameter("owner", owner)
+        model.register_parameter("replica", replica)
+        bias = torch.nn.Parameter(torch.ones(1))
+        model.register_parameter("bias", bias)
+        adam = torch.optim.AdamW([bias])
+        adam.state[bias]["exp_avg"] = torch.ones(1)
+        momentum = optimizer.state[owner]["momentum_buffer"]
+        exp_avg = adam.state[bias]["exp_avg"]
+        chain = ChainedOptimizer(model, {"muon": optimizer, "adamw": adam})
+        synthetic_batches = optimizer._hsdp_assignment_batches
+        wrapped = Float16OptimizerWithFloat16Params(chain, model)
+        # Wrapping rebuilds assignments from the real parameter meshes. These
+        # CPU parameters have none; restore the fixture's synthetic assignment.
+        optimizer._hsdp_assignment_batches = synthetic_batches
+        cleanup_synced_optimizer_state(wrapped)
+        self.assertIs(optimizer.state[owner]["momentum_buffer"], momentum)
+        self.assertNotIn(replica, optimizer.state)
+        self.assertIs(adam.state[bias]["exp_avg"], exp_avg)
 
 
 if __name__ == "__main__":

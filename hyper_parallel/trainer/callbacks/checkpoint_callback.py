@@ -25,6 +25,7 @@ import torch  # pylint: disable=forbidden-backend-import
 from hyper_parallel.components.checkpoint import build_checkpointer
 from hyper_parallel.components.checkpoint.dcp_checkpointer import (
     STEP_PREFIX,
+    cleanup_synced_optimizer_state,
     initialize_optimizer_state,
 )
 from hyper_parallel.components.optim.mixed_precision_optimizer import (
@@ -129,6 +130,7 @@ class CheckpointerCallback(Callback):
                 raise ValueError("Host PP checkpoint requires per-rank extra state")
 
         self._last_saved_step: int = -1
+        self._pending_synced_optimizers: List[Any] = []
         self.checkpointer = build_checkpointer(
             extra_state_per_rank=self._save_extra_state_per_rank,
         )
@@ -168,7 +170,17 @@ class CheckpointerCallback(Callback):
         # Asked every step on purpose. An async save that failed can only be
         # reported on a thread that cannot raise into this loop, so waiting for the
         # next save to notice would throw away every step in between.
-        self.checkpointer.raise_for_failed_async_save()
+        try:
+            self.checkpointer.raise_for_failed_async_save()
+        except BaseException:
+            # The backend may consume a failed or interrupted future. A later no-op wait must
+            # not reinterpret that failed snapshot as successful persistence.
+            self._pending_synced_optimizers.clear()
+            raise
+        if self._pending_synced_optimizers:
+            completed = getattr(self.checkpointer, "is_async_save_complete", None)
+            if callable(completed) and completed() is True:
+                self.wait_for_pending_save()
         if self._save_steps > 0 and state.global_step % self._save_steps == 0:
             if state.global_step == self._last_saved_step:
                 return
@@ -212,7 +224,14 @@ class CheckpointerCallback(Callback):
 
     def wait_for_pending_save(self) -> None:
         """Block until the checkpointer's in-flight async save is persisted."""
-        self.checkpointer.maybe_wait_for_async_save()
+        try:
+            self.checkpointer.maybe_wait_for_async_save()
+        except BaseException:
+            self._pending_synced_optimizers.clear()
+            raise
+        for optimizer in self._pending_synced_optimizers:
+            cleanup_synced_optimizer_state(optimizer)
+        self._pending_synced_optimizers.clear()
 
     # ------------------------------------------------------------------
     # Payload assembly
@@ -288,6 +307,8 @@ class CheckpointerCallback(Callback):
 
     def _save_checkpoint(self, state: TrainerState, force_sync: bool = False) -> None:
         """Assemble the payload for this step and hand it to the checkpointer."""
+        # Drain the previous writer before exporting another optimizer snapshot.
+        self.wait_for_pending_save()
         save_dir = os.path.join(self._checkpoint_dir, f"{STEP_PREFIX}{state.global_step}")
         save_async = self._is_async and not force_sync
 
@@ -304,9 +325,10 @@ class CheckpointerCallback(Callback):
         )
 
         checkpoint_state: Dict[str, Any] = {"model": self._model_state_dict()}
+        optimizers = _as_list(self.trainer.optimizer) if self._save_optimizer else []
         if self._save_optimizer:
             checkpoint_state["optimizer"] = _unwrap_single(
-                [optimizer.state_dict() for optimizer in _as_list(self.trainer.optimizer)]
+                [optimizer.state_dict() for optimizer in optimizers]
             )
         if self._save_train_state:
             checkpoint_state["extra_state"] = self._collect_extra_state(state)
@@ -342,6 +364,14 @@ class CheckpointerCallback(Callback):
         # mode: otherwise on_epoch_end would queue the same step again while the
         # first save is still in flight.
         self._last_saved_step = state.global_step
+        # The writer keeps its own payload until persistence completes.
+        # Drop this frame's references before trying to reclaim device copies.
+        del checkpoint_state
+        self._pending_synced_optimizers = (
+            [external.optimizer_for_dcp()] if external is not None and optimizers else optimizers
+        )
+        if not save_async:
+            self.wait_for_pending_save()
 
     # ------------------------------------------------------------------
     # Load / restore
@@ -453,6 +483,7 @@ class CheckpointerCallback(Callback):
         if restore_path is None:
             return
 
+        self.wait_for_pending_save()
         logger.info("Loading checkpoint from %s", restore_path)
         external = get_model_external_state(self.trainer.model)
         runtime = None
@@ -500,6 +531,12 @@ class CheckpointerCallback(Callback):
             load_plan,
         )
 
+        del checkpoint_state
+        cleanup_targets = (
+            [external.optimizer_for_dcp()] if external is not None and optimizers else optimizers
+        )
+        for optimizer in cleanup_targets:
+            cleanup_synced_optimizer_state(optimizer)
         empty_cache()
         # Computed here because this log is the only consumer: the training loops
         # derive their own starting position from ``state`` instead, so carrying it

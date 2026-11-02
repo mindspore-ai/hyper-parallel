@@ -18,6 +18,7 @@
 __all__ = [
     "STEP_PREFIX",
     "DistributedCheckpointer",
+    "cleanup_synced_optimizer_state",
     "initialize_optimizer_state",
 ]
 
@@ -307,6 +308,54 @@ def _leaf_optimizers(optimizer: Any) -> List[Any]:
     return [inner_optimizer]
 
 
+def _has_safe_nonowner_state(optimizer: Any) -> bool:
+    """Require valid ownership for every replicated state before native cleanup."""
+    assignments = getattr(optimizer, "_hsdp_assignment_batches", {})
+    groups = (
+        assignment
+        for info in assignments.values()
+        for batch_group in info["batch_groups"]
+        for assignment in batch_group["sub_batches"]
+        if assignment.is_replicated
+    )
+    has_nonowner = False
+    for assignment in groups:
+        for record in assignment.all_records:
+            state = optimizer.state.get(record.param)
+            if not state:
+                continue
+            owner = assignment.owner_by_index.get(record.index)
+            local = assignment.replicate_group_ranks
+            sizes = assignment.replicate_sizes
+            if (owner is None or len(owner) != len(sizes) or len(local) != len(sizes)
+                    or any(not 0 <= rank < size for coord in (owner, local)
+                           for rank, size in zip(coord, sizes))):
+                logger.warning("Retaining Muon state with unknown replica owner (index %s).", record.index)
+                return False
+            if not assignment.is_owned(record):
+                if set(state) != {"momentum_buffer"}:
+                    logger.warning("Retaining extended Muon non-owner state (index %s).", record.index)
+                    return False
+                has_nonowner = True
+    return has_nonowner
+
+
+def cleanup_synced_optimizer_state(optimizer: Any) -> None:
+    """Release known ordinary Muon copies after checkpoint I/O finishes.
+
+    Call on the training thread after synchronous I/O or after waiting for
+    asynchronous persistence. Unknown ownership and extended state are retained.
+    Subclasses and swap-managed optimizers keep their own checkpoint lifecycle.
+    """
+    for leaf in _leaf_optimizers(optimizer):
+        # Subclasses may give their state a different ownership or lifetime.
+        if type(leaf) is not HyperMuon or callable(  # pylint: disable=unidiomatic-typecheck
+                getattr(leaf, "_prepare_swap_checkpoint", None)):
+            continue
+        if _has_safe_nonowner_state(leaf):
+            leaf.cleanup_synced_state()
+
+
 def initialize_optimizer_state(optimizer: Any) -> bool:
     """Materialize optimizer state so a DCP load has entries to fill.
 
@@ -519,19 +568,23 @@ class DistributedCheckpointer(CheckpointerBase):
         the time the future resolves, and waiting for this call to come around
         would leave the checkpoint unnamed until the next save.
         """
-        if self._async_save_response is None:
+        response = self._async_save_response
+        if response is None:
             return
 
         rank = _get_rank()
         try:
             logger.info("[rank %s] waiting for async DCP save to finish...", rank)
-            self._async_save_response.persist_completion.result()
+            response.persist_completion.result()
             logger.info("[rank %s] async DCP save has been finished...", rank)
         except Exception:  # pylint: disable=broad-except
             logger.exception("[rank %s] async DCP save failed", rank)
             raise
         finally:
-            self._async_save_response = None
+            # An interrupted wait must not lose an unfinished writer. A later
+            # save or restore still has to drain it before reusing its tensors.
+            if response.persist_completion.done():
+                self._async_save_response = None
 
     def raise_for_failed_async_save(self) -> None:
         """Re-raise an in-flight async save's failure as soon as it is known.
@@ -552,6 +605,15 @@ class DistributedCheckpointer(CheckpointerBase):
         # for either way.
         self._async_save_response = None
         response.persist_completion.result()
+
+    def is_async_save_complete(self) -> bool:
+        """Observe persistence without waiting or consuming its result.
+
+        Callers still drain the save to surface any error before releasing
+        tensors that may be referenced by the checkpoint writer.
+        """
+        response = self._async_save_response
+        return response is None or response.persist_completion.done()
 
     def _publish_latest(self, save_dir: str, step: int) -> None:
         """Point the latest-checkpoint file at a checkpoint that is fully on disk.
