@@ -17,7 +17,7 @@
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -133,6 +133,21 @@ def _seed_owner_rows(fqn: str, table: HostEngramTable) -> torch.Tensor:
     return rows
 
 
+def _read_source_owner_rows(source_key: str, table: HostEngramTable,
+                            shape: tuple[int, ...], read_rows: Callable[[int, int], torch.Tensor]) -> torch.Tensor:
+    """Read the owner's logical rows and zero any physical tail padding."""
+    if (len(shape) != 2 or shape[1] != table.width
+            or shape[0] not in (table.logical_rows, table.physical_rows)):
+        raise ValueError(f"Host Engram source shape mismatch: {source_key}")
+    count = max(0, min(table.rows_per_owner, table.logical_rows - table.global_row_start))
+    if count == table.rows_per_owner:
+        return read_rows(table.global_row_start, count).float()
+    rows = torch.zeros((table.rows_per_owner, table.width), dtype=torch.float32)
+    if count:
+        rows[:count] = read_rows(table.global_row_start, count).float()
+    return rows
+
+
 def materialize_owner_rows(model: nn.Module, tables: Mapping[str, HostEngramTable],
                            context: ExternalLoadContext) -> frozenset[str]:
     """Install each owner's CPU rows into its existing parameter object.
@@ -169,19 +184,20 @@ def materialize_owner_rows(model: nn.Module, tables: Mapping[str, HostEngramTabl
                 rows = _read_manifest_rows(manifest_root, source_key, manifest[source_key], table)
             elif quantized_reader is not None:
                 metadata = quantized_reader.load_metadata().state_dict_metadata[source_key]
-                if metadata.size != (table.physical_rows, table.width):
-                    raise ValueError(f"Host Engram source shape mismatch: {target}")
-                rows = quantized_reader.read_region(
-                    source_key, (table.global_row_start, 0), (table.rows_per_owner, table.width),
-                ).float()
+                rows = _read_source_owner_rows(
+                    source_key, table, tuple(metadata.size),
+                    lambda start, count, source_key=source_key, width=table.width, reader=quantized_reader:
+                        reader.read_region(source_key, (start, 0), (count, width)),
+                )
             else:
                 with safe_open(str(index.files_by_key[source_key]), framework="pt", device="cpu") as source:
                     tensor_slice = source.get_slice(source_key)
-                    if tuple(tensor_slice.get_shape()) != (table.physical_rows, table.width):
-                        raise ValueError(f"Host Engram source shape mismatch: {target}")
                     if tensor_slice.get_dtype() not in ("BF16", "F32"):
                         raise ValueError(f"Host Engram source requires BF16/FP32 weights: {target}")
-                    rows = tensor_slice[table.global_row_start:table.global_row_start + table.rows_per_owner].float()
+                    rows = _read_source_owner_rows(
+                        source_key, table, tuple(tensor_slice.get_shape()),
+                        lambda start, count, tensor_slice=tensor_slice: tensor_slice[start:start + count],
+                    )
             source_keys.add(source_key)
         if rows.dtype != torch.float32 or tuple(rows.shape) != tuple(table.weight.shape):
             raise ValueError(f"Host Engram source dtype or local shape mismatch: {target}")

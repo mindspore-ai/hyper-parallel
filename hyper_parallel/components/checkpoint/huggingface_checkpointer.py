@@ -52,6 +52,7 @@ from hyper_parallel.components.checkpoint.load_groups import (
     build_replacement_routes,
     convert_group,
     copy_into_target,
+    checkpoint_logical_shapes,
     make_tensor_loader,
     resolve_checkpoint_index,
     validate_load_result,
@@ -229,6 +230,7 @@ class HuggingFaceCheckpointer(CheckpointerBase):
 
         checkpoint_index = resolve_checkpoint_index(pretrained_path)
         targets = build_load_targets(model)
+        logical_shapes = checkpoint_logical_shapes(model)
         if not external_target_fqns <= targets.keys():
             raise ValueError("External target is absent from the model")
         targets = {key: value for key, value in targets.items() if key not in external_target_fqns}
@@ -257,6 +259,7 @@ class HuggingFaceCheckpointer(CheckpointerBase):
                 source_shapes,
                 pretrained_path,
                 strict,
+                logical_shapes,
             )
         return self._load_base_conversions(
             model,
@@ -265,6 +268,7 @@ class HuggingFaceCheckpointer(CheckpointerBase):
             weights_mapping,
             pretrained_path,
             strict,
+            logical_shapes,
         )
 
     def _load_base_conversions(
@@ -275,6 +279,7 @@ class HuggingFaceCheckpointer(CheckpointerBase):
         weights_mapping: WeightsMapping,
         pretrained_path: str,
         strict: bool,
+        logical_shapes: Dict[str, tuple[int, ...]],
     ) -> LoadReport:
         """Load a model whose tensors the Transformers conversion rules reach directly."""
         groups, unexpected_keys, weight_mapping = build_load_groups(
@@ -298,7 +303,7 @@ class HuggingFaceCheckpointer(CheckpointerBase):
                 tensor = tensor[0] if isinstance(tensor, list) else tensor
                 target_id = id(target)
                 if target_id not in loaded_target_ids:
-                    copy_into_target(target_name, tensor, target)
+                    copy_into_target(target_name, tensor, target, logical_shapes.get(target_name))
                     loaded_target_ids.add(target_id)
                 loaded_keys.update(aliases_by_target[target_id])
 
@@ -329,6 +334,7 @@ class HuggingFaceCheckpointer(CheckpointerBase):
         source_shapes: Dict[str, tuple],
         pretrained_path: str,
         strict: bool,
+        logical_shapes: Dict[str, tuple[int, ...]],
     ) -> LoadReport:
         """Normalize original weights before applying replacement conversions."""
         base_mapping = base_weights_mapping(weights_mapping, replacement_mapping)
@@ -362,7 +368,7 @@ class HuggingFaceCheckpointer(CheckpointerBase):
                 tensor = tensor[0] if isinstance(tensor, list) else tensor
                 target_id = id(target)
                 if target_id not in loaded_target_ids:
-                    copy_into_target(target_name, tensor, target)
+                    copy_into_target(target_name, tensor, target, logical_shapes.get(target_name))
                     loaded_target_ids.add(target_id)
                 loaded_keys.update(aliases_by_target[target_id])
 

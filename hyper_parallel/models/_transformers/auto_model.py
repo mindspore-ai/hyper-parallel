@@ -33,6 +33,7 @@ from transformers import (
 )
 
 from hyper_parallel.components.checkpoint.huggingface_checkpointer import resolve_hf_loader
+from hyper_parallel.components.checkpoint.weight_verifier import verify_hf_weights as check_hf_weights
 from hyper_parallel.models._transformers.model_builder import (
     _init_model,
     apply_model_infrastructure,
@@ -228,6 +229,70 @@ def _prepare_codegen_artifact(
     return layout.artifact_dir
 
 
+def _load_pretrained_config(
+        pretrained_model_name_or_path: str,
+        attn_implementation: str,
+        torch_dtype: Union[str, torch.dtype],
+        config_overrides: Optional[dict[str, Any]],
+        kwargs: dict[str, Any],
+) -> PretrainedConfig:
+    """Load the HF configuration with call-time overrides."""
+    config_kwargs = dict(kwargs)
+    config_kwargs.update(config_overrides or {})
+    return get_hf_config(pretrained_model_name_or_path, attn_implementation, torch_dtype, **config_kwargs)
+
+
+def _validate_weight_check_options(verify_hf_weights: Optional[str], load_base_model: bool) -> None:
+    """Require pretrained loading when verification is requested."""
+    if verify_hf_weights is not None and not load_base_model:
+        raise ValueError("verify_hf_weights requires load_base_model=True")
+
+
+def _prepare_pretrained_build(
+        distributed_setup: DistributedSetup,
+        compile_config: Optional[Union[CompileConfig, dict]],
+        pretrained_model_name_or_path: str,
+        attn_implementation: str,
+        torch_dtype: Union[str, torch.dtype],
+        config_overrides: Optional[dict[str, Any]],
+        kwargs: dict[str, Any],
+        force_hf: bool,
+        codegen: bool,
+        backend: Optional[Any],
+        codegen_config: Optional[Any],
+        codegen_artifact_dir: Optional[str],
+) -> tuple[Any, Any, PretrainedConfig, bool, Any, Optional[str]]:
+    """Prepare infrastructure, HF configuration and the selected modeling backend."""
+    # ② Instantiate infrastructure
+    sharding_planner, fsdp2_manager = instantiate_infrastructure(
+        distributed_setup=distributed_setup,
+        device=_current_device(),
+        compile_config=compile_config,
+    )
+
+    # ③ Get HF config
+    hf_config = _load_pretrained_config(
+        pretrained_model_name_or_path, attn_implementation, torch_dtype, config_overrides, kwargs,
+    )
+    # ④ Determine model path
+    is_hf_model = get_is_hf_model(hf_config, force_hf)
+
+    # codegen sidecar: an explicit gen backend bypasses the HF/custom
+    # dispatch above; the master wiring stays as-is for everything else.
+    if codegen and not force_hf:
+        backend = ModelingBackend.GEN
+        if codegen_artifact_dir is None:
+            codegen_artifact_dir = _prepare_codegen_artifact(
+                codegen_config,
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                codegen_artifact_dir=codegen_artifact_dir,
+                config_overrides=config_overrides,
+                hf_config=hf_config,
+            )
+
+    return sharding_planner, fsdp2_manager, hf_config, is_hf_model, backend, codegen_artifact_dir
+
+
 class _BaseHyperAutoModelClass:
     """Shared from_pretrained / from_config logic.
 
@@ -275,6 +340,7 @@ class _BaseHyperAutoModelClass:
         codegen: bool = False,
         config_overrides: Optional[dict[str, Any]] = None,
         load_base_model: bool = True,
+        verify_hf_weights: Optional[str] = None,
         codegen_config: Optional[Any] = None,
         **kwargs: Any,
     ) -> PreTrainedModel:
@@ -286,11 +352,12 @@ class _BaseHyperAutoModelClass:
         Args:
             pretrained_model_name_or_path: HF checkpoint path or model identifier.
             *model_args: Positional arguments for model construction.
+            verify_hf_weights: Optional report directory for checking all loaded shards
+                against a local HF checkpoint before the first forward. All ranks must opt in.
             **kwargs: Additional model construction and HF configuration arguments.
 
         Returns:
             Constructed and parallelized pretrained model.
-
         Following design doc 01 §6.2:
         ① resolve distributed_setup → MeshContext
         ② instantiate_infrastructure → ShardingPlanner + FSDP2Manager
@@ -298,41 +365,27 @@ class _BaseHyperAutoModelClass:
         ④ get_is_hf_model → custom/HF path
         ⑤ _build_model → meta + shard + load
         """
+        _validate_weight_check_options(verify_hf_weights, load_base_model)
         if distributed_setup is None:
             distributed_setup = DistributedSetup()
         mesh = distributed_setup.mesh_context
-
-        # ② Instantiate infrastructure
-        sharding_planner, fsdp2_manager = instantiate_infrastructure(
-            distributed_setup=distributed_setup,
-            device=_current_device(),
-            compile_config=compile_config,
+        prepared = _prepare_pretrained_build(
+            distributed_setup,
+            compile_config,
+            pretrained_model_name_or_path,
+            attn_implementation,
+            torch_dtype,
+            config_overrides,
+            kwargs,
+            force_hf,
+            codegen,
+            backend,
+            codegen_config,
+            codegen_artifact_dir,
         )
-
-        # ③ Get HF config
-        config_kwargs = dict(kwargs)
-        config_kwargs.update(config_overrides or {})
-        hf_config = get_hf_config(
-            pretrained_model_name_or_path, attn_implementation, torch_dtype, **config_kwargs
-        )
-        # ④ Determine model path
-        is_hf_model = get_is_hf_model(hf_config, force_hf)
-
-        # codegen sidecar: an explicit gen backend bypasses the HF/custom
-        # dispatch above; the master wiring stays as-is for everything else.
-        if codegen and not force_hf:
-            backend = ModelingBackend.GEN
-            if codegen_artifact_dir is None:
-                codegen_artifact_dir = _prepare_codegen_artifact(
-                    codegen_config,
-                    pretrained_model_name_or_path=pretrained_model_name_or_path,
-                    codegen_artifact_dir=codegen_artifact_dir,
-                    config_overrides=config_overrides,
-                    hf_config=hf_config,
-                )
-
+        sharding_planner, fsdp2_manager, hf_config, is_hf_model, backend, codegen_artifact_dir = prepared
         # ⑤ Build model
-        return cls._build_model(
+        model = cls._build_model(
             pretrained_model_name_or_path,
             *model_args,
             is_hf_model=is_hf_model,
@@ -359,6 +412,10 @@ class _BaseHyperAutoModelClass:
             codegen_artifact_dir=codegen_artifact_dir,
             **kwargs,
         )
+        if verify_hf_weights is not None:
+            check_hf_weights(model, pretrained_model_name_or_path, verify_hf_weights,
+                             phase="after_load_before_first_forward")
+        return model
 
     @classmethod
     def from_config(  # pylint: disable=unused-argument

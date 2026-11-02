@@ -98,7 +98,7 @@ touch "${OUTPUT_DIR}/baseline.started"
     --nproc_per_node="${NPROC_PER_NODE}" \
     "${PROJECT_ROOT}/scripts/train_vl.py" \
     "${SCRIPT_DIR}/train_deepseek_v41_vlm_online_load_hf.yaml" \
-    --model.pretrained_model_name_or_path="${MODEL_PATH}" \
+    --model.config_path="${MODEL_PATH}" \
     --model.engram_assets_path="${ENGRAM_ASSETS_PATH}" \
     --dataset.model_assets.config_path="${PROCESSOR_PATH}" \
     --dataset.data_path="${DATA_PATH}" \

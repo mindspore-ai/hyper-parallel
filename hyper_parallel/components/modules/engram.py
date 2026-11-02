@@ -189,6 +189,10 @@ class EngramModule(nn.Module):
         self.padded_num_embeddings = int(module.padded_num_embeddings)
         self.train(module.training)
 
+    def checkpoint_logical_shapes(self) -> dict[str, tuple[int, ...]]:
+        """Return the logical embedding shape for checkpoint loading and checking."""
+        return {"embed.weight": (self.logical_num_embeddings, int(self.embed.weight.shape[1]))}
+
     def _fuse(self, hidden_states: torch.Tensor, embeddings: torch.Tensor) -> torch.Tensor:
         """Apply the exact V4.1 WKV projection and signed-root gate."""
         key_value = self.wkv(embeddings.flatten(start_dim=-2))

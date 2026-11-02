@@ -285,7 +285,9 @@ class TestHostEngramTable(unittest.TestCase):
             context = ExternalLoadContext(True, directory, mapping)
             result = state.materialize(context)
             self.assertEqual(result.source_keys, frozenset({"source.weight"}))
-            torch.testing.assert_close(table.weight, full[8:])
+            expected = full[8:].clone()
+            expected[-1].zero_()
+            torch.testing.assert_close(table.weight, expected)
 
             save_file({"source.weight": full, "embed.weight": full.clone()}, source_checkpoint)
             with self.assertRaisesRegex(ValueError, "Multiple Host Engram source keys"):
