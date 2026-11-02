@@ -137,7 +137,6 @@ def mla_cp_wrapper(
     ulysses_degree: int | None = None,
     kv_exchange: Literal["all_gather", "all_to_all_v"] = "all_gather",
     rotary_fn: Callable[..., torch.Tensor] | None = None,
-    attention_interface: Callable[..., tuple[torch.Tensor, Any]] | None = None,
 ) -> list[_ForwardRewriteRequest]:
     """Install NPU MLA CP after replacement and TP sharding, before FSDP.
 
@@ -158,7 +157,6 @@ def mla_cp_wrapper(
             and intermediate CP divisors select Ulysses x AllGather.
         kv_exchange: Full KV collection or selective causal-prefix distribution.
         rotary_fn: Optional local rotary callback; None retains the generic implementation.
-        attention_interface: Optional attention callback; None retains the generic NPU path.
 
     Returns:
         Atomic forward rewrites preserving projection parameters and hooks.
@@ -186,7 +184,7 @@ def mla_cp_wrapper(
     )
     plan.validate_scale(target_module.scaling)
     _validate_up_projections(target_module, plan)
-    runtime = MLAContextParallel(plan, cp_mesh, rotary_fn=rotary_fn, attention_interface=attention_interface)
+    runtime = MLAContextParallel(plan, cp_mesh, rotary_fn=rotary_fn)
 
     cp_forward = _make_cp_forward(target_module, runtime)
 

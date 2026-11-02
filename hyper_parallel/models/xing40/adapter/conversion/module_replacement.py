@@ -45,22 +45,26 @@ def fusion_attention_with_logit_maxima(module: nn.Module, query: torch.Tensor, k
     """Run causal TND fused attention and fold the per-head logit maxima into ``module.max_logits``.
 
     This is the ``attention_interface`` that :class:`Xing40MLAAttention` hands to
-    ``modules.MLAAttention``.
+    ``modules.MLAAttention``; the MLA context-parallel runtime calls it as well.
 
     Args:
         module: Attention module; its ``max_logits`` holds the maxima since the last QK clipping.
         query: Query states, ``[batch, heads, sequence, head_dim]``.
-        key: Key states, ``[batch, heads, sequence, head_dim]``.
-        value: Value states, ``[batch, heads, sequence, v_head_dim]``.
+        key: Key states, ``[batch, heads, key_sequence, head_dim]``; longer than the query only
+            under context parallelism, which then passes packed boundaries.
+        value: Value states, ``[batch, heads, key_sequence, v_head_dim]``.
         attention_mask: Unused; every sequence attends causally.
-        **kwargs: ``scaling``, the attention score scale; the other options of the
-            framework attention interface are unused.
+        **kwargs: ``scaling``, the attention score scale. The MLA context-parallel runtime also
+            passes the packed boundaries ``actual_seq_qlen``/``actual_seq_kvlen`` with its causal
+            options, and ``mla_head_offset``/``mla_local_heads``, the position of these heads among
+            the TP-local heads. The other options of the framework attention interface are unused.
 
     Returns:
         The attention output, ``[batch, sequence, heads, v_head_dim]``, and no attention weights.
 
     Raises:
-        ValueError: If the kernel's ``softmax_max`` is not the expected ``(T, heads, 8)`` shape.
+        ValueError: If the query and key lengths differ without packed boundaries, or the
+            kernel's ``softmax_max`` is not the expected ``(T, heads, 8)`` shape.
     """
     # torch_npu is optional outside Ascend environments.
     import torch_npu  # pylint: disable=C0415
@@ -70,8 +74,14 @@ def fusion_attention_with_logit_maxima(module: nn.Module, query: torch.Tensor, k
 
     del attention_mask
     batch, heads, sequence = query.shape[:3]
-    lengths = tuple(range(sequence, batch * sequence + 1, sequence))
-    context = _prepare_fusion_attention_context(module, query, key, value, None, {"actual_seq_len": lengths})
+    if kwargs.get("actual_seq_qlen") is None and kwargs.get("actual_seq_kvlen") is None:
+        if key.shape[2] != sequence:
+            raise ValueError("Query and key lengths differ without packed boundaries.")
+        options = {"actual_seq_len": tuple(range(sequence, batch * sequence + 1, sequence))}
+    else:
+        # MLA context parallelism: a query shard against its gathered key prefix, with the runtime's options.
+        options = kwargs
+    context = _prepare_fusion_attention_context(module, query, key, value, None, options)
     output, softmax_max = torch_npu.npu_fusion_attention(
         context.query, context.key, context.value, heads, context.input_layout,
         pse=None, padding_mask=None, atten_mask=context.attention_mask, scale=kwargs["scaling"],
@@ -88,6 +98,14 @@ def fusion_attention_with_logit_maxima(module: nn.Module, query: torch.Tensor, k
             raise ValueError(f"Expected (T, {heads}, 8) softmax_max for TND fusion attention, "
                              f"got shape {tuple(softmax_max.shape)}.")
         maximum = softmax_max.amax(dim=(0, 2))
+        local_heads = kwargs.get("mla_local_heads", heads)
+        if local_heads != heads:
+            # Ulysses context parallelism computes a slice of the TP-local heads on each rank; the MAX
+            # reduction of QK clipping fills in the heads of the other ranks.
+            placed = maximum.new_full((local_heads,), float("-inf"))
+            offset = kwargs["mla_head_offset"]
+            placed[offset:offset + heads] = maximum
+            maximum = placed
         module.max_logits = maximum if module.max_logits is None else torch.maximum(module.max_logits, maximum)
     return output.view(batch, sequence, heads, -1), None
 

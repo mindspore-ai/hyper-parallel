@@ -31,7 +31,7 @@ from hyper_parallel.distributed.context_parallel.collectives import (
     ulysses_head_to_seq, ulysses_seq_to_head,
 )
 from hyper_parallel.components.functional.npu_fusion_attention import (
-    PACKED_SEQUENCE_ARGUMENTS, npu_fusion_attention_forward, resolve_packed_sequence_lengths,
+    PACKED_SEQUENCE_ARGUMENTS, resolve_packed_sequence_lengths,
 )
 from hyper_parallel.core.utils.communication import (
     differentiable_all_gather_concat, differentiable_all_to_all_single,
@@ -413,27 +413,20 @@ class MLAContextParallel:
     """Run CP over normalized latents; parameter-gradient reduction belongs to the trainer."""
 
     def __init__(self, plan: MLACPPlan, cp_mesh: Any, *,
-                 rotary_fn: Callable[..., torch.Tensor] | None = None,
-                 attention_interface: Callable[..., tuple[torch.Tensor, Any]] | None = None) -> None:
+                 rotary_fn: Callable[..., torch.Tensor] | None = None) -> None:
         """Bind a validated execution plan to the framework-owned CP mesh.
 
         Args:
             plan: Validated MLA CP communication and head plan.
             cp_mesh: Framework-owned CP mesh, or None for degree one.
             rotary_fn: Optional local rotary callback; None uses generic RoPE.
-            attention_interface: Optional attention callback; None uses generic NPU attention.
-                It also receives ``mla_head_offset`` and ``mla_local_heads``: the position of its
-                heads among the TP-local heads, which Ulysses splits across CP ranks.
         """
         if (1 if cp_mesh is None else cp_mesh.size()) != plan.cp_degree:
             raise ValueError("MLACPPlan degree must match the CP mesh")
         if rotary_fn is not None and not callable(rotary_fn):
             raise TypeError("rotary_fn must be callable")
-        if attention_interface is not None and not callable(attention_interface):
-            raise TypeError("attention_interface must be callable")
         self.plan = plan
         self.rotary_fn = _apply_mla_rope if rotary_fn is None else rotary_fn
-        self.attention_interface = npu_fusion_attention_forward if attention_interface is None else attention_interface
         self.cp_mesh = cp_mesh
         rank = 0 if cp_mesh is None else cp_mesh.get_local_rank()
         self.query_rank, self.head_rank = divmod(rank, plan.ulysses_degree)
@@ -454,7 +447,12 @@ class MLAContextParallel:
         is_causal: bool | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, None]:
-        """Return local-token BSND attention output before the shared o_proj."""
+        """Return local-token BSND attention output before the shared o_proj.
+
+        Local attention runs through ``module.attention_interface``, which also receives
+        ``mla_head_offset`` and ``mla_local_heads``: the position of its heads among the TP-local
+        heads, which Ulysses splits across CP ranks.
+        """
         packed_kwargs = {name: kwargs.pop(name) for name in PACKED_SEQUENCE_ARGUMENTS if name in kwargs}
         packed_kwargs["actual_seq_len"] = actual_seq_len
         _validate_forward_kwargs(kwargs, position_embeddings)
@@ -485,7 +483,7 @@ class MLAContextParallel:
             state.key_rope.unsqueeze(2), positions, interleaved=module.rotary_interleaved,
         ).squeeze(2)
         query, key, value = self._attention_inputs(module, state, positions, rotated_key, partition)
-        output = self.attention_interface(
+        output = module.attention_interface(
             module, query, key, value, attention_mask, scaling=module.scaling,
             is_causal=causal, actual_seq_qlen=lengths, actual_seq_kvlen=key_lengths,
             pre_tokens=2147483647, next_tokens=0 if causal else 2147483647,
