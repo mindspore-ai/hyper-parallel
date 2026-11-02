@@ -12,13 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""indexed: indexed (.idx/.bin) dataset implementation and C++ helpers.
+"""Indexed token and prepared-record datasets, with native sampling helpers.
 
-Submodules are imported by full path; this package keeps no flat re-exports.
+Prepared Arrow datasets share the Indexed split and sampling pipeline.
 Offline indexed I/O tools live in ``hyper_parallel.data.tools.io``.
 """
 
 from pathlib import Path
+
+from hyper_parallel.data.indexed.indexed_pretrain_dataset import SFTFromMRDataset
+
+__all__ = ["SFTFromMRDataset"]
 
 
 def _extend_native_path(package_file: str, package_path: list[str]) -> None:

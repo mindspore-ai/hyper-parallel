@@ -46,6 +46,15 @@ class IndexedBoundaryResolver:
         """Recover leading-zero ``cu_seq_lens`` from Indexed tokens."""
         input_ids = canonical_batch["input_ids"]
         batch_size, seq_len = input_ids.shape
+        if "cu_seq_lens" in canonical_batch:
+            rows = canonical_batch["cu_seq_lens"]
+            if isinstance(rows, torch.Tensor) and rows.ndim == 1:
+                return rows.to(torch.int32)
+            if len(rows) != batch_size:
+                raise ValueError("cu_seq_lens must have one boundary array per batch row")
+            # Only metadata is flattened; tokens and labels remain [B, S].
+            ends = [end + row_idx * seq_len for row_idx, row in enumerate(rows) for end in row[1:]]
+            return torch.tensor([0, *ends], dtype=torch.int32)
         token_indices = torch.arange(seq_len, dtype=input_ids.dtype, device=input_ids.device)
 
         seq_ends = []

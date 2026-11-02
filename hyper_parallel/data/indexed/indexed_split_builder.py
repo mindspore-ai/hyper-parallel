@@ -28,6 +28,7 @@ from hyper_parallel.data.dataset_logging import get_dataset_logger
 from hyper_parallel.data.indexed.indexed_blended_dataset import BlendedDataset
 from hyper_parallel.data.indexed.indexed_data_config import GPTDatasetConfig
 from hyper_parallel.data.indexed.indexed_lazy_dataset import LazyDatasetProxy
+from hyper_parallel.data.indexed.indexed_pretrain_dataset import GPTDataset, MockGPTDataset
 from hyper_parallel.data.indexed.indexed_simple_blended_dataset import SimpleBlendedDataset
 from hyper_parallel.data.parallel import (
     DataLoaderParallelContext,
@@ -149,8 +150,10 @@ class IndexedDatasetSplitBuilder:
             raise ValueError("train_valid_test_num_samples must be non-negative")
         if blend_mode not in {"no", "inter", "intra"}:
             raise ValueError(f"Unsupported blend mode: {blend_mode!r}")
-        if blend_mode != "no" and not config.is_dataset_from_mr:
-            raise ValueError("inter/intra blending requires is_dataset_from_mr=True")
+        if config.mock != (dataset_type is MockGPTDataset):
+            raise ValueError("mock_data must match the selected MockGPTDataset class")
+        if not config.mock and (blend_mode == "no") != (dataset_type is GPTDataset):
+            raise ValueError("simple_blend='no' is only for GPTDataset; other Datasets require inter/intra")
 
         logger.debug(
             "Building indexed splits: dataset=%s, num_samples=%s, mock=%s, blend_mode=%s, lazy=%s",
@@ -382,7 +385,7 @@ class IndexedDatasetSplitBuilder:
             else:
                 dataset_factory = partial(dataset_type, low_level_dataset, dataset_path, indices, size, split, config)
                 mid_level_dataset = self._build_dataset_for_dataloader(
-                    dataset_factory, barrier_needed=not config.is_dataset_from_mr
+                    dataset_factory, barrier_needed=dataset_type is GPTDataset
                 )
             datasets.append(mid_level_dataset)
         return cast(DatasetSplits, tuple(datasets))

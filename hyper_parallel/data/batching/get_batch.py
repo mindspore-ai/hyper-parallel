@@ -34,6 +34,8 @@ from hyper_parallel.data.constants import (
     OMNI_LOSS_INPUT_FIELDS,
 )
 from hyper_parallel.data.dataset_logging import get_dataset_logger
+from hyper_parallel.data.indexed.indexed_data_config import resolve_dataset_type
+from hyper_parallel.data.indexed.indexed_pretrain_dataset import SFTFromMRDataset
 from hyper_parallel.data.parallel import (
     CPBatchSharder,
     DataLoaderParallelContext,
@@ -240,6 +242,9 @@ class TextParallelBatch:
         self.tokenizer = tokenizer
         self.data_config = dict(data_config)
         self.source_type = source_type
+        dataset_spec = data_config.get("low_level_dataset")
+        self.is_sft_dataset = (source_type == "indexed" and dataset_spec is not None
+                               and issubclass(resolve_dataset_type(dataset_spec), SFTFromMRDataset))
         self.causal = causal
         self.sliding_window = sliding_window
         if runtime_input_adapter is not None and not isinstance(
@@ -272,9 +277,14 @@ class TextParallelBatch:
         resolved_reset_attention_mask = (
             reset_attention_mask
             or bool(self.data_config.get("reset_attention_mask", False))
-            or source_type == "online"
+            or source_type == "online" or self.is_sft_dataset
         )
         self.eod_mask_loss = eod_mask_loss or bool(self.data_config.get("eod_mask_loss", False))
+        if self.is_sft_dataset:
+            if not self.labels_are_shifted or self.eod_mask_loss or not self.causal:
+                raise ValueError("Prepared records require shifted labels, causal attention and eod_mask_loss=False")
+            if (attention_mode == "compressed" or not create_attention_mask) and runtime_input_adapter is None:
+                raise ValueError("Prepared records without a dense mask require a boundary-aware runtime adapter")
         self.attention_runtime = AttentionRuntime(
             mode=attention_mode,
             create_mask=create_attention_mask,

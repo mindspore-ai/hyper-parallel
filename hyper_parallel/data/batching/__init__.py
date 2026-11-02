@@ -16,6 +16,7 @@
 
 from hyper_parallel.data.batching.build_collate_fn import (
     build_default_collate_fn,
+    build_sft_collate_fn,
     build_indexed_collate_fn,
     build_omni_collate_fn,
     build_online_text_collate_fn,
@@ -50,6 +51,7 @@ __all__ = [
     "SamplePacker",
     "TokenBatchLoader",
     "build_default_collate_fn",
+    "build_sft_collate_fn",
     "build_dataloader",
     "build_indexed_collate_fn",
     "build_omni_collate_fn",

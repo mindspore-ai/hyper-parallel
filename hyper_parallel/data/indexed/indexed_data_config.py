@@ -20,6 +20,7 @@ import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from importlib import import_module
 from typing import Any
 
 import numpy as np
@@ -109,13 +110,18 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     reuse_idx: bool = False
     data_lazy_load: bool = False
 
-    is_dataset_from_mr: bool = False
-    simple_blend: str = "no"
+    low_level_dataset: type | None = None
+    simple_blend: str | None = None
+    dataset_options: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Validate the blended Dataset fields followed by GPT-specific fields."""
         super().__post_init__()
 
+        if self.low_level_dataset is None:
+            raise ValueError("low_level_dataset must be explicitly configured")
+        if self.simple_blend is None:
+            raise ValueError("simple_blend must be explicitly configured")
         if self.sequence_length <= 0:
             raise ValueError("sequence_length must be positive")
         if self.tokenizer is None and not self.mock:
@@ -127,10 +133,11 @@ def _discover_indexed_paths(
     rank: int,
     world_size: int,
     distributed_walk: bool,
+    file_suffix: str,
 ) -> list[str]:
     """Discover indexed prefixes under one directory."""
     if not distributed_walk:
-        return _walk_bin_directories([current_path])
+        return _walk_data_directories([current_path], file_suffix)
 
     root_layout = None
     if rank == 0:
@@ -140,8 +147,8 @@ def _discover_indexed_paths(
             path = os.path.join(current_path, name)
             if os.path.isdir(path):
                 subdirectories.append(path)
-            elif name.endswith(".bin"):
-                top_files.append(os.path.splitext(path)[0])
+            elif name.endswith(file_suffix):
+                top_files.append(os.path.splitext(path)[0] if file_suffix == ".bin" else path)
         root_layout = (subdirectories, top_files)
 
     gathered_layouts: list[tuple[list[str], list[str]] | None] = [None] * world_size
@@ -150,7 +157,7 @@ def _discover_indexed_paths(
     if rank_zero_layout is None:
         raise ValueError("Rank 0 did not provide the indexed directory layout")
     subdirectories, file_paths = rank_zero_layout
-    local_files = _walk_bin_directories(subdirectories[rank::world_size])
+    local_files = _walk_data_directories(subdirectories[rank::world_size], file_suffix)
     gathered_files: list[list[str] | None] = [None] * world_size
     dist.all_gather_object(gathered_files, local_files)
     for rank_files in gathered_files:
@@ -163,12 +170,14 @@ def resolve_data_paths(
     data_path: str | Sequence[str],
     *,
     distributed_walk: bool = True,
+    file_suffix: str = ".bin",
 ) -> list[str]:
-    """Find ``.bin`` files and return indexed prefixes with optional weights.
+    """Discover independent data files and return source paths with optional weights.
 
     Args:
-        data_path: One indexed prefix or a sequence of directories/prefixes.
+        data_path: One indexed prefix, Arrow file, or sequence of directories/source paths.
         distributed_walk: Whether initialized ranks divide directory walking.
+        file_suffix: Dataset storage suffix: .bin returns prefixes, .arrow keeps full file paths.
 
     Returns:
         One prefix directly, or alternating weight/prefix values for multiple sources. If ``data_path`` is not a
@@ -189,7 +198,10 @@ def resolve_data_paths(
     # 3. Accept a direct prefix, or recursively discover prefixes in a directory.
     file_paths: list[str] = []
     for current_path in data_paths:
-        if os.path.isfile(current_path + ".bin"):
+        if file_suffix == ".arrow" and current_path.endswith(file_suffix) and os.path.isfile(current_path):
+            file_paths.append(current_path)
+            continue
+        if file_suffix == ".bin" and os.path.isfile(current_path + ".bin"):
             file_paths.append(current_path)
             continue
         if not os.path.isdir(current_path):
@@ -199,25 +211,29 @@ def resolve_data_paths(
             original_paths = list(data_paths)
             return original_paths
 
-        file_paths.extend(_discover_indexed_paths(current_path, rank, world_size, use_distributed_walk))
+        file_paths.extend(_discover_indexed_paths(current_path, rank, world_size, use_distributed_walk, file_suffix))
 
     if not file_paths:
-        raise ValueError(f"data_path {data_paths!r} has no data file ending with .bin")
+        raise ValueError(f"data_path {data_paths!r} has no data file ending with {file_suffix}")
 
     if len(file_paths) == 1:
         return file_paths
 
-    # 4. Prefer the numeric shard order encoded by the corpus filenames.
-    # Unknown naming schemes remain usable in their original walk order.
-    try:
-        def numeric_shard_key(path: str) -> tuple[int, int]:
-            """Extract numeric corpus and shard identifiers from a path."""
-            path_parts = os.path.basename(path).split("_")
-            return int(path_parts[2]), int(path_parts[-1])
+    if file_suffix == ".arrow":
+        # Every rank must blend files in the same order after directory discovery.
+        file_paths.sort()
+    else:
+        # 4. Prefer the numeric shard order encoded by the corpus filenames.
+        # Unknown naming schemes remain usable in their original walk order.
+        try:
+            def numeric_shard_key(path: str) -> tuple[int, int]:
+                """Extract numeric corpus and shard identifiers from a path."""
+                path_parts = os.path.basename(path).split("_")
+                return int(path_parts[2]), int(path_parts[-1])
 
-        file_paths.sort(key=numeric_shard_key)
-    except (IndexError, TypeError, ValueError):
-        logger.warning("Cannot sort indexed files with the numeric filename rule; keeping walk order")
+            file_paths.sort(key=numeric_shard_key)
+        except (IndexError, TypeError, ValueError):
+            logger.warning("Cannot sort indexed files with the numeric filename rule; keeping walk order")
 
     # 5. Automatically discovered sources use equal blend weights.
     weighted_paths = [value for path in file_paths for value in ("1", path)]
@@ -249,7 +265,7 @@ def build_gpt_dataset_config(
     ]
     has_independent_blends = any(blend_per_split)
     try:
-        mock_data = bool(data_config["mock_data"])
+        mock_data = bool(data_config.get("mock_data", False))
         tokenizer = data_config.get("tokenizer")
         if tokenizer is None and not mock_data:
             raise ValueError("tokenizer is required when mock_data is false")
@@ -261,11 +277,11 @@ def build_gpt_dataset_config(
             mock=mock_data,
             blend=None if has_independent_blends else list(data_paths),
             blend_per_split=blend_per_split if has_independent_blends else None,
-            split=None if has_independent_blends else data_config["split"],
+            split=None if has_independent_blends else data_config.get("split", "1, 0, 0"),
             path_to_cache=data_config.get("data_cache_path"),
             mmap_bin_files=data_config.get("mmap_bin_files", True),
             reuse_idx=data_config.get("reuse_idx", False),
-            data_lazy_load=data_config["data_lazy_load"],
+            data_lazy_load=data_config.get("data_lazy_load", False),
             reset_position_ids=data_config.get("reset_position_ids", False),
             reset_attention_mask=data_config.get("reset_attention_mask", False),
             eod_mask_loss=data_config.get("eod_mask_loss", False),
@@ -275,7 +291,11 @@ def build_gpt_dataset_config(
             allow_ambiguous_pad_tokens=data_config.get("allow_ambiguous_pad_tokens", False),
             dataset_margin=data_config.get("dataset_margin", 1.005),
             skip_data_check=data_config.get("skip_data_check", False),
-            is_dataset_from_mr=data_config["is_dataset_from_mr"],
+            low_level_dataset=resolve_dataset_type(data_config["low_level_dataset"]),
+            dataset_options=(
+                {key: value for key, value in data_config["low_level_dataset"].items() if key != "_target_"}
+                if isinstance(data_config["low_level_dataset"], Mapping) else {}
+            ),
             simple_blend=data_config["simple_blend"],
         )
     except KeyError as error:
@@ -285,13 +305,26 @@ def build_gpt_dataset_config(
     return config
 
 
-def _walk_bin_directories(directories: Sequence[str]) -> list[str]:
-    """Recursively find ``.bin`` files below the assigned directories."""
+def _walk_data_directories(directories: Sequence[str], file_suffix: str) -> list[str]:
+    """Recursively find source files below the assigned directories."""
     file_paths = []
     for directory in directories:
         for root, _, filenames in os.walk(directory):
             for filename in filenames:
-                if filename.endswith(".bin"):
+                if filename.endswith(file_suffix):
                     path = os.path.abspath(os.path.join(root, filename))
-                    file_paths.append(os.path.splitext(path)[0])
+                    file_paths.append(os.path.splitext(path)[0] if file_suffix == ".bin" else path)
     return file_paths
+
+
+def resolve_dataset_type(spec: Mapping[str, Any] | type) -> type:
+    """Resolve an explicitly selected class without constructing a Dataset."""
+    if isinstance(spec, type):
+        return spec
+    if not isinstance(spec, Mapping) or "_target_" not in spec:
+        raise ValueError("low_level_dataset requires an explicit Dataset _target_")
+    module, _, name = spec["_target_"].rpartition(".")
+    dataset_type = getattr(import_module(module), name)
+    if not isinstance(dataset_type, type):
+        raise ValueError("low_level_dataset._target_ must identify a Dataset class")
+    return dataset_type
