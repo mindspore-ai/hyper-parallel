@@ -78,13 +78,29 @@ class TestGroupedMatmul(unittest.TestCase):
             with self.subTest(bridge=name):
                 self._check_gradients(bridge, [0, 0, 0], compiling=True)
 
-    def _check_gradients(self, bridge, counts, compiling):
+    def test_integer_group_sequences_match_tensor_semantics(self):
+        """List and tuple boundaries preserve grouping, including empty experts."""
+        for representation in (list, tuple):
+            with self.subTest(representation=representation):
+                self._check_gradients(
+                    self.bridges["grouped"], [2, 0, 3], compiling=False,
+                    group_list_factory=representation,
+                )
+        groups = torch.tensor([2, 2, 5], dtype=torch.int64)
+        self.kernel.reset_mock()
+        self.bridges["grouped"](torch.randn(5, 4), torch.randn(3, 4, 6), groups)
+        self.assertIs(self.kernel.call_args_list[0].kwargs["group_list"], groups)
+
+    def _check_gradients(self, bridge, counts, compiling, group_list_factory=None):
         """Compare forward, input gradient and weight gradient with indexed matmul."""
         self.kernel.reset_mock()
         inputs = torch.randn(sum(counts), 4, requires_grad=True)
         weights = torch.randn(3, 4, 6, requires_grad=True)
         gradient = torch.randn(sum(counts), 6)
-        output = bridge(inputs, weights, torch.tensor(counts).cumsum(0))
+        groups = torch.tensor(counts).cumsum(0)
+        if group_list_factory is not None:
+            groups = group_list_factory(groups.tolist())
+        output = bridge(inputs, weights, groups)
         with patch("torch.compiler.is_compiling", return_value=compiling):
             actual = torch.autograd.grad(output, (inputs, weights), gradient)
         ids = torch.arange(3).repeat_interleave(torch.tensor(counts))
@@ -95,3 +111,10 @@ class TestGroupedMatmul(unittest.TestCase):
             torch.testing.assert_close(left, right)
         expected_groups = [0, 0, 2] if compiling or sum(counts) else [0, 0]
         self.assertEqual([call.kwargs["group_type"] for call in self.kernel.call_args_list], expected_groups)
+        if group_list_factory is not None:
+            self.assertEqual(groups, group_list_factory(torch.tensor(counts).cumsum(0).tolist()))
+            for call in self.kernel.call_args_list:
+                actual_groups = call.kwargs["group_list"]
+                self.assertIsInstance(actual_groups, torch.Tensor)
+                self.assertEqual(actual_groups.dtype, torch.int64)
+                self.assertEqual(actual_groups.device, inputs.device)

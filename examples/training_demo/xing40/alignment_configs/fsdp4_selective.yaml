@@ -1,0 +1,233 @@
+model:
+  _target_: hyper_parallel.models.xing40.adapter.builder.build_model
+  config:
+    vocab_size: 131072
+    hidden_size: 3584
+    intermediate_size: 9216
+    moe_intermediate_size: 1024
+    num_hidden_layers: 3
+    first_k_dense_replace: 2
+    max_position_embeddings: 4096
+    num_attention_heads: 32
+    num_key_value_heads: 32
+    q_lora_rank: 768
+    kv_lora_rank: 512
+    qk_rope_head_dim: 64
+    qk_nope_head_dim: 128
+    v_head_dim: 128
+    rms_norm_eps: 1.0e-06
+    hidden_act: silu
+    rope_parameters:
+      rope_type: default
+      rope_theta: 10000.0
+    rope_interleave: true
+    attention_softmax_scale: 0.1352337788608801
+    n_routed_experts: 64
+    num_experts_per_tok: 4
+    n_shared_experts: 1
+    routed_scaling_factor: 2.0
+    norm_topk_prob: true
+    n_group: 1
+    topk_group: 1
+    moe_aux_loss_coeff: 0.0006
+    moe_router_enable_expert_bias: true
+    moe_router_bias_update_rate: 0.001
+    moe_router_force_expert_balance: false
+    use_pad_tokens: true
+    num_residual_streams: 4
+    use_fused_mhc: true
+    mhc_sinkhorn_iterations: 20
+    mhc_init_gating_factor: 0.01
+    mhc_layernorm_epsilon: 1.0e-06
+    num_nextn_predict_layers: 0
+    mtp_loss_factor: 0.0
+    chunk_loss_size: 1024
+    use_cache: false
+    tie_word_embeddings: false
+    initializer_range: 0.02
+    attention_dropout: 0.0
+model_init_dtype: float32
+loss_fn:
+  _target_: hyper_parallel.components.losses.ModelOutputLoss
+training:
+  train_iters: 2500
+  global_batch_size: 4
+  micro_batch_size: 1
+  backend: hccl
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: false
+accelerator:
+  tp_size: 1
+  ep_size: 1
+  cp_size: 1
+  pp_size: 1
+  sequence_parallel: false
+fsdp_config:
+  dp_shard_size: 4
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    cast_forward_inputs: false
+    custom_params:
+      model.embed_tokens.weight:
+        param_dtype: float32
+      '*.mlp.gate.weight':
+        param_dtype: float32
+      '*_hc_pre.*':
+        param_dtype: float32
+      '*.hc_head.*':
+        param_dtype: float32
+      '*norm.weight':
+        param_dtype: float32
+activation_checkpoint:
+  mode: selective
+dataset:
+  _target_: xing40_alignment_data.build_alignment_dataset
+  model_assets: {}
+  data_prefix: /path/to/data_prefix
+  index_paths:
+    document_index: /path/to/document_index.npy
+    sample_index: /path/to/sample_index.npy
+    shuffle_index: /path/to/shuffle_index.npy
+  index_sha256:
+    document_index: 4c1b135944d7fdec25b593a7c9436a451a1428c5b7b06c214c66a33cd2c8226e
+    sample_index: 8be63e7b96ec2f2f1462cf100907e01fbb96858256fd071f45613816e375ace7
+    shuffle_index: 484d0800cccde790b43d1e91c8663cad05a39d8427fb3d1272d34b6de22f6643
+  sequence_length: 4096
+  eod_token_id: -1
+  pad_token_id: -1
+  add_extra_token_to_sequence: true
+  reset_position_ids: false
+  reset_attention_mask: false
+  eod_mask_loss: false
+  create_attention_mask: false
+  create_compressed_eod_mask: false
+  data_config:
+    seq_length: 4096
+    eod: -1
+    pad: -1
+    add_extra_token_to_sequence: true
+    reset_position_ids: false
+    reset_attention_mask: false
+    eod_mask_loss: false
+    create_attention_mask: false
+    create_compressed_eod_mask: false
+  data_sha256:
+    bin: 6b925f342504c3eae80c5bde3163ff5924ad36b262bc6a276839a6f3f817ea3c
+    idx: d535e502d62368e7a195b27a9a717543534ee1eaa9b4f9ce45f4d08d746cb5cd
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: xing40_alignment_data.build_alignment_collate_fn
+  get_batch:
+    _target_: xing40_alignment_data.AlignmentBatch
+    expected_batch_size: 1
+    sequence_length: 4096
+  sampler_type: single
+  drop_last: true
+  num_workers: 0
+optimizer:
+  _target_: hyper_parallel.models.xing40.adapter.optim.build_optimizer
+  logical_matrix_splits: true
+  fp32_main_params: true
+  muon_config:
+    muon_lr: 1.0e-05
+    muon_weight_decay: 0.1
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_ns_steps: 5
+    muon_ns_variant: legacy
+    matched_adamw_rms: 0.2
+    ns_epsilon: 1.0e-08
+    ns_input_dtype: float32
+    ns_compute_dtype: bfloat16
+    ns_epsilon_mode: clamp
+  adamw_config:
+    adamw_lr: 1.0e-05
+    adamw_weight_decay: 0.1
+    adamw_betas:
+    - 0.95
+    - 0.95
+    adamw_eps: 1.0e-08
+  qk_clip_threshold: 100
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: constant
+  lr_config:
+    lr: 1.0e-05
+    lr_warmup_steps: 0
+checkpoint:
+  save_ckpt: true
+  checkpoint_dir: /path/to/output/checkpoints
+  save_steps: 500
+  save_epochs: 0
+  is_async: false
+  save_optimizer: true
+  save_train_state: true
+  save_extra_state_per_rank: true
+  restore_from: null
+plan_overrides:
+- match: '*.self_attn'
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.models.xing40.adapter.conversion.module_replacement.Xing40MLAAttention
+    source_type: transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3Attention
+    exact_type: true
+- match:
+  - '*[!a]_layernorm'
+  - '*[.eh]norm'
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.components.modules.rms_norm.RMSNorm
+    source_type: transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3RMSNorm
+    exact_type: true
+- match: '*.mlp.experts'
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.components.modules.GroupedExperts
+    source_type: transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3Experts
+    exact_type: true
+- match: '*_hc_pre'
+  params:
+    branch_alpha:
+      tp: replicate
+    branch_beta:
+      tp: replicate
+- match: '*_hc_pre.phi'
+  params:
+    weight:
+      tp: replicate
+- match: '*.hc_head'
+  params:
+    hc_fn:
+      tp: replicate
+    hc_base:
+      tp: replicate
+    hc_scale:
+      tp: replicate
+- match:
+  - model.layers.0.mlp
+  - model.layers.1.mlp
+  - model.layers.2.mlp.shared_experts
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.components.modules.SwiGLUMLP
+    source_type: transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3MLP
+    exact_type: true
+- match: model.layers.0.mlp
+  params:
+    linear_fc1.weight:
+      tp: replicate
+    linear_fc2.weight:
+      tp: replicate
+- match: model.layers.1.mlp
+  params:
+    linear_fc1.weight:
+      tp: replicate
+    linear_fc2.weight:
+      tp: replicate
