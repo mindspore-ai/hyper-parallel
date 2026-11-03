@@ -1,8 +1,8 @@
-# GitHub: automatically merge after all reviewers approve
+# GitHub: automatically merge after the reviewer approval quorum
 
 [中文](github_auto_merge_zh.md) | English
 
-This feature determines the required reviewers from the **Reviewers** sidebar of each PR.
+This feature determines the reviewers from the **Reviewers** sidebar of each PR.
 It does not require every member of the repository's maintainer team to participate.
 It takes effect after the code is merged into the default branch and the repository settings below are configured.
 Adding workflow files alone does not change remote rules.
@@ -10,30 +10,34 @@ Adding workflow files alone does not change remote rules.
 ## Approval rules
 
 The required status is named `all-reviewers-approved` and is published on the PR's current head SHA.
+The name is retained for compatibility with existing Rulesets; the check now requires an approval quorum.
 
 GitHub's `requested_reviewers` contains only people whose reviews are still pending. Once a person submits a review,
-they move from that array to the reviews collection. The check therefore combines two sources: users with outstanding
-review requests and users who have already submitted a formal review. Ordinary comments in the PR's Conversation tab
-are not formal reviews and do not add required reviewers.
+they move from that array to the reviews collection. As in the existing gate, the check combines outstanding requests
+with submitted reviews, excluding the PR author. Submitted reviews include bot and unsolicited reviews.
+Ordinary comments in the PR's Conversation tab are not formal reviews and do not add reviewers.
 See the [GitHub Review Requests API](https://docs.github.com/en/rest/pulls/review-requests).
 
-- Each reviewer's effective decision must be `APPROVED` for the current head SHA.
-- `CHANGES_REQUESTED`, dismissed approvals, `COMMENTED` without an approval, and outstanding requests for another review
-  do not pass.
+- With one reviewer, one approval is required. With two or more, any two distinct approvals
+  meet the quorum; the remaining requested reviewers need not approve.
+- An approval counts only if the reviewer's latest effective decision is `APPROVED` for the current head SHA and the
+  reviewer has not been asked to review again. Dismissed and stale approvals do not count.
+- An outstanding `CHANGES_REQUESTED` decision from any non-author reviewer, including a bot, blocks the check even after the quorum is met.
+  A `COMMENTED` review is not an approval.
 - An ordinary review comment after approval does not cancel that approval. Unsubmitted draft reviews are ignored.
-- A person removed from Reviewers before submitting a review is no longer required. People who have already submitted
-  reviews remain part of the check.
-- Adding a reviewer requires that person's approval. Pushing a new commit makes approvals for the old SHA insufficient.
-- The PR author is excluded from their own approval check. A PR with no independent reviewers does not pass, so an empty
-  list cannot be treated as unanimous approval.
+- A person removed from Reviewers before submitting a review leaves the reviewer set. People who have already submitted
+  reviews remain in the set. Adding a second reviewer raises the quorum from one approval to two.
+- The PR author is excluded. A PR with no other reviewers does not pass. Bot reviews follow the existing reviewer rules.
 - A team still present in `requested_teams` blocks the check until GitHub considers its review request satisfied.
   The check does not expand a team into all of its members.
-- Bots participating as formal reviewers must also approve. A bot that only posts comments is not counted as approving.
 - Draft PRs do not pass. When multiple PRs share the same head SHA, all relevant PRs must satisfy the rules before the
   status is marked successful.
 
-For example, if Reviewers contains Alice, Bob, and Carol, only those three people need to approve. After Alice approves,
-she remains in the check's reviewer set even though `requested_reviewers` now contains only Bob and Carol.
+For example, if Reviewers contains Alice, Bob, and Carol, approvals from Alice and Bob meet the quorum without waiting
+for Carol, provided no other blocking review or required team request remains. The repository's native Code Owner,
+latest-push, conversation-resolution, and CI requirements still apply before GitHub merges the PR.
+This custom check does not verify repository write access, so an unsolicited approval can contribute to the quorum.
+GitHub's native approval and Code Owner rules independently enforce their own eligibility requirements.
 
 ## Files and triggers
 
@@ -71,9 +75,9 @@ It does not repeatedly publish the same status while a PR remains waiting with a
    **Dismiss stale pull request approvals when new commits are pushed** enabled. Existing requirements for Code Owners,
    independent approval of the most recent push, and conversation resolution continue to apply.
 5. Enable **Allow auto-merge** under **Settings → General → Pull Requests**.
-6. Verify with a test PR: it should keep waiting when only one of two reviewers has approved, then merge automatically
-   after the second approval and all other required checks pass. Also test adding or removing pending reviewers,
-   dismissing approvals, and pushing new commits.
+6. Verify with test PRs: one reviewer should require one approval; two or more reviewers should require two approvals,
+   without waiting for a third. Confirm that other required checks pass before automatic merging. Also test adding or
+   removing reviewers, change requests, pending teams, dismissed approvals, and new commits.
 
 After the approval check passes, the script examines the rules actually enforced on the target branch.
 It runs the merge command with `--auto --merge --match-head-commit` only when this check is bound to GitHub Actions,
@@ -114,9 +118,10 @@ of the updated result. Workflow queues, unavailable APIs, and delayed GitHub sch
 Before publishing success, the script rechecks commits, target branches, reviewers, and approvals. On API errors, it
 attempts to replace a previous success with a blocking status. However, the external required check and GitHub's merge
 operation are not one atomic transaction, so a zero-length race window cannot be guaranteed.
-Keep GitHub's native approval requirements enabled. This check is not a built-in atomic guarantee of unanimous approval.
+Keep GitHub's native approval requirements enabled. This external check is not an atomic GitHub approval guarantee.
 
-Run logs and the Actions Summary list users and teams whose approvals are still pending. The PR status links to the
+Run logs and the Actions Summary show the approval count and threshold, pending users and teams, and change requests.
+The PR status links to the
 workflow that published the result. Before enabling the feature in production, verify event delivery, token permissions,
 required-check binding, and actual automatic merging on GitHub. Local tests do not replace this acceptance testing.
 
