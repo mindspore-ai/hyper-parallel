@@ -28,7 +28,7 @@ inline bool InvalidCubeGeometry(int32_t rows, int32_t experts, int32_t hidden, i
 }
 
 inline bool InvalidCubePolling(int64_t watchdog, int32_t producers, void *input_ready, void *input_expected) {
-  return watchdog <= 0 || producers < 0 || producers > 48 ||
+  return watchdog <= 0 || producers < 0 ||
     ((input_ready == nullptr) != (input_expected == nullptr));
 }
 

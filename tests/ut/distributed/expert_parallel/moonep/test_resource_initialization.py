@@ -24,6 +24,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from hyper_parallel.distributed.expert_parallel.moonep.fused import executor as execution
+from hyper_parallel.distributed.expert_parallel.moonep.fused import communicators
 from tests.common.mark_utils import arg_mark
 
 
@@ -33,6 +34,7 @@ class TestResourceInitialization(unittest.TestCase):
 
     def setUp(self) -> None:
         """Create metadata-only admitted owners and trap every real device operation."""
+        self.enterContext(patch.object(communicators, "_bundles", {}))
         self.experts = [SimpleNamespace(owner=torch.nn.Linear(4, 4, bias=False), ranks=2, experts=4,
                                        home_count=2, top_k=2, replica_capacity=2, rank=0, group=object(),
                                        token_dedup=False, forward_ratio=0.75, backward_ratio=1.0,
@@ -41,6 +43,7 @@ class TestResourceInitialization(unittest.TestCase):
                                           shape=shape, stride=Mock(return_value=stride))
                           for shape, stride in (((2, 16, 32), (512, 32, 1)), ((2, 16, 16), (256, 16, 1))))
         self.runtime = execution.SparseMoonEPRuntime(self.experts)
+        self.enterContext(patch.object(execution, "vector_core_count", return_value=48))
         for name, value in (("is_initialized", True), ("get_world_size", 2), ("get_rank", 0),
                             ("get_process_group_ranks", [0, 1])):
             self.enterContext(patch.object(execution.dist, name, return_value=value))
@@ -61,7 +64,7 @@ class TestResourceInitialization(unittest.TestCase):
 
     @staticmethod
     def _gather(output: list, value: Any, **_kwargs: Any) -> None:
-        output[:] = [value, value]
+        output[:] = [value for _ in output]
 
     @staticmethod
     def _preflight(error: Exception | None) -> None:
@@ -132,5 +135,41 @@ class TestResourceInitialization(unittest.TestCase):
         self.gradient.drain.assert_called_once_with()
         self.workspace.close.assert_called_once_with()
         self.arena.close.assert_called_once_with()
-        self.assertEqual(self.destroy.call_count, 5)
+        self.destroy.assert_not_called()
         self.assertTrue(self.runtime.closed)
+        self.domains.side_effect = [self.weight, self.gradient]
+        reused = execution.SparseMoonEPRuntime(self.experts)
+        reused.initialize(self.experts[0], self.home)
+        self.assertEqual(self.groups.call_count, 5)
+        concurrent = communicators.reserve_communicators((0, 1))
+        self.assertNotEqual(concurrent.slot, reused._group_lease.slot)
+        self.assertFalse(concurrent.groups)
+        concurrent.release()
+        reused.close()
+
+    def test_ep64_and_sharded_ep_subgroup_admit_without_world_rank_assumptions(self) -> None:
+        """Resource membership follows EP while full home geometry remains unchanged."""
+        for members, shard_size in ((tuple(range(64)), 1), (tuple(range(32, 64)), 2)):
+            with self.subTest(ep=len(members), efs=shard_size):
+                expert = self.experts[0]
+                expert.ranks, expert.experts, expert.rank = len(members), 2 * len(members), 7
+                runtime = execution.SparseMoonEPRuntime(self.experts)
+                expert.owner.hsdp_scheduler = SimpleNamespace(
+                    modules=[expert.owner], cell=expert.owner,
+                    hsdp_state=SimpleNamespace(is_shard=True, hsdp_params=[SimpleNamespace(
+                        shard_world_size=shard_size, sharded_param=expert.owner.weight)]))
+                self.domains.side_effect = [self.weight, self.gradient]
+                self.groups.reset_mock()
+                with (patch.object(execution.dist, "get_world_size",
+                                   side_effect=lambda group=None: 64 if group is None else len(members)),
+                      patch.object(execution.dist, "get_rank",
+                                   side_effect=lambda group=None: members[7] if group is None else 7),
+                      patch.object(execution.dist, "get_process_group_ranks", return_value=list(members))):
+                    runtime.initialize(expert, self.home)
+                self.assertEqual(self.groups.call_count, 5)
+                for call in self.groups.call_args_list:
+                    self.assertEqual(call.kwargs["ranks"], members)
+                    self.assertTrue(call.kwargs["use_local_synchronization"])
+                self.assertEqual(runtime.home_geometry, ((2, 16, 32), (2, 16, 16),
+                                                         (512, 32, 1), (256, 16, 1)))
+                del expert.owner.hsdp_scheduler

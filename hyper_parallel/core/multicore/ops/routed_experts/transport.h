@@ -20,7 +20,10 @@ extern "C" int RoutedExpertsTransport(
   void *input_ready, void *input_expected, void *output_ready, void *expert_slots,
   int32_t producers, int32_t active_experts, int32_t slot_count,
   void *headers, void *dedup_state, void *group_metadata, bool reduce, bool publish_each_block,
-  float reduce_dense_ratio, float forward_compact_max_unique_ratio);
+  float reduce_dense_ratio, float forward_compact_max_unique_ratio, int32_t workers);
+
+extern "C" int32_t RoutedExpertsVectorCores();
+extern "C" int32_t RoutedExpertsTransportWorkers(int32_t ranks);
 
 extern "C" uint64_t RoutedExpertsGemmConfigBytes();
 extern "C" int RoutedExpertsGemmConfig(void *output, uint64_t capacity, int32_t m, int32_t n, int32_t k,

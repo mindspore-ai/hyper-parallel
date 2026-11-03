@@ -9,6 +9,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
 #include <cstring>
 #include "tiling/matmul/matmul_tiling.h"
 #include "tiling/platform/platform_ascendc.h"
@@ -30,6 +31,19 @@ bool UseFixedTiling(const platform_ascendc::PlatformAscendC &platform, int32_t m
 }
 
 }  // namespace
+
+extern "C" int32_t RoutedExpertsVectorCores() {
+  auto *platform = platform_ascendc::PlatformAscendCManager::GetInstance();
+  return platform == nullptr ? 0 : static_cast<int32_t>(platform->GetCoreNumAiv());
+}
+
+extern "C" int32_t RoutedExpertsTransportWorkers(int32_t ranks) {
+  const int32_t budget = RoutedExpertsVectorCores() - 8;
+  if (ranks < 1 || ranks >= (1 << 30) || budget < 1) {
+    return 0;
+  }
+  return 2 * ranks <= budget ? 2 * ranks : std::min(ranks, budget);
+}
 
 extern "C" uint64_t RoutedExpertsGemmConfigBytes() {
   return sizeof(AscendC::tiling::TCubeTiling);

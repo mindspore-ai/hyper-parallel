@@ -24,7 +24,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from hyper_parallel.core.multicore.modules.routed_experts import forward, readiness
+from hyper_parallel.core.multicore.modules.routed_experts import forward, readiness, transport
 from tests.common.mark_utils import arg_mark
 
 
@@ -232,14 +232,18 @@ class TestForwardPipeline(unittest.TestCase):
 
     def test_transport_occupancy_gate_covers_topology_boundaries(self) -> None:
         """A persistent consumer cannot consume the service's last vector workers."""
-        for ranks, expected in ((16, 8), (20, 8), (21, 0), (24, 0), (25, 8), (40, 8), (41, 0), (48, 0)):
-            transport_workers = 2 * ranks if ranks <= 24 else ranks
+        for ranks in (16, 20, 21, 24, 25, 40, 41, 48, 64, 128):
+            transport_workers = transport.transport_worker_count(ranks, 48)
             with self.subTest(ranks=ranks):
-                self.assertEqual(forward.forward_vector_budget(transport_workers), expected)
-        self.assertEqual(forward.forward_vector_budget(0), 8)
+                self.assertLessEqual(transport_workers, 40)
+                self.assertEqual(forward.forward_vector_budget(transport_workers, 48), 8)
+        self.assertEqual(transport.transport_worker_count(16, 48), 32)
+        self.assertEqual(transport.transport_worker_count(64, 48), 40)
+        self.assertEqual(transport.transport_worker_count(128, 32), 24)
+        self.assertEqual(forward.forward_vector_budget(0, 48), 8)
         for value in (-1, 49, True, 1.5):
             with self.subTest(value=value), self.assertRaises(ValueError):
-                forward.forward_vector_budget(value)
+                forward.forward_vector_budget(value, 48)
         pipeline, work = self._prepare((1,))
         disabled = forward.ForwardPipeline((1,), torch.device("cpu"), vector_workers=0)
         self.assertFalse(disabled.enabled)

@@ -71,7 +71,7 @@ void CheckReadiness(const std::optional<at::Tensor> &input_ready,
     }
     CheckTensor(**flags, anchor, at::kInt);
     const auto &value = **flags;
-    TORCH_CHECK(value.dim() == 3 && value.size(0) > 0 && value.size(0) <= 48 && value.size(1) == experts &&
+    TORCH_CHECK(value.dim() == 3 && value.size(0) > 0 && value.size(0) <= INT32_MAX && value.size(1) == experts &&
                   value.size(2) == 16 && (!value.numel() || reinterpret_cast<uintptr_t>(value.data_ptr()) % 64 == 0),
                 "invalid expert readiness cells");
     if (flags == &output_ready) {

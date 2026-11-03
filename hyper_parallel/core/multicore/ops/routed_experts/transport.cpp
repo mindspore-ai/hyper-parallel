@@ -48,26 +48,14 @@ class TransportWorker {
     reduce_dense_ratio_ = reduce_dense_ratio;
     forward_compact_max_unique_ratio_ = forward_compact_max_unique_ratio;
     signals_ = reinterpret_cast<__gm__ int32_t *>(signals);
-    split_workers_ = ranks <= 24;
-    peer_ = split_workers_ ? GetBlockIdx() / 2 : GetBlockIdx();
+    workers_ = GetBlockNum();
+    split_workers_ = workers_ == 2 * ranks;
+    multiplex_ = workers_ < ranks;
     send_worker_ = !split_workers_ || GetBlockIdx() % 2 == 0;
-    auto *config = reinterpret_cast<__gm__ int64_t *>(offsets) + peer_ * 6;
-    send_cursor_ = config[0];
-    send_end_ = config[1];
-    receive_cursor_ = config[2];
-    receive_begin_ = receive_cursor_;
-    receive_end_ = config[3];
-    if (config[4] < 0 || config[4] >= (1LL << 30) || config[5] < 0 || config[5] >= (1LL << 30)) {
-      Trap();
-    }
-    send_sequence_ = static_cast<int32_t>(config[4] + 1);
-    receive_sequence_ = static_cast<int32_t>(config[5] + 1);
-    if (send_cursor_ < 0 || send_end_ < send_cursor_ || send_end_ > send_count || receive_cursor_ < 0 ||
-        receive_end_ < receive_cursor_ || receive_end_ > receive_count || send_sequence_ < 1 ||
-        receive_sequence_ < 1) {
-      Trap();
-    }
-    progress_ = reinterpret_cast<__gm__ int64_t *>(progress) + GetBlockIdx() * 8;
+    offsets_ = reinterpret_cast<__gm__ int64_t *>(offsets);
+    progress_base_ = reinterpret_cast<__gm__ int64_t *>(progress);
+    send_count_ = send_count;
+    receive_count_ = receive_count;
     rank_ = rank;
     ranks_ = ranks;
     lanes_ = lanes;
@@ -83,9 +71,6 @@ class TransportWorker {
           input_rows_ >= (1LL << 31) || output_rows_ >= (1LL << 31)) {
         Trap();
       }
-      const int64_t stride = ((input_rows_ > 0 ? input_rows_ : 1) + 7) / 8 * 8;
-      seen_ = dedup_state_ + static_cast<int64_t>(peer_) * stride;
-      last_ = dedup_state_ + (static_cast<int64_t>(ranks_) + peer_) * stride;
     }
     if (reduce_) {
       if (gather || (group_metadata_ == nullptr && input_rows_ > 0)) {
@@ -93,17 +78,8 @@ class TransportWorker {
       }
       // Forward recorded each row's predecessor before backward starts.
       links_ = group_metadata_ == nullptr ? nullptr : group_metadata_ + 1;
-      if (send_cursor_ < send_end_ && peer_ != rank_) {
-        const int64_t first = sends_[send_cursor_ * 6 + 3];
-        const auto *summary = group_metadata_ + first * kTokenStride;
-        const int64_t unique = summary[2];
-        const int64_t rows = summary[3];
-        if (unique < 1 || rows < unique || rows > input_rows_) {
-          Trap();
-        }
-        dense_return_ = static_cast<float>(unique) >= reduce_dense_ratio_ * static_cast<float>(rows);
-      }
     }
+    BindPeer(split_workers_ ? GetBlockIdx() / 2 : GetBlockIdx());
     input_ready_ = reinterpret_cast<__gm__ int32_t *>(input_ready);
     input_expected_ = reinterpret_cast<__gm__ int32_t *>(input_expected);
     output_ready_ = reinterpret_cast<__gm__ int32_t *>(output_ready);
@@ -114,7 +90,7 @@ class TransportWorker {
     CheckReadiness();
     // Pure compact senders use one bank; adaptive dense dispatch and reverse
     // singleton copies use both banks for contiguous transfer overlap.
-    const bool compressed_sender = split_workers_ && send_worker_ && peer_ != rank_ &&
+    const bool compressed_sender = !multiplex_ && split_workers_ && send_worker_ && peer_ != rank_ &&
                                    dedup_state_ != nullptr && forward_compact_max_unique_ratio_ >= 1.0F;
     pipe_.InitBuffer(buffer_, (compressed_sender ? 1 : 2) * kScratchBytes);
     scratch_ = buffer_.Get<uint8_t>();
@@ -122,7 +98,7 @@ class TransportWorker {
     pipe_.InitBuffer(header_buffer_, ((block_rows_ + 8) / 8 * 8) * sizeof(int64_t));
     header_local_ = header_buffer_.Get<int64_t>();
     header_ptr_ = reinterpret_cast<__ubuf__ int64_t *>(header_local_.GetPhyAddr());
-    if (reduce_ && peer_ != rank_ && send_worker_ && send_cursor_ < send_end_) {
+    if (reduce_ && ranks_ > 1 && send_worker_) {
       pipe_.InitBuffer(reduce_input_buffer_, kReduceElements * sizeof(bfloat16_t));
       pipe_.InitBuffer(reduce_value_buffer_, kReduceElements * sizeof(float));
       pipe_.InitBuffer(reduce_sum_buffer_, kReduceElements * sizeof(float));
@@ -152,6 +128,10 @@ class TransportWorker {
   }
 
   __aicore__ inline void Run() {
+    if (multiplex_) {
+      RunMultiplexed();
+      return;
+    }
     if (peer_ == rank_) {
       if (send_worker_) {
         RunLocal();
@@ -173,6 +153,119 @@ class TransportWorker {
   static constexpr uint32_t kReduceElements = 4096;
   static constexpr uint32_t kTokenStride = 8;
   static constexpr int64_t kLocalTokenCapacity = 16384;
+
+  __aicore__ inline void BindPeer(int32_t peer) {
+    peer_ = peer;
+    progress_ = progress_base_ + (split_workers_ ? GetBlockIdx() : peer_) * 16;
+    const auto *config = offsets_ + static_cast<int64_t>(peer_) * 6;
+    send_cursor_ = config[0];
+    send_end_ = config[1];
+    receive_cursor_ = receive_begin_ = config[2];
+    receive_end_ = config[3];
+    if (config[4] < 0 || config[4] >= (1LL << 30) || config[5] < 0 || config[5] >= (1LL << 30)) {
+      Trap();
+    }
+    send_sequence_ = static_cast<int32_t>(config[4] + 1);
+    receive_sequence_ = static_cast<int32_t>(config[5] + 1);
+    if (send_cursor_ < 0 || send_end_ < send_cursor_ || send_end_ > send_count_ || receive_cursor_ < 0 ||
+        receive_end_ < receive_cursor_ || receive_end_ > receive_count_) {
+      Trap();
+    }
+    if (dedup_state_ != nullptr) {
+      const int64_t stride = ((input_rows_ > 0 ? input_rows_ : 1) + 7) / 8 * 8;
+      seen_ = dedup_state_ + static_cast<int64_t>(peer_) * stride;
+      last_ = dedup_state_ + (static_cast<int64_t>(ranks_) + peer_) * stride;
+    }
+    admitted_input_slot_ = -1;
+    pending_output_blocks_ = 0;
+    peer_unique_ = peer_rows_ = 0;
+    dense_return_ = false;
+    last_progress_ = GetSystemCycle();
+    if (multiplex_ && progress_[13] != 0) {
+      send_cursor_ = progress_[0];
+      receive_cursor_ = progress_[1];
+      send_sequence_ = static_cast<int32_t>(progress_[2]);
+      receive_sequence_ = static_cast<int32_t>(progress_[3]);
+      admitted_input_slot_ = static_cast<int32_t>(progress_[8]);
+      pending_output_blocks_ = static_cast<int32_t>(progress_[9]);
+      peer_unique_ = progress_[10];
+      peer_rows_ = progress_[11];
+      last_progress_ = static_cast<uint64_t>(progress_[12]);
+      dense_return_ = progress_[15] != 0;
+    } else if (reduce_ && send_cursor_ < send_end_ && peer_ != rank_) {
+      const int64_t first = sends_[send_cursor_ * 6 + 3];
+      if (first < 0 || first >= input_rows_) {
+        Trap();
+      }
+      const auto *summary = group_metadata_ + first * kTokenStride;
+      const int64_t unique = summary[2], rows = summary[3];
+      if (unique < 1 || rows < unique || rows > input_rows_) {
+        Trap();
+      }
+      dense_return_ = static_cast<float>(unique) >= reduce_dense_ratio_ * static_cast<float>(rows);
+    }
+  }
+
+  __aicore__ inline void SavePeer(bool done) {
+    // A block's local MTE/V work must finish before UB is lent to another peer.
+    PipeBarrier<PIPE_ALL>();
+    progress_[0] = send_cursor_;
+    progress_[1] = receive_cursor_;
+    progress_[2] = send_sequence_;
+    progress_[3] = receive_sequence_;
+    progress_[8] = admitted_input_slot_;
+    progress_[9] = pending_output_blocks_;
+    progress_[10] = peer_unique_;
+    progress_[11] = peer_rows_;
+    progress_[12] = static_cast<int64_t>(last_progress_);
+    progress_[13] = 1;
+    progress_[14] = done;
+    progress_[15] = dense_return_;
+  }
+
+  __aicore__ inline bool AdvancePeer() {
+    bool advanced = false;
+    if (peer_ == rank_) {
+      if (send_cursor_ < send_end_ && InputReady(sends_ + send_cursor_ * 6)) {
+        CopyLocalEdge(sends_ + send_cursor_ * 6);
+        ++send_cursor_;
+        advanced = true;
+      }
+    } else {
+      if (receive_cursor_ < receive_end_ && Ready(0, receive_sequence_)) {
+        Receive();
+        advanced = true;
+      }
+      if (send_cursor_ < send_end_ && Ready(1, send_sequence_) && InputReady(sends_ + send_cursor_ * 6)) {
+        Send();
+        advanced = true;
+      }
+    }
+    return advanced;
+  }
+
+  __aicore__ inline void RunMultiplexed() {
+    bool unfinished = true;
+    while (unfinished) {
+      unfinished = false;
+      for (int32_t peer = GetBlockIdx(); peer < ranks_; peer += workers_) {
+        if (progress_base_[static_cast<int64_t>(peer) * 16 + 14] != 0) {
+          continue;
+        }
+        BindPeer(peer);
+        CheckRemoteAccess();
+        if (AdvancePeer()) {
+          last_progress_ = GetSystemCycle();
+        } else if (GetSystemCycle() - last_progress_ > idle_cycles_) {
+          progress_[4] = -5;
+          Trap();
+        }
+        const bool done = send_cursor_ == send_end_ && (peer_ == rank_ || receive_cursor_ == receive_end_);
+        SavePeer(done);
+        unfinished = unfinished || !done;
+      }
+    }
+  }
 
   __aicore__ inline int64_t Seen(int64_t token) {
     return seen_ptr_ == nullptr ? seen_[token] : seen_ptr_[token];
@@ -994,12 +1087,14 @@ class TransportWorker {
   int64_t send_cursor_ = 0, send_end_ = 0, receive_cursor_ = 0, receive_end_ = 0, receive_begin_ = 0;
   int64_t peer_unique_ = 0, peer_rows_ = 0;
   int32_t send_sequence_ = 0, receive_sequence_ = 0;
-  int32_t rank_ = 0, ranks_ = 0, peer_ = 0, lanes_ = 0, block_rows_ = 0, row_bytes_ = 0;
+  __gm__ int64_t *offsets_ = nullptr, *progress_base_ = nullptr;
+  int64_t send_count_ = 0, receive_count_ = 0;
+  int32_t rank_ = 0, ranks_ = 0, peer_ = 0, lanes_ = 0, block_rows_ = 0, row_bytes_ = 0, workers_ = 0;
   bool gather_ = false, reduce_ = false, publish_each_block_ = false, dense_return_ = false;
   float reduce_dense_ratio_ = 1.0F;
   float forward_compact_max_unique_ratio_ = 1.0F;
-  bool split_workers_ = false, send_worker_ = false;
-  uint64_t idle_cycles_ = 0;
+  bool split_workers_ = false, send_worker_ = false, multiplex_ = false;
+  uint64_t idle_cycles_ = 0, last_progress_ = 0;
   int64_t input_rows_ = 0, output_rows_ = 0, mapping_rows_ = 0;
 };
 
@@ -1037,15 +1132,14 @@ extern "C" int RoutedExpertsTransport(
   void *input_ready, void *input_expected, void *output_ready, void *expert_slots,
   int32_t producers, int32_t active_experts, int32_t slot_count,
   void *headers, void *dedup_state, void *group_metadata, bool reduce, bool publish_each_block,
-  float reduce_dense_ratio, float forward_compact_max_unique_ratio) {
-  if (ranks < 1 || ranks > 48) {
+  float reduce_dense_ratio, float forward_compact_max_unique_ratio, int32_t workers) {
+  if (ranks < 1 || ranks >= (1 << 30) || workers < 1 || (workers > ranks && workers != 2 * ranks)) {
     return static_cast<int>(ACL_ERROR_INVALID_PARAM);
   }
   const auto previous_error = aclrtGetLastError(ACL_RT_THREAD_LEVEL);
   if (previous_error != ACL_SUCCESS) {
     return static_cast<int>(previous_error);
   }
-  const int32_t workers = ranks <= 24 ? 2 * ranks : ranks;
   TransportKernel<<<workers, nullptr, stream>>>(static_cast<uint8_t *>(input), static_cast<uint8_t *>(output),
     static_cast<uint8_t *>(mapping), static_cast<uint8_t *>(send_edges), static_cast<uint8_t *>(receive_edges),
     static_cast<uint8_t *>(peer_offsets), static_cast<uint8_t *>(ring), static_cast<uint8_t *>(signals),

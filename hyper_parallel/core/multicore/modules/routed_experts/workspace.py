@@ -42,7 +42,7 @@ class RingSpec:
         values = (self.ranks, self.hidden, self.block_rows, self.lanes)
         if any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in values):
             raise ValueError("ring dimensions must be positive integers")
-        if self.ranks > 48 or self.lanes > 2 or self.hidden > 32768 or self.hidden % 16 or self.block_rows > 1024:
+        if self.ranks >= 2**30 or self.lanes > 2 or self.hidden > 32768 or self.hidden % 16 or self.block_rows > 1024:
             raise ValueError("ring dimensions exceed the independent transport kernel's limits")
 
     @property

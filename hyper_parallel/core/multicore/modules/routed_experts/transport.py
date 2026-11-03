@@ -39,6 +39,33 @@ def _load_native() -> ctypes.CDLL:
     return handle
 
 
+@lru_cache(maxsize=1)
+def vector_core_count() -> int:
+    """Query native vector capacity once, without a device-to-host tensor copy."""
+    query = _load_native().RoutedExpertsVectorCores
+    query.argtypes, query.restype = [], ctypes.c_int32
+    cores = query()
+    if not isinstance(cores, int) or cores <= 8:
+        raise RuntimeError("native transport requires vector capacity beyond its eight-worker compute service")
+    return cores
+
+
+def transport_worker_count(ranks: int, vector_cores: int | None = None) -> int:
+    """Bound physical workers independently of EP membership.
+
+    A dedicated MTE send/receive pair is retained when it fits alongside the
+    vector compute service. Otherwise one owner services both directions for
+    each peer, fairly multiplexing peers when necessary.
+    """
+    if isinstance(ranks, bool) or not isinstance(ranks, int) or not 1 <= ranks < 2**30:
+        raise ValueError("transport rank count must fit positive native int32 coordinates")
+    cores = vector_core_count() if vector_cores is None else vector_cores
+    if isinstance(cores, bool) or not isinstance(cores, int) or cores <= 8:
+        raise ValueError("transport requires vector capacity beyond the eight-worker compute service")
+    budget = cores - 8
+    return 2 * ranks if 2 * ranks <= budget else min(ranks, budget)
+
+
 def _pack_blocks(edges: tuple[RouteEdge, ...], ranks: int, block_rows: int,
                  peer_column: int) -> tuple[torch.Tensor, np.ndarray, np.ndarray]:
     """Expand dense host rows in stable peer/edge/block order without edge objects."""
@@ -232,8 +259,10 @@ def _prepare(source: torch.Tensor, route: RouteDescriptor, workspace: RingWorksp
     if any(max(row[4] + row[1] - row[0], row[5] + row[3] - row[2]) >= 2**30 for row in host_offsets):
         raise RuntimeError("transport sequences require a collective drained reset before reuse")
     offsets = torch.tensor(host_offsets, dtype=torch.int64)
-    workers = 2 * route.ranks if route.ranks <= 24 else route.ranks
-    progress = torch.zeros((workers, 8), dtype=torch.int64, device=source.device)
+    workers = transport_worker_count(route.ranks)
+    # The first cache line retains diagnostics; the second keeps suspended
+    # logical-peer state. Each row has exactly one physical owner.
+    progress = torch.zeros((max(workers, route.ranks), 16), dtype=torch.int64, device=source.device)
     return output, indices, send, receive, upload_metadata(offsets, source.device), host_offsets, progress, current
 
 
@@ -475,7 +504,7 @@ def _check_dependency(dependency: ExpertReadiness | None, route: RouteDescriptor
     flags, expected = dependency.flags, dependency.expected
     for value in (flags, expected):
         _check_tensor(value, workspace)
-    if (flags.dtype != torch.int32 or flags.ndim != 3 or not 1 <= flags.shape[0] <= 48
+    if (flags.dtype != torch.int32 or flags.ndim != 3 or not 1 <= flags.shape[0] < 2**31
             or flags.shape[1:] != (len(route.active_experts), 16)
             or expected.dtype != torch.int32 or expected.shape != flags.shape[:2]):
         raise ValueError("transport dependency must cover the compact active experts")

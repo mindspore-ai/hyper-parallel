@@ -24,6 +24,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from hyper_parallel.distributed.expert_parallel.moonep.fused import executor as execution
+from hyper_parallel.distributed.expert_parallel.moonep.fused import communicators
 from tests.common.mark_utils import arg_mark
 
 
@@ -33,12 +34,14 @@ class TestOwnershipInitialization(unittest.TestCase):
 
     def setUp(self) -> None:
         """Install metadata-only home tensors and fake communication resource factories."""
+        self.enterContext(patch.object(communicators, "_bundles", {}))
         owners = [torch.nn.Linear(4, 4, bias=False) for _ in range(2)]
         self.experts = [SimpleNamespace(owner=owner, ranks=2, experts=4, top_k=2,
                                         replica_capacity=2, home_count=2, rank=0, group=object(),
                                         token_dedup=False, forward_ratio=0.75, backward_ratio=1.0,
                                         swiglu_limit=None) for owner in owners]
         self.runtime = execution.SparseMoonEPRuntime(self.experts)
+        self.enterContext(patch.object(execution, "vector_core_count", return_value=48))
         self.home = tuple(SimpleNamespace(dtype=torch.bfloat16, device=torch.device("npu"),
                                            shape=shape, stride=Mock(return_value=stride))
                           for shape, stride in (((2, 16, 32), (512, 32, 1)), ((2, 16, 16), (256, 16, 1))))
@@ -124,22 +127,21 @@ class TestOwnershipInitialization(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "home/ownership admission failed"):
                     self.runtime.initialize(self.experts[0], self.home)
                 self.gather.assert_called_once()
-                self.assertIn("share WORLD", self.gather.call_args.args[1][1])
+                self.assertIn("share EP", self.gather.call_args.args[1][1])
                 self._assert_no_resources()
                 setattr(peer, name, original)
 
 
-    def test_efs_metadata_rejects_sharded_experts_without_restoring_weights(self) -> None:
-        """EFS reads the stable FSDP degree even while a later owner remains sharded."""
+    def test_efs_metadata_admits_sharded_experts_without_restoring_weights(self) -> None:
+        """Stable ownership admission does not require materializing later EFS weights."""
         expert = self.experts[1]
         manager = SimpleNamespace(shard_world_size=2, sharded_param=expert.owner.weight)
         expert.owner.hsdp_scheduler = SimpleNamespace(
             modules=[expert.owner], cell=expert.owner,
             hsdp_state=SimpleNamespace(hsdp_params=[manager], is_shard=True))
         expert.read_weights = Mock(side_effect=AssertionError("must not restore a later owner"))
-        with self.assertRaisesRegex(ValueError, "home/ownership admission failed"):
-            self.runtime.initialize(self.experts[0], self.home)
-        self.assertIn("EFS shard_world_size=1", self.gather.call_args.args[1][1])
+        self.runtime.initialize(self.experts[0], self.home)
         self.gather.assert_called_once()
         expert.read_weights.assert_not_called()
-        self._assert_no_resources()
+        self.workspace.return_value.check_preflight.assert_called_once_with(None)
+        self.assertEqual(self.groups.call_count, 5)

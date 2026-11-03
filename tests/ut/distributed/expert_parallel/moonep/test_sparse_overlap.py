@@ -91,6 +91,7 @@ class TestSparseOverlap(unittest.TestCase):
         self.enterContext(patch.object(torch, "npu", npu, create=True))
         self.records = self.enterContext(patch.object(torch.Tensor, "record_stream"))
         self.enterContext(patch.object(transport, "_load_native"))
+        self.enterContext(patch.object(transport, "vector_core_count", return_value=48))
         self.enterContext(patch.object(transport, "upload_metadata", side_effect=self._upload))
         self.enterContext(patch.object(readiness, "upload_metadata", side_effect=self._upload))
         self.enterContext(patch.object(torch.ops.hyper_parallel, "routed_experts_transport", create=True,

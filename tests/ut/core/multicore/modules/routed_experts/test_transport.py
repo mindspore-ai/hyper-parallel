@@ -73,6 +73,7 @@ class TestPreparedExchange(unittest.TestCase):
         self.native = self.enterContext(patch.object(
             torch.ops.hyper_parallel, "routed_experts_transport", create=True))
         self.enterContext(patch.object(transport, "_load_native"))
+        self.enterContext(patch.object(transport, "vector_core_count", return_value=48))
         self.enterContext(patch.object(transport, "upload_metadata", side_effect=self._upload))
         self.enterContext(patch.object(readiness, "upload_metadata", side_effect=self._upload))
         self.workspace = self._workspace()

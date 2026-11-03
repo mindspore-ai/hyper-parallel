@@ -26,7 +26,7 @@ import torch
 
 from hyper_parallel.core.multicore.modules.routed_experts.frame import ExpertState
 from hyper_parallel.core.multicore.modules.routed_experts.readiness import ExpertReadiness, upload_metadata
-from hyper_parallel.core.multicore.modules.routed_experts.transport import _load_native
+from hyper_parallel.core.multicore.modules.routed_experts.transport import _load_native, vector_core_count
 
 
 _TILE_ROWS = 128
@@ -35,17 +35,19 @@ _WATCHDOG = 60_000_000_000
 Allocator = Callable[[str, tuple[int, ...], torch.dtype], Optional[torch.Tensor]]
 
 
-def forward_vector_budget(transport_workers: int) -> int:
+def forward_vector_budget(transport_workers: int, vector_cores: int | None = None) -> int:
     """Reserve eight service workers only when persistent transport leaves them free.
 
     The caller supplies its actual transport launch budget. This is a necessary
     occupancy bound; successful scheduling still requires device validation.
     Standalone compute uses zero transport workers and may reserve eight.
     """
-    if (isinstance(transport_workers, bool) or not isinstance(transport_workers, int)
-            or not 0 <= transport_workers <= 48):
-        raise ValueError("persistent transport workers must be an integer between zero and 48")
-    return 8 if transport_workers <= 40 else 0
+    cores = vector_core_count() if vector_cores is None else vector_cores
+    if (isinstance(cores, bool) or not isinstance(cores, int) or cores < 1
+            or isinstance(transport_workers, bool) or not isinstance(transport_workers, int)
+            or not 0 <= transport_workers <= cores):
+        raise ValueError("persistent transport workers must fit the device vector capacity")
+    return 8 if cores - transport_workers >= 8 else 0
 
 
 def forward_tasks(boundaries: tuple[int, ...]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -256,8 +258,8 @@ class ForwardPipeline:
             return
         dependency.validate_polling()
         flags, expected = dependency.flags, dependency.expected
-        if flags.ndim != 3 or not 1 <= flags.shape[0] <= 48:
-            raise ValueError("forward dependency requires between one and 48 producers")
+        if flags.ndim != 3 or not 1 <= flags.shape[0] < 2**31:
+            raise ValueError("forward dependency producer count must fit positive int32")
         _check_tensor(flags, (flags.shape[0], len(self.boundaries), 16), torch.int32,
                       self.device, "forward input flags")
         _check_tensor(expected, tuple(flags.shape[:2]), torch.int32, self.device, "forward input expectations")

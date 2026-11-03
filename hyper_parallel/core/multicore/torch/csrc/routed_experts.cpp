@@ -76,7 +76,7 @@ void CheckReadinessAliases(std::vector<at::Tensor> values, std::vector<size_t> w
 void CheckReadinessShape(const at::Tensor &flags, const at::Tensor &anchor, int64_t experts,
                          int64_t writers, bool output) {
   TORCH_CHECK(flags.device() == anchor.device() && flags.scalar_type() == at::kInt && flags.is_contiguous() &&
-                flags.dim() == 3 && flags.size(0) > 0 && flags.size(0) <= 48 &&
+                flags.dim() == 3 && flags.size(0) > 0 && flags.size(0) <= INT32_MAX &&
                 flags.size(1) == experts && flags.size(2) == 16 &&
                 (flags.numel() == 0 || reinterpret_cast<uintptr_t>(flags.data_ptr()) % 64 == 0) &&
                 (!output || flags.size(0) == writers), "invalid expert readiness cache lines");
@@ -139,24 +139,24 @@ void CheckTransportMatrices(const at::Tensor &input, const at::Tensor &output) {
 }
 
 void CheckTransportTopology(int64_t rank, int64_t ranks, int64_t lanes, int64_t block_rows, int64_t idle_cycles) {
-  TORCH_CHECK(ranks > 0 && ranks <= 48 && rank >= 0 && rank < ranks && lanes > 0 && lanes <= 2 &&
+  TORCH_CHECK(ranks > 0 && ranks < (1LL << 30) && rank >= 0 && rank < ranks && lanes > 0 && lanes <= 2 &&
                 block_rows > 0 && block_rows <= 1024 && idle_cycles > 0,
               "invalid routed transport topology, capacity or timeout");
 }
 
 void CheckTransportTables(const at::Tensor &mapping, const at::Tensor &send_edges, const at::Tensor &receive_edges,
-                          const at::Tensor &peer_offsets, const at::Tensor &progress, int64_t ranks) {
+                          const at::Tensor &peer_offsets, const at::Tensor &progress, int64_t ranks,
+                          int64_t workers) {
   TORCH_CHECK(send_edges.dim() == 2 && send_edges.size(1) == 6 && receive_edges.dim() == 2 &&
                 receive_edges.size(1) == 6 && peer_offsets.sizes() == at::IntArrayRef({ranks, 6}),
               "routed transport descriptors must have six int64 fields");
   for (const auto *value : {&mapping, &send_edges, &receive_edges, &peer_offsets, &progress}) {
     TORCH_CHECK(value->scalar_type() == at::kLong, "routed transport indices must be int64");
   }
-  const int64_t workers = ranks <= 24 ? 2 * ranks : ranks;
   TORCH_CHECK(mapping.dim() == 1, "routed transport mapping must be one-dimensional");
-  TORCH_CHECK(progress.dim() == 2 && progress.size(1) == 8 && progress.size(0) >= workers &&
+  TORCH_CHECK(progress.dim() == 2 && progress.size(1) == 16 && progress.size(0) >= std::max(ranks, workers) &&
                 reinterpret_cast<uintptr_t>(progress.data_ptr()) % 64 == 0,
-              "routed transport progress must contain at least ", workers, " aligned eight-int64 worker rows");
+              "routed transport progress must contain aligned sixteen-int64 rows for every logical owner");
 }
 
 void CheckTransportWindow(const at::Tensor &input, const at::Tensor &ring, const at::Tensor &signals,
@@ -292,10 +292,15 @@ void Transport(const at::Tensor &input, at::Tensor output, const at::Tensor &map
                 const std::optional<at::Tensor> &output_ready, const std::optional<at::Tensor> &expert_slots,
                 const std::optional<at::Tensor> &dedup_state,
                 const std::optional<at::Tensor> &group_metadata, bool reduce, bool publish_each_block,
-                double reduce_dense_ratio, double forward_compact_max_unique_ratio) {
+                double reduce_dense_ratio, double forward_compact_max_unique_ratio, int64_t workers) {
+  const c10_npu::NPUGuard guard(input.device());
   CheckTransportMatrices(input, output);
   CheckTransportTopology(rank, ranks, lanes, block_rows, idle_cycles);
-  CheckTransportTables(mapping, send_edges, receive_edges, peer_offsets, progress, ranks);
+  const int32_t capacity = RoutedExpertsVectorCores() - 8;
+  workers = workers == 0 ? RoutedExpertsTransportWorkers(static_cast<int32_t>(ranks)) : workers;
+  TORCH_CHECK(workers > 0 && workers <= capacity && (workers <= ranks || workers == 2 * ranks),
+              "transport worker budget must leave the vector compute service resident");
+  CheckTransportTables(mapping, send_edges, receive_edges, peer_offsets, progress, ranks, workers);
   CheckTransportWindow(input, ring, signals, headers, ranks, lanes, block_rows);
   TORCH_CHECK(!(dedup_state && reduce) &&
                 (dedup_state.has_value() || reduce) == group_metadata.has_value(),
@@ -316,7 +321,6 @@ void Transport(const at::Tensor &input, at::Tensor output, const at::Tensor &map
                   group_metadata->size(0) == input.size(0) && group_metadata->size(1) == 8,
                 "block return reduction metadata has invalid geometry");
   }
-  const c10_npu::NPUGuard guard(input.device());
   const int64_t experts = ReadinessExperts(input_ready, output_ready);
   CheckReadiness(input_ready, input_expected, input, experts, 0);
   CheckReadiness(output_ready, std::nullopt, input, experts, ranks, true);
@@ -379,7 +383,7 @@ void Transport(const at::Tensor &input, at::Tensor output, const at::Tensor &map
       OptionalPointer(expert_slots), input_ready ? input_ready->size(0) : 0, experts,
       expert_slots ? expert_slots->numel() : 0, headers.data_ptr(), OptionalPointer(dedup_state),
       OptionalPointer(group_metadata), reduce, publish_each_block, static_cast<float>(reduce_dense_ratio),
-      static_cast<float>(forward_compact_max_unique_ratio));
+      static_cast<float>(forward_compact_max_unique_ratio), static_cast<int32_t>(workers));
   });
 }
 
@@ -402,7 +406,7 @@ TORCH_LIBRARY_FRAGMENT(hyper_parallel, m) {
         "Tensor? input_ready=None, Tensor? input_expected=None, Tensor(e!)? output_ready=None, "
         "Tensor? expert_slots=None, Tensor(g!)? dedup_state=None, "
         "Tensor(h!)? group_metadata=None, bool reduce=False, bool publish_each_block=False, "
-        "float reduce_dense_ratio=1.0, float forward_compact_max_unique_ratio=1.0) -> ()");
+        "float reduce_dense_ratio=1.0, float forward_compact_max_unique_ratio=1.0, int workers=0) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(hyper_parallel, PrivateUse1, m) {

@@ -18,7 +18,6 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
-from datetime import timedelta
 import math
 from typing import Any, Callable
 
@@ -30,9 +29,11 @@ from hyper_parallel.core.multicore.modules.routed_experts.descriptor import Rout
 from hyper_parallel.core.multicore.modules.routed_experts.compute import NativeExpertCompute
 from hyper_parallel.core.multicore.modules.routed_experts.forward import forward_vector_budget
 from hyper_parallel.core.multicore.modules.routed_experts.readiness import upload_metadata
+from hyper_parallel.core.multicore.modules.routed_experts.transport import transport_worker_count, vector_core_count
 from hyper_parallel.core.multicore.modules.routed_experts.workspace import RingSpec, RingWorkspace
 from hyper_parallel.distributed.expert_parallel.moonep.checkpoint import bind_execution, is_replaying
 from hyper_parallel.distributed.expert_parallel.moonep.fused.autograd import SparseExpertFunction
+from hyper_parallel.distributed.expert_parallel.moonep.fused.communicators import reserve_communicators
 from hyper_parallel.distributed.expert_parallel.moonep.fused.ownership import validate_parameter_ownership
 from hyper_parallel.distributed.expert_parallel.moonep.fused.plan import compile_local_route
 from hyper_parallel.distributed.expert_parallel.moonep.fused.pool import check_dense
@@ -147,6 +148,7 @@ class SparseMoonEPRuntime:
         self.activation_stream = None
         self.forward_vector_workers = 0
         self.groups = ()
+        self._group_lease = None
         self.home_geometry = None
         self.home_device = None
         for layer, executor in enumerate(executors):
@@ -160,48 +162,45 @@ class SparseMoonEPRuntime:
                 scheduler.register_gradient_extension(SparseGradientExtension(executor, self))
 
     @staticmethod
-    def _validate_root_topology(root: Any, world_size: int, configuration: tuple) -> None:
+    def _validate_root_topology(root: Any, group_size: int, configuration: tuple) -> None:
         """Reject invalid root extents before inspecting individual expert groups."""
         if (any(isinstance(value, bool) or not isinstance(value, int) for value in configuration)
-                or root.ranks != world_size or not 1 <= root.ranks <= 48
+                or root.ranks != group_size or not 1 <= root.ranks < 2**30
                 or root.experts < 1 or root.experts != root.ranks * root.home_count
                 or not 0 < root.top_k <= root.experts or root.replica_capacity < 0):
-            raise ValueError("sparse experts require one valid EP root spanning WORLD")
+            raise ValueError("sparse experts require a valid EP root and expert partition")
 
     @staticmethod
     def _validate_peer_topology(peer: Any, configuration: tuple, expected_members: tuple[int, ...],
-                                world_size: int, world_rank: int) -> None:
+                                group_size: int, local_rank: int) -> None:
         """Check group metadata without changing collective membership or lookup order."""
         local = peer.ranks, peer.experts, peer.home_count, peer.top_k, peer.replica_capacity
         group = dist.group.WORLD if peer.group is None else peer.group
         members = tuple(dist.get_process_group_ranks(group))
         if (any(isinstance(value, bool) or not isinstance(value, int) for value in local)
                 or local != configuration or members != expected_members
-                or dist.get_world_size(peer.group) != world_size
+                or dist.get_world_size(peer.group) != group_size
                 or isinstance(peer.rank, bool) or not isinstance(peer.rank, int)
-                or peer.rank != world_rank or dist.get_rank(peer.group) != peer.rank):
-            raise ValueError("all sparse experts must share WORLD membership, rank, and expert partition")
+                or peer.rank != local_rank or dist.get_rank(peer.group) != peer.rank):
+            raise ValueError("all sparse experts must share EP membership, local rank, and expert partition")
 
     def _validate_topology(self, executor: Any) -> tuple[int, ...]:
         """Validate stable host metadata for every owner without restoring any weights."""
         root = self.executors[0]
-        world_size, world_rank = dist.get_world_size(), dist.get_rank()
-        expected_members = tuple(range(world_size))
+        group_size, local_rank = dist.get_world_size(root.group), dist.get_rank(root.group)
+        group = dist.group.WORLD if root.group is None else root.group
+        expected_members = tuple(dist.get_process_group_ranks(group))
         configuration = root.ranks, root.experts, root.home_count, root.top_k, root.replica_capacity
         if executor is not root:
             raise ValueError("sparse initialization requires the first registered expert")
-        self._validate_root_topology(root, world_size, configuration)
+        self._validate_root_topology(root, group_size, configuration)
         for peer in self.executors:
-            self._validate_peer_topology(peer, configuration, expected_members, world_size, world_rank)
+            self._validate_peer_topology(peer, configuration, expected_members, group_size, local_rank)
             if peer.token_dedup != root.token_dedup:
                 raise ValueError("all sparse experts must use the same device-counted transport mode")
             if (peer.forward_ratio, peer.backward_ratio, peer.swiglu_limit) != (
                     root.forward_ratio, root.backward_ratio, root.swiglu_limit):
                 raise ValueError("all sparse experts must share compact ratios and activation semantics")
-            scheduler = getattr(peer.owner, "hsdp_scheduler", None)
-            if scheduler is not None and any(parameter.shard_world_size != 1
-                                             for parameter in scheduler.hsdp_state.hsdp_params):
-                raise ValueError("sparse experts currently require EFS shard_world_size=1")
         return expected_members
 
     def validate_home(self, home: tuple[torch.Tensor, torch.Tensor]) -> None:
@@ -250,6 +249,8 @@ class SparseMoonEPRuntime:
         try:
             members = self._validate_topology(executor)
             manifest = self._initial_home_manifest(executor, home)
+            self._group_lease = reserve_communicators(members)
+            manifest = (*manifest, self._group_lease.slot)
         except Exception as exc:
             admission_error = f"{type(exc).__name__}: {exc}"
         gathered = [None] * dist.get_world_size(root.group)
@@ -257,31 +258,30 @@ class SparseMoonEPRuntime:
             dist.all_gather_object(gathered, (manifest, admission_error), group=root.group)
         except BaseException:
             self.poisoned = True
+            self._release_group_lease()
             raise
         failures = tuple((rank, item[1]) for rank, item in enumerate(gathered) if item[1] is not None)
         if failures:
             self.poisoned = True
+            self._release_group_lease()
             raise ValueError(f"sparse expert home/ownership admission failed: {failures}")
         if any(item[0] != manifest for item in gathered):
             self.poisoned = True
+            self._release_group_lease()
             raise ValueError("sparse executor model manifests differ across ranks")
         try:
-            self._initialize_resources(executor, home, manifest, members)
+            self._initialize_resources(executor, home, manifest)
         except BaseException:
             self.poisoned = True
             self._initialization_failed = True
             raise
 
     def _initialize_resources(self, executor: Any, home: tuple[torch.Tensor, torch.Tensor],
-                              manifest: tuple, members: tuple[int, ...]) -> None:
+                              manifest: tuple) -> None:
         """Build resources once; local construction errors require whole-job termination."""
         gate, down = home
-        payload_groups = tuple(dist.new_group(ranks=members, backend="hccl") for _ in range(2))
-        # Host admission must not drain the compute stream or a prefetched W/G
-        # stream. Separate control groups preserve each domain's call ordering.
-        control_groups = tuple(dist.new_group(ranks=members, backend="gloo", timeout=timedelta(seconds=60))
-                               for _ in range(3))
-        self.groups = payload_groups + control_groups
+        self.groups = self._group_lease.initialize()
+        payload_groups, control_groups = self.groups[:2], self.groups[2:]
         self.workspace = RingWorkspace(RingSpec(executor.ranks, gate.shape[1]), executor.group,
                                        control_group=control_groups[0])
         self.arena = PhaseArena(gate.device)
@@ -294,8 +294,11 @@ class SparseMoonEPRuntime:
         transposed = gate.stride(-2) == 1, down.stride(-2) == 1
         error = None
         try:
-            transport_workers = 2 * executor.ranks if executor.ranks <= 24 else executor.ranks
-            self.forward_vector_workers = forward_vector_budget(transport_workers)
+            vector_cores = vector_core_count()
+            transport_workers = transport_worker_count(executor.ranks, vector_cores)
+            self.forward_vector_workers = forward_vector_budget(transport_workers, vector_cores)
+            self.statistics.update(logical_peers=executor.ranks, transport_workers=transport_workers,
+                                   vector_cores=vector_cores)
             if (shapes != ((2048, 1536), (768, 2048))
                     or transposed[0] != transposed[1]):
                 self.forward_vector_workers = 0
@@ -595,8 +598,18 @@ class SparseMoonEPRuntime:
         self._retire_backward_scratch()
         self.version += 1
 
+    def _release_group_lease(self) -> None:
+        """Release admission-only or fully drained communicator ownership."""
+        if self._group_lease is not None:
+            self._group_lease.release()
+            self._group_lease = None
+
     def close(self) -> None:
-        """Close only after all graphs and streams have finished using the windows."""
+        """Drain execution storage and return session-owned communicators for reuse.
+
+        Torch WORLD teardown destroys the cached process groups. Per-runtime
+        weight, gradient, token-window and activation storage is released here.
+        """
         if self.closed:
             return
         if self._initialization_failed:
@@ -614,8 +627,7 @@ class SparseMoonEPRuntime:
             self.arena.close()
             self.arena = None
             self.activation_stream = None
-            for group in self.groups:
-                dist.destroy_process_group(group)
+            self._release_group_lease()
             self.workspace = None
             self.weight_domain = self.gradient_domain = None
             self.groups = ()
