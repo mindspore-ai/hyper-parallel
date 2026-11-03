@@ -229,7 +229,7 @@ class HSDPStateV2:
         )
 
     def _init_mp_dtypes(self):
-        """Initialize mixed-precision dtypes for all managed parameters."""
+        """Initialize dtype attributes for each parameter from the mixed-precision policy."""
         for hsdp_param in self.hsdp_params:
             hsdp_param.init_dtype_attrs(self.mp_policy)
 

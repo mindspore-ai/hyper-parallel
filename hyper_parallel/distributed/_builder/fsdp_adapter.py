@@ -25,6 +25,7 @@ Trainer step runtime); ``FSDP2Manager`` / ``_instantiate_fsdp2`` and the
 
 from __future__ import annotations
 
+import fnmatch
 import logging
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
@@ -97,6 +98,7 @@ class FSDP2Manager:
         self.config = config
         self.mesh_context = mesh_context
         self.fp32_main_params = fp32_main_params
+        self._mp_policy: fully_shard_utils.MixedPrecisionPolicy | None = None
 
 
     def _resolve_replicate_params(
@@ -168,13 +170,30 @@ class FSDP2Manager:
             return dense_mesh
         return self._build_compatibility_fsdp_mesh()
 
-    def _build_mixed_precision_policy(self) -> fully_shard_utils.MixedPrecisionPolicy:
-        """Resolve the configured dtype strings to torch dtypes.
+    def _resolve_custom_params(
+        self, parameters_by_fqn: Mapping[str, ParameterClass]
+    ) -> dict[ParameterClass, dict[str, Any]]:
+        """Resolve configured names and patterns against the supplied parameter mapping."""
+        custom_params = {}
+        for parameter_fqn, custom_dtypes in self.config.mix_precision.custom_params.items():
+            matched_fqns = [parameter_fqn] if parameter_fqn in parameters_by_fqn else [
+                fqn for fqn in parameters_by_fqn if fnmatch.fnmatchcase(fqn, parameter_fqn)
+            ]
+            if not matched_fqns:
+                raise ValueError(f"mix_precision.custom_params matches no parameter: {parameter_fqn}")
+            for matched_fqn in matched_fqns:
+                parameter = parameters_by_fqn[matched_fqn]
+                if parameter in custom_params and custom_params[parameter] != custom_dtypes:
+                    raise ValueError(f"mix_precision.custom_params has conflicting overrides for {matched_fqn}")
+                custom_params[parameter] = dict(custom_dtypes)
+        return custom_params
 
-        Dtype strings stay YAML-friendly; ``float32`` resolves to the
-        framework's ``float32`` dtype object. Fully-sharded params without an
-        explicit param dtype fall back to the framework default.
-        """
+    def _build_mixed_precision_policy(
+        self, custom_params: Mapping[ParameterClass, Mapping[str, Any]] | None = None
+    ) -> fully_shard_utils.MixedPrecisionPolicy:
+        """Build or reuse the shared precision policy for the current model."""
+        if custom_params is None and self._mp_policy is not None:
+            return self._mp_policy
         mix_precision = self.config.mix_precision
         dtype_by_name = {
             None: None,
@@ -182,13 +201,19 @@ class FSDP2Manager:
             "float16": torch.float16,
             "float32": torch.float32,
         }
-        return fully_shard_utils.MixedPrecisionPolicy(
+        custom_params = {
+            parameter: {name: dtype_by_name[dtype] for name, dtype in custom_dtypes.items()}
+            for parameter, custom_dtypes in (custom_params or {}).items()
+        }
+        self._mp_policy = fully_shard_utils.MixedPrecisionPolicy(
             param_dtype=dtype_by_name[mix_precision.param_dtype],
             reduce_dtype=dtype_by_name[mix_precision.reduce_dtype],
             output_dtype=dtype_by_name[mix_precision.output_dtype],
             cast_forward_inputs=mix_precision.cast_forward_inputs,
             apply_grad_on_fp32_main_grad=self.fp32_main_params,
+            custom_params=custom_params if custom_params else None,
         )
+        return self._mp_policy
 
     def _build_offload_policy(self) -> fully_shard_utils.OffloadPolicy:
         """Return CPU offload when enabled, otherwise the default no-offload policy."""
@@ -710,12 +735,17 @@ class FSDP2Manager:
             ValueError: If TP is enabled without FQN metadata or configured
                 parameter FQNs cannot be resolved.
         """
+        self._mp_policy = None
         metadata_by_parameter = _build_source_shard_info_by_param(
             self,
             model,
             source_shard_info,
         )
         replicate_params = self._resolve_replicate_params(model)
+        custom_params = None
+        if self.config.mix_precision.custom_params:
+            custom_params = self._resolve_custom_params(dict(model.named_parameters(remove_duplicate=False)))
+        self._build_mixed_precision_policy(custom_params)
 
         wrap_modules = self._find_wrap_modules(model, metadata_by_parameter)
         owner_by_parameter = self._resolve_parameter_owners(model, wrap_modules)

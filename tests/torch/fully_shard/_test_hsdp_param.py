@@ -1093,8 +1093,7 @@ def test_hsdp_param_v2_non_dim0_reduce_scatter_grad():
         shard_placement_fn=custom_shard_fn,
         device=_current_device(),
     )
-    hsdp_param.mp_policy = MixedPrecisionPolicy()
-    hsdp_param.init_dtype_attrs(hsdp_param.mp_policy)
+    hsdp_param.init_dtype_attrs(MixedPrecisionPolicy())
 
     hsdp_param.unshard()
     hsdp_param.wait_for_unshard()
@@ -1164,8 +1163,7 @@ def test_hsdp_param_v2_same_dim_strided_non_dim0_backward():
         shard_placement_fn=lambda param: Shard(1),  # pylint: disable=unused-argument
         device=_current_device(),
     )
-    hsdp_param.mp_policy = MixedPrecisionPolicy()
-    hsdp_param.init_dtype_attrs(hsdp_param.mp_policy)
+    hsdp_param.init_dtype_attrs(MixedPrecisionPolicy())
 
     assert tuple(hsdp_param._spmd_placements) == (StridedShard(1, tp_size), Shard(1))
     expected_local_shard = torch.chunk(local_weight, dp_size, dim=1)[mesh_info.shard_mesh_rank].contiguous()

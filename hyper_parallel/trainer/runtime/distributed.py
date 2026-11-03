@@ -240,9 +240,7 @@ def create_distributed_setup_from_config(cfg: Any) -> DistributedSetup:
 
     _populate_mesh_ranks(mesh_context, dp_shard_size)
 
-    fsdp_enabled = dist.is_initialized() and (
-        dp_shard_size > 1 or dp_replicate_size > 1 or edp_shard_size > 1
-    )
+    fsdp_enabled = dist.is_initialized()
     strategy_config = fsdp_config if fsdp_enabled else None
     return DistributedSetup(
         mesh_context=mesh_context,
