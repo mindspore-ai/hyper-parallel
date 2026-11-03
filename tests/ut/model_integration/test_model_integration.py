@@ -76,7 +76,6 @@ from hyper_parallel.tools.model_integration.integration_validator import (
     validate_final_model,
     validate_state_invariants,
 )
-from hyper_parallel.models.adapter_spec import RecomputePolicy
 from hyper_parallel.models.deepseek_v41.adapter.validation.model_validation_spec import (
     _run_native_module_parity,
 )
@@ -91,7 +90,6 @@ from hyper_parallel.models.validation_spec import (
 from hyper_parallel.tools.model_integration import cli as model_integration_cli
 from hyper_parallel.tools.model_integration.cli import main as model_integration_main
 from hyper_parallel.trainer.base import BaseTrainer
-from hyper_parallel.trainer.config.parallelism import ActivationCheckpointSelection
 from hyper_parallel.trainer.config.training import ModelIntegrationConfig
 
 
@@ -263,45 +261,6 @@ class TestModelIntegrationContracts(unittest.TestCase):
             isolated_runner=lambda _context: {"status": "PASS"},
         )
         self.assertIsNone(isolated.candidate_builder)
-
-    def test_activation_checkpoint_selection_requires_one_exact_selector(self) -> None:
-        """Require exactly one valid count-based or index-based selector."""
-        with self.assertRaisesRegex(ValueError, "only valid"):
-            ActivationCheckpointSelection(source="default", layer_count=1)
-        with self.assertRaisesRegex(ValueError, "exactly one"):
-            ActivationCheckpointSelection(source="model_adapter_safe_regions")
-        with self.assertRaisesRegex(ValueError, "exactly one"):
-            ActivationCheckpointSelection(
-                source="model_adapter_safe_regions",
-                layer_count=1,
-                layer_indices=[0],
-            )
-        with self.assertRaisesRegex(ValueError, "non-negative integer"):
-            ActivationCheckpointSelection(
-                source="model_adapter_safe_regions",
-                layer_count=-1,
-            )
-        with self.assertRaisesRegex(ValueError, "must not contain duplicates"):
-            ActivationCheckpointSelection(
-                source="model_adapter_safe_regions",
-                layer_indices=[0, 0],
-            )
-        self.assertEqual(
-            ActivationCheckpointSelection(
-                source="model_adapter_safe_regions",
-                layer_count=0,
-            ).layer_count,
-            0,
-        )
-        self.assertEqual(
-            ActivationCheckpointSelection(
-                source="model_adapter_safe_regions",
-                layer_indices=[0, 2],
-            ).layer_indices,
-            [0, 2],
-        )
-        with self.assertRaisesRegex(ValueError, "must be default or"):
-            ActivationCheckpointSelection(source="model_adapter_layer_regions")
 
     def test_manifest_is_local_only_and_command_validated(self) -> None:
         """Reject implicit remote model sources before command execution."""
@@ -626,7 +585,6 @@ class TestModelIntegrationContracts(unittest.TestCase):
                 "_validation_spec",
                 return_value=ModelValidationSpec(),
             ),
-            mock.patch.object(model_integration_cli, "_recompute_policy", return_value=None),
         ):
             with self.assertRaisesRegex(ManifestError, "invalid validation matrix"):
                 model_integration_cli.command_validate(SimpleNamespace())
@@ -637,17 +595,16 @@ class TestModelIntegrationContracts(unittest.TestCase):
         cases = generate_validation_cases(
             {
                 "baseline": baseline,
-                "recompute_selections": [{"layer_count": 2}],
+                "recompute_layers": [[0, 1]],
                 "cross_topology_resume": {"tp": 2, "ep": 16, "fsdp": 8},
             },
-            RecomputePolicy(region_patterns=("model.layers.*.mlp",)),
         )
         by_name = {case.name: case for case in cases}
 
         recompute_case = next(
             case
             for case in cases
-            if case.topology.get("recompute") == {"layer_count": 2}
+            if case.topology.get("recompute_layer") == [0, 1]
         )
         self.assertEqual(recompute_case.metadata["acceptance"], "same_topology")
         cross_resume = by_name["cross_topology_resume"]
@@ -664,10 +621,10 @@ class TestModelIntegrationContracts(unittest.TestCase):
                         "cp": 1,
                         "ep": 1,
                         "fsdp": 16,
-                        "recompute": {"layer_count": 0},
+                        "recompute_layer": [],
                     },
                     "cross_topology_resume": {
-                        "recompute": {"layer_indices": [0, 1]},
+                        "recompute_layer": [0, 1],
                     },
                 }
             )
@@ -703,27 +660,26 @@ class TestModelIntegrationContracts(unittest.TestCase):
                 ("PASS", "PASS"),
             )
 
-    def test_case_generator_uses_production_recompute_policy(self) -> None:
-        """Generate recompute cases without importing validation declarations."""
+    def test_case_generator_uses_explicit_recompute_layers(self) -> None:
+        """Generate full-checkpoint cases from explicit layer sets."""
         cases = generate_validation_cases(
             {
                 "baseline": {"tp": 1, "cp": 1, "ep": 1, "fsdp": 1},
-                "recompute_selections": [
-                    {"layer_count": 0},
-                    {"layer_count": 3},
-                    {"layer_indices": [0, 2]},
+                "recompute_layers": [
+                    [],
+                    ["0-2"],
+                    [0, 2],
                 ],
             },
-            RecomputePolicy(region_patterns=("model.layers.*.mlp",)),
         )
 
         self.assertEqual(
-            [case.topology.get("recompute") for case in cases],
+            [case.topology.get("recompute_layer") for case in cases],
             [
                 None,
-                {"layer_count": 0},
-                {"layer_count": 3},
-                {"layer_indices": [0, 2]},
+                [],
+                [0, 1, 2],
+                [0, 2],
             ],
         )
 
@@ -1686,7 +1642,7 @@ class TestModelIntegrationContracts(unittest.TestCase):
                 "  resume_split_step: 5\n"
                 "  shared_initial_checkpoint: true\n"
                 "  baseline: {tp: 2, cp: 1, ep: 16, fsdp: 8, "
-                "recompute: {layer_indices: [0, 1, 2, 3]}}\n"
+                "recompute_layer: [0, 1, 2, 3]}\n"
                 "  same_topology_resume: true\n",
                 encoding="utf-8",
             )
@@ -1698,7 +1654,7 @@ class TestModelIntegrationContracts(unittest.TestCase):
                 "ep": 16,
                 "fsdp": 8,
                 "sequence_parallel": True,
-                "recompute": {"layer_indices": [0, 1, 2, 3]},
+                "recompute_layer": [0, 1, 2, 3],
             }
             ordinary_case = SimpleNamespace(
                 name="baseline",
@@ -1775,8 +1731,8 @@ class TestModelIntegrationContracts(unittest.TestCase):
         self.assertIn("--accelerator.ep_size=16", ordinary_argv)
         self.assertIn("--fsdp_config.dp_shard_size=8", ordinary_argv)
         self.assertIn(
-            "--activation_checkpoint.selection={'source': "
-            "'model_adapter_safe_regions', 'layer_indices': [0, 1, 2, 3]}",
+            "--activation_checkpoint={'mode': 'full', 'full': "
+            "{'recompute_layer': [0, 1, 2, 3]}}",
             ordinary_argv,
         )
         self.assertIn("--training.train_iters=10", ordinary_argv)

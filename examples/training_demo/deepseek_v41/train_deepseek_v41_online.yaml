@@ -221,13 +221,15 @@ mixed_precision:
   enabled: false
 
 activation_checkpoint:
-  # Fully recompute each selected region, limited to 20 of 40 decoder layers.
+  # Fully recompute the first 20 of 40 decoder layers.
   mode: "full"
-  selection:
-    source: model_adapter_safe_regions
-    layer_count: 20
-
-activation_swap: none
+  full:
+    recompute_layer: [0-19]
+    exclude_region:
+      save:
+        # Full attention sources stay outside replay, matching the model's
+        # shared-state contract. Layer 20 is not checkpointed here.
+        self_attn: [2, 8, 14]
 
 compile:
   enabled: false

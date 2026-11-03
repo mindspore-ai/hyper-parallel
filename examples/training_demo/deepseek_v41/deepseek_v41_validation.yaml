@@ -2,8 +2,8 @@
 schema_version: 2
 
 model:
-  # ModelAdapterSpec identity. It selects model-owned structure, parity, and
-  # recompute contracts; model construction remains in launcher.config.
+  # ModelAdapterSpec identity. It selects model-owned structure and parity
+  # contracts; model construction remains in launcher.config.
   adapter: deepseek_v41
   # Replace these local paths before inspect/check. A Hugging Face URL alone is
   # first cloned with GIT_LFS_SKIP_SMUDGE=1; validation never fetches weights.
@@ -59,8 +59,8 @@ matrix:
     fsdp: 16
     # Whether TP also shards sequence activations.
     sequence_parallel: false
-    # Adapter-owned activation-checkpoint layer selection.
-    recompute: {layer_count: 0}
+    # Explicit full-checkpoint layer set; empty means activation checkpointing is off.
+    recompute_layer: []
 
   # Generate one-factor-at-a-time cases. Values equal to the baseline are
   # de-duplicated, so this entry adds the EP16 comparison.
@@ -88,12 +88,12 @@ matrix:
       fsdp: 16
       sequence_parallel: false
 
-  # Generate exact count-based and index-based safe-region recompute cases.
-  recompute_selections:
-    - {layer_count: 0}
-    - {layer_count: 2}
-    - {layer_indices: [0, 1, 2, 3]}
-  # Fixed topology used while only the recompute selection changes. This deliberately
+  # Generate exact full-checkpoint layer-set cases using the Trainer schema.
+  recompute_layers:
+    - []
+    - [0-1]
+    - [0, 1, 2, 3]
+  # Fixed topology used while only the recompute layer set changes. This deliberately
   # uses EP16 instead of the EP1 baseline, so these cases use cross_topology limits.
   recompute_topology:
     tp: 1

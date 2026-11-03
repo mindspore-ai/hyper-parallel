@@ -196,8 +196,13 @@ mixed_precision:
 
 activation_checkpoint:
   mode: full #"off"
-
-activation_swap: none
+  full:
+    # Global order: 40 decoder layers followed by 32 vision blocks.
+    recompute_layer: [0-71]
+    exclude_region:
+      save:
+        # Full/Reindex attention sources remain outside decoder replay.
+        self_attn: [2, 8, 14, 20, 24, 28, 32, 36]
 
 compile:
   enabled: false

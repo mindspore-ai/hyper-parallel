@@ -16,9 +16,9 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterable
 
-#: The two CSA2 attention roles that publish cross-layer state.
+# The two CSA2 attention roles that publish indexer outputs.
 _INDEX_SOURCE_ROLES = frozenset({"full", "reindex"})
 
 
@@ -39,31 +39,34 @@ def attention_role(module: Any) -> str | None:
     return "reuse"
 
 
-def configure_shared_state(model: Any, roles: tuple[str, ...]) -> None:
-    """Pin the discrete selection of every recomputed index source.
+def configure_shared_state(
+    model: Any,
+    roles: tuple[str, ...],
+    recompute_modules: Iterable[Any] | None = None,
+) -> None:
+    """Pin discrete indexer selections inside the configured recompute regions.
 
-    The policy keeps the attention roles outside ``roles`` out of the recompute
-    regions and hands the same tuple here, so a pinned selection always belongs
-    to a layer whose forward runs again during backward. The published
-    shared-state entries need no schedule: the state is an input of every
-    region, so the graph keeps it and its entries alive until backward is done
-    with every consumer.
+    Args:
+        model: Constructed model containing shared-compressed attention modules.
+        roles: CSA2 roles whose indexer selection needs replay protection.
+        recompute_modules: Modules that execute during checkpoint replay. When
+            omitted, all modules matching ``roles`` are configured.
     """
+    recompute_module_ids = (
+        None if recompute_modules is None else {id(module) for module in recompute_modules}
+    )
+
     for module in model.modules():
         role = attention_role(module)
-        if role in _INDEX_SOURCE_ROLES and role in roles:
-            _pin_regions(module)
+        if role not in _INDEX_SOURCE_ROLES or role not in roles:
+            continue
+        if recompute_module_ids is not None and id(module) not in recompute_module_ids:
+            continue
+        _pin_regions(module)
 
 
 def _pin_regions(module: Any) -> None:
-    """Turn the discrete selection of one recomputed index source into a region.
-
-    The selection is the only pinned block: recomputing it must not choose a
-    different Top-K set, and the block contains differentiable ops, whose
-    saved-tensor count has to match between the forward pass and the
-    recomputation. The compressor and the indexer projections recompute with the
-    rest of the layer.
-    """
+    """Keep a recomputed index source's discrete selection fixed across replay."""
     indexer = getattr(module, "indexer", None)
     if indexer is not None:
         indexer.enable_selection_exclude()

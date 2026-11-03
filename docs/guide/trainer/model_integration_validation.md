@@ -136,9 +136,9 @@ Trainer 生命周期。获得足够资源后，再使用完整 config/checkpoint
 
 模型接入验证用于回答四个不同层次的问题：最终构建出来的模型结构是否安全、替换后的关键模块是否与权威实现一致、优化路径相对公平基线是否同时满足精度和性能目标、同一训练状态在不同并行策略下是否保持精度自洽。它不会替代普通训练配置，也不会在运行时猜测某个模型族的语义。
 
-模型主体语义由正式 architecture 实现；模型特定的验证契约和安全重计算边界分别由
-`ModelAdapterSpec.validation` 与 `ModelAdapterSpec.recompute` 声明。通用工具只负责执行、采证、比较和
-报告。新增模型不需要在 Trainer、CLI 或诊断模块中加入模型名、类名或 FQN 特判。
+模型主体语义由正式 architecture 实现；模型特定的验证契约由
+`ModelAdapterSpec.validation` 声明。activation checkpoint 的目标选择则完全由 Trainer recipe 使用显式层号和模块路径配置；模型 adapter 的后置 hook 只能设置已选目标所需的 replay 不变量，不能推断或扩展目标。
+通用工具只负责执行、采证、比较和报告。新增模型不需要在 Trainer、CLI 或诊断模块中加入模型名、类名或 FQN 特判。
 
 本文统一使用三个容易混淆的术语：
 
@@ -415,49 +415,36 @@ case = ModuleParityCase(
 
 当参考仓与生产环境存在模块名冲突或只能在独立解释器中导入时，使用 `execution="isolated_process"` 和 `isolated_runner`。DeepSeek-V4.1 的 Engram、MoE 和 CSA2 就采用这一方式。
 
-### 3.4 安全重计算区域
+### 3.4 显式激活内存区域
 
-共享跨层状态的 producer/consumer 可以参与重算，但重算路径上有两类动作必须先处理掉：**只需执行一次的副作用**（写跨层状态）和**离散且不可复现的选择**（Top-K / 候选池）。模型 adapter 用一份声明同时描述"哪些模块成为区域"和"哪些后代必须留在重算之外"，并用 `on_applied` 安装依赖最终区域形状的运行期行为（例如给会被重算的层 pin 选区）：
+Trainer 不再从模型 adapter 猜测重算区域。模型完成模块替换和并行适配后，框架按稳定的 layer 顺序编号；recipe 必须使用 layer 相对模块路径显式声明整层重算、排除保存、排除 swap 或 selective wrapper。模块路径必须精确命中 `nn.Module`，不支持 glob、正则或自动回退。
 
-```python
-from hyper_parallel.models.adapter_spec import RecomputePolicy
-
-
-def build_recompute_policy():
-    """整层一个区域；attention 的重算范围由同一张角色表派生。"""
-    recomputed = ("full", "reindex", "reuse")
-    return RecomputePolicy(
-        region_patterns=("model.layers.*",),
-        exclude_predicate=...,                                       # 角色不在 recomputed 里的 attention 留在区域外
-        on_applied=...,                                              # 给会被重算的 index source pin 选区
-    )
-```
-
-DeepSeek-V4.1 把它写成 `models/deepseek_v41/adapter/policies/activation_checkpointing.py` 里的一档开关：`ATTENTION_RECOMPUTE_TIER` 取 `reuse`（默认）/ `reuse_reindex` / `all` / `none`，不在重算范围里的角色由同一张角色表派生为 `exclude_predicate`，会重算的 index source 由同一个元组派给 `configure_shared_state` 去 pin 选区。默认 `reuse`：只读跨层状态的层随层重算，Full/Reindex 这类生产者留在区域外保留激活。`configure_shared_state` 把 indexer 的离散选择 pin 成 exclude 区域，重算复用正向选出的集合，也避免"跳过一段可微代码"破坏 checkpoint 的张量数不变量。跨层状态本身不需要调度——它作为重算区域的输入被 checkpoint 持有，发布出去的条目随它活到反向结束，而 `publish_*` 只在正向执行（`is_recomputing()` 判定），重算不会写第二次。pin 只覆盖离散选择：选区之外的 compressor、indexer 投影按档位随层重算或留在区域外。
-
-`region_patterns` 取**最外层匹配**作为区域根：写成整层模式时一个区域只保存一份层输入，写成 `model.layers.*.mlp` 这类叶子模块模式时则每个模块各自成区域（此时 `exclude_patterns` 一般留空）。`exclude_patterns` 必须命中区域根的后代，否则直接报错；同一个模块也不能既是区域根又被排除。`on_applied` 是区域装好后的模型自有钩子，用于开启依赖最终区域形状的运行时行为（例如 DeepSeek-V4.1 用它给会被重算的层安装选区 pin）。
-
-Trainer recipe 通过通用配置选择该策略：
+例如，前两层整层重算，其中 `module_a` 保存、`module_b` swap；后两层分别做 selective 重算和 swap：
 
 ```yaml
 activation_checkpoint:
-  mode: selective
-  selection:
-    source: model_adapter_safe_regions
-    layer_count: 16
+  mode: hybrid
+  full:
+    recompute_layer: [0-1]
+    exclude_region:
+      save:
+        module_a: [0]
+      swap:
+        group_swap: false
+        cpu_pool: 512
+        module_b: [0-1]
+  selective:
+    recompute:
+      module_a: [2]
+    swap:
+      group_swap: true
+      cpu_pool: 512
+      module_b: [3]
 ```
 
-`layer_count` 按所有已发现 layer container 的展平顺序，从下标 `0` 开始连续选择指定数量的层；例如 `layer_count: 2` 选择第 `0、1` 层，`0` 表示不选择任何层。需要选择非连续层时使用与其互斥的 `layer_indices`：
+层集合支持非负整数和闭区间，例如 `[0,2-3]` 表示第 `0、2、3` 层。`cpu_pool` 的单位是 MiB；full exclude swap 与 selective swap 分别创建独立的 pinned-memory pool。`mode: hybrid` 要求 full layer 与所有 selective target layer 完全不相交。
 
-```yaml
-activation_checkpoint:
-  mode: selective
-  selection:
-    source: model_adapter_safe_regions
-    layer_indices: [0, 4, 8, 12]
-```
-
-`layer_indices` 从 `0` 开始，必须非空、非负且不重复。`source: default` 不接受这两个字段。
+所有 active layer/path 会在安装 wrapper 前一次性解析和校验。层号越界、路径不存在、目标不是 `nn.Module`、父子路径嵌套或 save/swap 冲突都会在训练开始前报错，且 resolve 失败不会修改模型树。
 
 ## 4. 编写验证清单
 
@@ -496,16 +483,16 @@ matrix:
     ep: 1
     fsdp: 16
     sequence_parallel: false
-    recompute: {layer_count: 0}
+    recompute_layer: []
   axes:
     ep: [1, 16]
   combined:
     - {tp: 2, cp: 1, ep: 16, fsdp: 8, sequence_parallel: true}
     - {tp: 1, cp: 2, ep: 16, fsdp: 16, sequence_parallel: false}
-  recompute_selections:
-    - {layer_count: 0}
-    - {layer_count: 2}
-    - {layer_indices: [0, 1, 2, 3]}
+  recompute_layers:
+    - []
+    - [0-1]
+    - [0, 1, 2, 3]
   recompute_topology: {tp: 1, cp: 1, ep: 16, fsdp: 16}
   same_topology_resume: true
   cross_topology_resume: {tp: 2, cp: 1, ep: 16, fsdp: 8}
@@ -549,19 +536,19 @@ acceptance:
 | `baseline` | 所有用例的参考拓扑 |
 | `axes` | 每次只覆盖一个字段，重复 baseline 的值会去重 |
 | `combined` | 显式覆盖多个 baseline 字段的混合策略 |
-| `recompute_selections` | 安全区域重计算的精确层数或层下标；每项只能包含 `layer_count` 或 `layer_indices` |
+| `recompute_layers` | full checkpoint 的显式层集合；每项使用与 `activation_checkpoint.full.recompute_layer` 相同的整数/闭区间语法，空列表表示关闭 |
 | `recompute_topology` | 运行重计算选择组时覆盖的固定拓扑 |
 | `production_validate_pair` | 同一拓扑分别设置 `model.validate_placement=false/true` |
 | `same_topology_resume` | baseline 拓扑保存并恢复 |
 | `cross_topology_resume` | baseline 拓扑保存、目标拓扑恢复 |
 
-标准 launcher 只接受 `tp`、`cp`、`ep`、`fsdp`、`sequence_parallel` 和 `recompute`。无法映射到 Trainer 命令的字段会直接报错，不会生成“命令相同但看似通过”的空转用例。
+标准 launcher 只接受 `tp`、`cp`、`ep`、`fsdp`、`sequence_parallel` 和 `recompute_layer`。无法映射到 Trainer 命令的字段会直接报错，不会生成“命令相同但看似通过”的空转用例。
 
 编写 matrix 前必须先建立 coverage ledger：逐项列出模型实际支持的并行轴、关键混合拓扑、重计算层选择、同/跨拓扑恢复、Production/Validate，以及多模态模型的 language/vision/projector/fusion 子树。每项只能是正式用例或带证据的排除项。`--generate-only` 后将 ledger 与 `cases/resolved_cases.json` 逐项对账，并分别统计 baseline、策略泛化、重计算、resume 和 Production/Validate；重计算和 resume 不计入策略泛化数量。只执行了一个策略候选时，即使另有两个重计算和两个 resume 用例，也只能报告一组策略泛化。
 
 多模态模型还必须记录各子树的实际 placement。ViT 在含 TP 的进程组里完成前向反向、但其参数沿 TP 为 `Replicate()` 时，只能证明“多模态路径与语言 TP 可组合”，不能报告为 ViT TP 覆盖。算子支持也按 dispatcher 截获的精确 callable key 审计；`npu_rms_norm` 不能替代 `rms_norm`，`conv3d` 不能替代 `conv1d`/`conv2d`。
 
-验收档位根据实际启动的 TP/CP/EP/FSDP/sequence-parallel 与 baseline 是否相同自动选择。重计算层选择本身不构成并行拓扑变化；如果 `recompute_topology` 改了 EP 等字段，则该组使用 `cross_topology` 阈值。`cross_topology_resume` 必须真正改变至少一个并行字段，当前不提供“只切换重计算策略后恢复”的用例。
+验收档位根据实际启动的 TP/CP/EP/FSDP/sequence-parallel 与 baseline 是否相同自动选择。重计算层集合本身不构成并行拓扑变化；如果 `recompute_topology` 改了 EP 等字段，则该组使用 `cross_topology` 阈值。`cross_topology_resume` 必须真正改变至少一个并行字段，当前不提供“只切换重计算策略后恢复”的用例。
 
 标量支持绝对阈值与相对阈值。默认 `combination: all`；显式设为 `any` 时，比较器分别判断 loss 和 norm 的“绝对或相对误差满足其一”，然后仍要求 loss、裁剪前 norm、裁剪后 norm、输入身份、LR 和有限性全部通过。不能用 loss 的相对阈值替代 norm 失败，也不能用 `any` 绕过数据身份门禁。
 
@@ -778,7 +765,7 @@ DeepSeek-V4.1 的模型主体和优化路径是一一对应、但彼此不互相
 `use_optimized_sparse_attention=False`，candidate 固定为 `True`。provider 只登记 factory；当前 demo 是 recipe
 显式选择三项 replacement。删掉这些条目时模型仍能 forward/backward，并回退到未优化 reference path。
 
-示例 `recompute_topology` 使用 EP16，而 baseline 使用 EP1，因此重计算组刻意按跨拓扑阈值比较。如果目标是单独验证重计算开关，应让 `recompute_topology` 的并行字段与 baseline 相同。
+示例 `recompute_topology` 使用 EP16，而 baseline 使用 EP1，因此重计算组刻意按跨拓扑阈值比较。如果目标是单独验证显式重计算层集合，应让 `recompute_topology` 的并行字段与 baseline 相同。
 
 ## 9. 常见失败与处理
 

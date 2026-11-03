@@ -34,44 +34,6 @@ from typing import Any, Callable, Optional
 
 
 @dataclass(frozen=True)
-class RecomputePolicy:
-    """Model-owned activation-checkpoint regions used by normal training.
-
-    One declaration covers both region shapes a model may need:
-
-    * ``region_patterns`` names the modules that become checkpoint regions. The
-      outermost match inside every selected layer is used, so a pattern set of
-      leaf submodules keeps one region per submodule while a layer pattern wraps
-      the whole layer and saves a single copy of the layer input.
-    * ``exclude_patterns`` names descendants that must stay outside the
-      recompute region, for a submodule whose forward may not run a second time
-      at all. A cross-layer state producer or consumer does not need an
-      exclusion: a model may instead guard its state writes with
-      ``is_recomputing()`` and pin the discrete results a recompute has to
-      reuse, as DeepSeek-V4.1 does for its indexer selection.
-
-    A module may not be a region root and an excluded descendant at the same
-    time, and an excluded module may not contain a region root. Layer coverage
-    is selected independently through the Trainer's activation-checkpoint
-    config.
-
-    ``on_applied`` lets a model enable runtime behaviour that depends on the
-    region shape finally installed, for example pinning the discrete selection
-    of every layer that will be recomputed.
-
-    ``exclude_predicate`` complements the patterns with an attribute rule that a
-    path cannot express, such as "keep the attention of every role that does not
-    recompute out of the region". It receives ``(module_fqn, module)`` and is
-    evaluated together with ``exclude_patterns``.
-    """
-
-    region_patterns: tuple[str, ...]
-    exclude_patterns: tuple[str, ...] = ()
-    exclude_predicate: Optional[Callable[[str, Any], bool]] = None
-    on_applied: Optional[Callable[[Any], None]] = None
-
-
-@dataclass(frozen=True)
 class ModelAdapterSpec:
     """Architecture identity + adapter providers for one model family.
 
@@ -111,8 +73,9 @@ class ModelAdapterSpec:
             selected child-unit FQN, then returning their first-forward
             execution order. This lets conditional multimodal models override
             module-registration order for FSDP communication prefetching.
-        recompute: provider returning normal-training activation-checkpoint
-            policy. This must not depend on validation-only imports.
+        activation_checkpointing: optional post-install provider for model-specific
+            replay invariants. It receives the built model after activation checkpoint
+            wrappers have been installed and must return ``None``.
         validation: lazy provider returning the family's ``ModelValidationSpec``.
             Normal training never calls it; authoritative repositories and
             validation-only dependencies therefore stay outside import paths.
@@ -136,7 +99,7 @@ class ModelAdapterSpec:
     fsdp_wrap_modules: Optional[Callable[..., Any]] = None
     fsdp_excluded_subtrees: Optional[Callable[..., Any]] = None
     fsdp_execution_order: Optional[Callable[..., Any]] = None
-    recompute: Optional[Callable[..., RecomputePolicy]] = None
+    activation_checkpointing: Optional[Callable[[Any], None]] = None
     validation: Optional[Callable[..., Any]] = None
     loss: Optional[Callable[..., Any]] = None
     encoder_parallel: Optional[Callable[..., Any]] = None

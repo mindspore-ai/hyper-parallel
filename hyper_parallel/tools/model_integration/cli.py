@@ -68,7 +68,6 @@ from hyper_parallel.tools.model_integration.integration_validator import (
     validate_final_model,
 )
 from hyper_parallel.models.registry import get_model_adapter
-from hyper_parallel.models.adapter_spec import RecomputePolicy
 from hyper_parallel.models.validation_spec import ModelValidationSpec
 
 
@@ -301,7 +300,7 @@ def command_scaffold(args: argparse.Namespace) -> int:
             "matrix:\n"
             "  devices: 1\n"
             "  steps: 10\n"
-            '  baseline: {tp: 1, cp: 1, ep: 1, fsdp: 1, recompute: "off"}\n'
+            '  baseline: {tp: 1, cp: 1, ep: 1, fsdp: 1, recompute_layer: []}\n'
             "acceptance:\n  same_topology: {loss_max_abs: 0.0, norm_max_abs: 0.0}\n"
         ),
         destination / "test_registration.py": _LICENSE
@@ -409,18 +408,6 @@ def _validation_spec(manifest: ValidationManifest) -> ModelValidationSpec:
     if not isinstance(validation_spec, ModelValidationSpec):
         raise ManifestError("adapter validation provider returned the wrong type")
     return validation_spec
-
-
-def _recompute_policy(manifest: ValidationManifest) -> Optional[RecomputePolicy]:
-    """Resolve normal-training recompute policy for precision case generation."""
-    adapter = get_model_adapter(manifest.family)
-    provider = None if adapter is None else adapter.recompute
-    if provider is None:
-        return None
-    recompute_policy = provider()
-    if not isinstance(recompute_policy, RecomputePolicy):
-        raise ManifestError("adapter recompute provider returned the wrong type")
-    return recompute_policy
 
 
 def _parameter_tolerance(
@@ -611,11 +598,11 @@ def _trainer_launch_argv(
         "accelerator.ep_size": topology.get("ep", 1),
         "accelerator.sequence_parallel": topology.get("sequence_parallel", False),
         "fsdp_config.dp_shard_size": topology.get("fsdp", 1),
-        "activation_checkpoint.mode": "selective",
-        "activation_checkpoint.selection": {
-            "source": "model_adapter_safe_regions",
-            **topology.get("recompute", {"layer_count": 0}),
-        },
+        "activation_checkpoint": (
+            {"mode": "full", "full": {"recompute_layer": topology["recompute_layer"]}}
+            if topology.get("recompute_layer")
+            else {"mode": "off"}
+        ),
         "model_integration.mode": "runtime",
     }
     if "validate_placement" in topology:
@@ -943,7 +930,6 @@ def command_validate(args: argparse.Namespace) -> int:
     try:
         cases = generate_validation_cases(
             manifest.matrix,
-            _recompute_policy(manifest),
             validation_spec.topology_constraints,
         )
     except (TypeError, ValueError) as error:

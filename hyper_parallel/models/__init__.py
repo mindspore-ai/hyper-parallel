@@ -47,7 +47,6 @@ if TYPE_CHECKING:
         HyperAutoModelForImageTextToText,
         HyperAutoModelForSequenceClassification,
     )
-    from hyper_parallel.models.adapter_spec import RecomputePolicy
     from hyper_parallel.models.materialization import (
         MaterializationContext,
         MaterializationReason,
@@ -117,7 +116,6 @@ __all__ = [
     "ObservationSpec",
     "ParameterProbeSpec",
     "RebuildableBufferSpec",
-    "RecomputePolicy",
     "SharedStateValidationSpec",
     "StateInvariantSpec",
     "TopologyConstraint",
@@ -149,8 +147,6 @@ def __getattr__(name):  # pylint: disable=invalid-name
         return value
     if name == "ModelAdapterSpec":
         return importlib.import_module(".adapter_spec", __name__).ModelAdapterSpec
-    if name == "RecomputePolicy":
-        return importlib.import_module(".adapter_spec", __name__).RecomputePolicy
     if name in ("get_model_adapter", "register_model_adapter"):
         return getattr(importlib.import_module(".registry", __name__), name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

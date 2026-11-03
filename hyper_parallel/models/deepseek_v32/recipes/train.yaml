@@ -66,8 +66,8 @@ mixed_precision:
 
 activation_checkpoint:
   mode: full
-
-activation_swap: none
+  full:
+    recompute_layer: [0-60]
 
 compile:
   enabled: false

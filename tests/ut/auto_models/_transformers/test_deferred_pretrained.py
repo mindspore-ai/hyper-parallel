@@ -56,6 +56,18 @@ class TestDeferredPretrained(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_removed_activation_swap_option_is_rejected(self):
+        """The standalone activation-swap option must not pass through generic kwargs."""
+        with self.assertRaisesRegex(ValueError, "activation_swap has been removed"):
+            HyperAutoModelForImageTextToText._build_model(
+                None, is_hf_model=False, hf_config=None, mesh=None, sharding_planner=None,
+                fsdp2_manager=None, backend=None, peft_config=None, torch_dtype=torch.float32,
+                attn_implementation="eager", validate_placement=False, load_base_model=False,
+                activation_swap="attention",
+            )
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_loader_selects_initial_construction_and_preserves_final_load(self):
         """Feature: automatic deferred HF loading.
 

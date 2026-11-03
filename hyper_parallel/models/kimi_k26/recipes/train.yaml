@@ -150,12 +150,10 @@ mixed_precision:
 
 activation_checkpoint:
   mode: full
-  # Activation offload (boundary inputs -> host). Needed for headroom: with 8 images
-  # kept per sample the vision activations are large. NOTE the effective key is HERE;
-  # a `swap_inputs` in the model: section is accepted but silently dropped.
-  swap_inputs: false
-
-activation_swap: none
+  full:
+    # Global discovery visits the frozen 27-layer vision tower first, then the
+    # 61-layer language tower. Recompute only the trainable text decoder.
+    recompute_layer: [27-87]
 
 compile:
   enabled: false

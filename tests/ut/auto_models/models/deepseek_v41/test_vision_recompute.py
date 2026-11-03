@@ -17,7 +17,6 @@
 import copy
 import sys
 import unittest
-import warnings
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -35,9 +34,17 @@ from hyper_parallel.distributed.encoder_parallel.attention import (
     current_encoder_attention_context,
     encoder_attention_checkpoint_contexts,
 )
-from hyper_parallel.models._transformers.model_builder import validate_model_init_dtype
 from hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel import DeepseekV41VisionBridge
+from hyper_parallel.models._transformers.model_builder import (
+    _apply_activation_features,
+    validate_model_init_dtype,
+)
 from hyper_parallel.models.deepseek_v41.vision import DeepseekV41VisionTower, _vision_attention
+from hyper_parallel.trainer.config.parallelism import (
+    ActivationCheckpointConfig,
+    FullCheckpointConfig,
+    SelectiveCheckpointConfig,
+)
 from tests.common.mark_utils import arg_mark
 
 
@@ -125,7 +132,14 @@ class TestVisionRecompute(unittest.TestCase):
         torch.manual_seed(1385)
         model = _vision_model()
         expected = copy.deepcopy(model.model.vision)
-        _apply_activation_checkpointing(model, "full")
+        _apply_activation_features(
+            model,
+            ActivationCheckpointConfig(
+                mode="full",
+                full=FullCheckpointConfig(recompute_layer=["0-1"]),
+            ),
+            compile_for_execution=False,
+        )
         tower = model.model.vision
         replay_hooks = [Mock(return_value=None) for _ in tower.blocks]
         for block, hook in zip(tower.blocks, replay_hooks):
@@ -134,7 +148,9 @@ class TestVisionRecompute(unittest.TestCase):
             self.assertIs(block.checkpoint_kwargs["early_stop"], False)
             handle = block.get_submodule("_wrapped_module").register_forward_hook(hook)
             self.addCleanup(handle.remove)
-        DeepseekV41VisionBridge(model).validate_training({"micro_batch_size": 1, "loss_parallel": False})
+        DeepseekV41VisionBridge(model).validate_training(
+            {"micro_batch_size": 1, "loss_parallel": False}
+        )
         patches = torch.randn(4, 3, 2, 2, requires_grad=True)
         reference_patches = patches.detach().clone().requires_grad_()
         actual = tower(patches, 2, 2)
@@ -150,24 +166,24 @@ class TestVisionRecompute(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_encoder_rejects_nested_checkpoint_even_with_supported_block(self) -> None:
-        """Feature: Encoder checkpoint collective safety validation.
-
-        Description: Add an independently checkpointed attention inside a safe block.
-        Expectation: Validation rejects the nested checkpoint instead of allowing unsafe replay.
-        """
+    def test_runtime_rejects_nested_checkpoint_on_an_already_wrapped_block(self) -> None:
+        """A second activation configuration should reject an already wrapped target."""
         model = _vision_model()
-        _apply_activation_checkpointing(model, "full")
-        block = model.model.vision.blocks[0]
-        wrapped = block.get_submodule("_wrapped_module")
-        # assertWarns inspects every loaded module and resolves optional HF/NPU imports.
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always", UserWarning)
-            wrapped.attn = CheckpointWrapper(wrapped.attn)
-        self.assertTrue(any(issubclass(item.category, UserWarning) and "already wrapped" in str(item.message)
-                            for item in caught))
-        with self.assertRaisesRegex(RuntimeError, "context-preserving full vision-block checkpoints"):
-            DeepseekV41VisionBridge(model).validate_training({"micro_batch_size": 1})
+        _apply_activation_checkpointing(
+            model,
+            ActivationCheckpointConfig(
+                mode="full",
+                full=FullCheckpointConfig(recompute_layer=[0]),
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "existing activation wrapper|already covered"):
+            _apply_activation_checkpointing(
+                model,
+                ActivationCheckpointConfig(
+                    mode="selective",
+                    selective=SelectiveCheckpointConfig(recompute={"attn": [0]}),
+                ),
+            )
 
 
 class TestVisionAttention(unittest.TestCase):

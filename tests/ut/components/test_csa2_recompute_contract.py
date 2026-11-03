@@ -31,7 +31,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any
-from unittest import mock
 
 import torch
 from torch import nn
@@ -43,9 +42,9 @@ from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedDSAAttentionBase,
     SharedCompressedDSAIndexer,
 )
-from hyper_parallel.core.activation_memory.api import checkpoint_wrapper
-from hyper_parallel.models.deepseek_v41.adapter.policies import (
-    activation_checkpointing as attention_policy,
+from hyper_parallel.core.activation_memory.api import checkpoint_exclude_wrapper, checkpoint_wrapper
+from hyper_parallel.models.deepseek_v41.adapter.policies.activation_checkpointing import (
+    configure_deepseek_v41_activation_checkpointing,
 )
 from hyper_parallel.models.deepseek_v41.adapter.policies.shared_state import (
     attention_role,
@@ -327,68 +326,42 @@ def test_checkpointed_index_source_matches_plain_and_writes_state_once():
 
 
 class _FakeIndexer:
-    """Minimal indexer that records whether the selection pin was installed."""
+    """Record whether the discrete selection exclusion was installed."""
 
     def __init__(self) -> None:
-        """Start unpinned until the model-owned hook decides otherwise."""
         self.selection_pinned = False
 
     def enable_selection_exclude(self) -> None:
-        """Record that the hook pinned the discrete selection."""
         self.selection_pinned = True
 
 
-class _FakeAttention(nn.Module):
-    """Attention stand-in exposing the attributes the CSA2 roles read."""
-
-    def __init__(self, layer_idx: int, *, kv_source: bool = False, index_source: bool = False) -> None:
-        """Describe one layer stand-in of a CSA2 role."""
-        super().__init__()
-        self.compress_ratio = 1
-        self.layer_idx = layer_idx
-        self.is_kv_source = kv_source
-        self.is_index_source = index_source
-        self.indexer = _FakeIndexer() if index_source else None
+def _fake_attention(*, kv_source: bool = False, index_source: bool = False) -> nn.Module:
+    """Create one attention role for model-adapter hook coverage."""
+    module = nn.Module()
+    module.layer_idx = 0
+    module.compress_ratio = 1
+    module.is_kv_source = kv_source
+    module.is_index_source = index_source
+    module.indexer = _FakeIndexer() if index_source else None
+    return module
 
 
-def _role_model():
-    """Return a stand-in model with one attention per CSA2 role."""
-    attentions = {
-        "full": _FakeAttention(2, kv_source=True, index_source=True),
-        "reindex": _FakeAttention(24, index_source=True),
-        "reuse": _FakeAttention(25),
-    }
+def test_shared_state_pin_is_limited_to_checkpointed_index_sources():
+    """Protect discrete choices only for source attention inside recompute roots."""
+    full_source = _fake_attention(kv_source=True, index_source=True)
+    reindex_source = _fake_attention(index_source=True)
+    reuse = _fake_attention()
     model = nn.Module()
-    model.norm = nn.LayerNorm(HIDDEN)
-    model.layers = nn.ModuleList(list(attentions.values()))
-    return model, attentions
+    excluded_layer = nn.Module()
+    excluded_layer.self_attn = checkpoint_exclude_wrapper(reindex_source)
+    model.layers = nn.ModuleList(
+        (checkpoint_wrapper(full_source), checkpoint_wrapper(excluded_layer), reuse)
+    )
 
+    configure_deepseek_v41_activation_checkpointing(model)
 
-_RECOMPUTE_TIERS = (
-    # tier, roles kept out of the recompute, index sources that recompute and get pinned
-    ("none", ("full", "reindex", "reuse"), ()),
-    ("reuse", ("full", "reindex"), ()),
-    ("reuse_reindex", ("full",), ("reindex",)),
-    ("all", (), ("full", "reindex")),
-)
-
-
-def _keeps_out_of_recompute(policy, module: nn.Module) -> bool:
-    """Return whether one policy keeps a module outside the recompute regions."""
-    predicate = policy.exclude_predicate
-    return bool(predicate is not None and predicate("layer.self_attn", module))
-
-
-def test_recompute_tiers_exclude_and_pin_one_role_set():
-    """The tier selects which attentions recompute and which of them get pinned."""
-    for tier, resident, pinned in _RECOMPUTE_TIERS:
-        with mock.patch.object(attention_policy, "ATTENTION_RECOMPUTE_TIER", tier):
-            policy = attention_policy.build_recompute_policy()
-            model, attentions = _role_model()
-            policy.on_applied(model)
-
-            assert not _keeps_out_of_recompute(policy, model.norm)
-            for role, attention in attentions.items():
-                assert attention_role(attention) == role
-                assert _keeps_out_of_recompute(policy, attention) == (role in resident)
-                assert bool(getattr(attention.indexer, "selection_pinned", False)) == (role in pinned)
+    assert attention_role(full_source) == "full"
+    assert attention_role(reindex_source) == "reindex"
+    assert attention_role(reuse) == "reuse"
+    assert full_source.indexer.selection_pinned
+    assert not reindex_source.indexer.selection_pinned

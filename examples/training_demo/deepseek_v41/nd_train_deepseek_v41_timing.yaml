@@ -202,10 +202,6 @@ mixed_precision:
   enabled: false
 activation_checkpoint:
   mode: 'off'
-  selection:
-    source: model_adapter_safe_regions
-    layer_count: 0
-activation_swap: none
 compile:
   enabled: false
   mode: default

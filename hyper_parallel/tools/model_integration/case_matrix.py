@@ -21,8 +21,8 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable, Mapping, Optional
 
-from hyper_parallel.models.adapter_spec import RecomputePolicy
 from hyper_parallel.models.validation_spec import TopologyConstraint
+from hyper_parallel.trainer.config.parallelism import FullCheckpointConfig
 
 _TOPOLOGY_DEFAULTS = {
     "tp": 1,
@@ -30,7 +30,7 @@ _TOPOLOGY_DEFAULTS = {
     "ep": 1,
     "fsdp": 1,
     "sequence_parallel": False,
-    "recompute": {"layer_count": 0},
+    "recompute_layer": [],
 }
 _PARALLEL_TOPOLOGY_FIELDS = (
     "tp",
@@ -57,59 +57,29 @@ class ValidationCase:
 
 
 def _case_name(topology: Mapping[str, Any], prefix: str = "") -> str:
-    ordered = (*_PARALLEL_TOPOLOGY_FIELDS, "recompute")
+    ordered = (*_PARALLEL_TOPOLOGY_FIELDS, "recompute_layer")
     pieces = []
     for name in ordered:
         if name not in topology:
             continue
         value = topology[name]
-        if name == "recompute" and isinstance(value, Mapping):
-            if "layer_count" in value:
-                value = f"count{value['layer_count']}"
-            elif "layer_indices" in value:
-                value = "indices" + "-".join(str(index) for index in value["layer_indices"])
+        if name == "recompute_layer":
+            value = "off" if not value else "layers" + "-".join(str(index) for index in value)
         pieces.append(f"{name}{value}")
     name = "_".join(str(piece).replace("/", "-") for piece in pieces)
     return f"{prefix}_{name}" if prefix else name
 
 
-def _validate_recompute_selection(selection: Any, path: str) -> dict[str, Any]:
-    """Validate one exact layer-count or layer-index recompute selection."""
-    if not isinstance(selection, Mapping):
-        raise ValueError(f"{path} must be a mapping")
-    unsupported = tuple(
-        name for name in selection if name not in ("layer_count", "layer_indices")
-    )
-    if unsupported:
-        raise ValueError(
-            f"{path} contains unsupported fields {unsupported}; supported fields: "
-            "layer_count, layer_indices"
-        )
-    if ("layer_count" in selection) == ("layer_indices" in selection):
-        raise ValueError(
-            f"{path} must contain exactly one of layer_count or layer_indices"
-        )
-    if "layer_count" in selection:
-        layer_count = selection["layer_count"]
-        if isinstance(layer_count, bool) or not isinstance(layer_count, int) or layer_count < 0:
-            raise ValueError(f"{path}.layer_count must be a non-negative integer")
-        return {"layer_count": layer_count}
-
-    layer_indices = selection["layer_indices"]
-    if not isinstance(layer_indices, list) or not layer_indices:
-        raise ValueError(
-            f"{path}.layer_indices must be a non-empty list of non-negative integers"
-        )
-    if any(
-        isinstance(index, bool) or not isinstance(index, int) or index < 0
-        for index in layer_indices
-    ):
-        raise ValueError(
-            f"{path}.layer_indices must contain only non-negative integers"
-        )
-    if len(set(layer_indices)) != len(layer_indices):
-        raise ValueError(f"{path}.layer_indices must not contain duplicates")
-    return {"layer_indices": list(layer_indices)}
+def _validate_recompute_layers(value: Any, path: str) -> list[int | str]:
+    """Validate one explicit full-checkpoint layer set."""
+    if not isinstance(value, list):
+        raise ValueError(f"{path} must be a list of layer numbers or ranges")
+    if not value:
+        return []
+    try:
+        return list(FullCheckpointConfig(recompute_layer=value).recompute_layers)
+    except ValueError as error:
+        raise ValueError(str(error).replace("activation_checkpoint.full.recompute_layer", path)) from error
 
 
 def _validate_topology(topology: Mapping[str, Any], path: str) -> dict[str, Any]:
@@ -123,10 +93,10 @@ def _validate_topology(topology: Mapping[str, Any], path: str) -> dict[str, Any]
         raise ValueError(
             f"{path} contains unsupported fields {unsupported}; supported fields: {supported}"
         )
-    if "recompute" in resolved:
-        resolved["recompute"] = _validate_recompute_selection(
-            resolved["recompute"],
-            f"{path}.recompute",
+    if "recompute_layer" in resolved:
+        resolved["recompute_layer"] = _validate_recompute_layers(
+            resolved["recompute_layer"],
+            f"{path}.recompute_layer",
         )
     return resolved
 
@@ -200,18 +170,15 @@ def _recompute_cases(
         baseline: Mapping[str, Any],
         seen: set[str],
 ) -> list[ValidationCase]:
-    """Generate one case per requested recompute layer selection."""
-    requested_selections = matrix.get(
-        "recompute_selections",
-        ({"layer_count": 0},),
-    )
-    if not isinstance(requested_selections, (list, tuple)) or not requested_selections:
-        raise ValueError("matrix.recompute_selections must be a non-empty list")
+    """Generate one case per requested full-checkpoint layer set."""
+    requested_layer_sets = matrix.get("recompute_layers") or ()
+    if not isinstance(requested_layer_sets, (list, tuple)):
+        raise ValueError("matrix.recompute_layers must be a list")
     cases = []
-    for index, requested_selection in enumerate(requested_selections):
-        selection = _validate_recompute_selection(
-            requested_selection,
-            f"matrix.recompute_selections[{index}]",
+    for index, requested_layers in enumerate(requested_layer_sets):
+        recompute_layers = _validate_recompute_layers(
+            requested_layers,
+            f"matrix.recompute_layers[{index}]",
         )
         topology = dict(baseline)
         topology.update(
@@ -220,7 +187,7 @@ def _recompute_cases(
                 "matrix.recompute_topology",
             )
         )
-        topology["recompute"] = selection
+        topology["recompute_layer"] = recompute_layers
         key = json.dumps(topology, sort_keys=True)
         if key in seen:
             continue
@@ -339,7 +306,6 @@ def _finalize_cases(
 
 def generate_validation_cases(
     matrix: Mapping[str, Any],
-    recompute_policy: Optional[RecomputePolicy] = None,
     topology_constraints: Iterable[TopologyConstraint] = (),
 ) -> tuple[ValidationCase, ...]:
     """Generate a minimum single-axis-plus-combined validation matrix."""
@@ -351,7 +317,7 @@ def generate_validation_cases(
     seen = {json.dumps(baseline, sort_keys=True)}
     cases.extend(_axis_cases(matrix, baseline, seen))
     cases.extend(_combined_cases(matrix, baseline, seen))
-    if recompute_policy is not None:
+    if matrix.get("recompute_layers"):
         cases.extend(_recompute_cases(matrix, baseline, seen))
     ep1_case = _ep1_fallback_case(cases, baseline)
     if ep1_case is not None:
