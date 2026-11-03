@@ -15,7 +15,6 @@
 """Stage-1 tests: build options surface, Trainer re-export identity, boundaries."""
 # pylint: disable=wrong-import-position
 
-import os
 import subprocess
 import sys
 import unittest
@@ -25,6 +24,7 @@ from pathlib import Path
 
 import torch
 
+from hyper_parallel.components.quantization.config import LowPrecisionConfig
 from hyper_parallel.models.build_options import (
     CompileConfig,
     FSDP2Config,
@@ -32,6 +32,7 @@ from hyper_parallel.models.build_options import (
     ModelBuildOptions,
     normalize_build_options,
 )
+from hyper_parallel.trainer.config.parallelism import ActivationCheckpointConfig
 from tests.common.mark_utils import arg_mark
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -144,16 +145,13 @@ class TestBuildOptionsFields(unittest.TestCase):
             [name for name, _ in _field_snapshot(ModelBuildOptions)],
             [
                 "device", "model_init_dtype", "activation_checkpoint",
-                "activation_swap", "swap_inputs", "compile",
-                "validate_placement", "low_precision",
+                "compile", "validate_placement", "low_precision",
             ],
         )
         options = ModelBuildOptions()
         self.assertIsNone(options.device)
         self.assertIsNone(options.model_init_dtype)
         self.assertIsNone(options.activation_checkpoint)
-        self.assertEqual(options.activation_swap, "none")
-        self.assertFalse(options.swap_inputs)
         self.assertIsInstance(options.compile, CompileConfig)
         self.assertFalse(options.validate_placement)
         self.assertIsNone(options.low_precision)
@@ -173,31 +171,27 @@ class TestModelBuildOptionsNormalization(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     def test_normalize_passthrough_identity(self):
         """An existing ModelBuildOptions is returned unchanged (identity)."""
-        options = ModelBuildOptions(activation_swap="attention")
+        options = ModelBuildOptions()
         self.assertIs(normalize_build_options(options), options)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_from_dict_normalizes_nested(self):
         """Nested compile/low_precision dicts and device strings are normalized."""
+        activation_checkpoint = ActivationCheckpointConfig(mode="off")
         options = normalize_build_options({
             "device": "cpu",
             "model_init_dtype": "bfloat16",
-            "activation_checkpoint": "full",
-            "activation_swap": "attention",
+            "activation_checkpoint": activation_checkpoint,
             "compile": {"enabled": True, "mode": "default"},
             "low_precision": {"enabled": True, "format": "hif8",
                               "scaling": "current"},
         })
         self.assertEqual(options.device, torch.device("cpu"))
         self.assertEqual(options.model_init_dtype, "bfloat16")
-        self.assertEqual(options.activation_checkpoint, "full")
-        self.assertEqual(options.activation_swap, "attention")
+        self.assertIs(options.activation_checkpoint, activation_checkpoint)
         self.assertIsInstance(options.compile, CompileConfig)
         self.assertTrue(options.compile.enabled)
-        from hyper_parallel.components.quantization.config import (
-            LowPrecisionConfig,
-        )
         self.assertIsInstance(options.low_precision, LowPrecisionConfig)
         self.assertTrue(options.low_precision.enabled)
 
@@ -209,10 +203,6 @@ class TestModelBuildOptionsNormalization(unittest.TestCase):
             ModelBuildOptions(model_init_dtype="float64")
         with self.assertRaisesRegex(ValueError, "activation_checkpoint"):
             ModelBuildOptions(activation_checkpoint="aggressive")
-        with self.assertRaisesRegex(ValueError, "activation_swap"):
-            ModelBuildOptions(activation_swap="all")
-        with self.assertRaisesRegex(TypeError, "swap_inputs must be a bool"):
-            ModelBuildOptions(swap_inputs=1)
         with self.assertRaisesRegex(TypeError, "validate_placement must be a bool"):
             ModelBuildOptions(validate_placement="yes")
         with self.assertRaisesRegex(TypeError, "compile"):
@@ -226,6 +216,8 @@ class TestModelBuildOptionsNormalization(unittest.TestCase):
         """Unknown keys fail fast instead of being silently swallowed."""
         with self.assertRaises(TypeError):
             ModelBuildOptions.from_dict({"not_a_field": 1})
+        with self.assertRaisesRegex(TypeError, "activation_swap"):
+            ModelBuildOptions.from_dict({"activation_swap": "attention"})
 
 
 class TestTrainerReexportIdentity(unittest.TestCase):
@@ -235,7 +227,7 @@ class TestTrainerReexportIdentity(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     def test_trainer_config_reexport_identity(self):
         """trainer.config CompileConfig/FSDP2Config ARE the build_options classes."""
-        from hyper_parallel.trainer import config as trainer_config
+        from hyper_parallel.trainer import config as trainer_config  # pylint: disable=import-outside-toplevel
 
         self.assertIs(trainer_config.CompileConfig, CompileConfig)
         self.assertIs(trainer_config.FSDP2Config, FSDP2Config)
@@ -244,7 +236,7 @@ class TestTrainerReexportIdentity(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     def test_package_root_reexport_identity(self):
         """The auto_models package root re-exports the same class objects."""
-        import hyper_parallel.models as auto_models
+        import hyper_parallel.models as auto_models  # pylint: disable=import-outside-toplevel
 
         self.assertIs(auto_models.ModelBuildOptions, ModelBuildOptions)
         self.assertIs(auto_models.CompileConfig, CompileConfig)
@@ -288,7 +280,7 @@ class TestBuildOptionsBoundary(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     def test_api_skeleton_surface(self):
         """api.py exposes the stable skeleton and delegates from_pretrained lazily."""
-        from hyper_parallel.models import api
+        from hyper_parallel.models import api  # pylint: disable=import-outside-toplevel
 
         self.assertEqual(
             api.__all__,
@@ -298,8 +290,8 @@ class TestBuildOptionsBoundary(unittest.TestCase):
             ],
         )
         self.assertIs(api.ModelBuildOptions, ModelBuildOptions)
-        options = api.normalize_options({"activation_swap": "attention"})
-        self.assertEqual(options.activation_swap, "attention")
+        with self.assertRaisesRegex(TypeError, "activation_swap"):
+            api.normalize_options({"activation_swap": "attention"})
 
 
 if __name__ == "__main__":

@@ -109,8 +109,7 @@ config.model = Target(
 self.model = self.config.model.build(
     distributed_setup=self.distributed_setup,
     peft_config=self.peft_config,
-    activation_checkpoint=self.config.activation_checkpoint.mode,
-    activation_swap=self.config.activation_swap,
+    activation_checkpoint=self.config.activation_checkpoint,
     compile_config=self.config.compile,
 )
 ```
@@ -126,8 +125,7 @@ self.model = HyperAutoModelForCausalLM.from_pretrained(
     force_hf=True,
     distributed_setup=self.distributed_setup,
     peft_config=self.peft_config,
-    activation_checkpoint=self.config.activation_checkpoint.mode,
-    activation_swap=self.config.activation_swap,
+    activation_checkpoint=self.config.activation_checkpoint,
     compile_config=self.config.compile,
 )
 ```

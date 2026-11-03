@@ -611,11 +611,6 @@ def _trainer_launch_argv(
         "accelerator.ep_size": topology.get("ep", 1),
         "accelerator.sequence_parallel": topology.get("sequence_parallel", False),
         "fsdp_config.dp_shard_size": topology.get("fsdp", 1),
-        "activation_checkpoint.mode": "selective",
-        "activation_checkpoint.selection": {
-            "source": "model_adapter_safe_regions",
-            **topology.get("recompute", {"layer_count": 0}),
-        },
         "model_integration.mode": "runtime",
     }
     if "validate_placement" in topology:

@@ -17,6 +17,7 @@
 Following design doc 01_hf_compatibility_layer.md §6.
 Stub — provides from_pretrained/from_config as entry points.
 """
+# pylint: disable=forbidden-backend-import
 
 import logging
 from dataclasses import is_dataclass, replace
@@ -71,6 +72,15 @@ _CONFIG_ONLY_KWARGS = {
     "trust_remote_code",
     "use_auth_token",
 }
+
+
+def _reject_removed_activation_swap(kwargs: dict[str, Any]) -> None:
+    """Reject the removed standalone activation-swap build option."""
+    if "activation_swap" in kwargs:
+        raise ValueError(
+            "activation_swap has been removed; configure swap through "
+            "activation_checkpoint.full.exclude_region.swap or activation_checkpoint.selective.swap"
+        )
 
 
 def _model_init_kwargs(
@@ -331,10 +341,7 @@ class _BaseHyperAutoModelClass:
         fp8_config: Optional[Any] = None,
         compile_config: Optional[Union[CompileConfig, dict]] = None,
         freeze_config: Optional[Any] = None,
-        activation_checkpoint: Optional[str] = None,
-        swap_inputs: bool = False,
-        allow_cache_entry_mutation: bool = False,
-        activation_swap: str = "none",
+        activation_checkpoint: Optional[Any] = None,
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
         codegen_artifact_dir: Optional[str] = None,
         codegen: bool = False,
@@ -365,6 +372,7 @@ class _BaseHyperAutoModelClass:
         ④ get_is_hf_model → custom/HF path
         ⑤ _build_model → meta + shard + load
         """
+        _reject_removed_activation_swap(kwargs)
         _validate_weight_check_options(verify_hf_weights, load_base_model)
         if distributed_setup is None:
             distributed_setup = DistributedSetup()
@@ -405,9 +413,6 @@ class _BaseHyperAutoModelClass:
             compile_config=compile_config,
             freeze_config=freeze_config,
             activation_checkpoint=activation_checkpoint,
-            swap_inputs=swap_inputs,
-            allow_cache_entry_mutation=allow_cache_entry_mutation,
-            activation_swap=activation_swap,
             model_init_dtype=model_init_dtype,
             codegen_artifact_dir=codegen_artifact_dir,
             **kwargs,
@@ -433,10 +438,7 @@ class _BaseHyperAutoModelClass:
         fp8_config: Optional[Any] = None,
         compile_config: Optional[Union[CompileConfig, dict]] = None,
         freeze_config: Optional[Any] = None,
-        activation_checkpoint: Optional[str] = None,
-        swap_inputs: bool = False,
-        allow_cache_entry_mutation: bool = False,
-        activation_swap: str = "none",
+        activation_checkpoint: Optional[Any] = None,
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
         codegen: bool = False,
         codegen_config: Optional[Any] = None,
@@ -451,6 +453,7 @@ class _BaseHyperAutoModelClass:
         config's source identity.  No checkpoint is loaded either way, so the
         from-config random initialization path is preserved.
         """
+        _reject_removed_activation_swap(kwargs)
         if distributed_setup is None:
             distributed_setup = DistributedSetup()
         mesh = distributed_setup.mesh_context
@@ -494,9 +497,6 @@ class _BaseHyperAutoModelClass:
             compile_config=compile_config,
             freeze_config=freeze_config,
             activation_checkpoint=activation_checkpoint,
-            swap_inputs=swap_inputs,
-            allow_cache_entry_mutation=allow_cache_entry_mutation,
-            activation_swap=activation_swap,
             model_init_dtype=model_init_dtype,
             codegen_artifact_dir=codegen_artifact_dir,
             **kwargs,
@@ -523,11 +523,7 @@ class _BaseHyperAutoModelClass:
         fp8_config=None,
         compile_config=None,
         freeze_config=None,
-        activation_checkpoint: Optional[str] = None,
-        activation_checkpoint_selection: Optional[Any] = None,
-        swap_inputs: bool = False,
-        allow_cache_entry_mutation: bool = False,
-        activation_swap: str = "none",
+        activation_checkpoint: Optional[Any] = None,
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
         codegen_artifact_dir: Optional[str] = None,
         **kwargs,
@@ -540,6 +536,7 @@ class _BaseHyperAutoModelClass:
         Step 3-12: apply_model_infrastructure (PEFT, QAT, ShardingPlan,
         activation checkpoint, FSDP2, load, layer compile)
         """
+        _reject_removed_activation_swap(kwargs)
         # Step 1: Determine meta device (inline world-size probe: auto_models
         # must not import the trainer runtime).
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -594,10 +591,6 @@ class _BaseHyperAutoModelClass:
             validate_placement=validate_placement,
             distributed_setup=distributed_setup,
             activation_checkpoint=activation_checkpoint,
-            activation_checkpoint_selection=activation_checkpoint_selection,
-            swap_inputs=swap_inputs,
-            allow_cache_entry_mutation=allow_cache_entry_mutation,
-            activation_swap=activation_swap,
             model_init_dtype=model_init_dtype,
             codegen_artifact_dir=(
                 codegen_artifact_dir if backend is ModelingBackend.GEN else None

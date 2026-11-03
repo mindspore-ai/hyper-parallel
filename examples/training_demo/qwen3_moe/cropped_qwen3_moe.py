@@ -39,16 +39,11 @@ class CroppedQwen3MoeOptions:
         distributed_setup: Trainer-provided distributed topology.
         peft_config: Optional Trainer-provided PEFT configuration.
         compile_config: Optional Trainer-provided compile configuration.
-        activation_checkpoint: Activation checkpoint mode.
-        activation_checkpoint_selection: Trainer-injected selection of
-            checkpoint-safe submodules; forwarded to the build pipeline.
-        swap_inputs: Trainer-injected activation-swap input flag.
+        activation_checkpoint: Normalized activation checkpoint configuration.
         model_init_dtype: Trainer-injected parameter initialization dtype.
-        activation_swap: Activation swap mode.
         codegen: Select the codegen ``gen`` backend for this build.
         codegen_config: Trainer config carrying the codegen settings; forwarded
             so the artifact bundle can be prepared from the config identity.
-        allow_cache_entry_mutation: Permit cache entry mutation for activation checkpointing.
     """
 
     num_hidden_layers: int = 4
@@ -59,14 +54,10 @@ class CroppedQwen3MoeOptions:
     distributed_setup: DistributedSetup | None = None
     peft_config: Any | None = None
     compile_config: CompileConfig | dict[str, Any] | None = None
-    activation_checkpoint: str | None = None
-    activation_checkpoint_selection: Any | None = None
-    swap_inputs: bool = False
+    activation_checkpoint: Any | None = None
     model_init_dtype: str | None = None
-    activation_swap: str = "none"
     codegen: bool = False
     codegen_config: Any | None = None
-    allow_cache_entry_mutation: bool = False
 
 
 def _resolve_build_options(
@@ -156,10 +147,6 @@ def build_cropped_qwen3_moe(
         validate_placement=options.validate_placement,
         compile_config=options.compile_config,
         activation_checkpoint=options.activation_checkpoint,
-        activation_checkpoint_selection=options.activation_checkpoint_selection,
-        swap_inputs=options.swap_inputs,
-        allow_cache_entry_mutation=options.allow_cache_entry_mutation,
-        activation_swap=options.activation_swap,
         model_init_dtype=options.model_init_dtype,
         codegen=options.codegen,
         codegen_config=options.codegen_config,

@@ -86,6 +86,18 @@ class TestConfigOverrides(unittest.TestCase):
             config.model.activation, "gelu",
             msg=f"case: keyword_default_is_filled, activation={config.model.activation!r}")
 
+    def test_removed_activation_swap_root_field_is_rejected(self) -> None:
+        """Standalone activation swap is no longer a Trainer configuration field."""
+        for value in ("none", "attention"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as tmpdir:
+                yaml_path = Path(tmpdir) / "train.yaml"
+                yaml_path.write_text(
+                    _SAMPLE_YAML.format(module=__name__) + f"\nactivation_swap: {value}\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(ConfigResolutionError, "activation_swap"):
+                    parse_training_args([str(yaml_path)])
+
     def test_scalar_overrides_are_coerced(self) -> None:
         """Scalar overrides are coerced against the declared annotations."""
         config = self._parse("--model.width=16", "--model.depth=3", "--model.activation=silu")

@@ -22,6 +22,7 @@ Split from ``auto_models/trainer/config.py`` in stage 7 (05 §15.2.5).
 
 import importlib
 import logging
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -62,110 +63,344 @@ class AcceleratorConfig:
     encoder_parallel: EncoderParallelConfig = field(default_factory=EncoderParallelConfig)
 
 
+_LAYER_RANGE_PATTERN = re.compile(r"^(\d+)-(\d+)$")
+_SWAP_OPTION_KEYS = frozenset(("group_swap", "cpu_pool"))
+
+
+def _normalize_layer_set(value: object, *, path: str) -> tuple[int, ...]:
+    """Normalize one YAML layer set into an ordered, duplicate-free tuple."""
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError(f"{path} must be a non-empty list of layer numbers or ranges")
+
+    layers = []
+    seen = set()
+    for item in value:
+        if isinstance(item, bool):
+            raise ValueError(f"{path} must not contain boolean layer values")
+        if isinstance(item, int):
+            if item < 0:
+                raise ValueError(f"{path} must not contain negative layer index {item}")
+            expanded = (item,)
+        elif isinstance(item, str):
+            match = _LAYER_RANGE_PATTERN.fullmatch(item)
+            if match is None:
+                raise ValueError(
+                    f"{path} contains invalid layer range {item!r}; expected forms such as '0-3'"
+                )
+            start, end = (int(group) for group in match.groups())
+            if start > end:
+                raise ValueError(f"{path} contains reversed layer range {item!r}")
+            expanded = tuple(range(start, end + 1))
+        else:
+            raise ValueError(
+                f"{path} must contain only non-negative integers or closed ranges, "
+                f"got {type(item).__name__}"
+            )
+
+        for layer_index in expanded:
+            if layer_index in seen:
+                raise ValueError(f"{path} contains duplicate layer index {layer_index}")
+            seen.add(layer_index)
+            layers.append(layer_index)
+    return tuple(sorted(layers))
+
+
+def _validate_module_path(module_path: object, *, path: str) -> str:
+    """Validate one exact layer-relative module path."""
+    if not isinstance(module_path, str) or not module_path.strip():
+        raise ValueError(f"{path} module paths must be non-empty strings")
+    normalized = module_path.strip()
+    if normalized != module_path or any(not part for part in normalized.split(".")):
+        raise ValueError(f"{path}.{module_path} is not a valid dotted module path")
+    if any(character in normalized for character in "*?[]"):
+        raise ValueError(
+            f"{path}.{module_path} must be an exact module path; glob and index syntax are unsupported"
+        )
+    return normalized
+
+
+@dataclass(frozen=True)
+class ModuleRegionSpec:
+    """One normalized layer-relative activation-wrapper target."""
+
+    module_path: str
+    layers: tuple[int, ...]
+
+
+def _normalize_region_mapping(value: object, *, path: str) -> tuple[ModuleRegionSpec, ...]:
+    """Normalize an exact module-path mapping into immutable region specs."""
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{path} must be a mapping from module paths to layer sets")
+    regions = []
+    for raw_module_path, raw_layers in value.items():
+        module_path = _validate_module_path(raw_module_path, path=path)
+        regions.append(
+            ModuleRegionSpec(
+                module_path=module_path,
+                layers=_normalize_layer_set(raw_layers, path=f"{path}.{module_path}"),
+            )
+        )
+    return tuple(regions)
+
+
+def _normalize_group_swap(value: object, *, path: str) -> bool:
+    """Normalize one optional group-swap flag."""
+    if not isinstance(value, bool):
+        raise ValueError(f"{path} must be a bool")
+    return value
+
+
+def _normalize_cpu_pool(value: object, *, path: str) -> Optional[int]:
+    """Normalize one optional pinned-memory-pool capacity in MiB."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{path} must be a positive integer MiB value or null")
+    return value
+
+
+def _split_swap_mapping(
+    value: object,
+    *,
+    path: str,
+) -> tuple[tuple[ModuleRegionSpec, ...], bool, Optional[int]]:
+    """Split swap common options from exact module-path targets."""
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{path} must be a mapping")
+    group_swap = _normalize_group_swap(value.get("group_swap", False), path=f"{path}.group_swap")
+    cpu_pool_mb = _normalize_cpu_pool(value.get("cpu_pool"), path=f"{path}.cpu_pool")
+    regions = _normalize_region_mapping(
+        {key: item for key, item in value.items() if key not in _SWAP_OPTION_KEYS},
+        path=path,
+    )
+    return regions, group_swap, cpu_pool_mb
+
+
+def _region_layer_pairs(regions: tuple[ModuleRegionSpec, ...]) -> set[tuple[int, str]]:
+    """Expand region specs into layer/path conflict keys."""
+    return {
+        (layer_index, region.module_path)
+        for region in regions
+        for layer_index in region.layers
+    }
+
+
+def _validate_nested_regions(
+    regions: tuple[ModuleRegionSpec, ...],
+    *,
+    path: str,
+) -> None:
+    """Reject ancestor/descendant activation targets within one layer."""
+    by_layer: dict[int, list[str]] = {}
+    for region in regions:
+        for layer_index in region.layers:
+            by_layer.setdefault(layer_index, []).append(region.module_path)
+    for layer_index, module_paths in by_layer.items():
+        for index, module_path in enumerate(module_paths):
+            for other_path in module_paths[index + 1:]:
+                if module_path.startswith(f"{other_path}.") or other_path.startswith(f"{module_path}."):
+                    raise ValueError(
+                        f"{path} has nested targets on layer {layer_index}: "
+                        f"{module_path!r} and {other_path!r}"
+                    )
+
+
 @dataclass
-class ActivationCheckpointSelection:
-    """Select adapter-declared recompute regions and exact layer coverage.
+class FullExcludeRegionConfig:
+    """Normalized exclusion regions inside full-layer checkpointing."""
 
-    ``layer_count`` selects the contiguous prefix ``[0, layer_count)`` from
-    the flattened layer-container order. ``layer_indices`` selects explicit
-    zero-based entries from that same order.
-
-    ``model_adapter_safe_regions`` wraps the outermost module matching the
-    adapter's ``region_patterns`` inside every selected layer and keeps every
-    ``exclude_patterns`` descendant outside the recompute region. Which shape that
-    produces is the model's declaration, not the Trainer's: leaf patterns give
-    one region per submodule, a layer pattern gives one region per layer.
-    """
-
-    source: Literal["default", "model_adapter_safe_regions"] = "default"
-    layer_count: Optional[int] = None
-    layer_indices: Optional[List[int]] = None
+    save: Mapping[str, Any] = field(default_factory=dict)
+    swap: Mapping[str, Any] = field(default_factory=dict)
+    save_regions: tuple[ModuleRegionSpec, ...] = field(init=False)
+    swap_regions: tuple[ModuleRegionSpec, ...] = field(init=False)
+    group_swap: bool = field(init=False)
+    cpu_pool_mb: Optional[int] = field(init=False)
 
     def __post_init__(self) -> None:
-        """Validate the mutually exclusive layer-count and layer-index selectors."""
-        self._validate_selector_choice()
-        self._validate_selector_values()
+        """Normalize save and swap mappings."""
+        self.save_regions = _normalize_region_mapping(
+            self.save,
+            path="activation_checkpoint.full.exclude_region.save",
+        )
+        self.swap_regions, self.group_swap, self.cpu_pool_mb = _split_swap_mapping(
+            self.swap,
+            path="activation_checkpoint.full.exclude_region.swap",
+        )
 
-    def _validate_selector_choice(self) -> None:
-        """Require one supported source and its matching selector form."""
-        if self.source not in ("default", "model_adapter_safe_regions"):
-            raise ValueError(
-                "activation_checkpoint.selection.source must be default or "
-                "model_adapter_safe_regions"
-            )
-        selectors = (self.layer_count is not None, self.layer_indices is not None)
-        if self.source == "default" and any(selectors):
-            raise ValueError(
-                "activation_checkpoint.selection.layer_count and layer_indices "
-                "are only valid when "
-                "selection.source=model_adapter_safe_regions"
-            )
-        if self.source == "model_adapter_safe_regions" and sum(selectors) != 1:
-            raise ValueError(
-                "activation_checkpoint.selection requires exactly one of "
-                "layer_count or layer_indices when "
-                "selection.source=model_adapter_safe_regions"
-            )
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the normalized exclusion configuration."""
+        swap = {
+            "group_swap": self.group_swap,
+            "cpu_pool": self.cpu_pool_mb,
+            **{region.module_path: list(region.layers) for region in self.swap_regions},
+        }
+        return {
+            "save": {region.module_path: list(region.layers) for region in self.save_regions},
+            "swap": swap,
+        }
 
-    def _validate_selector_values(self) -> None:
-        """Require non-negative, distinct layer numbers."""
-        if self.layer_count is not None and (
-            isinstance(self.layer_count, bool)
-            or not isinstance(self.layer_count, int)
-            or self.layer_count < 0
+
+@dataclass
+class FullCheckpointConfig:
+    """Full-layer recomputation and optional exclusion regions."""
+
+    recompute_layer: List[Union[int, str]]
+    exclude_region: Optional[FullExcludeRegionConfig] = None
+    recompute_layers: tuple[int, ...] = field(init=False)
+    save_regions: tuple[ModuleRegionSpec, ...] = field(init=False)
+    swap_regions: tuple[ModuleRegionSpec, ...] = field(init=False)
+    group_swap: bool = field(init=False)
+    cpu_pool_mb: Optional[int] = field(init=False)
+
+    def __post_init__(self) -> None:
+        """Normalize full-layer coverage and exclusion settings."""
+        self.recompute_layers = _normalize_layer_set(
+            self.recompute_layer,
+            path="activation_checkpoint.full.recompute_layer",
+        )
+        exclude_region = self.exclude_region or FullExcludeRegionConfig()
+        self.save_regions = exclude_region.save_regions
+        self.swap_regions = exclude_region.swap_regions
+        self.group_swap = exclude_region.group_swap
+        self.cpu_pool_mb = exclude_region.cpu_pool_mb
+
+    def validate_active(self) -> None:
+        """Validate conflicts that matter when full mode is active."""
+        recompute_layers = set(self.recompute_layers)
+        for config_path, regions in (
+            ("activation_checkpoint.full.exclude_region.save", self.save_regions),
+            ("activation_checkpoint.full.exclude_region.swap", self.swap_regions),
         ):
+            for region in regions:
+                outside = sorted(set(region.layers) - recompute_layers)
+                if outside:
+                    raise ValueError(
+                        f"{config_path}.{region.module_path} selects layer(s) {outside} outside "
+                        "activation_checkpoint.full.recompute_layer"
+                    )
+        conflicts = _region_layer_pairs(self.save_regions) & _region_layer_pairs(self.swap_regions)
+        if conflicts:
+            layer_index, module_path = sorted(conflicts)[0]
             raise ValueError(
-                "activation_checkpoint.selection.layer_count must be a "
-                "non-negative integer"
+                "activation_checkpoint.full.exclude_region.save and "
+                "activation_checkpoint.full.exclude_region.swap conflict on "
+                f"layer {layer_index}, module {module_path!r}"
             )
-        if self.layer_indices is None:
-            return
-        if not isinstance(self.layer_indices, list) or not self.layer_indices:
+        _validate_nested_regions(
+            self.save_regions + self.swap_regions,
+            path="activation_checkpoint.full.exclude_region",
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the normalized full configuration."""
+        result = {"recompute_layer": list(self.recompute_layers)}
+        if self.exclude_region is not None:
+            result["exclude_region"] = self.exclude_region.to_dict()
+        return result
+
+
+@dataclass
+class SelectiveCheckpointConfig:
+    """Exact submodule recomputation and swap targets."""
+
+    recompute: Mapping[str, Any] = field(default_factory=dict)
+    swap: Mapping[str, Any] = field(default_factory=dict)
+    recompute_regions: tuple[ModuleRegionSpec, ...] = field(init=False)
+    swap_regions: tuple[ModuleRegionSpec, ...] = field(init=False)
+    group_swap: bool = field(init=False)
+    cpu_pool_mb: Optional[int] = field(init=False)
+
+    def __post_init__(self) -> None:
+        """Normalize exact selective targets and swap options."""
+        self.recompute_regions = _normalize_region_mapping(
+            self.recompute,
+            path="activation_checkpoint.selective.recompute",
+        )
+        self.swap_regions, self.group_swap, self.cpu_pool_mb = _split_swap_mapping(
+            self.swap,
+            path="activation_checkpoint.selective.swap",
+        )
+
+    def validate_active(self) -> None:
+        """Validate active selective coverage and target conflicts."""
+        if not self.recompute_regions and not self.swap_regions:
             raise ValueError(
-                "activation_checkpoint.selection.layer_indices must be a "
-                "non-empty list of non-negative integers"
+                "activation_checkpoint.selective requires at least one recompute or swap module target"
             )
-        if any(
-            isinstance(index, bool) or not isinstance(index, int) or index < 0
-            for index in self.layer_indices
-        ):
+        conflicts = _region_layer_pairs(self.recompute_regions) & _region_layer_pairs(self.swap_regions)
+        if conflicts:
+            layer_index, module_path = sorted(conflicts)[0]
             raise ValueError(
-                "activation_checkpoint.selection.layer_indices must contain "
-                "only non-negative integers"
+                "activation_checkpoint.selective.recompute and activation_checkpoint.selective.swap "
+                f"conflict on layer {layer_index}, module {module_path!r}"
             )
-        if len(set(self.layer_indices)) != len(self.layer_indices):
-            raise ValueError(
-                "activation_checkpoint.selection.layer_indices must not "
-                "contain duplicates"
-            )
+        _validate_nested_regions(
+            self.recompute_regions + self.swap_regions,
+            path="activation_checkpoint.selective",
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the normalized selective configuration."""
+        return {
+            "recompute": {
+                region.module_path: list(region.layers)
+                for region in self.recompute_regions
+            },
+            "swap": {
+                "group_swap": self.group_swap,
+                "cpu_pool": self.cpu_pool_mb,
+                **{region.module_path: list(region.layers) for region in self.swap_regions},
+            },
+        }
 
 
 @dataclass
 class ActivationCheckpointConfig:
-    """Activation-checkpoint options exposed by the initial YAML schema.
+    """Top-level activation-memory strategy using the replacement YAML schema."""
 
-    ``swap_inputs`` is consumed only when ``mode`` is ``"full"`` or
-    ``"selective"``.
-    """
-
-    mode: Optional[Literal["off", "full", "selective"]] = "off"
-    swap_inputs: bool = False
-    selection: ActivationCheckpointSelection = field(
-        default_factory=ActivationCheckpointSelection
-    )
-    # Escape hatch for SAC's cached-tensor mutation check: safe when
-    # every in-place rewrite of a cached operator output is
-    # deterministic, so the recompute replays the same values (the
-    # CSA indexer's masked_fill_ family).
-    allow_cache_entry_mutation: bool = False
+    mode: Literal["off", "full", "selective", "hybrid"]
+    full: Optional[FullCheckpointConfig] = None
+    selective: Optional[SelectiveCheckpointConfig] = None
 
     def __post_init__(self) -> None:
-        """Reject ambiguous values for activation input swapping."""
-        if not isinstance(self.swap_inputs, bool):
-            raise TypeError("activation_checkpoint.swap_inputs must be a bool")
-        if not isinstance(self.allow_cache_entry_mutation, bool):
-            raise TypeError(
-                "activation_checkpoint.allow_cache_entry_mutation must be a bool")
+        """Validate mode-specific requirements and configuration conflicts."""
+        if self.mode not in ("off", "full", "selective", "hybrid"):
+            raise ValueError(
+                "activation_checkpoint.mode must be off, full, selective, or hybrid; "
+                f"got {self.mode!r}"
+            )
+        if self.mode in ("full", "hybrid"):
+            if self.full is None:
+                raise ValueError(f"activation_checkpoint.mode={self.mode} requires activation_checkpoint.full")
+            self.full.validate_active()
+        if self.mode in ("selective", "hybrid"):
+            if self.selective is None:
+                raise ValueError(
+                    f"activation_checkpoint.mode={self.mode} requires activation_checkpoint.selective"
+                )
+            self.selective.validate_active()
+        if self.mode == "hybrid":
+            full_layers = set(self.full.recompute_layers)
+            selective_layers = {
+                layer_index
+                for region in self.selective.recompute_regions + self.selective.swap_regions
+                for layer_index in region.layers
+            }
+            overlap = sorted(full_layers & selective_layers)
+            if overlap:
+                raise ValueError(
+                    "activation_checkpoint.mode=hybrid requires disjoint full and selective layers; "
+                    f"overlap={overlap}"
+                )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the normalized activation-checkpoint configuration."""
+        result: dict[str, Any] = {"mode": self.mode}
+        if self.full is not None:
+            result["full"] = self.full.to_dict()
+        if self.selective is not None:
+            result["selective"] = self.selective.to_dict()
+        return result
 
 
 def _resolve_replace_implementation(value: Union[str, Target[Any]]) -> Target[Any]:
