@@ -27,6 +27,9 @@ import torch
 from torch import nn
 
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
+from hyper_parallel.components.optim.mixed_precision_optimizer import Float16OptimizerWithFloat16Params
+from hyper_parallel.core.optimizer.adamw import AdamW
+from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
 from hyper_parallel.distributed.mesh import MeshContext
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.trainer.config.resolver import ConfigResolutionError, normalize_value
@@ -61,6 +64,70 @@ class ScalarModel(nn.Module):
 
 class TestStepLossNormalization(unittest.TestCase):
     """Compare actual gradients with explicitly constructed objectives."""
+
+    def test_finish_selects_main_gradient_before_regular_gradient(self):
+        """Match optimizer gradient selection, including aliases and missing buffers."""
+        for storage in ("regular", "fallback", "main", "both", "alias", "empty"):
+            with self.subTest(storage=storage):
+                parameter = nn.Parameter(torch.tensor(2.0))
+                normalizer = StepLossNormalization("token", 1, MeshContext())
+                normalizer.reduce(parameter.square(), {"foundation_tokens": torch.tensor(600)})
+                if storage in ("regular", "fallback", "both", "alias"):
+                    parameter.grad = torch.tensor(1200.0)
+                if storage != "regular":
+                    parameter.main_grad = None
+                if storage in ("main", "both"):
+                    parameter.main_grad = torch.tensor(1200.0)
+                if storage == "alias":
+                    parameter.main_grad = parameter.grad
+                loss, metrics = normalizer.finish(
+                    [parameter, parameter], 2400.0, {"foundation_loss": 2400.0},
+                )
+                self.assertEqual(loss, 4.0)
+                self.assertEqual(metrics["foundation_loss"], 4.0)
+                if storage in ("main", "both", "alias"):
+                    self.assertAlmostEqual(parameter.main_grad.item(), 2.0)
+                if parameter.grad is not None:
+                    self.assertAlmostEqual(parameter.grad.item(), 1200.0 if storage == "both" else 2.0)
+                if storage in ("main", "empty"):
+                    self.assertIsNone(parameter.grad)
+
+    def test_fp32_main_gradient_clipping_and_optimizer_update(self):
+        """FP32 master updates match a directly normalized objective after FSDP-style storage."""
+        model = nn.Linear(2, 1, bias=False, dtype=torch.bfloat16)
+        initial = torch.tensor([[1.0, 2.0]])
+        with torch.no_grad():
+            model.weight.copy_(initial)
+        optimizer = Float16OptimizerWithFloat16Params(
+            ChainedOptimizer(model, {"adamw": AdamW(model.parameters(), lr=0.01)}), model,
+        )
+        reference = nn.Parameter(initial.clone())
+        reference_optimizer = AdamW([reference], lr=0.01)
+        normalizer = StepLossNormalization("token", 2, MeshContext())
+        total = 0.0
+        for values in (torch.tensor([[1.0, 2.0]]), torch.tensor([[3.0, 4.0]]).repeat(3, 1)):
+            local_mean = (model.weight.float().square() * values).sum(dim=1).mean()
+            loss = normalizer.reduce(local_mean, {"foundation_tokens": torch.tensor(len(values))})
+            loss["foundation_loss"].backward()
+            total += loss["foundation_loss"].item()
+        expected = (reference.square() * torch.tensor([[1., 2.], [3., 4.], [3., 4.], [3., 4.]])).sum() / 4
+        expected.backward()
+        # Emulate FSDP's reduced FP32 buffer without requiring a process group.
+        model.weight.main_grad = model.weight.grad.float()
+        model.weight.grad = None
+        actual, _ = normalizer.finish(model.parameters(), total, {})
+        optimizer.prepare_grads()
+        main_param = model.weight.main_param
+        self.assertEqual(main_param.grad.dtype, torch.float32)
+        self.assertAlmostEqual(actual, expected.item())
+        torch.testing.assert_close(main_param.grad, reference.grad)
+        actual_norm = nn.utils.clip_grad_norm_([main_param], max_norm=0.1)
+        expected_norm = nn.utils.clip_grad_norm_([reference], max_norm=0.1)
+        torch.testing.assert_close(actual_norm, expected_norm)
+        optimizer.step_with_ready_grads()
+        reference_optimizer.step()
+        torch.testing.assert_close(main_param, reference)
+        torch.testing.assert_close(model.weight, reference.to(torch.bfloat16))
 
     def test_formulas_and_partition_invariance(self):
         """Token normalization is invariant to repartitioning a fixed set of targets."""

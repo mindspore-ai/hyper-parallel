@@ -110,10 +110,15 @@ class StepLossNormalization:
         seen = set()
         with SkipDTensorDispatch():
             for parameter in parameters:
-                if id(parameter) in seen or parameter.grad is None:
+                if id(parameter) in seen:
                     continue
                 seen.add(id(parameter))
-                grad = parameter.grad
+                # Match the optimizer: FSDP may store FP32 gradients only in main_grad.
+                grad = getattr(parameter, "main_grad", None)
+                if grad is None:
+                    grad = parameter.grad
+                if grad is None:
+                    continue
                 if isinstance(grad, DTensor):
                     grad = grad.to_local()
                 grad.mul_(factor.to(device=grad.device, dtype=grad.dtype))
