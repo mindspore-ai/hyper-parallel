@@ -18,6 +18,7 @@ Split from ``auto_models/trainer/config.py`` in stage 7 (05 §15.2.5);
 class name, fields and defaults are unchanged.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from typing import Any, List, Literal, Optional
 
@@ -99,6 +100,7 @@ class TrainerConfig:
             and self.accelerator.pp_size > 1
         ):
             raise ValueError("compile is not supported together with pipeline parallelism")
+        self._validate_loss_normalization()
         reduce_dtype = self.fsdp_config.mix_precision.reduce_dtype
         if self.optimizer.fp32_main_params and reduce_dtype != "float32":
             raise ValueError(
@@ -106,6 +108,19 @@ class TrainerConfig:
                 "fsdp_config.mix_precision.reduce_dtype='float32'; "
                 f"got {reduce_dtype!r}"
             )
+
+    def _validate_loss_normalization(self) -> None:
+        """Reject unsupported objectives before building the model or Trainer."""
+        if self.training.loss_normalization == "legacy":
+            return
+        for path, options in (("model", self.model), ("model.config", getattr(self.model, "config", None))):
+            for name in ("mtp_num_layers", "moe_aux_loss_coeff", "router_aux_loss_coef", "router_aux_loss_coeff"):
+                value = options.get(name) if isinstance(options, Mapping) else getattr(options, name, None)
+                if value is not None and value > 0:
+                    raise ValueError(
+                        f"training.loss_normalization={self.training.loss_normalization!r} only supports main LM loss; "
+                        f"{path}.{name}={value} enables MTP or auxiliary loss. Disable it or use 'legacy'."
+                    )
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the resolved trainer configuration for logging."""

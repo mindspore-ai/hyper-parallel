@@ -32,13 +32,73 @@ from hyper_parallel.core.optimizer.adamw import AdamW
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
 from hyper_parallel.distributed.mesh import MeshContext
 from hyper_parallel.trainer.base import BaseTrainer
-from hyper_parallel.trainer.config.resolver import ConfigResolutionError, normalize_value
+from hyper_parallel.trainer.config.resolver import (
+    ConfigResolutionError, normalize_value, replace_override_path, resolve_config,
+)
 from hyper_parallel.trainer.config.training import TrainingConfig
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.loss_normalization import StepLossNormalization
 from hyper_parallel.trainer.state import TrainerState
 from hyper_parallel.trainer.text_trainer import TextTrainer
 from hyper_parallel.trainer.vlm_trainer import VLMTrainer
+
+
+def _configured_model(
+    mtp_num_layers: int | None = None, moe_aux_loss_coeff: float = 0.0,
+    router_aux_loss_coef: float = 0.0, router_aux_loss_coeff: float = 0.0,
+    config: dict | None = None,
+) -> None:
+    """Describe configuration only; parsing must not allocate a model."""
+    del mtp_num_layers, moe_aux_loss_coeff, router_aux_loss_coef, router_aux_loss_coeff, config
+    raise AssertionError("Configuration validation must not build the model")
+
+
+def _configured_optimizer() -> None:
+    """Describe configuration without constructing an optimizer."""
+    raise AssertionError("Configuration validation must not build the optimizer")
+
+
+class TestLossNormalizationConfig(unittest.TestCase):
+    """Reject MTP/aux combinations during YAML resolution and CLI overrides."""
+
+    @staticmethod
+    def raw_config(mode: str, **model_options: object) -> dict:
+        """Build a minimal YAML-equivalent mapping with delayed targets."""
+        return {
+            "model": {"_target_": f"{__name__}._configured_model", **model_options},
+            "optimizer": {"_target_": f"{__name__}._configured_optimizer"},
+            "training": {"loss_normalization": mode},
+        }
+
+    def test_enabled_mtp_and_aux_are_rejected_at_parse_time(self):
+        """Builder options and nested model config both fail before any target is built."""
+        for mode in ("token", "microbatch"):
+            for name in ("mtp_num_layers", "moe_aux_loss_coeff", "router_aux_loss_coef", "router_aux_loss_coeff"):
+                for nested in (False, True):
+                    with self.subTest(mode=mode, name=name, nested=nested):
+                        options = {"config": {name: 1}} if nested else {name: 1}
+                        with self.assertRaisesRegex(ValueError, name):
+                            resolve_config(self.raw_config(mode, **options))
+
+    def test_disabled_options_and_legacy_remain_supported(self):
+        """None/zero MTP, zero aux and legacy's enabled objectives remain valid."""
+        for mode in ("legacy", "token", "microbatch"):
+            for depth in (None, 0):
+                config = resolve_config(self.raw_config(mode, mtp_num_layers=depth))
+                self.assertEqual(config.training.loss_normalization, mode)
+        config = resolve_config(self.raw_config("legacy", mtp_num_layers=2, moe_aux_loss_coeff=0.01))
+        self.assertEqual(config.model.mtp_num_layers, 2)
+
+    def test_cli_overrides_cannot_enable_incompatible_objectives(self):
+        """Replacing either side of the combination reruns cross-section validation."""
+        for mode in ("token", "microbatch"):
+            config = resolve_config(self.raw_config(mode, config={"moe_aux_loss_coeff": 0.0}))
+            for path in ("model.mtp_num_layers", "model.router_aux_loss_coef", "model.config.moe_aux_loss_coeff"):
+                with self.assertRaisesRegex(ValueError, "only supports main LM loss"):
+                    replace_override_path(config, path.split("."), 1, path="")
+            config = resolve_config(self.raw_config("legacy", mtp_num_layers=1))
+            with self.assertRaisesRegex(ValueError, "mtp_num_layers"):
+                replace_override_path(config, ["training", "loss_normalization"], mode, path="")
 
 
 class ScalarModel(nn.Module):
@@ -300,7 +360,7 @@ class TestTrainerLossNormalization(unittest.TestCase):
         """Both entrypoints release inputs and normalize all gradients before optimizer preparation."""
         for trainer_type in (TextTrainer, VLMTrainer):
             for mode in ("legacy", "microbatch", "token"):
-                for auxiliary in (False, True):
+                for auxiliary in ((False, True) if mode == "legacy" else (False,)):
                     with self.subTest(trainer=trainer_type, mode=mode, auxiliary=auxiliary):
                         trainer = self.make_trainer(trainer_type, mode, auxiliary)
                         refs = []
@@ -331,12 +391,6 @@ class TestTrainerLossNormalization(unittest.TestCase):
                              patch(f"hyper_parallel.trainer.{module}.memory_profiler.step"), \
                              patch("hyper_parallel.trainer.runtime.metrics.all_reduce",
                                    side_effect=lambda value, **_: value):
-                            if auxiliary and mode != "legacy":
-                                with self.assertRaisesRegex(ValueError, "auxiliary loss injection"):
-                                    trainer.train_step(iter(((1, 1.0), (3, 2.0))))
-                                trainer.base.prepare_optimizer_step.assert_not_called()
-                                self.assertIsNone(trainer.base.model.weight.grad)
-                                continue
                             result = trainer.train_step(iter(((1, 1.0), (3, 2.0))))
                         self.assertAlmostEqual(result["loss"], 4 * expected)
                         self.assertEqual(trainer.base.state.global_step, 1)
@@ -348,27 +402,6 @@ class TestTrainerLossNormalization(unittest.TestCase):
                             trainer.base.model.zero_grad()
                             trainer.train_step(iter(((1, 1.0), (3, 2.0))))
                         self.assertEqual(trainer.base.state.global_step, 2)
-
-    def test_mtp_configuration_and_combined_model_outputs_are_rejected(self):
-        """Known MTP configs and model-reported auxiliary terms cannot hide in a scalar loss."""
-        for mode in ("microbatch", "token"):
-            trainer = self.make_trainer(TextTrainer, mode, False)
-            for name in ("mtp_num_layers", "num_nextn_predict_layers", "n_mtp_layers"):
-                trainer.base.model.config = SimpleNamespace(**{name: 1})
-                with self.assertRaisesRegex(ValueError, "does not support MTP"):
-                    trainer.base.begin_loss_step(2)
-                trainer.base.model.config = SimpleNamespace(**{name: 0})
-                trainer.base.begin_loss_step(2)
-            trainer.base.loss_fn = Mock()
-            for name in ("mtp_loss", "aux_loss"):
-                for outputs in ({name: torch.tensor(0.)}, SimpleNamespace(**{name: torch.tensor(0.)})):
-                    with self.assertRaisesRegex(ValueError, f"does not support {name}"):
-                        trainer.base.postforward(outputs, None, current_token_counts={}, step_token_counts={})
-            trainer.base.loss_fn.assert_not_called()
-        trainer = self.make_trainer(TextTrainer, "legacy", False)
-        trainer.base.model.config = SimpleNamespace(mtp_num_layers=1)
-        trainer.base.begin_loss_step(2)
-        self.assertIsNone(trainer.base.loss_normalizer)
 
     def test_token_mode_rejects_unmanaged_gradient_paths(self):
         """Fail before consuming data when gradients cannot be finalized safely."""

@@ -748,11 +748,6 @@ class BaseTrainer(Stateful, ABC):
         Returns:
             Backward loss and named globally aggregated loss values.
         """
-        if self.loss_normalizer is not None:
-            for name in ("mtp_loss", "aux_loss"):
-                value = outputs.get(name) if isinstance(outputs, dict) else getattr(outputs, name, None)
-                if value is not None:
-                    raise ValueError(f"microbatch/token normalization does not support {name}; use legacy")
         local_loss = self.loss_fn(model_output=outputs, labels=labels)
         foundation_loss = local_loss.get("foundation_loss") if isinstance(local_loss, dict) else local_loss
         if foundation_loss is not None:
@@ -801,9 +796,7 @@ class BaseTrainer(Stateful, ABC):
             if channel_loss_callback is not None
             else nullcontext()
         )
-        with micro_step_context, aux_loss_scale_context(
-            allow_auxiliary=self.loss_normalizer is None,
-        ):
+        with micro_step_context, aux_loss_scale_context():
             micro_batch = self.preforward(micro_batch)
             # TextTrainer passes loss-only fields separately. Keep the legacy
             # BaseTrainer/VLM one-dictionary call contract working as well.
@@ -928,10 +921,6 @@ class BaseTrainer(Stateful, ABC):
         if mode == "legacy":
             self.loss_normalizer = None
             return
-        model_config = getattr(self.model, "config", None)
-        for name in ("mtp_num_layers", "num_nextn_predict_layers", "n_mtp_layers"):
-            if (getattr(model_config, name, 0) or 0) > 0:
-                raise ValueError("microbatch/token normalization does not support MTP; disable MTP or use legacy")
         if mode == "token":
             if self.graph_compiler is not None:
                 raise ValueError("token loss normalization requires eager Trainer execution")

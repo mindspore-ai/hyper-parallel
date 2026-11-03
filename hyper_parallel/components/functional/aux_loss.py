@@ -32,7 +32,6 @@ class _AuxLossScaleState:
 
     scale: torch.Tensor | float = 1.0
     active: bool = False
-    allow_auxiliary: bool = True
     handles: list[Any] = field(default_factory=list)
 
 
@@ -40,17 +39,14 @@ _AUX_LOSS_STATE: ContextVar[_AuxLossScaleState | None] = ContextVar("aux_loss_st
 
 
 @contextmanager
-def aux_loss_scale_context(*, allow_auxiliary: bool = True) -> Iterator[None]:
+def aux_loss_scale_context() -> Iterator[None]:
     """Isolate auxiliary gradient scaling for one forward/backward microstep.
 
     Call :func:`bind_aux_loss_scale` on the local scalar task loss before
     weighting it. Keep this context active through backward so checkpoint
     recomputation observes the same scale. Nested contexts are independent.
-
-    Args:
-        allow_auxiliary: Whether the caller supports injected auxiliary objectives.
     """
-    state = _AuxLossScaleState(allow_auxiliary=allow_auxiliary)
+    state = _AuxLossScaleState()
     token = _AUX_LOSS_STATE.set(state)
     try:
         yield
@@ -143,8 +139,6 @@ def aux_loss_auto_scale(output: torch.Tensor, aux_loss: torch.Tensor) -> torch.T
     """
     state = _AUX_LOSS_STATE.get()
     if state is not None:
-        if not state.allow_auxiliary:
-            raise ValueError("microbatch/token normalization does not support auxiliary loss injection; use legacy")
         state.active = True
     return _AuxLossAutoScaler.apply(output, aux_loss)
 
