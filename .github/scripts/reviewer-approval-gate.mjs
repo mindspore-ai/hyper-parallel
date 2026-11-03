@@ -15,8 +15,11 @@ import { appendFileSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { evaluate_labels, PASS_LABELS } from './ci-label-expiry.mjs';
+
 // Keep the existing required status context so the active Rulesets continue to enforce this check.
 export const CHECK_CONTEXT = 'all-reviewers-approved';
+export const CI_CHECK_CONTEXT = 'label-check';
 export const POLICY_PATH = '.github/reviewer-approval-policy.json';
 const ACTIONS_APP_ID = 15368;
 const DECISION_STATES = new Set(['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED']);
@@ -88,12 +91,13 @@ export function evaluate_reviews(pull, reviews) {
 
 /** Keep automatic merges behind enforced GitHub rules, including stale review dismissal. */
 export function permits_auto_merge(rules) {
-  const has_gate = rules.some(rule => rule.type === 'required_status_checks' &&
-    rule.parameters.required_status_checks.some(check =>
-      check.context === CHECK_CONTEXT && check.integration_id === ACTIONS_APP_ID));
+  const has_gates = [CHECK_CONTEXT, CI_CHECK_CONTEXT].every(context =>
+    rules.some(rule => rule.type === 'required_status_checks' &&
+      rule.parameters.required_status_checks.some(check =>
+        check.context === context && check.integration_id === ACTIONS_APP_ID)));
   const has_reviews = rules.some(rule => rule.type === 'pull_request' &&
     rule.parameters.dismiss_stale_reviews_on_push && rule.parameters.required_approving_review_count >= 1);
-  return has_gate && has_reviews && !rules.some(rule => rule.type === 'merge_queue');
+  return has_gates && has_reviews && !rules.some(rule => rule.type === 'merge_queue');
 }
 
 /** Small GitHub CLI adapter; arguments and JSON input never pass through a shell. */
@@ -129,6 +133,10 @@ export class GitHubClient {
 
   get_reviews(number) {
     return this.api(`pulls/${number}/reviews?per_page=100`, { paginate: true });
+  }
+
+  get_label_events(number) {
+    return this.api(`issues/${number}/events?per_page=100`, { paginate: true });
   }
 
   latest_status(sha) {
@@ -174,6 +182,17 @@ function same_review_requests(before, after) {
     JSON.stringify(teams(before)) === JSON.stringify(teams(after));
 }
 
+function same_ci_labels(before, after) {
+  const labels = pull => (pull.labels ?? []).map(label => label.name)
+    .filter(name => PASS_LABELS.includes(name)).sort();
+  return JSON.stringify(labels(before)) === JSON.stringify(labels(after));
+}
+
+function has_fresh_ci_label(client, pull) {
+  if (!(pull.labels ?? []).some(label => PASS_LABELS.includes(label.name))) return false;
+  return evaluate_labels(pull, client.get_label_events(pull.number)).some(label => !label.expired);
+}
+
 /** Reconcile live API state. Dry runs never publish checks or enable merging. */
 export function reconcile(client, policy, options = {}) {
   const { write = false, policy_sha, target_url, only_pr } = options;
@@ -201,6 +220,7 @@ export function reconcile(client, policy, options = {}) {
           previous = client.publish(sha, 'pending', 'Rechecking current reviewer approvals.', target_url);
         }
       }
+      let current = group;
       let results = group.map(pull => evaluate_reviews(pull, client.get_reviews(pull.number)));
       if (write && results.every(result => result.ready)) {
         // Check again before publishing success: a push, retarget, draft change,
@@ -219,6 +239,7 @@ export function reconcile(client, policy, options = {}) {
             !policy_is_current(client, policy_sha, repository.default_branch)) {
           throw new Error('The PR or trusted policy changed during evaluation; retry with fresh state.');
         }
+        current = fresh;
       }
       const ready = results.every(result => result.ready);
       const state = ready ? 'success' : 'pending';
@@ -231,13 +252,19 @@ export function reconcile(client, policy, options = {}) {
       // Status contexts are commit-scoped. Shared heads must satisfy every PR
       // using that SHA, even when their authors (and exemptions) differ.
       if (write && ready && policy.auto_merge && repository.allow_auto_merge) {
-        for (const pull of group) {
+        for (const pull of current) {
           if (!branch_rules.has(pull.base.ref)) {
             branch_rules.set(pull.base.ref, client.api(
               `rules/branches/${encodeURIComponent(pull.base.ref)}?per_page=100`, { paginate: true }));
           }
-          if (permits_auto_merge(branch_rules.get(pull.base.ref)) && !pull.auto_merge) {
-            client.enable_auto_merge(pull);
+          if (permits_auto_merge(branch_rules.get(pull.base.ref)) && !pull.auto_merge &&
+              has_fresh_ci_label(client, pull)) {
+            const latest = client.api(`pulls/${pull.number}`);
+            if (!same_snapshot(pull, latest) || !same_review_requests(pull, latest) ||
+                !same_ci_labels(pull, latest) || !evaluate_reviews(latest, client.get_reviews(latest.number)).ready) {
+              throw new Error('The PR, CI labels or reviews changed before enabling auto-merge.');
+            }
+            client.enable_auto_merge(latest);
           }
         }
       }
@@ -246,7 +273,7 @@ export function reconcile(client, policy, options = {}) {
       if (write) {
         // Fail closed, including when a prior successful check existed.
         try {
-          client.publish(sha, 'error', 'Unable to verify approvals; see the gate workflow log.', target_url);
+          client.publish(sha, 'error', 'Unable to verify merge requirements; see the gate workflow log.', target_url);
         } catch (publish_error) {
           console.error(`Could not invalidate ${sha}: ${publish_error.message}`);
         }

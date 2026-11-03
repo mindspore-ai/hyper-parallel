@@ -4,12 +4,14 @@ on:
   pull_request:
     paths:
       - .github/reviewer-approval-policy.json
+      - .github/scripts/ci-label-expiry.mjs
       - .github/scripts/reviewer-approval-gate*.mjs
       - .github/workflows/reviewer-approval-*.yml
   push:
     branches: [master]
     paths:
       - .github/reviewer-approval-policy.json
+      - .github/scripts/ci-label-expiry.mjs
       - .github/scripts/reviewer-approval-gate*.mjs
       - .github/workflows/reviewer-approval-*.yml
 

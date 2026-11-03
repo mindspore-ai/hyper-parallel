@@ -47,7 +47,7 @@ GitHub 原生审批和 Code Owner 规则仍会独立检查各自的权限条件�
 所有目标分支统一使用默认分支上的策略和脚本，PR 不能通过修改自己的配置或脚本放行自己。
 默认分支从 `master` 改名时，还需更新工作流中的 `push.branches`。
 
-PR 创建、更新、重开、转 Draft/Ready、调整 Reviewers 和关闭会触发检查。
+PR 创建、更新、重开、标签变更、转 Draft/Ready、调整 Reviewers 和关闭会触发检查。
 Review 的提交、编辑和撤销通过独立 signal 工作流触发 `workflow_run`。
 signal 不执行 PR 代码、不下载产物、不使用密钥；后续工作流重新向 GitHub 查询真实状态。
 主工作流只检出默认分支，不检出 PR head。
@@ -66,12 +66,14 @@ signal 不执行 PR 代码、不下载产物、不使用密钥；后续工作流
    保留已有 `label-check` 及其他质量检查。
 4. 保留 **Require a pull request before merging**、至少 1 个批准，以及
    **Dismiss stale pull request approvals when new commits are pushed**。
+   若一位评审需要一票即可合入，原生最低批准数须为 1；设为 2 时仍需要两票。
    现有 Code Owner、最近推送独立批准和讨论解决规则继续生效。
 5. 在 **Settings → General → Pull Requests** 勾选 **Allow auto-merge**。
 6. 用测试 PR 验收：一位评审需一人批准；两位及以上需两人批准，无需等待第三人；其他必需检查通过后自动合并。
    再分别验证新增/移除评审人、修改请求、待审团队、撤销批准和推送新提交。
 
-检查通过后，脚本核对目标分支的实际生效规则。只有本检查绑定 GitHub Actions、要求审批并撤销旧批准，
+评审人数达标后，还需要 `ci-pipeline-passed` 或 `ci-pipeline-passed-but-overtime` 标签未满 24 小时。
+脚本核对目标分支的实际生效规则：只有评审检查和 `label-check` 都绑定 GitHub Actions，要求审批并撤销旧批准，
 且仓库开启 Auto-merge，才执行带 `--auto --merge --match-head-commit` 的合并命令。
 采用仓库当前允许的 Merge commit 方式，不使用 `--admin` 绕过规则。
 仓库开关或上述条件未配置时，只发布审批检查，不自动合并。
@@ -122,12 +124,14 @@ conda run -n py312 python .agent/scripts/check_agents_catalog.py
 使用内置 `GITHUB_TOKEN`，不需要新增密钥或仓库必需检查。关闭或已合并的 PR 不清理。
 合入默认分支后即开始生效，包括此前已经添加的标签；标签没有可验证的添加记录时会报错，不猜测时间。
 
-定时任务先撤销失效的 GitHub Actions `label-check` 通过结果，再删除过期标签。
-这是因为 `GITHUB_TOKEN` 删除标签不会触发新的 `unlabeled` 工作流，单独删除会留下旧成功结果。
-脚本检查 PR head 和当前测试合并提交上的结果；若另一个标签仍有效，则只移除过期标签。
-正常标签检查也直接验证添加时间。`Label Gate Check` 完成时会触发一次针对该 head 的核对，
-处理标签删除期间仍在运行的检查随后发布旧成功的情况。定时扫描跳过没有 CI 通过标签的 PR，
-减少 API 调用；检查完成事件会核对没有标签的情况。
+工作流先发布名为 `label-check` 的提交状态，再删除过期标签。GitHub 要求这个状态和同名的原有
+Actions 检查都通过；因此即使旧检查仍显示成功，也不能凭过期标签合入。`GITHUB_TOKEN` 删除标签不会
+触发新的 `unlabeled` 工作流，且 GitHub 不允许工作流修改 Actions 已生成的检查结果。
+只有标签仍有效且最新 Actions `label-check` 成功时，提交状态才会成功；共用同一 head 的 PR 都需要有效标签。
+
+提交状态发布到 head；测试合并提交已经有 Actions `label-check` 时，也会发布到该提交。
+若另一个 CI 标签仍有效，只移除过期标签。正常标签检查仍会直接验证添加时间。`Label Gate Check`
+完成时触发核对，即使该 head 没有 CI 标签也会检查；每次运行还会扫描有标签的 PR，避免合并触发事件后漏查。
 
 GitHub Actions 定时任务可能排队或延迟，因此实际删除发生在满 24 小时后的下一次执行，
 不能保证精确到秒，也不能保证延迟不超过 5 分钟。标签、检查状态和合并不是原子事务；
@@ -146,4 +150,4 @@ GH_REPO=mindspore-ai/hyper-parallel node .github/scripts/ci-label-expiry.mjs --d
 ```
 
 写入模式仅由可信工作流使用 `--write` 执行。合入后应手动运行一次清理工作流，
-验收标签删除和旧 `label-check` 失效；本地模拟测试不能替代 GitHub 写入权限的实际验证。
+验收标签删除以及提交状态对旧 `label-check` 成功结果的阻断；本地模拟测试不能替代 GitHub 写入权限及必需检查的实际验证。

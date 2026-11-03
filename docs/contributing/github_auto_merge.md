@@ -53,7 +53,7 @@ The policy covers `master`, `r1.0.0`, and `r1.1.0`. Add explicit branch names to
 All target branches use the policy and script from the default branch, so a PR cannot approve itself by changing its own
 policy or script. If the default branch is renamed from `master`, also update `push.branches` in the workflow.
 
-Creating, updating, reopening, closing, or changing the draft state or Reviewers of a PR triggers the check.
+Creating, updating, reopening, closing, or changing the labels, draft state or Reviewers of a PR triggers the check.
 Review submissions, edits, and dismissals trigger `workflow_run` through a separate signal workflow.
 The signal does not execute PR code, download artifacts, or use secrets. The subsequent workflow queries GitHub again
 for the current state. The main workflow checks out only the default branch, never the PR head.
@@ -73,15 +73,17 @@ It does not repeatedly publish the same status while a PR remains waiting with a
    Keep the existing `label-check` and other quality checks.
 4. Keep **Require a pull request before merging**, at least one required approval, and
    **Dismiss stale pull request approvals when new commits are pushed** enabled. Existing requirements for Code Owners,
-   independent approval of the most recent push, and conversation resolution continue to apply.
+   independent approval of the most recent push, and conversation resolution continue to apply. Set the native minimum
+   to one if a PR with one reviewer should merge after one approval; a native minimum of two still requires two approvals.
 5. Enable **Allow auto-merge** under **Settings → General → Pull Requests**.
 6. Verify with test PRs: one reviewer should require one approval; two or more reviewers should require two approvals,
    without waiting for a third. Confirm that other required checks pass before automatic merging. Also test adding or
    removing reviewers, change requests, pending teams, dismissed approvals, and new commits.
 
-After the approval check passes, the script examines the rules actually enforced on the target branch.
-It runs the merge command with `--auto --merge --match-head-commit` only when this check is bound to GitHub Actions,
-reviews and dismissal of stale approvals are required, and the repository allows auto-merge.
+After the approval check passes, the script requires a current `ci-pipeline-passed` or
+`ci-pipeline-passed-but-overtime` label less than 24 hours old. It examines the rules actually enforced on the target
+branch and runs `--auto --merge --match-head-commit` only when both `all-reviewers-approved` and `label-check` are
+required from GitHub Actions, reviews and dismissal of stale approvals are required, and the repository allows auto-merge.
 It uses the repository's currently permitted merge-commit method and does not bypass rules with `--admin`.
 If the repository setting or those conditions are missing, it only publishes the approval status without enabling
 automatic merging.
@@ -139,14 +141,16 @@ the default branch, using the built-in `GITHUB_TOKEN`. No new secrets or require
 are excluded. The feature takes effect after merging into the default branch and also applies to labels added before
 rollout. If a label has no verifiable addition record, the workflow reports an error instead of guessing its age.
 
-The scheduled job invalidates outdated passing GitHub Actions `label-check` results before deleting expired labels.
-This is necessary because removing a label with `GITHUB_TOKEN` does not trigger another `unlabeled` workflow; deletion
-alone would leave an old success in place. The script inspects results on both the PR head and the current test merge
-commit. If the other label is still valid, only the expired label is removed and the passing check is preserved.
-The regular label check also validates addition timestamps directly. Completion of **Label Gate Check** triggers another
-reconciliation for that head to handle jobs that finish with an outdated success during label cleanup.
-Scheduled scans skip PRs without CI pass labels to reduce API usage; completion-event reconciliation also checks PRs
-without those labels.
+The workflow publishes a commit status named `label-check` before removing an expired label. GitHub requires both this
+status and the existing Actions check with the same name to pass. This blocks an old passing check after label removal,
+which does not itself trigger an `unlabeled` workflow when performed with `GITHUB_TOKEN`. GitHub does not allow workflows
+to change the result of an Actions-created check run. The status becomes successful only when a label is still valid and
+the latest Actions `label-check` has succeeded. PRs sharing a head commit must all have a valid label.
+
+The status is published on the head and on a test merge commit only if that commit already has an Actions `label-check`.
+If the other CI label is still valid, only the expired label is removed. The regular label check also validates addition
+timestamps directly. Completion of **Label Gate Check** triggers reconciliation, including its head even when it has no
+CI label. Each run also scans labeled PRs so that coalesced workflow events do not leave a renewed label unchecked.
 
 GitHub Actions schedules can be queued or delayed, so removal occurs on the next execution after the 24-hour expiry.
 Neither removal at the exact second nor a maximum delay of five minutes is guaranteed. Labels, check statuses, and
@@ -167,4 +171,5 @@ GH_REPO=mindspore-ai/hyper-parallel node .github/scripts/ci-label-expiry.mjs --d
 ```
 
 Only the trusted workflow uses `--write`. After merging, manually run the cleanup workflow once to verify label deletion
-and invalidation of old `label-check` successes. Local mock tests do not replace validation of write permissions on GitHub.
+and that the matching status blocks an old `label-check` success. Local mock tests do not replace validation of write
+permissions and required-check behavior on GitHub.
