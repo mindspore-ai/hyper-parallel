@@ -259,16 +259,6 @@ class MegaMoeExperts(MulticoreModule):
     independent parameters and optimizer state.
     """
 
-    def __new__(cls, *args, enable_hot_replica: bool = False, **kwargs):
-        """Select the optional hot-replica implementation at construction time."""
-        if not isinstance(enable_hot_replica, bool):
-            raise TypeError("enable_hot_replica must be a boolean")
-        if cls is MegaMoeExperts and enable_hot_replica:
-            from hyper_multicore.moonep.mega_moe import MoonEPMegaMoeExperts  # pylint: disable=C0415
-
-            return MoonEPMegaMoeExperts(*args, **kwargs)
-        return super().__new__(cls)
-
     @classmethod
     def from_module(
         cls, module: torch.nn.Module, *, top_k: int, ep_group: Any | None = None, **execution_options: Any,
@@ -381,8 +371,9 @@ class MegaMoeExperts(MulticoreModule):
                 Disjoint PP/DP groups bootstrap independently. Only one ordered EP membership
                 can be active in SHMEM per process.
         """
-        specification = {
-            "local_num_tokens": _COMMUNICATION_SPLIT,
+        if not isinstance(enable_hot_replica, bool):
+            raise TypeError("enable_hot_replica must be a boolean")
+        configuration = {
             "hidden_size": hidden_size,
             "intermediate_size": intermediate_size,
             "num_experts": num_experts,
@@ -397,7 +388,7 @@ class MegaMoeExperts(MulticoreModule):
             "dispatch_split": dispatch_split,
             "combine_split": combine_split,
         }
-        specification["auto_tokens"] = True
+        specification = {"local_num_tokens": _COMMUNICATION_SPLIT, **configuration, "auto_tokens": True}
         specification = self._resolve_specification(specification)
         compatibility_key = tuple(
             id(value) if name == "ep_group" else value for name, value in specification.items())
@@ -407,6 +398,31 @@ class MegaMoeExperts(MulticoreModule):
             resource_scope_key=("mega_moe", shmem.root_members(ep_group) if dist.is_initialized() else id(ep_group)),
         )
         self._initialize_module_state(specification, create_parameters=create_parameters)
+        self._hot_replica_executor = None
+        if enable_hot_replica:
+            from hyper_multicore import MegaMoeExperts as MulticoreExperts  # pylint: disable=C0415
+
+            self._hot_replica_executor = MulticoreExperts(
+                **configuration, create_parameters=False, enable_hot_replica=True,
+            )
+
+    @classmethod
+    def share_execution_resources(cls, modules):
+        """Share resources inside the selected execution backend."""
+        members = tuple(modules)
+        cls._validate_shared_members(members)
+        providers = [member._hot_replica_executor for member in members]
+        if all(provider is None for provider in providers):
+            return super().share_execution_resources(members)
+        if any(provider is None for provider in providers):
+            raise ValueError("shared MegaMoeExperts must use the same enable_hot_replica setting")
+        providers[0].share_execution_resources(providers)
+
+    def close(self) -> None:
+        """Release the optional executor and this module's resource ownership."""
+        if self._hot_replica_executor is not None:
+            self._hot_replica_executor.close()
+        super().close()
 
     def _initialize_module_state(
         self, specification: Mapping[str, Any], *, create_parameters: bool,
@@ -619,6 +635,9 @@ class MegaMoeExperts(MulticoreModule):
             rebuild and compare the histogram.
         """
         weights = ((self.gate_up_weight, self.down_weight) if expert_weights is None else expert_weights)
+        if self._hot_replica_executor is not None:
+            return self._hot_replica_executor(hidden_states, topk_ids, topk_weights,
+                                              tokens_per_expert=tokens_per_expert, expert_weights=weights)
         hidden_flat = self._validate_forward_inputs(
             hidden_states,
             topk_ids,

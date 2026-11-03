@@ -185,15 +185,14 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
 
     def test_optional_hot_replica_preserves_parameter_and_forward_contract(self) -> None:
         """HotReplica selection must retain checkpoint names and current FSDP parameter views."""
-        from hyper_multicore.moonep.mega_moe import MoonEPMegaMoeExperts
-
         for enabled in (False, True):
             with self.subTest(enable_hot_replica=enabled):
                 experts = DeepseekV41MegaMoeExperts(module=_source(), enable_hot_replica=enabled)
                 self.addCleanup(experts.close_runtime)
                 parameters = tuple(experts.parameters())
                 experts.configure(None, 1, 2)
-                self.assertIs(type(experts._executor), MoonEPMegaMoeExperts if enabled else MegaMoeExperts)
+                self.assertIs(type(experts._executor), MegaMoeExperts)
+                self.assertEqual(experts._executor._hot_replica_executor is not None, enabled)
                 self.assertEqual(tuple(experts.parameters()), parameters)
                 self.assertEqual(set(experts.state_dict()), {"gate_up_proj", "down_proj"})
                 self.assertIsNone(experts._executor.gate_up_weight)
@@ -201,7 +200,8 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
                 inputs = torch.zeros(3, 8)
                 indices = torch.zeros(3, 2, dtype=torch.int32)
                 probabilities = torch.ones(3, 2)
-                with patch.object(type(experts._executor), "forward", return_value=inputs) as forward:
+                backend = experts._executor._hot_replica_executor if enabled else experts._executor
+                with patch.object(backend, "forward", return_value=inputs) as forward:
                     self.assertIs(experts(inputs, indices, probabilities), inputs)
                 self.assertIs(forward.call_args.kwargs["expert_weights"][0], parameters[0])
                 self.assertIs(forward.call_args.kwargs["expert_weights"][1], parameters[1])

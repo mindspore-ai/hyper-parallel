@@ -23,7 +23,7 @@ HP 对外提供 `enable_hot_replica` 开关。开启时调用 HyperMulticore 的
 | Native EP | false，默认 | HP 原 native EP |
 | Native EP | true | HP 调度 token 交换，外部 MoonEP 提供 placement 和借用参数 |
 | MegaMoE | false，默认 | HP 已有 MegaMoE 执行器 |
-| MegaMoE | true | 外部 MoonEPMegaMoeExperts，复用原模块参数与配置的 push/pull 模式 |
+| MegaMoE | true | 外部 MegaMoeExperts(..., enable_hot_replica=True)，复用原模块参数与配置的 push/pull 模式 |
 
 下列片段位于已有 recipe 对应 replacement 的 implementation 层级。Native 配在 **EP compute replacement**；MegaMoE 配在 **专家模块 replacement**。两个片段分别用于各自的 recipe。
 
@@ -104,7 +104,7 @@ HP 的 EPRoutedState 已有调用方按位置读取字段。普通派发继续�
 
 - **配置契约**：enable_hot_replica 为布尔值，默认 false。现有模型 replacement target 与 dispatch_mode 继续决定模型类型及传输模式。
 - **Native 接口**：hyper_multicore.moonep.native.select_native_route 返回本次 selection；hyper_multicore.moonep.execution.run_local_experts 消费本次 placement。HP 使用返回对象提供的方法，虚拟槽编号和借用表布局由提供方解释。
-- **MegaMoE 接口**：hyper_multicore.moonep.mega_moe.MoonEPMegaMoeExperts 接受 EP 拓扑和原执行配置，forward 接受 expert_weights 及原路由输入。优化器和 checkpoint 面向 HP 模型参数。
+- **MegaMoE 接口**：hyper_multicore.MegaMoeExperts(..., enable_hot_replica=True) 接受 EP 拓扑和原执行配置，forward 接受 expert_weights 及原路由输入。优化器和 checkpoint 面向 HP 模型参数。
 - **关联设计**：配套《在 HyperMulticore 实现 MoonEP 动态专家借用》给出收益公式、放置算法、两种传输后端与精度边界。[社区 MoonEP RFC](https://github.com/mindspore-ai/hyper-parallel/issues/1128) · [HP 接入 PR](https://github.com/mindspore-ai/hyper-parallel/pull/1393) · [社区 RFC 模板](https://github.com/mindspore-ai/hyper-parallel/blob/master/.github/ISSUE_TEMPLATE/003-RFC.yml)
 
 ## 完整的反馈期限
