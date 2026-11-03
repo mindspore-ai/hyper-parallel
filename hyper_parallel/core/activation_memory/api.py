@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Activation checkpointing related interfaces"""
+"""Activation checkpointing related interfaces."""
+from __future__ import annotations
+
+# Native Torch is the supported backend; the legacy backend lint predates this API.
+# pylint: disable=forbidden-backend-import
 
 __all__ = [
     "CheckpointPolicy",
@@ -37,22 +41,30 @@ __all__ = [
 
 import contextlib
 from functools import partial
-from typing import Any, Callable, Optional, Tuple
+from types import TracebackType
+from typing import Any, Callable, Iterable, Optional, Tuple
 
 import torch
+import torch.utils.checkpoint as torch_checkpoint
 
 from .policy import CheckpointPolicy
 from .recompute_state import create_recompute_contexts
+from .swap import _collect_device_storage_ptrs
+
+# Wrapper/checkpoint/SAC modules import this public API; their imports below stay
+# local to avoid initialization cycles, not to dispatch between backends.
 
 
 class _StackedCtx:
     """Compose multiple context managers as one — enter in order, exit reversed."""
 
-    def __init__(self, ctxs) -> None:
+    def __init__(self, ctxs: Iterable[contextlib.AbstractContextManager]) -> None:
+        """Retain the ordered contexts for one forward or replay invocation."""
         self._ctxs = list(ctxs)
         self._stack = contextlib.ExitStack()
 
-    def __enter__(self):
+    def __enter__(self) -> _StackedCtx:
+        """Enter all contexts, unwinding partial entry if one raises."""
         self._stack.__enter__()
         try:
             for ctx in self._ctxs:
@@ -62,7 +74,9 @@ class _StackedCtx:
             raise
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type: type[BaseException] | None, exc_val: BaseException | None,
+                 exc_tb: TracebackType | None) -> bool:
+        """Exit entered contexts in reverse order."""
         return self._stack.__exit__(exc_type, exc_val, exc_tb)
 
 
@@ -71,7 +85,7 @@ def _compose_context_fns(
 ) -> Callable[[], Tuple[_StackedCtx, _StackedCtx]]:
     """Combine ``(forward_ctx, recompute_ctx)`` factories into one factory.
 
-    ``ms.recompute`` / ``torch.utils.checkpoint(use_reentrant=False)`` call
+    Non-reentrant checkpointing call
     ``context_fn()`` once per invocation and unpack the result as
     ``(forward_ctx, recompute_ctx)``.  This helper calls each input factory
     once, then stacks all forward contexts and all recompute contexts into
@@ -79,6 +93,7 @@ def _compose_context_fns(
     single-call contract.
     """
     def factory() -> Tuple[_StackedCtx, _StackedCtx]:
+        """Build fresh context pairs for one checkpoint invocation."""
         pairs = [fn() for fn in factories]
         fwd_ctxs = [pair[0] for pair in pairs]
         rec_ctxs = [pair[1] for pair in pairs]
@@ -88,15 +103,13 @@ def _compose_context_fns(
 
 
 def is_compiling() -> bool:
-    """Return whether the caller runs inside a ``torch.compile`` capture."""
+    """Return whether the caller runs inside a graph capture."""
     return torch.compiler.is_compiling()
 
 
-def noop_context_fn():
-    """The Torch-native no-op ``context_fn``, for callers that need an explicit one."""
-    # pylint: disable=C0415
-    from torch.utils.checkpoint import noop_context_fn as _torch_noop_context_fn
-    return _torch_noop_context_fn
+def noop_context_fn() -> Callable:
+    """The native no-op ``context_fn``, for callers that need an explicit one."""
+    return torch_checkpoint.noop_context_fn
 
 
 def checkpoint_exclude_wrapper(module: Any, *, save_output: bool = True) -> Any:
@@ -116,14 +129,19 @@ def checkpoint_exclude_wrapper(module: Any, *, save_output: bool = True) -> Any:
     return _wrapper(module, save_output=save_output)
 
 
-def checkpoint_wrapper(module, **checkpoint_kwargs):
-    """Wrap *module* with HyperParallel activation checkpointing."""
+def checkpoint_wrapper(module: Any, **checkpoint_kwargs: Any) -> Any:
+    """Wrap *module* with HyperParallel activation checkpointing.
+
+    Args:
+        module: Module or callable to wrap.
+        **checkpoint_kwargs: Options forwarded to the checkpoint wrapper."""
     # pylint: disable=C0415
     from .wrapper import ckpt_wrapper
     return ckpt_wrapper(module, **checkpoint_kwargs)
 
 
-def swap_wrapper(module, policy_fn=None, group_swap=False, cpu_pool=None):
+def swap_wrapper(module: Any, policy_fn: Callable | None = None, group_swap: bool = False,
+                 cpu_pool: Any = None) -> Any:
     """Wrap *module* so its activations are offloaded to host memory.
 
     Args:
@@ -131,7 +149,7 @@ def swap_wrapper(module, policy_fn=None, group_swap=False, cpu_pool=None):
         policy_fn: Optional per-tensor swap policy.
         group_swap: Whether tensors participate in group copy fusion.
         cpu_pool: Optional pinned host memory pool for the swapped tensors.
-            Only supported by the Torch backend, so it is forwarded only when set.
+            Forwarded only when a pool is supplied.
 
     Returns:
         The configured swap wrapper.
@@ -144,7 +162,8 @@ def swap_wrapper(module, policy_fn=None, group_swap=False, cpu_pool=None):
     return _swap_wrapper(module, policy_fn=policy_fn, group_swap=group_swap, **kwargs)
 
 
-def swap_tensor_wrapper(target, tag=None, group_swap=False, cpu_pool=None):
+def swap_tensor_wrapper(target: Any, tag: str | None = None, group_swap: bool = False,
+                        cpu_pool: Any = None) -> Any:
     """Wrap a single tensor or callable for activation swap.
 
     Args:
@@ -152,7 +171,7 @@ def swap_tensor_wrapper(target, tag=None, group_swap=False, cpu_pool=None):
         tag: Optional debug tag.
         group_swap: Whether tensors participate in group copy fusion.
         cpu_pool: Optional pinned host memory pool for the swapped tensors.
-            Only supported by the Torch backend, so it is forwarded only when set.
+            Forwarded only when a pool is supplied.
 
     Returns:
         The registered tensor structure.
@@ -165,7 +184,7 @@ def swap_tensor_wrapper(target, tag=None, group_swap=False, cpu_pool=None):
     return _swap_tensor_wrapper(target, tag=tag, group_swap=group_swap, **kwargs)
 
 
-def get_class_activation_wrapper():
+def get_class_activation_wrapper() -> type:
     """Return the :class:`ActivationWrapper` base class of this backend."""
     # pylint: disable=C0415
     from .wrapper import ActivationWrapper
@@ -173,15 +192,24 @@ def get_class_activation_wrapper():
 
 
 def ignore_sac_ops(ignore_ops: list) -> None:
-    """Exclude backend operators from selective-AC replay accounting."""
+    """Exclude backend operators from selective-AC replay accounting.
+
+    Args:
+        ignore_ops: Operators excluded from replay accounting."""
     # pylint: disable=C0415
     from .sac import ignore_sac_ops as _ignore_sac_ops
     _ignore_sac_ops(ignore_ops)
 
 
-def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation=False,
-                                         group_swap=False, cpu_pool=None):
-    """Create HyperParallel selective-checkpoint ``(forward_ctx, recompute_ctx)`` contexts."""
+def create_selective_checkpoint_contexts(policy_fn_or_list: Callable | list, allow_cache_entry_mutation: bool = False,
+                                         group_swap: bool = False, cpu_pool: Any = None) -> tuple:
+    """Create selective-checkpoint forward and recompute contexts.
+
+    Args:
+        policy_fn_or_list: Operator policy or list of operators to save.
+        allow_cache_entry_mutation: Whether cached saved entries may be changed.
+        group_swap: Whether to fuse host copies.
+        cpu_pool: Optional pinned host memory pool."""
     # pylint: disable=C0415
     from .sac import create_selective_checkpoint_contexts as _create_contexts
     return _create_contexts(
@@ -192,36 +220,53 @@ def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mu
     )
 
 
-def create_native_selective_checkpoint_contexts(policy_fn):
-    """Create Torch-native selective-checkpoint contexts for compile capture."""
+def create_native_selective_checkpoint_contexts(policy_fn: Callable) -> tuple:
+    """Create native selective-checkpoint contexts for compile capture.
+
+    Args:
+        policy_fn: Policy selecting saved and recomputed operators."""
     # pylint: disable=C0415
     from .compile_adapter import create_native_selective_checkpoint_contexts as _create_contexts
     return _create_contexts(policy_fn)
 
 
-def async_save_on_cpu(policy_fn=None, group_swap: bool = False, cpu_pool=None):
-    """Return the async host-offload context used by :func:`swap` and ``swap_inputs``."""
+def async_save_on_cpu(policy_fn: Callable | None = None, group_swap: bool = False,
+                      cpu_pool: Any = None) -> contextlib.AbstractContextManager:
+    """Return the async host-offload context used by swap and input swap.
+
+    Args:
+        policy_fn: Optional policy selecting tensors to save or swap.
+        group_swap: Whether to fuse host copies.
+        cpu_pool: Optional pinned host memory pool."""
     # pylint: disable=C0415
     from .wrapper import AsyncSaveOnCpu
     return AsyncSaveOnCpu(policy_fn=policy_fn, group_swap=group_swap, cpu_pool=cpu_pool)
 
 
-def recompute_handle_collector_ctx():
+def recompute_handle_collector_ctx() -> contextlib.AbstractContextManager:
     """Return the context that collects recompute handles for a checkpoint region."""
     # pylint: disable=C0415
     from .checkpoint import recompute_handle_collector_ctx as _collector_ctx
     return _collector_ctx()
 
 
-def recompute_handle(handle, session_id):
-    """Recompute the region behind *handle* under *session_id*."""
+def recompute_handle(handle: Any, session_id: Any) -> Any:
+    """Recompute the region behind *handle* under *session_id*.
+
+    Args:
+        handle: Saved recompute handle.
+        session_id: Owning replay session."""
     # pylint: disable=C0415
     from .checkpoint import recompute_handle as _recompute_handle
     return _recompute_handle(handle, session_id)
 
 
-def recompute_session_ctx(session_id, retain_on_unpack=False):
-    """Open a recompute session so replay can unpack saved activations."""
+def recompute_session_ctx(session_id: Any, retain_on_unpack: bool = False) -> contextlib.AbstractContextManager:
+    """Open a recompute session so replay can unpack saved activations.
+
+    Args:
+        session_id: Non-null identifier for the replay session.
+        retain_on_unpack: Whether unpacked values remain available to later consumers."""
     if session_id is None:
         raise ValueError("session_id must not be None.")
     # pylint: disable=C0415
@@ -229,8 +274,11 @@ def recompute_session_ctx(session_id, retain_on_unpack=False):
     return _session_ctx(session_id=session_id, retain_on_unpack=retain_on_unpack)
 
 
-def clear_recompute_session(session_id):
-    """Release all state held for *session_id*."""
+def clear_recompute_session(session_id: Any) -> None:
+    """Release all state held for *session_id*.
+
+    Args:
+        session_id: Identifier of the session to clear."""
     # pylint: disable=C0415
     from .checkpoint import clear_recompute_session as _clear
     return _clear(session_id)
@@ -259,7 +307,7 @@ def _validate_compile_checkpoint_options(
         raise ValueError(
             "HyperParallel checkpoint compile mode does not support: "
             + ", ".join(unsupported)
-            + ". Use Torch-native non-reentrant checkpointing with optional "
+            + ". Use native non-reentrant checkpointing with optional "
             "SAVE/RECOMPUTE selective policies."
         )
 
@@ -289,27 +337,47 @@ def _make_checkpoint_context_fn(
     return _compose_context_fns(tuple(factories))
 
 
-def _checkpoint_input_context(swap_inputs: bool, group_swap: bool, cpu_pool: Any) -> Any:
-    """Create the optional context that offloads checkpoint inputs."""
+def _checkpoint_input_context(swap_inputs: bool, group_swap: bool, cpu_pool: Any,
+                              args: tuple, keep_indices: tuple[int, ...]) -> Any:
+    """Offload inputs except explicitly retained positional tensors and aliases."""
     if not swap_inputs:
         return contextlib.nullcontext()
+    if not isinstance(keep_indices, tuple) or any(
+            isinstance(index, bool) or not isinstance(index, int) or index < 0 or index >= len(args)
+            for index in keep_indices):
+        raise ValueError("swap_input_keep_indices must be a tuple of valid nonnegative positional input indices")
     async_kwargs = {"group_swap": group_swap}
     if cpu_pool is not None:
         async_kwargs["cpu_pool"] = cpu_pool
+    if keep_indices:
+        protected = _collect_device_storage_ptrs(tuple(args[index] for index in keep_indices))
+
+        def input_policy(tensor: torch.Tensor) -> CheckpointPolicy:
+            """Retain aliased storage still owned by a subsequent forward consumer.
+
+            Args:
+                tensor: Saved input tensor whose storage may be shared.
+            """
+            if _collect_device_storage_ptrs(tensor).intersection(protected):
+                return CheckpointPolicy.MUST_SAVE
+            return CheckpointPolicy.MUST_SWAP
+
+        async_kwargs["policy_fn"] = input_policy
     return async_save_on_cpu(**async_kwargs)
 
 
 def checkpoint(
-    function,
-    *args,
+    function: Callable,
+    *args: Any,
     swap_inputs: bool = False,
+    swap_input_keep_indices: tuple[int, ...] = (),
     policy_fn: Optional[Callable] = None,
     context_fn: Optional[Callable[[], Tuple[object, object]]] = None,
     group_swap: bool = False,
-    cpu_pool=None,
+    cpu_pool: Any = None,
     early_stop: bool = True,
-    **kwargs,
-):
+    **kwargs: Any,
+) -> Any:
     """
     Apply activation checkpointing to a function with optional input swapping.
 
@@ -317,11 +385,11 @@ def checkpoint(
         function: The function to apply checkpointing to.
         *args: Arguments to pass to the function.
         swap_inputs (bool): Whether to enable input swapping using async_save_on_cpu context.
+        swap_input_keep_indices: Positional inputs whose aliased storage is still used by later regions.
         policy_fn (callable, optional): Function that determines checkpoint policy for operations.
         context_fn (callable, optional): A no-arg factory returning a
             ``(forward_ctx, recompute_ctx)`` pair, matching the
-            ``context_fn`` contract of ``ms.recompute(use_reentrant=False)``
-            and ``torch.utils.checkpoint(use_reentrant=False)``.  Use this
+            native non-reentrant ``context_fn`` contract.  Use this
             to bracket the backward-time forward re-run with custom logic.
             When ``policy_fn``, ``group_swap`` and ``context_fn`` are
             supplied together, the resulting factories are composed: their
@@ -330,7 +398,7 @@ def checkpoint(
         group_swap (bool, optional): Whether MUST_SWAP tensors participate in group copy fusion.
             Only effective when ``policy_fn`` is provided. Default: ``False``.
         cpu_pool (PinnedMemoryPool, optional): Explicit pinned host memory pool used by tensors
-            selected for swapping. Currently supported only by the Torch backend. Default: ``None``.
+            selected for swapping. Default: ``None``.
         early_stop (bool, optional): Whether recomputation stops after all tensors needed by
             backward have been produced. This per-call keyword is the only supported way to
             configure early stop. Default: ``True``.
@@ -360,7 +428,7 @@ def checkpoint(
             kwargs.get("preserve_rng_state", True),
         )
 
-    with _checkpoint_input_context(swap_inputs, group_swap, cpu_pool):
+    with _checkpoint_input_context(swap_inputs, group_swap, cpu_pool, args, swap_input_keep_indices):
         checkpoint_kwargs = {**kwargs, "use_reentrant": False, "early_stop": early_stop}
         if composed_context_fn is not None:
             checkpoint_kwargs["context_fn"] = composed_context_fn
@@ -369,7 +437,8 @@ def checkpoint(
         return hyper_checkpoint(function, *args, **checkpoint_kwargs)
 
 
-def swap(function, *args, policy_fn=None, group_swap=False, cpu_pool=None, **kwargs):
+def swap(function: Callable, *args: Any, policy_fn: Callable | None = None, group_swap: bool = False,
+         cpu_pool: Any = None, **kwargs: Any) -> Any:
     """Apply activation swap to a function call.
 
     Offloads intermediate activations saved by the autograd engine to CPU
@@ -388,7 +457,7 @@ def swap(function, *args, policy_fn=None, group_swap=False, cpu_pool=None, **kwa
         group_swap (bool, optional): Whether swapped tensors participate in
             group copy fusion.  Default: ``False``.
         cpu_pool (PinnedMemoryPool, optional): Explicit pinned host memory pool used by swapped
-            tensors. Currently supported only by the Torch backend. Default: ``None``.
+            tensors. Default: ``None``.
         **kwargs: Keyword arguments forwarded to *function*.
 
     Returns:
@@ -400,7 +469,7 @@ def swap(function, *args, policy_fn=None, group_swap=False, cpu_pool=None, **kwa
     if is_compiling():
         raise ValueError(
             "HyperParallel activation swap is not supported in compile mode. "
-            "Use Torch-native non-reentrant checkpointing with SAVE/RECOMPUTE policies."
+            "Use native non-reentrant checkpointing with SAVE/RECOMPUTE policies."
         )
     async_kwargs = {"policy_fn": policy_fn, "group_swap": group_swap}
     if cpu_pool is not None:

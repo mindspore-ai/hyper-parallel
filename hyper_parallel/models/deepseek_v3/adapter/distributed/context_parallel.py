@@ -23,65 +23,16 @@ from typing import Any, Literal
 # Native Torch is required, as in the existing CP adapters; the legacy lint rule predates that migration.
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
-from torch.nn import functional as F  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.modules.mla_attention import MLAAttention
-from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.distributed._builder.forward_rewriter import _ForwardRewriteRequest
+from hyper_parallel.distributed.context_parallel.mla_backward_overlap import (
+    MLAOutputExchange, mla_output_projection_request, restore_mla_output_gradient,
+)
 from hyper_parallel.distributed.context_parallel.mla_context_parallel import (
-    MLACPPlan, MLAContextParallel, MLACPStrategy, MLADimensions,
+    MLACPStrategy, prepare_mla_cp,
 )
 from hyper_parallel.distributed.recipe_spec import inner_wrapper
-
-
-def _head_projection_request(projection: nn.Linear, head_dim: int) -> _ForwardRewriteRequest:
-    """Select head rows inside the original Linear call to preserve parameter hooks."""
-    original = projection.forward
-
-    # Keep nn.Linear.forward(input=...) compatible with keyword callers.
-    @wraps(original)
-    def head_projection(  # pylint: disable=redefined-builtin
-        input: torch.Tensor, *, mla_head_range: tuple[int, int] | None = None,
-    ) -> torch.Tensor:
-        """Project selected contiguous heads inside the original module call.
-
-        Args:
-            input: Latent activations with the original Linear input width.
-            mla_head_range: Optional half-open range of TP-local heads.
-
-        Returns:
-            Activations projected onto the requested head rows.
-        """
-        if mla_head_range is None:
-            return original(input)
-        begin, end = mla_head_range
-        if not 0 <= begin < end <= projection.weight.shape[0] // head_dim:
-            raise ValueError("MLA projection head range is outside the original parameter")
-        rows = slice(begin * head_dim, end * head_dim)
-        bias = None if projection.bias is None else projection.bias[rows]
-        # Read parameters inside the managed module's forward, after pre-hooks.
-        # Slicing preserves the Parameter identity and scatters gradients back.
-        return F.linear(input, projection.weight[rows], bias)  # pylint: disable=not-callable
-
-    return _ForwardRewriteRequest(projection, head_projection)
-
-
-def _validate_up_projections(target_module: MLAAttention, plan: MLACPPlan) -> None:
-    """Check TP-local Linear weights without replacing managed parameters."""
-    dimensions = plan.dimensions
-    projections = (
-        (target_module.q_b_proj, dimensions.q_rank, dimensions.qk_dim),
-        (target_module.kv_b_proj, dimensions.kv_rank, dimensions.nope_dim + dimensions.value_dim),
-    )
-    for projection, in_features, head_dim in projections:
-        # Quantized/LoRA subclasses do not obey contiguous Linear head slicing.
-        if type(projection) is not nn.Linear:  # pylint: disable=unidiomatic-typecheck
-            raise ValueError("MLA CP requires plain nn.Linear up projections")
-        weight = projection.weight.to_local() if isinstance(projection.weight, DTensor) else projection.weight
-        if weight.shape != (plan.local_heads * head_dim, in_features):
-            raise ValueError("MLA up-projection shape must match TP-local heads; apply TP parameter sharding first")
-        if getattr(projection.forward, "__func__", None) is not nn.Linear.forward:
-            raise ValueError("MLA CP must be installed before other up-projection forward adapters")
 
 
 @inner_wrapper
@@ -94,6 +45,7 @@ def mla_cp_wrapper(
     *,
     strategy: MLACPStrategy = "expanded_ulysses",
     overlap: bool = False,
+    backward_overlap: bool = False,
     ulysses_degree: int | None = None,
     kv_exchange: Literal["all_gather", "all_to_all_v"] = "all_gather",
 ) -> list[_ForwardRewriteRequest]:
@@ -112,6 +64,7 @@ def mla_cp_wrapper(
         ep_mesh: Unused expert axis supplied by the recipe rewriter.
         strategy: Expanded QKV Ulysses or expanded Q with latent KV AllGather.
         overlap: Overlap forward input communication with independent MLA projections.
+        backward_overlap: Overlap output-gradient communication with output weight gradients at TP1.
         ulysses_degree: Defaults to CP size; at TP1, one selects KV AllGather,
             and intermediate CP divisors select Ulysses x AllGather.
         kv_exchange: Full KV collection or selective causal-prefix distribution.
@@ -120,30 +73,19 @@ def mla_cp_wrapper(
         Atomic forward rewrites preserving projection parameters and hooks.
     """
     del mesh, ep_mesh
+    if not isinstance(backward_overlap, bool):
+        raise ValueError("backward_overlap must be bool")
     if not isinstance(target_module, MLAAttention):
         raise ValueError("mla_cp_wrapper requires the MLAAttention replacement")
-    for name, axis in (("TP", tp_mesh), ("CP", cp_mesh)):
-        if axis is not None and (axis.size() < 1 or getattr(axis, "ndim", 1) != 1):
-            raise ValueError(f"mla_cp_wrapper requires a one-dimensional {name} mesh")
-    cp_degree = 1 if cp_mesh is None else cp_mesh.size()
-    tp_degree = 1 if tp_mesh is None else tp_mesh.size()
-    if getattr(target_module, "mla_cp_runtime", None) is not None:
-        raise ValueError("MLA CP is already configured on this module")
-    if target_module.attention_dropout != 0 or target_module.sliding_window is not None:
-        raise ValueError("MLA CP requires dropout=0 and no implicit sliding_window; use a supported boolean mask")
-    dimensions = MLADimensions(
-        heads=target_module.config.num_attention_heads, q_rank=target_module.q_lora_rank,
-        kv_rank=target_module.kv_lora_rank, nope_dim=target_module.qk_nope_head_dim,
-        rope_dim=target_module.qk_rope_head_dim, value_dim=target_module.v_head_dim,
+    runtime, child_requests = prepare_mla_cp(
+        target_module, cp_mesh, tp_mesh, strategy=strategy,
+        overlap=overlap, ulysses_degree=ulysses_degree, kv_exchange=kv_exchange,
     )
-    plan = MLACPPlan(
-        dimensions=dimensions, cp_degree=cp_degree, strategy=strategy,
-        tp_degree=tp_degree, overlap=overlap, ulysses_degree=ulysses_degree, kv_exchange=kv_exchange,
-    )
-    plan.validate_scale(target_module.scaling)
-    _validate_up_projections(target_module, plan)
+    if backward_overlap:
+        if runtime.plan.tp_degree != 1 or runtime.plan.ulysses_degree <= 1:
+            raise ValueError("MLA output backward overlap requires TP1 and Ulysses degree greater than one")
+        child_requests.append(mla_output_projection_request(target_module.o_proj))
     original = target_module.forward
-    runtime = MLAContextParallel(plan, cp_mesh)
 
     @wraps(original)
     def cp_forward(
@@ -173,15 +115,18 @@ def mla_cp_wrapper(
         attn_output, attn_weights = runtime(
             target_module, *target_module.project_latent_inputs(hidden_states),
             position_embeddings=position_embeddings, attention_mask=attention_mask,
-            actual_seq_len=actual_seq_len, **kwargs,
+            actual_seq_len=actual_seq_len, restore_output=not backward_overlap, **kwargs,
         )
+        if backward_overlap:
+            state = MLAOutputExchange(runtime.ulysses_mesh, target_module.v_head_dim)
+            local = runtime.restore_output(attn_output.detach()).reshape(batch_size, sequence_length, -1)
+            local = restore_mla_output_gradient(attn_output, local, state)
+            return target_module.o_proj(local, mla_output_exchange=state), attn_weights
         attn_output = attn_output.reshape(batch_size, sequence_length, -1).contiguous()
-        return target_module.o_proj(attn_output), attn_weights
+        return target_module.project_output(attn_output, hidden_states), attn_weights
 
     requests = [_ForwardRewriteRequest(
         target_module, cp_forward,
         companion_attrs={"mla_cp_runtime": runtime},
     )]
-    if strategy == "latent_kv_head":
-        requests.append(_head_projection_request(target_module.kv_b_proj, dimensions.nope_dim + dimensions.value_dim))
-    return requests
+    return requests + child_requests

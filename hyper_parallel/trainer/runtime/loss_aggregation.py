@@ -1,3 +1,4 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
 # Copyright 2025-2026 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,16 +16,49 @@
 
 from typing import Union
 
-import torch
+import torch  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.data.constants import IGNORE_INDEX
+
+
+def _foundation_token_count(obj: dict) -> torch.Tensor:
+    """Count the intersection of aligned targets and the optional loss mask."""
+    labels = obj.get("shift_labels")
+    if labels is None and bool(obj.get("labels_are_shifted", False)):
+        labels = obj["labels"]
+    loss_mask = obj.get("loss_mask")
+    if labels is None:
+        labels = obj["labels"][..., 1:]
+        if loss_mask is not None:
+            loss_mask = loss_mask[..., 1:]
+    # IGNORE_INDEX and loss_mask are independent exclusion mechanisms;
+    # global loss weighting must count the same intersection as CE.
+    valid_targets = labels != IGNORE_INDEX
+    if loss_mask is not None:
+        if loss_mask.shape != labels.shape:
+            raise ValueError(
+                "loss_mask must match the labels after causal alignment, "
+                f"got labels={tuple(labels.shape)} and "
+                f"aligned_mask={tuple(loss_mask.shape)}"
+            )
+        valid_targets = valid_targets & loss_mask.to(torch.bool)
+    foundation_tokens = torch.sum(valid_targets)
+    return foundation_tokens
 
 
 def count_loss_token(
     batches: Union[list[dict[str, torch.Tensor]], dict[str, torch.Tensor]],
 ) -> dict[str, torch.Tensor]:
     # FIXME: VeOmni version -> AutoModels version
-    """Calculate the total number of text_tokens/image_tokens/** for loss in a global batch, or one micro batch."""
+    """Count valid targets for each loss across the supplied microbatches.
+
+    Args:
+        batches: One microbatch or the list of microbatches in a training step.
+            Aligned targets use shift_labels; raw labels receive a causal shift.
+
+    Returns:
+        Per-loss valid target counts before distributed aggregation.
+    """
     if isinstance(batches, dict):
         batches = [batches]
     token_len: dict[str, torch.Tensor] = {}
@@ -34,24 +68,7 @@ def count_loss_token(
             # ``shift_labels`` already aligns one target with every local hidden
             # position. Otherwise align both labels and mask with the causal
             # next-token prediction before counting.
-            labels = obj.get("shift_labels")
-            loss_mask = obj.get("loss_mask")
-            if labels is None:
-                labels = obj["labels"][..., 1:]
-                if loss_mask is not None:
-                    loss_mask = loss_mask[..., 1:]
-            # IGNORE_INDEX and loss_mask are independent exclusion mechanisms;
-            # global loss weighting must count the same intersection as CE.
-            valid_targets = labels != IGNORE_INDEX
-            if loss_mask is not None:
-                if loss_mask.shape != labels.shape:
-                    raise ValueError(
-                        "loss_mask must match the labels after causal alignment, "
-                        f"got labels={tuple(labels.shape)} and "
-                        f"aligned_mask={tuple(loss_mask.shape)}"
-                    )
-                valid_targets = valid_targets & loss_mask.to(torch.bool)
-            foundation_tokens = torch.sum(valid_targets)
+            foundation_tokens = _foundation_token_count(obj)
             if "foundation_tokens" in token_len:
                 foundation_tokens = token_len["foundation_tokens"] + foundation_tokens
             token_len["foundation_tokens"] = foundation_tokens  # text tokens
@@ -59,7 +76,8 @@ def count_loss_token(
             for key in obj.keys():
                 if key.endswith("_labels") and key != "shift_labels":
                     token_name = key.split("_labels")[0]
-                    token_len[f"{token_name}_tokens"] = torch.sum(obj[key] != IGNORE_INDEX)  # image generation tokens
+                    token_key = f"{token_name}_tokens"
+                    token_len[token_key] = token_len.get(token_key, 0) + torch.sum(obj[key] != IGNORE_INDEX)
 
             if "image_output_mask" in obj:
                 image_decoder_tokens = torch.sum(obj["image_output_mask"])

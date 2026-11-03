@@ -17,7 +17,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections import deque
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
@@ -55,6 +56,7 @@ class OmniParallelBatch:
             pp_shared_data: bool = False,
             runtime_input_adapter: RuntimeInputAdapter | None = None,
             data_config: Mapping[str, Any] | None = None,
+            prefetch_step_on_cpu: bool = False,
     ) -> None:
         """Create the DataLoader ownership and TP/CP transport context.
 
@@ -64,6 +66,8 @@ class OmniParallelBatch:
             pp_shared_data: Whether pipeline stages share the source batch.
             runtime_input_adapter: Provider of additional forward inputs.
             data_config: Dataset cache settings used by DataLoader ownership.
+            prefetch_step_on_cpu: Prepare accumulation-window token counts while
+                retaining heavy payloads on the CPU until their micro-step.
         """
         # if encoder_dp:
         #     raise NotImplementedError("OmniParallelBatch encoder_dp image-bucket distribution is not implemented")
@@ -92,6 +96,46 @@ class OmniParallelBatch:
         self.tp_broadcaster = TPBatchBroadcaster(self.parallel_context, device)
         self.batch_transport = None
         self._batch_index = 0
+        self.prefetch_step_on_cpu = prefetch_step_on_cpu
+
+    def prepare_step(self, data_iterator: Any, num_micro_steps: int,
+                     token_counter: Callable) -> tuple[Any, dict[str, torch.Tensor] | None]:
+        """Prepare exact step counts without transferring future media payloads.
+
+        Args:
+            data_iterator: Source iterator owned by this data-parallel rank.
+            num_micro_steps: Number of batches consumed by the optimizer step.
+            token_counter: Trainer-owned counter accepting CP-local encoded batches.
+
+        Returns:
+            An iterator over prepared CPU batches and device token counts, or the
+            unchanged iterator and None when CPU window preparation is disabled.
+
+        Note:
+            The opt-in path consumes one complete accumulation window on the CPU.
+            Checkpoints remain optimizer-step boundaries; device transport and
+            runtime callbacks still execute once per actual micro-step.
+        """
+        if not self.prefetch_step_on_cpu:
+            return data_iterator, None
+        batches = deque()
+        counts = None
+        if self.parallel_context.build_on_rank():
+            for _ in range(num_micro_steps):
+                batch = next(data_iterator)
+                if any(torch.is_tensor(value) and value.device.type != "cpu" for value in batch.values()):
+                    raise ValueError("CPU step preparation requires CPU DataLoader tensors")
+                batches.append(batch)
+            local_batches = [self.cp_sharder.shard(self._normalize_source_batch(batch)) for batch in batches]
+            counts = token_counter(local_batches)
+        counts = self.tp_broadcaster.broadcast(counts, broadcast_all_fields=True)
+        return self._consume_cpu_batches(batches), counts
+
+    @staticmethod
+    def _consume_cpu_batches(batches: deque):
+        """Release consumed host payloads while leaving device transfer to __call__."""
+        while batches:
+            yield batches.popleft()
 
     def __call__(
             self,
@@ -122,7 +166,7 @@ class OmniParallelBatch:
             device_batch = self.tp_broadcaster.broadcast(local_batch, broadcast_all_fields=True)
         else:
             device_batch, transport_inputs = self.batch_transport(local_batch, self.tp_broadcaster)
-        runtime_inputs = self._build_runtime_inputs(device_batch)
+        runtime_inputs = self._build_runtime_inputs({**device_batch, **transport_inputs})
         model_inputs, loss_inputs = self._split_model_and_loss_inputs(device_batch)
         if set(transport_inputs).intersection((*device_batch, *runtime_inputs)):
             raise ValueError("batch transport cannot replace Omni model or runtime inputs")
@@ -339,6 +383,8 @@ class TextParallelBatch:
             options={
                 "source_type": self.source_type,
                 "attention_mode": self.attention_runtime.mode,
+                "reset_attention_mask": self.attention_runtime.reset_mask,
+                "reset_position_ids": self.reset_position_ids,
                 "causal": self.causal,
                 "sliding_window": self.sliding_window,
             },
