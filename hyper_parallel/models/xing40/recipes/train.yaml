@@ -1,0 +1,233 @@
+# Xing4.0-29B: DeepSeek-V3 architecture with mHC (40 layers, 64 routed experts, 4 residual
+# streams; 29.5B parameters plus a 0.77B MTP depth), 4k pretraining on 8 NPUs with FSDP.
+# Expert parallelism: add --accelerator.ep_size=<n>. The MindFormers 29B reference trains
+# without MTP: --model.config.num_nextn_predict_layers=0 matches it.
+# Weights: random initialization, or a checkpoint through checkpoint.restore_from.
+# NPU modules (plan_overrides): framework MLA, RMSNorm and grouped experts. The mHC modules
+# call the framework's fused mhc_pre/mhc_post, which need omni_training_custom_ops on NPU.
+model:
+  _target_: hyper_parallel.models.xing40.adapter.builder.build_model
+  config:
+    vocab_size: 131072
+    hidden_size: 3584
+    intermediate_size: 9216
+    moe_intermediate_size: 1024
+    num_hidden_layers: 40
+    first_k_dense_replace: 2
+    max_position_embeddings: 4096
+    num_attention_heads: 32
+    num_key_value_heads: 32
+    q_lora_rank: 768
+    kv_lora_rank: 512
+    qk_rope_head_dim: 64
+    qk_nope_head_dim: 128
+    v_head_dim: 128
+    rms_norm_eps: 1.0e-06
+    hidden_act: silu
+    rope_parameters:
+      rope_type: default
+      rope_theta: 10000.0
+    # MindFormers YaRN attention scale: mscale = 0.1*ln(scaling_factor)+1,
+    # softmax_scale = mscale**2 / sqrt(qk_head_dim). 1.0 keeps DeepSeek-V3's scale.
+    scaling_factor: 40.0
+    n_routed_experts: 64
+    num_experts_per_tok: 4
+    n_shared_experts: 1
+    routed_scaling_factor: 2.0
+    norm_topk_prob: true
+    n_group: 1
+    topk_group: 1
+    moe_aux_loss_coeff: 0.0006
+    moe_router_enable_expert_bias: true
+    moe_router_bias_update_rate: 0.001
+    use_pad_tokens: true
+    num_residual_streams: 4
+    use_fused_mhc: true
+    mhc_sinkhorn_iterations: 20
+    mhc_init_gating_factor: 0.01
+    mhc_layernorm_epsilon: 1.0e-06
+    num_nextn_predict_layers: 1
+    mtp_loss_factor: 0.3
+    chunk_loss_size: 4096
+    use_cache: false
+    tie_word_embeddings: false
+model_init_dtype: float32
+loss_fn:
+  _target_: hyper_parallel.components.losses.ModelOutputLoss
+training:
+  train_iters: 600
+  global_batch_size: 8
+  micro_batch_size: 1
+  backend: hccl
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: true
+accelerator:
+  tp_size: 1
+  ep_size: 1
+  cp_size: 1
+  pp_size: 1
+fsdp_config:
+  dp_shard_size: 8
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    cast_forward_inputs: false
+    # Keep FP32 embedding lookup/scatter; the model unconditionally casts its output to
+    # BF16 before residual expansion (Xing40Model.embed_inputs). Router, mHC and RMSNorm
+    # also compute in FP32.
+    custom_params:
+      'model.embed_tokens.weight':
+        param_dtype: float32
+      '*.mlp.gate.weight':
+        param_dtype: float32
+      '*_hc_pre.*':
+        param_dtype: float32
+      '*.hc_head.*':
+        param_dtype: float32
+      '*norm.weight':
+        param_dtype: float32
+activation_checkpoint:
+  mode: full
+dataset:
+  _target_: hyper_parallel.data.text.build_dataset.build_indexed_text_dataset
+  data_path: /path/to/mmap_deepseekv3_datasets_text_document
+  model_assets:
+    tokenizer:
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
+      tokenizer_type: pretokenized
+      vocab_size: 131072
+      eod_token_id: 1
+  data_config:
+    seq_length: 4096
+    split: 1, 0, 0
+    mock_data: false
+    distributed_walk: true
+    data_lazy_load: true
+    mmap_bin_files: true
+    skip_data_check: true
+    is_dataset_from_mr: false
+    simple_blend: "no"
+    create_ltor_fields_in_dataloader: false
+    # The model attends causally over the whole sequence.
+    create_attention_mask_in_dataloader: false
+    reset_position_ids: false
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_indexed_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.TextParallelBatch
+    source_type: indexed
+    attention_mode: dense
+  # Sequential over the GPTDataset's own shuffled index (MindFormers shuffle: false).
+  sampler_type: single
+  drop_last: true
+  num_workers: 0
+optimizer:
+  _target_: hyper_parallel.models.xing40.adapter.optim.build_optimizer
+  fp32_main_params: true
+  muon_config:
+    muon_lr: 1.0e-05
+    muon_weight_decay: 0.1
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_ns_steps: 5
+    muon_ns_variant: legacy
+    matched_adamw_rms: 0.2
+  adamw_config:
+    adamw_lr: 1.0e-05
+    adamw_weight_decay: 0.1
+    adamw_betas:
+    - 0.95
+    - 0.95
+    adamw_eps: 1.0e-08
+  qk_clip_threshold: 100.0
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: constant
+  lr_config:
+    lr: 1.0e-05
+    lr_warmup_steps: 0
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ./outputs/xing40/checkpoints
+  save_steps: 100
+  restore_from: null
+plan_overrides:
+# NPU MLA: the framework MLAAttention (one fused linear_qkv down projection) with the
+# MindFormers FP32 RoPE and the logit maxima QK clipping consumes. It swaps its latent
+# norms for the NPU RMSNorm itself, so the norm entry below leaves them out.
+- match: '*.self_attn'
+  replace:
+    kind: module
+    source_type: transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3Attention
+    exact_type: true
+    implementation:
+      _target_: hyper_parallel.models.xing40.adapter.conversion.module_replacement.Xing40MLAAttention
+# Fused NPU RMSNorm, as in the MindFormers reference: the input, post-attention and MTP final
+# layernorms ('*[!a]_layernorm' skips the attention's q_a_/kv_a_layernorm), and model.norm
+# and the MTP enorm/hnorm.
+- match:
+  - '*[!a]_layernorm'
+  - '*[.eh]norm'
+  replace:
+    kind: module
+    source_type: transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3RMSNorm
+    exact_type: true
+    implementation:
+      _target_: hyper_parallel.components.modules.rms_norm.RMSNorm
+# Grouped-GEMM NPU experts: permute, grouped matmul and unpermute with the routing weights in
+# the activation dtype, as MindFormers.
+- match: '*.mlp.experts'
+  replace:
+    kind: module
+    source_type: transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3Experts
+    exact_type: true
+    implementation:
+      _target_: hyper_parallel.components.modules.GroupedExperts
+# The mHC mixings, the stream-collapse head and the MTP fusion projection are replicated,
+# token-wise modules.
+- match: '*_hc_pre'
+  params:
+    branch_alpha:
+      tp: replicate
+    branch_beta:
+      tp: replicate
+- match: '*_hc_pre.phi'
+  params:
+    weight:
+      tp: replicate
+- match: '*.hc_head'
+  params:
+    hc_fn:
+      tp: replicate
+    hc_base:
+      tp: replicate
+    hc_scale:
+      tp: replicate
+- match: mtp.layers.*.eh_proj
+  params:
+    weight:
+      tp: replicate
+# Routed MoE layers: decoder layers from first_k_dense_replace=2 on, and the MTP depths.
+- match: model.layers.[2-9].mlp.forward
+  when: ep
+  region_dispatch: false
+  replace:
+    kind: method
+    implementation: &moe_ep_compute
+      _target_: hyper_parallel.models.xing40.adapter.distributed.expert_parallel.xing40_ep_compute_fn
+- match: model.layers.[1-9][0-9].mlp.forward
+  when: ep
+  region_dispatch: false
+  replace:
+    kind: method
+    implementation: *moe_ep_compute
+- match: mtp.layers.*.transformer_layer.mlp.forward
+  when: ep
+  region_dispatch: false
+  replace:
+    kind: method
+    implementation: *moe_ep_compute
