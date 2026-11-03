@@ -115,14 +115,14 @@ def test_parallel_args_build_new_distributed_setup_for_cp_ep(monkeypatch):
         reshard_after_forward=False,
         plan_overrides=[
             {
-                "match": "*.mlp",
+                "match": "*.mlp.forward",
                 "when": "ep",
-                "region_dispatch": False,
-                "local_compute_fn": {
-                    "_target_": (
+                "replace": {
+                    "kind": "method",
+                    "implementation": (
                         "hyper_parallel.distributed.expert_parallel.recipes."
                         "routed_only_ep_compute_fn"
-                    )
+                    ),
                 },
             }
         ],
@@ -136,10 +136,10 @@ def test_parallel_args_build_new_distributed_setup_for_cp_ep(monkeypatch):
     assert build_calls == [(mesh, "npu", 8)]
     cp_spec = distributed_setup.plan_overrides["*.self_attn"]
     assert cp_spec.inner_target == "self"
-    assert cp_spec.inner_wrapper == "sdpa_hf"
+    assert cp_spec.inner_wrapper.callable.__name__ == "sdpa_hf_cp_wrapper"
     assert cp_spec.region_dispatch is False
     ep_spec = distributed_setup.plan_overrides["*.mlp"]
-    assert ep_spec.local_compute_fn is not None
+    assert ep_spec.local_compute_fn.callable.__name__ == "routed_only_ep_compute_fn"
     assert ep_spec.region_dispatch is False
     strategy = distributed_setup.strategy_config
     assert strategy.dp_shard_size == 4
@@ -159,7 +159,7 @@ def test_parallel_args_do_not_enable_model_specific_replacements_by_default(monk
     setup = HyperParallelArguments(cp_size=2, device_type="npu").build_distributed_setup()
 
     cp_spec = setup.plan_overrides["*.self_attn"]
-    assert cp_spec.inner_wrapper == "sdpa_hf"
+    assert cp_spec.inner_wrapper.callable.__name__ == "sdpa_hf_cp_wrapper"
     assert not setup.module_replacements
 
 
