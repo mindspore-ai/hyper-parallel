@@ -20,6 +20,7 @@ dtype no-op vs cast, and invalid input handling. All tests run on CPU.
 import os
 import unittest
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import MagicMock, patch
 
 # Force torch platform before any hyper_parallel imports
@@ -34,15 +35,17 @@ from hyper_parallel.core.fully_shard.api import HSDPModule, _extend_module_with_
 from hyper_parallel.core.fully_shard import hsdp_state as state_mod
 from hyper_parallel.core.fully_shard.param_group import AllReduceParamGroup
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPStateV2, _to_dtype_if_needed
+from tests.common.mark_utils import arg_mark
 
 
 class _FakeGroup:
     """Small process group double with only size() implemented."""
 
-    def __init__(self, size=2):
+    def __init__(self, size: int = 2) -> None:
+        """Set the simulated process-group size."""
         self._size = size
 
-    def size(self):
+    def size(self) -> int:
         """Return fake process group size."""
         return self._size
 
@@ -53,15 +56,16 @@ class _FakeHSDPParam:
     def __init__(
         self,
         *,
-        requires_grad=True,
-        is_sharded=True,
-        shard_size=2,
-        dp_size=2,
-        grad=None,
-        unsharded_grad=None,
-        accumulated_grad=None,
-        device=None,
-    ):
+        requires_grad: bool = True,
+        is_sharded: bool = True,
+        shard_size: int = 2,
+        dp_size: int = 2,
+        grad: Optional[torch.Tensor] = None,
+        unsharded_grad: Optional[torch.Tensor] = None,
+        accumulated_grad: Optional[torch.Tensor] = None,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        """Initialize local tensor and communication state for state-machine tests."""
         self.is_sharded = is_sharded
         self.shard_size = shard_size
         self.shard_world_size = shard_size
@@ -121,7 +125,7 @@ class _FakeHSDPParam:
         )
         self._grad = None
 
-    def reduce_comm_dtype(self, grad=None) -> torch.dtype:
+    def reduce_comm_dtype(self, grad: Optional[torch.Tensor] = None) -> torch.dtype:
         """Return the effective reduction dtype for this parameter double."""
         if self.reduce_dtype is not None:
             return self.reduce_dtype
@@ -140,7 +144,8 @@ class _FakeHSDPParam:
         self.all_reduce_comm_ctx.all_reduce_output = None
 
     @property
-    def unsharded_param(self):
+    def unsharded_param(self) -> SimpleNamespace:
+        """Return the full-parameter double exposed to the scheduler."""
         return self._unsharded_param
 
 
@@ -184,7 +189,7 @@ def _new_root_scheduler(state):
 class TestToDtypeIfNeeded(unittest.TestCase):
     """Unit tests for _to_dtype_if_needed (tensor dtype cast or no-op)."""
 
-    def setUp(self):
+    def setUp(self) -> None:
         """Set up test fixtures before each test method."""
         self.device = torch.device("cpu")
 
@@ -511,15 +516,20 @@ class TestHSDPStateV2(unittest.TestCase):
             torch.tensor([100.0, 100.0], dtype=torch.bfloat16),
         )
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_root_finalization_applies_reduced_grad_only_once(self):
-        """Repeated root finalization should not accumulate the same reduced gradient twice."""
+        """Feature: Root gradient finalization.
+        Description: Finalize the same reduced gradient more than once.
+        Expectation: The optimizer gradient receives the contribution exactly once.
+        """
         current_output = torch.tensor([3.0, 4.0])
         param = _FakeHSDPParam(dp_size=1, grad=torch.tensor([10.0, 10.0]))
         param.reduce_partial_output = torch.tensor([1.0, 2.0])
         param.reduce_scatter_output.return_value = current_output
         param.reduce_scatter_comm_ctx.reduce_scatter_output = current_output
 
-        def apply_reduced_grad(grad):
+        def apply_reduced_grad(grad: torch.Tensor) -> bool:
+            """Apply the reduced contribution to the existing optimizer gradient."""
             param.sharded_param.grad.add_(grad)
             return False
 
@@ -628,8 +638,12 @@ class TestHSDPStateV2(unittest.TestCase):
         param.apply_reduced_grad.assert_called_once_with(reduced_grad)
         torch.testing.assert_close(param.sharded_param.grad, existing_grad)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_mixed_comm_fusion_root_waits_non_fused_reduce_scatter_before_apply(self):
-        """A fused root must drain a non-fused child's RS before applying its output."""
+        """Feature: Mixed communication finalization.
+        Description: Finalize a non-fused child from a fused root.
+        Expectation: RS completes before the next reduction and gradient application.
+        """
         reduced_grad = torch.tensor([1.0, 2.0])
         source_grad = torch.tensor([3.0, 4.0])
         handle = MagicMock()
@@ -639,7 +653,8 @@ class TestHSDPStateV2(unittest.TestCase):
         param.reduce_scatter_comm_ctx.reduce_scatter_output = reduced_grad
         param.reduce_scatter_comm_ctx.reduce_scatter_handle = handle
 
-        def wait_reduce_scatter():
+        def wait_reduce_scatter() -> torch.Tensor:
+            """Expose RS output after releasing its consumed input."""
             self.assertIs(param._grad, source_grad)
             events.append("wait_rs")
             handle.wait()
@@ -647,12 +662,14 @@ class TestHSDPStateV2(unittest.TestCase):
             param._grad = None
             return reduced_grad
 
-        def launch_tp_reduce(grad, reduce_op):
+        def launch_tp_reduce(grad: torch.Tensor, reduce_op: object) -> None:
+            """Record that the preceding RS result enters the next reduction."""
             self.assertIs(grad, reduced_grad)
             self.assertEqual(reduce_op, torch.distributed.ReduceOp.AVG)
             events.append("tp_reduce")
 
-        def apply_reduced_grad(grad):
+        def apply_reduced_grad(grad: torch.Tensor) -> bool:
+            """Verify that the finalized contribution is applied after its wait."""
             self.assertIsNone(param.reduce_scatter_comm_ctx.reduce_scatter_handle)
             self.assertIs(grad, reduced_grad)
             events.append("apply")
@@ -669,7 +686,8 @@ class TestHSDPStateV2(unittest.TestCase):
         scheduler._is_root = True
         scheduler._backward_hook = MagicMock()
 
-        def launch_child_reduce_scatter():
+        def launch_child_reduce_scatter() -> None:
+            """Queue the child RS for root finalization in the same iteration."""
             events.append("launch_rs")
             fused_root_state.scheduler_ctx.pre_reduce_scatter_params.append(param)
 
@@ -686,8 +704,12 @@ class TestHSDPStateV2(unittest.TestCase):
         handle.wait.assert_called_once_with()
         self.assertIsNone(param._grad)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_state_reset_releases_iteration_state_and_preserves_optimizer_grads(self):
-        """State reset should release communication storage but preserve optimizer gradients."""
+        """Feature: Iteration state cleanup.
+        Description: Reset populated gather and gradient communication contexts.
+        Expectation: Temporary references are cleared while optimizer gradients persist.
+        """
         grad = torch.tensor([3.0, 4.0])
         main_grad = torch.tensor([5.0, 6.0])
         param = _FakeHSDPParam(
@@ -697,6 +719,7 @@ class TestHSDPStateV2(unittest.TestCase):
         )
         param.sharded_param.main_grad = main_grad
         param.unsharded_param_buffers = [torch.ones(2)]
+        param.allgather_comm_ctx.allgather_input = torch.ones(2)
         param.allgather_comm_ctx.allgather_output = torch.ones(2)
         param.allgather_comm_ctx.allgather_handle = MagicMock()
         param.reduce_scatter_comm_ctx.reduce_scatter_output = torch.ones(2)
@@ -722,6 +745,7 @@ class TestHSDPStateV2(unittest.TestCase):
         self.assertEqual(state.scheduler_ctx.pre_all_reduce_params, [])
         self.assertEqual(state.scheduler_ctx.pre_all_reduce_groups, [])
         self.assertEqual(state.scheduler_ctx.pending_all_reduce_groups, [])
+        self.assertIsNone(param.allgather_comm_ctx.allgather_input)
         self.assertIsNone(param.allgather_comm_ctx.allgather_output)
         self.assertIsNone(param.allgather_comm_ctx.allgather_handle)
         self.assertIsNone(param.reduce_scatter_comm_ctx.reduce_scatter_output)

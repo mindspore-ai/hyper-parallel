@@ -71,16 +71,18 @@ class AllReduceCommCtx:
 
 @dataclass
 class AllGatherCommCtx:
-    """Per-parameter all-gather output and asynchronous work."""
+    """Per-parameter all-gather buffers and asynchronous work."""
 
     allgather_output: Optional[torch.Tensor] = None
     allgather_handle: Optional[dist.Work] = None
+    allgather_input: Optional[torch.Tensor] = None
 
 
 class ParameterHookMigrator:
     """Preserve parameter backward hooks across HSDP parameter replacement."""
 
     def __init__(self) -> None:
+        """Initialize the hook registry preserved across parameter replacement."""
         self._orig_param_hooks: List[Callable] = []
         self._saved_hook_ids: set[int] = set()
 
@@ -140,7 +142,7 @@ class HSDPParamV2:
         offload_policy: Optional[OffloadPolicy] = None,
         device: Optional[torch.device] = None,
         source_shard_info: Optional[SourceShardMetaInfo] = None,
-    ):
+    ) -> None:
         """
         Initialize HSDPParamV2 and shard the parameter.
 
@@ -394,6 +396,11 @@ class HSDPParamV2:
 
     @reduce_partial_output.setter
     def reduce_partial_output(self, value: Optional[torch.Tensor]) -> None:
+        """Replace accumulated contributions.
+
+        Args:
+            value: Partial reduced gradient, or None after consumption.
+        """
         self._reduce_partial_output = value
 
     def reduce_comm_dtype(self, grad: Optional[torch.Tensor] = None) -> torch.dtype:
@@ -574,6 +581,23 @@ class HSDPParamV2:
             spmd_placements[self._spmd_shard_mesh_dim] = fsdp_placement
         self._spmd_placements = tuple(spmd_placements)
 
+    def _init_mesh_sizes(self) -> None:
+        """Resolve shard and replica counts before parameter partitioning."""
+        if isinstance(self.mesh_info, FSDPMeshInfo):
+            self.shard_rank = self.mesh_info.shard_mesh_rank
+            self.shard_world_size = self.mesh_info.shard_mesh_size
+        else:
+            self.shard_rank = 0
+            self.shard_world_size = 1
+        if isinstance(self.mesh_info, DDPMeshInfo):
+            self.replicate_world_size = self.mesh_info.replicate_mesh_size
+        else:
+            self.replicate_world_size = 1
+        self.is_replicate_param = (
+            isinstance(self.mesh_info, DDPMeshInfo)
+            and not isinstance(self.mesh_info, HSDPMeshInfo)
+        )
+
     @torch.no_grad()
     def _init_sharded_param(
         self,
@@ -595,21 +619,7 @@ class HSDPParamV2:
             )
         self._orig_size = param_data.size()
         self._contiguous_orig_stride = make_contiguous_strides_for(self._orig_size)
-
-        if isinstance(self.mesh_info, FSDPMeshInfo):
-            self.shard_rank = self.mesh_info.shard_mesh_rank
-            self.shard_world_size = self.mesh_info.shard_mesh_size
-        else:
-            self.shard_rank = 0
-            self.shard_world_size = 1
-        if isinstance(self.mesh_info, DDPMeshInfo):
-            self.replicate_world_size = self.mesh_info.replicate_mesh_size
-        else:
-            self.replicate_world_size = 1
-        self.is_replicate_param = (
-            isinstance(self.mesh_info, DDPMeshInfo)
-            and not isinstance(self.mesh_info, HSDPMeshInfo)
-        )
+        self._init_mesh_sizes()
 
         self._init_shard_placements(
             param_data,
@@ -683,7 +693,7 @@ class HSDPParamV2:
         world_size: int,
         device: torch.device,
         force_recreate: bool = False,
-    ):
+    ) -> None:
         """
         Allocate buffers that hold unsharded parameter data.
 
@@ -1083,6 +1093,7 @@ class HSDPParamV2:
         )
         self.alloc_unsharded_param_buffers()
 
+        self.allgather_comm_ctx.allgather_input = all_gather_input
         self.allgather_comm_ctx.allgather_output = self.unsharded_param_buffers[0]
         if self.hsdp_placement.dim != 0:
             # Non-dim-0 sharding uses an extra all-gather buffer before
@@ -1156,6 +1167,18 @@ class HSDPParamV2:
         if self.allgather_comm_ctx.allgather_handle is not None:
             self.allgather_comm_ctx.allgather_handle.wait()
             self.allgather_comm_ctx.allgather_handle = None
+
+        all_gather_input = self.allgather_comm_ctx.allgather_input
+        if all_gather_input is not None and self.device.type != "cpu":
+            # A prefetched gather may be waited on a different stream. Its input
+            # must survive backend wait cleanup, which may release saved tensors.
+            # Record afterwards so that cleanup cannot erase this dependency.
+            stream = torch.get_device_module(self.device).current_stream(self.device)
+            all_gather_input.record_stream(stream)
+            self.unsharded_param_buffers[0].record_stream(stream)
+            if self.allgather_comm_ctx.allgather_output is not None:
+                self.allgather_comm_ctx.allgather_output.record_stream(stream)
+        self.allgather_comm_ctx.allgather_input = None
 
         self.init_unsharded_param()
         self.to_unsharded()

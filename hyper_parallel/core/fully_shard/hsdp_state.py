@@ -16,26 +16,34 @@
 # pylint: disable=protected-access
 
 from collections import defaultdict
-from typing import List, Mapping, Optional
+from typing import Callable, List, Mapping, Optional, TYPE_CHECKING, Union
 
 import torch
 import torch.distributed as dist
 from torch import nn
 
 from hyper_parallel.tools.logging import get_logger
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.core.fully_shard.hsdp_utils import (
     _get_param_module_infos,
 )
 from hyper_parallel.core.fully_shard.utils import (
     CPUOffloadPolicy,
+    CommFusionPolicy,
     DDPMeshInfo,
     FSDPMeshInfo,
     HSDPMeshInfo,
+    MixedPrecisionPolicy,
+    OffloadPolicy,
     SourceShardMetaInfo,
 )
 from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
 from hyper_parallel.core.fully_shard.param_group import HSDPParamGroup, AllReduceParamGroup
+
+if TYPE_CHECKING:
+    from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerContext
 
 logger = get_logger("FSDP")
 
@@ -61,18 +69,18 @@ class HSDPStateV2:
 
     def __init__(
         self,
-        cell,
-        mesh,
-        shard_placement_fn,
-        comm_fusion_policy,
-        mp_policy,
-        offload_policy,
-        raw_ignored_params,
-        raw_replicate_params,
-        scheduler_ctx,
-        device,
+        cell: nn.Module | list[nn.Module] | tuple[nn.Module, ...],
+        mesh: DeviceMesh,
+        shard_placement_fn: Optional[Callable[[nn.Parameter], Optional[Shard]]],
+        comm_fusion_policy: CommFusionPolicy,
+        mp_policy: MixedPrecisionPolicy,
+        offload_policy: OffloadPolicy,
+        raw_ignored_params: Optional[set[nn.Parameter]],
+        raw_replicate_params: Optional[set[nn.Parameter]],
+        scheduler_ctx: "HSDPSchedulerContext",
+        device: torch.device,
         source_shard_infos: Optional[Mapping[torch.nn.Parameter, SourceShardMetaInfo]] = None,
-    ):
+    ) -> None:
         """
         Initialize HSDPStateV2.
 
@@ -251,7 +259,7 @@ class HSDPStateV2:
                 f"{[(p._param_fqn, p.sharded_param.device) for p in hsdp_params_not_on_cpu]}\n"
             )
 
-    def lazy_init(self):
+    def lazy_init(self) -> None:
         """Deferred initialization: reset sharded params, validate devices, and set mixed-precision dtypes."""
         if self.is_shard and not self._reset_sharded_params:
             for hsdp_param in self.hsdp_params:
@@ -275,7 +283,7 @@ class HSDPStateV2:
                 "call module.reset_parameters() on each module to initialize values."
             )
 
-    def post_backward_for_comm_fusion(self):
+    def post_backward_for_comm_fusion(self) -> None:
         """post_backward_for_comm_fusion."""
         logger.debug("post_backward module=%s mode=comm_fusion enter", self)
         # Fused gradient reduction path: first apply any pending async reduction
@@ -298,7 +306,7 @@ class HSDPStateV2:
                 reduce_scatter_reduce_op=self.reduce_op_type,
             )
 
-    def post_backward(self, *unused):  # pylint: disable=unused-argument
+    def post_backward(self, *unused: object) -> None:  # pylint: disable=unused-argument
         """Reduce gradients and reshard parameters after backward."""
         logger.debug(
             "post_backward module=%s enter reduce_grads=%s comm_fusion=%s reshard_after_backward=%s",
@@ -504,7 +512,7 @@ class HSDPStateV2:
         self.scheduler_ctx.pending_all_reduce_groups.clear()
 
     def reset_iter_state(self) -> None:
-        """Clear Torch communication bookkeeping without clearing optimizer gradients."""
+        """Clear communication bookkeeping without clearing optimizer gradients."""
         self.scheduler_ctx.pre_reduce_scatter_params.clear()
         self.scheduler_ctx.pre_all_reduce_params.clear()
         self.scheduler_ctx.pre_all_reduce_groups.clear()
@@ -514,6 +522,7 @@ class HSDPStateV2:
         for hsdp_param in self.hsdp_params:
             hsdp_param.allgather_comm_ctx.allgather_handle = None
             hsdp_param.allgather_comm_ctx.allgather_output = None
+            hsdp_param.allgather_comm_ctx.allgather_input = None
             hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_handle = None
             hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output = None
             hsdp_param.all_reduce_comm_ctx.all_reduce_handle = None
@@ -634,12 +643,15 @@ class HSDPStateV2:
                 param.wait_for_unshard()
         self.is_shard = False
 
-    def set_gradient_scaling_factor(self, factor):
+    def set_gradient_scaling_factor(self, factor: Optional[Union[float, torch.Tensor]]) -> None:
         """Propagate the gradient scaling factor to the layer that applies it.
 
         The factor is consumed on the reduce input: ``param_group.foreach_reduce``
         for the fused (comm_fusion) path, or per-parameter ``reduce_scatter_grad``
         / ``all_reduce_grad`` otherwise. The state does not hold a copy.
+
+        Args:
+            factor: Scalar multiplier applied before reduction, or None.
         """
         if self.param_group is not None:
             self.param_group.gradient_scaling_factor = factor

@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test HSDPParamV2"""
+"""Distributed HSDP parameter tests.
+
+CPU coverage of reduce_partial_output and asynchronous input ownership lives in
+tests/ut/core/fully_shard/test_param.py.
+"""
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 from tests.common.distributed_launcher import torchrun_case
