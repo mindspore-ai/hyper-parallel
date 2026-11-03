@@ -311,6 +311,24 @@ class HSDPModule:
         """set is_last_backward flag"""
         self.hsdp_scheduler.scheduler_ctx.is_last_backward = is_last_backward
 
+    def set_isolated_backward(self, isolated_backward: bool = True) -> None:
+        """Configure a unit whose backward completes inside an outer forward.
+
+        Its hooks do not publish or clear the process-wide root backward state,
+        and an unrelated root backward does not make its forward a recompute.
+        The unit must have detached inputs and stay outside checkpoint replays
+        and the outer graph's backward. This setting applies to this unit only.
+
+        Args:
+            isolated_backward: Whether this unit uses independent early backward.
+
+        Raises:
+            ValueError: If the argument is not a bool.
+        """
+        if not isinstance(isolated_backward, bool):
+            raise ValueError("isolated_backward must be a bool")
+        self.hsdp_scheduler.isolated_backward = isolated_backward
+
     def set_requires_all_reduce(self, requires_all_reduce: bool, *, recurse: bool = True) -> None:
         """set requires_all_reduce flag"""
         if not isinstance(requires_all_reduce, bool):
