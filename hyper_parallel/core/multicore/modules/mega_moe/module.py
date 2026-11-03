@@ -259,6 +259,16 @@ class MegaMoeExperts(MulticoreModule):
     independent parameters and optimizer state.
     """
 
+    def __new__(cls, *args, enable_hot_replica: bool = False, **kwargs):
+        """Select the optional hot-replica implementation at construction time."""
+        if not isinstance(enable_hot_replica, bool):
+            raise TypeError("enable_hot_replica must be a boolean")
+        if cls is MegaMoeExperts and enable_hot_replica:
+            from hyper_multicore.moonep.mega_moe import MoonEPMegaMoeExperts  # pylint: disable=C0415
+
+            return MoonEPMegaMoeExperts(*args, **kwargs)
+        return super().__new__(cls)
+
     @classmethod
     def from_module(
         cls, module: torch.nn.Module, *, top_k: int, ep_group: Any | None = None, **execution_options: Any,
@@ -326,6 +336,7 @@ class MegaMoeExperts(MulticoreModule):
         intermediate_size: int,
         num_experts: int,
         top_k: int,
+        enable_hot_replica: bool = False,
         swiglu_limit: float | None = None,
         ep_size: int | None = None,
         ep_group: Any | None = None,
@@ -343,6 +354,7 @@ class MegaMoeExperts(MulticoreModule):
             hidden_size: Input and output hidden dimension.
             intermediate_size: SwiGLU intermediate dimension per expert.
             num_experts: Global routed-expert count.
+            enable_hot_replica: Enable per-invocation expert borrowing on overloaded EP ranks.
             top_k: Experts selected for every token.
             initial_capacity_factor: Push initial receive rows as a multiple of local routed rows.
                 Defaults to 1.25 for push; omitted for pull. Must be finite and at least 1.0.
