@@ -109,6 +109,30 @@ def _assert_same(actual, expected, *, exact=True):
                                    atol=0 if exact else 2e-6, msg=lambda message, field=name: f"{field}: {message}")
 
 
+
+def _assert_protocol_compatible(actual, expected):
+    """Report RD ordering differences using the existing layer regression budget.
+
+    The 0.003 relative-L2 guard belongs to this fixed test case, not a universal
+    training-accuracy guarantee. Exact replay and reset isolation remain separate.
+    """
+    worst = (0., "", 0., 0.)
+    failures = []
+    for name, value in actual.items():
+        reference = expected[name].double()
+        delta = value.double() - reference
+        norm = float(reference.norm())
+        relative = float(delta.norm()) / max(norm, 1e-30)
+        maximum = float(delta.abs().max())
+        if relative > worst[0]:
+            worst = (relative, name, norm, maximum)
+        if not torch.isfinite(value).all() or relative > .003:
+            failures.append(f"{name}: rel_l2={relative:.8g}, ref_norm={norm:.8g}, abs_max={maximum:.8g}")
+    print(f"RD protocol comparison rank={dist.get_rank()} worst={worst}", flush=True)
+    if failures:
+        raise AssertionError("TND RD comparison: " + "; ".join(failures))
+
+
 def _isolation(wrapper, inputs, grad, offsets, rank, length):
     """Loss in later documents must have exactly zero derivative on the first."""
     value = inputs.detach().clone().requires_grad_()
@@ -126,7 +150,8 @@ def _protocol_options(kind, npu, size):
     if kind == "kda":
         options.insert(1, (2, "p2p"))
         if npu:
-            options += [(1, "allgather"), (1, "grouped_allgather_p2p"), (2, "allgather")]
+            options += [(1, "allgather"), (1, "grouped_allgather_p2p"), (2, "allgather"),
+                            (1, "recursive_doubling"), (2, "recursive_doubling")]
             if size >= 8:
                 options.append((2, "grouped_allgather_p2p"))
     return options
@@ -168,6 +193,8 @@ def _run(npu):
             _assert_same(actual, expected)
             if method == "p2p":
                 references[degree] = expected
+            elif method == "recursive_doubling":
+                _assert_protocol_compatible(expected, references[degree])
             else:
                 _assert_same(expected, references[degree])
             _isolation(wrapper, local, do, offsets, rank, length)

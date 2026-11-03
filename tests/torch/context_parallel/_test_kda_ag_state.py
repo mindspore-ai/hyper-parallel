@@ -66,7 +66,8 @@ def _check(mesh, width):
     local_m = [matrices[rank].to(device), (matrices[rank] * .95).to(device)]
     output = [protocol.forward((states[rank] * (1 + step)).to(device), local_m[step]) for step in range(2)]
     for step in (1, 0):
-        actual = protocol.backward(gradients[rank].to(device), local_m[step])
+        state, cache = output[step]
+        actual = protocol.backward(gradients[rank].to(device), cache)
         expected = torch.zeros_like(states[0], dtype=torch.float64)
         adjoint = torch.zeros_like(expected)
         maps = matrices * (.95 if step else 1.)
@@ -74,7 +75,7 @@ def _check(mesh, width):
             expected = maps[index].double() @ expected + (states[index] * (1 + step)).double()
         for index in range(size - 1, rank, -1):
             adjoint = gradients[index].double() + maps[index].double().transpose(-1, -2) @ adjoint
-        torch.testing.assert_close(output[step].cpu().double(), expected, atol=2e-6, rtol=2e-5)
+        torch.testing.assert_close(state.cpu().double(), expected, atol=2e-6, rtol=2e-5)
         torch.testing.assert_close(actual.cpu().double(), adjoint, atol=2e-6, rtol=2e-5)
         torch.testing.assert_close(local_m[step].cpu(), maps[rank], atol=0, rtol=0)
     if any(isinstance(value, torch.Tensor) for value in vars(protocol).values()):

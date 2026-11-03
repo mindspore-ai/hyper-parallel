@@ -160,7 +160,6 @@ optimizer:
 plan_overrides:
   - match: "*.linear_attn.forward"
     when: cp
-    region_dispatch: false
     replace:
       kind: method
       implementation:
@@ -174,6 +173,8 @@ plan_overrides:
             config = parse_training_args([str(path)])
 
         entry = config.plan_overrides[0]
+        self.assertFalse(entry.region_dispatch)
+        self.assertNotIn("region_dispatch", entry.to_dict())
         self.assertEqual(entries_to_plan_overrides([entry], cp_size=1), {})
         active = entries_to_plan_overrides([entry], cp_size=4)
         self.assertIs(active["*.linear_attn"].inner_wrapper, entry.replace.implementation)
