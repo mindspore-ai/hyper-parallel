@@ -14,7 +14,7 @@
 # ============================================================================
 """Public module and RL examples share a namespace in either import order."""
 
-from importlib.util import find_spec
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -27,7 +27,12 @@ class TestExampleNamespaces(unittest.TestCase):
 
     def test_public_examples_coexist_with_rl_examples(self) -> None:
         """Import both example trees before and after adding the independent RL root."""
-        rl_root = Path(find_spec("hyper_parallel").origin).parent / "rl"
+        repo_root = Path(__file__).resolve().parents[3]
+        rl_root = repo_root / "hyper_parallel" / "rl"
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = os.pathsep.join(
+            filter(None, (str(repo_root), environment.get("PYTHONPATH")))
+        )
         for family_first in (True, False):
             program = f"""
 import sys
@@ -45,5 +50,6 @@ assert gsm8k.__file__
                 result = subprocess.run(
                     [sys.executable, "-c", program], cwd=directory,
                     capture_output=True, text=True, check=False, timeout=120,
+                    env=environment,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

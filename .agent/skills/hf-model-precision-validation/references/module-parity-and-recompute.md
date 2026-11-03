@@ -74,27 +74,27 @@ each consumer reads and that state from one forward cannot leak into another.
 Compare both outputs and gradients through producer-to-consumer edges.
 
 Whole-layer activation replay can be invalid when forward mutates or republishes
-shared state. Determine the maximum safe boundary from model semantics. Attention,
-compressor, or indexer activations may need to remain in the ordinary autograd
-graph while norms and MLP/MoE are checkpointed. This is still the model's maximum
-safe "full" policy; report the actual wrapped FQNs instead of implying the entire
-decoder is replayed.
+shared state. Determine safe targets from model semantics and express exceptions
+with explicit `full.exclude_region` or `selective` module paths. Non-module replay
+invariants, such as pinning a callable's discrete Top-K result, belong in the model
+adapter's post-install activation-checkpoint hook; that hook must not choose or
+expand targets. Report the actual wrapped FQNs instead of implying that an adapter
+chooses safe regions automatically.
 
 ## Recomputation Matrix
 
 Test at least these explicit selections:
 
-- `layer_count: 0`;
-- one intermediate prefix such as `layer_count: 2`, which selects layers 0 and 1
-  rather than spreading selections uniformly;
-- the maximum safe prefix or an explicit `layer_indices` set;
+- an empty `recompute_layer` set, which disables activation checkpointing;
+- one intermediate set such as `[0-1]`;
+- the maximum intended explicit layer set;
 - repeated maximum-safe run to check stability;
 - Production and strict Validate for one representative recomputation topology.
 
 Use the same checkpoint, data hashes, global batch, routing seeds, and optimizer
 state. Require aligned loss and global norm for at least ten consecutive paired
 optimizer steps in formal end-to-end self-consistency, not just the first forward.
-Read back the resolved selection and record exact wrapper
+Read back the resolved layer set and record exact wrapper
 count/FQNs, step time, peak memory, and whether
 shared-state producers were retained or replayed.
 

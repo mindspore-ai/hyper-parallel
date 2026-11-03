@@ -22,7 +22,7 @@ from hyper_parallel.models.deepseek_v41.adapter.conversion.checkpoint_mapping im
     register_deepseek_v41_checkpoint_mapping,
 )
 from hyper_parallel.models.deepseek_v41.adapter.policies.activation_checkpointing import (
-    build_recompute_policy,
+    configure_deepseek_v41_activation_checkpointing,
 )
 from hyper_parallel.models.deepseek_v41.adapter.policies.sharding import (
     build_parameter_sharding_rules,
@@ -96,7 +96,7 @@ DEEPSEEK_V41_ADAPTER_SPEC = ModelAdapterSpec(
     fsdp_wrap_modules=get_fsdp_wrap_modules,
     fsdp_excluded_subtrees=get_fsdp_excluded_subtrees,
     fsdp_execution_order=get_fsdp_execution_order,
-    recompute=build_recompute_policy,
+    activation_checkpointing=configure_deepseek_v41_activation_checkpointing,
     validation=_load_validation_spec,
     encoder_parallel=_load_encoder_parallel_spec,
     loss=_load_loss,

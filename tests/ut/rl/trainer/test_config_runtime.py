@@ -38,7 +38,11 @@ def _validated_recipe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
     """Provide a valid baseline so each negative case isolates one configuration error."""
     monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "0")
     monkeypatch.setenv("LOCAL_RANK", "0")
-    monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: torch.device("npu"))
+    monkeypatch.setattr(
+        torch.accelerator,
+        "current_accelerator",
+        lambda: SimpleNamespace(type="npu"),
+    )
     monkeypatch.setitem(config_module.ENVIRONMENTS._items, "ut-config-environment", lambda _context: object())
     config = resolve_vllm_automatic_limits(_complete_config(tmp_path))
     validate_config(config, build_algorithm(config["algorithm"]))
@@ -234,7 +238,11 @@ def test_complete_config_resolves_validates_and_builds_runtime(
     config = _complete_config(tmp_path)
     monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "0")
     monkeypatch.setenv("LOCAL_RANK", "0")
-    monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: torch.device("npu"))
+    monkeypatch.setattr(
+        torch.accelerator,
+        "current_accelerator",
+        lambda: SimpleNamespace(type="npu"),
+    )
     monkeypatch.setitem(
         config_module.ENVIRONMENTS._items,
         "ut-config-environment",
@@ -321,7 +329,11 @@ def fixture_validation_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     config["rollout"]["vllm"]["max_num_seqs"] = 2
     config["train"]["accelerator"]["dp_shard"] = 2
     monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "0,1,2,3")
-    monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: torch.device("npu"))
+    monkeypatch.setattr(
+        torch.accelerator,
+        "current_accelerator",
+        lambda: SimpleNamespace(type="npu"),
+    )
     monkeypatch.setitem(config_module.ENVIRONMENTS._items, "ut-config-environment", lambda _context: object())
     return config
 

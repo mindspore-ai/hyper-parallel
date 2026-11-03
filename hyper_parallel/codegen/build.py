@@ -62,15 +62,7 @@ def _build_and_publish(config: Any, artifact_dir: Optional[str]) -> ArtifactLayo
         config.model.build(
             distributed_setup=distributed_setup,
             peft_config=config.peft,
-            activation_checkpoint=config.activation_checkpoint.mode,
-            activation_checkpoint_selection=config.activation_checkpoint.selection,
-            swap_inputs=getattr(config.activation_checkpoint, "swap_inputs", False),
-            allow_cache_entry_mutation=getattr(
-                config.activation_checkpoint,
-                "allow_cache_entry_mutation",
-                False,
-            ),
-            activation_swap=config.activation_swap,
+            activation_checkpoint=config.activation_checkpoint,
             compile_config=config.compile,
             model_init_dtype=config.model_init_dtype,
         )

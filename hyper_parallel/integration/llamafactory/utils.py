@@ -32,6 +32,7 @@ from hyper_parallel.distributed.mesh import DistributedSetup, MeshContext
 from hyper_parallel.models import FSDP2Config, FSDP2MixedPrecisionConfig
 from hyper_parallel.models.build_options import get_device_id, get_device_type
 from hyper_parallel.trainer.config.parallelism import (
+    ActivationCheckpointConfig,
     PlanOverride,
     entries_to_module_replacements,
     entries_to_plan_overrides,
@@ -88,8 +89,7 @@ class HyperParallelArguments:
     fsdp_size: int | None = None
     plan_overrides: list[dict] | None = None
 
-    activation_mode: str = "none"
-    activation_swap_inputs: bool = True
+    activation_checkpoint: ActivationCheckpointConfig | dict | None = None
 
     @staticmethod
     def _validate_positive_int(name: str, value: int) -> None:
@@ -161,12 +161,9 @@ class HyperParallelArguments:
                 "reshard_after_forward must be a bool when provided, "
                 f"got {type(self.reshard_after_forward).__name__}."
             )
-        valid_activation_modes = {"none", "recompute", "swap"}
-        if self.activation_mode not in valid_activation_modes:
-            raise ValueError(
-                f"activation_mode must be one of {sorted(valid_activation_modes)}, "
-                f"got {self.activation_mode!r}."
-            )
+        self.activation_checkpoint = _resolve_activation_checkpoint(
+            self.activation_checkpoint
+        )
         if self.plan_overrides is not None and not isinstance(self.plan_overrides, list):
             raise ValueError("plan_overrides must be a list when provided.")
 
@@ -252,9 +249,10 @@ class HyperParallelArguments:
     def from_dict(cls, config: dict) -> "HyperParallelArguments":
         """Build arguments from a plain dict."""
         known_fields = set(cls.__dataclass_fields__)  # pylint: disable=no-member
-        parallel_args = cls(
-            **{key: value for key, value in config.items() if key in known_fields}
-        )
+        unknown_fields = sorted(set(config) - known_fields)
+        if unknown_fields:
+            raise ValueError(f"unknown hyper_parallel_args fields: {unknown_fields}")
+        parallel_args = cls(**config)
         parallel_args.validate()
         return parallel_args
 
@@ -282,15 +280,26 @@ class HyperParallelArguments:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_activation_checkpoint(
+    value: ActivationCheckpointConfig | dict | None,
+) -> ActivationCheckpointConfig | None:
+    """Normalize LlamaFactory activation settings to the shared Trainer DTO."""
+    if value is None or isinstance(value, ActivationCheckpointConfig):
+        return value
+    return resolve_component(
+        value,
+        annotation=ActivationCheckpointConfig,
+        path="hyper_parallel_args.activation_checkpoint",
+    )
+
+
 def parallelize_model(
     model: nn.Module,
     distributed_setup: DistributedSetup,
     *,
     pretrained_path: str | None = None,
     device: torch.device | None = None,
-    activation_checkpoint: str | None = None,
-    activation_swap: str = "none",
-    swap_inputs: bool = False,
+    activation_checkpoint: ActivationCheckpointConfig | dict | None = None,
     validate_placement: bool = False,
     model_init_dtype: str | None = None,
 ) -> nn.Module:
@@ -327,9 +336,7 @@ def parallelize_model(
         pretrained_path=pretrained_path,
         validate_placement=validate_placement,
         distributed_setup=distributed_setup,
-        activation_checkpoint=activation_checkpoint,
-        activation_swap=activation_swap,
-        swap_inputs=swap_inputs,
+        activation_checkpoint=_resolve_activation_checkpoint(activation_checkpoint),
         model_init_dtype=model_init_dtype,
     )
 

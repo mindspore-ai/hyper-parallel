@@ -150,13 +150,7 @@ mixed_precision:
   enabled: false
 
 activation_checkpoint:
-  mode: full
-  # Activation offload (boundary inputs -> host). Needed for headroom: with 8 images
-  # kept per sample the vision activations are large. NOTE the effective key is HERE;
-  # a `swap_inputs` in the model: section is accepted but silently dropped.
-  swap_inputs: false
-
-activation_swap: none
+  mode: 'off'
 
 compile:
   enabled: false

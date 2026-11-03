@@ -46,7 +46,6 @@ from hyper_parallel.components.functional.sparse_lightning_indexer_kl_loss_grad 
     gather_selected_keys, sparse_lightning_indexer_kl_loss, validate_fused_kl_inputs,
 )
 from hyper_parallel.core.activation_memory.recompute_state import is_recomputing
-from hyper_parallel.core.activation_memory.wrapper import checkpoint_exclude_wrapper
 from hyper_parallel.distributed.context_parallel.compressed_document import (
     CompressionBoundaryRoute, document_compression_plan,
 )
@@ -1277,15 +1276,6 @@ def shared_compressed_indexer_kl_loss(
 class SharedCompressedDSAIndexer(nn.Module):
     """Reusable V4.1 compressed Lightning Indexer semantics."""
 
-    # Installed by :meth:`enable_selection_exclude` for a layer that recomputes.
-    # It is written through ``object.__setattr__`` so the exclusion region stays
-    # out of ``modules()`` and the state dict.
-    _selection_region: Callable[..., Any] | None = None
-    _input_region: Callable[..., Any] | None = None
-    _prepare_region: Callable[..., Any] | None = None
-    _result_region: Callable[..., Any] | None = None
-    _wait_region: Callable[..., Any] | None = None
-
     def __init__(self, module: nn.Module) -> None:
         """Transfer the source projections without changing checkpoint names."""
         super().__init__()
@@ -1420,14 +1410,7 @@ class SharedCompressedDSAIndexer(nn.Module):
             key_position_embeddings: tuple | None = None,
             causal_upper: torch.Tensor | None = None,
     ) -> SharedCompressedIndexerOutput:
-        """Project local queries and score them against global compressed keys.
-
-        When the enclosing layer is recomputed, :meth:`enable_selection_exclude`
-        makes the discrete selection a checkpoint exclusion region: it runs in
-        the original forward and its cached result is reused during the
-        recomputation, so the chosen key set can never drift and the checkpoint
-        keeps saving the same tensors in both passes.
-        """
+        """Project local queries and score them against global compressed keys."""
         cos, sin = compress_position_embeddings
         if cp_context is not None and cp_context.launch_balance is not None:
             return self._forward_dispatched(
@@ -1452,7 +1435,7 @@ class SharedCompressedDSAIndexer(nn.Module):
         reduce_sum = None if tp_context is None else tp_context.reduce_sum
         if key_handle is not None:
             key = key_handle.wait()
-        topk_indices, candidate_blocks = self._run_selection(
+        topk_indices, candidate_blocks = self._select_tokens(
             query, key, merge_weight, query_residual, (cos, sin), cp_context, tp_context,
             candidate_blocks, query_offset, reduce_sum, minimum_key_indices, query_segments,
             document_lengths, causal_upper,
@@ -1478,46 +1461,29 @@ class SharedCompressedDSAIndexer(nn.Module):
             raise NotImplementedError("Indexer overlap requires ordinary causal selection and TP=1")
         weights = self.weights_proj(hidden_states.detach())
         weights = weights * (self.head_dim**-0.5 * self.global_num_heads**-0.5)
-        launch = self._launch_selection if self._input_region is None else self._input_region
-        wave = launch(query_residual, weights, (cos, sin), document_lengths, context)
+        wave = self._launch_selection(query_residual, weights, (cos, sin), document_lengths, context)
         key, handle = self._project_index_key(
             latent, cos, sin, index_key, context, block_plan, key_position_embeddings,
         )
         if prepare_attention is not None:
             prepare_attention()
-        prepare = self._prepare_dispatched if self._prepare_region is None else self._prepare_region
-        prepared = prepare(wave) if context.indexer_priority else None
+        prepared = self._prepare_dispatched(wave) if context.indexer_priority else None
         # KL uses this autograd edge; only selection transport runs under no_grad.
         if handle is not None:
             key = handle.wait()
         if not context.indexer_priority:
-            prepared = prepare(wave)
-        select = self._select_dispatched if self._result_region is None else self._result_region
-        result = select(prepared, key)
+            prepared = self._prepare_dispatched(wave)
+        result = self._select_dispatched(prepared, key)
         del prepared
         query = self._project_index_query(query_residual, cos, sin)
         if weights.shape[-1] != query.shape[2]:
             raise ValueError("Indexer query and merge weights must have matching head counts")
-        finish = self._finish_selection if self._wait_region is None else self._wait_region
-        return SharedCompressedIndexerOutput(finish(result), key, None, query, weights)
-
-    def enable_selection_exclude(self) -> None:
-        """Keep discrete selection fixed when the enclosing layer recomputes."""
-        object.__setattr__(
-            self, "_selection_region", checkpoint_exclude_wrapper(self._select_tokens)
-        )
-        object.__setattr__(self, "_input_region", checkpoint_exclude_wrapper(self._launch_selection))
-        # This output goes straight into an exclusion region; retain IDs, not expanded worker Q.
-        object.__setattr__(self, "_prepare_region", checkpoint_exclude_wrapper(  # pylint: disable=E1123
-            self._prepare_dispatched, save_output=False,
-        ))
-        object.__setattr__(self, "_result_region", checkpoint_exclude_wrapper(self._select_dispatched))
-        object.__setattr__(self, "_wait_region", checkpoint_exclude_wrapper(self._finish_selection))
+        return SharedCompressedIndexerOutput(self._finish_selection(result), key, None, query, weights)
 
     @torch.no_grad()
     def _launch_selection(self, qr: torch.Tensor, weights: torch.Tensor, embeddings: tuple,
                           lengths: tuple, context: SharedCompressedAttentionCPContext) -> Any:
-        """Cache the input launch so checkpoint replay does not repeat communication."""
+        """Launch load-balanced selection input transport."""
         return context.launch_balance(qr, weights, embeddings, lengths, self.compress_ratio)
 
     @torch.no_grad()
@@ -1537,13 +1503,8 @@ class SharedCompressedDSAIndexer(nn.Module):
     @staticmethod
     @torch.no_grad()
     def _finish_selection(result: Any) -> torch.Tensor:
-        """Cache completed IDs; replay never consumes an already finished handle."""
+        """Wait for the selected token IDs to return to their owner."""
         return result.wait().unsqueeze(0)
-
-    def _run_selection(self, *args: Any, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Select directly, or reuse the result retained by the checkpoint region."""
-        selection = self._select_tokens if self._selection_region is None else self._selection_region
-        return selection(*args, **kwargs)
 
     def _select_tokens(
             self, query: torch.Tensor, key: torch.Tensor, merge_weight: torch.Tensor,
@@ -1555,7 +1516,7 @@ class SharedCompressedDSAIndexer(nn.Module):
             minimum_key_indices: torch.Tensor | None, query_segments: tuple | None,
             document_lengths: tuple, causal_upper: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Cache dispatch, discrete selection and TopK return as one recompute region."""
+        """Run local or load-balanced token selection."""
         cos, sin = embeddings
         if cp_context is not None and cp_context.balance_indexer is not None:
             if tp_context is not None or self.is_candidate_source or self.uses_candidates:

@@ -172,9 +172,13 @@ def test_cli_logs_failure_as_warning(monkeypatch):
     assert captured["exc_info"] is False
 
 
+@pytest.mark.parametrize(
+    "activation_checkpoint",
+    [None, SimpleNamespace(mode="off"), SimpleNamespace(mode="hybrid", full=object(), selective=object())],
+)
 @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0", card_mark="onecard",
           essential_mark="essential")
-def test_native_build_orchestration_builds_only_model(monkeypatch):
+def test_native_build_orchestration_builds_only_model(monkeypatch, activation_checkpoint):
     """Feature: Build-only codegen orchestration.
     Description: Run generation with mocked model construction and planner setup.
     Expectation: Only the model path is built and its artifact is returned.
@@ -199,13 +203,7 @@ def test_native_build_orchestration_builds_only_model(monkeypatch):
         training=SimpleNamespace(backend="gloo", seed=7, enable_full_determinism=False),
         model=ModelTarget(),
         peft=None,
-        activation_checkpoint=SimpleNamespace(
-            mode="none",
-            selection=None,
-            swap_inputs=False,
-            allow_cache_entry_mutation=False,
-        ),
-        activation_swap="none",
+        activation_checkpoint=activation_checkpoint,
         compile=None,
         model_init_dtype=None,
     )
@@ -221,6 +219,12 @@ def test_native_build_orchestration_builds_only_model(monkeypatch):
 
     assert result is layout
     assert [event[0] for event in events] == ["normalize", "model"]
+    model_kwargs = events[-1][1]
+    assert model_kwargs["activation_checkpoint"] is activation_checkpoint
+    assert "activation_checkpoint_selection" not in model_kwargs
+    assert "swap_inputs" not in model_kwargs
+    assert "allow_cache_entry_mutation" not in model_kwargs
+    assert "activation_swap" not in model_kwargs
 
 
 @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0", card_mark="onecard",
@@ -234,8 +238,7 @@ def test_native_build_requires_published_artifact(monkeypatch):
         training=SimpleNamespace(backend="gloo", seed=7, enable_full_determinism=False),
         model=SimpleNamespace(build=lambda **_kwargs: object()),
         peft=None,
-        activation_checkpoint=SimpleNamespace(mode="none", selection=None),
-        activation_swap="none",
+        activation_checkpoint=None,
         compile=None,
         model_init_dtype=None,
     )
@@ -257,8 +260,7 @@ def test_native_build_reports_isolated_publication_failure(monkeypatch):
         training=SimpleNamespace(backend="gloo", seed=7, enable_full_determinism=False),
         model=SimpleNamespace(build=lambda **_kwargs: object()),
         peft=None,
-        activation_checkpoint=SimpleNamespace(mode="none", selection=None),
-        activation_swap="none",
+        activation_checkpoint=None,
         compile=None,
         model_init_dtype=None,
     )
