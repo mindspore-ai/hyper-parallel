@@ -25,6 +25,9 @@ import importlib
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from hyper_parallel.components.modules.mtp import (
+        MTPLayer, MultiTokenPrediction, MTPOutput, build_mtp,
+    )
     from hyper_parallel.components.modules.dsa_attention import DSAAttention, DeepseekV32DSAAttention
     from hyper_parallel.components.modules.gqa_attention import GatedGQAAttention, GQAAttention
     from hyper_parallel.components.modules.grouped_experts import GroupedExperts
@@ -36,6 +39,10 @@ if TYPE_CHECKING:
 
 _EXPORT_TO_MODULE = {
     "TritonGDN": "gdn_triton",
+    "build_mtp": "mtp",
+    "MTPLayer": "mtp",
+    "MultiTokenPrediction": "mtp",
+    "MTPOutput": "mtp",
     "DeepseekV32DSAAttention": "dsa_attention",
     "DSAAttention": "dsa_attention",
     "GQAAttention": "gqa_attention",
