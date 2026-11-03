@@ -192,33 +192,65 @@ class TestMixedPrecisionCustomParams(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     def test_fused_communication_uses_overridden_dtypes(self) -> None:
         """Feature: Mixed-dtype communication fusion.
-        Description: Build all-gather and reduce-scatter buckets for FP32 and BF16 weights in one FSDP unit.
-        Expectation: Buckets use each parameter's effective compute and reduction dtype.
+        Description: Unshard FP32 and BF16 parameters and bucket direct and accumulated gradients.
+        Expectation: All-gather and reduce-scatter use their independently overridden dtypes.
         """
         model = nn.Linear(4, 4)
         policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
-            custom_params={model.weight: {"param_dtype": torch.float32, "reduce_dtype": torch.float32}},
+            reduce_dtype=torch.float32,
+            custom_params={model.weight: {"param_dtype": torch.float32, "reduce_dtype": torch.bfloat16}},
         )
 
         self._shard_model(model, policy, comm_fusion=True)
         state = model.hsdp_scheduler.hsdp_state
         state._init_mp_dtypes()  # pylint: disable=protected-access
-        state.param_group._init_all_gather_buckets()  # pylint: disable=protected-access
-        for hsdp_param in state.hsdp_params:
-            hsdp_param.unsharded_accumulated_grad = torch.ones(
-                hsdp_param._orig_size,  # pylint: disable=protected-access
-                dtype=hsdp_param.param_dtype or hsdp_param.orig_dtype,
-            )
-        reduce_buckets = state.param_group._build_reduce_scatter_buckets(  # pylint: disable=protected-access
-            torch.distributed.ReduceOp.SUM
-        )
+
+        def _fake_all_gather(output, input_tensor, **kwargs):
+            output.copy_(input_tensor.repeat(kwargs["group"].size()))
+
+        def _fake_reduce_scatter(**kwargs):
+            output = kwargs["output"]
+            output.copy_(kwargs["input"].view(kwargs["group"].size(), -1).sum(dim=0))
+            return MagicMock()
+
+        with patch("hyper_parallel.core.fully_shard.param_group.dist.all_gather_into_tensor",
+                   side_effect=_fake_all_gather) as mock_all_gather:
+            state.param_group.unshard()
+            state.param_group.wait_for_unshard()
 
         self.assertEqual([bucket.dtype for bucket in state.param_group.all_gather_buckets],
                          [torch.float32, torch.bfloat16])
-        self.assertEqual([bucket.dtype for bucket in reduce_buckets], [torch.float32, torch.bfloat16])
+        self.assertEqual([call.args[1].dtype for call in mock_all_gather.call_args_list],
+                         [torch.float32, torch.bfloat16])
+        self.assertEqual([call.args[0].dtype for call in mock_all_gather.call_args_list],
+                         [torch.float32, torch.bfloat16])
         self.assertIs(state.param_group.all_gather_buckets[0].hsdp_params[0], state.hsdp_params[0])
+        self.assertIs(state.param_group.all_gather_buckets[1].hsdp_params[0], state.hsdp_params[1])
+
+        for accumulated in (False, True):
+            with self.subTest(accumulated=accumulated):
+                for hsdp_param in state.hsdp_params:
+                    hsdp_param.unsharded_accumulated_grad = None
+                    hsdp_param.unsharded_param.grad = torch.ones_like(hsdp_param.unsharded_param)
+                    if accumulated:
+                        hsdp_param.to_accumulated_grad_if_needed()
+                with patch("hyper_parallel.core.fully_shard.param_group.dist.reduce_scatter_tensor",
+                           side_effect=_fake_reduce_scatter) as mock_reduce_scatter:
+                    state.param_group.foreach_reducescatter(torch.distributed.ReduceOp.SUM)
+
+                reduce_buckets = state.param_group.reduce_scatter_buckets
+                self.assertEqual([bucket.dtype for bucket in reduce_buckets], [torch.bfloat16, torch.float32])
+                self.assertEqual([call.kwargs["input"].dtype for call in mock_reduce_scatter.call_args_list],
+                                 [torch.bfloat16, torch.float32])
+                self.assertIs(reduce_buckets[0].hsdp_params[0], state.hsdp_params[0])
+                self.assertIs(reduce_buckets[1].hsdp_params[0], state.hsdp_params[1])
+                state.param_group.wait_reduce_scatter_and_issue_all_reduce()
+                for hsdp_param in state.hsdp_params:
+                    reduced_grad = hsdp_param.reduce_scatter_output()
+                    torch.testing.assert_close(reduced_grad, torch.full_like(reduced_grad, 2))
+                    hsdp_param.clear_reduce_scatter_output()
+                state.param_group.reset_iter_state()
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
