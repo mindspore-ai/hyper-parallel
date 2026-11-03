@@ -88,6 +88,10 @@ class ModelAdapterSpec:
             (parameter names, mask/cache/forward adaptation).
         checkpoint: provider returning family-specific checkpoint
             key/layout mappings, when the generic mapping is insufficient.
+        checkpoint_export: optional callback accepting an export model view, gathered
+            state dictionary and optional original-format flag (None selects the
+            adapter default), returning the adapted state and resolved flag before
+            generic conversion. Must not mutate live model state.
         materialization: provider accepting the constructed model and registering
             deterministic derived buffers or state hooks before sharding and
             ``to_empty()``. This supports unmodified native HF model classes.
@@ -140,3 +144,4 @@ class ModelAdapterSpec:
     validation: Optional[Callable[..., Any]] = None
     loss: Optional[Callable[..., Any]] = None
     encoder_parallel: Optional[Callable[..., Any]] = None
+    checkpoint_export: Optional[Callable[..., tuple[dict[str, Any], bool]]] = None

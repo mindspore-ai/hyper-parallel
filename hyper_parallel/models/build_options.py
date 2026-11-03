@@ -235,7 +235,14 @@ class FSDP2MixedPrecisionConfig:
 
 @dataclass
 class FSDP2Config:
-    """FSDP2 strategy configuration (06 §4.1)."""
+    """FSDP2 strategy configuration (06 §4.1).
+
+    ``wrapper_class`` selects child units by exact runtime class name. An empty
+    list retains automatic decoder discovery; expert units are discovered in
+    either mode.
+
+    ``reshard_after_forward`` also controls the remaining root parameters.
+    """
     dp_shard_size: int = 1
     edp_shard_size: int = 1
     replicate_params: list[str] = field(default_factory=list)
@@ -250,9 +257,15 @@ class FSDP2Config:
     forward_prefetch_depth: int = 1
     comm_fusion: bool = False
     comm_fusion_zero_copy: Optional[bool] = None
+    # Exact runtime class names; empty preserves automatic decoder discovery.
+    wrapper_class: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """Validate topology sizes and prefetch depths."""
+        if not isinstance(self.wrapper_class, list) or any(
+            not isinstance(name, str) or not name.isidentifier() for name in self.wrapper_class
+        ):
+            raise ValueError("wrapper_class must be a list of module class names")
         if self.dp_shard_size < 1:
             raise ValueError("dp_shard_size must be greater than or equal to 1")
         if self.edp_shard_size < 1:
@@ -261,6 +274,9 @@ class FSDP2Config:
             raise ValueError("backward_prefetch_depth must be greater than or equal to 0")
         if self.forward_prefetch_depth < 0:
             raise ValueError("forward_prefetch_depth must be greater than or equal to 0")
+        if not isinstance(self.reshard_after_forward, bool):
+            raise TypeError("reshard_after_forward must be a bool")
+
 
 
 _MODEL_INIT_DTYPES = ("float16", "bfloat16", "float32")

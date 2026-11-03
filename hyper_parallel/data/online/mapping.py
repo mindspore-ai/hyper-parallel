@@ -44,6 +44,7 @@ def build_online_mapping_source(
     data_path: OnlineDataPath | None = None,
     sample_filter: Callable[[Mapping[str, Any]], bool] | None = None,
     train_valid_test_num_samples: Sequence[int] | None = None,
+    sampler_type: str = "single",
 ) -> Any:
     """Build a finite integer-indexed Online source.
 
@@ -51,6 +52,7 @@ def build_online_mapping_source(
         data_config: Online source options.
         data_path: Local path, Hub dataset ID, or pre-split path mapping. Use
             ``data_config.sources`` instead for multiple sources.
+        sampler_type: Cyclic leaves shuffle and repetition across epochs to the sampler.
         sample_filter: Optional raw-sample predicate applied before indexing.
         train_valid_test_num_samples: Optional target sample count for each
             train, validation, and test split.
@@ -58,7 +60,7 @@ def build_online_mapping_source(
     Returns:
         One Mapping Dataset or a train-valid-test tuple.
     """
-    dataset_builder = _OnlineMappingSourceBuilder(data_path, data_config, train_valid_test_num_samples)
+    dataset_builder = _OnlineMappingSourceBuilder(data_path, data_config, train_valid_test_num_samples, sampler_type)
     mapping_source = dataset_builder.build_source(sample_filter=sample_filter)
     return mapping_source
 
@@ -284,6 +286,7 @@ class _OnlineBlendedMappingDataset:
         weights: Sequence[float],
         size: int,
         random_seed: int,
+        shuffle: bool = True,
     ) -> None:
         """Build the source schedule and source-local shuffle indices."""
         if not source_datasets or len(source_datasets) != len(weights):
@@ -307,6 +310,7 @@ class _OnlineBlendedMappingDataset:
         self.source_shuffle_indices = self._build_source_shuffle_indices(
             source_lengths,
             random_seed,
+            shuffle,
         )
 
     def __len__(self) -> int:
@@ -362,6 +366,7 @@ class _OnlineBlendedMappingDataset:
         self,
         source_lengths: Sequence[int],
         random_seed: int,
+        shuffle: bool,
     ) -> tuple[np.ndarray, ...]:
         """Map source-local counters to repeated deterministic sample permutations."""
         source_sample_counts = np.bincount(
@@ -376,7 +381,8 @@ class _OnlineBlendedMappingDataset:
                 np.arange(source_length, dtype=np.int64),
                 repeated_epochs,
             )
-            source_random.shuffle(source_sample_index)
+            if shuffle:
+                source_random.shuffle(source_sample_index)
             source_shuffle_indices.append(source_sample_index[:requested_samples])
         return tuple(source_shuffle_indices)
 
@@ -389,9 +395,13 @@ class _OnlineMappingSourceBuilder(_OnlineSourceBuilder):
         data_path: OnlineDataPath | None,
         data_config: Mapping[str, Any],
         train_valid_test_num_samples: Sequence[int] | None,
+        sampler_type: str = "single",
     ) -> None:
         """Store source configuration and optional training sample targets."""
         super().__init__(data_path, data_config)
+        if sampler_type not in ("single", "cyclic"):
+            raise ValueError(f"Unsupported Mapping sampler_type: {sampler_type!r}")
+        self.sampler_type = sampler_type
         self.train_valid_test_num_samples = self._validate_split_sizes(train_valid_test_num_samples)
 
     def build_source(
@@ -405,6 +415,13 @@ class _OnlineMappingSourceBuilder(_OnlineSourceBuilder):
         for source_loader in source_loaders:
             source_result = self._build_leaf_source(source_loader, sample_filter)
             source_results.append(source_result)
+
+        # Cyclic sampling owns epoch shuffle and repetition, including explicit single sources.
+        if self.sampler_type == "cyclic" and len(source_results) == 1:
+            source = source_results[0]
+            if isinstance(source, tuple):
+                return tuple(split if split is not None and len(split) else None for split in source)
+            return source if len(source) else None
 
         # Example: source A returns Dataset, while source B returns (train, valid, test).
         # The combined result follows B's split structure, and A contributes only to train.
@@ -533,7 +550,7 @@ class _OnlineMappingSourceBuilder(_OnlineSourceBuilder):
 
     def _get_target_size(self, split_index: int, source_datasets: Sequence[Any]) -> int:
         """Return the configured sample target or one natural blended epoch."""
-        if self.train_valid_test_num_samples is not None:
+        if self.sampler_type != "cyclic" and self.train_valid_test_num_samples is not None:
             return self.train_valid_test_num_samples[split_index]
 
         natural_size = 0
@@ -564,6 +581,7 @@ class _OnlineMappingSourceBuilder(_OnlineSourceBuilder):
             nonempty_weights,
             target_size,
             self._random_seed,
+            shuffle=self.sampler_type != "cyclic",
         )
         return blended_dataset
 

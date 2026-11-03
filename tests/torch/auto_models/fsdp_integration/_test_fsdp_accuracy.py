@@ -236,6 +236,7 @@ def _build_dual_mode_model(
         forward_prefetch_depth=fsdp_manager.config.forward_prefetch_depth,
         backward_prefetch_depth=fsdp_manager.config.backward_prefetch_depth,
         expected_nested_unit_count=_QWEN2_NUM_LAYERS * 2,
+        reshard_after_forward=fsdp_manager.config.reshard_after_forward,
     )
     return model, source_shard_info_by_fqn
 
@@ -246,6 +247,7 @@ def _assert_runtime_fsdp_configuration(
     forward_prefetch_depth: int,
     backward_prefetch_depth: int,
     expected_nested_unit_count: int,
+    reshard_after_forward: bool,
 ) -> None:
     """Verify configured prefetch depths, replicate params, and root policy."""
     nested_fsdp_units = [
@@ -280,8 +282,11 @@ def _assert_runtime_fsdp_configuration(
     root_scheduler = model.hsdp_scheduler
     if root_scheduler.hsdp_state.raw_replicate_params != {replicate_parameter}:
         raise AssertionError("root replicate_params does not contain model.norm.weight")
-    if root_scheduler.reshard_after_forward:
-        raise AssertionError("FSDP root must use reshard_after_forward=False")
+    if root_scheduler.reshard_after_forward != reshard_after_forward:
+        raise AssertionError(
+            f"FSDP root reshard_after_forward must match configured value {reshard_after_forward}, "
+            f"got {root_scheduler.reshard_after_forward}"
+        )
 
 
 def _build_global_batch(step_index: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:

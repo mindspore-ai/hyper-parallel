@@ -241,10 +241,12 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
             random.Random(self.seed + self.epoch).shuffle(random_offsets)
             rank_indices = [bucket_start + offset for offset in random_offsets[bucket_offset:]]
         else:
-            # Shuffle the complete global-batch region, then stride by DP rank.
-            shuffled_indices = list(range(active_samples))
+            # Shuffle before dropping the tail so source-file tail samples remain eligible.
+            # Legacy checkpoints retain their cursor but not their old truncated permutation.
+            shuffled_indices = list(range(self.total_samples))
             random.Random(self.seed + self.epoch).shuffle(shuffled_indices)
-            active_indices = shuffled_indices[self.consumed_samples:]
+            active_indices = shuffled_indices[:active_samples]
+            active_indices = active_indices[self.consumed_samples:]
             rank_indices = active_indices[self.dp_rank::self.dp_world_size]
 
         local_batch = []
@@ -256,7 +258,7 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
                 local_batch = []
 
     def _active_samples(self) -> int:
-        """Return the complete global micro-batch region reused every epoch."""
+        """Return the number of samples fitting complete global micro-batches."""
         active_samples = self.total_samples - self.total_samples % self.global_micro_batch_size
         if active_samples <= 0:
             raise ValueError("cyclic Dataset must contain one complete global micro-batch")

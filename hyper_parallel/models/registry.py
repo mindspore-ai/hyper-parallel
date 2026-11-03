@@ -122,6 +122,7 @@ _FAMILY_DIR_ALIASES = {
     # ``model_type``/architecture spelling (kimi_k25) while the family is
     # registered from ``models/kimi_k26/``.
     "kimik25": "kimi_k26",
+    "qwen35moetext": "qwen3_5_moe",
 }
 
 # normalized family directory name → registration module path; built lazily.

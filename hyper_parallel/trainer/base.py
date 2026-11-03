@@ -450,6 +450,7 @@ class BaseTrainer(Stateful, ABC):
             tokenizer=self.tokenizer,
             mesh_context=self.mesh,
             training_config=self.config.training,
+            sampler_type=self.config.dataloader.sampler_type,
         )
 
         if isinstance(dataset_result, tuple) and len(dataset_result) == 3:
@@ -641,11 +642,16 @@ class BaseTrainer(Stateful, ABC):
             self._callbacks.append(self.stress_detect_callback)
         # Registered to save, to restore, or both --- the two are independent, so
         # a run that only loads an existing checkpoint still needs the callback.
-        if self.config.checkpoint.save_ckpt or self.config.checkpoint.restore_from is not None:
+        if (
+            self.config.checkpoint.save_ckpt
+            or self.config.checkpoint.save_hf_weights
+            or self.config.checkpoint.restore_from is not None
+        ):
             self._callbacks.append(CheckpointerCallback(self))
         else:
             logger.info(
-                "Checkpointing is inactive (save_ckpt=false, restore_from=None); "
+                "Checkpointing is inactive (save_ckpt=false, save_hf_weights=false, "
+                "restore_from=None); "
                 "no checkpoint callback registered."
             )
 

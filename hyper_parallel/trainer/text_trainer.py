@@ -99,8 +99,14 @@ class TextTrainer:
                 self.base.chat_template = build_chat_template(
                     assets_config.chat_template,
                     self.base.tokenizer,
+                    chat_template_kwargs=assets_config.chat_template_kwargs,
+                    log_first_rendered_template=config.debug.log_first_rendered_template,
                 )
             else:
+                if assets_config.chat_template_kwargs or config.debug.log_first_rendered_template:
+                    raise ValueError(
+                        "dataset.model_assets chat-template options require chat_template='tokenizer'"
+                    )
                 self.base.chat_template = assets_config.chat_template.build(
                     tokenizer=self.base.tokenizer,
                 )
