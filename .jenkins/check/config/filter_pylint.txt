@@ -136,6 +136,17 @@
 # 24. DSA functional exports are resolved lazily by components.functional;
 #     pylint cannot infer that the exported operator proxies are callable.
 "hyper-parallel/hyper_parallel/components/modules/dsa_attention.py"        "not-callable"
+# Chunk MLP uses the same lazy functional export mechanism for SwiGLU.
+"hyper-parallel/hyper_parallel/components/modules/chunked_swiglu_mlp.py"     "not-callable"
+# Torch-only modules follow AGENTS.md; the legacy backend checker still assumes a platform abstraction.
+"hyper-parallel/hyper_parallel/components/modules/_head_chunk_ops.py"          "forbidden-backend-import"
+"hyper-parallel/hyper_parallel/components/modules/_head_chunk_saved_stats.py"  "forbidden-backend-import"
+"hyper-parallel/hyper_parallel/components/modules/_head_chunk_shared_kv.py"    "forbidden-backend-import"
+"hyper-parallel/hyper_parallel/components/modules/_head_chunk_transport.py"    "forbidden-backend-import"
+"hyper-parallel/hyper_parallel/components/modules/chunked_swiglu_mlp.py"        "forbidden-backend-import"
+"hyper-parallel/hyper_parallel/components/modules/head_chunk_gqa.py"            "forbidden-backend-import"
+# torch.nn.functional.linear is a callable builtin, matching the existing MLP/DSA filter.
+"hyper-parallel/hyper_parallel/components/modules/_head_chunk_shared_kv.py"    "not-callable"
 
 # 25. Codegen package — importing hyper_parallel.codegen must not pull
 #     torch/transformers (import-time isolation), so backend imports stay

@@ -11,6 +11,10 @@ Python or declaratively replace existing model modules through Trainer YAML.
 | MoE and MLP | `GroupedExperts`, `SharedExpert`, `SwiGLUMLP` |
 | Normalization | `RMSNorm`, `OffsetRMSNorm` |
 | MHC | `MhcPreModule`, `MhcPostModule` |
+| Experimental chunking | `ChunkedSwiGLUMLP`, `HeadChunkGQA` |
+
+The [chunked MLP and GQA guide](../../../docs/guide/chunk_mlp_head_chunk_attention.md) describes their
+restricted input and parallelism contracts. They are opt-in and do not change default Trainer behavior or model recipes.
 
 Reusable high-performance functions are provided separately in [`hyper_parallel.components.functional`](../functional/README.md).
 
