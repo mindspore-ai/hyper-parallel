@@ -56,7 +56,6 @@ from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
 from hyper_parallel.components.functional.mhc_post import mhc_post
 from hyper_parallel.components.functional.mhc_pre import mhc_pre
 from hyper_parallel.components.losses.chunked_cross_entropy import chunked_cross_entropy
-from hyper_parallel.components.losses.projected_cross_entropy_sum import projected_cross_entropy_sum
 from hyper_parallel.core.activation_memory.recompute_state import is_recomputing
 from hyper_parallel.core.utils.communication import differentiable_all_reduce
 from hyper_parallel.data.constants import IGNORE_INDEX
@@ -666,14 +665,18 @@ class Xing40ForCausalLM(Xing40PreTrainedModel):
         return total * (self.config.mtp_loss_factor / len(self.mtp.layers))
 
     def _cross_entropy(self, hidden: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """Return the mean LM-head cross entropy without materializing the sequence's logits."""
+        """Return the LM-head cross entropy averaged over the non-ignored targets.
+
+        A head holding the whole vocabulary uses the chunked cross entropy, which never
+        materializes the sequence's logits. A tensor-parallel head runs as a module, so its
+        sharding plan gathers the logits or, under loss parallelism, keeps them
+        vocabulary-sharded for the ``loss_function`` the Trainer installs.
+        """
+        count = targets.ne(IGNORE_INDEX).sum().clamp_min(1)
         weight = self.lm_head.weight
         if getattr(weight, "placements", None) is None and weight.shape[0] == self.config.vocab_size:
             loss_sum = chunked_cross_entropy(hidden, targets, weight,
                                              chunk_size=self.config.chunk_loss_size, ignore_index=IGNORE_INDEX)
-        else:
-            loss_sum = projected_cross_entropy_sum(
-                hidden, targets, self.lm_head, vocab_size=self.config.vocab_size,
-                chunk_size=self.config.chunk_loss_size, ignore_index=IGNORE_INDEX,
-            )
-        return loss_sum / targets.ne(IGNORE_INDEX).sum().clamp_min(1)
+            return loss_sum / count
+        return self.loss_function(self.lm_head(hidden), None, self.config.vocab_size, num_items_in_batch=count,
+                                  ignore_index=IGNORE_INDEX, shift_labels=targets)
