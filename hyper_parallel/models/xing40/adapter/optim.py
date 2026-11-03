@@ -29,18 +29,26 @@ from torch import nn
 from hyper_parallel.components.optim.builders import Muon
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Shard
+from hyper_parallel.models.xing40.adapter.muon_layout import Xing40MuonLayout
 
 __all__ = ["build_optimizer", "clip_qk"]
 
 
+_MUON_LAYOUTS = ("native", "mindformers_pynative")
+
+
 def build_optimizer(*, model: nn.Module, muon_config: dict[str, Any], adamw_config: dict[str, Any],
-                    qk_clip_threshold: float = 0.0) -> Muon:
+                    qk_clip_threshold: float = 0.0, muon_layout: str = "native") -> Muon:
     """Build the framework Muon with the MindFormers AdamW decay groups.
 
-    Muon orthogonalizes every matrix parameter whole, as the framework does for any model;
-    this adapter does not reproduce MindFormers' per-block or per-head Newton-Schulz
-    splits. As in MindFormers, AdamW does not decay one-dimensional parameters (norm
-    weights, mHC gates and biases) or biases.
+    The default ``native`` layout orthogonalizes every matrix parameter whole, as the
+    framework does for any model. The opt-in ``mindformers_pynative`` layout instead
+    declares independent logical MLA and gate/up matrices through the framework's
+    existing ``reshape_fn``/``ns_transform_fn`` callbacks, using native NS and
+    per-matrix scaling; it requires the model's attention already replaced with the
+    fused-``linear_qkv`` ``Xing40MLAAttention`` and fails before construction otherwise.
+    As in MindFormers, AdamW does not decay one-dimensional parameters (norm weights,
+    mHC gates and biases) or biases.
 
     Args:
         model: Model whose parameters are optimized.
@@ -48,13 +56,19 @@ def build_optimizer(*, model: nn.Module, muon_config: dict[str, Any], adamw_conf
         adamw_config: Hyperparameters of the AdamW fallback.
         qk_clip_threshold: Maximum attention logit enforced by QK clipping after every
             optimizer step; 0 disables clipping.
+        muon_layout: ``native`` or ``mindformers_pynative`` logical matrix boundaries.
 
     Returns:
         The optimizer builder whose chained optimizer the Trainer steps.
     """
+    if muon_layout not in _MUON_LAYOUTS:
+        raise ValueError(f"Unknown Xing40 muon_layout: {muon_layout!r}; expected one of {_MUON_LAYOUTS}")
+    options = dict(muon_config)
+    if muon_layout == "mindformers_pynative":
+        options = _with_logical_layout(options, model)
     # The AdamW grouping matches name fragments; full names select exactly the 1-D parameters.
     no_decay = ["bias", *(name for name, parameter in model.named_parameters() if parameter.ndim == 1)]
-    builder = Muon(muon_config=dict(muon_config), adamw_config=dict(adamw_config), model=model,
+    builder = Muon(muon_config=options, adamw_config=dict(adamw_config), model=model,
                    no_decay_params=no_decay)
     if qk_clip_threshold > 0:
         # The MLA modules: the NPU Xing40MLAAttention replacement or, unreplaced, Transformers attention.
@@ -71,6 +85,34 @@ def build_optimizer(*, model: nn.Module, muon_config: dict[str, Any], adamw_conf
         # The Trainer keeps this chained optimizer; optimizer-state swap replaces its leaves, not it.
         chained.step = step_and_clip
     return builder
+
+
+def _with_logical_layout(options: dict[str, Any], model: nn.Module) -> dict[str, Any]:
+    """Bind the Xing40 ``mindformers_pynative`` Muon callbacks over ``options``.
+
+    Args:
+        options: Caller-supplied ``muon_config``, not mutated.
+        model: Model the layout's dimensions and parameter coverage are read from.
+
+    Returns:
+        A new mapping with ``reshape_fn``/``ns_transform_fn`` bound to the layout.
+    """
+    owned = {"reshape_fn", "ns_transform_fn"}
+    conflicts = sorted(key for key in options if key.removeprefix("muon_") in owned)
+    if conflicts:
+        raise ValueError(f"muon_layout='mindformers_pynative' owns {sorted(owned)}; "
+                         f"remove {conflicts} from muon_config")
+    # linear_qkv only exists after Xing40MLAAttention replaces the original attention;
+    # without it, q_b_proj/kv_b_proj alone would silently keep the unfused K/V latent
+    # projection on the whole-matrix path instead of the logical layout.
+    names = [name for name, _ in model.named_parameters()]
+    linear_qkv = sum(1 for name in names if name.endswith(".self_attn.linear_qkv.weight"))
+    q_b_proj = sum(1 for name in names if name.endswith(".self_attn.q_b_proj.weight"))
+    if linear_qkv != q_b_proj:
+        raise ValueError("mindformers_pynative requires the fused linear_qkv attention "
+                         f"(found {linear_qkv} linear_qkv.weight vs {q_b_proj} q_b_proj.weight)")
+    layout = Xing40MuonLayout.from_config(model.config)
+    return {**options, "reshape_fn": layout.reshape_fn, "ns_transform_fn": layout.ns_transform_fn}
 
 
 @torch.no_grad()
