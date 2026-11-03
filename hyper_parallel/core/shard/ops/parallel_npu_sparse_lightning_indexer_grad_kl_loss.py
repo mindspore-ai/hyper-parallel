@@ -22,6 +22,7 @@ from hyper_parallel.platform import get_platform
 from hyper_parallel.platform.platform import PlatformType
 from .parallel_ops import DistributedOp
 from .dsa_cp_fold import SPARSE_KL_MIN_ARGS, dsa_cp_fold_enabled, fold_sparse_indexer_kl_loss
+from .dsa_cp_fold import compact_tnd_call, tnd_compact_enabled
 from .parallel_npu_dense_lightning_indexer_softmax_lse import (
     _adjust_bsnd_key,
     _adjust_tnd_seq_lens,
@@ -485,6 +486,13 @@ class NpuSparseLightningIndexerGradKlLossDistributedOp(DistributedOp):
                         "lengths as keyword arguments (torch path).")
                 return fold_sparse_indexer_kl_loss(
                     func, seq_shard_id, seq_shards, *args, fold_layout='TND')
+
+            if tnd_compact_enabled(qlen_tensor, klen_tensor):
+                return compact_tnd_call(func, seq_shard_id, seq_shards, *args, variant="sparse_kl", **kwargs)
+            if (seq_shards > 1 and local_q.shape[0] * seq_shards == local_k.shape[0]
+                    and len(args) >= 13 and not kwargs):
+                return compact_tnd_call(func, seq_shard_id, seq_shards, *args,
+                                        variant="sparse_kl", trim_documents=False, **kwargs)
 
             adj_q, adj_k = _adjust_tnd_seq_lens(
                 local_q, local_k, qlen_tensor, klen_tensor,
