@@ -217,29 +217,15 @@ class TestStepLossNormalization(unittest.TestCase):
                 reference_optimizer.step()
                 torch.testing.assert_close(parameter, reference)
 
-    def test_token_mode_rejects_independent_denominators(self):
-        """One final scalar cannot normalize different objective families."""
-        normalizer = StepLossNormalization("token", 2, MeshContext())
-        with self.assertRaisesRegex(ValueError, "shared loss token family"):
-            normalizer.reduce({"foundation_loss": torch.tensor(1.), "image_loss": torch.tensor(2.)}, {})
-
-    def test_shared_family_is_counted_once(self):
-        """Multiple terms sharing the LM divisor do not multiply its token count."""
-        parameter = nn.Parameter(torch.tensor(2.0))
-        normalizer = StepLossNormalization("token", 1, MeshContext())
-        losses = normalizer.reduce(
-            {"foundation_loss": parameter.square(), "foundation_loss_mtp": parameter.square() / 2},
-            {"foundation_tokens": torch.tensor(3)},
-        )
-        total = sum(losses.values())
-        total.backward()
-        actual, metrics = normalizer.finish([parameter], total.item(),
-                                            {key: value.item() for key, value in losses.items()})
-        self.assertEqual(actual, 6.0)
-        self.assertEqual(parameter.grad.item(), 6.0)
-        self.assertEqual(metrics["foundation_loss_mtp"], 2.0)
-        with self.assertRaisesRegex(ValueError, "shared loss token family"):
-            normalizer.reduce({"image_loss": torch.tensor(1.)}, {"image_tokens": torch.tensor(3)})
+    def test_new_modes_reject_non_lm_objectives(self):
+        """Reject independent and same-family MTP/aux terms before counting or backward."""
+        for mode in ("microbatch", "token"):
+            for name in ("mtp_loss", "aux_loss", "foundation_loss/mtp_loss", "foundation_loss_aux", "image_loss"):
+                with self.subTest(mode=mode, name=name):
+                    normalizer = StepLossNormalization(mode, 2, MeshContext())
+                    with self.assertRaisesRegex(ValueError, "only foundation_loss"):
+                        normalizer.reduce({"foundation_loss": torch.tensor(1.), name: torch.tensor(2.)}, {})
+                    self.assertIsNone(normalizer.token_count)
 
     def test_mode_validation(self):
         """Validate parsed YAML and direct runtime construction at their existing boundaries."""
@@ -345,6 +331,12 @@ class TestTrainerLossNormalization(unittest.TestCase):
                              patch(f"hyper_parallel.trainer.{module}.memory_profiler.step"), \
                              patch("hyper_parallel.trainer.runtime.metrics.all_reduce",
                                    side_effect=lambda value, **_: value):
+                            if auxiliary and mode != "legacy":
+                                with self.assertRaisesRegex(ValueError, "auxiliary loss injection"):
+                                    trainer.train_step(iter(((1, 1.0), (3, 2.0))))
+                                trainer.base.prepare_optimizer_step.assert_not_called()
+                                self.assertIsNone(trainer.base.model.weight.grad)
+                                continue
                             result = trainer.train_step(iter(((1, 1.0), (3, 2.0))))
                         self.assertAlmostEqual(result["loss"], 4 * expected)
                         self.assertEqual(trainer.base.state.global_step, 1)
@@ -356,6 +348,27 @@ class TestTrainerLossNormalization(unittest.TestCase):
                             trainer.base.model.zero_grad()
                             trainer.train_step(iter(((1, 1.0), (3, 2.0))))
                         self.assertEqual(trainer.base.state.global_step, 2)
+
+    def test_mtp_configuration_and_combined_model_outputs_are_rejected(self):
+        """Known MTP configs and model-reported auxiliary terms cannot hide in a scalar loss."""
+        for mode in ("microbatch", "token"):
+            trainer = self.make_trainer(TextTrainer, mode, False)
+            for name in ("mtp_num_layers", "num_nextn_predict_layers", "n_mtp_layers"):
+                trainer.base.model.config = SimpleNamespace(**{name: 1})
+                with self.assertRaisesRegex(ValueError, "does not support MTP"):
+                    trainer.base.begin_loss_step(2)
+                trainer.base.model.config = SimpleNamespace(**{name: 0})
+                trainer.base.begin_loss_step(2)
+            trainer.base.loss_fn = Mock()
+            for name in ("mtp_loss", "aux_loss"):
+                for outputs in ({name: torch.tensor(0.)}, SimpleNamespace(**{name: torch.tensor(0.)})):
+                    with self.assertRaisesRegex(ValueError, f"does not support {name}"):
+                        trainer.base.postforward(outputs, None, current_token_counts={}, step_token_counts={})
+            trainer.base.loss_fn.assert_not_called()
+        trainer = self.make_trainer(TextTrainer, "legacy", False)
+        trainer.base.model.config = SimpleNamespace(mtp_num_layers=1)
+        trainer.base.begin_loss_step(2)
+        self.assertIsNone(trainer.base.loss_normalizer)
 
     def test_token_mode_rejects_unmanaged_gradient_paths(self):
         """Fail before consuming data when gradients cannot be finalized safely."""

@@ -36,8 +36,9 @@ class StepLossNormalization:
     """Normalize local mean losses without retaining micro-batch inputs.
 
     Counts describe CP-local targets and are replicated across TP ranks, as in
-    TextParallelBatch. Token mode accepts one loss family: a common divisor
-    cannot normalize gradients of independently normalized objectives.
+    TextParallelBatch. Both modes accept only the main LM loss, as a scalar or
+    ``foundation_loss``. Models must not fold MTP or auxiliary objectives into
+    that scalar; their independent normalization is not supported.
     """
 
     def __init__(self, mode: str, micro_steps: int, mesh: MeshContext) -> None:
@@ -49,7 +50,6 @@ class StepLossNormalization:
         self.mesh = mesh
         self.token_count = None
         self.loss_names = set()
-        self.token_family = None
 
     def reduce(
         self, losses: dict[str, torch.Tensor] | torch.Tensor, counts: dict[str, torch.Tensor],
@@ -57,18 +57,19 @@ class StepLossNormalization:
         """Return global reporting values with locally weighted backward edges.
 
         Args:
-            losses: CP-local means, keyed by ``<family>_loss...``.
+            losses: CP-local main LM mean, optionally keyed by ``foundation_loss``.
             counts: Effective local target counts keyed by ``<family>_tokens``.
         """
         if isinstance(losses, torch.Tensor):
             losses = {"foundation_loss": losses}
-        families = {key.split("_loss", maxsplit=1)[0] for key in losses}
+        if set(losses) != {"foundation_loss"}:
+            raise ValueError(
+                "microbatch/token normalization supports only foundation_loss (main LM loss); "
+                "MTP and auxiliary losses are not supported. Use legacy for existing model-specific objectives."
+            )
         if self.mode == "token":
-            if len(families) != 1 or (self.token_family is not None and families != {self.token_family}):
-                raise ValueError("token normalization requires one shared loss token family per optimizer step")
-            self.token_family, = families
-            loss_device = next(iter(losses.values())).device
-            count = counts[f"{self.token_family}_tokens"].detach().to(loss_device)
+            loss_device = losses["foundation_loss"].device
+            count = counts["foundation_tokens"].detach().to(loss_device)
             self.token_count = count if self.token_count is None else self.token_count + count
             self.loss_names.update(losses)
 
