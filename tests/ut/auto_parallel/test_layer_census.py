@@ -14,7 +14,6 @@
 # ============================================================================
 """Tests for the layer census, the activations it states in the model spec, and their pricing."""
 import contextlib
-import functools
 import importlib
 import importlib.util
 import os
@@ -52,22 +51,13 @@ from hyper_parallel.auto_parallel._layer_census import (  # pylint: disable=prot
     _measure,
     _modeling,
     _positions,
-    _RecomputedMatmuls,
-    _ForwardContext,
-    _census_policy,
-    _checkpointing,
-    _kernel_op,
-    _selective_contexts,
     tp_config,
-    _ATTENTION_KERNELS,
     delta_rule_module,
 )
 from hyper_parallel.auto_parallel._model_spec import KindActivations, ModelSpec, ModelSpecError
 from hyper_parallel.auto_parallel._npu_contracts import npu_contracts
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.core.activation_memory import api as activation_memory
-from hyper_parallel.core.activation_memory import sac
-from hyper_parallel.core.activation_memory.policy import CheckpointPolicy
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import bind_layer_stack
 
@@ -236,16 +226,13 @@ class TestLayerCensus(unittest.TestCase):
                                     lambda out: out.backward(torch.ones_like(out))))
         self.assertEqual(got[0], got[1])
 
-    def test_selective_checkpointing_keeps_every_other_matmul(self):
+    def test_full_checkpointing_keeps_only_its_input(self):
         """
-        Feature: _measure of a forward under HyperParallel's selective
-            activation checkpointing.
+        Feature: _measure of a forward under full activation checkpointing.
         Description: Two projections of a 64-wide input of 64 tokens with
-            an activation between them, checkpointed as the trainer
-            checkpoints a layer.
-        Expectation: The forward keeps its input and the first projection's
-            output, which the policy saves; it recomputes the activation
-            and the second projection.
+            an activation between them, checkpointed as one region.
+        Expectation: The forward keeps only its input; the backward
+            recomputes both projections and the activation.
         """
         with FakeTensorMode():
             first, second = (torch.nn.Parameter(torch.empty(64, 64, dtype=torch.bfloat16)) for _ in range(2))
@@ -254,48 +241,29 @@ class TestLayerCensus(unittest.TestCase):
             kept, _ = _measure(
                 [first, second], (hidden,),
                 lambda: activation_memory.checkpoint(lambda states: torch.relu(states @ first.t()) @ second.t(),
-                                                     hidden, swap_inputs=False, context_fn=_selective_contexts),
+                                                     hidden, swap_inputs=False),
                 lambda out: out.backward(torch.ones_like(out)), checkpointed=True)
-        self.assertEqual(kept, 2 * size)
+        self.assertEqual(kept, size)
 
-    def test_the_policy_runs_every_other_matmul_again(self):
+    def test_recomputed_census_requires_module_regions(self):
         """
-        Feature: the census's ledger of HyperParallel's selective policy.
-        Description: A layer of an attention projection and a feed-forward
-            of two, of 64 tokens, run under selective checkpointing.
-        Expectation: The policy saves the first and the third projections'
-            outputs and runs the second again: none of the attention's
-            FLOPs, and half the feed-forward's.
+        Feature: census_recomputed after retiring operator-level selective AC.
+        Description: A request without the module regions the trainer now selects.
+        Expectation: A clear unsupported-census error, not invented FLOP shares.
         """
-        with FakeTensorMode():
-            layer = _Layer()
-            hidden = torch.empty(64, 64, dtype=torch.bfloat16, requires_grad=True)
-            ledger = _RecomputedMatmuls(layer)
-            activation_memory.checkpoint(layer, hidden, swap_inputs=False,
-                                         context_fn=functools.partial(_selective_contexts, ledger))
-        self.assertEqual((ledger.share(attention=True), ledger.share(attention=False)), (0.0, 0.5))
+        with self.assertRaisesRegex(CensusUnavailable, "module regions"):
+            census_recomputed(_qwen35_text(), 0, 64)
 
-    def test_a_selective_layer_keeps_what_the_policy_saves(self):
+    def test_operator_selective_census_is_refused(self):
         """
-        Feature: census_layer under HyperParallel's selective checkpointing.
-        Description: Each kind's layer checkpointed selectively; the
-            full-attention one also with SAC ignoring the ops that build
-            empty tensors, as the trainer's selective setup has it.
-        Expectation: A layer keeps less than without recompute and more
-            than its input; the full-attention one keeps the attention's
-            output and two statistics, 24 KiB at 64 tokens, whatever SAC
-            ignores.
+        Feature: census_layer's retired operator-level selective option.
+        Description: Either kind requested under an unspecified selective plan.
+        Expectation: A clear error instead of calling a deleted trainer policy.
         """
         config = _qwen35_text()
-        size = 64 * 64 * 2
         for index in (0, 1):
-            (saved, _), (kept, _) = (census_layer(config, index, 64, selective=each) for each in (False, True))
-            self.assertLess(kept, saved)
-            self.assertGreater(kept, size)
-        self.assertGreaterEqual(kept, size + 24 * 1024)
-        ignored = set(sac.SAC_IGNORED_OPS) | {torch.ops.aten.empty.memory_format, torch.ops.aten.empty_like.default}
-        with patch.object(sac, "SAC_IGNORED_OPS", ignored):
-            self.assertEqual(census_layer(config, 1, 64, selective=True)[0], kept)
+            with self.subTest(index=index), self.assertRaisesRegex(CensusUnavailable, "module regions"):
+                census_layer(config, index, 64, selective=True)
 
     def test_a_census_runs_on_transformers_grouped_mm_fallback(self):
         """
@@ -426,24 +394,21 @@ class TestLayerCensus(unittest.TestCase):
             one full-attention layer.
         Expectation: A record per kind, at the census's length, splitting
             each layer's bytes between what TP splits and what it does not,
-            with and without selective checkpointing.
+            with no selective record for an unspecified module-region plan.
         """
         got = census_activations(_qwen35_text(), _STACK, 64)
         self.assertEqual(sorted(got), ["full_attention", "linear_attention"])
         for kind, index in (("linear_attention", 0), ("full_attention", 1)):
             record = got[kind]
             saved, working = census_layer(_qwen35_text(), index, 64)
-            kept, _ = census_layer(_qwen35_text(), index, 64, selective=True)
             self.assertEqual(record.seq_length, 64)
             self.assertAlmostEqual((record.saved + record.saved_tp) * 64, saved)
             self.assertAlmostEqual((record.working + record.working_tp) * 64, working)
-            self.assertAlmostEqual((record.selective + record.selective_tp) * 64, kept)
-            self.assertEqual((record.selective_attention_mm, record.selective_ffn_mm),
-                             census_recomputed(_qwen35_text(), index, 64))
+            self.assertIsNone(record.selective)
+            self.assertIsNone(record.selective_tp)
+            self.assertIsNone(record.selective_attention_mm)
+            self.assertIsNone(record.selective_ffn_mm)
             self.assertGreater(record.saved_tp, 0)
-            self.assertGreater(record.selective_tp, 0)
-            for share in (record.selective_attention_mm, record.selective_ffn_mm):
-                self.assertTrue(0 < share < 1, share)
             self.assertAlmostEqual(sum(record.ops.values()), record.saved)
             self.assertAlmostEqual(sum(record.ops_tp.values()), record.saved_tp)
         self.assertGreater(got["linear_attention"].ops_tp["linrec"], 0)
@@ -451,9 +416,8 @@ class TestLayerCensus(unittest.TestCase):
 
     def test_a_census_checkpoints_as_a_cpu_whatever_the_default_device(self):
         """
-        Feature: census_layer and census_recomputed under selective
-            checkpointing.
-        Description: A selective full-attention layer measured with
+        Feature: _measure of a checkpointed layer.
+        Description: A checkpointed layer measured with
             activation checkpointing's default device type left as it is,
             then with the default set to a type this host has no module for,
             as ``torch_npu`` sets its own on a host whose NPU cannot start.
@@ -461,11 +425,20 @@ class TestLayerCensus(unittest.TestCase):
             checkpoints as a CPU's and never reaches the default's module;
             the default is the one set once the census is done.
         """
-        expected = (census_layer(_qwen35_text(), 1, 64, selective=True), census_recomputed(_qwen35_text(), 1, 64))
+        def measure():
+            """Measure a real checkpoint without an operator-level policy."""
+            with FakeTensorMode():
+                layer = _Layer()
+                hidden = torch.empty(64, 64, dtype=torch.bfloat16, requires_grad=True)
+                return _measure(list(layer.parameters()), (hidden,),
+                                lambda: activation_memory.checkpoint(layer, hidden, swap_inputs=False),
+                                lambda out: out.backward(torch.ones_like(out)), checkpointed=True)
+
+        expected = measure()
         before = DefaultDeviceType.get_device_type()
         DefaultDeviceType.set_device_type("nd_no_such_device")
         try:
-            got = (census_layer(_qwen35_text(), 1, 64, selective=True), census_recomputed(_qwen35_text(), 1, 64))
+            got = measure()
             after = DefaultDeviceType.get_device_type()
         finally:
             DefaultDeviceType.set_device_type(before)
@@ -688,20 +661,6 @@ def _recipe_specs():
         return replacement_specs(yaml.safe_load(handle).get("plan_overrides"))
 
 
-# The operator HyperParallel's fused attention dispatches to on the NPU.
-_NPU_ATTENTION = "npu.npu_fusion_attention"
-
-
-@contextlib.contextmanager
-def _policy_naming(checkpointing: Any, names: tuple):
-    """The trainer's selective policy, its list of the compute operators it saves replaced by *names*."""
-    # pylint: disable=protected-access
-    with patch.object(checkpointing, "_SELECTIVE_AC_COMPUTE_OP_NAMES", names):
-        with patch.object(checkpointing, "_SELECTIVE_AC_MUST_SAVE_OPS",
-                          checkpointing._build_selective_ac_must_save_ops()):
-            yield
-
-
 @module_replacement
 def _needs_a_library(*, module, module_fqn, context):
     """A factory of a module this host cannot build."""
@@ -755,10 +714,9 @@ class TestModuleReplacements(unittest.TestCase):
         Feature: census_layer with replacements.
         Description: A Qwen3-MoE layer as Transformers builds it, and with
             the recipe's fused RMSNorm, grouped-query attention and grouped
-            experts installed, at 256 tokens, plain and under HyperParallel's
-            selective policy.
-        Expectation: The fused layer keeps less between its passes and less
-            under the policy, and its backward holds less; it holds the
+            experts installed, at 256 tokens without checkpointing.
+        Expectation: The fused layer keeps less between its passes and its
+            backward holds less; it holds the
             parameters its source held, so the parts count the same.
         """
         config, specs = _qwen3_moe(), _recipe_specs()
@@ -766,8 +724,6 @@ class TestModuleReplacements(unittest.TestCase):
         fused = census_layer(config, 0, 256, replacements=specs)
         self.assertLess(fused[0], eager[0])
         self.assertLess(fused[1], eager[1])
-        self.assertLess(census_layer(config, 0, 256, selective=True, replacements=specs)[0],
-                        census_layer(config, 0, 256, selective=True)[0])
         self.assertEqual(census_parameters(config, 0, replacements=specs), census_parameters(config, 0))
 
     def test_what_the_fused_kernels_save_is_named_by_op(self):
@@ -843,63 +799,29 @@ class TestModuleReplacements(unittest.TestCase):
         self.assertEqual(priced.estimate_peak(), _evaluator(_qwen35_text()).estimate_peak())
         self.assertIn("a_native_extension", "".join(logs.output))
 
-    def test_the_census_saves_what_the_installed_policy_saves(self):
+    def test_fused_census_does_not_invent_a_selective_plan(self):
         """
-        Feature: the census's selective policy, beside the policy the
-            installed trainer runs.
-        Description: Each of the census's attention kernels under the
-            census's policy, and the runtime operator it stands in for under
-            the trainer's: the trainer's list of the operators it saves as
-            installed, then without those two operators, then with both.
-        Expectation: The census saves a kernel's outputs exactly where the
-            trainer's policy saves its operator's, whatever that list names:
-            each kernel is saved under one list and recomputed under another.
+        Feature: census_activations with module replacements.
+        Description: Fused modules without a module-region checkpoint plan.
+        Expectation: A real plain census, without operator-policy selective fields.
         """
-        checkpointing = _checkpointing()
-        installed = checkpointing._SELECTIVE_AC_COMPUTE_OP_NAMES  # pylint: disable=protected-access
-        operators = tuple(_ATTENTION_KERNELS.values())
-        lists = {"installed": installed,
-                 "without": tuple(name for name in installed if name not in operators),
-                 "with": tuple(dict.fromkeys((*installed, *operators)))}
-        decided = {kernel: set() for kernel in _ATTENTION_KERNELS}
-        for case, names in lists.items():
-            with self.subTest(case=case), _policy_naming(checkpointing, names):
-                census = _census_policy()
-                trainer = checkpointing._make_selective_checkpoint_policy_fn()  # pylint: disable=protected-access
-                for kernel, name in _ATTENTION_KERNELS.items():
-                    operator = checkpointing._resolve_torch_op(name)  # pylint: disable=protected-access
-                    expected = (name in names if operator is None
-                                else trainer(_ForwardContext(), operator) == CheckpointPolicy.MUST_SAVE)
-                    saves = census(_ForwardContext(), _kernel_op(kernel)) == CheckpointPolicy.MUST_SAVE
-                    self.assertEqual(saves, expected, kernel)
-                    decided[kernel].add(saves)
-        self.assertEqual(decided, {kernel: {False, True} for kernel in _ATTENTION_KERNELS})
+        records = census_activations(_qwen3_moe(), [{"kind": "decoder", "count": 2}], 64,
+                                    replacements=_recipe_specs())
+        record = records["decoder"]
+        self.assertGreater(record.saved + record.saved_tp, 0)
+        self.assertIsNone(record.selective)
+        self.assertIsNone(record.selective_tp)
+        self.assertIsNone(record.selective_attention_mm)
+        self.assertIsNone(record.selective_ffn_mm)
 
-    def test_a_selective_fused_layer_keeps_the_attention_its_policy_saves(self):
+    def test_fused_operator_selective_census_is_refused(self):
         """
-        Feature: census_layer, selective, with the Qwen3-MoE recipe's fused
-            modules.
-        Description: The trainer's policy without the fused attention's
-            operator, ``npu.npu_fusion_attention``, in its list of the
-            operators it saves, then with it; then the policy as installed.
-        Expectation: Where the policy saves that operator, the layer keeps
-            the kernel's output and its two fp32 statistics of every head
-            and token besides, and nothing else; as installed, it keeps what
-            the installed list says.
+        Feature: census_layer with fused modules and the retired selective flag.
+        Description: A fused layer requested without a module-region plan.
+        Expectation: The same explicit refusal as for an unfused layer.
         """
-        config, specs = _qwen3_moe(), _recipe_specs()
-        checkpointing = _checkpointing()
-        installed = checkpointing._SELECTIVE_AC_COMPUTE_OP_NAMES  # pylint: disable=protected-access
-        kept = {}
-        for case, names in (("without", tuple(name for name in installed if name != _NPU_ATTENTION)),
-                            ("with", tuple(dict.fromkeys((*installed, _NPU_ATTENTION))))):
-            with _policy_naming(checkpointing, names):
-                kept[case] = census_layer(config, 0, 256, selective=True, replacements=specs)[0]
-        output = config.head_dim * 2
-        statistics = 2 * 8 * 4
-        self.assertEqual(kept["with"] - kept["without"], 256 * config.num_attention_heads * (output + statistics))
-        self.assertEqual(census_layer(config, 0, 256, selective=True, replacements=specs)[0],
-                         kept["with" if _NPU_ATTENTION in installed else "without"])
+        with self.assertRaisesRegex(CensusUnavailable, "module regions"):
+            census_layer(_qwen3_moe(), 0, 64, selective=True, replacements=_recipe_specs())
 
     def test_the_contracts_stand_in_for_the_kernels(self):
         """
@@ -1023,16 +945,17 @@ class TestCensusPricing(unittest.TestCase):
         linear = census["linear_attention"]
         self.assertAlmostEqual(working[0], 4096 * (linear.working + linear.working_tp) / 2 ** 20, delta=1)
 
-    def test_a_selective_layer_is_priced_with_its_kinds_census(self):
+    def test_explicit_selective_records_are_still_priced(self):
         """
-        Feature: the census on the memory path, under HyperParallel's
-            selective activation checkpointing.
-        Description: The hybrid model checkpointed selectively on one stage,
-            with a census.
-        Expectation: Each layer keeps what its kind keeps under the
-            trainer's selective policy for the micro-batch's 4096 tokens.
+        Feature: compatibility with explicitly supplied selective records.
+        Description: The hybrid model with fixed records from an external census.
+        Expectation: The legacy cost-model selective mode still reads those records.
         """
-        evaluator = _evaluator(_qwen35_text(), mode="selective", census=True)
+        records = {kind: KindActivations(128.0, 256.0, 512.0, 1024.0, 4096,
+                                        selective=64.0, selective_tp=128.0).to_dict()
+                   for kind in ("linear_attention", "full_attention")}
+        with patch("hyper_parallel.auto_parallel._hf_model_spec._census", return_value={"activations": records}):
+            evaluator = _evaluator(_qwen35_text(), mode="selective", census=True)
         census = evaluator.ccfg.census
         log = evaluator.estimate_peak_insight()[0]["Node Log"]
         for index, kind in enumerate(("linear_attention", "full_attention")):

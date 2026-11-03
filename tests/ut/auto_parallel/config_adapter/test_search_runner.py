@@ -23,6 +23,7 @@ from unittest.mock import patch, MagicMock
 
 import yaml
 
+from hyper_parallel.auto_parallel._model_spec import KindActivations
 from hyper_parallel.auto_parallel.config_adapter._normalized_config import (
     NormalizedConfig,
 )
@@ -629,11 +630,12 @@ class TestCensusInASearch(unittest.TestCase):
         """
         Feature: context.census through the search runner.
         Description: A train.yaml of a two-layer hybrid Qwen3.5-MoE model
-            asking for a census, read as a search reads it, and the yaml the
-            search hands ND, which states the model as overrides only.
-        Expectation: The reader measures each layer kind and the output
-            layer; the overrides carry the records, and ND prices with them
-            without a checkpoint to read, and without a warning.
+            asking for a census, with the census producer returning fixed
+            records, and the yaml the search hands ND, which states the
+            model as overrides only.
+        Expectation: The reader requests each layer kind and the output
+            layer; the overrides and ND preserve every record field without
+            a checkpoint to read, and without a warning.
         """
         from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (  # pylint: disable=C0415
             Qwen3_5MoeTextConfig,
@@ -652,23 +654,38 @@ class TestCensusInASearch(unittest.TestCase):
             "dataset": {"data_transform": {"max_seq_len": 64}},
             "context": {"census": True},
         }
+        layers = {
+            "linear_attention": KindActivations(128.0, 256.0, 512.0, 1024.0, 64,
+                                                selective=64.0, selective_tp=128.0),
+            "full_attention": KindActivations(256.0, 512.0, 1024.0, 2048.0, 64,
+                                              selective=128.0, selective_tp=256.0),
+        }
+        output = KindActivations(32.0, 64.0, 128.0, 256.0, 64)
+        census = {
+            "activations": {kind: record.to_dict() for kind, record in layers.items()},
+            "output_activations": output.to_dict(),
+        }
         with tempfile.TemporaryDirectory() as folder:
             path = os.path.join(folder, "train.yaml")
             with open(path, "w", encoding="utf-8") as handle:
                 yaml.safe_dump(train, handle)
-            with patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config", return_value=text):
+            with patch("hyper_parallel.auto_parallel._hf_model_spec._get_hf_config", return_value=text), \
+                    patch("hyper_parallel.auto_parallel._hf_model_spec._census", return_value=census) as mock_census:
                 config = read_hp_yaml_config(path)
-            self.assertEqual(sorted(config.model_spec["activations"]), ["full_attention", "linear_attention"])
+            mock_census.assert_called_once_with(text, config.model_spec["layers"], 64, ())
+            self.assertEqual(config.model_spec["activations"], census["activations"])
+            self.assertEqual(config.model_spec["output_activations"], census["output_activations"])
             data = _search_yaml(config)
             self.assertNotIn("pretrained_model_name_or_path", data["model"])
-            self.assertIn("output_activations", data["model"]["config_overrides"])
+            self.assertEqual(data["model"]["config_overrides"]["activations"], census["activations"])
+            self.assertEqual(data["model"]["config_overrides"]["output_activations"], census["output_activations"])
             search_path = os.path.join(folder, "search.yaml")
             with open(search_path, "w", encoding="utf-8") as handle:
                 yaml.safe_dump(data, handle)
             with self.assertNoLogs("hyper_parallel.auto_parallel._hf_model_spec", "WARNING"):
                 ccfg = EvaluatorV2(search_path, framework="hyper_v2", log_level=0).ccfg
-        self.assertEqual(sorted(ccfg.census), ["full_attention", "linear_attention"])
-        self.assertEqual(ccfg.output_census.seq_length, 64)
+        self.assertEqual(ccfg.census, layers)
+        self.assertEqual(ccfg.output_census, output)
 
     def test_the_census_spec_reaches_nd(self):
         """
@@ -843,17 +860,16 @@ class TestSearchStrategies(unittest.TestCase):
         with self.assertRaises(ValueError):
             sr.search_strategies(config, offload=figures)
 
-        # A train.yaml that states a census prices the trainer's selective
-        # mode, its policy, as well.
+        # A generic census cannot specify the selective mode's module regions.
         census = _make_full_config(run={"context": {"census": True}})
         census.estimator["recompute_strategy"] = "auto"
-        mock_runner.recompute_choices = {mock_dims: SimpleNamespace(mode="selective")}
+        mock_runner.recompute_choices = {mock_dims: SimpleNamespace(mode="full")}
         result = sr.search_strategies(census)
         kwargs = mock_parallelize_cls.call_args.kwargs
-        self.assertEqual(kwargs["recompute_modes"], sr.TRAINER_CENSUS_MODES)
+        self.assertEqual(kwargs["recompute_modes"], sr.TRAINER_RECOMPUTE_MODES)
         self.assertEqual(kwargs["recompute_selective"], HYPER_SELECTIVE_REC_OP)
         self.assertFalse(kwargs["recompute_mode_per_layer"])
-        self.assertEqual(result["activation_checkpoint"], "selective")
+        self.assertEqual(result["activation_checkpoint"], "full")
         self.assertNotIn("activation_checkpoint_layers", result)
 
     @patch(

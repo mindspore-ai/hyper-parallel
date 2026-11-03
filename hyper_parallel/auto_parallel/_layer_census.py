@@ -25,13 +25,10 @@ HyperParallel's chunked gated-delta-rule kernel, which saves the queries,
 keys, values, the cumulated gates, beta and one chunk matrix.  A layer built
 with half the heads and half the feed-forward widths, as a tensor-parallel
 rank of 2 holds it, tells the bytes tensor parallelism splits from those it
-does not.  Run again under HyperParallel's selective activation checkpointing,
-its own checkpoint and the policy the installed trainer runs, a layer keeps
-its input and the outputs that policy saves: every other matmul's, the
-convolution's, and the attention kernel's where the policy saves the
-operator the census's kernel stands for (:func:`_policy_saves`); the matmuls
-it does not save its backward runs again, a share of the attention's
-projections and of the rest of the layer.
+does not.  These records describe a layer without checkpointing.  The
+trainer's selective checkpointing now selects explicit module regions,
+not a model-wide operator policy, so a per-kind census cannot infer its
+saved bytes or recomputed FLOP shares and leaves those fields unstated.
 
 What a layer saves is also told apart by the op of ND's op vector whose
 backward takes it (:class:`_SavedOps`), the records of shared decision S1 as
@@ -56,12 +53,10 @@ host cannot call, so they run under the kernels' shape contracts
 (:mod:`hyper_parallel.auto_parallel._npu_contracts`).  A factory that needs
 a library the host lacks leaves the census with a layer the run does not
 build, which it refuses (:exc:`CensusUnavailable`): Transformers' own
-modules keep other bytes, and under the selective policy a DeepSeek-V3.2
-layer's eager indexer keeps 2.3 times what the layer keeps plain.  The FLOP census
-(:func:`census_flops`) and the shares of matmul FLOPs a selective layer
-recomputes (:func:`census_recomputed`) stay on Transformers' own modules:
-both count the arithmetic the time model prices, which fusing a module
-does not change, and a fused kernel runs matmuls no dispatch sees.
+modules keep other bytes.  The FLOP census (:func:`census_flops`) stays on
+Transformers' own modules: it counts the arithmetic the time model prices,
+which fusing a module does not change, and a fused kernel runs matmuls no
+dispatch sees.
 
 A model whose layers cannot run alone is measured over its whole stack
 (:func:`census_stack`): DeepSeek-V4.1's layers read what earlier layers
@@ -113,8 +108,6 @@ from torch.utils.checkpoint import DefaultDeviceType
 
 from hyper_parallel.auto_parallel._model_spec import KindActivations
 from hyper_parallel.auto_parallel._npu_contracts import npu_contracts
-from hyper_parallel.core.activation_memory import api as activation_memory
-from hyper_parallel.core.activation_memory.policy import CheckpointPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -162,17 +155,14 @@ _EAGER_GDN = "eager"
 _HYPER_GDN = "triton"
 _GDN_BACKENDS = (_EAGER_GDN, _HYPER_GDN)
 
-# The census's attention kernels, each beside the runtime operator it stands
-# in for, named as HyperParallel's selective policy names the operators it
-# saves: its own flash attention for PyTorch's scaled-dot-product attention,
-# and the contract of the kernel HyperParallel's fused attention calls,
-# ``torch_npu.npu_fusion_attention``.  A selective census saves what a kernel
-# returns exactly where the installed policy saves what its operator returns
-# (:func:`_policy_saves`).
-_ATTENTION_KERNELS = {
-    "nd_census::flash_attention": "aten.scaled_dot_product_attention",
-    "nd_census_npu::fusion_attention": "npu.npu_fusion_attention",
-}
+# Both attention contracts save fp32 softmax statistics separately from
+# their inputs and outputs; the per-op census classifies those saves alike.
+_ATTENTION_KERNELS = ("nd_census::flash_attention", "nd_census_npu::fusion_attention")
+
+_SELECTIVE_CENSUS_UNAVAILABLE = (
+    "operator-level selective census is no longer supported: activation checkpointing selects module regions, "
+    "which this per-kind census does not model; request a plain census instead"
+)
 
 # The per-head query and key norms an attention holds, which ND prices with
 # the layer's norms.
@@ -189,9 +179,8 @@ def _flash_outputs(query: torch.Tensor, key: torch.Tensor,
     return query.new_empty(batch, heads, seq, value.shape[-1]), stats[0], stats[1]
 
 
-# Flash attention as one op, as the runtime's kernel is: HyperParallel's
-# selective policy saves what the attention kernels it lists return, and
-# saves this one's too.
+# Keep flash attention opaque, as the runtime's kernel is, so its autograd
+# contract rather than an eager decomposition determines the saved tensors.
 _FLASH_KERNEL = torch.library.custom_op(
     "nd_census::flash_attention", mutates_args=(),
     schema="(Tensor query, Tensor key, Tensor value) -> (Tensor, Tensor, Tensor)")(_flash_outputs)
@@ -533,92 +522,6 @@ def _matmul_flops(func: Any, args: Sequence[Any]) -> int:
     return 2 * first.numel() * second.shape[-1]
 
 
-class _RecomputedMatmuls:
-    """The matmul FLOPs a layer's selective forward saves and leaves to run again, its attention's and the rest's."""
-
-    def __init__(self, layer: Any) -> None:
-        """Tell the attention's parameters, those of a child named for it, from the rest of *layer*'s."""
-        self.attention = {param.untyped_storage()._cdata  # pylint: disable=protected-access
-                          for name, param in layer.named_parameters()
-                          if "attn" in name.split(".")[0] or "attention" in name.split(".")[0]}
-        self.flops: Dict[Tuple[bool, bool], int] = {}
-
-    def note(self, func: Any, args: Sequence[Any], policy: CheckpointPolicy) -> None:
-        """Count the FLOPs of a matmul the policy decided on, by part and by whether it runs again."""
-        flops = _matmul_flops(func, args)
-        if flops:
-            attention = any(isinstance(arg, torch.Tensor)
-                            and arg.untyped_storage()._cdata in self.attention  # pylint: disable=protected-access
-                            for arg in args)
-            key = (attention, policy == CheckpointPolicy.MUST_RECOMPUTE)
-            self.flops[key] = self.flops.get(key, 0) + flops
-
-    def share(self, attention: bool) -> float:
-        """The share of the attention's matmul FLOPs, or of the rest's, that runs again."""
-        again = self.flops.get((attention, True), 0)
-        total = again + self.flops.get((attention, False), 0)
-        return again / total if total else 0.0
-
-
-class _ForwardContext(NamedTuple):
-    """What a selective policy reads of its checkpoint context, in the forward: no recompute is running."""
-
-    is_recompute: bool = False
-
-
-def _checkpointing() -> Any:
-    """HyperParallel's activation checkpointing module, which holds the policy its trainer runs.
-
-    Its distributed package takes as long to import as the rest of the cost
-    model, so it loads only when a census runs.
-    """
-    return importlib.import_module("hyper_parallel.distributed.activation_checkpoint")
-
-
-def _policy_saves(checkpointing: Any, name: str) -> bool:
-    """Whether the installed selective policy saves what the runtime operator *name* returns.
-
-    Where this host registers the operator, the policy decides on it as it
-    does in a run.  An NPU operator is registered only where ``torch_npu``
-    is installed: elsewhere the policy's own list of the operators it saves
-    is read for its name, which is what a run on the NPU resolves.
-    """
-    # pylint: disable=protected-access
-    operator = checkpointing._resolve_torch_op(name)
-    if operator is None:
-        return name in checkpointing._SELECTIVE_AC_COMPUTE_OP_NAMES
-    decide = checkpointing._make_selective_checkpoint_policy_fn()
-    return decide(_ForwardContext(), operator) == CheckpointPolicy.MUST_SAVE
-
-
-def _census_policy(ledger: Optional[_RecomputedMatmuls] = None) -> Callable[..., CheckpointPolicy]:
-    """The policy the installed trainer runs, deciding on the census's attention kernels as on their operators.
-
-    A census kernel is saved where the policy saves the operator it stands
-    for (:data:`_ATTENTION_KERNELS`), and recomputed where it does not, as
-    the policy recomputes any operator it does not name.  Its forward
-    decisions on matmuls go to *ledger*, if given.
-    """
-    checkpointing = _checkpointing()
-    policy = checkpointing._make_selective_checkpoint_policy_fn()  # pylint: disable=protected-access
-    saved = frozenset(_kernel_op(kernel) for kernel, name in _ATTENTION_KERNELS.items()
-                      if _policy_saves(checkpointing, name))
-
-    def census_policy(ctx: Any, func: Any, *args: Any, **kwargs: Any) -> CheckpointPolicy:
-        """The trainer's policy, which saves a census attention kernel where it saves the kernel's operator."""
-        decision = CheckpointPolicy.MUST_SAVE if func in saved else policy(ctx, func, *args, **kwargs)
-        if ledger is not None and not ctx.is_recompute:
-            ledger.note(func, args, decision)
-        return decision
-
-    return census_policy
-
-
-def _selective_contexts(ledger: Optional[_RecomputedMatmuls] = None) -> Tuple[Any, Any]:
-    """HyperParallel's selective checkpointing contexts under :func:`_census_policy`."""
-    return activation_memory.create_selective_checkpoint_contexts(_census_policy(ledger))
-
-
 def _kernel_op(name: str) -> Any:
     """The census kernel *name*, ``namespace::kernel``, as an op."""
     namespace, kernel = name.split("::")
@@ -743,11 +646,8 @@ def _replaced(holder: _Holder, specs: Sequence[Any]) -> None:
     Raises:
         CensusUnavailable: If a factory needs a library this host lacks, such
             as an attention built on a native extension.  Transformers' own
-            modules are not what the run trains, and measuring them prices a
-            layer nobody runs: a DeepSeek-V3.2 layer whose indexer runs eager
-            keeps, under the selective policy, 1192192 bytes a token against
-            the 516368 it keeps plain, its scores an fp32 tensor of one
-            sequence by another that the policy holds and no backward takes.
+            modules are not what the run trains, and measuring them would
+            attribute their saved tensors to a fused layer nobody ran.
     """
     from hyper_parallel.models.replacement import (  # pylint: disable=C0415
         apply_module_replacements,
@@ -1241,8 +1141,8 @@ def census_layer(config: Any, layer_index: int, seq_length: int, selective: bool
         config: The language model's Transformers config.
         layer_index: The layer to build, which settles its kind.
         seq_length: Tokens of the micro-batch of one sequence it runs.
-        selective: Whether the layer runs under HyperParallel's selective
-            activation checkpointing, as its trainer wraps a layer.
+        selective: Retired operator-level selective flag. True is refused:
+            the trainer now selects module regions this census does not model.
         ops: Where given, and the layer runs without checkpointing, takes
             the bytes it saves by the op saving them (:class:`_SavedOps`).
         replacements: The module replacements a run installs
@@ -1257,8 +1157,10 @@ def census_layer(config: Any, layer_index: int, seq_length: int, selective: bool
 
     Raises:
         CensusUnavailable: If no contract states what this model's kernels
-            save (:func:`_no_contract`).
+            save (:func:`_no_contract`), or selective is requested.
     """
+    if selective:
+        raise CensusUnavailable(_SELECTIVE_CENSUS_UNAVAILABLE)
     _no_contract(config)
     with _fake_layer(config, layer_index, gdn_backend=gdn_backend,
                      replacements=replacements) as (layer, rotary):
@@ -1272,22 +1174,13 @@ def census_layer(config: Any, layer_index: int, seq_length: int, selective: bool
             # counted, so they count toward no layer.
             with torch.no_grad():
                 _run(layer, hidden, _positions(rotary, hidden, seq_length))
-        if not selective:
-            saved_ops = None if ops is None else _SavedOps(layer)
-            measured = _measure(list(layer.parameters()), (hidden,),
-                                lambda: _run(layer, hidden, _positions(rotary, hidden, seq_length)),
-                                lambda out: out.backward(grad), grad_inputs=(grad,), ops=saved_ops)
-            if saved_ops is not None:
-                ops.update(saved_ops.saved)
-            return measured
-        # The model embeds the positions once for all its layers, outside
-        # their checkpoints, and the trainer checkpoints each layer's call.
-        positions = _positions(rotary, hidden, seq_length)
-        call = functools.partial(activation_memory.checkpoint, layer, swap_inputs=False,
-                                 context_fn=_selective_contexts)
-        return _measure(list(layer.parameters()), (hidden,), lambda: _run(layer, hidden, positions, call),
-                        lambda out: out.backward(grad), grad_inputs=(grad,), checkpointed=True,
-                        shared=tree_flatten(positions)[0])
+        saved_ops = None if ops is None else _SavedOps(layer)
+        measured = _measure(list(layer.parameters()), (hidden,),
+                            lambda: _run(layer, hidden, _positions(rotary, hidden, seq_length)),
+                            lambda out: out.backward(grad), grad_inputs=(grad,), ops=saved_ops)
+        if saved_ops is not None:
+            ops.update(saved_ops.saved)
+        return measured
 
 
 def census_saved_ops(config: Any, layer_index: int, seq_length: int,
@@ -1311,27 +1204,18 @@ def census_saved_ops(config: Any, layer_index: int, seq_length: int,
 
 
 def census_recomputed(config: Any, layer_index: int, seq_length: int) -> Tuple[float, float]:
-    """The shares of layer *layer_index*'s matmul FLOPs its backward runs again under selective checkpointing.
+    """Refuse the retired operator-policy census of recomputed matmul FLOPs.
 
     Args:
         config: The language model's Transformers config.
         layer_index: The layer to build, which settles its kind.
         seq_length: Tokens of the micro-batch of one sequence it runs.
 
-    Returns:
-        The share of its attention's projections' FLOPs, and of the rest of
-        the layer's, that HyperParallel's selective policy recomputes: it
-        saves every other matmul's output, in the order the layer runs
-        them, and a biased projection's always.
+    Raises:
+        CensusUnavailable: The trainer's module-region plan is not an
+            operator policy and cannot be inferred from these arguments.
     """
-    with _fake_layer(config, layer_index) as (layer, rotary):
-        hidden = torch.randn(1, seq_length, config.hidden_size, dtype=torch.bfloat16, requires_grad=True)
-        ledger = _RecomputedMatmuls(layer)
-        call = functools.partial(activation_memory.checkpoint, layer, swap_inputs=False,
-                                 context_fn=functools.partial(_selective_contexts, ledger))
-        with _checkpoints_on_cpu():
-            _run(layer, hidden, _positions(rotary, hidden, seq_length), call)
-    return ledger.share(attention=True), ledger.share(attention=False)
+    raise CensusUnavailable(_SELECTIVE_CENSUS_UNAVAILABLE)
 
 
 def _parameter_part(name: str) -> str:
@@ -1693,10 +1577,10 @@ def census_activations(config: Any, layers: Iterable[Mapping[str, Any]], seq_len
 
     Returns:
         Each kind's :class:`KindActivations`: of the bytes a layer at TP 2
-        holds, the part TP splits is half the part at TP 1; what it keeps
-        under HyperParallel's selective activation checkpointing too, the
-        shares of its matmul FLOPs that recomputes, and what it keeps for
-        each op, its records per op.  A family whose layers cannot run
+        holds, the part TP splits is half the part at TP 1, and what it keeps
+        for each op, its records per op. Selective fields remain unstated:
+        a module-region checkpoint plan cannot be inferred from a layer kind.
+        A family whose layers cannot run
         alone (:data:`_STACK_FAMILIES`) is measured over its whole stack
         instead (:func:`census_stack`), and its records state the plain
         layer's bytes only.
@@ -1721,21 +1605,12 @@ def census_activations(config: Any, layers: Iterable[Mapping[str, Any]], seq_len
             census_layer(tp_config(config, tp), layer_index, seq_length, ops=ops,
                          replacements=replacements, gdn_backend=gdn_backend)
             for tp, ops in ((1, ops_1), (2, ops_2)))
-        (kept_1, _), (kept_2, _) = (
-            census_layer(tp_config(config, tp), layer_index, seq_length, selective=True,
-                         replacements=replacements, gdn_backend=gdn_backend)
-            for tp in (1, 2))
-        attention_mm, ffn_mm = census_recomputed(config, layer_index, seq_length)
         out[kind] = KindActivations(
             saved=max(0.0, 2 * saved_2 - saved_1) / seq_length,
             saved_tp=max(0.0, 2 * (saved_1 - saved_2)) / seq_length,
             working=max(0.0, 2 * working_2 - working_1) / seq_length,
             working_tp=max(0.0, 2 * (working_1 - working_2)) / seq_length,
             seq_length=int(seq_length),
-            selective=max(0.0, 2 * kept_2 - kept_1) / seq_length,
-            selective_tp=max(0.0, 2 * (kept_1 - kept_2)) / seq_length,
-            selective_attention_mm=attention_mm,
-            selective_ffn_mm=ffn_mm,
             ops={op: max(0.0, 2 * ops_2.get(op, 0) - ops_1[op]) / seq_length for op in sorted(ops_1)},
             ops_tp={op: max(0.0, 2 * (ops_1[op] - ops_2.get(op, 0))) / seq_length for op in sorted(ops_1)},
         )

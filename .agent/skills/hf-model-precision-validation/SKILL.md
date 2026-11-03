@@ -172,8 +172,7 @@ rows in `comparison.json` for every formal case.
    ```
 
    Inspect `cases/resolved_cases.json`. It must include EP1 when EP is exercised,
-   requested TP/CP/EP combinations, adapter-safe `layer_count` and/or
-   `layer_indices` recomputation selections,
+   requested TP/CP/EP combinations, explicit `recompute_layer` sets,
    Production/Validate when requested, and explicit resume cases.
    For a VLM, the generic TP/CP/EP/FSDP matrix is only the decoder portion.
    Add the vision/projector and modality-routing overlay from the VLM reference;

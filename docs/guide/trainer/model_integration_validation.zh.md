@@ -417,49 +417,38 @@ case = ModuleParityCase(
 
 当参考仓与生产环境存在模块名冲突或只能在独立解释器中导入时，使用 `execution="isolated_process"` 和 `isolated_runner`。DeepSeek-V4.1 的 Engram、MoE 和 CSA2 就采用这一方式。
 
-### 3.4 安全重计算区域
+### 3.4 显式声明激活内存区域
 
-共享跨层状态的 producer/consumer 可以参与重算，但重算路径上有两类动作必须先处理掉：**只需执行一次的副作用**（写跨层状态）和**离散且不可复现的选择**（Top-K / 候选池）。模型 adapter 用一份声明同时描述"哪些模块成为区域"和"哪些后代必须留在重算之外"，并用 `on_applied` 安装依赖最终区域形状的运行期行为（例如给会被重算的层 pin 选区）：
+Trainer 不再从 model adapter 推断重算区域。模块替换和并行适配完成后，框架按稳定的 layer 顺序为层编号；recipe 必须使用相对于单个 layer 的模块路径，显式声明整层重算、排除区域的保存或换出，以及 selective wrapper。模块路径必须精确解析到 `nn.Module`，不支持 glob、正则表达式或自动回退。
 
-```python
-from hyper_parallel.models.adapter_spec import RecomputePolicy
-
-
-def build_recompute_policy():
-    """整层一个区域；attention 的重算范围由同一张角色表派生。"""
-    recomputed = ("full", "reindex", "reuse")
-    return RecomputePolicy(
-        region_patterns=("model.layers.*",),
-        exclude_predicate=...,                                       # 角色不在 recomputed 里的 attention 留在区域外
-        on_applied=...,                                              # 给会被重算的 index source pin 选区
-    )
-```
-
-DeepSeek-V4.1 把它写成 `models/deepseek_v41/adapter/policies/activation_checkpointing.py` 里的一档开关：`ATTENTION_RECOMPUTE_TIER` 取 `reuse`（默认）/ `reuse_reindex` / `all` / `none`，不在重算范围里的角色由同一张角色表派生为 `exclude_predicate`，会重算的 index source 由同一个元组派给 `configure_shared_state` 去 pin 选区。默认 `reuse`：只读跨层状态的层随层重算，Full/Reindex 这类生产者留在区域外保留激活。`configure_shared_state` 把 indexer 的离散选择 pin 成 exclude 区域，重算复用正向选出的集合，也避免"跳过一段可微代码"破坏 checkpoint 的张量数不变量。跨层状态本身不需要调度——它作为重算区域的输入被 checkpoint 持有，发布出去的条目随它活到反向结束，而 `publish_*` 只在正向执行（`is_recomputing()` 判定），重算不会写第二次。pin 只覆盖离散选择：选区之外的 compressor、indexer 投影按档位随层重算或留在区域外。
-
-`region_patterns` 取**最外层匹配**作为区域根：写成整层模式时一个区域只保存一份层输入，写成 `model.layers.*.mlp` 这类叶子模块模式时则每个模块各自成区域（此时 `exclude_patterns` 一般留空）。`exclude_patterns` 必须命中区域根的后代，否则直接报错；同一个模块也不能既是区域根又被排除。`on_applied` 是区域装好后的模型自有钩子，用于开启依赖最终区域形状的运行时行为（例如 DeepSeek-V4.1 用它给会被重算的层安装选区 pin）。
-
-Trainer recipe 通过通用配置选择该策略：
+例如，前两层整层重算，其中 `module_a` 保存、`module_b` 换出；后两层分别对指定模块应用 selective 重算和换出：
 
 ```yaml
 activation_checkpoint:
-  mode: selective
-  selection:
-    source: model_adapter_safe_regions
-    layer_count: 16
+  mode: hybrid
+  full:
+    recompute_layer: [0-1]
+    exclude_region:
+      save:
+        module_a: [0]
+      swap:
+        group_swap: false
+        cpu_pool: 512
+        module_b: [0-1]
+  selective:
+    recompute:
+      module_a: [2]
+    swap:
+      group_swap: true
+      cpu_pool: 512
+      module_b: [3]
 ```
 
-`layer_count` 按所有已发现 layer container 的展平顺序，从下标 `0` 开始连续选择指定数量的层；例如 `layer_count: 2` 选择第 `0、1` 层，`0` 表示不选择任何层。需要选择非连续层时使用与其互斥的 `layer_indices`：
+层集合支持非负整数和闭区间，例如 `[0,2-3]` 表示第 `0、2、3` 层。`cpu_pool` 单位为 MiB；full 排除区域换出和 selective 换出分别创建独立的 pinned-memory pool。`mode: hybrid` 要求 full 层与所有 selective 目标层完全不相交。
 
-```yaml
-activation_checkpoint:
-  mode: selective
-  selection:
-    source: model_adapter_safe_regions
-    layer_indices: [0, 4, 8, 12]
-```
+模型集成验证的重计算用例只替换 `full.recompute_layer`，并保留启动 recipe 中的 `full.exclude_region`。router/indexer 不允许 replay 的模型必须在 validation manifest 使用的 recipe 中声明该排除区域。
 
-`layer_indices` 从 `0` 开始，必须非空、非负且不重复。`source: default` 不接受这两个字段。
+框架会先统一解析并校验所有 active layer/path 目标，再安装 wrapper。层编号越界、路径不存在、目标不是 `nn.Module`、父子路径嵌套或保存/换出冲突，都会在训练开始前报错；解析失败不会修改模型树。
 
 ## 4. 编写验证清单
 
@@ -766,7 +755,7 @@ DeepSeek adapter 的验证声明包括：
 - `compressed_kv`、`index_key`、`topk_indices`、`candidate_blocks` 跨层 publish/consume 检查；
 - packed runtime 字段、视觉输入字段及 vision/aligner 梯度检查；
 - 独立进程中的原生 Engram/MoE/CSA2 前向与反向比较；
-- 整层作为一个区域重算（含 CSA2 attention）：状态写入只在正向执行（`is_recomputing()` 判定），离散选择 pin 成 exclude 区域；跨层条目由 autograd 图持有到反向结束。
+- CSA2 重算边界必须把 Full/Reindex 的 indexer 模块排除在 replay 外；状态写入只在正向执行（`is_recomputing()` 判定），跨层条目由 autograd 图持有到反向结束。
 
 DeepSeek-V4.1 的模型主体和优化路径是一一对应、但彼此不互相替代的：
 
@@ -793,7 +782,7 @@ DeepSeek-V4.1 的模型主体和优化路径是一一对应、但彼此不互相
 | checkpoint 覆盖相关报错 | checkpoint key 未覆盖或转换不可逆 | 增加 mapping/transform/reverse transform 或显式合法排除 |
 | forward 数据契约相关报错 | forward 字段所有权冲突、字段缺失、label shift/模态梯度不符 | 修正 Omni dataset transform、get-batch 或 runtime input adapter 声明 |
 | 参数探针未命中 | required probe 未匹配最终参数 | 使用替换后的最终 FQN 更新 adapter 声明 |
-| 共享状态契约相关报错 | 跨层状态缺 producer/consumer、producer 重复发布或 trace 超限 | 让状态写入只在正向执行（`is_recomputing()`）、把离散选择 pin 成 exclude 区域，或缩小重算边界 |
+| 共享状态契约相关报错 | 跨层状态缺 producer/consumer、producer 重复发布或 trace 超限 | 让状态写入只在正向执行（`is_recomputing()`）、把 indexer/router 模块排除在 replay 外，或缩小重算边界 |
 | Online dataloader 拒绝跨 DP world-size cursor，或跳过 cursor 后 input hash 仍不同 | DCP 能重分片模型/优化器，不代表 loader 能重建全局样本位置；从同一配置起点也不保证 DP-invariant packing | warm-start 可用 `restore_dataloader_state=false` 请求 replay，但必须检查 global input hash；正式跨拓扑精度改用固定 Offline replay，真正续训改用支持全局 cursor 重建的 loader，否则标为 `BLOCKED` |
 | `BLOCKED` | 证据、设备、资产或独立 oracle 不可用 | 补齐前置条件；不要放宽阈值或静默缩小实验 |
 

@@ -23,9 +23,9 @@ from unittest.mock import MagicMock, patch, sentinel
 
 import torch
 
+from hyper_parallel.core.activation_memory import CheckpointPolicy, swap_wrapper
 from hyper_parallel.core.activation_memory.pinned_memory_pool import PinnedMemoryPool
 from hyper_parallel.high_availability.model_recovery import ModelRecoveryAdapter
-from hyper_parallel.distributed.attention_swap import apply_attention_swap
 
 swap_module = importlib.import_module("hyper_parallel.core.activation_memory.swap")
 from hyper_parallel.core.activation_memory.swap import (  # noqa: E402
@@ -99,6 +99,16 @@ def _build_mock_platform():
     )
 
     return mp
+
+
+def _save_small_activations(tensor):
+    """Keep activations on device, mirroring the production attention-swap threshold.
+
+    The swap policy used by the attention activation-swap entry point only moved
+    large (>1 MiB), contiguously owned tensors to host. The layers exercised in
+    these tests are too small to qualify, so every saved tensor stays resident.
+    """
+    return CheckpointPolicy.MUST_SAVE
 
 
 class TestModuleFunctions(unittest.TestCase):
@@ -1533,7 +1543,12 @@ class TestSwapManager(unittest.TestCase):
         reference = copy.deepcopy(model)
         inputs = torch.ones(1, 2, requires_grad=True)
         reference(inputs).sum().backward()
-        apply_attention_swap(model, "attention")
+        conversations = []
+        for layer in model:
+            layer.self_attn = swap_wrapper(layer.self_attn, policy_fn=_save_small_activations, group_swap=True)
+            conversations.append(layer.self_attn)
+        for current_attention, next_attention in zip(conversations, conversations[1:]):
+            SwapManager().set_forward_prefetch_layer(current_attention, next_attention)
         adapter = ModelRecoveryAdapter(model)
         identities = list(model.parameters())
 

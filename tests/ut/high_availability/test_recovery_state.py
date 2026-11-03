@@ -28,9 +28,12 @@ from torch.utils.checkpoint import DefaultDeviceType, checkpoint as torch_checkp
 from hyper_parallel import Replicate, Shard
 from hyper_parallel.high_availability.recovery_state import ModelOptimizerState, TrainState
 from hyper_parallel.high_availability.model_recovery import ModelRecoveryAdapter
-from hyper_parallel.core.activation_memory.api import checkpoint as hyper_checkpoint
+from hyper_parallel.core.activation_memory import CheckpointPolicy
+from hyper_parallel.core.activation_memory.api import (
+    checkpoint as hyper_checkpoint,
+    create_selective_checkpoint_contexts,
+)
 from hyper_parallel.core.activation_memory.recompute_state import get_recompute_state
-from hyper_parallel.distributed.activation_checkpoint import make_selective_checkpoint_context_fn
 from hyper_parallel.high_availability.group_registry import GroupRegistry
 from hyper_parallel.high_availability.replica_topology import ReplicaTopology, model_replica_candidates
 from hyper_parallel.core.optimizer.adamw import AdamW
@@ -39,6 +42,31 @@ from hyper_parallel.core.optimizer.swap_optimizer import SwapOptimizerConfig, sw
 from hyper_parallel.core.optimizer.sharding_category import (
     CommDomainKey, HSDPCommGroup, ParamLayoutSpec, ParamRecord,
 )
+
+
+_SELECTIVE_MUST_SAVE_OPS = frozenset((
+    torch.ops.aten.matmul.default,
+    torch.ops.aten.mm.default,
+    torch.ops.aten.addmm.default,
+))
+
+
+def _make_selective_checkpoint_context_fn():
+    """Create a selective-activation-checkpoint context factory for this test.
+
+    Replaces the removed ``hyper_parallel.distributed.activation_checkpoint``
+    helper: expensive ops are kept on device, everything else is recomputed,
+    and a fresh ``(forward_ctx, recompute_ctx)`` pair is produced per region —
+    the contract expected by non-reentrant ``checkpoint``'s ``context_fn``.
+    """
+    def policy_fn(ctx, func, *args, **kwargs):
+        """Save expensive matmuls and recompute ordinary operators."""
+        del ctx, args, kwargs
+        if func in _SELECTIVE_MUST_SAVE_OPS:
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.MUST_RECOMPUTE
+
+    return lambda: create_selective_checkpoint_contexts(policy_fn)
 
 
 class StatefulValue:
@@ -561,7 +589,7 @@ class TestRecomputeRecovery(unittest.TestCase):
         loader = StatefulValue()
         train_state = TrainState(loader, {})
         adapter = ModelRecoveryAdapter(model)
-        checkpoint_args = ({"context_fn": make_selective_checkpoint_context_fn()}
+        checkpoint_args = ({"context_fn": _make_selective_checkpoint_context_fn()}
                            if mode == "selective" else {})
 
         def _raise_once(current):

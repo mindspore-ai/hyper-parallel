@@ -464,9 +464,6 @@ class TestCSA2Family(unittest.TestCase):
                     self.assertTrue(selected.indexer.q_b_proj.training)
                     self.assertFalse(selected.sinks.requires_grad)
                     self.assertNotIn("calibration", selected.state_dict())
-                    checkpoint_keys = tuple(selected.state_dict())
-                    selected.indexer.enable_selection_exclude()
-                    self.assertEqual(tuple(selected.state_dict()), checkpoint_keys)
 
     def test_complete_layout_and_invalid_override(self):
         """Every parameter is owned; invalid TP/CP placement overrides are rejected."""

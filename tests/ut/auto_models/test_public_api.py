@@ -236,7 +236,11 @@ class TestTrainerConfigContracts(unittest.TestCase):
             [
                 "AcceleratorConfig",
                 "ActivationCheckpointConfig",
-                "ActivationCheckpointSelection",
+                "FullCheckpointConfig",
+                "FullExcludeRegionConfig",
+                "ModelModuleSpec",
+                "ModuleRegionSpec",
+                "SelectiveCheckpointConfig",
                 "CompileConfig",
                 "DataLoaderConfig",
                 "DatasetConfig",

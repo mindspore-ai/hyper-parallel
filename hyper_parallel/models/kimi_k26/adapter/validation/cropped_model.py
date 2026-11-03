@@ -86,9 +86,7 @@ def build_cropped_kimi_vlm(
         distributed_setup: DistributedSetup | None = None,
         peft_config: Any | None = None,
         compile_config: CompileConfig | dict[str, Any] | None = None,
-        activation_checkpoint: str | None = None,
-        activation_swap: str = "none",
-        swap_inputs: bool = False,
+        activation_checkpoint: Any | None = None,
         freeze_patterns: list[str] | None = None,
         load_pretrained: bool = False,
         moe_router_force_load_balancing: bool = False,
@@ -125,12 +123,7 @@ def build_cropped_kimi_vlm(
         distributed_setup: Trainer-provided distributed topology.
         peft_config: Optional Trainer-provided PEFT configuration.
         compile_config: Optional Trainer-provided compile configuration.
-        activation_checkpoint: Activation checkpoint mode.
-        activation_swap: Activation swap mode.
-        swap_inputs: Offload each checkpointed block's boundary activation to
-            host memory during the forward pass. Independent of
-            ``activation_swap``; requires ``activation_checkpoint`` to be
-            ``"full"`` or ``"selective"``.
+        activation_checkpoint: Normalized activation checkpoint configuration.
         moe_router_force_load_balancing: Enable deterministic destinations in the new Gate family.
         moe_aux_loss_coeff: New Gate's sequence balancing coefficient; zero disables it.
         moe_router_bias_update_rate: New Gate's correction-bias update rate; zero disables it.
@@ -169,7 +162,7 @@ def build_cropped_kimi_vlm(
     config.text_config.moe_router_bias_update_rate = moe_router_bias_update_rate
     model = _build_cropped_kimi_model(
         config, attn_implementation, distributed_setup, peft_config, torch_dtype, validate_placement,
-        compile_config, activation_checkpoint, activation_swap, swap_inputs, freeze_patterns)
+        compile_config, activation_checkpoint, freeze_patterns)
 
     _maybe_load_pretrained(model, model_dir, load_pretrained)
     _bind_kimi_context_parallel(model, distributed_setup)
@@ -244,9 +237,7 @@ def _build_cropped_kimi_model(
         torch_dtype: str,
         validate_placement: bool,
         compile_config: CompileConfig | dict[str, Any] | None,
-        activation_checkpoint: str | None,
-        activation_swap: str,
-        swap_inputs: bool,
+        activation_checkpoint: Any | None,
         freeze_patterns: list[str] | None,
 ) -> PreTrainedModel:
     """Instantiate the parallelized model under the vision-init monkey patch."""
@@ -279,8 +270,6 @@ def _build_cropped_kimi_model(
             validate_placement=validate_placement,
             compile_config=compile_config,
             activation_checkpoint=activation_checkpoint,
-            activation_swap=activation_swap,
-            swap_inputs=swap_inputs,
             freeze_config=freeze_patterns,
         )
     finally:

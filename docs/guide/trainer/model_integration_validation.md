@@ -138,9 +138,8 @@ to complete `validation_scope=full_pretrained` validation.
 
 Model integration validation answers four distinct questions: whether the final constructed model structure is safe; whether replaced critical modules match the authoritative implementation; whether optimized paths meet both numerical-accuracy and performance targets against a fair baseline; and whether the same training state remains numerically self-consistent across parallel strategies. It neither replaces ordinary training configuration nor guesses model-family semantics at runtime.
 
-The production architecture implements the core model semantics. Model-specific validation contracts and safe recomputation boundaries are declared through
-`ModelAdapterSpec.validation` and `ModelAdapterSpec.recompute`, respectively. Generic tools only execute, collect evidence, compare, and
-report. Adding a model requires no model-name, class-name, or FQN special cases in the Trainer, CLI, or diagnostic modules.
+The production architecture implements the core model semantics, while model-specific validation contracts are declared through
+`ModelAdapterSpec.validation`. Activation-checkpoint targets are selected entirely by the Trainer recipe using explicit layer numbers and module paths. A model adapter's `on_applied` hook may only establish the replay invariants required by targets that have already been selected; it must not infer or expand those targets. Generic tools only execute, collect evidence, compare, and report. Adding a model requires no model-name, class-name, or FQN special cases in the Trainer, CLI, or diagnostic modules.
 
 This guide distinguishes three easily confused terms:
 
@@ -417,49 +416,38 @@ case = ModuleParityCase(
 
 When the reference repository conflicts with production module names or can only be imported in a separate interpreter, use `execution="isolated_process"` and `isolated_runner`. DeepSeek-V4.1 uses this approach for Engram, MoE, and CSA2.
 
-### 3.4 Safe Recomputation Regions
+### 3.4 Explicit Activation-Memory Regions
 
-Producers/consumers sharing cross-layer state may participate in recomputation, but two kinds of actions must first be handled on that path: **side effects that must execute only once** (writing cross-layer state) and **discrete, nonreproducible selections** (Top-K/candidate pools). A single model-adapter declaration specifies both which modules become regions and which descendants must remain outside recomputation. `on_applied` installs runtime behavior that depends on the final region structure, such as pinning selections for layers that will be recomputed:
+The Trainer no longer infers recomputation regions from the model adapter. After module replacement and parallel adaptation are complete, the framework assigns indices according to the stable layer order. The recipe must use layer-relative module paths to explicitly declare whole-layer recomputation, excluded saves, excluded swaps, or selective wrappers. Module paths must resolve exactly to an `nn.Module`; globs, regular expressions, and automatic fallbacks are not supported.
 
-```python
-from hyper_parallel.models.adapter_spec import RecomputePolicy
-
-
-def build_recompute_policy():
-    """Use one region per layer; derive attention recomputation scope from the same role table."""
-    recomputed = ("full", "reindex", "reuse")
-    return RecomputePolicy(
-        region_patterns=("model.layers.*",),
-        exclude_predicate=...,  # Keep attention roles outside recomputed out of the region.
-        on_applied=...,  # Pin selections for index sources that will be recomputed.
-    )
-```
-
-DeepSeek-V4.1 expresses this as a tier switch in `models/deepseek_v41/adapter/policies/activation_checkpointing.py`: `ATTENTION_RECOMPUTE_TIER` is `reuse` (default), `reuse_reindex`, `all`, or `none`. The same role table derives `exclude_predicate` for roles outside the recomputation scope, and the same tuple passes recomputed index sources to `configure_shared_state` to pin their selections. With default `reuse`, layers that only read cross-layer state are recomputed with their layer, while producers such as Full/Reindex remain outside the region and retain activations. `configure_shared_state` pins the indexer's discrete selection as an excluded region, reusing the forward-selected set during recomputation and avoiding violations of checkpoint tensor-count invariants caused by skipping differentiable code. Cross-layer state itself needs no scheduling: checkpointing holds it as an input to the recomputation region, and published entries live with it until backward ends. `publish_*` executes only during forward, as determined by `is_recomputing()`, so recomputation does not write it again. Pinning covers only discrete selection; compressor and indexer projections outside that selection are recomputed with the layer or kept outside the region according to the tier.
-
-`region_patterns` uses the **outermost match** as each region root. A whole-layer pattern saves one copy of the layer input per region; a leaf-module pattern such as `model.layers.*.mlp` creates a separate region for each module, usually with empty `exclude_patterns`. `exclude_patterns` must match descendants of a region root or raise an error; the same module cannot be both a region root and excluded. `on_applied` is a model-owned hook invoked after regions are installed to enable runtime behavior depending on their final structure, such as DeepSeek-V4.1 pinning selections for recomputed layers.
-
-The Trainer recipe selects this policy through generic configuration:
+For example, the first two layers use whole-layer recomputation, with `module_a` saved and `module_b` swapped; the next two layers use selective recomputation and swapping, respectively:
 
 ```yaml
 activation_checkpoint:
-  mode: selective
-  selection:
-    source: model_adapter_safe_regions
-    layer_count: 16
+  mode: hybrid
+  full:
+    recompute_layer: [0-1]
+    exclude_region:
+      save:
+        module_a: [0]
+      swap:
+        group_swap: false
+        cpu_pool: 512
+        module_b: [0-1]
+  selective:
+    recompute:
+      module_a: [2]
+    swap:
+      group_swap: true
+      cpu_pool: 512
+      module_b: [3]
 ```
 
-`layer_count` selects the specified number of consecutive layers starting at index `0`, in the flattened order of all discovered layer containers. For example, `layer_count: 2` selects layers `0, 1`, and `0` selects none. For nonconsecutive layers, use the mutually exclusive `layer_indices`:
+Layer sets support nonnegative integers and inclusive ranges; for example, `[0,2-3]` denotes layers `0`, `2`, and `3`. `cpu_pool` is measured in MiB. Full-exclusion swap and selective swap each create an independent pinned-memory pool. `mode: hybrid` requires the full layers to be completely disjoint from all selective target layers.
 
-```yaml
-activation_checkpoint:
-  mode: selective
-  selection:
-    source: model_adapter_safe_regions
-    layer_indices: [0, 4, 8, 12]
-```
+Model-integration recomputation cases replace only `full.recompute_layer` and preserve the launch recipe's `full.exclude_region`. Model families whose router/indexer cannot replay must declare that exclusion in the recipe used by the validation manifest.
 
-`layer_indices` is zero-based and must be nonempty, nonnegative, and duplicate-free. `source: default` accepts neither field.
+All active layer/path targets are resolved and validated in a single pass before any wrappers are installed. An out-of-range layer index, a nonexistent path, a target that is not an `nn.Module`, nested parent/child paths, or a save/swap conflict raises an error before training begins. A resolution failure leaves the model tree unchanged.
 
 ## 4. Write a Validation Manifest
 
@@ -498,16 +486,16 @@ matrix:
     ep: 1
     fsdp: 16
     sequence_parallel: false
-    recompute: {layer_count: 0}
+    recompute_layer: []
   axes:
     ep: [1, 16]
   combined:
     - {tp: 2, cp: 1, ep: 16, fsdp: 8, sequence_parallel: true}
     - {tp: 1, cp: 2, ep: 16, fsdp: 16, sequence_parallel: false}
-  recompute_selections:
-    - {layer_count: 0}
-    - {layer_count: 2}
-    - {layer_indices: [0, 1, 2, 3]}
+  recompute_layers:
+    - []
+    - [0-1]
+    - [0, 1, 2, 3]
   recompute_topology: {tp: 1, cp: 1, ep: 16, fsdp: 16}
   same_topology_resume: true
   cross_topology_resume: {tp: 2, cp: 1, ep: 16, fsdp: 8}
@@ -551,19 +539,19 @@ acceptance:
 | `baseline` | Reference topology for all cases |
 | `axes` | Override one field at a time; values duplicating the baseline are deduplicated |
 | `combined` | Hybrid strategies explicitly overriding multiple baseline fields |
-| `recompute_selections` | Exact layer counts or indices for safe-region recomputation; each entry contains only `layer_count` or `layer_indices` |
+| `recompute_layers` | Explicit layer sets for full activation checkpointing; each entry uses the same integer/inclusive-range syntax as `activation_checkpoint.full.recompute_layer`, and an empty list disables it |
 | `recompute_topology` | Fixed topology override for the recomputation-selection group |
 | `production_validate_pair` | Set `model.validate_placement=false/true` separately on the same topology |
 | `same_topology_resume` | Save and restore on the baseline topology |
 | `cross_topology_resume` | Save on the baseline topology and restore on the target topology |
 
-The standard launcher accepts only `tp`, `cp`, `ep`, `fsdp`, `sequence_parallel`, and `recompute`. Fields that cannot map to Trainer commands raise errors instead of producing duplicate-command cases that appear to pass without testing anything new.
+The standard launcher accepts only `tp`, `cp`, `ep`, `fsdp`, `sequence_parallel`, and `recompute_layer`. Fields that cannot be mapped to Trainer commands raise an error immediately; they do not produce no-op cases with identical commands that only appear to pass.
 
 Before writing the matrix, create a coverage ledger listing the parallel axes the model actually supports, critical hybrid topologies, recomputation layer selections, same-/cross-topology resume, Production/Validate, and language/vision/projector/fusion subtrees for multimodal models. Each item must be either a formal case or an exclusion supported by evidence. After `--generate-only`, reconcile the ledger item by item with `cases/resolved_cases.json` and count baseline, strategy generalization, recomputation, resume, and Production/Validate separately. Recomputation and resume do not count as strategy-generalization cases. If only one strategy candidate ran, report only one strategy-generalization comparison even if two recomputation and two resume cases also ran.
 
 Multimodal models must also record actual placements for each subtree. If ViT completes forward/backward in a process group with TP but its parameters are `Replicate()` along TP, this establishes only that the multimodal path composes with language TP; it does not establish ViT TP coverage. Audit operator support using the exact callable key intercepted by the dispatcher: `npu_rms_norm` does not substitute for `rms_norm`, and `conv3d` does not substitute for `conv1d`/`conv2d`.
 
-The acceptance tier is selected automatically according to whether the launched TP/CP/EP/FSDP/sequence-parallel configuration matches the baseline. Recomputation layer selection alone does not change parallel topology. If `recompute_topology` changes EP or another field, that group uses `cross_topology` thresholds. `cross_topology_resume` must actually change at least one parallel field; there is currently no case that resumes after changing only the recomputation strategy.
+The acceptance tier is selected automatically by comparing the actually launched TP/CP/EP/FSDP/sequence-parallel configuration with the baseline. The selected set of recomputed layers does not itself constitute a parallel-topology change. If `recompute_topology` changes EP or any other parallel field, the recomputation group uses `cross_topology` thresholds. `cross_topology_resume` must change at least one parallel field; no case is currently provided for resuming after changing only the recomputation strategy.
 
 Scalars support absolute and relative thresholds. The default is `combination: all`. With explicit `any`, the comparator accepts either absolute or relative error separately for loss and norm, while still requiring loss, pre-clip norm, post-clip norm, input identity, LR, and finiteness all to pass. A passing loss-relative threshold cannot compensate for a norm failure, and `any` cannot bypass the data-identity gate.
 
@@ -766,7 +754,7 @@ The DeepSeek adapter's validation declarations include:
 - Cross-layer publish/consume checks for `compressed_kv`, `index_key`, `topk_indices`, and `candidate_blocks`;
 - Checks for packed runtime fields, vision input fields, and vision/aligner gradients;
 - Native Engram/MoE/CSA2 forward/backward comparisons in isolated processes;
-- Whole-layer recomputation as one region, including CSA2 attention: state writes occur only during forward, as determined by `is_recomputing()`; discrete selections are pinned as excluded regions, and autograd holds cross-layer entries until backward ends.
+- CSA2 recomputation boundaries keep Full/Reindex indexer modules outside replay; state writes remain forward-only, as determined by `is_recomputing()`, and autograd holds cross-layer entries until backward ends.
 
 DeepSeek-V4.1 core model modules and optimized paths correspond one to one, but do not replace each other's responsibilities:
 
@@ -782,7 +770,7 @@ and communication policies. The native model and family use the same `Compressed
 algorithm. Setting `use_fused_ops: false` selects reference operations; removing an explicit recipe
 override retains the model-spec default. A separate attention forward wrapper is not required.
 
-The example uses EP16 for `recompute_topology` and EP1 for the baseline, so the recomputation group deliberately uses cross-topology thresholds. To isolate the effect of recomputation, make the parallel fields in `recompute_topology` match the baseline.
+The example uses EP16 for `recompute_topology` and EP1 for the baseline, so the recomputation group deliberately uses cross-topology thresholds. To validate only the explicitly specified set of recomputed layers, make the parallel fields in `recompute_topology` match the baseline.
 
 ## 9. Common Failures and Remedies
 
@@ -794,7 +782,7 @@ The example uses EP16 for `recompute_topology` and EP1 for the baseline, so the 
 | Checkpoint coverage errors | Checkpoint keys are uncovered or transformations are not reversible | Add mappings/transforms/reverse transforms or explicitly legitimate exclusions |
 | Forward data-contract errors | Conflicting forward-field ownership, missing fields, or incorrect label shift/modality gradients | Fix Omni dataset transforms, get-batch, or runtime input-adapter declarations |
 | Unmatched parameter probes | A required probe matches no final parameters | Update adapter declarations using final FQNs after replacement |
-| Shared-state contract errors | Cross-layer state lacks a producer/consumer, producers publish twice, or traces exceed limits | Restrict state writes to forward using `is_recomputing()`, pin discrete selections as excluded regions, or narrow recomputation boundaries |
+| Shared-state contract errors | Cross-layer state lacks a producer/consumer, producers publish twice, or traces exceed limits | Restrict state writes to forward using `is_recomputing()`, exclude indexer/router modules from replay, or narrow recomputation boundaries |
 | Online dataloader rejects a cursor across DP world sizes, or input hashes still differ after skipping the cursor | DCP model/optimizer resharding does not imply that the loader can reconstruct global sample positions; starting at the same configured point does not guarantee DP-invariant packing | Warm-start may request replay with `restore_dataloader_state=false`, but must check the global input hash. Use fixed Offline replay for formal cross-topology numerical validation and a loader supporting global-cursor reconstruction for actual continued training; otherwise mark `BLOCKED` |
 | `BLOCKED` | Evidence, devices, assets, or an independent oracle are unavailable | Satisfy prerequisites; do not relax thresholds or silently shrink the experiment |
 

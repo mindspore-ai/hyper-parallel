@@ -49,7 +49,7 @@ CSA2 结合 FP4 KV Cache，使模型的全局 KV Cache 占用降低至约 **890 
 
 针对 CSA2 的跨层数据依赖，HyperParallel 建立共享状态管理机制，区分压缩 KV、Indexer Key、候选块与 Top-K 结果的生产和复用关系，保留分层候选选择及 Indexer 辅助训练目标。在 TP 场景下，框架协调局部注意力计算与跨分片结果汇总；在 CP 场景下，通过可微通信组织共享 KV、索引相关状态的跨卡访问，并将通信发起与等待过程分离，为计算与通信协同创造条件。
 
-跨层共享还给激活重计算带来挑战：多个后续层可能依赖前面某层生成的同一份状态。对此，HyperParallel 实现**感知 Full、Reindex、Reuse 层角色的选择性重计算策略**，在保证前向选区与反向依赖一致的同时，避免重计算重复发布共享状态。
+跨层共享还给激活重计算带来挑战：多个后续层可能依赖前面某层生成的同一份状态。对此，HyperParallel 实现**感知 Full、Reindex、Reuse 层角色的选择性重计算策略**，将 Full/Reindex 的 indexer 模块排除在 replay 外，并避免参与重算的消费路径重复发布共享状态。
 HyperParallel 通过 `omni_training_custom_ops` 注册的 `torch.ops.custom.npu_sparse_flash_attention_enhance` 接入昇腾稀疏 Attention 前反向计算，并完成 Scalar Sink 等训练语义的张量组织与梯度接线。后续HyperParallel 将在进一步的融合优化中对接 **CANN 提供的 Lightning Indexer V2、Sparse Flash MLA 前反向和 Indexer KL 梯度融合算子**。
 
 ### 3. Engram：超大规模条件记忆，探索高效参数管理
@@ -119,7 +119,7 @@ DeepSeek-V4.1-Flash 从预训练阶段开始引入多模态数据，使用 DeepS
 
 CSA2 的 Full、Reindex、Reuse 路径会在不同层之间共享压缩 KV、Indexer Key 和 Top-K 等状态。HyperParallel 按注意力角色管理这些状态：上下文并行时，各 rank 保留本地 Query，通过异步可微 AllGather 获取计算所需的 KV 与 Indexer Key；张量并行时，先汇总各分片 Indexer Head 的分数，再完成全局 Top-K 选择。
 
-激活重计算也遵循相同的状态边界。重放时复用前向已经选出的离散索引，并避免再次写入共享状态，使 CSA2 的重计算与跨层状态生命周期保持一致。
+激活重计算配置会把 Full/Reindex 的 indexer 模块排除在 replay 外。参与重算的消费路径复用前向发布的共享状态，阶段守卫则避免 replay 再次发布该状态。
 
 ### 2. Engram：CPU 常驻、EP 分片和稀疏优化
 

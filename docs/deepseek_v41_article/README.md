@@ -49,7 +49,7 @@ Combined with FP4 KV caching, CSA2 reduces global KV cache usage to about **890 
 
 HyperParallel manages CSA2 shared state by distinguishing producers and consumers of compressed KV, Indexer Keys, candidate blocks, and Top-K results, preserving hierarchical candidate selection and the Indexer's auxiliary training objective. With TP, it coordinates local attention and aggregation across shards. With CP, differentiable communication enables cross-device access to shared KV and index state, separating communication initiation from waiting to support compute-communication coordination.
 
-Cross-layer sharing also complicates recomputation: multiple later layers may depend on state produced by one earlier layer. HyperParallel implements **selective recomputation aware of Full, Reindex, and Reuse roles**, keeping forward selections consistent with backward dependencies while preventing replay from republishing shared state.
+Cross-layer sharing also complicates recomputation: multiple later layers may depend on state produced by one earlier layer. HyperParallel implements **selective recomputation aware of Full, Reindex, and Reuse roles**, keeping Full/Reindex indexer modules outside replay while preventing recomputed consumer paths from republishing shared state.
 HyperParallel integrates Ascend sparse attention forward/backward through `torch.ops.custom.npu_sparse_flash_attention_enhance`, registered by `omni_training_custom_ops`, and handles tensor organization and gradient wiring for training semantics such as Scalar Sink. Future fusion work will integrate **CANN Lightning Indexer V2, Sparse Flash MLA forward/backward, and fused Indexer KL-gradient operators**.
 
 ### 3. Engram: Large-Scale Conditional Memory and Efficient Parameter Management
@@ -119,7 +119,7 @@ For DeepSeek-V4.1, HyperParallel's adaptation goes beyond reproducing the model 
 
 CSA2's Full, Reindex, and Reuse paths share compressed KV, Indexer Keys, and Top-K state across layers. HyperParallel manages this state by attention role. Under context parallelism, each rank retains local Queries and obtains the KV and Indexer Keys needed for computation through asynchronous differentiable AllGather. Under tensor parallelism, scores from sharded Indexer Heads are aggregated before global Top-K selection.
 
-Activation recomputation follows the same state boundaries. Replay reuses the discrete indices selected during forward and avoids writing shared state again, keeping CSA2 recomputation consistent with the cross-layer state lifecycle.
+Activation recipes keep Full/Reindex indexer modules outside replay. Recomputed consumer paths reuse the shared state published during forward, while phase guards prevent replay from publishing that state again.
 
 ### 2. Engram: CPU Residency, EP Sharding, and Sparse Optimization
 

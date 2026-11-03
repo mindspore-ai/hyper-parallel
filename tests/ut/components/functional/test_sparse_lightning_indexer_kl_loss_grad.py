@@ -36,8 +36,7 @@ from hyper_parallel.components.functional.sparse_lightning_indexer_kl_loss_grad 
     _SparseLightningIndexerKLLoss, _load_kl_ops, _stable_prediction_log, _teacher_bank, causal_attention_teacher,
     compressed_attention_teacher, gather_selected_keys, gather_selected_keys_fp32,
 )
-from hyper_parallel.core.activation_memory import checkpoint
-from hyper_parallel.distributed.activation_checkpoint import make_selective_checkpoint_context_fn
+from hyper_parallel.core.activation_memory import CheckpointPolicy, checkpoint
 from hyper_parallel.components.modules.attention.compressed_sparse_attention2.document_layout import (
     SharedCompressedPackedSequence,
 )
@@ -395,12 +394,17 @@ class TestSparseLightningIndexerKLInterface(unittest.TestCase):
         def _region(value):
             return _stable_prediction_log(prediction, value, key, weights, indices, 1).sum()
 
+        def _policy(context, op, *_args, **_kwargs):
+            del context  # Same policy on save and recompute passes.
+            return (CheckpointPolicy.MUST_SAVE
+                    if op is torch.ops.aten.mm.default else CheckpointPolicy.MUST_RECOMPUTE)
+
         # CPU einsum can hide mutation behind an unsafe view. Regular views
         # preserve the cached matmul version counter, as in the NPU failure.
         with patch("torch.einsum", side_effect=_contraction):
             loss = checkpoint(
                 _region, query, use_reentrant=False,
-                context_fn=make_selective_checkpoint_context_fn(),
+                policy_fn=_policy,
             )
             loss.backward()
         torch.testing.assert_close(loss, torch.tensor(-2000.), rtol=0, atol=0)

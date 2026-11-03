@@ -16,6 +16,7 @@
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -134,7 +135,11 @@ def test_r3_supports_internal_and_codex_multiturn(
     train_path = tmp_path / "train.parquet"
     train_path.touch()
     moe_config["data"]["train_path"] = str(train_path)
-    monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: torch.device("npu"))
+    monkeypatch.setattr(
+        torch.accelerator,
+        "current_accelerator",
+        lambda: SimpleNamespace(type="npu"),
+    )
     moe_config["train"].update(router_replay={"mode": "R3"}, model_init_cpu_threads=8)
     moe_config["rollout"]["vllm"].update(tensor_parallel_size=4, data_parallel_size=1, max_model_len=8192)
     moe_config["agentic"].update(max_turns=3, interaction_mode="multi_turn")
