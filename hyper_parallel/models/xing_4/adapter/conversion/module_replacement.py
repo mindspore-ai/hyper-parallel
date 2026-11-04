@@ -12,16 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""replacements: Xing4 structure replacements onto the generic modules.
+"""NPU replacements for Xing4 attention, experts and hyper-connections."""
 
-:class:`Xing4MLAAttention` extends the generic high-performance ``modules.MLAAttention``
-instead of reimplementing kernels; the NPU kernels live in ``functional``.
-
-The module stays importable on CPU-only checkouts: ``modules.rms_norm`` imports the
-NPU-only runtime, so it is imported lazily where the latent norms are swapped.
-"""
-
-# This adapter uses the Torch runtime, like the framework attention modules.
 # pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
@@ -32,16 +24,26 @@ from typing import Any
 import torch
 from torch import nn
 from transformers.activations import ACT2FN
+import torch_npu
 
 from hyper_parallel.components.checkpoint import weight_conversion
 from hyper_parallel.components.checkpoint.conversion_ops import ConcatenateWithSections
 from hyper_parallel.components.checkpoint.weight_conversion import Transpose, WeightConverter
 from hyper_parallel.components.functional.mhc_pre import mhc_pre
+from hyper_parallel.components.functional.npu_fusion_attention import (
+    _prepare_fusion_attention_context, PACKED_SEQUENCE_ARGUMENTS,
+)
+from hyper_parallel.components.functional.rotary_embedding import (
+    apply_rotary_pos_emb_interleave as fused_rotary,
+)
+from hyper_parallel.components.modules.rms_norm import RMSNorm
 from hyper_parallel.components.modules.grouped_experts import GroupedExperts
 from hyper_parallel.components.modules.mla_attention import MLAAttention
 from hyper_parallel.models.replacement import module_replacement as register_module_replacement
-from hyper_parallel.models.xing_4.adapter.training import Xing4HyperConnection
-from hyper_parallel.models.xing_4.transformer.modeling_xing4_0 import apply_rotary_pos_emb_interleave
+from hyper_parallel.models.xing_4.adapter.moe import Xing4MLP
+from hyper_parallel.models.xing_4.transformer.modeling_xing4_0 import (
+    Xing4_0HyperConnection, Xing4_0MLP, apply_rotary_pos_emb_interleave,
+)
 
 __all__ = ["Xing4MLAAttention", "Xing4GroupedExperts", "Xing4FusedHyperConnection"]
 
@@ -49,31 +51,10 @@ __all__ = ["Xing4MLAAttention", "Xing4GroupedExperts", "Xing4FusedHyperConnectio
 def fusion_attention_with_logit_maxima(module: nn.Module, query: torch.Tensor, key: torch.Tensor,
                                        value: torch.Tensor, attention_mask: torch.Tensor | None,
                                        **kwargs: Any) -> tuple[torch.Tensor, None]:
-    """Run causal TND fused attention and fold the per-head logit maxima into ``module.max_logits``.
+    """Run causal TND attention and accumulate maxima for QK clipping.
 
-    This is the ``attention_interface`` that :class:`Xing4MLAAttention` hands to
-    ``modules.MLAAttention``.
-
-    Args:
-        module: Attention module; its ``max_logits`` holds the maxima since the last QK clipping.
-        query: Query states, ``[batch, heads, sequence, head_dim]``.
-        key: Key states, ``[batch, heads, sequence, head_dim]``.
-        value: Value states, ``[batch, heads, sequence, v_head_dim]``.
-        attention_mask: Unused local HF mask; the training model accepts only implicit causality.
-        **kwargs: Attention scale, optional global packed boundaries and the MLA CP head range.
-
-    Returns:
-        The attention output, ``[batch, sequence, heads, v_head_dim]``, and no attention weights.
-
-    Raises:
-        ValueError: If the kernel's ``softmax_max`` is not the expected ``(T, heads, 8)`` shape.
-    """
-    # torch_npu is optional outside Ascend environments.
-    import torch_npu  # pylint: disable=C0415
-    from hyper_parallel.components.functional.npu_fusion_attention import (  # pylint: disable=C0415
-        _prepare_fusion_attention_context, PACKED_SEQUENCE_ARGUMENTS,
-    )
-
+    Query/key are BNSD, value is BNSV, and output is BSNV. CP supplies
+    packed sequence boundaries and the head range within the TP shard."""
     del attention_mask
     batch, heads, sequence = query.shape[:3]
     options = dict(kwargs)
@@ -91,11 +72,7 @@ def fusion_attention_with_logit_maxima(module: nn.Module, query: torch.Tensor, k
         inner_precise=0, sparse_mode=context.sparse_mode, actual_seq_qlen=context.query_lengths,
         actual_seq_kvlen=context.key_lengths, softmax_layout="TND")[:2]
     with torch.no_grad():
-        # softmax_max is (T, N, 8) for TND input: core/shard/ops/parallel_npu_flash_attention_score.py's
-        # sharding rule hard-codes this ("TND softmax outputs are 3-D (T, N, 8)"), and
-        # test_parallel_npu_flash_attention_score.py asserts dim 0 is token, dim 1 is head. Check it
-        # instead of silently maxing across the wrong axis if that assumption is ever wrong (MindFormers'
-        # own max_logit_tracker.py exists specifically because this failure raises nothing on its own).
+        # TND softmax statistics have token, head and redundant-lane axes.
         if softmax_max.ndim != 3 or softmax_max.shape[1] != heads:
             raise ValueError(f"Expected (T, {heads}, 8) softmax_max for TND fusion attention, "
                              f"got shape {tuple(softmax_max.shape)}.")
@@ -111,72 +88,37 @@ def fusion_attention_with_logit_maxima(module: nn.Module, query: torch.Tensor, k
 
 @register_module_replacement
 class Xing4MLAAttention(MLAAttention):
-    """Replace HF ``Xing4_0Attention`` with the generic MLA and HF FP32 RoPE.
-
-    ``modules.MLAAttention`` fuses ``q_a_proj``/``kv_a_proj_with_mqa`` into ``linear_qkv``
-    (checkpoint conversion declared through ``make_transforms``) and keeps the latent-norm
-    and projection structure. This replacement swaps the latent norms for the NPU ``RMSNorm``
-    (a replacement plan cannot also select these children of the replaced attention),
-    rotates in FP32 before returning to the activation dtype. On NPU it can select the
-    shared fused interleaved RoPE with the same Transformers layout. It calls attention through
-    :func:`fusion_attention_with_logit_maxima`, which folds in the per-head logit maxima QK
-    clipping consumes.
-    """
+    """Fuse MLA projections with FP32 rotary channels and per-head maxima."""
 
     def __init__(self, *, module: nn.Module, module_fqn: str = "",
                  context: Mapping[str, Any] | None = None) -> None:
-        """Build the replacement from the HF Xing4 attention.
-
-        Args:
-            module: Official ``Xing4_0Attention`` instance being replaced.
-            module_fqn: Fully qualified name of ``module``.
-            context: Replacement context of the build pipeline.
-        """
+        """Retain source weights and select the configured rotary implementation."""
         super().__init__(module=module, module_fqn=module_fqn, context=context,
                          attention_interface=fusion_attention_with_logit_maxima)
-        # Lazy: modules.rms_norm imports the NPU-only runtime.
-        from hyper_parallel.components.modules.rms_norm import RMSNorm  # pylint: disable=C0415
-
         self.q_a_layernorm = RMSNorm(module=self.q_a_layernorm)
         self.kv_a_layernorm = RMSNorm(module=self.kv_a_layernorm)
         if not self.linear_qkv.weight.is_meta:
             with torch.no_grad():
-                self.linear_qkv.weight.copy_(torch.cat((module.q_a_proj.weight, module.kv_a_proj_with_mqa.weight)))
-        self.apply_rotary_pos_emb_interleave = apply_rotary_pos_emb_interleave
+                split = self._q_latent_output_size
+                self.linear_qkv.weight[:split].copy_(module.q_a_proj.weight)
+                self.linear_qkv.weight[split:].copy_(module.kv_a_proj_with_mqa.weight)
+        self.apply_rotary_pos_emb_interleave = (
+            fused_rotary if getattr(self.config, "apply_rope_fusion", False) else apply_rotary_pos_emb_interleave
+        )
         # Per-head logit maxima since the last QK clipping, folded in by the attention interface.
         self.max_logits: torch.Tensor | None = None
 
     def _project_attention_inputs(self, hidden_states: torch.Tensor,
                                   position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
                                   past_key_values: Any | None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Project hidden states to query, key and value, rotating in FP32 and rounding once.
-
-        Args:
-            hidden_states: Normalized layer input, ``[batch, sequence, hidden]``.
-            position_embeddings: FP32 RoPE ``(cos, sin)`` tables.
-            past_key_values: Must be None; training uses no KV cache.
-
-        Returns:
-            Query, key and value states, ``[batch, heads, sequence, head_dim]``.
-
-        Raises:
-            ValueError: If the RoPE tables are missing or a KV cache is given.
-        """
+        """Reuse latent and KV projections, rounding RoPE at each concatenation."""
         if position_embeddings is None or past_key_values is not None:
             raise ValueError("Xing4 MLA requires RoPE tables and no KV cache")
         latents = self._project_latents(hidden_states)
-        cos, sin = position_embeddings
-        apply_rotary = self.apply_rotary_pos_emb_interleave
-        if getattr(self.config, "apply_rope_fusion", False) and hidden_states.device.type == "npu":
-            from hyper_parallel.components.functional.rotary_embedding import (  # pylint: disable=C0415
-                apply_rotary_pos_emb_interleave,
-            )
-            apply_rotary = apply_rotary_pos_emb_interleave
-        query_rope, key_rope = apply_rotary(latents.query_rope.float(), latents.key_rope.float(), cos, sin)
-        key_value = self.kv_b_proj(latents.kv_nope).view(
-            latents.batch_size, latents.sequence_length, self.num_heads,
-            self.qk_nope_head_dim + self.v_head_dim)
-        key_nope, value = key_value.transpose(1, 2).split((self.qk_nope_head_dim, self.v_head_dim), dim=-1)
+        query_rope, key_rope = self.apply_rotary_pos_emb_interleave(
+            latents.query_rope.float(), latents.key_rope.float(), *position_embeddings,
+        )
+        key_nope, value = self._expand_key_value(latents.kv_nope)
         query_pass = latents.query_pass.transpose(1, 2)
         query = torch.cat((query_pass, query_rope.to(query_pass.dtype)), dim=-1)
         key = torch.cat((key_nope, key_rope.to(key_nope.dtype).expand(-1, self.num_heads, -1, -1)), dim=-1)
@@ -184,7 +126,7 @@ class Xing4MLAAttention(MLAAttention):
 
 
 def _expert_weights(module: nn.Module) -> tuple[Any, list[tuple[nn.Parameter, nn.Parameter, nn.Parameter]]]:
-    """Validate the source container without discarding parameters, buffers or hooks."""
+    """Read per-expert projections and reject incompatible source modules."""
     if not isinstance(module, nn.ModuleList) or len(module) == 0:
         raise ValueError("Xing4 grouped experts require a nonempty ModuleList")
     config = getattr(module, "config", None)
@@ -195,18 +137,47 @@ def _expert_weights(module: nn.Module) -> tuple[Any, list[tuple[nn.Parameter, nn
     if any(True for _ in module.named_buffers(remove_duplicate=False)):
         raise ValueError("Xing4 grouped experts cannot discard source buffers")
     for child in module.modules():
+        if "forward" in vars(child):
+            raise ValueError("Xing4 grouped experts cannot migrate instance forward overrides")
         if any("hook" in name and isinstance(value, Mapping) and value for name, value in vars(child).items()):
             raise ValueError("Xing4 grouped experts cannot migrate source module hooks")
+    # Packing preserves only these exact expert, projection and activation implementations.
+    expert_type = type(module[0])
+    if expert_type not in (Xing4_0MLP, Xing4MLP) or any(
+            type(expert) is not expert_type for expert in module):  # pylint: disable=unidiomatic-typecheck
+        raise ValueError("Xing4 grouped experts require a uniform supported expert class")
+    policy = (
+        getattr(module[0], "limit", None),
+        getattr(module[0], "activation_compute_dtype", None),
+        bool(getattr(config, "use_fused_swiglu", True)),
+    )
+    for expert in module:
+        expert_config = getattr(expert, "config", None)
+        expert_policy = (
+            getattr(expert, "limit", None),
+            getattr(expert, "activation_compute_dtype", None),
+            bool(getattr(expert_config, "use_fused_swiglu", True)),
+        )
+        if getattr(expert_config, "hidden_act", None) != "silu" or expert_policy != policy:
+            raise ValueError("Xing4 grouped experts require uniform activation policy")
+    if expert_type is Xing4MLP:
+        # Xing4MLP loads this optional API only when the extended policy is used.
+        from hyper_parallel.components.functional.activation_swiglu import (  # pylint: disable=import-outside-toplevel
+            swiglu_from_projections,
+        )
+        if any(expert._swiglu is not swiglu_from_projections for expert in module):  # pylint: disable=protected-access
+            raise ValueError("Xing4 grouped experts require the standard SwiGLU implementation")
     weights = []
     expected_names = set()
     expected_activation = type(ACT2FN["silu"])
     for index, expert in enumerate(module):
-        if getattr(expert, "act_fn", None).__class__ is not expected_activation:
+        if type(getattr(expert, "act_fn", None)) is not expected_activation:  # pylint: disable=unidiomatic-typecheck
             raise ValueError("Xing4 grouped experts require the standard SiLU activation")
         projections = []
         for name in ("gate_proj", "up_proj", "down_proj"):
             projection = getattr(expert, name, None)
-            if projection.__class__ is not nn.Linear or projection.bias is not None:
+            # pylint: disable-next=unidiomatic-typecheck
+            if type(projection) is not nn.Linear or projection.bias is not None:
                 raise ValueError(f"Xing4 expert {index} requires bias-free Linear {name}")
             projections.append(projection.weight)
             expected_names.add(f"{index}.{name}.weight")
@@ -223,7 +194,7 @@ def _expert_weights(module: nn.Module) -> tuple[Any, list[tuple[nn.Parameter, nn
 def _validate_expert_weights(
     config: Any, weights: list[tuple[nn.Parameter, nn.Parameter, nn.Parameter]],
 ) -> tuple[int, int]:
-    """Ensure one packed parameter can preserve every source value and gradient flag."""
+    """Require uniform projection shapes, dtype, device and gradient ownership."""
     first_gate, _, first_down = weights[0]
     if first_gate.ndim != 2:
         raise ValueError("Xing4 expert gate weight must be a matrix")
@@ -252,17 +223,10 @@ def _validate_expert_weights(
 
 @register_module_replacement
 class Xing4GroupedExperts(GroupedExperts):
-    """Replace the official per-expert ModuleList with the shared grouped-GEMM implementation.
+    """Pack the official ModuleList into shared grouped-GEMM parameters.
 
-    This creates new packed parameters. Eager source values are copied immediately;
-    meta source values must be populated later through the declared checkpoint transforms.
-    The replacement must happen before an optimizer captures the original parameters.
-
-    Args:
-        module: Official Xing4 expert ModuleList.
-        module_fqn: Fully qualified name supplied by the replacement executor.
-        context: Replacement context supplied by the executor.
-    """
+    Eager weights are copied once. Meta weights use the reversible checkpoint
+    mappings. Replacement precedes optimizer construction."""
 
     def __init__(
         self,
@@ -333,10 +297,10 @@ class Xing4GroupedExperts(GroupedExperts):
 
 
 @register_module_replacement
-class Xing4FusedHyperConnection(Xing4HyperConnection):
-    """Replace the portable mHC computation with the shared NPU operations."""
+class Xing4FusedHyperConnection(Xing4_0HyperConnection):
+    """Adapt official mHC parameters to the shared NPU pre operation."""
 
-    def __init__(self, *, module: Xing4HyperConnection, module_fqn: str = "",
+    def __init__(self, *, module: Xing4_0HyperConnection, module_fqn: str = "",
                  context: Mapping[str, Any] | None = None) -> None:
         """Keep official parameter names, values and ownership."""
         nn.Module.__init__(self)
@@ -347,9 +311,7 @@ class Xing4FusedHyperConnection(Xing4HyperConnection):
         self.train(module.training)
 
     def forward(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """Use the shared fused pre operator on NPU and the portable reference otherwise."""
-        if hidden_streams.device.type != "npu":
-            return super().forward(hidden_streams)
+        """Run the fused pre operator and preserve its residual-gradient output."""
         hidden, post, mix, residual = mhc_pre(
             hidden_streams.flatten(2), self.hc_fn, self.hc_scale, self.hc_base, self.hc_mult,
             sinkhorn_iters=self.hc_sinkhorn_iters, norm_eps=self.input_norm.eps, hc_eps=self.hc_eps)

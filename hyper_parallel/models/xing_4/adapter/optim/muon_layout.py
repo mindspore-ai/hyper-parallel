@@ -12,34 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Logical MLA/MLP matrices for the framework Muon transform interfaces.
+"""Logical MLA/MLP matrix boundaries for framework Muon callbacks.
 
-The reversible head grouping follows townwish4git's JTMuonLayout in
-hf1s/hyper-parallel#303 (b743f77). Xing4's expert packing is transposed:
-gate/up occupy the last axis. Scaling remains the framework's per-matrix
-policy, as in MindFormers PyNative, without the later grouped-scale change.
+Head grouping follows townwish4git's JTMuonLayout (hf1s/hyper-parallel#303).
 """
 
 from __future__ import annotations
 
-from dataclasses import MISSING, dataclass, field, fields
+from dataclasses import dataclass, fields
+from functools import cached_property
 from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.core.optimizer.muon import NSInputTransform
 
-_MISSING_ATTR = object()
-
 
 @dataclass(frozen=True)
 class Xing4MuonLayout:
-    """Describe complete logical matrices in Xing4's native parameter packing.
+    """Describe complete logical matrices for the Muon callbacks.
 
-    Supply both bound methods to Muon. Contiguous fused sections share storage;
-    periodic attention rows are gathered and restored through NSInputTransform.
-    Dimensions check that tensor-parallel fragments are not silently mistaken
-    for complete logical matrices. Independent expert batches may stay local.
+    Tensor-parallel fragments must contain complete matrix axes; independent
+    expert batches may stay local. The framework scales each logical matrix.
     """
 
     q_lora_rank: int
@@ -51,35 +45,27 @@ class Xing4MuonLayout:
     hidden_size: int
     intermediate_size: int
     moe_intermediate_size: int
-    n_shared_experts: int = field(default=0, metadata={"minimum": 0})
+    n_shared_experts: int = 0
 
     def __post_init__(self) -> None:
         """Validate matrix dimensions before constructing the optimizer."""
         for item in fields(self):
             value = getattr(self, item.name)
-            minimum = item.metadata.get("minimum", 1)
+            minimum = 0 if item.name == "n_shared_experts" else 1
             if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
                 raise ValueError(f"Xing4 Muon layout requires integer {item.name} >= {minimum}")
 
     @classmethod
     def from_config(cls, config: Any) -> "Xing4MuonLayout":
-        """Bind matrix dimensions from the model configuration.
-
-        A field missing from ``config`` falls back to its own dataclass default, if any;
-        a field present but holding a non-integer value (including ``None``) is passed
-        through so ``__post_init__`` reports it.
+        """Read logical-matrix dimensions from a model configuration.
 
         Args:
-            config: Xing4 configuration containing MLA and feed-forward sizes.
+            config: Configuration containing MLA and expert dimensions.
 
         Returns:
-            One layout shared by the reshape and reversible-transform callbacks.
+            A validated matrix layout.
         """
-        values = {}
-        for item in fields(cls):
-            raw = getattr(config, item.name, _MISSING_ATTR)
-            values[item.name] = item.default if raw is _MISSING_ATTR and item.default is not MISSING else raw
-        return cls(**values)
+        return cls(**{item.name: getattr(config, item.name, item.default) for item in fields(cls)})
 
     @staticmethod
     def _check_shape(name: str, tensor: torch.Tensor, shape: tuple[int, ...]) -> None:
@@ -87,13 +73,9 @@ class Xing4MuonLayout:
         if tuple(tensor.shape) != shape:
             raise ValueError(f"Unexpected Xing4 Muon shape for {name}: {tuple(tensor.shape)}; expected {shape}")
 
+    @cached_property
     def _row_sections(self) -> dict[str, tuple[int, ...]]:
-        """Map a parameter's trailing name segments to its independent row sections.
-
-        Returns:
-            Row sizes summing to the complete parameter's row count, keyed by the
-            parameter name's last three dot-separated segments.
-        """
+        """Map parameter suffixes to contiguous logical row sizes."""
         shared_rows = self.n_shared_experts * self.moe_intermediate_size
         return {
             "self_attn.linear_qkv.weight": (self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim),
@@ -102,40 +84,38 @@ class Xing4MuonLayout:
         }
 
     def reshape_fn(self, name: str, tensor: torch.Tensor) -> list[torch.Tensor]:
-        """Expose independent fused sections as views of the native storage.
-
-        The expert batch is checked separately: it splits its last axis, not rows, and
-        keeps the leading expert axis whole. Every other recognized suffix splits full
-        rows and is looked up in :meth:`_row_sections`; an unrecognized suffix keeps the
-        tensor as one logical matrix.
+        """Split fused rows or expert channels into storage-sharing views.
 
         Args:
-            name: Fully qualified model parameter name.
-            tensor: Complete parameter-shaped Newton-Schulz input.
+            name: Full model parameter name.
+            tensor: Complete logical gradient or local expert batch.
 
         Returns:
-            Storage-sharing logical matrices, or the unchanged matrix.
+            Matrix views for independent Muon updates.
         """
         if name.endswith(".mlp.experts.gate_up_proj"):
             if tensor.shape[0] == 0:
                 raise ValueError(f"Xing4 Muon requires a nonempty expert batch for {name}")
             self._check_shape(name, tensor, (tensor.shape[0], self.hidden_size, 2 * self.moe_intermediate_size))
             return list(tensor.split(self.moe_intermediate_size, dim=-1))
-        rows = self._row_sections().get(".".join(name.split(".")[-3:]))
+        rows = self._row_sections.get(".".join(name.split(".")[-3:]))
         if rows is None:
             return [tensor]
         self._check_shape(name, tensor, (sum(rows), self.hidden_size))
         return list(tensor.split(rows, dim=0))
 
     def ns_transform_fn(self, name: str, tensor: torch.Tensor) -> NSInputTransform | None:
-        """Group corresponding channels across heads and restore native rows.
+        """Gather channels across heads and restore native rows after NS.
+
+        Q splits no-RoPE/RoPE; KV splits key/value. Expert gate/up occupy the
+        last axis and are handled by reshape_fn instead.
 
         Args:
-            name: Fully qualified model parameter name.
-            tensor: Complete parameter-shaped Newton-Schulz input.
+            name: Full model parameter name.
+            tensor: Complete MLA projection gradient.
 
         Returns:
-            The two reversible whole-head-group matrices, or None to use reshape_fn.
+            Matrix groups and their inverse mapping, or None for other weights.
         """
         if name.endswith(".self_attn.q_b_proj.weight"):
             first, second, columns = self.qk_nope_head_dim, self.qk_rope_head_dim, self.q_lora_rank

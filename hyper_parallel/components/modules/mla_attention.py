@@ -241,6 +241,20 @@ class MLAAttention(nn.Module):
             key_rope.view(batch_size, 1, sequence_length, self.qk_rope_head_dim),
         )
 
+    def _expand_key_value(self, kv_nope: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Expand cached or current KV latents into head-wise keys and values."""
+        kv_states = self.kv_b_proj(kv_nope).view(
+            kv_nope.shape[0],
+            kv_nope.shape[2],
+            self.num_heads,
+            self.qk_nope_head_dim + self.v_head_dim,
+        ).transpose(1, 2)
+        return torch.split(
+            kv_states,
+            (self.qk_nope_head_dim, self.v_head_dim),
+            dim=-1,
+        )
+
     def _project_attention_inputs(
         self,
         hidden_states: torch.Tensor,
@@ -262,17 +276,7 @@ class MLAAttention(nn.Module):
         kv_nope = latents.kv_nope
         if past_key_values is not None:
             kv_nope, key_rope = past_key_values.update(kv_nope, key_rope, self.layer_idx)
-        kv_states = self.kv_b_proj(kv_nope).view(
-            latents.batch_size,
-            kv_nope.shape[2],
-            self.num_heads,
-            self.qk_nope_head_dim + self.v_head_dim,
-        ).transpose(1, 2)
-        key_nope, value_states = torch.split(
-            kv_states,
-            (self.qk_nope_head_dim, self.v_head_dim),
-            dim=-1,
-        )
+        key_nope, value_states = self._expand_key_value(kv_nope)
         return (
             torch.cat((latents.query_pass.transpose(1, 2), query_rope), dim=-1),
             torch.cat((key_nope, key_rope.expand(-1, self.num_heads, -1, -1)), dim=-1),
