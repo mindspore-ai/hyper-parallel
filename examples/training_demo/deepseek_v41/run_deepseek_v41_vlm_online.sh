@@ -81,7 +81,7 @@ fi
 "${PYTHON_BIN}" -m torch.distributed.run \
     --standalone \
     --nproc_per_node="${NPROC_PER_NODE}" \
-    "${PROJECT_ROOT}/scripts/train_vl.py" \
+    --module scripts/train_vl.py" \
     "${SCRIPT_DIR}/train_deepseek_v41_vlm_online.yaml" \
     --model.config_path="${MODEL_PATH}" \
     --model.engram_assets_path="${ASSETS_PATH}" \
