@@ -108,6 +108,7 @@ class TqdmCallback(Callback):
     _ENV_METRICS = (
         ("performance/tokens_per_second", "tokens/s"),
         ("performance/step_time", "step_time"),
+        ("performance/tflops_per_device", "TFLOP/s"),
     )
 
     def __init__(self, trainer: Any) -> None:
@@ -143,6 +144,8 @@ class TqdmCallback(Callback):
             return f"{scalar:.3f}"
         if name == "performance/step_time":
             return f"{scalar:.3f}s"
+        if name == "performance/tflops_per_device":
+            return f"{scalar:.3f}"
         return f"{scalar:.6g}"
 
     def _create_progress_bar(self, total: int, initial: int) -> Any:
