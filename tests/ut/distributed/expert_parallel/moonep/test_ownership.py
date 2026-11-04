@@ -40,8 +40,8 @@ def _manage(owner: torch.nn.Module, *, shards: tuple | None = None, sharded: boo
     managed = [SimpleNamespace(sharded_param=shard, unsharded_param=current)
                for shard, current in zip(shards, parameters)]
     scheduler = SimpleNamespace(modules=[owner], cell=owner,
-                                hsdp_state=SimpleNamespace(hsdp_params=managed, is_shard=sharded),
-                                restore_with_all_gather_extension=Mock(side_effect=AssertionError("AG invoked")))
+                                hsdp_state=SimpleNamespace(hsdp_params=managed, is_shard=sharded,
+                                                           unshard=Mock(side_effect=AssertionError("AG invoked"))))
     owner.hsdp_scheduler = scheduler
     return scheduler
 
@@ -64,7 +64,7 @@ class TestOwnership(unittest.TestCase):
             _manage(owner)
         validate_parameter_ownership(owners)
         for owner in owners:
-            owner.hsdp_scheduler.restore_with_all_gather_extension.assert_not_called()
+            owner.hsdp_scheduler.hsdp_state.unshard.assert_not_called()
 
     def test_cross_owner_parameter_identity(self) -> None:
         """Tied Parameter objects are rejected even without a manager."""

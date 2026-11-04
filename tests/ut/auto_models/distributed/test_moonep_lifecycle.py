@@ -32,7 +32,7 @@ from hyper_parallel.distributed.expert_parallel.moonep.fsdp_hooks import MoonEPG
 from hyper_parallel.distributed.expert_parallel.moonep.numerics import (
     expert_backward_values, expert_forward_values, grouped_values, grouped_weight_grad,
 )
-from hyper_parallel.distributed.expert_parallel.moonep import planning
+from hyper_parallel.distributed.expert_parallel.moonep import checkpoint as moonep_checkpoint, planning
 from hyper_parallel.distributed.expert_parallel.moonep import runtime as moonep_runtime
 from hyper_parallel.distributed.expert_parallel.moonep.planning import compile_plan
 from tests.common.mark_utils import arg_mark
@@ -76,21 +76,34 @@ class _Block(torch.nn.Module):
 class TestMoonEPLifecycle(unittest.TestCase):
     """不初始化分布式、不依赖NPU，检查真实autograd与checkpoint。"""
 
+    def test_replay_context_does_not_read_weights_before_module_hooks(self):
+        """Entering replay only binds the key; FSDP module hooks must restore first."""
+        identity, key = object(), object()
+        lifecycle = SimpleNamespace(prepare=mock.Mock(side_effect=AssertionError("early weight read")),
+                                    statistics={"recomputations": 0})
+        executor = SimpleNamespace(runtime=lifecycle)
+        tape = moonep_checkpoint._Tape(executions=[(executor, key)], identity=identity)
+        phase = SimpleNamespace(is_recomputing=True, invocation_id=identity)
+        with mock.patch.object(moonep_checkpoint, "get_recompute_state", return_value=phase):
+            with moonep_checkpoint._phase(torch.nn.Module(), tape, True):
+                self.assertIs(moonep_checkpoint.bind_execution(executor, mock.Mock()), key)
+        lifecycle.prepare.assert_not_called()
+        self.assertEqual(lifecycle.statistics["recomputations"], 1)
+
 
     def test_native_backward_prefetch_submits_ep_extension_after_ag(self):
         """保留原生 AG 并按顺序接 EP；例如 B7 的预取先提交 B6 AG 再执行扩展。"""
         order = []
-        target = SimpleNamespace(
-            hsdp_state=SimpleNamespace(module_name='expert', prefetch=lambda: order.append('efs_ag')),
-            _all_gather_extension=SimpleNamespace(
-                fsdp_after_backward_prefetch=lambda _: order.append('ep_alltoallv')),
-        )
+        targets = [SimpleNamespace(hsdp_state=SimpleNamespace(
+            module_name=f'expert{index}',
+            prefetch=lambda index=index: order.append(('efs_ag', index)),
+            complete_prefetch=lambda index=index: order.append(('complete', index)))) for index in range(2)]
         scheduler = object.__new__(HSDPSchedulerV2)
         scheduler.hsdp_state = SimpleNamespace(module_name='current')
         scheduler.reshard_after_forward = False
-        scheduler.backward_prefetch_cells = [SimpleNamespace(hsdp_scheduler=target)]
+        scheduler.backward_prefetch_cells = [SimpleNamespace(hsdp_scheduler=target) for target in targets]
         scheduler._hsdp_backward_pre_hook(None, None)
-        self.assertEqual(order, ['efs_ag', 'ep_alltoallv'])
+        self.assertEqual(order, [('efs_ag', 0), ('efs_ag', 1), ('complete', 0), ('complete', 1)])
 
 
     def test_gradient_extension_waits_only_before_fsdp_reduce(self):

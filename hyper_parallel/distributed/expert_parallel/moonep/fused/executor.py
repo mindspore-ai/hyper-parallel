@@ -80,16 +80,16 @@ class SparseAllGatherExtension:
         """Bind a registered expert executor to its root runtime."""
         self.executor, self.runtime = executor, runtime
 
-    def fsdp_pre_all_gather(self, _scheduler: Any, _context: Any) -> dict:
+    def fsdp_pre_all_gather(self, _state: Any) -> dict:
         """Keep FSDP's own mixed-precision and all-gather input storage."""
         return {}
 
-    def fsdp_post_all_gather(self, _scheduler: Any, _context: Any) -> tuple[torch.Tensor, torch.Tensor]:
-        """Read current full home views only after the scheduler waited for AG."""
-        return self.executor.read_weights()
+    def fsdp_post_all_gather(self, _state: Any) -> None:
+        """Continue replica prefetch only after FSDP has restored home weights."""
+        self.runtime.prefetch_fsdp_expert(self.executor)
 
-    def fsdp_after_backward_prefetch(self, _scheduler: Any) -> None:
-        """Try one bounded replica prefetch after the generic FSDP notification."""
+    def fsdp_post_prefetch(self, _state: Any) -> None:
+        """Continue bounded replica prefetch when complete home weights are reused."""
         self.runtime.prefetch_fsdp_expert(self.executor)
 
 
@@ -362,7 +362,7 @@ class SparseMoonEPRuntime:
 
     @torch.no_grad()
     def prepare(self, key: ExecutionKey) -> WeightLease:
-        """Restore home storage and copy only remote experts for this execution."""
+        """Copy remote experts from home parameter views already restored by FSDP."""
         if self.weight_domain.parked:
             error = None
             try:
@@ -382,16 +382,9 @@ class SparseMoonEPRuntime:
         if len(self.tickets) >= 2:
             raise RuntimeError("demanded weight lease exceeds current plus one speculative lease")
         executor, plan = self.executions[key]
-        scheduler = getattr(executor.owner, "hsdp_scheduler", None)
-
-        def restore() -> tuple[torch.Tensor, torch.Tensor]:
-            """Restore and wait on W; no home pointer is retained in the ticket."""
-            if scheduler is not None:
-                return scheduler.restore_with_all_gather_extension(key)
-            return executor.read_weights()
-
         ticket = self.weight_domain.materialize(plan.route.active_experts, executor.home_count,
-                                               restore, plan.weights, executor.shapes, executor.transposed)
+                                               executor.read_weights, plan.weights,
+                                               executor.shapes, executor.transposed)
         self.tickets[key] = ticket
         self.statistics["materializations"] += 1
         self.statistics["max_live_tickets"] = max(self.statistics["max_live_tickets"], len(self.tickets))
@@ -452,13 +445,21 @@ class SparseMoonEPRuntime:
                 self.poisoned = True
                 raise
 
-    def prefetch_fsdp_expert(self, executor: Any) -> None:
-        """Skip speculation when full; never wait for a future backward to free a slot."""
-        if not self.backward_active or self.weight_domain.parked or len(self.tickets) >= 2:
-            return
+    def prefetch_key(self, executor: Any) -> ExecutionKey | None:
+        """Select one admitted invocation without waiting for a future lease release."""
+        if (not self.backward_active or self.weight_domain is None
+                or self.weight_domain.parked or len(self.tickets) >= 2):
+            return None
         matches = [key for key in self.trace if key.layer == executor.layer]
         if len(matches) == 1 and matches[0] not in self.tickets:
-            self.prepare(matches[0])
+            return matches[0]
+        return None
+
+    def prefetch_fsdp_expert(self, executor: Any) -> None:
+        """Prepare at most the current and one speculative replica lease."""
+        key = self.prefetch_key(executor)
+        if key is not None:
+            self.prepare(key)
             self.statistics["fsdp_ep_prefetches"] += 1
 
     def start_gradient(self, key: ExecutionKey, role: str, gradient: torch.Tensor) -> Any:

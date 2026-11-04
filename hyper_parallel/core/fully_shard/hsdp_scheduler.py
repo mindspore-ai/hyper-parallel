@@ -47,21 +47,21 @@ _R = TypeVar("_R")
 
 
 class FSDPAllGatherExtension(Protocol):
-    """参数恢复的可选前后处理接口，FSDP 始终持有参数及其通信句柄。
+    """Extend the fixed parameter restoration lifecycle owned by FSDP.
 
-    Example:
-        扩展可在前置钩子提供转换后的通信输入；FSDP 完成 all-gather 后，
-        后置钩子生成调用方视图。未注册扩展的模块沿用原路径。
+    Pre/post hooks run once per restoration. The prefetch notification also
+    covers retained complete parameters that need no new all-gather. FSDP
+    owns the completion stream; extensions may enqueue independent consumers.
     """
 
-    def fsdp_pre_all_gather(self, scheduler: "HSDPSchedulerV2", context: Any) -> dict[int, torch.Tensor]:
-        """返回参数 id 到通信输入缓冲区的映射。"""
+    def fsdp_pre_all_gather(self, state: Any) -> dict[int, torch.Tensor]:
+        """Return optional communication input buffers keyed by managed parameter id."""
 
-    def fsdp_post_all_gather(self, scheduler: "HSDPSchedulerV2", context: Any) -> Any:
-        """在所有 AG 完成后产生调用方视图。"""
+    def fsdp_post_all_gather(self, state: Any) -> None:
+        """Consume complete parameters after FSDP orders their all-gather completion."""
 
-    def fsdp_after_backward_prefetch(self, scheduler: "HSDPSchedulerV2") -> None:
-        """原生反向 AG 预取提交后继续执行扩展的准备工作。"""
+    def fsdp_post_prefetch(self, state: Any) -> None:
+        """Consume prefetched parameters, including a reuse without new AG."""
 
 
 class FSDPGradientExtension(Protocol):
@@ -124,6 +124,7 @@ class HSDPSchedulerContext:
         self.pre_all_reduce_groups = []
         self.pending_all_reduce_groups = []
         self.param_group_comm_ctx = ParamGroupCommCtx()
+        self.all_gather_post_stream = None
 
 
 class HSDPSchedulerV2:
@@ -182,7 +183,6 @@ class HSDPSchedulerV2:
         self._param_grad_ready = set()
         self._param_grad_handles = {}
         self._param_grad_input_done = False
-        self._all_gather_extension: Optional[FSDPAllGatherExtension] = None
         self._gradient_extension: Optional[FSDPGradientExtension] = None
         # Flag to identify root module.
         self._is_root = True
@@ -342,6 +342,8 @@ class HSDPSchedulerV2:
                     prefetch_state,
                 )
                 prefetch_state.prefetch()
+        for prefetch_cell in self.forward_prefetch_cells:
+            prefetch_cell.hsdp_scheduler.hsdp_state.complete_prefetch()
         return args, kwargs
 
     def _lazy_init_all_states(self):
@@ -420,14 +422,12 @@ class HSDPSchedulerV2:
                 )
                 prefetch_state.prefetch()
 
-        # 先提交全部原生 AG，再为每个带扩展的目标提交后续工作。
+        # Submit every AG before extension work can delay another submission.
         for prefetch_cell in self.backward_prefetch_cells:
             prefetch_state = prefetch_cell.hsdp_scheduler.hsdp_state
             with profiler_record(f"post_backward prefetch:"
                                  f"{prefetch_state.module_name}"):
-                extension = prefetch_cell.hsdp_scheduler._all_gather_extension  # pylint: disable=protected-access
-                if extension is not None and hasattr(extension, "fsdp_after_backward_prefetch"):
-                    extension.fsdp_after_backward_prefetch(prefetch_cell.hsdp_scheduler)
+                prefetch_state.complete_prefetch()
 
     # pylint: disable=W0613
     def _hsdp_backward_hook(self, cell, grad_inputs, grad_outputs):
@@ -502,20 +502,19 @@ class HSDPSchedulerV2:
         self.backward_prefetch_cells = hsdp_cell_list
 
     def register_all_gather_extension(self, extension: FSDPAllGatherExtension) -> None:
-        """为本 FSDP 单元注册参数恢复扩展，不改变普通前向或梯度归约。
+        """Register hooks on this unit's fixed FSDP restoration lifecycle.
 
         Args:
-            extension: 同时实现 fsdp_pre_all_gather 和 fsdp_post_all_gather 的对象。
-
-        Example:
-            扩展在前置钩子提供通信输入，FSDP 等待恢复完成后把参数视图交回扩展。
+            extension: Pre/post all-gather hooks, optionally selecting a stream
+                on which FSDP may finish prefetched parameter restores early.
         """
         if (not callable(getattr(extension, "fsdp_pre_all_gather", None))
                 or not callable(getattr(extension, "fsdp_post_all_gather", None))):
             raise ValueError("all-gather 扩展必须同时实现前置和后置 hook")
-        if self._all_gather_extension is not None and self._all_gather_extension is not extension:
+        registered = self.hsdp_state.all_gather_extension
+        if registered is not None and registered is not extension:
             raise ValueError("同一 FSDP 单元不能注册多个 all-gather 扩展")
-        self._all_gather_extension = extension
+        self.hsdp_state.all_gather_extension = extension
 
     def register_gradient_extension(self, extension: FSDPGradientExtension) -> None:
         """登记原生 FSDP 梯度归约前的扩展。
@@ -545,29 +544,6 @@ class HSDPSchedulerV2:
         if self._gradient_extension is None:
             raise RuntimeError("本 FSDP 单元没有注册梯度扩展")
         return self._gradient_extension.fsdp_pre_gradient_reduce(self, context)
-
-    def restore_with_all_gather_extension(self, context: Any) -> Any:
-        """执行前置 hook、FSDP AG、等待和后置 hook，返回扩展产生的视图。
-
-        Args:
-            context: 由扩展定义的单次恢复上下文。
-
-        Returns:
-            后置 hook 生成的参数视图。
-
-        Example:
-            外部调度器为下一单元恢复参数，扩展在 FSDP 完成 AG 后读取视图。
-        """
-        extension = self._all_gather_extension
-        if extension is None:
-            raise RuntimeError("本 FSDP 单元没有注册 all-gather 扩展")
-        inputs = extension.fsdp_pre_all_gather(self, context) if self.hsdp_state.is_shard else {}
-        if inputs:
-            self.hsdp_state.unshard(async_op=True, input_buffers=inputs)
-        else:
-            self.hsdp_state.unshard(async_op=True)
-        self.hsdp_state.wait_for_unshard()
-        return extension.fsdp_post_all_gather(self, context)
 
     def _disable_forward_prefetch_for_recompute(self) -> None:
         """Temporarily disable forward prefetch during activation recompute."""

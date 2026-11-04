@@ -246,7 +246,9 @@ class TransferDomain:
             raise ValueError("weight layout differs from replica admission")
         prepared = self._prepare_rounds(rounds, active)
         slot_index, generation, remote = self._claim_slot(active)
-        self.stream.wait_stream(torch.npu.current_stream(self.device))
+        current = torch.npu.current_stream(self.device)
+        if self.stream != current:
+            self.stream.wait_stream(current)
         with torch.npu.stream(self.stream):
             gate, down = read_weights()
             for value, shape, transpose in zip((gate, down), shapes, transposed):

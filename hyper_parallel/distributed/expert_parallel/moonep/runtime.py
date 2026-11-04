@@ -179,20 +179,6 @@ class MoonEPRuntime:
         if any(other != local for other in gathered):
             raise ValueError("同一 EP 组的 MoonEP 专家数和副本容量必须在所有 rank 上一致")
 
-    def _record_all_gather_workspace_demand(self) -> None:
-        """从分片参数元数据记录发送区的AG最低需求，只保存元素数。
-
-        Example:
-            home权重144MiB、EFS=2时，发送池首次建立即容纳72MiB转换输入，
-            即使前向只发送一个9MiB专家，也不会等首次反向预取才扩到72MiB。
-            不申请Tensor，不改变FSDP参数、归约输出或梯度的分配方式。
-        """
-        self.weight_workspace_demand["send"] = max(
-            ((executor.all_gather_extension or MoonEPAllGatherExtension(executor, self)).workspace_demand()
-             for executor in self.executors),
-            default=0,
-        )
-
     def _configure_groups(self) -> None:
         """复用 DeviceMesh 的 EP/EFS 域；例如 EP4×EFS2 不再创建相同成员的新组。"""
         for executor in self.executors:
@@ -211,7 +197,6 @@ class MoonEPRuntime:
                     raise ValueError("一个专家单元的参数必须使用同一EFS分片组")
                 extension = MoonEPAllGatherExtension(executor, self)
                 scheduler.register_all_gather_extension(extension)
-                executor.all_gather_extension = extension
                 gradient_extension = MoonEPGradientExtension(executor, self)
                 scheduler.register_gradient_extension(gradient_extension)
                 executor.gradient_extension = gradient_extension
@@ -249,8 +234,6 @@ class MoonEPRuntime:
     def _ensure_slots(self, gate: torch.Tensor, down: torch.Tensor) -> None:
         """首次计算只分配一张最终表；例如 BF16 计算不会按 FSDP 深度预留空槽。"""
         if not self.slots:
-            # FSDP在首次前向才完成混合精度初始化，此时才能读取真实AG转换输入大小。
-            self._record_all_gather_workspace_demand()
             if len({id(executor.weight_group) for executor in self.executors}) != 1:
                 raise ValueError("共享权重表要求所有专家层共用同一 EP 权重通信域")
             self.stream = (_communication_domain_stream(self.executors[0].weight_group, gate.device)
@@ -268,19 +251,19 @@ class MoonEPRuntime:
 
     @torch.no_grad()
     def prepare(self, key: ExecutionKey) -> _Ticket:
-        """在预取流完整提交AG→EP→组表，消费时才等待ready；例如B7预取K6。"""
+        """用FSDP已恢复的home视图提交副本交换和组表，消费时才等待ready。"""
         if key.version != self.version:
             raise RuntimeError("旧执行键不能读取更新后的权重")
         if key in self.tickets:
             self.statistics["ticket_hits"] += 1
             return self.tickets[key]
         executor, plan = self.executions[key]
-        # 首次调用已经位于专家FSDP pre-hook之后；后续物化从背景流恢复owner。
+        # 原生模块hook或预取post已恢复home；本函数只管理副本和计算表。
         if not self.slots:
             gate, down = executor.read_weights()
             self._ensure_slots(gate, down)
         if self.weight_workspace_busy:
-            raise RuntimeError("权重工作区仍在提交或上次物化失败，不能覆盖可能在途的AG/EP输入")
+            raise RuntimeError("权重工作区仍在提交或上次物化失败，不能覆盖可能在途的EP输入")
         slot = next((candidate for candidate in self.slots if candidate.key is None), None)
         if slot is None:
             # 预取 hook 与真实消费共用请求表；只在原有槽全部在途时增加物理槽。
@@ -293,19 +276,13 @@ class MoonEPRuntime:
         buffers, reclaimable, allocation_stream = None, [], None
         if self.stream is not None:
             allocation_stream = torch.npu.current_stream()
-            buffers = self._reserve_weight_buffers(executor, plan, slot, reclaimable)
-            self.stream.wait_stream(allocation_stream)
+            buffers = self._reserve_weight_buffers(plan, slot, reclaimable)
+            if self.stream != allocation_stream:
+                self.stream.wait_stream(allocation_stream)
         with torch.npu.stream(self.stream) if self.stream is not None else nullcontext():
             if slot.done is not None:
                 self.stream.wait_event(slot.done)
-            scheduler = getattr(executor.owner, "hsdp_scheduler", None)
-            if scheduler is not None:
-                if scheduler.hsdp_state.is_shard:
-                    self.statistics["owner_restores"] += 1
-                with torch.profiler.record_function("moonep::efs_restore"):
-                    gate, down = scheduler.restore_with_all_gather_extension(slot)
-            else:
-                gate, down = executor.read_weights()
+            gate, down = executor.read_weights()
             self._ensure_slots(gate, down)
             with torch.profiler.record_function("moonep::ep_weight_exchange"):
                 remote_gate, remote_down, keepalive = self._exchange_weights(executor, plan, gate, down, buffers)
@@ -335,25 +312,23 @@ class MoonEPRuntime:
         self.statistics["max_live_tickets"] = max(self.statistics["max_live_tickets"], len(self.tickets))
         return ticket
 
-    def _reserve_weight_buffers(self, executor: Any, plan: ExecutionPlan, slot: _Slot,
+    def _reserve_weight_buffers(self, plan: ExecutionPlan, slot: _Slot,
                                 reclaimable: list | None = None) -> tuple | None:
-        """在计算流恢复完整权重存储，超过池预算的EP发送包单次申请。
+        """为超过池预算的EP发送包单次申请；home存储由FSDP管理。
 
         Returns:
             可选的独立发送包和接收占位；池内包在W借用，完整权重仍由FSDP管理。
 
         Example:
-            B7预取B6时，在C恢复B6的home参数storage，W借3行发送和2行接收切片。
-            若需发送17行且预算为16行，才在C单次申请17行；消费端仍等待ready。
+            B7预取B6时，W借3行发送和2行接收切片。
+            若需发送17行且预算为16行，在当前提交流单次申请17行；消费端仍等待ready。
             发送量按所有目标的split求和，不能用单卡副本容量限制它。
-            reclaimable只登记本次在C新分配的storage，已有完整权重不能推断分配流。
+            reclaimable只登记本次新分配的发送包，allocation_stream记录其实际提交流。
         """
-        if executor.all_gather_extension is not None and reclaimable is not None:
-            executor.all_gather_extension.reserve_unsharded_storage(reclaimable)
         if not plan.any_migration:
             return None
         width = slot.gate.shape[1] * slot.gate.shape[2] + slot.down.shape[1] * slot.down.shape[2]
-        # 常规包在W复用有界池；仅超过发送预算的热点包继续在C单次申请。
+        # 常规包在W复用有界池，热点发送不能受单卡副本容量截断。
         send_limit = self.weight_send_capacity
         buffers = (slot.gate.new_empty((sum(plan.weight_send), width))
                    if sum(plan.weight_send) > send_limit else None, None)
@@ -366,7 +341,7 @@ class MoonEPRuntime:
         """按需建立有界工作区，在唯一预取流复用，超限使用独立临时存储。
 
         Args:
-            role: 发送或接收工作区；发送区同时供AG转换输入使用。
+            role: 发送或接收工作区；FSDP 自行管理 AG 转换输入。
             template: 决定dtype和device的已有权重。
             elements: 当前规划实际需要的元素数。
             limit: 由专家数与副本容量配置推导的工作区预算，不代表立即申请量。
@@ -378,7 +353,7 @@ class MoonEPRuntime:
             预算16行，首次接收1行只申请1行；下次接收3行增长为3行，
             再接收4行增长为6行，后续不超过6行均复用。17行走独立申请。
             步末释放Tensor但记住实际需求4行，下一步首次接收1行直接申请4行。
-            所有读写在W按AG wait→打包→A2Av wait→填表顺序提交；
+            所有读写在W按home就绪→打包→A2Av wait→填表顺序提交；
             增长创建新storage，已有ticket保留的旧视图不会被resize破坏。
         """
         if elements == 0 or elements > limit:
@@ -471,22 +446,28 @@ class MoonEPRuntime:
             with torch.profiler.record_function("moonep::prefetch_previous"):
                 self.prepare(self.trace[-2])
 
+    def prefetch_key(self, executor: Any) -> ExecutionKey | None:
+        """Select a retained invocation only when its layer has no ambiguity."""
+        if executor.layer in self.shared_executors:
+            return None
+        return next((item for item in reversed(self.trace)
+                     if item.layer == executor.layer and self.executions[item][0] is executor), None)
+
     def prefetch_fsdp_expert(self, executor: Any) -> None:
-        """按原生 FSDP 目标选择专家调用，只扩展 EP all-to-all-v。
+        """在FSDP固定post通知后选择专家调用，只提交EP副本准备。
 
         Args:
-            executor: 原生 FSDP 刚预取 AG 的目标专家单元。
+            executor: FSDP已经完成home参数恢复或复用的目标专家单元。
 
         Example:
-            B7 预取列表含 B6 时，FSDP 先提交 B6 的 EFS AG；本函数找到
-            原前向记录的 B6 计划，接续 EP 权重交换并记录 ready。若同层有
+            B7 预取列表含 B6 时，FSDP在S等待B6 AG并发出post；本函数找到
+            原前向记录的 B6 计划，在W提交权重交换并记录 ready。若同层有
             多个未完成微批，则留待真实消费时按调用键选择，避免配错副本。
         """
         if executor.layer in self.shared_executors:
             self.statistics["prefetch_ambiguous"] += 1
             return
-        key = next((item for item in reversed(self.trace)
-                    if item.layer == executor.layer and self.executions[item][0] is executor), None)
+        key = self.prefetch_key(executor)
         if key is None or key in self.tickets:
             return
         with torch.profiler.record_function("moonep::fsdp_ep_prefetch"):
@@ -682,11 +663,11 @@ class _ExpertFunction(torch.autograd.Function):
     @staticmethod
     @once_differentiable
     def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, None]:
-        """当前权重→必要重放→后继预取→四GMM→归属；例如R7完成后才预取K6。"""
+        """先解包并完成必要重放，再用已恢复权重计算四GMM及梯度归属。"""
         runtime, key = ctx.runtime, ctx.key
         executor, plan = runtime.executions[key]
-        runtime.prepare(key)
         x, preact, intermediate, boundaries = ctx.saved_tensors
+        runtime.prepare(key)
         gate, down = runtime.consume(key)
         scheduler = getattr(executor.owner, "hsdp_scheduler", None)
         if scheduler is None:
@@ -754,7 +735,6 @@ class MoonEPExecutor:
         self.runtime = None
         self.layer = -1
         self.weight_group, self.gradient_group = ep_group, ep_group
-        self.all_gather_extension = None
         self.gradient_extension = None
 
     def _plan(self, ids: torch.Tensor) -> ExecutionPlan:

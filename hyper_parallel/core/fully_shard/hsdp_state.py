@@ -19,7 +19,6 @@ from collections import defaultdict
 from typing import Callable, List, Mapping, Optional, TYPE_CHECKING, Union
 
 import torch
-import torch.distributed as dist
 from torch import nn
 
 from hyper_parallel.tools.logging import get_logger
@@ -114,6 +113,10 @@ class HSDPStateV2:
         self._move_states_to_device()
         self._init_hsdp_params()
         self.is_shard = True
+        self.all_gather_extension = None
+        self._all_gather_started = False
+        self._unshard_event = None
+        self._prefetch_pending = False
         self.module_name = None
         # requires_gradient_sync
         self.reduce_grads = True
@@ -517,6 +520,9 @@ class HSDPStateV2:
         self.scheduler_ctx.pre_all_reduce_params.clear()
         self.scheduler_ctx.pre_all_reduce_groups.clear()
         self.scheduler_ctx.pending_all_reduce_groups.clear()
+        self._all_gather_started = False
+        self._unshard_event = None
+        self._prefetch_pending = False
         if self.param_group is not None:
             self.param_group.reset_iter_state()
         for hsdp_param in self.hsdp_params:
@@ -561,9 +567,11 @@ class HSDPStateV2:
         )
         if self.is_shard:
             return
+        self.wait_for_unshard()
         for param in self.hsdp_params:
             param.to_sharded()
         self.is_shard = True
+        self._unshard_event = None
 
     def unshard(self, async_op: bool = False, input_buffers: dict | None = None) -> None:
         """恢复完整参数，可借用调用方保证生命周期的 AG 输入切片。
@@ -579,19 +587,28 @@ class HSDPStateV2:
             self.hsdp_params,
         )
         if not self.is_shard:
+            if not async_op:
+                self.wait_for_unshard()
             return
-
-        if self.comm_fusion_policy.enable_comm_fusion and self.param_group is not None:
-            if input_buffers:
-                raise ValueError("融合 AG 不支持逐参数借用输入")
-            self.param_group.unshard(async_op)
-        else:
-            for param in self.hsdp_params:
-                buffer = input_buffers.get(id(param)) if input_buffers else None
-                if buffer is None:
-                    param.unshard(async_op)
-                else:
-                    param.unshard(async_op, input_buffer=buffer)
+        if not getattr(self, "_all_gather_started", False):
+            extension = getattr(self, "all_gather_extension", None)
+            inputs = extension.fsdp_pre_all_gather(self) if extension is not None else {}
+            if inputs:
+                if input_buffers:
+                    raise ValueError("all-gather input buffers cannot be supplied by both caller and extension")
+                input_buffers = inputs
+            if self.comm_fusion_policy.enable_comm_fusion and self.param_group is not None:
+                if input_buffers:
+                    raise ValueError("融合 AG 不支持逐参数借用输入")
+                self.param_group.unshard(async_op)
+            else:
+                for param in self.hsdp_params:
+                    buffer = input_buffers.get(id(param)) if input_buffers else None
+                    if buffer is None:
+                        param.unshard(async_op)
+                    else:
+                        param.unshard(async_op, input_buffer=buffer)
+            self._all_gather_started = True
         if not async_op:
             self.wait_for_unshard()
 
@@ -603,6 +620,36 @@ class HSDPStateV2:
             self.hsdp_params,
         )
         self.unshard(async_op=True)
+        self._prefetch_pending = True
+
+    def complete_prefetch(self) -> None:
+        """Finish a prefetched restore on a shared FSDP completion stream.
+
+        Native schedulers call this only after submitting every target AG.
+        Extension consumers use their own streams, so the completion fence
+        does not make compute wait early for unrelated downstream transfers.
+        """
+        extension = getattr(self, "all_gather_extension", None)
+        if not getattr(self, "_prefetch_pending", False):
+            return
+        self._prefetch_pending = False
+        if extension is None:
+            return
+        device_module = torch.get_device_module(self.device)
+        stream = self.scheduler_ctx.all_gather_post_stream
+        if stream is None:
+            stream = device_module.Stream(device=self.device)
+            self.scheduler_ctx.all_gather_post_stream = stream
+        current = device_module.current_stream(self.device)
+        if stream != current:
+            stream.wait_stream(current)
+        with device_module.stream(stream):
+            self.wait_for_unshard()
+            post_prefetch = getattr(extension, "fsdp_post_prefetch", None)
+            if post_prefetch is not None:
+                post_prefetch(self)
+            self._unshard_event = device_module.Event()
+            self._unshard_event.record(stream)
 
 
     def wait_for_unshard(self) -> None:
@@ -612,7 +659,11 @@ class HSDPStateV2:
             self,
             self.hsdp_params,
         )
+        self._prefetch_pending = False
         if not self.is_shard:
+            event = getattr(self, "_unshard_event", None)
+            if event is not None:
+                torch.get_device_module(self.device).current_stream(self.device).wait_event(event)
             return
 
         if self.comm_fusion_policy.enable_comm_fusion and self.param_group is not None:
@@ -621,6 +672,10 @@ class HSDPStateV2:
             for param in self.hsdp_params:
                 param.wait_for_unshard()
         self.is_shard = False
+        self._all_gather_started = False
+        extension = getattr(self, "all_gather_extension", None)
+        if extension is not None:
+            extension.fsdp_post_all_gather(self)
 
     def set_gradient_scaling_factor(self, factor: Optional[Union[float, torch.Tensor]]) -> None:
         """Propagate the gradient scaling factor to the layer that applies it.
