@@ -27,13 +27,16 @@ Test strategy:
   - Both forward outputs and input gradients are compared with ``rtol=1e-3,
     atol=1e-3`` tolerances.
 
-Configuration for all tests:
+Configuration for the FSDP + EP tests:
   - 4 cards total: 2 FSDP ranks × 2 EP ranks (2D mesh [fsdp, ep])
   - num_experts: 4 (2 per EP rank)
   - top_k: 2
   - dim: 64, hidden_dim: 128
   - batch_size: 4, seq_len: 16
+The flattened-expert regression uses eight FSDP ranks over four experts.
 """
+import copy
+
 import torch
 import torch.distributed as dist
 
@@ -41,7 +44,10 @@ import torch_npu  # noqa: F401  # pylint: disable=unused-import
 
 from hyper_parallel import init_device_mesh, fully_shard
 from hyper_parallel.components.modules.moe import MoE
+from hyper_parallel.components.optim.builders import Muon
+from hyper_parallel.components.optim.mixed_precision_optimizer import Float16OptimizerWithFloat16Params
 from hyper_parallel.core.expert_parallel.expert_parallel import ExpertParallel
+from tests.common.grouped_experts_family import TinyMoE, family_config, replace_experts
 from tests.torch.utils import init_dist
 
 
@@ -240,3 +246,46 @@ def test_fsdp_ep_three_step_training_npu():
         )
 
     dist.barrier()
+
+
+def test_expert_2d_fsdp8() -> None:
+    """Feature: 2D experts with FSDP and Muon.
+
+    Description: Shard four experts across eight NPUs; compare real forward,
+        backward, and three mixed-precision optimizer updates with 3D experts.
+    Expectation: Every rank matches the unsharded 3D reference.
+    """
+    _, device_id = init_dist()
+    device = torch.device("npu", device_id)
+    torch.manual_seed(23)
+    source = TinyMoE(dtype=torch.bfloat16)
+    reference, actual = copy.deepcopy(source), copy.deepcopy(source)
+    actual.mlp.experts.config.expert_2d = True
+    for model in (reference, actual):
+        replace_experts(model, family_config())
+        model.to(device)
+        model.mlp.gate.indices = torch.arange(32, device=device).view(16, 2) % 4
+        model.mlp.gate.scores = torch.full((16, 2), 0.5, device=device)
+    mesh = init_device_mesh("npu", (8,), mesh_dim_names=("fsdp",))
+    fully_shard(actual.mlp.experts, mesh=mesh, reshard_after_forward=True)
+    optimizers = []
+    for model in (reference, actual):
+        builder = Muon(model=model, muon_config={"muon_lr": 0.01}, adamw_config={})
+        optimizers.append(Float16OptimizerWithFloat16Params(builder.get_optimizer(), model))
+    generator = torch.Generator().manual_seed(99)
+    for _ in range(3):
+        inputs = torch.randn(16, 128, dtype=torch.bfloat16, generator=generator).to(device)
+        expected_input = inputs.detach().clone().requires_grad_()
+        actual_input = inputs.detach().clone().requires_grad_()
+        expected, result = reference(expected_input), actual(actual_input)
+        torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+        expected.float().square().mean().backward()
+        result.float().square().mean().backward()
+        torch.testing.assert_close(actual_input.grad, expected_input.grad, rtol=1e-3, atol=1e-3)
+        for optimizer in optimizers:
+            optimizer.step()
+        for name, parameter in reference.named_parameters():
+            full = actual.get_parameter(name).full_tensor()
+            torch.testing.assert_close(full.view_as(parameter), parameter, rtol=1e-2, atol=1e-3)
+        for optimizer in optimizers:
+            optimizer.zero_grad()

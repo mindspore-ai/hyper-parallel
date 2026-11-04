@@ -195,6 +195,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         requires_grad=model_param.requires_grad,
                     )
                     main_param.model_name = model_param.model_name
+                    if hasattr(model_param, "logical_shape"):
+                        main_param.logical_shape = model_param.logical_shape
                     model_param.main_param = main_param
                     optimizer_group["params"][param_index] = main_param
                     if model_param in leaf_optimizer.state:

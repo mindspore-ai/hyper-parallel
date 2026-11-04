@@ -24,6 +24,7 @@ import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 from transformers.activations import ACT2FN
 from hyper_parallel.components.checkpoint.weight_conversion import (
+    Reshape,
     Transpose,
     WeightConverter,
     WeightRenaming,
@@ -50,6 +51,7 @@ class GroupedExperts(nn.Module):
         module: Source Transformers experts module.
         module_fqn: Fully qualified name supplied by the replacement framework.
         context: Additional replacement context.
+        expert_2d: Flatten expert storage for FSDP; defaults to config.expert_2d or False.
     """
 
     @staticmethod
@@ -180,7 +182,7 @@ class GroupedExperts(nn.Module):
         gated_linear_unit: bool,
     ) -> None:
         """Create or reuse expert parameters in the target NPU layout."""
-        if self._transpose_source_weights:
+        if self._transpose_source_weights or tuple(source_gate_up.shape) != npu_gate_up_shape:
             target_gate_up = nn.Parameter(
                 torch.empty(npu_gate_up_shape, device=source_gate_up.device, dtype=source_gate_up.dtype),
                 requires_grad=source_gate_up.requires_grad,
@@ -193,8 +195,10 @@ class GroupedExperts(nn.Module):
             # Eager replacement must preserve values already present in the source.
             if not source_gate_up.is_meta:
                 with torch.no_grad():
-                    target_gate_up.copy_(source_gate_up.transpose(-2, -1))
-                    self.down_proj.copy_(source_down.transpose(-2, -1))
+                    gate_up = source_gate_up.transpose(-2, -1) if self._transpose_source_weights else source_gate_up
+                    down = source_down.transpose(-2, -1) if self._transpose_source_weights else source_down
+                    target_gate_up.copy_(gate_up.reshape(npu_gate_up_shape))
+                    self.down_proj.copy_(down.reshape(npu_down_shape))
         else:
             target_gate_up = source_gate_up
             self.down_proj = source_down
@@ -238,12 +242,17 @@ class GroupedExperts(nn.Module):
         module: nn.Module,
         module_fqn: str = "",
         context: Mapping[str, Any] | None = None,
+        expert_2d: bool | None = None,
     ) -> None:
         """Build the high-performance module from a Transformers experts module."""
         super().__init__()
         del module_fqn, context
         config = getattr(module, "config", None)
         self.config = config
+        expert_2d = getattr(config, "expert_2d", False) if expert_2d is None else expert_2d
+        if not isinstance(expert_2d, bool):
+            raise ValueError("expert_2d must be a bool")
+        self.expert_2d = expert_2d
         self.initializer_range = getattr(config, "initializer_range", None)
         if bool(getattr(module, "has_bias", False)):
             raise ValueError("GroupedExperts does not support source modules with has_bias=True")
@@ -337,6 +346,12 @@ class GroupedExperts(nn.Module):
             (transformers_gate_up_shape, transformers_down_shape),
             (npu_gate_up_shape, npu_down_shape),
         )
+        self._source_shapes = source_shapes
+        self._logical_shapes = (npu_gate_up_shape, npu_down_shape)
+        self.use_2d_experts = self.use_2d_experts or self.expert_2d
+        if self.use_2d_experts:
+            npu_gate_up_shape = experts_2d_gate_up_shape
+            npu_down_shape = experts_2d_down_shape
         self._initialize_weights(
             source_gate_up, source_down, npu_gate_up_shape, npu_down_shape, gated_linear_unit
         )
@@ -357,21 +372,14 @@ class GroupedExperts(nn.Module):
     def make_transforms(self) -> list[WeightRenaming | WeightConverter]:
         """Describe reversible source-checkpoint to high-performance conversion."""
         transforms: list[WeightRenaming | WeightConverter] = []
-        if self._transpose_source_weights:
-            transforms.extend(
-                [
-                    WeightConverter(
-                        source_patterns=self._source_fc1_name,
-                        target_patterns=self._source_fc1_name,
-                        operations=[Transpose(dim0=-2, dim1=-1)],
-                    ),
-                    WeightConverter(
-                        source_patterns="down_proj",
-                        target_patterns="down_proj",
-                        operations=[Transpose(dim0=-2, dim1=-1)],
-                    ),
-                ]
-            )
+        for name, source_shape, logical_shape in zip(
+            (self._source_fc1_name, "down_proj"), self._source_shapes, self._logical_shapes
+        ):
+            operations = [Transpose(dim0=-2, dim1=-1)] if self._transpose_source_weights else []
+            if self.use_2d_experts and len(source_shape) == 3:
+                operations.append(Reshape(logical_shape, tuple(getattr(self, name).shape)))
+            if operations:
+                transforms.append(WeightConverter(source_patterns=name, target_patterns=name, operations=operations))
         if self.add_bias:
             for source_name, target_name in zip(
                 self._source_bias_names,
@@ -386,6 +394,12 @@ class GroupedExperts(nn.Module):
                     )
                 )
         return transforms
+
+    def logical_parameter_shapes(self) -> dict[str, tuple[int, ...]]:
+        """Describe independent expert matrices to optimizers after parameter sharding."""
+        if not self.use_2d_experts:
+            return {}
+        return dict(zip((self._source_fc1_name, "down_proj"), self._logical_shapes))
 
     def _grouped_gemm_expert_forward(
         self, gate_up_proj, down_proj, permuted, tokens_per_expert, permuted_probs
@@ -406,8 +420,7 @@ class GroupedExperts(nn.Module):
                 b1 = self.bias1.view(self.num_local_experts, -1)
                 fc1_output = fc1_output + torch.repeat_interleave(b1, self._tokens_per_expert_gmm, dim=0)
         else:
-            gate_up_proj_2d = gate_up_proj.view(self.hidden_size, -1)
-            fc1_output = torch.matmul(permuted, gate_up_proj_2d)
+            fc1_output = torch.matmul(permuted, gate_up_proj[0])
 
         # down
         if not self.router_gating_in_fp32 and permuted_probs is not None:
@@ -431,8 +444,7 @@ class GroupedExperts(nn.Module):
                     b2, self._tokens_per_expert_gmm, dim=0,
                 )
         else:
-            down_proj_2d = down_proj.view(-1, self.hidden_size)
-            fc2_output = torch.matmul(fc1_output, down_proj_2d)
+            fc2_output = torch.matmul(fc1_output, down_proj[0])
 
         return fc2_output
 

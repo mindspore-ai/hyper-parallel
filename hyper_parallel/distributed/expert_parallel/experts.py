@@ -328,6 +328,8 @@ def bind_local_expert_forward(
             f"num_experts ({global_expert_count}) must be divisible by ep_size ({ep_size})"
         )
     module.experts.local_expert_count = global_expert_count // ep_size
+    # Flattened storage needs the module's logical matrix views, not raw F.linear indexing.
+    use_grouped_gemm = use_grouped_gemm or bool(getattr(module.experts, "use_2d_experts", False))
     activation = getattr(module.experts, "act_fn", None)
     if activation is None:
         hidden_act = getattr(getattr(module, "config", None), "hidden_act", "silu")

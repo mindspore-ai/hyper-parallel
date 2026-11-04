@@ -188,6 +188,14 @@ def get_hyper_optimizer(
     """
     AdamW, Muon, ChainedOptimizer, detect_dtensor_backend = _load_torch_optimizer_runtime()
 
+    # Parameters may have been replaced by EP/FSDP since module construction.
+    if muon_params:
+        for module in model.modules():
+            describe_shapes = getattr(module, "logical_parameter_shapes", None)
+            if callable(describe_shapes):
+                for name, shape in describe_shapes().items():
+                    module.get_parameter(name).logical_shape = tuple(shape)
+
     filtered_adamw_config = _filter_optimizer_config(
         "adamw",
         AdamW,

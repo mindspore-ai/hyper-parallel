@@ -20,7 +20,10 @@ from unittest.mock import patch
 
 import torch
 
+from hyper_parallel.components.checkpoint.weight_conversion import revert_weight_conversion
+from hyper_parallel.components.modules import grouped_experts
 from hyper_parallel.components.modules.grouped_experts import GroupedExperts
+from hyper_parallel.distributed.expert_parallel.experts import bind_local_expert_forward
 from hyper_parallel.components.modules.mxfp8_grouped_swiglu import MXFP8GroupedSwiGLU, FusedMXFP8GroupedSwiGLU
 from hyper_parallel.trainer.config.resolver import ConfigResolutionError
 from tests.common.grouped_experts_family import TinyMoE, family_config, replace_experts
@@ -45,7 +48,8 @@ class TestGroupedExpertsFamily(unittest.TestCase):
         Expectation: Implementation, persistent layout and loaded weights match the baseline.
         """
         source = TinyMoE()
-        for selectors, expected in (({}, GroupedExperts), ({"use_mxfp8": True}, MXFP8GroupedSwiGLU),
+        for selectors, expected in (({}, GroupedExperts), ({"expert_2d": True}, GroupedExperts),
+                                    ({"use_mxfp8": True}, MXFP8GroupedSwiGLU),
                                     ({"use_mxfp8": True, "use_fused_mxfp8": True}, FusedMXFP8GroupedSwiGLU)):
             with self.subTest(selectors=selectors):
                 model = copy.deepcopy(source)
@@ -53,11 +57,14 @@ class TestGroupedExpertsFamily(unittest.TestCase):
                 expert = model.mlp.experts
                 self.assertIs(type(expert), expected)
                 self.assertIsInstance(expert, GroupedExperts)
-                self.assertEqual(tuple(expert.gate_up_proj.shape), (4, 128, 512))
-                self.assertEqual(tuple(expert.down_proj.shape), (4, 256, 128))
+                flat = selectors.get("expert_2d", False)
+                self.assertEqual(tuple(expert.gate_up_proj.shape), (512, 512) if flat else (4, 128, 512))
+                self.assertEqual(tuple(expert.down_proj.shape), (1024, 128) if flat else (4, 256, 128))
                 self.assertEqual(set(dict(expert.named_parameters())), {"gate_up_proj", "down_proj"})
-                torch.testing.assert_close(expert.gate_up_proj, source.mlp.experts.gate_up_proj.transpose(-2, -1))
-                torch.testing.assert_close(expert.down_proj, source.mlp.experts.down_proj.transpose(-2, -1))
+                torch.testing.assert_close(expert.gate_up_proj.reshape(4, 128, 512),
+                                           source.mlp.experts.gate_up_proj.transpose(-2, -1))
+                torch.testing.assert_close(expert.down_proj.reshape(4, 256, 128),
+                                           source.mlp.experts.down_proj.transpose(-2, -1))
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_invalid_selectors(self) -> None:
@@ -101,3 +108,63 @@ class TestGroupedExpertsFamily(unittest.TestCase):
                 mapping = replace_experts(meta, family_config(**selectors))
                 self.assertTrue(meta.mlp.experts.gate_up_proj.is_meta)
                 self.assertEqual(len(mapping), 2)
+
+
+    def test_expert_2d_conversion_and_config(self) -> None:
+        """Feature: 2D storage. Description: Convert both source layouts. Expectation: Exact round trip."""
+        for canonical in (False, True):
+            source = TinyMoE(canonical=canonical)
+            model = copy.deepcopy(source)
+            model.mlp.experts.config.expert_2d = True
+            model._weight_conversions = replace_experts(model, family_config())  # pylint: disable=protected-access
+            self.assertEqual(model.mlp.experts.gate_up_proj.ndim, 2)
+            restored = revert_weight_conversion(model, model.state_dict())
+            for name, value in source.state_dict().items():
+                torch.testing.assert_close(restored[name], value, rtol=0, atol=0)
+            source.mlp.experts.config.expert_2d = True
+            self.assertEqual(GroupedExperts(module=source.mlp.experts, expert_2d=False).gate_up_proj.ndim, 3)
+        for invalid in (1, "true"):
+            with self.assertRaisesRegex(ValueError, "expert_2d"):
+                GroupedExperts(module=source.mlp.experts, expert_2d=invalid)
+        meta = TinyMoE(device="meta")
+        replace_experts(meta, family_config(expert_2d=True))
+        self.assertTrue(meta.mlp.experts.gate_up_proj.is_meta)
+        self.assertEqual(meta.mlp.experts.gate_up_proj.ndim, 2)
+
+    def test_expert_2d_gradients_and_ep_entry(self) -> None:
+        """Feature: 2D computation. Description: Include empty tokens and EP binding. Expectation: Equal gradients."""
+        def grouped_mm(inputs: torch.Tensor, weights: torch.Tensor, *, group_list: torch.Tensor,
+                       **kwargs: object) -> torch.Tensor:
+            """Replace only device GEMM with its CPU reference."""
+            del kwargs
+            counts = torch.diff(group_list, prepend=group_list.new_zeros(1)).tolist()
+            return torch.cat([part @ weight for part, weight in zip(inputs.split(counts), weights)])
+
+        source = TinyMoE()
+        source.mlp.experts.config.use_fused_swiglu = False
+        reference, actual = copy.deepcopy(source), copy.deepcopy(source)
+        for model, enabled in ((reference, False), (actual, True)):
+            replace_experts(model, family_config(expert_2d=enabled))
+        with patch.object(grouped_experts, "grouped_matmul", grouped_mm):
+            for counts in ([2, 0, 3, 1], [0, 0, 0, 0]):
+                left = torch.randn(sum(counts), 128, requires_grad=True)
+                right = left.detach().clone().requires_grad_()
+                expected = reference.mlp.experts.forward_expert_major(left, torch.tensor(counts))
+                result = actual.mlp.experts.forward_expert_major(right, torch.tensor(counts))
+                torch.testing.assert_close(result, expected, rtol=0, atol=0)
+                expected.sum().backward()
+                result.sum().backward()
+                torch.testing.assert_close(right.grad, left.grad, rtol=0, atol=0)
+                for name, parameter in reference.named_parameters():
+                    torch.testing.assert_close(actual.get_parameter(name).grad.view_as(parameter),
+                                               parameter.grad, rtol=0, atol=0)
+                reference.zero_grad(set_to_none=True)
+                actual.zero_grad(set_to_none=True)
+            expert = actual.mlp.experts
+            expert.gate_up_proj = torch.nn.Parameter(expert.gate_up_proj[:128].detach().clone())
+            expert.down_proj = torch.nn.Parameter(expert.down_proj[:256].detach().clone())
+            bind_local_expert_forward(actual.mlp, 4)
+            inputs = torch.randn(5, 128)
+            expected = reference.mlp.experts.forward_expert_major(inputs, torch.tensor([5, 0, 0, 0]))
+            result = expert(inputs, torch.zeros(5, dtype=torch.long))
+            torch.testing.assert_close(result, expected, rtol=0, atol=0)
