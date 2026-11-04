@@ -16,6 +16,7 @@
 
 import importlib
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -26,6 +27,43 @@ from hyper_parallel.models.deepseek_v41.adapter.engram.host_state import Deepsee
 from hyper_parallel.components.modules.engram.host_engram_table import HostEngramTable
 
 base_module = importlib.import_module("hyper_parallel.trainer.base")
+
+
+class TestBaseTrainerCallbacks(unittest.TestCase):
+    """Checkpoint callback identity is shared by dispatch and recovery integration."""
+
+    def test_checkpoint_member_tracks_save_restore_and_disabled_modes(self) -> None:
+        """Feature: Direct checkpoint callback access.
+
+        Description: Initialize callbacks for save, export, restore-only and disabled configurations.
+        Expectation: Active modes expose the dispatched instance; disabled mode has no checkpoint member.
+        """
+        for save, export, restore in ((False, False, None), (True, False, None),
+                                     (False, True, None), (False, False, "checkpoint")):
+            with self.subTest(save=save, export=export, restore=restore):
+                trainer = SimpleNamespace(
+                    mesh=SimpleNamespace(dp_cp_mesh=None, sequence_parallel=False),
+                    model=object(),
+                    config=SimpleNamespace(
+                        checkpoint=SimpleNamespace(save_ckpt=save, save_hf_weights=export, restore_from=restore),
+                        stress_detect=SimpleNamespace(op_stress_detect=SimpleNamespace(detection_interval=0)),
+                    ),
+                )
+                with ExitStack() as stack:
+                    for name in (
+                        "MoEMonitorCallback", "EnvironMeterCallback", "TqdmCallback", "LoggingCallback",
+                        "EvaluateCallback", "GarbageCollectionCallback", "ProfilerCallback",
+                    ):
+                        stack.enter_context(patch.object(base_module, name))
+                    checkpoint = stack.enter_context(patch.object(base_module, "CheckpointerCallback"))
+                    base_module.BaseTrainer._init_callbacks(trainer)
+                if save or export or restore is not None:
+                    checkpoint.assert_called_once_with(trainer)
+                    self.assertIs(trainer.checkpoint_callback, checkpoint.return_value)
+                    self.assertEqual(trainer._callbacks.count(trainer.checkpoint_callback), 1)
+                else:
+                    checkpoint.assert_not_called()
+                    self.assertFalse(hasattr(trainer, "checkpoint_callback"))
 
 
 class TestBaseTrainerCleanup(unittest.TestCase):

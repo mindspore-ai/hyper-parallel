@@ -24,9 +24,11 @@ import pickle
 import dataclasses
 import queue
 import time
+import threading
 import traceback
 import multiprocessing as mp
 from pathlib import Path
+from multiprocessing.connection import wait
 from enum import Enum, auto
 from argparse import Namespace
 from collections.abc import Callable
@@ -248,6 +250,77 @@ class AsyncSaveResponse:
     """
 
     persist_completion: Future[Metadata]
+    process: Any = dataclasses.field(default=None, repr=False)
+    join_thread: Any = dataclasses.field(default=None, repr=False)
+    result_queue: Any = dataclasses.field(default=None, repr=False)
+    _finalize_lock: Any = dataclasses.field(default_factory=threading.Lock, repr=False)
+
+    def finalize(self, result: Any, async_callback: Callable, exitcode: int) -> None:
+        """Publish one persistence result under the same lock used by abort."""
+        with self._finalize_lock:
+            if self.persist_completion.done():
+                return
+
+            if result is None:
+                self.persist_completion.set_exception(
+                    RuntimeError(
+                        f"async_persist process exited with code {exitcode} and no result on queue"
+                    )
+                )
+                return
+
+            status, payload = result
+            if status == AsyncPersistStatus.SUCCESS:
+                try:
+                    # Future waiters can immediately start the next save, so publish
+                    # and restore its reusable plans before signalling completion.
+                    async_callback()
+                    StandardSavePlanner.cached_save_result.update(payload[1])
+                except Exception as exc:  # pylint: disable=broad-except
+                    self.persist_completion.set_exception(exc)
+                else:
+                    self.persist_completion.set_result(payload[0])
+            elif status == AsyncPersistStatus.FAILURE:
+                # The child sends a formatted traceback rather than an exception
+                # object; preserve that text in the error observed by Future waiters.
+                self.persist_completion.set_exception(RuntimeError(payload))
+            else:
+                self.persist_completion.set_exception(
+                    RuntimeError(f"async_persist queue returned unexpected status: {status!r}")
+                )
+
+    def abort(self, timeout: float = 5.0) -> None:
+        """Discard unfinished persistence and reap its resources before recovery.
+
+        Args:
+            timeout: Maximum seconds for each termination or join attempt.
+
+        Raises:
+            RuntimeError: A process or result thread could not be stopped.
+        """
+        # Cancellation and publication share a lock: after this returns, no late
+        # callback can publish latest or repopulate the plan cache during rollback.
+        if not self._finalize_lock.acquire(timeout=timeout):
+            raise RuntimeError("async checkpoint publication did not finish before recovery")
+        try:
+            self.persist_completion.cancel()
+        finally:
+            self._finalize_lock.release()
+        if self.process is not None:
+            if self.process.is_alive():
+                self.process.terminate()
+                self.process.join(timeout)
+            if self.process.is_alive():
+                self.process.kill()
+                self.process.join(timeout)
+            if self.process.is_alive():
+                raise RuntimeError("async checkpoint process did not stop")
+        if self.join_thread is not None:
+            self.join_thread.join(timeout)
+            if self.join_thread.is_alive():
+                raise RuntimeError("async checkpoint result thread did not stop")
+        if self.result_queue is not None:
+            self.result_queue.close()
 
     def get_result(self, timeout: int = None) -> Optional[Metadata]:
         """Wait for the save to be persisted and return its metadata.
@@ -276,6 +349,21 @@ def build_staged_state_dict(state_dict: dict[str, Any]) -> dict[str, Any]:
         dict[str, Any]: New dict with identical nesting and keys; tensor leaves are staging copies.
     """
     return DataCopier.copy(state_dict)
+
+
+def _start_parent_monitor() -> None:
+    """Exit an orphaned persist child when its training worker dies."""
+    parent = mp.parent_process()
+    if parent is None:
+        return
+
+    def _watch() -> None:
+        wait([parent.sentinel])
+        # The worker may have been SIGKILLed, so Python finalizers cannot be
+        # relied on to stop a child blocked on another rank's checkpoint files.
+        os._exit(1)
+
+    threading.Thread(target=_watch, name="AsyncCheckpointParentMonitor", daemon=True).start()
 
 
 def cleanup_and_reinit_process_group(
@@ -390,6 +478,7 @@ def execute_async_persist_with_gloo(
     # ``api`` imports this module at load time, so this import stays function local: that is
     # what keeps the two from importing each other at load time.
     from hyper_parallel.core.distributed_checkpoint.api import _save_impl  # pylint: disable=import-outside-toplevel
+    _start_parent_monitor()
     try:
         # Clear the original communication group information and establish the gloo communication.
         cleanup_and_reinit_process_group(
@@ -442,6 +531,7 @@ def execute_async_persist(
     """
     # ``api`` imports this module at load time, so this import has to stay function local.
     from hyper_parallel.core.distributed_checkpoint.api import _save_impl  # pylint: disable=import-outside-toplevel
+    _start_parent_monitor()
     try:
         meta = _save_impl(
             staged,
@@ -459,13 +549,34 @@ def execute_async_persist(
 
 
 def resolve_async_persist_result(
-        proc: mp.Process,
-        result_queue: mp.Queue,
-        persist_future: Future[None],
-        async_callback: Callable[[], None],
+    proc: mp.Process,
+    result_queue: mp.Queue,
+    response: AsyncSaveResponse,
+    async_callback: Callable[[], None],
 ) -> None:
-    """Join persist ``proc`` and complete ``persist_future`` (runs on a background thread)."""
+    """Resolve a persist child's result without publishing cancelled saves.
+
+    Runs in the training process's result thread. Receive the child's result and
+    wait for it to exit. On success, run the publication callback and merge the
+    child's plan cache before completing ``response.persist_completion`` with the
+    checkpoint metadata. Child failures, missing results, unexpected statuses and
+    callback errors are recorded on that Future for the caller to observe.
+
+    Args:
+        proc: Started child process performing checkpoint persistence.
+        result_queue: IPC queue carrying the child's status and result payload.
+        response: Save task holding the completion Future and finalization lock.
+        async_callback: Collective-free callback publishing the completed save.
+
+    Note:
+        Finalization shares a lock with ``AsyncSaveResponse.abort()``. If abort
+        cancels the Future first, discard the result without publishing or
+        updating the plan cache. If finalization acquires the lock first, abort
+        waits for publication and Future completion before proceeding.
+    """
     result = None
+    # Read before joining: a child may wait for its queue feeder to flush a large
+    # payload. Timed reads also detect children that exit without returning one.
     while result is None:
         try:
             result = result_queue.get(timeout=_PERSIST_RESULT_POLL_SECONDS)
@@ -481,34 +592,9 @@ def resolve_async_persist_result(
             break
 
     proc.join()
-    if persist_future.done():
-        return
-
-    if result is None:
-        persist_future.set_exception(
-            RuntimeError(
-                f"async_persist process exited with code {proc.exitcode} and no result on queue"
-            )
-        )
-        return
-
-    status, payload = result
-    if status == AsyncPersistStatus.SUCCESS:
-        try:
-            async_callback()
-            StandardSavePlanner.cached_save_result.update(payload[1])
-        except Exception as exc:  # pylint: disable=broad-except
-            persist_future.set_exception(exc)
-        else:
-            persist_future.set_result(payload[0])
-    elif status == AsyncPersistStatus.FAILURE:
-        # The child's exception object cannot cross the process boundary, so what
-        # arrives is its formatted traceback and a RuntimeError carries the text.
-        persist_future.set_exception(RuntimeError(payload))
-    else:
-        persist_future.set_exception(
-            RuntimeError(f"async_persist queue returned unexpected status: {status!r}")
-        )
+    # Abort may race a result already received above. Keep the Future check,
+    # publication and cache update under the same lock as cancellation.
+    response.finalize(result, async_callback, proc.exitcode)
 
 
 def batch_read_worker(file_batch: tuple[int], checkpoint_id: str, file_type: FileType) -> list:
@@ -666,9 +752,11 @@ def _safe_remove_file(file_path: str) -> None:
     """
     try:
         os.remove(file_path)
+    except FileNotFoundError:
+        pass
     except Exception as e:  # pylint: disable=broad-except
         logger.warning(
-            "Could not remove the STORAGE_DATA file %s, because the error: %s", file_path, e
+            "Could not remove the checkpoint exchange file %s, because the error: %s", file_path, e
         )
 
 
@@ -706,8 +794,7 @@ def load_file(checkpoint_id: str, file_type: FileType, file_id: int) -> Any:
         # The rank that owns this file has not written it yet; the caller comes back round.
         return None
 
-    # Delete only the STORAGE_DATA file. Do not delete the LOCAL_PALN file,
-    # as it is generated only during the initial save.
+    # Other ranks may still be reading LOCAL_PLAN, so only delete STORAGE_DATA here.
     if file_type == FileType.STORAGE_DATA:
         _safe_remove_file(file_path)
     return result

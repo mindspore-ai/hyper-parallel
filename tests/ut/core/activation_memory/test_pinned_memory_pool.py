@@ -91,6 +91,32 @@ class TestPinnedMemoryPool(unittest.TestCase):
     def tearDown(self) -> None:
         self.platform_patch.stop()
 
+    def test_recovery_recycles_pending_blocks_without_touching_old_events(self) -> None:
+        """Feature: Reuse pinned memory after device restart and transfer quiescence.
+
+        Description: Reset a pool with one pending block and another still checked out.
+        Expectation: Reuse only the released block without querying invalid events or exceeding capacity.
+        """
+        pool = PinnedMemoryPool(2048)
+        pending = pool.acquire(16)
+        checked_out = pool.acquire(16)
+        event = MagicMock()
+        event.query.side_effect = RuntimeError("stale event")
+        event.synchronize.side_effect = RuntimeError("stale event")
+        pool.release(pending, event=event)
+        pool.reset_after_device_restart()
+        reused = pool.acquire(16)
+        self.assertEqual(reused.data_ptr(), pending.data_ptr())
+        self.assertNotEqual(reused.data_ptr(), checked_out.data_ptr())
+        with self.assertRaisesRegex(RuntimeError, "capacity exceeded"):
+            pool.acquire(16)
+        event.query.assert_not_called()
+        event.synchronize.assert_not_called()
+        pool.release(reused)
+        pool.release(checked_out)
+        pool.reset_after_device_restart()
+        self.assertEqual(pool.total_allocated, 2048)
+
     def test_validates_constructor_and_acquire_arguments(self) -> None:
         """Reject invalid constructor limits and acquisition sizes."""
         for invalid in (0, -1, 1.5, True):

@@ -21,6 +21,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from typing import Optional
 from unittest.mock import MagicMock, call, patch
 
 from hyper_parallel.trainer.config.resolver import resolve_component
@@ -50,7 +51,7 @@ class TestMemoryProfiler(unittest.TestCase):
         return device_api, memory_api
 
     @staticmethod
-    def _reset(profiler: MemoryProfiler, config: MemoryConfig) -> None:
+    def _reset(profiler: MemoryProfiler, config: Optional[MemoryConfig]) -> None:
         """Start a session with representative logical ranks."""
         profiler.reset(
             config,
@@ -58,6 +59,154 @@ class TestMemoryProfiler(unittest.TestCase):
             tp_rank=2,
             dp_rank=3,
         )
+
+    def test_recovery_restores_recording_window_without_copying_history(self) -> None:
+        """Feature: Reopen restored allocator history at the next training step.
+
+        Description: Capture an active window, abort it, and load state in a freshly constructed profiler.
+        Expectation: Load restores counters; step reopens history once and respects the original window end.
+        """
+        device, memory = self._device()
+        config = MemoryConfig(enable=True, start_step=1, end_step=4, dump_ranks=[4])
+        with (
+            patch(f"{MODULE}.get_device_type", return_value="cuda"),
+            patch(f"{MODULE}.get_torch_device", return_value=device),
+        ):
+            original = MemoryProfiler()
+            self._reset(original, config)
+            original.step()
+            original.step()
+            saved = original.state_dict()
+            original.abort()
+            replacement = MemoryProfiler()
+            self._reset(replacement, config)
+            count = memory._record_memory_history.call_count
+            replacement.load_state_dict(saved)
+            self.assertEqual(replacement.current_step, 3)
+            self.assertFalse(replacement._history_started)
+            self.assertEqual(memory._record_memory_history.call_count, count)
+            with (
+                patch(f"{MODULE}.os.makedirs"),
+                patch(f"{MODULE}.os.chmod"),
+                patch(f"{MODULE}.time.strftime", return_value="2026-09-15-12-30-45") as timestamp,
+            ):
+                replacement.step()
+                self.assertTrue(replacement._history_started)
+                self.assertEqual(memory._record_memory_history.call_count, count + 1)
+                replacement.step()
+                self.assertEqual(memory._record_memory_history.call_count, count + 1)
+                replacement.step()
+            memory._dump_snapshot.assert_called_once()
+            timestamp.assert_called_once_with("%Y-%m-%d-%H-%M-%S")
+            memory._dump_snapshot.assert_called_once_with(
+                os.path.join(config.save_path, "snapshot_2026-09-15-12-30-45_4.pickle")
+            )
+            self.assertFalse(replacement._history_started)
+            self.assertTrue(replacement.enable)
+            count = memory._record_memory_history.call_count
+            replacement.load_state_dict(replacement.state_dict())
+            self.assertEqual(memory._record_memory_history.call_count, count)
+
+    def test_recovery_after_recording_window_does_not_reopen_empty_history(self) -> None:
+        """Feature: Completed allocator windows do not restart after recovery.
+
+        Description: Restore after the last recorded step but before the original dump control point.
+        Expectation: No backend history is reopened for an already completed window.
+        """
+        for statistics in (False, True):
+            with self.subTest(statistics=statistics):
+                profiler = MemoryProfiler()
+                profiler.enable = True
+                profiler.mem_info = statistics
+                profiler.end_step = 4
+                with (
+                    patch(f"{MODULE}.get_torch_device") as device,
+                    patch.object(profiler, "_dump") as dump,
+                    patch.object(profiler, "_log_memory_info") as log,
+                ):
+                    profiler.load_state_dict({"current_step": 5})
+                    self.assertEqual(profiler._session_active, statistics)
+                    profiler.step()
+                device.assert_not_called()
+                dump.assert_not_called()
+                self.assertEqual(log.call_count, int(statistics))
+                self.assertTrue(profiler.enable)
+                self.assertFalse(profiler._history_started)
+
+    def test_recovery_before_window_keeps_recording_deferred(self) -> None:
+        """Feature: Preserve future allocator recording boundaries.
+
+        Description: Resume before the recording window with memory statistics still enabled.
+        Expectation: Resume does not start history early; the configured boundary starts it once.
+        """
+        device, memory = self._device()
+        profiler = MemoryProfiler()
+        with (
+            patch(f"{MODULE}.get_device_type", return_value="cuda"),
+            patch(f"{MODULE}.get_torch_device", return_value=device),
+        ):
+            self._reset(profiler, MemoryConfig(enable=True, start_step=3, end_step=4, mem_info=True))
+            saved = profiler.state_dict()
+            profiler.abort()
+            profiler.load_state_dict(saved)
+            memory._record_memory_history.assert_not_called()
+            self.assertTrue(profiler.mem_info)
+            for _ in range(3):
+                profiler.step()
+            memory._record_memory_history.assert_called_once_with(stacks="all", max_entries=sys.maxsize)
+            profiler.abort()
+
+    def test_cleanup_preserves_configuration_and_restore_only_needs_progress(self) -> None:
+        """Feature: Local configuration survives cleanup without replica backup.
+
+        Description: Stop or abort history/statistics sessions, then restore only their committed counter.
+        Expectation: Cleanup prevents all further activity; restore reuses configuration at the next step.
+        """
+        for cleanup in ("stop", "abort"):
+            for history, statistics in ((True, True), (True, False), (False, True)):
+                with self.subTest(cleanup=cleanup, history=history, statistics=statistics):
+                    device, memory = self._device()
+                    profiler = MemoryProfiler()
+                    config = MemoryConfig(enable=history, mem_info=statistics, start_step=0, end_step=4)
+                    with (
+                        patch(f"{MODULE}.get_device_type", return_value="cuda"),
+                        patch(f"{MODULE}.get_torch_device", return_value=device) as resolve,
+                        patch(f"{MODULE}.os.makedirs"),
+                        patch(f"{MODULE}.os.chmod"),
+                    ):
+                        self._reset(profiler, config)
+                        saved = profiler.state_dict()
+                        self.assertEqual(saved, {"current_step": int(history)})
+                        getattr(profiler, cleanup)()
+                        self.assertEqual(profiler.enable, history)
+                        self.assertEqual(profiler.mem_info, statistics)
+                        self.assertFalse(profiler._session_active)
+                        if history:
+                            self.assertIs(profiler._device_api, device)
+                            self.assertIs(profiler._memory_api, memory)
+                        calls = list(device.mock_calls)
+                        profiler.step()
+                        self.assertEqual(device.mock_calls, calls)
+                        self.assertEqual(profiler.state_dict(), saved)
+                        resolves = resolve.call_count
+                        profiler.load_state_dict(saved)
+                        self.assertEqual(resolve.call_count, resolves)
+                        self.assertEqual(profiler.enable, history)
+                        self.assertEqual(profiler.mem_info, statistics)
+                        self.assertTrue(profiler._session_active)
+                        starts = memory._record_memory_history.call_count
+                        logs = device.reset_peak_memory_stats.call_count
+                        profiler.step()
+                        self.assertEqual(memory._record_memory_history.call_count, starts + int(history))
+                        self.assertEqual(device.reset_peak_memory_stats.call_count, logs + int(statistics))
+                        profiler.abort()
+                        device_api, memory_api = profiler._device_api, profiler._memory_api
+                        self._reset(profiler, None)
+                        self.assertFalse(profiler.enable)
+                        self.assertFalse(profiler.mem_info)
+                        self.assertFalse(profiler._session_active)
+                        self.assertIs(profiler._device_api, device_api)
+                        self.assertIs(profiler._memory_api, memory_api)
 
     def test_defaults_match_mindspeed_fsdp(self) -> None:
         """Expose the MindSpeed-compatible memory configuration defaults.
@@ -115,7 +264,7 @@ class TestMemoryProfiler(unittest.TestCase):
             patch(f"{MODULE}.get_torch_device", return_value=device_api),
             patch(f"{MODULE}.os.makedirs") as makedirs_mock,
             patch(f"{MODULE}.os.chmod"),
-            patch(f"{MODULE}.time.strftime", return_value="2026-09-15-12-30"),
+            patch(f"{MODULE}.time.strftime", return_value="2026-09-15-12-30-45"),
         ):
             self._reset(profiler, config)
             profiler.step()
@@ -130,7 +279,7 @@ class TestMemoryProfiler(unittest.TestCase):
             [call(stacks="all", max_entries=sys.maxsize), call(enabled=None)],
         )
         memory_api._dump_snapshot.assert_called_once_with(
-            "./memory_snapshot/snapshot_2026-09-15-12-30_4.pickle"
+            "./memory_snapshot/snapshot_2026-09-15-12-30-45_4.pickle"
         )
         makedirs_mock.assert_called_once_with("./memory_snapshot", exist_ok=True)
         self.assertFalse(profiler._history_started)
@@ -165,7 +314,7 @@ class TestMemoryProfiler(unittest.TestCase):
                     [call(stacks="all", max_entries=sys.maxsize), call(enabled=None)],
                 )
                 memory_api._dump_snapshot.assert_called_once()
-                self.assertFalse(profiler.enable)
+                self.assertTrue(profiler.enable)
                 self.assertFalse(profiler._session_active)
 
     def test_unselected_rank_records_without_dump_or_barrier(self) -> None:
@@ -400,24 +549,25 @@ class TestMemoryProfiler(unittest.TestCase):
         get_device_type_mock.assert_not_called()
 
     def test_unsupported_device_and_allocator_api_fail_clearly(self) -> None:
-        """Report missing accelerator capabilities before model construction.
+        """Report missing accelerator capabilities during session initialization.
 
         Feature: Allocator capability detection.
-        Description: Enable history on CPU and on an incomplete accelerator API.
-        Expectation: Reset raises a descriptive RuntimeError in both cases.
+        Description: Start immediate or deferred history on CPU and an incomplete accelerator API.
+        Expectation: Reset validates history APIs before either immediate or deferred recording.
         """
-        config = MemoryConfig(enable=True)
-        with patch(f"{MODULE}.get_device_type", return_value="cpu"):
-            with self.assertRaisesRegex(RuntimeError, "CUDA or NPU"):
-                self._reset(MemoryProfiler(), config)
-
-        device_api = MagicMock(memory=types.SimpleNamespace())
-        with (
-            patch(f"{MODULE}.get_device_type", return_value="cuda"),
-            patch(f"{MODULE}.get_torch_device", return_value=device_api),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "_record_memory_history, _dump_snapshot"):
-                self._reset(MemoryProfiler(), config)
+        for start in (0, 1):
+            for device_type, error in (("cpu", "CUDA or NPU"), ("cuda", "_record_memory_history, _dump_snapshot")):
+                with self.subTest(start=start, device=device_type):
+                    profiler = MemoryProfiler()
+                    config = MemoryConfig(enable=True, start_step=start)
+                    device_api = MagicMock(memory=types.SimpleNamespace())
+                    with (
+                        patch(f"{MODULE}.get_device_type", return_value=device_type) as resolve,
+                        patch(f"{MODULE}.get_torch_device", return_value=device_api),
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, error):
+                            self._reset(profiler, config)
+                        resolve.assert_called_once_with()
 
     def test_snapshot_is_owner_readable_with_write_only_npu_backend(self) -> None:
         """Repair the owner-write-only files created by torch-npu.

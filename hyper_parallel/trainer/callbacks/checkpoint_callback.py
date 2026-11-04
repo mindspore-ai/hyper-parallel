@@ -37,6 +37,7 @@ from hyper_parallel.models._transformers.checkpoint_loader import CheckpointMana
 from hyper_parallel.core.distributed_checkpoint.utils import flatten_state_dict
 from hyper_parallel.core.optimizer.muon import Muon
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
+from hyper_parallel.high_availability.group_registry import is_recovery_reboot
 from hyper_parallel.models._transformers.model_builder import (
     validate_model_init_dtype,
 )
@@ -171,6 +172,7 @@ class CheckpointerCallback(Callback):
 
         self._last_saved_step: int = -1
         self._last_hf_saved_step: int = -1
+        self._initial_checkpoint_processed = False
         self.checkpointer = build_checkpointer(
             extra_state_per_rank=self._save_extra_state_per_rank,
         )
@@ -207,9 +209,13 @@ class CheckpointerCallback(Callback):
             self._save_extra_state_per_rank,
             self._restore_from,
         )
-        self._load_checkpoint()
         if self._save_time_interval_seconds > 0:
             self._next_time_save = time.monotonic() + self._save_time_interval_seconds
+        if self._initial_checkpoint_processed:
+            return
+        if not is_recovery_reboot():
+            self._load_checkpoint()
+        self._initial_checkpoint_processed = True
 
     def on_step_end(  # pylint: disable=arguments-differ
         self, state: TrainerState, **kwargs: Any
@@ -271,6 +277,11 @@ class CheckpointerCallback(Callback):
             )
             self._save_hf_checkpoint(save_dir, state.global_step)
             self._rotate_checkpoints()
+
+    def cleanup_state(self) -> None:
+        """Reset save bookkeeping and abort local persistence before device restart."""
+        self._last_saved_step = -1
+        self.checkpointer.abort_async_save()
 
     def wait_for_pending_save(self) -> None:
         """Block until the checkpointer's in-flight async save is persisted."""

@@ -123,6 +123,24 @@ class TestStressDetectCallback(unittest.TestCase):
         self.assertIn("unrecognized return status", failures[2].getMessage(),
                       f"unknown status must be identified, got={logs.output}")
 
+    def test_device_stop_does_not_leave_an_incomplete_round_to_resume(self) -> None:
+        """Feature: Stress detection has no retained per-round recovery state.
+
+        Description: Interrupt an eligible round, then continue at restored progress and the next eligible step.
+        Expectation: The next full round uses fresh calls and the interruption remains an ordinary exception.
+        """
+        callback = StressDetectCallback(self._trainer(interval=2, count=2))
+        self.npu.stress_detect.side_effect = RuntimeError("FORCE STOP")
+        with self.assertRaisesRegex(RuntimeError, "FORCE STOP"):
+            callback.on_step_end(TrainerState(global_step=8))
+        self.npu.stress_detect.side_effect = None
+        self.npu.stress_detect.return_value = 0
+        self.npu.stress_detect.reset_mock()
+        callback.on_step_end(TrainerState(global_step=9))
+        self.npu.stress_detect.assert_not_called()
+        callback.on_step_end(TrainerState(global_step=10))
+        self.assertEqual(self.npu.stress_detect.call_count, 2)
+
     def test_backend_exception_propagates(self) -> None:
         """Preserve errors raised directly by torch_npu instead of suppressing them.
 

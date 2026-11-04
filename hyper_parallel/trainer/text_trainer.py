@@ -18,7 +18,7 @@ __all__ = ["TextTrainer"]
 
 from collections import defaultdict
 from itertools import count
-from typing import Any, Dict
+from typing import Any, Dict, Iterator, Optional
 
 import torch
 
@@ -29,6 +29,12 @@ from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import print_device_mem_info
 from hyper_parallel.trainer.runtime.memory_profiler import memory_profiler
 from hyper_parallel.trainer.runtime.device import synchronize
+from hyper_parallel.trainer.runtime.process_recovery import (
+    recovery_constructor,
+    recovery_epoch_initialized,
+    recovery_train_loop,
+    recovery_train_step,
+)
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.distributed_data import DistributedDataLoader
 from hyper_parallel.trainer.config import TrainerConfig
@@ -41,6 +47,7 @@ class TextTrainer:
 
     base: BaseTrainer
 
+    @recovery_constructor
     def __init__(self, config: TrainerConfig) -> None:
         """Build the text Trainer in the same explicit order as VeOmni."""
         self.base = BaseTrainer.__new__(BaseTrainer)
@@ -258,6 +265,7 @@ class TextTrainer:
 
         return loss, loss_dict
 
+    @recovery_train_step
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
         """Execute one text training step.
 
@@ -314,10 +322,15 @@ class TextTrainer:
             "grad_norm": grad_norm_value,
         }
 
+    @recovery_epoch_initialized
+    def _create_data_iterator(self) -> Optional[Iterator[Any]]:
+        """Construct the native iterator before consuming this epoch's data."""
+        loader = self.base.train_dataloader
+        return iter(loader) if loader is not None else None
+
     def _train_epoch(self, epoch: int, balanced_loader: bool) -> bool:
         """Consume complete optimizer steps and report whether the source epoch ended."""
-        train_dataloader = self.base.train_dataloader
-        data_iterator = iter(train_dataloader) if train_dataloader is not None else None
+        data_iterator = self._create_data_iterator()
         start_step = self.base.state.global_step - epoch * self.base.train_steps
         train_steps = min(self.base.train_steps, self.base.train_iters - epoch * self.base.train_steps)
         if balanced_loader:
@@ -337,6 +350,7 @@ class TextTrainer:
                 return True
         return False
 
+    @recovery_train_loop
     def train(self) -> None:
         """Run the configured global optimizer steps by Dataset epoch."""
         try:

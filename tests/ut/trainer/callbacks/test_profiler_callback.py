@@ -72,6 +72,134 @@ class TestProfilerCallback(unittest.TestCase):
         """Stop patches created by helper methods."""
         patch.stopall()
 
+    @staticmethod
+    def _initialized_callback(trainer: types.SimpleNamespace) -> ProfilerCallback:
+        """Enter the native train-begin lifecycle after callback construction."""
+        callback = ProfilerCallback(trainer)
+        callback.on_train_begin(TrainerState())
+        return callback
+
+    def test_backend_creation_is_deferred_until_train_begin(self) -> None:
+        """Feature: All workers construct profiler resources at train-begin.
+
+        Description: Construct a callback and optionally stage restored progress before train-begin.
+        Expectation: Only selected ranks with unfinished windows create a backend, once per session.
+        """
+        for rank, completed, creations in ((0, None, 1), (0, 2, 1), (0, 4, 0), (1, 2, 0)):
+            with self.subTest(rank=rank, completed=completed):
+                backend = MagicMock()
+                config = ProfilingConfig(enable=True, start_step=2, stop_step=4, rank_ids=[0])
+                with patch.object(
+                    ProfilerCallback,
+                    "_resolve_profiler_module",
+                    return_value=("cpu", backend),
+                ) as resolve:
+                    callback = ProfilerCallback(self._trainer(config, rank=rank, world_size=2))
+                    self.assertIsNone(callback.profiler)
+                    self.assertEqual(callback._training_step, 0)
+                    self.assertIsNone(callback._resume_step)
+                    resolve.assert_not_called()
+                    if completed is not None:
+                        callback.load_state_dict({"training_step": completed})
+                    resolve.assert_not_called()
+                    callback.on_train_begin(TrainerState(global_step=completed or 0))
+                    callback.on_train_begin(TrainerState(global_step=completed or 0))
+                    self.assertEqual(callback._training_step, completed or 0)
+                    self.assertIsNone(callback._resume_step)
+                    self.assertEqual(resolve.call_count, creations)
+                    self.assertEqual(backend.profile.call_count, creations)
+                    callback.close()
+
+    def test_recovery_rebuilds_remaining_window_on_main_thread(self) -> None:
+        """Feature: Restore profiler progress without reusing failed backend resources.
+
+        Description: Roll back a failed fifth step to four completed steps, then finish a six-step window.
+        Expectation: Load only stages state; train-begin creates a two-step session and records fresh metadata.
+        """
+        first, second = MagicMock(), MagicMock()
+        schedule, _, factory = self._cpu_profiler_patches(first)
+        factory.side_effect = [first, second]
+        config = ProfilingConfig(enable=True, start_step=3, stop_step=6, warmup_steps=1)
+        with patch("hyper_parallel.trainer.callbacks.profiler_callback.get_device_type", return_value="cpu"):
+            callback = self._initialized_callback(self._trainer(config))
+            for step in range(1, 5):
+                callback.on_step_begin(TrainerState(global_step=1000 + step))
+                callback.on_step_end(TrainerState(global_step=1000 + step))
+            saved = callback.state_dict()
+            callback.on_step_begin(TrainerState(global_step=1005))
+            callback.close()
+            callback.load_state_dict(saved)
+            self.assertEqual(factory.call_count, 1)
+            callback.on_train_begin(TrainerState(global_step=1004))
+            self.assertEqual(factory.call_count, 2)
+            schedule.assert_called_with(wait=0, warmup=0, active=2, repeat=1, skip_first=1)
+            for step in (1005, 1006):
+                callback.on_step_begin(TrainerState(global_step=step))
+                callback.on_step_end(TrainerState(global_step=step))
+            self.assertEqual(callback.state_dict(), {"training_step": 6})
+            second.add_metadata_json.assert_called_once()
+            second.stop.assert_called_once_with()
+            callback.load_state_dict(callback.state_dict())
+            callback.on_train_begin(TrainerState(global_step=1006))
+            self.assertEqual(factory.call_count, 2)
+
+    def test_recovery_schedule_clips_consumed_warmup(self) -> None:
+        """Feature: Recovery preserves the remaining warmup and active window.
+
+        Description: Restore before, within and after the warmup interval.
+        Expectation: The new schedule never replays completed warmup or active steps.
+        """
+        schedule, _, _ = self._cpu_profiler_patches(MagicMock())
+        with patch("hyper_parallel.trainer.callbacks.profiler_callback.get_device_type", return_value="cpu"):
+            callback = self._initialized_callback(self._trainer(
+                ProfilingConfig(enable=True, start_step=4, stop_step=6, warmup_steps=2),
+            ))
+            for completed, warmup, active in ((1, 2, 3), (2, 1, 3), (3, 0, 3), (4, 0, 2)):
+                with self.subTest(completed=completed):
+                    callback.load_state_dict({"training_step": completed})
+                    callback.on_train_begin(TrainerState(global_step=completed))
+                    schedule.assert_called_with(wait=0, warmup=warmup, active=active, repeat=1, skip_first=1)
+
+    def test_unselected_rank_protects_the_same_logical_progress(self) -> None:
+        """Feature: Replica state must not depend on profiler rank selection.
+
+        Description: Advance an unselected rank and restore its count without constructing a backend.
+        Expectation: Its provider progress advances normally while backend creation remains disabled.
+        """
+        config = ProfilingConfig(enable=True, rank_ids=[1])
+        with patch.object(ProfilerCallback, "_resolve_profiler_module") as resolve:
+            callback = self._initialized_callback(self._trainer(config, rank=0, world_size=2))
+            for step in (1, 2):
+                callback.on_step_begin(TrainerState(global_step=step))
+            self.assertEqual(callback.state_dict(), {"training_step": 2})
+            callback.load_state_dict({"training_step": 1})
+            callback.on_train_begin(TrainerState(global_step=1))
+            callback.on_step_begin(TrainerState(global_step=2))
+            self.assertEqual(callback.state_dict(), {"training_step": 2})
+            resolve.assert_not_called()
+
+    def test_failed_stop_is_retried_before_creating_recovery_session(self) -> None:
+        """Feature: Do not lose the old profiler when device-stop cleanup fails.
+
+        Description: Fail backend stop once, then restore progress after device recovery.
+        Expectation: The original handle remains reachable and is closed before a new profile is created.
+        """
+        first, second = MagicMock(), MagicMock()
+        _, _, factory = self._cpu_profiler_patches(first)
+        factory.side_effect = [first, second]
+        with patch("hyper_parallel.trainer.callbacks.profiler_callback.get_device_type", return_value="cpu"):
+            callback = self._initialized_callback(self._trainer(ProfilingConfig(enable=True)))
+            callback.on_step_begin(TrainerState(global_step=1))
+            first.stop.side_effect = RuntimeError("device stopped")
+            with self.assertRaisesRegex(RuntimeError, "device stopped"):
+                callback.close()
+            self.assertIs(callback.profiler, first)
+            callback.load_state_dict({"training_step": 0})
+            first.stop.side_effect = None
+            callback.on_train_begin(TrainerState())
+            self.assertIs(callback.profiler, second)
+            self.assertEqual(first.stop.call_count, 2)
+
     def test_analysis_options_are_forwarded_only_to_npu(self) -> None:
         """Route automatic analysis controls only to the Ascend trace handler.
 
@@ -91,7 +219,7 @@ class TestProfilerCallback(unittest.TestCase):
                         patch.object(ProfilerCallback, "_resolve_profiler_module", return_value=(device, backend)),
                         patch.object(ProfilerCallback, "_get_npu_experimental_config"),
                     ):
-                        callback = ProfilerCallback(self._trainer(config))
+                        callback = self._initialized_callback(self._trainer(config))
                     options = {"analyse_flag": enabled, "async_mode": asynchronous} if device == "npu" else {}
                     backend.tensorboard_trace_handler.assert_called_once_with(str(callback.output_path), **options)
 
@@ -109,7 +237,7 @@ class TestProfilerCallback(unittest.TestCase):
                     setattr(config.analysis, name, value)
                     with patch.object(ProfilerCallback, "_resolve_profiler_module") as backend:
                         with self.assertRaisesRegex(TypeError, f"profiler.analysis.{name}"):
-                            ProfilerCallback(self._trainer(config))
+                            self._initialized_callback(self._trainer(config))
                         backend.assert_not_called()
 
     def test_disabled_profile_does_not_initialize_backend(self) -> None:
@@ -122,7 +250,7 @@ class TestProfilerCallback(unittest.TestCase):
         trainer = self._trainer(ProfilingConfig())
 
         with patch("hyper_parallel.trainer.callbacks.profiler_callback.get_device_type") as get_device_type_mock:
-            callback = ProfilerCallback(trainer)
+            callback = self._initialized_callback(trainer)
 
         self.assertIsNone(callback.profiler)
         get_device_type_mock.assert_not_called()
@@ -146,7 +274,7 @@ class TestProfilerCallback(unittest.TestCase):
         )
 
         with patch("hyper_parallel.trainer.callbacks.profiler_callback.get_device_type", return_value="cpu"):
-            callback = ProfilerCallback(self._trainer(config))
+            callback = self._initialized_callback(self._trainer(config))
 
         schedule_mock.assert_called_once_with(wait=0, warmup=0, active=2, repeat=1, skip_first=3)
         profile_mock.assert_called_once_with(
@@ -184,7 +312,7 @@ class TestProfilerCallback(unittest.TestCase):
         )
 
         with patch("hyper_parallel.trainer.callbacks.profiler_callback.get_device_type", return_value="cpu"):
-            callback = ProfilerCallback(self._trainer(config))
+            callback = self._initialized_callback(self._trainer(config))
 
         schedule_mock.assert_called_once_with(wait=0, warmup=0, active=3, repeat=1, skip_first=1)
         callback.on_train_begin(TrainerState())
@@ -212,8 +340,8 @@ class TestProfilerCallback(unittest.TestCase):
         )
 
         with patch("hyper_parallel.trainer.callbacks.profiler_callback.get_device_type", return_value="cpu"):
-            selected = ProfilerCallback(self._trainer(config, rank=3, world_size=8))
-            skipped = [ProfilerCallback(self._trainer(config, rank=rank, world_size=8)) for rank in (0, 2, 4)]
+            selected = self._initialized_callback(self._trainer(config, rank=3, world_size=8))
+            skipped = [self._initialized_callback(self._trainer(config, rank=rank, world_size=8)) for rank in (0, 2, 4)]
 
         self.assertIs(selected.profiler, profile_mock)
         for callback in skipped:
@@ -232,7 +360,7 @@ class TestProfilerCallback(unittest.TestCase):
         config = ProfilingConfig(enable=True, rank_ids=[])
 
         with patch("hyper_parallel.trainer.callbacks.profiler_callback.get_device_type", return_value="cpu"):
-            callback = ProfilerCallback(self._trainer(config, rank=5, world_size=8))
+            callback = self._initialized_callback(self._trainer(config, rank=5, world_size=8))
 
         self.assertIs(callback.profiler, fake_profiler)
         profile_mock.assert_called_once()
@@ -247,7 +375,7 @@ class TestProfilerCallback(unittest.TestCase):
         config = ProfilingConfig(enable=True, rank_ids=[8])
 
         with self.assertRaisesRegex(ValueError, r"\[0, 8\)"):
-            ProfilerCallback(self._trainer(config, world_size=8))
+            self._initialized_callback(self._trainer(config, world_size=8))
 
     def test_cuda_backend_collects_cpu_and_cuda_activities(self) -> None:
         """Collect CPU and CUDA activities for a CUDA backend.
@@ -261,7 +389,7 @@ class TestProfilerCallback(unittest.TestCase):
         config = ProfilingConfig(enable=True)
 
         with patch("hyper_parallel.trainer.callbacks.profiler_callback.get_device_type", return_value="cuda"):
-            ProfilerCallback(self._trainer(config))
+            self._initialized_callback(self._trainer(config))
 
         self.assertEqual(
             profile_mock.call_args.kwargs["activities"],
@@ -279,7 +407,7 @@ class TestProfilerCallback(unittest.TestCase):
         config = ProfilingConfig(enable=True, start_step=9, stop_step=2)
 
         with patch("hyper_parallel.trainer.callbacks.profiler_callback.get_device_type", return_value="cpu"):
-            callback = ProfilerCallback(self._trainer(config))
+            callback = self._initialized_callback(self._trainer(config))
 
         self.assertEqual((callback.start_step, callback.stop_step), (1, 10))
         schedule_mock.assert_called_once_with(wait=0, warmup=0, active=10, repeat=1, skip_first=1)
@@ -314,7 +442,7 @@ class TestProfilerCallback(unittest.TestCase):
             patch.dict("sys.modules", {"torch_npu": fake_module}),
             patch("hyper_parallel.trainer.callbacks.profiler_callback.get_device_type", return_value="npu"),
         ):
-            callback = ProfilerCallback(self._trainer(config, world_size=16, pipeline_stages=2))
+            callback = self._initialized_callback(self._trainer(config, world_size=16, pipeline_stages=2))
             fake_profiler.add_metadata_json.assert_not_called()
             state = TrainerState()
             callback.on_step_begin(state)
@@ -359,7 +487,7 @@ class TestProfilerCallback(unittest.TestCase):
         fake_profiler = MagicMock()
         self._cpu_profiler_patches(fake_profiler)
         with patch("hyper_parallel.trainer.callbacks.profiler_callback.get_device_type", return_value="cpu"):
-            callback = ProfilerCallback(self._trainer(ProfilingConfig(enable=True, stop_step=3)))
+            callback = self._initialized_callback(self._trainer(ProfilingConfig(enable=True, stop_step=3)))
         callback.on_step_begin(TrainerState())
         callback.on_step_end(TrainerState(global_step=1))
         callback.on_train_end(TrainerState(global_step=1))
@@ -385,7 +513,7 @@ class TestProfilerCallback(unittest.TestCase):
                     with patch(
                         "hyper_parallel.trainer.callbacks.profiler_callback.get_device_type", return_value="cpu",
                     ):
-                        callback = ProfilerCallback(self._trainer(config))
+                        callback = self._initialized_callback(self._trainer(config))
                     callback.on_train_begin(TrainerState())
                     for step in range(1, 6):
                         state = TrainerState(global_step=step - 1)
@@ -402,6 +530,42 @@ class TestProfilerCallback(unittest.TestCase):
                               if event["name"].startswith("training-step-")}
                     self.assertEqual(labels, {f"training-step-{step}" for step in range(start_step, 5)})
 
+    def test_real_cpu_trace_restarts_at_the_remaining_recovery_window(self) -> None:
+        """Feature: Recovery emits a new trace segment without replaying finished steps.
+
+        Description: Interrupt step three, restore two completed profiling steps, then run three through five.
+        Expectation: A new trace contains recovered steps three and four, excluding step five.
+        """
+        with tempfile.TemporaryDirectory() as output:
+            config = ProfilingConfig(enable=True, start_step=2, stop_step=4, output_path=output, memory=False)
+            with patch("hyper_parallel.trainer.callbacks.profiler_callback.get_device_type", return_value="cpu"):
+                callback = self._initialized_callback(self._trainer(config))
+                for step in (1, 2):
+                    callback.on_step_begin(TrainerState(global_step=step - 1))
+                    with torch.profiler.record_function(f"original-step-{step}"):
+                        torch.ones(2).sum()
+                    callback.on_step_end(TrainerState(global_step=step))
+                saved = callback.state_dict()
+                callback.on_step_begin(TrainerState(global_step=2))
+                with torch.profiler.record_function("failed-step-3"):
+                    torch.ones(2).sum()
+                callback.close()
+                callback.load_state_dict(saved)
+                callback.on_train_begin(TrainerState(global_step=2))
+                for step in (3, 4, 5):
+                    callback.on_step_begin(TrainerState(global_step=step - 1))
+                    with torch.profiler.record_function(f"recovered-step-{step}"):
+                        torch.ones(2).sum()
+                    callback.on_step_end(TrainerState(global_step=step))
+                callback.close()
+            traces = list(Path(output).rglob("*.pt.trace.json"))
+            self.assertGreaterEqual(len(traces), 2)
+            recovered = set()
+            for trace in traces:
+                events = json.loads(trace.read_text(encoding="utf-8"))["traceEvents"]
+                recovered.update(event["name"] for event in events if event["name"].startswith("recovered-step-"))
+            self.assertEqual(recovered, {"recovered-step-3", "recovered-step-4"})
+
     def test_invalid_warmup_fails_before_backend_access(self) -> None:
         """Reject invalid warmup types and steps outside the preceding window.
 
@@ -414,10 +578,10 @@ class TestProfilerCallback(unittest.TestCase):
                 config = ProfilingConfig(enable=True, start_step=3, warmup_steps=warmup_steps)
                 with patch("hyper_parallel.trainer.callbacks.profiler_callback.get_device_type") as device_mock:
                     with self.assertRaisesRegex(error, "profiler.warmup_steps"):
-                        ProfilerCallback(self._trainer(config))
+                        self._initialized_callback(self._trainer(config))
                     device_mock.assert_not_called()
         with self.assertRaisesRegex(ValueError, "profiler.warmup_steps"):
-            ProfilerCallback(self._trainer(ProfilingConfig(enable=True, warmup_steps=1)))
+            self._initialized_callback(self._trainer(ProfilingConfig(enable=True, warmup_steps=1)))
 
 
 class TestProfilingConfig(unittest.TestCase):

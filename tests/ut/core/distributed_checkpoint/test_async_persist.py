@@ -15,15 +15,15 @@
 """UT for :mod:`hyper_parallel.core.distributed_checkpoint.async_persist`."""
 # pylint: disable=wrong-import-position
 import importlib
-import os
 import queue
+import threading
 import tempfile
 import traceback
 import unittest
 from concurrent.futures import Future
 from pathlib import Path
 from typing import Any, Optional
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -311,7 +311,12 @@ class TestResolveAsyncPersistResult(unittest.TestCase):
         proc = _FinishedProc()
         calls = []
 
-        staging_mod.resolve_async_persist_result(proc, result_queue, future, lambda: calls.append(1))
+        staging_mod.resolve_async_persist_result(
+            proc,
+            result_queue,
+            staging_mod.AsyncSaveResponse(future),
+            lambda: calls.append(1),
+        )
 
         self.assertIs(future.result(timeout=0), metadata)
         self.assertEqual(calls, [1])
@@ -328,7 +333,12 @@ class TestResolveAsyncPersistResult(unittest.TestCase):
         result_queue.put((staging_mod.AsyncPersistStatus.FAILURE, "OSError: No space left on device"))
         future: Future = Future()
 
-        staging_mod.resolve_async_persist_result(_FinishedProc(1), result_queue, future, lambda: None)
+        staging_mod.resolve_async_persist_result(
+            _FinishedProc(1),
+            result_queue,
+            staging_mod.AsyncSaveResponse(future),
+            lambda: None,
+        )
 
         with self.assertRaises(RuntimeError) as ctx:
             future.result(timeout=0)
@@ -342,7 +352,12 @@ class TestResolveAsyncPersistResult(unittest.TestCase):
         """
         future: Future = Future()
 
-        staging_mod.resolve_async_persist_result(_FinishedProc(-9), queue.Queue(), future, lambda: None)
+        staging_mod.resolve_async_persist_result(
+            _FinishedProc(-9),
+            queue.Queue(),
+            staging_mod.AsyncSaveResponse(future),
+            lambda: None,
+        )
 
         with self.assertRaises(RuntimeError) as ctx:
             future.result(timeout=0)
@@ -363,7 +378,12 @@ class TestResolveAsyncPersistResult(unittest.TestCase):
             """Stand in for a user callback that fails after a successful persist."""
             raise ValueError("callback exploded")
 
-        staging_mod.resolve_async_persist_result(_FinishedProc(), result_queue, future, boom)
+        staging_mod.resolve_async_persist_result(
+            _FinishedProc(),
+            result_queue,
+            staging_mod.AsyncSaveResponse(future),
+            boom,
+        )
 
         # Caught by hand rather than with assertRaises, which strips the traceback
         # off the exception it stores to break reference cycles.
@@ -390,7 +410,12 @@ class TestResolveAsyncPersistResult(unittest.TestCase):
         result_queue.put(("not_a_status", None))
         future: Future = Future()
 
-        staging_mod.resolve_async_persist_result(_FinishedProc(), result_queue, future, lambda: None)
+        staging_mod.resolve_async_persist_result(
+            _FinishedProc(),
+            result_queue,
+            staging_mod.AsyncSaveResponse(future),
+            lambda: None,
+        )
 
         with self.assertRaises(RuntimeError) as ctx:
             future.result(timeout=0)
@@ -516,7 +541,12 @@ class TestWaitsForTheChildProcess(unittest.TestCase):
                 """Joining a finished child is a no-op here."""
 
         future: Future = Future()
-        staging_mod.resolve_async_persist_result(_LiveThenDoneProc(), _SlowQueue(), future, lambda: None)
+        staging_mod.resolve_async_persist_result(
+            _LiveThenDoneProc(),
+            _SlowQueue(),
+            staging_mod.AsyncSaveResponse(future),
+            lambda: None,
+        )
 
         self.assertIs(future.result(timeout=0), metadata)
         self.assertTrue(all(t is not None and t > 0 for t in timeouts), f"expected timeouts, got {timeouts}")
@@ -544,6 +574,162 @@ class TestWaitsForTheChildProcess(unittest.TestCase):
         self.assertEqual(results, ["plan"])
         self.assertEqual(reads, [0, 0])
         self.assertEqual(sleeps, [])
+
+
+class TestAsyncRecoveryCancellation(unittest.TestCase):
+    """Cancellation must fence both checkpoint publication and plan-cache updates."""
+
+    def setUp(self) -> None:
+        staging_mod.StandardSavePlanner.cached_save_result.clear()
+
+    def tearDown(self) -> None:
+        staging_mod.StandardSavePlanner.cached_save_result.clear()
+
+    def test_cancelled_result_cannot_publish_or_restore_old_plans(self) -> None:
+        """Feature: Recovery cancellation. Description: A queued success arrives after
+        cancellation. Expectation: Neither latest nor the old cache is published.
+        """
+        future = Future()
+        response = staging_mod.AsyncSaveResponse(future)
+        response.abort()
+        result_queue = queue.Queue()
+        result_queue.put((staging_mod.AsyncPersistStatus.SUCCESS, (None, {"old": "plan"})))
+        publish = MagicMock()
+        staging_mod.resolve_async_persist_result(
+            _FinishedProc(),
+            result_queue,
+            response,
+            publish,
+        )
+        publish.assert_not_called()
+        self.assertTrue(future.cancelled())
+        self.assertEqual(staging_mod.StandardSavePlanner.cached_save_result, {})
+
+    def test_abort_reaps_process_and_result_thread(self) -> None:
+        """Feature: Resource cleanup. Description: Cancel a blocked save with a result
+        thread. Expectation: Terminate and join before returning, then close IPC.
+        """
+        proc = MagicMock()
+        proc.is_alive.return_value = True
+        proc.terminate.side_effect = lambda: setattr(proc.is_alive, "return_value", False)
+        proc.exitcode = -15
+        result_queue = queue.Queue()
+        response = staging_mod.AsyncSaveResponse(Future(), process=proc)
+        response.join_thread = threading.Thread(
+            target=staging_mod.resolve_async_persist_result,
+            args=(proc, result_queue, response, MagicMock()),
+        )
+        response.join_thread.start()
+        response.abort()
+        self.assertTrue(response.persist_completion.cancelled())
+        self.assertFalse(response.join_thread.is_alive())
+        proc.terminate.assert_called_once()
+        proc.kill.assert_not_called()
+
+    def test_publication_already_in_progress_finishes_before_abort_returns(self) -> None:
+        """Feature: Atomic finalization. Description: Cancel while latest is being
+        published. Expectation: Finalization wins completely before cancellation returns.
+        """
+        entered = threading.Event()
+        release = threading.Event()
+        cancelled = threading.Event()
+        future = Future()
+        response = staging_mod.AsyncSaveResponse(future)
+        result_queue = queue.Queue()
+        result_queue.put((staging_mod.AsyncPersistStatus.SUCCESS, (None, {"finished": "plan"})))
+
+        def publish():
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test did not release publication")
+
+        def abort():
+            response.abort()
+            cancelled.set()
+
+        resolver = threading.Thread(
+            target=staging_mod.resolve_async_persist_result,
+            args=(_FinishedProc(), result_queue, response, publish),
+        )
+        resolver.start()
+        self.assertTrue(entered.wait(5))
+        canceller = threading.Thread(target=abort)
+        canceller.start()
+        try:
+            self.assertFalse(cancelled.wait(0.05))
+        finally:
+            release.set()
+            resolver.join(5)
+            canceller.join(5)
+        self.assertTrue(cancelled.is_set())
+        self.assertFalse(future.cancelled())
+        self.assertEqual(staging_mod.StandardSavePlanner.cached_save_result, {"finished": "plan"})
+
+    def test_abort_fails_if_publication_cannot_be_fenced(self) -> None:
+        """Feature: Bounded cancellation. Description: Publication never releases its
+        lock. Expectation: Recovery fails explicitly instead of claiming cleanup succeeded.
+        """
+        response = staging_mod.AsyncSaveResponse(Future())
+        response._finalize_lock.acquire()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "publication did not finish"):
+                response.abort(timeout=0.01)
+            self.assertFalse(response.persist_completion.cancelled())
+        finally:
+            response._finalize_lock.release()
+
+    def test_parent_monitor_exits_without_running_child_finalizers(self) -> None:
+        """Feature: Orphan cleanup. Description: Signal the training parent's death.
+        Expectation: The persist child exits even if checkpoint peers never respond.
+        """
+        parent = MagicMock(sentinel=123)
+        with patch.object(staging_mod.mp, "parent_process", return_value=parent), \
+                patch.object(staging_mod.threading, "Thread") as thread, \
+                patch.object(staging_mod, "wait") as wait_for_parent, \
+                patch.object(staging_mod.os, "_exit") as exit_child:
+            staging_mod._start_parent_monitor()
+            self.assertTrue(thread.call_args.kwargs["daemon"])
+            thread.call_args.kwargs["target"]()
+        wait_for_parent.assert_called_once_with([123])
+        exit_child.assert_called_once_with(1)
+
+
+class TestCompletedAsyncSaveFiles(unittest.TestCase):
+    """Completed saves must not sweep shared coordination files again."""
+
+    def test_success_does_not_sweep_exchange_files_again(self) -> None:
+        """Feature: Completed save overhead. Description: Return from persistence
+        with exchange files still present. Expectation: No additional deletion;
+        STORAGE_DATA deletion remains the reader's responsibility.
+        """
+        for rank, storage_comm in ((0, True), (1, True), (0, False)):
+            with self.subTest(rank=rank, storage_comm=storage_comm), tempfile.TemporaryDirectory() as directory:
+                files = [Path(directory) / f"{kind.name}_{owner}.pkl"
+                         for owner in range(2) for kind in staging_mod.FileType]
+                payload = Path(directory) / "__0.distcp"
+                metadata = Path(directory) / ".metadata"
+                for filename in files + [payload, metadata]:
+                    filename.write_text("keep until finished", encoding="utf-8")
+
+                def persist(*args, context=(files,), **kwargs):
+                    files, = context
+                    del args, kwargs
+                    self.assertTrue(all(filename.exists() for filename in files))
+                    return "metadata"
+
+                result_queue = queue.Queue()
+                writer = MagicMock(checkpoint_dir=directory)
+                with patch("hyper_parallel.core.distributed_checkpoint.api._save_impl", side_effect=persist), \
+                        patch.object(staging_mod, "_start_parent_monitor"), \
+                        patch.object(staging_mod.dist, "get_rank", return_value=rank), \
+                        patch.object(staging_mod.dist, "get_world_size", return_value=2):
+                    # Exercise the writer-provided directory fallback as well.
+                    staging_mod.execute_async_persist(result_queue, {}, None, writer, None, False, True, storage_comm)
+                status, _ = result_queue.get_nowait()
+                self.assertEqual(status, staging_mod.AsyncPersistStatus.SUCCESS)
+                self.assertTrue(all(filename.exists() for filename in files))
+                self.assertTrue(payload.exists())
+                self.assertTrue(metadata.exists())
 
 
 if __name__ == "__main__":
