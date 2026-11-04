@@ -199,6 +199,11 @@ class Xing4ForCausalLM(Xing4_0ForCausalLM):
             raise ValueError("Xing4 MTP uses the same mHC decoder as the backbone")
         if config.attention_dropout:
             raise ValueError("Xing4 training requires attention_dropout=0")
+        compute_dtype = getattr(config, "compute_dtype", None)
+        self.embedding_compute_dtype = (getattr(torch, compute_dtype, compute_dtype)
+                                        if isinstance(compute_dtype, str) else compute_dtype)
+        if self.embedding_compute_dtype not in (None, torch.float16, torch.bfloat16, torch.float32):
+            raise ValueError(f"Unsupported Xing4 compute_dtype: {compute_dtype!r}")
         self.model = Xing4Model(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.mtp = build_mtp(config.num_nextn_predict_layers, layer_factory=lambda depth: MTPLayer(
@@ -229,8 +234,8 @@ class Xing4ForCausalLM(Xing4_0ForCausalLM):
             raise ValueError("Xing4 requires nonempty [batch, sequence] input_ids with matching shift_labels")
         if position_ids is None:
             position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
-        hidden = self.model(inputs_embeds=self.model.embed_tokens(input_ids).to(torch.bfloat16),
-                            position_ids=position_ids, use_cache=False).last_hidden_state
+        embeddings = self.model.embed_tokens(input_ids).to(dtype=self.embedding_compute_dtype)
+        hidden = self.model(inputs_embeds=embeddings, position_ids=position_ids, use_cache=False).last_hidden_state
         targets = shift_labels.masked_fill(shift_labels < 0, IGNORE_INDEX)
         losses = {"foundation_loss": self._cross_entropy(hidden, targets)}
         if self.mtp is not None:
@@ -250,7 +255,7 @@ class Xing4ForCausalLM(Xing4_0ForCausalLM):
         for layer in self.mtp.layers:
             input_ids = self.model.shift_tokens(input_ids, 0)
             targets = self.model.shift_tokens(targets, IGNORE_INDEX)
-            embeddings = self.model.embed_tokens(input_ids).to(torch.bfloat16)
+            embeddings = self.model.embed_tokens(input_ids).to(dtype=self.embedding_compute_dtype)
             attention_mask = create_causal_mask(
                 config=self.config, inputs_embeds=embeddings, attention_mask=None,
                 past_key_values=None, position_ids=position_ids)

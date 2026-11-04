@@ -154,7 +154,7 @@ def mla_all_gather(tensor: torch.Tensor, sequence_dim: int, cp_mesh: Any) -> tor
     return differentiable_all_gather_concat(tensor, cp_mesh.get_group(), cp_mesh.size(), sequence_dim)
 
 
-def _apply_mla_rope(
+def apply_mla_rope(
     tensor: torch.Tensor,
     position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
     *,
@@ -184,6 +184,10 @@ def _apply_mla_rope(
         rotated = rotated.permute(1, 2, 0, 3)
         return rotated.unflatten(-1, (-1, 2)).transpose(-1, -2).flatten(-2).transpose(1, 2)
     return rotated.transpose(0, 1)
+
+
+# Retain the original callback name for existing CP plans.
+_apply_mla_rope = apply_mla_rope
 
 
 def _validate_query_partition(causal, attention_mask):

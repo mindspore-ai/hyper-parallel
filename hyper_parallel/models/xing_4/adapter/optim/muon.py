@@ -28,7 +28,7 @@ from torch import nn
 
 from hyper_parallel.components.optim.builders import Muon
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
-from hyper_parallel.core.dtensor.placement_types import Shard
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.models.xing_4.adapter.optim.muon_layout import Xing4MuonLayout
 
 __all__ = ["build_optimizer", "clip_qk"]
@@ -108,7 +108,7 @@ def _with_logical_layout(options: dict[str, Any], model: nn.Module) -> dict[str,
     names = [name for name, _ in model.named_parameters()]
     linear_qkv = sum(1 for name in names if name.endswith(".self_attn.linear_qkv.weight"))
     q_b_proj = sum(1 for name in names if name.endswith(".self_attn.q_b_proj.weight"))
-    if linear_qkv != q_b_proj:
+    if not linear_qkv or linear_qkv != q_b_proj:
         raise ValueError("mindformers_pynative requires the fused linear_qkv attention "
                          f"(found {linear_qkv} linear_qkv.weight vs {q_b_proj} q_b_proj.weight)")
     layout = Xing4MuonLayout.from_config(model.config)
@@ -195,7 +195,10 @@ def _scale_head_rows(weight: torch.Tensor, scale: torch.Tensor, nope_dim: int, t
     tensor = getattr(weight, "main_param", None)
     tensor = weight if tensor is None else tensor
     if isinstance(tensor, DTensor):
-        local = distribute_tensor(factors.to(tensor.dtype), tensor.device_mesh, tensor.placements).to_local()
+        # A row factor is shared across every column shard of the projection.
+        placements = tuple(Replicate() if isinstance(p, Shard) and p.dim % tensor.ndim == 1 else p
+                           for p in tensor.placements)
+        local = distribute_tensor(factors.to(tensor.dtype), tensor.device_mesh, placements).to_local()
         tensor.to_local().mul_(local)
     else:
         tensor.mul_(factors.to(tensor.dtype))

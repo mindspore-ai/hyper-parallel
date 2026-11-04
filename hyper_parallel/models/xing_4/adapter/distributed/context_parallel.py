@@ -24,6 +24,7 @@ from torch import nn
 
 from hyper_parallel.core.utils.communication import differentiable_all_reduce, gather_counts_via_all_gather
 from hyper_parallel.distributed._builder.forward_rewriter import _ForwardRewriteRequest
+from hyper_parallel.distributed.context_parallel.mla_context_parallel import apply_mla_rope
 from hyper_parallel.distributed.recipe_spec import inner_wrapper
 from hyper_parallel.models.deepseek_v3.adapter.distributed.context_parallel import mla_cp_wrapper
 from hyper_parallel.models.replacement import method_replacement
@@ -31,7 +32,6 @@ from hyper_parallel.models.xing_4.adapter.conversion.module_replacement import (
     Xing4MLAAttention, fusion_attention_with_logit_maxima,
 )
 from hyper_parallel.models.xing_4.adapter.moe import Xing4MoE
-from hyper_parallel.models.xing_4.transformer.modeling_xing4_0 import apply_rotary_pos_emb_interleave
 
 
 def _rotary(tensor: torch.Tensor, positions: tuple[torch.Tensor, torch.Tensor] | None,
@@ -39,9 +39,7 @@ def _rotary(tensor: torch.Tensor, positions: tuple[torch.Tensor, torch.Tensor] |
     """Preserve official FP32 interleaved RoPE for the runtime's BSND tensors."""
     if positions is None or not interleaved:
         raise ValueError("Xing4 CP requires interleaved RoPE and local position embeddings")
-    cos, sin = positions
-    rotated, _ = apply_rotary_pos_emb_interleave(tensor.float(), tensor.float(), cos, sin, unsqueeze_dim=2)
-    return rotated.to(tensor.dtype)
+    return apply_mla_rope(tensor.float(), positions, interleaved=True).to(tensor.dtype)
 
 
 @inner_wrapper
@@ -140,8 +138,7 @@ def xing4_cp_mean_loss(*, module: nn.Module, method_fqn: str,
     @wraps(original_method)
     def mean_loss(loss_sum: torch.Tensor, count: torch.Tensor) -> torch.Tensor:
         global_count = count.clone()
-        work = dist.all_reduce(global_count, group=group, async_op=True)
-        work.wait()
+        dist.all_reduce(global_count, group=group)
         return differentiable_all_reduce(loss_sum, "sum", group) / global_count.clamp_min(1)
 
     return mean_loss

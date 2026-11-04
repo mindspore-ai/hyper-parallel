@@ -68,7 +68,6 @@ def create_config(config: dict[str, Any]) -> Xing4_0Config:
         result.attention_softmax_scale = None
     if not getattr(result, "use_fused_mhc", True):
         raise ValueError("The Xing4 training adapter uses fused mHC on NPU")
-    result.use_fused_mhc = True
     if result.use_cache:
         raise ValueError("The training recipe must explicitly disable the KV cache")
     return result

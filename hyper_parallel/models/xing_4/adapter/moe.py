@@ -19,7 +19,6 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from hyper_parallel.components.functional.activation_swiglu import swiglu_from_projections
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
 from hyper_parallel.core.activation_memory.recompute_state import is_recomputing
 from hyper_parallel.core.utils.communication import differentiable_all_reduce
@@ -52,7 +51,7 @@ class Xing4Router(Xing4_0TopkRouter):
         logits, weights, indices = super().forward(flat)
         scores = logits.sigmoid()
         weights = self._attach_balance_loss(weights, scores, batch_size=hidden_states.shape[0])
-        if not is_recomputing():
+        if self.training and not is_recomputing():
             counts = torch.zeros_like(scores[0]).scatter_add_(
                 0, indices.reshape(-1), torch.ones_like(indices.reshape(-1), dtype=scores.dtype))
             self._token_counts.add_(counts)
@@ -111,14 +110,19 @@ class Xing4MLP(Xing4_0MLP):
         self.hidden_size = source.hidden_size
         self.intermediate_size = source.intermediate_size
         self.gate_proj, self.up_proj, self.down_proj = source.gate_proj, source.up_proj, source.down_proj
+        # Only the optional clipped/compute-dtype policy needs the extended SwiGLU API.
+        from hyper_parallel.components.functional.activation_swiglu import (  # pylint: disable=import-outside-toplevel
+            swiglu_from_projections,
+        )
         self.act_fn = source.act_fn
+        self._swiglu = swiglu_from_projections
         self.limit = getattr(self.config, "swiglu_limit", None)
         dtype_name = getattr(self.config, "swiglu_compute_dtype", None)
         self.activation_compute_dtype = getattr(torch, dtype_name) if dtype_name is not None else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the configured shared SwiGLU policy to the HF projections."""
-        activation = swiglu_from_projections(
+        activation = self._swiglu(
             self.gate_proj(x), self.up_proj(x), clamp_limit=self.limit,
             compute_dtype=self.activation_compute_dtype,
             use_fused=bool(getattr(self.config, "use_fused_swiglu", True)))

@@ -32,14 +32,15 @@ from typing import Any
 import torch
 from torch import nn
 from transformers.activations import ACT2FN
-from transformers.core_model_loading import Concatenate
 
-from hyper_parallel.components.checkpoint.weight_conversion import MergeModulelist, Transpose, WeightConverter
+from hyper_parallel.components.checkpoint import weight_conversion
+from hyper_parallel.components.checkpoint.conversion_ops import ConcatenateWithSections
+from hyper_parallel.components.checkpoint.weight_conversion import Transpose, WeightConverter
 from hyper_parallel.components.functional.mhc_pre import mhc_pre
-from hyper_parallel.models.xing_4.adapter.training import Xing4HyperConnection
 from hyper_parallel.components.modules.grouped_experts import GroupedExperts
 from hyper_parallel.components.modules.mla_attention import MLAAttention
 from hyper_parallel.models.replacement import module_replacement as register_module_replacement
+from hyper_parallel.models.xing_4.adapter.training import Xing4HyperConnection
 from hyper_parallel.models.xing_4.transformer.modeling_xing4_0 import apply_rotary_pos_emb_interleave
 
 __all__ = ["Xing4MLAAttention", "Xing4GroupedExperts", "Xing4FusedHyperConnection"]
@@ -295,7 +296,6 @@ class Xing4GroupedExperts(GroupedExperts):
         carrier.has_gate = True
         carrier.is_concatenated = True
         carrier.is_transposed = True
-        carrier.router_gating_in_fp32 = getattr(module, "router_gating_in_fp32", True)
         carrier.limit = getattr(module[0], "limit", None)
         carrier.activation_compute_dtype = getattr(module[0], "activation_compute_dtype", None)
         carrier.gate_up_proj = packed_gate
@@ -309,18 +309,25 @@ class Xing4GroupedExperts(GroupedExperts):
 
     def make_transforms(self) -> list[WeightConverter]:
         """Return reversible mappings for every original expert projection."""
-        if MergeModulelist is None:
-            raise ImportError("Transformers MergeModulelist is required for expert conversion")
+        # Prefer HP's dimension-preserving reverse operation when available.
+        merge_experts = getattr(weight_conversion, "MergeModulelist", None)
+        if merge_experts is None:
+            from transformers.core_model_loading import MergeModulelist  # pylint: disable=import-outside-toplevel
+
+            if 1 in (self.hidden_size, self.intermediate_size):
+                raise ValueError("Singleton expert dimensions require the dimension-preserving MergeModulelist")
+            merge_experts = MergeModulelist
+        pack = ConcatenateWithSections((self.intermediate_size, self.intermediate_size), dim=1)
         return [
             WeightConverter(
                 source_patterns=[r"*.gate_proj.weight", r"*.up_proj.weight"],
                 target_patterns="gate_up_proj",
-                operations=[MergeModulelist(dim=0), Concatenate(dim=1), Transpose(-2, -1)],
+                operations=[merge_experts(dim=0), pack, Transpose(-2, -1)],
             ),
             WeightConverter(
                 source_patterns=r"*.down_proj.weight",
                 target_patterns="down_proj",
-                operations=[MergeModulelist(dim=0), Transpose(-2, -1)],
+                operations=[merge_experts(dim=0), Transpose(-2, -1)],
             ),
         ]
 
