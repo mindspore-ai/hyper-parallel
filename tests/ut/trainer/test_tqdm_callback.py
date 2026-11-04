@@ -21,6 +21,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+from tqdm import tqdm
+
 from hyper_parallel.trainer.callbacks import TqdmCallback
 from hyper_parallel.trainer.state import TrainerState
 from tests.common.mark_utils import arg_mark
@@ -90,6 +92,48 @@ class TestTqdmCallback(unittest.TestCase):
         self.assertIn("Training: 1/5", output, f"progress position missing from output, got={output!r}")
         self.assertIn("loss=2.5", output, f"progress metrics missing from output, got={output!r}")
         self.assertIn("step=1 epoch=0", output, f"structured log message missing from output, got={output!r}")
+
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="essential",
+    )
+    def test_actual_step_time_is_first_without_default_rate(self) -> None:
+        """Show the measured step time first in both progress output modes.
+
+        Feature: Trainer step-time display.
+        Description: Render a completed step with real tqdm on TTY and redirected streams.
+        Expectation: Actual step time is the first metric and the default rate is absent.
+        """
+        for interactive in (False, True):
+            with self.subTest(interactive=interactive):
+                stream = StringIO()
+                trainer = self._build_trainer()
+                trainer.step_env_metrics["performance/step_time"] = 1.234
+                callback = TqdmCallback(trainer)
+                state = TrainerState(global_step=0, epoch=0)
+
+                with patch.object(sys, "stderr", stream), patch.object(
+                    stream, "isatty", return_value=interactive,
+                ), patch.dict(sys.modules, {"tqdm": SimpleNamespace(tqdm=tqdm)}):
+                    callback.on_train_begin(state)
+                    state.global_step = 1
+                    callback.on_step_end(state)
+                    callback.on_train_end(state)
+
+                output = stream.getvalue()
+                self.assertIn("1/5", output, f"completed step missing, output={output!r}")
+                self.assertIn(
+                    ", step_time=1.234s, loss=2.5, tokens/s=128.125",
+                    output,
+                    f"actual step time must be the first metric, output={output!r}",
+                )
+                for rate_unit in ("s/step", "step/s"):
+                    self.assertNotIn(rate_unit, output, f"default {rate_unit} rate must be absent, output={output!r}")
+                if not interactive:
+                    self.assertEqual(output.count("\n"), 1, f"expected one progress line, output={output!r}")
+                    self.assertEqual(output.count("step_time="), 1, f"expected one step time, output={output!r}")
 
 
 if __name__ == "__main__":

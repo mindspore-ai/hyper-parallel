@@ -25,6 +25,7 @@ from .base import Callback, TrainerState
 
 
 logger = logging.getLogger(__name__)
+_BAR_FORMAT = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}{postfix}]"
 
 
 class _LogProgressBar:
@@ -76,6 +77,7 @@ class _LogProgressBar:
             unit="step",
             rate=rate,
             postfix=postfix or None,
+            bar_format=_BAR_FORMAT,
         )
         if self._pending_message:
             progress_line = f"{progress_line} | {self._pending_message}"
@@ -170,6 +172,7 @@ class TqdmCallback(Callback):
             unit="step",
             dynamic_ncols=True,
             file=stream,
+            bar_format=_BAR_FORMAT,
         )
 
     def _postfix(self) -> dict[str, str]:
@@ -192,6 +195,8 @@ class TqdmCallback(Callback):
         for name, label in self._ENV_METRICS:
             if name in env_metrics:
                 postfix[label] = self._format_metric(name, env_metrics[name])
+        if "step_time" in postfix:
+            postfix = {"step_time": postfix.pop("step_time"), **postfix}
         return postfix
 
     def on_train_begin(self, state: TrainerState, **kwargs: Any) -> None:
