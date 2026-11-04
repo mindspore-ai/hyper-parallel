@@ -701,7 +701,7 @@ def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
     get_batch_node = target_node.pop("get_batch", None)
     sampler_type = normalize_value(
         target_node.pop("sampler_type", "single"),
-        Literal["single", "cyclic"],
+        Literal["single", "cyclic", "distributed"],
         path=f"{path}.sampler_type",
     )
     data_rearrange_map = target_node.pop("data_rearrange_map", None)
@@ -714,6 +714,11 @@ def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
         target_node.pop("use_background_prefetcher", False),
         bool,
         path=f"{path}.use_background_prefetcher",
+    )
+    shuffle = normalize_value(
+        target_node.pop("shuffle", True),
+        bool,
+        path=f"{path}.shuffle",
     )
     target = _resolve_target(target_node, path=path)
     collate_fn = (
@@ -734,6 +739,7 @@ def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
         data_rearrange_map=data_rearrange_map,
         data_sharding=data_sharding,
         use_background_prefetcher=use_background_prefetcher,
+        shuffle=shuffle,
     )
 
 
