@@ -121,7 +121,7 @@ def device_plan_metrics(
 
     Example:
         第三个四卡例的部分填充返回 [0,6,3,3,6,0]；单home返回
-        [1,12,2,4,6,0]。两者都没有 M 最优证书，应进入严格求解。
+        [1,12,2,4,6,0]。两者都没有 M 最优证书，可供离线比较迁移质量。
     """
     return device_plan_metrics_batch(allocation.unsqueeze(0), totals, capacity)[0]
 

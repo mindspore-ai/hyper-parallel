@@ -338,12 +338,8 @@ class TestDispatchCapacityCompaction(unittest.TestCase):
     _GLOBAL_EXPERTS = 4
 
     def setUp(self) -> None:
-        """Isolate the dispatch from the static-plan cache and the collective."""
-        # The plan cache keys on the routing shape, not on the capacity mask, so a cached
-        # plan would hide exactly the compaction these tests are about.
+        """Isolate the dispatch from the collective."""
         self._patchers = [
-            mock.patch.object(ep_experts, "get_static_plan", lambda key: None),
-            mock.patch.object(ep_experts, "store_static_plan", lambda *args, **kwargs: None),
             mock.patch.object(ep_experts.dist, "all_to_all_single", self._identity_exchange),
         ]
         for patcher in self._patchers:

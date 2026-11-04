@@ -175,7 +175,7 @@ class TestTransferDomainPool(unittest.TestCase):
         domain = self._domain()
         with patch.object(weights_module.torch, "empty", side_effect=AssertionError("hot allocation")):
             first, second = self._materialize(domain), self._materialize(domain)
-            self.assertFalse(domain.has_free_slot)
+            self.assertTrue(all(slot.in_use for slot in domain._pool.slots))
             self.assertNotEqual(first.remote[1, "gate"].data_ptr(), second.remote[1, "gate"].data_ptr())
             domain.release_lease(first)
             last_reader = self.streams.events[-1]
@@ -187,7 +187,7 @@ class TestTransferDomainPool(unittest.TestCase):
             self.assertEqual(third.generation, first.generation + 1)
             domain.release_lease(second)
             domain.release_lease(third)
-        self.assertTrue(domain.has_free_slot)
+        self.assertTrue(all(not slot.in_use for slot in domain._pool.slots))
         self.assertTrue(self.record.called)
         self.distributed.all_reduce.assert_not_called()
         self.assertEqual(self.work.wait.call_count, 3)
@@ -198,9 +198,9 @@ class TestTransferDomainPool(unittest.TestCase):
         first, second = self._materialize(domain, remote=False), self._materialize(domain, remote=False)
         self.assertEqual(first.remote, {})
         self.assertEqual(second.remote, {})
-        self.assertFalse(domain.has_free_slot)
+        self.assertTrue(all(slot.in_use for slot in domain._pool.slots))
         domain.release_lease(first)
-        self.assertTrue(domain.has_free_slot)
+        self.assertTrue(any(not slot.in_use for slot in domain._pool.slots))
         domain.release_lease(second)
         self.distributed.all_to_all_single.assert_not_called()
 

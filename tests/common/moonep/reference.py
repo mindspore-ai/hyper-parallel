@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Independent numerical oracle for active expert ranges and borrowed weights.
+"""Offline numerical oracle for active expert ranges and borrowed weights.
 
 This implementation intentionally materializes intermediate tensors. It is the
 comparison oracle for the native phases, not a claim of fused-kernel performance.

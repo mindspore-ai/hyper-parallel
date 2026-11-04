@@ -14,11 +14,12 @@
 # ============================================================================
 """CPU coverage of sparse MoonEP route conservation and inverse placement."""
 
+from dataclasses import astuple
 import unittest
 
 import torch
 
-from hyper_parallel.distributed.expert_parallel.moonep.fused.plan import compile_local_route, compile_sparse_route
+from hyper_parallel.distributed.expert_parallel.moonep.fused.plan import compile_local_route
 from tests.common.mark_utils import arg_mark
 
 
@@ -28,25 +29,28 @@ class TestSparsePlan(unittest.TestCase):
 
     def test_split_expert_offsets(self):
         """Splitting e0 preserves source order while packing only active experts."""
-        routes = compile_sparse_route(torch.tensor([[4, 3, 0, 0], [1, 0, 0, 0]]),
-                                      torch.tensor([[1, 4], [3, 0], [0, 0], [0, 0]]))
+        counts = torch.tensor([[4, 3, 0, 0], [1, 0, 0, 0]])
+        allocation = torch.tensor([[1, 4], [3, 0], [0, 0], [0, 0]])
+        routes = [compile_local_route(counts, allocation, rank) for rank in range(2)]
         self.assertEqual(routes[0].active_experts, (0, 1))
         self.assertEqual(routes[1].active_experts, (0,))
         self.assertEqual(routes[0].boundaries, (1, 4))
         self.assertEqual(routes[1].boundaries, (4,))
-        self.assertEqual(routes[0].packed_edges().tolist(),
-                         [[0, 0, 0, 0, 0, 1], [0, 1, 0, 1, 0, 3], [0, 0, 1, 4, 1, 3]])
-        self.assertEqual(routes[1].packed_edges().tolist(), [[1, 1, 0, 0, 3, 1]])
-        self.assertEqual([edge.rows for edge in routes[0].communication_blocks(2)], [2, 1])
+        self.assertEqual([astuple(edge) for edge in routes[0].outgoing],
+                         [(0, 0, 0, 0, 0, 1), (0, 1, 0, 1, 0, 3), (0, 0, 1, 4, 1, 3)])
+        self.assertEqual([astuple(edge) for edge in routes[1].outgoing], [(1, 1, 0, 0, 3, 1)])
+        self.assertEqual([block.rows for edge in routes[0].outgoing if edge.target != 0
+                          for block in edge.blocks(2)], [2, 1])
 
     def test_empty_routes_have_no_tasks(self):
         """Zero rows create neither artificial slots nor zero-length messages."""
-        routes = compile_sparse_route(torch.zeros(2, 4, dtype=torch.int64),
-                                      torch.zeros(4, 2, dtype=torch.int64))
+        counts = torch.zeros(2, 4, dtype=torch.int64)
+        allocation = torch.zeros(4, 2, dtype=torch.int64)
+        routes = [compile_local_route(counts, allocation, rank) for rank in range(2)]
         for route in routes:
             self.assertEqual(route.active_experts, ())
-            self.assertEqual(route.communication_blocks(128), ())
-            self.assertEqual(route.packed_edges().shape, (0, 6))
+            self.assertEqual(route.outgoing, ())
+            self.assertEqual(route.incoming, ())
 
     def test_random_routes_are_bijective(self):
         """An independent row-by-row oracle checks conservation and exact order."""
@@ -66,9 +70,7 @@ class TestSparsePlan(unittest.TestCase):
                         expected[dst].append(row)
                     for src in range(ranks):
                         source_rows[src].extend(row for row in rows if row[0] == src)
-                routes = compile_sparse_route(counts, allocation)
-                for rank, route in enumerate(routes):
-                    self.assertEqual(compile_local_route(counts, allocation, rank), route)
+                routes = [compile_local_route(counts, allocation, rank) for rank in range(ranks)]
                 actual = [[None] * route.received_rows for route in routes]
                 seen = [set() for _ in range(ranks)]
                 for route in routes:

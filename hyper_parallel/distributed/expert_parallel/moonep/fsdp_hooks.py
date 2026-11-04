@@ -49,7 +49,7 @@ class MoonEPAllGatherExtension:
         return sum(parameter.padded_sharded_param_size.numel()
                    for parameter in scheduler.hsdp_state.hsdp_params
                    if parameter.shard_world_size > 1 and parameter.hsdp_placement.dim == 0
-                   and parameter.all_gather_process_group is not None
+                   and parameter.mesh_info.shard_process_group is not None
                    and not parameter.offload_to_cpu and parameter.param_dtype is not None
                    and parameter.orig_dtype != parameter.param_dtype)
 
@@ -86,7 +86,7 @@ class MoonEPAllGatherExtension:
             return {}
         parameters = [parameter for parameter in state.hsdp_params
                       if parameter.shard_world_size > 1 and parameter.hsdp_placement.dim == 0
-                      and parameter.all_gather_process_group is not None
+                      and parameter.mesh_info.shard_process_group is not None
                       and not parameter.offload_to_cpu and parameter.param_dtype == slot.gate.dtype
                       and parameter.orig_dtype != parameter.param_dtype
                       and parameter.allgather_comm_ctx.allgather_handle is None]

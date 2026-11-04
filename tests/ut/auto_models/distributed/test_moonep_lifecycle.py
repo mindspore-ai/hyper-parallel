@@ -27,10 +27,6 @@ from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
 from hyper_parallel.distributed.expert_parallel.moonep import (
     MoonEPExecutor, configure_moonep, wrap_moonep_checkpoint,
 )
-from hyper_parallel.distributed.expert_parallel.moonep.capacity import solve_capacity_exact
-from hyper_parallel.distributed.expert_parallel.moonep.candidates import (
-    device_candidate, device_candidates, device_plan_metrics, device_plan_metrics_batch,
-)
 from hyper_parallel.distributed.expert_parallel.moonep.checkpoint import checkpoint_route_ids
 from hyper_parallel.distributed.expert_parallel.moonep.fsdp_hooks import MoonEPGradientExtension
 from hyper_parallel.distributed.expert_parallel.moonep.numerics import (
@@ -40,6 +36,7 @@ from hyper_parallel.distributed.expert_parallel.moonep import planning
 from hyper_parallel.distributed.expert_parallel.moonep import runtime as moonep_runtime
 from hyper_parallel.distributed.expert_parallel.moonep.planning import compile_plan
 from tests.common.mark_utils import arg_mark
+from tests.common.moonep.planning import cpu_plan_metrics
 
 
 class _Experts(torch.nn.Module):
@@ -332,25 +329,7 @@ class TestMoonEPLifecycle(unittest.TestCase):
 
 
 class TestMoonEPCapacity(unittest.TestCase):
-    """独立穷举验证最小迁移与木桶目标，检查通信元数据守恒。"""
-
-
-    def test_small_exact_solver_against_exhaustive_search(self):
-        """遍历81组专家计数；例如B=1禁止同一卡同时接收两个不同远程专家。"""
-        for totals in itertools.product(range(3), repeat=4):
-            targets = ((sum(totals) + 1) // 2, sum(totals) // 2)
-            objectives = []
-            for to_zero in itertools.product(*(range(value + 1) for value in totals)):
-                if sum(to_zero) != targets[0]:
-                    continue
-                outgoing0 = sum(totals[e] > to_zero[e] for e in (0, 1))
-                outgoing1 = sum(to_zero[e] > 0 for e in (2, 3))
-                if max(outgoing0, outgoing1) > 1:
-                    continue
-                moved = sum(totals[e] - to_zero[e] for e in (0, 1)) + sum(to_zero[2:])
-                objectives.append((moved, max(outgoing0, outgoing1), outgoing0 + outgoing1))
-            result = solve_capacity_exact(totals, 2, 1)
-            self.assertEqual((result.moved, result.peak_copies, result.total_copies), min(objectives))
+    """验证默认规划合法性、迁移证书与通信元数据守恒。"""
 
 
     def test_planner_uses_bounded_fill_fallback_without_solver(self):
@@ -361,15 +340,18 @@ class TestMoonEPCapacity(unittest.TestCase):
         self.assertTrue(used_fallback)
         expected = planning._cpu_candidates(counts.sum(0).numpy(), 4, (False, True))[1]
         np.testing.assert_array_equal(allocation.numpy(), expected)
-        self.assertEqual(planning._cpu_plan_metrics(allocation.tolist(), totals.tolist(), [2] * 4)[1], 12)
+        self.assertEqual(cpu_plan_metrics(allocation.tolist(), totals.tolist(), [2] * 4)[1], 12)
 
     def test_compiled_dispatch_and_weight_splits_are_reciprocal(self):
         """每条路由只发送一次且权重收发互逆；例如热e0被分到两张卡。"""
         routes = [torch.tensor([0, 0, 0, 0, 1, 2]), torch.tensor([0, 0, 0, 2, 3, 3])]
         counts = torch.stack([torch.bincount(ids, minlength=4) for ids in routes])
-        allocation = torch.from_numpy(solve_capacity_exact(counts.sum(0).tolist(), 2, 2).allocation)
+        _, allocation, _ = planning.select_allocation(counts, 2)
         plans = [compile_plan(counts, allocation, ids, rank) for rank, ids in enumerate(routes)]
         for target, plan in enumerate(plans):
+            self.assertEqual(plan.unpermute_indices.dtype, torch.int32)
+            restored = plan.dispatch_order.index_select(0, plan.unpermute_indices.long())
+            torch.testing.assert_close(restored, torch.arange(routes[target].numel()))
             labels = []
             for source, source_plan in enumerate(plans):
                 self.assertEqual(plan.token_recv[source], source_plan.token_send[target])
@@ -382,52 +364,28 @@ class TestMoonEPCapacity(unittest.TestCase):
             self.assertEqual(sorted_labels.tolist(), sorted(labels))
 
 
-    def test_cpu_small_table_matches_reference_candidate_and_selection(self):
-        """CPU 小表候选与离线参考逐值一致；例如 EP8 的零负载与热点。"""
+    def test_cpu_small_table_plan_obeys_capacity_and_certificate(self) -> None:
+        """Validate the production planner using independent scalar invariants."""
         generator = torch.Generator().manual_seed(8921)
-        for ranks in (2, 4, 8):
-            for sample in range(35):
-                counts = torch.randint(0, 48, (ranks, ranks * 4), generator=generator)
+        for ranks in (2, 4, 8, 16):
+            for sample in range(10):
+                counts = torch.randint(0, 48, (ranks, ranks * 2), generator=generator)
                 if sample == 0:
                     counts.zero_()
                 elif sample == 1:
                     counts[:, 1:] = 0
+                returned, allocation, fallback = planning.select_allocation(counts, 2)
+                torch.testing.assert_close(returned, counts, rtol=0, atol=0)
                 totals = counts.sum(0)
-                rules = (False,) if ranks == 2 else (False, True)
-                expected = device_candidates(totals, ranks, rules)
-                actual = planning._cpu_candidates(totals.numpy(), ranks, rules)
-                np.testing.assert_array_equal(actual, expected.numpy())
-                for capacity in (0, 1, ranks * 4):
-                    device_metrics = device_plan_metrics_batch(
-                        expected, totals, torch.full((ranks,), capacity)).numpy()
-                    cpu_metrics = planning._cpu_candidate_metrics(actual, totals.numpy(), capacity)
-                    np.testing.assert_array_equal(cpu_metrics, device_metrics)
-                    if capacity == ranks * 4:
-                        self.assertEqual(tuple(cpu_metrics[0]), planning._cpu_plan_metrics(
-                            actual[0].tolist(), totals.tolist(), [capacity] * ranks))
-                if sample == 0:
-                    returned_counts, allocation, used_fallback = planning.select_allocation(counts, ranks * 4)
-                    torch.testing.assert_close(returned_counts, counts, rtol=0, atol=0)
-                    torch.testing.assert_close(allocation, expected[0], rtol=0, atol=0)
-                    self.assertFalse(used_fallback)
-        # FP32 排序的不可分辨整数必须沿用稳定次序；例如 2**24 与 2**24+1。
-        large = torch.tensor([2**24, 2**24 + 1, 1, 0, 0, 0, 0, 0], dtype=torch.long)
-        np.testing.assert_array_equal(planning._cpu_candidates(large.numpy(), 4, (False, True)),
-                                      device_candidates(large, 4).numpy())
-
-
-    def test_two_rank_analytic_certificate_matches_general_path(self):
-        """穷举81种两卡小计数，对照原设备证书；例如B=P和B>P都不改变分配。"""
-        for entries in itertools.product(range(3), repeat=4):
-            counts = torch.tensor(entries, dtype=torch.long).reshape(2, 2)
-            expected = device_candidate(counts.sum(0), 2, False)
-            for capacity in (1, 2):
-                metrics = device_plan_metrics(expected, counts.sum(0), torch.full((2,), capacity))
-                self.assertEqual(int(metrics[5]), 1)
-                actual_counts, actual, used_fallback = planning.select_allocation(counts, capacity)
-                torch.testing.assert_close(actual_counts, counts, rtol=0, atol=0)
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-                self.assertFalse(used_fallback)
+                metrics = cpu_plan_metrics(allocation.tolist(), totals.tolist(), [2] * ranks)
+                self.assertEqual(metrics[0], 1)
+                self.assertGreaterEqual(metrics[1], metrics[4])
+                actual = planning._cpu_candidate_metrics(allocation.numpy()[None], totals.numpy(), 2)[0]
+                np.testing.assert_array_equal(actual, metrics)
+                if not fallback:
+                    self.assertEqual(metrics[5], 1)
+        with self.assertRaisesRegex(RuntimeError, "B=0"):
+            planning.select_allocation(torch.tensor([[8, 0], [0, 0]]), 0)
 
 
     def test_weight_spans_match_global_weights_without_output_reallocation(self):

@@ -72,7 +72,7 @@ def solve_capacity_exact(
         返回 moved=8、peak_copies=2、total_copies=3。
         ``solve_capacity_exact([4, 0], 2, 0)`` 因禁止副本且负载不均衡而报错。
     """
-    # scipy仅用于无法获得设备最优证书时的精确求解；普通导入不加载该可选依赖。
+    # The offline oracle alone needs SciPy; importing training code never loads it.
     from scipy.optimize import Bounds, LinearConstraint, milp  # pylint: disable=import-outside-toplevel
     from scipy.sparse import coo_matrix  # pylint: disable=import-outside-toplevel
 

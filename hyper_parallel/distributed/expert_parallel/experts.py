@@ -33,7 +33,6 @@ Split out of components/distributed/ep_utils.py in stage 4e.
 """
 
 import logging
-import math
 import os
 from dataclasses import dataclass
 from typing import Any, Callable, NamedTuple, Optional
@@ -47,12 +46,6 @@ from hyper_parallel.components.functional.npu_grouped_swiglu import (
 from hyper_parallel.distributed._builder.forward_rewriter import (
     _install_bound_forward,
 )
-from hyper_parallel.core.expert_parallel.static_splits import (
-    get_static_plan,
-    probe_mode,
-    static_plan_key,
-    store_static_plan,
-)
 from hyper_parallel.distributed.expert_parallel.routing import (
     _resolve_capacity_order,
     apply_capacity_limit,
@@ -62,7 +55,6 @@ from hyper_parallel.distributed.expert_parallel.collectives import (
     ep_all_to_all,
     ep_all_to_all_async,
     ep_split_sizes,
-    wait_ep_all_to_all,
 )
 from hyper_parallel.distributed.expert_parallel.routing import (
     MOE_ROUTER_ADAPTERS,
@@ -130,31 +122,6 @@ def resolve_swiglu_weights(
 # while it is being measured (HP_EP_SORT_FP32=1).
 _SORT_KEY_FP32_LIMIT = 2 ** 24
 _SORT_FP32_ENABLED = os.environ.get("HP_EP_SORT_FP32", "0") == "1"
-
-# The routed dispatch issues two ragged all-to-all exchanges per pass (hidden
-# states, then expert indices) whose token counts are identical and whose
-# payloads differ only in width.  A profile of the 256-card step shows the
-# exchanges strictly serialized (zero overlapping pairs across 1799 pairs), so
-# carrying both payloads in ONE exchange shortens a serial chain instead of
-# adding a third one.  Opt-in while it is being measured
-# (HP_EP_FUSED_DISPATCH=1).
-_FUSED_DISPATCH_ENABLED = os.environ.get("HP_EP_FUSED_DISPATCH", "0") == "1"
-
-# The dispatch is followed by an expert GEMM that hard-depends on the arrived
-# tokens, so the routed all-to-all is the one collective in the step that has no
-# independent work to hide behind: a 512-card one-step profile of the K2.6 MoE
-# step puts hcom_alltoall + hcom_alltoallv at 5.87 s of union with only 0.375 s
-# of it overlapping AI-core kernels, while the same step's all-gather (2270
-# calls) and reduce-scatter (921 calls) already hide 46% / 54%.  The work has to
-# be *created*, and the routed stream is what makes it possible: split the
-# expert-major token order into HP_EP_DISPATCH_CHUNKS contiguous chunks and
-# software-pipeline them, so chunk c's expert GEMM runs against chunk c+1's
-# dispatch exchange and chunk c's combine against chunk c+1's GEMM.  Only the
-# first dispatch and the last combine stay exposed.
-#
-# Default 1 = the original single-exchange schedule, bit-identical: the chunked
-# path is never entered and every count/list it derives is unused.
-_DISPATCH_CHUNKS_RAW = os.environ.get("HP_EP_DISPATCH_CHUNKS", "1")
 
 # The dispatch tags every routed slot with its source token as
 # ``arange(token_count).repeat_interleave(top_k)``.  That eager call lowers to a
@@ -452,13 +419,13 @@ def _prepare_ep_dispatch(
     experts_per_token = topk_indices.shape[1]
     if keep is None:
         expert_indices = topk_indices.reshape(-1)
-        expert_weights = topk_weights.reshape(-1).to(flattened_states.dtype)
+        expert_weights = topk_weights.reshape(-1)
         source_indices = _routed_slot_token_ids(
             token_count, experts_per_token, flattened_states.device)
     else:
         flat_keep = keep.reshape(-1)
         expert_indices = topk_indices.reshape(-1)[flat_keep]
-        expert_weights = topk_weights.reshape(-1)[flat_keep].to(flattened_states.dtype)
+        expert_weights = topk_weights.reshape(-1)[flat_keep]
         source_indices = _routed_slot_token_ids(
             token_count, experts_per_token, flattened_states.device)[flat_keep]
     destination_ranks = torch.div(expert_indices, local_expert_count, rounding_mode="floor")
@@ -487,39 +454,11 @@ def _prepare_ep_dispatch(
         )
         dispatched_states = flattened_states[source_indices[dispatch_order]].contiguous()
     dispatched_indices = expert_indices[dispatch_order].unsqueeze(-1).contiguous()
-    # The counts exchange is a host-serialising step: a synchronous all-to-all followed
-    # by two ``.tolist()`` drains, and a drain waits for everything already enqueued on
-    # the stream, so the token all-to-all cannot be enqueued until the counts land.  When
-    # the routing plan is static (``fix_router: true``) the answer is the same in every
-    # layer, so it is computed once and reused -- that removes the extra collective and
-    # both syncs from every later dispatch.  See ``static_splits`` for the caveats.
-    plan_key = static_plan_key(
-        token_count, experts_per_token, ep_size, local_expert_count, global_expert_count,
-        device=flattened_states.device,
-    )
-    cached_counts = get_static_plan(plan_key)
-    if cached_counts is not None:
-        send_counts, receive_counts, send_counts_tensor, receive_counts_tensor = cached_counts
-        # Bisect probes (see ``probe_mode``): run one half of the original work so the
-        # 4/4 OOM can be attributed.  Both branches are no-ops in a normal run.
-        mode = probe_mode()
-        if mode == "a2a":
-            dist.all_to_all_single(
-                torch.empty_like(send_counts_tensor), send_counts_tensor, group=ep_group,
-            )
-        elif mode == "drains":
-            send_counts_tensor.tolist()
-            receive_counts_tensor.tolist()
-    else:
-        send_counts_tensor = _expert_token_counts(destination_ranks, ep_size)
-        receive_counts_tensor = ep_exchange_counts(send_counts_tensor, ep_group)
-        send_counts = ep_split_sizes(send_counts_tensor, dispatched_states.shape[0])
-        receive_counts = ep_split_sizes(receive_counts_tensor)
-        store_static_plan(
-            plan_key, (send_counts, receive_counts, send_counts_tensor, receive_counts_tensor),
-            f"(ep={ep_size}, tokens={token_count}, topk={experts_per_token}, "
-            f"tokens/peer={send_counts[0] if send_counts else 0})",
-        )
+    # A fixed shape does not imply a fixed router; use this invocation's counts.
+    send_counts_tensor = _expert_token_counts(destination_ranks, ep_size)
+    receive_counts_tensor = ep_exchange_counts(send_counts_tensor, ep_group)
+    send_counts = ep_split_sizes(send_counts_tensor, dispatched_states.shape[0])
+    receive_counts = ep_split_sizes(receive_counts_tensor)
     return _EPDispatch(
         source_indices=source_indices,
         expert_weights=expert_weights,
@@ -534,39 +473,18 @@ def _prepare_ep_dispatch(
 
 
 def _resolve_dispatch_chunks(ep_size: int) -> int:
-    """Resolve ``HP_EP_DISPATCH_CHUNKS`` for an EP group of size ``ep_size``.
+    """Use at most two target-rank groups for the ordinary EP pipeline.
+
+    Two groups provide the next dispatch to overlap without fragmenting expert
+    GEMMs into one batch per peer. A single-rank group needs only one chunk.
 
     Args:
-        ep_size: Size of the EP group.  The chunk count is clamped to it, since
-            a chunk covers a non-empty contiguous group of EP ranks.
+        ep_size: Number of ranks in the expert-parallel group.
 
     Returns:
-        The number of chunks to split the routed exchange into; 1 (also the
-        default) keeps the original single-exchange schedule.
-
-    Raises:
-        ValueError: If the knob is not a positive integer.
+        One chunk for EP1, otherwise two chunks.
     """
-    raw = _DISPATCH_CHUNKS_RAW.strip()
-    try:
-        chunk_count = int(raw, 10)
-    except ValueError:
-        raise ValueError(
-            "HP_EP_DISPATCH_CHUNKS must be a positive integer, but got "
-            f"{raw!r}; leave it unset (or 1) for the unchunked schedule"
-        ) from None
-    if chunk_count < 1:
-        raise ValueError(
-            f"HP_EP_DISPATCH_CHUNKS must be >= 1, but got {chunk_count}"
-        )
-    if chunk_count > ep_size:
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "HP_EP_DISPATCH_CHUNKS=%d exceeds the EP group size %d; clamping to %d",
-                chunk_count, ep_size, ep_size,
-            )
-        chunk_count = ep_size
-    return chunk_count
+    return min(2, ep_size)
 
 
 def _chunk_rank_range(group: int, ep_size: int, chunk_count: int) -> tuple[int, int]:
@@ -684,175 +602,28 @@ def _run_ep_local_experts(
     return ep_all_to_all(local_outputs.contiguous(), receive_counts, send_counts, ep_group)
 
 
-def _fused_row_layout(
-    hidden_size: int,
-    state_dtype: torch.dtype,
-    index_dtype: torch.dtype,
-) -> tuple[int, int]:
-    """Slot geometry of one fused dispatch row.
-
-    The row is ``[hidden states | head pad | index bytes]`` read in the states'
-    dtype: ``index_slots`` trailing state elements carry the index, and the head
-    pad moves that region to a byte offset which is a multiple of the index
-    element size -- the alignment ``Tensor.view(dtype)`` needs to reinterpret it
-    without a copy.
-
-    Args:
-        hidden_size: Width of the hidden states in the row.
-        state_dtype: Dtype of the hidden states (the row's storage dtype).
-        index_dtype: Dtype of the expert indices carried in the tail slots.
-
-    Returns:
-        ``(head_slots, index_slots)`` in state elements; the row is
-        ``hidden_size + head_slots + index_slots`` state elements wide.
-    """
-    index_slots = math.lcm(state_dtype.itemsize, index_dtype.itemsize) // state_dtype.itemsize
-    return (-hidden_size) % index_slots, index_slots
-
-
-def _pack_fused_dispatch(
-    dispatched_states: torch.Tensor,
-    dispatched_expert_indices: torch.Tensor,
-) -> torch.Tensor:
-    """Pack the hidden states and the expert indices of a token into one row.
-
-    Byte-view packing: the index bytes sit in the tail slots reinterpreted in
-    the states' dtype, so nothing is converted numerically and both payloads
-    stay bit-exact (a bf16 buffer cannot hold an expert index above 256
-    exactly, so the index must travel as bytes).  The row is one tensor, so the
-    whole fused exchange stays a differentiable ``cat`` on the send side and a
-    pair of views on the receive side.
-
-    Args:
-        dispatched_states: Expert-major hidden states, shape ``[tokens, H]``.
-        dispatched_expert_indices: Matching indices, shape ``[tokens, 1]``.
-
-    Returns:
-        ``[tokens, H + head_slots + index_slots]`` in the states' dtype.
-    """
-    token_count, hidden_size = dispatched_states.shape
-    head_slots, index_slots = _fused_row_layout(
-        hidden_size, dispatched_states.dtype, dispatched_expert_indices.dtype)
-    index_bytes = dispatched_expert_indices.reshape(token_count, 1).view(torch.uint8)
-    index_slots_buffer = F.pad(
-        index_bytes, (0, index_slots * dispatched_states.element_size() - index_bytes.shape[1]))
-    head_buffer = torch.zeros(
-        token_count, head_slots, dtype=dispatched_states.dtype, device=dispatched_states.device)
-    return torch.cat(
-        [dispatched_states, head_buffer, index_slots_buffer.view(dispatched_states.dtype)],
-        dim=1,
-    )
-
-
-def _unpack_fused_dispatch(
-    packed: torch.Tensor,
-    *,
-    hidden_size: int,
-    index_dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Split a received fused row back into ``(states, indices)``.
-
-    Both halves are views of the exchanged buffer, so the received bytes are
-    handed over as they arrived -- no decode step can change a value.  The index
-    half is detached: it is payload on its way into integer indexing, while the
-    states half stays the differentiable path that carries the routed gradient.
-    Staying view-only also keeps the exchange's lazy wait intact: a
-    materializing op here would enqueue the wait before the caller reaches its
-    independent work.
-
-    Args:
-        packed: Exchanged rows, shape ``[tokens, row]`` in the states' dtype.
-        hidden_size: Width of the hidden states in the row.
-        index_dtype: Dtype of the expert indices carried in the tail slots.
-
-    Returns:
-        ``(states [tokens, H], indices [tokens])``, both views of ``packed``.
-    """
-    head_slots, index_slots = _fused_row_layout(hidden_size, packed.dtype, index_dtype)
-    index_start = hidden_size + head_slots
-    index_bytes = packed.detach()[:, index_start:index_start + index_slots].view(torch.uint8)
-    return (
-        packed[:, :hidden_size],
-        index_bytes[:, :index_dtype.itemsize].view(index_dtype).squeeze(-1),
-    )
-
-
-def _fused_dispatch_exchange(
-    dispatched_states: torch.Tensor,
-    dispatched_expert_indices: torch.Tensor,
-    send_counts: list[int],
-    receive_counts: list[int],
-    ep_group: Any,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Dispatch the hidden states and the expert indices in ONE all-to-all.
-
-    Same handle/wait contract as the two exchanges it replaces: the exchange is
-    issued through :func:`ep_all_to_all_async` and both returned tensors are
-    views of it, so the wait still lands on their first non-view consumer (the
-    shared-expert overlap window is untouched).  ``allow_pending=False`` is what
-    keeps that possible: the unpack below is a view chain, which the split-free
-    exchange's pending handle cannot carry, so this exchange stays on the
-    async-tensor path even with ``HP_EP_EQUAL_A2A`` on.
-    """
-    packed = _pack_fused_dispatch(dispatched_states, dispatched_expert_indices)
-    # ``allow_pending=False``: the unpack below reads the exchanged buffer
-    # through a view chain (slice / detach / view-as-dtype), which a pending
-    # handle cannot express, so the fused exchange keeps the async-tensor lazy
-    # path and with it its own overlap window.
-    exchanged = ep_all_to_all_async(
-        packed, send_counts, receive_counts, ep_group, allow_pending=False)
-    return _unpack_fused_dispatch(
-        exchanged,
-        hidden_size=dispatched_states.shape[-1],
-        index_dtype=dispatched_expert_indices.dtype,
-    )
-
-
 def _dispatch_chunk(
     dispatched_states: torch.Tensor,
     dispatched_expert_indices: torch.Tensor,
     chunk_send_counts: list[int],
     chunk_recv_counts: list[int],
     ep_group: Any,
-    fused: bool = False,
-) -> tuple[Any, Any]:
-    """Issue one chunk's dispatch exchange, without waiting for it.
-
-    Every mode goes through :func:`ep_all_to_all_async`, and neither its fused
-    unpack nor the ``squeeze`` below reads the payload, so nothing materializes
-    the exchange here: the wait is enqueued by the chunk's first consumer (the
-    expert GEMM, through :func:`wait_ep_all_to_all`), which is what lets that
-    GEMM overlap the next chunk's exchange.  ``fused`` mirrors the caller's
-    switch: the packed states+indices exchange belongs to the split dispatch
-    (:func:`ep_routed_dispatch`), not to the cohesive routed branch, which
-    issues the two exchanges itself.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Issue one chunk's hidden-state and expert-index exchanges lazily.
 
     Args:
-        dispatched_states: This chunk's contiguous slice of the expert-major
-            hidden states, ``[rows, H]``.
-        dispatched_expert_indices: Matching slice, ``[rows, 1]``.
-        chunk_send_counts: Rows of this chunk sent to each EP rank.
-        chunk_recv_counts: Rows of this chunk received from each EP rank.
-        ep_group: Extended EP process group.
-        fused: Send the states and the indices in one packed exchange.
+        dispatched_states: Hidden rows belonging to this chunk.
+        dispatched_expert_indices: Matching expert IDs, shaped [rows, 1].
+        chunk_send_counts: Rows sent to each peer for this chunk.
+        chunk_recv_counts: Rows received from each peer for this chunk.
+        ep_group: Expert-parallel process group.
 
     Returns:
-        ``(received_states, received_indices)``, pending their exchange -- a
-        tensor or a :class:`_PendingEqualA2A` handle, depending on the knob, so
-        a caller must pass them through :func:`wait_ep_all_to_all`.
+        Received hidden rows and expert IDs. The squeeze is a view; their first
+        payload consumers order the collective wait.
     """
-    if fused:
-        return _fused_dispatch_exchange(
-            dispatched_states,
-            dispatched_expert_indices,
-            chunk_send_counts,
-            chunk_recv_counts,
-            ep_group,
-        )
     received_states = ep_all_to_all_async(
         dispatched_states, chunk_send_counts, chunk_recv_counts, ep_group)
-    # squeeze is a view (the handle's own, or a tensor's), so the wait stays
-    # deferred until the experts read it.
     received_indices = ep_all_to_all_async(
         dispatched_expert_indices, chunk_send_counts, chunk_recv_counts, ep_group).squeeze(-1)
     return received_states, received_indices
@@ -883,7 +654,7 @@ def _aggregate_ep_outputs(
         device=weighted_outputs.device,
     )
     output.index_add_(0, source_indices[dispatch_order], weighted_outputs)
-    return output.view(*output_shape)
+    return output.to(combined_outputs.dtype).view(*output_shape)
 
 
 def _aggregate_ep_chunks(
@@ -905,8 +676,7 @@ def _aggregate_ep_chunks(
     wait of chunk ``c`` lands after chunk ``c + 1``'s experts have been issued.
 
     Args:
-        combined_chunks: Per-chunk combine outputs, in plan order (tensors, or
-            pending handles with ``HP_EP_EQUAL_A2A=1``).
+        combined_chunks: Per-chunk combine tensors, consumed in plan order.
         row_ranges: Matching half-open slices of the expert-major stream.
         expert_weights: Flattened routing weights, ``[tokens * top_k]``.
         source_indices: Source token of every routed slot, ``[tokens * top_k]``.
@@ -920,15 +690,15 @@ def _aggregate_ep_chunks(
     output = torch.zeros(
         output_shape[0] * output_shape[1],
         output_shape[-1],
-        dtype=reference.dtype,
+        dtype=torch.promote_types(reference.dtype, expert_weights.dtype),
         device=reference.device,
     )
     for combined, (row_start, row_end) in zip(combined_chunks, row_ranges):
         rows = dispatch_order[row_start:row_end]
         # Reading a chunk is what orders its stream on the pending combine.
-        weighted_outputs = wait_ep_all_to_all(combined) * expert_weights[rows].unsqueeze(-1)
+        weighted_outputs = combined * expert_weights[rows].unsqueeze(-1)
         output.index_add_(0, source_indices[rows], weighted_outputs)
-    return output.view(*output_shape)
+    return output.to(reference.dtype).view(*output_shape)
 
 
 def _run_ep_local_experts_chunked(
@@ -990,8 +760,8 @@ def _run_ep_local_experts_chunked(
         following = issue(chunk + 1) if chunk + 1 < chunk_count else None
         received_states, received_indices = incoming
         local_outputs = module.experts(
-            wait_ep_all_to_all(received_states),
-            wait_ep_all_to_all(received_indices) - expert_offset)
+            received_states,
+            received_indices - expert_offset)
         combined_chunks.append(ep_all_to_all_async(
             local_outputs.contiguous(),
             plan.recv_counts[chunk],
@@ -1012,7 +782,7 @@ def _chunked_ep_forward(
     expert_offset: int,
     output_shape: tuple[int, int, int],
 ) -> torch.Tensor:
-    """Run the routed forward as ``HP_EP_DISPATCH_CHUNKS`` software-pipelined slices.
+    """Run routed forward over the bounded target-rank groups as a software pipeline.
 
     Split out of :func:`ep_routed_forward` so that entry point stays readable; the schedule
     itself is unchanged (see :func:`_run_ep_local_experts_chunked`).
@@ -1072,12 +842,12 @@ def ep_routed_forward(
     ``router_fn`` is supplied BY THE CALLER (explicit choice, e.g. an entry
     of MOE_ROUTER_ADAPTERS picked by name in the factory code).
 
-    With ``HP_EP_DISPATCH_CHUNKS > 1`` the same exchange is split into that many
-    contiguous chunks of the expert-major order and software-pipelined (see
+    With multiple EP ranks the exchange uses two contiguous target-rank groups
+    and is software-pipelined (see
     :func:`_run_ep_local_experts_chunked`): the math is the same up to the
     grouping of the experts' GEMM, and the routed all-to-all -- the one
     collective of the step with no independent work to hide behind -- gets the
-    chunk GEMMs to overlap with.  Default 1 keeps the unchunked schedule.
+    chunk GEMMs to overlap with. EP1 retains the single-chunk schedule.
 
     ``use_fused_moe_token_permute_and_unpermute`` replaces the generic sort/index-add routing
     with NPU token permute/unpermute. It defaults to enabled on NPU and does
@@ -1141,12 +911,10 @@ def ep_routed_forward(
 
 
 class _EPRoutedChunks(NamedTuple):
-    """Pending per-chunk dispatch state of a chunked routed exchange.
+    """Pending tensors for the two target-rank groups.
 
-    ``received_states[c]`` / ``received_indices[c]`` are chunk ``c``'s issued but
-    unwritten exchange results (the wait lands on the chunk's expert GEMM, via
-    :func:`wait_ep_all_to_all`); the chunk's traffic and stream slice are in
-    ``plan``.
+    Each received_states/received_indices entry is an issued exchange whose first
+    payload consumer orders the wait. The plan retains its traffic and row slice.
     """
 
     plan: _EPDispatchChunks
@@ -1155,22 +923,11 @@ class _EPRoutedChunks(NamedTuple):
 
 
 class EPRoutedState(NamedTuple):
-    """Pending routed-experts state between dispatch and experts+combine.
+    """Routed state between asynchronous dispatch and experts+combine.
 
-    Produced by :func:`ep_routed_dispatch` and consumed by
-    :func:`ep_routed_experts_and_combine`.  ``received_states`` /
-    ``received_indices`` may still be in flight (the exchange is issued
-    asynchronously); they materialize on first non-view use, or -- with
-    ``HP_EP_EQUAL_A2A=1`` -- on the explicit :func:`wait_ep_all_to_all` the
-    consumer must call before reading them.  A consumer outside
-    :func:`ep_routed_experts_and_combine` therefore has to pass them through
-    that helper rather than reading them directly.
-
-    With ``HP_EP_DISPATCH_CHUNKS > 1`` the exchange is split into per-chunk
-    slices, which cannot be expressed as the flat ``received_states`` /
-    ``received_indices`` tensors: those two stay ``None`` and the pending state
-    travels in ``chunks`` instead.  ``send_counts`` / ``receive_counts`` keep the
-    full (unchunked) counts either way.
+    The received tensors materialize at their first non-view consumers. With two
+    target-rank groups, received_states and received_indices stay None and the
+    per-group tensors travel in chunks. Full send/receive counts remain available.
     """
 
     source_token_indices: torch.Tensor
@@ -1239,7 +996,6 @@ def _issue_chunked_dispatch(
             plan.send_counts[chunk],
             plan.recv_counts[chunk],
             ep_group,
-            fused=_FUSED_DISPATCH_ENABLED,
         )
         chunk_states.append(chunk_state)
         chunk_indices.append(chunk_index)
@@ -1263,27 +1019,11 @@ def ep_routed_dispatch(
     router_fn: Callable,
     ep_group: Any,
 ) -> EPRoutedState:
-    """Route locally and **launch** the token exchange without waiting.
+    """Route locally and issue hidden-state and expert-index exchanges lazily.
 
-    Same routing/dispatch preparation as :func:`ep_routed_forward`, but the two
-    token exchanges are issued through :func:`ep_all_to_all_async`, whose wait
-    is deferred to the first non-view consumer.  A caller that runs independent
-    work between this call and :func:`ep_routed_experts_and_combine` (for
-    DeepSeek-V3 style blocks: the shared-expert MLP, which depends only on
-    ``hidden_states``) therefore overlaps that work with the in-flight
-    exchange instead of serializing behind it.
-
-    With ``HP_EP_FUSED_DISPATCH=1`` the states and the indices travel in one
-    packed exchange instead of two (see :func:`_fused_dispatch_exchange`); the
-    pending state and the wait point are the same either way.  With
-    ``HP_EP_DISPATCH_CHUNKS > 1`` every chunk's exchange is issued here in the
-    same way, so a caller's independent work still overlaps the whole dispatch
-    rather than only its first exchange (see :func:`_ep_dispatch_chunks`).
-
-    The pending values in the returned state are *not* necessarily tensors: with
-    ``HP_EP_EQUAL_A2A=1`` and a uniform plan they are pending handles, and a
-    consumer that drives this state itself must read them through
-    :func:`wait_ep_all_to_all`.
+    With multiple EP ranks, both target-rank groups are issued here. Independent
+    shared-expert work may run before ep_routed_experts_and_combine consumes the
+    received tensors and thereby orders their collective waits.
 
     Args:
         module: MoE block exposing ``experts`` (with ``local_expert_count``).
@@ -1331,20 +1071,10 @@ def ep_routed_dispatch(
             dispatch, ep_group, ep_size, dist.get_rank(group=ep_group), chunk_count,
             batch_size, sequence_length, hidden_size,
         )
-    if _FUSED_DISPATCH_ENABLED:
-        received_states, received_indices = _fused_dispatch_exchange(
-            dispatched_states,
-            dispatched_expert_indices,
-            send_counts,
-            receive_counts,
-            ep_group,
-        )
-    else:
-        received_states = ep_all_to_all_async(
-            dispatched_states, send_counts, receive_counts, ep_group)
-        # squeeze is a view, so the wait stays deferred until the experts read it.
-        received_indices = ep_all_to_all_async(
-            dispatched_expert_indices, send_counts, receive_counts, ep_group).squeeze(-1)
+    received_states = ep_all_to_all_async(
+        dispatched_states, send_counts, receive_counts, ep_group)
+    received_indices = ep_all_to_all_async(
+        dispatched_expert_indices, send_counts, receive_counts, ep_group).squeeze(-1)
     return EPRoutedState(
         source_token_indices,
         flattened_expert_weights,
@@ -1362,20 +1092,11 @@ def ep_routed_experts_and_combine(
     state: EPRoutedState,
     ep_group: Any,
 ) -> torch.Tensor:
-    """Run the local experts on a dispatched state and exchange the outputs back.
+    """Consume issued token exchanges, compute local experts and combine.
 
-    The dispatch exchange reached ``state`` from :func:`ep_routed_dispatch` and
-    is waited here -- at the first expert read, i.e. after whatever work the
-    caller ran in between -- and the combine exchange is issued asynchronously
-    as well, so its wait lands on the weighted aggregation instead of blocking
-    right after the local experts.  Both waits go through
-    :func:`wait_ep_all_to_all`, which is what a pending exchange (with
-    ``HP_EP_EQUAL_A2A=1``) needs before it can be read.
-
-    With ``HP_EP_DISPATCH_CHUNKS > 1`` (``state.chunks``) the experts and the
-    combines run one chunk at a time, keeping the same schedule property: chunk
-    ``c``'s combine is issued before chunk ``c + 1``'s experts run, so it
-    overlaps their GEMM, and every combine wait lands on the aggregation.
+    Received-index arithmetic and the experts' first hidden-state reads order
+    their respective collective waits. Per-group outputs accumulate in source
+    token order using the original routing weights.
 
     Args:
         module: MoE block exposing ``experts`` (with ``local_expert_count``).
@@ -1392,8 +1113,8 @@ def ep_routed_experts_and_combine(
         for chunk, (received_states, received_indices) in enumerate(
                 zip(state.chunks.received_states, state.chunks.received_indices)):
             local_outputs = module.experts(
-                wait_ep_all_to_all(received_states),
-                wait_ep_all_to_all(received_indices) - expert_offset)
+                received_states,
+                received_indices - expert_offset)
             combined_chunks.append(ep_all_to_all_async(
                 local_outputs.contiguous(),
                 plan.recv_counts[chunk],
@@ -1409,12 +1130,12 @@ def ep_routed_experts_and_combine(
             state.output_shape,
         )
     local_outputs = module.experts(
-        wait_ep_all_to_all(state.received_states),
-        wait_ep_all_to_all(state.received_indices) - expert_offset)
+        state.received_states,
+        state.received_indices - expert_offset)
     combined_expert_outputs = ep_all_to_all_async(
         local_outputs.contiguous(), state.receive_counts, state.send_counts, ep_group)
     return _aggregate_ep_outputs(
-        wait_ep_all_to_all(combined_expert_outputs),
+        combined_expert_outputs,
         state.flattened_expert_weights,
         state.source_token_indices,
         state.dispatch_order,

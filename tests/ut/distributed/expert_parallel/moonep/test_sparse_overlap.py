@@ -119,7 +119,7 @@ class TestSparseOverlap(unittest.TestCase):
                                        prepare_backward=self._prepare_backward, run_backward=self._run_backward,
                                        forward_pipeline=SimpleNamespace(enabled=False))
         self.plan = SimpleNamespace(route=self.route, order=torch.arange(3), inverse_order=torch.arange(3),
-                                    max_source_tokens=3, compute=self.compute)
+                                    compute=self.compute)
         self.runtime = SimpleNamespace(workspace=self.workspace, executions={self.key: (self.expert, self.plan)},
                                        prepare=Mock(return_value=self.ticket), arena=PhaseArena("cpu"),
                                        statistics=Counter(), poisoned=False, gradient_outputs={},
@@ -247,13 +247,16 @@ class TestSparseOverlap(unittest.TestCase):
         self.assertEqual(self.records.call_count, 8)
 
     def test_forward_submits_tokens_before_waiting_for_weights(self):
-        """Actual forward phase fences are initialized before C joins W."""
+        """Supported pipelines publish block progress while preserving W/T overlap."""
         context = _Context(self.operations)
+        self.compute.forward_pipeline = SimpleNamespace(enabled=True, supports=Mock(return_value=True))
 
         result = sparse_autograd.SparseExpertFunction.forward(
             context, self.hidden, self.scores, *self.home, self.key, self.runtime)
 
         self._assert_overlap_order("forward")
+        self.assertTrue(self.prepared[0].publish_each_block)
+        self.assertIsNotNone(self.prepared[0].ready.task_expected)
         self.assertEqual(result.shape, self.hidden.shape)
         self.workspace.check_preflight.assert_called_once_with(None)
         self.runtime.release.assert_called_once_with(self.key)
@@ -306,6 +309,8 @@ class TestSparseOverlap(unittest.TestCase):
             context, self.hidden, self.scores, *self.home, self.key, self.runtime)
 
         self._assert_overlap_order("forward")
+        self.assertFalse(self.prepared[0].publish_each_block)
+        self.assertIsNone(self.prepared[0].ready.task_expected)
         self.expert.read_weights.assert_called_once()
         self.runtime.release.assert_not_called()
 

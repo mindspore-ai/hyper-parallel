@@ -68,7 +68,6 @@ class SparseExecution:
     order: torch.Tensor
     inverse_order: torch.Tensor
     compute: NativeExpertCompute
-    max_source_tokens: int
     weights: tuple[TransferRound, ...]
     gate_gradients: tuple[TransferRound, ...]
     down_gradients: tuple[TransferRound, ...]
@@ -721,7 +720,7 @@ class SparseMoonEPExecutor:
                 raise ValueError("source selection rows must be a multiple of top-k")
             weight_quota = self.runtime.weight_domain.quota_elements
             gradient_quota = self.runtime.gradient_domain.quota_elements
-            return SparseExecution(route, order, inverse_order, compute, source_rows // self.top_k,
+            return SparseExecution(route, order, inverse_order, compute,
                                    compile_transfer_rounds(allocation, role_sizes, quota_elements=weight_quota),
                                    compile_transfer_rounds(allocation, role_sizes[:1], reverse=True,
                                                            quota_elements=gradient_quota),

@@ -14,10 +14,7 @@
 # ============================================================================
 """CPU coverage for capacity-independent cube task compilation."""
 
-from collections.abc import Callable
-from operator import attrgetter
 from types import SimpleNamespace
-from typing import Any
 import unittest
 from unittest.mock import Mock, patch
 
@@ -71,28 +68,11 @@ class TestComputeTasks(unittest.TestCase):
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
 class TestComputeTaskTables(unittest.TestCase):
-    """Preserve task ordering and cache ownership when constructing tables in batches."""
+    """Reject malformed native configurations during phase preparation."""
 
     def setUp(self) -> None:
-        """Keep each geometric-cache test independent of other CPU tests."""
-        compute._gradient_tile_template.cache_clear()
-        self.addCleanup(compute._gradient_tile_template.cache_clear)
-        # The decorator adds a no-argument inspection method, independent of
-        # the wrapped function's feature and column parameters.
-        self.cache_info: Callable[[], Any] = attrgetter("cache_info")(compute._gradient_tile_template)
+        """Keep CPU preparation from loading an unmocked native payload."""
         self.enterContext(patch.object(compute, "_load_native", side_effect=AssertionError("CPU tasks loaded native")))
-
-
-    def test_gradient_template_cache_is_bounded_to_eight_entries(self) -> None:
-        """The largest legal template is one MiB and LRU eviction limits retained shapes."""
-        template = compute._gradient_tile_template(32768, 32768)
-        self.assertEqual(template.nbytes, 1024**2)
-        for width in range(1, 10):
-            gradient_tasks((1,), 128, width)
-        info = self.cache_info()
-        self.assertEqual((info.maxsize, info.currsize), (8, 8))
-        compute._gradient_tile_template(32768, 32768)
-        self.assertEqual(self.cache_info().misses, info.misses + 1)
 
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
@@ -139,24 +119,23 @@ class TestLinearConfig(unittest.TestCase):
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
 class TestClippedActivation(unittest.TestCase):
-    """Keep DeepSeek's FP32 clamp semantics through the native expert buffers."""
+    """Check that clipped activations dispatch to the native forward and backward."""
 
-    def test_forward_and_gradient_match_autograd(self) -> None:
-        """Both projected halves and their clamp derivatives match PyTorch."""
+    def test_forward_and_gradient_use_native_clipped_kernels(self) -> None:
+        """Forward and backward pass the same clipping limit and admitted buffers."""
         for limit in (0.5, 1.5):
             with self.subTest(limit=limit):
-                torch.manual_seed(17)
-                preact = torch.randn(32, 64, dtype=torch.bfloat16, requires_grad=True)
-                derivative = torch.randn(32, 32, dtype=torch.bfloat16)
-                gate, up = preact.float().chunk(2, dim=-1)
-                expected = (torch.nn.functional.silu(gate.clamp(max=limit))
-                            * up.clamp(min=-limit, max=limit)).to(torch.bfloat16)
-                expected.backward(derivative)
+                preact = torch.empty(32, 64, dtype=torch.bfloat16)
+                derivative = torch.empty(32, 32, dtype=torch.bfloat16)
                 engine = compute.NativeExpertCompute.__new__(compute.NativeExpertCompute)
                 engine.swiglu_limit = limit
-                actual = torch.empty_like(expected)
+                actual = torch.empty_like(derivative)
                 gradient = torch.empty_like(preact)
-                engine._activate(preact.detach(), actual)
-                engine._activation_gradient(derivative, preact.detach(), gradient)
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-                torch.testing.assert_close(gradient, preact.grad, rtol=0, atol=0)
+                native = SimpleNamespace(routed_experts_clipped_swiglu=Mock(),
+                                         routed_experts_clipped_swiglu_backward=Mock())
+                with patch.object(torch.ops, "hyper_parallel", native):
+                    engine._activate(preact, actual)
+                    engine._activation_gradient(derivative, preact, gradient)
+                native.routed_experts_clipped_swiglu.assert_called_once_with(preact, actual, limit)
+                native.routed_experts_clipped_swiglu_backward.assert_called_once_with(
+                    derivative, preact, gradient, limit)

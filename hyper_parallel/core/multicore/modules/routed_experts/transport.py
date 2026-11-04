@@ -139,45 +139,6 @@ def compile_transport_metadata(route: RouteDescriptor, workspace: RingWorkspace,
     return send, receive, torch.from_numpy(offsets)
 
 
-def exchange_rows(source: torch.Tensor, route: RouteDescriptor, workspace: RingWorkspace, *,
-                  mapping: torch.Tensor | None = None, reverse: bool = False,
-                  output: torch.Tensor | None = None) -> torch.Tensor:
-    """Exchange one sparse phase; mapping gathers source tokens without expansion.
-
-    Args:
-        source: Contiguous BF16 [rows, hidden] source, on the current NPU.
-        route: Immutable route shared with the inverse phase.
-        workspace: Root-wide positive-capacity window lease.
-        mapping: Optional INT64 selection-to-source-row map, already on device.
-        reverse: Return expert-major destination rows to source selection order.
-        output: Optional preallocated output with the exact destination extent.
-
-    Returns:
-        Asynchronously populated expert-major rows, ordered on the current stream.
-    """
-    with workspace.submission(workspace.device):
-        return _exchange_rows(source, route, workspace, mapping=mapping, reverse=reverse, output=output,
-                              input_ready=None, publish=False)[0]
-
-
-def _exchange_rows(source: torch.Tensor, route: RouteDescriptor, workspace: RingWorkspace, *,
-                   mapping: torch.Tensor | None, reverse: bool, output: torch.Tensor | None,
-                   input_ready: ExpertReadiness | None, publish: bool) -> tuple:
-    """Submit one phase while holding the window's sequence and lifetime lease."""
-    preparation = None
-    error = None
-    try:
-        if input_ready is not None:
-            input_ready.validate_polling()
-        preparation = prepare_exchange(source, route, workspace, mapping=mapping, reverse=reverse,
-                                       output=output, dependency=input_ready, publish=publish)
-    except Exception as exc:  # Every rank must reach preflight, including allocation failures.
-        error = exc
-    workspace.check_preflight(error)
-    _submit_payload(preparation, workspace, input_ready)
-    return preparation.value, preparation.ready
-
-
 def _check_tensor(value: torch.Tensor, workspace: RingWorkspace) -> None:
     """Check host-visible properties before the collective preparation decision."""
     if value.device != workspace.device or not value.is_contiguous():
@@ -591,23 +552,3 @@ def submit_prepared(preparation: PreparedExchange, workspace: RingWorkspace, *,
         current.wait_event(preparation.ready.admitted)
         preparation.value.record_stream(current)
     return PendingExchange(preparation.value, preparation.ready, preparation.complete)
-
-
-def begin_exchange(source: torch.Tensor, route: RouteDescriptor, workspace: RingWorkspace, *,
-                   mapping: torch.Tensor | None = None, reverse: bool = False,
-                   dependency: ExpertReadiness | None = None) -> PendingExchange:
-    """Start a token phase on T; compact consumers can wait for individual experts.
-
-    A dependency admits T before the producing GEMM finishes, avoiding a stream
-    cycle. Without one, the source's current stream is joined before T reads it.
-    """
-    preparation, error = None, None
-    try:
-        if dependency is not None:
-            dependency.validate_polling()
-        preparation = prepare_exchange(source, route, workspace, mapping=mapping, reverse=reverse,
-                                       dependency=dependency)
-    except Exception as exc:
-        error = exc
-    workspace.check_preflight(error)
-    return submit_prepared(preparation, workspace)

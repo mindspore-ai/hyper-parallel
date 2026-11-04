@@ -14,7 +14,6 @@
 # ==========================================================================
 """Unit tests for Torch HSDP fused communication buckets."""
 # pylint: disable=protected-access
-import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -27,7 +26,6 @@ import torch.distributed as dist
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.core.fully_shard.utils import DDPMeshInfo, FSDPMeshInfo, HSDPMeshInfo
 from hyper_parallel.core.fully_shard.param_group import (
-    AllGatherMetadata,
     AllGatherResult,
     AllReduceParamGroup,
     HSDPParamGroup,
@@ -96,7 +94,6 @@ def _fake_param(
     sharded_param = _local_param(local_tensor.clone(), requires_grad)
     hsdp_param = MagicMock()
     hsdp_param.mesh_info = mesh_info or _mesh_info()
-    hsdp_param.all_gather_process_group = hsdp_param.mesh_info.shard_process_group
     hsdp_param.shard_world_size = (
         hsdp_param.mesh_info.shard_mesh_size
         if isinstance(hsdp_param.mesh_info, FSDPMeshInfo)
@@ -218,20 +215,19 @@ class TestAllGatherBuckets(unittest.TestCase):
 
     @patch("hyper_parallel.core.fully_shard.param_group.dist.reduce_scatter_tensor")
     @patch("hyper_parallel.core.fully_shard.param_group.dist.all_gather_into_tensor")
-    def test_independent_ag_route_does_not_change_rs_route(self, mock_all_gather, mock_reduce_scatter):
-        """融合AG走新组，RS保留原组；例如EFS同成员的两条通道不混用。"""
-        original_group, prefetch_group = _FakeGroup(), _FakeGroup()
-        param = _fake_param([1.0, 2.0], mesh_info=_mesh_info(shard_group=original_group))
-        param.all_gather_process_group = prefetch_group
+    def test_ag_and_rs_reuse_mesh_shard_group(self, mock_all_gather, mock_reduce_scatter):
+        """Parameter AG and gradient RS both use the mesh's shard group."""
+        shard_group = _FakeGroup()
+        param = _fake_param([1.0, 2.0], mesh_info=_mesh_info(shard_group=shard_group))
         group = HSDPParamGroup([param], device=torch.device("cpu"), enable_zero_copy=False)
 
         group.foreach_all_gather(async_op=True)
         _set_unsharded_grad(param, torch.tensor([1.0, 2.0, 3.0, 4.0]))
         group.foreach_reducescatter(dist.ReduceOp.SUM)
 
-        self.assertIs(mock_all_gather.call_args.kwargs["group"], prefetch_group)
-        self.assertIs(mock_reduce_scatter.call_args.kwargs["group"], original_group)
-        self.assertIs(param.mesh_info.shard_process_group, original_group)
+        self.assertIs(mock_all_gather.call_args.kwargs["group"], shard_group)
+        self.assertIs(mock_reduce_scatter.call_args.kwargs["group"], shard_group)
+        self.assertIs(param.mesh_info.shard_process_group, shard_group)
 
     def test_init_all_gather_buckets_groups_by_process_group_and_dtype(self):
         """All-gather buckets should group parameters by process group and dtype."""

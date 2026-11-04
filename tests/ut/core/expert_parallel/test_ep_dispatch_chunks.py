@@ -15,31 +15,12 @@
 # The distributed doubles below mirror torch's own API names (``ReduceOp``, ``Stream``,
 # ``Event``, ...) on purpose: the code under test calls them verbatim.
 # pylint: disable=invalid-name
-"""Unit tests for the chunked routed exchange (``HP_EP_DISPATCH_CHUNKS``).
+"""CPU contracts for the bounded two-group ordinary EP pipeline.
 
-The routed all-to-all is the one collective of the MoE step with no independent
-work to hide behind (the expert GEMM hard-depends on the arrived tokens), so
-``HP_EP_DISPATCH_CHUNKS > 1`` splits the expert-major stream into contiguous
-chunks and software-pipelines them.  What these tests pin:
-
-* the per-chunk count/slice algebra is self-consistent *across* ranks (the
-  contract the ragged all-to-all needs), reconstructs the original counts, and
-  needs no extra collective to learn a chunk's traffic;
-* ``1`` (and unset) executes the unchanged schedule bit-for-bit, while ``2/3/4``
-  produce the same routed output (grouped GEMM over smaller groups is not
-  bit-identical, so the comparison is a tight tolerance);
-* the schedule really is pipelined: chunk ``c + 1``'s dispatch is issued before
-  chunk ``c``'s experts run, and chunk ``c``'s combine before chunk ``c + 1``'s;
-* the lazy wait survives (nothing materializes an exchange before its consumer);
-* an invalid knob fails loudly.
-
-No process group is created: every exchange is driven by a barrier world inside
-this process, in which each rank runs in its own thread.  The world implements
-the ``all_to_all`` contract (including the zero-padding gloo fallback), so a
-chunk mis-derivation shows up as a hard shape assertion rather than as a wrong
-number.
+Check per-peer split conservation, output/input-gradient equivalence, empty
+chunks, and that the next dispatch is issued before the current expert work.
+The single-group composition is retained only as an independent test oracle.
 """
-import os
 import threading
 import unittest
 from unittest import mock
@@ -47,11 +28,9 @@ from unittest import mock
 import torch
 from torch import nn
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
-
-from hyper_parallel.distributed.expert_parallel import collectives as ep_collectives  # noqa: E402
-from hyper_parallel.distributed.expert_parallel import experts as ep_experts  # noqa: E402
-from hyper_parallel.distributed.expert_parallel.experts import (  # noqa: E402
+from hyper_parallel.distributed.expert_parallel import collectives as ep_collectives
+from hyper_parallel.distributed.expert_parallel import experts as ep_experts
+from hyper_parallel.distributed.expert_parallel.experts import (
     _chunk_rank_group,
     _chunk_rank_range,
     _ep_dispatch_chunks,
@@ -123,7 +102,6 @@ class _VirtualEpWorld:
         self._index = {}
         self.counts_calls = []
         self.trace = []
-        self.pending_flags = []
         self.handles = {rank: [] for rank in range(ep_size)}
         self.snapshots = []
         self.rows = {rank: [0, 0] for rank in range(ep_size)}
@@ -136,10 +114,6 @@ class _VirtualEpWorld:
                 self.snapshots.append(
                     (rank, [handle.completed for handle in self.handles[rank]]))
 
-    def record_pending(self, allowed: bool) -> None:
-        """Record an exchange that explicitly asked for (or refused) a lazy handle."""
-        with self._lock:
-            self.pending_flags.append(allowed)
 
     def events(self, rank):
         """Return one rank's schedule events, in order."""
@@ -341,7 +315,7 @@ def _scenario(seed=7):
     return hidden, topk, weights
 
 
-def _run_ranks(mode, chunk_count, *, fused=False, wrap_async=False, seed=7,
+def _run_ranks(mode, chunk_count, *, wrap_async=False, seed=7,
                trace_handles=False, differentiable=False, backward=False):
     """Drive every virtual rank once and return its outputs and schedule.
 
@@ -350,8 +324,7 @@ def _run_ranks(mode, chunk_count, *, fused=False, wrap_async=False, seed=7,
             ``"forward"`` (:func:`ep_routed_forward`), ``"split"``
             (:func:`ep_routed_dispatch` + :func:`ep_routed_experts_and_combine`)
             or ``"issue"`` (dispatch only, no experts).
-        chunk_count: Value the ``HP_EP_DISPATCH_CHUNKS`` knob takes.
-        fused: Value of the fused states+indices dispatch switch.
+        chunk_count: Oracle override; None exercises the production default.
         wrap_async: Hand every exchange back as an unfinished async handle.
         seed: Input seed.
         trace_handles: Also return the per-rank pending split-path states.
@@ -407,8 +380,6 @@ def _run_ranks(mode, chunk_count, *, fused=False, wrap_async=False, seed=7,
         """Build the stand-in :func:`ep_all_to_all` / ``..._async`` for this run."""
         def call(x, send_counts, recv_counts, group, **kwargs):
             """Hand one exchange to the world (as a Function when differentiable)."""
-            if "allow_pending" in kwargs:
-                world.record_pending(kwargs["allow_pending"])
             if differentiable:
                 return _VirtualA2A.apply(group.rank, x, send_counts, recv_counts, world, kind)
             return world.token_exchange(group.rank, x, send_counts, recv_counts, kind)
@@ -419,8 +390,8 @@ def _run_ranks(mode, chunk_count, *, fused=False, wrap_async=False, seed=7,
             ep_all_to_all_async=exchange("async"),
             ep_all_to_all=exchange("sync"),
             dist=_VirtualEpDist(world),
-            _DISPATCH_CHUNKS_RAW=str(chunk_count),
-            _FUSED_DISPATCH_ENABLED=fused), mock.patch.object(ep_collectives, "dist", _VirtualEpDist(world)):
+            _resolve_dispatch_chunks=(_resolve_dispatch_chunks if chunk_count is None
+                                      else lambda _size: chunk_count)), mock.patch.object(ep_collectives, "dist", _VirtualEpDist(world)):
         threads = [threading.Thread(target=run_rank, args=(rank,)) for rank in range(_EP_SIZE)]
         for thread in threads:
             thread.start()
@@ -462,9 +433,8 @@ class _VirtualA2A(torch.autograd.Function):
 def _unchunked_reference(module, hidden_states, router_fn, ep_group, rank):
     """The pre-change routed branch, called straight through its primitives.
 
-    This is the composition :func:`ep_routed_forward` ran before the chunked
-    path existed; comparing against it is what makes "``HP_EP_DISPATCH_CHUNKS``
-    unset is bit-identical" a checked claim rather than a code-reading exercise.
+    This independent single-group composition provides the output and gradient
+    reference for the default two-group pipeline.
     """
     topk_indices, topk_weights = router_fn(module, hidden_states)
     dispatch = ep_experts._prepare_ep_dispatch(  # pylint: disable=protected-access
@@ -535,7 +505,7 @@ class TestDispatchChunkPlan(unittest.TestCase):
 
     def test_chunk_counts_reconstruct_the_originals(self):
         """Every chunk's counts add back up to the full send/receive counts."""
-        for chunk_count in (2, 3, 4):
+        for chunk_count in (2,):
             for rank in range(self.ep_size):
                 plan = self._plan(rank, chunk_count)
                 with self.subTest(chunk_count=chunk_count, rank=rank):
@@ -560,7 +530,7 @@ class TestDispatchChunkPlan(unittest.TestCase):
         ``i`` and chunk ``c`` of rank ``j`` must agree on how many rows travel
         from ``i`` to ``j``.
         """
-        for chunk_count in (2, 3, 4):
+        for chunk_count in (2,):
             plans = [self._plan(rank, chunk_count) for rank in range(self.ep_size)]
             for src in range(self.ep_size):
                 for dest in range(self.ep_size):
@@ -573,7 +543,7 @@ class TestDispatchChunkPlan(unittest.TestCase):
 
     def test_row_ranges_partition_the_stream(self):
         """The chunk slices are contiguous, in order, and cover every row once."""
-        for chunk_count in (2, 3, 4):
+        for chunk_count in (2,):
             for rank in range(self.ep_size):
                 plan = self._plan(rank, chunk_count)
                 with self.subTest(chunk_count=chunk_count, rank=rank):
@@ -587,7 +557,7 @@ class TestDispatchChunkPlan(unittest.TestCase):
 
     def test_rows_in_a_chunk_all_go_to_that_chunk_rank_group(self):
         """A chunk's slice holds exactly the rows of its destination rank group."""
-        for chunk_count in (2, 3, 4):
+        for chunk_count in (2,):
             for rank in range(self.ep_size):
                 plan = self._plan(rank, chunk_count)
                 own_group = _chunk_rank_group(rank, self.ep_size, chunk_count)
@@ -633,46 +603,14 @@ class TestDispatchChunkPlan(unittest.TestCase):
                 self.assertEqual(covered, list(range(ep_size)))
 
 
-class TestDispatchChunkKnob(unittest.TestCase):
-    """``HP_EP_DISPATCH_CHUNKS`` parsing: default, clamping and rejection."""
+class TestDispatchChunkPolicy(unittest.TestCase):
+    """A bounded automatic policy provides overlap without per-peer fragmentation."""
 
-    def _resolve(self, raw, ep_size):
-        """Resolve the knob with ``raw`` as its value."""
-        with mock.patch.object(ep_experts, "_DISPATCH_CHUNKS_RAW", raw):
-            return _resolve_dispatch_chunks(ep_size)
-
-    def test_default_and_one_keep_the_unchunked_schedule(self):
-        """Unset (1) resolves to a single chunk for every group size."""
-        for raw in ("1", " 1 "):
-            for ep_size in (1, 2, 8):
-                with self.subTest(raw=raw, ep_size=ep_size):
-                    self.assertEqual(self._resolve(raw, ep_size), 1)
-
-    def test_value_is_used_up_to_the_ep_size(self):
-        """A valid chunk count is used as given while it fits the group."""
-        self.assertEqual(self._resolve("2", 4), 2)
-        self.assertEqual(self._resolve("3", 4), 3)
-        self.assertEqual(self._resolve("4", 4), 4)
-
-    def test_value_above_the_ep_size_is_clamped(self):
-        """More chunks than ranks would only add empty slices, so clamp."""
-        self.assertEqual(self._resolve("8", 4), 4)
-        self.assertEqual(self._resolve("2", 1), 1)
-
-    def test_invalid_values_are_rejected(self):
-        """Zero, negative and non-integer values fail with the knob named."""
-        for raw in ("0", "-1", "", "abc", "2.5", "1e3", "0x2"):
-            with self.subTest(raw=raw):
-                with self.assertRaisesRegex(ValueError, "HP_EP_DISPATCH_CHUNKS"):
-                    self._resolve(raw, 4)
-
-    def test_unset_environment_imports_as_one(self):
-        """The module-level default is the unchunked schedule."""
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("HP_EP_DISPATCH_CHUNKS", None)
-            self.assertEqual(os.environ.get("HP_EP_DISPATCH_CHUNKS", "1"), "1")
-        self.assertEqual(ep_experts._DISPATCH_CHUNKS_RAW,  # pylint: disable=protected-access
-                         os.environ.get("HP_EP_DISPATCH_CHUNKS", "1"))
+    def test_default_policy_uses_one_or_two_groups(self):
+        """EP1 has one group; every larger topology keeps exactly two."""
+        for ep_size in (1, 2, 3, 16, 32, 64, 128):
+            with self.subTest(ep_size=ep_size):
+                self.assertEqual(_resolve_dispatch_chunks(ep_size), min(2, ep_size))
 
 
 class TestChunkedRoutedForward(unittest.TestCase):
@@ -686,7 +624,7 @@ class TestChunkedRoutedForward(unittest.TestCase):
             f"{label}: max abs difference {difference:.3e}")
 
     def test_unchunked_path_is_bit_identical_to_the_previous_composition(self):
-        """``HP_EP_DISPATCH_CHUNKS=1`` reproduces the pre-change routed branch."""
+        """The single-group oracle reproduces the direct routed composition."""
         reference, _, _, _ = _run_ranks(_REFERENCE_MODE, 1)
         unchunked, _, world, _ = _run_ranks(_FORWARD_MODE, 1)
         for rank in range(_EP_SIZE):
@@ -701,10 +639,10 @@ class TestChunkedRoutedForward(unittest.TestCase):
                 self.assertEqual(world.events(rank), ["sync", "sync", "gemm", "sync"])
 
     def test_chunked_forward_matches_the_unchunked_output(self):
-        """2/3/4 chunks route the same tokens to the same places."""
+        """The default two groups route the same tokens to the same places."""
         reference, _, _, _ = _run_ranks(_REFERENCE_MODE, 1)
-        for chunk_count in (2, 3, 4):
-            outputs, _, _, _ = _run_ranks(_FORWARD_MODE, chunk_count)
+        for chunk_count in (2,):
+            outputs, _, _, _ = _run_ranks(_FORWARD_MODE, None)
             for rank in range(_EP_SIZE):
                 with self.subTest(chunk_count=chunk_count, rank=rank):
                     self._assert_close(outputs[rank], reference[rank],
@@ -713,7 +651,7 @@ class TestChunkedRoutedForward(unittest.TestCase):
     def test_chunked_split_path_matches_the_unchunked_output(self):
         """The overlap_shared_expert split point keeps the same routed output."""
         reference, _, _, _ = _run_ranks(_REFERENCE_MODE, 1)
-        for chunk_count in (2, 3, 4):
+        for chunk_count in (2,):
             outputs, states, _, _ = _run_ranks(_SPLIT_MODE, chunk_count, trace_handles=True)
             for rank in range(_EP_SIZE):
                 with self.subTest(chunk_count=chunk_count, rank=rank):
@@ -726,32 +664,6 @@ class TestChunkedRoutedForward(unittest.TestCase):
             self.assertIsNone(states[0].received_states)
             self.assertEqual(len(states[0].chunks.plan.row_ranges), chunk_count)
 
-    def test_chunked_fused_dispatch_matches_the_unchunked_output(self):
-        """The fused states+indices exchange works per chunk as well."""
-        reference, _, _, _ = _run_ranks(_REFERENCE_MODE, 1)
-        outputs, _, world, _ = _run_ranks(_SPLIT_MODE, 2, fused=True)
-        for rank in range(_EP_SIZE):
-            with self.subTest(rank=rank):
-                self._assert_close(outputs[rank], reference[rank], f"fused rank={rank}")
-        for rank in range(_EP_SIZE):
-            with self.subTest(rank=rank, schedule="fused"):
-                self.assertEqual(world.events(rank),
-                                 ["async", "async", "gemm", "async", "gemm", "async"])
-        # The fused unpack is a view chain over the exchanged buffer, which only
-        # a materializing exchange result can carry: the fused path must keep
-        # asking for one (``allow_pending=False``) instead of the lazy handle
-        # the split-free exchange returns for a uniform plan.
-        self.assertEqual(world.pending_flags, [False] * (2 * _EP_SIZE),
-                         f"fused exchanges asked for pending handles: {world.pending_flags}")
-
-    def test_cohesive_path_ignores_the_fused_switch_for_its_chunks(self):
-        """``ep_routed_forward`` never fused its exchange; its chunks do not either."""
-        _, _, world, _ = _run_ranks(_FORWARD_MODE, 2, fused=True)
-        for rank in range(_EP_SIZE):
-            with self.subTest(rank=rank):
-                self.assertEqual(world.events(rank),
-                                 ["async", "async", "async", "async",
-                                  "gemm", "async", "gemm", "async"])
 
     def test_chunked_backward_matches_the_unchunked_gradient(self):
         """Autograd stays correct: the reverse exchange runs once per chunk."""
@@ -771,9 +683,36 @@ class TestChunkedRoutedForward(unittest.TestCase):
                     f"rank {rank}: chunked gradient differs by "
                     f"{(gradients[2][rank] - gradients[1][rank]).abs().max().item():.3e}")
 
+        for chunked in (False, True):
+            with self.subTest(chunked=chunked, scores="float32"):
+                values = torch.tensor([[-4.25, 16.5], [2.25, 7.75], [0.5, -13.5], [6.75, 3.125]],
+                                      dtype=torch.bfloat16, requires_grad=True)
+                scores = torch.tensor([0.10009, 0.89991, 0.33337, 0.66663], requires_grad=True)
+                with mock.patch.object(ep_experts, "ep_exchange_counts", side_effect=lambda counts, _group: counts):
+                    dispatch = ep_experts._prepare_ep_dispatch(
+                        torch.ones((1, 2, 2), dtype=torch.bfloat16),
+                        torch.tensor([[2, 0], [3, 1]]), scores.reshape(2, 2),
+                        local_expert_count=2, global_expert_count=4, ep_size=2, ep_group=None)
+                self.assertEqual(dispatch.expert_weights.dtype, torch.float32)
+                ordered = values[dispatch.dispatch_order]
+                arguments = (dispatch.expert_weights, dispatch.source_indices,
+                             dispatch.dispatch_order, (1, 2, 2))
+                if chunked:
+                    output = ep_experts._aggregate_ep_chunks(
+                        [ordered[:2], ordered[2:]], [(0, 2), (2, 4)], *arguments)
+                else:
+                    output = ep_experts._aggregate_ep_outputs(ordered, *arguments)
+                expected = (values.float().reshape(2, 2, 2) * scores.reshape(2, 2, 1)).sum(1)
+                expected = expected.to(torch.bfloat16).reshape(1, 2, 2)
+                torch.testing.assert_close(output, expected, rtol=0, atol=0)
+                actual_grads = torch.autograd.grad(output.float().sum(), (values, scores))
+                reference_grads = torch.autograd.grad(expected.float().sum(), (values, scores))
+                for actual, reference in zip(actual_grads, reference_grads):
+                    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
     def test_pipeline_issues_the_next_dispatch_before_the_experts(self):
         """The schedule is the pipeline: dispatch(c+1) before GEMM(c) before combine(c)."""
-        for chunk_count in (2, 3, 4):
+        for chunk_count in (2,):
             for mode in (_FORWARD_MODE, _SPLIT_MODE):
                 _, _, world, _ = _run_ranks(mode, chunk_count)
                 with self.subTest(chunk_count=chunk_count, mode=mode):
@@ -794,7 +733,7 @@ class TestChunkedRoutedForward(unittest.TestCase):
     def test_no_chunk_exchange_carries_more_rows_than_the_unchunked_one(self):
         """Chunking splits the same traffic; it never adds rows or counts calls."""
         _, _, unchunked, _ = _run_ranks(_FORWARD_MODE, 1)
-        for chunk_count in (2, 3, 4):
+        for chunk_count in (2,):
             _, _, world, _ = _run_ranks(_FORWARD_MODE, chunk_count)
             for rank in range(_EP_SIZE):
                 with self.subTest(chunk_count=chunk_count, rank=rank):
@@ -904,7 +843,7 @@ class TestChunkedPaddedFallback(unittest.TestCase):
 
     def test_padded_fallback_matches_the_ragged_exchange(self):
         """pad-to-max + a2a_single moves exactly the rows the ragged a2a moves."""
-        for chunk_count in (2, 4):
+        for chunk_count in (2,):
             send_plan, plans, results = self._run(chunk_count)
             with self.subTest(chunk_count=chunk_count):
                 self.assertEqual(

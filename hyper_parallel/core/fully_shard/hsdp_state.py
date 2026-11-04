@@ -604,27 +604,6 @@ class HSDPStateV2:
         )
         self.unshard(async_op=True)
 
-    def set_all_gather_process_group(self, group: dist.ProcessGroup) -> None:
-        """单独设置参数 AG 通道，梯度 RS 仍使用原分片组。
-
-        Args:
-            group: 与原分片组成员及 rank 顺序相同的新通信组。
-
-        Example:
-            EFS 组 [0,4] 用新组提前恢复权重，梯度仍经原 [0,4] 组归约。
-        """
-        if self.param_group is not None and self.param_group.all_gather_buckets:
-            raise RuntimeError("必须在 FSDP 融合 AG bucket 初始化之前设置通信通道")
-        expected = dist.get_process_group_ranks(group)
-        for param in self.hsdp_params:
-            if param.shard_world_size <= 1:
-                continue
-            original = getattr(param.mesh_info, "shard_process_group", None)
-            if original is None or dist.get_process_group_ranks(original) != expected:
-                raise ValueError("AG 新组必须与原 FSDP 分片组保持相同成员及rank顺序")
-        for param in self.hsdp_params:
-            if param.shard_world_size > 1:
-                param.all_gather_process_group = group
 
     def wait_for_unshard(self) -> None:
         """wait for all unshard parameters"""

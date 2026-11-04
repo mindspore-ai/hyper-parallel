@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
 from typing import Any
 
 import torch
@@ -54,7 +53,7 @@ def _prepare_forward(hidden: torch.Tensor, gate: list, down: list, intermediate:
         group_metadata = (torch.empty((plan.route.received_rows, 8), dtype=torch.int64, device=hidden.device)
                          if executor.token_dedup else None)
         pipeline = plan.compute.forward_pipeline
-        publish_each_block = (os.environ.get("HP_MOONEP_TILE_READY", "0") == "1" and pipeline.enabled
+        publish_each_block = (pipeline.enabled
                               and pipeline.supports(hidden.shape[-1], intermediate, gate, down,
                                                     len(plan.route.boundaries)))
         incoming = prepare_exchange(hidden.contiguous(), plan.route, runtime.workspace,

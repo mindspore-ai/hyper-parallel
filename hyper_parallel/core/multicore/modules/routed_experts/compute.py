@@ -180,12 +180,6 @@ class NativeExpertCompute:
         if limit is None:
             torch.ops.hyper_parallel.routed_experts_swiglu(preact, output)
             return
-        if preact.device.type != "npu":
-            gate, up = preact.chunk(2, dim=-1)
-            gate = gate.float().clamp_(max=limit)
-            up = up.float().clamp_(min=-limit, max=limit)
-            output.copy_((torch.nn.functional.silu(gate) * up).to(output.dtype))
-            return
         torch.ops.hyper_parallel.routed_experts_clipped_swiglu(preact, output, limit)
 
     def _activation_gradient(self, derivative: torch.Tensor, preact: torch.Tensor,
@@ -194,19 +188,6 @@ class NativeExpertCompute:
         limit = self.swiglu_limit
         if limit is None:
             torch.ops.hyper_parallel.routed_experts_swiglu_backward(derivative, preact, output)
-            return
-        if preact.device.type != "npu":
-            raw_gate, raw_up = preact.chunk(2, dim=-1)
-            gate = raw_gate.float().clamp_(max=limit)
-            up = raw_up.float().clamp_(min=-limit, max=limit)
-            sigmoid = gate.sigmoid()
-            silu = gate * sigmoid
-            dy = derivative.float()
-            middle = raw_gate.shape[-1]
-            output[:, :middle].copy_((dy * up * sigmoid * (1 + gate * (1 - sigmoid))
-                                       * (raw_gate <= limit)).to(output.dtype))
-            output[:, middle:].copy_((dy * silu * (raw_up >= -limit)
-                                       * (raw_up <= limit)).to(output.dtype))
             return
         torch.ops.hyper_parallel.routed_experts_clipped_swiglu_backward(derivative, preact, output, limit)
 
@@ -350,11 +331,6 @@ class NativeExpertCompute:
             work.ready.poll_after.queued = True
         return work.result, work.ready
 
-    def linear(self, x: torch.Tensor, weights: Sequence[torch.Tensor], cols: int, *,
-               dependency: ExpertReadiness | None = None, publish: bool = False,
-               output: torch.Tensor | None = None) -> tuple:
-        """Prepare and submit one projection for callers without phase admission."""
-        return self.run_linear(self.prepare_linear(x, weights, cols, publish=publish, output=output), dependency)
 
     def prepare_gradient(self, x: torch.Tensor, dy: torch.Tensor, *,
                          output: torch.Tensor | None = None) -> GradientWork:
@@ -405,10 +381,6 @@ class NativeExpertCompute:
                 work.x, work.dy, self.prefix, work.tasks, work.result, work.config, work.cores)
         return work.result
 
-    def gradient(self, x: torch.Tensor, dy: torch.Tensor, *,
-                 output: torch.Tensor | None = None) -> torch.Tensor:
-        """Prepare and submit one FP32 partial for callers without phase admission."""
-        return self.run_gradient(self.prepare_gradient(x, dy, output=output))
 
     def _consume(self, work: LinearWork | GradientWork | ForwardWork | BackwardWork) -> None:
         """Reject reuse because published readiness cells are valid for one phase only."""
@@ -455,11 +427,6 @@ class NativeExpertCompute:
         self.run_linear(work.down)
         return work.output, work.state, work.ready
 
-    @torch.no_grad()
-    def forward(self, x: torch.Tensor, gate: Sequence[torch.Tensor], down: Sequence[torch.Tensor],
-                intermediate: int, dependency: ExpertReadiness | None = None) -> tuple:
-        """Prepare and submit F/replay, retaining X/Z and regenerating A in backward."""
-        return self.run_forward(self.prepare_forward(x, gate, down, intermediate), dependency)
 
     @torch.no_grad()
     def prepare_backward(self, dv: torch.Tensor, state: ExpertState, gate: Sequence[torch.Tensor],
@@ -519,13 +486,6 @@ class NativeExpertCompute:
         publish("gate", work.gate_gradient)
         self.run_linear(work.dx_work)
         return work.output, work.ready
-
-    @torch.no_grad()
-    def backward(self, dv: torch.Tensor, state: ExpertState, gate: Sequence[torch.Tensor],
-                 down: Sequence[torch.Tensor], publish: Callable[[str, torch.Tensor], None],
-                 dependency: ExpertReadiness | None = None) -> tuple:
-        """Prepare and submit B, publishing two independent FP32 owner-return inputs."""
-        return self.run_backward(self.prepare_backward(dv, state, gate, down), publish, dependency)
 
 
 def combine(values: torch.Tensor, inverse_order: torch.Tensor, scores: torch.Tensor | None,

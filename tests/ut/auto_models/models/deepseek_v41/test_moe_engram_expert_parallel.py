@@ -34,7 +34,6 @@ except ImportError as exc:
 from hyper_parallel.components import functional as hp_functional
 from hyper_parallel.distributed.expert_parallel.moonep import configure_moonep
 from hyper_parallel.distributed.expert_parallel.moonep.fused.executor import SparseMoonEPExecutor
-from hyper_parallel.distributed.expert_parallel.moonep.legacy import MoonEPExecutor as LegacyMoonEPExecutor
 from hyper_parallel.distributed._builder.rule_resolver import _resolve_local_compute_fn
 from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
     _deepseek_moonep_weights,
@@ -481,26 +480,3 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
                 with patch.object(SparseMoonEPExecutor, "__call__", return_value=torch.zeros(1, 2, 16)) as invoke:
                     compute(module, torch.randn(1, 2, 16, dtype=torch.bfloat16))
                 self.assertEqual(invoke.call_args.args[2].dtype, torch.float32)
-
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
-    def test_moonep_legacy_factory_uses_generic_module(self) -> None:
-        """旧版对照选项从通用 MoonEP 目录绑定执行器。"""
-        experts = DeepseekV4Experts(_expert_config())
-        gate = Mock()
-        gate.num_experts = 4
-        gate.top_k = 2
-        gate.return_value = (None, torch.ones(2, 2), torch.tensor([[0, 1], [2, 3]]))
-        module = SimpleNamespace(
-            gate=gate, experts=experts, shared_experts=torch.nn.Identity(), is_hash=False,
-            forward=lambda hidden_states, input_ids=None: hidden_states,
-        )
-        ep_mesh = Mock()
-        ep_mesh.get_group.return_value = None
-        ep_mesh.__getitem__ = Mock(return_value=SimpleNamespace(size=lambda: 1))
-        compute = deepseek_v41_ep_compute_fn(
-            module=module, mesh=None, tp_mesh=None, cp_mesh=None,
-            ep_mesh=ep_mesh, use_moonep=True, moonep_lifecycle=False,
-        )
-        self.assertIsInstance(experts._moonep_executor, LegacyMoonEPExecutor)  # pylint: disable=protected-access
-        self.assertEqual(compute(module, torch.randn(1, 2, 16)).shape, (1, 2, 16))

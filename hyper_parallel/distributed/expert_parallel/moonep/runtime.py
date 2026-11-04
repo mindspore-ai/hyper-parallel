@@ -209,9 +209,6 @@ class MoonEPRuntime:
                           for param in state.hsdp_params if param.shard_world_size > 1}
                 if len(groups) > 1:
                     raise ValueError("一个专家单元的参数必须使用同一EFS分片组")
-                if any(param.all_gather_process_group is not param.mesh_info.shard_process_group
-                       for param in state.hsdp_params if param.shard_world_size > 1):
-                    raise ValueError("专家AG必须复用DeviceMesh的EFS分片组")
                 extension = MoonEPAllGatherExtension(executor, self)
                 scheduler.register_all_gather_extension(extension)
                 executor.all_gather_extension = extension
@@ -787,7 +784,7 @@ class MoonEPExecutor:
         self.runtime.statistics["plans"] += 1
         self.runtime.statistics["planner_fallbacks"] += int(used_fallback)
         with torch.profiler.record_function("moonep::plan::compile"):
-            plan = compile_plan(counts_cpu, allocation, ids, self.rank, used_fallback)
+            plan = compile_plan(counts_cpu, allocation, ids, self.rank)
         self.runtime.statistics["moved_entries"] += plan.metrics[1]
         self.runtime.statistics["peak_copies"] = max(self.runtime.statistics["peak_copies"], plan.metrics[2])
         self.runtime.statistics["remote_experts_max"] = max(
@@ -868,8 +865,8 @@ class MoonEPExecutor:
         return _combine_returned_tokens(hidden, returned, scores, plan, source_rows)
 
 
-def _configure_legacy_prefetch(model: torch.nn.Module, executors: list, prefetch_depth: int | None) -> bool:
-    """Resolve only legacy standalone prefetch after sparse dispatch has returned."""
+def _configure_standalone_prefetch(model: torch.nn.Module, executors: list, prefetch_depth: int | None) -> bool:
+    """Resolve nonfused standalone prefetch after sparse dispatch has returned."""
     # FSDP 决定何时对专家发起 AG；扩展 hook 随之触发 EP 通信，不读取预取深度。
     schedulers = [module.hsdp_scheduler for module in model.modules()
                   if getattr(module, "hsdp_scheduler", None) is not None]
@@ -896,15 +893,15 @@ def configure_moonep(model: torch.nn.Module, *,
 
     Args:
         model: 已绑定专家执行器的完整模型。
-        prefetch_depth: 仅旧 MoonEP 无 FSDP 脚本路径的兼容参数；稀疏路径与 FSDP 模式不接受此参数。
+        prefetch_depth: 仅非融合 MoonEP 无 FSDP 路径的参数；稀疏路径与 FSDP 模式不接受此参数。
 
     Returns:
-        旧 MoonEP 或独立稀疏运行时；每次 optimizer 更新前调用 finish_step()。
+        非融合 MoonEP 或独立稀疏运行时；每次 optimizer 更新前调用 finish_step()。
 
     Note:
         稀疏路径要求所有 rank 在完整顺序前向后调用 runtime.backward(loss)，
         且 retain_graph=False、create_graph=False；不能直接调用 loss.backward()。
-        旧路径仍可使用普通 loss.backward()。所有图和流结束后，各 rank 一起调用 close()。
+        非融合路径仍可使用普通 loss.backward()。所有图和流结束后，各 rank 一起调用 close()。
     """
     executors = [module._moonep_executor for module in model.modules()  # pylint: disable=protected-access
                  if isinstance(getattr(module, "_moonep_executor", None), (MoonEPExecutor, SparseMoonEPExecutor))]
@@ -918,7 +915,7 @@ def configure_moonep(model: torch.nn.Module, *,
         runtime = SparseMoonEPRuntime(executors)
         model._moonep_runtime = runtime  # pylint: disable=protected-access
         return runtime
-    standalone_prefetch = _configure_legacy_prefetch(model, executors, prefetch_depth)
+    standalone_prefetch = _configure_standalone_prefetch(model, executors, prefetch_depth)
     runtime = MoonEPRuntime(executors, standalone_prefetch=standalone_prefetch)
     model._moonep_runtime = runtime  # pylint: disable=protected-access
     return runtime

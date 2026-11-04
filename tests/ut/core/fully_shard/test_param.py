@@ -16,7 +16,6 @@
 # pylint: disable=protected-access
 
 import gc
-import os
 import unittest
 import weakref
 from functools import partial
@@ -89,7 +88,6 @@ def _new_param():
     hsdp_param.reduce_partial_output = None
     hsdp_param.mesh_info = object.__new__(HSDPMeshInfo)
     hsdp_param.mesh_info.shard_process_group = None
-    hsdp_param.all_gather_process_group = None
     hsdp_param.mesh_info.replicate_process_group = None
     hsdp_param.sharded_state = ShardedState.SHARDED
     return hsdp_param
@@ -136,7 +134,7 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
             with self.subTest(wait_fails=wait_fails):
                 parameter = _new_param()
                 parameter.param_dtype = torch.bfloat16
-                parameter.all_gather_process_group = "test-group"
+                parameter.mesh_info.shard_process_group = "test-group"
                 parameter.init_unsharded_param = MagicMock()
                 parameter.to_unsharded = MagicMock()
                 references = {}
@@ -211,7 +209,7 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         """
         parameter = _new_param()
         parameter.param_dtype = torch.bfloat16
-        parameter.all_gather_process_group = "test-group"
+        parameter.mesh_info.shard_process_group = "test-group"
         storage = torch.empty(4, dtype=torch.bfloat16)
         borrowed = storage[:2]
         address = storage.data_ptr()
@@ -249,7 +247,7 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
             parameter = _new_param()
             parameter.param_dtype = torch.bfloat16
             parameter.shard_world_size = world_size
-            parameter.all_gather_process_group = group
+            parameter.mesh_info.shard_process_group = group
             buffer = torch.empty(2, dtype=torch.bfloat16)
             with self.assertRaisesRegex(ValueError, "实际执行 all-gather"):
                 parameter.unshard(input_buffer=buffer)
@@ -260,19 +258,18 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
 
     @patch("hyper_parallel.core.fully_shard.hsdp_param.dist.reduce_scatter_tensor")
     @patch("hyper_parallel.core.fully_shard.hsdp_param.dist.all_gather_into_tensor")
-    def test_independent_ag_route_preserves_original_rs_group(self, mock_all_gather, mock_reduce_scatter):
-        """非融合AG使用独立通道，RS保持原组；例如两个矩阵可分别发AG而不改梯度归属。"""
+    def test_ag_and_rs_reuse_mesh_shard_group(self, mock_all_gather, mock_reduce_scatter):
+        """Parameter AG and gradient RS both use the mesh's shard group."""
         param = _new_param()
         param.param_dtype = None
-        param.mesh_info.shard_process_group = "original-rs"
-        param.all_gather_process_group = "prefetch-ag"
+        param.mesh_info.shard_process_group = "shard-group"
 
         param._get_unsharded_param_data(async_op=True)
         param._unsharded_param.grad = torch.ones(4)
         param.reduce_scatter_grad(async_op=True)
 
-        self.assertEqual(mock_all_gather.call_args.kwargs["group"], "prefetch-ag")
-        self.assertEqual(mock_reduce_scatter.call_args.kwargs["group"], "original-rs")
+        self.assertEqual(mock_all_gather.call_args.kwargs["group"], "shard-group")
+        self.assertEqual(mock_reduce_scatter.call_args.kwargs["group"], "shard-group")
 
     def test_reduce_comm_dtype_prefers_parameter_policy_and_falls_back_to_grad(self):
         """Effective reduction dtype should be resolved entirely by the parameter."""

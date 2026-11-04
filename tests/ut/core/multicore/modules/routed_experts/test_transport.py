@@ -201,16 +201,6 @@ class TestPreparedExchange(unittest.TestCase):
         self.native.assert_not_called()
 
 
-    def test_begin_exchange_converges_local_preparation_failure(self):
-        """A malformed source still reaches the compatibility preflight once."""
-        with self.assertRaisesRegex(RuntimeError, "preflight failed"):
-            transport.begin_exchange(self.source.float(), self.route, self.workspace)
-
-        self.workspace.check_preflight.assert_called_once()
-        self.assertIsInstance(self.workspace.check_preflight.call_args.args[0], ValueError)
-        self.native.assert_not_called()
-
-
     def test_prepared_reverse_joins_latest_producer_poll_record_before_launch(self):
         """Preparation stores the event; submission waits its post-producer-setup generation."""
         source = torch.empty((4, 16), dtype=torch.bfloat16)

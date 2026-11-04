@@ -203,8 +203,6 @@ class HSDPParamV2:
         self._param_fqn: Optional[str] = None
         self.unsharded_param_buffers: List[torch.Tensor] = []
         self.allgather_comm_ctx = AllGatherCommCtx()
-        # 参数 AG 可走独立通信组；梯度 RS 仍沿用原分片组。
-        self.all_gather_process_group = getattr(self.mesh_info, "shard_process_group", None)
         self._post_load_hook_handle = (
             module_info.module.register_load_state_dict_post_hook(
                 lambda *args, **kwargs: self.reset_sharded_param()
@@ -1070,11 +1068,11 @@ class HSDPParamV2:
         if input_buffer is None:
             all_gather_input = self.all_gather_inputs[0]
         else:
-            if self.shard_world_size <= 1 or self.all_gather_process_group is None:
+            if self.shard_world_size <= 1 or self.mesh_info.shard_process_group is None:
                 raise ValueError("借用 AG 输入只支持实际执行 all-gather 的分片参数")
             all_gather_input = self.copy_all_gather_input(input_buffer)
 
-        if self.shard_world_size <= 1 or self.all_gather_process_group is None:
+        if self.shard_world_size <= 1 or self.mesh_info.shard_process_group is None:
             if len(self.unsharded_param_buffers) == 0:
                 self.unsharded_param_buffers = [all_gather_input]
             elif self.unsharded_param_buffers[0] is not all_gather_input:
@@ -1108,7 +1106,7 @@ class HSDPParamV2:
             self.allgather_comm_ctx.allgather_handle = dist.all_gather_into_tensor(
                 self.allgather_comm_ctx.allgather_output,
                 all_gather_input,
-                group=self.all_gather_process_group,
+                group=self.mesh_info.shard_process_group,
                 async_op=async_op,
             )
 

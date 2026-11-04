@@ -19,8 +19,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import cached_property
 
-import torch
-
 
 @dataclass(frozen=True)
 class RouteEdge:
@@ -126,15 +124,3 @@ class RouteDescriptor:
         for incoming, edges, extent in ((False, self.outgoing, self.source_rows),
                                          (True, self.incoming, self.received_rows)):
             self._validate_edge_coverage(incoming, edges, extent, expert_ranges)
-
-    def packed_edges(self, *, incoming: bool = False) -> torch.Tensor:
-        """Return CPU int64 ABI rows [source,target,expert,source_row,target_row,rows]."""
-        edges = self.incoming if incoming else self.outgoing
-        return torch.tensor([(edge.source, edge.target, edge.expert, edge.source_row,
-                              edge.target_row, edge.rows) for edge in edges], dtype=torch.int64).reshape(-1, 6)
-
-    def communication_blocks(self, block_rows: int) -> tuple[RouteEdge, ...]:
-        """Return only actual remote sends; local rows bypass the transport ring."""
-        if isinstance(block_rows, bool) or not isinstance(block_rows, int) or block_rows < 1:
-            raise ValueError("block_rows must be a positive integer")
-        return tuple(block for edge in self.outgoing if edge.target != self.rank for block in edge.blocks(block_rows))

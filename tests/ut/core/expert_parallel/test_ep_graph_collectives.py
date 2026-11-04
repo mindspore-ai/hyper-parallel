@@ -36,10 +36,33 @@ class TestEpGraphCollectives(unittest.TestCase):
         """The eager helper invokes the original count collective unchanged."""
         counts = torch.tensor([0, 3])
         with patch("hyper_parallel.distributed.expert_parallel.collectives.dist") as backend:
+            backend.get_backend.return_value = "hccl"
             backend.all_to_all_single.side_effect = lambda out, value, **kwargs: out.copy_(value.flip(0))
             received = ep_exchange_counts(counts, "ep")
-        self.assertEqual(ep_split_sizes(received), [3, 0])
-        self.assertEqual(backend.all_to_all_single.call_args.kwargs, {"group": "ep"})
+            self.assertEqual(ep_split_sizes(received), [3, 0])
+            self.assertEqual(backend.all_to_all_single.call_args.kwargs, {"group": "ep"})
+            payload = torch.arange(12, dtype=torch.float32).reshape(3, 4).requires_grad_()
+            output = collectives.ep_all_to_all(payload, [0, 3], [3, 0], "ep")
+            derivative = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+            gradient, = torch.autograd.grad(output, payload, derivative)
+            torch.testing.assert_close(output, payload.flip(0), rtol=0, atol=0)
+            torch.testing.assert_close(gradient, derivative.flip(0), rtol=0, atol=0)
+            self.assertEqual(backend.all_to_all_single.call_args.kwargs, {
+                "output_split_sizes": [0, 3], "input_split_sizes": [3, 0], "group": "ep",
+            })
+            backend.all_to_all.assert_not_called()
+
+    def test_async_entry_keeps_the_lazy_exchange_on_an_uneven_plan(self):
+        """Async payloads retain their split lists and lazy tensor ownership."""
+        payload = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        pending = collectives._functional_collectives.AsyncCollectiveTensor(payload)
+        with patch.object(collectives, "dist") as backend, \
+                patch.object(collectives, "differentiable_all_to_all_single_async", return_value=pending) as issue:
+            backend.get_backend.return_value = "hccl"
+            output = collectives.ep_all_to_all_async(payload, [0, 3], [3, 0], "ep")
+        self.assertIs(output, pending)
+        issue.assert_called_once_with(payload, [0, 3], [3, 0], "ep")
+        backend.all_to_all_single.assert_not_called()
 
     def test_one_graph_keeps_runtime_split_sizes(self):
         """A fixed-size count vector can describe empty or changing receives."""

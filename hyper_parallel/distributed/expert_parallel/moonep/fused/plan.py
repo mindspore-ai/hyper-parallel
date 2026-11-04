@@ -92,25 +92,3 @@ def compile_local_route(counts: torch.Tensor, allocation: torch.Tensor, rank: in
     if isinstance(rank, bool) or not isinstance(rank, int) or not 0 <= rank < source.shape[0]:
         raise ValueError("route rank must identify a PE in the expert group")
     return _compile_rank(source, target, rank)
-
-
-def compile_sparse_route(counts: torch.Tensor, allocation: torch.Tensor) -> tuple[RouteDescriptor, ...]:
-    """Compile the same source-ordered interval intersections on every rank.
-
-    Args:
-        counts: CPU int64 [source PE, global expert] histogram.
-        allocation: CPU int64 [global expert, target PE] MoonEP allocation.
-
-    Returns:
-        Immutable per-rank descriptors containing only nonempty ranges. Source
-        offsets address stable expert-sorted selections, not expanded payloads.
-
-    Raises:
-        ValueError: Invalid dtype, shape, negative counts, overflow or lost rows.
-
-    Example:
-        Four e0 selections split two per rank produce two actual ranges, even
-        if the caller's replica capacity could hold many more experts.
-    """
-    source, target = _checked_tables(counts, allocation)
-    return tuple(_compile_rank(source, target, rank) for rank in range(source.shape[0]))

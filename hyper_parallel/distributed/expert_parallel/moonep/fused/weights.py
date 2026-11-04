@@ -194,12 +194,6 @@ class TransferDomain:
             raise
         self.parked = False
 
-    @property
-    def has_free_slot(self) -> bool:
-        """Whether W can claim a slot; its last-reader event may still be pending."""
-        with self._lock:
-            return (self.admitted and not self.parked and not self.poisoned and self.dtype == torch.bfloat16
-                    and any(not slot.in_use for slot in self._pool.slots))
 
     def check_preflight(self, error: Exception | None) -> None:
         """Converge preparation before the fixed-order replica collectives."""

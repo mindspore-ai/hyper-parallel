@@ -45,14 +45,11 @@ class ExecutionPlan:
     home_positions: torch.Tensor
     home_rows: torch.Tensor
     remote_positions: torch.Tensor
-    remote_rows: torch.Tensor
     home_count: int
     any_migration: bool
     metrics: tuple[int, ...]
-    used_fallback: bool
     weight_ranges: tuple[tuple[int, int] | None, ...]
     home_dense: bool
-    source_counts: torch.Tensor | None = None
     dedup: TokenDedup | None = None
 
 
@@ -118,43 +115,6 @@ def _entry_order(counts: torch.Tensor, allocation: torch.Tensor,
     else:
         target_order = _stable_order(destinations)
     return expert_order[target_order]
-
-
-def _cpu_plan_metrics(allocation: list[list[int]], totals: list[int],
-                      capacities: list[int]) -> tuple[int, ...]:
-    """从已有CPU整数列表计算与设备版完全相同的六项指标。
-
-    输入分别是[E,R]分配、[E]专家总量、[R]副本容量；输出依次为
-    合法标志、迁移量M、收发副本峰值z、总副本、迁移下界M0、M最优证书。
-    例如allocation=[[2,2],[0,0]]、totals=[4,0]、capacities=[1,1]
-    返回(1,2,1,1,2,1)：两条e0迁到rank1，达到最小迁移量。
-    """
-    experts, ranks = len(totals), len(capacities)
-    if (ranks < 1 or experts < 1 or experts % ranks or len(allocation) != experts
-            or any(len(row) != ranks for row in allocation)):
-        raise ValueError("CPU规划指标要求合法的[E,R]、[E]、[R]形状")
-    home_count = experts // ranks
-    loads, incoming, outgoing = [0] * ranks, [0] * ranks, [0] * ranks
-    valid = all(value >= 0 for value in totals) and all(value >= 0 for value in capacities)
-    moved = 0
-    for expert, row in enumerate(allocation):
-        home = expert // home_count
-        valid = valid and all(value >= 0 for value in row) and sum(row) == totals[expert]
-        for target, value in enumerate(row):
-            loads[target] += value
-            if target != home:
-                # 非法候选也保留设备版的精确指标语义：负配额计入M，但不算启用副本。
-                moved += value
-                if value > 0:
-                    incoming[target] += 1
-                    outgoing[home] += 1
-    total = sum(totals)
-    targets = [total // ranks + int(rank < total % ranks) for rank in range(ranks)]
-    valid = valid and loads == targets and all(count <= capacity for count, capacity in zip(incoming, capacities))
-    lower_bound = sum(max(0, sum(totals[rank * home_count:(rank + 1) * home_count]) - targets[rank])
-                      for rank in range(ranks))
-    return (int(valid), moved, max(incoming + outgoing), sum(incoming),
-            lower_bound, int(valid and moved == lower_bound))
 
 
 def _cpu_candidates(totals: np.ndarray, ranks: int, rules: tuple[bool, ...]) -> np.ndarray:
@@ -303,7 +263,7 @@ def _receive_order_metadata(receive_counts: torch.Tensor | np.ndarray) -> tuple[
 
 
 def compile_plan(counts: torch.Tensor, allocation: torch.Tensor, ids: torch.Tensor,
-                 rank: int, used_fallback: bool = False) -> ExecutionPlan:
+                 rank: int) -> ExecutionPlan:
     """将小规划编译成设备索引和HCCL split，反向/重算直接复用。
 
     Example:
@@ -342,8 +302,7 @@ def compile_plan(counts: torch.Tensor, allocation: torch.Tensor, ids: torch.Tens
 
     # 所有短索引和路由前缀只传一次；这些 CPU 元数据本来就用于 HCCL 的动态 split。
     metadata_rows = [list(accumulate(group_counts)), send_ids, local_positions,
-                     [active[i] % home_count for i in local_positions], remote_positions,
-                     [remote_row[active[i]] for i in remote_positions]]
+                     [active[i] % home_count for i in local_positions], remote_positions]
     spans, ranges = [], []
     begin = 0
     while begin < len(active):
@@ -363,8 +322,8 @@ def compile_plan(counts: torch.Tensor, allocation: torch.Tensor, ids: torch.Tens
     lengths = [len(row) for row in metadata_rows]
     packed = torch.tensor([value for row in metadata_rows for value in row], dtype=torch.long).to(device)
     pieces = packed.split(lengths)
-    boundaries, sent_ids, home_positions, home_rows, remote_positions_device, remote_rows = pieces[:6]
-    weight_spans = tuple((*span, rows) for span, rows in zip(spans, pieces[6:-3]))
+    boundaries, sent_ids, home_positions, home_rows, remote_positions_device = pieces[:5]
+    weight_spans = tuple((*span, rows) for span, rows in zip(spans, pieces[5:-3]))
     route_metadata, receive_offsets_device, repeat_counts = pieces[-3:]
     # 已知每段源/目标起点，只展开平移量；output_size避免动态尺寸读取设备。
     received = sum(token_recv)
@@ -378,7 +337,6 @@ def compile_plan(counts: torch.Tensor, allocation: torch.Tensor, ids: torch.Tens
     return ExecutionPlan(
         allocation, dispatch_order, unpermute_indices, sort_order,
         boundaries, group_counts, token_send, token_recv, weight_send, weight_recv, sent_ids, weight_spans,
-        home_positions, home_rows, remote_positions_device, remote_rows,
-        home_count, any(bool(entries) for entries in remote), tuple(metrics), used_fallback, tuple(ranges),
-        home_dense, counts,
+        home_positions, home_rows, remote_positions_device,
+        home_count, any(bool(entries) for entries in remote), tuple(metrics), tuple(ranges), home_dense,
     )

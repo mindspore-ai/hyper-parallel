@@ -18,7 +18,7 @@ import unittest
 
 import torch
 
-from hyper_parallel.core.multicore.modules.routed_experts.reference import (
+from tests.common.moonep.reference import (
     backward_values, combine, combine_gradient, forward_values, grouped_gradient, swiglu,
 )
 from hyper_parallel.distributed.expert_parallel.moonep.fused.transfers import (
