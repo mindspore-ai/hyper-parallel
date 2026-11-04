@@ -259,6 +259,7 @@ if __name__ == '__main__':
             'hyper_parallel.models.deepseek_v41': [
                 'generated/*.json', 'generated/*.diff',
             ],
+            'hyper_parallel.models.deepseek_v41.tools': ['*.sh', '*.yaml', '*.md'],
             'hyper_parallel.auto_parallel': ['op_profiles/*.yaml', 'op_records.yaml'],
             'hyper_parallel.models.deepseek_v3': ['recipes/*.yaml'],
             'hyper_parallel.auto_parallel.sapp_nd.memory_estimation': [

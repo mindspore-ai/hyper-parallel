@@ -28,7 +28,7 @@ from hyper_parallel.components.functional.aux_loss import (
     bind_aux_loss_scale,
 )
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import shared_compressed_indexer_kl_loss
-from hyper_parallel.models.deepseek_v41.aux_loss import sequence_load_balancing_loss, update_modality_bias
+from hyper_parallel.models.deepseek_v41.adapter.aux_loss import sequence_load_balancing_loss, update_modality_bias
 from tests.common.mark_utils import arg_mark
 
 
@@ -109,7 +109,7 @@ class TestSequenceLoadBalancingLoss(unittest.TestCase):
             indices = torch.zeros(tokens, 2, dtype=torch.long)
             ids = torch.zeros(tokens, dtype=torch.long)
             group = object()
-            module = "hyper_parallel.models.deepseek_v41.aux_loss"
+            module = "hyper_parallel.models.deepseek_v41.adapter.aux_loss"
             with patch(f"{module}.dist.all_reduce") as reduce_counts, patch(
                     f"{module}.differentiable_all_reduce", side_effect=lambda tensor, *args: tensor,
             ) as reduce_probs:
@@ -144,7 +144,7 @@ class TestSequenceLoadBalancingLoss(unittest.TestCase):
             remote_sum = torch.zeros(2, 3).index_add(
                 0, remote_ids, functional.normalize(values[remote_slice], p=1, dim=-1),
             )
-            module = "hyper_parallel.models.deepseek_v41.aux_loss"
+            module = "hyper_parallel.models.deepseek_v41.adapter.aux_loss"
             with (
                 patch(f"{module}.dist.all_reduce",
                       side_effect=lambda tensor, counts=remote_counts, **kwargs: tensor.add_(counts)),

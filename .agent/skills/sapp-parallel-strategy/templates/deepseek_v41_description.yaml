@@ -15,8 +15,9 @@
 # config.json at text_parameter_divisor 8 and num_routed_experts 16; the rest
 # mirrors train_deepseek_v41_online.yaml, so ND prices the run that launches.
 #
-#   describe:  python nd_describe_deepseek_v41.py spec <model dir>
-#   check:     python nd_describe_deepseek_v41.py verify <model dir> \
+# Run from the repository root:
+#   describe:  python hyper_parallel/models/deepseek_v41/tools/nd_describe_deepseek_v41.py spec <model dir>
+#   check:     python hyper_parallel/models/deepseek_v41/tools/nd_describe_deepseek_v41.py verify <model dir> \
 #                  --assets <engram assets> --spec-yaml <this file>
 #   rank:      python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd \
 #                  -y <this file> -f hyper_v2 -d 16 -A A3 -b 16 -t 8 -mppb

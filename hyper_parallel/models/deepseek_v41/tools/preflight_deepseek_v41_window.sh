@@ -38,7 +38,7 @@
 #   profile taken on the reference is not a production run's.
 #
 # Usage:
-#   ./preflight_deepseek_v41_window.sh /path/to/DeepSeek-V4.1-Flash
+#   bash hyper_parallel/models/deepseek_v41/tools/preflight_deepseek_v41_window.sh <model>
 #
 # Exit status is 0 only when every FAIL-level check passed. WARN items do not
 # fail the run; they change what the window can be used for, so read them.
@@ -46,7 +46,7 @@
 set -uo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-PROJECT_ROOT=$(cd "${SCRIPT_DIR}/../../.." && pwd)
+PROJECT_ROOT=$(cd "${SCRIPT_DIR}/../../../.." && pwd)
 PYTHON_BIN=${PYTHON_BIN:-python}
 NPROC_PER_NODE=${NPROC_PER_NODE:-16}
 # A device holding more than this is somebody else's run, not driver overhead.
@@ -190,7 +190,8 @@ else
 fi
 
 head2 "7. What the launcher states, which the repeat script has to override"
-iters=$(grep -E '^[[:space:]]*train_iters:' "${SCRIPT_DIR}/train_deepseek_v41_online.yaml" \
+iters=$(grep -E '^[[:space:]]*train_iters:' \
+    "${PROJECT_ROOT}/examples/training_demo/deepseek_v41/train_deepseek_v41_online.yaml" \
     | head -1 | tr -d ' ' | cut -d: -f2)
 printf 'INFO  train_deepseek_v41_online.yaml states train_iters: %s\n' "${iters:-unknown}"
 if [[ "${iters:-1}" -le 5 ]]; then

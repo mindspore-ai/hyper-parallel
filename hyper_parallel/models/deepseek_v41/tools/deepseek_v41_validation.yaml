@@ -30,8 +30,8 @@ reference:
 launcher:
   # Python module launched by torchrun for every generated matrix case.
   module: examples.training_demo.train_text
-  # Trainer recipe, resolved relative to this validation manifest.
-  config: train_deepseek_v41_online.yaml
+  # Keep the runnable Trainer recipe in examples; resolve relative to this manifest.
+  config: ../../../../examples/training_demo/deepseek_v41/train_deepseek_v41_online.yaml
   # Per-process-group launch timeout in seconds.
   timeout_seconds: 7200
 

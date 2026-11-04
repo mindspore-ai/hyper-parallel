@@ -16,90 +16,75 @@
 
 set -euo pipefail
 
+# Keep generated assets and run outputs under the repository output directory.
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 PROJECT_ROOT=$(cd "${SCRIPT_DIR}/../../.." && pwd)
-OUTPUT_DIR="${PROJECT_ROOT}/output/training_demo/deepseek_v41"
-ASSETS_PATH="${OUTPUT_DIR}/engram_depth_preserving_d8.json"
-DATA_PATH="${OUTPUT_DIR}/online_4k.jsonl"
+OUTPUT_DIR=${OUTPUT_DIR:-"${PROJECT_ROOT}/output/training_demo/deepseek_v41"}
+ASSETS_PATH=${ASSETS_PATH:-"${OUTPUT_DIR}/artifacts/engram_depth_preserving_d4.json"}
+DEFAULT_DATA_PATH="${OUTPUT_DIR}/online_4k.jsonl"
+RUN_NAME=${RUN_NAME:-text_tp1_cp4_ep8_fsdp8}
 PYTHON_BIN=${PYTHON_BIN:-python}
 NPROC_PER_NODE=${NPROC_PER_NODE:-16}
 
-if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 /path/to/DeepSeek-V4.1-Flash tp1|tp2|cp2 [trainer overrides...]" >&2
+if [[ ! ${RUN_NAME} =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "RUN_NAME may contain only letters, digits, dots, underscores, and hyphens" >&2
     exit 1
 fi
+
+if [[ $# -lt 1 ]]; then
+    echo "Usage: $0 /path/to/DeepSeek-V4.1-Flash [path/to/train.jsonl] [trainer overrides...]" >&2
+    exit 1
+fi
+
+# Resolve input paths before switching to the repository root.
 MODEL_PATH=$1
-MODE=$2
-shift 2
+shift
+DATA_PATH="${DEFAULT_DATA_PATH}"
+if [[ $# -gt 0 && ${1} != --* ]]; then
+    DATA_PATH=$1
+    if [[ ! -s "${DATA_PATH}" ]]; then
+        echo "Text JSONL data is missing or empty: ${DATA_PATH}" >&2
+        exit 1
+    fi
+    shift
+fi
 MODEL_PATH=$(cd "${MODEL_PATH}" 2>/dev/null && pwd) || {
     echo "Model directory does not exist: ${MODEL_PATH}" >&2
     exit 1
 }
+if [[ "${DATA_PATH}" != /* ]]; then
+    DATA_PATH="${PWD}/${DATA_PATH}"
+fi
 if [[ ! -s "${MODEL_PATH}/config.json" || ! -s "${MODEL_PATH}/tokenizer.json" ]]; then
     echo "Local V4.1 config/tokenizer assets are incomplete: ${MODEL_PATH}" >&2
     exit 1
 fi
-if ! "${PYTHON_BIN}" -c \
-    "import hyper_parallel; from transformers.models.deepseek_v4 import DeepseekV4Config"; then
-    echo "The selected Python cannot import this HyperParallel checkout and " \
-        "Transformers DeepSeek-V4." >&2
-    echo "Transformers DeepSeek-V4 support is unavailable." >&2
-    echo "Install this repository's requirements.txt (including Transformers >= 5.11.0)." >&2
-    exit 1
-fi
-case "${MODE}" in
-    tp1)
-        TOPOLOGY_OVERRIDES=(
-            --accelerator.tp_size=1
-            --accelerator.cp_size=1
-            --fsdp_config.dp_shard_size=16
-            --training.global_batch_size=16
-        )
-        ;;
-    tp2)
-        if [[ ! -f "${OUTPUT_DIR}/tp1.success" ]]; then
-            echo "Run a successful tp1 smoke before tp2; ${OUTPUT_DIR}/tp1.success is missing" >&2
-            exit 1
-        fi
-        TOPOLOGY_OVERRIDES=(
-            --accelerator.tp_size=2
-            --accelerator.cp_size=1
-            --accelerator.sequence_parallel=true
-            --fsdp_config.dp_shard_size=8
-            --training.global_batch_size=8
-        )
-        ;;
-    cp2)
-        TOPOLOGY_OVERRIDES=(
-            --accelerator.tp_size=1
-            --accelerator.cp_size=2
-            --accelerator.sequence_parallel=false
-            --fsdp_config.dp_shard_size=16
-            --training.global_batch_size=8
-        )
-        ;;
-    *)
-        echo "Mode must be tp1, tp2, or cp2, got: ${MODE}" >&2
-        exit 1
-        ;;
-esac
-
+# Load the native runtime and custom operator environment from the repository root.
 cd "${PROJECT_ROOT}"
+source build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
+source "${OPS_TRANSFORMER_ROOT}/install/vendors/custom_transformer/bin/set_env.bash"
+
 mkdir -p "${OUTPUT_DIR}"
+# Clear the previous success marker before starting a new run.
+rm -f "${OUTPUT_DIR}/${RUN_NAME}.success"
+# Generate Engram assets only when the cached file is missing.
 if [[ ! -s "${ASSETS_PATH}" ]]; then
-    "${PYTHON_BIN}" -m examples.training_demo.deepseek_v41.prepare_deepseek_v41_assets \
+    "${PYTHON_BIN}" -m hyper_parallel.models.deepseek_v41.tools.prepare_deepseek_v41_assets \
         --model-dir "${MODEL_PATH}" \
         --output "${ASSETS_PATH}" \
         --bucket-base 4096 \
-        --parameter-divisor 8
+        --parameter-divisor 4
 fi
+
+# Generate deterministic text samples when the default dataset is absent.
 if [[ ! -s "${DATA_PATH}" ]]; then
-    "${PYTHON_BIN}" -m examples.training_demo.deepseek_v41.prepare_deepseek_v41_online_data \
+    "${PYTHON_BIN}" -m hyper_parallel.models.deepseek_v41.tools.prepare_deepseek_v41_online_data \
         --output "${DATA_PATH}" \
         --num-samples 128 \
         --sequence-length 4096
 fi
 
+# Launch with the YAML settings; trailing Trainer arguments override its defaults.
 "${PYTHON_BIN}" -m torch.distributed.run \
     --standalone \
     --nproc_per_node="${NPROC_PER_NODE}" \
@@ -109,8 +94,11 @@ fi
     --model.engram_assets_path="${ASSETS_PATH}" \
     --dataset.model_assets.tokenizer.pretrained_model_name_or_path="${MODEL_PATH}" \
     --dataset.data_path="${DATA_PATH}" \
-    "${TOPOLOGY_OVERRIDES[@]}" \
+    --checkpoint.checkpoint_dir="${OUTPUT_DIR}/artifacts/text_checkpoints" \
+    --profiler.output_path="${OUTPUT_DIR}/text_profiler" \
+    --memory.save_path="${OUTPUT_DIR}/text_memory_snapshot" \
     "$@" \
-    2>&1 | tee "${OUTPUT_DIR}/run_${MODE}.log"
+    2>&1 | tee "${OUTPUT_DIR}/run_${RUN_NAME}.log"
 
-touch "${OUTPUT_DIR}/${MODE}.success"
+# Mark success only after all training processes finish successfully.
+touch "${OUTPUT_DIR}/${RUN_NAME}.success"
