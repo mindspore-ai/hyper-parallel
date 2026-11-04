@@ -1239,14 +1239,9 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             packed_sequence = packed_sequence.prepare(input_ids.device, tuple(self.config.v41_compress_ratios))
             kwargs["packed_seq_params"] = packed_sequence
 
-            boundaries = packed_sequence.cu_seq_lens.to(device=input_ids.device, dtype=torch.long)
-            positions = torch.arange(
-                packed_sequence.local_query_start,
-                packed_sequence.local_query_start + packed_sequence.local_query_length,
-                device=input_ids.device,
-            )
-            kwargs["router_sequence_ids"] = torch.bucketize(positions, boundaries[1:], right=True).unsqueeze(0)
-            kwargs["router_num_sequences"] = boundaries.numel() - 1
+            sequence_ids, sequence_capacity = packed_sequence.router_metadata(input_ids.device)
+            kwargs["router_sequence_ids"] = sequence_ids
+            kwargs["router_num_sequences"] = sequence_capacity
         segment_start_mask = self._build_segment_start_mask(packed_sequence, input_ids)
         hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
         pre_mix = hidden_states.new_zeros(*hidden_states.shape[:2], self.config.hc_mult, dtype=torch.float32)

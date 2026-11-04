@@ -33,6 +33,7 @@ from typing import Any, Protocol
 
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
+from torch.utils._pytree import register_pytree_node  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
 from hyper_parallel.components.functional.lightning_indexer import (
@@ -268,6 +269,28 @@ class SharedCompressedPackedSequence:
         default_factory=dict, init=False, repr=False, compare=False
     )
 
+    _prepared_sequences: dict[torch.device, torch.Tensor] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    _use_prepared_packing_inputs: bool = field(default=False, init=False, repr=False, compare=False)
+    _restored_from_packing_tensors: bool = field(default=False, init=False, repr=False, compare=False)
+
+    def prepare_packing_geometry(self, device: torch.device) -> None:
+        """Prepare CP1 graph metadata independently of compression or indexing.
+
+        The runtime calls this before capture. Eager retains its real boundaries;
+        graph inputs carry token-shaped metadata, not a variable document list.
+        """
+        if self.local_query_start != 0 or self.local_query_length != self.global_sequence_length:
+            return
+        self.segment_start_mask(device)
+        object.__setattr__(self, "_use_prepared_packing_inputs", True)
+
+    def router_metadata(self, device: torch.device) -> tuple[torch.Tensor, int]:
+        """Return document IDs and storage capacity; empty rows do not affect the mean."""
+        count = self.local_query_length if self._restored_from_packing_tensors else self.cu_seq_lens.numel() - 1
+        return self._prepared_sequences[torch.device(device)], count
+
     def prepare(self, device: torch.device, compress_ratios: tuple[int, ...]) -> SharedCompressedPackedSequence:
         """Prepare an owned boundary snapshot, reused until the input is mutated.
 
@@ -286,7 +309,7 @@ class SharedCompressedPackedSequence:
         if version is not None and self._snapshot.get("version") == version:
             prepared: SharedCompressedPackedSequence = self if self._snapshot.get("owned") else self._snapshot["value"]
         else:
-            prepared = SharedCompressedPackedSequence(
+            prepared = type(self)(
                 self.cu_seq_lens.detach().clone(), self.local_query_start,
                 self.local_query_length, self.global_sequence_length,
             )
@@ -306,6 +329,12 @@ class SharedCompressedPackedSequence:
         """Populate caches on the owned snapshot, never on caller-owned boundaries."""
         starts = self.local_segment_starts(device)
         self._prepared_starts[device] = starts
+        if self._restored_from_packing_tensors and any(ratio > 0 for ratio in compress_ratios):
+            raise ValueError("packing-only graph inputs require compression and indexing to be disabled")
+        if device not in self._prepared_sequences:
+            self._prepared_sequences[device] = torch.bucketize(
+                self.local_positions(device).squeeze(0), self.cu_seq_lens.to(device=device)[1:], right=True,
+            ).unsqueeze(0)
         for ratio in set(compress_ratios):
             self.validate_compression_ratio(ratio)
             if ratio > 0 and (device, ratio) not in self._prepared_minima:
@@ -457,6 +486,40 @@ class SharedCompressedPackedSequence:
         return tuple((max(first, start)-first, start)
                      for start, end in zip(self.document_boundaries(), self.document_boundaries()[1:])
                      if max(first, start) < min(last, end))
+
+
+    def pytree_flatten(self) -> tuple[list[Any], tuple]:
+        """Expose packing tensors with a schema independent of document count and S."""
+        if self._use_prepared_packing_inputs:
+            return [self._prepared_starts, self._prepared_positions,
+                    self._prepared_masks, self._prepared_sequences], ("packing",)
+        return [self.cu_seq_lens], (self.local_query_start, self.local_query_length, self.global_sequence_length)
+
+    @classmethod
+    def pytree_unflatten(cls, children: Any, context: tuple) -> SharedCompressedPackedSequence:
+        """Restore prepared metadata without reading boundary values during capture."""
+        if context != ("packing",):
+            return cls(children[0], *context)
+        starts, positions, masks, sequences = children
+        reference = next(iter(starts.values()))
+        length = reference.shape[-1]
+        packed = cls(reference.new_empty(0), 0, length, length)
+        packed._prepared_starts.update(starts)
+        packed._prepared_positions.update(positions)
+        packed._prepared_masks.update(masks)
+        packed._prepared_sequences.update(sequences)
+        object.__setattr__(packed, "_use_prepared_packing_inputs", True)
+        object.__setattr__(packed, "_restored_from_packing_tensors", True)
+        packed._mark_owned()
+        return packed
+
+
+class GraphPackedSequence(SharedCompressedPackedSequence):
+    """Tensor-only packing inputs created exclusively at the graph boundary."""
+
+
+register_pytree_node(GraphPackedSequence, GraphPackedSequence.pytree_flatten,
+                    GraphPackedSequence.pytree_unflatten)
 
 
 def _rotate_half(tensor: torch.Tensor) -> torch.Tensor:

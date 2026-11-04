@@ -23,6 +23,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from tests.common.mark_utils import arg_mark
+from hyper_parallel.trainer.base import BaseTrainer
 
 
 def _load_text_trainer() -> type:
@@ -89,9 +90,15 @@ class TestTextTrainer(unittest.TestCase):
             )
             return torch.tensor(1.0), {"foundation_loss": torch.tensor(1.0)}
 
+        def on_micro_step_end(metrics: dict[str, torch.Tensor]) -> None:
+            """Record completion and verify the returned payload is forwarded unchanged."""
+            events.append("end")
+            self.assertEqual(float(metrics["foundation_loss"]), 1.0)
+
         base = SimpleNamespace(
             get_batch=Mock(return_value=(model_inputs, loss_inputs)),
             on_micro_step_begin=Mock(side_effect=on_micro_step_begin),
+            on_micro_step_end=Mock(side_effect=on_micro_step_end),
             forward_backward_step=Mock(side_effect=forward_backward_step),
         )
         trainer = TextTrainer.__new__(TextTrainer)
@@ -99,13 +106,44 @@ class TestTextTrainer(unittest.TestCase):
 
         loss, loss_dict = trainer.forward_backward_step(iter(()), num_micro_steps=1)
 
-        self.assertEqual(events, ["hook", "forward"], f"expected streaming hook order, got={events}")
+        self.assertEqual(events, ["hook", "forward", "end"], f"expected lifecycle hook order, got={events}")
+        base.on_micro_step_end.assert_called_once_with(loss_dict)
         self.assertEqual(float(loss), 1.0, f"expected loss 1.0, got={float(loss)}")
         self.assertEqual(
             float(loss_dict["foundation_loss"]),
             1.0,
             f"expected foundation loss 1.0, got={float(loss_dict['foundation_loss'])}",
         )
+
+    def test_base_micro_step_end_dispatches_state_payload_and_context(self) -> None:
+        """The shared dispatcher forwards one unchanged payload to every registered callback."""
+        base = BaseTrainer.__new__(BaseTrainer)
+        base.state = object()
+        callbacks = [Mock(), Mock()]
+        base._callbacks = callbacks
+        metrics = {"router_aux_loss": torch.tensor(0.25)}
+        base.on_micro_step_end(metrics, micro_step=3)
+        for callback in callbacks:
+            callback.on_micro_step_end.assert_called_once_with(base.state, loss_dict=metrics, micro_step=3)
+            self.assertIs(callback.on_micro_step_end.call_args.kwargs["loss_dict"], metrics)
+
+    def test_failed_forward_backward_does_not_dispatch_micro_step_end(self) -> None:
+        """A failed microstep propagates its error without emitting a completion event."""
+        base = SimpleNamespace(
+            get_batch=Mock(return_value=({"input_ids": torch.ones(1, 3)},
+                                        {"labels": torch.tensor([[1, 2, 3]])})),
+            on_micro_step_begin=Mock(),
+            forward_backward_step=Mock(side_effect=RuntimeError("microstep failed")),
+            on_micro_step_end=Mock(),
+        )
+        trainer = TextTrainer.__new__(TextTrainer)
+        trainer.base = base
+        with self.assertRaisesRegex(RuntimeError, "microstep failed"):
+            trainer.forward_backward_step(iter(()), num_micro_steps=1)
+        base.on_micro_step_begin.assert_called_once()
+        base.on_micro_step_end.assert_not_called()
+
+
 
 
 if __name__ == "__main__":

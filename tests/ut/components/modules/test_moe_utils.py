@@ -316,9 +316,8 @@ class TestMoEMonitorCallback(unittest.TestCase):
 
         callback.on_step_end()
 
-        # Mean of 0.1 and 0.3 ≈ 0.2 (float precision: tensor.item() may differ)
-        self.assertIsNotNone(callback.last_mean_aux_loss)
-        self.assertAlmostEqual(callback.last_mean_aux_loss, 0.2, places=5)
+        self.assertIsInstance(callback.last_mean_aux_loss, torch.Tensor)
+        torch.testing.assert_close(callback.last_mean_aux_loss, torch.tensor(0.2))
 
     @patch("hyper_parallel.components.modules.moe_utils.sync_and_update_expert_bias")
     def test_lbm05b_no_aux_loss_stores_none(self, mock_sync):  # pylint: disable=W0613
@@ -346,22 +345,25 @@ class TestMoEMonitorCallback(unittest.TestCase):
         self.assertEqual(callback.last_mean_aux_loss, 1.25)
 
     @patch("hyper_parallel.components.modules.moe_utils.sync_and_update_expert_bias")
-    def test_aux_scalar_conversion_is_deferred_until_read(self, mock_sync):
+    def test_aux_loss_passes_source_tensor_through_until_logging(self, mock_sync):
         """
-        Feature: Auxiliary-loss logging.
-        Description: Optimizer steps update bias without converting device loss scalars for logging.
-        Expectation: Scalar conversion occurs only on an explicit read and missing losses return None.
+        Feature: Unified eager and graph auxiliary-loss access.
+        Description: Neither optimizer hooks nor the getter read device values as Python scalars.
+        Expectation: The getter returns a scalar Tensor mirroring the stored
+            values (grad state included) and omits missing losses.
         """
         model, layers = self._make_model_with_moe_layers(num_layers=1)
-        scalar = MagicMock()
-        scalar.item.return_value = 1.25
-        layers[0].last_aux_loss = scalar
+        layers[0].last_aux_loss = torch.tensor(1.25, requires_grad=True)
         callback = MoEMonitorCallback(model)
-        callback.on_step_end()
+        with patch.object(torch.Tensor, "item", side_effect=RuntimeError("unexpected scalar read")):
+            callback.on_step_end()
+            metric = callback.last_mean_aux_loss
         mock_sync.assert_called_once()
-        scalar.item.assert_not_called()
-        self.assertEqual(callback.last_mean_aux_loss, 1.25)
-        scalar.item.assert_called_once_with()
+        self.assertIsInstance(metric, torch.Tensor)
+        self.assertEqual(metric.ndim, 0)
+        self.assertEqual(metric.requires_grad, layers[0].last_aux_loss.requires_grad)
+        torch.testing.assert_close(metric, torch.tensor(1.25))
+        self.assertTrue(layers[0].last_aux_loss.requires_grad)
         layers[0].last_aux_loss = None
         self.assertIsNone(callback.last_mean_aux_loss)
 

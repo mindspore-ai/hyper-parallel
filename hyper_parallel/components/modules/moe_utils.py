@@ -16,6 +16,7 @@
 
 from typing import TYPE_CHECKING, Optional, Any
 
+import torch
 import torch.distributed as dist
 from torch import nn
 
@@ -158,18 +159,21 @@ class MoEMonitorCallback:
         self._hook_handle = None
 
     @property
-    def last_mean_aux_loss(self) -> Optional[float]:
-        """Read the mean raw router loss from the latest local microbatch.
+    def last_mean_aux_loss(self) -> Optional[torch.Tensor]:
+        """Return the mean router metric as an on-device scalar Tensor.
 
-        Read only when logging: scalar conversion may synchronize the device.
-        Auxiliary loss is independent of whether expert-bias updates are enabled.
+        Keep the mean on-device so graph capture never reads a Python scalar.
+        Logging callbacks convert the result only when formatting output.
+        Writers detach ``last_aux_loss`` at the source, so the result carries
+        no autograd graph in production. Auxiliary loss remains observable
+        when expert-bias updates are disabled.
         """
         aux_losses = [
-            module.last_aux_loss.item()
+            module.last_aux_loss
             for module in self.model.modules()
             if getattr(module, "last_aux_loss", None) is not None
         ]
-        return sum(aux_losses) / len(aux_losses) if aux_losses else None
+        return torch.stack(aux_losses).mean() if aux_losses else None
 
     def on_step_end(self) -> None:
         """Update expert bias for all MoE layers in the model.

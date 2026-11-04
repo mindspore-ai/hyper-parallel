@@ -684,6 +684,16 @@ class BaseTrainer(Stateful, ABC):
         for callback in self._callbacks:
             callback.on_micro_step_begin(self.state, micro_batch, **kwargs)
 
+    def on_micro_step_end(self, loss_dict: Dict[str, torch.Tensor], **kwargs: Any) -> None:
+        """Run all registered callbacks after one forward-backward micro step.
+
+        Args:
+            loss_dict: Named losses and metrics returned by the completed micro step.
+            **kwargs: Additional callback context.
+        """
+        for callback in self._callbacks:
+            callback.on_micro_step_end(self.state, loss_dict=loss_dict, **kwargs)
+
     def on_step_end(
         self,
         loss: Optional[float] = None,
@@ -768,6 +778,12 @@ class BaseTrainer(Stateful, ABC):
         if extra_metrics:
             for name, value in extra_metrics.items():
                 loss_dict[name] = value.detach().float()
+        # Log-only outputs share the eager/graph path without entering backward loss.
+        moe_monitor = getattr(self, "moe_monitor", None)
+        if moe_monitor is not None:
+            aux_loss = moe_monitor.last_mean_aux_loss
+            if aux_loss is not None:
+                loss_dict["router_aux_loss"] = aux_loss
         return loss, loss_dict
 
     def forward_backward_step(
@@ -819,6 +835,9 @@ class BaseTrainer(Stateful, ABC):
             self.model_integration.record_batch(micro_batch, loss_inputs)
 
             if self.graph_compiler is not None:
+                runtime_adapter = getattr(getattr(self, "get_batch", None), "runtime_input_adapter", None)
+                if runtime_adapter is not None:
+                    micro_batch = runtime_adapter.prepare_graph_inputs(micro_batch)
                 if self.config.training.empty_cache_before_backward:
                     logger.warning(
                         "training.empty_cache_before_backward is ignored in graph compiler mode "
@@ -1027,6 +1046,7 @@ class BaseTrainer(Stateful, ABC):
             # token num for fixed_ce_loss in postforward
             self.current_token_counts = count_loss_token(micro_batch)
             loss, loss_dict = self.forward_backward_step(micro_batch)
+            self.on_micro_step_end(loss_dict)
 
             total_loss += loss.item()
             for k, v in loss_dict.items():
