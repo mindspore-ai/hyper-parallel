@@ -66,6 +66,9 @@ None. The replaced forward must accept the original forward's params
 - ``sdpa_*_load_balance_cp_wrapper``: local-tensor Colossal Head-Tail variants
   for Q exchange, K/V all-gather, dual SDPA execution, output restoration,
   and backward communication.
+- ``gdn_ulysses_cp_wrapper``: primitive interception for Gated DeltaNet,
+  with a causal-Conv1d halo and Ulysses exchange around the
+  Gated Delta Rule interface.
 
 Users may register their own named schemes::
 
@@ -109,6 +112,7 @@ from hyper_parallel.distributed.context_parallel.attention import (
     _mome_cp_halo_exchange,
     head_tail_load_balance_attention,
 )
+from hyper_parallel.distributed.context_parallel.gated_delta_net import install_gdn_ulysses_cp
 from hyper_parallel.distributed.recipe_spec import (
     inner_wrapper,
 )
@@ -1135,6 +1139,19 @@ def mla_dsa_ulysses_cp_wrapper(  # pylint: disable=inconsistent-return-statement
     return requests
 
 
+@inner_wrapper
+def gdn_ulysses_cp_wrapper(
+    target_module: Any,
+    mesh: Any,
+    tp_mesh: Any,
+    cp_mesh: Any,
+    ep_mesh: Any,
+) -> None:
+    """Install primitive-level Ulysses CP while preserving the model forward."""
+    del mesh, tp_mesh, ep_mesh
+    install_gdn_ulysses_cp(target_module, cp_mesh)
+
+
 # {registry_name: wrapper_fn} -- inner-wrapper named registry (05 §4.4.2).
 # The mechanism is not CP-gated (declaration means application); the in-repo
 # reference implementations carry CP semantics (their self-checks require an
@@ -1156,6 +1173,7 @@ INNER_WRAPPER_REGISTRY = {
     "sdpa_hf_ulysses": sdpa_hf_ulysses_cp_wrapper,
     "flex_hf_ulysses": flex_hf_ulysses_cp_wrapper,
     "mla_dsa_ulysses": mla_dsa_ulysses_cp_wrapper,
+    "gdn_ulysses": gdn_ulysses_cp_wrapper,
 }
 
 # Static requirements for shipped wrappers. Custom registry entries own their

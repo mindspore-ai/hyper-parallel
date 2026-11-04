@@ -52,6 +52,7 @@ class DebugConfig:
     """Debug parameters exposed by the initial YAML schema."""
 
     check_dataset: Optional[Literal["debug", "info", "warn"]] = None
+    log_first_rendered_template: bool = False
     check_nan_inf: bool = False
     check_fsdp_runtime: bool = False
 

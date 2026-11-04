@@ -81,6 +81,7 @@ def build_online_text_mapping_dataset(
     data_path: OnlineDataPath | None = None,
     transform: Callable[[Any], Any] | None = None,
     training_config: Any = None,
+    sampler_type: str = "single",
 ) -> Any:
     """Build an Online Mapping Dataset and apply its text transform.
 
@@ -91,6 +92,7 @@ def build_online_text_mapping_dataset(
             multiple sources.
         transform: Plaintext or conversation sample transform.
         training_config: Training plan providing the random seed and split sizes.
+        sampler_type: Mapping sampler policy controlling source-level shuffle.
 
     Returns:
         A transformed Online Dataset on each DataLoader-owning rank.
@@ -112,6 +114,7 @@ def build_online_text_mapping_dataset(
         data_path=data_path,
         data_config=dataset_config,
         sample_filter=sample_filter,
+        sampler_type=sampler_type,
         train_valid_test_num_samples=train_valid_test_num_samples,
     )
     text_dataset = MappingTransformDataset.apply(source_dataset, transform)

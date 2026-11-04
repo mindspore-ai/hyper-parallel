@@ -225,7 +225,7 @@ class FSDP2Manager:
         self,
         fsdp_mesh: DeviceMesh,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Build shared sublayer kwargs and the root-specialized copy."""
+        """Build child and root kwargs with the same configured reshard policy."""
         mp_policy = self._build_mixed_precision_policy()
         offload_policy = self._build_offload_policy()
 
@@ -238,7 +238,6 @@ class FSDP2Manager:
             "comm_fusion_zero_copy": self.config.comm_fusion_zero_copy,
         }
         fsdp_root_kwargs = fsdp_sublayer_kwargs.copy()
-        fsdp_root_kwargs["reshard_after_forward"] = False
         return fsdp_sublayer_kwargs, fsdp_root_kwargs
 
     @staticmethod
@@ -426,32 +425,66 @@ class FSDP2Manager:
                 )
         return set(excluded_fqns)
 
+    def _find_class_wrap_modules(self, model: ModuleClass) -> list[_WrapModuleInfo]:
+        """Select explicit classes, retaining checkpoint wrappers as the units."""
+        requested = set(self.config.wrapper_class)
+        matched = set()
+        selected = []
+        seen = set()
+        aliases = defaultdict(list)
+        for name, parameter in model.named_parameters(remove_duplicate=False):
+            aliases[parameter].append(name)
+        for fqn, module in model.named_modules():
+            if not fqn or id(module) in seen:
+                continue
+            underlying = _get_checkpoint_wrapped_module(module)
+            candidate = underlying if underlying is not None else module
+            class_name = type(candidate).__name__
+            if class_name not in requested:
+                continue
+            matched.add(class_name)
+            parameters = list(module.parameters())
+            if not parameters:
+                raise ValueError(f"wrapper_class selected a parameterless module: {fqn}")
+            if any(not name.startswith(f"{fqn}.") for param in parameters for name in aliases[param]):
+                raise ValueError(f"wrapper_class module shares parameters outside its subtree: {fqn}")
+            selected.append(_WrapModuleInfo(fqn, module))
+            seen.add(id(module))
+            seen.add(id(candidate))
+        if requested - matched:
+            raise ValueError(f"wrapper_class matched no child module for: {sorted(requested - matched)}")
+        return selected
+
     def _find_wrap_modules(
         self,
         model: ModuleClass,
         metadata_by_parameter: SourceShardInfoByParam | None = None,
     ) -> list[_WrapModuleInfo]:
         """Find automatic decoder/expert units and adapter-declared units."""
-        declared_wrap_modules = self._find_adapter_declared_wrap_modules(model)
-        if declared_wrap_modules:
-            logger.info(
-                "Adapter-declared FSDP child units: %s",
-                [wrap_module.fqn for wrap_module in declared_wrap_modules],
+        if self.config.wrapper_class:
+            wrap_modules = self._find_class_wrap_modules(model)
+            wrapped_module_ids = {id(unit.module) for unit in wrap_modules}
+        else:
+            declared_wrap_modules = self._find_adapter_declared_wrap_modules(model)
+            if declared_wrap_modules:
+                logger.info(
+                    "Adapter-declared FSDP child units: %s",
+                    [wrap_module.fqn for wrap_module in declared_wrap_modules],
+                )
+            excluded_subtree_module_fqns = {
+                wrap_module.fqn for wrap_module in declared_wrap_modules
+            }
+            excluded_subtree_module_fqns.update(
+                self._find_adapter_excluded_subtrees(model)
             )
-        excluded_subtree_module_fqns = {
-            wrap_module.fqn for wrap_module in declared_wrap_modules
-        }
-        excluded_subtree_module_fqns.update(
-            self._find_adapter_excluded_subtrees(model)
-        )
-        wrap_modules, wrapped_module_ids = self._find_transformer_block_modules(
-            model,
-            excluded_subtree_module_fqns=excluded_subtree_module_fqns,
-        )
-        wrapped_module_ids.update(
-            id(wrap_module.module) for wrap_module in declared_wrap_modules
-        )
-        wrap_modules.extend(declared_wrap_modules)
+            wrap_modules, wrapped_module_ids = self._find_transformer_block_modules(
+                model,
+                excluded_subtree_module_fqns=excluded_subtree_module_fqns,
+            )
+            wrapped_module_ids.update(
+                id(wrap_module.module) for wrap_module in declared_wrap_modules
+            )
+            wrap_modules.extend(declared_wrap_modules)
         wrap_modules.extend(
             self._find_expert_wrap_modules(
                 model,
@@ -800,11 +833,11 @@ def _instantiate_fsdp2(
 
 
 def _apply_fsdp2(
-    model: "nn.Module",
+    model: ModuleClass,
     fsdp2_manager: Any,
     source_shard_info: Any,
     ignored_params: set[ParameterClass] | None = None,
-) -> "nn.Module":
+) -> ModuleClass:
     """Apply FSDP2; Torch scheduler hooks remain outside Dynamo by design.
 
     Moved from ``_transformers/infrastructure.py`` (05 §15.2.1) so the FSDP

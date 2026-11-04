@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -24,8 +25,9 @@ import torch
 
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.data.dataset_logging import get_dataset_logger
+from hyper_parallel.data.online.format import InstructionMessages, normalize_conversation
 
-TextDataType = Literal["plaintext", "conversation"]
+TextDataType = Literal["plaintext", "sharegpt", "alpaca"]
 logger = get_dataset_logger(__name__)
 
 
@@ -39,6 +41,49 @@ def _get_record_value(sample: Mapping[str, Any], keys: str | Sequence[str]) -> A
         if key in sample:
             return sample[key]
     raise ValueError(f"Sample does not contain any configured text fields: {list(keys)!r}")
+
+
+def _normalize_tools(tools: Any, tools_key: str) -> list[dict[str, Any]] | None:
+    """Normalize an explicitly configured tools field for native chat templates."""
+    if tools is None or tools is False:
+        return None
+    if isinstance(tools, str):
+        if not tools:
+            return None
+        try:
+            tools = json.loads(tools)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Tools field {tools_key!r} must contain valid JSON") from exc
+        if tools is None or tools is False:
+            return None
+    if not isinstance(tools, Sequence) or isinstance(tools, (str, bytes)):
+        raise ValueError(f"Tools field {tools_key!r} must be a sequence of mappings")
+
+    normalized_tools = []
+    for tool in tools:
+        if not isinstance(tool, Mapping):
+            raise ValueError(f"Every entry in tools field {tools_key!r} must be a mapping")
+        normalized_tools.append(dict(tool))
+    return normalized_tools or None
+
+
+def _encode_messages(
+        chat_template: Any,
+        messages: Sequence[Mapping[str, Any]],
+        max_seq_len: int,
+        tools: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Encode normalized messages into a shifted causal-language-model sample."""
+    encode_kwargs = {"max_seq_len": max_seq_len}
+    if tools:
+        encode_kwargs["tools"] = tools
+    encoded = chat_template.encode_messages(messages, **encode_kwargs)
+    input_ids = torch.tensor(encoded["input_ids"], dtype=torch.int64)
+    labels = torch.tensor(encoded["labels"], dtype=torch.int64)
+    return {
+        "input_ids": input_ids[:-1],
+        "labels": labels[1:],
+    }
 
 
 class IdentityDataTransform:
@@ -119,6 +164,8 @@ class TextConversationTransform:
     chat_template: Any
     max_seq_len: int
     text_keys: str | Sequence[str] = "conversation"
+    tools_key: str | None = None
+    message_formatter: Callable[[Mapping[str, Any]], list[dict[str, Any]]] | None = None
 
     def __post_init__(self) -> None:
         """Validate the chat template and sequence length configuration."""
@@ -126,49 +173,51 @@ class TextConversationTransform:
             raise ValueError("chat_template is required for conversation data")
         if self.max_seq_len <= 0:
             raise ValueError("max_seq_len must be positive")
+        if self.tools_key is not None and (not isinstance(self.tools_key, str) or not self.tools_key):
+            raise ValueError("tools_key must be a non-empty string or None")
 
     def __call__(self, sample: Mapping[str, Any]) -> list[dict[str, Any]]:
         """Encode one conversation record."""
-        messages = _get_record_value(sample, self.text_keys)
-        encoded = self.chat_template.encode_messages(messages, max_seq_len=self.max_seq_len)
-        input_ids = torch.as_tensor(encoded["input_ids"], dtype=torch.long)
-        labels = torch.as_tensor(encoded["labels"], dtype=torch.long)
-        shifted_labels = labels[1:]
-        if not bool(shifted_labels.ne(IGNORE_INDEX).any()):
-            return []
-
-        model_sample = {
-            "input_ids": input_ids[:-1],
-            "labels": shifted_labels,
-        }
-        return [model_sample]
+        messages = (self.message_formatter(sample) if self.message_formatter is not None
+                    else normalize_conversation(_get_record_value(sample, self.text_keys)))
+        tools = None
+        if self.tools_key is not None:
+            tools = _normalize_tools(sample.get(self.tools_key), self.tools_key)
+        encoded = _encode_messages(self.chat_template, messages, self.max_seq_len, tools)
+        return [encoded] if bool(encoded["labels"].ne(IGNORE_INDEX).any()) else []
 
     def is_valid_sample(self, sample: Mapping[str, Any]) -> bool:
         """Return whether one source record contains conversation messages."""
-        messages = _get_record_value(sample, self.text_keys)
+        messages = (self.message_formatter(sample) if self.message_formatter is not None
+                    else _get_record_value(sample, self.text_keys))
         is_valid = bool(messages)
         return is_valid
 
 
 def build_text_transform(
-    data_type: TextDataType,
-    *,
-    tokenizer: Any = None,
-    chat_template: Any = None,
-    max_seq_len: int,
-    text_keys: str | Sequence[str] = "text",
-    drop_ragged_tail: bool = False,
+        data_type: TextDataType,
+        *,
+        tokenizer: Any = None,
+        chat_template: Any = None,
+        max_seq_len: int,
+        text_keys: str | Sequence[str] | None = None,
+        drop_ragged_tail: bool = False,
+        tools_key: str | None = None,
+        column_mapping: Mapping[str, str] | None = None,
+        input_separator: str = "\n\n",
 ) -> Callable[[Any], Any]:
-    """Build the transform selected by the text data type.
+    """Build the transform selected by the text dataset format.
 
     Args:
-        data_type: Plaintext or conversation input format.
+        data_type: One of plaintext, sharegpt, or alpaca.
         tokenizer: Tokenizer used by plaintext transforms.
         chat_template: Chat template used by conversation transforms.
         max_seq_len: Maximum model sequence length.
-        text_keys: Field or candidate fields containing the source text.
-        drop_ragged_tail: Drop the trailing partial window of a multi-window
-            plaintext record instead of emitting it as a shorter sample.
+        text_keys: Source field(s); defaults to text or conversations by format.
+        drop_ragged_tail: Drop trailing partial plaintext windows.
+        tools_key: Optional field containing tool definitions for conversation data.
+        column_mapping: Logical instruction/input/output fields mapped to source columns.
+        input_separator: Separator inserted between non-empty instruction and input fields.
 
     Returns:
         The configured text sample transform.
@@ -176,13 +225,26 @@ def build_text_transform(
     Raises:
         ValueError: If ``data_type`` is unsupported.
     """
+    if text_keys is None:
+        text_keys = {"sharegpt": "conversations"}.get(data_type, "text")
     if data_type == "plaintext":
-        data_transform = PlaintextTransform(
-            tokenizer, max_seq_len, text_keys, drop_ragged_tail)
-    elif data_type == "conversation":
-        data_transform = TextConversationTransform(chat_template, max_seq_len, text_keys)
+        if tools_key is not None:
+            raise ValueError("tools_key is only supported for sharegpt data")
+        data_transform = PlaintextTransform(tokenizer, max_seq_len, text_keys, drop_ragged_tail)
+    elif data_type == "sharegpt":
+        data_transform = TextConversationTransform(chat_template, max_seq_len, text_keys, tools_key)
+    elif data_type == "alpaca":
+        if tools_key is not None:
+            raise ValueError("tools_key is only supported for sharegpt data")
+        if column_mapping is None:
+            raise ValueError("column_mapping is required for alpaca data")
+        data_transform = TextConversationTransform(
+            chat_template,
+            max_seq_len,
+            message_formatter=InstructionMessages(column_mapping, input_separator),
+        )
     else:
-        raise ValueError(f"Unsupported text data type: {data_type!r}")
+        raise ValueError(f"Unsupported text data format: {data_type!r}")
 
     logger.debug("Built text transform: data_type=%s, transform=%s", data_type, type(data_transform).__name__)
     return data_transform

@@ -37,6 +37,7 @@ def build_online_omni_mapping_dataset(
     data_path: OnlineDataPath | None = None,
     transform: OmniDataTransform | None = None,
     training_config: Any = None,
+    sampler_type: str = "single",
 ) -> Any:
     """Build an Online Mapping source and apply its Omni transform lazily.
 
@@ -46,6 +47,7 @@ def build_online_omni_mapping_dataset(
             train/valid/test path mapping.
         transform: Omni sample transform selected by the Trainer.
         training_config: Training plan providing the random seed.
+        sampler_type: Mapping sampler policy controlling source-level shuffle.
 
     Returns:
         A transformed Online Mapping Dataset or train-valid-test tuple.
@@ -68,6 +70,7 @@ def build_online_omni_mapping_dataset(
         data_path=data_path,
         data_config=dataset_config,
         sample_filter=sample_filter,
+        sampler_type=sampler_type,
     )
     transformed_dataset = _OmniMappingDataset.apply(source_dataset, transform)
     return transformed_dataset

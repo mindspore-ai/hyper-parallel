@@ -22,6 +22,8 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from hyper_parallel.trainer.config.data import ModelAssetsConfig
+from hyper_parallel.trainer.config.training import DebugConfig
 from tests.common.mark_utils import arg_mark
 
 
@@ -46,6 +48,33 @@ TextTrainer = _load_text_trainer()
 
 class TestTextTrainer(unittest.TestCase):
     """Verify text training streams prepared batches into callbacks."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_template_logging_is_independent_of_dataset_debug(self) -> None:
+        """Feature: Independent template debug configuration.
+
+        Description: Build text assets with dataset debugging disabled.
+        Expectation: The debug template flag reaches the template for both values.
+        """
+        self.assertFalse(DebugConfig().log_first_rendered_template)
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                tokenizer = Mock(pretrained_model_name_or_path="/unused")
+                assets = ModelAssetsConfig(chat_template="tokenizer", tokenizer=tokenizer)
+                config = SimpleNamespace(
+                    dataset=SimpleNamespace(model_assets=assets),
+                    debug=DebugConfig(check_dataset=None, log_first_rendered_template=enabled),
+                )
+                trainer = TextTrainer.__new__(TextTrainer)
+                trainer.base = SimpleNamespace(config=config, model_config=object())
+                build = Mock()
+                with patch.dict(TextTrainer._build_model_assets.__globals__, build_chat_template=build):
+                    trainer._build_model_assets()
+                build.assert_called_once_with(
+                    "tokenizer", tokenizer.build.return_value,
+                    chat_template_kwargs={}, log_first_rendered_template=enabled,
+                )
 
     @arg_mark(
         plat_marks=["cpu_linux", "cpu_macos"],

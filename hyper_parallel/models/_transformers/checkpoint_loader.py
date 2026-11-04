@@ -27,6 +27,7 @@ and :class:`CheckpointManager` exports such a model back to Transformers format.
 
 import logging
 import re
+from copy import copy, deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,7 @@ from typing import Any
 import torch
 from torch import nn
 from torch.distributed import is_available, is_initialized
+from hyper_parallel.core.fully_shard.api import HSDPModule
 
 from hyper_parallel import DTensor
 from hyper_parallel.components.checkpoint.huggingface_checkpointer import (
@@ -45,6 +47,7 @@ from hyper_parallel.components.checkpoint.load_groups import (
     local_target_tensor,
 )
 from hyper_parallel.components.checkpoint.weight_conversion import revert_weight_conversion
+from hyper_parallel.models.registry import resolve_model_adapter
 
 # PEP 604 unions (``str | Path``, ``int | None``) are valid on this interpreter, but the checker
 # evaluates them and reports a false ``unsupported-binary-operation`` at every site.
@@ -71,14 +74,20 @@ class CheckpointManager:
         save_directory: str | Path,
         *,
         max_shard_size: int | str = "5GB",
-        save_original_format: bool = True,
+        save_original_format: bool | None = None,
         **kwargs: Any,
     ) -> bool:
         """Gather model weights and save a Transformers-compatible checkpoint.
 
-        All distributed ranks must call this method. Collectives produce each
-        full tensor on every rank, but only rank 0 retains CPU weights and
-        writes files.
+        All distributed ranks must call this method so live sharded weights can
+        be gathered. Only the main process retains and writes the full state.
+
+        Args:
+            save_directory: Destination Hugging Face checkpoint directory.
+            max_shard_size: Maximum size of each Hugging Face weight shard.
+            save_original_format: Whether to reverse registered weight conversions.
+                None uses the adapter default, or True when no adapter specifies one.
+            **kwargs: Additional arguments forwarded to ``save_pretrained``.
 
         Returns:
             True on the writing rank and False on all other ranks.
@@ -90,6 +99,14 @@ class CheckpointManager:
         state_dict = self._gather_full_state_dict(keep_state_dict=is_main_process)
         if not is_main_process:
             return False
+        export_model = self._hf_export_model()
+        adapter = resolve_model_adapter(export_model)
+        if adapter is not None and adapter.checkpoint_export is not None:
+            state_dict, save_original_format = adapter.checkpoint_export(
+                export_model, state_dict, save_original_format,
+            )
+        if save_original_format is None:
+            save_original_format = True
         used_base = getattr(
             self.model, "_hp_used_base_weight_conversions", None
         )
@@ -97,17 +114,17 @@ class CheckpointManager:
             self.model, "_hp_used_replacement_weight_conversions", None
         )
         if save_original_format and used_replacements:
-            original_mapping = getattr(self.model, "_weight_conversions", None)
+            original_mapping = getattr(export_model, "_weight_conversions", None)
             try:
-                self.model._weight_conversions = used_replacements  # pylint: disable=protected-access
-                state_dict = revert_weight_conversion(self.model, state_dict)
+                export_model._weight_conversions = used_replacements  # pylint: disable=protected-access
+                state_dict = revert_weight_conversion(export_model, state_dict)
                 if used_base:
-                    self.model._weight_conversions = used_base  # pylint: disable=protected-access
-                    state_dict = revert_weight_conversion(self.model, state_dict)
+                    export_model._weight_conversions = used_base  # pylint: disable=protected-access
+                    state_dict = revert_weight_conversion(export_model, state_dict)
             finally:
-                self.model._weight_conversions = original_mapping  # pylint: disable=protected-access
+                export_model._weight_conversions = original_mapping  # pylint: disable=protected-access
             save_original_format = False
-        save_method(
+        export_model.save_pretrained(
             save_directory,
             state_dict=state_dict,
             is_main_process=True,
@@ -117,6 +134,26 @@ class CheckpointManager:
         )
         return True
 
+    def _hf_export_model(self) -> nn.Module:
+        """Create a metadata-only HF view without modifying the live training model."""
+        # Callback imports must not initialize the optional Transformers model runtime.
+        from transformers import PreTrainedModel  # pylint: disable=C0415
+
+        if not isinstance(self.model, PreTrainedModel):
+            return self.model
+        export_model = copy(self.model)
+        model_class = type(self.model)
+        if HSDPModule in model_class.__bases__:
+            model_class = next(base for base in model_class.__bases__ if base is not HSDPModule)
+        export_model.__class__ = model_class
+        # HF overwrites architectures/dtype during saving. The shallow module
+        # copy shares parameters without allocating weights, but not metadata.
+        export_model.config = deepcopy(self.model.config)
+        if getattr(self.model, "generation_config", None) is not None:
+            export_model.generation_config = deepcopy(self.model.generation_config)
+        return export_model
+
+    @torch.no_grad()
     def _gather_full_state_dict(self, *, keep_state_dict: bool) -> dict[str, Any]:
         """Gather sharded model tensors into a full CPU state dictionary."""
 

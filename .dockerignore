@@ -1,5 +1,8 @@
 .git
 .gitignore
+outputs
+.venv
+venv
 .agent
 .jenkins
 build
