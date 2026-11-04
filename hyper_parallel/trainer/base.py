@@ -111,6 +111,12 @@ from hyper_parallel.trainer.callbacks import (
     CheckpointerCallback,
     TrainerState,
 )
+from hyper_parallel.trainer.runtime.fault_tolerance import (
+    record_step_metrics,
+    recovery_constructor,
+    recovery_optimizer_update,
+    recovery_train_loop,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -258,6 +264,7 @@ class BaseTrainer(Stateful, ABC):
     # Default seed when training.seed is omitted.
     default_seed: int = 42
 
+    @recovery_constructor
     def __init__(self, config: TrainerConfig) -> None:
         """
         Initialize the trainer.
@@ -941,6 +948,7 @@ class BaseTrainer(Stateful, ABC):
         self.model_integration.after_clip(post_clip_norm)
         return grad_norm
 
+    @recovery_optimizer_update
     def step_optimizers_and_schedulers(self) -> None:
         """Step every optimizer and scheduler, then expose the final state."""
         optimizers = self.optimizer if isinstance(self.optimizer, list) else [self.optimizer]
@@ -1033,6 +1041,7 @@ class BaseTrainer(Stateful, ABC):
                 total_loss_dict[k] += v.item()
 
         grad_norm = self.prepare_optimizer_step()
+        record_step_metrics(self, total_loss, total_loss_dict, grad_norm)
         self.step_optimizers_and_schedulers()
 
         grad_norm_value = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
@@ -1069,6 +1078,7 @@ class BaseTrainer(Stateful, ABC):
         synchronize()
         destroy_process_group()
 
+    @recovery_train_loop
     def train(self) -> None:
         """Run the configured training loop."""
         try:

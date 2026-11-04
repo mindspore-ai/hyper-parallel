@@ -31,6 +31,7 @@ import torch
 from torch import nn
 from hyper_parallel import DTensor
 from hyper_parallel.core.fully_shard.hsdp_utils import get_hsdp_state
+from hyper_parallel.core.fault_tolerance.groups import is_recovery_reboot
 from hyper_parallel.components.checkpoint.huggingface_checkpointer import (
     HuggingFaceCheckpointer,
 )
@@ -563,6 +564,10 @@ def _materialize_and_load_model(
 ) -> nn.Module:
     """Materialize model storage and load or initialize meta-device weights."""
     model = _move_model_to_device(model, is_meta_device, device)
+    if is_recovery_reboot():
+        # Peers are parked in MindIO. Only allocate persistent local shards;
+        # repair installs their values before the first model collective.
+        return model
     if not is_meta_device:
         return model
     external = get_model_external_state(model)

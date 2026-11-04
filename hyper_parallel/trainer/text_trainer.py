@@ -28,6 +28,7 @@ from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import print_device_mem_info
 from hyper_parallel.trainer.runtime.memory_profiler import memory_profiler
 from hyper_parallel.trainer.runtime.device import synchronize
+from hyper_parallel.trainer.runtime.fault_tolerance import record_step_metrics, recovery_constructor, recovery_train_loop
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.trainer.config import TrainerConfig
 
@@ -39,6 +40,7 @@ class TextTrainer:
 
     base: BaseTrainer
 
+    @recovery_constructor
     def __init__(self, config: TrainerConfig) -> None:
         """Build the text Trainer in the same explicit order as VeOmni."""
         self.base = BaseTrainer.__new__(BaseTrainer)
@@ -282,11 +284,13 @@ class TextTrainer:
                 total_loss_dict[loss_name] += loss_value.item()
 
         grad_norm = self.base.prepare_optimizer_step()
+        record_step_metrics(self.base, total_loss, total_loss_dict, grad_norm)
         self.base.step_optimizers_and_schedulers()
 
         # Checkpoint and logging callbacks observe the number of completed
         # optimizer updates.
-        self.base.state.global_step += 1
+        if vars(self.base).get("recovery") is None:
+            self.base.state.global_step += 1
         grad_norm_value = float(grad_norm)
         self.base._end_model_integration_step(  # pylint: disable=protected-access
             {"loss": total_loss, "grad_norm": grad_norm_value}
@@ -302,6 +306,7 @@ class TextTrainer:
             "grad_norm": grad_norm_value,
         }
 
+    @recovery_train_loop
     def train(self) -> None:
         """Run the configured global optimizer steps by Dataset epoch."""
         try:

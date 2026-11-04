@@ -23,6 +23,7 @@ from typing import Any
 
 import torch.distributed as dist
 
+from hyper_parallel.core.fault_tolerance.groups import is_recovery_reboot
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 
 logger = get_dataset_logger(__name__)
@@ -188,6 +189,11 @@ def build_dataset_for_dataloader(
     if not dataloader_context.distributed_enabled:
         local_dataset = dataset_factory()
         return local_dataset
+
+    if is_recovery_reboot():
+        # Cache-writer ranks are parked; preserve input ownership and build locally.
+        owns_dataset = dataloader_context.data_index_cache or dataloader_context.build_on_rank()
+        return dataset_factory() if owns_dataset else None
 
     local_dataset = None
     builds_cache_first = dataloader_context.build_cache_on_rank()

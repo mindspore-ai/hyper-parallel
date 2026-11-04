@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 from collections.abc import Mapping, Sequence
@@ -25,7 +27,9 @@ from typing import Any
 import numpy as np
 
 import torch.distributed as dist
+from torch.distributed.distributed_c10d import _get_default_store
 
+from hyper_parallel.core.fault_tolerance.groups import is_recovery_enabled, is_recovery_reboot
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 
 logger = get_dataset_logger(__name__)
@@ -174,6 +178,27 @@ def resolve_data_paths(
         One prefix directly, or alternating weight/prefix values for multiple sources. If ``data_path`` is not a
         collection of discoverable indexed paths, return it unchanged so an explicit blend can be parsed.
     """
+    if not is_recovery_enabled() or not dist.is_initialized():
+        return _resolve_data_paths(data_path, distributed_walk=distributed_walk)
+    source = [data_path] if isinstance(data_path, str) else list(data_path)
+    identity = json.dumps((source, distributed_walk), ensure_ascii=False).encode("utf-8")
+    key = f"hyper_parallel/recovery_data_paths/{dist.get_rank()}/{hashlib.sha256(identity).hexdigest()}"
+    store = _get_default_store()
+    if is_recovery_reboot():
+        # Rediscovery could change blend ordering even if it avoided collectives.
+        if not store.check([key]):
+            raise RuntimeError("original worker did not publish indexed data paths; recovery cannot rediscover them")
+        paths = json.loads(store.get(key).decode("utf-8"))
+        if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
+            raise RuntimeError("invalid indexed data path manifest in recovery store")
+        return paths
+    paths = _resolve_data_paths(source, distributed_walk=distributed_walk)
+    store.set(key, json.dumps(paths, ensure_ascii=False))
+    return paths
+
+
+def _resolve_data_paths(data_path: str | Sequence[str], *, distributed_walk: bool) -> list[str]:
+    """Discover indexed prefixes using the ordinary initial-training path."""
     # 1. Normalize one path and multiple paths to the same traversal form.
     data_paths = [data_path] if isinstance(data_path, str) else list(data_path)
 

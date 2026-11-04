@@ -1,0 +1,132 @@
+{
+  "recorded_at": "2026-11-05T17:08:27.792186+08:00",
+  "environment": {
+    "mindio_ttp": "26.2.0",
+    "torch": "2.12.0+cu130",
+    "torch_npu": "2.12.0",
+    "python": "3.12.13",
+    "architecture": "aarch64",
+    "native_libraries": {
+      "controller_ttp/_ttp_c2python_api.so": "67136307ea82bf281d2f2c62deb8d9f75353907da3aecf8750cd011e1a7d912e",
+      "framework_ttp/libttp_framework.so": "aa1eb24bee0f774440c8a6b8308b783b98eb2420da356c43d9315e19197eb98a",
+      "mindspore_api/libttp_c_api.so": "791cdd84818ea4a6f4731cf825e3dc16a1dc78f2fed4144fcbd31d5b79487ed2"
+    }
+  },
+  "raw_batches": {
+    "mindio_raw_shutdown_20261105": {
+      "rounds": 12,
+      "workers_per_round": 8,
+      "normal_processor_exits": 96,
+      "destroy_calls_per_worker": 3,
+      "exit_modes": {
+        "serial": 6,
+        "concurrent": 6
+      },
+      "native_abort_detected": false
+    },
+    "mindio_raw_shutdown_no_preload_20261105": {
+      "rounds": 32,
+      "workers_per_round": 8,
+      "normal_processor_exits": 256,
+      "destroy_calls_per_worker": 3,
+      "exit_modes": {
+        "serial": 16,
+        "concurrent": 16
+      },
+      "native_abort_detected": false
+    }
+  },
+  "full_batches": {
+    "mindio_shutdown_fixed_probe_20261105": {
+      "rounds": 5,
+      "cases": [
+        {
+          "case": "round0_rank0",
+          "exit_code": 0,
+          "elapsed": 129.04,
+          "end_to_end_pass": true,
+          "state_compare_exit_code": 0,
+          "pure_virtual_logs": []
+        },
+        {
+          "case": "round1_rank0",
+          "exit_code": 0,
+          "elapsed": 127.43,
+          "end_to_end_pass": true,
+          "state_compare_exit_code": 0,
+          "pure_virtual_logs": []
+        },
+        {
+          "case": "round2_rank0",
+          "exit_code": 0,
+          "elapsed": 128.05,
+          "end_to_end_pass": true,
+          "state_compare_exit_code": 0,
+          "pure_virtual_logs": []
+        },
+        {
+          "case": "round3_taskd",
+          "exit_code": 0,
+          "elapsed": 222.48,
+          "end_to_end_pass": true,
+          "state_compare_exit_code": 0,
+          "pure_virtual_logs": []
+        },
+        {
+          "case": "round4_taskd",
+          "exit_code": 0,
+          "elapsed": 222.81,
+          "end_to_end_pass": true,
+          "state_compare_exit_code": 0,
+          "pure_virtual_logs": []
+        }
+      ],
+      "workers_per_phase": 8,
+      "phases_per_round": 2,
+      "normal_processor_exits": 80,
+      "expected_injected_sigkills": 5
+    },
+    "mindio_shutdown_uninstrumented_20261105": {
+      "rounds": 2,
+      "cases": [
+        {
+          "case": "round0_rank0",
+          "exit_code": 0,
+          "elapsed": 132.58,
+          "end_to_end_pass": true,
+          "state_compare_exit_code": 0,
+          "pure_virtual_logs": []
+        },
+        {
+          "case": "round1_taskd",
+          "exit_code": 0,
+          "elapsed": 217.69,
+          "end_to_end_pass": true,
+          "state_compare_exit_code": 0,
+          "pure_virtual_logs": []
+        }
+      ],
+      "workers_per_phase": 8,
+      "phases_per_round": 2,
+      "normal_processor_exits": 32,
+      "expected_injected_sigkills": 2
+    }
+  },
+  "lifecycle_api_trace": {
+    "enter_calls": 334,
+    "return_calls": 334,
+    "unmatched_calls": []
+  },
+  "invalid_probe_runs": {
+    "count": 5,
+    "directory": "mindio_shutdown_validation_20261105",
+    "reason": "Probe imported a second SWIG module namespace; startup failed before destruction. Excluded."
+  },
+  "production_shutdown_logic_changed": false,
+  "test_harness_change": "Check TaskD Manager exit status so abnormal host cleanup cannot be silently accepted.",
+  "normal_processor_exits_total": 464,
+  "full_end_to_end_rounds": 7,
+  "raw_rounds": 44,
+  "conclusion": "Not reproduced in this retest; this is not proof that the intermittent defect is fixed.",
+  "remaining_boundary": "No new native crash stack captured; no ClusterD/Kubernetes Pod-rebuild acceptance."
+}
