@@ -747,9 +747,15 @@ class BaseTrainer(Stateful, ABC):
             Backward loss and named globally aggregated loss values.
         """
         local_loss = self.loss_fn(model_output=outputs, labels=labels)
-        foundation_loss = local_loss.get("foundation_loss") if isinstance(local_loss, dict) else local_loss
-        if foundation_loss is not None:
-            bind_aux_loss_scale(foundation_loss)
+        # Every foundation-family objective receives the same external token weight.
+        # Bind each branch before backward can reach its independently injected losses.
+        foundation_losses = (
+            (value for key, value in local_loss.items() if key.split("_loss", maxsplit=1)[0] == "foundation")
+            if isinstance(local_loss, dict) else (local_loss,)
+        )
+        for foundation_loss in foundation_losses:
+            if foundation_loss is not None:
+                bind_aux_loss_scale(foundation_loss)
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
             local_loss,
             current_token_counts,
