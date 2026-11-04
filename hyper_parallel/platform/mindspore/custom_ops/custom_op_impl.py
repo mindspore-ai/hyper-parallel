@@ -55,6 +55,7 @@ _CUSTOM_OP_SOURCES = [
     os.path.join(_CC_DIR, "sparse_lightning_indexer_kl_loss_grad.cc"),
     os.path.join(_CC_DIR, "chunk_kda_fwd.cc"),
     os.path.join(_CC_DIR, "chunk_kda_bwd.cc"),
+    os.path.join(_CC_DIR, "chunk_kda_stages.cc"),
 ]
 
 _ENHANCE_INDEXER_SOURCE = os.path.join(_CC_DIR, "lightning_indexer_enhance.cc")
@@ -158,9 +159,6 @@ else:
         _custom_ops = _build_custom_ops()
     elif (enhance_indexer_available()
           and not hasattr(_custom_ops, "npu_lightning_indexer_enhance")
-          and os.environ.get("HP_CUSTOM_OPS_NO_AUTO_REBUILD", "0") != "1"):
-        _custom_ops = _build_custom_ops()
-    elif (not hasattr(_custom_ops, "npu_chunk_kda_fwd_v2")
           and os.environ.get("HP_CUSTOM_OPS_NO_AUTO_REBUILD", "0") != "1"):
         _custom_ops = _build_custom_ops()
 
@@ -1213,10 +1211,16 @@ def _run_chunk_kda_fwd(q, k, v, g, beta, scale, chunk_size, layout,
         chunk_size, safe_gate, lower_bound,
     )
     canonical_layout = "NTD" if len(q_head.shape) == 3 else "BNSD"
+    if not hasattr(_custom_ops, "npu_chunk_kda_fwd_v2"):
+        raise RuntimeError(
+            "Chunk KDA FwdV2 is unavailable in the loaded extension. "
+            "Rebuild the HP custom-op extension and source a matching FLA-NPU OPP."
+        )
     result = _custom_ops.npu_chunk_kda_fwd_v2(
         q_head, k_head, v_head, g_head, beta_head, scale, chunk_size,
         canonical_layout, True, safe_gate, lower_bound,
-        use_gate_in_kernel, a_log, dt_bias, initial_state, cu_seqlens,
+        use_gate_in_kernel, a_log, None if dt_bias is None else dt_bias.reshape(-1).contiguous(),
+        initial_state, cu_seqlens,
         chunk_indices, state_v_first, epsilon, use_qk_l2norm_in_kernel,
         use_beta_sigmoid_in_kernel, allow_neg_eigval, use_exp2
     )

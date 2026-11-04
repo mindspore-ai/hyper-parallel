@@ -430,7 +430,7 @@ class TestNpuChunkKda(unittest.TestCase):
         mock_platform.custom_ops.npu_chunk_kda.assert_called_once_with(
             "q", "k", "v", "g", "beta", 0.125, 64, "BNSD", False,
             False, -5.0, True, "a_log", None, None, None, 1e-6,
-            False, False, False, True,
+            False, False, False, True, None, True, False,
         )
         self.assertIs(result, expected)
 
@@ -445,7 +445,13 @@ class TestNpuChunkKda(unittest.TestCase):
         )
 
         args = mock_platform.custom_ops.npu_chunk_kda.call_args.args
-        self.assertEqual(args[-5:], (1e-5, True, True, True, True))
+        self.assertEqual(args[16:21], (1e-5, True, True, True, True))
+
+    @patch(_PATCH_TARGET)
+    def test_state_and_recompute_options_forward(self, mock_platform):
+        npu_chunk_kda("q", "k", "v", "g", "beta", 1.0, a_log="a", safe_gate=True,
+                      initial_state="h0", disable_recompute=False, state_v_first=True)
+        self.assertEqual(mock_platform.custom_ops.npu_chunk_kda.call_args.args[21:], ("h0", False, True))
 
     def test_rejects_backward_modes_not_supported_by_fla_master(self):
         for kwargs, message in (

@@ -685,15 +685,8 @@ def npu_sparse_lightning_indexer_kl_loss_grad(
 
 
 def _validate_chunk_kda_autograd_options(
-        initial_state, disable_recompute, state_v_first, use_gate_in_kernel,
-        a_log, use_beta_sigmoid_in_kernel, allow_neg_eigval, use_exp2):
-    """Validate state options not yet supported by automatic backward."""
-    if initial_state is not None:
-        raise ValueError("initial_state is not supported until backward provides dht/dh0 semantics.")
-    if not disable_recompute:
-        raise ValueError("disable_recompute=False is not supported by the fused backward kernel.")
-    if state_v_first:
-        raise ValueError("state_v_first=True is not supported by the fused backward kernel.")
+        use_gate_in_kernel, a_log, use_beta_sigmoid_in_kernel, allow_neg_eigval, use_exp2):
+    """Validate options shared by fused and state-aware stage backward."""
     if not use_gate_in_kernel:
         raise ValueError("use_gate_in_kernel=False is not supported by the FLA master backward.")
     if a_log is None:
@@ -734,20 +727,28 @@ def npu_chunk_kda(
     """Run differentiable dense or packed Chunk KDA.
 
     Returns ``(attn_out, final_state)``; ``final_state`` is ``None`` unless
-    ``output_final_state=True``. MindSpore automatically invokes the fused
-    backward operator when gradients are requested. The FLA master backward
+    ``output_final_state=True``. MindSpore automatically invokes the paired
+    backward path when gradients are requested. The FLA master backward
     path requires BF16 q/k/v with 128-wide key/value dimensions,
     ``chunk_size=64``, ``use_gate_in_kernel=True``, and ``use_exp2=True``.
+    Safe raw gates use the explicit stage chain, including ordinary training.
+    State/recompute training currently requires ``safe_gate=True`` and the
+    six local forward/backward stage APIs. That path differentiates both boundary states
+    and canonicalizes V-first states internally to K-first.
     ``use_qk_l2norm_in_kernel`` and ``use_beta_sigmoid_in_kernel`` select the
     optional FwdV2 saved values consumed by backward.
+
+    BF16 state relays can amplify cancellation in terminal-state-only losses;
+    one strong-decay reference case currently exceeds the 4% gradient error
+    target. State-gradient accuracy is not fully validated for that regime.
     """
     _validate_chunk_kda_autograd_options(
-        initial_state, disable_recompute, state_v_first, use_gate_in_kernel,
-        a_log, use_beta_sigmoid_in_kernel, allow_neg_eigval, use_exp2,
+        use_gate_in_kernel, a_log, use_beta_sigmoid_in_kernel, allow_neg_eigval, use_exp2,
     )
     return _platform.custom_ops.npu_chunk_kda(
         q, k, v, g, beta, scale, chunk_size, layout, output_final_state,
         safe_gate, lower_bound, use_gate_in_kernel, a_log, dt_bias,
         cu_seqlens, chunk_indices, epsilon, use_qk_l2norm_in_kernel,
         use_beta_sigmoid_in_kernel, allow_neg_eigval, use_exp2,
+        initial_state, disable_recompute, state_v_first,
     )
