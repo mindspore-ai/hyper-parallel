@@ -12,12 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Compose the official Xing4 backbone with shared training contracts.
-
-The bundled transformer sources stay unchanged. The backbone forward, attention,
-expert MLPs and learned routing retain their official implementations. Extensions
-provide training losses/state and an mHC post boundary for kernel replacement.
-"""
+"""Teacher-forced LM/MTP training over the official Xing4 backbone."""
 from functools import partial
 from typing import Any
 
@@ -74,11 +69,6 @@ class Xing4HyperConnection(Xing4_0HyperConnection):
         """Reuse FP32 projection and stabilized Sinkhorn from Transformers."""
         return (*DeepseekV4HyperConnection.forward(self, hidden_streams), hidden_streams)
 
-    def post(self, output: torch.Tensor, residual: torch.Tensor,
-             post: torch.Tensor, mix: torch.Tensor) -> torch.Tensor:
-        """Use the official destination-by-source matrix layout."""
-        result = mhc_post(output, residual.flatten(2), post, mix.transpose(-1, -2).contiguous(), self.hc_mult)
-        return result.unflatten(-1, (self.hc_mult, output.shape[-1]))
 
 
 class Xing4DecoderLayer(Xing4_0DecoderLayer):
@@ -107,10 +97,18 @@ class Xing4DecoderLayer(Xing4_0DecoderLayer):
         post, mix, collapsed, residual = self.attn_hc(hidden_states)
         output = self.self_attn(hidden_states=self.input_layernorm(collapsed),
                                 position_embeddings=position_embeddings, attention_mask=attention_mask, **kwargs)[0]
-        hidden_states = self.attn_hc.post(output, residual, post, mix)
+        hidden_states = self._post(output, residual, post, mix)
         post, mix, collapsed, residual = self.ffn_hc(hidden_states)
         output = self.mlp(self.post_attention_layernorm(collapsed))
-        return self.ffn_hc.post(output, residual, post, mix)
+        return self._post(output, residual, post, mix)
+
+    @staticmethod
+    def _post(output: torch.Tensor, residual: torch.Tensor,
+              post: torch.Tensor, mix: torch.Tensor) -> torch.Tensor:
+        """Convert destination-by-source mixing to the shared post layout."""
+        streams = residual.shape[2]
+        result = mhc_post(output, residual.flatten(2), post, mix.transpose(-1, -2).contiguous(), streams)
+        return result.unflatten(-1, (streams, output.shape[-1]))
 
 
 @torch.no_grad()

@@ -40,7 +40,9 @@ class Xing4Router(Xing4_0TopkRouter):
         self.aux_loss_cp_group = None
         self.register_buffer("_token_counts", torch.zeros(self.num_experts, dtype=torch.float32))
         self.input_jitter_eps = config.moe_input_jitter_eps
-        self._aux_loss = None
+        self.last_aux_loss = None
+        self.enable_expert_bias = config.moe_router_enable_expert_bias
+        self.expert_bias_update_rate = config.moe_router_bias_update_rate
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Route real tokens once; safe-token padding consumes neither jitter nor counts."""
@@ -96,8 +98,22 @@ class Xing4Router(Xing4_0TopkRouter):
             load = counts / (tokens * self.top_k)
             affinity = differentiable_all_reduce(normalized.sum(dim=1), "sum", group) / tokens
         loss = (affinity * load).sum(dim=-1).mean() * self.num_experts
-        self._aux_loss = loss.detach()
+        self.last_aux_loss = loss.detach()
         return aux_loss_auto_scale(weights, loss * self.aux_loss_coeff)
+
+
+    @property
+    def tokens_per_expert(self) -> torch.Tensor:
+        """Expose the persistent counts to the shared MoE monitor."""
+        return self._token_counts
+
+    @torch.no_grad()
+    def update_expert_bias(self, lr: float, num_recomputations: int = 1) -> None:
+        """Apply one load-based update after the optimizer step."""
+        del num_recomputations
+        counts = self._token_counts
+        self.e_score_correction_bias.add_((counts.mean() - counts).sign(), alpha=lr)
+        counts.zero_()
 
 
 class Xing4MLP(Xing4_0MLP):
@@ -150,8 +166,6 @@ class Xing4MoE(Xing4_0MoE):
         self.num_experts = config.n_routed_experts
         self.top_k = config.num_experts_per_tok
         self.padding = config.n_routed_experts if config.use_pad_tokens else 0
-        self.enable_expert_bias = config.moe_router_enable_expert_bias
-        self.expert_bias_update_rate = config.moe_router_bias_update_rate
         self.ep_executor = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -175,36 +189,3 @@ class Xing4MoE(Xing4_0MoE):
         """Expose the same once-only router contract to the expert-parallel executor."""
         _, weights, indices = self.gate(hidden)
         return indices, weights
-
-    @property
-    def tokens_per_expert(self) -> torch.Tensor | None:
-        """Expose the once-per-forward counts to the shared bias callback."""
-        return self.gate._token_counts
-
-    @tokens_per_expert.setter
-    def tokens_per_expert(self, value: torch.Tensor | None) -> None:
-        """Update the single routing-count owner."""
-        self.gate._token_counts = value
-
-    @property
-    def last_aux_loss(self) -> torch.Tensor | None:
-        """Expose the raw sequence-wise objective without a second owner."""
-        return self.gate._aux_loss
-
-    @property
-    def aux_loss_cp_group(self) -> Any:
-        """Expose the optional sequence-reduction group to the parallel adapter."""
-        return self.gate.aux_loss_cp_group
-
-    @aux_loss_cp_group.setter
-    def aux_loss_cp_group(self, value: Any) -> None:
-        """Bind the router objective's optional context group."""
-        self.gate.aux_loss_cp_group = value
-
-    @torch.no_grad()
-    def update_expert_bias(self, lr: float, num_recomputations: int = 1) -> None:
-        """Update expert bias once after the optimizer, independently of recompute."""
-        del num_recomputations
-        counts = self.tokens_per_expert
-        self.gate.e_score_correction_bias.add_((counts.mean() - counts).sign(), alpha=lr)
-        counts.zero_()

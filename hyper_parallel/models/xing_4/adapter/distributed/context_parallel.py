@@ -87,9 +87,9 @@ def xing4_moe_cp_wrapper(target_module: Xing4MoE, mesh: Any, tp_mesh: Any,
     del mesh, tp_mesh, ep_mesh
     if not isinstance(target_module, Xing4MoE) or cp_mesh is None:
         raise ValueError("Xing4 router statistics require an MoE module and an active CP mesh")
-    if target_module.aux_loss_cp_group is not None:
+    if target_module.gate.aux_loss_cp_group is not None:
         raise ValueError("Xing4 MoE CP group is already configured")
-    target_module.aux_loss_cp_group = cp_mesh.get_group()
+    target_module.gate.aux_loss_cp_group = cp_mesh.get_group()
     return []
 
 

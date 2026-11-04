@@ -14,7 +14,6 @@
 # ============================================================================
 """Muon for Xing4: AdamW decay groups and QK clipping after each step."""
 
-# This adapter uses the Torch runtime, like the existing optimizer builders.
 # pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
@@ -39,27 +38,25 @@ _MUON_LAYOUTS = ("native", "mindformers_pynative")
 
 def build_optimizer(*, model: nn.Module, muon_config: dict[str, Any], adamw_config: dict[str, Any],
                     qk_clip_threshold: float = 0.0, muon_layout: str = "native") -> Muon:
-    """Build the framework Muon with the MindFormers AdamW decay groups.
+    """Build framework Muon with Xing4 decay groups and optional QK clipping.
 
-    The default ``native`` layout orthogonalizes every matrix parameter whole, as the
-    framework does for any model. The opt-in ``mindformers_pynative`` layout instead
-    declares independent logical MLA and gate/up matrices through the framework's
-    existing ``reshape_fn``/``ns_transform_fn`` callbacks, using native NS and
-    per-matrix scaling; it requires the model's attention already replaced with the
-    fused-``linear_qkv`` ``Xing4MLAAttention`` and fails before construction otherwise.
-    As in MindFormers, AdamW does not decay one-dimensional parameters (norm weights,
-    mHC gates and biases) or biases.
+    ``native`` uses whole matrices; ``mindformers_pynative`` uses logical
+    matrix callbacks and requires fused linear_qkv attention. AdamW excludes
+    one-dimensional parameters and biases from decay. A zero threshold disables
+    QK clipping.
 
     Args:
-        model: Model whose parameters are optimized.
-        muon_config: Muon hyperparameters.
-        adamw_config: Hyperparameters of the AdamW fallback.
-        qk_clip_threshold: Maximum attention logit enforced by QK clipping after every
-            optimizer step; 0 disables clipping.
-        muon_layout: ``native`` or ``mindformers_pynative`` logical matrix boundaries.
+        model: Model after recipe module replacements.
+        muon_config: Framework Muon options.
+        adamw_config: Fallback AdamW options.
+        qk_clip_threshold: Maximum allowed per-head attention logit.
+        muon_layout: Whole-matrix or logical-matrix grouping.
 
     Returns:
-        The optimizer builder whose chained optimizer the Trainer steps.
+        The framework optimizer builder.
+
+    Raises:
+        ValueError: If the layout or its projection ownership is incompatible.
     """
     if muon_layout not in _MUON_LAYOUTS:
         raise ValueError(f"Unknown Xing4 muon_layout: {muon_layout!r}; expected one of {_MUON_LAYOUTS}")
@@ -71,32 +68,17 @@ def build_optimizer(*, model: nn.Module, muon_config: dict[str, Any], adamw_conf
     builder = Muon(muon_config=options, adamw_config=dict(adamw_config), model=model,
                    no_decay_params=no_decay)
     if qk_clip_threshold > 0:
-        # The MLA modules: the NPU Xing4MLAAttention replacement or, unreplaced, Transformers attention.
         attention = [module for module in model.modules()
                      if hasattr(module, "q_b_proj") and hasattr(module, "kv_b_proj")]
-        chained = builder.get_optimizer()
-        step_leaves = chained.step
-
-        def step_and_clip(closure: Any = None) -> None:
-            """Step every leaf optimizer, then clip the attention logits before any main-weight copy-back."""
-            step_leaves(closure)
-            clip_qk(attention, qk_clip_threshold)
-
-        # The Trainer keeps this chained optimizer; optimizer-state swap replaces its leaves, not it.
-        chained.step = step_and_clip
+        # Chain hooks run after all leaves and before FP32 main-weight copy-back.
+        builder.get_optimizer().register_step_post_hook(
+            lambda _optimizer, _args, _kwargs: clip_qk(attention, qk_clip_threshold)
+        )
     return builder
 
 
 def _with_logical_layout(options: dict[str, Any], model: nn.Module) -> dict[str, Any]:
-    """Bind the Xing4 ``mindformers_pynative`` Muon callbacks over ``options``.
-
-    Args:
-        options: Caller-supplied ``muon_config``, not mutated.
-        model: Model the layout's dimensions and parameter coverage are read from.
-
-    Returns:
-        A new mapping with ``reshape_fn``/``ns_transform_fn`` bound to the layout.
-    """
+    """Bind the layout callbacks after validating ownership and fused attention."""
     owned = {"reshape_fn", "ns_transform_fn"}
     conflicts = sorted(key for key in options if key.removeprefix("muon_") in owned)
     if conflicts:
@@ -117,23 +99,19 @@ def _with_logical_layout(options: dict[str, Any], model: nn.Module) -> dict[str,
 
 @torch.no_grad()
 def clip_qk(attention: Sequence[nn.Module], threshold: float) -> None:
-    """Rescale the query/key projections of heads whose maximum logit exceeded ``threshold``.
+    """Reduce head maxima globally, scale projection rows, and clear recorded maxima.
 
-    MuonClip: with ``s = threshold / max(max_logit, threshold)`` per head, the query
-    no-RoPE rows and the key no-RoPE rows scale by ``sqrt(s)`` and the query RoPE rows
-    by ``s``; value rows are unchanged. Each rank writes the maxima of the heads it
-    computed at their global head positions, so one MAX all-reduce over every rank gives
-    each head's maximum, with or without tensor parallelism. The recorded maxima are then
-    cleared.
+    For s = threshold / max(maximum, threshold), Q no-RoPE and K rows use
+    sqrt(s), Q RoPE rows use s, and V rows are unchanged. All ranks must
+    provide the same modules and global-head ordering for the MAX reduction.
 
     Args:
-        attention: MLA modules; the NPU fused attention records their ``max_logits`` each step.
-        threshold: Maximum attention logit.
+        attention: MLA modules that recorded maxima during forward.
+        threshold: Positive target maximum.
 
     Raises:
-        RuntimeError: If a module recorded no maxima, as without the NPU fused attention.
-        ValueError: If a module's maxima cover only part of its heads but its query
-            projection is not sharded into contiguous head blocks along the ``tp`` mesh dimension.
+        RuntimeError: If attention did not record maxima.
+        ValueError: If a TP shard does not own contiguous complete heads.
     """
     maxima = [getattr(module, "max_logits", None) for module in attention]
     if any(maximum is None for maximum in maxima):
@@ -151,23 +129,7 @@ def clip_qk(attention: Sequence[nn.Module], threshold: float) -> None:
 
 
 def _at_global_heads(module: nn.Module, maximum: torch.Tensor) -> torch.Tensor:
-    """Return ``maximum`` at its global head positions, ``-inf`` for heads another rank computed.
-
-    Tensor parallelism shards ``q_b_proj`` rows by contiguous head blocks: the rank at
-    coordinate ``r`` of the ``tp`` mesh dimension computes heads ``[r * n, (r + 1) * n)``.
-    Without it every rank computes every head.
-
-    Args:
-        module: MLA module whose ``q_b_proj`` defines the global head count.
-        maximum: Logit maxima of the heads this rank computed.
-
-    Returns:
-        The maxima of all the module's heads.
-
-    Raises:
-        ValueError: If ``maximum`` covers part of the heads but the query projection is not
-            sharded into contiguous head blocks along the ``tp`` mesh dimension.
-    """
+    """Place local maxima at global positions for contiguous row-sharded TP heads."""
     weight = module.q_b_proj.weight
     heads = weight.shape[0] // (module.qk_nope_head_dim + module.qk_rope_head_dim)
     if maximum.numel() == heads:

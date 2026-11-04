@@ -22,7 +22,9 @@ from transformers import PreTrainedModel
 
 from hyper_parallel.models import HyperAutoModelForCausalLM
 from hyper_parallel.models.xing_4.adapter.configuration import create_config
-from hyper_parallel.models.xing_4.adapter.training import Xing4ForCausalLM, Xing4HyperConnection
+from hyper_parallel.models.xing_4.adapter.conversion.module_replacement import Xing4FusedHyperConnection
+from hyper_parallel.models.xing_4.adapter.training import Xing4ForCausalLM
+from hyper_parallel.models.xing_4.transformer.modeling_xing4_0 import Xing4_0HyperConnection
 
 __all__ = ["build_model"]
 
@@ -41,11 +43,7 @@ def build_model(*, config: dict[str, Any], **options: Any) -> PreTrainedModel:
     model = HyperAutoModelForCausalLM.from_config(resolved, **options)
     if not any(isinstance(module, Xing4ForCausalLM) for module in model.modules()):
         raise TypeError("Xing4 training requires the registered Xing4ForCausalLM adapter")
-    if config.get("use_fused_mhc"):
-        from hyper_parallel.models.xing_4.adapter.conversion.module_replacement import (  # pylint: disable=C0415
-            Xing4FusedHyperConnection,
-        )
-        for name, module in model.named_modules():
-            if isinstance(module, Xing4HyperConnection) and not isinstance(module, Xing4FusedHyperConnection):
-                raise ValueError(f"use_fused_mhc requires a Xing4FusedHyperConnection plan override for {name}")
+    for name, module in model.named_modules():
+        if isinstance(module, Xing4_0HyperConnection) and not isinstance(module, Xing4FusedHyperConnection):
+            raise ValueError(f"Xing4 training requires a Xing4FusedHyperConnection plan override for {name}")
     return model
