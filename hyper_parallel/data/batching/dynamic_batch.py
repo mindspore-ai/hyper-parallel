@@ -14,6 +14,8 @@
 # ============================================================================
 """Candidate buffering and finalization used by dynamic DataLoaders."""
 
+from __future__ import annotations
+
 import operator
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
@@ -170,6 +172,7 @@ class PackingCandidateBuffer(BaseCandidateBuffer):
         for selected_index in selected_indices:
             if isinstance(selected_index, bool):
                 raise TypeError("PackingSelector indices must be integers")
+
             try:
                 resolved_index = operator.index(selected_index)
             except TypeError as exc:
@@ -177,10 +180,12 @@ class PackingCandidateBuffer(BaseCandidateBuffer):
 
             if resolved_index < 0 or resolved_index >= len(self.buffer):
                 raise IndexError("PackingSelector returned an out-of-range candidate index")
+
             resolved_indices.append(resolved_index)
 
         if not resolved_indices:
             raise ValueError("PackingSelector must select at least one candidate")
+
         if len(set(resolved_indices)) != len(resolved_indices):
             raise ValueError("PackingSelector must not select a candidate more than once")
 
@@ -266,6 +271,12 @@ class MappingReplayDataset:
             source_item = self.dataset[resolved_index]
 
         return source_item
+
+    def set_epoch(self, epoch: int) -> None:
+        """Keep indexed replay on the same epoch as the wrapped Dataset."""
+        epoch_setter = getattr(self.dataset, "set_epoch", None)
+        if callable(epoch_setter):
+            epoch_setter(epoch)
 
 
 class IndexReplayCheckpoint:
@@ -478,6 +489,7 @@ class _OmniPackingPipeline(_BatchPipeline):
             encoded_sample = self.selected_sample_encoder(selected_sample)
             if not isinstance(encoded_sample, Mapping):
                 raise TypeError("postencode_sample must return a mapping")
+
             encoded_samples.append(encoded_sample)
 
         packed_sample = self.packer.pack_selected_samples(encoded_samples)

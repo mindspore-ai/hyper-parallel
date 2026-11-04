@@ -341,6 +341,7 @@ class VLMTrainer:
                 if hasattr(train_dataloader, "set_epoch"):
                     train_dataloader.set_epoch(epoch)
 
+                self.base.state.epoch = epoch
                 self.on_epoch_begin()
                 data_iterator = iter(train_dataloader) if train_dataloader is not None else None
 

@@ -492,6 +492,17 @@ class BaseTrainer(Stateful, ABC):
     def _compute_train_iters(self) -> None:
         """Resolve the run limit and the optimizer steps available per Dataset epoch."""
         training_config = self.config.training
+        if getattr(training_config, "epochs", None) is not None:
+            self.train_steps = training_config.get_online_steps_per_epoch(
+                repeat=getattr(self.config.dataloader, "repeat", True),
+            )
+            if self.train_dataloader is not None and getattr(self.train_dataloader, "repeat", False) is not True:
+                raise ValueError("Online epochs/max_step require a DataLoader supporting repeat=True")
+
+            self.train_epochs = training_config.epochs
+            self.train_iters = self.train_epochs * self.train_steps
+            return
+
         if training_config.train_iters is not None and training_config.train_samples is not None:
             raise ValueError("configure only one of training.train_iters and training.train_samples")
 
@@ -514,6 +525,7 @@ class BaseTrainer(Stateful, ABC):
             train_steps = micro_batches_per_epoch // self.num_micro_batches
             if train_steps <= 0:
                 raise ValueError("train DataLoader must provide one complete optimizer step per epoch")
+
         else:
             # Streaming and dynamic DataLoaders define an epoch only when their
             # source iterator is exhausted.

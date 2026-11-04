@@ -74,8 +74,10 @@ class DataLoaderConfig:
     use_background_prefetcher: bool = False
 
     def build(self, **runtime_kwargs: Any) -> Any:
-        """Build the DataLoader target with runtime Dataset arguments."""
-        return self.target.build(**runtime_kwargs)
+        """Apply the configured sampler policy and build with runtime Dataset arguments."""
+        runtime_kwargs.setdefault("sampler_type", self.sampler_type)
+        dataloader = self.target.build(**runtime_kwargs)
+        return dataloader
 
     def __getattr__(self, name: str) -> Any:
         """Expose configured DataLoader options through the wrapped target."""
@@ -89,5 +91,4 @@ class DataLoaderConfig:
         config["sampler_type"] = self.sampler_type
         config["data_rearrange_map"] = _serialize_config_value(self.data_rearrange_map)
         config["data_sharding"] = self.data_sharding
-        config["use_background_prefetcher"] = self.use_background_prefetcher
         return config

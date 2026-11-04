@@ -20,7 +20,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from hyper_parallel.data.dataset_logging import get_dataset_logger
-from hyper_parallel.data.indexed.indexed_dataset import (
+from hyper_parallel.data.indexed.build_dataset import (
     build_indexed_dataset as _build_indexed_dataset,
 )
 from hyper_parallel.data.online import (
@@ -107,7 +107,7 @@ def build_online_text_mapping_dataset(
     training_seed = getattr(training_config, "seed", None)
     dataset_config["random_seed"] = 42 if training_seed is None else int(training_seed)
     train_valid_test_num_samples = None
-    if training_config is not None:
+    if training_config is not None and getattr(training_config, "epochs", None) is None:
         train_valid_test_num_samples = _get_train_valid_test_num_samples(training_config)
     sample_filter = transform.is_valid_sample
     source_dataset = build_online_mapping_source(
@@ -194,6 +194,9 @@ def build_indexed_text_dataset(
     Raises:
         ValueError: If required path or training information is missing.
     """
+    if getattr(training_config, "epochs", None) is not None:
+        raise ValueError("Indexed training requires train_iters/train_samples; epochs/max_step are Online-only")
+
     dataset_config = dict(data_config)
     dataset_config.setdefault("distributed_walk", True)
     training_seed = getattr(training_config, "seed", None)

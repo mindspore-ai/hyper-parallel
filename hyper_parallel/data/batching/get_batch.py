@@ -132,7 +132,7 @@ class OmniParallelBatch:
         model_inputs.update(transport_inputs)
         # Shapes are host metadata; inspecting device tensor values here can stall collectives.
         logger.debug(
-            "Omni get_batch: batch=%d transport_ready fields=%s runtime_fields=%s",
+            "Omni get_batch: batch=%d transport_ready field_shapes=%s runtime_fields=%s",
             self._batch_index,
             {field: tuple(value.shape) for field, value in device_batch.items() if torch.is_tensor(value)},
             list(runtime_inputs), enabled=True,

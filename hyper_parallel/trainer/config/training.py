@@ -22,10 +22,20 @@ from hyper_parallel.components.quantization.config import LowPrecisionConfig
 
 @dataclass
 class TrainingConfig:
-    """Training-loop parameters exposed by the initial YAML schema."""
+    """Training-loop parameters.
+
+    Indexed training retains its ``train_iters`` or ``train_samples`` budget.
+    Online training uses ``epochs`` and ``max_step``; ``max_step`` limits
+    optimizer steps within each epoch, rather than the complete run.
+    This pair cannot be combined with ``train_iters`` or ``train_samples``.
+    """
 
     train_iters: Optional[int] = None
     train_samples: Optional[int] = None
+
+    epochs: Optional[int] = None
+    max_step: Optional[int] = None
+
     lr_scheduler_iters: Optional[int] = None
     eval_iters: int = 0
 
@@ -54,6 +64,46 @@ class TrainingConfig:
     attention over the real sequence boundaries.
     """
     low_precision: LowPrecisionConfig = field(default_factory=LowPrecisionConfig)
+
+    def __post_init__(self) -> None:
+        """Validate explicit epoch limits without changing legacy run budgets."""
+        if self.epochs is not None or self.max_step is not None:
+            for name, value in (("epochs", self.epochs), ("max_step", self.max_step)):
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    raise ValueError(f"training.{name} must be a positive integer when using epochs and max_step")
+
+            if self.train_iters is not None or self.train_samples is not None:
+                raise ValueError("training.epochs/max_step cannot be combined with train_iters or train_samples")
+
+    def get_online_steps_per_epoch(
+            self,
+            *,
+            repeat: bool = True,
+    ) -> int:
+        """Resolve an Online epoch's optimizer-step budget.
+
+        Args:
+            repeat: Whether the Online source repeats before packing at EOF. Defaults to true.
+
+        Returns:
+            Optimizer steps per epoch. The total run budget is this value times
+            ``epochs``.
+
+        Raises:
+            ValueError: If epoch limits are missing or source repetition is disabled.
+
+        Example:
+            ``epochs=3, max_step=100, repeat=True`` yields 100 optimizer steps
+            per epoch and 300 total, regardless of the source length on a DP rank.
+        """
+        if self.epochs is None or self.max_step is None:
+            raise ValueError("training.epochs and training.max_step must both be configured")
+
+        if repeat is not True:
+            raise ValueError("Online epoch-based training requires repeat=True before packing")
+
+        steps_per_epoch = self.max_step
+        return steps_per_epoch
 
 
 @dataclass
