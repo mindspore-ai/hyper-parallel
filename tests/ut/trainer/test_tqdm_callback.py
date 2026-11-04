@@ -91,6 +91,72 @@ class TestTqdmCallback(unittest.TestCase):
         self.assertIn("loss=2.5", output, f"progress metrics missing from output, got={output!r}")
         self.assertIn("step=1 epoch=0", output, f"structured log message missing from output, got={output!r}")
 
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="essential",
+    )
+    def test_optional_tflops_metric_reaches_the_postfix(self) -> None:
+        """Show the per-device TFLOP/s metric beside the existing throughput fields.
+
+        Feature: Optional per-device TFLOP/s metrics.
+        Description: Publish a step whose environment metrics carry ``performance/tflops_per_device``.
+        Expectation: The progress postfix renders the value with three decimals.
+        """
+        stream = StringIO()
+        trainer = self._build_trainer()
+        trainer.step_env_metrics = {
+            "performance/tokens_per_second": 65536.0,
+            "performance/step_time": 0.5,
+            "performance/tflops_per_device": 23.5584,
+        }
+        callback = TqdmCallback(trainer)
+        state = TrainerState(global_step=0, epoch=0)
+
+        with patch.object(sys, "stderr", stream), patch.dict(
+            sys.modules,
+            {"tqdm": SimpleNamespace(tqdm=_FakeTqdm)},
+        ):
+            callback.on_train_begin(state)
+            state.global_step = 1
+            callback.on_step_end(state)
+            callback.on_train_end(state)
+
+        output = stream.getvalue()
+        self.assertIn("TFLOP/s=23.558", output, f"tflops metric missing from postfix, got={output!r}")
+        self.assertIn("tokens/s=65536.000", output, f"throughput metric missing from postfix, got={output!r}")
+
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="essential",
+    )
+    def test_absent_tflops_metric_is_not_rendered(self) -> None:
+        """Leave the postfix unchanged when the optional metric is disabled.
+
+        Feature: Optional per-device TFLOP/s metrics.
+        Description: Publish a step whose environment metrics carry no FLOPs entry.
+        Expectation: The progress postfix shows no TFLOP/s label.
+        """
+        stream = StringIO()
+        callback = TqdmCallback(self._build_trainer())
+        state = TrainerState(global_step=0, epoch=0)
+
+        with patch.object(sys, "stderr", stream), patch.dict(
+            sys.modules,
+            {"tqdm": SimpleNamespace(tqdm=_FakeTqdm)},
+        ):
+            callback.on_train_begin(state)
+            state.global_step = 1
+            callback.on_step_end(state)
+            callback.on_train_end(state)
+
+        output = stream.getvalue()
+        self.assertNotIn("TFLOP/s", output, f"disabled metric must not render, got={output!r}")
+        self.assertIn("tokens/s=128.125", output, f"existing metric missing from postfix, got={output!r}")
+
 
 if __name__ == "__main__":
     unittest.main()
