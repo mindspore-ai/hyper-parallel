@@ -15,13 +15,14 @@
 """Experimental reentrant activation checkpoint with excluded regions.
 
 This module is intentionally independent from the public activation checkpoint
-entry points.  It provides a hook-free prototype in which the outer checkpoint
+entry points.  It provides a prototype in which the outer checkpoint
 uses a custom backward and every excluded region retains a small, ordinary
 PyNative autograd graph.  During checkpoint replay, a custom autograd bridge
 returns the cached excluded output and routes its backward through the retained
 local graph.
 
-The implementation currently supports PyNative execution with Tensor leaves in
+The implementation expects enable_mindspore_backward_compat() to be enabled.
+It currently supports PyNative execution with Tensor leaves in
 nested input and output containers. Selective checkpoint policies and activation
 swapping are intentionally not supported yet.
 """
@@ -43,6 +44,7 @@ import contextvars
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
+import importlib
 import threading
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 import weakref
@@ -60,22 +62,14 @@ from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap imp
 
 
 _DEFAULT_REPLAY_KEY = object()
-
-
-@lru_cache(maxsize=1)
-def _get_tensor_type() -> type:
-    """Return the MindSpore Tensor type."""
-    return Tensor
-
-
-def _is_tensor(value: Any) -> bool:
-    """Return whether *value* is a MindSpore Tensor."""
-    return isinstance(value, _get_tensor_type())
+_checkpoint_exclude = importlib.import_module(
+    "hyper_parallel.platform.mindspore.activation_checkpoint.checkpoint_exclude_wrapper"
+)
 
 
 def _tensor_leaves(value: Any) -> List[Any]:
     """Collect Tensor leaves from supported Python containers."""
-    if _is_tensor(value):
+    if isinstance(value, Tensor):
         return [value]
     leaves = []
     if isinstance(value, (tuple, list)):
@@ -89,7 +83,7 @@ def _tensor_leaves(value: Any) -> List[Any]:
 
 def _map_tensors(function: Callable[[Any], Any], value: Any) -> Any:
     """Apply *function* to Tensor leaves while preserving container types."""
-    if _is_tensor(value):
+    if isinstance(value, Tensor):
         return function(value)
     if isinstance(value, list):
         return [_map_tensors(function, item) for item in value]
@@ -106,6 +100,61 @@ def _map_tensors(function: Callable[[Any], Any], value: Any) -> Any:
 def _detach_tree(value: Any) -> Any:
     """Detach every Tensor leaf in *value*."""
     return _map_tensors(lambda tensor: tensor.detach(), value)
+
+
+@dataclass(frozen=True)
+class _DetachedInputs:
+    """Store detached arguments and tensor leaves collected in one traversal."""
+
+    args: Tuple[Any, ...]
+    kwargs: Dict[str, Any]
+    tensors: Tuple[Any, ...]
+    tensor_inputs: Tuple[Tuple[Tuple[Tuple[str, Any], ...], Any], ...]
+
+
+def _detach_inputs(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> _DetachedInputs:
+    """Detach inputs, mark tensor roots, and collect paths in one traversal."""
+    tensors = []
+    tensor_inputs = []
+
+    def detach(value: Any, path: Tuple[Tuple[str, Any], ...]) -> Any:
+        if isinstance(value, Tensor):
+            detached = value.detach()
+            detached.requires_grad = True
+            tensors.append(detached)
+            tensor_inputs.append((path, detached))
+            return detached
+        if isinstance(value, list):
+            return [detach(item, path + (("index", index),)) for index, item in enumerate(value)]
+        if isinstance(value, tuple):
+            items = [
+                detach(item, path + (("index", index),))
+                for index, item in enumerate(value)
+            ]
+            if hasattr(value, "_fields"):
+                return type(value)(*items)
+            return tuple(items)
+        if isinstance(value, dict):
+            return type(value)(
+                (key, detach(item, path + (("key", key),)))
+                for key, item in value.items()
+            )
+        return value
+
+    detached_args = tuple(
+        detach(value, (("arg", index),))
+        for index, value in enumerate(args)
+    )
+    detached_kwargs = {
+        key: detach(value, (("kwarg", key),))
+        for key, value in kwargs.items()
+    }
+    return _DetachedInputs(
+        args=detached_args,
+        kwargs=detached_kwargs,
+        tensors=tuple(tensors),
+        tensor_inputs=tuple(tensor_inputs),
+    )
 
 
 def _validate_output(output: Any) -> None:
@@ -130,24 +179,27 @@ def _normalize_sensitivities(output: Any, sensitivity: Any) -> List[Any]:
 
 
 def _mark_requires_grad(tensors: Sequence[Any]) -> None:
-    """Mark local VJP roots as requiring gradients."""
+    """Mark local backward roots as requiring gradients."""
     for tensor in tensors:
-        requires_grad = getattr(tensor, "requires_grad_", None)
-        if callable(requires_grad):
-            requires_grad()
-        else:
-            tensor._requires_grad = True  # pylint: disable=protected-access
+        tensor.requires_grad = True
 
 
-class _VjpTape:
-    """Retain one ordinary PyNative graph and expose a repeatable VJP."""
+class _ReplayGraph:
+    """Retain one ordinary PyNative graph and expose its backward."""
 
-    def __init__(self, output: Any, inputs: Sequence[Any], parameters: Sequence[Any]) -> None:
-        """Initialize a tape from a recorded output and its gradient targets."""
+    def __init__(
+        self,
+        output: Any,
+        input_count: int,
+        input_grads: List[Any],
+        input_grad_hooks: Sequence[Any],
+    ) -> None:
+        """Initialize a tape without retaining its input tensors."""
         _validate_output(output)
         self.output = output
-        self.inputs = tuple(inputs)
-        self.parameters = tuple(parameters)
+        self.input_count = input_count
+        self._input_grads = input_grads
+        self._input_grad_hooks = tuple(input_grad_hooks)
         self._released = False
 
     @classmethod
@@ -156,85 +208,79 @@ class _VjpTape:
         function: Callable[..., Any],
         args: Tuple[Any, ...],
         kwargs: Dict[str, Any],
-        parameters: Sequence[Any],
-    ) -> "_VjpTape":
+        input_tensors: Optional[Sequence[Any]] = None,
+    ) -> "_ReplayGraph":
         """Execute *function* with PyNative grad recording enabled.
 
         Args:
             function: Callable to record.
             args: Positional arguments passed to the callable.
             kwargs: Keyword arguments passed to the callable.
-            parameters: Parameters included as gradient targets.
+            input_tensors: Pre-collected differentiable input leaves.
         """
-        input_tensors = _tensor_leaves((args, kwargs))
-        _mark_requires_grad(input_tensors)
+        if input_tensors is None:
+            input_tensors = _tensor_leaves((args, kwargs))
+            _mark_requires_grad(input_tensors)
+        input_grads = [None] * len(input_tensors)
+        input_grad_hooks = []
         previous_enable_grad = _pynative_executor.enable_grad()
         previous_grad_flag = _pynative_executor.grad_flag()
-        _pynative_executor.set_enable_grad(True)
-        _pynative_executor.set_grad_flag(True)
         try:
+            for index, tensor in enumerate(input_tensors):
+                def capture_input_grad(gradient: Any, grad_index: int = index) -> Any:
+                    input_grads[grad_index] = gradient
+                    return gradient
+
+                input_grad_hooks.append(tensor.register_hook(capture_input_grad))
+            _pynative_executor.set_enable_grad(True)
+            _pynative_executor.set_grad_flag(True)
             output = function(*args, **kwargs)
+            return cls(output, len(input_tensors), input_grads, input_grad_hooks)
+        except BaseException:
+            for hook in input_grad_hooks:
+                hook.remove()
+            raise
         finally:
             _pynative_executor.set_grad_flag(previous_grad_flag)
             _pynative_executor.set_enable_grad(previous_enable_grad)
-        return cls(output, input_tensors, parameters)
 
-    def vjp(
+    def backward(
         self,
         sensitivity: Any,
         keep_graph: bool,
-        accumulate_parameters: bool = False,
-    ) -> Tuple[Tuple[Any, ...], Tuple[Any, ...]]:
-        """Calculate gradients for recorded inputs and parameters.
+    ) -> Tuple[Any, ...]:
+        """Accumulate all parameter gradients and return activation input grads.
 
         Args:
             sensitivity: Output gradients supplied by the caller.
             keep_graph: Whether to retain the local graph for another traversal.
-            accumulate_parameters: Accumulate parameter gradients through nested hooks.
         """
         if self._released:
             raise RuntimeError("The retained reentrant checkpoint graph has already been released")
+        self._input_grads[:] = [None] * self.input_count
         output_tensors = tuple(_tensor_leaves(self.output))
         sensitivity_tensors = tuple(_normalize_sensitivities(self.output, sensitivity))
-        targets = self.inputs + self.parameters
-        if accumulate_parameters:
-            gradients = run_backward(
-                output_tensors,
-                sensitivity_tensors,
-                keep_graph,
-                False,
-                (),
-                allow_unreachable=True,
-                accumulate_grad=True,
-            )
-            if gradients is None:
-                gradients = tuple(getattr(tensor, "grad", None) for tensor in self.inputs)
-                for tensor in self.inputs:
-                    tensor.grad = None
-            if not keep_graph:
-                self.release()
-            return tuple(gradients), (None,) * len(self.parameters)
-        gradients = run_backward(
+        run_backward(
             output_tensors,
             sensitivity_tensors,
             keep_graph,
             False,
-            targets,
+            (),
             allow_unreachable=True,
-            accumulate_grad=False,
+            accumulate_grad=True,
         )
-        input_count = len(self.inputs)
-        input_grads = tuple(gradients[:input_count])
-        parameter_grads = tuple(gradients[input_count:])
+        input_grads = tuple(self._input_grads)
         if not keep_graph:
             self.release()
-        return input_grads, parameter_grads
+        return input_grads
 
     def release(self) -> None:
         """Release all Python references keeping the PyNative graph alive."""
         self.output = None
-        self.inputs = ()
-        self.parameters = ()
+        for hook in self._input_grad_hooks:
+            hook.remove()
+        self._input_grad_hooks = ()
+        self._input_grads[:] = []
         self._released = True
 
 
@@ -321,77 +367,66 @@ def reentrant_recompute_backward_compat_ctx() -> Iterator[None]:
         _IN_REENTRANT_TOP_LEVEL_BACKWARD.reset(token)
 
 
-class _CheckpointInvocation:
-    """Own excluded-region graphs belonging to one checkpoint call."""
-
-    def __init__(self) -> None:
-        """Initialize an empty ordered call registry."""
-        self.exclude_entries: Dict[int, List[_ExcludeEntry]] = defaultdict(list)
-
-    def add_entry(self, wrapper_id: int, entry: "_ExcludeEntry") -> None:
-        """Append one original-forward excluded call.
-
-        Args:
-            wrapper_id: Identity of the exclusion wrapper.
-            entry: Retained graph for one invocation.
-        """
-        self.exclude_entries[wrapper_id].append(entry)
-
-    def get_entry(self, wrapper_id: int, index: int) -> "_ExcludeEntry":
-        """Return the excluded call matching replay order.
-
-        Args:
-            wrapper_id: Identity of the exclusion wrapper.
-            index: Invocation index within the wrapper.
-        """
-        entries = self.exclude_entries.get(wrapper_id)
-        if entries is None or index >= len(entries):
-            raise RuntimeError("Checkpoint replay executed an unmatched checkpoint exclusion wrapper call")
-        return entries[index]
-
-    def clear(self) -> None:
-        """Release all retained excluded-region graphs."""
-        for entries in self.exclude_entries.values():
-            for entry in entries:
-                entry.release()
-        self.exclude_entries.clear()
-
-
 class _ExecutionState:
-    """Expose one checkpoint invocation and phase to nested wrappers."""
+    """Run one reentrant exclude call during forward or replay."""
 
-    def __init__(self, invocation: _CheckpointInvocation, recomputing: bool) -> None:
+    def __init__(self, exclude_cache: _checkpoint_exclude._ExcludeCache, recomputing: bool) -> None:
         """Initialize forward or replay state."""
-        self.invocation = invocation
+        self.exclude_cache = exclude_cache
         self.recomputing = recomputing
-        self._positions: Dict[int, int] = defaultdict(int)
 
-    def next_entry(self, wrapper_id: int) -> "_ExcludeEntry":
-        """Consume the next original call entry for *wrapper_id*.
+    def __call__(
+        self,
+        wrapper: Any,
+        args: Tuple[Any, ...],
+        kwargs: Dict[str, Any],
+    ) -> Any:
+        """Execute one shared exclusion wrapper inside the reentrant phase."""
+        module = wrapper._ckpt_wrapped_module  # pylint: disable=protected-access
+        if self.recomputing:
+            entry = self.exclude_cache.pop(id(wrapper))
+            return _apply_exclude_replay(entry, args, kwargs)
 
-        Args:
-            wrapper_id: Identity of the exclusion wrapper.
-        """
-        index = self._positions[wrapper_id]
-        entry = self.invocation.get_entry(wrapper_id, index)
-        self._positions[wrapper_id] += 1
-        return entry
-
-
-_CURRENT_EXECUTION_STATE: contextvars.ContextVar[Optional[_ExecutionState]] = contextvars.ContextVar(
-    "hyper_parallel_reentrant_execution_state",
-    default=None,
-)
+        prepared = _detach_inputs(args, kwargs)
+        input_infos = (
+            ()
+            if wrapper.preserve_inputs
+            else _checkpoint_exclude._capture_recompute_inputs_from_leaves(
+                prepared.tensor_inputs
+            )
+        )
+        input_bindings = []
+        pack_token = _checkpoint_exclude._ACTIVE_PACK_STATE.set(
+            _checkpoint_exclude._PackState(input_infos, input_bindings)
+        )
+        try:
+            with _checkpoint_exclude._saved_tensors_context():
+                tape = _ReplayGraph.record(
+                    module,
+                    prepared.args,
+                    prepared.kwargs,
+                    input_tensors=prepared.tensors,
+                )
+        finally:
+            _checkpoint_exclude._ACTIVE_PACK_STATE.reset(pack_token)
+        rng_state = get_rng_state() if wrapper.save_rng_state else None
+        self.exclude_cache.save(
+            id(wrapper),
+            _checkpoint_exclude._ExcludeCacheEntry(
+                output=tape.output,
+                input_bindings=input_bindings,
+                rng_state=rng_state,
+                tape=tape,
+            ),
+        )
+        return tape.output
 
 
 @contextlib.contextmanager
 def _execution_state_ctx(state: _ExecutionState) -> Iterator[None]:
     """Install a checkpoint execution phase in the current dynamic scope."""
-    token = _CURRENT_EXECUTION_STATE.set(state)
-    try:
+    with _checkpoint_exclude.reentrant_exclude_runner_ctx(state):
         yield
-    finally:
-        _CURRENT_EXECUTION_STATE.reset(token)
 
 
 @contextlib.contextmanager
@@ -416,44 +451,6 @@ def _create_phase_contexts(
     return tuple(pair[0] for pair in pairs), tuple(pair[1] for pair in pairs)
 
 
-class _ExcludeEntry:
-    """Retain one excluded forward output and its local VJP graph."""
-
-    def __init__(
-        self,
-        output: Any,
-        tape: _VjpTape,
-        parameter_count: int,
-        rng_state_after: Optional[Any],
-    ) -> None:
-        """Initialize one excluded call entry."""
-        self.output = output
-        self.tape = tape
-        self.input_count = len(tape.inputs)
-        self.parameter_count = parameter_count
-        self.rng_state_after = rng_state_after
-
-    def vjp(self, sensitivity: Any, keep_graph: bool) -> Tuple[Tuple[Any, ...], Tuple[Any, ...]]:
-        """Run the retained excluded-region backward graph.
-
-        Args:
-            sensitivity: Output gradients supplied by the bridge.
-            keep_graph: Whether to retain the graph for another traversal.
-        """
-        return self.tape.vjp(sensitivity, keep_graph)
-
-    def restore_rng_state(self) -> None:
-        """Advance replay RNG to the state after the skipped region."""
-        if self.rng_state_after is None:
-            return
-        set_rng_state(self.rng_state_after)
-
-    def release(self) -> None:
-        """Release output and local VJP graph references."""
-        self.output = None
-        self.tape.release()
-
-
 @lru_cache(maxsize=1)
 def _get_exclude_replay_function() -> type:
     """Create the private MindSpore custom autograd bridge lazily."""
@@ -461,7 +458,12 @@ def _get_exclude_replay_function() -> type:
         """Return a cached output and connect it to replay inputs in backward."""
 
         @staticmethod
-        def forward(ctx: Any, entry: _ExcludeEntry, input_count: int, *tensors: Any) -> Any:
+        def forward(
+            ctx: Any,
+            entry: _checkpoint_exclude._ExcludeCacheEntry,
+            input_count: int,
+            *tensors: Any,
+        ) -> Any:
             """Return the cached output without executing the excluded module.
 
             Args:
@@ -477,7 +479,7 @@ def _get_exclude_replay_function() -> type:
 
         @staticmethod
         def backward(ctx: Any, *grad_outputs: Any) -> Tuple[Any, ...]:
-            """Route the bridge VJP through the original excluded graph.
+            """Route the bridge backward through the original excluded graph.
 
             Args:
                 ctx: Autograd context created in forward.
@@ -486,71 +488,46 @@ def _get_exclude_replay_function() -> type:
             session = _CURRENT_SESSION.get()
             keep_graph = session is not None and session.retain_graph
             sensitivity = grad_outputs[0] if len(grad_outputs) == 1 else grad_outputs
-            input_grads, parameter_grads = ctx.entry.vjp(sensitivity, keep_graph)
+            input_grads = ctx.entry.tape.backward(sensitivity, keep_graph)
             if len(input_grads) != ctx.input_count:
                 raise RuntimeError(
                     "Checkpoint exclusion input count changed between original forward and replay"
                 )
-            return (None, None, *input_grads, *parameter_grads)
+            return (None, None, *input_grads)
 
     return _ExcludeReplayFunction
 
 
 def _apply_exclude_replay(
-    entry: _ExcludeEntry,
+    entry: _checkpoint_exclude._ExcludeCacheEntry,
     args: Tuple[Any, ...],
     kwargs: Dict[str, Any],
-    parameters: Sequence[Any],
 ) -> Any:
     """Apply an autograd bridge from current replay tensors to cached output."""
-    entry.restore_rng_state()
+    if entry.tape is None:
+        raise RuntimeError("Reentrant checkpoint exclusion entry is missing its local backward graph")
+    if entry.rng_state is not None:
+        set_rng_state(entry.rng_state)
+    _checkpoint_exclude._materialize_recompute_inputs(entry, args, kwargs)
     input_tensors = tuple(_tensor_leaves((args, kwargs)))
-    if len(input_tensors) != entry.input_count:
+    if len(input_tensors) != entry.tape.input_count:
         raise RuntimeError(
             "Checkpoint exclusion Tensor input count changed between original forward and replay: "
-            f"expected {entry.input_count}, but got {len(input_tensors)}"
+            f"expected {entry.tape.input_count}, but got {len(input_tensors)}"
         )
-    if len(parameters) != entry.parameter_count:
-        raise RuntimeError(
-            "Checkpoint exclusion parameter count changed between original forward and replay: "
-            f"expected {entry.parameter_count}, but got {len(parameters)}"
-        )
-    differentiable_tensors = input_tensors + tuple(parameters)
-    if not differentiable_tensors:
+    if not input_tensors:
         return _detach_tree(entry.output)
     replay_function = _get_exclude_replay_function()
-    return replay_function.apply(entry, len(input_tensors), *differentiable_tensors)
+    return replay_function.apply(entry, len(input_tensors), *input_tensors)
 
 
-class ReentrantCheckpointExcludeWrapper(ActivationWrapper):
-    """Execute a region once and reuse its output during reentrant replay."""
+class ReentrantCheckpointExcludeWrapper(_checkpoint_exclude.CheckpointExcludeWrapper):
+    """Configure the shared exclusion wrapper for reentrant replay."""
 
     def __init__(self, module: Callable[..., Any], save_rng_state: bool = True) -> None:
         """Initialize a reentrant checkpoint exclusion wrapper."""
-        if not callable(module):
-            raise ValueError("module must be a MindSpore Cell or callable")
-        super().__init__(module, track_overlaps=False)
+        super().__init__(module)
         self.save_rng_state = save_rng_state
-
-    def construct(self, *args: Any, **kwargs: Any) -> Any:
-        """Record a local VJP in forward and insert a bridge during replay."""
-        state = _CURRENT_EXECUTION_STATE.get()
-        if state is None:
-            return self._wrapped_module(*args, **kwargs)  # pylint: disable=not-callable
-        parameters = tuple(self._wrapped_module.trainable_params())
-        if state.recomputing:
-            entry = state.next_entry(id(self))
-            return _apply_exclude_replay(entry, args, kwargs, parameters)
-
-        detached_args = _detach_tree(args)
-        detached_kwargs = _detach_tree(kwargs)
-        tape = _VjpTape.record(self._wrapped_module, detached_args, detached_kwargs, parameters)
-        rng_state_after = None
-        if self.save_rng_state:
-            rng_state_after = get_rng_state()
-        entry = _ExcludeEntry(tape.output, tape, len(parameters), rng_state_after)
-        state.invocation.add_entry(id(self), entry)
-        return tape.output
 
 
 class _ReentrantCheckpointCall:
@@ -566,14 +543,14 @@ class _ReentrantCheckpointCall:
         self._wrapped_module = module
         self.context_fn = context_fn
         self.save_rng_state = save_rng_state
-        self._invocation = _CheckpointInvocation()
+        self._exclude_cache = _checkpoint_exclude._ExcludeCache()
         self._original_args: Optional[Tuple[Any, ...]] = None
         self._original_kwargs: Optional[Dict[str, Any]] = None
         self._rng_state = None
         self._amp_strategy = None
         self._forward_contexts: Tuple[Any, ...] = ()
         self._recompute_contexts: Tuple[Any, ...] = ()
-        self._replay_tapes: Dict[Any, _VjpTape] = {}
+        self._replay_graphs: Dict[Any, _ReplayGraph] = {}
         self._lock = threading.RLock()
 
     @staticmethod
@@ -596,7 +573,7 @@ class _ReentrantCheckpointCall:
         if self.save_rng_state:
             self._rng_state = get_rng_state()
         self._amp_strategy = get_curr_amp_strategy()
-        execution_state = _ExecutionState(self._invocation, recomputing=False)
+        execution_state = _ExecutionState(self._exclude_cache, recomputing=False)
         with _stack_contexts(self._forward_contexts), _execution_state_ctx(execution_state), _no_grad():
             output = self._wrapped_module(*args, **kwargs)
         _validate_output(output)
@@ -612,7 +589,7 @@ class _ReentrantCheckpointCall:
         if self.save_rng_state:
             set_rng_state(self._rng_state)
         _pynative_executor.set_is_run_recompute(True)
-        execution_state = _ExecutionState(self._invocation, recomputing=True)
+        execution_state = _ExecutionState(self._exclude_cache, recomputing=True)
         try:
             with _stack_contexts(self._recompute_contexts), _execution_state_ctx(execution_state):
                 if self._amp_strategy is None:
@@ -630,19 +607,17 @@ class _ReentrantCheckpointCall:
             if previous_rng_state is not None:
                 set_rng_state(previous_rng_state)
 
-    def _record_replay(self) -> _VjpTape:
+    def _record_replay(self) -> _ReplayGraph:
         """Replay the checkpoint function once and retain its PyNative graph."""
         if self._original_args is None or self._original_kwargs is None:
             raise RuntimeError("Cannot replay a reentrant checkpoint before its original forward")
-        replay_args = _detach_tree(self._original_args)
-        replay_kwargs = _detach_tree(self._original_kwargs)
+        replay_inputs = _detach_inputs(self._original_args, self._original_kwargs)
         with self._replay_environment():
-            replay_parameters = tuple(self._wrapped_module.trainable_params())
-            return _VjpTape.record(
+            return _ReplayGraph.record(
                 self._wrapped_module,
-                replay_args,
-                replay_kwargs,
-                replay_parameters,
+                replay_inputs.args,
+                replay_inputs.kwargs,
+                input_tensors=replay_inputs.tensors,
             )
 
     def recompute(self, session_id: Any) -> None:
@@ -652,24 +627,24 @@ class _ReentrantCheckpointCall:
             session_id: Identifier used by the later backward traversal.
         """
         with self._lock:
-            if session_id not in self._replay_tapes:
-                self._replay_tapes[session_id] = self._record_replay()
+            if session_id not in self._replay_graphs:
+                self._replay_graphs[session_id] = self._record_replay()
         with _SESSION_LOCK:
             _SESSION_CALLS[session_id].add(self)
 
-    def _get_replay_tape(self, replay_key: Any) -> _VjpTape:
-        """Get or lazily record the replay tape for one backward session."""
+    def _get_replay_graph(self, replay_key: Any) -> _ReplayGraph:
+        """Get or lazily record the replay graph for one backward session."""
         with self._lock:
-            tape = self._replay_tapes.get(replay_key)
-            if tape is None:
-                tape = self._record_replay()
-                self._replay_tapes[replay_key] = tape
+            replay_graph = self._replay_graphs.get(replay_key)
+            if replay_graph is None:
+                replay_graph = self._record_replay()
+                self._replay_graphs[replay_key] = replay_graph
         if replay_key is not _DEFAULT_REPLAY_KEY:
             with _SESSION_LOCK:
                 _SESSION_CALLS[replay_key].add(self)
-        return tape
+        return replay_graph
 
-    def backward(self, sensitivity: Any) -> Tuple[Tuple[Any, ...], Tuple[Any, ...]]:
+    def backward(self, sensitivity: Any) -> Tuple[Any, ...]:
         """Replay if needed and calculate checkpoint gradients.
 
         Args:
@@ -678,21 +653,17 @@ class _ReentrantCheckpointCall:
         session = _CURRENT_SESSION.get()
         replay_key = session.session_id if session is not None else _DEFAULT_REPLAY_KEY
         retain_graph = session is not None and session.retain_graph
-        tape = self._get_replay_tape(replay_key)
-        input_grads, parameter_grads = tape.vjp(
-            sensitivity,
-            keep_graph=retain_graph,
-            accumulate_parameters=True,
-        )
+        replay_graph = self._get_replay_graph(replay_key)
+        input_grads = replay_graph.backward(sensitivity, keep_graph=retain_graph)
         if not retain_graph:
             self._finish_replay(replay_key)
-        return input_grads, parameter_grads
+        return input_grads
 
     def _finish_replay(self, replay_key: Any) -> None:
         """Drop replay and excluded graphs after their terminal consumer."""
         with self._lock:
-            self._replay_tapes.pop(replay_key, None)
-        self._invocation.clear()
+            self._replay_graphs.pop(replay_key, None)
+        self._exclude_cache.clear(release_retained=True)
         self._original_args = None
         self._original_kwargs = None
 
@@ -703,10 +674,10 @@ class _ReentrantCheckpointCall:
             session_id: Identifier of the replay session to clear.
         """
         with self._lock:
-            tape = self._replay_tapes.pop(session_id, None)
-        if tape is not None:
-            tape.release()
-        self._invocation.clear()
+            replay_graph = self._replay_graphs.pop(session_id, None)
+        if replay_graph is not None:
+            replay_graph.release()
+        self._exclude_cache.clear(release_retained=True)
         self._original_args = None
         self._original_kwargs = None
 
@@ -736,10 +707,12 @@ def _get_reentrant_checkpoint_function() -> type:
                 kwargs: Original keyword arguments.
                 tensors: Activation tensors attached to the node.
             """
-            del tensors
             ctx.call = call
             ctx.input_count = input_count
-            return call.run_forward(args, kwargs)
+            del tensors
+            # Keep the custom checkpoint output's autograd metadata separate
+            # from cached outputs owned by nested exclusion tapes.
+            return _detach_tree(call.run_forward(args, kwargs))
 
         @staticmethod
         def backward(ctx: Any, *grad_outputs: Any) -> Tuple[Any, ...]:
@@ -750,7 +723,7 @@ def _get_reentrant_checkpoint_function() -> type:
                 grad_outputs: Gradients of checkpoint outputs.
             """
             sensitivity = grad_outputs[0] if len(grad_outputs) == 1 else grad_outputs
-            input_grads, _ = ctx.call.backward(sensitivity)
+            input_grads = ctx.call.backward(sensitivity)
             if len(input_grads) != ctx.input_count:
                 raise RuntimeError(
                     "Checkpoint Tensor input count changed between original forward and replay"
@@ -761,7 +734,7 @@ def _get_reentrant_checkpoint_function() -> type:
 
 
 class ReentrantCheckpointWrapper(ActivationWrapper):
-    """Wrap a MindSpore Cell or method with hook-free reentrant checkpointing."""
+    """Wrap a MindSpore Cell or method with reentrant checkpointing."""
 
     def __init__(
         self,
@@ -801,7 +774,7 @@ def reentrant_checkpoint_wrapper(
     context_fn: Optional[Callable[[], Tuple[Any, Any]]] = None,
     save_rng_state: bool = True,
 ) -> ReentrantCheckpointWrapper:
-    """Wrap *module* with the experimental hook-free reentrant checkpoint.
+    """Wrap *module* with the experimental reentrant checkpoint.
 
     Args:
         module: Cell or callable to checkpoint.
