@@ -13,24 +13,31 @@
 # limitations under the License.
 # ============================================================================
 """MindSpore correctness, performance, and memory checks for reentrant exclude."""
+import contextlib
 import gc
 import math
 import statistics
 import time
+import weakref
 
 import numpy as np
 import psutil
 import pytest
 import mindspore as ms
 from mindspore import nn, ops, Tensor
+from mindspore.common._grad_function import _Function
 from mindspore.graph.api import _pynative_executor
 
+from hyper_parallel.core.activation_checkpoint import checkpoint_exclude_wrapper
+from hyper_parallel.platform import get_platform
 from hyper_parallel.platform.mindspore.activation_checkpoint.checkpoint_wrapper import ckpt_wrapper
 from hyper_parallel.platform.mindspore.activation_checkpoint.reentrant_checkpoint import (
+    _ReplayGraph,
     reentrant_checkpoint_exclude_wrapper,
     reentrant_checkpoint_wrapper,
 )
 from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
+from hyper_parallel.platform.mindspore.pipeline_parallel.backward import forward_and_gradfn
 
 
 _MIB = 1024 * 1024
@@ -81,6 +88,25 @@ class _Middle(nn.Cell):
         return ops.tanh(value * self.scale)
 
 
+class _ExcludedMatmul(nn.Cell):
+    """One excluded matrix multiply whose matrix output crosses checkpoint output."""
+
+    def __init__(self, excluded: bool) -> None:
+        """Initialize a deterministic matrix weight and optional exclusion."""
+        super().__init__()
+        weight = np.arange(96, dtype=np.float32).reshape(8, 12) / 96
+        self.weight = ms.Parameter(Tensor(weight), name="matmul_weight")
+        self.matmul = reentrant_checkpoint_exclude_wrapper(self._matmul) if excluded else self._matmul
+
+    def _matmul(self, value: Tensor) -> Tensor:
+        """Multiply by the shared weight."""
+        return ops.matmul(value, self.weight)
+
+    def construct(self, value: Tensor) -> Tensor:
+        """Return the non-scalar matrix product."""
+        return self.matmul(ops.sin(value))
+
+
 class _Workload(nn.Cell):
     """Pointwise workload with an excluded region between two op sequences."""
 
@@ -88,7 +114,7 @@ class _Workload(nn.Cell):
         """Initialize the workload."""
         super().__init__()
         middle = _Middle(calls)
-        self.middle = reentrant_checkpoint_exclude_wrapper(middle) if exclude_middle else middle
+        self.middle = checkpoint_exclude_wrapper(middle) if exclude_middle else middle
         self.depth = depth
 
     def construct(self, value: Tensor) -> Tensor:
@@ -124,6 +150,106 @@ class _DispatchWorkload(nn.Cell):
         return value
 
 
+class _SavedInputMarker(_Function):
+    """Record whether excluded backward unpacks the original or replay input."""
+
+    original_ptr = None
+    backward_ptr = None
+    original_tensor = None
+
+    @staticmethod
+    def forward(ctx: object, value: Tensor) -> Tensor:
+        """Save the input tensor that should be rebuilt from replay."""
+        ctx.save_for_backward(value)
+        _SavedInputMarker.original_tensor = value
+        _SavedInputMarker.original_ptr = value.untyped_storage().data_ptr()
+        return value * 2.0
+
+    @staticmethod
+    def backward(ctx: object, grad_output: Tensor) -> Tensor:
+        """Access the saved input so saved-tensor hooks must unpack it."""
+        saved_value = ctx.saved_tensors[0]
+        _SavedInputMarker.backward_ptr = saved_value.untyped_storage().data_ptr()
+        return grad_output * 2.0
+
+
+class _SavedInputExclude(nn.Cell):
+    """Excluded region whose backward saves its input tensor."""
+
+    def construct(self, value: Tensor) -> Tensor:
+        """Apply the marker function."""
+        return _SavedInputMarker.apply(value)
+
+
+class _SavedInputWorkload(nn.Cell):
+    """Create a replay-distinct boundary input before the excluded region."""
+
+    def __init__(self) -> None:
+        """Initialize the excluded region."""
+        super().__init__()
+        self.exclude = reentrant_checkpoint_exclude_wrapper(_SavedInputExclude())
+
+    def construct(self, value: Tensor) -> Tensor:
+        """Run a prefix before the excluded region so replay builds a new input."""
+        value = ops.sin(value * 1.01) + value * 0.01
+        value = self.exclude(value)
+        return (value * value).mean()
+
+
+class _RepeatedExcludeWorkload(nn.Cell):
+    """Invoke one excluded wrapper twice to validate per-call replay ordering."""
+
+    def __init__(self, excluded: bool) -> None:
+        """Initialize the shared excluded region."""
+        super().__init__()
+        module = _SavedInputExclude()
+        self.exclude = reentrant_checkpoint_exclude_wrapper(module) if excluded else module
+
+    def construct(self, value: Tensor) -> Tensor:
+        """Apply the shared excluded region at two distinct graph positions."""
+        value = ops.sin(value * 1.01) + value * 0.01
+        value = self.exclude(value)
+        value = ops.cos(value * 0.99) + value * 0.01
+        value = self.exclude(value)
+        return (value * value).mean()
+
+
+class _ExternalScale(nn.Cell):
+    """Parameterized Cell supplied to a wrapped layer as an argument."""
+
+    def __init__(self) -> None:
+        """Initialize one deterministic scale."""
+        super().__init__()
+        self.weight = ms.Parameter(Tensor(1.7, ms.float32), name="external_scale")
+
+    def construct(self, value: Tensor) -> Tensor:
+        """Apply the external parameter."""
+        return value * self.weight
+
+
+class _ExternalParameterLayer(nn.Cell):
+    """Wrapped layer whose parameter comes from an external Cell argument."""
+
+    def construct(self, value: Tensor, scale: nn.Cell) -> Tensor:
+        """Use the externally supplied Cell and expose its parameter in backward."""
+        return scale(value) ** 2
+
+
+class _ExternalParameterWorkload(nn.Cell):
+    """Workload sharing a parameterized Cell across the checkpoint boundary."""
+
+    def __init__(self, checkpointed: bool) -> None:
+        """Initialize the external Cell and optional reentrant wrapper."""
+        super().__init__()
+        self.scale = _ExternalScale()
+        layer = _ExternalParameterLayer()
+        self.layer = reentrant_checkpoint_wrapper(layer) if checkpointed else layer
+
+    def construct(self, value: Tensor) -> Tensor:
+        """Run the wrapped layer with the external Cell as a keyword argument."""
+        return self.layer(value, scale=self.scale).mean()
+
+
 def _make_input(shape: tuple[int, ...]) -> Tensor:
     """Create one deterministic differentiable Tensor."""
     value = Tensor(np.linspace(-1.0, 1.0, num=math.prod(shape), dtype=np.float32).reshape(shape))
@@ -145,6 +271,31 @@ def _run_step(module: nn.Cell, shape: tuple[int, ...]) -> None:
     loss.backward()
     del loss
     del value
+
+
+def _run_full_backward(net: nn.Cell, value: Tensor, prefire_recompute: bool):
+    """Run unified backward through the platform recompute session."""
+    platform = get_platform()
+    weights = tuple(net.trainable_params())
+    with platform.recompute_handle_collector_ctx() as handles:
+        output, grad_fn = forward_and_gradfn(net, value, weights=weights, grad_position=0)
+
+    session_id = ("reentrant_exclude_full", id(net))
+    if prefire_recompute:
+        assert handles, "reentrant prefire validation requires a recompute handle"
+        with platform.recompute_session_ctx(session_id=session_id, retain_on_unpack=True):
+            for handle in handles:
+                platform.recompute_handle(handle, session_id)
+
+    session_context = (
+        platform.recompute_session_ctx(session_id=session_id, retain_on_unpack=False)
+        if handles else contextlib.nullcontext()
+    )
+    with session_context:
+        input_grad = grad_fn.accumulate_grad(sens=Tensor(1., ms.float32))
+    if handles:
+        platform.clear_recompute_session(session_id)
+    return output, input_grad, len(handles)
 
 
 def _forward_peak_bytes(module: nn.Cell, shape: tuple[int, ...]) -> int:
@@ -206,6 +357,151 @@ def test_reentrant_exclude_result_correctness() -> None:
     )
     assert reference_calls == {"middle": 1}
     assert actual_calls == {"middle": 1}
+
+
+def test_reentrant_exclude_rebuilds_saved_input_from_replay() -> None:
+    """Excluded saved input tensors should be rebuilt from replay instead of retained."""
+    _SavedInputMarker.original_ptr = None
+    _SavedInputMarker.backward_ptr = None
+    _SavedInputMarker.original_tensor = None
+    module = reentrant_checkpoint_wrapper(_SavedInputWorkload())
+    value = _make_input((16, 64))
+
+    loss = module(value)
+    loss.backward()
+
+    assert _SavedInputMarker.original_ptr is not None
+    assert _SavedInputMarker.backward_ptr is not None
+    assert _SavedInputMarker.backward_ptr != _SavedInputMarker.original_ptr
+    assert value.grad is not None
+    _SavedInputMarker.original_tensor = None
+
+
+def test_reentrant_exclude_repeated_calls_correctness() -> None:
+    """One excluded wrapper should replay multiple forward calls in order."""
+    reference = _RepeatedExcludeWorkload(excluded=False)
+    actual = reentrant_checkpoint_wrapper(_RepeatedExcludeWorkload(excluded=True))
+    reference_input = _make_input((16, 64))
+    actual_input = _make_input((16, 64))
+
+    reference_loss = reference(reference_input)
+    actual_loss = actual(actual_input)
+    reference_loss.backward()
+    actual_loss.backward()
+
+    np.testing.assert_allclose(actual_loss.asnumpy(), reference_loss.asnumpy(), atol=1e-6, rtol=1e-6)
+    np.testing.assert_allclose(actual_input.grad.asnumpy(), reference_input.grad.asnumpy(), atol=1e-6, rtol=1e-5)
+
+
+def test_reentrant_external_cell_parameter_gets_gradient() -> None:
+    """Cell parameters passed as arguments remain visible to unified PP backward."""
+    reference = _ExternalParameterWorkload(checkpointed=False)
+    actual = _ExternalParameterWorkload(checkpointed=True)
+    reference_input = _make_input((8, 16))
+    actual_input = _make_input((8, 16))
+
+    reference_output, reference_dx, reference_handles = _run_full_backward(
+        reference, reference_input, prefire_recompute=False
+    )
+    actual_output, actual_dx, actual_handles = _run_full_backward(
+        actual, actual_input, prefire_recompute=True
+    )
+
+    assert reference_handles == 0
+    assert actual_handles >= 1
+    np.testing.assert_allclose(actual_output.asnumpy(), reference_output.asnumpy(), atol=1e-6, rtol=1e-6)
+    np.testing.assert_allclose(actual_dx.asnumpy(), reference_dx.asnumpy(), atol=1e-6, rtol=1e-5)
+    assert actual.scale.weight.grad is not None
+    np.testing.assert_allclose(
+        actual.scale.weight.grad.asnumpy(),
+        reference.scale.weight.grad.asnumpy(),
+        atol=1e-6,
+        rtol=1e-5,
+    )
+
+
+def test_reentrant_tape_does_not_retain_input_tensor() -> None:
+    """The recorded graph returns input gradients without owning its input tensor."""
+    value = _make_input((4, 4))
+    prepared = _ReplayGraph.record(
+        lambda tensor: (tensor * tensor).sum(),
+        (value,),
+        {},
+    )
+    input_ref = weakref.ref(value)
+    del value
+    gc.collect()
+
+    assert input_ref() is None
+    input_grads = prepared.backward(Tensor(1.0, ms.float32), keep_graph=False)
+    np.testing.assert_allclose(
+        input_grads[0].asnumpy(),
+        2 * _make_input((4, 4)).asnumpy(),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+@pytest.mark.parametrize("failure_kind", ("exception", "invalid_output"))
+def test_reentrant_record_failure_releases_hooks(monkeypatch: pytest.MonkeyPatch, failure_kind: str) -> None:
+    """Failed recording releases hook callbacks and restores the caller's grad flags."""
+    value = _make_input((4, 4))
+    hook_refs = []
+    register_hook = Tensor.register_hook
+
+    def _track_hook(tensor, hook):
+        hook_refs.append(weakref.ref(hook))
+        return register_hook(tensor, hook)
+
+    def _invalid_forward(tensor):
+        del tensor
+        if failure_kind == "exception":
+            raise RuntimeError("recording failed")
+        return None
+
+    monkeypatch.setattr(Tensor, "register_hook", _track_hook)
+    _pynative_executor.set_enable_grad(False)
+    _pynative_executor.set_grad_flag(False)
+    expected_error = RuntimeError if failure_kind == "exception" else ValueError
+    try:
+        with pytest.raises(expected_error):
+            _ReplayGraph.record(_invalid_forward, (value,), {})
+        gc.collect()
+        assert len(hook_refs) == 1
+        assert hook_refs[0]() is None
+        assert not _pynative_executor.enable_grad()
+        assert not _pynative_executor.grad_flag()
+    finally:
+        _enable_compat_grad_recording()
+
+
+def test_reentrant_excluded_matmul_tensor_output_backward() -> None:
+    """Returning an exclusion output tensor must preserve its local backward graph."""
+    reference = _ExcludedMatmul(excluded=False)
+    actual = reentrant_checkpoint_wrapper(_ExcludedMatmul(excluded=True))
+    value_data = np.arange(64, dtype=np.float32).reshape(8, 8) / 64
+    reference_input = Tensor(value_data)
+    reference_input.requires_grad_()
+    actual_input = Tensor(value_data)
+    actual_input.requires_grad_()
+
+    reference_output = reference(reference_input)
+    reference_output.sum().backward()
+    actual_output = actual(actual_input)
+    np.testing.assert_allclose(
+        actual_output.asnumpy(), reference_output.asnumpy(), atol=1e-6, rtol=1e-6
+    )
+    actual_output.sum().backward()
+
+    np.testing.assert_allclose(
+        actual_input.grad.asnumpy(), reference_input.grad.asnumpy(), atol=1e-5, rtol=1e-5
+    )
+    np.testing.assert_allclose(
+        actual._wrapped_module.weight.grad.asnumpy(),
+        reference.weight.grad.asnumpy(),
+        atol=1e-5,
+        rtol=1e-5,
+    )
 
 
 def test_reentrant_checkpoint_device_peak_memory() -> None:
