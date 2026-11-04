@@ -28,6 +28,7 @@ from torch.utils._foreach_utils import _foreach_supported_types as _torch_foreac
 
 from hyper_parallel.core.dtensor import _utils
 from hyper_parallel.core.dtensor._collective_utils import mesh_broadcast, mesh_scatter
+from hyper_parallel.high_availability.groups import is_recovery_bootstrapping
 from hyper_parallel.core.dtensor._ragged_utils import (
     _compute_ragged_slice,
     _layout_has_ragged_shard,
@@ -350,7 +351,8 @@ class DTensor(DTensorBase):
                   of tensor dimensions.
             run_check (bool, optional): When ``True``, perform cross-rank metadata
                 checks and broadcast replicate placements from the mesh source rank.
-                Default: ``False``.
+                Forced to ``False`` with a warning during replacement worker
+                bootstrap before recovery state is attached. Default: ``False``.
             shape (tuple[int, ...], optional): Explicit logical global shape.
                 Required for RaggedShard.
             stride (tuple[int, ...], optional): Explicit logical global stride.
@@ -377,6 +379,10 @@ class DTensor(DTensorBase):
             local_tensor = local_tensor.view(-1)
         elif stride is not None and shape is None:
             raise ValueError("stride requires an explicit shape")
+        if run_check and is_recovery_bootstrapping():
+            logger.warning("DTensor.from_local: overriding run_check=True with False during replacement bootstrap "
+                           "to avoid cross-rank checks while peers may be waiting for recovery")
+            run_check = False
         if run_check:
             # pylint: disable=C0415
             from hyper_parallel.core.dtensor._from_local_utils import run_from_local_checks
@@ -1072,9 +1078,11 @@ def distribute_tensor(
     Note:
         When ``src_data_rank`` is an ``int`` (e.g. ``0``), shard/replicate
         placements use scatter/broadcast from the source rank on each mesh axis,
-        matching PyTorch ``distribute_tensor``. When ``src_data_rank=None``
+        using source-rank distribution. When ``src_data_rank=None``
         (default), each rank slices its local tensor without communication
         (legacy Hyper behavior; all ranks must hold the same global data).
+        During replacement bootstrap, an explicit source rank is overridden
+        with ``None`` and a warning is emitted to avoid initialization collectives.
 
     Example:
         >>> mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
@@ -1082,6 +1090,13 @@ def distribute_tensor(
         >>> dtensor = distribute_tensor(global_tensor, mesh, [Shard(0), Replicate()])
         >>> dtensor = distribute_tensor(global_tensor, mesh, ("dp", "None"))
     """
+    if is_recovery_bootstrapping():
+        # A replacement constructs local storage while peers are parked.
+        # Replica repair supplies device values after communication rebuild.
+        if src_data_rank is not None:
+            logger.warning("distribute_tensor: overriding src_data_rank=%s with None "
+                           "during worker recovery to avoid source-rank communication", src_data_rank)
+        src_data_rank = None
     layout = _build_layout(device_mesh, placements, len(tensor.shape))
     if _layout_has_ragged_shard(layout):
         if src_data_rank is None:

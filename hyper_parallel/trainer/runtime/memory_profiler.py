@@ -74,6 +74,8 @@ class MemoryProfiler:
         """
         self._discard_previous_session()
         if config is None:
+            self.enable = False
+            self.mem_info = False
             return
 
         self._validate(config)
@@ -96,6 +98,23 @@ class MemoryProfiler:
             # after distributed setup and before model construction.
             self.step()
 
+    def state_dict(self) -> dict[str, int]:
+        """Protect recording progress; configuration and history remain local."""
+        return {"current_step": self.current_step}
+
+    def load_state_dict(self, state: dict[str, int]) -> None:
+        """Restore recording progress; the next step reopens any remaining window.
+
+        The caller must have restarted the device and selected this worker's
+        local device before discarding the previous allocator history.
+
+        Args:
+            state: Committed session-relative recording progress.
+        """
+        self._discard_previous_session()
+        self.current_step = state["current_step"]
+        self._session_active = self.mem_info or (self.enable and self.current_step <= self.end_step)
+
     def step(self) -> None:
         """Advance the state machine before a Trainer training step starts."""
         if not self._session_active:
@@ -103,16 +122,16 @@ class MemoryProfiler:
 
         try:
             if self.enable:
-                if self.current_step == self.start_step:
+                if self.start_step <= self.current_step <= self.end_step and not self._history_started:
                     self._record()
                 # The control point precedes training, so dump after the inclusive end step.
                 if self.current_step == self.end_step + 1:
                     try:
-                        self._dump_and_stop_history()
+                        if self._history_started:
+                            self._dump_and_stop_history()
                     finally:
-                        self.enable = False
                         if not self.mem_info and not self._history_started:
-                            self._deactivate_session()
+                            self._session_active = False
 
             if self.mem_info:
                 self._log_memory_info()
@@ -121,9 +140,6 @@ class MemoryProfiler:
             raise
         finally:
             self.current_step += 1
-
-        if not self.enable and not self.mem_info:
-            self._deactivate_session()
 
     def stop(self) -> None:
         """Dump an active partial window and end a normal training session."""
@@ -135,37 +151,23 @@ class MemoryProfiler:
                 if self._history_started:
                     self._dump_and_stop_history()
             finally:
-                self.enable = False
-                self.mem_info = False
-                if not self._history_started:
-                    self._deactivate_session()
+                self._session_active = False
         except BaseException:
             self.abort()
             raise
 
     def abort(self) -> None:
         """Stop allocator history without dumping or masking a Trainer error."""
-        self.enable = False
-        self.mem_info = False
+        self._session_active = False
         try:
             self._stop_history()
         except Exception:  # pylint: disable=broad-exception-caught
             logger.exception("Failed to stop allocator memory history while aborting training.")
-            return
-
-        self._deactivate_session()
 
     def _discard_previous_session(self) -> None:
         if self._history_started:
             self._stop_history()
-        self._deactivate_session()
-
-    def _deactivate_session(self) -> None:
-        self.enable = False
-        self.mem_info = False
         self._session_active = False
-        self._device_api = None
-        self._memory_api = None
 
     @staticmethod
     def _validate(config: MemoryConfig) -> None:
@@ -237,7 +239,7 @@ class MemoryProfiler:
         if self.global_rank not in self.dump_ranks:
             return
         os.makedirs(self.save_path, exist_ok=True)
-        timestamp = time.strftime("%Y-%m-%d-%H-%M")
+        timestamp = time.strftime("%Y-%m-%d-%H-%M-%S")
         file_path = os.path.join(
             self.save_path,
             f"snapshot_{timestamp}_{self.global_rank}.pickle",

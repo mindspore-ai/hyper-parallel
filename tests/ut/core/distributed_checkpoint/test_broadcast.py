@@ -42,6 +42,7 @@ from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import Shard
+from hyper_parallel.high_availability.groups import GroupRegistry
 from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 
@@ -468,6 +469,26 @@ class TestBroadcastGroupScope(unittest.TestCase):
                 self.assertEqual(groups, {(0, 1): "group(0, 1)"})
                 self.assertEqual(fake.destroyed_groups, [])
 
+        self.assertEqual(fake.destroyed_groups, ["group(0, 1)"])
+
+    def test_load_temporary_groups_bypass_only_the_sealed_recovery_catalog(self):
+        """Feature: Checkpoint broadcasts can create scoped groups during initial restore.
+
+        Description: Load with a sealed recovery group factory and no reusable broadcast group.
+        Expectation: Temporary groups are created and destroyed without registering persistent groups.
+        """
+        fake = _RecordingBackend(world_size=4)
+        source = BroadcastSource(group_ranks=(0, 1), src_rank=0)
+        registry = GroupRegistry()
+        registry.sealed = True
+        with _patch_broadcast(fake):
+            registry._original_new_group = broadcast_mod.dist.new_group
+            with patch.object(broadcast_mod.dist, "new_group", registry.new_group):
+                with broadcast_mod.broadcast_groups_for_load([self._item("w", source)]) as groups:
+                    self.assertEqual(groups, {(0, 1): "group(0, 1)"})
+                with self.assertRaisesRegex(RuntimeError, "before attach"):
+                    registry.new_group(ranks=[0, 1])
+        self.assertEqual(registry.groups, [])
         self.assertEqual(fake.destroyed_groups, ["group(0, 1)"])
 
     def test_the_group_a_load_built_is_drained_before_it_is_released(self):

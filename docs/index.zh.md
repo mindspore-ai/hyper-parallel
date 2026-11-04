@@ -25,7 +25,8 @@
 | [Activation Checkpoint / Swap](./guide/activation_checkpoint.zh.md) | checkpoint_wrapper、swap_wrapper、swap_tensor_wrapper、协同配置 |
 | [Optimizer](./guide/optimizer.zh.md) | AdamW、Muon、ChainedOptimizer、学习率调度器 |
 | [Chunk Loss](./guide/chunk_loss.zh.md) | 大词表输出投影与交叉熵分块、Trainer 和 Qwen3-MoE 接入 |
-| [DCP 分布式检查点](./guide/distributed_checkpoint.zh.md) | 检查点保存/加载、异步 staging、离线转换 |
+| [DCP 分布式检查点](./guide/high_availability/distributed_checkpoint.zh.md) | 检查点保存/加载、异步 staging、离线转换 |
+| [进程级快恢](./guide/high_availability/process_recovery.zh.md) | 基于等价副本的 worker 恢复、Trainer 配置和使用限制 |
 | [自动并行](./guide/auto_parallel.zh.md) | SAPP-ND、SAPP-PPB |
 | [LlamaFactory + HyperParallel SFT 训练](./guide/llama_factory_hyperparallel_sft_guide.zh.md) | 基于 LlamaFactory 和 HyperParallel 的 SFT 配置、启动、精度与性能验证 |
 | [模型接入验证使用指南](./guide/trainer/model_integration_validation.zh.md) | Adapter 声明、结构检查、模块对齐、精度矩阵与证据报告 |

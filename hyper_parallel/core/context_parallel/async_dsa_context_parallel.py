@@ -56,6 +56,13 @@ class _AsyncSequenceReplicateSlot:
         self._slots = {}
         self._bwd_slots = {}
 
+    def reset_after_device_restart(self) -> None:
+        """Drop failed queues after communication has quiesced, preserving hook references."""
+        for slots in self._slots.values():
+            slots.clear()
+        for slots in self._bwd_slots.values():
+            slots.clear()
+
     @staticmethod
     def _extract_tensor_output(output: Any) -> Any:
         if _is_tensor_or_dtensor(output):
@@ -170,6 +177,7 @@ class AsyncDSAIndexerContextParallel(DSAIndexerContextParallel):
         """Register async DSA indexer CP hooks on ``module`` and optional producer."""
         cp_mesh = _ensure_1d(device_mesh)
         async_state = _AsyncSequenceReplicateSlot(cp_mesh, self.seq_dim)
+        setattr(module, "_context_parallel_async_state", async_state)
         async_state.register_launch_hook(key_handoff, "key")
         specs = self._build_specs(
             cp_mesh,
@@ -193,6 +201,7 @@ class AsyncDSASparseAttentionContextParallel(DSASparseAttentionContextParallel):
         """Register async DSA sparse-attention CP hooks on ``module`` and producers."""
         cp_mesh = _ensure_1d(device_mesh)
         async_state = _AsyncSequenceReplicateSlot(cp_mesh, self.seq_dim)
+        setattr(module, "_context_parallel_async_state", async_state)
         async_state.register_launch_hook(key_handoff, "key")
         async_state.register_launch_hook(value_handoff, "value")
         async_state.register_launch_hook(key_rope_handoff, "key_rope")
@@ -214,6 +223,7 @@ class AsyncDSAIndexerLossContextParallel(DSAIndexerLossContextParallel):
         """Register async DSA indexer-loss CP hooks on ``module`` and producers."""
         cp_mesh = _ensure_1d(device_mesh)
         async_state = _AsyncSequenceReplicateSlot(cp_mesh, self.seq_dim)
+        setattr(module, "_context_parallel_async_state", async_state)
         async_state.register_launch_hook(key_handoff, "key")
         async_state.register_launch_hook(key_indexer_handoff, "key_indexer")
         async_state.register_launch_hook(key_rope_handoff, "key_rope")

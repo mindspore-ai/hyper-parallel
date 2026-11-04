@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import torch
 import torch.distributed as dist
 
+from hyper_parallel.high_availability.groups import is_recovery_bootstrapping
 from hyper_parallel.core.optimizer.optimizer import AsyncReplicateBroadcaster, BaseDistributedOptimizer
 from hyper_parallel.core.optimizer.dtensor_compat import to_local_if_dtensor
 from hyper_parallel.core.optimizer.sharding_category import (
@@ -304,16 +305,22 @@ class Muon(BaseDistributedOptimizer):
     def reset_optimizer_parameters(self) -> None:
         """Rebuild all parameter-identity caches from current param groups."""
         self._group_dtensor_by_mesh()
-        self._build_param_shard_metadata()
-        deduced_count = self._auto_deduce_replica_count()
-        if deduced_count is None:
-            self.hsdp_replica_count = None
-        elif self.hsdp_replica_count is None:
-            self.hsdp_replica_count = deduced_count
+        if is_recovery_bootstrapping():
+            # Peers are parked until communication rebuild. Shape collectives
+            # must run on all workers from rebuild_recovery_state instead.
+            self._param_shard_metadata = {}
+        else:
+            self._build_param_shard_metadata()
+        if self.hsdp_replica_count is None:
+            self.hsdp_replica_count = self._auto_deduce_replica_count()
         self._split_replicate_groups()
         self._build_hsdp_batch()
         self._build_param_broadcast_info()
         self._classify_parameters_for_step()
+
+    def rebuild_recovery_state(self) -> None:
+        """Refresh shard shapes on every rank after existing groups are reinitialized."""
+        self._build_param_shard_metadata()
 
     @staticmethod
     def _validate_ns_coefficients(

@@ -28,6 +28,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 
+from hyper_parallel.high_availability.groups import recovery_optimizer_subgroup
 from hyper_parallel.core.optimizer.dtensor_compat import to_local_if_dtensor
 from hyper_parallel.core.optimizer.sharding_category import (
     HSDPGroupAssignment,
@@ -481,6 +482,11 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
             sub_size: int,
     ) -> dist.ProcessGroup:
         """Retrieve or collectively create a synchronized sub-ProcessGroup."""
+        recovery_group = recovery_optimizer_subgroup(parent_pg, sub_size)
+        if recovery_group is not None:
+            parent_ranks = tuple(sorted(dist.get_process_group_ranks(parent_pg)))
+            self._split_sub_pg_cache[(parent_ranks, sub_size)] = {0: recovery_group}
+            return recovery_group
         local_parent_ranks = tuple(sorted(list(dist.get_process_group_ranks(parent_pg))))
         cache_key = (local_parent_ranks, sub_size)
 

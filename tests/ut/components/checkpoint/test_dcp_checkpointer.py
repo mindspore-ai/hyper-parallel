@@ -20,7 +20,7 @@ import unittest
 from concurrent.futures import Future
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, Optional
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from hyper_parallel.components.checkpoint.dcp_checkpointer import (
     LATEST_CHECKPOINT_FILE,
@@ -47,6 +47,33 @@ class TestDistributedCheckpointerPublish(unittest.TestCase):
     def _state() -> Dict[str, Any]:
         """Return a payload shaped like the trainer's, small enough to ignore."""
         return {"model": {"weight": 1}, "extra_state": {"global_step": 7}}
+
+    def test_recovery_aborts_only_the_pending_save(self) -> None:
+        """Feature: Recovery cleanup. Description: Drop a pending checkpoint, then
+        check and drain again. Expectation: No cancelled Future escapes into training.
+        """
+        checkpointer = DistributedCheckpointer()
+        response = MagicMock()
+        checkpointer._async_save_response = response
+        checkpointer.abort_async_save()
+        response.abort.assert_called_once_with()
+        self.assertIsNone(checkpointer._async_save_response)
+        checkpointer.raise_for_failed_async_save()
+        checkpointer.maybe_wait_for_async_save()
+        checkpointer.abort_async_save()
+        response.abort.assert_called_once_with()
+
+    def test_async_save_keeps_component_barrier_and_delegates_file_coordination(self) -> None:
+        """Feature: Async coordination ownership. Description: Dispatch through the
+        component. Expectation: Keep its existing barrier; DCP owns exchange-file coordination.
+        """
+        checkpointer = DistributedCheckpointer(extra_state_per_rank=False)
+        with tempfile.TemporaryDirectory() as save_dir, \
+                patch(f"{_CHECKPOINTER_MODULE}._barrier") as barrier, \
+                patch(f"{_CHECKPOINTER_MODULE}.dcp_async_save") as save:
+            checkpointer.save(save_dir, self._state(), global_step=7, save_async=True)
+        save.assert_called_once()
+        barrier.assert_called_once_with()
 
     def test_async_save_publishes_from_its_persist_callback(self) -> None:
         """Publish the pointer when persistence completes, not at the next save.

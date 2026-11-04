@@ -21,6 +21,7 @@ import unittest
 from pathlib import Path
 from typing import Any, Optional
 from unittest.mock import Mock, patch
+from contextlib import ExitStack
 
 import torch
 
@@ -181,6 +182,89 @@ class TestApi(unittest.TestCase):
         self.assertEqual(result, expected)
 
 
+class TestAsyncSaveStoragePreparation(unittest.TestCase):
+    """Storage exchange cleanup belongs to DCP, including direct API callers."""
+
+    def _mock_persistence(self, stack: ExitStack) -> Mock:
+        """Provide a persistence process and completion queue without starting a child."""
+        proc = Mock()
+        stack.enter_context(patch.object(api_mod.mp, "Process", return_value=proc))
+        stack.enter_context(patch.object(api_mod.threading, "Thread"))
+        stack.enter_context(patch.object(api_mod.mp, "Queue"))
+        stack.enter_context(patch.object(api_mod, "build_staged_state_dict", return_value={}))
+        stack.enter_context(patch.object(api_mod.dist, "get_world_size", return_value=2))
+        stack.enter_context(patch.object(api_mod.dist, "get_rank", return_value=0))
+        stack.enter_context(patch.object(api_mod.dist, "barrier"))
+        stack.enter_context(patch.dict(os.environ, {"MASTER_ADDR": "127.0.0.1", "MASTER_PORT": "29500"}))
+        return proc
+
+    def test_cleanup_and_barrier_precede_starting_persistence(self) -> None:
+        """Feature: Same-step retry. Description: Start via either checkpoint_id or
+        a writer directory. Expectation: Delete own stale files before admitting new writers.
+        """
+        for use_writer in (False, True):
+            with self.subTest(use_writer=use_writer), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+                own_files = [Path(directory) / name for name in ("LOCAL_PLAN_0.pkl", "STORAGE_DATA_0.pkl")]
+                peer = Path(directory) / "LOCAL_PLAN_1.pkl"
+                for filename in own_files + [peer]:
+                    filename.write_text("old", encoding="utf-8")
+                proc = self._mock_persistence(stack)
+
+                sync = stack.enter_context(patch.object(api_mod.dist, "barrier"))
+
+                def barrier(context=(own_files, peer, proc, sync)):
+                    own_files, peer, proc, sync = context
+                    self.assertTrue(all(not filename.exists() for filename in own_files))
+                    self.assertTrue(peer.exists())
+                    self.assertEqual(proc.start.call_count, sync.call_count - 1)
+
+                sync.side_effect = barrier
+                api_mod.async_save(
+                    {},
+                    checkpoint_id=None if use_writer else directory,
+                    storage_writer=Mock(checkpoint_dir=directory) if use_writer else None,
+                )
+                self.assertEqual(sync.call_count, 2)
+                proc.start.assert_called_once_with()
+
+    def test_other_persist_modes_do_not_cleanup_stale_communication_files(self) -> None:
+        """Feature: Coordination mode. Description: Use Gloo, rank-local or single-rank
+        persistence. Expectation: No storage exchange cleanup or preparation barrier.
+        """
+        for options in ({"no_dist": True}, {"use_collectives": False}, {"use_gloo": True}, {}):
+            with self.subTest(options=options), ExitStack() as stack:
+                proc = self._mock_persistence(stack)
+                if not options:
+                    stack.enter_context(patch.object(api_mod.dist, "get_world_size", return_value=1))
+                cleanup = stack.enter_context(patch.object(api_mod, "_cleanup_stale_communication_files"))
+                api_mod.async_save({}, checkpoint_id="unused", **options)
+                cleanup.assert_not_called()
+                proc.start.assert_called_once_with()
+
+    def test_cleanup_failure_does_not_start_new_writers(self) -> None:
+        """Feature: Failed preparation. Description: The old exchange file cannot be
+        removed. Expectation: Surface the I/O error without starting a new persist child.
+        """
+        with ExitStack() as stack:
+            proc = self._mock_persistence(stack)
+            sync = stack.enter_context(patch.object(api_mod.dist, "barrier"))
+            stack.enter_context(patch.object(api_mod.os, "remove", side_effect=PermissionError("read-only")))
+            with self.assertRaisesRegex(PermissionError, "read-only"):
+                api_mod.async_save({}, checkpoint_id="unused")
+            sync.assert_not_called()
+            proc.start.assert_not_called()
+
+    def test_storage_exchange_requires_a_directory(self) -> None:
+        """Feature: Directory resolution. Description: Omit checkpoint_id and writer.
+        Expectation: Fail before creating or launching a storage-coordinated child.
+        """
+        with ExitStack() as stack:
+            proc = self._mock_persistence(stack)
+            with self.assertRaisesRegex(ValueError, "checkpoint_id"):
+                api_mod.async_save({})
+            proc.start.assert_not_called()
+
+
 class TestCreatePersistProcess(unittest.TestCase):
     """Tests for the persist mode ``async_save`` picks for a given set of arguments.
 
@@ -208,6 +292,7 @@ class TestCreatePersistProcess(unittest.TestCase):
         """Build the persist process with a recording ``mp.Process`` and return that recorder."""
         recorder = Mock(name="Process")
         with patch("hyper_parallel.core.distributed_checkpoint.api.mp.Process", recorder), \
+                patch("hyper_parallel.core.distributed_checkpoint.api._cleanup_stale_communication_files"), \
                 patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_world_size",
                       return_value=world_size), \
                 patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_rank", return_value=0), \
