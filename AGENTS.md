@@ -46,7 +46,7 @@ Distributed ST helpers: `torchrun_case()` via `tests.common.distributed_launcher
 
 ## Env Gotchas / Do Not
 
-- **Editable must track this tree.** If `pip show hyper_parallel` shows another path (e.g. a deleted `.worktrees/...`), re-run `pip install -e .` from repo root. Do not rely on `PYTHONPATH` alone.
+- **Editable must track this tree on development hosts.** If `pip show hyper_parallel` shows another path (e.g. a deleted `.worktrees/...`), re-run `pip install -e .` from repo root. For shared-cluster overlays and clean-room audits where installs are out of scope, `PYTHONPATH` is supported; verify the import source with `python -c "import hyper_parallel; print(hyper_parallel.__file__)"`.
 - **Torch-only.** The `platform/` abstraction layer (and with it the MindSpore backend) has been
   removed. Every module uses native Torch APIs (`torch.distributed`, `torch.Tensor`, autograd)
   directly; do not reintroduce Platform dispatch or MindSpore implementations anywhere.
