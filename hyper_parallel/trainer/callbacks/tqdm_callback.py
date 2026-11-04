@@ -205,6 +205,8 @@ class TqdmCallback(Callback):
         self._last_updated_step = state.global_step
         if getattr(self.trainer, "global_rank", 0) != 0:
             return
+        if self._progress_bar is not None:
+            self._progress_bar.close()
         self._progress_bar = self._create_progress_bar(
             total=self.trainer.train_iters,
             initial=state.global_step,

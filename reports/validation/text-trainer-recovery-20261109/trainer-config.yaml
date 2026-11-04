@@ -1,0 +1,184 @@
+model:
+  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /home/zbx/hp_texttrainer_recovery_20261109_202040/text_trainer_ranks1/test_text_trainer_replacement0/assets/model
+  ignore_mismatched_sizes: true
+  torch_dtype: float32
+  attn_implementation: sdpa
+  force_hf: true
+  local_files_only: true
+training:
+  train_iters: 12
+  train_samples: null
+  global_batch_size: 8
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: true
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+fsdp_config:
+  dp_shard_size: 4
+  replicate_params: []
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
+plan_overrides:
+- match:
+  - '*.input_layernorm'
+  - '*.post_attention_layernorm'
+  - model.norm
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_rms_norm
+- match: '*.self_attn'
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_flash_attention
+- match: '*.mlp.experts'
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_grouped_experts
+- match: '*.self_attn.forward'
+  when: cp
+  replace:
+    kind: method
+    implementation:
+      _target_: hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel.qwen3_moe_flash_attention_cp_mask_wrapper
+- match: '*.mlp.forward'
+  when: ep
+  replace:
+    kind: method
+    implementation:
+      _target_: hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn
+      use_grouped_gemm: true
+mixed_precision:
+  enabled: false
+activation_checkpoint:
+  mode: 'off'
+activation_swap: none
+compile:
+  enabled: false
+  mode: default
+  fullgraph: false
+  dynamic: false
+  backend: null
+  options: {}
+  dynamo_cache_size_limit: 256
+dataset:
+  model_assets:
+    chat_template: null
+    tokenizer:
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: /home/zbx/hp_texttrainer_recovery_20261109_202040/text_trainer_ranks1/test_text_trainer_replacement0/assets/model
+      tokenizer_type: pretokenized
+      vocab_size: 1024
+      eod_token_id: 1023
+      local_files_only: true
+  _target_: hyper_parallel.data.text.build_dataset.build_indexed_text_dataset
+  data_path: /home/zbx/hp_texttrainer_recovery_20261109_202040/text_trainer_ranks1/test_text_trainer_replacement0/assets/data/parallel_offline_text_document
+  data_config:
+    seq_length: 32
+    split: 1, 0, 0
+    mock_data: false
+    distributed_walk: true
+    is_dataset_from_mr: false
+    simple_blend: 'no'
+    data_lazy_load: true
+    skip_data_check: true
+    labels_are_shifted: true
+    create_attention_mask_in_dataloader: false
+    create_ltor_fields_in_dataloader: false
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_indexed_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.TextParallelBatch
+    source_type: indexed
+    attention_mode: dense
+  sampler_type: single
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+optimizer:
+  _target_: hyper_parallel.components.optim.Muon
+  no_decay_params:
+  - bias
+  - norm
+  - ln_
+  muon_config:
+    muon_lr: 3.0e-05
+    muon_weight_decay: 0.0
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_ns_steps: 5
+    muon_ns_variant: asym5
+    muon_hsdp_replica_count: 1
+  adamw_config:
+    adamw_lr: 1.0e-05
+    adamw_weight_decay: 0.01
+    adamw_betas:
+    - 0.9
+    - 0.999
+    adamw_eps: 1.0e-08
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr: 3.0e-05
+    lr_warmup_steps: 1
+    min_lr: 0.0
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ./outputs/qwen3_moe/checkpoints
+  save_steps: 10
+  save_epochs: 1
+  is_async: false
+  save_optimizer: true
+  save_train_state: true
+  save_extra_state_per_rank: false
+  restore_from: null
+  restore_optimizer: true
+  restore_train_state: true
+  restore_dataloader_state: true
+debug:
+  check_nan_inf: false
+  check_dataset: null
+profiler:
+  enable: false
+  start_step: 1
+  stop_step: 10
+  memory: true
+  rank_ids: null
+  output_path: ./outputs/qwen3_moe
+  level: 1
+  with_stack: false
+  data_simplification: false
+stress_detect:
+  op_stress_detect:
+    detection_interval: 0
+    num_detections: 5
+    detect_type: all
+    exit_training_on_sdc: false
+  model_stress_detect:
+    detection_interval: 0
+worker_recovery:
+  enable_worker_reboot: true

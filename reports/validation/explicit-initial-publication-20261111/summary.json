@@ -1,0 +1,44 @@
+{
+  "date": "2026-11-11",
+  "scope": "Remove deferred-publication flag and pre-body publication; initialize then explicitly publish once",
+  "environment": {
+    "os": "win32",
+    "python": "3.13.1",
+    "torch": "2.15.0+cpu",
+    "numpy": "2.5.4",
+    "transformers": "5.22.2"
+  },
+  "repository_ut_run": true,
+  "fault_tolerance_ut": {
+    "passed": 86,
+    "subtests_passed": 47,
+    "failed": 0
+  },
+  "verified_behavior": [
+    "Default run does not publish before the body loads its initial state",
+    "Explicit post-initialization publication captures and reports checkpoint step once",
+    "Replacement SDK reentry does not publish initial metadata and resumes normal tensor communication",
+    "Base, Text and VLM native training/reentry CPU cases use the same flag-free run contract"
+  ],
+  "compiled_sources": [
+    "hyper_parallel/core/fault_tolerance/session.py",
+    "hyper_parallel/trainer/runtime/fault_tolerance.py",
+    "tests/ut/fault_tolerance/test_session.py",
+    "tests/ut/fault_tolerance/test_trainer.py",
+    "tests/torch/fault_tolerance/_test_process_recovery.py"
+  ],
+  "npu_retested": false,
+  "limitations": [
+    "Local Python 3.13/NumPy 2.5 differ from supported deployment versions",
+    "Editable installation is rejected by the Python version constraint; checkout import path was verified",
+    "The Ascend harness entry was syntax-checked; current remote MindIO/TaskD/NPU execution was not run",
+    "zbx SSH connectivity remains unavailable"
+  ],
+  "tested_source_sha256": {
+    "hyper_parallel/core/fault_tolerance/session.py": "484adb9ed135bbe1bb3b5d24ca8d6260e147bccb939687261baf003ced2df129",
+    "hyper_parallel/trainer/runtime/fault_tolerance.py": "5abb7b87e6e1328526031deff08cc8a8b73acd4ca6651632bed9aefaa5e0ce7f",
+    "tests/ut/fault_tolerance/test_session.py": "87c62e6d4e4c717fc8770db8c2c392670c22f1137959c9b44df8ac70f43f5462",
+    "tests/ut/fault_tolerance/test_trainer.py": "da692965e95b4e18fcda8e49d9177ee3cb7361743281bf0e78ee1dc2cff836a8",
+    "tests/torch/fault_tolerance/_test_process_recovery.py": "ebb7145a5599af27604e100712adc201db6677d06b5b997c1866d6190ce3cf9f"
+  }
+}

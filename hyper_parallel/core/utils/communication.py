@@ -30,6 +30,8 @@ import torch.distributed.nn.functional as dist_func
 from torch import Tensor
 from torch._C._distributed_c10d import ProcessGroup
 
+from hyper_parallel.core.fault_tolerance.groups import new_group
+
 
 def get_group_local_rank(group: Optional[ProcessGroup] = None) -> int:
     """Return the current rank's index within ``group``, or 0 before init.
@@ -128,7 +130,7 @@ def split_group(parent_pg=None,
     for split_rank in split_ranks:
         dist_group = get_created_group(split_rank)
         if dist_group is None:
-            dist_group = dist.new_group(ranks=split_rank, pg_options=pg_options)
+            dist_group = new_group(ranks=split_rank, pg_options=pg_options)
             EXISTING_COMM_GROUPS[str(tuple(sorted(split_rank)))] = dist_group
         if dist.get_rank() in split_rank:
             split_group_pg = dist_group

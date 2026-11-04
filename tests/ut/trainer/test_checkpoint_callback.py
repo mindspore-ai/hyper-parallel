@@ -21,6 +21,7 @@ from typing import Any, Dict, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
 from hyper_parallel.components.checkpoint.config import CheckpointingConfig
+from hyper_parallel.core.fault_tolerance.groups import GroupRegistry
 from hyper_parallel.trainer.callbacks.checkpoint_callback import CheckpointerCallback
 from hyper_parallel.trainer.state import TrainerState
 from tests.common.mark_utils import arg_mark
@@ -95,6 +96,46 @@ class _FakeCheckpointer:
 
 class TestCheckpointerCallbackRestore(unittest.TestCase):
     """Verify what each restore mode reads back into the trainer."""
+
+    def test_surviving_worker_skips_initial_checkpoint_during_reentry(self) -> None:
+        """Feature: Native start callbacks on a surviving worker during recovery.
+
+        Description: Reenter the checkpoint callback with pending replica RNG and no replacement identity.
+        Expectation: The callback does not resolve or load an initial checkpoint over repaired live state.
+        """
+        trainer = self._build_trainer("/unused/checkpoints", True)
+        trainer.recovery = SimpleNamespace(train_state=SimpleNamespace(rng_restore_pending=True))
+        with patch(f"{_CALLBACK_MODULE}.build_checkpointer"):
+            callback = CheckpointerCallback(trainer)
+            with patch(f"{_CALLBACK_MODULE}.is_recovery_reboot", return_value=False), \
+                    patch.object(callback, "_resolve_restore_path") as resolve:
+                callback.on_train_begin(trainer.state)
+            resolve.assert_not_called()
+            callback.checkpointer.load.assert_not_called()
+
+    def test_replacement_skips_disk_restore_after_replica_rollback(self) -> None:
+        """Feature: Checkpoint callback initialization on a replacement worker.
+
+        Description: Run the original begin hook with a configured checkpoint after device repair.
+        Expectation: Configuration logging executes without path discovery or disk load, preserving restored state.
+        """
+        trainer = self._build_trainer("/unused/checkpoints", True)
+        trainer.state.global_step = 8
+        checkpointer = MagicMock()
+        with patch(f"{_CALLBACK_MODULE}.build_checkpointer", return_value=checkpointer), \
+                patch(f"{_CALLBACK_MODULE}.logger") as log:
+            callback = CheckpointerCallback(trainer)
+            with GroupRegistry() as registry, \
+                    patch.object(callback, "_resolve_restore_path", return_value=None) as resolve:
+                registry.reboot = True
+                registry.sealed = True
+                callback.on_train_begin(trainer.state)
+            resolve.assert_not_called()
+        checkpointer.load.assert_not_called()
+        self.assertEqual(trainer.state.global_step, 8)
+        self.assertEqual(trainer.model.state_dict(), {"weight": 1})
+        self.assertTrue(any(str(call.args[0]).startswith("Checkpoint configuration:")
+                            for call in log.info.call_args_list))
 
     @staticmethod
     def _build_trainer(restore_from: str, restore_train_state: bool) -> SimpleNamespace:

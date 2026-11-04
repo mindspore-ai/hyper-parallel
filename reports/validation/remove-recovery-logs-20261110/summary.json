@@ -1,0 +1,320 @@
+{
+  "date": "2026-11-10",
+  "host": "ascend129",
+  "remote_directory": "/home/zbx/hp_texttrainer_recovery_20261109_202040/remove_logs_smoke_20261110_155734",
+  "source_base": "8c8f48b05717ad7d577fa0dcdc7c6a726dd40309",
+  "source_hash_encoding": "UTF-8 files normalized to LF",
+  "tested_source_sha256": {
+    "hyper_parallel/core/fault_tolerance/session.py": "33b715711aeb0470f41a427c79ed2972ccacc3ba7a6542a47f87abe63a099f2c",
+    "hyper_parallel/core/fault_tolerance/state.py": "0f8797ca55bd72aa0ac5521e95e68302c641f070f30055f6ced87eb6434993e5",
+    "hyper_parallel/trainer/runtime/fault_tolerance.py": "2112768cc55fa07270c4d967f354449ce94c4f4f47fa55f4439ed47718beac07",
+    "hyper_parallel/trainer/base.py": "84a9541994b3cfb9037161df4a4573df09c3b9d1d2567f39a29176eaff1e8130",
+    "hyper_parallel/trainer/text_trainer.py": "8d69d559840ab4db632684a1fb0be9572ae38e4e8dae47cc411a43916090c68f",
+    "hyper_parallel/trainer/vlm_trainer.py": "8d19b8066c65f8d476e830d62877a456803990a349970eb36e04af37014e7511",
+    "tests/ut/fault_tolerance/test_session.py": "7ee88b42a98139018eb71d5b244a4a903129d329cdd6e02cabce87be057562b9",
+    "tests/ut/fault_tolerance/test_state.py": "82b4356c9cbdd0fdd2579b13027689982b46adb82278186a0f315a8f3526308b",
+    "tests/ut/fault_tolerance/test_trainer.py": "f1efd794a980ae006ded677fa959b875f0a141f082552c022a93eb13d4657327",
+    "tests/torch/fault_tolerance/text_trainer_recovery.py": "63ef834b4c9325aa61a9cd1dec9ee779578a73e074a627cf80b493df8c6583ca",
+    "tests/torch/fault_tolerance/_test_process_recovery.py": "322efed0c3c95e75ff1014d47b4f517a10d59b3005045db1ef115d091af8d4ce",
+    "hyper_parallel/trainer/callbacks/checkpoint_callback.py": "18b536ee4b522117175d7bc482d9d5546802ce2397972573e5390e0bd504285f",
+    "tests/ut/trainer/test_checkpoint_callback.py": "4a056030571260db336df93175bbe0d176128a1a37e85a1cc59a05cbcec805c5"
+  },
+  "versions": {
+    "torch": "2.12.0",
+    "torch-npu": "2.12.0",
+    "mindio-ttp": "26.2.0",
+    "taskd": "26.2.0"
+  },
+  "change": "Remove the recovery-only logs provider, metrics collection, local snapshots and restored-metrics output; preserve original Trainer logging and required recovery state",
+  "cpu_tests": "189 passed, 8 warnings, 114 subtests passed in 17.17s",
+  "cpu_scope": "Fault tolerance, data, Base/Text/VLM Trainer, distributed runtime, native iterator, profiler lifecycle, checkpoint, logging, tqdm and environment metrics callbacks",
+  "cpu_regressions": [
+    "Protected Trainer providers contain only progress and schedulers",
+    "Native Base/Text/VLM loops resume with matching optimizer, scheduler and progress",
+    "Original logging, tqdm and environment metrics callback tests pass",
+    "Checkpoint and replacement initialization regressions pass"
+  ],
+  "npu_text_trainer": {
+    "case": "text_trainer_without_recovery_logs",
+    "fault_ranks": "4,5,6,7",
+    "exit_code": 0,
+    "elapsed_seconds": 240.59
+  },
+  "npu_scope": "8-card small Qwen3 MoE TextTrainer, FP32, HSDP 2x4, real Indexed Dataset, Muon/AdamW, real MindIO and TaskD Controller/Agent",
+  "fault_ranks": [
+    4,
+    5,
+    6,
+    7
+  ],
+  "commit_step": 8,
+  "final_step": 12,
+  "device_receives": [
+    {
+      "rank": 7,
+      "source": 3,
+      "step": 8
+    },
+    {
+      "rank": 4,
+      "source": 0,
+      "step": 8
+    },
+    {
+      "rank": 6,
+      "source": 2,
+      "step": 8
+    },
+    {
+      "rank": 5,
+      "source": 1,
+      "step": 8
+    }
+  ],
+  "processes": {
+    "event": "complete",
+    "original_pids": {
+      "0": 3241612,
+      "1": 3241613,
+      "2": 3241614,
+      "3": 3241615,
+      "4": 3241616,
+      "5": 3241617,
+      "6": 3241618,
+      "7": 3241619
+    },
+    "final_pids": {
+      "0": 3241612,
+      "1": 3241613,
+      "2": 3241614,
+      "3": 3241615,
+      "4": 3245519,
+      "5": 3245517,
+      "6": 3245516,
+      "7": 3245518
+    }
+  },
+  "begin_events": {
+    "baseline": {
+      "0": [
+        {
+          "pid": 3235491,
+          "step": 0,
+          "generation": 0
+        }
+      ],
+      "1": [
+        {
+          "pid": 3235492,
+          "step": 0,
+          "generation": 0
+        }
+      ],
+      "2": [
+        {
+          "pid": 3235493,
+          "step": 0,
+          "generation": 0
+        }
+      ],
+      "3": [
+        {
+          "pid": 3235494,
+          "step": 0,
+          "generation": 0
+        }
+      ],
+      "4": [
+        {
+          "pid": 3235495,
+          "step": 0,
+          "generation": 0
+        }
+      ],
+      "5": [
+        {
+          "pid": 3235496,
+          "step": 0,
+          "generation": 0
+        }
+      ],
+      "6": [
+        {
+          "pid": 3235497,
+          "step": 0,
+          "generation": 0
+        }
+      ],
+      "7": [
+        {
+          "pid": 3235498,
+          "step": 0,
+          "generation": 0
+        }
+      ]
+    },
+    "recovery": {
+      "0": [
+        {
+          "pid": 3241612,
+          "step": 0,
+          "generation": 0
+        }
+      ],
+      "1": [
+        {
+          "pid": 3241613,
+          "step": 0,
+          "generation": 0
+        }
+      ],
+      "2": [
+        {
+          "pid": 3241614,
+          "step": 0,
+          "generation": 0
+        }
+      ],
+      "3": [
+        {
+          "pid": 3241615,
+          "step": 0,
+          "generation": 0
+        }
+      ],
+      "4": [
+        {
+          "pid": 3241616,
+          "step": 0,
+          "generation": 0
+        },
+        {
+          "pid": 3245519,
+          "step": 8,
+          "generation": 1
+        }
+      ],
+      "5": [
+        {
+          "pid": 3241617,
+          "step": 0,
+          "generation": 0
+        },
+        {
+          "pid": 3245517,
+          "step": 8,
+          "generation": 1
+        }
+      ],
+      "6": [
+        {
+          "pid": 3241618,
+          "step": 0,
+          "generation": 0
+        },
+        {
+          "pid": 3245516,
+          "step": 8,
+          "generation": 1
+        }
+      ],
+      "7": [
+        {
+          "pid": 3241619,
+          "step": 0,
+          "generation": 0
+        },
+        {
+          "pid": 3245518,
+          "step": 8,
+          "generation": 1
+        }
+      ]
+    }
+  },
+  "remaining_worker_pids": [],
+  "provider_schemas": {
+    "baseline": {
+      "0": [
+        "progress",
+        "scheduler_0"
+      ],
+      "1": [
+        "progress",
+        "scheduler_0"
+      ],
+      "2": [
+        "progress",
+        "scheduler_0"
+      ],
+      "3": [
+        "progress",
+        "scheduler_0"
+      ],
+      "4": [
+        "progress",
+        "scheduler_0"
+      ],
+      "5": [
+        "progress",
+        "scheduler_0"
+      ],
+      "6": [
+        "progress",
+        "scheduler_0"
+      ],
+      "7": [
+        "progress",
+        "scheduler_0"
+      ]
+    },
+    "recovery": {
+      "0": [
+        "progress",
+        "scheduler_0"
+      ],
+      "1": [
+        "progress",
+        "scheduler_0"
+      ],
+      "2": [
+        "progress",
+        "scheduler_0"
+      ],
+      "3": [
+        "progress",
+        "scheduler_0"
+      ],
+      "4": [
+        "progress",
+        "scheduler_0"
+      ],
+      "5": [
+        "progress",
+        "scheduler_0"
+      ],
+      "6": [
+        "progress",
+        "scheduler_0"
+      ],
+      "7": [
+        "progress",
+        "scheduler_0"
+      ]
+    }
+  },
+  "normal_post_recovery_log_steps": [
+    9,
+    10,
+    11,
+    12
+  ],
+  "exact_state_comparison": "All eight ranks matched the uninterrupted baseline with rtol=0 atol=0",
+  "management_boundary": "ClusterD strategy and Manager-to-Agent delivery supplied by test driver; no physical node or Pod replacement",
+  "scope_exclusions": [
+    "Active distributed checkpoint writes and initial disk restore in the multi-card test",
+    "VLM full multimodal NPU recovery",
+    "Continuous repeated failures",
+    "User-defined collective initialization"
+  ]
+}

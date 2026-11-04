@@ -1,0 +1,237 @@
+{
+  "date": "2026-11-09",
+  "host": "ascend129",
+  "versions": {
+    "torch": "2.12.0",
+    "torch-npu": "2.12.0",
+    "mindio-ttp": "26.2.0",
+    "taskd": "26.2.0"
+  },
+  "source_base": "6e00e2ecfe6631213ae830139f07a3d9c9d525a4",
+  "tested_source_sha256": {
+    "hyper_parallel/core/fault_tolerance/groups.py": "d21b02ceb9c1ed91314011873bc8d9dd07b2ba20400a7fb17aa4e79d3d868710",
+    "hyper_parallel/core/fault_tolerance/session.py": "ef32061d949a3f2cdc38c47600a387b9b5b240d530fe5c5f9f7c10c950355f05",
+    "hyper_parallel/core/dtensor/dtensor.py": "7e8982b9814abe05800544551ed0ea20db8684f732578fee6fac46d87247e804",
+    "hyper_parallel/core/optimizer/muon.py": "75d4f6e2b07df152516f74ce0fbb04b8486b63509536ee6ce5dd6fc4434fe851",
+    "hyper_parallel/models/_transformers/model_builder.py": "2cef430c8afd4c1f7b8685e0c0bfbdfdadc055c5022dc8ad0279e0482f2af55e",
+    "tests/ut/fault_tolerance/test_session.py": "ca71bdf717247540a198331aa285f0b5736e961609a93fd7068f2f3860faa013",
+    "tests/ut/fault_tolerance/test_bootstrap.py": "b0f490ea307c17693b9f00311a22fcd3e7b1888e4d10000d6b7044198d9e80c4",
+    "tests/torch/fault_tolerance/_test_process_recovery.py": "43c2d2414462b5d77bc0dd0bf2b0435ab3435dc7ed820eec9c888268a78fbb08"
+  },
+  "remote_directory": "/home/zbx/hp_recovery_metadata_opt_20261106/design_audit_20261109_192431",
+  "regression_before_fix": {
+    "result": "2 failed",
+    "log": "/home/zbx/hp_recovery_metadata_opt_20261106/design_audit_20261109_192431/before-fix.log",
+    "observations": [
+      "Closed Session executed the training body instead of rejecting the call",
+      "Replacement worker skipped tensor distribution communication after repair"
+    ]
+  },
+  "unit_tests": "131 passed, 8 warnings, 76 subtests passed in 5.36s",
+  "layout": {
+    "world_size": 8,
+    "hsdp_mesh": [
+      2,
+      4
+    ],
+    "dtype": "float32",
+    "muon_hsdp_replica_count": 1
+  },
+  "controller": "Real MindIO Controller hosted by TaskD Manager",
+  "agent": "Real TaskD Agent replacement worker launch",
+  "injection": "SIGKILL fault workers after committed step 8, before step 9 forward completes",
+  "resume_collective_probe": "After repair, all ranks distribute rank-valued tensors using Replicate/Shard; expected local values are all zero",
+  "state_comparison": "Exact recursive comparison of final model, optimizer, scheduler, RNG and loader state against the no-fault baseline",
+  "management_boundary": "ClusterD decisions and Manager-to-Agent delivery supplied by the test harness; no real node or Pod replacement",
+  "fixes": [
+    "Use replacement bootstrap phase only for DTensor/model/Muon initialization; retain replacement identity for lazy data startup",
+    "Require initialized Processor and attached state before RecoverySession.run"
+  ],
+  "cases": [
+    {
+      "case": "hsdp_muon_taskd_ranks4_5_6_7",
+      "fault_ranks": [
+        4,
+        5,
+        6,
+        7
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 221.92,
+      "processes": {
+        "event": "complete",
+        "original_pids": {
+          "0": 750450,
+          "1": 750451,
+          "2": 750452,
+          "3": 750453,
+          "4": 750454,
+          "5": 750455,
+          "6": 750456,
+          "7": 750457
+        },
+        "final_pids": {
+          "0": 750450,
+          "1": 750451,
+          "2": 750452,
+          "3": 750453,
+          "4": 753035,
+          "5": 753037,
+          "6": 753036,
+          "7": 753034
+        }
+      },
+      "final_progress": [
+        {
+          "rank": 0,
+          "pid": 750450,
+          "step": 12,
+          "cursor": 12
+        },
+        {
+          "rank": 1,
+          "pid": 750451,
+          "step": 12,
+          "cursor": 12
+        },
+        {
+          "rank": 2,
+          "pid": 750452,
+          "step": 12,
+          "cursor": 12
+        },
+        {
+          "rank": 3,
+          "pid": 750453,
+          "step": 12,
+          "cursor": 12
+        },
+        {
+          "rank": 4,
+          "pid": 753035,
+          "step": 12,
+          "cursor": 12
+        },
+        {
+          "rank": 5,
+          "pid": 753037,
+          "step": 12,
+          "cursor": 12
+        },
+        {
+          "rank": 6,
+          "pid": 753036,
+          "step": 12,
+          "cursor": 12
+        },
+        {
+          "rank": 7,
+          "pid": 753034,
+          "step": 12,
+          "cursor": 12
+        }
+      ],
+      "resumed_collective_verified_ranks": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ]
+    },
+    {
+      "case": "hsdp_adamw_taskd_ranks1",
+      "fault_ranks": [
+        1
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 217.62,
+      "processes": {
+        "event": "complete",
+        "original_pids": {
+          "0": 762479,
+          "1": 762480,
+          "2": 762481,
+          "3": 762482,
+          "4": 762483,
+          "5": 762484,
+          "6": 762485,
+          "7": 762486
+        },
+        "final_pids": {
+          "0": 762479,
+          "1": 765825,
+          "2": 762481,
+          "3": 762482,
+          "4": 762483,
+          "5": 762484,
+          "6": 762485,
+          "7": 762486
+        }
+      },
+      "final_progress": [
+        {
+          "rank": 0,
+          "pid": 762479,
+          "step": 12,
+          "cursor": 12
+        },
+        {
+          "rank": 1,
+          "pid": 765825,
+          "step": 12,
+          "cursor": 12
+        },
+        {
+          "rank": 2,
+          "pid": 762481,
+          "step": 12,
+          "cursor": 12
+        },
+        {
+          "rank": 3,
+          "pid": 762482,
+          "step": 12,
+          "cursor": 12
+        },
+        {
+          "rank": 4,
+          "pid": 762483,
+          "step": 12,
+          "cursor": 12
+        },
+        {
+          "rank": 5,
+          "pid": 762484,
+          "step": 12,
+          "cursor": 12
+        },
+        {
+          "rank": 6,
+          "pid": 762485,
+          "step": 12,
+          "cursor": 12
+        },
+        {
+          "rank": 7,
+          "pid": 762486,
+          "step": 12,
+          "cursor": 12
+        }
+      ],
+      "resumed_collective_verified_ranks": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ]
+    }
+  ]
+}

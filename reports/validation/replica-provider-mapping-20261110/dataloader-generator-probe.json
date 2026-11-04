@@ -1,0 +1,25 @@
+{
+  "torchdata_version": "0.11.0",
+  "loader_has_generator": true,
+  "first_batch": [
+    0,
+    1
+  ],
+  "restored_next_batch": [
+    2,
+    3
+  ],
+  "generator_restored_by_load_state_dict": false,
+  "generator_restored_after_iterator_recreation": false,
+  "snapshot_keys": [
+    "_IterableDataset_len_called",
+    "_index_sampler_state",
+    "_iterator_finished",
+    "_num_yielded",
+    "_sampler_iter_state",
+    "_sampler_iter_yielded",
+    "_shared_seed",
+    "dataset_state",
+    "fetcher_state"
+  ]
+}

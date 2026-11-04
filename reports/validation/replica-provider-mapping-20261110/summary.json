@@ -1,0 +1,332 @@
+{
+  "date": "2026-11-10",
+  "host": "ascend129",
+  "remote_directory": "/home/zbx/hp_texttrainer_recovery_20261109_202040/replica_providers_smoke_20261110_172811",
+  "source_base": "8c8f48b05717ad7d577fa0dcdc7c6a726dd40309",
+  "source_hash_encoding": "UTF-8 files normalized to LF",
+  "tested_source_sha256": {
+    "hyper_parallel/core/fault_tolerance/session.py": "cd8c14135b8f3f95c58159900b01d046f4ffe92fdc335747a09dc73965f456b9",
+    "hyper_parallel/core/fault_tolerance/state.py": "be8536a8c856dab8af16bec62623f56a67fd5ec22f3eca21548f26a53e8f8307",
+    "hyper_parallel/core/fault_tolerance/transport.py": "c4cf7505e6cd34efa9be98d867177f6025868743e8068f3e78a0e45700917d05",
+    "hyper_parallel/trainer/runtime/fault_tolerance.py": "0175cb073127ff1fc0e85b4d398afddaa10c98c3943b102fbdae5def2b5abf19",
+    "hyper_parallel/trainer/base.py": "84a9541994b3cfb9037161df4a4573df09c3b9d1d2567f39a29176eaff1e8130",
+    "hyper_parallel/trainer/text_trainer.py": "8d69d559840ab4db632684a1fb0be9572ae38e4e8dae47cc411a43916090c68f",
+    "hyper_parallel/trainer/vlm_trainer.py": "8d19b8066c65f8d476e830d62877a456803990a349970eb36e04af37014e7511",
+    "tests/ut/fault_tolerance/test_session.py": "7ee88b42a98139018eb71d5b244a4a903129d329cdd6e02cabce87be057562b9",
+    "tests/ut/fault_tolerance/test_state.py": "8dc725c47be4c57193523483895bbdb238bf26c1787c846d64f120db13af5f53",
+    "tests/ut/fault_tolerance/test_trainer.py": "2460dc523097581bbaa75105c868e958f0cc3531fa6f5e52c0d41e0a82cb110a",
+    "tests/ut/fault_tolerance/test_transport.py": "a9a0b26a7f8a6a6cc12802ec4f856734463c6d851b451b8efd3b0c8736e4d27c",
+    "tests/torch/fault_tolerance/text_trainer_recovery.py": "63ef834b4c9325aa61a9cd1dec9ee779578a73e074a627cf80b493df8c6583ca",
+    "tests/torch/fault_tolerance/_test_process_recovery.py": "4b2b07074442c66738102338884a035d013914bec5c7d38b506651160300e80b",
+    "hyper_parallel/trainer/callbacks/checkpoint_callback.py": "18b536ee4b522117175d7bc482d9d5546802ce2397972573e5390e0bd504285f",
+    "tests/ut/trainer/test_checkpoint_callback.py": "4a056030571260db336df93175bbe0d176128a1a37e85a1cc59a05cbcec805c5"
+  },
+  "versions": {
+    "torch": "2.12.0",
+    "torch-npu": "2.12.0",
+    "mindio-ttp": "26.2.0",
+    "taskd": "26.2.0"
+  },
+  "change": "Replace the generic providers mapping plus replica-provider name set with one replica_providers object mapping; rename its snapshot field; keep loader, RNG and generators rank-specific; partition the whole replica snapshot locally in the metadata bank without a name registry",
+  "cpu_tests": "189 passed, 8 warnings, 114 subtests passed in 17.32s",
+  "cpu_scope": "Fault tolerance, data, Base/Text/VLM Trainer, distributed runtime, native iterator, profiler lifecycle, checkpoint, logging, tqdm and environment metrics callbacks",
+  "cpu_regressions": [
+    "Replica provider mapping stores objects directly and snapshots use replica_providers, not providers",
+    "Native Base/Text/VLM loops resume with matching optimizer, scheduler and progress",
+    "Metadata bank keeps all replica state local, mirrors only target-rank state, restores exact donor step and handles empty provider mappings",
+    "Checkpoint and replacement initialization regressions pass"
+  ],
+  "npu_text_trainer": {
+    "case": "text_trainer_replica_provider_mapping",
+    "fault_ranks": "4,5,6,7",
+    "exit_code": 0,
+    "elapsed_seconds": 266.69
+  },
+  "npu_scope": "8-card small Qwen3 MoE TextTrainer, FP32, HSDP 2x4, real Indexed Dataset, Muon/AdamW, real MindIO and TaskD Controller/Agent",
+  "fault_ranks": [
+    4,
+    5,
+    6,
+    7
+  ],
+  "commit_step": 8,
+  "final_step": 12,
+  "device_receives": [
+    {
+      "rank": 7,
+      "source": 3,
+      "step": 8
+    },
+    {
+      "rank": 4,
+      "source": 0,
+      "step": 8
+    },
+    {
+      "rank": 6,
+      "source": 2,
+      "step": 8
+    },
+    {
+      "rank": 5,
+      "source": 1,
+      "step": 8
+    }
+  ],
+  "processes": {
+    "event": "complete",
+    "original_pids": {
+      "0": 3460808,
+      "1": 3460809,
+      "2": 3460810,
+      "3": 3460811,
+      "4": 3460812,
+      "5": 3460813,
+      "6": 3460814,
+      "7": 3460815
+    },
+    "final_pids": {
+      "0": 3460808,
+      "1": 3460809,
+      "2": 3460810,
+      "3": 3460811,
+      "4": 3465390,
+      "5": 3465388,
+      "6": 3465391,
+      "7": 3465389
+    }
+  },
+  "begin_events": {
+    "baseline": {
+      "0": [
+        {
+          "pid": 3452625,
+          "step": 0,
+          "generation": 0
+        }
+      ],
+      "1": [
+        {
+          "pid": 3452626,
+          "step": 0,
+          "generation": 0
+        }
+      ],
+      "2": [
+        {
+          "pid": 3452627,
+          "step": 0,
+          "generation": 0
+        }
+      ],
+      "3": [
+        {
+          "pid": 3452628,
+          "step": 0,
+          "generation": 0
+        }
+      ],
+      "4": [
+        {
+          "pid": 3452629,
+          "step": 0,
+          "generation": 0
+        }
+      ],
+      "5": [
+        {
+          "pid": 3452630,
+          "step": 0,
+          "generation": 0
+        }
+      ],
+      "6": [
+        {
+          "pid": 3452631,
+          "step": 0,
+          "generation": 0
+        }
+      ],
+      "7": [
+        {
+          "pid": 3452632,
+          "step": 0,
+          "generation": 0
+        }
+      ]
+    },
+    "recovery": {
+      "0": [
+        {
+          "pid": 3460808,
+          "step": 0,
+          "generation": 0
+        }
+      ],
+      "1": [
+        {
+          "pid": 3460809,
+          "step": 0,
+          "generation": 0
+        }
+      ],
+      "2": [
+        {
+          "pid": 3460810,
+          "step": 0,
+          "generation": 0
+        }
+      ],
+      "3": [
+        {
+          "pid": 3460811,
+          "step": 0,
+          "generation": 0
+        }
+      ],
+      "4": [
+        {
+          "pid": 3460812,
+          "step": 0,
+          "generation": 0
+        },
+        {
+          "pid": 3465390,
+          "step": 8,
+          "generation": 1
+        }
+      ],
+      "5": [
+        {
+          "pid": 3460813,
+          "step": 0,
+          "generation": 0
+        },
+        {
+          "pid": 3465388,
+          "step": 8,
+          "generation": 1
+        }
+      ],
+      "6": [
+        {
+          "pid": 3460814,
+          "step": 0,
+          "generation": 0
+        },
+        {
+          "pid": 3465391,
+          "step": 8,
+          "generation": 1
+        }
+      ],
+      "7": [
+        {
+          "pid": 3460815,
+          "step": 0,
+          "generation": 0
+        },
+        {
+          "pid": 3465389,
+          "step": 8,
+          "generation": 1
+        }
+      ]
+    }
+  },
+  "remaining_worker_pids": [],
+  "provider_schemas": {
+    "baseline": {
+      "0": [
+        "progress",
+        "scheduler_0"
+      ],
+      "1": [
+        "progress",
+        "scheduler_0"
+      ],
+      "2": [
+        "progress",
+        "scheduler_0"
+      ],
+      "3": [
+        "progress",
+        "scheduler_0"
+      ],
+      "4": [
+        "progress",
+        "scheduler_0"
+      ],
+      "5": [
+        "progress",
+        "scheduler_0"
+      ],
+      "6": [
+        "progress",
+        "scheduler_0"
+      ],
+      "7": [
+        "progress",
+        "scheduler_0"
+      ]
+    },
+    "recovery": {
+      "0": [
+        "progress",
+        "scheduler_0"
+      ],
+      "1": [
+        "progress",
+        "scheduler_0"
+      ],
+      "2": [
+        "progress",
+        "scheduler_0"
+      ],
+      "3": [
+        "progress",
+        "scheduler_0"
+      ],
+      "4": [
+        "progress",
+        "scheduler_0"
+      ],
+      "5": [
+        "progress",
+        "scheduler_0"
+      ],
+      "6": [
+        "progress",
+        "scheduler_0"
+      ],
+      "7": [
+        "progress",
+        "scheduler_0"
+      ]
+    }
+  },
+  "normal_post_recovery_log_steps": [
+    9,
+    10,
+    11,
+    12
+  ],
+  "exact_state_comparison": "All eight ranks matched the uninterrupted baseline with rtol=0 atol=0",
+  "management_boundary": "ClusterD strategy and Manager-to-Agent delivery supplied by test driver; no physical node or Pod replacement",
+  "scope_exclusions": [
+    "Active distributed checkpoint writes and initial disk restore in the multi-card test",
+    "VLM full multimodal NPU recovery",
+    "Continuous repeated failures",
+    "User-defined collective initialization"
+  ],
+  "post_validation_docstring_completion": {
+    "final_source_sha256": {
+      "hyper_parallel/core/fault_tolerance/state.py": "dec03a4d38e83e60a0453d26b64c9fe633a82c1d9b22cba9a4cb75bec5696a6c",
+      "hyper_parallel/core/fault_tolerance/transport.py": "cf294b52b704f4c96cf61b91c4c375bda86600c4bc4ab74403e49ccf4dd5a7d8",
+      "tests/ut/fault_tolerance/test_transport.py": "fc7509f7f7d8a7b91f37a922f5b52734f749e3dd07573e3cbadcc06d17b09be8"
+    },
+    "executable_ast_unchanged": true,
+    "scope": "Docstring completion only after NPU validation",
+    "focused_cpu_tests": "71 passed, 2 warnings, 38 subtests passed in 4.35s"
+  }
+}

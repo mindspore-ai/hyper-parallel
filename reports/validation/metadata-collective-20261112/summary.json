@@ -1,0 +1,79 @@
+{
+  "date": "2026-11-12",
+  "scope": "Reuse exact EXISTING_COMM_GROUPS handles for metadata all-gather; default world reuse; lazy group-local fallback and registration; temporary MindIO repair groups remain P2P",
+  "environment": {
+    "os": "win32",
+    "python": "3.13.1",
+    "torch": "2.15.0+cpu",
+    "numpy": "2.5.4",
+    "transformers": "5.22.2"
+  },
+  "repository_ut_run": true,
+  "fault_tolerance_ut": {
+    "passed": 92,
+    "subtests_passed": 49,
+    "failed": 0
+  },
+  "cpu_gloo_runs": [
+    {
+      "world_size": 8,
+      "replicas_per_domain": 4,
+      "mirrored_steps": [
+        7,
+        8
+      ],
+      "target_specific_metadata_and_buffers": "exact",
+      "simultaneous_repair_targets": [
+        4,
+        5,
+        6,
+        7
+      ],
+      "parameter_and_optimizer_comparison": "exact",
+      "actual_process_replacement": false
+    },
+    {
+      "world_size": 8,
+      "replicas_per_domain": 8,
+      "mirrored_steps": [
+        7,
+        8
+      ],
+      "target_specific_metadata_and_buffers": "exact",
+      "simultaneous_repair_targets": [
+        4,
+        5,
+        6,
+        7
+      ],
+      "parameter_and_optimizer_comparison": "exact",
+      "actual_process_replacement": false
+    }
+  ],
+  "unit_scenarios": [
+    "Exact cached handle reused and registered once, including a permuted group rank order",
+    "Full-world replica domain reuses the default process group",
+    "Replacement creates only its missing metadata group without bootstrap collectives",
+    "Cached backend and actual-member mismatches rejected",
+    "Initialization barrier and default device binding rejected before fallback group creation",
+    "Variable payload lengths padded only when required; original local snapshots preserved"
+  ],
+  "npu_retested": false,
+  "performance_benchmark_run": false,
+  "limitations": [
+    "zbx SSH port 22 still times out; no current MindIO/TaskD/HCCL execution",
+    "CPU Gloo verifies actual collectives and state transfer, not HCCL speedup or lazy bootstrap",
+    "Fallback HCCL construction is verified through mocked UT; supported-deployment NPU validation remains required",
+    "Local Python 3.13/NumPy 2.5 differ from repository deployment requirements",
+    "Editable install was rejected by Python version constraint; checkout import path was verified",
+    "State repair tests transfer simultaneously without real worker death or replacement"
+  ],
+  "tested_source_sha256": {
+    "hyper_parallel/core/fault_tolerance/topology.py": "6cf7287c40a77fac78349336bd55a6b42b45cdd0b9e37ed1428dd3137fcd2193",
+    "hyper_parallel/core/fault_tolerance/groups.py": "159759b177ba82bcf336142ff1abc8264f6475ea50261ab23ed8eb0c99f51c42",
+    "hyper_parallel/core/fault_tolerance/session.py": "02a5a7da8b2e2431386df6cc85ec6ddc1a1971b192eb126e830358051a1ac0a2",
+    "hyper_parallel/core/fault_tolerance/transport.py": "a783c412e271174d28b6878d1269afa041048a2822e10a570278266c9b43c198",
+    "hyper_parallel/core/utils/communication.py": "79418a26ff1c670811b925fe81b186965a00462681b4d01ea982eca281b39f63",
+    "tests/ut/fault_tolerance/test_transport.py": "095bc2f4b8340f006dec2417aa6a246dd7e7274a0c19e77e6dc1baa99848627c"
+  }
+}

@@ -111,6 +111,15 @@ from hyper_parallel.trainer.callbacks import (
     CheckpointerCallback,
     TrainerState,
 )
+from hyper_parallel.trainer.runtime.fault_tolerance import (
+    recovery_constructor,
+    recovery_data_iterator,
+    recovery_epoch_initialized,
+    recovery_optimizer_update,
+    recovery_train_loop,
+    recovery_train_initialized,
+    recovery_train_step,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -258,6 +267,7 @@ class BaseTrainer(Stateful, ABC):
     # Default seed when training.seed is omitted.
     default_seed: int = 42
 
+    @recovery_constructor
     def __init__(self, config: TrainerConfig) -> None:
         """
         Initialize the trainer.
@@ -651,6 +661,8 @@ class BaseTrainer(Stateful, ABC):
 
     def on_train_begin(self) -> None:
         """Run all registered callbacks at the start of training."""
+        # During process recovery, callbacks must not depend on collective communication.
+        # If collectives are required, process recovery must be adapted for that scenario.
         for callback in self._callbacks:
             callback.on_train_begin(self.state)
 
@@ -941,6 +953,7 @@ class BaseTrainer(Stateful, ABC):
         self.model_integration.after_clip(post_clip_norm)
         return grad_norm
 
+    @recovery_optimizer_update
     def step_optimizers_and_schedulers(self) -> None:
         """Step every optimizer and scheduler, then expose the final state."""
         optimizers = self.optimizer if isinstance(self.optimizer, list) else [self.optimizer]
@@ -989,6 +1002,7 @@ class BaseTrainer(Stateful, ABC):
         resolved_metrics["samples"] = self.config.training.global_batch_size
         self.model_integration.end_step(resolved_metrics)
 
+    @recovery_train_step
     def train_step(
         self,
         data_iterator: Any,
@@ -1069,13 +1083,17 @@ class BaseTrainer(Stateful, ABC):
         synchronize()
         destroy_process_group()
 
+    @recovery_train_loop
     def train(self) -> None:
         """Run the configured training loop."""
         try:
             config: TrainerConfig = self.config
             self.on_train_begin()
-            self.data_iterator = HyperIter(
-                self.train_dataloader, use_background_prefetcher=config.dataloader.use_background_prefetcher
+            recovery_train_initialized(self)
+            self.data_iterator = recovery_data_iterator(
+                self, lambda: HyperIter(
+                    self.train_dataloader,
+                    use_background_prefetcher=config.dataloader.use_background_prefetcher)
             )
             logger.info(
                 "Rank%s Start training. Global step: %s. Train iters: %s. Start epoch: %s. Train epochs: %s.",
@@ -1087,12 +1105,15 @@ class BaseTrainer(Stateful, ABC):
                 for epoch in range(start_epoch, self.train_epochs):
                     if epoch != start_epoch:
                         self.train_dataloader.set_epoch(epoch)
-                        self.data_iterator = HyperIter(
-                            self.train_dataloader, use_background_prefetcher=config.dataloader.use_background_prefetcher
+                        self.data_iterator = recovery_data_iterator(
+                            self, lambda: HyperIter(
+                                self.train_dataloader,
+                                use_background_prefetcher=config.dataloader.use_background_prefetcher)
                         )
                     self.state.epoch = epoch
 
                     self.on_epoch_begin()
+                    recovery_epoch_initialized(self)
 
                     start_step = self.state.global_step - epoch * self.train_steps
                     train_steps = min(self.train_steps, self.train_iters - epoch * self.train_steps)

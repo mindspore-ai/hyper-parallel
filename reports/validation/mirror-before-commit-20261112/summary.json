@@ -1,0 +1,40 @@
+{
+  "date": "2026-11-12",
+  "scope": "Mirror required metadata successfully before end_updating_os; fatal mirror failures",
+  "environment": {
+    "os": "win32",
+    "python": "3.13.1",
+    "torch": "2.15.0+cpu",
+    "numpy": "2.5.4",
+    "transformers": "5.22.2"
+  },
+  "fault_tolerance_ut": {
+    "passed": 92,
+    "subtests_passed": 51,
+    "failed": 0
+  },
+  "local_mindio_decorator_probe": {
+    "actual_decorator_executed": true,
+    "device_and_report_interfaces_mocked": true,
+    "reported": "RS_UNKNOWN",
+    "training_body_calls": 1,
+    "wait_next_action_calls": 0,
+    "wait_repair_action_calls": 0,
+    "original_exception_cause_preserved": true
+  },
+  "npu_retested": false,
+  "limitations": [
+    "No real HCCL failure, Controller policy, TaskD restart, or NPU end-to-end test for this change",
+    "SDK report_status and exit coordination were mocked; they can still wait in deployment",
+    "Local Python/NumPy differ from supported deployment versions; editable install remains blocked"
+  ],
+  "tested_source_sha256": {
+    "hyper_parallel/core/fault_tolerance/topology.py": "6cf7287c40a77fac78349336bd55a6b42b45cdd0b9e37ed1428dd3137fcd2193",
+    "hyper_parallel/core/fault_tolerance/groups.py": "159759b177ba82bcf336142ff1abc8264f6475ea50261ab23ed8eb0c99f51c42",
+    "hyper_parallel/core/fault_tolerance/session.py": "d744ea549dd1affbe059d83ba02bab8ad677aa3f8da95f971945bafa1a4f2d7c",
+    "hyper_parallel/core/fault_tolerance/transport.py": "a783c412e271174d28b6878d1269afa041048a2822e10a570278266c9b43c198",
+    "hyper_parallel/core/utils/communication.py": "79418a26ff1c670811b925fe81b186965a00462681b4d01ea982eca281b39f63",
+    "tests/ut/fault_tolerance/test_transport.py": "095bc2f4b8340f006dec2417aa6a246dd7e7274a0c19e77e6dc1baa99848627c",
+    "tests/ut/fault_tolerance/test_session.py": "9f8c191e485105de55fea19c29f864cc145cb277c00bbaa6ec96d01fc9254a7d"
+  }
+}

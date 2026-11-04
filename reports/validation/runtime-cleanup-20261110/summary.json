@@ -1,0 +1,145 @@
+{
+  "date": "2026-11-10",
+  "host": "ascend129",
+  "remote_directory": "/home/zbx/hp_texttrainer_recovery_20261109_202040/cleanup_smoke_20261110_111648",
+  "source_base": "8c8f48b05717ad7d577fa0dcdc7c6a726dd40309",
+  "source_hash_encoding": "UTF-8 files normalized to LF",
+  "tested_source_sha256": {
+    "hyper_parallel/core/fault_tolerance/session.py": "74e9ce40480096924376efdedaaf8954c3fddb539db87afce70879df0ea2da34",
+    "tests/ut/fault_tolerance/test_session.py": "7ee88b42a98139018eb71d5b244a4a903129d329cdd6e02cabce87be057562b9",
+    "hyper_parallel/trainer/runtime/fault_tolerance.py": "47189b12048e3aba568f728d9e653aab947d2cdb1530902dc55b01a2c5de04a6",
+    "tests/ut/fault_tolerance/test_trainer.py": "d41172cb13312a5011b38bc580c1801b8b61eb3bfb1379a3047a96a69831187a"
+  },
+  "versions": {
+    "torch": "2.12.0",
+    "torch-npu": "2.12.0",
+    "mindio-ttp": "26.2.0",
+    "taskd": "26.2.0"
+  },
+  "regression_before_fix": {
+    "directory": "/home/zbx/hp_texttrainer_recovery_20261109_202040/cleanup_20261110_110831",
+    "test_exit_code": 1,
+    "test_summary": "3 failed in 0.24s"
+  },
+  "fix": "Remove entered-based resource flag clearing; wrap SDK decorator construction in cleanup protection; release only after leaving the SDK loop; preserve original errors in Session and Trainer cleanup",
+  "cpu_tests": "68 passed, 2 warnings, 35 subtests passed in 3.80s",
+  "combined_cpu_tests": "141 passed, 8 warnings, 86 subtests passed in 5.23s",
+  "sdk_exception_wrapper_probe": {
+    "real_sdk_exception_wrapper": "passed",
+    "cleanup_order": [
+      "processor",
+      "controller"
+    ],
+    "original_error_preserved": true,
+    "native_destroy_calls": "observed mocks",
+    "npu_operations": "mocked"
+  },
+  "sdk_probe_boundary": "Actual installed SDK Python exception wrapper; error reporting, NPU statistics/cache and destroy calls mocked; not a native fatal-training-error acceptance",
+  "npu_text_trainer": {
+    "case": "full_text_trainer_rank1_cleanup_regression",
+    "exit_code": 0,
+    "elapsed_seconds": 251.31
+  },
+  "npu_scope": "8-card small Qwen3 MoE TextTrainer, FP32, HSDP 2x4, real offline Indexed Dataset, Muon/AdamW, real TaskD Controller and Agent",
+  "fault_ranks": [
+    1
+  ],
+  "commit_step": 8,
+  "final_step": 12,
+  "device_receives": [
+    {
+      "rank": 1,
+      "source": 5,
+      "step": 8
+    }
+  ],
+  "processes": {
+    "event": "complete",
+    "original_pids": {
+      "0": 2381917,
+      "1": 2381918,
+      "2": 2381919,
+      "3": 2381920,
+      "4": 2381921,
+      "5": 2381922,
+      "6": 2381923,
+      "7": 2381924
+    },
+    "final_pids": {
+      "0": 2381917,
+      "1": 2385551,
+      "2": 2381919,
+      "3": 2381920,
+      "4": 2381921,
+      "5": 2381922,
+      "6": 2381923,
+      "7": 2381924
+    }
+  },
+  "final_worker_progress": [
+    {
+      "rank": 0,
+      "pid": 2381917,
+      "step": 12,
+      "global_step": 12,
+      "epoch": 0
+    },
+    {
+      "rank": 1,
+      "pid": 2385551,
+      "step": 12,
+      "global_step": 12,
+      "epoch": 0
+    },
+    {
+      "rank": 2,
+      "pid": 2381919,
+      "step": 12,
+      "global_step": 12,
+      "epoch": 0
+    },
+    {
+      "rank": 3,
+      "pid": 2381920,
+      "step": 12,
+      "global_step": 12,
+      "epoch": 0
+    },
+    {
+      "rank": 4,
+      "pid": 2381921,
+      "step": 12,
+      "global_step": 12,
+      "epoch": 0
+    },
+    {
+      "rank": 5,
+      "pid": 2381922,
+      "step": 12,
+      "global_step": 12,
+      "epoch": 0
+    },
+    {
+      "rank": 6,
+      "pid": 2381923,
+      "step": 12,
+      "global_step": 12,
+      "epoch": 0
+    },
+    {
+      "rank": 7,
+      "pid": 2381924,
+      "step": 12,
+      "global_step": 12,
+      "epoch": 0
+    }
+  ],
+  "exact_state_comparison": "all eight ranks matched the uninterrupted baseline with rtol=0 atol=0",
+  "native_teardown_result": "workers and TaskD Manager exited successfully; no shutdown-order change on successful runs",
+  "management_boundary": "ClusterD strategy and Manager-to-Agent delivery supplied by the test driver; no physical node or Pod replacement",
+  "scope_exclusions": [
+    "real multi-rank fatal Python exception injection",
+    "SIGKILL Python cleanup",
+    "forced native process exit cleanup"
+  ]
+}

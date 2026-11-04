@@ -26,6 +26,7 @@ import numpy as np
 
 import torch.distributed as dist
 
+from hyper_parallel.core.fault_tolerance.groups import is_recovery_enabled
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 
 logger = get_dataset_logger(__name__)
@@ -174,6 +175,13 @@ def resolve_data_paths(
         One prefix directly, or alternating weight/prefix values for multiple sources. If ``data_path`` is not a
         collection of discoverable indexed paths, return it unchanged so an explicit blend can be parsed.
     """
+    # Both original and replacement workers use the same local ordering.
+    # Replaying a distributed directory walk would require parked peers.
+    return _resolve_data_paths(data_path, distributed_walk=distributed_walk and not is_recovery_enabled())
+
+
+def _resolve_data_paths(data_path: str | Sequence[str], *, distributed_walk: bool) -> list[str]:
+    """Discover indexed prefixes using the ordinary initial-training path."""
     # 1. Normalize one path and multiple paths to the same traversal form.
     data_paths = [data_path] if isinstance(data_path, str) else list(data_path)
 
@@ -289,7 +297,10 @@ def _walk_bin_directories(directories: Sequence[str]) -> list[str]:
     """Recursively find ``.bin`` files below the assigned directories."""
     file_paths = []
     for directory in directories:
-        for root, _, filenames in os.walk(directory):
+        for root, subdirectories, filenames in os.walk(directory):
+            if is_recovery_enabled():
+                subdirectories.sort()
+                filenames = sorted(filenames)
             for filename in filenames:
                 if filename.endswith(".bin"):
                     path = os.path.abspath(os.path.join(root, filename))

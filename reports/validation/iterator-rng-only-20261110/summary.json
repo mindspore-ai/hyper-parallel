@@ -1,0 +1,18 @@
+{
+  "date": "2026-11-10",
+  "host": "ascend129",
+  "remote_directory": "/home/zbx/hp_texttrainer_recovery_20261109_202040/iterator_rng_20261110_200022",
+  "exit_code": 0,
+  "source_hash_encoding": "UTF-8 files normalized to LF",
+  "tested_source_sha256": {
+    "hyper_parallel/core/fault_tolerance/state.py": "e4825f461212c9ee8a756c89165bb697d9629f1b74959f1daa1832ef810332e5",
+    "hyper_parallel/core/fault_tolerance/transport.py": "f8db86e57066889fa5b8a681248822ae3b3291a20ba27e7a198a1690c200d682",
+    "tests/ut/fault_tolerance/test_state.py": "9a67fb2c2bf739fc3ba0243dd8f4fb9f6eb3f3cccdb8a98f73c5baed696aeaa0",
+    "tests/ut/fault_tolerance/test_transport.py": "c9bffb1abe3015a93058b1c9b3f807231ec0e60606eaad608727fa626778a75e"
+  },
+  "cpu_tests": "72 passed, 2 warnings, 38 subtests passed in 4.21s",
+  "change": "Capture only RNG and generators around iterator construction; skip loader/provider state export and restore; reuse the RNG reader in full commit capture without duplicating tensor snapshots",
+  "validation_scope": "CPU state snapshot, restore, bank partition, exact donor state merge, direct tensor transfer and Trainer reentry regressions",
+  "npu_retested": false,
+  "npu_scope_note": "No additional NPU run for this iterator RNG capture simplification; state layout and distributed communication remain unchanged"
+}

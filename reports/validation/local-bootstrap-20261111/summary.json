@@ -1,0 +1,93 @@
+{
+  "date": "2026-11-11",
+  "scope": "Local reconstruction instead of recovery-specific Store records, default-world P2P mirrors, MindIO-selected temporary repair groups, Muon metadata refresh in global rollback; no completed-training retry cache",
+  "environment": {
+    "os": "win32",
+    "python": "3.13.1",
+    "torch": "2.15.0+cpu",
+    "numpy": "2.5.4",
+    "transformers": "5.22.2"
+  },
+  "repository_ut_run": true,
+  "fault_tolerance_ut": {
+    "passed": 86,
+    "subtests_passed": 47,
+    "failed": 0
+  },
+  "gloo": {
+    "world_size": 8,
+    "replica_domains": [
+      [
+        0,
+        4
+      ],
+      [
+        1,
+        5
+      ],
+      [
+        2,
+        6
+      ],
+      [
+        3,
+        7
+      ]
+    ],
+    "mirrored_steps": [
+      7,
+      8
+    ],
+    "simultaneous_repair_targets": [
+      4,
+      5,
+      6,
+      7
+    ],
+    "live_parameter_and_optimizer_tensor_comparison": "exact",
+    "target_specific_metadata_and_buffers": "exact",
+    "actual_worker_restart": false
+  },
+  "broader_checks": {
+    "indexed_helpers": {
+      "passed": 3,
+      "failed": 1,
+      "reason": "Windows short/long temporary path spelling"
+    },
+    "memory_lifecycle_and_runtime": {
+      "passed": 19,
+      "subtests_passed": 22,
+      "failed": 2,
+      "reason": "Windows path separator and POSIX mode assertions"
+    },
+    "combined_trainer_collection": "Failed: patched sys.modules imports cause Torch Dynamo artifact re-registration"
+  },
+  "npu_retested": false,
+  "limitations": [
+    "zbx SSH port 22 timed out; no current MindIO/TaskD/NPU end-to-end run",
+    "CPU Gloo does not validate HCCL lazy initialization or native SDK callback scheduling",
+    "Local Python 3.13 and NumPy 2.5 differ from repository-supported Python <3.13 and NumPy <2",
+    "Editable installation was rejected by the Python version requirement; imports were verified in this checkout",
+    "Gloo repair is simultaneous state transfer, not fault injection or process replacement",
+    "Dataset file collections and index contents must remain stable across local reconstruction",
+    "SDK teardown RETRY after completed training is documented but not handled or claimed tested"
+  ],
+  "tested_source_sha256": {
+    "hyper_parallel/core/fault_tolerance/topology.py": "b29fcca02ec939519c09871747dd21b25359b270cfb0c5a503bf8cdd2ab78334",
+    "hyper_parallel/core/fault_tolerance/state.py": "0ec31b55ce19cd90af5fbe5c15e360c403d5d2f63628341d4543a8fcbf591a02",
+    "hyper_parallel/core/fault_tolerance/groups.py": "159759b177ba82bcf336142ff1abc8264f6475ea50261ab23ed8eb0c99f51c42",
+    "hyper_parallel/core/fault_tolerance/session.py": "c1b2f235738428b90ad93c07c8f6f0531deabd30e916754465a3b141ebac3586",
+    "hyper_parallel/core/fault_tolerance/transport.py": "8099c5f5e014f9a582985490ac975df933b8791a295d657d0641c6b7df9c0d8a",
+    "hyper_parallel/data/indexed/indexed_data_config.py": "2eef6a17403af02b5364d00f7ab8ecda98b51fcdfc2d1973c08a57e9b0b87237",
+    "hyper_parallel/trainer/runtime/fault_tolerance.py": "1eca68ac0106d0a15dd038bb1d8ebef16bd171760fea3069d578aed7501cb50e",
+    "hyper_parallel/trainer/base.py": "ab4f496a43c9fe32ef52a1c1721643990c0eaf058d1a66262d0045c2fe7d8f50",
+    "hyper_parallel/trainer/text_trainer.py": "f4c0571fce8aee7af3d5f80562dd707db9a229792b0480b7f435f037afb31166",
+    "hyper_parallel/trainer/vlm_trainer.py": "26eff58d77d2332cd026cfd085d4a5ccb72bd4d445c1f6d9404dc50f7abf585d",
+    "tests/ut/fault_tolerance/test_adapters.py": "c8a41434ff36f52f945567625a679cfbeddd0a634f88131f8867d8b374d00d68",
+    "tests/ut/fault_tolerance/test_bootstrap.py": "a380b8d21f84579010cc944e28739befb1714ecfde0396f185120471b6fc1966",
+    "tests/ut/fault_tolerance/test_session.py": "5a8eb99a584234179ab4db1071cdafde6465a6ac89d55d8341af5279156e0ef0",
+    "tests/ut/fault_tolerance/test_state.py": "a090b7350b940920b1b67d69f318b2b4ef4dd8eb13164c5d64dc1ab06c3928e6",
+    "tests/ut/fault_tolerance/test_trainer.py": "284af4107787e1a30f0f6aa07a9dafcd4d4c98b5af7d6fdf74a1625388c2f181",
+    "tests/ut/fault_tolerance/test_transport.py": "054423ef8e71213af4ddfe86a6dcec7d6842cf95ea523ac897f4cdd45fbc5f72"
+  }
+}

@@ -28,6 +28,10 @@ from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import print_device_mem_info
 from hyper_parallel.trainer.runtime.memory_profiler import memory_profiler
 from hyper_parallel.trainer.runtime.device import synchronize
+from hyper_parallel.trainer.runtime.fault_tolerance import (
+    recovery_constructor, recovery_data_iterator, recovery_epoch_initialized,
+    recovery_train_initialized, recovery_train_loop, recovery_train_step,
+)
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.trainer.config import TrainerConfig
 
@@ -39,6 +43,7 @@ class TextTrainer:
 
     base: BaseTrainer
 
+    @recovery_constructor
     def __init__(self, config: TrainerConfig) -> None:
         """Build the text Trainer in the same explicit order as VeOmni."""
         self.base = BaseTrainer.__new__(BaseTrainer)
@@ -246,6 +251,7 @@ class TextTrainer:
 
         return loss, loss_dict
 
+    @recovery_train_step
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
         """Execute one text training step.
 
@@ -302,11 +308,13 @@ class TextTrainer:
             "grad_norm": grad_norm_value,
         }
 
+    @recovery_train_loop
     def train(self) -> None:
         """Run the configured global optimizer steps by Dataset epoch."""
         try:
             config = self.base.config
             self.on_train_begin()
+            recovery_train_initialized(self.base)
             logger.info(
                 "Rank%s Start training. Global step: %s. Train iters: %s. Start epoch: %s. Train epochs: %s.",
                 self.base.local_rank,
@@ -324,7 +332,8 @@ class TextTrainer:
 
                 self.base.state.epoch = epoch
                 self.on_epoch_begin()
-                data_iterator = iter(train_dataloader) if train_dataloader is not None else None
+                data_iterator = recovery_data_iterator(self.base)
+                recovery_epoch_initialized(self.base)
                 start_step = self.base.state.global_step - epoch * self.base.train_steps
                 train_steps = min(self.base.train_steps, self.base.train_iters - epoch * self.base.train_steps)
                 for _ in range(start_step, train_steps):

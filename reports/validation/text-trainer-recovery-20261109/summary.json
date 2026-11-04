@@ -1,0 +1,515 @@
+{
+  "date": "2026-11-09",
+  "host": "ascend129",
+  "remote_root": "/home/zbx/hp_texttrainer_recovery_20261109_202040",
+  "versions": {
+    "torch": "2.12.0",
+    "torch-npu": "2.12.0",
+    "mindio-ttp": "26.2.0",
+    "taskd": "26.2.0",
+    "transformers": "5.14.1",
+    "torchdata": "0.11.0",
+    "einops": "0.8.2"
+  },
+  "source_base": "6e00e2ecfe6631213ae830139f07a3d9c9d525a4",
+  "source_hash_encoding": "UTF-8 source files normalized to LF",
+  "tested_source_sha256": {
+    "examples/training_demo/train_text.py": "a012e86f7976b15ac5140044420676100ea0140cecc1125ea7f6603a55d5481e",
+    "examples/training_demo/qwen3_moe/run_parallel_full_offline.sh": "5b58c76d8fdb6e0ced826cd433c4a469e94173b2e2fda69f8ad397cb5214f91b",
+    "examples/training_demo/qwen3_moe/train_parallel_full_offline.yaml": "e723b628b3f216539511eea9164263f4d18403785a76c8081daf3cd7208dd79b",
+    "hyper_parallel/trainer/text_trainer.py": "95d7267507fc74160338ddb5288f477ec5b8f477823d78c5c49ad3f3cdd00eee",
+    "hyper_parallel/trainer/base.py": "cde79cb66a08e2d082b6ac93ad5b30d42b5c4f16302367a8c63ff35358464025",
+    "hyper_parallel/trainer/runtime/fault_tolerance.py": "457b92b854b51b4c25d3ea717f79e53e6b1d1fe035487dc9adfd553b50cb0708",
+    "hyper_parallel/core/fault_tolerance/session.py": "ef32061d949a3f2cdc38c47600a387b9b5b240d530fe5c5f9f7c10c950355f05",
+    "hyper_parallel/core/fault_tolerance/groups.py": "d21b02ceb9c1ed91314011873bc8d9dd07b2ba20400a7fb17aa4e79d3d868710",
+    "hyper_parallel/core/fault_tolerance/topology.py": "78d57f3af683e66a648dbfe1e1564d6522f6814ebf73b803622af566f006b49e",
+    "hyper_parallel/core/fault_tolerance/state.py": "f6735ea2a08d4f8f2052c79108a93bac26d944c6196934b6d9b0b1d905ab37e9",
+    "hyper_parallel/core/fault_tolerance/transport.py": "883bbcb1ed98d9361aaf285ef84f7cb99a9967fc6382be167e29aaa2b20571d1",
+    "hyper_parallel/core/dtensor/dtensor.py": "7e8982b9814abe05800544551ed0ea20db8684f732578fee6fac46d87247e804",
+    "hyper_parallel/core/optimizer/muon.py": "75d4f6e2b07df152516f74ce0fbb04b8486b63509536ee6ce5dd6fc4434fe851",
+    "hyper_parallel/models/_transformers/model_builder.py": "2cef430c8afd4c1f7b8685e0c0bfbdfdadc055c5022dc8ad0279e0482f2af55e",
+    "tests/torch/fault_tolerance/_test_process_recovery.py": "4414a1a8da642887ee1c8ad48f3da3240d0ab6fa818e869c0be0366541ce52c5",
+    "tests/torch/fault_tolerance/text_trainer_recovery.py": "2fccd1517de50ad35040e25131d0c26802ca3bf8ad48878d002a6fd263fdde8b",
+    "tests/torch/fault_tolerance/test_process_recovery.py": "2cc1f1b66b32275a401cc0260a020f53a9c6b558c9e6b84798dbf55ec6d932aa"
+  },
+  "initial_driver_sha256": "37efdacbf3da86d9fe9fa143b054bcb6c026827f2701cac22092772908f0522b",
+  "entrypoint": "examples.training_demo.train_text.main -> TextTrainer(config) -> trainer.train()",
+  "reference": "examples/training_demo/qwen3_moe/run_parallel_full_offline.sh",
+  "recipe_derivation": "full offline recipe with small Qwen3 MoE, FP32, HSDP 2x4 and unsupported options disabled",
+  "model": {
+    "layers": 2,
+    "hidden_size": 64,
+    "experts": 4,
+    "vocab_size": 1024,
+    "sequence_length": 32
+  },
+  "optimizer": "real chained Muon and AdamW, Muon hsdp_replica_count=1",
+  "dataset": "real offline Indexed Dataset and FixedBatchDataLoader",
+  "injection": "SIGKILL after committed step 8; survivors released toward original TextTrainer step 9",
+  "final_step": 12,
+  "instrumentation": "train_step observer calls original method; on_train_end observer calls original then exports acceptance files; Trainer loop and recovery runtime unmodified",
+  "checkpoint_scope": "initial HF weights loaded by original workers; training checkpoint save/restore disabled; replacements repaired from device replicas",
+  "management_boundary": "real MindIO Controller and Processor, real TaskD Manager/Agent and Torch launch; ClusterD decisions and Manager-to-Agent command delivery supplied by test driver",
+  "scope_exclusions": [
+    "full 30B model",
+    "BF16",
+    "TP/EP/CP/PP",
+    "active checkpoint saves",
+    "optimizer-update-midpoint fault",
+    "repeated failures",
+    "physical node/Pod replacement"
+  ],
+  "cases": [
+    {
+      "case": "text_trainer_ranks1",
+      "fault_ranks": [
+        1
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 266.44,
+      "processes": {
+        "event": "complete",
+        "original_pids": {
+          "0": 899424,
+          "1": 899425,
+          "2": 899426,
+          "3": 899427,
+          "4": 899428,
+          "5": 899429,
+          "6": 899430,
+          "7": 899431
+        },
+        "final_pids": {
+          "0": 899424,
+          "1": 903456,
+          "2": 899426,
+          "3": 899427,
+          "4": 899428,
+          "5": 899429,
+          "6": 899430,
+          "7": 899431
+        }
+      },
+      "final_worker_steps": [
+        {
+          "rank": 0,
+          "pid": 899424,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 1,
+          "pid": 903456,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 2,
+          "pid": 899426,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 3,
+          "pid": 899427,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 4,
+          "pid": 899428,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 5,
+          "pid": 899429,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 6,
+          "pid": 899430,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 7,
+          "pid": 899431,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        }
+      ],
+      "device_receives": [
+        {
+          "rank": 1,
+          "source": 5,
+          "step": 8
+        }
+      ],
+      "restored_metrics": [
+        {
+          "rank": 0,
+          "step": 8,
+          "loss": 6.941646575927734,
+          "loss_dict": {
+            "foundation_loss": 6.941646575927734
+          },
+          "grad_norm": 1.0421268939971924,
+          "source_rank": 0
+        },
+        {
+          "rank": 1,
+          "step": 8,
+          "loss": 6.941646575927734,
+          "loss_dict": {
+            "foundation_loss": 6.941646575927734
+          },
+          "grad_norm": 1.0421268939971924,
+          "source_rank": 5
+        },
+        {
+          "rank": 2,
+          "step": 8,
+          "loss": 6.941646575927734,
+          "loss_dict": {
+            "foundation_loss": 6.941646575927734
+          },
+          "grad_norm": 1.0421268939971924,
+          "source_rank": 2
+        },
+        {
+          "rank": 3,
+          "step": 8,
+          "loss": 6.941646575927734,
+          "loss_dict": {
+            "foundation_loss": 6.941646575927734
+          },
+          "grad_norm": 1.0421268939971924,
+          "source_rank": 3
+        },
+        {
+          "rank": 4,
+          "step": 8,
+          "loss": 6.941646575927734,
+          "loss_dict": {
+            "foundation_loss": 6.941646575927734
+          },
+          "grad_norm": 1.0421268939971924,
+          "source_rank": 4
+        },
+        {
+          "rank": 5,
+          "step": 8,
+          "loss": 6.941646575927734,
+          "loss_dict": {
+            "foundation_loss": 6.941646575927734
+          },
+          "grad_norm": 1.0421268939971924,
+          "source_rank": 5
+        },
+        {
+          "rank": 6,
+          "step": 8,
+          "loss": 6.941646575927734,
+          "loss_dict": {
+            "foundation_loss": 6.941646575927734
+          },
+          "grad_norm": 1.0421268939971924,
+          "source_rank": 6
+        },
+        {
+          "rank": 7,
+          "step": 8,
+          "loss": 6.941646099090576,
+          "loss_dict": {
+            "foundation_loss": 6.941646099090576
+          },
+          "grad_norm": 1.0421268939971924,
+          "source_rank": 7
+        }
+      ],
+      "final_progress_provider": {
+        "global_step": 12,
+        "epoch": 1
+      },
+      "final_log_provider": {
+        "step": 12,
+        "loss": 6.951905250549316,
+        "loss_dict": {
+          "foundation_loss": 6.951905250549316
+        },
+        "grad_norm": 1.0229625701904297,
+        "source_rank": 0
+      },
+      "final_loader_state_keys": [
+        "_index_sampler_state",
+        "_sampler_iter_state",
+        "_sampler_iter_yielded",
+        "_num_yielded",
+        "_IterableDataset_len_called",
+        "_shared_seed",
+        "fetcher_state",
+        "dataset_state",
+        "_iterator_finished"
+      ],
+      "exact_state_comparison": "all 8 ranks passed, tensors rtol=0 atol=0"
+    },
+    {
+      "case": "text_trainer_ranks4_5_6_7",
+      "fault_ranks": [
+        4,
+        5,
+        6,
+        7
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 247.21,
+      "processes": {
+        "event": "complete",
+        "original_pids": {
+          "0": 916763,
+          "1": 916767,
+          "2": 916768,
+          "3": 916769,
+          "4": 916770,
+          "5": 916771,
+          "6": 916772,
+          "7": 916773
+        },
+        "final_pids": {
+          "0": 916763,
+          "1": 916767,
+          "2": 916768,
+          "3": 916769,
+          "4": 921574,
+          "5": 921577,
+          "6": 921575,
+          "7": 921573
+        }
+      },
+      "final_worker_steps": [
+        {
+          "rank": 0,
+          "pid": 916763,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 1,
+          "pid": 916767,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 2,
+          "pid": 916768,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 3,
+          "pid": 916769,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 4,
+          "pid": 921574,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 5,
+          "pid": 921577,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 6,
+          "pid": 921575,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 7,
+          "pid": 921573,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        }
+      ],
+      "device_receives": [
+        {
+          "rank": 4,
+          "source": 0,
+          "step": 8
+        },
+        {
+          "rank": 5,
+          "source": 1,
+          "step": 8
+        },
+        {
+          "rank": 6,
+          "source": 2,
+          "step": 8
+        },
+        {
+          "rank": 7,
+          "source": 3,
+          "step": 8
+        }
+      ],
+      "restored_metrics": [
+        {
+          "rank": 0,
+          "step": 8,
+          "loss": 6.941646575927734,
+          "loss_dict": {
+            "foundation_loss": 6.941646575927734
+          },
+          "grad_norm": 1.0421268939971924,
+          "source_rank": 0
+        },
+        {
+          "rank": 1,
+          "step": 8,
+          "loss": 6.941646575927734,
+          "loss_dict": {
+            "foundation_loss": 6.941646575927734
+          },
+          "grad_norm": 1.0421268939971924,
+          "source_rank": 1
+        },
+        {
+          "rank": 2,
+          "step": 8,
+          "loss": 6.941646575927734,
+          "loss_dict": {
+            "foundation_loss": 6.941646575927734
+          },
+          "grad_norm": 1.0421268939971924,
+          "source_rank": 2
+        },
+        {
+          "rank": 3,
+          "step": 8,
+          "loss": 6.941646575927734,
+          "loss_dict": {
+            "foundation_loss": 6.941646575927734
+          },
+          "grad_norm": 1.0421268939971924,
+          "source_rank": 3
+        },
+        {
+          "rank": 4,
+          "step": 8,
+          "loss": 6.941646575927734,
+          "loss_dict": {
+            "foundation_loss": 6.941646575927734
+          },
+          "grad_norm": 1.0421268939971924,
+          "source_rank": 0
+        },
+        {
+          "rank": 5,
+          "step": 8,
+          "loss": 6.941646575927734,
+          "loss_dict": {
+            "foundation_loss": 6.941646575927734
+          },
+          "grad_norm": 1.0421268939971924,
+          "source_rank": 1
+        },
+        {
+          "rank": 6,
+          "step": 8,
+          "loss": 6.941646575927734,
+          "loss_dict": {
+            "foundation_loss": 6.941646575927734
+          },
+          "grad_norm": 1.0421268939971924,
+          "source_rank": 2
+        },
+        {
+          "rank": 7,
+          "step": 8,
+          "loss": 6.941646575927734,
+          "loss_dict": {
+            "foundation_loss": 6.941646575927734
+          },
+          "grad_norm": 1.0421268939971924,
+          "source_rank": 3
+        }
+      ],
+      "final_progress_provider": {
+        "global_step": 12,
+        "epoch": 1
+      },
+      "final_log_provider": {
+        "step": 12,
+        "loss": 6.951905250549316,
+        "loss_dict": {
+          "foundation_loss": 6.951905250549316
+        },
+        "grad_norm": 1.0229625701904297,
+        "source_rank": 0
+      },
+      "final_loader_state_keys": [
+        "_index_sampler_state",
+        "_sampler_iter_state",
+        "_sampler_iter_yielded",
+        "_num_yielded",
+        "_IterableDataset_len_called",
+        "_shared_seed",
+        "fetcher_state",
+        "dataset_state",
+        "_iterator_finished"
+      ],
+      "exact_state_comparison": "all 8 ranks passed, tensors rtol=0 atol=0"
+    }
+  ],
+  "public_launcher": {
+    "case": "public_text_trainer_launcher_rank1",
+    "fault_ranks": [
+      1
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 249.21
+  },
+  "submission_review": {
+    "changes_since_device_validation": "Docstrings and test descriptions only in the files below; executable AST compared against the tested zbx checkout and identical",
+    "executable_ast_matches_tested_source": true,
+    "current_source_sha256_lf": {
+      "hyper_parallel/core/fault_tolerance/session.py": "e07a8bcc6971590c88a47de7d678b1be1180acb90f3d30bffda46e5a54c1495a",
+      "tests/torch/fault_tolerance/_test_process_recovery.py": "5556eee97a6cc07476ab69a30001f147223118ca1335cd0fdc562df3018d29e5",
+      "tests/torch/fault_tolerance/test_process_recovery.py": "dc69aa8ae6ea407b8092d28827ea520b82bebde8a8b6ecd920e5e535c6f1e30b",
+      "tests/torch/fault_tolerance/text_trainer_recovery.py": "2415013021b0cb70364ebfc42a558f99dac132e9aac290c1ca6c24cd10147f50",
+      "tests/ut/fault_tolerance/test_session.py": "8b4959a50ca12465960c5d552d0686c6ee1feaad595583706433778ef9630991",
+      "tests/ut/fault_tolerance/test_bootstrap.py": "b3fab003023ed992f4e65a9d789a86e9a03eaec3f1c994cbdba8c99dbf56b82a"
+    },
+    "existing_quality_findings": {
+      "type_annotation_findings": 13,
+      "complexity_warning_sites": 4,
+      "docstring_findings": 1
+    },
+    "new_quality_findings": 0,
+    "unit_test_marks_scope": "UT follows the hardware-agnostic unit-test rule; arg_mark is checked on the ST launcher"
+  }
+}

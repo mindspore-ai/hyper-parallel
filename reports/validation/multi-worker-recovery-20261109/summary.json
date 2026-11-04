@@ -1,0 +1,174 @@
+{
+  "date": "2026-11-09",
+  "host": "ascend129",
+  "versions": {
+    "torch": "2.12.0",
+    "torch-npu": "2.12.0",
+    "mindio-ttp": "26.2.0",
+    "taskd": "26.2.0"
+  },
+  "layout": {
+    "world_size": 8,
+    "hsdp_mesh": [
+      2,
+      4
+    ],
+    "dtype": "float32",
+    "muon_hsdp_replica_count": 1
+  },
+  "fault_ranks": [
+    4,
+    5,
+    6,
+    7
+  ],
+  "committed_step_at_injection": 8,
+  "resume_step": 9,
+  "final_step": 12,
+  "injection": "Consecutive SIGKILL calls in one failure batch while survivors enter forward step 9",
+  "controller": "Real MindIO Controller hosted by TaskD Manager",
+  "agent": "Real TaskD Agent; one restart message containing ranks 4,5,6,7",
+  "management_boundary": "ClusterD decisions and Manager-to-Agent delivery supplied by the test harness",
+  "fix": "CPU Store fence after all process-group reinit calls and before any recovery collective",
+  "first_attempt": {
+    "directory": "/home/zbx/hp_recovery_metadata_opt_20261106/multi_fault_20261109_104244",
+    "results": [
+      {
+        "case": "hsdp_muon_fp32_taskd_ranks4_7",
+        "exit_code": 1,
+        "elapsed_seconds": 312.57
+      }
+    ],
+    "observation": "Replacement Muon workers blocked in shard-shape all-gather during rebuild"
+  },
+  "unit_tests": "55 passed, 2 warnings, 25 subtests passed in 3.88s",
+  "source_base": "7b60925423c629ff11b3ed85d4bc80f2dfa33f27",
+  "tested_source_sha256": {
+    "hyper_parallel/core/fault_tolerance/groups.py": "6b537f28837d3c342ec8c345ac40fa8d78635ed27d902e5c66b760871708d74f",
+    "tests/torch/fault_tolerance/_test_process_recovery.py": "28967ed34fa373b792935f13a24d5a5d9c27535a186d23472f06aa25698be860",
+    "tests/torch/fault_tolerance/taskd_agent.py": "d982223cb98f2da762485605a648f4bdf716d188f4ae7effe0820d84dd6dfcbe",
+    "tests/ut/fault_tolerance/test_session.py": "1eaebc6ea87f2dcf42c8858057eca9f4e0de85bfcb7da94c4e7483ffa4988418"
+  },
+  "remote_directory": "/home/zbx/hp_recovery_metadata_opt_20261106/multi_fault_fenced_20261109_104950",
+  "cases": [
+    {
+      "case": "hsdp_muon_fp32_taskd_ranks4_7",
+      "exit_code": 0,
+      "elapsed_seconds": 229.31,
+      "device_receives": [
+        {
+          "rank": 4,
+          "source": 0,
+          "step": 8
+        },
+        {
+          "rank": 5,
+          "source": 1,
+          "step": 8
+        },
+        {
+          "rank": 6,
+          "source": 2,
+          "step": 8
+        },
+        {
+          "rank": 7,
+          "source": 3,
+          "step": 8
+        }
+      ],
+      "processes": {
+        "event": "complete",
+        "original_pids": {
+          "0": 3614541,
+          "1": 3614542,
+          "2": 3614543,
+          "3": 3614544,
+          "4": 3614545,
+          "5": 3614546,
+          "6": 3614547,
+          "7": 3614548
+        },
+        "final_pids": {
+          "0": 3614541,
+          "1": 3614542,
+          "2": 3614543,
+          "3": 3614544,
+          "4": 3616849,
+          "5": 3616847,
+          "6": 3616846,
+          "7": 3616848
+        }
+      },
+      "upstream_rpc_counts": {
+        "ReportProcessFault": 2,
+        "ReportStopComplete": 1,
+        "ReportRecoverStrategy": 1,
+        "ReportRecoverStatus": 1
+      },
+      "exact_baseline_comparison": "passed",
+      "signal_span_seconds": 0.017992160050198436,
+      "all_final_cursors_equal_12": true
+    },
+    {
+      "case": "hsdp_adamw_fp32_taskd_ranks4_7",
+      "exit_code": 0,
+      "elapsed_seconds": 224.21,
+      "device_receives": [
+        {
+          "rank": 4,
+          "source": 0,
+          "step": 8
+        },
+        {
+          "rank": 5,
+          "source": 1,
+          "step": 8
+        },
+        {
+          "rank": 6,
+          "source": 2,
+          "step": 8
+        },
+        {
+          "rank": 7,
+          "source": 3,
+          "step": 8
+        }
+      ],
+      "processes": {
+        "event": "complete",
+        "original_pids": {
+          "0": 3630858,
+          "1": 3630859,
+          "2": 3630860,
+          "3": 3630861,
+          "4": 3630862,
+          "5": 3630863,
+          "6": 3630864,
+          "7": 3630865
+        },
+        "final_pids": {
+          "0": 3630858,
+          "1": 3630859,
+          "2": 3630860,
+          "3": 3630861,
+          "4": 3633544,
+          "5": 3633542,
+          "6": 3633545,
+          "7": 3633543
+        }
+      },
+      "upstream_rpc_counts": {
+        "ReportProcessFault": 2,
+        "ReportStopComplete": 1,
+        "ReportRecoverStrategy": 1,
+        "ReportRecoverStatus": 1
+      },
+      "exact_baseline_comparison": "passed",
+      "signal_span_seconds": 0.0016854999121278524,
+      "all_final_cursors_equal_12": true
+    }
+  ],
+  "timing_note": "Elapsed seconds include baseline, bootstrap, repair, exact comparison and teardown; not pure recovery latency."
+}

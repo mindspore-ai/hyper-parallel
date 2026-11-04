@@ -1,0 +1,16 @@
+{
+  "date": "2026-11-10",
+  "host": "ascend129",
+  "remote_directory": "/home/zbx/hp_texttrainer_recovery_20261109_202040/remove_profiler_stop_20261110_204317",
+  "exit_code": 0,
+  "source_hash_encoding": "UTF-8 files normalized to LF",
+  "tested_source_sha256": {
+    "hyper_parallel/trainer/runtime/fault_tolerance.py": "f6ab4a258cdd16ec7a64757ddc45eefbcd2c541e9c14b83dd651abc8c74bec4e",
+    "tests/ut/fault_tolerance/test_trainer.py": "0bc48919fb8d2aee3d79aebb1d32cbe9700b852e433e3844fa54a0456ce16a81"
+  },
+  "cpu_tests": "80 passed, 7 warnings, 53 subtests passed in 4.41s",
+  "change": "Remove the duplicate outer memory_profiler.stop and its unused import; retain native Trainer stop and defer train-end callbacks/distributed teardown until after SDK exit",
+  "validation_scope": "CPU fault tolerance, Base/Text/VLM native loop reentry, once-only lifecycle order and memory profiler lifecycle regressions",
+  "npu_retested": false,
+  "npu_scope_note": "No additional NPU run for removal of the redundant idempotent profiler call; previous deferred-RNG NPU record remains tied to its original source hashes"
+}

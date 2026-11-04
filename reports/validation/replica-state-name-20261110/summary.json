@@ -1,0 +1,18 @@
+{
+  "date": "2026-11-10",
+  "host": "ascend129",
+  "remote_directory": "/home/zbx/hp_texttrainer_recovery_20261109_202040/replica_state_20261110_192155",
+  "exit_code": 0,
+  "source_hash_encoding": "UTF-8 files normalized to LF",
+  "tested_source_sha256": {
+    "hyper_parallel/core/fault_tolerance/state.py": "c67e49fd53a4064fba60e6cefe626c1dd7025fa0ff8aed9db54a81e121151e6a",
+    "hyper_parallel/core/fault_tolerance/transport.py": "f8db86e57066889fa5b8a681248822ae3b3291a20ba27e7a198a1690c200d682",
+    "tests/ut/fault_tolerance/test_state.py": "7317c4e69c2fae4c9accf84e0bac6255445dd69c97a92f54e0ca97171cedfba7",
+    "tests/ut/fault_tolerance/test_transport.py": "c9bffb1abe3015a93058b1c9b3f807231ec0e60606eaad608727fa626778a75e"
+  },
+  "cpu_tests": "72 passed, 2 warnings, 38 subtests passed in 4.24s",
+  "change": "Keep replica_providers as the provider object mapping; rename only the serialized replica snapshot field to replica_state alongside rank_state",
+  "validation_scope": "CPU state snapshot, restore, bank partition, exact donor state merge, direct tensor transfer and Trainer reentry regressions",
+  "npu_retested": false,
+  "npu_scope_note": "No additional NPU run for this snapshot-field rename; prior grouped snapshot NPU evidence remains historical"
+}

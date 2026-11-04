@@ -1,0 +1,278 @@
+{
+  "date": "2026-11-10",
+  "host": "ascend129",
+  "remote_directory": "/home/zbx/hp_texttrainer_recovery_20261109_202040/native_train_smoke_20261110_121240",
+  "source_base": "8c8f48b05717ad7d577fa0dcdc7c6a726dd40309",
+  "source_hash_encoding": "UTF-8 files normalized to LF",
+  "npu_tested_source_sha256": {
+    "hyper_parallel/core/fault_tolerance/session.py": "39bf61a4a1172c765e312301011b9adc719c3a0b83e2c43085e99e7a932c3a10",
+    "hyper_parallel/core/fault_tolerance/state.py": "0f8797ca55bd72aa0ac5521e95e68302c641f070f30055f6ced87eb6434993e5",
+    "hyper_parallel/trainer/runtime/fault_tolerance.py": "44cbe4db3e84a11d918221f17900c401ebb9da50efdaa9992f9693362a5453ff",
+    "hyper_parallel/trainer/base.py": "034767a512a8dbef801f98593ac675b86fc27ba29764e68870f9d0958918a9e4",
+    "hyper_parallel/trainer/text_trainer.py": "43f3c69f64b7a1298de95c5e683774bce077d9ea8894eb7cf79b7008ae6b14e6",
+    "hyper_parallel/trainer/vlm_trainer.py": "5d6354095d4f8122f1dd3d8929339374e8a1a3e4befd9977a0b3eb2a111c512f",
+    "tests/ut/fault_tolerance/test_session.py": "7ee88b42a98139018eb71d5b244a4a903129d329cdd6e02cabce87be057562b9",
+    "tests/ut/fault_tolerance/test_state.py": "82b4356c9cbdd0fdd2579b13027689982b46adb82278186a0f315a8f3526308b",
+    "tests/ut/fault_tolerance/test_trainer.py": "8f210929569e9b6f7af0ea83fcd1b9dea5955ab6db5426023900ac6ad4e2bf3c",
+    "tests/torch/fault_tolerance/text_trainer_recovery.py": "75ded4b3d66813f12999be3502a615e352dfe38e00c3ed2bb7df079d6293c865"
+  },
+  "final_source_sha256": {
+    "hyper_parallel/core/fault_tolerance/session.py": "33b715711aeb0470f41a427c79ed2972ccacc3ba7a6542a47f87abe63a099f2c",
+    "hyper_parallel/core/fault_tolerance/state.py": "0f8797ca55bd72aa0ac5521e95e68302c641f070f30055f6ced87eb6434993e5",
+    "hyper_parallel/trainer/runtime/fault_tolerance.py": "365d4c96dbed63aa18e83d4f3f0716e2d9a40fff3174ce6ecbbf9f0362a67913",
+    "hyper_parallel/trainer/base.py": "034767a512a8dbef801f98593ac675b86fc27ba29764e68870f9d0958918a9e4",
+    "hyper_parallel/trainer/text_trainer.py": "43f3c69f64b7a1298de95c5e683774bce077d9ea8894eb7cf79b7008ae6b14e6",
+    "hyper_parallel/trainer/vlm_trainer.py": "5d6354095d4f8122f1dd3d8929339374e8a1a3e4befd9977a0b3eb2a111c512f",
+    "tests/ut/fault_tolerance/test_session.py": "7ee88b42a98139018eb71d5b244a4a903129d329cdd6e02cabce87be057562b9",
+    "tests/ut/fault_tolerance/test_state.py": "82b4356c9cbdd0fdd2579b13027689982b46adb82278186a0f315a8f3526308b",
+    "tests/ut/fault_tolerance/test_trainer.py": "c6da03e097fdcd6b792b025a42de62b9fff253e763f6a38c9c7f688965c741ed",
+    "tests/torch/fault_tolerance/text_trainer_recovery.py": "75ded4b3d66813f12999be3502a615e352dfe38e00c3ed2bb7df079d6293c865"
+  },
+  "post_npu_docstring_only_changes": [
+    "hyper_parallel/core/fault_tolerance/session.py",
+    "hyper_parallel/trainer/runtime/fault_tolerance.py",
+    "tests/ut/fault_tolerance/test_trainer.py"
+  ],
+  "post_npu_change_verification": "Executable AST identical after removing docstrings; final CPU regression rerun",
+  "versions": {
+    "torch": "2.12.0",
+    "torch-npu": "2.12.0",
+    "mindio-ttp": "26.2.0",
+    "taskd": "26.2.0"
+  },
+  "change": "Invoke each original Trainer train method inside the SDK reentry loop; share lifecycle, iterator, step and optimizer hooks without copying epoch/step loops; preserve native counter timing and capture the committed step in progress snapshots",
+  "cpu_tests": "157 passed, 8 warnings, 106 subtests passed in 5.74s",
+  "cpu_scope": "Fault tolerance, data, Base/Text/VLM Trainer, distributed runtime, native iterator and profiler lifecycle",
+  "cpu_native_loop_coverage": [
+    "BaseTrainer pre-forward counters",
+    "TextTrainer post-optimizer counters",
+    "VLMTrainer post-optimizer counters",
+    "two-epoch reentry",
+    "one-time lifecycle callbacks and deferred teardown",
+    "Muon/AdamW scheduler and exact parameter comparison",
+    "native iterator factory RNG protection"
+  ],
+  "npu_scope": "8-card small Qwen3 MoE TextTrainer, FP32, HSDP 2x4, real offline Indexed Dataset, Muon/AdamW, real TaskD Controller and Agent",
+  "cases": [
+    {
+      "case": "native_text_trainer_reentry",
+      "fault_ranks": [
+        1
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 255.2,
+      "device_receives": [
+        {
+          "rank": 1,
+          "source": 5,
+          "step": 8
+        }
+      ],
+      "processes": {
+        "event": "complete",
+        "original_pids": {
+          "0": 2616123,
+          "1": 2616124,
+          "2": 2616125,
+          "3": 2616126,
+          "4": 2616127,
+          "5": 2616128,
+          "6": 2616129,
+          "7": 2616130
+        },
+        "final_pids": {
+          "0": 2616123,
+          "1": 2621339,
+          "2": 2616125,
+          "3": 2616126,
+          "4": 2616127,
+          "5": 2616128,
+          "6": 2616129,
+          "7": 2616130
+        }
+      },
+      "final_worker_progress": [
+        {
+          "rank": 0,
+          "pid": 2616123,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 1,
+          "pid": 2621339,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 2,
+          "pid": 2616125,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 3,
+          "pid": 2616126,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 4,
+          "pid": 2616127,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 5,
+          "pid": 2616128,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 6,
+          "pid": 2616129,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 7,
+          "pid": 2616130,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        }
+      ],
+      "exact_state_comparison": "All eight ranks matched the uninterrupted baseline with rtol=0 atol=0"
+    },
+    {
+      "case": "native_text_trainer_reentry",
+      "fault_ranks": [
+        4,
+        5,
+        6,
+        7
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 284.51,
+      "device_receives": [
+        {
+          "rank": 7,
+          "source": 3,
+          "step": 8
+        },
+        {
+          "rank": 4,
+          "source": 0,
+          "step": 8
+        },
+        {
+          "rank": 6,
+          "source": 2,
+          "step": 8
+        },
+        {
+          "rank": 5,
+          "source": 1,
+          "step": 8
+        }
+      ],
+      "processes": {
+        "event": "complete",
+        "original_pids": {
+          "0": 2634180,
+          "1": 2634181,
+          "2": 2634182,
+          "3": 2634183,
+          "4": 2634184,
+          "5": 2634185,
+          "6": 2634186,
+          "7": 2634187
+        },
+        "final_pids": {
+          "0": 2634180,
+          "1": 2634181,
+          "2": 2634182,
+          "3": 2634183,
+          "4": 2639142,
+          "5": 2639140,
+          "6": 2639139,
+          "7": 2639141
+        }
+      },
+      "final_worker_progress": [
+        {
+          "rank": 0,
+          "pid": 2634180,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 1,
+          "pid": 2634181,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 2,
+          "pid": 2634182,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 3,
+          "pid": 2634183,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 4,
+          "pid": 2639142,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 5,
+          "pid": 2639140,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 6,
+          "pid": 2639139,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        },
+        {
+          "rank": 7,
+          "pid": 2639141,
+          "step": 12,
+          "global_step": 12,
+          "epoch": 0
+        }
+      ],
+      "exact_state_comparison": "All eight ranks matched the uninterrupted baseline with rtol=0 atol=0"
+    }
+  ],
+  "management_boundary": "ClusterD strategy and Manager-to-Agent delivery supplied by the test driver; no physical node or Pod replacement",
+  "scope_exclusions": [
+    "VLM full multimodal NPU recovery",
+    "active checkpoint writes",
+    "TP/EP native Trainer NPU recovery",
+    "continuous repeated failures",
+    "optimizer mid-update and metadata-mirror failure windows"
+  ]
+}

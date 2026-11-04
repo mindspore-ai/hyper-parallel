@@ -31,6 +31,7 @@ from hyper_parallel.components.optim.mixed_precision_optimizer import (
     MixedPrecisionOptimizer,
 )
 from hyper_parallel.core.distributed_checkpoint.utils import flatten_state_dict
+from hyper_parallel.core.fault_tolerance.groups import is_recovery_reboot
 from hyper_parallel.models._transformers.model_builder import (
     validate_model_init_dtype,
 )
@@ -449,6 +450,12 @@ class CheckpointerCallback(Callback):
 
     def _load_checkpoint(self) -> None:
         """Restore a checkpoint into the trainer's live objects."""
+        # Replica repair has already restored live state. Loading the initial
+        # checkpoint again would overwrite it and enter unmatched DCP collectives.
+        session = vars(self.trainer).get("recovery")
+        if is_recovery_reboot() or (session is not None and session.train_state.rng_restore_pending):
+            logger.info("Skipping initial disk checkpoint restore during worker recovery")
+            return
         restore_path = self._resolve_restore_path()
         if restore_path is None:
             return

@@ -1,0 +1,40 @@
+{
+  "date": "2026-11-11",
+  "host": "local Windows",
+  "tests_run": 13,
+  "passed": true,
+  "method": "Compile selected original source AST nodes; run actual TrainState, Session completion and Trainer hook methods with standard-library RNG API substitutes",
+  "scope": [
+    "normal epochs skip both finalizers",
+    "one completion after initialization",
+    "repeated rollbacks rearm completion",
+    "failed RNG application stays pending",
+    "failed iterator construction stays pending",
+    "disabled recovery",
+    "native begin is not intercepted in recovery context",
+    "initial checkpoint progress precedes snapshot publication",
+    "generic Session startup remains compatible",
+    "initial layout changes fail explicitly",
+    "checkpoint skip applies to replacement and surviving recovery workers",
+    "tqdm reentry closes its old local progress bar",
+    "native startup hook follows full begin method"
+  ],
+  "source_hash_encoding": "UTF-8 files normalized to LF",
+  "tested_source_sha256": {
+    "hyper_parallel/core/fault_tolerance/state.py": "f0b63af0ee39360842c8c8aa36c2dc679a288b469d0a354c6204713b53f86e99",
+    "hyper_parallel/core/fault_tolerance/session.py": "9bbde188b03b928b098bbef6a97158f3112053ff5d5d4617d3e17b818742c597",
+    "hyper_parallel/trainer/runtime/fault_tolerance.py": "ef3838302d607b913ee11b4e2049570e470e623756e3bd936c4b153a8aa721e6",
+    "hyper_parallel/trainer/base.py": "30948a5188cfc2bd6be68c2fd56684b5214c5948b1ddc0f22ff053f28a90d698",
+    "hyper_parallel/trainer/text_trainer.py": "f4c0571fce8aee7af3d5f80562dd707db9a229792b0480b7f435f037afb31166",
+    "hyper_parallel/trainer/vlm_trainer.py": "26eff58d77d2332cd026cfd085d4a5ccb72bd4d445c1f6d9404dc50f7abf585d",
+    "hyper_parallel/trainer/callbacks/checkpoint_callback.py": "e8b2fcb44215ba0ca3b26194ed386397cc3bd41a868596c9c373ecd6221d7e7e",
+    "hyper_parallel/trainer/callbacks/tqdm_callback.py": "5a1aee64cb4e87ad9cb222f1c268e8760222f945998de9ec61de1924c10083de"
+  },
+  "repository_ut_run": false,
+  "npu_retested": false,
+  "limitations": [
+    "zbx SSH port 22 timed out; no current remote test result",
+    "ModelOptimizerState is a descriptor substitute; actual tensor binding and DCP behavior are not exercised",
+    "local Torch and pytest unavailable; protocol checks do not exercise real Torch/NPU RNG or full Trainer loops"
+  ]
+}

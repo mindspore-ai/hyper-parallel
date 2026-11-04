@@ -19,7 +19,7 @@ import unittest
 from io import StringIO
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from hyper_parallel.trainer.callbacks import TqdmCallback
 from hyper_parallel.trainer.state import TrainerState
@@ -37,6 +37,21 @@ class _FakeTqdm:
 
 class TestTqdmCallback(unittest.TestCase):
     """Verify interactive and redirected progress output behavior."""
+
+    def test_reentry_closes_old_progress_bar_before_recreating_it(self) -> None:
+        """Feature: Locally reentrant progress-bar initialization.
+
+        Description: Call train-begin again on a surviving worker at its restored progress.
+        Expectation: The old bar closes before creating the new bar at the committed step.
+        """
+        callback = TqdmCallback(self._build_trainer())
+        old_bar, new_bar = MagicMock(), MagicMock()
+        callback._progress_bar = old_bar
+        with patch.object(callback, "_create_progress_bar", return_value=new_bar) as create:
+            callback.on_train_begin(TrainerState(global_step=3))
+        old_bar.close.assert_called_once()
+        create.assert_called_once_with(total=5, initial=3)
+        self.assertIs(callback._progress_bar, new_bar)
 
     @staticmethod
     def _build_trainer() -> SimpleNamespace:

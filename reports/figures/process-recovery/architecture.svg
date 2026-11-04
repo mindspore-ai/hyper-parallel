@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1180" viewBox="0 0 1200 1180">
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10Z" fill="#506a84"/></marker></defs>
+<style>text{font-family:"Microsoft YaHei","Segoe UI",sans-serif;fill:#172b40;font-size:20px} .edge{fill:none;stroke:#506a84;stroke-width:2;marker-end:url(#arrow)} .label{font-size:18px;fill:#415b74} .box{fill:#edf4fb;stroke:#7b9cba;stroke-width:1.5} .module{fill:#fff;stroke:#8ea8be;stroke-width:1.5}</style>
+<rect width="1200" height="1180" fill="white"/>
+<text x="600" y="36" text-anchor="middle" style="font-size:25px;font-weight:600">HyperParallel 进程级快恢总体架构</text>
+
+<rect x="110" y="70" width="420" height="84" rx="8" class="box"/>
+<text x="320.0" y="105.0" text-anchor="middle" font-size="20">
+<tspan x="320.0" dy="0">rank 0 worker 托管</tspan>
+<tspan x="320.0" dy="28">Controller（同进程后台线程）</tspan>
+</text>
+<rect x="670" y="70" width="420" height="84" rx="8" class="box"/>
+<text x="880.0" y="105.0" text-anchor="middle" font-size="20">
+<tspan x="880.0" dy="0">TaskD Manager 托管</tspan>
+<tspan x="880.0" dy="28">Controller</tspan>
+</text>
+<path d="M320 154 V178 H500 V204" class="edge"/>
+<path d="M880 154 V178 H700 V204" class="edge"/>
+<rect x="400" y="204" width="400" height="84" rx="8" class="box"/>
+<text x="600.0" y="239.0" text-anchor="middle" font-size="20">
+<tspan x="600.0" dy="0">MindIO Controller</tspan>
+<tspan x="600.0" dy="28">两种托管方式二选一</tspan>
+</text>
+<path d="M600 288 V356" class="edge" marker-start="url(#arrow)"/>
+<text x="785" y="327" text-anchor="middle" class="label" font-size="20">
+<tspan x="785" dy="0">心跳、状态、恢复命令</tspan>
+</text>
+<rect x="400" y="356" width="400" height="84" rx="8" class="box"/>
+<text x="600.0" y="391.0" text-anchor="middle" font-size="20">
+<tspan x="600.0" dy="0">MindIO Processor</tspan>
+<tspan x="600.0" dy="28">每个训练 worker 内</tspan>
+</text>
+<path d="M470 510 V440" class="edge"/>
+<text x="367" y="480" text-anchor="middle" class="label" font-size="20">
+<tspan x="367" dy="0">注册回调</tspan>
+</text>
+<path d="M730 440 V510" class="edge"/>
+<text x="853" y="480" text-anchor="middle" class="label" font-size="20">
+<tspan x="853" dy="0">触发恢复回调</tspan>
+</text>
+<rect x="400" y="510" width="400" height="84" rx="8" class="box"/>
+<text x="600.0" y="545.0" text-anchor="middle" font-size="20">
+<tspan x="600.0" dy="0">RecoverySession</tspan>
+<tspan x="600.0" dy="28">恢复会话与训练生命周期协调</tspan>
+</text>
+<rect x="40" y="510" width="290" height="84" rx="8" class="box"/>
+<text x="185.0" y="545.0" text-anchor="middle" font-size="20">
+<tspan x="185.0" dy="0">训练主线程</tspan>
+<tspan x="185.0" dy="28">更新窗口 / 步边界 / 重入</tspan>
+</text>
+<path d="M330 552 H400" class="edge"/>
+<rect x="870" y="510" width="290" height="84" rx="8" class="box"/>
+<text x="1015.0" y="545.0" text-anchor="middle" font-size="20">
+<tspan x="1015.0" dy="0">launcher / TaskD Agent</tspan>
+<tspan x="1015.0" dy="28">故障 worker 生命周期</tspan>
+</text>
+<path d="M600 594 V648" class="edge"/>
+<rect x="40" y="648" width="1120" height="350" rx="12" fill="#f7fafc" stroke="#a9bdcf" stroke-width="1.5"/>
+<text x="600" y="682" text-anchor="middle" class="label" font-size="20">
+<tspan x="600" dy="0">恢复会话调用的状态与运行时模块</tspan>
+</text>
+<rect x="65" y="710" width="330" height="108" rx="8" class="module"/>
+<text x="230.0" y="757.0" text-anchor="middle" font-size="20">
+<tspan x="230.0" dy="0">GroupRegistry</tspan>
+<tspan x="230.0" dy="28">登记并原位重建 HCCL 组</tspan>
+</text>
+<rect x="435" y="710" width="330" height="108" rx="8" class="module"/>
+<text x="600.0" y="743.0" text-anchor="middle" font-size="20">
+<tspan x="600.0" dy="0">ModelRecoveryAdapter</tspan>
+<tspan x="600.0" dy="28">中断迭代清理</tspan>
+<tspan x="600.0" dy="28">分片调度状态复位</tspan>
+</text>
+<rect x="805" y="710" width="330" height="108" rx="8" class="module"/>
+<text x="970.0" y="743.0" text-anchor="middle" font-size="20">
+<tspan x="970.0" dy="0">ReplicaTopology</tspan>
+<tspan x="970.0" dy="28">模型布局 + 优化器状态归属</tspan>
+<tspan x="970.0" dy="28">推导完整副本</tspan>
+</text>
+<rect x="250" y="853" width="330" height="108" rx="8" class="module"/>
+<text x="415.0" y="900.0" text-anchor="middle" font-size="20">
+<tspan x="415.0" dy="0">ReplicaTransport</tspan>
+<tspan x="415.0" dy="28">从供体 device 传输状态</tspan>
+</text>
+<rect x="620" y="853" width="330" height="108" rx="8" class="module"/>
+<text x="785.0" y="886.0" text-anchor="middle" font-size="20">
+<tspan x="785.0" dy="0">TrainState /</tspan>
+<tspan x="785.0" dy="28">DeviceMetadataBank</tspan>
+<tspan x="785.0" dy="28">各 rank 元信息与 buffer</tspan>
+</text>
+<path d="M415 961 V1020 H500 V1052" class="edge"/>
+<text x="267" y="1031" text-anchor="middle" class="label" font-size="20">
+<tspan x="267" dy="0">参数、主参数、优化器槽</tspan>
+</text>
+<path d="M1015 594 V620 H1182 V1096 H800" class="edge"/>
+<text x="1002" y="1031" text-anchor="middle" class="label" font-size="20">
+<tspan x="1002" dy="0">重拉故障进程</tspan>
+</text>
+<rect x="400" y="1052" width="400" height="88" rx="8" class="box"/>
+<text x="600.0" y="1089.0" text-anchor="middle" font-size="20">
+<tspan x="600.0" dy="0">替代 worker</tspan>
+<tspan x="600.0" dy="28">构造本地对象并接收恢复状态</tspan>
+</text>
+</svg>
