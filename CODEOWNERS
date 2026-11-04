@@ -10,12 +10,12 @@
 * @yangzhenzhang02 @suteng @yaoyifanx
 
 # The maintainers of hyper_parallel/auto_parallel.
-/hyper_parallel/auto_parallel/ @bj-wang @Hrxwhr
+/hyper_parallel/auto_parallel/ @Hrxwhr
 /hyper_parallel/auto_parallel/fast-tuner/ @ChaoRanCaaat
 
 
 # The maintainers of hyper_parallel/collectives.
-/hyper_parallel/collectives/ @changzherui1 @changzherui
+/hyper_parallel/collectives/ @yangzhenzhang02
 
 
 # The maintainers of hyper_parallel/core.
@@ -42,13 +42,13 @@
 /tests/torch/distributed_checkpoint/ @zhangbuxue @xiaoyuxing-010818
 /tests/torch/fully_shard/ @mxysfive
 /tests/torch/pipeline_parallel/ @lichen666
-/tests/torch/process_group/ @changzherui1 @changzherui
+/tests/torch/process_group/ @yangzhenzhang02
 /tests/torch/shard/ @yangzhenzhang02
 
 
 # The maintainers of other code directories.
 /.jenkins/ @yangzhenzhang02
-/docs/ @yangzhenzhang02 @gemini524
+/docs/ @yangzhenzhang02
 /requirements.txt  @yangzhenzhang02
 /setup.py  @yangzhenzhang02
 
@@ -57,15 +57,15 @@
 /tests/torch/multicore/ @davidhe91 @Probiotics5333
 
 # Hyper-RL code and Qwen3 adapters.
-/hyper_parallel/rl/ @yangzhenzhang02 @suteng @yaoyifanx @bj-wang
-/hyper_parallel/models/qwen3/ @yangzhenzhang02 @suteng @yaoyifanx @bj-wang
+/hyper_parallel/rl/ @yangzhenzhang02 @suteng @yaoyifanx
+/hyper_parallel/models/qwen3/ @yangzhenzhang02 @suteng @yaoyifanx
 
 # Hyper-RL tests.
-/tests/ut/rl/ @liuchongming74 @bj-wang
-/hyper_parallel/rl/tests/ @yangzhenzhang02 @bj-wang
-/tests/common/rl_st_cases.py @liuchongming74 @bj-wang
+/tests/ut/rl/ @liuchongming74
+/hyper_parallel/rl/tests/ @yangzhenzhang02
+/tests/common/rl_st_cases.py @liuchongming74
 
 # Hyper-RL documentation and development rules.
-/docs/rl-*.md @yangzhenzhang02 @gemini524 @bj-wang
-/.agent/rules/hyper-rl.md @yangzhenzhang02 @suteng @yaoyifanx @bj-wang
-/.agent/rules/rl/ @yangzhenzhang02 @suteng @yaoyifanx @bj-wang
+/docs/rl-*.md @yangzhenzhang02
+/.agent/rules/hyper-rl.md @yangzhenzhang02 @suteng @yaoyifanx
+/.agent/rules/rl/ @yangzhenzhang02 @suteng @yaoyifanx
