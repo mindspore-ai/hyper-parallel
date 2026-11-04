@@ -216,11 +216,15 @@ class HyperParallelArguments:
         )
         default_plan_overrides = [
             {
-                "match": "*.self_attn",
+                "match": "*.self_attn.forward",
                 "when": "cp",
-                "inner_target": "self",
-                "inner_wrapper": "sdpa_hf",
-                "region_dispatch": False,
+                "replace": {
+                    "kind": "method",
+                    "implementation": (
+                        "hyper_parallel.distributed.context_parallel.wrappers."
+                        "sdpa_hf_cp_wrapper"
+                    ),
+                },
             }
         ]
 
