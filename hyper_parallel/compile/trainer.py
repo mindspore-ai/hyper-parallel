@@ -232,6 +232,10 @@ class GraphTrainer:
 
         return losses
 
+    def close(self) -> None:
+        """Release the compiler's captured graphs and coordination resources."""
+        self._compiler.close()
+
     def _init_optimizer(self):
         """Initialize optimizer on the model's (FSDP-sharded) parameters.
 

@@ -48,6 +48,7 @@ from .pass_config import (
 )
 from .graph_parallel_plan import GraphParallelPlan
 from .passes.pipeline import PassPipeline
+from .passes.aclgraph_runtime import teardown_aclgraph
 from .tracer.dynamic_shapes import normalize_dynamic_arg_dims
 from .tracer.graph_tracer import run_traced_graph, trace_model_graph
 
@@ -189,13 +190,12 @@ class GraphCompiler:
         pipeline = PassPipeline.from_config(self.pass_config, self.parallel_plan)
 
         pass_kwargs = self._build_pass_kwargs()
-        # Terminal backend compilation (InductorPass) sizes its regions from
-        # the tracer's fake example inputs; every other pass ignores them.
+        # Backend compilation and capture passes use fake inputs to refresh
+        # metadata on regions transformed by earlier passes.
         pass_kwargs["example_inputs"] = joint_graph.example_inputs
 
-        # Passes mutate ``graph_module`` in place and return it, so the
-        # transformed graph lives on ``joint_graph`` for ``forward_backward``.
-        pipeline.run(joint_graph.graph_module, **pass_kwargs)
+        # Partitioning passes may return a new GraphModule.
+        joint_graph.graph_module = pipeline.run(joint_graph.graph_module, **pass_kwargs)
 
         if joint_graph.input_guards is not None:
             joint_graph.input_guards.refresh()
@@ -232,6 +232,11 @@ class GraphCompiler:
         """Register a no-arg hook run immediately before first compilation."""
         self._pytree_pre_hook = hook
         return self
+
+    def close(self) -> None:
+        """Release captured graphs before distributed process-group teardown."""
+        if self._joint_graph is not None:
+            teardown_aclgraph(self._joint_graph.graph_module)
 
     def to(self, device: torch.device) -> "GraphCompiler":
         """Move the model to ``device`` and remember it for graph execution."""

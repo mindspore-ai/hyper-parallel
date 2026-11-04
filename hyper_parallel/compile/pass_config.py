@@ -35,6 +35,7 @@ __all__ = [
     "PassConfig",
     "PP_SCHEDULES",
     "INDUCTOR_MODES",
+    "ACLGRAPH_MODES",
     "DP_MODES",
     "normalize_dp_mode",
     "build_pass_config_from_trainer_config",
@@ -56,6 +57,8 @@ PP_SCHEDULES = ("gpipe", "1f1b", "interleaved_1f1b", "vpp")
 #                side-effectful nodes stay eager (see InductorPass)
 #   "full"     - compile the whole joint graph as one Inductor region
 INDUCTOR_MODES = ("off", "regional", "full")
+
+ACLGRAPH_MODES = ("off", "static", "dynamic")
 
 # Schedule names that can drive multiple virtual stages per physical rank.
 _INTERLEAVED_SCHEDULES = ("interleaved_1f1b", "vpp")
@@ -201,6 +204,11 @@ class PassConfig:
             compiled regions (keys validated by ``torch._inductor.config``),
             e.g. ``{"reorder_for_peak_memory": True}``. ``"full"`` mode
             always sets ``reorder_for_peak_memory=True`` unless overridden.
+        aclgraph_mode: NPU joint-graph capture: ``"off"`` (default),
+            ``"static"`` (reject changed replay inputs), or ``"dynamic"``
+            (coordinate recapture across ranks). Host work stays eager.
+            Supports regional Inductor compilation before capture; PP and
+            full Inductor compilation remain unsupported.
 
     Note:
         ``fsdp_enabled`` / ``pp_enabled`` no longer probe
@@ -227,6 +235,7 @@ class PassConfig:
     max_in_flight_gb: float = 0.25
     inductor_mode: str = "off"
     inductor_configs: Optional[Dict[str, Any]] = None
+    aclgraph_mode: str = "off"
 
     def __post_init__(self) -> None:
         self.dp_mode = normalize_dp_mode(self.dp_mode)
@@ -245,6 +254,14 @@ class PassConfig:
         self._validate_flags()
         self._validate_dp()
         self._validate_pp()
+        self._validate_aclgraph()
+
+    def _validate_aclgraph(self) -> None:
+        """Validate capture mode and the initial joint-FX execution boundary."""
+        if self.aclgraph_mode not in ACLGRAPH_MODES:
+            raise ValueError(f"aclgraph_mode must be one of {ACLGRAPH_MODES}, got {self.aclgraph_mode!r}")
+        if self.aclgraph_mode != "off" and (self.pp_enabled or self.inductor_mode == "full"):
+            raise ValueError("ACLGraph currently requires pp_enabled=False and inductor_mode in ('off', 'regional')")
 
     def _validate_flags(self) -> None:
         """Validate boolean flags and the overlap memory budget."""
@@ -367,4 +384,5 @@ def build_pass_config_from_trainer_config(
             compile_config, "fsdp_overlap_grad_reduce", True
         ),
         max_in_flight_gb=getattr(compile_config, "max_in_flight_gb", 0.25),
+        aclgraph_mode=getattr(compile_config, "aclgraph_mode", "off"),
     )

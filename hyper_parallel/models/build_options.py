@@ -44,7 +44,7 @@ import logging
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Union
 
 import torch  # pylint: disable=forbidden-backend-import
 
@@ -123,6 +123,8 @@ class CompileConfig:
     ``max_in_flight_gb`` follows PyTorch's overlap scheduler naming and binary
     units; here it bounds early all-gather replicas until first use, per phase.
     Eager FSDP2 module prefetch depths do not configure these graph passes.
+    ``aclgraph_mode`` optionally records NPU joint-graph regions, with static
+    replay guards or coordinated dynamic recapture. It defaults to ``"off"``.
     """
 
     enabled: bool = False
@@ -134,10 +136,11 @@ class CompileConfig:
     options: Optional[dict[str, Any]] = None
     dynamo_cache_size_limit: int = 256
     # Joint-graph input paths, e.g. model_inputs.input_ids: [0, 1].
-    dynamic_arg_dims: Optional[dict[str, int | list[int]]] = None
+    dynamic_arg_dims: Optional[dict[str, Union[int, list[int]]]] = None
     fsdp_allgather_prefetch: bool = True
     fsdp_overlap_grad_reduce: bool = True
     max_in_flight_gb: float = 0.25
+    aclgraph_mode: str = "off"
 
     def selects_graph_compiler(self) -> bool:
         """Return whether this config selects the graph-compiler trainer path."""
@@ -153,6 +156,10 @@ class CompileConfig:
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"compile.{name} must be a bool")
         self._validate_max_in_flight_gb()
+        if self.aclgraph_mode not in ("off", "static", "dynamic"):
+            raise ValueError("compile.aclgraph_mode must be 'off', 'static', or 'dynamic'")
+        if self.aclgraph_mode != "off" and not self.selects_graph_compiler():
+            raise ValueError("compile.aclgraph_mode requires enabled=True and use_joint_graph=True")
         if self.dynamic_arg_dims is not None and not isinstance(self.dynamic_arg_dims, dict):
             raise ValueError("compile.dynamic_arg_dims must be a mapping or None")
         if not isinstance(self.mode, str) or not self.mode.strip():

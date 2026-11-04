@@ -48,7 +48,7 @@ class TestBuildOptionsFields(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_compile_config_fields(self):
-        """CompileConfig field order and defaults stay unchanged after the move."""
+        """CompileConfig keeps stable defaults, with ACLGraph explicitly opt-in."""
         self.assertEqual(
             _field_snapshot(CompileConfig),
             [
@@ -64,6 +64,7 @@ class TestBuildOptionsFields(unittest.TestCase):
                 ("fsdp_allgather_prefetch", "True"),
                 ("fsdp_overlap_grad_reduce", "True"),
                 ("max_in_flight_gb", "0.25"),
+                ("aclgraph_mode", "'off'"),
             ],
         )
 

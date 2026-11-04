@@ -56,9 +56,10 @@ a warning, leaves the graph untouched and records ``inductor_compiled =
 
 Contract notes:
 
-- The pass must run LAST: after compilation the FX graph is a thin wrapper
-  around the compiled callable and is no longer authoritative for
-  graph-level passes. PP stage subgraphs are compiled through the schedule's
+- This pass runs after all graph optimizations. After compilation the FX
+  graph contains opaque compiled calls. ACLGraph may subsequently wrap these
+  calls using their preserved metadata, without rewriting their internals.
+  PP stage subgraphs are compiled through the schedule's
   ``map_stage_graphs`` hook, so the stub remains the outer entry point.
 - ``regional_inductor`` switches a compiled graph module to the boxed calling
   convention (``forward(self, args_list)``); the pass resets it to the
@@ -83,10 +84,17 @@ from torch import fx, nn
 from torch._subclasses import FakeTensor
 from torch.fx.graph import CodeGen
 from torch.fx.node import _side_effectful_functions
-from torch.fx.passes.fake_tensor_prop import FakeTensorProp
 
 from ..pass_config import PassConfig
 from .base import GraphPass
+from .graph_metadata import (
+    COMPILED_MUTATIONS_META,
+    COMPILED_REGION_META,
+    is_host_node,
+    propagate_fake_values,
+    tensor_storages,
+    written_nodes,
+)
 
 _LOG = logging.getLogger(__name__)
 
@@ -146,7 +154,7 @@ def _placeholder_fake_args(gm: fx.GraphModule) -> list:
     return args
 
 
-def _propagate_fake_vals(gm: fx.GraphModule) -> fx.GraphModule:
+def _propagate_fake_vals(gm: fx.GraphModule, model: Optional[nn.Module] = None) -> fx.GraphModule:
     """Fill ``meta["val"]`` on nodes inserted after tracing (FSDP collectives,
     pad views, reshard frees) so ``regional_inductor`` can size each region.
 
@@ -161,8 +169,7 @@ def _propagate_fake_vals(gm: fx.GraphModule) -> fx.GraphModule:
             "carry fake meta['val'] tensors"
         )
     fake_args = _placeholder_fake_args(gm)
-    FakeTensorProp(gm, fake_mode).propagate_dont_convert_inputs(*fake_args)
-    return gm
+    return propagate_fake_values(gm, tuple(fake_args), model)
 
 
 def _node_is_comm(node: fx.Node) -> bool:
@@ -276,8 +283,22 @@ def _tag_node(node: fx.Node, inductor_configs: Optional[Dict[str, Any]]) -> None
     }
 
 
+def _mark_compiled_regions(graph_module, original_targets, mutated_storages):
+    # Only functions installed by this compiler are capture candidates. User
+    # Python helpers remain eager even when their output metadata is on device.
+    for node in graph_module.graph.nodes:
+        if node.op != "call_function" or node.target == original_targets.get(node):
+            continue
+        if isinstance(node.target, torch._ops.OpOverload) or node.target is operator.getitem:
+            continue
+        node.meta[COMPILED_REGION_META] = True
+        node.meta[COMPILED_MUTATIONS_META] = tuple(
+            index for index, value in enumerate(node.all_input_nodes) if tensor_storages(value) & mutated_storages
+        )
+
+
 class InductorPass(GraphPass):
-    """Terminal backend compilation pass (TorchInductor).
+    """Backend compilation after graph optimizations and before optional capture.
 
     See the module docstring for the mode semantics, the numerics policy and
     the calling-convention contract.
@@ -335,7 +356,7 @@ class InductorPass(GraphPass):
                     "JointGraph.example_inputs) to size compiled regions"
                 )
             if _regional_inductor_available():
-                self._compile_graph(graph_module, pass_config, example_inputs)
+                self._compile_graph(graph_module, pass_config, example_inputs, model=kwargs.get("model"))
                 compiled = True
             else:
                 self._warn_unavailable(mode)
@@ -405,6 +426,7 @@ class InductorPass(GraphPass):
         graph_module: fx.GraphModule,
         pass_config: PassConfig,
         example_inputs: Optional[Sequence[Any]],
+        model: Optional[nn.Module] = None,
     ) -> fx.GraphModule:
         """Compile one FX graph (joint graph or one PP stage subgraph).
 
@@ -414,9 +436,12 @@ class InductorPass(GraphPass):
         """
         mode = pass_config.inductor_mode
         output_spec, graph_module = _flatten_nested_outputs(graph_module)
-        _propagate_fake_vals(graph_module)
-        if example_inputs is None:
-            example_inputs = _placeholder_fake_args(graph_module)
+        _propagate_fake_vals(graph_module, model)
+        example_inputs = _placeholder_fake_args(graph_module)
+        if any(isinstance(value, torch.Tensor) and value.device.type == "npu" for value in example_inputs):
+            # standalone_compile bypasses Dynamo's lazy NPU backend setup.
+            npu_dynamo = importlib.import_module("torch_npu.utils._dynamo")
+            npu_dynamo.register_inductor_npu()
         _LOG.info(
             "InductorPass: compiling graph in %r mode (%d placeholders, %d nodes)",
             mode,
@@ -427,7 +452,13 @@ class InductorPass(GraphPass):
         if mode == "full":
             self._tag_full(graph_module, pass_config.inductor_configs)
         else:
-            self._tag_regional(graph_module, pass_config.inductor_configs)
+            capture_enabled = pass_config.aclgraph_mode != "off"
+            configs = dict(pass_config.inductor_configs or {})
+            if capture_enabled:
+                # ACLGraph owns recording; nested backend graph capture cannot
+                # run while the outer region is being recorded.
+                configs["triton.cudagraphs"] = False
+            self._tag_regional(graph_module, configs, preserve_host_work=capture_enabled)
 
         # Imported lazily so this module does not pull in the (heavy)
         # TorchInductor stack unless compilation actually runs.
@@ -460,7 +491,12 @@ class InductorPass(GraphPass):
             # ``regional_inductor`` consumes these on torch releases whose
             # signature expects example inputs; newer releases size regions
             # from the nodes' fake ``meta["val"]`` instead.
+            original_targets = {node: node.target for node in graph_module.graph.nodes}
+            mutated_storages = set().union(*(
+                tensor_storages(written) for node in graph_module.graph.nodes for written in written_nodes(node)
+            ))
             regional_inductor(graph_module, example_inputs)
+            _mark_compiled_regions(graph_module, original_targets, mutated_storages)
 
         # regional_inductor compiles regions with the boxed calling
         # convention (one mutable args list); reset to the default positional
@@ -504,7 +540,8 @@ class InductorPass(GraphPass):
 
     @staticmethod
     def _tag_regional(
-        graph_module: fx.GraphModule, inductor_configs: Optional[Dict[str, Any]]
+        graph_module: fx.GraphModule, inductor_configs: Optional[Dict[str, Any]],
+        *, preserve_host_work: bool = False,
     ) -> None:
         """Tag functional compute nodes, keeping comms and side effects eager.
 
@@ -513,9 +550,21 @@ class InductorPass(GraphPass):
         the collective launch/wait nodes remain plain FX nodes so the overlap
         passes' scheduling decisions stay observable at runtime.
         """
+        region_id = 0
+        in_region = False
         for node in graph_module.graph.nodes:
             if node.op not in ("call_function", "call_method"):
                 continue
             if _node_is_comm(node) or _node_is_side_effectful(node):
+                in_region = False
                 continue
+            if preserve_host_work and is_host_node(node):
+                in_region = False
+                continue
+            if not in_region:
+                region_id += 1
+                in_region = True
             _tag_node(node, inductor_configs)
+            # Capability partitioning otherwise merges non-adjacent compute
+            # across storage frees, delaying a parameter read until after free.
+            node.meta["custom"]["compile_with_inductor"]["inductor_region"] = region_id

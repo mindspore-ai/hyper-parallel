@@ -41,14 +41,16 @@ pass_config = PassConfig(enable_overlap=True)
 
 ```text
 DeadCodeElimination → CanonicalizeGraph → FSDPPass
-    → AutoOverlapPass → FsdpOverlapPass → [PP: PpPass] → [Inductor: InductorPass]
+    → AutoOverlapPass → FsdpOverlapPass
+    → [PP: PpPass] → [Inductor: InductorPass] → [ACLGraph: ACLGraphPass]
 ```
 
 `PpPass` runs last among the graph-level passes so every pass still sees the
 joint graph; it then replaces it with the schedule stub. `InductorPass`
 (when `inductor_mode` is enabled) is TERMINAL: it lowers the graph to
 TorchInductor kernels, after which the FX graph wraps the compiled callable
-and no further graph-level pass may run. With PP enabled it compiles the
+and no further graph optimization may run. Optional `ACLGraphPass` then wraps
+executable regions without changing compiled kernels. With PP enabled it compiles the
 schedule's per-stage forward/backward subgraphs instead of the stub (see
 below).
 
@@ -140,6 +142,84 @@ pass_config = PassConfig(
     inductor_mode="regional",                  # or "full"
     inductor_configs={"reorder_for_peak_memory": True},  # optional overrides
 )
+```
+
+**ACLGraphPass** (NPU joint-graph capture, opt-in):
+
+```python
+pass_config = PassConfig(aclgraph_mode="static")
+compiler = GraphCompiler(model, train_fn, pass_config=pass_config)
+try:
+    loss, loss_dict = compiler.forward_backward(**batch)
+finally:
+    compiler.close()  # before destroying distributed process groups
+```
+
+The pass runs after FSDP, bucketing and communication scheduling. It splits the
+final FX graph into contiguous device regions and eager host regions. CPU tensor
+operations, scalar reads, Python helpers and storage-release operations remain
+eager. Each device region executes one warmup call, records on its second call,
+and then replays with current inputs and live model parameters. Lifted state and
+mutated inputs keep their storage; ordinary contiguous user inputs are copied to
+persistent buffers. Escaping outputs are copied so a later replay cannot overwrite
+an earlier loss or gradient.
+
+`aclgraph_mode` accepts `off` (default), `static`, or `dynamic`. Static replay
+checks shapes, strides, dtype, device, Python constants, and state addresses and
+raises on an incompatible input. Dynamic mode coordinates recapture over a Gloo
+CPU group before executing captured HCCL work. All ranks must enable the same
+mode and execute the same region order. To change tensor shapes across calls,
+also enable `dynamic` or `dynamic_arg_dims` on the compiler; ACLGraph does not
+remove the tracer's input guards. Dynamic mode re-records graphs; it does not
+update recorded kernel dimensions or collective splits in place.
+
+The YAML-driven Trainer exposes the same option:
+
+```yaml
+compile:
+  enabled: true
+  use_joint_graph: true
+  aclgraph_mode: static
+```
+
+The Trainer projects this setting onto `PassConfig` and releases captures before
+its distributed teardown. Standalone `GraphCompiler` and `GraphTrainer` callers
+must call `close()` before destroying process groups. Capture requires `torch_npu`
+and task queue mode 0 or 1; mode 2 is switched to 1 using the runtime API when
+available. CPU-only graphs keep normal FX execution without loading this backend.
+Regional Inductor compilation can run before ACLGraph:
+
+```python
+pass_config = PassConfig(inductor_mode="regional", aclgraph_mode="static")
+```
+
+The pipeline executes `InductorPass` then `ACLGraphPass`. Compilation preserves
+CPU/scalar boundaries and publishes storage-mutation metadata for its opaque
+functions. Distinct region IDs prevent compilation from merging compute across
+communication or storage-release boundaries. HCCL waits remain device operations
+even when the compiler registers them as effectful. Capture consumes metadata
+without executing compiled artifacts on FakeTensors. Inductor's own CUDA/NPU graph
+capture is disabled in this combination;
+ACLGraph owns recording and replay. Standalone NPU compilation initializes the
+selected `torch_npu` Inductor backend, configured by the installed runtime (for
+example, `TORCHINDUCTOR_NPU_BACKEND=ascendc`). Inductor settings remain Python
+`PassConfig` options, as described above.
+
+PP and full Inductor compilation remain unsupported with ACLGraph. This includes
+no model-specific preparation, EP capacity stabilization, or DSv4 metadata changes.
+
+CPU contracts live in [test_aclgraph_pass.py](../../tests/ut/compile/test_aclgraph_pass.py).
+Native replay, state updates, and two-card FSDP/recapture checks, both with and
+without regional compilation, live in
+[test_aclgraph.py](../../tests/torch/compile/test_aclgraph.py). The compiled
+recapture case changes parameter storage on one rank; the plain FX case changes
+batch shape. Symbolic-shape compilation additionally depends on the selected
+Inductor backend and is not established by the compiled storage-recapture case.
+Activate a matching CANN compiler/runtime environment before running:
+
+```bash
+TASK_QUEUE_ENABLE=1 TORCHINDUCTOR_NPU_BACKEND=ascendc \
+  python -m pytest tests/torch/compile/test_aclgraph.py -q
 ```
 
 **FsdpOverlapPass** (independent FSDP graph controls):
