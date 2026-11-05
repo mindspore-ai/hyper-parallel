@@ -427,6 +427,8 @@ def _finalize_model_loading(
 
     tied_aliases = _resolve_tied_aliases(model, targets, loaded_keys)
     missing_keys.difference_update(tied_aliases)
+    # Ignoring a missing key silences diagnostics; its storage still needs initialization.
+    initialization_keys = missing_keys.copy()
     missing_keys, unexpected_keys, ignored_missing, ignored_unexpected = _adjust_loading_keys(
         model,
         missing_keys,
@@ -442,9 +444,9 @@ def _finalize_model_loading(
     initialization_targets = [
         target
         for target in targets.values()
-        if not target.is_non_persistent and target.fqn in missing_keys
+        if not target.is_non_persistent and target.fqn in initialization_keys
     ]
-    _validate_missing_initialization_targets(initialization_targets, missing_keys)
+    _validate_missing_initialization_targets(initialization_targets, initialization_keys)
     _validate_materialized(initialization_targets)
     _prepare_initialization_targets(initialization_targets)
     if initialization_targets:
