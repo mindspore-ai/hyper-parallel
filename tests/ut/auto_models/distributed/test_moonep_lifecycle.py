@@ -77,15 +77,17 @@ class TestMoonEPLifecycle(unittest.TestCase):
     """不初始化分布式、不依赖NPU，检查真实autograd与checkpoint。"""
 
     def test_replay_context_does_not_read_weights_before_module_hooks(self):
-        """Entering replay only binds the key; FSDP module hooks must restore first."""
+        """Replay restores private resources while module hooks retain parameter ownership."""
         identity, key = object(), object()
         lifecycle = SimpleNamespace(prepare=mock.Mock(side_effect=AssertionError("early weight read")),
+                                    prepare_backward_resources=mock.Mock(),
                                     statistics={"recomputations": 0})
         executor = SimpleNamespace(runtime=lifecycle)
         tape = moonep_checkpoint._Tape(executions=[(executor, key)], identity=identity)
         phase = SimpleNamespace(is_recomputing=True, invocation_id=identity)
         with mock.patch.object(moonep_checkpoint, "get_recompute_state", return_value=phase):
             with moonep_checkpoint._phase(torch.nn.Module(), tape, True):
+                lifecycle.prepare_backward_resources.assert_called_once_with(key)
                 self.assertIs(moonep_checkpoint.bind_execution(executor, mock.Mock()), key)
         lifecycle.prepare.assert_not_called()
         self.assertEqual(lifecycle.statistics["recomputations"], 1)

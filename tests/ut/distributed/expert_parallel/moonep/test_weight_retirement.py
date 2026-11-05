@@ -188,7 +188,13 @@ class TestWeightRetirement(unittest.TestCase):
         runtime.backward_active = True
         runtime.backward_token = tuple(reversed(keys))
         runtime.weight_domain.materialize = Mock(return_value=SimpleNamespace(remote={}, ready=Mock()))
+        runtime.prepare_backward_resources(keys[-1])
+        runtime.prepare_backward_resources(keys[-1])
+        runtime.weight_domain.materialize.assert_not_called()
+        self.distributed.all_reduce.assert_called_once()
+        self.assertEqual(runtime.statistics["weight_storage_restores"], 1)
         runtime.prepare(keys[-1])
+        self.distributed.all_reduce.assert_called_once()
         runtime.tickets.clear()
         runtime.trace.clear()
         runtime.executions.clear()

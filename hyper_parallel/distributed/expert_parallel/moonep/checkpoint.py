@@ -102,7 +102,7 @@ def _suspend_forward_prefetch(scheduler: Any) -> Iterator[None]:
 
 @contextmanager
 def _phase(block: torch.nn.Module, tape: _Tape, replay: bool) -> Iterator[None]:
-    """Bind the replay identity; expert module hooks restore weights on demand."""
+    """Bind replay and restore private buffers; module hooks restore parameters."""
     state = get_recompute_state()
     if state is None or state.is_recomputing != replay:
         raise RuntimeError("MoonEP要求Hyper eager非重入checkpoint入口")
@@ -120,7 +120,10 @@ def _phase(block: torch.nn.Module, tape: _Tape, replay: bool) -> Iterator[None]:
                               if getattr(module, "hsdp_scheduler", None) is not None}
                 for scheduler in schedulers.values():
                     stack.enter_context(_suspend_forward_prefetch(scheduler))
-                executor, _ = tape.executions[0]
+                executor, key = tape.executions[0]
+                prepare_resources = getattr(executor.runtime, "prepare_backward_resources", None)
+                if prepare_resources is not None:
+                    prepare_resources(key)
                 executor.runtime.statistics["recomputations"] += 1
             yield
             if replay and scope.cursor != 1:

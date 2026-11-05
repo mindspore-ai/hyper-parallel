@@ -360,9 +360,15 @@ class SparseMoonEPRuntime:
             self.poisoned = True
             raise RuntimeError(f"sparse forward calls violate the registered rank-consistent order: {rows}")
 
-    @torch.no_grad()
-    def prepare(self, key: ExecutionKey) -> WeightLease:
-        """Copy remote experts from home parameter views already restored by FSDP."""
+    def prepare_backward_resources(self, key: ExecutionKey) -> None:
+        """Restore retired replica buffers before replay without reading parameters.
+
+        Args:
+            key: First admitted sparse backward execution, also reused by replay.
+
+        The same admission is reused by demand preparation without checkpointing.
+        Repeated calls after restoration neither allocate nor communicate.
+        """
         if self.weight_domain.parked:
             error = None
             try:
@@ -377,6 +383,11 @@ class SparseMoonEPRuntime:
                 self.poisoned = True
                 raise
             self.statistics["weight_storage_restores"] += 1
+
+    @torch.no_grad()
+    def prepare(self, key: ExecutionKey) -> WeightLease:
+        """Copy remote experts from home parameter views already restored by FSDP."""
+        self.prepare_backward_resources(key)
         if key in self.tickets:
             return self.tickets[key]
         if len(self.tickets) >= 2:
