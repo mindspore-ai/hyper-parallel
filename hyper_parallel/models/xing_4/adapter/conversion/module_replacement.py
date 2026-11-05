@@ -60,6 +60,8 @@ def fusion_attention_with_logit_maxima(module: nn.Module, query: torch.Tensor, k
     options = dict(kwargs)
     head_offset = options.pop("mla_head_offset", 0)
     local_heads = options.pop("mla_local_heads", heads)
+    if not options.get("is_causal", getattr(module, "is_causal", True)):
+        raise ValueError("Xing4 training requires causal attention")
     if not any(options.get(name) is not None for name in PACKED_SEQUENCE_ARGUMENTS):
         if sequence != key.shape[2]:
             raise ValueError("Unequal Xing4 CP query/key lengths require global sequence boundaries")
