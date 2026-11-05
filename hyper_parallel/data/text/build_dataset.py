@@ -195,6 +195,7 @@ def build_indexed_text_dataset(
         ValueError: If required path or training information is missing.
     """
     dataset_config = dict(data_config)
+    dataset_config.setdefault("distributed_walk", True)
     training_seed = getattr(training_config, "seed", None)
     dataset_config["random_seed"] = 42 if training_seed is None else int(training_seed)
     if tokenizer is not None:

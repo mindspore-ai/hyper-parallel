@@ -12,15 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Read token sequences from paired ``.idx/.bin`` files."""
+"""Read indexed token files and prepared Arrow records."""
 
 from __future__ import annotations
 
 import os
 import struct
 import time
+from collections.abc import Mapping
 from functools import lru_cache
-from typing import ClassVar
+from pathlib import Path
+from typing import Any, ClassVar
 
 import numpy as np
 
@@ -274,3 +276,25 @@ class IndexedDataReader:
         if self.index is None:
             raise ValueError("Indexed Dataset metadata is not initialized")
         return self.index
+
+
+class ArrowDataReader:
+    """Memory-map one Arrow file, the low-level source of one SFT Dataset."""
+
+    def __init__(self, dataset_path: str) -> None:
+        """Open one HF Arrow IPC stream; directory discovery belongs to the builder."""
+        path = Path(dataset_path)
+        if path.suffix != ".arrow" or not path.is_file():
+            raise ValueError("ArrowDataReader requires one .arrow file, not a directory")
+        # Keep the HF dependency out of Trainer and bin/idx import paths.
+        from datasets import Dataset  # pylint: disable=C0415
+
+        self.dataset = Dataset.from_file(str(path))
+
+    def __len__(self) -> int:
+        """Return the number of complete prepared records in this file."""
+        return len(self.dataset)
+
+    def __getitem__(self, index: int) -> Mapping[str, Any]:
+        """Return source columns for one record, including labels and boundaries."""
+        return self.dataset[int(index)]

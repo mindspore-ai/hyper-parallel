@@ -749,7 +749,14 @@ def _resolve_dataset_config(node: object, *, path: str) -> DatasetConfig:
     training_mode = None if training_mode_node is None else normalize_value(
         training_mode_node, Literal["sft", "pretrain"], path=f"{path}.training_mode"
     )
+    # Dataset classes need path/split arguments supplied later by the indexed builder.
+    data_options = dict(target_node.get("data_config", {}))
+    dataset_class = data_options.pop("low_level_dataset", None)
+    if dataset_class is not None:
+        target_node["data_config"] = data_options
     target = _resolve_target(target_node, path=path)
+    if dataset_class is not None:
+        target = target.replace(data_config={**target.data_config, "low_level_dataset": dataset_class})
     if isinstance(model_assets_node, Mapping) and "_target_" in model_assets_node:
         model_assets = _resolve_target(
             model_assets_node,

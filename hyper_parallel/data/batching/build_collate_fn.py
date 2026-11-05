@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
@@ -261,6 +262,74 @@ def build_default_collate_fn() -> Callable[[list[Any]], Any]:
 
 # Indexed samples are already prepared and use the same ordinary collation.
 build_indexed_collate_fn = build_default_collate_fn
+
+
+def _sft_row_boundaries(boundaries: Any, sequence_length: int) -> list[int]:
+    """Remove boundary sentinels and validate one complete SFT row."""
+    row = torch.as_tensor(boundaries)
+    if row.ndim != 1 or row.dtype not in (torch.int32, torch.int64):
+        raise ValueError("Each cu_seq_lens row must be a one-dimensional integer array")
+    row = row[row != -1]
+    if (row.numel() < 2 or row[0] != 0 or row[-1] != sequence_length
+            or torch.any(row[1:] <= row[:-1])):
+        raise ValueError("Document boundaries must strictly increase from zero to row length")
+    return row.tolist()
+
+
+def _collate_sft_samples(batch: list[Any], *, alignment_size: int) -> Any:
+    """Stack SFT rows and retain per-row boundaries without sentinel padding.
+
+    Records from SFTFromMRDataset have 1D tokens/labels; already grouped
+    records may have [rows, S]. Variable-length rows are padded, never truncated.
+    """
+    if not isinstance(batch[0], Mapping) or "cu_seq_lens" not in batch[0]:
+        return default_collate(batch)
+
+    token_key = "tokens" if "tokens" in batch[0] else "input_ids"
+    token_rows, label_rows, boundary_rows = [], [], []
+    for sample in batch:
+        tokens, labels = torch.as_tensor(sample[token_key]), torch.as_tensor(sample["labels"])
+        if tokens.ndim not in (1, 2) or tokens.shape != labels.shape or not tokens.numel():
+            raise ValueError("SFT tokens and labels must have matching nonempty [S] or [rows, S] shapes")
+        boundaries = sample["cu_seq_lens"]
+        if tokens.ndim == 1:
+            tokens, labels, boundaries = tokens.unsqueeze(0), labels.unsqueeze(0), [boundaries]
+        if len(boundaries) != len(tokens):
+            raise ValueError("cu_seq_lens must have one boundary array per token row")
+        for row in boundaries:
+            boundary_rows.append(_sft_row_boundaries(row, tokens.shape[-1]))
+        token_rows.extend(tokens.unbind(0))
+        label_rows.extend(labels.unbind(0))
+
+    sequence_length = max(row.numel() for row in token_rows)
+    sequence_length += (-sequence_length) % alignment_size
+    packed_keys = {token_key, "labels", "cu_seq_lens"}
+    result = default_collate([
+        {key: value for key, value in sample.items() if key not in packed_keys} for sample in batch
+    ])
+    for key, rows, value in ((token_key, token_rows, 0), ("labels", label_rows, IGNORE_INDEX)):
+        result[key] = torch.stack([
+            torch.nn.functional.pad(row, (0, sequence_length - row.numel()), value=value) for row in rows
+        ])
+    for row in boundary_rows:
+        if row[-1] < sequence_length:
+            # Isolate ignored tail padding from every real document.
+            row.append(sequence_length)
+    result["cu_seq_lens"] = boundary_rows
+    return result
+
+
+def build_sft_collate_fn(mesh_context: Any | None = None) -> Callable[[list[Any]], Any]:
+    """Build SFT collation preserving [B, S] and each row's document boundaries.
+
+    Args:
+        mesh_context: Optional topology for TP x CP sequence-length alignment.
+
+    Returns:
+        A CPU collator accepting 1D records or already grouped 2D records.
+        Ordinary records without cu_seq_lens use default collation.
+    """
+    return partial(_collate_sft_samples, alignment_size=_get_token_alignment_size(mesh_context))
 
 
 def build_omni_collate_fn(

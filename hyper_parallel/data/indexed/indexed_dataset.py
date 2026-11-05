@@ -25,12 +25,9 @@ from hyper_parallel.data.indexed.indexed_data_config import (
     GPTDatasetConfig,
     build_gpt_dataset_config,
     resolve_data_paths,
+    resolve_dataset_type,
 )
-from hyper_parallel.data.indexed.indexed_pretrain_dataset import (
-    GPTDataset,
-    GPTFromMRDataset,
-    MockGPTDataset,
-)
+from hyper_parallel.data.indexed.indexed_pretrain_dataset import SFTFromMRDataset
 from hyper_parallel.data.indexed.indexed_split_builder import IndexedDatasetSplitBuilder
 from hyper_parallel.data.parallel import DataLoaderParallelContext
 
@@ -171,9 +168,11 @@ class IndexedPretrainDatasetBuilder:
         if self.data_path is None:
             raise ValueError("data_path is required when mock_data is false")
 
+        dataset_type = resolve_dataset_type(self.data_config["low_level_dataset"])
         data_paths = resolve_data_paths(
             self.data_path,
             distributed_walk=bool(self.data_config["distributed_walk"]),
+            file_suffix=".arrow" if issubclass(dataset_type, SFTFromMRDataset) else ".bin",
         )
         return data_paths
 
@@ -185,13 +184,7 @@ class IndexedPretrainDatasetBuilder:
     @staticmethod
     def _select_dataset_type(config: GPTDatasetConfig) -> type:
         """Select GPT, Mock GPT, or MR GPT Dataset."""
-        if config.mock:
-            return MockGPTDataset
-
-        if config.is_dataset_from_mr:
-            return GPTFromMRDataset
-
-        return GPTDataset
+        return config.low_level_dataset
 
     def _select_split_builder(self, config: GPTDatasetConfig) -> SplitBuilder:
         """
@@ -202,9 +195,6 @@ class IndexedPretrainDatasetBuilder:
         if config.simple_blend == "no":
             split_builder = partial(self.split_builder.build, blend_mode="no")
             return split_builder
-
-        if not config.is_dataset_from_mr:
-            raise ValueError("simple_blend values other than 'no' require is_dataset_from_mr=True")
 
         if config.simple_blend not in {"inter", "intra"}:
             raise ValueError("simple_blend must be one of 'no', 'inter', or 'intra'; "
