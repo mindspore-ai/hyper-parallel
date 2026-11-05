@@ -14,6 +14,7 @@
 # ============================================================================
 """MoonEP规划、显式GMM反向和真实非重入重算的CPU回归。"""
 
+from contextlib import contextmanager
 import itertools
 from types import SimpleNamespace
 import unittest
@@ -146,6 +147,53 @@ class TestMoonEPLifecycle(unittest.TestCase):
         torch.testing.assert_close(gate_param.grad[1], gate_grad[1].transpose(0, 1))
         torch.testing.assert_close(down_param.grad[1], down_grad[1])
         torch.testing.assert_close(gate_param.grad[0], gate_grad[0].transpose(0, 1))
+
+    def test_weight_table_stream_ownership_and_consumer_lifetime(self):
+        """Persistent W tables keep ready/read fences and C lifetime protection."""
+        expert = _Experts()
+        runtime = configure_moonep(expert)
+        weight, compute, ready = mock.Mock(), mock.Mock(), object()
+        runtime.stream = weight
+        events = []
+        new_empty = torch.Tensor.new_empty
+
+        @contextmanager
+        def _stream_context(stream):
+            self.assertIs(stream, weight)
+            events.append("allocate_on_w")
+            yield
+            events.append("leave_w")
+
+        def _allocate(tensor, shape):
+            self.assertEqual(events[-1], "allocate_on_w")
+            return new_empty(tensor, shape)
+
+        def _record(_tensor, stream):
+            self.assertIs(stream, compute)
+            events.append("protect_c")
+
+        compute.wait_event.side_effect = lambda event: events.append(("wait_ready", event))
+        npu = SimpleNamespace(stream=_stream_context, current_stream=lambda: compute, Event=mock.Mock)
+        with mock.patch.object(torch, "npu", npu, create=True), \
+                mock.patch.object(torch.Tensor, "new_empty", _allocate):
+            slot = runtime._new_slot(expert.gate, expert.down)
+        slot.gate.fill_(3)
+        slot.down.fill_(5)
+        key = object()
+        ticket = SimpleNamespace(slot=slot, gate=slot.gate[:1], down=slot.down[:1], ready=ready,
+                                 allocation_stream=weight, reclaimable=(), keepalive=[object()], consumed=False)
+        runtime.tickets[key] = ticket
+        with mock.patch.object(torch, "npu", npu, create=True), \
+                mock.patch.object(runtime, "prepare", return_value=ticket), \
+                mock.patch.object(torch.Tensor, "record_stream", _record):
+            gate, down = moonep_runtime.MoonEPRuntime.consume(runtime, key)
+            runtime.release(key)
+        self.assertEqual(events, ["allocate_on_w", "leave_w", ("wait_ready", ready), "protect_c", "protect_c"])
+        self.assertEqual(ticket.keepalive, [])
+        self.assertEqual(runtime.tickets, {})
+        slot.done.record.assert_called_once_with(compute)
+        torch.testing.assert_close(gate, torch.full_like(gate, 3))
+        torch.testing.assert_close(down, torch.full_like(down, 5))
 
     def test_weight_workspace_is_bounded_and_reused(self):
         """AG与EP按需共池且增长不破坏旧视图；例如预算8元素时9元素不能扩池。"""

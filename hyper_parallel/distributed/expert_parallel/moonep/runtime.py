@@ -246,8 +246,10 @@ class MoonEPRuntime:
 
     def _new_slot(self, gate: torch.Tensor, down: torch.Tensor) -> _Slot:
         """按实际在途请求增加一张专家表；例如 B7 占用首槽时 B6 的 hook 获得第二槽。"""
-        return _Slot(gate.new_empty((self.capacity, *gate.shape[1:])),
-                     down.new_empty((self.capacity, *down.shape[1:])))
+        # 长期表使用既有 W 分配池，减少与 C 激活和交叉熵临时量的交错分配。
+        with torch.npu.stream(self.stream) if self.stream is not None else nullcontext():
+            return _Slot(gate.new_empty((self.capacity, *gate.shape[1:])),
+                         down.new_empty((self.capacity, *down.shape[1:])))
 
     @torch.no_grad()
     def prepare(self, key: ExecutionKey) -> _Ticket:
@@ -415,6 +417,9 @@ class MoonEPRuntime:
         if self.stream is not None:
             current = torch.npu.current_stream()
             current.wait_event(ticket.ready)
+            # 表在 W 分配、由 C 读取；等待 ready 保证数据就绪，record_stream 保护存储生命周期。
+            ticket.gate.record_stream(current)
+            ticket.down.record_stream(current)
             if current == ticket.allocation_stream:
                 # C已排队等待W的最后读取，后续C复用必在该等待之后，无需再等host轮询。
                 # 仅擦除确认在本次C分配的storage；其它来源仍由record_stream保护。
