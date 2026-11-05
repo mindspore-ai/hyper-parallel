@@ -321,7 +321,7 @@ class TestDynamicShapes(unittest.TestCase):
 
         def postforward(
             outputs: torch.Tensor, labels: torch.Tensor, *,
-            current_token_counts: dict, step_token_counts: dict,
+            current_token_counts: dict,
         ) -> tuple:
             """Build the scalar loss and named diagnostics."""
             loss = ((outputs - labels) ** 2).mean()
@@ -337,7 +337,6 @@ class TestDynamicShapes(unittest.TestCase):
                 expected, _ = postforward(
                     base.model(x), y,
                     current_token_counts=base.current_token_counts,
-                    step_token_counts=base.step_token_counts,
                 )
                 torch.testing.assert_close(actual, expected)
                 torch.testing.assert_close(losses["main"], expected.detach())
@@ -368,7 +367,8 @@ class TestDynamicShapes(unittest.TestCase):
         base.model_integration = Mock(spec=["record_batch"])
         base.config = SimpleNamespace(training=SimpleNamespace(empty_cache_before_backward=False))
         base.model = KeywordModel(4, 3)
-        base.device, base.state, base.mesh = torch.device("cpu"), None, None
+        base.device, base.state = torch.device("cpu"), None
+        base.mesh = SimpleNamespace(dp_cp_mesh=None, sequence_parallel=False, dp_size=1, cp_size=1)
         base.model_fwd_context = nullcontext()
         base.model_bwd_context = nullcontext()
         base.loss_fn = lambda model_output, labels: (model_output - labels).square().mean()
@@ -376,26 +376,21 @@ class TestDynamicShapes(unittest.TestCase):
                                  pass_config=self.config, dynamic=mode == "dynamic")
         base.graph_compiler = None if mode == "eager" else compiler
 
-        def aggregate(loss: torch.Tensor, current: dict, step: dict, device_mesh: object) -> dict:
-            """Weight the current loss by live token counts."""
-            return {"foundation_loss": loss * current["foundation_tokens"] / step["foundation_tokens"]}
-
-        with patch("hyper_parallel.trainer.base.mean_global_loss", side_effect=aggregate):
-            with patch.object(compiler, "compile", wraps=compiler.compile) as compile_spy:
-                batches = [(2, 2, 8), (2, 6, 12), (2 if mode == "static" else 3, 3, 9)]
-                for batch, count, step_count in batches:
-                    x, y = torch.randn(batch, 4), torch.randn(batch, 3)
-                    base.current_token_counts = {"foundation_tokens": torch.tensor(count)}
-                    base.step_token_counts = {"foundation_tokens": torch.tensor(step_count)}
-                    base.model.zero_grad()
-                    actual, losses = base.forward_backward_step({"input_ids": x}, loss_inputs={"labels": y})
-                    expected = (base.model(x) - y).square().mean() * count / step_count
-                    torch.testing.assert_close(actual, expected)
-                    torch.testing.assert_close(losses["foundation_loss"], expected)
-                    gradients = torch.autograd.grad(expected, tuple(base.model.parameters()))
-                    for parameter, gradient in zip(base.model.parameters(), gradients):
-                        torch.testing.assert_close(parameter.grad, gradient)
-                self.assertEqual(compile_spy.call_count, 0 if mode == "eager" else 1)
+        with patch.object(compiler, "compile", wraps=compiler.compile) as compile_spy:
+            batches = [(2, 2), (2, 0), (2, 6), (2 if mode == "static" else 3, 3)]
+            for batch, count in batches:
+                x, y = torch.randn(batch, 4), torch.randn(batch, 3)
+                base.current_token_counts = {"foundation_tokens": torch.tensor(count)}
+                base.step_token_counts = {}
+                base.model.zero_grad()
+                actual, losses = base.forward_backward_step({"input_ids": x}, loss_inputs={"labels": y})
+                expected = (base.model(x) - y).square().mean() * count
+                torch.testing.assert_close(actual, expected)
+                torch.testing.assert_close(losses["foundation_loss"], expected)
+                gradients = torch.autograd.grad(expected, tuple(base.model.parameters()))
+                for parameter, gradient in zip(base.model.parameters(), gradients):
+                    torch.testing.assert_close(parameter.grad, gradient)
+            self.assertEqual(compile_spy.call_count, 0 if mode == "eager" else 1)
 
 
     def test_causal_label_padding_preserves_dynamic_length(self):
