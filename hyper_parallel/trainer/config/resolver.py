@@ -447,7 +447,7 @@ def replace_override_path(config: object, parts: list[str], value: object, *, pa
             location, f"value of type {type(config).__name__} has no configurable fields"
         )
 
-    config_fields = {field.name: field for field in fields(config)}
+    config_fields = {field.name: field for field in fields(config) if field.init}
     name = parts[0]
     if name not in config_fields:
         target = getattr(config, "target", None)
@@ -513,7 +513,7 @@ def _resolve_dataclass(node: object, config_type: type, *, path: str) -> object:
     if not isinstance(node, Mapping):
         raise ConfigResolutionError(path, "configuration section must be a YAML mapping")
 
-    config_fields = {field.name: field for field in fields(config_type)}
+    config_fields = {field.name: field for field in fields(config_type) if field.init}
     unknown = sorted(set(node) - set(config_fields))
     if unknown:
         raise ConfigResolutionError(path, f"unknown configuration fields: {unknown}")
@@ -687,7 +687,7 @@ def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
 
     target_node = dict(node)
     if "dataloader_type" in target_node:
-        raise _fail(f"{path}.dataloader_type", "renamed to sampler_type")
+        raise ConfigResolutionError(f"{path}.dataloader_type", "renamed to sampler_type")
 
     if "batch_adapter" in target_node:
         raise ConfigResolutionError(

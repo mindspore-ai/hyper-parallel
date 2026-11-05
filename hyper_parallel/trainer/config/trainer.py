@@ -67,10 +67,7 @@ class TrainerConfig:
     mixed_precision: MixedPrecisionConfig = field(
         default_factory=MixedPrecisionConfig
     )
-    activation_checkpoint: ActivationCheckpointConfig = field(
-        default_factory=ActivationCheckpointConfig
-    )
-    activation_swap: Literal["none", "attention"] = "none"
+    activation_checkpoint: Optional[ActivationCheckpointConfig] = None
     compile: CompileConfig = field(default_factory=CompileConfig)
 
     # codegen
@@ -93,6 +90,15 @@ class TrainerConfig:
 
     def __post_init__(self) -> None:
         """Validate combinations that span multiple config sections."""
+        if (
+            self.compile.enabled
+            and self.activation_checkpoint is not None
+            and self.activation_checkpoint.mode != "off"
+        ):
+            raise ValueError(
+                "compile.enabled=true is not supported with activation_checkpoint.mode="
+                f"{self.activation_checkpoint.mode}"
+            )
         if (
             self.compile.enabled
             and not self.compile.selects_graph_compiler()

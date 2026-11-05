@@ -375,12 +375,7 @@ class BaseTrainer(Stateful, ABC):
         self.model = self.config.model.build(
             distributed_setup=self.distributed_setup,
             peft_config=self.peft_config,
-            activation_checkpoint=self.config.activation_checkpoint.mode,
-            activation_checkpoint_selection=self.config.activation_checkpoint.selection,
-            swap_inputs=getattr(self.config.activation_checkpoint, "swap_inputs", False),
-            allow_cache_entry_mutation=getattr(
-                self.config.activation_checkpoint, "allow_cache_entry_mutation", False),
-            activation_swap=self.config.activation_swap,
+            activation_checkpoint=self.config.activation_checkpoint,
             compile_config=self.config.compile,
             codegen=self.config.codegen,
             # The final dtype is applied inside the atomic build (05 stage-5

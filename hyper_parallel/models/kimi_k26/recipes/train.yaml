@@ -155,8 +155,6 @@ activation_checkpoint:
   # a `swap_inputs` in the model: section is accepted but silently dropped.
   swap_inputs: false
 
-activation_swap: none
-
 compile:
   enabled: false
   mode: default

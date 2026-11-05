@@ -91,7 +91,6 @@ from hyper_parallel.models.validation_spec import (
 from hyper_parallel.tools.model_integration import cli as model_integration_cli
 from hyper_parallel.tools.model_integration.cli import main as model_integration_main
 from hyper_parallel.trainer.base import BaseTrainer
-from hyper_parallel.trainer.config.parallelism import ActivationCheckpointSelection
 from hyper_parallel.trainer.config.training import ModelIntegrationConfig
 
 
@@ -263,45 +262,6 @@ class TestModelIntegrationContracts(unittest.TestCase):
             isolated_runner=lambda _context: {"status": "PASS"},
         )
         self.assertIsNone(isolated.candidate_builder)
-
-    def test_activation_checkpoint_selection_requires_one_exact_selector(self) -> None:
-        """Require exactly one valid count-based or index-based selector."""
-        with self.assertRaisesRegex(ValueError, "only valid"):
-            ActivationCheckpointSelection(source="default", layer_count=1)
-        with self.assertRaisesRegex(ValueError, "exactly one"):
-            ActivationCheckpointSelection(source="model_adapter_safe_regions")
-        with self.assertRaisesRegex(ValueError, "exactly one"):
-            ActivationCheckpointSelection(
-                source="model_adapter_safe_regions",
-                layer_count=1,
-                layer_indices=[0],
-            )
-        with self.assertRaisesRegex(ValueError, "non-negative integer"):
-            ActivationCheckpointSelection(
-                source="model_adapter_safe_regions",
-                layer_count=-1,
-            )
-        with self.assertRaisesRegex(ValueError, "must not contain duplicates"):
-            ActivationCheckpointSelection(
-                source="model_adapter_safe_regions",
-                layer_indices=[0, 0],
-            )
-        self.assertEqual(
-            ActivationCheckpointSelection(
-                source="model_adapter_safe_regions",
-                layer_count=0,
-            ).layer_count,
-            0,
-        )
-        self.assertEqual(
-            ActivationCheckpointSelection(
-                source="model_adapter_safe_regions",
-                layer_indices=[0, 2],
-            ).layer_indices,
-            [0, 2],
-        )
-        with self.assertRaisesRegex(ValueError, "must be default or"):
-            ActivationCheckpointSelection(source="model_adapter_layer_regions")
 
     def test_manifest_is_local_only_and_command_validated(self) -> None:
         """Reject implicit remote model sources before command execution."""
@@ -1774,11 +1734,6 @@ class TestModelIntegrationContracts(unittest.TestCase):
         self.assertIn("--accelerator.tp_size=2", ordinary_argv)
         self.assertIn("--accelerator.ep_size=16", ordinary_argv)
         self.assertIn("--fsdp_config.dp_shard_size=8", ordinary_argv)
-        self.assertIn(
-            "--activation_checkpoint.selection={'source': "
-            "'model_adapter_safe_regions', 'layer_indices': [0, 1, 2, 3]}",
-            ordinary_argv,
-        )
         self.assertIn("--training.train_iters=10", ordinary_argv)
         self.assertIn("--training.lr_scheduler_iters=10", ordinary_argv)
         self.assertIn("--training.train_iters=1", initialize_argv)

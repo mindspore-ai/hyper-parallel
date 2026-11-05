@@ -42,6 +42,29 @@ fsdp_config:
   backward_prefetch_depth: 1
   comm_fusion: false
 
+activation_checkpoint:
+  mode: selective # full # off, selective, hybrid
+  full:
+    # This demo crops Qwen3-30B-A3B to four transformer layers.
+    recompute_layer: [0-3]
+    exclude_region:
+      # save:
+      #   self_attn.linear_qkv: [0]
+      swap:
+        group_swap: false
+        cpu_pool: null
+        self_attn.o_proj: [0-3]
+        self_attn.linear_qkv: [0-3]
+        mlp.experts: [0-3]
+  selective:
+    recompute:
+      self_attn.linear_qkv: [0-3]
+    swap:
+      group_swap: true
+      cpu_pool: 512
+      self_attn.o_proj: [0-3]
+      mlp.experts: [0-3]
+
 plan_overrides:
   - match:
       - "*.input_layernorm"
@@ -77,9 +100,6 @@ plan_overrides:
 
 mixed_precision:
   enabled: false
-
-activation_checkpoint:
-  mode: "off"
 
 dataset:
   model_assets:

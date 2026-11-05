@@ -134,7 +134,7 @@ class CompileConfig:
     options: Optional[dict[str, Any]] = None
     dynamo_cache_size_limit: int = 256
     # Joint-graph input paths, e.g. model_inputs.input_ids: [0, 1].
-    dynamic_arg_dims: Optional[dict[str, int | list[int]]] = None
+    dynamic_arg_dims: Optional[dict[str, int | list[int]]] = None  # pylint: disable=unsupported-binary-operation
     fsdp_allgather_prefetch: bool = True
     fsdp_overlap_grad_reduce: bool = True
     max_in_flight_gb: float = 0.25
@@ -280,8 +280,7 @@ class FSDP2Config:
 
 
 _MODEL_INIT_DTYPES = ("float16", "bfloat16", "float32")
-_ACTIVATION_CHECKPOINT_MODES = ("off", "full", "selective")
-_ACTIVATION_SWAP_MODES = ("none", "attention")
+_ACTIVATION_CHECKPOINT_MODES = ("off", "full", "selective", "hybrid")
 
 
 @dataclass
@@ -298,9 +297,7 @@ class ModelBuildOptions:
     # Final floating-point dtype after weights are loaded or initialized
     # from scratch; None preserves the initialization-path dtype.
     model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None
-    activation_checkpoint: Optional[Literal["off", "full", "selective"]] = None
-    activation_swap: Literal["none", "attention"] = "none"
-    swap_inputs: bool = False
+    activation_checkpoint: Optional[Any] = None
     compile: CompileConfig = field(default_factory=CompileConfig)
     # Validate DTensor placements (skip compile) instead of a production build.
     validate_placement: bool = False
@@ -323,19 +320,16 @@ class ModelBuildOptions:
                 "model_init_dtype must be one of float16, bfloat16, float32, "
                 f"or null; got {self.model_init_dtype!r}"
             )
+        activation_checkpoint_mode = getattr(self.activation_checkpoint, "mode", None)
         if self.activation_checkpoint is not None and (
-            self.activation_checkpoint not in _ACTIVATION_CHECKPOINT_MODES
+            activation_checkpoint_mode not in _ACTIVATION_CHECKPOINT_MODES
         ):
             raise ValueError(
-                "activation_checkpoint must be one of off, full, selective, "
-                f"or null; got {self.activation_checkpoint!r}"
+                "activation_checkpoint must be a normalized configuration with mode "
+                "off, full, selective, or hybrid; "
+                f"got {self.activation_checkpoint!r}"
             )
-        if self.activation_swap not in _ACTIVATION_SWAP_MODES:
-            raise ValueError(
-                "activation_swap must be one of none, attention; "
-                f"got {self.activation_swap!r}"
-            )
-        for name in ("swap_inputs", "validate_placement"):
+        for name in ("validate_placement",):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"ModelBuildOptions.{name} must be a bool")
         if isinstance(self.compile, Mapping):

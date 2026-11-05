@@ -13,6 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """Core HyperParallel utilities for LlamaFactory integration."""
+# Torch is the only supported backend; the legacy platform-agnostic pylint rule is not applicable here.
+# pylint: disable=forbidden-backend-import,unsupported-binary-operation
 
 import json
 import logging
@@ -20,6 +22,7 @@ import os
 import types
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -259,7 +262,7 @@ class HyperParallelArguments:
         return parallel_args
 
     @classmethod
-    def from_finetuning_args(cls, finetuning_args) -> "HyperParallelArguments":
+    def from_finetuning_args(cls, finetuning_args: Any) -> "HyperParallelArguments":
         """Extract HyperParallel arguments from LlamaFactory finetuning args."""
         raw = getattr(finetuning_args, "hyper_parallel_args", None)
         if raw is None:
@@ -288,9 +291,7 @@ def parallelize_model(
     *,
     pretrained_path: str | None = None,
     device: torch.device | None = None,
-    activation_checkpoint: str | None = None,
-    activation_swap: str = "none",
-    swap_inputs: bool = False,
+    activation_checkpoint: Any | None = None,
     validate_placement: bool = False,
     model_init_dtype: str | None = None,
 ) -> nn.Module:
@@ -328,8 +329,6 @@ def parallelize_model(
         validate_placement=validate_placement,
         distributed_setup=distributed_setup,
         activation_checkpoint=activation_checkpoint,
-        activation_swap=activation_swap,
-        swap_inputs=swap_inputs,
         model_init_dtype=model_init_dtype,
     )
 
@@ -433,7 +432,7 @@ def _load_local_optimizer_state(optimizer, saved_sd: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-def wrap_optimizer_with_skip_dtensor_dispatch(optimizer) -> None:
+def wrap_optimizer_with_skip_dtensor_dispatch(optimizer: Any) -> None:
     """Wrap chain and leaf optimizer steps so DTensor updates use local shards."""
     wrapped_attribute = "_distributed_step_wrapped"
     optimizers = list(getattr(optimizer, "optimizers_dict", {}).values()) + [optimizer]
@@ -457,7 +456,7 @@ def wrap_optimizer_with_skip_dtensor_dispatch(optimizer) -> None:
 # ---------------------------------------------------------------------------
 
 
-def export_to_hf_format(model: nn.Module, tokenizer, save_dir: str) -> None:
+def export_to_hf_format(model: nn.Module, tokenizer: Any, save_dir: str) -> None:
     """Gather full state dict via HyperParallel and save in HuggingFace-compatible format."""
     from torch.distributed.checkpoint.state_dict import (  # pylint: disable=import-outside-toplevel
         StateDictOptions,
@@ -489,7 +488,7 @@ def export_to_hf_format(model: nn.Module, tokenizer, save_dir: str) -> None:
 def save_hsdp_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer | None,
-    lr_scheduler,
+    lr_scheduler: Any,
     output_dir: str,
     should_save_scheduler: bool = True,
 ) -> None:
@@ -537,7 +536,7 @@ def load_hsdp_model(model: nn.Module, checkpoint_dir: str) -> bool:
 
 def load_hsdp_optimizer_and_scheduler(
     optimizer: torch.optim.Optimizer | None,
-    lr_scheduler,
+    lr_scheduler: Any,
     checkpoint_dir: str,
 ) -> None:
     """Load optimizer/scheduler from per-rank checkpoint files."""
