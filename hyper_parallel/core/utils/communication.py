@@ -29,6 +29,7 @@ import torch.distributed as dist
 import torch.distributed.nn.functional as dist_func
 from torch import Tensor
 from torch._C._distributed_c10d import ProcessGroup
+from torch.distributed import _functional_collectives
 
 
 def get_group_local_rank(group: Optional[ProcessGroup] = None) -> int:
@@ -382,7 +383,7 @@ def differentiable_all_gather_concat(data: Tensor, group, concat_size: int, conc
     data = ensure_contiguous(data)
     # Eager path: use legacy autograd API (dist_func.all_gather) to preserve
     # original numerical behavior. Compile/graph-trace path: use functional
-    # collectives (fc.all_gather_single) for torch.compile / make_fx.
+    # collectives for torch.compile / make_fx.
     if rank_list is not None:
         group_ranks = dist.get_process_group_ranks(group)
         if tuple(rank_list) != tuple(group_ranks):
@@ -401,28 +402,11 @@ def differentiable_all_gather_concat(data: Tensor, group, concat_size: int, conc
             for tensor in dist_func.all_gather(data, group=group)
         ]
         return torch.cat(output, dim=concat_dim)
-    # Compile: use functional collective API for torch.compile compatibility.
-    # all_gather_single only reliably supports gather_dim=0; for other dims we
-    # gather on dim 0 then reshape to avoid _maybe_view_chunk_cat view() bugs
-    # in Dynamo fake tensor tracing.
-    group_size = dist.get_world_size(group)
-    import torch.distributed._functional_collectives as fc  # pylint: disable=C0415
-    gathered = fc.all_gather_single(data, 0, group)
-    if hasattr(gathered, 'wait'):
-        gathered = gathered.wait()
-    if concat_dim == 0:
-        return gathered
-    # Reshape from [group_size * d0, d1, ...] to [d0 * group_size, d1, ...]
-    # by moving the group_size factor from dim 0 to concat_dim.
-    orig_shape = list(data.shape)
-    gathered_shape = [orig_shape[0] * group_size] + orig_shape[1:]
-    gathered = gathered.view(gathered_shape)
-    # Move group_size from dim 0 to concat_dim via unflatten + movedim + flatten
-    unflattened = gathered.unflatten(0, (group_size, orig_shape[0]))
-    moved = torch.movedim(unflattened, 0, concat_dim)
-    result_shape = list(orig_shape)
-    result_shape[concat_dim] *= group_size
-    return moved.reshape(result_shape).contiguous()
+    # Torch 2.14 functional collectives provide autograd and tracing-aware waits.
+    if not -data.ndim <= concat_dim < data.ndim:
+        raise IndexError("All-gather concatenation dimension is out of range")
+    concat_dim %= data.ndim
+    return _functional_collectives.all_gather_single(data, concat_dim, group)
 
 
 def differentiable_all_to_all_single(input_tensor: Tensor, input_splits: Sequence[int],
@@ -477,10 +461,7 @@ def differentiable_all_reduce(data: Tensor, op: Union[str, Any], group) -> Tenso
     # Eager: use legacy autograd API. Compile/graph-trace: use functional collectives.
     if not _is_tracing_or_compiling():
         return dist_func.all_reduce(data, op=reduce_op, group=group)
-    # Compile: use functional collective API for torch.compile compatibility.
-    # fc.all_reduce expects a string reduceOp and a ProcessGroup.
-    import torch.distributed._functional_collectives as fc  # pylint: disable=C0415
-    return fc.all_reduce(data, _reduce_op_to_str(reduce_op), group)
+    return _functional_collectives.all_reduce(data, _reduce_op_to_str(reduce_op), group)
 
 
 def differentiable_reduce_scatter(data: Tensor, dev_num: int, axis: int,
@@ -501,12 +482,7 @@ def differentiable_reduce_scatter(data: Tensor, dev_num: int, axis: int,
             output_tensor = output_tensor / dev_num
         return output_tensor
 
-    # Compile: use functional collective API for torch.compile compatibility.
-    # fc.reduce_scatter_single expects a string reduceOp, scatter_dim, and group.
-    import torch.distributed._functional_collectives as fc  # pylint: disable=C0415
-    result = fc.reduce_scatter_single(data, _reduce_op_to_str(reduce_op), axis, group)
-    if hasattr(result, 'wait'):
-        result = result.wait()
+    result = _functional_collectives.reduce_scatter_single(data, _reduce_op_to_str(reduce_op), axis, group)
     # 'avg' maps to SUM in _OP_MAP, so the division stays manual.
     if op == 'avg':
         result = result / dev_num

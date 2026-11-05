@@ -33,20 +33,28 @@ from __future__ import annotations
 __all__ = ["GraphCompiler"]
 
 import logging
+import math
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+from torch._prims_common import make_contiguous_strides_for
 from torch.distributed.distributed_c10d import _register_process_group
 
-from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, init_device_mesh
+from hyper_parallel.core.dtensor.layout import Layout
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
+from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
+from hyper_parallel.models.build_options import FSDP2Config
+from hyper_parallel.models.external_state import get_model_external_state
 
-from .pass_config import (
-    PassConfig,
-    normalize_dp_mode,
-    build_pass_config_from_trainer_config,
-)
 from .graph_parallel_plan import GraphParallelPlan
+from .pass_config import (
+    GradientReduction,
+    PassConfig,
+    build_pass_config_from_trainer_config,
+    normalize_dp_mode,
+)
 from .passes.pipeline import PassPipeline
 from .passes.activation_checkpoint import prepare_activation_checkpoint
 from .tracer.dynamic_shapes import normalize_dynamic_arg_dims
@@ -75,6 +83,7 @@ class GraphCompiler:
         mesh_context: Optional[Any] = None,
         dynamic: Optional[bool] = None,
         dynamic_arg_dims: dict[str, int | list[int]] | None = None,
+        source_shard_info: Optional[dict] = None,
     ) -> None:
         """
         Args:
@@ -97,6 +106,8 @@ class GraphCompiler:
             dynamic: Symbolize user input dimensions; inherits trainer_config.compile.dynamic when omitted.
             dynamic_arg_dims: Optional dotted input paths to dynamic dimensions, e.g. {"x": [0, 1]}.
                 Overrides automatic dimension selection and inherits trainer configuration when omitted.
+            source_shard_info: Source placements and meshes returned by apply_sharding_plan,
+                before FSDP cuts the localized parameters.
         """
         compile_config = getattr(trainer_config, "compile", None)
         self.dynamic = (
@@ -115,6 +126,15 @@ class GraphCompiler:
             trainer_config=trainer_config,
         )
         self._mesh_context = mesh_context
+        self.source_shard_info = source_shard_info
+        self._fsdp_mesh = None
+        self._expert_fsdp_mesh = None
+        self._fsdp_config = getattr(trainer_config, 'fsdp_config', None)
+        self._parameter_meshes = {}
+        self._parameter_groups = {}
+        self._parameter_shapes = {}
+        self._parameter_layouts = None
+        self._layout_signature = None
         self.device = device or (
             torch.device("npu")
             if (hasattr(torch, "npu") and torch.npu.is_available())
@@ -148,6 +168,23 @@ class GraphCompiler:
         """Whether a joint graph has already been compiled."""
         return self._joint_graph is not None
 
+    @property
+    def parameter_layouts(self) -> Optional[dict]:
+        """Final parameter-identity layouts, available after lazy compilation.
+
+        Cache metadata only: gradients may be replaced on every optimizer step.
+        Replacing a parameter invalidates the mapping, as does compiling again.
+        """
+        if self._joint_graph is None:
+            return None
+        parameters = dict(self.model.named_parameters())
+        signature = tuple((id(param), tuple(param.shape), param.dtype, param.device) for param in parameters.values())
+        if signature != self._layout_signature:
+            self._parameter_layouts = self._build_parameter_layouts(parameters)
+            self._layout_signature = signature
+            self._joint_graph.graph_module.parameter_layouts = self._parameter_layouts
+        return self._parameter_layouts
+
     def compile(self, **inputs: Any) -> None:
         """
         Compile model into parallel graph
@@ -159,6 +196,10 @@ class GraphCompiler:
             **inputs: Model inputs, forwarded to ``train_fn`` as keyword
                 arguments and used to trace the joint graph
         """
+        external = get_model_external_state(self.model)
+        if external is not None and external.parameters:
+            raise ValueError("GraphCompiler does not support externally managed parameters yet")
+
         if (
             self.dynamic or self.dynamic_arg_dims is not None
         ) and self.pass_config.pp_enabled:
@@ -169,6 +210,12 @@ class GraphCompiler:
             self._pytree_pre_hook()
 
         self._validate_ep_topology()
+        if (
+            isinstance(getattr(self._mesh_context, "tp_size", None), int)
+            and self._mesh_context.tp_size > 1
+            and not self.source_shard_info
+        ):
+            raise ValueError("Graph TP requires source_shard_info from the sharding plan")
 
         if self.pass_config.fsdp_enabled and dist.is_initialized():
             # Only build the FSDP mesh when distributed is actually up.
@@ -183,6 +230,10 @@ class GraphCompiler:
         ac_scope = None
         if self.pass_config.ac_mode != "off":
             ac_scope = prepare_activation_checkpoint(self.model, self.pass_config)
+
+        self._bind_parameter_meshes()
+        self._parameter_shapes = {name: tuple(param.shape) for name, param in self.model.named_parameters()}
+        self._layout_signature = None
 
         trace_kwargs = {}
         if self.dynamic or self.dynamic_arg_dims is not None:
@@ -249,6 +300,120 @@ class GraphCompiler:
         self.model = self.model.to(self.device)
         return self
 
+    def source_layout_for_parameter(self, name: str) -> Optional[tuple]:
+        """Resolve pre-FSDP placement, including tied and replicated parameters.
+
+        Args:
+            name: Parameter FQN in the live model.
+
+        Returns:
+            The source ``(placements, mesh)`` pair, or None for a plain local model.
+        """
+        if self.source_shard_info is not None:
+            if name in self.source_shard_info:
+                return self.source_shard_info[name]
+            parameters = dict(self.model.named_parameters(remove_duplicate=False))
+            for alias, layout in self.source_shard_info.items():
+                if parameters.get(alias) is parameters.get(name):
+                    return layout
+        context = self._mesh_context
+        if context is None:
+            return None
+        if name in self._expert_param_names:
+            return ((Shard(0),), context.fsdp_moe_mesh["ep"])
+        mesh = context.fsdp_non_moe_mesh
+        if mesh is not None and "tp" in mesh.mesh_dim_names:
+            return ((Replicate(),), mesh["tp"])
+        return None
+
+    def _build_parameter_layouts(self, parameters: dict) -> Optional[dict]:
+        """Describe actual local storage using common FSDP layout construction."""
+        context = self._mesh_context
+        if context is None and self._fsdp_mesh is None:
+            return None
+        if self._fsdp_mesh is None and context is not None:
+            # Plain graph mode still needs metadata, without creating collectives.
+            self._init_mesh_from_context(context, self.pass_config.dp_mode, register_groups=False)
+        sharded = getattr(self._joint_graph.graph_module, "fsdp_sharded_param_names", frozenset())
+        layouts = {}
+        for name, parameter in parameters.items():
+            if not parameter.requires_grad:
+                continue
+            mesh = self._parameter_meshes.get(name)
+            if mesh is None:
+                mesh = self._expert_fsdp_mesh if name in self._expert_param_names else self._fsdp_mesh
+            if mesh is None:
+                raise ValueError("Parameter layouts require an initialized FSDP mesh or parameter binding")
+            layouts[parameter] = self._build_parameter_layout(
+                parameter, mesh, self.source_layout_for_parameter(name), sharded=name in sharded,
+                unsharded_shape=self._parameter_shapes.get(name, tuple(parameter.shape)),
+            )
+        return layouts
+
+    @staticmethod
+    def _build_parameter_layout(
+        parameter: torch.nn.Parameter, fsdp_mesh: DeviceMesh, source: Optional[tuple], *,
+        sharded: bool, unsharded_shape: Tuple[int, ...],
+    ) -> Layout:
+        """Describe actual local storage without changing parameters or source metadata.
+
+        Args:
+            parameter: Live parameter after physical FSDP slicing.
+            fsdp_mesh: Selected data-parallel child mesh.
+            source: Source TP/EP placements and mesh before FSDP.
+            sharded: Whether the pass physically sliced this parameter.
+            unsharded_shape: Local shape before FSDP padding and slicing.
+        """
+        mesh = fsdp_mesh
+        placements = [Replicate() for _ in range(mesh.ndim)]
+        shape = tuple(unsharded_shape)
+        axis = None
+        if sharded:
+            axis = next((index for index, name in enumerate(mesh.mesh_dim_names or ())
+                         if name in ("fsdp_shard", "edp_shard", "fsdp", "dp", "dp_shard")), None)
+            if axis is None or parameter.ndim == 0:
+                raise ValueError("A physically sharded parameter requires a shard mesh axis and a non-scalar shape")
+            shape = (parameter.shape[0] * mesh.size(axis), *shape[1:])
+        if source is not None and source[1] is not None:
+            source_placements, source_mesh = source
+            source_layout = Layout.from_device_mesh(source_mesh)
+            source_layout.set_placements(tuple(source_placements))
+            source_layout.placement_to_tensor_map(len(shape))
+            shape = source_layout.get_global_shape(shape)
+            mesh = DeviceMesh.concatenate([fsdp_mesh, source_mesh])
+            placements.extend(source_placements)
+        if axis is not None:
+            split_factor = math.prod(mesh.mesh_shape[index] for index, value in enumerate(placements)
+                                     if index != axis and value.is_shard(0))
+            placements[axis] = StridedShard(0, split_factor) if split_factor > 1 else Shard(0)
+        layout = Layout.from_device_mesh(mesh)
+        layout.set_placements(tuple(placements))
+        layout.placement_to_tensor_map(len(shape))
+        layout.set_tensor_meta(tuple(shape), make_contiguous_strides_for(shape), parameter.dtype)
+        return layout
+
+    def _bind_parameter_meshes(self) -> None:
+        """Reuse eager unit discovery and managed identities without eager hooks."""
+        self._parameter_meshes = {}
+        self._parameter_groups = {}
+        if not isinstance(self._fsdp_config, FSDP2Config) or self._mesh_context is None:
+            return
+        manager = FSDP2Manager(self._fsdp_config, self._mesh_context)
+        bindings = manager.parameter_mesh_bindings(self.model, self.source_shard_info)
+        registered = {}
+        for name, parameter in self.model.named_parameters(remove_duplicate=False):
+            mesh = bindings.get(parameter)
+            if mesh is None:
+                continue
+            self._parameter_meshes[name] = mesh
+            shard = mesh[mesh.mesh_dim_names[-1]]
+            ranks = tuple(shard.rank_list)
+            if ranks not in registered:
+                group = f"fsdp_unit_{len(registered)}"
+                self._register_mesh_group(group, shard)
+                registered[ranks] = group
+            self._parameter_groups[name] = (registered[ranks], shard.size())
+
     def _init_device_mesh(self, mesh_context: Optional[Any] = None):
         """Initialize the DP process group(s) for the configured ``dp_mode``.
 
@@ -294,6 +459,7 @@ class GraphCompiler:
                 rank_list=rank_list,
                 init_backend=True,
             )
+            self._fsdp_mesh = mesh
             self._register_mesh_group("dp_replicate", mesh["fsdp_replicate"])
             self.pass_config.dp_replicate_degree = mesh["fsdp_replicate"].size()
             return
@@ -307,6 +473,7 @@ class GraphCompiler:
                 rank_list=rank_list,
                 init_backend=True,
             )
+            self._fsdp_mesh = mesh
             self._register_mesh_group("dp_replicate", mesh["fsdp_replicate"])
             self._register_mesh_group("fsdp", mesh["fsdp_shard"])
             self.pass_config.dp_replicate_degree = mesh["fsdp_replicate"].size()
@@ -321,6 +488,7 @@ class GraphCompiler:
             rank_list=rank_list,
             init_backend=True,
         )
+        self._fsdp_mesh = mesh
         self._register_mesh_group("fsdp", mesh["fsdp_shard"])
         # Back-fill, mirroring the external-mesh branch: FSDPPass resolves the
         # group size from ``fsdp_degree`` (falling back to world_size when
@@ -333,9 +501,9 @@ class GraphCompiler:
         if context is None or getattr(context, "ep_size", 1) <= 1:
             return
         if any(
-            getattr(context, axis, 1) != 1 for axis in ("tp_size", "cp_size", "pp_size")
+            getattr(context, axis, 1) != 1 for axis in ("cp_size", "pp_size")
         ):
-            raise ValueError("Graph EP currently requires TP=CP=PP=1")
+            raise ValueError("Graph EP currently requires CP=PP=1")
         if self.pass_config.enable_overlap:
             raise ValueError("Graph EP currently requires enable_overlap=False")
 
@@ -367,7 +535,8 @@ class GraphCompiler:
         }
         if not self._expert_param_names:
             raise ValueError("Graph EP requires bound local expert parameters")
-        self._register_mesh_group("fsdp_expert", mesh["edp_shard"])
+        self._expert_fsdp_mesh = mesh["edp_shard"]
+        self._register_mesh_group("fsdp_expert", self._expert_fsdp_mesh)
 
     def _init_pp_dp_mesh(
         self, dp_mode: str, mesh_context: Optional[Any] = None
@@ -459,6 +628,7 @@ class GraphCompiler:
         self, mesh: Any, dp_mode: str, dp_mesh_name: str, pp_degree: int, dp_degree: int
     ) -> None:
         """Register both hybrid groups and back-fill the pass-config degrees."""
+        self._fsdp_mesh = mesh[dp_mesh_name]
         self._register_mesh_group("pp", mesh["pp"])
         self._register_mesh_group(
             "fsdp" if dp_mesh_name == "fsdp_shard" else "dp_replicate",
@@ -478,7 +648,7 @@ class GraphCompiler:
             return "npu"
         return "cpu"
 
-    def _init_mesh_from_context(self, mesh_context: Any, dp_mode: str) -> None:
+    def _init_mesh_from_context(self, mesh_context: Any, dp_mode: str, *, register_groups: bool = True) -> None:
         """Resolve and register the DP group(s) from an automodel ``MeshContext``.
 
         Reuses automodel's already-built mesh (boundary forwards hold the TP
@@ -487,6 +657,11 @@ class GraphCompiler:
         / ``"fsdp"``. The effective mode is first reconciled with the mesh
         topology (see ``_reconcile_mode_with_context``), mirroring the eager
         ``FSDP2Manager`` which picks HSDP from ``dp_replicate_size > 1``.
+
+        Args:
+            mesh_context: Existing data/model parallel topology.
+            dp_mode: Requested data-parallel mode.
+            register_groups: False for metadata-only access in plain graph mode.
         """
         fsdp_mesh = (
             getattr(mesh_context, "fsdp_non_moe_mesh", None) or mesh_context.device_mesh
@@ -504,13 +679,15 @@ class GraphCompiler:
                     f"dims {names}"
                 )
             sub = fsdp_mesh[dim]
-            self._register_mesh_group("dp_replicate", sub)
+            self._fsdp_mesh = sub
+            if register_groups:
+                self._register_mesh_group("dp_replicate", sub)
             self.pass_config.dp_replicate_degree = sub.size()
             return
 
         if dp_mode == "hsdp":
             rep_dim = self._first_dim(names, ("fsdp_replicate", "dp_replicate"))
-            shard_dim = self._first_dim(names, ("fsdp_shard", "fsdp", "dp"))
+            shard_dim = self._first_dim(names, ("fsdp_shard", "fsdp", "dp_shard", "dp"))
             if rep_dim is None or shard_dim is None:
                 raise ValueError(
                     "dp_mode='hsdp' needs both a replicate axis "
@@ -519,8 +696,14 @@ class GraphCompiler:
                 )
             rep_sub = fsdp_mesh[rep_dim]
             shard_sub = fsdp_mesh[shard_dim]
-            self._register_mesh_group("dp_replicate", rep_sub)
-            self._register_mesh_group("fsdp", shard_sub)
+            if shard_dim == "dp_shard" and "cp" in names:
+                shard_sub = fsdp_mesh[(shard_dim, "cp")].flatten("fsdp_shard")
+                self._fsdp_mesh = DeviceMesh.concatenate([rep_sub, shard_sub])
+            else:
+                self._fsdp_mesh = fsdp_mesh[(rep_dim, shard_dim)]
+            if register_groups:
+                self._register_mesh_group("dp_replicate", rep_sub)
+                self._register_mesh_group("fsdp", shard_sub)
             self.pass_config.dp_replicate_degree = rep_sub.size()
             self.pass_config.fsdp_degree = shard_sub.size()
             return
@@ -528,9 +711,13 @@ class GraphCompiler:
         # dp_mode == "fsdp": automodel's fsdp_non_moe_mesh is
         # ("fsdp_replicate","fsdp_shard","tp"); device_mesh (cp=1) is
         # ("dp","cp","tp") and "dp" is the FSDP axis.
-        dim = "fsdp_shard" if "fsdp_shard" in names else "dp"
+        dim = self._first_dim(names, ("fsdp_shard", "dp_shard", "dp"))
         sub = fsdp_mesh[dim]
-        self._register_mesh_group("fsdp", sub)
+        if dim == "dp_shard" and "cp" in names:
+            sub = fsdp_mesh[(dim, "cp")].flatten("fsdp_shard")
+        self._fsdp_mesh = sub
+        if register_groups:
+            self._register_mesh_group("fsdp", sub)
         self.pass_config.fsdp_degree = sub.size()
 
     def _reconcile_mode_with_context(self, mesh_context: Any, dp_mode: str) -> str:
@@ -633,9 +820,12 @@ class GraphCompiler:
 
         if self.pass_config.fsdp_enabled:
             kwargs["fsdp_group_name"] = "fsdp"
+            if self._parameter_groups:
+                kwargs["parameter_groups"] = self._parameter_groups
             if self._expert_param_names:
                 kwargs["expert_param_names"] = self._expert_param_names
                 kwargs["expert_fsdp_group_name"] = "fsdp_expert"
+            kwargs.update(self._source_reduction_kwargs())
             # DDP / HSDP also reduce gradients on the replicate axis.
             if normalize_dp_mode(self.pass_config.dp_mode) in ("ddp", "hsdp"):
                 kwargs["dp_replicate_group_name"] = "dp_replicate"
@@ -648,6 +838,44 @@ class GraphCompiler:
             kwargs["pp_group_name"] = self._pp_group_name
 
         return kwargs
+
+    def _source_reduction_kwargs(self) -> dict:
+        """Lower eager source-layout normalization and replicated-axis synchronization."""
+        names = (
+            dict(self.model.named_parameters(remove_duplicate=False))
+            if self.source_shard_info is not None else self._expert_param_names
+        )
+        if not names:
+            return {}
+        if self._mesh_context is None:
+            raise ValueError("Graph source-layout reduction requires MeshContext")
+        context = self._mesh_context
+        loss_replicas = 1 if context.loss_parallel else context.tp_size
+        reduction = GradientReduction("sum", context.dp_size * context.cp_size * loss_replicas)
+        result = {"gradient_reductions": dict.fromkeys(names, reduction)}
+        if self.source_shard_info is None:
+            return result
+        groups, registered = {}, {}
+        for name in names:
+            layout = self.source_layout_for_parameter(name)
+            if layout is None:
+                continue
+            placements, mesh = layout
+            if mesh is None or not placements:
+                continue
+            axes = tuple(axis for index, axis in enumerate(mesh.mesh_dim_names)
+                         if placements[index].is_replicate() and mesh.size(index) > 1)
+            if not axes:
+                continue
+            replica_mesh = mesh[axes].flatten()
+            ranks = tuple(replica_mesh.rank_list)
+            if ranks not in registered:
+                group_name = f"fsdp_source_{len(registered)}"
+                self._register_mesh_group(group_name, replica_mesh)
+                registered[ranks] = group_name
+            groups[name] = registered[ranks]
+        result["source_gradient_groups"] = groups
+        return result
 
     def _run_graph(self, **inputs):
         """Execute compiled graph"""

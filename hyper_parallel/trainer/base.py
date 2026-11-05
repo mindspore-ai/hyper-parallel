@@ -587,6 +587,7 @@ class BaseTrainer(Stateful, ABC):
             trainer_config=self.config,
             device=self.device,
             mesh_context=self.mesh,
+            source_shard_info=getattr(self.model, "_source_shard_info", None),
         )
 
     def _graph_train_fn(
@@ -947,8 +948,10 @@ class BaseTrainer(Stateful, ABC):
             return preparation.global_norm
         grad_norm: Any = 0.0
         post_clip_norm = None
+        compiler = getattr(self, "graph_compiler", None)
+        clip_kwargs = {"parameter_layouts": compiler.parameter_layouts} if compiler is not None else {}
         if max_grad_norm > 0:
-            grad_norm = clip_grad_norm_(self.model, max_grad_norm)
+            grad_norm = clip_grad_norm_(self.model, max_grad_norm, **clip_kwargs)
             if self.model_integration.runtime_enabled:
                 grad_norm_value = (
                     float(grad_norm.item())
@@ -961,7 +964,7 @@ class BaseTrainer(Stateful, ABC):
                 )
                 post_clip_norm = grad_norm_value * clip_coefficient
         elif self.model_integration.runtime_enabled:
-            grad_norm = clip_grad_norm_(self.model, float("inf"))
+            grad_norm = clip_grad_norm_(self.model, float("inf"), **clip_kwargs)
             post_clip_norm = grad_norm
         self.model_integration.after_clip(post_clip_norm)
         return grad_norm

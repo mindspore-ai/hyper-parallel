@@ -38,6 +38,7 @@ from torch.nn import Parameter as ParameterClass
 
 import hyper_parallel.core.fully_shard.utils as fully_shard_utils
 from hyper_parallel import DeviceMesh, HSDPModule, fully_shard
+from hyper_parallel.core.fully_shard.hsdp_utils import get_managed_modules_parameters
 from hyper_parallel.distributed._builder.source_shard import (
     SourceShardInfoByFQN,  # pylint: disable=unused-import
     SourceShardInfoByParam,  # pylint: disable=unused-import
@@ -169,6 +170,37 @@ class FSDP2Manager:
         if dense_mesh is not None:
             return dense_mesh
         return self._build_compatibility_fsdp_mesh()
+
+    def parameter_mesh_bindings(
+        self, model: ModuleClass, source_shard_info: SourceShardInfoByFQN | None,
+        ignored_params: set[ParameterClass] | None = None,
+    ) -> dict[ParameterClass, DeviceMesh]:
+        """Resolve unit-owned parameter meshes without installing FSDP hooks.
+
+        Args:
+            model: Final model before graph capture or eager wrapping.
+            source_shard_info: The planner's non-FSDP parameter placements.
+            ignored_params: Parameters managed outside FSDP.
+
+        The same managed-parameter selector runs inside-out in both paths.
+        Claimed identities model the initialized inner units, including tied
+        aliases; nearest-parent ownership alone would not match fully_shard.
+        """
+        metadata = _build_source_shard_info_by_param(self, model, source_shard_info)
+        units = self._find_wrap_modules(model, metadata)
+        units = [unit.module for unit in sorted(units, key=lambda unit: unit.fqn.count("."), reverse=True)]
+        claimed = set(ignored_params or ())
+        bindings = {}
+        for owner in [*units, model]:
+            parameters = get_managed_modules_parameters((owner,), claimed)
+            source = _build_managed_source_shard_info(self, owner, metadata, claimed)
+            expert = self._uses_expert_mesh(source)
+            if owner is model and expert:
+                raise ValueError("Routed expert parameters must belong to a nested experts FSDP unit")
+            mesh = self._build_fsdp_actual_mesh(expert)
+            bindings.update(dict.fromkeys(parameters, mesh))
+            claimed.update(parameters)
+        return bindings
 
     def _resolve_custom_params(
         self, parameters_by_fqn: Mapping[str, ParameterClass]

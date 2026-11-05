@@ -14,6 +14,7 @@
 # ============================================================================
 """Unit tests for graph-mode integration helpers."""
 
+import math
 import os
 import unittest
 from contextlib import nullcontext
@@ -27,7 +28,15 @@ import torch
 from hyper_parallel.compile.compiler import GraphCompiler
 from hyper_parallel.compile.pass_config import PassConfig, build_pass_config_from_trainer_config
 from hyper_parallel.compile.trainer import GraphTrainer
+from hyper_parallel.core.dtensor.device_mesh import clear_device_mesh_cache, init_device_mesh
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.layout import infer_slice_area_by_layout
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
+from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
+from hyper_parallel.core.fully_shard.utils import FSDPMeshInfo
+from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 from hyper_parallel.distributed.compile import _resolve_compile_config
+from hyper_parallel.distributed.mesh import MeshContext
 from hyper_parallel.models._transformers.model_builder import instantiate_infrastructure
 from hyper_parallel.models.build_options import CompileConfig
 from hyper_parallel.trainer.base import BaseTrainer
@@ -80,6 +89,8 @@ class TestGraphModeIntegration(unittest.TestCase):
             fsdp_config=SimpleNamespace(dp_shard_size=1, edp_shard_size=1),
         )
         base.model = torch.nn.Linear(2, 2)
+        source_info = {"weight": ((), None)}
+        base.model._source_shard_info = source_info
         base.device = torch.device("cpu")
         base.mesh = SimpleNamespace()
         base.model_fwd_context = nullcontext()
@@ -92,6 +103,7 @@ class TestGraphModeIntegration(unittest.TestCase):
 
         self.assertIsInstance(base.graph_compiler, GraphCompiler)
         self.assertEqual(base.graph_compiler.train_fn.__self__, base)
+        self.assertIs(base.graph_compiler.source_shard_info, source_info)
 
         base.config.compile = CompileConfig(enabled=True, use_joint_graph=False)
         base.graph_compiler = None
@@ -420,6 +432,113 @@ class TestGraphModeIntegration(unittest.TestCase):
             pass_config.enable_overlap,
             f"overlap flag mismatch: expected=True, got={pass_config.enable_overlap}",
         )
+
+
+class TestGraphParameterLayout(unittest.TestCase):
+    """Graph-local storage metadata preserves source order and padding."""
+
+    def setUp(self) -> None:
+        """Keep synthetic CPU meshes independent across cases."""
+        clear_device_mesh_cache()
+        self.addCleanup(clear_device_mesh_cache)
+
+    @staticmethod
+    def _mesh(shape, names):
+        """Construct a metadata-only CPU mesh without a process group."""
+        return init_device_mesh("cpu", shape, mesh_dim_names=names,
+                                rank_list=tuple(range(math.prod(shape))), init_backend=False)
+
+    def test_same_dim_shards_preserve_source_first_order(self):
+        """Graph metadata preserves source coordinates without mutating them."""
+        mesh = self._mesh((2, 4), ("fsdp_shard", "tp"))
+        source = [Shard(0)]
+        parameter = torch.nn.Parameter(torch.zeros(2, 3))
+        layout = GraphCompiler._build_parameter_layout(
+            parameter, mesh["fsdp_shard"], (source, mesh["tp"]),
+            sharded=True, unsharded_shape=(4, 3),
+        )
+        self.assertEqual(layout.tensor_shape, (16, 3))
+        self.assertEqual(layout.tensor_stride, (3, 1))
+        self.assertEqual(layout.tensor_dtype, torch.float32)
+        self.assertEqual(layout.placements, (StridedShard(0, split_factor=4), Shard(0)))
+        self.assertEqual(source, [Shard(0)])
+
+    def test_eager_placement_input_and_noncontiguous_stride_contract(self):
+        """Restored eager methods retain list mutation and logical strides."""
+        mesh = self._mesh((2, 4), ("dp", "tp"))
+        state = object.__new__(HSDPParamV2)
+        state.mesh_info = object.__new__(FSDPMeshInfo)
+        state._spmd_mesh = mesh
+        state._spmd_shard_mesh_dim = 0
+        placements = [Replicate(), Shard(1)]
+        actual = state._apply_data_parallel_placements(placements, Shard(1))
+        expected = (StridedShard(1, split_factor=4), Shard(1))
+        self.assertEqual(actual, expected)
+        self.assertEqual(tuple(placements), expected)
+        state._spmd_placements = actual
+        source = DTensor.from_local(torch.zeros(4, 3).t(), mesh, (Replicate(), Shard(1)),
+                                    shape=(3, 16), stride=(1, 3))
+        layout = state._build_sharding_spec(source, source.to_local())
+        self.assertEqual(layout.tensor_shape, (3, 16))
+        self.assertEqual(layout.tensor_stride, (1, 3))
+        self.assertEqual(layout.placements, expected)
+
+    def test_distinct_dims_and_replication_do_not_add_strided_shards(self):
+        """Retain ordinary sharding when the source splits another dimension."""
+        mesh = self._mesh((2, 4), ("fsdp_shard", "tp"))
+        parameter = torch.nn.Parameter(torch.zeros(2, 3))
+        for source in (Replicate(), Shard(1)):
+            with self.subTest(source=source):
+                layout = GraphCompiler._build_parameter_layout(
+                    parameter, mesh["fsdp_shard"], ((source,), mesh["tp"]),
+                    sharded=True, unsharded_shape=(4, 3),
+                )
+                self.assertEqual(layout.placements, (Shard(0), source))
+
+    def test_graph_padding_is_applied_before_restoring_source_global_shape(self):
+        """Describe equal physical chunks after padding and source sharding."""
+        mesh = self._mesh((2, 2), ("fsdp_shard", "tp"))
+        parameter = torch.nn.Parameter(torch.zeros(2, 4))
+        layout = GraphCompiler._build_parameter_layout(
+            parameter, mesh["fsdp_shard"], ((Shard(0),), mesh["tp"]),
+            sharded=True, unsharded_shape=(3, 4),
+        )
+        self.assertEqual(layout.tensor_shape, (8, 4))
+        for rank in range(4):
+            area = infer_slice_area_by_layout(layout, rank, layout.tensor_shape)
+            self.assertEqual(tuple(end - start for start, end in area), (2, 4))
+
+    def test_replicated_scalar_and_invalid_shard_axis(self):
+        """Keep scalars replicated and reject invalid physical declarations."""
+        mesh = self._mesh((2,), ("fsdp_replicate",))
+        scalar = torch.nn.Parameter(torch.tensor(1.))
+        layout = GraphCompiler._build_parameter_layout(scalar, mesh, None, sharded=False, unsharded_shape=())
+        self.assertEqual(layout.tensor_shape, ())
+        self.assertEqual(layout.placements, (Replicate(),))
+        for parameter in (scalar, torch.nn.Parameter(torch.ones(2))):
+            with self.subTest(shape=parameter.shape), self.assertRaisesRegex(ValueError, "shard mesh axis"):
+                GraphCompiler._build_parameter_layout(parameter, mesh, None,
+                                                      sharded=True, unsharded_shape=parameter.shape)
+
+    def test_unit_mesh_selection_dense_expert_and_world_fallback(self):
+        """Original manager methods preserve dense, expert and world rules."""
+        dense = self._mesh((2, 2, 2), ("fsdp_replicate", "fsdp_shard", "tp"))
+        expert = self._mesh((1, 2, 4), ("edp_replicate", "edp_shard", "ep"))
+        manager = object.__new__(FSDP2Manager)
+        manager.mesh_context = MeshContext(fsdp_non_moe_mesh=dense, fsdp_moe_mesh=expert, dp_replicate_size=2)
+        self.assertEqual(manager._build_fsdp_actual_mesh().mesh_dim_names, ("fsdp_replicate", "fsdp_shard"))
+        self.assertEqual(manager._build_fsdp_actual_mesh(True).mesh_dim_names, ("edp_replicate", "edp_shard"))
+        world = self._mesh((2, 2, 2), ("dp_replicate", "dp_shard", "cp"))
+        manager.mesh_context = MeshContext(device_mesh=world)
+        fallback = manager._build_fsdp_actual_mesh()
+        self.assertEqual(fallback.mesh_dim_names, ("dp_replicate", "fsdp_shard"))
+        self.assertEqual(fallback.mesh_shape, (2, 4))
+        manager.mesh_context = MeshContext(fsdp_non_moe_mesh=dense)
+        with self.assertRaisesRegex(ValueError, "fsdp_moe_mesh"):
+            manager._build_fsdp_actual_mesh(True)
+        manager.mesh_context = MeshContext()
+        with self.assertRaisesRegex(ValueError, "fsdp_non_moe_mesh"):
+            manager._build_fsdp_actual_mesh()
 
 
 if __name__ == "__main__":
