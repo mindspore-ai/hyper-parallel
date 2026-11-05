@@ -43,7 +43,8 @@ def build_optimizer(*, model: nn.Module, muon_config: dict[str, Any], adamw_conf
     ``native`` uses whole matrices; ``mindformers_pynative`` uses logical
     matrix callbacks and requires fused linear_qkv attention. AdamW excludes
     one-dimensional parameters and biases from decay. A zero threshold disables
-    QK clipping.
+    QK clipping. With clipping enabled, both MLA up-projections must be
+    trainable Muon parameters; optimizer-state swap does not support their hook.
 
     Args:
         model: Model after recipe module replacements.
@@ -70,8 +71,14 @@ def build_optimizer(*, model: nn.Module, muon_config: dict[str, Any], adamw_conf
     if qk_clip_threshold > 0:
         attention = [module for module in model.modules()
                      if hasattr(module, "q_b_proj") and hasattr(module, "kv_b_proj")]
-        # Chain hooks run after all leaves and before FP32 main-weight copy-back.
-        builder.get_optimizer().register_step_post_hook(
+        muon = builder.get_optimizer().optimizers_dict["muon"]
+        owned = {id(parameter) for group in muon.param_groups for parameter in group["params"]}
+        if not attention or any(
+                not projection.weight.requires_grad or id(projection.weight) not in owned
+                for module in attention for projection in (module.q_b_proj, module.kv_b_proj)):
+            raise ValueError("QK clipping requires trainable q_b_proj and kv_b_proj weights owned by Muon")
+        # The FP32 main-weight wrapper copies model weights back after the leaf step.
+        muon.register_step_post_hook(
             lambda _optimizer, _args, _kwargs: clip_qk(attention, qk_clip_threshold)
         )
     return builder
