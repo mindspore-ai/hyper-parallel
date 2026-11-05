@@ -20,20 +20,15 @@ import ast
 from collections import defaultdict
 from typing import Iterable
 
-from hyper_parallel.codegen.astkit.edits import (
-    TextEdit,
-    apply_edits,
-    insert_after_imports,
-    replace_function_body,
-)
+from hyper_parallel.codegen.astkit.edits import TextEdit, apply_edits
 from hyper_parallel.codegen.astkit.index import build_source_index
+from hyper_parallel.codegen.inline.declaration_edits import declaration_edits
+from hyper_parallel.codegen.inline.forward_edits import forward_extract_edits
+from hyper_parallel.codegen.inline.definition_edits import apply_class_removals
 from hyper_parallel.codegen.inline.ir import (
-    ClassRemovalPatch,
     ConstructorReplacePatch,
     ForwardExtractPatch,
-    ImportPatch,
     InlinePatchSet,
-    ModuleSnippetPatch,
 )
 
 
@@ -48,93 +43,130 @@ def apply_patch_set(source_text: str, patch_set: InlinePatchSet) -> str:
         The patched source text.
     """
 
-    first_pass: list[TextEdit] = []
+    text, hits = _apply_source_declarations(source_text, patch_set)
+    text = _apply_constructor_followups(text, patch_set, hits)
+    return _apply_forward_patches(text, patch_set.forward_extracts)
+
+
+def _apply_source_declarations(
+    source_text: str, patch_set: InlinePatchSet
+) -> tuple[str, dict[str, int]]:
+    """Apply top-level declarations and the first constructor rewrite wave."""
     index = build_source_index(source_text)
-    import_edit = _import_edit(source_text, index.import_end, index.docstring_end, patch_set.imports)
-    if import_edit is not None:
-        first_pass.append(import_edit)
-    snippet_edit = _snippet_edit(source_text, index.import_end, index.docstring_end, patch_set.module_snippets)
-    if snippet_edit is not None:
-        first_pass.append(snippet_edit)
-    first_pass.extend(_constructor_edits(source_text, patch_set.constructor_replaces))
-    text = apply_edits(source_text, first_pass) if first_pass else source_text
-
-    if patch_set.class_removals:
-        text = _apply_class_removals(text, patch_set.class_removals)
-
-    second_pass: list[TextEdit] = []
-    second_pass.extend(_forward_extract_edits(text, patch_set.forward_extracts))
-    return apply_edits(text, second_pass) if second_pass else text
-
-
-def _import_edit(
-    source_text: str,
-    import_end: int | None,
-    docstring_end: int | None,
-    imports: Iterable[ImportPatch],
-) -> TextEdit | None:
-    lines = _render_imports(source_text, imports)
-    if not lines:
-        return None
-    return insert_after_imports(
+    edits = declaration_edits(
         source_text,
-        import_end,
-        "\n" + "\n".join(lines) + "\n",
-        default_offset=docstring_end or 0,
+        index.import_end,
+        index.docstring_end,
+        patch_set.imports,
+        patch_set.module_snippets,
     )
+    waves = _constructor_waves(list(patch_set.constructor_replaces))
+    hits: dict[str, int] = defaultdict(int)
+    if waves:
+        edits.extend(_constructor_edits(source_text, waves[0], hits))
+    text = apply_edits(source_text, edits) if edits else source_text
+    for wave in waves[1:]:
+        wave_edits = _constructor_edits(text, wave, hits)
+        if wave_edits:
+            text = apply_edits(text, wave_edits)
+    return text, hits
 
 
-def _render_imports(source_text: str, imports: Iterable[ImportPatch]) -> list[str]:
-    """Render import patches as deduplicated, grouped import lines."""
-    grouped: dict[str, set[str]] = defaultdict(set)
-    lines: list[str] = []
-    for patch in imports:
-        if patch.raw:
-            if patch.raw not in source_text:
-                lines.append(patch.raw)
-            continue
-        grouped[patch.module].update(patch.names)
-    for module in sorted(grouped):
-        names = tuple(sorted(grouped[module]))
-        line = f"from {module} import {', '.join(names)}"
-        if line not in source_text:
-            lines.append(line)
-    return lines
-
-
-def _snippet_edit(
+def _apply_constructor_followups(
     source_text: str,
-    import_end: int | None,
-    docstring_end: int | None,
-    snippets: Iterable[ModuleSnippetPatch],
-) -> TextEdit | None:
-    parts = [snippet.text.strip("\n") for snippet in snippets if snippet.text.strip()]
-    if not parts:
-        return None
-    return insert_after_imports(
+    patch_set: InlinePatchSet,
+    hits: dict[str, int],
+) -> str:
+    """Apply deferred replacements, validate scopes, and remove replaced classes."""
+    deferred_edits = _deferred_replacement_edits(
         source_text,
-        import_end,
-        "\n\n" + "\n\n".join(parts) + "\n",
-        default_offset=docstring_end or 0,
+        patch_set.constructor_replaces,
+        hits,
+    )
+    if deferred_edits:
+        source_text = apply_edits(source_text, deferred_edits)
+    if patch_set.constructor_replaces:
+        _require_scoped_rewrites(patch_set.constructor_replaces, hits)
+    if patch_set.class_removals:
+        source_text = apply_class_removals(source_text, patch_set.class_removals)
+    return source_text
+
+
+def _apply_forward_patches(
+    source_text: str, patches: Iterable[ForwardExtractPatch]
+) -> str:
+    """Apply forward extraction only after the source structure has settled."""
+    edits = forward_extract_edits(source_text, patches)
+    return apply_edits(source_text, edits) if edits else source_text
+
+
+def _constructor_waves(
+    patch_list: list[ConstructorReplacePatch],
+) -> list[list[ConstructorReplacePatch]]:
+    """Group constructor rewrites into dependency-ordered waves.
+
+    Two compositions force a later wave, re-parsed from the previous
+    wave's output: a patch whose ``old_ctor`` another remaining patch
+    introduces (an ``A -> B`` wrap retargeted further by a ``B -> C``
+    patch), and a ``name`` retarget sharing its ``old_ctor`` with a
+    ``wrap_source`` patch — the inline CP subclass retargets the
+    *outer* wrapper call the wrap introduced, and applying the name
+    swap first would consume the call site the wrap still needs (a
+    scoped wrap with no call site fails loudly, so the order is not
+    optional).
+    """
+
+    remaining = list(patch_list)
+    waves: list[list[ConstructorReplacePatch]] = []
+    while remaining:
+        introduced = {
+            patch.new_ctor for patch in remaining if patch.new_ctor != patch.old_ctor
+        }
+        wave = [patch for patch in remaining if _is_wave_ready(patch, remaining, introduced)]
+        if not wave:
+            names = sorted({patch.old_ctor for patch in remaining})
+            raise ValueError(
+                f"codegen: constructor replacement dependency cycle among {names}"
+            )
+        chosen = {id(patch) for patch in wave}
+        remaining = [patch for patch in remaining if id(patch) not in chosen]
+        waves.append(wave)
+    return waves
+
+
+def _is_wave_ready(
+    patch: ConstructorReplacePatch,
+    remaining: list[ConstructorReplacePatch],
+    introduced: set[str],
+) -> bool:
+    """Return whether a constructor patch has no remaining dependency."""
+    if patch.old_ctor in introduced:
+        return False
+    if patch.mode != "name":
+        return True
+    return not any(
+        other is not patch
+        and other.mode == "wrap_source"
+        and other.old_ctor == patch.old_ctor
+        for other in remaining
     )
 
 
 def _constructor_edits(
     source_text: str,
-    patches: Iterable[ConstructorReplacePatch],
+    patches: list[ConstructorReplacePatch],
+    hits: dict[str, int],
 ) -> list[TextEdit]:
     """Build the edits that swap constructor calls per patch target."""
-    patch_list = list(patches)
     patches_by_old: dict[str, list[ConstructorReplacePatch]] = defaultdict(list)
-    for patch in patch_list:
+    for patch in patches:
         patches_by_old[patch.old_ctor].append(patch)
     if not patches_by_old:
         return []
-    scopes = _scopes_by_old_ctor(patch_list)
+    scopes = _scopes_by_old_ctor(patches)
     tree = ast.parse(source_text)
     offsets = _line_offsets(source_text)
     edits: list[TextEdit] = []
-    hits: dict[str, int] = defaultdict(int)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Assign):
             continue
@@ -163,7 +195,6 @@ def _constructor_edits(
             edits.append(TextEdit(start, end, replacement))
         else:
             raise ValueError(f"unknown constructor replacement mode: {patch.mode!r}")
-    _require_scoped_rewrites(patch_list, hits)
     return _drop_nested_edits(edits)
 
 
@@ -227,6 +258,93 @@ def _require_scoped_rewrites(
         )
 
 
+def _deferred_replacement_edits(
+    source_text: str,
+    patches: Iterable[ConstructorReplacePatch],
+    hits: dict[str, int],
+) -> list[TextEdit]:
+    """Install observed wrappers after an imported owner built its subtree.
+
+    Some source models inherit a decoder whose constructor lives in an
+    installed dependency. The copied modeling unit therefore has no direct
+    constructor call to rewrite. For a wrap-style replacement, the native
+    operation is still expressible exactly: wait until the root model has
+    built the observed FQNs, then replace those module attributes in place.
+    """
+    pending = [
+        patch
+        for patch in patches
+        if patch.scope_fqns and not hits.get(patch.old_ctor)
+    ]
+    if not pending:
+        return []
+    tree = ast.parse(source_text)
+    offsets = _line_offsets(source_text)
+    insertions: dict[int, list[str]] = defaultdict(list)
+    for patch in pending:
+        if patch.mode != "wrap_source":
+            continue
+        root_attr = patch.scope_fqns[0].split(".", 1)[0]
+        constructors = _root_constructors(tree, root_attr)
+        if len(constructors) != 1:
+            continue
+        function = constructors[0]
+        _, end = _node_span(function.body[-1], offsets)
+        insertions[end].append(_render_deferred_replacement(patch))
+        hits[patch.old_ctor] += 1
+    return [
+        TextEdit(offset, offset, "".join(parts))
+        for offset, parts in insertions.items()
+    ]
+
+
+def _root_constructors(tree: ast.Module, root_attr: str) -> list[ast.FunctionDef]:
+    """Return constructors that establish the first segment of an observed FQN."""
+    constructors = []
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for child in node.body:
+            if not isinstance(child, ast.FunctionDef) or child.name != "__init__":
+                continue
+            if any(
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+                and target.attr == root_attr
+                for item in ast.walk(child)
+                if isinstance(item, (ast.Assign, ast.AnnAssign))
+                for target in (
+                    item.targets if isinstance(item, ast.Assign) else (item.target,)
+                )
+            ):
+                constructors.append(child)
+    return constructors
+
+
+def _render_deferred_replacement(patch: ConstructorReplacePatch) -> str:
+    """Render an exact-FQN replacement loop inside a root constructor."""
+    arguments = [
+        argument
+        for argument in patch.keyword_args
+        if not argument.startswith("module_fqn=")
+    ]
+    extra = "".join(f", {argument}" for argument in arguments)
+    fqns = repr(tuple(patch.scope_fqns))
+    return (
+        "\n        _hp_replacement_cache = {}\n"
+        f"        for _hp_fqn in {fqns}:\n"
+        "            _hp_parent_fqn, _, _hp_name = _hp_fqn.rpartition('.')\n"
+        "            _hp_parent = self.get_submodule(_hp_parent_fqn)\n"
+        "            _hp_source = getattr(_hp_parent, _hp_name)\n"
+        "            _hp_key = id(_hp_source)\n"
+        "            if _hp_key not in _hp_replacement_cache:\n"
+        f"                _hp_replacement_cache[_hp_key] = {patch.new_ctor}(\n"
+        f"                    module=_hp_source, module_fqn=_hp_fqn{extra})\n"
+        "            setattr(_hp_parent, _hp_name, _hp_replacement_cache[_hp_key])"
+    )
+
+
 def _drop_nested_edits(edits: list[TextEdit]) -> list[TextEdit]:
     """Keep outer constructor rewrites when constructor calls are nested."""
     kept: list[TextEdit] = []
@@ -237,209 +355,6 @@ def _drop_nested_edits(edits: list[TextEdit]) -> list[TextEdit]:
         kept.append(edit)
         covered_end = edit.end
     return kept
-
-
-def drop_shadowed_definitions(text: str, imported_names: Iterable[str]) -> str:
-    """Remove definitions that shadow a library import of the same name.
-
-    The artifact imports the very helpers the native path calls, but the copied
-    modeling source defines its own module-level helpers with those names, and a
-    local definition wins over the import.  For a *decorated* helper that means
-    a different implementation runs: ``use_kernel_func_from_hub("rotary_pos_emb")``
-    resolves its kernel binding per module, and the generated module is not the
-    module the binding was registered for.  Both paths must therefore end up with
-    the imported implementation, so the shadowing copy is dropped.
-
-    Callers pass names that the *base source* already defines, so the classes and
-    snippets the inline passes render (which share names with library imports on
-    purpose) keep their definitions.
-
-    Args:
-        text: Source to drop the shadowing definitions from.
-        imported_names: Names the library imports bind in module scope.
-
-    Returns:
-        The source with the shadowing definitions removed.
-    """
-
-    names = {name for name in imported_names if name}
-    if not names:
-        return text
-    tree = ast.parse(text)
-    offsets = _line_offsets(text)
-    edits: list[TextEdit] = []
-    for node in tree.body:
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            continue
-        if node.name not in names or not node.decorator_list:
-            continue
-        start, end = _node_span(node, offsets)
-        edits.append(TextEdit(start, _skip_trailing_blank_lines(text, end), ""))
-    if not edits:
-        return text
-    return apply_edits(text, edits)
-
-
-def _name_is_referenced(tree: ast.AST, name: str) -> bool:
-    """Return whether ``name`` still appears as a reference in ``tree``."""
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and node.id == name:
-            return True
-        if isinstance(node, ast.Attribute) and node.attr == name:
-            return True
-    return False
-
-
-def _apply_class_removals(
-    text: str,
-    patches: Iterable[ClassRemovalPatch],
-) -> str:
-    """Rewrite surviving bare references to removed classes, then delete them.
-
-    Runs as a **separate pass** after constructor rewrites so the AST reflects
-    the already-patched text: every ``old_name(...)`` call has become
-    ``new_name(...)`` and only *bare* references (dict values, ``isinstance``
-    targets, annotations) remain.  Those are rewritten to ``new_name`` when
-    they fall outside a class-deletion range; references inside a class being
-    deleted are left alone because the entire block is removed.
-
-    Args:
-        text: Source text after the constructor rewrites.
-        patches: Class removals requested by the replacement specs.
-
-    Returns:
-        The text with unused classes removed.
-    """
-    patch_list = list(patches)
-    if not patch_list:
-        return text
-    tree = ast.parse(text)
-    offsets = _line_offsets(text)
-    names_to_remove, new_name_by_old = _removal_targets(tree, patch_list)
-    if not names_to_remove:
-        return text
-    deletion_ranges, classdef_nodes = _class_deletion_spans(tree, offsets, names_to_remove)
-    edits = _reference_edits(
-        tree, offsets, names_to_remove, new_name_by_old, deletion_ranges
-    )
-    edits.extend(_deletion_edits(text, offsets, patch_list, classdef_nodes))
-    return apply_edits(text, edits) if edits else text
-
-
-def _removal_targets(
-    tree: ast.AST,
-    patch_list: list[ClassRemovalPatch],
-) -> tuple[set[str], dict[str, str]]:
-    """Return the classes still unused after the rewrites, and their renames.
-
-    A scoped rewrite can leave the original class in use -- the recipe keeps
-    the HF Q/K norm while replacing the layer norms -- so a class is removed
-    only once the patched source no longer references it.  Removing a class
-    that is still called would turn a partially replaced model into a
-    ``NameError`` instead of the model the plan described.
-    """
-
-    names = {patch.old_name for patch in patch_list}
-    unused = {name for name in names if not _name_is_referenced(tree, name)}
-    return unused, {patch.old_name: patch.new_name for patch in patch_list}
-
-
-def _class_deletion_spans(
-    tree: ast.AST,
-    offsets: tuple[int, ...],
-    names_to_remove: set[str],
-) -> tuple[list[tuple[int, int]], dict[str, ast.ClassDef]]:
-    """Return the source spans of the removable classes and their nodes."""
-
-    deletion_ranges: list[tuple[int, int]] = []
-    classdef_nodes: dict[str, ast.ClassDef] = {}
-    for node in tree.body:
-        if isinstance(node, ast.ClassDef) and node.name in names_to_remove:
-            classdef_nodes[node.name] = node
-            deletion_ranges.append(_node_span(node, offsets))
-    return deletion_ranges, classdef_nodes
-
-
-def _reference_edits(
-    tree: ast.AST,
-    offsets: tuple[int, ...],
-    names_to_remove: set[str],
-    new_name_by_old: dict[str, str],
-    deletion_ranges: list[tuple[int, int]],
-) -> list[TextEdit]:
-    """Return edits rewriting bare references that survive the deletion."""
-
-    edits: list[TextEdit] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Name) or node.id not in names_to_remove:
-            continue
-        start, end = _node_span(node, offsets)
-        if any(span <= start < stop for span, stop in deletion_ranges):
-            continue
-        edits.append(TextEdit(start, end, new_name_by_old[node.id]))
-    return edits
-
-
-def _deletion_edits(
-    text: str,
-    offsets: tuple[int, ...],
-    patch_list: list[ClassRemovalPatch],
-    classdef_nodes: dict[str, ast.ClassDef],
-) -> list[TextEdit]:
-    """Return edits deleting the removable class blocks and trailing blanks."""
-
-    edits: list[TextEdit] = []
-    for patch in patch_list:
-        cls_node = classdef_nodes.get(patch.old_name)
-        if cls_node is None:
-            continue
-        start, end = _node_span(cls_node, offsets)
-        end = _skip_trailing_blank_lines(text, end)
-        edits.append(TextEdit(start, end, ""))
-    return edits
-
-
-def _skip_trailing_blank_lines(text: str, end: int) -> int:
-    """Advance ``end`` past spaces and blank lines following a deleted block."""
-
-    while end < len(text) and text[end] in " \t":
-        end += 1
-    while end < len(text) and text[end] == "\n":
-        end += 1
-        while end < len(text) and text[end] in " \t":
-            end += 1
-    return end
-
-
-def _forward_extract_edits(
-    source_text: str,
-    patches: Iterable[ForwardExtractPatch],
-) -> list[TextEdit]:
-    """Build the edits that extract patched forwards into impl functions."""
-    if not patches:
-        return []
-    from hyper_parallel.codegen.emit.parallel import (  # pylint: disable=import-outside-toplevel
-        _build_forward_impl_edit,
-    )
-
-    index = build_source_index(source_text)
-    edits: list[TextEdit] = []
-    for patch in patches:
-        cls = index.find_class(patch.class_name)
-        if cls is None:
-            continue
-        func = cls.methods.get(patch.method_name)
-        if func is None:
-            continue
-        impl = _build_forward_impl_edit(
-            source_text,
-            func,
-        )
-        if impl is not None:
-            edits.append(impl)
-        edits.extend(replace_function_body(source_text, func, patch.body, indent="        "))
-    return edits
 
 
 def _call_name(node: ast.AST) -> str | None:

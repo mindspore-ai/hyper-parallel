@@ -62,6 +62,13 @@ def _load_loss():
     return chunked_loss
 
 
+def _load_codegen():
+    """Return the shared Qwen3 fused-attention source renderer lazily."""
+    from hyper_parallel.models.qwen3.adapter import codegen  # pylint: disable=C0415
+
+    return codegen
+
+
 QWEN3_MOE_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Qwen3MoeForCausalLM",
     model_type="qwen3_moe",
@@ -70,6 +77,7 @@ QWEN3_MOE_ADAPTER_SPEC = ModelAdapterSpec(
     context_parallel=_load_context_parallel,
     expert_parallel=_load_expert_parallel,
     loss=_load_loss,
+    codegen=_load_codegen,
 )
 
 register_model_adapter(QWEN3_MOE_ADAPTER_SPEC)

@@ -23,9 +23,9 @@ import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Optional
 
-from torch import nn
+from torch import nn  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.checkpoint.weight_conversion import (
     WeightConverter,
@@ -33,10 +33,23 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
     get_model_conversion_mapping,
 )
 
-
 ModuleReplacementFactory = Callable[..., nn.Module]
 MethodReplacementFactory = Callable[..., Callable[..., Any]]
 logger = logging.getLogger(__name__)
+
+
+class ModuleReplacementMatchError(ValueError):
+    """A required replacement pattern did not match the final model tree."""
+
+    def __init__(self, unmatched: tuple[dict[str, str], ...]) -> None:
+        """Initialize the error with unmatched replacement declarations."""
+        self.unmatched = unmatched
+        patterns = [item["pattern"] for item in unmatched]
+        super().__init__(
+            "module replacement pattern(s) matched no final module: "
+            f"{patterns}. Inspect the finalized module inventory and update the "
+            "adapter pattern; do not silently skip a required replacement."
+        )
 
 
 def module_replacement(factory: ModuleReplacementFactory) -> ModuleReplacementFactory:
@@ -168,8 +181,16 @@ class ModuleReplacementSpec:
     factory: ModuleReplacementFactory
     module_type: type[nn.Module] | None = None
     exact_type: bool = False
+    declaration_id: str = ""
+    replacement_target: Optional[str] = None
+    static_arguments: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        self._validate_match_and_type()
+        self._validate_factory_and_codegen_metadata()
+
+    def _validate_match_and_type(self) -> None:
+        """Validate matching and source-module constraints."""
         if not self.match or any(not isinstance(pattern, str) or not pattern for pattern in self.match):
             raise ValueError("module replacement match must contain non-empty FQN patterns")
         if self.module_type is not None and (
@@ -177,8 +198,17 @@ class ModuleReplacementSpec:
             raise TypeError("module_type must be an nn.Module type")
         if self.exact_type and self.module_type is None:
             raise ValueError("exact_type requires module_type")
+
+    def _validate_factory_and_codegen_metadata(self) -> None:
+        """Validate the factory and optional serializable declaration metadata."""
         if not callable(self.factory) or not getattr(self.factory, "_hp_module_replacement", False):
             raise TypeError("module replacement factory must be decorated with @module_replacement")
+        if not isinstance(self.declaration_id, str):
+            raise TypeError("module replacement declaration_id must be a string")
+        if self.replacement_target is not None and not isinstance(self.replacement_target, str):
+            raise TypeError("module replacement replacement_target must be a string or None")
+        if self.static_arguments is not None and not isinstance(self.static_arguments, Mapping):
+            raise TypeError("module replacement static_arguments must be a mapping or None")
 
 
 @dataclass(frozen=True)
@@ -203,6 +233,7 @@ class ModuleReplacementPlan:
     """Immutable result of matching replacement rules against one model tree."""
 
     targets: tuple[ModuleReplacementTarget, ...]
+    specs: tuple[ModuleReplacementSpec, ...] = ()
 
 
 def _all_module_aliases(model: nn.Module) -> dict[int, tuple[nn.Module, tuple[str, ...]]]:
@@ -245,6 +276,7 @@ def _validate_module_type(
 
 def _select_replacement_spec(
     spec: ModuleReplacementSpec,
+    spec_index: int,
     aliases: dict[int, tuple[nn.Module, tuple[str, ...]]],
     selected: dict[int, ModuleReplacementTarget],
 ) -> None:
@@ -270,10 +302,15 @@ def _select_replacement_spec(
         pattern for pattern, matched_ids in matched_ids_by_pattern.items() if not matched_ids
     ]
     if unmatched_patterns:
-        raise ValueError(
-            "module replacement pattern(s) matched no final module: "
-            f"{unmatched_patterns}. Inspect the finalized module inventory and update the "
-            "adapter pattern; do not silently skip a required replacement."
+        raise ModuleReplacementMatchError(
+            tuple(
+                {
+                    "rule_id": _replacement_rule_id(spec, spec_index),
+                    "pattern": pattern,
+                    "reason": "matched_no_final_module",
+                }
+                for pattern in unmatched_patterns
+            )
         )
 
 
@@ -297,16 +334,48 @@ def compile_module_replacements(
 
     specs = tuple(specs)
     if not specs:
-        return ModuleReplacementPlan(())
+        return ModuleReplacementPlan((), specs)
 
     aliases = _all_module_aliases(model)
     selected: dict[int, ModuleReplacementTarget] = {}
-    for spec in specs:
-        _select_replacement_spec(spec, aliases, selected)
+    for spec_index, spec in enumerate(specs):
+        _select_replacement_spec(spec, spec_index, aliases, selected)
 
     targets = tuple(selected.values())
     _validate_non_nested_targets(targets)
-    return ModuleReplacementPlan(targets)
+    return ModuleReplacementPlan(targets, specs)
+
+
+def _symbol_path(symbol: Any) -> str | None:
+    """Return a stable import-like identity without retaining the symbol."""
+    if symbol is None:
+        return None
+    return f"{symbol.__module__}:{symbol.__qualname__}"
+
+
+def _replacement_rule_id(spec: ModuleReplacementSpec, index: int) -> str:
+    """Return the declared rule id or a stable fallback for Python callers."""
+    if spec.declaration_id:
+        return spec.declaration_id
+    return f"python-replacement-{index:04d}"
+
+
+def describe_replacement_declarations(
+    specs: Iterable[ModuleReplacementSpec],
+) -> tuple[dict[str, Any], ...]:
+    """Project normalized replacement rules to JSON-safe declarations."""
+    return tuple(
+        {
+            "rule_id": _replacement_rule_id(spec, index),
+            "match": list(spec.match),
+            "source_type": _symbol_path(spec.module_type),
+            "exact_type": spec.exact_type,
+            "replacement_target": spec.replacement_target or _symbol_path(spec.factory),
+            "static_arguments": dict(spec.static_arguments or {}),
+            "order": index,
+        }
+        for index, spec in enumerate(specs)
+    )
 
 
 def _parent_and_name(model: nn.Module, fqn: str) -> tuple[nn.Module, str]:
@@ -512,7 +581,8 @@ def _apply_module_replacement_actions(
             "Low-precision online training currently requires TP=CP=EP=PP=1; "
             f"active axes: {active_model_parallel_axes}."
         )
-    plan = compile_module_replacements(model, tuple(replacement_rules or ()))
+    specs = tuple(replacement_rules or ())
+    plan = compile_module_replacements(model, specs)
     return apply_module_replacements(
         model,
         plan,

@@ -45,10 +45,7 @@ from hyper_parallel.models.replacement import (
 )
 from hyper_parallel.distributed import forward_replacement, inner_wrapper
 from hyper_parallel.distributed._builder.rule_resolver import _resolve_local_compute_fn
-from hyper_parallel.codegen.emit.replacement import compile_overrides_for_meta
-from hyper_parallel.codegen.manager import _apply_generation_replacements
-from hyper_parallel.codegen.plan.freeze import freeze_injections
-from hyper_parallel.codegen.spec.project import _canonicalize_override
+from hyper_parallel.codegen.plan.observation import observe_emission_plan
 from hyper_parallel.trainer.config.resolver import ConfigResolutionError, resolve_config
 from hyper_parallel.trainer.config import (
     PlanOverride,
@@ -664,22 +661,11 @@ class TestModuleReplacementYaml(unittest.TestCase):
         apply_module_replacements(model, compile_module_replacements(model, specs))
         self.assertTrue(all(isinstance(module, _ReplacementLinear) for module in model))
         self.assertTrue(all(module.weight is weight for module, weight in zip(model, original_weights)))
-        records = compile_overrides_for_meta(
-            nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4)), specs,
-            factory_paths=[f"{__name__}._replace_linear"],
-        )
-        self.assertEqual({record["fqn"] for record in records}, {"0", "1"})
-        self.assertEqual(records[0]["factory"], f"{__name__}._replace_linear")
-        self.assertIn("replace", _canonicalize_override(rule))
-
         wrong_type = PlanOverride(match="0", replace=ReplaceAction(
             kind="module", source_type="torch.nn.Conv2d", implementation=f"{__name__}._replace_linear"))
         mismatched = entries_to_module_replacements([wrong_type])
-        with self.assertRaisesRegex(TypeError, "replace.kind=module"):
-            compile_overrides_for_meta(
-                nn.Sequential(nn.Linear(4, 4)), mismatched,
-                factory_paths=[f"{__name__}._replace_linear"],
-            )
+        with self.assertRaisesRegex(TypeError, "expected Conv2d"):
+            compile_module_replacements(nn.Sequential(nn.Linear(4, 4)), mismatched)
 
     def test_new_module_action_infers_source_type_from_match(self):
         """A module rule without source_type uses each matched source instance."""
@@ -695,24 +681,9 @@ class TestModuleReplacementYaml(unittest.TestCase):
         specs = entries_to_module_replacements(config.plan_overrides)
         self.assertIsNone(specs[0].module_type)
 
-        meta_model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
-        records = compile_overrides_for_meta(
-            meta_model, specs, factory_paths=[f"{__name__}._replace_linear"]
-        )
-        self.assertEqual({record["module_type"] for record in records}, {
-            f"{nn.Linear.__module__}.{nn.Linear.__qualname__}"
-        })
-
-        generated_model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
-        dims = SimpleNamespace(tp_size=1, cp_size=1, ep_size=1, pp_size=1, sequence_parallel=False)
-        generated_records = _apply_generation_replacements(
-            SimpleNamespace(), SimpleNamespace(plan_overrides=config.plan_overrides),
-            generated_model, SimpleNamespace(parallel_dims=dims),
-        )
-        self.assertEqual({record["module_type"] for record in generated_records}, {
-            f"{nn.Linear.__module__}.{nn.Linear.__qualname__}"
-        })
-        self.assertTrue(all(isinstance(module, _ReplacementLinear) for module in generated_model))
+        model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
+        plan = compile_module_replacements(model, specs)
+        self.assertEqual({type(target.source) for target in plan.targets}, {nn.Linear})
 
         model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
         original_weights = [module.weight for module in model]
@@ -736,16 +707,15 @@ class TestModuleReplacementYaml(unittest.TestCase):
         self.assertEqual(ep_rule.to_dict()["replace"]["implementation"]["scale"], 2.0)
         self.assertNotIn("region_dispatch", ep_rule.to_dict())
         self.assertIs(cp_rule.replace.implementation.callable, _wrapper_factory)
-        canonical = _canonicalize_override(cp_rule)
-        self.assertEqual(canonical.pop("match"), "*.self_attn.forward")
+        self.assertEqual(cp_rule.to_dict()["match"], "*.self_attn.forward")
         self.assertEqual(entries_to_plan_overrides(config.plan_overrides, cp_size=1, ep_size=1), {})
         active = entries_to_plan_overrides(config.plan_overrides, cp_size=2, ep_size=2)
         self.assertIs(active["*.mlp"].local_compute_fn, ep_rule.replace.implementation)
         self.assertIs(active["*.self_attn"].inner_wrapper, cp_rule.replace.implementation)
-        frozen = freeze_injections(SimpleNamespace(modules=active))
-        self.assertEqual({entry["match"] for entry in frozen}, {"*.mlp", "*.self_attn"})
-        self.assertIn("local_compute_fn", next(entry for entry in frozen if entry["match"] == "*.mlp"))
-        self.assertIn("inner_wrapper", next(entry for entry in frozen if entry["match"] == "*.self_attn"))
+        injections = observe_emission_plan(SimpleNamespace(modules=active), model=None).injections
+        self.assertEqual({entry["match"] for entry in injections}, {"*.mlp", "*.self_attn"})
+        self.assertIn("local_compute_fn", next(entry for entry in injections if entry["match"] == "*.mlp"))
+        self.assertIn("inner_wrapper", next(entry for entry in injections if entry["match"] == "*.self_attn"))
 
         model = _NestedModule()
         compute = _resolve_local_compute_fn(model, active["*.mlp"], None, (), None)
@@ -783,7 +753,6 @@ class TestModuleReplacementYaml(unittest.TestCase):
         self.assertIs(model.layers[0].gate, original_gate)
         self.assertTrue(torch.equal(result, torch.full_like(result, 8.0)))
         self.assertTrue(torch.equal(inputs.grad, torch.full_like(inputs, 4.0)))
-        self.assertIn("replace", _canonicalize_override(rule))
 
         gated = PlanOverride(match="*.gate.route", when="cp", replace=ReplaceAction(
             kind="method", implementation=f"{__name__}._route_factory"))
@@ -798,11 +767,12 @@ class TestModuleReplacementYaml(unittest.TestCase):
         self.assertEqual(entries_to_plan_overrides([rule], ep_size=2)["*.mlp"].local_compute_fn,
                          rule.replace.implementation)
         self.assertEqual(entries_to_method_replacements([rule], ep_size=2), ())
-        frozen = freeze_injections(SimpleNamespace(modules=entries_to_plan_overrides([rule], ep_size=2)))
-        self.assertEqual(frozen[0]["match"], "*.mlp")
+        plan = SimpleNamespace(modules=entries_to_plan_overrides([rule], ep_size=2))
+        injections = observe_emission_plan(plan, model=None).injections
+        self.assertEqual(injections[0]["match"], "*.mlp")
 
-    def test_method_replacement_is_wired_in_native_and_codegen_setup(self):
-        """Codegen validates targets; native construction installs the patch."""
+    def test_method_replacement_is_wired_in_native_setup(self):
+        """Native construction installs the normalized method patch."""
         rule = PlanOverride(match="gate.route", replace=ReplaceAction(
             kind="method", implementation=f"{__name__}._route_factory"))
         setup = SimpleNamespace(mesh_context=SimpleNamespace(
@@ -813,12 +783,6 @@ class TestModuleReplacementYaml(unittest.TestCase):
 
         model = nn.Module()
         model.gate = _RouteGate()
-        dims = SimpleNamespace(tp_size=1, cp_size=1, ep_size=1, pp_size=1, sequence_parallel=False)
-        records = _apply_generation_replacements(
-            SimpleNamespace(), SimpleNamespace(plan_overrides=[rule]), model,
-            SimpleNamespace(parallel_dims=dims),
-        )
-        self.assertEqual(records, [])
         self.assertNotIn("route", vars(model.gate))
         apply_method_replacements(model, setup.method_replacements)
         self.assertTrue(torch.equal(model.gate(torch.ones(1)), torch.full((1,), 2.0)))

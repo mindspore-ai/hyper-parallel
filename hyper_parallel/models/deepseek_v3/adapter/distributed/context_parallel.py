@@ -35,6 +35,40 @@ from hyper_parallel.distributed.context_parallel.mla_context_parallel import (
 from hyper_parallel.distributed.recipe_spec import inner_wrapper
 
 
+def mla_cp_forward(
+    target_module: nn.Module,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+    attention_mask: torch.Tensor | None = None,
+    past_key_values: Any | None = None,
+    actual_seq_len: torch.Tensor | Sequence[int] | None = None,
+    **kwargs: Any,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run the native MLA CP path shared by the wrapper and generated source."""
+    if past_key_values is not None:
+        raise ValueError("MLA CP training does not support a KV cache")
+    batch_size, sequence_length = hidden_states.shape[:-1]
+    runtime = target_module.mla_cp_runtime
+    supports_output_backward = runtime.plan.overlap and runtime.plan.tp_degree == 1 and runtime.plan.ulysses_degree > 1
+    overlap_output_backward = supports_output_backward and torch.is_grad_enabled()
+    # Hybrid CP supports output dO overlap, but paired input adjoints are
+    # currently implemented only for pure Ulysses.
+    overlap_input_backward = overlap_output_backward and runtime.plan.all_gather_degree == 1
+    attn_output, attn_weights = runtime(
+        target_module, *target_module.project_latent_inputs(hidden_states),
+        position_embeddings=position_embeddings, attention_mask=attention_mask,
+        actual_seq_len=actual_seq_len, restore_output=not overlap_output_backward,
+        overlap_input_backward=overlap_input_backward, **kwargs,
+    )
+    if overlap_output_backward:
+        state = MLAOutputProjectionState(runtime.ulysses_mesh, target_module.v_head_dim)
+        return target_module.o_proj(
+            attn_output, mla_output_state=state,
+        ), attn_weights
+    attn_output = attn_output.reshape(batch_size, sequence_length, -1).contiguous()
+    return target_module.project_output(attn_output, hidden_states), attn_weights
+
+
 @inner_wrapper
 def mla_cp_wrapper(
     target_module: nn.Module,
@@ -115,26 +149,15 @@ def mla_cp_wrapper(
         Returns:
             Projected local-token output and None for attention weights.
         """
-        if past_key_values is not None:
-            raise ValueError("MLA CP training does not support a KV cache")
-        batch_size, sequence_length = hidden_states.shape[:-1]
-        overlap_output_backward = supports_output_backward and torch.is_grad_enabled()
-        # Hybrid CP supports output dO overlap, but paired input adjoints are
-        # currently implemented only for pure Ulysses.
-        overlap_input_backward = overlap_output_backward and runtime.plan.all_gather_degree == 1
-        attn_output, attn_weights = runtime(
-            target_module, *target_module.project_latent_inputs(hidden_states),
-            position_embeddings=position_embeddings, attention_mask=attention_mask,
-            actual_seq_len=actual_seq_len, restore_output=not overlap_output_backward,
-            overlap_input_backward=overlap_input_backward, **kwargs,
+        return mla_cp_forward(
+            target_module,
+            hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            actual_seq_len=actual_seq_len,
+            **kwargs,
         )
-        if overlap_output_backward:
-            state = MLAOutputProjectionState(runtime.ulysses_mesh, target_module.v_head_dim)
-            return target_module.o_proj(
-                attn_output, mla_output_state=state,
-            ), attn_weights
-        attn_output = attn_output.reshape(batch_size, sequence_length, -1).contiguous()
-        return target_module.project_output(attn_output, hidden_states), attn_weights
 
     requests = [_ForwardRewriteRequest(
         target_module, cp_forward,

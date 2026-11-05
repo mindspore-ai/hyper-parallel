@@ -22,11 +22,19 @@ from hyper_parallel.models.kimi_k3.adapter.policies.sharding import (
 from hyper_parallel.models.registry import register_model_adapter
 
 
+def _load_codegen():
+    """Return shared Kimi source-export compatibility lazily."""
+    from hyper_parallel.models.kimi_k3.adapter import codegen  # pylint: disable=C0415
+
+    return codegen
+
+
 KIMI_LINEAR_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="KimiLinearForCausalLM",
     model_type="kimi_linear",
     context_parallel=load_context_parallel,
     sharding_rules=build_parameter_sharding_rules,
+    codegen=_load_codegen,
 )
 
 register_model_adapter(KIMI_LINEAR_ADAPTER_SPEC)

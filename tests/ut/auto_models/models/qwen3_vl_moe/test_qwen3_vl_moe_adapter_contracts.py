@@ -23,6 +23,7 @@ from torch import nn
 
 from hyper_parallel.components.functional.npu_fusion_attention import npu_fusion_attention_forward
 from hyper_parallel.distributed._builder.forward_rewriter import _ForwardRewriteRequest
+from hyper_parallel.distributed.tensor_parallel.param_role import ParamRole
 from hyper_parallel.models import get_model_adapter
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 from hyper_parallel.models.qwen3_vl_moe.adapter.distributed import (
@@ -46,6 +47,8 @@ def test_model_adapter_registers_its_distributed_providers() -> None:
     assert spec.architecture == "Qwen3VLMoeForConditionalGeneration"
     assert spec.context_parallel is not None
     assert spec.expert_parallel is not None
+    assert spec.sharding_rules is not None
+    assert spec.sharding_rules() == [("model.visual.", ParamRole.REPLICATED)]
 
 
 @arg_mark(

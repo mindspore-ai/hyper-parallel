@@ -12,13 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Classify each frozen boundary into the forward form the emitter renders.
+"""Classify each observed boundary into the forward form the emitter renders.
 
-Single source of truth shared by generation (``emit/parallel``), install-time
-validation (``runtime``), and preflight (``check/preflight``).  The per-tensor
+Single source of truth shared by regular and recorded-forward emitters. The per-tensor
 transition judgment itself lives in
 ``distributed._builder.tp_collective_lowering.classify_tp_transition`` — this
-module only folds a whole frozen boundary entry (its ``in_src``/``in_dst``/
+module only folds a whole observed boundary entry (its ``in_src``/``in_dst``/
 ``out_src``/``out_dst`` named placements) into one of four forms:
 
 - ``region``        — the boundary has a ``local_compute_fn`` injection (EP
@@ -26,36 +25,34 @@ module only folds a whole frozen boundary entry (its ``in_src``/``in_dst``/
   re-wraps locals per ``out_src`` before the boundary exit.
 - ``identity``      — every declared transition is identity on the plan's
   active axes AND no inner-wrapper injection is declared: the class forward
-  is NOT rewritten (pruned); the runtime install path covers the exact no-op
-  / to-local semantics with its generic wrapper.
+  is not rewritten because the observed contract is a no-op.
 - ``generic`` (forced) — a boundary with an ``inner_wrapper`` injection is
-  generic even when every transition is identity: the CP wrapper is applied
-  to the module at runtime by ``hp_apply_inner_wrapper``, so the class
-  must keep the rewritten redistribute forward that P1 always emitted.
+  generic even when every transition is identity, so the generated CP
+  dispatch remains visible around the original forward.
 - ``tp_collective`` — every declared transition is identity or TP-lowerable
   (``all_gather`` / ``all_reduce`` / ``reduce_scatter`` on the tp axis): the
   emitter may sink bare operator calls (``self._hp_tp.all_gather(...)``),
-  subject to source-side structural gates (see ``emit/parallel``); the
-  runtime re-validates against the live mesh at install time and falls back
-  to the generic engine when the compiled plan disagrees.
+  subject to source-side structural gates in ``emit/parallel``.
 - ``generic``       — anything else (non-tp axis differences, unsupported
   placement pairs, expert-mesh routing): the forward is rewritten to call
   the instance-bound compiled plan (``self._hp_boundary``) with a
   declarative comment annotation of what each side does.
 
-The classification is a pure function of the frozen entry, the plan's active
-axis names, and the (optional) injection rule — the same inputs the drift
-check re-emits from, so generation, install, and preflight always agree.
-
-The runtime-conditional facts (live mesh axes, rank order, backend, expert
-mesh) are deliberately NOT classified here: the emit-time decision is
-optimistic and the runtime's install-time validation is the safety net.
+The classification is a pure function of the observed entry, active plan
+axes, and optional injection declaration. Runtime-only mesh and backend
+objects never enter this source-emission decision.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Optional
+
+from hyper_parallel.codegen.plan.placements import parse_named_placement
+from hyper_parallel.distributed.recipe_spec import resolve_placements
+from hyper_parallel.distributed._builder.tp_collective_lowering import (
+    classify_tp_transition,
+)
 
 #: Region form: local-compute injection owns the forward (EP MoE).
 FORM_REGION = "region"
@@ -146,6 +143,17 @@ def classify_boundary_form(
             return BoundaryForm(form=FORM_GENERIC)
         return BoundaryForm(form=FORM_IDENTITY)
 
+    return _classify_active_axes(entry, axes, is_region=is_region, inner_wrap=inner_wrap)
+
+
+def _classify_active_axes(
+    entry: dict[str, Any],
+    axes: tuple[str, ...],
+    *,
+    is_region: bool,
+    inner_wrap: bool,
+) -> BoundaryForm:
+    """Classify an entry whose plan has at least one active axis."""
     in_ops: dict[str, TransitionOp] = {}
     in_notes: dict[str, str] = {}
     in_declared: list[str] = []
@@ -230,14 +238,6 @@ def _classify_side(
     transition is not TP-lowerable); ``note`` is the declarative annotation
     line for non-identity transitions (``None`` for identity / no-op names).
     """
-    # Lazy imports: plan modules must not pull the distributed package (and
-    # its torch-dependent __init__) at codegen import time.
-    from hyper_parallel.codegen.plan.freeze import parse_named_placement
-    from hyper_parallel.distributed.recipe_spec import resolve_placements
-    from hyper_parallel.distributed._builder.tp_collective_lowering import (
-        classify_tp_transition,
-    )
-
     src_named = parse_named_placement(entry.get(src_field) or {})
     dst_named = parse_named_placement(entry.get(dst_field) or {})
     src_raw = entry.get(src_field) or {}
