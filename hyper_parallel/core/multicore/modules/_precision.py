@@ -19,15 +19,15 @@ from collections.abc import Callable, Iterable
 import torch
 
 
-def preserve_fp32_parameters(
+def preserve_fp32_tensors(
     module: torch.nn.Module, transform: Callable[[torch.Tensor], torch.Tensor], names: Iterable[str],
 ) -> Callable[[torch.Tensor], torch.Tensor]:
-    """Wrap Module._apply without rounding protected Parameters or their existing gradients.
+    """Wrap Module._apply without rounding protected parameters, buffers or existing gradients.
 
     Args:
-        module: Module holding the protected control Parameters.
+        module: Module holding the protected control tensors.
         transform: Requested parameter device or dtype transformation.
-        names: Names of control Parameters which must retain FP32 values.
+        names: Local names of parameters or buffers which must retain FP32 values.
     """
     protected = set()
     for name in names:
@@ -51,3 +51,7 @@ def preserve_fp32_parameters(
         return tensor.to(device=converted.device, dtype=torch.float32)
 
     return apply
+
+
+# Keep the existing parameter-only entry point compatible.
+preserve_fp32_parameters = preserve_fp32_tensors

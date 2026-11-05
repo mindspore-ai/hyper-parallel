@@ -68,6 +68,30 @@ def create_config(config: dict[str, Any]) -> Xing4_0Config:
         result.attention_softmax_scale = None
     if not getattr(result, "use_fused_mhc", True):
         raise ValueError("The Xing4 training adapter uses fused mHC on NPU")
+    required = ["mhc_init_gating_factor", "mhc_layernorm_epsilon"]
+    if result.num_nextn_predict_layers:
+        required.append("mtp_loss_factor")
+    has_moe = result.n_routed_experts is not None and (
+        result.num_hidden_layers + result.num_nextn_predict_layers > result.first_k_dense_replace
+    )
+    if has_moe:
+        required.extend(("moe_aux_loss_coeff", "moe_router_bias_update_rate",
+                         "moe_router_enable_expert_bias", "use_pad_tokens"))
+    missing = [name for name in required if getattr(result, name, None) is None]
+    if missing:
+        raise ValueError(f"Xing4 training configuration requires: {', '.join(missing)}")
+    for name in required:
+        value = getattr(result, name)
+        if name in ("moe_router_enable_expert_bias", "use_pad_tokens"):
+            if not isinstance(value, bool):
+                raise ValueError(f"{name} must be a bool")
+        elif isinstance(value, bool) or not isinstance(value, (int, float)) \
+                or not math.isfinite(value):
+            raise ValueError(f"{name} must be finite")
+        elif value < 0 and name != "mhc_init_gating_factor":
+            raise ValueError(f"{name} must be nonnegative")
+    if result.mhc_layernorm_epsilon == 0:
+        raise ValueError("mhc_layernorm_epsilon must be positive")
     if result.use_cache:
         raise ValueError("The training recipe must explicitly disable the KV cache")
     return result
