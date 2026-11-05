@@ -21,7 +21,6 @@ Recipes bind :func:`xing4_ep_compute_fn` to the MoE modules with a
 from collections.abc import Callable
 from typing import Any
 
-from hyper_parallel.components.modules.grouped_experts import GroupedExperts
 from hyper_parallel.distributed.expert_parallel.experts import SHARED_MERGE_MODES
 from hyper_parallel.distributed.expert_parallel.recipes import build_ep_compute
 from hyper_parallel.distributed.recipe_spec import local_compute
@@ -38,8 +37,8 @@ def xing4_ep_compute_fn(*, module: Any, mesh: Any, tp_mesh: Any, cp_mesh: Any,
     and statistics from the learned router keep their separate semantics.
     """
     del mesh, tp_mesh, cp_mesh
-    if not isinstance(module.experts, GroupedExperts):
-        raise ValueError("Xing4 EP requires the grouped experts replacement before binding the executor")
+    if not callable(getattr(module.experts, "forward_expert_major", None)):
+        raise ValueError("Xing4 EP requires an expert-major module replacement before binding the executor")
     module.ep_executor = build_ep_compute(
         module, ep_mesh, router_fn=type(module).route, archetype_key="xing4",
         expected_attrs=["gate", "experts", "shared_experts"], combine=SHARED_MERGE_MODES["none"],

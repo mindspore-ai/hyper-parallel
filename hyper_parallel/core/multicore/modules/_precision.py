@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Preserve FP32 parameters and buffers during ordinary model dtype conversion."""
+"""Preserve full-precision control parameters during ordinary model dtype conversion."""
 
 from collections.abc import Callable, Iterable
 
@@ -22,12 +22,12 @@ import torch
 def preserve_fp32_parameters(
     module: torch.nn.Module, transform: Callable[[torch.Tensor], torch.Tensor], names: Iterable[str],
 ) -> Callable[[torch.Tensor], torch.Tensor]:
-    """Wrap Module._apply without rounding protected parameters, buffers or existing gradients.
+    """Wrap Module._apply without rounding protected Parameters or their existing gradients.
 
     Args:
-        module: Module holding the protected control tensors.
+        module: Module holding the protected control Parameters.
         transform: Requested parameter device or dtype transformation.
-        names: Local names of parameters or buffers which must retain FP32 values.
+        names: Names of control Parameters which must retain FP32 values.
     """
     protected = set()
     for name in names:

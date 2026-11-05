@@ -35,7 +35,7 @@ from hyper_parallel.models.replacement import method_replacement
 from hyper_parallel.models.xing_4.adapter.conversion.module_replacement import (
     Xing4MLAAttention, fusion_attention_with_logit_maxima,
 )
-from hyper_parallel.models.xing_4.adapter.moe import Xing4MoE
+from hyper_parallel.models.xing_4.adapter.training import Xing4MoE
 
 
 def _rotary(tensor: torch.Tensor, positions: tuple[torch.Tensor, torch.Tensor] | None,
