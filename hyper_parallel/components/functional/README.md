@@ -48,6 +48,16 @@ weights and computation; routing, expert-parallel communication, and shared expe
 
 `hyper_parallel.components.functional` also exports `aux_loss_auto_scale` and `set_aux_loss_scale` for auxiliary-loss gradient injection.
 
+## DeepSeek V3.2 DSA
+
+The DSA interfaces are `dsa_indexer`, `dsa_sparse_attention`, `dsa_kl_loss`, and
+`dsa_dense`. The CANN backend targets CANN 9.2.0 and requires its matching
+`cann_ops_transformer` extension and native operators. Sparse/Dense KL use
+the fused `torch_npu.npu_{sparse,dense}_lightning_indexer_grad_kl_loss` APIs;
+teacher probabilities and scalar loss are computed inside CANN. Dense indexer
+LSE returns the native max/sum pair. Indexer and sparse-attention backward use
+`cann_ops_transformer`; attention forward uses `torch_npu.npu_sparse_flash_attention`.
+
 ## DeepSeek V4.1 fused operators
 
 The V4.1 adapters use the optional `cann_ops_transformer` PyTorch extension:
