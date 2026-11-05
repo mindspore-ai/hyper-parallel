@@ -16,8 +16,9 @@
 """Base distributed optimizer and chain optimizer composition."""
 # pylint: disable=forbidden-backend-import
 
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from contextlib import contextmanager, nullcontext
+from functools import wraps
 import logging
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -44,6 +45,17 @@ from hyper_parallel.core.optimizer.utils import empty_accelerator_cache, get_cur
 logger = logging.getLogger(__name__)
 
 
+def _with_step_post_hooks(step):
+    """Dispatch chain post-hooks only after every leaf step succeeds."""
+    @wraps(step)
+    def _wrapped(self, *args, **kwargs):
+        result = step(self, *args, **kwargs)
+        for hook in self._optimizer_step_post_hooks.values():
+            hook(self, (self, *args), kwargs)
+        return result
+    return _wrapped
+
+
 class ChainedOptimizer:
     """Composition wrapper that dispatches step/zero_grad to sub-optimizers."""
 
@@ -60,6 +72,7 @@ class ChainedOptimizer:
             optimizers: Leaf optimizers keyed by their configured names.
             flatten: Whether leaf optimizer state uses flattened FQN keys.
         """
+        self._optimizer_step_post_hooks = OrderedDict()
         self.optimizers_dict = optimizers
         self.chained_optimizers = list(optimizers.values())
         self.optimizers_keys = list(optimizers.keys())
@@ -163,6 +176,10 @@ class ChainedOptimizer:
 
     __repr__ = __str__
 
+    # Reuse PyTorch registration and RemovableHandle semantics.
+    register_step_post_hook = torch.optim.Optimizer.register_step_post_hook
+
+    @_with_step_post_hooks
     def step(self, closure: Any = None) -> None:
         """Call each sub-optimizer's step in order.
 
