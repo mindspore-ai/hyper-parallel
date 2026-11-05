@@ -30,6 +30,17 @@ See [Module Family](README.module_family.md) for GroupedExperts MXFP8 examples, 
 
 ## Install custom operators
 
+### Select CANN fused mHC
+
+`MhcPreModule` and `MhcPostModule` accept `backend="cann"` in direct construction
+or the `replace_module` YAML mapping. Set it on both modules for the same block.
+This explicit option keeps the source parameter objects and uses CANN's fused
+pre/Sinkhorn and post autograd operators. Existing callers keep the default Omni
+implementation. See the [supported inputs and setup](../functional/README.md#cann-fused-mhc),
+including the four-stream A2 constraints, lack of gamma support and HF32 arithmetic.
+
+### Install Omni operators
+
 Some modules depend on the training operators from [Omni Ops](https://gitee.com/omniai/omni-ops). Ensure that CANN,
 PyTorch and `torch_npu` are compatible before building the operators.
 

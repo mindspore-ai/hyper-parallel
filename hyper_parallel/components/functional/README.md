@@ -48,6 +48,31 @@ weights and computation; routing, expert-parallel communication, and shared expe
 
 `hyper_parallel.components.functional` also exports `aux_loss_auto_scale` and `set_aux_loss_scale` for auxiliary-loss gradient injection.
 
+## CANN fused mHC
+
+`mhc_pre` and `mhc_post` accept the explicit keyword `backend="cann"`.
+The default remains `"omni"`; installing CANN does not switch existing callers.
+This backend uses the Python autograd wrappers
+`cann_ops_transformer.ops.mhc.mhc_pre_sinkhorn.mhc_pre_sinkhorn` and
+`cann_ops_transformer.ops.mhc.mhc_post.mhc_post`, including their native backward operators.
+The package-level names may expose raw operator handles with different return values.
+
+On Atlas A2 the supported contract is packed `[B, S, 4*D]` streams, `0 < D < 100000`
+divisible by 128, 20 Sinkhorn iterations, BF16/FP16 activations and FP32 mixing
+parameters/coefficients. The fused pre operator has no normalization gamma input;
+gamma and DTensor inputs are rejected. The residual branch remains in the ordinary
+autograd graph and is combined with the pre branch once.
+
+This path was exercised on Ascend 910B3 with the CANN 9.2.0 toolkit and its
+`cann_ops_transformer` package, PyTorch 2.12.0 and torch-npu 2.12.0.post3.
+The A2 pre/backward kernels use HF32 Cube arithmetic even for FP32 projection
+parameters. They do not guarantee batch consistency across different batch shapes.
+Consult the official [MhcPreSinkhorn contract](https://gitcode.com/cann/ops-transformer/blob/master/mhc/mhc_pre_sinkhorn/README.md)
+and [extension setup](https://gitcode.com/cann/ops-transformer/blob/master/torch_extension/README.md).
+Source the toolkit environment before use. The optional package is loaded only
+when this backend executes and can JIT compile PyTorch C++ bridges on first import;
+set `TORCH_EXTENSIONS_DIR` to a writable build-cache directory.
+
 ## DeepSeek V4.1 fused operators
 
 The V4.1 adapters use the optional `cann_ops_transformer` PyTorch extension:
