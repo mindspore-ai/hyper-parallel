@@ -454,6 +454,9 @@ class MLAContextParallel:
         if not isinstance(causal, bool):
             raise ValueError("is_causal must be bool")
         _validate_mask(attention_mask, lengths, batch, sequence * degree, query_latent.device)
+        # The generic attention interface reserves 2D masks for batch padding.
+        if attention_mask is not None and attention_mask.ndim == 2:
+            attention_mask = attention_mask.unsqueeze(0).unsqueeze(0)
         partition = None
         if self.plan.all_gather_degree > 1:
             _validate_query_partition(causal, attention_mask)
