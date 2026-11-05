@@ -60,6 +60,8 @@ plan_overrides:
       kind: method
       implementation:
         _target_: hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper
+        # null follows dsa_dense_warm_up; true/false forces one path for the full run.
+        dense_warmup: null
 
 mixed_precision:
   enabled: false

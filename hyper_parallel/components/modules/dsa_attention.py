@@ -39,6 +39,91 @@ from hyper_parallel.components.functional import (
 from hyper_parallel.components.functional.npu_fusion_attention import resolve_packed_sequence_lengths
 
 
+def _dense_flash_attention(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    sequence_lengths: tuple[torch.Tensor, torch.Tensor],
+    *,
+    need_stats: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Run one TND FA and return dense-indexer statistics."""
+    query_ends, key_ends = (lengths.tolist() for lengths in sequence_lengths)
+    q_flat, k_flat, v_flat = (tensor.flatten(0, 1) for tensor in (query, key, value))
+    num_heads = q_flat.shape[1]
+    causal_mask = torch.ones((2048, 2048), dtype=torch.bool, device=query.device).triu(diagonal=1)
+    import torch_npu  # pylint: disable=import-outside-toplevel,forbidden-backend-import
+
+    result = torch_npu.npu_fusion_attention(
+        q_flat.contiguous(), k_flat.contiguous(), v_flat.contiguous(), num_heads, "TND",
+        pse=None, padding_mask=None, atten_mask=causal_mask, scale=module.scaling,
+        pre_tockens=getattr(module, "pre_tockens", 1048576),
+        next_tockens=getattr(module, "next_tockens", 0), keep_prob=1.0, inner_precise=0,
+        actual_seq_qlen=query_ends, actual_seq_kvlen=key_ends, sparse_mode=3,
+    )
+    output = result[0].reshape(*query.shape[:3], value.shape[-1])
+    if not need_stats:
+        return output, None, None
+
+    # TND FA stores each packed segment as [head, token, 8], while exposing a
+    # physical [token, head, 8] shape. Dense KL consumes [head, token, 1].
+    statistics = []
+    starts = [0, *query_ends[:-1]]
+    for statistic in result[1:3]:
+        rows = statistic.reshape(-1, statistic.shape[-1])
+        segments = [
+            rows[start * num_heads : end * num_heads].reshape(
+                num_heads, end - start, statistic.shape[-1]
+            )[..., :1]
+            for start, end in zip(starts, query_ends)
+        ]
+        statistics.append(torch.cat(segments, dim=1).detach())
+    return output, statistics[0], statistics[1]
+
+
+def _deepseek_v32_dense_attention(
+    module: nn.Module,
+    index_states: tuple[torch.Tensor, ...],
+    attention_states: tuple[torch.Tensor, ...],
+    sequence_lengths: tuple[torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    """Run unabsorbed MLA FA and the fused dense indexer KL on local states."""
+    query, compressed_kv, query_rope, key_rope = attention_states
+    projected_kv = module.kv_b_proj(compressed_kv.squeeze(2)).view(
+        *compressed_kv.shape[:2], module.num_heads, module.qk_nope_head_dim + module.v_head_dim,
+    )
+    key, value = projected_kv.split((module.qk_nope_head_dim, module.v_head_dim), dim=-1)
+    key_rope = key_rope.expand(-1, -1, module.num_heads, -1)
+    need_stats = bool(module.training and not module.freeze_dsa and module.dsa_loss_coeff)
+    output, maximum, total = _dense_flash_attention(
+        module, torch.cat((query, query_rope), dim=-1), torch.cat((key, key_rope), dim=-1),
+        value, sequence_lengths, need_stats=need_stats,
+    )
+    if need_stats:
+        # Dense CANN operators are optional for sparse and Omni execution.
+        # pylint: disable=import-outside-toplevel
+        from hyper_parallel.components.functional.dsa_dense import (
+            dsa_dense_indexer_kl_loss,
+            dsa_dense_indexer_lse,
+        )
+        # pylint: enable=import-outside-toplevel
+
+        query_lengths, key_lengths = sequence_lengths
+        index_query, index_key, weights = (tensor.flatten(0, 1) for tensor in index_states)
+        indexer_stats = dsa_dense_indexer_lse(
+            index_query, index_key, weights, query_lengths=query_lengths, key_lengths=key_lengths,
+        )
+        loss = dsa_dense_indexer_kl_loss(
+            index_query, index_key, weights, query.flatten(0, 1), key.flatten(0, 1),
+            maximum, total, indexer_stats, scale=module.scaling,
+            query_rope=query_rope.flatten(0, 1), key_rope=key_rope.flatten(0, 1),
+            query_lengths=query_lengths, key_lengths=key_lengths, loss_coefficient=module.dsa_loss_coeff,
+        )
+        output = aux_loss_auto_scale(output, loss)
+    return output
+
+
 def apply_mome(
     hidden_states: torch.Tensor,
     mome_mask: torch.Tensor | None,
@@ -215,6 +300,9 @@ class DeepseekV32DSAAttention(nn.Module):
         )
         self.dsa_loss_coeff = getattr(config, "dsa_loss_coeff", 0.0)
         self.freeze_dsa = bool(getattr(config, "freeze_DSA", getattr(config, "freeze_dsa", False)))
+        self.dsa_dense_warm_up = bool(
+            getattr(module, "dsa_dense_warm_up", getattr(config, "dsa_dense_warm_up", False))
+        )
         if getattr(module, "param_sink_number", 0) > 0:
             raise ValueError("DeepseekV32DSAAttention does not support the parameter-sink path")
         if getattr(module, "use_mome", False):
@@ -370,8 +458,10 @@ class DeepseekV32DSAAttention(nn.Module):
     def _project_attention_states(
         self,
         hidden_states: torch.Tensor,
+        *,
+        use_dense: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Project hidden states into absorbed-query and latent KV states."""
+        """Project MLA Q/KV, retaining Q before absorption during dense warm-up."""
         batch_size, seq_length = hidden_states.shape[:-1]
         latent_states = self.linear_qkv(hidden_states)
         q_latent, kv_nope, k_rot = torch.split(
@@ -383,7 +473,7 @@ class DeepseekV32DSAAttention(nn.Module):
         kv_weight = self.kv_b_proj.weight.view(
             self.num_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank
         )
-        absorbed_query = _absorb_query_projection(
+        absorbed_query = q_pass if use_dense else _absorb_query_projection(
             q_pass,
             kv_weight[:, : self.qk_nope_head_dim],
             num_heads=self.num_heads,
@@ -437,17 +527,18 @@ class DeepseekV32DSAAttention(nn.Module):
             tensor.reshape(-1, tensor.shape[2], tensor.shape[3])
             for tensor in attention_states
         )
-        aux_loss = dsa_kl_loss(  # pylint: disable=not-callable
+        aux_loss = dsa_kl_loss(
             *index_states, query_tnd, key_tnd,
             topk_indices, *softmax_stats, q_rot_tnd, k_rot_tnd,
             actual_q_len, actual_kv_len, self.scaling, self.dsa_loss_coeff,
+            backend="cann",
         )
         return aux_loss_auto_scale(attn_output, aux_loss)
 
     def _prepare_attention_states(self, hidden_states, position_embeddings):
         """Project attention states and apply their rotary embeddings."""
         q_resid, absorbed_query_states, kv_nope, q_rot, k_rot, kv_weight = self._project_attention_states(
-            hidden_states
+            hidden_states, use_dense=self.dsa_dense_warm_up,
         )
         q_rot, k_rot = _apply_attention_rope(
             q_rot, k_rot, position_embeddings, interleaved=self.rotary_interleaved
@@ -470,8 +561,8 @@ class DeepseekV32DSAAttention(nn.Module):
         actual_kv_len = self._get_actual_seq_len(
             actual_kv_len, *hidden_states.shape[:-1], hidden_states.device,
         )
-        indexed = dsa_indexer(  # pylint: disable=not-callable
-            *index_states, actual_q_len, actual_kv_len, self.index_topk
+        indexed = dsa_indexer(
+            *index_states, actual_q_len, actual_kv_len, self.index_topk, backend="cann",
         )
         return indexed[0], indexed[1:], actual_q_len, actual_kv_len
 
@@ -482,8 +573,9 @@ class DeepseekV32DSAAttention(nn.Module):
         topk_indices, index_states, actual_q_len, actual_kv_len = self._run_indexer(
             hidden_states, q_resid, position_embeddings, actual_seq_len, kwargs,
         )
-        attn_output, softmax_max, softmax_sum = dsa_sparse_attention(  # pylint: disable=not-callable
+        attn_output, softmax_max, softmax_sum = dsa_sparse_attention(
             *attention_states, topk_indices, self.scaling, actual_q_len, actual_kv_len,
+            backend="cann",
         )
         return self._apply_auxiliary_loss(
             attn_output, index_states, attention_states, topk_indices,
@@ -493,11 +585,22 @@ class DeepseekV32DSAAttention(nn.Module):
     def _compute_attention_output(
         self, hidden_states, position_embeddings, actual_seq_len, kwargs,
     ):
-        """Compute sparse attention and restore its value projection."""
+        """Run the selected dense/sparse stage and restore the value projection."""
         batch_size, seq_length = hidden_states.shape[:-1]
         q_resid, attention_states, kv_weight = self._prepare_attention_states(
             hidden_states, position_embeddings,
         )
+        if self.dsa_dense_warm_up:
+            index_states = self._project_index_states(hidden_states, q_resid, position_embeddings)
+            packed_kwargs = {**kwargs, "actual_seq_len": actual_seq_len}
+            lengths = resolve_packed_sequence_lengths(
+                packed_kwargs, batch_size * seq_length, batch_size * seq_length,
+            )
+            lengths = tuple(self._get_actual_seq_len(
+                value, batch_size, seq_length, hidden_states.device,
+            ) for value in lengths)
+            output = _deepseek_v32_dense_attention(self, index_states, attention_states, lengths)
+            return output.flatten(2)
         attn_output = self._compute_sparse_attention(
             hidden_states, q_resid, attention_states, position_embeddings, actual_seq_len, kwargs,
         )

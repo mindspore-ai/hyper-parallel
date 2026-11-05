@@ -33,14 +33,13 @@ import torch
 from torch import nn
 
 from hyper_parallel.components.functional.dsa_indexer import dsa_indexer
-from hyper_parallel.components.functional.dsa_sparse_attention import (
-    dsa_sparse_attention,
-)
+from hyper_parallel.components.functional.dsa_sparse_attention import dsa_sparse_attention
 from hyper_parallel.components.functional.npu_fusion_attention import (
     resolve_packed_sequence_lengths,
 )
 from hyper_parallel.components.modules.dsa_attention import (
     _apply_attention_rope,
+    _deepseek_v32_dense_attention,
     _restore_attention_projection,
 )
 from hyper_parallel.distributed._builder.forward_rewriter import (
@@ -76,9 +75,8 @@ def _cp_local_sequence_lengths(
     ``boundaries`` describe the unsharded ``[B, S_global]`` token stream.  A
     query shard covers ``[offset, offset + local_seq_len)`` in each row, while
     the gathered KV tensor covers the causal prefix ``[0, prefix_len)``.  The
-    conversion deliberately retains zero-length entries: they preserve the
-    original packed-sequence numbering for ranks that own no query token from
-    a particular pack.
+    Dense DSA requires every packed sequence to contribute query tokens on each
+    CP rank, so its cumulative query lengths remain strictly increasing.
     """
     global_seq_len = local_seq_len * cp_size
     prefix_len = (cp_rank + 1) * local_seq_len
@@ -152,11 +150,6 @@ def _resolve_cp_sequence_lengths(
             for row in range(batch_size)
         ]
         key_lengths = list(query_lengths)
-    elif key_lengths is None:
-        # ``resolve_packed_sequence_lengths`` normally rejects this case; keep
-        # the guard here so the CP conversion has a single explicit contract.
-        raise ValueError("packed DSA attention requires query and KV lengths")
-
     if len(query_lengths) != len(key_lengths):
         raise ValueError(
             "DeepSeek-V3.2 DSA requires the same number of packed query and "
@@ -180,39 +173,6 @@ def _resolve_cp_sequence_lengths(
         kind="KV",
     ).to(device=device)
     return query_cp, key_cp
-
-
-def _validate_cp_attention_mask(
-    attention_mask: torch.Tensor | None,
-    *,
-    batch_size: int,
-    local_seq_len: int,
-    global_seq_len: int,
-) -> None:
-    """Validate the shape of an optional Transformers causal mask.
-
-    DSA generates the causal mask from cumulative lengths, so the supplied
-    mask is intentionally not forwarded to the custom operators.  Both the
-    pre-sharded local form and the Trainer's global form are accepted.
-    """
-    if attention_mask is None:
-        return
-    if attention_mask.ndim != 4 or attention_mask.shape[:2] != (batch_size, 1):
-        raise ValueError(
-            "DeepseekV32DSAAttention CP expects attention_mask with shape "
-            "[batch_size, 1, query_length, key_length]"
-        )
-    query_length, key_length = attention_mask.shape[-2:]
-    if query_length not in (local_seq_len, global_seq_len):
-        raise ValueError(
-            "DeepseekV32DSAAttention CP attention_mask query dimension must "
-            f"be {local_seq_len} or {global_seq_len}, got {query_length}"
-        )
-    if key_length not in (local_seq_len, global_seq_len):
-        raise ValueError(
-            "DeepseekV32DSAAttention CP attention_mask key dimension must "
-            f"be {local_seq_len} or {global_seq_len}, got {key_length}"
-        )
 
 
 def _validate_cp_target(target_module: nn.Module, cp_mesh: Any) -> None:
@@ -245,11 +205,16 @@ def _run_cp_dsa_kernels(
     index_states: tuple[torch.Tensor, ...],
     attention_states: tuple[torch.Tensor, ...],
     sequence_lengths: tuple[torch.Tensor, torch.Tensor],
+    *,
+    use_dense: bool,
 ) -> torch.Tensor:
-    """Run the DSA indexer, sparse attention, and auxiliary-loss path."""
+    """Run the selected sparse or dense DSA CANN path."""
     index_query, index_key, merge_weight = index_states
     absorbed_query, kv_nope, q_rot, k_rot = attention_states
     actual_q_len, actual_kv_len = sequence_lengths
+    if use_dense:
+        return _deepseek_v32_dense_attention(module, index_states, attention_states, sequence_lengths)
+
     topk_indices, index_query_tnd, index_key_tnd, merge_weight_tnd = dsa_indexer(
         index_query,
         index_key,
@@ -257,6 +222,7 @@ def _run_cp_dsa_kernels(
         actual_q_len,
         actual_kv_len,
         module.index_topk,
+        backend="cann",
     )
     attn_output, softmax_max, softmax_sum = dsa_sparse_attention(
         absorbed_query,
@@ -267,6 +233,7 @@ def _run_cp_dsa_kernels(
         module.scaling,
         actual_q_len,
         actual_kv_len,
+        backend="cann",
     )
     return module._apply_auxiliary_loss(  # pylint: disable=protected-access
         attn_output,
@@ -287,9 +254,11 @@ def _deepseek_v32_dsa_cp_forward(
     past_key_values: Any | None = None,
     position_ids: torch.Tensor | None = None,
     actual_seq_len: torch.Tensor | Sequence[int] | None = None,
+    use_dense: bool | None = None,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, None]:
     """Run one DeepSeek DSA layer with all-gathered causal KV prefixes."""
+    del attention_mask
     if hidden_states.ndim != 3:
         raise ValueError(
             "DeepseekV32DSAAttention CP expects hidden_states with shape [B, S, H]"
@@ -300,13 +269,7 @@ def _deepseek_v32_dsa_cp_forward(
         raise RuntimeError("DeepSeek-V3.2 DSA CP forward is missing its CP mesh")
     cp_size = cp_mesh.size()
     cp_rank = cp_mesh.get_local_rank()
-    global_seq_len = local_seq_len * cp_size
-    _validate_cp_attention_mask(
-        attention_mask,
-        batch_size=batch_size,
-        local_seq_len=local_seq_len,
-        global_seq_len=global_seq_len,
-    )
+    use_dense = bool(module.dsa_dense_warm_up) if use_dense is None else use_dense
     module._validate_forward_inputs(  # pylint: disable=protected-access
         hidden_states,
         None,
@@ -316,7 +279,7 @@ def _deepseek_v32_dsa_cp_forward(
     )
 
     q_resid, absorbed_query, kv_nope, q_rot, k_rot, kv_weight = (
-        module._project_attention_states(hidden_states)  # pylint: disable=protected-access
+        module._project_attention_states(hidden_states, use_dense=use_dense)  # pylint: disable=protected-access
     )
     q_rot, k_rot = _apply_attention_rope(
         q_rot,
@@ -349,16 +312,6 @@ def _deepseek_v32_dsa_cp_forward(
     gathered_index_key = index_key_gather.wait()
     gathered_kv_nope = kv_nope_gather.wait()
     gathered_k_rot = k_rot_gather.wait()
-    for name, tensor in (
-        ("index_key", gathered_index_key),
-        ("kv_nope", gathered_kv_nope),
-        ("k_rot", gathered_k_rot),
-    ):
-        if tensor.shape[1] != global_seq_len:
-            raise ValueError(
-                f"gathered {name} sequence dimension is {tensor.shape[1]}, "
-                f"expected {global_seq_len}"
-            )
     index_key = gathered_index_key[:, :prefix_len].contiguous()
     kv_nope = gathered_kv_nope[:, :prefix_len].contiguous()
     k_rot = gathered_k_rot[:, :prefix_len].contiguous()
@@ -367,7 +320,10 @@ def _deepseek_v32_dsa_cp_forward(
         (index_query, index_key, merge_weight),
         (absorbed_query, kv_nope, q_rot, k_rot),
         (actual_q_len, actual_kv_len),
+        use_dense=use_dense,
     )
+    if use_dense:
+        return module.o_proj(attn_output.flatten(2)), None
     value_up_weight = kv_weight[:, module.qk_nope_head_dim :].transpose(1, 2)
     attn_output = _restore_attention_projection(
         attn_output,
@@ -388,8 +344,16 @@ def deepseek_v32_dsa_attention_cp_wrapper(
     tp_mesh: Any,
     cp_mesh: Any,
     ep_mesh: Any,
+    dense_warmup: bool | None = None,
 ) -> _ForwardRewriteRequest:
-    """Install manual all-gather CP for ``DeepseekV32DSAAttention``."""
+    """Install CP and follow the source DSA dense-warm-up state by default.
+
+    ``dense_warmup`` explicitly overrides the stage flag when supplied.
+    Otherwise the forward reads ``target_module.dsa_dense_warm_up`` so training
+    code can switch between dense warm-up and sparse DSA without reinstalling
+    the wrapper. Set it to ``true`` or ``false`` in the recipe only to force a
+    path for the whole run; leave it ``null`` to follow the model's stage flag.
+    """
     del mesh, tp_mesh, ep_mesh
     _validate_cp_target(target_module, cp_mesh)
     original_forward = target_module.forward
@@ -413,6 +377,7 @@ def deepseek_v32_dsa_attention_cp_wrapper(
             past_key_values,
             position_ids,
             actual_seq_len,
+            use_dense=dense_warmup,
             **kwargs,
         )
 
@@ -423,7 +388,9 @@ def deepseek_v32_dsa_attention_cp_wrapper(
             "_hp_deepseek_v32_dsa_cp_mesh": cp_mesh,
             "_hp_deepseek_v32_dsa_cp_config": {
                 "cp_size": cp_mesh.size(),
+                "dense_warmup_override": dense_warmup,
             },
+            "_hp_deepseek_v32_dsa_cp_dense_warmup": dense_warmup,
         },
     )
 
