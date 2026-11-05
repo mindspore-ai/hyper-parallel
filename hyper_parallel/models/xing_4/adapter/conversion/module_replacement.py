@@ -40,7 +40,7 @@ from hyper_parallel.components.modules.rms_norm import RMSNorm
 from hyper_parallel.components.modules.grouped_experts import GroupedExperts
 from hyper_parallel.components.modules.mla_attention import MLAAttention
 from hyper_parallel.models.replacement import module_replacement as register_module_replacement
-from hyper_parallel.models.xing_4.adapter.moe import Xing4MLP
+from hyper_parallel.models.xing_4.adapter.training import Xing4MLP
 from hyper_parallel.models.xing_4.transformer.modeling_xing4_0 import (
     Xing4_0HyperConnection, Xing4_0MLP, apply_rotary_pos_emb_interleave,
 )
