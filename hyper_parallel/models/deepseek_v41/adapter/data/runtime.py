@@ -22,7 +22,7 @@ from typing import Any
 import torch  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
-    SharedCompressedPackedSequence,
+    GraphPackedSequence, SharedCompressedPackedSequence,
 )
 from hyper_parallel.data.batching.runtime_input import (
     RuntimeInputAdapter,
@@ -49,6 +49,23 @@ class DeepseekV41Runtime(RuntimeInputAdapter):
         """
         self.include_position_ids = include_position_ids
         self.include_image_sequence_start = include_image_sequence_start
+
+    def prepare_graph_inputs(self, model_inputs: Mapping[str, Any]) -> dict[str, Any]:
+        """Build an isolated packing-only representation at the graph boundary.
+
+        Eager FSDP also rebuilds pytrees, so its inputs must retain real document
+        boundaries. Only the compiler receives this prepared metadata copy.
+        """
+        inputs = dict(model_inputs)
+        source = inputs["packed_seq_params"]
+        device = inputs["input_ids"].device
+        packed = GraphPackedSequence(
+            source.cu_seq_lens, source.local_query_start,
+            source.local_query_length, source.global_sequence_length,
+        ).prepare(device, ())
+        packed.prepare_packing_geometry(device)
+        inputs["packed_seq_params"] = packed
+        return inputs
 
     def runtime_input_fields(self) -> tuple[str, ...]:
         """Declare the stable set of model inputs produced by this instance."""
