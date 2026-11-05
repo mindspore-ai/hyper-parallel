@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Preserve full-precision control parameters during ordinary model dtype conversion."""
+"""Preserve FP32 parameters and buffers during ordinary model dtype conversion."""
 
 from collections.abc import Callable, Iterable
 
 import torch
 
 
-def preserve_fp32_tensors(
+def preserve_fp32_parameters(
     module: torch.nn.Module, transform: Callable[[torch.Tensor], torch.Tensor], names: Iterable[str],
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """Wrap Module._apply without rounding protected parameters, buffers or existing gradients.
@@ -51,7 +51,3 @@ def preserve_fp32_tensors(
         return tensor.to(device=converted.device, dtype=torch.float32)
 
     return apply
-
-
-# Keep the existing parameter-only entry point compatible.
-preserve_fp32_parameters = preserve_fp32_tensors

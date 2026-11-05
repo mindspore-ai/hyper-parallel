@@ -22,7 +22,7 @@ from torch import nn
 
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
 from hyper_parallel.core.activation_memory.recompute_state import is_recomputing
-from hyper_parallel.core.multicore.modules._precision import preserve_fp32_tensors
+from hyper_parallel.core.multicore.modules._precision import preserve_fp32_parameters
 from hyper_parallel.core.utils.communication import differentiable_all_reduce
 from hyper_parallel.models.xing_4.transformer.modeling_xing4_0 import (
     Xing4_0MLP, Xing4_0MoE, Xing4_0TopkRouter,
@@ -50,7 +50,7 @@ class Xing4Router(Xing4_0TopkRouter):
 
     def _apply(self, fn: Callable, recurse: bool = True) -> "Xing4Router":
         """Keep load-balancing bias updates in FP32 during model dtype conversion."""
-        return super()._apply(preserve_fp32_tensors(self, fn, self.fp32_buffer_names), recurse=recurse)
+        return super()._apply(preserve_fp32_parameters(self, fn, self.fp32_buffer_names), recurse=recurse)
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Route real tokens once; safe-token padding consumes neither jitter nor counts."""
@@ -118,6 +118,7 @@ class Xing4Router(Xing4_0TopkRouter):
     @torch.no_grad()
     def update_expert_bias(self, lr: float, num_recomputations: int = 1) -> None:
         """Apply one load-based update after the optimizer step."""
+        # Forward already excludes recomputation from the accumulated token counts.
         del num_recomputations
         counts = self._token_counts
         self.e_score_correction_bias.add_((counts.sum() - counts * self.num_experts).sign(), alpha=lr)
