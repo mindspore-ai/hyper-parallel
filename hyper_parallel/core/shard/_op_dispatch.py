@@ -794,13 +794,17 @@ class OpDispatcher:
         op_impl = op_call if op_impl is None else op_impl
         py_output = op_impl(*local_args, **local_kwargs)
         output = distribute_op.wrap_output(py_output, infer_result[0])
-        return OpDispatcher._restore_inplace_dtensor_result(op_name, args, output)
+        return OpDispatcher._restore_inplace_dtensor_result(op_name, args, output, kwargs)
 
     @staticmethod
-    def _restore_inplace_dtensor_result(op_name: str, args: tuple, output: Any) -> Any:
+    def _restore_inplace_dtensor_result(
+        op_name: str, args: tuple, output: Any, kwargs: Optional[dict] = None,
+    ) -> Any:
         """Return the original DTensor wrapper after a local in-place operation."""
-        if op_name in {"add_", "sub_"} and args and isinstance(args[0], DTensor):
-            return args[0]
+        if op_name in {"add_", "sub_", "constant_"}:
+            target = args[0] if args else (kwargs or {}).get("tensor")
+            if isinstance(target, DTensor):
+                return target
         return output
 
     @staticmethod
