@@ -16,6 +16,7 @@
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
@@ -62,6 +63,15 @@ class TestCustomOpsLoading(unittest.TestCase):
         expected_suffix = os.path.join("custom_ops", "build", "lib")
         build_lib_paths = [p for p in sys.path if expected_suffix in p]
         self.assertTrue(build_lib_paths, f"build/lib not found in sys.path: {sys.path[:5]}")
+
+    def test_missing_optional_kda_does_not_rebuild(self) -> None:
+        """An older usable extension need not contain optional KDA bridges."""
+        mock_mod = SimpleNamespace(npu_situ_glu=object(), npu_lightning_indexer_enhance=object())
+        with patch.dict(os.environ, {"HP_CUSTOM_OPS_NO_AUTO_REBUILD": "0"}), \
+                patch.dict(sys.modules, {_MODULE_NAME: mock_mod}):
+            custom_op_impl = __import__(_PKG, fromlist=["_custom_ops"])
+        self.assertIs(custom_op_impl._custom_ops, mock_mod)
+        self._mock_ms.ops.CustomOpBuilder.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -135,3 +135,18 @@ class TorchCustomOps:
         raise NotImplementedError(
             "npu_chunk_kda is not supported on the PyTorch platform."
         )
+
+    @staticmethod
+    def _chunk_kda_stage(*args: Any, **kwargs: Any) -> Any:
+        """Explicit KDA stages currently require the MindSpore Ascend platform."""
+        raise NotImplementedError("Chunk KDA stages are not supported on the PyTorch platform.")
+
+    npu_chunk_kda_fwd_prepare = _chunk_kda_stage
+    npu_chunk_kda_pre_process_fwd = _chunk_kda_stage
+    npu_chunk_kda_fwd_h = _chunk_kda_stage
+    npu_chunk_kda_fwd_finalize = _chunk_kda_stage
+    npu_chunk_kda_bwd_prepare = _chunk_kda_stage
+    npu_chunk_kda_pre_process_bwd = _chunk_kda_stage
+    npu_chunk_kda_bwd_dhu = _chunk_kda_stage
+    npu_chunk_kda_bwd_finalize = _chunk_kda_stage
+    npu_chunk_kda_merge_fwd_bwd = _chunk_kda_stage
