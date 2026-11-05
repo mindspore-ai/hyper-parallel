@@ -114,15 +114,15 @@ class Xing4DecoderLayer(Xing4_0DecoderLayer):
 
 @torch.no_grad()
 def initialize(owner: Any, module: nn.Module) -> None:
-    """Initialize training state and repair the bundled HC initializer's field lookup."""
+    """Use guarded initializers to preserve tensors already loaded from a checkpoint."""
     if isinstance(module, Xing4_0HyperConnection):
         nn.init.normal_(module.hc_fn, mean=0.0, std=1e-4)
-        module.hc_scale.fill_(owner.config.mhc_init_gating_factor)
-        module.hc_base.zero_()
+        nn.init.constant_(module.hc_scale, owner.config.mhc_init_gating_factor)
+        nn.init.zeros_(module.hc_base)
     elif isinstance(module, Xing4Router):
         nn.init.normal_(module.weight, mean=0.0, std=owner.config.initializer_range)
-        module._token_counts.zero_()
-        module.e_score_correction_bias.zero_()
+        nn.init.zeros_(module._token_counts)
+        nn.init.zeros_(module.e_score_correction_bias)
     else:
         Xing4_0PreTrainedModel._init_weights(owner, module)
 

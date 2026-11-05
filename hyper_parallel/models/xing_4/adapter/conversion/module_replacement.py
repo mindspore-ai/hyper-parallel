@@ -286,7 +286,7 @@ class Xing4GroupedExperts(GroupedExperts):
                 raise ValueError("GroupedExperts must support the requested SwiGLU clamp and compute dtype")
 
     def forward(self, *args: torch.Tensor, **kwargs: torch.Tensor) -> torch.Tensor:
-        """Preserve the ModuleList replacement call contract for the shared builder."""
+        """Keep the variadic ModuleList signature required by replacement validation."""
         return super().forward(*args, **kwargs)
 
     def make_transforms(self) -> list[WeightConverter]:
