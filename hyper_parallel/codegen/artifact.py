@@ -15,12 +15,10 @@
 """Artifact-layout resolution and atomic writes for codegen bundles.
 
 The artifact bundle lives in a ``generated/`` directory and holds the
-generated modeling file, its diff against the original, and
-``codegen_meta.json``.  Three layout anchors exist: the model-anchored
-default (``hyper_parallel/models/<model_type>/generated``, one bundle per
-model type), the YAML-anchored layout (``<yaml_dir>/generated``, used only
-when no model identity resolves), and the working-directory /
-explicit-directory layout for model-construction workflows.  The bundle is
+generated modeling file, its diff against the original, and copied remote-code
+dependencies. Two layout anchors exist: the model-anchored default
+(``hyper_parallel/models/<model_type>/generated``, one bundle per model type)
+and an explicit directory for isolated model-construction workflows. The bundle is
 written as one atomic unit: every file is first staged into a temporary
 *sibling* directory, then the whole directory is swapped into place, so a
 half-written bundle can never be imported.
@@ -28,48 +26,33 @@ half-written bundle can never be imported.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+import ctypes
+from dataclasses import dataclass
+import errno
 import logging
 import os
+from pathlib import Path
 import shutil
 import tempfile
-from dataclasses import dataclass
-from pathlib import Path
+import time
+from typing import Iterator
 
 # Bundle directory name shared by every layout constructor.
 _GENERATED_DIR = "generated"
 
 _LOGGER = logging.getLogger(__name__)
+_LOCK_INITIALIZATION_GRACE_S = 1.0
 
 
 @dataclass
 class ArtifactLayout:
-    """Describe the bundle path set for one YAML."""
+    """Describe the paths belonging to one generated bundle."""
 
-    yaml_path: str
     artifact_dir: str
     modeling_path: str
     diff_path: str
-    meta_path: str
     init_path: str
-
-    @classmethod
-    def build(cls, yaml_path: str, model_name: str | None = None) -> "ArtifactLayout":
-        """Create the layout from a YAML path and optional model name.
-
-        ``artifact_dir`` is ``<yaml_dir>/generated/``. Example directories
-        contain one Codegen YAML, so another per-YAML directory is redundant.
-        """
-        yaml_path = os.path.abspath(yaml_path)
-        artifact_dir = os.path.join(os.path.dirname(yaml_path), _GENERATED_DIR)
-        modeling_name = _default_modeling_name(model_name)
-        return cls(
-            yaml_path=yaml_path,
-            artifact_dir=artifact_dir,
-            modeling_path=os.path.join(artifact_dir, modeling_name),
-            diff_path=os.path.join(artifact_dir, modeling_name + ".diff"),
-            meta_path=os.path.join(artifact_dir, "codegen_meta.json"),
-            init_path=os.path.join(artifact_dir, "__init__.py"),
-        )
 
     @classmethod
     def build_default(
@@ -79,19 +62,14 @@ class ArtifactLayout:
     ) -> "ArtifactLayout":
         """Create the layout for model-construction codegen.
 
-        ``artifact_dir`` defaults to ``Path.cwd()/generated``.  ``yaml_path``
-        is kept as an empty string for backward-compatible metadata shape; the
-        signature is computed from the resolved config projection, not from a
-        YAML file path.
+        ``artifact_dir`` defaults to ``Path.cwd()/generated``.
         """
         resolved_dir = os.path.abspath(artifact_dir or os.path.join(os.getcwd(), _GENERATED_DIR))
         modeling_name = _default_modeling_name(model_name)
         return cls(
-            yaml_path="",
             artifact_dir=resolved_dir,
             modeling_path=os.path.join(resolved_dir, modeling_name),
             diff_path=os.path.join(resolved_dir, modeling_name + ".diff"),
-            meta_path=os.path.join(resolved_dir, "codegen_meta.json"),
             init_path=os.path.join(resolved_dir, "__init__.py"),
         )
 
@@ -100,7 +78,6 @@ class ArtifactLayout:
         cls,
         model_type: str,
         model_name: str | None = None,
-        yaml_path: str | None = None,
     ) -> "ArtifactLayout":
         """Create the model-anchored layout for one model type.
 
@@ -110,9 +87,6 @@ class ArtifactLayout:
         warning is emitted and the directory is created on demand, so a
         model without a family directory still gets its own bundle home
         instead of silently falling back to another location.
-        ``yaml_path`` records the originating training YAML in
-        ``codegen_meta.json`` (provenance only — the signature never reads
-        it); it is empty when no YAML anchors the run.
         """
         # ``artifact.py`` lives in ``hyper_parallel/codegen/``; the models
         # tree is its sibling — package-relative, never cwd-dependent.
@@ -130,11 +104,9 @@ class ArtifactLayout:
         artifact_dir = os.path.join(str(family_root), _GENERATED_DIR)
         modeling_name = _default_modeling_name(model_name)
         return cls(
-            yaml_path=os.path.abspath(yaml_path) if yaml_path else "",
             artifact_dir=artifact_dir,
             modeling_path=os.path.join(artifact_dir, modeling_name),
             diff_path=os.path.join(artifact_dir, modeling_name + ".diff"),
-            meta_path=os.path.join(artifact_dir, "codegen_meta.json"),
             init_path=os.path.join(artifact_dir, "__init__.py"),
         )
 
@@ -144,13 +116,6 @@ def _default_modeling_name(model_name: str | None) -> str:
     # '' / '-' are not valid Python identifiers in module names.
     safe = "".join(c if c.isalnum() or c == "_" else "_" for c in base)
     return f"modeling_{safe}_gen_npu.py"
-
-
-def resolve_artifact_layout(
-    yaml_path: str, model_name: str | None = None
-) -> ArtifactLayout:
-    """Resolve the artifact layout for ``yaml_path``."""
-    return ArtifactLayout.build(yaml_path, model_name)
 
 
 def resolve_default_artifact_layout(
@@ -164,7 +129,6 @@ def resolve_default_artifact_layout(
 def resolve_model_artifact_layout(
     model_type: str,
     model_name: str | None = None,
-    yaml_path: str | None = None,
 ) -> "ArtifactLayout":
     """Resolve the model-anchored layout for ``model_type``.
 
@@ -174,9 +138,7 @@ def resolve_model_artifact_layout(
     exist yet, ``ArtifactLayout.build_model_anchored`` warns and the directory is
     created on demand by :func:`ensure_artifact_dir`.
     """
-    return ArtifactLayout.build_model_anchored(
-        model_type, model_name=model_name, yaml_path=yaml_path
-    )
+    return ArtifactLayout.build_model_anchored(model_type, model_name=model_name)
 
 
 def ensure_artifact_dir(layout: ArtifactLayout) -> None:
@@ -197,16 +159,11 @@ def ensure_artifact_dir(layout: ArtifactLayout) -> None:
         ) from exc
 
 
-def write_bundle_atomic(
-    layout: ArtifactLayout, files: dict[str, str], meta: object = None
-) -> None:
+def write_bundle_atomic(layout: ArtifactLayout, files: dict[str, str]) -> None:
     """Write the whole bundle into place as one atomic directory switch.
 
     ``files`` maps filename -> content; keys must be plain file names (not
-    absolute paths) so nothing bypasses the staging directory.  ``meta``, when
-    given, is hashed against the *staged* files and written
-    ``codegen_meta.json`` LAST inside the staging directory, so meta being
-    present AND parseable always means the rest of the bundle is already there.
+    absolute paths) so nothing bypasses the staging directory.
 
     The bundle is first staged into a temporary *sibling* of ``artifact_dir``
     (never inside it), then the whole directory is swapped in.  On Windows
@@ -221,9 +178,7 @@ def write_bundle_atomic(
     tmpdir = tempfile.mkdtemp(prefix=".codegen_tmp_", dir=parent)
     old_dir = None
     try:
-        _stage_bundle(tmpdir, layout, files, has_meta=meta is not None)
-        if meta is not None:
-            _stage_meta(tmpdir, layout, meta)
+        _stage_bundle(tmpdir, files)
 
         if os.path.exists(layout.artifact_dir):
             old_dir = tempfile.mkdtemp(prefix=".codegen_old_", dir=parent)
@@ -244,64 +199,25 @@ def write_bundle_atomic(
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def _stage_bundle(
-    tmpdir: str,
-    layout: ArtifactLayout,
-    files: dict[str, str],
-    *,
-    has_meta: bool,
-) -> None:
-    """Copy any existing bundle files plus ``files`` into ``tmpdir``.
-
-    Existing non-temp files are preserved so a partial update (e.g. adding
-    ``source_*.py``) never drops the rest of
-    the bundle; a key in ``files`` always wins over the preserved copy.  When
-    ``has_meta`` is False the prior ``codegen_meta.json`` is also preserved —
-    otherwise the caller is going to write a fresh one into the staging dir.
-    """
-
-    def _is_tmp_name(name: str) -> bool:
-        return name.startswith(".codegen_tmp_") or name.startswith(".codegen_old_")
-
+def _stage_bundle(tmpdir: str, files: dict[str, str]) -> None:
+    """Write the complete newly emitted file set into ``tmpdir``."""
     normalized = dict(files)
     for name in normalized:
         _validate_bundle_filename(name)
 
     init_present = "__init__.py" in normalized
-    if not has_meta and os.path.isdir(layout.artifact_dir):
-        for name in os.listdir(layout.artifact_dir):
-            if _is_tmp_name(name):
-                continue
-            if name == "codegen_meta.json":
-                continue  # preserved below, after the loop
-            if name in normalized:
-                continue
-            src = os.path.join(layout.artifact_dir, name)
-            if not os.path.isfile(src):
-                continue
-            if name == "__init__.py":
-                init_present = True
-            shutil.copy2(src, os.path.join(tmpdir, name))
-
     if not init_present:
         normalized["__init__.py"] = ""
 
     for name, content in normalized.items():
         # newline="" disables the platform's default CRLF translation so the
         # staged bytes equal the emitted text bytes exactly.  On Windows the
-        # default (newline=None) would turn every LF into CRLF, inflating each
-        # file by one byte per line and breaking the drift/hash checks that
-        # compare on-disk bytes against the re-emitted LF text.
+        # default (newline=None) would turn every LF into CRLF and make bundle
+        # bytes platform-dependent.
         with open(
             os.path.join(tmpdir, name), "w", encoding="utf-8", newline=""
         ) as handle:
             handle.write(content)
-
-    if not has_meta and os.path.isfile(layout.meta_path):
-        shutil.copy2(
-            layout.meta_path, os.path.join(tmpdir, os.path.basename(layout.meta_path))
-        )
-
 
 def _validate_bundle_filename(name: str) -> None:
     """Reject absolute, nested, and parent-relative bundle paths."""
@@ -314,18 +230,6 @@ def _validate_bundle_filename(name: str) -> None:
         or name in {".", ".."}
     ):
         raise ValueError(f"bundle file keys must be plain names, got {name!r}")
-
-
-def _stage_meta(tmpdir: str, layout: ArtifactLayout, meta: object) -> None:
-    """Hash the staged content files then write ``codegen_meta.json`` last."""
-    from hyper_parallel.codegen.meta import (
-        record_output_hashes,
-        write_codegen_meta,
-    )
-
-    record_output_hashes(meta, layout, base_dir=tmpdir)
-    meta_path = os.path.join(tmpdir, os.path.basename(layout.meta_path))
-    write_codegen_meta(meta, meta_path)
 
 
 def clean_temp_artifacts(layout: ArtifactLayout) -> None:
@@ -342,12 +246,150 @@ def clean_temp_artifacts(layout: ArtifactLayout) -> None:
             shutil.rmtree(os.path.join(parent, name), ignore_errors=True)
 
 
+@contextmanager
+def artifact_generation_lock(
+    layout: ArtifactLayout,
+    *,
+    timeout_s: float = 600.0,
+) -> Iterator[None]:
+    """Serialize bundle publication and recover locks left by dead owners."""
+    parent = os.path.dirname(layout.artifact_dir) or "."
+    bundle_name = os.path.basename(layout.artifact_dir.rstrip(os.sep)) or "generated"
+    lock_path = os.path.join(parent, f".{bundle_name}.codegen.lock")
+    deadline = time.monotonic() + timeout_s
+    descriptor = None
+    owner_identity = None
+    while descriptor is None:
+        try:
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(descriptor, str(os.getpid()).encode("ascii"))
+            except BaseException:
+                os.close(descriptor)
+                descriptor = None
+                try:
+                    os.unlink(lock_path)
+                except FileNotFoundError:
+                    pass
+                raise
+            owner_identity = _file_identity(lock_path)
+        except FileExistsError:
+            if _remove_stale_lock(lock_path):
+                continue
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"codegen: timed out waiting for artifact lock {lock_path}"
+                ) from None
+            time.sleep(0.1)
+    try:
+        yield
+    finally:
+        os.close(descriptor)
+        if owner_identity is not None and _file_identity(lock_path) == owner_identity:
+            try:
+                os.unlink(lock_path)
+            except FileNotFoundError:
+                pass
+
+
+def _remove_stale_lock(lock_path: str) -> bool:
+    """Remove ``lock_path`` when its recorded owner process is dead."""
+    try:
+        identity = _file_identity(lock_path)
+        stat_result = os.stat(lock_path)
+        with open(lock_path, "r", encoding="ascii") as handle:
+            value = handle.read().strip()
+    except (FileNotFoundError, OSError, UnicodeError):
+        return False
+
+    try:
+        pid = int(value)
+    except ValueError:
+        # There is a tiny interval between O_EXCL creation and writing the PID.
+        # Only reclaim malformed locks after that initialization window.
+        age_s = max(0.0, time.time() - stat_result.st_mtime)
+        stale = age_s >= _LOCK_INITIALIZATION_GRACE_S
+    else:
+        stale = not _pid_is_alive(pid)
+    if not stale or _file_identity(lock_path) != identity:
+        return False
+    try:
+        os.unlink(lock_path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    _LOGGER.warning("codegen: removed stale artifact lock %s", lock_path)
+    return True
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """Return whether ``pid`` still identifies a live process."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        return _windows_pid_is_alive(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return False
+        if exc.errno == errno.EPERM:
+            return True
+        return True
+    return True
+
+
+def _windows_pid_is_alive(pid: int) -> bool:
+    """Query a Windows process without using ``os.kill(pid, 0)``.
+
+    Windows does not implement the POSIX signal-zero probe; using it may
+    terminate the target process. ``OpenProcess`` plus ``GetExitCodeProcess``
+    is read-only and reports ``STILL_ACTIVE`` for a live owner.
+    """
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = (ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong)
+    open_process.restype = ctypes.c_void_p
+    get_exit_code = kernel32.GetExitCodeProcess
+    get_exit_code.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong))
+    get_exit_code.restype = ctypes.c_int
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (ctypes.c_void_p,)
+    close_handle.restype = ctypes.c_int
+    process = open_process(0x1000, False, pid)
+    if not process:
+        # Access denied proves that the process exists. Other errors are
+        # treated conservatively except ERROR_INVALID_PARAMETER (no such PID).
+        return ctypes.get_last_error() != 87
+    try:
+        exit_code = ctypes.c_ulong()
+        if not get_exit_code(process, ctypes.byref(exit_code)):
+            return True
+        return exit_code.value == 259  # STILL_ACTIVE
+    finally:
+        close_handle(process)
+
+
+def _file_identity(path: str) -> tuple[int, int, int] | None:
+    """Return enough stat identity to avoid unlinking a replaced lock file."""
+    try:
+        result = os.stat(path)
+    except FileNotFoundError:
+        return None
+    return result.st_ino, result.st_mtime_ns, result.st_size
+
+
 __all__ = [
     "ArtifactLayout",
+    "artifact_generation_lock",
     "clean_temp_artifacts",
     "ensure_artifact_dir",
     "resolve_default_artifact_layout",
     "resolve_model_artifact_layout",
-    "resolve_artifact_layout",
     "write_bundle_atomic",
 ]

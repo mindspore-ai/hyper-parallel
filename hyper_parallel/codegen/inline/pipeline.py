@@ -17,19 +17,35 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import replace
 import importlib
+import textwrap
 from typing import Any
 
-from hyper_parallel.codegen.inline.ir import InlinePatchSet
+from hyper_parallel.codegen.inline.ir import (
+    ImportPatch,
+    InlinePatchSet,
+    ModuleSnippetPatch,
+)
 from hyper_parallel.codegen.inline.meta_plan import normalize_inline_meta
-from hyper_parallel.codegen.inline.patch_engine import apply_patch_set, drop_shadowed_definitions
-from hyper_parallel.codegen.inline.replacement_pass import build_replacement_patches
-from hyper_parallel.codegen.inline.specs import replacement_spec, strategy_spec
+from hyper_parallel.codegen.inline.definition_edits import drop_shadowed_definitions
+from hyper_parallel.codegen.inline.patch_engine import apply_patch_set
+from hyper_parallel.codegen.inline.framework_spec import (
+    replacement_spec_for as replacement_spec,
+    strategy_spec_for as strategy_spec,
+)
 from hyper_parallel.codegen.inline.strategy_pass import build_strategy_patches
-from hyper_parallel.codegen.inline.yaml_rules import collect_inline_rules
+from hyper_parallel.codegen.inline.observations import collect_source_observations
+from hyper_parallel.codegen.inline.source_plan import build_source_patch_plan
 
 
-def render_inline_modeling(source_text: str, meta: Any, model_type: str | None = None) -> str:
+def render_inline_modeling(
+    source_text: str,
+    meta: Any,
+    model_type: str | None = None,
+    *,
+    patch_plan: Any = None,
+) -> str:
     """Render the inline-patched modeling file for a frozen plan.
 
     This is the only artifact route. A YAML target with no adapter declaration
@@ -46,13 +62,45 @@ def render_inline_modeling(source_text: str, meta: Any, model_type: str | None =
         The rendered modeling source.
     """
 
-    rules = collect_inline_rules(meta)
+    rendered, _ = render_inline_modeling_with_plan(
+        source_text,
+        meta,
+        model_type,
+        patch_plan=patch_plan,
+    )
+    return rendered
+
+
+def render_inline_modeling_with_plan(
+    source_text: str,
+    meta: Any,
+    model_type: str | None = None,
+    *,
+    patch_plan: Any = None,
+) -> tuple[str, Any]:
+    """Render source and return the independently normalized emission plan."""
+    rules = collect_source_observations(meta)
     if not rules:
-        return source_text
-    _require_inline_coverage(rules, model_type)
-    replacement_patches = build_replacement_patches(rules, model_type)
-    strategy_patches = build_strategy_patches(rules, model_type)
-    patch_set = _merge_patch_sets(replacement_patches, strategy_patches)
+        return source_text, meta
+    patches = patch_plan
+    recorded_local_compute = bool(
+        getattr(patches, "local_computes", ()) if patches is not None else ()
+    )
+    strategy_rules = (
+        tuple(replace(rule, local_compute_target=None) for rule in rules)
+        if recorded_local_compute
+        else rules
+    )
+    _require_inline_coverage(strategy_rules, model_type)
+    patch_set = build_source_patch_plan(
+        rules,
+        strategy_rules,
+        model_type,
+        _observed_boundary_classes(meta, patch_plan),
+        getattr(meta, "external_state_classes", None),
+    )
+    _add_recorded_forward_host_imports(source_text, patch_set, patch_plan)
+    _materialize_imported_forward_hosts(source_text, patch_set)
     rendered = apply_patch_set(source_text, patch_set)
     # The copied modeling source brings its own decorated helpers that share
     # names with the library functions the artifact imports, and a local
@@ -65,8 +113,175 @@ def render_inline_modeling(source_text: str, meta: Any, model_type: str | None =
     rendered = drop_shadowed_definitions(
         rendered, _library_import_names(rendered) & _decorated_names(source_text)
     )
-    normalize_inline_meta(meta, rules, model_type)
-    return rendered
+    normalized_meta = normalize_inline_meta(meta, strategy_rules, model_type)
+    return rendered, normalized_meta
+
+
+def _add_recorded_forward_host_imports(
+    source_text: str,
+    patch_set: InlinePatchSet,
+    patch_plan: Any,
+) -> None:
+    """Expose observed replacement hosts needed by a forward rewrite.
+
+    A replacement application can be observed after the root model has built,
+    while its constructor belongs to an imported decoder rather than the copied
+    top-level source.  In that case the frozen replacement record is the source
+    of truth for the concrete host type.  Add its real import so the generic
+    imported-host materializer can emit the CP dispatch class.
+    """
+    source_classes = {
+        node.name
+        for node in ast.parse(source_text).body
+        if isinstance(node, ast.ClassDef)
+    }
+    imported_names = {
+        name
+        for item in patch_set.imports
+        if not item.raw
+        for name in item.names
+    }
+    replacements = (
+        getattr(patch_plan, "module_replacements", ())
+        if patch_plan is not None
+        else ()
+    )
+    replacement_types = {
+        record.replacement_type.__name__: record.replacement_type
+        for record in replacements
+    }
+    for patch in patch_set.forward_extracts:
+        if patch.class_name in source_classes or patch.class_name in imported_names:
+            continue
+        replacement_type = replacement_types.get(patch.class_name)
+        if replacement_type is None:
+            continue
+        patch_set.imports.append(
+            ImportPatch(replacement_type.__module__, (replacement_type.__name__,))
+        )
+        imported_names.add(patch.class_name)
+
+
+def _observed_boundary_classes(meta: Any, patch_plan: Any) -> dict[str, str]:
+    """Return boundary owners after native inner-wrapper target resolution."""
+    classes = dict(getattr(meta, "boundary_classes", None) or {})
+    wrappers = (
+        getattr(patch_plan, "inner_wrappers", ())
+        if patch_plan is not None
+        else ()
+    )
+    for record in wrappers:
+        target_type = getattr(record, "target_type", None)
+        if target_type is None:
+            continue
+        target_fqn = (
+            record.module_fqn
+            if record.target_fqn == "self"
+            else f"{record.module_fqn}.{record.target_fqn}"
+        )
+        classes[target_fqn] = target_type.__name__
+    return classes
+
+
+def _materialize_imported_forward_hosts(
+    source_text: str, patch_set: InlinePatchSet
+) -> None:
+    """Render same-name subclasses when a strategy host is an imported component."""
+    source_classes = {
+        node.name
+        for node in ast.parse(source_text).body
+        if isinstance(node, ast.ClassDef)
+    }
+    remaining = []
+    rendered: set[str] = set()
+    for patch in patch_set.forward_extracts:
+        if patch.class_name in source_classes:
+            remaining.append(patch)
+            continue
+        import_index = next(
+            (
+                index
+                for index, item in enumerate(patch_set.imports)
+                if not item.raw and patch.class_name in item.names
+            ),
+            None,
+        )
+        if import_index is None:
+            remaining.append(patch)
+            continue
+        if patch.class_name in rendered:
+            continue
+        rendered.add(patch.class_name)
+        imported = patch_set.imports[import_index]
+        other_names = tuple(name for name in imported.names if name != patch.class_name)
+        alias = f"_{patch.class_name}Base"
+        replacement_imports = []
+        if other_names:
+            replacement_imports.append(ImportPatch(imported.module, other_names))
+        replacement_imports.append(ImportPatch(
+            module="",
+            names=(),
+            raw=f"from {imported.module} import {patch.class_name} as {alias}",
+        ))
+        patch_set.imports[import_index:import_index + 1] = replacement_imports
+        body = patch.body.replace(
+            "return self._forward_impl(__hp_forward_args__)",
+            "return super().forward(__hp_forward_args__)",
+        ).replace("__hp_forward_args__", "*args, **kwargs")
+        snippet = (
+            f"class {patch.class_name}({alias}):\n"
+            "    \"\"\"Generated source-visible parallel form.\"\"\"\n\n"
+            "    cp_enable = False\n\n"
+            "    def forward(self, *args, **kwargs):\n"
+            f"{textwrap.indent(body.strip(), '        ')}\n"
+        )
+        patch_set.module_snippets.append(ModuleSnippetPatch(snippet))
+    patch_set.forward_extracts = remaining
+
+
+def render_inline_strategies_for_source_unit(
+    source_text: str,
+    meta: Any,
+    model_type: str | None = None,
+    *,
+    patch_plan: Any = None,
+) -> str:
+    """Render only strategy forwards owned by one sibling source unit."""
+    rules = collect_source_observations(meta)
+    if not rules:
+        return source_text
+    recorded_local_compute = bool(
+        getattr(patch_plan, "local_computes", ())
+        if patch_plan is not None
+        else ()
+    )
+    strategy_rules = (
+        tuple(replace(rule, local_compute_target=None) for rule in rules)
+        if recorded_local_compute
+        else rules
+    )
+    _require_inline_coverage(strategy_rules, model_type)
+    patches = build_strategy_patches(
+        strategy_rules,
+        model_type,
+        _observed_boundary_classes(meta, patch_plan),
+        getattr(meta, "external_state_classes", None),
+    )
+    source_classes = {
+        node.name
+        for node in ast.parse(source_text).body
+        if isinstance(node, ast.ClassDef)
+    }
+    patches.forward_extracts = [
+        patch for patch in patches.forward_extracts
+        if patch.class_name in source_classes
+    ]
+    if not patches.forward_extracts:
+        return source_text
+    patches.module_snippets.clear()
+    patches.constructor_replaces.clear()
+    patches.class_removals.clear()
+    return apply_patch_set(source_text, patches)
 
 
 def _library_import_names(text: str) -> set[str]:
@@ -181,14 +396,3 @@ def _require_inline_coverage(rules: tuple[Any, ...], model_type: str | None = No
             "component or framework strategy, and a local_compute target "
             "names no @local_compute factory"
         )
-
-
-def _merge_patch_sets(*sets: InlinePatchSet) -> InlinePatchSet:
-    merged = InlinePatchSet()
-    for patch_set in sets:
-        merged.imports.extend(patch_set.imports)
-        merged.module_snippets.extend(patch_set.module_snippets)
-        merged.constructor_replaces.extend(patch_set.constructor_replaces)
-        merged.forward_extracts.extend(patch_set.forward_extracts)
-        merged.class_removals.extend(patch_set.class_removals)
-    return merged

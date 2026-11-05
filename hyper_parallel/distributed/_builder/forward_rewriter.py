@@ -37,13 +37,12 @@ import inspect
 import logging
 import types
 import weakref
-from typing import Any, Callable, List, Optional, Sequence, Union
+from typing import Any, Callable, List, Sequence
 
 import torch
 from torch import nn
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
-from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.distributed.recipe_spec import (
     INNER_WRAPPER,
@@ -594,59 +593,6 @@ def _rewrap_local_outputs(output, spec, mesh, mesh_dim_names, module_name):
         raise ValueError(
             f"{module_name}: scalar forward output cannot satisfy "
             f"{len(declared)} declared out_src entries"
-        )
-    return items[0]
-
-
-def rewrap_declared_outputs(
-    output: Union[torch.Tensor, Sequence[Optional[torch.Tensor]]],
-    entries: List[tuple[int, str, tuple]],
-    mesh: DeviceMesh,
-    *,
-    label: str,
-) -> Union[torch.Tensor, Sequence[Optional[torch.Tensor]]]:
-    """Re-wrap declared local-region outputs with their ``out_src`` layout.
-
-    The codegen-runtime counterpart of :func:`_rewrap_local_outputs`:
-    ``InstalledBoundary.rewrap_outputs`` calls this with placements it
-    pre-resolved from the frozen plan at install time, so the forward-path
-    work is a plain replay.  ``None`` and already-DTensor items pass through.
-
-    Args:
-        output: Forward output tensor, or tuple/list of optional tensors.
-        entries: Pre-resolved ``(index, out_name, placements)`` rewrap plan.
-        mesh: Dense mesh the declared outputs shard across.
-        label: Caller label used in error messages.
-
-    Returns:
-        The output with declared entries re-wrapped as DTensors.
-    """
-    is_sequence = isinstance(output, (tuple, list))
-    items = list(output) if is_sequence else [output]
-    for index, out_name, placements in entries:
-        if index >= len(items):
-            raise ValueError(
-                f"{label}: out_src maps output {out_name!r} to index "
-                f"{index}, but forward returned only {len(items)} output(s)"
-            )
-        item = items[index]
-        if item is None or isinstance(item, DTensor):
-            continue
-        if not isinstance(item, torch.Tensor):
-            raise TypeError(
-                f"{label}: declared output {out_name!r} at index "
-                f"{index} must be a Tensor or None, got {type(item).__name__}"
-            )
-        items[index] = DTensor.from_local(item, mesh, tuple(placements))
-
-    if isinstance(output, tuple):
-        return tuple(items)
-    if isinstance(output, list):
-        return items
-    if len(items) != 1:
-        raise ValueError(
-            f"{label}: scalar forward output cannot satisfy "
-            f"{len(entries)} declared out_src entries"
         )
     return items[0]
 

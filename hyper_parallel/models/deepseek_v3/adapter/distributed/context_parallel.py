@@ -84,6 +84,29 @@ def _validate_up_projections(target_module: MLAAttention, plan: MLACPPlan) -> No
             raise ValueError("MLA CP must be installed before other up-projection forward adapters")
 
 
+def mla_cp_forward(
+    target_module: nn.Module,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+    attention_mask: torch.Tensor | None = None,
+    past_key_values: Any | None = None,
+    actual_seq_len: torch.Tensor | Sequence[int] | None = None,
+    **kwargs: Any,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Route latent inputs through the CP runtime configured by the wrapper."""
+    if past_key_values is not None:
+        raise ValueError("MLA CP training does not support a KV cache")
+    batch_size, sequence_length = hidden_states.shape[:-1]
+    runtime = target_module.mla_cp_runtime
+    attn_output, attn_weights = runtime(
+        target_module, *target_module.project_latent_inputs(hidden_states),
+        position_embeddings=position_embeddings, attention_mask=attention_mask,
+        actual_seq_len=actual_seq_len, **kwargs,
+    )
+    attn_output = attn_output.reshape(batch_size, sequence_length, -1).contiguous()
+    return target_module.o_proj(attn_output), attn_weights
+
+
 @inner_wrapper
 def mla_cp_wrapper(
     target_module: nn.Module,
@@ -167,16 +190,15 @@ def mla_cp_wrapper(
         Returns:
             Projected local-token output and None for attention weights.
         """
-        if past_key_values is not None:
-            raise ValueError("MLA CP training does not support a KV cache")
-        batch_size, sequence_length = hidden_states.shape[:-1]
-        attn_output, attn_weights = runtime(
-            target_module, *target_module.project_latent_inputs(hidden_states),
-            position_embeddings=position_embeddings, attention_mask=attention_mask,
-            actual_seq_len=actual_seq_len, **kwargs,
+        return mla_cp_forward(
+            target_module,
+            hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            actual_seq_len=actual_seq_len,
+            **kwargs,
         )
-        attn_output = attn_output.reshape(batch_size, sequence_length, -1).contiguous()
-        return target_module.o_proj(attn_output), attn_weights
 
     requests = [_ForwardRewriteRequest(
         target_module, cp_forward,

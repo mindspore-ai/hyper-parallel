@@ -125,6 +125,8 @@ class ModelAdapterSpec:
         encoder_parallel: lazy provider returning construction-time visual
             replacement/isolation rules and a factory for a model-bound
             Encoder-DP/Encoder-CP bridge.
+        codegen: lazy provider for model-owned source compatibility and source
+            renderers used only while exporting a generated bundle.
     """
 
     architecture: str
@@ -145,3 +147,4 @@ class ModelAdapterSpec:
     loss: Optional[Callable[..., Any]] = None
     encoder_parallel: Optional[Callable[..., Any]] = None
     checkpoint_export: Optional[Callable[..., tuple[dict[str, Any], bool]]] = None
+    codegen: Optional[Callable[..., Any]] = None

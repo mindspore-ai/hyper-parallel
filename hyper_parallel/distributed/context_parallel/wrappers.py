@@ -427,37 +427,49 @@ def sdpa_hf_cp_wrapper(
             "local_compute_fn channel (see "
             "examples/distributed/perf_replacement.py)")
 
-    original_forward = target_module.forward
-    orig_sdpa = F.scaled_dot_product_attention
+    setattr(target_module, "_hp_sdpa_hf_cp_mesh", cp_mesh)
+    setattr(target_module, "_hp_sdpa_hf_original_forward", target_module.forward)
 
-    @functools.wraps(original_forward)
+    @functools.wraps(target_module.forward)
     def cp_forward(hidden_states: Any, *args: Any, **kwargs: Any) -> Any:
-        """Run the HF forward with F.sdpa temporarily replaced by the CP-aware one."""
-        fired = {"hit": False}
-
-        def cp_aware_sdpa(q: Any, k: Any, v: Any, **kw: Any) -> Any:
-            """CP-aware SDPA replacement: all-gather K/V plus the D-04 mask."""
-            fired["hit"] = True
-            return _cp_sdpa_call(orig_sdpa, cp_mesh, q, k, v, kw)
-
-        F.scaled_dot_product_attention = cp_aware_sdpa
-        try:
-            out = original_forward(hidden_states, *args, **kwargs)
-        finally:
-            F.scaled_dot_product_attention = orig_sdpa
-        if not fired["hit"]:
-            raise RuntimeError(
-                f"CP wrapper 'sdpa_hf' did not intercept any "
-                f"F.scaled_dot_product_attention call on "
-                f"{type(target_module).__name__} -- the wrapper does "
-                f"not match the module implementation (K/V were not "
-                f"all-gathered; continuing would produce silent numerical "
-                f"errors). Please explicitly set inner_wrapper='sdpa_qkv' "
-                f"(the (q,k,v) convention), or provide a custom inner_wrapper "
-                f"callable")
-        return out
+        """Delegate to the source-visible SDPA helper shared with Codegen."""
+        return sdpa_hf_cp_forward(target_module, hidden_states, *args, **kwargs)
 
     return cp_forward
+
+
+def sdpa_hf_cp_forward(
+        target_module: Module, hidden_states: Any,
+        *args: Any, **kwargs: Any) -> Any:
+    """Run an HF attention forward while intercepting SDPA for CP."""
+    cp_mesh = getattr(target_module, "_hp_sdpa_hf_cp_mesh")
+    original_forward = getattr(target_module, "_forward_impl", None)
+    if original_forward is None:
+        original_forward = getattr(target_module, "_hp_sdpa_hf_original_forward")
+    orig_sdpa = F.scaled_dot_product_attention
+    fired = {"hit": False}
+
+    def cp_aware_sdpa(q: Any, k: Any, v: Any, **kw: Any) -> Any:
+        """CP-aware SDPA replacement: all-gather K/V plus the D-04 mask."""
+        fired["hit"] = True
+        return _cp_sdpa_call(orig_sdpa, cp_mesh, q, k, v, kw)
+
+    F.scaled_dot_product_attention = cp_aware_sdpa
+    try:
+        out = original_forward(hidden_states, *args, **kwargs)
+    finally:
+        F.scaled_dot_product_attention = orig_sdpa
+    if not fired["hit"]:
+        raise RuntimeError(
+            f"CP wrapper 'sdpa_hf' did not intercept any "
+            f"F.scaled_dot_product_attention call on "
+            f"{type(target_module).__name__} -- the wrapper does "
+            f"not match the module implementation (K/V were not "
+            f"all-gathered; continuing would produce silent numerical "
+            f"errors). Please explicitly set inner_wrapper='sdpa_qkv' "
+            f"(the (q,k,v) convention), or provide a custom inner_wrapper "
+            f"callable")
+    return out
 
 
 @inner_wrapper

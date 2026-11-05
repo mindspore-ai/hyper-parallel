@@ -21,8 +21,8 @@ from typing import Literal, Optional
 
 
 @dataclass(frozen=True)
-class InlineRule:
-    """One normalized rule recovered from frozen YAML-derived metadata."""
+class SourceObservation:
+    """One normalized replacement or injection observed during native build."""
 
     match: tuple[str, ...]
     module_type: Optional[str] = None
@@ -66,6 +66,7 @@ class ConstructorReplacePatch:
     mode: Literal["name", "wrap_source"] = "name"
     keyword_args: tuple[str, ...] = ()
     scope_attrs: tuple[str, ...] = ()
+    scope_fqns: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,7 @@ class ForwardExtractPatch:
     class_name: str
     method_name: str
     body: str
+    merge_original_body: bool = False
 
 
 @dataclass(frozen=True)
@@ -100,3 +102,49 @@ class InlinePatchSet:
     constructor_replaces: list[ConstructorReplacePatch] = field(default_factory=list)
     forward_extracts: list[ForwardExtractPatch] = field(default_factory=list)
     class_removals: list[ClassRemovalPatch] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ReplacementSpec:
+    """Source-level form of one module replacement implementation."""
+
+    old_ctor: str
+    new_ctor: str
+    imports: tuple[ImportPatch, ...]
+    mode: str = "name"
+    keyword_args: tuple[str, ...] = ()
+    snippets: tuple[ModuleSnippetPatch, ...] = ()
+    remove_class: bool = True
+    replacement_note: str | None = None
+
+
+@dataclass(frozen=True)
+class StrategySpec:
+    """Source-level form of one parallel strategy target."""
+
+    kind: str
+    imports: tuple[ImportPatch, ...]
+    target_class: str | None = None
+    method_name: str = "forward"
+    body_template: str | None = None
+    subclass_shell: str | None = None
+    subclass_state_attr: str | None = None
+    snippets: tuple[ModuleSnippetPatch, ...] = ()
+    strip_boundary_subpatterns: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Require a complete method patch or an imports-only declaration."""
+        if self.target_class is not None and self.body_template is None:
+            raise ValueError("Inline strategy target_class requires a body_template")
+        if self.target_class is not None and (not self.target_class or not self.body_template.strip()):
+            raise ValueError("Inline strategy class and body must be nonempty")
+        if not self.method_name.isidentifier():
+            raise ValueError("Inline strategy method_name must be a Python identifier")
+        if self.subclass_shell is not None:
+            if self.target_class is not None or self.body_template is not None:
+                raise ValueError(
+                    "Inline strategy subclass_shell is exclusive with "
+                    "target_class and body_template"
+                )
+            if not self.subclass_shell.strip():
+                raise ValueError("Inline strategy subclass shell must be nonempty")
