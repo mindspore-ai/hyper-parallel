@@ -86,6 +86,7 @@ class Xing4DecoderLayer(Xing4_0DecoderLayer):
         self.post_attention_layernorm = source.post_attention_layernorm
         self.attn_hc = Xing4HyperConnection(config, source.attn_hc)
         self.ffn_hc = Xing4HyperConnection(config, source.ffn_hc)
+        # The training recipe applies its norm epsilon to both MLA latent projections.
         self.self_attn.q_a_layernorm.variance_epsilon = config.rms_norm_eps
         self.self_attn.kv_a_layernorm.variance_epsilon = config.rms_norm_eps
         if config.attention_softmax_scale is not None:
@@ -273,8 +274,11 @@ class Xing4ForCausalLM(Xing4_0ForCausalLM):
         count = targets.ne(IGNORE_INDEX).sum()
         weight = self.lm_head.weight
         if getattr(weight, "placements", None) is None and weight.shape[0] == self.config.vocab_size:
+            chunk_size = getattr(self.config, "chunk_loss_size", None)
+            if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
+                raise ValueError("Full-vocabulary Xing4 cross entropy requires a positive integer chunk_loss_size")
             loss_sum = chunked_cross_entropy(hidden, targets, weight,
-                                             chunk_size=self.config.chunk_loss_size, ignore_index=IGNORE_INDEX)
+                                             chunk_size=chunk_size, ignore_index=IGNORE_INDEX)
         else:
             loss_sum = self.loss_function(self.lm_head(hidden), None, self.config.vocab_size, num_items_in_batch=1,
                                           ignore_index=IGNORE_INDEX, shift_labels=targets)

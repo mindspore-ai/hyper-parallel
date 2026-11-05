@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Training objectives around the official Xing4 router, experts and MLPs."""
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -21,6 +22,7 @@ from torch import nn
 
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
 from hyper_parallel.core.activation_memory.recompute_state import is_recomputing
+from hyper_parallel.core.multicore.modules._precision import preserve_fp32_tensors
 from hyper_parallel.core.utils.communication import differentiable_all_reduce
 from hyper_parallel.models.xing_4.transformer.modeling_xing4_0 import (
     Xing4_0MLP, Xing4_0MoE, Xing4_0TopkRouter,
@@ -30,6 +32,8 @@ from hyper_parallel.models.xing_4.transformer.modeling_xing4_0 import (
 class Xing4Router(Xing4_0TopkRouter):
     """HF learned selection with the recipe's training state and objectives."""
 
+    fp32_buffer_names = ("e_score_correction_bias",)
+
     def __init__(self, config: Any, source: nn.Module) -> None:
         """Retain the HF weights and register all resumable routing state."""
         super().__init__(config)
@@ -38,11 +42,15 @@ class Xing4Router(Xing4_0TopkRouter):
         self.padding = config.n_routed_experts if config.use_pad_tokens else 0
         self.aux_loss_coeff = config.moe_aux_loss_coeff
         self.aux_loss_cp_group = None
-        self.register_buffer("_token_counts", torch.zeros(self.num_experts, dtype=torch.float32))
+        self.register_buffer("_token_counts", torch.zeros(self.num_experts, dtype=torch.int64))
         self.input_jitter_eps = config.moe_input_jitter_eps
         self.last_aux_loss = None
         self.enable_expert_bias = config.moe_router_enable_expert_bias
         self.expert_bias_update_rate = config.moe_router_bias_update_rate
+
+    def _apply(self, fn: Callable, recurse: bool = True) -> "Xing4Router":
+        """Keep load-balancing bias updates in FP32 during model dtype conversion."""
+        return super()._apply(preserve_fp32_tensors(self, fn, self.fp32_buffer_names), recurse=recurse)
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Route real tokens once; safe-token padding consumes neither jitter nor counts."""
@@ -53,9 +61,9 @@ class Xing4Router(Xing4_0TopkRouter):
         logits, weights, indices = super().forward(flat)
         scores = logits.sigmoid()
         weights = self._attach_balance_loss(weights, scores, batch_size=hidden_states.shape[0])
-        if self.training and not is_recomputing():
-            counts = torch.zeros_like(scores[0]).scatter_add_(
-                0, indices.reshape(-1), torch.ones_like(indices.reshape(-1), dtype=scores.dtype))
+        if self.training and self.enable_expert_bias and not is_recomputing():
+            counts = torch.zeros_like(self._token_counts).scatter_add_(
+                0, indices.reshape(-1), torch.ones_like(indices.reshape(-1), dtype=torch.int64))
             self._token_counts.add_(counts)
         if self.padding:
             batch = hidden_states.shape[0]
@@ -112,7 +120,7 @@ class Xing4Router(Xing4_0TopkRouter):
         """Apply one load-based update after the optimizer step."""
         del num_recomputations
         counts = self._token_counts
-        self.e_score_correction_bias.add_((counts.mean() - counts).sign(), alpha=lr)
+        self.e_score_correction_bias.add_((counts.sum() - counts * self.num_experts).sign(), alpha=lr)
         counts.zero_()
 
 

@@ -19,12 +19,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from functools import partial
 from typing import Any
 
 import torch
 from torch import nn
 from transformers.activations import ACT2FN
-import torch_npu
 
 from hyper_parallel.components.checkpoint import weight_conversion
 from hyper_parallel.components.checkpoint.conversion_ops import ConcatenateWithSections
@@ -56,6 +56,8 @@ def fusion_attention_with_logit_maxima(module: nn.Module, query: torch.Tensor, k
     Query/key are BNSD, value is BNSV, and output is BSNV. CP supplies
     packed sequence boundaries and the head range within the TP shard."""
     del attention_mask
+    if kwargs.get("indices") is not None or kwargs.get("dropout", 0.0):
+        raise ValueError("Xing4 MLA requires dense attention with dropout=0")
     batch, heads, sequence = query.shape[:3]
     options = dict(kwargs)
     head_offset = options.pop("mla_head_offset", 0)
@@ -67,6 +69,9 @@ def fusion_attention_with_logit_maxima(module: nn.Module, query: torch.Tensor, k
             raise ValueError("Unequal Xing4 CP query/key lengths require global sequence boundaries")
         options["actual_seq_len"] = tuple(range(sequence, batch * sequence + 1, sequence))
     context = _prepare_fusion_attention_context(module, query, key, value, None, options)
+    # Configuration and conversion do not require the optional NPU extension.
+    import torch_npu  # pylint: disable=import-outside-toplevel
+
     output, softmax_max = torch_npu.npu_fusion_attention(
         context.query, context.key, context.value, heads, context.input_layout,
         pse=None, padding_mask=None, atten_mask=context.attention_mask, scale=kwargs["scaling"],
@@ -269,8 +274,19 @@ class Xing4GroupedExperts(GroupedExperts):
         carrier.train(module.training)
         super().__init__(module=carrier, module_fqn=module_fqn, context=context)
 
+        if carrier.limit is not None or carrier.activation_compute_dtype is not None:
+            expected = {
+                "clamp_limit": carrier.limit,
+                "compute_dtype": carrier.activation_compute_dtype,
+                "use_fused": bool(getattr(config, "use_fused_swiglu", True)),
+            }
+            activation = self.activation_func
+            if not isinstance(activation, partial) or any(
+                    activation.keywords.get(name) != value for name, value in expected.items()):
+                raise ValueError("GroupedExperts must support the requested SwiGLU clamp and compute dtype")
+
     def forward(self, *args: torch.Tensor, **kwargs: torch.Tensor) -> torch.Tensor:
-        """Preserve the ModuleList replacement signature and delegate grouped execution."""
+        """Preserve the ModuleList replacement call contract for the shared builder."""
         return super().forward(*args, **kwargs)
 
     def make_transforms(self) -> list[WeightConverter]:
