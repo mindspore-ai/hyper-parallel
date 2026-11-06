@@ -15,6 +15,7 @@
 """Validate memory optimization for adjacent PyTorch checkpoint SAVE regions."""
 
 from tests.common.mark_utils import arg_mark
+from tests.torch.activation_memory import checkpoint_exclude_matmul
 from tests.torch.activation_memory.checkpoint_exclude_matmul import (
     _HIDDEN_SIZE,
     _TOKEN_NUM,
@@ -50,3 +51,18 @@ def test_adjacent_save_regions_elide_intermediate_output() -> None:
     tolerance = expected_gap // 4
     forward_gap = legacy["forward_bytes"] - optimized["forward_bytes"]
     assert abs(forward_gap - expected_gap) <= tolerance
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="onecard",
+    essential_mark="essential",
+)
+def test_rmsnorm_matmul_exclude_retains_less_memory() -> None:
+    """Optimized RMSNorm/MatMul exclusion should retain less memory than legacy.
+
+    The body already isolates each mode in its own subprocess, so it needs one card
+    rather than a slot in an eight-card group.
+    """
+    checkpoint_exclude_matmul.test_rmsnorm_matmul_checkpoint_exclude_memory()
