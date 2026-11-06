@@ -15,12 +15,14 @@
 
 """Unit tests for the Muon optimizer."""
 
+from collections import defaultdict
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
-from hyper_parallel.core.optimizer.muon import Muon
+from hyper_parallel.core.optimizer.muon import Muon, zeropower_via_newtonschulz5
+from hyper_parallel.core.optimizer.muon_shard import build_pad_ns_inputs
 from hyper_parallel.core.optimizer.optimizer import BaseDistributedOptimizer
 
 
@@ -151,3 +153,83 @@ def test_async_hierarchical_broadcast_waits_between_mesh_dimensions():
     first_work.wait.assert_called_once_with()
     final_work.wait.assert_not_called()
     assert handles == [final_work]
+
+
+def test_ns_normalizes_in_fp32_before_low_precision_compute():
+    """Clamping applies to the FP32 norm, including zero and sub-epsilon inputs."""
+    values = torch.tensor([[[3e-10], [4e-10]], [[0.0], [0.0]]])
+
+    direction = zeropower_via_newtonschulz5(
+        values, steps=0, epsilon=1e-8, epsilon_mode="clamp",
+        compute_dtype=torch.bfloat16)
+
+    # The first Frobenius norm is 5e-10, so the denominator is exactly epsilon.
+    expected = torch.tensor([[[0.03], [0.04]], [[0.0], [0.0]]], dtype=torch.bfloat16)
+    torch.testing.assert_close(direction, expected, rtol=0, atol=0)
+    assert direction.dtype == torch.bfloat16
+    assert torch.isfinite(direction).all()
+
+
+@pytest.mark.parametrize("use_transform", [False, True])
+def test_muon_precision_policy_preserves_normalization_and_scaling_boundaries(use_transform):
+    """Both restoration paths scale in the iteration dtype before restoring buffers."""
+    optimizer = Muon.__new__(Muon)
+    optimizer.state = defaultdict(dict)
+    optimizer.reshape_fn = None
+    optimizer.ns_transform_fn = (lambda _name, _tensor: None) if use_transform else None
+    optimizer.zeropower_fn = None
+    optimizer.momentum_update_fn = None
+    parameter = torch.nn.Parameter(torch.zeros(2, 1))
+    parameter.model_name = "weight"
+    parameter.grad = torch.tensor([[3e-9], [4e-9]])
+    group = _plain_ns_group(
+        momentum=0.95, nesterov=False, ns_variant="custom",
+        ns_coefficients=((1.0, 0.0, 0.0),), ns_epsilon=1e-8,
+        ns_input_dtype="float32", ns_compute_dtype="bfloat16", ns_epsilon_mode="clamp",
+        lr=1e-5, apply_lr_in_update=True)
+
+    inputs = optimizer._update_muon_momentum(group, [parameter])  # pylint: disable=protected-access
+    assert inputs[parameter].dtype == torch.float32
+    torch.testing.assert_close(inputs[parameter], parameter.grad, rtol=0, atol=0)
+    updates = optimizer._compute_batched_ns_updates(  # pylint: disable=protected-access
+        [parameter], inputs, group, no_shard=True)
+
+    # One identity polynomial leaves the clamped direction [0.3, 0.4].
+    # Quantize that direction, then scale once in BF16; restore into FP32 storage.
+    direction = torch.tensor([[0.3], [0.4]], dtype=torch.bfloat16)
+    expected = (direction * (-1e-5 * (2 ** 0.5) * 0.2)).float()
+    assert updates[parameter].dtype == torch.float32
+    torch.testing.assert_close(updates[parameter], expected, rtol=0, atol=0)
+    torch.testing.assert_close(optimizer.state[parameter]["momentum_buffer"], parameter.grad, rtol=0, atol=0)
+
+
+def test_ns_padding_uses_explicit_dtype_on_empty_ranks():
+    """A rank without gradients must use the same collective dtype as populated ranks."""
+    parameter = torch.nn.Parameter(torch.ones(2, 2, dtype=torch.float32))
+    ns_input = torch.ones_like(parameter, dtype=torch.bfloat16)
+    populated = build_pad_ns_inputs([parameter], {parameter: ns_input}, dtype=torch.bfloat16)
+    empty = build_pad_ns_inputs([parameter], {}, dtype=torch.bfloat16)
+
+    assert populated[0] is ns_input
+    assert empty[0].dtype == populated[0].dtype
+    torch.testing.assert_close(empty[0], torch.zeros_like(ns_input), rtol=0, atol=0)
+    with pytest.raises(ValueError, match="same dtype"):
+        build_pad_ns_inputs([parameter], {parameter: ns_input}, dtype=torch.float32)
+
+
+@pytest.mark.parametrize("options", [
+    {"ns_input_dtype": "float16"},
+    {"ns_compute_dtype": "float16"},
+    {"ns_epsilon_mode": "unknown"},
+])
+def test_muon_rejects_unsupported_precision_options(options):
+    """Invalid precision policies fail before distributed setup."""
+    with pytest.raises(ValueError, match="ns_"):
+        Muon([torch.nn.Parameter(torch.ones(2, 2))], **options)
+
+
+def test_muon_rejects_built_in_precision_policy_with_custom_ns():
+    """Custom callbacks cannot silently ignore built-in normalization options."""
+    with pytest.raises(ValueError, match="built-in"):
+        Muon([torch.nn.Parameter(torch.ones(2, 2))],
+             zeropower_fn=lambda value, steps: value, ns_epsilon_mode="clamp")
