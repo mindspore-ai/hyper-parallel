@@ -57,9 +57,11 @@ placeholders. ``PpPass`` runs later and inherits the rewrite value-level.
 Operator policy sets and transformer-block discovery are shared with the
 eager path (``hyper_parallel.distributed.activation_checkpoint``), so a
 model sees the same save/recompute vocabulary in both modes. RNG ops are
-saved in every mode (a graph cannot replay random state). Communication
-ops are saved too, except that ``ac_save_forward_all_gather`` may opt
-forward (TP/SP/CP) all-gathers into backward replay.
+saved in every mode (a graph cannot replay random state). For collectives,
+the eager selective must-save set (all-to-all/reduce-scatter/in-place
+allreduce) is always saved; other collectives follow the mode policy.
+``ac_save_forward_all_gather`` may opt forward (TP/SP/CP) all-gathers into
+backward replay.
 """
 
 from __future__ import annotations
@@ -94,6 +96,7 @@ from hyper_parallel.distributed.activation_checkpoint import (
     _select_excluded_targets,
     _select_layer_region_roots,
     _selected_checkpoint_layer_fqns,
+    _validate_region_exclusions,
 )
 
 from ..pass_config import PassConfig
@@ -104,7 +107,8 @@ _LOG = logging.getLogger(__name__)
 # FSDP all-gathers are inserted after this pass, but forward (TP/SP/CP)
 # all-gathers are already in the traced forward; saving them avoids a second
 # collective during backward recompute. ``PassConfig.ac_save_forward_all_gather``
-# selects that superset.
+# selects that superset. Only the selective communication set is always saved:
+# other collectives follow the mode policy, matching the eager path.
 _GRAPH_AC_COMM_OPS = _existing_ops(
     *(_resolve_torch_op(name) for name in _SELECTIVE_AC_COMM_OP_NAMES),
     _resolve_op_attr(torch.ops, "deepep.dispatch.default"),
@@ -216,6 +220,12 @@ def _adapter_scope(
             "model adapter recompute patterns matched no region in the selected layers"
         )
     excluded = _select_excluded_targets(module_by_fqn, roots, recompute_spec)
+    if recompute_spec.exclude_patterns and not excluded:
+        raise ValueError(
+            "model adapter recompute exclusions matched no module "
+            "inside the selected regions"
+        )
+    _validate_region_exclusions(roots, excluded)
     return _CheckpointScope(
         region_fqns=frozenset(fqn for fqn, _ in roots),
         exclude_fqns=frozenset(fqn for fqn, _ in excluded),
@@ -285,23 +295,22 @@ def _resolve_scope(
         layer_indices=pass_config.ac_layer_indices,
     )
     selected_layers = frozenset(_selected_checkpoint_layer_fqns(containers, selection))
-    if not selected_layers:
-        # Zero selected layers is a no-op, not an error.
-        _LOG.info("activation checkpoint layer selection matched zero layers")
-        return _CheckpointScope(region_fqns=frozenset(), unit_fqns=block_fqns)
     recompute_spec = _adapter_recompute_spec(model, required=explicit_regions)
-    if recompute_spec is None:
-        if explicit_regions:
+    if explicit_regions:
+        if recompute_spec is None:
             raise ValueError(
                 "activation_checkpoint.selection.source=model_adapter_safe_regions "
                 "requires ModelAdapterSpec.recompute"
             )
-        return _CheckpointScope(region_fqns=selected_layers, unit_fqns=block_fqns)
-    if not recompute_spec.region_patterns:
-        if explicit_regions:
+        if not recompute_spec.region_patterns:
             raise ValueError(
                 "model adapter recompute requires RecomputePolicy.region_patterns"
             )
+    if not selected_layers:
+        # Zero selected layers is a no-op, not an error.
+        _LOG.info("activation checkpoint layer selection matched zero layers")
+        return _CheckpointScope(region_fqns=frozenset(), unit_fqns=block_fqns)
+    if recompute_spec is None or not recompute_spec.region_patterns:
         return _CheckpointScope(region_fqns=selected_layers, unit_fqns=block_fqns)
     return _adapter_scope(model, selected_layers, block_fqns, recompute_spec)
 
@@ -387,10 +396,10 @@ def _tag_policy_pass(
     """Tag forward nodes per policy, applying the structural exceptions.
 
     RNG ops and SymInt scalars stay saved; getitem/wait_tensor inherit their
-    parent's decision. Communication ops are saved in every mode (including
-    ``full``): replaying a collective in backward changes communication
-    semantics. All-gathers join the saved set when
-    ``ac_save_forward_all_gather`` is enabled.
+    parent's decision. The selective communication set is saved in every mode
+    (including ``full``), matching the eager selective policy; all-gathers join
+    the saved set when ``ac_save_forward_all_gather`` is enabled. Other
+    collectives (functional all-reduce/broadcast) follow the mode policy.
     """
     policy_fn = _make_policy_fn(pass_config)
     comm_ops = _GRAPH_AC_COMM_OPS
@@ -663,6 +672,14 @@ def _has_cross_unit_forward_consumer(node: fx.Node, scope: _CheckpointScope) -> 
     return False
 
 
+def _get_attr_value(graph_module: fx.GraphModule, target: str) -> Any:
+    """Resolve an FX ``get_attr`` target, including dotted qualified names."""
+    try:
+        return graph_module.get_submodule(target)
+    except AttributeError:
+        return getattr(graph_module, target, None)
+
+
 def _duplicate_subgraph_get_attrs(
     graph_module: fx.GraphModule, fwd_node: fx.Node, bwd_target: fx.Node
 ) -> Dict[fx.Node, fx.Node]:
@@ -677,7 +694,7 @@ def _duplicate_subgraph_get_attrs(
     for arg in fwd_node.all_input_nodes:
         if arg.op != "get_attr":
             continue
-        if not isinstance(getattr(graph_module, arg.target, None), fx.GraphModule):
+        if not isinstance(_get_attr_value(graph_module, arg.target), fx.GraphModule):
             continue
         with graph_module.graph.inserting_before(bwd_target):
             dup_attr = graph_module.graph.get_attr(arg.target)
@@ -772,6 +789,10 @@ def _remat(graph_module: fx.GraphModule) -> int:
 
     _flatten_getitems(graph_module)
     graph.lint()
+    # ``raise_getitems`` recompiles when present; the explicit call also covers
+    # torch builds without it, where the inserted/erased nodes would otherwise
+    # leave the GraphModule's generated code stale.
+    graph_module.recompile()
     return len(recomputed)
 
 
