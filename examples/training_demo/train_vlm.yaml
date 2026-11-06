@@ -59,7 +59,6 @@ dataloader:
   get_batch:
     _target_: hyper_parallel.data.batching.OmniParallelBatch
   sampler_type: single
-  token_budget: 128
   min_buffered_samples: 1
   data_rearrange_map: null
   data_sharding: false

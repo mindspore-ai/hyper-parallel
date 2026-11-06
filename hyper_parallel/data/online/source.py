@@ -165,18 +165,6 @@ class _OnlineLeafSourceLoader:
                     selected_splits.append(split_expression)
             selected_split = selected_splits
 
-<<<<<<< HEAD
-        if load_dataset_path in ("json", "parquet") and "data_files" in load_options and not streaming:
-            loaded_dataset = self._load_local_files(load_dataset_path, load_options["data_files"], selected_split)
-        else:
-            loaded_dataset = load_dataset(
-                load_dataset_path,
-                **load_options,
-                split=selected_split,
-                streaming=streaming,
-                cache_dir=self.data_config.get("cache_dir"),
-            )
-=======
         loaded_dataset = load_dataset(
             loader_name,
             **loader_args,
@@ -184,7 +172,6 @@ class _OnlineLeafSourceLoader:
             streaming=streaming,
             cache_dir=self.data_config.get("cache_dir"),
         )
->>>>>>> c5a05879 (remove invalid raw sample, data iteration)
 
         if filter_before_split:
             filtered_dataset = loaded_dataset.filter(sample_filter)

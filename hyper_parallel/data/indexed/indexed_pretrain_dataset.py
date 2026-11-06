@@ -539,7 +539,7 @@ class GPTFromMRDataset(_IndexedPretrainDataset):
 
     Each entry in the underlying indexed Dataset represents a complete pre-packed
     training sample. Samples are read directly without rebuilding document, sample,
-    or shuffle indices.
+    or shuffle indices. Requests beyond the split capacity repeat its records in order.
 
     Args:
         dataset: The indexed Dataset containing pre-packed samples converted from MindRecord.
@@ -570,11 +570,8 @@ class GPTFromMRDataset(_IndexedPretrainDataset):
                     "All pre-cut records must match sequence_length + add_extra_token_to_sequence; "
                     f"expected {expected_length}, got {self.dataset.sequence_lengths.tolist()}"
                 )
-        if self.num_samples > len(self.indices):
-            raise ValueError(
-                "Requested samples exceed the pre-cut records in this split: "
-                f"requested {self.num_samples}, available {len(self.indices)}"
-            )
+        if self.num_samples > 0 and len(self.indices) == 0:
+            raise ValueError("Cannot draw pre-cut records from an empty split")
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: IndexedDataReader) -> int:
@@ -608,8 +605,14 @@ class GPTFromMRDataset(_IndexedPretrainDataset):
         return self.num_samples
 
     def __getitem__(self, index: int) -> Mapping[str, Any]:
-        """Read and shift one pre-cut record without dynamic concatenation."""
-        sequence_id = int(self.indices[index])
+        """Read and shift one pre-cut record, repeating within the split as needed."""
+        if index < 0:
+            index += self.num_samples
+        if not 0 <= index < self.num_samples:
+            raise IndexError(f"Sample index {index} is out of range for {self.num_samples} samples")
+
+        # Repeat the split's records to satisfy the logical sample count without expanding the underlying .idx/.bin.
+        sequence_id = int(self.indices[index % len(self.indices)])
         text = np.asarray(self.dataset[sequence_id], dtype=np.int64)
         if np.any(text == self._pad_token_id):
             raise ValueError("Pre-cut indexed Dataset records must be packed without padding")

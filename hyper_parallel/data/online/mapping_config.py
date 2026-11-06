@@ -49,7 +49,7 @@ class OnlineMappingConfig:
     filter_identifiers: Mapping[str, Any] | None = None
     use_filtered_cache: bool = False
     mode: Literal["production", "debug"] = "production"
-    train_valid_test_num_samples: Sequence[int] | None = None
+    train_valid_test_num_samples: list[int] | tuple[int, int, int] | None = None
 
     def __post_init__(self) -> None:
         """Snapshot user options and validate policy before any record scan or file publication."""
@@ -130,7 +130,7 @@ def build_online_mapping_config(
     transform: Any,
     training_config: Any = None,
     mode: Literal["production", "debug"] = "production",
-    train_valid_test_num_samples: Sequence[int] | None = None,
+    train_valid_test_num_samples: list[int] | tuple[int, int, int] | None = None,
 ) -> OnlineMappingConfig:
     """Assemble Mapping policy at the Omni entry, where the transform is explicitly available.
 

@@ -1,4 +1,4 @@
-# Validated eight-rank baseline; other training settings follow train_deepseek_v41_vlm_online.yaml.
+# Validated eight-rank baseline; other training settings follow train_deepseek_v41_vlm_online_modify.yaml.
 # Runtime layer crop: original widths, selected weights read directly from local HF weights.
 # BF16/FP32 loads directly; native FP8/FP4 is decoded to BF16 during DCP reads, without an offline copy.
 # Retain original layer-1 Engram dimensions; the launcher generates its released hashing assets.
@@ -238,7 +238,6 @@ dataloader:
     runtime_input_adapter:
       _target_: hyper_parallel.models.deepseek_v41.adapter.data.runtime.DeepseekV41Runtime
   sampler_type: single
-  token_budget: 128
   min_buffered_samples: 1
   drop_last: true
   num_workers: 0

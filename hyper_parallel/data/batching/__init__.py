@@ -27,6 +27,7 @@ from hyper_parallel.data.batching.build_dataloader import (
     TokenBatchLoader,
     build_dataloader,
     calculate_num_micro_batches,
+    calculate_packed_seq_len,
 )
 from hyper_parallel.data.batching.get_batch import OmniParallelBatch, TextParallelBatch
 from hyper_parallel.data.batching.packing import (
@@ -57,4 +58,5 @@ __all__ = [
     "build_omni_collate_fn",
     "build_online_text_collate_fn",
     "calculate_num_micro_batches",
+    "calculate_packed_seq_len",
 ]

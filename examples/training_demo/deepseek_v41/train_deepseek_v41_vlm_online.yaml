@@ -209,6 +209,7 @@ compile:
   dynamo_cache_size_limit: 256
 
 dataset:
+  mode: debug  # Filter invalid samples after attempting image recovery.
   training_mode: pretrain
   model_assets:
     _target_: hyper_parallel.models.deepseek_v41.adapter.data.processor.build_deepseek_v41_processor
@@ -216,29 +217,33 @@ dataset:
   data_transform:
     _target_: hyper_parallel.models.deepseek_v41.adapter.data.transform_fn.build_deepseek_v41_omni_transform
     sample_format: image_caption  # pretrain: image_caption/interleaved; sft: messages/openai/hf/sharegpt.
-    max_seq_len: 1024
-    sample_alignment_size: 1
+    download_verify_ssl: false
+    max_seq_len: 512
+    sample_alignment_size: 2
   _target_: hyper_parallel.data.omni.build_dataset.build_online_omni_mapping_dataset
-  data_path: /path/to/image_caption/train.jsonl
-  data_config: {}
+  data_path: ./output_prepare/cc12m_000001_100/manifests/000001.jsonl
+  data_config:
+    path_to_cache: ./output/data_cache/deepseek_v41
 
 dataloader:
   _target_: hyper_parallel.data.batching.OmniPackingLoader
   collate_fn:
     _target_: hyper_parallel.data.batching.build_omni_collate_fn
-    pad_to_length: 1024
   get_batch:
     _target_: hyper_parallel.data.batching.OmniParallelBatch
     runtime_input_adapter:
       _target_: hyper_parallel.models.deepseek_v41.adapter.data.runtime.DeepseekV41Runtime
-  sampler_type: single
-  # Pack whole samples within the fixed global token window.
-  token_budget: 1024
-  min_buffered_samples: 20
-  drop_last: true
-  num_workers: 0
-  pin_memory: false
-  prefetch_factor: null
+  loader_config:
+    # Sampling and source repetition; drop_last applies to global source blocks.
+    sampler_type: single  # Default: single.
+    repeat: true  # Default: true.
+    drop_last: true  # Default: true.
+    # Packing and padding use micro_batch_size * data_transform.max_seq_len.
+    min_buffered_samples: 20  # Default: 200.
+    # Source loading; prefetch_factor is used only when num_workers > 0.
+    num_workers: 0  # Default: 0.
+    pin_memory: false  # Default: false.
+    prefetch_factor: null  # Default: null.
 
 optimizer:
   _target_: hyper_parallel.components.optim.Sinkhorn

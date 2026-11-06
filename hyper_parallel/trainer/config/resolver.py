@@ -34,6 +34,7 @@ from typing import Any, Literal, Union, get_args, get_origin, get_type_hints
 from hyper_parallel.trainer.config.data import (
     DataLoaderConfig,
     DatasetConfig,
+    LoaderConfig,
     ModelAssetsConfig,
 )
 from hyper_parallel.trainer.config.optimization import (
@@ -363,6 +364,8 @@ def _replace_target_path(
     """Return a ``Target`` copy with an argument or nested value replaced."""
     name = parts[0]
     full_path = f"{path}.{name}" if path else name
+    if name == "max_seq_len" and path in ("dataloader", "dataloader.collate_fn"):
+        raise ConfigResolutionError(f"CLI.{full_path}", "configure dataset.data_transform.max_seq_len instead")
     if name == "_target_":
         raise ConfigResolutionError(
             f"CLI.{full_path}", "changing _target_ through an override is not supported"
@@ -413,6 +416,17 @@ def _replace_target_path(
     return config.replace(**{name: normalized})
 
 
+def _replace_legacy_loader_option(
+    config: DataLoaderConfig, parts: list[str], value: object, *, path: str,
+) -> DataLoaderConfig:
+    """Route a flat CLI option into LoaderConfig and validate the selected Loader."""
+    loader_config = replace_override_path(config.loader_config, parts, value, path=path)
+    try:
+        return replace(config, loader_config=loader_config)
+    except ValueError as exc:
+        raise ConfigResolutionError(f"CLI.{path}.{parts[0]}", str(exc)) from exc
+
+
 def replace_override_path(config: object, parts: list[str], value: object, *, path: str) -> object:
     """Return a configuration copy with a dotted-path override applied.
 
@@ -449,6 +463,8 @@ def replace_override_path(config: object, parts: list[str], value: object, *, pa
 
     config_fields = {field.name: field for field in fields(config)}
     name = parts[0]
+    if isinstance(config, DataLoaderConfig) and name in {item.name for item in fields(LoaderConfig)}:
+        return _replace_legacy_loader_option(config, parts, value, path=path)
     if name not in config_fields:
         target = getattr(config, "target", None)
         if isinstance(target, Target):
@@ -465,14 +481,21 @@ def replace_override_path(config: object, parts: list[str], value: object, *, pa
         normalized = normalize_value(
             _normalize_override_scalar(value, annotation), annotation, path=f"CLI.{full_path}"
         )
-        return replace(config, **{name: normalized})
+        try:
+            return replace(config, **{name: normalized})
+        except (TypeError, ValueError) as exc:
+            raise ConfigResolutionError(f"CLI.{full_path}", str(exc)) from exc
 
     child = getattr(config, name)
     if child is None:
         raise ConfigResolutionError(
             f"CLI.{full_path}", "component was not selected by the YAML"
         )
-    return replace(config, **{name: replace_override_path(child, parts[1:], value, path=full_path)})
+    updated_child = replace_override_path(child, parts[1:], value, path=full_path)
+    try:
+        return replace(config, **{name: updated_child})
+    except (TypeError, ValueError) as exc:
+        raise ConfigResolutionError(f"CLI.{full_path}", str(exc)) from exc
 
 
 def _resolve_union(node: object, annotation: object, *, path: str) -> object:
@@ -542,7 +565,7 @@ def _resolve_dataclass(node: object, config_type: type, *, path: str) -> object:
     }
     try:
         return config_type(**resolved)
-    except TypeError as exc:
+    except (TypeError, ValueError) as exc:
         raise ConfigResolutionError(path, f"could not construct {config_type.__name__}: {exc}") from exc
 
 
@@ -680,14 +703,28 @@ def _resolve_replacement_target(node: object, *, path: str) -> Target[Any]:
         raise ConfigResolutionError(path, str(exc)) from exc
 
 
+def _validate_loader_length_options(node: object, *, path: str) -> None:
+    """Keep the transform's maximum sequence length as the only configured limit."""
+    if not isinstance(node, Mapping):
+        return
+    for name in ("token_budget", "pad_to_length"):
+        if name in node:
+            raise ConfigResolutionError(
+                f"{path}.{name}", "removed; configure dataset.data_transform.max_seq_len instead",
+            )
+    if node.get("max_seq_len") is not None:
+        raise ConfigResolutionError(f"{path}.max_seq_len", "configure dataset.data_transform.max_seq_len instead")
+
+
 def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
     """Resolve a DataLoader target with nested collator and batch runtime."""
     if not isinstance(node, Mapping):
         raise ConfigResolutionError(path, "DataLoader configuration must be a YAML mapping")
 
     target_node = dict(node)
+    _validate_loader_length_options(target_node, path=path)
     if "dataloader_type" in target_node:
-        raise _fail(f"{path}.dataloader_type", "renamed to sampler_type")
+        raise ConfigResolutionError(f"{path}.dataloader_type", "renamed to loader_config.sampler_type")
 
     if "batch_adapter" in target_node:
         raise ConfigResolutionError(
@@ -699,23 +736,23 @@ def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
 
     collate_node = target_node.pop("collate_fn", None)
     get_batch_node = target_node.pop("get_batch", None)
-    sampler_type = normalize_value(
-        target_node.pop("sampler_type", "single"),
-        Literal["single", "cyclic"],
-        path=f"{path}.sampler_type",
-    )
-    data_rearrange_map = target_node.pop("data_rearrange_map", None)
-    data_sharding = normalize_value(
-        target_node.pop("data_sharding", False),
-        bool,
-        path=f"{path}.data_sharding",
-    )
-    use_background_prefetcher = normalize_value(
-        target_node.pop("use_background_prefetcher", False),
-        bool,
-        path=f"{path}.use_background_prefetcher",
-    )
+    loader_node = target_node.pop("loader_config", {})
+    _validate_loader_length_options(loader_node, path=f"{path}.loader_config")
+    _validate_loader_length_options(collate_node, path=f"{path}.collate_fn")
+    if not isinstance(loader_node, Mapping):
+        raise ConfigResolutionError(f"{path}.loader_config", "configuration section must be a YAML mapping")
+    option_names = {item.name for item in fields(LoaderConfig)}
+    legacy_options = {name: target_node.pop(name) for name in option_names if name in target_node}
+    duplicates = sorted(set(loader_node) & set(legacy_options))
+    if duplicates:
+        raise ConfigResolutionError(
+            f"{path}.loader_config", f"options also defined at {path}: {duplicates}; configure each option once",
+        )
     target = _resolve_target(target_node, path=path)
+    defaults = {name: getattr(target, name) for name in option_names if hasattr(target, name)}
+    loader_config = _resolve_dataclass(
+        {**defaults, **legacy_options, **loader_node}, LoaderConfig, path=f"{path}.loader_config",
+    )
     collate_fn = (
         None
         if collate_node is None
@@ -726,15 +763,19 @@ def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
         if get_batch_node is None
         else _resolve_target(get_batch_node, path=f"{path}.get_batch")
     )
-    return DataLoaderConfig(
-        target=target,
-        collate_fn=collate_fn,
-        get_batch=get_batch,
-        sampler_type=sampler_type,
-        data_rearrange_map=data_rearrange_map,
-        data_sharding=data_sharding,
-        use_background_prefetcher=use_background_prefetcher,
-    )
+    try:
+        config = DataLoaderConfig(
+            target=target,
+            collate_fn=collate_fn,
+            get_batch=get_batch,
+            loader_config=loader_config,
+        )
+    except ValueError as exc:
+        raise ConfigResolutionError(f"{path}.loader_config", str(exc)) from exc
+    unsupported = sorted((set(legacy_options) | set(loader_node)) - config.supported_loader_options)
+    if unsupported:
+        raise ConfigResolutionError(f"{path}.loader_config", f"selected Loader does not support options: {unsupported}")
+    return config
 
 
 def _resolve_dataset_config(node: object, *, path: str) -> DatasetConfig:

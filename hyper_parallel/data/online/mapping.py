@@ -279,13 +279,9 @@ def build_online_mapping_source(
     data_config: Mapping[str, Any] | OnlineMappingConfig,
     data_path: OnlineDataPath | None = None,
     sample_filter: Callable[[Mapping[str, Any]], bool] | None = None,
-    train_valid_test_num_samples: Sequence[int] | None = None,
-<<<<<<< HEAD
-    sampler_type: str = "single",
-=======
+    train_valid_test_num_samples: list[int] | tuple[int, int, int] | None = None,
     mode: Literal["production", "debug"] = "production",
     dataloader_context: DataLoaderParallelContext | None = None,
->>>>>>> c5a05879 (remove invalid raw sample, data iteration)
 ) -> Any:
     """Build a finite integer-indexed Online source.
 
@@ -309,10 +305,6 @@ def build_online_mapping_source(
         and sample targets. Plain dictionaries retain the legacy source path and use
         the separate callback/mode/target arguments. Callback attributes are never inspected.
     """
-<<<<<<< HEAD
-    dataset_builder = _OnlineMappingSourceBuilder(data_path, data_config, train_valid_test_num_samples, sampler_type)
-    mapping_source = dataset_builder.build_source(sample_filter=sample_filter)
-=======
     if isinstance(data_config, OnlineMappingConfig):
         if sample_filter is not None or train_valid_test_num_samples is not None or mode != "production":
             raise ValueError("Configure the filter, mode and sample targets inside OnlineMappingConfig")
@@ -339,7 +331,6 @@ def build_online_mapping_source(
     mapping_source = build_dataset_for_dataloader(
         dataset_factory, context, barrier_needed=True, mode=config.mode,
     )
->>>>>>> c5a05879 (remove invalid raw sample, data iteration)
     return mapping_source
 
 
@@ -940,14 +931,8 @@ class _OnlineBlendedMappingDataset:
         self,
         source_datasets: Sequence[Any],
         weights: Sequence[float],
-<<<<<<< HEAD
-        size: int,
-        random_seed: int,
-        shuffle: bool = True,
-=======
         source_index: np.ndarray,
         source_sample_index: np.ndarray,
->>>>>>> c5a05879 (remove invalid raw sample, data iteration)
     ) -> None:
         """Retain prepared mid-level Datasets and their global source schedule.
 
@@ -962,21 +947,10 @@ class _OnlineBlendedMappingDataset:
             raise ValueError("Mapping blend indices must be nonempty aligned one-dimensional arrays")
 
         self.source_datasets = tuple(source_datasets)
-<<<<<<< HEAD
-        self.weights = self._normalize_weights(weights)
-        self.size = size
-        self.source_index, self.source_sample_index = self._build_blend_indices()
-        self.source_shuffle_indices = self._build_source_shuffle_indices(
-            source_lengths,
-            random_seed,
-            shuffle,
-        )
-=======
         self.weights = tuple(weights)
         self.source_index = source_index
         self.source_sample_index = source_sample_index
         self.size = len(source_index)
->>>>>>> c5a05879 (remove invalid raw sample, data iteration)
 
     def __len__(self) -> int:
         """Return the requested global sample count."""
@@ -989,70 +963,6 @@ class _OnlineBlendedMappingDataset:
         source_sample = self.source_datasets[source_id][source_sample_id]
         return source_sample
 
-<<<<<<< HEAD
-    @staticmethod
-    def _normalize_weights(weights: Sequence[float]) -> tuple[float, ...]:
-        """Validate and normalize source weights."""
-        if not weights or any(weight <= 0.0 for weight in weights):
-            raise ValueError("Mapping blend weights must be positive")
-
-        weight_sum = sum(weights)
-        normalized_weights = []
-        for weight in weights:
-            normalized_weights.append(float(weight) / weight_sum)
-        return tuple(normalized_weights)
-
-    def _build_blend_indices(self) -> tuple[np.ndarray, np.ndarray]:
-        """Build Megatron's deterministic largest-deficit source schedule."""
-        source_index = np.empty(self.size, dtype=np.int16)
-        source_logical_index = np.empty(self.size, dtype=np.int64)
-        source_sample_counts = [0] * len(self.source_datasets)
-
-        for global_sample_index in range(self.size):
-            scheduled_samples = max(global_sample_index, 1)
-            selected_source = 0
-            largest_deficit = self.weights[0] * scheduled_samples - source_sample_counts[0]
-            for source_id in range(1, len(self.source_datasets)):
-                source_deficit = (
-                    self.weights[source_id] * scheduled_samples
-                    - source_sample_counts[source_id]
-                )
-                if source_deficit > largest_deficit:
-                    selected_source = source_id
-                    largest_deficit = source_deficit
-
-            source_index[global_sample_index] = selected_source
-            source_logical_index[global_sample_index] = source_sample_counts[selected_source]
-            source_sample_counts[selected_source] += 1
-
-        return source_index, source_logical_index
-
-    def _build_source_shuffle_indices(
-        self,
-        source_lengths: Sequence[int],
-        random_seed: int,
-        shuffle: bool,
-    ) -> tuple[np.ndarray, ...]:
-        """Map source-local counters to repeated deterministic sample permutations."""
-        source_sample_counts = np.bincount(
-            self.source_index,
-            minlength=len(self.source_datasets),
-        )
-        source_random = np.random.RandomState(random_seed)
-        source_shuffle_indices = []
-        for source_length, requested_samples in zip(source_lengths, source_sample_counts):
-            repeated_epochs = int(np.ceil(int(requested_samples) / source_length))
-            source_sample_index = np.tile(
-                np.arange(source_length, dtype=np.int64),
-                repeated_epochs,
-            )
-            if shuffle:
-                source_random.shuffle(source_sample_index)
-            source_shuffle_indices.append(source_sample_index[:requested_samples])
-        return tuple(source_shuffle_indices)
-
-=======
->>>>>>> c5a05879 (remove invalid raw sample, data iteration)
 
 class _OnlineMappingSourceBuilder(_OnlineSourceBuilder):
     """Build file Datasets, preserve source weights, and blend each split before DP sampling.
@@ -1067,44 +977,12 @@ class _OnlineMappingSourceBuilder(_OnlineSourceBuilder):
     def __init__(
         self,
         data_path: OnlineDataPath | None,
-<<<<<<< HEAD
-        data_config: Mapping[str, Any],
-        train_valid_test_num_samples: Sequence[int] | None,
-        sampler_type: str = "single",
-    ) -> None:
-        """Store source configuration and optional training sample targets."""
-        super().__init__(data_path, data_config)
-        if sampler_type not in ("single", "cyclic"):
-            raise ValueError(f"Unsupported Mapping sampler_type: {sampler_type!r}")
-        self.sampler_type = sampler_type
-        self.train_valid_test_num_samples = self._validate_split_sizes(train_valid_test_num_samples)
-
-    def build_source(
-        self,
-=======
         config: OnlineMappingConfig,
->>>>>>> c5a05879 (remove invalid raw sample, data iteration)
         *,
         writer: bool = True,
     ) -> None:
         """Store build policy without reading records or building indexes.
 
-<<<<<<< HEAD
-        # Cyclic sampling owns epoch shuffle and repetition, including explicit single sources.
-        if self.sampler_type == "cyclic" and len(source_results) == 1:
-            source = source_results[0]
-            if isinstance(source, tuple):
-                return tuple(split if split is not None and len(split) else None for split in source)
-            return source if len(source) else None
-
-        # Example: source A returns Dataset, while source B returns (train, valid, test).
-        # The combined result follows B's split structure, and A contributes only to train.
-        has_split_result = False
-        for source_result in source_results:
-            if isinstance(source_result, tuple):
-                has_split_result = True
-                break
-=======
         Example:
             Input: data_path="/data/manifests", Config with path_to_cache="/cache/data"
             and train_valid_test_num_samples=[100, 10, 0].
@@ -1117,7 +995,6 @@ class _OnlineMappingSourceBuilder(_OnlineSourceBuilder):
         self._is_cache_writer = writer
         self._cache_root = config.path_to_cache
         self._reader_failure_directories: list[tuple[_RecordReader, str]] = []
->>>>>>> c5a05879 (remove invalid raw sample, data iteration)
 
     def build_source(self) -> Any:
         """Build configured source groups, blend their splits, and publish failure reports.
@@ -1398,19 +1275,6 @@ class _OnlineMappingSourceBuilder(_OnlineSourceBuilder):
 
         return data_files
 
-<<<<<<< HEAD
-    def _get_target_size(self, split_index: int, source_datasets: Sequence[Any]) -> int:
-        """Return the configured sample target or one natural blended epoch."""
-        if self.sampler_type != "cyclic" and self.train_valid_test_num_samples is not None:
-            return self.train_valid_test_num_samples[split_index]
-
-        natural_size = 0
-        for source_dataset in source_datasets:
-            natural_size += len(source_dataset)
-        return natural_size
-
-=======
->>>>>>> c5a05879 (remove invalid raw sample, data iteration)
     def _build_blended_split(
         self,
         source_datasets: Sequence[Any],
@@ -1445,15 +1309,7 @@ class _OnlineMappingSourceBuilder(_OnlineSourceBuilder):
             sample_datasets.append(sample_dataset)
 
         blended_dataset = _OnlineBlendedMappingDataset(
-<<<<<<< HEAD
-            nonempty_datasets,
-            nonempty_weights,
-            target_size,
-            self._random_seed,
-            shuffle=self.sampler_type != "cyclic",
-=======
             sample_datasets, blend_index.weights, blend_index.source_index, blend_index.source_sample_index,
->>>>>>> c5a05879 (remove invalid raw sample, data iteration)
         )
         return blended_dataset
 

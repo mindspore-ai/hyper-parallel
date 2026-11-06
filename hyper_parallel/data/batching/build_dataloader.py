@@ -40,6 +40,25 @@ from hyper_parallel.data.parallel import build_dataset_batch_sampler
 logger = get_dataset_logger(__name__)
 
 
+def calculate_packed_seq_len(micro_batch_size: int, max_seq_len: int) -> int:
+    """Derive the shared packing and padding limit from one source length.
+
+    Args:
+        micro_batch_size: Number of sequence-length units per rank-local batch.
+        max_seq_len: Maximum length configured on the sample transform.
+
+    Returns:
+        Maximum packed length used by both selection and collation.
+
+    Raises:
+        ValueError: If either input is not a positive integer.
+    """
+    for name, value in (("micro_batch_size", micro_batch_size), ("max_seq_len", max_seq_len)):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    return micro_batch_size * max_seq_len
+
+
 def calculate_num_micro_batches(
         global_batch_size: int,
         micro_batch_size: int,
@@ -85,6 +104,26 @@ def _is_iterable_dataset(dataset: Any) -> bool:
         has_index_access = callable(getattr(dataset, "__getitem__", None))
         is_iterable = has_iterator and not has_index_access
     return is_iterable
+
+
+def _resolve_dp_geometry(
+        batch_sampler: Any, dp_world_size: int | None, dp_rank: int | None,
+) -> tuple[int, int]:
+    """Resolve source lanes and reject a sampler with inconsistent DP ownership."""
+    resolved_size = getattr(batch_sampler, "dp_world_size", 1) if dp_world_size is None else dp_world_size
+    if isinstance(resolved_size, bool) or not isinstance(resolved_size, int) or resolved_size <= 0:
+        raise ValueError("dp_world_size must be a positive integer")
+    if getattr(batch_sampler, "dp_world_size", resolved_size) != resolved_size:
+        raise ValueError("batch_sampler.dp_world_size must match dp_world_size")
+
+    sampler_rank = getattr(batch_sampler, "dp_rank", 0)
+    resolved_rank = sampler_rank if dp_rank is None else dp_rank
+    if (isinstance(resolved_rank, bool) or not isinstance(resolved_rank, int)
+            or not 0 <= resolved_rank < resolved_size):
+        raise ValueError("dp_rank must be an integer within dp_world_size")
+    if batch_sampler is not None and sampler_rank != resolved_rank:
+        raise ValueError("batch_sampler.dp_rank must match dp_rank")
+    return resolved_size, resolved_rank
 
 
 def build_dataloader(
@@ -266,9 +305,7 @@ class _DynamicBatchLoader(ABC):
         max_step: Optional optimizer-step limit per Online training epoch.
         save_by_idx: Whether to checkpoint buffer entries as output indices.
             Mapping Datasets default to true and iterable Datasets default to false.
-        max_seq_len: Maximum sample length used to derive the token budget.
-        token_budget: Optional candidate-selection budget. Values smaller than
-            one sample still emit that sample alone instead of truncating it.
+        max_seq_len: Maximum sample length. Packing uses batch_size * max_seq_len.
         min_buffered_samples: Minimum candidate samples buffered before batching.
         drop_last: Compatibility option retained from fixed DataLoader configuration.
             Finite sources drain the dynamic buffer when the source is exhausted.
@@ -296,7 +333,6 @@ class _DynamicBatchLoader(ABC):
             max_step: int | None = None,
             save_by_idx: bool | None = None,
             max_seq_len: int | None,
-            token_budget: int | None = None,
             min_buffered_samples: int = 200,
             drop_last: bool = True,
             sampler_type: str = "single",
@@ -314,9 +350,6 @@ class _DynamicBatchLoader(ABC):
         if max_seq_len is None:
             raise ValueError(f"{type(self).__name__} requires data_transform.max_seq_len")
 
-        if token_budget is not None and token_budget <= 0:
-            raise ValueError("token_budget must be positive")
-
         if not isinstance(repeat, bool):
             raise ValueError("repeat must be a boolean")
 
@@ -330,23 +363,7 @@ class _DynamicBatchLoader(ABC):
         if max_step is not None and not repeat:
             raise ValueError("Online max_step requires repeat=True")
 
-        resolved_dp_world_size = getattr(batch_sampler, "dp_world_size", 1) if dp_world_size is None else dp_world_size
-        if (isinstance(resolved_dp_world_size, bool) or not isinstance(resolved_dp_world_size, int)
-                or resolved_dp_world_size <= 0):
-            raise ValueError("dp_world_size must be a positive integer")
-
-        sampler_dp_world_size = getattr(batch_sampler, "dp_world_size", resolved_dp_world_size)
-        if sampler_dp_world_size != resolved_dp_world_size:
-            raise ValueError("batch_sampler.dp_world_size must match dp_world_size")
-
-        sampler_dp_rank = getattr(batch_sampler, "dp_rank", 0)
-        resolved_dp_rank = sampler_dp_rank if dp_rank is None else dp_rank
-        if (isinstance(resolved_dp_rank, bool) or not isinstance(resolved_dp_rank, int)
-                or not 0 <= resolved_dp_rank < resolved_dp_world_size):
-            raise ValueError("dp_rank must be an integer within dp_world_size")
-
-        if batch_sampler is not None and sampler_dp_rank != resolved_dp_rank:
-            raise ValueError("batch_sampler.dp_rank must match dp_rank")
+        resolved_dp_world_size, resolved_dp_rank = _resolve_dp_geometry(batch_sampler, dp_world_size, dp_rank)
 
         self.drop_last = drop_last
         self.batch_collate_fn = collate_fn
@@ -361,9 +378,9 @@ class _DynamicBatchLoader(ABC):
         self._epoch_source_start_state: dict[str, Any] | None = None
 
         self._batch_pipeline = self._build_batch_pipeline(dataset)
-        resolved_token_budget = batch_size * max_seq_len if token_budget is None else token_budget
+        packed_max_seq_len = calculate_packed_seq_len(batch_size, max_seq_len)
         self.candidate_buffer = self._batch_pipeline.build_candidate_buffer(
-            token_budget=resolved_token_budget,
+            max_seq_len=packed_max_seq_len,
             min_buffered_samples=min_buffered_samples,
         )
         if batch_sampler is not None:
@@ -483,9 +500,9 @@ class _DynamicBatchLoader(ABC):
         # Stage 3: At EOF, bypass readiness thresholds so no pulled candidate is lost.
         logger.debug(
             "Dynamic loader source exhausted: buffered_samples=%d buffered_tokens=%d "
-            "token_budget=%d drop_last=%s; draining remaining candidates",
+            "max_seq_len=%d drop_last=%s; draining remaining candidates",
             len(self.candidate_buffer.buffer), self.candidate_buffer.buffer_token_count,
-            self.candidate_buffer.token_budget, self.drop_last, enabled=True,
+            self.candidate_buffer.max_seq_len, self.drop_last, enabled=True,
         )
         while not self.candidate_buffer.empty():
             yield self._build_micro_batch()
@@ -500,8 +517,8 @@ class _DynamicBatchLoader(ABC):
         """Select, finalize, collate, and encode one micro-batch."""
         selected_samples = self.candidate_buffer.get_micro_batch()
         logger.debug(
-            "Dynamic loader selected: samples=%d token_budget=%d remaining_samples=%d remaining_tokens=%d",
-            len(selected_samples), self.candidate_buffer.token_budget, len(self.candidate_buffer.buffer),
+            "Dynamic loader selected: samples=%d max_seq_len=%d remaining_samples=%d remaining_tokens=%d",
+            len(selected_samples), self.candidate_buffer.max_seq_len, len(self.candidate_buffer.buffer),
             self.candidate_buffer.buffer_token_count, enabled=True,
         )
         finalized_samples = self._batch_pipeline.finalize_selected_samples(selected_samples)

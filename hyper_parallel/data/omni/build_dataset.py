@@ -39,13 +39,9 @@ def build_online_omni_mapping_dataset(
     data_path: OnlineDataPath | None = None,
     transform: OmniDataTransform | None = None,
     training_config: Any = None,
-<<<<<<< HEAD
-    sampler_type: str = "single",
-=======
     mode: Literal["production", "debug"] = "production",
     mesh_context: Any = None,
     train_valid_test_num_samples: list[int] | tuple[int, int, int] | None = None,
->>>>>>> c5a05879 (remove invalid raw sample, data iteration)
 ) -> Any:
     """Build an Online Mapping source and apply its Omni transform lazily.
 
@@ -55,15 +51,11 @@ def build_online_omni_mapping_dataset(
             train/valid/test path mapping.
         transform: Omni sample transform selected by the Trainer.
         training_config: Training plan providing the random seed.
-<<<<<<< HEAD
-        sampler_type: Mapping sampler policy controlling source-level shuffle.
-=======
         mode: Abort on invalid samples in production, or filter them in debug.
         mesh_context: Trainer mesh used to select cache writers and DataLoader ranks.
         train_valid_test_num_samples: Optional train/validation/test counts of raw-record
             accesses before packing. None uses each split's total valid-record count.
             These counts are not inferred from training iterations or packed batch sizes.
->>>>>>> c5a05879 (remove invalid raw sample, data iteration)
 
     Returns:
         A transformed Online Mapping Dataset or train-valid-test tuple.
@@ -91,12 +83,7 @@ def build_online_omni_mapping_dataset(
     source_dataset = build_online_mapping_source(
         data_path=data_path,
         data_config=dataset_config,
-<<<<<<< HEAD
-        sample_filter=sample_filter,
-        sampler_type=sampler_type,
-=======
         dataloader_context=create_dataloader_parallel_context(mesh_context),
->>>>>>> c5a05879 (remove invalid raw sample, data iteration)
     )
     transformed_dataset = _OmniMappingDataset.apply(source_dataset, transform)
     return transformed_dataset

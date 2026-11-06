@@ -19,9 +19,7 @@ __all__ = ["VLMTrainer"]
 from collections import defaultdict
 from typing import Any, Dict
 
-import torch  # pylint: disable=forbidden-backend-import
-
-from hyper_parallel.data.batching import calculate_num_micro_batches
+from hyper_parallel.data.batching import calculate_num_micro_batches, calculate_packed_seq_len
 from hyper_parallel.data.batching.get_batch import OmniParallelBatch
 from hyper_parallel.data.omni import OmniDataTransform
 from hyper_parallel.distributed.encoder_parallel import build_encoder_parallel_runtime
@@ -135,8 +133,14 @@ class VLMTrainer:
             micro_batch_size=training_config.micro_batch_size,
             dp_world_size=self.base.mesh.dp_size,
         )
+        max_seq_len = getattr(self.base.data_transform, "max_seq_len", None)
+        packed_max_seq_len = (
+            calculate_packed_seq_len(training_config.micro_batch_size, max_seq_len)
+            if max_seq_len is not None else None
+        )
         self.base.collate_fn = dataloader_config.collate_fn.build(
             mesh_context=self.base.mesh,
+            max_seq_len=packed_max_seq_len,
         )
 
     def _build_get_batch(self) -> None:
