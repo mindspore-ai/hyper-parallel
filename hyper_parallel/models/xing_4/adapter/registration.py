@@ -18,8 +18,11 @@ Expert parallelism and the optimizer are selected by the recipe through
 ``plan_overrides`` and the ``optimizer`` target.
 """
 
+from functools import partial
+from importlib import import_module
 from typing import Any
 
+from hyper_parallel.distributed.tensor_parallel.param_role import ParamRole
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec, RecomputePolicy
 from hyper_parallel.models.registry import register_custom_model, register_model_adapter
 
@@ -49,40 +52,10 @@ def build_parameter_sharding_rules() -> list[tuple[list[str], Any]]:
     Returns:
         Name patterns and their parameter roles.
     """
-    # Discovery imports this module without requiring the distributed runtime.
-    from hyper_parallel.distributed.tensor_parallel.param_role import (  # pylint: disable=import-outside-toplevel
-        ParamRole,
-    )
-
     return [
         (["linear_qkv"], ParamRole.REPLICATED),
         (["q_b_proj", "kv_b_proj"], ParamRole.COLWISE),
     ]
-
-
-def _load_replacements():
-    """Return the family's replacement-factory module (lazy provider)."""
-    from hyper_parallel.models.xing_4.adapter.conversion import (  # pylint: disable=import-outside-toplevel
-        module_replacement,
-    )
-
-    return module_replacement
-
-
-def _load_context_parallel():
-    """Load the recipe-selected CP wrappers without importing the runtime at discovery."""
-    from hyper_parallel.models.xing_4.adapter.distributed import (  # pylint: disable=C0415
-        context_parallel,
-    )
-    return context_parallel
-
-
-def _load_expert_parallel():
-    """Load the recipe-selected shared EP executor adapter lazily."""
-    from hyper_parallel.models.xing_4.adapter.distributed import (  # pylint: disable=C0415
-        expert_parallel,
-    )
-    return expert_parallel
 
 
 register_custom_model(
@@ -94,9 +67,8 @@ register_custom_model(
 XING4_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Xing4ForCausalLM",
     model_type="xing4_0",
-    replacements=_load_replacements,
-    context_parallel=_load_context_parallel,
-    expert_parallel=_load_expert_parallel,
+    context_parallel=partial(import_module, "hyper_parallel.models.xing_4.adapter.distributed.context_parallel"),
+    expert_parallel=partial(import_module, "hyper_parallel.models.xing_4.adapter.distributed.expert_parallel"),
     recompute=build_recompute_policy,
     sharding_rules=build_parameter_sharding_rules,
     fsdp_wrap_modules=get_fsdp_wrap_modules,
