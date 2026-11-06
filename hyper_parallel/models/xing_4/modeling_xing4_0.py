@@ -12,7 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Xing4 training and NPU plan replacements for the official backbone."""
+"""Training-capable Xing4 model built on the bundled Hugging Face sources.
+
+The unmodified official sources stay in ``transformer/``. This module subclasses
+them and assembles, at construction time, every shared module that carries
+training semantics: fused MLA with per-head logit maxima, the fused mHC pre
+operation, grouped-GEMM experts and the training router.
+
+The recipe still selects, through ``plan_overrides``:
+
+- ``SwiGLUMLP`` for the dense decoder MLPs and ``mlp.shared_experts``; the
+  official MLP computes the same result, so this is a pure performance choice.
+- the context- and expert-parallel rules, which need meshes that do not exist
+  while the model is built.
+
+Weights come from a converted training checkpoint the Trainer restores by the
+model's own tensor names, so no checkpoint conversion is declared here. Loading
+the published Hugging Face weights is not a supported entry point: it would
+need the fused layouts declared, the released configuration resolved to the
+bundled ``Xing4_0Config``, and the MTP decoder mapped out of its backbone
+layer index.
+"""
 
 from __future__ import annotations
 
@@ -25,14 +45,11 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import torch_npu
 from torch import nn
-from transformers.core_model_loading import MergeModulelist
+from transformers import PreTrainedModel
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.utils import ModelOutput
 
-from hyper_parallel.components.checkpoint import weight_conversion
-from hyper_parallel.components.checkpoint.conversion_ops import ConcatenateWithSections
-from hyper_parallel.components.checkpoint.weight_conversion import Transpose, WeightConverter
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
 from hyper_parallel.components.functional.mhc_post import mhc_post
 from hyper_parallel.components.functional.mhc_pre import mhc_pre
@@ -51,14 +68,39 @@ from hyper_parallel.core.activation_memory.recompute_state import is_recomputing
 from hyper_parallel.core.multicore.modules._precision import preserve_fp32_parameters
 from hyper_parallel.core.utils.communication import differentiable_all_reduce
 from hyper_parallel.data.constants import IGNORE_INDEX
+from hyper_parallel.distributed.expert_parallel.experts import SHARED_MERGE_MODES
+from hyper_parallel.distributed.expert_parallel.recipes import build_ep_compute
+from hyper_parallel.distributed.recipe_spec import local_compute
+from hyper_parallel.models import HyperAutoModelForCausalLM
 from hyper_parallel.models.materialization import register_rebuildable_buffer
-from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.models.xing_4.transformer.configuration_xing4_0 import Xing4_0Config
 from hyper_parallel.models.xing_4.transformer.modeling_xing4_0 import (
     Xing4_0DecoderLayer, Xing4_0ForCausalLM, Xing4_0HyperConnection,
     Xing4_0Model, Xing4_0MoE, Xing4_0PreTrainedModel, Xing4_0RMSNorm, Xing4_0TopkRouter,
     apply_rotary_pos_emb_interleave,
 )
+
+__all__ = [
+    "Xing4ForCausalLM",
+    "build_model",
+    "create_config",
+    "xing4_ep_compute_fn",
+]
+
+# MindFormers recipe options this model does not implement. Nothing here reads
+# them, so accepting a different value would train something other than what the
+# recipe asks for, without any error: ``mhc_pre`` has no CMHC, HC-head or clamp
+# argument at all. ``create_config`` supplies the one supported value when the
+# recipe leaves the option out, and names the option when it does not.
+_REQUIRED_OPTIONS = {
+    "use_fused_mhc": True,
+    "enable_cmhc": False,
+    "enable_hc_head": False,
+    "mtp_enable_hyper_connections": True,
+    "hc_sinkhorn_clamp": None,
+    "mhc_h_res_clamp_min": None,
+    "mhc_h_res_clamp_max": None,
+}
 
 
 def fusion_attention_with_logit_maxima(module: nn.Module, query: torch.Tensor, key: torch.Tensor,
@@ -96,24 +138,20 @@ def fusion_attention_with_logit_maxima(module: nn.Module, query: torch.Tensor, k
     return output.view(batch, sequence, heads, -1), None
 
 
-@module_replacement
 class Xing4MLAAttention(MLAAttention):
-    """Fuse MLA projections with FP32 rotary channels and per-head maxima."""
+    """Fuse MLA projections with FP32 rotary channels and per-head maxima.
 
-    def __init__(self, *, module: nn.Module, module_fqn: str = "",
-                 context: Mapping[str, Any] | None = None) -> None:
-        """Retain source weights and select the configured rotary implementation."""
-        super().__init__(module=module, module_fqn=module_fqn, context=context,
-                         attention_interface=fusion_attention_with_logit_maxima)
+    The decoder applies the recipe's latent-norm epsilon and attention scaling
+    to the official module before this wrapper snapshots them.
+    """
+
+    def __init__(self, module: nn.Module) -> None:
+        """Adopt the official attention weights and select the rotary implementation."""
+        super().__init__(module=module, attention_interface=fusion_attention_with_logit_maxima)
         if not self.rotary_interleaved:
             raise ValueError("Xing4 MLA requires interleaved rotary weights")
         self.q_a_layernorm = RMSNorm(module=self.q_a_layernorm)
         self.kv_a_layernorm = RMSNorm(module=self.kv_a_layernorm)
-        if not self.linear_qkv.weight.is_meta:
-            with torch.no_grad():
-                split = self._q_latent_output_size
-                self.linear_qkv.weight[:split].copy_(module.q_a_proj.weight)
-                self.linear_qkv.weight[split:].copy_(module.kv_a_proj_with_mqa.weight)
         self.apply_rotary_pos_emb_interleave = (
             fused_rotary if getattr(self.config, "apply_rope_fusion", False) else apply_rotary_pos_emb_interleave
         )
@@ -142,7 +180,7 @@ class Xing4Router(Xing4_0TopkRouter):
 
     fp32_buffer_names = ("e_score_correction_bias",)
 
-    def __init__(self, config: Any, source: nn.Module) -> None:
+    def __init__(self, config: Any, source: nn.Module, layer_idx: int) -> None:
         """Retain the HF weights and register all resumable routing state."""
         super().__init__(config)
         self.weight = source.weight
@@ -153,12 +191,46 @@ class Xing4Router(Xing4_0TopkRouter):
         self.register_buffer("_token_counts", torch.zeros(self.num_experts, dtype=torch.int64))
         self.input_jitter_eps = config.moe_input_jitter_eps
         self.last_aux_loss = None
-        self.enable_expert_bias = config.moe_router_enable_expert_bias
+        self.group_score_topk = config.moe_router_group_score_topk
+        # Benchmarks only: an exactly balanced round robin replacing the decision.
+        self.force_expert_balance = config.moe_router_force_expert_balance
+        # MindFormers hashes the leading decoder layers, never an MTP depth, and
+        # drops the load bias wherever the hash table decides the selection.
+        self.is_hash_layer = layer_idx < config.moe_n_hash_layers
+        self.token_ids = None
+        if self.is_hash_layer:
+            self.register_buffer("tid2eid", torch.empty(config.vocab_size, self.top_k, dtype=torch.int32))
+        self.enable_expert_bias = config.moe_router_enable_expert_bias and not self.is_hash_layer
         self.expert_bias_update_rate = config.moe_router_bias_update_rate
 
     def _apply(self, fn: Callable, recurse: bool = True) -> "Xing4Router":
         """Keep load-balancing bias updates in FP32 during model dtype conversion."""
         return super()._apply(preserve_fp32_parameters(self, fn, self.fp32_buffer_names), recurse=recurse)
+
+    def _select_experts(self, scores: torch.Tensor) -> torch.Tensor:
+        """Select experts the way MindFormers does: round robin, hash table, groups or top-k.
+
+        Forced expert balance replaces the decision with an exactly balanced
+        round robin, for benchmarks. A hash layer reads fixed expert ids from
+        ``tid2eid``. Otherwise the load bias steers a top-k that node-limited
+        routing may restrict to the best ``topk_group`` groups, each group
+        scoring as the sum of its ``moe_router_group_score_topk`` best biased
+        affinities.
+        """
+        if self.force_expert_balance:
+            tokens = scores.shape[0]
+            return (torch.arange(tokens * self.top_k, device=scores.device)
+                    .view(tokens, self.top_k) % self.num_experts)
+        if self.is_hash_layer:
+            return self.tid2eid.index_select(0, self.token_ids.reshape(-1)).long()
+        biased = scores + self.e_score_correction_bias
+        if self.num_group:
+            grouped = biased.unflatten(-1, (self.num_group, -1))
+            group_scores = grouped.topk(self.group_score_topk, dim=-1).values.sum(dim=-1)
+            keep = torch.zeros_like(group_scores, dtype=torch.bool).scatter_(
+                1, group_scores.topk(self.topk_group, dim=-1, sorted=False).indices, True)
+            biased = grouped.masked_fill(~keep.unsqueeze(-1), float("-inf")).flatten(-2)
+        return biased.topk(self.top_k, dim=-1, sorted=False).indices
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Route real tokens once; safe-token padding consumes neither jitter nor counts."""
@@ -166,9 +238,15 @@ class Xing4Router(Xing4_0TopkRouter):
         flat = real_hidden.reshape(-1, hidden_states.shape[-1]).float()
         if self.training and self.input_jitter_eps:
             flat = flat * (1.0 + (2.0 * torch.rand_like(flat) - 1.0) * self.input_jitter_eps)
-        logits, weights, indices = super().forward(flat)
+        logits = F.linear(flat, self.weight.float())
         scores = logits.sigmoid()
-        weights = self._attach_balance_loss(weights, scores, batch_size=hidden_states.shape[0])
+        indices = self._select_experts(scores)
+        # The load bias steers selection only; the gate value stays the raw affinity.
+        weights = scores.gather(1, indices)
+        if self.norm_topk_prob or self.is_hash_layer:
+            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+        weights = weights * self.routed_scaling_factor
+        weights = self._attach_balance_loss(weights, scores, indices, batch_size=hidden_states.shape[0])
         if self.training and self.enable_expert_bias and not is_recomputing():
             counts = torch.zeros_like(self._token_counts).scatter_add_(
                 0, indices.reshape(-1), torch.ones_like(indices.reshape(-1), dtype=torch.int64))
@@ -182,7 +260,8 @@ class Xing4Router(Xing4_0TopkRouter):
                                  weights.reshape(batch, -1, self.top_k)), dim=1).reshape(-1, self.top_k)
         return logits, weights.to(hidden_states.dtype), indices
 
-    def _attach_balance_loss(self, weights: torch.Tensor, scores: torch.Tensor, batch_size: int) -> torch.Tensor:
+    def _attach_balance_loss(self, weights: torch.Tensor, scores: torch.Tensor, indices: torch.Tensor,
+                             batch_size: int) -> torch.Tensor:
         """Inject ``coeff * E * mean_b(sum_i(f_bi * P_bi))`` through the routing weights.
 
         ``f_bi`` counts unbiased top-k affinities per sequence, independently of the expert-load bias. ``P_bi`` averages
@@ -194,11 +273,13 @@ class Xing4Router(Xing4_0TopkRouter):
             scores: Router affinities of every expert.
             batch_size: Number of independent sequences before flattening the tokens.
         """
-        selected_indices = scores.topk(self.top_k, dim=-1, sorted=False).indices
-        selected = selected_indices.reshape(batch_size, -1)
+        # Hash routing, the load bias and group limiting all leave the auxiliary
+        # statistics on the raw affinities; only forced balance replaces them.
+        selected = (indices if self.force_expert_balance
+                    else scores.topk(self.top_k, dim=-1, sorted=False).indices).reshape(batch_size, -1)
         counts = scores.new_zeros(batch_size, self.num_experts).scatter_add_(
             1, selected, torch.ones_like(selected, dtype=scores.dtype))
-        if getattr(self, 'aux_loss_cp_group', None) is None:
+        if self.aux_loss_cp_group is None:
             load = counts / selected.shape[1]
             affinity = (scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)).reshape(
                 batch_size, -1, self.num_experts).mean(dim=1)
@@ -232,88 +313,48 @@ class Xing4Router(Xing4_0TopkRouter):
         counts.zero_()
 
 
-def swiglu_policy(config: Xing4_0Config) -> tuple[float | None, torch.dtype | None]:
-    """Return the optional clamp and compute dtype used by the shared SwiGLU replacements."""
-    dtype = getattr(config, "swiglu_compute_dtype", None)
-    return getattr(config, "swiglu_limit", None), getattr(torch, dtype) if isinstance(dtype, str) else dtype
+def build_grouped_experts(config: Xing4_0Config, experts: nn.ModuleList) -> GroupedExperts:
+    """Build the shared grouped-GEMM experts for the official per-expert projections.
 
+    The packed parameters stay empty: the Trainer's checkpoint restore or
+    ``GroupedExperts.reset_parameters`` fills them.
 
-@module_replacement
-class Xing4GroupedExperts(GroupedExperts):
-    """Pack the official ModuleList into shared grouped-GEMM parameters.
+    Args:
+        config: Resolved Xing4 configuration.
+        experts: Official per-expert ``Xing4_0MLP`` modules.
 
-    Eager weights are copied once. Meta weights use the reversible checkpoint
-    mappings. Replacement precedes optimizer construction."""
-
-    def __init__(
-        self,
-        *,
-        module: nn.ModuleList,
-        module_fqn: str = "",
-        context: Mapping[str, Any] | None = None,
-    ) -> None:
-        """Pack the HF experts before the Trainer freezes or shards their parameters."""
-        config = module[0].config
-        count = len(module)
-        gate, down = module[0].gate_proj.weight, module[0].down_proj.weight
-        intermediate_size, hidden_size = gate.shape
-        packed_gate = nn.Parameter(
-            gate.new_empty((count, hidden_size, 2 * intermediate_size)), requires_grad=gate.requires_grad
-        )
-        packed_down = nn.Parameter(
-            down.new_empty((count, intermediate_size, hidden_size)), requires_grad=down.requires_grad
-        )
-        if not gate.is_meta:
-            with torch.no_grad():
-                for index, expert in enumerate(module):
-                    packed_gate[index, :, :intermediate_size].copy_(expert.gate_proj.weight.T)
-                    packed_gate[index, :, intermediate_size:].copy_(expert.up_proj.weight.T)
-                    packed_down[index].copy_(expert.down_proj.weight.T)
-        carrier = nn.Module()
-        carrier.config = config
-        carrier.num_local_experts = count
-        carrier.hidden_size = hidden_size
-        carrier.intermediate_size = intermediate_size
-        carrier.has_gate = True
-        carrier.is_concatenated = True
-        carrier.is_transposed = True
-        carrier.limit, carrier.activation_compute_dtype = swiglu_policy(config)
-        carrier.gate_up_proj = packed_gate
-        carrier.down_proj = packed_down
-        carrier.train(module.training)
-        super().__init__(module=carrier, module_fqn=module_fqn, context=context)
-
-    def forward(self, *args: torch.Tensor, **kwargs: torch.Tensor) -> torch.Tensor:
-        """Keep the variadic ModuleList signature required by replacement validation."""
-        return super().forward(*args, **kwargs)
-
-    def make_transforms(self) -> list[WeightConverter]:
-        """Return reversible mappings for every original expert projection."""
-        merge_experts = getattr(weight_conversion, "MergeModulelist", None) or MergeModulelist
-        pack = ConcatenateWithSections((self.intermediate_size, self.intermediate_size), dim=1)
-        return [
-            WeightConverter(
-                source_patterns=[r"*.gate_proj.weight", r"*.up_proj.weight"],
-                target_patterns="gate_up_proj",
-                operations=[merge_experts(dim=0), pack, Transpose(-2, -1)],
-            ),
-            WeightConverter(
-                source_patterns=r"*.down_proj.weight",
-                target_patterns="down_proj",
-                operations=[merge_experts(dim=0), Transpose(-2, -1)],
-            ),
-        ]
+    Returns:
+        The packed grouped-GEMM experts replacing the official module list.
+    """
+    gate, down = experts[0].gate_proj.weight, experts[0].down_proj.weight
+    intermediate_size, hidden_size = gate.shape
+    count = len(experts)
+    source = nn.Module()
+    source.config = config
+    source.num_local_experts = count
+    source.hidden_size = hidden_size
+    source.intermediate_size = intermediate_size
+    source.has_gate = True
+    source.is_concatenated = True
+    source.is_transposed = True
+    source.gate_up_proj = nn.Parameter(
+        gate.new_empty((count, hidden_size, 2 * intermediate_size)), requires_grad=gate.requires_grad)
+    source.down_proj = nn.Parameter(
+        down.new_empty((count, intermediate_size, hidden_size)), requires_grad=down.requires_grad)
+    source.train(experts.training)
+    return GroupedExperts(module=source)
 
 
 class Xing4MoE(Xing4_0MoE):
-    """Reuse the HF MoE facade and experts with explicit training extensions."""
+    """Reuse the HF MoE facade with grouped-GEMM experts and training routing."""
 
-    def __init__(self, config: Any, source: nn.Module) -> None:
-        """Retain HF experts and add the training router and EP execution boundary."""
+    def __init__(self, config: Any, source: nn.Module, layer_idx: int) -> None:
+        """Pack the official experts and add the training router and EP boundary."""
         nn.Module.__init__(self)  # pylint: disable=non-parent-init-called
         self.config = config
-        self.experts = source.experts
-        self.gate = Xing4Router(config, source.gate)
+        self.experts = build_grouped_experts(config, source.experts)
+        self.gate = Xing4Router(config, source.gate, layer_idx)
+        # The recipe replaces this dense MLP with the shared SwiGLUMLP.
         self.shared_experts = source.shared_experts
         self.num_experts = config.n_routed_experts
         self.top_k = config.num_experts_per_tok
@@ -321,20 +362,21 @@ class Xing4MoE(Xing4_0MoE):
         self.ep_executor = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Reuse HF expert computation, with optional padding and EP dispatch."""
+        """Route real tokens through the experts, with optional padding and EP dispatch."""
         padded = hidden_states
         if self.padding:
             padded = torch.cat((padded.new_zeros(padded.shape[0], self.padding, padded.shape[-1]), padded), dim=1)
         if self.ep_executor is not None:
             routed = self.ep_executor(self, padded)
-            return routed[:, self.padding:] + self.shared_experts(hidden_states)
-        return super().forward(padded)[:, self.padding:]
+        else:
+            shape = padded.shape
+            routed = self.moe(padded.view(-1, shape[-1]), *self.route(padded)).view(*shape)
+        # Safe-token padding never reaches the shared experts: they are token-wise.
+        return routed[:, self.padding:] + self.shared_experts(hidden_states)
 
     def moe(self, hidden_states: torch.Tensor, topk_indices: torch.Tensor,
             topk_weights: torch.Tensor) -> torch.Tensor:
-        """Select the HF per-expert or declared grouped-expert implementation."""
-        if isinstance(self.experts, nn.ModuleList):
-            return super().moe(hidden_states, topk_indices, topk_weights)
+        """Run the packed grouped-GEMM experts on flattened tokens."""
         return self.experts(hidden_states, topk_indices, topk_weights)
 
     def route(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -343,15 +385,12 @@ class Xing4MoE(Xing4_0MoE):
         return indices, weights
 
 
-@module_replacement
 class Xing4FusedHyperConnection(Xing4_0HyperConnection):
     """Adapt official mHC parameters to the shared NPU pre operation."""
 
-    def __init__(self, *, module: Xing4_0HyperConnection, module_fqn: str = "",
-                 context: Mapping[str, Any] | None = None) -> None:
+    def __init__(self, module: Xing4_0HyperConnection) -> None:
         """Keep official parameter names, values and ownership."""
         nn.Module.__init__(self)
-        del module_fqn, context
         self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps = module.hc_mult, module.hc_sinkhorn_iters, module.hc_eps
         self.input_norm = module.input_norm
         self.hc_fn, self.hc_base, self.hc_scale = module.hc_fn, module.hc_base, module.hc_scale
@@ -368,31 +407,31 @@ class Xing4FusedHyperConnection(Xing4_0HyperConnection):
 
 
 class Xing4DecoderLayer(Xing4_0DecoderLayer):
-    """Keep HF submodules and expose its inline residual mixing for replacement."""
+    """Install the high-performance blocks around the official decoder weights."""
 
     def __init__(self, config: Any, layer_idx: int, source: nn.Module | None = None) -> None:
-        """Retain HF attention, norms and feed-forward weights."""
+        """Apply the recipe's norm and scaling values, then adopt the shared modules."""
         nn.Module.__init__(self)
         source = Xing4_0DecoderLayer(config, layer_idx) if source is None else source
         self.hidden_size = source.hidden_size
-        self.self_attn = source.self_attn
-        self.mlp = Xing4MoE(config, source.mlp) if isinstance(source.mlp, Xing4_0MoE) else source.mlp
-        # The recipe replaces this HF MLP with the shared SwiGLUMLP before training.
-        dense = self.mlp.shared_experts if isinstance(self.mlp, Xing4MoE) else self.mlp
-        dense.limit, dense.activation_compute_dtype = swiglu_policy(config)
+        # The official attention builds its latent norms with the module default epsilon and
+        # the wrapper snapshots them, so the recipe values must be applied before wrapping.
+        source.self_attn.q_a_layernorm.variance_epsilon = config.rms_norm_eps
+        source.self_attn.kv_a_layernorm.variance_epsilon = config.rms_norm_eps
+        if config.attention_softmax_scale is not None:
+            source.self_attn.scaling = config.attention_softmax_scale
+        self.self_attn = Xing4MLAAttention(source.self_attn)
+        # Dense layers keep the official MLP; the recipe replaces it with the shared SwiGLUMLP.
+        self.mlp = Xing4MoE(config, source.mlp, layer_idx) if isinstance(source.mlp, Xing4_0MoE) else source.mlp
         self.input_layernorm = source.input_layernorm
         self.post_attention_layernorm = source.post_attention_layernorm
-        self.attn_hc, self.ffn_hc = source.attn_hc, source.ffn_hc
-        self.attn_hc.input_norm.eps = self.ffn_hc.input_norm.eps = config.mhc_layernorm_epsilon
-        # The training recipe applies its norm epsilon to both MLA latent projections.
-        self.self_attn.q_a_layernorm.variance_epsilon = config.rms_norm_eps
-        self.self_attn.kv_a_layernorm.variance_epsilon = config.rms_norm_eps
-        if config.attention_softmax_scale is not None:
-            self.self_attn.scaling = config.attention_softmax_scale
+        source.attn_hc.input_norm.eps = source.ffn_hc.input_norm.eps = config.mhc_layernorm_epsilon
+        self.attn_hc = Xing4FusedHyperConnection(source.attn_hc)
+        self.ffn_hc = Xing4FusedHyperConnection(source.ffn_hc)
 
     def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None = None,
                 position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None, **kwargs: Any) -> torch.Tensor:
-        """Call the official blocks through replaceable pre/post mHC operations."""
+        """Call the official blocks through the fused mHC pre/post operations."""
         post, mix, collapsed, residual = self.attn_hc(hidden_states)
         output = self.self_attn(hidden_states=self.input_layernorm(collapsed),
                                 position_embeddings=position_embeddings, attention_mask=attention_mask, **kwargs)[0]
@@ -412,11 +451,22 @@ class Xing4DecoderLayer(Xing4_0DecoderLayer):
 
 @torch.no_grad()
 def _init_training_weights(owner: Xing4_0PreTrainedModel, module: nn.Module) -> None:
-    """Initialize the recipe's mHC tensors and the additional router count under HF's partial-load guards."""
+    """Initialize the modules the official ``_init_weights`` no longer sees.
+
+    The official implementation initializes ``Xing4_0HyperConnection`` through
+    ``fn``/``base``/``scale``, which that class does not define, so its branch
+    is replaced here. The shared RMSNorm, grouped experts and the additional
+    router count are not official module types. Every call goes through HF's
+    partial-load guards so already loaded values are preserved.
+    """
     if isinstance(module, Xing4_0HyperConnection):
         nn.init.normal_(module.hc_fn, mean=0.0, std=1e-4)
         nn.init.constant_(module.hc_scale, owner.config.mhc_init_gating_factor)
         nn.init.zeros_(module.hc_base)
+    elif isinstance(module, RMSNorm):
+        nn.init.ones_(module.weight)
+    elif isinstance(module, GroupedExperts):
+        module.reset_parameters()
     else:
         Xing4_0PreTrainedModel._init_weights(owner, module)
         if isinstance(module, Xing4Router):
@@ -495,6 +545,8 @@ class Xing4ForCausalLM(Xing4_0ForCausalLM):
         if self.mtp is not None:
             self.mtp.gradient_checkpointing = False
         self.post_init()
+        self._hash_routers = [module for module in self.modules()
+                              if isinstance(module, Xing4Router) and module.is_hash_layer]
 
     @classmethod
     def from_config(cls, config: Any, **kwargs: Any) -> "Xing4ForCausalLM":
@@ -513,6 +565,8 @@ class Xing4ForCausalLM(Xing4_0ForCausalLM):
             raise ValueError("Xing4 training requires shift_labels aligned to input_ids")
         if position_ids is None:
             position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
+        for router in self._hash_routers:
+            router.token_ids = input_ids
         embeddings = self.model.embed_tokens(input_ids).to(dtype=self.embedding_compute_dtype)
         hidden = self.model(inputs_embeds=embeddings, position_ids=position_ids, use_cache=False).last_hidden_state
         targets = shift_labels.masked_fill(shift_labels < 0, IGNORE_INDEX)
@@ -560,3 +614,77 @@ class Xing4ForCausalLM(Xing4_0ForCausalLM):
             loss_sum = self.loss_function(self.lm_head(hidden), None, self.config.vocab_size, num_items_in_batch=1,
                                           ignore_index=IGNORE_INDEX, shift_labels=targets)
         return self.model.mean_loss(loss_sum, count)
+
+
+@local_compute
+def xing4_ep_compute_fn(*, module: Any, mesh: Any, tp_mesh: Any, cp_mesh: Any,
+                        ep_mesh: Any, fix_router: bool = False) -> Callable:
+    """Dispatch routed experts while retaining local shared experts and router state.
+
+    ``fix_router`` balances dispatch indices for benchmarks; safe-token padding
+    and statistics from the learned router keep their separate semantics.
+
+    Args:
+        module: One :class:`Xing4MoE` layer.
+        mesh: Full framework mesh.
+        tp_mesh: Tensor parallel mesh, or None.
+        cp_mesh: Context parallel mesh, or None.
+        ep_mesh: Expert parallel mesh owning the routed experts.
+        fix_router: Benchmark-only balanced destinations.
+
+    Returns:
+        The MoE forward that the rewriter binds to the module.
+    """
+    del mesh, tp_mesh, cp_mesh
+    module.ep_executor = build_ep_compute(
+        module, ep_mesh, router_fn=type(module).route, archetype_key="xing4",
+        expected_attrs=["gate", "experts", "shared_experts"], combine=SHARED_MERGE_MODES["none"],
+        use_grouped_gemm=True, fix_router=fix_router)
+    return type(module).forward
+
+
+def create_config(config: dict[str, Any]) -> Xing4_0Config:
+    """Map training aliases to HF fields, preferring an explicit HF value.
+
+    Args:
+        config: Model fields supplied by the training recipe.
+
+    Returns:
+        The bundled HF configuration carrying HP training options.
+
+    Raises:
+        ValueError: If the recipe selects semantics the shared components do not implement.
+    """
+    values = dict(config)
+    for alias, field in (("num_residual_streams", "hc_mult"), ("mhc_sinkhorn_iterations", "hc_sinkhorn_iters"),
+                         ("router_jitter_noise", "moe_input_jitter_eps")):
+        if alias in values:
+            values.setdefault(field, values.pop(alias))
+    values.setdefault("moe_input_jitter_eps", 0.0)
+    values.setdefault("attention_softmax_scale", None)
+    values.setdefault("use_cache", False)
+    values.setdefault("moe_n_hash_layers", 0)
+    values.setdefault("moe_router_group_score_topk", 2)
+    values.setdefault("moe_router_force_expert_balance", False)
+    unsupported = sorted(name for name, required in _REQUIRED_OPTIONS.items()
+                         if values.setdefault(name, required) != required)
+    if unsupported:
+        raise ValueError(f"Xing4 training implements one fixed recipe; unsupported options: {unsupported}")
+    values.update(architectures=["Xing4ForCausalLM"])
+    return Xing4_0Config(**values)
+
+
+def build_model(*, config: dict[str, Any], **options: Any) -> PreTrainedModel:
+    """Build and parallelize the model without loading weights.
+
+    The Trainer restores the converted training checkpoint afterwards, by the
+    model's own tensor names.
+
+    Args:
+        config: Model configuration with HF fields and HP training options.
+        **options: Construction options the Trainer passes to the shared builder.
+
+    Returns:
+        The constructed, parallelized model.
+    """
+    return HyperAutoModelForCausalLM.from_config(create_config(config), **options)

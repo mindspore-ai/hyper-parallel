@@ -14,8 +14,8 @@
 # ============================================================================
 """Register the Xing4 model and its adapter.
 
-Expert parallelism and the optimizer are selected by the recipe through
-``plan_overrides`` and the ``optimizer`` target.
+Context and expert parallelism are selected by the recipe through
+``plan_overrides``; the optimizer is selected by the ``optimizer`` target.
 """
 
 from functools import partial
@@ -60,7 +60,7 @@ def build_parameter_sharding_rules() -> list[tuple[list[str], Any]]:
 
 register_custom_model(
     "Xing4ForCausalLM",
-    "hyper_parallel.models.xing_4.adapter.training",
+    "hyper_parallel.models.xing_4.modeling_xing4_0",
     "Xing4ForCausalLM",
 )
 
@@ -68,7 +68,7 @@ XING4_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Xing4ForCausalLM",
     model_type="xing4_0",
     context_parallel=partial(import_module, "hyper_parallel.models.xing_4.adapter.distributed.context_parallel"),
-    expert_parallel=partial(import_module, "hyper_parallel.models.xing_4.adapter.distributed.expert_parallel"),
+    expert_parallel=partial(import_module, "hyper_parallel.models.xing_4.modeling_xing4_0"),
     recompute=build_recompute_policy,
     sharding_rules=build_parameter_sharding_rules,
     fsdp_wrap_modules=get_fsdp_wrap_modules,

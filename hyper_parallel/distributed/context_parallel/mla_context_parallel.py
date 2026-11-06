@@ -182,10 +182,6 @@ def apply_mla_rope(
     return rotated.transpose(0, 1)
 
 
-# Retain the original callback name for existing CP plans.
-_apply_mla_rope = apply_mla_rope
-
-
 def _validate_query_partition(causal, attention_mask):
     """Reject query-partition modes whose FA metadata contract is not implemented."""
     if not causal or attention_mask is not None:
@@ -348,7 +344,7 @@ def _query(
     latent: torch.Tensor,
     positions: tuple[torch.Tensor, torch.Tensor] | None,
     heads: int,
-    rotary_fn=_apply_mla_rope,
+    rotary_fn=apply_mla_rope,
 ) -> torch.Tensor:
     """Expand and rotate the query through the managed TP-local projection module."""
     projected = module.q_b_proj(latent)
@@ -432,7 +428,7 @@ class MLAContextParallel:
         if attention_interface is not None and not callable(attention_interface):
             raise TypeError("attention_interface must be callable")
         self.plan = plan
-        self.rotary_fn = _apply_mla_rope if rotary_fn is None else rotary_fn
+        self.rotary_fn = apply_mla_rope if rotary_fn is None else rotary_fn
         self.attention_interface = npu_fusion_attention_forward if attention_interface is None else attention_interface
         self.cp_mesh = cp_mesh
         rank = 0 if cp_mesh is None else cp_mesh.get_local_rank()

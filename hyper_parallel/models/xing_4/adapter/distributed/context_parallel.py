@@ -32,7 +32,7 @@ from hyper_parallel.distributed.context_parallel.mla_context_parallel import MLA
 from hyper_parallel.distributed.recipe_spec import inner_wrapper
 from hyper_parallel.models.deepseek_v3.adapter.distributed.context_parallel import mla_cp_wrapper
 from hyper_parallel.models.replacement import method_replacement
-from hyper_parallel.models.xing_4.adapter.training import Xing4MoE, fusion_attention_with_logit_maxima
+from hyper_parallel.models.xing_4.modeling_xing4_0 import Xing4MoE, fusion_attention_with_logit_maxima
 
 
 def _rotary(tensor: torch.Tensor, positions: tuple[torch.Tensor, torch.Tensor] | None,

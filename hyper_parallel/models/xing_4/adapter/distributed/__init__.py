@@ -12,4 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Xing4 EP/CP rule providers."""
+"""Xing4 context-parallel rule provider."""
