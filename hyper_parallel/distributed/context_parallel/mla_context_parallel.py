@@ -26,6 +26,7 @@ from typing import Any, Literal
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.components import functional
 from hyper_parallel.distributed.context_parallel.collectives import (
     _build_hybrid_cp_submeshes, async_cp_allgather_launch, async_ulysses_seq_to_head_launch,
     ulysses_head_to_seq, ulysses_seq_to_head,
@@ -166,16 +167,11 @@ def apply_mla_rope(
     cos, sin = (part.to(tensor.dtype) for part in position_embeddings)
     if cos.ndim == 2:
         cos, sin = cos.unsqueeze(0), sin.unsqueeze(0)
-    # Load the optional NPU dependency only when executing RoPE.
-    from hyper_parallel.components.functional.rotary_embedding import (  # pylint: disable=C0415
-        apply_rotary_pos_emb_single,
-    )
-
     if interleaved:
         cos, sin = (part[..., :tensor.shape[-1] // 2].repeat_interleave(2, dim=-1)
                     for part in (cos, sin))
     cos, sin = (part.expand(tensor.shape[0], -1, -1).transpose(0, 1) for part in (cos, sin))
-    rotated = apply_rotary_pos_emb_single(
+    rotated = functional.apply_rotary_pos_emb_single(
         tensor.transpose(0, 1), cos, sin,
         rotary_interleaved=interleaved, use_fused_rotary_pos_emb=True,
     )

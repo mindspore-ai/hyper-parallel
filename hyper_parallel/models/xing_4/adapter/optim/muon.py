@@ -33,9 +33,6 @@ from hyper_parallel.models.xing_4.adapter.optim.muon_layout import Xing4MuonLayo
 __all__ = ["build_optimizer", "clip_qk"]
 
 
-_MUON_LAYOUTS = ("native", "mindformers_pynative")
-
-
 def build_optimizer(*, model: nn.Module, muon_config: dict[str, Any], adamw_config: dict[str, Any],
                     qk_clip_threshold: float = 0.0, muon_layout: str = "native") -> Muon:
     """Build framework Muon with Xing4 decay groups and optional QK clipping.
@@ -59,49 +56,36 @@ def build_optimizer(*, model: nn.Module, muon_config: dict[str, Any], adamw_conf
     Raises:
         ValueError: If the layout or its projection ownership is incompatible.
     """
-    if muon_layout not in _MUON_LAYOUTS:
-        raise ValueError(f"Unknown Xing4 muon_layout: {muon_layout!r}; expected one of {_MUON_LAYOUTS}")
     options = dict(muon_config)
+    attention = [module for module in model.modules()
+                 if hasattr(module, "q_b_proj") and hasattr(module, "kv_b_proj")]
     if muon_layout == "mindformers_pynative":
-        options = _with_logical_layout(options, model)
+        if any(not hasattr(module, "linear_qkv") for module in attention):
+            raise ValueError("The MindFormers logical Muon layout requires fused MLA projections")
+        layout = Xing4MuonLayout.from_config(model.config)
+        options.pop("muon_reshape_fn", None)
+        options.pop("muon_ns_transform_fn", None)
+        options.update(reshape_fn=layout.reshape_fn, ns_transform_fn=layout.ns_transform_fn)
+    elif muon_layout != "native":
+        raise ValueError(f"Unknown Xing4 Muon layout: {muon_layout!r}")
     # The AdamW grouping matches name fragments; full names select exactly the 1-D parameters.
     no_decay = ["bias", *(name for name, parameter in model.named_parameters() if parameter.ndim == 1)]
     builder = Muon(muon_config=options, adamw_config=dict(adamw_config), model=model,
                    no_decay_params=no_decay)
     if qk_clip_threshold > 0:
-        attention = [module for module in model.modules()
-                     if hasattr(module, "q_b_proj") and hasattr(module, "kv_b_proj")]
         muon = builder.get_optimizer().optimizers_dict["muon"]
         owned = {id(parameter) for group in muon.param_groups for parameter in group["params"]}
         if not attention or any(
                 not projection.weight.requires_grad or id(projection.weight) not in owned
                 for module in attention for projection in (module.q_b_proj, module.kv_b_proj)):
             raise ValueError("QK clipping requires trainable q_b_proj and kv_b_proj weights owned by Muon")
+        for module in attention:
+            module.record_logit_maxima = True
         # The FP32 main-weight wrapper copies model weights back after the leaf step.
         muon.register_step_post_hook(
             lambda _optimizer, _args, _kwargs: clip_qk(attention, qk_clip_threshold)
         )
     return builder
-
-
-def _with_logical_layout(options: dict[str, Any], model: nn.Module) -> dict[str, Any]:
-    """Bind the layout callbacks after validating ownership and fused attention."""
-    owned = {"reshape_fn", "ns_transform_fn"}
-    conflicts = sorted(key for key in options if key.removeprefix("muon_") in owned)
-    if conflicts:
-        raise ValueError(f"muon_layout='mindformers_pynative' owns {sorted(owned)}; "
-                         f"remove {conflicts} from muon_config")
-    # linear_qkv only exists after Xing4MLAAttention replaces the original attention;
-    # without it, q_b_proj/kv_b_proj alone would silently keep the unfused K/V latent
-    # projection on the whole-matrix path instead of the logical layout.
-    names = [name for name, _ in model.named_parameters()]
-    linear_qkv = sum(1 for name in names if name.endswith(".self_attn.linear_qkv.weight"))
-    q_b_proj = sum(1 for name in names if name.endswith(".self_attn.q_b_proj.weight"))
-    if not linear_qkv or linear_qkv != q_b_proj:
-        raise ValueError("mindformers_pynative requires the fused linear_qkv attention "
-                         f"(found {linear_qkv} linear_qkv.weight vs {q_b_proj} q_b_proj.weight)")
-    layout = Xing4MuonLayout.from_config(model.config)
-    return {**options, "reshape_fn": layout.reshape_fn, "ns_transform_fn": layout.ns_transform_fn}
 
 
 @torch.no_grad()
@@ -117,13 +101,9 @@ def clip_qk(attention: Sequence[nn.Module], threshold: float) -> None:
         threshold: Positive target maximum.
 
     Raises:
-        RuntimeError: If attention did not record maxima.
         ValueError: If a TP shard does not own contiguous complete heads.
     """
-    maxima = [getattr(module, "max_logits", None) for module in attention]
-    if any(maximum is None for maximum in maxima):
-        raise RuntimeError("QK clipping requires the logit maxima recorded by the NPU fused attention")
-    maxima = [_at_global_heads(module, maximum) for module, maximum in zip(attention, maxima)]
+    maxima = [_at_global_heads(module, module.max_logits) for module in attention]
     flat = torch.cat(maxima)
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(flat, op=dist.ReduceOp.MAX)

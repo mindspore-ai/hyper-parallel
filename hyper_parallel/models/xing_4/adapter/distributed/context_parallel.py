@@ -32,18 +32,15 @@ from hyper_parallel.distributed.context_parallel.mla_context_parallel import MLA
 from hyper_parallel.distributed.recipe_spec import inner_wrapper
 from hyper_parallel.models.deepseek_v3.adapter.distributed.context_parallel import mla_cp_wrapper
 from hyper_parallel.models.replacement import method_replacement
-from hyper_parallel.models.xing_4.adapter.conversion.module_replacement import (
-    Xing4MLAAttention, fusion_attention_with_logit_maxima,
-)
-from hyper_parallel.models.xing_4.adapter.training import Xing4MoE
+from hyper_parallel.models.xing_4.adapter.training import Xing4MoE, fusion_attention_with_logit_maxima
 
 
 def _rotary(tensor: torch.Tensor, positions: tuple[torch.Tensor, torch.Tensor] | None,
             *, interleaved: bool = False) -> torch.Tensor:
     """Preserve official FP32 interleaved RoPE for the runtime's BSND tensors."""
-    if positions is None or not interleaved:
-        raise ValueError("Xing4 CP requires interleaved RoPE and local position embeddings")
-    return apply_mla_rope(tensor.float(), positions, interleaved=True).to(tensor.dtype)
+    if positions is None:
+        raise ValueError("Xing4 CP requires local RoPE position embeddings")
+    return apply_mla_rope(tensor.float(), positions, interleaved=interleaved).to(tensor.dtype)
 
 
 @inner_wrapper
@@ -72,8 +69,6 @@ def xing4_mla_cp_wrapper(target_module: nn.Module, mesh: Any, tp_mesh: Any,
     Returns:
         Atomic forward rewrites from the shared MLA runtime.
     """
-    if not isinstance(target_module, Xing4MLAAttention) or cp_mesh is None:
-        raise ValueError("Xing4 CP requires an active CP mesh and the MLA module replacement")
     requests = mla_cp_wrapper(
         target_module, mesh, tp_mesh, cp_mesh, ep_mesh, strategy=strategy, overlap=overlap,
         ulysses_degree=ulysses_degree, kv_exchange=kv_exchange,
@@ -97,19 +92,15 @@ def xing4_moe_cp_wrapper(target_module: Xing4MoE, mesh: Any, tp_mesh: Any,
                          cp_mesh: Any, ep_mesh: Any) -> list:
     """Bind sequence-wise router statistics without replacing the MoE computation."""
     del mesh, tp_mesh, ep_mesh
-    if not isinstance(target_module, Xing4MoE) or cp_mesh is None:
-        raise ValueError("Xing4 router statistics require an MoE module and an active CP mesh")
-    if target_module.gate.aux_loss_cp_group is not None:
-        raise ValueError("Xing4 MoE CP group is already configured")
     target_module.gate.aux_loss_cp_group = cp_mesh.get_group()
     return []
 
 
 def _cp_mesh(context: Mapping[str, Any]) -> Any:
     """Resolve the same mesh used by TextParallelBatch's contiguous CP sharder."""
-    mesh = getattr(context.get("mesh_context"), "cp_mesh", None)
-    if mesh is None or mesh.size() <= 1 or mesh.get_group() is None:
-        raise ValueError("Xing4 sequence methods require an active CP mesh")
+    mesh = context["mesh_context"].cp_mesh
+    if mesh.get_group() is None:
+        raise ValueError("Xing4 sequence reductions require an explicit CP group")
     return mesh
 
 

@@ -47,14 +47,6 @@ class Xing4MuonLayout:
     moe_intermediate_size: int
     n_shared_experts: int = 0
 
-    def __post_init__(self) -> None:
-        """Validate matrix dimensions before constructing the optimizer."""
-        for item in fields(self):
-            value = getattr(self, item.name)
-            minimum = 0 if item.name == "n_shared_experts" else 1
-            if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
-                raise ValueError(f"Xing4 Muon layout requires integer {item.name} >= {minimum}")
-
     @classmethod
     def from_config(cls, config: Any) -> "Xing4MuonLayout":
         """Read logical-matrix dimensions from a model configuration.
@@ -63,9 +55,9 @@ class Xing4MuonLayout:
             config: Configuration containing MLA and expert dimensions.
 
         Returns:
-            A validated matrix layout.
+            The logical matrix layout.
         """
-        return cls(**{item.name: getattr(config, item.name, item.default) for item in fields(cls)})
+        return cls(**{item.name: getattr(config, item.name) for item in fields(cls) if hasattr(config, item.name)})
 
     @staticmethod
     def _check_shape(name: str, tensor: torch.Tensor, shape: tuple[int, ...]) -> None:
@@ -94,8 +86,6 @@ class Xing4MuonLayout:
             Matrix views for independent Muon updates.
         """
         if name.endswith(".mlp.experts.gate_up_proj"):
-            if tensor.shape[0] == 0:
-                raise ValueError(f"Xing4 Muon requires a nonempty expert batch for {name}")
             self._check_shape(name, tensor, (tensor.shape[0], self.hidden_size, 2 * self.moe_intermediate_size))
             return list(tensor.split(self.moe_intermediate_size, dim=-1))
         rows = self._row_sections.get(".".join(name.split(".")[-3:]))

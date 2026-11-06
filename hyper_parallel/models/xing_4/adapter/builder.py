@@ -16,21 +16,21 @@
 
 from __future__ import annotations
 
-import math
 from typing import Any
 
 from transformers import PreTrainedModel
 
+from hyper_parallel.components.modules.swiglu_mlp import SwiGLUMLP
 from hyper_parallel.models import HyperAutoModelForCausalLM
-from hyper_parallel.models.xing_4.adapter.conversion.module_replacement import Xing4FusedHyperConnection
+from hyper_parallel.models.xing_4.adapter.training import swiglu_policy
 from hyper_parallel.models.xing_4.transformer.configuration_xing4_0 import Xing4_0Config
-from hyper_parallel.models.xing_4.transformer.modeling_xing4_0 import Xing4_0HyperConnection
+from hyper_parallel.models.xing_4.transformer.modeling_xing4_0 import Xing4_0MLP
 
 __all__ = ["build_model", "create_config"]
 
 
 def create_config(config: dict[str, Any]) -> Xing4_0Config:
-    """Accept HF configuration fields and equivalent training aliases.
+    """Map training aliases to HF fields, preferring an explicit HF value.
 
     Args:
         config: Model fields supplied by the training recipe.
@@ -39,68 +39,22 @@ def create_config(config: dict[str, Any]) -> Xing4_0Config:
         The bundled HF configuration carrying HP training options.
     """
     values = dict(config)
-    for training_name, hf_name in (
-            ("num_residual_streams", "hc_mult"),
-            ("mhc_sinkhorn_iterations", "hc_sinkhorn_iters")):
-        if training_name not in values:
-            continue
-        value = values.pop(training_name)
-        if hf_name in values and values[hf_name] != value:
-            raise ValueError(f"Conflicting {training_name} and {hf_name}")
-        values[hf_name] = value
-    jitter = values.get("router_jitter_noise", values.get("moe_input_jitter_eps", 0.0))
-    if "moe_input_jitter_eps" in values and values["moe_input_jitter_eps"] != jitter:
-        raise ValueError("Conflicting router_jitter_noise and moe_input_jitter_eps")
-    if not math.isfinite(jitter) or jitter < 0:
-        raise ValueError("Router jitter must be finite and nonnegative")
-    values["moe_input_jitter_eps"] = jitter
-    if values.get("moe_n_hash_layers", 0) or values.get("moe_router_force_expert_balance", False):
-        raise ValueError("Xing4 uses the official learned top-k router")
-    values["architectures"] = ["Xing4ForCausalLM"]
-    limit = values.get("swiglu_limit")
-    if limit is not None and (not math.isfinite(limit) or limit <= 0):
-        raise ValueError("swiglu_limit must be finite and positive, or None")
-    if values.get("swiglu_compute_dtype") not in (None, "float32", "float16", "bfloat16"):
-        raise ValueError("swiglu_compute_dtype must be a floating-point dtype name, or None")
-    # The bundled inference config defaults to clamped Sinkhorn. This training
-    # contract uses the shared unclamped mHC operators; reject a semantic mismatch.
-    clamp = values.pop("hc_sinkhorn_clamp", None)
-    if clamp is not None or values.get("mhc_h_res_clamp_min") is not None \
-            or values.get("mhc_h_res_clamp_max") is not None:
-        raise ValueError("Xing4 training currently requires mHC clamp disabled")
-    values["mhc_h_res_clamp_min"] = values["mhc_h_res_clamp_max"] = None
-    result = Xing4_0Config(**values)
-    if not hasattr(result, "attention_softmax_scale"):
-        result.attention_softmax_scale = None
-    if not getattr(result, "use_fused_mhc", True):
-        raise ValueError("The Xing4 training adapter uses fused mHC on NPU")
-    required = ["mhc_init_gating_factor", "mhc_layernorm_epsilon"]
-    if result.num_nextn_predict_layers:
-        required.append("mtp_loss_factor")
-    has_moe = result.n_routed_experts is not None and (
-        result.num_hidden_layers + result.num_nextn_predict_layers > result.first_k_dense_replace
-    )
-    if has_moe:
-        required.extend(("moe_aux_loss_coeff", "moe_router_bias_update_rate",
-                         "moe_router_enable_expert_bias", "use_pad_tokens"))
-    missing = [name for name in required if getattr(result, name, None) is None]
-    if missing:
-        raise ValueError(f"Xing4 training configuration requires: {', '.join(missing)}")
-    for name in required:
-        value = getattr(result, name)
-        if name in ("moe_router_enable_expert_bias", "use_pad_tokens"):
-            if not isinstance(value, bool):
-                raise ValueError(f"{name} must be a bool")
-        elif isinstance(value, bool) or not isinstance(value, (int, float)) \
-                or not math.isfinite(value):
-            raise ValueError(f"{name} must be finite")
-        elif value < 0 and name != "mhc_init_gating_factor":
-            raise ValueError(f"{name} must be nonnegative")
-    if result.mhc_layernorm_epsilon == 0:
-        raise ValueError("mhc_layernorm_epsilon must be positive")
-    if result.use_cache:
-        raise ValueError("The training recipe must explicitly disable the KV cache")
-    return result
+    for alias, field in (("num_residual_streams", "hc_mult"), ("mhc_sinkhorn_iterations", "hc_sinkhorn_iters"),
+                         ("router_jitter_noise", "moe_input_jitter_eps")):
+        if alias in values:
+            values.setdefault(field, values.pop(alias))
+    values.setdefault("moe_input_jitter_eps", 0.0)
+    values.setdefault("attention_softmax_scale", None)
+    values.setdefault("use_cache", False)
+    if values.get("moe_n_hash_layers") or values.get("moe_router_force_expert_balance"):
+        raise ValueError("Xing4 uses the official learned router")
+    if (not values.get("use_fused_mhc", True) or values.get("enable_cmhc") or values.get("enable_hc_head")
+            or not values.get("mtp_enable_hyper_connections", True)):
+        raise ValueError("Xing4 training requires fused mHC with mean stream collapse")
+    if any(values.get(key) is not None for key in ("hc_sinkhorn_clamp", "mhc_h_res_clamp_min", "mhc_h_res_clamp_max")):
+        raise ValueError("Xing4 fused mHC requires clamp disabled")
+    values.update(architectures=["Xing4ForCausalLM"], mhc_h_res_clamp_min=None, mhc_h_res_clamp_max=None)
+    return Xing4_0Config(**values)
 
 
 def build_model(*, config: dict[str, Any], **options: Any) -> PreTrainedModel:
@@ -115,7 +69,13 @@ def build_model(*, config: dict[str, Any], **options: Any) -> PreTrainedModel:
     """
     resolved = create_config(config)
     model = HyperAutoModelForCausalLM.from_config(resolved, **options)
-    for name, module in model.named_modules():
-        if isinstance(module, Xing4_0HyperConnection) and not isinstance(module, Xing4FusedHyperConnection):
-            raise ValueError(f"Xing4 training requires a Xing4FusedHyperConnection plan override for {name}")
+    policy = swiglu_policy(resolved)
+    if policy != (None, None):
+        for name, module in model.named_modules():
+            if not isinstance(module, (Xing4_0MLP, SwiGLUMLP)):
+                continue
+            applied = (getattr(module, "activation_clamp_value", None),
+                       getattr(module, "activation_compute_dtype", None))
+            if isinstance(module, Xing4_0MLP) or applied != policy:
+                raise ValueError(f"The SwiGLU plan for {name} must preserve the configured clamp and compute dtype")
     return model
