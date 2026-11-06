@@ -26,7 +26,9 @@ import torch
 
 from hyper_parallel.core.multicore._loader import get_routed_experts_paths
 from hyper_parallel.core.multicore.modules.routed_experts.descriptor import RouteDescriptor, RouteEdge
-from hyper_parallel.core.multicore.modules.routed_experts.readiness import ExpertReadiness, upload_metadata
+from hyper_parallel.core.multicore.modules.routed_experts.readiness import (
+    ExpertReadiness, upload_metadata, upload_metadata_batch,
+)
 from hyper_parallel.core.multicore.modules.routed_experts.workspace import RingWorkspace
 
 
@@ -205,8 +207,7 @@ def _prepare(source: torch.Tensor, route: RouteDescriptor, workspace: RingWorksp
     if cached is None or cached[4] is not route:
         send, receive, offsets = compile_transport_metadata(route, workspace, reverse)
         ranges = tuple(tuple(row[:4]) for row in offsets.tolist())
-        send = upload_metadata(send, source.device)
-        receive = upload_metadata(receive, source.device)
+        send, receive = upload_metadata_batch((send, receive), source.device)
         initialized = torch.npu.Event()
         initialized.record(current)
         workspace.metadata[cache_key] = send, receive, ranges, initialized, route
@@ -281,40 +282,51 @@ class PreparedExchange:
 
 
 def _task_readiness_metadata(route: RouteDescriptor, block_rows: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compile each tile's last intersecting block ordinal for every source peer."""
-    experts = {expert: index for index, expert in enumerate(route.active_experts)}
-    expected = np.zeros((route.ranks, len(experts)), dtype=np.int32)
-    starts = (0, *route.boundaries[:-1])
-    tile_counts = [(end - begin + 127) // 128 for begin, end in zip(starts, route.boundaries)]
-    tile_offsets = np.cumsum((0, *tile_counts[:-1]))
-    task_expected = np.zeros((route.ranks, sum(tile_counts)), dtype=np.int32)
-    # Each peer's receiver consumes its blocks in stable edge order. A tile can
-    # read after the last intersecting block for that peer has published its count.
-    for peer in range(route.ranks):
-        for edge in route.incoming:
-            if edge.source != peer:
-                continue
-            slot = experts[edge.expert]
-            first = starts[slot]
-            for block in edge.blocks(block_rows):
-                expected[peer, slot] += 1
-                first_tile = tile_offsets[slot] + (block.target_row - first) // 128
-                last_tile = tile_offsets[slot] + (block.target_row + block.rows - 1 - first) // 128
-                task_expected[peer, first_tile:last_tile + 1] = expected[peer, slot]
+    """Compile last-block readiness per peer and compute tile on CPU arrays.
+
+    A tile crossing two blocks needs the later block's ordinal. Ordinals are
+    local to a peer/expert pair and follow stable edge order, even when edges
+    for that expert are interleaved with another expert's edges.
+    """
+    experts = len(route.active_experts)
+    starts = np.asarray((0, *route.boundaries[:-1]), dtype=np.int64)
+    lengths = np.diff(np.asarray((0, *route.boundaries), dtype=np.int64))
+    tile_counts = (lengths + 127) // 128
+    tile_offsets = np.cumsum(tile_counts) - tile_counts
+    task_expected = np.zeros((route.ranks, int(tile_counts.sum())), dtype=np.int32)
+    if not route.incoming:
+        if task_expected.size:
+            raise ValueError("incoming blocks do not cover every forward compute tile")
+        return torch.from_numpy(np.zeros((route.ranks, experts), dtype=np.int32)), torch.from_numpy(task_expected)
+    blocks, _, _ = _pack_blocks(route.incoming, route.ranks, block_rows, 0)
+    packed = blocks.numpy()
+    peers = packed[:, 0]
+    slots = np.searchsorted(np.asarray(route.active_experts, dtype=np.int64), packed[:, 2])
+    keys = peers * experts + slots
+    counts = np.bincount(keys, minlength=route.ranks * experts)
+    permutation = np.argsort(keys, kind="stable")
+    ordinal = np.empty(len(keys), dtype=np.int32)
+    ordinal[permutation] = np.arange(len(keys)) - np.repeat(counts.cumsum() - counts, counts) + 1
+    first = tile_offsets[slots] + (packed[:, 4] - starts[slots]) // 128
+    last = tile_offsets[slots] + (packed[:, 4] + packed[:, 5] - 1 - starts[slots]) // 128
+    touches = last - first + 1
+    owner = np.repeat(np.arange(len(keys)), touches)
+    tiles = np.repeat(first, touches) + np.arange(len(owner)) - np.repeat(touches.cumsum() - touches, touches)
+    np.maximum.at(task_expected, (peers[owner], tiles), ordinal[owner])
     if task_expected.size and not np.all(task_expected.sum(axis=0) > 0):
         raise ValueError("incoming blocks do not cover every forward compute tile")
-    return torch.from_numpy(expected), torch.from_numpy(task_expected)
+    return torch.from_numpy(counts.astype(np.int32).reshape(route.ranks, experts)), torch.from_numpy(task_expected)
 
 
 def _create_readiness_metadata(route: RouteDescriptor, workspace: RingWorkspace,
                                publish: bool, publish_each_block: bool, current: Any) -> tuple:
-    """Initialize one immutable readiness template in the original upload order."""
+    """Build and upload the immutable readiness template before admitting consumers."""
     experts = {expert: index for index, expert in enumerate(route.active_experts)}
     count = 1 + max((edge.expert for edge in (*route.incoming, *route.outgoing)), default=-1)
     slots = np.full((count,), -1, dtype=np.int64)
     for expert, index in experts.items():
         slots[expert] = index
-    slots = upload_metadata(torch.from_numpy(slots), workspace.device)
+    slots = torch.from_numpy(slots)
     if publish_each_block:
         expected, task_expected = _task_readiness_metadata(route, workspace.spec.block_rows)
     else:
@@ -323,8 +335,13 @@ def _create_readiness_metadata(route: RouteDescriptor, workspace: RingWorkspace,
             counts[edge.source, experts[edge.expert]] += (
                 edge.rows + workspace.spec.block_rows - 1) // workspace.spec.block_rows
         expected, task_expected = torch.from_numpy(counts), None
-    target = upload_metadata(expected, workspace.device) if publish else None
-    task_target = upload_metadata(task_expected, workspace.device) if publish and task_expected is not None else None
+    host_values = (slots,) + ((expected,) if publish else ())
+    if publish and task_expected is not None:
+        host_values += (task_expected,)
+    uploaded = upload_metadata_batch(host_values, workspace.device)
+    slots = uploaded[0]
+    target = uploaded[1] if publish else None
+    task_target = uploaded[2] if publish and task_expected is not None else None
     initialized = torch.npu.Event()
     initialized.record(current)
     workspace.metadata[(route, "readiness")] = slots, expected, initialized, target, task_expected, task_target

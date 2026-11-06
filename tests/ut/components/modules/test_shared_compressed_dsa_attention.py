@@ -189,6 +189,42 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
                 with self.assertRaisesRegex(NotImplementedError, "candidate-pool"):
                     module.indexer._select_indices(self.query, self.key, self.weights, None, 0, None, None, None)
 
+    def test_candidate_key_selection_preserves_batch_offsets_padding_and_causality(self):
+        """Feature: Shared compressed attention candidate selection.
+        Description: Compare both candidate branches with an increasing-key oracle.
+        Expectation: Batch offsets, padding and causal visibility preserve exact IDs.
+        """
+        query = torch.ones(2, 7, 2, 4)
+        key = torch.arange(72, dtype=torch.float32).reshape(2, 4, 9).transpose(1, 2)
+        weights = torch.ones(2, 7, 2)
+        minimum = torch.tensor([[0, 1, 0, 1, 0, 1, 0], [1, 0, 1, 0, 1, 0, 1]])
+        blocks = torch.tensor([[[-1, 0, 2], [0, 0, 3], [1, 2, 4], [0, 1, -1],
+                                [2, 1, 0], [3, 4, 0], [1, 2, 3]],
+                               [[0, 1, 3], [-1, 0, 1], [2, 1, 0], [0, 0, -1],
+                                [4, 3, 1], [1, 2, 0], [2, 3, 4]]])
+        kwargs = {"compress_ratio": 2, "sparse_count": 5, "query_offset": 3,
+                  "query_chunk_size": 3, "minimum_key_indices": minimum}
+        full, _ = attention.compressed_causal_topk_and_candidates(
+            query, key, weights, topk_blocks=2, block_size=2, **kwargs)
+        candidate = attention.compressed_candidate_topk(
+            query, key, weights, blocks, block_size=2, **kwargs)
+        expected_full, expected_candidate = [], []
+        for batch in range(2):
+            full_rows, candidate_rows = [], []
+            for row in range(7):
+                visible = (3 + row + 1) // 2
+                lower = int(minimum[batch, row])
+                choices = [position for block in blocks[batch, row].tolist() if block >= 0
+                           for position in (2 * block, 2 * block + 1) if lower <= position < min(9, visible)]
+                for values, target in ((list(range(lower, min(9, visible))), full_rows),
+                                       (choices, candidate_rows)):
+                    selected = sorted(values)[-5:]
+                    target.append(selected + [-1] * (5 - len(selected)))
+            expected_full.append(full_rows)
+            expected_candidate.append(candidate_rows)
+        torch.testing.assert_close(full, torch.tensor(expected_full, dtype=torch.int32), rtol=0, atol=0)
+        torch.testing.assert_close(candidate, torch.tensor(expected_candidate, dtype=torch.int32), rtol=0, atol=0)
+
     def test_zero_loss_does_not_require_an_unused_kernel(self):
         """A zero objective is not an attempted fused calculation."""
         query = self.query.clone().requires_grad_()

@@ -13,6 +13,7 @@
 #include "lib/matmul_intf.h"
 #include "acl/acl.h"
 #include "transport.h"
+#include "progress.h"
 
 using namespace AscendC;
 inline __gm__ struct OpSystemRunCfg g_opSystemRunCfg {0};
@@ -49,7 +50,7 @@ __aicore__ inline bool ExpertReady(GM_ADDR ready, GM_ADDR expected, int32_t prod
   auto *cells = reinterpret_cast<__gm__ int32_t *>(ready);
   for (int32_t producer = 0; producer < producers; ++producer) {
     const int64_t index = static_cast<int64_t>(producer) * experts + expert;
-    const int32_t count = counts[index];
+    int32_t count = counts[index];
     if (count < 0) {
       Trap();
     }
@@ -58,6 +59,9 @@ __aicore__ inline bool ExpertReady(GM_ADDR ready, GM_ADDR expected, int32_t prod
     }
     auto *cell = cells + index * kReadyCellElements;
     FlushReadyCell(cell);
+    if (cell[routed::kProgressMode] == 1) {
+      count = cell[routed::kProgressTaskCount];
+    }
     const int32_t value = *reinterpret_cast<__gm__ volatile int32_t *>(cell);
     if (value < 0) {
       Trap();
@@ -68,18 +72,6 @@ __aicore__ inline bool ExpertReady(GM_ADDR ready, GM_ADDR expected, int32_t prod
   }
   PipeBarrier<PIPE_ALL>();
   return true;
-}
-
-__aicore__ inline void PublishExpert(GM_ADDR ready, int32_t experts, int32_t expert) {
-  if (ready == nullptr || expert < 0) {
-    return;
-  }
-  // Fixpipe writes must complete before the scalar completion flag becomes visible.
-  PipeBarrier<PIPE_ALL>();
-  auto *cell = reinterpret_cast<__gm__ int32_t *>(ready) +
-    (static_cast<int64_t>(GetBlockIdx()) * experts + expert) * kReadyCellElements;
-  *reinterpret_cast<__gm__ volatile int32_t *>(cell) = 1;
-  FlushReadyCell(cell);
 }
 
 template <bool TransposeB, typename MatrixMultiply>
@@ -137,10 +129,13 @@ __aicore__ inline void RunReadyTasks(MatrixMultiply &mm, GM_ADDR input, GM_ADDR 
         continue;
       }
       const int64_t end = ranges[expert * 2 + 1];
+      routed::TaskProgressPublisher publisher;
+      publisher.Init(output_ready, active_experts, expert);
       for (int64_t index = first; index < end; index += GetBlockNum()) {
         ComputeTask<TransposeB>(mm, input, output, pointers, descriptors + index * 5, n, k);
+        publisher.Publish(index);
       }
-      PublishExpert(output_ready, active_experts, expert);
+      publisher.Finish();
       ranges[expert * 2] = -1;
       --remaining;
       advanced = true;
@@ -180,6 +175,7 @@ __global__ __aicore__ void GemmKernel(GM_ADDR input, GM_ADDR weights, GM_ADDR ta
   }
   const bool readiness_enabled = input_ready != nullptr || output_ready != nullptr;
   int32_t current_expert = -1;
+  routed::TaskProgressPublisher publisher;
   for (int32_t index = GetBlockIdx(); index < task_count; index += GetBlockNum()) {
     // [weight reference, first input row, rows, first output column, columns]
     const auto *task = descriptors + static_cast<int64_t>(index) * 5;
@@ -189,13 +185,15 @@ __global__ __aicore__ void GemmKernel(GM_ADDR input, GM_ADDR weights, GM_ADDR ta
       }
       const int32_t expert = static_cast<int32_t>(task[0]);
       if (expert != current_expert) {
-        PublishExpert(output_ready, active_experts, current_expert);
+        publisher.Finish();
+        publisher.Init(output_ready, active_experts, expert);
         current_expert = expert;
       }
     }
     ComputeTask<TransposeB>(mm, input, output, pointers, task, n, k);
+    publisher.Publish(index);
   }
-  PublishExpert(output_ready, active_experts, current_expert);
+  publisher.Finish();
   mm.End();
 }
 

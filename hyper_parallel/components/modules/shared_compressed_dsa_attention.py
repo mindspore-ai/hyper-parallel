@@ -758,7 +758,24 @@ def compressed_causal_topk_and_candidates(
         reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None = None,
         minimum_key_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Select Full-layer Top-K and candidate blocks from one score pass."""
+    """Select Full-layer Top-K and candidate blocks from one score pass.
+
+    Args:
+        query: Query vectors shaped [batch, sequence, heads, head_dim].
+        key: Compressed keys shaped [batch, compressed_sequence, head_dim].
+        merge_weight: Per-query head weights shaped [batch, sequence, heads].
+        compress_ratio: Number of raw tokens represented by each compressed key.
+        sparse_count: Maximum number of selected compressed keys per query.
+        topk_blocks: Maximum number of candidate blocks per query.
+        block_size: Number of compressed keys in each candidate block.
+        query_offset: Absolute raw-token position of the first query.
+        query_chunk_size: Number of queries scored in one temporary allocation.
+        reduce_sum: Optional reduction of scores across head shards.
+        minimum_key_indices: Optional lower bound for each query's visible keys.
+
+    Returns:
+        Sorted compressed-key indices and candidate-block indices, padded with -1.
+    """
     if compress_ratio <= 0:
         raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
     if query_chunk_size <= 0:
@@ -805,7 +822,7 @@ def compressed_causal_topk_and_candidates(
             scores.masked_fill_(key_positions < minimum, float("-inf"))
         top = scores.topk(top_k, dim=-1, sorted=False)
         indices = top.indices.masked_fill(~torch.isfinite(top.values), compressed_length)
-        indices = indices.sort(dim=-1).values
+        indices = sort_key_indices(indices, compressed_length)
         selected_chunks.append(indices.masked_fill(indices == compressed_length, -1).to(torch.int32))
         candidate_chunks.append(
             select_candidate_block_indices(
@@ -832,7 +849,24 @@ def compressed_candidate_topk(
         reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None = None,
         minimum_key_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Score only hierarchical candidate blocks and return global key ids."""
+    """Score only hierarchical candidate blocks and return global key ids.
+
+    Args:
+        query: Query vectors shaped [batch, sequence, heads, head_dim].
+        key: Compressed keys shaped [batch, compressed_sequence, head_dim].
+        merge_weight: Per-query head weights shaped [batch, sequence, heads].
+        candidate_blocks: Candidate block IDs for each query, with -1 padding.
+        compress_ratio: Number of raw tokens represented by each compressed key.
+        sparse_count: Maximum number of selected compressed keys per query.
+        block_size: Number of compressed keys in each candidate block.
+        query_offset: Absolute raw-token position of the first query.
+        query_chunk_size: Number of queries scored in one temporary allocation.
+        reduce_sum: Optional reduction of scores across head shards.
+        minimum_key_indices: Optional lower bound for each query's visible keys.
+
+    Returns:
+        Sorted global compressed-key indices, padded with -1 for missing keys.
+    """
     if compress_ratio <= 0:
         raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
     if block_size <= 0:
@@ -869,7 +903,6 @@ def compressed_candidate_topk(
         )
 
     block_offsets = torch.arange(block_size, device=query.device)
-    batch_indices = torch.arange(batch_size, device=query.device).view(-1, 1, 1)
     selected_chunks = []
     for start in range(0, sequence_length, query_chunk_size):
         end = min(start + query_chunk_size, sequence_length)
@@ -884,7 +917,7 @@ def compressed_candidate_topk(
         if minimum_key_indices is not None:
             valid = valid & (positions >= minimum_key_indices[:, start:end].unsqueeze(-1))
         safe_positions = positions.clamp(min=0, max=max(compressed_length - 1, 0))
-        selected_key = key[batch_indices, safe_positions].float()
+        selected_key = gather_selected_keys(key, safe_positions).float()
         dots = torch.einsum(
             "bchd,bckd->bchk",
             query[:, start:end].float(),
@@ -897,7 +930,7 @@ def compressed_candidate_topk(
         top = scores.topk(top_k, dim=-1, sorted=False)
         selected = positions.gather(-1, top.indices)
         selected.masked_fill_(~torch.isfinite(top.values), compressed_length)
-        selected = selected.sort(dim=-1).values
+        selected = sort_key_indices(selected, compressed_length)
         selected.masked_fill_(selected == compressed_length, -1)
         selected_chunks.append(selected.to(torch.int32))
     return torch.cat(selected_chunks, dim=1)

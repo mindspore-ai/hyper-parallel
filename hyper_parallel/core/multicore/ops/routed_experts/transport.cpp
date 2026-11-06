@@ -14,6 +14,7 @@
 #include "data_plane/mte_rma.h"
 #include "data_plane/sync.h"
 #include "transport.h"
+#include "progress.h"
 
 using namespace AscendC;
 namespace communication = hyper_parallel::multicore::shmem::data_plane;
@@ -106,6 +107,25 @@ class TransportWorker {
       reduce_value_ = reduce_value_buffer_.Get<float>();
       reduce_sum_ = reduce_sum_buffer_.Get<float>();
     }
+    // Geometry is immutable for a phase. Snapshot it once, then invalidate only
+    // counters belonging to the current payload block. The cache also remembers
+    // producers already observed to have completed their entire expert range.
+    const int64_t geometry_bytes = static_cast<int64_t>(producers_) * active_experts_ * kSignalStride * sizeof(int32_t);
+    if (input_ready_ != nullptr && send_worker_ && geometry_bytes > 0 && geometry_bytes <= kGeometryBytes) {
+      pipe_.InitBuffer(geometry_buffer_, static_cast<uint32_t>(geometry_bytes));
+      geometry_local_ = geometry_buffer_.Get<int32_t>();
+      geometry_ptr_ = reinterpret_cast<__ubuf__ int32_t *>(geometry_local_.GetPhyAddr());
+      GlobalTensor<int32_t> source;
+      source.SetGlobalBuffer(input_ready_, geometry_bytes / sizeof(int32_t));
+      const DataCopyExtParams copy{1, static_cast<uint32_t>(geometry_bytes), 0, 0, 0};
+      const DataCopyPadExtParams<int32_t> pad{false, 0, 0, 0};
+      DataCopyPad(geometry_local_, source, copy, pad);
+      SetFlag<HardEvent::MTE2_S>(EVENT_ID2);
+      WaitFlag<HardEvent::MTE2_S>(EVENT_ID2);
+      for (int32_t index = 0; index < producers_ * active_experts_; ++index) {
+        geometry_ptr_[index * kSignalStride] = 0;
+      }
+    }
     // The two per-peer tables fit in UB for the common 4K/8K token extent.
     // Larger extents retain the GM fallback for the predecessor table.
     if (compressed_sender && dedup_state_ != nullptr && input_rows_ <= kLocalTokenCapacity) {
@@ -150,6 +170,7 @@ class TransportWorker {
  private:
   static constexpr uint32_t kScratchBytes = 65536;
   static constexpr uint32_t kSignalStride = 16;
+  static constexpr uint32_t kGeometryBytes = 8192;
   static constexpr uint32_t kReduceElements = 4096;
   static constexpr uint32_t kTokenStride = 8;
   static constexpr int64_t kLocalTokenCapacity = 16384;
@@ -408,17 +429,51 @@ class TransportWorker {
     if (slot == admitted_input_slot_) {
       return true;
     }
-    for (int32_t producer = 0; producer < producers_; ++producer) {
+    bool whole_expert = true;
+    // Spread simultaneous peer probes across producer cache lines. Starting
+    // every sender at producer zero makes polling contend with its completion
+    // store and can slow down the GEMM that these senders are waiting for.
+    for (int32_t checked = 0, producer = peer_ % producers_; checked < producers_;
+         ++checked, producer = producer + 1 == producers_ ? 0 : producer + 1) {
       const int64_t index = static_cast<int64_t>(producer) * active_experts_ + slot;
-      const int32_t expected = input_expected_[index];
+      auto *geometry = geometry_ptr_ == nullptr ? nullptr : geometry_ptr_ + index * kSignalStride;
+      if (geometry != nullptr && geometry[0] != 0) {
+        continue;
+      }
+      int32_t expected = input_expected_[index];
       if (expected < 0) {
         Trap();
       }
       if (expected == 0) {
+        if (geometry != nullptr) {
+          geometry[0] = 1;
+        }
         continue;
       }
       auto *cell = input_ready_ + index * kSignalStride;
-      RefreshLocalFlag(cell);
+      bool task_progress;
+      int32_t total = expected;
+      if (geometry != nullptr) {
+        task_progress = geometry[routed::kProgressMode] == 1;
+        if (task_progress) {
+          expected = routed::RequiredTaskProgress(geometry, edge[3], edge[3] + edge[5] - 1);
+          total = geometry[routed::kProgressTaskCount];
+        }
+      } else {
+        RefreshLocalFlag(cell);
+        task_progress = cell[routed::kProgressMode] == 1;
+        if (task_progress) {
+          expected = routed::RequiredTaskProgress(cell, edge[3], edge[3] + edge[5] - 1);
+          total = cell[routed::kProgressTaskCount];
+        }
+      }
+      if (expected == 0) {
+        whole_expert = false;
+        continue;
+      }
+      if (geometry != nullptr) {
+        RefreshLocalFlag(cell);
+      }
       const int32_t observed = *reinterpret_cast<__gm__ volatile int32_t *>(cell);
       if (observed < 0) {
         Trap();
@@ -427,11 +482,18 @@ class TransportWorker {
       if (observed < expected) {
         return false;
       }
+      if (observed < total) {
+        whole_expert = false;
+      } else if (geometry != nullptr) {
+        geometry[0] = 1;
+      }
     }
     PipeBarrier<PIPE_ALL>();
     // A phase's readiness counters only advance. Repeated blocks of an already
     // admitted expert do not need to invalidate every producer cache line again.
-    admitted_input_slot_ = slot;
+    if (whole_expert) {
+      admitted_input_slot_ = slot;
+    }
     return true;
   }
 
@@ -548,12 +610,20 @@ class TransportWorker {
       auto local = scratch_[slot * kScratchBytes];
       const int64_t row = static_cast<int64_t>(chunk) * batch_rows;
       const int32_t count = static_cast<int32_t>(rows - row < batch_rows ? rows - row : batch_rows);
-      for (int32_t index = 0; index < count; ++index) {
+      for (int32_t index = 0; index < count;) {
+        const int64_t source_row = SourceRow(first + row + index);
+        int32_t run = 1;
+        // Stable expert routing often preserves adjacent token rows; merge their DMA submissions.
+        while (index + run < count && SourceRow(first + row + index + run) == source_row + run) {
+          ++run;
+        }
+        const uint32_t bytes = static_cast<uint32_t>(run * row_bytes_);
         GlobalTensor<uint8_t> source;
-        source.SetGlobalBuffer(input_ + SourceRow(first + row + index) * row_bytes_, row_bytes_);
-        DataCopyExtParams copy{1, static_cast<uint32_t>(row_bytes_), 0, 0, 0};
+        source.SetGlobalBuffer(input_ + source_row * row_bytes_, bytes);
+        DataCopyExtParams copy{1, bytes, 0, 0, 0};
         DataCopyPadExtParams<uint8_t> pad{false, 0, 0, 0};
         DataCopyPad(local[index * row_bytes_], source, copy, pad);
+        index += run;
       }
       SetFlag<HardEvent::MTE2_MTE3>(slot);
       WaitFlag<HardEvent::MTE2_MTE3>(slot);
@@ -1061,13 +1131,16 @@ class TransportWorker {
   TPipe pipe_;
   TBuf<TPosition::VECOUT> buffer_;
   TBuf<TPosition::VECOUT> header_buffer_;
+  TBuf<TPosition::VECIN> geometry_buffer_;
   TBuf<TPosition::VECCALC> seen_buffer_, last_buffer_;
   TBuf<TPosition::VECIN> reduce_input_buffer_;
   TBuf<TPosition::VECCALC> reduce_value_buffer_, reduce_sum_buffer_;
   LocalTensor<uint8_t> scratch_;
   LocalTensor<int64_t> header_local_;
+  LocalTensor<int32_t> geometry_local_;
   LocalTensor<int32_t> seen_local_, last_local_;
   __ubuf__ int64_t *header_ptr_ = nullptr;
+  __ubuf__ int32_t *geometry_ptr_ = nullptr;
   __ubuf__ int32_t *seen_ptr_ = nullptr, *last_ptr_ = nullptr;
   LocalTensor<bfloat16_t> reduce_input_;
   LocalTensor<float> reduce_value_, reduce_sum_;

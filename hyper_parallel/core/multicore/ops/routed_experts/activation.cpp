@@ -36,25 +36,27 @@ class ActivationWorker {
     tiles_ = (inner + kColumns - 1) / kColumns;
     limit_ = limit;
     backward_ = gradient != nullptr;
-    pipe_.InitBuffer(gate_buffer_, kColumns * sizeof(bfloat16_t));
-    pipe_.InitBuffer(up_buffer_, kColumns * sizeof(bfloat16_t));
-    pipe_.InitBuffer(gradient_buffer_, kColumns * sizeof(bfloat16_t));
-    pipe_.InitBuffer(result_buffer_, kColumns * sizeof(bfloat16_t));
-    pipe_.InitBuffer(gate_float_buffer_, kColumns * sizeof(float));
-    pipe_.InitBuffer(up_float_buffer_, kColumns * sizeof(float));
-    pipe_.InitBuffer(derivative_buffer_, kColumns * sizeof(float));
-    pipe_.InitBuffer(sigmoid_buffer_, kColumns * sizeof(float));
-    pipe_.InitBuffer(work_buffer_, kColumns * sizeof(float));
-    pipe_.InitBuffer(mask_buffer_, kColumns * sizeof(uint8_t));
+    pipe_.InitBuffer(gate_buffer_, kElements * sizeof(bfloat16_t));
+    pipe_.InitBuffer(up_buffer_, kElements * sizeof(bfloat16_t));
+    pipe_.InitBuffer(gradient_buffer_, kElements * sizeof(bfloat16_t));
+    pipe_.InitBuffer(result_buffer_, kElements * sizeof(bfloat16_t));
+    pipe_.InitBuffer(gate_float_buffer_, kElements * sizeof(float));
+    pipe_.InitBuffer(up_float_buffer_, kElements * sizeof(float));
+    pipe_.InitBuffer(derivative_buffer_, kElements * sizeof(float));
+    pipe_.InitBuffer(sigmoid_buffer_, kElements * sizeof(float));
+    pipe_.InitBuffer(work_buffer_, kElements * sizeof(float));
+    pipe_.InitBuffer(mask_buffer_, kElements * sizeof(uint8_t));
   }
 
   __aicore__ inline void Run() {
-    const int64_t tasks = rows_ * tiles_;
+    const int64_t tasks = (rows_ + kRows - 1) / kRows * tiles_;
     for (int64_t task = GetBlockIdx(); task < tasks; task += GetBlockNum()) {
-      const int64_t row = task / tiles_;
+      const int64_t row = task / tiles_ * kRows;
       const int32_t column = static_cast<int32_t>(task % tiles_) * kColumns;
-      const uint32_t count = inner_ - column < kColumns ? inner_ - column : kColumns;
-      Load(row, column, count);
+      const uint32_t columns = inner_ - column < kColumns ? inner_ - column : kColumns;
+      const uint16_t rows = rows_ - row < kRows ? rows_ - row : kRows;
+      const uint32_t count = rows * columns;
+      Load(row, column, columns, rows);
       if (backward_) {
         Backward(row, column, count);
       } else {
@@ -66,15 +68,22 @@ class ActivationWorker {
   }
 
  private:
+  // Batch rows to amortize DMA/event setup while retaining the same elementwise arithmetic.
+  static constexpr int32_t kRows = 24;
   static constexpr int32_t kColumns = 256;
+  static constexpr int32_t kElements = kRows * kColumns;
 
-  __aicore__ inline void Load(int64_t row, int32_t column, uint32_t count) {
-    const DataCopyExtParams copy{1, count * static_cast<uint32_t>(sizeof(bfloat16_t)), 0, 0, 0};
+  __aicore__ inline void Load(int64_t row, int32_t column, uint32_t columns, uint16_t rows) {
+    const uint32_t count = columns * rows;
+    const DataCopyExtParams copy{rows, columns * static_cast<uint32_t>(sizeof(bfloat16_t)),
+      (inner_ * 2 - columns) * static_cast<uint32_t>(sizeof(bfloat16_t)), 0, 0};
     const DataCopyPadExtParams<bfloat16_t> padding{false, 0, 0, static_cast<bfloat16_t>(0.0F)};
     DataCopyPad(gate_buffer_.Get<bfloat16_t>(), input_[row * inner_ * 2 + column], copy, padding);
     DataCopyPad(up_buffer_.Get<bfloat16_t>(), input_[row * inner_ * 2 + inner_ + column], copy, padding);
     if (backward_) {
-      DataCopyPad(gradient_buffer_.Get<bfloat16_t>(), gradient_[row * inner_ + column], copy, padding);
+      const DataCopyExtParams derivative_copy{rows, columns * static_cast<uint32_t>(sizeof(bfloat16_t)),
+        (inner_ - columns) * static_cast<uint32_t>(sizeof(bfloat16_t)), 0, 0};
+      DataCopyPad(gradient_buffer_.Get<bfloat16_t>(), gradient_[row * inner_ + column], derivative_copy, padding);
     }
     SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
     WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
@@ -109,7 +118,10 @@ class ActivationWorker {
     Cast(result, work_buffer_.Get<float>(), RoundMode::CAST_RINT, count);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
     WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-    const DataCopyExtParams copy{1, count * static_cast<uint32_t>(sizeof(bfloat16_t)), 0, 0, 0};
+    const uint32_t columns = inner_ - column < kColumns ? inner_ - column : kColumns;
+    const uint16_t rows = count / columns;
+    const DataCopyExtParams copy{rows, columns * static_cast<uint32_t>(sizeof(bfloat16_t)), 0,
+      (inner_ * (backward_ ? 2 : 1) - columns) * static_cast<uint32_t>(sizeof(bfloat16_t)), 0};
     const int64_t offset = row * inner_ * (backward_ ? 2 : 1) + column + (up_branch ? inner_ : 0);
     DataCopyPad(output_[offset], result, copy);
     SetFlag<HardEvent::MTE3_V>(EVENT_ID0);

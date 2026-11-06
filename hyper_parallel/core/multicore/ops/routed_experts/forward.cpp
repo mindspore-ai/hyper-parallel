@@ -15,6 +15,7 @@
 
 #include "forward_common.h"
 #include "forward.h"
+#include "progress.h"
 #include "lib/matmul_intf.h"
 #include "acl/acl.h"
 #include <initializer_list>
@@ -74,7 +75,7 @@ __aicore__ inline bool ExpertReady(GM_ADDR ready, GM_ADDR expected, int32_t prod
   const auto *counts = reinterpret_cast<__gm__ int32_t *>(expected);
   for (int32_t producer = 0; producer < producers; ++producer) {
     const int64_t index = static_cast<int64_t>(producer) * experts + expert;
-    const int32_t expected_count = counts[static_cast<int64_t>(producer) * expected_columns +
+    int32_t expected_count = counts[static_cast<int64_t>(producer) * expected_columns +
                                           (expected_columns == experts ? expert : task)];
     if (expected_count < 0) {
       Trap();
@@ -83,6 +84,9 @@ __aicore__ inline bool ExpertReady(GM_ADDR ready, GM_ADDR expected, int32_t prod
       continue;
     }
     const int32_t actual = ReadCell(cells + index * 16);
+    if (cells[index * 16 + routed::kProgressMode] == 1) {
+      expected_count = cells[index * 16 + routed::kProgressTaskCount];
+    }
     if (actual < 0) {
       Trap();
     }
@@ -95,27 +99,39 @@ __aicore__ inline bool ExpertReady(GM_ADDR ready, GM_ADDR expected, int32_t prod
 }
 
 template <bool TransposeB, typename MatrixMultiply>
-__aicore__ inline void ComputeChunk(MatrixMultiply &mm, GM_ADDR x, GM_ADDR gate, GM_ADDR down,
-                                    GM_ADDR tasks, GM_ADDR z, GM_ADDR activation, GM_ADDR y,
-                                    GM_ADDR mailboxes, int32_t index, int32_t generation, int32_t rows, int32_t experts,
-                                    int32_t hidden, int32_t inner, int32_t tile_rows, int64_t watchdog) {
+__aicore__ inline void ComputeGate(MatrixMultiply &mm, GM_ADDR x, GM_ADDR gate, GM_ADDR tasks, GM_ADDR z,
+                                  int32_t index, int32_t rows, int32_t experts, int32_t hidden, int32_t inner,
+                                  int32_t tile_rows) {
   const auto *task = reinterpret_cast<__gm__ int64_t *>(tasks) + static_cast<int64_t>(index) * 3;
   CheckTask(task, rows, experts, tile_rows);
-  const int32_t core = GetBlockIdx();
-  auto *cells = reinterpret_cast<__gm__ int32_t *>(mailboxes);
-  auto *local_activation = reinterpret_cast<__gm__ bfloat16_t *>(activation) +
-    static_cast<int64_t>(core) * tile_rows * inner;
   const auto gate_pointer = reinterpret_cast<__gm__ int64_t *>(gate)[task[0]];
-  const auto down_pointer = reinterpret_cast<__gm__ int64_t *>(down)[task[0]];
-  if (gate_pointer <= 0 || down_pointer <= 0 || gate_pointer % 32 || down_pointer % 32) {
+  if (gate_pointer <= 0 || gate_pointer % 32) {
     Trap();
   }
   RunRole<TransposeB>(mm,
     reinterpret_cast<__gm__ bfloat16_t *>(x) + task[1] * hidden,
     reinterpret_cast<__gm__ bfloat16_t *>(gate_pointer),
     reinterpret_cast<__gm__ bfloat16_t *>(z) + task[1] * inner * 2, task[2], inner * 2, hidden);
+}
+
+__aicore__ inline void RequestActivation(GM_ADDR mailboxes, int32_t index, int32_t generation) {
+  const int32_t core = GetBlockIdx();
+  auto *cells = reinterpret_cast<__gm__ int32_t *>(mailboxes);
   *reinterpret_cast<__gm__ volatile int32_t *>(cells + core * 16 + 1) = index;
   WriteCell(cells + core * 16, generation);
+}
+
+template <bool TransposeB, typename MatrixMultiply>
+__aicore__ inline void CompleteChunk(MatrixMultiply &mm, GM_ADDR down, GM_ADDR tasks, GM_ADDR activation,
+                                    GM_ADDR y, GM_ADDR mailboxes, int32_t index, int32_t generation,
+                                    int32_t hidden, int32_t inner, int32_t tile_rows, int64_t watchdog) {
+  const auto *task = reinterpret_cast<__gm__ int64_t *>(tasks) + static_cast<int64_t>(index) * 3;
+  const int32_t core = GetBlockIdx();
+  auto *cells = reinterpret_cast<__gm__ int32_t *>(mailboxes);
+  const auto down_pointer = reinterpret_cast<__gm__ int64_t *>(down)[task[0]];
+  if (down_pointer <= 0 || down_pointer % 32) {
+    Trap();
+  }
   const auto started = GetSystemCycle();
   while (ReadCell(cells + (GetBlockNum() + core) * 16) != generation) {
     if (GetSystemCycle() - started >= static_cast<uint64_t>(watchdog)) {
@@ -123,7 +139,8 @@ __aicore__ inline void ComputeChunk(MatrixMultiply &mm, GM_ADDR x, GM_ADDR gate,
     }
   }
   PipeBarrier<PIPE_ALL>();
-  RunRole<TransposeB>(mm, local_activation,
+  RunRole<TransposeB>(mm, reinterpret_cast<__gm__ bfloat16_t *>(activation) +
+    static_cast<int64_t>(core) * tile_rows * inner,
     reinterpret_cast<__gm__ bfloat16_t *>(down_pointer),
     reinterpret_cast<__gm__ bfloat16_t *>(y) + task[1] * hidden, task[2], hidden, inner);
 }
@@ -180,25 +197,38 @@ __global__ __aicore__ void CubeKernel(GM_ADDR x, GM_ADDR gate, GM_ADDR down, GM_
       if (first[expert] < 0) {
         continue;
       }
-      if (!tile_ready && !ExpertReady(input_ready, input_expected, producers, experts, expert,
-                                      first[expert], expected_columns)) {
+      if (!ExpertReady(input_ready, input_expected, producers, experts, expert,
+                       first[expert], expected_columns)) {
         continue;
       }
-      while (first[expert] < end[expert] &&
-             (!tile_ready || ExpertReady(input_ready, input_expected, producers, experts, expert,
-                                          first[expert], expected_columns))) {
-        ComputeChunk<TransposeB>(mm, x, gate, down, tasks, z, activation, y, mailboxes, first[expert],
-                                ++generation, rows, experts, hidden, inner, tile_rows, watchdog);
+      routed::TaskProgressPublisher publisher;
+      publisher.Init(output_ready, experts, expert);
+      int32_t pending = -1;
+      do {
+        // Compute the next gate while V serves the previous chunk. Do not lend
+        // the single activation slot again until its down projection has finished.
+        ComputeGate<TransposeB>(mm, x, gate, tasks, z, first[expert], rows, experts, hidden, inner, tile_rows);
+        if (pending >= 0) {
+          CompleteChunk<TransposeB>(mm, down, tasks, activation, y, mailboxes, pending, generation,
+                                    hidden, inner, tile_rows, watchdog);
+          publisher.Publish(pending);
+        }
+        pending = first[expert];
+        RequestActivation(mailboxes, pending, ++generation);
         first[expert] += GetBlockNum();
         advanced = true;
+      } while (first[expert] < end[expert] &&
+               (!tile_ready || ExpertReady(input_ready, input_expected, producers, experts, expert,
+                                            first[expert], expected_columns)));
+      if (pending >= 0) {
+        CompleteChunk<TransposeB>(mm, down, tasks, activation, y, mailboxes, pending, generation,
+                                  hidden, inner, tile_rows, watchdog);
+        publisher.Publish(pending);
       }
       if (first[expert] < end[expert]) {
         continue;
       }
-      if (output_ready != nullptr) {
-        WriteCell(reinterpret_cast<__gm__ int32_t *>(output_ready) +
-                  (static_cast<int64_t>(core) * experts + expert) * 16, 1);
-      }
+      publisher.Finish();
       first[expert] = -1;
       --remaining;
     }

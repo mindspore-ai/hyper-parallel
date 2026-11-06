@@ -28,7 +28,9 @@ from hyper_parallel.core.multicore.modules.routed_experts.forward import Forward
 from hyper_parallel.core.multicore.modules.routed_experts.frame import (
     BackwardWork, ExpertState, ForwardWork, GradientWork, LinearWork,
 )
-from hyper_parallel.core.multicore.modules.routed_experts.readiness import ExpertReadiness, upload_metadata
+from hyper_parallel.core.multicore.modules.routed_experts.readiness import (
+    ExpertReadiness, producer_progress, upload_metadata, upload_metadata_batch,
+)
 from hyper_parallel.core.multicore.modules.routed_experts.transport import _load_native
 
 
@@ -238,21 +240,29 @@ class NativeExpertCompute:
             expected = np.zeros((cores, len(self.boundaries)), dtype=np.int32)
             expected[np.arange(host_tasks.shape[0]) % cores, host_tasks.numpy()[:, 0]] = 1
             expected = torch.from_numpy(expected)
-            tasks = upload_metadata(host_tasks, self.device)
-            config = upload_metadata(_linear_config(tile_rows, tile_cols, x.shape[1], transposed), self.device)
-            expected_device = upload_metadata(expected, self.device) if publish else None
+            host_config = _linear_config(tile_rows, tile_cols, x.shape[1], transposed)
+            if publish:
+                tasks, config, expected_device = upload_metadata_batch((host_tasks, host_config, expected), self.device)
+            else:
+                tasks, config = upload_metadata_batch((host_tasks, host_config), self.device)
+                expected_device = None
             initialized = torch.npu.Event()
             initialized.record(current)
-            metadata = tasks, config, expected, expected_device, initialized
+            progress = (producer_progress(host_tasks, self.boundaries, cores, tile_rows,
+                                          (cols + tile_cols - 1) // tile_cols) if publish else None)
+            metadata = tasks, config, expected, expected_device, progress, initialized
             self.linear_metadata[key] = metadata
-        tasks, config, expected, expected_device, initialized = metadata
+        tasks, config, expected, expected_device, progress, initialized = metadata
         current.wait_event(initialized)
         if publish and expected_device is None:
             expected_device = upload_metadata(expected, self.device)
+            progress = producer_progress(linear_tasks(self.boundaries, cols, tile_rows, tile_cols),
+                                         self.boundaries, expected.shape[0], tile_rows,
+                                         (cols + tile_cols - 1) // tile_cols)
             initialized = torch.npu.Event()
             initialized.record(current)
-            self.linear_metadata[key] = tasks, config, expected, expected_device, initialized
-        return tasks, config, expected, expected_device, initialized
+            self.linear_metadata[key] = tasks, config, expected, expected_device, progress, initialized
+        return tasks, config, expected, expected_device, progress, initialized
 
     def prepare_linear(self, x: torch.Tensor, weights: Sequence[torch.Tensor], cols: int, *,
                        publish: bool = False, output: torch.Tensor | None = None) -> LinearWork:
@@ -284,7 +294,7 @@ class NativeExpertCompute:
         if not weights:
             return LinearWork(self, x, weights, None, result, None, None,
                               self.empty_workspace, self.initialized, False, 0, None)
-        tasks, config, expected, expected_device, initialized = self._prepare_linear_metadata(
+        tasks, config, expected, expected_device, progress, initialized = self._prepare_linear_metadata(
             x, cols, transposed, publish, current)
         # Each frame binds current FSDP storage; a prior execution's addresses are invalid.
         weight_table = torch.ops.hyper_parallel.routed_experts_weight_table(weights)
@@ -295,7 +305,8 @@ class NativeExpertCompute:
         schedule_workspace = torch.empty(cores * schedule_stride, dtype=torch.uint8, device=self.device)
         if schedule_workspace.data_ptr() % 64:
             raise ValueError("linear scheduling workspace must be aligned to 64 bytes")
-        ready = (ExpertReadiness.create(expected, self.device, deferred_poll=True, expected_device=expected_device)
+        ready = (ExpertReadiness.create(expected, self.device, deferred_poll=True, expected_device=expected_device,
+                                        progress=progress)
                  if publish else None)
         if ready is None:
             initialized = torch.npu.Event()
@@ -359,9 +370,9 @@ class NativeExpertCompute:
         key = x.shape[1], dy.shape[1]
         metadata = self.gradient_metadata.get(key)
         if metadata is None:
-            tasks = upload_metadata(gradient_tasks(self.boundaries, *key), self.device)
             maximum = max(end - begin for begin, end in zip((0, *self.boundaries[:-1]), self.boundaries))
-            config = upload_metadata(_gradient_config(*key, maximum), self.device)
+            tasks, config = upload_metadata_batch(
+                (gradient_tasks(self.boundaries, *key), _gradient_config(*key, maximum)), self.device)
             initialized = torch.npu.Event()
             initialized.record(current)
             metadata = tasks, config, initialized

@@ -25,7 +25,9 @@ import numpy as np
 import torch
 
 from hyper_parallel.core.multicore.modules.routed_experts.frame import ExpertState
-from hyper_parallel.core.multicore.modules.routed_experts.readiness import ExpertReadiness, upload_metadata
+from hyper_parallel.core.multicore.modules.routed_experts.readiness import (
+    ExpertReadiness, producer_progress, upload_metadata, upload_metadata_batch,
+)
 from hyper_parallel.core.multicore.modules.routed_experts.transport import _load_native, vector_core_count
 
 
@@ -199,26 +201,43 @@ class ForwardPipeline:
         key = hidden, transposed
         if key not in self.metadata:
             host_tasks, expected = forward_tasks(self.boundaries)
-            tasks = upload_metadata(host_tasks, self.device)
-            config = upload_metadata(_forward_config(hidden, transposed), self.device) if gate else None
-            expected_device = upload_metadata(expected, self.device) if expected.shape[0] else None
+            if gate and expected.shape[0]:
+                tasks, config, expected_device = upload_metadata_batch(
+                    (host_tasks, _forward_config(hidden, transposed), expected), self.device)
+            else:
+                tasks = upload_metadata(host_tasks, self.device)
+                config = upload_metadata(_forward_config(hidden, transposed), self.device) if gate else None
+                expected_device = upload_metadata(expected, self.device) if expected.shape[0] else None
             event = torch.npu.Event()
             event.record(current)
-            self.metadata[key] = tasks, config, expected, expected_device, event
-        tasks, config, expected, expected_device, metadata_ready = self.metadata[key]
+            progress = (producer_progress(host_tasks, self.boundaries, expected.shape[0], _TILE_ROWS, 1)
+                        if expected.shape[0] else None)
+            self.metadata[key] = tasks, config, expected, expected_device, progress, event
+        tasks, config, expected, expected_device, progress, metadata_ready = self.metadata[key]
         current.wait_event(metadata_ready)
-        return tasks, config, expected, expected_device
+        return tasks, config, expected, expected_device, progress
 
     @torch.no_grad()
     def prepare(self, x: torch.Tensor, gate: Sequence[torch.Tensor], down: Sequence[torch.Tensor],
                 intermediate: int, allocator: Allocator | None = None) -> PipelineForwardWork:
-        """Allocate both kernels' storage and events before collective phase admission."""
+        """Allocate both kernels' storage and events before collective phase admission.
+
+        Args:
+            x: Packed BF16 input rows in compact expert order.
+            gate: Current gate/up matrix views for the active experts.
+            down: Current down-projection matrix views for the active experts.
+            intermediate: Width of each expert's activated intermediate state.
+            allocator: Optional owner of reusable activation and output buffers.
+
+        Returns:
+            Prepared work retaining operands, metadata and fresh phase fences.
+        """
         _load_native()
         rows = self.boundaries[-1] if self.boundaries else 0
         hidden, gate, down = self._check_forward_operands(x, gate, down, intermediate, rows)
         current = torch.npu.current_stream(self.device)
         transposed = bool(gate and gate[0].stride(-2) == 1)
-        tasks, config, expected, expected_device = self._prepare_metadata(hidden, transposed, gate, current)
+        tasks, config, expected, expected_device, progress = self._prepare_metadata(hidden, transposed, gate, current)
         cores = expected.shape[0]
         z = torch.empty((rows, 2 * intermediate), dtype=x.dtype, device=self.device)
         activation = self._allocate(allocator, "forward_activation", (cores, _TILE_ROWS, intermediate))
@@ -233,7 +252,8 @@ class ForwardPipeline:
                 readers.append(table)
         if config is not None:
             readers.append(config)
-        ready = (ExpertReadiness.create(expected, self.device, deferred_poll=True, expected_device=expected_device)
+        ready = (ExpertReadiness.create(expected, self.device, deferred_poll=True, expected_device=expected_device,
+                                        progress=progress)
                  if cores else None)
         writers = [z, activation, output, mailboxes]
         if ready is not None:
