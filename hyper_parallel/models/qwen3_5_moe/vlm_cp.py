@@ -25,51 +25,23 @@ from torch.nn import functional  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.data.batching.get_batch import OmniParallelBatch
 from hyper_parallel.data.batching.runtime_input import RuntimeInputAdapter, RuntimeInputContext
-from hyper_parallel.distributed.encoder_parallel.contracts import EncoderFeature, EncoderWorkItem
-from hyper_parallel.models.qwen3_5_moe.adapter.encoder_parallel import QwenVisionBridge
 
 
 @dataclass(frozen=True)
 class QwenVLMCPInputs:
-    """Precomputed full-conversation geometry and local next-token targets."""
+    """Global sequence fields and the local next-token interval, independent of a model."""
 
     start: int
     stop: int
-    position_ids: torch.Tensor
+    input_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    token_type_ids: torch.Tensor | None
     targets: torch.Tensor
-    images: tuple[EncoderWorkItem, ...]
-
-
-def select_local_image_features(records: list[EncoderFeature], geometry: QwenVLMCPInputs,
-                                hidden: torch.Tensor, input_ids: torch.Tensor,
-                                image_token_id: int) -> torch.Tensor:
-    """Insert only image rows intersecting this rank's global token interval.
-
-    Args:
-        records: Image work items paired with their encoded features.
-        geometry: Global token interval assigned to this CP rank.
-        hidden: Local text embeddings receiving image features.
-        input_ids: Local token IDs identifying image placeholders.
-        image_token_id: Token ID used for image placeholders.
-
-    Returns:
-        Local embeddings with image placeholders replaced by image features.
-    """
-    rows = []
-    for item, features in sorted(records, key=lambda record: record[0].decoder_token_start):
-        begin = max(geometry.start, item.decoder_token_start)
-        end = min(geometry.stop, item.decoder_token_start + item.output_rows)
-        if begin < end:
-            rows.append(features[begin - item.decoder_token_start:end - item.decoder_token_start])
-    mask = input_ids.eq(image_token_id).unsqueeze(-1).expand_as(hidden)
-    features = torch.cat(rows).to(hidden.dtype) if rows else hidden.new_empty((0, hidden.shape[-1]))
-    if int(mask[..., 0].sum()) != features.shape[0]:
-        raise ValueError("CP-local image placeholders do not match routed image features")
-    return hidden.masked_scatter(mask, features)
+    cp_size: int
 
 
 class QwenVLMParallelBatch(OmniParallelBatch, RuntimeInputAdapter):
-    """Prepare full-image geometry before slicing an unpacked conversation over CP.
+    """Retain global sequence metadata while slicing an unpacked conversation over CP.
 
     TP/SP, video, packing and interior/left padding are intentionally unsupported.
     Decoder attention/GDN may use Ulysses or KV all-gather/P2P respectively.
@@ -85,8 +57,6 @@ class QwenVLMParallelBatch(OmniParallelBatch, RuntimeInputAdapter):
             raise ValueError("sequence_alignment must be a positive integer")
         if sequence_alignment % (64 * mesh_context.cp_size):
             raise ValueError("sequence_alignment must be divisible by 64 * cp_size")
-        self.model = None
-        self.bridge = None
         self.sequence_alignment = sequence_alignment
         super().__init__(mesh_context=mesh_context, device=device,
                          runtime_input_adapter=runtime_input_adapter or self, **kwargs)
@@ -98,16 +68,6 @@ class QwenVLMParallelBatch(OmniParallelBatch, RuntimeInputAdapter):
     def build_runtime_inputs(self, *, batch: Mapping[str, Any], context: RuntimeInputContext) -> dict[str, Any]:
         """Keep the model-specific geometry owned by the batch adapter."""
         return {}
-
-    def bind_model(self, model: Any) -> None:
-        """Bind native mRoPE and visual metadata without changing model execution.
-
-        Args:
-            model: Qwen multimodal conditional-generation model.
-        """
-        if model.config.model_type not in ("qwen3_5", "qwen3_5_moe"):
-            raise ValueError("QwenVLMParallelBatch requires the conditional-generation Qwen Dense or MoE model")
-        self.model, self.bridge = model, QwenVisionBridge(model)
 
     def _pad(self, source: Mapping[str, Any]) -> dict[str, Any]:
         """Right-pad token fields together without truncating any image span."""
@@ -125,48 +85,40 @@ class QwenVLMParallelBatch(OmniParallelBatch, RuntimeInputAdapter):
             raise ValueError("Qwen VLM CP does not support interior padding")
         if bool((batch["labels"][~valid] != -100).any()):
             raise ValueError("Qwen VLM CP padding must not contain supervised labels")
-        if bool((ids[~valid] == self.model.config.image_token_id).any()):
-            raise ValueError("Qwen VLM CP padding must not contain image placeholders")
         batch["attention_mask"] = mask
         pad = (-ids.shape[1]) % self.sequence_alignment
         for field, value in tuple(batch.items()):
-            if torch.is_tensor(value) and value.shape == ids.shape and field not in self.bridge.input_fields:
+            if torch.is_tensor(value) and value.shape == ids.shape and field not in ("pixel_values", "image_grid_thw"):
                 batch[field] = functional.pad(value, (0, pad), value=-100 if field == "labels" else 0)
         batch["loss_mask"] = batch["labels"].ne(-100)
         return batch
 
     def __call__(self, data_iterator: Any, *, external_batch: Mapping[str, Any] | None = None
                  ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Render global positions/targets, then expose only local tokens to the decoder."""
-        if self.model is None:
-            raise RuntimeError("bind_model must run before reading a Qwen VLM CP batch")
+        """Shift targets globally and retain model-independent metadata for the adapter."""
         source = external_batch if external_batch is not None else next(data_iterator)
         batch = self.tp_broadcaster.broadcast(
             self._pad(self._normalize_source_batch(source)), broadcast_all_fields=True,
         )
-        images = self.bridge.parse_images(batch)
         cp_size = self.parallel_context.cp_world_size
-        if cp_size == 1:
-            runtime_inputs = self._build_runtime_inputs(batch)
-            model_inputs, loss_inputs = self._split_model_and_loss_inputs(batch)
-            model_inputs.update(runtime_inputs)
-            if getattr(self.model, "_hp_qwen_vlm_chunk_loss_bound", False):
-                targets = functional.pad(batch["labels"], (0, 1), value=-100)[:, 1:].contiguous()
-                self._add_chunk_targets(model_inputs, loss_inputs, targets)
-            return model_inputs, loss_inputs
         global_ids = batch["input_ids"]
-        token_types = batch.get("mm_token_type_ids", global_ids.eq(self.model.config.image_token_id).long())
-        positions, _ = self.model.model.get_rope_index(
-            input_ids=global_ids, mm_token_type_ids=token_types,
-            image_grid_thw=batch.get("image_grid_thw"), attention_mask=batch["attention_mask"],
-        )
         length = global_ids.shape[1] // cp_size
         start = self.parallel_context.cp_rank * length
         stop = start + length
         targets = functional.pad(batch["labels"], (0, 1), value=-100)[:, 1:][:, start:stop].contiguous()
-        geometry = QwenVLMCPInputs(start, stop, positions[..., start:stop].contiguous(), targets, images)
+        geometry = QwenVLMCPInputs(
+            start, stop, global_ids, batch["attention_mask"], batch.get("mm_token_type_ids"), targets, cp_size,
+        )
+        if cp_size == 1:
+            runtime_inputs = self._build_runtime_inputs(batch)
+            model_inputs, loss_inputs = self._split_model_and_loss_inputs(batch)
+            model_inputs.update(runtime_inputs)
+            model_inputs["vlm_cp_inputs"] = geometry
+            self._add_chunk_targets(loss_inputs, targets)
+            return model_inputs, loss_inputs
         for field, value in tuple(batch.items()):
-            if torch.is_tensor(value) and value.shape == global_ids.shape and field not in self.bridge.input_fields:
+            if (torch.is_tensor(value) and value.shape == global_ids.shape
+                    and field not in ("pixel_values", "image_grid_thw")):
                 batch[field] = value[:, start:stop].contiguous()
         # The native trainer counts labels[..., 1:]. This sentinel preserves that
         # contract while the forward bridge uses the already globally shifted targets.
@@ -178,13 +130,11 @@ class QwenVLMParallelBatch(OmniParallelBatch, RuntimeInputAdapter):
         model_inputs, loss_inputs = self._split_model_and_loss_inputs(batch)
         model_inputs.update(runtime_inputs)
         model_inputs["vlm_cp_inputs"] = geometry
-        self._add_chunk_targets(model_inputs, loss_inputs, targets)
+        self._add_chunk_targets(loss_inputs, targets)
         return model_inputs, loss_inputs
 
-    def _add_chunk_targets(self, model_inputs: dict[str, Any], loss_inputs: dict[str, Any],
-                           targets: torch.Tensor) -> None:
-        """Expose aligned labels only to the opt-in chunk objective and token counter."""
-        if getattr(self.model, "_hp_qwen_vlm_chunk_loss_bound", False):
-            for inputs in (model_inputs, loss_inputs):
-                inputs["shift_labels"] = targets
-                inputs["loss_mask"] = targets.ne(-100)
+    @staticmethod
+    def _add_chunk_targets(loss_inputs: dict[str, Any], targets: torch.Tensor) -> None:
+        """Provide shifted targets without depending on the selected model loss adapter."""
+        loss_inputs["shift_labels"] = targets
+        loss_inputs["loss_mask"] = targets.ne(-100)
