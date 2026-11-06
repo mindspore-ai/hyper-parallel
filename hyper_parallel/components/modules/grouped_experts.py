@@ -35,8 +35,8 @@ from hyper_parallel.components.functional import (
     grouped_matmul,
     moe_token_permute,
     moe_token_unpermute,
-    swiglu,
 )
+from hyper_parallel.components.functional.swiglu import swiglu
 
 
 @module_replacement
