@@ -837,7 +837,7 @@ class BaseTrainer(Stateful, ABC):
             if self.graph_compiler is not None:
                 runtime_adapter = getattr(getattr(self, "get_batch", None), "runtime_input_adapter", None)
                 if runtime_adapter is not None:
-                    micro_batch = runtime_adapter.prepare_graph_inputs(micro_batch)
+                    micro_batch = runtime_adapter.prepare_graph_inputs(micro_batch, model_config=self.model_config)
                 if self.config.training.empty_cache_before_backward:
                     logger.warning(
                         "training.empty_cache_before_backward is ignored in graph compiler mode "

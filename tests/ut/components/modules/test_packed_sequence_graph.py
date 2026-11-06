@@ -29,6 +29,7 @@ from hyper_parallel.models.deepseek_v41.aux_loss import sequence_load_balancing_
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.trainer.runtime.model_integration import DisabledModelIntegrationSession
+from tests.common.mark_utils import arg_mark
 
 
 def _inputs(boundaries: list[int], *, graph: bool = True) -> dict:
@@ -102,8 +103,15 @@ class TestPackingOnlyGraph(unittest.TestCase):
                 torch.testing.assert_close(inputs["packed_seq_params"].cu_seq_lens,
                                            torch.tensor([0, 3, 8], dtype=torch.int32))
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_eager_fsdp_hook_preserves_compression_boundaries(self) -> None:
-        """Real FSDP autograd input wrapping retains eager compression geometry."""
+        """Real FSDP autograd input wrapping retains eager compression geometry.
+
+        Feature: Opaque packed metadata under eager FSDP hooks.
+        Description: Wrap ordinary inputs using the production backward-hook registration.
+        Expectation: Packing object identity, real boundaries, and compressed key prefixes are preserved.
+        """
         for boundaries in ([0, 4, 8], [0, 3, 8]):
             with self.subTest(boundaries=boundaries):
                 inputs = _inputs(boundaries, graph=False)
@@ -131,7 +139,7 @@ class TestPackingOnlyGraph(unittest.TestCase):
         leaves, spec = tree_flatten(prepared["packed_seq_params"])
         graph = tree_unflatten(leaves, spec)
         self.assertEqual(graph.cu_seq_lens.numel(), 0)
-        with self.assertRaisesRegex(ValueError, "packing-only graph inputs"):
+        with self.assertRaisesRegex(ValueError, "graph compression ratios"):
             graph.prepare(torch.device("cpu"), (2,))
 
     def test_symbolic_joint_graph_replays_lengths_boundaries_and_gradients(self) -> None:

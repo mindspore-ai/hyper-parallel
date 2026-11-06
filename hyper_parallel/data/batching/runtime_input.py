@@ -139,15 +139,19 @@ class RuntimeInputAdapter(ABC):
             )
         return dict(runtime_inputs)
 
-    def prepare_graph_inputs(self, model_inputs: dict[str, Any]) -> dict[str, Any]:
+    def prepare_graph_inputs(
+            self, model_inputs: dict[str, Any], *, model_config: Any = None,
+    ) -> dict[str, Any]:
         """Return inputs unchanged unless the model needs graph-only metadata.
 
         Args:
             model_inputs: Real model inputs immediately before graph execution.
+            model_config: Final configuration defining any model-owned graph metadata.
 
         Returns:
             Inputs used for both graph capture and replay. Eager never calls this hook.
         """
+        del model_config
         return model_inputs
 
     def runtime_input_fields(self) -> tuple[str, ...]:
