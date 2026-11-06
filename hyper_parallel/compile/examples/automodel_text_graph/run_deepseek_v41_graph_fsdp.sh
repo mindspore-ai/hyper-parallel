@@ -16,20 +16,22 @@
 set -euo pipefail
 
 # Example: MODEL_DIR=/models/v41 TOKENIZER_DIR=/models/tokenizer \
-# WIKITEXT_TRAIN_FILE=/datasets/wikitext-train.arrow bash "$0"
-# Model config must contain compatible V4.1/Engram fields and packing-only settings.
+# WIKITEXT_TRAIN_FILE=/datasets/wikitext-train.jsonl bash "$0"
+# Model config must contain compatible V4.1/Engram fields with active Compressor
+# and Indexer roles (compression ratios, KV/Index source layers).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 cd "${REPO_ROOT}"
 : "${MODEL_DIR:?Set MODEL_DIR to a compatible local model configuration directory}"
 : "${TOKENIZER_DIR:?Set TOKENIZER_DIR to a local tokenizer directory}"
-: "${WIKITEXT_TRAIN_FILE:?Set WIKITEXT_TRAIN_FILE to a local WikiText Arrow/Parquet file}"
+: "${WIKITEXT_TRAIN_FILE:?Set WIKITEXT_TRAIN_FILE to a local WikiText JSONL/Arrow/Parquet file}"
 CONFIG="${CONFIG:-${SCRIPT_DIR}/train_deepseek_v41_graph_packing_fsdp2.yaml}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 OUTPUT_LOG="${OUTPUT_LOG:-output/automodel_text_graph/run_graph_fsdp.log}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
+export HCCL_EXEC_TIMEOUT="${HCCL_EXEC_TIMEOUT:-600}"
 export HCCL_DETERMINISTIC="${HCCL_DETERMINISTIC:-true}"
 export HCCL_NPU_SOCKET_PORT_RANGE="${HCCL_NPU_SOCKET_PORT_RANGE:-auto}"
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1}"

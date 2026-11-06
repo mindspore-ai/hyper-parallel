@@ -1,4 +1,6 @@
-# Packing-only static graph; no Compressor, Indexer, candidate pool or Indexer KL.
+# WikiText packed static graph with active Compressor and Indexer; CP1 reference DSA.
+# The packed documents are per-doc aligned (lcm of active ratios) and padded to a
+# fixed row length, so eager and one captured graph share the same shape contract.
 model:
   _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: ./model
@@ -8,11 +10,8 @@ model:
   config_overrides:
     _experts_implementation: batched_mm
     router_aux_loss_coef: 0.0001
-    v41_indexer_loss_coeff: 0.0
-    v41_kv_source_layer_ids: []
-    v41_index_source_layer_ids: []
+    v41_indexer_loss_coeff: 0.1
     v41_candidate_source_layer_id: -1
-    num_kv_shared_layers: 0
 optimizer:
   _target_: hyper_parallel.components.optim.builders.AdamW
   adamw_config:
@@ -58,13 +57,15 @@ dataset:
       use_fast: true
       trust_remote_code: false
   data_transform:
-    _target_: hyper_parallel.data.text.text_transform.build_text_transform
+    _target_: hyper_parallel.models.deepseek_v41.adapter.data.text_transform.build_deepseek_v41_text_transform
     data_type: plaintext
     text_keys: text
     max_seq_len: 32
     drop_ragged_tail: false
+    # lcm of the model's active compress ratios: blocks never cross a document.
+    sample_alignment_size: 2
   _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
-  data_path: ./output/datasets/wikitext-train.arrow
+  data_path: ./output/datasets/wikitext-train.jsonl
   data_config:
     create_attention_mask_in_dataloader: true
     labels_are_shifted: true
@@ -74,6 +75,9 @@ dataloader:
   min_buffered_samples: 200
   collate_fn:
     _target_: hyper_parallel.data.batching.build_online_text_collate_fn
+    # Fixed packed row length: one captured graph replays for every batch and
+    # eager keeps the identical shape contract.
+    pad_to_length: 32
   get_batch:
     _target_: hyper_parallel.data.batching.TextParallelBatch
     source_type: online
@@ -82,6 +86,11 @@ dataloader:
       _target_: hyper_parallel.models.deepseek_v41.adapter.data.runtime.DeepseekV41Runtime
       include_position_ids: false
       include_image_sequence_start: false
+      # Every active model compress ratio; the graph boundary prepares
+      # per-ratio compressed-key metadata from this list.
+      compress_ratios:
+      - 1
+      - 2
   sampler_type: single
   data_rearrange_map: null
   data_sharding: false
@@ -90,6 +99,8 @@ dataloader:
   num_workers: 0
   pin_memory: false
   prefetch_factor: null
+  # One max_seq_len document per micro-batch: the planned per-epoch sample
+  # count then equals the iteration count and the padded row stays at 32.
   token_budget: 32
 checkpoint:
   save_ckpt: false
