@@ -21,20 +21,17 @@ __all__ = [
     "build_packed_weight_buckets",
     "materialize_packed_weight_bucket",
     "unpack_packed_weights",
-    "build_direct_reshard_buckets",
-    "pack_direct_bucket",
 ]
 
 
 from dataclasses import dataclass, replace
-from itertools import product
 from math import prod
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Mapping, Optional
 
 import torch
 import torch.distributed as dist
 
-from rl.weight_sync.layout import TensorRegion, TransferBucket, TransferEntry, local_tensor
+from rl.weight_sync.layout import local_tensor
 
 
 @dataclass(frozen=True)
@@ -295,119 +292,3 @@ def _unpack_canonical_rows(tensor: Any, rows: list[Mapping[str, Any]]) -> list[t
             raise ValueError(f"Canonical row ranges for {name!r} are incomplete")
         weights.append((name, torch.cat(tensors, dim=0)))
     return weights
-
-
-
-def _tile_region(
-    region: TensorRegion,
-    *,
-    element_size: int,
-    bucket_size_bytes: int,
-) -> tuple[TensorRegion, ...]:
-    """Tile a rectangle in canonical order, independently of gather/direct routing."""
-    max_numel = bucket_size_bytes // element_size
-    if max_numel <= 0:
-        raise ValueError("Weight-sync bucket is smaller than one tensor element")
-    if region.numel <= max_numel:
-        return (region,)
-    chunks = [1] * len(region.lengths)
-    remaining = max_numel
-    for dim in reversed(range(len(chunks))):
-        chunks[dim] = min(region.lengths[dim], max(1, remaining))
-        remaining = max(1, remaining // chunks[dim])
-    ranges = [range(0, length, chunk) for length, chunk in zip(region.lengths, chunks)]
-    return tuple(
-        TensorRegion(
-            tuple(start + offset for start, offset in zip(region.starts, offsets)),
-            tuple(min(chunk, length - offset) for offset, chunk, length in zip(offsets, chunks, region.lengths)),
-        )
-        for offsets in product(*ranges)
-    )
-
-
-def _bucketize(
-    entries: Iterable[TransferEntry],
-    bucket_size_bytes: int,
-) -> tuple[TransferBucket, ...]:
-    """Assign aligned offsets and group bounded direct entries."""
-    buckets, current = [], []
-    size = 0
-    for entry in entries:
-        if entry.num_bytes > bucket_size_bytes:
-            raise ValueError(f"Weight-sync fragment {entry.name!r} exceeds its bucket")
-        offset = _aligned_offset(size, entry.element_size)
-        if current and offset + entry.num_bytes > bucket_size_bytes:
-            buckets.append(TransferBucket(tuple(current), size))
-            current, offset = [], 0
-        current.append(entry.with_buffer_offset(offset))
-        size = offset + entry.num_bytes
-    if current:
-        buckets.append(TransferBucket(tuple(current), size))
-    return tuple(buckets)
-
-
-def _split_entry(entry: TransferEntry, bucket_size_bytes: int) -> tuple[TransferEntry, ...]:
-    """Apply shared canonical tiles to the source and permuted destination."""
-    region = TensorRegion((0,) * len(entry.lengths), entry.lengths)
-    tiles = _tile_region(
-        region,
-        element_size=entry.element_size,
-        bucket_size_bytes=bucket_size_bytes,
-    )
-    if tiles == (region,):
-        return (entry,)
-    return tuple(
-        replace(
-            entry,
-            source_starts=tuple(start + offset for start, offset in zip(entry.source_starts, tile.starts)),
-            destination_starts=tuple(
-                start + tile.starts[axis] for start, axis in zip(entry.destination_starts, entry.physical_permutation)
-            ),
-            lengths=tile.lengths,
-            buffer_offset=0,
-        )
-        for tile in tiles
-    )
-
-
-def build_direct_reshard_buckets(
-    entries: Iterable[TransferEntry], bucket_size_bytes: int,
-) -> tuple[TransferBucket, ...]:
-    """Split and group ordered direct fragments within the strict byte limit."""
-    return _bucketize(
-        (fragment for entry in entries for fragment in _split_entry(entry, bucket_size_bytes)),
-        bucket_size_bytes,
-    )
-
-
-def pack_direct_bucket(
-    state_dict: Mapping[str, Any],
-    bucket: TransferBucket,
-    device: Any,
-) -> Any:
-    """Pack one direct route into a bounded byte tensor on ``device``."""
-    packed = torch.empty(bucket.total_bytes, dtype=torch.uint8, device=device)
-    for entry in bucket.entries:
-        value = state_dict.get(entry.source_key)
-        if value is None:
-            raise ValueError(
-                f"Direct reshard source parameter {entry.source_key!r} is missing"
-            )
-        source_slice = tuple(
-            slice(start, start + length)
-            for start, length in zip(entry.source_starts, entry.lengths)
-        )
-        fragment = local_tensor(value)[source_slice].detach()
-        if entry.physical_permutation != tuple(range(len(entry.lengths))):
-            fragment = fragment.permute(entry.physical_permutation)
-        fragment = fragment.contiguous()
-        if str(fragment.device) != str(device):
-            fragment = fragment.to(device)
-        raw = fragment.view(torch.uint8).view(-1)
-        if int(raw.numel()) != entry.num_bytes:
-            raise ValueError(
-                f"Direct reshard source fragment {entry.source_key!r} has "
-                f"{raw.numel()} bytes, expected {entry.num_bytes}"
-            )
-        packed.narrow(0, entry.buffer_offset, entry.num_bytes).copy_(raw)
-    return packed

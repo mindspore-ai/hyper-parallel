@@ -18,14 +18,12 @@ import base64
 import os
 import pickle
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, Mapping, Optional, Sequence
 
 import torch
 import torch.distributed as dist
 
-from rl.weight_sync.layout import DirectReshardPlan
-from rl.weight_sync.packed_weight import PackedWeightAck, pack_direct_bucket
+from rl.weight_sync.packed_weight import PackedWeightAck
 from rl.weight_sync.sync import coordinator_call, synchronized_call
 from rl.weight_sync.vllm_client import VLLMWeightSyncClientMixin, shared_endpoint
 
@@ -39,13 +37,6 @@ class PhysicalRolloutWorker:
     physical_device_id: Any
 
 
-def _pack_or_allocate_direct_bucket(
-    state_dict: Mapping[str, Any], bucket: Any, device: Any, rank: int, source_rank: int,
-) -> Any:
-    """Materialize source bytes or allocate a same-sized broadcast receiver."""
-    if rank == source_rank:
-        return pack_direct_bucket(state_dict, bucket, device)
-    return torch.empty(bucket.total_bytes, dtype=torch.uint8, device=device)
 
 
 def resolve_physical_worker_topology(
@@ -235,36 +226,6 @@ class IPCWeightTransport:
             "IPC acknowledged producer synchronization", torch.get_device_module().current_stream().synchronize,
         )
 
-    def send_bucket(
-        self, client: VLLMWeightSyncClientMixin, context: IPCContext,
-        target_tp_rank: int, bucket_index: int, metadata: Mapping[str, Any], packed: Any, policy_version: int,
-        *, target_worker_rank: Optional[int] = None,
-    ) -> None:
-        """Export one buffer per target NPU and retain it until receipt is known."""
-        expected_devices = {worker.physical_device_id for worker in context.workers
-                            if worker.tp_rank == target_tp_rank}
-        if target_worker_rank is not None:
-            expected_devices = {worker.physical_device_id for index, worker in enumerate(context.workers)
-                                if index == target_worker_rank}
-        try:
-            handles = self._collect_handles(context, packed, expected_devices)
-            payload = {
-                "physical_worker_routes": target_worker_rank is not None,
-                "buckets_by_target": {(target_worker_rank if target_worker_rank is not None else target_tp_rank): [{
-                    "target_rank": target_tp_rank, "bucket_index": bucket_index,
-                    "metadata": dict(metadata), "ipc_handles": handles,
-                }]},
-                "tensor_parallel_size": self._tensor_parallel_size,
-                "worker_topology": [vars(worker) for worker in context.workers],
-            }
-            self._receive(
-                client, context, "receive_ipc_direct_reshard", payload, policy_version,
-                target_tp_rank, sum(int(entry["num_bytes"]) for entry in metadata["entries"]), target_worker_rank,
-            )
-        except Exception:
-            if context.physical_device_id in expected_devices:
-                self._failed_buffers.append(packed)
-            raise
 
     def prepare_packed(self, client: VLLMWeightSyncClientMixin) -> IPCContext:
         """Resolve every same-device worker that will load complete parameters."""
@@ -323,34 +284,6 @@ class IPCWeightTransport:
             bucket_index, total_bytes, self._data_parallel_size * self._tensor_parallel_size,
         )
 
-    def transfer_direct(
-        self, client: VLLMWeightSyncClientMixin, state_dict: Mapping[str, Any], plan: DirectReshardPlan,
-        policy_version: int,
-    ) -> None:
-        """Redistribute one source bucket at a time before same-device IPC delivery."""
-
-        context = self.prepare(client, plan.destination_tp_size)
-        device_handle = torch.get_device_module()
-        device_type = (torch.accelerator.current_accelerator() or torch.device("cpu")).type
-        device = torch.device(device_type, device_handle.current_device())
-        rank = dist.get_rank()
-        for source_rank in range(plan.source_world_size):
-            for target_rank in range(plan.destination_worker_size or plan.destination_tp_size):
-                for bucket_index, bucket in enumerate(plan.for_route(source_rank, target_rank)):
-                    packed = synchronized_call(
-                        "direct IPC bucket packing",
-                        partial(_pack_or_allocate_direct_bucket, state_dict, bucket, device, rank, source_rank),
-                    )
-                    torch.get_device_module().current_stream().synchronize()
-                    dist.broadcast(packed, src=source_rank)
-                    torch.get_device_module().current_stream().synchronize()
-                    try:
-                        self.send_bucket(client, context, target_rank, bucket_index, bucket.worker_metadata(),
-                                         packed, policy_version,
-                                         target_worker_rank=target_rank if plan.destination_worker_size else None)
-                    finally:
-                        # The transport owns any exported buffer whose receive was uncertain.
-                        del packed
 
     def close(self) -> None:
         """Release resources after the rollout process has shut down."""

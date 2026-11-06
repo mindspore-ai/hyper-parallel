@@ -1,8 +1,11 @@
 <!-- markdownlint-disable MD033 -->
+
 <h1 align="center">
   <img src="docs/assets/hyper-rl-logo.svg" width="120" height="80" alt="HyperParallel-RL logo"><br>
   HyperParallel-RL · Experimental
 </h1>
+
+当前重构仅保留 native-vLLM 与流式 full_gather；组件替换在本次 YAML 的 `train.plan_overrides` 中显式声明。Checkpoint 使用 schema 2，不兼容历史快照。下述历史设备结果不代表本次重构已经完成设备验收。
 
 <p align="center"><strong>A lightweight, extensible reinforcement learning framework.</strong></p>
 
@@ -60,19 +63,16 @@ HyperParallel-RL 是面向 LLM、VLM、世界模型、具身智能和 Agentic AI
 
 - **FSDP 并行训练**：复用 HyperParallel 的状态分片能力及预取、通算重叠等优化机制，以已验证的 FSDP、TP、EP 组合支持 dense 与 Qwen3-30B-A3B 已验证配方。见 [FSDP 优化](../../docs/guide/fsdp.md#fsdp-性能优化)。
 - **共卡与分离部署**：Qwen3 dense 支持训推共卡或独立设备部署，分别通过 NPU IPC、HCCL 发布权重；共卡按阶段释放与恢复采样侧资源。MoE 当前限于共卡，见[支持范围](#支持范围)。
-- **流式权重同步**：分桶传输与确认后释放缓冲控制临时内存占用；显式 direct-reshard 按训推分片交集传输参数，同时保留 full-gather 路径。见 [vLLM Rollout](docs/vllm_rollout.md)。
+- **流式权重同步**：native-vLLM 使用 full_gather，经 IPC/HCCL 逐桶发送并在确认后释放缓冲。
 
 底层优化基础还包括 HyperParallel 的[单边通信与多核 MoE 通算重叠](../core/multicore/README.md)，其 HyperParallel-RL 接入与端到端收益待验证。
 
-### 🔗 训推一致性
+### 已发布策略与概率记录
 
 保留生成依据，校验概率差异，明确策略发布边界。
 
-- **原始样本贯通训练**：保留生成 token、logprobs、动作掩码与策略身份，避免重新分词改变样本；工具反馈与环境观察仅作为上下文，不参与 policy loss。见[轨迹合同](rl/dataset/contracts.py)。
-- **同源语义与 Bit-Exact 校验**：Qwen3 dense 的 Trainer 与 Hyper-vLLM 共享参数语义和 TP 切分方案；可选校验在更新前逐位比较有效动作 token 的 FP32 raw logprobs，失败即阻止更新与发布。
+- **原始样本贯通训练**：保留生成 token、logprobs、动作掩码与策略身份，避免重新分词改变样本；工具反馈与环境观察仅作为上下文，不参与 policy loss。见[轨迹合同](rl/data/contracts.py)。
 - **已发布策略才可采样**：同步流程消费同一已发布版本的轨迹；新权重完成传输、worker 身份校验与缓存重置后才恢复采样，参数发布与概率一致性分别验证。
-
-Bit-Exact 默认关闭，已验证范围为单节点 Ascend、BF16/eager、Qwen3 dense + Hyper-vLLM、训推 matched TP1/TP2；不等同于梯度或收敛保证。完整条件与结果见[训推一致性文档](docs/qwen3_training_inference_consistency.md)。
 
 ---
 
@@ -139,7 +139,7 @@ npu-smi info
 
 ### 示例一：Qwen 基础训练
 
-**Qwen3-4B + GSM8K，四卡单步同步 GRPO。** 数据目录需包含 `train.parquet`、`test.parquet`，每行使用 `prompt` 和 `extra_info` 列；`extra_info` 提供答案，具体解析规则见[数据读取实现](rl/dataset/data_source.py)。
+**Qwen3-4B + GSM8K，四卡单步同步 GRPO。** 数据目录需包含 `train.parquet`、`test.parquet`，每行使用 `prompt` 和 `extra_info` 列；`extra_info` 提供答案，具体解析规则见[数据读取实现](rl/data/prompts.py)。
 
 ```bash
 export HYPER_QWEN3_TP_MODEL_ROOT=/absolute/path/to/Qwen3-4B
@@ -152,8 +152,6 @@ export HYPER_QWEN3_TP_MAX_STEPS=1
 
 ./hyper_parallel/rl/examples/gsm8k/scripts/run_qwen3_tp_docker.sh colocated
 ```
-
-**成功判据**：退出码为 0，结果目录日志中 `train/global_step=1`、`policy/version=1`，`train/total_loss` 为有限值。此检查关闭评估、保存与 Bit-Exact。
 
 <!-- markdownlint-disable-next-line MD033 -->
 <a id="agentic-example"></a>
@@ -227,8 +225,8 @@ HyperParallel-RL 提供任务、数据与算法层的扩展入口。单轮任务
 | --- | --- |
 | 奖励与任务环境 | [GSM8K 示例](examples/gsm8k/agent.py)展示环境与奖励实现，通过 `agentic.module_path` 和 `agentic.environment` 选择任务 |
 | 多轮交互或自定义循环 | 使用 [Environment](rl/agentic/envs/environment.py)由框架驱动交互；[AgentProgram](rl/agentic/core/program_runner.py)承载程序化循环，内置路径及新增 harness 的接入边界见 [Agentic RL](docs/agentic_rl.md)；环境观察不参与 policy loss |
-| 数据与训练样本 | [数据源](rl/dataset/data_source.py)负责输入，[轨迹与 batch 合同](rl/dataset/contracts.py)定义进入学习阶段的数据 |
-| 学习算法与更新过程 | 从 [loss](rl/algorithm/loss.py)、[advantage](rl/algorithm/advantage.py)和 [SyncTrainer](rl/trainer.py)定位学习逻辑，借助[功能导航](../../docs/rl-navigation.md)找到相关测试 |
+| 数据与训练样本 | [数据源](rl/data/prompts.py)负责输入，[轨迹与 batch 合同](rl/data/contracts.py)定义进入学习阶段的数据 |
+| 学习算法与更新过程 | 从 [loss](rl/algorithm/loss.py)、[advantage](rl/algorithm/advantage.py)和 [SyncTrainer](rl/trainer/sync.py)定位学习逻辑，借助[功能导航](../../docs/rl-navigation.md)找到相关测试 |
 
 ### 替换奖励函数
 
@@ -238,13 +236,11 @@ HyperParallel-RL 提供任务、数据与算法层的扩展入口。单轮任务
 from examples.gsm8k.agent import GSM8KMultiTurnEnvironment, build_gsm8k_environment
 from rl.agentic.core.types import EpisodeContext
 from rl.agentic.envs.environment import ENVIRONMENTS
-from rl.dataset.contracts import PromptRecord
-
+from rl.data.contracts import PromptRecord
 
 def exact_match(answer: str, prompt: PromptRecord) -> float:
     """Score the final answer against the dataset target."""
     return float(answer.strip() == str(prompt.ground_truth).strip())
-
 
 @ENVIRONMENTS.register("custom_gsm8k")
 def build_environment(context: EpisodeContext) -> GSM8KMultiTurnEnvironment:
@@ -284,8 +280,7 @@ GSM8K 的规则评分与模型评分都在 [agent.py](examples/gsm8k/agent.py)�
 | **程序化 Agent** | ◐ | Codex / DeepSeek：真实调用上下文、episode GRPO、DP 补齐和失败归因；自定义程序需适配，见 [Agentic RL](docs/agentic_rl.md) |
 | **仓库型 Code Agent** | ◐ | SWE-Smith 隔离工作区、独立评分与逐调用 GRPO；9B 短预算 RL/恢复及长预算推理已验证，长轨迹学习和全量规模未验证，见[使用说明](examples/swe_smith/README.md) |
 | **采样与部署** | ✅ | Hyper/Native-vLLM；Qwen3 dense 支持共卡与分离部署，MoE 限共卡；DP/TP/EP 组合见 [vLLM Rollout](docs/vllm_rollout.md) |
-| **权重同步与运行保障** | ✅ | 流式 full-gather / 显式 direct-reshard、IPC/HCCL、策略发布校验、checkpoint 恢复及 console / W&B 指标；见[架构合同](docs/architecture.md) |
-| **Bit-Exact 校验** | ✅ | 可选更新前 logprob 校验，仅限 Qwen3 dense + Hyper-vLLM matched TP1/TP2，见[完整条件](docs/qwen3_training_inference_consistency.md) |
+| **权重同步与运行保障** | ✅ | 流式 full-gather、IPC/HCCL、策略发布校验、checkpoint 恢复及 console / W&B 指标；见[架构合同](docs/architecture.md) |
 | **PPO / GAE / Critic** | ✅ | Dense Qwen3 内部 runner 已完成两卡 Actor/Critic 两步更新与发布；外部 harness 分段轨迹、MoE PPO 不支持 |
 | **单节点异步 GRPO** | ◐ | Qwen3 dense 的 internal GSM8K、Codex Search/SWE-Smith 两步 NPU 流程通过，Search 覆盖跨版本 episode；SWE 零奖励未验证学习收益，见[异步合同](docs/architecture.md#rayless-asynchronous-grpo) |
 | **多节点异步训练** | ○ | 扩展多节点采样、发布和恢复 |
@@ -300,7 +295,7 @@ GSPO 默认 `kl_coef=0`，不创建 Reference 或 Critic；GRPO/PPO/GSPO 仅在 
 | 模型 | 状态 | 验证范围或目标 |
 | :--- | :---: | :--- |
 | **Qwen3 dense** | ✅ | 单节点 GRPO；Hyper/Native-vLLM TP1/TP2，Trainer 支持 TP1、pure TP2 与 FSDP-shard×TP2 |
-| **Qwen3-30B-A3B** | ✅ | Native vLLM、GRPO 共卡；四卡 TP2/EP2/EDP2 的 full-gather 与 direct-reshard 均独立通过两步更新；MoE+code 的 full-gather 两步/评估通过，不支持 Hyper/MoE PPO |
+| **Qwen3-30B-A3B** | ✅ | Native vLLM、GRPO 共卡；四卡 TP2/EP2/EDP2 的 full-gather 均独立通过两步更新；MoE+code 的 full-gather 两步/评估通过，不支持 Hyper/MoE PPO |
 | **Qwen3.5-9B / Qwen3.8-27B** | ◐ | 公共 text AutoModel、FSDP TP=CP=1、共卡 native-vLLM GRPO 与流式 full-gather；9B 远端短预算闭环已验证，27B 本次迁移后未复验，不声明 bit-exact，见[边界](docs/swe_smith.md) |
 | **Moonlight-16B-A3B-Instruct** | ◐ | Hyper 两步非零学习通过；Native 发布通过，连续非零学习验收未通过 |
 | **Qwen2.5-VL-7B-Instruct** | ○ | 图像数学问答与多模态 Agent |
@@ -331,7 +326,6 @@ Qwen3-MoE 的具体配置与同步边界见 [vLLM Rollout](docs/vllm_rollout.md#
 ## 📌 当前边界
 
 - **运行范围**：同步 RL 与实验性 rayless 异步 GRPO 均限定单节点 Ascend；模型与拓扑以[支持范围](#支持范围)为准。MoE 暂不支持分离部署与专家内部 TP；PPO / Critic 的 dense 内部 runner 两卡配方已验收，其他组合不能据此外推。
-- **验证范围**：功能运行通过不等于长期学习收益已验证。Bit-Exact 仅覆盖指定 Qwen3 dense + Hyper-vLLM 配置的更新前 logprobs，不代表梯度、更新后参数或收敛保证，详见[一致性文档](docs/qwen3_training_inference_consistency.md)。
 - **恢复与计数**：已有检查点恢复实现；同步路径的样本/token 消费计数尚未逐步累加，不应据此统计实际训练量。异步路径按已消费组和有效token单独计数。见[状态与恢复边界](docs/architecture.md#状态所有权)。
 - **部署要求**：vLLM 的 RLHF/refit 开发接口仅用于受信任、隔离的训练网络；环境与驱动要求见[运行镜像](docker/README.md)。
 
@@ -380,7 +374,6 @@ python -m pytest -vv -s hyper_parallel/rl/tests/st/test_rl_st.py
 | [Agentic RL](docs/agentic_rl.md) | 内部环境、Codex / DeepSeek Harness 的配置、轨迹与接入边界 |
 | [Code Agent](examples/swe_smith/README.md) | 隔离仓库、SWE 判题、模型配方与训练入口 |
 | [MoE 模型](https://atomgit.com/mindspore/hyper-parallel/blob/f9f2696341c631327524ea37b6b2ca328076980a/hyper_parallel/rl/docs/moe_models.md) | 模型、TP/EP 配置、组件归属与验证边界 |
-| [Qwen3 训练-推理一致性](docs/qwen3_training_inference_consistency.md) | Bit-Exact 定义、recipe 和验收门禁 |
 
 ### 架构与演进
 

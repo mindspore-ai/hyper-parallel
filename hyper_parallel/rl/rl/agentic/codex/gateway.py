@@ -35,7 +35,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from rl.agentic.codex.protocol import CodexResponsesProtocol
 from rl.agentic.codex.cli_contract import prepare_isolated_request, tool_argument_failure
-from rl.tool_protocol import inspect_tool_response
+from rl.tool_protocol.protocol import inspect_tool_response
 
 
 logger = logging.getLogger(__name__)

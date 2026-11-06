@@ -28,7 +28,7 @@ from rl.agentic.codex.harness import (
     CodexAgentProgram, _CodexExecutionFailure, _interpret_codex_output, build_codex_call_trajectories,
 )
 from rl.agentic.codex.gateway import ContextBudgetExceeded, ToolProtocolFailure, _Handler, _State, _context_budget_error
-from rl.dataset.contracts import Message, PromptRecord
+from rl.data.contracts import Message, PromptRecord
 
 
 def captured_output() -> dict:

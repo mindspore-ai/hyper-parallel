@@ -21,8 +21,8 @@ from pathlib import Path
 import urllib.request
 
 from rl.agentic.codex.harness import CodexAgentProgram, DEFAULT_CODEX_VERSION, build_codex_call_trajectories
-from rl.tool_diagnostics import summarize_tool_protocol
-from rl.tool_protocol import InfrastructureRolloutError
+from rl.tool_protocol.diagnostics import summarize_tool_protocol
+from rl.tool_protocol.protocol import InfrastructureRolloutError
 from rl.agentic.core.program_runner import audit_training_rows, request_gateway_json
 from examples.search_r1.container_runtime import close_bridges
 

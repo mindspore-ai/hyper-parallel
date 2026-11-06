@@ -21,8 +21,8 @@ from unittest.mock import Mock, patch
 import torch
 import torch.distributed as dist
 
-from rl.fully_async.fully_async_rollouter import AsyncRuntime
-from rl.colocate_async.colocate_async_trainer import ColocateAsyncTrainer, _ColocateRoleRuntime
+from rl.async_runtime.producer import AsyncRuntime
+from rl.trainer.colocate_async import ColocateAsyncTrainer, _ColocateRoleRuntime
 from hyper_parallel.rl.tests.st._async_train import TinyRuntime, producer
 
 
@@ -100,9 +100,9 @@ def test_colocate_worker():
         """Keep real bounded IPC while replacing the expensive model server."""
         return AsyncRuntime(*args, target=producer, control_client=Mock())
 
-    with patch("rl.colocate_async.colocate_async_trainer._ColocateRoleRuntime", ColocateTinyRuntime), patch(
-            "rl.colocate_async.colocate_async_trainer.AsyncGenerationClient.from_config", return_value=Mock()), patch(
-            "rl.colocate_async.colocate_async_rollouter.AsyncRuntime", sampler_factory):
+    with patch("rl.trainer.colocate_async._ColocateRoleRuntime", ColocateTinyRuntime), patch(
+            "rl.trainer.colocate_async.AsyncGenerationClient.from_config", return_value=Mock()), patch(
+            "rl.async_runtime.colocated.AsyncRuntime", sampler_factory):
         trainer = ColocateAsyncTrainer(config)
         trainer.train()
         first_roles = cast(ColocateTinyRuntime, trainer.roles)

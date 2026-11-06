@@ -41,7 +41,7 @@ from rl.agentic.core.program_runner import (
 )
 from rl.agentic.core.types import RewardResult
 from rl.agentic.ds_harness.gateway import DeepSeekGateway
-from rl.dataset.contracts import PromptRecord, Trajectory
+from rl.data.contracts import PromptRecord, Trajectory
 DEFAULT_DEEPSEEK_HARNESS_VERSION = "0.1.1rc1"
 RewardCallable = Callable[[str, PromptRecord], float | RewardResult]
 _MAX_GENERATION_PREFIX_REWRITE = 16

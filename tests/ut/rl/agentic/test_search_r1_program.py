@@ -29,7 +29,7 @@ from rl.agentic.codex.harness import (
 )
 from rl.agentic.core.types import RewardResult
 from rl.agentic.envs.docker_workspace import CommandResult
-from rl.dataset.contracts import Message, PromptRecord
+from rl.data.contracts import Message, PromptRecord
 
 from examples.search_r1.agent import SearchR1Program
 from examples.search_r1 import container_runtime

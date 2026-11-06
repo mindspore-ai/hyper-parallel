@@ -22,13 +22,14 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from rl.algorithm import build_algorithm
-from rl.cli import load_config
-from rl.config import ColocateAsyncConfig, validate_colocate_async_config, validate_config
-from rl.fully_async.protocol import configuration_fingerprint
-from rl.colocate_async.colocate_async_trainer import ColocateAsyncTrainer
+from rl.config.loader import load_config
+from rl.config.schema import ColocateAsyncConfig
+from rl.config.validate import validate_colocate_async_config, validate_config
+from rl.async_runtime.protocol import configuration_fingerprint
+from rl.trainer.colocate_async import ColocateAsyncTrainer
 from tests.ut.rl.colocate_async.support import trainer_fixture
 
 
@@ -54,8 +55,11 @@ class TestColocateConfig(unittest.TestCase):
         """Verify disabled correction keeps legacy checkpoint fingerprint."""
         roles, _, _ = trainer_fixture()
         config = recipe()
-        with patch("rl.colocate_async.colocate_async_trainer._ColocateRoleRuntime", return_value=roles.roles), patch(
-                "rl.colocate_async.colocate_async_trainer.dist.get_rank", return_value=0):
+        roles._tracker = roles.tracker
+        roles.codex_runtime = None
+        roles.device_handle = Mock()
+        with patch("rl.trainer.colocate_async.build_resources", return_value=roles), patch(
+                "rl.trainer.colocate_async.dist.get_rank", return_value=0):
             legacy = ColocateAsyncTrainer(config)
             self.assertNotIn("off_policy", legacy.config["colocate_async"])
             config["colocate_async"]["off_policy"] = {"mode": "off"}
@@ -154,7 +158,7 @@ class TestColocateConfig(unittest.TestCase):
                     environment = {"ASCEND_RT_VISIBLE_DEVICES": ",".join(map(str, range(world))),
                                    "WORLD_SIZE": str(world), "LOCAL_WORLD_SIZE": str(world)}
                     with patch.dict(os.environ, environment), patch(
-                            "rl.config.torch.accelerator.current_accelerator",
+                            "rl.config.validate.torch.accelerator.current_accelerator",
                             return_value=SimpleNamespace(type="npu")):
                         validate_colocate_async_config(config)
                         del config["colocate_async"]
@@ -163,8 +167,8 @@ class TestColocateConfig(unittest.TestCase):
     def test_normal_sync_import_remains_isolated(self):
         script = (
             "import sys, rl.trainer; "
-            "assert not any(name.startswith('rl.colocate_async') for name in sys.modules); "
-            "assert 'rl.fully_async.fully_async_rollouter' not in sys.modules"
+            "assert not any(name.startswith('rl.trainer.colocate_async') for name in sys.modules); "
+            "assert 'rl.async_runtime.producer' not in sys.modules"
         )
         result = subprocess.run([sys.executable, "-c", script],
                                 env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},

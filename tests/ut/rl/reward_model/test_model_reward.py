@@ -26,12 +26,13 @@ from unittest.mock import patch
 import torch
 
 from rl.agentic.core.types import Action, EpisodeContext, InteractionMode, RewardResult, TurnContext
-from rl.dataset.batch_builder import ExperiencePreparer, build_experience_batch
-from rl.dataset.contracts import Message, PromptRecord, Trajectory, Turn
+from rl.data.experience import ExperiencePreparer, build_experience_batch
+from rl.data.contracts import Message, PromptRecord, Trajectory, Turn
 from rl.reward_model.client import RewardModelClient
 from rl.reward_model.scoring import load_reward_function, score_model_batch, scorer_fingerprint
-from rl.roles.rollout.base import GenerationSettings
-from rl.trainer import SyncTrainer
+from rl.rollout.base import GenerationSettings
+from rl.trainer.sync import SyncTrainer
+from rl.reward_model.runtime import RewardScorer
 from rl.utils.monitoring.metrics import _local_rollout_record, _rollout_metrics
 
 from examples.gsm8k.agent import (
@@ -274,11 +275,13 @@ class TestColocatedScoringOrder(unittest.TestCase):
         """The task callback runs only between RM wake and verified sleep."""
         events = []
         trainer = object.__new__(SyncTrainer)
+        trainer.reward_scorer = None
+        trainer.residency = SimpleNamespace(move=lambda **kw: None, release=lambda: None, offload_manager=None, metrics={})
         trainer.rollout_engine = SimpleNamespace(
             prepare_for_training=lambda: events.append("rollout_sleep"),
             prepare_for_rollout=lambda: events.append("rollout_resume"),
         )
-        trainer._release_training_state_for_rollout = lambda: events.append("release")
+        trainer.residency.release = lambda: events.append("release")
         trainer.parallel_dims = SimpleNamespace(tp_rank=0, tp_size=1)
         trainer.reward_model_config = {"max_concurrency": 2}
         trainer.reward_model_scorer = score_gsm8k_environment_reward
@@ -302,9 +305,12 @@ class TestColocatedScoringOrder(unittest.TestCase):
 
         trainer.reward_model_client = Client()
         scored = SimpleNamespace(metadata={"reward_status": "scored"})
-        with patch("rl.trainer.score_model_batch", side_effect=lambda *_args, **_kwargs: (
+        with patch("rl.reward_model.runtime.score_model_batch", side_effect=lambda *_args, **_kwargs: (
                 events.append("score") or scored)):
-            result = trainer._score_model_rollout((), object(), evaluation=True)
+            result = RewardScorer(reward_model_client=trainer.reward_model_client,
+                reward_model_scorer=trainer.reward_model_scorer, reward_model_scorer_id=trainer.reward_model_scorer_id,
+                reward_model_config=trainer.reward_model_config, parallel_dims=trainer.parallel_dims,
+                rollout_engine=trainer.rollout_engine, residency=trainer.residency).score((), object(), evaluation=True)
         self.assertIs(result, scored)
         self.assertEqual(events, ["rollout_sleep", "release", "rm_wake", "score", "rm_sleep", "rollout_resume"])
         self.assertEqual(trainer.reward_model_client.state, "sleeping")
@@ -313,8 +319,10 @@ class TestColocatedScoringOrder(unittest.TestCase):
         """An exception cannot leave the shared reward service active."""
         events = []
         trainer = object.__new__(SyncTrainer)
+        trainer.reward_scorer = None
+        trainer.residency = SimpleNamespace(move=lambda **kw: None, release=lambda: None, offload_manager=None, metrics={})
         trainer.rollout_engine = SimpleNamespace(prepare_for_training=lambda: events.append("rollout_sleep"))
-        trainer._release_training_state_for_rollout = lambda: events.append("release")
+        trainer.residency.release = lambda: events.append("release")
         trainer.parallel_dims = SimpleNamespace(tp_rank=0, tp_size=1)
         trainer.reward_model_config = {}
         trainer.reward_model_scorer = score_gsm8k_environment_reward
@@ -333,8 +341,11 @@ class TestColocatedScoringOrder(unittest.TestCase):
 
         client.prepare, client.sleep = prepare, sleep
         trainer.reward_model_client = client
-        with patch("rl.trainer.score_model_batch", side_effect=RuntimeError("score failed")):
+        with patch("rl.reward_model.runtime.score_model_batch", side_effect=RuntimeError("score failed")):
             with self.assertRaisesRegex(RuntimeError, "score failed"):
-                trainer._score_model_rollout((), object())
+                RewardScorer(reward_model_client=trainer.reward_model_client,
+                reward_model_scorer=trainer.reward_model_scorer, reward_model_scorer_id=trainer.reward_model_scorer_id,
+                reward_model_config=trainer.reward_model_config, parallel_dims=trainer.parallel_dims,
+                rollout_engine=trainer.rollout_engine, residency=trainer.residency).score((), object())
         self.assertEqual(events, ["rollout_sleep", "release", "rm_wake", "rm_sleep"])
         self.assertEqual(client.state, "sleeping")

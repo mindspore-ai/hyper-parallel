@@ -18,7 +18,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from rl.fully_async.protocol import AsyncCheckpoint
+from rl.async_runtime.protocol import AsyncCheckpoint
 from tests.ut.rl.colocate_async.support import trainer_fixture
 
 
@@ -27,7 +27,7 @@ class TestColocateCheckpoint(unittest.TestCase):
 
     def setUp(self) -> None:
         """Install CPU fixtures and register cleanup for each isolated case."""
-        self.coordinator = patch("rl.colocate_async.colocate_async_trainer.coordinator_call",
+        self.coordinator = patch("rl.trainer.colocate_async.coordinator_call",
                                  side_effect=lambda _, callback: callback())
         self.coordinator.start()
         self.addCleanup(self.coordinator.stop)
@@ -36,18 +36,18 @@ class TestColocateCheckpoint(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.trainer, self.events, _ = trainer_fixture()
         self.directory = Path(self.temporary.name) / "step_1"
-        self.trainer.roles.state.global_step = 1
-        self.trainer.roles.checkpoints.directory.return_value = self.directory
+        self.trainer.state.global_step = 1
+        self.trainer.checkpoints.directory.return_value = self.directory
         self.trainer.rollouter.drain_and_snapshot.side_effect = self._snapshot
-        self.trainer.roles.checkpoints.save.side_effect = self._model_save
+        self.trainer.checkpoints.save.side_effect = self._model_save
 
     def _snapshot(self):
-        self.assertEqual(self.trainer.roles.rollout_engine.phase, "rollout")
+        self.assertEqual(self.trainer.rollout_engine.phase, "rollout")
         self.events.append("snapshot")
         return {"buffer": {}, "source": {"cursor": 5}}
 
     def _model_save(self, state):
-        self.assertEqual(self.trainer.roles.rollout_engine.phase, "training")
+        self.assertEqual(self.trainer.rollout_engine.phase, "training")
         del state
         self.events.append("model_save")
         self.directory.mkdir()
@@ -56,8 +56,8 @@ class TestColocateCheckpoint(unittest.TestCase):
     def test_periodic_last_step_saves_even_when_final_export_disabled(self):
         """Verify periodic last step saves even when final export disabled."""
         self.trainer._save_checkpoint(final=True)
-        self.trainer.roles.checkpoints.save.assert_called_once()
-        self.trainer.roles.checkpoints.finalize.assert_not_called()
+        self.trainer.checkpoints.save.assert_called_once()
+        self.trainer.checkpoints.finalize.assert_not_called()
         state = AsyncCheckpoint.load(str(self.directory), self.trainer.config)
         self.assertEqual(state["execution_mode"], "colocate_async")
         self.assertEqual(state["source"], {"cursor": 5})
@@ -67,17 +67,17 @@ class TestColocateCheckpoint(unittest.TestCase):
         self.trainer.rollouter.resume.assert_not_called()
 
     def test_non_final_save_wakes_the_same_policy_without_republication(self):
-        self.trainer.roles.evaluator = Mock()
-        self.trainer.roles.evaluator.run.side_effect = lambda _: (self.events.append("evaluate") or ({}, []))
+        self.trainer.evaluator = Mock()
+        self.trainer.evaluator.run.side_effect = lambda _: (self.events.append("evaluate") or ({}, []))
         self.trainer._save_checkpoint(final=False)
         self.assertLess(self.events.index("snapshot"), self.events.index("evaluate"))
         self.assertLess(self.events.index("evaluate"), self.events.index("sleep"))
-        self.trainer.roles.publish_policy.assert_not_called()
-        self.trainer.roles.rollout_engine.prepare_for_rollout.assert_called_once_with()
+        self.trainer.publication.publish.assert_not_called()
+        self.trainer.rollout_engine.prepare_for_rollout.assert_called_once_with()
         self.trainer.rollouter.resume.assert_called_once_with(2)
 
     def test_save_failure_has_no_commit_marker_and_does_not_resume(self):
-        self.trainer.roles.checkpoints.save.side_effect = OSError("disk full")
+        self.trainer.checkpoints.save.side_effect = OSError("disk full")
         with self.assertRaisesRegex(OSError, "disk full"):
             self.trainer._save_checkpoint(final=False)
         self.assertFalse((self.directory / "async_complete.json").exists())
@@ -94,14 +94,14 @@ class TestColocateCheckpoint(unittest.TestCase):
     def test_codex_evaluation_hands_off_gateway_and_restores_source(self):
         """Verify codex evaluation hands off gateway and restores source."""
         self.trainer.config["agentic"] = {"runner": "codex"}
-        self.trainer.roles.evaluation_needs_gateway_handoff = True
-        self.trainer.roles.codex_runtime = Mock()
-        self.trainer.roles.codex_runtime.close.side_effect = lambda: self.events.append("eval_gateway_closed")
-        self.trainer.roles.evaluator = Mock()
-        self.trainer.roles.evaluator.run.side_effect = lambda _: (self.events.append("evaluate") or ({}, []))
+        self.trainer.config["agentic"] = {"runner": "codex"}
+        self.trainer.codex_runtime = Mock()
+        self.trainer.codex_runtime.close.side_effect = lambda: self.events.append("eval_gateway_closed")
+        self.trainer.evaluator = Mock()
+        self.trainer.evaluator.run.side_effect = lambda _: (self.events.append("evaluate") or ({}, []))
         previous = self.trainer.rollouter
         previous.close.side_effect = lambda **_: self.events.append("producer_closed")
-        with patch("rl.colocate_async.colocate_async_trainer.ColocateAsyncRollouter") as factory:
+        with patch("rl.trainer.colocate_async.ColocateAsyncRollouter") as factory:
             self.trainer._save_checkpoint(final=False)
         self.assertLess(self.events.index("snapshot"), self.events.index("producer_closed"))
         self.assertLess(self.events.index("producer_closed"), self.events.index("evaluate"))
@@ -117,59 +117,59 @@ class TestColocateCheckpoint(unittest.TestCase):
     def test_codex_evaluation_failure_closes_gateway_without_restart_or_save(self):
         """Verify codex evaluation failure closes gateway without restart or save."""
         self.trainer.config["agentic"] = {"runner": "codex"}
-        self.trainer.roles.evaluation_needs_gateway_handoff = True
-        self.trainer.roles.codex_runtime = Mock()
-        self.trainer.roles.evaluator = Mock()
-        self.trainer.roles.evaluator.run.side_effect = RuntimeError("evaluation failed")
-        with patch("rl.colocate_async.colocate_async_trainer.ColocateAsyncRollouter") as factory:
+        self.trainer.config["agentic"] = {"runner": "codex"}
+        self.trainer.codex_runtime = Mock()
+        self.trainer.evaluator = Mock()
+        self.trainer.evaluator.run.side_effect = RuntimeError("evaluation failed")
+        with patch("rl.trainer.colocate_async.ColocateAsyncRollouter") as factory:
             with self.assertRaisesRegex(RuntimeError, "evaluation failed"):
                 self.trainer._save_checkpoint(final=False)
         self.trainer.rollouter.close.assert_called_once_with(graceful=True)
-        self.trainer.roles.codex_runtime.close.assert_called_once_with()
-        self.trainer.roles.checkpoints.save.assert_not_called()
+        self.trainer.codex_runtime.close.assert_called_once_with()
+        self.trainer.checkpoints.save.assert_not_called()
         factory.assert_not_called()
 
     def test_gateway_close_failure_prevents_save_and_producer_restart(self):
         """Verify gateway close failure prevents save and producer restart."""
         self.trainer.config["agentic"] = {"runner": "codex"}
-        self.trainer.roles.evaluation_needs_gateway_handoff = True
-        self.trainer.roles.codex_runtime = Mock()
-        self.trainer.roles.codex_runtime.close.side_effect = RuntimeError("gateway close failed")
-        self.trainer.roles.evaluator = Mock()
-        self.trainer.roles.evaluator.run.return_value = ({}, [])
-        with patch("rl.colocate_async.colocate_async_trainer.ColocateAsyncRollouter") as factory:
+        self.trainer.config["agentic"] = {"runner": "codex"}
+        self.trainer.codex_runtime = Mock()
+        self.trainer.codex_runtime.close.side_effect = RuntimeError("gateway close failed")
+        self.trainer.evaluator = Mock()
+        self.trainer.evaluator.run.return_value = ({}, [])
+        with patch("rl.trainer.colocate_async.ColocateAsyncRollouter") as factory:
             with self.assertRaisesRegex(RuntimeError, "gateway close failed"):
                 self.trainer._save_checkpoint(final=False)
-        self.trainer.roles.checkpoints.save.assert_not_called()
+        self.trainer.checkpoints.save.assert_not_called()
         factory.assert_not_called()
 
     def test_producer_rebuild_failure_preserves_committed_checkpoint(self):
         """Verify producer rebuild failure preserves committed checkpoint."""
         self.trainer.config["agentic"] = {"runner": "codex"}
-        self.trainer.roles.evaluation_needs_gateway_handoff = True
-        self.trainer.roles.codex_runtime = Mock()
-        self.trainer.roles.evaluator = Mock()
-        self.trainer.roles.evaluator.run.return_value = ({}, [])
+        self.trainer.config["agentic"] = {"runner": "codex"}
+        self.trainer.codex_runtime = Mock()
+        self.trainer.evaluator = Mock()
+        self.trainer.evaluator.run.return_value = ({}, [])
         previous = self.trainer.rollouter
-        with patch("rl.colocate_async.colocate_async_trainer.ColocateAsyncRollouter",
+        with patch("rl.trainer.colocate_async.ColocateAsyncRollouter",
                    side_effect=RuntimeError("producer rebuild failed")):
             with self.assertRaisesRegex(RuntimeError, "producer rebuild failed"):
                 self.trainer._save_checkpoint(final=False)
         state = AsyncCheckpoint.load(str(self.directory), self.trainer.config)
         self.assertEqual(state["source"], {"cursor": 5})
-        self.trainer.roles.codex_runtime.close.assert_called_once_with()
+        self.trainer.codex_runtime.close.assert_called_once_with()
         previous.resume.assert_not_called()
-        self.trainer.roles.publish_policy.assert_not_called()
+        self.trainer.publication.publish.assert_not_called()
 
     def test_non_root_evaluation_never_reads_root_sampler(self):
         """Verify non root evaluation never reads root sampler."""
         self.trainer.rank, self.trainer.rollouter = 1, None
         self.trainer.config["agentic"] = {"runner": "codex"}
-        self.trainer.roles.evaluation_needs_gateway_handoff = True
-        self.trainer.roles.codex_runtime = Mock()
-        self.trainer.roles.evaluator = Mock()
-        self.trainer.roles.evaluator.run.return_value = ({}, [])
-        with patch("rl.colocate_async.colocate_async_trainer.coordinator_call", return_value=None):
+        self.trainer.config["agentic"] = {"runner": "codex"}
+        self.trainer.codex_runtime = Mock()
+        self.trainer.evaluator = Mock()
+        self.trainer.evaluator.run.return_value = ({}, [])
+        with patch("rl.trainer.colocate_async.coordinator_call", return_value=None):
             self.assertTrue(self.trainer._evaluate_checkpoint())
-        self.trainer.roles.evaluator.run.assert_called_once_with(2)
-        self.trainer.roles.codex_runtime.close.assert_called_once_with()
+        self.trainer.evaluator.run.assert_called_once_with(2)
+        self.trainer.codex_runtime.close.assert_called_once_with()

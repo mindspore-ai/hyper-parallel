@@ -24,9 +24,9 @@ import pytest
 import torch
 
 from rl.algorithm import build_algorithm
-from rl.dataset.contracts import ExperienceBatch
-from rl.roles.policy.actor import Actor
-from rl.roles.policy.dynamic_batch import equalize_batch_count, plan_token_batches
+from rl.data.contracts import ExperienceBatch
+from rl.workers.actor import Actor
+from rl.workers.input.batching import equalize_batch_count, plan_token_batches
 
 
 class TokenPolicy(torch.nn.Module):
@@ -134,8 +134,8 @@ def test_dynamic_update_preserves_causal_attention_context_and_loss(budget):
         torch.testing.assert_close(parameter, expected, atol=0, rtol=0)
         assert parameter.grad is None
     experience = replace(experience, old_log_probs=old, reference_log_probs=old)
-    with patch("rl.roles.policy.actor.hsdp_sync_stream"), patch(
-        "rl.roles.policy.actor.clip_grad_norm_", torch.nn.utils.clip_grad_norm_,
+    with patch("rl.workers.engine.optimizer.hsdp_sync_stream"), patch(
+        "rl.workers.engine.optimizer.clip_grad_norm_", torch.nn.utils.clip_grad_norm_,
     ):
         fixed, dynamic = [actor.update(experience) for actor in actors]
     assert dynamic.optimizer_steps == fixed.optimizer_steps == 4
@@ -193,7 +193,7 @@ def test_dp_planning_preserves_membership_and_rejects_empty_calls() -> None:
             """Supply two peer optimizer minibatches without real collectives."""
             assert group == "dp"
             output[:] = [local, [(peer_count, 4), (1, 2)]]
-        with patch("rl.roles.policy.actor.dist.all_gather_object", side_effect=gather):
+        with patch("rl.workers.actor.dist.all_gather_object", side_effect=gather):
             if peer_count == 5:
                 with pytest.raises(ValueError, match="empty batches"):
                     actor._plan_dynamic_update(experience)

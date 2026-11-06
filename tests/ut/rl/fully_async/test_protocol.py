@@ -31,15 +31,15 @@ import rl
 
 from rl.algorithm import GRPOAlgorithm, GRPOConfig
 from rl.algorithm.loss import build_algorithm
-from rl.fully_async.fully_async_rollouter import ExperienceBuffer
-from rl.fully_async.protocol import (
+from rl.async_runtime.producer import ExperienceBuffer
+from rl.async_runtime.protocol import (
     AsyncCheckpoint, AsyncTrainingConfig, SampleGroup, SamplingTask, validate_async_config,
 )
-from rl.cli import load_config
-from rl.config import validate_config
-from rl.dataset.batch_builder import build_experience_batch, ExperiencePreparer
-from rl.dataset.episodes import episode_rows
-from rl.roles.rollout.base import GenerationSettings
+from rl.config.loader import load_config
+from rl.config.validate import validate_config
+from rl.data.experience import build_experience_batch, ExperiencePreparer
+from rl.data.episodes import episode_rows
+from rl.rollout.base import GenerationSettings
 from rl.utils.async_audit import ActorLossAudit, EventTrace
 from tests.ut.rl.fully_async.support import group
 
@@ -57,17 +57,21 @@ class TestExperienceBuffer(unittest.TestCase):
         """Encode and deliver one reserved test group."""
         self.buffer.accept(group(task).encode(2, 65536))
 
-    def test_restore_groups_saved_before_package_rename(self) -> None:
-        """Restore buffered groups whose pickle records the former module path."""
-        legacy = "rl.async_training.protocol"
-        module = sys.modules[SampleGroup.__module__]
-        aliases = {legacy: module, "rl.async_training": ModuleType("rl.async_training")}
-        with patch.dict(sys.modules, aliases), patch.object(SampleGroup, "__module__", legacy), \
-                patch.object(SamplingTask, "__module__", legacy):
-            payload = group(SamplingTask(0, 1, 0)).encode(2, 65536)
+    def test_wire_fields_do_not_persist_python_module_paths(self) -> None:
+        """New snapshots rebuild records from schema fields, independent of import paths."""
+        payload = group(SamplingTask(0, 1, 0)).encode(2, 65536)
+        self.assertNotIn(b"rl.async_runtime.protocol", payload)
+        self.assertNotIn(b"rl.data.contracts", payload)
         self.buffer.load_state_dict({"next_identity": 1, "ready": [payload],
                                      "consumed_groups": 0, "dropped_groups": 0})
         self.assertEqual(self.buffer.select(1)[0].task, SamplingTask(0, 1, 0))
+
+    def test_wire_rejects_unversioned_python_objects(self) -> None:
+        """Historical pickled records are not silently accepted as the new schema."""
+        import pickle
+        payload = pickle.dumps(group(SamplingTask(0, 1, 0)))
+        with self.assertRaisesRegex(ValueError, "Unsupported sample wire schema"):
+            self.buffer.accept(payload)
 
     def test_capacity_includes_selected_batch(self):
         """Test capacity includes selected batch."""
@@ -309,7 +313,7 @@ class TestAsyncConfig(unittest.TestCase):
                     validate_async_config(config)
                     del config["async_training"]
                     with patch.dict("os.environ", {"ASCEND_RT_VISIBLE_DEVICES": "0,1", "WORLD_SIZE": "2"}), patch(
-                            "rl.config.torch.accelerator.current_accelerator",
+                            "rl.config.validate.torch.accelerator.current_accelerator",
                             return_value=SimpleNamespace(type="npu")):
                         validate_config(config, build_algorithm(config["algorithm"]))
 

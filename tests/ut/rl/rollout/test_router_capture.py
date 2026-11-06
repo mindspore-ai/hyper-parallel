@@ -23,11 +23,11 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from rl.roles.rollout.base import GenerationRequest, GenerationSettings
-from rl.roles.rollout.router_capture import (
+from rl.rollout.base import GenerationRequest, GenerationSettings
+from rl.rollout.router_capture import (
     RouterCaptureSpec, decode_router_trace,
 )
-from rl.roles.rollout.vllm import VLLMGenerationEngine, _VLLMHTTPClient
+from rl.rollout.vllm import VLLMGenerationEngine, _VLLMHTTPClient
 
 
 def _payload(array: np.ndarray) -> str:
@@ -112,8 +112,8 @@ class TestRouterCapture(unittest.TestCase):
                 metadata_payloads.append(value)
             output[:] = [metadata_payloads[0], None]
 
-        with patch("rl.roles.rollout.vllm.dist.broadcast", side_effect=broadcast), patch(
-            "rl.roles.rollout.vllm.dist.all_gather_object", side_effect=gather,
+        with patch("rl.rollout.vllm.dist.broadcast", side_effect=broadcast), patch(
+            "rl.rollout.vllm.dist.all_gather_object", side_effect=gather,
         ):
             owner._broadcast_tp_result(request, result, 0)
             owner._trainer_tp_rank = 1

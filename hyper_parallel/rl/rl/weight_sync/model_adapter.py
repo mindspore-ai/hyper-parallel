@@ -29,11 +29,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Mapping, Optional
 
-from rl.weight_sync.layout import describe_source_tensor
 
 # Annotation-only references must not initialize roles while weight_sync is importing.
 if TYPE_CHECKING:
-    from rl.roles.model_setup import VLLMModelRegistration
+    from rl.workers.engine.model import VLLMModelRegistration
 
 
 @dataclass(frozen=True)
@@ -125,55 +124,8 @@ class ModelWeightAdapter:
             mapped[mapped_name] = tensor
         return mapped
 
-    def direct_source_descriptions(
-        self,
-        state_dict: Mapping[str, Any],
-        source_rank: int,
-    ) -> list[dict[str, Any]]:
-        """Describe canonical tensors while retaining physical source ownership."""
-        descriptions = []
-        for name, tensor in sorted(state_dict.items()):
-            mapped_name = self._model.actor_weight_name(name)
-            if mapped_name is None:
-                continue
-            description = describe_source_tensor(mapped_name, tensor, source_rank)
-            description["source_name"] = mapped_name
-            description["source_starts"] = [0] * len(description["global_shape"])
-            expert_slices = self._expert_slices(mapped_name, description["global_shape"])
-            if expert_slices:
-                descriptions.extend(_expert_source_regions(description, expert_slices))
-                continue
-            rows = self._canonical_rows(mapped_name)
-            if rows:
-                descriptions.extend(_canonical_source_regions(description, rows))
-            else:
-                descriptions.append(description)
-        return descriptions
 
 
-def _canonical_source_regions(description: dict[str, Any], rows: tuple) -> list[dict[str, Any]]:
-    """Intersect physical FSDP/TP shards with the model's canonical row ranges."""
-    shape = description["global_shape"]
-    starts = description.get("region_starts")
-    if len(shape) != 2 or starts is None or sum(row.length for row in rows) != shape[0]:
-        raise ValueError(f"Fused Qwen3 source {description['name']!r} requires explicit two-dimensional regions")
-    local_rows, local_columns = description["local_shape"]
-    result = []
-    for row in rows:
-        begin = max(starts[0], row.source_start)
-        end = min(starts[0] + local_rows, row.source_start + row.length)
-        if begin >= end or local_columns == 0:
-            continue
-        result.append({
-            **description,
-            "name": row.name,
-            "global_shape": [row.target_rows, shape[1]],
-            "local_shape": [end - begin, local_columns],
-            "region_starts": [row.target_start + begin - row.source_start, starts[1]],
-            "source_starts": [begin - starts[0], 0],
-            "shard_dim": None,
-        })
-    return result
 
 
 _EXPERT_WEIGHT_PATTERN = re.compile(
@@ -205,30 +157,6 @@ def _expert_weight_slices(name: str, shape: Any, config: Any) -> list[dict[str, 
     return slices
 
 
-def _expert_source_regions(description: dict[str, Any], slices: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Intersect EP/EDP shards without changing physical source tensor axes."""
-    physical_starts = description.get("region_starts")
-    if physical_starts is None:
-        raise ValueError("GroupedExperts publication requires explicit source mesh regions")
-    result = []
-    for entry in slices:
-        starts = [max(left, right) for left, right in zip(physical_starts, entry["starts"])]
-        ends = [min(left + length, right + size) for left, length, right, size in zip(
-            physical_starts, description["local_shape"], entry["starts"], entry["shape"],
-        )]
-        lengths = [end - start for start, end in zip(starts, ends)]
-        if any(length <= 0 for length in lengths):
-            continue
-        result.append({
-            **description,
-            "name": entry["name"],
-            "global_shape": entry["shape"],
-            "local_shape": lengths,
-            "region_starts": [start - base for start, base in zip(starts, entry["starts"])],
-            "source_starts": [start - base for start, base in zip(starts, physical_starts)],
-            "shard_dim": None,
-        })
-    return result
 
 
 def build_model_weight_adapter(
@@ -419,7 +347,7 @@ def _native_qwen3_gate_up_descriptions(
     return descriptions
 
 
-def _native_qwen3_direct_tensors(
+def _native_qwen3_tensors(
     model: Any,
     hf_config: Any,
     tp_rank: int,
@@ -548,40 +476,10 @@ def _native_expert_descriptions(name: str, parameter: Any, layer: Any, config: A
     return descriptions
 
 
-def _adapted_tp_placement(model: Any, name: str, tp_size: int) -> tuple[str, Optional[int]]:
-    """Read the public apply pass's parameter placement for the adapted Qwen3 model."""
-    placements = tuple(getattr(model, "_tp_placements", {}).get(name, ()))
-    if tp_size == 1 and not placements:
-        return "replicate", None
-    if len(placements) != 1:
-        raise ValueError(f"Direct reshard parameter {name!r} requires one TP placement, got {placements}")
-    placement = placements[0]
-    if callable(getattr(placement, "is_shard", None)) and placement.is_shard():
-        return "shard", int(placement.dim)
-    if callable(getattr(placement, "is_replicate", None)) and placement.is_replicate():
-        return "replicate", None
-    raise ValueError(f"Direct reshard parameter {name!r} has unsupported placement {placement!r}")
 
 
-def rollout_tensor_descriptions(
-    model: Any, hf_config: Any, *, is_adapted: bool, tp_rank: int, tp_size: int,
-) -> list[dict[str, Any]]:
-    """Describe Native fused storage or public adapter TP placements."""
-    if not is_adapted:
-        if hf_config is None:
-            raise ValueError("Native Qwen3 direct reshard requires an HF config")
-        return _native_qwen3_direct_tensors(model, hf_config, tp_rank, tp_size)
-    if not hasattr(model, "_tp_placements"):
-        raise ValueError("Adapted direct reshard requires public TP placements")
-    tensors = []
-    for name, parameter in sorted(model.named_parameters()):
-        placement, shard_dim = _adapted_tp_placement(model, name, tp_size)
-        tensors.append({
-            "name": name,
-            "dtype_name": str(parameter.dtype).rsplit(".", maxsplit=1)[-1],
-            "element_size": int(parameter.element_size()),
-            "local_shape": list(parameter.shape),
-            "placement": placement,
-            "shard_dim": shard_dim,
-        })
-    return tensors
+def rollout_tensor_descriptions(model: Any, hf_config: Any, *, tp_rank: int, tp_size: int) -> list[dict[str, Any]]:
+    """Describe native logical weights for full-gather completeness checks."""
+    if hf_config is None:
+        raise ValueError("Native weight coverage requires an HF config")
+    return _native_qwen3_tensors(model, hf_config, tp_rank, tp_size)

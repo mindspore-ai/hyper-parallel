@@ -26,11 +26,11 @@ Read the affected product contract rather than every RL document.
 - Use native Torch APIs. Do not reintroduce Platform dispatch or `get_platform()`.
   Shared HyperParallel modules retain their own model, distributed and coding rules.
 - Shared model loading belongs in `hyper_parallel/models/`; RL Qwen3 construction compatibility belongs in
-  `rl/roles/qwen3_builder.py`, Critic/value-head integration in `rl/roles/policy/critic.py`, and
-  RL-only probability/recomputation adapters in `rl/roles/policy/token_log_probs*.py`.
-- `SyncTrainer` owns synchronous execution; `rl/fully_async/` owns the independent rayless loop.
+  `rl/workers/adapters/qwen3.py`, Critic/value-head integration in `rl/workers/critic.py`, and
+  RL-only probability/recomputation adapters in `rl/workers/adapters/token_log_probs.py` and `log_probs.py`.
+- `SyncTrainer` owns synchronous execution; `rl/async_runtime/` owns the independent rayless loop.
   Both reuse the role runtime and publication machinery. CPU preparation overlap is still synchronous RL.
-- Supported model/algorithm/topology combinations are checked by `rl/config.py` and `rl/roles/model_setup.py`.
+- Supported model/algorithm/topology combinations are checked by `rl/config/validate.py` and `rl/workers/engine/model.py`.
   Consult [support boundaries](../../hyper_parallel/rl/README.md#支持范围),
   [MoE contracts](../../hyper_parallel/rl/docs/moe_code_agent.md#功能与支持边界), and
   [Qwen3.5-family recipes](../../hyper_parallel/rl/examples/swe_smith/README.md#模型配方).
@@ -48,7 +48,7 @@ Read the affected product contract rather than every RL document.
 - Keep sampling probabilities separate from Actor-recomputed anchors. Follow the configured `old_log_prob_source`;
   missing sampling probabilities must not be presented as a zero discrepancy. See the
   [training contract](../../hyper_parallel/rl/docs/architecture.md#一个训练步).
-- Publication supports explicit `full_gather`/`direct_reshard` and IPC/HCCL according to deployment.
+- Publication supports explicit `full_gather` and IPC/HCCL according to deployment.
   Errors propagate without fallback. Asynchronous admission, lag, group consumption and recovery follow the
   [async contract](../../hyper_parallel/rl/docs/architecture.md#rayless-asynchronous-grpo), not synchronous version assumptions.
 - In synchronous Agent execution, infrastructure/unknown failures reject the update; verified model failures may

@@ -25,7 +25,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from rl.trainer import SyncTrainer
+from rl.trainer.sync import SyncTrainer
 from rl.distillation.config import DistillationConfig, parse_distillation_config
 from rl.distillation.monitoring import DistillationMetricAccumulator, validate_probability_gate
 from tests.ut.rl.distillation.test_distillation import batch, configuration
@@ -127,6 +127,8 @@ class TestDistillationMonitoring(unittest.TestCase):
     def test_trainer_rejects_before_actor_critic_and_publication(self) -> None:
         """Exercise the real step pipeline and prove rejected scores cannot reach updates."""
         trainer = object.__new__(SyncTrainer)
+        trainer.reward_scorer = None
+        trainer.residency = SimpleNamespace(move=lambda **kw: None, release=lambda: None, offload_manager=None, metrics={})
         experience = replace(batch(), old_log_probs=torch.full((2, 3), -5.0))
         trainer.state = SimpleNamespace(global_step=0)
         trainer.device = torch.device("cpu")
@@ -141,17 +143,17 @@ class TestDistillationMonitoring(unittest.TestCase):
         trainer.rollout_engine = Mock()
         trainer.actor = Mock()
         trainer.critic = Mock()
-        trainer._score_teacher_rollout = Mock(return_value=experience)
-        trainer._prepare_experience = Mock(return_value=(experience, {}))
-        trainer._release_training_state_for_rollout = Mock()
+        trainer.teacher_scorer = SimpleNamespace(score=Mock(return_value=experience))
+        trainer.targets = SimpleNamespace(prepare=Mock(return_value=(experience, {})))
+        trainer.residency.release = Mock()
         trainer._publish_policy = Mock()
         trainer._complete_step = Mock()
         inputs = {"sample_indices": [0], "input_ids": torch.ones((1, 1), dtype=torch.long),
                   "attention_mask": torch.ones((1, 1), dtype=torch.bool)}
         with (
-            patch("rl.trainer.dist.get_rank", return_value=0),
-            patch("rl.trainer.build_prompt_records", return_value=[]),
-            patch("rl.trainer.pad_agent_call_batch_for_dp", return_value=experience),
+            patch("rl.trainer.sync.dist.get_rank", return_value=0),
+            patch("rl.trainer.sync.build_prompt_records", return_value=[]),
+            patch("rl.trainer.sync.pad_agent_call_batch_for_dp", return_value=experience),
         ):
             with self.assertRaisesRegex(RuntimeError, "pre-update probability gate rejected"):
                 trainer._train_step(inputs)

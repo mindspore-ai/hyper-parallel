@@ -22,10 +22,10 @@ import pytest
 import torch
 
 from rl.algorithm import build_algorithm
-from rl.dataset import ExperiencePreparer
-from rl.dataset.batch_builder import build_experience_batch
-from rl.dataset.contracts import Trajectory, Turn
-from rl.roles.rollout.base import GenerationSettings
+from rl.data.experience import ExperiencePreparer
+from rl.data.experience import build_experience_batch
+from rl.data.contracts import Trajectory, Turn
+from rl.rollout.base import GenerationSettings
 
 
 def _settings() -> GenerationSettings:

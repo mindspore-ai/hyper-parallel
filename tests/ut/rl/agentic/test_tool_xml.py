@@ -20,8 +20,8 @@ import json
 from typing import Any
 import unittest
 
-from rl.tool_protocol import inspect_tool_response
-from rl.tool_xml import inspect_xml_calls
+from rl.tool_protocol.protocol import inspect_tool_response
+from rl.tool_protocol.xml import inspect_xml_calls
 
 
 TOOLS = [{"type": "function", "function": {"name": "add_numbers", "parameters": {

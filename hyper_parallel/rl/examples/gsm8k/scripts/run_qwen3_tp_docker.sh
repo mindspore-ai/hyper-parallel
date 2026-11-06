@@ -378,7 +378,6 @@ docker run --rm --name "${container_name}" --privileged --shm-size="${shm_size}"
 
         args=(
             /run-config.yaml
-            --consistency.enabled=false
             --data.train_path=/data/gsm8k/train.parquet
             --data.max_train_samples=4
             --data.shuffle=false

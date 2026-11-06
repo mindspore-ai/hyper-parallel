@@ -27,9 +27,9 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
 from rl.algorithm import build_algorithm
-from rl.dataset.batch_builder import ExperiencePreparer, build_experience_batch, pad_agent_call_batch_for_dp
-from rl.dataset.contracts import Trajectory, Turn
-from rl.roles.rollout.base import GenerationSettings
+from rl.data.experience import ExperiencePreparer, build_experience_batch, pad_agent_call_batch_for_dp
+from rl.data.contracts import Trajectory, Turn
+from rl.rollout.base import GenerationSettings
 
 
 def _calls(rank: int, version: int) -> tuple[Trajectory, ...]:

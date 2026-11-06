@@ -8,8 +8,6 @@ model:
   attention_implementation: transformers_builtin
   trust_remote_code: false
   tokenizer_trust_remote_code: false
-consistency:
-  enabled: false
 data:
   train_path: /results/swe_smith/train.parquet
   test_path: /results/swe_smith/validation.parquet
@@ -130,6 +128,7 @@ algorithm:
   kl_type: low_var_kl
   loss_aggregation: token-mean
 train:
+  plan_overrides: []
   model_init_cpu_threads: null  # Optional 8 during model build; restore original threads afterward.
   max_steps: 1
   seed: 1234
@@ -144,6 +143,10 @@ train:
     min_gradient_norm: 0.0
     require_mixed_rewards: false
   accelerator:
+    requires_grad_sync: true
+    reshard_after_backward: false
+    loss_parallel: false
+    sequence_parallel: false
     dp_replicate: 1
     dp_shard: 4
     tp: 1

@@ -18,10 +18,10 @@ from unittest.mock import Mock
 
 import torch
 
-from rl.fully_async.protocol import SamplingTask
-from rl.colocate_async.colocate_async_trainer import ColocateAsyncTrainer, _ColocateRoleRuntime
-from rl.config import ColocateAsyncConfig
-from rl.roles.rollout.base import GenerationSettings
+from rl.async_runtime.protocol import SamplingTask
+from rl.trainer.colocate_async import ColocateAsyncTrainer
+from rl.config.schema import ColocateAsyncConfig
+from rl.rollout.base import GenerationSettings
 from rl.utils.monitoring.metrics import ActorUpdateMetrics
 from tests.ut.rl.fully_async.support import group
 
@@ -59,7 +59,6 @@ def trainer_fixture() -> tuple[ColocateAsyncTrainer, list, tuple[bytes, ...]]:
     engine.start_service = Mock(side_effect=lambda: events.append("start_service"))
     update = ActorUpdateMetrics(1., 1., 0., 0., 0., 0., .1, .001, 4, 1)
     roles = SimpleNamespace(
-        resolved_config=trainer.config,
         state=SimpleNamespace(global_step=0, max_steps=1, consumed_samples=0, consumed_tokens=0),
         device=torch.device("cpu"), parallel_dims=SimpleNamespace(dp_rank=0, dp_size=2, tp_rank=0),
         rollout_manager=SimpleNamespace(agent_runner=SimpleNamespace(
@@ -71,10 +70,15 @@ def trainer_fixture() -> tuple[ColocateAsyncTrainer, list, tuple[bytes, ...]]:
         close=Mock(side_effect=lambda: events.append("roles_close")), checkpoints=Mock(),
         evaluation_needs_gateway_handoff=False,
     )
-    roles.evaluate_policy = lambda version: _ColocateRoleRuntime.evaluate_policy(roles, version)
+
     roles.checkpoints.will_save.return_value = False
     roles.checkpoints.config = {}
-    trainer.roles = roles
+    trainer.__dict__.update(vars(roles))
+    trainer.publication = SimpleNamespace(publish=getattr(trainer, "publish_policy", None))
+    trainer.lifecycle = SimpleNamespace(close=getattr(trainer, "close", None))
+    trainer.residency = SimpleNamespace(release=getattr(trainer, "release_training_residency", None))
+    trainer.targets = SimpleNamespace(prepare=lambda batch, *_args: (trainer.prepare_experience(batch), {}))
+    trainer._dp_group_info = None
     trainer.rollouter = Mock()
     trainer.rollouter.sample_batch.side_effect = lambda *_: (events.append("sample_return") or payloads)
     trainer.rollouter.pause.side_effect = lambda: events.append("partial_pause_done")

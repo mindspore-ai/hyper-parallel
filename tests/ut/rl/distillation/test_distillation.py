@@ -17,6 +17,7 @@
 # Tests inspect package-owned state and stage boundaries without public runtime hooks.
 # pylint: disable=protected-access
 
+from contextlib import nullcontext
 import unittest
 import tempfile
 from pathlib import Path
@@ -29,8 +30,8 @@ import torch
 
 from rl.algorithm.distillation import PureDistillationAlgorithm, compose_training_algorithm, compute_opd_loss
 from rl.algorithm.loss import build_algorithm
-from rl.dataset.batch_builder import ExperiencePreparer, pad_agent_call_batch_for_dp
-from rl.dataset.contracts import ExperienceBatch, Trajectory
+from rl.data.experience import ExperiencePreparer, pad_agent_call_batch_for_dp
+from rl.data.contracts import ExperienceBatch, Trajectory
 from rl.distillation.config import (
     distillation_fingerprint,
     DistillationConfig,
@@ -38,8 +39,10 @@ from rl.distillation.config import (
     parse_distillation_config,
 )
 from rl.distillation.teacher import TeacherClient, TeacherManager
-from rl.trainer import SyncTrainer
-from rl.roles.policy.actor import Actor
+from rl.trainer.sync import SyncTrainer
+from rl.workers.targets import TargetPreparer
+from rl.distillation.runtime import TeacherScorer
+from rl.workers.actor import Actor
 from rl.utils.monitoring.metrics import summarize_training_diagnostics
 
 
@@ -244,7 +247,7 @@ class TestDistillation(unittest.TestCase):
             )
             experience = batch(torch.full((2, 3), -1.0))
             experience = replace(experience, old_log_probs=actor.compute_log_probs(experience))
-            with patch("rl.roles.policy.actor.trainer_sequence_log_probs", return_value=None):
+            with nullcontext():
                 update = actor.update(experience)
             self.assertGreater(update.gradient_norm, 0)
             self.assertNotEqual(update.total_loss, 0)
@@ -264,7 +267,7 @@ class TestDistillation(unittest.TestCase):
         )
         experience = batch(torch.full((2, 3), -1.0))
         experience = replace(experience, old_log_probs=actor.compute_log_probs(experience))
-        with patch("rl.roles.policy.actor.trainer_sequence_log_probs", return_value=None):
+        with nullcontext():
             actor.update(experience)
         local = actor.distillation_metrics()
         actor._dp_size = 2
@@ -293,7 +296,7 @@ class TestDistillation(unittest.TestCase):
             device=torch.device("cpu"),
             response_mini_batch_size=2,
         )
-        with patch("rl.roles.policy.actor.trainer_sequence_log_probs", return_value=None):
+        with nullcontext():
             actor.update(batch())
         self.assertEqual(actor.distillation_metrics(), {})
 
@@ -330,7 +333,7 @@ class TestDistillation(unittest.TestCase):
                     experience = replace(
                         batch(torch.full((2, 3), -1.0)) if enabled else batch(), advantages=torch.full((2, 3), 0.5)
                     )
-                    with patch("rl.roles.policy.actor.trainer_sequence_log_probs", return_value=None):
+                    with nullcontext():
                         experience = replace(experience, old_log_probs=actor.compute_log_probs(experience))
                         actor.forward_backward(experience, 0, 2, global_tokens=3, global_sequences=2)
                     gradients.append(model.logits.grad.clone())
@@ -340,6 +343,8 @@ class TestDistillation(unittest.TestCase):
     def test_tp_nonowner_does_not_request_teacher(self) -> None:
         """A TP sibling consumes the owner result without duplicating HTTP requests."""
         trainer = SyncTrainer.__new__(SyncTrainer)
+        trainer.reward_scorer = None
+        trainer.residency = SimpleNamespace(move=lambda **kw: None, release=lambda: None, offload_manager=None, metrics={})
         trainer.parallel_dims = SimpleNamespace(
             tp_size=2, tp_rank=1, device_mesh={"tp": SimpleNamespace(get_group=lambda: "tp")}
         )
@@ -353,16 +358,19 @@ class TestDistillation(unittest.TestCase):
             values[0] = result
 
         with (
-            patch("rl.trainer.dist.get_global_rank", return_value=0),
-            patch("rl.trainer.dist.broadcast_object_list", side_effect=broadcast),
+            patch("rl.distillation.runtime.run_synchronized", side_effect=lambda _, fn: fn()),
+            patch("rl.trainer.sync.dist.get_global_rank", return_value=0),
+            patch("rl.trainer.sync.dist.broadcast_object_list", side_effect=broadcast),
         ):
-            scored = trainer._score_teacher_rollout([], batch())
+            scored = TeacherScorer(teacher_manager=trainer.teacher_manager, parallel_dims=trainer.parallel_dims).score([], batch())
         trainer.teacher_manager.score_batch.assert_not_called()
         self.assertEqual(scored.teacher_keys, result[1])
 
     def test_teacher_failure_prevents_optimizer_and_publication(self) -> None:
         """The train-step pipeline rejects teacher failure before any student update."""
         trainer = SyncTrainer.__new__(SyncTrainer)
+        trainer.reward_scorer = None
+        trainer.residency = SimpleNamespace(move=lambda **kw: None, release=lambda: None, offload_manager=None, metrics={})
         trainer.state = SimpleNamespace(global_step=0)
         trainer.device = torch.device("cpu")
         trainer.rollout_manager = Mock()
@@ -373,16 +381,16 @@ class TestDistillation(unittest.TestCase):
         trainer.actor = Mock()
         trainer._publish_policy = Mock()
         trainer._run_rank_synchronized = lambda operation, callback: callback()
-        trainer._score_teacher_rollout = Mock(side_effect=TimeoutError("teacher unavailable"))
+        trainer.teacher_scorer = SimpleNamespace(score=Mock(side_effect=TimeoutError("teacher unavailable")))
         inputs = {
             "sample_indices": [0],
             "input_ids": torch.ones(1, 2, dtype=torch.long),
             "attention_mask": torch.ones(1, 2, dtype=torch.long),
         }
         with (
-            patch("rl.trainer.dist.get_rank", return_value=0),
-            patch("rl.trainer.build_prompt_records", return_value=[]),
-            patch("rl.trainer.pad_agent_call_batch_for_dp", side_effect=lambda rollout, group: rollout),
+            patch("rl.trainer.sync.dist.get_rank", return_value=0),
+            patch("rl.trainer.sync.build_prompt_records", return_value=[]),
+            patch("rl.trainer.sync.pad_agent_call_batch_for_dp", side_effect=lambda rollout, group: rollout),
             self.assertRaises(TimeoutError),
         ):
             trainer._train_step(inputs)
@@ -482,8 +490,8 @@ class TestProbabilityContract(unittest.TestCase):
                       distillation=DistillationConfig(enabled=True))
         experience = replace(batch(torch.full((2, 3), -1.0)), old_log_probs=torch.full((2, 3), -1.5))
         with patch.object(algorithm, "compute_actor_loss", wraps=algorithm.compute_actor_loss) as task, patch(
-            "rl.roles.policy.actor.compute_opd_loss", wraps=compute_opd_loss
-        ) as opd, patch("rl.roles.policy.actor.trainer_sequence_log_probs", return_value=None):
+            "rl.workers.actor.compute_opd_loss", wraps=compute_opd_loss
+        ) as opd, nullcontext():
             actor.forward_backward(experience, 0, 2, global_tokens=3)
         torch.testing.assert_close(task.call_args.kwargs["old_log_probs"], experience.rollout_log_probs)
         torch.testing.assert_close(opd.call_args.args[1], experience.rollout_log_probs)
@@ -515,6 +523,8 @@ class TestTrainerProbabilityContract(unittest.TestCase):
     def test_prepare_retains_sampling_and_recomputed_probabilities(self) -> None:
         """Preparing teacher targets must preserve both probability identities."""
         trainer = SyncTrainer.__new__(SyncTrainer)
+        trainer.reward_scorer = None
+        trainer.residency = SimpleNamespace(move=lambda **kw: None, release=lambda: None, offload_manager=None, metrics={})
         trainer.algorithm = PureDistillationAlgorithm()
         trainer.teacher_manager = Mock()
         trainer._consistency_profile = "off"
@@ -527,7 +537,10 @@ class TestTrainerProbabilityContract(unittest.TestCase):
         with patch("rl.utils.monitoring.metrics.dist.get_rank", return_value=0), patch(
             "rl.utils.monitoring.metrics.dist.get_world_size", return_value=1
         ):
-            prepared, diagnostics = trainer._prepare_experience(source, True, {})
+            prepared, diagnostics = TargetPreparer(
+                actor=trainer.actor, reference_actor=None, critic=None, algorithm=trainer.algorithm,
+                experience_preparer=trainer.experience_preparer, run_synchronized=trainer._run_rank_synchronized,
+                has_teacher=True).prepare(source, True, {})
         torch.testing.assert_close(prepared.rollout_log_probs, source.rollout_log_probs)
         torch.testing.assert_close(prepared.old_log_probs, expected)
         self.assertGreater(diagnostics["training/rollout_log_probs_diff_max"], 0.12)
@@ -568,7 +581,7 @@ class TestProbabilityPadding(unittest.TestCase):
             del kwargs
             summary.copy_(summary.new_tensor([1, 3]))
 
-        with patch("rl.dataset.batch_builder.dist.all_reduce", side_effect=peer_maximum):
+        with patch("rl.data.experience.dist.all_reduce", side_effect=peer_maximum):
             padded = pad_agent_call_batch_for_dp(source, SimpleNamespace(rank_size=2, group=object()))
         self.assertEqual(tuple(padded.rollout_log_probs.shape), (3, 3))
         torch.testing.assert_close(padded.rollout_log_probs[:2], original)

@@ -102,7 +102,7 @@ def _verify_strict_training(log: str, final: list[str]) -> None:
 def verify_artifacts(output: Path) -> dict:
     """Validate trainable episodes and prove infra failures never reached training."""
     # Keep the host/container broker importable with the standard library only.
-    from rl.tool_diagnostics import aggregate_tool_protocol_summaries  # pylint: disable=import-outside-toplevel
+    from rl.tool_protocol.diagnostics import aggregate_tool_protocol_summaries  # pylint: disable=import-outside-toplevel
 
     requests = list(output.glob("jobs/*/execution-request.json"))
     if not requests:

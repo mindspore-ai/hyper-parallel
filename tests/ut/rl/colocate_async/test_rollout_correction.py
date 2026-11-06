@@ -22,8 +22,8 @@ import torch
 
 from rl.algorithm import build_algorithm
 from rl.algorithm.rollout_correction import correction_metrics, prepare_rollout_correction
-from rl.config import ColocateAsyncConfig, RolloutCorrectionConfig
-from rl.roles.policy.actor import Actor
+from rl.config.schema import ColocateAsyncConfig, RolloutCorrectionConfig
+from rl.workers.actor import Actor
 from tests.ut.rl.colocate_async.support import trainer_fixture
 
 
@@ -177,27 +177,27 @@ class TestRolloutCorrection(unittest.TestCase):
         trainer.settings = replace(trainer.settings, off_policy=replace(self.config, rejection="group",
                                     max_abs_log_ratio=.5, max_refill_rounds=0))
         trainer._correct_experience = lambda batch: (batch, {}, ("0",))
-        with patch("rl.colocate_async.colocate_async_trainer.coordinator_call",
+        with patch("rl.trainer.colocate_async.coordinator_call",
                    side_effect=lambda _, callback: callback()):
             with self.assertRaisesRegex(RuntimeError, "max_refill_rounds"):
                 trainer.train()
-        trainer.roles.actor.update.assert_not_called()
-        trainer.roles.publish_policy.assert_not_called()
+        trainer.actor.update.assert_not_called()
+        trainer.publication.publish.assert_not_called()
         trainer.rollouter.commit_batch.assert_not_called()
         trainer.rollouter.reject_batch_groups.assert_called_once_with(("0",))
-        self.assertEqual(trainer.roles.state.global_step, 0)
+        self.assertEqual(trainer.state.global_step, 0)
 
     def test_refill_resumes_same_version_then_updates_once(self):
         """Verify refill resumes same version then updates once."""
         trainer, events, _ = trainer_fixture()
         trainer.settings = replace(trainer.settings, off_policy=self.config)
         trainer._correct_experience = MockCorrection()
-        with patch("rl.colocate_async.colocate_async_trainer.coordinator_call",
+        with patch("rl.trainer.colocate_async.coordinator_call",
                    side_effect=lambda _, callback: callback()):
             trainer.train()
-        self.assertEqual(trainer.roles.state.global_step, 1)
-        trainer.roles.actor.update.assert_called_once()
-        trainer.roles.publish_policy.assert_called_once_with(2)
+        self.assertEqual(trainer.state.global_step, 1)
+        trainer.actor.update.assert_called_once()
+        trainer.publication.publish.assert_called_once_with(2)
         self.assertLess(events.index("partial_resume_done"), events.index("update_start"))
         self.assertEqual(trainer.rollouter.resume.call_args_list[0].args, (1,))
         trainer.rollouter.commit_batch.assert_called_once()

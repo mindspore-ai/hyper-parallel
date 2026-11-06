@@ -23,8 +23,9 @@ import pytest
 import torch
 
 from rl.algorithm import build_algorithm
-from rl.roles.model_setup import build_role_model, build_role_optimizer
-from rl.roles.policy.actor import Actor
+from rl.workers.engine.model import build_role_model
+from rl.workers.engine.optimizer import build_role_optimizer
+from rl.workers.actor import Actor
 
 
 def test_actor_runtime_distinguishes_trainable_and_reference_roles() -> None:

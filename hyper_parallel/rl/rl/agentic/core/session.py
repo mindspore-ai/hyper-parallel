@@ -31,7 +31,7 @@ from rl.agentic.core.types import (
     TurnContext,
 )
 from rl.agentic.envs.environment import Environment
-from rl.dataset.contracts import PromptRecord, RouterTrace, Trajectory, Turn, resize_router_trace
+from rl.data.contracts import PromptRecord, RouterTrace, Trajectory, Turn, resize_router_trace
 
 _TOOL_COUNTER_NAMES = ("tool_call_count", "tool_success_count", "tool_error_count")
 _RESERVED_TRANSITION_INFO = frozenset(("reward_components", *_TOOL_COUNTER_NAMES))

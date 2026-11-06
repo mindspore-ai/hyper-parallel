@@ -26,7 +26,7 @@ import pytest
 import torch
 from torch.utils.checkpoint import DefaultDeviceType
 
-from rl.roles.policy.token_log_probs_adapter import bind_token_log_probs
+from rl.workers.adapters.log_probs import bind_token_log_probs
 
 pytest.importorskip("transformers", minversion="5.5.4")
 
@@ -229,11 +229,11 @@ class TestSelectedLogProbs(unittest.TestCase):
         for bound in (0, 513, True):
             with self.subTest(chunk_size=bound), self.assertRaisesRegex(ValueError, "chunk_size"):
                 bind_token_log_probs(model, chunk_size=bound)
-        with patch("rl.roles.policy.token_log_probs_adapter.get_hsdp_state", return_value=object()):
+        with patch("rl.workers.adapters.log_probs.get_hsdp_state", return_value=object()):
             with self.assertRaisesRegex(ValueError, "independently sharded lm_head"):
                 bind_token_log_probs(model)
         model.hsdp_scheduler = SimpleNamespace(reshard_after_forward=True)
-        with patch("rl.roles.policy.token_log_probs_adapter.get_hsdp_state",
+        with patch("rl.workers.adapters.log_probs.get_hsdp_state",
                    side_effect=lambda module: object() if module is model else None):
             if model.config.model_type == "qwen3_5_text":
                 with self.assertRaisesRegex(ValueError, "root reshard_after_forward"):

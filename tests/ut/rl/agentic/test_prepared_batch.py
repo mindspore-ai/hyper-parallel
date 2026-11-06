@@ -22,7 +22,7 @@ import threading
 import unittest
 
 from rl.agentic.core.prepared_batch import PreparedProgramBatch
-from rl.dataset.contracts import Message, PromptRecord
+from rl.data.contracts import Message, PromptRecord
 
 
 class TestPreparedProgramBatch(unittest.TestCase):

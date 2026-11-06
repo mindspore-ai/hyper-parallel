@@ -23,8 +23,8 @@ from transformers import Qwen3Config, Qwen3ForCausalLM
 
 from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
-from rl.roles.policy.critic import attach_value_head, build_value_model
-from rl.roles.qwen3_builder import Qwen3ShardingPlanner
+from rl.workers.critic import attach_value_head, build_value_model
+from rl.workers.adapters.qwen3 import Qwen3ShardingPlanner
 from tests.ut.auto_models.distributed.conftest import FakeDeviceMesh
 
 

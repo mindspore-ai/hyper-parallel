@@ -26,9 +26,9 @@ import torch
 import torch.distributed as dist
 import yaml
 
-from rl.dataset.episodes import episode_rows
-from rl.roles.rollout.router_capture import RouterCaptureSpec, decode_router_trace
-from rl.trainer import SyncTrainer
+from rl.data.episodes import episode_rows
+from rl.rollout.router_capture import RouterCaptureSpec, decode_router_trace
+from rl.trainer.sync import SyncTrainer
 
 if __package__:
     from ._agent_train import _padding_counts, _validate_rank_alignment, _verify_captured_tokens

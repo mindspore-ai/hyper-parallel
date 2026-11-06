@@ -16,8 +16,8 @@
 | `infer.py`、`configs/` | 无训练的推理入口、模型配方及固定九例的镜像/任务身份 |
 | `launch.py`、`run_config.py` | 本地或 SSH 沙盒选择、路径和数据/镜像身份核验、可信 controller 生命周期 |
 | `rl/agentic/codex/`、`rl/agentic/envs/docker_workspace.py` | 通用 Codex 协议、原始采样证据、本地/远端工作区 |
-| `rl/roles/policy/token_log_probs_adapter.py` | RL侧动作位置概率、分块词表投影与重计算 |
-| `rl/roles/`、`rl/weight_sync/`、`rl/checkpoint.py` | 训练构造、流式发布、图刷新及完整恢复 |
+| `rl/workers/adapters/log_probs.py` | RL侧动作位置概率、分块词表投影与重计算 |
+| `rl/roles/`、`rl/weight_sync/`、`rl/trainer/checkpoint.py` | 训练构造、流式发布、图刷新及完整恢复 |
 
 ## 任务与评分合同
 

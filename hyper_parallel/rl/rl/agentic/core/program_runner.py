@@ -31,16 +31,16 @@ import torch
 import torch.distributed as dist
 
 from rl.agentic.core.prepared_batch import PreparedProgramBatch
-from rl.dataset.batch_builder import build_experience_batch
-from rl.dataset.contracts import ExperienceBatch, PromptRecord, Trajectory, Turn
-from rl.dataset.episodes import episode_rows
+from rl.data.experience import build_experience_batch
+from rl.data.contracts import ExperienceBatch, PromptRecord, Trajectory, Turn
+from rl.data.episodes import episode_rows
 # Preserve the public imports while host executors use the dependency-free transport module.
 from rl.agentic.core.gateway_transport import (  # pylint: disable=unused-import,useless-import-alias
     GatewayTransportError as GatewayTransportError, request_gateway_json as request_gateway_json,
 )
-from rl.roles.rollout.base import GenerationSettings
-from rl.roles.rollout.router_capture import router_trace_from_capture, router_trace_from_wire, router_trace_to_wire
-from rl.tool_protocol import validate_trainability
+from rl.rollout.base import GenerationSettings
+from rl.rollout.router_capture import router_trace_from_capture, router_trace_from_wire, router_trace_to_wire
+from rl.tool_protocol.protocol import validate_trainability
 
 _NATURAL_STOPS = frozenset({"stop", "tool_calls", "stop_sequence"})
 _LOGGER = logging.getLogger(__name__)

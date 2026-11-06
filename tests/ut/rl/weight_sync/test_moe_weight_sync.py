@@ -24,12 +24,10 @@ from unittest.mock import patch
 
 import torch
 
-from rl.weight_sync.layout import resolve_destination_layouts, resolve_source_layouts
 from rl.weight_sync.model_adapter import ModelWeightAdapter, _native_expert_descriptions
 from rl.weight_sync import vllm_worker
 from rl.weight_sync.ipc import IPCWeightTransport, PhysicalRolloutWorker
-from rl.weight_sync.packed_weight import PackedWeight, pack_direct_bucket, unpack_packed_weights
-from rl.weight_sync.transfer import DirectReshardStrategy
+from rl.weight_sync.packed_weight import PackedWeight, unpack_packed_weights
 
 from hyper_parallel.core.dtensor.placement_types import Shard
 
@@ -80,51 +78,6 @@ class TestMoEWeightSync(unittest.TestCase):
             with self.subTest(failure=failure), self.assertRaises(ValueError):
                 unpack_packed_weights(self.value.view(torch.uint8).flatten(), metadata)
 
-    def test_direct_routes_preserve_physical_expert_storage(self) -> None:
-        """EP/EDP source shards reconstruct non-contiguous rollout expert ownership."""
-        self.config.num_experts = 4
-        for projection, shape, suffix in (("gate_up_proj", (4, 3, 8), "w13_weight"),
-                                          ("down_proj", (4, 4, 3), "w2_weight")):
-            name = f"model.layers.0.mlp.experts.{projection}"
-            full = torch.arange(torch.tensor(shape).prod().item(), dtype=torch.float32).reshape(shape)
-            values, descriptions = {}, []
-            for rank in range(4):
-                ep_rank, edp_rank = divmod(rank, 2)
-                local = full.chunk(2, dim=0)[ep_rank].chunk(2, dim=1)[edp_rank].contiguous()
-                mesh = SimpleNamespace(ndim=2, size=lambda dim: 2,
-                                       get_coordinate=lambda ep=ep_rank, edp=edp_rank: [ep, edp])
-                shard = SimpleNamespace(shape=shape, placements=(Shard(0), Shard(1)), device_mesh=mesh,
-                                        to_local=lambda value=local: value)
-                values[rank] = {name: local}
-                descriptions.append(self.adapter.direct_source_descriptions({name: shard}, rank))
-            sources = resolve_source_layouts(descriptions)
-            workers = []
-            target_name = f"model.layers.0.mlp.experts.{suffix}"
-            targets = [torch.zeros((2,) + shape[1:]) for _ in range(2)]
-            for rank in range(2):
-                mapping = [0, -1, 1, -1] if rank == 0 else [-1, 0, -1, 1]
-                layer = SimpleNamespace(ep_size=2, tp_size=1, tp_rank=0, expert_map=torch.tensor(mapping))
-                tensors = _native_expert_descriptions(target_name, targets[rank], layer, self.config)
-                workers.append({'worker_rank': rank, 'dp_rank': rank, 'tp_rank': 0, 'tp_size': 1, 'tensors': tensors})
-            shapes = {item.name: item.global_shape for item in sources}
-            destinations = resolve_destination_layouts(workers, shapes)
-            plan = DirectReshardStrategy.build_direct_reshard_plan(
-                sources, destinations, source_world_size=4, bucket_size_bytes=32,
-            )
-            self.assertEqual(plan.destination_worker_size, 2)
-            for (source_rank, rank), buckets in plan.buckets.items():
-                for bucket in buckets:
-                    packed = pack_direct_bucket(values[source_rank], bucket, torch.device("cpu"))
-                    for entry in bucket.entries:
-                        value = packed.narrow(0, entry.buffer_offset, entry.num_bytes).view(torch.float32)
-                        region = tuple(slice(start, start + length)
-                                       for start, length in zip(entry.destination_starts, entry.lengths))
-                        targets[rank][region].copy_(value.reshape(entry.lengths))
-            for rank in range(2):
-                torch.testing.assert_close(targets[rank], full[rank::2])
-            workers[1]["tp_rank"] = 1
-            with self.assertRaisesRegex(ValueError, "coordinates"):
-                resolve_destination_layouts(workers, shapes)
 
     def test_full_gather_reload_owns_buffers_and_requires_complete_weights(self) -> None:
         """IPC inputs survive producer release; partial or duplicate updates fail."""

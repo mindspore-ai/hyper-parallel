@@ -7,7 +7,7 @@
 
 首个配方使用 Qwen3-4B 学生与冻结的 Qwen3-30B-A3B 教师。二者必须具有相同的
 `tokenizer.json`、tokenizer 配置和特殊 token 配置。教师是外部管理的独立 vLLM 服务；
-不参与学生 optimizer 或 full_gather/direct_reshard 发布。
+不参与学生 optimizer 或 full_gather 发布。
 
 示例配置学生单 rank、独立单卡推理 TP1；教师建议另外两卡 TP2。A3B 是激活参数量，
 教师仍需装载整个 checkpoint。具体余量取决于权重、缓存、上下文与并发，不保证任意配置可运行。
@@ -56,16 +56,14 @@ rank 本地状态将主参数 DTensor 转为其本地 FP32 张量保存；不序
 小学习率累积、实际主梯度裁剪与恢复见 [精度回归测试](../../../../tests/ut/rl/policy/test_optimizer_precision.py)。
 默认学生训练使用 NPU 0，rollout 使用 YAML 中的 `visible_devices: '1'`；教师另外分配设备。
 指定镜像中的 DP=2 概率偏差已定位到 meta materialization 后未恢复的非持久 RoPE 频率缓冲区。
-RL 的 [materialization 适配](../../rl/roles/materialization.py) 通过已有公共接口，
+RL 的 [materialization 适配](../../rl/workers/engine/materialization.py) 通过已有公共接口，
 仅为 RL builder 构建的 Qwen3 实例注册缓冲区重建：在 CPU 调用原生 HF 公式，再传到目标设备，
-与 Hyper-vLLM 的 canonical 初始化一致；直接在 NPU 重算频率会产生 FP32 微小差异，
+与原生 HF 初始化公式一致；直接在 NPU 重算频率会产生 FP32 微小差异，
 并可能在较大位置改变 BF16 cos/sin。
 注册在分片与 `to_empty` 前完成，覆盖 checkpoint 加载与随机初始化；重复注册不会改变公共类或其他模型实例。
 无需修改 `hyper_parallel/core` 或 `hyper_parallel/models`。
 相关实例隔离与 HF RoPE 对照测试位于 [RL 内的 materialization 测试](../../tests/ut/test_materialization.py)。
-蒸馏示例开启 `consistency.enabled`，使用固定版本的
-[Qwen3 一致性配方](../../docs/qwen3_training_inference_consistency.md#023-概率归一化配方)，
-每批更新前要求有效动作 token 的概率 bit-exact；失败时不更新或发布。
+蒸馏示例使用 native-vLLM，并独立记录 rollout 与训练端重算概率。旧 bit-exact 门禁已删除；Teacher 概率有效性门禁继续阻止无效更新与发布。
 重放通过不替代训练、发布与 checkpoint 验收，默认使用资源需求更低的单 rank 配方。
 
 ## 多教师
@@ -212,7 +210,7 @@ ST 还检查更新前 rollout 与 Actor 的 log-probability 偏差：默认平�
 
 [teacher]: ../../rl/distillation/teacher.py
 [objective]: ../../rl/algorithm/distillation.py
-[trainer]: ../../rl/trainer.py
+[trainer]: ../../rl/trainer/sync.py
 [unit]: ../../../../tests/ut/rl/distillation/test_distillation.py
 [system]: ../../tests/st/test_distillation_st.py
 

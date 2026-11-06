@@ -20,8 +20,8 @@ from types import SimpleNamespace
 
 import torch
 
-from rl.roles.phase_offload import TrainingStateOffload
-from rl.trainer import SyncTrainer
+from rl.workers.engine.offload import TrainingStateOffload
+from rl.workers.engine.residency import TrainingResidency
 
 from hyper_parallel.components.optim.mixed_precision_optimizer import Float16OptimizerWithFloat16Params
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
@@ -97,13 +97,13 @@ class TestResidentOptimizer(unittest.TestCase):
         optimizer = SimpleNamespace(param_groups=[{"params": [parameter]}], state={parameter: {
             "step": torch.tensor(1.0), "exp_avg": torch.empty(2, device="meta"),
         }})
-        SyncTrainer._validate_optimizer_device_residency(optimizer, torch.device("meta"))
+        TrainingResidency.validate_optimizer_device_residency(optimizer, torch.device("meta"))
         optimizer.state[parameter]["exp_avg"] = torch.zeros(2)
         with self.assertRaisesRegex(RuntimeError, "optimizer state"):
-            SyncTrainer._validate_optimizer_device_residency(optimizer, torch.device("meta"))
+            TrainingResidency.validate_optimizer_device_residency(optimizer, torch.device("meta"))
         optimizer.state[parameter]["exp_avg"] = torch.zeros(())
         with self.assertRaisesRegex(RuntimeError, "optimizer state"):
-            SyncTrainer._validate_optimizer_device_residency(optimizer, torch.device("meta"))
+            TrainingResidency.validate_optimizer_device_residency(optimizer, torch.device("meta"))
         optimizer.param_groups[0]["params"] = [torch.zeros(2)]
         with self.assertRaisesRegex(RuntimeError, "optimizer parameter"):
-            SyncTrainer._validate_optimizer_device_residency(optimizer, torch.device("meta"))
+            TrainingResidency.validate_optimizer_device_residency(optimizer, torch.device("meta"))

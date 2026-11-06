@@ -27,7 +27,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from rl.agentic.codex.gateway import _Handler, _State
 from rl.agentic.codex.harness import CodexAgentProgram
 from rl.agentic.core.program_runner import GatewayTransportError
-from rl.dataset.contracts import PromptRecord
+from rl.data.contracts import PromptRecord
 
 
 class TestGatewayEventStorage(unittest.TestCase):

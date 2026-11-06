@@ -20,7 +20,7 @@ from typing import Any, Callable, Mapping, Optional, Protocol
 import torch
 
 from rl.algorithm.advantage import TargetOutput, get_advantage_estimator
-from rl.registry import Registry
+from rl.utils.registry import Registry
 
 
 @dataclass(frozen=True)

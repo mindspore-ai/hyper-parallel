@@ -24,8 +24,8 @@ import torch.distributed as dist
 import torch_npu  # pylint: disable=unused-import
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
-from rl.roles.policy.token_log_probs_adapter import bind_token_log_probs
-from rl.trainer import SyncTrainer
+from rl.workers.adapters.log_probs import bind_token_log_probs
+from rl.trainer.sync import SyncTrainer
 from rl.utils.failure_reporting import report_failure
 
 from hyper_parallel import SkipDTensorDispatch, fully_shard, hsdp_sync_stream

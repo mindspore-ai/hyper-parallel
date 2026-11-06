@@ -24,14 +24,11 @@ import yaml
 import rl
 
 from rl.algorithm import build_algorithm
-from rl.config import (
-    build_model_registration,
-    build_runtime_config,
-    resolve_router_replay_config,
-    resolve_vllm_automatic_limits,
-    validate_config,
-)
-from rl.roles.model_setup import resolve_vllm_model
+from rl.config.schema import build_model_registration
+from rl.config.resolve import build_runtime_config, resolve_router_replay_config
+from rl.config.limits import resolve_vllm_automatic_limits
+from rl.config.validate import validate_config
+from rl.workers.engine.model import resolve_vllm_model
 
 
 @pytest.fixture(name="moe_config")
@@ -75,13 +72,13 @@ def test_moe_runtime_uses_public_recipe_and_native_rollout(moe_config: dict) -> 
     (("train", "accelerator", "ep"), 3, "divide training world_size"),
     (("train", "accelerator", "ep"), 1, "edp_shard requires ep"),
     (("train", "accelerator", "edp_shard"), 0, "positive integer"),
-    (("consistency", "enabled"), True, "consistency off"),
+    (("consistency", "enabled"), True, "consistency was removed"),
 ])
 def test_moe_rejects_unsupported_runtime(moe_config: dict, path: tuple, value: object, error: str) -> None:
     """Unsupported combinations fail before constructing models or process groups."""
     section = moe_config
     for key in path[:-1]:
-        section = section[key]
+        section = section.setdefault(key, {})
     section[path[-1]] = value
     with pytest.raises(ValueError, match=error):
         build_runtime_config(moe_config)

@@ -21,9 +21,9 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from rl.fully_async.fully_async_rollouter import ExperienceBuffer, FullyAsyncRollouter
-from rl.fully_async.fully_async_trainer import FullyAsyncTrainer
-from rl.fully_async.protocol import AsyncCheckpoint, AsyncTrainingConfig, SamplingTask
+from rl.async_runtime.producer import ExperienceBuffer, FullyAsyncRollouter
+from rl.trainer.fully_async import FullyAsyncTrainer
+from rl.async_runtime.protocol import AsyncCheckpoint, AsyncTrainingConfig, SamplingTask
 from tests.ut.rl.fully_async.support import group
 
 
@@ -34,34 +34,44 @@ class TestAsyncDecisions(unittest.TestCase):
         """Test selected checkpoint reaches both restore owners."""
         trainer = FullyAsyncTrainer.__new__(FullyAsyncTrainer)
         trainer.config = {"train": {"checkpoint": {}}}
-        trainer.roles = Mock()
-        trainer.roles.checkpoints.config = {}
-        trainer.roles.checkpoints.validate_resume.side_effect = ValueError("stop before model loading")
+        trainer.checkpoints = Mock()
+        trainer.close = Mock()
+        trainer.state = SimpleNamespace(global_step=0)
+        trainer.publication = SimpleNamespace(publish=getattr(trainer, "publish_policy", None))
+        trainer.lifecycle = SimpleNamespace(close=getattr(trainer, "close", None))
+        trainer.residency = SimpleNamespace(release=getattr(trainer, "release_training_residency", None))
+        trainer.targets = SimpleNamespace(prepare=lambda batch, *_args: (trainer.prepare_experience(batch), {}))
+        trainer._dp_group_info = None
+        trainer.checkpoints.config = {}
+        trainer.checkpoints.validate_resume.side_effect = ValueError("stop before model loading")
         trainer.rank, trainer.sampler, trainer.trace = 0, None, Mock()
-        with patch("rl.fully_async.fully_async_trainer.coordinator_call", side_effect=lambda _, call: call()):
+        with patch("rl.trainer.fully_async.coordinator_call", side_effect=lambda _, call: call()):
             with patch.object(AsyncCheckpoint, "resolve_path", return_value="checkpoints/step_10"):
                 with patch.object(AsyncCheckpoint, "load", return_value=None) as load:
                     with self.assertRaisesRegex(ValueError, "stop before model loading"):
                         trainer.train()
-        self.assertEqual(trainer.roles.checkpoints.config["load_path"], "checkpoints/step_10")
+        self.assertEqual(trainer.checkpoints.config["load_path"], "checkpoints/step_10")
         load.assert_called_once_with("checkpoints/step_10", trainer.config)
-        trainer.roles.checkpoints.begin.assert_not_called()
+        trainer.checkpoints.begin.assert_not_called()
 
     def test_cleanup_preserves_primary_failure_and_attempts_every_resource(self):
         """Test cleanup preserves primary failure and attempts every resource."""
         trainer = FullyAsyncTrainer.__new__(FullyAsyncTrainer)
         trainer.config, trainer.rank = {}, 0
-        trainer.roles, trainer.sampler, trainer.trace = Mock(), Mock(), Mock()
-        trainer.roles.state.global_step = 0
+        trainer.lifecycle = SimpleNamespace(close=Mock())
+        trainer.close = trainer.lifecycle.close
+        trainer.sampler, trainer.trace = Mock(), Mock()
+        trainer.state = SimpleNamespace(global_step=0)
+        trainer.state.global_step = 0
         trainer.sampler.close.side_effect = RuntimeError("sampler cleanup failed")
-        trainer.roles.close.side_effect = RuntimeError("role cleanup failed")
+        trainer.close.side_effect = RuntimeError("role cleanup failed")
         trainer.trace.emit.side_effect = OSError("audit write failed")
-        with patch("rl.fully_async.fully_async_trainer.coordinator_call", side_effect=lambda _, call: call()):
+        with patch("rl.trainer.fully_async.coordinator_call", side_effect=lambda _, call: call()):
             with patch.object(AsyncCheckpoint, "resolve_path", side_effect=ValueError("original failure")):
                 with self.assertRaisesRegex(ValueError, "original failure"):
                     trainer.train()
         trainer.sampler.close.assert_called_once_with(graceful=False)
-        trainer.roles.close.assert_called_once()
+        trainer.close.assert_called_once()
         trainer.trace.emit.assert_called_once_with("run_end", completed=False, update=0)
 
     def test_exhausted_freshness_budget_requests_publish_before_new_sampling(self):
@@ -69,8 +79,12 @@ class TestAsyncDecisions(unittest.TestCase):
         trainer = FullyAsyncTrainer.__new__(FullyAsyncTrainer)
         trainer.settings = AsyncTrainingConfig()
         trainer.buffer = ExperienceBuffer(trainer.settings, 2)
-        trainer.roles = SimpleNamespace(state=SimpleNamespace(global_step=5),
-                                        parallel_dims=SimpleNamespace(dp_size=1))
+        trainer.__dict__.update(vars(SimpleNamespace(state=SimpleNamespace(global_step=5), parallel_dims=SimpleNamespace(dp_size=1))))
+        trainer.publication = SimpleNamespace(publish=getattr(trainer, "publish_policy", None))
+        trainer.lifecycle = SimpleNamespace(close=getattr(trainer, "close", None))
+        trainer.residency = SimpleNamespace(release=getattr(trainer, "release_training_residency", None))
+        trainer.targets = SimpleNamespace(prepare=lambda batch, *_args: (trainer.prepare_experience(batch), {}))
+        trainer._dp_group_info = None
         trainer.sampler = Mock()
         trainer.source_update = 0
         trainer.version = 1
@@ -80,9 +94,9 @@ class TestAsyncDecisions(unittest.TestCase):
     def test_fresh_synchronous_import_does_not_load_async_execution_or_reporting(self):
         """Shared config/data helpers must not activate the asynchronous runtime for SyncTrainer."""
         script = (
-            "import rl.trainer, sys; "
+            "import rl.trainer.sync, sys; "
             "assert not any(name in sys.modules for name in ("
-            "'rl.fully_async', 'rl.roles.rollout.collection', 'rl.utils.monitoring.async_metrics'))"
+            "'rl.async_runtime', 'rl.trainer.fully_async', 'rl.trainer.colocate_async', 'rl.rollout.collection', 'rl.utils.monitoring.async_metrics'))"
         )
         result = subprocess.run([sys.executable, "-c", script],
                                 env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
@@ -97,8 +111,12 @@ class TestPartialPublication(unittest.TestCase):
     def _trainer():
         trainer = FullyAsyncTrainer.__new__(FullyAsyncTrainer)
         trainer.settings = AsyncTrainingConfig()
-        trainer.roles = SimpleNamespace(state=SimpleNamespace(global_step=2),
-                                        publish_policy=Mock(), tracker=Mock())
+        trainer.__dict__.update(vars(SimpleNamespace(state=SimpleNamespace(global_step=2), publish_policy=Mock(), tracker=Mock())))
+        trainer.publication = SimpleNamespace(publish=getattr(trainer, "publish_policy", None))
+        trainer.lifecycle = SimpleNamespace(close=getattr(trainer, "close", None))
+        trainer.residency = SimpleNamespace(release=getattr(trainer, "release_training_residency", None))
+        trainer.targets = SimpleNamespace(prepare=lambda batch, *_args: (trainer.prepare_experience(batch), {}))
+        trainer._dp_group_info = None
         trainer.sampler, trainer.trace = Mock(), Mock()
         return trainer
 
@@ -109,20 +127,20 @@ class TestPartialPublication(unittest.TestCase):
             order = Mock()
             order.attach_mock(trainer.sampler.pause, "pause")
             order.attach_mock(trainer.sampler.drain, "drain")
-            order.attach_mock(trainer.roles.publish_policy, "publish")
+            order.attach_mock(trainer.publication.publish, "publish")
             order.attach_mock(trainer.sampler.resume, "resume")
             with self.subTest(resume=resume), patch(
-                "rl.fully_async.fully_async_trainer.coordinator_call", side_effect=lambda name, call: call(),
+                "rl.trainer.fully_async.coordinator_call", side_effect=lambda name, call: call(),
             ):
                 trainer._publish(resume=resume)
             self.assertEqual([call[0] for call in order.mock_calls],
                              ["pause", "publish", "resume"] if resume else ["drain", "publish"])
-            trainer.roles.publish_policy.assert_called_once_with(3)
+            trainer.publication.publish.assert_called_once_with(3)
 
     def test_failed_publication_never_releases_continuations(self):
         trainer = self._trainer()
-        trainer.roles.publish_policy.side_effect = RuntimeError("transfer failed")
-        with patch("rl.fully_async.fully_async_trainer.coordinator_call", side_effect=lambda name, call: call()):
+        trainer.publication.publish.side_effect = RuntimeError("transfer failed")
+        with patch("rl.trainer.fully_async.coordinator_call", side_effect=lambda name, call: call()):
             with self.assertRaisesRegex(RuntimeError, "transfer failed"):
                 trainer._publish()
         trainer.sampler.resume.assert_not_called()
@@ -130,9 +148,9 @@ class TestPartialPublication(unittest.TestCase):
     def test_non_coordinator_never_dereferences_the_coordinator_only_sampler(self):
         trainer = self._trainer()
         trainer.sampler = None
-        with patch("rl.fully_async.fully_async_trainer.coordinator_call", return_value=None):
+        with patch("rl.trainer.fully_async.coordinator_call", return_value=None):
             trainer._publish()
-        trainer.roles.publish_policy.assert_called_once_with(3)
+        trainer.publication.publish.assert_called_once_with(3)
 
 
 class TestCandidateFailures(unittest.TestCase):

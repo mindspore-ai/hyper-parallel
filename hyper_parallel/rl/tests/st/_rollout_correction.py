@@ -29,11 +29,11 @@ from torch.nn.parallel import DistributedDataParallel
 
 from rl.algorithm import build_algorithm
 from rl.algorithm.rollout_correction import correction_metrics, prepare_rollout_correction
-from rl.fully_async.fully_async_rollouter import AsyncRuntime
-from rl.colocate_async.colocate_async_trainer import ColocateAsyncTrainer
-from rl.config import RolloutCorrectionConfig
-from rl.dataset.contracts import ExperienceBatch
-from rl.roles.policy.actor import Actor
+from rl.async_runtime.producer import AsyncRuntime
+from rl.trainer.colocate_async import ColocateAsyncTrainer
+from rl.config.schema import RolloutCorrectionConfig
+from rl.data.contracts import ExperienceBatch
+from rl.workers.actor import Actor
 from hyper_parallel.rl.tests.st._async_train import TinyPolicy, producer
 from hyper_parallel.rl.tests.st._colocate_train import ColocateTinyRuntime
 
@@ -141,9 +141,9 @@ def test_rejection_refill() -> None:
         """Keep the real spawned producer and coordinator control path."""
         return AsyncRuntime(*args, target=outlier_producer, control_client=client)
 
-    with patch("rl.colocate_async.colocate_async_trainer._ColocateRoleRuntime", ColocateTinyRuntime), patch(
-            "rl.colocate_async.colocate_async_trainer.AsyncGenerationClient.from_config", return_value=Mock()), patch(
-            "rl.colocate_async.colocate_async_rollouter.AsyncRuntime", sampler):
+    with patch("rl.trainer.colocate_async._ColocateRoleRuntime", ColocateTinyRuntime), patch(
+            "rl.trainer.colocate_async.AsyncGenerationClient.from_config", return_value=Mock()), patch(
+            "rl.async_runtime.colocated.AsyncRuntime", sampler):
         trainer = ColocateAsyncTrainer(config)
         trainer.train()
     assert trainer.roles.publications == [1, 2]

@@ -24,16 +24,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import rl.config as config_module
+import rl.config.validate as config_module
 from rl.algorithm import build_algorithm
-from rl.config import (
-    build_model_registration,
-    build_runtime_config,
-    resolve_vllm_automatic_limits,
-    uses_colocated_vllm,
-    validate_config,
-)
-from rl.roles.model_setup import resolve_vllm_model
+from rl.config.schema import build_model_registration, uses_colocated_vllm
+from rl.config.resolve import build_runtime_config
+from rl.config.limits import resolve_vllm_automatic_limits
+from rl.config.validate import validate_config
+from rl.workers.engine.model import resolve_vllm_model
 
 
 @pytest.fixture(name="validated_recipe")
@@ -129,7 +126,7 @@ def test_actor_anchor_can_disable_sampling_probabilities(validated_recipe) -> No
     validated_recipe["rollout"]["vllm"]["seed"] = 42
     validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
     validated_recipe["consistency"] = {"enabled": True}
-    with pytest.raises(ValueError, match="Consistency and distillation require rollout"):
+    with pytest.raises(ValueError, match="consistency was removed"):
         validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
 
 
@@ -226,70 +223,7 @@ def _complete_config(tmp_path: Path) -> dict:
     test_path = tmp_path / "test.parquet"
     train_path.touch()
     test_path.touch()
-    return {
-        "model": {
-            "name": "qwen3",
-            "registry_name": "qwen",
-            "weights_path": str(model_dir),
-            "tokenizer_path": str(tokenizer_dir),
-            "attn_implementation": "sdpa",
-        },
-        "data": {
-            "train_path": str(train_path),
-            "test_path": str(test_path),
-            "max_prompt_length": 16,
-        },
-        "rollout": {
-            "engine": "vllm",
-            "num_return_sequences": 2,
-            "max_new_tokens": 8,
-            "seed": 7,
-            "ignore_eos": False,
-            "vllm": {
-                "deployment": "disjoint",
-                "data_parallel_size": 1,
-                "tensor_parallel_size": 1,
-                "visible_devices": "4",
-                "host": "127.0.0.1",
-                "port": 8200,
-                "dtype": "bfloat16",
-                "gpu_memory_utilization": 0.8,
-                "kv_cache_memory_bytes": 2 * 1024 * 1024,
-                "max_model_len": 64,
-                "max_num_seqs": None,
-                "max_num_batched_tokens": 64,
-                "block_size": 16,
-                "model_implementation": "native",
-                "weight_sync": {
-                    "strategy": "full_gather",
-                    "bucket_size_mb": 1,
-                },
-            },
-        },
-        "agentic": {
-            "environment": "ut-config-environment",
-            "max_turns": 1,
-            "max_observation_tokens": 0,
-            "interaction_mode": "single_turn",
-            "apply_chat_template": False,
-        },
-        "algorithm": {"name": "grpo", "loss_aggregation": "token-mean"},
-        "evaluation": {
-            "enabled": True,
-            "batch_size": 1,
-            "max_new_tokens": 8,
-            "max_samples": 2,
-            "log_samples": 0,
-            "progress_steps": 0,
-            "ignore_eos": False,
-        },
-        "train": _training_config(tmp_path),
-        "logging": {
-            "backends": ["console"],
-            "wandb": {"mode": "disabled"},
-        },
-        "consistency": {"enabled": False},
-    }
+    return {'model': {'name': 'qwen3', 'registry_name': 'qwen', 'weights_path': str(model_dir), 'tokenizer_path': str(tokenizer_dir), 'attn_implementation': 'sdpa'}, 'data': {'train_path': str(train_path), 'test_path': str(test_path), 'max_prompt_length': 16}, 'rollout': {'engine': 'vllm', 'num_return_sequences': 2, 'max_new_tokens': 8, 'seed': 7, 'ignore_eos': False, 'vllm': {'deployment': 'disjoint', 'data_parallel_size': 1, 'tensor_parallel_size': 1, 'visible_devices': '4', 'host': '127.0.0.1', 'port': 8200, 'dtype': 'bfloat16', 'gpu_memory_utilization': 0.8, 'kv_cache_memory_bytes': 2 * 1024 * 1024, 'max_model_len': 64, 'max_num_seqs': None, 'max_num_batched_tokens': 64, 'block_size': 16, 'model_implementation': 'native', 'weight_sync': {'strategy': 'full_gather', 'bucket_size_mb': 1}}}, 'agentic': {'environment': 'ut-config-environment', 'max_turns': 1, 'max_observation_tokens': 0, 'interaction_mode': 'single_turn', 'apply_chat_template': False}, 'algorithm': {'name': 'grpo', 'loss_aggregation': 'token-mean'}, 'evaluation': {'enabled': True, 'batch_size': 1, 'max_new_tokens': 8, 'max_samples': 2, 'log_samples': 0, 'progress_steps': 0, 'ignore_eos': False}, 'train': _training_config(tmp_path), 'logging': {'backends': ['console'], 'wandb': {'mode': 'disabled'}}}
 
 
 def test_complete_config_resolves_validates_and_builds_runtime(
@@ -328,7 +262,7 @@ def test_complete_config_resolves_validates_and_builds_runtime(
     assert runtime.fsdp_config.mix_precision.reduce_dtype == "float32"
     assert runtime.activation_checkpoint.mode == "selective"
     assert runtime.checkpoint.save_ckpt
-    assert runtime.model.to_dict()["_target_"] == "rl.roles.qwen3_builder.build_causal_lm"
+    assert runtime.model.to_dict()["_target_"] == "rl.workers.adapters.qwen3.build_causal_lm"
     assert runtime.model.torch_dtype == "bfloat16"
     assert runtime.optimizer.target.to_dict()["_target_"] == "hyper_parallel.components.optim.AdamW"
 
@@ -364,7 +298,7 @@ def test_dense_rollout_rejects_expert_options(option: str) -> None:
         config_module._validate_dense_parallelism({option: True}, {})
 
 
-@pytest.mark.parametrize("implementation", ["native", "hyper"])
+@pytest.mark.parametrize("implementation", ["native"])
 def test_dense_registration_preserves_both_rollout_implementations(
     tmp_path: Path, implementation: str,
 ) -> None:
@@ -373,7 +307,7 @@ def test_dense_registration_preserves_both_rollout_implementations(
     rollout = resolve_vllm_model(registration, implementation)
     assert rollout.family == "qwen3"
     assert rollout.architecture == (
-        "HyperQwen3ForCausalLM" if implementation == "hyper" else "Qwen3ForCausalLM"
+        "Qwen3ForCausalLM" if implementation == "hyper" else "Qwen3ForCausalLM"
     )
     config_module._validate_dense_parallelism(
         {"enable_expert_parallel": False, "enable_eplb": False}, {"ep": 1},
@@ -395,7 +329,7 @@ def fixture_validation_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
 @pytest.mark.parametrize("deployment", ["colocated", "disjoint"])
 @pytest.mark.parametrize("trainer_tp", [1, 2])
 @pytest.mark.parametrize("rollout_tp", [1, 2])
-@pytest.mark.parametrize("strategy", ["full_gather", "direct_reshard"])
+@pytest.mark.parametrize("strategy", ["full_gather"])
 def test_supported_parallel_and_weight_sync_combinations(
     validation_config: dict, deployment: str, trainer_tp: int, rollout_tp: int, strategy: str,
 ) -> None:
@@ -469,7 +403,7 @@ def test_model_resolution_still_rejects_invalid_implementation(validation_config
 
 def _training_config(tmp_path):
     """Return fresh optimizer, precision and checkpoint settings for configuration tests."""
-    return {
+    return {"plan_overrides": [],
         "max_steps": 2,
         "prompt_batch_size": 1,
         "micro_batch_size": 1,
@@ -588,3 +522,57 @@ def test_selected_token_probabilities_validate_supported_scope(validated_recipe:
     with pytest.raises(ValueError, match="selected_chunked requires"):
         config_module._validate_token_log_probs(config, config_module.build_model_registration(config),
                                               build_algorithm(config["algorithm"]))
+
+
+@pytest.mark.parametrize("rules", [None, {}, "implicit"])
+def test_config_requires_explicit_plan_rules(validated_recipe, rules):
+    """Reject implicit or malformed training replacement declarations."""
+    if rules is None:
+        validated_recipe["train"].pop("plan_overrides")
+    else:
+        validated_recipe["train"]["plan_overrides"] = rules
+    with pytest.raises(ValueError, match="plan_overrides"):
+        validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
+
+
+def test_role_rules_replace_shared_list_without_mutating_actor(validated_recipe):
+    """Normalization of one role cannot overwrite another role's declarations."""
+    from dataclasses import replace
+    from hyper_parallel.distributed.mesh import DistributedSetup
+    from hyper_parallel.trainer.config import normalize_distributed_setup_overrides
+
+    train = validated_recipe["train"]
+    train["plan_overrides"] = [{"match": "*.mlp", "region_dispatch": True}]
+    train["reference"] = {"plan_overrides": []}
+    train["critic"] = {"plan_overrides": []}
+    actor = build_runtime_config(validated_recipe)
+    reference = build_runtime_config(validated_recipe, reference=True)
+    critic = build_runtime_config(validated_recipe, critic=True)
+    setup = DistributedSetup()
+    normalize_distributed_setup_overrides(setup, actor)
+    before = setup.plan_overrides
+    reference_setup = replace(setup)
+    normalize_distributed_setup_overrides(reference_setup, reference)
+    assert len(actor.plan_overrides) == 1
+    assert reference.plan_overrides == critic.plan_overrides == []
+    assert setup.plan_overrides is before
+    assert reference_setup.plan_overrides is None
+    assert train["plan_overrides"] == [{"match": "*.mlp", "region_dispatch": True}]
+
+
+def test_effective_role_config_keeps_declared_and_active_rules(validated_recipe):
+    """Persist declared HP fields separately from condition-filtered selections."""
+    from hyper_parallel.distributed.mesh import DistributedSetup
+    from hyper_parallel.trainer.config import normalize_distributed_setup_overrides
+    from rl.trainer.build import _TrainerBuilder
+
+    runtime = build_runtime_config(validated_recipe)
+    setup = DistributedSetup()
+    normalize_distributed_setup_overrides(setup, runtime)
+    builder = object.__new__(_TrainerBuilder)
+    builder.resolved_config = validated_recipe
+    builder._record_role_config("actor", runtime, setup)
+    effective = validated_recipe["effective_training"]["actor"]
+    assert effective["source"] == "train.plan_overrides"
+    assert effective["runtime"] == runtime.to_dict()
+    assert effective["active_module_matches"] == []

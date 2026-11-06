@@ -15,7 +15,7 @@
 """All-rank colocated reporting; stage scheduling stays with the trainer."""
 from typing import Any, Callable
 
-from rl.fully_async.protocol import behavior_segments, decode_group
+from rl.async_runtime.protocol import behavior_segments, decode_group
 from rl.utils.monitoring.metrics import build_training_metrics, enforce_learning_gate, summarize_rollout
 
 
@@ -38,6 +38,6 @@ def report_colocate_update(roles: Any, rollout: Any, update: Any, diagnostics: C
     )
     metrics = build_training_metrics(step=step, actor_update=update, rollout_metrics=rollout_metrics,
                                      policy=roles.rollout_engine, diagnostic_metrics=diagnostics())
-    enforce_learning_gate(metrics, step=step, config=roles.resolved_config["train"].get("learning_gate", {}),
+    enforce_learning_gate(metrics, step=step, config=roles.config["train"].get("learning_gate", {}),
                           run_synchronized=roles.run_synchronized)
     roles.tracker.log(metrics, step=step, samples=samples)

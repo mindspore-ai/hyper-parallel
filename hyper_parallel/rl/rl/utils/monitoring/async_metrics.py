@@ -16,7 +16,7 @@
 import time
 from typing import Any
 
-from rl.fully_async.protocol import behavior_segments, decode_group
+from rl.async_runtime.protocol import behavior_segments, decode_group
 from rl.utils.monitoring.metrics import build_training_metrics, enforce_learning_gate, summarize_rollout
 from rl.weight_sync.sync import coordinator_call
 
@@ -24,16 +24,16 @@ from rl.weight_sync.sync import coordinator_call
 def report_async_update(trainer: Any, rollout: Any, update: Any, payloads: tuple[bytes, ...],
                         started: float) -> None:
     """Preserve metric names, learning gates and collective order; call on every training rank."""
-    step = trainer.roles.state.global_step
+    step = trainer.state.global_step
     metrics, samples = summarize_rollout(
-        rollout, {"sample_indices": []}, step=trainer.roles.state.global_step, sample_limit=0,
-        is_request_owner=trainer.roles.parallel_dims.tp_rank == 0,
+        rollout, {"sample_indices": []}, step=trainer.state.global_step, sample_limit=0,
+        is_request_owner=trainer.parallel_dims.tp_rank == 0,
     )
     metrics = build_training_metrics(
-        step=trainer.roles.state.global_step, actor_update=update, rollout_metrics=metrics,
-        policy=trainer.roles.rollout_engine,
+        step=trainer.state.global_step, actor_update=update, rollout_metrics=metrics,
+        policy=trainer.rollout_engine,
         diagnostic_metrics={"async/update_seconds": time.monotonic() - started,
-                            "async/policy_lag_updates": trainer.roles.state.global_step - trainer.source_update,
+                            "async/policy_lag_updates": trainer.state.global_step - trainer.source_update,
                             "async/optimizer_steps": trainer.optimizer_steps},
     )
     finished = time.monotonic()
@@ -58,8 +58,8 @@ def report_async_update(trainer: Any, rollout: Any, update: Any, payloads: tuple
         "async/behavior_versions": len({segment["policy_version"] for segment in versions}),
     })
     enforce_learning_gate(
-        metrics, step=trainer.roles.state.global_step,
+        metrics, step=trainer.state.global_step,
         config=trainer.config["train"].get("learning_gate", {}),
-        run_synchronized=trainer.roles.run_synchronized,
+        run_synchronized=trainer.run_synchronized,
     )
-    trainer.roles.tracker.log(metrics, step=trainer.roles.state.global_step, samples=samples)
+    trainer.tracker.log(metrics, step=trainer.state.global_step, samples=samples)

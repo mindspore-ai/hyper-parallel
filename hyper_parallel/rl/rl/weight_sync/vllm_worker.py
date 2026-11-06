@@ -32,8 +32,7 @@ from typing import Any, Mapping, Optional
 import torch  # pylint: disable=forbidden-backend-import
 from safetensors import safe_open
 
-from rl.roles.model_setup import (
-    ADAPTED_QWEN3_ARCHITECTURE,
+from rl.workers.engine.model import (
     NATIVE_QWEN3_ARCHITECTURE,
     NATIVE_QWEN3_MOE_ARCHITECTURE,
     NATIVE_QWEN3_5_ARCHITECTURE,
@@ -44,8 +43,7 @@ from rl.weight_sync.vllm_client import KEEP_SCHEDULER_PAUSED_TAG
 
 _SUPPORTED_ARCHITECTURES = frozenset(
     (
-        ADAPTED_QWEN3_ARCHITECTURE,
-        NATIVE_QWEN3_ARCHITECTURE,
+            NATIVE_QWEN3_ARCHITECTURE,
         NATIVE_QWEN3_MOE_ARCHITECTURE,
         NATIVE_QWEN3_5_ARCHITECTURE,
     )
@@ -159,7 +157,7 @@ def _receive_ack(
     }
 
 
-def get_direct_reshard_layout(worker: Any) -> dict[str, Any]:
+def _native_weight_layout(worker: Any) -> dict[str, Any]:
     """Describe local Qwen3 storage and the worker's physical ownership."""
     if worker.model_runner is None:
         raise RuntimeError("vLLM model runner is not initialized")
@@ -174,7 +172,6 @@ def get_direct_reshard_layout(worker: Any) -> dict[str, Any]:
         "model_type": getattr(getattr(worker.model_config, "hf_config", None), "model_type", "qwen3"),
         "tensors": rollout_tensor_descriptions(
             model, getattr(worker.model_config, "hf_config", None),
-            is_adapted=_is_adapted_worker(worker),
             tp_rank=int(topology["tp_rank"]), tp_size=int(topology["tp_size"]),
         ),
     }
@@ -222,71 +219,8 @@ def _target_tp_rank(value: int, tensor_parallel_size: int) -> int:
     return target
 
 
-def _direct_worker(
-    worker: Any,
-    target_tp_rank: int,
-    data_parallel_size: int,
-    tensor_parallel_size: int,
-) -> tuple[dict[str, Any], int, int, int]:
-    """Resolve one direct RPC's worker and target coordinates."""
-    topology = _rollout_worker_topology(worker)
-    dp_rank, tp_rank = _validate_topology(
-        topology,
-        expected_data_parallel_size=data_parallel_size,
-        expected_tensor_parallel_size=tensor_parallel_size,
-    )
-    target = _target_tp_rank(target_tp_rank, tensor_parallel_size)
-    return topology, dp_rank, tp_rank, target
 
 
-def init_direct_reshard_group(
-    worker: Any,
-    *,
-    group_id: str,
-    target_tp_rank: int,
-    master_address: str,
-    master_port: int,
-    world_size: int,
-    expected_data_parallel_size: int,
-    expected_tensor_parallel_size: int,
-) -> dict[str, Any]:
-    """Join one source-rank-to-target-TP stateless HCCL broadcast group."""
-    _, dp_rank, tp_rank, target_tp_rank = _direct_worker(
-        worker,
-        target_tp_rank,
-        expected_data_parallel_size,
-        expected_tensor_parallel_size,
-    )
-    expected_world_size = 1 + int(expected_data_parallel_size)
-    if int(world_size) != expected_world_size:
-        raise ValueError(
-            "Direct reshard HCCL group world size differs from configured rollout DP: "
-            f"expected={expected_world_size}, actual={world_size}"
-        )
-    if tp_rank != target_tp_rank:
-        return {
-            "joined": False,
-            "dp_rank": dp_rank,
-            "tp_rank": tp_rank,
-            "group_rank": None,
-        }
-    receiver_rank = 1 + dp_rank
-    _join_hccl_group(
-        worker,
-        attribute="_rl_direct_reshard_groups",
-        group_id=group_id,
-        master_address=master_address,
-        master_port=master_port,
-        receiver_rank=receiver_rank,
-        world_size=world_size,
-    )
-    return {
-        "joined": True,
-        "dp_rank": dp_rank,
-        "tp_rank": tp_rank,
-        "group_rank": receiver_rank,
-        "group_id": group_id,
-    }
 
 
 def init_packed_weight_group(
@@ -357,114 +291,12 @@ def _validate_update(worker: Any, policy_version: int, *, transport: str) -> int
     return version
 
 
-def _validate_direct_parameter(
-    parameter: Any, entry: Mapping[str, Any], transport: str, name: str,
-) -> None:
-    """Check that one rollout parameter can receive the planned fragment."""
-    destination_dtype = getattr(torch, str(entry.get("destination_dtype_name", entry["dtype_name"])))
-    destination_element_size = int(entry.get("destination_element_size", entry["element_size"]))
-    if int(parameter.element_size()) != destination_element_size or parameter.dtype != destination_dtype:
-        raise ValueError(
-            f"{transport} parameter {name!r} dtype mismatch: "
-            f"parameter={parameter.dtype}, destination={destination_dtype}"
-        )
 
 
-def _apply_direct_bucket(
-    parameters: Mapping[str, Any],
-    packed: Any,
-    metadata: Mapping[str, Any],
-    *,
-    transport: str,
-) -> int:
-    """Scatter one packed direct bucket into rollout-local parameters."""
-
-    received_bytes = 0
-    for entry in metadata["entries"]:
-        name = str(entry["name"])
-        parameter = parameters.get(name)
-        if parameter is None:
-            raise ValueError(f"{transport} parameter {name!r} is missing")
-        source_dtype = getattr(torch, str(entry["dtype_name"]))
-        _validate_direct_parameter(parameter, entry, transport, name)
-        lengths = tuple(
-            int(value)
-            for value in entry.get("destination_lengths", entry["lengths"])
-        )
-        starts = tuple(int(value) for value in entry["destination_starts"])
-        num_bytes = int(entry["num_bytes"])
-        fragment = packed.narrow(0, int(entry["buffer_offset"]), num_bytes).view(source_dtype).view(lengths)
-        destination_slice = tuple(
-            slice(start, start + length) for start, length in zip(starts, lengths)
-        )
-        target = parameter[destination_slice]
-        if tuple(target.shape) != lengths:
-            raise ValueError(
-                f"{transport} destination {name!r} has shape "
-                f"{tuple(target.shape)}, expected {lengths}"
-            )
-        with torch.no_grad():
-            target.copy_(fragment)
-        received_bytes += num_bytes
-    return received_bytes
 
 
-def receive_direct_reshard(
-    worker: Any,
-    *,
-    group_id: str,
-    target_tp_rank: int,
-    buckets: list[Mapping[str, Any]],
-    policy_version: int,
-    expected_data_parallel_size: int,
-    expected_tensor_parallel_size: int,
-) -> dict[str, Any]:
-    """Receive bounded source fragments and write them into local TP parameters."""
-    topology, dp_rank, tp_rank, target_tp_rank = _direct_worker(
-        worker,
-        target_tp_rank,
-        expected_data_parallel_size,
-        expected_tensor_parallel_size,
-    )
-    if tp_rank != target_tp_rank:
-        return {
-            "received": False,
-            "dp_rank": dp_rank,
-            "tp_rank": tp_rank,
-            "bytes": 0,
-        }
-    version = _validate_update(worker, policy_version, transport="Direct reshard")
-    groups = getattr(worker, "_rl_direct_reshard_groups", {})
-    group = groups.get(group_id)
-    if group is None:
-        raise RuntimeError(f"Direct reshard HCCL group {group_id!r} is not initialized")
-
-    received_bytes = _receive_direct_buckets(worker, group, buckets)
-    worker._rl_pending_policy_version = version
-    return _receive_ack(
-        topology,
-        received_bytes,
-        bucket_count=len(buckets),
-    )
 
 
-def _receive_direct_buckets(worker: Any, group: Any, buckets: list[Mapping[str, Any]]) -> int:
-    """Receive, synchronize and apply each bucket in publication order."""
-    parameters = dict(worker.model_runner.get_model().named_parameters())
-    received_bytes = 0
-    for bucket in buckets:
-        total_bytes = int(bucket["total_bytes"])
-        packed = torch.empty(total_bytes, dtype=torch.uint8, device=group.device)
-        group.broadcast(packed, src=0)
-        torch.npu.current_stream().synchronize()
-        received_bytes += _apply_direct_bucket(
-            parameters,
-            packed,
-            bucket,
-            transport="Direct reshard rollout",
-        )
-        del packed
-    return received_bytes
 
 
 def _ipc_worker(
@@ -505,67 +337,8 @@ def _import_ipc_buffer(handles: Mapping[Any, Any], physical_npu_id: Any) -> Any:
     return rebuild_npu_tensor(*rebuild_args)
 
 
-def _apply_ipc_direct_buckets(
-    worker: Any, buckets: Any, physical_npu_id: Any,
-) -> int:
-    """Import bounded buffers and apply each bucket to local parameters."""
-    parameters = dict(worker.model_runner.get_model().named_parameters())
-    received_bytes = 0
-    imported_buffers = []
-    try:
-        for bucket in buckets:
-            handles = bucket["ipc_handles"]
-            packed = _import_ipc_buffer(handles, physical_npu_id)
-            imported_buffers.append(packed)
-            metadata = bucket["metadata"]
-            if int(packed.numel()) != int(metadata["total_bytes"]):
-                raise ValueError(
-                    "IPC direct reshard packed-buffer size mismatch: "
-                    f"tensor={packed.numel()}, metadata={metadata['total_bytes']}"
-                )
-            received_bytes += _apply_direct_bucket(
-                parameters,
-                packed,
-                metadata,
-                transport="IPC direct reshard",
-            )
-    finally:
-        if imported_buffers:
-            torch.npu.current_stream().synchronize()
-            imported_buffers.clear()
-    return received_bytes
 
 
-def receive_ipc_direct_reshard(
-    worker: Any,
-    *,
-    payload_pickled: str,
-    policy_version: int,
-) -> dict[str, Any]:
-    """Import same-NPU packed buffers and scatter them into TP-local weights."""
-    version = _validate_update(worker, policy_version, transport="IPC direct")
-    payload = pickle.loads(base64.b64decode(payload_pickled.encode("ascii")))
-    topology, physical_npu_id = _ipc_worker(worker, payload["worker_topology"])
-    worker_tp_size = int(topology.get("tp_size", 1))
-    tensor_parallel_size = int(payload["tensor_parallel_size"])
-    if tensor_parallel_size != worker_tp_size:
-        raise ValueError(
-            "IPC direct payload TP size differs from the worker topology: "
-            f"payload={tensor_parallel_size}, worker={worker_tp_size}"
-        )
-    tp_rank = int(topology["tp_rank"])
-    target_rank = (int(topology["dp_rank"]) * tensor_parallel_size + tp_rank
-                   if payload.get("physical_worker_routes", False) else tp_rank)
-    buckets = payload["buckets_by_target"].get(target_rank, ())
-    received_bytes = _apply_ipc_direct_buckets(worker, buckets, physical_npu_id)
-
-    worker._rl_pending_policy_version = version
-    return _receive_ack(
-        topology,
-        received_bytes,
-        physical_device_id=physical_npu_id,
-        bucket_count=len(buckets),
-    )
 
 
 def _load_packed_weights(
@@ -582,10 +355,7 @@ def _load_packed_weights(
     if NATIVE_QWEN3_5_ARCHITECTURE in _worker_architectures(worker):
         _load_qwen3_5_checkpoint_weights(worker, model, weights)
         return
-    if _is_adapted_worker(worker):
-        loaded = model.load_weights(weights, require_all=False)
-    else:
-        loaded = model.load_weights(weights)
+    loaded = model.load_weights(weights)
     if weights and not loaded:
         raise RuntimeError(
             "vLLM load_weights did not accept any parameter from a packed bucket"
@@ -634,7 +404,7 @@ def _load_moe_checkpoint_weights(worker: Any, model: Any, weights: list[tuple[st
     from vllm.model_executor.model_loader.reload import initialize_layerwise_reload  # pylint: disable=C0415
 
     if not getattr(worker, "_rl_layerwise_reload", False):
-        descriptions = get_direct_reshard_layout(worker)["tensors"]
+        descriptions = _native_weight_layout(worker)["tensors"]
         worker._rl_expected_weights = {tensor["name"] for tensor in descriptions}
         worker._rl_received_weights = set()
         with torch.device(worker.device):
@@ -748,9 +518,6 @@ def _worker_architectures(worker: Any) -> frozenset[str]:
     return frozenset(architectures or ())
 
 
-def _is_adapted_worker(worker: Any) -> bool:
-    """Return whether the worker hosts an adapted model."""
-    return ADAPTED_QWEN3_ARCHITECTURE in _worker_architectures(worker)
 
 
 def _is_supported_worker(worker: Any) -> bool:
@@ -947,8 +714,8 @@ def _patch_dp_weight_rpc() -> None:
 
     original = DPLBAsyncMPClient.collective_rpc_async
     weight_methods = frozenset((
-        "get_direct_reshard_layout", "get_policy_version",
-        "receive_ipc_direct_reshard", "receive_ipc_packed_weights",
+        "get_policy_version",
+        "receive_ipc_packed_weights",
     ))
 
     async def collective_rpc_async(
@@ -974,11 +741,7 @@ def install_vllm_weight_sync_hooks(*, private_lifecycle: bool = True) -> None:
     if not hasattr(WorkerBase, "get_policy_version"):
         setattr(WorkerBase, "get_policy_version", get_policy_version)
     for name, method in (
-        ("get_direct_reshard_layout", get_direct_reshard_layout),
-        ("init_direct_reshard_group", init_direct_reshard_group),
         ("init_packed_weight_group", init_packed_weight_group),
-        ("receive_direct_reshard", receive_direct_reshard),
-        ("receive_ipc_direct_reshard", receive_ipc_direct_reshard),
         ("receive_ipc_packed_weights", receive_ipc_packed_weights),
         ("receive_packed_weights", receive_packed_weights),
     ):

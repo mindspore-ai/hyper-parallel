@@ -45,7 +45,7 @@ from rl.agentic.core.program_runner import (
     request_gateway_json,
 )
 from rl.agentic.core.types import RewardResult
-from rl.dataset.contracts import PromptRecord, Trajectory
+from rl.data.contracts import PromptRecord, Trajectory
 
 
 _LOGGER = logging.getLogger(__name__)

@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from rl.tool_protocol import inspect_tool_response
+from rl.tool_protocol.protocol import inspect_tool_response
 
 logger = logging.getLogger(__name__)
 

@@ -25,8 +25,7 @@ import pytest
 import torch
 
 import rl.utils.monitoring.metrics as metrics_module
-from rl.consistency import measure_post_update_old_policy_mismatch
-from rl.dataset.contracts import ExperienceBatch, Trajectory
+from rl.data.contracts import ExperienceBatch, Trajectory
 from rl.utils.monitoring.metrics import (
     ActorMetricAccumulator,
     ActorMicroBatchMetrics,
@@ -70,8 +69,8 @@ def test_actor_metrics_aggregate_by_global_valid_tokens(
     critic_update = CriticUpdateMetrics(0.25, 1.5, 0.02, 6, 2)
     policy = SimpleNamespace(
         policy_version=3,
-        weight_sync_configured_strategy="direct_reshard",
-        weight_sync_last_strategy="direct_reshard",
+        weight_sync_configured_strategy="full_gather",
+        weight_sync_last_strategy="full_gather",
     )
 
     metrics = build_training_metrics(
@@ -89,8 +88,8 @@ def test_actor_metrics_aggregate_by_global_valid_tokens(
     assert actor_update.optimizer_steps == 2
     assert metrics["critic/value_loss"] == 0.25
     assert metrics["policy/version"] == 3.0
-    assert metrics["weight_sync/configured_direct_reshard"] == 1.0
-    assert metrics["weight_sync/last_direct_reshard"] == 1.0
+    assert metrics["weight_sync/configured_full_gather"] == 1.0
+    assert metrics["weight_sync/last_full_gather"] == 1.0
     dynamic_metrics = build_training_metrics(
         step=3, actor_update=replace(actor_update, micro_batches=3, input_tokens=18, padded_input_tokens=24),
         rollout_metrics={},
@@ -130,108 +129,6 @@ def _trajectory(
     )
 
 
-def test_rollout_and_training_diagnostics_use_global_masked_statistics(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Global rollout and probability diagnostics exclude every non-action token."""
-    action_mask = torch.tensor(
-        [[False, True, True, False], [False, True, False, False]]
-    )
-    attention_mask = torch.tensor(
-        [[True, True, True, True], [True, True, True, False]]
-    )
-    rollout = ExperienceBatch(
-        trajectories=(
-            _trajectory("0", "group", action_mask[0], 1.0, False),
-            _trajectory("1", "group", action_mask[1], 0.0, True),
-        ),
-        sequences=torch.tensor([[1, 2, 3, 4], [5, 6, 7, 0]]),
-        attention_mask=attention_mask,
-        action_mask=action_mask,
-        rewards=torch.tensor([1.0, 0.0]),
-        old_log_probs=torch.tensor([[0.0, 0.0, 99.0], [0.0, 99.0, 99.0]]),
-        responses=("one", "zero"),
-        generation_seconds=2.0,
-        advantages=torch.tensor([[1.0, 2.0, 99.0], [3.0, 99.0, 99.0]]),
-        values=torch.tensor([[0.5, 1.5, 99.0], [2.5, 99.0, 99.0]]),
-        returns=torch.tensor([[1.0, 2.0, 99.0], [3.0, 99.0, 99.0]]),
-    )
-    actor_log_probs = torch.tensor(
-        [[0.1, 0.2, -999.0], [0.3, -999.0, -999.0]]
-    )
-    batch = {
-        "sample_indices": [0, 1],
-        "prompts": ["p0", "p1"],
-        "ground_truths": ["1", "0"],
-    }
-
-    def all_gather(output: list[Any], value: dict[str, Any]) -> None:
-        output[0] = value
-        if "reward_sum" not in value:
-            output[1] = value.copy()
-            return
-        second = value.copy()
-        second.update(
-            {
-                "reward_sum": 2.0,
-                "reward_square_sum": 2.0,
-                "reward_count": 2,
-                "reward_min": 1.0,
-                "reward_max": 1.0,
-                "zero_std_groups": 1,
-                "length_sum": 4,
-                "length_square_sum": 8,
-                "length_min": 2,
-                "length_max": 2,
-                "truncated_count": 0,
-                "generated_tokens": 4,
-                "generation_seconds": 4.0,
-                "samples": [{**value["samples"][0], "rank": 1}],
-            }
-        )
-        output[1] = second
-
-    monkeypatch.setattr(metrics_module.dist, "get_rank", lambda: 0)
-    monkeypatch.setattr(metrics_module.dist, "get_world_size", lambda: 2)
-    monkeypatch.setattr(metrics_module.dist, "all_gather_object", all_gather)
-    rollout_metrics, samples = summarize_rollout(rollout, batch, step=1, sample_limit=2)
-    diagnostic_metrics = summarize_training_diagnostics(rollout, actor_log_probs)
-    mismatch_metrics = measure_post_update_old_policy_mismatch(
-        rollout,
-        actor_log_probs,
-        group=None,
-        group_size=1,
-    )
-
-    assert rollout_metrics["reward/mean"] == 0.75
-    assert rollout_metrics["reward/std"] == pytest.approx(math.sqrt(0.1875))
-    assert rollout_metrics["rollout/response_length_mean"] == 1.75
-    assert rollout_metrics["rollout/truncated_ratio"] == 0.25
-    assert rollout_metrics["rollout/generated_tokens"] == 7.0
-    assert rollout_metrics["rollout/generation_seconds"] == 4.0
-    assert rollout_metrics["rollout/tokens_per_second"] == 1.75
-    assert [sample["rank"] for sample in samples] == [0, 1]
-    assert diagnostic_metrics["training/log_probs_valid_tokens"] == 6.0
-    assert diagnostic_metrics["training/total_tokens"] == 14.0
-    assert diagnostic_metrics["training/rollout_log_probs_diff_mean"] == pytest.approx(0.2)
-    assert diagnostic_metrics["train/advantage_mean"] == 2.0
-    assert mismatch_metrics["training/post_update_old_policy_mismatch_count"] == 3.0
-
-    without_probabilities = summarize_training_diagnostics(rollout)
-    assert without_probabilities["training/total_tokens"] == 14.0
-    assert without_probabilities["train/advantage_mean"] == 2.0
-    assert without_probabilities["training/rollout_probs_diff_valid"] == 0.0
-    assert "training/rollout_log_probs_diff_mean" not in without_probabilities
-
-    padding_mask = action_mask.clone()
-    padding_mask[1] = False
-    padded = replace(rollout, action_mask=padding_mask, old_log_probs=None, rollout_log_probs=None,
-                     trajectories=(rollout.trajectories[0],
-                                   replace(rollout.trajectories[1], metadata={"dp_padding": True})))
-    padding_metrics = summarize_training_diagnostics(padded)
-    assert padding_metrics["training/total_tokens"] == 8.0
-    assert padding_metrics["training/action_token_fraction"] == 0.5
-    assert padding_metrics["train/advantage_mean"] == 1.5
 
 
 

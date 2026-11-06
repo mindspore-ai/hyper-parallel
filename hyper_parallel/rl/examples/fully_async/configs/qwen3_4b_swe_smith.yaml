@@ -8,7 +8,6 @@ model:
   attention_implementation: transformers_builtin
   trust_remote_code: false
   tokenizer_trust_remote_code: false
-consistency: {enabled: false}
 data:
   train_path: /results/swe_smith/train.parquet
   test_path: /results/swe_smith/validation.parquet
@@ -129,6 +128,24 @@ algorithm:
   kl_type: low_var_kl
   loss_aggregation: token-mean
 train:
+  plan_overrides:
+  - match:
+    - '*.input_layernorm'
+    - '*.post_attention_layernorm'
+    - model.norm
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3.modeling_qwen3.Qwen3RMSNorm
+      implementation:
+        _target_: hyper_parallel.models.qwen3.adapter.conversion.module_replacement.replace_qwen3_rms_norm
+  - match: '*.self_attn'
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3.modeling_qwen3.Qwen3Attention
+      implementation:
+        _target_: hyper_parallel.models.qwen3.adapter.conversion.module_replacement.replace_qwen3_flash_attention
+  - match: '*.self_attn'
+    region_dispatch: false
   model_init_cpu_threads: null  # Optional 8 during model build; restore original threads afterward.
   max_steps: 2
   seed: 1234

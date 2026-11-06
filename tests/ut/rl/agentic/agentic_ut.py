@@ -68,7 +68,7 @@ def _modules() -> SimpleNamespace:
 
 def _prompt(prompt_id: str = "prompt-1") -> Any:
     """Build the smallest tokenized prompt accepted by Agentic contracts."""
-    contracts = importlib.import_module("rl.dataset.contracts")
+    contracts = importlib.import_module("rl.data.contracts")
     return contracts.PromptRecord(
         prompt_id,
         (contracts.Message("user", "What is 1 + 1?"),),
@@ -877,8 +877,8 @@ def _r3_multiturn_runner(monkeypatch: pytest.MonkeyPatch, *, failure: str = "", 
     """Drive two real runner calls over controlled full-prefix captures and tool feedback."""
     modules = _modules()
     runner_module = importlib.import_module("rl.agentic.core.trajectory_runner")
-    contracts = importlib.import_module("rl.dataset.contracts")
-    rollout = importlib.import_module("rl.roles.rollout.base")
+    contracts = importlib.import_module("rl.data.contracts")
+    rollout = importlib.import_module("rl.rollout.base")
 
     class Environment:
         """Append one observation between actions and one terminal observation."""
@@ -956,7 +956,7 @@ def test_multiturn_router_trace_covers_observations_and_replay(monkeypatch: pyte
     assert trace.valid_mask.tolist() == [True] * 6 + [False, False], (
         f"Final action and terminal observation must remain unrouted: {trace.valid_mask.tolist()}")
     torch.testing.assert_close(trace.expert_ids[:7], engine.traces[-1].expert_ids)
-    replay = importlib.import_module("rl.router_replay").RouterReplay((0, 1), 3, 2)
+    replay = importlib.import_module("rl.workers.adapters.router_replay").RouterReplay((0, 1), 3, 2)
     targets = replay.prepare(batch.router_traces, batch.attention_mask, batch.action_mask)
     with replay.use(targets):
         ids, valid = replay.layer_targets(0)
@@ -977,7 +977,7 @@ def test_multiturn_router_trace_requires_consistent_capture(monkeypatch: pytest.
     with pytest.raises(ValueError, match="required router traces"):
         runner.rollout([_prompt()], 2)
     modules = _modules()
-    contracts = importlib.import_module("rl.dataset.contracts")
+    contracts = importlib.import_module("rl.data.contracts")
     session_type = importlib.import_module("rl.agentic.core.session").AgentSession
     for missing_first in (True, False):
         session = session_type(_prompt(), None, 2, 0, 2)
@@ -1008,7 +1008,7 @@ def test_runner_boundary_validation() -> None:
     """AgentRunner rejects invalid limits, seeds, masks, and stale policies."""
     _modules()
     runner_module = importlib.import_module("rl.agentic.core.trajectory_runner")
-    rollout = importlib.import_module("rl.roles.rollout.base")
+    rollout = importlib.import_module("rl.rollout.base")
     settings = rollout.GenerationSettings(
         max_new_tokens=2,
         temperature=0,
@@ -1043,7 +1043,7 @@ def test_runner_complete_batched_rollout_and_helper_branches(
     """AgentRunner drives active and dummy rows and validates engine boundaries."""
     modules = _modules()
     runner_module = importlib.import_module("rl.agentic.core.trajectory_runner")
-    rollout = importlib.import_module("rl.roles.rollout.base")
+    rollout = importlib.import_module("rl.rollout.base")
 
     class Tokenizer:
         def __call__(self, **_kwargs: Any) -> dict[str, Any]:
@@ -1143,8 +1143,8 @@ def test_runner_complete_batched_rollout_and_helper_branches(
 def test_program_runner_owner_sibling_and_payload_validation(monkeypatch: pytest.MonkeyPatch) -> None:
     """Program runner synchronizes owner results and validates sibling payloads."""
     program_runner = importlib.import_module("rl.agentic.core.program_runner")
-    contracts = importlib.import_module("rl.dataset.contracts")
-    rollout = importlib.import_module("rl.roles.rollout.base")
+    contracts = importlib.import_module("rl.data.contracts")
+    rollout = importlib.import_module("rl.rollout.base")
     settings = rollout.GenerationSettings(
         max_new_tokens=2,
         temperature=0,

@@ -19,7 +19,7 @@ import unittest
 
 import torch
 
-from rl.dataset.contracts import ExperienceBatch, Trajectory, Turn
+from rl.data.contracts import ExperienceBatch, Trajectory, Turn
 
 
 class TestTokenContracts(unittest.TestCase):

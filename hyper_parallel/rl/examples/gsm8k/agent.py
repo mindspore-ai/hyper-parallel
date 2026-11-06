@@ -24,7 +24,7 @@ from rl.agentic.core.types import (
 from rl.agentic.envs.environment import ENVIRONMENTS, ToolEnvironment
 from rl.agentic.tools import INTERACTION_PROTOCOLS, ToolExecutor
 from rl.algorithm.reward import extract_answer
-from rl.dataset.contracts import PromptRecord, Trajectory
+from rl.data.contracts import PromptRecord, Trajectory
 
 from examples.gsm8k.tools import build_calculator_registry
 

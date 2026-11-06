@@ -24,22 +24,17 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from rl.roles.model_setup import ModelRegistration, resolve_vllm_model
+from rl.workers.engine.model import ModelRegistration, resolve_vllm_model
 from rl.weight_sync import transfer as transfer_module
 from rl.weight_sync import vllm_worker
-from rl.weight_sync.packed_weight import PackedWeightAck, pack_direct_bucket
+from rl.weight_sync.packed_weight import PackedWeightAck
 from rl.weight_sync.sync import (
     ActorRolloutWeightSync,
     PolicySnapshot,
     coordinator_call,
     synchronized_call,
 )
-from rl.weight_sync.transfer import (
-    DirectReshardStrategy,
-    FullGatherStrategy,
-    WeightPublisher,
-    WeightSource,
-)
+from rl.weight_sync.transfer import WeightPublisher, WeightSource
 from rl.weight_sync.vllm_client import VLLMWeightSyncClientMixin
 
 
@@ -47,7 +42,7 @@ def _model():
     return resolve_vllm_model(ModelRegistration(
         "qwen", "qwen3", "/model", "/tokenizer",
         "Qwen3ForCausalLM", "qwen3", "qwen3", False,
-    ), "hyper")
+    ), "native")
 
 
 @pytest.fixture(autouse=True)
@@ -126,7 +121,7 @@ class LocalWorkers(VLLMWeightSyncClientMixin):
                 model_runner=SimpleNamespace(get_model=lambda value=model: value),
                 model_config=SimpleNamespace(
                     hf_config=SimpleNamespace(
-                        architectures=["HyperQwen3ForCausalLM"]
+                        architectures=["Qwen3ForCausalLM"]
                     )
                 ),
                 _check_weight_transfer_engine=lambda: None,
@@ -194,7 +189,7 @@ class LocalWorkers(VLLMWeightSyncClientMixin):
         """Represent the scripted collective rpc boundary."""
         del kwargs, base_url
         self.rpc_methods.append(method)
-        if method == "get_direct_reshard_layout":
+        if method == "_native_weight_layout":
             return [self._layout(worker) for worker in self.workers]
         if method == "get_policy_version":
             return [vllm_worker.get_policy_version(worker) for worker in self.workers]
@@ -221,17 +216,6 @@ class LocalWorkers(VLLMWeightSyncClientMixin):
             ],
         }
 
-    def apply(self, rank: Any, metadata: Any, packed: Any, version: Any) -> Any:
-        """Represent the scripted apply boundary."""
-        worker = self.workers[rank]
-        vllm_worker._validate_update(worker, version, transport="CPU test")
-        vllm_worker._apply_direct_bucket(
-            worker.parameters,
-            packed,
-            metadata,
-            transport="CPU test",
-        )
-        worker._rl_pending_policy_version = version
 
 
 class TensorTransport:
@@ -253,14 +237,6 @@ class TensorTransport:
         del unused_client
         return "packed"
 
-    def transfer_direct(self, client: Any, state: Any, plan: Any, version: Any) -> Any:
-        """Execute the scripted direct transport."""
-        for (unused_source, target), buckets in plan.buckets.items():
-            for bucket in buckets:
-                packed = pack_direct_bucket(state, bucket, torch.device("cpu"))
-                client.apply(target, bucket.worker_metadata(), packed, version)
-                if self.fail:
-                    raise RuntimeError("direct transfer failed")
 
     def send_packed_bucket(
         self,
@@ -295,17 +271,8 @@ class TensorTransport:
 def _publication(deployment, strategy, *, sleep_level=1):
     """Assemble an in-process publisher, transport and versioned worker client."""
     source = WeightSource(_model(), 16)
-    selected = (
-        DirectReshardStrategy(
-            source,
-            data_parallel_size=1,
-            tensor_parallel_size=2,
-        )
-        if strategy == "direct_reshard"
-        else FullGatherStrategy(source)
-    )
     wire = TensorTransport("ipc" if deployment == "colocated" else "hccl")
-    publisher = WeightPublisher(selected, wire)
+    publisher = WeightPublisher(source, wire)
     client = LocalWorkers()
     controller = ActorRolloutWeightSync("qwen", deployment, lambda: client, publisher, sleep_level=sleep_level)
     state = {
@@ -332,7 +299,7 @@ def _assert_parameters(client, state):
 
 
 @pytest.mark.parametrize("deployment", ["colocated", "disjoint"])
-@pytest.mark.parametrize("strategy", ["direct_reshard", "full_gather"])
+@pytest.mark.parametrize("strategy", ["full_gather"])
 def test_publication_writes_parameters_and_commits_version(deployment, strategy):
     """Verify parameter contents and policy commit across deployment and strategy combinations."""
     publisher, wire, client, controller, state = _publication(deployment, strategy)
@@ -344,7 +311,7 @@ def test_publication_writes_parameters_and_commits_version(deployment, strategy)
     _assert_parameters(client, state)
     assert controller.policy_version == 1
     assert publisher.last_strategy == strategy
-    assert ("get_direct_reshard_layout" in client.rpc_methods) is (
+    assert ("_native_weight_layout" in client.rpc_methods) is (
         strategy == "direct_reshard"
     )
     assert client.events.index("start") < client.events.index("finish")
@@ -354,7 +321,7 @@ def test_publication_writes_parameters_and_commits_version(deployment, strategy)
 
 
 @pytest.mark.parametrize("deployment", ["colocated", "disjoint"])
-@pytest.mark.parametrize("strategy", ["direct_reshard", "full_gather"])
+@pytest.mark.parametrize("strategy", ["full_gather"])
 def test_transfer_failure_propagates_without_recovery(deployment, strategy):
     """Verify transfer errors propagate without committing or attempting compensation."""
     publisher, wire, client, controller, state = _publication(deployment, strategy)
@@ -450,25 +417,25 @@ def test_graph_refresh_failure_during_kv_wake_cannot_expose_transferred_policy()
 
 def test_strategies_cache_plans_and_reject_missing_sources():
     """Verify plan reuse and rejection of a missing source model."""
-    for strategy_name in ("direct_reshard", "full_gather"):
+    for strategy_name in ("full_gather",):
         publisher, wire, client, unused_controller, state = _publication(
             "disjoint", strategy_name
         )
-        publisher.strategy.prepare(client, state, wire)
+        publisher.prepare(client, state, wire)
         plan = (
-            publisher.strategy._plan
+            publisher._plan
             if strategy_name == "direct_reshard"
-            else publisher.strategy._buckets
+            else publisher._buckets
         )
-        publisher.strategy.prepare(client, state, wire)
+        publisher.prepare(client, state, wire)
         cached = (
-            publisher.strategy._plan
+            publisher._plan
             if strategy_name == "direct_reshard"
-            else publisher.strategy._buckets
+            else publisher._buckets
         )
         assert cached is plan
         with pytest.raises(ValueError, match="missing"):
-            publisher.strategy.prepare(
+            publisher.prepare(
                 client,
                 {"model.norm.weight": state["model.norm.weight"]},
                 wire,

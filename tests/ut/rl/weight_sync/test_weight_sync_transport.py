@@ -31,7 +31,6 @@ import rl.weight_sync.sync as sync_module
 import rl.weight_sync.vllm_client as client_module
 from rl.weight_sync.hccl import HCCLWeightTransport
 from rl.weight_sync.ipc import PhysicalRolloutWorker
-from rl.weight_sync.layout import DirectReshardPlan, TransferBucket, TransferEntry
 
 
 class _Collectives:
@@ -167,18 +166,6 @@ class _Client:
         ]
 
 
-def _plan() -> DirectReshardPlan:
-    """Return one 16-byte source-to-TP route split into two entries."""
-    entries = (
-        TransferEntry("weight", "float32", 4, (0, 0), (0, 0), (1, 2), buffer_offset=0),
-        TransferEntry("weight", "float32", 4, (1, 0), (1, 0), (1, 2), buffer_offset=8),
-    )
-    return DirectReshardPlan(
-        source_world_size=1,
-        destination_tp_size=1,
-        bucket_size_bytes=16,
-        buckets={(0, 0): (TransferBucket(entries, total_bytes=16),)},
-    )
 
 
 def _configure_transport(
@@ -206,34 +193,6 @@ def _configure_transport(
     return transport, client, group
 
 
-def test_hccl_transport_sends_complete_route_and_closes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Production transfer initializes, packs, sends, acknowledges, and closes its route."""
-    transport, client, group = _configure_transport(monkeypatch)
-
-    transport.transfer_direct(
-        client,
-        {"weight": torch.arange(4, dtype=torch.float32).reshape(2, 2)},
-        _plan(),
-        policy_version=2,
-    )
-
-    assert transport._group_ids[(0, 0)] == "hyper-direct-s0-t0-d2-p12345"
-    assert transport._groups[(0, 0)] is group
-    assert len(group.buffers) == 1
-    torch.testing.assert_close(
-        group.buffers[0].view(torch.float32),
-        torch.arange(4, dtype=torch.float32),
-    )
-    assert [call[0] for call in client.calls] == [
-        "init_direct_reshard_group",
-        "receive_direct_reshard",
-    ]
-    transport.close()
-    assert not transport._groups
-    assert not transport._group_ids
-    assert transport._endpoint is None
 
 
 def test_hccl_transport_broadcasts_one_packed_bucket(
@@ -321,21 +280,6 @@ def _configure_ipc(monkeypatch):
     return ipc_module.IPCWeightTransport(), _IPCClient(), exported
 
 
-def test_ipc_direct_packs_and_delivers_through_one_endpoint(monkeypatch):
-    """A direct payload preserves bytes, physical ownership and one RPC per bucket."""
-    transport, client, exported = _configure_ipc(monkeypatch)
-    state = {"weight": torch.arange(4, dtype=torch.float32).reshape(2, 2)}
-    transport.transfer_direct(client, state, _plan(), 1)
-    assert len(client.payloads) == len(exported) == 1
-    torch.testing.assert_close(exported[0].view(torch.float32), state["weight"].flatten())
-    payload = client.payloads[0]
-    assert payload["worker_topology"] == [{"dp_rank": 0, "tp_rank": 0, "physical_device_id": "npu-0"}]
-    assert set(payload["buckets_by_target"][0][0]["ipc_handles"]) == {"npu-0"}
-    assert transport.failed_buffer_count == 0
-    context = transport.prepare(client, 1)
-    assert transport.prepare(client, 1) is context
-    transport.close()
-    assert transport._context is None
 
 
 def test_ipc_retains_unacknowledged_storage_until_close(monkeypatch):
@@ -395,7 +339,7 @@ def test_shared_endpoint_rejects_different_trainer_endpoints(monkeypatch):
         client_module.shared_endpoint(SimpleNamespace(base_url="http://a"))
 
 
-@pytest.mark.parametrize("strategy", ["direct", "packed"])
+@pytest.mark.parametrize("strategy", ["packed"])
 def test_ipc_export_failure_is_synchronized_before_handle_collective(monkeypatch, strategy):
     """An export failure enters error gathering instead of the handle collective."""
     transport, client, unused_exported = _configure_ipc(monkeypatch)
@@ -488,42 +432,3 @@ def test_packed_hccl_propagates_failures_and_retains_buffer(monkeypatch, failure
     assert transport._failed_buffers == [packed]
     transport.close()
     assert not transport._failed_buffers
-
-
-@pytest.mark.parametrize("rank", [0, 1, 2])
-def test_direct_hccl_keeps_coordinator_separate_from_producer(monkeypatch, rank):
-    """Rank zero issues RPC, only rank one packs, and idle ranks share the ACK."""
-    transport, client, group = _configure_transport(monkeypatch)
-    metadata = _plan().for_route(0, 0)[0].worker_metadata()
-    packed = torch.arange(16, dtype=torch.uint8)
-    materialized = []
-    replies = [{"received": True, "dp_rank": dp, "tp_rank": 0, "bytes": 16} for dp in range(2)]
-
-    class TrainerRanks(_Collectives):
-        """Expose the selected trainer rank for collective coordination assertions."""
-        @staticmethod
-        def get_rank():
-            return rank
-
-        @staticmethod
-        def get_world_size():
-            return 3
-
-        @staticmethod
-        def all_gather_object(output, value):
-            assert (value is not None) is (rank == 0)
-            output[:] = [replies, None, None]
-
-    def materialize(index):
-        materialized.append(index)
-        return packed
-
-    monkeypatch.setattr(hccl_module, "dist", TrainerRanks())
-    transport._group_ids[(1, 0)] = "source-1"
-    if rank == 1:
-        transport._groups[(1, 0)] = group
-    sent, copied = transport._broadcast_buffers(client, client.base_url, 1, 0, [metadata], materialize, 1)
-    assert len(client.calls) == int(rank == 0)
-    assert materialized == ([0] if rank == 1 else [])
-    assert len(group.buffers) == int(rank == 1)
-    assert (sent, copied) == (16 if rank == 1 else 0, 16)

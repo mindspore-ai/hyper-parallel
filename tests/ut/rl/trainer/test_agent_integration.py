@@ -23,11 +23,11 @@ import pytest
 import torch
 
 from rl.algorithm import build_algorithm
-from rl.config import validate_config
-from rl.dataset.data_source import collate_prompt_samples
-from rl.evaluation import Evaluator
-from rl.roles.rollout import vllm as vllm_module
-from rl.trainer import SyncTrainer
+from rl.config.validate import validate_config
+from rl.data.prompts import collate_prompt_samples
+from rl.trainer.evaluation import Evaluator
+from rl.rollout import vllm as vllm_module
+from rl.trainer.sync import SyncTrainer
 from rl.utils.monitoring import metrics as metrics_module
 
 
@@ -99,17 +99,20 @@ def test_server_shutdown_drains_children_before_escalation(
 def test_final_checkpoint_shutdown_is_once_and_preserves_retry_on_failure() -> None:
     """The engine is released before training-state release, and failed close is not marked complete."""
     trainer = object.__new__(SyncTrainer)
+    trainer.reward_scorer = None
+    trainer.residency = SimpleNamespace(move=lambda **kw: None, release=lambda: None, offload_manager=None, metrics={})
     events = []
     trainer.rollout_engine = SimpleNamespace(close=lambda: events.append("close"))
-    trainer._release_training_state_for_rollout = lambda: events.append("release")
+    trainer.lifecycle = SimpleNamespace(_rollout_closed_for_final_checkpoint=False)
+    trainer.residency.release = lambda: events.append("release")
     trainer._close_rollout_for_final_checkpoint()
     trainer._close_rollout_for_final_checkpoint()
     assert events == ["close", "release"]
-    trainer._rollout_closed_for_final_checkpoint = False
+    trainer.lifecycle._rollout_closed_for_final_checkpoint = False
     trainer.rollout_engine.close = Mock(side_effect=RuntimeError("close failed"))
     with pytest.raises(RuntimeError, match="close failed"):
         trainer._close_rollout_for_final_checkpoint()
-    assert not trainer._rollout_closed_for_final_checkpoint
+    assert not trainer.lifecycle._rollout_closed_for_final_checkpoint
 
 
 @pytest.mark.parametrize("runner", ["codex", "deepseek"])

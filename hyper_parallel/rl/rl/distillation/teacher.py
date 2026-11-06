@@ -24,7 +24,7 @@ from urllib.request import Request, urlopen
 
 import torch
 
-from rl.dataset.contracts import ExperienceBatch
+from rl.data.contracts import ExperienceBatch
 from rl.distillation.config import (
     DistillationConfig, TeacherConfig, distillation_fingerprint, teacher_weight_files, tokenizer_identity,
 )

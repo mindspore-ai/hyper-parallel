@@ -28,9 +28,9 @@ import yaml
 from examples import gsm8k
 from rl.algorithm import GSPOAlgorithm, GSPOConfig, build_algorithm
 from rl.algorithm.loss import GSPOPolicyObjective
-from rl.dataset.batch_builder import ExperiencePreparer
-from rl.dataset.contracts import ExperienceBatch
-from rl.roles.policy.actor import Actor
+from rl.data.experience import ExperiencePreparer
+from rl.data.contracts import ExperienceBatch
+from rl.workers.actor import Actor
 from rl.utils.monitoring.metrics import ActorMetricAccumulator, ActorMicroBatchMetrics, build_training_metrics
 
 
@@ -94,9 +94,9 @@ def _actor(micro_batch_size: int = 4, dp_size: int = 1, name: str = "gspo", epoc
 def _cpu_optimizer_context() -> ExitStack:
     """Mock only hardware orchestration, retaining Torch backward and SGD."""
     stack = ExitStack()
-    stack.enter_context(patch("rl.roles.policy.actor.hsdp_sync_stream"))
-    stack.enter_context(patch("rl.roles.policy.actor.SkipDTensorDispatch", nullcontext))
-    stack.enter_context(patch("rl.roles.policy.actor.clip_grad_norm_", torch.nn.utils.clip_grad_norm_))
+    stack.enter_context(patch("rl.workers.engine.optimizer.hsdp_sync_stream"))
+    stack.enter_context(patch("rl.workers.engine.optimizer.SkipDTensorDispatch", nullcontext))
+    stack.enter_context(patch("rl.workers.engine.optimizer.clip_grad_norm_", torch.nn.utils.clip_grad_norm_))
     return stack
 
 
@@ -309,7 +309,7 @@ class TestGSPOActor(unittest.TestCase):
         gradients = []
         for start, end in ((0, 1), (1, 4)):
             actor = _actor(dp_size=2)
-            with patch("rl.roles.policy.actor.dist.all_reduce") as reduce:
+            with patch("rl.workers.actor.dist.all_reduce") as reduce:
                 actor.forward_backward(experience, start, end, global_tokens=6, global_sequences=3)
                 self.assertEqual(reduce.call_args.kwargs["group"], "dp-only")
             gradients.append(actor.actor_model.weight.grad)
@@ -325,7 +325,7 @@ class TestGSPOActor(unittest.TestCase):
             torch.testing.assert_close(counts, torch.tensor([6, 3]))
             counts.add_(torch.tensor([9, 2]))
 
-        with patch("rl.roles.policy.actor.dist.all_reduce", side_effect=add_remote):
+        with patch("rl.workers.actor.dist.all_reduce", side_effect=add_remote):
             counts = actor._global_batch_counts(  # pylint: disable=protected-access
                 _experience().loss_action_mask
             )
@@ -359,7 +359,7 @@ class TestGSPOActor(unittest.TestCase):
             self.assertEqual(group, "dp-only")
             errors[:] = [None, "non-finite rewards"]
 
-        with patch("rl.roles.policy.actor.dist.all_gather_object", side_effect=remote_failure):
+        with patch("rl.workers.actor.dist.all_gather_object", side_effect=remote_failure):
             with self.assertRaisesRegex(ValueError, "non-finite rewards"):
                 actor.update(_experience())
 
@@ -393,8 +393,8 @@ class TestGSPOActor(unittest.TestCase):
                 tensor.mul_(2)
 
         with _cpu_optimizer_context(), \
-                patch("rl.roles.policy.actor.dist.all_gather_object", side_effect=gather), \
-                patch("rl.roles.policy.actor.dist.all_reduce", side_effect=reduce), \
+                patch("rl.workers.actor.dist.all_gather_object", side_effect=gather), \
+                patch("rl.workers.actor.dist.all_reduce", side_effect=reduce), \
                 patch.object(actor, "_set_gradient_sync") as sync:
             metrics = actor.update(_experience())
         self.assertEqual(count_inputs, [[6, 3], [6, 3]])

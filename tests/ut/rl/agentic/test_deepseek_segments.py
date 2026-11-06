@@ -23,7 +23,7 @@ import torch
 
 from rl.agentic.core.types import RewardResult
 from rl.agentic.ds_harness import harness
-from rl.dataset.contracts import Message, PromptRecord
+from rl.data.contracts import Message, PromptRecord
 
 
 

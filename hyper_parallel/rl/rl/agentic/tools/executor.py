@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 from rl.agentic.core.types import Action, ToolCall, ToolResult, TurnContext
-from rl.registry import Registry
+from rl.utils.registry import Registry
 
 
 _DEFAULT_MAX_CONCURRENCY = 4

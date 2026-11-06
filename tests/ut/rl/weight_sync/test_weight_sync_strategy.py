@@ -17,10 +17,10 @@
 import pytest
 
 import rl.weight_sync.transfer as transfer_module
-from rl.roles.model_setup import ModelRegistration, resolve_vllm_model
-from rl import weight_sync
+from rl.workers.engine.model import ModelRegistration, resolve_vllm_model
+import rl.weight_sync.transfer as weight_sync
 from rl.weight_sync.config import resolve_weight_sync_config
-from rl.weight_sync.transfer import build_weight_transfer
+from rl.weight_sync.transfer import build_weight_publisher
 
 
 def _rollout_model():
@@ -35,25 +35,21 @@ def _rollout_model():
         "qwen3",
         True,
     )
-    return resolve_vllm_model(model, "hyper")
+    return resolve_vllm_model(model, "native")
 
 
 @pytest.mark.parametrize("deployment, transport_name", [("colocated", "ipc"), ("disjoint", "hccl")])
-@pytest.mark.parametrize("strategy", ["direct_reshard", "full_gather"])
+@pytest.mark.parametrize("strategy", ["full_gather"])
 @pytest.mark.parametrize("tp_size", [1, 2])
 def test_weight_sync_preserves_explicit_strategy_for_tp1_and_tp2(deployment, transport_name, strategy, tp_size):
     """All combinations reuse the publisher while preserving the explicit strategy."""
-    result = build_weight_transfer(
+    result = build_weight_publisher(
         deployment, _rollout_model(), tensor_parallel_size=tp_size, data_parallel_size=2,
         bucket_size_bytes=64, strategy=strategy,
     )
     assert result.configured_strategy == strategy
-    assert result.strategy.name == strategy
     assert result.transport.name == transport_name
-    assert result.strategy.source.bucket_size_bytes == 64
-    if strategy == "direct_reshard":
-        assert result.strategy.tensor_parallel_size == tp_size
-        assert result.strategy.data_parallel_size == 2
+    assert result.source.bucket_size_bytes == 64
 
 
 def test_only_current_publisher_interface_is_exposed() -> None:
@@ -68,7 +64,7 @@ def test_only_current_publisher_interface_is_exposed() -> None:
     )
     assert all(not hasattr(weight_sync, name) for name in removed_names)
     assert all(not hasattr(transfer_module, name) for name in removed_names)
-    publisher = build_weight_transfer("colocated", _rollout_model())
+    publisher = build_weight_publisher("colocated", _rollout_model())
     assert callable(publisher.publish)
     assert not hasattr(publisher, "transfer")
     assert not hasattr(publisher, "refit")

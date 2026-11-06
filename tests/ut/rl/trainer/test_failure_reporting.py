@@ -25,7 +25,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 import rl
-from rl.trainer import SyncTrainer
+from rl.trainer.sync import SyncTrainer
+from rl.trainer.lifecycle import RunLifecycle
 from rl.utils.failure_reporting import report_failure
 
 RL_ROOT = Path(rl.__file__).resolve().parent.parent
@@ -59,6 +60,8 @@ class TestFailureReporting(unittest.TestCase):
         ):
             target = Path(directory) / "failure-rank-3.json"
             trainer = object.__new__(SyncTrainer)
+            trainer.reward_scorer = None
+            trainer.residency = SimpleNamespace(move=lambda **kw: None, release=lambda: None, offload_manager=None, metrics={})
             trainer.state = SimpleNamespace(global_step=0)
             original = RuntimeError("actor OOM")
             trainer._train_and_checkpoint = Mock(side_effect=original)
@@ -69,8 +72,9 @@ class TestFailureReporting(unittest.TestCase):
                 report_failure(ValueError("cleanup failed"), stage="cleanup")
                 raise ValueError("cleanup failed")
 
-            trainer._cleanup = cleanup
-            with patch("rl.trainer.dist.barrier") as barrier, self.assertRaises(RuntimeError) as caught:
+            trainer.lifecycle = RunLifecycle(state=trainer.state)
+            trainer.lifecycle.close = cleanup
+            with patch("rl.trainer.sync.dist.barrier") as barrier, self.assertRaises(RuntimeError) as caught:
                 trainer.train()
             self.assertIs(caught.exception, original)
             barrier.assert_not_called()

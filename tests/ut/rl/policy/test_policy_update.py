@@ -23,15 +23,16 @@ from types import MethodType, SimpleNamespace
 from typing import Any
 
 import pytest
+import rl.workers.engine.optimizer as optimizer_module
 import torch
 
-import rl.roles.policy.actor as actor_module
-import rl.roles.policy.critic as critic_module
+import rl.workers.actor as actor_module
+import rl.workers.critic as critic_module
 from rl.algorithm import build_algorithm
 from rl.algorithm.loss import CriticLossOutput
-from rl.dataset.contracts import ExperienceBatch
-from rl.roles.policy.actor import Actor
-from rl.roles.policy.critic import Critic
+from rl.data.contracts import ExperienceBatch
+from rl.workers.actor import Actor
+from rl.workers.critic import Critic
 from rl.utils.monitoring.metrics import ActorMicroBatchMetrics
 
 
@@ -135,13 +136,13 @@ def test_actor_update_follows_token_and_optimizer_contract(monkeypatch: pytest.M
     monkeypatch.setattr(actor, "forward_backward", MethodType(forward_backward, actor))
     actor._set_gradient_sync = record_sync  # pylint: disable=protected-access
     monkeypatch.setattr(actor_module.dist, "all_reduce", all_reduce)
-    monkeypatch.setattr(actor_module, "hsdp_sync_stream", lambda: events.append("stream-sync"))
+    monkeypatch.setattr(optimizer_module, "hsdp_sync_stream", lambda: events.append("stream-sync"))
     monkeypatch.setattr(
-        actor_module,
+        optimizer_module,
         "clip_grad_norm_",
         lambda *_args, **_kwargs: events.append("clip") or torch.tensor(2.0),
     )
-    monkeypatch.setattr(actor_module, "SkipDTensorDispatch", RecordingContext)
+    monkeypatch.setattr(optimizer_module, "SkipDTensorDispatch", RecordingContext)
 
     metrics = actor.update(experience)
 
@@ -257,9 +258,9 @@ def test_critic_values_and_update_follow_policy_contract(monkeypatch: pytest.Mon
         values=torch.zeros((2, 3)),
         returns=torch.ones((2, 3)),
     )
-    monkeypatch.setattr(critic_module, "hsdp_sync_stream", lambda: None)
-    monkeypatch.setattr(critic_module, "SkipDTensorDispatch", nullcontext)
-    monkeypatch.setattr(critic_module, "clip_grad_norm_", lambda *_args, **_kwargs: torch.tensor(1.0))
+    monkeypatch.setattr(optimizer_module, "hsdp_sync_stream", lambda: None)
+    monkeypatch.setattr(optimizer_module, "SkipDTensorDispatch", nullcontext)
+    monkeypatch.setattr(optimizer_module, "clip_grad_norm_", lambda *_args, **_kwargs: torch.tensor(1.0))
 
     aligned = critic.sequence_values(sequences, experience.attention_mask)
     original_bias = model.state_dict()["bias"].clone()
@@ -311,9 +312,9 @@ def _assert_actor_closed_form_update(monkeypatch, experience, mini_batch_size=4)
         lambda *_args: gradients.append(model.logits.grad.detach().clone())
     )
     with monkeypatch.context() as cpu:
-        cpu.setattr(actor_module, "hsdp_sync_stream", lambda: None)
-        cpu.setattr(actor_module, "SkipDTensorDispatch", nullcontext)
-        cpu.setattr(actor_module, "clip_grad_norm_", torch.nn.utils.clip_grad_norm_)
+        cpu.setattr(optimizer_module, "hsdp_sync_stream", lambda: None)
+        cpu.setattr(optimizer_module, "SkipDTensorDispatch", nullcontext)
+        cpu.setattr(optimizer_module, "clip_grad_norm_", torch.nn.utils.clip_grad_norm_)
         updated = direct_actor.update(batch)
     hook.remove()
     assert len(gradients) == 1, f"Expected one optimizer step, got {len(gradients)}"
@@ -408,9 +409,9 @@ def test_selected_context_trimming_preserves_probabilities_gradients_and_update(
         optimizer=torch.optim.SGD(model.parameters(), lr=0.05, foreach=False, fused=False),
         device=torch.device("cpu"), response_mini_batch_size=4, max_grad_norm=0.0,
     ) for model in models]
-    monkeypatch.setattr(actor_module, "hsdp_sync_stream", lambda: None)
-    monkeypatch.setattr(actor_module, "SkipDTensorDispatch", nullcontext)
-    monkeypatch.setattr(actor_module, "clip_grad_norm_", torch.nn.utils.clip_grad_norm_)
+    monkeypatch.setattr(optimizer_module, "hsdp_sync_stream", lambda: None)
+    monkeypatch.setattr(optimizer_module, "SkipDTensorDispatch", nullcontext)
+    monkeypatch.setattr(optimizer_module, "clip_grad_norm_", torch.nn.utils.clip_grad_norm_)
     mask = experience.loss_action_mask
     probabilities = [actor.compute_log_probs(experience) for actor in actors]
     torch.testing.assert_close(probabilities[0][mask], probabilities[1][mask])
@@ -447,8 +448,8 @@ def test_selected_context_trimming_preserves_probabilities_gradients_and_update(
     assert bool(probabilities[0][3].eq(0).all()), f"Zero-action output changed: actual={probabilities[0][3]}"
 
 
-@pytest.mark.parametrize("mode", ["legacy", "no_trajectories", "consistency"])
-def test_context_trimming_preserves_legacy_and_consistency_inputs(monkeypatch, mode):
+@pytest.mark.parametrize("mode", ["legacy", "no_trajectories"])
+def test_context_trimming_preserves_legacy_inputs(monkeypatch, mode):
     """Only complete selected-output trajectories may change model input lengths."""
     model = _CausalContextPolicy()
     experience = _padded_context_experience(model)
@@ -457,7 +458,7 @@ def test_context_trimming_preserves_legacy_and_consistency_inputs(monkeypatch, m
     elif mode == "no_trajectories":
         experience = replace(experience, trajectories=())
     else:
-        monkeypatch.setattr(actor_module, "consistency_runtime_state", lambda: {"trainer_recipe": "active"})
+        pass
     actor = Actor(model, build_algorithm({"name": "grpo", "loss_aggregation": "token-mean"}), micro_batch_size=1)
     actor.compute_log_probs(experience)
     assert model.lengths == [8, 8, 8, 8], f"Legacy input lengths changed: actual={model.lengths}, expected={[8] * 4}"
