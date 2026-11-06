@@ -18,7 +18,7 @@ from typing import Any, Callable, Optional, Protocol
 
 import torch
 
-from rl.registry import Registry
+from rl.utils.registry import Registry
 
 AdvantageEstimatorBuilder = Callable[..., "AdvantageEstimator"]
 

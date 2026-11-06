@@ -17,7 +17,7 @@
 import json
 
 from examples.search_r1.reward import normalize_answer, score_hotpotqa_answer
-from rl.dataset.contracts import Message, PromptRecord
+from rl.data.contracts import Message, PromptRecord
 
 
 def _prompt() -> PromptRecord:

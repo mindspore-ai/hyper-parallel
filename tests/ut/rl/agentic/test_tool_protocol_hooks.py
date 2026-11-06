@@ -24,7 +24,7 @@ from typing import Any, AsyncIterator, Optional
 import unittest
 from unittest.mock import patch
 
-from rl import tool_protocol
+from rl.tool_protocol import protocol as tool_protocol
 
 
 class TestUnifiedParserEvidence(unittest.IsolatedAsyncioTestCase):

@@ -26,10 +26,10 @@ import torch
 
 from rl.agentic.core import trajectory_runner as runner_module
 from rl.agentic.core.types import Observation, Transition
-from rl.dataset.contracts import ExperienceBatch, Message, PromptRecord, Trajectory
-from rl.dataset.data_source import collate_prompt_samples
-import rl.evaluation as evaluation_module
-from rl.roles.rollout.base import GenerationResult, GenerationSettings
+from rl.data.contracts import ExperienceBatch, Message, PromptRecord, Trajectory
+from rl.data.prompts import collate_prompt_samples
+import rl.trainer.evaluation as evaluation_module
+from rl.rollout.base import GenerationResult, GenerationSettings
 import rl.utils.monitoring.metrics as metrics_module
 
 

@@ -24,10 +24,10 @@ from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeTopKRouter
 
 from rl.algorithm import build_algorithm
-from rl.dataset.batch_builder import ExperiencePreparer, _append_padding_rows
-from rl.dataset.contracts import ExperienceBatch, RouterTrace, Trajectory, Turn
-from rl.roles.policy.actor import Actor
-from rl.roles.policy.router_adapter import install_router_replay
+from rl.data.experience import ExperiencePreparer, _append_padding_rows
+from rl.data.contracts import ExperienceBatch, RouterTrace, Trajectory, Turn
+from rl.workers.actor import Actor
+from rl.workers.adapters.router_adapter import install_router_replay
 
 
 class TinyMoe(torch.nn.Module):

@@ -12,25 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Public policy publication interfaces used by rollout roles."""
-from rl.weight_sync.sync import (
-    ActorRolloutWeightSync,
-    PolicySnapshot,
-    synchronized_call,
-    synchronize_error,
-)
-from rl.weight_sync.transfer import (
-    WeightPublisher,
-    build_weight_transfer,
-)
-from rl.weight_sync.vllm_client import VLLMWeightSyncClientMixin
-
-__all__ = [
-    "ActorRolloutWeightSync",
-    "PolicySnapshot",
-    "VLLMWeightSyncClientMixin",
-    "WeightPublisher",
-    "build_weight_transfer",
-    "synchronized_call",
-    "synchronize_error",
-]
+"""RL weight publication and transport; import concrete interfaces directly."""

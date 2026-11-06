@@ -24,9 +24,9 @@ from unittest.mock import AsyncMock, Mock, patch
 import torch
 
 from rl.agentic.core.program_runner import ProgramAgentRunner
-from rl.fully_async.vllm_server import CallAdmissionMiddleware, PartialRequestService, install_async_routes
-from rl.roles.rollout.base import GenerationRequest, GenerationSettings
-from rl.roles.rollout.client import HTTPGenerationEngine
+from rl.async_runtime.vllm_server import CallAdmissionMiddleware, PartialRequestService, install_async_routes
+from rl.rollout.base import GenerationRequest, GenerationSettings
+from rl.rollout.client import HTTPGenerationEngine
 
 
 class TestCallPublication(unittest.IsolatedAsyncioTestCase):
@@ -224,7 +224,7 @@ class TestCallPublication(unittest.IsolatedAsyncioTestCase):
         modules = {"vllm": vllm, "vllm.entrypoints": entrypoints,
                    "vllm.entrypoints.serve": serve, "vllm.sampling_params": sampling, "fastapi": fastapi}
         with patch.dict("sys.modules", modules), patch(
-                "rl.fully_async.vllm_server.package_version",
+                "rl.async_runtime.vllm_server.package_version",
                 side_effect=lambda name: "0.23.0" if name == "vllm" else "0.23.0.post1"):
             install_async_routes()
             getattr(serve, "register_vllm_serve_api_routers")(app)

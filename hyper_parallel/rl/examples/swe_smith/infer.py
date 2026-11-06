@@ -25,13 +25,13 @@ import torch.distributed as dist
 from transformers import AutoTokenizer
 
 from rl.agentic.codex import CodexRuntime
-from rl.dataset.contracts import PromptRecord
-from rl.dataset.data_source import PromptDataset, build_prompt_records, collate_prompt_samples
-from rl.roles.model_setup import resolve_model
-from rl.roles.rollout import build_rollout_engine
-from rl.roles.rollout.worker import CodexRolloutManager
+from rl.data.contracts import PromptRecord
+from rl.data.prompts import PromptDataset, build_prompt_records, collate_prompt_samples
+from rl.workers.engine.model import resolve_model
+from rl.rollout.registry import build_rollout_engine
+from rl.rollout.manager import CodexRolloutManager
 from rl.utils.process_cleanup import cleanup_processes
-from train_rl import load_config
+from rl.config.loader import load_config
 
 
 def load_prompts(paths: Sequence[Path], tokenizer: Any,

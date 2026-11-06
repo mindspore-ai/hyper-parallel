@@ -1,8 +1,11 @@
 <!-- markdownlint-disable MD033 -->
+
 <h1 align="center">
   <img src="docs/assets/hyper-rl-logo.svg" width="120" height="80" alt="HyperParallel-RL logo"><br>
   HyperParallel-RL · Experimental
 </h1>
+
+This refactor supports native-vLLM and streaming full_gather only. Declare `train.plan_overrides` in the current YAML. Checkpoints use schema 2; historical snapshots are incompatible. Historical device results do not validate this refactored checkout.
 
 <p align="center"><strong>A lightweight, extensible reinforcement learning framework.</strong></p>
 
@@ -49,27 +52,24 @@ Clear extension boundaries with a reusable training pipeline.
 - **Algorithms decoupled from orchestration:** Advantage estimators and policy losses support registered extensions. Algorithms compatible with existing training roles reuse the Trainer; sampling and learning execution mechanisms can be customized in core orchestration.
 - **Tasks, tools, and rewards in Python:** Replace scoring logic or add tool interactions without modifying distributed training or weight publication. See the [reward example](#replace-the-reward-function).
 - **Two agentic interaction styles:** Environment supports framework-driven turns; AgentProgram hosts user programs. Built-in Codex / DeepSeek harnesses are integrated; custom programs still require adaptation. See [Agentic RL](docs/agentic_rl.md).
-- **Model and backend adaptation at defined boundaries:** New models reuse HyperParallel capabilities with training/inference adapters and weight mapping. Other inference backends can be extended and independently validated in downstream forks. See [extension interfaces](docs/architecture.md#扩展点) and [infrastructure choices](docs/design.md#基础设施选型).
+- **Model and backend adaptation at defined boundaries:** New models reuse HyperParallel capabilities with workers/inference adapters and weight mapping. Other inference backends can be extended and independently validated in downstream forks. See [extension interfaces](docs/architecture.md#扩展点) and [infrastructure choices](docs/design.md#基础设施选型).
 
 ### ⚙️ Ascend-friendly
 
 Organize training and sampling around Ascend computation, memory, and communication capabilities.
 
 - **FSDP training:** Reuse HyperParallel state sharding and optimization mechanisms such as prefetching and communication–computation overlap, with validated FSDP, TP, and EP combinations for dense and selected MoE paths. See [FSDP optimization](../../docs/guide/fsdp.md#fsdp-性能优化).
-- **Colocated and disjoint deployment:** Qwen3 dense supports shared or separate training/inference devices, publishing weights through NPU IPC or HCCL respectively. Colocated deployment releases and restores inference resources by phase. MoE currently requires colocation; see [supported capabilities](#supported-capabilities).
-- **Streaming weight synchronization:** Bucketed transfer and buffer release after acknowledgment bound temporary memory use. Explicit direct-reshard transfers parameter intersections between training and inference shards; full-gather remains available. See [vLLM Rollout](docs/vllm_rollout.md).
+- **Colocated and disjoint deployment:** Qwen3 dense supports shared or separate workers/inference devices, publishing weights through NPU IPC or HCCL respectively. Colocated deployment releases and restores inference resources by phase. MoE currently requires colocation; see [supported capabilities](#supported-capabilities).
+- **Streaming weight synchronization:** native-vLLM full_gather over IPC/HCCL releases each bucket after acknowledgement.
 
 HyperParallel also provides [one-sided communication and multicore MoE communication–computation overlap](../core/multicore/README.md) as a foundation for further optimization. HyperParallel-RL integration and end-to-end benefits remain to be validated.
 
-### 🔗 Training–inference consistency
+### Published policies and probability records
 
 Preserve generation evidence, check probability differences, and define policy publication boundaries.
 
-- **Original samples throughout training:** Preserve generated tokens, logprobs, action masks, and policy identity, avoiding sample changes from re-tokenization. Tool feedback and environment observations provide context and do not contribute to policy loss. See the [trajectory contract](rl/dataset/contracts.py).
-- **Shared semantics and Bit-Exact checks:** For Qwen3 dense, the Trainer and Hyper-vLLM share parameter semantics and TP sharding plans. Optional pre-update checks compare FP32 raw logprobs bit by bit on valid action tokens; failure blocks the update and publication.
+- **Original samples throughout training:** Preserve generated tokens, logprobs, action masks, and policy identity, avoiding sample changes from re-tokenization. Tool feedback and environment observations provide context and do not contribute to policy loss. See the [trajectory contract](rl/data/contracts.py).
 - **Sampling uses published policies:** The synchronous flow consumes trajectories from one published version. Sampling resumes only after weight transfer, worker identity checks, and cache reset complete; parameter publication and probability consistency are validated separately.
-
-Bit-Exact is disabled by default and validated for single-node Ascend, BF16/eager, Qwen3 dense + Hyper-vLLM with matched TP1/TP2. It does not guarantee gradients or convergence. See [training–inference consistency](docs/qwen3_training_inference_consistency.md) for full conditions and results.
 
 ---
 
@@ -128,7 +128,7 @@ After [environment setup](#installation-and-environment), run either example fro
 
 ### Example 1: Qwen basic training
 
-**Qwen3-4B + GSM8K, one synchronous GRPO step on four NPUs.** The data directory needs `train.parquet` and `test.parquet`, with `prompt` and `extra_info` columns in each row. `extra_info` supplies the answer; see the [dataset reader](rl/dataset/data_source.py) for parsing rules.
+**Qwen3-4B + GSM8K, one synchronous GRPO step on four NPUs.** The data directory needs `train.parquet` and `test.parquet`, with `prompt` and `extra_info` columns in each row. `extra_info` supplies the answer; see the [dataset reader](rl/data/prompts.py) for parsing rules.
 
 ```bash
 export HYPER_QWEN3_TP_MODEL_ROOT=/absolute/path/to/Qwen3-4B
@@ -142,8 +142,6 @@ export HYPER_QWEN3_TP_MAX_STEPS=1
 ./hyper_parallel/rl/examples/gsm8k/scripts/run_qwen3_tp_docker.sh colocated
 ```
 
-**Success:** Exit code 0, `train/global_step=1`, `policy/version=1`, and finite `train/total_loss` in the results directory logs. Evaluation, checkpoint saving, and Bit-Exact are disabled for this check.
-
 <!-- markdownlint-disable-next-line MD033 -->
 <a id="agentic-example"></a>
 
@@ -152,8 +150,6 @@ export HYPER_QWEN3_TP_MAX_STEPS=1
 **Qwen3-4B + Search-R1.** Codex searches per-question HotpotQA article files in isolated workspaces.
 Follow the [Search-R1 instructions](docs/search_r1.md) for data preparation and execution.
 For the completed single-turn and Codex GSM8K runs, use the [50-step recipes](examples/gsm8k/README.md).
-
-Other entry points: [Programmatic agents](docs/agentic_rl.md) · [Deployment and sampling](docs/vllm_rollout.md) · [Bit-Exact checks](docs/qwen3_training_inference_consistency.md) · [MoE models](https://atomgit.com/mindspore/hyper-parallel/blob/f9f2696341c631327524ea37b6b2ca328076980a/hyper_parallel/rl/docs/moe_models.md).
 
 ---
 
@@ -168,8 +164,8 @@ HyperParallel-RL exposes task, data, and algorithm extension points. Single-turn
 | --- | --- |
 | Rewards and task environments | The [GSM8K example](examples/gsm8k/agent.py) defines environments and rewards; select a task through `agentic.module_path` and `agentic.environment` |
 | Multi-turn interaction or custom loops | [Environment](rl/agentic/envs/environment.py) provides framework-driven interaction; [AgentProgram](rl/agentic/core/program_runner.py) hosts programmatic loops. See [Agentic RL](docs/agentic_rl.md) for built-in paths and harness integration boundaries. Environment observations are excluded from policy loss |
-| Data and training samples | The [data source](rl/dataset/data_source.py) handles inputs; [trajectory and batch contracts](rl/dataset/contracts.py) define data entering learning |
-| Algorithms and updates | Locate learning logic in [loss](rl/algorithm/loss.py), [advantage](rl/algorithm/advantage.py), and [SyncTrainer](rl/trainer.py); use [feature navigation](../../docs/rl-navigation.md) to find related tests |
+| Data and training samples | The [data source](rl/data/prompts.py) handles inputs; [trajectory and batch contracts](rl/data/contracts.py) define data entering learning |
+| Algorithms and updates | Locate learning logic in [loss](rl/algorithm/loss.py), [advantage](rl/algorithm/advantage.py), and [SyncTrainer](rl/trainer/sync.py); use [feature navigation](../../docs/rl-navigation.md) to find related tests |
 
 ### Replace the reward function
 
@@ -179,13 +175,11 @@ This example reuses the GSM8K multi-turn environment and calculator, replacing o
 from examples.gsm8k.agent import GSM8KMultiTurnEnvironment, build_gsm8k_environment
 from rl.agentic.core.types import EpisodeContext
 from rl.agentic.envs.environment import ENVIRONMENTS
-from rl.dataset.contracts import PromptRecord
-
+from rl.data.contracts import PromptRecord
 
 def exact_match(answer: str, prompt: PromptRecord) -> float:
     """Score the final answer against the dataset target."""
     return float(answer.strip() == str(prompt.ground_truth).strip())
-
 
 @ENVIRONMENTS.register("custom_gsm8k")
 def build_environment(context: EpisodeContext) -> GSM8KMultiTurnEnvironment:
@@ -225,8 +219,7 @@ Currently validated on **single-node Ascend 910B3**; see the [runtime image](doc
 | **Programmatic agents** | ◐ | Codex / DeepSeek harnesses integrated; custom programs require adaptation. See [Agentic RL](docs/agentic_rl.md) |
 | **Repository Code Agent** | ◐ | SWE-Smith isolated workspaces, independent grading and per-call GRPO; 9B short-budget RL/recovery and reference-budget inference validated. Long-trajectory learning and full-dataset scale remain unverified. See [usage](examples/swe_smith/README.md) |
 | **Sampling and deployment** | ✅ | Hyper/Native-vLLM; Qwen3 dense supports colocated and disjoint deployment, MoE is colocated only. See [vLLM Rollout](docs/vllm_rollout.md) for DP/TP/EP combinations |
-| **Weight synchronization and runtime support** | ✅ | Streaming full-gather / explicit direct-reshard, IPC/HCCL, publication checks, checkpoint recovery, and console / W&B metrics. See [architecture contracts](docs/architecture.md) |
-| **Bit-Exact checks** | ✅ | Optional pre-update logprob checks, limited to Qwen3 dense + Hyper-vLLM matched TP1/TP2. See [full conditions](docs/qwen3_training_inference_consistency.md) |
+| **Weight synchronization and runtime support** | ✅ | Streaming full-gather, IPC/HCCL, publication checks, checkpoint recovery, and console / W&B metrics. See [architecture contracts](docs/architecture.md) |
 | **PPO / GAE / Critic** | ✅ | Dense Qwen3 internal runner validated with two-device Actor/Critic updates and publication; segmented external-agent trajectories and MoE PPO are unsupported |
 | **Single-node asynchronous GRPO** | ◐ | Rayless Qwen3 dense implementation with disjoint vLLM, bounded policy lag and recovery; see [scope](docs/architecture.md#rayless-asynchronous-grpo). Multi-node support remains planned |
 | **Multimodal training and interaction** | ○ | Visual RL, media/action alignment, and multimodal agents |
@@ -236,7 +229,7 @@ Currently validated on **single-node Ascend 910B3**; see the [runtime image](doc
 | Model | Status | Validation scope or target |
 | :--- | :---: | :--- |
 | **Qwen3 dense** | ✅ | Single-node GRPO; Hyper/Native-vLLM TP1/TP2, with Trainer TP1, pure TP2, or FSDP-shard×TP2 |
-| **Qwen3-30B-A3B** | ✅ | Colocated native vLLM GRPO; four-device TP2/EP2/EDP2 full-gather and direct-reshard validated independently. Hyper rollout and MoE PPO are unsupported |
+| **Qwen3-30B-A3B** | ✅ | Colocated native vLLM GRPO; four-device TP2/EP2/EDP2 full-gather validated independently. Hyper rollout and MoE PPO are unsupported |
 | **Qwen3.5-9B / Qwen3.8-27B** | ◐ | Shared text AutoModel, FSDP with training TP=CP=1, colocated native vLLM GRPO and streamed full-gather. 9B short-budget remote loop validated; 27B not revalidated after migration. No bit-exact claim. See [scope](docs/swe_smith.md) |
 | **Moonlight-16B-A3B-Instruct** | ◐ | Hyper passes two-step nonzero learning; Native publication passes, but sustained nonzero learning has not passed acceptance |
 | **Qwen2.5-VL-7B-Instruct** | ○ | Image-based math questions and multimodal agents |
@@ -265,7 +258,6 @@ Each direction requires complete recipes, learning results, and resource-cost co
 ## 📌 Current limitations
 
 - **Runtime scope:** Synchronous RL and experimental rayless asynchronous GRPO target single-node Ascend, within the models and topologies in [supported capabilities](#supported-capabilities). Dense GSPO has CPU coverage and an NPU acceptance recipe; real NPU acceptance has not been run. MoE does not yet support disjoint deployment or intra-expert TP. Dense internal-runner PPO has two-device acceptance; other combinations require independent validation.
-- **Validation scope:** Functional success does not establish long-term learning gains. Bit-Exact covers pre-update logprobs only in specified Qwen3 dense + Hyper-vLLM configurations; it does not guarantee gradients, updated parameters, or convergence. See [consistency documentation](docs/qwen3_training_inference_consistency.md).
 - **Recovery and counters:** Checkpoint recovery is implemented. Synchronous sample/token counters are not incremented per update and must not measure training volume; asynchronous execution separately counts consumed groups and valid tokens. See [state and recovery boundaries](docs/architecture.md#状态所有权).
 - **Deployment requirements:** vLLM RLHF/refit development endpoints are intended only for trusted, isolated training networks. See the [runtime image](docker/README.md) for environment and driver requirements.
 
@@ -308,7 +300,6 @@ Linked product documentation is currently primarily in Chinese. Both README edit
 | [Agentic RL](docs/agentic_rl.md) | Internal environments, Codex / DeepSeek harness configuration, trajectories, and integration boundaries |
 | [Code Agent](examples/swe_smith/README.md) | SWE-Smith data, task images, inference and training |
 | [MoE Models](https://atomgit.com/mindspore/hyper-parallel/blob/f9f2696341c631327524ea37b6b2ca328076980a/hyper_parallel/rl/docs/moe_models.md) | Models, TP/EP configurations, component ownership, and validation boundaries |
-| [Qwen3 Training–Inference Consistency](docs/qwen3_training_inference_consistency.md) | Bit-Exact definitions, recipes, and acceptance gates |
 
 ### Architecture and evolution
 

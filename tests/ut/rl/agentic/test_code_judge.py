@@ -21,7 +21,7 @@ from aiohttp import web
 import torch
 
 from rl.agentic.core.types import Action, EpisodeContext, TurnContext
-from rl.dataset.contracts import Message, PromptRecord
+from rl.data.contracts import Message, PromptRecord
 from examples.code.agent import CodeEnvironment
 from examples.code.client import ExecutionResult, SandboxFusionExecutor, _parse_result
 from examples.code.judge import extract_python, judge_stdio, validate_tests

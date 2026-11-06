@@ -39,10 +39,10 @@ from rl.agentic.codex.harness import build_codex_call_trajectories, build_codex_
 from rl.agentic.core import program_runner as program_module
 from rl.agentic.core.program_runner import ProgramAgentRunner
 from rl.agentic.ds_harness.harness import build_deepseek_trajectory
-from rl.dataset.contracts import Message, PromptRecord
-from rl.roles.rollout.base import GenerationSettings
-from rl.roles.rollout.router_capture import RouterCaptureSpec
-from rl.roles.rollout.worker import CodexRolloutManager
+from rl.data.contracts import Message, PromptRecord
+from rl.rollout.base import GenerationSettings
+from rl.rollout.router_capture import RouterCaptureSpec
+from rl.rollout.manager import CodexRolloutManager
 
 
 def _record(ordinal: int, prompt: list[int], action: list[int]) -> dict:

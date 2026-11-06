@@ -26,7 +26,7 @@ import pytest
 
 from rl.agentic.core import program_runner
 from rl.agentic.codex import harness
-from rl.config import _validate_codex_agentic, _validate_external_agentic_rollout
+from rl.config.validate import _validate_codex_agentic, _validate_external_agentic_rollout
 
 
 _CONFIG = {"version": "0.152.1", "executable": "codex", "session_root": "/tmp/repository-contract",

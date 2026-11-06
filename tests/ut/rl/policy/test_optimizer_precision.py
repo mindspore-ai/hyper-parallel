@@ -18,14 +18,15 @@
 from types import SimpleNamespace
 
 import pytest
+import rl.workers.engine.optimizer as optimizer_module
 import torch
 
 from rl.algorithm import build_algorithm
-from rl.roles.model_setup import build_role_optimizer
-from rl.roles.policy.actor import Actor
-from rl.roles.policy.critic import Critic
-import rl.roles.policy.actor as actor_module
-import rl.roles.policy.critic as critic_module
+from rl.workers.engine.optimizer import build_role_optimizer
+from rl.workers.actor import Actor
+from rl.workers.critic import Critic
+import rl.workers.actor as actor_module
+import rl.workers.critic as critic_module
 
 from hyper_parallel.core.optimizer.adamw import AdamW
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
@@ -56,8 +57,8 @@ def _role(kind: str) -> tuple[torch.nn.Module, object, torch.nn.Module]:
 @pytest.mark.parametrize("kind", ["actor", "critic"])
 def test_main_parameters_accumulate_sub_bf16_updates_and_resume(kind, tmp_path, monkeypatch) -> None:
     """Hidden small updates survive a checkpoint and clipping acts on the actual FP32 gradient."""
-    monkeypatch.setattr(actor_module, "hsdp_sync_stream", lambda: None)
-    monkeypatch.setattr(critic_module, "hsdp_sync_stream", lambda: None)
+    monkeypatch.setattr(optimizer_module, "hsdp_sync_stream", lambda: None)
+    monkeypatch.setattr(optimizer_module, "hsdp_sync_stream", lambda: None)
     model, optimizer, role = _role(kind)
     model.weight.main_grad = torch.full((1, 1), float("nan"), dtype=torch.float32)
     with pytest.raises(RuntimeError):

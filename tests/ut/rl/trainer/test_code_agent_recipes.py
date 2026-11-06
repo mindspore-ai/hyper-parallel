@@ -26,8 +26,10 @@ import yaml
 
 import rl
 from rl.algorithm import build_algorithm
-from rl.config import build_model_registration, build_runtime_config, validate_config
-from rl.roles.rollout.vllm import VLLMGenerationEngine
+from rl.config.schema import build_model_registration
+from rl.config.resolve import build_runtime_config
+from rl.config.validate import validate_config
+from rl.rollout.vllm import VLLMGenerationEngine
 
 from examples.swe_smith.prepare_data import prepare_data
 

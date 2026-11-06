@@ -33,7 +33,7 @@ import torch
 from rl.agentic.codex import harness as shared_harness
 from rl.agentic.core.types import RewardResult
 from rl.agentic.envs.docker_workspace import CommandResult, InvalidSubmissionError, WorkspaceOutputLimitError
-from rl.dataset.contracts import Message, PromptRecord
+from rl.data.contracts import Message, PromptRecord
 from examples.swe_smith import agent as harness
 
 

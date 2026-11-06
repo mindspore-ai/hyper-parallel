@@ -23,10 +23,10 @@ from typing import Any
 import pytest
 import torch
 
-import rl.evaluation as evaluation_module
-from rl.evaluation import Evaluator
-from rl.dataset.data_source import build_padded_evaluation_batches, collate_prompt_samples
-from rl.dataset.episodes import generation_finish_reason
+import rl.trainer.evaluation as evaluation_module
+from rl.trainer.evaluation import Evaluator
+from rl.data.prompts import build_padded_evaluation_batches, collate_prompt_samples
+from rl.data.episodes import generation_finish_reason
 
 
 @pytest.mark.parametrize("sample_count,batch_size", [(500, 64), (3, 2), (8, 1)])

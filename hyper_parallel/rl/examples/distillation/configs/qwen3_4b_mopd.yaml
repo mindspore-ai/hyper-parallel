@@ -6,9 +6,6 @@ model:
   tokenizer_path: /models/Qwen3-4B
   config_overrides: null
 
-consistency:
-  enabled: true
-
 data:
   chat_template_kwargs:
     enable_thinking: false
@@ -39,7 +36,7 @@ rollout:
     visible_devices: '1'
     data_parallel_size: 1
     port: 8460
-    model_implementation: hyper
+    model_implementation: native
     tensor_parallel_size: 1
     weight_sync:
       strategy: full_gather
@@ -90,6 +87,24 @@ algorithm:
   loss_aggregation: token-mean
 
 train:
+  plan_overrides:
+  - match:
+    - '*.input_layernorm'
+    - '*.post_attention_layernorm'
+    - model.norm
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3.modeling_qwen3.Qwen3RMSNorm
+      implementation:
+        _target_: hyper_parallel.models.qwen3.adapter.conversion.module_replacement.replace_qwen3_rms_norm
+  - match: '*.self_attn'
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3.modeling_qwen3.Qwen3Attention
+      implementation:
+        _target_: hyper_parallel.models.qwen3.adapter.conversion.module_replacement.replace_qwen3_flash_attention
+  - match: '*.self_attn'
+    region_dispatch: false
   max_steps: 2
   seed: 1234
   prompt_batch_size: 1
@@ -103,6 +118,10 @@ train:
     min_gradient_norm: 0.0
     require_mixed_rewards: false
   accelerator:
+    requires_grad_sync: true
+    reshard_after_backward: false
+    loss_parallel: false
+    sequence_parallel: false
     dp_replicate: 1
     dp_shard: 1
     tp: 1

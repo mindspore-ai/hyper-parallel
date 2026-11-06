@@ -23,7 +23,7 @@ from contextlib import ExitStack
 from unittest.mock import MagicMock, call, patch, sentinel
 
 from rl.utils import process_cleanup as runtime
-from rl.trainer import SyncTrainer
+from rl.trainer.lifecycle import RunLifecycle
 
 from hyper_parallel.core.dtensor import device_mesh
 from hyper_parallel.core.pipeline_parallel import _p2p
@@ -114,7 +114,7 @@ class TestDistributedTeardown(unittest.TestCase):
 
     def test_trainer_cleanup_calls_the_rl_teardown_without_shared_patches(self) -> None:
         """The real Trainer cleanup must reach the RL helper and close every owned service."""
-        trainer = object.__new__(SyncTrainer)
+        trainer = object.__new__(RunLifecycle)
         tracker = MagicMock()
         trainer._tracker = tracker
         trainer.rollout_manager = MagicMock()
@@ -125,7 +125,7 @@ class TestDistributedTeardown(unittest.TestCase):
         order.attach_mock(trainer.rollout_manager.close, "manager")
         order.attach_mock(trainer.rollout_engine.close, "engine")
         order.attach_mock(self.destroy, "distributed")
-        trainer._cleanup()
+        trainer.close()
         self.assertEqual(order.mock_calls, [call.tracker(), call.manager(), call.engine(), call.distributed()])
         tracker.finish.assert_called_once_with()
         trainer.rollout_manager.close.assert_called_once_with()
@@ -137,7 +137,7 @@ class TestDistributedTeardown(unittest.TestCase):
 
     def test_service_failures_still_release_groups_and_reset_state(self) -> None:
         """A failure at each cleanup stage must not prevent later stages from running."""
-        trainer = object.__new__(SyncTrainer)
+        trainer = object.__new__(RunLifecycle)
         tracker = MagicMock()
         tracker.finish.side_effect = RuntimeError("tracker failed")
         trainer._tracker = tracker
@@ -149,7 +149,7 @@ class TestDistributedTeardown(unittest.TestCase):
         self.destroy.side_effect = RuntimeError("backend teardown failed")
 
         with self.assertLogs(runtime.logger, level="WARNING") as logs:
-            trainer._cleanup()
+            trainer.close()
 
         self.assertEqual(len(logs.records), 4)
         tracker.finish.assert_called_once_with()
@@ -162,13 +162,13 @@ class TestDistributedTeardown(unittest.TestCase):
 
     def test_partial_initialization_closes_tracker_without_destroying_groups(self) -> None:
         """Cleanup accepts a Trainer that has not created rollout services or a group."""
-        trainer = object.__new__(SyncTrainer)
+        trainer = object.__new__(RunLifecycle)
         tracker = MagicMock()
         trainer._tracker = tracker
         trainer._runtime_started = False
 
-        trainer._cleanup()
-        trainer._cleanup()
+        trainer.close()
+        trainer.close()
 
         tracker.finish.assert_called_once_with()
         self.destroy.assert_not_called()

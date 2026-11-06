@@ -27,10 +27,10 @@ from typing import Any
 import pytest
 import torch
 
-import rl.roles.rollout.vllm as vllm_module
-from rl.roles.model_setup import ModelRegistration, resolve_vllm_model
-from rl.roles.rollout.base import GenerationRequest, GenerationSettings
-from rl.roles.rollout.vllm import VLLMGenerationEngine
+import rl.rollout.vllm as vllm_module
+from rl.workers.engine.model import ModelRegistration, resolve_vllm_model
+from rl.rollout.base import GenerationRequest, GenerationSettings
+from rl.rollout.vllm import VLLMGenerationEngine
 
 
 def _model() -> ModelRegistration:
@@ -453,7 +453,7 @@ def test_shared_server_builds_command_and_isolated_environment(
         "deployment": "colocated",
         "data_parallel_size": 2,
         "tensor_parallel_size": 2,
-        "model_implementation": "hyper",
+        "model_implementation": "native",
         "enable_prefix_caching": False,
         "enable_chunked_prefill": True,
         "enable_prompt_tokens_details": True,
@@ -469,13 +469,13 @@ def test_shared_server_builds_command_and_isolated_environment(
         "max_num_seqs": 8,
         "weight_sync": {
             "bucket_size_mb": 1,
-            "strategy": "direct_reshard",
+            "strategy": "full_gather",
         },
     }
     transfer = SimpleNamespace(publish=lambda _client, _snapshot: None)
     monkeypatch.setattr(
         vllm_module,
-        "build_weight_transfer",
+        "build_weight_publisher",
         lambda *args, **kwargs: transfer,
     )
     engine = vllm_module.build_vllm_engine({"vllm": vllm_config}, _model())
@@ -496,11 +496,11 @@ def test_shared_server_builds_command_and_isolated_environment(
     assert "--enable-prompt-tokens-details" in command
     assert "--skip-mm-profiling" in command
     assert command[command.index("--profiler-config") + 1] == '{"profiler": "none"}'
-    assert "HyperQwen3ForCausalLM" in command[command.index("--hf-overrides") + 1]
+    assert "--hf-overrides" not in command
     assert environment["ASCEND_RT_VISIBLE_DEVICES"] == "0,1,2,3"
     assert environment["VLLM_BATCH_INVARIANT"] == "1"
     assert environment["HCCL_IF_BASE_PORT"] == "65000"
-    assert environment["HYPER_RL_CONSISTENCY_PROFILE"] == "profile"
+    assert "HYPER_RL_CONSISTENCY_PROFILE" not in environment
     assert "RANK" not in environment
 
 
@@ -917,12 +917,12 @@ def test_engine_exposes_weight_sync_strategy_and_streaming_stats() -> None:
     """Rollout forwards the retained publication status."""
     engine = object.__new__(VLLMGenerationEngine)
     engine._weight_sync = SimpleNamespace(
-        configured_strategy="direct_reshard",
+        configured_strategy="full_gather",
         last_strategy="full_gather",
         streaming_stats={"bucket_count": 3},
     )
     engine._model = _model()
-    engine._rollout_model = resolve_vllm_model(engine._model, "hyper")
+    engine._rollout_model = resolve_vllm_model(engine._model, "native")
     engine._deployment = "colocated"
     engine._config = {
         "tensor_parallel_size": 1,
@@ -932,7 +932,7 @@ def test_engine_exposes_weight_sync_strategy_and_streaming_stats() -> None:
 
     command = engine._server_command("127.0.0.1", 8100)
 
-    assert engine.weight_sync_configured_strategy == "direct_reshard"
+    assert engine.weight_sync_configured_strategy == "full_gather"
     assert engine.weight_sync_last_strategy == "full_gather"
     assert engine.weight_sync_streaming_stats == {"bucket_count": 3}
     assert "--enable-expert-parallel" not in command

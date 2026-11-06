@@ -26,7 +26,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from transformers import AutoTokenizer
 
-from rl.dataset.contracts import Message, PromptRecord
+from rl.data.contracts import Message, PromptRecord
 from examples.code.judge import validate_tests
 
 DATASET = "PRIME-RL/Eurus-2-RL-Data"

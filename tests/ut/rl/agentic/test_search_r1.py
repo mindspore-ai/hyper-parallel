@@ -33,7 +33,8 @@ import yaml
 from rl.algorithm import build_algorithm
 from rl.agentic.codex.protocol import CodexResponsesProtocol
 from rl.agentic.core.program_runner import audit_training_rows
-from rl.config import resolve_vllm_automatic_limits, validate_config
+from rl.config.limits import resolve_vllm_automatic_limits
+from rl.config.validate import validate_config
 
 from examples.search_r1 import container_runtime, launcher
 from examples.search_r1.agent import repair_request, validate_citations

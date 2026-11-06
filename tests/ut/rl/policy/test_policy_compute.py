@@ -23,9 +23,9 @@ import pytest
 import torch
 
 from rl.algorithm import build_algorithm
-from rl.dataset.contracts import ExperienceBatch
-from rl.roles.policy.actor import Actor
-from rl.roles.policy.critic import Critic
+from rl.data.contracts import ExperienceBatch
+from rl.workers.actor import Actor
+from rl.workers.critic import Critic
 
 
 def _experience() -> ExperienceBatch:

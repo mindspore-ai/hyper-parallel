@@ -26,8 +26,10 @@ import yaml
 from safetensors.torch import save_file
 
 import rl
-from rl.config import build_model_registration, build_runtime_config, validate_rollout_and_agentic
-from rl.roles.model_setup import resolve_vllm_model
+from rl.config.schema import build_model_registration
+from rl.config.resolve import build_runtime_config
+from rl.config.validate import validate_rollout_and_agentic
+from rl.workers.engine.model import resolve_vllm_model
 from rl.weight_sync.model_adapter import ModelWeightAdapter, alias_tied_embeddings
 from rl.weight_sync.packed_weight import PackedWeight, unpack_packed_weights
 from rl.weight_sync import vllm_worker
@@ -80,7 +82,7 @@ class TestQwen35Runtime(unittest.TestCase):
         """Hybrid policy support cannot expand through an unrelated dense default."""
         cases = [
             (("algorithm", "name"), "ppo", "GRPO only"),
-            (("consistency", "enabled"), True, "consistency off"),
+            (("consistency", "enabled"), True, "consistency was removed"),
             (("train", "accelerator", "tp"), 2, "tp=1"),
             (("train", "accelerator", "cp"), 2, "cp=1"),
             (("train", "accelerator", "ep"), 2, "ep=1"),
@@ -95,7 +97,7 @@ class TestQwen35Runtime(unittest.TestCase):
                 config = deepcopy(self.config)
                 section = config
                 for key in keys[:-1]:
-                    section = section[key]
+                    section = section.setdefault(key, {})
                 section[keys[-1]] = value
                 with self.assertRaisesRegex(ValueError, error):
                     build_runtime_config(config)

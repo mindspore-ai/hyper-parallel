@@ -21,7 +21,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional
 
 if TYPE_CHECKING:
-    from rl.dataset.contracts import RouterTrace
+    from rl.data.contracts import RouterTrace
 
 
 class InteractionMode(str, Enum):

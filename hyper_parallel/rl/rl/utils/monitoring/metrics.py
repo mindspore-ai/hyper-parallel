@@ -23,7 +23,7 @@ import torch
 import torch.distributed as dist
 
 if TYPE_CHECKING:
-    from rl.dataset.contracts import ExperienceBatch
+    from rl.data.contracts import ExperienceBatch
 
 _GIB = 1024 ** 3
 
@@ -230,7 +230,7 @@ def build_training_metrics(
         metrics["policy/version"] = float(policy.policy_version)
         configured_strategy = getattr(policy, "weight_sync_configured_strategy", None)
         last_strategy = getattr(policy, "weight_sync_last_strategy", None)
-        for strategy in ("direct_reshard", "full_gather"):
+        for strategy in ("full_gather",):
             metrics[f"weight_sync/configured_{strategy}"] = float(
                 configured_strategy == strategy
             )
@@ -531,7 +531,7 @@ def _rollout_samples(
 ) -> list[dict[str, Any]]:
     """Render bounded episode samples without counting each model call as a candidate."""
     # The dataset package eagerly imports Actor, which itself imports these metrics.
-    from rl.dataset.episodes import generation_finish_reason  # pylint: disable=C0415
+    from rl.data.episodes import generation_finish_reason  # pylint: disable=C0415
 
     batch_rows = {
         str(prompt_id): row
@@ -586,7 +586,7 @@ def _local_rollout_record(
 ) -> dict[str, Any]:
     """Build mergeable rollout statistics and bounded local samples."""
     # Defer the dataset package cycle until Actor and its metrics are initialized.
-    from rl.dataset.episodes import episode_rows  # pylint: disable=C0415
+    from rl.data.episodes import episode_rows  # pylint: disable=C0415
 
     metadata = getattr(rollout, "metadata", {})
     if metadata.get("reward_status") == "pending":

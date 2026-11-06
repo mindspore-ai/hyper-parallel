@@ -26,10 +26,10 @@ import yaml
 
 import rl
 
-import rl.config as config_module
+import rl.config.validate as config_module
 
-from rl.dataset.contracts import Message, PromptRecord
-from rl.dataset.data_source import (
+from rl.data.contracts import Message, PromptRecord
+from rl.data.prompts import (
     PromptDataset, build_prompt_records, collate_prompt_samples, validate_row_adapter_config,
 )
 

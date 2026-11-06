@@ -26,7 +26,7 @@ import torch
 import torch.distributed as dist
 import yaml
 
-from rl.trainer import SyncTrainer
+from rl.trainer.sync import SyncTrainer
 
 
 class CodeObservedTrainer(SyncTrainer):

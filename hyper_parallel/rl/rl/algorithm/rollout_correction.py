@@ -20,7 +20,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from rl.config import RolloutCorrectionConfig
+from rl.config.schema import RolloutCorrectionConfig
 
 
 @dataclass(frozen=True)

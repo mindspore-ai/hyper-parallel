@@ -16,7 +16,7 @@
 
 import pytest
 
-from rl.roles.rollout.topology import resolve_vllm_rollout_topology
+from rl.rollout.topology import resolve_vllm_rollout_topology
 
 
 @pytest.mark.parametrize(

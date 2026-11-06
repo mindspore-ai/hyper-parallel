@@ -21,13 +21,13 @@ import pytest
 import torch
 
 from rl.algorithm import build_algorithm
-from rl.dataset import batch_builder
-from rl.dataset.batch_builder import (
+from rl.data import experience as batch_builder
+from rl.data.experience import (
     ExperiencePreparer, build_experience_batch, normalize_advantages, pad_agent_call_batch_for_dp,
 )
-from rl.dataset.contracts import Trajectory, Turn
-from rl.dataset.episodes import episode_rows
-from rl.roles.rollout.base import GenerationSettings
+from rl.data.contracts import Trajectory, Turn
+from rl.data.episodes import episode_rows
+from rl.rollout.base import GenerationSettings
 
 
 

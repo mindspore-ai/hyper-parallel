@@ -28,7 +28,7 @@ import pytest
 from rl.agentic.codex.gateway import CodexGateway, _Handler, _State
 from rl.agentic.codex.protocol import CodexResponsesProtocol
 from rl.agentic.ds_harness import gateway as ds_gateway
-from rl.tool_protocol import inspect_tool_response, validate_trainability
+from rl.tool_protocol.protocol import inspect_tool_response, validate_trainability
 
 
 

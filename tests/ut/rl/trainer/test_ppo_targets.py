@@ -27,9 +27,9 @@ from unittest.mock import patch
 
 import torch
 
-from rl import checkpoint
+from rl.trainer import checkpoint
 from rl.algorithm.advantage import GAEAdvantageEstimator
-from rl.dataset.batch_builder import get_bootstrap_values, normalize_advantages
+from rl.data.experience import get_bootstrap_values, normalize_advantages
 
 from .test_checkpoint import _manager, _Stateful
 
@@ -57,7 +57,7 @@ class TestPPOTargets(unittest.TestCase):
             """Add statistics of the other DP rank's two action tokens."""
             assert group == "dp"
             stats.add_(torch.tensor([7.0, 25.0, 2.0]))
-        with patch("rl.dataset.batch_builder.dist.all_reduce", side_effect=all_reduce) as reduce:
+        with patch("rl.data.experience.dist.all_reduce", side_effect=all_reduce) as reduce:
             actual = normalize_advantages(local, mask, SimpleNamespace(rank_size=2, group="dp"))
         expected = ((local - 2.5) / (torch.tensor(1.25).sqrt() + 1e-6)) * mask
         torch.testing.assert_close(actual, expected)
@@ -104,14 +104,14 @@ class TestPPOCheckpoint(unittest.TestCase):
                  patch.object(checkpoint.torch, "get_rng_state", return_value=b"rng"), \
                  patch.object(checkpoint.torch, "set_rng_state"):
                 manager._save(state)
-                trainer.model.value = "changed"
-                trainer.optimizer.value = "changed"
+                trainer.actor.actor_model.value = "changed"
+                trainer.actor.optimizer.value = "changed"
                 trainer.critic.critic_model.value = "changed"
                 trainer.critic.optimizer.value = "changed"
                 trainer.critic.lr_scheduler.value = "changed"
                 manager.begin(state)
-            self.assertEqual(trainer.model.value, "model-live")
-            self.assertEqual(trainer.optimizer.value, "optimizer-live")
+            self.assertEqual(trainer.actor.actor_model.value, "model-live")
+            self.assertEqual(trainer.actor.optimizer.value, "optimizer-live")
             self.assertEqual(trainer.critic.critic_model.value, "critic-live")
             self.assertEqual(trainer.critic.optimizer.value, "critic-optim-live")
             self.assertEqual(trainer.critic.lr_scheduler.value, "critic-scheduler-live")

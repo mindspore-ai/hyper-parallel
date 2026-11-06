@@ -24,8 +24,8 @@ import torch
 import torch.distributed as dist
 from torch.multiprocessing.reductions import StorageWeakRef
 
-from rl.roles.phase_offload import TrainingStateOffload
-from rl.trainer import SyncTrainer
+from rl.workers.engine.offload import TrainingStateOffload
+from rl.trainer.sync import SyncTrainer
 
 from hyper_parallel import fully_shard, hsdp_sync_stream
 from hyper_parallel.components.optim.mixed_precision_optimizer import Float16OptimizerWithFloat16Params

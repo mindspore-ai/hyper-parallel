@@ -112,12 +112,12 @@ Search-R1 引用修正等追加调用同样经过该路径，无需按数据集�
 
 | 职责 | 文件 |
 | --- | --- |
-| 数据合同与训练行绑定 | `rl/dataset/contracts.py`、`rl/dataset/batch_builder.py` |
-| capture 解码与 TP 传输 | `rl/roles/rollout/router_capture.py`、`rl/roles/rollout/vllm.py` |
-| 模型无关 replay 作用域 | `rl/router_replay.py` |
-| Qwen3-MoE gate 适配与 Actor 接线 | `rl/roles/policy/router_adapter.py`、`rl/roles/policy/actor.py` |
+| 数据合同与训练行绑定 | `rl/data/contracts.py`、`rl/data/experience.py` |
+| capture 解码与 TP 传输 | `rl/rollout/router_capture.py`、`rl/rollout/vllm.py` |
+| 模型无关 replay 作用域 | `rl/workers/adapters/router_replay.py` |
+| Qwen3-MoE gate 适配与 Actor 接线 | `rl/workers/adapters/router_adapter.py`、`rl/workers/actor.py` |
 | 多轮调用记录与轨迹 | `rl/agentic/codex/gateway.py`、`harness.py`、`rl/agentic/core/` |
-| 配置与装配 | `rl/config.py`、`rl/trainer.py` |
+| 配置与装配 | `rl/config/validate.py`、`rl/trainer/sync.py` |
 
 实现参考 [R3 论文](https://arxiv.org/html/2510.11370v1)及以下固定版本：
 

@@ -23,7 +23,7 @@ import os
 import threading
 from typing import Any, Callable, Coroutine, Sequence
 
-from rl.dataset.contracts import PromptRecord
+from rl.data.contracts import PromptRecord
 
 
 class PreparedProgramBatch:

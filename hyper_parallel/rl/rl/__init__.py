@@ -28,11 +28,11 @@ from typing import Any
 
 
 _EXPORTS = {
-    "ExperienceBatch": ("rl.dataset.contracts", "ExperienceBatch"),
-    "Message": ("rl.dataset.contracts", "Message"),
-    "PromptRecord": ("rl.dataset.contracts", "PromptRecord"),
-    "Trajectory": ("rl.dataset.contracts", "Trajectory"),
-    "Turn": ("rl.dataset.contracts", "Turn"),
+    "ExperienceBatch": ("rl.data.contracts", "ExperienceBatch"),
+    "Message": ("rl.data.contracts", "Message"),
+    "PromptRecord": ("rl.data.contracts", "PromptRecord"),
+    "Trajectory": ("rl.data.contracts", "Trajectory"),
+    "Turn": ("rl.data.contracts", "Turn"),
 }
 
 

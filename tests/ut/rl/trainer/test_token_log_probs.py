@@ -12,6 +12,7 @@
 # ============================================================================
 """Role binding and generic token-probability dispatch preserve legacy execution."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
 import unittest
@@ -20,9 +21,9 @@ from unittest.mock import Mock, patch
 import torch
 
 from rl.algorithm import build_algorithm
-from rl.dataset.contracts import ExperienceBatch
-from rl.roles.model_setup import build_role_model
-from rl.roles.policy.actor import Actor
+from rl.data.contracts import ExperienceBatch
+from rl.workers.engine.model import build_role_model
+from rl.workers.actor import Actor
 
 
 class _ProbabilityModel(torch.nn.Module):
@@ -73,7 +74,7 @@ class TestTokenLogProbs(unittest.TestCase):
                 self.assertTrue(all(left is right for left, right in zip(parameters, model.parameters())))
                 self.assertTrue(all(parameter.requires_grad is not frozen for parameter in model.parameters()))
 
-    def test_actor_uses_normal_module_call_and_keeps_consistency_precedence(self) -> None:
+    def test_actor_uses_normal_module_call(self) -> None:
         """The established consistency path wins; otherwise the generic capability returns its vector."""
         ids = torch.tensor([[1, 2, 3, 4]])
         mask = torch.ones_like(ids, dtype=torch.bool)
@@ -82,16 +83,12 @@ class TestTokenLogProbs(unittest.TestCase):
         actor = self._actor(model)
         hooks = []
         model.register_forward_pre_hook(lambda _module, _inputs: hooks.append(True))
-        with patch("rl.roles.policy.actor.trainer_sequence_log_probs", return_value=None):
+        with nullcontext():
             self.assertIs(actor.sequence_log_probs(ids, mask), expected)
         self.assertEqual(len(hooks), 1)
         self.assertTrue(model.calls[0]["return_token_log_probs"])
         self.assertFalse(model.calls[0]["use_cache"])
         self.assertIs(model.calls[0]["input_ids"], ids)
-        packed = expected + 1
-        with patch("rl.roles.policy.actor.trainer_sequence_log_probs", return_value=packed):
-            self.assertIs(actor.sequence_log_probs(ids, mask), packed)
-        self.assertEqual(len(model.calls), 1)
 
     def test_actor_rejects_invalid_selected_output(self) -> None:
         """Reject a lossy dtype or unshifted shape instead of falling back to dense logits."""
@@ -100,7 +97,7 @@ class TestTokenLogProbs(unittest.TestCase):
         for value in (torch.zeros(1, 3, dtype=torch.bfloat16), torch.zeros(1, 4)):
             with self.subTest(dtype=value.dtype, shape=value.shape):
                 actor = self._actor(_ProbabilityModel(value))
-                with patch("rl.roles.policy.actor.trainer_sequence_log_probs", return_value=None):
+                with nullcontext():
                     with self.assertRaisesRegex(ValueError, "FP32"):
                         actor.sequence_log_probs(ids, mask)
 
@@ -113,7 +110,7 @@ class TestTokenLogProbs(unittest.TestCase):
             model = _ProbabilityModel(torch.zeros(1, 3))
             model.supports_token_log_probs_mask = capable
             actor = self._actor(model)
-            with patch("rl.roles.policy.actor.trainer_sequence_log_probs", return_value=None):
+            with nullcontext():
                 actor.sequence_log_probs(ids, mask, actions)
                 batch = ExperienceBatch(trajectories=(), sequences=ids, attention_mask=mask,
                                         action_mask=torch.cat((torch.zeros(1, 1, dtype=torch.bool), actions), dim=1),

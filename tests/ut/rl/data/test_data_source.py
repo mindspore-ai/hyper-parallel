@@ -21,8 +21,8 @@ from typing import Any
 
 import pytest
 
-from rl.dataset import data_source
-from rl.dataset.data_source import (
+from rl.data import prompts as data_source
+from rl.data.prompts import (
     PromptDataset,
     build_padded_evaluation_batches,
     build_prompt_records,

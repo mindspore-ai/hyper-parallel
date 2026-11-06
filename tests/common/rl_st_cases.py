@@ -35,7 +35,6 @@ class Case:
     runner: str = "internal"
     disjoint: bool = False
     resume: bool = False
-    exact: bool = False
     algorithm: str = "grpo"
 
     @property
@@ -50,18 +49,18 @@ class Case:
 
 
 CASES = (
-    Case("dense-tp2-consistency-full", tp=2, exact=True),
-    Case("dense-tp2-direct", tp=2, strategy="direct_reshard"),
+    Case("dense-tp2-native-full", tp=2),
+    Case("dense-tp2-native-diverse", tp=2, strategy="full_gather"),
     Case("checkpoint-resume", resume=True),
     Case("codex-agent", runner="codex"),
     Case("deepseek-agent", runner="deepseek"),
     Case("ppo-tp1-full", algorithm="ppo"),
     Case("gspo-tp1-full", algorithm="gspo"),
-    Case("gspo-tp2-consistency-full", algorithm="gspo", tp=2, exact=True),
+    Case("gspo-tp2-native-full", algorithm="gspo", tp=2),
     Case("gspo-checkpoint-resume", algorithm="gspo", resume=True),
-    Case("reward-model-tp1", algorithm="gspo", exact=True),
+    Case("reward-model-tp1", algorithm="gspo"),
     Case("reward-model-tp2", algorithm="gspo", tp=2),
-    Case("reward-model-resume", algorithm="gspo", resume=True, exact=True),
+    Case("reward-model-resume", algorithm="gspo", resume=True),
 )
 
 AGENT_INSTRUCTIONS = {
@@ -101,20 +100,19 @@ def prepare_config(case: Case, phase: int, ports: tuple[int, int], devices: list
         recipe = EXAMPLES / "gsm8k/configs/qwen3_4b_gsm8k_base.yaml"
     config = yaml.safe_load(recipe.read_text())
     config["model"].update(weights_path="/model", tokenizer_path="/model")
-    config["consistency"]["enabled"] = case.exact
     config["data"].update(train_path="/data/train.parquet", test_path="/data/test.parquet",
                           max_train_samples=8, shuffle=False, num_workers=0)
     # Dense Qwen3 needs room to finish reasoning before the answer is scored.
     generation_budget = 512 if case.runner == "internal" else 256
     config["rollout"].update(num_return_sequences=4, max_new_tokens=generation_budget, seed=20260908)
-    if case.name == "dense-tp2-direct":
+    if case.name == "dense-tp2-native-diverse":
         # More diverse responses make a non-zero GRPO update observable.
         config["rollout"].update(num_return_sequences=8, temperature=1.1)
     vllm = config["rollout"]["vllm"]
     vllm.update(deployment="disjoint" if case.disjoint else "colocated",
                 data_parallel_size=2, tensor_parallel_size=case.tp, port=ports[0],
-                model_implementation="native" if case.runner != "internal" else "hyper",
-                enforce_eager=True, batch_invariant=case.exact,
+                model_implementation="native",
+                enforce_eager=True, batch_invariant=False,
                 max_num_seqs=4)
     if case.runner == "codex":
         # Keep the small ST reservation independent of the full-run KV allocation.

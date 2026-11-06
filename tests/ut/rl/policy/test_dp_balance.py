@@ -20,7 +20,7 @@ from unittest.mock import Mock, patch
 import torch
 from torch.nn import functional
 
-from rl.roles.policy.dp_balance import balanced_row_indices, balance_experience, _cpu_metadata
+from rl.workers.input.dp_balance import balanced_row_indices, balance_experience, _cpu_metadata
 from tests.ut.rl.policy.test_dynamic_batch import make_actor, make_experience
 
 
@@ -86,11 +86,11 @@ class TestActorBalance(TestCase):
                          for name in ("trajectories", "responses", "teacher_keys")}
                         for source in range(2)]
 
-            with patch("rl.roles.policy.dp_balance.dist.get_world_size", return_value=2), patch(
-                "rl.roles.policy.dp_balance.dist.get_rank", return_value=rank,
-            ), patch("rl.roles.policy.dp_balance.dist.all_gather_object", side_effect=_gather), patch(
-                "rl.roles.policy.dp_balance.dist.all_to_all_single", side_effect=_exchange,
-            ), patch("rl.roles.policy.dp_balance._exchange_metadata", side_effect=_metadata):
+            with patch("rl.workers.input.dp_balance.dist.get_world_size", return_value=2), patch(
+                "rl.workers.input.dp_balance.dist.get_rank", return_value=rank,
+            ), patch("rl.workers.input.dp_balance.dist.all_gather_object", side_effect=_gather), patch(
+                "rl.workers.input.dp_balance.dist.all_to_all_single", side_effect=_exchange,
+            ), patch("rl.workers.input.dp_balance._exchange_metadata", side_effect=_metadata):
                 actual = balance_experience(original, lengths[rank], 2, "dp")
             self.assertEqual(actual.responses, tuple(f"{i // 4}/{i % 4}" for i in orders[rank]))
             self.assertEqual(actual.teacher_keys, actual.responses)
@@ -129,17 +129,17 @@ class TestActorBalance(TestCase):
         actor._dp_size = 2
         actor._dp_group_info = Mock(group="dp")
         raw = replace(make_experience([5, 8, 3, 7]), old_log_probs=None, reference_log_probs=None)
-        with patch("rl.roles.policy.actor.synchronized_call", side_effect=lambda _label, fn: fn()), patch(
-            "rl.roles.policy.actor.balance_experience", return_value=raw,
+        with patch("rl.workers.actor.synchronized_call", side_effect=lambda _label, fn: fn()), patch(
+            "rl.workers.actor.balance_experience", return_value=raw,
         ) as exchange:
             self.assertIs(actor.balance_rollout(raw), raw)
             exchange.assert_called_once_with(raw, [5, 8, 3, 7], 4, "dp")
         with self.assertRaisesRegex(ValueError, "advantages"):
             actor._balance_lengths(replace(raw, advantages=None))
         actor._dp_size = 1
-        late_exchange = patch("rl.roles.policy.actor.balance_experience",
+        late_exchange = patch("rl.workers.actor.balance_experience",
                               side_effect=AssertionError("late redistribution"))
         with late_exchange, patch(
-            "rl.roles.policy.actor.hsdp_sync_stream",
-        ), patch("rl.roles.policy.actor.clip_grad_norm_", torch.nn.utils.clip_grad_norm_):
+            "rl.workers.engine.optimizer.hsdp_sync_stream",
+        ), patch("rl.workers.engine.optimizer.clip_grad_norm_", torch.nn.utils.clip_grad_norm_):
             actor.update(make_experience([5, 8, 3, 7]))

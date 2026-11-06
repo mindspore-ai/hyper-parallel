@@ -27,7 +27,7 @@ python -m pip install --no-deps --no-build-isolation "${rl_install_dir}"
 python - <<'PYTHON'
 from importlib.metadata import entry_points
 
-expected = "rl.roles.rollout.vllm_plugin:register_hyper_models"
+expected = "rl.rollout.vllm_plugin:install_runtime_hooks"
 plugins = entry_points(group="vllm.general_plugins")
 if not any(plugin.name == "hyper_parallel" and plugin.value == expected for plugin in plugins):
     raise RuntimeError("Hyper-RL vLLM plugin is not installed")

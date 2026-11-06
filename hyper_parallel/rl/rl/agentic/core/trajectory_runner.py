@@ -29,9 +29,9 @@ from rl.agentic.core.types import (
     ObservationEncoder,
 )
 from rl.agentic.envs.environment import ENVIRONMENTS
-from rl.dataset.batch_builder import build_experience_batch
-from rl.dataset.contracts import ExperienceBatch, PromptRecord, Trajectory, resize_router_trace
-from rl.roles.rollout.base import GenerationEngine, GenerationRequest, GenerationSettings
+from rl.data.experience import build_experience_batch
+from rl.data.contracts import ExperienceBatch, PromptRecord, Trajectory, resize_router_trace
+from rl.rollout.base import GenerationEngine, GenerationRequest, GenerationSettings
 
 
 def _canonical_row_seed(

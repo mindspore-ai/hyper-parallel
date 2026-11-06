@@ -34,7 +34,7 @@ from rl.agentic.core.types import (
     TurnResult,
 )
 from rl.agentic.tools.executor import InteractionProtocol, ParsedAction, ToolExecutorProtocol
-from rl.registry import Registry
+from rl.utils.registry import Registry
 
 
 class Environment(Protocol):

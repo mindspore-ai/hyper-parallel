@@ -63,8 +63,8 @@ value and dtype checks. Transient request errors can be retried as configured;
 protocol errors, service failures, and incomplete scores abort the batch rather
 than becoming zero rewards.
 
-Implementation: [configuration](../rl/config.py),
-[Trainer](../rl/trainer.py), [service client](../rl/reward_model/client.py),
+Implementation: [configuration](../rl/config/validate.py),
+[Trainer](../rl/trainer/sync.py), [service client](../rl/reward_model/client.py),
 [batch scoring](../rl/reward_model/scoring.py), and
 [task scorer](../examples/gsm8k/agent.py). CPU contract tests live in
 `tests/ut/rl/reward_model/test_model_reward.py`. Real NPU acceptance

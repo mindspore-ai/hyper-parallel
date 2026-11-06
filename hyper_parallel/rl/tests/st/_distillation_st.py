@@ -29,7 +29,7 @@ import torch
 import torch.distributed as dist
 import yaml
 
-from rl.trainer import SyncTrainer
+from rl.trainer.build import build_trainer
 
 
 def main() -> None:
@@ -55,7 +55,7 @@ def main() -> None:
     distillation.setdefault("probability_gate", {}).update(
         max_mean_logprob_diff=mean_limit, max_logprob_diff=max_limit,
     )
-    trainer = SyncTrainer(config)
+    trainer = build_trainer(config)
     original = trainer._complete_step
 
     def verify_step(**kwargs: Any) -> None:
@@ -91,10 +91,11 @@ def main() -> None:
         if trainer.rollout_engine.policy_version != kwargs["step"]:
             raise RuntimeError("OPD ST requires the updated policy to be published")
         main_params = bool(config["train"]["optimizer"].get("fp32_main_params", False))
-        optimizer_dtypes = sorted({str(parameter.dtype) for group in trainer.optimizer.param_groups
+        optimizer = trainer.actor.optimizer
+        optimizer_dtypes = sorted({str(parameter.dtype) for group in optimizer.param_groups
                                    for parameter in group["params"]})
         if main_params:
-            state_dtypes = {str(value.dtype) for leaf in trainer.optimizer.chained_optimizers
+            state_dtypes = {str(value.dtype) for leaf in optimizer.chained_optimizers
                             for state in leaf.state.values() for value in state.values()
                             if isinstance(value, torch.Tensor) and value.is_floating_point()}
             if optimizer_dtypes != ["torch.float32"] or state_dtypes != {"torch.float32"}:

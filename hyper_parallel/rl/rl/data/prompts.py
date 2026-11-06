@@ -1,0 +1,551 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Stateful prompt sources and deterministic evaluation partitioning."""
+
+from __future__ import annotations
+
+import importlib
+import functools
+import random
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Iterator, Mapping, Optional, Sequence
+
+import pandas as pd
+import torch
+
+from rl.data.contracts import Message, PromptRecord
+
+if TYPE_CHECKING:
+    from torchdata.stateful_dataloader import StatefulDataLoader as _StatefulDataLoader
+
+# Backward-compatible public constant. PromptDataset applies it only when the
+# caller explicitly passes prompt_instruction, so non-GSM8K tasks stay clean.
+PROMPT_INSTRUCTION = 'Let\'s think step by step and output the final answer after "####".'
+_PROMPT_COLUMN_CANDIDATES = ("prompt", "question", "problem", "input_text")
+_ANSWER_COLUMN_CANDIDATES = ("extra_info", "answer", "solution")
+_MAPPING_ANSWER_KEYS = ("ground_truth", "answer", "solution")
+
+
+def _to_builtin(value: Any) -> Any:
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, Mapping):
+        return {key: _to_builtin(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_builtin(item) for item in value]
+    return value
+
+
+def _pick_column(
+    columns: set[str], configured: Optional[str], candidates: Sequence[str],
+    label: str, required: bool,
+) -> Optional[str]:
+    """Resolve an explicit or inferred parquet column."""
+    if configured is not None:
+        column = configured.strip()
+        if not column:
+            raise ValueError(f"{label}_column must be non-empty when provided")
+        if column in columns:
+            return column
+        raise ValueError(
+            "Prompt parquet is missing required columns: "
+            f"{label}_column={column!r}; available={sorted(columns)}"
+        )
+    column = next((candidate for candidate in candidates if candidate in columns), None)
+    if column is not None or not required:
+        return column
+    raise ValueError(
+        f"Prompt parquet is missing required columns: no {label} column found; "
+        f"expected one of {list(candidates)}, available={sorted(columns)}"
+    )
+
+
+def _append_prompt_instruction(prompt: str, prompt_instruction: Optional[str]) -> str:
+    """Append one task-owned instruction without duplicating existing text."""
+    if prompt_instruction is None or prompt_instruction in prompt:
+        return prompt
+    return f"{prompt} {prompt_instruction}"
+
+
+def _normalize_prompt(
+    prompt_source: Any,
+    index: int,
+    prompt_instruction: Optional[str] = None,
+) -> tuple[str, str]:
+    """Normalize one raw or structured prompt source."""
+    prompt_source = _to_builtin(prompt_source)
+    if isinstance(prompt_source, str):
+        source_prompt = prompt_source.strip()
+        if not source_prompt:
+            raise ValueError("Prompt source must not be empty")
+        prompt = _append_prompt_instruction(source_prompt, prompt_instruction)
+        return source_prompt, prompt
+    if isinstance(prompt_source, Sequence) and not isinstance(prompt_source, (str, bytes)):
+        messages = list(prompt_source)
+        if len(messages) != 1 or not isinstance(messages[0], Mapping):
+            raise ValueError("Structured prompt sources must contain exactly one chat message")
+        role = messages[0].get("role")
+        content = messages[0].get("content")
+        if role != "user" or not isinstance(content, str) or not content.strip():
+            raise ValueError("Structured prompt sources must contain one non-empty user message")
+        source_prompt = content.strip()
+        return source_prompt, _append_prompt_instruction(source_prompt, prompt_instruction)
+    raise ValueError(
+        f"Unsupported prompt source type at sample {index}: {type(prompt_source)!r}"
+    )
+
+
+def _normalize_ground_truth(answer_source: Any, index: int) -> str:
+    """Normalize one mapping or string answer into an exact-match target."""
+    answer_source = _to_builtin(answer_source)
+    if isinstance(answer_source, Mapping):
+        for key in _MAPPING_ANSWER_KEYS:
+            value = answer_source.get(key)
+            if value is not None:
+                return _normalize_ground_truth(value, index)
+        raise ValueError(
+            f"Answer mapping at sample {index} must contain one of {_MAPPING_ANSWER_KEYS}"
+        )
+    if not isinstance(answer_source, str):
+        raise ValueError(f"Answer source at sample {index} must be text or a supported mapping")
+    ground_truth = answer_source.strip()
+    if "####" in ground_truth:
+        ground_truth = ground_truth.rsplit("####", maxsplit=1)[-1].strip()
+    ground_truth = ground_truth.replace(",", "").replace("$", "").strip()
+    if not ground_truth:
+        raise ValueError(f"Ground truth at sample {index} must not be empty")
+    return ground_truth
+
+
+def _select_answer_source(
+    record: Mapping[str, Any],
+    answer_column: Optional[str],
+    index: int,
+    *,
+    answer_column_is_explicit: bool,
+) -> Any:
+    """Select an explicit answer column before inferred answer sources."""
+    if answer_column_is_explicit and answer_column is not None:
+        return record[answer_column]
+    reward_model = _to_builtin(record.get("reward_model"))
+    if isinstance(reward_model, Mapping) and reward_model.get("ground_truth") is not None:
+        return reward_model["ground_truth"]
+    if answer_column is not None:
+        return record[answer_column]
+    raise ValueError(
+        f"Sample {index} is missing reward_model.ground_truth and fallback answer"
+    )
+
+
+class _DistributedPromptSampler:
+    """Deterministically shard prompt indices across data-parallel ranks."""
+
+    def __init__(
+        self,
+        dataset_size: int,
+        *,
+        rank: int,
+        world_size: int,
+        seed: int,
+        shuffle: bool,
+    ) -> None:
+        """Store deterministic rank-local sampling parameters."""
+        self.dataset_size = dataset_size
+        self.rank = rank
+        self.world_size = world_size
+        self.seed = seed
+        self.shuffle = shuffle
+        self.epoch = 0
+
+    def __iter__(self) -> Iterator[int]:
+        """Yield this rank's deterministic, equally sized index shard."""
+        indices = list(range(self.dataset_size))
+        if self.shuffle:
+            random.Random(self.seed + self.epoch).shuffle(indices)
+        usable_size = self.dataset_size - self.dataset_size % self.world_size
+        return iter(indices[:usable_size][self.rank::self.world_size])
+
+    def __len__(self) -> int:
+        """Return the number of complete samples owned by this rank."""
+        return self.dataset_size // self.world_size
+
+    def set_epoch(self, epoch: int) -> None:
+        """Select the deterministic shuffle order for one data epoch."""
+        self.epoch = int(epoch)
+
+
+def validate_row_adapter_config(data: Mapping[str, Any]) -> None:
+    """Validate the mutually exclusive adapted-record and text-column inputs."""
+    row_adapter = data.get("row_adapter")
+    if row_adapter is None:
+        return
+    if (not isinstance(row_adapter, str) or row_adapter.count(":") != 1
+            or not all(part.strip() for part in row_adapter.split(":"))):
+        raise ValueError("data.row_adapter must use module:function syntax")
+    if any(data.get(key) is not None for key in ("prompt_column", "answer_column", "prompt_instruction")):
+        raise ValueError("data.row_adapter owns messages and labels; column/instruction overrides must be omitted")
+
+
+def _load_row_adapter(
+    row_adapter: Optional[str], prompt_column: Optional[str], answer_column: Optional[str],
+    prompt_instruction: Optional[str],
+) -> Any:
+    """Resolve an explicit task adapter independently of text-column inference."""
+    if row_adapter is None:
+        return None
+    validate_row_adapter_config({
+        "row_adapter": row_adapter, "prompt_column": prompt_column,
+        "answer_column": answer_column, "prompt_instruction": prompt_instruction,
+    })
+    module_name, function_name = row_adapter.split(":")
+    adapter = getattr(importlib.import_module(module_name), function_name, None)
+    if not callable(adapter):
+        raise ValueError("data.row_adapter must resolve to a callable")
+    return adapter
+
+
+def validate_chat_template_kwargs(value: Optional[Mapping[str, Any]]) -> dict[str, Any]:
+    """Validate optional model template controls without changing tokenization contracts."""
+    if value is not None and not isinstance(value, Mapping):
+        raise ValueError("data.chat_template_kwargs must be a mapping")
+    options = dict(value or {})
+    protected = {"tokenize", "add_generation_prompt", "truncation", "max_length", "return_dict",
+                 "return_tensors", "tokenizer_kwargs"}
+    if set(options) & protected or any(not isinstance(key, str) for key in options):
+        raise ValueError("data.chat_template_kwargs cannot override tokenization or length controls")
+    return options
+
+
+class PromptDataset:
+    """Read tokenized prompt records from supported text parquet layouts."""
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any], tokenizer: Any, *, split: str = "train") -> "PromptDataset":
+        """Build a train/test source with one shared interpretation of task options."""
+        if split not in ("train", "test"):
+            raise ValueError(f"Unknown prompt dataset split: {split}")
+        limit = config.get("max_train_samples") if split == "train" else None
+        return cls(
+            parquet_path=str(config[f"{split}_path"]), tokenizer=tokenizer,
+            max_prompt_length=int(config["max_prompt_length"]),
+            max_samples=None if limit is None else int(limit),
+            row_adapter=config.get("row_adapter"), metadata_columns=config.get("metadata_columns"),
+            chat_template_kwargs=config.get("chat_template_kwargs"),
+            **{key: None if config.get(key) is None else str(config[key])
+               for key in ("prompt_column", "answer_column", "prompt_instruction")})
+
+    def __init__(
+        self,
+        parquet_path: str,
+        tokenizer: Any,
+        max_prompt_length: int,
+        prompt_column: Optional[str] = None,
+        answer_column: Optional[str] = None,
+        max_samples: Optional[int] = None,
+        prompt_instruction: Optional[str] = None,
+        row_adapter: Optional[str] = None,
+        metadata_columns: Optional[Sequence[str]] = None,
+        chat_template_kwargs: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        """Load and validate a tokenized prompt dataset from parquet."""
+        self._chat_template_kwargs = validate_chat_template_kwargs(chat_template_kwargs)
+        path = Path(parquet_path)
+        if not path.is_file():
+            raise ValueError(f"Prompt parquet file does not exist: {path}")
+        if max_prompt_length <= 0:
+            raise ValueError(
+                f"max_prompt_length must be positive, got {max_prompt_length}"
+            )
+        if prompt_instruction is not None:
+            if not isinstance(prompt_instruction, str) or not prompt_instruction.strip():
+                raise ValueError("prompt_instruction must be non-empty text when provided")
+            prompt_instruction = prompt_instruction.strip()
+        frame = pd.read_parquet(path)
+        if frame.empty:
+            raise ValueError(f"Prompt parquet contains no rows: {path}")
+        self._row_adapter = _load_row_adapter(row_adapter, prompt_column, answer_column, prompt_instruction)
+        columns = set(str(column) for column in frame.columns)
+        selected_metadata = tuple(metadata_columns or ())
+        if any(not isinstance(column, str) or not column.strip() for column in selected_metadata):
+            raise ValueError("data.metadata_columns must contain non-empty column names")
+        if len(set(selected_metadata)) != len(selected_metadata):
+            raise ValueError("data.metadata_columns must not contain duplicates")
+        missing_metadata = sorted(set(selected_metadata) - columns)
+        if missing_metadata:
+            raise ValueError(f"Prompt parquet is missing metadata columns: {missing_metadata}")
+        self._metadata_columns = selected_metadata
+        self._prompt_column = _pick_column(
+            columns, prompt_column, _PROMPT_COLUMN_CANDIDATES, "prompt", self._row_adapter is None
+        )
+        self._answer_column = _pick_column(
+            columns, answer_column, _ANSWER_COLUMN_CANDIDATES, "answer", False
+        )
+        self._answer_column_is_explicit = answer_column is not None
+        if self._row_adapter is None and self._answer_column is None and "reward_model" not in columns:
+            raise ValueError(
+                "Prompt parquet is missing required columns: no ground-truth source "
+                "found; expected reward_model.ground_truth or one of "
+                f"{list(_ANSWER_COLUMN_CANDIDATES)}, available={sorted(columns)}"
+            )
+        if max_samples is not None:
+            if max_samples <= 0:
+                raise ValueError(
+                    f"max_samples must be positive or null, got {max_samples}"
+                )
+            frame = frame.iloc[:max_samples]
+        self._records = frame.to_dict("records")
+        self._tokenizer = tokenizer
+        self._max_prompt_length = max_prompt_length
+        self._prompt_instruction = prompt_instruction
+
+    def __len__(self) -> int:
+        """Return the number of prompt samples."""
+        return len(self._records)
+
+    def _tokenize(self, prompt: str, index: int, messages: Optional[tuple[Message, ...]] = None) -> tuple[Any, Any]:
+        """Tokenize one prompt and enforce its configured length bound."""
+        encoded = self._tokenizer.apply_chat_template(
+            ([{"role": message.role, "content": message.content} for message in messages]
+             if messages is not None else [{"role": "user", "content": prompt}]),
+            add_generation_prompt=True,
+            tokenize=True,
+            truncation=messages is None,
+            max_length=self._max_prompt_length,
+            return_dict=True,
+            tokenizer_kwargs={"return_attention_mask": True},
+            **self._chat_template_kwargs,
+        )
+        input_ids = torch.tensor(encoded["input_ids"], dtype=torch.long)
+        attention_mask = torch.tensor(
+            encoded.get("attention_mask", [1] * len(encoded["input_ids"])),
+            dtype=torch.long,
+        )
+        if input_ids.ndim != 1 or input_ids.numel() == 0:
+            raise ValueError(
+                f"Tokenizer returned invalid input_ids for sample {index}: "
+                f"shape={input_ids.shape}"
+            )
+        if messages is not None and input_ids.numel() > self._max_prompt_length:
+            raise ValueError(
+                f"Adapted prompt {index} exceeds max_prompt_length={self._max_prompt_length}; preprocess it"
+            )
+        if attention_mask.shape != input_ids.shape:
+            raise ValueError(
+                f"Tokenizer attention_mask shape must equal input_ids shape for sample {index}: "
+                f"input_ids={input_ids.shape}, "
+                f"attention_mask={attention_mask.shape}"
+            )
+        return input_ids, attention_mask
+
+    def _adapt_sample(self, record: Mapping[str, Any], index: int) -> dict[str, Any]:
+        """Keep task-owned messages, labels and metadata together through collation."""
+        adapted = self._row_adapter(_to_builtin(record), index)
+        if (not isinstance(adapted, PromptRecord) or not isinstance(adapted.prompt_id, str)
+                or not adapted.prompt_id.strip()):
+            raise ValueError("data.row_adapter must return a PromptRecord with a non-empty string prompt_id")
+        if not adapted.messages or any(
+            not isinstance(message, Message)
+            or message.role not in ("system", "user", "assistant", "tool", "environment")
+            or not isinstance(message.content, str) or not message.content.strip() for message in adapted.messages
+        ):
+            raise ValueError("data.row_adapter returned invalid messages")
+        if not isinstance(adapted.metadata, dict):
+            raise ValueError("data.row_adapter metadata must be a dictionary")
+        prompt = "\n".join(message.content for message in adapted.messages)
+        input_ids, attention_mask = self._tokenize(prompt, index, tuple(adapted.messages))
+        return {
+            "sample_index": index, "prompt_id": adapted.prompt_id,
+            "source_prompt": prompt, "prompt": prompt, "messages": tuple(adapted.messages),
+            "ground_truth": adapted.ground_truth, "metadata": adapted.metadata,
+            "input_ids": input_ids, "attention_mask": attention_mask,
+        }
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        """Return one formatted and tokenized prompt sample."""
+        record = self._records[index]
+        if self._row_adapter is not None:
+            return self._adapt_sample(record, index)
+        source_prompt, prompt = _normalize_prompt(
+            record[self._prompt_column],
+            index,
+            self._prompt_instruction,
+        )
+        answer_source = _select_answer_source(
+            record,
+            self._answer_column,
+            index,
+            answer_column_is_explicit=self._answer_column_is_explicit,
+        )
+        input_ids, attention_mask = self._tokenize(prompt, index)
+        return {
+            "sample_index": index,
+            "source_prompt": source_prompt,
+            "prompt": prompt,
+            "ground_truth": _normalize_ground_truth(answer_source, index),
+            "metadata": {column: _to_builtin(record[column]) for column in self._metadata_columns},
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+
+
+def build_padded_evaluation_batches(
+    dataset_size: int, num_replicas: int, rank: int, batch_size: int,
+    max_samples: Optional[int] = None,
+) -> list[list[tuple[int, bool]]]:
+    """Partition evaluation rows and pad the final distributed batch."""
+    if dataset_size <= 0:
+        raise ValueError(f"dataset_size must be positive, got {dataset_size}")
+    if num_replicas <= 0:
+        raise ValueError(f"num_replicas must be positive, got {num_replicas}")
+    if rank < 0 or rank >= num_replicas:
+        raise ValueError(f"rank must be in [0, {num_replicas}), got {rank}")
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if max_samples is not None and max_samples <= 0:
+        raise ValueError(f"max_samples must be positive or null, got {max_samples}")
+    sample_count = dataset_size if max_samples is None else min(dataset_size, max_samples)
+    global_batch_size = num_replicas * batch_size
+    num_batches = (sample_count + global_batch_size - 1) // global_batch_size
+    batches: list[list[tuple[int, bool]]] = []
+    for batch_index in range(num_batches):
+        start = batch_index * global_batch_size + rank * batch_size
+        indices = range(start, start + batch_size)
+        batches.append(
+            [
+                (index if index < sample_count else 0, index < sample_count)
+                for index in indices
+            ]
+        )
+    return batches
+
+
+def build_prompt_records(
+    batch: Mapping[str, Any],
+    input_ids: Any,
+    attention_mask: Any,
+) -> tuple[PromptRecord, ...]:
+    """Attach unpadded input tokens to prompt records consumed by rollout."""
+    return tuple(
+        PromptRecord(
+            prompt_id=(batch["prompt_ids"][index] if "prompt_ids" in batch
+                       else str(int(batch["sample_indices"][index]))),
+            messages=(batch["messages"][index] if "messages" in batch else (Message("user", batch["prompts"][index]),)),
+            ground_truth=batch["ground_truths"][index],
+            metadata={
+                **(batch["metadata"][index] if "metadata" in batch else {}),
+                "input_ids": input_ids[index][attention_mask[index].bool()].detach()
+            },
+        )
+        for index in range(input_ids.shape[0])
+    )
+
+
+def _left_pad(tensor: Any, length: int, value: int) -> Any:
+    padding = torch.full((length - int(tensor.numel()),), value, dtype=tensor.dtype)
+    return torch.cat((padding, tensor), dim=0)
+
+
+def collate_prompt_samples(samples: Sequence[dict[str, Any]], pad_token_id: int) -> dict[str, Any]:
+    """Left-pad prompt samples into one training batch."""
+    if not samples:
+        raise ValueError("collate_prompt_samples requires at least one sample")
+    max_length = max(int(sample["input_ids"].numel()) for sample in samples)
+    input_ids = [_left_pad(sample["input_ids"], max_length, pad_token_id) for sample in samples]
+    attention_masks = [_left_pad(sample["attention_mask"], max_length, 0) for sample in samples]
+    return {
+        "input_ids": torch.cat(tuple(tensor.unsqueeze(0) for tensor in input_ids), dim=0),
+        "attention_mask": torch.cat(
+            tuple(tensor.unsqueeze(0) for tensor in attention_masks),
+            dim=0,
+        ),
+        "sample_indices": [int(sample["sample_index"]) for sample in samples],
+        "source_prompts": [str(sample["source_prompt"]) for sample in samples],
+        "prompts": [str(sample["prompt"]) for sample in samples],
+        "ground_truths": [sample["ground_truth"] for sample in samples],
+        "prompt_ids": [sample.get("prompt_id", str(int(sample["sample_index"]))) for sample in samples],
+        "messages": [sample.get("messages", (Message("user", sample["prompt"]),)) for sample in samples],
+        "metadata": [sample.get("metadata", {}) for sample in samples],
+    }
+
+
+def build_train_dataloader(
+    dataset: Any,
+    collate_fn: Any,
+    *,
+    batch_size: int,
+    rank: int,
+    world_size: int,
+    seed: int,
+    shuffle: bool,
+    num_workers: int,
+    pin_memory: bool,
+    prefetch_factor: Optional[int] = None,
+) -> tuple[_StatefulDataLoader, _DistributedPromptSampler]:
+    """Build the stateful prompt loader over the RL data-parallel domain."""
+    # Only training-loader construction needs the optional torchdata runtime.
+    from torchdata.stateful_dataloader import StatefulDataLoader  # pylint: disable=C0415
+
+    sampler = _DistributedPromptSampler(
+        len(dataset),
+        rank=rank,
+        world_size=world_size,
+        seed=seed,
+        shuffle=shuffle,
+    )
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "sampler": sampler,
+        "collate_fn": collate_fn,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "drop_last": True,
+    }
+    if num_workers > 0 and prefetch_factor is not None:
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+    return StatefulDataLoader(dataset, **loader_kwargs), sampler
+
+
+class StatefulPromptSource:
+    """Read a recoverable single-owner prompt stream without allocating training task identities."""
+
+    def __init__(self, config: Mapping[str, Any], tokenizer: Any, seed: int,
+                 state: dict | None = None) -> None:
+        dataset = PromptDataset.from_config(config, tokenizer)
+        self.loader, self.sampler = build_train_dataloader(
+            dataset, functools.partial(collate_prompt_samples, pad_token_id=tokenizer.pad_token_id),
+            batch_size=1, rank=0, world_size=1, seed=seed, shuffle=config.get("shuffle", True),
+            num_workers=0, pin_memory=False)
+        if len(self.loader) == 0:
+            raise ValueError("Async prompt dataset is empty")
+        self.epoch = 0 if state is None else state["epoch"]
+        self.sampler.set_epoch(self.epoch)
+        if state is not None:
+            self.loader.load_state_dict(state["loader"])
+        self.iterator = iter(self.loader)
+
+    def next_record(self) -> PromptRecord:
+        """Advance once, preserving deterministic epoch rollover and original prompt identity."""
+        try:
+            batch = next(self.iterator)
+        except StopIteration:
+            self.epoch += 1
+            self.sampler.set_epoch(self.epoch)
+            self.iterator = iter(self.loader)
+            batch = next(self.iterator)
+        return build_prompt_records(batch, batch["input_ids"], batch["attention_mask"])[0]
+
+    def state_dict(self) -> dict[str, Any]:
+        """Export the original loader/epoch schema; the caller owns checkpoint quiescence."""
+        return {"epoch": self.epoch, "loader": self.loader.state_dict()}

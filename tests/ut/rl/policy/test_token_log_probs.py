@@ -20,7 +20,7 @@ import unittest
 import torch
 from torch.utils.checkpoint import DefaultDeviceType
 
-from rl.roles.policy.token_log_probs import chunked_token_log_probs
+from rl.workers.adapters.token_log_probs import chunked_token_log_probs
 
 
 class TestChunkedTokenLogProbs(unittest.TestCase):

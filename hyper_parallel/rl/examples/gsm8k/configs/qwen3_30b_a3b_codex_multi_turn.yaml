@@ -6,9 +6,6 @@ model:
   tokenizer_path: /models/Qwen3-30B-A3B
   config_overrides: null
 
-consistency:
-  enabled: false
-
 data:
   train_path: /data/gsm8k/train.parquet
   test_path: /data/gsm8k/test.parquet
@@ -117,6 +114,41 @@ algorithm:
   loss_aggregation: token-mean
 
 train:
+  plan_overrides:
+  - match:
+    - '*.input_layernorm'
+    - '*.post_attention_layernorm'
+    - model.norm
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm
+      implementation:
+        _target_: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_rms_norm
+  - match: '*.self_attn'
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention
+      implementation:
+        _target_: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_flash_attention
+  - match: '*.mlp.experts'
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts
+      implementation:
+        _target_: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_grouped_experts
+  - match: '*.self_attn.forward'
+    when: cp
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel.qwen3_moe_flash_attention_cp_mask_wrapper
+  - match: '*.mlp.forward'
+    when: ep
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn
+        use_grouped_gemm: true
   router_replay:
     mode: disabled  # Set R3 to enable rollout capture and training replay together.
   model_init_cpu_threads: null  # Optional 8 during model build; restore original threads afterward.
@@ -133,6 +165,10 @@ train:
     min_gradient_norm: 0.0
     require_mixed_rewards: false
   accelerator:
+    requires_grad_sync: true
+    reshard_after_backward: false
+    loss_parallel: false
+    sequence_parallel: false
     dp_replicate: 1
     dp_shard: 2
     tp: 2

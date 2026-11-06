@@ -19,15 +19,13 @@ __all__ = ["HCCLWeightTransport"]
 
 import logging
 import socket
-import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Mapping, Optional, Sequence, Union
+from typing import Any, Callable, Mapping, Optional
 
 import torch
 import torch.distributed as dist
 
-from rl.weight_sync.layout import DirectReshardPlan
-from rl.weight_sync.packed_weight import PackedWeightAck, pack_direct_bucket
+from rl.weight_sync.packed_weight import PackedWeightAck
 from rl.weight_sync.sync import coordinator_call, synchronize_error, synchronized_call
 from rl.weight_sync.vllm_client import VLLMWeightSyncClientMixin, shared_endpoint
 
@@ -120,243 +118,14 @@ class HCCLWeightTransport:
         self._endpoint = endpoint
         return endpoint
 
-    @staticmethod
-    def _group_id(
-        source_rank: int,
-        tp_rank: int,
-        replica_count: int,
-        master_port: int,
-    ) -> str:
-        return (
-            f"hyper-direct-s{source_rank}-t{tp_rank}-d{replica_count}"
-            f"-p{master_port}"
-        )
 
-    def _initialize_route(
-        self,
-        client: VLLMWeightSyncClientMixin,
-        endpoint: str,
-        source_rank: int,
-        tp_rank: int,
-    ) -> None:
-        """Join one source and all matching shared-deployment DP workers."""
-        route = (source_rank, tp_rank)
-        if route in self._group_ids:
-            return
-        local_rank = dist.get_rank()
-        master_port = coordinator_call("HCCL rendezvous port", _open_port)
-        group_id = self._group_id(source_rank, tp_rank, self._data_parallel_size, master_port)
-        init_info = {
-            "master_address": "127.0.0.1",
-            "master_port": master_port,
-            "world_size": 1 + self._data_parallel_size,
-        }
 
-        def join() -> Any:
-            """Only this route's producer joins the stateless group."""
-            return self._trainer_init(init_info) if local_rank == source_rank else None
 
-        group, worker_results = _rpc_with_collective(
-            client, endpoint, "init_direct_reshard_group",
-            {"group_id": group_id, "target_tp_rank": tp_rank, **init_info,
-             "expected_data_parallel_size": self._data_parallel_size,
-             "expected_tensor_parallel_size": self._tensor_parallel_size},
-            join, timeout=180,
-        )
-        self._validate_route_workers(worker_results, group_id, tp_rank)
-        if local_rank == source_rank:
-            self._groups[route] = group
-        self._group_ids[route] = group_id
 
-    @staticmethod
-    def _validate_route_workers(worker_results: Any, group_id: str, tp_rank: int) -> None:
-        """Validate joined and skipped worker acknowledgements for one route."""
-        if not isinstance(worker_results, list) or not worker_results:
-            raise RuntimeError(
-                f"Direct reshard group {group_id!r} returned invalid workers: {worker_results}"
-            )
-        for result in worker_results:
-            if not isinstance(result, Mapping):
-                raise RuntimeError(
-                    f"Direct reshard group {group_id!r} returned invalid ACK: {result!r}"
-                )
-            result_tp_rank = int(result["tp_rank"])
-            result_dp_rank = int(result["dp_rank"])
-            result_group_rank = result.get("group_rank")
-            if bool(result.get("joined")):
-                expected_group_rank = 1 + result_dp_rank
-                if result_tp_rank != tp_rank or int(result_group_rank) != expected_group_rank:
-                    raise RuntimeError(
-                        f"Direct reshard group {group_id!r} returned invalid ACK: {result}"
-                    )
-            elif result_tp_rank == tp_rank or result_group_rank is not None:
-                raise RuntimeError(
-                    f"Direct reshard group {group_id!r} returned invalid skip ACK: {result}"
-                )
 
-    def ensure_groups(
-        self,
-        client: VLLMWeightSyncClientMixin,
-        plan: DirectReshardPlan,
-    ) -> str:
-        """Create routes in deterministic source/TP order to avoid rendezvous races."""
-        endpoint = self._resolve_endpoint(client)
-        if plan.destination_tp_size != self._tensor_parallel_size:
-            raise RuntimeError(
-                "Direct reshard plan TP size differs from configured topology: "
-                f"expected={self._tensor_parallel_size}, actual={plan.destination_tp_size}"
-            )
-        for source_rank in range(plan.source_world_size):
-            for tp_rank in range(plan.destination_tp_size):
-                if not plan.for_route(source_rank, tp_rank):
-                    continue
-                self._initialize_route(
-                    client,
-                    endpoint,
-                    source_rank,
-                    tp_rank,
-                )
-        return endpoint
 
-    def _broadcast_route(
-        self, client: VLLMWeightSyncClientMixin, endpoint: str, state_dict: Mapping[str, Any],
-        plan: DirectReshardPlan, source_rank: int, tp_rank: int, policy_version: int,
-    ) -> tuple[int, int]:
-        """Pack and broadcast the original ordered buckets for one direct route."""
-        buckets = plan.for_route(source_rank, tp_rank)
 
-        def materialize(index: int) -> Any:
-            """Only the route's source rank evaluates the producer callback."""
-            return pack_direct_bucket(state_dict, buckets[index], self._groups[(source_rank, tp_rank)].device)
-        return self._broadcast_buffers(
-            client, endpoint, source_rank, tp_rank,
-            [bucket.worker_metadata() for bucket in buckets], materialize, policy_version,
-        )
 
-    def transfer_direct(
-        self,
-        client: VLLMWeightSyncClientMixin,
-        state_dict: Mapping[str, Any],
-        plan: DirectReshardPlan,
-        policy_version: int,
-    ) -> None:
-        """Execute every route without ever materializing one full Actor tensor."""
-        group_started = time.perf_counter()
-        endpoint = self.ensure_groups(client, plan)
-        group_seconds = time.perf_counter() - group_started
-        transfer_started = time.perf_counter()
-        sent_bytes, fragment_bytes = self._transfer_direct_routes(client, endpoint, state_dict, plan, policy_version)
-        transfer_seconds = time.perf_counter() - transfer_started
-        metric_values: list[Optional[dict[str, Union[float, int]]]] = [None] * plan.source_world_size
-        dist.all_gather_object(metric_values, {"sent_bytes": sent_bytes, "fragment_bytes": fragment_bytes})
-        total_sent = sum(int(value["sent_bytes"]) for value in metric_values if value)
-        total_fragments = sum(int(value["fragment_bytes"]) for value in metric_values if value)
-        if dist.get_rank() == 0:
-            logger.info(
-                "direct reshard completed: group_init=%.6fs transfer=%.6fs "
-                "sent_gib=%.6f delivered_gib=%.6f routes=%d fragments=%d",
-                group_seconds,
-                transfer_seconds,
-                total_sent / 2**30,
-                total_fragments * self._data_parallel_size / 2**30,
-                plan.route_count,
-                plan.fragment_count,
-            )
-
-    def _transfer_direct_routes(
-        self, client: VLLMWeightSyncClientMixin, endpoint: str, state_dict: Mapping[str, Any],
-        plan: DirectReshardPlan, policy_version: int,
-    ) -> tuple[int, int]:
-        """Broadcast each populated route and count the local source's bytes."""
-        local_rank = dist.get_rank()
-        sent_bytes = 0
-        fragment_bytes = 0
-        for source_rank in range(plan.source_world_size):
-            for tp_rank in range(plan.destination_tp_size):
-                if not plan.for_route(source_rank, tp_rank):
-                    continue
-                result = self._broadcast_route(
-                    client,
-                    endpoint,
-                    state_dict,
-                    plan,
-                    source_rank,
-                    tp_rank,
-                    policy_version,
-                )
-                if local_rank == source_rank:
-                    route_sent, route_fragments = result
-                    sent_bytes += route_sent
-                    fragment_bytes += route_fragments
-        return sent_bytes, fragment_bytes
-
-    def _broadcast_buffers(
-        self, client: VLLMWeightSyncClientMixin, endpoint: str, source_rank: int, tp_rank: int,
-        metadata: Sequence[Mapping[str, Any]], materialize: Callable[[int], Any], policy_version: int,
-    ) -> tuple[int, int]:
-        """Receive one route asynchronously while its source broadcasts bounded buffers."""
-        route = (source_rank, tp_rank)
-        group_id = self._group_ids.get(route)
-        if group_id is None:
-            raise RuntimeError(f"Weight-sync HCCL route {route} has no group identity")
-
-        def broadcast() -> int:
-            """Pack and broadcast each bucket only on its source rank."""
-            if dist.get_rank() != source_rank:
-                return 0
-            group = self._groups.get(route)
-            if group is None:
-                raise RuntimeError(f"Weight-sync HCCL route {route} has no producer group")
-            packed = None
-            sent_bytes = 0
-            try:
-                for index, description in enumerate(metadata):
-                    packed = materialize(index)
-                    if int(packed.numel()) != int(description["total_bytes"]):
-                        raise ValueError("HCCL packed buffer differs from bucket metadata")
-                    torch.get_device_module().current_stream().synchronize()
-                    group.broadcast(packed, src=0)
-                    torch.get_device_module().current_stream().synchronize()
-                    sent_bytes += int(description["total_bytes"])
-                    packed = None
-            except Exception:
-                if packed is not None:
-                    self._failed_buffers.append(packed)
-                raise
-            return sent_bytes
-
-        sent_bytes, results = _rpc_with_collective(
-            client, endpoint, "receive_direct_reshard",
-            {"group_id": group_id, "target_tp_rank": tp_rank, "buckets": list(metadata),
-             "policy_version": policy_version, "expected_data_parallel_size": self._data_parallel_size,
-             "expected_tensor_parallel_size": self._tensor_parallel_size},
-            broadcast, timeout=600,
-        )
-        copied_bytes = sum(int(entry["num_bytes"]) for bucket in metadata for entry in bucket["entries"])
-        self._validate_receive_results(results, tp_rank, copied_bytes)
-        return sent_bytes, copied_bytes
-
-    def _validate_receive_results(self, results: Any, tp_rank: int, expected_bytes: int) -> None:
-        """Validate representative DP results after workers check their coordinates."""
-        if not isinstance(results, list) or not results:
-            raise RuntimeError(f"HCCL returned invalid receive results: {results}")
-        coordinates = set()
-        received = set()
-        for result in results:
-            if not isinstance(result, Mapping):
-                raise RuntimeError(f"HCCL returned an invalid receive ACK: {result}")
-            coordinate = (int(result["dp_rank"]), int(result["tp_rank"]))
-            if (coordinate in coordinates or not 0 <= coordinate[0] < self._data_parallel_size
-                    or not 0 <= coordinate[1] < self._tensor_parallel_size):
-                raise RuntimeError(f"HCCL receive ACK has an invalid or duplicate rank: {result}")
-            coordinates.add(coordinate)
-            intended = coordinate[1] == tp_rank
-            if result.get("received") is not intended or int(result["bytes"]) != (expected_bytes if intended else 0):
-                raise RuntimeError(f"HCCL receive ACK differs from its route: {result}")
-            if intended:
-                received.add(coordinate)
-        if not received:
-            raise RuntimeError(f"HCCL returned no representative ACK for TP{tp_rank}: {results}")
 
     def prepare_packed(self, client: VLLMWeightSyncClientMixin) -> str:
         """Create one rank-zero producer group containing every rollout worker."""

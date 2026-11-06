@@ -21,7 +21,7 @@ from collections import Counter
 from typing import Any, Mapping
 
 from rl.agentic.core.types import RewardResult
-from rl.dataset.contracts import PromptRecord
+from rl.data.contracts import PromptRecord
 
 _ANSWER = re.compile(r"^ANSWER\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 _SOURCES = re.compile(r"^SOURCES\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)

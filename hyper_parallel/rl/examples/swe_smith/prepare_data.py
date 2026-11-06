@@ -24,7 +24,7 @@ from typing import Any, Iterator, Mapping, Sequence
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from rl.dataset.contracts import Message, PromptRecord
+from rl.data.contracts import Message, PromptRecord
 
 
 _SCHEMA = pa.schema([

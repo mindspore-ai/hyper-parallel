@@ -18,7 +18,7 @@
 import pytest
 import torch
 
-from rl.roles.model_setup import ModelRegistration, resolve_vllm_model
+from rl.workers.engine.model import ModelRegistration, resolve_vllm_model
 from rl.weight_sync.model_adapter import (
     ModelWeightAdapter,
     build_model_weight_adapter,
@@ -41,7 +41,7 @@ def _model(family: str, *, tied: bool = True):
         text_model_type=model_type,
         tie_word_embeddings=tied,
     )
-    return resolve_vllm_model(registration, "hyper")
+    return resolve_vllm_model(registration, "native")
 
 
 @pytest.mark.parametrize("tied", [False, True])
@@ -62,9 +62,6 @@ def test_model_adapter_maps_dense_and_tied_actor_names(tied: bool) -> None:
         expected_names.insert(1, "lm_head.weight")
     assert list(mapped) == expected_names
     assert mapped["model.embed_tokens.weight"] is embedding
-    descriptions = adapter.direct_source_descriptions(mapped, source_rank=3)
-    assert [description["name"] for description in descriptions] == sorted(expected_names)
-    assert {description["source_rank"] for description in descriptions} == {3}
 
 
 def test_model_adapter_factory_selects_registered_family() -> None:

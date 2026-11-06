@@ -26,8 +26,8 @@ import torch
 import torch.distributed as dist
 import yaml
 
-from rl.dataset.episodes import episode_rows
-from rl.trainer import SyncTrainer
+from rl.data.episodes import episode_rows
+from rl.trainer.sync import SyncTrainer
 
 
 def _verify_captured_tokens(row: Any) -> None:

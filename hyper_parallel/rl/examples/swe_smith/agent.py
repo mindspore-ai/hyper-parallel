@@ -32,7 +32,7 @@ from rl.agentic.core.types import RewardResult
 from rl.agentic.envs.docker_workspace import (
     DockerWorkspace, InvalidSubmissionError, acquire_workspace_slot,
 )
-from rl.dataset.contracts import Trajectory
+from rl.data.contracts import Trajectory
 from rl.agentic.codex.container_execution import CandidateRelay, run_container_codex
 from examples.swe_smith.reward import SWESmithTask
 

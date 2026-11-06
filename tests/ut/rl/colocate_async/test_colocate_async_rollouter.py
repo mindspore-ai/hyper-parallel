@@ -17,8 +17,8 @@ from copy import deepcopy
 import unittest
 from unittest.mock import Mock, patch
 
-from rl.fully_async.protocol import AsyncTrainingConfig, decode_group
-from rl.colocate_async.colocate_async_rollouter import ColocateAsyncRollouter
+from rl.async_runtime.protocol import AsyncTrainingConfig, decode_group
+from rl.async_runtime.colocated import ColocateAsyncRollouter
 from tests.ut.rl.fully_async.support import group
 
 
@@ -30,7 +30,7 @@ class TestColocateAsyncRollouter(unittest.TestCase):
         self.settings = AsyncTrainingConfig(max_inflight_groups=4, max_buffer_groups=4)
         self.config = {"rollout": {"num_return_sequences": 2}, "colocate_async": {"warmup_batches": 1}}
         self.runtime = Mock()
-        with patch("rl.colocate_async.colocate_async_rollouter.AsyncRuntime", return_value=self.runtime):
+        with patch("rl.async_runtime.colocated.AsyncRuntime", return_value=self.runtime):
             self.rollouter = ColocateAsyncRollouter(self.config, self.settings)
 
     def _accept(self, version=1, update=0):
@@ -83,7 +83,7 @@ class TestColocateAsyncRollouter(unittest.TestCase):
     def test_restore_preserves_ready_experience_and_producer_cursor(self):
         self._accept()
         restored = {"buffer": self.rollouter.buffer.state_dict(), "source": {"cursor": 12}}
-        with patch("rl.colocate_async.colocate_async_rollouter.AsyncRuntime") as runtime:
+        with patch("rl.async_runtime.colocated.AsyncRuntime") as runtime:
             result = ColocateAsyncRollouter(self.config, self.settings, restored)
         self.assertEqual(result.buffer.next_identity, 1)
         self.assertEqual(result.buffer.ready, self.rollouter.buffer.ready)
@@ -92,7 +92,7 @@ class TestColocateAsyncRollouter(unittest.TestCase):
         self.assertEqual(runtime.call_args.args[0]["async_training"]["max_buffer_groups"], 4)
 
     def test_wait_has_a_deadline_and_transport_failures_propagate(self):
-        with patch("rl.colocate_async.colocate_async_rollouter.time.monotonic", side_effect=[0, 1000]):
+        with patch("rl.async_runtime.colocated.time.monotonic", side_effect=[0, 1000]):
             with self.assertRaises(TimeoutError):
                 self.rollouter.sample_batch(1, 0, 1)
         self.runtime.pump.side_effect = RuntimeError("producer died")

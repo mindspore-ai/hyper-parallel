@@ -57,7 +57,7 @@ def load_adapter_modules() -> tuple[ModuleType, ModuleType]:
     modules["vllm.model_executor.model_loader.weight_utils"].default_weight_loader = _backend_not_mocked
     modules["vllm.model_executor.layers.attention"].Attention = _backend_not_mocked
 
-    package_name = "rl.roles.rollout.consistency_models.qwen3"
+    package_name = "rl.rollout.consistency_models.qwen3"
     source = Path(next(iter(importlib.util.find_spec(package_name).submodule_search_locations)))
     loaded = {}
     with pytest.MonkeyPatch.context() as patcher:

@@ -5,9 +5,6 @@ model:
   tokenizer_path: /models/Qwen3-4B
   config_overrides: null
 
-consistency:
-  enabled: false
-
 data:
   train_path: /data/gsm8k/train.parquet
   test_path: /data/gsm8k/test.parquet
@@ -113,6 +110,24 @@ algorithm:
   loss_aggregation: token-mean
 
 train:
+  plan_overrides:
+  - match:
+    - '*.input_layernorm'
+    - '*.post_attention_layernorm'
+    - model.norm
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3.modeling_qwen3.Qwen3RMSNorm
+      implementation:
+        _target_: hyper_parallel.models.qwen3.adapter.conversion.module_replacement.replace_qwen3_rms_norm
+  - match: '*.self_attn'
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3.modeling_qwen3.Qwen3Attention
+      implementation:
+        _target_: hyper_parallel.models.qwen3.adapter.conversion.module_replacement.replace_qwen3_flash_attention
+  - match: '*.self_attn'
+    region_dispatch: false
   model_init_cpu_threads: null  # Optional 8 during model build; restore original threads afterward.
   max_steps: 2
   seed: 1234
@@ -127,6 +142,10 @@ train:
     min_gradient_norm: 0.0
     require_mixed_rewards: false
   accelerator:
+    requires_grad_sync: true
+    reshard_after_backward: false
+    loss_parallel: false
+    sequence_parallel: false
     dp_replicate: 1
     dp_shard: 2
     tp: 1

@@ -190,9 +190,9 @@ def capture_runtime_state(roles: Any) -> dict[str, Any]:
     """Fingerprint the live model, optimizer, scheduler and both saved RNG states."""
     with SkipDTensorDispatch():
         result = {
-            "model": state_digest(roles.model.state_dict()),
-            "optimizer": state_digest(roles.optimizer.state_dict()),
-            "scheduler": state_digest(None if roles.lr_scheduler is None else roles.lr_scheduler.state_dict()),
+            "model": state_digest(roles.actor.actor_model.state_dict()),
+            "optimizer": state_digest(roles.actor.optimizer.state_dict()),
+            "scheduler": state_digest(None if roles.actor.lr_scheduler is None else roles.actor.lr_scheduler.state_dict()),
             "cpu_rng": state_digest(torch.get_rng_state()),
             "device_rng": state_digest(roles.device_handle.get_rng_state(roles.device)),
         }
@@ -202,7 +202,7 @@ def capture_runtime_state(roles: Any) -> dict[str, Any]:
 def write_rollout_diagnostics(experience: Any, directory: str, step: int, dp_rank: int, response_limit: int) -> None:
     """Save consumed responses and actual group advantage signals, once per DP shard."""
     # Dataset initialization imports Actor/monitoring; defer this import until the runtime is constructed.
-    from rl.dataset.episodes import generation_finish_reason  # pylint: disable=C0415
+    from rl.data.episodes import generation_finish_reason  # pylint: disable=C0415
 
     nonzero = ((experience.advantages != 0) & experience.loss_action_mask.bool()).any(dim=-1).cpu().tolist()
     groups = {}
@@ -253,20 +253,20 @@ def write_rollout_diagnostics(experience: Any, directory: str, step: int, dp_ran
 def record_async_state(trainer: Any, event: str, **metadata: Any) -> None:
     """Capture model/optimizer/RNG evidence only when the existing audit option is enabled."""
     if trainer.settings.audit_dir is not None:
-        state = trainer.roles.run_synchronized("audit " + event, lambda: capture_runtime_state(trainer.roles))
-        trainer.trace.emit(event, update=trainer.roles.state.global_step, digests=state, **metadata)
+        state = trainer.run_synchronized("audit " + event, lambda: capture_runtime_state(trainer))
+        trainer.trace.emit(event, update=trainer.state.global_step, digests=state, **metadata)
 
 
 def record_async_rollout(trainer: Any, experience: Any, step: int) -> None:
     """Persist the same consumed calls on TP owners and synchronize any diagnostic IO failure."""
     def write_samples() -> None:
         """Keep one diagnostics file per DP owner."""
-        if trainer.roles.parallel_dims.tp_rank == 0:
+        if trainer.parallel_dims.tp_rank == 0:
             root = trainer.settings.audit_dir or trainer.config["train"]["checkpoint"]["output_dir"]
             write_rollout_diagnostics(experience, str(Path(root).parent / "rollouts"), step,
-                                      trainer.roles.parallel_dims.dp_rank, trainer.config["rollout"]["max_new_tokens"])
+                                      trainer.parallel_dims.dp_rank, trainer.config["rollout"]["max_new_tokens"])
 
-    trainer.roles.run_synchronized("async rollout diagnostics", write_samples)
+    trainer.run_synchronized("async rollout diagnostics", write_samples)
 
 
 def record_async_checkpoint(trace: EventTrace, directory: Path, snapshot: dict) -> None:
@@ -290,8 +290,8 @@ def install_async_audit(roles: Any, trace: EventTrace, enabled: bool) -> ActorLo
 def begin_async_update(trainer: Any, step: int, experience: Any) -> None:
     """Record fixed targets and exact optimizer start after synchronized preparation."""
     if trainer.loss_audit is not None:
-        trainer.roles.run_synchronized("async audit targets", lambda: trainer.loss_audit.begin(
-            step, experience, trainer.config["train"], trainer.roles.parallel_dims.dp_size))
+        trainer.run_synchronized("async audit targets", lambda: trainer.loss_audit.begin(
+            step, experience, trainer.config["train"], trainer.parallel_dims.dp_size))
     trainer.trace.emit("update_start", update=step,
                        groups=sorted({row.group_id for row in experience.trajectories}),
                        behavior_versions=sorted({segment["policy_version"]
@@ -303,7 +303,7 @@ def begin_async_update(trainer: Any, step: int, experience: Any) -> None:
 def finish_async_update(trainer: Any) -> None:
     """Check every observed backward before reporting a successful optimizer update."""
     if trainer.loss_audit is not None:
-        trainer.roles.run_synchronized("async audit completion", trainer.loss_audit.finish)
+        trainer.run_synchronized("async audit completion", trainer.loss_audit.finish)
 
 
 def record_async_selection(trace: EventTrace, groups: tuple[Any, ...], update: int) -> None:
@@ -316,7 +316,7 @@ def record_async_selection(trace: EventTrace, groups: tuple[Any, ...], update: i
 
 def record_publication_timing(trainer: Any, started: float, admitted_at: float) -> None:
     """Keep publication timing metrics separate from the commit/admission transaction."""
-    trainer.roles.tracker.log({"async/publication_seconds": time.monotonic() - started,
+    trainer.tracker.log({"async/publication_seconds": time.monotonic() - started,
                               "async/publication_wait_seconds": admitted_at - started,
                               "async/publication_transfer_seconds": time.monotonic() - admitted_at},
-                             step=trainer.roles.state.global_step)
+                             step=trainer.state.global_step)

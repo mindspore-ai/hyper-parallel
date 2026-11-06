@@ -26,7 +26,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from rl.checkpoint import RLCheckpointManager
+from rl.trainer.checkpoint import RLCheckpointManager
 from rl.distillation.config import distillation_fingerprint, parse_distillation_config, teacher_weight_files
 from rl.distillation.teacher import TeacherManager
 
@@ -97,13 +97,13 @@ class TestDistillationIdentity(unittest.TestCase):
         output = self.root / "checkpoints"
         directory = output / "step_2"
         manager = RLCheckpointManager(
-            SimpleNamespace(teacher_manager=teacher, critic=None),
+            SimpleNamespace(teacher_fingerprint=teacher.fingerprint, critic=None),
             {"output_dir": str(output), "load_path": str(directory)}, resolved,
             lambda operation, callback: callback(),
         )
         state = SimpleNamespace(global_step=2, epoch=1, consumed_samples=4, consumed_tokens=32)
-        with patch("rl.checkpoint.dist.get_rank", return_value=0), \
-                patch("rl.checkpoint.dist.get_world_size", return_value=1):
+        with patch("rl.trainer.checkpoint.dist.get_rank", return_value=0), \
+                patch("rl.trainer.checkpoint.dist.get_world_size", return_value=1):
             with patch("rl.distillation.config._file_fingerprint", side_effect=AssertionError("Unexpected rescan")):
                 manager._write_metadata(directory, state)
                 (directory / "rank_0").mkdir()
@@ -111,15 +111,14 @@ class TestDistillationIdentity(unittest.TestCase):
             saved = json.loads((directory / "checkpoint_complete.json").read_text())
             self.assertEqual(saved["distillation_fingerprint"], teacher.fingerprint)
             self.shards[1].write_bytes(b'new weights')
-            manager.trainer.teacher_manager = self.validated_teacher()
+            manager.resources.teacher_fingerprint = self.validated_teacher().fingerprint
             with self.assertRaisesRegex(RuntimeError, "teacher identity differs"):
                 manager.validate_resume()
 
     def test_checkpoint_rejects_unvalidated_identity(self) -> None:
         """Checkpoint IO cannot bypass teacher startup validation."""
-        teacher = TeacherManager(parse_distillation_config(self.config), lambda *args: Mock())
         manager = RLCheckpointManager(
-            SimpleNamespace(teacher_manager=teacher), {"output_dir": str(self.root / "checkpoints")},
+            SimpleNamespace(teacher_fingerprint=None), {"output_dir": str(self.root / "checkpoints")},
             {"distillation": self.config}, lambda operation, callback: callback(),
         )
         with self.assertRaisesRegex(RuntimeError, "validated teacher weight identity"):

@@ -25,8 +25,8 @@ from torch import nn
 from transformers import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
 
-from rl.roles.materialization import _rope_factory, register_qwen3_materialization
-from rl.roles.qwen3_builder import adapt_materialization
+from rl.workers.engine.materialization import _rope_factory, register_qwen3_materialization
+from rl.workers.adapters.qwen3 import adapt_materialization
 
 from hyper_parallel.models.materialization import MaterializationContext, rebuild_materialized_state
 

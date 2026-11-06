@@ -139,8 +139,8 @@ SWE-Smith 候选和 grader 仍使用按仓库任务准备的专用镜像，不�
 `Dockerfile.qwen3_8` 是仅加入固定 Codex CLI 的最小叠层入口；发布版本还包含已准备的 RL 依赖，复用官方推理栈。
 已验收运行环境为 Torch 2.10.0+cpu、torch-npu 2.10.0.post4、CANN 9.1、
 Transformers 5.5.4、vLLM 0.23.0、vLLM-Ascend 0.23.0.post1、Codex CLI 0.152.1；
-SWE-Smith 不依赖 SWE-bench evaluator。Qwen3 dense 一致性按版本选择对应的固定配方，见
-[一致性运行说明](../docs/qwen3_training_inference_consistency.md#运行)。
+SWE-Smith 不依赖 SWE-bench evaluator。当前推理使用 native-vLLM，部署要求见
+[推理运行说明](../docs/vllm_rollout.md)。
 
 [SWE-Smith Dockerfile](../examples/swe_smith/Dockerfile) 为选中仓库的固定任务镜像加入 CLI 和独立 Python stdlib。
 任务镜像与 CLI 必须匹配宿主架构；`prepare_images.py` 默认不拉取缺失镜像。可信 controller 持有 Docker 客户端及 socket，候选与 grader

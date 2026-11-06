@@ -28,14 +28,14 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
 from rl.algorithm.loss import build_algorithm
-from rl.fully_async.protocol import AsyncTrainingConfig
-from rl.fully_async.fully_async_trainer import FullyAsyncTrainer
-from rl.fully_async.protocol import SampleGroup
-from rl.fully_async.fully_async_rollouter import AsyncRuntime
-from rl.roles.rollout.base import GenerationSettings
-from rl.dataset.batch_builder import ExperiencePreparer, pad_agent_call_batch_for_dp
-from rl.dataset.contracts import Trajectory, Turn
-from rl.roles.policy.actor import Actor
+from rl.async_runtime.protocol import AsyncTrainingConfig
+from rl.trainer.fully_async import FullyAsyncTrainer
+from rl.async_runtime.protocol import SampleGroup
+from rl.async_runtime.producer import AsyncRuntime
+from rl.rollout.base import GenerationSettings
+from rl.data.experience import ExperiencePreparer, pad_agent_call_batch_for_dp
+from rl.data.contracts import Trajectory, Turn
+from rl.workers.actor import Actor
 
 
 class TinyPolicy(torch.nn.Module):
@@ -244,8 +244,8 @@ def run(output: str) -> None:
         """Keep production IPC while substituting a deterministic producer."""
         return AsyncRuntime(*args, target=producer, control_client=Mock())
 
-    with patch("rl.fully_async.fully_async_trainer.RLRoleRuntime", TinyRuntime), patch(
-        "rl.fully_async.fully_async_trainer.AsyncRuntime", sampler_factory,
+    with patch("rl.trainer.fully_async.RLRoleRuntime", TinyRuntime), patch(
+        "rl.trainer.fully_async.AsyncRuntime", sampler_factory,
     ):
         trainer = FullyAsyncTrainer(config)
         trainer.train()

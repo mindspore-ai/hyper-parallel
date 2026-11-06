@@ -15,7 +15,7 @@
 """Task reward functions consumed by agentic environments."""
 import re
 from typing import Callable, List, Optional, Sequence, Union
-from rl.registry import Registry
+from rl.utils.registry import Registry
 RewardInput = Union[str, Sequence[str]]
 RewardOutput = Union[float, List[float]]
 RewardFunction = Callable[[RewardInput, str], RewardOutput]

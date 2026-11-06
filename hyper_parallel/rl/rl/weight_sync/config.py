@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 
-SUPPORTED_WEIGHT_SYNC_STRATEGIES = frozenset(("direct_reshard", "full_gather"))
+SUPPORTED_WEIGHT_SYNC_STRATEGIES = frozenset(("full_gather",))
 SUPPORTED_WEIGHT_SYNC_FAMILIES = frozenset(("qwen3", "qwen3_moe", "qwen3_5"))
 
 
@@ -59,7 +59,7 @@ def validate_weight_sync_support(
     if rollout_tp <= 0:
         raise ValueError("rollout tensor_parallel_size must be positive")
     if strategy not in SUPPORTED_WEIGHT_SYNC_STRATEGIES:
-        raise ValueError(f"Unsupported weight-sync strategy: {strategy!r}")
+        raise ValueError(f"Weight-sync strategy {strategy!r} was removed or is unsupported; use full_gather")
 
 
 def resolve_weight_sync_config(

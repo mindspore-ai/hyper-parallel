@@ -26,17 +26,7 @@ import pytest
 import torch
 
 import rl.weight_sync.vllm_worker as worker_module
-from rl.weight_sync.vllm_worker import (
-    get_direct_reshard_layout,
-    get_policy_version,
-    init_direct_reshard_group,
-    init_packed_weight_group,
-    install_vllm_weight_sync_hooks,
-    receive_direct_reshard,
-    receive_ipc_direct_reshard,
-    receive_ipc_packed_weights,
-    receive_packed_weights,
-)
+from rl.weight_sync.vllm_worker import _native_weight_layout, get_policy_version, init_packed_weight_group, install_vllm_weight_sync_hooks, receive_ipc_packed_weights, receive_packed_weights
 
 
 class _Placement:
@@ -79,7 +69,7 @@ def _worker(model: Any) -> Any:
     return SimpleNamespace(
         model_runner=SimpleNamespace(get_model=lambda: model),
         model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["HyperQwen3ForCausalLM"])
+            hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"])
         ),
         parallel_config=SimpleNamespace(data_parallel_index=0, data_parallel_size=1),
         _rl_loaded_policy_version=1,
@@ -87,33 +77,6 @@ def _worker(model: Any) -> Any:
     )
 
 
-def test_worker_reports_layout_and_committed_version(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Worker layout and committed version remain available without weight hashing."""
-    tp_group = SimpleNamespace(rank_in_group=0, world_size=2)
-    monkeypatch.setitem(sys.modules, "vllm.distributed", SimpleNamespace(get_tp_group=lambda: tp_group))
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm_ascend.distributed.weight_transfer.npu_ipc_engine",
-        SimpleNamespace(npu_generate_uuid=lambda: "host-4"),
-    )
-    monkeypatch.setenv("HYPER_RL_ROLLOUT_VISIBLE_DEVICES", "4,5")
-    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 7)
-    model = _Model()
-    worker = _worker(model)
-
-    layout = get_direct_reshard_layout(worker)
-
-    assert layout["dp_rank"] == 0
-    assert layout["tp_rank"] == 0
-    assert layout["tp_size"] == 2
-    assert layout["physical_device_id"] == "host-4"
-    assert [(item["name"], item["placement"], item["shard_dim"]) for item in layout["tensors"]] == [
-        ("model.matrix.weight", "shard", 0),
-        ("model.norm.weight", "replicate", None),
-    ]
-    assert get_policy_version(worker) == {"version": 1}
 
 
 class _ReceiveModel(torch.nn.Module):
@@ -143,7 +106,7 @@ def _receive_worker() -> Any:
     return SimpleNamespace(
         model_runner=SimpleNamespace(get_model=lambda: model),
         model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["HyperQwen3ForCausalLM"])
+            hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"])
         ),
         _weight_update_active=True,
         _check_weight_transfer_engine=lambda: None,
@@ -183,68 +146,6 @@ def _packed_metadata() -> list[dict[str, Any]]:
     }]
 
 
-def test_worker_receives_direct_reshard_and_commits_version(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """HCCL receive writes the TP-local slice before committing the pending version."""
-    source = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
-
-    class Group:
-        device = torch.device("cpu")
-
-        @staticmethod
-        def broadcast(packed: torch.Tensor, src: int) -> None:
-            assert src == 0
-            packed.copy_(source.view(torch.uint8).view(-1))
-
-    synchronizations: list[str] = []
-    monkeypatch.setattr(
-        worker_module,
-        "_rollout_worker_topology",
-        lambda _worker: {
-            "dp_rank": 0,
-            "dp_size": 1,
-            "tp_rank": 0,
-            "tp_size": 1,
-            "physical_device_id": "host-0",
-        },
-    )
-    monkeypatch.setattr(
-        torch,
-        "npu",
-        SimpleNamespace(
-            current_stream=lambda: SimpleNamespace(
-                synchronize=lambda: synchronizations.append("sync")
-            )
-        ),
-    )
-    worker = _receive_worker()
-    worker._rl_direct_reshard_groups = {"route": Group()}
-
-    result = receive_direct_reshard(
-        worker,
-        group_id="route",
-        target_tp_rank=0,
-        buckets=_bucket_metadata(),
-        policy_version=1,
-        expected_data_parallel_size=1,
-        expected_tensor_parallel_size=1,
-    )
-
-    torch.testing.assert_close(worker.model_runner.get_model().weight, source)
-    assert result == {
-        "received": True,
-        "dp_rank": 0,
-        "tp_rank": 0,
-        "bytes": 16,
-        "bucket_count": 1,
-    }
-    assert worker._rl_pending_policy_version == 1
-    assert worker._rl_loaded_policy_version == 0
-    worker_module._finish_custom_weight_update(worker)
-    assert worker._rl_loaded_policy_version == 1
-    assert worker._rl_pending_policy_version is None
-    assert synchronizations == ["sync"]
 
 
 def test_worker_receives_packed_hccl_weights_through_model_loader(
@@ -292,88 +193,11 @@ def test_worker_receives_packed_hccl_weights_through_model_loader(
 
     model = worker.model_runner.get_model()
     torch.testing.assert_close(model.weight, source)
-    assert model.load_modes == [False]
+    assert model.load_modes == [True]
     assert result["bytes"] == 16
     assert worker._rl_pending_policy_version == 1
 
 
-def test_worker_receives_ipc_reshard_and_releases_buffers_after_sync(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """IPC receive imports one buffer, writes its parameter, and synchronizes before release."""
-    source = torch.tensor([[5.0, 6.0], [7.0, 8.0]])
-    synchronizations: list[str] = []
-    monkeypatch.setattr(
-        worker_module,
-        "_rollout_worker_topology",
-        lambda _worker: {
-            "dp_rank": 0,
-            "dp_size": 1,
-            "tp_rank": 0,
-            "tp_size": 1,
-            "physical_device_id": "host-4",
-        },
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm_ascend.distributed.weight_transfer.npu_ipc_engine",
-        SimpleNamespace(npu_generate_uuid=lambda: "host-4"),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "torch_npu.multiprocessing.reductions",
-        SimpleNamespace(
-            rebuild_npu_tensor=lambda *_args: source.view(torch.uint8).view(-1).clone()
-        ),
-    )
-    monkeypatch.setattr(
-        torch,
-        "accelerator",
-        SimpleNamespace(current_device_index=lambda: 0),
-    )
-    monkeypatch.setattr(
-        torch,
-        "npu",
-        SimpleNamespace(
-            current_stream=lambda: SimpleNamespace(
-                synchronize=lambda: synchronizations.append("sync")
-            )
-        ),
-    )
-    payload = {
-        "tensor_parallel_size": 1,
-        "worker_topology": [
-            {"physical_device_id": "host-4", "dp_rank": 0, "tp_rank": 0}
-        ],
-        "buckets_by_target": {
-            0: [
-                {
-                    "ipc_handles": {"host-4": [None] * 7},
-                    "metadata": _bucket_metadata()[0],
-                }
-            ]
-        },
-    }
-    encoded = base64.b64encode(pickle.dumps(payload)).decode("ascii")
-    worker = _receive_worker()
-
-    result = receive_ipc_direct_reshard(
-        worker,
-        payload_pickled=encoded,
-        policy_version=2,
-    )
-
-    torch.testing.assert_close(worker.model_runner.get_model().weight, source)
-    assert result == {
-        "received": True,
-        "dp_rank": 0,
-        "tp_rank": 0,
-        "physical_device_id": "host-4",
-        "bytes": 16,
-        "bucket_count": 1,
-    }
-    assert worker._rl_pending_policy_version == 2
-    assert synchronizations == ["sync"]
 
 
 @pytest.mark.parametrize("load_failure", [False, True])
@@ -456,118 +280,11 @@ def test_worker_receives_ipc_packed_weights_through_model_loader(
 
     model = worker.model_runner.get_model()
     torch.testing.assert_close(model.weight, source)
-    assert model.load_modes == [False]
+    assert model.load_modes == [True]
     assert result["bytes"] == 16
     assert worker._rl_pending_policy_version == 2
 
 
-def test_worker_initializes_direct_group_for_target_rank(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Worker group setup assigns the expected direct receiver rank."""
-    group_calls = []
-
-    class Engine:
-        @staticmethod
-        def _stateless_init_process_group(*args: Any, **kwargs: Any) -> Any:
-            group_calls.append((args, kwargs))
-            return f"group-{args[2]}"
-
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm_ascend.distributed.weight_transfer.hccl_engine",
-        SimpleNamespace(HCCLWeightTransferEngine=Engine),
-    )
-    monkeypatch.setattr(
-        worker_module,
-        "_rollout_worker_topology",
-        lambda _worker: {
-            "dp_rank": 1,
-            "dp_size": 2,
-            "tp_rank": 1,
-            "tp_size": 2,
-            "physical_device_id": "host-3",
-        },
-    )
-    monkeypatch.setattr(
-        worker_module.torch,
-        'get_device_module',
-        lambda _device_type=None: SimpleNamespace(current_device=lambda: 3),
-    )
-    monkeypatch.setattr(worker_module.torch.accelerator, 'current_accelerator', lambda: torch.device("npu"))
-    transfer_engine = SimpleNamespace(
-        model_update_group=None,
-        _stateless_init_process_group=Engine._stateless_init_process_group,
-    )
-    worker = SimpleNamespace(
-        weight_transfer_engine=transfer_engine,
-        _check_weight_transfer_engine=lambda: None,
-    )
-
-    direct = init_direct_reshard_group(
-        worker,
-        group_id="direct-tp1",
-        target_tp_rank=1,
-        master_address="127.0.0.1",
-        master_port=9000,
-        world_size=3,
-        expected_data_parallel_size=2,
-        expected_tensor_parallel_size=2,
-    )
-    assert direct == {
-        "joined": True,
-        "dp_rank": 1,
-        "tp_rank": 1,
-        "group_rank": 2,
-        "group_id": "direct-tp1",
-    }
-    assert worker._rl_direct_reshard_groups == {"direct-tp1": "group-2"}
-    assert [call[0][2] for call in group_calls] == [2]
-
-    monkeypatch.setattr(
-        worker_module,
-        "_rollout_worker_topology",
-        lambda _worker: {
-            "dp_rank": 0,
-            "dp_size": 1,
-            "tp_rank": 1,
-            "tp_size": 2,
-            "physical_device_id": "host-1",
-        },
-    )
-    skip_worker = SimpleNamespace()
-    skipped_group = init_direct_reshard_group(
-        skip_worker,
-        group_id="direct-tp0",
-        target_tp_rank=0,
-        master_address="127.0.0.1",
-        master_port=9000,
-        world_size=2,
-        expected_data_parallel_size=1,
-        expected_tensor_parallel_size=2,
-    )
-    skipped_receive = receive_direct_reshard(
-        skip_worker,
-        group_id="direct-tp0",
-        target_tp_rank=0,
-        buckets=[],
-        policy_version=1,
-        expected_data_parallel_size=1,
-        expected_tensor_parallel_size=2,
-    )
-
-    assert skipped_group == {
-        "joined": False,
-        "dp_rank": 0,
-        "tp_rank": 1,
-        "group_rank": None,
-    }
-    assert skipped_receive == {
-        "received": False,
-        "dp_rank": 0,
-        "tp_rank": 1,
-        "bytes": 0,
-    }
 
 
 def test_worker_initializes_one_packed_group_for_all_rollout_workers(
@@ -687,7 +404,7 @@ def test_worker_hook_installation_runs_custom_update_and_wake_lifecycles(
 
     install_vllm_weight_sync_hooks(private_lifecycle=True)
 
-    assert getattr(WorkerBase, "receive_direct_reshard") is receive_direct_reshard
+    assert not hasattr(WorkerBase, "receive_direct_reshard")
     assert getattr(WorkerBase, "receive_packed_weights") is receive_packed_weights
     assert (
         getattr(WorkerBase, "receive_ipc_packed_weights")
@@ -695,7 +412,7 @@ def test_worker_hook_installation_runs_custom_update_and_wake_lifecycles(
     )
     worker = SimpleNamespace(
         model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["HyperQwen3ForCausalLM"])
+            hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"])
         ),
         _rl_loaded_policy_version=0,
         _rl_pending_policy_version=None,
@@ -825,7 +542,7 @@ def test_worker_reports_native_qwen3_fused_qkv_layout(
         },
     )
 
-    layout = get_direct_reshard_layout(worker)
+    layout = _native_weight_layout(worker)
 
     names = {item["name"] for item in layout["tensors"]}
     assert names == {

@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import unittest
 
 from rl.agentic.core.program_runner import ProgramAgentRunner
-from rl.dataset.contracts import PromptRecord
+from rl.data.contracts import PromptRecord
 
 
 class TestProgramAdmission(unittest.IsolatedAsyncioTestCase):

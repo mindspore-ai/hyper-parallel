@@ -20,7 +20,7 @@ Agentic 决定模型如何与任务环境交互；Hyper-RL 决定这些交互数
 | Rollout | 提供共享 vLLM 推理端点，返回 token ID、raw logprob 和策略身份 | 任务语义和奖励规则 |
 | Hyper-RL Trainer | 构建 prompt、选择 runner、准备训练 batch、更新 Actor、发布策略并记录指标 | 具体工具如何实现 |
 
-同步模式由 `SyncTrainer` 编排。它在 `rl/trainer.py` 中创建 rollout engine，再根据 `agentic.runner` 选择对应的
+同步模式由 `SyncTrainer` 编排。它在 `rl/trainer/sync.py` 中创建 rollout engine，再根据 `agentic.runner` 选择对应的
 rollout manager。Agentic 不绕过 Trainer，也不直接更新模型参数。
 
 ## 三种执行路径
@@ -315,18 +315,18 @@ Codex 和 DeepSeek 除各自子配置外，还必须满足以下共享约束：
 
 | 关注点 | 文件 |
 | --- | --- |
-| 配置与 runner 约束 | `rl/config.py` |
-| 同步训练编排入口 | `rl/trainer.py` |
-| 三种 rollout manager | `rl/roles/rollout/worker.py` |
+| 配置与 runner 约束 | `rl/config/validate.py` |
+| 同步训练编排入口 | `rl/trainer/sync.py` |
+| 三种 rollout manager | `rl/rollout/manager.py` |
 | Internal episode 循环 | `rl/agentic/core/trajectory_runner.py`、`session.py` |
 | 外部 program 数据面 | `rl/agentic/core/program_runner.py` |
 | 环境与工具组合 | `rl/agentic/envs/environment.py`、`rl/agentic/tools/` |
 | Codex 适配 | `rl/agentic/codex/` |
 | DeepSeek 适配 | `rl/agentic/ds_harness/` |
 | MCP 工具桥接 | `rl/agentic/mcp_server.py` |
-| 标准训练数据契约与 episode 分组 | `rl/dataset/contracts.py`、`batch_builder.py`、`episodes.py` |
-| 原始工具证据与可训练性 | `rl/tool_protocol.py`、`rl/roles/rollout/vllm_plugin.py` |
-| 共享 vLLM 与策略身份 | `rl/roles/rollout/vllm.py` |
+| 标准训练数据契约与 episode 分组 | `rl/data/contracts.py`、`batch_builder.py`、`episodes.py` |
+| 原始工具证据与可训练性 | `rl/tool_protocol/protocol.py`、`rl/rollout/vllm_plugin.py` |
+| 共享 vLLM 与策略身份 | `rl/rollout/vllm.py` |
 
 ## 当前实现边界
 
