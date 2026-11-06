@@ -40,7 +40,7 @@ pass_config = PassConfig(enable_overlap=True)
 ### Layer 3: Pass Pipeline
 
 ```text
-DeadCodeElimination → CanonicalizeGraph → FSDPPass
+DeadCodeElimination → CanonicalizeGraph → [AC: ActivationCheckpointPass] → FSDPPass
     → AutoOverlapPass → FsdpOverlapPass → [PP: PpPass] → [Inductor: InductorPass]
 ```
 
@@ -51,6 +51,65 @@ TorchInductor kernels, after which the FX graph wraps the compiled callable
 and no further graph-level pass may run. With PP enabled it compiles the
 schedule's per-stage forward/backward subgraphs instead of the stub (see
 below).
+
+**ActivationCheckpointPass** (static-graph activation checkpointing,
+`PassConfig.ac_mode`):
+
+- Runs on the plain joint graph BEFORE `FSDPPass`, following torchtitan
+  graph_trainer's tag + rematerialize design: forward nodes are tagged with
+  a `CheckpointPolicy`, then every tagged node the backward consumes is
+  duplicated in front of its earliest backward consumer and the backward
+  consumers are redirected to the duplicate. The forward original is freed
+  at its last forward use (FX codegen drops dead locals), and the value is
+  rebuilt during backward instead of being held across the whole step
+- Reuses the dynamic-graph configuration vocabulary
+  (`hyper_parallel/trainer/config` `activation_checkpoint:` section):
+  `mode: off / full / selective` maps to `ac_mode`, a
+  `selection.source=model_adapter_safe_regions` block contributes its
+  `layer_count` / `layer_indices` selectors, and `swap_inputs` /
+  `allow_cache_entry_mutation` are ignored with a warning (no eager
+  checkpoint cache exists in graph mode)
+- The recompute scope and the per-layer boundary units are the discovered
+  transformer blocks — the same HuggingFace-marker discovery the eager path
+  requires — so a model is AC-eligible in both modes under the same
+  contract. Nodes outside the blocks (embedding, head, the `train_fn` loss
+  chain) always stay saved, and the adapter's `RecomputePolicy`
+  (`model_adapter_safe_regions`) narrows the selected blocks to its region
+  patterns with `exclude_patterns` pulled back out of the recompute. `full`
+  with the default selection upgrades to that policy automatically,
+  matching the eager path, and its `on_applied` runtime hook runs before
+  tracing
+- `"full"` recomputes every scoped node; `"selective"` saves the shared
+  compute/communication operator set from
+  `hyper_parallel/distributed/activation_checkpoint.py` (matmuls, attention,
+  collectives) and recomputes the rest
+- Always saved regardless of mode: RNG ops (the graph cannot replay random
+  state), in-place mutations, their forward consumers, and the mutated
+  tensor's forward readers, SymInt scalars, and nodes read forward across a
+  block boundary (their original stays alive anyway, so recomputing them
+  would be pure waste)
+- Recompute duplicates carry `autograd_backward`, so `FSDPPass` counts them
+  as backward consumers and inserts the backward re-gather for them;
+  `PpPass` phase classification and the overlap passes inherit the rewrite
+  value-level
+- Graph mode skips the eager model-build checkpoint wrapper for the same
+  `activation_checkpoint` section: `ActivationCheckpointPass` owns recompute,
+  so a custom factory must not also wrap its blocks eagerly
+
+Trainer configuration (graph mode reuses the eager section):
+
+```yaml
+activation_checkpoint:
+  mode: full            # off (default) / full / selective
+  selection:
+    source: model_adapter_safe_regions
+    layer_count: 8      # or layer_indices: [0, 2, 4]
+```
+
+Or drive it directly: `PassConfig(ac_mode="selective", ac_layer_count=8)`.
+Layer selectors require the model to advertise the HuggingFace
+`gradient_checkpointing` marker on a repeated block container (the same
+contract as the eager path).
 
 **FSDPPass** (data-parallel, `PassConfig.dp_mode`):
 
@@ -322,6 +381,7 @@ tracer. It adds no runtime dependency on the separate MagiCompiler checkout.
 | FSDP / DDP / HSDP | Implemented | `FSDPPass`; `PassConfig.dp_mode` selects the mode |
 | PP | Implemented | `PpPass` + `pp_schedule` (`gpipe` / `1f1b` / `interleaved_1f1b` / `vpp`), including VPP via `pp_chunks > 1`; pure PP and the PP+FSDP / PP+DDP hybrid (2-D `(pp, DP)` mesh) |
 | TP (+ SP / LP) | Via `mesh_context` | TP collectives are baked into automodel boundary forwards; graph mode reuses the mesh |
+| Activation checkpoint | Implemented | `ActivationCheckpointPass` (`ac_mode: full` / `selective`); reuses the eager `activation_checkpoint` config (mode, safe-region selection) |
 | PP + HSDP / PP + TP | Planned | HSDP needs a 3-D mesh; TP-in-stage needs per-stage TP collectives in the graph |
 | EP | Planned | — |
 
@@ -354,6 +414,15 @@ tracer. It adds no runtime dependency on the separate MagiCompiler checkout.
   stages. The interleaved schedule ships boundary values between adjacent
   virtual stages, including the last-stage -> rank-0 wrap edge.
 - **`AutoOverlapPass` is a placeholder no-op** — see the pass note above.
+- **Activation checkpointing shares the eager contract**: the recompute scope
+  is the discovered HuggingFace-marker transformer blocks, so a model without
+  the `gradient_checkpointing` marker + repeated block container is rejected
+  (the eager path raises the same way). `swap_inputs` and
+  `allow_cache_entry_mutation` from the eager `activation_checkpoint` section
+  are ignored in graph mode (with a warning / info log). RNG ops inside the
+  recompute scope are always saved (the graph cannot replay random state),
+  so a block whose dropout must be recomputed is out of scope for the static
+  path — eager full AC replays them by forking the RNG state instead.
 - **`InductorPass` composes with PP (and everything else)**: `regional` /
   `full` backend compilation runs after `PpPass` and compiles each virtual
   stage's forward/backward subgraph through the schedule's

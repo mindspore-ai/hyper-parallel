@@ -36,13 +36,18 @@ __all__ = [
     "PP_SCHEDULES",
     "INDUCTOR_MODES",
     "DP_MODES",
+    "AC_MODES",
+    "AC_REGION_SOURCES",
     "normalize_dp_mode",
     "build_pass_config_from_trainer_config",
 ]
 
+import logging
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+
+_LOG = logging.getLogger(__name__)
 
 
 # Pipeline schedule names accepted by ``pp_schedule``. Kept torch-free here so
@@ -73,9 +78,28 @@ _DP_MODE_ALIASES = {
     "hybrid_shard": "hsdp",
 }
 
+# Static-graph activation checkpointing modes for ``ActivationCheckpointPass``,
+# mirroring the dynamic ``ActivationCheckpointConfig.mode`` vocabulary:
+#   "off"       - save every forward activation (no recompute pass)
+#   "full"      - recompute every checkpoint-scoped module op in backward
+#   "selective" - save compute/communication intensive ops, recompute the rest
+AC_MODES = ("off", "full", "selective")
+
+# Where the recompute-region shape comes from, mirroring
+# ``ActivationCheckpointSelection.source``. ``default`` selects whole blocks
+# (and lets ``full`` auto-upgrade to a model-owned RecomputePolicy);
+# ``model_adapter_safe_regions`` requires an adapter-declared region.
+AC_REGION_SOURCES = ("default", "model_adapter_safe_regions")
+
 
 def normalize_dp_mode(mode: str) -> str:
     """Return the canonical DP mode for ``mode`` (accepts simplefsdp aliases).
+
+    Args:
+        mode: Requested DP mode spelling.
+
+    Returns:
+        The canonical ``DP_MODES`` entry.
 
     Raises:
         ValueError: When ``mode`` is not a string or is unknown.
@@ -201,6 +225,34 @@ class PassConfig:
             compiled regions (keys validated by ``torch._inductor.config``),
             e.g. ``{"reorder_for_peak_memory": True}``. ``"full"`` mode
             always sets ``reorder_for_peak_memory=True`` unless overridden.
+        ac_mode: Static-graph activation checkpointing mode for
+            ``ActivationCheckpointPass``, one of ``AC_MODES``. Mirrors the
+            dynamic ``ActivationCheckpointConfig.mode`` vocabulary and is
+            projected from a trainer config's ``activation_checkpoint``
+            section by ``build_pass_config_from_trainer_config``. ``"off"``
+            (default) saves every forward activation; ``"full"`` recomputes
+            every checkpoint-scoped module op in backward; ``"selective"``
+            saves the shared compute/communication operator set and
+            recomputes the rest.
+        ac_layer_count: Optional layer selector: checkpoint only the first
+            ``ac_layer_count`` discovered transformer blocks (the same
+            HuggingFace-marker discovery the eager path uses). Mutually
+            exclusive with ``ac_layer_indices``.
+        ac_layer_indices: Optional explicit zero-based indices into the
+            discovered transformer blocks; only nodes inside the selected
+            blocks recompute. Mutually exclusive with ``ac_layer_count``.
+        ac_region_source: Where the recompute-region shape comes from, one of
+            ``AC_REGION_SOURCES``. ``"default"`` selects whole blocks (and
+            lets ``full`` auto-upgrade to a model-owned ``RecomputePolicy``);
+            ``"model_adapter_safe_regions"`` requires an adapter-declared
+            region and its ``exclude_patterns``. Projected from the trainer
+            selection's ``source``.
+        ac_save_forward_all_gather: Save forward (TP/SP/CP) all-gathers instead
+            of replaying them during backward recompute. Graph-mode only;
+            defaults to ``True``, so static-graph recompute does not duplicate
+            a forward collective. FSDP parameter all-gathers are inserted after
+            this pass and are unaffected. Set ``False`` to replay the
+            all-gather, trading communication for less retained memory.
 
     Note:
         ``fsdp_enabled`` / ``pp_enabled`` no longer probe
@@ -221,12 +273,19 @@ class PassConfig:
     pp_microbatch_size: int = 1
     pp_schedule: str = "gpipe"
     fsdp_bucketing: bool = False
-    fsdp_bucket_modules: Optional[list[str | list[str]] | tuple[tuple[str, ...], ...]] = None
+    fsdp_bucket_modules: Optional[
+        list[str | list[str]] | tuple[tuple[str, ...], ...]
+    ] = None
     fsdp_allgather_prefetch: bool = True
     fsdp_overlap_grad_reduce: bool = True
     max_in_flight_gb: float = 0.25
     inductor_mode: str = "off"
     inductor_configs: Optional[Dict[str, Any]] = None
+    ac_mode: str = "off"
+    ac_layer_count: Optional[int] = None
+    ac_layer_indices: Optional[List[int]] = None
+    ac_region_source: str = "default"
+    ac_save_forward_all_gather: bool = True
 
     def __post_init__(self) -> None:
         self.dp_mode = normalize_dp_mode(self.dp_mode)
@@ -240,20 +299,96 @@ class PassConfig:
                 ``pp_degree``, a non-positive ``pp_microbatch_size``, an
                 unknown ``pp_schedule`` / ``dp_mode``, or a non-positive
                 ``dp_replicate_degree``, or ``pp_chunks > 1`` with a
-                non-interleaved schedule.
+                non-interleaved schedule, or an invalid activation
+                checkpointing mode / layer selector.
         """
         self._validate_flags()
         self._validate_dp()
         self._validate_pp()
+        self._validate_ac()
+
+    def _validate_ac(self) -> None:
+        """Validate the activation checkpointing mode and layer selectors."""
+        if not isinstance(self.ac_mode, str) or self.ac_mode not in AC_MODES:
+            raise ValueError(f"ac_mode must be one of {AC_MODES}, got {self.ac_mode!r}")
+        if (
+            not isinstance(self.ac_region_source, str)
+            or self.ac_region_source not in AC_REGION_SOURCES
+        ):
+            raise ValueError(
+                f"ac_region_source must be one of {AC_REGION_SOURCES}, "
+                f"got {self.ac_region_source!r}"
+            )
+        if not isinstance(self.ac_save_forward_all_gather, bool):
+            raise ValueError("ac_save_forward_all_gather must be a bool")
+        self._validate_ac_layer_count()
+        self._validate_ac_layer_indices()
+        if self.ac_layer_count is not None and self.ac_layer_indices is not None:
+            raise ValueError(
+                "ac_layer_count and ac_layer_indices are mutually exclusive; "
+                "set exactly one"
+            )
+        if (
+            self.ac_mode != "off"
+            and self.ac_region_source == "model_adapter_safe_regions"
+            and (self.ac_layer_count is None and self.ac_layer_indices is None)
+        ):
+            raise ValueError(
+                "ac_region_source=model_adapter_safe_regions requires exactly "
+                "one of ac_layer_count or ac_layer_indices"
+            )
+
+    def _validate_ac_layer_count(self) -> None:
+        """Validate the optional prefix layer selector."""
+        if self.ac_layer_count is not None and (
+            isinstance(self.ac_layer_count, bool)
+            or not isinstance(self.ac_layer_count, int)
+            or self.ac_layer_count < 0
+        ):
+            raise ValueError(
+                "ac_layer_count must be None or a non-negative integer, "
+                f"got {self.ac_layer_count!r}"
+            )
+
+    def _validate_ac_layer_indices(self) -> None:
+        """Validate the optional explicit layer index selector."""
+        indices = self.ac_layer_indices
+        if indices is None:
+            return
+        invalid = (
+            not isinstance(indices, list)
+            or not indices
+            or any(
+                isinstance(index, bool) or not isinstance(index, int) or index < 0
+                for index in indices
+            )
+        )
+        if invalid:
+            raise ValueError(
+                "ac_layer_indices must be None or a non-empty list of "
+                f"non-negative integers, got {indices!r}"
+            )
+        if len(set(indices)) != len(indices):
+            raise ValueError(
+                f"ac_layer_indices must not contain duplicates, got {indices!r}"
+            )
 
     def _validate_flags(self) -> None:
         """Validate boolean flags and the overlap memory budget."""
-        for name in ("fsdp_bucketing", "fsdp_allgather_prefetch", "fsdp_overlap_grad_reduce"):
+        for name in (
+            "fsdp_bucketing",
+            "fsdp_allgather_prefetch",
+            "fsdp_overlap_grad_reduce",
+        ):
             value = getattr(self, name)
             if not isinstance(value, bool):
                 raise ValueError(f"{name} must be a bool")
-        if self.fsdp_bucket_modules is not None and not isinstance(self.fsdp_bucket_modules, (list, tuple)):
-            raise ValueError("fsdp_bucket_modules must be None or a list/tuple of module groups")
+        if self.fsdp_bucket_modules is not None and not isinstance(
+            self.fsdp_bucket_modules, (list, tuple)
+        ):
+            raise ValueError(
+                "fsdp_bucket_modules must be None or a list/tuple of module groups"
+            )
         value = self.max_in_flight_gb
         if (
             isinstance(value, bool)
@@ -345,6 +480,24 @@ def build_pass_config_from_trainer_config(
     projected: TP / SP / LP topology (``accelerator.tp_size`` /
     ``sequence_parallel`` / ``loss_parallel``) is owned by the automodel
     flow and deliberately not copied.
+
+    The dynamic ``activation_checkpoint`` section is projected onto the
+    static-graph AC fields: ``mode`` becomes ``ac_mode`` and a
+    ``model_adapter_safe_regions`` selection contributes its layer
+    selectors. ``swap_inputs`` and ``allow_cache_entry_mutation`` have no
+    static-graph counterpart (no eager checkpoint cache) and are ignored
+    with a warning when set, mirroring the dynamic compile path.
+
+    Args:
+        config: Trainer topology (e.g. a ``TrainerConfig``); only the
+            ``fsdp_config``, ``compile`` and ``activation_checkpoint``
+            surfaces are read.
+        fsdp_enabled: Overrides the sharded-DP intent derived from
+            ``config.fsdp_config`` when provided.
+        enable_overlap: Value for the legacy ``AutoOverlapPass`` switch.
+
+    Returns:
+        The graph-mode ``PassConfig`` for this trainer topology.
     """
     compile_config = getattr(config, "compile", None)
     if fsdp_enabled is None:
@@ -353,6 +506,30 @@ def build_pass_config_from_trainer_config(
             or config.fsdp_config.edp_shard_size > 1
         )
     fsdp_degree = config.fsdp_config.dp_shard_size if fsdp_enabled else None
+
+    ac_mode = "off"
+    ac_layer_count = None
+    ac_layer_indices = None
+    ac_region_source = "default"
+    ac_config = getattr(config, "activation_checkpoint", None)
+    if ac_config is not None and getattr(ac_config, "mode", None) not in (None, "off"):
+        ac_mode = ac_config.mode
+        selection = getattr(ac_config, "selection", None)
+        ac_region_source = getattr(selection, "source", "default")
+        if ac_region_source == "model_adapter_safe_regions":
+            ac_layer_count = getattr(selection, "layer_count", None)
+            ac_layer_indices = getattr(selection, "layer_indices", None)
+        if getattr(ac_config, "swap_inputs", False):
+            _LOG.warning(
+                "activation_checkpoint.swap_inputs is not supported in graph "
+                "mode; input swapping will be disabled."
+            )
+        if getattr(ac_config, "allow_cache_entry_mutation", False):
+            _LOG.info(
+                "activation_checkpoint.allow_cache_entry_mutation has no "
+                "effect in graph mode; ignoring it."
+            )
+
     return PassConfig(
         enable_overlap=enable_overlap,
         fsdp_enabled=fsdp_enabled,
@@ -367,4 +544,8 @@ def build_pass_config_from_trainer_config(
             compile_config, "fsdp_overlap_grad_reduce", True
         ),
         max_in_flight_gb=getattr(compile_config, "max_in_flight_gb", 0.25),
+        ac_mode=ac_mode,
+        ac_layer_count=ac_layer_count,
+        ac_layer_indices=ac_layer_indices,
+        ac_region_source=ac_region_source,
     )

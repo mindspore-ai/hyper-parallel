@@ -19,7 +19,13 @@ Automatically builds Pass execution order based on parallel configuration.
 
 Execution Order:
 1. Basic optimization: DeadCodeElimination, CanonicalizeGraph
-2. Execution layer:
+2. Activation checkpointing: ActivationCheckpointPass (``ac_mode`` != off)
+   runs on the plain joint graph BEFORE FSDPPass, so recomputed duplicates
+   are ordinary forward ops when the FSDP collectives are inserted (their
+   ``autograd_backward`` tag makes FSDPPass count them as backward
+   consumers and re-gather parameters for them). Running AC after FSDP
+   would make recompute read sharded placeholders.
+3. Execution layer:
    - FSDPPass (FSDP)
    - FsdpBucketingPass (opt-in AG/RS fusion; supports FSDP with PP disabled).
    - PpPass (pipeline-parallel stage split) — runs AFTER FSDPPass: the FSDP
@@ -28,15 +34,15 @@ Execution Order:
      while foreign stages' collectives are simply never copied. Splitting
      first would hand FSDPPass two subgraphs and a loss-less output list,
      breaking its grad-index contract.
-3. Communication-compute overlap: AutoOverlapPass, then FsdpOverlapPass
+4. Communication-compute overlap: AutoOverlapPass, then FsdpOverlapPass
    (independent FSDP all-gather prefetch and gradient overlap).
-4. Pipeline split: PpPass runs last among the graph-level passes, after
+5. Pipeline split: PpPass runs last among the graph-level passes, after
    every graph-level pass. It replaces the joint graph with a schedule stub,
    moving the collectives into the schedule's per-stage submodules where a
    graph-level pass can no longer reach them. Running it last keeps the
    non-PP pass order untouched and still lets FsdpOverlapPass reorder the
    FSDP collectives before the split.
-5. Backend compilation: InductorPass is TERMINAL (``inductor_mode`` != off).
+6. Backend compilation: InductorPass is TERMINAL (``inductor_mode`` != off).
    It lowers the graph — or its tagged compute regions — to TorchInductor
    kernels; afterwards the FX graph is a wrapper around the compiled callable
    and no further FX-graph-level pass may run. When PpPass already split the
@@ -49,6 +55,7 @@ __all__ = ["PassPipeline"]
 from typing import TYPE_CHECKING, Any, List, Optional
 
 from ..pass_config import PassConfig
+from .activation_checkpoint import ActivationCheckpointPass
 from .base import GraphPass
 from .bucketing.bucketing_pass import FsdpBucketingPass
 from .inductor_pass import InductorPass
@@ -89,26 +96,32 @@ class PassPipeline:
         self.passes.append(DeadCodeEliminationPass())
         self.passes.append(CanonicalizeGraphPass())
 
-        # 2. Execution layer: Parallel dimension partitioning
+        # 2. Activation checkpointing: recompute duplicates must exist while
+        # the graph is still plain (no collectives yet), so FSDPPass inserts
+        # parameter all-gathers / backward re-gathers around them.
+        if self.config.ac_mode != "off":
+            self.passes.append(ActivationCheckpointPass())
+
+        # 3. Execution layer: Parallel dimension partitioning
         if getattr(self.config, "fsdp_enabled", False):
             self.passes.append(FSDPPass(parallel_plan=self.parallel_plan))
         if self.config.fsdp_bucketing:
             self.passes.append(FsdpBucketingPass())
 
-        # 3. Communication-compute overlap optimization
+        # 4. Communication-compute overlap optimization
         if getattr(self.config, "enable_overlap", False):
             self.passes.append(AutoOverlapPass())
         if self.config.fsdp_allgather_prefetch or self.config.fsdp_overlap_grad_reduce:
             self.passes.append(FsdpOverlapPass())
 
-        # 4. Pipeline split must run last: it replaces the joint graph with a
+        # 5. Pipeline split must run last: it replaces the joint graph with a
         # schedule stub, moving the collectives into the schedule's per-stage
         # submodules. Every graph-level pass (notably FsdpOverlapPass) must
         # therefore see the collectives before the split.
         if getattr(self.config, "pp_enabled", False):
             self.passes.append(PpPass(parallel_plan=self.parallel_plan))
 
-        # 5. Terminal backend compilation: after this the FX graph wraps the
+        # 6. Terminal backend compilation: after this the FX graph wraps the
         # compiled callable and no further FX-graph-level pass may run.
         if self.config.inductor_mode != "off":
             self.passes.append(InductorPass())
@@ -153,7 +166,16 @@ class PassPipeline:
         config: PassConfig,
         parallel_plan: Optional["GraphParallelPlan"] = None,
     ) -> "PassPipeline":
-        """Create Pipeline from configuration."""
+        """Create Pipeline from configuration.
+
+        Args:
+            config: Parallel configuration driving pass selection.
+            parallel_plan: Optional sharding plan forwarded to partitioning
+                passes.
+
+        Returns:
+            The built pipeline, ready to ``run``.
+        """
         return cls(config, parallel_plan).build()
 
 
@@ -168,7 +190,16 @@ class DeadCodeEliminationPass(GraphPass):
         pass_config: PassConfig,
         **kwargs: Any,
     ) -> "fx.GraphModule":
-        """Eliminate dead nodes and recompile the graph."""
+        """Eliminate dead nodes and recompile the graph.
+
+        Args:
+            graph_module: The FX GraphModule to transform.
+            pass_config: Parallel configuration (unused by this pass).
+            **kwargs: Extra pass kwargs (unused).
+
+        Returns:
+            The transformed graph module.
+        """
         graph_module.graph.eliminate_dead_code()
         graph_module.recompile()
         return graph_module
@@ -185,7 +216,16 @@ class CanonicalizeGraphPass(GraphPass):
         pass_config: PassConfig,
         **kwargs: Any,
     ) -> "fx.GraphModule":
-        """Lint and recompile the graph to a canonical form."""
+        """Lint and recompile the graph to a canonical form.
+
+        Args:
+            graph_module: The FX GraphModule to transform.
+            pass_config: Parallel configuration (unused by this pass).
+            **kwargs: Extra pass kwargs (unused).
+
+        Returns:
+            The transformed graph module.
+        """
         graph_module.graph.lint()
         graph_module.recompile()
         return graph_module

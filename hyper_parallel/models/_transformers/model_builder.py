@@ -532,9 +532,16 @@ def _apply_activation_features(
     swap_inputs: bool = False,
     selection: Optional[Any] = None,
     allow_cache_entry_mutation: bool = False,
+    apply_checkpoint: bool = True,
 ) -> nn.Module:
-    """Apply activation checkpointing and attention swap in execution order."""
-    if activation_checkpoint not in (None, "off"):
+    """Apply activation checkpointing and attention swap in execution order.
+
+    ``apply_checkpoint`` is False in graph mode: the joint-graph
+    ``ActivationCheckpointPass`` owns recompute, so the live model must stay
+    unwrapped. The requested mode is still passed to the attention-swap
+    validation so incompatible combinations keep failing.
+    """
+    if apply_checkpoint and activation_checkpoint not in (None, "off"):
         model = _apply_activation_checkpointing(
             model,
             activation_checkpoint,
@@ -772,13 +779,14 @@ def apply_model_infrastructure(
     """
 
     distributed_setup = kwargs.get("distributed_setup")
-
     compile_config, compile_for_execution = _resolve_compile_config(
         compile_config, validate_placement, fsdp2_manager
     )
+    graph_mode_requested = bool(
+        compile_config is not None and compile_config.selects_graph_compiler()
+    )
     _apply_pre_sharding_features(peft_config, qat_config, fp8_config)
 
-    # Step 5.5: structure-preserving replacement before plan derivation.
     weights_mapping = get_model_conversion_mapping(model)
     model, weights_mapping = _maybe_apply_module_replacements(
         model, codegen_artifact_dir, distributed_setup, low_precision_config,
@@ -800,7 +808,6 @@ def apply_model_infrastructure(
         context=method_context,
     )
 
-    # Steps 7-8: plan and apply parameter/activation layouts.
     handled, source_shard_info = _parallelize_from_generated(
         model,
         mesh,
@@ -817,14 +824,9 @@ def apply_model_infrastructure(
         )
 
     model = _apply_activation_features(
-        model,
-        activation_checkpoint,
-        activation_swap,
-        compile_for_execution,
-        mesh,
-        swap_inputs=swap_inputs,
-        selection=activation_checkpoint_selection,
-        allow_cache_entry_mutation=allow_cache_entry_mutation,
+        model, activation_checkpoint, activation_swap, compile_for_execution, mesh,
+        swap_inputs=swap_inputs, selection=activation_checkpoint_selection,
+        allow_cache_entry_mutation=allow_cache_entry_mutation, apply_checkpoint=not graph_mode_requested,
     )
     external = _create_external_state(
         model, mesh, source_shard_info, device, is_meta_device, model_init_dtype,
@@ -832,7 +834,6 @@ def apply_model_infrastructure(
     )
     model = _apply_fsdp2_with_external(model, fsdp2_manager, source_shard_info, external)
 
-    # Steps 11-12: materialize model storage, then load or initialize weights.
     model = _materialize_and_load_model(
         model,
         is_meta_device=is_meta_device,
@@ -848,7 +849,6 @@ def apply_model_infrastructure(
     if external is not None:
         external.check_identities()
 
-    # Step 13: compile only the execution model, after FSDP and loading.
     if compile_for_execution:
         model = apply_compile(model, compile_config)
 
