@@ -1,0 +1,14 @@
+--- a/configuration_kimi.py
++++ b/configuration_kimi.py
+@@ -1,3 +1,6 @@
++# GENERATED CODE. DO NOT EDIT MANUALLY.
++# pylint: skip-file
++# codespell:ignore-begin
+ # coding=utf-8
+ from typing import Optional
+
+@@ -138,3 +141,4 @@
+             self.linear_attn_config is not None
+             and (layer_idx + 1) in self.linear_attn_config["kda_layers"]
+         )
++# codespell:ignore-end
