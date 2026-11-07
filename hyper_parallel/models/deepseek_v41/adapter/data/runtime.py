@@ -50,20 +50,30 @@ class DeepseekV41Runtime(RuntimeInputAdapter):
         self.include_position_ids = include_position_ids
         self.include_image_sequence_start = include_image_sequence_start
 
-    def prepare_graph_inputs(self, model_inputs: Mapping[str, Any]) -> dict[str, Any]:
-        """Build an isolated packing-only representation at the graph boundary.
+    def prepare_graph_inputs(
+            self, model_inputs: Mapping[str, Any], *, model_config: Any = None,
+    ) -> dict[str, Any]:
+        """Build an isolated packing/compression representation at the graph boundary.
 
-        Eager FSDP also rebuilds pytrees, so its inputs must retain real document
-        boundaries. Only the compiler receives this prepared metadata copy.
+        Ordinary packing objects remain opaque pytree leaves. Only this isolated
+        subclass instance exposes prepared tensors for capture and replay.
+
+        Args:
+            model_inputs: Runtime inputs containing raw packed sequence boundaries.
+            model_config: Final model configuration defining compression ratios.
+
+        Returns:
+            Input copy whose packing metadata carries prepared tensor geometry.
         """
+        ratios = tuple(getattr(model_config, "v41_compress_ratios", ()))
         inputs = dict(model_inputs)
         source = inputs["packed_seq_params"]
         device = inputs["input_ids"].device
         packed = GraphPackedSequence(
             source.cu_seq_lens, source.local_query_start,
             source.local_query_length, source.global_sequence_length,
-        ).prepare(device, ())
-        packed.prepare_packing_geometry(device)
+        ).prepare(device, ratios)
+        packed.prepare_graph_geometry(device, ratios)
         inputs["packed_seq_params"] = packed
         return inputs
 
