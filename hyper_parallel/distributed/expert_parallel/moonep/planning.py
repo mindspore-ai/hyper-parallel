@@ -117,48 +117,49 @@ def _entry_order(counts: torch.Tensor, allocation: torch.Tensor,
     return expert_order[target_order]
 
 
-def _cpu_candidates(totals: np.ndarray, ranks: int, rules: tuple[bool, ...]) -> np.ndarray:
-    """在已回传的专家小表上生成快速候选；例如 R8/E128 输出两张 [128,8] 表。
+def _cpu_transfer_quotas(home_totals: np.ndarray, targets: np.ndarray, fill: bool) -> np.ndarray:
+    """Preserve first-rank tie breaking without batch-index arrays inside the small greedy loop."""
+    ranks = home_totals.shape[0]
+    balance = (home_totals.sum(axis=1) - targets).tolist()
+    quotas = np.zeros((ranks, ranks), dtype=np.int64)
+    rank_ids = range(ranks)
+    for _ in range(ranks - 1):
+        source = max(rank_ids, key=balance.__getitem__)
+        target = min(rank_ids, key=balance.__getitem__)
+        amount = -balance[target] if fill else min(balance[source], -balance[target])
+        quotas[source, target] += amount
+        balance[source] -= amount
+        balance[target] += amount
+    return quotas
 
-    稳定 FP32 排序和并列 rank 的选择保持确定性；大 token 索引仍在 NPU。
-    """
-    experts = totals.size
-    home_count, batches = experts // ranks, len(rules)
+
+def _cpu_candidates(totals: np.ndarray, ranks: int, rules: tuple[bool, ...]) -> np.ndarray:
+    """Generate deterministic candidates using bounded scalar rounds on the CPU small table."""
+    home_count = totals.size // ranks
     rank_ids = np.arange(ranks, dtype=np.int64)
     total = int(totals.sum())
     targets = total // ranks + (rank_ids < total % ranks).astype(np.int64)
     home_totals = totals.reshape(ranks, home_count)
-    balance = np.broadcast_to(home_totals.sum(axis=1) - targets, (batches, ranks)).copy()
-    quotas = np.zeros((batches, ranks, ranks), dtype=np.int64)
-    batch_ids = np.arange(batches)
-    for _ in range(ranks - 1):
-        source = balance.argmax(axis=1)
-        target = balance.argmin(axis=1)
-        surplus = balance[batch_ids, source]
-        deficit = -balance[batch_ids, target]
-        amount = np.where(rules, deficit, np.minimum(surplus, deficit))
-        np.add.at(quotas, (batch_ids, source, target), amount)
-        np.add.at(balance, (batch_ids, source), -amount)
-        np.add.at(balance, (batch_ids, target), amount)
-
     expert_order = np.argsort(-home_totals.astype(np.float32), axis=1, kind='stable')
-    target_order = np.argsort(-quotas.astype(np.float32), axis=2, kind='stable')
     ordered_experts = np.take_along_axis(home_totals, expert_order, axis=1)
-    ordered_quotas = np.take_along_axis(quotas, target_order, axis=2)
-    expert_ends = ordered_experts.cumsum(axis=1)[None, :, :, None]
-    target_ends = ordered_quotas.cumsum(axis=2)[:, :, None, :]
-    moved_ordered = np.maximum(
-        np.minimum(expert_ends, target_ends)
-        - np.maximum(expert_ends - ordered_experts[None, :, :, None],
-                     target_ends - ordered_quotas[:, :, None, :]), 0)
-    by_expert = np.empty_like(moved_ordered)
-    np.put_along_axis(by_expert, target_order[:, :, None, :], moved_ordered, axis=3)
-    moved = np.empty_like(by_expert)
-    np.put_along_axis(moved, expert_order[None, :, :, None], by_expert, axis=2)
-    remaining = home_totals[None] - moved.sum(axis=3)
-    for home in range(ranks):
-        moved[:, home, :, home] += remaining[:, home, :]
-    return moved.reshape(batches, experts, ranks)
+    expert_ends = ordered_experts.cumsum(axis=1)[:, :, None]
+    candidates = []
+    for fill in rules:
+        quotas = _cpu_transfer_quotas(home_totals, targets, fill)
+        target_order = np.argsort(-quotas.astype(np.float32), axis=1, kind='stable')
+        ordered_quotas = np.take_along_axis(quotas, target_order, axis=1)
+        target_ends = ordered_quotas.cumsum(axis=1)[:, None, :]
+        moved_ordered = np.maximum(np.minimum(expert_ends, target_ends)
+                                  - np.maximum(expert_ends - ordered_experts[:, :, None],
+                                               target_ends - ordered_quotas[:, None, :]), 0)
+        by_expert = np.empty_like(moved_ordered)
+        np.put_along_axis(by_expert, target_order[:, None, :], moved_ordered, axis=2)
+        moved = np.empty_like(by_expert)
+        np.put_along_axis(moved, expert_order[:, :, None], by_expert, axis=1)
+        remaining = home_totals - moved.sum(axis=2)
+        moved[rank_ids, :, rank_ids] += remaining
+        candidates.append(moved.reshape(totals.size, ranks))
+    return np.stack(candidates)
 
 
 def _cpu_candidate_metrics(allocation: np.ndarray, totals: np.ndarray, capacity: int) -> np.ndarray:

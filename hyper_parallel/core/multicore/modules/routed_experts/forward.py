@@ -25,10 +25,13 @@ import numpy as np
 import torch
 
 from hyper_parallel.core.multicore.modules.routed_experts.frame import ExpertState
+from hyper_parallel.core.multicore.modules.routed_experts.descriptor import RouteDescriptor
+from hyper_parallel.core.multicore.modules.routed_experts.metadata import compile_forward_metadata
 from hyper_parallel.core.multicore.modules.routed_experts.readiness import (
     ExpertReadiness, producer_progress, upload_metadata, upload_metadata_batch,
 )
 from hyper_parallel.core.multicore.modules.routed_experts.transport import _load_native, vector_core_count
+from hyper_parallel.core.multicore.modules.routed_experts.workspace import RingWorkspace
 
 
 _TILE_ROWS = 128
@@ -194,6 +197,24 @@ class ForwardPipeline:
             for matrix in matrices:
                 _check_tensor(matrix, shape, x.dtype, self.device, "forward weight", dense=True)
         return hidden, gate, down
+
+    def prepare_route_metadata(self, route: RouteDescriptor, workspace: RingWorkspace,
+                               anchor: torch.Tensor, transposed: bool) -> None:
+        """Compile transport and compute metadata once for a supported forward.
+
+        Args:
+            route: Final local expert placement for this execution.
+            workspace: Transport cache sharing this execution's lifetime.
+            anchor: Current source input, used only to select its device.
+            transposed: Physical weight layout selected by the current lease.
+        """
+        if route.boundaries != self.boundaries:
+            raise ValueError("forward route must match the compute expert boundaries")
+        key = anchor.shape[-1], transposed
+        if key not in self.metadata:
+            config = (_forward_config(*key) if self.boundaries
+                      else torch.empty(0, dtype=torch.uint8, device="cpu"))
+            self.metadata[key] = compile_forward_metadata(route, workspace, anchor, config, _TILE_ROWS)
 
     def _prepare_metadata(self, hidden: int, transposed: bool, gate: tuple[torch.Tensor, ...],
                           current: Any) -> tuple:

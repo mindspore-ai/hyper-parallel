@@ -73,6 +73,15 @@ def upload_metadata(value: torch.Tensor, device: torch.device) -> torch.Tensor:
     return value.pin_memory(device=device).to(device, non_blocking=True)
 
 
+def _metadata_view(base: torch.Tensor, value: torch.Tensor, byte_offset: int) -> torch.Tensor:
+    """Restore a table through one alias, using canonical strides even for singleton axes."""
+    shape = value.shape
+    strides = [1] * len(shape)
+    for index in range(len(shape) - 2, -1, -1):
+        strides[index] = strides[index + 1] * max(shape[index + 1], 1)
+    return torch.as_strided(base, shape, strides, byte_offset // value.element_size())
+
+
 def upload_metadata_batch(values: Sequence[torch.Tensor], device: torch.device) -> tuple[torch.Tensor, ...]:
     """Upload immutable control tables through one aligned pinned allocation.
 
@@ -93,14 +102,19 @@ def upload_metadata_batch(values: Sequence[torch.Tensor], device: torch.device) 
         size = (size + 63) // 64 * 64
         offsets.append(size)
         size += value.numel() * value.element_size()
+    # Whole-allocation dtype views require the padded tail to fit every element size.
+    size = (size + 63) // 64 * 64
     host = torch.empty(size, dtype=torch.uint8, device="cpu", pin_memory=device.type != "cpu")
     host_bytes = host.numpy()
     for value, offset in zip(values, offsets):
         source = value.reshape(-1).view(torch.uint8).numpy()
         host_bytes[offset:offset + source.size] = source
     uploaded = host.to(device, non_blocking=True)
-    return tuple(uploaded.narrow(0, offset, value.numel() * value.element_size()).view(value.dtype).view(value.shape)
-                 for value, offset in zip(values, offsets))
+    typed = {}
+    for value in values:
+        if value.dtype not in typed:
+            typed[value.dtype] = uploaded.view(value.dtype)
+    return tuple(_metadata_view(typed[value.dtype], value, offset) for value, offset in zip(values, offsets))
 
 
 @dataclass

@@ -16,13 +16,14 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 import torch
 
-from hyper_parallel.core.multicore.modules.routed_experts import compute, forward, readiness, transport
+from hyper_parallel.core.multicore.modules.routed_experts import compute, forward, metadata, readiness, transport
 from hyper_parallel.core.multicore.modules.routed_experts.descriptor import RouteDescriptor, RouteEdge
 from tests.common.mark_utils import arg_mark
 
@@ -98,6 +99,7 @@ class TestReadinessTemplate(unittest.TestCase):
         self.current = _Stream(name)
         return self.current
 
+    @arg_mark(plat_marks=['cpu_linux'], level_mark='level0', card_mark='dryrun', essential_mark='essential')
     def test_control_batch_preserves_typed_disjoint_views_and_source_independence(self) -> None:
         """Feature: Batched immutable control metadata.
         Description: Pack mixed dtypes, large int64 IDs and empty tails.
@@ -105,7 +107,9 @@ class TestReadinessTemplate(unittest.TestCase):
         """
         values = (torch.tensor([2**60 + 3, 2**60 + 5], dtype=torch.int64),
                   torch.tensor([1, 3, 9], dtype=torch.uint8),
-                  torch.tensor([[5, -2]], dtype=torch.int32), torch.empty((0, 3), dtype=torch.int32))
+                  torch.tensor([[5, -2]], dtype=torch.int32), torch.empty((0, 3), dtype=torch.int32),
+                  torch.tensor(2**60 + 7, dtype=torch.int64), torch.ones((2, 3), dtype=torch.bfloat16),
+                  torch.as_strided(torch.arange(3), (3, 1), (1, 17)))
         references = tuple(value.clone() for value in values)
         packed = readiness.upload_metadata_batch(values, torch.device('cpu'))
         self.assertEqual(len(packed), len(values), f"expected={len(values)}, got={len(packed)}")
@@ -127,6 +131,7 @@ class TestReadinessTemplate(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "contiguous"):
             readiness.upload_metadata_batch((torch.ones(2, 3).t(),), torch.device('cpu'))
 
+    @arg_mark(plat_marks=['cpu_linux'], level_mark='level0', card_mark='dryrun', essential_mark='essential')
     def test_receive_tile_ordinals_follow_interleaved_peer_expert_blocks(self) -> None:
         """Feature: Block-level receive readiness.
         Description: Mix peer/expert edge order and blocks crossing tile boundaries.
@@ -144,6 +149,18 @@ class TestReadinessTemplate(unittest.TestCase):
                 expected, task_expected = transport._task_readiness_metadata(route, block_rows)
                 torch.testing.assert_close(expected, torch.tensor(counts, dtype=torch.int32), rtol=0, atol=0)
                 torch.testing.assert_close(task_expected, torch.tensor(tasks, dtype=torch.int32), rtol=0, atol=0)
+                blocks, _, _ = transport._pack_blocks(route.incoming, route.ranks, block_rows, 0)
+                workspace = SimpleNamespace(metadata={(route, 'host_transport', block_rows):
+                                                      (route, None, blocks, None)})
+                with patch.object(transport, '_pack_blocks', wraps=transport._pack_blocks) as pack:
+                    cached = transport._task_readiness_metadata(route, block_rows, workspace)
+                    pack.assert_not_called()
+                for actual, reference in zip(cached, (expected, task_expected)):
+                    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+                equal_route = replace(route)
+                with patch.object(transport, '_pack_blocks', wraps=transport._pack_blocks) as pack:
+                    transport._task_readiness_metadata(equal_route, block_rows, workspace)
+                    pack.assert_called_once()
         missing = RouteDescriptor(0, 1, 0, 1, (0,), (1,), (), ())
         with self.assertRaisesRegex(ValueError, "do not cover"):
             transport._task_readiness_metadata(missing, 256)
@@ -233,3 +250,59 @@ class TestReadinessTemplate(unittest.TestCase):
         self.assertFalse(replay.ready.poll_after.queued)
         self.assertIs(replay.initialized.stream, stream)
         torch.testing.assert_close(replay.ready.flags, pipeline.metadata[(2048, False)][-2], rtol=0, atol=0)
+
+    @arg_mark(plat_marks=['cpu_linux'], level_mark='level0', card_mark='dryrun', essential_mark='essential')
+    def test_compiled_route_shares_event_without_reusing_mutable_frame_state(self) -> None:
+        """Feature: Joint transport and compute metadata compilation.
+        Description: Replay on another stream with a new weight lease and credit bases.
+        Expectation: One compilation/event; fresh progress, pointers and sequence offsets.
+        """
+        route = self._route()
+        workspace = SimpleNamespace(metadata={}, device=torch.device('cpu'),
+                                    spec=SimpleNamespace(block_rows=256, ranks=1),
+                                    send_sequence=[[0], [0]], receive_sequence=[[0], [0]])
+        blocks, _, _ = transport._pack_blocks(route.outgoing, 1, 256, 1)
+        tasks, expected = forward.forward_tasks(route.boundaries)
+        progress = readiness.producer_progress(tasks, route.boundaries, expected.shape[0], 128, 1)
+        receive_expected, tile_expected = transport._task_readiness_metadata(route, 256)
+        host = [blocks, blocks, torch.tensor([[0, 2, 0, 2]]), receive_expected,
+                tile_expected, expected, progress]
+        device = [blocks, blocks, blocks, blocks, torch.tensor([0]), receive_expected,
+                  tile_expected, tasks, torch.empty(256, dtype=torch.uint8), expected]
+        pipeline = forward.ForwardPipeline(route.boundaries, workspace.device, vector_stream=_Stream('vector'))
+        x = torch.empty((257, 2048), dtype=torch.bfloat16)
+        gate = [torch.empty((2048, 1536), dtype=x.dtype)]
+        down = [torch.empty((768, 2048), dtype=x.dtype)]
+        with (patch.object(metadata, '_load_native'),
+              patch.object(torch.ops.hyper_parallel, 'routed_experts_forward_metadata',
+                           return_value=(host, device), create=True) as compile_tables):
+            pipeline.prepare_route_metadata(route, workspace, x, False)
+            first = pipeline.prepare(x, gate, down, 768)
+            receive, _ = transport._prepare_readiness(route, workspace, False, None, True)
+            event = pipeline.metadata[(2048, False)][-1]
+            self.assertIs(workspace.metadata[(route, False)][3], event)
+            self.assertIs(workspace.metadata[(route, True)][3], event)
+            self.assertIs(workspace.metadata[(route, 'readiness')][2], event)
+            first.ready.flags.fill_(7)
+            receive.flags.fill_(7)
+            replay_stream = self._new_stream('replay')
+            pipeline.prepare_route_metadata(route, workspace, x, False)
+            new_gate, new_down = [torch.empty_like(gate[0])], [torch.empty_like(down[0])]
+            replay = pipeline.prepare(x, new_gate, new_down, 768)
+            replay_receive, _ = transport._prepare_readiness(route, workspace, False, None, True)
+            compile_tables.assert_called_once()
+        self.assertIn(('wait', event, event.stream), replay_stream.calls)
+        self.assertIs(replay.ready.expected, first.ready.expected)
+        self.assertIs(replay_receive.expected, receive.expected)
+        self.assertNotEqual(replay.ready.flags.data_ptr(), first.ready.flags.data_ptr())
+        self.assertNotEqual(replay_receive.flags.data_ptr(), receive.flags.data_ptr())
+        torch.testing.assert_close(replay.ready.flags, progress, rtol=0, atol=0)
+        self.assertEqual(replay_receive.flags.count_nonzero().item(), 0)
+        self.assertIsNot(replay.ready.admitted, first.ready.admitted)
+        self.assertEqual(replay.gate_table.tolist(), [new_gate[0].data_ptr()])
+        self.assertEqual(replay.down_table.tolist(), [new_down[0].data_ptr()])
+        workspace.send_sequence[1][0] = 19
+        workspace.receive_sequence[1][0] = 23
+        with patch.object(transport, '_pack_blocks', side_effect=AssertionError('cached blocks were repacked')):
+            _, _, offsets = transport.compile_transport_metadata(route, workspace, True)
+        self.assertEqual(offsets.tolist(), [[0, 2, 0, 2, 19, 23]])

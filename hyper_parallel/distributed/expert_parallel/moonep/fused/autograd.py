@@ -56,6 +56,9 @@ def _prepare_forward(hidden: torch.Tensor, gate: list, down: list, intermediate:
         publish_each_block = (pipeline.enabled
                               and pipeline.supports(hidden.shape[-1], intermediate, gate, down,
                                                     len(plan.route.boundaries)))
+        if publish_each_block:
+            pipeline.prepare_route_metadata(plan.route, runtime.workspace, hidden,
+                                            bool(gate and gate[0].stride(-2) == 1))
         incoming = prepare_exchange(hidden.contiguous(), plan.route, runtime.workspace,
                                     mapping=plan.order // executor.top_k,
                                     dedup=executor.token_dedup, group_metadata=group_metadata,

@@ -246,15 +246,29 @@ class TestSparseOverlap(unittest.TestCase):
         self.assertEqual(self.expert.read_weights.call_count, 2)
         self.assertEqual(self.records.call_count, 8)
 
+    @arg_mark(plat_marks=['cpu_linux'], level_mark='level0', card_mark='dryrun', essential_mark='essential')
     def test_forward_submits_tokens_before_waiting_for_weights(self):
-        """Supported pipelines publish block progress while preserving W/T overlap."""
+        """Feature: Block-ready forward preparation and weight/token overlap.
+
+        Description: Compile route metadata after consuming weights and before preflight.
+        Expectation: Tokens start before the weight wait and preparation errors still converge.
+        """
         context = _Context(self.operations)
-        self.compute.forward_pipeline = SimpleNamespace(enabled=True, supports=Mock(return_value=True))
+        metadata = Mock(side_effect=lambda *_args: self.operations.append(("metadata",)))
+        self.compute.forward_pipeline = SimpleNamespace(
+            enabled=True, supports=Mock(return_value=True), prepare_route_metadata=metadata)
 
         result = sparse_autograd.SparseExpertFunction.forward(
             context, self.hidden, self.scores, *self.home, self.key, self.runtime)
 
         self._assert_overlap_order("forward")
+        metadata.assert_called_once()
+        self.assertIs(metadata.call_args.args[0], self.route)
+        self.assertIs(metadata.call_args.args[1], self.workspace)
+        self.assertEqual(metadata.call_args.args[2].data_ptr(), self.hidden.data_ptr())
+        self.assertIs(metadata.call_args.args[3], False)
+        self.assertLess(self.operations.index(("read_weights",)), self.operations.index(("metadata",)))
+        self.assertLess(self.operations.index(("metadata",)), self.operations.index(("preflight",)))
         self.assertTrue(self.prepared[0].publish_each_block)
         self.assertIsNotNone(self.prepared[0].ready.task_expected)
         self.assertEqual(result.shape, self.hidden.shape)

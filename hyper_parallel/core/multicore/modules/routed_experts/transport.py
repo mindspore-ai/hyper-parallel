@@ -281,7 +281,8 @@ class PreparedExchange:
     submitted: bool = False
 
 
-def _task_readiness_metadata(route: RouteDescriptor, block_rows: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _task_readiness_metadata(route: RouteDescriptor, block_rows: int,
+                             workspace: RingWorkspace | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """Compile last-block readiness per peer and compute tile on CPU arrays.
 
     A tile crossing two blocks needs the later block's ordinal. Ordinals are
@@ -298,7 +299,11 @@ def _task_readiness_metadata(route: RouteDescriptor, block_rows: int) -> tuple[t
         if task_expected.size:
             raise ValueError("incoming blocks do not cover every forward compute tile")
         return torch.from_numpy(np.zeros((route.ranks, experts), dtype=np.int32)), torch.from_numpy(task_expected)
-    blocks, _, _ = _pack_blocks(route.incoming, route.ranks, block_rows, 0)
+    cached = workspace.metadata.get((route, "host_transport", block_rows)) if workspace is not None else None
+    if cached is not None and cached[0] is route:
+        blocks = cached[2]
+    else:
+        blocks, _, _ = _pack_blocks(route.incoming, route.ranks, block_rows, 0)
     packed = blocks.numpy()
     peers = packed[:, 0]
     slots = np.searchsorted(np.asarray(route.active_experts, dtype=np.int64), packed[:, 2])
@@ -328,7 +333,7 @@ def _create_readiness_metadata(route: RouteDescriptor, workspace: RingWorkspace,
         slots[expert] = index
     slots = torch.from_numpy(slots)
     if publish_each_block:
-        expected, task_expected = _task_readiness_metadata(route, workspace.spec.block_rows)
+        expected, task_expected = _task_readiness_metadata(route, workspace.spec.block_rows, workspace)
     else:
         counts = np.zeros((route.ranks, len(experts)), dtype=np.int32)
         for edge in route.incoming:
@@ -366,7 +371,7 @@ def _prepare_readiness(route: RouteDescriptor, workspace: RingWorkspace, reverse
         current.wait_event(initialized)
         if publish and (target is None or publish_each_block and task_target is None):
             if publish_each_block and task_expected is None:
-                tile_counts, task_expected = _task_readiness_metadata(route, workspace.spec.block_rows)
+                tile_counts, task_expected = _task_readiness_metadata(route, workspace.spec.block_rows, workspace)
                 if not torch.equal(tile_counts, expected):
                     raise ValueError("cached expert and tile block counts disagree")
             if target is None:
