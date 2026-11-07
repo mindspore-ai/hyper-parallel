@@ -20,6 +20,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from tests.common.mark_utils import arg_mark
 
 base_module = importlib.import_module("hyper_parallel.trainer.base")
@@ -175,10 +177,10 @@ class TestBaseTrainerExternalState(unittest.TestCase):
         card_mark="allcards",
         essential_mark="essential",
     )
-    def test_prepare_optimizer_step_uses_external_norm(self) -> None:
+    def test_clip_grad_norm_uses_external_norm(self) -> None:
         """
         Feature: Host external-state gradient clipping.
-        Description: Run prepare_optimizer_step with external state present.
+        Description: Run clipping with external state present.
         Expectation: The external preparation drives after_clip and its global norm is returned.
         """
         trainer = MagicMock()
@@ -188,10 +190,34 @@ class TestBaseTrainerExternalState(unittest.TestCase):
         preparation = SimpleNamespace(post_clip_norm=0.5, global_norm=2.0)
         external.prepare_optimizer_step.return_value = preparation
         with patch.object(base_module, "get_model_external_state", return_value=external):
-            result = base_module.BaseTrainer.prepare_optimizer_step(trainer)
+            result = base_module.BaseTrainer.clip_grad_norm(trainer)
         self.assertEqual(result, 2.0)
         external.prepare_optimizer_step.assert_called_once_with(max_norm=1.0)
         trainer.model_integration.after_clip.assert_called_once_with(0.5)
+
+
+    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
+    def test_main_grad_normalizes_before_clipping(self) -> None:
+        """Feature: FP32 main-gradient normalization.
+
+        Description: Exercise main_grad with absent or stale ordinary gradients.
+        Expectation: Clipping sees the scaled FP32 buffer; diagnostic metrics stay unchanged.
+        """
+        for ordinary_grad in (None, torch.tensor([[99.]], dtype=torch.bfloat16)):
+            trainer = base_module.BaseTrainer.__new__(base_module.BaseTrainer)
+            trainer.model = torch.nn.Linear(1, 1, bias=False, dtype=torch.bfloat16)
+            trainer.model.weight.main_grad = torch.tensor([[1200.]])
+            trainer.model.weight.grad = ordinary_grad
+            trainer.mesh = SimpleNamespace(dp_cp_mesh=None)
+            trainer.loss_names = ("foundation_loss",)
+            trainer.step_token_counts = {"foundation_tokens": torch.tensor(600)}
+            trainer.clip_grad_norm = MagicMock(side_effect=trainer.model.weight.main_grad.item)
+            metrics = {"foundation_loss": 1200.0, "diagnostic": 7.0}
+            self.assertEqual(trainer.prepare_optimizer_step(1200.0, metrics), (2.0, 2.0))
+            self.assertEqual(metrics, {"foundation_loss": 2.0, "diagnostic": 7.0})
+            self.assertIs(trainer.model.weight.grad, ordinary_grad)
+            if ordinary_grad is not None:
+                torch.testing.assert_close(ordinary_grad, torch.tensor([[99.]], dtype=torch.bfloat16))
 
 
 if __name__ == "__main__":

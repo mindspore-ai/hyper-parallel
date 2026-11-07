@@ -133,7 +133,7 @@ class TestTextTrainer(unittest.TestCase):
         trainer = TextTrainer.__new__(TextTrainer)
         trainer.base = base
 
-        loss, loss_dict = trainer.forward_backward_step(iter(()), num_micro_steps=1)
+        loss, loss_dict = trainer.forward_backward_step(iter(()))
 
         self.assertEqual(events, ["hook", "forward", "end"], f"expected lifecycle hook order, got={events}")
         base.on_micro_step_end.assert_called_once_with(loss_dict)
