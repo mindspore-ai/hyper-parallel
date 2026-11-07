@@ -1,0 +1,165 @@
+# WikiText packed static graph with active Compressor and Indexer; CP1 reference DSA.
+# The packed documents are per-doc aligned (lcm of active ratios) so eager and the
+# captured graph share one compact compressed-bank shape policy.
+model:
+  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: ./model
+  load_base_model: false
+  torch_dtype: float32
+  attn_implementation: eager
+  config_overrides:
+    _experts_implementation: batched_mm
+    router_aux_loss_coef: 0.0001
+    v41_indexer_loss_coeff: 0.1
+    v41_candidate_source_layer_id: -1
+optimizer:
+  _target_: hyper_parallel.components.optim.builders.AdamW
+  adamw_config:
+    lr: 0.0001
+    adamw_weight_decay: 0.0
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.lr_scheduler.MultiLRScheduler
+  lr_decay_style: constant
+  lr_config:
+    lr: 0.0001
+    lr_warmup_steps: 0
+training:
+  train_iters: 30
+  global_batch_size: 2
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  logging_steps: 1
+  seed: 42
+  enable_full_determinism: false
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+fsdp_config:
+  dp_shard_size: 2
+compile:
+  enabled: true
+  use_joint_graph: true
+  fsdp_allgather_prefetch: false
+  fsdp_overlap_grad_reduce: false
+  dynamic: true
+dataset:
+  model_assets:
+    chat_template: null
+    tokenizer:
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: ./tokenizer
+      local_files_only: true
+      use_fast: true
+      trust_remote_code: false
+  data_transform:
+    _target_: hyper_parallel.data.text.text_transform.build_text_transform
+    data_type: plaintext
+    text_keys: text
+    max_seq_len: 32
+    drop_ragged_tail: false
+  _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
+  data_path: ./output/datasets/wikitext-train.jsonl
+  data_config:
+    create_attention_mask_in_dataloader: true
+    labels_are_shifted: true
+    cache_dir: ./output/automodel_text_graph/wikitext_compression_cache
+dataloader:
+  _target_: hyper_parallel.data.batching.TokenBatchLoader
+  min_buffered_samples: 200
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_online_text_collate_fn
+    # lcm of the crop's active compress ratios: blocks never cross a document.
+    per_doc_alignment: 2
+    # Fixed packed row length: one captured graph replays for every batch and
+    # eager keeps the identical shape contract.
+    pad_to_length: 32
+  get_batch:
+    _target_: hyper_parallel.data.batching.TextParallelBatch
+    source_type: online
+    attention_mode: compressed
+    runtime_input_adapter:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.data.runtime.DeepseekV41Runtime
+      include_position_ids: false
+      include_image_sequence_start: false
+      # Every active model compress ratio; the graph boundary prepares
+      # per-ratio compressed-key metadata from this list.
+      compress_ratios:
+      - 1
+      - 2
+  sampler_type: single
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+  # One max_seq_len document per micro-batch: the planned per-epoch sample
+  # count then equals the iteration count and the padded row stays at 32.
+  token_budget: 32
+checkpoint:
+  save_ckpt: false
+model_init_dtype: float32
+plan_overrides:
+- match: model.layers.*.*_hc
+  region_dispatch: false
+  params:
+    fn:
+      tp: replicate
+    base:
+      tp: replicate
+    scale:
+      tp: replicate
+  in_src:
+    hidden_streams:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+  in_dst:
+    hidden_streams:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+  out_src:
+    pre:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+    post:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+    residual:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+  out_dst:
+    pre:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+    post:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+    residual:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+- match: model.layers.*.engram
+  params:
+    q_weight:
+      tp: replicate
+    k_weight:
+      tp: replicate
+    embed.weight:
+      tp: replicate
+    wkv.weight:
+      tp: replicate
+debug:
+  check_dataset: debug

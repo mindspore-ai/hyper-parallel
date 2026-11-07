@@ -133,10 +133,17 @@ class TextPackingCollator:
 
     alignment_size: int = 1
     pad_to_length: int | None = None
+    per_doc_alignment: int = 1
 
     def __post_init__(self) -> None:
         """Validate fixed padding before any samples are read."""
         _validate_padding_config(self.alignment_size, self.pad_to_length)
+        if (
+                isinstance(self.per_doc_alignment, bool)
+                or not isinstance(self.per_doc_alignment, int)
+                or self.per_doc_alignment <= 0
+        ):
+            raise ValueError(f"per_doc_alignment must be a positive integer, got {self.per_doc_alignment!r}")
 
     def __call__(self, model_samples: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
         """Pack samples into one ``[1, packed_length]`` forward-backward batch.
@@ -153,13 +160,17 @@ class TextPackingCollator:
         if not model_samples:
             raise ValueError("model_samples must contain at least one Online sample")
 
+        padded_samples = [
+            self._align_sample(model_sample) for model_sample in model_samples
+        ]
+
         packed_batch = {}
         for field in ("input_ids", "labels"):
-            values = [model_sample[field] for model_sample in model_samples]
+            values = [model_sample[field] for model_sample in padded_samples]
             packed_batch[field] = torch.cat(values, dim=-1).unsqueeze(0)
 
-        seq_lens = model_samples[0]["input_ids"].new_tensor(
-            [model_sample["input_ids"].shape[-1] for model_sample in model_samples]
+        seq_lens = padded_samples[0]["input_ids"].new_tensor(
+            [model_sample["input_ids"].shape[-1] for model_sample in padded_samples]
         )
         zero = seq_lens.new_zeros(1)
         seq_ends = seq_lens.cumsum(dim=0)
@@ -171,6 +182,38 @@ class TextPackingCollator:
             packed_batch, self.alignment_size, {"input_ids": 0, "labels": IGNORE_INDEX}, self.pad_to_length,
         )
         return aligned_batch
+
+    def _align_sample(self, model_sample: Mapping[str, Any]) -> dict[str, Any]:
+        """Pad one sample to a complete-block multiple for DSA compression.
+
+        Padding appends ignored tokens at the document end: labels receive
+        ``IGNORE_INDEX`` so the loss skips them, later documents keep causal
+        isolation, and real tokens keep their relative positions. This is the
+        data-side shape policy that lets eager and the static graph share one
+        compact compressed-bank layout.
+
+        Args:
+            model_sample: One Online sample with ``input_ids`` and ``labels``.
+
+        Returns:
+            The same sample, or a padded copy whose token count divides
+            ``per_doc_alignment``.
+        """
+        if self.per_doc_alignment <= 1:
+            return dict(model_sample)
+        length = model_sample["input_ids"].shape[-1]
+        pad_length = (-length) % self.per_doc_alignment
+        if not pad_length:
+            return dict(model_sample)
+        padded = dict(model_sample)
+        padded["input_ids"] = torch.nn.functional.pad(
+            model_sample["input_ids"], (0, pad_length), value=0,
+        )
+        if "labels" in model_sample:
+            padded["labels"] = torch.nn.functional.pad(
+                model_sample["labels"], (0, pad_length), value=IGNORE_INDEX,
+            )
+        return padded
 
 
 @dataclass
@@ -357,6 +400,7 @@ def build_omni_collate_fn(
 def build_online_text_collate_fn(
         mesh_context: Any | None = None,
         pad_to_length: int | None = None,
+        per_doc_alignment: int = 1,
 ) -> TextPackingCollator:
     """Build Online text collation shared by fixed N and dynamic K batching.
 
@@ -372,6 +416,10 @@ def build_online_text_collate_fn(
         mesh_context: Runtime TP/CP topology injected by the Trainer.
         pad_to_length: Exact global token length, divisible by TP × CP. None
             pads only for alignment. Longer packed sequences raise ValueError.
+        per_doc_alignment: Pad every packed document to a multiple of this
+            value (use the lcm of the model's active compress ratios) so DSA
+            compression blocks never cross a document boundary. Default 1
+            keeps natural document lengths.
 
     Returns:
         A collator producing one forward-backward batch.
@@ -380,6 +428,9 @@ def build_online_text_collate_fn(
         ValueError: If pad_to_length is not a positive aligned integer or None.
     """
     alignment_size = _get_token_alignment_size(mesh_context)
-    collate_fn = TextPackingCollator(alignment_size=alignment_size, pad_to_length=pad_to_length)
+    collate_fn = TextPackingCollator(
+        alignment_size=alignment_size, pad_to_length=pad_to_length,
+        per_doc_alignment=per_doc_alignment,
+    )
 
     return collate_fn
