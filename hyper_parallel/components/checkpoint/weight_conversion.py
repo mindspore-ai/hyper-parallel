@@ -23,6 +23,7 @@ from __future__ import annotations
 __all__ = [
     "ConversionOps",
     "Transpose",
+    "MergeModulelist",
     "WeightConverter",
     "WeightRenaming",
     "dot_natural_key",
@@ -37,7 +38,7 @@ from collections import defaultdict
 from copy import deepcopy
 from typing import Any, Callable
 
-import torch
+import torch  # pylint: disable=forbidden-backend-import  # Torch checkpoint tensors
 
 try:
     from transformers.conversion_mapping import (
@@ -55,6 +56,15 @@ except ImportError:
     _HFTranspose = None
     _HFWeightConverter = None
     _HFWeightRenaming = None
+
+try:
+    from transformers.core_model_loading import (
+        MergeModulelist as _HFMergeModulelist, SplitModulelist as _HFSplitModulelist,
+    )
+except ImportError:
+    _HFMergeModulelist = None
+    _HFSplitModulelist = None
+
 
 try:
     from transformers.core_model_loading import (
@@ -550,3 +560,43 @@ else:
             state_dict, renamings, converters
         )
         return _materialize_reverse_conversions(model, conversion_mapping)
+
+
+# Compatibility for Transformers versions whose SplitModulelist removes every
+# singleton dimension instead of only the expert dimension.
+# https://github.com/huggingface/transformers/pull/49773
+if _HFMergeModulelist is not None and _HFSplitModulelist is not None:
+    class _SplitModulelistPreserveDims(_HFSplitModulelist):
+        """Undo stacking without dropping singleton tensor dimensions."""
+
+        @torch.no_grad()
+        def convert(
+            self, input_dict: dict[str, Any], source_patterns: list[str],
+            target_patterns: list[str], **kwargs: Any,
+        ) -> dict[str, torch.Tensor]:
+            """Split stacked tensors while preserving their original ranks."""
+            del source_patterns, kwargs
+            outputs = {}
+            for pattern, tensors in input_dict.items():
+                tensor = tensors[0] if isinstance(tensors, list) else tensors
+                size = tensor.size(self.dim)
+                targets = self.get_target_patterns(input_dict, pattern, target_patterns, size)
+                chunks = torch.chunk(tensor, size, dim=self.dim)
+                outputs.update({name: chunk.squeeze(self.dim) for name, chunk in zip(targets, chunks)})
+            return outputs
+
+        @property
+        def reverse_op(self) -> ConversionOps:
+            """Return the corresponding stack operation."""
+            return MergeModulelist(self.dim)
+
+
+    class MergeModulelist(_HFMergeModulelist):
+        """Use Transformers stacking with rank-preserving reverse conversion."""
+
+        @property
+        def reverse_op(self) -> ConversionOps:
+            """Return the rank-preserving inverse."""
+            return _SplitModulelistPreserveDims(self.dim)
+else:
+    MergeModulelist = None
