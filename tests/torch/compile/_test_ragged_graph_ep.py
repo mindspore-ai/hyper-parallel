@@ -89,16 +89,17 @@ def _average_gradients(model):
         parameter.grad.copy_(gradient.div_(dist.get_world_size()))
 
 
-def _reference_fsdp_gradient(gradient: torch.Tensor, *, group: object) -> torch.Tensor:
+def _reference_fsdp_gradient(gradient: torch.Tensor, *, group: object, scale: float, reduce_op: object) -> torch.Tensor:
     """Match eager FSDP's per-backward shard reduction before accumulation.
 
-    Reconstructing the full averaged gradient keeps this reference independent
+    Reconstructing the full reduced gradient keeps this reference independent
     of compiler parameter sharding. Averaging after microbatch accumulation
     changes BF16 rounding and models a different synchronization schedule.
     """
     degree = dist.get_world_size(group)
+    gradient = gradient * scale
     shard = gradient.new_empty((gradient.shape[0] // degree, *gradient.shape[1:]))
-    dist.reduce_scatter_tensor(shard, gradient.contiguous(), op=dist.ReduceOp.AVG, group=group)
+    dist.reduce_scatter_tensor(shard, gradient.contiguous(), op=reduce_op, group=group)
     result = torch.empty_like(gradient, memory_format=torch.contiguous_format)
     dist.all_gather_into_tensor(result, shard, group=group)
     return result
@@ -109,7 +110,12 @@ def _install_reference_sync(model, expert_mesh):
     handles = []
     for name, parameter in model.named_parameters():
         group = expert_mesh.get_group() if name.startswith("experts.") else dist.group.WORLD
-        handles.append(parameter.register_hook(partial(_reference_fsdp_gradient, group=group)))
+        # Expert transport uses EDP, but its loss normalization domain is DP.
+        expert = name.startswith("experts.")
+        scale = 1. / dist.get_world_size() if expert else 1.
+        reduce_op = dist.ReduceOp.SUM if expert else dist.ReduceOp.AVG
+        handles.append(parameter.register_hook(
+            partial(_reference_fsdp_gradient, group=group, scale=scale, reduce_op=reduce_op)))
     return handles
 
 

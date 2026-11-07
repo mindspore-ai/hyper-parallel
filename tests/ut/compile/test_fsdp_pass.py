@@ -46,15 +46,18 @@ inserted as FX nodes only, so ``torch.distributed`` is mocked throughout.
 import unittest
 from contextlib import contextmanager
 from typing import Iterator
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 
 import torch
 from torch import fx, nn
 
-from hyper_parallel.compile.pass_config import PassConfig
+from hyper_parallel.compile.compiler import GraphCompiler
+from hyper_parallel.compile.pass_config import GradientReduction, PassConfig
 from hyper_parallel.compile.passes.parallel.fsdp_pass import FSDPPass
 from hyper_parallel.compile.graph_parallel_plan import GraphParallelPlan
+from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
+from hyper_parallel.distributed.mesh import MeshContext
 
 _DIST_PATH = "hyper_parallel.compile.passes.parallel.fsdp_pass.dist"
 _RESOLVE_PG_PATH = (
@@ -512,6 +515,55 @@ class TestFSDPPassRunSharding(unittest.TestCase):
             "the [3, 4] gradient must be padded back to [4, 4] before reduction",
         )
 
+    def test_source_replicate_sum_follows_waited_fsdp_reduction(self):
+        """TP-replicated gradients sum after DP shards, retaining both identities."""
+        gm = _linear_joint_graph()
+        model = nn.Linear(4, 4)
+        policies = dict.fromkeys({"weight", "bias"}, GradientReduction("sum", 8))
+        with _patch_dist(world_size=8):
+            FSDPPass().run(
+                gm, PassConfig(fsdp_degree=4), model=model, fsdp_group_name="fsdp",
+                gradient_reductions=policies, source_gradient_groups={"bias": "tp"},
+            )
+        gm.graph.lint()
+        self.assertEqual(gm.fsdp_sharded_param_names, {"weight", "bias"})
+        reductions = [node for node in gm.graph.nodes if node.meta.get("comm_type") == "fsdp_reduce_scatter"]
+        self.assertEqual({node.meta["param_name"] for node in reductions}, {"weight", "bias"})
+        self.assertTrue(all(node.args[1:] == ("sum", 4, "fsdp") for node in reductions))
+        source = [node for node in gm.graph.nodes if node.meta.get("comm_type") == "source_all_reduce"]
+        self.assertEqual(len(source), 1)
+        self.assertEqual(source[0].meta["param_name"], "bias")
+        self.assertEqual(source[0].args[1:], ("sum", "tp"))
+        wait = source[0].args[0].args[0]
+        self.assertIn("wait_tensor", str(wait.target))
+        self.assertEqual(wait.args[0].meta["comm_type"], "fsdp_reduce_scatter")
+
+    def test_unit_binding_overrides_default_group(self) -> None:
+        """Bound parameters use their unit group; others retain the dense group."""
+        gm = _linear_joint_graph()
+        model = nn.Linear(4, 4)
+        with _patch_dist(world_size=8):
+            FSDPPass().run(gm, PassConfig(fsdp_degree=4), model=model,
+                           parameter_groups={"weight": ("unit", 2)})
+        gm.graph.lint()
+        self.assertEqual(tuple(model.weight.shape), (2, 4))
+        self.assertEqual(tuple(model.bias.shape), (1,))
+        self.assertEqual(gm.fsdp_sharded_param_names, {"weight", "bias"})
+        expected = {"weight": (2, "unit"), "bias": (4, "fsdp")}
+        for comm_type, first_arg in (("fsdp_all_gather", 1), ("fsdp_reduce_scatter", 2)):
+            actual = {node.meta["param_name"]: node.args[first_arg:] for node in gm.graph.nodes
+                      if node.meta.get("comm_type") == comm_type}
+            self.assertEqual(actual, expected)
+
+    def test_ddp_metadata_does_not_claim_physical_shards(self):
+        """Clipping must see replication when the pass only reduces DDP gradients."""
+        gm = _linear_joint_graph()
+        model = nn.Linear(4, 4)
+        with _patch_dist(world_size=4):
+            FSDPPass().run(gm, PassConfig(dp_mode="ddp", dp_replicate_degree=4), model=model)
+        self.assertFalse(gm.fsdp_sharded_param_names)
+        self.assertEqual(tuple(model.weight.shape), (4, 4))
+
     def test_run_rejects_non_divisible_expert_param(self):
         """Do not silently replicate an unsynchronized trainable expert."""
         cfg = PassConfig(fsdp_enabled=True, fsdp_degree=4)
@@ -525,6 +577,7 @@ class TestFSDPPassRunSharding(unittest.TestCase):
                         FSDPPass().run(
                             gm, cfg, model=model, fsdp_group_name="fsdp",
                             expert_param_names={"odd"}, expert_fsdp_group_name="fsdp_expert",
+                            gradient_reductions={"odd": GradientReduction("sum", 4)},
                         )
                 self.assertEqual(tuple(model.odd.shape), shape)
                 self.assertEqual(_count_targets(gm, "all_gather_into_tensor"), 0)
@@ -548,12 +601,30 @@ class TestFSDPPassRunSharding(unittest.TestCase):
                     FSDPPass().run(
                         gm, PassConfig(fsdp_degree=2), model=model,
                         expert_param_names={"frozen", "buf"},
+                        gradient_reductions=dict.fromkeys({"frozen", "buf"}, GradientReduction("sum", 2)),
                     )
                 self.assertEqual(tuple(model.trainable.shape), (2, 4))
                 torch.testing.assert_close(model.frozen, torch.ones(3), atol=0, rtol=0)
                 torch.testing.assert_close(model.buf, torch.ones(3), atol=0, rtol=0)
                 self.assertEqual(_count_targets(gm, "all_gather_into_tensor"), 1)
                 self.assertEqual(_count_targets(gm, "reduce_scatter_tensor"), 1)
+
+    def test_expert_reduction_requires_an_explicit_policy(self):
+        """Do not infer an expert's normalization divisor from its group size."""
+        with _patch_dist(world_size=4):
+            with self.assertRaisesRegex(ValueError, "explicit gradient reduction policies"):
+                FSDPPass().run(_odd_joint_graph(), PassConfig(fsdp_degree=4), model=_OddParam(),
+                               expert_param_names={"odd"})
+
+    def _assert_gradient_reductions(self, graph_module, reductions):
+        """Dense AVG and expert prescaled SUM use their selected groups."""
+        scales = [node for node in graph_module.graph.nodes if node.target == torch.mul]
+        self.assertEqual([node.args[1] for node in scales], [0.25])
+        self.assertEqual(scales[0].args[0].name, "grad_lin_weight")
+        for node in reductions:
+            self.assertEqual(node.args[1], "sum" if node.args[-1] == "edp" else "avg")
+            if node.args[-1] == "edp":
+                self.assertIs(node.args[0].args[0], scales[0])
 
     def test_expert_group_with_dense_padding_and_scalar_reduction(self):
         """Keep dense padding/scalar sync while experts shard or stay local."""
@@ -575,6 +646,7 @@ class TestFSDPPassRunSharding(unittest.TestCase):
                     FSDPPass().run(
                         gm, PassConfig(fsdp_degree=4), model=model, fsdp_group_name="dense",
                         expert_param_names={"lin.weight"}, expert_fsdp_group_name="edp",
+                        gradient_reductions={"lin.weight": GradientReduction("sum", 4)},
                     )
                 expected_weight = weight[2:] if degree > 1 else weight
                 torch.testing.assert_close(model.lin.weight, expected_weight, atol=0, rtol=0)
@@ -595,6 +667,31 @@ class TestFSDPPassRunSharding(unittest.TestCase):
                 self.assertEqual([node.args[2] for node in replicated], ["dense"])
                 groups = {node.meta["comm_group"] for node in gm.graph.nodes if "comm_group" in node.meta}
                 self.assertEqual(groups, {"dense", "edp"} if degree > 1 else {"dense"})
+                self._assert_gradient_reductions(gm, reductions)
+
+    def test_expert_only_edp1_normalizes_without_collectives(self):
+        """A singleton expert group still normalizes by the explicit DP domain."""
+        for dp_degree in (3, 8):
+            with self.subTest(dp_degree=dp_degree):
+                model = _OddParam()
+                gm = _odd_joint_graph()
+                output = next(node for node in gm.graph.nodes if node.op == "output")
+                output.args = ([*output.args[0], output.args[0][0]],)
+                gm.loss_dict_keys = ["aux"]
+                with _patch_dist(world_size=dp_degree) as mocked:
+                    mocked.get_world_size.side_effect = (
+                        lambda group=None, degree=dp_degree: degree if group is None else 1
+                    )
+                    FSDPPass().run(
+                        gm, PassConfig(fsdp_degree=dp_degree), model=model, expert_param_names={"odd"},
+                        gradient_reductions={"odd": GradientReduction("sum", dp_degree)},
+                    )
+                loss, gradient, aux = gm(model.odd, torch.ones(4, 1), torch.full_like(model.odd, dp_degree))
+                torch.testing.assert_close(gradient, torch.ones_like(model.odd), rtol=0, atol=0)
+                torch.testing.assert_close(loss, aux, rtol=0, atol=0)
+                self.assertEqual(_count_targets(gm, "all_gather_into_tensor"), 0)
+                self.assertEqual(_count_targets(gm, "reduce_scatter_tensor"), 0)
+                self.assertEqual(_count_targets(gm, "wait_tensor"), 0)
 
     def test_unmarked_expert_fallback_uses_edp_group(self):
         """A partial-plan expert fallback must never reduce across dense/EP peers."""
@@ -610,6 +707,7 @@ class TestFSDPPassRunSharding(unittest.TestCase):
                     FSDPPass().run(
                         gm, PassConfig(fsdp_degree=4), model=model, parallel_plan=plan,
                         fsdp_group_name="dense", expert_param_names={"extra"}, expert_fsdp_group_name="edp",
+                        gradient_reductions={"extra": GradientReduction("sum", 4)},
                     )
                 self.assertEqual(tuple(model.extra.shape), (2, 2))
                 replicated = [node for node in gm.graph.nodes if node.meta.get("comm_type") == "fsdp_all_reduce"]
@@ -897,6 +995,68 @@ class TestFSDPPassHelpers(unittest.TestCase):
             [0, 1, 2],
             f"fallback should return all state indices, got {result}",
         )
+
+
+class TestGraphGradientReduction(unittest.TestCase):
+    """Graph-only policies match the unchanged eager adapter contract."""
+
+    @staticmethod
+    def _source_kwargs(context, experts=("expert",)):
+        """Resolve policies without constructing a model or process group."""
+        compiler = object.__new__(GraphCompiler)
+        compiler._mesh_context = context
+        compiler.source_shard_info = None
+        compiler._expert_param_names = set(experts)
+        return compiler._source_reduction_kwargs()
+
+    def test_normalization_domain_is_independent_of_ep_and_edp(self):
+        """Changing expert transport cannot change the DP loss divisor."""
+        for ep, edp in ((2, 4), (4, 2), (8, 1)):
+            with self.subTest(ep=ep, edp=edp):
+                context = MeshContext(dp_size=8, ep_size=ep, edp_shard_size=edp)
+                reduction = self._source_kwargs(context)["gradient_reductions"]["expert"]
+                self.assertEqual(reduction, GradientReduction("sum", 8))
+                self.assertEqual(reduction.scale, 0.125)
+                self.assertEqual(self._source_kwargs(context, experts=()), {})
+                self.assertEqual(GradientReduction(), GradientReduction("avg", 1))
+
+    def test_existing_loss_replica_semantics_are_preserved(self):
+        """CP and replicated TP losses retain the eager loss domain."""
+        context = MeshContext(dp_size=2, cp_size=2, tp_size=2)
+        self.assertEqual(self._source_kwargs(context)["gradient_reductions"]["expert"].divisor, 8)
+        context.loss_parallel = True
+        self.assertEqual(self._source_kwargs(context)["gradient_reductions"]["expert"].divisor, 4)
+        self.assertIsNone(GradientReduction("sum").scale)
+
+    def test_graph_policy_matches_eager_setter_values_and_order(self):
+        """Graph divisors agree with eager for expert and loss-replica domains."""
+        manager = object.__new__(FSDP2Manager)
+        contexts = [MeshContext(dp_size=8, ep_size=ep, edp_shard_size=edp)
+                    for ep, edp in ((2, 4), (4, 2), (8, 1))]
+        contexts.extend((MeshContext(dp_size=2, cp_size=2, tp_size=2),
+                         MeshContext(dp_size=2, cp_size=2, tp_size=2, loss_parallel=True), MeshContext()))
+        for context in contexts:
+            with self.subTest(dp=context.dp_size, cp=context.cp_size, tp=context.tp_size,
+                              ep=context.ep_size, loss_parallel=context.loss_parallel):
+                manager.mesh_context = context
+                module = MagicMock()
+                self.assertFalse(manager._configure_source_layout_gradient_scaling(module, None))
+                self.assertEqual(module.mock_calls, [])
+                reduction = self._source_kwargs(context)["gradient_reductions"]["expert"]
+                scaled = manager._configure_source_layout_gradient_scaling(module, {"expert": object()})
+                calls = [call.set_reduce_op_type("sum", recurse=False)]
+                if reduction.scale is not None:
+                    calls.append(call.set_gradient_scaling_factor(reduction.scale))
+                self.assertEqual(scaled, reduction.scale is not None)
+                self.assertEqual(module.mock_calls, calls)
+
+    def test_invalid_policy_is_rejected(self):
+        """Reject invalid operations and divisors before graph lowering."""
+        for divisor in (0, -1, True, 2.5):
+            with self.subTest(divisor=divisor), self.assertRaisesRegex(ValueError, "positive integer"):
+                GradientReduction("sum", divisor)
+        with self.assertRaisesRegex(ValueError, "'avg' or 'sum'"):
+            GradientReduction("max")
 
 
 if __name__ == "__main__":
