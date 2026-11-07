@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import inspect
+from functools import partial
 from types import MethodType
 from typing import Any, Callable
 
@@ -36,10 +37,10 @@ from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import (
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import deepseek_v41_swiglu
 
 
-def _deepseek_v41_unclamped_gate(gate_up: torch.Tensor) -> torch.Tensor:
-    """Apply native FP32 SwiGLU when a nonpositive limit disables clamping."""
+def _deepseek_v41_packed_gate(gate_up: torch.Tensor, limit: float = 0.0) -> torch.Tensor:
+    """Apply the native FP32 clamp and SwiGLU to packed projections."""
     gate, up = gate_up.float().chunk(2, dim=-1)
-    return deepseek_v41_swiglu(gate, up, 0.0).to(gate_up.dtype)
+    return deepseek_v41_swiglu(gate, up, limit).to(gate_up.dtype)
 
 
 def _deepseek_v41_grouped_expert_forward(
@@ -69,9 +70,7 @@ def _deepseek_v41_grouped_expert_forward(
         group_type=0,
         group_list_type=0,
     )
-    # Cast the packed projections once; the shared helper's casts are then no-ops.
-    gate, up = gate_up.float().chunk(2, dim=-1)
-    intermediate = deepseek_v41_swiglu(gate, up, experts.limit)
+    intermediate = _deepseek_v41_packed_gate(gate_up, experts.limit)
     return grouped_matmul(  # pylint: disable=not-callable
         intermediate.to(hidden_states.dtype),
         experts.down_proj.transpose(1, 2),
@@ -197,6 +196,10 @@ def deepseek_v41_ep_compute_fn(
         ep_mesh: Any,
         use_grouped_gemm: bool = False,
         fix_router: bool = False,
+        use_moonep: bool = False,
+        moonep_token_dedup: bool = True,
+        moonep_replica_capacity: int | None = None,
+        moonep_prefetch_depth: int = 1,
 ) -> Callable:
     """Build V4.1 routed/shared computation with training-aware routing.
 
@@ -215,6 +218,11 @@ def deepseek_v41_ep_compute_fn(
         fix_router: Enable benchmark-only balanced destinations while retaining
             learned Top-K weights and their gradients. Normal training and
             correctness runs keep this disabled.
+        use_moonep: Balance routed assignments with collective MoonEP on NPU.
+        moonep_token_dedup: Send unique token/destination vectors; enabled by default.
+        moonep_replica_capacity: Remote expert slots per rank; None defaults to E/EP.
+        moonep_prefetch_depth: Earlier calls to prefetch without FSDP; 0 disables
+            cross-layer prefetch. FSDP restores this layer before its dY dispatch.
 
     Returns:
         The source-compatible local compute callable.
@@ -233,15 +241,21 @@ def deepseek_v41_ep_compute_fn(
     tp_rank = 0 if tp_mesh is None else tp_mesh.get_local_rank()
     apply_gate = (
         module.experts._apply_gate  # pylint: disable=protected-access
-        if module.experts.limit > 0 else _deepseek_v41_unclamped_gate
+        if module.experts.limit > 0 else _deepseek_v41_packed_gate
     )
-    if use_grouped_gemm:
+    if use_moonep:
+        apply_gate = partial(_deepseek_v41_packed_gate, limit=module.experts.limit)
+    if use_grouped_gemm and not use_moonep:
         module.experts.forward_expert_major = MethodType(
             _deepseek_v41_grouped_expert_forward, module.experts,
         )
     bind_local_expert_forward(
         module, ep_size, use_grouped_gemm=use_grouped_gemm,
-        apply_gate=None if use_grouped_gemm else apply_gate,
+        apply_gate=apply_gate if use_moonep or not use_grouped_gemm else None,
+        use_moonep=use_moonep,
+        moonep_token_dedup=moonep_token_dedup,
+        moonep_replica_capacity=moonep_replica_capacity,
+        moonep_prefetch_depth=moonep_prefetch_depth,
     )
 
     def auxiliary_compute_fn(
