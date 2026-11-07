@@ -936,9 +936,16 @@ def _validate_model_state_dtype(
         if id(tensor) not in external_ids and (tensor.is_floating_point() or id(tensor) in fp32_ids)
         and tensor.dtype != (torch.float32 if id(tensor) in fp32_ids else target_dtype)
     ]
+    fp32_buffer_ids = {
+        id(buffer)
+        for module in model.modules()
+        for name, buffer in module.named_buffers(recurse=False, remove_duplicate=False)
+        if name in getattr(module, "fp32_buffer_names", ())
+    }
     mismatched.extend(
         name for name, tensor in model.named_buffers(remove_duplicate=False)
-        if tensor.is_floating_point() and tensor.dtype != target_dtype
+        if (tensor.is_floating_point() or id(tensor) in fp32_buffer_ids)
+        and tensor.dtype != (torch.float32 if id(tensor) in fp32_buffer_ids else target_dtype)
     )
     if mismatched:
         raise RuntimeError(

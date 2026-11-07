@@ -1916,6 +1916,9 @@ class SwapOptimizer(torch.optim.Optimizer):
 
     def __init__(self, optimizer: Any, config: Any, adapter_factory: AdapterFactory) -> None:
         """Wrap a leaf with its family adapter and independent transfer runtime."""
+        # The pipeline calls adapter updates directly, bypassing the leaf's step hooks.
+        if optimizer._optimizer_step_pre_hooks or optimizer._optimizer_step_post_hooks:
+            raise ValueError("Optimizer-state swap does not support step hooks; disable swap before wrapping")
         # Do not call ``torch.optim.Optimizer.__init__``: the wrapped base
         # optimizer already owns param_groups/state/defaults. Inheriting keeps
         # PyTorch LR schedulers and isinstance checks happy while this wrapper
