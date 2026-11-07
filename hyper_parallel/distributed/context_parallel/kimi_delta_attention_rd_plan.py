@@ -101,8 +101,9 @@ def _interval_rounds(
 class RDResetPlan:
     """An immutable local schedule derived from true document boundaries.
 
-    The same plan is transposed by backward. Matrices are never inspected on
-    device: only true document boundaries can remove an edge. Binding one rank
+    Cached-adjoint backward transposes the same plan; fresh reverse maps use
+    a mirrored plan. Matrices are never inspected on device: only true document
+    boundaries can remove an edge. Binding one rank
     retains its tail interval and rounds, without building the all-rank graph.
     """
 
@@ -157,8 +158,16 @@ def _validate_intervals(offsets: tuple[int, ...], local_length: int, size: int) 
 
 
 @lru_cache(maxsize=32)
+def _reverse_documents(offsets: tuple[int, ...] | PackedDocumentInfo) -> PackedDocumentInfo:
+    """Cache the reversed immutable snapshot across layers of the same batch."""
+    values = offsets.offsets if isinstance(offsets, PackedDocumentInfo) else offsets
+    return PackedDocumentInfo(tuple(values[-1] - value for value in reversed(values)))
+
+
+@lru_cache(maxsize=32)
 def build_reset_plan(
     offsets: tuple[int, ...] | PackedDocumentInfo, local_length: int, size: int, rank: int | None = None,
+    *, reverse: bool = False,
 ) -> RDResetPlan:
     """Derive one rank's exact live edges from its tail document interval.
 
@@ -167,7 +176,9 @@ def build_reset_plan(
             Reusing the snapshot avoids full-offset validation and hashing.
         local_length: Equal token interval length after any Ulysses exchange.
         size: Number of chronological state ranks, independent of global rank IDs.
-        rank: Optional local rank whose execution schedule should be cached.
+        rank: Optional physical group rank whose execution schedule should be cached.
+        reverse: Plan a fresh reverse-map scan in mirrored token/rank order.
+            The executor maps logical peers back to the unchanged process group.
 
     Returns:
         An immutable CPU plan reusable across layers with identical metadata.
@@ -175,6 +186,11 @@ def build_reset_plan(
     """
     if rank is not None and not 0 <= rank < size:
         raise ValueError("RD execution-plan rank is outside the state process group")
+    if reverse:
+        if not isinstance(offsets, PackedDocumentInfo):
+            _validate_intervals(offsets, local_length, size)
+        offsets = _reverse_documents(offsets)
+        rank = None if rank is None else size - rank - 1
     if isinstance(offsets, PackedDocumentInfo):
         offsets = offsets.offsets
         if size < 1 or local_length < 1 or offsets[-1] != size * local_length:
