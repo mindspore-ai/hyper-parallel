@@ -14,9 +14,10 @@ HyperParallel 提供灵活的激活内存优化机制，包括选择性重计算
 
 | 接口 | 说明 |
 |------|------|
-| `checkpoint` | 函数式激活重计算，支持 policy_fn、swap_inputs、context_fn |
+| `checkpoint` | 函数式激活重计算；默认 non-reentrant 支持 policy_fn、swap_inputs、context_fn |
 | `swap` | 函数式激活 swap，不重计算，仅 offload/prefetch |
-| `checkpoint_wrapper` | 模块级 checkpoint 装饰器 |
+| `checkpoint_wrapper` | 模块级 checkpoint 装饰器；可设置 `use_reentrant=True` |
+| `checkpoint_exclude_wrapper` | checkpoint 内跳过重计算指定区域（正向执行一次） |
 | `swap_wrapper` | 模块级 swap 装饰器 |
 | `swap_tensor_wrapper` | 单 tensor swap 装饰器 |
 | `CheckpointPolicy` | 重计算策略枚举：MUST_SAVE / PREFER_SAVE / MUST_RECOMPUTE / PREFER_RECOMPUTE / MUST_SWAP |
@@ -29,7 +30,7 @@ HyperParallel 提供灵活的激活内存优化机制，包括选择性重计算
 ### 1. 函数式 checkpoint
 
 ```python
-from hyper_parallel.core.activation_checkpoint import checkpoint, CheckpointPolicy
+from hyper_parallel.core.activation_memory import checkpoint, CheckpointPolicy
 
 # 基础使用：将 model.layer 包装为 checkpoint 区域，x 是传给 model.layer 的输入
 output = checkpoint(model.layer, x)
@@ -59,8 +60,8 @@ output = checkpoint(model.layer, x, early_stop=True)   # 默认值，减少无�
 output = checkpoint(model.layer, x, early_stop=False)  # 完整执行整个重计算区域
 ```
 
-Torch eager 模式在 2.6、2.7 和 2.9 上统一使用 HyperParallel 的 non-reentrant 实现，并固定
-`use_reentrant=False`。`early_stop` 只通过 Hyper 的单次调用关键字或配置字典控制：
+默认 `use_reentrant=False` 使用 HyperParallel 的 non-reentrant 实现；`early_stop` 只通过
+Hyper 的单次调用关键字或配置字典控制：
 
 ```python
 checkpoint_kwargs = {"early_stop": False, "preserve_rng_state": True}
@@ -71,10 +72,40 @@ output = checkpoint(model.layer, x, **checkpoint_kwargs)
 `checkpoint_wrapper(model.layer, early_stop=False)` 使用相同规则。图编译状态暂时回退到 Torch 原生
 non-reentrant checkpoint；完整的 compile/context_fn 组合适配不在当前版本范围内。
 
+### Reentrant checkpoint 与排除重计算区域
+
+Torch eager 下可将 `use_reentrant=True` 传给 `checkpoint` 或 `checkpoint_wrapper`。
+`checkpoint_exclude_wrapper` 标记区域在首次 forward 执行并保存必要输出与反向图；checkpoint
+replay 会复用该区域的输出，不再执行其 forward：
+
+```python
+from hyper_parallel.core.activation_memory import checkpoint_wrapper, checkpoint_exclude_wrapper
+
+# 在被 checkpoint 的模块内部调用 excluded；其参数仍由父模块持有。
+model.block.expensive = checkpoint_exclude_wrapper(model.block.expensive)
+model.block = checkpoint_wrapper(model.block, use_reentrant=True)
+```
+
+排除区域始终缓存输出；设置 `swap=True` 时可依照当前 swap group 卸载输出及不可从重算输入恢复的
+内部激活，重算输入仍通过配方恢复。`group_swap` 与 `cpu_pool` 可配置在 exclude wrapper 上；
+reentrant checkpoint 本身支持 `preserve_rng_state` 和可调用的 `context_fn`，但其外层不支持
+`policy_fn`、`swap_inputs`、`group_swap`、`cpu_pool`、非默认 `early_stop`、`debug`、
+`determinism_check` 或 `torch.compile`；上述组合会报错。不要嵌套 reentrant checkpoint。
+
+PP stage 的普通 backward 可以使用 reentrant checkpoint；stage 自动管理分阶段作用域，用户无需手动绑定。
+`ScheduleInterleaved1F1B(overlap_b_f=True, enable_dxdw_split=True)` 的 dx/dw 分离
+在非 FSDP/HSDP stage 中按微批保留 replay 状态：dx 阶段只传输入梯度，dw 阶段再计算参数梯度，
+两阶段共用一次 replay。reentrant + PP split + FSDP/HSDP 以及
+`retain_backward_graph=True` 不支持并会显式报错；不使用 PP split 的普通 FSDP 路径不受此限制。
+不在 PP stage 的分阶段作用域内时，`autograd.grad` 即使只请求输入梯度，reentrant 内部仍可能
+累积闭包捕获参数的梯度；需要完整的目标限定求导能力时使用 non-reentrant。
+当前实现不承诺高阶梯度或任意嵌套 checkpoint 支持。
+PP reentrant stage 假定运行期间参数对象保持不变；不支持动态替换参数对象。
+
 ### 2. 函数式 swap
 
 ```python
-from hyper_parallel.core.activation_checkpoint import swap, CheckpointPolicy, SwapManager
+from hyper_parallel.core.activation_memory import swap, CheckpointPolicy, SwapManager
 
 # 基础使用：将所有中间激活 swap 到 CPU
 output = swap(model.layer, x)
@@ -94,7 +125,7 @@ SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
 ### 3. 声明式接口
 
 ```python
-from hyper_parallel.core.activation_checkpoint import (
+from hyper_parallel.core.activation_memory import (
     CheckpointPolicy,
     SwapManager,
     checkpoint_exclude_wrapper,
@@ -161,7 +192,7 @@ swap_output = swap_block_func(x)
 ```python
 import torch.nn as nn
 
-from hyper_parallel.core.activation_checkpoint import SwapManager, swap_tensor_wrapper
+from hyper_parallel.core.activation_memory import SwapManager, swap_tensor_wrapper
 
 class TransformerBlock(nn.Module):
     def forward(self, x):
@@ -187,7 +218,7 @@ SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
 
 ```python
 from hyper_parallel import fully_shard, init_device_mesh
-from hyper_parallel.core.activation_checkpoint import checkpoint_wrapper
+from hyper_parallel.core.activation_memory import checkpoint_wrapper
 
 mesh = init_device_mesh("npu", (dp_size,), mesh_dim_names=("dp",))
 
@@ -202,7 +233,7 @@ model = fully_shard(model, mesh=mesh)
 
 ```python
 from hyper_parallel import ColwiseParallel, RowwiseParallel, parallelize_module, init_device_mesh
-from hyper_parallel.core.activation_checkpoint import SwapManager, swap_wrapper
+from hyper_parallel.core.activation_memory import SwapManager, swap_wrapper
 
 tp_mesh = init_device_mesh("npu", (tp_size,), mesh_dim_names=("tp",))
 

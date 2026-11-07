@@ -13,11 +13,13 @@
 # limitations under the License.
 # ============================================================================
 """test activation checkpoint"""
+from pathlib import Path
+
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 
-ACTIVATION_CHECKPOINT = "activation_checkpoint.py"
-CHECKPOINT_CASES = "checkpoint_cases.py"
+ACTIVATION_CHECKPOINT = str(Path(__file__).with_name("activation_checkpoint.py").resolve())
+CHECKPOINT_CASES = str(Path(__file__).with_name("checkpoint_cases.py").resolve())
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
@@ -35,11 +37,11 @@ def test_ac_memory_group():
     """
     parallel_run([
         TorchCase(ACTIVATION_CHECKPOINT, "test_ac_memory_comparison", 12404, 1),
-        TorchCase(ACTIVATION_CHECKPOINT, "test_checkpoint_wrapper_accepts_func", 12405, 1),
-        TorchCase(ACTIVATION_CHECKPOINT, "test_wrapper_overlap_detection_cases", 12406, 1),
-        TorchCase(ACTIVATION_CHECKPOINT, "test_wrapper_non_overlapping_allowed_cases", 12407, 1),
-        TorchCase(CHECKPOINT_CASES, "TestCheckpoint", 12418, 1),
-        TorchCase(CHECKPOINT_CASES, "TestScheduledRecomputation", 12419, 1),
+        TorchCase(ACTIVATION_CHECKPOINT, "test_checkpoint_wrapper_accepts_func", num_proc=1),
+        TorchCase(ACTIVATION_CHECKPOINT, "test_wrapper_overlap_detection_cases", num_proc=1),
+        TorchCase(ACTIVATION_CHECKPOINT, "test_wrapper_non_overlapping_allowed_cases", num_proc=1),
+        TorchCase(CHECKPOINT_CASES, "TestCheckpoint", num_proc=1),
+        TorchCase(CHECKPOINT_CASES, "TestScheduledRecomputation", num_proc=1),
     ])
 
 
@@ -54,23 +56,13 @@ def test_ac_features():
         4. test_scheduled_recompute_npu_preserves_rng_state
         5. test_checkpoint_exclude_save_preserves_rng_state
         6. test_scheduled_recompute_npu_restores_autocast
-        7. test_scheduled_recompute_supports_dx_dw_split
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(ACTIVATION_CHECKPOINT, "test_native_npu_rng_for_closure_only_tensor_is_not_restored", 12408, 1),
-        TorchCase(ACTIVATION_CHECKPOINT, "test_hyper_npu_rng_for_closure_only_tensor_matches_native", 12408, 1),
-        TorchCase(ACTIVATION_CHECKPOINT, "test_scheduled_recompute_supports_dx_dw_split", 12409, 1),
-        TorchCase(ACTIVATION_CHECKPOINT, "test_scheduled_recompute_npu_preserves_rng_state", 12410, 1),
-        TorchCase(ACTIVATION_CHECKPOINT, "test_checkpoint_exclude_save_preserves_rng_state", 12411, 1),
-        TorchCase(ACTIVATION_CHECKPOINT, "test_scheduled_recompute_npu_restores_autocast", 12412, 1),
-        TorchCase(ACTIVATION_CHECKPOINT, "test_scheduled_recompute_supports_dx_dw_split", 12413, 1),
+        TorchCase(ACTIVATION_CHECKPOINT, "test_native_npu_rng_for_closure_only_tensor_is_not_restored", num_proc=1),
+        TorchCase(ACTIVATION_CHECKPOINT, "test_hyper_npu_rng_for_closure_only_tensor_matches_native", num_proc=1),
+        TorchCase(ACTIVATION_CHECKPOINT, "test_scheduled_recompute_supports_dx_dw_split", num_proc=1),
+        TorchCase(ACTIVATION_CHECKPOINT, "test_scheduled_recompute_npu_preserves_rng_state", num_proc=1),
+        TorchCase(ACTIVATION_CHECKPOINT, "test_checkpoint_exclude_save_preserves_rng_state", num_proc=1),
+        TorchCase(ACTIVATION_CHECKPOINT, "test_scheduled_recompute_npu_restores_autocast", num_proc=1),
     ])
-
-
-
-
-# @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-# def test_checkpoint_npu_semantics() -> None:
-#     """Run eager checkpoint semantics and scheduling coverage on NPU."""
-#     checkpoint_cases.run_checkpoint_cases()

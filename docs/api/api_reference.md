@@ -761,11 +761,11 @@ get_hyper_optimizer(
 
 ## Activation Checkpoint / Swap
 
-> 公共 API 位于 `hyper_parallel.core.activation_checkpoint`。
+> 公共 API 位于 `hyper_parallel.core.activation_memory`。
 
 ### `checkpoint`
 
-函数式激活重计算（`use_reentrant=False`）。
+函数式激活重计算；默认 `use_reentrant=False`，Torch eager 可设置 `use_reentrant=True`。
 
 ```python
 checkpoint(
@@ -775,7 +775,9 @@ checkpoint(
     policy_fn: Optional[Callable] = None,
     context_fn: Optional[Callable[[], Tuple[object, object]]] = None,
     group_swap: bool = False,
+    cpu_pool=None,
     early_stop: bool = True,
+    use_reentrant: bool = False,
     **kwargs,
 )
 ```
@@ -787,13 +789,19 @@ checkpoint(
 | `function` | `callable` | — | 要 checkpoint 的函数或模块 |
 | `swap_inputs` | `bool` | `False` | 是否将 checkpoint 保存的输入 offload 到 CPU |
 | `policy_fn` | `callable` | `None` | SAC 逐算子策略：`(ctx, op, *args, **kwargs) -> CheckpointPolicy` |
-| `context_fn` | `callable` | `None` | 返回 `(forward_ctx, recompute_ctx)` 的无参工厂；可与 `policy_fn` 组合 |
+| `context_fn` | `callable` | `None` | 返回 `(forward_ctx, recompute_ctx)` 的无参工厂；non-reentrant 可与 `policy_fn` 组合 |
 | `group_swap` | `bool` | `False` | 是否对 `MUST_SWAP` tensor 启用分组 copy 融合 |
+| `cpu_pool` | 可选对象 | `None` | non-reentrant 输入 swap 所用的 pinned memory pool |
 | `early_stop` | `bool` | `True` | 是否在产生全部 backward 所需 tensor 后提前停止重计算 |
+| `use_reentrant` | `bool` | `False` | 是否启用 Torch eager reentrant checkpoint |
 
-Torch 2.6、2.7、2.9 eager 模式统一使用 HyperParallel non-reentrant 实现。`early_stop` 只接受单次调用
-关键字或 `checkpoint_kwargs` 配置，不继承外层 `torch.utils.checkpoint.set_checkpoint_early_stop()`。
-Torch backend 还会消费 `preserve_rng_state`、`determinism_check` 和 `debug` 等 checkpoint 保留关键字。
+默认 eager 路径使用 HyperParallel non-reentrant 实现。`early_stop` 只接受单次调用关键字或
+`checkpoint_kwargs` 配置，不继承外层 `torch.utils.checkpoint.set_checkpoint_early_stop()`。
+`preserve_rng_state` 两种模式均可配置；`determinism_check` 和 `debug` 仅适用于 non-reentrant。
+reentrant 支持 `context_fn` 和普通 `backward()`，但不支持 `policy_fn`、`swap_inputs`、
+`group_swap`、`cpu_pool`、非默认 `early_stop`、`torch.compile` 或高阶梯度。
+未使用 PP stage 的显式分阶段作用域时，`autograd.grad` 即使只请求输入梯度，reentrant 内部
+仍可能累积闭包捕获参数的梯度；需要通用的目标限定求导 API 时使用 non-reentrant。
 
 ---
 
@@ -827,7 +835,8 @@ swap(
 checkpoint_wrapper(module, **checkpoint_kwargs) -> CheckpointWrapper
 ```
 
-`checkpoint_kwargs` 与 `checkpoint` 一致，例如 `policy_fn`、`swap_inputs`、`early_stop`。
+`checkpoint_kwargs` 与 `checkpoint` 一致，例如默认模式下的 `policy_fn`、`swap_inputs`、`early_stop`，
+或 Torch eager 下的 `use_reentrant=True`。
 
 ---
 
@@ -846,8 +855,8 @@ checkpoint_exclude_wrapper(
 ) -> CheckpointExcludeWrapper
 ```
 
-支持 PyTorch eager 模式，并且需要在 HyperParallel 的 `checkpoint` 或
-`checkpoint_wrapper`（`use_reentrant=False`）内部使用。支持包装 Module/Cell 和普通 callable。
+支持 PyTorch eager 模式，在 HyperParallel 的 `checkpoint` 或 `checkpoint_wrapper` 内部使用，
+适用于 non-reentrant 与 reentrant。支持包装 Module 和普通 callable。
 
 默认 `swap=False`，输出始终保存在设备侧并进入 replay cache。设置 `swap=True` 后，显式输出以及不能从
 replay 输入重建的内部 saved tensor 会尝试注册到当前 `SwapManager` group；Parameter、Parameter view、空
@@ -857,6 +866,10 @@ storage、缺少 active group 或位于最后一个 group 的 tensor 自动退�
 `swap=True` 不会自动建立 prefetch chain，仍需通过
 `SwapManager().set_forward_prefetch_layer(layer, next_layer)` 配置 offload/load 顺序。外层没有 active
 checkpoint 时，wrapper 完全透传，不缓存输出、不安装 saved-tensor hooks，也不注册 swap storage。
+
+PP stage 使用 reentrant checkpoint 时，普通 backward 无需额外配置；对于启用 dx/dw 分离的
+`ScheduleInterleaved1F1B`，stage 自动管理每个微批的分阶段求导与 replay 状态，无需用户手动绑定。
+reentrant + PP split + FSDP/HSDP 尚不支持并会显式报错；普通 FSDP backward 不受此限制。
 
 ---
 
