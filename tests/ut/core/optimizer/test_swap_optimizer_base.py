@@ -787,6 +787,38 @@ class TestSwapRuntimeOffloadWindow(unittest.TestCase):
         self.assertEqual(slot.state, "h2d")
         self.assertEqual(runtime.to_device, ["moment"])
 
+    def test_prefetch_rolls_back_restored_storage_when_later_restore_fails(self):
+        """A failed storage restore releases earlier allocations in reverse order."""
+        runtime = _DummySwapRuntime()
+        slots = [
+            SwapSlot(
+                name=name,
+                tensor=object(),
+                cpu_tensor=object(),
+                storage_nbytes=16,
+                state="host",
+            )
+            for name in ("first", "second", "failing")
+        ]
+        restored = []
+        released = []
+
+        def _restore(slot):
+            if slot.name == "failing":
+                raise RuntimeError("storage restore failed")
+            restored.append(slot)
+
+        runtime.restore_device_storage = _restore
+        runtime.release_device_storage = released.append
+
+        with self.assertRaisesRegex(RuntimeError, "storage restore failed"):
+            runtime.prefetch([_unit(slots)])
+
+        self.assertEqual(restored, slots[:2])
+        self.assertEqual(released, [slots[1], slots[0]])
+        self.assertEqual([slot.state for slot in slots], ["host", "host", "host"])
+        self.assertEqual(runtime.to_device, [])
+
     def test_prefetch_copies_each_slot_alias_once(self):
         """State reachable through several units is transferred a single time."""
         runtime = _DummySwapRuntime()
