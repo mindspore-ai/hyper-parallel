@@ -15,12 +15,13 @@
 
 """Unit tests for the Muon optimizer."""
 
+import copy
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
-from hyper_parallel.core.optimizer.muon import Muon
+from hyper_parallel.core.optimizer.muon import Muon, NSInputTransform
 from hyper_parallel.core.optimizer.optimizer import BaseDistributedOptimizer
 
 
@@ -151,3 +152,49 @@ def test_async_hierarchical_broadcast_waits_between_mesh_dimensions():
     first_work.wait.assert_called_once_with()
     final_work.wait.assert_not_called()
     assert handles == [final_work]
+
+
+def test_flat_experts_preserve_muon_callbacks_and_resume():
+    """Feature: Logical matrices. Description: Resume with callbacks. Expectation: Equal weights and momentum."""
+    def split(_name: str, tensor: torch.Tensor) -> list[torch.Tensor]:
+        """Return independent gate/up views."""
+        return list(tensor.chunk(2, dim=-1))
+
+    def transform(name: str, tensor: torch.Tensor) -> NSInputTransform:
+        """Exercise the reversible callback on logical matrices."""
+        def restore(updates: list[torch.Tensor], output: torch.Tensor) -> None:
+            """Restore both projection blocks."""
+            output.copy_(torch.cat(updates, dim=-1))
+        return NSInputTransform(split(name, tensor), restore)
+
+    def parameter(value: torch.Tensor, flat: bool) -> torch.nn.Parameter:
+        """Keep metadata attached when rebuilding an optimizer for resume."""
+        result = torch.nn.Parameter(value.flatten(0, 1).clone() if flat else value.clone())
+        result.model_name = "experts"
+        if flat:
+            result.logical_shape = tuple(value.shape)
+        return result
+
+    for options in ({}, {"reshape_fn": split}, {"ns_transform_fn": transform}):
+        source = torch.randn(3, 4, 12, dtype=torch.bfloat16)
+        params = [parameter(source, flat) for flat in (False, True)]
+        optimizers = [Muon([param], ns_steps=5, **options) for param in params]
+        for step in range(2):
+            gradient = torch.randn_like(source)
+            for param, optimizer in zip(params, optimizers):
+                param.grad = gradient.view_as(param)
+                optimizer.step()
+            torch.testing.assert_close(params[1].view_as(params[0]), params[0], rtol=0, atol=0)
+            left, right = [optimizer.state[param] for optimizer, param in zip(optimizers, params)]
+            for key, value in left.items():
+                if isinstance(value, torch.Tensor):
+                    torch.testing.assert_close(right[key].view_as(value), value, rtol=0, atol=0)
+            if step == 0:
+                state = copy.deepcopy(optimizers[1].state_dict())
+                params[1] = parameter(params[1].detach().view_as(source), True)
+                optimizers[1] = Muon([params[1]], ns_steps=5, **options)
+                optimizers[1].load_state_dict(state)
+    for shape in ((3, 4, 5), (3, 0, 4), (True, 12, 4)):
+        params[1].logical_shape = shape
+        with pytest.raises(ValueError, match="logical_shape"):
+            Muon._logical_ns_input(params[1], torch.ones(12, 12))  # pylint: disable=protected-access

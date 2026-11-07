@@ -77,3 +77,10 @@ def test_fsdp_ep_three_step_training():
     _run_group(
         ("test_fsdp_ep_three_step_training_npu", 10502, 4),
     )
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_expert_2d_fsdp8():
+    """Feature: 2D experts. Description: Eight shards over four experts. Expectation: Equal training updates."""
+    _run_group(("test_expert_2d_fsdp8", None, 8))

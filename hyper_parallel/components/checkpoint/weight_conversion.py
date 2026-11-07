@@ -22,6 +22,7 @@ from __future__ import annotations
 
 __all__ = [
     "ConversionOps",
+    "Reshape",
     "Transpose",
     "WeightConverter",
     "WeightRenaming",
@@ -35,6 +36,7 @@ import re
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from copy import deepcopy
+from math import prod
 from typing import Any, Callable
 
 import torch
@@ -550,3 +552,36 @@ else:
             state_dict, renamings, converters
         )
         return _materialize_reverse_conversions(model, conversion_mapping)
+
+
+class Reshape(ConversionOps):
+    """Reversibly change checkpoint storage shape without changing element order."""
+
+    def __init__(self, source_shape: tuple[int, ...], target_shape: tuple[int, ...]) -> None:
+        """Configure explicit source and target shapes with the same element count."""
+        self.source_shape, self.target_shape = tuple(source_shape), tuple(target_shape)
+        if (not self.source_shape or not self.target_shape
+                or any(not isinstance(size, int) or isinstance(size, bool) or size <= 0
+                       for size in self.source_shape + self.target_shape)
+                or prod(self.source_shape) != prod(self.target_shape)):
+            raise ValueError("Reshape requires positive shapes with equal element counts")
+
+    def convert(self, input_dict: dict, source_patterns: list[str], target_patterns: list[str],
+                **kwargs: Any) -> dict[str, torch.Tensor]:
+        """Reshape exactly one collected tensor, checking its declared source layout."""
+        del kwargs
+        if len(input_dict) != 1 or len(source_patterns) != 1 or len(target_patterns) != 1:
+            raise ValueError("Reshape requires exactly one source and target")
+        value = next(iter(input_dict.values()))
+        if isinstance(value, list):
+            if len(value) != 1:
+                raise ValueError("Reshape requires exactly one collected tensor")
+            value = value[0]
+        if tuple(value.shape) != self.source_shape:
+            raise ValueError(f"Reshape expected {self.source_shape}, got {tuple(value.shape)}")
+        return {target_patterns[0]: value.reshape(self.target_shape)}
+
+    @property
+    def reverse_op(self) -> "Reshape":
+        """Return the inverse storage conversion."""
+        return Reshape(self.target_shape, self.source_shape)

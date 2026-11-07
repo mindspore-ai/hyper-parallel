@@ -721,7 +721,7 @@ class Muon(BaseDistributedOptimizer):
         groups = defaultdict(list)
 
         for p in params:
-            core_shape = self._shape_to_core_shape(tuple(p.shape))
+            core_shape = self._shape_to_core_shape(tuple(getattr(p, "logical_shape", p.shape)))
             groups[core_shape].append(p)
 
         return groups
@@ -742,7 +742,7 @@ class Muon(BaseDistributedOptimizer):
             ns_input: torch.Tensor,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """Return the contiguous NS input and any reshape views used for NS."""
-        working_input = ns_input if ns_input.is_contiguous() else ns_input.contiguous()
+        working_input = self._logical_ns_input(param, ns_input)
         if self.reshape_fn is None:
             return working_input, [working_input]
 
@@ -768,13 +768,29 @@ class Muon(BaseDistributedOptimizer):
 
         return working_input, reshaped_inputs
 
+    @staticmethod
+    def _logical_ns_input(param: torch.nn.Parameter, ns_input: torch.Tensor) -> torch.Tensor:
+        """Recover independent matrices after the existing shard-gather path."""
+        working = ns_input if ns_input.is_contiguous() else ns_input.contiguous()
+        shape = getattr(param, "logical_shape", None)
+        if shape is None:
+            return working
+        if (len(shape) != 3 or any(not isinstance(size, int) or isinstance(size, bool) or size <= 0
+                                   for size in shape)
+                or tuple(param.shape) != (shape[0] * shape[1], shape[2])):
+            raise ValueError("logical_shape must describe the independent matrices of a flattened 2D parameter")
+        rows, cols = shape[-2:]
+        if working.numel() % (rows * cols):
+            raise ValueError("Muon input must contain complete logical matrices after shard gathering")
+        return working.view(-1, rows, cols)
+
     def _prepare_ns_transform(
             self,
             param: torch.nn.Parameter,
             ns_input: torch.Tensor,
     ) -> Tuple[torch.Tensor, NSInputTransform]:
         """Route one parameter through custom, zero-copy, or identity NS preparation."""
-        working_input = ns_input if ns_input.is_contiguous() else ns_input.contiguous()
+        working_input = self._logical_ns_input(param, ns_input)
         param_fqn = getattr(param, "model_name", None)
         if self.ns_transform_fn is not None and param_fqn is not None:
             transform = self.ns_transform_fn(param_fqn, working_input)
@@ -978,7 +994,7 @@ class Muon(BaseDistributedOptimizer):
             update = ns_inputs[param].view(state["origin_shapes"][param])
             working_input = state["working_inputs"][param]
             if working_input.untyped_storage().data_ptr() != update.untyped_storage().data_ptr():
-                update.copy_(working_input)
+                update.copy_(working_input.view_as(update))
             state["restored"][param] = update
         return state["restored"]
 
@@ -1055,7 +1071,7 @@ class Muon(BaseDistributedOptimizer):
 
             if (state["working_inputs"][p].untyped_storage().data_ptr()
                     != reshaped_update.untyped_storage().data_ptr()):
-                reshaped_update.copy_(state["working_inputs"][p])
+                reshaped_update.copy_(state["working_inputs"][p].view_as(reshaped_update))
             state["restored"][p] = reshaped_update
 
         return state["restored"]

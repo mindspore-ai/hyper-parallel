@@ -919,7 +919,7 @@ class ShardingPlanner:
             match = self._PER_EXPERT_RE.match(rel)
             if match is not None:
                 stacks.setdefault(match.group(2), []).append((int(match.group(1)), rel))
-            elif self._BATCHED_EXPERT_RE.match(rel) is not None and (param_ndims or {}).get(param_fqn, 2) >= 3:
+            elif self._BATCHED_EXPERT_RE.match(rel) is not None and (param_ndims or {}).get(param_fqn, 2) >= 2:
                 batched.append(rel)
         if stacks and batched:
             logger.warning(
