@@ -40,7 +40,8 @@ class _OnlineSourceBuilder:
     @property
     def _random_seed(self) -> int:
         """Return the common source shuffle and blend seed."""
-        return int(self.data_config.get("random_seed", 42))
+        random_seed = int(self.data_config.get("random_seed", 42))
+        return random_seed
 
     @property
     def _stopping_strategy(self) -> str:
@@ -51,29 +52,17 @@ class _OnlineSourceBuilder:
                 f"Unsupported Online stopping_strategy {stopping_strategy!r}; "
                 f"expected one of {ONLINE_STOPPING_STRATEGIES!r}"
             )
+
         return stopping_strategy
 
     def _create_source_loaders(self) -> tuple[list[_OnlineLeafSourceLoader], list[float]]:
         """Create one leaf source loader per configured source.
 
         Example:
-            ``data_path="/data/train.jsonl"`` produces one source with weight
-            ``1.0``.
-
-            The following configuration produces two sources. Both inherit
-            ``split="98, 1, 1"``, while the second source overrides it::
-
-                {
-                    "split": "98, 1, 1",
-                    "sources": [
-                        {"data_path": "/data/a.parquet", "weight": 0.7},
-                        {
-                            "data_path": "/data/b.parquet",
-                            "weight": 0.3,
-                            "split": "90, 5, 5",
-                        },
-                    ],
-                }
+            data_path="train.jsonl" -> ([train_loader], [1.0]).
+            sources=[{data_path: A, weight: 3}, {data_path: B, weight: 1, split: "80, 20, 0"}]
+            with common split="90, 10, 0" -> ([A_loader, B_loader], [3.0, 1.0]).
+            A inherits the common split; B overrides it with "80, 20, 0".
 
         Returns:
             Leaf source loaders and their corresponding unnormalized weights.
@@ -82,11 +71,13 @@ class _OnlineSourceBuilder:
         if sources is None:
             if self.data_path is None:
                 raise ValueError("Online Dataset requires data_path or data_config.sources")
+
             source_loader = _OnlineLeafSourceLoader(self.data_path, self.data_config)
             return [source_loader], [1.0]
 
         if self.data_path is not None:
             raise ValueError("Online Dataset cannot combine data_path with data_config.sources")
+
         if isinstance(sources, (str, bytes)) or not isinstance(sources, Sequence) or not sources:
             raise ValueError("Online data_config.sources must be a non-empty sequence")
 
@@ -97,21 +88,23 @@ class _OnlineSourceBuilder:
         for source in sources:
             if not isinstance(source, Mapping):
                 raise ValueError("Each Online source must be a mapping with data_path and weight")
+
+            source_options = dict(source)
             try:
-                source_path = source["data_path"]
-                source_weight = float(source["weight"])
+                source_path = source_options.pop("data_path")
+                source_weight = float(source_options.pop("weight"))
             except KeyError as error:
                 raise ValueError("Each Online source must define data_path and weight") from error
+
             if source_weight <= 0:
                 raise ValueError("Online source weight must be positive")
 
-            source_config = dict(common_config)
-            for option_name, option_value in source.items():
-                if option_name not in ("data_path", "weight"):
-                    source_config[option_name] = option_value
+            source_config = {**common_config, **source_options}
             source_loaders.append(_OnlineLeafSourceLoader(source_path, source_config))
             source_weights.append(source_weight)
-        return source_loaders, source_weights
+
+        loaders_and_weights = (source_loaders, source_weights)
+        return loaders_and_weights
 
     def _interleave_sources(self, source_datasets: Sequence[Any], weights: Sequence[float]) -> Any:
         """Interleave Mapping or Iterable sources through the Hugging Face interface."""
@@ -161,54 +154,51 @@ class _OnlineLeafSourceLoader:
             raise ImportError("Online Dataset requires the optional 'datasets' package") from error
 
         # Examples: "Salesforce/wikitext", "/data/*.parquet", {"train": "/data/train.jsonl"}.
-        load_dataset_path, load_options, split_expressions = self._build_load_request(streaming=streaming)
-        ratio_split_config = self.data_config.get("split")
-        filter_before_ratio_split = ratio_split_config is not None and sample_filter is not None
+        loader_name, loader_args, split_expressions = self._build_load_request(streaming=streaming)
+        split_config = self.data_config.get("split")
+        filter_before_split = split_config is not None and sample_filter is not None
         selected_split: str | list[str] = "train"
-        if split_expressions is not None and not filter_before_ratio_split:
+        if split_expressions is not None and not filter_before_split:
             selected_splits = []
             for split_expression in split_expressions:
                 if split_expression is not None:
                     selected_splits.append(split_expression)
             selected_split = selected_splits
 
-        if load_dataset_path in ("json", "parquet") and "data_files" in load_options and not streaming:
-            loaded_dataset = self._load_local_files(load_dataset_path, load_options["data_files"], selected_split)
-        else:
-            loaded_dataset = load_dataset(
-                load_dataset_path,
-                **load_options,
-                split=selected_split,
-                streaming=streaming,
-                cache_dir=self.data_config.get("cache_dir"),
-            )
+        loaded_dataset = load_dataset(
+            loader_name,
+            **loader_args,
+            split=selected_split,
+            streaming=streaming,
+            cache_dir=self.data_config.get("cache_dir"),
+        )
 
-        if filter_before_ratio_split:
+        if filter_before_split:
             filtered_dataset = loaded_dataset.filter(sample_filter)
-            split_percentages = self.parse_split_percentages(ratio_split_config)
+            split_percentages = self.parse_split_percentages(split_config)
             filtered_splits = self._split_filtered_dataset(filtered_dataset, split_percentages)
             return filtered_splits
 
-        dataset_result = loaded_dataset
+        dataset = loaded_dataset
         if split_expressions is not None:
             # Example: ("train", None, "test") keeps the empty valid slot.
-            loaded_dataset_iterator = iter(loaded_dataset)
-            restored_splits = []
+            dataset_iterator = iter(loaded_dataset)
+            split_datasets = []
             for split_expression in split_expressions:
                 if split_expression is None:
-                    restored_splits.append(None)
+                    split_datasets.append(None)
                     continue
-                loaded_split = next(loaded_dataset_iterator)
-                restored_splits.append(loaded_split)
-            dataset_result = (restored_splits[0], restored_splits[1], restored_splits[2])
+                loaded_split = next(dataset_iterator)
+                split_datasets.append(loaded_split)
+            dataset = (split_datasets[0], split_datasets[1], split_datasets[2])
 
         if sample_filter is None:
-            return dataset_result
+            return dataset
 
         # Example: (train, None, test) filters available splits and preserves the empty valid slot.
-        if isinstance(dataset_result, tuple):
+        if isinstance(dataset, tuple):
             filtered_splits = []
-            for split_dataset in dataset_result:
+            for split_dataset in dataset:
                 if split_dataset is None:
                     filtered_splits.append(None)
                     continue
@@ -217,7 +207,7 @@ class _OnlineLeafSourceLoader:
             filtered_dataset = (filtered_splits[0], filtered_splits[1], filtered_splits[2])
             return filtered_dataset
 
-        filtered_dataset = dataset_result.filter(sample_filter)
+        filtered_dataset = dataset.filter(sample_filter)
         return filtered_dataset
 
     def _load_local_files(self, file_format: str, data_files: Any, selected_split: str | list[str]) -> Any:
@@ -280,13 +270,13 @@ class _OnlineLeafSourceLoader:
         if split_config is not None:
             split_expressions = self._parse_split_ratios(split_config)
 
-        load_options: dict[str, Any] = {}
+        loader_args: dict[str, Any] = {}
         # Example: {"train": "/data/train.jsonl", "valid": "/data/valid.jsonl"}.
         if isinstance(self.data_path, Mapping):
-            data_files, load_dataset_path, split_expressions = self._resolve_split_data_files(self.data_path)
-            load_options["data_files"] = data_files
-            resolved_request = (load_dataset_path, load_options, split_expressions)
-            return resolved_request
+            data_files, loader_name, split_expressions = self._resolve_split_data_files(self.data_path)
+            loader_args["data_files"] = data_files
+            load_request = (loader_name, loader_args, split_expressions)
+            return load_request
 
         is_local_path = not isinstance(self.data_path, str)
         if isinstance(self.data_path, str):
@@ -295,19 +285,19 @@ class _OnlineLeafSourceLoader:
 
         # Examples: ["/data/a.jsonl", "/data/b.jsonl"], "/data/*.parquet".
         if is_local_path:
-            data_files, load_dataset_path = self._collect_local_data_files(self.data_path)
-            load_options["data_files"] = data_files
-            resolved_request = (load_dataset_path, load_options, split_expressions)
-            return resolved_request
+            data_files, loader_name = self._collect_local_data_files(self.data_path)
+            loader_args["data_files"] = data_files
+            load_request = (loader_name, loader_args, split_expressions)
+            return load_request
 
         # Example: "Salesforce/wikitext" is a Hub dataset ID.
-        load_dataset_path = self.data_path
+        loader_name = self.data_path
         config_name = self.data_config.get("config_name")
         if config_name is not None:
-            load_options["name"] = config_name
+            loader_args["name"] = config_name
 
-        resolved_request = (load_dataset_path, load_options, split_expressions)
-        return resolved_request
+        load_request = (loader_name, loader_args, split_expressions)
+        return load_request
 
     @staticmethod
     def _split_filtered_dataset(dataset: Any, percentages: Sequence[int]) -> tuple[Any, Any, Any]:
@@ -334,8 +324,8 @@ class _OnlineLeafSourceLoader:
         if not data_path:
             raise ValueError("Online split data_path mapping must not be empty")
 
-        split_data_files: dict[str, list[str]] = {}
-        loader_formats = set()
+        split_files: dict[str, list[str]] = {}
+        file_formats = set()
         for split_name, split_path in data_path.items():
             if split_name not in ONLINE_SPLIT_NAMES:
                 raise ValueError(
@@ -343,62 +333,62 @@ class _OnlineLeafSourceLoader:
                     f"expected one of {ONLINE_SPLIT_NAMES!r}"
                 )
 
-            data_files, loader_format = self._collect_local_data_files(split_path)
-            split_data_files[split_name] = data_files
-            loader_formats.add(loader_format)
+            data_files, file_format = self._collect_local_data_files(split_path)
+            split_files[split_name] = data_files
+            file_formats.add(file_format)
 
-        if len(loader_formats) != 1:
+        if len(file_formats) != 1:
             raise ValueError("Online train/valid/test paths must use one common file format")
 
         train_split = None
-        if "train" in split_data_files:
+        if "train" in split_files:
             train_split = "train"
 
         valid_split = None
-        if "valid" in split_data_files:
+        if "valid" in split_files:
             valid_split = "valid"
 
         test_split = None
-        if "test" in split_data_files:
+        if "test" in split_files:
             test_split = "test"
 
         selected_splits = (train_split, valid_split, test_split)
-        loader_format = loader_formats.pop()
-        return split_data_files, loader_format, selected_splits
+        file_format = file_formats.pop()
+        return split_files, file_format, selected_splits
 
     @staticmethod
     def _collect_local_data_files(data_path: OnlinePathSpec) -> tuple[list[str], str]:
         """Collect local files and select their ``load_dataset`` format."""
         if isinstance(data_path, str):
-            configured_paths = [data_path]
+            file_paths = [data_path]
         else:
-            configured_paths = list(data_path)
+            file_paths = list(data_path)
 
         data_files = []
-        for configured_path in configured_paths:
-            if not os.path.isdir(configured_path):
-                data_files.append(configured_path)
+        for file_path in file_paths:
+            if not os.path.isdir(file_path):
+                data_files.append(file_path)
                 continue
 
-            for filename in sorted(os.listdir(configured_path)):
+            for filename in sorted(os.listdir(file_path)):
                 file_extension = os.path.splitext(filename)[1].lower()
                 if file_extension in ONLINE_FILE_FORMATS:
-                    data_files.append(os.path.join(configured_path, filename))
+                    data_files.append(os.path.join(file_path, filename))
 
         if not data_files:
             raise ValueError("Online files must use one format: JSON/JSONL/Parquet/CSV/Arrow")
 
         first_extension = os.path.splitext(data_files[0])[1].lower()
-        loader_format = ONLINE_FILE_FORMATS.get(first_extension)
+        file_format = ONLINE_FILE_FORMATS.get(first_extension)
         for data_file in data_files[1:]:
             file_extension = os.path.splitext(data_file)[1].lower()
-            if ONLINE_FILE_FORMATS.get(file_extension) != loader_format:
+            if ONLINE_FILE_FORMATS.get(file_extension) != file_format:
                 raise ValueError("Online files must use one format: JSON/JSONL/Parquet/CSV/Arrow")
 
-        if loader_format is None:
+        if file_format is None:
             raise ValueError("Online files must use one format: JSON/JSONL/Parquet/CSV/Arrow")
 
-        return data_files, loader_format
+        return data_files, file_format
 
     @staticmethod
     def parse_split_percentages(split: Any) -> tuple[int, int, int]:
@@ -415,6 +405,7 @@ class _OnlineLeafSourceLoader:
 
         if sum(percentages) != 100:
             raise ValueError("Online split percentages must sum to 100")
+
         if any(percentage < 0 for percentage in percentages):
             raise ValueError("Online split percentages must be non-negative")
 

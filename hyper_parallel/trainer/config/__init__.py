@@ -30,6 +30,7 @@ __all__ = [
     "CompileConfig",
     "DataLoaderConfig",
     "DatasetConfig",
+    "LoaderConfig",
     "DebugConfig",
     "FSDP2Config",
     "MemoryConfig",
@@ -57,6 +58,7 @@ from hyper_parallel.components.checkpoint.config import CheckpointingConfig
 from hyper_parallel.trainer.config.data import (
     DataLoaderConfig,
     DatasetConfig,
+    LoaderConfig,
     ModelAssetsConfig,
 )
 from hyper_parallel.trainer.config.optimization import (

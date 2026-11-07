@@ -50,20 +50,20 @@ def _get_token_alignment_size(mesh_context: Any | None) -> int:
     return alignment_size
 
 
-def _validate_padding_config(alignment_size: int, pad_to_length: int | None) -> None:
+def _validate_padding_config(alignment_size: int, max_seq_len: int | None) -> None:
     """Check the shared text/Omni padding contract once at construction."""
     if alignment_size <= 0:
         raise ValueError("alignment_size must be positive")
 
-    if pad_to_length is None:
+    if max_seq_len is None:
         return
 
-    if isinstance(pad_to_length, bool) or not isinstance(pad_to_length, int) or pad_to_length <= 0:
-        raise ValueError("pad_to_length must be a positive integer or None")
+    if isinstance(max_seq_len, bool) or not isinstance(max_seq_len, int) or max_seq_len <= 0:
+        raise ValueError("max_seq_len must be a positive integer or None")
 
-    if pad_to_length % alignment_size:
+    if max_seq_len % alignment_size:
         raise ValueError(
-            f"pad_to_length={pad_to_length} must be divisible by TP * CP alignment_size={alignment_size}"
+            f"max_seq_len={max_seq_len} must be divisible by TP * CP alignment_size={alignment_size}"
         )
 
 
@@ -71,14 +71,14 @@ def _pad_batch_tokens(
         batch: Mapping[str, Any],
         alignment_size: int,
         token_pad_values: Mapping[str, int],
-        pad_to_length: int | None = None,
+        max_seq_len: int | None = None,
 ) -> dict[str, Any]:
     """Pad to a fixed length or alignment while preserving real boundaries and media.
 
     Example:
         Length 18, TP=4, CP=2: token fields grow to 24, labels pad with
         -100, and cu_seq_lens [0, 10, 18] becomes [0, 10, 18, 24].
-        With pad_to_length=32, the same boundaries become [0, 10, 18, 32].
+        With max_seq_len=32, the same boundaries become [0, 10, 18, 32].
     """
     padded_batch = dict(batch)
     input_ids = padded_batch["input_ids"]
@@ -86,16 +86,16 @@ def _pad_batch_tokens(
         raise ValueError("Batch alignment requires input_ids with shape [batch, sequence]")
 
     sequence_length = input_ids.shape[-1]
-    if pad_to_length is None:
+    if max_seq_len is None:
         pad_length = (-sequence_length) % alignment_size
     else:
-        if sequence_length > pad_to_length:
+        if sequence_length > max_seq_len:
             raise ValueError(
-                f"Packed sequence length {sequence_length} exceeds pad_to_length={pad_to_length}; "
-                "increase pad_to_length or reduce the packing token budget and sample lengths"
+                f"Packed sequence length {sequence_length} exceeds max_seq_len={max_seq_len}; "
+                "increase dataset.data_transform.max_seq_len or check the selected sample lengths"
             )
 
-        pad_length = pad_to_length - sequence_length
+        pad_length = max_seq_len - sequence_length
 
     if not pad_length:
         return padded_batch
@@ -132,11 +132,11 @@ class TextPackingCollator:
     """
 
     alignment_size: int = 1
-    pad_to_length: int | None = None
+    max_seq_len: int | None = None
 
     def __post_init__(self) -> None:
         """Validate fixed padding before any samples are read."""
-        _validate_padding_config(self.alignment_size, self.pad_to_length)
+        _validate_padding_config(self.alignment_size, self.max_seq_len)
 
     def __call__(self, model_samples: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
         """Pack samples into one ``[1, packed_length]`` forward-backward batch.
@@ -168,7 +168,7 @@ class TextPackingCollator:
         packed_batch["cu_seq_lens"] = cu_seq_lens
 
         aligned_batch = _pad_batch_tokens(
-            packed_batch, self.alignment_size, {"input_ids": 0, "labels": IGNORE_INDEX}, self.pad_to_length,
+            packed_batch, self.alignment_size, {"input_ids": 0, "labels": IGNORE_INDEX}, self.max_seq_len,
         )
         return aligned_batch
 
@@ -178,11 +178,11 @@ class OmniCollator:
     """Collate Omni samples, then pad token fields to a fixed length or TP × CP."""
 
     alignment_size: int = 1
-    pad_to_length: int | None = None
+    max_seq_len: int | None = None
 
     def __post_init__(self) -> None:
         """Validate fixed padding before any samples are read."""
-        _validate_padding_config(self.alignment_size, self.pad_to_length)
+        _validate_padding_config(self.alignment_size, self.max_seq_len)
 
     def __call__(self, model_samples: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
         """Stack token fields, concatenate media, and pad only the final batch.
@@ -211,7 +211,7 @@ class OmniCollator:
                 batch[field] = default_collate(values)
 
         token_pad_values = {field: OMNI_CP_PAD_VALUES.get(field, 0) for field in OMNI_CP_TOKEN_FIELDS}
-        aligned_batch = _pad_batch_tokens(batch, self.alignment_size, token_pad_values, self.pad_to_length)
+        aligned_batch = _pad_batch_tokens(batch, self.alignment_size, token_pad_values, self.max_seq_len)
         if logger.isEnabledFor(logging.DEBUG) and batch["input_ids"].device.type == "cpu":
             self._log_batch(aligned_batch, batch["input_ids"].shape[-1])
         return aligned_batch
@@ -334,35 +334,36 @@ def build_sft_collate_fn(mesh_context: Any | None = None) -> Callable[[list[Any]
 
 def build_omni_collate_fn(
         mesh_context: Any | None = None,
-        pad_to_length: int | None = None,
+        max_seq_len: int | None = None,
 ) -> OmniCollator:
     """Build Omni collation with optional fixed padding after packing.
 
     Args:
         mesh_context: Runtime TP/CP topology injected by the Trainer.
-        pad_to_length: Exact global token length, divisible by TP × CP. None
-            pads only for alignment. Longer packed sequences raise ValueError.
+        max_seq_len: Packed length injected by the Trainer as micro_batch_size
+            times the transform's max_seq_len; must be divisible by TP × CP.
+            None pads only for alignment in standalone use. Longer inputs raise ValueError.
 
     Returns:
         A collator that pads token lengths and preserves modality metadata.
 
     Raises:
-        ValueError: If pad_to_length is not a positive aligned integer or None.
+        ValueError: If max_seq_len is not a positive aligned integer or None.
     """
     alignment_size = _get_token_alignment_size(mesh_context)
-    collate_fn = OmniCollator(alignment_size=alignment_size, pad_to_length=pad_to_length)
+    collate_fn = OmniCollator(alignment_size=alignment_size, max_seq_len=max_seq_len)
     return collate_fn
 
 
 def build_online_text_collate_fn(
         mesh_context: Any | None = None,
-        pad_to_length: int | None = None,
+        max_seq_len: int | None = None,
 ) -> TextPackingCollator:
     """Build Online text collation shared by fixed N and dynamic K batching.
 
     Packing concatenates ``input_ids`` and ``labels`` and emits ``cu_seq_lens``.
-    Tail padding defaults to alignment from the runtime topology. A fixed
-    pad_to_length can instead specify the exact global packed token length.
+    The Trainer injects max_seq_len as the derived packed length. Standalone
+    calls without max_seq_len pad only for alignment from the runtime topology.
     The unified alignment size is ``cp_size * tp_size``, derived directly
     from the topology without a separate SP switch. Real sample boundaries
     remain unchanged and one synthetic final boundary covers the physical
@@ -370,16 +371,17 @@ def build_online_text_collate_fn(
 
     Args:
         mesh_context: Runtime TP/CP topology injected by the Trainer.
-        pad_to_length: Exact global token length, divisible by TP × CP. None
-            pads only for alignment. Longer packed sequences raise ValueError.
+        max_seq_len: Packed length injected by the Trainer as micro_batch_size
+            times the transform's max_seq_len; must be divisible by TP × CP.
+            None pads only for alignment in standalone use. Longer inputs raise ValueError.
 
     Returns:
         A collator producing one forward-backward batch.
 
     Raises:
-        ValueError: If pad_to_length is not a positive aligned integer or None.
+        ValueError: If max_seq_len is not a positive aligned integer or None.
     """
     alignment_size = _get_token_alignment_size(mesh_context)
-    collate_fn = TextPackingCollator(alignment_size=alignment_size, pad_to_length=pad_to_length)
+    collate_fn = TextPackingCollator(alignment_size=alignment_size, max_seq_len=max_seq_len)
 
     return collate_fn

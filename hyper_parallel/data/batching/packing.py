@@ -14,11 +14,13 @@
 # ============================================================================
 """Select and combine samples for multimodal packing."""
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-import torch
+import torch  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.data.constants import DEFAULT_FIELD_PACK_DIMS, PACKING_METADATA_FIELDS
 from hyper_parallel.data.dataset_logging import get_dataset_logger
@@ -38,7 +40,7 @@ class PackingSelector(ABC):
     def select_samples_to_pack(
             self,
             samples: Sequence[Mapping[str, Any]],
-            token_budget: int,
+            max_seq_len: int,
     ) -> Sequence[int]:
         """Return indices of candidates that form the next packed sequence."""
         raise NotImplementedError
@@ -62,7 +64,7 @@ class FirstFitPackingSelector(PackingSelector):
     def select_samples_to_pack(
             self,
             samples: Sequence[Mapping[str, Any]],
-            token_budget: int,
+            max_seq_len: int,
     ) -> Sequence[int]:
         """Select the next ordered first-fit group from the candidate buffer."""
         if not samples:
@@ -72,7 +74,7 @@ class FirstFitPackingSelector(PackingSelector):
         selected_cost = 0
         for sample_index, sample in enumerate(samples):
             sample_cost = self.get_sample_cost(sample)
-            sample_fits = selected_cost == 0 or selected_cost + sample_cost <= token_budget
+            sample_fits = selected_cost == 0 or selected_cost + sample_cost <= max_seq_len
             if sample_fits:
                 selected_indices.append(sample_index)
                 selected_cost += sample_cost

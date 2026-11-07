@@ -256,8 +256,8 @@ def build_gpt_dataset_config(
     Raises:
         ValueError: If a required build field is missing.
     """
-    # The source argument parser owns defaults and validation. This stage only
-    # renames fields where the Dataset implementation expects another name.
+    # Keep sequence length and split explicit; implementation options use the
+    # existing GPTDatasetConfig defaults when omitted from YAML.
     blend_per_split = [
         data_config.get("train_data_path"),
         data_config.get("valid_data_path"),
@@ -291,12 +291,8 @@ def build_gpt_dataset_config(
             allow_ambiguous_pad_tokens=data_config.get("allow_ambiguous_pad_tokens", False),
             dataset_margin=data_config.get("dataset_margin", 1.005),
             skip_data_check=data_config.get("skip_data_check", False),
-            low_level_dataset=resolve_dataset_type(data_config["low_level_dataset"]),
-            dataset_options=(
-                {key: value for key, value in data_config["low_level_dataset"].items() if key != "_target_"}
-                if isinstance(data_config["low_level_dataset"], Mapping) else {}
-            ),
-            simple_blend=data_config["simple_blend"],
+            is_dataset_from_mr=data_config.get("is_dataset_from_mr", False),
+            simple_blend=data_config.get("simple_blend", "no"),
         )
     except KeyError as error:
         raise ValueError(f"Missing indexed Dataset build option: {error.args[0]}") from error

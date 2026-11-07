@@ -20,7 +20,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from hyper_parallel.data.dataset_logging import get_dataset_logger
-from hyper_parallel.data.indexed.indexed_dataset import (
+from hyper_parallel.data.indexed.build_dataset import (
     build_indexed_dataset as _build_indexed_dataset,
 )
 from hyper_parallel.data.online import (
@@ -107,7 +107,7 @@ def build_online_text_mapping_dataset(
     training_seed = getattr(training_config, "seed", None)
     dataset_config["random_seed"] = 42 if training_seed is None else int(training_seed)
     train_valid_test_num_samples = None
-    if training_config is not None:
+    if training_config is not None and getattr(training_config, "epochs", None) is None:
         train_valid_test_num_samples = _get_train_valid_test_num_samples(training_config)
     sample_filter = transform.is_valid_sample
     source_dataset = build_online_mapping_source(
@@ -172,7 +172,6 @@ def build_indexed_text_dataset(
         data_config: Mapping[str, Any],
         data_path: str | Sequence[str] | None = None,
         tokenizer: Any = None,
-        train_valid_test_num_samples: Sequence[int] | None = None,
         dataloader_context: DataLoaderParallelContext | None = None,
         mesh_context: Any = None,
         training_config: Any = None,
@@ -183,7 +182,6 @@ def build_indexed_text_dataset(
         data_config: Indexed Dataset and split options.
         data_path: Indexed prefix, directory, or ordered paths.
         tokenizer: Tokenizer providing vocabulary and EOD metadata.
-        train_valid_test_num_samples: Optional explicit split sizes.
         dataloader_context: Optional explicit DataLoader ownership context.
         mesh_context: Runtime mesh used to derive DataLoader ownership.
         training_config: Training plan used to derive split sizes and seed.
@@ -194,6 +192,9 @@ def build_indexed_text_dataset(
     Raises:
         ValueError: If required path or training information is missing.
     """
+    if getattr(training_config, "epochs", None) is not None:
+        raise ValueError("Indexed training requires train_iters/train_samples; epochs/max_step are Online-only")
+
     dataset_config = dict(data_config)
     dataset_config.setdefault("distributed_walk", True)
     training_seed = getattr(training_config, "seed", None)
@@ -204,8 +205,7 @@ def build_indexed_text_dataset(
     if data_path is None and not bool(dataset_config.get("mock_data", False)):
         raise ValueError("Indexed Dataset requires data_path")
 
-    if train_valid_test_num_samples is None:
-        train_valid_test_num_samples = _get_train_valid_test_num_samples(training_config)
+    train_valid_test_num_samples = _get_train_valid_test_num_samples(training_config)
 
     if dataloader_context is None:
         dataloader_context = _build_dataloader_context(mesh_context, dataset_config)

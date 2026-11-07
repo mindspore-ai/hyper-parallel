@@ -14,6 +14,8 @@
 # ============================================================================
 """Candidate buffering and finalization used by dynamic DataLoaders."""
 
+from __future__ import annotations
+
 import operator
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
@@ -31,7 +33,7 @@ from hyper_parallel.data.batching.packing import (
 class BaseCandidateBuffer(ABC):
     """Store candidates and expose the next selected sample group."""
 
-    token_budget: int
+    max_seq_len: int
     min_buffered_samples: int
     buffer: list[tuple[Mapping[str, Any], int]] = field(default_factory=list, init=False)
     buffer_output_indices: list[Any | None] = field(default_factory=list, init=False)
@@ -39,8 +41,8 @@ class BaseCandidateBuffer(ABC):
 
     def __post_init__(self) -> None:
         """Validate the candidate-buffer limits."""
-        if self.token_budget <= 0:
-            raise ValueError("token_budget must be positive")
+        if self.max_seq_len <= 0:
+            raise ValueError("max_seq_len must be positive")
 
         if self.min_buffered_samples <= 0:
             raise ValueError("min_buffered_samples must be positive")
@@ -60,7 +62,7 @@ class BaseCandidateBuffer(ABC):
     def is_ready_for_micro_batch(self) -> bool:
         """Return whether both configured candidate limits are reached."""
         enough_samples = len(self.buffer) >= self.min_buffered_samples
-        enough_tokens = self.buffer_token_count >= self.token_budget
+        enough_tokens = self.buffer_token_count >= self.max_seq_len
         is_ready = enough_samples and enough_tokens
         return is_ready
 
@@ -101,7 +103,7 @@ class TokenBudgetCandidateBuffer(BaseCandidateBuffer):
                 self.buffer,
                 self.buffer_output_indices,
         ):
-            sample_fits = selected_token_count == 0 or selected_token_count + sample_length <= self.token_budget
+            sample_fits = selected_token_count == 0 or selected_token_count + sample_length <= self.max_seq_len
             if sample_fits:
                 selected_samples.append(model_sample)
                 selected_token_count += sample_length
@@ -138,7 +140,7 @@ class PackingCandidateBuffer(BaseCandidateBuffer):
 
         selected_indices = self.packing_selector.select_samples_to_pack(
             candidates,
-            self.token_budget,
+            self.max_seq_len,
         )
         resolved_indices = self._validate_selected_indices(selected_indices)
         selected_index_set = set(resolved_indices)
@@ -170,6 +172,7 @@ class PackingCandidateBuffer(BaseCandidateBuffer):
         for selected_index in selected_indices:
             if isinstance(selected_index, bool):
                 raise TypeError("PackingSelector indices must be integers")
+
             try:
                 resolved_index = operator.index(selected_index)
             except TypeError as exc:
@@ -177,10 +180,12 @@ class PackingCandidateBuffer(BaseCandidateBuffer):
 
             if resolved_index < 0 or resolved_index >= len(self.buffer):
                 raise IndexError("PackingSelector returned an out-of-range candidate index")
+
             resolved_indices.append(resolved_index)
 
         if not resolved_indices:
             raise ValueError("PackingSelector must select at least one candidate")
+
         if len(set(resolved_indices)) != len(resolved_indices):
             raise ValueError("PackingSelector must not select a candidate more than once")
 
@@ -266,6 +271,12 @@ class MappingReplayDataset:
             source_item = self.dataset[resolved_index]
 
         return source_item
+
+    def set_epoch(self, epoch: int) -> None:
+        """Keep indexed replay on the same epoch as the wrapped Dataset."""
+        epoch_setter = getattr(self.dataset, "set_epoch", None)
+        if callable(epoch_setter):
+            epoch_setter(epoch)
 
 
 class IndexReplayCheckpoint:
@@ -371,7 +382,7 @@ class _BatchPipeline(ABC):
     def build_candidate_buffer(
             self,
             *,
-            token_budget: int,
+            max_seq_len: int,
             min_buffered_samples: int,
     ) -> BaseCandidateBuffer:
         """Build the candidate buffer used by this pipeline."""
@@ -396,12 +407,12 @@ class _TokenBatchPipeline(_BatchPipeline):
     def build_candidate_buffer(
             self,
             *,
-            token_budget: int,
+            max_seq_len: int,
             min_buffered_samples: int,
     ) -> BaseCandidateBuffer:
         """Build the token-budget candidate buffer."""
         candidate_buffer = TokenBudgetCandidateBuffer(
-            token_budget=token_budget,
+            max_seq_len=max_seq_len,
             min_buffered_samples=min_buffered_samples,
         )
         return candidate_buffer
@@ -431,15 +442,12 @@ class _OmniPackingPipeline(_BatchPipeline):
         if not callable(selected_sample_encoder) or not callable(batch_encoder):
             raise TypeError("OmniPackingLoader requires encode_selected_sample() and encode_batch()")
 
-        # Hook—a criterion used to select data objects; this criterion can be extended to support load balancing.
         selector = getattr(dataset, "packing_selector", None)
         if selector is None:
             selector = FirstFitPackingSelector()
         if not isinstance(selector, PackingSelector):
-            raise TypeError("dataset.packing_selector must implement PackingSelector")
+            raise TypeError("packing_selector must implement PackingSelector")
 
-        # This is a hook function used to package data into different fields;
-        # you need to verify that the keyword mappings match.
         packer = getattr(dataset, "sample_packer", None)
         if packer is None:
             packer = SamplePacker()
@@ -457,12 +465,12 @@ class _OmniPackingPipeline(_BatchPipeline):
     def build_candidate_buffer(
             self,
             *,
-            token_budget: int,
+            max_seq_len: int,
             min_buffered_samples: int,
     ) -> BaseCandidateBuffer:
         """Build candidate selection around the composed selector."""
         candidate_buffer = PackingCandidateBuffer(
-            token_budget=token_budget,
+            max_seq_len=max_seq_len,
             min_buffered_samples=min_buffered_samples,
             packing_selector=self.selector,
         )
@@ -478,6 +486,7 @@ class _OmniPackingPipeline(_BatchPipeline):
             encoded_sample = self.selected_sample_encoder(selected_sample)
             if not isinstance(encoded_sample, Mapping):
                 raise TypeError("postencode_sample must return a mapping")
+
             encoded_samples.append(encoded_sample)
 
         packed_sample = self.packer.pack_selected_samples(encoded_samples)

@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
-from typing import Any
+from typing import Any, Literal
 
 import torch.distributed as dist
 
@@ -165,11 +165,24 @@ def split_iterable_dataset_by_dp(
     return split_dataset
 
 
+def _synchronize_dataset_build_errors(local_error: Exception | None) -> None:
+    """Make writer and reader failures visible to every participating rank."""
+    error_message = None
+    if local_error is not None:
+        error_message = f"{type(local_error).__name__}: {local_error}"
+    errors = [None] * dist.get_world_size()
+    dist.all_gather_object(errors, error_message)
+    failures = [f"rank {rank}: {error}" for rank, error in enumerate(errors) if error is not None]
+    if failures:
+        raise ValueError("Dataset construction failed: " + "; ".join(failures)) from local_error
+
+
 def build_dataset_for_dataloader(
         dataset_factory: Callable[[], Any],
         dataloader_context: DataLoaderParallelContext,
         *,
         barrier_needed: bool,
+        mode: Literal["production", "debug"] = "production",
 ) -> Any | None:
     """Build a Dataset on the ranks that own DataLoader input.
 
@@ -177,6 +190,8 @@ def build_dataset_for_dataloader(
         dataset_factory: Deferred Dataset construction callable.
         dataloader_context: DataLoader ownership and cache synchronization policy.
         barrier_needed: Whether cache writers and readers must synchronize.
+        mode: Production synchronizes construction errors when a cache barrier is
+            needed. Debug propagates local errors without error collectives.
 
     Returns:
         Dataset used by the local DataLoader, or ``None`` on non-owning ranks.
@@ -185,11 +200,15 @@ def build_dataset_for_dataloader(
         With shared storage, the cache-builder rank calls ``dataset_factory``
         first. Other DataLoader ranks wait for the cache and then reopen it.
     """
+    if mode not in ("production", "debug"):
+        raise ValueError(f"Unsupported dataset mode: {mode}")
+
     if not dataloader_context.distributed_enabled:
         local_dataset = dataset_factory()
         return local_dataset
 
     local_dataset = None
+    synchronize_errors = barrier_needed and mode == "production"
     builds_cache_first = dataloader_context.build_cache_on_rank()
     owns_dataset = dataloader_context.data_index_cache or dataloader_context.build_on_rank()
     logger.debug(
@@ -199,16 +218,29 @@ def build_dataset_for_dataloader(
         enabled=owns_dataset,
     )
 
-    if builds_cache_first and owns_dataset:
-        local_dataset = dataset_factory()
+    try:
+        # All ranks participate in both phases, including ranks without a Dataset.
+        # Readers only open the index after the writer has published its cache.
+        for writer_phase in (True, False):
+            local_error = None
+            if owns_dataset and builds_cache_first == writer_phase:
+                try:
+                    local_dataset = dataset_factory()
+                except Exception as error:  # Synchronize failures; never treat them as skipped samples.
+                    if not synchronize_errors:
+                        raise
 
-    if barrier_needed:
-        try:
-            dataloader_context.barrier()
-        finally:
+                    local_error = error
+
+            if synchronize_errors:
+                _synchronize_dataset_build_errors(local_error)
+
+            if writer_phase and barrier_needed:
+                dataloader_context.barrier()
+    finally:
+        if barrier_needed:
             # Dataset-specific barriers may own a temporary auxiliary group.
-            # Close it after all ranks have crossed the barrier so repeated
-            # dataset builds do not retain process groups and file handles.
+            # Release it even if construction fails before reaching the barrier.
             barrier = dataloader_context.barrier
             barrier_owner = getattr(barrier, "__self__", None)
             if barrier_owner is None and hasattr(barrier, "close"):
@@ -216,8 +248,5 @@ def build_dataset_for_dataloader(
             close = getattr(barrier_owner, "close", None)
             if close is not None:
                 close()
-
-    if not builds_cache_first and owns_dataset:
-        local_dataset = dataset_factory()
 
     return local_dataset

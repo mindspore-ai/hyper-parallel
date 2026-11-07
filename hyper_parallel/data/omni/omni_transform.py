@@ -135,6 +135,16 @@ class OmniDataTransform:
         self.max_seq_len = max_seq_len
         self.processor = processor
 
+    @property
+    def unique_identifiers(self) -> Mapping[str, Any] | None:
+        """Identify source-filtering behavior for persistent valid-record caches.
+
+        Transforms enabling filtered indexes must include a validator version and
+        every setting that changes sample validity. Encoding-only options need
+        not invalidate the index. None keeps the legacy source-loading behavior.
+        """
+        return None
+
     def is_valid_sample(self, sample: Mapping[str, Any]) -> bool:
         """Return whether one source record contains conversation messages."""
         messages = sample.get("messages")

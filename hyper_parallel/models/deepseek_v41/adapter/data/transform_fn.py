@@ -18,10 +18,18 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
+import ssl
+import stat
 from collections.abc import Mapping, Sequence
+from http.client import HTTPException
+from tempfile import TemporaryDirectory
 from typing import Any
+from urllib.error import URLError
+from urllib.request import urlopen
 
 import torch  # pylint: disable=forbidden-backend-import
+from PIL import Image
 
 from hyper_parallel.data.constants import IGNORE_INDEX, ONLINE_SOURCE_PATH_KEY
 from hyper_parallel.data.dataset_logging import get_dataset_logger
@@ -32,6 +40,7 @@ from hyper_parallel.data.online.format import (
     normalize_chat_media_fields,
     resolve_media_path,
 )
+from hyper_parallel.models.deepseek_v41.adapter.data.encoding import process_image_messages
 from hyper_parallel.models.deepseek_v41.adapter.data.image_processor import (
     IMAGE,
     IMAGE_NEW_LINE,
@@ -95,6 +104,64 @@ class _DeepseekV41OmniTransformBase(OmniDataTransform):
         for field, pad_value in (("input_ids", pad_token_id), ("labels", IGNORE_INDEX), ("token_types", TEXT)):
             sample[field] = torch.nn.functional.pad(sample[field], (0, pad_length), value=pad_value)
         return sample
+
+    @staticmethod
+    def _validate_local_image(
+            sample: Mapping[str, Any],
+            image_record: Mapping[str, Any],
+    ) -> None:
+        """Verify and decode one local image; report data errors without choosing a mode.
+
+        Example:
+            source=/data/train.jsonl + url=images/a.jpg -> /data/images/a.jpg.
+            Valid image -> no exception; missing/empty/corrupt image -> ValueError.
+        """
+        if image_record.get("data") is not None:
+            raise ValueError("Image validation requires local file paths, not embedded image data")
+
+        image_path = image_record.get("url")
+        image_source = image_record.get("source")
+        if isinstance(image_source, Mapping):
+            if image_source.get("data") is not None:
+                raise ValueError("Image validation requires local file paths, not embedded image data")
+
+            image_path = image_source.get("url") or image_path
+        if not isinstance(image_path, str) or not image_path.strip():
+            raise ValueError("Image reference must be a nonempty local file path")
+
+        if image_path.lower().startswith(("http://", "https://", "data:")):
+            raise ValueError(f"Image must be downloaded before source indexing: {image_path}")
+
+        source_path = sample.get(ONLINE_SOURCE_PATH_KEY)
+        source_directory = os.path.dirname(os.path.abspath(source_path)) if source_path else os.getcwd()
+        image_path = resolve_media_path(image_path, source_directory)
+        try:
+            file_stat = os.stat(image_path)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise ValueError(f"Image path is not a regular file: {image_path}")
+
+            if file_stat.st_size == 0:
+                raise ValueError(f"Image file is empty: {image_path}")
+
+            with open(image_path, "rb") as image_file:
+                with Image.open(image_file) as image:
+                    image.verify()
+                # Verification does not decode pixels; reopen the same file to check the payload.
+                image_file.seek(0)
+                with Image.open(image_file) as image:
+                    image.load()
+        except (FileNotFoundError, NotADirectoryError) as error:
+            raise ValueError(f"Image file not found: {image_path}") from error
+
+        except OSError as error:
+            # Pillow reports invalid streams without errno; storage errors must abort the build.
+            if error.errno is not None:
+                raise
+
+            raise ValueError(f"Image cannot be decoded: {image_path}: {error}") from error
+
+        except (SyntaxError, ValueError, Image.DecompressionBombError) as error:
+            raise ValueError(f"Image verification failed: {image_path}: {error}") from error
 
     def encode_batch(self, batch: Mapping[str, Any]) -> dict[str, Any]:
         """Convert packing metadata into the V4.1 model batch contract.
@@ -228,19 +295,34 @@ class DeepseekV41SFTTransform(_DeepseekV41OmniTransformBase):
 
         self.sample_format = sample_format
 
+    @property
+    def unique_identifiers(self) -> Mapping[str, Any]:
+        """Identify the conversation schema and local-image validation rules."""
+        filter_identifiers = {
+            "class": f"{type(self).__module__}.{type(self).__qualname__}",
+            "version": 1,
+            "sample_format": self.sample_format,
+        }
+        return filter_identifiers
+
     def is_valid_sample(self, sample: Mapping[str, Any]) -> bool:
-        """Filter the configured messages or ShareGPT conversations column.
+        """Validate the configured conversation and every image without rendering a prompt."""
+        try:
+            if self.sample_format == "sharegpt":
+                messages = convert_sharegpt_to_messages(sample)
+            else:
+                messages = normalize_chat_media_fields(sample)
+            if len(messages) < 2 or messages[-1].get("role") != "assistant":
+                raise ValueError("DeepSeek-V4.1 SFT sample must end with a final assistant message")
 
-        Args:
-            sample: Raw conversation record in the configured format.
-        """
-        message_key = "conversations" if self.sample_format == "sharegpt" else "messages"
-        messages = sample.get(message_key)
-        if not isinstance(messages, list):
-            raise ValueError(f"DeepSeek-V4.1 {self.sample_format} sample requires a {message_key} list")
+            _, image_records = process_image_messages(messages)
+        except ValueError as error:
+            raise ValueError(f"Invalid {self.sample_format} sample: {error}") from error
 
-        valid_sample = bool(messages)
-        return valid_sample
+        for image_record in image_records:
+            self._validate_local_image(sample, image_record)
+
+        return True
 
     def encode_sample(self, sample: dict[str, Any]) -> dict[str, Any] | None:
         """Encode native image conversations and supervise the final assistant reply.
@@ -318,6 +400,7 @@ class DeepseekV41PretrainTransform(_DeepseekV41OmniTransformBase):
             self, processor: DeepseekV41Processor, *, max_seq_len: int = 4096,
             sample_format: str = "image_caption",
             sample_alignment_size: int = 1,
+            download_verify_ssl: bool = True,
     ) -> None:
         """Select native image-caption or interleaved pretraining explicitly."""
         super().__init__(
@@ -326,28 +409,108 @@ class DeepseekV41PretrainTransform(_DeepseekV41OmniTransformBase):
         if sample_format not in ("image_caption", "interleaved"):
             raise ValueError(f"Unsupported DeepSeek-V4.1 pretrain sample format: {sample_format!r}")
 
+        if not isinstance(download_verify_ssl, bool):
+            raise ValueError("download_verify_ssl must be a boolean")
+
         self.sample_format = sample_format
+        self.download_verify_ssl = download_verify_ssl
+
+    @property
+    def unique_identifiers(self) -> Mapping[str, Any]:
+        """Identify the pretraining schema and download validation settings."""
+        filter_identifiers = {
+            "class": f"{type(self).__module__}.{type(self).__qualname__}",
+            "version": 1,
+            "sample_format": self.sample_format,
+            "download_verify_ssl": self.download_verify_ssl,
+        }
+        return filter_identifiers
+
+    def _download_image_caption(self, sample: Mapping[str, Any]) -> None:
+        """Recover an invalid local caption image from its top-level HTTP(S) URL.
+
+        Example:
+            image=images/a.jpg + url=https://host/a.jpg -> download temporary file
+            -> verify/decode -> atomically replace images/a.jpg.
+        """
+        image_path = sample.get("image")
+        if (not isinstance(image_path, str) or not image_path.strip()
+                or image_path.lower().startswith(("http://", "https://", "data:"))):
+            raise ValueError("Image-caption download requires a nonempty local image path")
+
+        remote_url = sample.get("url")
+        if not isinstance(remote_url, str) or not remote_url.lower().startswith(("http://", "https://")):
+            raise ValueError("Image-caption download requires an HTTP(S) url")
+
+        source_path = sample.get(ONLINE_SOURCE_PATH_KEY)
+        source_directory = os.path.dirname(os.path.abspath(source_path)) if source_path else os.getcwd()
+        image_path = resolve_media_path(image_path, source_directory)
+        if os.path.exists(image_path) and not stat.S_ISREG(os.stat(image_path).st_mode):
+            raise ValueError(f"Image path is not a regular file: {image_path}")
+
+        image_directory = os.path.dirname(image_path)
+        os.makedirs(image_directory, exist_ok=True)
+        context = ssl.create_default_context()
+        if not self.download_verify_ssl:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+
+        with TemporaryDirectory(dir=image_directory, prefix=".image-") as temporary_directory:
+            temporary_path = os.path.join(temporary_directory, "download")
+            try:
+                with open(temporary_path, "wb") as file, urlopen(remote_url, timeout=30, context=context) as response:
+                    shutil.copyfileobj(response, file)
+            except (URLError, TimeoutError, ConnectionError, HTTPException, ssl.SSLError) as error:
+                raise ValueError(f"Image download failed: {remote_url}: {error}") from error
+
+            self._validate_local_image(sample, {"url": temporary_path})
+            os.replace(temporary_path, image_path)
 
     def is_valid_sample(self, sample: Mapping[str, Any]) -> bool:
-        """Filter the explicitly selected image-caption or interleaved record schema.
-
-        Args:
-            sample: Raw image-caption or interleaved record.
-        """
+        """Validate the selected pretraining schema and all required local images."""
         if self.sample_format == "interleaved":
-            texts, images = sample.get("texts"), sample.get("images")
-            if not isinstance(texts, list) or not isinstance(images, list):
-                raise ValueError("Interleaved pretraining requires texts/images lists")
+            try:
+                blocks = convert_interleaved_to_content(sample)
+            except ValueError as error:
+                raise ValueError(f"Invalid interleaved sample: {error}") from error
 
-            valid_sample = bool(texts and images)
-            return valid_sample
+            if not any(block["type"] == "text" and block["text"].strip() for block in blocks):
+                raise ValueError("Interleaved pretraining requires nonempty text")
 
-        image, caption = sample.get("image"), sample.get("caption")
-        if not isinstance(image, str) or not isinstance(caption, str):
-            raise ValueError("Image-caption sample requires image and caption strings")
+        else:
+            image, caption = sample.get("image"), sample.get("caption")
+            if not isinstance(caption, str) or not caption.strip():
+                raise ValueError("Image-caption sample requires a nonempty caption string")
 
-        valid_sample = bool(image.strip() and caption.strip())
-        return valid_sample
+            blocks = [{"type": "image", "url": image}]
+
+        for block in blocks:
+            if block["type"] == "image":
+                try:
+                    self._validate_local_image(sample, block)
+                except ValueError as validation_error:
+                    if self.sample_format != "image_caption":
+                        raise ValueError(
+                            f"URL recovery requires image_caption; got {self.sample_format!r}. "
+                            f"Image validation failed: {validation_error}"
+                        ) from validation_error
+
+                    remote_url = sample.get("url")
+                    if not isinstance(remote_url, str) or not remote_url.strip():
+                        raise ValueError(
+                            "Cannot recover local image: sample.url must be a nonempty string. "
+                            f"Image validation failed: {validation_error}"
+                        ) from validation_error
+
+                    if not remote_url.lower().startswith(("http://", "https://")):
+                        raise ValueError(
+                            "Cannot recover local image: sample.url must use HTTP or HTTPS. "
+                            f"Image validation failed: {validation_error}"
+                        ) from validation_error
+
+                    self._download_image_caption(sample)
+
+        return True
 
     def encode_sample(self, sample: dict[str, Any]) -> dict[str, Any] | None:
         """Encode image-caption or interleaved pretraining without adding chat roles.
@@ -361,7 +524,8 @@ class DeepseekV41PretrainTransform(_DeepseekV41OmniTransformBase):
                                 "images": [None, "cat.jpg", None]}
             Output: input_ids = [BOS, text/image spans in source order, EOS].
             Labels mask BOS and images, and supervise text plus EOS.
-            Optional image-caption url can recover an unreadable local image.
+            Source validation may recover a local image from the top-level url.
+            Encoding reads that local image and does not retry downloads.
         """
         if self.sample_format == "interleaved":
             blocks = convert_interleaved_to_content(sample)
@@ -396,16 +560,7 @@ class DeepseekV41PretrainTransform(_DeepseekV41OmniTransformBase):
                 token_type_ids.extend([TEXT] * len(text_ids))
                 continue
             image_reference = block["url"]
-            try:
-                image_input = prepare_image_input({"url": image_reference}, self.processor, start=len(token_ids))
-            except OSError as exc:
-                original_url = sample.get("url") if self.sample_format == "image_caption" else None
-                if not isinstance(original_url, str) or not original_url.startswith(("http://", "https://")):
-                    raise
-
-                logger.warning("Cannot load offline image %s; falling back to %s: %s",
-                               image_reference, original_url, exc)
-                image_input = prepare_image_input({"url": original_url}, self.processor, start=len(token_ids))
+            image_input = prepare_image_input({"url": image_reference}, self.processor, start=len(token_ids))
             image_inputs.append(image_input)
             token_ids.extend([self.processor.image_token_id] * image_input.types.numel())
             token_type_ids.extend(image_input.types.tolist())
@@ -440,6 +595,7 @@ def build_deepseek_v41_omni_transform(
         drop_thinking: bool = True,
         sample_format: str | None = None,
         sample_alignment_size: int = 1,
+        download_verify_ssl: bool = True,
 ) -> OmniDataTransform:
     """Select the native transform using the explicitly configured dataset.training_mode.
 
@@ -453,9 +609,10 @@ def build_deepseek_v41_omni_transform(
         sample_format: messages/openai/hf/sharegpt for SFT, image_caption/interleaved for pretrain.
             None retains the existing messages (SFT) or image_caption (pretrain) default.
         sample_alignment_size: Pad each sample before packing to this multiple, with ignored labels.
-            Defaults to 1: ordinary TopK supports natural document lengths without sample padding.
-            Explicit candidate-pool configurations still require compression-aligned samples.
-            Samples exceeding max_seq_len after padding are skipped.
+            Use the least common multiple of positive CSA compression ratios (2 for CSA2).
+            Defaults to 1 to preserve unpadded samples. Samples exceeding max_seq_len after padding are skipped.
+        download_verify_ssl: Verify HTTPS certificates when recovering an image-caption image from its url.
+            False disables certificate and hostname checks for that download request only.
 
     Returns:
         SFTTransform for final-reply supervision or PretrainTransform for image-caption/interleaved
@@ -470,6 +627,7 @@ def build_deepseek_v41_omni_transform(
             max_seq_len=max_seq_len,
             sample_format="image_caption" if sample_format is None else sample_format,
             sample_alignment_size=sample_alignment_size,
+            download_verify_ssl=download_verify_ssl,
         )
     elif training_mode == "sft":
         data_transform = DeepseekV41SFTTransform(

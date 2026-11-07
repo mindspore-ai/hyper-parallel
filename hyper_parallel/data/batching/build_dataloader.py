@@ -19,6 +19,7 @@ from __future__ import annotations
 import copy
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from itertools import islice
 from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
@@ -37,6 +38,25 @@ from hyper_parallel.data.dataset_logging import get_dataset_logger
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
 
 logger = get_dataset_logger(__name__)
+
+
+def calculate_packed_seq_len(micro_batch_size: int, max_seq_len: int) -> int:
+    """Derive the shared packing and padding limit from one source length.
+
+    Args:
+        micro_batch_size: Number of sequence-length units per rank-local batch.
+        max_seq_len: Maximum length configured on the sample transform.
+
+    Returns:
+        Maximum packed length used by both selection and collation.
+
+    Raises:
+        ValueError: If either input is not a positive integer.
+    """
+    for name, value in (("micro_batch_size", micro_batch_size), ("max_seq_len", max_seq_len)):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    return micro_batch_size * max_seq_len
 
 
 def calculate_num_micro_batches(
@@ -86,6 +106,26 @@ def _is_iterable_dataset(dataset: Any) -> bool:
     return is_iterable
 
 
+def _resolve_dp_geometry(
+        batch_sampler: Any, dp_world_size: int | None, dp_rank: int | None,
+) -> tuple[int, int]:
+    """Resolve source lanes and reject a sampler with inconsistent DP ownership."""
+    resolved_size = getattr(batch_sampler, "dp_world_size", 1) if dp_world_size is None else dp_world_size
+    if isinstance(resolved_size, bool) or not isinstance(resolved_size, int) or resolved_size <= 0:
+        raise ValueError("dp_world_size must be a positive integer")
+    if getattr(batch_sampler, "dp_world_size", resolved_size) != resolved_size:
+        raise ValueError("batch_sampler.dp_world_size must match dp_world_size")
+
+    sampler_rank = getattr(batch_sampler, "dp_rank", 0)
+    resolved_rank = sampler_rank if dp_rank is None else dp_rank
+    if (isinstance(resolved_rank, bool) or not isinstance(resolved_rank, int)
+            or not 0 <= resolved_rank < resolved_size):
+        raise ValueError("dp_rank must be an integer within dp_world_size")
+    if batch_sampler is not None and sampler_rank != resolved_rank:
+        raise ValueError("batch_sampler.dp_rank must match dp_rank")
+    return resolved_size, resolved_rank
+
+
 def build_dataloader(
         dataloader_target: Any,
         *,
@@ -125,6 +165,31 @@ def build_dataloader(
     if dataloader_target is None:
         raise ValueError("dataloader_target must define a build target")
 
+    common_options = {
+        "dp_world_size": mesh_context.dp_size,
+        "dp_rank": mesh_context.dp_rank,
+        "seed": training_config.seed if training_config.seed is not None else default_seed,
+    }
+    sampler_options = {
+        **common_options,
+        "micro_batch_size": training_config.micro_batch_size,
+        "global_batch_size": training_config.global_batch_size,
+        "drop_last": getattr(dataloader_target, "drop_last", True),
+        "data_rearrange_map": getattr(dataloader_target, "data_rearrange_map", None),
+        "sampler_type": getattr(dataloader_target, "sampler_type", "single"),
+        "data_sharding": getattr(dataloader_target, "data_sharding", False),
+    }
+    loader_options = {
+        **common_options,
+        "batch_size": training_config.micro_batch_size,
+        "max_seq_len": max_seq_len,
+        "num_micro_batches": calculate_num_micro_batches(
+            training_config.global_batch_size, training_config.micro_batch_size, mesh_context.dp_size,
+        ),
+    }
+    train_repeat = getattr(dataloader_target, "repeat", True)
+    epoch_max_step = getattr(training_config, "max_step", None)
+
     dataloaders: list[Any | None] = [None] * len(datasets)
     batch_samplers: list[Any | None] = [None] * len(datasets)
 
@@ -137,26 +202,17 @@ def build_dataloader(
         if not _is_iterable_dataset(dataset):
             batch_sampler = build_dataset_batch_sampler(
                 total_samples=len(dataset),
-                micro_batch_size=training_config.micro_batch_size,
-                global_batch_size=training_config.global_batch_size,
-                dp_world_size=mesh_context.dp_size,
-                dp_rank=mesh_context.dp_rank,
-                drop_last=getattr(dataloader_target, "drop_last", True),
-                data_rearrange_map=getattr(dataloader_target, "data_rearrange_map", None),
-                sampler_type=getattr(dataloader_target, "sampler_type", "single"),
-                data_sharding=getattr(dataloader_target, "data_sharding", False),
-                seed=training_config.seed if training_config.seed is not None else default_seed,
+                **sampler_options,
             )
 
+        split_options = {**loader_options, "repeat": False, "max_step": None}
+        if split_name == "train":
+            split_options.update(repeat=train_repeat, max_step=epoch_max_step)
         dataloaders[split_index] = dataloader_target.build(
             dataset=dataset,
             collate_fn=collate_fn,
             batch_sampler=batch_sampler,
-            batch_size=training_config.micro_batch_size,
-            sampler_type=getattr(dataloader_target, "sampler_type", "single"),
-            dp_world_size=mesh_context.dp_size,
-            max_seq_len=max_seq_len,
-            seed=training_config.seed if training_config.seed is not None else default_seed,
+            **split_options,
         )
         logger.debug(
             "Built DataLoader split=%s, dataset=%s, batch_sampler=%s",
@@ -167,7 +223,9 @@ def build_dataloader(
         batch_samplers[split_index] = batch_sampler
 
     logger.debug("Finished building train/valid/test DataLoaders")
-    return tuple(dataloaders), tuple(batch_samplers)
+    dataloader_splits = tuple(dataloaders)
+    batch_sampler_splits = tuple(batch_samplers)
+    return dataloader_splits, batch_sampler_splits
 
 
 class FixedBatchDataLoader(StatefulDataLoader):
@@ -240,17 +298,22 @@ class _DynamicBatchLoader(ABC):
         batch_sampler: Optional mapping-style batch sampler.
         collate_fn: Final batch collator receiving the selected ModelSamples.
         batch_size: Configured micro batch size used to derive the token budget.
-        dp_world_size: Number of data-parallel source lanes.
+        dp_world_size: Number of data-parallel source lanes. Defaults to the sampler's
+            size, or one when reading a standalone source.
+        dp_rank: This source's data-parallel rank. Defaults to the sampler's rank.
+        num_micro_batches: Number of emitted micro-batches consumed by one optimizer step.
+        max_step: Optional optimizer-step limit per Online training epoch.
         save_by_idx: Whether to checkpoint buffer entries as output indices.
             Mapping Datasets default to true and iterable Datasets default to false.
-        max_seq_len: Maximum sample length used to derive the token budget.
-        token_budget: Optional candidate-selection budget. Values smaller than
-            one sample still emit that sample alone instead of truncating it.
+        max_seq_len: Maximum sample length. Packing uses batch_size * max_seq_len.
         min_buffered_samples: Minimum candidate samples buffered before batching.
         drop_last: Compatibility option retained from fixed DataLoader configuration.
-            Dynamic buffers are always drained when the source is exhausted.
+            Finite sources drain the dynamic buffer when the source is exhausted.
         sampler_type: Whether each Dataset epoch reuses one order or advances
             the deterministic cyclic order.
+        repeat: Whether to rewind the source at EOF before packing. The current
+            epoch's source order and unselected candidates are retained. Defaults
+            to true; the split builder disables it for validation and test.
         num_workers: Number of source DataLoader workers.
         seed: Source DataLoader random seed.
         pin_memory: Whether source samples use pinned host memory.
@@ -265,12 +328,15 @@ class _DynamicBatchLoader(ABC):
             *,
             batch_size: int,
             dp_world_size: int | None = None,
+            dp_rank: int | None = None,
+            num_micro_batches: int = 1,
+            max_step: int | None = None,
             save_by_idx: bool | None = None,
             max_seq_len: int | None,
-            token_budget: int | None = None,
             min_buffered_samples: int = 200,
             drop_last: bool = True,
             sampler_type: str = "single",
+            repeat: bool = True,
             num_workers: int = 0,
             seed: int = 1234,
             pin_memory: bool = False,
@@ -283,26 +349,38 @@ class _DynamicBatchLoader(ABC):
 
         if max_seq_len is None:
             raise ValueError(f"{type(self).__name__} requires data_transform.max_seq_len")
-        if token_budget is not None and token_budget <= 0:
-            raise ValueError("token_budget must be positive")
 
-        resolved_dp_world_size = dp_world_size
-        if resolved_dp_world_size <= 0:
-            raise ValueError("dp_world_size must be positive")
+        if not isinstance(repeat, bool):
+            raise ValueError("repeat must be a boolean")
 
-        sampler_dp_world_size = getattr(batch_sampler, "dp_world_size", resolved_dp_world_size)
-        if sampler_dp_world_size != resolved_dp_world_size:
-            raise ValueError("batch_sampler.dp_world_size must match dp_world_size")
+        for name, value in (("num_micro_batches", num_micro_batches), ("max_step", max_step)):
+            if name == "max_step" and value is None:
+                continue
+
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+
+        if max_step is not None and not repeat:
+            raise ValueError("Online max_step requires repeat=True")
+
+        resolved_dp_world_size, resolved_dp_rank = _resolve_dp_geometry(batch_sampler, dp_world_size, dp_rank)
 
         self.drop_last = drop_last
         self.batch_collate_fn = collate_fn
         self.dp_world_size = resolved_dp_world_size
+        self.dp_rank = resolved_dp_rank
+        self.num_micro_batches = num_micro_batches
+        self.max_step = max_step
+        self.repeat = repeat
+        self.epoch = 0
+        self.repeat_count = 0
+        self._micro_batches_yielded = 0
+        self._epoch_source_start_state: dict[str, Any] | None = None
 
-        # build_candidate_buffer
         self._batch_pipeline = self._build_batch_pipeline(dataset)
-        resolved_token_budget = batch_size * max_seq_len if token_budget is None else token_budget
+        packed_max_seq_len = calculate_packed_seq_len(batch_size, max_seq_len)
         self.candidate_buffer = self._batch_pipeline.build_candidate_buffer(
-            token_budget=resolved_token_budget,
+            max_seq_len=packed_max_seq_len,
             min_buffered_samples=min_buffered_samples,
         )
         if batch_sampler is not None:
@@ -310,7 +388,6 @@ class _DynamicBatchLoader(ABC):
             if callable(enable_source_resume):
                 enable_source_resume()
 
-        # Resuming training from a checkpoint
         self._buffer_checkpoint = self._build_buffer_checkpoint(dataset, save_by_idx)
 
         self.source_dataloader = FixedBatchDataLoader(
@@ -364,7 +441,12 @@ class _DynamicBatchLoader(ABC):
             self.candidate_buffer.buffer_token_count = 0
 
         source_iterator = iter(self.source_dataloader)
+        if self.repeat and self._epoch_source_start_state is None:
+            self._epoch_source_start_state = copy.deepcopy(self.source_dataloader.state_dict())
         batch_iterator = self._batch_data_generator(source_iterator)
+        if self.max_step is not None:
+            remaining_micro_batches = self.max_step * self.num_micro_batches - self._micro_batches_yielded
+            batch_iterator = islice(batch_iterator, remaining_micro_batches)
         self.resume_pending = False
 
         return batch_iterator
@@ -378,20 +460,49 @@ class _DynamicBatchLoader(ABC):
         while self.candidate_buffer.is_ready_for_micro_batch():
             yield self._build_micro_batch()
 
-        # Stage 2: Retain unselected candidates while incrementally reading source batches.
-        for source_samples in source_iterator:
-            for source_sample in source_samples:
-                self._buffer_checkpoint.put_source_item(source_sample, self.candidate_buffer)
+        # Stage 2: Repeat the source before packing so tail candidates can join
+        # the next pass. Restoring the initial cursor also retains worker state.
+        is_repeated_source_pass = False
+        while True:
+            pass_added_valid_samples = False
+            for source_samples in source_iterator:
+                buffered_sample_count_before = len(self.candidate_buffer.buffer)
+                for source_sample in source_samples:
+                    self._buffer_checkpoint.put_source_item(source_sample, self.candidate_buffer)
+                pass_added_valid_samples = (
+                    pass_added_valid_samples or len(self.candidate_buffer.buffer) > buffered_sample_count_before
+                )
 
-            while self.candidate_buffer.is_ready_for_micro_batch():
-                yield self._build_micro_batch()
+                while self.candidate_buffer.is_ready_for_micro_batch():
+                    yield self._build_micro_batch()
+
+            if not self.repeat:
+                break
+
+            # A resumed cursor can already be at EOF; only a complete restarted
+            # pass proves that this rank cannot produce a usable sample.
+            if is_repeated_source_pass and not pass_added_valid_samples:
+                raise ValueError("repeat=True requires at least one usable source sample on each DP rank")
+
+            self.repeat_count += 1
+            optimizer_step_in_epoch = self._micro_batches_yielded // self.num_micro_batches + 1
+            logger.warning(
+                "Online source exhausted; repeating: dp_rank=%d epoch=%d step=%d/%s repeat_count=%d "
+                "buffered_samples=%d buffered_tokens=%d",
+                self.dp_rank, self.epoch + 1, optimizer_step_in_epoch,
+                self.max_step if self.max_step is not None else "unbounded", self.repeat_count,
+                len(self.candidate_buffer.buffer), self.candidate_buffer.buffer_token_count,
+            )
+            self.source_dataloader.load_state_dict(copy.deepcopy(self._epoch_source_start_state))
+            source_iterator = iter(self.source_dataloader)
+            is_repeated_source_pass = True
 
         # Stage 3: At EOF, bypass readiness thresholds so no pulled candidate is lost.
         logger.debug(
             "Dynamic loader source exhausted: buffered_samples=%d buffered_tokens=%d "
-            "token_budget=%d drop_last=%s; draining remaining candidates",
+            "max_seq_len=%d drop_last=%s; draining remaining candidates",
             len(self.candidate_buffer.buffer), self.candidate_buffer.buffer_token_count,
-            self.candidate_buffer.token_budget, self.drop_last, enabled=True,
+            self.candidate_buffer.max_seq_len, self.drop_last, enabled=True,
         )
         while not self.candidate_buffer.empty():
             yield self._build_micro_batch()
@@ -406,22 +517,32 @@ class _DynamicBatchLoader(ABC):
         """Select, finalize, collate, and encode one micro-batch."""
         selected_samples = self.candidate_buffer.get_micro_batch()
         logger.debug(
-            "Dynamic loader selected: samples=%d token_budget=%d remaining_samples=%d remaining_tokens=%d",
-            len(selected_samples), self.candidate_buffer.token_budget, len(self.candidate_buffer.buffer),
+            "Dynamic loader selected: samples=%d max_seq_len=%d remaining_samples=%d remaining_tokens=%d",
+            len(selected_samples), self.candidate_buffer.max_seq_len, len(self.candidate_buffer.buffer),
             self.candidate_buffer.buffer_token_count, enabled=True,
         )
         finalized_samples = self._batch_pipeline.finalize_selected_samples(selected_samples)
 
-        # build batch data
         batch = self.batch_collate_fn(finalized_samples)
         encoded_batch = self._batch_pipeline.encode_batch(batch)
+        self._micro_batches_yielded += 1
         return encoded_batch
 
     def state_dict(self) -> dict[str, Any]:
-        """Capture the future source cursor and unconsumed dynamic buffer."""
+        """Capture the source cursor, repeat origin, and unconsumed dynamic buffer."""
+        source_state = self.source_dataloader.state_dict()
+        if self.repeat and self._epoch_source_start_state is None:
+            self._epoch_source_start_state = copy.deepcopy(source_state)
         state = {
             "dp_world_size": self.dp_world_size,
-            "source_dataloader": self.source_dataloader.state_dict(),
+            "source_dataloader": source_state,
+            "repeat": self.repeat,
+            "epoch": self.epoch,
+            "max_step": self.max_step,
+            "num_micro_batches": self.num_micro_batches,
+            "micro_batches_yielded": self._micro_batches_yielded,
+            "repeat_count": self.repeat_count,
+            "source_start_state": self._epoch_source_start_state,
             "save_by_idx": self._buffer_checkpoint.save_by_idx,
             "buffer": self._buffer_checkpoint.get_buffer_state(self.candidate_buffer),
             "buffer_token_count": self.candidate_buffer.buffer_token_count,
@@ -440,8 +561,37 @@ class _DynamicBatchLoader(ABC):
                 f"saved_dp_world_size={saved_dp_world_size}, current_dp_world_size={self.dp_world_size}"
             )
 
+        if checkpoint_state.get("repeat", False) != self.repeat:
+            raise ValueError("Online dataloader resume requires an unchanged repeat policy")
+
+        if checkpoint_state.get("max_step") != self.max_step:
+            raise ValueError("Online dataloader resume requires an unchanged max_step")
+
+        if checkpoint_state.get("num_micro_batches", self.num_micro_batches) != self.num_micro_batches:
+            raise ValueError("Online dataloader resume requires unchanged gradient accumulation")
+
+        micro_batches_yielded = checkpoint_state.get("micro_batches_yielded", 0)
+        repeat_count = checkpoint_state.get("repeat_count", 0)
+        saved_epoch = checkpoint_state.get("epoch", 0)
+        for name, value in (
+                ("micro_batches_yielded", micro_batches_yielded),
+                ("repeat_count", repeat_count),
+                ("epoch", saved_epoch),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"Checkpoint {name} must be a non-negative integer")
+
+        if self.max_step is not None and micro_batches_yielded > self.max_step * self.num_micro_batches:
+            raise ValueError("Checkpoint micro-batch progress exceeds the epoch's max_step")
+
+        source_start_state = checkpoint_state.get("source_start_state")
+        if self.repeat and not isinstance(source_start_state, dict):
+            raise ValueError("A repeating Online checkpoint must contain source_start_state")
+
         previous_save_by_idx = bool(checkpoint_state.get("save_by_idx", False))
         saved_buffer = checkpoint_state["buffer"]
+        # Buffered indices must be re-encoded with the checkpoint's Dataset epoch.
+        self.source_dataloader.set_epoch(saved_epoch)
         restored_buffer, restored_indices = self._buffer_checkpoint.restore_buffer(
             saved_buffer,
             previous_save_by_idx,
@@ -456,11 +606,21 @@ class _DynamicBatchLoader(ABC):
         self.candidate_buffer.buffer = restored_buffer
         self.candidate_buffer.buffer_output_indices = restored_indices
         self.candidate_buffer.buffer_token_count = restored_token_count
+        self._epoch_source_start_state = source_start_state
+        self.epoch = saved_epoch
+        self._micro_batches_yielded = micro_batches_yielded
+        self.repeat_count = repeat_count
         self.resume_pending = True
 
     def set_epoch(self, epoch: int) -> None:
-        """Forward epoch state to the stateful source DataLoader."""
+        """Start a new source order, preserving a checkpoint in the same epoch."""
         self.source_dataloader.set_epoch(epoch)
+        if epoch != self.epoch:
+            self._epoch_source_start_state = None
+            self.resume_pending = False
+            self.epoch = epoch
+            self.repeat_count = 0
+            self._micro_batches_yielded = 0
 
 
 class TokenBatchLoader(_DynamicBatchLoader):

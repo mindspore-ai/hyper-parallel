@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Literal
 
 from hyper_parallel.data.constants import ONLINE_SPLIT_COUNT
 from hyper_parallel.data.omni.omni_transform import (
@@ -29,6 +29,8 @@ from hyper_parallel.data.online import (
     OnlineDataPath,
     build_online_mapping_source,
 )
+from hyper_parallel.data.online.mapping_config import build_online_mapping_config
+from hyper_parallel.data.parallel.dataloader_parallel import create_dataloader_parallel_context
 
 
 def build_online_omni_mapping_dataset(
@@ -37,7 +39,9 @@ def build_online_omni_mapping_dataset(
     data_path: OnlineDataPath | None = None,
     transform: OmniDataTransform | None = None,
     training_config: Any = None,
-    sampler_type: str = "single",
+    mode: Literal["production", "debug"] = "production",
+    mesh_context: Any = None,
+    train_valid_test_num_samples: list[int] | tuple[int, int, int] | None = None,
 ) -> Any:
     """Build an Online Mapping source and apply its Omni transform lazily.
 
@@ -47,30 +51,39 @@ def build_online_omni_mapping_dataset(
             train/valid/test path mapping.
         transform: Omni sample transform selected by the Trainer.
         training_config: Training plan providing the random seed.
-        sampler_type: Mapping sampler policy controlling source-level shuffle.
+        mode: Abort on invalid samples in production, or filter them in debug.
+        mesh_context: Trainer mesh used to select cache writers and DataLoader ranks.
+        train_valid_test_num_samples: Optional train/validation/test counts of raw-record
+            accesses before packing. None uses each split's total valid-record count.
+            These counts are not inferred from training iterations or packed batch sizes.
 
     Returns:
         A transformed Online Mapping Dataset or train-valid-test tuple.
 
     Raises:
         TypeError: If transform is not an OmniDataTransform.
-        ValueError: If no Omni transform is configured.
+        ValueError: If no Omni transform is configured or split targets are invalid.
+
+    Example:
+        Input: valid source sizes [3, 7], weights [0.8, 0.2], targets [20, 0, 0].
+        Output: 20 training-record accesses: 16 from the first source, 4 from the second.
+        The first source repeats its 3 valid records through independently shuffled epochs.
+        Without targets, the same sources provide 10 training-record accesses.
     """
     if transform is None:
         raise ValueError("Online Omni Dataset requires a data_transform")
+
     if not isinstance(transform, OmniDataTransform):
         raise TypeError("Online Omni Dataset transform must be an OmniDataTransform")
 
-    dataset_config = dict(data_config)
-    training_seed = getattr(training_config, "seed", None)
-    dataset_config["random_seed"] = 42 if training_seed is None else int(training_seed)
-
-    sample_filter = transform.is_valid_sample
+    dataset_config = build_online_mapping_config(
+        data_config, transform=transform, training_config=training_config,
+        mode=mode, train_valid_test_num_samples=train_valid_test_num_samples,
+    )
     source_dataset = build_online_mapping_source(
         data_path=data_path,
         data_config=dataset_config,
-        sample_filter=sample_filter,
-        sampler_type=sampler_type,
+        dataloader_context=create_dataloader_parallel_context(mesh_context),
     )
     transformed_dataset = _OmniMappingDataset.apply(source_dataset, transform)
     return transformed_dataset
