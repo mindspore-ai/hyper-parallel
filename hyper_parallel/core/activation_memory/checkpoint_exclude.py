@@ -155,6 +155,7 @@ class _ExcludeCacheEntry:
     output: Any
     input_bindings: List[_InputBinding]
     rng_state: Optional[_RNGStateSnapshot] = None
+    tape: Any = None
 
 
 class _ExcludeCache:
@@ -180,6 +181,11 @@ class _ExcludeCache:
 
     def clear(self) -> None:
         """Release outputs not consumed because recomputation stopped early."""
+        for entries in self._entries.values():
+            for entry in entries:
+                if entry.tape is not None:
+                    entry.tape.release()
+                    entry.output = None
         self._entries.clear()
 
 

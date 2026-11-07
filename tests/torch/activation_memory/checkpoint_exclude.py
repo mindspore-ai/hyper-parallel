@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 from typing import Any, Dict, Optional
+from unittest.mock import patch
 
 import torch
 
@@ -188,16 +189,19 @@ class _SaveChainNet(torch.nn.Module):
 class _SwapSaveBlock(torch.nn.Module):
     """Produce replayable input saves plus independent internal activations."""
 
-    def __init__(self, calls: list[int], index: int) -> None:
+    def __init__(self, calls: list[int], index: int, randomized: bool = False) -> None:
         """Store the shared execution counters and this block's index."""
         super().__init__()
         self.calls = calls
         self.index = index
+        self.randomized = randomized
 
     def forward(self, tensor: torch.Tensor) -> torch.Tensor:
         """Save the input for replay and two internal tensors for backward."""
         self.calls[self.index] += 1
         replay_input = tensor.square()
+        if self.randomized:
+            replay_input = torch.nn.functional.dropout(replay_input, p=0.25, training=True)
         hidden = replay_input * 0.5 + 0.5
         return hidden.square() + replay_input.square()
 
@@ -213,11 +217,13 @@ class _SwapSaveStage(torch.nn.Module):
         swap: bool,
         group_swap: bool,
         cpu_pool: Optional[PinnedMemoryPool],
+        reentrant: bool = False,
     ) -> None:
         """Wrap one activation-producing block with checkpoint exclusion."""
         super().__init__()
+        self.reentrant = reentrant
         self.excluded = checkpoint_exclude_wrapper(
-            _SwapSaveBlock(calls, index),
+            _SwapSaveBlock(calls, index, randomized=reentrant),
             swap=swap,
             group_swap=group_swap,
             cpu_pool=cpu_pool,
@@ -225,7 +231,8 @@ class _SwapSaveStage(torch.nn.Module):
 
     def forward(self, tensor: torch.Tensor) -> torch.Tensor:
         """Run the excluded block inside this stage's checkpoint invocation."""
-        return self.excluded(tensor)
+        result = self.excluded(tensor)
+        return result * torch.rand_like(result) if self.reentrant else result
 
 
 class _SwapSaveChainNet(torch.nn.Module):
@@ -238,6 +245,7 @@ class _SwapSaveChainNet(torch.nn.Module):
         swap: bool,
         group_swap: bool = False,
         cpu_pool: Optional[PinnedMemoryPool] = None,
+        reentrant: bool = False,
     ) -> None:
         """Create four excluded blocks and wire their swap groups when requested."""
         super().__init__()
@@ -249,7 +257,9 @@ class _SwapSaveChainNet(torch.nn.Module):
                     swap=swap,
                     group_swap=group_swap,
                     cpu_pool=cpu_pool,
-                )
+                    reentrant=reentrant,
+                ),
+                use_reentrant=reentrant,
             )
             for index in range(_SWAP_LAYER_NUM)
         ])
@@ -412,7 +422,8 @@ def _remaining_swap_storage_count(layers: torch.nn.ModuleList) -> int:
     return count
 
 
-def _run_swap_save_chain(*, swap: bool, group_swap: bool, use_cpu_pool: bool) -> Dict[str, Any]:
+def _run_swap_save_chain(*, swap: bool, group_swap: bool, use_cpu_pool: bool,
+                         reentrant: bool = False) -> Dict[str, Any]:
     """Run one checkpoint-exclusion swap mode and report correctness and lifecycle metrics."""
     torch.use_deterministic_algorithms(True)
     torch.manual_seed(2029)
@@ -424,6 +435,7 @@ def _run_swap_save_chain(*, swap: bool, group_swap: bool, use_cpu_pool: bool) ->
         swap=swap,
         group_swap=group_swap,
         cpu_pool=cpu_pool,
+        reentrant=reentrant,
     )
     net = chain.npu()
     tensor = torch.randn(
@@ -433,8 +445,24 @@ def _run_swap_save_chain(*, swap: bool, group_swap: bool, use_cpu_pool: bool) ->
         dtype=torch.float32,
     ).mul_(0.1).requires_grad_()
 
-    loss = net(tensor)
+    saved = {"recipes": 0, "internal": 0, "swapped_internal": 0}
+    original_pack = _EXCLUDE_MODULE._pack_saved_tensor  # pylint: disable=protected-access
+
+    def record_pack(value: torch.Tensor) -> Any:
+        """Inspect the real saved-tensor hook without retaining its activation."""
+        packed = original_pack(value)
+        if isinstance(packed, _EXCLUDE_MODULE._RecomputedInputHandle):  # pylint: disable=protected-access
+            saved["recipes"] += 1
+        elif isinstance(packed, _EXCLUDE_MODULE._SavedTensorData):  # pylint: disable=protected-access
+            saved["internal"] += 1
+            if packed.swap_hooks is not None:
+                saved["swapped_internal"] += 1
+        return packed
+
+    with patch.object(_EXCLUDE_MODULE, "_pack_saved_tensor", side_effect=record_pack):
+        loss = net(tensor)
     _synchronize()
+    forward_bytes = int(torch.npu.memory_allocated())
     swap_metrics = _swap_group_metrics(chain.layers) if swap else {
         "registered_storage_count": 0,
         "offloaded_tensor_count": 0,
@@ -450,6 +478,9 @@ def _run_swap_save_chain(*, swap: bool, group_swap: bool, use_cpu_pool: bool) ->
         "pool_allocated_bytes": 0 if cpu_pool is None else cpu_pool.total_allocated,
         "pool_capacity_bytes": 0 if cpu_pool is None else cpu_pool.max_host_bytes,
         "remaining_storage_count": _remaining_swap_storage_count(chain.layers),
+        "forward_bytes": forward_bytes,
+        "rng_state": torch.npu.get_rng_state().cpu().tolist(),
+        **saved,
         **swap_metrics,
     }
 
@@ -574,6 +605,12 @@ def _run_mode(mode: str) -> Dict[str, Any]:
         return _run_swap_save_chain(swap=True, group_swap=False, use_cpu_pool=False)
     if mode == "group_swap_pool_save_chain":
         return _run_swap_save_chain(swap=True, group_swap=True, use_cpu_pool=True)
+    if mode == "reentrant_save_chain_baseline":
+        return _run_swap_save_chain(swap=False, group_swap=False, use_cpu_pool=False, reentrant=True)
+    if mode == "reentrant_swap_save_chain":
+        return _run_swap_save_chain(swap=True, group_swap=False, use_cpu_pool=False, reentrant=True)
+    if mode == "reentrant_group_swap_pool_save_chain":
+        return _run_swap_save_chain(swap=True, group_swap=True, use_cpu_pool=True, reentrant=True)
     if mode == "host_performance_comparison":
         return _run_host_performance_comparison()
     if mode == "long_stability":
@@ -604,6 +641,7 @@ def _run_mode_in_subprocess(mode: str) -> Dict[str, Any]:
     completed = subprocess.run(
         command,
         cwd=project_root,
+        env=os.environ.copy(),
         capture_output=True,
         text=True,
         check=False,
@@ -695,3 +733,19 @@ def test_checkpoint_exclude_save_chain_group_swap_cpu_pool() -> None:
     _assert_swap_save_chain_matches_baseline(baseline, pooled)
     assert pooled["group_managed_tensor_count"] > 0
     assert 0 < pooled["pool_allocated_bytes"] <= pooled["pool_capacity_bytes"]
+
+
+def test_reentrant_checkpoint_exclude_swap() -> None:
+    """Reentrant replay rebuilds input saves, swaps internal saves and clears prefetch groups."""
+    baseline = _run_mode_in_subprocess("reentrant_save_chain_baseline")
+    for mode in ("reentrant_swap_save_chain", "reentrant_group_swap_pool_save_chain"):
+        swapped = _run_mode_in_subprocess(mode)
+        _assert_swap_save_chain_matches_baseline(baseline, swapped)
+        assert swapped["rng_state"] == baseline["rng_state"]
+        assert baseline["recipes"] > 0 and swapped["recipes"] > 0
+        assert baseline["internal"] > 0 and swapped["internal"] > 0
+        assert baseline["swapped_internal"] == 0
+        assert swapped["swapped_internal"] > 0
+        if mode == "reentrant_group_swap_pool_save_chain":
+            assert swapped["group_managed_tensor_count"] > 0
+            assert 0 < swapped["pool_allocated_bytes"] <= swapped["pool_capacity_bytes"]
