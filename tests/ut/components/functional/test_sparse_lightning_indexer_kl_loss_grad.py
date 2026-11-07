@@ -14,6 +14,7 @@
 # ============================================================================
 """Numerical and interface regressions for compressed Indexer/KL fusion."""
 
+from itertools import product
 import sys
 import unittest
 from types import ModuleType
@@ -43,6 +44,7 @@ from hyper_parallel.components.modules.shared_compressed_dsa_attention import sh
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     compressed_causal_topk,
 )
+from tests.common.mark_utils import arg_mark
 
 
 def _scalar_reference(query, key, weights, attention_query, main_key, indices, sinks):
@@ -257,36 +259,62 @@ class TestSparseLightningIndexerKL(unittest.TestCase):
         self.assertEqual(old.indexer_segments(2), expected)
         self.assertNotEqual(old.indexer_segments(2), new.indexer_segments(2))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_loss_and_gradient_match_scalar_objective(self):
-        """Forward precomputation honors the scalar derivative and outer seed."""
-        for autocast in (False, True):
-            for underflow in (False, True):
-                with self.subTest(autocast=autocast, underflow=underflow):
-                    torch.manual_seed(1418)
-                    inputs = [torch.randn(2, 3, 2, 4)*.2, torch.randn(2, 5, 4)*.2,
-                              torch.randn(2, 3, 2)*.1]
-                    actual_inputs = [value.clone().requires_grad_() for value in inputs]
-                    oracle_inputs = [value.clone().requires_grad_() for value in inputs]
-                    aq = (torch.randn(2, 3, 3, 4)*.3).requires_grad_()
-                    ak = (torch.randn(2, 5, 4)*.3).requires_grad_()
-                    sinks = torch.full((3,), 1000. if underflow else .7, requires_grad=True)
-                    indices = torch.tensor([[[0, 0, 3], [-1, -1, -1], [4, -1, 2]],
-                                            [[4, 2, -1], [0, 1, 3], [-1, 2, -1]]])
-                    expected = _scalar_reference(*oracle_inputs, aq, ak, indices, sinks)
-                    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
-                        actual = shared_compressed_indexer_kl_loss(
-                            *actual_inputs, aq, ak, indices, sinks,
-                            attention_scale=.5, loss_coeff=.7, query_chunk_size=2,
-                        )
-                    seed = torch.tensor(.37)
-                    actual.backward(seed)
-                    expected.backward(seed)
-                    torch.testing.assert_close(actual, expected)
-                    for value, reference in zip(actual_inputs, oracle_inputs):
-                        torch.testing.assert_close(value.grad, reference.grad)
-                    self.assertIsNone(aq.grad)
-                    self.assertIsNone(ak.grad)
-                    self.assertIsNone(sinks.grad)
+        """Feature: Chunked reference KL with fixed-shape validity preparation.
+
+        Description: Compare mixed padding, underflow and autocast at several chunk sizes.
+        Expectation: Loss and student gradients match the independent scalar objective.
+        """
+        for autocast, underflow, chunk_size in product((False, True), (False, True), (1, 2, 5)):
+            with self.subTest(autocast=autocast, underflow=underflow, chunk_size=chunk_size):
+                torch.manual_seed(1418)
+                inputs = [torch.randn(2, 3, 2, 4)*.2, torch.randn(2, 5, 4)*.2,
+                          torch.randn(2, 3, 2)*.1]
+                actual_inputs = [value.clone().requires_grad_() for value in inputs]
+                oracle_inputs = [value.clone().requires_grad_() for value in inputs]
+                aq = (torch.randn(2, 3, 3, 4)*.3).requires_grad_()
+                ak = (torch.randn(2, 5, 4)*.3).requires_grad_()
+                sinks = torch.full((3,), 1000. if underflow else .7, requires_grad=True)
+                indices = torch.tensor([[[0, 0, 3], [-1, -1, -1], [4, -1, 2]],
+                                        [[4, 2, -1], [-1, -1, -1], [-1, 2, -1]]])
+                expected = _scalar_reference(*oracle_inputs, aq, ak, indices, sinks)
+                with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
+                    actual = shared_compressed_indexer_kl_loss(
+                        *actual_inputs, aq, ak, indices, sinks,
+                        attention_scale=.5, loss_coeff=.7, query_chunk_size=chunk_size,
+                    )
+                seed = torch.tensor(.37)
+                actual.backward(seed)
+                expected.backward(seed)
+                torch.testing.assert_close(actual, expected)
+                for value, reference in zip(actual_inputs, oracle_inputs):
+                    torch.testing.assert_close(value.grad, reference.grad)
+                self.assertIsNone(aq.grad)
+                self.assertIsNone(ak.grad)
+                self.assertIsNone(sinks.grad)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_reference_kl_empty_chunks_keep_zero_gradients(self):
+        """Feature: Fixed-shape reference KL preparation.
+
+        Description: Exercise empty selections and padded chunk tails with unused NaN keys.
+        Expectation: Skipped chunks contribute zero loss and zero student gradients.
+        """
+        for selected in (0, 3):
+            with self.subTest(selected=selected):
+                query = torch.ones(2, 5, 2, 4, requires_grad=True)
+                key = torch.full((2, 3, 4), float("nan"), requires_grad=True)
+                weights = torch.ones(2, 5, 2, requires_grad=True)
+                loss = shared_compressed_indexer_kl_loss(
+                    query, key, weights, torch.ones(2, 2, 5, 4), torch.ones(2, 3, 4),
+                    torch.full((2, 5, selected), -1, dtype=torch.long), torch.zeros(2),
+                    attention_scale=.5, loss_coeff=.7, query_chunk_size=2,
+                )
+                loss.backward()
+                torch.testing.assert_close(loss, torch.zeros(()), rtol=0, atol=0)
+                for value in (query, key, weights):
+                    torch.testing.assert_close(value.grad, torch.zeros_like(value), rtol=0, atol=0)
 
     def test_flat_gather_keeps_batch_and_duplicate_gradient(self):
         """Noncontiguous banks retain independent batch offsets and repeated-key SUM."""
