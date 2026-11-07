@@ -23,20 +23,28 @@ function event(name = NORMAL, age = TTL_MS, id = 1, action = 'labeled') {
   return { id, event: action, label: { name }, created_at: new Date(NOW - age).toISOString() };
 }
 function check(id = 1, overrides = {}) {
-  return { id, name: 'label-check', conclusion: 'success', app: { id: 15368 }, ...overrides };
+  return { id, name: 'label-check', status: 'completed', conclusion: 'success', app: { id: 15368 }, ...overrides };
+}
+function status(state = 'success') {
+  return { context: 'label-check', state, creator: { login: 'github-actions[bot]' } };
 }
 class FakeClient {
   constructor(names = [NORMAL]) {
     this.pull = pull(names);
     this.events = names.map((name, index) => event(name, TTL_MS, index + 1));
     this.checks = { head: [check(1)], merge: [check(2)] };
+    this.statuses = { head: [status()], merge: [status()] };
     this.writes = [];
   }
   list_pulls() { return [structuredClone(this.pull)]; }
   get_pull() { return structuredClone(this.pull); }
   get_events() { return structuredClone(this.events); }
-  get_checks(sha) { return this.checks[sha]; }
-  fail_check(value) { this.writes.push(['fail', value.id]); value.conclusion = 'failure'; }
+  get_checks(sha) { return structuredClone(this.checks[sha] ?? []); }
+  get_statuses(sha) { return structuredClone(this.statuses[sha] ?? []); }
+  set_status(sha, state) {
+    this.writes.push(['status', sha, state]);
+    this.statuses[sha] = [status(state)];
+  }
   remove_label(number, name) {
     this.writes.push(['remove', number, name]);
     this.pull.labels = this.pull.labels.filter(label => label.name !== name);
@@ -72,10 +80,11 @@ test('unattached labels are ignored; missing, removed, invalid or future additio
     assert.throws(() => evaluate_labels(pull(), events, NOW), /Cannot establish/);
   }
 });
-test('both expired labels are removed after invalidating head and merge checks', () => {
+test('both expired labels are removed after blocking head and merge statuses', () => {
   const client = new FakeClient(PASS_LABELS);
   assert.equal(sweep(client).errors.length, 0);
-  assert.deepEqual(client.writes, [['fail', 1], ['fail', 2], ['remove', 1, NORMAL], ['remove', 1, OVERTIME]]);
+  assert.deepEqual(client.writes, [['status', 'head', 'failure'], ['status', 'merge', 'failure'],
+    ['remove', 1, NORMAL], ['remove', 1, OVERTIME]]);
   assert.deepEqual(client.pull.labels, []);
 });
 test('a still-valid alternative label preserves the passing check', () => {
@@ -98,7 +107,8 @@ test('a re-added label between evaluation and removal is preserved', () => {
   let reads = 0;
   client.get_events = () => ++reads === 1 ? client.events : [event(NORMAL, 1000, 3), client.events[1]];
   assert.equal(sweep(client).errors.length, 1);
-  assert.deepEqual(client.writes, []);
+  assert.deepEqual(client.writes, [['status', 'head', 'failure'], ['status', 'merge', 'failure']]);
+  assert.equal(client.pull.labels.length, 2);
 });
 test('a changed head or closed PR does not receive an outdated mutation', () => {
   for (const change of [{ head: { sha: 'new-head' } }, { state: 'closed' }]) {
@@ -108,31 +118,77 @@ test('a changed head or closed PR does not receive an outdated mutation', () => 
     assert.deepEqual(client.writes, []);
   }
 });
-test('check invalidation failure prevents removal and is retried next sweep', () => {
+test('status publication failure prevents removal and is retried next sweep', () => {
   const client = new FakeClient();
-  client.fail_check = () => { throw new Error('permission denied'); };
+  client.set_status = () => { throw new Error('permission denied'); };
   assert.match(sweep(client).errors[0], /permission denied/);
   assert.equal(client.pull.labels.length, 1);
-  client.fail_check = FakeClient.prototype.fail_check;
+  client.set_status = FakeClient.prototype.set_status;
   assert.equal(sweep(client).errors.length, 0);
   assert.equal(client.pull.labels.length, 0);
 });
-test('repairs stale successes even when a prior sweep already removed labels', () => {
+test('blocks stale successes even when a prior sweep already removed labels', () => {
   const client = new FakeClient([]);
   assert.equal(sweep(client).errors.length, 0);
-  assert.deepEqual(client.writes, [['fail', 1], ['fail', 2]]);
+  assert.deepEqual(client.writes, [['status', 'head', 'failure'], ['status', 'merge', 'failure']]);
   client.writes = [];
   assert.equal(sweep(client).errors.length, 0);
   assert.deepEqual(client.writes, []);
 });
-test('only passing label-check results owned by GitHub Actions are invalidated', () => {
-  const client = new FakeClient([]);
+test('a fresh label needs a successful current GitHub Actions label check', () => {
+  const client = new FakeClient();
+  client.events = [event(NORMAL, 1000)];
   client.pull.merge_commit_sha = null;
   client.checks.head = [check(1, { app: { id: 99 } }), check(2, { name: 'unit-test' }),
-    check(3, { conclusion: 'failure' }), check(4, { conclusion: null }),
-    check(5, { conclusion: 'neutral' }), check(6, { conclusion: 'skipped' })];
+    check(3, { conclusion: 'success' }), check(4, { status: 'in_progress', conclusion: null })];
   sweep(client);
-  assert.deepEqual(client.writes, [['fail', 5], ['fail', 6]]);
+  assert.deepEqual(client.writes, [['status', 'head', 'failure']]);
+  client.checks.head.push(check(5));
+  sweep(client);
+  assert.deepEqual(client.writes.at(-1), ['status', 'head', 'success']);
+});
+test('does not create a status on a merge commit without a label check', () => {
+  const client = new FakeClient();
+  client.checks.merge = [];
+  sweep(client);
+  assert.deepEqual(client.writes, [['status', 'head', 'failure'], ['remove', 1, NORMAL]]);
+});
+test('a renewed CI label restores the status after a successful label check', () => {
+  const client = new FakeClient();
+  assert.equal(sweep(client).errors.length, 0);
+  client.pull.labels = [{ name: NORMAL }];
+  client.events = [event(NORMAL, 1000, 2)];
+  client.writes = [];
+  assert.equal(sweep(client).errors.length, 0);
+  assert.deepEqual(client.writes, [['status', 'head', 'success'], ['status', 'merge', 'success']]);
+  assert.equal(client.pull.labels.length, 1);
+});
+test('a missing label addition event blocks the head without deleting the label', () => {
+  const client = new FakeClient();
+  client.events = [];
+  assert.match(sweep(client).errors[0], /Cannot establish/);
+  assert.deepEqual(client.writes, [['status', 'head', 'failure']]);
+  assert.equal(client.pull.labels.length, 1);
+});
+test('PRs sharing a head cannot override each other with conflicting CI labels', () => {
+  const client = new FakeClient();
+  const other = pull([], { number: 2, merge_commit_sha: null });
+  client.events = [event(NORMAL, 1000)];
+  client.list_pulls = () => [structuredClone(client.pull), structuredClone(other)];
+  client.get_pull = number => structuredClone(number === 1 ? client.pull : other);
+  assert.equal(sweep(client).errors.length, 0);
+  assert.deepEqual(client.writes, [['status', 'head', 'failure'], ['status', 'merge', 'failure']]);
+});
+test('a newly opened PR sharing the head prevents a stale success', () => {
+  const client = new FakeClient();
+  client.events = [event(NORMAL, 1000)];
+  client.statuses.head = [status('failure')];
+  let reads = 0;
+  client.list_pulls = () => ++reads === 1 ? [structuredClone(client.pull)] :
+    [structuredClone(client.pull), pull([], { number: 2 })];
+  assert.match(sweep(client).errors[0], /sharing this head changed/);
+  assert.equal(client.writes.some(item => item[0] === 'status' && item[2] === 'success'), false);
+  assert.equal(client.pull.labels.length, 1);
 });
 test('label deletion errors are surfaced unless another actor already removed it', () => {
   const client = new FakeClient();
@@ -153,7 +209,7 @@ test('adapter paginates lists and object pages, handles empty responses, and use
   const calls = [];
   const client = new LabelClient('owner/repo', (command, args, options) => {
     calls.push({ command, args, options });
-    if (args.includes('PATCH')) return '';
+    if (args.includes('POST')) return '';
     if (args.some(arg => arg.includes('check-runs?'))) {
       return JSON.stringify([{ check_runs: [check()] }, { check_runs: [check(2)] }]);
     }
@@ -161,14 +217,14 @@ test('adapter paginates lists and object pages, handles empty responses, and use
   });
   assert.equal(client.get_events(1).length, 2);
   assert.equal(client.get_checks('head').length, 2);
-  client.fail_check(check());
+  client.set_status('head', 'failure');
   assert.ok(calls[0].args.includes('--paginate'));
   assert.ok(calls[0].args.includes('--slurp'));
-  assert.equal(JSON.parse(calls[2].options.input).conclusion, 'failure');
+  assert.equal(JSON.parse(calls[2].options.input).state, 'failure');
   assert.throws(() => new LabelClient('bad repo'), /Invalid GH_REPO/);
 });
 
-test('scheduled scans skip unlabeled PRs; completion signals only reconcile their head', () => {
+test('scheduled scans skip unlabeled PRs; completion signals include their head', () => {
   const client = new FakeClient([]);
   client.get_checks = () => { throw new Error('Unexpected check query'); };
   assert.deepEqual(sweep(client, { completed_head: undefined }).reports, []);

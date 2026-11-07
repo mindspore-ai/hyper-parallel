@@ -16,7 +16,8 @@ import { fileURLToPath } from 'node:url';
 
 export const PASS_LABELS = ['ci-pipeline-passed', 'ci-pipeline-passed-but-overtime'];
 export const TTL_MS = 24 * 60 * 60 * 1000;
-const PASSING_CONCLUSIONS = new Set(['success', 'neutral', 'skipped']);
+const STATUS_CONTEXT = 'label-check';
+const ACTIONS_APP_ID = 15368;
 
 /** Evaluate each currently attached label using its latest label transition. */
 export function evaluate_labels(pull, events, now = Date.now()) {
@@ -62,13 +63,11 @@ export class LabelClient {
     return this.api(`commits/${sha}/check-runs?check_name=label-check&filter=latest&per_page=100`,
       { paginate: true }).flatMap(page => page.check_runs);
   }
-  fail_check(check) {
-    this.api(`check-runs/${check.id}`, {
-      method: 'PATCH', body: {
-        status: 'completed', conclusion: 'failure',
-        output: { title: 'A fresh CI pass label is required',
-          summary: 'Neither CI pass label is within its 24-hour validity period. Run CI again to renew it.' },
-      },
+  get_statuses(sha) { return this.api(`commits/${sha}/statuses?per_page=100`); }
+  set_status(sha, state) {
+    this.api(`statuses/${sha}`, {
+      method: 'POST', body: { state, context: STATUS_CONTEXT,
+        description: state === 'success' ? 'CI pass label is valid' : 'Fresh CI pass and label check required' },
     });
   }
   remove_label(number, name) {
@@ -85,56 +84,101 @@ function snapshot(client, number, now, listed_pull) {
 
 function identity(value) {
   return JSON.stringify([value.pull.state, value.pull.head.sha, value.pull.merge_commit_sha,
-    value.labels.map(label => [label.name, label.event_id])]);
+    value.labels.map(label => [label.name, label.event_id, label.expired])]);
 }
 
-function invalidate_checks(client, current, now) {
-  // pull_request checks can belong to the synthetic merge commit or the head.
-  const shas = [...new Set([current.pull.head.sha, current.pull.merge_commit_sha].filter(Boolean))];
-  const checks = shas.flatMap(sha => client.get_checks(sha)).filter(check =>
-    check.name === 'label-check' && check.app?.id === 15368 && PASSING_CONCLUSIONS.has(check.conclusion));
-  for (const check of checks) {
-    const fresh = snapshot(client, current.pull.number, now);
-    if (identity(fresh) !== identity(current) || fresh.labels.some(label => !label.expired)) {
-      throw new Error('PR or CI labels changed before invalidating the old check; retry on the next sweep');
-    }
-    client.fail_check(check);
+function action_checks(client, sha) {
+  return client.get_checks(sha).filter(check => check.name === STATUS_CONTEXT && check.app?.id === ACTIONS_APP_ID)
+    .sort((left, right) => right.id - left.id);
+}
+
+function publish_status(client, sha, state, before_write = () => {}) {
+  const latest = client.get_statuses(sha).find(status => status.context === STATUS_CONTEXT);
+  if (latest?.state !== state || latest.creator?.login !== 'github-actions[bot]') {
+    before_write();
+    client.set_status(sha, state);
   }
 }
 
-/** Expire labels and invalidate stale passing checks; default to read-only. */
+function revalidate_group(client, current, now) {
+  const head = current[0].pull.head.sha;
+  const numbers = values => values.map(pull => pull.number).sort((left, right) => left - right).join(',');
+  const sharing = client.list_pulls().filter(pull => pull.state === 'open' && pull.head.sha === head);
+  if (numbers(sharing) !== numbers(current.map(entry => entry.pull))) {
+    throw new Error('The PRs sharing this head changed during reconciliation');
+  }
+  for (const entry of current) {
+    if (identity(snapshot(client, entry.pull.number, now)) !== identity(entry)) {
+      throw new Error('PR or CI labels changed during reconciliation; retry on the next sweep');
+    }
+  }
+}
+
+/** Expire labels and publish a blocking status when CI is stale; default to read-only. */
 export function reconcile_labels(client, { write = false, now = Date.now, only_pr, completed_head } = {}) {
   const reports = [];
   const errors = [];
   const pulls = only_pr ? [client.get_pull(only_pr)] : client.list_pulls();
-  for (const pull of pulls) {
+  const open = pulls.filter(pull => pull.state === 'open');
+  const heads = new Set(open.filter(pull => pull.head.sha === completed_head ||
+    pull.labels.some(label => PASS_LABELS.includes(label.name))).map(pull => pull.head.sha));
+  for (const head of heads) {
+    const group = open.filter(pull => pull.head.sha === head);
+    let current = [];
+    const checks = new Map();
     try {
-      if (completed_head && pull.head.sha !== completed_head) continue;
-      if (!completed_head && !pull.labels.some(label => PASS_LABELS.includes(label.name))) continue;
-      let current = snapshot(client, pull.number, now, pull);
-      if (current.pull.state !== 'open') continue;
-      const expired = current.labels.filter(label => label.expired);
-      reports.push({ number: pull.number, labels: current.labels });
+      current = group.map(pull => snapshot(client, pull.number, now, pull));
+      reports.push(...current.map(entry => ({ number: entry.pull.number, labels: entry.labels })));
       if (!write) continue;
-      // GITHUB_TOKEN removals do not trigger the unlabeled workflow. A completed
-      // label-check workflow also signals this reconciler to handle late successes.
-      if (!current.labels.some(label => !label.expired)) invalidate_checks(client, current, now);
-      for (const label of expired) {
-        const fresh = snapshot(client, pull.number, now);
-        if (identity(fresh) !== identity(current)) {
-          throw new Error('PR or CI labels changed before removal; retry on the next sweep');
+      const valid = current.every(entry => entry.labels.some(label => !label.expired));
+      checks.set(head, action_checks(client, head));
+      for (const entry of current) {
+        const merge = entry.pull.merge_commit_sha;
+        if (merge && !checks.has(merge)) {
+          const merge_checks = action_checks(client, merge);
+          // Creating a status on an otherwise unchecked test merge commit can
+          // change which commit GitHub evaluates for all required checks.
+          if (merge_checks.length) checks.set(merge, merge_checks);
         }
-        const candidate = fresh.labels.find(item => item.name === label.name);
-        if (!candidate?.expired) continue;
-        try {
-          client.remove_label(pull.number, label.name);
-        } catch (error) {
-          if (client.get_pull(pull.number).labels.some(item => item.name === label.name)) throw error;
+      }
+      for (const [sha, runs] of checks) {
+        const latest = runs[0];
+        const state = valid && latest?.status === 'completed' && latest.conclusion === 'success' ?
+          'success' : 'failure';
+        publish_status(client, sha, state, () => revalidate_group(client, current, now));
+      }
+      for (const entry of current) {
+        let previous = entry;
+        for (const label of entry.labels.filter(item => item.expired)) {
+          const fresh = snapshot(client, entry.pull.number, now);
+          if (identity(fresh) !== identity(previous)) {
+            throw new Error(`PR #${entry.pull.number} or its labels changed before removal`);
+          }
+          try {
+            client.remove_label(entry.pull.number, label.name);
+          } catch (error) {
+            if (client.get_pull(entry.pull.number).labels.some(item => item.name === label.name)) throw error;
+          }
+          previous = { pull: fresh.pull, labels: fresh.labels.filter(item => item.name !== label.name) };
         }
-        current = { pull: fresh.pull, labels: fresh.labels.filter(item => item.name !== label.name) };
       }
     } catch (error) {
-      errors.push(`PR #${pull.number}: ${error.message}`);
+      errors.push(`PRs ${group.map(pull => `#${pull.number}`).join(', ')}: ${error.message}`);
+      if (write) {
+        // When event history or check reads fail, a blocking status is safer
+        // than leaving an older success usable. Never delete an uncertain label.
+        try {
+          const still_open = group.some(pull => {
+            const fresh = client.get_pull(pull.number);
+            return fresh.state === 'open' && fresh.head.sha === head;
+          });
+          if (still_open) {
+            for (const sha of new Set([head, ...checks.keys()])) publish_status(client, sha, 'failure');
+          }
+        } catch (fallback_error) {
+          errors.push(`Head ${head}: could not publish a blocking status: ${fallback_error.message}`);
+        }
+      }
     }
   }
   return { reports, errors };

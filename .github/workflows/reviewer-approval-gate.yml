@@ -6,6 +6,8 @@ on:
       - opened
       - reopened
       - synchronize
+      - labeled
+      - unlabeled
       - edited
       - ready_for_review
       - converted_to_draft
@@ -19,6 +21,7 @@ on:
     branches: [master]
     paths:
       - .github/reviewer-approval-policy.json
+      - .github/scripts/ci-label-expiry.mjs
       - .github/scripts/reviewer-approval-gate.mjs
       - .github/workflows/reviewer-approval-gate.yml
       - .github/workflows/reviewer-approval-signal.yml
