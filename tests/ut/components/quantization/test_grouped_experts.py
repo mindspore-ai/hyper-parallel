@@ -15,6 +15,7 @@
 """Preserve the pre-refactor precision of routed expert contributions."""
 
 import unittest
+from typing import Optional
 from unittest import mock
 
 import torch
@@ -41,11 +42,12 @@ def _cpu_projection(
     ])
 
 
-def _legacy_output(
+def _reference_output(
     module: GroupedExperts, hidden: torch.Tensor, indices: torch.Tensor,
-    probabilities: torch.Tensor, *, round_each_route: bool,
+    probabilities: torch.Tensor,
+    activation_limit: Optional[float] = None,
 ) -> torch.Tensor:
-    """Express the two historical combine contracts without consulting the new policy."""
+    """Mirror the expert projection and routing contract with CPU matmuls."""
     top_k = indices.shape[1]
     order = indices.flatten().argsort()
     counts = indices.new_zeros(module.num_experts)
@@ -55,11 +57,13 @@ def _legacy_output(
     routed = hidden[order // top_k]
     gate_up = _cpu_projection(routed, module.gate_up_proj, counts, None, 1)
     gate, up = gate_up.chunk(2, dim=-1)
+    if activation_limit is not None:
+        gate = gate.clamp(max=activation_limit)
+        up = up.clamp(min=-activation_limit, max=activation_limit)
     outputs = _cpu_projection(module.act_fn(gate) * up, module.down_proj, counts, None, 1)
     weighted = outputs * probabilities.flatten()[order, None]
-    if round_each_route:
-        weighted = weighted.to(hidden.dtype)
-    return weighted[order.argsort()].reshape(hidden.shape[0], top_k, hidden.shape[1]).sum(dim=1)
+    routed = weighted[order.argsort()].reshape(hidden.shape[0], top_k, hidden.shape[1]).sum(dim=1)
+    return routed.to(dtype=hidden.dtype)
 
 
 class TestGroupedExpertsRoutingPrecision(unittest.TestCase):
@@ -70,18 +74,29 @@ class TestGroupedExpertsRoutingPrecision(unittest.TestCase):
         self.addCleanup(torch.set_rng_state, torch.get_rng_state())
 
     @staticmethod
-    def _source(dtype: torch.dtype) -> nn.Module:
+    def _source(dtype: torch.dtype, activation_limit: Optional[float] = None) -> nn.Module:
         source = nn.Module()
         source.gate_up_proj = nn.Parameter(torch.randn(6, 12, 4, dtype=dtype) * 0.25)
         source.down_proj = nn.Parameter(torch.randn(6, 4, 6, dtype=dtype) * 0.25)
         source.act_fn = nn.SiLU()
+        if activation_limit is not None:
+            source.limit = activation_limit
         return source
 
 
-    def _check_case(self, factory, dtype: torch.dtype, route_dtype: torch.dtype, top_k: int, round_routes: bool):
-        """Compare one format and routing configuration with its legacy contract."""
+    def _check_case(
+        self,
+        factory,
+        dtype: torch.dtype,
+        route_dtype: torch.dtype,
+        top_k: int,
+        activation_limit: Optional[float] = None,
+    ):
+        """Compare one format and routing configuration with the output-dtype contract."""
         torch.manual_seed(20261020)
-        module = GroupedExperts.from_module(self._source(dtype), fqn="experts", grouped_linear=factory())
+        module = GroupedExperts.from_module(
+            self._source(dtype, activation_limit), fqn="experts", grouped_linear=factory()
+        )
         hidden = torch.randn(5, 4, dtype=dtype, requires_grad=True)
         indices = torch.stack([torch.arange(top_k).roll(token) for token in range(hidden.shape[0])])
         probabilities = torch.softmax(torch.randn(5, top_k), dim=-1).to(route_dtype).requires_grad_(True)
@@ -90,9 +105,8 @@ class TestGroupedExpertsRoutingPrecision(unittest.TestCase):
             side_effect=_cpu_projection,
         ):
             actual = module(hidden, indices, probabilities)
-        expected = _legacy_output(module, hidden, indices, probabilities, round_each_route=round_routes)
-        expected_dtype = dtype if round_routes else torch.promote_types(dtype, route_dtype)
-        self.assertEqual(actual.dtype, expected_dtype)
+        expected = _reference_output(module, hidden, indices, probabilities, activation_limit)
+        self.assertEqual(actual.dtype, dtype)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
         parameters = (module.gate_up_proj, module.down_proj, probabilities)
@@ -115,26 +129,32 @@ class TestGroupedExpertsRoutingPrecision(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_outputs_gradients_and_update_keep_each_formats_original_precision(self) -> None:
-        """Only HiFloat8 rounds routed contributions to the hidden-state dtype."""
+        """Every grouped strategy restores dtype once after routed reduction."""
         cases = (
-            ("mxfp8", MXFP8GroupedLinear, False),
-            ("hif8", HiFloat8GroupedLinear, True),
-            ("w4a8_32", W4A8GroupedLinear, False),
-            ("fake_w4a8_32", FakeW4A8GroupedLinear, False),
+            ("mxfp8", MXFP8GroupedLinear),
+            ("hif8", HiFloat8GroupedLinear),
+            ("w4a8_32", W4A8GroupedLinear),
+            ("fake_w4a8_32", FakeW4A8GroupedLinear),
         )
-        for name, factory, round_each_route in cases:
+        for name, factory in cases:
             for dtype in (torch.bfloat16, torch.float16):
                 for route_dtype in (torch.float32, dtype):
                     for top_k in (1, 2, 6):
                         with self.subTest(format=name, dtype=dtype, route_dtype=route_dtype, top_k=top_k):
-                            self.assertEqual(
-                                factory.CAST_ROUTED_OUTPUT_TO_INPUT_DTYPE,
-                                round_each_route,
-                            )
                             self._check_case(
                                 factory,
                                 dtype,
                                 route_dtype,
                                 top_k,
-                                round_each_route,
                             )
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_v41_activation_limit_is_preserved(self) -> None:
+        """V4.1's clipped SwiGLU is retained by the shared expert replacement."""
+        self._check_case(
+            FakeW4A8GroupedLinear,
+            torch.bfloat16,
+            torch.float32,
+            top_k=2,
+            activation_limit=0.05,
+        )

@@ -78,6 +78,7 @@ class GroupedExperts(nn.Module):
         self.intermediate_dim = intermediate_dim
         self.fqn = fqn
         self.grouped_linear = grouped_linear
+        self.activation_limit = None
 
     @staticmethod
     def _validate_grouped_linear(grouped_linear: GroupedLinear) -> None:
@@ -147,12 +148,14 @@ class GroupedExperts(nn.Module):
             )
         for name, module in source._modules.items():  # pylint: disable=protected-access
             converted.add_module(name, module)
+        converted.act_fn = getattr(source, "act_fn", nn.SiLU())
 
         converted.num_experts = gate_up_proj.shape[0]
         converted.hidden_dim = gate_up_proj.shape[2]
         converted.intermediate_dim = gate_up_proj.shape[1] // _GATE_UP_BRANCHES
         converted.fqn = fqn
         converted.grouped_linear = grouped_linear
+        converted.activation_limit = getattr(source, "limit", None)
         if hasattr(source, "config"):
             converted.config = source.config
         converted.training = source.training
@@ -174,7 +177,12 @@ class GroupedExperts(nn.Module):
                 GROUP_LIST_COUNTS,
             )
             gate, up = gate_up.chunk(_GATE_UP_BRANCHES, dim=-1)
-            intermediate = self.act_fn(gate) * up
+            if self.activation_limit is None:
+                intermediate = self.act_fn(gate) * up
+            else:
+                gate = gate.clamp(max=self.activation_limit)
+                up = up.clamp(min=-self.activation_limit, max=self.activation_limit)
+                intermediate = self.act_fn(gate) * up
             return _GroupedLinearFunction.apply(
                 intermediate,
                 self.down_proj,
@@ -214,6 +222,7 @@ class GroupedExperts(nn.Module):
                 f"routes={top_k_index.shape[0]}, tokens={hidden_states.shape[0]}."
             )
 
+        input_dtype = hidden_states.dtype
         token_count = hidden_states.shape[0]
         top_k = top_k_index.shape[1]
         source_token_indices = torch.arange(
@@ -238,22 +247,20 @@ class GroupedExperts(nn.Module):
         sorted_outputs = self._grouped_forward(sorted_inputs, tokens_per_expert)
         sorted_weights = top_k_weights.reshape(-1)[expert_order]
         sorted_outputs = sorted_outputs * sorted_weights.unsqueeze(-1)
-        # CANN grouped-matmul may promote its result or routing weights may be
-        # FP32.  Low-precision strategies opt into restoring the model
-        # activation dtype before the expert reduction is returned.
-        if self.grouped_linear.CAST_ROUTED_OUTPUT_TO_INPUT_DTYPE:
-            sorted_outputs = sorted_outputs.to(hidden_states.dtype)
 
         inverse_order = torch.empty_like(expert_order)
         inverse_order[expert_order] = torch.arange(
             expert_order.shape[0],
             device=expert_order.device,
         )
+        # Accumulate every routed contribution before rounding once at the
+        # module boundary.  GroupedExperts preserves the input activation
+        # dtype even when FP32 routing weights promote the weighted outputs.
         return sorted_outputs[inverse_order].view(
             token_count,
             top_k,
             self.hidden_dim,
-        ).sum(dim=1)
+        ).sum(dim=1).to(dtype=input_dtype)
 
 
 __all__ = ["GroupedExperts"]
