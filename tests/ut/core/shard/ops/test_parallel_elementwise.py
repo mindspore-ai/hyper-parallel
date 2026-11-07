@@ -192,6 +192,27 @@ class TestParallelElementwiseOps(unittest.TestCase):
         assert cache_values[1] is y_layout
         assert cache_values[2] == [(4, 8), (4, 8)]
 
+    def test_in_place_unary_math_is_registered_like_its_out_of_place_form(self):
+        """`log_` must infer layouts exactly as `log` does.
+
+        State-space and linear-attention families initialise parameters with
+        the in-place idiom `torch.empty_like(p).uniform_(...).log_()`. The
+        `empty_like` inherits DTensor-ness, so `log_` dispatches through the
+        distributed layer; without a registration the whole family fails at
+        init with "does not contain parallel layout infer func".
+        """
+        for op_name in ("log", "log_"):
+            registered_op = get_distributed_op(op_name)
+            self.assertIsInstance(
+                registered_op,
+                ElementWiseDistributedOp,
+                msg=f"Expected {op_name} to use element-wise inference, got {registered_op!r}",
+            )
+        self.assertIs(type(get_distributed_op("log_")),
+                      type(get_distributed_op("log")),
+                      "in-place form must share the out-of-place semantics, "
+                      "including the refusal of Partial inputs")
+
     def test_torch_clamp_family_uses_elementwise_layout_inference(self):
         """Torch clamp variants preserve the input element-wise layout."""
         for op_name in ("clamp", "clamp_min", "clamp_max"):
