@@ -58,11 +58,19 @@ def _load_loss():
     return chunk_loss
 
 
+def _load_codegen():
+    """Return shared Kimi source-export compatibility lazily."""
+    from hyper_parallel.models.kimi_k3.adapter import codegen  # pylint: disable=C0415
+
+    return codegen
+
+
 KIMI_K26_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="KimiK25ForConditionalGeneration",
     model_type="kimi_k26",
     sharding_rules=_load_sharding_rules,
     loss=_load_loss,
+    codegen=_load_codegen,
 )
 
 register_model_adapter(KIMI_K26_ADAPTER_SPEC)

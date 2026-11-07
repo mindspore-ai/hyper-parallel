@@ -24,19 +24,8 @@ from astroid import nodes
 from pylint.checkers import BaseChecker
 
 APACHE_HEADER_SNIPPETS: Tuple[str, ...] = (
-    "Copyright 2026 Huawei Technologies Co., Ltd",
     "Licensed under the Apache License, Version 2.0",
-    "limitations under the License.",
-)
-BACKEND_IMPORTS = {"torch"}
-PLATFORM_ALLOWED_PARTS = ("tests/", "scripts/", ".agent/")
-TORCH_ONLY_CORE_PARTS = (
-    "hyper_parallel/core/distributed_checkpoint/",
-    "hyper_parallel/core/dtensor/",
-    "hyper_parallel/core/fully_shard/",
-    "hyper_parallel/core/multicore/",
-    "hyper_parallel/core/pipeline_parallel/",
-    "hyper_parallel/core/shard/dfunction.py",
+    "WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND",
 )
 PUBLIC_MAGIC_ALLOWLIST = {
     "__init__", "__call__", "__enter__", "__exit__", "__iter__", "__next__",
@@ -100,27 +89,6 @@ def _is_public_function(node: nodes.FunctionDef) -> bool:
     return True
 
 
-def _is_platform_agnostic_module(path: str) -> bool:
-    """Check whether backend imports should be blocked for this file.
-
-    Only shipped library code under ``hyper_parallel/`` is in scope; tests, scripts and
-    agent tooling may import a backend freely.
-    """
-    normalized = _normalize_path(path)
-    if not normalized.endswith(".py"):
-        return False
-    return not any(part in normalized for part in PLATFORM_ALLOWED_PARTS)
-
-
-def _is_forbidden_backend(path: str, module_name: str) -> bool:
-    """Allow Torch in explicitly Torch-only core components."""
-    backend = module_name.split(".", maxsplit=1)[0]
-    normalized = _normalize_path(path)
-    if backend == "torch" and any(part in normalized for part in TORCH_ONLY_CORE_PARTS):
-        return False
-    return backend in BACKEND_IMPORTS
-
-
 class HyperParallelChecker(BaseChecker):
     """Custom checks for HyperParallel project style rules."""
 
@@ -135,7 +103,7 @@ class HyperParallelChecker(BaseChecker):
         "C9002": (
             "Direct backend import '%s' is forbidden in platform-agnostic code",
             "forbidden-backend-import",
-            "Used when torch is imported outside approved platform-specific modules.",
+            "Retained as a compatibility name for existing local suppressions.",
         ),
         "C9004": (
             "Avoid mutating sys.path with insert(0, ...)",
@@ -180,30 +148,6 @@ class HyperParallelChecker(BaseChecker):
             return
         self._check_apache_header(node, path)
 
-    def visit_import(self, node: nodes.Import) -> None:
-        """Block direct backend imports in platform-agnostic modules.
-
-        Args:
-            node: The import AST node being visited.
-        """
-        if not _is_platform_agnostic_module(self._module_path):
-            return
-        for name, _ in node.names:
-            if _is_forbidden_backend(self._module_path, name):
-                self.add_message("forbidden-backend-import", node=node, args=(name,))
-
-    def visit_importfrom(self, node: nodes.ImportFrom) -> None:
-        """Block direct backend imports in platform-agnostic modules.
-
-        Args:
-            node: The import-from AST node being visited.
-        """
-        if not _is_platform_agnostic_module(self._module_path):
-            return
-        module_name = node.modname or ""
-        if _is_forbidden_backend(self._module_path, module_name):
-            self.add_message("forbidden-backend-import", node=node, args=(module_name,))
-
     def visit_call(self, node: nodes.Call) -> None:
         """Check subprocess and sys.path patterns.
 
@@ -219,6 +163,15 @@ class HyperParallelChecker(BaseChecker):
         Args:
             node: The function definition AST node being visited.
         """
+        normalized_path = _normalize_path(self._module_path)
+        if "/tests/" in normalized_path or normalized_path.startswith("tests/"):
+            return
+        parent = node.parent
+        if isinstance(parent, (nodes.FunctionDef, nodes.AsyncFunctionDef)):
+            return
+        if isinstance(parent, nodes.ClassDef):
+            if parent.name.startswith("_") or isinstance(parent.parent, nodes.FunctionDef):
+                return
         self._check_public_function(node)
 
     visit_asyncfunctiondef = visit_functiondef

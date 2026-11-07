@@ -24,15 +24,17 @@ from hyper_parallel.codegen.inline.ir import (
     ClassRemovalPatch,
     ConstructorReplacePatch,
     InlinePatchSet,
-    InlineRule,
+    SourceObservation,
     ModuleSnippetPatch,
 )
-from hyper_parallel.codegen.inline.specs import replacement_spec
+from hyper_parallel.codegen.inline.framework_spec import replacement_spec_for as replacement_spec
 
 logger = logging.getLogger(__name__)
 
 
-def build_replacement_patches(rules: tuple[InlineRule, ...], model_type: str | None = None) -> InlinePatchSet:
+def build_replacement_patches(
+    rules: tuple[SourceObservation, ...], model_type: str | None = None
+) -> InlinePatchSet:
     """Build constructor replacement patches from module actions.
 
     The rule's settled FQNs (``rule.match``, recorded from the same plan the
@@ -57,6 +59,7 @@ def build_replacement_patches(rules: tuple[InlineRule, ...], model_type: str | N
 
     patch_set = InlinePatchSet()
     scopes_by_target: dict[str, set[str]] = defaultdict(set)
+    fqns_by_target: dict[str, set[str]] = defaultdict(set)
     specs_by_target: dict[str, Any] = {}
     for rule in rules:
         target = rule.replace_target
@@ -67,6 +70,7 @@ def build_replacement_patches(rules: tuple[InlineRule, ...], model_type: str | N
             continue
         specs_by_target.setdefault(target, spec)
         scopes_by_target[target].update(_scope_attrs(rule))
+        fqns_by_target[target].update(fqn for fqn in rule.match if fqn)
     for target, spec in specs_by_target.items():
         scope_attrs = tuple(sorted(scopes_by_target[target]))
         if not scope_attrs:
@@ -88,6 +92,7 @@ def build_replacement_patches(rules: tuple[InlineRule, ...], model_type: str | N
                 mode=spec.mode,  # type: ignore[arg-type]
                 keyword_args=spec.keyword_args,
                 scope_attrs=scope_attrs,
+                scope_fqns=tuple(sorted(fqns_by_target[target])),
             )
         )
         if spec.remove_class:
@@ -97,7 +102,7 @@ def build_replacement_patches(rules: tuple[InlineRule, ...], model_type: str | N
     return patch_set
 
 
-def _scope_attrs(rule: InlineRule) -> tuple[str, ...]:
+def _scope_attrs(rule: SourceObservation) -> tuple[str, ...]:
     """Attribute names of the rule's settled FQNs, i.e. the rewrite scope.
 
     ``model.layers.3.post_attention_layernorm`` scopes the rewrite to

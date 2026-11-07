@@ -1,58 +1,25 @@
 # Copyright 2026 Huawei Technologies Co., Ltd
-# Licensed under the Apache License, Version 2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # ============================================================================
-"""Codegen: bake TP/CP/EP parallel contracts into a generated HF-modeling file.
-
-Public manager helpers:
-
-- :func:`ensure_codegen_artifact` — generate/reuse the bundle for a YAML.
-- :func:`preflight_integrity_check` — fail-fast drift detection before train.
-- :func:`resolve_artifact_layout` — map a YAML path to its bundle paths.
-
-Planning and validation APIs:
-
-- :func:`derive_sharding_plan` / :func:`freeze_plan` — run the planner over
-  an offline mesh and freeze the plan into JSON-safe structures.
-- :func:`verify_signature` / :func:`verify_output_hashes` / ... — per-zone
-  preflight verifiers.
-"""
-from hyper_parallel.codegen.artifact import resolve_artifact_layout
-from hyper_parallel.codegen.check.preflight import (
-    verify_generated_import,
-    verify_meta_required_fields,
-    verify_output_hashes,
-    verify_param_plan,
-    verify_signature,
-    warn_skipped_overrides,
-)
-from hyper_parallel.codegen.manager import (
-    ensure_codegen_artifact,
-    preflight_integrity_check,
-)
-from hyper_parallel.codegen.plan.freeze import (
-    FrozenPlan,
-    freeze_plan,
-    freeze_param_plan,
-    named_placement_to_dict,
-    placement_to_string,
-)
-from hyper_parallel.codegen.plan.offline_mesh import OfflineMesh, build_offline_mesh
+"""Generate source-visible model forms from observed native build facts."""
+from hyper_parallel.codegen.manager import ensure_codegen_artifact_from_snapshot
+from hyper_parallel.codegen.session import CodegenBuildSession
+from hyper_parallel.codegen.snapshot import CodegenSnapshot, CodegenStatus
 
 __all__ = [
-    "FrozenPlan",
-    "OfflineMesh",
-    "build_offline_mesh",
-    "ensure_codegen_artifact",
-    "freeze_param_plan",
-    "freeze_plan",
-    "named_placement_to_dict",
-    "placement_to_string",
-    "preflight_integrity_check",
-    "resolve_artifact_layout",
-    "verify_generated_import",
-    "verify_meta_required_fields",
-    "verify_output_hashes",
-    "verify_param_plan",
-    "verify_signature",
-    "warn_skipped_overrides",
+    "CodegenBuildSession",
+    "CodegenSnapshot",
+    "CodegenStatus",
+    "ensure_codegen_artifact_from_snapshot",
 ]

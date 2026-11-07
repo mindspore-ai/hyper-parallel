@@ -23,23 +23,171 @@ model-construction inputs, while process-group lifecycle helpers moved to
 
 __all__ = [
     "DistributedSetup",
+    "LogicalDeviceMesh",
     "MeshContext",
+    "ParallelLayout",
+    "ParallelTopologySpec",
+    "infer_minimum_world_size",
+    "resolve_parallel_layout",
 ]
 
 import inspect
-import logging
 import math
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional, Tuple, Union
 
 import torch.distributed as dist
 
 from hyper_parallel import init_device_mesh
-from hyper_parallel.models.build_options import (  # pylint: disable=syntax-error
-    get_device_type,
-)
 
-logger = logging.getLogger(__name__)
+
+def _compatible_parallel_degree(value: Any) -> Any:
+    """Preserve the Trainer's historical minimum parallel degree of one."""
+    return max(1, value)
+
+
+def _positive_world_size(value: Any) -> int:
+    """Validate the process-group or inferred world size."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"world_size must be a positive integer, got {value!r}")
+    return value
+
+
+@dataclass(frozen=True)
+class ParallelTopologySpec:
+    """Normalized parallel degrees shared by runtime and offline planning."""
+
+    tp_size: int
+    cp_size: int
+    pp_size: int
+    ep_size: int
+    dp_shard_size: int
+    edp_shard_size: int
+    sequence_parallel: bool
+    loss_parallel: bool
+
+    @classmethod
+    def from_config(cls, config: Any) -> "ParallelTopologySpec":
+        """Read parallel degrees using the Trainer's compatibility semantics."""
+        accelerator = config.accelerator
+        fsdp_config = config.fsdp_config
+        return cls(
+            tp_size=_compatible_parallel_degree(accelerator.tp_size),
+            cp_size=_compatible_parallel_degree(accelerator.cp_size),
+            pp_size=_compatible_parallel_degree(accelerator.pp_size),
+            ep_size=_compatible_parallel_degree(accelerator.ep_size),
+            dp_shard_size=_compatible_parallel_degree(fsdp_config.dp_shard_size),
+            edp_shard_size=_compatible_parallel_degree(fsdp_config.edp_shard_size),
+            sequence_parallel=bool(accelerator.sequence_parallel),
+            loss_parallel=bool(accelerator.loss_parallel),
+        )
+
+
+@dataclass(frozen=True)
+class ParallelLayout:
+    """Resolved parallel topology independent of devices and process groups."""
+
+    spec: ParallelTopologySpec
+    world_size: int
+    dp_size: int
+    dp_replicate_size: int
+
+    @property
+    def dense_world_size(self) -> int:
+        """Return the rank count in one pipeline stage."""
+        return self.dp_size * self.spec.cp_size * self.spec.tp_size
+
+
+def resolve_parallel_layout(
+    spec: ParallelTopologySpec, world_size: int
+) -> ParallelLayout:
+    """Validate a world size and resolve its DP/FSDP/EP layout."""
+    world_size = _positive_world_size(world_size)
+    non_dp_size = spec.tp_size * spec.cp_size * spec.pp_size
+    if world_size % non_dp_size != 0:
+        raise ValueError(
+            f"world_size {world_size} is not divisible by non-DP size "
+            f"{non_dp_size}"
+        )
+    dp_size = world_size // non_dp_size
+    fsdp_data_parallel_size = dp_size * spec.cp_size
+    if fsdp_data_parallel_size % spec.dp_shard_size != 0:
+        raise ValueError(
+            "DP+CP size "
+            f"{fsdp_data_parallel_size} is not divisible by FSDP shard size "
+            f"{spec.dp_shard_size}"
+        )
+    dense_world_size = dp_size * spec.cp_size * spec.tp_size
+    if dense_world_size % spec.ep_size != 0:
+        raise ValueError(
+            f"expert domain size ({dense_world_size}) must be divisible by "
+            f"ep_size ({spec.ep_size})"
+        )
+    expert_data_parallel_size = dense_world_size // spec.ep_size
+    if expert_data_parallel_size % spec.edp_shard_size != 0:
+        raise ValueError(
+            f"expert data-parallel size ({expert_data_parallel_size}) must be "
+            f"divisible by edp_shard_size ({spec.edp_shard_size})"
+        )
+    return ParallelLayout(
+        spec=spec,
+        world_size=world_size,
+        dp_size=dp_size,
+        dp_replicate_size=fsdp_data_parallel_size // spec.dp_shard_size,
+    )
+
+
+def infer_minimum_world_size(spec: ParallelTopologySpec) -> int:
+    """Return the smallest world size satisfying every parallel contract."""
+    dense_world_size = math.lcm(
+        spec.tp_size * spec.cp_size,
+        spec.ep_size,
+        spec.tp_size * spec.dp_shard_size,
+        spec.ep_size * spec.edp_shard_size,
+    )
+    return dense_world_size * spec.pp_size
+
+
+@dataclass(frozen=True)
+class LogicalDeviceMesh:
+    """Process-group-free subset of the DeviceMesh planning interface."""
+
+    mesh_dim_names: tuple[str, ...]
+    mesh_shape: tuple[int, ...]
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        """Return the logical mesh shape."""
+        return self.mesh_shape
+
+    def __getitem__(
+        self, mesh_dim_names: Union[str, Tuple[str, ...]]
+    ) -> "LogicalDeviceMesh":
+        """Return a logical submesh selected by dimension name."""
+        names = (
+            (mesh_dim_names,)
+            if isinstance(mesh_dim_names, str)
+            else tuple(mesh_dim_names)
+        )
+        missing = tuple(name for name in names if name not in self.mesh_dim_names)
+        if missing:
+            raise KeyError(f"logical mesh has no dimensions {missing!r}")
+        shape_by_name = dict(zip(self.mesh_dim_names, self.mesh_shape))
+        return LogicalDeviceMesh(
+            mesh_dim_names=names,
+            mesh_shape=tuple(shape_by_name[name] for name in names),
+        )
+
+    def size(self, mesh_dim: Optional[Union[int, str]] = None) -> int:
+        """Return the total or selected logical dimension size."""
+        if mesh_dim is None:
+            return math.prod(self.mesh_shape)
+        index = (
+            self.mesh_dim_names.index(mesh_dim)
+            if isinstance(mesh_dim, str)
+            else mesh_dim
+        )
+        return self.mesh_shape[index]
 
 
 def _init_topology_mesh(mesh_kwargs: dict[str, Any]) -> Any:
@@ -74,6 +222,23 @@ class MeshContext:
     ep_rank: int = 0
     sequence_parallel: bool = False
     loss_parallel: bool = False
+
+    @classmethod
+    def from_layout(cls, layout: ParallelLayout) -> "MeshContext":
+        """Create common mesh metadata from a resolved parallel layout."""
+        spec = layout.spec
+        return cls(
+            dp_size=layout.dp_size,
+            dp_replicate_size=layout.dp_replicate_size,
+            dp_shard_size=spec.dp_shard_size,
+            edp_shard_size=spec.edp_shard_size,
+            tp_size=spec.tp_size,
+            cp_size=spec.cp_size,
+            pp_size=spec.pp_size,
+            ep_size=spec.ep_size,
+            sequence_parallel=spec.sequence_parallel,
+            loss_parallel=spec.loss_parallel,
+        )
 
     @property
     def pp_enabled(self) -> bool:
@@ -196,7 +361,7 @@ class MeshContext:
         self,
         device_type: str,
         init_backend: bool,
-        dense_rank_list: tuple[int, ...] | None,
+        dense_rank_list: Optional[Tuple[int, ...]],
     ) -> None:
         """Build the expert-parallel FSDP mesh when expert parallelism is enabled."""
         self.fsdp_moe_mesh = None
@@ -256,9 +421,6 @@ class DistributedSetup:
     """
     mesh_context: MeshContext = field(default_factory=MeshContext)
     strategy_config: Any = None
-    pipeline_config: Any = None
-    moe_parallel_config: Any = None
-    activation_checkpointing: Any = None
     # Normalized ``{match: ModuleShardingSpec}`` mapping (or None) — the
     # Trainer desugars YAML PlanOverride entries via
     # entries_to_plan_overrides (when-filtering against the built mesh
@@ -275,53 +437,25 @@ class DistributedSetup:
     low_precision_config: Any = None
     fp32_main_params: bool = False
 
+    @classmethod
+    def from_config(
+        cls, config: Any, mesh_context: MeshContext, *, strategy_enabled: bool
+    ) -> "DistributedSetup":
+        """Assemble model-build configuration independently of mesh execution.
 
-def _build_device_mesh_from_accelerator(
-    accel: Any,
-    dp_shard_size: int,
-    dp_replicate_size: int,
-    world_size: int,
-    edp_shard_size: int = 1,
-) -> tuple[MeshContext, tuple[str, ...]]:
-    """Build the explicit MeshContext domains from accelerator topology."""
-    tp_size = max(1, accel.tp_size)
-    cp_size = max(1, accel.cp_size)
-    pp_size = max(1, accel.pp_size)
-    ep_size = max(1, accel.ep_size)
+        Args:
+            config: Resolved training configuration.
+            mesh_context: Topology prepared by the caller.
+            strategy_enabled: Whether to retain the configured FSDP strategy.
 
-    dp_size = world_size // (tp_size * cp_size * pp_size)
-    mesh_context = MeshContext(
-        dp_size=dp_size,
-        dp_replicate_size=dp_replicate_size,
-        dp_shard_size=dp_shard_size,
-        edp_shard_size=edp_shard_size,
-        tp_size=tp_size,
-        cp_size=cp_size,
-        pp_size=pp_size,
-        ep_size=ep_size,
-        sequence_parallel=bool(accel.sequence_parallel),
-        loss_parallel=bool(accel.loss_parallel),
-    )
-    mesh_context.build_meshs(get_device_type(), world_size)
-    device_mesh_shape = (
-        mesh_context.device_mesh.mesh_shape
-        if hasattr(mesh_context.device_mesh, "mesh_shape")
-        else None
-    )
-    dense_shape = (
-        mesh_context.fsdp_non_moe_mesh.mesh_shape
-        if hasattr(mesh_context.fsdp_non_moe_mesh, "mesh_shape")
-        else None
-    )
-    expert_shape = (
-        mesh_context.fsdp_moe_mesh.mesh_shape
-        if mesh_context.fsdp_moe_mesh is not None and hasattr(mesh_context.fsdp_moe_mesh, "mesh_shape")
-        else None
-    )
-    logger.info(
-        "Built device mesh %s, dense FSDP mesh %s and expert FSDP mesh %s",
-        device_mesh_shape,
-        dense_shape,
-        expert_shape,
-    )
-    return mesh_context, mesh_context.device_mesh.mesh_dim_names
+        Returns:
+            Setup with common model-build policies populated.
+        """
+        return cls(
+            mesh_context=mesh_context,
+            strategy_config=config.fsdp_config if strategy_enabled else None,
+            low_precision_config=getattr(
+                getattr(config, "training", None), "low_precision", None
+            ),
+            fp32_main_params=config.optimizer.fp32_main_params,
+        )

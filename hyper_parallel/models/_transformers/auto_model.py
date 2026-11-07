@@ -19,8 +19,6 @@ Stub — provides from_pretrained/from_config as entry points.
 """
 
 import logging
-from dataclasses import is_dataclass, replace
-from types import SimpleNamespace
 from typing import Any, Literal, Optional, Union
 
 import torch
@@ -41,13 +39,14 @@ from hyper_parallel.models._transformers.model_builder import (
 )
 from hyper_parallel.models._transformers.config_resolver import get_hf_config, get_is_hf_model
 from hyper_parallel.distributed.mesh import DistributedSetup
-from hyper_parallel.codegen.modeling_backend import ModelingBackend
-from hyper_parallel.models.build_options import get_device_id, get_device_type  # pylint: disable=syntax-error
-from hyper_parallel.models.build_options import CompileConfig
+from hyper_parallel.models.build_options import (  # pylint: disable=syntax-error
+    CompileConfig,
+    get_device_id,
+    get_device_type,
+)
 from hyper_parallel.components.checkpoint.quantized_hf_storage import supports_hf_dequantization
 
 logger = logging.getLogger(__name__)
-
 
 def _current_device() -> torch.device:
     """Return the current accelerator device, or CPU when no accelerator exists."""
@@ -124,111 +123,6 @@ def _model_init_context(is_meta_device: bool) -> Any:
     return ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
 
 
-def _with_codegen_model_args(
-    config: Any,
-    *,
-    pretrained_model_name_or_path: str,
-    codegen_artifact_dir: Optional[str],
-    config_overrides: Optional[dict[str, Any]],
-) -> Any:
-    """Return a config-like object carrying model args needed by generation."""
-    yaml_path = getattr(config, "_yaml_path", None)
-    model_changes: dict[str, Any] = {
-        "pretrained_model_name_or_path": pretrained_model_name_or_path,
-    }
-    if codegen_artifact_dir is not None:
-        model_changes["codegen_artifact_dir"] = codegen_artifact_dir
-    if config_overrides is not None:
-        model_changes["config_overrides"] = config_overrides
-
-    if config is None:
-        result = SimpleNamespace(
-            codegen=True,
-            model=SimpleNamespace(**model_changes),
-        )
-        if yaml_path is not None:
-            result._yaml_path = yaml_path  # pylint: disable=protected-access
-        return result
-
-    model = getattr(config, "model", None)
-    if hasattr(model, "replace"):
-        model = model.replace(**model_changes)
-    else:
-        model = SimpleNamespace(**model_changes)
-
-    if is_dataclass(config):
-        result = replace(
-            config,
-            model=model,
-            codegen=True,
-        )
-        if yaml_path is not None:
-            result._yaml_path = yaml_path  # pylint: disable=protected-access
-        return result
-    values = dict(vars(config))
-    values.update(
-        model=model,
-        codegen=True,
-    )
-    result = SimpleNamespace(**values)
-    if yaml_path is not None:
-        result._yaml_path = yaml_path  # pylint: disable=protected-access
-    return result
-
-
-def _config_source_id(config: Any) -> str:
-    """Source identity of a config-only build, for codegen artifact resolution.
-
-    ``AutoConfig.from_pretrained`` records the originating directory in
-    ``_name_or_path``; that identity is what the codegen spec needs to resolve
-    the HuggingFace modeling file.  A config built by hand carries nothing, so
-    fail loudly instead of generating an artifact keyed on an empty source.
-    """
-    source_id = getattr(config, "_name_or_path", None) or getattr(config, "name_or_path", None)
-    if not source_id:
-        raise ValueError(
-            "codegen with from_config requires a config that records its source "
-            "(config._name_or_path); load it with AutoConfig.from_pretrained(path) "
-            "or use from_pretrained()"
-        )
-    return source_id
-
-
-def _prepare_codegen_artifact(
-    config: Any,
-    *,
-    pretrained_model_name_or_path: str,
-    codegen_artifact_dir: Optional[str],
-    config_overrides: Optional[dict[str, Any]],
-    hf_config: Any,
-) -> str:
-    """Generate or reuse the artifact bundle for the gen backend."""
-    from hyper_parallel.codegen.manager import (  # pylint: disable=import-outside-toplevel
-        ensure_codegen_artifact,
-        preflight_integrity_check,
-    )
-
-    codegen_config = _with_codegen_model_args(
-        config,
-        pretrained_model_name_or_path=pretrained_model_name_or_path,
-        codegen_artifact_dir=codegen_artifact_dir,
-        config_overrides=config_overrides,
-    )
-    layout = ensure_codegen_artifact(
-        codegen_config,
-        artifact_dir=codegen_artifact_dir,
-        hf_config=hf_config,
-    )
-    if layout is None:
-        raise RuntimeError("codegen is enabled but no artifact layout was produced")
-    preflight_integrity_check(
-        codegen_config,
-        artifact_dir=layout.artifact_dir,
-        hf_config=hf_config,
-    )
-    return layout.artifact_dir
-
-
 def _load_pretrained_config(
         pretrained_model_name_or_path: str,
         attn_implementation: str,
@@ -257,12 +151,8 @@ def _prepare_pretrained_build(
         config_overrides: Optional[dict[str, Any]],
         kwargs: dict[str, Any],
         force_hf: bool,
-        codegen: bool,
-        backend: Optional[Any],
-        codegen_config: Optional[Any],
-        codegen_artifact_dir: Optional[str],
-) -> tuple[Any, Any, PretrainedConfig, bool, Any, Optional[str]]:
-    """Prepare infrastructure, HF configuration and the selected modeling backend."""
+) -> tuple[Any, Any, PretrainedConfig, bool]:
+    """Prepare infrastructure, HF configuration and model-path selection."""
     # ② Instantiate infrastructure
     sharding_planner, fsdp2_manager = instantiate_infrastructure(
         distributed_setup=distributed_setup,
@@ -277,20 +167,7 @@ def _prepare_pretrained_build(
     # ④ Determine model path
     is_hf_model = get_is_hf_model(hf_config, force_hf)
 
-    # codegen sidecar: an explicit gen backend bypasses the HF/custom
-    # dispatch above; the master wiring stays as-is for everything else.
-    if codegen and not force_hf:
-        backend = ModelingBackend.GEN
-        if codegen_artifact_dir is None:
-            codegen_artifact_dir = _prepare_codegen_artifact(
-                codegen_config,
-                pretrained_model_name_or_path=pretrained_model_name_or_path,
-                codegen_artifact_dir=codegen_artifact_dir,
-                config_overrides=config_overrides,
-                hf_config=hf_config,
-            )
-
-    return sharding_planner, fsdp2_manager, hf_config, is_hf_model, backend, codegen_artifact_dir
+    return sharding_planner, fsdp2_manager, hf_config, is_hf_model
 
 
 class _BaseHyperAutoModelClass:
@@ -313,7 +190,15 @@ class _BaseHyperAutoModelClass:
     @classmethod
     def _from_config_parent_class(cls, *args, **kwargs):
         """Delegate to the parent Hugging Face AutoModel ``from_config`` path."""
-        return super().from_config(*args, **kwargs)  # pylint: disable=no-member
+        parent_classes = (
+            AutoModelForCausalLM,
+            AutoModelForImageTextToText,
+            AutoModelForSequenceClassification,
+        )
+        for parent_class in parent_classes:
+            if issubclass(cls, parent_class):
+                return parent_class.from_config(*args, **kwargs)
+        raise TypeError(f"{cls.__name__} has no supported Hugging Face AutoModel parent")
 
     @classmethod
     def from_pretrained(
@@ -321,7 +206,6 @@ class _BaseHyperAutoModelClass:
         pretrained_model_name_or_path: str,
         *model_args: Any,
         distributed_setup: Optional[DistributedSetup] = None,
-        backend: Optional[Any] = None,
         peft_config: Optional[Any] = None,
         torch_dtype: Union[str, torch.dtype] = "auto",
         attn_implementation: str = "sdpa",
@@ -336,12 +220,9 @@ class _BaseHyperAutoModelClass:
         allow_cache_entry_mutation: bool = False,
         activation_swap: str = "none",
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
-        codegen_artifact_dir: Optional[str] = None,
-        codegen: bool = False,
         config_overrides: Optional[dict[str, Any]] = None,
         load_base_model: bool = True,
         verify_hf_weights: Optional[str] = None,
-        codegen_config: Optional[Any] = None,
         **kwargs: Any,
     ) -> PreTrainedModel:
         """HF-compatible from_pretrained entry point.
@@ -378,12 +259,8 @@ class _BaseHyperAutoModelClass:
             config_overrides,
             kwargs,
             force_hf,
-            codegen,
-            backend,
-            codegen_config,
-            codegen_artifact_dir,
         )
-        sharding_planner, fsdp2_manager, hf_config, is_hf_model, backend, codegen_artifact_dir = prepared
+        sharding_planner, fsdp2_manager, hf_config, is_hf_model = prepared
         # ⑤ Build model
         model = cls._build_model(
             pretrained_model_name_or_path,
@@ -393,7 +270,6 @@ class _BaseHyperAutoModelClass:
             mesh=mesh,
             sharding_planner=sharding_planner,
             fsdp2_manager=fsdp2_manager,
-            backend=backend,
             peft_config=peft_config,
             torch_dtype=torch_dtype,
             attn_implementation=attn_implementation,
@@ -409,7 +285,6 @@ class _BaseHyperAutoModelClass:
             allow_cache_entry_mutation=allow_cache_entry_mutation,
             activation_swap=activation_swap,
             model_init_dtype=model_init_dtype,
-            codegen_artifact_dir=codegen_artifact_dir,
             **kwargs,
         )
         if verify_hf_weights is not None:
@@ -424,7 +299,6 @@ class _BaseHyperAutoModelClass:
         *model_args: Any,
         distributed_setup: Optional[DistributedSetup] = None,
         device_mesh: Optional[Any] = None,
-        backend: Optional[Any] = None,
         peft_config: Optional[Any] = None,
         torch_dtype: Union[str, torch.dtype] = "auto",
         attn_implementation: str = "sdpa",
@@ -438,18 +312,14 @@ class _BaseHyperAutoModelClass:
         allow_cache_entry_mutation: bool = False,
         activation_swap: str = "none",
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
-        codegen: bool = False,
-        codegen_config: Optional[Any] = None,
         **kwargs: Any,
     ) -> PreTrainedModel:
         """Build model from PretrainedConfig (no weight loading).
 
         Following design doc 01 §6.1.
 
-        ``codegen`` selects the ``gen`` backend exactly as in
-        :meth:`from_pretrained`: the artifact bundle is prepared here from the
-        config's source identity.  No checkpoint is loaded either way, so the
-        from-config random initialization path is preserved.
+        No checkpoint is loaded, so the from-config random initialization path
+        is preserved.
         """
         if distributed_setup is None:
             distributed_setup = DistributedSetup()
@@ -462,18 +332,6 @@ class _BaseHyperAutoModelClass:
         )
         is_hf_model = get_is_hf_model(config, force_hf=False)
 
-        # codegen sidecar (same shape as from_pretrained's)
-        codegen_artifact_dir = None
-        if codegen:
-            backend = ModelingBackend.GEN
-            codegen_artifact_dir = _prepare_codegen_artifact(
-                codegen_config,
-                pretrained_model_name_or_path=_config_source_id(config),
-                codegen_artifact_dir=None,
-                config_overrides=None,
-                hf_config=config,
-            )
-
         return cls._build_model(
             None,
             *model_args,
@@ -482,7 +340,6 @@ class _BaseHyperAutoModelClass:
             mesh=mesh,
             sharding_planner=sharding_planner,
             fsdp2_manager=fsdp2_manager,
-            backend=backend,
             peft_config=peft_config,
             torch_dtype=torch_dtype,
             attn_implementation=attn_implementation,
@@ -498,7 +355,6 @@ class _BaseHyperAutoModelClass:
             allow_cache_entry_mutation=allow_cache_entry_mutation,
             activation_swap=activation_swap,
             model_init_dtype=model_init_dtype,
-            codegen_artifact_dir=codegen_artifact_dir,
             **kwargs,
         )
 
@@ -512,7 +368,6 @@ class _BaseHyperAutoModelClass:
         mesh,
         sharding_planner,
         fsdp2_manager,
-        backend,
         peft_config,
         torch_dtype,
         attn_implementation,
@@ -529,7 +384,6 @@ class _BaseHyperAutoModelClass:
         allow_cache_entry_mutation: bool = False,
         activation_swap: str = "none",
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
-        codegen_artifact_dir: Optional[str] = None,
         **kwargs,
     ) -> PreTrainedModel:
         """Core model building orchestration.
@@ -570,8 +424,6 @@ class _BaseHyperAutoModelClass:
                 torch_dtype,
                 is_hf_model,
                 *model_args,
-                backend=backend,
-                codegen_artifact_dir=codegen_artifact_dir,
                 **init_kwargs,
             )
 
@@ -599,10 +451,6 @@ class _BaseHyperAutoModelClass:
             allow_cache_entry_mutation=allow_cache_entry_mutation,
             activation_swap=activation_swap,
             model_init_dtype=model_init_dtype,
-            codegen_artifact_dir=(
-                codegen_artifact_dir if backend is ModelingBackend.GEN else None
-            ),
-            hf_config=hf_config,
         )
 
         model.train()

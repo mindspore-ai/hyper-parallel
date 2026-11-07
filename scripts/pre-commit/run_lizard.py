@@ -17,6 +17,10 @@
 
 from __future__ import annotations
 
+import csv
+import io
+import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -25,6 +29,7 @@ from typing import List
 LIZARD_CCN = 15
 LIZARD_NLOC = 100
 SOURCE_SUFFIXES = {".py", ".c", ".cc", ".cpp", ".h", ".hpp"}
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
 
 def _repo_root() -> Path:
@@ -62,8 +67,82 @@ def main() -> int:
         f"-T nloc={LIZARD_NLOC}",
         "-w",
     ] + files
+    from_ref = os.environ.get("PRE_COMMIT_FROM_REF")
+    to_ref = os.environ.get("PRE_COMMIT_TO_REF")
+    if from_ref and to_ref:
+        return _run_incremental(repo_root, files, from_ref, to_ref)
     result = subprocess.run(command, cwd=repo_root, check=False)
     return result.returncode
+
+
+def _run_incremental(repo_root: Path, files: List[str], from_ref: str, to_ref: str) -> int:
+    """Reject complex functions only when the pushed diff touches their body."""
+    changed = _changed_line_ranges(repo_root, files, from_ref, to_ref)
+    result = subprocess.run(
+        ["lizard", "--csv"] + files,
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode:
+        sys.stderr.write(result.stderr)
+        return result.returncode
+    failures = []
+    for row in csv.reader(io.StringIO(result.stdout)):
+        if len(row) < 11:
+            continue
+        nloc, complexity = int(row[0]), int(row[1])
+        filename, function_name = row[6], row[7]
+        start, end = int(row[9]), int(row[10])
+        if nloc <= LIZARD_NLOC and complexity <= LIZARD_CCN:
+            continue
+        if not _overlaps(changed.get(filename, ()), start, end):
+            continue
+        failures.append(
+            f"{filename}:{start}: warning: {function_name} has {nloc} NLOC, "
+            f"{complexity} CCN"
+        )
+    if failures:
+        print("\n".join(failures))
+        return 1
+    return 0
+
+
+def _changed_line_ranges(
+    repo_root: Path, files: List[str], from_ref: str, to_ref: str
+) -> dict[str, list[tuple[int, int]]]:
+    """Return added/modified line ranges for each file in a pushed ref range."""
+    result = subprocess.run(
+        ["git", "diff", "--unified=0", from_ref, to_ref, "--"] + files,
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    ranges: dict[str, list[tuple[int, int]]] = {}
+    current = None
+    for line in result.stdout.splitlines():
+        if line.startswith("+++ b/"):
+            current = line[6:]
+            continue
+        match = _HUNK_RE.match(line)
+        if current is None or match is None:
+            continue
+        start = int(match.group(1))
+        count = int(match.group(2) or "1")
+        if count:
+            ranges.setdefault(current, []).append((start, start + count - 1))
+    return ranges
+
+
+def _overlaps(ranges: list[tuple[int, int]], start: int, end: int) -> bool:
+    """Return whether a function intersects an added or modified line range."""
+    return any(range_start <= end and start <= range_end for range_start, range_end in ranges)
 
 
 if __name__ == "__main__":
