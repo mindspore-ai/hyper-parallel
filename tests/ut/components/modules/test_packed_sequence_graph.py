@@ -25,7 +25,7 @@ from torch.utils._pytree import tree_flatten, tree_unflatten
 
 from hyper_parallel.compile.tracer.graph_tracer import trace_model_graph, run_traced_graph
 from hyper_parallel.models.deepseek_v41.adapter.data.runtime import DeepseekV41Runtime
-from hyper_parallel.models.deepseek_v41.aux_loss import sequence_load_balancing_loss
+from hyper_parallel.models.deepseek_v41.adapter.aux_loss import sequence_load_balancing_loss
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.trainer.runtime.model_integration import DisabledModelIntegrationSession

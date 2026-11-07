@@ -86,7 +86,7 @@ global step、RNG 和 dataloader cursor 继续 N 步；两条路径必须使用�
 重复固定句子使 Online tokenizer 和 packing 能稳定形成 4K 序列：
 
 ```bash
-python -m examples.training_demo.deepseek_v41.prepare_deepseek_v41_online_data \
+python -m hyper_parallel.models.deepseek_v41.tools.prepare_deepseek_v41_online_data \
   --output output/training_demo/deepseek_v41/online_4k.jsonl \
   --num-samples 128 \
   --sequence-length 4096
@@ -752,7 +752,7 @@ checkpoint continuation 失败仍决定核心精度状态；吞吐不会改变�
 
 ## 8. DeepSeek-V4.1 示例
 
-可从 [DeepSeek-V4.1 validation manifest](../../../examples/training_demo/deepseek_v41/deepseek_v41_validation.yaml) 开始。该示例保持清单简洁：模型结构、Online 数据、4K 序列和 dtype 在相邻 Trainer recipe 中，shell 环境和本地资产由用户指定。
+可从 [DeepSeek-V4.1 validation manifest](../../../hyper_parallel/models/deepseek_v41/tools/deepseek_v41_validation.yaml) 开始。模型结构、Online 数据、4K 序列和 dtype 仍由 `examples/training_demo/deepseek_v41/` 中的 Trainer recipe 定义，清单使用相对路径引用它；shell 环境和本地资产由用户指定。
 
 DeepSeek adapter 的验证声明包括：
 

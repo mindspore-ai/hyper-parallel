@@ -1,12 +1,11 @@
-# Single host: 16 Ascend dies, TP1/CP2/EP16, dense DP8, GBS8/micro1.
-# Retain all 40 decoder and 32 vision layers; text/vision widths are divided by 4
-# and routed experts are reduced to 16. This is a random-initialized training
-# crop, not the released full-width 384-expert model or a pretrained-weight run.
-# Keep FP32 initialization/main optimizer parameters and FP32 gradient reduction.
-# Use fused CSA2 attention and grouped-GEMM EP with diagnostic fixed routing;
-# candidate-pool layers explicitly retain reference Indexer selection and KL.
-# Use CC12M image-caption pretraining data for functional validation.
-# All paths can be overridden with the paired launcher or dotted Trainer options.
+# Multiple hosts: 128 Ascend dies, TP1/CP128/EP128, dense DP1, GBS1/micro1.
+# Retain all 40 decoder layers and 32 vision blocks, divide parameter widths by 4,
+# and use 128 routed experts for 1,048,576-token image-caption pretraining.
+# Use Host Engram, fused CSA2 attention, MegaMoe, MegaMhc, and MegaGate.
+# Candidate pools are disabled; fixed expert destinations are for benchmarking.
+# Use BF16 initialization and gradient reduction without FP32 main parameters.
+# Full activation recomputation is enabled; FSDP prefetching is disabled.
+# Override local paths with the paired launcher or dotted Trainer options.
 
 model:
   _target_: hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model.build_cropped_deepseek_v41
@@ -19,9 +18,9 @@ model:
   text_parameter_divisor: 4
   enable_vision: true
   vision_parameter_divisor: 4
-  # EP16: one local routed expert per rank, while preserving the released
-  # top-k (6), routing, dispatch, and optimizer-sharding paths.
+  # EP128 places one routed expert on each rank and retains top-k=6.
   num_routed_experts: 128
+  # Disable validation-only Indexer remapping and candidate pools for fusion.
   exercise_post_training_indexer: false
   enable_candidate_pool: false
   indexer_loss_coeff: 0.001
@@ -32,15 +31,16 @@ model:
   # Generic HyperAutoModel build options accepted by the builder.
   torch_dtype: bfloat16
   validate_placement: false
-  engram_storage_backend: host #device
+  # Keep the Engram embedding tables in host memory.
+  engram_storage_backend: host
 model_init_dtype: bfloat16
 
 training:
   train_iters: 400
   train_samples: null
   eval_iters: 0
-  # TP1/CP2 leaves eight dense DP ranks; GBS8/micro1 uses one microbatch.
-  # Expert parallelism redistributes tokens without reducing the DP divisor.
+  # DP = 128 / (TP1 * CP128 * PP1) = 1; GBS1/micro1 uses one microbatch.
+  # EP overlaps the DP+CP domain and does not change this batch-size divisor.
   global_batch_size: 1
   micro_batch_size: 1
   backend: hccl
@@ -51,18 +51,19 @@ training:
   enable_full_determinism: false
 
 accelerator:
-  tp_size: 1  # 当前CSA2融合算子不支持TP
+  tp_size: 1  # The fused CSA2 attention path requires TP1.
   cp_size: 128
   ep_size: 128
   pp_size: 1
   sequence_parallel: true
   loss_parallel: false
   encoder_parallel:
-    # 保留视觉编码器并行；空图像发送方的特征交换由 ECP 的占位传输适配处理。
+    # Encode images in groups of four; ECP uses placeholder transport for empty senders.
     enabled: true
     encoder_cp_size: 4
 
 fsdp_config:
+  # Shard dense parameters across the full 128-rank DP+CP domain.
   dp_shard_size: 128
   edp_shard_size: 1
   replicate_params: []
@@ -73,8 +74,8 @@ fsdp_config:
   reshard_after_forward: true
   reshard_after_backward: true
   requires_grad_sync: true
-  forward_prefetch_depth: 0 #1
-  backward_prefetch_depth: 0 #1
+  forward_prefetch_depth: 0
+  backward_prefetch_depth: 0
   comm_fusion: false
 
 plan_overrides:
@@ -83,30 +84,30 @@ plan_overrides:
   - match: "model.vision.blocks.*.attn"
     replace:
       kind: module
-      implementation: 
+      implementation:
         _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel.replace_vision_attention
   - match: "model.layers.*.engram"
     replace:
       kind: module
-      implementation: 
+      implementation:
         _target_: hyper_parallel.models.deepseek_v41.adapter.engram.host_replacement.HostEngramModule
   - match: "model.layers.*.self_attn"
     replace:
       kind: module
-      implementation: 
+      implementation:
         _target_: >-
           hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
+        # Fused CSA2 requires candidate pools to remain disabled and TP=1.
         use_fused_ops: true
   - match: "*.self_attn"
     tp_divide_attrs: [num_groups]
   - match: "*.self_attn.forward"
     replace:
       kind: method
-      implementation: 
+      implementation:
         _target_: >-
           hyper_parallel.models.deepseek_v41.adapter.distributed.shared_attention_context_parallel.deepseek_v41_shared_attention_parallel_wrapper
-  # V4.1 image boundary embeddings are model-owned scalars. They stay
-  # replicated over TP (TP1 in this smoke) and are covered by FSDP8.
+  # Image boundary embeddings stay replicated over TP; FSDP owns their sharding.
   - match: "model"
     params:
       image_start: {tp: replicate}
@@ -155,25 +156,24 @@ plan_overrides:
   - match: "model.layers.*.engram.forward"
     replace:
       kind: method
-      implementation: 
+      implementation:
         _target_: >-
           hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn
-  # Native alternative: remove the MegaMoe expert replacement above and select
+  # Native alternative: remove the MegaMoe expert replacement below and select
   # deepseek_v41_ep_compute_fn with use_grouped_gemm: true.
   - match: "model.layers.*.mlp.forward"
     replace:
       kind: method
-      implementation: 
+      implementation:
         _target_: >-
           hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_megamoe_compute_fn
-        fix_router: true
-  # MegaMoe supports CP and TP+SP with EP>1; PP=1. Pair this replacement with its compute target below.
+        fix_router: true  # Benchmark-only balanced destinations; use false for normal training.
+  # MegaMoe supports CP and TP+SP with EP>1 and PP=1; pair it with the compute target above.
   - match: "model.layers.*.mlp.experts"
     replace:
       kind: module
-      implementation: 
+      implementation:
         _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe.DeepseekV41MegaMoeExperts
-        # Upper bound on actual local rows; increase it for larger encoded VLM batches.
         dispatch_mode: push  # Set to pull for GET dispatch.
   # HyperMegaMhc reuses the original fn/base/scale parameters.
   - match:
@@ -181,13 +181,13 @@ plan_overrides:
       - "model.layers.*.ffn_hc"
     replace:
       kind: module
-      implementation: 
+      implementation:
         _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc.DeepseekV41HyperMegaMhc
   # MegaGate fused router: requires the multicore native build.
   - match: "model.layers.*.mlp.gate"
     replace:
       kind: module
-      implementation: 
+      implementation:
         _target_: >-
           hyper_parallel.models.deepseek_v41.adapter.distributed.mega_gate.DeepseekV41MegaGate
 
@@ -195,7 +195,8 @@ mixed_precision:
   enabled: false
 
 activation_checkpoint:
-  mode: full #"off"
+  # Recompute full model regions to reduce activation memory.
+  mode: full
 
 activation_swap: none
 
@@ -209,6 +210,7 @@ compile:
   dynamo_cache_size_limit: 256
 
 dataset:
+  # Supervise caption text and EOS; image positions and padding are ignored.
   training_mode: pretrain
   model_assets:
     _target_: hyper_parallel.models.deepseek_v41.adapter.data.processor.build_deepseek_v41_processor
@@ -267,15 +269,13 @@ lr_scheduler:
 
 checkpoint:
   save_ckpt: false
-  checkpoint_dir: /path/to/ckpt/
+  checkpoint_dir: ./output/training_demo/deepseek_v41/artifacts/checkpoints
   save_steps: 10
   save_epochs: 1
   is_async: false
   save_optimizer: true
   save_train_state: true
-  # DeepSeek-V4.1 VLM (24.54B) verified: per_rank=true layout works with sync/async
-  # save, full-state resume, weights-only restore, and async checkpoint resume across
-  # 8-card EP8/FSDP8 with text_parameter_divisor=2, vision_parameter_divisor=2, 64 experts.
+  # Preserve rank-local extra state when checkpoint saving is enabled.
   save_extra_state_per_rank: true
   restore_from: null
   restore_optimizer: true

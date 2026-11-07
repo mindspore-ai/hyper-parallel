@@ -40,10 +40,10 @@ mkdir -p "${OUTPUT_DIR}"
 cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 
 source /usr/local/Ascend/cann/set_env.sh
-source /usr/local/Ascend/cann-9.2.0-beta.2/opp/vendors/omni_training_custom_transformer/bin/set_env.bash
+source /usr/local/Ascend/cann-9.2.0/opp/vendors/omni_training_custom_transformer/bin/set_env.bash
 
-export ASCEND_CUSTOM_OPP_PATH="/usr/local/Ascend/cann-9.2.0-beta.2/opp/vendors/custom_transformer${ASCEND_CUSTOM_OPP_PATH:+:${ASCEND_CUSTOM_OPP_PATH}}"
-export LD_LIBRARY_PATH="/usr/local/Ascend/cann-9.2.0-beta.2/opp/vendors/custom_transformer/op_api/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+export ASCEND_CUSTOM_OPP_PATH="/usr/local/Ascend/cann-9.2.0/opp/vendors/custom_transformer${ASCEND_CUSTOM_OPP_PATH:+:${ASCEND_CUSTOM_OPP_PATH}}"
+export LD_LIBRARY_PATH="/usr/local/Ascend/cann-9.2.0/opp/vendors/custom_transformer/op_api/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export PYTHONPATH="/workspace/venv/lib/python3.12/site-packages${PYTHONPATH:+:${PYTHONPATH}}"
 
 source build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
@@ -82,7 +82,7 @@ export TORCH_EXTENSIONS_DIR
 printf 'Torch extensions cache: %s\n' "${TORCH_EXTENSIONS_DIR}"
 
 if [[ ! -s "${ASSETS_PATH}" ]]; then
-    "${PYTHON_BIN}" -m examples.training_demo.deepseek_v41.prepare_deepseek_v41_assets \
+    "${PYTHON_BIN}" -m hyper_parallel.models.deepseek_v41.tools.prepare_deepseek_v41_assets \
         --model-dir "${MODEL_PATH}" \
         --output "${ASSETS_PATH}" \
         --bucket-base 4096 \
@@ -95,7 +95,7 @@ if [[ ! -s "${DATA_PATH}" ]]; then
         echo "Use an existing VLM dataset or a path ending in /train.jsonl." >&2
         exit 1
     fi
-    "${PYTHON_BIN}" -m examples.training_demo.deepseek_v41.prepare_deepseek_v41_vlm_data \
+    "${PYTHON_BIN}" -m hyper_parallel.models.deepseek_v41.tools.prepare_deepseek_v41_vlm_data \
         --model-dir "${MODEL_PATH}" \
         --output-dir "$(dirname "${DATA_PATH}")" \
         --num-samples 128000 \

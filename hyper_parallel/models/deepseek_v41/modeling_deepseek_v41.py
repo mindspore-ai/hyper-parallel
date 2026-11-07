@@ -48,7 +48,7 @@ from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
 from hyper_parallel.components.modules.mhc import PipelinedMhcModule, pipelined_mhc_post
 from hyper_parallel.core.multicore.modules.mega_gate import MegaGate
-from hyper_parallel.models.deepseek_v41.aux_loss import (
+from hyper_parallel.models.deepseek_v41.adapter.aux_loss import (
     accumulate_router_load,
     sequence_load_balancing_loss,
     update_modality_bias,

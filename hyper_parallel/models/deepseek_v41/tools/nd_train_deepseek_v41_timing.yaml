@@ -1,34 +1,41 @@
-# Validated eight-rank baseline; other training settings follow train_deepseek_v41_vlm_online.yaml.
-# Runtime layer crop: original widths, selected weights read directly from local HF weights.
-# BF16/FP32 loads directly; native FP8/FP4 is decoded to BF16 during DCP reads, without an offline copy.
-# Retain original layer-1 Engram dimensions; the launcher generates its released hashing assets.
-# Host table plus SparseAdam moments require approximately 1.1 TiB of CPU memory across eight ranks.
-# Run with run_deepseek_v41_vlm_online_load_hf.sh; baseline saves checkpoints, without resume.
+# The launcher the repeat script reads when it times layouts of this crop.
+#
+# It trains exactly what train_deepseek_v41_online.yaml trains, and differs from it
+# in the three things a timing round needs:
+#
+#   - No checkpointing. A round launches the same job many times, and a save of
+#     the full state costs more wall clock than the steps being measured.
+#   - Grouped GEMM off in the expert compute function, so every layout in a round
+#     runs the one expert path and a comparison between layouts is a comparison of
+#     the layouts.
+#   - No drafter plan overrides. They apply only when a drafter depth is asked for,
+#     which a timing round never does.
+#
+# The cost model prices this file, and the sapp-parallel-strategy skill ships it as a
+# template, so a round times the job the model priced. Keep the two in step: the
+# skill refuses to write a round's command where this launcher states anything the
+# model did not price, apart from the fields the script sets for each run and the
+# paths it takes from the node.
+#
+# The model, Engram assets, tokenizer and data paths below are placeholders. The
+# repeat script passes the node's own on every launch.
+# Relative output paths are resolved from the repository root, not this tools directory.
 model:
   _target_: hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model.build_cropped_deepseek_v41
-  config_path: /path/to/DeepSeek-V4.1-Flash-BF16
-  num_hidden_layers: 2
-  text_parameter_divisor: 1
-  enable_vision: true
-  vision_num_hidden_layers: 2
-  vision_parameter_divisor: 1
-  num_routed_experts: 384
-  exercise_post_training_indexer: false
-  enable_candidate_pool: true
-  router_aux_loss_coeff: 0.001
-  engram_assets_path: /path/to/generated/engram_assets.json
-  engram_storage_backend: host
-  load_base_model: true
-  # Verify all loaded shards, including CPU Host Engram, before the first forward.
-  verify_hf_weights: ./output/training_demo/deepseek_v41/hf_weight_check
+  config_path: /path/to/DeepSeek-V4.1-Flash
+  engram_assets_path: ./output/training_demo/deepseek_v41/engram_depth_preserving_d8.json
+  text_parameter_divisor: 8
+  num_routed_experts: 16
+  exercise_post_training_indexer: true
+  indexer_loss_coeff: 0.001
   torch_dtype: bfloat16
   validate_placement: false
 model_init_dtype: float32
 training:
-  train_iters: 10
+  train_iters: 1
   train_samples: null
   eval_iters: 0
-  global_batch_size: 8
+  global_batch_size: 16
   micro_batch_size: 1
   backend: hccl
   init_device: meta
@@ -39,14 +46,12 @@ training:
 accelerator:
   tp_size: 1
   cp_size: 1
-  ep_size: 8
+  ep_size: 16
   pp_size: 1
   sequence_parallel: false
   loss_parallel: false
-  encoder_parallel:
-    enabled: false
 fsdp_config:
-  dp_shard_size: 8
+  dp_shard_size: 16
   edp_shard_size: 1
   replicate_params: []
   mix_precision:
@@ -60,11 +65,6 @@ fsdp_config:
   backward_prefetch_depth: 1
   comm_fusion: false
 plan_overrides:
-- match: model.vision.blocks.*.attn
-  replace:
-    kind: module
-    implementation:
-      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel.replace_vision_attention
 - match:
   - model.layers.*.attn_hc
   - model.layers.*.ffn_hc
@@ -72,29 +72,16 @@ plan_overrides:
     kind: module
     implementation:
       _target_: hyper_parallel.components.modules.mhc.PipelinedMhcModule
+- match: model.layers.*.engram
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.components.modules.engram.EngramModule
 - match: model.layers.*.self_attn
   replace:
     kind: module
     implementation:
       _target_: hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
-- match: model.layers.*.engram
-  replace:
-    kind: module
-    implementation:
-      _target_: hyper_parallel.models.deepseek_v41.adapter.engram.host_replacement.HostEngramModule
-- match: model.layers.*.engram
-  params:
-    q_weight: {tp: replicate}
-    k_weight: {tp: replicate}
-    embed.weight: {ep: 'shard(0)'}
-    wkv.weight: {tp: replicate}
-- match: model.layers.*.engram.forward
-  when: ep
-  region_dispatch: false
-  replace:
-    kind: method
-    implementation:
-      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn
 - match: '*.self_attn'
   tp_divide_attrs:
   - num_groups
@@ -104,14 +91,6 @@ plan_overrides:
     kind: method
     implementation:
       _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.shared_attention_context_parallel.deepseek_v41_shared_attention_parallel_wrapper
-- match: model
-  params:
-    image_start:
-      tp: replicate
-    image_end:
-      tp: replicate
-    image_newline:
-      tp: replicate
 - match: model.layers.*.*_hc
   region_dispatch: false
   params:
@@ -195,18 +174,38 @@ plan_overrides:
       tp: shard(1)
       cp: shard(1)
       ep: replicate
-- match: model.layers.*.mlp.forward
+- match: model.layers.*.engram
+  params:
+    q_weight:
+      tp: replicate
+    k_weight:
+      tp: replicate
+    embed.weight:
+      ep: shard(0)
+    wkv.weight:
+      tp: replicate
+- match: model.layers.*.engram.forward
+  when: ep
+  region_dispatch: false
+  replace:
+    kind: method
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn
+- match: '*.mlp.forward'
   when: ep
   region_dispatch: false
   replace:
     kind: method
     implementation:
       _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
-      use_grouped_gemm: true
+      use_grouped_gemm: false
 mixed_precision:
   enabled: false
 activation_checkpoint:
   mode: 'off'
+  selection:
+    source: model_adapter_safe_regions
+    layer_count: 0
 activation_swap: none
 compile:
   enabled: false
@@ -217,41 +216,48 @@ compile:
   options: {}
   dynamo_cache_size_limit: 256
 dataset:
-  training_mode: sft
   model_assets:
-    _target_: hyper_parallel.models.deepseek_v41.adapter.data.processor.build_deepseek_v41_processor
-    config_path: /path/to/DeepSeek-V4.1-Flash-BF16
+    chat_template: null
+    tokenizer:
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: /path/to/DeepSeek-V4.1-Flash
+      local_files_only: true
+      use_fast: true
+      trust_remote_code: false
   data_transform:
-    _target_: hyper_parallel.models.deepseek_v41.adapter.data.transform_fn.build_deepseek_v41_omni_transform
+    _target_: hyper_parallel.data.text.text_transform.build_text_transform
+    data_type: plaintext
+    text_keys: text
     max_seq_len: 4096
-    sample_format: messages
-    sample_alignment_size: 4
-  _target_: hyper_parallel.data.omni.build_dataset.build_online_omni_mapping_dataset
-  data_path: /path/to/train.jsonl
-  data_config: {}
+  _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
+  data_path: ./output/training_demo/deepseek_v41/online_4k.jsonl
+  data_config:
+    create_attention_mask_in_dataloader: true
+    labels_are_shifted: true
 dataloader:
-  _target_: hyper_parallel.data.batching.OmniPackingLoader
+  _target_: hyper_parallel.data.batching.TokenBatchLoader
+  min_buffered_samples: 1
   collate_fn:
-    _target_: hyper_parallel.data.batching.build_omni_collate_fn
+    _target_: hyper_parallel.data.batching.build_online_text_collate_fn
   get_batch:
-    _target_: hyper_parallel.data.batching.OmniParallelBatch
+    _target_: hyper_parallel.data.batching.TextParallelBatch
+    source_type: online
+    attention_mode: compressed
     runtime_input_adapter:
       _target_: hyper_parallel.models.deepseek_v41.adapter.data.runtime.DeepseekV41Runtime
+      include_position_ids: false
+      include_image_sequence_start: false
   sampler_type: single
-  token_budget: 128
-  min_buffered_samples: 1
+  data_rearrange_map: null
+  data_sharding: false
   drop_last: true
+  use_background_prefetcher: false
   num_workers: 0
   pin_memory: false
   prefetch_factor: null
 optimizer:
   _target_: hyper_parallel.components.optim.Muon
   fp32_main_params: true
-  swap:
-    enabled: true
-    swap_times: 16
-    min_numel: 1024
-    packed_swap: false
   no_decay_params:
   - bias
   - norm
@@ -278,18 +284,9 @@ lr_scheduler:
     lr_warmup_steps: 1
     min_lr: 0.0
 checkpoint:
-  save_ckpt: true
-  checkpoint_dir: runs/deepseek_v41/vlm_load_hf/checkpoints
-  save_steps: 10
-  save_epochs: 1
-  is_async: false
-  save_optimizer: true
-  save_train_state: true
-  save_extra_state_per_rank: true
+  save_ckpt: false
+  checkpoint_dir: ./output/training_demo/deepseek_v41/checkpoints
   restore_from: null
-  restore_optimizer: true
-  restore_train_state: true
-  restore_dataloader_state: true
 debug:
   check_nan_inf: false
-  check_dataset: debug
+  check_dataset: null

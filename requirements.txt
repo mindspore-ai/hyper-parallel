@@ -12,3 +12,4 @@ huggingface-hub>=1.5.0
 tokenizers>=0.22.1
 einops>=0.1.0
 packaging>=22.0
+peft>=0.21.2

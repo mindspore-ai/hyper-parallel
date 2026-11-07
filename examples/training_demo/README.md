@@ -113,86 +113,55 @@ validates both Indexed Dataset files. Missing local assets therefore fail
 explicitly rather than triggering a network download. Additional typed Trainer
 overrides may be appended to either command.
 
-## DeepSeek-V4.1 Engram and shared compressed attention
+## DeepSeek-V4.1 text pretraining
 
-`deepseek_v41/train_deepseek_v41_online.yaml` is a four-layer, randomly initialized
-DeepSeek-V4.1 text crop. Hierarchical candidates are disabled by default,
-preserving the released Full/Reindex/Reuse roles of the retained layers.
-With zero-based layer indices, layer 1 owns Engram, layer 2 is a Full layer
-that publishes compressed KV, Index K, and TopK selections, and layer 3 is a
-Reuse layer that consumes those shared results. This prefix has no Reindex layer.
-The crop also enables the PanGu-style selected-TopK Indexer KL training path.
+The [text configuration](deepseek_v41/train_deepseek_v41_online.yaml) retains all
+40 decoder layers, divides text parameter widths by four, and uses 16 routed
+experts with random initialization. It follows the VLM recipe's TP1/CP4/EP8,
+FSDP8, FP32 main parameters and reduction, BF16 forward parameters, Host Engram,
+fused CSA2 attention, MegaMoe/MegaMhc/MegaGate, and full recomputation.
+Vision and encoder parallelism are disabled. Fixed expert destinations are a
+benchmark setting; set `fix_router: false` for normal learned routing.
 
-For non-fused candidate testing, set `enable_candidate_pool: true`. Only then
-does `exercise_post_training_indexer: true` (the default) bound the candidate
-pool and remap layer 3 to Reindex for this shallow crop. Vision, DSpark, the
-second Engram layer, later compressed-attention source groups, PP-stage shadow
-indexers, runtime KV-cache decode, and FP4 QAT remain outside this validation
-crop. Raw KV, shared compressed KV, and compressed index K use PanGu-style
-asynchronous KV-all-gather CP.
-
-The Engram table is scaled consistently instead of truncating a checkpoint
-table. `deepseek_v41/prepare_deepseek_v41_assets.py` changes every active hash bucket to a
-different prime near 4096, then recomputes offsets and the embedding row count.
-For the active layer-1 table this changes 384,006,168 rows to 100,776 rows while
-retaining 3 n-gram orders, 8 hash heads, and a 256-wide embedding. The tokenizer
-normalization and hash multipliers remain the V4.1 values.
-
-Online packing emits compact sample boundaries instead of a dense `[S,S]`
-attention mask. Each packed sample is aligned to the encoder compression ratio,
-so neither CSA2 compressor groups nor Engram n-grams cross sample boundaries.
-
-Prepare the shell using the project
-[`installation guide`](../../docs/installation.md), then run TP1 first. A
-successful TP1 run creates a marker required by TP2:
+Prepare the environment with the [DeepSeek-V4.1 quick start](deepseek_v41/deepseek_v41_quick_start.md),
+then run from the repository root:
 
 ```bash
 bash examples/training_demo/deepseek_v41/run_deepseek_v41_online.sh \
-    /path/to/DeepSeek-V4.1-Flash tp1
+    /path/to/DeepSeek-V4.1-Flash --training.train_iters=1 --checkpoint.restore_from=null
 
+# Supply an existing text JSONL instead of generating the default test data.
 bash examples/training_demo/deepseek_v41/run_deepseek_v41_online.sh \
-    /path/to/DeepSeek-V4.1-Flash tp2
-
-bash examples/training_demo/deepseek_v41/run_deepseek_v41_online.sh \
-    /path/to/DeepSeek-V4.1-Flash cp2
+    /path/to/DeepSeek-V4.1-Flash /path/to/text/train.jsonl
 ```
 
-All modes use 16 processes, Online tokenization, a 4096-token sequence, EP=16,
-and the mandatory FP32-main-parameter policy. TP1 uses FSDP=16; TP2 uses
-FSDP=8 and enables sequence parallel so Engram's replicated fusion projections
-operate on disjoint token slices, matching PanGu's `SequenceParallelLinear`
-contract. CP2 keeps TP=1 and uses asynchronous Colossal/KV-all-gather CP; it
-does not use Ulysses sequence-to-head exchange. The launcher reads only local
-config/tokenizer files and creates the scaled Engram metadata plus deterministic
-Online JSONL under `output/training_demo/deepseek_v41`.
-
-The model-owned Engram, CSA2, TP/CP/EP, checkpoint, and validation declarations
-live together in the
-[`deepseek_v41` adapter](../../hyper_parallel/models/deepseek_v41/adapter/).
-The generic workflow is documented in the
-[`model-integration validation guide`](../../docs/guide/trainer/model_integration_validation.md).
+Records use a `text` field. The transform tokenizes documents into 4096-token
+windows and drops partial tails. The launcher accepts a model path, an optional
+dataset path, and dotted Trainer overrides; the old `tp1|tp2|cp2` selector is no
+longer used. Fused CSA2 requires TP1. Generated Engram assets use parameter divisor 4.
+Text logs use `run_text_tp1_cp4_ep8_fsdp8.log` by default, and checkpoints use
+`output/training_demo/deepseek_v41/artifacts/text_checkpoints`.
 
 ## DeepSeek-V4.1 multimodal Online smoke
 
-The custom validation crop adds the V4.1 ViT, 3x3 aligner, image-boundary
-embeddings, image-aware MoE routing, and OpenAI-messages image data transform.
-It uses one vision block and 16 routed experts for the validation crop while
-retaining the released model dimensions. The model adapter declares per-vision
-block, aligner, and mixed-mesh Engram FSDP units plus the actual forward order;
-the generic FSDP manager contains no DeepSeek-specific branches.
-
-Prepare the environment and the local image JSONL, then run:
+The [VLM configuration](deepseek_v41/train_deepseek_v41_vlm_online.yaml) also
+retains 32 vision blocks with parameter divisor 4 and enables encoder CP4.
+It uses `pretrain + image_caption` data and a 4096-token packed window.
+See the [quick start](deepseek_v41/deepseek_v41_quick_start.md) for dependencies,
+CC12M/fake data preparation, operator switches, HF weight-loading constraints,
+and troubleshooting.
 
 ```bash
 bash examples/training_demo/deepseek_v41/run_deepseek_v41_vlm_online.sh \
-    /path/to/DeepSeek-V4.1-Flash \
-    /path/to/train.jsonl
+    /path/to/DeepSeek-V4.1-Flash /path/to/image_caption/train.jsonl
 ```
 
-The default data path is
-`output/training_demo/deepseek_v41/mm_data/deepseek_v41_messages/train.jsonl`.
-The launcher removes a stale success marker before starting and recreates it
-only after all 16 ranks complete. Use
-[`deepseek_v41_validation.yaml`](deepseek_v41/deepseek_v41_validation.yaml) to
-generate reproducible structure, module-parity, precision, checkpoint, and
-performance evidence for the selected local environment.
+The default dataset is
+`output/training_demo/deepseek_v41/mm_data/deepseek_v41_image_caption/train.jsonl`.
+Both launchers clear a stale success marker and recreate it after every worker
+exits successfully. Explicit Trainer overrides are passed last.
+
+The [validation manifest](../../hyper_parallel/models/deepseek_v41/tools/deepseek_v41_validation.yaml)
+defines the TP/CP/EP, recompute, precision and checkpoint validation matrix. The
+[ND measurement guide](../../hyper_parallel/models/deepseek_v41/tools/nd_timing_round.md)
+describes the separate layout measurement workflow.

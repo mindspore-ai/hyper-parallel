@@ -1,37 +1,44 @@
-# Depth-preserving DeepSeek-V4.1 parameter crop: Online 4K and EP16.
-# All 40 decoder layers and their released roles remain at native indices. The
-# MegaMoe supports CP and TP with sequence_parallel=true and EP>1; PP must remain 1.
+# Single host: 16 Ascend dies, TP1/CP4/EP8, dense DP4, GBS8/micro1.
+# Retain all 40 decoder layers, divide text parameter widths by 4, and use
+# 16 routed experts for a 4096-token text pretraining smoke; vision is disabled.
+# Use Host Engram, fused CSA2 attention, MegaMoe, MegaMhc, and MegaGate.
+# Candidate pools are disabled; fixed expert destinations are for benchmarking.
+# Initialize in FP32, use BF16 forward parameters, and reduce gradients in FP32.
 
 model:
   _target_: hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model.build_cropped_deepseek_v41
+  # Official DeepSeek-V4.1-Flash repository; environment-specific paths are
+  # intentionally supplied by the user.
   config_path: /path/to/DeepSeek-V4.1-Flash
-  engram_assets_path: ./output/training_demo/deepseek_v41/engram_depth_preserving_d8.json
-  # Scale text width, MLP, attention, low-rank, Indexer, and Engram dimensions
-  # by 8 while preserving per-head widths, decoder depth, and layer roles.
-  # Preserve all 40 decoder layers; the selected recompute regions below
-  # bound activation memory for the 4K Online training sequence.
-  text_parameter_divisor: 8
+  # Validation-only scaled Engram metadata generated from the official assets.
+  engram_assets_path: ./output/training_demo/deepseek_v41/artifacts/engram_depth_preserving_d4.json
+  # Keep the released decoder depth and layer roles; scale parameter dimensions.
+  text_parameter_divisor: 4
+  enable_vision: false
+  # EP8 places two routed experts on each rank and retains top-k=6.
   num_routed_experts: 16
-  # Exercise the released decoder's post-training Full -> Reindex hierarchy
-  # at its native layer indices while keeping a larger-than-TopK candidate pool.
-  exercise_post_training_indexer: true
-  # Validation-only value: the V4.1 report does not publish the production
-  # coefficient. This activates PanGu-style sparse-stage Indexer KL training.
+  # Disable validation-only Indexer remapping and candidate pools for fusion.
+  exercise_post_training_indexer: false
+  enable_candidate_pool: false
   indexer_loss_coeff: 0.001
   # Sequence auxiliary loss; 0 disables it.
   router_aux_loss_coeff: 0.0001
   # Modality load statistics and bias updates; 0 disables them.
   router_bias_update_rate: 0.001
+  # Generic HyperAutoModel build options accepted by the builder.
   torch_dtype: bfloat16
   validate_placement: false
-
+  # Keep the Engram embedding tables in host memory.
+  engram_storage_backend: host
 model_init_dtype: float32
 
 training:
-  train_iters: 1
+  train_iters: 100
   train_samples: null
   eval_iters: 0
-  global_batch_size: 16
+  # DP = 16 / (TP1 * CP4 * PP1) = 4; GBS8/micro1 accumulates two microbatches.
+  # EP overlaps the DP+CP domain and does not change this batch-size divisor.
+  global_batch_size: 8
   micro_batch_size: 1
   backend: hccl
   init_device: meta
@@ -41,15 +48,16 @@ training:
   enable_full_determinism: true
 
 accelerator:
-  tp_size: 1
-  cp_size: 1
-  ep_size: 16
+  tp_size: 1  # The fused CSA2 attention path requires TP1.
+  cp_size: 4
+  ep_size: 8
   pp_size: 1
-  sequence_parallel: false
+  sequence_parallel: true
   loss_parallel: false
 
 fsdp_config:
-  dp_shard_size: 16
+  # The DP+CP domain has 16 ranks: two replicas of each eight-rank shard group.
+  dp_shard_size: 8
   edp_shard_size: 1
   replicate_params: []
   mix_precision:
@@ -64,61 +72,29 @@ fsdp_config:
   comm_fusion: false
 
 plan_overrides:
-  # Keep the routed expert replacement paired with the MegaMoe compute target below.
-  - match: "model.layers.*.mlp.experts"
-    replace:
-      kind: module
-      implementation:
-        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe.DeepseekV41MegaMoeExperts
-        dispatch_mode: push  # Set to pull for GET dispatch.
-  # HyperMegaMhc reuses the original fn/base/scale parameters.
-  # These replacements are optimizations only: the registered architecture is
-  # executable before the Trainer applies any of them.
-  - match:
-      - "model.layers.*.attn_hc"
-      - "model.layers.*.ffn_hc"
-    replace:
-      kind: module
-      implementation:
-        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc.DeepseekV41HyperMegaMhc
-  # MegaGate fused router: requires the multicore native build.
-  - match: "model.layers.*.mlp.gate"
-    replace:
-      kind: module
-      implementation:
-        _target_: >-
-          hyper_parallel.models.deepseek_v41.adapter.distributed.mega_gate.DeepseekV41MegaGate
   - match: "model.layers.*.engram"
     replace:
       kind: module
       implementation:
-        _target_: hyper_parallel.components.modules.engram.EngramModule
+        _target_: hyper_parallel.models.deepseek_v41.adapter.engram.host_replacement.HostEngramModule
   - match: "model.layers.*.self_attn"
     replace:
       kind: module
       implementation:
         _target_: >-
           hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
-        # This recipe exercises post-training candidate pools, which the fused
-        # path does not support. Enable only for ordinary causal r1/r2 training
-        # with supported head dimensions/counts (see the replacement docstring).
-        use_fused_ops: false
+        # Fused CSA2 requires candidate pools to remain disabled and TP=1.
+        use_fused_ops: true
   - match: "*.self_attn"
-    # num_heads is auto-derived from q_b_proj sharding; the KV-group ratio is
-    # TP-invariant. Only V4.1's grouped output-projection count is custom.
     tp_divide_attrs: [num_groups]
   - match: "*.self_attn.forward"
-    # PanGu-style explicit parallel region: Indexer Q/merge heads are TP
-    # column-sharded and all-reduce scores before Top-K; CP keeps local Q and
-    # asynchronously gathers raw KV, compressed KV, and index K. The module
-    # owns the communication launch/wait points.
     replace:
       kind: method
       implementation:
         _target_: >-
           hyper_parallel.models.deepseek_v41.adapter.distributed.shared_attention_context_parallel.deepseek_v41_shared_attention_parallel_wrapper
-  # A fully declared glob expands against the optimized model tree and
-  # creates one boundary for every mHC module, independent of model depth.
+  # Fully declared globs create the mHC/Engram boundaries from the final
+  # model tree, independent of model depth and Engram layer IDs.
   - match: "model.layers.*.*_hc"
     region_dispatch: false
     params:
@@ -137,8 +113,6 @@ plan_overrides:
       pre: {tp: replicate, cp: "shard(1)", ep: replicate}
       post: {tp: replicate, cp: "shard(1)", ep: replicate}
       residual: {tp: replicate, cp: "shard(1)", ep: replicate}
-  # When TP sequence parallel is active, the later entry replaces only the
-  # mHC activation contract; parameter and local-region declarations inherit.
   - match: "model.layers.*.*_hc"
     when: sequence_parallel
     in_src:
@@ -153,8 +127,6 @@ plan_overrides:
       pre: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
       post: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
       residual: {tp: "shard(1)", cp: "shard(1)", ep: replicate}
-  # Engram layers are discovered by the glob. The table layout creates the
-  # boundary; sparse all-to-all compute is added only for active virtual EP.
   - match: "model.layers.*.engram"
     params:
       q_weight: {tp: replicate}
@@ -162,13 +134,12 @@ plan_overrides:
       embed.weight: {ep: "shard(0)"}
       wkv.weight: {tp: replicate}
   - match: "model.layers.*.engram.forward"
-    when: ep
     replace:
       kind: method
       implementation:
         _target_: >-
           hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn
-  # Native alternative: remove the MegaMoe expert replacement above and select
+  # Native alternative: remove the MegaMoe expert replacement below and select
   # deepseek_v41_ep_compute_fn with use_grouped_gemm: true.
   - match: "model.layers.*.mlp.forward"
     replace:
@@ -176,56 +147,36 @@ plan_overrides:
       implementation:
         _target_: >-
           hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_megamoe_compute_fn
-        # Synthetic performance tests only; normal training keeps learned routing.
-        fix_router: false
-
-  # DSpark drafter (enabled via --model.dspark_depth>0): small coefficient,
-  # attention, and draft-MoE parameters stay TP-replicated; FSDP owns sharding.
-  # Single-character globs match these FQNs only when DSpark is present.
-  - match: "dspar[k]"
-    params:
-      main_proj.weight: {tp: replicate}
-      noise_embedding: {tp: replicate}
-      markov_head.embed.weight: {tp: replicate}
-      markov_head.head.weight: {tp: replicate}
-      confidence_head.proj.weight: {tp: replicate}
-  - match: "dspark.stages.0.attn_h[c]"
-    params:
-      fn: {tp: replicate}
-      base: {tp: replicate}
-      scale: {tp: replicate}
-  - match: "dspark.stages.0.ffn_h[c]"
-    params:
-      fn: {tp: replicate}
-      base: {tp: replicate}
-      scale: {tp: replicate}
-  - match: "dspark.stages.0.self_att[n]"
-    params:
-      attn_sink: {tp: replicate}
-      wq_a.weight: {tp: replicate}
-      wq_b.weight: {tp: replicate}
-      wkv.weight: {tp: replicate}
-      wo_a.weight: {tp: replicate}
-      wo_b.weight: {tp: replicate}
-  - match: "dspark.stages.0.ml[p]"
-    params:
-      gate.weight: {tp: replicate}
-      gate.bias: {tp: replicate}
-      experts.gate_up_proj: {tp: replicate}
-      experts.down_proj: {tp: replicate}
-      shared_experts.gate_proj.weight: {tp: replicate}
-      shared_experts.up_proj.weight: {tp: replicate}
-      shared_experts.down_proj.weight: {tp: replicate}
+        fix_router: false  # Benchmark-only balanced destinations; use false for normal training.
+  # MegaMoe supports CP and TP+SP with EP>1 and PP=1; pair it with the compute target above.
+  - match: "model.layers.*.mlp.experts"
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe.DeepseekV41MegaMoeExperts
+        dispatch_mode: push  # Set to pull for GET dispatch.
+  # HyperMegaMhc reuses the original fn/base/scale parameters.
+  - match:
+      - "model.layers.*.attn_hc"
+      - "model.layers.*.ffn_hc"
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc.DeepseekV41HyperMegaMhc
+  # MegaGate fused router: requires the multicore native build.
+  - match: "model.layers.*.mlp.gate"
+    replace:
+      kind: module
+      implementation:
+        _target_: >-
+          hyper_parallel.models.deepseek_v41.adapter.distributed.mega_gate.DeepseekV41MegaGate
 
 mixed_precision:
   enabled: false
 
 activation_checkpoint:
-  # Fully recompute each selected region, limited to 20 of 40 decoder layers.
-  mode: "full"
-  selection:
-    source: model_adapter_safe_regions
-    layer_count: 20
+  # Recompute full model regions to reduce activation memory.
+  mode: full
 
 activation_swap: none
 
@@ -268,6 +219,7 @@ dataloader:
   min_buffered_samples: 1
   collate_fn:
     _target_: hyper_parallel.data.batching.build_online_text_collate_fn
+    pad_to_length: 4096
   get_batch:
     _target_: hyper_parallel.data.batching.TextParallelBatch
     source_type: online
@@ -331,16 +283,16 @@ lr_scheduler:
     min_lr: 0.0
 
 checkpoint:
-  save_ckpt: true
-  checkpoint_dir: ./output/deepseek_v41/checkpoints
+  save_ckpt: false
+  checkpoint_dir: ./output/training_demo/deepseek_v41/artifacts/text_checkpoints
   save_steps: 10
   save_epochs: 1
-  is_async: true
+  is_async: false
   save_optimizer: true
   save_train_state: true
-  # DeepSeek-V4.1 text-only verified: per_rank=true layout works with sync/async
-  # save, full-state resume, and weights-only restore across 8-card EP8/FSDP8.
+  # Preserve rank-local extra state when checkpoint saving is enabled.
   save_extra_state_per_rank: true
+  # Resume the latest checkpoint when present; otherwise start from scratch.
   restore_from: LATEST
   restore_optimizer: true
   restore_train_state: true
@@ -348,4 +300,23 @@ checkpoint:
 
 debug:
   check_nan_inf: false
-  check_dataset: null
+  check_dataset: warn
+
+loss_fn: null
+
+profiler:
+  enable: false
+  start_step: 3
+  stop_step: 4
+  output_path: ./output/training_demo/deepseek_v41/text_profiler
+  memory: false
+  with_stack: false
+  rank_ids: [0]
+
+memory:
+  enable: true
+  start_step: 0
+  end_step: 1
+  save_path: ./output/training_demo/deepseek_v41/text_memory_snapshot
+  dump_ranks: [0]
+  stacks: all

@@ -16,12 +16,13 @@
 
 set -euo pipefail
 
+# Keep generated assets and run outputs under the repository output directory.
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 PROJECT_ROOT=$(cd "${SCRIPT_DIR}/../../.." && pwd)
-OUTPUT_DIR="${PROJECT_ROOT}/output/training_demo/deepseek_v41"
-ASSETS_PATH="${OUTPUT_DIR}/engram_depth_preserving_d4.json"
-DEFAULT_DATA_PATH="${OUTPUT_DIR}/mm_data/deepseek_v41_messages/train.jsonl"
-RUN_NAME=${RUN_NAME:-vlm_tp1_ep8_fsdp8}
+OUTPUT_DIR=${OUTPUT_DIR:-"${PROJECT_ROOT}/output/training_demo/deepseek_v41"}
+ASSETS_PATH=${ASSETS_PATH:-"${OUTPUT_DIR}/artifacts/engram_depth_preserving_d4.json"}
+DEFAULT_DATA_PATH="${OUTPUT_DIR}/mm_data/deepseek_v41_image_caption/train.jsonl"
+RUN_NAME=${RUN_NAME:-vlm_tp1_cp4_ep8_fsdp8}
 PYTHON_BIN=${PYTHON_BIN:-python}
 NPROC_PER_NODE=${NPROC_PER_NODE:-16}
 
@@ -35,6 +36,7 @@ if [[ $# -lt 1 ]]; then
     exit 1
 fi
 
+# Resolve input paths before switching to the repository root.
 MODEL_PATH=$1
 shift
 DATA_PATH="${DEFAULT_DATA_PATH}"
@@ -56,39 +58,42 @@ if [[ ! -s "${MODEL_PATH}/config.json" || ! -s "${MODEL_PATH}/tokenizer.json" ]]
 fi
 if [[ ! -s "${DATA_PATH}" ]]; then
     echo "V4.1 JSONL data is missing or empty: ${DATA_PATH}" >&2
-    exit 1
-fi
-if ! "${PYTHON_BIN}" -c \
-    "import hyper_parallel; from transformers.models.deepseek_v4 import DeepseekV4Config"; then
-    echo "The selected Python cannot import this HyperParallel checkout and " \
-        "Transformers DeepSeek-V4." >&2
-    echo "Transformers DeepSeek-V4 support is unavailable." >&2
-    echo "Prepare the shell with docs/guide/trainer/current_hf_model_environment.md" >&2
+    echo "Provide image-caption JSONL records with image and caption fields." >&2
     exit 1
 fi
 
+# Load the native runtime and custom operator environment from the repository root.
 cd "${PROJECT_ROOT}"
+source build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
+source "${OPS_TRANSFORMER_ROOT}/install/vendors/custom_transformer/bin/set_env.bash"
+
 mkdir -p "${OUTPUT_DIR}"
+# Clear the previous success marker before starting a new run.
 rm -f "${OUTPUT_DIR}/${RUN_NAME}.success"
+# Generate Engram assets only when the cached file is missing.
 if [[ ! -s "${ASSETS_PATH}" ]]; then
-    "${PYTHON_BIN}" -m examples.training_demo.deepseek_v41.prepare_deepseek_v41_assets \
+    "${PYTHON_BIN}" -m hyper_parallel.models.deepseek_v41.tools.prepare_deepseek_v41_assets \
         --model-dir "${MODEL_PATH}" \
         --output "${ASSETS_PATH}" \
         --bucket-base 4096 \
         --parameter-divisor 4
 fi
 
+# Launch with the YAML settings; trailing Trainer arguments override its defaults.
 "${PYTHON_BIN}" -m torch.distributed.run \
     --standalone \
     --nproc_per_node="${NPROC_PER_NODE}" \
-    "${PROJECT_ROOT}/scripts/train_vl.py" \
+    --module scripts.train_vl \
     "${SCRIPT_DIR}/train_deepseek_v41_vlm_online.yaml" \
     --model.config_path="${MODEL_PATH}" \
     --model.engram_assets_path="${ASSETS_PATH}" \
     --dataset.model_assets.config_path="${MODEL_PATH}" \
     --dataset.data_path="${DATA_PATH}" \
-    --accelerator.cp_size=1 \
+    --checkpoint.checkpoint_dir="${OUTPUT_DIR}/artifacts/checkpoints" \
+    --profiler.output_path="${OUTPUT_DIR}/profiler" \
+    --memory.save_path="${OUTPUT_DIR}/memory_snapshot" \
     "$@" \
     2>&1 | tee "${OUTPUT_DIR}/run_${RUN_NAME}.log"
 
+# Mark success only after all training processes finish successfully.
 touch "${OUTPUT_DIR}/${RUN_NAME}.success"
