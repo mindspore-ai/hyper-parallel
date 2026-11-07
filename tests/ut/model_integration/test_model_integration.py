@@ -30,6 +30,8 @@ from unittest import mock
 import torch
 from torch import nn
 
+from hyper_parallel.core.activation_memory.api import checkpoint_wrapper
+from hyper_parallel.core.fully_shard import api as fully_shard_api
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedAttentionState,
     SharedCompressedDSAIndexer,
@@ -73,6 +75,7 @@ from hyper_parallel.tools.model_integration.schemas import (
     ModelIntegrationFinding,
 )
 from hyper_parallel.tools.model_integration.integration_validator import (
+    collect_activation_checkpoint_wrappers,
     validate_final_model,
     validate_state_invariants,
 )
@@ -213,6 +216,29 @@ class _UnevenShardTensor:
 
 class TestModelIntegrationContracts(unittest.TestCase):
     """Exercise hardware-independent framework contracts."""
+
+    def test_activation_checkpoint_inventory_handles_fsdp_wrapper(self) -> None:
+        """Count real wrappers after FSDP composition and reject a same-named class."""
+        unrelated = type(
+            "CheckpointWrapper", (nn.Module,),
+            {"__module__": "hyper_parallel.core.activation_memory.wrapper"},
+        )()
+        model = nn.ModuleList([
+            checkpoint_wrapper(nn.Linear(3, 3)),
+            checkpoint_wrapper(nn.Linear(3, 3)),
+            nn.Linear(3, 3),
+            unrelated,
+        ])
+        with mock.patch.dict(fully_shard_api.origin_class_to_extend_class, clear=True):
+            fully_shard_api._extend_module_with_hsdp_interface(model[0])
+            actual = collect_activation_checkpoint_wrappers(model)
+        self.assertEqual(actual, {
+            "count": 2,
+            "wrappers": [
+                {"fqn": "0", "wrapped_type": "torch.nn.modules.linear.Linear"},
+                {"fqn": "1", "wrapped_type": "torch.nn.modules.linear.Linear"},
+            ],
+        })
 
     def test_trainer_config_exposes_only_validation_scope(self) -> None:
         """Keep probe selection and output policy out of the user YAML schema."""
