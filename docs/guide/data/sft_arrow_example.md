@@ -119,6 +119,11 @@ dataloader:
 
 ## 组批结果
 
+Indexed 和 Online 文本 Dataset 均以 `input_ids` 返回 token ID。
+`MockGPTDataset`、`GPTDataset`、`GPTFromMRDataset` 和 `SFTFromMRDataset` 的输出不再包含旧的 `tokens` 键；
+自定义 collator、metadata 回调和 MP batch 声明应统一使用 `input_ids`。
+磁盘文件无需转换，Arrow 的 `input_ids_key` 等源字段映射仍然生效。
+
 上述两条记录都满足 `seq_length: 8`，组批后保留两行，得到 `[B,S]=[2,8]`：
 
 ```text
@@ -131,12 +136,12 @@ loss_mask:    [[0, 1, 0, 1, 0, 0, 0, 0], [1, 0, 1, 0, 0, 0, 0, 0]]
 ```
 
 本例 collate 不改变行长度。下游累计边界转换为 `[0, 3, 5, 8, 10, 11, 16]`，
-但 tokens 和 labels 保持 `[2,8]`。正确消费这些边界的 attention 会隔离不同文档以及 padding 与真实文档。
+但 `input_ids` 和 `labels` 保持 `[2,8]`。正确消费这些边界的 attention 会隔离不同文档以及 padding 与真实文档。
 
 ## 长度校验与 32K、256K 数据
 
 `seq_length` 必须显式填写。默认 `skip_data_check: false` 时，SFT Dataset 在取出每条记录、组批之前，
-要求 tokens 和 labels 长度一致且等于 `seq_length`；偏短、偏长都会报错，不自动截断、补齐或重新装箱。
+要求 `input_ids` 和 `labels` 长度一致且等于 `seq_length`；偏短、偏长都会报错，不自动截断、补齐或重新装箱。
 Arrow 长度检查按记录读取时执行，不在初始化时扫描全量文件；开启 lazy load 时也执行相同检查。
 
 - 固定 32K 的记录配置 `seq_length: 32768`。

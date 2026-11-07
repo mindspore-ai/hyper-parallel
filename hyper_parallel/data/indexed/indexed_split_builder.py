@@ -282,10 +282,10 @@ class IndexedDatasetSplitBuilder:
               books.idx: sequence_lengths[1] = 2049, sequence_pointers[1] = 4098
               books_reader[1] -> books.bin[offset=4098, count=2049] -> text token IDs
 
-            Mid-level, organize tokens into training records (tokens, labels, and masks),
+            Mid-level, organize tokens into training records (input_ids, labels, and masks),
             with one GPTDataset/GPTFromMRDataset per source and split:
               books_train[0] -> split indices[0] = 1 -> books_reader[1]
-                             -> tokens = text[:-1], labels = text[1:]
+                             -> input_ids = text[:-1], labels = text[1:]
               datasets_per_source = [
                   (books_train[80], books_valid[10], None),
                   (code_train[20],  code_valid[5],   None),
@@ -359,7 +359,10 @@ class IndexedDatasetSplitBuilder:
         if (
             config.data_lazy_load
             and self.dataloader_context.distributed_enabled
-            and not (self.dataloader_context.data_index_cache or self.dataloader_context.build_on_rank())
+            and not (
+                self.dataloader_context.data_index_cache
+                or self.dataloader_context.build_on_rank()
+            )
         ):
             return cast(DatasetSplits, (None, None, None))
 

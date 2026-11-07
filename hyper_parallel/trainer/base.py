@@ -35,6 +35,7 @@ import logging
 import os
 from abc import ABC
 from collections import defaultdict
+from collections.abc import Callable
 from contextlib import nullcontext
 from functools import partial
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -59,6 +60,7 @@ from hyper_parallel.trainer.config import (
 )
 from hyper_parallel.data.dataset_logging import enable_dataset_logging
 from hyper_parallel.data.batching import build_dataloader
+from hyper_parallel.data.parallel import DataLoaderParallelContext, create_dataloader_parallel_context
 from hyper_parallel.trainer.runtime.distributed import (
     get_global_rank_safe,
     get_local_rank_safe,
@@ -116,6 +118,8 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from hyper_parallel.data.text.chat_template import ChatTemplate
+    from hyper_parallel.distributed_data import BalancingAlgorithm, CostModel
+    from hyper_parallel.distributed_data.schema import SampleMetadata
 
 
 def _to_swap_optimizer_config(config: OptimizerSwapConfig) -> SwapOptimizerConfig:
@@ -220,8 +224,12 @@ class BaseTrainer(Stateful, ABC):
 
     # Data
     train_dataset: Dataset
+    data_transform: Any
     collate_fn: Any
-    train_dataloader: Any
+    get_batch: Any
+    dataloader_context: DataLoaderParallelContext | None = None
+    train_dataloader: Any = None
+    num_micro_batches: int
 
     # Model
     model: PreTrainedModel = None
@@ -445,12 +453,20 @@ class BaseTrainer(Stateful, ABC):
 
     def _build_dataset(self) -> None:
         """Build and assign one Dataset or a train-validation-test tuple."""
+        data_config = getattr(self.config.dataset, "data_config", {})
+        self.dataloader_context = create_dataloader_parallel_context(
+            self.mesh,
+            data_index_cache=bool(data_config.get("data_index_cache", False)),
+            shared_storage=not bool(data_config.get("no_shared_storage", False)),
+            tp_source_rank=None if self.config.dataloader.load_balance is not None else 0,
+        )
         dataset_result = self.config.dataset.build(
             transform=self.data_transform,
             tokenizer=self.tokenizer,
             mesh_context=self.mesh,
             training_config=self.config.training,
             sampler_type=self.config.dataloader.sampler_type,
+            dataloader_context=self.dataloader_context,
         )
 
         if isinstance(dataset_result, tuple) and len(dataset_result) == 3:
@@ -464,7 +480,13 @@ class BaseTrainer(Stateful, ABC):
         """Require a concrete Trainer to build its micro-batch collator."""
         raise NotImplementedError("Concrete Trainer must implement _build_collate_fn")
 
-    def _build_dataloader(self) -> None:
+    def _build_dataloader(
+            self,
+            *,
+            metadata_fn: Callable[[Any], SampleMetadata] | None = None,
+            cost_model: CostModel | None = None,
+            balancing_algorithm: BalancingAlgorithm | None = None,
+    ) -> None:
         """Build and assign train, validation, and test dataloaders."""
         split_names = ("train", "valid", "test")
         datasets = tuple(getattr(self, f"{split_name}_dataset", None) for split_name in split_names)
@@ -474,8 +496,13 @@ class BaseTrainer(Stateful, ABC):
             collate_fn=self.collate_fn,
             mesh_context=self.mesh,
             training_config=self.config.training,
+            data_config=getattr(self.config.dataset, "data_config", {}),
             max_seq_len=getattr(self.data_transform, "max_seq_len", None),
             default_seed=self.default_seed,
+            metadata_fn=metadata_fn,
+            model_config=self.model_config,
+            cost_model=cost_model,
+            balancing_algorithm=balancing_algorithm,
         )
         for split_name, dataloader, batch_sampler in zip(split_names, dataloaders, batch_samplers):
             setattr(self, f"{split_name}_dataloader", dataloader)
@@ -873,6 +900,9 @@ class BaseTrainer(Stateful, ABC):
                     current_token_counts=self.current_token_counts,
                     step_token_counts=self.step_token_counts,
                 )
+                prefetch_plan = getattr(self.train_dataloader, "prefetch_plan", None)
+                if callable(prefetch_plan):
+                    prefetch_plan()  # pylint: disable=not-callable  # Guarded dynamic hook.
                 # The loss graph owns everything required for backward. Releasing
                 # the model output here avoids retaining large vocabulary logits
                 # until the whole backward pass finishes.
@@ -883,6 +913,9 @@ class BaseTrainer(Stateful, ABC):
                 # Backward pass
                 with self.model_bwd_context:
                     loss.backward()
+            prefetch = getattr(self.train_dataloader, "prefetch", None)
+            if callable(prefetch):
+                prefetch()  # pylint: disable=not-callable  # Guarded dynamic hook.
 
             del micro_batch
             return loss, loss_dict

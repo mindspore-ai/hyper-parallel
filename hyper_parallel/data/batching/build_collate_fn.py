@@ -279,16 +279,15 @@ def _sft_row_boundaries(boundaries: Any, sequence_length: int) -> list[int]:
 def _collate_sft_samples(batch: list[Any], *, alignment_size: int) -> Any:
     """Stack SFT rows and retain per-row boundaries without sentinel padding.
 
-    Records from SFTFromMRDataset have 1D tokens/labels; already grouped
+    Records from SFTFromMRDataset have 1D input_ids/labels; already grouped
     records may have [rows, S]. Variable-length rows are padded, never truncated.
     """
     if not isinstance(batch[0], Mapping) or "cu_seq_lens" not in batch[0]:
         return default_collate(batch)
 
-    token_key = "tokens" if "tokens" in batch[0] else "input_ids"
     token_rows, label_rows, boundary_rows = [], [], []
     for sample in batch:
-        tokens, labels = torch.as_tensor(sample[token_key]), torch.as_tensor(sample["labels"])
+        tokens, labels = torch.as_tensor(sample["input_ids"]), torch.as_tensor(sample["labels"])
         if tokens.ndim not in (1, 2) or tokens.shape != labels.shape or not tokens.numel():
             raise ValueError("SFT tokens and labels must have matching nonempty [S] or [rows, S] shapes")
         boundaries = sample["cu_seq_lens"]
@@ -303,11 +302,11 @@ def _collate_sft_samples(batch: list[Any], *, alignment_size: int) -> Any:
 
     sequence_length = max(row.numel() for row in token_rows)
     sequence_length += (-sequence_length) % alignment_size
-    packed_keys = {token_key, "labels", "cu_seq_lens"}
+    packed_keys = {"input_ids", "labels", "cu_seq_lens"}
     result = default_collate([
         {key: value for key, value in sample.items() if key not in packed_keys} for sample in batch
     ])
-    for key, rows, value in ((token_key, token_rows, 0), ("labels", label_rows, IGNORE_INDEX)):
+    for key, rows, value in (("input_ids", token_rows, 0), ("labels", label_rows, IGNORE_INDEX)):
         result[key] = torch.stack([
             torch.nn.functional.pad(row, (0, sequence_length - row.numel()), value=value) for row in rows
         ])
