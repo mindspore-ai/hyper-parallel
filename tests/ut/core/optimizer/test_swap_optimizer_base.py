@@ -15,6 +15,7 @@
 """Unit tests for the generic swap runtime, slots and core wrapper."""
 
 import contextlib
+import copy
 import os
 import types
 import unittest
@@ -24,13 +25,14 @@ from unittest import mock
 os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
 
 import torch
+from torch.optim import optimizer as torch_optimizer
 
 from hyper_parallel import DTensor, Replicate
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
+from hyper_parallel.core.optimizer import Muon, SwapOptimizerConfig, swap_optimizer
 from hyper_parallel.core.optimizer.swap_optimizer_base import (
     PipelineSwapRuntime,
     StateSwapAdapter,
-    SwapOptimizer,
     SwapSlot,
     SwapUpdateUnit,
     UpdateUnit,
@@ -1938,6 +1940,73 @@ class TestSwapRuntimeStreamHooks(unittest.TestCase):
 
         self.assertEqual(self.runtime._record_current_stream_event(), "event")
         self.runtime.record_event.assert_called_once_with("compute")
+
+
+class TestSwapOptimizerHookGuard(unittest.TestCase):
+    """Reject unsupported step hooks before swap side effects."""
+
+    def test_existing_hooks_are_rejected_before_runtime(self):
+        """Existing instance and global hooks fail before swap construction."""
+        config = SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False)
+        cases = ((torch.optim.AdamW, "leaf", "pre"), (Muon, "leaf", "post"),
+                 (torch.optim.AdamW, "global", "pre"), (torch.optim.AdamW, "global", "post"))
+        for optimizer_type, scope, hook_kind in cases:
+            with self.subTest(optimizer=optimizer_type.__name__, scope=scope, hook=hook_kind):
+                param = torch.nn.Parameter(torch.ones(2, 2))
+                optimizer = optimizer_type([param], lr=0.01)
+                register = (getattr(torch_optimizer, f"register_optimizer_step_{hook_kind}_hook")
+                            if scope == "global" else getattr(optimizer, f"register_step_{hook_kind}_hook"))
+                handle = register(lambda *args: None)
+                self.addCleanup(handle.remove)
+                before = param.detach().clone()
+                with mock.patch(
+                    "hyper_parallel.core.optimizer.swap_optimizer_base.PipelineSwapRuntime"
+                ) as runtime:
+                    with self.assertRaisesRegex(ValueError, "registered step hooks"):
+                        swap_optimizer(optimizer, config)
+                    runtime.assert_not_called()
+                self.assertTrue(torch.equal(param, before))
+                self.assertEqual(len(optimizer.state), 0)
+                handle.remove()
+                wrapped = swap_optimizer(optimizer, config)
+                self.assertIs(wrapped.optimizer, optimizer)
+
+    def test_late_hooks_are_rejected_before_step(self):
+        """Late hooks cannot silently bypass callbacks or partially update a leaf."""
+        config = SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False)
+        for scope, hook_kind in (("leaf", "pre"), ("wrapper", "post"), ("global", "pre"), ("global", "post")):
+            with self.subTest(scope=scope, hook=hook_kind):
+                param = torch.nn.Parameter(torch.ones(2, 2))
+                param.grad = torch.full_like(param, 0.1)
+                optimizer = torch.optim.AdamW([param], lr=0.01)
+                wrapped = swap_optimizer(optimizer, config)
+                wrapped.step()
+                before = param.detach().clone()
+                state_before = copy.deepcopy(optimizer.state_dict())
+                owner = optimizer if scope == "leaf" else wrapped
+                register = (getattr(torch_optimizer, f"register_optimizer_step_{hook_kind}_hook")
+                            if scope == "global" else getattr(owner, f"register_step_{hook_kind}_hook"))
+                hook = mock.Mock(return_value=None)
+                handle = register(hook)
+                self.addCleanup(handle.remove)
+                with mock.patch.object(
+                    wrapped.adapter, "prepare_step", wraps=wrapped.adapter.prepare_step
+                ) as prepare:
+                    with self.assertRaisesRegex(ValueError, "registered step hooks"):
+                        wrapped.step()
+                    prepare.assert_not_called()
+                torch.testing.assert_close(param, before, rtol=0, atol=0)
+                torch.testing.assert_close(optimizer.state_dict(), state_before, rtol=0, atol=0)
+                hook.assert_not_called()
+                handle.remove()
+                wrapped.step()
+                self.assertFalse(torch.equal(param, before))
+                torch.testing.assert_close(optimizer.state[param]["step"], state_before["state"][0]["step"] + 1)
+
+    def test_unsupported_optimizer_keeps_value_error(self):
+        """Hook inspection preserves the factory's unsupported-type error."""
+        with self.assertRaisesRegex(ValueError, "only supports"):
+            swap_optimizer(object())
 
 
 class TestModuleHelpers(unittest.TestCase):
