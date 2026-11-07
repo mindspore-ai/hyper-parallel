@@ -50,6 +50,7 @@ from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
 from hyper_parallel.trainer.config import PlanOverride, entries_to_plan_overrides
 from hyper_parallel.trainer.config.resolver import resolve_component
 from tests.ut.auto_models.distributed.conftest import FakeDeviceMesh
+from tests.common.deepseek_v41_mhc_stubs import stub_mhc_for_cpu
 from tests.common.mark_utils import arg_mark
 
 
@@ -317,7 +318,7 @@ class TestV41NativeAuxLoss(unittest.TestCase):
     def test_native_forward_backward_preserves_logits_and_checkpoint_keys(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.
-        Description: The production model runs aux training without module replacement.
+        Description: Verify router aux training with shape-preserving mHC stubs on CPU.
         Expectation: Logits and checkpoint keys match while router gradients include the auxiliary objective.
         """
         torch.manual_seed(17)
@@ -330,12 +331,13 @@ class TestV41NativeAuxLoss(unittest.TestCase):
             reference = copy.deepcopy(model)
             reference.model.layers[0].mlp.gate.aux_loss_coeff = 0
             tokens = torch.tensor([[1, 2, 3, 4], [4, 2, 5, 6]])
-            with aux_loss_scale_context():
-                output = model(tokens, labels=tokens)
-                bind_aux_loss_scale(output.loss)
-                (output.loss / 2).backward()
-            reference_output = reference(tokens, labels=tokens)
-            (reference_output.loss / 2).backward()
+            with stub_mhc_for_cpu():
+                with aux_loss_scale_context():
+                    output = model(tokens, labels=tokens)
+                    bind_aux_loss_scale(output.loss)
+                    (output.loss / 2).backward()
+                reference_output = reference(tokens, labels=tokens)
+                (reference_output.loss / 2).backward()
             torch.testing.assert_close(output.logits, reference_output.logits)
             torch.testing.assert_close(output.loss, reference_output.loss)
             gate = model.model.layers[0].mlp.gate
@@ -397,7 +399,8 @@ class TestV41NativeAuxLoss(unittest.TestCase):
                 local_query_start=0, local_query_length=4, global_sequence_length=4,
             )
             gate = model.model.layers[0].mlp.gate
-            with patch.object(gate, "forward", wraps=gate.forward) as forward:
+            with (stub_mhc_for_cpu(),
+                  patch.object(gate, "forward", wraps=gate.forward) as forward):
                 model(tokens, labels=tokens, packed_seq_params=packed).loss.backward()
             torch.testing.assert_close(forward.call_args.kwargs["sequence_ids"], torch.tensor([[0, 1, 1, 1]]))
             self.assertEqual(forward.call_args.kwargs["num_sequences"], 2)

@@ -19,7 +19,6 @@ import unittest
 import torch
 from torch import nn
 
-from hyper_parallel.components.modules.mhc import pipelined_mhc_post
 from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import (
     DeepseekV41HyperMegaMhc,
 )
@@ -73,7 +72,7 @@ class _SourceMhc(nn.Module):
 @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
           card_mark="onecard", essential_mark="essential")
 class TestDeepseekV41HyperMegaMhc(unittest.TestCase):
-    """Validate replacement contracts and the hardware-free shifted protocol."""
+    """Validate replacement and configuration contracts without running mHC."""
 
     @staticmethod
     def _source() -> DeepseekV41PipelinedHyperConnection:
@@ -100,40 +99,6 @@ class TestDeepseekV41HyperMegaMhc(unittest.TestCase):
             {name: id(parameter) for name, parameter in model.named_parameters()},
             original_parameters,
         )
-
-    def test_cpu_advance_matches_shifted_reference_boundary(self):
-        """Keep the model protocol numerically testable without importing multicore."""
-        module = DeepseekV41HyperMegaMhc(module=self._source(), context={})
-        previous_output = torch.randn(2, 3, 8)
-        residual = torch.randn(2, 3, 4, 8)
-        previous_pre = torch.softmax(torch.randn(2, 3, 4), dim=-1)
-        previous_post = torch.randn(2, 3, 4)
-        previous_residual_mix = torch.softmax(torch.randn(2, 3, 4, 4), dim=-1)
-        norm_weight = torch.randn(8)
-
-        outputs = module.advance(
-            previous_output,
-            residual,
-            previous_pre,
-            previous_post,
-            previous_residual_mix,
-            norm_weight,
-        )
-
-        expected_residual = pipelined_mhc_post(
-            previous_output,
-            residual,
-            previous_post,
-            previous_residual_mix,
-        )
-        expected_pre, expected_post, expected_mix = module(expected_residual)
-        mixed_input = (previous_pre.unsqueeze(-1) * expected_residual).sum(dim=2)
-        expected_input = mixed_input * torch.rsqrt(
-            mixed_input.square().mean(dim=-1, keepdim=True) + module.norm_eps
-        ) * norm_weight
-        expected = expected_residual, expected_pre, expected_post, expected_mix, expected_input
-        for actual_value, expected_value in zip(outputs, expected):
-            torch.testing.assert_close(actual_value, expected_value)
 
     def test_yaml_target_resolves_declarative_replacement(self):
         """Resolve the HyperMegaMhc adapter through the generic YAML target channel."""

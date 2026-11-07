@@ -2,6 +2,8 @@
 
 `hyper_parallel.components.functional` provides reusable high-performance functions for Ascend NPU.
 Some interfaces also expose an explicit `eager` reference backend; fused calls do not automatically fall back.
+`mhc_pre` and `mhc_post` require Ascend NPU tensors and `omni_training_custom_ops`; they do not provide an eager
+fallback for CPU, GPU, or an unavailable custom-operator package.
 
 ```python
 from hyper_parallel.components.functional import rms_norm
