@@ -78,3 +78,6 @@ zeros_like:
 
 empty_like:
   dist_op_name: _torch_empty_like_dist_op
+
+constant_:
+  dist_op_name: _torch_constant__dist_op
