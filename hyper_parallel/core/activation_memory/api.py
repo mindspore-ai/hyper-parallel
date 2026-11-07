@@ -33,9 +33,11 @@ __all__ = [
     "get_class_activation_wrapper",
     "noop_context_fn",
     "is_compiling",
+    "reentrant_checkpoint_scope",
 ]
 
 import contextlib
+from contextlib import AbstractContextManager
 from functools import partial
 from typing import Any, Callable, Optional, Tuple
 
@@ -135,6 +137,24 @@ def checkpoint_wrapper(module, **checkpoint_kwargs):
     return ckpt_wrapper(module, **checkpoint_kwargs)
 
 
+def reentrant_checkpoint_scope(parameters: Any) -> AbstractContextManager:
+    """Collect reentrant frames with explicit stage parameters for split backward.
+
+    Args:
+        parameters: Stage parameters or lazy zero-argument provider. The provider
+            is evaluated only when a reentrant checkpoint is invoked.
+
+    Returns:
+        A context manager yielding handles with ``set_phase``, ``release``, and
+        ``backward_trigger``. For split DX, set phase to ``dx`` and target stage
+        input activations. For DW, set phase to ``dw`` and target stage parameters
+        plus every handle's ``backward_trigger``. Captured parameter hooks run
+        only during DW; shared parameters can receive separate contributions.
+    """
+    from .reentrant_checkpoint import reentrant_checkpoint_scope as _scope  # pylint: disable=C0415
+    return _scope(parameters)
+
+
 def swap_wrapper(module, policy_fn=None, group_swap=False, cpu_pool=None):
     """Wrap *module* so its activations are offloaded to host memory.
 
@@ -218,31 +238,55 @@ def async_save_on_cpu(policy_fn=None, group_swap: bool = False, cpu_pool=None):
     return AsyncSaveOnCpu(policy_fn=policy_fn, group_swap=group_swap, cpu_pool=cpu_pool)
 
 
-def recompute_handle_collector_ctx():
+def recompute_handle_collector_ctx() -> AbstractContextManager:
     """Return the context that collects recompute handles for a checkpoint region."""
     # pylint: disable=C0415
-    from .checkpoint import recompute_handle_collector_ctx as _collector_ctx
+    from .checkpoint import recompute_handle_collector_ctx as _collector_ctx  # pylint: disable=C0415
     return _collector_ctx()
 
 
-def recompute_handle(handle, session_id):
+def recompute_handle(handle: Any, session_id: Any) -> Any:
     """Recompute the region behind *handle* under *session_id*."""
+    from .checkpoint import _validate_session_id  # pylint: disable=C0415
+    _validate_session_id(session_id)
+    from .reentrant_checkpoint import ReentrantCheckpointHandle  # pylint: disable=C0415
+    if isinstance(handle, ReentrantCheckpointHandle):
+        handle.bind_session(session_id)
+        return handle.recompute()
     # pylint: disable=C0415
     from .checkpoint import recompute_handle as _recompute_handle
     return _recompute_handle(handle, session_id)
 
 
-def recompute_session_ctx(session_id, retain_on_unpack=False):
+def recompute_session_ctx(session_id: Any, retain_on_unpack: bool = False) -> AbstractContextManager:
     """Open a recompute session so replay can unpack saved activations."""
     if session_id is None:
         raise ValueError("session_id must not be None.")
     # pylint: disable=C0415
     from .checkpoint import recompute_session_ctx as _session_ctx
-    return _session_ctx(session_id=session_id, retain_on_unpack=retain_on_unpack)
+    from .reentrant_checkpoint import activate_session, deactivate_session  # pylint: disable=C0415
+    from .checkpoint import _RECOMPUTE_SESSION  # pylint: disable=C0415
+
+    @contextlib.contextmanager
+    def combined_session() -> Any:
+        """Bind replay retention to registered frames for this session scope."""
+        with _session_ctx(session_id=session_id, retain_on_unpack=retain_on_unpack):
+            activation = _RECOMPUTE_SESSION.get()
+            activate_session(activation)
+            try:
+                yield session_id
+            finally:
+                deactivate_session(activation)
+
+    return combined_session()
 
 
-def clear_recompute_session(session_id):
+def clear_recompute_session(session_id: Any) -> Any:
     """Release all state held for *session_id*."""
+    from .checkpoint import _validate_session_id  # pylint: disable=C0415
+    _validate_session_id(session_id)
+    from .reentrant_checkpoint import clear_session as _clear_reentrant  # pylint: disable=C0415
+    _clear_reentrant(session_id)
     # pylint: disable=C0415
     from .checkpoint import clear_recompute_session as _clear
     return _clear(session_id)
@@ -311,17 +355,70 @@ def _checkpoint_input_context(swap_inputs: bool, group_swap: bool, cpu_pool: Any
     return async_save_on_cpu(**async_kwargs)
 
 
+def _checkpoint_reentrant(
+    function: Callable,
+    args: tuple,
+    context_fn: Optional[Callable[[], Tuple[object, object]]],
+    kwargs: dict,
+) -> Any:
+    """Apply the eager reentrant checkpoint implementation."""
+    from .reentrant_checkpoint import checkpoint as _reentrant  # pylint: disable=C0415
+
+    preserve_rng_state = kwargs.pop("preserve_rng_state", True)
+    if not isinstance(preserve_rng_state, bool):
+        raise ValueError("preserve_rng_state must be bool")
+    if context_fn is not None and not callable(context_fn):
+        raise ValueError("context_fn must be callable")
+    state_context = partial(create_recompute_contexts, preserve_rng_state=preserve_rng_state)
+    reentrant_context = (
+        _compose_context_fns((state_context, context_fn)) if context_fn is not None else state_context
+    )
+    reentrant_options = {"preserve_rng_state": preserve_rng_state,
+                         "context_fn": reentrant_context, **kwargs}
+    return _reentrant(function, *args, **reentrant_options)
+
+
+def _validate_reentrant_options(
+    swap_inputs: bool,
+    policy_fn: Optional[Callable],
+    group_swap: bool,
+    cpu_pool: Any,
+    early_stop: bool,
+    kwargs: dict,
+) -> None:
+    """Validate options unsupported by eager reentrant checkpointing."""
+    unsupported = []
+    if swap_inputs:
+        unsupported.append("swap_inputs")
+    if policy_fn is not None:
+        unsupported.append("policy_fn")
+    if group_swap:
+        unsupported.append("group_swap")
+    if cpu_pool is not None:
+        unsupported.append("cpu_pool")
+    if early_stop is not True:
+        unsupported.append("early_stop")
+    for name in ("debug", "determinism_check"):
+        if name in kwargs:
+            unsupported.append(name)
+    if is_compiling():
+        unsupported.append("use_reentrant=True under torch.compile")
+    if unsupported:
+        raise ValueError("Reentrant checkpoint does not support: " + ", ".join(unsupported))
+
+
 def checkpoint(
-    function,
-    *args,
+    function: Callable,
+    *args: Any,
     swap_inputs: bool = False,
     policy_fn: Optional[Callable] = None,
     context_fn: Optional[Callable[[], Tuple[object, object]]] = None,
     group_swap: bool = False,
-    cpu_pool=None,
+    cpu_pool: Any = None,
     early_stop: bool = True,
-    **kwargs,
-):
+    use_reentrant: bool = False,
+    **kwargs: Any,
+) -> Any:
     """
     Apply activation checkpointing to a function with optional input swapping.
 
@@ -346,6 +443,10 @@ def checkpoint(
         early_stop (bool, optional): Whether recomputation stops after all tensors needed by
             backward have been produced. This per-call keyword is the only supported way to
             configure early stop. Default: ``True``.
+        use_reentrant (bool, optional): Use eager reentrant checkpointing with
+            localized exclusion graphs. Ordinary backward can accumulate
+            captured parameters even when ``autograd.grad`` targets only an
+            activation; use a reentrant scope for split DX/DW execution.
         **kwargs: Additional keyword arguments to pass to the function.
 
     Returns:
@@ -353,6 +454,13 @@ def checkpoint(
     """
     if not isinstance(early_stop, bool):
         raise ValueError(f"early_stop must be bool, but got {type(early_stop).__name__}.")
+    if not isinstance(use_reentrant, bool):
+        raise ValueError("use_reentrant must be bool")
+    if use_reentrant:
+        _validate_reentrant_options(
+            swap_inputs, policy_fn, group_swap, cpu_pool, early_stop, kwargs
+        )
+        return _checkpoint_reentrant(function, args, context_fn, kwargs)
 
     if is_compiling():
         _validate_compile_checkpoint_options(

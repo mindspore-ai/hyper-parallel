@@ -301,6 +301,13 @@ def _get_autocast_kwargs(device_type: str) -> Tuple[Optional[Dict[str, Any]], Di
     return device_kwargs, cpu_kwargs
 
 
+def _autocast_context(device_type: str, kwargs: Optional[Dict[str, Any]]) -> Any:
+    """Create an autocast context only when another thread enabled it."""
+    if kwargs is None or not kwargs.get("enabled", False):
+        return contextlib.nullcontext()
+    return torch.amp.autocast(device_type=device_type, **kwargs)
+
+
 def _create_recomputation_hooks(frame: _CheckpointFrame, session_id: Any) -> Any:
     """Create saved-tensor hooks that retain tensors from one recomputation."""
     frame_ref = weakref.ref(frame)
@@ -510,12 +517,9 @@ class _ExecutionState:
                 if self.device_was_initialized:
                     _set_device_states(self.device_type, self.device_ids, self.device_states)
 
-            device_autocast_context = contextlib.nullcontext()
-            if self.device_autocast_kwargs is not None:
-                device_autocast_context = torch.amp.autocast(
-                    device_type=self.device_type, **self.device_autocast_kwargs
-                )
-            with device_autocast_context, torch.amp.autocast("cpu", **self.cpu_autocast_kwargs), self.recompute_context:
+            device_autocast_context = _autocast_context(self.device_type, self.device_autocast_kwargs)
+            cpu_autocast_context = _autocast_context("cpu", self.cpu_autocast_kwargs)
+            with device_autocast_context, cpu_autocast_context, self.recompute_context:
                 function(*function_args, **function_kwargs)
 
 

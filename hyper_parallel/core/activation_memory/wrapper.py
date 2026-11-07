@@ -32,6 +32,7 @@ from hyper_parallel.core.activation_memory.pinned_memory_pool import PinnedMemor
 from hyper_parallel.core.activation_memory.recompute_state import get_recompute_state
 from hyper_parallel.core.activation_memory.swap import SwapManager, SwapTensor, Storage
 from . import checkpoint_exclude as _checkpoint_exclude
+from .reentrant_exclude import current_frame, run_exclude
 
 
 _SWAP_WRAPPED_MODULE = "_swap_wrapped_module"
@@ -527,10 +528,15 @@ class CheckpointWrapper(ActivationWrapper):
         self.checkpoint_kwargs = checkpoint_kwargs
 
     def _do_checkpoint(self, wrapped_module: Any, *args: Any, **kwargs: Any) -> Any:
+        """Run the wrapped module through the configured checkpoint function."""
         # Checkpoint may save inputs before the wrapped module's pre-hook runs.
         group_name = getattr(self, "_swap_group_name", None)
         if group_name is not None:
             SwapManager().set_current_group_name(group_name)
+            # Reentrant backward can bypass this wrapper's full backward hook.
+            # This method is called for a new forward, never for its replay.
+            if getattr(self, "_swap_state", None) == "pre_backward":
+                self._swap_state = "backward"
 
         from hyper_parallel.core.activation_memory.api import checkpoint  # pylint: disable=C0415
         return checkpoint(
@@ -587,9 +593,29 @@ class CheckpointExcludeWrapper(ActivationWrapper):
         self.group_swap = group_swap
         self.cpu_pool = cpu_pool
 
+    def _make_exclude_swap_hooks(self) -> Optional[AsyncSaveOnCpu]:
+        """Create the fallback hooks shared by both exclusion execution modes."""
+        if not self.swap:
+            return None
+        swap_hooks = AsyncSaveOnCpu(group_swap=self.group_swap, cpu_pool=self.cpu_pool)
+        if not callable(getattr(swap_hooks, "pack_hook", None)) or not callable(
+            getattr(swap_hooks, "unpack_hook", None)
+        ):
+            raise RuntimeError(
+                "There is no callable pack_hook and unpack_hook attributes for checkpoint exclusion swap"
+            )
+        return swap_hooks
+
+    def _register_exclude_outputs(self, output: Any) -> None:
+        """Make cached outputs available to the active swap group."""
+        _register_checkpoint_exclude_outputs(output, group_swap=self.group_swap, cpu_pool=self.cpu_pool)
+
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         """Execute normally outside recompute and return the cached output in recompute."""
         wrapped_module = cast(Callable[..., Any], self._wrapped_module)
+        frame = current_frame()
+        if frame is not None:
+            return run_exclude(self, wrapped_module, args, kwargs, frame)
         state = get_recompute_state()
         if state is None:
             return wrapped_module(*args, **kwargs)
@@ -603,19 +629,7 @@ class CheckpointExcludeWrapper(ActivationWrapper):
                 _checkpoint_exclude._has_used_input(entry.input_bindings),
             )
 
-        swap_hooks = None
-        if self.swap:
-            swap_hooks = AsyncSaveOnCpu(
-                group_swap=self.group_swap,
-                cpu_pool=self.cpu_pool,
-            )
-            if not callable(getattr(swap_hooks, "pack_hook", None)) or not callable(
-                getattr(swap_hooks, "unpack_hook", None)
-            ):
-                raise RuntimeError(
-                    "There is no callable pack_hook and unpack_hook attributes "
-                    "for checkpoint exclusion swap"
-                )
+        swap_hooks = self._make_exclude_swap_hooks()
         input_infos = _checkpoint_exclude._capture_recompute_inputs(args, kwargs)
         input_bindings = []
         pack_token = _checkpoint_exclude._ACTIVE_PACK_STATE.set(
@@ -627,11 +641,7 @@ class CheckpointExcludeWrapper(ActivationWrapper):
         finally:
             _checkpoint_exclude._ACTIVE_PACK_STATE.reset(pack_token)
         if swap_hooks is not None:
-            _register_checkpoint_exclude_outputs(
-                output,
-                group_swap=self.group_swap,
-                cpu_pool=self.cpu_pool,
-            )
+            self._register_exclude_outputs(output)
         rng_state = _checkpoint_exclude._capture_rng_state(
             args,
             kwargs,
@@ -675,11 +685,11 @@ def checkpoint_exclude_wrapper(
 
     Returns:
         A wrapper that saves the callable's autograd tensors and reuses its
-        forward output while replaying a non-reentrant checkpoint.
+        forward output while replaying a checkpoint.
 
     Note:
         This feature requires eager mode and a surrounding HyperParallel
-        checkpoint configured with ``use_reentrant=False``. Nested checkpoint
+        checkpoint. Both modes cache the excluded outputs; nested checkpoint
         exclusion wrappers are not supported.
     """
     return CheckpointExcludeWrapper(
