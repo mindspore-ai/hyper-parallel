@@ -28,6 +28,7 @@ from torch.utils._foreach_utils import _foreach_supported_types as _torch_foreac
 
 from hyper_parallel.core.dtensor import _utils
 from hyper_parallel.core.dtensor._collective_utils import mesh_broadcast, mesh_scatter
+from hyper_parallel.core.fault_tolerance.groups import is_recovery_reboot
 from hyper_parallel.core.dtensor._ragged_utils import (
     _compute_ragged_slice,
     _layout_has_ragged_shard,
@@ -1082,6 +1083,10 @@ def distribute_tensor(
         >>> dtensor = distribute_tensor(global_tensor, mesh, [Shard(0), Replicate()])
         >>> dtensor = distribute_tensor(global_tensor, mesh, ("dp", "None"))
     """
+    if is_recovery_reboot():
+        # A replacement constructs local storage while peers are parked.
+        # Replica repair supplies device values after communication rebuild.
+        src_data_rank = None
     layout = _build_layout(device_mesh, placements, len(tensor.shape))
     if _layout_has_ragged_shard(layout):
         if src_data_rank is None:

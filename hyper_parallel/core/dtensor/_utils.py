@@ -35,6 +35,7 @@ from torch.distributed.distributed_c10d import _get_default_group
 
 import torch.distributed as dist
 
+from hyper_parallel.core.fault_tolerance.groups import new_group
 from hyper_parallel.core.utils.communication import (
     EXISTING_COMM_GROUPS,
     differentiable_all_gather_concat,
@@ -156,7 +157,7 @@ def split_group(parent_pg: Optional[ProcessGroup] = None,
     for split_rank in split_ranks:
         dist_group = get_created_group(split_rank)
         if dist_group is None:
-            dist_group = dist.new_group(ranks=split_rank, pg_options=pg_options)
+            dist_group = new_group(ranks=split_rank, pg_options=pg_options)
             EXISTING_COMM_GROUPS[str(tuple(sorted(split_rank)))] = dist_group
         if dist.get_rank() in split_rank:
             split_group_pg = dist_group
@@ -415,7 +416,7 @@ def create_sub_groups(
             print(f"Rank {my_rank}: Creating group with ranks {sorted_ranks}")
 
         # key: all processes participate in each group creation
-        group = dist.new_group(ranks=sorted_ranks)
+        group = new_group(ranks=sorted_ranks)
         EXISTING_COMM_GROUPS[str(tuple(sorted_ranks))] = group
 
         # only save when current process is in the group

@@ -46,6 +46,7 @@ import gc
 import os
 import shutil
 import struct
+import tempfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -57,6 +58,7 @@ import traceback
 import numpy
 import torch
 
+from hyper_parallel.core.fault_tolerance.groups import is_recovery_reboot
 from hyper_parallel.data.constants import INDEX_HEADER, INDEX_VERSION, MSC_PREFIX, S3_PREFIX
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 
@@ -151,7 +153,8 @@ def _cache_index_file(remote_path: str, local_path: str) -> None:
     """Download ``.idx`` from object storage to ``local_path``.
 
     Rank 0 performs the download and other ranks wait on a ``torch.distributed``
-    barrier. If the local file already exists this is a no-op.
+    barrier. A replacement worker downloads a missing local cache itself and
+    publishes it atomically without waiting for parked training peers.
 
     Raises:
         ImportError: If the relevant client library (``boto3`` for ``s3://`` or
@@ -159,37 +162,49 @@ def _cache_index_file(remote_path: str, local_path: str) -> None:
         ValueError: If ``remote_path`` is neither an ``s3://`` nor an
             ``msc://`` URI.
     """
-    torch_dist_enabled = torch.distributed.is_initialized()
-    rank = torch.distributed.get_rank() if torch_dist_enabled else 0
-
     if remote_path.startswith(S3_PREFIX):
         if not HAS_BOTO3:
             raise ImportError("boto3 is required to read s3:// datasets. Install via `pip install boto3`.")
-        if not os.path.exists(local_path):
-            if not torch_dist_enabled or rank == 0:
-                os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                bucket, key = _parse_s3_path(remote_path)
-                client = boto3.client("s3")
-                logger.info("Downloading %s -> %s", remote_path, local_path)
-                client.download_file(bucket, key, local_path)
-                client.close()
     elif remote_path.startswith(MSC_PREFIX):
         if not HAS_MSC:
             raise ImportError(
                 "multi_storage_client is required to read msc:// datasets. "
                 "Install via `pip install multi-storage-client`."
             )
-        if not os.path.exists(local_path):
-            if not torch_dist_enabled or rank == 0:
-                os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                multi_storage_client.download_file(remote_path, local_path)
     else:
         raise ValueError(f"Unsupported object storage path: {remote_path}")
 
+    reboot = is_recovery_reboot()
+    torch_dist_enabled = torch.distributed.is_initialized() and not reboot
+    rank = torch.distributed.get_rank() if torch_dist_enabled else 0
+    if not os.path.exists(local_path) and rank == 0:
+        directory = os.path.dirname(local_path) or "."
+        os.makedirs(directory, exist_ok=True)
+        if reboot:
+            with tempfile.TemporaryDirectory(prefix=".idx-recovery-", dir=directory) as temporary:
+                staged = os.path.join(temporary, os.path.basename(local_path))
+                _download_index_file(remote_path, staged)
+                os.replace(staged, local_path)
+        else:
+            _download_index_file(remote_path, local_path)
     if torch_dist_enabled:
         torch.distributed.barrier()
     if not os.path.exists(local_path):
         raise RuntimeError(f"Index cache file not found after download: {local_path}")
+
+
+def _download_index_file(remote_path: str, local_path: str) -> None:
+    """Download a validated object-storage index to one local destination."""
+    if remote_path.startswith(S3_PREFIX):
+        bucket, key = _parse_s3_path(remote_path)
+        client = boto3.client("s3")
+        try:
+            logger.info("Downloading %s -> %s", remote_path, local_path)
+            client.download_file(bucket, key, local_path)
+        finally:
+            client.close()
+    else:
+        multi_storage_client.download_file(remote_path, local_path)
 
 
 class DType(Enum):

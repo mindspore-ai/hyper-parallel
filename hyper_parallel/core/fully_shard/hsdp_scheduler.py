@@ -235,6 +235,28 @@ class HSDPSchedulerV2:
         self._restore_forward_prefetch_after_recompute()
         self.hsdp_state.reset_iter_state()
 
+    def abort_iter_state(self) -> None:
+        """Discard an interrupted iteration after the device has been stopped.
+
+        The recovery coordinator must first abort outstanding device work
+        and park the training thread. Unlike ordinary finalization this
+        path never waits on a failed collective, reads an unsharded buffer,
+        or replaces a persistent sharded parameter.
+        """
+        state = self.hsdp_state
+        self.reset_iter_state()
+        for param in state.hsdp_params:
+            param.sharded_param.grad = None
+            if hasattr(param.sharded_param, "main_grad"):
+                param.sharded_param.main_grad = None
+            param._setattr_on_modules(param.sharded_param)
+            # Avoid to_sharded(): a failure before the first all-gather may
+            # leave unsharded_param_buffers empty.
+            if param.unsharded_param_buffers and param.unsharded_param_buffers[0] is not param._sharded_param_data:
+                param.free_unsharded_param()
+            param.sharded_state = type(param.sharded_state).SHARDED
+        state.is_shard = True
+
     def set_requires_grad_sync(self, requires_grad_sync: bool) -> None:
         """Set flag controlling whether gradients are synchronized.
 

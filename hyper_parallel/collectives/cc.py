@@ -19,6 +19,7 @@ from typing import Any, Optional, Union
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from hyper_parallel.core.fault_tolerance.groups import new_group
 from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 
@@ -127,7 +128,7 @@ def split_group(parent_pg: Optional[ProcessGroup] = None,
         key = _group_key(ranks)
         group = EXISTING_COMM_GROUPS.get(key)
         if group is None:
-            group = dist.new_group(ranks=ranks)
+            group = new_group(ranks=ranks)
             EXISTING_COMM_GROUPS[key] = group
         if current_rank in ranks:
             current_group = group
