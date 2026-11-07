@@ -42,15 +42,6 @@ from hyper_parallel.models.deepseek_v3.adapter.conversion.module_replacement imp
     replace_grouped_experts,
     replace_linear,
 )
-from tests.common.mark_utils import arg_mark
-
-
-cpu_test = arg_mark(
-    plat_marks=["cpu_linux", "cpu_macos"],
-    level_mark="level0",
-    card_mark="allcards",
-    essential_mark="essential",
-)
 
 
 class _SourceExperts(nn.Module):
@@ -106,7 +97,6 @@ def _reference_experts(module, hidden_states, top_k_index, top_k_weights):
 class TestGroupedExpertsConversion(unittest.TestCase):
     """Conversion preserves checkpoint identity while changing only computation."""
 
-    @cpu_test
     def test_from_module_preserves_registered_state_and_metadata(self):
         """The shell is new, but parameters/buffers/submodules remain identical."""
         source = _SourceExperts()
@@ -127,7 +117,6 @@ class TestGroupedExpertsConversion(unittest.TestCase):
         self.assertEqual(tuple(converted.state_dict()), ("gate_up_proj", "down_proj"))
         self.assertEqual(converted.fqn, "model.layers.0.mlp.experts")
 
-    @cpu_test
     def test_routing_forward_and_backward_match_dense_reference(self):
         """Sorting/restoration and top-k weighting preserve dense MoE semantics."""
         torch.manual_seed(23)
@@ -157,7 +146,6 @@ class TestGroupedExpertsConversion(unittest.TestCase):
         self.assertIsNotNone(converted.gate_up_proj.grad)
         self.assertIsNotNone(converted.down_proj.grad)
 
-    @cpu_test
     def test_source_contract_rejects_registration_and_shape_mismatch(self):
         """The adapter fails before partially converting an incompatible module."""
         missing = nn.Module()
@@ -178,7 +166,6 @@ class TestGroupedExpertsConversion(unittest.TestCase):
                 grouped_linear=FakeW4A8GroupedLinear(),
             )
 
-    @cpu_test
     def test_invalid_expert_ids_fail_before_grouped_compute(self):
         """Out-of-range routes never reach a grouped-linear kernel."""
         source = _SourceExperts()
@@ -200,7 +187,6 @@ class TestGroupedExpertsConversion(unittest.TestCase):
 class TestGroupedExpertsFactory(unittest.TestCase):
     """The replacement factory owns policy selection and topology gates."""
 
-    @cpu_test
     def test_factory_passes_policy_and_live_weight_shapes(self):
         """Strategy construction receives the selected policy and both live tiles."""
         source = _SourceExperts(experts=2, hidden=32, intermediate=32)
@@ -209,7 +195,7 @@ class TestGroupedExpertsFactory(unittest.TestCase):
         )
         strategy = FakeW4A8GroupedLinear()
         patch_path = (
-            "hyper_parallel.models.deepseek_v3.adapter.conversion.module_replacement."
+            "hyper_parallel.components.quantization.modules.replacement."
             "build_low_precision_strategy"
         )
         with mock.patch(patch_path, return_value=strategy) as build:
@@ -227,7 +213,6 @@ class TestGroupedExpertsFactory(unittest.TestCase):
         self.assertIs(converted.grouped_linear, strategy)
         self.assertIs(converted.gate_up_proj, source.gate_up_proj)
 
-    @cpu_test
     def test_factory_rejects_every_active_parallel_axis(self):
         """Packed experts currently support only TP=CP=EP=PP=1."""
         source = _SourceExperts(experts=2, hidden=32, intermediate=32)
@@ -240,7 +225,6 @@ class TestGroupedExpertsFactory(unittest.TestCase):
                         context={axis: object()},
                     )
 
-    @cpu_test
     def test_factory_selects_hif8_without_mx_tile_gate(self):
         """The HiFloat8 policy reaches its strategy on unaligned expert shapes."""
         source = _SourceExperts(experts=2, hidden=31, intermediate=7)
@@ -305,7 +289,6 @@ class _ContractStrategy(LinearStrategy):
 class TestLinearReplacement(unittest.TestCase):
     """The DeepSeek adapter replacement preserves source Linear state."""
 
-    @cpu_test
     def test_replacement_reuses_parameters_and_training_state(self):
         """Conversion does not allocate new weights or alter module mode."""
         source = nn.Linear(8, 4)
@@ -313,7 +296,7 @@ class TestLinearReplacement(unittest.TestCase):
         strategy = _ContractStrategy()
         policy = object()
         path = (
-            "hyper_parallel.models.deepseek_v3.adapter.conversion.module_replacement."
+            "hyper_parallel.components.quantization.modules.replacement."
             "build_linear_strategy"
         )
         with mock.patch(path, return_value=strategy) as build:
@@ -330,7 +313,6 @@ class TestLinearReplacement(unittest.TestCase):
         self.assertIs(converted.strategy, strategy)
         self.assertFalse(converted.training)
 
-    @cpu_test
     def test_replacement_rejects_non_exact_linear_types(self):
         """Subclasses are excluded because the adapter contract is exact nn.Linear."""
         class DerivedLinear(nn.Linear):
@@ -343,7 +325,6 @@ class TestLinearReplacement(unittest.TestCase):
                 context={},
             )
 
-    @cpu_test
     def test_replacement_rejects_pipeline_parallel(self):
         """The direct Dense replacement rejects PP as specified by its contract."""
         source = nn.Linear(8, 4)
@@ -354,12 +335,11 @@ class TestLinearReplacement(unittest.TestCase):
                 context={"pp": 2},
             )
 
-    @cpu_test
     def test_replacement_adds_target_context_to_invalid_policy(self):
         """Policy errors identify the FQN selected by the replacement plan."""
         source = nn.Linear(8, 4)
         path = (
-            "hyper_parallel.models.deepseek_v3.adapter.conversion.module_replacement."
+            "hyper_parallel.components.quantization.modules.replacement."
             "build_linear_strategy"
         )
         with mock.patch(path, side_effect=ValueError("bad policy")):
@@ -374,7 +354,6 @@ class TestLinearReplacement(unittest.TestCase):
 class TestLinearStrategyFactory(unittest.TestCase):
     """Dense policy dispatch stays independent of grouped strategy selection."""
 
-    @cpu_test
     def test_factory_selects_mxfp8_after_alignment_gate(self):
         """MXFP8 runtime validation follows a successful 32-feature shape check."""
         policy = LowPrecisionDtypeScheme(weight_format="mxfp8", act_format="mxfp8")
@@ -392,7 +371,6 @@ class TestLinearStrategyFactory(unittest.TestCase):
                 build_linear_strategy(policy, in_features=63, out_features=32)
         validate.assert_not_called()
 
-    @cpu_test
     def test_factory_selects_hif8_without_tile_alignment(self):
         """Native HiFloat8 accepts non-MX feature sizes and validates its runtime."""
         policy = LowPrecisionDtypeScheme(weight_format="hif8", act_format="hif8")
@@ -406,7 +384,6 @@ class TestLinearStrategyFactory(unittest.TestCase):
         self.assertIsInstance(strategy, HiFloat8LinearStrategy)
         validate.assert_called_once_with()
 
-    @cpu_test
     def test_factory_rejects_fake_dense_policy(self):
         """Dense fake QAT remains outside the current Linear design scope."""
         policy = LowPrecisionDtypeScheme(
