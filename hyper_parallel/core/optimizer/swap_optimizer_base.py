@@ -26,6 +26,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Sequ
 
 # Optimizer runtime is Torch-only; the legacy checker still flags core imports.
 import torch  # pylint: disable=forbidden-backend-import
+from torch.optim import optimizer as torch_optimizer  # pylint: disable=forbidden-backend-import
 
 logger = logging.getLogger(__name__)
 
@@ -1902,6 +1903,18 @@ class StateSwapAdapter:
         return tuple(self.config.state_keys or self.default_state_keys())
 
 
+def _check_step_hooks(optimizer: Any) -> None:
+    """Reject step hooks that the swap pipeline bypasses."""
+    if (getattr(optimizer, "_optimizer_step_pre_hooks", None)
+            or getattr(optimizer, "_optimizer_step_post_hooks", None)
+            or torch_optimizer._global_optimizer_pre_hooks
+            or torch_optimizer._global_optimizer_post_hooks):
+        raise ValueError(
+            "Optimizer-state swap does not support registered step hooks; "
+            "remove the hooks or disable swap"
+        )
+
+
 class SwapOptimizer(torch.optim.Optimizer):
     """Torch optimizer wrapper around a family-provided swap adapter.
 
@@ -1916,6 +1929,7 @@ class SwapOptimizer(torch.optim.Optimizer):
 
     def __init__(self, optimizer: Any, config: Any, adapter_factory: AdapterFactory) -> None:
         """Wrap a leaf with its family adapter and independent transfer runtime."""
+        _check_step_hooks(optimizer)
         # Do not call ``torch.optim.Optimizer.__init__``: the wrapped base
         # optimizer already owns param_groups/state/defaults. Inheriting keeps
         # PyTorch LR schedulers and isinstance checks happy while this wrapper
@@ -2003,6 +2017,7 @@ class SwapOptimizer(torch.optim.Optimizer):
         """Run one optimizer step with pipeline state swap."""
         if closure is not None:
             raise ValueError("Swap optimizer does not support closure.")
+        _check_step_hooks(self.optimizer)
         self._check_reset_complete()
         self._step_active = True
         try:
