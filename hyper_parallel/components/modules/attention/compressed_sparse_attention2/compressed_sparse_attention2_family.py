@@ -113,6 +113,13 @@ def _validate(*, config: Any, module: nn.Module | None, context: Any, member: An
     validate_indexer_hybrid_threshold(mode, arguments.get("indexer_zigzag_min_length"))
     if arguments.get("main_kv_comm", "all_gather") not in ("all_gather", "all_to_all_v"):
         raise ValueError("main_kv_comm must be 'all_gather' or 'all_to_all_v'")
+    if arguments.get("index_k_comm", "all_gather") not in ("all_gather", "all_to_all_v"):
+        raise ValueError("index_k_comm must be 'all_gather' or 'all_to_all_v'")
+    paged = arguments.get("indexer_paged_k", False)
+    if not isinstance(paged, bool):
+        raise ValueError("indexer_paged_k must be a bool")
+    if paged and not member.selectors["use_fused_ops"]:
+        raise ValueError("indexer_paged_k requires use_fused_ops=True")
     if member.axis_sizes["tp"] > 1 and (member.selectors["use_fused_ops"] or mode != "none"):
         raise NotImplementedError("CSA2 fusion and Indexer load balancing currently require TP=1")
 
@@ -121,12 +128,15 @@ def _build_local(*, config: Any = None, module: nn.Module | None = None, layer_i
                  module_fqn: str = "", context: Any = None, use_fused_ops: bool = False,
                  indexer_load_balance: str = "none", main_kv_comm: str = "all_gather",
                  indexer_balance_block_size: int | None = None,
-                 indexer_zigzag_min_length: int | None = None) -> nn.Module:
+                 indexer_zigzag_min_length: int | None = None, index_k_comm: str = "all_gather",
+                 indexer_paged_k: bool = False) -> nn.Module:
     """Retain CP options in family provenance without adding them to local math."""
-    del module_fqn, indexer_load_balance, main_kv_comm, indexer_balance_block_size, indexer_zigzag_min_length
+    del module_fqn, indexer_load_balance, main_kv_comm, index_k_comm
+    del indexer_balance_block_size, indexer_zigzag_min_length
     implementation = (_TPCompressedSparseAttention2 if context is not None and context.get("tp_size", 1) > 1
                       else CompressedSparseAttention2Module)
-    return implementation(module, config=config, layer_idx=layer_idx, use_fused_ops=use_fused_ops)
+    return implementation(module, config=config, layer_idx=layer_idx, use_fused_ops=use_fused_ops,
+                          indexer_paged_k=indexer_paged_k)
 
 
 _reference = partial(_build_local, use_fused_ops=False)
@@ -141,7 +151,8 @@ def CompressedSparseAttention2(  # pylint: disable=invalid-name
         module_fqn: str = "", context: Any = None, mesh: Any = None,
         use_fused_ops: bool = False, indexer_load_balance: str = "none",
         main_kv_comm: str = "all_gather", indexer_balance_block_size: int | None = None,
-        indexer_zigzag_min_length: int | None = None,
+        indexer_zigzag_min_length: int | None = None, index_k_comm: str = "all_gather",
+        indexer_paged_k: bool = False,
 ) -> nn.Module:
     """Build complete CSA2, choosing CP automatically from the job's existing mesh.
 
@@ -155,6 +166,8 @@ def CompressedSparseAttention2(  # pylint: disable=invalid-name
         use_fused_ops: Select all three native entries; unsupported calls raise explicitly.
         indexer_load_balance: none, zigzag, greedy or hybrid; only selection tasks move.
         main_kv_comm: all_gather or document-prefix all_to_all_v.
+        index_k_comm: Independent Index K all_gather or document-prefix all_to_all_v.
+        indexer_paged_k: Use shared LI V2 physical pages for logical prefixes; requires fusion.
         indexer_balance_block_size: Greedy/hybrid task size, defaulting to 2048.
         indexer_zigzag_min_length: Hybrid-only long-document threshold in raw tokens.
     """
@@ -164,6 +177,7 @@ def CompressedSparseAttention2(  # pylint: disable=invalid-name
         indexer_load_balance=indexer_load_balance, main_kv_comm=main_kv_comm,
         indexer_balance_block_size=indexer_balance_block_size,
         indexer_zigzag_min_length=indexer_zigzag_min_length,
+        index_k_comm=index_k_comm, indexer_paged_k=indexer_paged_k,
     )
 
 

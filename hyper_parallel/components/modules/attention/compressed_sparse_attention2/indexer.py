@@ -40,6 +40,9 @@ class CSA2IndexerOutput:
     candidate_blocks: torch.Tensor | None
     index_query: torch.Tensor
     merge_weight: torch.Tensor
+    key_plan: Any = None
+    owner_index_key: torch.Tensor | None = None
+    owner_key_offset: int = 0
 
 
 def _run_lightning_indexer(
@@ -47,6 +50,7 @@ def _run_lightning_indexer(
         top_k: int, compress_ratio: int, query_offset: int,
         reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None,
         minimum_key_indices: torch.Tensor | None, query_segments: tuple | None,
+        paged_key: bool = False,
 ) -> torch.Tensor:
     """Run LI V2 with explicit adapter errors and native capability validation."""
     if reduce_sum is not None:
@@ -60,7 +64,7 @@ def _run_lightning_indexer(
         length = query.shape[1]
         raw_end = query_offset + length
         query_segments = ((0, length, 0, raw_end // compress_ratio, raw_end % compress_ratio),)
-    return lightning_indexer(query, key, merge_weight, compress_ratio, top_k, query_segments)
+    return lightning_indexer(query, key, merge_weight, compress_ratio, top_k, query_segments, paged_key=paged_key)
 
 def _causal_key_bounds(
         query: torch.Tensor, ratio: int, query_offset: int,
@@ -90,6 +94,56 @@ def _causal_key_bounds(
         lower[begin:end] = key_start
     return upper.unsqueeze(0), lower.unsqueeze(0).expand(batch_size, -1)
 
+def _validate_causal_inputs(
+        query: torch.Tensor, key: torch.Tensor, merge_weight: torch.Tensor, compress_ratio: int,
+        query_chunk_size: int, minimum_key_indices: torch.Tensor | None,
+) -> None:
+    """Validate selection tensor relationships before scoring or native dispatch."""
+    if compress_ratio <= 0:
+        raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
+    if query_chunk_size <= 0:
+        raise ValueError(f"query_chunk_size must be positive, got {query_chunk_size}")
+    if query.ndim != 4:
+        raise ValueError(f"Indexer query must have shape [B, Q, H, D], got {tuple(query.shape)}")
+    batch_size, _, _, head_dim = query.shape
+    if key.ndim != 3 or key.shape[::2] != (batch_size, head_dim):
+        raise ValueError(
+            "compressed index key must have shape [batch, compressed_sequence, head_dim]"
+        )
+    if merge_weight.shape != query.shape[:3]:
+        raise ValueError(
+            f"merge_weight must have shape {tuple(query.shape[:3])}, got {tuple(merge_weight.shape)}"
+        )
+    if minimum_key_indices is not None and minimum_key_indices.shape != query.shape[:2]:
+        raise ValueError("minimum_key_indices must have shape [batch, query]")
+
+
+
+def _reference_causal_topk(
+        scores: torch.Tensor, top_k: int, logical_length: int,
+        key_global_positions: torch.Tensor | None,
+) -> torch.Tensor:
+    """Keep the reference TopK tie convention when remote K rows are omitted.
+
+    Eager TopK can choose different tied IDs when its input width changes.
+    Restore logical score slots only; the physical K bank stays compact.
+    Native LI already packs the same per-document prefix in both CP modes.
+    """
+    if key_global_positions is not None:
+        full_scores = scores.new_full((*scores.shape[:-1], logical_length), float("-inf"))
+        full_scores.index_copy_(-1, key_global_positions, scores)
+        scores = full_scores
+    length = scores.shape[-1]
+    top = scores.topk(min(top_k, length), dim=-1, sorted=False)
+    indices = top.indices.masked_fill(~torch.isfinite(top.values), length)
+    indices = sort_key_indices(indices, length)
+    indices = indices.masked_fill(indices == length, -1)
+    if indices.shape[-1] < top_k:
+        indices = torch.nn.functional.pad(indices, (0, top_k - indices.shape[-1]), value=-1)
+    return indices.to(torch.int32)
+
+
+
 @torch.no_grad()
 def compressed_causal_topk(
         query: torch.Tensor,
@@ -105,6 +159,9 @@ def compressed_causal_topk(
         query_segments: tuple[tuple[int, int, int, int, int], ...] | None = None,
         causal_upper: torch.Tensor | None = None,
         use_fused: bool = False,
+        paged_key: bool = False,
+        global_key_length: int | None = None,
+        key_global_positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Select compressed positions with V4.1's ratio-aware causal rule.
 
@@ -114,45 +171,35 @@ def compressed_causal_topk(
     document-local K prefixes; the reference retains TP score reductions.
 
     Args:
-        query_segments: Local Q intersections and global compressed K prefixes.
-        causal_upper: Packed per-query exclusive causal bound shared by eager
-            and graph execution; supersedes ``query_segments`` for reference
-            selection when provided.
+        query_segments: Local Q intersections and physical compressed K prefixes.
+        global_key_length: Logical bank length before optional CP compaction, used
+            to retain the global output width. Unfilled slots remain -1.
+        key_global_positions: Optional compact-to-global row IDs for eager TopK.
+            Logical score slots preserve the original reference tie selection.
+        paged_key: Share native LI pages across repeated prefixes; requires fused selection.
+        causal_upper: Packed per-query exclusive causal bound in the physical
+            key coordinates; supersedes ``query_segments`` for reference selection.
         use_fused: Select LI V2 and raise if a nonempty call is unsupported.
             False explicitly selects the numerical reference.
     """
-    if compress_ratio <= 0:
-        raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
-    if query_chunk_size <= 0:
-        raise ValueError(f"query_chunk_size must be positive, got {query_chunk_size}")
-    if query.ndim != 4:
-        raise ValueError(f"Indexer query must have shape [B, Q, H, D], got {tuple(query.shape)}")
-    batch_size, sequence_length, _, head_dim = query.shape
-    if key.ndim != 3 or key.shape[::2] != (batch_size, head_dim):
-        raise ValueError(
-            "compressed index key must have shape [batch, compressed_sequence, head_dim]"
-        )
-    if merge_weight.shape != query.shape[:3]:
-        raise ValueError(
-            f"merge_weight must have shape {tuple(query.shape[:3])}, got {tuple(merge_weight.shape)}"
-        )
+    if paged_key and not use_fused:
+        raise ValueError("paged_key requires fused Indexer selection")
+    _validate_causal_inputs(query, key, merge_weight, compress_ratio, query_chunk_size, minimum_key_indices)
+    batch_size, sequence_length = query.shape[:2]
     compressed_length = key.shape[1]
-    if minimum_key_indices is not None and minimum_key_indices.shape != query.shape[:2]:
-        raise ValueError("minimum_key_indices must have shape [batch, query]")
-    top_k = min(sparse_count, compressed_length)
-    if top_k <= 0 or sequence_length == 0:
-        return torch.empty(
-            batch_size,
-            sequence_length,
-            max(top_k, 0),
-            dtype=torch.int32,
-            device=query.device,
+    logical_length = compressed_length if global_key_length is None else global_key_length
+    if logical_length < compressed_length:
+        raise ValueError("global_key_length cannot be shorter than the physical Index K bank")
+    top_k = min(sparse_count, logical_length)
+    if top_k <= 0 or sequence_length == 0 or compressed_length == 0:
+        return torch.full(
+            (batch_size, sequence_length, max(top_k, 0)), -1, dtype=torch.int32, device=query.device,
         )
 
     if use_fused:
         return _run_lightning_indexer(
             query, key, merge_weight, top_k, compress_ratio, query_offset,
-            reduce_sum, minimum_key_indices, query_segments,
+            reduce_sum, minimum_key_indices, query_segments, paged_key,
         )
 
     visible_keys, minimum_key_indices = _causal_key_bounds(
@@ -174,11 +221,7 @@ def compressed_causal_topk(
         if minimum_key_indices is not None:
             minimum = minimum_key_indices[:, start:end].unsqueeze(-1)
             scores.masked_fill_(key_positions < minimum, float("-inf"))
-        top = scores.topk(top_k, dim=-1, sorted=False)
-        indices = top.indices.masked_fill(~torch.isfinite(top.values), compressed_length)
-        indices = sort_key_indices(indices, compressed_length)
-        indices = indices.masked_fill(indices == compressed_length, -1)
-        selected_chunks.append(indices.to(torch.int32))
+        selected_chunks.append(_reference_causal_topk(scores, top_k, logical_length, key_global_positions))
     return torch.cat(selected_chunks, dim=1)
 
 def select_candidate_blocks(
@@ -521,6 +564,7 @@ class CSA2Indexer(nn.Module):
         if self.apply_rope is None:
             raise ValueError("CSA2 Indexer requires the enclosing attention's rotary function")
         self.use_fused = getattr(module, "use_fused", False)
+        self.paged_key = getattr(module, "paged_key", False)
         self.compress_ratio = module.compress_ratio
         self.global_num_heads = getattr(module, "global_num_heads", getattr(module, "num_heads", None))
         self.head_dim = module.head_dim
@@ -726,5 +770,6 @@ class CSA2Indexer(nn.Module):
                 query_segments=query_segments,
                 causal_upper=causal_upper,
                 use_fused=self.use_fused,
+                paged_key=self.paged_key,
             )
         return topk_indices, candidate_blocks
