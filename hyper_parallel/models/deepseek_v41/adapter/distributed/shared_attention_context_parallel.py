@@ -35,6 +35,8 @@ from hyper_parallel.distributed.context_parallel.collectives import (
     async_cp_allgather_launch,
 )
 from hyper_parallel.distributed.context_parallel.compressed_document import CompressionBoundaryRoute
+from hyper_parallel.distributed.context_parallel.index_key_dispatch import index_key_plan
+from hyper_parallel.distributed.context_parallel.batch_plan import CPBatchPlan
 from hyper_parallel.distributed.context_parallel.indexer_balance import (
     balanced_indexer_select, launch_indexer_inputs, resolve_indexer_balance_block_size,
     validate_indexer_hybrid_threshold,
@@ -47,10 +49,14 @@ def _build_shared_attention_cp_context(
         cp_mesh: Any, indexer_load_balance: str = "none",
         main_kv_comm: str = "all_gather", indexer_balance_block_size: int | None = None,
         indexer_zigzag_min_length: int | None = None,
+        index_k_comm: str = "all_gather",
+        prepared_batch: CPBatchPlan | None = None,
 ) -> SharedCompressedAttentionCPContext:
-    """Build raw/main bank communication while keeping Index K globally gathered."""
+    """Build independent raw/main/Index K transport with owner-side gradients."""
     if main_kv_comm not in ("all_gather", "all_to_all_v"):
         raise ValueError("main_kv_comm must be 'all_gather' or 'all_to_all_v'")
+    if index_k_comm not in ("all_gather", "all_to_all_v"):
+        raise ValueError("index_k_comm must be all_gather or all_to_all_v")
     indexer_balance_block_size = resolve_indexer_balance_block_size(
         indexer_load_balance, indexer_balance_block_size,
     )
@@ -58,6 +64,15 @@ def _build_shared_attention_cp_context(
     validate_indexer_hybrid_threshold(
         indexer_load_balance, indexer_zigzag_min_length,
     )
+
+    if prepared_batch is not None:
+        config = prepared_batch.config
+        expected = (cp_mesh.size(), cp_mesh.get_local_rank(), indexer_load_balance,
+                    indexer_balance_block_size, indexer_zigzag_min_length, main_kv_comm, index_k_comm)
+        actual = (config.size, config.rank, config.mode, config.block_size,
+                  config.zigzag_min_length, config.main_kv_comm, config.index_k_comm)
+        if actual != expected:
+            raise ValueError("Prepared CP batch configuration differs from the active communication context")
 
     def _gather_sequence(tensor: torch.Tensor, sequence_dim: int) -> torch.Tensor:
         """All-gather one sequence dimension in CP-rank order."""
@@ -86,6 +101,19 @@ def _build_shared_attention_cp_context(
         """Exchange planned bank intervals on the existing CP group."""
         return async_sequence_dispatch(tensor, sequence_dim, route, cp_mesh.get_group())
 
+    def _plan_index_key(lengths: tuple, ratio: int) -> Any:
+        """Cache the union of worker selection and original-owner learning demand."""
+        if prepared_batch is not None:
+            prepared_batch.validate(lengths, cp_mesh.size(), cp_mesh.get_local_rank())
+            return prepared_batch.for_ratio(ratio).index_key
+        return index_key_plan(lengths, cp_mesh.size(), cp_mesh.get_local_rank(), ratio,
+                              indexer_load_balance, indexer_balance_block_size, indexer_zigzag_min_length)
+
+    def _launch_index(tensor: torch.Tensor, sequence_dim: int, plan: Any) -> Any:
+        """Transmit each requested prefix once; reverse only differentiable owner rows."""
+        return async_sequence_dispatch(tensor, sequence_dim, plan.dispatch, cp_mesh.get_group(),
+                                       gradient=plan.gradient)
+
     def _balance_indexer(query_residual, weights, embeddings, selector, lengths, ratio):
         """Move only selection tasks; differentiable banks and KL remain with owners."""
         return balanced_indexer_select(
@@ -96,10 +124,14 @@ def _build_shared_attention_cp_context(
 
     def _launch_balance(query_residual, weights, embeddings, lengths, ratio):
         """Launch no-grad selection inputs before independent owner projections."""
+        route = None
+        if prepared_batch is not None:
+            prepared_batch.validate(lengths, cp_mesh.size(), cp_mesh.get_local_rank())
+            route = prepared_batch.for_ratio(ratio).worker_route
         return launch_indexer_inputs(
             query_residual, weights, embeddings, lengths, ratio, indexer_load_balance,
             cp_mesh.get_group(), indexer_balance_block_size,
-            indexer_zigzag_min_length,
+            indexer_zigzag_min_length, prepared_route=route,
         )
 
     cp_context = SharedCompressedAttentionCPContext(
@@ -113,6 +145,8 @@ def _build_shared_attention_cp_context(
         balance_indexer=_balance_indexer if indexer_load_balance != "none" else None,
         launch_balance=_launch_balance if indexer_load_balance != "none" else None,
         indexer_priority=True,
+        plan_index_key=_plan_index_key if index_k_comm == "all_to_all_v" else None,
+        launch_index=_launch_index if index_k_comm == "all_to_all_v" else None,
     )
     return cp_context
 
@@ -145,7 +179,7 @@ def deepseek_v41_shared_attention_parallel_wrapper(
     """Install V4.1's explicit TP Indexer and Colossal CP collectives.
 
     Raw KV uses SWA halo all-to-all-v.
-    Main KV selects prefix dispatch or all-gather; Index K remains globally gathered.
+    Main KV and Index K independently select prefix dispatch or all-gather.
     Launch/wait separation permits independent projection work. Indexer Q/merge heads remain TP-local and
     reduce their score and KL-target contributions before global Top-K.
     Packed compression grouping is owned by the shared module; this adapter
@@ -166,6 +200,7 @@ def deepseek_v41_shared_attention_parallel_wrapper(
             cp_mesh, target_module.indexer_load_balance, target_module.main_kv_comm,
             target_module.indexer_balance_block_size,
             target_module.indexer_zigzag_min_length,
+            index_k_comm=target_module.index_k_comm,
         )
         if cp_mesh is not None and cp_mesh.size() > 1
         else None
@@ -182,8 +217,18 @@ def deepseek_v41_shared_attention_parallel_wrapper(
         if "shared_attention_cp_context" in kwargs or "shared_attention_tp_context" in kwargs:
             raise ValueError("shared attention parallel contexts are owned by the wrapper")
         call_kwargs = dict(kwargs)
-        if cp_context is not None:
-            call_kwargs["shared_attention_cp_context"] = cp_context
+        prepared_batch = call_kwargs.pop("cp_batch_plan", None)
+        active_context = cp_context
+        if prepared_batch is not None:
+            if cp_context is None or not isinstance(prepared_batch, CPBatchPlan):
+                raise ValueError("cp_batch_plan requires a prepared CP batch and an active CP mesh")
+            active_context = _build_shared_attention_cp_context(
+                cp_mesh, target_module.indexer_load_balance, target_module.main_kv_comm,
+                target_module.indexer_balance_block_size, target_module.indexer_zigzag_min_length,
+                index_k_comm=target_module.index_k_comm, prepared_batch=prepared_batch,
+            )
+        if active_context is not None:
+            call_kwargs["shared_attention_cp_context"] = active_context
         if tp_context is not None:
             call_kwargs["shared_attention_tp_context"] = tp_context
         return original_forward(*args, **call_kwargs)

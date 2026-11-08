@@ -177,12 +177,12 @@ class DocumentCompressionPlan:
         """
         capacity = max(self.counts)
         if not capacity:
-            return CompactBankGather(None, tensor, None)
+            return CompactBankGather(None, tensor, None, self.counts)
         padded = tensor if tensor.shape[1] == capacity else functional.pad(
             tensor, (0, 0, 0, capacity - tensor.shape[1]),
         )
         slots = _bank_slots(self.counts, tensor.device)
-        return CompactBankGather(context.launch(padded, 1), tensor, slots)
+        return CompactBankGather(context.launch(padded, 1), tensor, slots, self.counts)
 
 
 @dataclass
@@ -192,6 +192,7 @@ class CompactBankGather:
     handle: Any
     tensor: torch.Tensor
     slots: torch.Tensor | None
+    counts: tuple[int, ...]
 
     def wait(self) -> torch.Tensor:
         """Keep compaction in autograd so all consumers return gradients to owners.
@@ -200,7 +201,35 @@ class CompactBankGather:
             Complete compressed bank in canonical document order, without padding.
         """
         output = self.tensor if self.handle is None else self.handle.wait()
-        return output if self.slots is None else output.index_select(1, self.slots)
+        return output if self.slots is None else _CompactBank.apply(output, self.slots, self.counts)
+
+
+class _CompactBank(torch.autograd.Function):
+    """Remove owner padding with a disjoint, copy-only gradient inverse."""
+
+    @staticmethod
+    def forward(ctx: Any, tensor: torch.Tensor, slots: torch.Tensor, counts: tuple[int, ...]) -> torch.Tensor:
+        """Select only the unique valid rows of each owner container."""
+        ctx.input_shape = tensor.shape
+        ctx.counts = counts
+        return tensor.index_select(1, slots)
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple:
+        """Copy each owner gradient into its padded range without reduction."""
+        # Each compact row occurs once: index_add would perform an unnecessary
+        # reduction and may allocate full-bank FP32 workspaces for BF16 inputs.
+        grad_input = grad_output.new_empty(ctx.input_shape)
+        capacity = max(ctx.counts)
+        cursor = 0
+        for owner, count in enumerate(ctx.counts):
+            start = owner * capacity
+            if count:
+                grad_input[:, start:start + count].copy_(grad_output[:, cursor:cursor + count])
+            if count < capacity:
+                grad_input[:, start + count:start + capacity].zero_()
+            cursor += count
+        return grad_input, None, None
 
 
 @lru_cache(maxsize=128)
