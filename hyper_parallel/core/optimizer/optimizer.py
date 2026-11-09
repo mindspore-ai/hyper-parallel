@@ -972,8 +972,9 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
 
         In HSDP mode, _broadcast_state_fused_for_ckpt broadcasts state to all
         ranks so every rank can save a complete checkpoint. This method removes
-        the non-owned state to restore per-rank memory savings. Must be called
-        after the checkpoint has been fully written to disk.
+        the non-owned state to restore per-rank memory savings. Call once all
+        checkpoint consumers have finished reading the live state, either after
+        persistence or after creating an independent snapshot for async I/O.
         """
         params_to_remove = []
         for assignment_info in self._hsdp_assignment_batches.values():
@@ -982,6 +983,9 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
                     if not hsdp_info.is_replicated:
                         continue
                     for record in hsdp_info.all_records:
+                        # Records without an owner are never broadcast, so their state is not a replica copy.
+                        if record.index not in hsdp_info.owner_by_index:
+                            continue
                         if not hsdp_info.is_owned(record) and record.param in self.state:
                             params_to_remove.append(record.param)
 

@@ -35,6 +35,8 @@ from hyper_parallel.components.optim.mixed_precision_optimizer import (
 )
 from hyper_parallel.models._transformers.checkpoint_loader import CheckpointManager
 from hyper_parallel.core.distributed_checkpoint.utils import flatten_state_dict
+from hyper_parallel.core.optimizer.muon import Muon
+from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
 from hyper_parallel.models._transformers.model_builder import (
     validate_model_init_dtype,
 )
@@ -81,6 +83,17 @@ def _unwrap_single(values: List[Any]) -> Any:
     if len(values) == 1:
         return values[0]
     return values
+
+
+def _cleanup_muon_checkpoint_state(optimizer: Any) -> None:
+    """Release ordinary Muon replicas after checkpoint consumers finish."""
+    if isinstance(optimizer, MixedPrecisionOptimizer):
+        optimizer = optimizer.optimizer
+    leaves = optimizer.chained_optimizers if isinstance(optimizer, ChainedOptimizer) else (optimizer,)
+    for leaf in leaves:
+        # Swap wrappers and subclasses own their checkpoint state lifecycle.
+        if type(leaf) is Muon:  # pylint: disable=unidiomatic-typecheck
+            leaf.cleanup_synced_state()
 
 
 class CheckpointerCallback(Callback):
@@ -385,9 +398,10 @@ class CheckpointerCallback(Callback):
         )
 
         checkpoint_state: Dict[str, Any] = {"model": self._model_state_dict()}
+        optimizers = _as_list(self.trainer.optimizer) if self._save_optimizer else []
         if self._save_optimizer:
             checkpoint_state["optimizer"] = _unwrap_single(
-                [optimizer.state_dict() for optimizer in _as_list(self.trainer.optimizer)]
+                [optimizer.state_dict() for optimizer in optimizers]
             )
         if self._save_train_state:
             checkpoint_state["extra_state"] = self._collect_extra_state(state)
@@ -423,6 +437,13 @@ class CheckpointerCallback(Callback):
         # mode: otherwise on_epoch_end would queue the same step again while the
         # first save is still in flight.
         self._last_saved_step = state.global_step
+        # save() has finished snapshotting even when disk persistence is async.
+        del checkpoint_state
+        cleanup_targets = (
+            [external.optimizer_for_dcp()] if external is not None and optimizers else optimizers
+        )
+        for optimizer in cleanup_targets:
+            _cleanup_muon_checkpoint_state(optimizer)
         if self._save_hf_weights:
             # The full-weight gather is memory-intensive, so never overlap it
             # with an asynchronous DCP persistence job.
@@ -752,6 +773,12 @@ class CheckpointerCallback(Callback):
             load_plan,
         )
 
+        del checkpoint_state
+        cleanup_targets = (
+            [external.optimizer_for_dcp()] if external is not None and optimizers else optimizers
+        )
+        for optimizer in cleanup_targets:
+            _cleanup_muon_checkpoint_state(optimizer)
         empty_cache()
         # Computed here because this log is the only consumer: the training loops
         # derive their own starting position from ``state`` instead, so carrying it
