@@ -316,6 +316,7 @@ class TestBuildEpComputeSwitch(unittest.TestCase):
                 del key
                 return _Axis()
 
+        original_bind = recipes_module.bind_local_expert_forward
         recipes_module.bind_local_expert_forward = lambda *args, **kwargs: None
         recipes_module.ep_routed_forward = _forward
         try:
@@ -325,6 +326,7 @@ class TestBuildEpComputeSwitch(unittest.TestCase):
                 combine=lambda mod, hidden, routed: routed, fix_router=True)
             compute(module, torch.zeros(1, 1))
         finally:
+            recipes_module.bind_local_expert_forward = original_bind
             recipes_module.ep_routed_forward = original_forward
         self.assertIsNot(captured["router_fn"], real)
         self.assertEqual(captured["router_fn"].__name__, "balanced__StubRouter")
