@@ -21,6 +21,7 @@ import contextlib
 import copy
 import itertools
 import logging
+import weakref
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
 
@@ -42,6 +43,8 @@ KNOWN_STATE_KEYS = (
 _PACKED_ALIGNMENT_BYTES = 512
 _DEVICE_TYPE = "npu"
 _MISSING_CHECKPOINT_STATE = object()
+_TensorHookState = Dict[str, Tuple[torch.Tensor, tuple[Any, ...]]]
+_HookStateSnapshot = Dict[Any, Tuple[bool, _TensorHookState]]
 
 
 def _restore_dtensor_metadata(template: Any, local_tensor: Any) -> Any:
@@ -144,6 +147,9 @@ class PipelineSwapRuntime:
         """Initialize instance-owned streams and packed storage metadata."""
         self.config = config
         self._copy_stream: Optional[Any] = None
+        # Packed teardown drains its own copy chain before returning. This tail
+        # only tracks per-tensor D2H writes that may cross a hook boundary.
+        self._host_tail_event: Optional[Any] = None
         self._packed_enabled = bool(getattr(config, "packed_swap", True))
         self._host_buffers: Dict[Any, Any] = {}
         self._host_layout_signature = ()
@@ -363,6 +369,7 @@ class PipelineSwapRuntime:
         # Storage release only needs stream ordering above. Host completion is
         # required separately because checkpoint_state_dict reads CPU mirrors.
         self.wait_event(checkpoint_event, None)
+        self._host_tail_event = None
         for slot in slot_list:
             slot.event = None
         self.restore_packed_host_views(slot_list)
@@ -472,6 +479,7 @@ class PipelineSwapRuntime:
                 self.copy_to_cpu(slot)
                 slot.state = "d2h"
             copy_event = self.record_event(copy_stream) if copy_stream is not None else None
+        self._host_tail_event = copy_event
         for slot in slots:
             slot.event = copy_event
 
@@ -522,6 +530,15 @@ class PipelineSwapRuntime:
         if self._copy_stream is None:
             self._copy_stream = self.new_stream()
         return self._copy_stream
+
+    def synchronize_host_transfers(self) -> None:
+        """Wait until per-tensor host mirrors are safe for CPU hooks."""
+        event = self._host_tail_event
+        if event is None:
+            return
+        self.wait_event(event, None)
+        if self._host_tail_event is event:
+            self._host_tail_event = None
 
     def _record_current_stream_event(self) -> Any:
         current_stream = self.current_stream()
@@ -753,9 +770,13 @@ class PipelineSwapRuntime:
 
     def wait_offload_slot(self, slot: SwapSlot) -> None:
         """Release device storage after D2H copy completes."""
-        if self._storage_tensor(slot.tensor).device.type != "cpu":
-            self.release_device_storage(slot)
-        slot.state = "host"
+        try:
+            if self._storage_tensor(slot.tensor).device.type != "cpu":
+                self.release_device_storage(slot)
+        finally:
+            # The caller has already waited for D2H. Keep that completed CPU
+            # copy authoritative even when releasing its device shell fails.
+            slot.state = "host"
 
     def restore_device_storage(self, slot: SwapSlot) -> None:
         """Restore device tensor storage before H2D."""
@@ -1204,6 +1225,48 @@ def validate_state_keys(state_keys: Optional[Sequence[str]]) -> Optional[tuple[s
 AdapterFactory = Callable[[Any, Any, PipelineSwapRuntime], "StateSwapAdapter"]
 
 
+def _build_profiled_step(wrapper: Any) -> Callable[..., Any]:
+    """Build a PyTorch step-hook dispatcher without retaining ``wrapper`` strongly."""
+    wrapper_ref = weakref.ref(wrapper)
+
+    def hooked_leaf_step(optimizer: Any, *args: Any, **kwargs: Any) -> Any:
+        """Dispatch one raw optimizer leaf through its swap wrapper."""
+        current = wrapper_ref()
+        if current is None:
+            raise RuntimeError("Swap optimizer wrapper has been released.")
+        if optimizer is not current.optimizer:
+            raise ValueError("Optimizer step hooks cannot replace optimizer identity.")
+        return current._step_impl(*args, **kwargs)
+
+    return torch.optim.Optimizer.profile_hook_step(hooked_leaf_step)
+
+
+def _hook_requires_optimizer_state(hook: Callable[..., Any]) -> bool:
+    """Return whether a hook may access state, with only literal ``False`` opting out."""
+    return getattr(hook, "requires_optimizer_state", True) is not False
+
+
+def _step_hooks_require_optimizer_state(
+        optimizer: Any,
+        *,
+        pre: bool = False,
+        post: bool = False,
+) -> bool:
+    """Check current instance and global hooks for optimizer-state access."""
+    hook_groups: List[Iterable[Callable[..., Any]]] = []
+    if pre:
+        hook_groups.extend((
+            torch_optimizer._global_optimizer_pre_hooks.values(),
+            (getattr(optimizer, "_optimizer_step_pre_hooks", None) or {}).values(),
+        ))
+    if post:
+        hook_groups.extend((
+            (getattr(optimizer, "_optimizer_step_post_hooks", None) or {}).values(),
+            torch_optimizer._global_optimizer_post_hooks.values(),
+        ))
+    return any(_hook_requires_optimizer_state(hook) for hooks in hook_groups for hook in hooks)
+
+
 class StateSwapAdapter:
     """Algorithm-independent optimizer-state swap adapter base.
 
@@ -1299,6 +1362,45 @@ class StateSwapAdapter:
                 if state:
                     slots.extend(self._build_slots(param, state))
         return tuple(slots)
+
+    def prepare_hook_step(self) -> None:
+        """Bind per-tensor state shells after pre-hooks and before step preparation."""
+        for _param, key, state, slot in self._iter_optimizer_slots():
+            if slot.swappable and not slot.packed and slot.tensor is not None:
+                state[key] = slot.tensor
+
+    def publish_hook_state(self, *, require_host: bool = False) -> None:
+        """Expose each swapped state's current authoritative tensor to step hooks.
+
+        Successful step boundaries require host residency. Exception cleanup may
+        instead publish a device shell when its slot did not reach host.
+        """
+        for _param, key, state, slot in self._iter_optimizer_slots():
+            if not slot.swappable:
+                continue
+            if slot.state == "host" and slot.cpu_tensor is not None:
+                state[key] = slot.cpu_tensor
+                continue
+            if require_host:
+                raise RuntimeError(
+                    f"Swap state {key!r} did not reach host residency before post-hooks."
+                )
+            state[key] = slot.tensor
+
+    def _iter_optimizer_slots(self) -> Iterable[Tuple[Any, str, Dict[str, Any], SwapSlot]]:
+        """Yield live optimizer-state mappings and their registered slots once."""
+        seen_slots = set()
+        for group in self.optimizer.param_groups:
+            for param in group["params"]:
+                state = self.optimizer.state.get(param)
+                if state is None:
+                    continue
+                for key in self._configured_state_keys():
+                    slot = self._slots.get((id(param), key))
+                    if slot is None or id(slot) in seen_slots or key not in state:
+                        continue
+                    seen_slots.add(id(slot))
+                    yield param, key, state, slot
 
     def finish_step(self, step_context: Any) -> Any:
         """Finish one outer optimizer step."""
@@ -1910,43 +2012,38 @@ class StateSwapAdapter:
         return tuple(self.config.state_keys or self.default_state_keys())
 
 
-def _check_step_hooks(optimizer: Any) -> None:
-    """Reject step hooks that the swap pipeline bypasses."""
-    if (getattr(optimizer, "_optimizer_step_pre_hooks", None)
-            or getattr(optimizer, "_optimizer_step_post_hooks", None)
-            or torch_optimizer._global_optimizer_pre_hooks
-            or torch_optimizer._global_optimizer_post_hooks):
-        raise ValueError(
-            "Optimizer-state swap does not support registered step hooks; "
-            "remove the hooks or disable swap"
-        )
-
-
 class SwapOptimizer(torch.optim.Optimizer):
     """Torch optimizer wrapper around a family-provided swap adapter.
 
     The wrapper is algorithm agnostic: it owns the pipeline runtime, exposes the
     wrapped optimizer's ``param_groups``/``state``/``defaults`` and drives one
     step as ``prepare_step`` -> ``partition`` -> ``run_pipeline`` ->
-    ``finish_step``.  The concrete adapter is built by the family factory passed
-    as ``adapter_factory`` (see ``swap_adam.py``/``swap_muon.py``).
+    ``finish_step``. Step hooks may update existing optimizer-state tensors in
+    place, but must not add, remove or replace tensor state entries; violations
+    raise ``RuntimeError``. Every step passes through PyTorch's hook dispatcher,
+    including steps with no hooks currently registered, so hooks added later
+    take effect. The concrete adapter is built by the family factory passed as
+    ``adapter_factory`` (see ``swap_adam.py``/``swap_muon.py``).
     """
 
     _is_swap_optimizer = True
 
     def __init__(self, optimizer: Any, config: Any, adapter_factory: AdapterFactory) -> None:
         """Wrap a leaf with its family adapter and independent transfer runtime."""
-        _check_step_hooks(optimizer)
         # Do not call ``torch.optim.Optimizer.__init__``: the wrapped base
         # optimizer already owns param_groups/state/defaults. Inheriting keeps
         # PyTorch LR schedulers and isinstance checks happy while this wrapper
         # delegates all optimizer state to ``self.optimizer``.
         self.optimizer = optimizer
         self.config = config
+        self._hooked_leaf_step = _build_profiled_step(self)
+        self._hook_step_active = False
         self._step_active = False
         self._reset_active = False
         self._reset_required = False
         self._export_active = False
+        self._pre_hook_state_snapshot: Optional[_HookStateSnapshot] = None
+        self._post_hook_state_snapshot: Optional[_HookStateSnapshot] = None
         self.runtime = PipelineSwapRuntime(config)
         self.adapter = adapter_factory(optimizer, config, self.runtime)
         self.adapter.validate()
@@ -1956,6 +2053,7 @@ class SwapOptimizer(torch.optim.Optimizer):
         self.runtime.offload_initial_slots(initial_slots)
         self.runtime.prepare_packed_host(initial_slots)
         self.adapter.publish_packed_state()
+        self.adapter.publish_hook_state()
 
     def __getattr__(self, name: str) -> Any:
         """Delegate unknown attributes to the base optimizer."""
@@ -2002,8 +2100,9 @@ class SwapOptimizer(torch.optim.Optimizer):
             RuntimeError: If a step, checkpoint or transfer is still active.
         """
         slots = tuple(self.adapter.tracked_slots())
-        if (self._step_active or self._reset_active or self._export_active or self.adapter._checkpoint_active
-                or self.runtime._packed_batch_plans or self.runtime._packed_tail_event is not None
+        if (self._hook_step_active or self._step_active or self._reset_active or self._export_active
+                or self.adapter._checkpoint_active or self.runtime._packed_batch_plans
+                or self.runtime._packed_tail_event is not None
                 or any(slot.state in ("h2d", "d2h") for slot in slots)):
             raise RuntimeError("Cannot reset optimizer parameters during a step, checkpoint or transfer.")
         self._reset_active = True
@@ -2016,28 +2115,168 @@ class SwapOptimizer(torch.optim.Optimizer):
                     reset()
                 self.adapter.rebind_parameter_slots(new_to_old_param or {})
                 self.runtime.invalidate_packed_layout()
+                self.adapter.publish_hook_state()
             self._reset_required = False
         finally:
             self._reset_active = False
 
     def step(self, closure: Optional[Any] = None) -> Any:
-        """Run one optimizer step with pipeline state swap."""
+        """Run one optimizer step through PyTorch's leaf hook dispatcher.
+
+        The swap pipeline never runs a closure, so a non-None value is rejected
+        before step hooks run, before any swap transfer is enqueued and before
+        any optimizer state is rewritten. Omitted and explicit ``None`` closures
+        are both forwarded to leaf hooks as ``closure=None``.
+
+        Args:
+            closure: Unsupported. Must be omitted or None.
+
+        Raises:
+            RuntimeError: If called recursively or a hook changes tensor state entries.
+            ValueError: If a non-None closure is supplied.
+        """
         if closure is not None:
             raise ValueError("Swap optimizer does not support closure.")
-        _check_step_hooks(self.optimizer)
+        if self._hook_step_active:
+            raise RuntimeError("Recursive SwapOptimizer.step() is not supported.")
         self._check_reset_complete()
+        pre_hooks_require_state = _step_hooks_require_optimizer_state(self.optimizer, pre=True)
+        if pre_hooks_require_state:
+            self.runtime.synchronize_host_transfers()
+            pre_hook_state = self._snapshot_hook_state()
+        else:
+            pre_hook_state = None
+        self._pre_hook_state_snapshot = pre_hook_state
+        self._post_hook_state_snapshot = None
+        self._hook_step_active = True
+        try:
+            result = self._hooked_leaf_step(self.optimizer, closure=closure)
+            post_hook_state = self._post_hook_state_snapshot
+            if post_hook_state is not None:
+                self._validate_hook_state_snapshot(post_hook_state)
+            return result
+        except BaseException:
+            if self._post_hook_state_snapshot is not None:
+                self._restore_hook_state_snapshot(self._post_hook_state_snapshot)
+            elif self._pre_hook_state_snapshot is not None:
+                self._restore_hook_state_snapshot(self._pre_hook_state_snapshot)
+            raise
+        finally:
+            self._hook_step_active = False
+            self._pre_hook_state_snapshot = None
+            self._post_hook_state_snapshot = None
+
+    def _step_impl(self, *args: Any, **kwargs: Any) -> Any:
+        """Execute the swap pipeline between PyTorch pre- and post-hooks."""
+        pre_hook_state = self._pre_hook_state_snapshot
+        if pre_hook_state is not None:
+            self._validate_hook_state_snapshot(pre_hook_state)
+        # ``step()`` already rejected the caller's closure; whatever arrives here
+        # is either the forwarded ``closure=None`` or a pre-hook rewrite.
+        if len(args) > 1 or set(kwargs) - {"closure"}:
+            raise ValueError("Swap optimizer does not support extra step arguments.")
+        if args and "closure" in kwargs:
+            raise TypeError("closure was passed both positionally and by keyword.")
+        closure = args[0] if args else kwargs.get("closure")
+        if closure is not None:
+            raise ValueError("Swap optimizer does not support closure.")
+
+        # A pending pre-hook snapshot also marks that the update body has not
+        # started yet. Consume it before any pipeline state can be mutated.
+        self._pre_hook_state_snapshot = None
         self._step_active = True
         try:
             with self._no_grad_context():
+                self.adapter.prepare_hook_step()
                 step_context = self.adapter.prepare_step()
                 units = self.adapter.iter_update_units(step_context)
                 unit_costs = self.adapter.partition_costs(units, step_context)
                 batches = self.runtime.partition(units, unit_costs=unit_costs)
                 self.adapter.prepare_pipeline(batches, step_context)
                 self.runtime.run_pipeline(batches, step_context, self.adapter.step_batch)
-                return self.adapter.finish_step(step_context)
+                result = self.adapter.finish_step(step_context)
+                post_hooks_require_state = _step_hooks_require_optimizer_state(self.optimizer, post=True)
+                if post_hooks_require_state:
+                    self.runtime.synchronize_host_transfers()
+                self.adapter.publish_hook_state(require_host=True)
+                if post_hooks_require_state:
+                    self._post_hook_state_snapshot = self._snapshot_hook_state()
+                return result
+        except BaseException:
+            slots = (slot for slot in self.adapter.all_slots() if slot.state != "pending")
+            self.runtime.synchronize_cpu_mirrors(slots)
+            self.adapter.publish_hook_state(require_host=True)
+            raise
         finally:
             self._step_active = False
+
+    @staticmethod
+    def _tensor_state_metadata(tensor: torch.Tensor) -> tuple[Any, ...]:
+        """Return metadata that step hooks must preserve for state tensors."""
+        return tuple(tensor.shape), tensor.dtype, tensor.device, tensor.layout
+
+    def _snapshot_hook_state(self) -> _HookStateSnapshot:
+        """Capture tensor-valued state entries, including params with empty state."""
+        snapshot: _HookStateSnapshot = {}
+        for param, param_state in self.optimizer.state.items():
+            tensor_state = {}
+            for key, value in param_state.items():
+                if isinstance(value, torch.Tensor):
+                    tensor_state[key] = (value, self._tensor_state_metadata(value))
+            snapshot[param] = (True, tensor_state)
+        for group in self.optimizer.param_groups:
+            for param in group["params"]:
+                snapshot.setdefault(param, (False, {}))
+        return snapshot
+
+    def _restore_hook_state_snapshot(
+            self,
+            snapshot: _HookStateSnapshot,
+    ) -> None:
+        """Restore original tensor bindings after a hook changes tensor state keys."""
+        for param, (entry_existed, expected_tensors) in snapshot.items():
+            param_state = self.optimizer.state.get(param)
+            if param_state is None:
+                if not entry_existed and not expected_tensors:
+                    continue
+                param_state = {}
+                self.optimizer.state[param] = param_state
+            for key, value in tuple(param_state.items()):
+                if isinstance(value, torch.Tensor) and key not in expected_tensors:
+                    del param_state[key]
+            for key, (tensor, _metadata) in expected_tensors.items():
+                param_state[key] = tensor
+            if not entry_existed and not param_state:
+                self.optimizer.state.pop(param, None)
+
+    def _validate_hook_state_snapshot(
+            self,
+            snapshot: _HookStateSnapshot,
+    ) -> None:
+        """Reject tensor state additions, removals, replacements or metadata changes."""
+        invalid_entries = []
+        for param, (_entry_existed, expected_tensors) in snapshot.items():
+            param_state = self.optimizer.state.get(param)
+            actual_tensors = {} if param_state is None else {
+                key: value for key, value in param_state.items() if isinstance(value, torch.Tensor)
+            }
+            for key in expected_tensors.keys() | actual_tensors.keys():
+                expected_entry = expected_tensors.get(key)
+                actual = actual_tensors.get(key)
+                if expected_entry is None or actual is None:
+                    invalid_entries.append(key)
+                    continue
+                expected, metadata = expected_entry
+                if actual is not expected or self._tensor_state_metadata(actual) != metadata:
+                    invalid_entries.append(key)
+        if not invalid_entries:
+            return
+        self._restore_hook_state_snapshot(snapshot)
+        keys = ", ".join(sorted({str(key) for key in invalid_entries}))
+        raise RuntimeError(
+            "Step hooks may modify existing optimizer-state tensor values in place, but must not "
+            f"add, remove or replace tensor state entries or change their metadata; invalid keys: {keys}."
+        )
 
     def _check_reset_complete(self) -> None:
         """Prevent using a partially rebuilt optimizer after reset failed."""
@@ -2112,6 +2351,7 @@ class SwapOptimizer(torch.optim.Optimizer):
         """Release HSDP checkpoint copies and restore host-resident slots."""
         try:
             self.adapter.finish_checkpoint()
+            self.adapter.publish_hook_state()
         finally:
             cleanup = getattr(self.optimizer, "cleanup_synced_state", None)
             if callable(cleanup):
@@ -2125,6 +2365,7 @@ class SwapOptimizer(torch.optim.Optimizer):
             self.adapter.load_checkpoint_state_dict(state_dict)
         finally:
             self._export_active = previous_active
+        self.adapter.publish_hook_state()
 
     @contextlib.contextmanager
     def _no_grad_context(self) -> Iterable[None]:

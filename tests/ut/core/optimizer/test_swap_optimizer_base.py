@@ -16,10 +16,12 @@
 
 import contextlib
 import copy
+import inspect
 import os
 import types
 import unittest
 from types import SimpleNamespace
+from typing import Any, Sequence
 from unittest import mock
 
 os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
@@ -29,21 +31,14 @@ from torch.optim import optimizer as torch_optimizer
 
 from hyper_parallel import DTensor, Replicate
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
-from hyper_parallel.core.optimizer import Muon, SwapOptimizerConfig, swap_optimizer
+from hyper_parallel.core.optimizer import (Muon, SwapOptimizerConfig,
+                                           swap_optimizer)
+from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
 from hyper_parallel.core.optimizer.swap_optimizer_base import (
-    PipelineSwapRuntime,
-    StateSwapAdapter,
-    SwapSlot,
-    SwapUpdateUnit,
-    UpdateUnit,
-    _PackedBatchPlan,
-    _PackedBatchRegion,
-    _StagingArena,
-    _iter_unique_events,
-    _iter_unique_slot_objects,
-    _iter_unique_slots,
-    validate_state_keys,
-)
+    PipelineSwapRuntime, StateSwapAdapter, SwapOptimizer, SwapSlot, SwapUpdateUnit,
+    UpdateUnit, _hook_requires_optimizer_state, _iter_unique_events,
+    _iter_unique_slot_objects, _iter_unique_slots, _PackedBatchPlan,
+    _PackedBatchRegion, _StagingArena, validate_state_keys)
 
 # Real Torch allocators, captured before the tests patch them for CPU-only runs.
 _TORCH_EMPTY = torch.empty
@@ -855,6 +850,40 @@ class TestSwapRuntimeOffloadWindow(unittest.TestCase):
         self.assertEqual(tiny_slot.state, "device")
         self.assertEqual(live_slot.state, "d2h")
 
+    def test_offload_keeps_the_latest_per_tensor_host_event(self):
+        """The per-tensor host tail follows the most recently submitted D2H copy."""
+        runtime = _DummySwapRuntime()
+        runtime.new_stream = mock.Mock(return_value="copy-stream")
+        events = [mock.Mock(name=name) for name in ("compute0", "copy0", "compute1", "copy1")]
+        runtime.record_event = mock.Mock(side_effect=events)
+        first = SwapSlot(name="first", tensor="t0", storage_nbytes=16, state="device")
+        second = SwapSlot(name="second", tensor="t1", storage_nbytes=16, state="device")
+
+        runtime.offload([_unit(first)])
+        self.assertIs(runtime._host_tail_event, events[1])
+        runtime.offload([_unit(second)])
+
+        self.assertIs(runtime._host_tail_event, events[3])
+        self.assertIs(first.event, events[1])
+        self.assertIs(second.event, events[3])
+
+    def test_wait_offload_keeps_completed_host_copy_authoritative_when_release_fails(self):
+        """A device-storage release failure cannot demote an already completed D2H copy."""
+        runtime = _like_device_runtime(packed_swap=False)
+        slot = SwapSlot(
+            name="moment",
+            tensor=_DeviceLikeTensor(torch.ones(4)),
+            cpu_tensor=torch.ones(4),
+            storage_nbytes=16,
+            state="d2h",
+        )
+        runtime.release_device_storage = mock.Mock(side_effect=RuntimeError("release failed"))
+
+        with self.assertRaisesRegex(RuntimeError, "release failed"):
+            runtime.wait_offload_slot(slot)
+
+        self.assertEqual(slot.state, "host")
+
     def test_synchronize_cpu_mirrors_requires_host_slots_to_keep_a_mirror(self):
         """Checkpointing fails loudly when a host slot lost its CPU mirror."""
         runtime = _DummySwapRuntime()
@@ -867,6 +896,7 @@ class TestSwapRuntimeOffloadWindow(unittest.TestCase):
         """Device-resident state is copied to its mirror, then released."""
         runtime = _DummySwapRuntime()
         runtime.record_event = mock.Mock(return_value=None)
+        runtime._host_tail_event = mock.Mock()
         device_slot = SwapSlot(name="device-slot", tensor="t0", cpu_tensor="cpu:t0", storage_nbytes=16, state="device")
         pending_slot = SwapSlot(name="pending-slot", tensor="t1", storage_nbytes=16, state="h2d")
 
@@ -876,6 +906,7 @@ class TestSwapRuntimeOffloadWindow(unittest.TestCase):
         self.assertEqual(device_slot.state, "host")
         self.assertEqual(pending_slot.state, "host")
         self.assertIsNone(device_slot.event)
+        self.assertIsNone(runtime._host_tail_event)
         runtime.record_event.assert_not_called()
 
     def test_synchronize_cpu_mirrors_skips_unswappable_and_empty_inputs(self):
@@ -1965,6 +1996,32 @@ class TestSwapRuntimeStreamHooks(unittest.TestCase):
         self.assertEqual(first, "copy-stream")
         self.runtime.new_stream.assert_called_once_with()
 
+    def test_synchronize_host_transfers_waits_for_the_tail_event_once(self):
+        """Hook-boundary synchronization targets the D2H tail rather than the whole stream."""
+        self.runtime.synchronize_host_transfers()
+        copy_stream = mock.Mock()
+        event = mock.Mock()
+        self.runtime._copy_stream = copy_stream
+        self.runtime._host_tail_event = event
+
+        self.runtime.synchronize_host_transfers()
+        self.runtime.synchronize_host_transfers()
+
+        event.synchronize.assert_called_once_with()
+        copy_stream.synchronize.assert_not_called()
+        self.assertIsNone(self.runtime._host_tail_event)
+
+    def test_synchronize_host_transfers_keeps_a_tail_event_when_waiting_fails(self):
+        """A failed host wait remains recoverable by a later barrier or cleanup path."""
+        event = mock.Mock()
+        event.synchronize.side_effect = RuntimeError("event wait failed")
+        self.runtime._host_tail_event = event
+
+        with self.assertRaisesRegex(RuntimeError, "event wait failed"):
+            self.runtime.synchronize_host_transfers()
+
+        self.assertIs(self.runtime._host_tail_event, event)
+
     def test_record_current_stream_event_uses_the_compute_stream(self):
         """The event that gates a copy is tied to the compute stream."""
         self.runtime.current_stream = mock.Mock(return_value="compute")
@@ -1974,11 +2031,49 @@ class TestSwapRuntimeStreamHooks(unittest.TestCase):
         self.runtime.record_event.assert_called_once_with("compute")
 
 
-class TestSwapOptimizerHookGuard(unittest.TestCase):
-    """Reject unsupported step hooks before swap side effects."""
+class TestSwapOptimizerStepHooks(unittest.TestCase):
+    """Step hooks remain active across swap wrapper construction and execution."""
 
-    def test_existing_hooks_are_rejected_before_runtime(self):
-        """Existing instance and global hooks fail before swap construction."""
+    def test_step_signature_uses_optional_closure(self):
+        """The wrapper exposes the same closure parameter shape as Torch optimizers."""
+        actual = inspect.signature(SwapOptimizer.step).parameters
+        expected = inspect.signature(torch.optim.Optimizer.step).parameters
+
+        self.assertEqual(tuple(actual), ("self", "closure"))
+        self.assertEqual(actual["closure"].kind, expected["closure"].kind)
+        self.assertIsNone(actual["closure"].default)
+
+    def test_non_none_closure_is_rejected_before_pre_hooks(self):
+        """An unsupported closure cannot trigger hook or optimizer-state side effects."""
+        param = torch.nn.Parameter(torch.ones(2, 2))
+        optimizer = torch.optim.AdamW([param], lr=0.01)
+        wrapped = swap_optimizer(
+            optimizer,
+            SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False),
+        )
+        pre_hook = mock.Mock(return_value=None)
+        handle = optimizer.register_step_pre_hook(pre_hook)
+        self.addCleanup(handle.remove)
+
+        with mock.patch.object(
+                wrapped.runtime,
+                "synchronize_host_transfers",
+                wraps=wrapped.runtime.synchronize_host_transfers,
+        ) as synchronize, mock.patch.object(
+                wrapped,
+                "_snapshot_hook_state",
+                wraps=wrapped._snapshot_hook_state,
+        ) as snapshot:
+            with self.assertRaisesRegex(ValueError, "does not support closure"):
+                wrapped.step(closure=lambda: None)
+
+        pre_hook.assert_not_called()
+        synchronize.assert_not_called()
+        snapshot.assert_not_called()
+        self.assertEqual(dict(optimizer.state), {})
+
+    def test_existing_instance_and_global_hooks_are_dispatched(self):
+        """Hooks registered before wrapping execute around the swap step."""
         config = SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False)
         cases = ((torch.optim.AdamW, "leaf", "pre"), (Muon, "leaf", "post"),
                  (torch.optim.AdamW, "global", "pre"), (torch.optim.AdamW, "global", "post"))
@@ -1988,23 +2083,692 @@ class TestSwapOptimizerHookGuard(unittest.TestCase):
                 optimizer = optimizer_type([param], lr=0.01)
                 register = (getattr(torch_optimizer, f"register_optimizer_step_{hook_kind}_hook")
                             if scope == "global" else getattr(optimizer, f"register_step_{hook_kind}_hook"))
-                handle = register(lambda *args: None)
-                self.addCleanup(handle.remove)
-                before = param.detach().clone()
-                with mock.patch(
-                    "hyper_parallel.core.optimizer.swap_optimizer_base.PipelineSwapRuntime"
-                ) as runtime:
-                    with self.assertRaisesRegex(ValueError, "registered step hooks"):
-                        swap_optimizer(optimizer, config)
-                    runtime.assert_not_called()
-                self.assertTrue(torch.equal(param, before))
-                self.assertEqual(len(optimizer.state), 0)
-                handle.remove()
+                hook = mock.Mock(return_value=None)
+                handle = register(hook)
                 wrapped = swap_optimizer(optimizer, config)
-                self.assertIs(wrapped.optimizer, optimizer)
+                try:
+                    wrapped.step()
+                    hook.assert_called_once_with(optimizer, (optimizer,), {"closure": None})
+                    self.assertIs(wrapped.optimizer, optimizer)
+                finally:
+                    handle.remove()
 
-    def test_late_hooks_are_rejected_before_step(self):
-        """Late hooks cannot silently bypass callbacks or partially update a leaf."""
+    def test_dispatch_order_and_pre_hook_kwargs_rewrite(self):
+        """The dispatcher preserves PyTorch order and forwards pre-hook rewrites."""
+        param = torch.nn.Parameter(torch.ones(2, 2))
+        optimizer = torch.optim.AdamW([param], lr=0.01)
+        wrapped = swap_optimizer(
+            optimizer,
+            SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False),
+        )
+        events = []
+        hook_args = []
+
+        def global_pre(_leaf: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, Any]:
+            """Record global pre-hook arguments and move the closure to args."""
+            events.append("global_pre")
+            hook_args.append(("global_pre", args, dict(kwargs)))
+            return args + (kwargs["closure"],), {}
+
+        def instance_pre(_leaf: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+            """Record instance pre-hook arguments."""
+            events.append("instance_pre")
+            hook_args.append(("instance_pre", args, dict(kwargs)))
+
+        def finish_step(_context: Any) -> None:
+            """Record completion of the stubbed optimizer body."""
+            events.append("algorithm")
+
+        def optimizer_step_code() -> None:
+            """Record PyTorch's optimizer step-code callback."""
+            events.append("optimizer_step_code")
+
+        def instance_post(_leaf: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+            """Record instance post-hook arguments."""
+            events.append("instance_post")
+            hook_args.append(("instance_post", args, dict(kwargs)))
+
+        def global_post(_leaf: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+            """Record global post-hook arguments."""
+            events.append("global_post")
+            hook_args.append(("global_post", args, dict(kwargs)))
+
+        global_pre_handle = torch_optimizer.register_optimizer_step_pre_hook(global_pre)
+        global_post_handle = torch_optimizer.register_optimizer_step_post_hook(global_post)
+        instance_pre_handle = optimizer.register_step_pre_hook(instance_pre)
+        instance_post_handle = optimizer.register_step_post_hook(instance_post)
+        self.addCleanup(global_pre_handle.remove)
+        self.addCleanup(global_post_handle.remove)
+        self.addCleanup(instance_pre_handle.remove)
+        self.addCleanup(instance_post_handle.remove)
+        with mock.patch.object(wrapped.adapter, "finish_step", side_effect=finish_step), \
+                mock.patch.object(optimizer, "_optimizer_step_code", side_effect=optimizer_step_code):
+            wrapped.step()
+
+        self.assertEqual(
+            events,
+            ["global_pre", "instance_pre", "algorithm", "optimizer_step_code", "instance_post", "global_post"],
+        )
+        self.assertEqual(hook_args[0][1:], ((optimizer,), {"closure": None}))
+        self.assertEqual(hook_args[1][1:], ((optimizer, None), {}))
+        self.assertEqual(hook_args[2][1:], ((optimizer, None), {}))
+        self.assertEqual(hook_args[3][1:], ((optimizer, None), {}))
+
+    def test_none_closure_is_normalized_to_keyword_for_hooks(self):
+        """Omitted, positional and keyword None closures have one hook representation."""
+        param = torch.nn.Parameter(torch.ones(2, 2))
+        optimizer = torch.optim.AdamW([param], lr=0.01)
+        wrapped = swap_optimizer(
+            optimizer,
+            SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False),
+        )
+        seen = []
+        pre_handle = optimizer.register_step_pre_hook(
+            lambda _optimizer, args, kwargs: seen.append(("pre", args, dict(kwargs)))
+        )
+        post_handle = optimizer.register_step_post_hook(
+            lambda _optimizer, args, kwargs: seen.append(("post", args, dict(kwargs)))
+        )
+        self.addCleanup(pre_handle.remove)
+        self.addCleanup(post_handle.remove)
+
+        calls = (
+            ("omitted", lambda: wrapped.step()),
+            ("positional", lambda: wrapped.step(None)),
+            ("keyword", lambda: wrapped.step(closure=None)),
+        )
+        for name, call in calls:
+            with self.subTest(call=name):
+                seen.clear()
+                call()
+                self.assertEqual(
+                    seen,
+                    [
+                        ("pre", (optimizer,), {"closure": None}),
+                        ("post", (optimizer,), {"closure": None}),
+                    ],
+                )
+
+    def test_chained_optimizer_passes_explicit_none_to_leaf_hooks(self):
+        """Muon and AdamW chain leaves see PyTorch order and explicit None kwargs."""
+        model = torch.nn.Linear(2, 2)
+        muon = Muon([model.weight], lr=0.01)
+        adamw = torch.optim.AdamW([model.bias], lr=0.01)
+        config = SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False)
+        wrapped_muon = swap_optimizer(muon, config)
+        wrapped_adamw = swap_optimizer(adamw, config)
+        chain = ChainedOptimizer(model, {"muon": wrapped_muon, "adamw": wrapped_adamw})
+        seen = []
+
+        def label(leaf: Any) -> str:
+            """Return the optimizer-family label for one leaf."""
+            return "muon" if leaf is muon else "adamw"
+
+        def global_pre(leaf: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+            """Record a global pre-hook call for one chain leaf."""
+            seen.append((f"global_pre_{label(leaf)}", leaf, args, dict(kwargs)))
+
+        def global_post(leaf: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+            """Record a global post-hook call for one chain leaf."""
+            seen.append((f"global_post_{label(leaf)}", leaf, args, dict(kwargs)))
+
+        global_pre_handle = torch_optimizer.register_optimizer_step_pre_hook(global_pre)
+        global_post_handle = torch_optimizer.register_optimizer_step_post_hook(global_post)
+        muon_pre_handle = muon.register_step_pre_hook(
+            lambda leaf, args, kwargs: seen.append(("instance_pre_muon", leaf, args, dict(kwargs)))
+        )
+        muon_post_handle = muon.register_step_post_hook(
+            lambda leaf, args, kwargs: seen.append(("instance_post_muon", leaf, args, dict(kwargs)))
+        )
+        adamw_pre_handle = adamw.register_step_pre_hook(
+            lambda leaf, args, kwargs: seen.append(("instance_pre_adamw", leaf, args, dict(kwargs)))
+        )
+        adamw_post_handle = adamw.register_step_post_hook(
+            lambda leaf, args, kwargs: seen.append(("instance_post_adamw", leaf, args, dict(kwargs)))
+        )
+        for handle in (
+                global_pre_handle, global_post_handle, muon_pre_handle, muon_post_handle,
+                adamw_pre_handle, adamw_post_handle):
+            self.addCleanup(handle.remove)
+
+        chain.step()
+
+        expected = [
+            ("global_pre_muon", muon),
+            ("instance_pre_muon", muon),
+            ("instance_post_muon", muon),
+            ("global_post_muon", muon),
+            ("global_pre_adamw", adamw),
+            ("instance_pre_adamw", adamw),
+            ("instance_post_adamw", adamw),
+            ("global_post_adamw", adamw),
+        ]
+        self.assertEqual([(event, leaf) for event, leaf, _args, _kwargs in seen], expected)
+        for _event, leaf, args, kwargs in seen:
+            self.assertEqual(args, (leaf,))
+            self.assertEqual(kwargs, {"closure": None})
+
+    def test_pre_and_post_hooks_run_once_for_multiple_swap_batches(self):
+        """Batching multiple parameter updates does not multiply hook calls."""
+        params = [torch.nn.Parameter(torch.ones(2, 2)) for _ in range(2)]
+        optimizer = torch.optim.AdamW(params, lr=0.01)
+        for param in params:
+            param.grad = torch.ones_like(param)
+        wrapped = swap_optimizer(
+            optimizer,
+            SwapOptimizerConfig(swap_times=2, min_numel=1, packed_swap=False),
+        )
+        pre_hook = mock.Mock(return_value=None)
+        post_hook = mock.Mock(return_value=None)
+        pre_handle = optimizer.register_step_pre_hook(pre_hook)
+        post_handle = optimizer.register_step_post_hook(post_hook)
+        self.addCleanup(pre_handle.remove)
+        self.addCleanup(post_handle.remove)
+        partitioned_batches = []
+
+        def split_units(units: Sequence[Any], unit_costs: Any = None) -> list[list[Any]]:
+            """Return one update unit per batch and capture the partition."""
+            del unit_costs
+            batches = [[unit] for unit in units]
+            partitioned_batches.extend(batches)
+            return batches
+
+        with mock.patch.object(PipelineSwapRuntime, "new_stream", return_value=None), \
+                mock.patch.object(PipelineSwapRuntime, "current_stream", return_value=None), \
+                mock.patch.object(
+                    PipelineSwapRuntime,
+                    "is_swappable_tensor",
+                    side_effect=lambda tensor, min_numel: tensor.numel() >= min_numel,
+                ), \
+                mock.patch.object(
+                    wrapped.runtime,
+                    "partition",
+                    side_effect=split_units,
+                ) as partition:
+            wrapped.step()
+
+        self.assertEqual(partition.call_count, 1)
+        self.assertEqual(len(partitioned_batches), len(params))
+        pre_hook.assert_called_once_with(optimizer, (optimizer,), {"closure": None})
+        post_hook.assert_called_once_with(optimizer, (optimizer,), {"closure": None})
+
+    def test_hook_exceptions_preserve_pytorch_update_semantics(self):
+        """Pre-hook failures skip updates; post-hook failures keep completed updates."""
+        param = torch.nn.Parameter(torch.ones(2, 2))
+        param.grad = torch.full_like(param, 0.1)
+        optimizer = torch.optim.AdamW([param], lr=0.01)
+        wrapped = swap_optimizer(
+            optimizer,
+            SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False),
+        )
+        initial = torch.clone(param)
+
+        def pre_failure(*_args: Any) -> None:
+            """Raise from the pre-hook before the optimizer update starts."""
+            raise RuntimeError("pre failed")
+
+        pre_handle = optimizer.register_step_pre_hook(pre_failure)
+        post_mock = mock.Mock()
+        post_handle = optimizer.register_step_post_hook(post_mock)
+        self.addCleanup(pre_handle.remove)
+        self.addCleanup(post_handle.remove)
+
+        with self.assertRaisesRegex(RuntimeError, "pre failed"):
+            wrapped.step()
+
+        torch.testing.assert_close(param, initial, rtol=0, atol=0)
+        post_mock.assert_not_called()
+        self.assertFalse(wrapped._step_active)
+        self.assertFalse(wrapped._hook_step_active)
+        pre_handle.remove()
+
+        def post_failure(_optimizer: Any, _args: Any, _kwargs: Any) -> None:
+            """Raise after the optimizer update has already completed."""
+            raise RuntimeError("post failed")
+
+        failing_post = optimizer.register_step_post_hook(post_failure)
+        self.addCleanup(failing_post.remove)
+        with self.assertRaisesRegex(RuntimeError, "post failed"):
+            wrapped.step()
+
+        self.assertFalse(torch.equal(param, initial))
+        self.assertFalse(wrapped._step_active)
+        self.assertFalse(wrapped._hook_step_active)
+
+    def test_failing_pre_hook_restores_state_before_body_entry(self):
+        """A pre-hook failure restores tensor bindings while its snapshot is pending."""
+        param = torch.nn.Parameter(torch.ones(2, 2))
+        param.grad = torch.ones_like(param)
+        optimizer = torch.optim.AdamW([param], lr=0.01)
+        optimizer.state[param] = {
+            "step": torch.tensor(1.0),
+            "exp_avg": torch.full_like(param, 2.0),
+            "exp_avg_sq": torch.full_like(param, 3.0),
+        }
+        wrapped = swap_optimizer(
+            optimizer,
+            SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False),
+        )
+        original = optimizer.state[param]["exp_avg"]
+
+        def replace_then_fail(_optimizer: Any, _args: Any, _kwargs: Any) -> None:
+            """Replace a tensor before raising from the pre-hook phase."""
+            optimizer.state[param]["exp_avg"] = torch.full_like(param, 99.0)
+            raise RuntimeError("pre failed after replacement")
+
+        handle = optimizer.register_step_pre_hook(replace_then_fail)
+        self.addCleanup(handle.remove)
+
+        with self.assertRaisesRegex(RuntimeError, "pre failed after replacement"):
+            wrapped.step()
+
+        self.assertIs(optimizer.state[param]["exp_avg"], original)
+
+    def test_body_failure_keeps_lazily_initialized_state(self):
+        """Once the body starts, failure recovery does not restore the pre-hook snapshot."""
+        param = torch.nn.Parameter(torch.ones(2, 2))
+        param.grad = torch.ones_like(param)
+        optimizer = torch.optim.AdamW([param], lr=0.01)
+        wrapped = swap_optimizer(
+            optimizer,
+            SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False),
+        )
+        handle = optimizer.register_step_pre_hook(lambda *_args: None)
+        self.addCleanup(handle.remove)
+
+        with mock.patch.object(wrapped.runtime, "partition", side_effect=RuntimeError("partition failed")):
+            with self.assertRaisesRegex(RuntimeError, "partition failed"):
+                wrapped.step()
+
+        self.assertIn(param, optimizer.state)
+        self.assertEqual(set(optimizer.state[param]), {"step", "exp_avg", "exp_avg_sq"})
+
+    def test_failed_step_publishes_host_state_to_later_pre_hook(self):
+        """A pre-hook registered after a partial update only sees authoritative CPU mirrors."""
+        params = [torch.nn.Parameter(torch.ones(2, 2)) for _ in range(2)]
+        optimizer = torch.optim.AdamW(params, lr=0.01)
+        for param in params:
+            param.grad = torch.ones_like(param)
+        wrapped = swap_optimizer(
+            optimizer,
+            SwapOptimizerConfig(swap_times=2, min_numel=1, packed_swap=False),
+        )
+        original_step_batch = wrapped.adapter.step_batch
+        batch_calls = 0
+
+        def fail_second_batch(batch: Any, step_context: Any) -> None:
+            """Apply both updates, then fail before the second batch can offload."""
+            nonlocal batch_calls
+            original_step_batch(batch, step_context)
+            batch_calls += 1
+            if batch_calls == 2:
+                raise RuntimeError("injected update failure")
+
+        with mock.patch.object(PipelineSwapRuntime, "new_stream", return_value=None), \
+                mock.patch.object(PipelineSwapRuntime, "current_stream", return_value=None), \
+                mock.patch.object(
+                    PipelineSwapRuntime,
+                    "is_swappable_tensor",
+                    side_effect=lambda tensor, min_numel: tensor.numel() >= min_numel,
+                ), mock.patch.object(wrapped.adapter, "step_batch", side_effect=fail_second_batch):
+            with self.assertRaisesRegex(RuntimeError, "injected update failure"):
+                wrapped.step()
+
+        seen_bindings = []
+
+        def inspect_state(_optimizer: Any, _args: Any, _kwargs: Any) -> None:
+            """Capture the state bindings before the next step restores device shells."""
+            for param in params:
+                for key in ("exp_avg", "exp_avg_sq"):
+                    slot = wrapped.adapter._slots[(id(param), key)]
+                    seen_bindings.append((slot.state, optimizer.state[param][key] is slot.cpu_tensor))
+
+        pre_handle = optimizer.register_step_pre_hook(inspect_state)
+        self.addCleanup(pre_handle.remove)
+        for param in params:
+            param.grad = torch.ones_like(param)
+        with mock.patch.object(PipelineSwapRuntime, "new_stream", return_value=None), \
+                mock.patch.object(PipelineSwapRuntime, "current_stream", return_value=None), \
+                mock.patch.object(
+                    PipelineSwapRuntime,
+                    "is_swappable_tensor",
+                    side_effect=lambda tensor, min_numel: tensor.numel() >= min_numel,
+                ):
+            wrapped.step()
+
+        self.assertEqual(seen_bindings, [("host", True)] * 4)
+
+    def test_hooks_cannot_reset_optimizer_parameters(self):
+        """Parameter reset is rejected throughout pre- and post-hook dispatch."""
+        for hook_kind in ("pre", "post"):
+            with self.subTest(hook=hook_kind):
+                param = torch.nn.Parameter(torch.ones(2, 2))
+                param.grad = torch.ones_like(param)
+                optimizer = torch.optim.AdamW([param], lr=0.01)
+                wrapped = swap_optimizer(
+                    optimizer,
+                    SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False),
+                )
+
+                def reset_from_hook(*_args: Any) -> None:
+                    """Attempt to rebuild parameter metadata while hook dispatch is active."""
+                    wrapped.reset_optimizer_parameters()
+
+                register = getattr(optimizer, f"register_step_{hook_kind}_hook")
+                handle = register(reset_from_hook)
+                self.addCleanup(handle.remove)
+                with mock.patch.object(
+                        optimizer, "reset_optimizer_parameters", create=True,
+                ) as reset, mock.patch.object(
+                        wrapped.adapter,
+                        "rebind_parameter_slots",
+                        wraps=wrapped.adapter.rebind_parameter_slots,
+                ) as rebind:
+                    with self.assertRaisesRegex(RuntimeError, "during a step, checkpoint or transfer"):
+                        wrapped.step()
+
+                reset.assert_not_called()
+                rebind.assert_not_called()
+                self.assertFalse(wrapped._step_active)
+                self.assertFalse(wrapped._hook_step_active)
+
+    def test_per_tensor_state_is_host_visible_and_in_place_edits_survive(self):
+        """Hooks see host mirrors and their in-place edits reach later steps."""
+        param = torch.nn.Parameter(torch.ones(2, 2))
+        optimizer = torch.optim.AdamW([param], lr=0.01)
+        optimizer.state[param] = {
+            "step": torch.tensor(1.0),
+            "exp_avg": torch.full_like(param, 2.0),
+            "exp_avg_sq": torch.full_like(param, 3.0),
+        }
+        param.grad = torch.ones_like(param)
+        pre_values = []
+        post_calls = []
+
+        def pre_hook(_optimizer: Any, _args: Any, _kwargs: Any) -> None:
+            """Capture host state and mutate its value on the first step."""
+            state = optimizer.state[param]
+            self.assertEqual(state["exp_avg"].device.type, "cpu")
+            pre_values.append(state["exp_avg"].clone())
+            if len(pre_values) == 1:
+                state["exp_avg"].fill_(7.0)
+
+        def post_hook(_optimizer: Any, _args: Any, _kwargs: Any) -> None:
+            """Capture host state and edit it in place after the first step."""
+            state = optimizer.state[param]
+            self.assertEqual(state["exp_avg"].device.type, "cpu")
+            post_calls.append(None)
+            if len(post_calls) == 1:
+                state["exp_avg"].fill_(11.0)
+
+        with mock.patch.object(PipelineSwapRuntime, "new_stream", return_value=None), \
+                mock.patch.object(PipelineSwapRuntime, "current_stream", return_value=None), \
+                mock.patch.object(
+                    PipelineSwapRuntime,
+                    "is_swappable_tensor",
+                    side_effect=lambda tensor, min_numel: tensor.numel() >= min_numel,
+                ):
+            wrapped = swap_optimizer(
+                optimizer,
+                SwapOptimizerConfig(swap_times=1, min_numel=1, packed_swap=False),
+            )
+            slot = wrapped.adapter._slots[(id(param), "exp_avg")]
+            self.assertIs(optimizer.state[param]["exp_avg"], slot.cpu_tensor)
+            pre_handle = optimizer.register_step_pre_hook(pre_hook)
+            post_handle = optimizer.register_step_post_hook(post_hook)
+            self.addCleanup(pre_handle.remove)
+            self.addCleanup(post_handle.remove)
+
+            wrapped.step()
+            self.assertIs(optimizer.state[param]["exp_avg"], slot.cpu_tensor)
+            torch.testing.assert_close(optimizer.state[param]["exp_avg"], torch.full_like(param, 11.0))
+            wrapped.step()
+
+        torch.testing.assert_close(pre_values[0], torch.full_like(param, 2.0))
+        torch.testing.assert_close(pre_values[1], torch.full_like(param, 11.0))
+        self.assertEqual(len(post_calls), 2)
+
+    def test_packed_state_in_place_edits_survive_republication(self):
+        """Re-publishing packed host views preserves post-hook in-place edits."""
+        param = torch.nn.Parameter(torch.ones(2, 2))
+        optimizer = torch.optim.AdamW([param], lr=0.01)
+        optimizer.state[param] = {
+            "step": torch.tensor(1.0),
+            "exp_avg": torch.full_like(param, 2.0),
+            "exp_avg_sq": torch.full_like(param, 3.0),
+        }
+        param.grad = torch.ones_like(param)
+        pre_values = []
+        post_calls = []
+
+        def pre_hook(_optimizer: Any, _args: Any, _kwargs: Any) -> None:
+            """Capture the host view exposed by a packed optimizer state."""
+            state_tensor = optimizer.state[param]["exp_avg"]
+            self.assertEqual(state_tensor.device.type, "cpu")
+            pre_values.append(state_tensor.clone())
+
+        def post_hook(_optimizer: Any, _args: Any, _kwargs: Any) -> None:
+            """Edit the packed host view in place after the first step."""
+            state_tensor = optimizer.state[param]["exp_avg"]
+            self.assertEqual(state_tensor.device.type, "cpu")
+            post_calls.append(None)
+            if len(post_calls) == 1:
+                state_tensor.fill_(13.0)
+
+        with mock.patch.object(PipelineSwapRuntime, "new_stream", return_value=None), \
+                mock.patch.object(PipelineSwapRuntime, "current_stream", return_value=None), \
+                mock.patch.object(PipelineSwapRuntime, "supports_packed_pipeline", return_value=False), \
+                mock.patch.object(
+                    PipelineSwapRuntime,
+                    "is_swappable_tensor",
+                    side_effect=lambda tensor, min_numel: tensor.numel() >= min_numel,
+                ):
+            wrapped = swap_optimizer(
+                optimizer,
+                SwapOptimizerConfig(swap_times=1, min_numel=1, packed_swap=True),
+            )
+            slot = wrapped.adapter._slots[(id(param), "exp_avg")]
+            self.assertTrue(slot.packed)
+            self.assertIs(optimizer.state[param]["exp_avg"], slot.cpu_tensor)
+            pre_handle = optimizer.register_step_pre_hook(pre_hook)
+            post_handle = optimizer.register_step_post_hook(post_hook)
+            self.addCleanup(pre_handle.remove)
+            self.addCleanup(post_handle.remove)
+
+            wrapped.step()
+            self.assertIs(optimizer.state[param]["exp_avg"], slot.cpu_tensor)
+            torch.testing.assert_close(slot.cpu_tensor, torch.full_like(param, 13.0))
+            wrapped.step()
+
+        torch.testing.assert_close(pre_values[0], torch.full_like(param, 2.0))
+        torch.testing.assert_close(pre_values[1], torch.full_like(param, 13.0))
+        self.assertEqual(len(post_calls), 2)
+
+    def test_state_tensor_replacement_raises_and_restores_binding(self):
+        """Pre- and post-hooks cannot replace swapped or ordinary state tensors."""
+        cases = ((1, "pre", False), (1024, "post", False), (1, "post", True))
+        for min_numel, hook_kind, packed_swap in cases:
+            with self.subTest(min_numel=min_numel, hook=hook_kind, packed=packed_swap):
+                param = torch.nn.Parameter(torch.ones(2, 2))
+                optimizer = torch.optim.AdamW([param], lr=0.01)
+                optimizer.state[param] = {
+                    "step": torch.tensor(1.0),
+                    "exp_avg": torch.full_like(param, 2.0),
+                    "exp_avg_sq": torch.full_like(param, 3.0),
+                }
+                param.grad = torch.ones_like(param)
+                with mock.patch.object(PipelineSwapRuntime, "new_stream", return_value=None), \
+                        mock.patch.object(PipelineSwapRuntime, "current_stream", return_value=None), \
+                        mock.patch.object(PipelineSwapRuntime, "supports_packed_pipeline", return_value=False), \
+                        mock.patch.object(
+                            PipelineSwapRuntime,
+                            "is_swappable_tensor",
+                            side_effect=lambda tensor, min_numel: tensor.numel() >= min_numel,
+                        ):
+                    wrapped = swap_optimizer(
+                        optimizer,
+                        SwapOptimizerConfig(
+                            swap_times=1,
+                            min_numel=min_numel,
+                            packed_swap=packed_swap,
+                        ),
+                    )
+                    original = optimizer.state[param]["exp_avg"]
+
+                    def replace_state(_optimizer: Any, _args: Any, _kwargs: Any) -> None:
+                        """Replace one existing state tensor to exercise validation."""
+                        optimizer.state[param]["exp_avg"] = torch.full_like(param, 99.0)
+
+                    register = getattr(optimizer, f"register_step_{hook_kind}_hook")
+                    handle = register(replace_state)
+                    try:
+                        with self.assertRaisesRegex(RuntimeError, "must not add, remove or replace"):
+                            wrapped.step()
+                    finally:
+                        handle.remove()
+
+                    self.assertIs(optimizer.state[param]["exp_avg"], original)
+
+    def test_hook_cannot_add_lazy_tensor_state(self):
+        """Pre-hooks cannot inject state tensors that lazy init would overwrite."""
+        param = torch.nn.Parameter(torch.ones(2, 2))
+        optimizer = torch.optim.AdamW([param], lr=0.01)
+        param.grad = torch.ones_like(param)
+        wrapped = swap_optimizer(
+            optimizer,
+            SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False),
+        )
+
+        def add_state(_optimizer: Any, _args: Any, _kwargs: Any) -> None:
+            """Add the lazy Adam moment before the adapter initializes it."""
+            optimizer.state[param]["exp_avg"] = torch.full_like(param, 7.0)
+
+        handle = optimizer.register_step_pre_hook(add_state)
+        self.addCleanup(handle.remove)
+
+        with self.assertRaisesRegex(RuntimeError, "must not add, remove or replace"):
+            wrapped.step()
+
+        self.assertNotIn(param, optimizer.state)
+        self.assertEqual(optimizer.state_dict()["state"], {})
+        self.assertFalse(wrapped._step_active)
+        self.assertFalse(wrapped._hook_step_active)
+
+    def test_hook_restore_does_not_create_uninitialized_parameter_state(self):
+        """Restoring a violation leaves unrelated lazy parameter state absent."""
+        initialized = torch.nn.Parameter(torch.ones(2, 2))
+        uninitialized = torch.nn.Parameter(torch.ones(2, 2))
+        initialized.grad = torch.ones_like(initialized)
+        optimizer = torch.optim.AdamW([initialized, uninitialized], lr=0.01)
+        optimizer.state[initialized] = {
+            "step": torch.tensor(1.0),
+            "exp_avg": torch.full_like(initialized, 2.0),
+            "exp_avg_sq": torch.full_like(initialized, 3.0),
+        }
+        wrapped = swap_optimizer(
+            optimizer,
+            SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False),
+        )
+        state_ids_before = set(optimizer.state_dict()["state"])
+
+        def replace_state(_optimizer: Any, _args: Any, _kwargs: Any) -> None:
+            """Replace initialized state so restoring visits every snapshotted parameter."""
+            optimizer.state[initialized]["exp_avg"] = torch.full_like(initialized, 7.0)
+
+        handle = optimizer.register_step_pre_hook(replace_state)
+        self.addCleanup(handle.remove)
+
+        with self.assertRaisesRegex(RuntimeError, "must not add, remove or replace"):
+            wrapped.step()
+
+        self.assertNotIn(uninitialized, optimizer.state)
+        self.assertEqual(set(optimizer.state_dict()["state"]), state_ids_before)
+
+    def test_hook_restore_preserves_existing_empty_state_entry(self):
+        """Restoring a violation preserves an empty state entry that already existed."""
+        param = torch.nn.Parameter(torch.ones(2, 2))
+        optimizer = torch.optim.AdamW([param], lr=0.01)
+        optimizer.state[param] = {}
+        wrapped = swap_optimizer(
+            optimizer,
+            SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False),
+        )
+
+        def add_state(_optimizer: Any, _args: Any, _kwargs: Any) -> None:
+            """Add a tensor to the existing empty state entry."""
+            optimizer.state[param]["exp_avg"] = torch.full_like(param, 7.0)
+
+        handle = optimizer.register_step_pre_hook(add_state)
+        self.addCleanup(handle.remove)
+
+        with self.assertRaisesRegex(RuntimeError, "must not add, remove or replace"):
+            wrapped.step()
+
+        self.assertIn(param, optimizer.state)
+        self.assertEqual(optimizer.state[param], {})
+        self.assertEqual(optimizer.state_dict()["state"], {0: {}})
+
+    def test_muon_reads_prefetched_momentum_and_publishes_host_state(self):
+        """Muon's direct state lookup sees the device shell only after prefetch."""
+        param = torch.nn.Parameter(torch.arange(1.0, 5.0).reshape(2, 2))
+        optimizer = Muon([param], lr=0.01)
+        wrapped = swap_optimizer(
+            optimizer,
+            SwapOptimizerConfig(swap_times=1, min_numel=1, packed_swap=False),
+        )
+        param.grad = torch.ones_like(param)
+        pre_values = []
+        read_bindings = []
+        post_calls = []
+        original_update = optimizer._update_muon_momentum
+
+        def pre_hook(_optimizer: Any, _args: Any, _kwargs: Any) -> None:
+            """Observe the momentum host mirror before the second update."""
+            state = optimizer.state[param]
+            if "momentum_buffer" in state:
+                self.assertEqual(state["momentum_buffer"].device.type, "cpu")
+                pre_values.append(state["momentum_buffer"].clone())
+
+        def post_hook(_optimizer: Any, _args: Any, _kwargs: Any) -> None:
+            """Mutate the momentum host mirror after the first update."""
+            state = optimizer.state[param]
+            self.assertEqual(state["momentum_buffer"].device.type, "cpu")
+            post_calls.append(None)
+            if len(post_calls) == 1:
+                state["momentum_buffer"].fill_(5.0)
+
+        def update_with_observation(group: dict[str, Any], params: list[torch.Tensor]) -> Any:
+            """Record the momentum binding before Muon's in-place update."""
+            for current_param in params:
+                buffer = optimizer.state[current_param]["momentum_buffer"]
+                slot = wrapped.adapter._slots[(id(current_param), "momentum_buffer")]
+                read_bindings.append((buffer is slot.tensor, buffer is slot.cpu_tensor))
+            return original_update(group, params)
+
+        pre_handle = optimizer.register_step_pre_hook(pre_hook)
+        post_handle = optimizer.register_step_post_hook(post_hook)
+        self.addCleanup(pre_handle.remove)
+        self.addCleanup(post_handle.remove)
+        with mock.patch.object(PipelineSwapRuntime, "new_stream", return_value=None), \
+                mock.patch.object(PipelineSwapRuntime, "current_stream", return_value=None), \
+                mock.patch.object(
+                    PipelineSwapRuntime,
+                    "is_swappable_tensor",
+                    side_effect=lambda tensor, min_numel: tensor.numel() >= min_numel,
+                ), \
+                mock.patch.object(optimizer, "_update_muon_momentum", side_effect=update_with_observation):
+            wrapped.step()
+            slot = wrapped.adapter._slots[(id(param), "momentum_buffer")]
+            self.assertIs(optimizer.state[param]["momentum_buffer"], slot.cpu_tensor)
+            wrapped.step()
+
+        self.assertEqual(len(pre_values), 1)
+        torch.testing.assert_close(pre_values[0], torch.full_like(param, 5.0))
+        self.assertEqual(read_bindings, [(True, False), (True, False)])
+        self.assertEqual(len(post_calls), 2)
+
+    def test_hooks_registered_after_wrapping_are_dispatched(self):
+        """Instance and global hooks are read at step time, not cached at wrap time."""
         config = SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False)
         for scope, hook_kind in (("leaf", "pre"), ("wrapper", "post"), ("global", "pre"), ("global", "post")):
             with self.subTest(scope=scope, hook=hook_kind):
@@ -2024,16 +2788,202 @@ class TestSwapOptimizerHookGuard(unittest.TestCase):
                 with mock.patch.object(
                     wrapped.adapter, "prepare_step", wraps=wrapped.adapter.prepare_step
                 ) as prepare:
-                    with self.assertRaisesRegex(ValueError, "registered step hooks"):
-                        wrapped.step()
-                    prepare.assert_not_called()
-                torch.testing.assert_close(param, before, rtol=0, atol=0)
-                torch.testing.assert_close(optimizer.state_dict(), state_before, rtol=0, atol=0)
-                hook.assert_not_called()
-                handle.remove()
-                wrapped.step()
+                    wrapped.step()
+                    prepare.assert_called_once_with()
+                hook.assert_called_once()
                 self.assertFalse(torch.equal(param, before))
-                torch.testing.assert_close(optimizer.state[param]["step"], state_before["state"][0]["step"] + 1)
+                torch.testing.assert_close(
+                    optimizer.state[param]["step"],
+                    state_before["state"][0]["step"] + 1,
+                )
+                handle.remove()
+                hook.reset_mock()
+                wrapped.step()
+                hook.assert_not_called()
+                torch.testing.assert_close(
+                    optimizer.state[param]["step"],
+                    state_before["state"][0]["step"] + 2,
+                )
+
+    def test_host_barrier_and_state_snapshots_follow_dynamic_hooks(self):
+        """Dynamic state-dependent hooks trigger host waits and full state snapshots."""
+        param = torch.nn.Parameter(torch.ones(2, 2))
+        optimizer = torch.optim.AdamW([param], lr=0.01)
+        wrapped = swap_optimizer(
+            optimizer,
+            SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False),
+        )
+        with mock.patch.object(
+                wrapped.runtime,
+                "synchronize_host_transfers",
+                wraps=wrapped.runtime.synchronize_host_transfers,
+        ) as synchronize, mock.patch.object(
+                wrapped,
+                "_snapshot_hook_state",
+                wraps=wrapped._snapshot_hook_state,
+        ) as snapshot:
+            wrapped.step()
+            synchronize.assert_not_called()
+            snapshot.assert_not_called()
+
+            pre_handle = torch_optimizer.register_optimizer_step_pre_hook(lambda *_args: None)
+            post_handle = torch_optimizer.register_optimizer_step_post_hook(lambda *_args: None)
+            try:
+                wrapped.step()
+                self.assertEqual(synchronize.call_count, 2)
+                self.assertEqual(snapshot.call_count, 2)
+            finally:
+                post_handle.remove()
+                pre_handle.remove()
+
+            wrapped.step()
+            self.assertEqual(synchronize.call_count, 2)
+            self.assertEqual(snapshot.call_count, 2)
+
+    def test_only_literal_false_marks_hook_state_independent(self):
+        """Missing, true and malformed declarations conservatively require state."""
+        def hook(*_args: Any) -> None:
+            """Provide a callable whose declaration is varied by the test."""
+
+        missing = object()
+        cases = (
+            ("missing", missing, True),
+            ("false", False, False),
+            ("true", True, True),
+            ("none", None, True),
+            ("zero", 0, True),
+            ("string", "False", True),
+        )
+        for name, declaration, expected in cases:
+            with self.subTest(declaration=name):
+                if declaration is missing:
+                    if hasattr(hook, "requires_optimizer_state"):
+                        delattr(hook, "requires_optimizer_state")
+                else:
+                    setattr(hook, "requires_optimizer_state", declaration)
+
+                self.assertIs(_hook_requires_optimizer_state(hook), expected)
+
+    def test_state_independent_hooks_skip_host_barrier_and_snapshots(self):
+        """Explicitly state-independent instance and global hooks still run without a barrier."""
+        param = torch.nn.Parameter(torch.ones(2, 2))
+        optimizer = torch.optim.AdamW([param], lr=0.01)
+        wrapped = swap_optimizer(
+            optimizer,
+            SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False),
+        )
+        events = []
+
+        def global_pre(_optimizer: Any, _args: Any, _kwargs: Any) -> None:
+            """Record the state-independent global pre-hook."""
+            events.append("global_pre")
+
+        def instance_pre(_optimizer: Any, _args: Any, _kwargs: Any) -> None:
+            """Record the state-independent instance pre-hook."""
+            events.append("instance_pre")
+
+        def instance_post(_optimizer: Any, _args: Any, _kwargs: Any) -> None:
+            """Record the state-independent instance post-hook."""
+            events.append("instance_post")
+
+        def global_post(_optimizer: Any, _args: Any, _kwargs: Any) -> None:
+            """Record the state-independent global post-hook."""
+            events.append("global_post")
+
+        for hook in (global_pre, instance_pre, instance_post, global_post):
+            setattr(hook, "requires_optimizer_state", False)
+        handles = (
+            torch_optimizer.register_optimizer_step_pre_hook(global_pre),
+            optimizer.register_step_pre_hook(instance_pre),
+            optimizer.register_step_post_hook(instance_post),
+            torch_optimizer.register_optimizer_step_post_hook(global_post),
+        )
+        for handle in handles:
+            self.addCleanup(handle.remove)
+
+        with mock.patch.object(
+                wrapped.runtime,
+                "synchronize_host_transfers",
+                wraps=wrapped.runtime.synchronize_host_transfers,
+        ) as synchronize, mock.patch.object(
+                wrapped,
+                "_snapshot_hook_state",
+                wraps=wrapped._snapshot_hook_state,
+        ) as snapshot:
+            wrapped.step()
+
+        self.assertEqual(events, ["global_pre", "instance_pre", "instance_post", "global_post"])
+        synchronize.assert_not_called()
+        snapshot.assert_not_called()
+
+    def test_mixed_post_hooks_keep_host_barrier_and_snapshot(self):
+        """One unmarked hook makes the entire post phase optimizer-state dependent."""
+        param = torch.nn.Parameter(torch.ones(2, 2))
+        optimizer = torch.optim.AdamW([param], lr=0.01)
+        wrapped = swap_optimizer(
+            optimizer,
+            SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False),
+        )
+
+        def state_independent_post(*_args: Any) -> None:
+            """Represent a post-hook that does not access optimizer state."""
+
+        def default_post(*_args: Any) -> None:
+            """Represent an undeclared post-hook that may access optimizer state."""
+
+        setattr(state_independent_post, "requires_optimizer_state", False)
+        instance_handle = optimizer.register_step_post_hook(state_independent_post)
+        global_handle = torch_optimizer.register_optimizer_step_post_hook(default_post)
+        self.addCleanup(instance_handle.remove)
+        self.addCleanup(global_handle.remove)
+
+        with mock.patch.object(
+                wrapped.runtime,
+                "synchronize_host_transfers",
+                wraps=wrapped.runtime.synchronize_host_transfers,
+        ) as synchronize, mock.patch.object(
+                wrapped,
+                "_snapshot_hook_state",
+                wraps=wrapped._snapshot_hook_state,
+        ) as snapshot:
+            wrapped.step()
+
+        synchronize.assert_called_once_with()
+        snapshot.assert_called_once_with()
+
+    def test_state_independent_pre_hook_can_add_dependent_post_hook(self):
+        """Post-hook requirements are re-evaluated after pre-hooks run."""
+        param = torch.nn.Parameter(torch.ones(2, 2))
+        optimizer = torch.optim.AdamW([param], lr=0.01)
+        wrapped = swap_optimizer(
+            optimizer,
+            SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False),
+        )
+        post_hook = mock.Mock(return_value=None)
+
+        def dynamic_pre(_optimizer: Any, _args: Any, _kwargs: Any) -> None:
+            """Register an undeclared post-hook for the current step."""
+            post_handle = optimizer.register_step_post_hook(post_hook)
+            self.addCleanup(post_handle.remove)
+
+        setattr(dynamic_pre, "requires_optimizer_state", False)
+        pre_handle = optimizer.register_step_pre_hook(dynamic_pre)
+        self.addCleanup(pre_handle.remove)
+
+        with mock.patch.object(
+                wrapped.runtime,
+                "synchronize_host_transfers",
+                wraps=wrapped.runtime.synchronize_host_transfers,
+        ) as synchronize, mock.patch.object(
+                wrapped,
+                "_snapshot_hook_state",
+                wraps=wrapped._snapshot_hook_state,
+        ) as snapshot:
+            wrapped.step()
+
+        post_hook.assert_called_once_with(optimizer, (optimizer,), {"closure": None})
+        synchronize.assert_called_once_with()
+        snapshot.assert_called_once_with()
 
     def test_unsupported_optimizer_keeps_value_error(self):
         """Hook inspection preserves the factory's unsupported-type error."""

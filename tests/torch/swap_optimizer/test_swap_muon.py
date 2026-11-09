@@ -17,7 +17,7 @@
 from pathlib import Path
 
 from tests.common.mark_utils import arg_mark
-from tests.common.parallel_case import parallel_run, TorchCase
+from tests.common.parallel_case import TorchCase, parallel_run
 
 SWAP_MUON = str(Path(__file__).resolve().parent / "swap_muon.py")
 
@@ -30,6 +30,8 @@ def test_swap_muon_1():
         TorchCase(SWAP_MUON, "test_swap_muon_checkpoint_host_state", None, 1),
         TorchCase(SWAP_MUON, "test_swap_muon_first_step_is_lazy_and_offloaded", None, 1),
         TorchCase(SWAP_MUON, "test_swap_muon_packed_swap", None, 1),
+        TorchCase(SWAP_MUON, "test_swap_muon_optimizer_step_hooks", None, 1),
+        TorchCase(SWAP_MUON, "test_swap_muon_post_hook_exception_semantics", None, 1),
     ])
 
 

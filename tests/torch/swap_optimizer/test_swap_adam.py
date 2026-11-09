@@ -15,9 +15,9 @@
 """test swap optimizer"""
 from pathlib import Path
 
-from tests.common.mark_utils import arg_mark
 from tests.common.distributed_launcher import torchrun_case
-from tests.common.parallel_case import parallel_run, TorchCase
+from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import TorchCase, parallel_run
 
 SWAP_OPTIMIZER = "swap_adam.py"
 
@@ -61,6 +61,9 @@ def test_swap_optimizer_2():
         3. test_torch_adam_swap_optimizer_checkpoint_host_state
         4. test_torch_adamw_eager_state_swap_optimizer_parameter_align
         5. test_torch_fused_adamw_swap_optimizer_parameter_align
+        6. test_torch_adamw_swap_optimizer_step_hooks
+        7. test_torch_adamw_swap_optimizer_hook_rejects_state_replacement
+        8. test_torch_adamw_failed_step_publishes_host_state_to_later_pre_hook
     Expectation: Run success.
     """
     parallel_run([
@@ -69,6 +72,19 @@ def test_swap_optimizer_2():
         TorchCase(SWAP_OPTIMIZER, "test_torch_adam_swap_optimizer_checkpoint_host_state", 12506, 1),
         TorchCase(SWAP_OPTIMIZER, "test_torch_adamw_eager_state_swap_optimizer_parameter_align", 12509, 1),
         TorchCase(SWAP_OPTIMIZER, "test_torch_fused_adamw_swap_optimizer_parameter_align", 12510, 1),
+        TorchCase(SWAP_OPTIMIZER, "test_torch_adamw_swap_optimizer_step_hooks", 12512, 1),
+        TorchCase(
+            SWAP_OPTIMIZER,
+            "test_torch_adamw_swap_optimizer_hook_rejects_state_replacement",
+            12513,
+            1,
+        ),
+        TorchCase(
+            SWAP_OPTIMIZER,
+            "test_torch_adamw_failed_step_publishes_host_state_to_later_pre_hook",
+            12514,
+            1,
+        ),
     ])
 
 

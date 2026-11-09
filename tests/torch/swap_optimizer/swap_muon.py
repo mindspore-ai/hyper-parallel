@@ -26,13 +26,18 @@ from unittest import mock
 
 import torch
 import torch.distributed as dist
+from torch.optim.optimizer import (register_optimizer_step_post_hook,
+                                   register_optimizer_step_pre_hook)
 
-from hyper_parallel import DTensor, Replicate, Shard, SkipDTensorDispatch, distribute_tensor, init_device_mesh
-from hyper_parallel.components.optim.mixed_precision_optimizer import Float16OptimizerWithFloat16Params
+from hyper_parallel import (DTensor, Replicate, Shard, SkipDTensorDispatch,
+                            distribute_tensor, init_device_mesh)
+from hyper_parallel.components.optim.mixed_precision_optimizer import \
+    Float16OptimizerWithFloat16Params
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
+from hyper_parallel.core.optimizer import (Muon, SwapOptimizerConfig,
+                                           swap_optimizer)
 from hyper_parallel.core.optimizer.dtensor_compat import to_local_if_dtensor
-from hyper_parallel.core.optimizer import Muon, SwapOptimizerConfig, swap_optimizer
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
 from tests.torch.utils import init_dist
 
@@ -175,6 +180,172 @@ def test_swap_muon_parameter_align() -> None:
     Expectation: Losses and parameters align exactly, and every momentum slot ends host-resident.
     """
     _run_align_case("test_swap_muon_parameter_align", swap_times=2)
+
+
+def _run_muon_step_hook_case(packed_swap: bool) -> None:
+    """Verify Muon hook ordering and momentum residency for one swap mode."""
+    batches = _fixed_batches()
+    model, optimizer = _build(True, 2, _initial_state(), packed_swap=packed_swap)
+    leaf = optimizer.optimizer
+    events = []
+    pre_values = []
+    update_reads = []
+    post_count = 0
+
+    def _check_call(name: str, current: object, args: Tuple[object, ...], kwargs: Dict[str, object]) -> None:
+        assert current is leaf, f"{name} received optimizer={current!r}, expected leaf={leaf!r}"
+        assert args == (leaf,), f"{name} args mismatch: actual={args!r}, expected={(leaf,)!r}"
+        assert kwargs == {"closure": None}, (
+            f"{name} kwargs mismatch: actual={kwargs!r}, expected={{'closure': None}}"
+        )
+        events.append(name)
+
+    def _global_pre(current: object, args: Tuple[object, ...], kwargs: Dict[str, object]) -> None:
+        """Record the global pre-hook call."""
+        _check_call("global_pre", current, args, kwargs)
+
+    def _instance_pre(current: object, args: Tuple[object, ...], kwargs: Dict[str, object]) -> None:
+        """Check host-visible momentum before Muon binds device shells."""
+        _check_call("instance_pre", current, args, kwargs)
+        buffers = [
+            leaf.state[param]["momentum_buffer"]
+            for group in leaf.param_groups
+            for param in group["params"]
+            if "momentum_buffer" in leaf.state.get(param, {})
+        ]
+        if buffers:
+            assert all(buffer.device.type == "cpu" for buffer in buffers), (
+                f"pre-hook momentum devices must be CPU, got {[buffer.device for buffer in buffers]}"
+            )
+            pre_values.append([buffer.detach().clone() for buffer in buffers])
+
+    def _instance_post(current: object, args: Tuple[object, ...], kwargs: Dict[str, object]) -> None:
+        """Edit every authoritative CPU momentum mirror after the first step."""
+        nonlocal post_count
+        _check_call("instance_post", current, args, kwargs)
+        buffers = [
+            leaf.state[param]["momentum_buffer"]
+            for group in leaf.param_groups
+            for param in group["params"]
+            if "momentum_buffer" in leaf.state.get(param, {})
+        ]
+        assert buffers, "Muon post-hook did not receive materialized momentum state"
+        assert all(buffer.device.type == "cpu" for buffer in buffers), (
+            f"post-hook momentum devices must be CPU, got {[buffer.device for buffer in buffers]}"
+        )
+        if post_count == 0:
+            for buffer in buffers:
+                buffer.fill_(0.25)
+        post_count += 1
+
+    def _global_post(current: object, args: Tuple[object, ...], kwargs: Dict[str, object]) -> None:
+        """Record the global post-hook call."""
+        _check_call("global_post", current, args, kwargs)
+
+    instance_pre_handle = leaf.register_step_pre_hook(_instance_pre)
+    instance_post_handle = leaf.register_step_post_hook(_instance_post)
+    global_pre_handle = register_optimizer_step_pre_hook(_global_pre)
+    global_post_handle = register_optimizer_step_post_hook(_global_post)
+    original_step_batch = optimizer.adapter.step_batch
+    current_step = 0
+
+    def _observe_step_batch(batch, step_context):
+        """Verify Muon's direct state lookup sees the active device shell."""
+        for unit in batch:
+            for param in unit.params:
+                state_tensor = leaf.state[param]["momentum_buffer"]
+                slot = optimizer.adapter._slots[(id(param), "momentum_buffer")]  # pylint: disable=protected-access
+                assert state_tensor is slot.tensor, "Muon did not read the active momentum device shell"
+                assert to_local_if_dtensor(state_tensor).device.type == "npu", (
+                    f"Muon update momentum must be on NPU, got device={to_local_if_dtensor(state_tensor).device}"
+                )
+                if current_step == 1:
+                    torch.testing.assert_close(state_tensor, torch.full_like(state_tensor, 0.25), rtol=0, atol=0)
+                update_reads.append((current_step, id(state_tensor)))
+        return original_step_batch(batch, step_context)
+
+    optimizer.adapter.step_batch = _observe_step_batch
+    try:
+        for current_step, (inputs, target) in enumerate(batches[:2]):
+            optimizer.zero_grad(set_to_none=True)
+            loss = torch.nn.functional.mse_loss(model(inputs), target)
+            loss.backward()
+            optimizer.step(closure=None)
+            _assert_swap_state_offloaded(optimizer, expected_params=len(tuple(model.parameters())))
+            for param in model.parameters():
+                slot = optimizer.adapter._slots[(id(param), "momentum_buffer")]  # pylint: disable=protected-access
+                assert leaf.state[param]["momentum_buffer"] is slot.cpu_tensor, (
+                    "Muon did not republish the authoritative CPU momentum mirror"
+                )
+    finally:
+        optimizer.adapter.step_batch = original_step_batch
+        global_post_handle.remove()
+        global_pre_handle.remove()
+        instance_post_handle.remove()
+        instance_pre_handle.remove()
+
+    expected_events = [
+        "global_pre", "instance_pre", "instance_post", "global_post",
+        "global_pre", "instance_pre", "instance_post", "global_post",
+    ]
+    assert events == expected_events, f"hook order mismatch: actual={events!r}, expected={expected_events!r}"
+    assert len(pre_values) == 1, f"expected one materialized pre-hook snapshot, got {len(pre_values)}"
+    for buffer in pre_values[0]:
+        torch.testing.assert_close(buffer, torch.full_like(buffer, 0.25), rtol=0, atol=0)
+    assert len(update_reads) == 4, f"expected four Muon momentum reads, got {len(update_reads)}"
+
+
+def test_swap_muon_optimizer_step_hooks() -> None:
+    """Verify Muon step hooks for per-tensor and packed momentum swap."""
+    print("test_swap_muon_optimizer_step_hooks")
+    for packed_swap in (False, True):
+        _run_muon_step_hook_case(packed_swap)
+        _release_device_memory()
+
+
+def test_swap_muon_post_hook_exception_semantics() -> None:
+    """Verify a failing Muon post-hook keeps updates and stops later hooks."""
+    print("test_swap_muon_post_hook_exception_semantics")
+    batches = _fixed_batches()
+    model, optimizer = _build(True, 2, _initial_state(), packed_swap=False)
+    leaf = optimizer.optimizer
+    _train(model, optimizer, batches, steps=1)
+    before = [param.detach().clone() for param in model.parameters()]
+    later_calls = []
+
+    def _fail_post(_optimizer: object, _args: Tuple[object, ...], _kwargs: Dict[str, object]) -> None:
+        """Raise after Muon finishes its parameter and momentum updates."""
+        raise RuntimeError("muon post-hook failed")
+
+    def _later_post(_optimizer: object, _args: Tuple[object, ...], _kwargs: Dict[str, object]) -> None:
+        """Record a hook that must not run after the previous failure."""
+        later_calls.append("called")
+
+    failing_handle = leaf.register_step_post_hook(_fail_post)
+    later_handle = leaf.register_step_post_hook(_later_post)
+    inputs, target = batches[1]
+    optimizer.zero_grad(set_to_none=True)
+    loss = torch.nn.functional.mse_loss(model(inputs), target)
+    loss.backward()
+    error = None
+    try:
+        optimizer.step()
+    except RuntimeError as caught:
+        error = caught
+    finally:
+        later_handle.remove()
+        failing_handle.remove()
+
+    assert error is not None, "failing Muon post-hook must propagate RuntimeError"
+    assert str(error) == "muon post-hook failed", f"unexpected Muon post-hook error: {error!r}"
+    assert not later_calls, f"later Muon post-hook unexpectedly ran: calls={later_calls!r}"
+    assert any(not torch.equal(param, old) for param, old in zip(model.parameters(), before)), (
+        "Muon post-hook failure rolled back the completed parameter update"
+    )
+    assert not optimizer._step_active, "Muon wrapper left _step_active set after post-hook failure"
+    assert not optimizer._hook_step_active, "Muon wrapper left _hook_step_active set after post-hook failure"
+    _assert_swap_state_offloaded(optimizer, expected_params=len(tuple(model.parameters())))
+    _release_device_memory()
 
 
 def test_swap_muon_swap_times_parameter_align() -> None:

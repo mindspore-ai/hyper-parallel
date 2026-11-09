@@ -20,18 +20,20 @@ import weakref
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+from torch.optim.optimizer import (register_optimizer_step_post_hook,
+                                   register_optimizer_step_pre_hook)
 
 from hyper_parallel import DTensor, SkipDTensorDispatch, init_device_mesh
-from hyper_parallel.components.optim.mixed_precision_optimizer import Float16OptimizerWithFloat16Params
+from hyper_parallel.components.optim.mixed_precision_optimizer import \
+    Float16OptimizerWithFloat16Params
+from hyper_parallel.core.fully_shard.api import fully_shard
+from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from hyper_parallel.core.optimizer import SwapOptimizerConfig, swap_optimizer
 from hyper_parallel.core.optimizer.adamw import AdamW as NewAdamW
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
-from hyper_parallel.core.fully_shard.api import fully_shard
-from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from hyper_parallel.trainer.base import _attach_optimizer_swap
 from hyper_parallel.trainer.config.optimization import OptimizerSwapConfig
 from tests.torch.utils import init_dist
-
 
 _TRAIN_STEPS = 8
 _SWAP_TIMES = 3
@@ -589,6 +591,214 @@ def test_torch_adamw_swap_optimizer_parameter_align() -> None:
     Expectation: Per-step losses and final parameters are aligned; swap AdamW uses lower peak memory.
     """
     _run_optimizer_align_case("test_torch_adamw_swap_optimizer_parameter_align", torch.optim.AdamW)
+
+
+def _run_adamw_step_hook_case(packed_swap: bool) -> None:
+    """Verify hook ordering, kwargs and host-state edits for one swap mode."""
+    param = torch.nn.Parameter(torch.arange(64, dtype=torch.float32, device="npu").reshape(8, 8) * 0.01)
+    leaf = torch.optim.AdamW([param], **_optimizer_kwargs(torch.optim.AdamW))
+    events = []
+    pre_values = []
+    update_reads = []
+    post_count = 0
+
+    def _check_call(name: str, optimizer: Any, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+        assert optimizer is leaf, f"{name} received optimizer={optimizer!r}, expected leaf={leaf!r}"
+        assert args == (leaf,), f"{name} args mismatch: actual={args!r}, expected={(leaf,)!r}"
+        assert kwargs == {"closure": None}, (
+            f"{name} kwargs mismatch: actual={kwargs!r}, expected={{'closure': None}}"
+        )
+        events.append(name)
+
+    def _global_pre(optimizer: Any, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+        """Record the global pre-hook call."""
+        _check_call("global_pre", optimizer, args, kwargs)
+
+    def _instance_pre(optimizer: Any, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+        """Check hook-boundary state before the device-shell binding."""
+        _check_call("instance_pre", optimizer, args, kwargs)
+        state = leaf.state.get(param, {})
+        if "exp_avg" in state:
+            assert state["exp_avg"].device.type == "cpu", (
+                f"pre-hook exp_avg must be on CPU, got device={state['exp_avg'].device}"
+            )
+            pre_values.append(state["exp_avg"].detach().clone())
+
+    def _instance_post(optimizer: Any, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+        """Edit the authoritative CPU mirror after the first update."""
+        nonlocal post_count
+        _check_call("instance_post", optimizer, args, kwargs)
+        state = leaf.state[param]
+        assert state["exp_avg"].device.type == "cpu", (
+            f"post-hook exp_avg must be on CPU, got device={state['exp_avg'].device}"
+        )
+        if post_count == 0:
+            state["exp_avg"].fill_(0.25)
+        post_count += 1
+
+    def _global_post(optimizer: Any, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+        """Record the global post-hook call."""
+        _check_call("global_post", optimizer, args, kwargs)
+
+    instance_pre_handle = leaf.register_step_pre_hook(_instance_pre)
+    instance_post_handle = leaf.register_step_post_hook(_instance_post)
+    optimizer = swap_optimizer(
+        leaf,
+        SwapOptimizerConfig(swap_times=2, min_numel=1, packed_swap=packed_swap),
+    )
+    # Register globals after wrapping to verify the dispatcher never caches an
+    # empty global-hook container at construction time.
+    global_pre_handle = register_optimizer_step_pre_hook(_global_pre)
+    global_post_handle = register_optimizer_step_post_hook(_global_post)
+    original_step_batch = optimizer.adapter.step_batch
+    current_step = 0
+
+    def _observe_step_batch(batch: List[Any], step_context: Dict[str, Any]) -> Any:
+        """Verify AdamW reads device state after prefetch, then run the update."""
+        for unit in batch:
+            state_tensor = leaf.state[unit.param]["exp_avg"]
+            slot = next(slot for slot in unit.slots if slot.name == "exp_avg")
+            assert state_tensor is slot.tensor, "AdamW did not read the active exp_avg device shell"
+            assert state_tensor.device.type == "npu", (
+                f"AdamW update exp_avg must be on NPU, got device={state_tensor.device}"
+            )
+            if current_step == 1:
+                torch.testing.assert_close(state_tensor, torch.full_like(state_tensor, 0.25), rtol=0, atol=0)
+            update_reads.append((current_step, id(state_tensor)))
+        return original_step_batch(batch, step_context)
+
+    optimizer.adapter.step_batch = _observe_step_batch
+    try:
+        for current_step in range(2):
+            param.grad = torch.full_like(param, current_step + 1.0)
+            optimizer.step(closure=None)
+            slot = optimizer.adapter._slots[(id(param), "exp_avg")]  # pylint: disable=protected-access
+            assert leaf.state[param]["exp_avg"] is slot.cpu_tensor, (
+                "AdamW did not republish the authoritative CPU mirror after the step"
+            )
+            assert slot.state == "host", f"AdamW slot residency mismatch: actual={slot.state}, expected='host'"
+    finally:
+        optimizer.adapter.step_batch = original_step_batch
+        global_post_handle.remove()
+        global_pre_handle.remove()
+        instance_post_handle.remove()
+        instance_pre_handle.remove()
+
+    expected_events = [
+        "global_pre", "instance_pre", "instance_post", "global_post",
+        "global_pre", "instance_pre", "instance_post", "global_post",
+    ]
+    assert events == expected_events, f"hook order mismatch: actual={events!r}, expected={expected_events!r}"
+    assert len(pre_values) == 1, f"expected one materialized pre-hook state, got {len(pre_values)}"
+    torch.testing.assert_close(pre_values[0], torch.full_like(pre_values[0], 0.25), rtol=0, atol=0)
+    assert len(update_reads) == 2, f"expected two AdamW update reads, got {len(update_reads)}"
+
+
+def test_torch_adamw_swap_optimizer_step_hooks() -> None:
+    """Verify AdamW step hooks for per-tensor and packed optimizer-state swap."""
+    print("test_torch_adamw_swap_optimizer_step_hooks")
+    for packed_swap in (False, True):
+        _run_adamw_step_hook_case(packed_swap)
+        _release_device_memory()
+
+
+def test_torch_adamw_swap_optimizer_hook_rejects_state_replacement() -> None:
+    """Verify packed AdamW rejects post-hook tensor replacement without losing its binding."""
+    print("test_torch_adamw_swap_optimizer_hook_rejects_state_replacement")
+    param = torch.nn.Parameter(torch.ones(8, 8, dtype=torch.float32, device="npu"))
+    leaf = torch.optim.AdamW([param], **_optimizer_kwargs(torch.optim.AdamW))
+    optimizer = swap_optimizer(
+        leaf,
+        SwapOptimizerConfig(swap_times=1, min_numel=1, packed_swap=True),
+    )
+    param.grad = torch.ones_like(param)
+    optimizer.step()
+    original_state = leaf.state[param]["exp_avg"]
+    before = torch.clone(param)
+
+    def _replace_state(_optimizer: Any, _args: Tuple[Any, ...], _kwargs: Dict[str, Any]) -> None:
+        """Attempt an unsupported optimizer-state tensor replacement."""
+        leaf.state[param]["exp_avg"] = torch.full_like(param, 99.0, device="cpu")
+
+    handle = leaf.register_step_post_hook(_replace_state)
+    param.grad = torch.full_like(param, 2.0)
+    error = None
+    try:
+        optimizer.step()
+    except RuntimeError as caught:
+        error = caught
+    finally:
+        handle.remove()
+
+    assert error is not None, "state tensor replacement must raise RuntimeError"
+    assert "must not add, remove or replace" in str(error), f"unexpected replacement error: {error!r}"
+    assert leaf.state[param]["exp_avg"] is original_state, "failed hook did not restore the packed host binding"
+    assert not torch.equal(param, before), "post-hook failure must retain the completed AdamW parameter update"
+    _release_device_memory()
+
+
+def test_torch_adamw_failed_step_publishes_host_state_to_later_pre_hook() -> None:
+    """Verify a pre-hook registered after a partial update sees valid CPU state."""
+    print("test_torch_adamw_failed_step_publishes_host_state_to_later_pre_hook")
+    params = [
+        torch.nn.Parameter(torch.ones(8, 8, dtype=torch.float32, device="npu"))
+        for _ in range(2)
+    ]
+    leaf = torch.optim.AdamW(params, **_optimizer_kwargs(torch.optim.AdamW))
+    optimizer = swap_optimizer(
+        leaf,
+        SwapOptimizerConfig(swap_times=2, min_numel=1, packed_swap=False),
+    )
+    original_step_batch = optimizer.adapter.step_batch
+    batch_calls = 0
+
+    def _fail_second_batch(batch: List[Any], step_context: Dict[str, Any]) -> None:
+        """Fail after updating the second batch but before it can offload."""
+        nonlocal batch_calls
+        original_step_batch(batch, step_context)
+        batch_calls += 1
+        if batch_calls == 2:
+            raise RuntimeError("injected AdamW update failure")
+
+    for param in params:
+        param.grad = torch.ones_like(param)
+    optimizer.adapter.step_batch = _fail_second_batch
+    error = None
+    try:
+        optimizer.step()
+    except RuntimeError as caught:
+        error = caught
+    finally:
+        optimizer.adapter.step_batch = original_step_batch
+
+    assert error is not None, f"expected an injected update failure, got error={error!r}"
+    assert str(error) == "injected AdamW update failure", f"unexpected update error: error={error!r}"
+    seen_state = []
+
+    def _inspect_state(_optimizer: Any, _args: Tuple[Any, ...], _kwargs: Dict[str, Any]) -> None:
+        """Validate host bindings before the next step restores device shells."""
+        for param in params:
+            for key in _SWAPPABLE_STATE_KEYS:
+                slot = optimizer.adapter._slots[(id(param), key)]
+                state = leaf.state[param][key]
+                seen_state.append((slot.state, state is slot.cpu_tensor, state.device.type))
+                assert state.untyped_storage().size() > 0, (
+                    f"recovered state has empty storage: key={key!r}, size={state.untyped_storage().size()}"
+                )
+
+    handle = leaf.register_step_pre_hook(_inspect_state)
+    try:
+        for param in params:
+            param.grad = torch.ones_like(param)
+        optimizer.step()
+    finally:
+        handle.remove()
+
+    expected_state = [("host", True, "cpu")] * (len(params) * len(_SWAPPABLE_STATE_KEYS))
+    assert seen_state == expected_state, (
+        f"failed-step state was not restored to CPU mirrors: actual={seen_state!r}, expected={expected_state!r}"
+    )
+    _release_device_memory()
 
 
 def test_torch_fused_adamw_swap_optimizer_parameter_align() -> None:
