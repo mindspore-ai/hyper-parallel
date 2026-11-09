@@ -44,11 +44,12 @@ from hyper_parallel.models.build_options import (
 from hyper_parallel.components.checkpoint.base import CheckpointerBase
 from hyper_parallel.core.distributed_checkpoint import (
     StandardLoadPlanner,
+    TensorStorageMetadata,
     async_save as dcp_async_save,
     load as dcp_load,
     save as dcp_save,
 )
-from hyper_parallel.core.distributed_checkpoint.utils import flatten_state_dict
+from hyper_parallel.core.distributed_checkpoint.utils import flatten_state_dict, set_element, str_to_dtype
 from hyper_parallel.core.optimizer.adamw import AdamW as HyperAdamW
 from hyper_parallel.core.optimizer.muon import Muon as HyperMuon
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
@@ -183,6 +184,21 @@ class _ModelStrictLoadPlanner(StandardLoadPlanner):
             **kwargs: Any,
     ) -> None:
         """Normalize optional optimizer state before flattening the load skeleton."""
+        # Loader schemas can change when balancing is toggled. Read the saved
+        # subtree, rather than retaining fresh cursor defaults for missing keys.
+        extra = state_dict.get("extra_state")
+        if extra is not None and "train_dataloader" in extra:
+            extra.pop("train_dataloader")
+            for name, entry in metadata.state_dict_metadata.items():
+                if not name.startswith("extra_state.train_dataloader.") and name != "extra_state.train_dataloader":
+                    continue
+                path = (metadata.planner_data or {}).get(name)
+                if path is None:
+                    raise ValueError("Dataloader checkpoint is missing its saved field paths")
+                value = None
+                if isinstance(entry, TensorStorageMetadata):
+                    value = torch.empty(entry.size, dtype=str_to_dtype(entry.properties.dtype))
+                set_element(state_dict, path, value)
         _prepare_main_param_state_for_dcp_load(
             state_dict,
             set(metadata.state_dict_metadata),

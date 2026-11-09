@@ -446,6 +446,41 @@ class FixedBatchDataLoader(StatefulDataLoader):
                 **worker_options,
             )
 
+    def state_dict(self) -> dict[str, Any]:
+        """Save the native delivered cursor alongside torchdata's worker state."""
+        state = super().state_dict()
+        snapshot = state.get("_snapshot", {}).get("_main_snapshot", state)
+        sampler = snapshot.get("_index_sampler_state")
+        if isinstance(sampler, dict) and "consumed_samples" in sampler:
+            sampler = dict(sampler)
+            sampler["consumed_samples"] += (
+                state.get("_steps_since_snapshot", 0) * self.batch_sampler.global_micro_batch_size
+            )
+            state["native_sampler"] = sampler
+        return state
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Restore torchdata state, or a balanced loader's complete native cursor.
+
+        Args:
+            state_dict: State saved by the ordinary or balanced native loader.
+        """
+        if "global_rank" not in state_dict:
+            super().load_state_dict(state_dict)
+            return
+        sampler = state_dict.get("native_sampler")
+        if sampler is None:
+            reader = state_dict.get("dataset_reader") or state_dict.get("metadata_reader") or {}
+            sampler = reader.get("sampler")
+        if sampler is None:
+            raise ValueError("Balanced checkpoint has no native sampler cursor on this rank")
+        if sampler["consumed_samples"] % sampler["global_batch_size"]:
+            raise ValueError("Switching loaders requires a complete optimizer-step cursor")
+        self.batch_sampler.load_state_dict(sampler)
+        self.set_epoch(sampler["epoch"])
+        super().load_state_dict({})
+        self.next_iter_state = None
+
     def set_epoch(self, epoch: int) -> None:
         """Forward epoch state to the Dataset and configured batch sampler.
 
