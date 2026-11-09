@@ -64,6 +64,8 @@ class TestBuildOptionsFields(unittest.TestCase):
                 ("fsdp_allgather_prefetch", "True"),
                 ("fsdp_overlap_grad_reduce", "True"),
                 ("max_in_flight_gb", "0.25"),
+                ("offload_budget_gb", "64.0"),
+                ("offload_prefetch_n_layers", "1"),
             ],
         )
 
@@ -117,6 +119,10 @@ class TestBuildOptionsFields(unittest.TestCase):
             CompileConfig(mode="reduce-overhead", options={"triton": True})
         with self.assertRaisesRegex(ValueError, "dynamo_cache_size_limit"):
             CompileConfig(dynamo_cache_size_limit=0)
+        with self.assertRaisesRegex(ValueError, "offload_budget_gb"):
+            CompileConfig(offload_budget_gb=-1)
+        with self.assertRaisesRegex(ValueError, "offload_prefetch_n_layers"):
+            CompileConfig(offload_prefetch_n_layers=-1)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

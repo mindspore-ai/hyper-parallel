@@ -63,11 +63,17 @@ def _make_kw_model() -> torch.nn.Module:
     """Tiny module following the ``input_ids``/``use_cache`` call protocol."""
 
     class _KWModel(torch.nn.Module):
-        def __init__(self):
+        """Tiny linear module exposing the ``input_ids``/``use_cache`` protocol."""
+
+        def __init__(self) -> None:
+            """Build the tiny linear layer."""
             super().__init__()
             self.linear = torch.nn.Linear(4, 4)
 
-        def forward(self, input_ids, use_cache=False):
+        def forward(
+            self, input_ids: torch.Tensor, use_cache: bool = False
+        ) -> torch.Tensor:
+            """Run the linear layer; ``use_cache`` is accepted but ignored."""
             return self.linear(input_ids)
 
     return _KWModel()
@@ -429,6 +435,23 @@ class TestGraphModeIntegration(unittest.TestCase):
             pass_config.enable_overlap,
             f"overlap flag mismatch: expected=True, got={pass_config.enable_overlap}",
         )
+
+    def test_build_pass_config_projects_offload_tuning(self):
+        """Graph-only offload budget/prefetch are reachable from trainer config."""
+        config = SimpleNamespace(
+            fsdp_config=SimpleNamespace(dp_shard_size=1, edp_shard_size=1),
+            activation_swap="attention",
+            compile=SimpleNamespace(
+                offload_budget_gb=8.0,
+                offload_prefetch_n_layers=2,
+            ),
+        )
+
+        pass_config = build_pass_config_from_trainer_config(config)
+
+        self.assertEqual(pass_config.activation_swap, "attention")
+        self.assertEqual(pass_config.offload_budget_gb, 8.0)
+        self.assertEqual(pass_config.offload_prefetch_n_layers, 2)
 
 
 class TestGraphParameterLayout(unittest.TestCase):

@@ -44,7 +44,7 @@ import logging
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Union
 
 import torch  # pylint: disable=forbidden-backend-import
 
@@ -122,6 +122,9 @@ class CompileConfig:
     schedule FSDP parameter gathers and gradient reductions, including wait sinking.
     ``max_in_flight_gb`` follows PyTorch's overlap scheduler naming and binary
     units; here it bounds early all-gather replicas until first use, per phase.
+    ``offload_budget_gb`` and ``offload_prefetch_n_layers`` tune the graph-mode
+    attention activation offload selected by the top-level ``activation_swap``
+    field (they have no eager counterpart).
     Eager FSDP2 module prefetch depths do not configure these graph passes.
     """
 
@@ -134,10 +137,12 @@ class CompileConfig:
     options: Optional[dict[str, Any]] = None
     dynamo_cache_size_limit: int = 256
     # Joint-graph input paths, e.g. model_inputs.input_ids: [0, 1].
-    dynamic_arg_dims: Optional[dict[str, int | list[int]]] = None
+    dynamic_arg_dims: Optional[dict[str, Union[int, list[int]]]] = None
     fsdp_allgather_prefetch: bool = True
     fsdp_overlap_grad_reduce: bool = True
     max_in_flight_gb: float = 0.25
+    offload_budget_gb: float = 64.0
+    offload_prefetch_n_layers: int = 1
 
     def selects_graph_compiler(self) -> bool:
         """Return whether this config selects the graph-compiler trainer path."""
@@ -153,6 +158,7 @@ class CompileConfig:
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"compile.{name} must be a bool")
         self._validate_max_in_flight_gb()
+        self._validate_offload()
         if self.dynamic_arg_dims is not None and not isinstance(self.dynamic_arg_dims, dict):
             raise ValueError("compile.dynamic_arg_dims must be a mapping or None")
         if not isinstance(self.mode, str) or not self.mode.strip():
@@ -184,6 +190,24 @@ class CompileConfig:
             or value < 0
         ):
             raise ValueError("compile.max_in_flight_gb must be a finite non-negative number")
+
+    def _validate_offload(self) -> None:
+        """Validate the graph-mode attention-offload tuning values."""
+        budget = self.offload_budget_gb
+        if (
+            isinstance(budget, bool)
+            or not isinstance(budget, (int, float))
+            or not math.isfinite(budget)
+            or budget < 0
+        ):
+            raise ValueError(
+                "compile.offload_budget_gb must be a finite non-negative number"
+            )
+        prefetch = self.offload_prefetch_n_layers
+        if isinstance(prefetch, bool) or not isinstance(prefetch, int) or prefetch < 0:
+            raise ValueError(
+                "compile.offload_prefetch_n_layers must be a non-negative integer"
+            )
 
 
 @dataclass

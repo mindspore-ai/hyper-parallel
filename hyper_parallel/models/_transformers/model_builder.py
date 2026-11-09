@@ -459,13 +459,16 @@ def _apply_activation_features(
     selection: Optional[Any] = None,
     allow_cache_entry_mutation: bool = False,
     apply_checkpoint: bool = True,
+    apply_swap: bool = True,
 ) -> nn.Module:
     """Apply activation checkpointing and attention swap in execution order.
 
     ``apply_checkpoint`` is False in graph mode: the joint-graph
     ``ActivationCheckpointPass`` owns recompute, so the live model must stay
-    unwrapped. The requested mode is still passed to the attention-swap
-    validation so incompatible combinations keep failing.
+    unwrapped. ``apply_swap`` is also False in graph mode: the graph-mode
+    ``CpuOffloadPass`` owns host activation offload, so wrapping the live model
+    with the eager ``SwapManager`` would offload twice. The requested modes are
+    still validated so incompatible combinations keep failing.
     """
     if apply_checkpoint and activation_checkpoint not in (None, "off"):
         model = _apply_activation_checkpointing(
@@ -482,7 +485,9 @@ def _apply_activation_features(
         enable_compile=compile_for_execution,
         pp_size=getattr(mesh, "pp_size", 1),
     )
-    return apply_attention_swap(model, activation_swap) if activation_swap != "none" else model
+    if not apply_swap or activation_swap == "none":
+        return model
+    return apply_attention_swap(model, activation_swap)
 
 
 def _materialize_and_load_model(
@@ -742,7 +747,9 @@ def apply_model_infrastructure(
     model = _apply_activation_features(
         model, activation_checkpoint, activation_swap, compile_for_execution, mesh,
         swap_inputs=swap_inputs, selection=activation_checkpoint_selection,
-        allow_cache_entry_mutation=allow_cache_entry_mutation, apply_checkpoint=not graph_mode_requested,
+        allow_cache_entry_mutation=allow_cache_entry_mutation,
+        apply_checkpoint=not graph_mode_requested,
+        apply_swap=not graph_mode_requested,
     )
     external = _create_external_state(
         model, mesh, source_shard_info, device, is_meta_device, model_init_dtype,
