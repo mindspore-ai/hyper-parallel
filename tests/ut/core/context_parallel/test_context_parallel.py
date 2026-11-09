@@ -16,6 +16,7 @@
 import os
 import unittest
 from functools import partial
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -108,6 +109,20 @@ class TestContextParallel(unittest.TestCase):
         """Head-tail load balance is only valid for Pure Colossal CP."""
         with self.assertRaisesRegex(ValueError, "load_balance=True"):
             ContextParallel(load_balance=True)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_state_colossal_preserves_all_input_shards(self, mock_platform):
+        """Recurrent inputs keep local sequence shards instead of gathering K/V."""
+        mesh = self._make_mesh(mock_platform, mesh_shape=(2,))
+        style = ContextParallel(ulysses_degree=1, qkv_indices=(0, 1, 2, 3, 4), state_parallel=True)
+        inputs = tuple(torch.randn(1, 3, 1, 4) for _ in range(5))
+        with patch.object(cp_module, "_gather_seq", side_effect=AssertionError("must retain local sequence")):
+            outputs, _ = style._pre_hook_colossal(  # pylint: disable=protected-access
+                _IdentityModule(), inputs, {}, mesh
+            )
+        for original, output in zip(inputs, outputs):
+            self.assertEqual(output.placements, (Shard(1),))
+            torch.testing.assert_close(output.to_local(), original)
 
     def test_apply_rejects_non_divisible_ulysses_degree(self):
         """Hybrid degree must divide the CP mesh size."""
@@ -593,6 +608,46 @@ class TestContextParallel(unittest.TestCase):
         self.assertEqual(non_cp_out[0].device_mesh.mesh_dim_names, ("tp",))
         self.assertEqual(non_cp_out[0].placements, (Shard(2),))
         self.assertEqual(non_cp_out[1], "keep")
+
+
+class TestRecurrentStateContext(unittest.TestCase):
+    """Check causal halo values and gradients without requiring a process group."""
+
+    def test_rejects_load_balance(self):
+        """Recurrences require natural sequence order."""
+        with self.assertRaisesRegex(ValueError, "natural sequence order"):
+            ContextParallel(ulysses_degree=1, state_parallel=True, load_balance=True)
+
+    def test_halo_values_and_future_gradients(self):
+        """A future-only loss must reach preceding shards, even for one-token shards."""
+        for length in (1, 5):
+            with self.subTest(length=length):
+                source = torch.arange(3 * length * 4, dtype=torch.float32).reshape(2, 3 * length, 2)
+                source.requires_grad_()
+                shards = source.chunk(3, dim=1)
+                tails = torch.cat([part[:, -min(3, length):].movedim(1, 0) for part in shards])
+                gathered = SimpleNamespace(redistribute=lambda *args: SimpleNamespace(to_local=lambda: tails))
+                outputs = []
+                with patch.object(cp_module.DTensor, "from_local", return_value=gathered):
+                    for rank, shard in enumerate(shards):
+                        mesh = SimpleNamespace(get_local_rank=lambda rank=rank: rank, size=lambda: 3)
+                        context = cp_module._RecurrentStateContext(mesh)  # pylint: disable=protected-access
+                        output = context.sequence_halo(shard, 3)
+                        prefix = source[:, max(0, rank * length - 3):rank * length]
+                        expected = torch.cat((torch.zeros(2, 3 - prefix.shape[1], 2), prefix, shard), dim=1)
+                        torch.testing.assert_close(output, expected)
+                        outputs.append(output)
+                outputs[-1][:, :3].sum().backward()
+                expected_grad = torch.zeros_like(source)
+                expected_grad[:, max(0, 2 * length - 3):2 * length] = 1
+                torch.testing.assert_close(source.grad, expected_grad)
+
+    def test_empty_halo_shard_is_rejected(self):
+        """An empty shard cannot provide a recurrent boundary."""
+        mesh = SimpleNamespace(get_local_rank=lambda: 0, size=lambda: 2)
+        context = cp_module._RecurrentStateContext(mesh)  # pylint: disable=protected-access
+        with self.assertRaisesRegex(ValueError, "nonempty"):
+            context.sequence_halo(torch.zeros(1, 0, 2), 3)
 
 
 if __name__ == "__main__":

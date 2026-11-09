@@ -115,19 +115,21 @@ class MindSporeCustomOps:
     @staticmethod
     def npu_chunk_kda(*args, **kwargs):
         """Run differentiable Chunk KDA with automatic backward dispatch."""
-        initial_state, disable_recompute, state_v_first = args[21:] if len(args) > 21 else (None, True, False)
+        initial_state, disable_recompute, state_v_first = args[21:24] if len(args) > 21 else (None, True, False)
+        context_parallel = args[24] if len(args) > 24 else None
         # Reuse the state-capable stage chain for its paired safe-gate ABI.
         # The legacy fused backward produces nonfinite gradients for the MF
         # Ulysses workload; the stage chain also covers ordinary no-state loss.
         paired_stages = args[9] and args[11] and args[20] and args[12] is not None
-        if paired_stages or initial_state is not None or not disable_recompute or state_v_first:
+        if (paired_stages or context_parallel is not None or initial_state is not None
+                or not disable_recompute or state_v_first):
             from hyper_parallel.platform.mindspore.custom_ops.chunk_kda_autograd import run_chunk_kda_stages
             names = ("layout", "output_final_state", "safe_gate", "lower_bound", "use_gate_in_kernel",
                      "a_log", "dt_bias", "cu_seqlens", "chunk_indices", "epsilon", "use_qk_l2norm_in_kernel",
                      "use_beta_sigmoid_in_kernel", "allow_neg_eigval", "use_exp2")
             options = dict(zip(names, args[7:21]))
             options.update(initial_state=initial_state, disable_recompute=disable_recompute,
-                           state_v_first=state_v_first)
+                           state_v_first=state_v_first, context_parallel=context_parallel)
             return run_chunk_kda_stages(*args[:7], **options)
         return NpuChunkKdaDFunction.apply(*args[:21], **kwargs)
 

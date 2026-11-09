@@ -710,6 +710,7 @@ def npu_chunk_kda(
         use_beta_sigmoid_in_kernel: bool = False,
         allow_neg_eigval: bool = False,
         use_exp2: bool = True,
+        context_parallel: Optional[object] = None,
 ):
     """Run differentiable dense or packed Chunk KDA.
 
@@ -725,6 +726,11 @@ def npu_chunk_kda(
     ``use_qk_l2norm_in_kernel`` and ``use_beta_sigmoid_in_kernel`` select the
     optional FwdV2 saved values consumed by backward.
 
+    ``context_parallel`` accepts the state context attached by
+    ``ContextParallel(state_parallel=True)`` for dense contiguous sequence
+    shards. It exchanges summaries rather than full sequences; packed inputs,
+    external initial states and per-shard final-state losses are unsupported.
+
     BF16 state relays can amplify cancellation in terminal-state-only losses;
     one strong-decay reference case currently exceeds the 4% gradient error
     target. State-gradient accuracy is not fully validated for that regime.
@@ -734,5 +740,5 @@ def npu_chunk_kda(
         safe_gate, lower_bound, use_gate_in_kernel, a_log, dt_bias,
         cu_seqlens, chunk_indices, epsilon, use_qk_l2norm_in_kernel,
         use_beta_sigmoid_in_kernel, allow_neg_eigval, use_exp2,
-        initial_state, disable_recompute, state_v_first,
+        initial_state, disable_recompute, state_v_first, context_parallel,
     )

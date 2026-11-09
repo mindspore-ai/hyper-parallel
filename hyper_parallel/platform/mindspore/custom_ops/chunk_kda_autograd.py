@@ -14,8 +14,8 @@
 # ============================================================================
 """Local state-aware autograd assembled from the explicit KDA stages.
 
-No communication lives here. An optional caller-owned scan supplies boundary
-states and replicated-gradient reduction (used by MF's experimental CP path).
+Local stages are paired with an optional state scan. ContextParallel provides
+DTensor transport; the model retains responsibility for parameter reductions.
 """
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ from hyper_parallel.core.shard.dfunction import DFunction
 from hyper_parallel.custom_ops.experimental.chunk_kda_stages import (
     npu_chunk_kda_fwd_prepare, npu_chunk_kda_fwd_h, npu_chunk_kda_fwd_finalize,
     npu_chunk_kda_bwd_prepare, npu_chunk_kda_bwd_dhu, npu_chunk_kda_bwd_finalize,
+    npu_chunk_kda_pre_process_fwd, npu_chunk_kda_pre_process_bwd, npu_chunk_kda_merge_fwd_bwd,
 )
 
 if TYPE_CHECKING:
@@ -50,6 +51,57 @@ def _scan_forward(cache, h0, options):
         output_final_state=True, chunk_size=options["chunk_size"],
         cu_seqlens=options["cu_seqlens"], chunk_indices=options["chunk_indices"],
     )
+
+
+class _KdaContextScan:
+    """Local KDA summaries coupled to ContextParallel's DTensor transport."""
+
+    def __init__(self, transport: Any) -> None:
+        """Bind the transport created by the model's context-parallel style."""
+        self.transport = transport
+
+    def _merge(self, summary, forward):
+        from mindspore import mint  # pylint: disable=C0415
+        full = self.transport.gather_summaries(summary)
+        count = self.transport.rank if forward else self.transport.size - self.transport.rank - 1
+        states = []
+        for batch in range(summary.shape[0]):
+            state = mint.zeros(summary.shape[1:-1] + (summary.shape[-1] - summary.shape[-2],),
+                               dtype=summary.dtype)
+            if count:
+                npu_chunk_kda_merge_fwd_bwd(state, full[:, batch].contiguous(), count,
+                                           self.transport.rank, forward=forward)
+            states.append(state)
+        return mint.stack(states)
+
+    def forward_boundary(self, cache: tuple, initial_state: ms.Tensor | None) -> ms.Tensor:
+        """Compute incoming states from preceding sequence summaries."""
+        from mindspore import mint  # pylint: disable=C0415
+        if initial_state is not None:
+            raise ValueError("Sequence CP currently requires the model's zero initial state.")
+        summaries = [npu_chunk_kda_pre_process_fwd(
+            cache[6][i:i + 1], cache[3][i:i + 1], cache[4][i:i + 1],
+            gk=cache[0][i:i + 1], cu_seqlens=[0, cache[0].shape[2]])[0][0]
+                     for i in range(cache[0].shape[0])]
+        return self._merge(mint.stack(summaries), True)
+
+    def backward_boundary(self, cache: tuple, d_o: ms.Tensor, dv_local: ms.Tensor,
+                          grad_final: ms.Tensor | None, scale: float) -> ms.Tensor:
+        """Compute terminal gradients from the following sequence summaries."""
+        from mindspore import mint  # pylint: disable=C0415
+        if grad_final is not None:
+            raise ValueError("Sequence CP does not expose per-shard final-state losses.")
+        summaries = [npu_chunk_kda_pre_process_bwd(
+            cache[5][i:i + 1], cache[6][i:i + 1], cache[3][i:i + 1],
+            d_o[i:i + 1], dv_local[i:i + 1], scale,
+            gk=cache[0][i:i + 1].astype(d_o.dtype), cu_seqlens=[0, d_o.shape[2]])
+                     for i in range(d_o.shape[0])]
+        return self._merge(mint.stack(summaries), False).astype(d_o.dtype)
+
+    @staticmethod
+    def finish_gradients(d_a: ms.Tensor, d_bias: ms.Tensor, dh0: ms.Tensor) -> tuple:
+        """Leave parameter partials to the model's existing FSDP/DP reduction."""
+        return d_a, d_bias, dh0
 
 
 class _ChunkKdaStageFunction(DFunction):
@@ -146,7 +198,8 @@ def run_chunk_kda_stages(
         chunk_indices: list | None = None, initial_state: ms.Tensor | None = None,
         disable_recompute: bool = True, state_v_first: bool = False, epsilon: float = 1e-6,
         use_qk_l2norm_in_kernel: bool = False, use_beta_sigmoid_in_kernel: bool = False,
-        allow_neg_eigval: bool = False, use_exp2: bool = True, scan: Any = None) -> tuple:
+        allow_neg_eigval: bool = False, use_exp2: bool = True, scan: Any = None,
+        context_parallel: Any = None) -> tuple:
     """Internal local training adapter; MF may supply its caller-owned scan.
 
     The current paired FLA finalize ABI requires safe raw gates, BF16,
@@ -157,6 +210,10 @@ def run_chunk_kda_stages(
     from mindspore import mint  # pylint: disable=C0415
     if not safe_gate or not use_gate_in_kernel or not use_exp2 or a_log is None:
         raise ValueError("State-aware KDA stages require safe_gate/use_gate_in_kernel/use_exp2=True and a_log.")
+    if context_parallel is not None:
+        if cu_seqlens is not None or output_final_state or scan is not None:
+            raise ValueError("Model sequence CP requires dense inputs and no exposed per-shard final state.")
+        scan = _KdaContextScan(context_parallel)
     if layout not in ("BNSD", "BSND", "NTD", "TND"):
         raise ValueError("layout must be BNSD, BSND, NTD or TND.")
     packed = len(q.shape) == 3
