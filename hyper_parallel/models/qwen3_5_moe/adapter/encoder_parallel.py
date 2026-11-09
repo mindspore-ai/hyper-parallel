@@ -117,14 +117,8 @@ class QwenVisionBridge:
             raise NotImplementedError("Wrap visual children, not model.visual/model as standalone FSDP units")
         if options.get("micro_batch_size") != 1:
             raise ValueError("Qwen encoder parallel currently requires micro_batch_size=1")
-        if options.get("sequence_parallel") or options.get("loss_parallel"):
-            raise NotImplementedError("Qwen image insertion requires SP=false and loss_parallel=false")
-        if options.get("cp_size", 1) != 1 and not getattr(self.model, "_hp_vlm_cp_enabled", False):
-            raise NotImplementedError(
-                "Decoder CP requires QwenVLMParallelBatch to own image insertion and loss shifting"
-            )
-        if options.get("activation_checkpoint", "off") not in (None, "off"):
-            raise NotImplementedError("Qwen encoder parallel currently requires activation_checkpoint.mode=off")
+        if options.get("loss_parallel"):
+            raise NotImplementedError("Qwen image insertion requires loss_parallel=false")
         if getattr(self.vision, "gradient_checkpointing", False):
             raise NotImplementedError("Qwen encoder parallel does not support vision gradient checkpointing")
 
