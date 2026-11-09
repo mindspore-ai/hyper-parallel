@@ -128,7 +128,12 @@ Top-N 和 expert 分布转换为带 step/rank/module 的 Table；其他诊断事
 TensorBoard 标量使用相同原始数值。rank-local 标量的远端 key 附带 rank/module，避免混为同一曲线。
 WandB 离线目录可用 SDK 的 `wandb sync <offline-run-directory>` 上传；JSONL 本身不是 SDK 离线 run 文件。
 已有外部 `wandb.entity` 继续生效；恢复时同一 run ID 使用 SDK resume。
-远端队列有界，失败告警、保留本地 JSONL，不无限重试；退出等待有上限。
+远端输出队列上限 256 条，容纳多层 EP 在 step 边界集中产生的记录；它与设备摘要传输的 32 槽队列不同。
+每个 sink 独立处理异常，WandB 失败不会跳过 TensorBoard 写入/关闭；同一 sink 的重复故障只首次告警。
+队列满仍显式计数并保留本地 JSONL，不无限重试；退出等待有上限。
+WandB artifact staging/cache 目录也必须可写，服务器共享 HOME 不可写时可由外部设置
+`WANDB_DIR`、`WANDB_DATA_DIR`、`WANDB_CACHE_DIR`、`WANDB_CONFIG_DIR` 到作业目录。
+每步全量上传逐层 Table 会增加 CPU/SDK 开销，异步线程不等于无性能影响；参见设备验收报告的对照结果。
 不在远端启用时导入 SDK。
 
 ## MFU 完整性
@@ -188,7 +193,7 @@ norm、激活及逐元素门控也沿用本方案的忽略约定；没有将整�
 
 ## 验收状态
 
-2026-11-09 本地合并回归通过 533 项测试、746 个子用例，覆盖 Trainer、clip-grad、Muon、MoE、
+2026-11-09 本地合并回归通过 534 项测试、746 个子用例，覆盖 Trainer、clip-grad、Muon、MoE、
 checkpoint、数据入口、配置解析与原生 EP；其中既有 EP 用例的 Gloo 仅使用本机回环地址。
 新增 Python 文件通过 Ruff E/F 检查，所有改动 Python 文件可编译，Markdown 格式、相对链接和 AGENTS 目录检查通过。
 
@@ -205,8 +210,10 @@ MFU 输出链路使用测试专用峰值验证归一化，不将 CPU 测试数�
 真实 WandB 0.31.0 offline SDK 已生成 `.wandb` run 与 token Table 文件，
 TensorBoard 2.21.0 event 文件已重新读取并核对原始 step 和 scalar；本轮未上传在线 run。
 
-尚未完成的设备验收：实际 Qwen3.6 多卡/多机、EP/CP/TP 拓扑、GPU/NPU event 与 pin-memory 行为、
-采样开关吞吐/峰值显存对照和长跑无增长、在线 WandB 网络故障恢复。
+已完成的单机 NPU 验收和实际开销见 [8 卡验收报告](trainer_monitor_npu_acceptance.md)：
+Qwen3.6 20 层文本视图、EP2/CP2/FSDP8、NPU event/pinned-memory、采样/输出及小模型保存恢复。
+尚未完成：完整 40 层、多机、其他 TP/PP 拓扑、GPU、长跑无增长、在线 WandB 网络故障恢复。
+逐步全量 SDK Table 输出的性能仍需优化；单次短跑不能证明零开销。
 compiled 区域不插入 Python 采集 graph break；缺失的 tensor 诊断明确 unavailable。
 外部稀疏梯度 owner 没有适配时不输出仅含 dense 部分的“完整 local norm”。
 这些边界不能因 CPU 回归通过而标记验收完成。

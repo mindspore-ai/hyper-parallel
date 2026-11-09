@@ -51,7 +51,10 @@ class OutputWriter:
         self.file = None
         if set(config.sinks) & {"jsonl", "wandb", "tensorboard"}:
             self.file = (self.directory / f"rank_{rank}.jsonl").open("a", encoding="utf-8")
-        self.queue: queue.Queue = queue.Queue(maxsize=32)
+        # One step can publish local/global distributions for every decoder layer.
+        # Bound the queue while allowing a whole 40-layer sampling burst.
+        self.queue: queue.Queue = queue.Queue(maxsize=256)
+        self.failed_sinks = set()
         self.dropped = 0
         self.closed = False
         self.stop = threading.Event()
@@ -128,6 +131,45 @@ class OutputWriter:
             )
         return tables
 
+    @staticmethod
+    def _scalars(record: dict) -> dict:
+        metrics = record.get("metrics", {})
+        scalars = {key: value for key, value in metrics.items() if isinstance(value, (int, float))}
+        if record["event"] != "train_step":
+            scope = f"rank_{record['rank']}/{record.get('module', record.get('call', 'all'))}"
+            scalars = {f"{key}/{scope}": value for key, value in scalars.items()}
+        return scalars
+
+    def _write_wandb(self, wandb: Any, run: Any, record: dict, scalars: dict) -> None:
+        if scalars:
+            run.log({"global_step": record.get("step", 0), **scalars})
+        if record["event"] != "train_step":
+            run.log(self._tables(wandb, record))
+
+    @staticmethod
+    def _write_tensorboard(tensorboard: Any, record: dict, scalars: dict) -> None:
+        for key, value in scalars.items():
+            tensorboard.add_scalar(key, value, record.get("step", 0))
+
+    def _sink_failure(self, name: str, exc: Exception) -> None:
+        # Repeated filesystem/network errors must not flood the training log.
+        if name not in self.failed_sinks:
+            self.failed_sinks.add(name)
+            logger.warning("Monitor %s output failed; retaining local JSONL: %s", name, exc)
+
+    def _deliver(self, wandb: Any, run: Any, tensorboard: Any, record: dict) -> None:
+        scalars = self._scalars(record)
+        if run is not None:
+            try:
+                self._write_wandb(wandb, run, record, scalars)
+            except Exception as exc:
+                self._sink_failure("wandb", exc)
+        if tensorboard is not None:
+            try:
+                self._write_tensorboard(tensorboard, record, scalars)
+            except Exception as exc:
+                self._sink_failure("tensorboard", exc)
+
     def _run(self) -> None:
         wandb, run, tensorboard = self._open_sinks()
         try:
@@ -137,35 +179,19 @@ class OutputWriter:
                 except queue.Empty:
                     continue
                 try:
-                    if record is None:
-                        return
-                    metrics = record.get("metrics", {})
-                    scalars = {k: v for k, v in metrics.items() if isinstance(v, (int, float))}
-                    step = record.get("step", 0)
-                    if record["event"] != "train_step":
-                        scope = f"rank_{record['rank']}/{record.get('module', record.get('call', 'all'))}"
-                        scalars = {f"{key}/{scope}": value for key, value in scalars.items()}
-                    if run is not None:
-                        if scalars:
-                            run.log({"global_step": step, **scalars})
-                        if record["event"] != "train_step":
-                            tables = self._tables(wandb, record)
-                            run.log(tables)
-                    if tensorboard is not None:
-                        for key, value in scalars.items():
-                            tensorboard.add_scalar(key, value, step)
-                except Exception as exc:
-                    logger.warning("Monitor remote output failed; retaining local record: %s", exc)
+                    self._deliver(wandb, run, tensorboard, record)
                 finally:
                     self.queue.task_done()
         finally:
-            try:
-                if run is not None:
-                    run.finish()
-                if tensorboard is not None:
-                    tensorboard.close()
-            except Exception as exc:
-                logger.warning("Monitor remote sink close failed: %s", exc)
+            for name, sink in (("wandb", run), ("tensorboard", tensorboard)):
+                if sink is not None:
+                    try:
+                        if name == "wandb":
+                            sink.finish()
+                        else:
+                            sink.close()
+                    except Exception as exc:
+                        self._sink_failure(name, exc)
 
     def close(self) -> None:
         """Bound shutdown latency even if a remote SDK stops responding."""

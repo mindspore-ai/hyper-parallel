@@ -15,8 +15,10 @@
 """CPU contract tests for monitor ownership, arithmetic, lifecycle and output."""
 
 from concurrent.futures import Future
+from contextlib import ExitStack
 import json
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -45,7 +47,9 @@ class TestMonitorSession(unittest.TestCase):
 
     def setUp(self) -> None:
         """Allocate isolated output and a CPU-only trainer fixture."""
-        directory = self.enterContext(tempfile.TemporaryDirectory())
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        directory = stack.enter_context(tempfile.TemporaryDirectory())
         self.config = MonitorConfig(sinks=["jsonl"], output_dir=directory)
         self.model = torch.nn.Sequential(torch.nn.Linear(3, 2, bias=False))
         self.trainer = SimpleNamespace(
@@ -420,3 +424,43 @@ class TestMonitorDataAndOutput(unittest.TestCase):
         recorder.record({"input_ids": torch.ones(1, 4, dtype=torch.int64), "cu_seq_lens": torch.tensor([0.0, 4.0])})
         self.assertIn("offset_dtype", recorder.snapshot()["packing_failures"])
         self.assertEqual(snapshot["top_tokens"], [])
+
+    def test_remote_layer_burst_preserves_steps_and_isolates_sink_failure(self) -> None:
+        """Exercise a full decoder sampling burst while a sink starts slowly.
+
+        Feature: Bounded optional output delivery.
+        Description: Queue forty layers of local/global routing, then a train step;
+            make WandB fail while TensorBoard stays healthy.
+        Expectation: No burst drops, TensorBoard gets the step, and errors log once.
+        """
+        started, release = threading.Event(), threading.Event()
+        run, tensorboard = Mock(), Mock()
+        run.log.side_effect = OSError("unwritable artifact directory")
+        run.finish.side_effect = OSError("sink shutdown failure")
+
+        def open_sinks() -> tuple:
+            """Hold initialization to reproduce a whole-step producer burst."""
+            started.set()
+            release.wait(timeout=5)
+            return Mock(), run, tensorboard
+
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        directory = stack.enter_context(tempfile.TemporaryDirectory())
+        config = MonitorConfig(output_dir=directory, sinks=["jsonl", "wandb", "tensorboard"])
+        with patch.object(OutputWriter, "_open_sinks", side_effect=open_sinks):
+            with patch("hyper_parallel.trainer.runtime.monitor.output.logger") as log:
+                writer = OutputWriter(config, 0, "burst")
+                self.assertTrue(started.wait(timeout=2))
+                try:
+                    for layer in range(40):
+                        for kind in ("expert_load", "expert_load_local"):
+                            writer.emit({"event": kind, "step": 1, "module": str(layer), "counts": [2, 1]})
+                    writer.emit({"event": "train_step", "step": 1, "metrics": {"training/total_loss": 2.5}})
+                finally:
+                    release.set()
+                    writer.close()
+                self.assertEqual(writer.dropped, 0)
+                tensorboard.add_scalar.assert_called_once_with("training/total_loss", 2.5, 1)
+                tensorboard.close.assert_called_once()
+                log.warning.assert_called_once()
