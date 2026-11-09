@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.trainer.runtime.monitor.session import monitor_phase, monitor_scope
 from hyper_parallel.components.checkpoint import build_checkpointer
 from hyper_parallel.components.checkpoint.dcp_checkpointer import (
     STEP_PREFIX,
@@ -207,7 +208,8 @@ class CheckpointerCallback(Callback):
             self._save_extra_state_per_rank,
             self._restore_from,
         )
-        self._load_checkpoint()
+        with monitor_phase(self.trainer, "checkpoint_restore"), monitor_scope(self.trainer):
+            self._load_checkpoint()
         if self._save_time_interval_seconds > 0:
             self._next_time_save = time.monotonic() + self._save_time_interval_seconds
 
@@ -274,7 +276,8 @@ class CheckpointerCallback(Callback):
 
     def wait_for_pending_save(self) -> None:
         """Block until the checkpointer's in-flight async save is persisted."""
-        self.checkpointer.maybe_wait_for_async_save()
+        with monitor_phase(self.trainer, "checkpoint_wait"), monitor_scope(self.trainer):
+            self.checkpointer.maybe_wait_for_async_save()
         self._rotate_checkpoints()
 
     # ------------------------------------------------------------------
@@ -316,7 +319,15 @@ class CheckpointerCallback(Callback):
         schedulers = _as_list(self.trainer.lr_scheduler)
         lr_scheduler_sd = _unwrap_single([sch.state_dict() for sch in schedulers])
 
+        meter = getattr(self.trainer, "environ_meter_callback", None)
+        monitor = getattr(self.trainer, "monitor", None)
+        monitor_state = {}
+        if meter is not None:
+            monitor_state["meter"] = meter.state_dict()
+        if monitor is not None:
+            monitor_state["session"] = monitor.state_dict()
         return {
+            **({"monitor": monitor_state} if monitor_state else {}),
             "global_step": state.global_step,
             "epoch": state.epoch,
             "lr_scheduler": lr_scheduler_sd,
@@ -426,12 +437,14 @@ class CheckpointerCallback(Callback):
                 checkpoint_state,
             )
 
-        self.checkpointer.save(
-            save_dir,
-            checkpoint_state,
-            global_step=state.global_step,
-            save_async=save_async,
-        )
+        phase = "checkpoint_submit" if save_async else "checkpoint_save"
+        with monitor_phase(self.trainer, phase), monitor_scope(self.trainer):
+            self.checkpointer.save(
+                save_dir,
+                checkpoint_state,
+                global_step=state.global_step,
+                save_async=save_async,
+            )
 
         # Bookkeeping reflects the dispatched step immediately, including in async
         # mode: otherwise on_epoch_end would queue the same step again while the
@@ -454,6 +467,11 @@ class CheckpointerCallback(Callback):
             self._rotate_checkpoints()
 
     def _save_hf_checkpoint(self, save_dir: str, global_step: int) -> None:
+        """Time materialization, export and asset persistence together."""
+        with monitor_phase(self.trainer, "weights_save"):
+            self._export_hf_checkpoint(save_dir, global_step)
+
+    def _export_hf_checkpoint(self, save_dir: str, global_step: int) -> None:
         """Collect and export one Transformers-compatible model checkpoint."""
         if self._hf_checkpoint_manager is None:
             raise RuntimeError("Hugging Face checkpoint manager is not initialized")
@@ -800,7 +818,16 @@ class CheckpointerCallback(Callback):
     def _apply_extra_state(self, extra: Dict[str, Any]) -> None:
         """Restore progress, scheduler, dataloader position and RNG state."""
         trainer = self.trainer
+        monitor_state = extra.get("monitor", {})
+        meter = getattr(trainer, "environ_meter_callback", None)
+        monitor = getattr(trainer, "monitor", None)
+        if meter is not None and "meter" in monitor_state:
+            meter.load_state_dict(monitor_state["meter"])
+        if monitor is not None and "session" in monitor_state:
+            monitor.load_state_dict(monitor_state["session"])
         trainer.state.global_step = extra["global_step"]
+        if monitor is not None:
+            monitor.step = trainer.state.global_step
         persisted_epoch = extra.get("epoch", 0)
         trainer.state.epoch = persisted_epoch
 

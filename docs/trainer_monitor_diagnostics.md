@@ -1,7 +1,8 @@
 # 通用 Trainer 监控指标诊断说明
 
-适用范围：通用 Trainer，不涉及 RL。配套 [监控设计方案](design/trainer_monitoring_plan.md)。
-本文描述指标的诊断用途；新增 Recorder、异步链路及标准模块 MFU 仍为设计，不代表当前分支已经实现。
+适用范围：通用 Trainer，不涉及 RL。配套 [监控设计方案](design/trainer_monitoring_plan.md) 和 [使用与实现边界](trainer_monitor_usage.md)。
+本文描述指标的诊断用途；Recorder、异步链路及标准模块 MFU 已接入 `monitor_dev`。
+当前实现范围与本地/设备验收状态以 [使用与实现边界](trainer_monitor_usage.md) 为准。
 开始诊断前核对运行 revision、实际输出字段和能力报告；设计中的字段缺失不自动判为运行故障。
 
 ## 使用前提

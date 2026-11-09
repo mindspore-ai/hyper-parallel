@@ -22,6 +22,7 @@ from typing import Any
 
 import torch
 
+from hyper_parallel.components.monitor import report_statistics, statistics_phase
 from hyper_parallel.data.batching.runtime_input import (
     AttentionRuntime,
     IndexedBoundaryResolver,
@@ -108,11 +109,13 @@ class OmniParallelBatch:
         local_batch = None
         if self.parallel_context.build_on_rank():
             logger.debug("Omni get_batch: batch=%d source_read_begin", self._batch_index, enabled=True)
-            source_batch = external_batch if external_batch is not None else next(data_iterator)
+            with statistics_phase("data_wait"):
+                source_batch = external_batch if external_batch is not None else next(data_iterator)
             if not isinstance(source_batch, Mapping):
                 raise TypeError("Omni DataLoader must yield a mapping batch")
 
             normalized_batch = self._normalize_source_batch(source_batch)
+            report_statistics("dataset", self, batch=normalized_batch)
             local_batch = self.cp_sharder.shard(normalized_batch)
             logger.debug(
                 "Omni get_batch: batch=%d source_ready global_shape=%s local_shape=%s tp=%d cp=%d cp_rank=%d",
@@ -326,13 +329,23 @@ class TextParallelBatch:
         Returns:
             Model inputs and loss inputs for one forward-backward step.
         """
-        canonical_batch = self._read_source_batch(data_iterator)
+        with statistics_phase("data_wait"):
+            canonical_batch = self._read_source_batch(data_iterator)
         cu_seq_lens = self._resolve_sequence_boundaries(canonical_batch)
+        if canonical_batch is not None:
+            report_statistics(
+                "dataset", self, batch={**canonical_batch, "cu_seq_lens": cu_seq_lens},
+                labels_are_shifted=self.labels_are_shifted,
+                eod_mask_loss=self.eod_mask_loss, eod_token_id=getattr(self.tokenizer, "eod", None),
+                packing_policy="isolated" if self.attention_runtime.reset_mask else "concatenated",
+                reset_position_ids=self.reset_position_ids,
+            )
         cp_local_batch = self.cp_sharder.shard(canonical_batch)
-        parallel_batch = self.tp_broadcaster.broadcast(
-            cp_local_batch,
-            cu_seq_lens,
-        )
+        with statistics_phase("batch_h2d_transport"):
+            parallel_batch = self.tp_broadcaster.broadcast(
+                cp_local_batch,
+                cu_seq_lens,
+            )
         self._log_batch_flow(canonical_batch, parallel_batch)
 
         position_ids = self._build_local_position_ids(

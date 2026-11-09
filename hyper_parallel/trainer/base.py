@@ -103,6 +103,7 @@ from hyper_parallel.trainer.runtime.device import (  # pylint: disable=syntax-er
     synchronize,
 )
 
+from hyper_parallel.trainer.runtime.monitor.session import MonitorSession, monitor_phase, monitor_scope
 from hyper_parallel.trainer.callbacks import (
     EnvironMeterCallback,
     EvaluateCallback,
@@ -110,7 +111,6 @@ from hyper_parallel.trainer.callbacks import (
     LoggingCallback,
     ProfilerCallback,
     StressDetectCallback,
-    TqdmCallback,
     CheckpointerCallback,
     TrainerState,
 )
@@ -198,7 +198,7 @@ class BaseTrainer(Stateful, ABC):
     Callback Hooks:
         The trainer calls callback methods at various stages:
         - evaluate_callback: evaluation callback
-        - trace_callback: tracing callback (meter, wandb, tqdm, profile)
+        - environ_meter_callback: shared step metrics and monitor finalization
         - checkpoint_callback: checkpointing callback
     """
 
@@ -308,11 +308,15 @@ class BaseTrainer(Stateful, ABC):
         self._build_loss()
 
         # Build trainer-owned data components after the model finalizes parameters and sharding.
-        self._build_model_assets()
-        self._build_data_transform()
-        self._build_dataset()
+        with monitor_phase(self, "tokenizer_processor_load"):
+            self._build_model_assets()
+        with monitor_phase(self, "data_transform_build"):
+            self._build_data_transform()
+        with monitor_phase(self, "dataset_build"):
+            self._build_dataset()
         self._build_collate_fn()
-        self._build_dataloader()
+        with monitor_phase(self, "dataloader_build"):
+            self._build_dataloader()
         self._compute_train_iters()
 
         self._build_optimizer()
@@ -325,13 +329,15 @@ class BaseTrainer(Stateful, ABC):
         """Initialize logging, distributed state, and the local device."""
         # log args
         setup_logging()
+        self.monitor = MonitorSession(self)
 
         # Initialize distributed process group
         backend = getattr(self.config.training, "backend", "nccl")
         if backend == "hccl" and self.config.training.enable_full_determinism:
             # HCCL reads this when creating communicators, before set_seed runs below.
             os.environ["HCCL_DETERMINISTIC"] = "true"
-        initialize_distributed(backend=backend)
+        with monitor_phase(self, "distributed_init"):
+            initialize_distributed(backend=backend)
 
         self.local_rank = get_local_rank_safe()
         self.global_rank = get_global_rank_safe()
@@ -358,11 +364,14 @@ class BaseTrainer(Stateful, ABC):
         # Register distributed_setup; the Trainer-side desugar fills its
         # normalized plan_overrides/module_replacements (05 §15.2.6) so the
         # AutoModels build pipeline never sees raw YAML PlanOverride DTOs.
-        self.distributed_setup = create_distributed_setup_from_config(self.config)
+        with monitor_phase(self, "process_groups"):
+            self.distributed_setup = create_distributed_setup_from_config(self.config)
         normalize_distributed_setup_overrides(self.distributed_setup, self.config)
         self.mesh = self.distributed_setup.mesh_context
         self.device_mesh = self.mesh.device_mesh
         self.dp_cp_mesh = self.mesh.dp_cp_mesh
+
+        self.monitor.initialize()
 
         # Set random seed
         set_seed(self.config.training.seed, self.config.training.enable_full_determinism)
@@ -381,25 +390,28 @@ class BaseTrainer(Stateful, ABC):
     def _build_model(self) -> None:
         """Build the model and derive Trainer-owned runtime state."""
         self.peft_config = self.config.peft
-        self.model = self.config.model.build(
-            distributed_setup=self.distributed_setup,
-            peft_config=self.peft_config,
-            activation_checkpoint=self.config.activation_checkpoint.mode,
-            activation_checkpoint_selection=self.config.activation_checkpoint.selection,
-            swap_inputs=getattr(self.config.activation_checkpoint, "swap_inputs", False),
-            allow_cache_entry_mutation=getattr(
-                self.config.activation_checkpoint, "allow_cache_entry_mutation", False),
-            activation_swap=self.config.activation_swap,
-            compile_config=self.config.compile,
-            # The final dtype is applied inside the atomic build (05 stage-5
-            # item 5); the Trainer no longer patches it afterwards.
-            model_init_dtype=self.config.model_init_dtype,
-        )
+        with monitor_phase(self, "model_build"), monitor_scope(self):
+            self.model = self.config.model.build(
+                distributed_setup=self.distributed_setup,
+                peft_config=self.peft_config,
+                activation_checkpoint=self.config.activation_checkpoint.mode,
+                activation_checkpoint_selection=self.config.activation_checkpoint.selection,
+                swap_inputs=getattr(self.config.activation_checkpoint, "swap_inputs", False),
+                allow_cache_entry_mutation=getattr(
+                    self.config.activation_checkpoint, "allow_cache_entry_mutation", False),
+                activation_swap=self.config.activation_swap,
+                compile_config=self.config.compile,
+                # The final dtype is applied inside the atomic build (05 stage-5
+                # item 5); the Trainer no longer patches it afterwards.
+                model_init_dtype=self.config.model_init_dtype,
+            )
         _validate_optimize_dtype(
             self.model,
             fp32_main_params=self.config.optimizer.fp32_main_params,
         )
         self.model_config = self.model.config
+        if getattr(self, "monitor", None) is not None:
+            self.monitor.bind_model()
         if self.global_rank == 0:
             logger.info(
                 "Model config:\n%s",
@@ -650,7 +662,6 @@ class BaseTrainer(Stateful, ABC):
         self.state = TrainerState()
         # Raw AUX is not normalized with the backward loss; average its observations.
         self.environ_meter_callback = EnvironMeterCallback(self, microbatch_mean_metrics=("router_aux_loss",))
-        self.tqdm_callback = TqdmCallback(self)
         self.logging_callback = LoggingCallback(self)
         self.evaluate_callback = EvaluateCallback(self)
         self.garbage_collection_callback = GarbageCollectionCallback(self)
@@ -658,7 +669,6 @@ class BaseTrainer(Stateful, ABC):
         self._callbacks = [
             self.environ_meter_callback,
             self.logging_callback,
-            self.tqdm_callback,
             self.evaluate_callback,
             self.garbage_collection_callback,
             self.profiler_callback,
@@ -685,11 +695,15 @@ class BaseTrainer(Stateful, ABC):
         """Run all registered callbacks at the start of training."""
         for callback in self._callbacks:
             callback.on_train_begin(self.state)
+        if getattr(self, "monitor", None) is not None:
+            self.monitor.start_output()
 
     def on_train_end(self) -> None:
         """Run all registered callbacks at the end of training."""
         for callback in self._callbacks:
             callback.on_train_end(self.state)
+        if getattr(self, "monitor", None) is not None:
+            self.monitor.close()
 
     def on_epoch_begin(self) -> None:
         """Run all registered callbacks at the start of an epoch."""
@@ -703,6 +717,9 @@ class BaseTrainer(Stateful, ABC):
 
     def on_step_begin(self, **kwargs: Any) -> None:
         """Run all registered callbacks at the start of a training step."""
+        if getattr(self, "monitor", None) is not None:
+            step = self.state.global_step if "micro_batches" in kwargs else self.state.global_step + 1
+            self.monitor.begin_step(step)
         for callback in self._callbacks:
             callback.on_step_begin(self.state, **kwargs)
 
@@ -766,7 +783,12 @@ class BaseTrainer(Stateful, ABC):
 
         # chunk_mbs_config = getattr(self.config.training, "chunk_mbs_config", None)
         # self._chunk_mbs_ranges = build_chunk_mbs_ranges(micro_batch, chunk_mbs_config)
-        micro_batch = {k: _to_device(v) for k, v in micro_batch.items()}  # type: ignore
+        if getattr(self, "monitor", None) is not None and "input_ids" in micro_batch:
+            # Text get-batch records the canonical source before its distributed transfer.
+            if not hasattr(self, "get_batch"):
+                self.monitor.record_component("dataset", self, {"batch": micro_batch})
+        with monitor_phase(self, "h2d_submit"):
+            micro_batch = {k: _to_device(v) for k, v in micro_batch.items()}  # type: ignore
         # if getattr(self, "LOG_SAMPLE", True):
         #     self.LOG_SAMPLE = False
         return micro_batch
@@ -787,6 +809,10 @@ class BaseTrainer(Stateful, ABC):
             Backward loss and named globally aggregated loss values.
         """
         local_loss = self.loss_fn(model_output=outputs, labels=labels)
+        monitor = getattr(self, "monitor", None)
+        if (monitor is not None and getattr(self, "graph_compiler", None) is None
+                and not torch.compiler.is_compiling()):
+            monitor.record_loss(local_loss, current_token_counts)
         # Names are static graph metadata; diagnostics added below are not losses.
         self.loss_names = tuple(local_loss) if isinstance(local_loss, dict) else ("foundation_loss",)
         # Every foundation-family objective receives the same external token weight.
@@ -885,18 +911,19 @@ class BaseTrainer(Stateful, ABC):
                 # The traced ``loss_dict`` values flow back as extra graph
                 # outputs (emitted after the gradients), so the logging
                 # metrics keep per-key parity with the eager path.
-                loss, loss_dict = self.graph_compiler.forward_backward(
-                    model_inputs=micro_batch,
-                    labels=labels,
-                    current_token_counts=self.current_token_counts,
-                )
+                with monitor_phase(self, "forward_backward_joint"):
+                    loss, loss_dict = self.graph_compiler.forward_backward(
+                        model_inputs=micro_batch,
+                        labels=labels,
+                        current_token_counts=self.current_token_counts,
+                    )
             else:
                 model_fwd_context = (
                     self.model_fwd_context()
                     if callable(self.model_fwd_context)
                     else self.model_fwd_context
                 )
-                with model_fwd_context:
+                with model_fwd_context, monitor_phase(self, "forward"), monitor_scope(self):
                     outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
 
                 # with use_parallel_state("base"):
@@ -915,7 +942,7 @@ class BaseTrainer(Stateful, ABC):
                     empty_cache()
 
                 # Backward pass
-                with self.model_bwd_context:
+                with self.model_bwd_context, monitor_phase(self, "backward"):
                     loss.backward()
             prefetch = getattr(self.train_dataloader, "prefetch", None)
             if callable(prefetch):
@@ -1021,43 +1048,52 @@ class BaseTrainer(Stateful, ABC):
 
     def clip_grad_norm(self, *, gradient_divisor: float = 1.0) -> Any:
         """Run pre-optimizer diagnostics and clipping in their required order."""
-        self.model_integration.after_backward_before_clip()
-        self.validate_fsdp_runtime_before_optimizer()
-        max_grad_norm = self.config.training.max_grad_norm
-        external = get_model_external_state(self.model)
-        if external is not None:
-            preparation = external.prepare_optimizer_step(max_norm=max_grad_norm, gradient_divisor=gradient_divisor)
-            self.model_integration.after_clip(preparation.post_clip_norm)
-            return preparation.global_norm
-        grad_norm: Any = 0.0
-        post_clip_norm = None
-        compiler = getattr(self, "graph_compiler", None)
-        clip_kwargs = {"parameter_layouts": compiler.parameter_layouts} if compiler is not None else {}
-        if max_grad_norm > 0:
-            grad_norm = clip_grad_norm_(self.model, max_grad_norm, **clip_kwargs)
-            if self.model_integration.runtime_enabled:
-                grad_norm_value = (
-                    float(grad_norm.item())
-                    if isinstance(grad_norm, torch.Tensor)
-                    else float(grad_norm)
-                )
-                clip_coefficient = min(
-                    float(max_grad_norm) / (grad_norm_value + 1.0e-6),
-                    1.0,
-                )
-                post_clip_norm = grad_norm_value * clip_coefficient
-        elif self.model_integration.runtime_enabled:
-            grad_norm = clip_grad_norm_(self.model, float("inf"), **clip_kwargs)
-            post_clip_norm = grad_norm
-        self.model_integration.after_clip(post_clip_norm)
-        return grad_norm
+        with monitor_phase(self, "gradient_prepare_clip"), monitor_scope(self):
+            self.model_integration.after_backward_before_clip()
+            self.validate_fsdp_runtime_before_optimizer()
+            max_grad_norm = self.config.training.max_grad_norm
+            external = get_model_external_state(self.model)
+            if external is not None:
+                monitor = getattr(self, "monitor", None)
+                if monitor is not None and monitor.sampled(monitor.config.local_grad_norm):
+                    monitor.unavailable("local_grad_norm", "external gradient owner has no monitor adapter")
+                preparation = external.prepare_optimizer_step(
+                    max_norm=max_grad_norm, gradient_divisor=gradient_divisor)
+                self.model_integration.after_clip(preparation.post_clip_norm)
+                return preparation.global_norm
+            if (getattr(self, "monitor", None) is not None and max_grad_norm <= 0
+                    and not self.model_integration.runtime_enabled):
+                self.monitor.record_gradients()
+            grad_norm: Any = 0.0
+            post_clip_norm = None
+            compiler = getattr(self, "graph_compiler", None)
+            clip_kwargs = {"parameter_layouts": compiler.parameter_layouts} if compiler is not None else {}
+            if max_grad_norm > 0:
+                grad_norm = clip_grad_norm_(self.model, max_grad_norm, **clip_kwargs)
+                if self.model_integration.runtime_enabled:
+                    grad_norm_value = (
+                        float(grad_norm.item())
+                        if isinstance(grad_norm, torch.Tensor)
+                        else float(grad_norm)
+                    )
+                    clip_coefficient = min(
+                        float(max_grad_norm) / (grad_norm_value + 1.0e-6),
+                        1.0,
+                    )
+                    post_clip_norm = grad_norm_value * clip_coefficient
+            elif self.model_integration.runtime_enabled:
+                grad_norm = clip_grad_norm_(self.model, float("inf"), **clip_kwargs)
+                post_clip_norm = grad_norm
+            self.model_integration.after_clip(post_clip_norm)
+            return grad_norm
 
     def step_optimizers_and_schedulers(self) -> None:
         """Step every optimizer and scheduler, then expose the final state."""
         optimizers = self.optimizer if isinstance(self.optimizer, list) else [self.optimizer]
         for optimizer in optimizers:
             # Keep zeros_like dispatched so lazily created optimizer states retain DTensor metadata.
-            with SkipDTensorDispatch(no_skip={torch.zeros_like}):
+            with (SkipDTensorDispatch(no_skip={torch.zeros_like}),
+                  monitor_phase(self, "optimizer"), monitor_scope(self)):
                 optimizer.step()
             optimizer.zero_grad()
         moe_monitor = getattr(self, "moe_monitor", None)
@@ -1070,8 +1106,9 @@ class BaseTrainer(Stateful, ABC):
             if isinstance(self.lr_scheduler, list)
             else ([self.lr_scheduler] if self.lr_scheduler is not None else [])
         )
-        for scheduler in schedulers:
-            scheduler.step()
+        with monitor_phase(self, "scheduler"):
+            for scheduler in schedulers:
+                scheduler.step()
 
     def _end_model_integration_step(self, metrics: Dict[str, Any]) -> None:
         """Persist structured step metrics and global input identity."""
@@ -1241,6 +1278,8 @@ class BaseTrainer(Stateful, ABC):
                 logger.exception("Failed to save memory snapshot after training error.")
             finally:
                 self.abort_profilers()
+                if getattr(self, "monitor", None) is not None:
+                    self.monitor.close()
             raise
 
         synchronize()

@@ -72,6 +72,24 @@ class TestConfigOverrides(unittest.TestCase):
             yaml_path.write_text(_SAMPLE_YAML.format(module=__name__), encoding="utf-8")
             return parse_training_args([str(yaml_path), *overrides])
 
+    def test_monitor_configuration_has_one_sampling_vocabulary(self) -> None:
+        """Feature: Monitor YAML. Description: Typed overrides. Expectation: No duplicate cadence keys."""
+        config = self._parse("--monitor.local_loss.enabled=true", "--monitor.local_loss.sampler_steps=2",
+                             "--monitor.local_grad_norm.modules=[model.layers.0]", "--monitor.mfu=true",
+                             "--monitor.sinks=[console,jsonl,wandb]", "--monitor.wandb.mode=offline",
+                             "--monitor.datasets.top_n_tokens=8")
+        self.assertTrue(config.monitor.local_loss.enabled)
+        self.assertEqual(config.monitor.local_loss.sampler_steps, 2)
+        self.assertEqual(config.monitor.local_grad_norm.modules, ["model.layers.0"])
+        self.assertTrue(config.monitor.mfu)
+        self.assertEqual(config.monitor.wandb.mode, "offline")
+        self.assertEqual(config.monitor.datasets.top_n_tokens, 8)
+        self.assertEqual(config.to_dict()["monitor"]["local_loss"]["sampler_steps"], 2)
+        for override in ("--monitor.logging_steps=2", "--monitor.sampler_steps=2",
+                         "--monitor.local_loss.every_n_steps=2", "--monitor.moe.include_children=true"):
+            with self.subTest(override=override), self.assertRaises(ConfigResolutionError):
+                self._parse(override)
+
     def test_reads_yaml_without_overrides(self) -> None:
         """YAML values survive, and the callable default is filled in."""
         config = self._parse()

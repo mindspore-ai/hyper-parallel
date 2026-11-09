@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 class LoggingCallback(Callback):
-    """Log shared step metrics on global rank zero without breaking tqdm."""
+    """Log shared step metrics on global rank zero through the shared output writer."""
 
     def __init__(self, trainer: Any) -> None:
         """Initialize the configured logging cadence.
@@ -58,14 +58,6 @@ class LoggingCallback(Callback):
             for name, value in sorted(metrics.items())
         )
         return " ".join(fields)
-
-    def _write(self, message: str) -> None:
-        """Write through the active tqdm bar or fall back to standard logging."""
-        tqdm_callback = getattr(self.trainer, "tqdm_callback", None)
-        tqdm_write = getattr(tqdm_callback, "write", None)
-        if callable(tqdm_write) and tqdm_write(message):
-            return
-        logger.info("%s", message)
 
     def on_step_end(
         self,
@@ -99,5 +91,9 @@ class LoggingCallback(Callback):
                 metrics["training/router_aux_loss"] = float(aux_loss)
         if not metrics:
             return
-        self._write(self._format_message(state, metrics))
+        monitor = getattr(self.trainer, "monitor", None)
+        if monitor is not None and monitor.enabled:
+            monitor.log_step(state, metrics)
+        else:
+            logger.info("%s", self._format_message(state, metrics))
         self._last_logged_step = state.global_step

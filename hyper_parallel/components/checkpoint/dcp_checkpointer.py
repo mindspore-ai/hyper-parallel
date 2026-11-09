@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional
 import torch  # pylint: disable=forbidden-backend-import
 import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.components.monitor import statistics_completion
 from hyper_parallel import SkipDTensorDispatch
 from hyper_parallel.components.optim.mixed_precision_optimizer import (
     FP32_MAIN_PARAM_STATE_KEY,
@@ -626,11 +627,14 @@ class DistributedCheckpointer(CheckpointerBase):
             # a run that dies after an async save has landed but before the
             # next save would otherwise leave a complete checkpoint on disk
             # that the pointer never names.
+            completion = statistics_completion("checkpoint_persist")
             self._async_save_response = dcp_async_save(
                 payload,
                 checkpoint_id=path,
                 callback=partial(self._publish_latest, path, global_step),
             )
+            if completion is not None:
+                self._async_save_response.persist_completion.add_done_callback(completion)
             logger.info("Async DCP save dispatched: %s", path)
         else:
             dcp_save(payload, checkpoint_id=path)

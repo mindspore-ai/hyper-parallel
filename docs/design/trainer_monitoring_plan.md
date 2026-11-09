@@ -1,6 +1,7 @@
 # 通用 Trainer 训练监控与日志改造方案
 
-状态：设计草案，尚未实现。新增接口、文件名和配置字段为建议。
+状态：monitor_dev 已接入通用 Trainer 实现；当前能力、配置和未完成的设备验收见 [使用与实现边界](../trainer_monitor_usage.md)。
+本文件保留目标设计与验收要求，不能将设计条目全部视为已验收。
 范围：`hyper_parallel/trainer`；需求来源为 [Issue #1174](https://github.com/mindspore-ai/hyper-parallel/issues/1174)。
 基线：`upstream/master@c75f5f9f`，2026-11-05 的 Qwen3.6 MoE 纯文本 20-step 实跑。
 
@@ -155,7 +156,7 @@ flowchart TB
 ### 1.3 最终 YAML 配置形态（设计草案）
 
 以下展示改造后训练 YAML 中的 `monitor` 配置段，其他模型、数据和并行配置保持各自入口。
-这是拟实现的配置接口，尚不能直接用于当前 master；可选的细粒度采集默认关闭。
+此配置接口已在 monitor_dev 接入，未表示 master 已包含；可选的细粒度采集默认关闭。
 不再提供 tqdm 或独立 debug 配置。
 
 ```yaml
@@ -555,7 +556,8 @@ NS 迭代输出矩阵 norm；可选迭代前 norm 与相对变化。按采样频
 | Attention 核心 QKᵀ / AV | 按 Q/K 长度、query heads、head_dim 和有效 query-key 对数 A 计算，两次矩阵乘 forward 为 `4 × A × query_heads × head_dim`，backward 按梯度路径计入；causal-triangular/full-square 明确版本。QKV/O 投影由 Linear 块计数，禁止重复 |
 | Dense FFN / SwiGLU | 作为组合节点，展开 gate/up/down（或实际两层）Linear；不另加一份父 FFN 总量 |
 | Routed / shared expert FFN | routed 标准模型工作量按有效输入 token × top-k 分配到 expert 块；共享 expert 按实际声明计入。dispatch padding、drop、路由实际负载另报差异，不静默改变标准 MFU 分子 |
-| GDN / MLA / 其他非标准计算 | adapter 注册可复用的计算块公式与几何；投影部分复用 Linear，其余核单独核算。未覆盖时标记 incomplete，不冒充普通 Attention |
+| GDN | QKV/Z/alpha/beta/output 复用 Linear，depthwise causal convolution 与 delta-rule core 独立记账；Qwen3.6 等维 GDN core forward 使用 `8×T×Hv×D²`，训练乘 3；完整公式与本地验收见 [实现说明](../trainer_monitor_usage.md#gdn-分块公式与-qwen36-覆盖) |
+| MLA / 其他非标准计算 | adapter 注册可复用的计算块公式与几何；投影部分复用 Linear，其余核单独核算。未覆盖时标记 incomplete，不冒充普通 Attention |
 | 重计算 / 通信 / optimizer / 轻量算子 | 重计算、通信、optimizer 不进入本方案标准 MFU 分子；norm、激活、RoPE 等是否忽略在公式版本中明确列出，不将未知大块归为“轻量忽略” |
 
 ```text
@@ -868,7 +870,7 @@ LoRA/frozen 路径对 forward、输入梯度、权重梯度使用不同系数，
 
 来源：[固定提交 count_flops.py](https://github.com/ByteDance-Seed/VeOmni/blob/617cc0fb7d7af70c07f4507fc31d871f4eef55d0/veomni/utils/count_flops.py)。
 
-**对 HyperParallel 的设计结论（建议，尚未实现）：**
+**对 HyperParallel 的设计结论（实现进度见使用文档）：**
 
 1. 采用第 2.9 节确定的标准模块分块方案：adapter 声明块组成、通用块公式求和、运行时提供几何、指标层计时/归一化。
 2. 保持 `training.log_tflops` 与 `monitor.mfu` 分别控制输出；分块明细可用于诊断，完整覆盖且峰值可信时输出 `mfu_percent`。
