@@ -28,6 +28,7 @@ from unittest.mock import MagicMock, call, patch
 
 import torch  # pylint: disable=C0413
 
+from hyper_parallel.core.activation_memory.api import checkpoint_wrapper, checkpoint_exclude_wrapper, swap_wrapper
 from hyper_parallel.components.modules.moe_utils import (  # pylint: disable=C0413
     MoEMonitorCallback,
     sync_and_update_expert_bias,
@@ -167,6 +168,46 @@ class TestSyncAndUpdateExpertBias(unittest.TestCase):
 
 class TestMoEMonitorCallback(unittest.TestCase):
     """Unit tests for MoEMonitorCallback (Layer 1+2 of the three-layer architecture)."""
+
+    @patch("hyper_parallel.components.modules.moe_utils.sync_and_update_expert_bias")
+    def test_wrapped_router_is_counted_once(self, mock_sync):
+        """Checkpointing leaves logical layer weights and bias-update count unchanged."""
+        for wrap in (checkpoint_wrapper, checkpoint_exclude_wrapper, swap_wrapper):
+            for wrap_parent in (False, True):
+                with self.subTest(wrapper=wrap.__name__, wrap_parent=wrap_parent):
+                    routers = [torch.nn.Identity(), torch.nn.Identity()]
+                    for router, value in zip(routers, (1.2, 0.9)):
+                        router.last_aux_loss = torch.tensor(value)
+                        router.enable_expert_bias = True
+                    model = torch.nn.ModuleList(routers)
+                    if wrap_parent:
+                        model = wrap(model)
+                    else:
+                        model[1] = wrap(routers[1])
+                    monitor = MoEMonitorCallback(model)
+                    torch.testing.assert_close(monitor.last_mean_aux_loss, torch.tensor(1.05))
+                    mock_sync.reset_mock()
+                    monitor.on_step_end()
+                    self.assertEqual([call.args[0] for call in mock_sync.call_args_list], routers)
+
+    def test_buffer_and_property_metrics_are_observable(self):
+        """Router metrics need not be stored in the module's instance dictionary."""
+        class PropertyRouter(torch.nn.Identity):
+            """Expose a buffer through the router metric protocol."""
+
+            @property
+            def last_aux_loss(self) -> torch.Tensor:
+                """Return the latest router metric."""
+                return self.aux_loss
+
+        direct = torch.nn.Identity()
+        direct.register_buffer("last_aux_loss", torch.tensor(1.2))
+        indirect = PropertyRouter()
+        indirect.register_buffer("aux_loss", torch.tensor(0.9))
+        model = torch.nn.ModuleList([direct, checkpoint_wrapper(indirect)])
+        monitor = MoEMonitorCallback(model)
+
+        torch.testing.assert_close(monitor.last_mean_aux_loss, torch.tensor(1.05))
 
     def _make_model_with_moe_layers(self, num_layers: int = 2,
                                     num_experts_list: list = None,

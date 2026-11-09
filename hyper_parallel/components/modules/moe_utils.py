@@ -20,6 +20,8 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from hyper_parallel.core.activation_memory.wrapper import ActivationWrapper
+
 if TYPE_CHECKING:
     from hyper_parallel.components.modules.moe import MoE
 
@@ -168,10 +170,11 @@ class MoEMonitorCallback:
         no autograd graph in production. Auxiliary loss remains observable
         when expert-bias updates are disabled.
         """
+        # Transparent wrappers expose the same router; its child owns the metric.
         aux_losses = [
             module.last_aux_loss
             for module in self.model.modules()
-            if getattr(module, "last_aux_loss", None) is not None
+            if not isinstance(module, ActivationWrapper) and getattr(module, "last_aux_loss", None) is not None
         ]
         return torch.stack(aux_losses).mean() if aux_losses else None
 
@@ -186,7 +189,7 @@ class MoEMonitorCallback:
         bias updates do not synchronize device scalars for logging each step.
         """
         for moe in self.model.modules():
-            if not getattr(moe, "enable_expert_bias", False):
+            if isinstance(moe, ActivationWrapper) or not getattr(moe, "enable_expert_bias", False):
                 continue
             sync_and_update_expert_bias(
                 moe,
