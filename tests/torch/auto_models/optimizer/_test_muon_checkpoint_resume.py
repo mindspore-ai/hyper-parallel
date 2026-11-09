@@ -228,9 +228,8 @@ def _train_step(
     loss = mean_global_loss(
         local_loss,
         {"foundation_tokens": token_count},
-        {"foundation_tokens": token_count},
         distributed_setup.mesh_context,
-    )["foundation_loss"]
+    )["foundation_loss"] / labels.numel()
     loss.backward()
     grad_norm = clip_grad_norm_(model, max_norm=float("inf"))
     with SkipDTensorDispatch(no_skip={torch.zeros_like}):

@@ -1404,7 +1404,7 @@ class TestModelIntegrationContracts(unittest.TestCase):
             "hyper_parallel.trainer.base.clip_grad_norm_",
             return_value=torch.tensor(2.5),
         ) as clip:
-            grad_norm = trainer.prepare_optimizer_step()
+            grad_norm = trainer.clip_grad_norm()
 
         self.assertEqual(float(grad_norm), 2.5)
         clip.assert_called_once_with(trainer.model, 1.0)
@@ -1423,7 +1423,7 @@ class TestModelIntegrationContracts(unittest.TestCase):
             "hyper_parallel.trainer.base.clip_grad_norm_",
             return_value=torch.tensor(2.5),
         ) as clip:
-            grad_norm = trainer.prepare_optimizer_step()
+            grad_norm = trainer.clip_grad_norm()
 
         self.assertEqual(float(grad_norm), 2.5)
         clip.assert_called_once_with(trainer.model, float("inf"))

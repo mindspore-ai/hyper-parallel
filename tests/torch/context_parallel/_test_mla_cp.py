@@ -467,8 +467,7 @@ def _model_fsdp_case(mesh: MeshContext, strategy: str, device: torch.device, *, 
                               position_ids=positions[:, begin:end].contiguous(), use_cache=False).logits
             local_mean = (actual.float() - targets[dp_rank:dp_rank + 1, begin:end]).square().mean()
             counts = {"foundation_tokens": local_tokens.new_tensor(local_tokens.numel())}
-            step_counts = {"foundation_tokens": counts["foundation_tokens"] * 2}
-            loss = mean_global_loss(local_mean, counts, step_counts, mesh)["foundation_loss"]
+            loss = mean_global_loss(local_mean, counts, mesh)["foundation_loss"] / (tokens.numel() * 2)
             loss.backward()
         _compare(actual, expected[dp_rank:dp_rank + 1, begin:end], dtype, "decoder FSDP logits")
         _compare(loss, expected_loss, dtype, "decoder FSDP global loss")

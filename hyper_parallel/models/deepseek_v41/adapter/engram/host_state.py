@@ -187,7 +187,7 @@ class DeepseekV41HostState:
         return all(moe.get_local_rank(name) == 0 for name in
                    ("edp_shard", "edp_replicate") if name in (moe.mesh_dim_names or ()))
 
-    def _prepare_sparse_rows(self) -> None:
+    def _prepare_sparse_rows(self, gradient_divisor: float = 1.0) -> None:
         """Coalesce and synchronize each table before the shared failure gate."""
         mesh = self.mesh_context
         failed = False
@@ -215,7 +215,7 @@ class DeepseekV41HostState:
                 failed = True
                 break
             table.pending = torch.sparse_coo_tensor(
-                synced.indices(), synced.values() / denominator, synced.shape,
+                synced.indices(), synced.values() / (denominator * gradient_divisor), synced.shape,
             ).coalesce()
         if mesh is not None and mesh.pp_size > 1:
             device_type = mesh.device_mesh.device_type
@@ -248,11 +248,17 @@ class DeepseekV41HostState:
             raise RuntimeError("Non-finite combined Engram gradient norm")
         return global_sq.sqrt(), dense_refs
 
-    def prepare_optimizer_step(self, *, max_norm: float) -> GradientPreparation:
-        """Synchronize sparse rows and clip them with dense effective gradients."""
+    def prepare_optimizer_step(self, *, max_norm: float, gradient_divisor: float = 1.0) -> GradientPreparation:
+        """Normalize owned sparse gradients, then clip jointly with dense gradients.
+
+        Args:
+            max_norm: Joint clipping threshold; nonpositive disables clipping.
+            gradient_divisor: Step divisor for sparse gradients only; Trainer has
+                already normalized dense gradients. Defaults to no normalization.
+        """
         if self.optimizer is None or self.optimizer.state != "ACCUMULATING":
             raise RuntimeError("Host gradient preparation requires ACCUMULATING state")
-        self._prepare_sparse_rows()
+        self._prepare_sparse_rows(gradient_divisor)
         norm, dense_refs = self._combined_gradient_norm()
         coefficient = (torch.clamp(max_norm / (norm + 1.0e-6), max=1.0)
                        if max_norm > 0 else torch.ones_like(norm))

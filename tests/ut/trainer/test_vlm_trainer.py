@@ -59,7 +59,8 @@ class TestVLMTrainer(unittest.TestCase):
         base.model_reshard = Mock()
         base.configure_fsdp_gradient_sync = Mock()
         base.begin_fsdp_runtime_diagnostics = Mock()
-        base.prepare_optimizer_step = Mock(return_value=0.5)
+        base.model = torch.nn.Linear(1, 1)
+        base.prepare_optimizer_step = Mock(side_effect=lambda loss, metrics: (loss, 0.5))
         base.step_optimizers_and_schedulers = Mock()
         base._end_model_integration_step = Mock()  # pylint: disable=protected-access
         base._callbacks = [EnvironMeterCallback(base)]  # pylint: disable=protected-access
@@ -116,13 +117,6 @@ class TestVLMTrainer(unittest.TestCase):
                 observed_tokens, expected_tokens,
                 f"expected local tokens={expected_tokens}, got={observed_tokens}",
             )
-            step_counts = trainer.base.step_token_counts
-            observed_tokens = int(step_counts["foundation_tokens"])
-            expected_step_tokens = expected_tokens * num_micro_steps
-            self.assertEqual(
-                observed_tokens, expected_step_tokens,
-                f"expected scaled tokens={expected_step_tokens}, got={observed_tokens}",
-            )
             loss = weight * model_inputs["pixel_values"].mean() / num_micro_steps
             loss.backward()
             events.append(("backward", index))
@@ -158,7 +152,7 @@ class TestVLMTrainer(unittest.TestCase):
             f"expected completed global step=1, got={trainer.base.state.global_step}",
         )
         trainer.base.model_integration.begin_step.assert_called_once_with(1)
-        trainer.base.prepare_optimizer_step.assert_called_once_with()
+        trainer.base.prepare_optimizer_step.assert_called_once()
         trainer.base.step_optimizers_and_schedulers.assert_called_once_with()
 
     @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")

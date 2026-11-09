@@ -48,7 +48,7 @@ from torch.utils.data import Dataset
 from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizerBase
 from transformers.modeling_outputs import ModelOutput
 
-from hyper_parallel import HSDPModule, SkipDTensorDispatch
+from hyper_parallel import DTensor, HSDPModule, SkipDTensorDispatch
 from hyper_parallel.compile.compiler import GraphCompiler
 from hyper_parallel.core.tensor_parallel import loss_parallel
 from hyper_parallel.core.utils import clip_grad_norm_
@@ -62,6 +62,7 @@ from hyper_parallel.data.dataset_logging import enable_dataset_logging
 from hyper_parallel.data.batching import build_dataloader
 from hyper_parallel.data.parallel import DataLoaderParallelContext, create_dataloader_parallel_context
 from hyper_parallel.trainer.runtime.distributed import (
+    all_reduce,
     get_global_rank_safe,
     get_local_rank_safe,
     get_world_size_safe,
@@ -623,7 +624,6 @@ class BaseTrainer(Stateful, ABC):
             model_inputs: Dict[str, Any],
             labels: Optional[torch.Tensor],
             current_token_counts: Dict[str, torch.Tensor],
-            step_token_counts: Dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Capture forward/loss with explicit runtime token counts."""
         model_fwd_context = (
@@ -638,7 +638,6 @@ class BaseTrainer(Stateful, ABC):
         loss, loss_dict = self.postforward(
             outputs, labels,
             current_token_counts=current_token_counts,
-            step_token_counts=step_token_counts,
         )
         return loss, loss_dict
 
@@ -777,7 +776,6 @@ class BaseTrainer(Stateful, ABC):
             self, outputs: ModelOutput, labels: Optional[torch.Tensor],
             *,
             current_token_counts: Dict[str, torch.Tensor],
-            step_token_counts: Dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Postprocess model outputs after forward pass.
 
@@ -785,19 +783,25 @@ class BaseTrainer(Stateful, ABC):
             outputs: Model outputs consumed by the configured loss.
             labels: Labels associated with the current micro-batch.
             current_token_counts: Per-loss token counts for the current micro-batch.
-            step_token_counts: Per-loss token counts for the optimizer step.
 
         Returns:
             Backward loss and named globally aggregated loss values.
         """
         local_loss = self.loss_fn(model_output=outputs, labels=labels)
-        foundation_loss = local_loss.get("foundation_loss") if isinstance(local_loss, dict) else local_loss
-        if foundation_loss is not None:
-            bind_aux_loss_scale(foundation_loss)
+        # Names are static graph metadata; diagnostics added below are not losses.
+        self.loss_names = tuple(local_loss) if isinstance(local_loss, dict) else ("foundation_loss",)
+        # Every foundation-family objective receives the same external token weight.
+        # Bind each branch before backward can reach its independently injected losses.
+        foundation_losses = (
+            (value for key, value in local_loss.items() if key.split("_loss", maxsplit=1)[0] == "foundation")
+            if isinstance(local_loss, dict) else (local_loss,)
+        )
+        for foundation_loss in foundation_losses:
+            if foundation_loss is not None:
+                bind_aux_loss_scale(foundation_loss)
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
             local_loss,
             current_token_counts,
-            step_token_counts,
             device_mesh=self.mesh,
         )
         loss = torch.stack(list(loss_dict.values())).sum()
@@ -835,6 +839,8 @@ class BaseTrainer(Stateful, ABC):
         Returns:
             Backward loss and the named globally aggregated loss mapping.
         """
+        for name, count in self.current_token_counts.items():
+            self.step_token_counts[name] = self.step_token_counts.get(name, 0) + count.detach()
         channel_loss_callback = getattr(self, "channel_loss_callback", None)
         micro_step_context = (
             channel_loss_callback.micro_step_context(self.state, micro_batch)
@@ -884,7 +890,6 @@ class BaseTrainer(Stateful, ABC):
                     model_inputs=micro_batch,
                     labels=labels,
                     current_token_counts=self.current_token_counts,
-                    step_token_counts=self.step_token_counts,
                 )
             else:
                 model_fwd_context = (
@@ -899,7 +904,6 @@ class BaseTrainer(Stateful, ABC):
                 loss, loss_dict = self.postforward(
                     outputs, labels,
                     current_token_counts=self.current_token_counts,
-                    step_token_counts=self.step_token_counts,
                 )
                 prefetch_plan = getattr(self.train_dataloader, "prefetch_plan", None)
                 if callable(prefetch_plan):
@@ -969,14 +973,61 @@ class BaseTrainer(Stateful, ABC):
             )
             self.fsdp_runtime_diagnostics.validate_before_optimizer_step()
 
-    def prepare_optimizer_step(self) -> Any:
+    def begin_loss_step(self) -> None:
+        """Reset scalar counters before reading the next optimizer step."""
+        self.step_token_counts = {}
+
+    def _loss_denominator(self) -> float:
+        """Return the optimizer-step valid-token count across DP/CP."""
+        family = self.loss_names[0].split("_loss", maxsplit=1)[0]
+        count = self.step_token_counts[f"{family}_tokens"].detach().clone()
+        mesh = self.mesh.dp_cp_mesh
+        if mesh is not None and mesh.size() > 1:
+            count = all_reduce(count.to(self.device), op="sum", group=mesh.get_group())
+        else:
+            count = count.item()
+        return max(count, 1)
+
+    @torch.no_grad()
+    def loss_normalize(self, loss: float, loss_dict: Dict[str, float], *, denominator: float | None = None) -> float:
+        """Normalize Trainer-owned gradients and loss metrics before clipping.
+
+        External providers expose their owned parameters through ``parameters``
+        and normalize those gradients in ``prepare_optimizer_step`` instead.
+        """
+        if denominator is None:
+            denominator = self._loss_denominator()
+        external = get_model_external_state(self.model)
+        excluded = {id(param) for param in external.parameters.values()} if external is not None else set()
+        with SkipDTensorDispatch():
+            for parameter in self.model.parameters():
+                if id(parameter) in excluded:
+                    continue
+                grad = getattr(parameter, "main_grad", None)
+                if grad is None:
+                    grad = parameter.grad
+                if grad is not None:
+                    if isinstance(grad, DTensor):
+                        grad = grad.to_local()
+                    grad.div_(denominator)
+        for name in self.loss_names:
+            loss_dict[name] /= denominator
+        return loss / denominator
+
+    def prepare_optimizer_step(self, loss: float, loss_dict: Dict[str, float]) -> tuple[float, Any]:
+        """Normalize the step objective before clipping and optimizer preparation."""
+        denominator = self._loss_denominator()
+        loss = self.loss_normalize(loss, loss_dict, denominator=denominator)
+        return loss, self.clip_grad_norm(gradient_divisor=denominator)
+
+    def clip_grad_norm(self, *, gradient_divisor: float = 1.0) -> Any:
         """Run pre-optimizer diagnostics and clipping in their required order."""
         self.model_integration.after_backward_before_clip()
         self.validate_fsdp_runtime_before_optimizer()
         max_grad_norm = self.config.training.max_grad_norm
         external = get_model_external_state(self.model)
         if external is not None:
-            preparation = external.prepare_optimizer_step(max_norm=max_grad_norm)
+            preparation = external.prepare_optimizer_step(max_norm=max_grad_norm, gradient_divisor=gradient_divisor)
             self.model_integration.after_clip(preparation.post_clip_norm)
             return preparation.global_norm
         grad_norm: Any = 0.0
@@ -1076,7 +1127,7 @@ class BaseTrainer(Stateful, ABC):
         total_loss_dict = defaultdict(int)
 
         # token num for fixed_ce_loss in postforward
-        self.step_token_counts = count_loss_token(micro_batches)
+        self.begin_loss_step()
         num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):
@@ -1094,7 +1145,7 @@ class BaseTrainer(Stateful, ABC):
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
 
-        grad_norm = self.prepare_optimizer_step()
+        total_loss, grad_norm = self.prepare_optimizer_step(total_loss, total_loss_dict)
         self.step_optimizers_and_schedulers()
 
         grad_norm_value = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
