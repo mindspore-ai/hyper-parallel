@@ -41,13 +41,17 @@ import functools
 import math
 import warnings
 from collections import defaultdict, namedtuple
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
 
 from hyper_parallel.core.dtensor.placement_types import Partial
+
+if TYPE_CHECKING:
+    from hyper_parallel.core.dtensor.layout import Layout
 
 try:
     from torch.utils._foreach_utils import (
@@ -347,6 +351,7 @@ def _get_local_grad(param: torch.nn.Parameter) -> Optional[torch.Tensor]:
 
 def _get_param_mesh_info(
     param: torch.nn.Parameter,
+    parameter_layout: Optional["Layout"] = None,
 ) -> Tuple[
     Optional[object],
     Tuple[int, ...],
@@ -368,19 +373,34 @@ def _get_param_mesh_info(
     grad = _get_grad_obj(param)
     # Prefer grad's spec (most accurate); fall back to param's.
     spec_source = grad if _is_dtensor(grad) else param
-    if not _is_dtensor(spec_source):
-        return None, (), ()
+    if parameter_layout is None:
+        if not _is_dtensor(spec_source):
+            return None, (), ()
+        placements = spec_source.placements
+        mesh = spec_source.device_mesh
+    else:
+        layout = spec_source.layout if _is_dtensor(spec_source) else None
+        if layout is not None and (
+            layout.mesh_shape, layout.rank_list, layout.alias_name, layout.placements, layout.tensor_shape
+        ) != (
+            parameter_layout.mesh_shape, parameter_layout.rank_list, parameter_layout.alias_name,
+            parameter_layout.placements, parameter_layout.tensor_shape
+        ):
+            raise ValueError("Explicit parameter layout conflicts with its DTensor layout")
+        layout = layout if layout is not None else parameter_layout
+        placements = layout.placements
+        mesh = layout.mesh
 
     shard_dims = tuple(
-        i for i, p in enumerate(spec_source.placements)
+        i for i, p in enumerate(placements)
         if p.is_shard()
     )
     partial_info = tuple(
         (i, *_str_to_reduce_op(p.reduce_op))
-        for i, p in enumerate(spec_source.placements)
+        for i, p in enumerate(placements)
         if isinstance(p, Partial)
     )
-    return spec_source.device_mesh, shard_dims, partial_info
+    return mesh, shard_dims, partial_info
 
 
 def _sum_p_norms(
@@ -851,6 +871,7 @@ def _coalesce_partial_reduce(  # pylint: disable=R0914
 
 def _build_grad_groups(  # pylint: disable=R0914
     params: List[torch.Tensor],
+    parameter_layouts: Optional[Mapping[torch.nn.Parameter, "Layout"]] = None,
 ) -> Tuple[
     Dict[_GradGroupKey, List[torch.Tensor]],
     List[torch.Tensor],
@@ -890,7 +911,13 @@ def _build_grad_groups(  # pylint: disable=R0914
     device: Optional[torch.device] = None
 
     for param in params:
-        mesh, shard_dims, partial_info = _get_param_mesh_info(param)
+        if parameter_layouts is None:
+            mesh, shard_dims, partial_info = _get_param_mesh_info(param)
+        else:
+            layout = parameter_layouts.get(param)
+            if layout is None and not _is_dtensor(param) and not _is_dtensor(_get_grad_obj(param)):
+                raise ValueError("Explicit layouts must cover every local parameter participating in clipping")
+            mesh, shard_dims, partial_info = _get_param_mesh_info(param, layout)
         key: _GradGroupKey = (
             id(mesh) if mesh is not None else None, shard_dims,
         )
@@ -1004,6 +1031,8 @@ def clip_grad_norm_(
     norm_type: float = 2.0,
     error_if_nonfinite: bool = False,
     foreach: Optional[bool] = None,
+    *,
+    parameter_layouts: Optional[Mapping[torch.nn.Parameter, "Layout"]] = None,
 ) -> torch.Tensor:
     """Compute and clip gradient norm for distributed models.
 
@@ -1040,6 +1069,10 @@ def clip_grad_norm_(
             implementation for devices that support it and silently
             fall back to the per-tensor implementation for others.
             Default ``None``.
+        parameter_layouts: Optional parameter-identity mapping to final HyperParallel
+            Layouts for local tensors. DTensor gradient/parameter layouts take
+            precedence and must agree with explicit metadata. Local trainable
+            parameters must be fully covered; frozen parameters are ignored.
 
     Returns:
         The total (unclipped) gradient norm as a scalar tensor,
@@ -1049,11 +1082,16 @@ def clip_grad_norm_(
     norm_type = float(norm_type)
 
     params = _normalize_parameters(parameters)
+    if parameter_layouts is not None:
+        params = [param for param in dict.fromkeys(params) if param.requires_grad]
+        if foreach is None:
+            foreach = False
 
     (
         grad_groups, all_grads, norm_grads, key_per_grad,
         mesh_cache, device, has_dtensor_grad,
-    ) = _build_grad_groups(params)
+    ) = (_build_grad_groups(params) if parameter_layouts is None
+         else _build_grad_groups(params, parameter_layouts))
 
     # -- Norm + clip (all ranks participate) --------------------------------
     # _compute_local_norm returns identity elements for empty groups,

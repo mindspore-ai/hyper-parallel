@@ -45,7 +45,7 @@ import torch
 from torch import nn
 
 from hyper_parallel.compile.graph_parallel_plan import GraphParallelPlan
-from hyper_parallel.compile.pass_config import PassConfig
+from hyper_parallel.compile.pass_config import GradientReduction, PassConfig
 from hyper_parallel.compile.passes.parallel.fsdp_pass import (
     FSDPPass,
     _free_tensor_storage,
@@ -339,6 +339,7 @@ class TestReshardStructure(unittest.TestCase):
             FSDPPass().run(
                 graph, PassConfig(fsdp_degree=4, fsdp_reshard_after_forward=True), model=live,
                 expert_param_names={expert_name}, expert_fsdp_group_name="edp", fsdp_group_name="fsdp",
+                gradient_reductions={expert_name: GradientReduction("sum", 4)},
             )
         graph.graph.lint()
         backward = [node for node in graph.graph.nodes if node.meta.get("comm_type") == "fsdp_all_gather_backward"]

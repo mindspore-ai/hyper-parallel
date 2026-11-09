@@ -34,16 +34,21 @@ tracer tests validate; only the compiler wiring is asserted here.
 """
 
 import os
+from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
-
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
 from torch import nn
 
 from hyper_parallel.compile.compiler import GraphCompiler
 from hyper_parallel.compile.pass_config import PassConfig
+from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
+from hyper_parallel.distributed.mesh import MeshContext
+from hyper_parallel.models.build_options import FSDP2Config
+
+os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 
 def _make_model() -> nn.Linear:
@@ -64,6 +69,99 @@ def _fixed_batch():
 
 class TestGraphCompilerForwardBackward(unittest.TestCase):
     """``compile`` / lazy ``forward_backward`` without distributed."""
+
+    def test_unit_bindings_reach_passes_with_tied_expert(self) -> None:
+        """Claim nested experts before the root and keep every alias on EDP."""
+        model = nn.Module()
+        model.dense = nn.Linear(4, 4, bias=False)
+        model.mlp = nn.Module()
+        model.mlp.experts = nn.Linear(4, 4, bias=False)
+        model.tied_expert = model.mlp.experts.weight
+        dense = init_device_mesh("cpu", (4, 1), mesh_dim_names=("fsdp_shard", "tp"),
+                                 rank_list=(0, 1, 2, 3), init_backend=False)
+        expert = init_device_mesh("cpu", (2, 2), mesh_dim_names=("edp_shard", "ep"),
+                                  rank_list=(0, 1, 2, 3), init_backend=False)
+        compiler = GraphCompiler(
+            model, _mse_train_fn, PassConfig(fsdp_enabled=True), device=torch.device("cpu"),
+            trainer_config=SimpleNamespace(fsdp_config=FSDP2Config(dp_shard_size=4, edp_shard_size=2)),
+            mesh_context=MeshContext(fsdp_non_moe_mesh=dense, fsdp_moe_mesh=expert, dp_size=4, ep_size=2),
+            source_shard_info={"dense.weight": ((Replicate(),), dense["tp"]),
+                               "mlp.experts.weight": ((Shard(0),), expert["ep"])},
+        )
+        with patch.object(compiler, "_register_mesh_group") as register:
+            compiler._bind_parameter_meshes()
+            kwargs = compiler._build_pass_kwargs()
+        groups = kwargs["parameter_groups"]
+        registered = {call.args[0]: call.args[1] for call in register.call_args_list}
+        self.assertEqual(len(registered), 2)
+        self.assertEqual(groups["tied_expert"], groups["mlp.experts.weight"])
+        self.assertEqual(groups["tied_expert"][1], 2)
+        self.assertEqual(groups["dense.weight"][1], 4)
+        self.assertIs(registered[groups["tied_expert"][0]], expert["edp_shard"])
+        self.assertIs(registered[groups["dense.weight"][0]], dense["fsdp_shard"])
+        self.assertIs(model.tied_expert, model.mlp.experts.weight)
+        self.assertFalse(hasattr(model, "hsdp_scheduler"))
+        self.assertFalse(hasattr(model.mlp.experts, "hsdp_scheduler"))
+
+    def test_external_parameters_rejected_before_compile_side_effects(self) -> None:
+        """Reject external parameters at explicit and lazy graph entry points."""
+        x, y = _fixed_batch()
+        for fsdp_enabled in (False, True):
+            for entry_point in ("compile", "forward_backward"):
+                with self.subTest(fsdp_enabled=fsdp_enabled, entry_point=entry_point):
+                    model = _make_model()
+                    compiler = GraphCompiler(
+                        model, _mse_train_fn, PassConfig(fsdp_enabled=fsdp_enabled, ac_mode="full"),
+                        device=torch.device("cpu"),
+                    )
+                    model._hp_external_state = SimpleNamespace(parameters={"weight": model.weight})
+                    preparation = MagicMock()
+                    compiler.set_pytree_pre_hook(preparation.pytree)
+                    with (
+                        patch.object(compiler, "_init_device_mesh", preparation.mesh),
+                        patch("hyper_parallel.compile.compiler.prepare_activation_checkpoint", preparation.checkpoint),
+                        patch("hyper_parallel.compile.compiler.trace_model_graph", preparation.trace),
+                        self.assertRaisesRegex(ValueError, "externally managed parameters"),
+                    ):
+                        getattr(compiler, entry_point)(x=x, y=y)
+                    self.assertEqual(preparation.mock_calls, [])
+
+    def test_empty_external_state_preserves_loss_and_gradients(self) -> None:
+        """An empty provider leaves ordinary graph execution numerically unchanged."""
+        model = _make_model()
+        x, y = _fixed_batch()
+        expected_loss = _mse_train_fn(model, x=x, y=y)
+        expected_grads = torch.autograd.grad(expected_loss, tuple(model.parameters()))
+        compiler = GraphCompiler(model, _mse_train_fn, device=torch.device("cpu"))
+        model._hp_external_state = SimpleNamespace(parameters={})
+
+        compiler.compile(x=x, y=y)
+        loss, _ = compiler.forward_backward(x=x, y=y)
+
+        torch.testing.assert_close(loss, expected_loss, rtol=0, atol=0)
+        for parameter, expected in zip(model.parameters(), expected_grads):
+            torch.testing.assert_close(parameter.grad, expected, rtol=0, atol=0)
+
+    def test_parameter_layouts_are_lazy_and_refresh_replaced_parameters(self):
+        """Only final physical storage is described; no gradient references are cached."""
+        model = _make_model()
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("fsdp_shard",),
+                                rank_list=(0,), init_backend=False)
+        compiler = GraphCompiler(model, _mse_train_fn, PassConfig(fsdp_enabled=False),
+                                 mesh_context=MeshContext(fsdp_non_moe_mesh=mesh))
+        self.assertIsNone(compiler.parameter_layouts)
+        x, y = _fixed_batch()
+        compiler.forward_backward(x=x, y=y)
+        first = compiler.parameter_layouts
+        self.assertIs(compiler.parameter_layouts, first)
+        old = model.weight
+        model.weight = nn.Parameter(old.detach().clone())
+        updated = compiler.parameter_layouts
+        self.assertIsNot(updated, first)
+        self.assertIn(model.weight, updated)
+        self.assertNotIn(old, updated)
+        self.assertEqual(updated[model.weight].tensor_shape, (4, 4))
+        self.assertFalse(hasattr(compiler, "clip_grad_norm_"))
 
     def test_forward_backward_compiles_lazily_without_dist(self):
         """Test the first ``forward_backward`` compiles and the graph runs.
@@ -532,6 +630,54 @@ class TestGraphCompilerDeviceMesh(unittest.TestCase):
         comp._pp_group_name = "pp"
         self.assertEqual(comp._build_pass_kwargs()["pp_group_name"], "pp")
 
+    def test_build_pass_kwargs_hands_gradient_policy_to_fsdp_pass(self):
+        """Forward the DP loss domain independently of the expert group size."""
+        context = MagicMock(dp_size=8, cp_size=1, tp_size=1, loss_parallel=False, ep_size=4, edp_shard_size=2)
+        comp = GraphCompiler(
+            model=_make_model(), train_fn=_mse_train_fn,
+            pass_config=PassConfig(fsdp_degree=4), device=torch.device("cpu"), mesh_context=context,
+        )
+        self.assertNotIn("gradient_reductions", comp._build_pass_kwargs())
+        comp._expert_param_names = {"weight"}
+        kwargs = comp._build_pass_kwargs()
+        self.assertEqual(set(kwargs["gradient_reductions"]), {"weight"})
+        self.assertEqual(kwargs["gradient_reductions"]["weight"].reduce_op, "sum")
+        self.assertEqual(kwargs["gradient_reductions"]["weight"].divisor, 8)
+        self.assertNotIn("expert_parallel_degree", kwargs)
+        self.assertEqual(kwargs["expert_fsdp_group_name"], "fsdp_expert")
+
+    def test_tp_source_policies_and_replicated_gradients_are_forwarded(self):
+        """Source-sharded weights and tied aliases avoid replicated-TP gradient sums."""
+        model = _make_model()
+        model.register_parameter("alias", model.weight)
+        replica, shard = MagicMock(), MagicMock()
+        replica.is_replicate.return_value = True
+        shard.is_replicate.return_value = False
+        tp = MagicMock(mesh_dim_names=("tp",), rank_list=(0, 1))
+        tp.size.return_value = 2
+        tp.__getitem__.return_value = tp
+        tp.flatten.return_value = tp
+        source = {"weight": ((shard,), tp), "bias": ((replica,), tp)}
+        context = MagicMock(dp_size=4, cp_size=1, tp_size=2, loss_parallel=False)
+        comp = GraphCompiler(model, _mse_train_fn, PassConfig(fsdp_degree=4),
+                             mesh_context=context, source_shard_info=source)
+        with patch.object(comp, "_register_mesh_group") as register:
+            kwargs = comp._build_pass_kwargs()
+        self.assertEqual(set(kwargs["gradient_reductions"]), {"weight", "bias", "alias"})
+        self.assertTrue(all(policy.reduce_op == "sum" and policy.divisor == 8
+                            for policy in kwargs["gradient_reductions"].values()))
+        self.assertEqual(kwargs["source_gradient_groups"], {"bias": "fsdp_source_0"})
+        register.assert_called_once_with("fsdp_source_0", tp)
+        self.assertIs(comp.source_layout_for_parameter("alias"), source["weight"])
+
+    def test_tp_requires_source_layout_before_capture(self):
+        """Localized TP parameters cannot silently lose their gradient-sync semantics."""
+        context = MagicMock(tp_size=2, ep_size=1)
+        for source in (None, {}):
+            comp = GraphCompiler(_make_model(), _mse_train_fn, mesh_context=context, source_shard_info=source)
+            with self.subTest(source=source), self.assertRaisesRegex(ValueError, "Graph TP requires source_shard_info"):
+                comp.compile()
+
     def test_init_device_mesh_pp_rejects_invalid_topology(self):
         """Test PP rejects an external MeshContext, HSDP, and untiled degrees."""
         cases = (
@@ -578,6 +724,7 @@ class TestGraphCompilerDeviceMesh(unittest.TestCase):
         mock_non_moe.__getitem__.side_effect = {
             "fsdp_replicate": repl_sub,
             "fsdp_shard": shard_sub,
+            ("fsdp_replicate", "fsdp_shard"): MagicMock(),
         }.__getitem__
         mesh_context = MagicMock()
         mesh_context.ep_size = 1
@@ -647,6 +794,91 @@ class TestGraphCompilerDeviceMesh(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             comp._init_device_mesh(mesh_context)
         self.assertIn("dp_shard_size", str(ctx.exception))
+
+
+class TestParameterLayoutMeshFallback(unittest.TestCase):
+    """Standalone compilers retain the meshes chosen during initialization."""
+
+    def test_plain_graph_layouts_without_distributed_initialization(self):
+        """Lazy metadata access needs neither FSDP wrapping nor process groups."""
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("fsdp_shard",),
+                                rank_list=(0,), init_backend=False)
+        for enabled in (False, True):
+            with self.subTest(fsdp_enabled=enabled):
+                model = _make_model()
+                compiler = GraphCompiler(model, _mse_train_fn, pass_config=PassConfig(fsdp_enabled=enabled),
+                                         mesh_context=MeshContext(fsdp_non_moe_mesh=mesh))
+                with patch("hyper_parallel.compile.compiler.dist.is_initialized", return_value=False), \
+                        patch.object(compiler, "_register_mesh_group") as register:
+                    compiler.compile(x=torch.ones(2, 4), y=torch.zeros(2, 4))
+                    layouts = compiler.parameter_layouts
+                register.assert_not_called()
+                self.assertEqual(layouts[model.weight].placements, (Replicate(),))
+                self.assertEqual(layouts[model.weight].tensor_shape, tuple(model.weight.shape))
+
+    def test_dense_and_expert_layouts_without_fsdp_config(self):
+        """Fallback retains source EP sharding even for a singleton EDP axis."""
+        for ep in (4, 8):
+            with self.subTest(ep=ep):
+                dense = init_device_mesh("cpu", (8,), mesh_dim_names=("fsdp_shard",),
+                                         rank_list=tuple(range(8)), init_backend=False)
+                expert = init_device_mesh("cpu", (8 // ep, ep), mesh_dim_names=("edp_shard", "ep"),
+                                          rank_list=tuple(range(8)), init_backend=False)
+                model = nn.Module()
+                model.dense = nn.Parameter(torch.ones(2, 4))
+                model.experts = nn.Linear(4, 2, bias=False)
+                model.experts.local_expert_count = 2
+                context = MeshContext(fsdp_non_moe_mesh=dense, fsdp_moe_mesh=expert,
+                                      dp_size=8, dp_shard_size=8, ep_size=ep, edp_shard_size=8 // ep)
+                compiler = GraphCompiler(model, _mse_train_fn, mesh_context=context)
+                with patch.object(compiler, "_register_mesh_group"):
+                    compiler._init_device_mesh(context)
+                compiler._bind_parameter_meshes()
+                self.assertEqual(compiler._parameter_meshes, {})
+                compiler._joint_graph = SimpleNamespace(graph_module=SimpleNamespace())
+                layouts = compiler.parameter_layouts
+                self.assertEqual(layouts[model.dense].mesh.mesh_dim_names, ("fsdp_shard",))
+                expert_layout = layouts[model.experts.weight]
+                self.assertEqual(expert_layout.mesh.mesh_dim_names, ("edp_shard", "ep"))
+                self.assertEqual(expert_layout.placements, (Replicate(), Shard(0)))
+                self.assertEqual(expert_layout.tensor_shape, (2 * ep, 4))
+
+    def test_legacy_named_world_metadata_flattens_dp_and_cp(self):
+        """Retain world-only layout queries without a dense mesh or FSDP config."""
+        for replicate in (1, 2):
+            with self.subTest(replicate=replicate):
+                shape = (replicate, 2, 2)
+                mesh = init_device_mesh("cpu", shape, mesh_dim_names=("dp_replicate", "dp_shard", "cp"),
+                                        rank_list=tuple(range(replicate * 4)), init_backend=False)
+                context = MeshContext(device_mesh=mesh, dp_replicate_size=replicate, dp_shard_size=2)
+                model = _make_model()
+                compiler = GraphCompiler(model, _mse_train_fn, PassConfig(fsdp_enabled=False), mesh_context=context)
+                compiler._joint_graph = SimpleNamespace(graph_module=SimpleNamespace())
+                with patch.object(compiler, "_register_mesh_group") as register:
+                    layout = compiler.parameter_layouts[model.weight]
+                register.assert_not_called()
+                expected = ("fsdp_shard",) if replicate == 1 else ("dp_replicate", "fsdp_shard")
+                self.assertEqual(layout.mesh.mesh_dim_names, expected)
+                self.assertEqual(layout.mesh.mesh_shape[-1], 4)
+
+    def test_hsdp_and_named_world_layout_meshes(self):
+        """Use initialized child axes rather than reconstructing mesh selection."""
+        for world_only in (False, True):
+            with self.subTest(world_only=world_only):
+                names = ("dp", "cp", "tp") if world_only else ("fsdp_replicate", "fsdp_shard", "tp")
+                mesh = init_device_mesh("cpu", (2, 2, 2), mesh_dim_names=names,
+                                        rank_list=tuple(range(8)), init_backend=False)
+                context = MeshContext(device_mesh=mesh, fsdp_non_moe_mesh=None if world_only else mesh,
+                                      dp_replicate_size=1 if world_only else 2, dp_shard_size=2)
+                model = _make_model()
+                compiler = GraphCompiler(model, _mse_train_fn, mesh_context=context)
+                with patch.object(compiler, "_register_mesh_group"):
+                    compiler._init_device_mesh(context)
+                expected = ("dp",) if world_only else ("fsdp_replicate", "fsdp_shard")
+                self.assertEqual(compiler._fsdp_mesh.mesh_dim_names, expected)
+                compiler._joint_graph = SimpleNamespace(graph_module=SimpleNamespace())
+                layout_names = expected if world_only else (*expected, "tp")
+                self.assertEqual(compiler.parameter_layouts[model.weight].mesh.mesh_dim_names, layout_names)
 
 
 if __name__ == "__main__":

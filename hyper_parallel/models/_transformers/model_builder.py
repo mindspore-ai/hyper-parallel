@@ -739,6 +739,10 @@ def _apply_fsdp2_with_external(
         source_shard_info,
         ignored_params=ignored_params,
     )
+    if fsdp2_manager is None and source_shard_info is not None:
+        # Local graph parameters retain the planner's source layout for
+        # gradient synchronization and global norm accounting.
+        setattr(model, "_source_shard_info", source_shard_info)
     if external is not None:
         model._hp_external_state = external  # pylint: disable=protected-access
     return model

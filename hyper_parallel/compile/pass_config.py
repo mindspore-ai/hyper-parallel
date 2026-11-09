@@ -33,6 +33,7 @@ Note:
 
 __all__ = [
     "PassConfig",
+    "GradientReduction",
     "PP_SCHEDULES",
     "INDUCTOR_MODES",
     "DP_MODES",
@@ -45,7 +46,7 @@ __all__ = [
 import logging
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 _LOG = logging.getLogger(__name__)
 
@@ -108,6 +109,30 @@ def normalize_dp_mode(mode: str) -> str:
         raise ValueError(f"dp_mode must be a string, got {type(mode).__name__}")
     key = mode.strip().lower()
     return _DP_MODE_ALIASES.get(key, key)
+
+
+@dataclass(frozen=True)
+class GradientReduction:
+    """Reduction operation and a divisor independent of the communication mesh.
+
+    The divisor is applied before communication, matching eager FSDP's
+    reduction-precision scaling and its singleton-group behavior.
+    """
+
+    reduce_op: Literal["avg", "sum"] = "avg"
+    divisor: int = 1
+
+    def __post_init__(self) -> None:
+        if self.reduce_op not in ("avg", "sum"):
+            raise ValueError("Gradient reduction must be 'avg' or 'sum'")
+        if isinstance(self.divisor, bool) or not isinstance(self.divisor, int) or self.divisor < 1:
+            raise ValueError("Gradient divisor must be a positive integer")
+
+    @property
+    def scale(self) -> float | None:
+        """Return the pre-reduction multiplier, or None for an identity scale."""
+        return 1.0 / self.divisor if self.divisor > 1 else None
+
 
 
 @dataclass

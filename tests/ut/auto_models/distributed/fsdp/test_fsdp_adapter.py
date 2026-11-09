@@ -24,7 +24,7 @@ import torch
 from torch import nn
 from torch.multiprocessing.reductions import StorageWeakRef
 
-from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, clear_device_mesh_cache
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, clear_device_mesh_cache, init_device_mesh
 from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 from hyper_parallel.distributed.mesh import MeshContext
@@ -52,6 +52,38 @@ class TestFSDPCustomPrecisionConfig(unittest.TestCase):
         """Isolate mesh metadata between tests."""
         clear_device_mesh_cache()
         self.addCleanup(clear_device_mesh_cache)
+
+    def test_graph_unit_bindings_follow_actual_inner_parameter_claims(self):
+        """Dry unit binding excludes inner/ignored identities without installing hooks."""
+        model = _DecoderModel()
+        model.layers[0].experts = nn.Linear(4, 4, bias=False)
+        model.head.register_parameter("shared", model.layers[0].experts.weight)
+        dense = init_device_mesh("cpu", (2, 2), mesh_dim_names=("fsdp_shard", "tp"),
+                                 rank_list=(0, 1, 2, 3), init_backend=False)
+        expert = init_device_mesh("cpu", (2, 2), mesh_dim_names=("edp_shard", "ep"),
+                                  rank_list=(0, 1, 2, 3), init_backend=False)
+        context = MeshContext(fsdp_non_moe_mesh=dense, fsdp_moe_mesh=expert, tp_size=2)
+        source = {"layers.0.experts.weight": ((Replicate(),), expert["ep"]),
+                  "head.shared": ((Replicate(),), expert["ep"])}
+        manager = FSDP2Manager(FSDP2Config(), context)
+        ignored = {model.layers[1].bias}
+        bindings = manager.parameter_mesh_bindings(model, source, ignored)
+        self.assertEqual(bindings[model.layers[0].experts.weight].mesh_dim_names, ("edp_shard",))
+        self.assertEqual(bindings[model.head.weight].mesh_dim_names, ("fsdp_shard",))
+        self.assertNotIn(model.layers[1].bias, bindings)
+        self.assertEqual(len(bindings), len(list(model.parameters())) - 1)
+        self.assertTrue(all(not getattr(param, "_hsdp_param_initialized", False) for param in model.parameters()))
+
+    def test_preinitialized_parameters_are_absent_from_graph_bindings(self):
+        """An already managed nested parameter is not claimed a second time."""
+        model = _DecoderModel()
+        mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("fsdp_shard",),
+                                rank_list=(0, 1), init_backend=False)
+        model.layers[0].weight._hsdp_param_initialized = True
+        manager = FSDP2Manager(FSDP2Config(), MeshContext(fsdp_non_moe_mesh=mesh))
+        bindings = manager.parameter_mesh_bindings(model, None)
+        self.assertNotIn(model.layers[0].weight, bindings)
+        self.assertIn(model.layers[0].bias, bindings)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
