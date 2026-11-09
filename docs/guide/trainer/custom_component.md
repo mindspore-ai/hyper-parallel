@@ -1,28 +1,30 @@
-# 二次开发指南
+# Extension Guide
 
-HyperParallel 模型训练将 YAML 解析为 `TrainerConfig`，再由任务 Trainer 构建运行对象。`Target` 和 CLI dotted override 的解析规则见 [YAML Trainer 配置结构](yaml_config.md)。
+**English** | [简体中文](custom_component.zh.md)
 
-## 扩展入口
+HyperParallel model training parses YAML into `TrainerConfig`, then a task Trainer constructs runtime objects. See [YAML Trainer Configuration](yaml_config.md) for `Target` and CLI dotted override parsing rules.
 
-| 需求 | 推荐入口 | 是否修改 Trainer |
+## Extension Points
+
+| Requirement | Recommended entry point | Modify Trainer? |
 |---|---|---|
-| 调整已有组件参数 | 修改 YAML 字段或使用 CLI override | 否 |
-| 替换模型子模块或增加并行计划 | 在 `plan_overrides` 中配置匹配规则、替换函数或分片契约 | 否 |
-| 增加模型构建、数据处理、损失函数、优化器或学习率策略 | 实现 Python 类或函数，并通过 `_target_` 引用 | 否 |
-| 支持新的模态资产、模型输入协议或训练循环 | 新增任务 Trainer，复用 `BaseTrainer` 的共享阶段 | 是 |
+| Adjust existing component parameters | Edit YAML fields or use CLI overrides | No |
+| Replace model submodules or add parallel plans | Configure matching rules, replacement functions, or sharding contracts in `plan_overrides` | No |
+| Add model construction, data processing, losses, optimizers, or learning rate policies | Implement a Python class or function and reference it through `_target_` | No |
+| Support new modality assets, model input protocols, or training loops | Add a task Trainer reusing shared `BaseTrainer` phases | Yes |
 
-`plan_overrides` 中的 `_target_` 修改模型内部结构或计算；组件节点的 `_target_` 构建 Trainer 直接使用的模型、数据、Loss、Optimizer 或 Scheduler 对象。
+A `_target_` in `plan_overrides` modifies model internals or computation; a component node's `_target_` constructs a model, data, loss, optimizer, or scheduler object used directly by the Trainer.
 
-## 1. 调整已有组件参数
+## 1. Adjust Existing Component Parameters
 
-改动位置：训练 YAML 或启动命令。
+Edit the training YAML or launch command.
 
 ```yaml
 training:
   train_iters: 10
 ```
 
-同一字段可以由 CLI 覆盖：
+The same field can be overridden through the CLI:
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \
@@ -30,11 +32,11 @@ torchrun --standalone --nproc_per_node=8 \
   --training.train_iters=10
 ```
 
-字段路径从 `TrainerConfig` 根节点开始；字段不存在或值无法转换为声明类型时，解析失败。
+Field paths start at the `TrainerConfig` root. Parsing fails if a field does not exist or its value cannot be converted to the declared type.
 
-## 2. 替换模型子模块或增加并行计划
+## 2. Replace Model Submodules or Add Parallel Plans
 
-模块替换通过 `plan_overrides.replace` 配置；完整字段见 [`PlanOverride` 定义](../../../hyper_parallel/trainer/config/parallelism.py)。
+Configure module replacements through `plan_overrides.replace`; see the [`PlanOverride` definition](../../../hyper_parallel/trainer/config/parallelism.py) for all fields.
 
 ```yaml
 plan_overrides:
@@ -44,54 +46,54 @@ plan_overrides:
       implementation: my_project.modules.replace_rms_norm
 ```
 
-YAML 解析结果为 `list[PlanOverride]`；Trainer 侧先归一化为替换规则（§15.2.6），再由 [`_apply_module_replacement_actions()`](../../../hyper_parallel/models/replacement.py) 应用。接入必须满足：
+YAML parsing produces `list[PlanOverride]`. The Trainer normalizes this into replacement rules (§15.2.6), then [`_apply_module_replacement_actions()`](../../../hyper_parallel/models/replacement.py) applies them. Integration requires:
 
-1. `match` 中的每个路径模式至少命中一个模型子模块；框架从命中的对象取得实际类型。只有需要额外断言预期类型时才填写 `replace.source_type`，此时可配合 `exact_type: true`。
-2. `replace.implementation` 指向训练环境可导入的替换工厂；静态参数可用 `{_target_: 路径, ...}` 映射填写。
-3. 工厂使用 `@module_replacement`，声明 `module`、`module_fqn`、`context` 三个参数，并返回 `torch.nn.Module`。
+1. Each path pattern in `match` must match at least one model submodule; the framework obtains the actual type from matched objects. Set `replace.source_type` only when an additional expected-type assertion is needed, optionally with `exact_type: true`.
+2. `replace.implementation` points to a replacement factory importable in the training environment. Supply static arguments with a `{_target_: path, ...}` mapping.
+3. Decorate the factory with `@module_replacement`, declare `module`, `module_fqn`, and `context` parameters, and return a `torch.nn.Module`.
 
-完整实现可参考 [`RMSNorm`](../../../hyper_parallel/components/modules/rms_norm.py#L31-L82)。
+See [`RMSNorm`](../../../hyper_parallel/components/modules/rms_norm.py#L31-L82) for a complete implementation.
 
-模型族 adapter 按职责统一划分：模块/权重转换位于 `adapter/conversion/`，数据编码、processor、
-transform 和 runtime-input 位于 `adapter/data/`，模型前向合约位于 `adapter/runtime/`，CP/EP
-实现位于 `adapter/distributed/`，并行与重计算策略位于 `adapter/policies/`，验收声明位于
-`adapter/validation/`。没有对应职责的模型无需创建空目录。YAML 通过 `_target_` 直接引用具体实现，
-唯一训练入口为 `models/<family>/recipes/train.yaml`。
+Model-family adapters are organized by responsibility: module/weight conversion in `adapter/conversion/`; data encoding, processors,
+transforms, and runtime inputs in `adapter/data/`; model forward contracts in `adapter/runtime/`; CP/EP
+implementations in `adapter/distributed/`; parallel and recomputation policies in `adapter/policies/`; and acceptance declarations in
+`adapter/validation/`. Do not create empty directories for responsibilities a model does not have. YAML references concrete implementations directly through `_target_`.
+The sole training entry point is `models/<family>/recipes/train.yaml`.
 
-## 3. 接入新的组件实现
+## 3. Integrate New Components
 
-开发者可以在外部编写新的组件实现逻辑，再通过训练 YAML 的 `_target_` 接入，无需修改框架源码。
+Developers can implement components externally and reference them through `_target_` in training YAML without modifying framework source code.
 
-### 3.1 以自定义 Loss 实现为例
+### 3.1 Custom Loss Example
 
-[`TrainerConfig.loss_fn`](../../../hyper_parallel/trainer/config/trainer.py#L54) 是可选的 `Target`。[`BaseTrainer._build_loss()`](../../../hyper_parallel/trainer/base.py#L315-L325) 根据该字段是否配置，确定训练实际使用的 Loss 模块：
+[`TrainerConfig.loss_fn`](../../../hyper_parallel/trainer/config/trainer.py#L54) is an optional `Target`. [`BaseTrainer._build_loss()`](../../../hyper_parallel/trainer/base.py#L315-L325) selects the loss module based on whether this field is configured:
 
-- 配置 `loss_fn` 时，调用 `config.loss_fn.build()` 构建指定实现。
-- 未配置 `loss_fn` 时，创建默认的 [`ModelOutputLoss`](../../../hyper_parallel/components/losses/model_output.py#L26-L58)；该模块从 `model_output.loss` 获取 Loss。
+- When `loss_fn` is configured, `config.loss_fn.build()` constructs the specified implementation.
+- Otherwise, the default [`ModelOutputLoss`](../../../hyper_parallel/components/losses/model_output.py#L26-L58) reads the loss from `model_output.loss`.
 
-无论使用配置实现还是默认实现，构建结果都必须是 `torch.nn.Module`，并保存为 `self.loss_fn`。训练时，[`BaseTrainer.postforward()`](../../../hyper_parallel/trainer/base.py#L517-L530) 按以下方式调用该模块：
+In either case, the constructed object must be a `torch.nn.Module` and is stored as `self.loss_fn`. During training, [`BaseTrainer.postforward()`](../../../hyper_parallel/trainer/base.py#L517-L530) invokes it as follows:
 
 ```python
 self.loss_fn(model_output=outputs, labels=labels)
 ```
 
-普通 post-forward 自定义 `loss_fn` 只需要满足三个条件：
+An ordinary custom post-forward `loss_fn` has three requirements:
 
-1. `_target_` 构建出的对象是 `torch.nn.Module`。
-2. `forward()` 接受 `model_output` 和 `labels` 两个关键字参数。
-3. `forward()` 返回 `torch.Tensor` 或 `dict[str, torch.Tensor]`。
+1. `_target_` constructs a `torch.nn.Module`.
+2. `forward()` accepts the keyword arguments `model_output` and `labels`.
+3. `forward()` returns `torch.Tensor` or `dict[str, torch.Tensor]`.
 
-需要在完整模型输出生成前介入的 loss（例如不生成 full logits 的
-[Chunk Loss](../chunk_loss.md)）还可以实现两个可选生命周期接口：
+Losses that intervene before complete model outputs are generated, such as
+[Chunk Loss](../chunk_loss.md), which avoids full logits, may implement two optional lifecycle interfaces:
 
-1. `bind_model(model, distributed_setup)`：Loss 构建后调用一次，用于绑定已完成 FSDP 的模型族
-   adapter；
-2. `prepare_model_inputs(model_inputs, loss_inputs)`：每个 micro-batch 前调用，把 get-batch runtime
-   产生的独立 loss-only 字段转换为模型内 loss 协议。
+1. `bind_model(model, distributed_setup)`: Called once after loss construction to bind the model-family
+   adapter after FSDP has been applied;
+2. `prepare_model_inputs(model_inputs, loss_inputs)`: Called before each micro-batch to convert the get-batch runtime's
+   separate loss-only fields into the model-integrated loss protocol.
 
-普通 loss 不实现这两个方法时，Trainer 行为保持不变。
+Trainer behavior is unchanged for ordinary losses that do not implement these methods.
 
-以下列 `my_project/losses.py` 为例：
+For example, in `my_project/losses.py`:
 
 ```python
 from typing import Any
@@ -114,7 +116,7 @@ class ScaledModelOutputLoss(torch.nn.Module):
         return model_output.loss * self.scale
 ```
 
-在训练 YAML 中配置该实现：
+Configure the implementation in training YAML:
 
 ```yaml
 loss_fn:
@@ -122,18 +124,18 @@ loss_fn:
   scale: 0.5
 ```
 
-### 3.2 以自定义 Optimizer 实现为例
+### 3.2 Custom Optimizer Example
 
-[`TrainerConfig.optimizer`](../../../hyper_parallel/trainer/config/trainer.py#L51) 是必填的 `Target`。[`BaseTrainer._build_optimizer()`](../../../hyper_parallel/trainer/base.py#L405-L414) 调用 `config.optimizer.build(model=self.model)` 构建配置的 Optimizer 组件，并由 Trainer 传入已构建的模型。
+[`TrainerConfig.optimizer`](../../../hyper_parallel/trainer/config/trainer.py#L51) is a required `Target`. [`BaseTrainer._build_optimizer()`](../../../hyper_parallel/trainer/base.py#L405-L414) calls `config.optimizer.build(model=self.model)` to construct the configured optimizer component, supplying the already-built model.
 
-target 构建完成后，Trainer 调用其 `get_optimizer()`，并将返回值保存为 `self.optimizer`。
+After target construction, the Trainer calls `get_optimizer()` and stores its result as `self.optimizer`.
 
-因此，自定义 Optimizer target 只需要满足两个条件：
+A custom optimizer target therefore has two requirements:
 
-1. 接受 `model` 关键字参数。
-2. 构建出的对象提供 `get_optimizer()`，返回训练循环使用的 Optimizer。
+1. Accept the `model` keyword argument.
+2. Provide `get_optimizer()` on the constructed object, returning the optimizer used by the training loop.
 
-以下列 `my_project/optimizers.py` 为例：
+For example, in `my_project/optimizers.py`:
 
 ```python
 import torch
@@ -147,7 +149,7 @@ class SGDOptimizer:
         return self.optimizer
 ```
 
-在训练 YAML 中配置该实现：
+Configure the implementation in training YAML:
 
 ```yaml
 optimizer:
@@ -155,31 +157,31 @@ optimizer:
   lr: 1.0e-3
 ```
 
-完整实现可参考 [`AdamW`](../../../hyper_parallel/components/optim/builders.py#L37-L107)。
+See [`AdamW`](../../../hyper_parallel/components/optim/builders.py#L37-L107) for a complete implementation.
 
-### 3.3 其他可配置组件
+### 3.3 Other Configurable Components
 
-| 配置字段 | 构建位置 | Trainer 提供的运行时参数 |
+| Configuration field | Construction site | Runtime arguments supplied by the Trainer |
 |---|---|---|
-| `model` | [`BaseTrainer._build_model()`](../../../hyper_parallel/trainer/base.py#L285-L314) | `distributed_setup`、`peft_config`、`activation_checkpoint`、`activation_swap`、`compile_config` |
-| `dataset` | [`BaseTrainer._build_dataset()`](../../../hyper_parallel/trainer/base.py#L334-L349) | `transform`、`tokenizer`、`mesh_context`、`training_config` |
-| `dataloader` | [`BaseTrainer._build_dataloader()`](../../../hyper_parallel/trainer/base.py#L354-L370) → [`build_dataloader()`](../../../hyper_parallel/data/batching/build_dataloader.py#L171-L269) | `dataset`、构建后的 `collate_fn`、`batch_sampler`、`batch_size`、`dp_world_size`、`max_seq_len`、`seed` |
+| `model` | [`BaseTrainer._build_model()`](../../../hyper_parallel/trainer/base.py#L285-L314) | `distributed_setup`, `peft_config`, `activation_checkpoint`, `activation_swap`, `compile_config` |
+| `dataset` | [`BaseTrainer._build_dataset()`](../../../hyper_parallel/trainer/base.py#L334-L349) | `transform`, `tokenizer`, `mesh_context`, `training_config` |
+| `dataloader` | [`BaseTrainer._build_dataloader()`](../../../hyper_parallel/trainer/base.py#L354-L370) → [`build_dataloader()`](../../../hyper_parallel/data/batching/build_dataloader.py#L171-L269) | `dataset`, constructed `collate_fn`, `batch_sampler`, `batch_size`, `dp_world_size`, `max_seq_len`, `seed` |
 | `optimizer` | [`BaseTrainer._build_optimizer()`](../../../hyper_parallel/trainer/base.py#L405-L414) | `model` |
-| `lr_scheduler` | [`BaseTrainer._build_lr_scheduler()`](../../../hyper_parallel/trainer/base.py#L415-L422) | `optimizer`、`train_iters` |
-| `loss_fn` | [`BaseTrainer._build_loss()`](../../../hyper_parallel/trainer/base.py#L315-L325) | 构建时无；可选生命周期接收模型、并行配置和 loss inputs |
+| `lr_scheduler` | [`BaseTrainer._build_lr_scheduler()`](../../../hyper_parallel/trainer/base.py#L415-L422) | `optimizer`, `train_iters` |
+| `loss_fn` | [`BaseTrainer._build_loss()`](../../../hyper_parallel/trainer/base.py#L315-L325) | None during construction; optional lifecycle hooks receive the model, parallel configuration, and loss inputs |
 
-其他组件的配置与教程见 [HyperParallel 模型训练](../../../hyper_parallel/models/README.md)。
+See [HyperParallel Model Training](../../../hyper_parallel/models/README.md) for other component configurations and tutorials.
 
-## 4. 新增任务 Trainer
+## 4. Add a Task Trainer
 
-新增一种训练任务通常涉及两个位置：
+A new training task typically requires changes in two places:
 
-1. **配置**：任务需要独立配置区域时，在 [`TrainerConfig`](../../../hyper_parallel/trainer/config/trainer.py#L47-L105) 中增加根字段及对应 dataclass；能够归入现有 `model`、`dataset`、`dataloader` 或 `training` 配置时，不需要增加根字段。
-2. **任务 Trainer**：在 `hyper_parallel/trainer/` 中新增 `<task>_trainer.py`，复用 [`BaseTrainer`](../../../hyper_parallel/trainer/base.py#L105) 的共享构建阶段，并实现该任务所需的模型资产、样本转换、collator、`get_batch` 和训练步骤。
+1. **Configuration**: Add a root field and its dataclass to [`TrainerConfig`](../../../hyper_parallel/trainer/config/trainer.py#L47-L105) only when the task needs an independent configuration section. No new root field is needed if the settings fit existing `model`, `dataset`, `dataloader`, or `training` sections.
+2. **Task Trainer**: Add `<task>_trainer.py` under `hyper_parallel/trainer/`, reuse shared construction phases from [`BaseTrainer`](../../../hyper_parallel/trainer/base.py#L105), and implement the task's model assets, sample transformation, collator, `get_batch`, and training steps.
 
-以[`VLMTrainer`](../../../hyper_parallel/trainer/vlm_trainer.py#L34-L298) 为例，VLMTrainer 复用现有 `TrainerConfig` 配置，直接在任务 Trainer 中完成：
+For example, [`VLMTrainer`](../../../hyper_parallel/trainer/vlm_trainer.py#L34-L298) reuses `TrainerConfig` and implements these operations directly in the task Trainer:
 
-- [`_build_model_assets()`](../../../hyper_parallel/trainer/vlm_trainer.py#L66-L85)：根据模型路径构建 processor，并取得 processor 中的 tokenizer。
-- [`_build_data_transform()`](../../../hyper_parallel/trainer/vlm_trainer.py#L87-L97) 和 [`_build_collate_fn()`](../../../hyper_parallel/trainer/vlm_trainer.py#L99-L110)：将 processor 传给多模态样本转换，并构建多模态 collator。
-- [`_build_get_batch()`](../../../hyper_parallel/trainer/vlm_trainer.py#L112-L127)：根据并行 mesh 创建 `parallel_context`，再构建 DataLoader 到模型输入的 get-batch runtime。
-- [`train_step()`](../../../hyper_parallel/trainer/vlm_trainer.py#L177-L205)：从 `get_batch` 取得 `model_inputs` 和 `loss_inputs`，分别用于模型前向/反向和 Loss token 统计。
+- [`_build_model_assets()`](../../../hyper_parallel/trainer/vlm_trainer.py#L66-L85): Build the processor from the model path and obtain its tokenizer.
+- [`_build_data_transform()`](../../../hyper_parallel/trainer/vlm_trainer.py#L87-L97) and [`_build_collate_fn()`](../../../hyper_parallel/trainer/vlm_trainer.py#L99-L110): Pass the processor to the multimodal sample transformation and build the multimodal collator.
+- [`_build_get_batch()`](../../../hyper_parallel/trainer/vlm_trainer.py#L112-L127): Create `parallel_context` from the parallel mesh, then build the get-batch runtime that converts DataLoader output into model inputs.
+- [`train_step()`](../../../hyper_parallel/trainer/vlm_trainer.py#L177-L205): Obtain `model_inputs` and `loss_inputs` from `get_batch` for model forward/backward and loss token statistics respectively.

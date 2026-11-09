@@ -1,34 +1,36 @@
-# Llama Factory训练说明文档
+# LlamaFactory Training Guide
 
-## 版本及示例
+**English** | [简体中文](llama_factory_hyperparallel_sft_guide.zh.md)
 
-**请严格按照给出的版本进行实验，已发现torch/torch-npu/cann/机器有较严格的对应关系。**
+## Versions and Examples
 
-基础环境
+**Use the specified versions exactly. Compatibility depends closely on the torch, torch-npu, CANN, and hardware combination.**
 
-| **项目** | **配置**  |
+Base environment
+
+| **Item** | **Configuration** |
 |----------|-----------|
-| 计算设备 | 昇腾 910c |
+| Compute device | Ascend 910C |
 | CANN     | 8.5.2     |
 | Python   | 3.11.10   |
 
-框架与依赖
+Frameworks and dependencies
 
-| **框架**      | **版本**    | **代码**                                            |
+| **Framework** | **Version** | **Source** |
 |--------------|-------------|---------------------------------------------------|
 | LlamaFactory | master      | <https://github.com/hiyouga/LlamaFactory>         |
 | HyperParallel | master      | <https://gitcode.com/mindspore/hyper-parallel.git> |
 | Transformers | 4.57.1      |                                                   |
 | Accelerate   | 1.11.0      |                                                   |
 | torch        | 2.7.1       |                                                   |
-| torch_npu    | 2.7.1.post4 | torch_npu按对应版本安装，此处仅为参考                           |
+| torch_npu | 2.7.1.post4 | Install the matching torch_npu version; this value is a reference |
 | torchvision  | 0.22.1      |                                                   |
 | torchaudio   | 2.7.1       |                                                   |
 | trl          | 0.24.0      |                                                   |
 | datasets     | 4.0.0       |                                                   |
 | peft         | 0.18.0      |                                                   |
 
-## yaml配置
+## YAML Configuration
 
 `qwen3vlmoe_full_sft_fsdp2.yaml`
 
@@ -88,9 +90,9 @@ resume_from_checkpoint: null
 seed: 1234
 ```
 
-## 启动命令
+## Launch Commands
 
-先下载模型权重，将yaml文件中model_path替换为上述文件夹路径。
+Download the model weights first, then replace model_path in the YAML file with the downloaded directory path.
 
 accelerate config:
 
@@ -119,23 +121,23 @@ tpu_use_sudo: false
 use_cpu: false
 ```
 
-Hyper Parallel FSDP启动命令：
+Launch HyperParallel FSDP with:
 
 ```bash
 accelerate launch --config_file examples/accelerate/fsdp2_config.yaml src/train.py examples/ascend/qwen3vlmoe_full_sft_fsdp2.yaml
 ```
 
-即可跑通Hyper Parallel FSDP的训练流程。
+This runs the HyperParallel FSDP training workflow.
 
-## 精度验证
+## Numerical Validation
 
-### Torch FSDP/ Hyper FSDP精度对比
+### Torch FSDP / Hyper FSDP Comparison
 
 **Model:** Qwen3-VL-30B-A3B-Instruct
 
 **Configuration:**
 
-- Basline torch FSDP, ours hyper FSDP
+- Baseline torch FSDP, ours hyper FSDP
 
 - 16 cards
 
@@ -145,9 +147,9 @@ accelerate launch --config_file examples/accelerate/fsdp2_config.yaml src/train.
 
 - cutoff_len=16384
 
-![Torch FSDP 与 Hyper FSDP 精度对比](../images/llama_factory_hyperparallel_sft_guide_image1.png)
+![Torch FSDP and Hyper FSDP numerical comparison](../images/llama_factory_hyperparallel_sft_guide_image1.png)
 
-### Hyper FSDP + CP精度
+### Hyper FSDP + CP Numerical Results
 
 **Model:** Qwen3-VL-30B-A3B-Instruct
 
@@ -165,9 +167,9 @@ accelerate launch --config_file examples/accelerate/fsdp2_config.yaml src/train.
 
 - cutoff_len=16384
 
-![Hyper FSDP + CP 精度](../images/llama_factory_hyperparallel_sft_guide_image2.png)
+![Hyper FSDP + CP numerical results](../images/llama_factory_hyperparallel_sft_guide_image2.png)
 
-### Hyper FSDP/Hyper FSDP + CP精度对比
+### Hyper FSDP / Hyper FSDP + CP Comparison
 
 **Model:** Qwen3-VL-30B-A3B-Instruct(num_hidden_layers=24)
 
@@ -183,11 +185,11 @@ accelerate launch --config_file examples/accelerate/fsdp2_config.yaml src/train.
 
 - cutoff_len=16384
 
-![Hyper FSDP 与 Hyper FSDP + CP 精度对比](../images/llama_factory_hyperparallel_sft_guide_image3.png)
+![Hyper FSDP and Hyper FSDP + CP numerical comparison](../images/llama_factory_hyperparallel_sft_guide_image3.png)
 
-## 性能
+## Performance
 
-| **方案**        | **性能**    |
+| **Configuration** | **Performance** |
 |-----------------|-------------|
 | torch FSDP      | 4.4 s/iter  |
 | hyper FSDP      | 3.54 s/iter |

@@ -1,89 +1,85 @@
-# 开发环境搭建
+# Development Environment
 
-## 前置条件
+**English** | [简体中文](dev_environment.zh.md)
+
+## Prerequisites
 
 - Python 3.10 / 3.11 / 3.12
-- 当前 Python 的开发头文件，以及 `setuptools`、`wheel`、`pybind11`
+- Development headers for the current Python, plus `setuptools`, `wheel`, and `pybind11`
 - Git
-- GCC/G++（支持 C++17）、GNU Make、binutils、coreutils、tar、sed、awk
-- CANN >= 9.1.0 的完整 toolkit/ops 开发环境（Ascend NPU 开发需要）
+- GCC/G++ with C++17 support, GNU Make, binutils, coreutils, tar, sed, and awk
+- A complete CANN >= 9.1.0 toolkit/ops development environment for Ascend NPU development
 - CMake ≥ 3.18
-- Ninja（native target 需要）
+- Ninja for native targets
 
-## 克隆仓库
+## Clone the Repository
 
 ```bash
 git clone https://gitcode.com/mindspore/hyper-parallel.git
 cd hyper-parallel
 ```
 
-## Fork 工作流
+## Fork Workflow
 
-采用 origin（fork）+ upstream（主仓库）模式：
+Use origin for your fork and upstream for the main repository:
 
 ```bash
-# 在 GitCode 上 fork 仓库后
+# After forking the repository on GitCode:
 git remote add origin https://gitcode.com/<your-username>/hyper-parallel.git
 git remote add upstream https://gitcode.com/mindspore/hyper-parallel.git
 ```
 
-## 构建开发版本
+## Build a Development Version
 
 ```bash
-# 仅 Python 源码开发（不编译 optional native 组件）
+# Python source development only, without optional native components.
 pip install -e .
 
-# native 本地开发；先 source 用户选择的 CANN 官方环境
+# Local native development: first source your selected official CANN environment.
 source /usr/local/Ascend/cann/set_env.sh
 ./build.sh --multicore on --soc-list ascend910b,ascend910_93
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 source build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
 python your_program.py
 
-# 该命令同时生成 wheel；安装 build.sh 最后打印的精确路径
+# The build also produces a wheel; install the exact path printed by build.sh.
 wheel_path=/absolute/path/printed/by/build.sh
 pip install "${wheel_path}"
 source "$(command -v hyper_parallel_multicore_set_env.bash)"
 ```
 
-直接执行 `python setup.py bdist_wheel` 只生成 core-only wheel，不在 setup/pip 阶段下载或编译 native 依赖。
-其他公共构建选项见[安装指南](../installation.md)。Multicore 的依赖和 CANN custom OPP 激活方式见
-[Multicore 构建与使用](../../hyper_parallel/core/multicore/docs/build.md)。
+Running `python setup.py bdist_wheel` directly produces a core-only wheel. The setup/pip phase does not download or compile native dependencies. See the [Installation Guide](../installation.md) for other public build options, and [Multicore Build and Usage](../../hyper_parallel/core/multicore/docs/build.md) for Multicore dependencies and CANN custom OPP activation.
 
-## 安装开发依赖
+## Install Development Dependencies
 
 ```bash
 pip install pytest pylint markdownlint
 ```
 
-## 代码规范
+## Coding Standards
 
-项目遵循以下代码规范（详见 `.agent/rules/code-style.md`）：
+The project follows these standards; see [code-style.md](../../.agent/rules/code-style.md) for the authoritative rules:
 
-- **License**：所有 `.py` 文件需包含 Apache 2.0 header（前 16 行）
-- **Style**：PEP 8，~120 字符行宽
-- **Naming**：类 `PascalCase`，函数/变量 `snake_case`，私有 `_leading_underscore`
-- **Docstrings**：Google 风格（`Args:`、`Returns:`、`Raises:`、`Example:`）
-- **Type hints**：公共函数签名必须包含类型提示
-- **Errors**：使用 `ValueError` 配合描述性消息，仅在边界处验证
-- **Imports**：
-  - `core/`、`collectives/`、`tests/` 等：模块顶部 import
-  - `core/**`：模块顶部直接 import Torch，不做后端分发
-  - `core/multicore/**`：可选依赖（如 `torch_npu`、共享内存库）放在方法内 lazy import
+- **License**: Every `.py` file must include the Apache 2.0 header in its first 16 lines.
+- **Style**: PEP 8, with lines around 120 characters.
+- **Naming**: `PascalCase` for classes, `snake_case` for functions and variables, and `_leading_underscore` for private names.
+- **Docstrings**: Google style (`Args:`, `Returns:`, `Raises:`, `Example:`).
+- **Type hints**: Required on public function signatures.
+- **Errors**: Use `ValueError` with descriptive messages; validate at boundaries.
+- **Imports**: Use module-level imports in `core/`, `collectives/`, and `tests/`. Import Torch directly without backend dispatch. Optional dependencies follow the exceptions in the coding rules.
 
-## Git 工作流
+## Git Workflow
 
-- **Commits**：Conventional Commits 格式（`feat:`、`fix:`、`docs:`），~80 字符标题，祈使语气
-- **Branch**：功能分支命名 `feat/xxx` 或 `fix/xxx` 或 `docs/xxx`
-- **Squash**：打开 PR 前压缩 WIP commits
+- **Commits**: Conventional Commits (`feat:`, `fix:`, `docs:`), with an imperative subject around 80 characters.
+- **Branch**: Name feature branches `feat/xxx`, `fix/xxx`, or `docs/xxx`.
+- **Squash**: Squash work-in-progress commits before opening a PR.
 
-## AI Agent 工具
+## AI Agent Tools
 
-项目配置了 AI Agent skills（`.agent/skills/`），支持：
+The project provides AI agent skills in `.agent/skills/`:
 
-| Skill | 用途 |
-|-------|------|
-| `autogit` | GitCode fork 工作流自动化（commit、PR、status、squash） |
-| `code-review` | 分布式正确性、stream sync、内存安全审查 |
-| `dist-op-dev` | 分布式算子开发流程 |
-| `platform-dev` | 平台抽象层开发 |
+| Skill | Purpose |
+|-------|---------|
+| `autogit` | Automate the GitCode fork workflow: commit, PR, status, and squash |
+| `code-review` | Review distributed correctness, stream synchronization, and memory safety |
+| `dist-op-dev` | Distributed operator development workflow |

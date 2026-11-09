@@ -1,37 +1,39 @@
-# Codegen 使用指南
+# Codegen Guide
 
-codegen 把并行规划与高性能模块替换显示的写入模型文件。codegen读取训练 YAML配置，离线推导 TP/CP/EP 等并行契约，将参数布局、边界重分发、前向边界改写和模块替换冻结进 artifact（`codegen_meta.json` + 生成版 modeling 文件）。训练时各 rank 加载同一份 artifact，由 runtime 读取其中冻结的 sharding plan 并执行分片。
+**English** | [简体中文](codegen.zh.md)
 
-codegen 同时承载两类能力：一类是将 sharding plan 固化为生成模型中的参数分片和边界通信逻辑；另一类是将 `replace.kind: module` 等模型改写下沉到生成文件。当 YAML 用 `replace.kind: module` 把标准注意力或 MoE 替换成融合实现（flash attention、grouped GEMM 专家、CP wrapper）时，codegen 会把替换入口写入模型类的 `__init__`，保证替换在模型构造阶段生效。
+Codegen writes parallel plans and high-performance module replacements explicitly into model files. It reads training YAML, infers TP/CP/EP contracts offline, and freezes parameter layouts, boundary redistribution, forward-boundary rewrites, and module replacements into an artifact: `codegen_meta.json` plus generated modeling files. During training, all ranks load the same artifact; the runtime reads its frozen sharding plan and performs sharding.
 
-## 核心概念
+Codegen serves two purposes: embedding a sharding plan as parameter sharding and boundary communication in generated models, and lowering model rewrites such as `replace.kind: module` into generated files. When YAML uses `replace.kind: module` to replace standard attention or MoE with fused implementations such as flash attention, grouped-GEMM experts, or CP wrappers, codegen writes the replacement entry into the model class's `__init__`, so it takes effect during construction.
 
-| 概念 | 说明 |
+## Core Concepts
+
+| Concept | Description |
 |------|------|
-| 产物 bundle | 默认位于 `hyper_parallel/models/<模型>/generated/`（模型锚定，每个模型一份，目录名与 model_type 一一对应）；`models/<模型>/` 尚不存在时打 WARNING 并自动创建。可用 `model.codegen_artifact_dir` 显式指定落点。含生成版 modeling 文件、`.diff` 差异、`codegen_meta.json` |
-| signature | 对影响 artifact 的全部输入取 sha256 前 12 位：canonical spec 投影、modeling source 的 sha256、Transformers 版本、model id、结构配置摘要（层数/头数/专家数等 shape 字段）、codegen 实现摘要（整个 codegen 包的 digest）与 inline declaration 摘要。因此升级 HyperParallel 自身也会触发重新生成；训练步数、优化器等无关字段不会 |
-| `codegen: true` | 打开 artifact 生成与预检；`force_hf=false` 时后端即为 `gen` |
-| `force_hf` | 逃生门，优先级最高，会把 `gen` 覆盖回 `hf`——见下方「注意事项」 |
+| Artifact bundle | Defaults to `hyper_parallel/models/<model>/generated/`, anchored to the model with one bundle per model and a directory name corresponding exactly to model_type. If `models/<model>/` does not exist, codegen logs a WARNING and creates it. Override the destination with `model.codegen_artifact_dir`. Contains generated modeling files, `.diff` files, and `codegen_meta.json` |
+| Signature | First 12 SHA-256 characters over all artifact-affecting inputs: canonical spec projection, modeling-source SHA-256, Transformers version, model ID, structural configuration digest (layers/heads/experts and other shape fields), implementation digest of the entire codegen package, and inline declaration digest. Upgrading HyperParallel therefore triggers regeneration; unrelated settings such as training steps or optimizer configuration do not. |
+| `codegen: true` | Enable artifact generation and preflight; with `force_hf=false`, the backend is `gen`. |
+| `force_hf` | Highest-priority escape hatch that overrides `gen` with `hf`; see Important Notes below. |
 
-## 前置条件
+## Prerequisites
 
-- 一份训练 YAML。离线训练推荐让 `pretrained_model_name_or_path` 指向本地 checkpoint；模型 ID 也可以使用，但必须能被当前 Transformers 环境和 source resolver 正常解析，并能取得对应的 config 与 modeling source；经 `register_custom_model` 注册的自定义架构同样支持（DeepSeek-V4.1 裁剪版即走此路径）。
-- 一份能被 `parse_training_args` 解析的 YAML——codegen 通过它记录「这份 YAML 在哪」（写入 `codegen_meta.json` 作为来源追溯，签名不包含该路径）。
+- Training YAML. For offline training, point `pretrained_model_name_or_path` at a local checkpoint. Model IDs also work if the current Transformers environment and source resolver can resolve them and retrieve configuration and modeling source. Custom architectures registered through `register_custom_model` are supported, including cropped DeepSeek-V4.1.
+- A YAML file parseable by `parse_training_args`: codegen records its location in `codegen_meta.json` for provenance; the path is not part of the signature.
 
 ---
 
-## 快速开始
+## Quick Start
 
-### 1. 在 YAML 里打开 codegen
+### 1. Enable Codegen in YAML
 
-推荐直接从已经验证过的 `examples/training_demo/qwen3_moe/train_parallel_offline_codegen.yaml` 开始。它与 native 对照 `train_parallel_offline.yaml` 完全同构，唯一差异就是顶层多出的一个字段：
+Start with the validated `examples/training_demo/qwen3_moe/train_parallel_offline_codegen.yaml`. It matches the native reference `train_parallel_offline.yaml` exactly except for one additional top-level field:
 
 ```yaml
-# train_parallel_offline_codegen.yaml —— 与 native 臂唯一的差异点
+# train_parallel_offline_codegen.yaml: the only difference from the native variant.
 codegen: true
 
 model:
-  # demo 用 from_config 构建裁剪到 4 层的 Qwen3-MoE（随机初始化，不加载 checkpoint）
+  # The demo uses from_config for a four-layer cropped Qwen3-MoE, randomly initialized without loading a checkpoint.
   _target_: examples.training_demo.qwen3_moe.cropped_qwen3_moe.build_cropped_qwen3_moe
   config_path: /path/to/Qwen3-30B-A3B
   num_hidden_layers: 4
@@ -40,31 +42,31 @@ model:
   attn_implementation: sdpa
 ```
 
-自定义 YAML 时，**在 `from_pretrained` 路径下真正必需的是 `codegen: true` 并关闭模型配置里的 `force_hf`**——开了 `codegen` 后端就是 `gen`。`from_config` 构建路径（如上例）不受 `force_hf` 影响，`codegen: true` 即生效：`HyperAutoModelForCausalLM.from_config` 会从 config 的 source identity 准备 artifact，再从 generated modeling 构建模型，全程不加载 checkpoint（随机初始化）。注意裁剪层数等结构字段参与 signature——层数变化会触发重新生成。
+For custom YAML on the `from_pretrained` path, **enable `codegen: true` and disable `force_hf` in model configuration**; codegen selects the `gen` backend. The `from_config` path above is unaffected by `force_hf`: `codegen: true` is sufficient. `HyperAutoModelForCausalLM.from_config` prepares an artifact from the configuration's source identity and builds from generated modeling without loading checkpoints, using random initialization. Structural fields such as cropped layer count participate in the signature, so changes trigger regeneration.
 
-codegen 的输入就是这份 YAML 本身，不需要第二份配置：模型来源与结构、并行规模、`plan_overrides` 等 codegen 相关配置都从这份 YAML 读取。签名只纳入这些会影响产物的输入；修改优化器、日志级别、训练步数或 YAML 注释等无关参数，不会触发重新生成。
+The training YAML itself is the input; no second configuration is needed. Model source and structure, parallel scale, and `plan_overrides` come from it. Only artifact-affecting inputs enter the signature; changes to optimizer settings, log levels, training steps, or YAML comments do not regenerate artifacts.
 
-### 2. 生成产物（或直接交给 trainer）
+### 2. Generate Artifacts or Let the Trainer Handle Them
 
-训练 YAML 本身就会触发生成：训练启动时，trainer 在 `_setup` 与 `_build_model` 之间执行 codegen manager——产物不存在就生成，存在但签名变了就覆盖生成，存在且签名一致就复用（跳过生成，耗时约等于一次文件校验）。
+Training YAML triggers generation automatically. Between `_setup` and `_build_model`, the Trainer runs the codegen manager: generate missing artifacts, replace artifacts when signatures differ, or reuse matching artifacts. Reuse skips generation and costs approximately one file-validation pass.
 
-也可以手动管理产物：
+Artifacts can also be managed manually:
 
 ```bash
-# 生成 / 复用产物（--verbose 用于显示 artifact 与 signature）
+# Generate or reuse artifacts; --verbose displays artifact and signature information.
 python -m hyper_parallel.codegen --verbose generate \
   --config examples/training_demo/qwen3_moe/train_parallel_offline_codegen.yaml
 
-# 预飞完整性校验：signature、文件哈希、meta、import 与冻结计划结构
+# Preflight integrity checks: signature, file hashes, metadata, imports, and frozen-plan structure.
 python -m hyper_parallel.codegen --verbose check \
   --config examples/training_demo/qwen3_moe/train_parallel_offline_codegen.yaml
 ```
 
-`generate` 与 `check` 在 `codegen:false` 时都是 no-op；加上 `--verbose` 才会显示对应的跳过信息。`check` 不实例化完整模型，真实模型参数覆盖检查会在训练加载 generated model 时继续执行。
+Both `generate` and `check` are no-ops when `codegen:false`; `--verbose` displays the skip reason. `check` does not instantiate the full model. Actual parameter-coverage validation continues when training loads the generated model.
 
-### 3. 正常启动训练
+### 3. Launch Training Normally
 
-用 `python -m torch.distributed.run` 启动（注意：不要依赖 PATH 上的同名 `torchrun`，它可能被其他 CLI 应用遮蔽，导致 `--nproc_per_node` 等 PyTorch 分布式参数不可识别；用 `python -m torch.distributed.run` 最稳）：
+Launch with `python -m torch.distributed.run`. Avoid relying on a `torchrun` executable from PATH, which another CLI application may shadow, causing PyTorch distributed options such as `--nproc_per_node` to be rejected. The module invocation is the safest choice:
 
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
@@ -77,46 +79,46 @@ python -m torch.distributed.run --standalone --nproc_per_node=8 \
   --training.train_iters=5
 ```
 
-首次启动时应看到生成日志；复用时则显示 `reuse artifact`：
+The first launch logs generation; reuse logs `reuse artifact`:
 
 ```text
-codegen: generating artifact hyper_parallel/models/<模型>/generated (signature f463aefff4a4)
+codegen: generating artifact hyper_parallel/models/<model>/generated (signature f463aefff4a4)
 ```
 
-### 4. 判断是否真正使用 codegen 启动成功
+### 4. Confirm Training Actually Uses Codegen
 
-生成 artifact 只表示 codegen manager 已经执行过，不等于训练模型一定来自 generated modeling。判断训练是否**真正使用 gen 后端**，需要同时满足以下日志条件。
+An artifact only proves that the codegen manager ran, not that the training model came from generated modeling. To confirm the **gen backend is actually used**, verify all the following log conditions.
 
-首先，模型构建阶段应看到 generated modeling 文件被导入：
+First, model construction must log import of the generated modeling file:
 
 ```text
 codegen: imported generated modeling file .../modeling_<model>_gen_npu.py
 ```
 
-这说明 `HyperAutoModel` 选择了 `gen` 后端，并从 artifact 目录加载生成后的 Python 模型文件。
+This means `HyperAutoModel` selected `gen` and loaded the generated Python model from the artifact directory.
 
-其次，并行化阶段应看到 generated module 接管 sharding：
+Second, parallelization must log generated-module sharding:
 
 ```text
 codegen: sharding applied by the generated module; source_shard_info keys=<N>
 ```
 
-这说明训练没有进入 native planner/applier 主链，而是由 generated modeling 文件接管分片：runtime 读取 artifact 中冻结的 sharding plan 并执行（generated 文件若定义了 `hp_parallelize()` 入口则优先调用它），并向 FSDP/训练框架返回 `source_shard_info`。
+This means generated modeling handles sharding rather than the native planner/applier path. The runtime reads and executes the frozen plan, preferring `hp_parallelize()` if the generated file defines it, and returns `source_shard_info` to FSDP and the training framework.
 
-最后，权重加载和训练 step 应继续正常推进：
+Finally, weight loading and training steps must proceed normally:
 
 ```text
 Loaded <N> model tensors from ...
 step=1 ... training/foundation_loss=...
 ```
 
-如果只看到 `generating artifact` 或 `reuse artifact`，不能证明模型使用了生成文件。`force_hf=true` 时 artifact 仍可能生成或复用，但建模后端会回到 HF。只有同时看到 generated modeling import、generated sharding 应用、checkpoint 正常加载和 step 推进，才可以判定 codegen 启动成功。
+Seeing only `generating artifact` or `reuse artifact` does not prove the generated file is used. With `force_hf=true`, artifacts may still be generated or reused while modeling falls back to HF. Confirm generated-model import, generated sharding, successful checkpoint loading, and advancing training steps together.
 
 ---
 
-## 产物 bundle
+## Artifact Bundle
 
-产物目录按「模型锚定」布局：默认位于 `hyper_parallel/models/<模型>/generated/`——每个模型一份 bundle，与该模型的 adapter 代码同目录。目录名与模型 model_type 严格一一对应（`deepseek_v2` 与 `deepseek_v3` 即使共享 adapter 代码，产物也各自独立成目录）。当 `models/<模型>/` 目录尚不存在时，codegen 会打一条 WARNING 提示该模型还没有对应的 models 目录，并在生成时自动创建该目录存放产物：
+Artifacts use a model-anchored layout, defaulting to `hyper_parallel/models/<model>/generated/`: one bundle per model, alongside its adapter code. Directory names correspond exactly to model_type; `deepseek_v2` and `deepseek_v3` have separate artifact directories even when sharing adapter code. If `models/<model>/` does not yet exist, codegen logs a WARNING that the model has no corresponding models directory and creates it during generation:
 
 ```text
 hyper_parallel/models/qwen3_moe/
@@ -127,43 +129,43 @@ hyper_parallel/models/qwen3_moe/
     ├── codegen_meta.json
     ├── modeling_Qwen3_Moe_gen_npu.py
     ├── modeling_Qwen3_Moe_gen_npu.py.diff
-    └── configuration_*.py / source_*.py / 其他同级依赖文件（可选）
+    └── configuration_*.py / source_*.py / other sibling dependencies (optional)
 ```
 
-布局解析的完整优先级：YAML 里显式的 `model.codegen_artifact_dir` > 模型锚定目录 `hyper_parallel/models/<模型>/generated/`（默认）> 训练 YAML 同级 `generated/`（仅当配置里解析不出任何模型身份时使用）> `cwd/generated`。一个模型只应有一份 codegen YAML：YAML 内容变化即签名变化，下次生成会自动覆盖更新 `generated/`。
+The complete resolution priority is: explicit `model.codegen_artifact_dir` in YAML > model-anchored `hyper_parallel/models/<model>/generated/` (default) > `generated/` alongside the training YAML, only when no model identity can be resolved from configuration > `cwd/generated`. Each model should have only one codegen YAML; changing its content changes the signature, and the next generation automatically overwrites and updates `generated/`.
 
-`model.codegen_artifact_dir` 是可选的显式覆盖字段，写在训练 YAML 的 `model` 段下即可改变产物落点（生成与加载都指向该目录）。常规训练不需要设置——只有特殊场景才用它，例如 hyper-parallel 以 wheel 方式安装到只读的 site-packages 时把产物指到可写目录，或同一模型需要为多套不同并行配置分别维护产物时：
+`model.codegen_artifact_dir` is an optional explicit override under the training YAML's `model` section, directing both generation and loading to that directory. Ordinary training does not need it. Use it for special cases, such as directing artifacts to a writable directory when hyper-parallel is installed as a wheel in read-only site-packages, or maintaining separate artifacts for multiple parallel configurations of one model:
 
 ```yaml
 model:
   _target_: hyper_parallel.models._transformers.auto_model.HyperAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: /path/to/Qwen3-30B-A3B
-  codegen_artifact_dir: /home/lxy/my_codegen_bundles/qwen3_moe  # 可选，不写走默认
+  codegen_artifact_dir: /home/lxy/my_codegen_bundles/qwen3_moe  # Optional; omit to use the default.
 ```
 
-`generated/` 是整份 bundle 的根目录。训练时 loader 会在该目录下查找唯一的 `modeling_*_gen_npu.py`，并把这个目录注册成一个隔离的 synthetic Python package，避免不同 YAML 的生成文件在 `sys.modules` 中互相覆盖。
+`generated/` is the bundle root. During training, the loader finds its unique `modeling_*_gen_npu.py` and registers the directory as an isolated synthetic Python package, preventing generated files from different YAML configurations from overwriting each other in `sys.modules`.
 
-`generated/` 是机器生成产物，由 `codegen generate` 或训练首次启动时在本地生成。本仓库的两个模型家族（`qwen3_moe/`、`deepseek_v41/`）已将一次真实生成的参考产物随模型目录提交，可直接查阅作为对照；用户自己目录下的产物默认不参与版本管理。
+`generated/` contains machine-generated artifacts produced locally by `codegen generate` or the first training launch. The repository's two model families, `qwen3_moe/` and `deepseek_v41/`, include reference artifacts from real generation runs in their model directories for inspection. Artifacts in users' own directories are excluded from version control by default.
 
-`__init__.py` 让 `generated/` 具备包目录形态。它通常不承载业务逻辑，主要用于让 generated modeling 和可选同级依赖在同一个 package 下解析相对导入。
+`__init__.py` gives `generated/` package structure. It normally contains no business logic and allows generated modeling and optional sibling dependencies to resolve relative imports within one package.
 
-`codegen_meta.json` 是 bundle 的索引和校验文件。它记录本次生成对应的 signature、YAML 摘要、原始 modeling source 摘要、并行维度、入口点、冻结后的 sharding plan、module override 记录、输出文件哈希和 covered 声明。训练前的 preflight 会读取它判断 artifact 是否属于当前配置；训练时 runtime 也会消费其中的 frozen plan。
+`codegen_meta.json` indexes and validates the bundle. It records the signature, YAML digest, original modeling-source digest, parallel dimensions, entry points, frozen sharding plan, module overrides, output hashes, and coverage declarations. Preflight uses it to check compatibility with the current configuration; runtime also consumes its frozen plan.
 
-`modeling_Qwen3_Moe_gen_npu.py` 是真正被训练导入的生成模型文件。它以原始 Transformers modeling 源码为基础，追加生成来源 banner，把可静态下沉的边界 forward 改写为显式的边界通信代码（原始主体保留为 `_forward_impl`，公开 `forward` 变成"入口算子 → 原始计算 → 出口算子"的静态下沉形态，见下节），并把 `replace.kind: module` 下沉到模块的构造点。生成文件不再写入冻结计划常量或 `hp_parallelize()` 入口——冻结计划保存在 `codegen_meta.json`，由 runtime 读取后执行分片；模型构建时，`replace.kind: module` 相关 patch 直接由这个文件里的 `__init__` 构造逻辑生效。
+`modeling_Qwen3_Moe_gen_npu.py` is the generated model file actually imported for training. Based on the original Transformers modeling source, it adds a generation banner, lowers eligible boundary forwards into explicit boundary communication code, retaining the original body as `_forward_impl` and turning public `forward` into “input operator → original computation → output operator” as described below, and lowers `replace.kind: module` at module construction sites. The generated file no longer contains frozen-plan constants or an `hp_parallelize()` entry. Instead, `codegen_meta.json` stores the frozen plan for runtime to read and shard. During model construction, `replace.kind: module` patches take effect directly through this file's `__init__` logic.
 
-`modeling_Qwen3_Moe_gen_npu.py.diff` 是审计文件。它展示原始 modeling 源码和 generated modeling 的统一 diff，用于检查 codegen 到底改了哪些位置：新增了哪些 import、哪些类的 forward 被改写为边界通信形态（`_forward_impl` 提取 + 入口/出口算子），以及哪些模块构造点被替换成融合实现。
+`modeling_Qwen3_Moe_gen_npu.py.diff` is an audit file showing a unified diff against original modeling source: added imports, forward rewrites with `_forward_impl` extraction and entry/exit operators, and construction sites replaced with fused implementations.
 
-可选的 `configuration_*.py`、`source_*.py` 或其他同级 Python 文件用于支持 remote-code 或相对导入场景。当原始 modeling 文件依赖同级模块时，codegen 会把必要依赖复制进 bundle，使 generated modeling 离开原包目录后仍然可以 import。
+Optional `configuration_*.py`, `source_*.py`, and other sibling Python files support remote-code or relative-import scenarios. When original modeling depends on sibling modules, codegen copies the required dependencies into the bundle so it remains importable outside its original package.
 
-bundle 以**原子目录切换**写入：先写进临时兄弟目录，再整目录换入，所以永远不会导入到半成品。
+Bundles are written with an **atomic directory swap**: first write a temporary sibling directory, then replace the entire destination, preventing imports of partial artifacts.
 
 ---
 
-## codegen 如何打入 patch
+## How Codegen Applies Patches
 
-codegen 的 patch 不是在训练过程中动态改 Python 源码，而是在生成阶段把改写结果写入 generated modeling 文件。训练 import 的就是已经改写好的文件。
+Codegen does not dynamically edit Python source during training. It writes rewritten source during generation, and training imports the already-modified file.
 
-以普通 attention boundary 为例，原始 Transformers modeling 通常是一个直接执行计算的 `forward`：
+For an ordinary attention boundary, original Transformers modeling typically computes directly in `forward`:
 
 ```python
 class Qwen3MoeAttention(nn.Module):
@@ -185,7 +187,7 @@ class Qwen3MoeAttention(nn.Module):
         return attn_output, attn_weights
 ```
 
-生成后，codegen 会保留原始实现为 `_forward_impl()`，再把公开的 `forward()` 改成“入口算子 → 原始计算 → 出口算子”的静态下沉结构。下面是 tp_collective 形态（取自真实产物，`_forward_impl` 主体即上例的逐字保留）：
+After generation, codegen retains the original implementation as `_forward_impl()` and lowers public `forward()` into entry operator → original computation → exit operator. This tp_collective form comes from a real artifact; its `_forward_impl` body preserves the example above verbatim:
 
 ```python
 class Qwen3MoeAttention(nn.Module):
@@ -233,20 +235,20 @@ class Qwen3MoeAttention(nn.Module):
         return outputs
 ```
 
-这段改写的核心含义是：原始计算逻辑仍在 `_forward_impl()` 中，codegen 只把并行边界通信显式插到它的前后。`# hidden_states: ...` / `# output: ...` 注释由 codegen 生成，标注每一步的布局迁移——如 `P(sum) -> R ==> all_reduce(sum)` 表示出口把 TP 上的部分和规约成完整张量。`self._hp_tp` 由 runtime 在 install 时绑定：安装前会先对照真实 mesh 重新校验该形态与冻结计划一致，不一致就用通用引擎整个替换这个 `forward`，烤进文件的调用永远不会在校验通过前运行。
+Original computation remains in `_forward_impl()`; codegen inserts only parallel-boundary communication around it. Generated `# hidden_states: ...` / `# output: ...` comments describe layout transitions. For example, `P(sum) -> R ==> all_reduce(sum)` reduces TP partial sums into a complete output tensor. Runtime binds `self._hp_tp` during installation, first revalidating this form against the real mesh and frozen plan. Any mismatch replaces the entire `forward` with the generic engine; generated calls never execute before validation succeeds.
 
-### 模块替换的源码下沉
+### Lowering Module Replacements into Source
 
-对于 `replace.kind: module`，原生路径是在 trainer 的动态 applier 中匹配模块并替换；codegen 在生成阶段就把替换下沉到源码里的模块构造点，因此生成的 `__init__` 直接构造的就是高性能实现，模型构建时不再需要跑一遍替换：
+For `replace.kind: module`, the native path matches and replaces modules through the Trainer's dynamic applier. Codegen instead lowers replacements into module construction sites during generation, so the generated `__init__` directly constructs high-performance implementations without rerunning replacement during model construction:
 
 ```python
-# 原始 modeling 源码
+# Original modeling source.
 class Qwen3MoeDecoderLayer(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.self_attn = Qwen3MoeAttention(config, layer_idx)
 
-# 生成后：构造点替换为通用融合实现，原类作为 wrapper 输入保留
+# Generated source: replace the construction site with a generic fused implementation, retaining the original class as wrapper input.
 class Qwen3MoeDecoderLayer(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -258,125 +260,125 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
 ```
 
-命中的 FQN 仍会记录进 `codegen_meta.json` 的 `module_overrides`（并置 `covered.module_overrides=true`），供 preflight 核对，同时告诉 trainer 不必再对同一批规则执行自己的替换步骤。
+Matched FQNs remain in `codegen_meta.json` under `module_overrides`, with `covered.module_overrides=true`, for preflight verification and to tell the Trainer not to reapply those rules.
 
-YAML 里 `replace.implementation` 的 `_target_` 有两种写法：指向返回包装器的工厂函数（如本例的 `replace_qwen3_moe_flash_attention`），或直接指向 `hyper_parallel.components.*` 下的组件类。两种写法 codegen 都支持，生成结果与原生路径的模块替换一致。
+The `_target_` in YAML's `replace.implementation` supports two forms: a factory returning a wrapper, such as `replace_qwen3_moe_flash_attention` in this example, or a component class directly under `hyper_parallel.components.*`. Codegen supports both, with results matching module replacement in the native path.
 
-在本文 demo 使用的 Qwen3-MoE 配置中，RMSNorm、attention fusion、CP wrapper、MoE local compute 等 patch 都由 generated artifact 承载。训练启动后只需要 import generated modeling，runtime 会读取 artifact 中冻结的 sharding plan 并执行分片，不需要再把同一批 `replace.kind: module` 规则交给 native applier 重复处理。其他模型是否包含同类 patch，取决于对应 YAML 中的 `plan_overrides` 和 codegen 当前支持的静态下沉能力。
+In this guide's Qwen3-MoE demo configuration, the generated artifact carries RMSNorm, attention fusion, CP wrappers, MoE local compute, and related patches. Training only imports the generated modeling file; runtime reads its frozen sharding plan and applies sharding, without handing the same `replace.kind: module` rules back to the native applier. Whether other models include similar patches depends on their YAML `plan_overrides` and the static lowering capabilities currently supported by codegen.
 
 ---
 
-## 注意事项
+## Important Notes
 
-### 1. `force_hf` 把 codegen 盖掉了
+### 1. force_hf Overrides Codegen
 
-后端优先级：`force_hf` > `codegen`。若 YAML 里 `force_hf: true`（native/offline 示例通常如此），即使加了 `codegen:true`，后端仍解析为 `hf`——训练照常跑、照常收敛，但**用的根本不是生成的 modeling 文件**。这是最危险的一种静默失败。
+Backend priority is `force_hf` > `codegen`. With `force_hf: true`, common in native/offline examples, adding `codegen:true` still resolves to `hf`. Training may run and converge normally while **never using generated modeling**. This is a particularly subtle silent failure.
 
-日志会出现：
+The log reports:
 
 ```text
 codegen is enabled but force_hf=True, so the generated modeling file will not be used
 ```
 
-修法：跑 codegen 时关掉 `force_hf`，而不要只加 `codegen:true`：
+Disable `force_hf` when using codegen, rather than only adding `codegen:true`:
 
 ```bash
 --model.force_hf=false
 ```
 
-### 2. checkpoint 提示部分模型权重没有加载
+### 2. Checkpoint Reports Unloaded Model Weights
 
-**问题现象**
+**Symptoms**
 
-生成模型可以成功 import，sharding 也已经执行，但加载 checkpoint 时出现类似日志：
+Generated modeling imports and sharding succeeds, but checkpoint loading reports:
 
 ```text
 did not load <N> owned model tensors
 ```
 
-这表示当前 rank 应该持有的一部分预训练参数没有从 checkpoint 正确恢复。此时不要继续用后续 loss 判断训练是否正常；即使训练流程没有立刻退出，这次启动也应视为无效。
+Some pretrained parameters owned by the current rank were not restored correctly. Do not judge training validity from subsequent loss. Even if execution continues, treat this launch as invalid.
 
-**问题根因**
+**Root cause**
 
-先区分两类情况。
+Distinguish two cases.
 
-如果 checkpoint 路径、模型类型、Transformers 版本或 YAML 中的 `replace.kind: module` 配置写错，属于用户配置问题。典型表现是模型文件和权重本来就不匹配，native 路径也无法稳定加载同一份 checkpoint。
+An incorrect checkpoint path, model type, Transformers version, or YAML `replace.kind: module` configuration is a user configuration issue. Typically, model files and weights are already incompatible, and the native path cannot reliably load the same checkpoint either.
 
-如果同一份 YAML 的 native 路径可以正常加载，而 codegen 路径出现该日志，通常属于 HyperParallel codegen 对当前模型结构或权重转换规则的支持不足。常见原因是生成模型中已经应用了结构融合或模块替换，但 codegen 尚未为这种生成后的结构注册对应的 checkpoint 转换规则，导致原始 checkpoint 中的参数名无法映射到生成模型中的目标参数名。
+If the same YAML loads correctly through the native path but codegen reports missing weights, codegen likely lacks support for the current model structure or weight-conversion rules. A common cause is structural fusion or replacement in generated modeling without matching checkpoint conversion registration, preventing original parameter names from mapping to generated-model targets.
 
-**解决方案**
+**Resolution**
 
-用户侧只需要完成基础配置排查：
+Users should first check basic configuration:
 
-1. 确认 `pretrained_model_name_or_path` 指向与 YAML 模型类型一致的 checkpoint；
-2. 确认使用项目声明支持的 HyperParallel 与 Transformers 版本；
-3. 重新生成产物——签名变化会自动覆盖历史产物，无需先手动清理：
+1. Confirm `pretrained_model_name_or_path` points to a checkpoint matching the YAML model type.
+2. Confirm HyperParallel and Transformers versions are supported by the project.
+3. Regenerate artifacts; signature changes automatically replace old artifacts without manual cleanup:
 
 ```bash
 python -m hyper_parallel.codegen --verbose generate \
   --config examples/training_demo/qwen3_moe/train_parallel_offline_codegen.yaml
 ```
 
-如果上述条件都满足，native 路径可加载而 codegen 仍报该问题，请在 HyperParallel 仓库提交 issue，并附上以下信息：模型名称、训练 YAML、checkpoint 加载日志、generated artifact 中的 `codegen_meta.json`，以及 native 路径可以正常加载同一 checkpoint 的日志片段。
+If these conditions hold, native loading works, and codegen still fails, open a HyperParallel issue with the model name, training YAML, checkpoint-loading logs, artifact `codegen_meta.json`, and a log excerpt demonstrating successful native loading of the same checkpoint.
 
-### 3. 修改配置后仍复用旧产物
+### 3. Old Artifacts Are Reused After Configuration Changes
 
-**问题现象**
+**Symptoms**
 
-修改 YAML 中的模型来源、并行策略或模块替换配置后重新启动训练，日志仍显示：
+After changing model source, parallel strategy, or module replacement settings and restarting training, logs still show:
 
 ```text
 codegen: reuse artifact ...
 ```
 
-或者训练仍然导入旧的 generated modeling 文件，表现为生成文件内容、运行行为或训练结果没有体现本次修改。
+Alternatively, training imports an old generated file whose content, behavior, or results do not reflect the changes.
 
-**问题根因**
+**Root cause**
 
-通常有三种情况：
+There are usually three possibilities:
 
-1. 修改的是训练步数、日志、优化器等运行参数。这类配置不会改变 generated model，复用旧产物是正常行为。
-2. 修改的是模型来源、并行规模、`plan_overrides` 或 `replace.kind: module`。这类配置应该触发重新生成；如果没有重新生成，说明当前 artifact 与预期不一致。
-3. 直接编辑了 `generated/` 下的文件。generated 文件是产物，不是源码入口，手工修改不会成为稳定配置，后续检查或重新生成会覆盖这些改动。
+1. Changes affect runtime settings such as steps, logging, or optimizers. They do not change the generated model, so reuse is expected.
+2. The model source, parallel scale, `plan_overrides`, or `replace.kind: module` changed. These changes should trigger regeneration; otherwise, the current artifact does not match expectations.
+3. Files inside `generated/` were edited directly. Generated files are outputs rather than source entry points; manual edits are not stable configuration and may be rejected by checks or overwritten by regeneration.
 
-**解决方案**
+**Resolution**
 
-如果修改的是模型或并行相关配置，直接重新生成即可（签名变化会自动覆盖旧产物）；
-若曾手工编辑过 `generated/` 下的文件，先删除该目录再生成：
+For model or parallel configuration changes, regenerate directly; changed signatures replace old artifacts automatically.
+If files inside `generated/` were manually edited, delete that directory before regenerating:
 
 ```bash
 python -m hyper_parallel.codegen --verbose generate \
   --config examples/training_demo/qwen3_moe/train_parallel_offline_codegen.yaml
 ```
 
-重新生成后执行检查：
+Run checks after regeneration:
 
 ```bash
 python -m hyper_parallel.codegen --verbose check \
   --config examples/training_demo/qwen3_moe/train_parallel_offline_codegen.yaml
 ```
 
-重新启动训练时，应确认日志中出现新的生成或导入记录：
+On the next training launch, confirm new generation or import logs:
 
 ```text
 codegen: generating artifact ...
 codegen: imported generated modeling file ...
 ```
 
-如果只是修改训练步数、日志级别、学习率等运行参数，不需要清理或重新生成 artifact。
+Changes only to steps, log levels, learning rates, or other runtime settings do not require artifact cleanup or regeneration.
 
-### 4. 生成阶段直接报错（fail-closed）
+### 4. Generation Fails Immediately (Fail-Closed)
 
-**问题现象**
+**Symptoms**
 
-`codegen generate` 或训练首次启动的生成阶段直接抛出错误，例如提示找不到模块构造点、缺少 inline declaration，或目标组件不受支持。
+`codegen generate` or first-launch generation raises an error, such as a missing module construction site, missing inline declaration, or unsupported target component.
 
-**问题根因**
+**Root cause**
 
-codegen 对当前不支持的模型结构不做静默回退：无法把 YAML 声明的并行策略或 `replace.kind: module` 忠实下沉到生成文件时，生成会立即失败，而不是产出一份语义不完整的产物。这是设计行为，报错说明该配置超出了 codegen 已验证的结构范围。
+Codegen does not silently fall back for unsupported model structures. If it cannot faithfully lower the YAML parallel strategy or `replace.kind: module` into generated files, generation fails immediately instead of producing a semantically incomplete artifact. This is intentional: the configuration exceeds codegen's validated structural scope.
 
-**解决方案**
+**Resolution**
 
-1. 核对 YAML 中 `plan_overrides` / `replace.kind: module` 的目标是否属于 codegen 已支持的结构（可对照本文示例使用的配置范围）；
-2. 暂不需要 codegen 时，去掉 `codegen: true` 即回到原生 trainer 路径，训练不受影响；
-3. 若确认配置无误仍失败，请在 HyperParallel 仓库提交 issue，附上模型名称、训练 YAML 与完整报错信息。
+1. Check whether the targets in YAML `plan_overrides` / `replace.kind: module` belong to supported structures, using this guide's example configuration as a reference;
+2. If codegen is not needed, remove `codegen: true` to return to the native Trainer path without affecting training.
+3. If configuration is correct but generation still fails, open a HyperParallel issue with the model name, training YAML, and complete error message.

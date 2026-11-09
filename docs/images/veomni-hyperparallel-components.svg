@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 870" width="1200" height="870" role="img" aria-labelledby="title desc">
+  <title id="title">VeOmni × HyperParallel · 接入后的组件架构 / Proposed component architecture</title>
+  <desc id="desc">VeOmni owns data, model construction, the parallel plan, DeviceMesh, process groups and the Trainer. It selects an implementation per capability. Native Torch is the default. An opt-in adapter in VeOmni reuses its mesh and calls the public APIs of a separate HyperParallel wheel. Phase 1 adds FSDP/HSDP and distributed Muon in November 2026. Phase 2 adds high-performance modules and MegaMoE in December 2026. The first integration targets Ascend NPUs.</desc>
+  <defs>
+    <marker id="native-arrow" viewBox="0 0 10 10" markerWidth="7" markerHeight="7" refX="9" refY="5" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#42618d"/>
+    </marker>
+    <marker id="adapter-arrow" viewBox="0 0 10 10" markerWidth="7" markerHeight="7" refX="9" refY="5" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#65449b"/>
+    </marker>
+    <style>
+      text{font-family:Inter,"PingFang SC","Microsoft YaHei","Noto Sans CJK SC",Arial,sans-serif;fill:#182740}
+      .title{font-size:34px;font-weight:700}.subtitle{font-size:18px;fill:#485a76}
+      .owner{font-size:23px;font-weight:700}.role{font-size:16px;fill:#485a76}
+      .label{font-size:19px;font-weight:650}.detail{font-size:16px;fill:#435670}
+      .phase{font-size:15px;font-weight:650;fill:#543585}
+      .native{fill:none;stroke:#42618d;stroke-width:2;marker-end:url(#native-arrow)}
+      .optional{fill:none;stroke:#65449b;stroke-width:2.4;marker-end:url(#adapter-arrow)}
+    </style>
+  </defs>
+  <rect width="1200" height="870" rx="16" fill="#f7f9fd"/>
+  <text x="42" y="54" class="title">VeOmni × HyperParallel</text>
+  <text x="43" y="84" class="subtitle">拟接入组件图 · Proposed component architecture</text>
+
+  <rect x="40" y="110" width="1120" height="376" rx="16" fill="#fff" stroke="#9eb4d4" stroke-width="2"/>
+  <text x="64" y="147" class="owner">VeOmni</text>
+  <text x="180" y="147" class="role">训练编排与后端选择 · Training orchestration and backend selection</text>
+
+  <g fill="#f0f4fc" stroke="#c2cfe4">
+    <rect x="64" y="165" width="310" height="68" rx="9"/>
+    <rect x="390" y="165" width="354" height="68" rx="9"/>
+    <rect x="760" y="165" width="376" height="68" rx="9"/>
+  </g>
+  <text x="83" y="193" class="label">数据管线</text>
+  <text x="83" y="217" class="detail">Data pipeline</text>
+  <text x="409" y="193" class="label">模型构建与并行计划</text>
+  <text x="409" y="217" class="detail">Model construction &amp; parallel plan</text>
+  <text x="779" y="193" class="label">分布式拓扑</text>
+  <text x="779" y="217" class="detail">DeviceMesh &amp; process groups</text>
+
+  <path class="native" d="M219 234v22"/><path class="native" d="M567 234v22"/><path class="native" d="M948 234v22"/>
+  <rect x="64" y="259" width="1072" height="68" rx="9" fill="#233c70"/>
+  <text x="83" y="287" class="label" style="fill:white">VeOmni Trainer · 训练循环</text>
+  <text x="83" y="312" class="detail" style="fill:#e0eaff">训练、优化器更新与检查点调度 · Training, optimizer steps &amp; checkpoint orchestration</text>
+
+  <path class="native" d="M219 328v46"/>
+  <text x="232" y="355" class="detail">默认 · Default</text>
+  <path class="optional" d="M744 328v46"/>
+  <text x="758" y="355" class="detail">按能力启用 · Opt in per capability</text>
+
+  <rect x="64" y="378" width="310" height="85" rx="9" fill="#f0f4fc" stroke="#b6c7e0"/>
+  <text x="83" y="410" class="label">原生 Torch 路径</text>
+  <text x="83" y="437" class="detail">Native Torch execution</text>
+  <rect x="390" y="378" width="746" height="85" rx="9" fill="#f3effb" stroke="#bcacd9"/>
+  <text x="409" y="410" class="label">HyperParallel 适配层 · VeOmni-side adapter</text>
+  <text x="409" y="437" class="detail">复用 VeOmni 的拓扑和进程组 · Reuses VeOmni’s mesh and process groups</text>
+
+  <path d="M219 464v115" fill="none" stroke="#42618d" stroke-width="2"/>
+  <text x="219" y="605" text-anchor="middle" class="detail">无需安装 HyperParallel</text>
+  <text x="219" y="628" text-anchor="middle" class="detail">No HyperParallel wheel required</text>
+  <path class="native" d="M219 644v132"/>
+  <path class="optional" d="M744 464v61"/>
+  <text x="758" y="514" class="detail">公共 API · Public API</text>
+
+  <rect x="390" y="529" width="770" height="205" rx="15" fill="#f3effb" stroke="#a48ac7" stroke-width="2"/>
+  <text x="414" y="565" class="owner">HyperParallel</text>
+  <text x="602" y="565" class="role">可选 Python 包 · Optional Python wheel</text>
+  <g fill="#fff" stroke="#d1c5e6">
+    <rect x="414" y="581" width="345" height="130" rx="8"/>
+    <rect x="777" y="581" width="359" height="130" rx="8"/>
+  </g>
+  <text x="431" y="607" class="phase">第一阶段 · Phase 1 / 2026-11</text>
+  <text x="431" y="646" class="label">FSDP / HSDP</text>
+  <text x="431" y="679" class="label">分布式 Muon · Distributed Muon</text>
+  <text x="794" y="607" class="phase">第二阶段 · Phase 2 / 2026-12</text>
+  <text x="794" y="641" class="label">高性能模块</text>
+  <text x="794" y="662" class="detail">High-performance modules</text>
+  <text x="794" y="692" class="label">MegaMoE</text>
+  <path class="optional" d="M744 735v41"/>
+
+  <rect x="40" y="780" width="1120" height="68" rx="12" fill="#e6eef9" stroke="#adc0dd"/>
+  <text x="64" y="809" class="label">PyTorch · Ascend NPU</text>
+  <text x="64" y="834" class="detail">首版运行环境 · First-release runtime</text>
+</svg>

@@ -1,17 +1,19 @@
-# HyperParallel-RL 架构与主项目边界
+# HyperParallel-RL Architecture and Main-Project Boundaries
 
-主项目负责模型、并行、优化器及 DCP；RL 负责算法、轨迹、奖励与训练调度。
-本次重构保留独立发行包 `hyper-parallel-rl` 和顶层导入 `rl`，不改变主项目实现。
+**English** | [简体中文](rl-architecture.zh.md)
 
-`train_rl.main → trainer/build.py` 是组装入口。
-同步、分离异步和共卡异步循环位于 `trainer/`，分别持有明确的组件依赖，不继承通用角色运行时。
-配置拆分为 schema、resolve、limits 和 validate；模型替换规则直接在本次 RL YAML 中声明。
-数据合同在 `data/`，算法和角色在 `algorithm/`、`workers/`，生成与权重发布在 `rollout/`，CPU 异步协议在 `async_runtime/`。
+The main project owns models, parallelism, optimizers, and DCP; RL owns algorithms, trajectories, rewards, and training scheduling.
+This refactor retains the separate `hyper-parallel-rl` distribution and top-level `rl` import without changing main-project implementations.
 
-仅保留 native-vLLM 和流式 full_gather，按部署选择 IPC/HCCL。
-旧 consistency、Hyper 推理模型和 direct_reshard 已删除；新版 checkpoint 显式采用 schema 2，不兼容历史快照。
-GRPO/PPO/GSPO、MoE、RM、Teacher、Agent 及两种异步模式继续遵守原有支持矩阵；目录迁移不扩展支持范围。
+`train_rl.main → trainer/build.py` is the assembly entry point.
+Synchronous, disjoint asynchronous, and colocated asynchronous loops reside in `trainer/`, each with explicit component dependencies rather than inheriting a generic role runtime.
+Configuration is split into schema, resolve, limits, and validate; model replacement rules are declared directly in this run's RL YAML.
+Data contracts reside in `data/`, algorithms and roles in `algorithm/` and `workers/`, generation and weight publication in `rollout/`, and CPU asynchronous protocols in `async_runtime/`.
 
-详细顺序与状态合同见[运行时架构](../hyper_parallel/rl/docs/architecture.md)，
-配置及验证入口见[功能导航](rl-navigation.md)，开发边界见[RL 规则](../.agent/rules/hyper-rl.md)。
-CPU 合同验证、设备短流程和学习效果应分别记录。
+Only native-vLLM and streaming full_gather remain, using IPC/HCCL according to deployment.
+The old consistency machinery, Hyper inference models, and direct_reshard have been removed. New checkpoints explicitly use schema 2 and are incompatible with historical snapshots.
+GRPO/PPO/GSPO, MoE, RM, Teacher, Agent, and both asynchronous modes retain their existing support matrices; directory migration does not expand support.
+
+See the [runtime architecture](../hyper_parallel/rl/docs/architecture.md) for detailed ordering and state contracts,
+[feature navigation](rl-navigation.md) for configuration and validation entry points, and [RL rules](../.agent/rules/hyper-rl.md) for development boundaries.
+Record CPU contract validation, short device flows, and learning outcomes separately.

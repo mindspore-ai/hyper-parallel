@@ -1,66 +1,68 @@
-# 模型接入验证使用指南
+# Model Integration Validation Guide
 
-## 使用 Agent 开始接入验证
+**English** | [简体中文](model_integration_validation.zh.md)
 
-最少只需告诉 Agent 模型来源和可用设备。模型来源可以是本地路径、Hugging Face repo ID，
-也可以是 `https://huggingface.co/...` URL。没有现成数据时，让 Agent 自动制作一份；并行
-策略、序列长度等有明确要求时，再追加一句即可。
+## Start Integration Validation with an Agent
 
-```text
-请使用 hf-model-integration 和 hf-model-precision-validation，接入并验证
-[模型名称]。权威实现/模型来源为 [本地路径、HF repo ID 或 HF URL]，
-当前有 [卡数] 张 [NPU/GPU]。
-
-如果没有数据，请自动制作小型、确定性的本地验证数据，并让所有 case 复用相同输入。
-实现前请扫描仓库现有通用高性能模块、replacement、CP/EP 通信与已有模型 adapter，输出
-能力匹配表和复用决策；不要重复实现已有 kernel 或直接依赖其他模型族的私有 adapter。
-对每个声明为高性能的 replacement、CP 或 EP 路径，使用相同权重、输入、dtype、拓扑和
-Trainer 路径完成替换前后精度对拍、目标设备模块微基准和同拓扑端到端 A/B；另行报告
-CP/EP 扩展性。没有公平 A/B 证据时标记 PERFORMANCE_INCONCLUSIVE，不要宣称加速。
-先构造覆盖全部关键层角色的裁剪模型做快速验证；如具备完整权重和足够资源，最后加载
-完整规格权重做短程续训与断点恢复验证。请修复接入问题直至 PASS，无法继续则报告
-BLOCKED。不要在框架中硬编码模型，也不要未经允许联网下载。最后给出实际运行的配置、
-命令、结果、证据目录和未覆盖项。
-```
-
-例如只需追加：`验证 TP1/TP2、CP1/CP2、EP1/EP8，序列长度 4K。` 未指定时，Agent
-会根据模型结构和实际设备生成最小但有区分度的验证矩阵。
-
-如果完整规格权重已经下载，只需追加本地路径：
+At minimum, tell the agent the model source and available devices. The source can be a local path, a Hugging Face repository ID,
+or an `https://huggingface.co/...` URL. If no data is available, ask the agent to create it automatically. Add a sentence for any explicit requirements
+such as parallel strategies or sequence length.
 
 ```text
-裁剪验证通过后，请加载本地完整规格模型 [checkpoint 目录]，在 [目标卡数/并行策略] 下
-验证短程续训；不要重新下载权重。请在第 K 步保存完整训练状态，恢复后继续 N 步，并与
-连续 K+N 步对齐。若资源不足以承载完整模型，请报告 BLOCKED。
+Use hf-model-integration and hf-model-precision-validation to integrate and validate
+[model name]. The authoritative implementation/model source is [local path, HF repository ID, or HF URL],
+and [device count] [NPUs/GPUs] are available.
+
+If no data is available, automatically create a small, deterministic local validation dataset and reuse the same inputs for every case.
+Before implementing, scan existing generic high-performance modules, replacements, CP/EP communication, and model adapters in the repository. Produce
+a capability-matching table and reuse decisions; do not reimplement existing kernels or depend directly on another model family's private adapter.
+For every replacement, CP, or EP path claimed to be high performance, use the same weights, inputs, dtype, topology, and
+Trainer path for numerical comparisons before/after replacement, module microbenchmarks on the target device, and end-to-end A/B on the same topology. Report
+CP/EP scalability separately. Without fair A/B evidence, mark PERFORMANCE_INCONCLUSIVE and do not claim a speedup.
+First construct a cropped model covering all critical layer roles for fast validation. If full weights and sufficient resources are available, finally load
+the full-size weights to validate short continued training and checkpoint resumption. Fix integration issues until PASS; if progress is impossible, report
+BLOCKED. Do not hard-code models in the framework or download resources without permission. Finally provide the configurations actually run,
+commands, results, evidence directory, and uncovered items.
 ```
 
-Agent 会检查该目录中的完整 config、权重分片及索引、tokenizer/processor 和 checkpoint
-coverage。完整权重路径只用于第二阶段；第一阶段仍基于同一发布 config 构造裁剪模型。
+For example, append: `Validate TP1/TP2, CP1/CP2, and EP1/EP8 at sequence length 4K.` Without explicit settings, the agent
+creates a minimal but discriminating validation matrix based on the model structure and available devices.
 
-如果权重尚未下载，并且希望 Agent 下载后验证，则追加：
+If full-size weights have already been downloaded, simply append the local path:
 
 ```text
-裁剪验证通过后，允许将 [HF repo ID 或 URL] 的完整权重下载到 [本地目录]；请使用完整
-发布 config 和权重，在 [目标卡数/并行策略] 下验证短程续训，并在第 K 步保存完整训练状态，
-恢复后继续 N 步，与连续 K+N 步对齐。若资源不足以承载完整模型，请报告 BLOCKED，不要
-再次裁剪后宣称完整规格通过。
+After cropped validation passes, load the local full-size model from [checkpoint directory] and validate short continued training with
+[target device count/parallel strategy]. Do not download the weights again. Save the complete training state at step K, resume for N steps, and compare against
+an uninterrupted K+N-step run. Report BLOCKED if resources cannot accommodate the full model.
 ```
 
-只给出 Hugging Face URL 并不代表允许下载大权重。Agent 应先用 source-only 方式取得本地
-原始仓：`GIT_LFS_SKIP_SMUDGE=1 git clone --filter=blob:none <URL> <DIR>`，固定解析后的
-commit，并确认权重文件仍是 Git LFS pointer，而不是 payload。训练 launcher 使用这个本地
-目录读取 config、tokenizer 和源码，不在多卡启动过程中临时访问网络。只有用户明确授权并
-给出目标目录后，才可另行下载权重内容。
+The agent checks the directory's complete config, weight shards and index, tokenizer/processor, and checkpoint
+coverage. The full-weight path is used only in stage two; stage one still constructs a cropped model from the same release config.
 
-### 默认的两阶段验证
+If weights have not been downloaded and you want the agent to download and validate them, append:
 
-第一阶段是裁剪模型快速验证。Agent 从完整 config 出发，保留 dense/MoE、不同 attention
-角色、共享状态以及视觉路径等结构差异，使用 `from_config` 初始化小模型，完成最终模块
-parity、并行/重计算精度自洽和裁剪模型的 checkpoint resume。该阶段通过只能证明
-`cropped_due_to_resource` 范围。
+```text
+After cropped validation passes, you may download the full weights from [HF repository ID or URL] to [local directory]. Use the complete
+release config and weights to validate short continued training with [target device count/parallel strategy]. Save the full training state at step K,
+resume for N steps, and compare against an uninterrupted K+N-step run. If resources cannot accommodate the full model, report BLOCKED; do not
+crop it again and claim that the full-size model passed.
+```
 
-第二阶段是完整规格权重续训。对应 Trainer recipe 必须切换到完整 config 和
-`from_pretrained`，不得继续使用裁剪 builder。HF-native 模型的加载形式例如：
+Providing a Hugging Face URL alone does not authorize downloading large weights. The agent should first obtain a local source-only
+copy of the original repository with `GIT_LFS_SKIP_SMUDGE=1 git clone --filter=blob:none <URL> <DIR>`, pin the resolved
+commit, and verify that weight files remain Git LFS pointers rather than payloads. The training launcher reads config, tokenizer, and source code from this local
+directory without ad hoc network access during multi-device startup. Weight payloads may be downloaded separately only after the user explicitly authorizes it
+and supplies a destination directory.
+
+### Default Two-stage Validation
+
+Stage one quickly validates a cropped model. Starting from the full config, the agent preserves structural distinctions such as dense/MoE, different attention
+roles, shared state, and vision paths. It initializes a small model with `from_config` and validates final-module
+parity, numerical self-consistency across parallelism/recomputation, and checkpoint resumption for the cropped model. Passing this stage establishes only the
+`cropped_due_to_resource` scope.
+
+Stage two continues training from full-size weights. The corresponding Trainer recipe must switch to the complete config and
+`from_pretrained`; it must not continue using the cropped builder. For example, an HF-native model is loaded as follows:
 
 ```yaml
 model:
@@ -68,22 +70,22 @@ model:
   pretrained_model_name_or_path: /local/path/to/full-hf-checkpoint
 ```
 
-自定义架构则由 custom-model registry 解析正式模型类，由 checkpoint mapping 加载同一个本地完整
-checkpoint；model adapter 另外暴露并行、FSDP、重计算和验证能力。完整规格验收至少检查权重
-coverage、第一步 native/candidate 对齐和短程 loss/norm。
+For custom architectures, the custom-model registry resolves the production model class, and checkpoint mapping loads the same complete local
+checkpoint. The model adapter separately exposes parallelism, FSDP, recomputation, and validation capabilities. Full-size acceptance checks at least weight
+coverage, native/candidate alignment on the first step, and short-run loss/norm.
 
-需要注意，Hugging Face 模型仓通常只提供模型权重。用它启动训练是“从预训练权重开始续训”，
-不等于“恢复完整训练状态”。断点续训验证还要从该权重启动一条连续 K+N 步基线，同时运行
-K 步后保存 HyperParallel DCP，再恢复模型、FP32 main parameters、optimizer、scheduler、
-global step、RNG 和 dataloader cursor 继续 N 步；两条路径必须使用相同输入并对齐结果。
+Hugging Face model repositories usually provide only model weights. Starting training from them means continuing training from pretrained weights,
+not restoring the complete training state. Resume validation must also run an uninterrupted K+N-step baseline from those weights, alongside a run that
+saves HyperParallel DCP after K steps, then restores the model, FP32 main parameters, optimizer, scheduler,
+global step, RNG, and dataloader cursor for another N steps. Both paths must use the same inputs and produce aligned results.
 
-### Agent 默认如何制作验证数据
+### How the Agent Creates Validation Data by Default
 
-用户没有提供数据时，Agent 应先制作可重复的小数据集，不要求用户理解 Dataset、collator
-或 label shift 的细节。
+When the user supplies no data, the agent should first create a small reproducible dataset, without requiring the user to understand Dataset, collator,
+or label-shift details.
 
-文本模型默认生成本地 JSONL。此前 DeepSeek V4.1 验证使用了 128 条带唯一编号的长文本，
-重复固定句子使 Online tokenizer 和 packing 能稳定形成 4K 序列：
+For text models, the default is local JSONL. Previous DeepSeek V4.1 validation used 128 long texts with unique IDs,
+repeating fixed sentences so the Online tokenizer and packing could reliably form 4K sequences:
 
 ```bash
 python -m hyper_parallel.models.deepseek_v41.tools.prepare_deepseek_v41_online_data \
@@ -92,106 +94,106 @@ python -m hyper_parallel.models.deepseek_v41.tools.prepare_deepseek_v41_online_d
   --sequence-length 4096
 ```
 
-每行只有一个通用字段，例如 `{"text": "..."}`。模型自己的 transform 负责 tokenize、
-packing 和 labels；固定文件、随机种子和 sampler 后，各并行 case 必须得到相同的
-`global_input_sha256`。
+Each line has only one generic field, such as `{"text": "..."}`. The model's transform handles tokenization,
+packing, and labels. With fixed files, random seed, and sampler, all parallel cases must produce the same
+`global_input_sha256`.
 
-多模态模型默认制作少量图片和 OpenAI messages 风格 JSONL。此前 DeepSeek V4.1 VLM
-验证从固定 revision 的 ChartQA `val` 中选择固定行，保存图片，并在每条记录中写入数据集
-revision、row index 和图片 SHA256：
+For multimodal models, the default is a small set of images and JSONL in OpenAI messages format. Previous DeepSeek V4.1 VLM
+validation selected fixed rows from ChartQA `val` at a pinned revision, saved the images, and recorded the dataset
+revision, row index, and image SHA256 in each record:
 
 ```json
-{"id":"chartqa_val_1656","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"images/train/chartqa_val_1656.jpg"}},{"type":"text","text":"图中的答案是什么？"}]},{"role":"assistant","content":"China"}],"source":{"dataset":"HuggingFaceM4/ChartQA","revision":"固定 revision","row_index":1656,"image_sha256":"..."}}
+{"id":"chartqa_val_1656","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"images/train/chartqa_val_1656.jpg"}},{"type":"text","text":"What is the answer in the chart?"}]},{"role":"assistant","content":"China"}],"source":{"dataset":"HuggingFaceM4/ChartQA","revision":"pinned revision","row_index":1656,"image_sha256":"..."}}
 ```
 
-如果不允许联网，Agent 可以生成固定尺寸和颜色的本地测试图片及对应问答；这足以验证图片
-读取、processor、视觉塔、融合与反向链路，但不能替代真实数据质量结论。只有用户明确允许
-联网时，Agent 才下载固定 revision 的小型公开数据子集。
+Without network permission, the agent can generate local test images with fixed dimensions and colors and corresponding question-answer pairs. This is sufficient to validate image
+loading, the processor, vision tower, fusion, and backward path, but cannot establish real-data quality. The agent downloads a small public-data subset at a fixed revision only when
+the user explicitly permits network access.
 
-无论文本还是多模态数据，Online 数据只有在所有 case 的全局输入哈希一致时，才可作为
-正式精度证据；否则只能记为 smoke。需要与外部基线严格逐 token 对齐时，Agent 会把已经
-tokenize 的 batch 固化为 Offline replay。
+For both text and multimodal data, Online data qualifies as formal numerical-accuracy evidence only if all cases have the same global input hash;
+otherwise it counts only as a smoke test. When strict token-by-token alignment with an external baseline is required, the agent saves already
+tokenized batches as Offline replay.
 
-### 裁剪验证和全量验证的结论边界
+### Limits of Cropped and Full-model Conclusions
 
-大模型在有限设备上通常只能先完成裁剪验证。裁剪不是降低验收标准，而是缩小了验收结论
-所覆盖的模型实例：同样需要逐模块前向/反向对齐、多步精度自洽、重计算、并行和 checkpoint
-验证，但不能把裁剪实例的结果外推为全量模型已经通过。
+With limited devices, large models usually require cropped validation first. Cropping narrows the model instance covered by the acceptance conclusion without lowering
+the acceptance criteria: per-module forward/backward alignment, multistep numerical self-consistency, recomputation, parallelism, and checkpoint
+validation are still required. Results for the cropped instance must not be extrapolated into a full-model pass.
 
-工具状态始终是 `PASS`、`FAIL` 或 `BLOCKED`。Agent 会根据是否改动发布 config 自动在报告
-中标明 `cropped_due_to_resource` 或 `full_pretrained`，用户无需在提示词中填写该字段。
+Tool status is always `PASS`, `FAIL`, or `BLOCKED`. The agent automatically marks reports as
+`cropped_due_to_resource` or `full_pretrained` according to whether the release config was modified; users need not include that field in their prompts.
 
-| `validation_scope` 与状态 | 可以证明 | 不能证明 |
+| `validation_scope` and status | What it establishes | What it does not establish |
 |---|---|---|
-| `cropped_due_to_resource` + `PASS` | 已覆盖模块和层角色的数学、梯度、数据、并行与恢复路径在所执行配置下通过 | 完整 checkpoint 全覆盖、未进入裁剪图的层角色、全量显存/性能、完整规模通信行为和训练收敛 |
-| `full_pretrained` + `PASS` | 完整发布结构和 checkpoint 在实际执行矩阵下通过规定门禁 | 未运行的拓扑、序列长度、硬件或精度配置 |
-| `BLOCKED` | 已有证据不足以作出通过或失败结论 | 不能通过放宽阈值、缩小模型或跳过 case 改写为 PASS |
+| `cropped_due_to_resource` + `PASS` | Mathematics, gradients, data, parallelism, and resume paths of covered modules and layer roles passed under the executed configuration | Full checkpoint coverage, layer roles absent from the cropped graph, full-model memory/performance, full-scale communication behavior, and training convergence |
+| `full_pretrained` + `PASS` | The complete released structure and checkpoint passed the required gates under the executed matrix | Topologies, sequence lengths, hardware, or precision configurations that were not run |
+| `BLOCKED` | Existing evidence is insufficient for a pass or fail conclusion | It cannot be rewritten as PASS by relaxing thresholds, shrinking the model, or skipping cases |
 
-即使裁剪模型保留了全部角色，也仍应标明 `validation_scope=cropped_due_to_resource`。模块 parity 可以使用
-与权威实现相同的模块尺寸；端到端 crop 则负责在现有设备上验证这些模块组合后的真实
-Trainer 生命周期。获得足够资源后，再使用完整 config/checkpoint 复用相同清单和证据门，
-完成 `validation_scope=full_pretrained` 的验证。
+Even if the cropped model retains every role, it must still report `validation_scope=cropped_due_to_resource`. Module parity may use
+the same module dimensions as the authoritative implementation; the end-to-end crop validates the real
+Trainer lifecycle of those modules in combination on available devices. Once sufficient resources are available, reuse the same manifest and evidence gates with the full config/checkpoint
+to complete `validation_scope=full_pretrained` validation.
 
-## 教程目标
+## Tutorial Objectives
 
-模型接入验证用于回答四个不同层次的问题：最终构建出来的模型结构是否安全、替换后的关键模块是否与权威实现一致、优化路径相对公平基线是否同时满足精度和性能目标、同一训练状态在不同并行策略下是否保持精度自洽。它不会替代普通训练配置，也不会在运行时猜测某个模型族的语义。
+Model integration validation answers four distinct questions: whether the final constructed model structure is safe; whether replaced critical modules match the authoritative implementation; whether optimized paths meet both numerical-accuracy and performance targets against a fair baseline; and whether the same training state remains numerically self-consistent across parallel strategies. It neither replaces ordinary training configuration nor guesses model-family semantics at runtime.
 
-模型主体语义由正式 architecture 实现；模型特定的验证契约和安全重计算边界分别由
-`ModelAdapterSpec.validation` 与 `ModelAdapterSpec.recompute` 声明。通用工具只负责执行、采证、比较和
-报告。新增模型不需要在 Trainer、CLI 或诊断模块中加入模型名、类名或 FQN 特判。
+The production architecture implements the core model semantics. Model-specific validation contracts and safe recomputation boundaries are declared through
+`ModelAdapterSpec.validation` and `ModelAdapterSpec.recompute`, respectively. Generic tools only execute, collect evidence, compare, and
+report. Adding a model requires no model-name, class-name, or FQN special cases in the Trainer, CLI, or diagnostic modules.
 
-本文统一使用三个容易混淆的术语：
+This guide distinguishes three easily confused terms:
 
-| 术语 | 含义 |
+| Term | Meaning |
 |---|---|
-| 正式 reference path | production architecture 自带的未优化、可执行 fallback；也可以作为性能 A/B baseline |
-| 正确性 oracle | 与生产实现独立的发布仓实现或公式，用于证明输出、梯度和中间量正确 |
-| 优化 candidate | recipe 显式选择的 replacement、CP/EP wrapper 或 fused kernel |
+| Production reference path | The executable, unoptimized fallback included in the production architecture; it can also serve as a performance A/B baseline |
+| Correctness oracle | A released-repository implementation or formula independent of production code, used to establish correctness of outputs, gradients, and intermediate values |
+| Optimized candidate | A replacement, CP/EP wrapper, or fused kernel explicitly selected by the recipe |
 
-reference path 与优化 candidate 可以共享语义基类来避免状态机漂移，但共享代码不能充当独立 oracle；
-公共数学仍要与发布仓实现或独立公式对拍。性能 baseline 还必须与 candidate 位于相同设备、dtype、
-输入和拓扑，不能拿 CPU correctness oracle 与 NPU candidate 计算加速比。
+The reference path and optimized candidate may share a semantic base class to prevent state-machine drift, but shared code cannot serve as an independent oracle.
+Their common mathematics must still be compared against the released implementation or independent formulas. The performance baseline and candidate must also use the same device, dtype,
+inputs, and topology; speedup cannot be calculated by comparing a CPU correctness oracle with an NPU candidate.
 
-## 1. 验证边界
+## 1. Validation Boundaries
 
-验证流程分为四个证据门：
+Validation has four evidence gates:
 
-1. `DISCOVERED`：记录清单、源码环境和候选/参考结构。
-2. `STRUCTURE_VALIDATED`：检查正式 architecture 的直接可执行树、可选替换后的最终树、materialization、FSDP 参数归属、checkpoint 覆盖和探针覆盖。
-3. `MODULE_PARITY_PASSED`：比较权威模块与生产路径最终模块的前向、中间量、输入梯度和参数梯度。
-4. `MATRIX_PASSED`：比较不同 TP/CP/EP/FSDP、重计算深度和断点恢复用例的输入、loss、norm、参数生命周期及 checkpoint layout。
+1. `DISCOVERED`: record the manifest, source environment, and candidate/reference structures.
+2. `STRUCTURE_VALIDATED`: check the directly executable production architecture tree, the final tree after optional replacements, materialization, FSDP parameter ownership, checkpoint coverage, and probe coverage.
+3. `MODULE_PARITY_PASSED`: compare forward outputs, intermediate values, input gradients, and parameter gradients between authoritative modules and the final production-path modules.
+4. `MATRIX_PASSED`: compare inputs, loss, norm, parameter lifecycles, and checkpoint layouts across TP/CP/EP/FSDP, recomputation depths, and resume cases.
 
-状态只能按顺序前进；`FAILED` 和 `BLOCKED` 是终态。终态目录不得继续复用，应修复问题后使用新的输出目录。
+States advance only in order; `FAILED` and `BLOCKED` are terminal. Do not reuse terminal-state directories; fix the issue and use a new output directory.
 
-高性能能力发现与 A/B 是贯穿这些状态的设计/实验门禁，不新增状态机枚举。核心模型精度
-状态与优化性能状态分别报告；只有 `PRECISION_PASS + PERFORMANCE_PASS` 才能把一个目标
-称为已验收的高性能实现。
+High-performance capability discovery and A/B testing are design/experimental gates spanning these states, without adding state-machine enum values. Core model numerical-accuracy
+status and optimization performance status are reported separately. Only `PRECISION_PASS + PERFORMANCE_PASS` qualifies a target
+as an accepted high-performance implementation.
 
-训练侧只有三个开关值：
+Training exposes only three mode values:
 
-| `model_integration.mode` | 行为 | 适用场景 |
+| `model_integration.mode` | Behavior | Use case |
 |---|---|---|
-| `off` | 使用 no-op session，不采集证据 | 正常训练，默认值 |
-| `build` | 构建完成后执行结构、布局、数据和 checkpoint 契约检查 | 低成本接入检查 |
-| `runtime` | 包含 `build`，并逐步采集输入、梯度、参数、优化器、共享状态、性能和 checkpoint layout | 正式精度矩阵 |
+| `off` | Use a no-op session without collecting evidence | Normal training; default |
+| `build` | Check structure, layout, data, and checkpoint contracts after construction | Low-cost integration checks |
+| `runtime` | Include `build`, then collect inputs, gradients, parameters, optimizer, shared state, performance, and checkpoint layouts step by step | Formal numerical-accuracy matrix |
 
-`debug.check_fsdp_runtime` 是独立的 FSDP 执行顺序诊断开关，不由 `model_integration.mode` 隐式开启。
+`debug.check_fsdp_runtime` independently controls FSDP execution-order diagnostics and is not implicitly enabled by `model_integration.mode`.
 
-## 2. 准备工作
+## 2. Preparation
 
-从当前检出目录安装并确认实际导入路径：
+Install from the current checkout and verify the actual import path:
 
 ```bash
 pip install -e .
 python -c "import hyper_parallel; print(hyper_parallel.__file__)"
 ```
 
-模型、权重、tokenizer、processor 和参考仓可以由用户提供本地路径，也可以提供 Hugging Face
-来源并授权 Agent 下载到指定目录。数据可以由用户提供，也可以按本文开头的默认方式交给
-Agent 制作。验证流程不会未经允许联网下载资源，也不会替用户设置设备、通信库或 Python
-环境变量。
+Users can provide local paths for models, weights, tokenizers, processors, and reference repositories, or provide a Hugging Face
+source and authorize the agent to download to a specified directory. Data can be supplied by the user or created by the agent
+using the defaults at the beginning of this guide. Validation does not download resources without permission or configure device, communication-library, or Python
+environment variables on the user's behalf.
 
-建议先准备一个能被标准 Trainer 正常启动的 recipe。正式精度验证建议固定以下策略：
+First prepare a recipe that starts successfully with the standard Trainer. For formal numerical validation, the following settings are recommended:
 
 ```yaml
 model_init_dtype: float32
@@ -206,15 +208,15 @@ optimizer:
   fp32_main_params: true
 
 model_integration:
-  mode: off  # validate 命令会对矩阵子进程覆盖为 runtime
+  mode: off  # The validate command overrides this to runtime for matrix subprocesses.
 ```
 
-除非模型合约明确要求，不配置 `fsdp_config.mix_precision.output_dtype`，从而保留模型产生的 FP32 scalar loss。
+Unless explicitly required by the model contract, leave `fsdp_config.mix_precision.output_dtype` unset to preserve the model's FP32 scalar loss.
 
-### 2.1 高性能能力发现与复用设计
+### 2.1 High-performance Capability Discovery and Reuse Design
 
-在创建 adapter 或编写优化代码前，Agent 必须从权威实现提取 attention、norm、位置编码、
-共享/递归状态、router、expert activation、多模态路径和目标 dtype/backend，然后扫描：
+Before creating an adapter or writing optimized code, the agent must extract attention, normalization, positional encoding,
+shared/recurrent state, router, expert activation, multimodal paths, and target dtype/backend from the authoritative implementation, then scan:
 
 ```bash
 rg --files hyper_parallel/components/modules
@@ -226,70 +228,70 @@ rg -n 'replacements=|context_parallel=|expert_parallel=' \
   hyper_parallel/models/*/adapter/registration.py
 ```
 
-搜索结果必须形成 `analysis/optimized_capability_inventory.json`，而不是只写在 Agent 对话里。
-每个待优化的最终 FQN、CP 路径和 EP 路径至少记录：
+Search results must be saved to `analysis/optimized_capability_inventory.json`, not merely stated in the agent conversation.
+For each final FQN, CP path, and EP path to optimize, record at least:
 
-- 权威源码和数学/状态契约；
-- 可复用的通用组件、collective、routing/packing/dispatch 原语；
-- 可作为设计参考的已有模型 adapter；
-- forward/backward、state dict、materialization、checkpoint 和 TP/CP/EP/FSDP 兼容性；
-- 目标硬件、kernel/backend 依赖和 fallback；
-- `direct_reuse`、`thin_wrapper`、`extract_generic`、`new_generic`、`model_owned` 或
-  `unsupported` 决策，以及被拒绝候选的具体原因；
-- 预期改善的是计算、通信、重叠、显存还是扩展性；
-- 对应精度和性能实验 ID。
+- Authoritative source code and mathematical/state contracts;
+- Reusable generic components, collectives, and routing/packing/dispatch primitives;
+- Existing model adapters that can inform the design;
+- Forward/backward, state-dict, materialization, checkpoint, and TP/CP/EP/FSDP compatibility;
+- Target hardware, kernel/backend dependencies, and fallbacks;
+- A `direct_reuse`, `thin_wrapper`, `extract_generic`, `new_generic`, `model_owned`, or
+  `unsupported` decision, with specific reasons for rejected candidates;
+- Whether the expected improvement concerns computation, communication, overlap, memory, or scalability;
+- Corresponding numerical-accuracy and performance experiment IDs.
 
-复用优先级是：直接复用通用组件；组合通用原语并增加模型薄 wrapper；把已有模型私有实现
-中的共性抽到通用组件；新增模型无关组件；最后才保留不可约的模型私有逻辑。已有模型
-adapter 只作为参考，不能被另一个模型族直接依赖。名称或 tensor shape 相似不代表可以复用，
-mask、参数 packing、状态生命周期、activation 和 checkpoint identity 都必须逐项一致。
+Reuse priorities are: reuse generic components directly; compose generic primitives with a thin model wrapper; extract common behavior from an existing model's private implementation
+into a generic component; add a model-independent component; and only then retain irreducible model-private logic. Existing model
+adapters are references only and must not become direct dependencies of another model family. Similar names or tensor shapes do not establish reusability:
+masks, parameter packing, state lifecycles, activations, and checkpoint identity must each match.
 
-实现前还要写 `analysis/optimization_plan.yaml`，声明 correctness reference、performance
-baseline、候选实现、相同拓扑 Trainer A/B、模块微基准 shape、warm-up/测量策略、精度容差、
-性能阈值、fallback/通信重叠证据和结论范围。性能阈值来自用户或项目目标，不假设一个通用
-加速比。没有现成目标时，先运行标记为 pilot 的 baseline 估计重复运行波动区间，随后冻结
-正式 plan；candidate 的改善必须超过该区间且不能有无法解释的 p90 或显存回退，不能在看到
-candidate 结果后再选择阈值。
+Before implementation, also write `analysis/optimization_plan.yaml`, declaring the correctness reference, performance
+baseline, candidate implementation, Trainer A/B on the same topology, module-microbenchmark shapes, warm-up/measurement policy, numerical tolerances,
+performance thresholds, fallback/communication-overlap evidence, and conclusion scope. Performance thresholds come from user or project goals; do not assume a universal
+speedup ratio. If no target exists, first run a baseline labeled pilot to estimate variability across repeated runs, then freeze
+the formal plan. Candidate improvements must exceed that range without unexplained p90 or memory regressions; thresholds must not be chosen after seeing
+candidate results.
 
-### 2.2 模型主体与高性能实现的边界
+### 2.2 Boundaries Between the Core Model and High-performance Implementations
 
-正式注册的 architecture 必须直接构造可执行的模型主体，并在不应用 recipe replacement 的
-条件下通过小型 forward/backward。Attention、MoE/Router、Engram/Memory、残差连接和跨层
-状态等数学语义不能只存在于高性能替换函数中。正式模块可以和优化模块共享不含设备优化的
-语义基类，但不能在构造时默认把“优化 replacement”当成模型主体。设备 fused kernel 可以是
-模块内部可关闭的分支，也可以是 recipe replacement；无论哪种形式，关闭优化不能使模型失去
-基本语义。
+The registered production architecture must directly construct an executable core model and pass a small forward/backward run without applying recipe
+replacements. Mathematical semantics such as Attention, MoE/Router, Engram/Memory, residual connections, and cross-layer
+state must not exist only in high-performance replacement functions. Production and optimized modules may share a semantic base class without device-specific optimizations,
+but construction must not default to treating an optimized replacement as the core model. A device fused kernel may be a disableable
+branch inside a module or a recipe replacement; either way, disabling optimizations must preserve the model's
+basic semantics.
 
-验收必须分成两个阶段：第一阶段完全不应用 recipe replacement，验证 production architecture 的
-direct forward/backward、参数初始化和 checkpoint FQN；第二阶段应用优化 replacement，验证替换前后
-state-dict identity、数值精度、TP/CP/EP/FSDP 能力和同拓扑性能。第二阶段通过不能替代第一阶段，
-否则 Placeholder 或 mandatory wrapper 仍可能被误当成正式模型。
+Acceptance requires two stages: first, apply no recipe replacements and validate the production architecture's
+direct forward/backward, parameter initialization, and checkpoint FQNs. Second, apply optimized replacements and validate before/after
+state-dict identity, numerical accuracy, TP/CP/EP/FSDP capabilities, and same-topology performance. Passing the second stage cannot replace the first,
+or a Placeholder or mandatory wrapper could still be mistaken for the production model.
 
-只有在 planner 或 loader 必须先观察官方参数树、且直接构造无法保持 FQN、参数 alias、初始化、
-meta materialization 或 checkpoint 契约时，才允许临时参数 Placeholder。此时必须记录该
-生命周期约束，证明替换前后 state-dict/FQN identity，并保证最终生产 builder 返回前完成
-finalization；structure gate 发现遗留 Placeholder 必须失败。为了开发方便而用 Placeholder
-拼出模型，不属于可接受理由。
+Temporary parameter Placeholders are allowed only when a planner or loader must first inspect the official parameter tree and direct construction cannot preserve FQNs, parameter aliases, initialization,
+meta materialization, or checkpoint contracts. In that case, document the
+lifecycle constraint, prove before/after state-dict/FQN identity, and complete
+finalization before the final production builder returns. The structure gate must fail on leftover Placeholders. Using Placeholders to assemble a model
+merely for development convenience is not an acceptable reason.
 
-直接套用通用 wrapper 时还要复现源类的类型特定初始化。例如 wrapper 使模块不再是上游
-Attention/HyperConnection 类型后，上游 `post_init()` 可能不会清零 attention sinks 或残差
-mixing base，也不会把 scale 置为 1。除类型断言外，必须检查这些特殊参数的初始化值，并用
-端到端反向确认 loss 和梯度有限。
+Applying a generic wrapper directly must also reproduce the source class's type-specific initialization. For example, once a wrapper means a module is no longer an upstream
+Attention/HyperConnection type, upstream `post_init()` may no longer zero attention sinks or the residual
+mixing base, or set scale to 1. In addition to type assertions, check these special parameter initial values and run
+end-to-end backward to verify finite loss and gradients.
 
-## 3. 声明模型侧验证契约
+## 3. Declare Model-side Validation Contracts
 
-### 3.1 注册入口
+### 3.1 Registration Entry
 
-每个模型族在 `hyper_parallel/models/<family>/adapter/registration.py` 完成三类互相独立的登记。注册模块
-由目录约定惰性发现，中央 registry 无需修改：
+Each model family performs three independent registrations in `hyper_parallel/models/<family>/adapter/registration.py`. Registration modules
+are discovered lazily by directory convention, with no central-registry changes:
 
-| 注册机制 | 登记的关系 | 不负责什么 |
+| Registration mechanism | Registered relationship | Outside its responsibility |
 |---|---|---|
-| `register_custom_model()` | `config.architectures[0]` 到正式 Python 类 | 不构造模型、不应用 recipe、不选择并行策略 |
-| checkpoint mapping 注册 | 发布 checkpoint key 到正式参数 key 的转换 | 不创建参数、不决定 placement、不下载权重 |
-| `register_model_adapter()` | model type/architecture 到模型能力 provider | 仅使 provider 可发现；不代表 provider 已调用或优化已启用 |
+| `register_custom_model()` | `config.architectures[0]` to a production Python class | Does not construct models, apply recipes, or choose parallel strategies |
+| Checkpoint-mapping registration | Released checkpoint keys to production parameter keys | Does not create parameters, determine placements, or download weights |
+| `register_model_adapter()` | Model type/architecture to a model-capability provider | Only makes the provider discoverable; does not imply it has been called or an optimization enabled |
 
-一个完整入口的骨架如下。checkpoint 注册 API 取决于上游权重系统，因此由 family 函数封装：
+A complete entry has the following structure. The checkpoint-registration API depends on the upstream weight system and is therefore wrapped in a family-specific function:
 
 ```python
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
@@ -318,16 +320,16 @@ register_example_checkpoint_mapping()
 register_model_adapter(MODEL_ADAPTER_SPEC)
 ```
 
-import 这个 registration 模块只完成登记，不会立即解析模型类、调用 provider、安装 replacement 或启动
-并行。`validation` 必须惰性加载，这样普通训练不会导入权威参考仓、测试算子或验证专用依赖。
-`replacements/context_parallel/expert_parallel` 在当前 recipe 驱动路径中属于能力目录，实际启用仍由
-`plan_overrides.replace.implementation` 显式声明：模块替换用 `kind: module` 与模块路径，
-CP/EP 前向替换用 `kind: method` 与 `.forward` 路径；sharding、
-FSDP、recompute 和 validation provider 则由对应 planner/Trainer/工具直接消费。
+Importing this registration module only registers entries; it does not immediately resolve model classes, call providers, install replacements, or start
+parallelism. `validation` must load lazily so ordinary training does not import authoritative reference repositories, test operators, or validation-only dependencies.
+In the current recipe-driven path, `replacements/context_parallel/expert_parallel` form a capability catalog; actual activation is still
+explicitly declared through `plan_overrides.replace.implementation`: module replacements use `kind: module` with module paths,
+while CP/EP forward replacements use `kind: method` with `.forward` paths. Sharding,
+FSDP, recompute, and validation providers are consumed directly by their corresponding planner/Trainer/tools.
 
-### 3.2 最小验证声明
+### 3.2 Minimal Validation Declaration
 
-`ModelValidationSpec` 的所有字段均可选；根据模型风险逐项声明：
+Every `ModelValidationSpec` field is optional; declare fields according to the model's risks:
 
 ```python
 from hyper_parallel.models.validation_spec import (
@@ -365,24 +367,24 @@ def get_validation_spec():
     )
 ```
 
-常用声明如下：
+Common declarations include:
 
-| 声明 | 用途 |
+| Declaration | Purpose |
 |---|---|
-| `ModuleParityCase` | 定义权威模块与最终生产模块的比较方法 |
-| `ObservationSpec` | 增加路由结果、索引、共享状态等中间量比较 |
-| `ParameterProbeSpec` | 按最终 FQN 选择参数及生命周期阶段 |
-| `StateInvariantSpec` | 在 structure/materialization/checkpoint/runtime 阶段检查模型语义 |
-| `SharedStateValidationSpec` | 验证跨层状态只发布一次且消费者读取正确来源 |
-| `DataValidationSpec` | 声明 forward 字段、运行时字段、模态字段和 label shift |
-| `CheckpointValidationSpec` | 声明训练专用 target 和推理专用 source 的合法缺失 |
-| `TopologyConstraint` | 在启动前拒绝模型不支持的并行组合 |
+| `ModuleParityCase` | Define comparisons between authoritative modules and final production modules |
+| `ObservationSpec` | Add intermediate-value comparisons for routing results, indices, shared state, and similar observations |
+| `ParameterProbeSpec` | Select parameters and lifecycle phases by final FQN |
+| `StateInvariantSpec` | Check model semantics during structure/materialization/checkpoint/runtime phases |
+| `SharedStateValidationSpec` | Verify that cross-layer state is published once and consumers read the correct source |
+| `DataValidationSpec` | Declare forward fields, runtime fields, modality fields, and label shift |
+| `CheckpointValidationSpec` | Declare legitimate missing training-only targets and inference-only sources |
+| `TopologyConstraint` | Reject parallel combinations unsupported by the model before launch |
 
-### 3.3 模块精度对齐
+### 3.3 Module Numerical Alignment
 
-进程内 parity 的 candidate 必须来自正式构建/materialization 路径；若实验对象是可选
-replacement，再让 candidate 经过该真实替换路径。reference 必须是独立实现。下面示例比较
-一个最终线性模块：
+Candidates for in-process parity must come from the production construction/materialization path. If an optional
+replacement is under test, also pass the candidate through that real replacement path. The reference must be an independent implementation. The following example compares
+a final linear module:
 
 ```python
 def build_candidate(context):
@@ -413,31 +415,31 @@ case = ModuleParityCase(
 )
 ```
 
-当参考仓与生产环境存在模块名冲突或只能在独立解释器中导入时，使用 `execution="isolated_process"` 和 `isolated_runner`。DeepSeek-V4.1 的 Engram、MoE 和 CSA2 就采用这一方式。
+When the reference repository conflicts with production module names or can only be imported in a separate interpreter, use `execution="isolated_process"` and `isolated_runner`. DeepSeek-V4.1 uses this approach for Engram, MoE, and CSA2.
 
-### 3.4 安全重计算区域
+### 3.4 Safe Recomputation Regions
 
-共享跨层状态的 producer/consumer 可以参与重算，但重算路径上有两类动作必须先处理掉：**只需执行一次的副作用**（写跨层状态）和**离散且不可复现的选择**（Top-K / 候选池）。模型 adapter 用一份声明同时描述"哪些模块成为区域"和"哪些后代必须留在重算之外"，并用 `on_applied` 安装依赖最终区域形状的运行期行为（例如给会被重算的层 pin 选区）：
+Producers/consumers sharing cross-layer state may participate in recomputation, but two kinds of actions must first be handled on that path: **side effects that must execute only once** (writing cross-layer state) and **discrete, nonreproducible selections** (Top-K/candidate pools). A single model-adapter declaration specifies both which modules become regions and which descendants must remain outside recomputation. `on_applied` installs runtime behavior that depends on the final region structure, such as pinning selections for layers that will be recomputed:
 
 ```python
 from hyper_parallel.models.adapter_spec import RecomputePolicy
 
 
 def build_recompute_policy():
-    """整层一个区域；attention 的重算范围由同一张角色表派生。"""
+    """Use one region per layer; derive attention recomputation scope from the same role table."""
     recomputed = ("full", "reindex", "reuse")
     return RecomputePolicy(
         region_patterns=("model.layers.*",),
-        exclude_predicate=...,                                       # 角色不在 recomputed 里的 attention 留在区域外
-        on_applied=...,                                              # 给会被重算的 index source pin 选区
+        exclude_predicate=...,  # Keep attention roles outside recomputed out of the region.
+        on_applied=...,  # Pin selections for index sources that will be recomputed.
     )
 ```
 
-DeepSeek-V4.1 把它写成 `models/deepseek_v41/adapter/policies/activation_checkpointing.py` 里的一档开关：`ATTENTION_RECOMPUTE_TIER` 取 `reuse`（默认）/ `reuse_reindex` / `all` / `none`，不在重算范围里的角色由同一张角色表派生为 `exclude_predicate`，会重算的 index source 由同一个元组派给 `configure_shared_state` 去 pin 选区。默认 `reuse`：只读跨层状态的层随层重算，Full/Reindex 这类生产者留在区域外保留激活。`configure_shared_state` 把 indexer 的离散选择 pin 成 exclude 区域，重算复用正向选出的集合，也避免"跳过一段可微代码"破坏 checkpoint 的张量数不变量。跨层状态本身不需要调度——它作为重算区域的输入被 checkpoint 持有，发布出去的条目随它活到反向结束，而 `publish_*` 只在正向执行（`is_recomputing()` 判定），重算不会写第二次。pin 只覆盖离散选择：选区之外的 compressor、indexer 投影按档位随层重算或留在区域外。
+DeepSeek-V4.1 expresses this as a tier switch in `models/deepseek_v41/adapter/policies/activation_checkpointing.py`: `ATTENTION_RECOMPUTE_TIER` is `reuse` (default), `reuse_reindex`, `all`, or `none`. The same role table derives `exclude_predicate` for roles outside the recomputation scope, and the same tuple passes recomputed index sources to `configure_shared_state` to pin their selections. With default `reuse`, layers that only read cross-layer state are recomputed with their layer, while producers such as Full/Reindex remain outside the region and retain activations. `configure_shared_state` pins the indexer's discrete selection as an excluded region, reusing the forward-selected set during recomputation and avoiding violations of checkpoint tensor-count invariants caused by skipping differentiable code. Cross-layer state itself needs no scheduling: checkpointing holds it as an input to the recomputation region, and published entries live with it until backward ends. `publish_*` executes only during forward, as determined by `is_recomputing()`, so recomputation does not write it again. Pinning covers only discrete selection; compressor and indexer projections outside that selection are recomputed with the layer or kept outside the region according to the tier.
 
-`region_patterns` 取**最外层匹配**作为区域根：写成整层模式时一个区域只保存一份层输入，写成 `model.layers.*.mlp` 这类叶子模块模式时则每个模块各自成区域（此时 `exclude_patterns` 一般留空）。`exclude_patterns` 必须命中区域根的后代，否则直接报错；同一个模块也不能既是区域根又被排除。`on_applied` 是区域装好后的模型自有钩子，用于开启依赖最终区域形状的运行时行为（例如 DeepSeek-V4.1 用它给会被重算的层安装选区 pin）。
+`region_patterns` uses the **outermost match** as each region root. A whole-layer pattern saves one copy of the layer input per region; a leaf-module pattern such as `model.layers.*.mlp` creates a separate region for each module, usually with empty `exclude_patterns`. `exclude_patterns` must match descendants of a region root or raise an error; the same module cannot be both a region root and excluded. `on_applied` is a model-owned hook invoked after regions are installed to enable runtime behavior depending on their final structure, such as DeepSeek-V4.1 pinning selections for recomputed layers.
 
-Trainer recipe 通过通用配置选择该策略：
+The Trainer recipe selects this policy through generic configuration:
 
 ```yaml
 activation_checkpoint:
@@ -447,7 +449,7 @@ activation_checkpoint:
     layer_count: 16
 ```
 
-`layer_count` 按所有已发现 layer container 的展平顺序，从下标 `0` 开始连续选择指定数量的层；例如 `layer_count: 2` 选择第 `0、1` 层，`0` 表示不选择任何层。需要选择非连续层时使用与其互斥的 `layer_indices`：
+`layer_count` selects the specified number of consecutive layers starting at index `0`, in the flattened order of all discovered layer containers. For example, `layer_count: 2` selects layers `0, 1`, and `0` selects none. For nonconsecutive layers, use the mutually exclusive `layer_indices`:
 
 ```yaml
 activation_checkpoint:
@@ -457,24 +459,24 @@ activation_checkpoint:
     layer_indices: [0, 4, 8, 12]
 ```
 
-`layer_indices` 从 `0` 开始，必须非空、非负且不重复。`source: default` 不接受这两个字段。
+`layer_indices` is zero-based and must be nonempty, nonnegative, and duplicate-free. `source: default` accepts neither field.
 
-## 4. 编写验证清单
+## 4. Write a Validation Manifest
 
-验证清单只描述模型身份、标准 Trainer 启动方式、实验矩阵和验收阈值。模型结构、数据集、dtype、tokenizer 和本地资产应留在 Trainer recipe；环境变量、源码 revision 和 hash 会自动进入证据，不在 YAML 中重复维护。
+The validation manifest describes only model identity, standard Trainer launch configuration, the experiment matrix, and acceptance thresholds. Model structure, datasets, dtype, tokenizer, and local assets belong in the Trainer recipe. Environment variables, source revisions, and hashes are automatically recorded as evidence and should not be duplicated in YAML.
 
 ```yaml
 schema_version: 2
 
 model:
   adapter: example
-  # inspect/check 需要最终生产模型 builder；kwargs 原样传入。
+  # inspect/check require the final production-model builder; kwargs are passed unchanged.
   builder:
     _target_: your_package.build_final_model
     config_path: /local/model/config.json
 
 reference:
-  # parity 使用的本地权威仓；不会隐式下载。
+  # Local authoritative repository for parity; no implicit downloads.
   source_path: /local/reference/repository
 
 launcher:
@@ -487,8 +489,8 @@ matrix:
   steps: 10
   resume_split_step: 5
   performance_warmup_steps: 2
-  # 先由 baseline initialize launch 完成 1 步并保存 step-1 warm-start DCP，再让正式 baseline 和
-  # 所有候选恢复同一模型、优化器、scheduler 与 RNG，并从相同配置的数据起点请求 replay。
+  # First run one baseline initialization step and save a step-1 warm-start DCP. Then restore the same
+  # model, optimizer, scheduler, and RNG for the formal baseline and all candidates, requesting replay from the same configured data start.
   shared_initial_checkpoint: true
   baseline:
     tp: 1
@@ -519,10 +521,10 @@ acceptance:
     loss_max_rel: 5.0e-3
     norm_max_abs: 1.25e-1
     norm_max_rel: 5.0e-3
-    # 分别对 loss 和 norm 使用“绝对或相对误差满足其一”；loss 与 norm 仍必须都通过。
+    # Apply absolute-or-relative acceptance separately to loss and norm; both must still pass.
     combination: any
   parameters:
-    # 基础档用于模块对拍和同拓扑；两者不能被跨拓扑 BF16 容差放宽。
+    # Strict base tier for module parity and the same topology; cross-topology BF16 tolerances must not relax either.
     max_abs: 1.0e-6
     relative_l2: 1.0e-6
     combination: all
@@ -531,105 +533,105 @@ acceptance:
     cross_topology:
       max_abs: 1.0e-3
       relative_l2: 2.0e-2
-      # 只对记录了完整 values 的张量生效。
+      # Applies only to tensors whose complete values were recorded.
       combination: any
       summary:
-        # 大张量只有聚合摘要时，只能判断 L2 范数本身的相对漂移。
+        # With only aggregate summaries for large tensors, only relative drift of the L2 norm itself can be evaluated.
         l2_norm_relative: 2.0e-2
 ```
 
-### 4.1 Matrix 字段
+### 4.1 Matrix Fields
 
-| 字段 | 说明 |
+| Field | Description |
 |---|---|
-| `devices` | 每个 `torchrun` 子进程的 `--nproc_per_node` |
-| `steps` | 普通用例训练步数，也是 resume 恢复后的最终步数 |
-| `resume_split_step` | resume prepare 阶段保存步数，必须满足 `0 < split < steps` |
-| `shared_initial_checkpoint` | 生成公共 step-1 warm-start DCP；baseline、候选及 resume prepare 恢复同一模型/优化器/scheduler/RNG，但不恢复 warm-start 的 dataloader cursor，而是请求从配置的数据起点 replay；是否得到相同逻辑输入仍由 global input hash 门禁判定 |
-| `baseline` | 所有用例的参考拓扑 |
-| `axes` | 每次只覆盖一个字段，重复 baseline 的值会去重 |
-| `combined` | 显式覆盖多个 baseline 字段的混合策略 |
-| `recompute_selections` | 安全区域重计算的精确层数或层下标；每项只能包含 `layer_count` 或 `layer_indices` |
-| `recompute_topology` | 运行重计算选择组时覆盖的固定拓扑 |
-| `production_validate_pair` | 同一拓扑分别设置 `model.validate_placement=false/true` |
-| `same_topology_resume` | baseline 拓扑保存并恢复 |
-| `cross_topology_resume` | baseline 拓扑保存、目标拓扑恢复 |
+| `devices` | `--nproc_per_node` for each `torchrun` launch |
+| `steps` | Training steps for ordinary cases and the final step after resume |
+| `resume_split_step` | Step at which resume preparation saves state; must satisfy `0 < split < steps` |
+| `shared_initial_checkpoint` | Generate a shared step-1 warm-start DCP; baseline, candidates, and resume preparation restore the same model/optimizer/scheduler/RNG, but request replay from the configured data start instead of restoring the warm-start dataloader cursor. The global-input-hash gate still determines whether logical inputs match |
+| `baseline` | Reference topology for all cases |
+| `axes` | Override one field at a time; values duplicating the baseline are deduplicated |
+| `combined` | Hybrid strategies explicitly overriding multiple baseline fields |
+| `recompute_selections` | Exact layer counts or indices for safe-region recomputation; each entry contains only `layer_count` or `layer_indices` |
+| `recompute_topology` | Fixed topology override for the recomputation-selection group |
+| `production_validate_pair` | Set `model.validate_placement=false/true` separately on the same topology |
+| `same_topology_resume` | Save and restore on the baseline topology |
+| `cross_topology_resume` | Save on the baseline topology and restore on the target topology |
 
-标准 launcher 只接受 `tp`、`cp`、`ep`、`fsdp`、`sequence_parallel` 和 `recompute`。无法映射到 Trainer 命令的字段会直接报错，不会生成“命令相同但看似通过”的空转用例。
+The standard launcher accepts only `tp`, `cp`, `ep`, `fsdp`, `sequence_parallel`, and `recompute`. Fields that cannot map to Trainer commands raise errors instead of producing duplicate-command cases that appear to pass without testing anything new.
 
-编写 matrix 前必须先建立 coverage ledger：逐项列出模型实际支持的并行轴、关键混合拓扑、重计算层选择、同/跨拓扑恢复、Production/Validate，以及多模态模型的 language/vision/projector/fusion 子树。每项只能是正式用例或带证据的排除项。`--generate-only` 后将 ledger 与 `cases/resolved_cases.json` 逐项对账，并分别统计 baseline、策略泛化、重计算、resume 和 Production/Validate；重计算和 resume 不计入策略泛化数量。只执行了一个策略候选时，即使另有两个重计算和两个 resume 用例，也只能报告一组策略泛化。
+Before writing the matrix, create a coverage ledger listing the parallel axes the model actually supports, critical hybrid topologies, recomputation layer selections, same-/cross-topology resume, Production/Validate, and language/vision/projector/fusion subtrees for multimodal models. Each item must be either a formal case or an exclusion supported by evidence. After `--generate-only`, reconcile the ledger item by item with `cases/resolved_cases.json` and count baseline, strategy generalization, recomputation, resume, and Production/Validate separately. Recomputation and resume do not count as strategy-generalization cases. If only one strategy candidate ran, report only one strategy-generalization comparison even if two recomputation and two resume cases also ran.
 
-多模态模型还必须记录各子树的实际 placement。ViT 在含 TP 的进程组里完成前向反向、但其参数沿 TP 为 `Replicate()` 时，只能证明“多模态路径与语言 TP 可组合”，不能报告为 ViT TP 覆盖。算子支持也按 dispatcher 截获的精确 callable key 审计；`npu_rms_norm` 不能替代 `rms_norm`，`conv3d` 不能替代 `conv1d`/`conv2d`。
+Multimodal models must also record actual placements for each subtree. If ViT completes forward/backward in a process group with TP but its parameters are `Replicate()` along TP, this establishes only that the multimodal path composes with language TP; it does not establish ViT TP coverage. Audit operator support using the exact callable key intercepted by the dispatcher: `npu_rms_norm` does not substitute for `rms_norm`, and `conv3d` does not substitute for `conv1d`/`conv2d`.
 
-验收档位根据实际启动的 TP/CP/EP/FSDP/sequence-parallel 与 baseline 是否相同自动选择。重计算层选择本身不构成并行拓扑变化；如果 `recompute_topology` 改了 EP 等字段，则该组使用 `cross_topology` 阈值。`cross_topology_resume` 必须真正改变至少一个并行字段，当前不提供“只切换重计算策略后恢复”的用例。
+The acceptance tier is selected automatically according to whether the launched TP/CP/EP/FSDP/sequence-parallel configuration matches the baseline. Recomputation layer selection alone does not change parallel topology. If `recompute_topology` changes EP or another field, that group uses `cross_topology` thresholds. `cross_topology_resume` must actually change at least one parallel field; there is currently no case that resumes after changing only the recomputation strategy.
 
-标量支持绝对阈值与相对阈值。默认 `combination: all`；显式设为 `any` 时，比较器分别判断 loss 和 norm 的“绝对或相对误差满足其一”，然后仍要求 loss、裁剪前 norm、裁剪后 norm、输入身份、LR 和有限性全部通过。不能用 loss 的相对阈值替代 norm 失败，也不能用 `any` 绕过数据身份门禁。
+Scalars support absolute and relative thresholds. The default is `combination: all`. With explicit `any`, the comparator accepts either absolute or relative error separately for loss and norm, while still requiring loss, pre-clip norm, post-clip norm, input identity, LR, and finiteness all to pass. A passing loss-relative threshold cannot compensate for a norm failure, and `any` cannot bypass the data-identity gate.
 
-参数探针必须区分拓扑档位和证据强度。`parameters` 根字段是模块对拍与同拓扑的严格基础档；`parameters.module_parity`、`parameters.same_topology`、`parameters.cross_topology` 可分别覆盖它，未声明的字段继承基础档。因此 BF16 跨拓扑的尺度容差不会意外放宽模块对拍或同拓扑恢复。记录了完整 `values` 的小张量才能计算真实逐元素 `max_abs` 和张量 `relative_l2`，其默认组合规则是 `all`；BF16 跨拓扑可在预先声明且有数值依据时使用 `parameters.cross_topology.combination: any`。只记录 `sum/l2/min/max` 的大张量没有逐元素证据，比较器会将 `max_abs` 和 `relative_l2` 报为 `n/a`，仅按当前档位的 `summary.l2_norm_relative`（以及可选的 `l2_norm_max_abs`）判断 L2 范数摘要漂移。聚合统计量之差不得再标成逐元素最大误差。两种模式始终单独检查有限性和全局 shape。
+Parameter probes must distinguish topology tiers and evidence strength. Root `parameters` fields define the strict base tier for module parity and same-topology comparisons. `parameters.module_parity`, `parameters.same_topology`, and `parameters.cross_topology` may override it separately; undeclared fields inherit the base tier. Thus BF16 cross-topology scale tolerances do not accidentally relax module parity or same-topology resume. Only small tensors with complete `values` recorded support true elementwise `max_abs` and tensor `relative_l2`; their default combination is `all`. BF16 cross-topology comparisons may use `parameters.cross_topology.combination: any` when declared in advance with numerical justification. Large tensors recording only `sum/l2/min/max` lack elementwise evidence; the comparator reports `max_abs` and `relative_l2` as `n/a` and evaluates L2-norm summary drift using the current tier's `summary.l2_norm_relative` and optional `l2_norm_max_abs`. Differences between aggregate statistics must not be labeled as elementwise maximum errors. Both modes always check finiteness and global shape separately.
 
-### 4.2 复用 parity handoff
+### 4.2 Reuse a Parity Handoff
 
-可以在同一个输出目录依次执行所有门，也可以让精度清单引用之前生成的 handoff：
+Run all gates sequentially in one output directory, or reference a previously generated handoff in the numerical-validation manifest:
 
 ```yaml
 integration_handoff: /local/evidence/integration_handoff.yaml
 ```
 
-handoff 必须是 schema-v2、`status: PASS`，并且 `family` 与 `model.adapter` 相同。它只证明结构与模块 parity 已通过，不替代本次 matrix 的 Trainer recipe 和输入证据。
+The handoff must use schema-v2, have `status: PASS`, and have a `family` matching `model.adapter`. It proves only that structure and module parity passed; it does not replace the current matrix's Trainer recipe and input evidence.
 
-### 4.3 高性能替换的成对实验
+### 4.3 Paired Experiments for High-performance Replacements
 
-每个被称为高性能的 replacement、CP 或 EP 路径需要四层证据：
+Every replacement, CP, or EP path described as high performance requires four layers of evidence:
 
-| 实验 | 固定条件 | 需要回答的问题 |
+| Experiment | Fixed conditions | Question to answer |
 |---|---|---|
-| 模块精度对拍 | 相同权重、输入、状态、dtype | 输出、中间量、输入梯度和参数梯度是否与独立权威实现一致 |
-| 目标设备模块微基准 | 相同 shape、dtype、autograd、compile 和同步边界 | forward/backward p50/p90、吞吐、峰值显存和 kernel fallback 是否达到预声明目标 |
-| 同拓扑 Trainer A/B | 相同起始/预热步完整 DCP、数据 hash、拓扑、精度、优化器、重计算和步数 | 优化路径是否在真实训练生命周期保持精度并改善端到端性能 |
-| CP/EP 扩展性 | 相同全局 workload 和模型语义 | CP/EP degree 增加后的通信、负载均衡、显存和扩展效率如何 |
+| Module numerical parity | Same weights, inputs, state, and dtype | Do outputs, intermediate values, input gradients, and parameter gradients match an independent authoritative implementation? |
+| Target-device module microbenchmark | Same shape, dtype, autograd, compilation, and synchronization boundaries | Do forward/backward p50/p90, throughput, peak memory, and kernel fallback meet predeclared targets? |
+| Same-topology Trainer A/B | Same complete initial/warm-up-step DCP, data hash, topology, precision, optimizer, recomputation, and step count | Does the optimized path preserve numerical accuracy and improve end-to-end performance in the real training lifecycle? |
+| CP/EP scalability | Same global workload and model semantics | How do communication, load balancing, memory, and scaling efficiency change as CP/EP degree increases? |
 
-正确性 reference 与性能 baseline 不一定相同：权威 eager 公式可以用于精度，但 CPU
-reference 不能与 NPU candidate 计算加速比；性能 baseline 与 candidate 必须使用相同设备、拓扑、shape、
-dtype、compile 和同步边界。普通 validation matrix 只切换并行拓扑与
-recompute，不能切换任意 replacement provider；因此端到端 A/B 使用两个只在目标实现选择上
-不同的 recipe 或 `plan_overrides`，分别写入隔离证据目录，并共享同一个已记录实际步号的
-完整 DCP。标准 matrix launcher 当前生成 step-1 warm-start DCP，不能把它写成 step 0。
+The correctness reference and performance baseline need not be the same. An authoritative eager formula can establish numerical accuracy, but a CPU
+reference cannot be compared with an NPU candidate to compute speedup. Performance baseline and candidate must use the same device, topology, shape,
+dtype, compilation, and synchronization boundaries. An ordinary validation matrix switches only parallel topology and
+recomputation, not arbitrary replacement providers. End-to-end A/B therefore uses two recipes or `plan_overrides` differing only in the target implementation
+selection, writes to separate evidence directories, and shares the same
+complete DCP with its actual step number recorded. The standard matrix launcher currently generates a step-1 warm-start DCP; do not label it step 0.
 
-这里还有一个必须在 `--generate-only` 后预检的限制：DCP 能重分片模型/优化器，不代表 stateful
-dataloader cursor 也能跨 DP world size 重分片。标准 launcher 已区分两个场景：共享 warm-start 恢复
-模型/优化器/scheduler/RNG，但显式不恢复 initialize 步骤消费后的 cursor，让 measured case 从配置的数据
-起点重新请求 replay；真正 K→K+N resume 则仍恢复 K 步后的 cursor。重新从起点不自动等于相同输入：若
-Online loader 的 rank 分片、随机化或 packing 依赖 DP world size，TP/CP 改变 DP degree 后 global input hash
-仍可能不同，此时该 case 只能证明拓扑可执行，不能比较数值。正式跨拓扑精度应使用 DP-invariant 的固定
-Offline replay；当前 Online dataloader 在真正 resume 场景遇到 DP world size 改变也会显式失败，需要能按
-全局样本位置重建 cursor 的 loader，否则将能力记录为 `BLOCKED`/带证据排除。不能删除 cursor 后仍宣称
-输入连续，也不能把输入不一致或训练前失败记成 TP/CP 模型精度失败。
+Another limitation must be preflighted after `--generate-only`: DCP's ability to reshard model/optimizer state does not imply that a stateful
+dataloader cursor can be resharded across DP world sizes. The standard launcher distinguishes two scenarios. Shared warm-start restores
+model/optimizer/scheduler/RNG but explicitly does not restore the cursor after the initialization step consumed data, allowing measured cases to request replay from the configured data
+start. Actual K→K+N resume still restores the cursor after step K. Restarting from the beginning does not automatically mean identical inputs: if
+Online-loader rank sharding, randomization, or packing depends on DP world size, changing TP/CP and thus DP degree may still change the global input hash.
+Such a case establishes only topology executability and cannot support numerical comparisons. Formal cross-topology numerical validation should use fixed, DP-invariant
+Offline replay. The current Online dataloader also fails explicitly when actual resume changes DP world size. A loader capable of reconstructing the cursor from
+global sample positions is required; otherwise mark the capability `BLOCKED` or exclude it with evidence. Do not drop the cursor and still claim
+input continuity, or classify mismatched inputs or pre-training failures as TP/CP model numerical failures.
 
-CP 的实现 A/B 必须在相同 CP/TP degree、全局序列、mask 和 attention kernel 下比较同步/参考
-与优化通信；CP1 对 CPn 只能称扩展性实验。EP 同理，需要在相同 EP degree、learned router、
-expert layout、capacity 和 grouped-kernel 设置下比较 dispatch/compute/combine；EP1 对 EPn
-不能替代实现 A/B。
+Implementation A/B for CP must compare synchronous/reference and optimized communication at the same CP/TP degree, global sequence, mask, and
+attention kernel. CP1 versus CPn is only a scalability experiment. EP similarly requires comparing dispatch/compute/combine with the same EP degree, learned router,
+expert layout, capacity, and grouped-kernel settings. EP1 versus EPn
+cannot replace implementation A/B.
 
-结果写入 `analysis/optimization_results.json`，逐目标保存精度误差、p50/p90、吞吐、峰值
-显存、collective bytes/time、异步 launch/wait 与 overlap、实际 kernel/backend、fallback、
-样本数/离散度和范围。分别给出：
+Write results to `analysis/optimization_results.json`, recording per-target numerical errors, p50/p90, throughput, peak
+memory, collective bytes/time, asynchronous launch/wait and overlap, actual kernel/backend, fallbacks,
+sample count/dispersion, and scope. Report separately:
 
-- `PRECISION_PASS` 或 `PRECISION_FAIL`；
-- `PERFORMANCE_PASS`、`PERFORMANCE_FAIL` 或 `PERFORMANCE_INCONCLUSIVE`。
+- `PRECISION_PASS` or `PRECISION_FAIL`;
+- `PERFORMANCE_PASS`, `PERFORMANCE_FAIL`, or `PERFORMANCE_INCONCLUSIVE`.
 
-只有 `PRECISION_PASS + PERFORMANCE_PASS` 才能称该目标为已验收的高性能实现。裁剪模型
-端到端结果只适用于 crop；使用完整 shape 的模块微基准也不能外推成完整模型吞吐或通信
-扩展性。
+Only `PRECISION_PASS + PERFORMANCE_PASS` qualifies a target as an accepted high-performance implementation. Cropped-model
+end-to-end results apply only to the crop. Even full-shape module microbenchmarks cannot be extrapolated to full-model throughput or communication
+scalability.
 
-当前通用 `report` 命令不会执行或读取任意 replacement A/B。保留它生成的 `summary.md` 和
-`summary.zh-CN.md`，再由 Agent 从 inventory、plan 和 results 生成相邻的英文
-`optimization-summary.md` 与中文 `optimization-summary.zh-CN.md`；不能手工改写矩阵首行
-状态来伪装性能验收。
+The generic `report` command currently neither executes nor reads arbitrary replacement A/B experiments. Keep its generated `summary.md` and
+`summary.zh-CN.md`, then have the agent use the inventory, plan, and results to generate an adjacent English
+`optimization-summary.md` and Chinese `optimization-summary.zh-CN.md`. Do not manually rewrite the matrix's first-line
+status to imply performance acceptance.
 
-## 5. 执行流程
+## 5. Execution Workflow
 
-以下命令应使用同一个绝对 `--output-dir`。相对路径按 manifest 所在目录解析，不按当前 shell
-目录解析，因此建议在正式运行中始终写绝对路径：
+Use the same absolute `--output-dir` for the following commands. Relative paths resolve against the manifest directory, not the current shell
+directory, so absolute paths are recommended for all formal runs:
 
 ```bash
 RUN_DIR=output/model_integration/example
@@ -645,10 +647,10 @@ python -m hyper_parallel.tools.model_integration parity \
   --manifest "$MANIFEST" --output-dir "$RUN_DIR" \
   --device cpu --dtype float32
 
-# 按 analysis/optimization_plan.yaml 执行生产 dtype 模块对拍、目标设备
-# 微基准，以及隔离目录中的 reference/optimized 同拓扑 Trainer A/B。
-# 这些实验由模型的 builder、recipe 和 plan_overrides 决定，没有通用的
-# 隐式 replacement 开关；结果写入 analysis/optimization_results.json。
+# Follow analysis/optimization_plan.yaml for production-dtype module parity, target-device
+# microbenchmarks, and reference/optimized same-topology Trainer A/B in separate directories.
+# These experiments depend on the model's builder, recipe, and plan_overrides; there is no generic
+# implicit replacement switch. Write results to analysis/optimization_results.json.
 
 python -m hyper_parallel.tools.model_integration validate \
   --manifest "$MANIFEST" --output-dir "$RUN_DIR" --generate-only
@@ -660,44 +662,44 @@ python -m hyper_parallel.tools.model_integration report \
   --output-dir "$RUN_DIR"
 ```
 
-先用 coverage ledger 检查 `cases/resolved_cases.json` 的分类数量和完整拓扑列表，再占用多卡资源。正式用例中移除 `--generate-only`。
+Check category counts and the complete topology list in `cases/resolved_cases.json` against the coverage ledger before using multiple devices. Remove `--generate-only` for actual runs.
 
-命令语义：
+Command semantics:
 
-| 命令 | 输入 | 主要产物 |
+| Command | Input | Main artifacts |
 |---|---|---|
-| `inspect` | 本地路径或显式 builder | reference/candidate inventory、结构差异、资源指纹 |
-| `scaffold` | 模型 identity | 最小 adapter 注册、validation provider、manifest 和注册测试骨架 |
-| `check` | 最终生产模型 builder | findings、参数归属、FSDP unit、checkpoint 覆盖 |
-| `parity` | adapter validation provider + reference | 模块比较和 `integration_handoff.yaml` |
-| `validate` | Trainer recipe + matrix | 每个 case 的训练证据、跨 case 比较、性能摘要 |
-| `report` | 已存在的 evidence dir | 首行稳定为 PASS/FAIL/BLOCKED 的英文 `summary.md` 与中文 `summary.zh-CN.md` |
+| `inspect` | Local path or explicit builder | Reference/candidate inventories, structure differences, resource fingerprints |
+| `scaffold` | Model identity | Minimal adapter registration, validation provider, manifest, and registration-test skeleton |
+| `check` | Final production-model builder | Findings, parameter ownership, FSDP units, checkpoint coverage |
+| `parity` | Adapter validation provider and reference | Module comparisons and `integration_handoff.yaml` |
+| `validate` | Trainer recipe and matrix | Per-case training evidence, cross-case comparisons, performance summaries |
+| `report` | Existing evidence directory | English `summary.md` and Chinese `summary.zh-CN.md`, each with PASS/FAIL/BLOCKED consistently on the first line |
 
-退出码为 `0=PASS`、`1=FAIL 或执行错误`、`2=BLOCKED 或 manifest 错误`。
+Exit codes are `0=PASS`, `1=FAIL or execution error`, and `2=BLOCKED or manifest error`.
 
-## 6. 只启用 Trainer 内检查
+## 6. Enable Checks Only Within the Trainer
 
-不运行矩阵时，也可以直接在普通 Trainer recipe 中开启：
+Without running a matrix, enable checks directly in an ordinary Trainer recipe:
 
 ```yaml
 model_integration:
   mode: build
 ```
 
-或：
+Or:
 
 ```yaml
 model_integration:
   mode: runtime
 ```
 
-若未设置 `HYPER_PARALLEL_MODEL_INTEGRATION_OUTPUT_DIR`，证据默认写到 `<checkpoint_dir>/model_integration`。矩阵 launcher 会为每个 case 自动设置独立目录，普通用户无需在 YAML 增加输出路径字段。
+If `HYPER_PARALLEL_MODEL_INTEGRATION_OUTPUT_DIR` is unset, evidence defaults to `<checkpoint_dir>/model_integration`. The matrix launcher automatically assigns a separate directory to each case, so ordinary users need no output-path field in YAML.
 
-`runtime` 会在优化器更新前检查梯度和布局；因此发现错误时不会先污染参数。它会增加诊断开销，只应用于验证运行。
+`runtime` checks gradients and layouts before the optimizer update, avoiding parameter corruption when it detects an error. It adds diagnostic overhead and should be used only for validation runs.
 
-## 7. 证据目录
+## 7. Evidence Directory
 
-典型目录如下：
+A typical directory is:
 
 ```text
 <run>/
@@ -743,76 +745,76 @@ model_integration:
 └── optimization-summary.zh-CN.md
 ```
 
-参数探针和 checkpoint layout 会按 rank 写文件。比较器按逻辑 global shape、mesh/placement 和 logical shard identity 聚合，不通过把完整大参数聚集到单卡来比较。
+Parameter probes and checkpoint layouts are written per rank. The comparator aggregates by logical global shape, mesh/placement, and logical shard identity instead of gathering complete large parameters onto one device.
 
-普通并行矩阵中的性能数据是描述信息：loss、norm、输入 identity、参数探针、布局或
-checkpoint continuation 失败仍决定核心精度状态；吞吐不会改变该状态。对明确声明为高性能
-的 replacement、CP 或 EP，另行使用预声明的同拓扑成对实验作性能门禁，其结果只决定该
-优化目标的 `PERFORMANCE_PASS/FAIL/INCONCLUSIVE`，不能掩盖精度失败。
+Performance data in an ordinary parallel matrix is descriptive. Failures in loss, norm, input identity, parameter probes, layouts, or
+checkpoint continuation still determine core numerical-accuracy status; throughput does not alter it. For replacements, CP, or EP explicitly claimed as high performance,
+use separately predeclared same-topology paired experiments as the performance gate. Their results determine only that
+optimization target's `PERFORMANCE_PASS/FAIL/INCONCLUSIVE` and cannot conceal numerical failures.
 
-## 8. DeepSeek-V4.1 示例
+## 8. DeepSeek-V4.1 Example
 
-可从 [DeepSeek-V4.1 validation manifest](../../../hyper_parallel/models/deepseek_v41/tools/deepseek_v41_validation.yaml) 开始。模型结构、Online 数据、4K 序列和 dtype 仍由 `examples/training_demo/deepseek_v41/` 中的 Trainer recipe 定义，清单使用相对路径引用它；shell 环境和本地资产由用户指定。
+Start with the [DeepSeek-V4.1 validation manifest](../../../hyper_parallel/models/deepseek_v41/tools/deepseek_v41_validation.yaml). Model structure, Online data, 4K sequence length, and dtype are still defined by Trainer recipes in `examples/training_demo/deepseek_v41/`, referenced through relative paths in the manifest. Users provide the shell environment and local assets.
 
-DeepSeek adapter 的验证声明包括：
+The DeepSeek adapter's validation declarations include:
 
-- Engram `q_weight`、`k_weight`、`wkv.weight` 参数生命周期探针；
-- CSA2 sinks 与 MoE gate bias 探针；
-- 正式模型直接构造可执行的 Attention、Engram、mHC 和 Router，不依赖 mandatory replacement；
-- 直接 wrapper 覆盖的 attention sinks、mHC base/scale 等特殊初始化必须正确且梯度有限；
-- scratch crop 的 Engram q/k 必须完成官方初始化；
-- `compressed_kv`、`index_key`、`topk_indices`、`candidate_blocks` 跨层 publish/consume 检查；
-- packed runtime 字段、视觉输入字段及 vision/aligner 梯度检查；
-- 独立进程中的原生 Engram/MoE/CSA2 前向与反向比较；
-- 整层作为一个区域重算（含 CSA2 attention）：状态写入只在正向执行（`is_recomputing()` 判定），离散选择 pin 成 exclude 区域；跨层条目由 autograd 图持有到反向结束。
+- Parameter-lifecycle probes for Engram `q_weight`, `k_weight`, and `wkv.weight`;
+- Probes for CSA2 sinks and MoE gate bias;
+- Direct construction of executable Attention, Engram, mHC, and Router modules in the production model, without mandatory replacements;
+- Correct special initialization and finite gradients for attention sinks, mHC base/scale, and similar parameters covered by direct wrappers;
+- Official initialization of Engram q/k in scratch crops;
+- Cross-layer publish/consume checks for `compressed_kv`, `index_key`, `topk_indices`, and `candidate_blocks`;
+- Checks for packed runtime fields, vision input fields, and vision/aligner gradients;
+- Native Engram/MoE/CSA2 forward/backward comparisons in isolated processes;
+- Whole-layer recomputation as one region, including CSA2 attention: state writes occur only during forward, as determined by `is_recomputing()`; discrete selections are pinned as excluded regions, and autograd holds cross-layer entries until backward ends.
 
-DeepSeek-V4.1 的模型主体和优化路径是一一对应、但彼此不互相替代的：
+DeepSeek-V4.1 core model modules and optimized paths correspond one to one, but do not replace each other's responsibilities:
 
-| 模型语义 | 正式 reference 模块 | recipe 可选 candidate | 选择方式 |
+| Model semantics | Production reference module | Optional recipe candidate | Selection |
 |---|---|---|---|
 | pipelined mHC | `DeepseekV41PipelinedHyperConnection` | `PipelinedMhcModule` | `replace.kind: module` + `implementation` |
 | Engram | `DeepseekV41Engram` | `EngramModule` | `replace.kind: module` + `implementation` |
 | CSA2 Attention | `DeepseekV41Attention` | `SharedCompressedDSAAttention` | `replace.kind: module` + `implementation` |
 
-两种 Attention 共享 `SharedCompressedDSAAttentionBase`：正式模块固定
-`use_optimized_sparse_attention=False`，candidate 固定为 `True`。provider 只登记 factory；当前 demo 是 recipe
-显式选择三项 replacement。删掉这些条目时模型仍能 forward/backward，并回退到未优化 reference path。
+Both Attention implementations share `SharedCompressedDSAAttentionBase`. The production module fixes
+`use_optimized_sparse_attention=False`, while the candidate fixes it to `True`. Providers only register factories; the current demo's recipe
+explicitly selects three replacements. Removing those entries still allows forward/backward and falls back to the unoptimized reference path.
 
-示例 `recompute_topology` 使用 EP16，而 baseline 使用 EP1，因此重计算组刻意按跨拓扑阈值比较。如果目标是单独验证重计算开关，应让 `recompute_topology` 的并行字段与 baseline 相同。
+The example uses EP16 for `recompute_topology` and EP1 for the baseline, so the recomputation group deliberately uses cross-topology thresholds. To isolate the effect of recomputation, make the parallel fields in `recompute_topology` match the baseline.
 
-## 9. 常见失败与处理
+## 9. Common Failures and Remedies
 
-| 现象 | 含义 | 处理方式 |
+| Symptom | Meaning | Remedy |
 |---|---|---|
-| 替换相关报错 | 可选替换未命中，或最终树仍有非可执行 Placeholder/forward-state 契约破坏 | 优先把模型主体迁入正式 architecture；确有生命周期约束时再修正 finalization、adapter pattern 或显式 mapping |
-| FSDP ownership 相关报错 | 一个 FSDP unit 混合 dense/expert 域、专家落入 root 或 alias 归属冲突 | 在 adapter 声明同质 child unit 和正确边界 |
-| materialization 相关报错 | meta tensor、derived buffer 或模型初始化未完成 | 修正 materialization hook/模型初始化，不用 checkpoint 掩盖派生状态 |
-| checkpoint 覆盖相关报错 | checkpoint key 未覆盖或转换不可逆 | 增加 mapping/transform/reverse transform 或显式合法排除 |
-| forward 数据契约相关报错 | forward 字段所有权冲突、字段缺失、label shift/模态梯度不符 | 修正 Omni dataset transform、get-batch 或 runtime input adapter 声明 |
-| 参数探针未命中 | required probe 未匹配最终参数 | 使用替换后的最终 FQN 更新 adapter 声明 |
-| 共享状态契约相关报错 | 跨层状态缺 producer/consumer、producer 重复发布或 trace 超限 | 让状态写入只在正向执行（`is_recomputing()`）、把离散选择 pin 成 exclude 区域，或缩小重算边界 |
-| Online dataloader 拒绝跨 DP world-size cursor，或跳过 cursor 后 input hash 仍不同 | DCP 能重分片模型/优化器，不代表 loader 能重建全局样本位置；从同一配置起点也不保证 DP-invariant packing | warm-start 可用 `restore_dataloader_state=false` 请求 replay，但必须检查 global input hash；正式跨拓扑精度改用固定 Offline replay，真正续训改用支持全局 cursor 重建的 loader，否则标为 `BLOCKED` |
-| `BLOCKED` | 证据、设备、资产或独立 oracle 不可用 | 补齐前置条件；不要放宽阈值或静默缩小实验 |
+| Replacement errors | Optional replacement did not match, or the final tree still contains a nonexecutable Placeholder/violated forward-state contract | First move core model semantics into the production architecture; only for genuine lifecycle constraints, fix finalization, adapter patterns, or explicit mappings |
+| FSDP ownership errors | An FSDP unit mixes dense/expert domains, experts fall into the root, or alias ownership conflicts | Declare homogeneous child units and correct boundaries in the adapter |
+| Materialization errors | Meta tensors, derived buffers, or model initialization remain incomplete | Fix materialization hooks/model initialization; do not mask derived-state issues with checkpoints |
+| Checkpoint coverage errors | Checkpoint keys are uncovered or transformations are not reversible | Add mappings/transforms/reverse transforms or explicitly legitimate exclusions |
+| Forward data-contract errors | Conflicting forward-field ownership, missing fields, or incorrect label shift/modality gradients | Fix Omni dataset transforms, get-batch, or runtime input-adapter declarations |
+| Unmatched parameter probes | A required probe matches no final parameters | Update adapter declarations using final FQNs after replacement |
+| Shared-state contract errors | Cross-layer state lacks a producer/consumer, producers publish twice, or traces exceed limits | Restrict state writes to forward using `is_recomputing()`, pin discrete selections as excluded regions, or narrow recomputation boundaries |
+| Online dataloader rejects a cursor across DP world sizes, or input hashes still differ after skipping the cursor | DCP model/optimizer resharding does not imply that the loader can reconstruct global sample positions; starting at the same configured point does not guarantee DP-invariant packing | Warm-start may request replay with `restore_dataloader_state=false`, but must check the global input hash. Use fixed Offline replay for formal cross-topology numerical validation and a loader supporting global-cursor reconstruction for actual continued training; otherwise mark `BLOCKED` |
+| `BLOCKED` | Evidence, devices, assets, or an independent oracle are unavailable | Satisfy prerequisites; do not relax thresholds or silently shrink the experiment |
 
-如果两个 case 的 `global_input_sha256` 不同，应先修复数据重放，再判断 loss/norm。若聚合 loss/norm 通过但参数探针失败，应以参数探针为准，它用于发现小参数、专家局部参数和 optimizer state 的局部错误。
+If two cases have different `global_input_sha256` values, fix data replay before evaluating loss/norm. If aggregate loss/norm passes but parameter probes fail, the parameter probes take precedence: they detect local errors in small parameters, expert-local parameters, and optimizer states.
 
-## 10. 新模型接入完成条件
+## 10. Completion Criteria for a New Model Integration
 
-一个接入只有同时满足以下条件才可判定完成：
+An integration is complete only when all of the following hold:
 
-- 中央框架中没有新增模型名、模型类、模型 FQN 或模型配置字段特判；
-- 高性能能力 inventory 覆盖所有 required optimized modules、CP 和 EP 路径，并记录搜索范围、复用决策、被拒绝候选和 fallback；
-- 每个高性能声明都有预先制定的 optimization plan、独立精度 oracle、目标设备模块微基准和同拓扑端到端 A/B；
-- 优化目标只有在 `PRECISION_PASS + PERFORMANCE_PASS` 时称为已验收；缺少公平 baseline 或稳定证据时明确标记 `PERFORMANCE_INCONCLUSIVE`；
-- 最终生产模块而非测试替身参与 structure check 和 parity；
-- 正式 architecture 在不应用 recipe replacement 时可直接完成有限的 forward/backward，高性能实现不承担模型主体语义；
-- checkpoint 每个 source/target key 都有明确分类；
-- dense/expert 参数归属和 DTensor global layout 可证明；
-- coverage ledger 与 `resolved_cases.json` 完全对账，报告按互斥类别计数；
-- 多模态各子树的实际 TP/CP/EP/FSDP placement 单独记录，不以启动拓扑代替真实切分证据；
-- 所需 DTensor 算子按精确 callable key 验证实现、签名与注册；
-- 输入 identity、loss、pre/post-clip norm、关键参数/梯度/优化器状态均比较；
-- 共享跨层状态和重计算边界由 adapter 明确声明；
-- 多模态输入到达模型时，声明的视觉参数获得有限梯度；
-- 同拓扑、跨拓扑、EP1 对照、重计算和 resume 覆盖满足模型实际使用场景；
-- 中英文最终报告首行为 `PASS`，并在人工结论中明确标注裁剪或全量验证范围。
+- No model-name, model-class, model-FQN, or model-config-field special cases were added to the central framework;
+- The high-performance capability inventory covers all required optimized modules, CP paths, and EP paths, recording search scope, reuse decisions, rejected candidates, and fallbacks;
+- Every high-performance claim has a predeclared optimization plan, independent numerical oracle, target-device module microbenchmark, and same-topology end-to-end A/B;
+- Optimization targets are accepted only with `PRECISION_PASS + PERFORMANCE_PASS`; missing fair baselines or stable evidence are explicitly marked `PERFORMANCE_INCONCLUSIVE`;
+- Final production modules participate in structure checks and parity, rather than test substitutes;
+- The production architecture directly completes forward/backward with finite results without recipe replacements, and high-performance implementations do not carry the core model semantics;
+- Every checkpoint source/target key has an explicit classification;
+- Dense/expert parameter ownership and DTensor global layouts are demonstrable;
+- The coverage ledger fully reconciles with `resolved_cases.json`, and report counts use mutually exclusive categories;
+- Actual TP/CP/EP/FSDP placements for each multimodal subtree are recorded separately; launch topology is not used as evidence of actual sharding;
+- Required DTensor operators have their implementations, signatures, and registrations verified by exact callable keys;
+- Input identity, loss, pre-/post-clip norm, and critical parameter/gradient/optimizer states are all compared;
+- The adapter explicitly declares shared cross-layer state and recomputation boundaries;
+- Declared vision parameters receive finite gradients when multimodal inputs reach the model;
+- Same-topology, cross-topology, EP1-control, recomputation, and resume coverage matches the model's actual use cases;
+- English and Chinese final reports begin with `PASS`, and the written conclusion explicitly states whether validation covered a cropped or full model.

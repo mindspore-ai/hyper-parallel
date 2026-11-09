@@ -1,6 +1,8 @@
-# YAML Trainer 配置结构
+# YAML Trainer Configuration
 
-HyperParallel 模型训练按 [`TrainerConfig`](../../../hyper_parallel/trainer/config/trainer.py#L47-L105) 的字段定义解析 YAML。字段名决定 YAML 可以包含哪些配置项，字段类型决定对应的值如何解析。解析完成后得到 `TrainerConfig` 对象，随后通过 CLI dotted overrides 更新配置字段。
+**English** | [简体中文](yaml_config.zh.md)
+
+HyperParallel model training parses YAML according to the fields of [`TrainerConfig`](../../../hyper_parallel/trainer/config/trainer.py#L47-L105). Field names determine the accepted configuration keys; field types determine how values are parsed. Parsing produces a `TrainerConfig` object, then CLI dotted overrides update its fields.
 
 ```python
 @dataclass
@@ -12,11 +14,11 @@ class TrainerConfig:
     ...
 ```
 
-`training` 和 `accelerator` 按各自的 dataclass 解析；`model`、`optimizer`解析为 `Target`。
+`training` and `accelerator` are parsed as their respective dataclasses; `model` and `optimizer` are parsed as `Target` objects.
 
-## 1. Dataclass 节点
+## 1. Dataclass Nodes
 
-当 `TrainerConfig` 字段声明为 dataclass 时，对应的 YAML mapping 按该 dataclass 的字段解析，不写 `_target_`：
+When a `TrainerConfig` field is declared as a dataclass, its YAML mapping is parsed according to that dataclass's fields, without `_target_`:
 
 ```yaml
 training:
@@ -36,47 +38,47 @@ accelerator:
   loss_parallel: false
 ```
 
-上例中的两个 mapping 分别解析为 `TrainingConfig` 和 `AcceleratorConfig`。解析器按照 dataclass 定义：
+The two mappings above become `TrainingConfig` and `AcceleratorConfig`. Following the dataclass definitions, the parser:
 
-- 校验 YAML key 是否对应字段。
-- 为缺省字段填入默认值，并检查无默认值的必填字段。
-- 根据字段类型转换标量和容器，包括 `Optional`、`Literal`、list、tuple 和嵌套 dataclass。
-- 在类型或字段错误中保留完整路径，例如 `$.accelerator.tp_size: expected int, got str`。
+- Validates that YAML keys correspond to declared fields.
+- Fills defaults for omitted fields and checks required fields without defaults.
+- Converts scalars and containers according to field types, including `Optional`, `Literal`, lists, tuples, and nested dataclasses.
+- Preserves full paths in type and field errors, such as `$.accelerator.tp_size: expected int, got str`.
 
-外层字段的类型注解确定嵌套 mapping 对应的 dataclass。因此根 YAML 只接受 `TrainerConfig` 声明的字段，嵌套配置也只接受对应 dataclass 声明的字段。
+The outer field's type annotation determines the dataclass for each nested mapping. The root YAML therefore accepts only fields declared by `TrainerConfig`; nested configurations accept only fields declared by the corresponding dataclass.
 
-### NPU 算子级在线压测
+### Online NPU Operator Stress Testing
 
-通过与 `training` 并列的 [`StressDetectConfig`](../../../hyper_parallel/trainer/config/stress_detect.py)
-配置压测，在完整优化器 step 结束后执行：
+Configure stress testing through [`StressDetectConfig`](../../../hyper_parallel/trainer/config/stress_detect.py),
+alongside `training`. Detection runs after a complete optimizer step:
 
 ```yaml
 stress_detect:
   op_stress_detect:
-    detection_interval: 100        # step 间隔；默认 0，不创建压测回调
-    num_detections: 3              # 每轮每种类型的检测次数，默认 1
-    detect_type: all               # aic（默认）、hccs 或 all
-    exit_training_on_sdc: false    # 精度异常时是否终止训练，默认 false
+    detection_interval: 100        # Step interval; defaults to 0, which creates no stress-testing callback.
+    num_detections: 3              # Detections per type per round; defaults to 1.
+    detect_type: all               # aic (default), hccs, or all.
+    exit_training_on_sdc: false    # Whether a numerical anomaly stops training; defaults to false.
 ```
 
-`aic` 检测 AI Core，`hccs` 检测节点内卡间链路；`all` 先执行 AIC，再执行 HCCS。
-每次检测返回后立即处理结果：
+`aic` tests AI Cores, `hccs` tests inter-device links within a node, and `all` runs AIC first, then HCCS.
+Results are handled immediately after each detection returns:
 
-- 精度异常：记录 ERROR；`exit_training_on_sdc: true` 时立即抛异常，终止训练及剩余检测。
-- 执行失败或未知返回值：记录 WARNING，继续训练。
-- 电压恢复失败等底层异常：直接向上传播。
+- Numerical anomaly: log ERROR; with `exit_training_on_sdc: true`, immediately raise an exception, stopping training and remaining detections.
+- Execution failure or unknown return value: log WARNING and continue training.
+- Low-level exceptions, such as voltage-restoration failures: propagate directly.
 
-仅支持 NPU，需预留约 10 GB 设备内存。各 rank 应使用一致配置，HCCS 还要求已初始化分布式通信。
-其他硬件及运行约束见 [torch_npu 接口文档](https://www.hiascend.com/document/detail/zh/Pytorch/700/apiref/apilist/ptaoplist_001321.html)。
-如需查看检测开始和成功的 INFO 日志，设置 `HP_LOG_CONFIG=HP:INFO`。
+Only NPU is supported, and approximately 10 GB of device memory must be reserved. Use identical configuration on all ranks; HCCS additionally requires initialized distributed communication.
+For other hardware and runtime constraints, see the [torch_npu API documentation](https://www.hiascend.com/document/detail/zh/Pytorch/700/apiref/apilist/ptaoplist_001321.html).
+Set `HP_LOG_CONFIG=HP:INFO` to see INFO logs for detection start and success.
 
-`model_stress_detect` 为预留配置，暂不支持启用。
+`model_stress_detect` is reserved configuration and cannot currently be enabled.
 
-## 2. Target 节点
+## 2. Target Nodes
 
-[`Target`](../../../hyper_parallel/trainer/config/target.py#L54) 是一个延迟调用 Python 类或函数的配置对象。它保存导入后的目标对象、原始导入路径和 YAML 参数；调用 `build()` 时，再合并 Trainer 提供的运行时参数并创建组件。
+[`Target`](../../../hyper_parallel/trainer/config/target.py#L54) is a configuration object for deferred invocation of a Python class or function. It stores the imported target, original import path, and YAML arguments. `build()` merges runtime arguments supplied by the Trainer and creates the component.
 
-以模型配置为例：
+For example, consider model configuration:
 
 ```yaml
 model:
@@ -88,7 +90,7 @@ model:
   force_hf: true
 ```
 
-框架完成对于配置的解析 [`_resolve_target()`](../../../hyper_parallel/trainer/config/resolver.py#L347-L382)：Resolver 导入 `_target_` 指向的对象，校验并规范化 YAML 参数，然后构造：
+The framework parses the configuration through [`_resolve_target()`](../../../hyper_parallel/trainer/config/resolver.py#L347-L382): the resolver imports the object referenced by `_target_`, validates and normalizes YAML arguments, then constructs:
 
 ```python
 config.model = Target(
@@ -101,9 +103,9 @@ config.model = Target(
 )
 ```
 
-`normalized_args` 包含 YAML 参数和 [`HyperAutoModelForCausalLM.from_pretrained()`](../../../hyper_parallel/models/_transformers/auto_model.py#L77-L152) 的默认参数。此时只生成配置对象，不调用 `from_pretrained`，也不加载模型权重。
+`normalized_args` contains the YAML arguments and defaults from [`HyperAutoModelForCausalLM.from_pretrained()`](../../../hyper_parallel/models/_transformers/auto_model.py#L77-L152). This creates only a configuration object; it neither calls `from_pretrained` nor loads model weights.
 
-[`BaseTrainer._build_model()`](../../../hyper_parallel/trainer/base.py#L285-L314) 在分布式环境初始化完成后构建模型：
+[`BaseTrainer._build_model()`](../../../hyper_parallel/trainer/base.py#L285-L314) constructs the model after distributed environment initialization:
 
 ```python
 self.model = self.config.model.build(
@@ -115,7 +117,7 @@ self.model = self.config.model.build(
 )
 ```
 
-将 YAML 参数与 Trainer 提供的运行时参数合并后，这一构建过程等价于调用 `HyperAutoModelForCausalLM.from_pretrained()` 函数：
+After merging YAML arguments with runtime arguments supplied by the Trainer, this is equivalent to calling `HyperAutoModelForCausalLM.from_pretrained()`:
 
 ```python
 self.model = HyperAutoModelForCausalLM.from_pretrained(
@@ -132,26 +134,26 @@ self.model = HyperAutoModelForCausalLM.from_pretrained(
 )
 ```
 
-[`TrainerConfig`](../../../hyper_parallel/trainer/config/trainer.py#L47-L105) 通过字段类型声明各配置节点的解析方式：`Target[...]` 字段解析为 `Target`，dataclass 字段解析为对应的 dataclass。
+[`TrainerConfig`](../../../hyper_parallel/trainer/config/trainer.py#L47-L105) declares each node's parsing behavior through its field type: `Target[...]` fields become `Target` objects; dataclass fields become their corresponding dataclasses.
 
-解析 `Target` 时会检查：
+When parsing a `Target`, the parser checks:
 
-1. `_target_` 的路径能否导入，以及导入结果是否可调用。
-2. YAML 中的每个参数名能否作为关键字参数传给目标对象。
-3. 目标参数存在类型注解时，YAML 值能否按该类型校验和转换。
+1. Whether `_target_` can be imported and the imported object is callable.
+2. Whether every YAML argument name can be passed to the target as a keyword argument.
+3. Whether YAML values can be validated and converted according to target argument annotations, where present.
 
-解析器还会补入目标函数的默认参数。由 Trainer 在构建阶段提供的必填参数不需要写入 YAML。
+The parser also fills in target function defaults. Required arguments supplied by the Trainer during construction need not be included in YAML.
 
-基于 `_target_` 接入外部模型和训练组件的方法见 [AutoModels 二次开发指南](custom_component.md)。
+See the [Extension Guide](custom_component.md) for integrating external models and training components through `_target_`.
 
-性能 trace 使用根节点 `profiler`，字段与迁移方法见 [Training profiler](profiler.md)。
+Performance tracing uses the root `profiler` node; see [Training profiler](profiler.md) for fields and migration instructions.
 
-Allocator memory history 使用根节点 `memory` 配置。字段、step 边界和异常清理语义见
-[Memory snapshot 配置](memory_profiler.md)。
+Allocator memory history is configured through the root `memory` node. For fields, step boundaries, and exception-cleanup semantics, see
+[Memory snapshot configuration](memory_profiler.md).
 
 ## 3. CLI Dotted Override
 
-CLI override 在 YAML 已经解析为 `TrainerConfig` 后执行，使用 `--field.path=value` 定位并替换配置树中的值：
+CLI overrides run after YAML has been parsed into `TrainerConfig`, using `--field.path=value` to locate and replace values in the configuration tree:
 
 ```bash
 --training.train_iters=100
@@ -160,7 +162,7 @@ CLI override 在 YAML 已经解析为 `TrainerConfig` 后执行，使用 `--fiel
 --profiler.enable=true
 ```
 
-Value 先由 `yaml.safe_load()` 解析，再按照目标节点的类型转换：
+Values are first parsed with `yaml.safe_load()`, then converted according to the target node's type:
 
 ```bash
 --optimizer.no_decay_params='[bias, norm, ln_]'
@@ -169,11 +171,11 @@ Value 先由 `yaml.safe_load()` 解析，再按照目标节点的类型转换：
 --checkpoint.restore_from=null
 ```
 
-路径替换遵循配置树本身的结构：
+Path replacement follows the configuration tree's structure:
 
-- 参数使用 `--field.path=value`，不接受分离的 `--field.path value`。
-- Dataclass 路径必须对应已有字段。
-- 普通 Mapping 只能修改已有 key。
-- `Target` 参数必须已在配置中，或存在于 callable 签名中；带 `**kwargs` 的 callable 可以接收新增参数。
-- `_target_` 不参与替换，CLI override 不改变 callable。
-- 当前值为 `None` 的可选组件没有可继续遍历的配置节点，组件结构需要由 YAML 提供。
+- Use `--field.path=value`; the separate form `--field.path value` is not accepted.
+- Dataclass paths must refer to existing fields.
+- Ordinary mappings allow updates only to existing keys.
+- `Target` arguments must already be configured or appear in the callable's signature; callables with `**kwargs` may accept new arguments.
+- `_target_` is not replaceable; CLI overrides do not change the callable.
+- An optional component whose current value is `None` has no configuration nodes to traverse; YAML must provide its structure.

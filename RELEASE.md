@@ -1,5 +1,7 @@
 # HyperParallel v1.0.0 Release Notes
 
+**English** | [简体中文](RELEASE_CN.md)
+
 HyperParallel is a distributed parallel acceleration library for Ascend SuperNodes, decoupling model code from system optimization and providing unified distributed training capabilities ranging from cluster-level MPMD to in-chip multicore parallelism. v1.0.0 is the first official release, with the following core features:
 
 ## Core Features

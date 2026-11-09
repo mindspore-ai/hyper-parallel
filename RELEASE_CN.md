@@ -1,5 +1,7 @@
 # HyperParallel v1.0.0 Release Notes
 
+[English](RELEASE.md) | **简体中文**
+
 HyperParallel 是面向昇腾超节点的分布式并行加速库，解耦模型代码与系统优化，提供从集群级 MPMD 到芯片内多核并行的统一分布式训练能力。v1.0.0 为首个正式发布版本，核心特性如下：
 
 ## 核心特性

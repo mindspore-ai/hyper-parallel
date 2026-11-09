@@ -1,6 +1,6 @@
 include requirements.txt
 include README.md
-include README.en.md
+include README.zh.md
 include LICENSE
 include build.sh
 include hyper_parallel/rl/pyproject.toml

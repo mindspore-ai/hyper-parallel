@@ -1,9 +1,11 @@
-# 单轮 Python code 训练
+# Single-Turn Python Code Training
 
-本示例通过 internal runner 生成一次 Python stdin/stdout 程序，在独立 SandboxFusion 服务中判题，
-再将奖励交给 GRPO。示例配置见 [qwen3_4b_code_vllm.yaml](configs/qwen3_4b_code_vllm.yaml)。
+**English** | [简体中文](README.zh.md)
 
-## 接入合同
+This example uses the internal runner to generate one Python stdin/stdout program, grades it in an independent SandboxFusion service,
+and passes the reward to GRPO. See [qwen3_4b_code_vllm.yaml](configs/qwen3_4b_code_vllm.yaml).
+
+## Integration Contract
 
 ```yaml
 data:
@@ -20,24 +22,24 @@ agentic:
     request_timeout: 300
 ```
 
-`row_adapter` 保留原始多消息、稳定 `task_id`、来源 metadata 和结构化 `ground_truth`。
-它与 `prompt_column`、`answer_column`、`prompt_instruction` 互斥。私有测试仅放在
-`ground_truth.inputs/outputs`，不进入 prompt；超长消息明确报错，不能静默截断题意。
+`row_adapter` preserves original multi-message inputs, stable `task_id`, source metadata, and structured `ground_truth`.
+It is mutually exclusive with `prompt_column`, `answer_column`, and `prompt_instruction`. Private tests belong only in
+`ground_truth.inputs/outputs`, never the prompt. Oversized messages raise an explicit error instead of silently truncating the problem.
 
-判题器提取最后一个 Python 代码块，也接受未加代码围栏的程序。提取仅用于沙箱执行，训练仍使用原始
-action tokens 和 rollout logprobs。所有声明测试都执行完成后，按空白分词精确比较输出；全通过奖励为 1，
-否则为 0。首次失败原因记录为 `wrong_answer`、`runtime_error`、`timeout` 或 `output_limit`；
-空程序、不支持的代码围栏或超过 64 KiB 的代码记为 `format_error`。不支持交互题、特殊 checker 和浮点容差。
+The judge extracts the last Python code block or accepts an unfenced program. Extraction is only for sandbox execution; training retains original
+action tokens and rollout logprobs. After every declared test completes, output is compared exactly after whitespace tokenization. All tests passing earns 1,
+otherwise 0. The first failure is recorded as `wrong_answer`, `runtime_error`, `timeout`, or `output_limit`.
+Empty programs, unsupported code fences, or code over 64 KiB yield `format_error`. Interactive tasks, special checkers, and floating-point tolerances are unsupported.
 
-HTTP、解码、协议及 `SandboxError` 均向上传播，不伪装成零分，也不隐式重试执行。
-Trainer TP 组仅 request owner 执行环境，其他 rank 重放结果；`finish_reason=length` 记录为截断。
+HTTP, decoding, protocol, and `SandboxError` failures propagate; they are not disguised as zero scores or implicitly retried.
+Only the request owner in each Trainer TP group executes the environment; other ranks replay results. `finish_reason=length` records truncation.
 
-## 数据准备和核验
+## Data Preparation and Review
 
-以下命令在统一训练容器的仓库根目录执行。当前源码挂载为 `/workspace/hyper-parallel`，
-权重根目录挂载为 `/models`，数据根目录挂载为 `/data`，输出目录挂载为 `/results`。
-先按[运行环境](../../docker/README.md)保留 CANN 初始化和插件注册，并确认主包 editable 指向当前 checkout。
-示例模块沿用现有 launcher 的源码路径：
+Run these commands from the repository root in the unified training container. Source is mounted at `/workspace/hyper-parallel`,
+weights at `/models`, data at `/data`, and output at `/results`.
+Preserve CANN initialization and plugin registration from the [runtime guide](../../docker/README.md), and verify the editable main package points to the current checkout.
+Example modules use the existing launcher's source paths:
 
 ```bash
 export PYTHONPATH=/workspace/hyper-parallel/hyper_parallel/rl:/workspace/hyper-parallel:${PYTHONPATH:-}
@@ -51,25 +53,25 @@ python -m examples.code.prepare_data \
   --max-train 128 --max-validation 32
 ```
 
-准备脚本只读本地原始 parquet，保持测试内容与顺序，过滤不支持的题型、超预算测试和重复题目，
-并生成包含源文件/结果哈希、过滤计数及稳定任务 ID 的 `manifest.json`。
-`--manual-exclusions exclusions.json` 接受 `{"train:455277": "审核原因"}` 形式的明确排除记录。
+Preparation reads only local raw Parquet, preserves test content/order, filters unsupported task types, over-budget tests, and duplicate questions,
+and produces `manifest.json` with source/result hashes, filter counts, and stable task IDs.
+`--manual-exclusions exclusions.json` accepts explicit exclusions such as `{"train:455277": "review reason"}`.
 
-准备成功不代表标签正确。训练前须用独立参考解运行每题全部原始测试；输入输出错配时保留失败证据，
-通过 `--manual-exclusions` 排除整题，不修改标签来获得通过结果。
-训练配置应指向审核后的 prepared 文件，不直接把候选目录视为可信数据。
+Successful preparation does not establish correct labels. Before training, run every original test for each question with an independent reference solution. Preserve mismatch evidence,
+and exclude the entire question with `--manual-exclusions`; do not modify labels to obtain passing results.
+Training configuration must point to reviewed prepared files; the candidate directory is not automatically trusted data.
 
-## SandboxFusion 部署
+## SandboxFusion Deployment
 
-使用 `swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/sandboxfusion-python:v2-arm64`。
-先按[镜像获取与校验](../../docker/README.md#单轮-code-的-sandboxfusion-镜像)拉取并核对镜像身份；
-镜像基于独立 Python slim 环境，不继承训练基础层。
-训练镜像是 `swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:v0.23.0.post1-code-agent-arm64`，两者分开运行。
-沙箱不挂载训练源码、权重、数据或 Docker socket。
+Use `swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/sandboxfusion-python:v2-arm64`.
+Pull and verify the image following [image download and verification](../../docker/README.md#sandboxfusion-image-for-single-turn-code).
+It uses an independent Python slim environment, without inheriting the training base layer.
+The training image is `swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:v0.23.0.post1-code-agent-arm64`; run them separately.
+Do not mount training source, weights, data, or the Docker socket into the sandbox.
 
-以下启动方式适用于 Docker 18 / cgroup v1。Docker 18 没有 `--cgroupns`，
-因此在容器内部使用 `unshare` 建立私有 cgroup/mount namespace，再为原始 lite 隔离挂载控制器；
-保持镜像的 `lite` 隔离；镜像内的 `tini` 回收候选超时或结束后遗留的已退出子进程。
+This launch method targets Docker 18 / cgroup v1. Docker 18 lacks `--cgroupns`,
+so `unshare` creates private cgroup/mount namespaces inside the container before mounting controllers for the original lite isolation.
+Retain the image's `lite` isolation; bundled `tini` reaps exited children left after candidate timeout or completion.
 
 ```bash
 docker network inspect hyper-rl-sandbox >/dev/null 2>&1 || docker network create hyper-rl-sandbox
@@ -95,14 +97,14 @@ docker run -d --name hyper-rl-code-sandbox \
 curl --fail http://127.0.0.1:18790/health
 ```
 
-训练容器须使用 host 网络才能通过上述 loopback endpoint 访问沙箱。
-服务全局并发为 1，候选 stdout/stderr 原始输出上限为 1 MiB；HTTP 超时包含排队时间，
-与单测试 `run_timeout` 分开。当前固定镜像不提供逐请求内存限制配置，资源由部署与原有 lite 实现约束。
-如果返回 `SandboxError`，检查服务日志；仅 `/health` 成功不能证明 overlay/cgroup 和候选执行可用。
+The training container needs host networking to reach the sandbox through this loopback endpoint.
+Service-wide concurrency is 1, with a 1 MiB raw candidate stdout/stderr limit. HTTP timeout includes queueing time
+and is separate from per-test `run_timeout`. The pinned image offers no per-request memory limit configuration; deployment and existing lite isolation constrain resources.
+For `SandboxError`, inspect service logs. A successful `/health` alone does not prove overlay/cgroups or candidate execution work.
 
-## 验证与训练
+## Validation and Training
 
-CPU 合同测试不会在训练进程执行候选代码；HTTP 用例使用本地受控服务响应。
+CPU contract tests never execute candidate code in the training process; HTTP cases use locally controlled service responses.
 
 ```bash
 python -m pytest -q \
@@ -111,9 +113,9 @@ python -m pytest -q \
   tests/ut/rl/agentic/test_code_runner.py
 ```
 
-真实沙箱合同测试使用固定正确/错误程序，验证运行异常、超时、输出限制，以及非 root/零有效权限、
-候选依赖独立、网络和跨请求文件隔离；
-服务不可达与响应损坏的失败传播由 UT 覆盖。资源须显式配置，缺失时跳过不算通过：
+Real sandbox contract tests use fixed correct/incorrect programs to check runtime exceptions, timeouts, output limits, non-root/zero-effective-capability execution,
+independent candidate dependencies, network isolation, and cross-request file isolation.
+UT covers propagation of unreachable-service and corrupted-response failures. Configure resources explicitly; skipping due to missing resources is not a pass:
 
 ```bash
 export RL_ST_SANDBOX_ENDPOINT=http://127.0.0.1:18790
@@ -122,10 +124,10 @@ export RL_ST_REQUIRED=1
 python -m pytest -q hyper_parallel/rl/tests/st/test_feature_st.py::test_code_sandbox
 ```
 
-### 从宿主机直接启动
+### Launch Directly from the Host
 
-使用 [Docker 启动脚本](scripts/run_qwen3_4b_code_docker.sh)。先部署上面的 v2 沙箱，
-准备本地训练镜像、Qwen3-4B 权重和已审核数据，并确认四卡可用。脚本不会下载这些资源。
+Use the [Docker launcher](scripts/run_qwen3_4b_code_docker.sh). Deploy the v2 sandbox above first,
+prepare the local training image, Qwen3-4B weights, and reviewed data, and confirm four devices are available. The script does not download them.
 
 ```bash
 export HYPER_CODE_MODEL_ROOT=/path/to/models/Qwen3-4B
@@ -135,26 +137,26 @@ bash hyper_parallel/rl/examples/code/scripts/run_qwen3_4b_code_docker.sh --dry-r
 bash hyper_parallel/rl/examples/code/scripts/run_qwen3_4b_code_docker.sh
 ```
 
-将示例路径替换为本机的模型及已审核数据目录，后者须包含 `train.parquet` 和 `validation.parquet`。
-输出默认写到仓库 `output/code/<时间>-<进程号>/`，
-可用 `HYPER_CODE_OUTPUT_DIR` 指定；包含 `train.log` 和 `checkpoints/`。
-脚本安装当前源码的 editable 主包和 RL 插件，并将实际沙箱 Image ID 传给 `agentic.code.runtime_version`。
+Replace example paths with local model and reviewed-data directories. The latter must contain `train.parquet` and `validation.parquet`.
+Output defaults to repository `output/code/<timestamp>-<pid>/`,
+overridable with `HYPER_CODE_OUTPUT_DIR`, and contains `train.log` and `checkpoints/`.
+The script installs the current source's editable main package and RL plugin, passing the actual sandbox Image ID as `agentic.code.runtime_version`.
 
-默认执行 YAML 的两步训练、每题四候选、最终评测和保存；生成预算以配置为准。
-初始化 CPU 线程配置为 `null`，sleep level 为 `1`。既有配置项可在脚本末尾显式覆盖，例如：
+By default, it runs the YAML's two training steps, four candidates per question, final evaluation, and saving; generation budgets follow configuration.
+Initialization CPU threads are `null`, and sleep level is `1`. Override existing fields explicitly at the end of the command, for example:
 
 ```bash
 bash hyper_parallel/rl/examples/code/scripts/run_qwen3_4b_code_docker.sh \
   --train.model_init_cpu_threads=8 --rollout.vllm.sleep_level=2
 ```
 
-默认普通权限，只映射所选四张物理卡，并在容器内使用逻辑编号 `0,1,2,3`。
-驱动确需特权访问时，可显式设置 `HYPER_CODE_PRIVILEGED=1`；此模式使用所选物理卡编号。
-`--help` 可查看镜像、沙箱服务、设备和端口等配置入口。
+Default execution is unprivileged, maps only the selected four physical devices, and uses logical IDs `0,1,2,3` inside the container.
+If the driver requires privileged access, explicitly set `HYPER_CODE_PRIVILEGED=1`; this mode uses selected physical device IDs.
+See `--help` for image, sandbox service, device, and port configuration.
 
-### 在已有训练容器中启动
+### Launch in an Existing Training Container
 
-确认 4 张卡空闲、数据经过上述审核后执行：
+After confirming four devices are idle and data has passed the review above, run:
 
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
@@ -165,9 +167,9 @@ python -m torch.distributed.run --standalone --nproc_per_node=4 \
   --data.test_path=/results/code-reviewed/validation.parquet
 ```
 
-本配置为 dense Qwen3、TP2/DP2、colocated native vLLM。保存 checkpoint 时会触发评估，
-因此同时启用 `evaluation.enabled` 和 `train.checkpoint.save_final`；最终写入模型与优化器状态。
-启动前核对训练和 rollout 的总设备占用，`runtime_version` 须与实际沙箱镜像身份一致。
-验收检查有限 loss/梯度、真实参数更新、策略版本递增及更新后的再次采样。
-系统测试入口及边界见[功能与验证说明](../../docs/moe_code_agent.md#系统测试)。
-为快速检查链路而复用同一批题作为 train/validation 时，必须明确记录重叠，不报告为独立泛化评估。
+This configuration uses dense Qwen3, TP2/DP2, and colocated native vLLM. Checkpoint saving triggers evaluation,
+so both `evaluation.enabled` and `train.checkpoint.save_final` are enabled; model and optimizer states are saved at the end.
+Before launch, verify total training/rollout device occupancy and ensure `runtime_version` matches the actual sandbox image.
+Acceptance checks finite loss/gradients, actual parameter updates, increasing policy versions, and resampling after updates.
+See [feature and validation documentation](../../docs/moe_code_agent.md#system-tests) for ST entry points and boundaries.
+If reusing the same questions for train/validation to check execution quickly, record the overlap explicitly and do not report independent generalization evaluation.

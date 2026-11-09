@@ -1,5 +1,7 @@
 # GSM8K training examples
 
+**English** | [简体中文](README.zh.md)
+
 ## Training recipes
 
 | Task | Configuration |

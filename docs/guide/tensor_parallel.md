@@ -1,33 +1,35 @@
-# TP 张量并行使用指南
+# TP Tensor Parallelism Guide
 
-HyperParallel 提供声明式张量并行（Tensor Parallel）接口，兼容 `torch.distributed.tensor.parallel` API 设计，支持 ColwiseParallel、RowwiseParallel、SequenceParallel 等并行策略，并支持 Loss Parallel。
+**English** | [简体中文](tensor_parallel.zh.md)
 
-## 核心概念
+HyperParallel provides declarative tensor parallelism interfaces compatible with the `torch.distributed.tensor.parallel` API design. It supports ColwiseParallel, RowwiseParallel, SequenceParallel, and Loss Parallel.
 
-张量并行将模型权重/激活在多个设备上切分，每个设备只持有部分权重和激活，通过集合通信协调计算结果。
+## Core Concepts
 
-| 策略 | 说明 | 适用场景 |
+Tensor parallelism shards model weights and activations across devices. Each device holds only part of the weights and activations, and collective communication coordinates the computation results.
+
+| Strategy | Description | Use case |
 |------|------|----------|
-| ColwiseParallel | 列切分（输出维度切分） | Q/K/V projection、gate/up projection |
-| RowwiseParallel | 行切分（输入维度切分） | O projection、down projection |
-| SequenceParallel | 序列维度切分 | LayerNorm + Dropout |
+| ColwiseParallel | Column sharding (output dimension) | Q/K/V projections and gate/up projections |
+| RowwiseParallel | Row sharding (input dimension) | O projection and down projection |
+| SequenceParallel | Sequence-dimension sharding | LayerNorm + Dropout |
 
-## 接口概览
+## API Overview
 
-| 接口 | 说明 |
+| Interface | Description |
 |------|------|
-| `ColwiseParallel` | 列切分并行策略 |
-| `RowwiseParallel` | 行切分并行策略 |
-| `SequenceParallel` | 序列并行策略 |
-| `PrepareModuleInput` / `PrepareModuleOutput` / `PrepareModuleInputOutput` | 模块输入/输出准备钩子 |
-| `parallelize_module` | 声明式 TP 应用接口 |
-| `ParallelStyle` | 并行策略基类 |
+| `ColwiseParallel` | Column-sharded parallel strategy |
+| `RowwiseParallel` | Row-sharded parallel strategy |
+| `SequenceParallel` | Sequence parallel strategy |
+| `PrepareModuleInput` / `PrepareModuleOutput` / `PrepareModuleInputOutput` | Module input/output preparation hooks |
+| `parallelize_module` | Declarative TP application interface |
+| `ParallelStyle` | Base class for parallel strategies |
 
 ---
 
-## 基础使用
+## Basic Usage
 
-### 1. TransformerBlock 标准 TP 配置
+### 1. Standard TP Configuration for TransformerBlock
 
 ```python
 from hyper_parallel import ColwiseParallel, RowwiseParallel, parallelize_module, init_device_mesh
@@ -49,10 +51,10 @@ parallelize_module(
 )
 ```
 
-### 2. 使用 fnmatch glob pattern
+### 2. Use fnmatch Glob Patterns
 
 ```python
-# 对多层 TransformerBlock 使用通配符
+# Use wildcards for multiple TransformerBlock layers.
 parallelize_module(
     model,
     tp_mesh,
@@ -70,54 +72,54 @@ parallelize_module(
 
 ---
 
-## ColwiseParallel 详解
+## ColwiseParallel in Detail
 
-将 Linear 或 Embedding 的输出维度切分到 TP ranks：
+Shard the output dimension of Linear or Embedding across TP ranks:
 
-| 模块类型 | weight 切分 | bias 切分 |
+| Module type | Weight sharding | Bias sharding |
 |----------|-------------|-----------|
-| Linear | `Shard(0)` — 切分输出特征 | `Shard(0)` |
-| Embedding | `Shard(1)` — 切分 embedding 维 | N/A |
+| Linear | `Shard(0)` — output features | `Shard(0)` |
+| Embedding | `Shard(1)` — embedding dimension | N/A |
 
-参数：
+Parameters:
 
-| 参数 | 类型 | 默认值 | 说明 |
+| Parameter | Type | Default | Description |
 |------|------|--------|------|
-| `input_layouts` | Placement | `Replicate()` | 输入排布 |
-| `output_layouts` | Placement | `Shard(-1)` | 输出排布 |
-| `use_local_output` | bool | `True` | 是否将 DTensor 转为 local tensor |
+| `input_layouts` | Placement | `Replicate()` | Input layout |
+| `output_layouts` | Placement | `Shard(-1)` | Output layout |
+| `use_local_output` | bool | `True` | Whether to convert DTensor to a local tensor |
 
-## RowwiseParallel 详解
+## RowwiseParallel in Detail
 
-将 Linear 或 Embedding 的输入维度切分到 TP ranks：
+Shard the input dimension of Linear or Embedding across TP ranks:
 
-| 模块类型 | weight 切分 | bias 切分 |
+| Module type | Weight sharding | Bias sharding |
 |----------|-------------|-----------|
-| Linear | `Shard(1)` — 切分输入特征 | `Replicate()` |
-| Embedding | `Shard(0)` — 切分 vocab 维 | N/A |
+| Linear | `Shard(1)` — input features | `Replicate()` |
+| Embedding | `Shard(0)` — vocabulary dimension | N/A |
 
-参数：
+Parameters:
 
-| 参数 | 类型 | 默认值 | 说明 |
+| Parameter | Type | Default | Description |
 |------|------|--------|------|
-| `input_layouts` | Placement | `Shard(-1)` | 输入排布 |
-| `output_layouts` | Placement | `Replicate()` | 输出排布 |
-| `use_local_output` | bool | `True` | 是否将 DTensor 转为 local tensor |
+| `input_layouts` | Placement | `Shard(-1)` | Input layout |
+| `output_layouts` | Placement | `Replicate()` | Output layout |
+| `use_local_output` | bool | `True` | Whether to convert DTensor to a local tensor |
 
 ---
 
 ## Loss Parallel
 
-TP 训练中 loss 计算也可以并行化，避免在 loss 计算时需要 gather 全部 logits：
+Loss computation can also be parallelized during TP training, avoiding the need to gather all logits:
 
 ```python
-# 在 TP mesh 上并行计算 loss
-# logits 已经在 TP 维度上切分，直接计算分片上的 loss
+# Compute loss in parallel over the TP mesh.
+# Logits are already sharded along the TP dimension; compute loss directly on the shards.
 ```
 
 ---
 
-## 典型组合模式
+## Typical Combinations
 
 ### MLP (Gate / Up / Down)
 
@@ -138,37 +140,37 @@ Input (Replicate) ─► Q/K/V projections (ColwiseParallel) ─► Shard(-1)
 
 ---
 
-## 与其他并行策略组合
+## Combine with Other Parallel Strategies
 
-TP 使用 1-D DeviceMesh，在混合并行场景下从多维 mesh 中切片：
+TP uses a 1-D DeviceMesh, sliced from a multidimensional mesh for hybrid parallelism:
 
 ```python
 mesh = init_device_mesh("npu", (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
 
-# TP 在 "tp" 子 mesh
+# Apply TP on the "tp" submesh.
 parallelize_module(model, mesh["tp"], tp_plan)
 
-# FSDP 在 "dp" 子 mesh
+# Apply FSDP on the "dp" submesh.
 fully_shard(model, mesh=mesh["dp"])
 ```
 
-TP hooks 不干扰 FSDP unshard/reshard 或 pipeline scheduling。
+TP hooks do not interfere with FSDP unshard/reshard or pipeline scheduling.
 
 ---
 
-## 从 PyTorch TP 迁移
+## Migrate from PyTorch TP
 
-| PyTorch | HyperParallel | 说明 |
+| PyTorch | HyperParallel | Description |
 |---------|---------------|------|
-| `from torch.distributed.tensor.parallel import ColwiseParallel` | `from hyper_parallel import ColwiseParallel` | 类名相同 |
-| `from torch.distributed.tensor.parallel import RowwiseParallel` | `from hyper_parallel import RowwiseParallel` | 类名相同 |
-| `parallelize_module(m, mesh, plan)` | `parallelize_module(m, mesh, plan)` | 签名相同 |
-| `style._apply(module, mesh)` | `style.apply(module, mesh)` | 无前导下划线 |
-| `DTensor.redistribute(placements=...)` | `DTensor.redistribute(device_mesh, placements)` | 显式 mesh 参数 |
+| `from torch.distributed.tensor.parallel import ColwiseParallel` | `from hyper_parallel import ColwiseParallel` | Same class name |
+| `from torch.distributed.tensor.parallel import RowwiseParallel` | `from hyper_parallel import RowwiseParallel` | Same class name |
+| `parallelize_module(m, mesh, plan)` | `parallelize_module(m, mesh, plan)` | Same signature |
+| `style._apply(module, mesh)` | `style.apply(module, mesh)` | No leading underscore |
+| `DTensor.redistribute(placements=...)` | `DTensor.redistribute(device_mesh, placements)` | Explicit mesh argument |
 
 ---
 
-## 更多参考
+## Further Reading
 
-- [TP Styles 详细文档](./tensor_parallel_styles.md) — 原有的 TP Styles 特性文档
-- [API 参考](../api/api_reference.md) — TP 模块接口详细说明
+- [TP Styles](./tensor_parallel_styles.md) — Detailed documentation for TP styles
+- [API Reference](../api/api_reference.md) — Detailed TP interfaces

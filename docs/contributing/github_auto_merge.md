@@ -1,6 +1,6 @@
 # GitHub: automatically merge after the reviewer approval quorum
 
-[中文](github_auto_merge_zh.md) | English
+**English** | [简体中文](github_auto_merge.zh.md)
 
 This feature determines the reviewers from the **Reviewers** sidebar of each PR.
 It does not require every member of the repository's maintainer team to participate.

@@ -1,0 +1,61 @@
+# HyperParallel 文档
+
+[English](index.md) | **简体中文**
+
+昇腾超节点亲和的分布式并行加速库 — 文档中心
+
+## 快速入门
+
+| 文档                                       | 说明 |
+|------------------------------------------|------|
+| [安装指南](./installation.zh.md)                | 源码构建、依赖安装、环境配置 |
+
+## 特性使用指南
+
+| 文档 | 说明 |
+|------|------|
+| [HSDP / FSDP 数据并行](./guide/fsdp.zh.md) | fully_shard、HSDPModule、overlap、梯度缩放 |
+| [TP 张量并行](./guide/tensor_parallel.zh.md) | ColwiseParallel、RowwiseParallel、parallelize_module、Loss Parallel |
+| [PP 流水线并行](./guide/pipeline_parallel.zh.md) | PipelineStage、Schedule、overlap_b_f、PP+FSDP、P2P prefetch、 Mpipe |
+| [CP 上下文并行](./guide/context_parallel.zh.md) | ContextParallel、AsyncContextParallel、DSA 系列 |
+| [KDA 上下文并行](./guide/kda_context_parallel.zh.md) | KDA P2P、AllGather、Ulysses 及混合方式的配置与显存 |
+| [KDA 递归倍增与 Ulysses 混合 CP](./guide/kda_recursive_doubling.md) | RD 状态扫描、TND reset 剪枝与转移缓存 |
+| [线性注意力 TND 上下文并行](./guide/linear_attention_tnd_cp.md) | KDA / GDN 的文档边界、配置、状态交换与数值语义 |
+| [EP 专家并行](./guide/expert_parallel.zh.md) | ExpertParallel、MoE 构建模块、负载均衡 |
+| [Activation Checkpoint / Swap](./guide/activation_checkpoint.zh.md) | checkpoint_wrapper、swap_wrapper、swap_tensor_wrapper、协同配置 |
+| [Optimizer](./guide/optimizer.zh.md) | AdamW、Muon、ChainedOptimizer、学习率调度器 |
+| [Chunk Loss](./guide/chunk_loss.zh.md) | 大词表输出投影与交叉熵分块、Trainer 和 Qwen3-MoE 接入 |
+| [DCP 分布式检查点](./guide/distributed_checkpoint.zh.md) | 检查点保存/加载、异步 staging、离线转换 |
+| [自动并行](./guide/auto_parallel.zh.md) | SAPP-ND、SAPP-PPB |
+| [LlamaFactory + HyperParallel SFT 训练](./guide/llama_factory_hyperparallel_sft_guide.zh.md) | 基于 LlamaFactory 和 HyperParallel 的 SFT 配置、启动、精度与性能验证 |
+| [模型接入验证使用指南](./guide/trainer/model_integration_validation.zh.md) | Adapter 声明、结构检查、模块对齐、精度矩阵与证据报告 |
+
+## API 参考
+
+| 文档 | 说明 |
+|------|------|
+| [API Reference](./api/api_reference.zh.md) | 按特性模块组织的完整接口说明 |
+| [DFunction](./api/dfunction.md) | Torch 自定义分布式 autograd 函数详细文档 |
+
+## FAQ 与故障排查
+
+| 文档 | 说明 |
+|------|------|
+| [FAQ & 故障排查](./faq.zh.md) | 安装问题、运行时问题、通信问题、内存问题、调试技巧 |
+
+## 社区贡献
+
+| 文档 | 说明 |
+|------|------|
+| [开发环境搭建](./contributing/dev_environment.zh.md) | 开发环境配置、依赖安装 |
+| [测试流程规范](./contributing/testing.zh.md) | 测试框架、标记规范、分布式测试 |
+| [发布流程规范](./contributing/release.zh.md) | 版本发布流程、文档更新规范 |
+
+## 其他
+
+| 文档 | 说明 |
+|------|------|
+| [Release Notes v1.0.0](../hyper_parallel_v1.0.0_release_notes.zh.md) | 版本变更记录 |
+| [PP overlap_b_f 设计文档](./guide/pipeline_parallel_overlap_b_f.zh.md) | 通算掩盖详细设计（原 docs 保留） |
+| [TP Styles 文档](./guide/tensor_parallel_styles.md) | TP Styles 原有特性文档（原 docs 保留） |
+| [agent_workflow.md](./agent_workflow.md) | AI Agent 工作流参考 |

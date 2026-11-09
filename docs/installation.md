@@ -1,61 +1,56 @@
-# 安装指南
+# Installation Guide
 
-HyperParallel 提供两种安装方式：
+**English** | [简体中文](installation.zh.md)
 
-- **pip 安装**：安装已经构建好的 `hyper-parallel` 包，并通过 extras 选择运行时深度学习框架依赖。
-- **源码构建**：使用 `./build.sh` 生成 whl 包，并按构建参数决定是否编译 native 扩展。
+HyperParallel provides two installation methods:
 
-如果只需要安装已发布的包，优先使用 `pip install`。如果需要在本机生成 whl，或需要调整 native 扩展构建配置，再使用源码构建。
+- **pip installation**: Install a prebuilt `hyper-parallel` package and select runtime deep learning framework dependencies through extras.
+- **Source build**: Use `./build.sh` to generate a wheel, with build options controlling whether native extensions are compiled.
 
-## 1. 使用 pip 安装
+Prefer `pip install` when you only need a published package. Build from source when you need to generate a wheel locally or customize native extension builds.
 
-`pip install` 的 extras 只控制 Python 运行时依赖，不控制 native 扩展的编译。
+## 1. Install with pip
 
-| 命令                                        | 安装内容                                             | 适用场景                          |
-|-------------------------------------------|--------------------------------------------------|-------------------------------|
-| `pip install hyper-parallel`              | 仅安装通用依赖，不安装深度学习框架                                | 已自行管理框架版本，或只使用不依赖框架的能力        |
-| `pip install 'hyper-parallel[torch]'`     | 通用依赖 + `torch==2.9.1` + `torch-npu==2.9.1`       | 使用默认 PyTorch 2.9 后端           |
-| `pip install 'hyper-parallel[torch26]'`   | 通用依赖 + `torch==2.6.0` + `torch-npu==2.6.0.post3` | 使用 PyTorch 2.6 后端             |
-| `pip install 'hyper-parallel[torch27]'`   | 通用依赖 + `torch==2.7.1` + `torch-npu==2.7.1`       | 使用 PyTorch 2.7 后端             |
-| `pip install 'hyper-parallel[torch29]'`   | 通用依赖 + `torch==2.9.1` + `torch-npu==2.9.1`       | 显式使用 PyTorch 2.9 后端           |
-| `pip install 'hyper-parallel[all]'`       | 通用依赖 + 默认 PyTorch 2.9                            | 使用默认 PyTorch 后端                |
+The extras for `pip install` control Python runtime dependencies only, not native extension compilation.
 
-zsh 等 shell 下建议给带 extras 的包名加引号，避免 `[]` 被解释为通配符。
+| Command | Installed dependencies | Use case |
+|---------|------------------------|----------|
+| `pip install hyper-parallel` | Common dependencies only; no deep learning framework | You manage framework versions yourself or only use framework-independent capabilities |
+| `pip install 'hyper-parallel[torch]'` | Common dependencies + `torch==2.9.1` + `torch-npu==2.9.1` | Default PyTorch 2.9 backend |
+| `pip install 'hyper-parallel[torch26]'` | Common dependencies + `torch==2.6.0` + `torch-npu==2.6.0.post3` | PyTorch 2.6 backend |
+| `pip install 'hyper-parallel[torch27]'` | Common dependencies + `torch==2.7.1` + `torch-npu==2.7.1` | PyTorch 2.7 backend |
+| `pip install 'hyper-parallel[torch29]'` | Common dependencies + `torch==2.9.1` + `torch-npu==2.9.1` | Explicit PyTorch 2.9 backend |
+| `pip install 'hyper-parallel[all]'` | Common dependencies + default PyTorch 2.9 | Default PyTorch backend |
 
-## 2. 从源码编译 whl 包
+In shells such as zsh, quote package names containing extras so that `[]` is not interpreted as a wildcard.
 
-统一入口调用所选组件的构建脚本，再将成功组件的产物组装为一个 wheel。indexed Dataset C++ helper
-每次都会编译；Multicore 包含其私有 SHMEM 依赖，不再提供独立 SHMEM 开关。
+## 2. Build a Wheel from Source
 
-| 参数 | 默认值 | 可选值 | 说明 |
-|------|--------|--------|------|
-| `--multicore` | `on` | `on`、`off` | 编译 Torch Multicore 及其私有 SHMEM。 |
-| `--soc-list` | `ascend910b,ascend910_93` | SoC 列表 | 选择 Multicore kernel 目标。 |
-| `--strict` | `off` | `on`、`off` | 所选 optional 组件失败时是否终止。 |
-| `--jobs` | `nproc` | 正整数 | 设置 native 编译并行度。 |
-| `--clean` | 关闭 | 无参数开关 | 重建所选组件的工作和安装目录。 |
+The unified entry point invokes the build scripts for the selected components, then assembles the successful components into one wheel. The indexed Dataset C++ helper is always compiled. Multicore includes its private SHMEM dependency; there is no separate SHMEM switch.
+
+| Option | Default | Values | Description |
+|--------|---------|--------|-------------|
+| `--multicore` | `on` | `on`, `off` | Build Torch Multicore and its private SHMEM. |
+| `--soc-list` | `ascend910b,ascend910_93` | SoC list | Select Multicore kernel targets. |
+| `--strict` | `off` | `on`, `off` | Abort if a selected optional component fails. |
+| `--jobs` | `nproc` | Positive integer | Set native compilation parallelism. |
+| `--clean` | Disabled | Flag without an argument | Recreate work and installation directories for selected components. |
 
 ```bash
 ./build.sh --help
 ./build.sh --multicore on --soc-list ascend910b,ascend910_93
 ./build.sh --strict on --jobs 24
-# 安装本次命令打印的精确 wheel 路径
+# Install the exact wheel path printed by this build.
 pip install /absolute/path/to/the-built-wheel.whl
 ```
 
-通用构建要求：Python 3.10–3.12、对应开发头文件、setuptools、wheel、pybind11、C++17 主机工具链。
-每个 wheel 对应一个 Python ABI 和主机架构；各 native 组件的 SDK、框架和设备要求由组件自行定义。
-源码和预编译 wheel 的运行环境还必须满足最终 ELF 记录的 glibc、框架 ABI 及 SDK 约束。
+General build requirements: Python 3.10–3.12, matching development headers, setuptools, wheel, pybind11, and a C++17 host toolchain. Each wheel targets one Python ABI and host architecture. Each native component defines its own SDK, framework, and device requirements. Runtime environments for source and prebuilt wheels must also satisfy the glibc, framework ABI, and SDK constraints recorded in the final ELF binaries.
 
-每次统一构建重新生成 `build/native/payload/hyper_parallel`；只交付本次成功的组件。
-`--strict on` 在所选组件失败时终止，适用于验收与发布；默认宽松模式允许 optional 组件失败后继续组包，
-因此 wheel 生成不代表所有 optional 组件可用。
-`python setup.py bdist_wheel` 不触发 native 编译；无显式 payload 时仅组装 Python 源码。
-启用 Multicore 后，必须在启动 Python 前激活其 CANN custom OPP。
+Each unified build regenerates `build/native/payload/hyper_parallel` and ships only components that succeeded in that build. `--strict on` aborts when a selected component fails and is suitable for acceptance and release builds. The default permissive mode continues packaging after optional component failures, so generating a wheel does not prove that all optional components are available. `python setup.py bdist_wheel` does not trigger native compilation; without an explicit payload, it packages Python sources only. When Multicore is enabled, activate its CANN custom OPP before starting Python.
 
-## 3. 激活 Multicore CANN custom OPP
+## 3. Activate the Multicore CANN Custom OPP
 
-源码或 editable 开发使用统一构建生成的 payload：
+For source or editable development, use the payload generated by the unified build:
 
 ```bash
 source /usr/local/Ascend/cann/set_env.sh
@@ -63,7 +58,7 @@ source build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
 python your_program.py
 ```
 
-wheel 安装后，使用安装到当前 Python 环境的定位脚本：
+After installing a wheel, use the locator script installed in the current Python environment:
 
 ```bash
 source /usr/local/Ascend/cann/set_env.sh
@@ -71,13 +66,11 @@ source "$(command -v hyper_parallel_multicore_set_env.bash)"
 python your_program.py
 ```
 
-激活脚本必须在启动业务 Python 进程前执行。脚本设置已交付 Multicore vendor 所需的
-`ASCEND_CUSTOM_OPP_PATH` 和动态库路径。wheel 安装态不依赖源码仓中的 `build/` 目录；源码或 editable
-开发态则从同一 checkout 的 `build/native/payload` 加载构建产物。
+Run the activation script before starting the application Python process. It sets `ASCEND_CUSTOM_OPP_PATH` and the shared library paths required by the shipped Multicore vendor. A wheel installation does not depend on the source repository's `build/` directory; source or editable development loads build artifacts from `build/native/payload` in the same checkout.
 
-## 4. 验证安装
+## 4. Verify the Installation
 
-安装完成后，可以先验证核心模块是否可导入：
+After installation, first verify that the core module imports successfully:
 
 ```python
 import hyper_parallel as hp

@@ -1,5 +1,7 @@
 # Generate example
 
+**English** | [简体中文](README.zh.md)
+
 This directory contains a minimal validation path for
 `hyper_parallel.infer`. The example covers greedy/top-k/top-p generation,
 KV-cache decode, no-cache fallback, HuggingFace alignment, and a small
@@ -90,7 +92,7 @@ export MODEL_PATH=/data/models/Qwen3-4B-Instruct-2507
 
 python examples/generate/hf_alignment_check.py \
   --model "$MODEL_PATH" \
-  --prompt "用一段话简单介绍深度学习。" \
+  --prompt "Briefly introduce deep learning in one paragraph." \
   --max-new-tokens 128 \
   --logits-compare-steps 128 \
   --device npu \
@@ -112,7 +114,7 @@ The output JSON should contain the following validation fields:
 
 ```json
 {
-  "prompt": "用一段话简单介绍深度学习。",
+  "prompt": "Briefly introduce deep learning in one paragraph.",
   "generated_new_tokens": 128,
   "hf_vs_hyper_cache_ids_match": true,
   "hyper_cache_vs_no_cache_ids_match": true,

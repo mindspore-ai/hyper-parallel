@@ -1,67 +1,69 @@
-# DCP 分布式检查点使用指南
+# DCP Distributed Checkpoint Guide
 
-HyperParallel 提供 DCP（Distributed Checkpoint）能力：每个 rank 只保存自己持有的分片，配合一份描述"谁存了哪一块"的全局元数据；加载时按目标切分策略重新计算需要读哪些片段，因此**并行策略变化后无需离线转换**。此外支持异步落盘、副本张量读一次 + 广播、Plan 缓存、直接加载 Hugging Face 权重和 torch 分片写出的 safetensors 目录，以及与 Hugging Face safetensors 格式的离线互转。
+**English** | [简体中文](distributed_checkpoint.zh.md)
 
-## 核心概念
+HyperParallel provides Distributed Checkpoint (DCP): each rank saves only its own shards, accompanied by global metadata describing which rank stored each region. Loading recomputes the fragments required by the target sharding strategy, so **changing parallel strategies requires no offline conversion**. DCP also supports asynchronous persistence, reading replicated tensors once and broadcasting them, plan caching, direct loading of Hugging Face weights and torch-sharded safetensors directories, and offline conversion to and from Hugging Face safetensors.
 
-| 概念 | 说明 |
+## Core Concepts
+
+| Concept | Description |
 |------|------|
-| **Planner（规划器）** | 决定"写什么 / 读什么"：把 state_dict 翻译成带全局坐标的 `WriteItem` / `ReadItem` 列表 |
-| **Storage（存储后端）** | 决定"怎么写 / 怎么读"：把规划落到具体文件格式（默认 safetensors） |
-| **Metadata（元数据）** | `fqn → 全局 shape + chunk 列表`，是跨切分策略读取的唯一依据；`.metadata` 由 coordinator 最后写出 |
-| **Chunk** | 一个张量分片在全局张量中的 `offsets` + `sizes`，即一个 N 维半开区间盒 |
-| **重切分（reshard）** | "我要的区域" ∩ "磁盘上存过的区域"，交集即需要读取的片段 |
+| **Planner** | Decides what to write/read, translating state_dict into `WriteItem` / `ReadItem` lists with global coordinates |
+| **Storage** | Decides how to write/read, implementing plans in a concrete file format, safetensors by default |
+| **Metadata** | Maps `fqn` to global shape and chunk list; the sole basis for reading across sharding strategies. The coordinator writes `.metadata` last. |
+| **Chunk** | A shard's `offsets` and `sizes` in the global tensor: an N-dimensional half-open box |
+| **Resharding** | Intersect the requested region with stored regions; read the resulting intersections |
 
-## 模块一览
+## Module Overview
 
-DCP 模块位于 `hyper_parallel/core/distributed_checkpoint/`：
+DCP resides in `hyper_parallel/core/distributed_checkpoint/`:
 
-| 文件 | 说明 |
+| File | Description |
 |------|------|
-| `api.py` | 对外主接口：`save` / `async_save` / `load` |
-| `planner.py` | Planner 抽象接口与 `SavePlan` / `LoadPlan` / `WriteItem` / `ReadItem` 数据结构 |
-| `standard_planner.py` | 默认实现 `StandardSavePlanner` / `StandardLoadPlanner` |
-| `storage.py` | 存储后端抽象接口 `StorageWriter` / `StorageReader` |
-| `filesystem_storage.py` | 文件系统实现 `FileSystemWriter` / `FileSystemReader`（safetensors） |
-| `metadata.py` | `Metadata` / `ChunkStorageMetadata` / `ChunkInfo` / `BroadcastInfo` 等元数据结构 |
-| `async_persist.py` | 异步保存：staging（`DataCopier`）与子进程持久化 |
-| `ragged.py` | `RaggedShard`（非均匀切分）的几何适配 |
-| `offline_transform.py` | Hugging Face safetensors ⇄ DCP 离线互转 |
-| `utils.py` | 去冗余、同分片组推导、区间求交、分阶段计时等公共能力 |
-| `broadcast.py` | 副本分片的广播：通信组的建立与销毁、发送与批量合并 |
-| `checkpoint_io.py` | 单个 checkpoint 文件的读写（safetensors / pickle） |
+| `api.py` | Public entry points: `save` / `async_save` / `load` |
+| `planner.py` | Planner abstractions and `SavePlan` / `LoadPlan` / `WriteItem` / `ReadItem` structures |
+| `standard_planner.py` | Default `StandardSavePlanner` / `StandardLoadPlanner` implementations |
+| `storage.py` | `StorageWriter` / `StorageReader` backend abstractions |
+| `filesystem_storage.py` | Safetensors filesystem implementations: `FileSystemWriter` / `FileSystemReader` |
+| `metadata.py` | Metadata structures including `Metadata`, `ChunkStorageMetadata`, `ChunkInfo`, and `BroadcastInfo` |
+| `async_persist.py` | Asynchronous saving: staging with `DataCopier` and subprocess persistence |
+| `ragged.py` | Geometry adaptation for uneven `RaggedShard` partitioning |
+| `offline_transform.py` | Offline Hugging Face safetensors ⇄ DCP conversion |
+| `utils.py` | Deduplication, identical-shard group inference, interval intersections, and phase timing |
+| `broadcast.py` | Replicated-shard broadcast: group creation/destruction, sending, and batching |
+| `checkpoint_io.py` | Reading/writing individual checkpoint files: safetensors / pickle |
 
-HF 格式适配和自定义加载扩展位于 `hyper_parallel/components/checkpoint/`，依赖上述 DCP 基础设施：
+HF format adapters and custom loading extensions are in `hyper_parallel/components/checkpoint/`, built on the DCP infrastructure above:
 
-| 文件 | 说明 |
+| File | Description |
 |------|------|
-| `hf_storage.py` | HF 完整权重和 torch 分片 safetensors 目录的 Reader |
-| `quantized_hf_storage.py` | 通用量化 Reader，按区域读取并调用 Transformers 反量化 |
-| `remap_planner.py` | 根据 `RemapBlock` 和本地分片生成读取计划的 `RemapLoadPlanner` |
-| `huggingface_load_planner.py` | 将模型权重转换规则编译为区域读取或完整转换任务的 `HFLoadPlanner` |
-| `huggingface_checkpointer.py` | 组织 HF 权重加载、选择 loader 并生成加载报告 |
+| `hf_storage.py` | Readers for complete HF weights and torch-sharded safetensors directories |
+| `quantized_hf_storage.py` | Generic quantized reader that reads regions and invokes Transformers dequantization |
+| `remap_planner.py` | `RemapLoadPlanner`, which generates read plans from `RemapBlock` and local shards |
+| `huggingface_load_planner.py` | `HFLoadPlanner`, which compiles model weight-conversion rules into region reads or full-conversion tasks |
+| `huggingface_checkpointer.py` | Orchestrates HF weight loading, selects the loader, and generates loading reports |
 
-依赖方向为 `components/checkpoint` → `core/distributed_checkpoint`；core 不导入这些组件。
+The dependency direction is `components/checkpoint` → `core/distributed_checkpoint`; core does not import these components.
 
 ---
 
-## 快速上手
+## Quick Start
 
 ```python
 from hyper_parallel.core.distributed_checkpoint import save, load
 
-# 保存：每个 rank 写自己的分片，rank0 写 .metadata
+# Save: each rank writes its shards; rank 0 writes .metadata.
 save(state_dict, checkpoint_id="/ckpt/step_1000")
 
-# 加载：原地写回 state_dict，返回 None
+# Load: update state_dict in place and return None.
 load(state_dict, checkpoint_id="/ckpt/step_1000")
 ```
 
-> **注意**：`load` 是**原地修改**传入的 `state_dict`，不是返回一个新字典。传入的 state_dict 必须预先构造好目标形状的张量（DCP 只会往**已存在的 key** 里填数据），否则会静默读不到内容——优化器状态尤其需要先做一次"预热"让 `optimizer.state` 非空。
+> **Note:** `load` **modifies the supplied `state_dict` in place** rather than returning a new dictionary. Preconstruct tensors with the target shapes: DCP fills only **existing keys**. Otherwise data may silently remain unloaded. Optimizer state especially needs a warmup step so `optimizer.state` is nonempty.
 
 ---
 
-## 接口详解
+## API Details
 
 ### `save`
 
@@ -77,15 +79,15 @@ save(
 ) -> Metadata
 ```
 
-| 参数 | 说明 |
+| Parameter | Description |
 |------|------|
-| `checkpoint_id` | checkpoint 目录。未传 `storage_writer` 时必填，会据此构造 `FileSystemWriter` |
-| `storage_writer` | 自定义存储后端；与 `checkpoint_id` 同时传入时以 `checkpoint_id` 初始化 |
-| `planner` | 自定义规划器，默认 `StandardSavePlanner()` |
-| `no_dist` | `True` 表示单进程保存（强制关闭 `use_collectives`） |
-| `use_collectives` | `True`（默认）：跨 rank 交换 plan，写出全局 `.metadata`；`False`：各 rank 互不通信，各写各的 `{rank}.metadata` |
+| `checkpoint_id` | Checkpoint directory; required without `storage_writer`, and used to construct `FileSystemWriter` |
+| `storage_writer` | Custom storage backend; initialized with `checkpoint_id` when both are supplied |
+| `planner` | Custom planner; defaults to `StandardSavePlanner()` |
+| `no_dist` | `True` selects single-process saving and forces `use_collectives` off |
+| `use_collectives` | `True` (default): exchange plans across ranks and write global `.metadata`; `False`: ranks do not communicate and each writes `{rank}.metadata` |
 
-返回全局 `Metadata`；函数末尾会做一次 `barrier`，返回时全部 rank 均已落盘。
+Returns global `Metadata`. A final `barrier` ensures every rank has persisted its data before return.
 
 ### `async_save`
 
@@ -96,18 +98,18 @@ async_save(
 ) -> AsyncSaveResponse
 ```
 
-**staging 是同步的，持久化是异步的**：函数内先在训练进程中把张量拷贝到 Host 内存，然后把规划、通信、写盘全部交给一个后台子进程。因此：
+**Staging is synchronous; persistence is asynchronous.** The training process first copies tensors into host memory, then a background subprocess handles planning, communication, and disk writes. Therefore:
 
-- `async_save` 一返回，原 `state_dict` 就可以被训练继续改写；
-- 但**磁盘上还没有 `.metadata`**，要确认落盘必须等 `AsyncSaveResponse`：
+- Once `async_save` returns, training may modify the original `state_dict` again.
+- **`.metadata` is not yet guaranteed on disk**; wait for `AsyncSaveResponse` to confirm persistence:
 
 ```python
 resp = async_save(state_dict, checkpoint_id="/ckpt/step_1000", callback=lambda: print("landed"))
-# ... 训练继续 ...
-metadata = resp.get_result(timeout=600)   # 等价于 resp.persist_completion.result(timeout=600)
+# ... Training continues ...
+metadata = resp.get_result(timeout=600)   # Equivalent to resp.persist_completion.result(timeout=600).
 ```
 
-子进程与 join 线程都**刻意不是 daemon**：训练脚本退出时会等在途的 checkpoint 落完，而不是丢掉它。
+The subprocess and join thread are **deliberately non-daemon**: script exit waits for in-flight checkpoints to persist instead of discarding them.
 
 ### `load`
 
@@ -120,176 +122,176 @@ load(
 ) -> None
 ```
 
-| 参数 | 说明 |
+| Parameter | Description |
 |------|------|
-| `use_collectives` | **默认 `True`**（与 `save` 一致）：跨 rank 交换 plan，据此推导副本组。设 `False` 则各 rank 独立读自己需要的数据，不做跨 rank 协同 |
-| `broadcast_replicated_tensors` | **默认 `True`**：加载内容完全相同的若干 rank 只由其中一个读盘，其余通过组内广播拿数据，读盘量按副本数成比例下降；读盘卡按已分配字节数均衡挑选，不固定在最小 rank |
-| `broadcast_groups` | 预建的广播通信组 `{rank_tuple: group}`；不传则按需创建。**必须与 `broadcast_replicated_tensors=True` 同时使用**，否则抛 `ValueError` |
-| `broadcast_batch_bytes` | 小于该阈值的分片**攒成一次广播**发送，大于等于的各发各的。默认 6 MiB，设 0 关闭。仅在开启广播时生效。**各 rank 必须传相同的值**——攒批位置是各卡各自算出来的，不一致会死锁 |
+| `use_collectives` | **Defaults to `True`**, like `save`: exchange plans across ranks and infer replica groups. `False` makes each rank read independently without coordination. |
+| `broadcast_replicated_tensors` | **Defaults to `True`**: among ranks loading identical contents, one reads and broadcasts to the others, reducing requested reads in proportion to replica count. Reader assignment balances allocated bytes rather than always choosing the lowest rank. |
+| `broadcast_groups` | Precreated broadcast groups `{rank_tuple: group}`; created on demand if omitted. **Requires `broadcast_replicated_tensors=True`**, otherwise raises `ValueError`. |
+| `broadcast_batch_bytes` | Shards smaller than this threshold are **batched into one broadcast**; larger or equal shards are sent separately. Defaults to 6 MiB; 0 disables batching. Applies only with broadcasting. **All ranks must pass the same value**: each computes batch boundaries independently, so mismatches deadlock. |
 
-> `use_collectives=True`（默认）要求**默认通信组里每个 rank 都调用 `load`**——plan 交换跑在该组上，缺席的 rank 会让其余 rank 卡在一个永远凑不齐的 gather 上。没有数据要加载的 rank 也要参与，传空 state_dict 即可。只想让部分 rank 加载时请显式传 `use_collectives=False`。`save` 一直是同样的要求。
+> `use_collectives=True` (default) requires **every rank in the default process group to call `load`**. Plan exchange uses that group; absent ranks leave the others waiting forever in gather. Ranks with no data to load must participate with an empty state_dict. Explicitly set `use_collectives=False` to load on only a subset of ranks. `save` has the same requirement.
 >
-> 广播只在 `use_collectives=True` 时生效：副本组是从各 rank allgather 上来的 load plan 中「读请求完全相同」推导出来的，不做这次 allgather 就无从判断谁和谁读的是同一份数据。
+> Broadcasting works only with `use_collectives=True`: replica groups are inferred from identical read requests in all-gathered load plans. Without that all-gather, identical readers cannot be identified.
 
-读取元数据时若找不到 `.metadata`，会自动回退到 `{rank}.metadata`（即 `use_collectives=False` 保存出来的 checkpoint），并同步把 `use_collectives` 关掉。
+If `.metadata` is missing, metadata loading falls back to `{rank}.metadata`, as produced by saving with `use_collectives=False`, and disables `use_collectives` accordingly.
 
 ---
 
-## 落盘产物
+## Persisted Files
 
 ```text
 /ckpt/step_1000/
-├── .metadata               # use_collectives=True：coordinator 写出的全局元数据
-├── 0.metadata              # use_collectives=False：每 rank 各写一份 rank 局部元数据
-├── _rank0_.safetensors     # 张量分片
-├── _rank0_.bytes           # 非张量数据（标量、pickle 对象等）
+├── .metadata               # use_collectives=True: global metadata written by the coordinator
+├── 0.metadata              # use_collectives=False: rank-local metadata written by each rank
+├── _rank0_.safetensors     # Tensor shards
+├── _rank0_.bytes           # Non-tensor data: scalars, pickled objects, etc.
 ├── _rank1_.safetensors
 └── ...
 ```
 
-`.metadata` 由 `finalize_checkpoint` 最后写出，可作为"这个目录写完整了"的判据——写到一半被打断的目录没有这个文件。
+`finalize_checkpoint` writes `.metadata` last. It indicates that the directory is complete; an interrupted partial write has no such file.
 
 ---
 
-## 异步保存的三种协同模式
+## Three Coordination Modes for Asynchronous Saving
 
-子进程无法直接复用训练侧的 HCCL/NCCL 通信域（`fork` 之后其 C++ 全局状态已失效），因此提供三档协同方式：
+The subprocess cannot reuse training-side HCCL/NCCL groups directly because their C++ global state is invalid after `fork`. Three coordination modes are available:
 
-| 组合 | 行为 | 适用场景 |
+| Combination | Behavior | Use case |
 |------|------|----------|
-| `use_collectives=True, use_gloo=True` | 子进程重建一个独立的 **CPU gloo 通信域**交换 plan 与写结果 | 有可用端口，希望协同开销最低 |
-| `use_collectives=True, use_gloo=False` | 通过**存储介质**交换：各 rank 写 `LOCAL_PLAN_{rank}.pkl` / `STORAGE_DATA_{rank}.pkl`，带写完标记，多线程轮询并行读 | 不便再开通信域时的默认选择 |
-| `use_collectives=False` | 完全不跨 rank，各写各的 `{rank}.metadata` | 单机调试、或上层自行保证一致性 |
+| `use_collectives=True, use_gloo=True` | Recreate an independent **CPU Gloo group** in subprocesses to exchange plans and write results | Available ports and minimal coordination overhead |
+| `use_collectives=True, use_gloo=False` | Exchange through **storage**: each rank writes `LOCAL_PLAN_{rank}.pkl` / `STORAGE_DATA_{rank}.pkl` with completion markers; multiple threads poll and read in parallel | Default when another communication group is inconvenient |
+| `use_collectives=False` | No cross-rank coordination; each writes `{rank}.metadata` | Local debugging or consistency managed by the caller |
 
-使用 `use_gloo=True` 需要环境变量 `MASTER_ADDR` / `MASTER_PORT`，否则抛 `AssertionError`；使用存储介质协同则必须提供 `checkpoint_id`（需要一个目录当"信箱"）。
+`use_gloo=True` requires `MASTER_ADDR` / `MASTER_PORT`, otherwise raising `AssertionError`. Storage-based coordination requires `checkpoint_id` as a mailbox directory.
 
 ```python
-# gloo 协同
+# Gloo coordination.
 async_save(sd, checkpoint_id=path, use_collectives=True, use_gloo=True)
-# 存储介质协同
+# Storage-based coordination.
 async_save(sd, checkpoint_id=path, use_collectives=True, use_gloo=False)
-# 不协同
+# No coordination.
 async_save(sd, checkpoint_id=path, use_collectives=False)
 ```
 
 ---
 
-## 加载时重切分（跨并行策略续训）
+## Reshard During Loading (Resume with a Different Parallel Strategy)
 
-**不需要任何额外接口**：save 端忠实记录每个分片的全局坐标，load 端按目标 layout 计算自己需要的区域，与元数据中的 chunk 求交后只读重叠部分。
+**No additional interface is needed.** Saving records each shard's global coordinates. Loading computes the requested target-layout region, intersects it with metadata chunks, and reads only overlaps.
 
 ```python
-# 用 TP=4 保存
+# Save with TP=4.
 save(state_dict_tp4, checkpoint_id="/ckpt/step_1000")
 
-# 换成 TP=2 直接加载，state_dict 按新切分构造好即可
+# Load directly with TP=2; preconstruct state_dict using the new sharding.
 load(state_dict_tp2, checkpoint_id="/ckpt/step_1000")
 ```
 
-已覆盖的典型倒换：`TP4 → TP2`、`TP4 → DP2×TP2`、`DP2×TP2 → TP2`，以及 `fully_shard` 分片之间的重切分。
+Covered transitions include `TP4 → TP2`, `TP4 → DP2×TP2`, `DP2×TP2 → TP2`, and resharding between `fully_shard` layouts.
 
 ---
 
-## 副本张量读一次 + 广播
+## Read Replicated Tensors Once and Broadcast
 
-在有复制维度的场景（如 DP 复制、TP 上的 `Replicate()` 参数），多张卡持有同一份数据。打开广播后，每份数据在组内只有一张卡真正读盘，其余 rank 通过一次组内 broadcast 拿到，**把磁盘读放大从 N× 降到 1×**：
+With replicated dimensions, such as DP replicas or TP `Replicate()` parameters, multiple devices hold identical data. Broadcasting lets one rank read each piece and send it to its group, **reducing duplicated read requests from N× to 1×**:
 
 ```python
 import torch.distributed as dist
 
-load(state_dict, checkpoint_id=path)   # 两者默认都是开的
+load(state_dict, checkpoint_id=path)   # Both options are enabled by default.
 
-# 多次加载时可预建通信组，省掉加载路径上的建组开销
+# Precreate groups for repeated loads to avoid group creation in the loading path.
 groups = {ranks: dist.new_group(ranks=list(ranks)) for ranks in my_group_ranks if rank in ranks}
 load(state_dict, checkpoint_id=path, use_collectives=True,
      broadcast_replicated_tensors=True, broadcast_groups=groups)
 ```
 
-**谁读哪一份**由 `StandardLoadPlanner.build_global_plan` 决定，各 rank 用同一份 allgather 结果跑同一个算法，因此算出的结果一致，不需要额外通信来对齐：按字节数从大到小依次分配，每份交给组内当前已分配字节数最少的 rank。分配结果写在 plan 的 `ReadItem.source` 上，`FileSystemReader` 照着执行。
+`StandardLoadPlanner.build_global_plan` decides **who reads each piece**. Every rank runs the same algorithm on the same all-gathered results, requiring no extra alignment communication: assign pieces in descending byte size, each to the group rank with the fewest assigned bytes. The assignment is stored in `ReadItem.source`, which `FileSystemReader` follows.
 
-**分组粒度是分片，不是整个张量。** 一个分片就是 `to_local()` 拿到的那块本地缓冲区，由 `dest_index`（`fqn` + `offset` + `index`）唯一标识；持有同一个 `dest_index` 的 rank 组成一个组，一次 broadcast 发整块缓冲区（`dist.broadcast` 要求连续内存，而 narrow 出来的子区域通常带 stride）。同一个张量的不同分片各广播各的，互不牵扯——0/2 卡持有分片 1、1/3 卡持有分片 2，就是 0→2 和 1→3 两次独立广播。`BYTE_IO`（存的是 pickle 出来的 Python 对象而非张量存储）永不参与。
+**Groups are defined per shard, not per tensor.** A shard is the local buffer returned by `to_local()`, uniquely identified by `dest_index` (`fqn` + `offset` + `index`). Ranks holding the same `dest_index` form a group. Each broadcast sends the full buffer: `dist.broadcast` requires contiguous memory, whereas narrowed subregions are often strided. Different shards of one tensor broadcast independently; if ranks 0/2 hold shard 1 and ranks 1/3 hold shard 2, these become independent 0→2 and 1→3 broadcasts. `BYTE_IO`, which stores pickled Python objects rather than tensor storage, never participates.
 
-**读取与广播是流水化的。** `execute_read` 按 `(fqn, offset, index)` 的全序遍历分片，轮到自己读的读完立刻发起异步广播，不等它完成就继续下一片，因此一次广播总是和下一片的读取重叠；最多同时有 8 个广播在飞。各卡跑的是同一份 `all_plans`、走的是同一个全序，所以入队顺序天然一致——同一个通信组上的集合通信按入队顺序在流上串行执行，这既是数据不错乱的保证，也是不死锁的前提。没有别的卡等着的分片放在最后读：早读只会挡住广播，放最后还能填满尾部广播仍在飞的时间。
+**Reads and broadcasts are pipelined.** `execute_read` traverses shards in total `(fqn, offset, index)` order. A rank immediately starts an asynchronous broadcast after reading its assigned shard, then reads the next without waiting. Each broadcast therefore overlaps the next read, with up to eight broadcasts in flight. Every rank uses identical `all_plans` and ordering, so enqueue order agrees automatically. Collectives within a group execute serially in enqueue order on the stream, ensuring correctness and avoiding deadlock. Shards with no waiting peers are read last, so they do not delay broadcasts and can fill the tail while broadcasts remain in flight.
 
-**小分片会合批。** 一次 broadcast 的固定开销约 145 µs，与它搬多少数据几乎无关（64 KiB 和 1 MiB 都是这个数），要到几 MiB 才跑满 33 GiB/s。也就是说小于交叉点（实测约 4.6 MiB）的分片，时间全花在「发起广播」而不是「搬数据」上——而 checkpoint 里恰恰有大量小张量：各种 norm、bias、scalar。所以 `broadcast_batch_bytes` 以下的分片会先拷进一块连续 staging、合成一次广播发出，落地后再散回各自 buffer；以上的仍然各发各的。
+**Small shards are batched.** Broadcast startup costs about 145 µs, nearly independent of data size: both 64 KiB and 1 MiB have that cost, and transfers need several MiB to reach 33 GiB/s. Below the measured crossover of about 4.6 MiB, startup dominates transfer time. Checkpoints contain many small norms, biases, and scalars. Shards below `broadcast_batch_bytes` are copied into contiguous staging, broadcast together, then scattered back to their buffers; larger shards remain separate.
 
-只有**通信组、源卡、dtype 三者都相同**的分片才能同批——一次广播只面向一个组、一个源、一块连续 buffer。各卡遍历分片的顺序相同，所以攒批和发批的位置天然一致，这和单发时不需要额外通信对齐是同一个道理。
+Only shards with **identical group, source rank, and dtype** can share a batch: a broadcast has one group, one source, and one contiguous buffer. Identical traversal order gives all ranks identical batch boundaries without extra communication, just as for individual broadcasts.
 
-实测数据（4 卡、512 × 64 KiB）：单发 81.5 ms，合成一次 1.1 ms。散回用 `torch._foreach_copy_` 融合成一次 kernel，1.4 ms（逐片 copy 要 11.8 ms）。
+Measurements on four devices with 512 × 64 KiB: individual broadcasts took 81.5 ms, one batched broadcast 1.1 ms. A fused `torch._foreach_copy_` scatter-back kernel took 1.4 ms, versus 11.8 ms for individual copies.
 
-> 代价是显存：一个批要留到它的广播落地为止，所以最多占 `broadcast_batch_bytes` × 在飞上限（8）。默认配置下约 48 MiB。另外 `torch.distributed._coalescing_manager` 在 torch_npu 上实测无效（81.0 vs 81.5 ms），所以只能走 staging 这条路。
+> The cost is device memory: batches remain live until broadcast completion, consuming up to `broadcast_batch_bytes` × eight in-flight operations, about 48 MiB by default. `torch.distributed._coalescing_manager` showed no benefit on torch_npu (81.0 versus 81.5 ms), so staging is used.
 
-读盘本身还会在一个后台线程上**提前读一两片**（仅 torch 后端）。读的那一半只碰 checkpoint 文件，不碰 planner 也不碰设备，所以能和主线程的 H2D 拷贝、广播下发并行；批次按交出去的顺序回来，发送顺序不受任何影响。收益来自把 `safe_open` 的开销挪出主线程，外加建 view 时顺带触发的内核预读（见下）——一张卡要在多于 `_TORCH_FILES_KEPT`（8）个 checkpoint 文件之间来回读时（常见于重切分加载），实测快 14~17%；文件局部性好、句柄缓存不失效时基本持平。
+A background thread also **reads one or two shards ahead**, on the Torch backend only. Reading touches checkpoint files, not planners or devices, allowing overlap with main-thread H2D copies and broadcast submission. Batches return in submission order, preserving send order. Benefits come from moving `safe_open` overhead off the main thread and triggering kernel readahead when constructing views, discussed below. When a device alternates among more than `_TORCH_FILES_KEPT` (8) files, common in resharded loading, measured speedups are 14–17%; with good file locality and no handle-cache eviction, performance is essentially unchanged.
 
-> **读序和广播序保持一致是有意的，别拆。** 试过让读线程按文件序走、主线程仍按全局序消费（中间用完成表代替 FIFO），想借此修掉跨文件跳的开销 —— 30B 实测反而**慢 38%**（15.3 s → 21.1 s，三个变体交错跑两轮，轮间偏差 0.2 s 内）。两个原因：一是 checkpoint 文件本就按 key 字典序首尾相接排布，和全局序 `(fqn, offset, index)` 完全吻合（实测 9218/9218、零空洞），单文件内的读**已经是顺序访问**，没有可修的；二是拆成两个序之后，读线程按文件序碰页、主线程按全局序 `copy_`，两个访问序在同一个文件上交错，打乱内核的顺序检测，预读失效。另外光是把 FIFO 换成完成表、顺序一个字不动，也要付 **7.6%** —— 18867 次字典插入加查找不是白来的。
+> **Read order intentionally matches broadcast order; do not separate them.** An experiment read in file order while the main thread consumed global order, using a completion table instead of FIFO to reduce cross-file switching. A 30B model became **38% slower**, from 15.3 s to 21.1 s, across two interleaved rounds of three variants with under 0.2 s variation. First, checkpoint files already concatenate keys lexicographically, exactly matching `(fqn, offset, index)` order: 9218/9218 entries with no gaps. Reads within each file are **already sequential**. Second, file-ordered page touches and global-ordered main-thread `copy_` accesses interleave on the same file, disrupting kernel sequential-access detection and readahead. Merely replacing FIFO with a completion table, without changing order, costs **7.6%** from 18,867 dictionary insertions and lookups.
 >
-> 推论：跨文件跳在当前架构下没有便宜解法。要让读盘按文件走，`copy_` 就得跟着按文件走，而 `copy_` 的顺序就是广播顺序，动它会把各个读者串行化（总时间从 `max(各读者)` 退化成 `sum(各读者)`）。
+> Consequently, cross-file switching has no inexpensive fix in this architecture. File-ordered reads require file-ordered `copy_`, whose order is also broadcast order. Changing it serializes readers, degrading total time from `max(readers)` to `sum(readers)`.
 
-### 读盘的时间花在哪：mmap 与页缓存
+### Where Read Time Goes: mmap and the Page Cache
 
-torch 后端读 checkpoint 走的是 **mmap，不是 `read()`**——`safe_open` 内部是 `MmapOptions::map_copy_read_only`，整条读路径上没有一次读系统调用。数据进入进程靠的是访问映射区时的**缺页中断**，所以「什么时候读盘」等价于「什么时候第一次碰那块内存」。
+The Torch checkpoint reader uses **mmap, not `read()`**. Internally, `safe_open` uses `MmapOptions::map_copy_read_only`; the entire read path makes no read system calls. Data enters the process through **page faults** on mapped memory, so disk-read timing is determined by the first access to those bytes.
 
-`_fetch_torch_tensor_file` 里的 `tensor_file.get_slice(key)[tensor_slices]` **拿到的是直接落在 mmap 上的零拷贝 view**：它的 `data_ptr()` 落在 `/proc/self/maps` 里那块文件映射区内，同一个张量取两次地址相同。所以取数据这一步几乎不花时间，**大张量的字节是后面 `_apply_fetched` 里的 `copy_` 读进来的**（实测 155.6 MiB 的 embedding，事先 `posix_fadvise(DONTNEED)` 清掉页缓存）：
+In `_fetch_torch_tensor_file`, `tensor_file.get_slice(key)[tensor_slices]` returns **a zero-copy view directly over mmap**. Its `data_ptr()` lies inside the file mapping shown by `/proc/self/maps`; repeated requests return the same address. Fetching therefore costs almost nothing. **Large tensor bytes are read later by `copy_` in `_apply_fetched`**, as measured for a 155.6 MiB embedding after clearing page cache with `posix_fadvise(DONTNEED)`:
 
-| 语句 | 耗时 | 磁盘读 |
+| Statement | Time | Disk reads |
 |---|---|---|
 | `get_slice(key)` | 0.03 ms | 0 |
 | `[tensor_slices]` | 0.74 ms | 0 |
-| `target_tensor.copy_(tensor)` | 127.60 ms | 147.7 MiB（179 次 major fault） |
-| 同样的 `copy_` 再来一次 | 25.29 ms | 0 |
+| `target_tensor.copy_(tensor)` | 127.60 ms | 147.7 MiB (179 major faults) |
+| Repeat the same `copy_` | 25.29 ms | 0 |
 
-最后两行差 5 倍，差的就是**页缓存**：内核把读过的文件页留在空闲内存里（`free` 的 `buff/cache` 列，可随时回收），再访问同样的字节直接从内存拿，磁盘计数器纹丝不动。
+The final two rows differ fivefold because of the **page cache**. The kernel retains file pages in available memory, shown as reclaimable `buff/cache` by `free`; subsequent accesses use memory without changing disk counters.
 
-> `[tensor_slices]` 那一行是 0，不代表建 view 不缺页——embedding 排在文件最前面，它的首页在 `safe_open` 解析 header 时就被预读带进了页缓存，所以那次是 minor fault，磁盘计数器不动。建 view 总会碰一页，只是这一页未必要走盘。
+> Zero disk reads for `[tensor_slices]` do not imply that view construction causes no page fault. The embedding begins the file, and header parsing in `safe_open` had already brought its first page into cache through readahead. That access caused a minor fault, leaving disk counters unchanged. View construction touches a page, but that page need not require disk I/O.
 
-**但这张表只是大张量的情形。** 建 view 本身会碰一下映射区（一页），触发**内核预读**（本机 `read_ahead_kb=4096`，一次最多带进 4 MiB）。张量小于预读窗口时，建 view 就把它整个带进来了，`copy_` 一个扇区都不用读；远大于窗口时，建 view 只带进开头一段，剩下的由 `copy_` 边读边缺页。从文件中段取 500 个张量（共 381 MiB，MoE 专家权重每个约 0.76 MiB，避开头部被 header 预读覆盖的影响）：
+**The table applies only to large tensors.** Constructing a view touches one mapped page and triggers **kernel readahead**: `read_ahead_kb=4096` on the measured host brings in up to 4 MiB at once. For tensors smaller than that window, view construction reads everything and `copy_` needs no disk sectors. For much larger tensors, only the beginning is prefetched; `copy_` faults in the remainder. For 500 tensors from the middle of a file, totaling 381 MiB with MoE expert weights around 0.76 MiB each and avoiding header readahead:
 
-| 路线 | `get_tensor(k)` / `get_slice(k)` | `[slice]` / `[spec]` | `copy_` |
+| Path | `get_tensor(k)` / `get_slice(k)` | `[slice]` / `[spec]` | `copy_` |
 |---|---|---|---|
-| `get_tensor(k)[slice]` | 170.54 ms，**387.5 MiB** | 3.41 ms，0 | 0 |
-| `get_slice(k)[spec]` | 0.27 ms，0 | 181.22 ms，**387.5 MiB** | ~0 |
+| `get_tensor(k)[slice]` | 170.54 ms, **387.5 MiB** | 3.41 ms, 0 | 0 |
+| `get_slice(k)[spec]` | 0.27 ms, 0 | 181.22 ms, **387.5 MiB** | ~0 |
 
-两条路线读盘量完全一致，只是落在不同语句上：`get_tensor(k)` 自己就把 view 建好了（碰映射区在这一步），`get_slice(k)` 只取元数据、要等 `[spec]` 才建。而 `[slice]` 作用在已经建好的 torch 张量上，只改 sizes / strides / storage_offset，**永远不会缺页**。
+Both paths read identical bytes at different statements. `get_tensor(k)` constructs the view immediately and touches the mapping; `get_slice(k)` retrieves metadata only and constructs the view at `[spec]`. Applying `[slice]` to an existing Torch tensor only changes sizes, strides, and storage_offset and **never faults in data**.
 
-**所以后台预读线程确实在预读，只是靠的是内核。** 它不拷贝任何字节，只是建 view 时碰一下映射区，剩下的是内核预读顺手做的。checkpoint 里张量普遍小于预读窗口时（MoE 尤其如此），这等于把整批数据提前拉进了页缓存，主线程的 `copy_` 只走内存：2486 个张量共 2.0 GiB 的场景，建 view 阶段就拉进 1903 MiB，`copy_` 只需再读 155 MiB。反过来，单个远大于窗口的张量（比如 embedding），`copy_` 仍要自己边读边缺页。
+**The background thread really does prefetch, through the kernel.** It copies no bytes; constructing a view touches the mapping, and kernel readahead does the rest. When most checkpoint tensors fit within the readahead window, especially for MoE, this brings entire batches into page cache before main-thread `copy_`. In a 2.0 GiB case with 2486 tensors, view construction read 1903 MiB and `copy_` needed another 155 MiB. A single tensor far larger than the window, such as an embedding, still requires page faults during `copy_`.
 
-> 这份预读依赖两个条件：预读窗口够大、且张量在文件里排布紧密。要做成确定性的，读线程里得显式 `madvise(MADV_WILLNEED)`，或者真把字节拷出来（后者要多付一份主机内存）。
+> This depends on a sufficiently large readahead window and tightly packed tensors in the file. Deterministic prefetch would require explicit `madvise(MADV_WILLNEED)` in the reader thread or actual byte copies, with the latter consuming another host-memory buffer.
 
-**`get_slice(k)[spec]` 与 `get_tensor(k)[spec]` 实测等价**（safetensors 0.8.0）：两者都返回 mmap 上的 view，地址相同，建 view 都是零点几毫秒、0 磁盘，后续 `copy_` 的耗时和读盘量也一致。差别只在 `get_slice` 可以先 `get_shape()` 而完全不碰数据——校验 key 和形状时用得上。
+**`get_slice(k)[spec]` and `get_tensor(k)[spec]` measured equivalently** with safetensors 0.8.0: both return mmap views at identical addresses, take fractions of a millisecond with zero disk reads to construct the view, and have the same subsequent `copy_` time and read volume. The difference is that `get_slice` permits `get_shape()` without touching data, useful for key and shape validation.
 
-**但怎么切很要紧。** dim 0 的前缀切（行并行）只读要的那部分：半个 embedding 是 74.98 MiB，整个是 148.88 MiB。dim 1 的切（列并行）拿到的是 strided view，`copy_` 要跨过每一页，**整个张量都会被读上来**（148.88 MiB，和不切一样）。重切分加载时列切方向省不到 I/O。
+**The slicing dimension matters.** A dimension-0 prefix slice, as in row parallelism, reads only the requested portion: half an embedding reads 74.98 MiB versus 148.88 MiB for the full tensor. A dimension-1 column slice produces a strided view whose `copy_` traverses every page, so **the entire tensor is read**, 148.88 MiB, just as without slicing. Column sharding saves no I/O during resharded loading.
 
-这一点也直接决定了广播能省多少。**同一台机器上的 dp 副本读的是同一个文件的同一段字节**，关掉广播时第二个 rank 的读全部命中页缓存，磁盘并不会读第二遍：8 卡实测无论广播开关，`/proc/diskstats` 都是 **56.9 GiB**，完全相同。所以单机布局下广播省不到磁盘 I/O，端到端只有 1 秒量级的出入（读播流水化之前甚至是负收益）。真正让广播值钱的是页缓存兜不住的场景——**跨节点 dp、共享存储 / NFS，或者 checkpoint 大到装不进内存**。
+This also determines broadcast savings. **DP replicas on one host read the same bytes from the same file.** Without broadcasting, the second rank hits page cache entirely instead of rereading disk. Eight-device measurements showed identical **56.9 GiB** in `/proc/diskstats` with broadcasting on or off. Broadcasting therefore saves no disk I/O for a single-host layout, with end-to-end differences around one second; before read/broadcast pipelining it could even hurt. Broadcasting matters when page cache cannot absorb duplication: **cross-node DP, shared storage/NFS, or checkpoints larger than memory**.
 
-> 想自己数字节数只能用 `/proc/diskstats`，别拿 `majflt` 乘 4 KiB 反推：一次阻塞式缺页会顺带把后面一整个预读窗口拉进页缓存，上面 1.866 GiB 只报了 951 次 major fault。另外统计设备时正则要锚定 `^nvme[0-9]+n[0-9]+$`，否则整盘和分区各算一遍，数字直接翻倍。还有 `posix_fadvise(DONTNEED)` 会跳过仍被映射在页表里的页——测冷读必须先丢掉 `safe_open` 的句柄，最稳妥是一个配置起一个进程。
+> Measure bytes with `/proc/diskstats`, not `majflt × 4 KiB`: one blocking fault can pull an entire readahead window into cache. The 1.866 GiB measurement above reported only 951 major faults. Anchor device matching to `^nvme[0-9]+n[0-9]+$` to avoid counting both disks and partitions and doubling totals. `posix_fadvise(DONTNEED)` also skips pages still mapped in page tables. Drop `safe_open` handles before measuring cold reads; one process per configuration is safest.
 
 ---
 
-## 去冗余与 Plan 缓存
+## Deduplication and Plan Caching
 
-`StandardSavePlanner` 的两个默认优化，均只在 `use_collectives=True` 时生效：
+`StandardSavePlanner` enables two optimizations by default, both requiring `use_collectives=True`:
 
 ```python
 StandardSavePlanner(
-    enable_plan_caching=True,    # 缓存最终 plan 与 metadata
-    remove_redundancy=True,      # 跨 rank 去重
-    save_to_minimum_rank=False,  # 去重后归属策略
+    enable_plan_caching=True,    # Cache the final plan and metadata.
+    remove_redundancy=True,      # Deduplicate across ranks.
+    save_to_minimum_rank=False,  # Ownership policy after deduplication.
 )
 ```
 
-- **去冗余**：同一分片被多个 rank 持有时只写一份。归属默认按**已规划字节数最小**的 plan 分配（负载均衡，避免副本全堆到 rank0）；置 `save_to_minimum_rank=True` 则统一归给最小 rank。
-- **Plan 缓存**：以 state_dict 的 key 集合为缓存键，缓存在类级别。模型结构不变时，第二次及以后的 `save` 会跳过 `build_local_plan` / `all_gather` / `build_global_plan` 整个规划阶段——这一步是唯一随 world_size 线性增长的通信。异步保存路径下，子进程算出的缓存会随结果回传给父进程复用。
+- **Deduplication**: Write one copy of shards held by multiple ranks. By default, assign ownership to the plan with the **fewest planned bytes**, balancing load instead of concentrating replicas on rank 0. `save_to_minimum_rank=True` always selects the lowest rank.
+- **Plan caching**: Class-level caching uses the state_dict key set. With unchanged model structure, subsequent saves skip the entire `build_local_plan` / `all_gather` / `build_global_plan` phase, the only communication that grows linearly with world size. For asynchronous saves, subprocess-generated caches return to the parent with results for reuse.
 
-**两种自动降级**（无需干预，但需知情）：
+**Two automatic fallbacks** require no intervention but should be understood:
 
-- `use_collectives=False` 时，去冗余与 Plan 缓存都会自动关闭（没有全局视图）；
-- state_dict 中含 `ragged_shard` 的 DTensor 时，Plan 缓存自动关闭（几何结构可能逐步变化）。
+- `use_collectives=False` disables deduplication and plan caching because no global view exists.
+- DTensors with `ragged_shard` in state_dict disable plan caching because geometry may change between steps.
 
 ---
 
-## 与 FSDP / HSDP 配合
+## FSDP / HSDP Integration
 
-DCP 与 `fully_shard` 天然配合：分片后的参数已经是 DTensor，带着完整的 layout 信息。
+DCP naturally composes with `fully_shard`: sharded parameters are already DTensors carrying complete layout information.
 
 ```python
 from hyper_parallel import fully_shard, init_device_mesh
@@ -303,16 +305,16 @@ save(model.state_dict(), checkpoint_id="/ckpt/step_1000")
 
 ---
 
-## 直接加载 safetensors 权重
+## Load Safetensors Weights Directly
 
-两种不是 DCP 写出的 safetensors 目录可以直接交给 `load`，不必先离线转成 DCP。两种目录的规则互相冲突，所以各用一个 reader：
+Two types of safetensors directories not written by DCP can be passed directly to `load`, without offline conversion first. Their directory rules conflict, so each has its own reader:
 
 | | `HuggingFaceStorageReader` | `TorchShardedSafetensorsReader` |
 |------|------|------|
-| 读什么 | Hugging Face 权重，即 `save_pretrained` 的产物：张量完整，每个只在一个文件里 | torch `HuggingFaceStorageWriter(save_distributed=True)` 写出、尚未合并的分片：每个 rank 一个文件，同一个张量分散在多个文件里，没有 index |
-| 读哪些文件 | `model.safetensors.index.json` 列出的文件；没有 index 时只读 `model.safetensors`，目录里其他 safetensors 都不读 | 目录下（不递归）的全部 `*.safetensors` |
-| 张量位置 | 文件头若带 `DCP_SHARDING_INFO`，offsets 必须全为 0 | 每个文件都必须带 `DCP_SHARDING_INFO`；同名张量的各片按 offsets 拼成一个张量，必须拼满且不重叠 |
-| 指错目录时 | 某个张量的 offsets 不为 0 → `ValueError`；既没有 index 也没有 `model.safetensors` → `FileNotFoundError`。两者都提示改用 `TorchShardedSafetensorsReader` | 目录里有 index，或文件没带 `DCP_SHARDING_INFO` → `ValueError`，提示改用 `HuggingFaceStorageReader` |
+| Input | Hugging Face weights produced by `save_pretrained`: each tensor is complete and appears in exactly one file | Unmerged shards written by torch `HuggingFaceStorageWriter(save_distributed=True)`: one file per rank, tensors spanning multiple files, no index |
+| Files read | Files listed in `model.safetensors.index.json`; without an index, only `model.safetensors`, ignoring other safetensors files in the directory | All `*.safetensors` directly in the directory, without recursion |
+| Tensor positions | If file headers contain `DCP_SHARDING_INFO`, all offsets must be 0 | Every file must contain `DCP_SHARDING_INFO`; shards sharing a tensor name are assembled by offsets and must cover the whole tensor without overlap |
+| Wrong directory type | Nonzero offsets for any tensor raise `ValueError`; absence of both an index and `model.safetensors` raises `FileNotFoundError`. Both errors suggest `TorchShardedSafetensorsReader` | An index in the directory, or a file missing `DCP_SHARDING_INFO`, raises `ValueError` suggesting `HuggingFaceStorageReader` |
 
 ```python
 from hyper_parallel.components.checkpoint import (
@@ -323,63 +325,63 @@ from hyper_parallel.core.distributed_checkpoint import StandardLoadPlanner, load
 
 load(model.state_dict(), storage_reader=HuggingFaceStorageReader("/models/Qwen3-8B"))
 
-# tie_word_embeddings 的模型：绑定权重在 HF 文件里只存一份，缺的 key 需要放行
+# With tie_word_embeddings, HF stores tied weights only once; allow the missing keys.
 load(model.state_dict(), storage_reader=HuggingFaceStorageReader("/models/Qwen3-8B"),
      planner=StandardLoadPlanner(allow_partial_load=True))
 
-# torch 分片写出、尚未合并的目录
+# A directory of torch-written shards that have not yet been merged.
 load(model.state_dict(), storage_reader=TorchShardedSafetensorsReader("/ckpt/step_1000/sharded"))
 ```
 
-torchtitan 保存为 HF 格式时，先把分片写到 checkpoint 下的 `sharded/` 目录，再合并出带 index 的完整权重，这两个目录分别对应上面两个 reader。
+When torchtitan saves in HF format, it first writes shards under the checkpoint's `sharded/` directory, then merges complete weights with an index. These directories correspond to the two readers above.
 
-两个 reader 替换的只是「元数据从哪来」这一步：`FileSystemReader` 反序列化 `.metadata`，它们则读每个 safetensors 文件开头的 JSON 头，拿到每个张量的 dtype 和 shape，拼成同样的 `Metadata`，每个张量记在它在文件里的名字下。构造元数据只读文件头，不读张量数据。之后的规划、重切分、副本读一次 + 广播、按文件读取全部沿用，所以：
+These readers change only the source of metadata. `FileSystemReader` deserializes `.metadata`; the safetensors readers read each file's JSON header for tensor dtypes and shapes, constructing the same `Metadata` under each tensor's stored name. Building metadata reads only headers, not tensor data. Subsequent planning, resharding, read-once replica broadcasting, and per-file reading remain unchanged, so:
 
-- 目标可以是任意切分的 DTensor，每个 rank 只读自己那一片；
-- 目标 dtype 可以和文件不同（例如文件是 bf16、参数是 fp32），`copy_` 时转换。
+- Targets can be DTensors with arbitrary sharding, and each rank reads only its own shard;
+- Target dtype can differ from the file, such as bf16 files and fp32 parameters; conversion occurs during `copy_`.
 
-**这一层只管读，不做转换：**
+**This layer only reads; it does not transform weights:**
 
-| 限制 | 说明 |
+| Limitation | Description |
 |------|------|
-| 名字和形状要对上 | state_dict 的 key 必须就是文件里的张量名，全局 shape 一致。改名、q/k/v 合并成 `linear_qkv`、专家权重堆叠这类转换不在这一层 |
-| 缺失的 key | 默认报 `Missing key in checkpoint state_dict`；需要放行时传 `StandardLoadPlanner(allow_partial_load=True)` |
-| 量化权重 | 按存储原样读：FP8 权重读出来仍是 FP8 值，scale 是单独的张量，不做反量化 |
-| 只读 | 暂不支持保存为 HF 格式 |
-| 需要进程组 | 与其他 `load` 相同，要求已经 `init_process_group`，单进程也不例外 |
+| Names and shapes must match | state_dict keys must exactly match tensor names in the files, with identical global shapes. Renaming, merging q/k/v into `linear_qkv`, and stacking expert weights are outside this layer |
+| Missing keys | Raise `Missing key in checkpoint state_dict` by default; pass `StandardLoadPlanner(allow_partial_load=True)` to allow them |
+| Quantized weights | Read exactly as stored: FP8 weights remain FP8 values and scales are separate tensors, without dequantization |
+| Read-only | Saving in HF format is not yet supported |
+| Process group required | Like other `load` calls, requires `init_process_group`, even for a single process |
 
-以下情况 `load_metadata` 直接报错，而不是读出错误的数据：同一张量的同一片出现在两个文件里；各片 dtype 不一致；各片拼不满整个张量（缺文件）或互相重叠；记录了 `DCP_SHARDING_INFO` 的文件漏记了某个张量的偏移；dtype 没有对应的 torch 类型。
+`load_metadata` raises an error instead of reading incorrect data when the same tensor shard appears in two files, shard dtypes differ, shards fail to cover the complete tensor due to missing files or overlap, a file containing `DCP_SHARDING_INFO` omits a tensor's offsets, or a dtype has no corresponding torch type.
 
 ---
 
-## DCP 加载时在线反量化
+## Online Dequantization During DCP Loading
 
-通过 `HyperAutoModelForCausalLM.from_pretrained()` 或
-`HyperAutoModelForImageTextToText.from_pretrained()` 加载 HF 目录时，默认使用 DCP。
-普通 BF16/FP32 目录继续使用 `HuggingFaceStorageReader`；目录的 `config.json` 声明受支持的
-`quantization_config` 时，自动使用共用的 `QuantizedHuggingFaceStorageReader`。
+Loading an HF directory through `HyperAutoModelForCausalLM.from_pretrained()` or
+`HyperAutoModelForImageTextToText.from_pretrained()` uses DCP by default.
+Ordinary BF16/FP32 directories continue to use `HuggingFaceStorageReader`. If the directory's `config.json` declares a supported
+`quantization_config`, the shared `QuantizedHuggingFaceStorageReader` is selected automatically.
 
-当前支持 `quant_method: fp8` 下的二维 E4M3 权重、打包 FP4 权重及配套 scale。
-该能力按存储格式复用，不依赖具体模型；不支持的量化方法会报错。
-例如 DeepSeek V4.1 的 FP8/FP4、UE8M0 scale 可以直接加载，无需先生成离线 BF16 副本。
+Currently supported under `quant_method: fp8` are two-dimensional E4M3 weights, packed FP4 weights, and their scales.
+This capability is reused by storage format and is model-independent; unsupported quantization methods raise errors.
+For example, DeepSeek V4.1 FP8/FP4 weights and UE8M0 scales can load directly without first generating an offline BF16 copy.
 
 ```text
-量化文件头 → 逻辑 BF16 Metadata → 原有转换与分片规划
-→ 读取所需 weight/scale 区域 → Transformers Fp8Dequantize
-→ 裁回请求区域 → 原有 DCP 拷贝与最终完整性检查
+Quantized file headers → logical BF16 Metadata → existing conversion and sharding planning
+→ Read required weight/scale regions → Transformers Fp8Dequantize
+→ Crop to requested regions → existing DCP copies and final completeness checks
 ```
 
-FP4 的逻辑列数是打包存储列数的两倍；Planner 的偏移和长度使用逻辑坐标，Reader 负责
-压缩坐标换算、块对齐和分块反量化。权重命名、专家合并和高性能模块转换继续使用原有规则。
-模型本身先从配置在 meta 上构建并分片，不通过 Transformers 提前读取权重。
+FP4 has twice as many logical columns as packed storage columns. Planner offsets and lengths use logical coordinates; the Reader handles
+packed-coordinate conversion, block alignment, and blockwise dequantization. Weight naming, expert merging, and high-performance module conversions retain their existing rules.
+The model is first constructed from config on meta and sharded, without having Transformers read weights in advance.
 
-反量化由安装的 Transformers `Fp8Dequantize` 实现执行，版本必须支持对应格式。
-当前不接受在 DCP 构建入口显式传入 `quantization_config` 来请求量化模块初始化或重新量化；
-在线解码以 checkpoint 自带配置为准。解码输出为 BF16，随后按目标参数及
-`model_init_dtype` 配置处理 dtype。官方算子保留 FP4 的负零，因此可能与把负零归一化的
-离线工具存在零值符号位差异。
+Dequantization uses the installed Transformers `Fp8Dequantize` implementation, whose version must support the format.
+Explicitly passing `quantization_config` at the DCP construction entry to request quantized-module initialization or requantization is currently rejected;
+online decoding follows the checkpoint's own configuration. Decoding produces BF16, followed by dtype handling according to target parameters and
+`model_init_dtype`. The official operator preserves FP4 negative zero, so zero sign bits may differ from those produced by
+offline tools that normalize negative zero.
 
-DeepSeek 裁层示例可直接传入官方量化目录或已有 BF16 目录：
+The cropped-layer DeepSeek example accepts either the official quantized directory or an existing BF16 directory directly:
 
 ```bash
 bash examples/training_demo/deepseek_v41/run_deepseek_v41_vlm_online_load_hf.sh /data/DeepSeek-V4.1-Flash
@@ -387,17 +389,17 @@ bash examples/training_demo/deepseek_v41/run_deepseek_v41_vlm_online_load_hf.sh 
 
 ---
 
-## 离线格式转换（Hugging Face ⇄ DCP）
+## Offline Format Conversion (Hugging Face ⇄ DCP)
 
-`offline_transform` 提供单进程的离线互转，用于"HF 权重初始化训练"和"训练产物导出成 HF 格式"两个方向：
+`offline_transform` provides single-process offline conversion for initializing training from HF weights and exporting training outputs to HF:
 
 ```python
 from hyper_parallel.core.distributed_checkpoint.offline_transform import (
-    convert_full_checkpoint_to_dcp,        # 完整权重文件/HF 目录 → DCP
-    full_state_dict_to_dcp_format,         # 内存中的完整 state_dict → DCP
-    dcp_to_full_state_dict,                # DCP 分片 → 合并后的完整 state_dict
-    parse_checkpoint_from_huggingface,     # 读 HF safetensors（单文件或分片 + index）
-    save_state_dict_as_huggingface_format, # 写成 HF 风格 safetensors（可分片）
+    convert_full_checkpoint_to_dcp,        # Full weight file / HF directory → DCP
+    full_state_dict_to_dcp_format,         # Full in-memory state_dict → DCP
+    dcp_to_full_state_dict,                # DCP shards → merged full state_dict
+    parse_checkpoint_from_huggingface,     # Read HF safetensors: single file or shards + index
+    save_state_dict_as_huggingface_format, # Write HF-style safetensors, optionally sharded
 )
 
 # HF → DCP
@@ -408,113 +410,113 @@ full_sd = dcp_to_full_state_dict("/ckpt/step_1000")
 save_state_dict_as_huggingface_format("/export/hf", full_sd, max_shard_size="5GB")
 ```
 
-`src_platform` 可取 `"huggingface"`（HF 目录）或 `"torch"`（PyTorch 完整 checkpoint 文件，pickle 或 `.safetensors`）。
+`src_platform` accepts `"huggingface"` for HF directories or `"torch"` for full PyTorch checkpoints in pickle or `.safetensors` format.
 
 ---
 
-## 自定义扩展
+## Custom Extensions
 
-- **自定义存储后端**：继承 `StorageWriter` / `StorageReader`，实现 `execute_write` / `execute_read` / `load_metadata` 等方法，通过 `storage_writer=` / `storage_reader=` 传入。
-- **自定义规划器**：继承 `SavePlanner` / `LoadPlanner`，或从 `StandardSavePlanner` / `StandardLoadPlanner` 派生后覆写。
-- **自定义对象的异步 staging**：`async_save` 通过 `DataCopier` 按类型分派拷贝方法，未注册的类型会走通用深拷贝并打 warning。自定义类型请显式注册：
+- **Storage backend**: Subclass `StorageWriter` / `StorageReader`, implement `execute_write`, `execute_read`, `load_metadata`, and related methods, then pass through `storage_writer=` / `storage_reader=`.
+- **Planner**: Subclass `SavePlanner` / `LoadPlanner`, or derive from `StandardSavePlanner` / `StandardLoadPlanner` and override behavior.
+- **Asynchronous staging of custom objects**: `async_save` dispatches copies by type through `DataCopier`. Unregistered types use generic deep copy with a warning. Register custom types explicitly:
 
 ```python
 from hyper_parallel.core.distributed_checkpoint.async_persist import DataCopier
 
 @DataCopier.register(MyState)
 def _copy_my_state(obj):
-    return MyState(...)   # 返回 Host 内存中的副本
+    return MyState(...)   # Return a copy in host memory.
 ```
 
-> 注意 `DTensor` 是 `torch.Tensor` 的子类，分派按"精确类型 → 最派生的注册基类"顺序解析。自定义类型如果也存在继承关系，请确认命中的是预期的 handler。
+> `DTensor` subclasses `torch.Tensor`. Dispatch resolves exact types first, then the most-derived registered base class. For custom inheritance hierarchies, verify that the intended handler is selected.
 
 ---
 
-## 调试与性能
+## Debugging and Performance
 
-**打开分阶段耗时日志**（定位存盘瓶颈的第一手段）：
+**Enable per-phase timing logs** as the first step in diagnosing save bottlenecks:
 
 ```bash
 export HP_LOG_CONFIG=DCP:INFO
-# 输出形如：
+# Example output:
 # [INFO] [HP-DCP]: [rank=0] >>> func build_local_plan cost 0.0003 seconds
 # [INFO] [HP-DCP]: [rank=0] >>> func execute_write cost 0.0061 seconds
 ```
 
-覆盖 `save` / `_save_impl` / `build_local_plan` / `all_gather_object` / `build_global_plan` / `execute_write` / `execute_read` / `build_staged_state_dict` 等关键阶段，每个 rank 单独计时。命中 Plan 缓存时会打印 `Hit final plan and metadata cache.`。
+Key phases include `save`, `_save_impl`, `build_local_plan`, `all_gather_object`, `build_global_plan`, `execute_write`, `execute_read`, and `build_staged_state_dict`, timed separately on every rank. Cache hits log `Hit final plan and metadata cache.`.
 
-**性能建议**：
+**Performance recommendations:**
 
-1. 用 `async_save` 让落盘与训练计算重叠，训练进程只付 staging 的开销；
-2. 保持 `enable_plan_caching=True`，让规划阶段的通信只在第一次存盘时付出；
-3. 有复制维度时保持 `broadcast_replicated_tensors` 开启（默认），用通信换 IO；
-4. 变更并行策略优先走 load 时重切分；确需离线合并再切分时才用 `offline_transform`。
-
----
-
-## 注意事项
-
-1. **`load` 只填已存在的 key**：目标 state_dict 必须先构造出正确形状的张量；优化器状态需要先预热（让 `optimizer.state` 非空）再加载。
-2. **相同 FQN 会被跨 rank 去重**：权重、优化器状态天然一致，没问题；但 **RNG state 这类每卡不同的数据**不能以相同 key 内嵌保存，否则只会留下一份。这类状态请每 rank 单独存，或给 key 加 rank 后缀。
-3. **`async_save` 返回不代表落盘完成**：staging 已完成（原 state_dict 可继续改写），但需等 `get_result()` 才确认磁盘写完。
-4. **`save` 与 `load` 的 `use_collectives` 默认值相反**（`True` / `False`），跨函数复制参数时容易搞错。
-5. **`no_dist=True` 会强制关闭 `use_collectives`**。
+1. Use `async_save` to overlap persistence with training computation; the training process pays only staging costs.
+2. Keep `enable_plan_caching=True` so planning communication is paid only for the first save.
+3. Keep `broadcast_replicated_tensors` enabled, as by default, when replicated dimensions exist, trading communication for I/O.
+4. Prefer resharding during load when changing parallel strategies; use `offline_transform` only when an offline merge and reshard is necessary.
 
 ---
 
-## 流水并行（PP）下的广播加载
+## Important Notes
 
-PP 打破了「各卡 state_dict 键相同」这个前提：一个 stage 只持有分给它的层，`embed` 只在首
-stage、`head` 只在末 stage，两个 stage 几乎没有共同的键。这套流程能扛住，靠的是三点：
-
-- `build_local_plan` 是**纯本地**的，`all_gather_object` 本来就允许各卡内容不同；
-- `build_global_plan` 按 `dest_index`（`fqn` + `offset` + `index`）聚合副本组，所以 stage0 的
-  参数天然只组成 stage0 内部的组，stage1 的只组成 stage1 内部的组，**两组不相交**；
-- 顺序不变量只需要**在组内**成立，而一个组的成员必然在同一个 stage、遍历同一个子序列，
-  所以**跨 stage 不需要对齐**，一个 stage 可以远远跑在另一个前面。
-
-### 通信组：建出来、用一次、销毁
-
-一个 stage 内部的副本组（stage 的 4 张卡、或某个 tp 列的 2 张卡）通常不在任何已有通信域里，
-得现建。建组走的是 **`dist.new_group(ranks=...)`**——**建的就是给它的那几个 rank**，
-建完就还给调用方。
-
-这里**不用 `create_group`**（`core/dtensor/_utils.py`），它做的事超出所需：把 rank 列表当**模板**展开成对全世界
-的一个划分，并把展开出的每个组都塞进进程级缓存。两个后果对 PP 都不合适——缓存会让这些只用
-一次的通信域活到任务结束（一个 communicator 一直占着显存），而模板展开会**拒绝** PP 会产生的
-rank 列表，比如绑定在两个不相邻 stage 上的参数（`[0,1,6,7]` → `ValueError: Template must have
-consistent intra-group step`）。走 `new_group` 这两个问题都不存在。
-
-组在 `load()` 里用 `broadcast_groups_for_load(...)` 圈住：读完就按 rank 元组顺序销毁（这个顺序
-各卡算出来一致，而销毁只由组内成员发起，它们是一起走到读取末尾的）。调用方通过
-`broadcast_groups=` 预建传进来的组**不属于**这次加载，原样留着不动。
-
-**建组是全局集合调用。** 建组的进入条件是
-`broadcast_replicated_tensors and use_collectives and world_size > 1`——三个全卡一致的量，
-不是「我有没有要广播的分片」。一个全部参数都被切满、一个副本分片都没有的 stage，仍然必须
-进来陪着建组，否则另一个 stage 会一直等它。这些 rank 从 `new_group` 拿到的是后端的非成员标记
-（torch 上是 `-100`），既不会被存进组字典，也不参与销毁。
+1. **`load` fills existing keys only**: Preconstruct target tensors with correct shapes. Warm up optimizer state so `optimizer.state` is nonempty before loading.
+2. **Identical FQNs are deduplicated across ranks**: This is appropriate for identical weights and optimizer state, but **rank-specific data such as RNG state** cannot be embedded under the same key or only one copy survives. Save it separately per rank or add a rank suffix to keys.
+3. **Returning from `async_save` does not mean persistence is complete**: Staging is complete and state_dict can be modified, but wait for `get_result()` to confirm disk completion.
+4. **`save` and `load` both default `use_collectives` to `True`**. Set `False` explicitly when independent rank-local operation is intended.
+5. **`no_dist=True` forces `use_collectives` off**.
 
 ---
 
-## 相关 ST
+## Broadcast Loading with Pipeline Parallelism (PP)
+
+PP breaks the assumption that all ranks have identical state_dict keys: each stage holds only its assigned layers, with `embed` on the first
+stage and `head` on the last. Stages share almost no keys. The workflow handles this through three properties:
+
+- `build_local_plan` is **entirely local**, and `all_gather_object` already permits different contents on different ranks.
+- `build_global_plan` groups replicas by `dest_index` (`fqn` + `offset` + `index`), so stage 0 parameters
+  naturally form groups within stage 0 and stage 1 parameters form groups within stage 1; **the groups are disjoint**.
+- The ordering invariant is required only **within each group**. Members of a group belong to the same stage and traverse the same subsequence,
+  so **stages need no mutual alignment**; one stage may run far ahead of another.
+
+### Communication Groups: Create, Use Once, Destroy
+
+Replica groups within a stage, such as its four devices or two devices in one TP column, usually do not correspond to existing communication groups
+and must be created. **`dist.new_group(ranks=...)`** creates **exactly the supplied ranks**,
+then returns the group to the caller.
+
+This path **does not use `create_group`** from `core/dtensor/_utils.py`, which does more than needed: it expands a rank-list **template** into a partition of
+WORLD and caches every resulting group process-wide. Both consequences are unsuitable for PP. Caching retains one-use
+communicators and their device memory until the job ends, while template expansion **rejects** some PP-generated
+rank lists, such as tied parameters across nonadjacent stages (`[0,1,6,7]` → `ValueError: Template must have
+consistent intra-group step`). `new_group` avoids both problems.
+
+Within `load()`, `broadcast_groups_for_load(...)` scopes groups and destroys them after reading in rank-tuple order. Every rank computes the same order,
+and only group members initiate destruction after reaching the end of reading together. Caller-provided groups passed through
+`broadcast_groups=` **are not owned** by this load and remain untouched.
+
+**Group creation is a global collective operation.** Its entry condition is
+`broadcast_replicated_tensors and use_collectives and world_size > 1`, three values shared by all ranks,
+not whether the current rank has a shard to broadcast. Even a stage with fully sharded parameters and no replica shards must
+participate, or another stage will wait indefinitely. Such ranks receive the backend's nonmember marker from `new_group`,
+`-100` on Torch, which is neither stored in the group dictionary nor destroyed.
+
+---
+
+## Related System Tests
 
 ```bash
-# 无 NPU 也可验证（CPU + gloo 后端）
+# Validate without NPUs using CPU and Gloo.
 export HYPER_PARALLEL_TEST_DEVICE_TYPE=cpu
 python -m torch.distributed.run --nproc-per-node=4 -m pytest -s \
     tests/torch/distributed_checkpoint/dcp_async_save.py::test_dcp_async_save_twice_reuses_the_plan_cache
 ```
 
-| 用例文件 | 覆盖内容 |
+| Test file | Coverage |
 |------|------|
-| `tests/torch/distributed_checkpoint/dcp_save_and_load.py` | DTensor + 普通 Tensor + 标量混合存取、跨切分加载 |
-| `tests/torch/distributed_checkpoint/dcp_async_save.py` | 三种异步协同模式、Plan 缓存复用 |
-| `tests/torch/distributed_checkpoint/dcp_broadcast_load.py` | 副本张量广播加载（预建 / 懒建通信组） |
-| `tests/torch/distributed_checkpoint/dcp_pipeline_load.py` | 读播流水：超出在飞上限、通信组交错、非张量状态、重复加载 |
-| `tests/torch/distributed_checkpoint/dcp_pp_stage_load.py` | PP 下的广播加载（8 卡 `pp=2 × dp=2 × tp=2`）：各 stage 参数不同、某个 stage 无副本分片、两 stage 在分片序中交错、跨 stage 绑定参数 |
-| `tests/torch/distributed_checkpoint/dcp_resharding_api.py` | 多种 mesh 组合下的重切分读取 |
-| `tests/torch/distributed_checkpoint/_test_dcp_tp_dp.py` | `fully_shard` + 优化器状态 + flatten_state_dict |
-| `tests/torch/distributed_checkpoint/dcp_plan_cache_minimal_api.py` | Plan 缓存命中与 model / optimizer 缓存隔离 |
+| `tests/torch/distributed_checkpoint/dcp_save_and_load.py` | Mixed saving/loading of DTensors, ordinary Tensors, and scalars; loading across sharding layouts |
+| `tests/torch/distributed_checkpoint/dcp_async_save.py` | Three asynchronous coordination modes and plan-cache reuse |
+| `tests/torch/distributed_checkpoint/dcp_broadcast_load.py` | Broadcast loading of replicated tensors with precreated or lazily created groups |
+| `tests/torch/distributed_checkpoint/dcp_pipeline_load.py` | Read/broadcast pipelining: exceeding the in-flight limit, interleaved groups, nontensor state, and repeated loading |
+| `tests/torch/distributed_checkpoint/dcp_pp_stage_load.py` | Broadcast loading with PP on 8 devices (`pp=2 × dp=2 × tp=2`): different stage parameters, a stage without replicated shards, interleaved shard order across stages, and tied parameters across stages |
+| `tests/torch/distributed_checkpoint/dcp_resharding_api.py` | Resharded reads with multiple mesh combinations |
+| `tests/torch/distributed_checkpoint/_test_dcp_tp_dp.py` | `fully_shard`, optimizer state, and flatten_state_dict |
+| `tests/torch/distributed_checkpoint/dcp_plan_cache_minimal_api.py` | Plan-cache hits and isolation of model/optimizer caches |
 
-用例文件本身不带 `test_` 前缀（或以 `_` 开头），由同名的 `test_*.py` 包装器通过 `parallel_run` 拉起多进程执行；直接用 `torch.distributed.run` 跑上表中的文件即可。
+Worker files omit the `test_` prefix or begin with `_`. Corresponding `test_*.py` wrappers launch multiprocess execution through `parallel_run`; the files above can also be run directly with `torch.distributed.run`.

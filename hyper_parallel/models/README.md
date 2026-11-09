@@ -1,45 +1,45 @@
-# HyperParallel 模型训练
+# HyperParallel Model Training
 
-HyperParallel 模型训练提供由 YAML 配置驱动的文本与多模态 Trainer。`parse_training_args()` 将 YAML 和 CLI dotted overrides 解析为 `TrainerConfig`，`TextTrainer` 或 `VLMTrainer` 再根据配置构建训练组件并执行训练。分布式张量、模型分片和集合通信等底层能力由 HyperParallel Core 提供。
+**English** | [简体中文](README.zh.md)
 
-## 使用入口
+HyperParallel model training provides YAML-driven text and multimodal trainers. `parse_training_args()` parses YAML and CLI dotted overrides into `TrainerConfig`; `TextTrainer` or `VLMTrainer` then builds the training components and runs training according to that configuration. HyperParallel Core provides the underlying distributed tensors, model sharding, and collective communication.
 
-- 安装要求、源码构建参数、CANN 与通信环境配置见 [安装指南](../../docs/installation.md)。
-- 训练启动方式见 [项目快速开始](../../README.md#快速开始)。
-- 接入新的 HF 或自定义模型，先看 [新模型接入指南](../../docs/guide/trainer/new_model_integration.md)，再按 [模型接入验证指南](../../docs/guide/trainer/model_integration_validation.md)完成精度与恢复验收。
+## Entry Points
 
-## TrainerConfig 配置
+- See the [Installation Guide](../../docs/installation.md) for installation requirements, source build options, and CANN and communication environment configuration.
+- See the [Project Quick Start](../../README.md#-quick-start) for training launch instructions.
 
-[`TrainerConfig`](../trainer/config/trainer.py#L47-L114) 中由当前 Trainer 主路径使用的配置区域如下：
+For numerical validation and checkpoint recovery acceptance when integrating a new Hugging Face or custom model, see the [Model Integration Validation Guide](../../docs/guide/trainer/model_integration_validation.md).
 
-| 配置字段 | 作用 | 相关文档 |
-|---|---|---|
-| `model` / `peft` | 配置模型构建入口、预训练权重、数据类型、注意力实现和 PEFT | — |
-| `training` | 配置训练步数、batch、随机种子、梯度裁剪及日志和评估周期 | — |
-| `accelerator` / `fsdp_config` | 配置并行拓扑和 FSDP/HSDP 参数分片 | — |
-| `mixed_precision` | 配置 Trainer 混合精度开关 | — |
-| `plan_overrides` | 按模块匹配规则替换模型组件或覆盖并行计划 | — |
-| `activation_checkpoint` | 配置激活重计算 | [Activation Checkpoint](../../docs/guide/activation_checkpoint.md) |
-| `activation_swap` / `compile` | 配置激活换入换出和模型编译 | — |
-| `dataset` / `dataloader` | 配置模型资产、样本转换、数据集读取、batch 组装和模型输入 | [Dataset / DataLoader](../data/README.md) |
-| `loss_fn` / `optimizer` / `lr_scheduler` | 配置损失计算、参数分组、优化器和学习率策略 | — |
-| `checkpoint` | 配置模型、优化器和训练进度的保存与恢复 | [Distributed Checkpoint](../../docs/guide/distributed_checkpoint.md) |
-| `debug` / `profiler` / `wandb` | 配置数据与数值检查、性能采集和训练指标上报 | — |
+## TrainerConfig Configuration
 
-字段解析、`Target` 和 CLI dotted override 规则见 [YAML Trainer 配置结构](../../docs/guide/trainer/yaml_config.md)；外部组件的接入方式见 [二次开发指南](../../docs/guide/trainer/custom_component.md)。
+The current main Trainer path uses the following configuration sections in [`TrainerConfig`](../trainer/config/trainer.py#L47-L114):
 
-## 模块结构
+| Configuration field | Purpose | Related documentation |
+|---------------------|---------|-----------------------|
+| `model` / `peft` | Model construction entry point, pretrained weights, dtype, attention implementation, and PEFT | — |
+| `training` | Training steps, batches, random seed, gradient clipping, logging, and evaluation intervals | — |
+| `accelerator` / `fsdp_config` | Parallel topology and FSDP/HSDP parameter sharding | — |
+| `mixed_precision` | Trainer mixed-precision switches | — |
+| `plan_overrides` | Replace model components or override parallel plans using module matching rules | — |
+| `activation_checkpoint` | Activation recomputation | [Activation Checkpoint](../../docs/guide/activation_checkpoint.md) |
+| `activation_swap` / `compile` | Activation swapping and model compilation | — |
+| `dataset` / `dataloader` | Model assets, sample transformation, dataset reading, batch assembly, and model inputs | [Dataset / DataLoader](../data/README.md) |
+| `loss_fn` / `optimizer` / `lr_scheduler` | Loss computation, parameter groups, optimizers, and learning rate policies | — |
+| `checkpoint` | Save and restore models, optimizers, and training progress | [Distributed Checkpoint](../../docs/guide/distributed_checkpoint.md) |
+| `debug` / `profiler` / `wandb` | Data and numerical checks, profiling, and training metric reporting | — |
+
+See [YAML Trainer Configuration](../../docs/guide/trainer/yaml_config.md) for field parsing, `Target`, and CLI dotted override rules, and the [Extension Guide](../../docs/guide/trainer/custom_component.md) for integrating external components.
+
+## Module Structure
 
 ```text
 hyper_parallel/
-├── models/          # 模型族适配层（adapter + recipes/train.yaml）、对外入口与 _transformers 模型构建
-├── trainer/         # YAML 解析、TrainerConfig、组件构建、训练循环与生命周期
-├── components/      # 优化器、损失函数、checkpoint、高性能 modules/functional 与量化
-├── data/            # 数据集读取、样本转换与 dataloader
-└── distributed/     # 分布式模型构建、并行计划应用与激活管理
+├── models/          # Model-family adapters and recipes/train.yaml, public entry points, and _transformers construction
+├── trainer/         # YAML parsing, TrainerConfig, component construction, training loops, and lifecycle
+├── components/      # Optimizers, losses, checkpoints, high-performance modules/functional, and quantization
+├── data/            # Dataset reading, sample transformations, and dataloaders
+└── distributed/     # Distributed model construction, parallel plan application, and activation management
 ```
 
-模型族的替换工厂、CP/EP 规则和训练入口收敛在 `models/<family>/` 下；当前交付
-`models/qwen3_moe/recipes/train.yaml`、`models/deepseek_v32/recipes/train.yaml` 与
-`models/kimi_k26/recipes/train.yaml`（Kimi-K2.6 多模态，4 超节点 / 512 卡主线配方，
-家族说明见 [`models/kimi_k26/README.md`](kimi_k26/README.md)）。
+Each model family's replacement factories, CP/EP rules, and training entry points reside under `models/<family>/`. The repository currently ships `models/qwen3_moe/recipes/train.yaml`, `models/deepseek_v32/recipes/train.yaml`, and `models/kimi_k26/recipes/train.yaml`. The Kimi-K2.6 multimodal recipe targets four SuperNodes / 512 devices; see the [Kimi-K2.6 model-family guide](kimi_k26/README.md).

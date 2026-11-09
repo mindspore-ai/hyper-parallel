@@ -1,95 +1,96 @@
-# 发布流程规范
+# Release Process
 
-## 版本命名
+**English** | [简体中文](release.zh.md)
 
-遵循语义化版本（SemVer）：`vMAJOR.MINOR.PATCH`
+## Version Naming
 
-- **MAJOR**：不兼容的 API 变更
-- **MINOR**：向后兼容的功能新增
-- **PATCH**：向后兼容的 bug 修复
+Follow semantic versioning (SemVer): `vMAJOR.MINOR.PATCH`.
 
-## 发布流程
+- **MAJOR**: Incompatible API changes.
+- **MINOR**: Backward-compatible new features.
+- **PATCH**: Backward-compatible bug fixes.
 
-### 1. 版本准备
+## Release Workflow
+
+### 1. Prepare the Version
 
 ```bash
-# 确认所有待发布特性已合并到 master
+# Confirm all features for this release have been merged into master.
 git checkout master
 git pull upstream master
 
-# 确认版本号
-# 版本号定义在 setup.py 或 __init__.py 中
+# Check the version number defined in setup.py or __init__.py.
 ```
 
-### 2. 生成 Release Notes
+### 2. Generate Release Notes
 
 ```bash
-# 分析自上一个 tag 到 HEAD 的变更
+# Review changes from the previous tag to HEAD.
 git log vPREV_TAG..HEAD --oneline
 git diff vPREV_TAG..HEAD --stat
 ```
 
-Release Notes 需包含：
+Release notes must include:
 
-- **全量特性列表**（首个正式版本需列出所有已实现特性）
-- **增量变更**（标注上一个版本到当前版本的变更）
-- **贡献者名单**
-- **已合并 PR 列表**
+- **Complete feature list**: List all implemented features for the first official release.
+- **Incremental changes**: Identify changes since the previous release.
+- **Contributors**
+- **Merged PRs**
+- **Known limitations**
+- **Upgrade guide**
 
-- **已知限制**
-- **升级指南**
+### 3. Update Documentation
 
-### 3. 文档更新
+Update the following before every release:
 
-每个版本发布前需同步更新：
+| Documentation | Required updates |
+|---------------|------------------|
+| README.md / README.zh.md | Feature checkboxes and new feature sections |
+| docs/guide/ | New feature guides and updates to existing guides |
+| docs/api/ | New interfaces and updated parameters |
+| docs/faq.md | New frequently asked questions |
+| Release Notes | Version history |
 
-| 文档类型 | 更新内容 |
-|----------|----------|
-| README.md / README.en.md | 特性 checkbox 更新、新特性章节 |
-| docs/guide/ | 新增特性使用指南、更新已有指南 |
-| docs/api/ | 新增接口说明、更新已有接口参数 |
-| docs/faq.md | 新增常见问题 |
-| Release Notes | 生成版本变更记录 |
+English is the default language for documents without a language suffix. Keep Chinese translations in sibling `.zh.md` files and update both versions together.
 
-### 4. 打 Tag
+### 4. Create a Tag
 
 ```bash
 git tag -a vX.Y.Z -m "HyperParallel vX.Y.Z release"
 git push upstream vX.Y.Z
 ```
 
-### 5. 构建 Wheel
+### 5. Build the Wheel
 
 ```bash
-# 外部构建工程先选择 CANN 环境；统一入口完成依赖准备、native 编译和 wheel 打包
+# Select the CANN environment; the unified entry point prepares dependencies,
+# compiles native components, and packages the wheel.
 source /usr/local/Ascend/cann/set_env.sh
 bash build.sh --multicore on --strict on --jobs 24
 
-# 每个 Python ABI/host 架构一个 wheel，例如：
+# Build one wheel per Python ABI and host architecture, for example:
 # hyper_parallel-0.1.0-cp310-cp310-linux_aarch64.whl
 ```
 
-严格模式下，任一启用组件失败都会终止，本次不生成 wheel。开发场景使用默认 `--strict off` 时，optional
-native 组件失败会记录 warning 并继续组包；此时 wheel 生成不代表所有 optional 能力可用。正式发布由版本
-指定的 glibc 基线构建、全量用例和人工评审共同决定。native 制品要求 CANN >= 9.1.0。
+In strict mode, failure of any enabled component aborts the build without generating a wheel. With the default `--strict off` for development, optional native component failures emit warnings and packaging continues; a generated wheel therefore does not prove all optional capabilities are available. Official release acceptance combines builds against the version's specified glibc baseline, the full test suite, and human review. Native artifacts require CANN >= 9.1.0.
 
-### 6. 发布后验证
+### 6. Validate After Release
 
-逐组件执行其声明的制品、导入和 ST 验证。需要激活 SDK/制品环境的组件必须先激活再启动测试。
+Run each component's declared artifact, import, and system-test checks. Activate required SDK and artifact environments before starting tests.
 
-- [ ] README 中英文版本章节一致、代码示例可运行
-- [ ] 用户手册安装步骤在空环境可复现、特性文档代码示例与 examples/ 一致
-- [ ] API 文档接口签名与源代码一致、参数描述与类型匹配
-- [ ] Release Notes 变更分类准确、贡献者名单完整
-- [ ] 所有文档 markdown lint 通过
-- [ ] 交叉引用链接正确、术语一致
-- [ ] wheel/PYTHONPATH 的组件验证和 clean-venv smoke 通过
-- [ ] 所选组件的缺失依赖、环境未激活和 ABI 错误诊断符合各自契约
-- [ ] 目标 glibc 基线检查通过；910B/910C native 构建与用例通过，不支持的 SoC 返回明确 reason code
+- [ ] English and Chinese README sections match, and code examples run.
+- [ ] Installation instructions reproduce in a clean environment, and feature examples match examples/.
+- [ ] API signatures match source code, and parameter descriptions match types.
+- [ ] Release note categories are accurate and the contributor list is complete.
+- [ ] All documentation passes Markdown lint.
+- [ ] Cross-references work and terminology is consistent.
+- [ ] Component validation through wheel/PYTHONPATH and clean-venv smoke tests pass.
+- [ ] Missing dependency, inactive environment, and ABI error diagnostics satisfy each selected component's contract.
+- [ ] The target glibc baseline check passes; 910B/910C native builds and tests pass, and unsupported SoCs return explicit reason codes.
 
-## 版本历史
+## Version History
 
-| 版本 | 日期 | 说明 |
-|------|------|------|
-| v0.2.0 | — | 上一个发布版本 |
-| v1.0.0 | 2026-06-30 | 首个正式版本，全量特性覆盖 |
+| Version | Date | Description |
+|---------|------|-------------|
+| v0.2.0 | — | Previous release |
+| v1.0.0 | 2026-06-30 | First official release with full feature coverage |

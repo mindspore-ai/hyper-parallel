@@ -1,62 +1,61 @@
-# HyperParallel 文档
+# HyperParallel Documentation
 
-昇腾超节点亲和的分布式并行加速库 — 文档中心
+**English** | [简体中文](index.zh.md)
 
-## 快速入门
+Documentation for the distributed parallel acceleration library optimized for Ascend SuperNodes.
 
-| 文档                                       | 说明 |
-|------------------------------------------|------|
-| [安装指南](./installation.md)                | 源码构建、依赖安装、环境配置 |
+## Getting Started
 
-## 特性使用指南
+| Document | Description |
+|----------|-------------|
+| [Installation Guide](./installation.md) | Source builds, dependencies, and environment configuration |
 
-| 文档 | 说明 |
-|------|------|
-| [HSDP / FSDP 数据并行](./guide/fsdp.md) | fully_shard、HSDPModule、overlap、梯度缩放 |
-| [TP 张量并行](./guide/tensor_parallel.md) | ColwiseParallel、RowwiseParallel、parallelize_module、Loss Parallel |
-| [PP 流水线并行](./guide/pipeline_parallel.md) | PipelineStage、Schedule、overlap_b_f、PP+FSDP、P2P prefetch、 Mpipe |
-| [CP 上下文并行](./guide/context_parallel.md) | ContextParallel、AsyncContextParallel、DSA 系列 |
-| [KDA 上下文并行](./guide/kda_context_parallel.md) | KDA P2P、AllGather、Ulysses 及混合方式的配置与显存 |
-| [KDA 递归倍增与 Ulysses 混合 CP](./guide/kda_recursive_doubling.md) | RD 状态扫描、TND reset 剪枝与转移缓存 |
-| [线性注意力 TND 上下文并行](./guide/linear_attention_tnd_cp.md) | KDA / GDN 的文档边界、配置、状态交换与数值语义 |
-| [EP 专家并行](./guide/expert_parallel.md) | ExpertParallel、MoE 构建模块、负载均衡 |
-| [Activation Checkpoint / Swap](./guide/activation_checkpoint.md) | checkpoint_wrapper、swap_wrapper、swap_tensor_wrapper、协同配置 |
-| [Optimizer](./guide/optimizer.md) | AdamW、Muon、ChainedOptimizer、学习率调度器 |
-| [Chunk Loss](./guide/chunk_loss.md) | 大词表输出投影与交叉熵分块、Trainer 和 Qwen3-MoE 接入 |
-| [DCP 分布式检查点](./guide/distributed_checkpoint.md) | 检查点保存/加载、异步 staging、离线转换 |
-| [自动并行](./guide/auto_parallel.md) | SAPP-ND、SAPP-PPB |
-| [LlamaFactory + HyperParallel SFT 训练](./guide/llama_factory_hyperparallel_sft_guide.md) | 基于 LlamaFactory 和 HyperParallel 的 SFT 配置、启动、精度与性能验证 |
-| [新模型接入指南](./guide/trainer/new_model_integration.md) | 选择 HF/adapter/自定义架构路径、实现接口、训练配方和验收步骤 |
-| [模型接入验证使用指南](./guide/trainer/model_integration_validation.md) | Adapter 声明、结构检查、模块对齐、精度矩阵与证据报告 |
-| [DeepSeek V4.1 Engram Host 代码阅读手册](./guide/deepseek_v41_engram_host_sparse_code_guide.md) | 原理、逐函数改动、代码示例与安全约束 |
-| [DeepSeek V4.1 Engram Host 重构设计](./guide/deepseek_v41_engram_host_sparse_refactor_plan.md) | 过度设计审查、职责收敛方案与验收约束 |
+## Feature Guides
 
-## API 参考
+| Document | Description |
+|----------|-------------|
+| [HSDP / FSDP Data Parallelism](./guide/fsdp.md) | fully_shard, HSDPModule, overlap, and gradient scaling |
+| [TP Tensor Parallelism](./guide/tensor_parallel.md) | ColwiseParallel, RowwiseParallel, parallelize_module, and Loss Parallel |
+| [PP Pipeline Parallelism](./guide/pipeline_parallel.md) | PipelineStage, schedules, overlap_b_f, PP+FSDP, P2P prefetch, and Mpipe |
+| [CP Context Parallelism](./guide/context_parallel.md) | ContextParallel, AsyncContextParallel, and DSA variants |
+| [KDA Context Parallelism](./guide/kda_context_parallel.md) | Configuration and memory usage for KDA P2P, AllGather, Ulysses, and hybrid strategies |
+| [KDA Recursive Doubling and Ulysses Hybrid CP](./guide/kda_recursive_doubling.md) | RD state scans, TND reset pruning, and transition caching |
+| [Linear Attention TND Context Parallelism](./guide/linear_attention_tnd_cp.md) | KDA / GDN document boundaries, configuration, state exchange, and numerical semantics |
+| [EP Expert Parallelism](./guide/expert_parallel.md) | ExpertParallel, MoE building blocks, and load balancing |
+| [Activation Checkpoint / Swap](./guide/activation_checkpoint.md) | checkpoint_wrapper, swap_wrapper, swap_tensor_wrapper, and combined configuration |
+| [Optimizer](./guide/optimizer.md) | AdamW, Muon, ChainedOptimizer, and learning rate schedulers |
+| [Chunk Loss](./guide/chunk_loss.md) | Chunked output projection and cross-entropy for large vocabularies; Trainer and Qwen3-MoE integration |
+| [DCP Distributed Checkpoints](./guide/distributed_checkpoint.md) | Saving/loading checkpoints, asynchronous staging, and offline conversion |
+| [Automatic Parallelism](./guide/auto_parallel.md) | SAPP-ND and SAPP-PPB |
+| [LlamaFactory + HyperParallel SFT Training](./guide/llama_factory_hyperparallel_sft_guide.md) | SFT configuration, launch, numerical validation, and performance validation |
+| [Model Integration Validation](./guide/trainer/model_integration_validation.md) | Adapter declarations, structural checks, module parity, numerical validation matrices, and evidence reports |
 
-| 文档 | 说明 |
-|------|------|
-| [API Reference](./api/api_reference.md) | 按特性模块组织的完整接口说明 |
-| [DFunction](./api/dfunction.md) | Torch 自定义分布式 autograd 函数详细文档 |
+## API Reference
 
-## FAQ 与故障排查
+| Document | Description |
+|----------|-------------|
+| [API Reference](./api/api_reference.md) | Complete interface documentation organized by feature |
+| [DFunction](./api/dfunction.md) | Custom distributed autograd functions for Torch |
 
-| 文档 | 说明 |
-|------|------|
-| [FAQ & 故障排查](./faq.md) | 安装问题、运行时问题、通信问题、内存问题、调试技巧 |
+## FAQ and Troubleshooting
 
-## 社区贡献
+| Document | Description |
+|----------|-------------|
+| [FAQ and Troubleshooting](./faq.md) | Installation, runtime, communication, memory, and debugging |
 
-| 文档 | 说明 |
-|------|------|
-| [开发环境搭建](./contributing/dev_environment.md) | 开发环境配置、依赖安装 |
-| [测试流程规范](./contributing/testing.md) | 测试框架、标记规范、分布式测试 |
-| [发布流程规范](./contributing/release.md) | 版本发布流程、文档更新规范 |
+## Contributing
 
-## 其他
+| Document | Description |
+|----------|-------------|
+| [Development Environment](./contributing/dev_environment.md) | Environment setup and dependencies |
+| [Testing Standards](./contributing/testing.md) | Test framework, markers, and distributed tests |
+| [Release Process](./contributing/release.md) | Version releases and documentation updates |
 
-| 文档 | 说明 |
-|------|------|
-| [Release Notes v1.0.0](../hyper_parallel_v1.0.0_release_notes.md) | 版本变更记录 |
-| [PP overlap_b_f 设计文档](./guide/pipeline_parallel_overlap_b_f.md) | 通算掩盖详细设计（原 docs 保留） |
-| [TP Styles 文档](./guide/tensor_parallel_styles.md) | TP Styles 原有特性文档（原 docs 保留） |
-| [agent_workflow.md](./agent_workflow.md) | AI Agent 工作流参考 |
+## Other Documentation
+
+| Document | Description |
+|----------|-------------|
+| [Release Notes v1.0.0](../hyper_parallel_v1.0.0_release_notes.md) | Version history |
+| [PP overlap_b_f Design](./guide/pipeline_parallel_overlap_b_f.md) | Detailed compute-communication overlap design |
+| [TP Styles](./guide/tensor_parallel_styles.md) | Tensor parallel style documentation |
+| [Agent Workflow](./agent_workflow.md) | AI agent workflow reference |
