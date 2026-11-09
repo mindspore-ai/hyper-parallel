@@ -33,7 +33,7 @@ from hyper_parallel.core.dtensor.device_mesh import (
     _get_sub_rank_list,
     init_device_mesh,
 )
-from hyper_parallel.core.dtensor._mesh_layout import _MeshLayout
+from hyper_parallel.core.dtensor._mesh_layout import _MeshLayout, _contiguous_strides
 from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 
@@ -475,6 +475,140 @@ class TestInitDeviceMesh(_MockedDeviceMeshTestCase):
         with self.assertRaises(ValueError):
             init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "tp"),
                              rank_list=(0, 1, 2), init_backend=False)
+
+
+# ===========================================================================
+# Process-group split derivation tests
+# ===========================================================================
+
+def _brute_force_split_ranks(mesh_shape, mesh_dim_names, dim_name, rank_list):
+    """Reference subgroup list derived from the per-rank helper."""
+    dim_names = (dim_name,) if not isinstance(dim_name, tuple) else dim_name
+    groups = {
+        tuple(sorted(_get_sub_rank_list(mesh_shape, mesh_dim_names, rank_list, dim_names, rank)))
+        for rank in rank_list
+    }
+    return sorted(list(group) for group in groups)
+
+
+class TestInitOneProcessGroup(_MockedDeviceMeshTestCase):
+    """Tests for DeviceMesh._init_one_process_group."""
+
+    def _run(self, mesh_shape, mesh_dim_names, dim_name, rank_list):
+        captured = {}
+
+        def _split_group_side_effect(*, split_ranks):
+            captured["split_ranks"] = split_ranks
+
+        with patch("hyper_parallel.core.dtensor.device_mesh._utils.split_group",
+                   side_effect=_split_group_side_effect):
+            group_key = DeviceMesh._init_one_process_group(
+                mesh_shape, mesh_dim_names, dim_name, rank_list
+            )
+        return captured["split_ranks"], group_key
+
+    def test_matches_per_rank_reference(self):
+        """Vectorized derivation must match the per-rank helper for every axis."""
+        cases = [
+            ((4,), ("dp",), "dp", tuple(range(4))),
+            ((2, 2), ("dp", "tp"), "dp", tuple(range(4))),
+            ((2, 2), ("dp", "tp"), "tp", tuple(range(4))),
+            ((2, 3), ("dp", "tp"), "tp", tuple(range(6))),
+            ((2, 2, 3), ("dp", "cp", "tp"), "cp", tuple(range(12))),
+            ((2, 2, 3), ("dp", "cp", "tp"), ("dp", "tp"), tuple(range(12))),
+        ]
+        for mesh_shape, names, dim_name, rank_list in cases:
+            with self.subTest(mesh_shape=mesh_shape, dim_name=dim_name):
+                split_ranks, group_key = self._run(mesh_shape, names, dim_name, rank_list)
+                expected = _brute_force_split_ranks(mesh_shape, names, dim_name, rank_list)
+                self.assertEqual(split_ranks, expected)
+
+                dim_names = (dim_name,) if not isinstance(dim_name, tuple) else dim_name
+                expected_key = str(tuple(sorted(
+                    _get_sub_rank_list(mesh_shape, names, rank_list, dim_names, 0)
+                )))
+                self.assertEqual(group_key, expected_key)
+
+                # Subgroups must form a partition of the mesh ranks.
+                self.assertEqual(
+                    sorted(rank for group in split_ranks for rank in group),
+                    sorted(rank_list),
+                )
+
+    def test_current_rank_outside_mesh_returns_none(self):
+        """A process that is not part of the mesh must not report a group key."""
+        self.mock_platform.get_rank.return_value = 99
+        split_ranks, group_key = self._run((2, 2), ("dp", "tp"), "dp", tuple(range(4)))
+        self.assertEqual(split_ranks, [[0, 2], [1, 3]])
+        self.assertIsNone(group_key)
+
+
+class TestBuildDimSplitRanks(_MockedDeviceMeshTestCase):
+    """Tests for DeviceMesh._build_dim_split_ranks."""
+
+    @staticmethod
+    def _rank_map(ranks):
+        return DeviceMesh._convert_rank_map_to_tensor(tuple(ranks))
+
+    def test_contiguous_layout_matches_per_rank_reference(self):
+        """Every contiguous axis must match the per-rank helper."""
+        cases = [
+            ((4,), ("dp",)),
+            ((2, 4), ("dp", "tp")),
+            ((2, 2, 2), ("dp", "cp", "tp")),
+        ]
+        for mesh_shape, names in cases:
+            numel = int(np.prod(mesh_shape))
+            rank_list = tuple(range(numel))
+            rank_map = self._rank_map(rank_list)
+            layout = _MeshLayout(mesh_shape, _contiguous_strides(mesh_shape))
+            for dim, sub_layout in enumerate(layout):
+                with self.subTest(mesh_shape=mesh_shape, dim=dim):
+                    split_ranks, group_key = DeviceMesh._build_dim_split_ranks(
+                        sub_layout, rank_map
+                    )
+                    expected = _brute_force_split_ranks(
+                        mesh_shape, names, names[dim], rank_list
+                    )
+                    self.assertEqual(split_ranks, expected)
+
+                    expected_key = str(tuple(sorted(_get_sub_rank_list(
+                        mesh_shape, names, rank_list, (names[dim],), 0
+                    ))))
+                    self.assertEqual(group_key, expected_key)
+
+    def test_non_contiguous_layout(self):
+        """Interleaved strides must still yield the strided rank groups."""
+        sub_layout = _MeshLayout((2, 2), (4, 1))
+        rank_map = self._rank_map(range(8))
+        split_ranks, group_key = DeviceMesh._build_dim_split_ranks(sub_layout, rank_map)
+        self.assertEqual(split_ranks, [[0, 1, 4, 5], [2, 3, 6, 7]])
+        self.assertEqual(group_key, "(0, 1, 4, 5)")
+
+    def test_non_contiguous_layout_respects_rank_map_order(self):
+        """Group membership follows the rank map, not the physical rank id."""
+        sub_layout = _MeshLayout((2, 2), (4, 1))
+        rank_map = self._rank_map([4, 5, 6, 7, 0, 1, 2, 3])
+        split_ranks, group_key = DeviceMesh._build_dim_split_ranks(sub_layout, rank_map)
+        self.assertEqual(split_ranks, [[0, 1, 4, 5], [2, 3, 6, 7]])
+        self.assertEqual(group_key, "(0, 1, 4, 5)")
+
+    def test_current_rank_outside_mesh_returns_none(self):
+        """A process outside the rank map must not report a group key."""
+        self.mock_platform.get_rank.return_value = 99
+        sub_layout = _MeshLayout((2, 2), (4, 1))
+        split_ranks, group_key = DeviceMesh._build_dim_split_ranks(
+            sub_layout, self._rank_map(range(8))
+        )
+        self.assertEqual(split_ranks, [[0, 1, 4, 5], [2, 3, 6, 7]])
+        self.assertIsNone(group_key)
+
+    def test_duplicate_membership_raises(self):
+        """A rank appearing in two subgroups is a layout error."""
+        sub_layout = _MeshLayout((2, 2), (4, 1))
+        rank_map = self._rank_map([0, 1, 0, 1, 0, 1, 0, 1])
+        with self.assertRaises(RuntimeError):
+            DeviceMesh._build_dim_split_ranks(sub_layout, rank_map)
 
 
 if __name__ == "__main__":
