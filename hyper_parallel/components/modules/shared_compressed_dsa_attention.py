@@ -1600,6 +1600,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             cp_context: SharedCompressedAttentionCPContext,
             position_ids: torch.Tensor,
             sequence_length: int,
+            packed_sequence: SharedCompressedPackedSequence | None = None,
     ) -> tuple[int, int]:
         """Validate contiguous CP shards and return global query geometry."""
         if cp_context.size <= 1 or not 0 <= cp_context.rank < cp_context.size:
@@ -1608,7 +1609,9 @@ class SharedCompressedDSAAttentionBase(nn.Module):
                 f"0 <= rank < size, got rank={cp_context.rank}, size={cp_context.size}"
             )
         query_offset = cp_context.rank * sequence_length
-        if not torch.all(position_ids[..., 0] == query_offset):
+        # Packed RoPE positions may restart at document boundaries. Physical
+        # offsets are checked against packed geometry by _resolve_packed_segments.
+        if packed_sequence is None and not torch.all(position_ids[..., 0] == query_offset):
             raise ValueError(
                 "shared compressed attention CP requires contiguous global position_ids; "
                 f"rank {cp_context.rank} expected first position {query_offset}"
@@ -2042,7 +2045,21 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             past_key_values: Any | None = None,
             **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Publish or consume compressed KV and execute indexed K=V attention."""
+        """Publish or consume compressed KV and execute indexed K=V attention.
+
+        Args:
+            hidden_states: Local token activations in batch, sequence, hidden order.
+            position_embeddings: Main and compressed-attention rotary embeddings.
+            position_ids: Rotary positions, which may reset at packed document boundaries.
+            attention_mask: Must be None; packed_seq_params carries document boundaries.
+            past_key_values: Must be None for this training-only path.
+            **kwargs: Forward-scoped shared state, optional packed sequence geometry,
+                and optional TP/CP communication contexts. CP offsets describe physical
+                packed-row coordinates independently of rotary positions.
+
+        Returns:
+            Local attention output and None for attention weights.
+        """
         (
             shared_state,
             packed_sequence,
@@ -2058,6 +2075,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
                 cp_context,
                 position_ids,
                 sequence_length,
+                packed_sequence,
             )
         if packed_sequence is not None:
             packed_sequence = packed_sequence.prepare(hidden_states.device, (self.compress_ratio,))

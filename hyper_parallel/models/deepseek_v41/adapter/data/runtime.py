@@ -38,6 +38,7 @@ class DeepseekV41Runtime(RuntimeInputAdapter):
             *,
             include_position_ids: bool = True,
             include_image_sequence_start: bool = True,
+            pad_token_id: int | None = None,
     ) -> None:
         """Configure fields already supplied by the selected batch runtime.
 
@@ -46,9 +47,12 @@ class DeepseekV41Runtime(RuntimeInputAdapter):
                 require this; ``TextParallelBatch`` already owns them.
             include_image_sequence_start: Build the local decoder image insertion
                 offset. Text-only batches do not need this field.
+            pad_token_id: Dedicated padding token excluded from router statistics.
+                Leave unset when padding shares an ID with a real text token.
         """
         self.include_position_ids = include_position_ids
         self.include_image_sequence_start = include_image_sequence_start
+        self.pad_token_id = pad_token_id
 
     def prepare_graph_inputs(self, model_inputs: Mapping[str, Any]) -> dict[str, Any]:
         """Build an isolated packing-only representation at the graph boundary.
@@ -70,6 +74,8 @@ class DeepseekV41Runtime(RuntimeInputAdapter):
     def runtime_input_fields(self) -> tuple[str, ...]:
         """Declare the stable set of model inputs produced by this instance."""
         fields = ["packed_seq_params"]
+        if self.pad_token_id is not None:
+            fields.append("router_token_mask")
         if self.include_position_ids:
             fields.append("position_ids")
         if self.include_image_sequence_start:
@@ -104,6 +110,9 @@ class DeepseekV41Runtime(RuntimeInputAdapter):
             )
         }
         cp_start = runtime_inputs["packed_seq_params"].local_query_start
+        if self.pad_token_id is not None:
+            # Prompt-masked labels still represent real router tokens.
+            runtime_inputs["router_token_mask"] = batch["input_ids"] != self.pad_token_id
         if self.include_position_ids:
             input_ids = batch["input_ids"]
             position_ids = torch.arange(
