@@ -24,7 +24,6 @@ import hyper_parallel.trainer.callbacks.environ_meter_callback as environ_meter_
 from hyper_parallel.trainer.callbacks.environ_meter_callback import EnvironMeterCallback
 from hyper_parallel.trainer.runtime.flops import estimate_step_flops
 from hyper_parallel.trainer.state import TrainerState
-from tests.common.mark_utils import arg_mark
 
 
 class _NoItemScalar:
@@ -57,13 +56,41 @@ class TestEnvironMeterCallback(unittest.TestCase):
 
     @patch.object(environ_meter_module, "get_device_type", return_value="cpu")
     @patch.object(environ_meter_module, "get_world_size_safe", return_value=1)
+    def test_registered_metrics_average_observed_microbatches(self, mock_world: Mock, mock_device: Mock) -> None:
+        """Average registered observations while preserving counts and training losses."""
+        del mock_world, mock_device
+        trainer = self._build_trainer()
+        callback = EnvironMeterCallback(trainer, microbatch_mean_metrics=("router_aux_loss", "quality"))
+        state = TrainerState(global_step=1)
+        callback.on_step_begin(state)
+        first_aux = torch.tensor(1.0, requires_grad=True)
+        callback.on_micro_step_end(state, {"router_aux_loss": first_aux, "quality": 2.0, "token_count": 2})
+        with torch.no_grad():
+            first_aux.fill_(9.0)
+        callback.on_micro_step_end(state, {})
+        callback.on_micro_step_end(state, {"router_aux_loss": torch.tensor(3.0), "quality": 6.0, "token_count": 8})
+        totals = {"router_aux_loss": 4.0, "quality": 8.0, "token_count": 10, "foundation_loss": 2.5}
+        callback.on_step_end(state, loss=2.5, loss_dict=totals, grad_norm=1.0)
+        expected = {"router_aux_loss": 2.0, "quality": 4.0, "token_count": 10.0, "foundation_loss": 2.5}
+        observed = {name: trainer.step_env_metrics[f"training/{name}"] for name in expected}
+        self.assertEqual(observed, expected, f"expected aggregation={expected}, got={observed}")
+        means = vars(callback)["_local_mean_metrics"]
+        self.assertEqual(means, {}, f"expected step-end scalar release, got={means}")
+
+        callback.on_step_begin(state)
+        callback.on_micro_step_end(state, {"router_aux_loss": torch.tensor(0.0)})
+        callback.on_step_end(state, loss=1.0, loss_dict={"router_aux_loss": 0.0}, grad_norm=1.0)
+        observed = trainer.step_env_metrics["training/router_aux_loss"]
+        self.assertEqual(observed, 0.0, f"expected zero AUX on the next step, got={observed}")
+
+        callback.on_step_begin(state)
+        callback.on_step_end(state, loss=1.0, loss_dict={"router_aux_loss": 9.0}, grad_norm=1.0)
+        observed = trainer.step_env_metrics["training/router_aux_loss"]
+        self.assertEqual(observed, 9.0, f"expected supplied step value without observations, got={observed}")
+
+    @patch.object(environ_meter_module, "get_device_type", return_value="cpu")
+    @patch.object(environ_meter_module, "get_world_size_safe", return_value=1)
     @patch.object(environ_meter_module.time, "perf_counter", side_effect=(10.0, 12.0))
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_micro_step_publishes_nonzero_token_throughput(
             self,
             mock_time: Mock,
@@ -108,12 +135,6 @@ class TestEnvironMeterCallback(unittest.TestCase):
             f"step token scalar must be released after publishing, got={step_tokens!r}",
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_micro_step_avoids_host_conversion_and_step_begin_resets(self) -> None:
         """Keep device token scalars asynchronous and clear them at the next step.
 
@@ -121,7 +142,7 @@ class TestEnvironMeterCallback(unittest.TestCase):
         Description: Accumulate a detached scalar that rejects host conversion and begin a new step.
         Expectation: Accumulation avoids item calls and the next step clears prior scalar state.
         """
-        callback = EnvironMeterCallback(self._build_trainer())
+        callback = EnvironMeterCallback(self._build_trainer(), microbatch_mean_metrics=("quality",))
         state = TrainerState(global_step=0, epoch=0)
 
         callback.on_step_begin(state)
@@ -129,6 +150,7 @@ class TestEnvironMeterCallback(unittest.TestCase):
             state,
             {"token_count": _NoItemScalar()},
         )
+        callback.on_micro_step_end(state, {"quality": _NoItemScalar()})
 
         step_tokens = vars(callback)["_local_step_tokens"]
         self.assertIsInstance(
@@ -147,12 +169,6 @@ class TestEnvironMeterCallback(unittest.TestCase):
     @patch.object(environ_meter_module, "get_world_size_safe", return_value=4)
     @patch.object(environ_meter_module, "all_reduce")
     @patch.object(environ_meter_module.time, "perf_counter", side_effect=(10.0, 12.0))
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_context_parallel_reduction_does_not_duplicate_samples(
             self,
             mock_time: Mock,
@@ -218,12 +234,6 @@ class TestEnvironMeterCallback(unittest.TestCase):
     @patch.object(environ_meter_module, "get_device_type", return_value="cpu")
     @patch.object(environ_meter_module, "get_world_size_safe", return_value=1)
     @patch.object(environ_meter_module.time, "perf_counter", side_effect=(10.0, 12.0))
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_tflops_metric_stays_opt_in(
             self,
             mock_time: Mock,
@@ -261,12 +271,6 @@ class TestEnvironMeterCallback(unittest.TestCase):
     @patch.object(environ_meter_module, "get_world_size_safe", return_value=4)
     @patch.object(environ_meter_module, "all_reduce")
     @patch.object(environ_meter_module.time, "perf_counter", side_effect=(10.0, 12.0))
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_tflops_metric_divides_global_work_by_devices(
             self,
             mock_time: Mock,
@@ -320,12 +324,6 @@ class TestEnvironMeterCallback(unittest.TestCase):
     @patch.object(environ_meter_module, "get_world_size_safe", return_value=1)
     @patch.object(environ_meter_module, "all_reduce")
     @patch.object(environ_meter_module.time, "perf_counter", side_effect=(10.0, 12.0))
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_tflops_metric_counts_prompt_tokens_excluded_from_loss(
             self,
             mock_time: Mock,
@@ -381,12 +379,6 @@ class TestEnvironMeterCallback(unittest.TestCase):
     @patch.object(environ_meter_module, "get_world_size_safe", return_value=1)
     @patch.object(environ_meter_module, "all_reduce")
     @patch.object(environ_meter_module.time, "perf_counter", side_effect=(10.0, 12.0))
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_tflops_metric_accumulates_squared_sequence_lengths(
             self,
             mock_time: Mock,
@@ -447,12 +439,6 @@ class TestEnvironMeterCallback(unittest.TestCase):
     @patch.object(environ_meter_module, "get_device_type", return_value="cpu")
     @patch.object(environ_meter_module, "get_world_size_safe", return_value=1)
     @patch.object(environ_meter_module.time, "perf_counter", side_effect=(10.0, 12.0))
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_tflops_metric_uses_packed_sequence_boundaries(
             self,
             mock_time: Mock,
@@ -499,12 +485,6 @@ class TestEnvironMeterCallback(unittest.TestCase):
     @patch.object(environ_meter_module, "get_world_size_safe", return_value=2)
     @patch.object(environ_meter_module, "all_reduce")
     @patch.object(environ_meter_module.time, "perf_counter", side_effect=(10.0, 12.0))
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_tflops_metric_restores_context_parallel_sequence_length(
             self,
             mock_time: Mock,
@@ -555,12 +535,6 @@ class TestEnvironMeterCallback(unittest.TestCase):
     @patch.object(environ_meter_module, "get_device_type", return_value="cpu")
     @patch.object(environ_meter_module, "get_world_size_safe", return_value=1)
     @patch.object(environ_meter_module.time, "perf_counter", side_effect=(10.0, 12.0))
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_tflops_metric_skips_unsupported_models(
             self,
             mock_time: Mock,
@@ -597,12 +571,6 @@ class TestEnvironMeterCallback(unittest.TestCase):
     @patch.object(environ_meter_module, "get_device_type", return_value="cpu")
     @patch.object(environ_meter_module, "get_world_size_safe", return_value=1)
     @patch.object(environ_meter_module.time, "perf_counter", side_effect=(10.0, 12.0))
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_tflops_metric_ignores_empty_input_geometry(
             self,
             mock_time: Mock,
@@ -640,12 +608,6 @@ class TestEnvironMeterCallback(unittest.TestCase):
     @patch.object(environ_meter_module, "get_device_type", return_value="cpu")
     @patch.object(environ_meter_module, "get_world_size_safe", return_value=1)
     @patch.object(environ_meter_module.time, "perf_counter", side_effect=(10.0, 12.0))
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_tflops_metric_requires_tokens(
             self,
             mock_time: Mock,

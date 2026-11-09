@@ -216,6 +216,14 @@ class VLMTrainer:
         """
         self.base.on_micro_step_begin(micro_batch)
 
+    def on_micro_step_end(self, loss_dict: dict[str, torch.Tensor]) -> None:
+        """Dispatch the micro-step-end lifecycle hook.
+
+        Args:
+            loss_dict: Named losses and metrics from the completed forward-backward step.
+        """
+        self.base.on_micro_step_end(loss_dict)
+
     def on_step_end(
             self,
             loss: Any = None,
@@ -251,6 +259,7 @@ class VLMTrainer:
         self.base.current_token_counts = count_loss_token(loss_inputs)
         self.on_micro_step_begin(model_inputs)
         loss, loss_dict = self.base.forward_backward_step(model_inputs, loss_inputs)
+        self.on_micro_step_end(loss_dict)
 
         return loss, loss_dict
 

@@ -24,9 +24,9 @@ import torch
 
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.trainer.callbacks.environ_meter_callback import EnvironMeterCallback
+from hyper_parallel.trainer.callbacks.logging_callback import LoggingCallback
 from hyper_parallel.trainer.state import TrainerState
 from hyper_parallel.trainer.vlm_trainer import VLMTrainer
-from tests.common.mark_utils import arg_mark
 
 
 class TestVLMTrainer(unittest.TestCase):
@@ -63,10 +63,36 @@ class TestVLMTrainer(unittest.TestCase):
         base.prepare_optimizer_step = Mock(side_effect=lambda loss, metrics: (loss, 0.5))
         base.step_optimizers_and_schedulers = Mock()
         base._end_model_integration_step = Mock()  # pylint: disable=protected-access
-        base._callbacks = [EnvironMeterCallback(base)]  # pylint: disable=protected-access
+        meter = EnvironMeterCallback(base, microbatch_mean_metrics=("router_aux_loss",))
+        base._callbacks = [meter]
         return trainer
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
+    def test_router_aux_mean_reaches_shared_metrics_and_logger(self) -> None:
+        """Publish the AUX mean through VLM callbacks while keeping the training loss sum."""
+        trainer = self._make_trainer(2)
+        trainer.base.config = SimpleNamespace(training=SimpleNamespace(logging_steps=1))
+        trainer.base._callbacks.append(LoggingCallback(trainer.base))
+        trainer.base.get_batch = Mock(return_value=(
+            {"input_ids": torch.ones((1, 4), dtype=torch.long)},
+            {"labels": torch.ones((1, 4), dtype=torch.long)},
+        ))
+        trainer.base.forward_backward_step = Mock(side_effect=[
+            (torch.tensor(0.5), {"foundation_loss": torch.tensor(0.5), "router_aux_loss": torch.tensor(aux)})
+            for aux in (1.0, 3.0)
+        ])
+
+        with patch("hyper_parallel.trainer.callbacks.logging_callback.logger.info") as log:
+            result = trainer.train_step(iter(range(2)))
+
+        metrics = getattr(trainer.base, "step_env_metrics")
+        expected = {"training/router_aux_loss": 2.0, "training/foundation_loss": 1.0, "training/total_loss": 1.0}
+        observed = {name: metrics[name] for name in expected}
+        self.assertEqual(observed, expected, f"expected step metrics={expected}, got={observed}")
+        self.assertEqual(result["loss"], 1.0, f"expected backward loss sum=1.0, got={result['loss']}")
+        log.assert_called_once()
+        message = log.call_args.args[1]
+        self.assertIn("training/router_aux_loss=2", message.split(), f"expected terminal AUX=2, got={message}")
+
     def test_micro_steps_release_images_before_fetching_next_batch(self) -> None:
         """Bound image residency without changing accumulation or step metrics.
 
@@ -137,7 +163,7 @@ class TestVLMTrainer(unittest.TestCase):
         torch.testing.assert_close(weight.grad, torch.tensor((num_micro_steps + 1) / 2))
         expected_metrics = {"loss": float(num_micro_steps + 1), "grad_norm": 0.5}
         self.assertEqual(result, expected_metrics, f"expected={expected_metrics}, got={result}")
-        metrics = trainer.base.step_env_metrics
+        metrics = getattr(trainer.base, "step_env_metrics")
         expected_tokens = 2 * num_micro_steps
         self.assertEqual(
             metrics["data/step_tokens"], expected_tokens,
@@ -155,7 +181,6 @@ class TestVLMTrainer(unittest.TestCase):
         trainer.base.prepare_optimizer_step.assert_called_once()
         trainer.base.step_optimizers_and_schedulers.assert_called_once_with()
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_backward_failure_does_not_fetch_later_micro_batches(self) -> None:
         """Stop reading input when the current micro-step fails.
 
