@@ -3,6 +3,8 @@ torchdata>=0.10.0
 PyYAML>=6.0.1
 pybind11>=2.11.1
 datasets>=2.16.0
+# PyArrow 26 requires NumPy 2; the framework currently uses NumPy 1.x.
+pyarrow>=15.0.0,<26.0.0
 psutil>=5.9.6
 tqdm>=4.62.1
 

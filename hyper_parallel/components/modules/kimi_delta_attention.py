@@ -43,7 +43,6 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from hyper_parallel.components.functional.kimi_delta_attention_ascendc import ascendc_chunk_kda
 from hyper_parallel.components.functional.linear_attention_packed import (
     packed_causal_conv1d, packed_reference, resolve_packed_sequence,
 )
@@ -406,7 +405,7 @@ def _prepare_kda_wy(
         "...ik,...jk,...ijk->...ij",
         key,
         key,
-        gate_pair.exp(),
+        gate_pair.masked_fill(~strict_causal.unsqueeze(-1), 0).exp(),
     )
     strict_lower = (
         key_pair * beta.unsqueeze(-1)
@@ -444,7 +443,7 @@ def _run_kda_chunks(
             "bhik,bhjk,bhijk->bhij",
             query_i,
             key_i,
-            relative_gate.exp(),
+            relative_gate.masked_fill(~causal.unsqueeze(-1), 0).exp(),
         ).masked_fill(~causal, 0)
         value_new = u_i - w_i @ state
         output_inter = (query_i * gate_i.exp()) @ state
@@ -482,6 +481,27 @@ def torch_chunk_kda(
     This implementation is algebraically independent from
     :func:`torch_recurrent_kda`; comparing the two catches errors in the
     chunk transform that a second token loop would hide.
+
+    Args:
+        query: Query tensor in BTHK layout, or THK with packed offsets.
+        key: Key tensor matching the query head dimensions.
+        value: Value tensor with the configured value heads.
+        gate: Per-channel decay logits or activated log-decays.
+        beta: Per-head beta logits or activated update weights.
+        a_log: Optional learned log decay rates.
+        dt_bias: Optional learned gate bias.
+        scale: Query scaling; defaults to the inverse square root of the key width.
+        initial_state: Optional entry state for the local sequence.
+        output_final_state: Return the exit state when the selected backend supports it.
+        use_qk_l2norm_in_kernel: Normalize Q/K inside this operation when True.
+        use_gate_in_kernel: Activate gate logits using a_log and dt_bias when True.
+        use_beta_sigmoid_in_kernel: Apply sigmoid to beta logits when True.
+        lower_bound: Optional lower bound for the activated gate.
+        chunk_size: Tokens per recurrent chunk.
+        cu_seqlens: Optional cumulative packed document offsets, including zero.
+
+    Returns:
+        Token outputs and an optional final recurrent state.
     """
     if cu_seqlens is not None:
         return packed_reference(
@@ -569,9 +589,11 @@ def _validate_fused_state_contract(initial_state, output_final_state, qk_norm, g
             f"KDA backend={backend!r} currently supports zero initial state without "
             "returning a final state; stateful execution is owned by the CP backend."
         )
-    if not (qk_norm and gate and beta):
+    if backend == "ascendc" and not qk_norm:
+        raise NotImplementedError("KDA backend=ascendc requires fused Q/K normalization.")
+    if not (gate and beta):
         raise NotImplementedError(
-            f"KDA backend={backend!r} requires fused Q/K normalization, gate activation, "
+            f"KDA backend={backend!r} requires fused gate activation, "
             "and beta sigmoid."
         )
 
@@ -596,7 +618,30 @@ def chunk_kda(
     backend: str = "eager",
     cu_seqlens: Optional[torch.Tensor | Sequence[int]] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Dispatch dense or packed KDA to the explicitly selected local backend."""
+    """Dispatch KDA to an explicitly selected eager, Triton or AscendC backend.
+
+    Args:
+        query: Query tensor in BTHK layout, or THK with packed offsets.
+        key: Key tensor matching the query head dimensions.
+        value: Value tensor with the configured value heads.
+        gate: Per-channel decay logits or activated log-decays.
+        beta: Per-head beta logits or activated update weights.
+        a_log: Optional learned log decay rates.
+        dt_bias: Optional learned gate bias.
+        scale: Query scaling; defaults to the inverse square root of the key width.
+        initial_state: Optional entry state for the local sequence.
+        output_final_state: Return the exit state when the selected backend supports it.
+        use_qk_l2norm_in_kernel: Normalize Q/K inside this operation when True.
+        use_gate_in_kernel: Activate gate logits using a_log and dt_bias when True.
+        use_beta_sigmoid_in_kernel: Apply sigmoid to beta logits when True.
+        lower_bound: Optional lower bound for the activated gate.
+        chunk_size: Tokens per recurrent chunk.
+        backend: Explicit eager, Triton or AscendC backend selection.
+        cu_seqlens: Optional cumulative packed document offsets, including zero.
+
+    Returns:
+        Token outputs and an optional final recurrent state.
+    """
     if query.ndim == 3:
         output, final = chunk_kda(
             *(tensor.unsqueeze(0) for tensor in (query, key, value, gate, beta)),
@@ -628,6 +673,11 @@ def chunk_kda(
     _validate_fused_state_contract(initial_state, output_final_state, use_qk_l2norm_in_kernel,
                                   use_gate_in_kernel, use_beta_sigmoid_in_kernel, backend)
     if backend == "ascendc":
+        # Native KDA and its state kernels are optional for eager and MLA consumers.
+        from hyper_parallel.components.functional.kimi_delta_attention_ascendc import (  # pylint: disable=C0415
+            ascendc_chunk_kda,
+        )
+
         output = ascendc_chunk_kda(
             query, key, value, gate, beta,
             a_log=a_log.float() if a_log is not None else None,
@@ -671,6 +721,7 @@ def chunk_kda(
         chunk_size=chunk_size,
         safe_gate=True,
         cu_seqlens=cu_seqlens,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
     return output, None
 
@@ -728,6 +779,24 @@ def torch_kda_state_summary(
     ``[B, HV, K, K]``. Query is accepted to share KDA input preprocessing and
     grouped-value validation; the state transition itself is independent of
     query and output scale.
+
+    Args:
+        query: Query tensor in BTHK layout, or THK with packed offsets.
+        key: Key tensor matching the query head dimensions.
+        value: Value tensor with the configured value heads.
+        gate: Per-channel decay logits or activated log-decays.
+        beta: Per-head beta logits or activated update weights.
+        a_log: Optional learned log decay rates.
+        dt_bias: Optional learned gate bias.
+        scale: Query scaling; defaults to the inverse square root of the key width.
+        use_qk_l2norm_in_kernel: Normalize Q/K inside this operation when True.
+        use_gate_in_kernel: Activate gate logits using a_log and dt_bias when True.
+        use_beta_sigmoid_in_kernel: Apply sigmoid to beta logits when True.
+        lower_bound: Optional lower bound for the activated gate.
+        chunk_size: Tokens per recurrent chunk.
+
+    Returns:
+        Affine state output and transition tensors.
     """
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
@@ -764,7 +833,7 @@ def torch_kda_state_summary(
         "...ik,...jk,...ijk->...ij",
         key,
         key,
-        gate_pair.exp(),
+        gate_pair.masked_fill(~strict_causal.unsqueeze(-1), 0).exp(),
     )
     strict_lower = (key_pair * beta.unsqueeze(-1)).masked_fill(
         ~strict_causal,

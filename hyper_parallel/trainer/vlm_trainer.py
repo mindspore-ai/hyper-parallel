@@ -256,7 +256,8 @@ class VLMTrainer:
             Loss tensor and named loss tensors for this FB step.
         """
         model_inputs, loss_inputs = self.base.get_batch(data_iterator)
-        self.base.current_token_counts = count_loss_token(loss_inputs)
+        count_inputs = {**loss_inputs, "labels_are_shifted": model_inputs.get("labels_are_shifted", False)}
+        self.base.current_token_counts = count_loss_token(count_inputs)
         self.on_micro_step_begin(model_inputs)
         loss, loss_dict = self.base.forward_backward_step(model_inputs, loss_inputs)
         self.on_micro_step_end(loss_dict)
@@ -301,7 +302,7 @@ class VLMTrainer:
         total_loss, grad_norm = self.base.prepare_optimizer_step(total_loss, total_loss_dict)
         self.base.step_optimizers_and_schedulers()
 
-        # Checkpoint and logging callbacks observe completed optimizer updates.
+        # Checkpoints retain consumed batches; optimizer_step counts successful updates.
         self.base.state.global_step += 1
         grad_norm_value = float(grad_norm)
         # The base trainer owns this integration hook and the VLM subclass only
@@ -343,6 +344,33 @@ class VLMTrainer:
                 return True
         return False
 
+    def _run_training_epochs(self) -> tuple[Any, bool]:
+        """Run epochs while retaining a restored cursor on the first iteration."""
+        train_dataloader = self.base.train_dataloader
+        balanced_loader = isinstance(train_dataloader, DistributedDataLoader)
+        start_epoch = self.base.state.epoch
+        epochs = count(start_epoch) if balanced_loader else range(start_epoch, self.base.train_epochs)
+        for epoch in epochs:
+            if self.base.state.global_step >= self.base.train_iters:
+                break
+            # Do not erase the cursor restored by on_train_begin on the first epoch.
+            if hasattr(train_dataloader, "set_epoch") and (not balanced_loader or epoch != start_epoch):
+                train_dataloader.set_epoch(epoch)
+
+            self.base.state.epoch = epoch
+            self.on_epoch_begin()
+            epoch_start_step = self.base.state.global_step
+            epoch_exhausted = self._train_epoch(epoch, balanced_loader)
+            if balanced_loader and epoch != start_epoch and self.base.state.global_step == epoch_start_step:
+                raise ValueError("VLM Dataset epoch cannot provide one complete optimizer step")
+
+            self.on_epoch_end()
+            self.base.state.epoch = epoch + 1 if not balanced_loader or epoch_exhausted else epoch
+            print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+
+        return train_dataloader, balanced_loader
+
+
     def train(self) -> None:
         """Run the VLM training loop."""
         try:
@@ -356,27 +384,7 @@ class VLMTrainer:
                 self.base.train_epochs,
             )
 
-            train_dataloader = self.base.train_dataloader
-            balanced_loader = isinstance(train_dataloader, DistributedDataLoader)
-            start_epoch = self.base.state.epoch
-            epochs = count(start_epoch) if balanced_loader else range(start_epoch, self.base.train_epochs)
-            for epoch in epochs:
-                if self.base.state.global_step >= self.base.train_iters:
-                    break
-                # Do not erase the cursor restored by on_train_begin on the first epoch.
-                if hasattr(train_dataloader, "set_epoch") and (not balanced_loader or epoch != start_epoch):
-                    train_dataloader.set_epoch(epoch)
-
-                self.base.state.epoch = epoch
-                self.on_epoch_begin()
-                epoch_start_step = self.base.state.global_step
-                epoch_exhausted = self._train_epoch(epoch, balanced_loader)
-                if balanced_loader and epoch != start_epoch and self.base.state.global_step == epoch_start_step:
-                    raise ValueError("VLM Dataset epoch cannot provide one complete optimizer step")
-
-                self.on_epoch_end()
-                self.base.state.epoch = epoch + 1 if not balanced_loader or epoch_exhausted else epoch
-                print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+            train_dataloader, balanced_loader = self._run_training_epochs()
 
             memory_profiler.stop()
             self.on_train_end()

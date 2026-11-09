@@ -34,7 +34,19 @@ class GMMFunction(torch.autograd.Function):
         bias: Optional[torch.Tensor],
         group_args: tuple,
     ) -> torch.Tensor:
-        """Run grouped matrix multiplication and save its backward state."""
+        """Run grouped matrix multiplication and save its backward state.
+
+        Args:
+            ctx: Per-invocation autograd context.
+            original_weight: Parameter owner used by fused weight-gradient accumulation.
+            x: Packed input rows for all local experts.
+            weight: Compute weights for the grouped multiplication.
+            bias: Optional grouped bias.
+            group_args: Group descriptors and grouped-matmul execution options.
+
+        Returns:
+            Packed output rows in the original group order.
+        """
         group_list, group_type, gemm_fusion, group_list_type, group_list_data_type = group_args
 
         npu_bias = [bias] if bias is not None else []
@@ -55,7 +67,9 @@ class GMMFunction(torch.autograd.Function):
         else:
             ctx.save_for_backward(x, weight, group_list)
 
-        ctx.original_weight = original_weight
+        # Only fused wgrad needs the owner; ordinary references would bypass
+        # saved-tensor hooks used by activation offload and recomputation.
+        ctx.original_weight = original_weight if gemm_fusion else None
         ctx.gemm_fusion = gemm_fusion
         ctx.group_list_type = group_list_type
         ctx.group_list_data_type = group_list_data_type

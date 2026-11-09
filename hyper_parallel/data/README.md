@@ -456,3 +456,22 @@ enable_dataset_logging("debug", ranks=None)
 ```
 
 Logs cover sources, splits/blending, Datasets, Samplers, DataLoaders, and parallel batch shapes, without recording sample text.
+
+## 12. Random augmentation and worker recovery
+
+For map-style datasets with random augmentation, set `checkpoint_worker_rng: true`
+in the existing DataLoader configuration. With `num_workers > 0`, the wrapped
+Dataset saves Python, NumPy global, and Torch CPU RNG state through
+StatefulDataLoader worker snapshots. These snapshots track consumed samples,
+including the loader's prefetch bookkeeping.
+
+Fixed batching, TokenBatchLoader, and OmniPackingLoader share this option.
+Dynamic loaders save the complete augmented buffer when it is enabled;
+`save_by_idx: true` is incompatible because restoring by index would repeat
+random augmentation. Storing the augmented buffer increases checkpoint size.
+
+Independent Generators, external decoders, and stateful transforms still require
+the Dataset's own `state_dict/load_state_dict` implementation. Private collator
+state is not discovered automatically. This option supports map-style datasets
+with unchanged worker counts and DP topology. Worker device RNG is not captured;
+`num_workers: 0` uses the Trainer's main-process RNG protocol.

@@ -87,10 +87,17 @@ The factory must RETURN the compute fn
 tensors inside the local-region skeleton.
 """
 
-from typing import Any, Callable, Optional
+from __future__ import annotations
+
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Any, Callable, Optional, Sequence
 
 import torch
+from torch import nn
 
+from hyper_parallel.core.utils.communication import get_device_handle
+from hyper_parallel.distributed.expert_parallel.planned import ep_planned_forward
 from hyper_parallel.distributed.expert_parallel.routing import (
     resolve_moe_router,
 )
@@ -143,7 +150,7 @@ def build_ep_compute(
     *,
     router_fn: Callable,
     archetype_key: str,
-    expected_attrs,
+    expected_attrs: Sequence[str],
     combine: Callable,
     use_grouped_gemm: bool = False,
     fix_router: bool = False,
@@ -176,6 +183,21 @@ def build_ep_compute(
     around the given callable -- so a family gets the uniform-load comparison mode
     without carrying its own copy of the router.  See that factory for what it does and
     why its numbers must not be reported as an efficiency result.
+
+    Args:
+        module: Parameter-owning MoE block.
+        ep_mesh: Expert-parallel submesh.
+        router_fn: Router callable or registered router name.
+        archetype_key: Explicit routing/composition contract name.
+        expected_attrs: Required module attributes checked before installation.
+        combine: Callback combining routed and optional shared outputs.
+        use_grouped_gemm: Whether to bind grouped local expert computation.
+        fix_router: Enable uniform benchmark routing instead of learned routing.
+        capacity_factor: Optional routed-slot capacity bound.
+        overlap_fn: Optional independent branch scheduled during dispatch.
+
+    Returns:
+        Local compute function bound to the declared expert group.
     """
     router_fn = resolve_moe_router(router_fn, fix_router)
     ep_group = _require_ep_group(ep_mesh, f"archetype '{archetype_key}'")
@@ -410,3 +432,120 @@ EP_ARCHETYPES = {
     "qwen2moe_shared_expert_gate": qwen2moe_ep_compute_fn,
     "deepseekv3_sigmoid_group_shared": deepseekv3_ep_compute_fn,
 }
+
+
+@dataclass(frozen=True)
+class LatentMoEExecutionOptions:
+    """Execution choices independent of the calling model's configuration."""
+
+    ep_backend: str = "standard"
+    ep_payload_dtype: torch.dtype = torch.float32
+    replay_routed: bool = False
+    ep_combine_backend: str = "index_add"
+    overlap_shared_expert: bool = False
+    async_counts: bool = False
+    replay_policy: str = "full"
+
+
+@lru_cache(maxsize=None)
+def _shared_expert_stream(device: torch.device) -> Any:
+    """Reuse a compute stream without retaining per-forward activations."""
+    return get_device_handle(device.type).Stream(device=device)
+
+
+def _start_shared_expert(expert: nn.Module, hidden_states: torch.Tensor) -> tuple[torch.Tensor, Any]:
+    """Enqueue the independent shared branch before routed counts and payload work.
+
+    Shared computation stays outside routed checkpoint replay. Its consumer waits
+    on this stream before addition; autograd retains the branch's stream dependency.
+    """
+    if hidden_states.device.type == "cpu":
+        return expert(hidden_states), None
+    handle = get_device_handle(hidden_states.device.type)
+    stream = _shared_expert_stream(hidden_states.device)
+    stream.wait_stream(handle.current_stream())
+    hidden_states.record_stream(stream)
+    with handle.stream(stream):
+        output = expert(hidden_states)
+    return output, stream
+
+
+def latent_moe_forward(module: nn.Module, hidden_states: torch.Tensor, ep_group: Any,
+                       valid_token_mask: torch.Tensor | None, collect_router_stats: bool, *,
+                       options: LatentMoEExecutionOptions) -> torch.Tensor:
+    """Execute a LatentMoE with explicit transport and replay choices.
+
+    Args:
+        module: Parameter-owning LatentMoE exposing a stacked expert module.
+        hidden_states: Local decoder activations.
+        ep_group: Expert group, or None for local execution.
+        valid_token_mask: Router statistics mask.
+        collect_router_stats: Whether routing contributes observations.
+        options: Transport, replay and shared-branch scheduling policy.
+
+    Returns:
+        Routed plus shared outputs in decoder shape and compute dtype.
+    """
+    indices, weights = module.gate(hidden_states, valid_token_mask, collect_router_stats)
+    latent = module.project_routed_input(hidden_states)
+    latent = latent.reshape(*hidden_states.shape[:-1], latent.shape[-1])
+
+    def router_fn(target: nn.Module, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reuse routing computed from full hidden features before latent projection.
+
+        Args:
+            target: Dispatcher-provided MoE module, unused because routing is cached
+                in this forward's closure.
+            states: Dispatched latent features, unused for full-width routing.
+
+        Returns:
+            The current forward's [tokens, top_k] expert indices and mixture weights.
+        """
+        del target, states
+        return indices, weights
+
+    # The shared dispatcher casts routing weights to its transport dtype. This recipe
+    # requires FP32 weights and accumulation, so this reference path exchanges
+    # FP32 slots; experts still compute in their parameter/activation dtype.
+    shared = None
+    shared_stream = None
+    if options.ep_backend == "planned" and options.overlap_shared_expert and hasattr(module, "shared_experts"):
+        shared, shared_stream = _start_shared_expert(module.shared_experts, hidden_states)
+    if options.ep_backend == "planned":
+        combined = ep_planned_forward(module, latent, indices, weights, ep_group,
+                                      payload_dtype=options.ep_payload_dtype, replay_routed=options.replay_routed,
+                                      combine_backend=options.ep_combine_backend,
+                                      async_counts=options.async_counts,
+                                      replay_policy=options.replay_policy)
+    elif ep_group is None:
+        combined = _local_routed_forward(module, latent, indices, weights)
+    elif options.overlap_shared_expert and hasattr(module, "shared_experts"):
+        pending = ep_routed_dispatch(module, latent.float(), router_fn=router_fn, ep_group=ep_group)
+        shared = module.shared_experts(hidden_states)
+        combined = ep_routed_experts_and_combine(module, pending, ep_group)
+    else:
+        combined = ep_routed_forward(
+            module, latent.float(), router_fn=router_fn, ep_group=ep_group,
+            use_fused_moe_token_permute_and_unpermute=False,
+        )
+    combined = combined.to(latent.dtype).reshape(-1, latent.shape[-1])
+    combined = module.project_routed_output(combined)
+    combined = combined.reshape(hidden_states.shape)
+    if shared_stream is not None:
+        get_device_handle(hidden_states.device.type).current_stream().wait_stream(shared_stream)
+    if hasattr(module, "shared_experts"):
+        combined = combined + (module.shared_experts(hidden_states) if shared is None else shared)
+    return combined
+
+
+def _local_routed_forward(module: nn.Module, latent: torch.Tensor, indices: torch.Tensor,
+                          weights: torch.Tensor) -> torch.Tensor:
+    """Run the same stacked expert parameters without communication for EP1."""
+    flattened = latent.reshape(-1, latent.shape[-1])
+    token_ids = torch.arange(flattened.shape[0], device=latent.device)[:, None].expand_as(indices).reshape(-1)
+    expert_ids = indices.reshape(-1)
+    order = expert_ids.argsort(stable=True)
+    values = module.experts(flattened[token_ids[order]], expert_ids[order]).float()
+    values = values * weights.reshape(-1)[order, None]
+    output = torch.zeros_like(flattened, dtype=torch.float32)
+    return output.index_add(0, token_ids[order], values).reshape(latent.shape)

@@ -1,0 +1,127 @@
+# Native K3 LLM scratch baseline: 4 ranks, DP4/FSDP4, TP=CP=EP=PP=1.
+# Each fixed-length row is one continuous attention sequence, possibly spanning documents.
+# EOS concatenation is supported; document attention/position resets are not.
+# The model configuration is local and explicit; no weights or assets are downloaded.
+model:
+  _target_: hyper_parallel.models.kimi_k3.adapter.construction.build_kimi_linear_training_model
+  config_path: /path/to/k3-training-config.json
+  strip_inference_quantization: false
+  torch_dtype: bfloat16
+model_init_dtype: float32
+loss_fn:
+  _target_: hyper_parallel.components.losses.chunked_cross_entropy.ChunkedCausalLMLoss
+  chunk_size: 128
+  ignore_index: -100
+training:
+  train_iters: 10
+  eval_iters: 0
+  global_batch_size: 4
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: true
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+  encoder_parallel:
+    enabled: false
+fsdp_config:
+  dp_shard_size: 4
+  edp_shard_size: 4
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    cast_forward_inputs: false
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+mixed_precision:
+  enabled: false
+activation_checkpoint:
+  mode: 'off'
+activation_swap: none
+compile:
+  enabled: false
+dataset:
+  _target_: hyper_parallel.data.text.build_dataset.build_indexed_text_dataset
+  data_path: /path/to/text_document
+  model_assets:
+    chat_template: null
+    tokenizer:
+      _target_: hyper_parallel.data.text.build_tokenizer.AutoTokenizer.from_pretrained
+      pretrained_model_name_or_path: /path/to/local/Kimi-K3
+      local_files_only: true
+      tokenizer_type: pretokenized
+      vocab_size: 163840
+      eod_token_id: 163586
+  data_config:
+    seq_length: 2048
+    split: 1, 0, 0
+    mock_data: false
+    distributed_walk: true
+    is_dataset_from_mr: false
+    simple_blend: 'no'
+    data_lazy_load: true
+    skip_data_check: true
+    labels_are_shifted: true
+    create_attention_mask_in_dataloader: false
+    create_ltor_fields_in_dataloader: false
+    reset_position_ids: false
+    reset_attention_mask: false
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_indexed_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.TextParallelBatch
+    source_type: indexed
+    attention_mode: compressed
+    runtime_input_adapter:
+      _target_: hyper_parallel.models.kimi_k3.adapter.data.text_runtime.build_kimi_linear_runtime_input_adapter
+      pad_token_id: null
+      packed: false
+  sampler_type: single
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+  fp32_main_params: true
+  no_decay_params:
+  - bias
+  - norm
+  - ln_
+  adamw_config:
+    adamw_lr: 1.0e-05
+    adamw_weight_decay: 0.1
+    adamw_betas:
+    - 0.9
+    - 0.95
+    adamw_eps: 1.0e-08
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr_warmup_steps: 1
+    min_lr: 0.0
+checkpoint:
+  save_ckpt: false
+  save_extra_state_per_rank: true
+  restore_from: null
+  checkpoint_dir: ./output/kimi_k3_llm/checkpoints
+model_integration:
+  mode: 'off'
+debug:
+  check_nan_inf: true
+  check_dataset: null

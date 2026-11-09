@@ -1,4 +1,5 @@
 # Copyright 2025-2026 Bytedance Ltd. and/or its affiliates
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,14 +19,19 @@ Split out of the former ``auto_models/components/utils/helper.py`` in stage 7
 (05 §10.4); function names and signatures are unchanged.
 """
 
+from __future__ import annotations
+
 import os
 import random
 
 import numpy as np
-import torch
+import torch  # pylint: disable=forbidden-backend-import
 from transformers import set_seed as set_seed_func
 
 from hyper_parallel.models.build_options import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
+from hyper_parallel.trainer.runtime.rng import (
+    capture_numpy_rng_state, capture_rng_state, restore_numpy_rng_state, restore_rng_state,
+)
 
 if IS_NPU_AVAILABLE:
     # Importing torch_npu preserves its torch.npu and HCCL registrations.
@@ -89,6 +95,10 @@ def set_seed(seed: int | None, full_determinism: bool = False) -> None:
 
 
 __all__ = [
+    "capture_numpy_rng_state",
+    "restore_numpy_rng_state",
+    "capture_rng_state",
+    "restore_rng_state",
     "enable_full_determinism",
     "enable_high_precision_for_bf16",
     "set_seed",

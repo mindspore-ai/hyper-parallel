@@ -73,10 +73,15 @@ class EncoderParallelAdapterSpec:
     ``validate_training``, ``parse_images``, ``pack_payload``, ``payload_field``,
     ``empty_payload_shape``, ``encode_local`` and ``project``.
     The runtime uses these operations without inspecting model-specific state.
-    Module replacement is selected separately by recipe ``replace_module``.
+    An optional ``project_many(hidden_states, items)`` batches all real/dummy
+    slots into one projector invocation, preserving its FSDP parameter lifetime.
+    It returns one feature tensor per slot; bridges without it use ``project``.
+    An optional ``source_attention_type`` limits a block-wide pattern to its
+    actual attention owners. Module replacement is selected by recipe ``replace.kind=module``.
     """
 
     isolated_subtrees: tuple[str, ...]
     attention_pattern: str
     replacement_attention_type: type[nn.Module]
     bind: Callable[[nn.Module], Any]
+    source_attention_type: type[nn.Module] | None = None

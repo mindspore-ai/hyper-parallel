@@ -275,36 +275,60 @@ def resolve_packed_sequence(
     return info
 
 
-class _PackedConvTap(torch.autograd.Function):
-    """Recreate a masked tap in backward instead of retaining its FP32 copy."""
+class _PackedCausalConvolution(torch.autograd.Function):
+    """Save low-precision input once and round its summed tap gradient once."""
 
     @staticmethod
     def forward(
-        ctx: Any, extended: torch.Tensor, weight: torch.Tensor, valid: torch.Tensor, offset: int, length: int,
+        ctx: Any, extended: torch.Tensor, weights: torch.Tensor, valid: torch.Tensor, dilation: int, length: int,
     ) -> torch.Tensor:
-        """Save shared input storage while preserving the eager product precision."""
-        ctx.save_for_backward(extended, weight, valid)
-        ctx.offset, ctx.length = offset, length
-        values = extended[:, offset : offset + length].to(weight.dtype)
-        values = torch.where(valid[None, :, None], values, 0.0)
-        return values * weight[None, None, :]
+        """Reconstruct tap products without retaining their FP32 activation copies.
+
+        Args:
+            ctx: Per-invocation autograd storage.
+            extended: Low-precision input with preceding causal history.
+            weights: Accumulation-precision depthwise weights.
+            valid: Per-tap document-isolation mask.
+            dilation: Distance between adjacent kernel taps.
+            length: Number of local output tokens.
+        """
+        ctx.save_for_backward(extended, weights, valid)
+        ctx.dilation, ctx.length = dilation, length
+        output = extended.new_zeros((extended.shape[0], length, extended.shape[-1]), dtype=weights.dtype)
+        for tap in range(weights.shape[-1]):
+            offset = tap * dilation
+            values = extended[:, offset:offset + length].to(weights.dtype)
+            values = torch.where(valid[tap, None, :, None], values, 0.0)
+            output = output + values * weights[None, None, :, tap]
+        return output
 
     @staticmethod
     def backward(
         ctx: Any, grad_output: torch.Tensor,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, None, None, None]:
-        """Rebuild only this tap; differentiable Torch operations retain higher derivatives."""
-        extended, weight, valid = ctx.saved_tensors
-        grad_extended = grad_weight = None
-        if ctx.needs_input_grad[0]:
-            grad_values = grad_output * weight[None, None, :]
-            grad_values = torch.where(valid[None, :, None], grad_values, 0.0).to(extended.dtype)
-            grad_extended = F.pad(grad_values, (0, 0, ctx.offset, extended.shape[1] - ctx.offset - ctx.length))
-        if ctx.needs_input_grad[1]:
-            values = extended[:, ctx.offset : ctx.offset + ctx.length].to(weight.dtype)
-            values = torch.where(valid[None, :, None], values, 0.0)
-            grad_weight = (grad_output * values).sum(dim=(0, 1))
-        return grad_extended, grad_weight, None, None, None
+        """Accumulate dX before casting; retain differentiability for higher derivatives.
+
+        Args:
+            ctx: Saved input, weights and document masks.
+            grad_output: Accumulation-precision output adjoint.
+        """
+        extended, weights, valid = ctx.saved_tensors
+        grad_extended = torch.zeros_like(extended, dtype=weights.dtype) if ctx.needs_input_grad[0] else None
+        grad_weights = []
+        for tap in range(weights.shape[-1]):
+            offset = tap * ctx.dilation
+            mask = valid[tap, None, :, None]
+            if grad_extended is not None:
+                contribution = torch.where(mask, grad_output * weights[None, None, :, tap], 0.0)
+                grad_extended = grad_extended + F.pad(
+                    contribution, (0, 0, offset, extended.shape[1] - offset - ctx.length),
+                )
+            if ctx.needs_input_grad[1]:
+                values = extended[:, offset:offset + ctx.length].to(weights.dtype)
+                grad_weights.append((grad_output * torch.where(mask, values, 0.0)).sum(dim=(0, 1)))
+        if grad_extended is not None:
+            grad_extended = grad_extended.to(extended.dtype)
+        return grad_extended, torch.stack(grad_weights, dim=-1) if grad_weights else None, None, None, None
 
 
 def packed_causal_conv1d(
@@ -324,6 +348,7 @@ def packed_causal_conv1d(
     Masking taps also masks their autograd contribution to an exchanged halo.
     Backward reconstructs each masked tap from the shared input rather than
     retaining a full accumulation-precision input for every window position.
+    All tap contributions to dX accumulate before one cast to the input dtype.
 
     Args:
         inputs: Local projected tokens with shape ``[1, T, C]``.
@@ -372,11 +397,11 @@ def packed_causal_conv1d(
     sample_indices = torch.bucketize(positions, boundaries[1:], right=True)
     starts = boundaries[sample_indices]
     dtype = torch.float32 if inputs.dtype in (torch.bfloat16, torch.float16) else inputs.dtype
-    output = torch.zeros_like(inputs, dtype=dtype)
     weights = weight[:, 0].to(dtype)
-    for tap in range(width):
-        valid = positions - (width - 1 - tap) * dilation >= starts
-        output = output + _PackedConvTap.apply(extended, weights[:, tap], valid, tap * dilation, info.length)
+    valid = torch.stack([
+        positions - (width - 1 - tap) * dilation >= starts for tap in range(width)
+    ])
+    output = _PackedCausalConvolution.apply(extended, weights, valid, dilation, info.length)
     if bias is not None:
         output = output + bias.to(dtype)
     return F.silu(output.to(inputs.dtype))

@@ -24,6 +24,10 @@ from hyper_parallel.components.checkpoint.conversion_ops import (
     InterleaveGateQKV,
     InterleaveQKV,
     Split,
+    StackExpertWeights,
+    UnstackExpertWeights,
+    StackExpertFC1,
+    UnstackExpertFC1,
 )
 from hyper_parallel.components.checkpoint.dcp_checkpointer import (
     STEP_PREFIX,
@@ -71,6 +75,10 @@ __all__ = [
     "RemapLoadPlanner",
     "STEP_PREFIX",
     "Split",
+    "StackExpertWeights",
+    "UnstackExpertWeights",
+    "StackExpertFC1",
+    "UnstackExpertFC1",
     "TorchShardedSafetensorsReader",
     "build_checkpointer",
     "initialize_optimizer_state",

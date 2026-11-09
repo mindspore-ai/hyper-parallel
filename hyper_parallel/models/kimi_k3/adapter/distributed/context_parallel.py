@@ -19,6 +19,7 @@ from __future__ import annotations
 __all__ = [
     "kimi_delta_attention_cp_wrapper",
     "kimi_mla_cp_wrapper",
+    "kimi_k3_attention_cp_wrapper",
     "kimi_delta_attention_p2p_cp_wrapper",
     "kimi_delta_attention_ulysses_cp_wrapper",
 ]
@@ -29,6 +30,7 @@ from typing import Any, Type
 import torch
 from torch import nn
 
+from hyper_parallel.components.modules.kimi_delta_attention import KimiDeltaAttention
 from hyper_parallel.distributed import inner_wrapper
 from hyper_parallel.distributed._builder.forward_rewriter import (
     _ForwardRewriteRequest,
@@ -72,6 +74,14 @@ def _build_kda_cp_rewrite(
         )
 
     execution_options = {} if execution_options is None else execution_options
+    config = getattr(target_module, "config", None)
+    if getattr(config, "model_type", None) == "kimi_linear":
+        # The KDA executor can require optional kernels; importing MLA must stay independent.
+        from hyper_parallel.models.kimi_k3.adapter.distributed.kda import select_k3_executor  # pylint: disable=C0415
+
+        if mode != "ulysses":
+            execution_options = {**execution_options, "conv_backend": config.causal_conv_backend}
+        executor_class = select_k3_executor(executor_class, backend, config.causal_conv_backend)
     executor = executor_class(
         target_module,
         cp_mesh,
@@ -94,7 +104,10 @@ def _build_kda_cp_rewrite(
         target_module,
         cp_forward,
         companion_attrs={
-            "_hp_kda_cp_executor": executor,
+            # The executor references the target. Registering it as a child would
+            # create a module cycle and duplicate the target's parameter ownership.
+            "_hp_kda_cp_executor": executor.__call__,
+            "_hp_cp_mesh": cp_mesh,
             "_hp_kda_cp_config": {
                 "mode": mode,
                 "backend": backend,
@@ -288,13 +301,66 @@ def kimi_mla_cp_wrapper(
             Projected hidden states in the original local-token order.
         """
         del position_ids
+        kwargs.pop("position_embeddings", None)
         if past_key_values is not None:
             raise ValueError("Kimi MLA CP does not support a KV cache")
-        return gated_mla_forward(
-            target_module, runtime, hidden_states, attention_mask, kwargs,
+        valid = (attention_mask if attention_mask is not None
+                 and attention_mask.shape == hidden_states.shape[:2] else None)
+        output = gated_mla_forward(
+            target_module, runtime, hidden_states, None if valid is not None else attention_mask, kwargs,
             overlap_output_backward=supports_output_backward and torch.is_grad_enabled(),
         )
+        return output if valid is None else output * valid.unsqueeze(-1).to(output.dtype)
 
     return [_ForwardRewriteRequest(
-        target_module, cp_forward, companion_attrs={"mla_cp_runtime": runtime},
+        target_module, cp_forward, companion_attrs={"mla_cp_runtime": runtime, "_hp_cp_mesh": cp_mesh},
     )] + children
+
+
+@inner_wrapper
+def kimi_k3_attention_cp_wrapper(
+        target_module: nn.Module, mesh: Any, tp_mesh: Any, cp_mesh: Any, ep_mesh: Any, *,
+        kda_strategy: str = "ulysses", kda_backend: str = "triton",
+        kda_state_method: str = "p2p", kda_ulysses_degree: int = 1, kda_allgather_group_size: int = 1,
+        mla_strategy: str = "expanded_ulysses", mla_ulysses_degree: int | None = None,
+        mla_kv_exchange: str = "all_gather", mla_overlap: bool = False,
+) -> _ForwardRewriteRequest | list[_ForwardRewriteRequest]:
+    """Bind one explicit CP recipe to both roles of the native hybrid decoder.
+
+    Args:
+        target_module: Native KDA or explicitly replaced gated MLA layer.
+        mesh: Planner mesh context.
+        tp_mesh: Size-one tensor-parallel mesh.
+        cp_mesh: Chronologically ordered context-parallel mesh.
+        ep_mesh: Unused expert mesh passed to the role-specific factory.
+        kda_strategy: Ulysses or state communication for linear attention.
+        kda_backend: Local linear-attention backend, eager or triton.
+        kda_state_method: State transfer schedule for the state strategy.
+        kda_ulysses_degree: Head exchange degree within the state strategy.
+        kda_allgather_group_size: State gather group size for grouped state CP.
+        mla_strategy: Expanded Ulysses or latent-KV head communication.
+        mla_ulysses_degree: MLA head exchange degree; None uses the CP size.
+        mla_kv_exchange: Shared latent-KV exchange choice.
+        mla_overlap: Enable the shared MLA forward and backward overlap schedule.
+
+    Returns:
+        Existing role-specific rewrites, preserving parameter ownership and FQNs.
+    """
+    if kda_strategy not in ("ulysses", "state"):
+        raise ValueError("K3 kda_strategy must be ulysses or state")
+    arguments = (target_module, mesh, tp_mesh, cp_mesh, ep_mesh)
+    if isinstance(target_module, KimiMLAAttention):
+        return kimi_mla_cp_wrapper(
+            *arguments, strategy=mla_strategy, ulysses_degree=mla_ulysses_degree,
+            kv_exchange=mla_kv_exchange, overlap=mla_overlap,
+        )
+    if not isinstance(target_module, KimiDeltaAttention):
+        raise ValueError("K3 CP requires native KDA or the explicit KimiMLAAttention replacement")
+    if kda_strategy == "ulysses":
+        if (kda_state_method, kda_ulysses_degree, kda_allgather_group_size) != ("p2p", 1, 1):
+            raise ValueError("KDA state options require kda_strategy=state")
+        return kimi_delta_attention_ulysses_cp_wrapper(*arguments, backend=kda_backend)
+    return kimi_delta_attention_cp_wrapper(
+        *arguments, backend=kda_backend, state_cp_method=kda_state_method,
+        ulysses_degree=kda_ulysses_degree, allgather_group_size=kda_allgather_group_size,
+    )

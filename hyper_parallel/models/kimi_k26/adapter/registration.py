@@ -60,7 +60,7 @@ def _load_loss():
 
 def _load_codegen():
     """Return shared Kimi source-export compatibility lazily."""
-    from hyper_parallel.models.kimi_k3.adapter import codegen  # pylint: disable=C0415
+    from hyper_parallel.codegen.source import compat as codegen  # pylint: disable=C0415
 
     return codegen
 

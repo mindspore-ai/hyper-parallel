@@ -94,7 +94,11 @@ class ModelIntegrationSession(Protocol):
         """Observe parameters after the optimizer step."""
 
     def end_step(self, metrics: Mapping[str, Any]) -> None:
-        """Finish one optimizer step."""
+        """Record the completed training iteration and its numerical observations.
+
+        Args:
+            metrics: Loss, gradient norms, learning rates and optimizer-update metadata.
+        """
 
     def record_fsdp_trace(self, trace: Mapping[str, Any]) -> None:
         """Record optional FSDP runtime evidence."""
@@ -518,7 +522,11 @@ class TrainerModelIntegrationSession:
         self.parameter_probes.capture("optimizer_state")
 
     def end_step(self, metrics: Mapping[str, Any]) -> None:
-        """Persist structured scalar and global input identity evidence."""
+        """Persist structured scalar and global input identity evidence.
+
+        Args:
+            metrics: Loss, gradient norms, learning rates and optimizer-update metadata.
+        """
         if not self.runtime_enabled:
             return
         self._finish_shared_state_trace()
@@ -529,6 +537,8 @@ class TrainerModelIntegrationSession:
         memory = peak_device_memory()
         row = {
             "step": self._current_step,
+            "optimizer_step": metrics.get("optimizer_step"),
+            "optimizer_step_applied": metrics.get("optimizer_step_applied", True),
             "loss": metrics.get("loss"),
             "grad_norm_pre_clip": metrics.get("grad_norm"),
             "grad_norm_post_clip": metrics.get(

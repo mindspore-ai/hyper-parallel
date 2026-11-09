@@ -128,3 +128,21 @@ def _import_statements(text: str) -> list[_Stmt]:
             )
         )
     return statements
+
+
+def prepare_model_import() -> None:
+    """Restore an optional Transformers descriptor used by exported model sources."""
+    # Transformers is optional for source-only AST processing and non-HF callers.
+    from transformers.utils import generic  # pylint: disable=C0415
+
+    if hasattr(generic, "OutputRecorder"):
+        return
+
+    class OutputRecorder:  # pylint: disable=too-few-public-methods
+        """Describe the output class and tuple index recorded by remote source."""
+
+        def __init__(self, target_class: type, index: int = 0) -> None:
+            self.target_class = target_class
+            self.index = index
+
+    generic.OutputRecorder = OutputRecorder

@@ -25,4 +25,16 @@ def load_context_parallel() -> ModuleType:
     return context_parallel
 
 
-__all__ = ["load_context_parallel"]
+__all__ = ["load_context_parallel", "load_loss", "load_text_loss"]
+
+
+def load_text_loss() -> ModuleType:
+    """Load the native text objective contract only when requested."""
+    from hyper_parallel.models.kimi_k3.adapter import text_loss  # pylint: disable=C0415
+    return text_loss
+
+
+def load_loss() -> ModuleType:
+    """Load the native multimodal objective contract only when requested."""
+    from hyper_parallel.models.kimi_k3.adapter import loss  # pylint: disable=C0415
+    return loss

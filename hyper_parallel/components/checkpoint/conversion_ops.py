@@ -434,3 +434,143 @@ class DeinterleaveGateQKV(ConversionOps):
             self.query_head_dim,
             self.value_head_dim,
         )
+
+
+def _expert_tensor(value: Any) -> torch.Tensor:
+    if isinstance(value, (list, tuple)):
+        if len(value) != 1:
+            raise ValueError("Each explicit expert checkpoint source must occur exactly once")
+        value = value[0]
+    if not isinstance(value, torch.Tensor):
+        raise TypeError("Expert checkpoint conversion expects tensors")
+    return value
+
+
+class StackExpertWeights(ConversionOps):
+    """Stack explicitly ordered expert matrices without changing their values."""
+
+    def convert(self, input_dict: dict[str, Any], source_patterns: list[str],
+                target_patterns: list[str], **kwargs: Any) -> dict[str, torch.Tensor]:
+        """Stack ordered expert matrices along the global expert axis.
+
+        Args:
+            input_dict: Source-pattern keys mapped to matrices or singleton lists.
+            source_patterns: Explicit expert keys in numerical expert order.
+            target_patterns: Exactly one key for the packed output tensor.
+            **kwargs: Unused conversion-protocol options.
+
+        Returns:
+            The target key mapped to a tensor shaped [experts, output, input].
+
+        Raises:
+            ValueError: Sources are missing or matrices have incompatible shapes.
+            TypeError: A source value is not a tensor.
+        """
+        del kwargs
+        if len(target_patterns) != 1 or set(input_dict) != set(source_patterns):
+            raise ValueError("Expert stacking requires every declared source and exactly one target")
+        tensors = [_expert_tensor(input_dict[name]) for name in source_patterns]
+        if not tensors or any(value.ndim != 2 or value.shape != tensors[0].shape for value in tensors):
+            raise ValueError("Expert sources must be nonempty, identically shaped matrices")
+        return {target_patterns[0]: torch.stack(tensors, dim=0)}
+
+    @property
+    def reverse_op(self) -> ConversionOps:
+        """Return the inverse that restores the original per-expert FQNs."""
+        return UnstackExpertWeights()
+
+
+class UnstackExpertWeights(ConversionOps):
+    """Restore explicitly ordered expert matrices from a complete logical tensor."""
+
+    def convert(self, input_dict: dict[str, Any], source_patterns: list[str],
+                target_patterns: list[str], **kwargs: Any) -> dict[str, torch.Tensor]:
+        """Split a complete logical expert tensor into ordered matrices.
+
+        Args:
+            input_dict: One source-pattern key mapped to the global packed tensor.
+            source_patterns: Exactly one key for the packed source.
+            target_patterns: Explicit per-expert keys in numerical expert order.
+            **kwargs: Unused conversion-protocol options.
+
+        Returns:
+            Per-expert target keys mapped to unbound [output, input] matrices.
+
+        Raises:
+            ValueError: The source does not contain the complete declared expert axis.
+            TypeError: The source value is not a tensor.
+        """
+        del kwargs
+        if len(source_patterns) != 1 or set(input_dict) != set(source_patterns):
+            raise ValueError("Expert unstacking requires exactly one complete source")
+        tensor = _expert_tensor(input_dict[source_patterns[0]])
+        if tensor.ndim != 3 or tensor.shape[0] != len(target_patterns):
+            raise ValueError("Expert unstacking requires the complete declared global expert axis")
+        return dict(zip(target_patterns, tensor.unbind(0)))
+
+    @property
+    def reverse_op(self) -> ConversionOps:
+        """Return the forward stack operation."""
+        return StackExpertWeights()
+
+
+class StackExpertFC1(ConversionOps):
+    """Combine ordered per-expert gate/up pairs before model construction."""
+
+    def convert(self, input_dict: dict[str, Any], source_patterns: list[str],
+                target_patterns: list[str], **kwargs: Any) -> dict[str, torch.Tensor]:
+        """Map alternating w1/w3 patterns to a complete packed FC1 tensor.
+
+        Args:
+            input_dict: Per-expert gate/up matrices keyed by declared source patterns.
+            source_patterns: Alternating w1/w3 patterns in numerical expert order.
+            target_patterns: One packed w13 target.
+            **kwargs: Unused conversion-protocol options.
+
+        Returns:
+            The target mapped to [experts, 2*intermediate, input] storage.
+        """
+        del kwargs
+        if len(target_patterns) != 1 or len(source_patterns) % 2 or not source_patterns:
+            raise ValueError("FC1 stacking requires nonempty gate/up pairs and one target")
+        tensors = [_expert_tensor(input_dict[name]) for name in source_patterns]
+        if any(value.ndim != 2 or value.shape != tensors[0].shape for value in tensors):
+            raise ValueError("FC1 source matrices must have matching two-dimensional shapes")
+        return {target_patterns[0]: torch.stack([torch.cat(tensors[index:index + 2], dim=0)
+                                                for index in range(0, len(tensors), 2)])}
+
+    @property
+    def reverse_op(self) -> ConversionOps:
+        """Restore numbered gate/up checkpoint names."""
+        return UnstackExpertFC1()
+
+
+class UnstackExpertFC1(ConversionOps):
+    """Restore the original, interleaved per-expert w1 and w3 matrices."""
+
+    def convert(self, input_dict: dict[str, Any], source_patterns: list[str],
+                target_patterns: list[str], **kwargs: Any) -> dict[str, torch.Tensor]:
+        """Split each complete expert matrix into its gate/up pair.
+
+        Args:
+            input_dict: One packed global FC1 tensor keyed by its source pattern.
+            source_patterns: Exactly one packed source pattern.
+            target_patterns: Alternating numbered gate/up checkpoint names.
+            **kwargs: Unused conversion-protocol options.
+
+        Returns:
+            Per-expert gate/up matrices with their original shapes and names.
+        """
+        del kwargs
+        if len(source_patterns) != 1:
+            raise ValueError("FC1 unstacking requires one complete source")
+        tensor = _expert_tensor(input_dict[source_patterns[0]])
+        if tensor.ndim != 3 or tensor.shape[0] * 2 != len(target_patterns) or tensor.shape[1] % 2:
+            raise ValueError("FC1 unstacking requires complete experts and matching gate/up targets")
+        matrices = [part for expert in tensor.unbind(0) for part in expert.chunk(2, dim=0)]
+        return dict(zip(target_patterns, matrices))
+
+    @property
+    def reverse_op(self) -> ConversionOps:
+        """Return the paired stack operation."""
+        return StackExpertFC1()

@@ -101,7 +101,10 @@ def _with_history(
 ) -> tuple[torch.Tensor, tuple[int, ...] | None, int]:
     """Prepend only the first fragment's true history without inventing a reset."""
     if info is None:
-        return inputs, None, 0
+        if halo is None:
+            return inputs, None, 0
+        # Dense batch rows remain independent; the halo extends each row separately.
+        return torch.cat((halo, inputs), dim=1), None, width - 1
     if halo is None:
         return inputs, info.local_offsets, 0
     prefix = min(width - 1, info.preceding_sample_tokens)
@@ -170,9 +173,8 @@ def _validate_fused_history(
     width: int,
 ) -> None:
     """Reject history that cannot represent the same document and activation layout."""
-    if info is None:
-        raise ValueError("Fused convolution halo requires explicit packed sequence metadata.")
-    if halo.shape != (1, width - 1, inputs.shape[-1]):
+    batch_size = inputs.shape[0] if info is None else 1
+    if halo.shape != (batch_size, width - 1, inputs.shape[-1]):
         raise ValueError("Fused convolution halo has an incompatible shape.")
     if halo.dtype != inputs.dtype or halo.device != inputs.device:
         raise ValueError("Fused convolution halo must match the input dtype and device.")
@@ -195,7 +197,7 @@ def fused_causal_conv1d(
         weight: The original parameter's local view with shape ``[C,1,W]``.
         bias: Optional local bias with shape ``[C]``.
         info: Packed document boundaries, or None for independent dense batch samples.
-        halo: Already exchanged packed history; this helper adds no communication.
+        halo: Already exchanged history for independent dense rows or packed tokens; no communication is added.
         backend: Explicit ``triton`` or ``ascendc`` selection, with no fallback.
         dilation: Source convolution dilation; fused kernels require one.
 
