@@ -42,6 +42,7 @@ HyperParallel 面向昇腾超节点提供分布式并行加速能力。针对资
 
 ## 📣 最新消息
 
+- [Oct, 9, 2026]: [moonshotai/Kimi-K2.6 模型支持](hyper_parallel/models/kimi_k26/recipes/train.yaml)
 - [Aug. 25, 2026]: [Qwen/Qwen3-30B-A3B 模型支持](hyper_parallel/models/qwen3_moe/recipes/train.yaml)
 
 ---
@@ -100,6 +101,7 @@ HyperParallel 面向昇腾超节点提供分布式并行加速能力。针对资
 | DeepSeek-V3.2 | [recipes](hyper_parallel/models/deepseek_v32/recipes/) |
 | DeepSeek-V4.1 | [文本配置](examples/training_demo/deepseek_v41/train_deepseek_v41_online.yaml) · [多模态配置](examples/training_demo/deepseek_v41/train_deepseek_v41_vlm_online.yaml) |
 | Kimi-K2.6 | [recipes](hyper_parallel/models/kimi_k26/recipes/) |
+| openPangu-2.0 | [代码仓](https://gitcode.com/ascend-tribe/openPangu-2.0-Training) |
 
 ---
 
@@ -197,7 +199,7 @@ TP、CP、EP、PP 等组合方式见 [特性使用指南](docs/guide/)，公开�
 
 感谢以下合作伙伴与项目的出色工作和支持：
 
-- [Pengcheng Laboratory](https://www.pcl.ac.cn/)
+- [鹏城实验室（Pengcheng Laboratory）](https://www.pcl.ac.cn/)
 - [LlamaFactory](https://github.com/hiyouga/LlamaFactory)
 
 ---
