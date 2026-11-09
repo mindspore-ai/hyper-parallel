@@ -525,6 +525,24 @@ class TestRemat(unittest.TestCase):
                 for grad, ref_grad in zip(grads, ref_grads):
                     self.assertTrue(torch.allclose(grad, ref_grad, atol=1e-10))
 
+    def test_remat_recompiles_without_raise_getitems(self):
+        """The fallback still recompiles when torch lacks raise_getitems."""
+        joint = _trace(self.model, self.x, self.y)
+        with patch(
+            "hyper_parallel.compile.passes.activation_checkpoint."
+            "compile_utils.raise_getitems",
+            None,
+            create=True,
+        ):
+            ActivationCheckpointPass().run(
+                joint.graph_module, self.config, model=self.model
+            )
+        loss, grads, _ = run_traced_graph(joint, self.model, {"x": self.x, "y": self.y})
+        ref_loss, ref_grads = _eager_reference(self.model, self.x, self.y)
+        self.assertTrue(torch.allclose(loss, ref_loss, atol=1e-10))
+        for grad, ref_grad in zip(grads, ref_grads):
+            self.assertTrue(torch.allclose(grad, ref_grad, atol=1e-10))
+
     def test_duplicates_are_backward_tagged_and_selective_is_subset(self):
         """Duplicates are backward-tagged; selective duplicates fewer than full."""
         full_joint, _ = _run_ac(self.model, self.config)
@@ -955,6 +973,49 @@ class TestAdapterRegions(unittest.TestCase):
             with self.assertRaises(ValueError):
                 prepare_activation_checkpoint(_Model(), config)
 
+    def test_region_root_exclusion_raises(self):
+        """An exclusion that swallows a recompute region root is rejected."""
+        spec = RecomputePolicy(
+            region_patterns=("layers.*",),
+            exclude_patterns=("layers.0",),
+        )
+        with patch(_ADAPTER_SPEC_PATH, return_value=spec):
+            with self.assertRaises(ValueError):
+                prepare_activation_checkpoint(
+                    _Model(),
+                    PassConfig(
+                        ac_mode="full", enable_overlap=False, fsdp_enabled=False
+                    ),
+                )
+
+    def test_unmatched_exclude_patterns_raise(self):
+        """Pattern-based exclusions that match nothing are rejected."""
+        spec = RecomputePolicy(
+            region_patterns=("layers.*",),
+            exclude_patterns=("missing.*",),
+        )
+        with patch(_ADAPTER_SPEC_PATH, return_value=spec):
+            with self.assertRaises(ValueError):
+                prepare_activation_checkpoint(
+                    _Model(),
+                    PassConfig(
+                        ac_mode="full", enable_overlap=False, fsdp_enabled=False
+                    ),
+                )
+
+    def test_zero_layers_still_validate_explicit_regions(self):
+        """Zero selected layers do not bypass the adapter-region contract."""
+        config = PassConfig(
+            ac_mode="full",
+            ac_region_source="model_adapter_safe_regions",
+            ac_layer_count=0,
+            enable_overlap=False,
+            fsdp_enabled=False,
+        )
+        with patch(_ADAPTER_SPEC_PATH, return_value=None):
+            with self.assertRaises(ValueError):
+                prepare_activation_checkpoint(_Model(), config)
+
 
 class TestHOPSubgraphAttrs(unittest.TestCase):
     """Recompute duplicates get private HOP subgraph ``get_attr`` nodes."""
@@ -1001,6 +1062,49 @@ class TestHOPSubgraphAttrs(unittest.TestCase):
         self.assertIsNot(duplicate_attr, sub_attr)
         self.assertEqual(duplicate_attr.meta.get("marker"), "shared")
         self.assertIn(duplicate[0], backward.all_input_nodes)
+
+    def test_duplicate_owns_a_fresh_get_attr_for_dotted_target(self):
+        """A nested (dotted) HOP get_attr is duplicated too."""
+
+        class _Subgraph(nn.Module):
+            def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+                """Return the shifted input so the subgraph is not an identity."""
+                return inputs + 1
+
+        subgraph = torch.fx.symbolic_trace(_Subgraph())
+        graph = torch.fx.Graph()
+        inputs = graph.placeholder("x")
+        sub_attr = graph.get_attr("layers.0.sub")
+        sub_attr.meta["marker"] = "shared"
+        forward = graph.call_function(
+            torch.ops.aten.add.Tensor, args=(inputs, sub_attr)
+        )
+        forward.meta["recompute"] = CheckpointPolicy.MUST_RECOMPUTE
+        backward = graph.call_function(
+            torch.ops.aten.mul.Tensor, args=(forward, forward)
+        )
+        backward.meta["autograd_backward"] = True
+        graph.output((backward,))
+        root = nn.Module()
+        root.layers = nn.ModuleList([nn.Module()])
+        root.layers[0].sub = subgraph
+        graph_module = torch.fx.GraphModule(root, graph)
+
+        _remat(graph_module)
+
+        attributes = [
+            node
+            for node in graph_module.graph.nodes
+            if node.op == "get_attr" and node.target == "layers.0.sub"
+        ]
+        self.assertEqual(len(attributes), 2)
+        duplicate = _duplicates(graph_module)
+        self.assertEqual(len(duplicate), 1)
+        duplicate_attr = next(
+            node for node in duplicate[0].all_input_nodes if node.op == "get_attr"
+        )
+        self.assertIsNot(duplicate_attr, sub_attr)
+        self.assertEqual(duplicate_attr.meta.get("marker"), "shared")
 
 
 class TestEagerWrappedModel(unittest.TestCase):
