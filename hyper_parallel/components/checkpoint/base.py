@@ -55,6 +55,10 @@ class CheckpointerBase(ABC):
     ) -> None:
         """Write ``state`` into the checkpoint directory ``path``.
 
+        A successful return releases the caller to mutate or reuse ``state``.
+        Async backends must snapshot both its structure and tensor values before
+        returning; only persistence may continue in the background.
+
         Args:
             path: Directory for this checkpoint; created if absent.
             state: Payload to persist (``model`` / ``optimizer`` /
