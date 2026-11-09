@@ -81,6 +81,7 @@ See the [Models Roadmap](https://github.com/mindspore-ai/hyper-parallel/issues/1
 | DeepSeek-V3.2 | [recipes](hyper_parallel/models/deepseek_v32/recipes/) |
 | DeepSeek-V4.1 | [Text configuration](examples/training_demo/deepseek_v41/train_deepseek_v41_online.yaml) · [Multimodal configuration](examples/training_demo/deepseek_v41/train_deepseek_v41_vlm_online.yaml) |
 | Kimi-K2.6 | [recipes](hyper_parallel/models/kimi_k26/recipes/) |
+| openPangu-2.0 | [代码仓](https://gitcode.com/ascend-tribe/openPangu-2.0-Training) |
 
 ## Key Features
 
