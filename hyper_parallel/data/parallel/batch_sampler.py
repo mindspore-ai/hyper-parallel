@@ -163,8 +163,11 @@ class _DatasetBatchSampler:
             raise ValueError("elastic DP resume requires an unchanged global_batch_size")
 
         if self._resume_at_source_batch:
-            if state_dict["dp_world_size"] != self.dp_world_size:
-                raise ValueError("Online dataloader resume does not support DP world-size changes")
+            if (
+                    state_dict["dp_world_size"] != self.dp_world_size
+                    and consumed_samples % self.global_batch_size != 0
+            ):
+                raise ValueError("Changing DP requires a complete global optimizer batch")
 
             if (
                     consumed_samples != self.total_samples
@@ -208,7 +211,11 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
         self.seed = seed
 
     def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
-        """Restore a fixed-GBS cursor, repartitioning only global shuffle order."""
+        """Restore a fixed-GBS cursor, repartitioning only global shuffle order.
+
+        Args:
+            state_dict: Saved native sampler progress and original DP size.
+        """
         if self.data_sharding and state_dict["dp_world_size"] != self.dp_world_size:
             raise ValueError("elastic DP resume requires data_sharding=False")
 

@@ -598,10 +598,12 @@ class DistributedDataLoader(Iterator[Any]):
             raise ValueError("Switching loaders requires an unchanged global_batch_size")
         if consumed < 0 or consumed % expected["global_batch_size"] or epoch < 0:
             raise ValueError("Switching loaders requires a complete optimizer-step cursor")
-        sampler = dict(sampler, dp_world_size=expected["dp_world_size"])
+        # Preserve the source topology until the native sampler validates it.
+        # Rewriting it first would bypass cyclic data_sharding safety checks.
+        sampler = dict(sampler)
         target.update(epoch=epoch, step=consumed // (
             self._planner.local_batch_size * self._topology.data_parallel_size
-        ), stopped=False, native_sampler=sampler)
+        ), stopped=False, native_sampler=dict(sampler, dp_world_size=expected["dp_world_size"]))
         for key in ("dataset_reader", "metadata_reader", "direct_sample_loader"):
             reader = target[key]
             if reader is None:

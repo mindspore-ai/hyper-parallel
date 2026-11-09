@@ -106,6 +106,72 @@ class TestNativeBatchSampler(unittest.TestCase):
     """Test without process groups or accelerator hardware."""
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_changed_dp_preserves_complete_global_batches(self) -> None:
+        """Feature: Elastic native cursor migration across loader modes.
+        Description: Change DP4 to DP1 and back with a nonzero global cursor.
+        Expectation: Online/metadata readers and fixed loaders keep the remaining samples.
+        """
+        for kind in ("single", "cyclic"):
+            options = {"total_samples": 24, "sampler_type": kind, "seed": 42}
+            reference = _sampler(**options)
+            reference.set_epoch(2)
+            reference.consumed_samples = 4
+            expected = sorted(index for batch in reference for index in batch)
+            for metadata_mode in (False, True):
+                with self.subTest(kind=kind, metadata=metadata_mode):
+                    source_sampler = _sampler(**options, dp_world_size=4, micro_batch_size=1)
+                    source_sampler.set_epoch(2)
+                    source = FixedBatchDataLoader(_TrackedDataset(24), batch_sampler=source_sampler,
+                                                 collate_fn=list, num_workers=0)
+                    next(iter(source))
+                    saved = source.state_dict()
+                    original = copy.deepcopy(saved)
+                    with _loader(_TrackedDataset(24), sampler=_sampler(**options),
+                                 metadata_mode=metadata_mode) as target:
+                        target.load_state_dict(saved)
+                        self.assertEqual(target.state_dict()["native_sampler"]["dp_world_size"], 1)
+                        self.assertEqual(sorted(sample["id"] for batch in target for sample in batch), expected)
+                    self.assertEqual(saved, original)
+                    with _loader(_TrackedDataset(24), sampler=_sampler(**options),
+                                 metadata_mode=metadata_mode) as source:
+                        source.set_epoch(2)
+                        next(source)
+                        next(source)
+                        balanced = source.state_dict()
+                    actual = []
+                    for rank in range(4):
+                        target = FixedBatchDataLoader(
+                            _TrackedDataset(24), batch_sampler=_sampler(
+                                **options, dp_world_size=4, dp_rank=rank, micro_batch_size=1,
+                            ), collate_fn=list, num_workers=0,
+                        )
+                        target.load_state_dict(balanced)
+                        actual.extend(sample["id"] for batch in target for sample in batch)
+                    self.assertEqual(sorted(actual), expected)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_changed_dp_rejects_unsafe_cursor_and_rank_shuffle(self) -> None:
+        """Feature: Elastic cursor safety checks.
+        Description: Preserve source DP for native validation instead of masking it.
+        Expectation: Reject incomplete steps and cyclic per-rank shuffle when DP changes.
+        """
+        source = _sampler(dp_world_size=2, micro_batch_size=1, total_samples=24)
+        saved = dict(source.state_dict(), consumed_samples=2)
+        target = _sampler(total_samples=24)
+        target.enable_source_batch_resume()
+        with self.assertRaisesRegex(ValueError, "complete global optimizer batch"):
+            target.load_state_dict(saved)
+        saved["consumed_samples"] = 4
+        for metadata_mode in (False, True):
+            with self.subTest(metadata=metadata_mode), _loader(
+                    _TrackedDataset(24), metadata_mode=metadata_mode,
+                    sampler=_sampler(total_samples=24, sampler_type="cyclic", data_sharding=True),
+            ) as target:
+                with self.assertRaisesRegex(ValueError, "data_sharding=False"):
+                    target.load_state_dict({"_index_sampler_state": saved})
+                self.assertEqual(target.state_dict()["native_sampler"]["consumed_samples"], 0)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_rank", return_value=0)
     @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_world_size", return_value=1)
     @patch("hyper_parallel.core.distributed_checkpoint.api.dist.barrier")
