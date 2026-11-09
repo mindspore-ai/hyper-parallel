@@ -219,8 +219,8 @@ class TestGenerationFailureIsolation(unittest.TestCase):
             _observe_plan=mock.Mock(side_effect=lambda *_args: events.append("plan")),
             _publish_session=mock.Mock(),
         ), mock.patch.object(auto_model, "_init_model", return_value=(False, model)), \
+                mock.patch.object(auto_model, "_current_device", return_value="cpu"), \
                 mock.patch.object(model_builder, "_apply_pre_sharding_features"), \
-                mock.patch.object(model_builder, "_build_replacement_context", return_value={}), \
                 mock.patch.object(model_builder, "apply_method_replacements", side_effect=apply_methods):
             build_model = model_build_overlay._codegen_build_model(
                 CodegenBuildSession(), None, SimpleNamespace(),

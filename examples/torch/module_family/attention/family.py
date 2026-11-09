@@ -21,22 +21,35 @@ from typing import Any
 from torch import nn
 
 from examples.torch.module_family.config import DecoderConfig
-from hyper_parallel.components.modules import BackendSpec, ModuleFamily, build_family, register_module_family
+from hyper_parallel.components.modules import (
+    ModuleFamily, VariantRule, build_family, register_module_family,
+)
+from hyper_parallel.core.dtensor.placement_types import Replicate
+from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
 from hyper_parallel.models.replacement import module_replacement
 
 
+def _sharding(*, module: nn.Module, module_fqn: str, member: Any, context: Any) -> ModuleShardingSpec:
+    del module_fqn, member, context
+    return ModuleShardingSpec(params={name: {"cp": Replicate()} for name, _ in module.named_parameters()},
+                              in_src={}, in_dst={}, is_boundary=False)
+
+
+# Public family entries retain constructor-style names for stable target paths.
 @module_replacement
-def CausalAttention(*, config: DecoderConfig | None = None, module: nn.Module | None = None,
-                    module_fqn: str = "", context: Any = None, mesh: Any = None,
-                    backend: str | None = None) -> nn.Module:
+def CausalAttention(  # pylint: disable=invalid-name
+    *, config: DecoderConfig | None = None, module: nn.Module | None = None,
+    module_fqn: str = "", context: Any = None, mesh: Any = None,
+) -> nn.Module:
     """Construct the attention family using complete config or a source member."""
     return build_family(CausalAttention, config=config, module=module, module_fqn=module_fqn,
-                        context=context, mesh=mesh, backend=backend)
+                        context=context, mesh=mesh)
 
 
 register_module_family(ModuleFamily(
     name="example_causal_attention", baseline=CausalAttention,
-    variants={"local": "examples.torch.module_family.attention.attention.CausalAttentionModule"},
-    default_variant="local", local_variant_of={"local": "local"},
-    backend_specs={"torch": BackendSpec(("local",))}, default_backends={"local": "torch"},
+    variants={"local": "examples.torch.module_family.attention.attention.CausalAttentionModule",
+              "cp": "examples.torch.module_family.attention.cp_attention.CPCausalAttention"},
+    default_variant="local", parallel_axis="cp", variant_rules=(VariantRule({"parallel": True}, "cp"),),
+    sharding=_sharding,
 ))

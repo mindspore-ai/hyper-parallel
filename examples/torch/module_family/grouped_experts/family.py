@@ -21,22 +21,36 @@ from typing import Any
 from torch import nn
 
 from examples.torch.module_family.config import DecoderConfig
-from hyper_parallel.components.modules import BackendSpec, ModuleFamily, build_family, register_module_family
+from hyper_parallel.components.modules import (
+    ModuleFamily, VariantRule, build_family, register_module_family,
+)
+from hyper_parallel.core.dtensor.placement_types import Shard
+from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
 from hyper_parallel.models.replacement import module_replacement
 
 
+def _sharding(*, module: nn.Module, module_fqn: str, member: Any, context: Any) -> ModuleShardingSpec:
+    del module_fqn, context
+    placements = {"ep": Shard(0)} if member.selectors["parallel"] else {}
+    return ModuleShardingSpec(params={name: dict(placements) for name, _ in module.named_parameters()},
+                              in_src={}, in_dst={}, is_boundary=False)
+
+
+# Public family entries retain constructor-style names for stable target paths.
 @module_replacement
-def GroupedExperts(*, config: DecoderConfig | None = None, module: nn.Module | None = None,
-                   module_fqn: str = "", context: Any = None, mesh: Any = None,
-                    backend: str | None = None) -> nn.Module:
+def GroupedExperts(  # pylint: disable=invalid-name
+    *, config: DecoderConfig | None = None, module: nn.Module | None = None,
+    module_fqn: str = "", context: Any = None, mesh: Any = None,
+) -> nn.Module:
     """Construct the expert family through its shared public interface."""
     return build_family(GroupedExperts, config=config, module=module, module_fqn=module_fqn,
-                        context=context, mesh=mesh, backend=backend)
+                        context=context, mesh=mesh)
 
 
 register_module_family(ModuleFamily(
     name="example_swiglu_experts", baseline=GroupedExperts,
-    variants={"local": "examples.torch.module_family.grouped_experts.grouped_experts.GroupedExpertsModule"},
-    default_variant="local", local_variant_of={"local": "local"},
-    backend_specs={"torch": BackendSpec(("local",))}, default_backends={"local": "torch"},
+    variants={"local": "examples.torch.module_family.grouped_experts.grouped_experts.GroupedExpertsModule",
+              "ep": "examples.torch.module_family.grouped_experts.ep_grouped_experts.EPGroupedExperts"},
+    default_variant="local", parallel_axis="ep", variant_rules=(VariantRule({"parallel": True}, "ep"),),
+    sharding=_sharding,
 ))

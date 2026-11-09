@@ -27,7 +27,7 @@ import torch
 from torch import nn
 
 from hyper_parallel.components.modules.module_family import (
-    FamilyBoundary, FamilyBuildInfo, _build_family_member, collect_family_modules, resolve_family,
+    FamilyBoundary, FamilyBuildInfo, _build_family_member, _context_from_mesh, collect_family_modules, resolve_family,
     validate_family_context,
 )
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
@@ -102,6 +102,8 @@ def build_module_context(
     result["legacy_low_precision_targets"] = bool(getattr(distributed_setup,
                                                           "_hp_legacy_low_precision_targets", False))
     result["sequence_parallel"] = bool(getattr(mesh, "sequence_parallel", False))
+    result["loss_parallel"] = bool(getattr(mesh, "loss_parallel", False))
+    result["mesh_dim_names"] = tuple(getattr(getattr(mesh, "device_mesh", None), "mesh_dim_names", ()) or ())
     result["mesh"] = mesh
     result["model_spec"] = model_spec
     result["module_replacement_requests"] = getattr(distributed_setup, "module_replacement_requests", None)
@@ -172,11 +174,15 @@ def _prepare_family_member(
 ) -> tuple[nn.Module, FamilyBuildInfo]:
     """Resolve a saved request, preparing a candidate without changing the model."""
     source, info = boundary.module, boundary.info
+    if info.layout is not None:
+        validate_family_context(source, context)
+        return source, info
+    context = _context_from_mesh(None, context)
     member = resolve_family(info.request, context=context)
     previous = info.resolved
     axis = member.family.parallel_axis
     same_topology = axis is None or member.axis_sizes[axis] == previous.axis_sizes[axis]
-    unchanged = (member.constructor is previous.constructor and member.backend == previous.backend
+    unchanged = (member.constructor is previous.constructor
                  and member.selectors == previous.selectors and same_topology)
     if not unchanged or member.axis_sizes != previous.axis_sizes:
         _validate_family_lifetime(source)
@@ -208,7 +214,6 @@ def _finalize_family_modules(model: nn.Module, context: Mapping[str, Any]) -> nn
     )
     for _, candidate, info in prepared:
         candidate._hp_family_build_info = info  # pylint: disable=protected-access
-    validate_family_context(model, context)
     return model
 
 
@@ -241,6 +246,7 @@ def construct_family_model(
 
 
 def _provider_rules(provider: Callable, model: nn.Module, context: Mapping[str, Any]) -> tuple:
+    """Load default module replacement requests from the effective model specification."""
     signature = inspect.signature(provider)
     try:
         signature.bind(model=model, context=context)

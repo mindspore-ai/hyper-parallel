@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Any, Iterable, Optional, Tuple
 
 from astroid import nodes
@@ -27,6 +28,7 @@ APACHE_HEADER_SNIPPETS: Tuple[str, ...] = (
     "Licensed under the Apache License, Version 2.0",
     "WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND",
 )
+APACHE_COPYRIGHT = re.compile(r"Copyright \d{4}(?:-\d{4})? Huawei Technologies Co\., Ltd")
 BACKEND_IMPORTS = {"mindspore"}
 PLATFORM_ALLOWED_PARTS = ("tests/", "scripts/", ".agent/")
 PUBLIC_MAGIC_ALLOWLIST = {
@@ -229,7 +231,8 @@ class HyperParallelChecker(BaseChecker):
         except OSError:
             return
         header_window = "\n".join(content.splitlines()[:16])
-        if all(snippet in header_window for snippet in APACHE_HEADER_SNIPPETS):
+        complete_license = all(snippet in header_window for snippet in APACHE_HEADER_SNIPPETS)
+        if APACHE_COPYRIGHT.search(header_window) and complete_license:
             return
         self.add_message("missing-apache-license-header", node=node)
 

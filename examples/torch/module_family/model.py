@@ -24,6 +24,8 @@ from torch import nn
 from examples.torch.module_family.attention import CausalAttention
 from examples.torch.module_family.config import DecoderConfig
 from examples.torch.module_family.grouped_experts import GroupedExperts
+from hyper_parallel.core.dtensor.placement_types import Replicate
+from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 from hyper_parallel.models.registry import register_model_adapter
 
@@ -36,7 +38,7 @@ class FamilyDecoder(nn.Module):
 
         Args:
             config: Global algorithm dimensions.
-            mesh: Existing job meshes borrowed for member selection.
+            mesh: Existing job meshes borrowed for member selection, layout and binding.
             context: Internal constraints injected by the managed model builder.
         """
         super().__init__()
@@ -64,5 +66,12 @@ def _fsdp_units(model: nn.Module) -> tuple[str, ...]:
     return ("attention", "experts")
 
 
-MODEL_SPEC = ModelAdapterSpec("FamilyDecoder", "module_family_decoder", fsdp_wrap_modules=_fsdp_units)
+def _model_sharding(*, model: nn.Module, context: Any) -> dict[str, ModuleShardingSpec]:
+    del model, context
+    return {"router": ModuleShardingSpec(params={"weight": {"cp": Replicate()}},
+                                        in_src={}, in_dst={}, is_boundary=False)}
+
+
+MODEL_SPEC = ModelAdapterSpec("FamilyDecoder", "module_family_decoder", fsdp_wrap_modules=_fsdp_units,
+                              sharding=_model_sharding)
 register_model_adapter(MODEL_SPEC)

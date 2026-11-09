@@ -48,6 +48,9 @@ class ShardingPlan:
     # Tied-weight pairs: [(fqn_a, fqn_b)], parameters sharing storage
     # (embed_tokens <-> lm_head).
     tied_pairs: List[Tuple[str, str]] = field(default_factory=list)
+    parallel_modules: Dict[str, Any] = field(default_factory=dict)
+    owned_parameter_names: set[str] = field(default_factory=set)
+    parameter_aliases: List[Tuple[str, str]] = field(default_factory=list)
 
     def _format_named_placement(self, named: Optional[NamedPlacement]) -> str:
         """Format a named placement as a compact one-line dictionary."""

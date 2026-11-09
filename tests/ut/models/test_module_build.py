@@ -27,10 +27,9 @@ import torch
 from torch import nn
 from transformers import BertConfig
 
-from hyper_parallel.codegen.family_model import prepare_direct_model_artifact
 from hyper_parallel.components.modules import family as family_registry
 from hyper_parallel.components.modules.family import VariantRule
-from hyper_parallel.components.modules.module_family import family_plan_snapshot, get_family_build_info
+from hyper_parallel.components.modules.module_family import get_family_build_info
 from hyper_parallel.models import HyperAutoModelForCausalLM, HyperAutoModelForSequenceClassification, registry
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 from hyper_parallel.models.module_build import (
@@ -46,10 +45,9 @@ from hyper_parallel.trainer.config.parallelism import normalize_distributed_setu
 from tests.common.mark_utils import arg_mark
 from tests.ut.dual_mode_dtensor.test_module_replacement import _AllocatedMappedLinear, _replace_linear
 from tests.common.module_family_fixtures import (
-    load_direct_model_entry,
-    FamilyModel, FamilyModelConfig, LinearBlockFamily, LinearConfig, LinearFamily, LocalLinear, ParallelLinear,
-    ParallelLinearBlock, StatefulLocalLinear, StatefulParallelLinear,
-    create_family_model, create_classifier_model, register_linear_family,
+    FamilyModel, FamilyModelConfig, LinearBlockFamily, LinearConfig, LinearFamily, LocalLinear, MegaLinear,
+    ParallelLinear, ParallelLinearBlock, StatefulLocalLinear, StatefulParallelLinear,
+    create_family_model, register_linear_family,
     get_classifier_replacements,
 )
 
@@ -95,30 +93,25 @@ class TestModuleBuild(unittest.TestCase):
         card_mark="onecard", essential_mark="essential",
     )
     def test_public_build_performs_each_preparation_work_once(self) -> None:
-        """Feature: One common preparation pass for factory, source and codegen entry points.
+        """Feature: One common preparation pass for factory and source entry points.
         Description: Exercise public facades while observing traversal and conversion-provider calls.
         Expectation: Each build finalizes and reads weight mappings once; empty method rules do no work.
         """
         auto = importlib.import_module("hyper_parallel.models._transformers.auto_model")
         builder = importlib.import_module("hyper_parallel.models.module_build")
         infrastructure = importlib.import_module("hyper_parallel.models._transformers.model_builder")
-        for direct, codegen in ((True, False), (True, True), (False, False)):
-            with self.subTest(direct=direct, codegen=codegen), tempfile.TemporaryDirectory() as folder, \
+        for direct in (True, False):
+            with self.subTest(direct=direct), \
                     patch.object(auto, "_current_device", return_value=torch.device("cpu")), \
                     patch.object(builder, "_finalize_family_modules",
                                  wraps=builder._finalize_family_modules) as finalize, \
                     patch.object(builder, "model_weight_mapping", wraps=builder.model_weight_mapping) as mapping, \
-                    patch.object(infrastructure, "_build_replacement_context",
+                    patch.object(infrastructure, "build_module_context",
                                  side_effect=AssertionError("empty rules")):
                 if direct:
                     model = HyperAutoModelForCausalLM.from_config(
                         FamilyModelConfig(), model_factory=create_family_model, torch_dtype=torch.float32,
                     )
-                    if codegen:
-                        prepare_direct_model_artifact(
-                            model, create_family_model, model.config, model._hp_module_build_context,
-                            artifact_dir=folder,
-                        )
                     torch.testing.assert_close(model(torch.ones(2, 4)), torch.full((2, 3), 0.75))
                 else:
                     config = BertConfig.from_dict({
@@ -181,7 +174,6 @@ class TestModuleBuild(unittest.TestCase):
                     model.projection.weight.fill_(0.7)
                 source = model.projection
                 identities = {name: id(value) for name, value in model.named_parameters(remove_duplicate=False)}
-                fingerprint = family_plan_snapshot(model)
                 inputs = torch.randn(2, 4, dtype=torch.float64, requires_grad=True)
                 expected = model(inputs).detach()
                 context = build_module_context(SimpleNamespace(mesh_context=SimpleNamespace(**{f"{axis}_size": 2})))
@@ -199,7 +191,6 @@ class TestModuleBuild(unittest.TestCase):
                 self.assertFalse(model.projection.training)
                 self.assertFalse(model.projection.bias.requires_grad)
                 self.assertEqual(get_family_build_info(model.projection).origin, "direct")
-                self.assertNotEqual(fingerprint, family_plan_snapshot(model))
                 torch.testing.assert_close(model(inputs), expected)
                 model(inputs).sum().backward()
                 torch.testing.assert_close(inputs.grad, torch.full_like(inputs, 2.1))
@@ -269,13 +260,12 @@ class TestModuleBuild(unittest.TestCase):
         Description: Apply EP configuration to a root created through the local public family.
         Expectation: The returned root selects the parallel class and retains the loaded Parameter objects.
         """
-        original = LinearFamily(config=LinearConfig(), backend="alternate")
+        original = LinearFamily(config=LinearConfig())
         weight = original.weight
         context = build_module_context(SimpleNamespace(mesh_context=SimpleNamespace(ep_size=2)))
         model, _ = prepare_model_components(original, context)
         self.assertIs(type(model), ParallelLinear)
         self.assertIs(model.weight, weight)
-        self.assertEqual(model.backend, "alternate")
         self.assertIs(model._hp_module_build_context, context)
         with self.assertRaisesRegex(ValueError, "another build context"):
             prepare_model_components(model, build_module_context())
@@ -354,8 +344,6 @@ class TestModuleBuild(unittest.TestCase):
         family_registry.register_module_family(replace(
             declaration, name="test_linear_block", baseline=LinearBlockFamily, variants=variants,
             selector_specs={}, variant_rules=(VariantRule({"parallel": True}, "parallel"),),
-            local_variant_of={"default": "default", "parallel": "default"},
-            backend_specs={}, default_backends={},
         ))
         model = nn.Module()
         model.block = LinearBlockFamily(config=LinearConfig())
@@ -396,14 +384,18 @@ class TestModuleBuild(unittest.TestCase):
         Description: A defective parallel constructor changes the projection's global width.
         Expectation: Preparation rejects the changed shape and retains the original member and loaded weights.
         """
-        def incompatible(instance: nn.Module, *, config: LinearConfig) -> None:
-            """Construct a deliberately incompatible projection for contract validation."""
-            LocalLinear.__init__(instance, config=replace(config, width=config.width + 1))
+        class IncompatibleParallelLinear(LocalLinear):
+            """Parallel member with a deliberately incorrect logical projection width."""
+
+            def __init__(self, *, config: LinearConfig) -> None:
+                """Construct incompatible weights to exercise state-contract validation."""
+                config = replace(config, width=config.width + 1)
+                super().__init__(config=config)
         model = FamilyModel(FamilyModelConfig())
         original = model.projection
         weight = original.weight
         context = build_module_context(SimpleNamespace(mesh_context=SimpleNamespace(ep_size=2)))
-        with patch.object(ParallelLinear, "__init__", new=incompatible), \
+        with patch("tests.common.module_family_fixtures.ParallelLinear", IncompatibleParallelLinear), \
                 self.assertRaisesRegex(ValueError, "changed logical parameter shape"):
             prepare_model_components(model, context)
         self.assertIs(model.projection, original)
@@ -481,14 +473,14 @@ class TestModuleBuild(unittest.TestCase):
         model.first = nn.Linear(4, 3)
         model.alias = model.first
         weight = model.first.weight
-        default = ModuleReplacementRequest(("first",), LinearFamily, {"backend": "alternate"})
+        default = ModuleReplacementRequest(("first",), LinearFamily, {"kernel": "megakernel"})
         user = ModuleReplacementRequest(("alias",), LinearFamily, {"precision": "inherit"}, origin="user")
         rules = compile_module_replacements(model, defaults=(default,), overrides=(user,))
         self.assertEqual(len(rules.targets), 1)
         result, _ = _apply_module_replacement_actions(model, rules, context={"ep_size": 1})
         self.assertIs(result.first, result.alias)
         self.assertIs(result.first.weight, weight)
-        self.assertEqual(result.first.backend, "alternate")
+        self.assertIs(type(result.first), MegaLinear)
 
     @arg_mark(
         plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
@@ -521,7 +513,7 @@ class TestModuleBuild(unittest.TestCase):
         """
         replacement = importlib.import_module("hyper_parallel.models.replacement")
         model = nn.ModuleDict({"first": nn.Linear(4, 3), "second": nn.Linear(4, 3)})
-        default = ModuleReplacementRequest(("*",), LinearFamily, {"backend": "alternate"})
+        default = ModuleReplacementRequest(("*",), LinearFamily, {"kernel": "megakernel"})
         override = ModuleReplacementRequest(("*",), LinearFamily, {"precision": "inherit"})
         with patch.object(replacement.fnmatch, "fnmatchcase", wraps=replacement.fnmatch.fnmatchcase) as match:
             first = compile_module_replacements(model, defaults=(default,), overrides=(override,))
@@ -533,7 +525,8 @@ class TestModuleBuild(unittest.TestCase):
         self.assertEqual(len(final.targets), 3)
         with patch.object(replacement, "compile_module_replacements", side_effect=AssertionError("recompiled")):
             model, _ = _apply_module_replacement_actions(model, final)
-        self.assertTrue(all(child.backend == "alternate" for child in model.values()))
+        for child in model.values():
+            self.assertIs(type(child), MegaLinear)
 
     @arg_mark(
         plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
@@ -775,41 +768,6 @@ class TestModuleBuild(unittest.TestCase):
         plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
         card_mark="onecard", essential_mark="essential",
     )
-    def test_stable_codegen_reconstructs_without_replacement_and_rejects_stale_config(self):
-        """Feature: Direct model code generation records construction facts.
-        Description: Generated entry calls the stable factory and verifies config and member signatures.
-        Expectation: Outputs agree, changed configurations invalidate reuse, and native closures remain valid.
-        """
-        config = FamilyModelConfig()
-        context = build_module_context()
-        model = construct_family_model(create_family_model, config, context=context)
-        with tempfile.TemporaryDirectory() as folder:
-            with self.assertRaisesRegex(ValueError, "prepare_model_components"):
-                prepare_direct_model_artifact(model, create_family_model, config, context, artifact_dir=folder)
-            model, _ = prepare_model_components(model, context)
-            prepare_direct_model_artifact(model, create_family_model, config, context, artifact_dir=folder)
-            generated = load_direct_model_entry(folder)
-            replica = generated(config, context=context)
-            x = torch.randn(3, 4)
-            torch.testing.assert_close(model(x), replica(x))
-            with self.assertRaisesRegex(ValueError, "signature changed"):
-                generated(replace(config, width=5), context=context)
-            def native(config: FamilyModelConfig, context: Mapping[str, Any]) -> nn.Module:
-                """Keep a valid native constructor deliberately local to this test.
-
-                Args:
-                    config: Complete logical model configuration.
-                    context: Read-only job context and effective model facts.
-                """
-                return create_family_model(config, context=context)
-            construct_family_model(native, config, context=context)
-            with self.assertRaisesRegex(ValueError, "stable importable"):
-                prepare_direct_model_artifact(model, native, config, context, artifact_dir=folder)
-
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
-        card_mark="onecard", essential_mark="essential",
-    )
     def test_new_spec_discovery_is_lazy_and_canonical(self):
         """Feature: Filesystem discovery loads one canonical MODEL_SPEC.
         Description: A model directory and its model_type filename may differ.
@@ -835,10 +793,10 @@ class TestModuleBuild(unittest.TestCase):
         plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
         card_mark="onecard", essential_mark="essential",
     )
-    def test_source_defaults_codegen_preserves_scope_and_reuses_shared_components(self):
-        """Feature: Source families use the same construction artifact and default declarations.
-        Description: A real tiny HF classifier is converted without user replacement YAML.
-        Expectation: Native and generated constructors install the same family and load identical state.
+    def test_source_defaults_preserve_effective_spec_and_numerical_behavior(self):
+        """Feature: Source models apply their default family declarations without replacement YAML.
+        Description: Build a real tiny HF classifier twice with an explicit per-build spec.
+        Expectation: Both builds select the family, preserve the spec and agree after loading identical state.
         """
         auto = importlib.import_module("hyper_parallel.models._transformers.auto_model")
         config = BertConfig.from_dict({"vocab_size": 16, "hidden_size": 8, "num_hidden_layers": 1,
@@ -846,23 +804,24 @@ class TestModuleBuild(unittest.TestCase):
                                        "architectures": ["BertForSequenceClassification"],
                                        "hidden_dropout_prob": 0.0, "attention_probs_dropout_prob": 0.0})
         spec = ModelAdapterSpec("BertForSequenceClassification", "bert", replacements=get_classifier_replacements)
-        with tempfile.TemporaryDirectory() as folder, \
-                patch.object(auto, "_current_device", return_value=torch.device("cpu")), \
+        with patch.object(auto, "_current_device", return_value=torch.device("cpu")), \
                 patch.object(auto, "resolve_effective_model_spec", wraps=resolve_effective_model_spec) as resolve_spec:
             model = HyperAutoModelForSequenceClassification.from_config(
                 config, model_spec=spec, torch_dtype=torch.float32,
             )
             self.assertIs(type(model.classifier), LocalLinear)
-            context = model._hp_module_build_context
-            prepare_direct_model_artifact(model, create_classifier_model, config, context, artifact_dir=folder)
-            replica = load_direct_model_entry(folder)(config, context=context)
+            self.assertIs(model._hp_model_adapter_spec, spec)
+            self.assertEqual(resolve_spec.call_count, 1)
+            replica = HyperAutoModelForSequenceClassification.from_config(
+                config, model_spec=spec, torch_dtype=torch.float32,
+            )
+            self.assertIs(type(replica.classifier), LocalLinear)
             replica.load_state_dict(model.state_dict())
             model.eval()
             replica.eval()
             inputs = torch.tensor([[1, 2, 3]])
             torch.testing.assert_close(model(inputs).logits, replica(inputs).logits)
-            self.assertTrue((Path(folder) / "family_manifest.json").exists())
-            self.assertEqual(resolve_spec.call_count, 1)
+            self.assertEqual(resolve_spec.call_count, 2)
 
     @arg_mark(
         plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
@@ -878,7 +837,6 @@ class TestModuleBuild(unittest.TestCase):
         family_registry._FAMILIES.clear()
         family_registry.register_module_family(replace(
             declaration, variants={**declaration.variants, "test_precision": declaration.variants["default"]},
-            local_variant_of={**declaration.local_variant_of, "test_precision": "default"},
             variant_rules=(*declaration.variant_rules, VariantRule(
                 {"kernel": "default", "precision": "test_precision", "parallel": False}, "test_precision")),
         ))
@@ -905,14 +863,14 @@ class TestModuleBuild(unittest.TestCase):
         class RequiredKeyword(nn.Module):
             """Minimal real computation with an explicit keyword-only operand."""
 
-            def forward(self, input: torch.Tensor, *, scale: float) -> torch.Tensor:
+            def forward(self, inputs: torch.Tensor, *, scale: float) -> torch.Tensor:
                 """Scale the input using the required operand.
 
                 Args:
-                    input: Local activations.
+                    inputs: Local activations.
                     scale: Required scaling factor.
                 """
-                return input * scale
+                return inputs * scale
 
         @module_replacement
         def preserve(*, module: nn.Module, module_fqn: str, context: Mapping[str, Any]) -> nn.Module:
@@ -943,26 +901,26 @@ class TestModuleBuild(unittest.TestCase):
         class OptionalScale(nn.Module):
             """A source stage whose second positional operand may be omitted."""
 
-            def forward(self, input: torch.Tensor, scale: float = 1.) -> torch.Tensor:
+            def forward(self, inputs: torch.Tensor, scale: float = 1.) -> torch.Tensor:
                 """Scale activations, defaulting to identity.
 
                 Args:
-                    input: Local activations.
+                    inputs: Local activations.
                     scale: Optional scaling factor.
                 """
-                return input * scale
+                return inputs * scale
 
         class RequiredScale(nn.Module):
             """An incompatible target that makes the optional operand mandatory."""
 
-            def forward(self, input: torch.Tensor, scale: float) -> torch.Tensor:
+            def forward(self, inputs: torch.Tensor, scale: float) -> torch.Tensor:
                 """Scale activations using a mandatory operand.
 
                 Args:
-                    input: Local activations.
+                    inputs: Local activations.
                     scale: Required scaling factor.
                 """
-                return input * scale
+                return inputs * scale
 
         @module_replacement
         def strengthen(*, module: nn.Module, module_fqn: str, context: Mapping[str, Any]) -> nn.Module:

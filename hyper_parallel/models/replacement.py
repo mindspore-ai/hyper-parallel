@@ -20,6 +20,7 @@ import fnmatch
 import inspect
 import logging
 import weakref
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
@@ -27,6 +28,7 @@ from typing import Any, Callable, Iterable, Optional
 
 from torch import nn
 
+from hyper_parallel.components.modules.family import resolve_module_family_target
 from hyper_parallel.components.modules.module_family import (
     FamilyRequest, _module_aliases, build_family, get_family_build_info, get_module_family,
 )
@@ -54,8 +56,8 @@ class ModuleReplacementMatchError(ValueError):
             item["reason"] == "matched_no_compatible_module" for item in unmatched
         ) else "matched no final module")
         super().__init__(
-            "module replacement pattern(s) matched no final module: "
-            f"{patterns} ({message}). Inspect the finalized module inventory and update the "
+            f"module replacement pattern(s) {message}: "
+            f"{patterns}. Inspect the finalized module inventory and update the "
             "adapter pattern; do not silently skip a required replacement."
         )
 
@@ -212,6 +214,7 @@ class ModuleReplacementRequest:
         origin: Diagnostic origin, assigned by the normalization layer.
         module_type: Optional source type constraint owned by model code.
         exact_type: Match only the exact declared source type.
+        declaration_id: Internal provenance retained for deterministic replacement snapshots.
     """
 
     match: tuple[str, ...]
@@ -224,6 +227,8 @@ class ModuleReplacementRequest:
 
     def __post_init__(self) -> None:
         _validate_module_match(self.match, self.module_type, self.exact_type)
+        if not isinstance(self.declaration_id, str):
+            raise TypeError("replacement request declaration_id must be a string")
         if not callable(self.target) or not getattr(self.target, "_hp_module_replacement", False):
             raise TypeError("replacement request target must use @module_replacement")
         reserved = {"module", "module_fqn", "context", "origin"} & set(self.kwargs)
@@ -396,7 +401,7 @@ def compile_module_replacements(
     """
 
     specs, defaults, overrides = tuple(specs), tuple(defaults), tuple(overrides)
-    if not (specs or defaults or overrides):
+    if not any((specs, defaults, overrides)):
         return ModuleReplacementPlan(())
 
     inventory = _module_aliases(model)
@@ -412,18 +417,28 @@ def compile_module_replacements(
         if identity in direct_ids or identity in explicit_ids:
             raise ValueError(f"explicit replacement conflict at {target.module_fqns}")
         selected.pop(identity, None)
-    targets = []
-    for module, request in selected.values():
-        spec = ModuleReplacementSpec(request.match, _factory_for_request(request),
-                                     request.module_type, request.exact_type, request=request,
-                                     replacement_target=_symbol_path(request.target), static_arguments=request.kwargs,
-                                     declaration_id=request.declaration_id)
-        targets.append(ModuleReplacementTarget(request.match, weakref.ref(module), spec))
+    targets = _request_replacement_targets(selected)
     targets.extend(opaque.values())
 
     _validate_non_nested_targets(tuple(targets))
     return ModuleReplacementPlan(tuple(targets), specs=tuple(target.spec for target in targets) if selected else specs,
                                  atomic=any(target.spec.request is not None for target in targets))
+
+
+def _request_replacement_targets(selected: dict) -> list[ModuleReplacementTarget]:
+    """Specialize final requests and assign stable identities to per-source declarations."""
+    targets = []
+    declaration_counts = Counter(request.declaration_id for _, request in selected.values())
+    for module, request in selected.values():
+        declaration_id = request.declaration_id
+        if declaration_id and declaration_counts[declaration_id] > 1:
+            declaration_id = f"{declaration_id}:{request.match[0]}"
+        spec = ModuleReplacementSpec(request.match, _factory_for_request(request),
+                                     request.module_type, request.exact_type, request=request,
+                                     replacement_target=_symbol_path(request.target), static_arguments=request.kwargs,
+                                     declaration_id=declaration_id)
+        targets.append(ModuleReplacementTarget(request.match, weakref.ref(module), spec))
+    return targets
 
 
 def _symbol_path(symbol: Any) -> str | None:
@@ -801,6 +816,7 @@ def apply_module_replacements(
 
 
 def _factory_for_request(request: ModuleReplacementRequest) -> ModuleReplacementFactory:
+    """Resolve a request target and bind selectors through the shared family resolver."""
     @module_replacement
     def factory(*, module: nn.Module, module_fqn: str, context: Mapping[str, Any]) -> nn.Module:
         """Construct one already-composed source boundary using its preserved request."""
@@ -810,7 +826,8 @@ def _factory_for_request(request: ModuleReplacementRequest) -> ModuleReplacement
                 FamilyRequest(request.target, request.kwargs),
                 module=module, module_fqn=module_fqn, context=context,
             )
-        return request.target(module=module, module_fqn=module_fqn, context=context, **request.kwargs)
+        constructor, arguments = resolve_module_family_target(request.target, request.kwargs)
+        return constructor(module=module, module_fqn=module_fqn, context=context, **arguments)
     return factory
 
 

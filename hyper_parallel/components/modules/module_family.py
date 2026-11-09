@@ -16,26 +16,22 @@
 
 from __future__ import annotations
 
-import hashlib
 import inspect
 from collections.abc import Mapping
 from copy import deepcopy
-from dataclasses import dataclass, fields, is_dataclass
-from importlib import import_module
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any, Callable
 
-import torch
 from torch import nn
 
 from hyper_parallel.components.modules.family import (
-    BackendSpec,
     ModuleFamily,
     SelectorSpec,
     VariantRule,
     _FAMILIES,
     _validate_deferred_arguments,
-    _validate_selector_value,
+    _select_variant,
     get_family_selector_specs,
     get_module_family,
     register_module_family,
@@ -44,12 +40,28 @@ from hyper_parallel.components.modules.family import (
 
 
 __all__ = [
-    "BackendSpec", "ModuleFamily", "SelectorSpec", "VariantRule", "FamilyRequest", "ResolvedFamily",
+    "ModuleFamily", "SelectorSpec", "VariantRule", "FamilyRequest", "ResolvedFamily",
     "FamilyBuildInfo", "FamilyBoundary", "register_module_family", "get_module_family",
     "get_family_selector_specs", "resolve_module_family_target", "resolve_family", "build_family",
     "get_family_build_info", "collect_family_modules", "validate_family_context",
-    "family_plan_snapshot",
+    "FamilyShardingContext",
 ]
+
+
+@dataclass(frozen=True)
+class FamilyShardingContext:
+    """Logical computation axes and global shapes; no communication resources."""
+
+    mesh_dim_names: tuple[str, ...]
+    axis_sizes: Mapping[str, int]
+    parameter_shapes: Mapping[str, tuple[int, ...]]
+    sequence_parallel: bool = False
+    loss_parallel: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "axis_sizes", MappingProxyType(dict(self.axis_sizes)))
+        object.__setattr__(self, "parameter_shapes", MappingProxyType(dict(self.parameter_shapes)))
+
 
 @dataclass(frozen=True)
 class FamilyRequest:
@@ -72,11 +84,9 @@ class ResolvedFamily:
 
     family: ModuleFamily
     variant: str
-    local_variant: str
     constructor: Callable
     arguments: Mapping[str, Any]
     selectors: Mapping[str, Any]
-    backend: str | None
     axis_sizes: Mapping[str, int]
 
     @property
@@ -86,13 +96,26 @@ class ResolvedFamily:
 
 
 @dataclass(frozen=True)
+class _FamilyLayout:
+    """Borrowed mesh and completed component layout, outside serialized requests."""
+
+    mesh: Any
+    sharding: Any
+    parallel: Any
+    parameter_shapes: Mapping[str, tuple[int, ...]]
+    source_shard_info: Mapping[str, Any]
+    applied: bool = True
+
+
+@dataclass(frozen=True)
 class FamilyBuildInfo:
-    """Immutable construction provenance; runtime bindings live outside this record."""
+    """Construction provenance and layout records; execution resources stay on the module."""
 
     request: FamilyRequest
     resolved: ResolvedFamily
     config_snapshot: Any
     origin: str
+    layout: _FamilyLayout | None = None
 
 
 @dataclass(frozen=True)
@@ -104,14 +127,8 @@ class FamilyBoundary:
     info: FamilyBuildInfo
 
 
-def _symbol(path: str) -> Any:
-    module_path, _, name = path.rpartition(".")
-    if not module_path or not name:
-        raise ValueError(f"expected a stable import path, got {path!r}")
-    return getattr(import_module(module_path), name)
-
-
 def _axis_sizes(context: Mapping[str, Any]) -> Mapping[str, int]:
+    """Read and validate logical parallel degrees from the construction context."""
     result = {}
     for axis in ("tp", "cp", "ep", "pp"):
         size = context.get(f"{axis}_size")
@@ -144,16 +161,14 @@ def _mesh_axis_size(mesh: Any, axis: str) -> int:
         raise ValueError(f"{axis}_size={size} requires an axis named {axis!r}; available mesh axes: {names!r}")
     return size
 
-def _same_mesh(first: Any, second: Any) -> bool:
-    """Compare borrowed job views without copying or reconstructing their groups."""
-    return (getattr(first, "device_mesh", first) is getattr(second, "device_mesh", second)
-            and getattr(first, "fsdp_moe_mesh", None) is getattr(second, "fsdp_moe_mesh", None))
 
 def _context_from_mesh(mesh: Any, context: Mapping[str, Any] | None) -> Mapping[str, Any]:
     """Read actual job axes without copying mesh resources into a request."""
     result = dict(context or {})
     if mesh is None:
-        return result
+        mesh = result.get("mesh")
+        if getattr(mesh, "device_mesh", None) is None:
+            return result
     device_mesh = getattr(mesh, "device_mesh", None)
     if device_mesh is None:
         raise ValueError("mesh requires a prebuilt device_mesh")
@@ -172,74 +187,33 @@ def _context_from_mesh(mesh: Any, context: Mapping[str, Any] | None) -> Mapping[
     return result
 
 
-def _resolve_backend(
-    family: ModuleFamily,
-    local_variant: str,
-    requested: str | None,
-    context: Mapping[str, Any],
-) -> str | None:
-    backend = requested if requested is not None else family.default_backends.get(local_variant)
-    if not family.backend_specs:
-        if backend is not None:
-            raise ValueError(f"family {family.name!r} does not declare backend {backend!r}")
-        return None
-    declaration = family.backend_specs.get(backend)
-    if declaration is None or local_variant not in declaration.local_variants:
-        raise ValueError(f"backend {backend!r} does not support local variant {local_variant!r}")
-    for key, allowed in (("device_type", declaration.device_types), ("dtype", declaration.dtypes)):
-        actual = context.get(key)
-        actual = str(actual).removeprefix("torch.") if actual is not None else None
-        if actual is not None and allowed and actual not in allowed:
-            raise ValueError(f"backend {backend!r} does not support {key}={actual!r}")
-    missing = set(context.get("features", ())) - declaration.features
-    if missing:
-        raise ValueError(f"backend {backend!r} does not support features {sorted(missing)}")
-    if declaration.implementation is not None:
-        _symbol(declaration.implementation)
-    return backend
-
-
 def resolve_family(request: FamilyRequest, *, context: Mapping[str, Any] | None = None) -> ResolvedFamily:
     """Resolve exactly one allowlisted member using the current job context.
 
     Args:
         request: Original family and explicit arguments.
-        context: Read-only logical topology and target numerical constraints.
+        context: Read-only job topology used for automatic CP/EP selection.
 
     Returns:
         Concrete construction information without allocating model resources.
     """
     family = get_module_family(request.target)
-    context = dict(context or {})
+    context = context or {}
     axes = _axis_sizes(context)
     args = deepcopy(dict(request.kwargs))
-    selectors = {name: args.pop(name, spec.default) for name, spec in family.selector_specs.items()}
-    for name, value in selectors.items():
-        _validate_selector_value(family, name, value)
-    selectors["parallel"] = family.parallel_axis is not None and axes[family.parallel_axis] > 1
-    defaults = {name: spec.default for name, spec in family.selector_specs.items()}
-    defaults["parallel"] = False
-    if selectors == defaults:
-        variant = family.default_variant
-    else:
-        matches = [rule.variant for rule in family.variant_rules if dict(rule.when) == selectors]
-        if len(matches) != 1:
-            raise ValueError(f"family {family.name!r} has no legal combination for {selectors}")
-        variant = matches[0]
-    local_variant = family.local_variant_of[variant]
-    backend = _resolve_backend(family, local_variant, args.pop("backend", None), context)
-    constructor = _symbol(family.variants[variant])
+    parallel = family.parallel_axis is not None and axes[family.parallel_axis] > 1
+    constructor, variant, selectors = _select_variant(family, args, parallel=parallel)
     if constructor is family.baseline:
         raise ValueError("a concrete family member cannot be its public factory")
     return ResolvedFamily(
-        family, variant, local_variant, constructor, MappingProxyType(args),
-        MappingProxyType(selectors), backend, axes,
+        family, variant, constructor, MappingProxyType(args), MappingProxyType(selectors), axes,
     )
 
 
 def _constructor_arguments(
     member: ResolvedFamily, config: Any, module: nn.Module | None, fqn: str, context: Mapping[str, Any],
 ) -> dict[str, Any]:
+    """Bind source or config construction arguments accepted by the selected member."""
     signature = inspect.signature(member.constructor)
     required = "config" if module is None else "module"
     if required not in signature.parameters:
@@ -249,8 +223,6 @@ def _constructor_arguments(
     if unknown:
         raise TypeError(f"member {member.variant!r} does not accept {sorted(unknown)}")
     runtime = {"config": config, "module": module, "module_fqn": fqn, "context": context}
-    if member.backend is not None:
-        runtime["backend"] = member.backend
     kwargs.update({name: value for name, value in runtime.items() if name in signature.parameters})
     signature.bind(**kwargs)
     return kwargs
@@ -309,16 +281,16 @@ def build_family(
     Args:
         target: Public family callable, registered name, or preserved request.
         config: Complete logical model configuration for direct construction.
-        mesh: Existing job mesh context used for concrete member selection.
+        mesh: Prebuilt job mesh context; select, shard and bind this component when supplied.
             Active CP requires a 'cp' axis in device_mesh. Active EP requires an 'ep' axis
             in fsdp_moe_mesh, or device_mesh when no expert view is supplied.
         module: Existing source module; mutually exclusive with config.
         module_fqn: Source path when converting an existing module.
-        context: Job topology and numerical constraints; omission initially selects local execution.
+        context: Optional job constraints; without mesh, may supply logical topology for selection.
         **kwargs: Explicit selectors and ordinary public factory arguments.
 
     Returns:
-        The runnable current member with its discoverable family request and construction provenance.
+        The concrete member with construction provenance. Logical/meta builds finish physical work at runtime.
     """
     request = _normalize_family_request(target, kwargs)
     arguments = dict(request.kwargs)
@@ -329,10 +301,15 @@ def build_family(
         request = FamilyRequest(request.target, arguments)
     if (config is None) == (module is None):
         raise ValueError("provide exactly one of config or module")
-    context = MappingProxyType(dict(_context_from_mesh(mesh, context)))
+    context = _context_from_mesh(mesh, context)
     member = resolve_family(request, context=context)
-    return _build_family_member(request, member, config=config, module=module,
-                                module_fqn=module_fqn, context=context)
+    result = _build_family_member(request, member, config=config, module=module,
+                                 module_fqn=module_fqn, context=context)
+    if mesh is not None:
+        # Layout discovery imports this module; defer its runtime dependency to avoid a cycle.
+        from hyper_parallel.distributed._builder.family_layout import _prepare_family_layout  # pylint: disable=C0415,R0401
+        _prepare_family_layout(result, mesh)
+    return result
 
 
 def get_family_build_info(module: nn.Module) -> FamilyBuildInfo | None:
@@ -343,6 +320,20 @@ def get_family_build_info(module: nn.Module) -> FamilyBuildInfo | None:
     """
     value = getattr(module, "_hp_family_build_info", None)
     return value if isinstance(value, FamilyBuildInfo) else None
+
+
+def _family_parameter_shapes(model: nn.Module) -> dict[str, tuple[int, ...]]:
+    """Return logical parameter shapes even after component construction localized weights."""
+    by_identity = {}
+    for boundary in collect_family_modules(model):
+        layout = boundary.info.layout
+        if layout is not None:
+            for name, shape in layout.parameter_shapes.items():
+                identity = id(boundary.module.get_parameter(name))
+                if by_identity.setdefault(identity, shape) != shape:
+                    raise ValueError(f"shared family parameter {name!r} has conflicting logical shapes")
+    return {name: by_identity.get(id(value), tuple(value.shape))
+            for name, value in model.named_parameters(remove_duplicate=False)}
 
 
 def _module_aliases(model: nn.Module) -> dict[int, tuple[nn.Module, tuple[str, ...]]]:
@@ -374,8 +365,10 @@ def validate_family_context(model: nn.Module, context: Mapping[str, Any]) -> Non
         model: Final or source model tree for this build.
         context: Read-only job context and effective model facts.
     """
-    axes = _axis_sizes(context)
+    axes = _axis_sizes(_context_from_mesh(None, context))
     for boundary in collect_family_modules(model):
+        if boundary.info.layout is not None and boundary.info.layout.applied:
+            _context_from_mesh(boundary.info.layout.mesh, context)
         member = boundary.info.resolved
         for axis in ("cp", "ep"):
             if member.axis_sizes[axis] != axes[axis]:
@@ -383,72 +376,61 @@ def validate_family_context(model: nn.Module, context: Mapping[str, Any]) -> Non
                     f"family at {boundary.fqns} was constructed with {axis}={member.axis_sizes[axis]}, "
                     f"job requires {axes[axis]}; call prepare_model_components with the job context before layout"
                 )
-        _resolve_backend(member.family, member.local_variant, member.backend, context)
 
 
-def _plain_callable(value: Callable) -> dict[str, str]:
-    """Serialize only an importable callable with stable implementation identity."""
-    name = getattr(value, "__qualname__", None)
-    if not isinstance(name, str):
-        raise ValueError("codegen requires stable importable callables")
-    path = f"{value.__module__}.{name}"
-    if "<" in path or _symbol(path) is not value:
-        raise ValueError("codegen requires stable importable callables")
-    return {"callable": path, "source_hash": _code_hash(value)}
+def _validate_applied_layout(cached: _FamilyLayout, spec: Any, fqn: str) -> None:
+    """Reject post-construction changes to a component's declared computation layout."""
+    original = cached.sharding
+    if any(name not in original.params or named != original.params[name] for name, named in spec.params.items()):
+        raise ValueError(f"layout at {fqn!r} conflicts with its constructed family layout")
+    for field_name in ("in_src", "in_dst", "out_src", "out_dst", "out_names", "is_boundary"):
+        if getattr(spec, field_name) != getattr(original, field_name):
+            raise ValueError(f"{field_name} at {fqn!r} conflicts with its constructed family layout")
 
 
-def _plain(value: Any) -> Any:
-    if value is None or isinstance(value, (str, bool, int, float)):
-        return value
-    if is_dataclass(value) and not isinstance(value, type):
-        return {field.name: _plain(getattr(value, field.name)) for field in fields(value)}
-    if isinstance(value, Mapping):
-        return {str(key): _plain(item) for key, item in value.items()}
-    if isinstance(value, (frozenset, set)):
-        return [_plain(item) for item in sorted(value, key=str)]
-    if isinstance(value, (tuple, list)):
-        return [_plain(item) for item in value]
-    if isinstance(value, (torch.dtype, torch.device)):
-        return str(value)
-    if hasattr(value, "to_dict"):
-        return _plain(value.to_dict())
-    if callable(value):
-        return _plain_callable(value)
-    raise ValueError(f"cannot serialize family value of type {type(value).__name__}")
-
-
-def family_plan_snapshot(model: nn.Module) -> list[dict[str, Any]]:
-    """Describe effective members for cache validation and checkpoint provenance.
-
-    Args:
-        model: Final or source model tree for this build.
-    """
-    records = []
+def _record_family_layouts(model, plan, mesh, shapes, source_shard_info, *, applied=True):
+    """Retain relative declarations once for constructor and model-level application."""
     for boundary in collect_family_modules(model):
-        info = boundary.info
-        member = info.resolved
-        records.append({
-            "fqns": list(boundary.fqns), "family": member.family.name, "version": member.family.version,
-            "origin": info.origin, "variant": member.variant,
-            "local_variant": member.local_variant, "backend": member.backend,
-            "selectors": dict(member.selectors), "axis_sizes": dict(member.axis_sizes),
-            "config": _plain(info.config_snapshot), "kwargs": _plain(info.request.kwargs),
-            "constructor": _plain(member.constructor), "sharding": _plain(member.sharding),
-            "backend_specs": _plain(member.family.backend_specs),
-            "default_backends": dict(member.family.default_backends),
-        })
-    return records
-
-
-def _code_hash(value: Callable) -> str:
-    """Include inherited algorithms while requiring external kernels to declare versions."""
-    definitions = value.__mro__ if isinstance(value, type) else (value,)
-    sources = []
-    for definition in definitions:
-        if definition is object or getattr(definition, "__module__", "").startswith("torch."):
+        fqn = boundary.fqns[0]
+        if fqn not in plan.modules or boundary.info.resolved.sharding is None:
             continue
-        try:
-            sources.append(inspect.getsource(definition))
-        except (OSError, TypeError):
-            sources.append(str(getattr(definition, "__qualname__", "")))
-    return hashlib.sha256("\n".join(sources).encode()).hexdigest()
+        existing = boundary.info.layout
+        if existing is not None and existing.applied:
+            continue
+        prefix = fqn + "." if fqn else ""
+        names = plan.modules[fqn].params
+        relative_shapes = {name: shapes[prefix + name] for name in names}
+        source = {name: source_shard_info[prefix + name] for name in names
+                  if source_shard_info is not None and prefix + name in source_shard_info}
+        layout = _FamilyLayout(mesh, deepcopy(plan.modules[fqn]), plan.parallel_modules.get(fqn),
+                              MappingProxyType(relative_shapes), MappingProxyType(source), applied)
+        boundary.module._hp_family_build_info = replace(boundary.info, layout=layout)  # pylint: disable=protected-access
+
+
+def _family_source_shard_info(model: nn.Module) -> dict[str, Any]:
+    """Gather constructed component source layouts under their final model paths."""
+    result = {}
+    for boundary in collect_family_modules(model):
+        layout = boundary.info.layout
+        if layout is not None and layout.applied:
+            for fqn in boundary.fqns:
+                result.update({f"{fqn}.{name}" if fqn else name: value
+                               for name, value in layout.source_shard_info.items()})
+    return result
+
+
+def _same_mesh(first: Any, second: Any) -> bool:
+    """Compare borrowed job views without copying or reconstructing their groups."""
+    return (getattr(first, "device_mesh", first) is getattr(second, "device_mesh", second)
+            and getattr(first, "fsdp_moe_mesh", None) is getattr(second, "fsdp_moe_mesh", None))
+
+
+def _family_mesh(model: nn.Module, mesh: Any) -> Any:
+    """Reuse the complete context when a caller passes its dense DeviceMesh view."""
+    layouts = [boundary.info.layout for boundary in collect_family_modules(model)
+               if boundary.info.layout is not None and boundary.info.layout.applied]
+    if not hasattr(mesh, "device_mesh"):
+        mesh = next((layout.mesh for layout in layouts if layout.mesh.device_mesh is mesh), mesh)
+    if any(not _same_mesh(layout.mesh, mesh) for layout in layouts):
+        raise ValueError("constructed families cannot be applied with a different job mesh")
+    return mesh

@@ -17,16 +17,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import importlib.util
-from pathlib import Path
 from typing import Any, Callable, Mapping
 
 import torch
 from torch import nn
-from transformers import AutoModelForSequenceClassification
 
 from hyper_parallel.components.modules.module_family import (
-    BackendSpec, ModuleFamily, SelectorSpec, VariantRule, build_family, get_module_family, register_module_family,
+    ModuleFamily, SelectorSpec, VariantRule, build_family, get_module_family, register_module_family,
 )
 from hyper_parallel.models.replacement import ModuleReplacementRequest, module_replacement
 
@@ -45,7 +42,7 @@ class LocalLinear(nn.Module):
 
     def __init__(
         self, *, config: LinearConfig | None = None, module: nn.Linear | None = None,
-        module_fqn: str = "", context: Mapping[str, Any] | None = None, backend: str = "torch",
+        module_fqn: str = "", context: Mapping[str, Any] | None = None,
     ) -> None:
         """Create logical weights or retain a source module's parameters."""
         super().__init__()
@@ -58,7 +55,6 @@ class LocalLinear(nn.Module):
             self.weight = nn.Parameter(torch.empty(config.output_size, config.width, dtype=config.dtype))
             self.bias = nn.Parameter(torch.empty(config.output_size, dtype=config.dtype))
             self.reset_parameters()
-        self.backend = backend
         self.module_fqn = module_fqn
 
     def reset_parameters(self) -> None:
@@ -67,7 +63,8 @@ class LocalLinear(nn.Module):
             self.weight.fill_(0.125)
             self.bias.fill_(0.25)
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    # Preserve the nn.Linear input keyword across local and parallel replacements.
+    def forward(self, input: torch.Tensor) -> torch.Tensor:  # pylint: disable=redefined-builtin
         """Evaluate the complete mathematical operation.
 
         Args:
@@ -105,7 +102,8 @@ class StatefulLocalLinear(LocalLinear):
         """
         self.samples_seen = state["samples_seen"]
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    # Preserve the nn.Linear input keyword across local and parallel replacements.
+    def forward(self, input: torch.Tensor) -> torch.Tensor:  # pylint: disable=redefined-builtin
         """Apply the stored output calibration to ordinary linear computation.
 
         Args:
@@ -127,7 +125,8 @@ class LocalLinearBlock(nn.Module):
         self.projection = LinearFamily(config=config, context=context)
         self.alias = self.projection
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    # Keep the input port shared with this fixture family's Linear layout provider.
+    def forward(self, input: torch.Tensor) -> torch.Tensor:  # pylint: disable=redefined-builtin
         """Use the nested family through an ordinary child call.
 
         Args:
@@ -140,21 +139,25 @@ class ParallelLinearBlock(LocalLinearBlock):
     """Parallel parent member retaining independent nested family ownership."""
 
 
-def LinearBlockFamily(*, config: LinearConfig, context: Mapping[str, Any] | None = None) -> nn.Module:
+# Public family entries retain constructor-style names for stable target paths.
+def LinearBlockFamily(  # pylint: disable=invalid-name
+    *, config: LinearConfig, context: Mapping[str, Any] | None = None,
+) -> nn.Module:
     """Construct the nested test family without source replacement."""
     return build_family(LinearBlockFamily, config=config, context=context)
 
 
+# Public family entries retain constructor-style names for stable target paths.
 @module_replacement
-def LinearFamily(
+def LinearFamily(  # pylint: disable=invalid-name
     *, config: LinearConfig | None = None, module: nn.Module | None = None,
     module_fqn: str = "", context: Mapping[str, Any] | None = None,
-    kernel: str = "default", precision: str = "inherit", backend: str | None = None,
+    kernel: str = "default", precision: str = "inherit",
 ) -> nn.Module:
     """One public callable shared by direct and source construction."""
     return build_family(
         LinearFamily, config=config, module=module, module_fqn=module_fqn, context=context,
-        kernel=kernel, precision=precision, backend=backend,
+        kernel=kernel, precision=precision,
     )
 
 
@@ -174,9 +177,6 @@ def register_linear_family(*, sharding: Callable | None = None, axis: str = "ep"
                   "mega": f"{prefix}.MegaLinear"},
         selector_specs={"kernel": SelectorSpec(str, "default"), "precision": SelectorSpec(str, "inherit")},
         variant_rules=rules, default_variant="default", parallel_axis=axis, sharding=sharding,
-        local_variant_of={"default": "default", "parallel": "default", "mega": "mega"},
-        backend_specs={"torch": BackendSpec(("default", "mega")), "alternate": BackendSpec(("default",))},
-        default_backends={"default": "torch", "mega": "torch"},
     ))
 
 
@@ -201,17 +201,13 @@ class FamilyModel(nn.Module):
             config=LinearConfig(config.width, config.output_size), context=context,
         )
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         """Compute model output through normal child-module calls.
 
         Args:
-            input: Input activation tensor.
+            inputs: Input activation tensor.
         """
-        return self.projection(input)
-
-
-class InheritedFamilyModel(FamilyModel):
-    """Importable factory inheriting its algorithm for artifact invalidation tests."""
+        return self.projection(inputs)
 
 
 def create_family_model(config: FamilyModelConfig, *, context: Mapping[str, Any]) -> FamilyModel:
@@ -227,24 +223,3 @@ def get_classifier_replacements(*, model: nn.Module, context: Mapping[str, Any])
     """Stable default source declaration for a small HF model acceptance test."""
     del model, context
     return (ModuleReplacementRequest(("classifier",), LinearFamily),)
-
-
-def load_direct_model_entry(artifact_dir: str) -> Callable:
-    """Load the generated entry without changing process-wide module registration.
-
-    Args:
-        artifact_dir: Directory containing the generated construction artifact.
-    """
-    path = Path(artifact_dir) / "modeling_family.py"
-    spec = importlib.util.spec_from_file_location("_hp_direct_model_artifact", path)
-    if spec is None or spec.loader is None:
-        raise ValueError(f"invalid direct model artifact at {artifact_dir!r}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.build_model
-
-
-def create_classifier_model(config: Any, *, context: Mapping[str, Any]) -> nn.Module:
-    """Construct an HF classifier for explicit cached-construction acceptance tests."""
-    del context
-    return AutoModelForSequenceClassification.from_config(config)

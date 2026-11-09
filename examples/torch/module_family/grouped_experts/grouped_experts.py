@@ -39,17 +39,16 @@ class GroupedExpertsModule(nn.Module):
     """Routed SwiGLU experts; the model owns routing and shared experts."""
 
     def __init__(self, *, config: DecoderConfig | None = None, module: nn.Module | None = None,
-                 context: Any = None, backend: str = "torch") -> None:
+                 context: Any = None) -> None:
         """Register logical parameters without acquiring parallel resources.
 
         Args:
             config: Complete global algorithm dimensions for direct construction.
             module: Compatible existing member for source conversion.
             context: Job selection facts, consumed by the family entry.
-            backend: Selected numerical implementation.
         """
         super().__init__()
-        del context, backend
+        del context
         self.config = config if module is None else module.config
         self.gate_up = nn.Parameter(torch.empty(self.config.num_experts, self.config.hidden_size,
                                                 2 * self.config.intermediate_size))

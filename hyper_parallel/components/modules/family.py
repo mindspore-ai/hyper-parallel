@@ -42,26 +42,6 @@ class VariantRule:
 
 
 @dataclass(frozen=True)
-class BackendSpec:
-    """Capabilities of one explicitly selected numerical implementation.
-
-    Attributes:
-        local_variants: Numerical variants supported by this backend.
-        device_types: Accepted device types; empty means unrestricted.
-        dtypes: Accepted dtype names; empty means unrestricted.
-        features: Supported source/config features when explicitly requested.
-        implementation: Optional import path checked only for the selected backend.
-    """
-
-    local_variants: tuple[str, ...]
-    device_types: tuple[str, ...] = ()
-    dtypes: tuple[str, ...] = ()
-    features: frozenset[str] = frozenset()
-    implementation: str | None = None
-    version: str = "1"
-
-
-@dataclass(frozen=True)
 class ModuleFamily:
     """One baseline and explicitly allowed construction-time alternatives."""
 
@@ -73,11 +53,7 @@ class ModuleFamily:
     default_variant: str | None = None
     parallel_axis: str | None = None
     sharding: Callable | None = None
-    backend_specs: Mapping[str, "BackendSpec"] = field(default_factory=dict)
-    default_backends: Mapping[str, str] = field(default_factory=dict)
-    local_variant_of: Mapping[str, str] = field(default_factory=dict)
     validate: Callable | None = None
-    version: str = "1"
 
 
 # Keep the baseline in the value so its identity cannot be reused while registered.
@@ -162,36 +138,6 @@ def _validate_family_rules(family: ModuleFamily) -> None:
         conditions.append(condition)
 
 
-def _validate_backend_entries(family: ModuleFamily, local_variants: set[str]) -> None:
-    """Validate static backend capabilities against concrete numerical members."""
-    for name, spec in family.backend_specs.items():
-        if not isinstance(name, str) or not name or not isinstance(spec, BackendSpec):
-            raise TypeError("backend_specs must map non-empty names to BackendSpec")
-        if not set(spec.local_variants) <= local_variants:
-            raise ValueError(f"backend {name!r} declares unknown local variants")
-    for variant, backend in family.default_backends.items():
-        if backend not in family.backend_specs or variant not in family.backend_specs[backend].local_variants:
-            raise ValueError(f"default backend {backend!r} does not support {variant!r}")
-
-
-def _validate_backends(family: ModuleFamily) -> None:
-    """Validate complete local-variant mappings without importing implementations."""
-    if family.default_variant is None:
-        if family.backend_specs or family.default_backends or family.local_variant_of:
-            raise ValueError("backend declarations require default_variant")
-        return
-    if set(family.local_variant_of) != set(family.variants):
-        raise ValueError("local_variant_of must cover every concrete variant")
-    local_variants = set(family.local_variant_of.values())
-    if not local_variants <= set(family.variants):
-        raise ValueError("local_variant_of must reference concrete numerical variants")
-    if not isinstance(family.version, str) or not family.version:
-        raise ValueError("family version must be a non-empty string")
-    if family.backend_specs and set(family.default_backends) != local_variants:
-        raise ValueError("default_backends must cover every local variant")
-    _validate_backend_entries(family, local_variants)
-
-
 def register_module_family(family: ModuleFamily) -> None:
     """Register a checked snapshot for an exact baseline callable.
 
@@ -205,14 +151,10 @@ def register_module_family(family: ModuleFamily) -> None:
     if id(family.baseline) in _FAMILIES:
         raise ValueError(f"Module family already registered: {family.name}")
     _validate_family_rules(family)
-    _validate_backends(family)
     snapshot = replace(
         family,
         variants=MappingProxyType(dict(family.variants)),
         selector_specs=MappingProxyType(dict(family.selector_specs)),
-        backend_specs=MappingProxyType(dict(family.backend_specs)),
-        default_backends=MappingProxyType(dict(family.default_backends)),
-        local_variant_of=MappingProxyType(dict(family.local_variant_of)),
         variant_rules=tuple(
             VariantRule(MappingProxyType(dict(rule.when)), rule.variant) for rule in family.variant_rules
         ),
@@ -276,22 +218,32 @@ def normalize_family_selectors(target: Callable, arguments: Mapping) -> dict:
     return args
 
 
-def _select_variant(family: ModuleFamily, args: dict) -> Callable:
-    """Consume selectors and accept only the baseline defaults or one full rule."""
+def _select_variant(
+    family: ModuleFamily, args: dict, *, parallel: bool = False,
+) -> tuple[Callable, str | None, dict[str, Any]]:
+    """Consume target selectors and resolve one concrete constructor for both entry paths."""
     selectors = {name: args.pop(name, spec.default) for name, spec in family.selector_specs.items()}
     for name, value in selectors.items():
         _validate_selector_value(family, name, value)
     defaults = {name: spec.default for name, spec in family.selector_specs.items()}
+    if family.default_variant is not None:
+        selectors["parallel"] = parallel
+        defaults["parallel"] = False
     if selectors == defaults:
-        return family.baseline
-    matches = [rule for rule in family.variant_rules if selectors == dict(rule.when)]
-    if len(matches) != 1:
-        legal = [defaults, *(dict(rule.when) for rule in family.variant_rules)]
-        raise ValueError(
-            f"ModuleFamily {family.name}: unsupported selector combination {selectors}; " f"legal combinations: {legal}"
-        )
-    module_path, _, name = family.variants[matches[0].variant].rpartition(".")
-    return getattr(import_module(module_path), name)
+        variant = family.default_variant
+    else:
+        matches = [rule.variant for rule in family.variant_rules if selectors == dict(rule.when)]
+        if len(matches) != 1:
+            legal = [defaults, *(dict(rule.when) for rule in family.variant_rules)]
+            raise ValueError(
+                f"ModuleFamily {family.name}: unsupported selector combination {selectors}; legal combinations: {legal}"
+            )
+        variant = matches[0]
+    constructor = family.baseline
+    if variant is not None:
+        module_path, _, name = family.variants[variant].rpartition(".")
+        constructor = getattr(import_module(module_path), name)
+    return constructor, variant, selectors
 
 
 def resolve_module_family_target(target: Callable, arguments: Mapping) -> tuple[Callable, dict]:
@@ -312,7 +264,7 @@ def resolve_module_family_target(target: Callable, arguments: Mapping) -> tuple[
     if family.default_variant is not None:
         _validate_deferred_arguments(family, args)
         return target, args
-    target = _select_variant(family, args)
+    target, _, _ = _select_variant(family, args)
     target_signature = signature(target)
     allowed = {
         name
@@ -332,9 +284,6 @@ def _validate_deferred_arguments(family: ModuleFamily, args: Mapping[str, Any]) 
     unknown = set(args) - allowed
     if unknown:
         raise TypeError(f"ModuleFamily {family.name}: unknown replacement arguments: {sorted(unknown)}")
-    for name, spec in family.selector_specs.items():
+    for name in family.selector_specs:
         if name in args:
             _validate_selector_value(family, name, args[name])
-    if "backend" in args and args["backend"] is not None:
-        if not isinstance(args["backend"], str) or args["backend"] not in family.backend_specs:
-            raise ValueError(f"ModuleFamily {family.name}: unknown backend {args['backend']!r}")

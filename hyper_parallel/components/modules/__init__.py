@@ -70,8 +70,9 @@ _EXPORT_TO_MODULE = {
     "SwiGLUMLP": "swiglu_mlp",
 }
 _EXPORT_TO_MODULE.update({name: "module_family" for name in (
-    "BackendSpec", "ModuleFamily", "SelectorSpec", "VariantRule", "FamilyRequest", "ResolvedFamily",
+    "ModuleFamily", "SelectorSpec", "VariantRule", "FamilyRequest", "ResolvedFamily",
     "build_family", "register_module_family", "get_family_build_info", "collect_family_modules",
+    "FamilyShardingContext",
 )})
 __all__.extend(_EXPORT_TO_MODULE)
 

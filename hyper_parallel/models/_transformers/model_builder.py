@@ -61,8 +61,10 @@ from hyper_parallel.distributed._builder.fsdp_adapter import (
 )
 from hyper_parallel.distributed.mesh import DistributedSetup, MeshContext
 from hyper_parallel.distributed.apply import apply_sharding_plan
+from hyper_parallel.distributed.module_binding import validate_materialized_modules
 from hyper_parallel.distributed._builder.planner import ShardingPlanner
 from hyper_parallel.models.registry import _resolve_custom_model_cls, resolve_model_adapter
+from hyper_parallel.components.modules.module_family import collect_family_modules
 from hyper_parallel.models.module_build import (
     attach_build_context, build_module_context, prepare_model_components, resolve_effective_model_spec,
 )
@@ -238,6 +240,14 @@ def _init_model(
     return True, model
 
 
+def _has_module_owned_layouts(model):
+    """Family/native declarations remain active even for a size-one job."""
+    spec = resolve_model_adapter(model)
+    if spec is not None and (spec.sharding is not None or spec.native_parallel is not None):
+        return True
+    return any(boundary.info.resolved.sharding is not None for boundary in collect_family_modules(model))
+
+
 def _plan_and_apply_sharding(
     model: nn.Module,
     mesh,
@@ -253,7 +263,7 @@ def _plan_and_apply_sharding(
     if (
         sharding_planner is None
         or mesh is None
-        or (is_hf_model and not model_sharding_requested)
+        or (is_hf_model and not model_sharding_requested and not _has_module_owned_layouts(model))
     ):
         return model, None
     if mesh.device_mesh is None:
@@ -339,12 +349,16 @@ def _initialize_model_weights(model: nn.Module) -> None:
     logger.info("Initialized model state with model-native random initialization")
 
 
-def _build_replacement_context(
-    distributed_setup: Any,
-    low_precision_config: Any,
-) -> dict[str, Any]:
-    """Build the replacement-factory context from the resolved setup."""
-    return dict(build_module_context(distributed_setup, low_precision_config=low_precision_config))
+def _apply_model_method_replacements(model: nn.Module, distributed_setup: Any, low_precision_config: Any) -> None:
+    """Apply configured methods using the prepared model's logical context."""
+    rules = getattr(distributed_setup, "method_replacements", None) or ()
+    if not rules:
+        return
+    context = getattr(model, "_hp_module_build_context", None)
+    if context is None:
+        context = build_module_context(distributed_setup, low_precision_config=low_precision_config)
+    context = {**context, "mesh_context": getattr(distributed_setup, "mesh_context", None)}
+    apply_method_replacements(model, rules, context=context)
 
 
 def _apply_pre_sharding_features(
@@ -709,19 +723,11 @@ def apply_model_infrastructure(
     if freeze_config is not None:
         _apply_parameter_freezing(model, freeze_config)
 
-    method_replacements = getattr(distributed_setup, "method_replacements", None) or ()
-    if method_replacements:
-        method_context = _build_replacement_context(distributed_setup, low_precision_config)
-        method_context["mesh_context"] = getattr(distributed_setup, "mesh_context", None)
-        apply_method_replacements(model, method_replacements, context=method_context)
+    _apply_model_method_replacements(model, distributed_setup, low_precision_config)
 
     # Steps 7-8: plan and apply parameter/activation layouts.
     model, source_shard_info = _plan_and_apply_sharding(
-        model,
-        mesh,
-        sharding_planner,
-        is_hf_model,
-        validate_placement,
+        model, mesh, sharding_planner, is_hf_model, validate_placement,
     )
 
     model = _apply_activation_features(
@@ -736,17 +742,14 @@ def apply_model_infrastructure(
     model = _apply_fsdp2_with_external(model, fsdp2_manager, source_shard_info, external)
 
     model = _materialize_and_load_model(
-        model,
-        is_meta_device=is_meta_device,
-        device=device,
-        load_base_model=load_base_model,
-        pretrained_path=pretrained_path,
-        weights_mapping=weights_mapping,
+        model, is_meta_device=is_meta_device, device=device,
+        load_base_model=load_base_model, pretrained_path=pretrained_path, weights_mapping=weights_mapping,
     )
 
     # Final dtype conversion belongs to the atomic build (05 stage-5 item
     # 5): the Trainer never patches model dtype after construction.
     apply_model_init_dtype(model, model_init_dtype)
+    validate_materialized_modules(model)
     if external is not None:
         external.check_identities()
 

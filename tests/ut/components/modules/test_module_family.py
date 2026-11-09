@@ -14,7 +14,10 @@
 # ============================================================================
 """Numerical and lifecycle acceptance of direct and deferred family construction."""
 
+from __future__ import annotations
+
 from dataclasses import replace
+from typing import Any, Mapping
 import unittest
 from unittest.mock import patch
 
@@ -23,13 +26,22 @@ from torch import nn
 
 from hyper_parallel.components.modules import family as registry
 from hyper_parallel.components.modules.module_family import (
-    FamilyRequest, family_plan_snapshot, get_family_build_info, validate_family_context,
+    FamilyRequest, build_family, collect_family_modules, get_family_build_info, validate_family_context,
 )
 from hyper_parallel.trainer.config.replacement import ReplacementTarget
 from tests.common.mark_utils import arg_mark
 from tests.common.module_family_fixtures import (
     LinearConfig, LinearFamily, LocalLinear, MegaLinear, ParallelLinear, register_linear_family,
 )
+
+
+def BackendLinear(
+    *, config: LinearConfig | None = None, module: nn.Module | None = None, module_fqn: str = "",
+    context: Mapping[str, Any] | None = None, backend: str = "torch",
+) -> nn.Module:
+    """Test that backend is an ordinary target selector consumed before construction."""
+    return build_family(BackendLinear, config=config, module=module, module_fqn=module_fqn,
+                        context=context, backend=backend)
 
 
 class TestModuleFamilyConstruction(unittest.TestCase):
@@ -96,20 +108,38 @@ class TestModuleFamilyConstruction(unittest.TestCase):
         plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
         card_mark="onecard", essential_mark="essential",
     )
-    def test_backend_is_static_and_inherited_by_parallel_member(self):
+    def test_backend_target_argument_selects_the_concrete_module(self):
         """
-        Feature: Explicit backend contracts.
-        Description: Parallel selection keeps the chosen local backend and rejects undeclared combinations.
-        Expectation: No installed-package probing or fallback changes an effective backend.
+        Feature: Backend uses the same target-argument selection as kernel and precision.
+        Description: Select concrete classes through direct construction and replacement in local and EP jobs.
+        Expectation: Both entries select the declared class without forwarding a backend label to its constructor.
         """
-        member = LinearFamily(config=LinearConfig(), backend="alternate", context={"ep_size": 2})
-        self.assertIs(type(member), ParallelLinear)
-        self.assertEqual(member.backend, "alternate")
-        with self.assertRaisesRegex(ValueError, "does not support"):
-            LinearFamily(config=LinearConfig(), kernel="megakernel", backend="alternate")
-        with self.assertRaisesRegex(ValueError, "unknown backend"):
-            LinearFamily(config=LinearConfig(), backend="missing")
-        with self.assertRaisesRegex(ValueError, "no legal combination"):
+        declaration = registry.get_module_family(LinearFamily)
+        registry.register_module_family(replace(
+            declaration, name="backend_linear", baseline=BackendLinear,
+            selector_specs={"backend": registry.SelectorSpec(str, "torch")},
+            variant_rules=(
+                registry.VariantRule({"backend": "torch", "parallel": True}, "parallel"),
+                registry.VariantRule({"backend": "alternate", "parallel": False}, "mega"),
+                registry.VariantRule({"backend": "alternate", "parallel": True}, "mega"),
+            ),
+        ))
+        for size, backend, expected in ((1, "torch", LocalLinear), (2, "torch", ParallelLinear),
+                                        (1, "alternate", MegaLinear), (2, "alternate", MegaLinear)):
+            with self.subTest(ep_size=size, backend=backend):
+                direct = BackendLinear(config=LinearConfig(), backend=backend, context={"ep_size": size})
+                source = nn.Linear(4, 3)
+                source.load_state_dict(direct.state_dict())
+                target = ReplacementTarget(BackendLinear, target_path=f"{__name__}.BackendLinear", backend=backend)
+                converted = target.build(module=source, context={"ep_size": size})
+                self.assertIs(type(direct), expected)
+                self.assertIs(type(converted), expected)
+                self.assertIs(converted.weight, source.weight)
+                torch.testing.assert_close(direct(torch.ones(2, 4)), converted(torch.ones(2, 4)))
+                self.assertEqual(get_family_build_info(direct).resolved.arguments, {})
+        with self.assertRaisesRegex(ValueError, "unsupported selector combination"):
+            BackendLinear(config=LinearConfig(), backend="missing")
+        with self.assertRaisesRegex(ValueError, "unsupported selector combination"):
             LinearFamily(config=LinearConfig(), precision="unimplemented")
 
     @arg_mark(
@@ -155,22 +185,27 @@ class TestModuleFamilyConstruction(unittest.TestCase):
         plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
         card_mark="onecard", essential_mark="essential",
     )
-    def test_snapshot_includes_defaults_and_preserves_aliases(self):
+    def test_boundaries_preserve_aliases_and_effective_target_selectors(self):
         """
         Feature: Reproducible family metadata.
-        Description: Shared module paths and backend defaults participate in cache validation.
-        Expectation: Alias paths are discoverable and changing a declaration changes the effective snapshot.
+        Description: Shared module paths and target arguments remain visible on the effective member.
+        Expectation: One boundary owns both aliases and a target argument selects its concrete constructor directly.
         """
         model = nn.Module()
         model.first = LinearFamily(config=LinearConfig())
         model.second = model.first
-        initial = family_plan_snapshot(model)
-        declaration = registry.get_module_family(LinearFamily)
-        registry._FAMILIES.clear()
-        registry.register_module_family(replace(
-            declaration, default_backends={"default": "alternate", "mega": "torch"},
-        ))
+        boundaries = collect_family_modules(model)
+        self.assertEqual(len(boundaries), 1)
+        boundary = boundaries[0]
+        self.assertEqual(boundary.fqns, ("first", "second"))
+        self.assertIs(boundary.info.resolved.constructor, LocalLinear)
+        self.assertEqual(boundary.info.resolved.selectors["kernel"], "default")
         newer = nn.Module()
-        newer.first = LinearFamily(config=LinearConfig())
+        newer.first = LinearFamily(config=LinearConfig(), kernel="megakernel")
         newer.second = newer.first
-        self.assertNotEqual(initial, family_plan_snapshot(newer))
+        updated_boundaries = collect_family_modules(newer)
+        self.assertEqual(len(updated_boundaries), 1)
+        updated = updated_boundaries[0]
+        self.assertEqual(updated.fqns, boundary.fqns)
+        self.assertIs(updated.info.resolved.constructor, MegaLinear)
+        self.assertEqual(updated.info.resolved.selectors["kernel"], "megakernel")

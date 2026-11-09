@@ -106,7 +106,7 @@ def test_native_replacement_records_declaration_and_application_once():
     session.record_source({"model_type": "toy"})
 
     plan = compile_module_replacements(model, (spec,))
-    with _observe_replacement_installations(model, plan.specs) as applications:
+    with _observe_replacement_installations(plan.specs) as applications:
         apply_module_replacements(model, plan, context={"ep": True})
     session.record_replacements(
         declarations=replacement_api.describe_replacement_declarations(plan.specs),
@@ -163,7 +163,7 @@ def test_python_replacement_rule_gets_stable_order_fallback():
     applications = []
 
     plan = compile_module_replacements(model, (spec,))
-    with _observe_replacement_installations(model, plan.specs) as applications:
+    with _observe_replacement_installations(plan.specs) as applications:
         apply_module_replacements(model, plan)
 
     declarations = replacement_api.describe_replacement_declarations(plan.specs)
@@ -185,7 +185,7 @@ def test_inferred_source_type_is_recorded_from_native_application():
     session.record_source({"model_type": "toy"})
 
     plan = compile_module_replacements(model, (spec,))
-    with _observe_replacement_installations(model, plan.specs) as applications:
+    with _observe_replacement_installations(plan.specs) as applications:
         apply_module_replacements(model, plan)
     session.record_replacements(
         declarations=replacement_api.describe_replacement_declarations(plan.specs),
@@ -263,11 +263,12 @@ def test_unmatched_rule_is_recorded_before_native_error_is_raised():
 
 
 def test_replacement_observer_restores_native_installer_after_error():
+    """Failed observation restores the native installer and leaves no partial replacement record."""
     original_prepare = replacement_api._prepare_replacement_target
     original_install = replacement_api._install_module_candidates
 
     with pytest.raises(RuntimeError, match="probe"):
-        with _observe_replacement_installations(nn.Module(), ()):
+        with _observe_replacement_installations(()):
             assert replacement_api._prepare_replacement_target is not original_prepare
             assert replacement_api._install_module_candidates is not original_install
             raise RuntimeError("probe")

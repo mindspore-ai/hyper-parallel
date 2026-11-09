@@ -242,7 +242,8 @@ if __name__ == '__main__':
         test_suite="tests",
         packages=find_packages(exclude=["*tests*"]) + find_namespace_packages(
             include=["hyper_parallel.rl", "hyper_parallel.rl.rl", "hyper_parallel.rl.rl.*",
-                     "hyper_parallel.rl.examples", "hyper_parallel.rl.examples.*"],
+                     "hyper_parallel.rl.examples", "hyper_parallel.rl.examples.*",
+                     "examples.torch.module_family", "examples.torch.module_family.*"],
         ),
         platforms=[get_platform()],
         include_package_data=True,
