@@ -15,19 +15,19 @@
 %%{init: {"themeVariables": {"fontSize": "22px"}, "flowchart": {"nodeSpacing": 25, "rankSpacing": 35}}}%%
 flowchart TB
     subgraph CONFIG["配置与生命周期｜控制何时、在哪采集"]
-        C["monitor 配置【新增】<br/>开关 / 频次 / global rank / module / sinks"]
+        C["monitor 配置【新增】<br/>开关 / 采样频次 / module / sinks"]
     end
     subgraph COLLECT["现场采集｜只提供原始统计，详见下面分块"]
         H["计时 · loss / grad norm · 数据量<br/>ExpertLoadRecorder · Muon NS · FLOPs<br/>设备显存沿用现状"]
     end
     subgraph AGG["汇总层｜统一口径，不负责模型内部采集"]
         M["EnvironMeterCallback【改造】<br/>消费本步统计 / 累计量 / 吞吐与 MFU"]
-        S["统一快照【新增】<br/>step / rank / module / 单位 / 数值 / 采样时机"]
+        S["统一快照【新增】<br/>异步完成后就绪，保留原采样 step<br/>rank / module / 单位 / 数值 / 采样时机"]
         M --> S
     end
     subgraph OUTPUT["输出层｜消费同一份数据，不重复计算"]
         L["LoggingCallback【改造】<br/>响应外部日志触发 / 去重 / 渠道分发"]
-        W["共享输出适配器【新增】<br/>Console / JSONL / TensorBoard / WandB"]
+        W["共享输出适配器【新增】<br/>有界异步队列 / 外部日志触发<br/>Console / JSONL / TensorBoard / WandB"]
         L --> W
     end
     C --> H --> M
@@ -75,7 +75,7 @@ flowchart TB
     end
     subgraph METER["紫色 · step 汇总【改造】"]
         M1["EnvironMeterCallback<br/>汇合本步采集结果与 recorder 结果"]
-        M2["累计 samples / tokens、吞吐<br/>模型 FLOPs estimator + 峰值配置 → MFU"]
+        M2["累计 samples / tokens、吞吐<br/>标准模块 FLOPs 分项求和 + 设备峰值 → MFU"]
         M3["冻结本步快照 → LoggingCallback<br/>未采样指标省略，不沿用旧值"]
         M1 --> M2 --> M3
     end
@@ -132,7 +132,7 @@ flowchart TB
 | 改造 | `EnvironMeterCallback` | 统一 step 指标出口，接入 recorder/计时结果；不承载所有现场采集逻辑 |
 | 改造 | `LoggingCallback` | 直接分发结构化记录；router aux loss 移到共享快照，不再由日志独享 |
 | 增加 | 启动/分块计时器 | 分布式组网、模型构建、ckpt 加载、数据处理、训练块与保存耗时 |
-| 增加 | local loss / module grad norm 采集 | 独立开关、打印频次、global rank；module 筛选仅用于 grad norm |
+| 增加 | local loss / module grad norm 采集 | 独立开关、采样频次、全 rank 采集；module 筛选仅用于 grad norm |
 | 增加 | `ExpertLoadRecorder` | 逐层 expert load、max_vio、可用的 drop 与分布 |
 | 增加 | Muon NS 采集 | 在 NS 输出位置记录 norm，不改变更新算法 |
 | 扩展 | 数据、FLOPs 统计 | 计数语义、续训累计量、模型适配和可信 MFU |
@@ -149,6 +149,8 @@ flowchart TB
 - **训练流程中的 Recorder 不影响训练性能及显存：**作为实现与验收约束，关闭或未采样时不执行额外 tensor 计算、拷贝、统计通信或设备同步；启用采样后优先复用已有统计，采用有界缓冲，不滞留计算图或大 tensor。以同配置对照实测确认吞吐、step 耗时及峰值显存无超出测量波动的退化，且长跑显存不持续增长；未达标的采集项必须优化或降采样后重新验收，不能仅凭 Recorder 封装宣称零开销。
 - 不保留 batch、大 activation、router logits、完整梯度副本或计算图。
 - 字段和配置兼容迁移必须显式，缺少指标不伪造零值。
+- **Hook 必须计入开销预算：**优先复用已有生命周期/计数，确需 hook 时只注册必要采集点。未采样时的 Python 回调分派、GIL、图编译 graph break 和重计算重复触发也需要对照测量，不能把“没有 tensor 运算”当作零开销。
+- **允许异步采集与输出：**在 tensor 有效期间生成有界摘要；异步 D2H、CPU 汇总/落盘可以与训练重叠，但必须满足 stream/event 与缓冲生命周期约束，不改变训练同步语义。方案与降级边界见第 2.1 节。
 
 ### 1.3 最终 YAML 配置形态（设计草案）
 
@@ -159,47 +161,28 @@ flowchart TB
 ```yaml
 monitor:
   enabled: true
-  sinks: [console, jsonl]  # 可选增加 tensorboard、wandb；默认不启用远端输出
+  sinks: [console, jsonl]  # 可选 tensorboard、wandb；不默认上传
   output_dir: ./outputs/metrics
+  timing: true
+  mfu: false  # 标准模块分块估算；已有 log_tflops 保持原入口
 
-  timing: true  # 启动、训练分块、权重加载/保存及 checkpoint 耗时
-  mfu: false  # 新增 MFU 利用率；复用已有 FLOPs 估算与 step 耗时
-
-  wandb:  # 仅在 sinks 包含 wandb 时生效；否则不初始化 SDK 或上传
+  wandb:  # 仅 sinks 包含 wandb 时生效
     project: hyper-parallel
-    entity: null
     mode: online
-    run_id: null
-    resume: never  # 续训时指定原 run_id，并设置 must
 
   local_loss:
     enabled: false
-    ranks: [0]
     sampler_steps: 100
-    granularity: both
-    micro_steps: all
 
   local_grad_norm:
     enabled: false
-    ranks: [0]
     sampler_steps: 100
-    capture: post_reduce_pre_clip
-    norm_type: 2
-    include_children: true
-    include_experts: true
-    modules:
-      - match: exact
-        pattern: "model.layers.0"  # 按实际模型规范路径设置
+    modules: []  # 空列表统计整体；可选规范 module 路径，包含其子模块参数
 
   moe:
     enabled: false
     sampler_steps: 100
-    recorder: expert_load
-    scope: global  # local 不增加统计通信；global 按注册布局归约
-    modules: []  # 空列表表示全部已注册且支持统计的 MoE 层
-    per_layer: false  # false 仅输出汇总，但内部仍按层计算 max_vio
     record_distribution: false
-    flush: true  # 输出时消费并清理本次采样缓冲
 
   optimizer:
     ns_norm:
@@ -207,14 +190,21 @@ monitor:
       sampler_steps: 100
 
   datasets:
-    ranks: [0]  # global rank；详细统计默认仅反映所选 rank
-    sampler_steps: 100  # 采样 step 内汇总全部 micro-batch
-    token_distribution: true  # input/有效监督长度分布、padding/ignored 占比
-    top_n_tokens: 20  # 非 padding 输入 token 的频次 Top-N；0 表示关闭
-    packing_stats: true  # 拼接数、填充率、截断与 segment 长度
-    packing_boundary_check: true  # 采样检查边界、position、attention 与 label 对齐
+    sampler_steps: 100
+    token_distribution: true
+    top_n_tokens: 20  # 0 关闭
+    packing_stats: true
+    packing_boundary_check: true
     log_first_rendered_template: false
 ```
+
+精简原则：只暴露功能开关、采样间隔和必要的筛选/输出参数，不把内部生命周期作为配置。
+开启的指标由所有实际持有相应数据的 rank 采集，不重复配置 `ranks`；PP 不持有 loss 的 stage 不制造 loss。
+local loss 固定记录采样 step 的全部 micro-batch 及整步汇总；local norm 固定 L2、规约后裁剪前。
+module 子树参数按身份去重，包含该子树中的 expert 参数；不提供 `include_children`、`include_experts`。
+MoE 固定采集全部已注册层的本地计数，按布局形成逐层全局结果，生命周期自动清理缓冲；
+不暴露 recorder 类型、scope、per_layer、flush 或子模块递归开关。输出记录仍保留 scope/rank 元数据。
+WandB 的 entity/run ID/resume 等复用既有外部实验管理入口，不在 monitor 重复定义。
 
 ## 2. 分模块设计
 
@@ -236,7 +226,7 @@ monitor:
 - recorder 在相应执行位置采集，必须先 finalize，再由 meter 汇总，最后 logging 消费。
 - 新数据契约、采样计划可置于候选 `trainer/runtime/monitor/`，不把模型实现导入通用日志模块。
 - 启动事件不伪装成 step 0；未采样值不沿用上一轮结果冒充当前值。
-- 配置中的 global rank/module 过滤与集合通信参与条件分开；不能因不打印而跳过必需通信。
+- 所有持有指标的 rank 参与采集；module 选择不改变必要通信的参与集合。global rank 0 是汇总输出角色，不是唯一采集者。
 
 **验收**
 
@@ -254,7 +244,7 @@ monitor:
 | 采集对象 | 专用 recorder（候选名称） | 现场与保留数据 |
 | --- | --- | --- |
 | local / micro loss | `LossRecorder` | loss 产生处；只保留脱离计算图的标量统计 |
-| local / module grad norm | `GradNormRecorder` | 明确的规约前或规约后裁剪前位置；复用已有 norm 或按需计算，不复制完整梯度 |
+| local / module grad norm | `GradNormRecorder` | 本期规约后裁剪前显式采集；复用已有 norm 或按需计算，不复制完整梯度 |
 | EP expert load | `ExpertLoadRecorder` | router/dispatch；只保留 expert 计数小向量 |
 | Muon NS norm | `OptimizerStatsRecorder` | NS 输出现场；计算统计后立即释放中间矩阵引用 |
 | token 长度、重复度、Top-N、模板样本 | `DatasetStatsRecorder` | 数据处理/batch 现场；有界摘要或限长样本，不缓存完整 batch |
@@ -264,7 +254,7 @@ monitor:
 
 **共用执行边界**
 
-1. 初始化时解析 module/rank 筛选并注册必要采集点；关闭时不注册额外 hook 或分配统计 buffer。
+1. 初始化时解析 module 选择并注册必要采集点；所有拥有该指标的 rank 按一致计划采集，关闭时不注册额外 hook 或分配统计 buffer。
 2. step 开始按 `sampler_steps` 决定是否采集，在训练现场执行新增 tensor 运算之前检查采样开关；未采样时不计算后丢弃。
 3. 优先复用训练已有统计；必要时在现场计算小型摘要。`detach()` 仅断开计算图，仍可能共享大 tensor 的存储，不能据此允许长期保存切片或原 tensor。
 4. 热路径不逐 micro-step/layer 执行 `.item()`、`.cpu()` 或打印设备 tensor。按既定完成边界批量取得摘要；如需跨流读取，明确 event/wait，不能读未完成结果。
@@ -281,12 +271,80 @@ monitor:
 - 覆盖重计算、梯度累积、PP micro-batch、重复 finalize、异常中止与续训；无重复采集、计算图滞留或失效 tensor 引用。
 - 先独立验收每个 recorder，再验证组合开关；以相同训练配置对照 loss/梯度/更新结果，允许范围沿用训练数值精度标准。
 
+#### 采集接入清单：显式调用与 Hook 的分工
+
+本期主路径采用显式采集调用，复用已有 Trainer callback 生命周期做汇总与发布。
+这里的“显式”指在明确语义位置调用 recorder/计时器；`on_micro_step_end` 等已有 callback 不是新增的 PyTorch tensor/module hook。
+不会为了支持 module 筛选，就给每层都装 forward/backward hook。
+
+| 监控部分 | 本期接入方式 | 具体位置与边界 |
+| --- | --- | --- |
+| 启动组网、模型构建、数据初始化 | **显式计时** | Trainer `_setup()` 的对应构建调用前后；独立阶段事件可早于 callback 注册，不用 module hook 反推启动耗时 |
+| 权重加载/保存、resume、完整 checkpoint | **显式计时** | 真实 loader/saver 调用边界；异步保存从已有完成回调/future 取得完成时刻，不把提交返回视为完成 |
+| batch_fetch、transform、collate、H2D | **显式计时/metadata 上报** | 主进程取 batch/H2D 及实际执行的 transform/collate；worker 侧回传小型阶段摘要，不在模型 forward hook 中猜测数据耗时 |
+| forward、backward、clip、optimizer、scheduler 耗时 | **显式计时** | `text_trainer.py`/`base.py` 的对应调用前后；无法拆开的 PP/编译联合路径记录组合范围，不通过逐层 hook 强行拆分 |
+| local / micro loss | **显式 recorder 调用** | `BaseTrainer.postforward()` 中 `local_loss = self.loss_fn(...)` 之后、`mean_global_loss()` 加权/规约之前；携带有效分母与 micro-step，不在 `outputs` 上装 hook，也不重算 CE |
+| global loss、lr、训练使用的 grad norm | **复用已有结果，显式汇总** | loss 聚合返回值、optimizer/scheduler 状态与 `prepare_optimizer_step()` 返回的裁剪前 norm；不新增 tensor hook，不重复规约同语义指标 |
+| local / module grad norm | **显式 recorder 调用** | 所有 micro-batch backward 及必要梯度通信完成后、实际裁剪/更新前；初始化解析 module 参数集合，运行时只读这些梯度，不注册逐参数梯度 hook |
+| EP 负载 | **显式 recorder 调用** | model/router adapter 在路由计数或 dispatch 接收计数产生后立即上报；源端 attempted/drop、接收端 accepted/padding 分别标注。普通 MoE 层输出 hook 无法可靠取得内部计数，因此不作为主路径 |
+| Muon NS norm | **显式 recorder 调用** | `core/optimizer/muon.py` 的 NS 输出已生成、尚未按学习率等缩放或应用更新的位置；兼顾默认与自定义 `zeropower_fn`，保留参数/批处理映射。optimizer step 后的 hook 已无法取得这个语义时点 |
+| 数据长度/Top-N/packing/边界校验/模板 | **显式 recorder 调用** | CPU transform/collate 或 batch 适配处读取已有输入与 packing metadata；不为统计给模型装 hook，也不拷回完整设备 batch |
+| MFU 标准模块清单与动态几何 | **显式注册与更新为主；限定的 forward-pre-hook 为可选补充** | adapter 初始化声明块组成/静态维度，运行时由 batch metadata 更新 token 几何。仅对无法从接口获得、且确需核对调用形状的白名单标准模块使用下述临时 hook |
+| 设备显存 | **保持现状** | 沿用原有采集逻辑，不新增 hook 或采集入口 |
+| 异步拷贝、汇总与输出 | **显式队列提交** | 上述位置生成摘要后交给 event/有界队列；后台 worker 只接收已就绪的摘要，不安装 hook 来延迟读取活跃 tensor |
+
+**本期唯一预留的新增 hook：MFU 形状核对用的 `register_forward_pre_hook`。**
+
+- 它是受限的兼容补充，不是所有模型默认安装。只有 adapter 无法提供必要 metadata，且已验证该模块通过正常 module 调用入口执行时才使用；编译/fused 路径不保证 Python hook 可见。
+- 只读取 Python 可见的 shape、dtype、调用身份等 metadata，不访问 tensor 数值、不 `.item()`、不保留输入引用，不在 hook 中做通信或 FLOPs tensor 运算。
+- 在真实训练调用中核对，不额外运行一遍 forward。固定结构确认后移除；重计算调用单独标记，不能计入标准 MFU 分子。
+- 临时核对不能代表后续动态执行：若 shape/分支/调用次数会变化，必须由运行时 adapter 每步提供准确 metadata。无法提供时相关块标记 incomplete，不能沿用首步值或只按采样步推算完整 MFU。
+- 安装/移除会触发重编译或该路径不支持 hook 时，不使用此补充；要求显式 adapter 接入或标记不支持。未通过空 hook 与实际 hook 的性能对照，不进入默认方案。
+
+**梯度接入的额外边界：**普通 `.register_hook()` 的触发时点并不保证是“整步累积完成且所有规约结束”，因此不用它实现本期 local norm。
+FSDP/main-grad/external optimizer 路径须从实际用于更新的梯度存储中读取，并由该路径提供明确的完成边界；不能假定统一读取 `.grad` 就覆盖所有模型。
+未来若实现 pre-reduce norm，另在实际规约入口设计显式接入，本期不额外注册 backward/full-backward hook。
+既有 `bind_aux_loss_scale()` 的梯度 hook 服务于训练数学语义，保持原行为，不复用成监控 hook，也不把它算作本次新增采集。
+
+**组件依赖边界：**Trainer 持有 recorder；模型 adapter、EP 和优化器仅接受可选的轻量统计接口，由构建阶段注入。
+核心组件不反向导入 `trainer`，也不直接调用 LoggingCallback/WandB；采样判断在新增 norm/统计计算之前完成，未启用时无额外统计 buffer。
+接口名和插入位置是待实现设计；需按目标 revision 核对具体函数，不能据此宣称已接入。
+
+**接入验收：**逐项提供实际插入位置、调用次数、采样条件与资源持有时间；显式路径和 hook 路径分别核对数值、额外 kernel/通信、CPU 开销和显存。
+特别覆盖多 micro-batch、activation checkpoint、共享模块多次调用、graph compiler 及 FSDP main-grad；关闭功能后无残留 hook 或 recorder 资源。
+
+#### Hook 与异步采集的实现边界
+
+具体方式以“采集接入清单”为准：本期只有 MFU 形状核对预留临时 forward-pre-hook，其余均显式接入；不引入通用的“拿不到 tensor 就加 hook”回退。
+hook 本体只校验采样状态并产生必要摘要，不打印、序列化、调用网络或执行同步设备取值。
+能在 step 边界安全启停时，未采样步不安装 hook；需常驻的 hook 必须单独测空回调成本，且关闭功能时彻底移除。
+forward/backward hook 的调用次数、autograd 语义、重计算身份和 torch.compile/graph capture 兼容性均需验证；不支持时明确报告，不能静默切回 eager。
+
+候选异步链路为：
+
+```text
+训练流产生 tensor → 在有效期内提取/写入小型摘要 → 记录 ready event
+→ 采集流等待 event → 异步 D2H 到有界 pinned buffer → 记录 copy-complete event
+→ 完成后后台 CPU worker 汇总/序列化 → 外部输出触发后发布
+```
+
+- 异步不是延迟读取任意 tensor。梯度可能被 optimizer 修改、activation 可能被释放；必须在语义时点完成摘要读取或按流依赖固定一个小快照。跨流直接读取训练 tensor 只有在可证明其生命周期与后续写入安全时使用，不默认保留大 tensor。
+- D2H 是否真正异步取决于设备后端与 pinned memory 支持；接口用 `record_event`/wait/query 与可用异步拷贝能力组合，不能在 CPU 读完成前的数据。CPU-only 统计直接进入 worker，不引入设备 event。
+- buffer 固定槽位/字节上限，每个槽位携带 run、step、micro-step、module、rank；在途槽位不得清零或复用。仅保存有界统计，设备与 pinned-host 内存都纳入预算。
+- global 统计的 collective 按统一计划和固定顺序发起，持有异步 work 直到完成；不能由各 rank 的后台线程按本地队列是否空闲随意发起通信。容量不足时，仅可在统一决定后跳过可选的全局采样；已发起通信必须完成。
+- 输出晚于训练时保留真实采样 step，使用独立采样事件，不伪装为最新 step，也不重复常规 train_step。输出触发时未 ready 的可选记录延后，不为等指标阻塞主训练路径。
+- 队列满时跳过后续可选详细采样并记录 dropped/pending 计数；基础 loss、token/sample 累计量和训练正确性检查不可因背压丢失。异步 worker 不承载训练必须立即执行的错误检查。
+- 关闭/退出采用有界 drain，未完成记录明确标记 incomplete；不把 pending 记录当作零。设备不支持异步时报告该路径不可用，可采用已满足开销预算的低频同步摘要，不宣称异步。
+
+验收至少比较：无 hook、常驻空 hook、同步摘要、异步摘要四种模式；记录 hook 调用次数与 CPU 开销、graph break、训练 step P50/P95、设备/pinned-host 峰值、队列峰值与采样丢弃率。
+覆盖慢消费者、异步输出乱序、缓冲复用、异常退出、重计算和多 rank collective 顺序；所有指标值与同步参考一致。
+
 ### 2.2 日志输出与 WandB
 
 **监控功能**
 
 Console、JSONL、TensorBoard、WandB 使用相同字段与数值。
-常规汇总仅 global rank 0 输出；local/module 记录按选定 rank 独立保存。
+常规汇总仅 global rank 0 输出；所有 rank 的 local/module 记录按 rank 独立保存，避免每个 rank 都打印到共享终端。
 交互和非交互终端均采用结构化 step 行，不保留进度条。
 
 **接入与边界**
@@ -354,7 +412,7 @@ Console、JSONL、TensorBoard、WandB 使用相同字段与数值。
 
 - 总 loss、分项 loss、学习率、训练链路使用的 global grad norm。
 - 可配置 local loss、micro loss 和 module local grad norm。
-- local loss/norm 独立启用，支持打印频次和 global rank；module 路径及可选参数过滤仅用于 grad norm。
+- local loss/norm 独立启用，各自设置采样频次；所有持有对应数据的 rank 采集，module 路径仅用于 grad norm。
 
 **接入与边界**
 
@@ -362,17 +420,17 @@ Console、JSONL、TensorBoard、WandB 使用相同字段与数值。
 - local loss 在 loss provider 跨 rank 规约前取得，保留分子、分母及 scale。
 - local loss 由训练 loss 产生位置直接采集，不提供 module 路径配置，也不构造逐层 loss。
 - local step loss 使用全部 micro-batch 分子分母，不以采样 micro loss 均值代替。
-- local norm 默认在规约后、裁剪前读取本地梯度分片；pre_reduce 单独配置，在实际梯度通信前采集。
-- pre_reduce 接入点可能涉及 `core/fully_shard/` 或其他后端通信路径；不改通信算法，不复制完整梯度强行实现。
+- local norm 固定在规约后、裁剪前读取本地梯度分片；pre_reduce 不属于本次精简配置，只保留语义区别。
+- 后续若扩展 pre_reduce，需在实际通信前接入并另行验证；本次不修改通信算法，也不复制完整梯度强行实现。
 - 规范 module 名由模型映射到包装后的执行对象；PP stage 不拥有目标模块时不制造记录。
 - 共享参数去重，明确 unscale、expert 参数和递归子模块语义；micro norm 不能相加充当 step norm。
 - 完整字段、筛选规则和配置语义见附录 C。
 
 **验收**
 
-- 独立开关、频次和 rank 过滤有效；grad norm 的 module 过滤生效且无匹配时明确报告；local loss 无需配置模块路径。
-- local step loss 与独立分子分母统计一致，不受 micro 输出筛选影响。
-- pre/post-reduce、混精 unscale、共享参数、expert 参数、PP 所有权均有用例。
+- 独立开关和采样频次有效，验证全 rank 覆盖；grad norm 的 module 选择生效且全局无匹配时明确报告，local loss 无需配置模块路径。
+- local step loss 与全部真实 micro-batch 的独立分子分母统计一致。
+- 验证 post-reduce 的采集时点、混精 unscale、共享参数、expert 参数、PP 所有权，不能标成 pre-reduce。
 - global norm 与实际裁剪使用值一致；采集不改变梯度和更新结果。
 
 ### 2.5 数据量、数据质量与吞吐
@@ -391,7 +449,7 @@ Console、JSONL、TensorBoard、WandB 使用相同字段与数值。
 | `top_n_tokens` | 统计非 padding 输入中每个 token ID 的出现次数，输出前 N 项的 ID、count、占非 padding input tokens 的比例；频次相同按 token ID 排序，默认不解码文本 |
 | `packing_stats` | 输出 packing 是否启用、packed 行数、原始样本数、每行 segment 数分布、segment 长度分布和填充率；metadata 可用时增加截断样本数/丢弃 token 数 |
 | `packing_boundary_check` | 按实际 packing 策略检查 segment 偏移、长度、position IDs、attention 分段与 shifted labels/监督 mask 的边界一致性；输出检查数、失败数、检查项和有界定位信息 |
-| `log_first_rendered_template` | 在选定 rank 限长输出首步实际渲染结果；一次性输出，不受周期采样漏过首步 |
+| `log_first_rendered_template` | 仅 global rank 0 限长输出首步实际渲染结果；一次性输出，不受周期采样漏过首步 |
 
 `sampler_steps` 控制这些详细统计与边界抽查，不影响基础 token/sample 累计量逐步更新。
 “本 step”只指命中采样的 optimizer step，不将前 100 步混成该步分布；每份记录附 step、rank、scope 和采样样本数。
@@ -407,10 +465,10 @@ Top-N 使用 token ID 频次，和序列长度分布是两类统计；padding �
 - packing 后的 batch 行数不等于原始样本数，缺少 metadata 则原始样本计数不可用。
 - 只提交完成的训练消费；预取但未训练的 batch 不推进累计计数。
 - 通过既有 checkpoint 扩展保存/恢复累计量，不新建 checkpoint 系统。
-- Top-N/重复度限频统计；首步渲染通过 `monitor.datasets.log_first_rendered_template` 显式开启，限定 rank、长度和次数。
+- Top-N/重复度限频统计；首步渲染通过 `monitor.datasets.log_first_rendered_template` 显式开启，固定 global rank 0、限制长度和次数；文本预览作为单份展示，不限制各 rank 的数值统计。
 - 详细数据统计由 `DatasetStatsRecorder` 接入，优先消费 collate 后、H2D 前的 CPU 数据与 packing metadata，不为统计把完整设备 batch 拷回主机。
 - Top-N 汇总采样 step 内全部 token 计数后再选取，不能只合并各 micro-batch 的 Top-N。计数结构按词表大小或显式容量约束，临时工作空间和样本缓冲需有上限；分位数采用有界直方图近似时必须标明近似口径。
-- 默认输出所选 rank 的本地分布，不标成全局分布；CP 切片前后范围需标识。未来全局 Top-N 需要完整计数归约或有误差说明的算法，不能拼接各 rank Top-N 冒充精确全局结果。
+- 所有数据持有 rank 输出各自本地分布，不标成全局分布；CP 切片前后范围需标识。未来全局 Top-N 需要完整计数归约或有误差说明的算法，不能拼接各 rank Top-N 冒充精确全局结果。
 - packing 边界检查以实际策略为准：isolated 策略验证禁止跨 segment attention/监督；允许拼接的策略按既定语义验证，不强制 position 重置或一律隔离。检查 offsets 单调、起止合法、segment 覆盖与有效输入一致，并核对 loss shift 是否意外跨界。
 - 不构造新的完整 S×S attention mask；通过 offsets/cu_seqlens、position IDs 和实际 mask 构建参数检查。只能验证 metadata 时标明覆盖范围，不能宣称已验证 kernel 行为。
 - packing 未启用时标为 disabled；缺少 metadata 的检查标为 unavailable，不能当作通过或填零。抽查失败输出有界定位，不新增独立 Debug 流程，也不替代或关闭原有逐 batch 合法性检查。
@@ -420,7 +478,7 @@ Top-N 使用 token ID 频次，和序列长度分布是两类统计；padding �
 - 小样本手工复算 token、sample、shift、mask、packing 和 CP 去重。
 - 外部每 5 步输出与每步输出时的累计量一致；恢复前后与 dataloader 游标一致。
 - 覆盖全 ignored label、padding、重复 token、特殊 token、空输入的边界。
-- 首步渲染只在选定 rank 输出一次，反映模型实际输入，不默认输出全文。
+- 首步渲染只在 global rank 0 输出一次，反映模型实际输入，不默认输出全文。
 - 用已知 token ID 频次和序列长度的多 micro-batch 数据复算分布与 Top-N；覆盖频次并列、N 大于唯一 token 数、pad/eos 同 ID 和空有效输入。
 - 构造正确 packing 及 offsets 越界/重叠/缺失、错误 position、attention 配置不一致、shifted label 意外跨界等样本；确认按策略检测且报告检查覆盖范围。
 - 分别验证 packing 关闭、metadata 缺失、截断和多 segment 情形，缺少的信息不伪造；详细统计关闭或未采样时无新增扫描、设备拷贝和通信。
@@ -440,7 +498,7 @@ Top-N 使用 token ID 频次，和序列长度分布是两类统计；padding �
 - Router/dispatch 提供已有小向量；一份 recorder 管理多个层，不为每层注册 callback。
 - 生命周期：register → begin_step → record → finalize_step → meter 合并 → logging → reset。
 - Top-k 负载默认是 assignment 次数，不是唯一 token 数；drop assignment 不能冒充 token drop。
-- local 模式不增加通信；global 按注册布局拼接/求和并去除路由副本，不能机械 all-reduce。
+- 所有层的持有 rank 采集本地计数；逐层全局结果按注册布局拼接/求和并去除路由副本，不能机械 all-reduce。不再让用户选择 local/global 模式。
 - activation checkpoint 重计算不重复记录，共享模块多次真实调用不能漏计。
 - 不介入既有 MoEMonitorCallback 的 expert bias 更新，不保存 logits 或 token→expert 大索引。
 - finalize 幂等；缓冲固定规模并消费后清理。接口、统计公式和边界详见附录 F。
@@ -456,7 +514,7 @@ Top-N 使用 token ID 频次，和序列长度分布是两类统计；padding �
 
 **监控功能**
 
-NS 迭代输出矩阵 norm；可选迭代前 norm 与相对变化。支持采样频次、module/参数和 rank 过滤。
+NS 迭代输出矩阵 norm；可选迭代前 norm 与相对变化。按采样频次采集所有相关参数，保留 module/参数与 rank 身份。
 
 **接入与边界**
 
@@ -469,7 +527,7 @@ NS 迭代输出矩阵 norm；可选迭代前 norm 与相对变化。支持采样
 **验收**
 
 - 小矩阵与独立 norm 参考一致，零输入、前后 norm 和相对变化分母规则明确。
-- 过滤、频次和 rank 生效；未启用时不执行新增 norm 计算。
+- 采样频次及全 rank 覆盖有效；未启用时不执行新增 norm 计算。
 - 开启前后参数更新一致，无矩阵引用残留和额外全局通信。
 
 ### 2.8 设备显存：沿用现状
@@ -478,42 +536,66 @@ NS 迭代输出矩阵 norm；可选迭代前 norm 与相对变化。支持采样
 不新增 current 指标、跨 rank 聚合或窗口峰值，也不调整 peak 重置行为。
 监控自身的显存开销仍作为 Recorder 和整体方案的验收项，见第 4.2 节。
 
-### 2.9 FLOPs、TFLOP/s 与 MFU
+### 2.9 FLOPs、TFLOP/s 与 MFU：按标准模块分块计算
 
-`monitor.mfu: true/false` 仅控制新增 MFU 利用率，默认关闭，不接管已有 `training.log_tflops`。
-master 已有 `estimate_step_flops()` 和 `performance/tflops_per_device` 输出，由 `training.log_tflops` 控制；FLOPs 运算量目前是中间结果，并未作为独立指标输出。现有 estimator 仅支持 `qwen3_moe`，本次扩展模型适配并复用该计算链路。
-两个开关任一开启时按需估算一次 FLOPs：TFLOP/s 字段仍由 `training.log_tflops` 控制，MFU 字段由 `monitor.mfu` 控制；只开启 MFU 时内部复用计算，不强制额外输出 TFLOP/s。关闭 MFU 不关闭既有 TFLOP/s 功能。
-MFU 依赖既有 step 耗时，不要求打开分块计时 `monitor.timing`；日志输出仍由外部 Trainer 控制。
+`monitor.mfu` 只控制新增 MFU，默认关闭；已有 `training.log_tflops` 保持原入口。
+基线 master 已有 step FLOPs 估算与 TFLOP/s 输出，但 estimator 仅支持 qwen3_moe。
+本次确定采用“标准模块计算块 → 模块分项 → 整步求和”的统一 estimator，模型 adapter 只声明块组成、维度与特殊语义，不在通用 Trainer 持续增加 model_type 分支。
+两个开关任一启用时共用一次估算；TFLOP/s 和 MFU 分别按各自开关输出，不重复计算。
+使用既有整步时间，不依赖分块计时 `monitor.timing`。
 
-**监控功能**
+**监控功能与计算口径**
 
-复用理论 step FLOPs 与每设备 TFLOP/s 的计算，在设备峰值可信时输出 MFU%。`model_flops_per_step` 的独立输出属于可选扩展，不是 master 已有字段。
-模型公式不支持时不输出估算值；仅设备峰值缺失时保留已启用的 TFLOP/s 输出，省略 MFU，并一次性说明不可用原因。
+每个标准块记录 block_type、规范 module、调用身份、输入几何、公式版本、forward/backward FLOPs 和 coverage。
+分块是理论模型运算量的组成，不是把各模块实测耗时相加。`model_flops_per_step` 可作为诊断分项输出。
+
+| 标准计算块 | 计数方法与边界 |
+| --- | --- |
+| Linear / LM head / router projection | GEMM forward 按 `2 × M × K × N`；全量训练且输入、权重梯度均需计算时 forward+backward 为 `6 × M × K × N`。冻结/LoRA 按真实梯度路径拆分，不统一乘 3 |
+| Attention 核心 QKᵀ / AV | 按 Q/K 长度、query heads、head_dim 和有效 query-key 对数 A 计算，两次矩阵乘 forward 为 `4 × A × query_heads × head_dim`，backward 按梯度路径计入；causal-triangular/full-square 明确版本。QKV/O 投影由 Linear 块计数，禁止重复 |
+| Dense FFN / SwiGLU | 作为组合节点，展开 gate/up/down（或实际两层）Linear；不另加一份父 FFN 总量 |
+| Routed / shared expert FFN | routed 标准模型工作量按有效输入 token × top-k 分配到 expert 块；共享 expert 按实际声明计入。dispatch padding、drop、路由实际负载另报差异，不静默改变标准 MFU 分子 |
+| GDN / MLA / 其他非标准计算 | adapter 注册可复用的计算块公式与几何；投影部分复用 Linear，其余核单独核算。未覆盖时标记 incomplete，不冒充普通 Attention |
+| 重计算 / 通信 / optimizer / 轻量算子 | 重计算、通信、optimizer 不进入本方案标准 MFU 分子；norm、激活、RoPE 等是否忽略在公式版本中明确列出，不将未知大块归为“轻量忽略” |
 
 ```text
+F_step = Σ（本步各逻辑调用的标准块 forward FLOPs + 必要 backward FLOPs）
 TFLOP/s/device = F_step / (dt × device_count × 10^12)
-MFU_percent   = 100 × F_step / (dt × device_count × peak_flops_per_device)
+MFU_percent = 100 × F_step / (dt × device_count × peak_flops_per_device)
 ```
 
 **接入与边界**
 
-- 扩展 `trainer/runtime/flops.py` 的模型 estimator；模型 adapter 提供结构参数，数据层提供输入几何。
-- meter 只进行时间/设备数归一化，输出层不再计算 MFU。
-- Qwen3.6 单独核算标准 attention、GDN、top-k/shared expert、router 和 LM head，不套总参数量。
-- 输入 prompt 被 loss mask 仍参与计算；不能用有效监督吞吐替代计算规模。
-- 变长 attention 使用实际长度平方和，混合结构走专门 estimator。
-- 明确因果三角/完整平方、重计算是否计入、设备 SKU/dtype/dense-sparse 和 estimator 版本。
-- 不把 checkpoint/组网启动时间混入稳态 MFU；窗口指标使用 sum(F)/sum(dt)。
-- 模型不支持或峰值未知时输出不可用原因，不输出零或硬编码通用设备峰值。
-- Megatron、Bridge、TorchTitan、VeOmni 的算法差异见附录 B。
+- 在 `trainer/runtime/flops.py` 及候选子模块实现标准块 registry/聚合器；模型 adapter 生成计算清单，数据层提供实际输入几何。复用既有模型估算作为迁移对照，不另行双算。
+- 初始化时建立块清单，固定形状项缓存；逐步仅更新 token 总量、各 segment 长度平方和等小型 metadata。优先无 hook，不能每步全模型遍历或为公式留存 tensor。
+- 变长/packing Attention 使用与 mask 语义一致的 query-key 对数（分段平方和或明确的因果对数），不能用平均长度平方代替；被 loss mask 的 prompt 仍参与模型计算。
+- 统计逻辑完整模型工作量。DP 汇总独立样本，TP/CP/EP 副本和分片按块所有权还原，PP 汇合不同层；同一块不因副本、重计算或父子递归重复计数。共享权重的多次真实调用分别计数，权重共享不等于计算只发生一次。
+- fused 替换前后使用同一逻辑计算块定义；adapter 明确 composite 与子块互斥的计数所有权，不能 fused 父块与内部 Linear 同时记账。
+- MFU 分子默认标准模型有用运算量；MoE padding/drop 等实际执行差异作为单独诊断数据，跨框架对比先统一此口径。
+- meter 只做求和、时间和设备数归一化，输出层不算 MFU。记录公式版本、块覆盖率、忽略项以及峰值的 SKU/dtype/dense-sparse/来源。
+- 必要块未覆盖时可输出已知分项，但整体 MFU/TFLOP/s 标记不可用；峰值缺失时仅 MFU 不可用。不能把部分和伪装成完整模型工作量，也不输出假零。
+- 窗口指标用 sum(F)/sum(dt)，不纳入组网、加载/保存或以各分块耗时相加代替 dt。混合精度/异构峰值无可信统一约定时不报 MFU。
+- 框架算法调研保留在附录 B，作为分块公式核对来源；实施方案固定为本节的标准模块组合。
 
 **验收**
 
-- 小模型独立公式复算，覆盖 Dense/MoE、top-k/shared expert、变长与 packing。
-- Qwen 混合 attention 按实际层类型验证，不能仅测试 Dense Transformer。
-- 多卡设备数归一化不重复除；输入/监督 token 不混用。
-- 不支持模型、未知设备峰值和低精度混合场景明确不可用或采用显式约定。
-- 与其他框架比较时先统一估算约定和时间窗口，不只比较 MFU 数值。
+- 独立手算 Linear、causal/full Attention、Dense/SwiGLU、routed/shared expert 分项，并验证组合总量等于唯一计数块之和。
+- 覆盖可变长度/packing、共享模块重复调用、fused 替换、重计算、冻结/LoRA；公式不遗漏也不重复计数。
+- 对同一逻辑 batch、模型和公式版本切换 DP/TP/CP/EP/PP，F_step 应一致；设备数归一化只做一次。
+- Qwen 混合 Attention/GDN 核对逐层清单，未知块明确 incomplete；与旧 qwen3_moe estimator 在相同公式约定下交叉复算。
+- 验证未知峰值、混合精度和不完整覆盖；启用 estimator 的 hook/遍历/metadata 开销纳入第 4.2 节验收。
+
+### 2.10 指标诊断文档与 Skill
+
+各项指标不仅定义计算方法，还必须说明“能观察什么问题、应联查什么证据、哪些结论不能单独推出”。
+完整映射维护在 [训练监控指标诊断说明](../trainer_monitor_diagnostics.md)，覆盖 loss、norm、数据、EP、Muon、分块耗时、既有显存和 MFU。
+该说明是诊断语义的单一来源；新增/改名指标时同步更新字段定义与该映射，不把指标升降直接判成训练故障。
+
+[模型精度验证 skill](../../.agent/skills/hf-model-precision-validation/SKILL.md) 引用该文档指导训练异常定位；
+skill 先核对实现支持、统计范围和采样完整性，再按对齐的 step/rank/module 关联证据。
+本次仍是设计阶段，文档中的新指标不代表已可运行，不能凭配置草案开启未实现采集。
+
+验收：每项设计指标都能在诊断表找到用途与边界；用 loss 突升、EP 倾斜、packing 错位、MFU 下降四类案例复核诊断路径；缺失/异步丢弃指标不能被判成健康或零值。
 
 ## 3. 输出效果：改前与改后
 
@@ -557,7 +639,7 @@ memory/device_max_allocated_gb=51.0571 memory/device_max_reserved_gb=53.7422
 | 交互终端 / 重定向 | global rank 0 输出结构化 step 行，不输出 tqdm |
 | Console 和文件同时启用 | 各写入一次同一记录，不通过抓取 stdout 生成文件 |
 | 多机 | 仅 global rank 0 输出汇总；不按各节点 local rank 0 输出 |
-| 指定 rank 的详细统计 | 按 rank 独立文件，携带真实 global rank |
+| 全 rank 详细统计 | 各 rank 独立文件，携带真实 global rank；共享终端只打印汇总 |
 | 最后一步未命中外部日志间隔 | 遵循外部是否触发最终记录的决定；monitor 仅去重和分发 |
 
 ### 3.3 分块耗时记录
@@ -602,7 +684,7 @@ JSONL 可保存结构化的不可用事件，TensorBoard 和 WandB 不写伪造�
 | 1 | 2.1 统一契约、2.2 结构化日志及输出适配 | 删除 tqdm 的代码检查，改前/改后日志，Console/JSONL/WandB 一致性，多机 rank 输出验证 |
 | 2 | 2.3 分块耗时、2.5 数据 | 启动/加载/训练阶段日志，数据计数复算与续训恢复 |
 | 3 | 2.4 local/module、2.6 EP recorder、2.7 Muon | 独立参考结果，过滤/频次用例，EP 布局/重计算边界和数值不变验证 |
-| 4 | 2.9 模型 FLOPs/MFU | estimator 与设备峰值来源，公式复算，模型/设备不支持的输出示例 |
+| 4 | 2.9 标准模块 FLOPs/MFU | 块注册与唯一计数清单、逐块及组合公式复算、并行布局不变性、缺失块/峰值示例 |
 
 每批次对应模块的验收项必须落地，不以全量 UT 通过代替指标口径验证。
 参考源码入口见附录 I；后续实现如调整模块位置，保持各模块职责边界不变。
@@ -620,7 +702,9 @@ JSONL 可保存结构化的不可用事件，TensorBoard 和 WandB 不写伪造�
 - 检查关闭功能无其额外 hook、buffer、统计通信和设备同步。
 - 检查详细采样频率、批量规约和有界输出队列，长训练无 buffer 增长。
 - 不保留完整梯度、activation、router logits 或计算图。
-- 性能开销阈值在对应模块实现前明确，不预设未经验证的百分比。
+- 分别测无 hook、空 hook、同步采集与异步采集；检查 graph break、采样丢弃率、CPU worker 与 pinned-host 内存，不能只看设备峰值。
+- 全 rank 采集需在多机上测聚合通信与文件/上传压力；每 rank 有界不等于全任务开销固定。
+- 以无超出测量波动的性能/显存退化为目标，记录测量方法和波动区间；若固定缓冲等开销可测，明确报出并继续优化，不能宣称数学意义的零开销。
 
 ### 4.3 模块级待确认项
 
@@ -630,7 +714,7 @@ JSONL 可保存结构化的不可用事件，TensorBoard 和 WandB 不写伪造�
 | 数据 | packed 行、原始样本、已完成消费的映射 | 缺 metadata 时伪造原始样本数 |
 | 计时 | 每条路径的起止边界、host/device 与嵌套关系 | 用提交耗时冒充设备完成时间 |
 | 输出 | schema 迁移、WandB resume 去重和有界重试 | 同名字段静默改变语义 |
-| MFU | 模型公式及设备峰值的版本化来源 | 未支持时套 Dense 公式或通用峰值 |
+| MFU | 标准块公式、组合所有权、并行去重与设备峰值版本 | 未覆盖块用 Dense 公式补齐或把部分和当完整值 |
 
 ## 附录 A：当前实现与实跑证据
 
@@ -786,8 +870,8 @@ LoRA/frozen 路径对 forward、输入梯度、权重梯度使用不同系数，
 
 **对 HyperParallel 的设计结论（建议，尚未实现）：**
 
-1. 采用模型侧 estimator + 运行时几何统计 + 指标层计时/归一化的分工。
-2. 优先输出 `model_flops_per_step` 和 `tflops_per_device`，峰值信息完整后再输出 `mfu_percent`。
+1. 采用第 2.9 节确定的标准模块分块方案：adapter 声明块组成、通用块公式求和、运行时提供几何、指标层计时/归一化。
+2. 保持 `training.log_tflops` 与 `monitor.mfu` 分别控制输出；分块明细可用于诊断，完整覆盖且峰值可信时输出 `mfu_percent`。
 3. Qwen3.6 应分别核算标准 attention、GDN、top-k routed/shared FFN、router、LM head，
    不能使用总参数量或直接复用现有仅支持 qwen3_moe 的 estimator。
 4. 输入 prompt 即使被 loss mask 也参与模型计算；同时保留 input/valid tokens/s，但 MFU 不用监督 token 吞吐替代计算规模。
@@ -802,42 +886,42 @@ LoRA/frozen 路径对 forward、输入梯度、权重梯度使用不同系数，
 ## 附录 C：Local loss 与 module norm 详细规则
 
 复用训练链路的 step loss 和实际用于裁剪的 global norm，不由 callback 再计算一次。
-local loss 与 local grad norm 均支持独立开关、指定 global rank 和打印频次；仅 local grad norm 支持 module 筛选。
+local loss 与 local grad norm 均支持独立开关和采样频次，覆盖所有持有对应数据的 rank；仅 local grad norm 支持 module 筛选。
 这些属于 monitor，不引入 Debug 配置或 callback。
 
 ### C.1 Module 选择与输出频次
 
 - 以下 module 选择规则仅用于 local grad norm；local loss 不配置 `modules`。
-- `modules` 按模型规范模块路径选择，使用显式的 `match: exact | glob | regex` 规则。
-- 初始化时解析模块选择并记录命中结果；无匹配时明确报错，不能静默不输出。
+- `modules` 使用模型规范路径列表精确选择子树；空列表表示整体。不额外暴露 exact/glob/regex 模式开关。
+- 初始化时解析模块选择并记录命中结果；全局无匹配时明确报错，某个 PP stage 不持有目标模块则正常跳过。
 - 以并行包装前的规范模块名标识，保留到实际执行模块的映射；某个 PP stage 不拥有目标模块时正常跳过。
-- `ranks` 使用 global rank；grad norm 同时匹配 rank 与 module，local loss 仅匹配 rank 和采样条件，不额外全局规约。
+- 不提供 `ranks` 配置；所有数据持有 rank 按采样计划采集，grad norm 额外按 module 选择。local 采集本身不额外全局规约。
 - `sampler_steps` 表示每 N 个 optimizer step 采集一次；输出由外部日志触发控制，记录保留实际采样 step，不将旧采样值标成当前值。
-- `micro_steps: all | last | [0, 1, ...]` 选择采样 step 内的 micro-batch，编号从 0 开始。
+- 采样 step 覆盖全部真实 micro-batch，编号从 0 开始；不暴露 micro_steps 选择开关。
 - 每个 local 事件携带 step、micro_step（如适用）、rank、PP stage 和采集阶段；module 仅在 grad norm 等适用事件中携带。
 - JSONL 按 rank 保存，console 输出明确标识 rank；远端汇总只在开启相应输出时有界收集，不能冒充零通信。
 
 ### C.2 Local / micro loss
 
 - 在跨 rank 规约前的 loss 产生位置采集；记录原始分子、有效分母及 reduction/scale 语义。
-- `granularity: micro | step | both` 控制输出粒度。step 级 local loss 使用该 rank 全部 micro-batch
+- 固定记录 micro 与 step 两种粒度，不再配置 granularity。step 级 local loss 使用该 rank 全部 micro-batch
   的分子和分母汇总，不能仅对采样出的 micro loss 直接取均值。
-- micro-step 过滤只控制详细记录；请求 step local loss 时仍需取得该 step 的完整统计。
+- step local loss 需取得该 step 的完整统计，不通过部分 micro-batch 代替整步。
 - 直接从训练流程取得 local/micro loss，不需要 module 路径或用户注册 loss provider；普通 decoder/block 不生成逐层 loss。
 - 仅在实际计算 loss 的 PP stage 记录该 loss；其他 stage 不制造同名 loss。
 
 ### C.3 Gradient local norm
 
-Issue 的“规约前”定义与“规约后”采集时机存在冲突，配置显式区分：
+Issue 的“规约前”定义与“规约后”采集时机存在冲突，语义必须区分。当前精简配置只提供规约后裁剪前；规约前保留为未来能力，不加入本次 YAML：
 
-| `capture` | 含义 | 输出键 |
+| 采集阶段 | 含义 | 输出键 |
 | --- | --- | --- |
 | `pre_reduce` | 训练梯度通信前，当前 rank 可观测的梯度范数 | `training/grad_norm_local_pre_reduce` |
 | `post_reduce_pre_clip` | 训练通信完成后、裁剪前的本地梯度/分片范数 | `training/grad_norm_local_post_reduce_pre_clip` |
 
-module 选择对 norm 只统计该 module 的参数，提供 `include_children`、`include_experts` 和可选参数名过滤。
+module 选择统计该 module 子树的全部参数，包含 expert；去掉 include_children/include_experts 等重复开关。
 共享参数按参数身份去重；逐 module 输出与跨 module 总计的去重规则分别说明。
-`norm_type` 默认 2，支持明确配置；混精时以 unscaled 梯度为统计目标，并说明累计和缩放状态。
+norm 固定为 L2，不提供 norm_type 开关；混精时以 unscaled 梯度为统计目标，并说明累计和缩放状态。
 
 默认采用 `post_reduce_pre_clip`，不把它称为规约前 local norm，也不把本地分片 norm 称为 global norm。
 FSDP/DDP 可能在 backward 中已执行通信，因此 `pre_reduce` 需要在实际通信前接入采集点；
@@ -957,13 +1041,14 @@ SDK 格式依据：[W&B 自定义横轴与字典上报文档](https://docs.wandb
 ## 附录 F：ExpertLoadRecorder 接口与统计语义
 
 增加独立的 `ExpertLoadRecorder`，由 Trainer 持有，model/router adapter 注册采集点。
-一个 recorder 管理已选择的 MoE 层，不为每层创建 callback；不直接打印或调用 WandB。
+一个 recorder 管理全部已注册的 MoE 层，不为每层创建 callback；不直接打印或调用 WandB。
 现有 `MoEMonitorCallback` 的 expert bias 更新职责不迁入 recorder，避免监控改变训练算法。
 
 ```text
 Trainer step_begin → recorder.begin_step(step)
 Router / Dispatch → recorder.record(layer, micro_step, invocation, counters)
 Trainer step_end → recorder.finalize_step()
+                 → 等待异步结果就绪（如适用，保留原采样 step）
                  → EnvironMeterCallback 合并标量与分布快照
                  → LoggingCallback → Console / JSONL / TensorBoard / WandB
                  → recorder.reset_step()
@@ -977,10 +1062,10 @@ Recorder 在组网完成、模型完成并行包装后初始化，注册规范 m
 | 接口 | 职责 |
 | --- | --- |
 | `register_layer(spec)` | 注册 module 路径、expert 数量、ID 映射、分布式布局、计数语义和能力 |
-| `begin_step(step)` | 按统一采样计划启用当前 step，清空上一轮状态 |
+| `begin_step(step)` | 按统一采样计划启用当前 step，取得空闲槽位；不清空上一轮在途摘要 |
 | `record(layer_id, micro_step, invocation_id, counters, phase)` | 收集当前实际 forward 的轻量计数，忽略重计算 phase |
-| `finalize_step()` | 按预定组和顺序聚合，生成一次不可变快照；重复调用不重复通信或累计 |
-| `reset_step()` | 消费结束或中止后释放引用、重置缓冲；可复用固定大小计数 buffer |
+| `finalize_step()` | 按预定组和顺序提交聚合，完成后生成一次不可变快照；异步未完成时保留 pending，重复调用不重复通信或累计 |
+| `reset_step()` | 已完成且消费结束后归还槽位；中止时记录 incomplete，完成在途访问后再回收 |
 | `close()` | 解除采集注册、释放资源；不负责销毁训练通信组 |
 
 接口名称是设计草案。常规路由只复用现有小规模计数，不额外保存 router logits、
@@ -1010,7 +1095,7 @@ Top-k 路由中一个 token 可以贡献多次 assignment，因此 expert load �
   不能仅根据 world size 推断；跨数据副本汇总也要注明通信组和观察窗口。
 - PP 各 stage 只拥有部分层；逐层统计在所属 stage 完成，再按显式流程向汇总 rank 传递。
 - 采样与通信顺序由参与组一致决定，不能因为只有 rank 0 打印，就让其他 rank 跳过通信。
-- `scope: local` 不增加通信；`scope: global` 的通信仅在采样步发生，并尽量批量处理多层计数。
+- 本地采集不增加通信；逐层全局汇总的通信仅在采样步发生，尽量批量处理多层计数。scope 是记录元数据，不再是用户开关。
 
 **派生指标与输出：**
 
@@ -1027,16 +1112,16 @@ max_vio=<value> empty_experts=<count> empty_batch=<bool>
 ```
 
 每次快照附带采样 step、micro-batch 次数、聚合组/范围和计数语义。
-采样步统计整步全部实际 micro-batch，默认每个采样步输出，不与前后未采样步混合。
+采样步统计整步全部实际 micro-batch，按外部日志触发发布已就绪记录，保留原采样 step，不与前后未采样步混合。
 未采样步不沿用上一轮结果；只有明确启用跨步窗口时才累计并输出窗口范围。
 
 **重计算、共享模块与资源管理：**
 
 - activation checkpoint 的反向重计算不重复记录；不能仅凭 grad_enabled 区分，因为重计算模式不同。
 - 使用实际 forward/recompute 上下文以及调用身份区分；同一 module 在同一 micro-step 合法调用多次时都应统计。
-- 每步状态转换为 idle → collecting/skipped → finalized → reset，异常中止同样清理。
-- `flush: true` 指将采样快照交给统一输出层并消费当前缓冲，不表示每层同步设备或立即网络上传。
-- 缓冲按“已选择层数 × expert 数”固定规模，不随 token 数或训练步数增长。
+- 每个槽位状态为 idle → collecting/skipped → pending（异步时）→ finalized → consumed → reset，异常中止按在途完成状态安全回收。
+- 采样快照消费后自动释放或归还缓冲，不暴露 flush 开关；异步在途摘要须等待完成后才能复用，不表示每层同步设备或立即网络上传。
+- 缓冲按“已注册层数 × expert 数 × 有界在途槽数”固定规模，不随 token 数或训练步数增长。
 - 关闭时不创建 recorder 统计 buffer 或额外 hook，不改变 router 的输出、expert bias 和梯度。
 
 **验收：**
@@ -1044,7 +1129,7 @@ max_vio=<value> empty_experts=<count> empty_batch=<bool>
 - 以小规模显式路由结果独立复算 expert load、max_vio 和 assignment drop。
 - 覆盖 top-k、空 batch、空 expert、padding、重复路由副本、EP 分片及 DP/CP/TP/PP 组合。
 - 验证重计算不重复计数，共享 module 多次真实调用不漏计，finalize 重入不重复通信。
-- 关闭和开启时的训练数值一致；采样间隔/模块过滤生效，buffer 长时间运行不增长。
+- 关闭和开启时的训练数值一致；采样间隔与全部已注册层的覆盖生效，buffer 长时间运行不增长。
 - 未提供 drop 统计的 router 不输出伪造的零 drop；local/global 输出名称与 scope 明确区分。
 
 ## 附录 G：配置语义与兼容规则
@@ -1056,9 +1141,9 @@ max_vio=<value> empty_experts=<count> empty_batch=<bool>
 - `sampler_steps` 控制可降采样的统计，累计消费量仍逐步维护或由可靠的累计源提供。
 - 输出频率由外部 Trainer 控制，`monitor` 不定义 `logging_steps`；当前步指标不自动解释成间隔平均值。
 - 未在某步采集的可选指标不得沿用旧值冒充当前值；需要携带采样 step 或省略。
-- 详细指标的 rank、层/参数过滤、norm 类型和 Top-N 由对应 monitor 配置段定义。
+- 详细指标全 rank 采集，grad norm 固定 L2；仅保留 module 选择、Top-N 等必要配置。
 - 沿用外部训练配置的日志策略，不在 `monitor` 新增日志间隔、兼容别名或优先级规则。
-- 主输出固定 global rank 0；详细指标 rank 配置独立。
+- 主输出固定 global rank 0；详细指标覆盖全部持有数据的 rank，无重复 rank 配置。
 - 文件命名包含 run 标识，详细指标文件再包含 global rank，避免多进程竞争写入。
 
 ## 附录 H：字段兼容与迁移
