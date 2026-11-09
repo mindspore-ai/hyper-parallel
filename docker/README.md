@@ -1,39 +1,41 @@
-# HyperParallel Docker 环境
+# HyperParallel Docker Environment
 
-本目录提供 Ascend NPU Docker 环境配置，用于安装和验证 HyperParallel。
+**English** | [简体中文](README.zh.md)
 
-## 快速部署
+This directory provides an Ascend NPU Docker environment for installing and validating HyperParallel.
 
-### 1. 获取已构建镜像
+## Quick Deployment
 
-可以直接从 Quay.io 获取 PyTorch 2.9 NPU 镜像：
+### 1. Pull a Prebuilt Image
+
+Pull the PyTorch 2.9 NPU image directly from Quay.io:
 
 ```bash
 docker pull quay.io/hyper-parallel/hyper-parallel-npu:cann9.1.0-torch29
 ```
 
-使用已拉取的镜像启动容器：
+Start a container from the downloaded image:
 
 ```bash
 IMAGE=quay.io/hyper-parallel/hyper-parallel-npu:cann9.1.0-torch29 \
 bash docker/run_hyper-parallel.sh
 ```
 
-### 2. 从源码构建镜像
+### 2. Build an Image from Source
 
-如果需要使用当前源码或自定义依赖，可以使用构建脚本：
+Use the build script to include the current source or custom dependencies:
 
 ```bash
 bash docker/build_hyper-parallel_npu.sh hyper-parallel:npu
 ```
 
-构建完成后启动本地镜像：
+Start the local image after building:
 
 ```bash
 IMAGE=hyper-parallel:npu bash docker/run_hyper-parallel.sh --name hyper-parallel-npu --cards auto
 ```
 
-### 3. 进入容器并验证
+### 3. Enter the Container and Verify
 
 ```bash
 docker exec -it hyper-parallel-npu bash
@@ -41,31 +43,31 @@ source /usr/local/Ascend/cann/set_env.sh
 python3 -c "import importlib.metadata as md; print(md.version('hyper_parallel'))"
 ```
 
-## 文件说明
+## Files
 
-| 文件 | 说明 |
+| File | Description |
 | --- | --- |
-| `Dockerfile.hyper-parallel-npu` | 通用 HyperParallel NPU 镜像，默认 PyTorch 2.9 后端 |
-| `Dockerfile.models-npu-a3` | Ascend A3 / Ubuntu 22.04 / Python 3.11 训练镜像，含高性能融合算子依赖 |
-| `Dockerfile.torch` | PyTorch 后端镜像，安装 `hyper_parallel[torch29]` |
-| `build_hyper-parallel_npu.sh` | 简化构建脚本，构建后自动做 import smoke test |
-| `run_hyper-parallel.sh` | Ascend NPU 容器启动脚本 |
+| `Dockerfile.hyper-parallel-npu` | General HyperParallel NPU image, defaulting to the PyTorch 2.9 backend |
+| `Dockerfile.models-npu-a3` | Ascend A3 / Ubuntu 22.04 / Python 3.11 training image with dependencies for high-performance fused operators |
+| `Dockerfile.torch` | PyTorch backend image installing `hyper_parallel[torch29]` |
+| `build_hyper-parallel_npu.sh` | Simplified build script that runs an import smoke test after building |
+| `run_hyper-parallel.sh` | Ascend NPU container launch script |
 
-基础镜像默认使用：
+The default base image is:
 
 ```bash
 quay.io/ascend/cann:9.1.0-a3-ubuntu22.04-py3.12
 ```
 
-## 构建镜像
+## Build Images
 
-默认构建通用 NPU 镜像。该命令需要在仓库根目录执行：
+The default build creates the general NPU image. Run this command from the repository root:
 
 ```bash
 bash docker/build_hyper-parallel_npu.sh hyper-parallel:npu
 ```
 
-构建 PyTorch 环境：
+Build the PyTorch environment:
 
 ```bash
 DOCKERFILE=docker/Dockerfile.torch \
@@ -73,43 +75,43 @@ HP_EXTRA=torch29 \
 bash docker/build_hyper-parallel_npu.sh hyper-parallel:torch
 ```
 
-`HP_EXTRA` 对应 `docs/installation.md` 中的 extras：
+`HP_EXTRA` corresponds to the extras in `docs/installation.md`:
 
 ```text
 torch26 | torch27 | torch29 | torch | all
 ```
 
-## 启动容器
+## Start Containers
 
-启动默认镜像并进入 shell。脚本默认挂载当前仓库目录，并删除同名旧容器；`--cards auto` 会自动
-探测主机上的 NPU 卡，适配 A2/A3 及非 8 卡机器：
+Start the default image and enter its shell. By default, the script mounts the current repository and removes an existing container with the same name. `--cards auto`
+automatically detects the host's NPU devices, supporting A2/A3 and hosts with device counts other than eight:
 
 ```bash
 bash docker/run_hyper-parallel.sh
 ```
 
-指定 NPU 卡：
+Select NPU devices explicitly:
 
 ```bash
 bash docker/run_hyper-parallel.sh --cards 0,1
 ```
 
-也可以通过环境变量指定卡列表或硬件对应的默认列表：
+Alternatively, set the device list or hardware-specific defaults through environment variables:
 
 ```bash
 CARDS=auto DEFAULT_CARDS=0,1,2,3 bash docker/run_hyper-parallel.sh
 ```
 
-执行验证命令：
+Run a verification command:
 
 ```bash
 bash docker/run_hyper-parallel.sh --cards 0,1,2,3,4,5,6,7 -- \
   python3 -c "import importlib.metadata as md; print(md.version('hyper_parallel'))"
 ```
 
-## Native 扩展构建
+## Native Extension Builds
 
-Dockerfile 支持以下构建参数：
+The Dockerfile supports these build arguments:
 
 ```text
 BUILD_MULTICORE_EXTENSION=off|torch|all
@@ -117,7 +119,7 @@ BUILD_SHMEM_EXTENSION=off|torch|all
 HYPER_PARALLEL_BUILD_STRICT=off|on
 ```
 
-示例：
+Example:
 
 ```bash
 docker build -f docker/Dockerfile.torch \
@@ -129,16 +131,16 @@ docker build -f docker/Dockerfile.torch \
   .
 ```
 
-## 验证
+## Verification
 
-镜像内验证：
+Verify inside the image:
 
 ```bash
 source /usr/local/Ascend/cann/set_env.sh
 python3 -c "import importlib.metadata as md; print(md.version('hyper_parallel'))"
 ```
 
-查看包版本：
+Check the package version:
 
 ```bash
 python3 - <<'PY'
@@ -151,15 +153,15 @@ for name in ("hyper_parallel", "torch", "torch-npu"):
 PY
 ```
 
-## 基础版本参数
+## Base Version Parameters
 
-构建脚本支持通过环境变量覆盖基础镜像版本和硬件架构：
+The build script allows environment variables to override the base image version and hardware architecture:
 
 ```bash
 CANN_VERSION=9.1.0 CANN_ARCH=a2 PYTHON_VERSION=3.12 \
 bash docker/build_hyper-parallel_npu.sh hyper-parallel:a2
 ```
 
-其中 `CANN_ARCH` 用于选择基础镜像标签（例如 `a2` 或 `a3`，具体以镜像仓库实际提供的标签为准）。
-若基础镜像使用 `/usr/local/Ascend/ascend-toolkit` 或带版本号的 CANN 目录，Dockerfile 会自动
-创建统一的 `/usr/local/Ascend/cann` 路径。
+`CANN_ARCH` selects the base image tag, such as `a2` or `a3`; available values depend on the tags actually published in the image registry.
+If the base image uses `/usr/local/Ascend/ascend-toolkit` or a versioned CANN directory, the Dockerfile automatically
+creates the unified `/usr/local/Ascend/cann` path.

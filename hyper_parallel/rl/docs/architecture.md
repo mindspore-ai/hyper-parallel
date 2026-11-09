@@ -1,140 +1,160 @@
-# Hyper-RL 架构
+# Hyper-RL Architecture
 
-## 系统视图
+**English** | [简体中文](architecture.zh.md)
 
-`train_rl.py` 的 `main()` 调用 `rl.config.loader.load_config()` 加载配置。`trainer/build.py` 校验配置并组装资源，按 YAML 选择同步、分离异步或共卡异步循环。
-构建对象只在初始化期间存在；循环直接持有所需组件，不继承共享角色运行时。
-主项目继续负责模型加载、并行计划、HSDP、优化器和 DCP；RL 保留算法、轨迹、奖励及训练调度。
-`trainer/` 表示训练循环与控制流程；`workers/` 表示 Actor/Critic 等执行角色，
-其中 `engine/` 负责共享的模型、优化器、驻留和卸载机制。
+## System View
 
-| 职责 | 代码 |
+`main()` in `train_rl.py` calls `rl.config.loader.load_config()` to load configuration. `trainer/build.py` validates it and assembles resources, selecting the synchronous, disjoint asynchronous, or colocated asynchronous loop from YAML.
+Builder objects exist only during initialization; loops directly own the components they need and do not inherit a shared role runtime.
+The main project continues to own model loading, parallel plans, HSDP, optimizers, and DCP; RL owns algorithms, trajectories, rewards, and training scheduling.
+`trainer/` contains training loops and control flow; `workers/` contains execution roles such as Actor/Critic,
+with `engine/` providing shared model, optimizer, residency, and offload mechanisms.
+
+| Responsibility | Code |
 | --- | --- |
-| 类型与基本字段 | `rl/config/schema.py` |
-| HP 配置转换、自动容量与支持矩阵 | `rl/config/resolve.py`、`limits.py`、`validate.py` |
-| YAML 加载与严格覆盖 | `rl/config/loader.py`；外部入口为 `train_rl.py` |
-| Checkpoint 与评估 | `rl/trainer/checkpoint.py`、`rl/trainer/evaluation.py` |
-| 工具证据、XML 校验与诊断 | `rl/tool_protocol/protocol.py`、`xml.py`、`diagnostics.py` |
-| 共享扩展点注册 | `rl/utils/registry.py` |
-| 唯一组装入口 | `rl/trainer/build.py` |
-| 三种训练循环 | `rl/trainer/sync.py`、`fully_async.py`、`colocate_async.py` |
-| 进度、失败同步、服务清理 | `rl/trainer/state.py`、`distributed.py`、`lifecycle.py` |
-| Actor、Critic、固定训练目标 | `rl/workers/actor.py`、`critic.py`、`targets.py` |
-| 模型、优化器、驻留 | `rl/workers/engine/` |
-| token 分批、DP 重排、模型适配 | `rl/workers/input/`、`adapters/` |
-| 轨迹、提示、episode 和经验 | `rl/data/` |
-| native-vLLM 推理 | `rl/rollout/` |
-| 权重发布及 IPC/HCCL 传输 | `rl/weight_sync/` |
-| CPU producer、版本化样本、partial service | `rl/async_runtime/` |
+| Types and basic fields | `rl/config/schema.py` |
+| HP configuration conversion, automatic capacity, and support matrix | `rl/config/resolve.py`, `limits.py`, `validate.py` |
+| YAML loading and strict overrides | `rl/config/loader.py`; external entry point: `train_rl.py` |
+| Checkpointing and evaluation | `rl/trainer/checkpoint.py`, `rl/trainer/evaluation.py` |
+| Tool evidence, XML validation, and diagnostics | `rl/tool_protocol/protocol.py`, `xml.py`, `diagnostics.py` |
+| Shared extension registry | `rl/utils/registry.py` |
+| Sole assembly entry point | `rl/trainer/build.py` |
+| Three training loops | `rl/trainer/sync.py`, `fully_async.py`, `colocate_async.py` |
+| Progress, failure synchronization, and service cleanup | `rl/trainer/state.py`, `distributed.py`, `lifecycle.py` |
+| Actor, Critic, and fixed training targets | `rl/workers/actor.py`, `critic.py`, `targets.py` |
+| Models, optimizers, and residency | `rl/workers/engine/` |
+| Token batching, DP reordering, and model adapters | `rl/workers/input/`, `adapters/` |
+| Trajectories, prompts, episodes, and experience | `rl/data/` |
+| Native-vLLM inference | `rl/rollout/` |
+| Weight publication and IPC/HCCL transport | `rl/weight_sync/` |
+| CPU producer, versioned samples, and partial service | `rl/async_runtime/` |
 
-## 控制面
+## Control Plane
 
-配置先验证算法、模型、设备拓扑和路径，再启动分布式环境。启动失败与训练失败都通过 `RunLifecycle` 清理已拥有的资源，保留原始异常。
-`RewardScorer` 和 `TeacherScorer` 负责真实评分流程；评估回调捕获这些组件，不捕获构建器。
+Configuration validates algorithms, models, device topology, and paths before starting the distributed environment. Both startup and training failures use `RunLifecycle` to clean up owned resources while preserving the original exception.
+`RewardScorer` and `TeacherScorer` perform actual scoring; evaluation callbacks capture these components, not the builder.
 
-### master 模型接入
+<!-- markdownlint-disable-next-line MD033 -->
+<a id="master-模型接入"></a>
 
-`train.plan_overrides` 必须在本次 RL YAML 中显式声明；空列表表示不替换组件。
-示例直接列出共享 HP 的 RMSNorm、Attention 或 MoE 替换规则，不在运行时读取另一份训练 recipe，也不按 family 隐式补规则。
-`train.reference.plan_overrides`、`train.critic.plan_overrides` 可替换各角色的完整规则列表，独立归一化，不修改 Actor 的计划。
-Qwen3 适配仅处理 tied 参数身份、物化缓冲与加载 provenance；不注册自定义 vLLM 模型。
+### Mainline Model Integration
 
-Actor/Critic 共用 `workers/engine/optimizer.py`：同步流、准备主参数梯度、裁剪、执行 step、清理梯度。
-每个 optimizer mini-batch 的成员、有效 action-token 归一化和 optimizer 次数不变；scheduler 仍由各角色 update 的既定边界推进。
-动态分批复用 HP `FirstFitPackingSelector`，预算按实际 padded rectangle 计费，超预算单行单独成批，不截断。
-DP rank 的 microbatch 调用次数对齐，不能通过复制有效训练样本对齐。
+`train.plan_overrides` must be declared explicitly in this run's RL YAML; an empty list means no component replacements.
+Examples directly list shared HP replacement rules for RMSNorm, Attention, or MoE, without reading another training recipe at runtime or implicitly supplying family-specific rules.
+`train.reference.plan_overrides` and `train.critic.plan_overrides` can replace each role's complete rule list; each is normalized independently without modifying the Actor plan.
+The Qwen3 adapter handles only tied-parameter identity, materialization buffers, and loading provenance; it does not register a custom vLLM model.
 
-训练 CPU offload 与生成阶段 offload 分别配置。`TrainingResidency` 在发布前后重分片、校验优化器状态并同步设备流。
-`TrainingStateOffload` 保持参数和 optimizer 对象身份；搬运要求梯度已清理。IPC 接收确认后才释放 bucket 和缓存，再唤醒 rollout。
-`sequence_parallel`、`loss_parallel`、`reshard_after_backward`、`requires_grad_sync` 已显式映射到 HP 配置；支持矩阵仍拒绝未验证的值组合。
+Actor/Critic share `workers/engine/optimizer.py` for stream synchronization, master-parameter gradient preparation, clipping, stepping, and gradient cleanup.
+Optimizer mini-batch membership, valid action-token normalization, and optimizer step counts remain unchanged; schedulers advance at each role update's established boundaries.
+Dynamic batching reuses HP `FirstFitPackingSelector`, charging the actual padded rectangle against the budget. An over-budget row forms its own batch without truncation.
+DP ranks align microbatch invocation counts without duplicating valid training samples.
 
-## 边界合同
+Training CPU offload and generation-phase offload are configured separately. `TrainingResidency` reshards before/after publication, validates optimizer state, and synchronizes device streams.
+`TrainingStateOffload` preserves parameter and optimizer object identity; transfers require cleared gradients. Buckets and caches are released only after IPC receipt acknowledgment, before waking rollout.
+`sequence_parallel`, `loss_parallel`, `reshard_after_backward`, and `requires_grad_sync` map explicitly to HP configuration; the support matrix still rejects unvalidated combinations.
 
-### Token-first 不变量
+<!-- markdownlint-disable-next-line MD033 -->
+<a id="边界合同"></a>
 
-轨迹中的 token IDs 是训练输入的权威来源；禁止 decode 后重新 tokenize。
-`sequences`、`attention_mask`、`action_mask` 为 `[batch, tokens]`，概率、优势和 value 目标对齐 next-token 位置。
-loss mask 为 `action_mask[:, 1:]`。Prompt、padding、工具观察及 EOS 之后的 token 不参与 policy loss。
-episode/call ID、worker policy version、行为概率和完整上下文随重排一起迁移。
+## Boundary Contracts
 
-### Agent 边界
+### Token-First Invariants
 
-internal runner 驱动环境与工具，Codex/DeepSeek harness 保留多轮程序和逐调用轨迹。
-完整 episode 奖励可以附着到多个调用，但不能把不连续的模型调用拼成一条虚假 token 序列。
+Trajectory token IDs are the authoritative training input; decoding and retokenizing them is prohibited.
+`sequences`, `attention_mask`, and `action_mask` have shape `[batch, tokens]`; probabilities, advantages, and value targets align to next-token positions.
+The loss mask is `action_mask[:, 1:]`. Prompts, padding, tool observations, and post-EOS tokens do not contribute to policy loss.
+Episode/call IDs, worker policy versions, behavior probabilities, and complete contexts move together during reordering.
+
+### Agent Boundary
+
+The internal runner drives environments and tools; Codex/DeepSeek harnesses preserve multi-turn programs and per-call trajectories.
+A complete episode reward may attach to multiple calls, but discontinuous model calls must not be joined into a fabricated token sequence.
 
 ### Agentic Harness
 
-任务 prompt、容器工作区和评分函数留在 examples。通用 Agent 层不按任务名分支。
-同步 CPU preparation overlap 不改变策略版本，不跨 evaluation、checkpoint 或 epoch 边界预取。
+Task prompts, container workspaces, and scoring functions remain in examples. The generic Agent layer does not branch on task names.
+Synchronous CPU preparation overlap does not change policy versions or prefetch across evaluation, checkpoint, or epoch boundaries.
 
-## 一个训练步
+<!-- markdownlint-disable-next-line MD033 -->
+<a id="一个训练步"></a>
 
-1. 按已提交策略生成真实轨迹，完成 RM/Teacher 评分，休眠 rollout 并恢复训练驻留。
-2. `TargetPreparer` 按算法需求计算 Actor anchor、Reference 概率、PPO values/bootstrap 和固定目标。
-   启用 DP balancing 时，先在完整 GRPO 组上计算目标，再重排，最后计算对应 anchor/reference；不能在残组上重算优势。
-3. 更新 Actor 与可选 Critic；发布 Actor 权重并确认所有 worker 的版本，然后推进 global_step、记录指标、评估和保存。
+## One Training Step
 
-`old_log_prob_source=actor` 强制重算并冻结更新前概率；独立 rollout 概率仍保留用于诊断和蒸馏。
-可选诊断本身不改变训练分母。旧 consistency profile 和 bit-exact 门禁已经删除；蒸馏的概率有效性门禁继续保留。
+1. Generate actual trajectories using the committed policy, complete RM/Teacher scoring, put rollout to sleep, and restore training residency.
+2. `TargetPreparer` computes the Actor anchor, Reference probabilities, PPO values/bootstrap, and fixed targets according to algorithm requirements.
+   With DP balancing enabled, compute targets on complete GRPO groups first, then reorder, then compute the corresponding anchor/reference. Advantages must not be recomputed on incomplete groups.
+3. Update Actor and optional Critic; publish Actor weights and verify every worker's version before advancing global_step, recording metrics, evaluating, and saving.
 
-## 状态所有权
+`old_log_prob_source=actor` forces recomputation and freezing of pre-update probabilities; separate rollout probabilities remain available for diagnostics and distillation.
+Optional diagnostics do not themselves change the training denominator. The old consistency profile and bit-exact gate have been removed; distillation probability-validity checks remain.
 
-Actor/Critic 各自拥有模型、optimizer 和 scheduler。进度属于训练循环，worker 发布版本属于权重同步控制器。
-`TargetPreparer` 只持有目标计算依赖，`TrainingResidency` 只负责存储生命周期，`PolicyPublication` 负责训练到推理的切换顺序。
-`CheckpointResources` 明确列出持久化所需资源，不持有 trainer、rollout 或构建器回引用。
+## State Ownership
 
-## 两种 Deployment
+Actor/Critic each own their model, optimizer, and scheduler. Progress belongs to the training loop; worker publication versions belong to the weight synchronization controller.
+`TargetPreparer` holds only target-computation dependencies, `TrainingResidency` owns only storage lifecycles, and `PolicyPublication` controls the training-to-inference transition order.
+`CheckpointResources` explicitly lists persistence resources without back-references to the trainer, rollout, or builder.
 
-colocated 使用 NPU IPC，disjoint 使用 HCCL；具体模型和并行组合以配置校验为准。
-仅支持 native-vLLM 和流式 full_gather。`model_implementation=hyper`、`direct_reshard`、顶层 `consistency` 都会明确报错。
+## Two Deployment Modes
 
-## 权重发布与失败原子性
+Colocated deployment uses NPU IPC; disjoint deployment uses HCCL. Configuration validation determines allowed model/parallelism combinations.
+Only native-vLLM and streaming full_gather are supported. `model_implementation=hyper`, `direct_reshard`, and top-level `consistency` are explicitly rejected.
 
-发布依次准备布局、暂停 admission、开始更新、逐 bucket 传输、完成加载、核验 committed version。
-仅保留一个 full-gather 发布实现。一次最多有一个 bucket 在途，收到同步复制确认后释放临时存储。
-单个参数可能超过 bucket 大小；该参数独占一个 bucket。统计分别记录最大 bucket、确认和释放数量。
-任一阶段失败不提交新版本、不恢复采样，也不隐式切换传输策略。
+## Weight Publication and Failure Atomicity
 
-## Checkpoint 与恢复
+Publication prepares layouts, pauses admission, begins the update, transfers buckets, completes loading, and verifies the committed version, in that order.
+Only one full-gather publication implementation remains. At most one bucket is in flight, and temporary storage is released after acknowledgment of synchronous copying.
+A single parameter may exceed the bucket size and then occupies its own bucket. Metrics separately record the largest bucket, acknowledgments, and releases.
+Failure at any stage prevents committing a new version or resuming sampling; transport strategies never switch implicitly.
 
-新格式 `schema=2`。不兼容历史 checkpoint；缺失或不匹配的版本在加载模型前报错。
-HP DCP 保存模型及 rank-local optimizer、scheduler、dataloader 和 RNG；完成标记最后提交。
-恢复保持 FP32 主参数精度、并行拓扑、Critic 所有权及 Teacher/RM 身份校验；恢复 RNG 放在其他状态加载之后。
-异步完成标记链接样本状态校验和和配置指纹，样本使用版本化字段表示，不保存 RL 类的 Python 导入路径。
-恢复要求 producer 已 drain、没有在途或 selected 未提交组；损坏和不兼容快照不能被悄悄接受。
+<!-- markdownlint-disable-next-line MD033 -->
+<a id="checkpoint-与恢复"></a>
 
-## 扩展点
+## Checkpoints and Recovery
 
-算法需求驱动可选角色和目标。任务扩展使用现有 Agent/environment 接口。
-新增模型必须明确验证训练映射、native 权重加载、完整轨迹和支持矩阵；不预留 IsoExec、多后端或已删除策略的占位实现。
+The new format uses `schema=2` and is incompatible with historical checkpoints. Missing or mismatched versions fail before model loading.
+HP DCP saves the model and rank-local optimizer, scheduler, dataloader, and RNG; the completion marker is committed last.
+Recovery preserves FP32 master-parameter precision, parallel topology, Critic ownership, and Teacher/RM identity checks; RNG is restored after other state.
+Asynchronous completion markers bind sample-state checksums and configuration fingerprints. Samples use versioned fields without storing Python import paths for RL classes.
+Recovery requires a drained producer, with no in-flight or selected uncommitted groups; corrupt or incompatible snapshots must not be silently accepted.
 
-## 演进边界（规划）
+## Extension Points
 
-IsoExec 不属于本次实现。当前代码与配置可运行不代表新组合或学习效果已经完成设备验收。
+Algorithm requirements determine optional roles and targets. Task extensions use existing Agent/environment interfaces.
+New models require explicit validation of training mappings, native weight loading, complete trajectories, and the support matrix; there are no placeholder implementations for IsoExec, multiple backends, or deleted strategies.
 
-## 阅读代码
+## Evolution Boundaries (Planned)
 
-从 `trainer/build.py` 进入对应循环，再阅读 `workers/targets.py`、Actor/Critic update、`weight_sync/publication.py` 和 checkpoint。
-配置、源码、示例与测试索引见[功能导航](../../../docs/rl-navigation.md)。
+IsoExec is outside this implementation. Runnable code and configuration do not establish device acceptance for new combinations or learning quality.
+
+## Reading the Code
+
+Start at `trainer/build.py`, enter the appropriate loop, then read `workers/targets.py`, Actor/Critic updates, `weight_sync/publication.py`, and checkpointing.
+See [feature navigation](../../../docs/rl-navigation.md) for configuration, source, example, and test indexes.
 
 ## Rayless asynchronous GRPO
 
-分离异步循环在训练线程执行 optimizer 和发布 collective；CPU producer 负责完整候选组。
-先完成 update，才提交消费额度；随后按 freshness 或发布间隔更新策略。
-`policy_version = source_update + 1`，不能用 global_step 直接替代发布版本。缓冲容量计入 selected 组，完整组 admission、lag 和重试上限不变。
-仅保留现有 GRPO、模型及拓扑支持范围，不扩展为异步 PPO。
+The disjoint asynchronous loop runs the optimizer and publication collectives on the training thread; a CPU producer owns complete candidate groups.
+Updates complete before consumption credits are committed; policy publication then follows freshness requirements or the publication interval.
+`policy_version = source_update + 1`; global_step cannot directly substitute for the publication version. Buffer capacity includes selected groups; whole-group admission, lag, and retry limits remain unchanged.
+Existing GRPO, model, and topology support boundaries remain; this does not add asynchronous PPO.
 
-## 共卡异步 GRPO
+<!-- markdownlint-disable-next-line MD033 -->
+<a id="共卡异步-grpo"></a>
 
-共卡循环显式执行 pause/drain、推理休眠、训练驻留、更新、发布和 partial resume。
-失败不能误提交 lease 或版本。Codex 评估前 producer 释放 gateway，评估后关闭评估 gateway，再按恢复快照重启 producer。
+## Colocated Asynchronous GRPO
 
-### 共卡 off-policy 校正
+The colocated loop explicitly performs pause/drain, inference sleep, training residency, updates, publication, and partial resume.
+Failures must not incorrectly commit leases or versions. Before Codex evaluation, the producer releases its gateway; afterward, the evaluation gateway closes and the producer restarts from the recovery snapshot.
 
-校正保持默认关闭，启用时遵守现有算法支持范围和逐行为段概率合同。
-拒绝的组不进入 optimizer，训练 batch 在恢复 rollout 前释放。
+<!-- markdownlint-disable-next-line MD033 -->
+<a id="共卡-off-policy-校正"></a>
 
-### 共卡发布与恢复
+### Colocated Off-Policy Correction
 
-保存前 drain 完整组并冻结 source，模型 checkpoint 和异步快照提交为同一成功更新边界。
-恢复后先重新发布实际 Actor，再放行 producer；不得复用旧进程中的推理版本状态。
+Correction remains disabled by default. When enabled, it follows the existing algorithm support matrix and per-behavior-segment probability contract.
+Rejected groups do not reach the optimizer, and training batches are released before rollout resumes.
+
+### Colocated Publication and Recovery
+
+Before saving, drain complete groups and freeze the source. Commit the model checkpoint and asynchronous snapshot at the same successful-update boundary.
+After recovery, republish the actual Actor before releasing the producer; do not reuse inference-version state from the old process.

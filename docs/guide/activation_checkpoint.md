@@ -1,43 +1,45 @@
-# Activation Checkpoint / Swap 使用指南
+# Activation Checkpoint / Swap Guide
 
-HyperParallel 提供灵活的激活内存优化机制，包括选择性重计算（Activation Checkpoint）和激活 Swap（将中间激活 offload 到 CPU，反向时 prefetch 回来），支持两者协同配置。
+**English** | [简体中文](activation_checkpoint.zh.md)
 
-## 核心概念
+HyperParallel provides flexible activation memory optimization through selective recomputation (Activation Checkpoint) and Activation Swap, which offloads intermediate activations to CPU and prefetches them during backward. Both mechanisms can be configured together.
 
-| 机制 | 原理 | 内存节省 | 计算开销 |
+## Core Concepts
+
+| Mechanism | Principle | Memory savings | Compute overhead |
 |------|------|----------|----------|
-| Activation Checkpoint | 正向时不保存中间激活，反向时重计算 | 大（不存储激活） | 有（反向多一次正向计算） |
-| Activation Swap | 正向时将激活 offload 到 CPU，反向时 prefetch 回来 | 大（不占用 NPU HBM） | 低（异步 DMA 传输） |
-| 协同配置 | 对计算密集层用 checkpoint，对传输密集层用 swap | 最大化 | 最优化 |
+| Activation Checkpoint | Omit intermediate activations during forward and recompute them during backward | High (activations are not stored) | Additional forward computation during backward |
+| Activation Swap | Offload activations to CPU during forward and prefetch them during backward | High (does not occupy NPU HBM) | Low (asynchronous DMA transfers) |
+| Combined configuration | Checkpoint compute-intensive layers and swap transfer-intensive layers | Maximized | Optimized |
 
-## 接口概览
+## API Overview
 
-| 接口 | 说明 |
+| Interface | Description |
 |------|------|
-| `checkpoint` | 函数式激活重计算；默认 non-reentrant 支持 policy_fn、swap_inputs、context_fn |
-| `swap` | 函数式激活 swap，不重计算，仅 offload/prefetch |
-| `checkpoint_wrapper` | 模块级 checkpoint 装饰器；可设置 `use_reentrant=True` |
-| `checkpoint_exclude_wrapper` | checkpoint 内跳过重计算指定区域（正向执行一次） |
-| `swap_wrapper` | 模块级 swap 装饰器 |
-| `swap_tensor_wrapper` | 单 tensor swap 装饰器 |
-| `CheckpointPolicy` | 重计算策略枚举：MUST_SAVE / PREFER_SAVE / MUST_RECOMPUTE / PREFER_RECOMPUTE / MUST_SWAP |
-| `SwapManager` | Swap 分组管理器（单例） |
+| `checkpoint` | Functional activation checkpointing; default non-reentrant mode supports policy_fn, swap_inputs, and context_fn |
+| `swap` | Functional activation swapping: offload/prefetch without recomputation |
+| `checkpoint_wrapper` | Module-level checkpoint wrapper; supports `use_reentrant=True` |
+| `checkpoint_exclude_wrapper` | Exclude a region inside a checkpoint from recomputation, executing its forward once |
+| `swap_wrapper` | Module-level swap wrapper |
+| `swap_tensor_wrapper` | Single-tensor swap wrapper |
+| `CheckpointPolicy` | Recomputation policy enum: MUST_SAVE / PREFER_SAVE / MUST_RECOMPUTE / PREFER_RECOMPUTE / MUST_SWAP |
+| `SwapManager` | Swap group manager (singleton) |
 
 ---
 
-## 使用方式
+## Usage
 
-### 1. 函数式 checkpoint
+### 1. Functional Checkpoint
 
 ```python
 from hyper_parallel.core.activation_memory import checkpoint, CheckpointPolicy
 
-# 基础使用：将 model.layer 包装为 checkpoint 区域，x 是传给 model.layer 的输入
+# Basic usage: wrap model.layer in a checkpoint region; x is its input.
 output = checkpoint(model.layer, x)
 
-# 带 policy_fn：选择性保存 / 卸载 / 重计算
+# With policy_fn: selectively save, offload, or recompute.
 def my_policy(ctx, op, *args, **kwargs):
-    # 返回 MUST_SAVE 表示保存该算子的输出；返回 MUST_SWAP 表示卸载该算子的输出到 HOST 侧；返回 MUST_RECOMPUTE 表示反向时重计算。
+    # MUST_SAVE saves the operator output; MUST_SWAP offloads it to the host; MUST_RECOMPUTE recomputes it during backward.
     op_name_attr = getattr(op, "name", None)
     op_name = op_name_attr() if callable(op_name_attr) else (op_name_attr or str(op))
     if op_name in {"LayerNormExt", "aten.addmm.default"}:
@@ -46,83 +48,83 @@ def my_policy(ctx, op, *args, **kwargs):
 
 output = checkpoint(model.layer, x, policy_fn=my_policy)
 
-# 带 swap_inputs：checkpoint 区域保存的输入也 offload 到 CPU
+# With swap_inputs: also offload the checkpoint region's saved inputs to CPU.
 output = checkpoint(model.layer, x, swap_inputs=True)
 
-# 带 context_fn：为正向和重计算阶段分别提供上下文管理器
+# With context_fn: provide separate context managers for forward and recomputation.
 def context_fn():
     return forward_context(), recompute_context()
 
 output = checkpoint(model.layer, x, context_fn=context_fn)
 
-# 控制是否在产生全部 backward 所需 tensor 后提前停止重计算
-output = checkpoint(model.layer, x, early_stop=True)   # 默认值，减少无效尾部计算
-output = checkpoint(model.layer, x, early_stop=False)  # 完整执行整个重计算区域
+# Control whether recomputation stops once all tensors needed by backward are available.
+output = checkpoint(model.layer, x, early_stop=True)   # Default: avoid unnecessary trailing computation.
+output = checkpoint(model.layer, x, early_stop=False)  # Execute the entire recomputation region.
 ```
 
-默认 `use_reentrant=False` 使用 HyperParallel 的 non-reentrant 实现；`early_stop` 只通过
-Hyper 的单次调用关键字或配置字典控制：
+The default `use_reentrant=False` uses HyperParallel's non-reentrant implementation. `early_stop` is controlled only through
+HyperParallel's per-call keyword or configuration dictionary:
 
 ```python
 checkpoint_kwargs = {"early_stop": False, "preserve_rng_state": True}
 output = checkpoint(model.layer, x, **checkpoint_kwargs)
 ```
 
-外层的 `torch.utils.checkpoint.set_checkpoint_early_stop()` 不会覆盖 Hyper eager checkpoint 的参数。
-`checkpoint_wrapper(model.layer, early_stop=False)` 使用相同规则。图编译状态暂时回退到 Torch 原生
-non-reentrant checkpoint；完整的 compile/context_fn 组合适配不在当前版本范围内。
+An outer `torch.utils.checkpoint.set_checkpoint_early_stop()` does not override HyperParallel eager checkpoint arguments.
+`checkpoint_wrapper(model.layer, early_stop=False)` follows the same rules. Graph compilation currently falls back to Torch's native
+non-reentrant checkpoint; complete support for compile/context_fn combinations is outside the current release scope.
 
-### Reentrant checkpoint 与排除重计算区域
+### Reentrant Checkpointing and Excluded Regions
 
-Torch eager 下可将 `use_reentrant=True` 传给 `checkpoint` 或 `checkpoint_wrapper`。
-`checkpoint_exclude_wrapper` 标记区域在首次 forward 执行并保存必要输出与反向图；checkpoint
-replay 会复用该区域的输出，不再执行其 forward：
+In Torch eager mode, pass `use_reentrant=True` to `checkpoint` or `checkpoint_wrapper`.
+A region marked with `checkpoint_exclude_wrapper` executes during the initial forward, retaining necessary outputs and its backward graph. Checkpoint
+replay reuses its outputs without executing its forward again:
 
 ```python
 from hyper_parallel.core.activation_memory import checkpoint_wrapper, checkpoint_exclude_wrapper
 
-# 在被 checkpoint 的模块内部调用 excluded；其参数仍由父模块持有。
+# Call the excluded region inside the checkpointed module; the parent still owns its parameters.
 model.block.expensive = checkpoint_exclude_wrapper(model.block.expensive)
 model.block = checkpoint_wrapper(model.block, use_reentrant=True)
 ```
 
-排除区域始终缓存输出；设置 `swap=True` 时可依照当前 swap group 卸载输出及不可从重算输入恢复的
-内部激活，重算输入仍通过配方恢复。`group_swap` 与 `cpu_pool` 可配置在 exclude wrapper 上；
-reentrant checkpoint 本身支持 `preserve_rng_state` 和可调用的 `context_fn`，但其外层不支持
-`policy_fn`、`swap_inputs`、`group_swap`、`cpu_pool`、非默认 `early_stop`、`debug`、
-`determinism_check` 或 `torch.compile`；上述组合会报错。不要嵌套 reentrant checkpoint。
+Excluded regions always cache outputs. With `swap=True`, the current swap group can offload outputs and internal activations that cannot be recovered from
+recomputation inputs; those inputs are still restored through recipes. Configure `group_swap` and `cpu_pool` on the exclude wrapper.
+Reentrant checkpointing itself supports `preserve_rng_state` and a callable `context_fn`, but its outer call does not support
+`policy_fn`, `swap_inputs`, `group_swap`, `cpu_pool`, nondefault `early_stop`, `debug`,
+`determinism_check`, or `torch.compile`; these combinations raise errors. Do not nest reentrant checkpoints.
 
-PP stage 的普通 backward 可以使用 reentrant checkpoint；stage 自动管理分阶段作用域，用户无需手动绑定。
-`ScheduleInterleaved1F1B(overlap_b_f=True, enable_dxdw_split=True)` 的 dx/dw 分离
-在非 FSDP/HSDP stage 中按微批保留 replay 状态：dx 阶段只传输入梯度，dw 阶段再计算参数梯度，
-两阶段共用一次 replay。reentrant + PP split + FSDP/HSDP 以及
-`retain_backward_graph=True` 不支持并会显式报错；不使用 PP split 的普通 FSDP 路径不受此限制。
-不在 PP stage 的分阶段作用域内时，`autograd.grad` 即使只请求输入梯度，reentrant 内部仍可能
-累积闭包捕获参数的梯度；需要完整的目标限定求导能力时使用 non-reentrant。
-当前实现不承诺高阶梯度或任意嵌套 checkpoint 支持。
-PP reentrant stage 假定运行期间参数对象保持不变；不支持动态替换参数对象。
+Ordinary PP-stage backward can use reentrant checkpointing; the stage automatically manages phased scopes without manual binding.
+With `ScheduleInterleaved1F1B(overlap_b_f=True, enable_dxdw_split=True)`, dx/dw separation
+retains replay state per micro-batch in non-FSDP/HSDP stages: dx propagates only input gradients, then dw computes parameter gradients,
+sharing one replay between both phases. Reentrant + PP split + FSDP/HSDP and
+`retain_backward_graph=True` are unsupported and explicitly rejected; ordinary FSDP without PP split is unaffected.
+Outside a PP stage's phased scope, reentrant internals may accumulate gradients for closure-captured parameters even when
+`autograd.grad` requests only input gradients. Use non-reentrant mode for full differentiation restricted to specified targets.
+The current implementation does not guarantee higher-order gradients or arbitrary nested checkpoints.
+PP reentrant stages assume parameter objects remain unchanged throughout execution; dynamically replacing parameters is unsupported.
 
-### 2. 函数式 swap
+### 2. Functional Swap
 
 ```python
 from hyper_parallel.core.activation_memory import swap, CheckpointPolicy, SwapManager
 
-# 基础使用：将所有中间激活 swap 到 CPU
+# Basic usage: swap all intermediate activations to CPU.
 output = swap(model.layer, x)
 
-# 带 policy_fn：选择性 swap
+# With policy_fn: selectively swap activations.
 def swap_policy(target):
     if target.is_small_op:
-        return CheckpointPolicy.MUST_SAVE  # 小 tensor 不 swap
-    return CheckpointPolicy.MUST_SWAP  # 其余 swap
+        return CheckpointPolicy.MUST_SAVE  # Do not swap small tensors.
+    return CheckpointPolicy.MUST_SWAP  # Swap the remaining tensors.
 
 output = swap(model.layer, x, policy_fn=swap_policy)
 
-# 使用 swap 功能时，需要注册层间的 offload / prefetch 关系（可以不是相邻层）
+# Register inter-layer offload/prefetch relationships when using swap; layers need not be adjacent.
 SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
 ```
 
-### 3. 声明式接口
+### 3. Declarative Interfaces
 
 ```python
 from hyper_parallel.core.activation_memory import (
@@ -133,18 +135,18 @@ from hyper_parallel.core.activation_memory import (
     swap_wrapper,
 )
 
-# 以下示例展示不同用法；不要对同一个模块重复嵌套 wrapper。
+# These examples show alternatives; do not nest wrappers repeatedly on the same module.
 
-# 用 checkpoint_wrapper 替换模块：该模块每次 forward 都会进入 checkpoint 区域
+# Replace the module with checkpoint_wrapper: each forward enters a checkpoint region.
 model.layers[0] = checkpoint_wrapper(model.layers[0])
 
-# checkpoint_wrapper 支持与 checkpoint 相同的关键字参数，例如 policy_fn、swap_inputs、group_swap
+# checkpoint_wrapper accepts the same keywords as checkpoint, including policy_fn, swap_inputs, and group_swap.
 def recompute_policy(ctx, op, *args, **kwargs):
     return CheckpointPolicy.MUST_RECOMPUTE
 
 model.layers[1] = checkpoint_wrapper(model.layers[1], policy_fn=recompute_policy)
 
-# SAVE 区域始终缓存输出；swap=True 时可将输出和不可重建的内部激活卸载到 CPU。
+# SAVE regions always cache outputs; swap=True can offload outputs and nonreconstructible internal activations to CPU.
 model.expensive_a = checkpoint_exclude_wrapper(
     model.expensive_a,
     swap=True,
@@ -153,28 +155,28 @@ model.expensive_a = checkpoint_exclude_wrapper(
 model.expensive_b = checkpoint_exclude_wrapper(model.expensive_b)
 SwapManager().set_forward_prefetch_layer(model.expensive_a, model.expensive_b)
 
-# 外层没有 active checkpoint 时 checkpoint_exclude_wrapper 完全透传，swap 配置不生效。
+# Without an enclosing active checkpoint, checkpoint_exclude_wrapper passes through and swap settings have no effect.
 
-# 用 swap_wrapper 替换模块：模块 forward 中保存的中间激活会按策略 offload 到 CPU
+# Replace the module with swap_wrapper: intermediate activations saved during forward are offloaded to CPU according to policy.
 def tensor_swap_policy(tensor):
     if tensor.numel() < 1024:
-        return CheckpointPolicy.MUST_SAVE  # 小 tensor 保留在设备侧
+        return CheckpointPolicy.MUST_SAVE  # Keep small tensors on the device.
     return CheckpointPolicy.MUST_SWAP
 
 model.layers[2] = swap_wrapper(model.layers[2], policy_fn=tensor_swap_policy)
 
-# 组合使用：从尚未包装过的模型开始，对不同层选择一种 wrapper
+# Combined use: start with an unwrapped model and select one wrapper for each layer.
 for i, layer in enumerate(model.layers):
     if i % 2 == 0:
         model.layers[i] = checkpoint_wrapper(layer)
     else:
         model.layers[i] = swap_wrapper(layer)
 
-# 使用 swap 功能时，需要注册层间的 offload / prefetch 关系（可以不是相邻层）
+# Register inter-layer offload/prefetch relationships when using swap; layers need not be adjacent.
 SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
 
-# checkpoint_wrapper 和 swap_wrapper 既可以包裹 nn.Module / Cell，也可以包裹普通 func。
-# 包裹 func 时，返回值仍然是可调用对象，调用方式与原函数保持一致。
+# checkpoint_wrapper and swap_wrapper accept nn.Module instances or ordinary functions.
+# Wrapping a function returns a callable with the same calling convention.
 def block_func(x):
     return model.block(x)
 
@@ -185,9 +187,9 @@ ckpt_output = ckpt_block_func(x)
 swap_output = swap_block_func(x)
 ```
 
-### 4. 单 tensor 卸载
+### 4. Offload Individual Tensors
 
-`swap_tensor_wrapper` 适用于只想卸载某几个明确的大激活 tensor。它需要在模块的 `forward` / `construct` 内部调用，会把其中符合条件的 tensor 注册到当前 swap group 中，等待后续 offload / prefetch 调度。
+Use `swap_tensor_wrapper` to offload specific large activation tensors. Call it inside the module's `forward`; it registers eligible tensors with the current swap group for subsequent offload/prefetch scheduling.
 
 ```python
 import torch.nn as nn
@@ -206,13 +208,13 @@ class TransformerBlock(nn.Module):
         x = x + self.ffn(x)
         return self.norm2(x)
 
-# 使用 swap_tensor_wrapper 时，同样需要注册层间的 offload / prefetch 关系（可以不是相邻层）
+# Register inter-layer offload/prefetch relationships for swap_tensor_wrapper as well; layers need not be adjacent.
 SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
 ```
 
 ---
 
-## 与其他并行策略组合
+## Combine with Other Parallel Strategies
 
 ### FSDP + Activation Checkpoint / Activation Swap
 
@@ -222,10 +224,10 @@ from hyper_parallel.core.activation_memory import checkpoint_wrapper
 
 mesh = init_device_mesh("npu", (dp_size,), mesh_dim_names=("dp",))
 
-# 先对需要的子模块应用 checkpoint_wrapper 或 swap_wrapper，使 wrapper 位于 FSDP 边界内部
+# Apply checkpoint_wrapper or swap_wrapper to selected submodules first, placing wrappers inside the FSDP boundary.
 model.transformer.layer = checkpoint_wrapper(model.transformer.layer)
 
-# 再应用 FSDP，让 FSDP 包住已经 checkpoint 的模块
+# Then apply FSDP around the checkpointed module.
 model = fully_shard(model, mesh=mesh)
 ```
 
@@ -237,24 +239,24 @@ from hyper_parallel.core.activation_memory import SwapManager, swap_wrapper
 
 tp_mesh = init_device_mesh("npu", (tp_size,), mesh_dim_names=("tp",))
 
-# 先应用 TP
+# Apply TP first.
 parallelize_module(model, tp_mesh, tp_plan)
 
-# 再对需要的层或子模块应用 checkpoint_wrapper 或 swap_wrapper
+# Then apply checkpoint_wrapper or swap_wrapper to selected layers or submodules.
 for i, layer in enumerate(model.layers):
     model.layers[i].attn = swap_wrapper(layer.attn)
 
-# 使用 swap 时，需要注册层间的 offload / prefetch 关系（可以不是相邻层）
+# Register inter-layer offload/prefetch relationships when using swap; layers need not be adjacent.
 SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
 ```
 
 ---
 
-## 性能建议
+## Performance Recommendations
 
-1. **小 tensor 不要 swap**：swap 的 DMA 启动开销对于小 tensor（如 bias）可能超过收益，用 `policy_fn` 过滤
-2. **优先对大激活层使用 swap**：Attention 输出、MLP 中间激活等大 tensor 最适合 swap
-3. **Checkpoint vs Swap 选择**：
-   - 计算密集层（如 softmax）：用 checkpoint，重计算开销可接受
-   - 内存密集层（如大型 MLP）：用 swap，DMA 传输开销更低
-4. **协同配置**：混合使用 checkpoint 和 swap 可最大化内存节省并最小化计算/传输开销
+1. **Do not swap small tensors**: DMA startup costs may outweigh the benefits for small tensors such as biases; filter them with `policy_fn`.
+2. **Prioritize large activations for swapping**: Attention outputs and MLP intermediate activations are suitable candidates.
+3. **Choosing checkpoint or swap**:
+   - Compute-intensive layers such as softmax: use checkpoint when recomputation overhead is acceptable.
+   - Memory-intensive layers such as large MLPs: use swap for lower DMA transfer overhead.
+4. **Combined configuration**: Mix checkpointing and swapping to maximize memory savings while minimizing computation and transfer overhead.

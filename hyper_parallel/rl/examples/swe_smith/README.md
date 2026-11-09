@@ -1,33 +1,38 @@
-# Code Agent：SWE-Smith
+# Code Agent:SWE-Smith
 
-使用 Codex 修改仓库，通过独立测试评分，支持推理、GRPO 训练和 checkpoint 恢复。
-默认使用本机 Docker socket；远端沙盒通过 `--docker-host` 指定。
+**English** | [简体中文](README.zh.md)
 
-## 环境准备
+Use Codex to modify repositories and independent tests to score results, supporting inference, GRPO training, and checkpoint recovery.
+The local Docker socket is used by default; specify remote sandboxes with `--docker-host`.
 
-准备 Docker、模型权重、空闲 Ascend NPU，以及[固定版本的 RL controller 镜像](../../docker/README.md#仓库型-code-agent-与-qwen35-家族)。
-宿主启动入口依赖 Python 和 PyYAML；数据准备在已安装本项目及 RL 依赖的环境中执行。
-以下命令均从仓库根目录运行，路径替换为实际位置：
+## Environment Setup
+
+Prepare Docker, model weights, idle Ascend NPUs, and the [pinned RL controller image](../../docker/README.md#repository-code-agent-and-the-qwen35-family).
+The host launcher requires Python and PyYAML. Run data preparation in an environment with this project and RL dependencies installed.
+Run all commands from the repository root and replace paths with actual locations:
 
 ```bash
 export PYTHONPATH="$PWD/hyper_parallel/rl:$PWD${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
-## 模型配方
+<!-- markdownlint-disable-next-line MD033 -->
+<a id="模型配方"></a>
 
-| 模型 | 配方 | NPU 数量 |
+## Model Recipes
+
+| Model | Recipe | NPUs |
 | --- | --- | --- |
-| Qwen3.5-9B（默认） | [qwen3_5_9b.yaml](configs/qwen3_5_9b.yaml) | 2 |
+| Qwen3.5-9B (default) | [qwen3_5_9b.yaml](configs/qwen3_5_9b.yaml) | 2 |
 | Qwen3.8-27B | [qwen3_8_27b.yaml](configs/qwen3_8_27b.yaml) | 4 |
 
-均为纯文本 GRPO，默认 eager。切换配方使用 `--config`，同时调整 `--devices`。
+Both use text-only GRPO and default to eager execution. Select a recipe with `--config` and adjust `--devices` accordingly.
 
-## 镜像准备与身份
+## Image Preparation and Identity
 
-镜像必须匹配沙盒主机的 CPU 架构。下面三个已发布镜像用于 ARM64 九例验证；
-远端 amd64 或其他任务需准备对应镜像和清单，见[远端运行](#远端沙盒)。
+Images must match the sandbox host's CPU architecture. The three published images below support the nine-case ARM64 validation.
+Remote amd64 hosts or other tasks require matching images and manifests; see [remote execution](#remote-sandboxes).
 
-### 本地 ARM64 九例镜像
+### Local ARM64 Nine-Case Images
 
 ```bash
 SWE_REGISTRY=swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/swe-smith
@@ -36,14 +41,14 @@ docker --host unix:///var/run/docker.sock pull "$SWE_REGISTRY:boltons-arm64-code
 docker --host unix:///var/run/docker.sock pull "$SWE_REGISTRY:oauthlib-arm64-codex-0.152.1"
 ```
 
-若需要认证，先用有权限的账号执行 `docker login swr.cn-east-3.myhuaweicloud.com`。
-镜像已包含源码、测试依赖和 Codex；直接使用 [images_arm64.json](configs/images_arm64.json)，无需构建。
-该清单固定 Image ID 和远端摘要；原始数据集名称中的 `x86_64` 仅用于身份映射。
+If authentication is required, run `docker login swr.cn-east-3.myhuaweicloud.com` with an authorized account first.
+Images already contain source, test dependencies, and Codex. Use [images_arm64.json](configs/images_arm64.json) directly without building.
+The manifest pins Image IDs and remote digests; `x86_64` in original dataset names is used only for identity mapping.
 
-## 准备子集或全量数据
+## Prepare Subset or Full Data
 
-下载 agent-lightning 的[筛选数据包](https://drive.google.com/file/d/1q19DP53l4rldvBR2dkUhbaPI_mHVBVL1/view)，
-使用其中的两个 JSONL。下面准备[固定九例](configs/selected_ids.txt)：六例训练、三例验证。
+Download agent-lightning's [filtered data package](https://drive.google.com/file/d/1q19DP53l4rldvBR2dkUhbaPI_mHVBVL1/view)
+and use its two JSONL files. The following prepares the [fixed nine cases](configs/selected_ids.txt): six for training, three for validation.
 
 ```bash
 python -m examples.swe_smith.prepare_data \
@@ -53,12 +58,12 @@ python -m examples.swe_smith.prepare_data \
   --output /path/to/swe_smith/data
 ```
 
-输出目录须为空，保存 Parquet、实例记录和选择清单。省略 `--instance-ids-file` 可准备全量数据，
-但仍需提供所有任务对应的镜像，这三个镜像不覆盖完整数据集。
+The output directory must be empty; it stores Parquet, instance records, and selection manifests. Omit `--instance-ids-file` for the full dataset,
+but supply images for every task; these three images do not cover the complete dataset.
 
-## 本地与远端统一运行入口
+## Unified Local and Remote Entry Point
 
-在宿主机设置路径和空闲 NPU 编号；数据准备若在容器内完成，这里填写对应的宿主路径：
+Set paths and idle NPU IDs on the host. If data preparation ran in a container, supply the corresponding host paths:
 
 ```bash
 SWE_DATA=/path/to/swe_smith/data
@@ -70,11 +75,11 @@ swe_common=(--data-dir "$SWE_DATA" --images-path "$SWE_IMAGES"
             --model-dir "$SWE_MODEL" --devices 0,1)
 ```
 
-默认连接 `unix:///var/run/docker.sock`。入口自动填写配置、挂载目录并启动 controller；
-模型和 NPU 始终位于 controller 宿主。需要特权设备访问时，显式追加
-`swe_common+=(--privileged-controller)`，该选项与沙盒运行在本地还是远端无关。
+The default endpoint is `unix:///var/run/docker.sock`. The entry point fills configuration and mount paths and starts the controller.
+Models and NPUs always reside on the controller host. If privileged device access is required, explicitly append
+`swe_common+=(--privileged-controller)`; this option is independent of whether sandboxes run locally or remotely.
 
-### 短预算推理
+### Short-Budget Inference
 
 ```bash
 python -m examples.swe_smith.launch --mode infer "${swe_common[@]}" \
@@ -82,10 +87,10 @@ python -m examples.swe_smith.launch --mode infer "${swe_common[@]}" \
   --checkpoint-dir "$SWE_CHECKPOINTS/infer-unused"
 ```
 
-默认运行已准备的九例，每例最多两次调用、每次最多 512 输出 token。
-可追加 `--instance-id ID` 选择单例。推理不保存 checkpoint，但入口仍要求该目录参数。
+By default, run the nine prepared cases, with at most two calls per case and 512 output tokens per call.
+Append `--instance-id ID` to select one case. Inference saves no checkpoints, but the entry point still requires the checkpoint-directory argument.
 
-### 训练一步与新进程恢复
+### One Training Step and New-Process Recovery
 
 ```bash
 python -m examples.swe_smith.launch --mode train "${swe_common[@]}" \
@@ -98,16 +103,16 @@ python -m examples.swe_smith.launch --mode train "${swe_common[@]}" \
   --checkpoint-dir "$SWE_CHECKPOINTS/resume-step2"
 ```
 
-`--steps` 是总步数，恢复到 2 只追加一步。恢复须保持模型、配方及数据/镜像清单身份一致。
-每次使用新的结果目录，为完整 checkpoint 预留空间；训练和恢复分别保存。
-日志见 `runtime.log`，推理结果见 `predictions.jsonl`，调用和评分记录见 `sessions/`。
-入口结束后清理本次 controller 和临时目录，保留结果及 checkpoint；强制中断后需核查本次沙盒残留。
+`--steps` is the total step count, so resuming to 2 adds only one step. Recovery requires identical model, recipe, and data/image manifest identities.
+Use a new results directory each time and reserve space for complete checkpoints; training and resumed runs save separately.
+Logs are in `runtime.log`, inference results in `predictions.jsonl`, and call/grading records in `sessions/`.
+The entry point cleans its controller and temporary directories on exit while preserving results/checkpoints. After forced interruption, check for leftover sandboxes from that run.
 
-## 远端沙盒
+## Remote Sandboxes
 
-远端主机需有 Docker、对应架构的任务镜像；宿主需已解锁的 SSH-agent 和已验证的 host key。
-ARM64 远端可下载上面的镜像；amd64 远端须使用其对应的镜像和清单。
-已有目标架构的任务镜像和 CLI 运行镜像时，可在 RL 环境中生成远端清单：
+The remote host needs Docker and task images for its architecture. The launching host needs an unlocked SSH agent and a verified host key.
+ARM64 remotes can pull the images above; amd64 remotes require their own images and manifests.
+With task images and a CLI runtime image for the target architecture already available, generate a remote manifest in the RL environment:
 
 ```bash
 python -m examples.swe_smith.prepare_images \
@@ -116,21 +121,21 @@ python -m examples.swe_smith.prepare_images \
   --docker-host ssh://USER@HOST:PORT --cli-image TARGET_CLI_IMAGE
 ```
 
-已有完整清单可跳过此步；缺失任务镜像时显式加 `--pull`。
-启动时将上面的 `SWE_IMAGES` 换成远端清单的宿主路径，重新构造 `swe_common`，再追加：
+Skip this step if a complete manifest exists; explicitly add `--pull` for missing task images.
+Replace `SWE_IMAGES` above with the host path to the remote manifest, reconstruct `swe_common`, then append:
 
 ```bash
 swe_common+=(--docker-host ssh://USER@HOST:PORT)
 ```
 
-其余推理和训练命令相同。远端连接失败会报错，不会切换本地执行。
+The remaining inference/training commands are identical. Remote connection failure raises an error without falling back to local execution.
 
-## 图执行与验证范围
+## Graph Execution and Validation Scope
 
-9B 短预算 eager 已覆盖本地 ARM64 和远端 amd64 沙盒的推理、训练与新进程恢复。
-真实零奖励、零梯度仅证明流程运行；学习验收仍需真实混合奖励和非零更新。
-参考预算推理使用 [qwen3_5_9b_infer.yaml](configs/qwen3_5_9b_infer.yaml)，通过 `launch --mode infer --config` 选择。
-评分合同、图配置、资源参数、27B 及全量验证限制见[开发说明](../../docs/swe_smith.md)。
+9B short-budget eager validation covers inference, training, and new-process recovery with local ARM64 and remote amd64 sandboxes.
+Actual zero rewards and zero gradients prove only execution; learning acceptance still requires real mixed rewards and nonzero updates.
+Reference-budget inference uses [qwen3_5_9b_infer.yaml](configs/qwen3_5_9b_infer.yaml), selected through `launch --mode infer --config`.
+See the [development guide](../../docs/swe_smith.md) for grading contracts, graph configuration, resource parameters, and 27B/full-scale validation limits.
 
 ## Asynchronous training
 

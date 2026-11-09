@@ -1,93 +1,95 @@
-# SWE-Smith Code Agent：实现与限制
+# SWE-Smith Code Agent: Implementation and Limitations
 
-使用步骤见[示例 README](../examples/swe_smith/README.md)。本文维护实现边界、评分合同和验收要求。
+**English** | [简体中文](swe_smith.zh.md)
 
-## 代码组织
+See the [example README](../examples/swe_smith/README.md) for usage. This document maintains implementation boundaries, grading contracts, and acceptance requirements.
 
-任务通过 `program_callable` 接入公共 `SyncTrainer`；任务数据、仓库编排和业务评分留在示例。
+## Code Organization
 
-| 位置 | 职责 |
+Tasks integrate with the shared `SyncTrainer` through `program_callable`; task data, repository orchestration, and business scoring remain in examples.
+
+| Location | Responsibility |
 | --- | --- |
-| `examples/swe_smith/agent.py` | 仓库准备、Codex 生命周期、调用预算、冻结提交、评分和逐调用轨迹 |
-| `workspace.py` | 固定问题分支和可信测试恢复 |
-| `rl/agentic/codex/container_execution.py` | 与Search-R1共用的容器内会话中继、CLI执行和输出记录 |
-| `artifacts.py`、`reward.py` | 源码补丁投影、保护测试/配置、独立 pytest 评分与失败归因 |
-| `prepare_data.py`、`prepare_images.py` | 子集/全量转换、任务镜像映射、架构和身份核验 |
-| `infer.py`、`configs/` | 无训练的推理入口、模型配方及固定九例的镜像/任务身份 |
-| `launch.py`、`run_config.py` | 本地或 SSH 沙盒选择、路径和数据/镜像身份核验、可信 controller 生命周期 |
-| `rl/agentic/codex/`、`rl/agentic/envs/docker_workspace.py` | 通用 Codex 协议、原始采样证据、本地/远端工作区 |
-| `rl/workers/adapters/log_probs.py` | RL侧动作位置概率、分块词表投影与重计算 |
-| `rl/roles/`、`rl/weight_sync/`、`rl/trainer/checkpoint.py` | 训练构造、流式发布、图刷新及完整恢复 |
+| `examples/swe_smith/agent.py` | Repository preparation, Codex lifecycle, call budgets, frozen submissions, grading, and per-call trajectories |
+| `workspace.py` | Pin issue branches and restore trusted tests |
+| `rl/agentic/codex/container_execution.py` | In-container session relay, CLI execution, and output recording shared with Search-R1 |
+| `artifacts.py`, `reward.py` | Source patch projection, protected tests/configuration, independent pytest grading, and failure attribution |
+| `prepare_data.py`, `prepare_images.py` | Subset/full-data conversion, task image mapping, architecture and identity checks |
+| `infer.py`, `configs/` | Inference without training, model recipes, and fixed nine-case image/task identities |
+| `launch.py`, `run_config.py` | Local/SSH sandbox selection, paths and data/image identity checks, trusted controller lifecycle |
+| `rl/agentic/codex/`, `rl/agentic/envs/docker_workspace.py` | Generic Codex protocol, original sampling evidence, local/remote workspaces |
+| `rl/workers/adapters/log_probs.py` | RL-side action-position probabilities, chunked vocabulary projection, and recomputation |
+| `rl/workers/`, `rl/weight_sync/`, `rl/trainer/checkpoint.py` | Training construction, streaming publication, graph refresh, and complete recovery |
 
-## 任务与评分合同
+## Task and Grading Contract
 
-候选检出实例的问题分支，核验“Bug Patch → Remove F2P Tests”的结构并解析固定 commit。
-随后移除 Git 历史，保留 controller 捕获的可信问题基线。
-容器无网络、Docker socket 和 NPU；管理凭据不进入候选，relay 仅绑定其会话。
-候选、relay 和 grader 使用同一显式 Docker endpoint，远端连接失败不会切换本地执行。
+Candidates check out the instance's problem branch, validate the “Bug Patch → Remove F2P Tests” structure, and resolve pinned commits.
+Git history is then removed, while the controller retains the captured trusted problem baseline.
+Containers have no network, Docker socket, or NPU. Management credentials never enter candidates, and the relay is bound only to its session.
+Candidate, relay, and grader use the same explicit Docker endpoint; remote connection failure never switches to local execution.
 
-Responses 中同一回复的说明文字和函数调用合并为一个 assistant Chat 消息。
-来源校验允许解码串与 engine text 仅相差一个精确的末尾 EOS；原始采样 token 保留不变。
-未闭合 XML 属于不可执行的模型格式错误，其他来源不一致继续拒绝会话。
-预算终止响应确认交付后 relay 停止接收新请求，随后由控制器关闭；CLI 重试不能重新打开会话。
+Explanatory text and function calls in one Responses reply are combined into one assistant Chat message.
+Source validation permits decoded text and engine text to differ only by one exact trailing EOS; original sampled tokens remain unchanged.
+Unclosed XML is a nonexecutable model-format error; other source inconsistencies still reject the session.
+Once delivery of a budget-termination response is acknowledged, the relay stops accepting new requests and the controller shuts it down. CLI retries cannot reopen the session.
 
-Codex 正常结束或经网关证实调用预算耗尽后，停止候选并导出真实代码。
-`artifacts.py` 在 controller 上生成补丁，允许普通 Python / Python stub 源码修改，
-保护已有测试、项目配置、特殊文件和执行权限；不信任候选 Git 元数据。
-新增非 Python 的复现输入、备份等中间文件不进入提交补丁；新增 Python 测试/hook 仍检查受保护路径。
-评分版本为 `swe-smith-pytest-v3`，冻结工件可以独立重评，无需重新生成模型轨迹。
-工件 byte/file 上限由任务配置控制。
+After normal Codex completion or gateway-confirmed budget exhaustion, stop the candidate and export its actual code.
+`artifacts.py` generates the patch on the controller, allowing ordinary Python/Python-stub source changes
+while protecting existing tests, project configuration, special files, and execute permissions; candidate Git metadata is untrusted.
+New non-Python reproduction inputs, backups, and other intermediate files are excluded. New Python tests/hooks are still checked against protected paths.
+The grading version is `swe-smith-pytest-v3`; frozen artifacts can be regraded independently without regenerating model trajectories. <!-- codespell:ignore regraded -->
+Task configuration controls artifact byte/file limits.
 
-grader 从新容器启动，校验相同问题/测试 commit，应用冻结补丁并恢复可信测试。
-默认 `f2p_only=true`：全部 F2P 与相同测试文件内的 P2P；设为 false 可检查完整 P2P。
-所有选中测试均有可信状态且全部为 PASSED/XFAIL 才得到奖励 1；完整判题失败为 0。
-已独立确认的提交或语法错误可形成零奖励。候选源码导致测试无法收集时，
-须通过 pytest 钩子确认异常来自修改源码，且原问题基线能收集全部选中测试，才记为零奖励。
-保留真实异常和已报告状态，不为未运行节点伪造 FAILED。
-采样、容器、传输、无法归因的收集失败及其他不完整判题错误均拒绝更新。
+The grader starts in a fresh container, verifies the same problem/test commits, applies the frozen patch, and restores trusted tests.
+Default `f2p_only=true` selects all F2P and P2P in the same test files; false checks the complete P2P set.
+Reward 1 requires trusted statuses for all selected tests, all PASSED/XFAIL. Complete grading failure yields 0.
+Independently confirmed submission or syntax errors may yield zero reward. If candidate source prevents collection,
+pytest hooks must attribute the exception to modified source, and the original problem baseline must collect every selected test, before assigning zero reward.
+Retain actual exceptions and reported statuses; do not fabricate FAILED for unexecuted nodes.
+Sampling, container, transfer, unattributable collection, and other incomplete grading failures reject the update.
 
-## 训练配置与资源
+## Training Configuration and Resources
 
-模型范围为 Qwen3.5-9B / Qwen3.8-27B 的文本 GRPO、训练 TP=CP=1、
-colocated native vLLM、流式 `full_gather`、consistency off。不声明 BF16 bit-exact。
-训练和新进程恢复命令见[示例 README](../examples/swe_smith/README.md#训练一步与新进程恢复)。
-恢复须保持模型、配方及数据/镜像清单身份一致；恢复后先发布恢复版本，再继续采样和更新。
-支持完整训练 checkpoint 恢复，不支持恢复进行中的 Codex 会话或未完成的 optimizer step。
+Supported models are Qwen3.5-9B / Qwen3.8-27B for text GRPO with training TP=CP=1,
+colocated native vLLM and streamed `full_gather`, without the removed consistency field. No BF16 bit-exact claim is made.
+See the [example README](../examples/swe_smith/README.md#one-training-step-and-new-process-recovery) for training and new-process resume commands.
+Recovery requires identical model, recipe, and data/image manifest identities. Publish the restored version before resuming sampling and updates.
+Full training checkpoint recovery is supported; ongoing Codex sessions and incomplete optimizer steps are not recoverable.
 
-短预算配方每 rank 一个提示、每提示两个会话，每会话最多两次模型调用、单次最多 512 输出 token。
-`train.response_mini_batch_size` 的单位是逐调用训练行。增加调用预算会增加重计算上下文，
-须同时检查训练批大小、显存和耗时。真实奖励相同时可能零梯度；学习验收需真实混合奖励，
-可开启 `train.learning_gate` 检查非零更新，默认评分不注入人工奖励。
+Short-budget recipes use one prompt per rank, two sessions per prompt, at most two calls per session, and 512 output tokens per call.
+`train.response_mini_batch_size` counts per-call training rows. Larger call budgets increase recomputation context,
+so check training batch size, device memory, and runtime together. Identical real rewards may produce zero gradients; learning acceptance requires real mixed rewards.
+Enable `train.learning_gate` to check nonzero updates. Default scoring does not inject synthetic rewards.
 
-统一入口的训练端默认使用 `HCCL_IF_BASE_PORT=63200`、`HCCL_NPU_SOCKET_PORT_RANGE=63200-63299`；
-rollout 使用 `63400-63499`。覆盖训练端口须成对设置两个环境变量，范围在 `1024..65520` 内，
-包含基础端口且不与 rollout 重叠。9B 短配方显式配置 8 GiB KV cache，为重复权重发布保留空间。
+The unified training entry defaults to `HCCL_IF_BASE_PORT=63200` and `HCCL_NPU_SOCKET_PORT_RANGE=63200-63299`;
+rollout uses `63400-63499`. Override both training port variables together; the range must lie within `1024..65520`,
+include the base port, and avoid overlap with rollout. The short 9B recipe explicitly reserves an 8 GiB KV cache to leave room for repeated publication.
 
-### 采样组与训练 DP
+### Sampling Groups and Training DP
 
-公共 Trainer 按训练 DP rank 分配提示，`rollout.num_return_sequences` 是每个提示的会话数；
-组内 GRPO 优势在该 rank 内计算。目前不支持将同一提示组的会话分发到多个训练 DP rank。
-推理 TP 与训练采样组独立：vLLM DP1 / TP2 是一个两卡推理副本，不会自动重分配采样组。
+The shared Trainer assigns prompts by training DP rank; `rollout.num_return_sequences` is the session count per prompt.
+Within-group GRPO advantages are computed on that rank. Distributing sessions from one prompt group across training DP ranks is currently unsupported.
+Inference TP is independent of training sampling groups: vLLM DP1 / TP2 is one two-device inference replica and does not reassign sampling groups automatically.
 
-双卡 FSDP2 需要两个可分配提示。使用 `prepare_data --repeats 2` 创建同题副本后，
-每 rank 四会话得到两个独立四样本组、共八会话；每提示改为八会话则全局为十六会话。
-跨训练 DP 的采样组重分配应由公共 RL 层实现，保留唯一 episode 身份、真实奖励、
-policy version 和零损失 padding。
+Two-device FSDP2 needs two assignable prompts. After creating duplicate-question records with `prepare_data --repeats 2`,
+four sessions per rank form two independent four-sample groups, eight sessions total; eight per prompt yield sixteen globally.
+Redistribution across training DP ranks belongs in shared RL, preserving unique episode identities, actual rewards,
+policy versions, and zero-loss padding.
 
-## 参考预算推理
+## Reference-Budget Inference
 
 [qwen3_5_9b_infer.yaml](../examples/swe_smith/configs/qwen3_5_9b_infer.yaml)
-提供较长推理预算：100 次调用、单次最多 12,288 输出 token、上下文 81,920、
-5,400 秒、温度 1.0、thinking 关闭。工具协议为 Codex/Qwen3Coder。
-`max_observation_chars=6000` 对模型收到的观察保留首尾并按字符截断，原始工具证据不变。
-自动压缩阈值为 65,536，压缩请求也计入调用预算；CLI 自身的输出限制仍然有效。
-该配方不声明与其他 Agent 的提示、观察包装、压缩策略或随机轨迹完全一致。
-独立 grader 资源和超时由配方控制，外部终止不计作求解失败。
+provides a longer inference budget: 100 calls, at most 12,288 output tokens per call, 81,920 context tokens,
+5,400 seconds, temperature 1.0, and thinking disabled. The tool protocol is Codex/Qwen3Coder.
+`max_observation_chars=6000` retains the head and tail of observations delivered to the model and truncates by characters; raw tool evidence is unchanged.
+The automatic compaction threshold is 65,536; compaction requests also consume call budget. CLI output limits remain effective.
+This recipe does not claim identical prompts, observation wrappers, compaction strategies, or random trajectories to other agents.
+The recipe controls independent grader resources and timeouts; external termination is not a solving failure.
 
-## 图执行配置
+## Graph Execution Configuration
 
-固定 vLLM 0.23.0 / vLLM-Ascend 0.23.0.post1、rollout DP1 支持显式 FULL_DECODE_ONLY：
-设置 `enforce_eager=false`，在 `rollout.vllm` 下加入以下配置，并保持 `max_num_seqs=4`。
+Pinned vLLM 0.23.0 / vLLM-Ascend 0.23.0.post1 with rollout DP1 supports explicit FULL_DECODE_ONLY:
+Set `enforce_eager=false`, add the following under `rollout.vllm`, and retain `max_num_seqs=4`.
 
 ```yaml
 compilation_config:
@@ -97,28 +99,28 @@ compilation_config:
   max_cudagraph_capture_size: 4
 ```
 
-该模式包含 `torch.compile` 和图重放。流式 full-gather 完整发布并唤醒 KV 后，
-在开放采样前重新捕获 decode 图，刷新失败不得提交版本。
+This mode includes `torch.compile` and graph replay. After complete streamed full-gather publication and KV wake,
+recapture decode graphs before admitting sampling; a refresh failure must not commit the version.
 
-## 验证范围与回归
+## Validation Scope and Regression
 
-9B 短预算 eager 覆盖了 ARM64 Ascend controller 搭配本地 ARM64 或远端 amd64 沙盒，
-包括推理、训练、完整保存和新进程恢复。任务评分覆盖 schema、boltons、oauthlib 九例，
-通过问题基线失败/可信修复成功对照检查独立 grader。零奖励、零梯度的闭环只证明流程，
-不能作为有效学习的证据。
+9B short-budget eager validation covers ARM64 Ascend controllers with local ARM64 or remote amd64 sandboxes,
+including inference, training, complete saving, and new-process recovery. Task grading covers nine schema, boltons, and oauthlib cases,
+checking the independent grader against failing problem baselines and successful trusted fixes. Zero-reward, zero-gradient loops prove execution only,
+not effective learning.
 
-9B 图推理已运行；图模式重复发布刷新、长预算真实混合奖励更新/恢复、27B 完整回归和
-全数据集验收仍需单独执行。更多仓库须检查架构、分支布局、测试依赖和资源需求。
-当前源码补丁范围只含普通 Python / Python stub；其他语言及需要修改构建配置的任务不在验收范围内。
+9B graph inference has run. Repeated graph-mode publication/refresh, long-budget updates/recovery with real mixed rewards, complete 27B regression,
+and full-dataset acceptance still require separate execution. Additional repositories require architecture, branch layout, test dependency, and resource checks.
+Current patch scope includes only ordinary Python/Python stubs; other languages and tasks requiring build-configuration changes are outside acceptance scope.
 
-从仓库根目录运行 CPU 合同检查：
+Run CPU contract checks from the repository root:
 
 ```bash
 python -m pytest -q tests/ut/rl/agentic/swe_smith \
   tests/ut/rl/agentic/codex tests/ut/rl/agentic/test_docker_workspace.py
 ```
 
-模型数学合同在 `tests/ut/auto_models/models/qwen3_5/`，训练、发布和恢复在 `tests/ut/rl/` 对应模块。
-共享代码变更还须覆盖 Search-R1、文本网关、Hermes 证据和完整 checkpoint 回归。
-CPU 通过不等同于新硬件组合、长预算学习或全数据集通过；真实运行前须检查设备、镜像空间、
-独立的输出/checkpoint 目录和预算。
+Model mathematical contracts live in `tests/ut/auto_models/models/qwen3_5/`; training, publication, and recovery tests reside in corresponding `tests/ut/rl/` modules.
+Shared code changes must also cover Search-R1, the text gateway, Hermes evidence, and complete checkpoint regression.
+CPU success does not establish acceptance for new hardware combinations, long-budget learning, or the full dataset. Before real execution, check devices, image storage,
+separate output/checkpoint directories, and budgets.

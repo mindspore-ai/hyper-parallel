@@ -1,25 +1,27 @@
-# Hyper-RL 功能导航
+# Hyper-RL Feature Navigation
 
-路径相对 `hyper_parallel/rl/`；`tests/ut/rl/` 相对仓库根目录。
+**English** | [简体中文](rl-navigation.zh.md)
 
-| 功能 | 配置/入口 | 实现 | 验证 |
+Paths are relative to `hyper_parallel/rl/`; `tests/ut/rl/` is relative to the repository root.
+
+| Feature | Configuration / entry point | Implementation | Validation |
 | --- | --- | --- | --- |
-| 构建与支持矩阵 | `train_rl.py`、本次 YAML | `rl/config/loader.py`、`rl/config/`、`rl/trainer/build.py` | `tests/ut/rl/trainer/test_config_runtime.py` |
-| 显式替换规则 | `train.plan_overrides`、角色 overrides | `rl/config/resolve.py`、`rl/workers/adapters/qwen3.py` | `test_qwen3_master.py`、`test_moe_config.py` |
-| 同步训练 | 默认执行模式 | `rl/trainer/sync.py` | `test_trainer_orchestration.py` |
-| 分离异步 | `async_training` | `rl/trainer/fully_async.py`、`rl/async_runtime/producer.py` | `tests/ut/rl/fully_async/` |
-| 共卡异步 | `colocate_async` | `rl/trainer/colocate_async.py`、`rl/async_runtime/colocated.py` | `tests/ut/rl/colocate_async/` |
-| GRPO/PPO/GSPO | `algorithm.name` | `rl/algorithm/`、`rl/workers/actor.py`、`critic.py` | `tests/ut/rl/algorithm/`、`policy/` |
-| 概率、目标、bootstrap | `old_log_prob_source`、算法需求 | `rl/workers/targets.py`、`rl/data/experience.py` | 目标顺序、概率身份及 PPO 测试 |
-| 共享优化器与驻留 | optimizer、accelerator | `rl/workers/engine/` | optimizer precision、phase offload、checkpoint 测试 |
-| 动态 batching / DP balance | 三类 token budget、`balance_dp_tokens` | `rl/workers/input/` | 分批预算、梯度、行顺序测试 |
-| Agent 及真实轨迹 | `agentic`、examples | `rl/agentic/`、`rl/data/` | `tests/ut/rl/agentic/`、`data/` |
-| native-vLLM | `model_implementation: native` | `rl/rollout/vllm.py`、`vllm_plugin.py` | rollout runtime、plugin、sampler 测试 |
-| full_gather IPC/HCCL | weight_sync、deployment | `rl/weight_sync/` | transaction、transport、worker 和 MoE 映射测试 |
+| Construction and support matrix | `train_rl.py`, this run's YAML | `rl/config/loader.py`, `rl/config/`, `rl/trainer/build.py` | `tests/ut/rl/trainer/test_config_runtime.py` |
+| Explicit replacement rules | `train.plan_overrides`, role overrides | `rl/config/resolve.py`, `rl/workers/adapters/qwen3.py` | `test_qwen3_master.py`, `test_moe_config.py` |
+| Synchronous training | Default execution mode | `rl/trainer/sync.py` | `test_trainer_orchestration.py` |
+| Disjoint asynchronous training | `async_training` | `rl/trainer/fully_async.py`, `rl/async_runtime/producer.py` | `tests/ut/rl/fully_async/` |
+| Colocated asynchronous training | `colocate_async` | `rl/trainer/colocate_async.py`, `rl/async_runtime/colocated.py` | `tests/ut/rl/colocate_async/` |
+| GRPO/PPO/GSPO | `algorithm.name` | `rl/algorithm/`, `rl/workers/actor.py`, `critic.py` | `tests/ut/rl/algorithm/`, `policy/` |
+| Probabilities, targets, and bootstrap | `old_log_prob_source`, algorithm requirements | `rl/workers/targets.py`, `rl/data/experience.py` | Target ordering, probability identity, and PPO tests |
+| Shared optimizer and residency | optimizer, accelerator | `rl/workers/engine/` | Optimizer precision, phase offload, and checkpoint tests |
+| Dynamic batching / DP balance | Three token-budget types, `balance_dp_tokens` | `rl/workers/input/` | Batch budget, gradient, and row-order tests |
+| Agent and actual trajectories | `agentic`, examples | `rl/agentic/`, `rl/data/` | `tests/ut/rl/agentic/`, `data/` |
+| Native-vLLM | `model_implementation: native` | `rl/rollout/vllm.py`, `vllm_plugin.py` | Rollout runtime, plugin, and sampler tests |
+| full_gather IPC/HCCL | weight_sync, deployment | `rl/weight_sync/` | Transaction, transport, worker, and MoE mapping tests |
 | RM | `reward_model` | `rl/reward_model/runtime.py` | `tests/ut/rl/reward_model/` |
-| Teacher / OPD / MOPD | `distillation` | `rl/distillation/`、`rl/algorithm/distillation.py` | `tests/ut/rl/distillation/` |
-| MoE R3 | `train.router_replay.mode` | `rl/workers/adapters/router_*`、`rl/rollout/router_capture.py` | router replay 与 MoE 测试 |
-| 保存与恢复 | `train.checkpoint` | `rl/trainer/checkpoint.py`、`rl/async_runtime/protocol.py` | schema、精度、拓扑、版本、RNG 与 buffer 恢复测试 |
+| Teacher / OPD / MOPD | `distillation` | `rl/distillation/`, `rl/algorithm/distillation.py` | `tests/ut/rl/distillation/` |
+| MoE R3 | `train.router_replay.mode` | `rl/workers/adapters/router_*`, `rl/rollout/router_capture.py` | Router replay and MoE tests |
+| Save and resume | `train.checkpoint` | `rl/trainer/checkpoint.py`, `rl/async_runtime/protocol.py` | Schema, precision, topology, version, RNG, and buffer recovery tests |
 
-设备测试入口位于 `hyper_parallel/rl/tests/st/`；使用前按[系统测试说明](../hyper_parallel/rl/README.md#系统测试)分配设备。
-详见[运行时架构](../hyper_parallel/rl/docs/architecture.md)和[native-vLLM 合同](../hyper_parallel/rl/docs/vllm_rollout.md)。
+Device-test entry points reside in `hyper_parallel/rl/tests/st/`; allocate devices following the [system test instructions](../hyper_parallel/rl/README.md#system-tests) before running them.
+See the [runtime architecture](../hyper_parallel/rl/docs/architecture.md) and [native-vLLM contract](../hyper_parallel/rl/docs/vllm_rollout.md).

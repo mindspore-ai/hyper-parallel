@@ -1,262 +1,265 @@
-# Multicore 私有 SHMEM
+# Multicore Private SHMEM
 
-SHMEM是Multicore内部的对称内存与单边通信组件。它管理进程级Runtime和对称Allocation，提供Put、Get、
-Signal、Barrier与AllGather等通信机制。
+**English** | [简体中文](shmem.zh.md)
 
-## 1. 组件定位与架构
+SHMEM is Multicore's internal symmetric-memory and one-sided communication component. It manages process-level runtimes and symmetric allocations, providing Put, Get,
+Signal, Barrier, AllGather, and other communication mechanisms.
 
-### 1.1 依赖方向
+## 1. Component Role and Architecture
 
-SHMEM为MegaKernel提供物理资源与通信机制。Host控制面和Device执行路径分别如下：
+### 1.1 Dependency Direction
+
+SHMEM supplies physical resources and communication mechanisms to MegaKernels. The host control plane and device execution paths are shown below:
 
 ```mermaid
 flowchart TB
-    subgraph Business["MegaMoe业务层"]
-        P["spec / plan<br/>计算图、任务与事件依赖"]
-        H["HeapManager<br/>容量、layout与业务状态"]
-        W["workspace<br/>Tensor映射、lease与完成事件"]
-        H -->|配置与绑定| W
+    subgraph Business["MegaMoe business layer"]
+        P["spec / plan<br/>Compute graphs, tasks, and event dependencies"]
+        H["HeapManager<br/>Capacity, layout, and business state"]
+        W["workspace<br/>Tensor mapping, leases, and completion events"]
+        H -->|Configure and bind| W
     end
-    subgraph Host["SHMEM Host控制面"]
-        L["Python lifecycle / API<br/>Root、引用与阶段收敛"]
+    subgraph Host["SHMEM host control plane"]
+        L["Python lifecycle / API<br/>Roots, references, and stage agreement"]
         B["SHMEM Torch binding"]
-        N["Native Runtime<br/>物理状态、设备与Allocation登记"]
+        N["Native Runtime<br/>Physical state, devices, and allocation registry"]
         A["CANN Host Adapter"]
         L --> B --> N --> A
     end
-    subgraph Device["MegaKernel设备执行"]
-        T["Torch算子binding"]
-        K["MegaKernel worker<br/>业务任务与通信协议"]
+    subgraph Device["MegaKernel device execution"]
+        T["Torch operator binding"]
+        K["MegaKernel worker<br/>Business tasks and communication protocols"]
         D["SHMEM Device Data Plane"]
         C["CANN Device Adapter"]
         T --> K --> D --> C
     end
-    V["CANN SHMEM<br/>Host Runtime与设备通信原语"]
-    H -->|heap目标、替换清单、只读预检| L
-    W -->|分配与释放对称Tensor| L
-    P -->|调度配置| T
-    W -->|Tensor及事件存储| T
+    V["CANN SHMEM<br/>Host runtime and device communication primitives"]
+    H -->|Heap target, replacement list, read-only preflight| L
+    W -->|Allocate and free symmetric tensors| L
+    P -->|Scheduling configuration| T
+    W -->|Tensors and event storage| T
     A --> V
     C --> V
-    N -.->|拥有设备执行所需的对称Allocation| W
+    N -.->|Owns symmetric allocations needed for device execution| W
 ```
 
-实线表示调用或参数传递，虚线表示物理资源依赖；图中的Host与Device路径共享同一活动Runtime及其对称内存。
-Python控制面负责Root协调和引用生命周期；Native Runtime拥有物理Runtime状态和Allocation登记；CANN Adapter
-隔离上游接口；Device Data Plane提供设备侧地址、数据搬移和同步机制。MegaKernel执行已提交的设备任务时，
-不为每次Put/Get/Signal回到Python控制面。Host侧`shmem.put/get`是另一个显式stream提交入口。
+Solid arrows indicate calls or argument passing; dashed arrows indicate physical-resource dependencies. The host and device paths share the same active runtime and symmetric memory.
+The Python control plane coordinates roots and reference lifecycles; the native runtime owns physical runtime state and the allocation registry; the CANN adapter
+isolates upstream interfaces; and the device data plane provides device-side addressing, data movement, and synchronization. When executing submitted device tasks, a MegaKernel
+does not return to the Python control plane for each Put/Get/Signal. Host-side `shmem.put/get` is a separate explicit stream-submission entry point.
 
-代码层次如下：
+The code hierarchy is:
 
 ```text
 core/multicore/shmem/
-├── _runtime.py       # Native与Torch模块的惰性访问
-├── _lifecycle.py     # Runtime、Root、引用生命周期和Runtime restart
-├── _api.py           # Allocation和通信接口
-├── _debug.py         # Runtime只读诊断
+├── _runtime.py       # Lazy access to native and Torch modules.
+├── _lifecycle.py     # Runtime, root, and reference lifecycles; runtime restart.
+├── _api.py           # Allocation and communication interfaces.
+├── _debug.py         # Read-only runtime diagnostics.
 └── ccsrc/
     ├── bindings/     # Torch binding
     ├── runtime/      # Native Runtime
     ├── cann/         # CANN Adapter
-    ├── data_plane/   # 数据面实现
-    ├── device/       # Device公共定义
-    └── ops/          # AllGather等设备算子
+    ├── data_plane/   # Data-plane implementation.
+    ├── device/       # Shared device definitions.
+    └── ops/          # Device operators such as AllGather.
 ```
 
-### 1.2 组件职责
+### 1.2 Component Responsibilities
 
-- 管理进程内唯一活动Runtime的初始化、引用计数、Root成员关系、关闭和terminal状态。
-- 冻结并校验Runtime使用的NPU设备、Root坐标和Native配置。
-- 管理对称Allocation的创建、释放、登记和合法性检查。
-- 提供单边通信、信号、Barrier和AllGather，并定义其stream与Host完成语义。
-- 执行调用方已经决定的Runtime restart事务，包括资源覆盖校验、quiesce、shutdown、bootstrap、
-  initialize以及有序的Allocation释放和恢复。
-- 提供Runtime、Native配置和活动Allocation的只读诊断。
+- Manage initialization, reference counting, root membership, shutdown, and terminal state for the process's sole active runtime.
+- Freeze and validate the runtime's NPU device, root coordinates, and native configuration.
+- Manage creation, release, registration, and validity checks for symmetric allocations.
+- Provide one-sided communication, signals, Barrier, and AllGather, defining their stream and host completion semantics.
+- Execute runtime-restart transactions already planned by callers, including resource-coverage validation, quiesce, shutdown, bootstrap,
+  initialization, and ordered allocation release and restoration.
+- Provide read-only diagnostics for the runtime, native configuration, and active allocations.
 
-### 1.3 接口边界与语义
+### 1.3 Interface Boundaries and Semantics
 
-调用方通过SHMEM边界提供：
+Callers provide the following at the SHMEM boundary:
 
-- Root ProcessGroup、已选定的当前NPU设备和物理heap字节数；`acquire()`从当前设备读取并冻结设备归属。
-- 对称Allocation的shape、dtype和alignment。
-- 单边通信的本地Tensor、远端对称地址和Root内PE编号。
-- collective调用顺序、stream依赖和资源释放时机。
-- Runtime restart所需的目标heap字节数、完整Allocation替换清单及业务状态预检钩子。
+- A root ProcessGroup, the selected current NPU device, and physical heap bytes; `acquire()` reads the current device and freezes device ownership.
+- Symmetric allocation shapes, dtypes, and alignments.
+- Local tensors, remote symmetric addresses, and root-local PE IDs for one-sided communication.
+- Collective call order, stream dependencies, and resource-release timing.
+- Target heap bytes, a complete allocation-replacement list, and business-state preflight hooks for runtime restart.
 
-SHMEM返回对称Tensor、通信入队结果、Runtime状态或restart结果；`debug_state()`提供Runtime、Native配置和
-Allocation的只读事实。调用方拥有业务描述及其发布时机，SHMEM接口只表达物理资源与通信语义。
+SHMEM returns symmetric tensors, communication enqueue results, runtime state, or restart results; `debug_state()` exposes read-only facts about the runtime, native configuration,
+and allocations. Callers own business descriptions and when to publish them; SHMEM interfaces express only physical-resource and communication semantics.
 
-restart预检钩子只读地验证业务状态，返回可比较的确定性快照，不分配、释放资源或发布状态。SHMEM只比较快照
-是否一致；阶段操作直接返回用于一致性比较的manifest，无声明值的阶段返回`None`。内部描述由生成源、写入
-约束和所有者的锁维护一致性，参数、资源状态及通信完成在各自边界校验。失败处理见[失败与恢复合同](#44-失败与恢复合同)。
+Restart preflight hooks validate business state read-only and return comparable deterministic snapshots; they do not allocate or free resources or publish state. SHMEM only compares snapshots
+for agreement. Stage operations return manifests directly for consistency checks, or `None` when a stage declares no value. Generation sources, write
+constraints, and owner locks maintain internal-description consistency; arguments, resource state, and communication completion are validated at their respective boundaries. See the [Failure and Recovery Contract](#44-failure-and-recovery-contract).
 
-### 1.4 MegaMoe与SHMEM的状态所有权
+### 1.4 MegaMoe and SHMEM State Ownership
 
-MegaKernel是融合任务的执行方式；MegaMoe是使用该方式的业务模块。业务plan、workspace、物理Runtime和设备
-通信协议各有独立的所有者。
+MegaKernel is a fused-task execution approach; MegaMoe is a business module using that approach. Business plans, workspaces, physical runtimes, and device
+communication protocols have separate owners.
 
-| 所有者 | 负责的状态与行为 |
+| Owner | State and behavior owned |
 | --- | --- |
-| [Multicore资源管理](../modules/module.py) | 模块成员、兼容资源共享、延迟绑定、协调关闭 |
-| [MegaMoe spec与plan](../modules/mega_moe/plan.py) | 业务规格、正反向计算图、任务/事件配置和tiling |
-| [MegaMoe HeapManager](../modules/mega_moe/heap_manager.py) | reservation、layout、容量预算、替换描述、业务epoch和growth record |
-| [MegaMoe workspace](../modules/mega_moe/workspace.py) | Tensor字段映射、lease、完成事件、反向图使用关系和业务计数器布局 |
-| [SHMEM lifecycle](../shmem/_lifecycle.py) | 引用、Root一致性、阶段收敛、物理restart编排和进程级不可用标记 |
-| [Native Runtime](../shmem/ccsrc/runtime/runtime.cpp) | 设备归属、物理状态、Allocation登记、输入合法性及诊断事实 |
-| [Device Data Plane](../shmem/ccsrc/data_plane/) | 对称地址访问、数据搬移、信号和完成机制 |
+| [Multicore resource management](../modules/module.py) | Module membership, compatible resource sharing, deferred binding, coordinated close |
+| [MegaMoe spec and plan](../modules/mega_moe/plan.py) | Business specifications, forward/backward compute graphs, task/event configuration, and tiling |
+| [MegaMoe HeapManager](../modules/mega_moe/heap_manager.py) | Reservations, layouts, capacity budgets, replacement descriptions, business epochs, and growth records |
+| [MegaMoe workspace](../modules/mega_moe/workspace.py) | Tensor-field mappings, leases, completion events, backward-graph usage relationships, and business-counter layouts |
+| [SHMEM lifecycle](../shmem/_lifecycle.py) | References, root consistency, stage agreement, physical restart orchestration, and process-level unavailability markers |
+| [Native Runtime](../shmem/ccsrc/runtime/runtime.cpp) | Device ownership, physical state, allocation registry, input validity, and diagnostic facts |
+| [Device Data Plane](../shmem/ccsrc/data_plane) | Symmetric-address access, data movement, signals, and completion mechanisms |
 
-HeapManager的`ready/failed`描述业务资源是否可用；SHMEM的invalidated描述进程是否允许继续使用物理Runtime。
-物理restart成功后，业务绑定仍可能失败，两者具有不同的状态转换条件。HeapManager在物理失败时查询
-SHMEM健康事实并更新自身状态，不通过解析错误文案猜测状态。
+HeapManager's `ready/failed` state describes business-resource availability; SHMEM's invalidated state determines whether the process may continue using the physical runtime.
+Business binding may still fail after a successful physical restart, and the two have different transition conditions. On physical failure, HeapManager queries
+SHMEM health facts and updates its own state without inferring status from error-message text.
 
-容量到物理内存的转换只发生在调用方：MegaMoe根据路由需求和业务layout计算目标字节数，再交给SHMEM执行。
-SHMEM知道Tensor的shape、dtype、alignment及字节范围，但不知道其中哪一维表示token或expert。
+Capacity is converted to physical-memory requirements only by the caller: MegaMoe calculates target bytes from routing demand and business layouts, then asks SHMEM to execute.
+SHMEM knows tensor shapes, dtypes, alignments, and byte ranges, but not which dimension represents tokens or experts.
 
-### 1.5 MegaKernel执行与通信协议
+### 1.5 MegaKernel Execution and Communication Protocols
 
-以MegaMoe为例，plan描述Dispatch、GMM、SwiGLU、Combine的任务及依赖，workspace提供对应的Tensor、
-事件存储和有效容量；Torch binding将这些参数提交给设备worker。worker按业务任务决定访问的PE、槽位和时机，
-调用SHMEM数据面完成传输及信号操作。
+For MegaMoe, the plan describes Dispatch, GMM, SwiGLU, and Combine tasks and dependencies; the workspace supplies their tensors,
+event storage, and valid capacities; and the Torch binding submits these arguments to device workers. Workers select the PE, slot, and timing according to business tasks,
+then invoke the SHMEM data plane for transfers and signals.
 
-- 专家编号到Root PE的映射、Push/Pull选择、接收槽位、计数器布局和复用代次属于MegaMoe协议。
-- 对称地址是否合法、访问范围、Signal操作和通信完成语义属于SHMEM机制。
-- workspace lease和autograd保存对象决定何时仍有计算需要旧Tensor。SHMEM无法从Allocation登记推断这些关系。
-- 调用方必须在释放或restart前停止旧Storage的使用，并建立所需的stream完成关系。对象仍存在不代表Storage仍有效。
-- plan缓存只能复用与当前规格匹配的调度描述；重建后使用的物理Tensor由workspace重新绑定，不将旧地址视为稳定标识。
+- Expert-to-root-PE mappings, Push/Pull selection, receive slots, counter layouts, and reuse generations belong to the MegaMoe protocol.
+- Symmetric-address validity, access ranges, signal operations, and communication-completion semantics belong to SHMEM mechanisms.
+- Workspace leases and autograd-saved objects determine whether computation still needs old tensors. SHMEM cannot infer these relationships from its allocation registry.
+- Before release or restart, callers must stop using old storage and establish the necessary stream-completion relationships. An object remaining alive does not imply its storage is valid.
+- Plan caches may reuse only scheduling descriptions matching the current specification; workspaces rebind physical tensors after rebuilding, and old addresses are not stable identities.
 
-通信任务的具体调度见[MoE-FFN架构设计](architecture.md)，SHMEM完成语义见第3节。控制面检查位于Host调用边界，
-设备通信任务不逐次经过Host检查；普通执行的正确性独立于诊断采集。
+See [MoE-FFN Architecture Design](architecture.md) for communication-task scheduling and Section 3 for SHMEM completion semantics. Control-plane checks occur at host call boundaries;
+device communication tasks do not pass through host checks individually, and ordinary execution correctness does not depend on diagnostic capture.
 
-架构图展示主要调用关系。MegaMoe部分设备代码还直接访问CANN设备状态，这些调用与私有SDK版本存在耦合。
-CANN Adapter负责上游机制适配，业务worker负责通信任务及协议。
+The architecture diagram shows the main call relationships. Some MegaMoe device code also accesses CANN device state directly, coupling those calls to the private SDK version.
+The CANN adapter adapts upstream mechanisms; business workers own communication tasks and protocols.
 
-### 1.6 跨层协作与Root选择
+### 1.6 Cross-Layer Coordination and Root Selection
 
-[_collective](../_collective.py)提供显式group上的结果交换、失败报告和rank诊断。
-[_automatic](../_automatic.py)负责自动清理、框架teardown适配和注册Root选择，结果交换委托给共享模块。
-其`exchange(value)`和`collective_call(callback, *, stage)`仅使用注册Root；需要显式group的调用使用`_collective`。
+[_collective](../_collective.py) provides result exchange, failure reporting, and rank diagnostics on explicit groups.
+[_automatic](../_automatic.py) handles automatic cleanup, framework teardown adaptation, and registered-root selection, delegating result exchange to the shared module.
+Its `exchange(value)` and `collective_call(callback, *, stage)` use only the registered root; calls requiring an explicit group use `_collective`.
 
-MegaMoe资源构造和workspace关闭使用所属HeapManager的`root_group`，不依赖自动清理的Root注册状态。
-workspace的集体关闭及部分释放重试要求已绑定HeapManager；缺失owner时不回退到WORLD或注册Root。
-通用ResourceManager的资源回收与自动清理仍使用`_automatic`的注册Root适配。
+MegaMoe resource construction and workspace close use the owning HeapManager's `root_group`, independently of automatic cleanup's root registration.
+Collective workspace close and partial-release retries require a bound HeapManager; a missing owner does not fall back to WORLD or the registered root.
+Generic ResourceManager reclamation and automatic cleanup still use `_automatic`'s registered-root adapter.
 
-HeapManager的Configuration/LayoutAgreement使用自身Root交换业务配置，并拥有单rank配置`ValueError`契约，
-SHMEM阶段使用acquire时的Root收敛物理结果。distributed未初始化时，共享交换返回本地结果；该结果不证明
-Runtime健康，生命周期状态变化由SHMEM前置校验判定。
+HeapManager's Configuration/LayoutAgreement exchanges business configuration on its own root and owns the single-rank configuration `ValueError` contract;
+SHMEM stages use the root from acquire to establish agreement on physical results. Without distributed initialization, shared exchange returns local results; that does not prove
+runtime health, and SHMEM precondition checks determine lifecycle transitions.
 
-## 2. Runtime模型与生命周期
+## 2. Runtime Model and Lifecycle
 
-### 2.1 Root、world与PE坐标
+### 2.1 Root, World, and PE Coordinates
 
-本文中的**world**是当前获取的CANN SHMEM Root group，可能小于Torch WORLD。PE编号使用该Root group的
-局部rank，不是Torch global rank。
+In this document, **world** means the acquired CANN SHMEM root group, which may be smaller than Torch WORLD. PE IDs use
+local ranks within that root group, not Torch global ranks.
 
-- `acquire(None)`选择Torch WORLD；显式EP group可以是非连续子组。
-- 不相交的PP或DP group使用各自group-local CANN unique ID独立bootstrap。
-- 初始化、Allocation顺序、复用Barrier和最终释放只涉及Root成员，不要求无关WORLD成员参与。
-- 一个进程只支持一个有序的活动membership。等价group handle可以共享Runtime；Root重叠但成员或顺序不同的
-  group会被拒绝。
+- `acquire(None)` selects Torch WORLD; an explicit EP group may be a noncontiguous subgroup.
+- Disjoint PP or DP groups bootstrap independently using group-local CANN unique IDs.
+- Initialization, allocation order, reuse barriers, and final release involve only root members, without requiring unrelated WORLD members.
+- A process supports only one active ordered membership. Equivalent group handles may share the runtime; overlapping roots with different members or ordering
+  are rejected.
 
-### 2.2 引用生命周期
+### 2.2 Reference Lifecycle
 
-SHMEM通过配对接口管理进程内唯一Runtime：
+SHMEM manages the process's sole runtime through paired interfaces:
 
 ```python
 from hyper_parallel.core.multicore import shmem
 
-shmem.acquire()  # 首个引用初始化Runtime
+shmem.acquire()  # The first reference initializes the runtime.
 try:
     ...
 finally:
-    shmem.release()  # 最后一个引用关闭Runtime
+    shmem.release()  # The final reference shuts down the runtime.
 ```
 
-- 每次成功`acquire()`必须对应一次`release()`。
-- 首个引用解析Root并初始化Native Runtime；后续等价Root只增加引用，不重复初始化。
-- 非最后一个`release()`只减少引用。最后一个引用负责关闭Runtime。
-- `root_members()`返回Root的Torch global ranks，不能把该结果当作CANN PE编号。
+- Every successful `acquire()` must have a matching `release()`.
+- The first reference resolves the root and initializes the native runtime; subsequent equivalent roots only increment the reference count without reinitializing.
+- A nonfinal `release()` only decrements the reference count. The final reference shuts down the runtime.
+- `root_members()` returns the root's Torch global ranks, which must not be treated as CANN PE IDs.
 
-### 2.3 关闭与失败状态
+### 2.3 Shutdown and Failure States
 
-最后一个引用释放前，调用方必须完成相关backward和设备操作、释放全部对称Allocation，并保持初始化时冻结的
-NPU为当前设备。所有Root rank必须按一致顺序关闭，再销毁HCCL ProcessGroup。
+Before releasing the final reference, callers must finish relevant backward and device operations, free all symmetric allocations, and keep the NPU frozen at initialization
+as the current device. All root ranks must close in the same order before destroying the HCCL ProcessGroup.
 
-- 关闭前置条件的纯校验失败会保留最后一个引用，调用方修正Allocation或设备选择后可以重试`release()`。
-- Native初始化失败不产生引用。能否重新尝试还取决于设备、Root通信及上游初始化后的状态；
-  Python允许再次调用不等于保证任意初始化失败后可安全重试。
-- 干净关闭后，同一进程可以再次`acquire()`开启新生命周期；heap配置在新生命周期首次获取时重新生效。
+- Pure shutdown-precondition validation failures retain the final reference; callers can correct allocations or device selection and retry `release()`.
+- Failed native initialization creates no reference. Retry safety also depends on the device, root communication, and state after upstream initialization;
+  Python permitting another call does not guarantee safe retries after every initialization failure.
+- After clean shutdown, the same process can call `acquire()` for a new lifecycle; heap configuration takes effect again on that lifecycle's first acquisition.
 
-关闭和restart的Runtime失效判定遵循[失败与恢复合同](#44-失败与恢复合同)。
+Runtime invalidation during shutdown and restart follows the [Failure and Recovery Contract](#44-failure-and-recovery-contract).
 
-## 3. 接口合同
+## 3. Interface Contracts
 
-所有操作都要求调用方持有尚未释放的Runtime引用，并且不得与最后一个`release()`并发。SHMEM只跟踪通过
-`shmem.empty()`创建的对称Allocation；调用方负责确保使用这些Allocation的计算已经完成，再释放Allocation、
-关闭Runtime或销毁ProcessGroup。
+All operations require an unreleased runtime reference and must not run concurrently with the final `release()`. SHMEM tracks only symmetric allocations created through
+`shmem.empty()`. Callers must ensure computation using those allocations has completed before freeing allocations,
+shutting down the runtime, or destroying the ProcessGroup.
 
-### 3.1 对称内存
+### 3.1 Symmetric Memory
 
-- `shmem.empty(*size, dtype=None, alignment=None)`：从对称heap分配连续Tensor；`alignment`是可选的
-  分配基址字节对齐。全world必须以一致顺序调用。
-- `shmem.free(tensor)`：在相关stream静止后释放完整Allocation，view不能独立释放。成功后本地共享Storage
-  缩为0，data pointer清空，原Tensor和全部view均失效，但shape元数据保留。
+- `shmem.empty(*size, dtype=None, alignment=None)`: allocate a contiguous tensor from the symmetric heap; optional `alignment` specifies
+  the allocation base's byte alignment. All world members must call in the same order.
+- `shmem.free(tensor)`: free a complete allocation after relevant streams are quiescent; views cannot be freed independently. On success, local shared storage
+  shrinks to 0 and its data pointer is cleared. The original tensor and all views become invalid, while shape metadata remains.
 
-重复`free`、释放上一生命周期的Tensor或把失效Tensor传给SHMEM操作都会被拒绝。分配器可能复用已释放地址，
-调用方仍应在`free`后丢弃原Tensor及全部view。既定模式是首次使用时分配、关闭时释放，不支持高频分配释放循环。
+Repeated `free`, freeing a tensor from a previous lifecycle, or passing invalid tensors to SHMEM operations is rejected. Allocators may reuse freed addresses,
+so callers should discard the original tensor and all views after `free`. The intended pattern allocates on first use and frees at close; high-frequency allocation/free loops are unsupported.
 
-### 3.2 同步与集合操作
+### 3.2 Synchronization and Collectives
 
-- `shmem.barrier(blocking=True)`：在当前NPU stream上入队world barrier。默认在返回前同步当前stream；
-  `blocking=False`只保证入队，后续依赖操作必须提交到同一stream。全world按一致顺序调用阻塞Barrier，可以在
-  `free()`前收敛各rank当前stream上的既有工作。
-- `shmem.host_barrier()`：执行Host同步的HCCL world barrier，不经过SHMEM设备Barrier。返回时，各rank当前
-  stream上早于本调用入队的工作已经完成；其他stream不在保证范围内。单PE场景为no-op。
-- `shmem.all_gather(output, input)`：执行world AllGather，`output`必须为对称Tensor，槽位按world rank排列。
-  零字节输入完成校验后为no-op。接口不隐含Barrier：gather前用`host_barrier()`确保各rank的input和对称output
-  已经就绪；本rank stream完成后再次用`host_barrier()`确保全rank输出可读，然后才能覆写input或释放output。
+- `shmem.barrier(blocking=True)`: enqueue a world barrier on the current NPU stream. By default, synchronize the current stream before returning;
+  `blocking=False` guarantees only enqueueing, and dependent operations must be submitted to the same stream. Blocking barriers called in the same order by all world members can
+  complete each rank's existing current-stream work before `free()`.
+- `shmem.host_barrier()`: execute a host-synchronous HCCL world barrier without using the SHMEM device barrier. On return, work enqueued before this call on each rank's current
+  stream has completed; other streams are outside the guarantee. This is a no-op for a single PE.
+- `shmem.all_gather(output, input)`: perform world AllGather; `output` must be symmetric, with slots ordered by world rank.
+  Zero-byte input is a no-op after validation. The interface implies no barrier: use `host_barrier()` before gather to ensure each rank's input and symmetric output
+  are ready; after the local stream completes, use `host_barrier()` again to ensure every rank's output is readable before overwriting input or freeing output.
 
-Allocation、free、Barrier和AllGather等collective路径必须由全world以一致顺序调用。
+Collective paths, including allocation, free, Barrier, and AllGather, must be called by all world members in the same order.
 
-### 3.3 单边通信
+### 3.3 One-Sided Communication
 
-- `shmem.put(remote_dst, local_src, target_pe)`：把本地连续NPU Tensor按字节写入target PE的对称地址；
-  源和目标字节数必须一致。
-- `shmem.get(local_dst, remote_src, source_pe)`：从source PE的对称地址读取到本地连续NPU Tensor。
-- `shmem.signal(remote_signal, value, target_pe, operation="set")`：对target PE的一个`int32`对称信号执行
-  `set`或`add`。
-- `shmem.wait_signal(signal, value, comparison="eq")`：等待本地`int32`对称信号满足`eq`、`ne`、`gt`、
-  `ge`、`lt`或`le`条件。
+- `shmem.put(remote_dst, local_src, target_pe)`: write bytes from a local contiguous NPU tensor to the target PE's symmetric address;
+  source and destination byte counts must match.
+- `shmem.get(local_dst, remote_src, source_pe)`: read from the source PE's symmetric address into a local contiguous NPU tensor.
+- `shmem.signal(remote_signal, value, target_pe, operation="set")`: perform
+  `set` or `add` on one `int32` symmetric signal on the target PE.
+- `shmem.wait_signal(signal, value, comparison="eq")`: wait until a local `int32` symmetric signal satisfies `eq`, `ne`, `gt`,
+  `ge`, `lt`, or `le`.
 
-Put、Get和Signal均为stream入队语义，返回不表示远端消费已经完成。调用方必须通过同一stream顺序、Signal协议或
-显式同步建立完成关系。
+Put, Get, and Signal all enqueue on a stream; return does not mean remote consumption has completed. Callers must establish completion through same-stream ordering, a signal protocol, or
+explicit synchronization.
 
-### 3.4 设备归属
+### 3.4 Device Ownership
 
-Runtime初始化时冻结当前NPU设备。`empty`、`barrier`、`signal`、`wait_signal`以及实际发射设备任务的非零
-`put`、`get`和`all_gather`会拒绝其他设备的stream。零字节Put、Get和AllGather完成本地参数校验后不发射任务。
+Runtime initialization freezes the current NPU device. `empty`, `barrier`, `signal`, `wait_signal`, and nonzero
+`put`, `get`, and `all_gather` calls that launch device tasks reject streams on other devices. Zero-byte Put, Get, and AllGather perform local argument validation without launching tasks.
 
-### 3.5 诊断
+### 3.5 Diagnostics
 
-`shmem.debug_state()`只返回Runtime和Allocation事实：
+`shmem.debug_state()` returns only runtime and allocation facts:
 
-- Runtime状态、Root、引用数和生效配置。
-- heap的请求字节占用、剩余字节和峰值请求字节。
-- 按Allocation ID排序的活动Allocation及其base和bytes。
-- Tensor引用丢失但未经`free()`的泄漏Allocation。
-- 最近一次失败的只读快照。
+- Runtime state, root, reference count, and effective configuration.
+- Requested heap bytes in use, remaining bytes, and peak requested bytes.
+- Active allocations sorted by allocation ID, with their bases and byte counts.
+- Leaked allocations whose tensor references were lost without `free()`.
+- A read-only snapshot of the most recent failure.
 
-干净关闭后生命周期字段为`None`。占用量按请求字节投影；CANN heap按16字节对齐并切分余洞，真实设备侧占用
-可能略高。
+Lifecycle fields become `None` after clean shutdown. Occupancy is projected from requested bytes; CANN heaps align to 16 bytes and split residual holes, so actual device-side usage
+may be slightly higher.
 
+<!-- markdownlint-disable-next-line MD033 -->
 <a id="runtime-restart"></a>
 
 ## 4. Runtime restart
 
-### 4.1 SHMEM restart机制
+### 4.1 SHMEM Restart Mechanism
 
-SHMEM lifecycle负责进程级Runtime引用、Root一致性和安全restart。内部调用方提交目标heap字节数、完整的
-Allocation替换清单和只读业务状态预检钩子；lifecycle验证这些Allocation完整覆盖活动Runtime后，按以下顺序
-执行集体事务：
+The SHMEM lifecycle owns process-level runtime references, root consistency, and safe restart. Internal callers submit target heap bytes, a complete
+allocation-replacement list, and read-only business-state preflight hooks. After checking that these allocations fully cover the active runtime, the lifecycle executes
+this collective transaction in order:
 
 ```text
 preflight
@@ -269,33 +272,33 @@ preflight
 → restore allocations
 ```
 
-SDK bootstrap是全局状态，必须先finalize旧Runtime，再获取fresh unique ID。restart保留逻辑引用计数和
-HCCL ProcessGroup，只在Root成员间collective，不要求无关WORLD成员参与。
+SDK bootstrap is global state: finalize the old runtime before obtaining a fresh unique ID. Restart retains logical reference counts and
+the HCCL ProcessGroup, runs collectives only among root members, and requires no unrelated WORLD members.
 
-restart包含7次stage结果收敛和1次bootstrap ID广播。每个阶段具有明确的失败归属和计时范围，阶段间的结果
-收敛保证各rank进入下一本地操作前完成状态对齐。收敛次数描述本实现的执行成本，不属于公开接口合同。
-`all_gather_object`与barrier具有不同的执行成本，同步次数不构成性能等价关系。
+Restart includes seven stage-result agreement operations and one bootstrap-ID broadcast. Each stage has explicit failure ownership and timing boundaries; inter-stage result
+agreement aligns rank states before the next local operation. The agreement count describes this implementation's cost and is not part of the public interface contract.
+`all_gather_object` and barriers have different execution costs; synchronization counts do not imply equivalent performance.
 
-restart的前置条件为：
+Restart preconditions are:
 
-- 发起者是Runtime的唯一user，替换清单恰好覆盖全部活动Allocation。
-- 各Root rank的业务状态和Allocation manifest只包含确定性的全局事实，不包含本地地址或timing。
-- 没有活跃调用或graph capture阻止Allocation失效。
-- 调用方已经停止可能访问旧物理Storage的计算。
+- The initiator is the runtime's sole user, and the replacement list exactly covers all active allocations.
+- Business-state snapshots and allocation manifests on every root rank contain only deterministic global facts, excluding local addresses and timings.
+- No active calls or graph captures prevent allocation invalidation.
+- The caller has stopped computation that could access old physical storage.
 
-各阶段的失败状态与恢复语义见[失败与恢复合同](#44-失败与恢复合同)。
+See the [Failure and Recovery Contract](#44-failure-and-recovery-contract) for stage failure states and recovery semantics.
 
-### 4.2 调用方集成合同
+### 4.2 Caller Integration Contract
 
-调用方可以通过`acquire(root_group, heap_size_bytes=...)`指定初始物理heap。活动Runtime上的后续引用只能请求
-不超过当前heap的大小。
+Callers can specify the initial physical heap using `acquire(root_group, heap_size_bytes=...)`. Subsequent references to an active runtime may request only
+sizes no greater than the current heap.
 
-需要改变物理heap时，内部调用方先确定目标字节数，并为每个活动Allocation声明当前完整Tensor和目标shape、dtype、
-alignment。SHMEM统一收敛业务状态与物理manifest，释放旧Allocation并按声明顺序创建新Tensor。restart成功后，
-旧物理Tensor Storage及其view失效；调用方在本地验证返回Tensor、绑定稳定业务对象并发布自身状态。SHMEM返回
-物理结果，业务提交属于调用方的本地操作；验证或绑定失败遵循[失败与恢复合同](#44-失败与恢复合同)。
+To change the physical heap, internal callers first determine target bytes and declare the current complete tensor and target shape, dtype,
+alignment for every active allocation. SHMEM establishes agreement on business state and physical manifests, frees old allocations, and creates new tensors in declared order. After a successful restart,
+old physical tensor storage and its views are invalid. The caller locally validates returned tensors, binds stable business objects, and publishes its own state. SHMEM returns
+physical results; business commit is a caller-local operation. Validation or binding failure follows the [Failure and Recovery Contract](#44-failure-and-recovery-contract).
 
-### 4.3 MegaMoe扩容的职责交接
+### 4.3 Responsibility Handoff During MegaMoe Growth
 
 ```mermaid
 sequenceDiagram
@@ -303,130 +306,130 @@ sequenceDiagram
     participant W as MegaMoe workspace
     participant S as SHMEM lifecycle
     participant N as Native Runtime / CANN
-    M->>M: 计算candidate layout和目标heap字节数
-    M->>W: 描述完整Allocation及目标规格
+    M->>M: Calculate candidate layout and target heap bytes
+    M->>W: Describe complete allocations and target specifications
     M->>S: restart(heap bytes, replacements, preflight hook)
-    S->>M: 只读业务预检与确定性快照
-    M->>W: 检查lease及当前物理Tensor映射
-    M-->>S: 业务快照
-    S->>S: Root收敛与Quiesce
-    Note over S,N: 从释放旧Allocation开始不可回滚
+    S->>M: Read-only business preflight and deterministic snapshot
+    M->>W: Check leases and current physical tensor mappings
+    M-->>S: Business snapshot
+    S->>S: Root agreement and quiesce
+    Note over S,N: No rollback after old-allocation release begins
     S->>N: ReleaseAllocations / ValidateShutdown / Shutdown
     S->>S: Bootstrap fresh unique ID
     S->>N: Initialize / RestoreAllocations
-    N-->>S: 按替换顺序创建的新Tensor
+    N-->>S: New tensors created in replacement order
     S-->>M: replacement tensors + physical stages_ms
-    M->>W: 本地验证全部返回结果
-    M->>W: 本地绑定workspace字段
-    M->>M: 发布layout / capacity / heap bytes / epoch / growth record
+    M->>W: Locally validate all returned results
+    M->>W: Locally bind workspace fields
+    M->>M: Publish layout / capacity / heap bytes / epoch / growth record
 ```
 
-图示为成功路径，各SHMEM阶段按[restart机制](#41-shmem-restart机制)收敛；返回后的MegaMoe验证和绑定均为本地操作。
+The diagram shows the successful path. Each SHMEM stage establishes agreement as described in the [restart mechanism](#41-shmem-restart-mechanism); MegaMoe validation and binding after return are local operations.
 
-`stages_ms`只描述SHMEM物理阶段；MegaMoe的`total_ms`覆盖替换描述构造、物理restart、本地验证、绑定及业务发布。
-业务发布及其计时归属MegaMoe，不属于SHMEM物理阶段。
+`stages_ms` describes only SHMEM physical stages; MegaMoe's `total_ms` covers replacement-description construction, physical restart, local validation, binding, and business publication.
+Business publication and its timing belong to MegaMoe, outside SHMEM physical stages.
 
-### 4.4 失败与恢复合同
+### 4.4 Failure and Recovery Contract
 
-SHMEM生命周期依据明确的状态和异常类别判定恢复行为。CANN/Native提供操作错误、符号码、可用的HBM快照和
-原始detail；Native异常摘要裁剪仅适配诊断展示，不参与状态判断。
+The SHMEM lifecycle determines recovery from explicit states and exception categories. CANN/native code supplies operation errors, symbolic codes, available HBM snapshots, and
+raw detail; native exception-summary truncation serves diagnostic display only and does not affect state decisions.
 
-本地底层异常及traceback保留为直接cause；collective只交换可序列化的结果、失败报告与`runtime_unavailable`
-标志，不传输异常对象。纯远端失败按失败rank给出摘要并抑制内部汇聚traceback。通信状态查询与结果交换属于
-同一异常边界，失败时保留原始通信cause，不伪造未知的peer失败rank。
+Local underlying exceptions and tracebacks remain direct causes. Collectives exchange only serializable results, failure reports, and the `runtime_unavailable`
+flag, never exception objects. Purely remote failures produce summaries identifying failed ranks and suppress internal aggregation tracebacks. Communication-status queries and result exchange share
+a single exception boundary: failures preserve the original communication cause without inventing unknown failed-peer ranks.
 
-| 失败条件 | 状态与恢复行为 |
+| Failure condition | State and recovery behavior |
 | --- | --- |
-| 健康Runtime在破坏性操作前发生安全校验失败，且Root收敛成功 | 保留Runtime、引用及Allocation，修正条件后可重试 |
-| 已有terminal状态、Native状态漂移或设备同步失败 | Runtime不可用，要求终止并重启进程 |
-| Root通信状态变化、通信查询或结果交换失败 | 能够返回的rank标记Runtime不可用，不承诺可重试 |
-| restart进入ReleaseAllocations后任一阶段失败，或final release进入Native Shutdown后失败 | Runtime保持terminal，拒绝后续操作和引用 |
-| 物理restart成功后的MegaMoe本地验证失败 | 本地HeapManager进入failed，不绑定workspace、不发布layout、capacity、heap size、epoch或growth record |
-| MegaMoe本地绑定失败 | 本地HeapManager进入failed，部分workspace字段可能已改变，业务状态不再继续发布 |
+| Safe validation failure on a healthy runtime before destructive operations, with successful root agreement | Retain runtime, references, and allocations; retry after correcting conditions |
+| Existing terminal state, native-state drift, or device synchronization failure | Runtime unavailable; terminate and restart the process |
+| Root communication-state change, communication-query failure, or result-exchange failure | Ranks able to return mark the runtime unavailable; retry is not guaranteed |
+| Any failure after restart enters ReleaseAllocations, or final release fails after entering native Shutdown | Runtime remains terminal and rejects subsequent operations and references |
+| MegaMoe local validation fails after successful physical restart | Local HeapManager becomes failed; do not bind workspaces or publish layout, capacity, heap size, epoch, or growth record |
+| MegaMoe local binding fails | Local HeapManager becomes failed; some workspace fields may have changed, and business-state publication stops |
 
-旧Allocation尚未释放只说明本次操作尚未破坏物理资源，不能单独证明Runtime健康。业务验证和绑定没有额外的
-collective，不保证其他rank同步失败或尚未发布状态；两者失败均属于作业级不可恢复错误。失败rank保留直接cause，
-不得继续训练、单rank释放或回滚新Allocation，异常必须传播给launcher以终止其余rank并重启作业。
-vendor collective阻塞或进程退出依赖通信库及launcher超时。
+Old allocations remaining unreleased proves only that this operation has not yet destroyed physical resources; it alone cannot establish runtime health. Business validation and binding add no
+collectives and do not guarantee other ranks fail synchronously or have not already published state; either failure is unrecoverable at job level. Failed ranks retain direct causes;
+do not continue training, release on a single rank, or roll back new allocations. Propagate the exception to the launcher to terminate other ranks and restart the job.
+Blocked vendor collectives and process exits depend on communication-library and launcher timeouts.
 
 ```mermaid
 flowchart TB
-    E["SHMEM本地阶段操作<br/>产生诊断与可用性分类"] --> G["Root阶段结果交换<br/>本地异常对象留在本rank"]
-    G --> Q{"通信组查询和结果交换成功？"}
-    Q -->|否| C["收敛失败<br/>保留通信异常cause<br/>能够返回的rank标记Runtime不可用"]
-    Q -->|是| F{"本地或peer阶段失败？"}
-    F -->|否，且声明值一致| NEXT["进入下一物理阶段"]
-    F -->|是，或声明值不一致| S["SHMEM lifecycle判定恢复行为"]
-    S --> D{"已进入破坏性阶段<br/>或Runtime不可用？"}
-    D -->|是| TERMINAL["Runtime terminal<br/>要求终止并重启进程"]
-    D -->|否，明确为安全校验失败| RETRY["保留活动Runtime及Allocation<br/>修正条件后重试"]
+    E["SHMEM local stage operation<br/>Produces diagnostics and availability classification"] --> G["Root stage-result exchange<br/>Local exception objects stay on their rank"]
+    G --> Q{"Communication-group query and result exchange succeed?"}
+    Q -->|No| C["Agreement failure<br/>Preserve communication cause<br/>Returning ranks mark runtime unavailable"]
+    Q -->|Yes| F{"Local or peer stage failure?"}
+    F -->|No, declared values agree| NEXT["Enter next physical stage"]
+    F -->|Yes, or declared values differ| S["SHMEM lifecycle determines recovery"]
+    S --> D{"Destructive stage entered<br/>or runtime unavailable?"}
+    D -->|Yes| TERMINAL["Runtime terminal<br/>Terminate and restart process"]
+    D -->|No, explicitly safe validation failure| RETRY["Retain active runtime and allocations<br/>Correct conditions and retry"]
     C --> TERMINAL
-    OK["SHMEM物理restart成功返回"] --> M["MegaMoe本地验证及workspace绑定"]
-    M -->|成功| PUBLISH["发布layout、capacity与epoch"]
-    M -->|失败| FAILED["本地HeapManager failed<br/>保留本地cause<br/>异常传播给launcher终止作业"]
+    OK["SHMEM physical restart returns successfully"] --> M["MegaMoe local validation and workspace binding"]
+    M -->|Success| PUBLISH["Publish layout, capacity, and epoch"]
+    M -->|Failure| FAILED["Local HeapManager failed<br/>Preserve local cause<br/>Propagate to launcher to terminate job"]
 ```
 
-## 5. 单边通信协议
+## 5. One-Sided Communication Protocols
 
-### 5.1 Push与Pull
+### 5.1 Push and Pull
 
-- **Push**：发送方通过`put`把数据写入接收方对称槽，再通过`signal`通知；接收方`wait_signal`后读取自己的
-  本地对称槽。该模式适合接收方拥有消费buffer的场景。
-- **Pull**：发送方把数据写入自己的对称槽并通知接收方；接收方`wait_signal`后通过`get`拉取。该模式适合
-  发送方复用同一buffer多轮发布的场景。
+- **Push**: the sender uses `put` to write into the receiver's symmetric slot, then notifies it with `signal`; after `wait_signal`, the receiver reads its own
+  local symmetric slot. This suits cases where the receiver owns the consumption buffer.
+- **Pull**: the sender writes into its own symmetric slot and notifies the receiver; after `wait_signal`, the receiver fetches data with `get`. This suits
+  senders reusing the same buffer for multiple publication rounds.
 
-单边通信省去对端配对的接收调用，但不改变物理链路带宽，也不自动提供跨PE完成关系。
+One-sided communication removes the peer's matching receive call, but neither changes physical-link bandwidth nor automatically establishes cross-PE completion relationships.
 
-### 5.2 协议约束
+### 5.2 Protocol Constraints
 
-1. **Signal热点的64 B隔离**：多个来源PE或设备任务并发更新同一目标PE上的多个Signal位置时，这些位置不能
-   共享64 B cacheline。热点消费者的每个Signal独占一个`alignment=64`的Allocation，或在同一Allocation中
-   按64 B步长排布。不存在邻居并发写的单个Signal不需要额外的64 B基址对齐。
-2. **跨rank初始化收敛**：任何远端可见写之前，所有rank必须完成相应槽位的本地初始化，并通过
-   `host_barrier()`收敛。迟到的`zero_()`或`fill_()`会覆盖已经送达的远端写，表现为Signal永久等待或数据全零。
-3. **初始化收敛使用Host Barrier**：`shmem.barrier()`的远端等待可能无超时自旋，互连竞争下会触发
-   AICore 507015，不作为初始化收敛的替代机制。
+1. **64 B isolation for signal hotspots**: when multiple source PEs or device tasks concurrently update multiple signal locations on one target PE, those locations must not
+   share a 64 B cache line. Each hotspot-consumer signal needs its own `alignment=64` allocation or
+   a 64 B stride within one allocation. A single signal without concurrent neighboring writes needs no extra 64 B base alignment.
+2. **Cross-rank initialization agreement**: before any remotely visible write, all ranks must finish local initialization of the corresponding slots and use
+   `host_barrier()` to establish completion. A late `zero_()` or `fill_()` can overwrite delivered remote writes, causing indefinitely waiting signals or all-zero data.
+3. **Use a host barrier for initialization agreement**: remote waits in `shmem.barrier()` may spin without a timeout and trigger
+   AICore 507015 under interconnect contention; it is not a substitute for initialization agreement.
 
-## 6. 配置与日志
+## 6. Configuration and Logging
 
-| 变量 | 默认值 | 语义 |
+| Variable | Default | Semantics |
 | --- | --- | --- |
-| `HYPER_PARALLEL_SHMEM_HEAP_SIZE` | 1073741824（1 GiB） | `acquire()`未显式指定heap大小时使用的默认字节数 |
-| `HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT` | `tcp://127.0.0.1:8662` | 普通WORLD或单进程初始化endpoint；子组及显式heap初始化使用独立unique ID |
-| `SHMEM_UID_SOCK_IFNAME` | CANN自动选择 | 子组UID bootstrap使用的Host网卡，所有group成员必须可达 |
-| `HYPER_PARALLEL_SHMEM_TIMEOUT_SEC` | 120 | Runtime超时秒数 |
-| `HYPER_PARALLEL_SHMEM_DATA_ENGINE` | `mte` | 数据搬移引擎，当前只支持`mte` |
-| `SHMEM_LOG_LEVEL` | `ERROR` | CANN及HP SHMEM日志级别：`DEBUG`、`INFO`、`WARN`、`ERROR`或`FATAL` |
-| `SHMEM_LOG_TO_STDOUT` | `0` | `1`输出到stdout且不落盘；其他值使用文件sink |
-| `SHMEM_LOG_PATH` | `${HOME}/shmem/log` | CANN及HP SHMEM日志的统一落盘目录 |
+| `HYPER_PARALLEL_SHMEM_HEAP_SIZE` | 1073741824 (1 GiB) | Default bytes when `acquire()` does not explicitly specify heap size |
+| `HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT` | `tcp://127.0.0.1:8662` | Ordinary WORLD or single-process initialization endpoint; subgroup and explicit-heap initialization use independent unique IDs |
+| `SHMEM_UID_SOCK_IFNAME` | Automatically selected by CANN | Host network interface for subgroup UID bootstrap; reachable by every group member |
+| `HYPER_PARALLEL_SHMEM_TIMEOUT_SEC` | 120 | Runtime timeout in seconds |
+| `HYPER_PARALLEL_SHMEM_DATA_ENGINE` | `mte` | Data movement engine; only `mte` is currently supported |
+| `SHMEM_LOG_LEVEL` | `ERROR` | CANN and HP SHMEM log level: `DEBUG`, `INFO`, `WARN`, `ERROR`, or `FATAL` |
+| `SHMEM_LOG_TO_STDOUT` | `0` | `1` writes to stdout without files; other values use the file sink |
+| `SHMEM_LOG_PATH` | `${HOME}/shmem/log` | Shared output directory for CANN and HP SHMEM logs |
 
-CANN和HP日志共用SHMEM原生sink，由它统一补充时间戳、级别、TID和PID，并负责级别过滤、stdout选择及文件
-轮转。原始CANN正文保持`[SHM_SHMEM file:line]`格式；HP正文使用
-`[HP_SHMEM file:line] [rank N] [Operation|Stage] message`。其中`rank N`是当前CANN Root WORLD内的局部
-PE编号，不一定等于Torch global rank；归属未知时省略rank。初始化消息中的`NPU device N`是当前进程可见的
-ACL逻辑设备编号，不表示机器上的物理卡号。HP初始化失败汇总行保留符号化Native错误名、数值码
-和精简HBM快照，但不嵌入`cann_detail`；原始CANN日志、异常和`debug_state()`提供完整诊断。
-`SHMEM_LOG_LEVEL=DEBUG`时，
-`shmem.empty`额外记录直接调用点，可结合`allocation_base`定位泄漏来源。
+CANN and HP logs share SHMEM's native sink, which adds timestamps, levels, TIDs, and PIDs and handles level filtering, stdout selection, and file
+rotation. Original CANN message bodies retain `[SHM_SHMEM file:line]`; HP bodies use
+`[HP_SHMEM file:line] [rank N] [Operation|Stage] message`. Here `rank N` is the local
+PE ID in the current CANN root WORLD, not necessarily the Torch global rank; rank is omitted when ownership is unknown. `NPU device N` in initialization messages is the
+ACL logical device ID visible to the process, not the machine's physical card number. HP initialization-failure summaries retain symbolic native error names, numeric codes,
+and compact HBM snapshots but do not embed `cann_detail`; original CANN logs, exceptions, and `debug_state()` provide full diagnostics.
+With `SHMEM_LOG_LEVEL=DEBUG`,
+`shmem.empty` also records the direct call site, which can be combined with `allocation_base` to locate leak sources.
 
-## 7. 安全边界
+## 7. Security Boundaries
 
-Subgroup UID bootstrap使用未加密的Host socket。相互独立的group使用独立的rendezvous分配；共享固定的
-`SHMEM_UID_SESSION_ID`会绕过该隔离机制。
+Subgroup UID bootstrap uses unencrypted host sockets. Independent groups use separate rendezvous allocations; sharing a fixed
+`SHMEM_UID_SESSION_ID` bypasses that isolation.
 
-CANN `aclshmem`具有以下安全属性：
+CANN `aclshmem` has the following security properties:
 
-- config-store通过`HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT`指定的TCP endpoint引导，当前使用
-  `aclshmemx_set_conf_store_tls(false, nullptr, 0)`，未启用TLS。
-- Root内任意PE可以凭对称地址，通过RMA访问其他PE的heap，不提供PE间访问隔离。
-- MTE数据面传输不加密。
+- The config store bootstraps through the TCP endpoint specified by `HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT`, currently using
+  `aclshmemx_set_conf_store_tls(false, nullptr, 0)` with TLS disabled.
+- Any PE within the root can access another PE's heap via RMA using symmetric addresses; there is no inter-PE access isolation.
+- MTE data-plane transfers are unencrypted.
 
-因此，本组件只适用于可信内网和同一集群内PE互信的场景，不应用于跨信任域部署。
+The component is therefore suitable only for trusted internal networks with mutually trusted PEs in one cluster, not deployments across trust domains.
 
-## 8. 构建与制品
+## 8. Build and Artifacts
 
-SHMEM没有独立对外构建开关。`--multicore on`会构建Torch Multicore及其必需的SHMEM；`--multicore off`
-不交付两者的Native payload。内部`shmem/build.sh`依次构建AllGather kernel、Runtime和Torch binding。
+SHMEM has no separate public build switch. `--multicore on` builds Torch Multicore and its required SHMEM; `--multicore off`
+delivers neither native payload. Internally, `shmem/build.sh` builds the AllGather kernel, runtime, and Torch binding in order.
 
-私有库位于`core/multicore/shmem/lib`，使用专属SONAME，避免与框架自带的通用SHMEM库冲突。制品不携带
-RPATH或RUNPATH，运行时搜索路径由Multicore `set_env.bash`统一配置。详见[构建与使用](build.md)。
+Private libraries reside in `core/multicore/shmem/lib` and use dedicated SONAMEs to avoid conflicts with generic SHMEM libraries bundled with frameworks. Artifacts contain no
+RPATH or RUNPATH; Multicore's `set_env.bash` centrally configures runtime search paths. See [Build and Usage](build.md).

@@ -1,16 +1,18 @@
-# HyperParallel API 参考文档
+# HyperParallel API Reference
 
-本文档按特性模块组织，每个模块包含概述 + 接口详细说明。
+**English** | [简体中文](api_reference.zh.md)
+
+This document is organized by feature, with an overview and detailed interface descriptions for each module.
 
 ---
 
-## HSDP / FSDP 数据并行
+## HSDP / FSDP Data Parallelism
 
-HyperParallel 提供 FSDP/HSDP 数据并行能力，支持参数/梯度/优化器状态的分布式切分，显著降低单卡内存占用。
+HyperParallel provides FSDP/HSDP data parallelism, distributing parameter, gradient, and optimizer state shards to significantly reduce per-device memory usage.
 
 ### `fully_shard`
 
-对模型应用 FSDP/HSDP 参数切分。
+Apply FSDP/HSDP parameter sharding to a model.
 
 ```python
 fully_shard(
@@ -25,117 +27,117 @@ fully_shard(
 ) -> Module
 ```
 
-**参数：**
+**Parameters:**
 
-| 参数 | 类型 | 默认值 | 说明 |
+| Parameter | Type | Default | Description |
 |------|------|--------|------|
-| `module` | `Module` | — | 要切分的模块 |
-| `mesh` | `DeviceMesh` | — | DP 维度的 DeviceMesh |
-| `reshard_after_forward` | `bool` | `True` | 正向后是否 reshard（节省内存） |
-| `mixed_precision` | `MixedPrecisionPolicy` | `None` | 混合精度策略 |
-| `offload_policy` | `OffloadPolicy` | `None` | Offload 策略 |
-| `comm_fusion` | `bool` | `True` | 通信融合 |
-| `comm_fusion_zero_copy` | `bool` | `None` | 通信融合零拷贝（默认 True） |
+| `module` | `Module` | — | Module to shard |
+| `mesh` | `DeviceMesh` | — | DeviceMesh for the DP dimension |
+| `reshard_after_forward` | `bool` | `True` | Reshard after forward to save memory |
+| `mixed_precision` | `MixedPrecisionPolicy` | `None` | Mixed-precision policy |
+| `offload_policy` | `OffloadPolicy` | `None` | Offload policy |
+| `comm_fusion` | `bool` | `True` | Communication fusion |
+| `comm_fusion_zero_copy` | `bool` | `None` | Zero-copy communication fusion (defaults to True) |
 
-**返回值：** 切分后的模块（原地修改，返回同一对象）。
+**Returns:** The sharded module, modified in place; the same object is returned.
 
 ---
 
 ### `HSDPModule`
 
-HSDP 模块封装类。
+HSDP module wrapper.
 
 ```python
 class HSDPModule
 ```
 
-HSDPModule 封装了 HSDP 参数切分的核心逻辑，包括参数 unshard/reshard、梯度同步等。
+HSDPModule encapsulates core HSDP parameter sharding logic, including parameter unshard/reshard and gradient synchronization.
 
 ---
 
 ### `hsdp_sync_stream`
 
-HSDP 梯度同步流管理。
+HSDP gradient synchronization stream management.
 
 ```python
 hsdp_sync_stream()
 ```
 
-返回 HSDP 使用的梯度同步流，确保梯度 all-reduce 与计算流正确同步。
+Return the gradient synchronization stream used by HSDP, ensuring gradient all-reduce is synchronized correctly with the compute stream.
 
 ---
 
-## DTensor 分布式张量
+## DTensor Distributed Tensors
 
-DTensor 是 HyperParallel 的核心分布式张量抽象，封装 local shard + DeviceMesh + Placements。
+DTensor is HyperParallel's core distributed tensor abstraction, encapsulating a local shard, DeviceMesh, and Placements.
 
 ### `DTensor`
 
-分布式张量类。
+Distributed tensor class.
 
 ```python
 class DTensor
 ```
 
-**核心方法：**
+**Core methods:**
 
-| 方法 | 说明 |
+| Method | Description |
 |------|------|
-| `from_local(local_tensor, layout)` | 从本地张量创建 DTensor |
-| `to_local()` | 获取本地 shard 张量 |
-| `redistribute(device_mesh, placements)` | 重分布到目标 layout |
-| `full_tensor()` | 获取完整（聚合后的）张量 |
-| `is_partial()` | 检查是否为 partial 状态 |
-| `reduce_partial()` | 对 partial DTensor 执行 reduce |
+| `from_local(local_tensor, layout)` | Create a DTensor from a local tensor |
+| `to_local()` | Obtain the local shard tensor |
+| `redistribute(device_mesh, placements)` | Redistribute to the target layout |
+| `full_tensor()` | Obtain the complete gathered tensor |
+| `is_partial()` | Check whether the state is partial |
+| `reduce_partial()` | Reduce a partial DTensor |
 
 ---
 
 ### `Layout`
 
-张量到 mesh 的排布映射。
+Tensor-to-mesh layout mapping.
 
 ```python
 Layout(mesh_shape, mesh_dim_names)
 ```
 
-**参数：**
+**Parameters:**
 
-| 参数 | 类型 | 说明 |
+| Parameter | Type | Description |
 |------|------|------|
-| `mesh_shape` | `tuple` | mesh 形状，如 `(4, 8)` |
-| `mesh_dim_names` | `tuple` | mesh 维度名，如 `("dp", "tp")` |
+| `mesh_shape` | `tuple` | Mesh shape, such as `(4, 8)` |
+| `mesh_dim_names` | `tuple` | Mesh dimension names, such as `("dp", "tp")` |
 
-**使用方式：**
+**Usage:**
 
 ```python
 layout = Layout((dp, tp), ("dp", "tp"))
-x_layout = layout("dp", "tp")      # 指定各维度的排布
-w_layout = layout("tp", "None")    # "None" 表示不切分
-out_layout = layout()               # 空 layout 表示 Replicate
+x_layout = layout("dp", "tp")      # Specify each dimension's layout.
+w_layout = layout("tp", "None")    # "None" means no sharding.
+out_layout = layout()               # An empty layout means Replicate.
 ```
 
 ---
 
 ### `DeviceMesh`
 
-多维设备拓扑管理。
+Multidimensional device topology management.
 
 ```python
 class DeviceMesh
 ```
 
-**核心方法：**
+**Core methods:**
 
-| 方法 | 说明 |
+| Method | Description |
 |------|------|
-| `__getitem__(dim_name)` | 切片子 mesh，如 `mesh["dp"]` |
-| `get_device_num_along_axis(dim_name)` | 获取指定维度设备数 |
+| `__getitem__(dim_name)` | Slice a submesh, such as `mesh["dp"]` |
+| `get_device_num_along_axis(dim_name)` | Get the device count along a dimension |
 
 ---
 
 ### `init_device_mesh`
 
-创建 DeviceMesh。
+Create a DeviceMesh.
 
 ```python
 init_device_mesh(
@@ -145,19 +147,19 @@ init_device_mesh(
 ) -> DeviceMesh
 ```
 
-**参数：**
+**Parameters:**
 
-| 参数 | 类型 | 说明 |
+| Parameter | Type | Description |
 |------|------|------|
-| `device_type` | `str` | 设备类型，如 `"npu"` 或 `"cuda"` |
-| `mesh_shape` | `tuple` | mesh 形状 |
-| `mesh_dim_names` | `tuple` | mesh 维度名 |
+| `device_type` | `str` | Device type, such as `"npu"` or `"cuda"` |
+| `mesh_shape` | `tuple` | Mesh shape |
+| `mesh_dim_names` | `tuple` | Mesh dimension names |
 
 ---
 
 ### `get_current_mesh`
 
-获取当前活跃的 DeviceMesh。
+Get the currently active DeviceMesh.
 
 ```python
 get_current_mesh() -> DeviceMesh
@@ -167,7 +169,7 @@ get_current_mesh() -> DeviceMesh
 
 ### `distribute_module`
 
-将模块的参数按指定 layout 分布。
+Distribute a module's parameters according to the specified layout.
 
 ```python
 distribute_module(module, device_mesh, ...)
@@ -177,31 +179,31 @@ distribute_module(module, device_mesh, ...)
 
 ### `init_parameters`
 
-分片参数初始化。
+Sharded parameter initialization.
 
 ```python
 init_parameters(model) -> Module
 ```
 
-对模型参数按 DTensor layout 进行分片初始化，避免先初始化完整参数再切分导致的内存峰值。
+Initialize parameters as shards according to their DTensor layouts, avoiding the peak memory cost of initializing full parameters before sharding.
 
 ---
 
 ### `init_empty_weights`
 
-空权重初始化上下文。
+Empty-weight initialization context.
 
 ```python
 init_empty_weights()
 ```
 
-延迟初始化上下文，创建参数时不分配内存，后续通过 `init_parameters` 分片初始化。
+Deferred initialization context that creates parameters without allocating memory; initialize shards later through `init_parameters`.
 
 ---
 
 ### `init_on_device`
 
-在设备上初始化参数。
+Initialize parameters on the device.
 
 ```python
 init_on_device()
@@ -211,21 +213,21 @@ init_on_device()
 
 ### `manual_seed`
 
-分布式随机数种子控制（PyTorch parity）。
+Distributed random seed control with PyTorch parity.
 
 ```python
 manual_seed(seed: int)
 ```
 
-设置分布式随机数种子，确保各 rank 的随机数生成一致。
+Set the distributed random seed to keep random number generation consistent across ranks.
 
 ---
 
-## Shard / 自定义切分
+## Shard / Custom Sharding
 
 ### `custom_shard`
 
-自定义并行接入 DTensor 并行流程。
+Integrate custom parallelism into the DTensor parallel workflow.
 
 ```python
 custom_shard(...)
@@ -235,7 +237,7 @@ custom_shard(...)
 
 ### `DFunction`
 
-Torch 自定义分布式 autograd 函数基类。
+Base class for custom distributed Torch autograd functions.
 
 ```python
 class DFunction(torch.autograd.Function):
@@ -251,27 +253,27 @@ class DFunction(torch.autograd.Function):
     def apply(cls, *args, **kwargs) -> Tensor | DTensor: ...
 ```
 
-**详细文档：** 参见 [DFunction 文档](./dfunction.md)。
+**Detailed documentation:** See [DFunction](./dfunction.md).
 
 ---
 
 ### `SkipDTensorDispatch`
 
-梯度 hook 中绕过 DTensor dispatch 的标记。
+Marker for bypassing DTensor dispatch in gradient hooks.
 
 ```python
 class SkipDTensorDispatch
 ```
 
-在 FSDP/HSDP 的梯度 hook 中使用，直接操作 local tensor 而不经过 DTensor dispatch 系统。
+Use in FSDP/HSDP gradient hooks to operate directly on local tensors without passing through DTensor dispatch.
 
 ---
 
-## TP Styles 声明式张量并行
+## TP Styles: Declarative Tensor Parallelism
 
 ### `ColwiseParallel`
 
-列切分并行策略。
+Column-sharded parallel strategy.
 
 ```python
 class ColwiseParallel(ParallelStyle):
@@ -284,7 +286,7 @@ class ColwiseParallel(ParallelStyle):
 
 ### `RowwiseParallel`
 
-行切分并行策略。
+Row-sharded parallel strategy.
 
 ```python
 class RowwiseParallel(ParallelStyle):
@@ -297,7 +299,7 @@ class RowwiseParallel(ParallelStyle):
 
 ### `SequenceParallel`
 
-序列并行策略。
+Sequence parallel strategy.
 
 ```python
 class SequenceParallel(ParallelStyle)
@@ -307,7 +309,7 @@ class SequenceParallel(ParallelStyle)
 
 ### `PrepareModuleInput`
 
-模块输入准备钩子。
+Module input preparation hook.
 
 ```python
 class PrepareModuleInput(ParallelStyle)
@@ -317,7 +319,7 @@ class PrepareModuleInput(ParallelStyle)
 
 ### `PrepareModuleOutput`
 
-模块输出准备钩子。
+Module output preparation hook.
 
 ```python
 class PrepareModuleOutput(ParallelStyle)
@@ -327,7 +329,7 @@ class PrepareModuleOutput(ParallelStyle)
 
 ### `PrepareModuleInputOutput`
 
-模块输入/输出准备钩子。
+Module input/output preparation hook.
 
 ```python
 class PrepareModuleInputOutput(ParallelStyle)
@@ -337,19 +339,19 @@ class PrepareModuleInputOutput(ParallelStyle)
 
 ### `ParallelStyle`
 
-并行策略基类。
+Base class for parallel strategies.
 
 ```python
 class ParallelStyle
 ```
 
-所有并行策略的抽象基类，定义 `apply(module, device_mesh)` 接口。
+Abstract base class for all parallel strategies, defining `apply(module, device_mesh)`.
 
 ---
 
 ### `parallelize_module`
 
-声明式 TP 应用接口。
+Declarative TP application interface.
 
 ```python
 parallelize_module(
@@ -361,22 +363,22 @@ parallelize_module(
 ) -> Module
 ```
 
-**参数：**
+**Parameters:**
 
-| 参数 | 类型 | 说明 |
+| Parameter | Type | Description |
 |------|------|------|
-| `module` | `Module` | 要并行化的模块 |
+| `module` | `Module` | Module to parallelize |
 | `device_mesh` | `DeviceMesh` | 1-D TP DeviceMesh |
-| `parallelize_plan` | `dict` 或 `ParallelStyle` | 并行策略配置，支持 fnmatch glob pattern |
-| `src_data_rank` | `int` | 数据源 rank（默认 0） |
+| `parallelize_plan` | `dict` or `ParallelStyle` | Parallel configuration supporting fnmatch glob patterns |
+| `src_data_rank` | `int` | Source data rank (defaults to 0) |
 
 ---
 
-## PP 流水线并行
+## PP Pipeline Parallelism
 
 ### `PipelineStage`
 
-流水线 stage 封装。
+Pipeline stage wrapper.
 
 ```python
 class PipelineStage:
@@ -388,19 +390,19 @@ class PipelineStage:
     )
 ```
 
-**参数：**
+**Parameters:**
 
-| 参数 | 类型 | 说明 |
+| Parameter | Type | Description |
 |------|------|------|
-| `module` | `Module` | stage 对应的子模块 |
-| `stage_index` | `int` | 当前 stage 的索引 |
-| `stage_num` | `int` | 总 stage 数 |
+| `module` | `Module` | Submodule for this stage |
+| `stage_index` | `int` | Current stage index |
+| `stage_num` | `int` | Total number of stages |
 
 ---
 
 ### `Schedule1F1B`
 
-1F1B 调度策略。
+1F1B scheduling strategy.
 
 ```python
 class Schedule1F1B:
@@ -415,7 +417,7 @@ class Schedule1F1B:
 
 ### `ScheduleGPipe`
 
-GPipe 调度策略。
+GPipe scheduling strategy.
 
 ```python
 class ScheduleGPipe:
@@ -430,7 +432,7 @@ class ScheduleGPipe:
 
 ### `ScheduleInterleaved1F1B`
 
-VPP（交错 1F1B）调度策略。
+VPP (interleaved 1F1B) scheduling strategy.
 
 ```python
 class ScheduleInterleaved1F1B:
@@ -444,32 +446,32 @@ class ScheduleInterleaved1F1B:
     )
 ```
 
-**参数：**
+**Parameters:**
 
-| 参数 | 类型 | 默认值 | 说明 |
+| Parameter | Type | Default | Description |
 |------|------|--------|------|
-| `stages` | `list` | — | PipelineStage 列表 |
-| `micro_batch_num` | `int` | — | micro-batch 数 |
-| `overlap_p2p` | `bool` | `False` | 是否启用 P2P prefetch |
-| `overlap_b_f` | `bool` | `False` | 是否启用 B/F 通算掩盖 |
+| `stages` | `list` | — | List of PipelineStage objects |
+| `micro_batch_num` | `int` | — | Number of micro-batches |
+| `overlap_p2p` | `bool` | `False` | Enable P2P prefetch |
+| `overlap_b_f` | `bool` | `False` | Enable B/F compute-communication overlap |
 
 ---
 
 ### `MetaStep`
 
-调度单元抽象。
+Scheduling unit abstraction.
 
 ```python
 class MetaStep
 ```
 
-描述调度单元，包含 `step_type` 和可选的 `sub_steps`。
+Describe a scheduling unit with `step_type` and optional `sub_steps`.
 
 ---
 
 ### `MetaStepType`
 
-调度单元类型枚举。
+Scheduling unit type enum.
 
 ```python
 class MetaStepType(enum.Enum):
@@ -487,7 +489,7 @@ class MetaStepType(enum.Enum):
 
 ### `BatchDimSpec`
 
-批量维度规格。
+Batch dimension specification.
 
 ```python
 class BatchDimSpec
@@ -497,7 +499,7 @@ class BatchDimSpec
 
 ### `CommComputeOverlap`
 
-双线程通算掩盖协调器。
+Two-thread compute-communication overlap coordinator.
 
 ```python
 class CommComputeOverlap:
@@ -510,7 +512,7 @@ class CommComputeOverlap:
 
 ### `HookCoordinator` / `HookRole`
 
-COMM-first rendezvous 原语。
+COMM-first rendezvous primitives.
 
 ```python
 class HookCoordinator:
@@ -525,11 +527,11 @@ class HookRole(enum.Enum):
 
 ---
 
-## CP 上下文并行
+## CP Context Parallelism
 
 ### `ContextParallel`
 
-基础上下文并行。
+Basic context parallelism.
 
 ```python
 class ContextParallel(ParallelStyle)
@@ -539,7 +541,7 @@ class ContextParallel(ParallelStyle)
 
 ### `AsyncContextParallel`
 
-异步上下文并行。
+Asynchronous context parallelism.
 
 ```python
 class AsyncContextParallel(ParallelStyle)
@@ -547,40 +549,40 @@ class AsyncContextParallel(ParallelStyle)
 
 ---
 
-### DSA 系列
+### DSA Variants
 
-| 类 | 说明 |
+| Class | Description |
 |----|------|
-| `DSAIndexerContextParallel` | DSA 索引器 CP |
-| `AsyncDSAIndexerContextParallel` | 异步 DSA 索引器 CP |
-| `DSAIndexerLossContextParallel` | DSA 索引器 + Loss CP |
-| `AsyncDSAIndexerLossContextParallel` | 异步 DSA 索引器 + Loss CP |
+| `DSAIndexerContextParallel` | DSA indexer CP |
+| `AsyncDSAIndexerContextParallel` | Asynchronous DSA indexer CP |
+| `DSAIndexerLossContextParallel` | DSA indexer + loss CP |
+| `AsyncDSAIndexerLossContextParallel` | Asynchronous DSA indexer + loss CP |
 | `DSASparseAttentionContextParallel` | DSA Sparse Attention CP |
-| `AsyncDSASparseAttentionContextParallel` | 异步 DSA Sparse Attention CP |
+| `AsyncDSASparseAttentionContextParallel` | Asynchronous DSA sparse attention CP |
 
-所有 DSA 类均继承 `ParallelStyle`，支持 `apply(module, device_mesh)` 接口。
+All DSA classes inherit `ParallelStyle` and support `apply(module, device_mesh)`.
 
 ---
 
-## EP 专家并行
+## EP Expert Parallelism
 
 ### `ExpertParallel`
 
-标准 all-to-all EP。
+Standard all-to-all EP.
 
 ```python
 class ExpertParallel(BaseExpertParallel)
 ```
 
-每个 rank 持有 `num_experts / ep_degree` 个本地专家，通过 differentiable all-to-all 实现 token dispatch/combine。
+Each rank owns `num_experts / ep_degree` local experts and dispatches/combines tokens through differentiable all-to-all.
 
-**Mesh 需求：** 1-D mesh，如 `mesh_dim_names=("ep",)`。
+**Mesh requirement:** A 1-D mesh, such as `mesh_dim_names=("ep",)`.
 
 ---
 
-### `TensorParallel`（EP 内）
+### `TensorParallel` (within EP)
 
-TP-only 权重切分（EP degree = 1 时使用）。
+TP-only weight sharding, used when EP degree = 1.
 
 ```python
 class TensorParallel(BaseExpertParallel)
@@ -590,21 +592,21 @@ class TensorParallel(BaseExpertParallel)
 
 ### `ExpertTensorParallel`
 
-EP+TP 二维并行。
+Two-dimensional EP+TP.
 
 ```python
 class ExpertTensorParallel(BaseExpertParallel)
 ```
 
-**Mesh 需求：** 2-D mesh，如 `mesh_dim_names=("ep", "tp")`。
+**Mesh requirement:** A 2-D mesh, such as `mesh_dim_names=("ep", "tp")`.
 
 ---
 
-## Process Group 进程组管理
+## Process Group Management
 
 ### `init_process_group`
 
-初始化进程组。
+Initialize a process group.
 
 ```python
 init_process_group(backend: str, ...)
@@ -614,7 +616,7 @@ init_process_group(backend: str, ...)
 
 ### `destroy_process_group`
 
-销毁进程组。
+Destroy a process group.
 
 ```python
 destroy_process_group()
@@ -624,7 +626,7 @@ destroy_process_group()
 
 ### `get_process_group_ranks`
 
-获取进程组内所有 rank。
+Get all ranks in a process group.
 
 ```python
 get_process_group_ranks(group) -> list
@@ -634,7 +636,7 @@ get_process_group_ranks(group) -> list
 
 ### `get_backend`
 
-获取当前进程组的 backend 类型。
+Get the current process group's backend type.
 
 ```python
 get_backend() -> str
@@ -644,7 +646,7 @@ get_backend() -> str
 
 ### `split_group`
 
-从父进程组中分裂出子进程组。
+Split a subgroup from a parent process group.
 
 ```python
 split_group(group, split_size, ...)
@@ -654,7 +656,7 @@ split_group(group, split_size, ...)
 
 ### `get_group_local_rank`
 
-获取进程组内的 local rank。
+Get the local rank within a process group.
 
 ```python
 get_group_local_rank(group) -> int
@@ -664,7 +666,7 @@ get_group_local_rank(group) -> int
 
 ### `mark_created_groups`
 
-标记已创建的进程组。
+Mark a created process group.
 
 ```python
 mark_created_groups(groups)
@@ -672,11 +674,11 @@ mark_created_groups(groups)
 
 ---
 
-## Optimizer 优化器
+## Optimizers
 
 ### `AdamW`
 
-标准 AdamW 优化器。
+Standard AdamW optimizer.
 
 ```python
 class AdamW(torch.optim.Optimizer):
@@ -695,7 +697,7 @@ class AdamW(torch.optim.Optimizer):
 
 ### `Muon`
 
-Muon（momentum-based）优化器。
+Muon momentum-based optimizer.
 
 ```python
 class Muon(torch.optim.Optimizer):
@@ -715,7 +717,7 @@ class Muon(torch.optim.Optimizer):
 
 ### `ChainedOptimizer`
 
-链式优化器（Muon+AdamW 组合）。
+Chained optimizer combining Muon and AdamW.
 
 ```python
 class ChainedOptimizer:
@@ -735,7 +737,7 @@ class ChainedOptimizer:
 
 ### `get_hyper_optimizer`
 
-优化器工厂函数。
+Optimizer factory function.
 
 ```python
 get_hyper_optimizer(
@@ -747,25 +749,25 @@ get_hyper_optimizer(
 ) -> ChainedOptimizer
 ```
 
-**参数：**
+**Parameters:**
 
-| 参数 | 类型 | 说明 |
+| Parameter | Type | Description |
 |------|------|------|
-| `model` | `nn.Module` | 模型 |
-| `muon_params` | `List[Dict]` | Muon 参数组，空列表禁用 Muon |
-| `adamw_params` | `List[Dict]` | AdamW 参数组，空列表禁用 AdamW |
-| `muon_kwargs` | `Dict` | Muon 配置，支持 `muon_` 前缀自动去前缀 |
-| `adamw_kwargs` | `Dict` | AdamW 配置，支持 `adamw_` 前缀自动去前缀 |
+| `model` | `nn.Module` | Model |
+| `muon_params` | `List[Dict]` | Muon parameter groups; an empty list disables Muon |
+| `adamw_params` | `List[Dict]` | AdamW parameter groups; an empty list disables AdamW |
+| `muon_kwargs` | `Dict` | Muon configuration with automatic stripping of the `muon_` prefix |
+| `adamw_kwargs` | `Dict` | AdamW configuration with automatic stripping of the `adamw_` prefix |
 
 ---
 
 ## Activation Checkpoint / Swap
 
-> 公共 API 位于 `hyper_parallel.core.activation_memory`。
+> Public APIs are in `hyper_parallel.core.activation_memory`.
 
 ### `checkpoint`
 
-函数式激活重计算；默认 `use_reentrant=False`，Torch eager 可设置 `use_reentrant=True`。
+Functional activation checkpointing; defaults to `use_reentrant=False`, with `use_reentrant=True` available in Torch eager mode.
 
 ```python
 checkpoint(
@@ -782,32 +784,32 @@ checkpoint(
 )
 ```
 
-**参数：**
+**Parameters:**
 
-| 参数 | 类型 | 默认值 | 说明 |
+| Parameter | Type | Default | Description |
 |------|------|--------|------|
-| `function` | `callable` | — | 要 checkpoint 的函数或模块 |
-| `swap_inputs` | `bool` | `False` | 是否将 checkpoint 保存的输入 offload 到 CPU |
-| `policy_fn` | `callable` | `None` | SAC 逐算子策略：`(ctx, op, *args, **kwargs) -> CheckpointPolicy` |
-| `context_fn` | `callable` | `None` | 返回 `(forward_ctx, recompute_ctx)` 的无参工厂；non-reentrant 可与 `policy_fn` 组合 |
-| `group_swap` | `bool` | `False` | 是否对 `MUST_SWAP` tensor 启用分组 copy 融合 |
-| `cpu_pool` | 可选对象 | `None` | non-reentrant 输入 swap 所用的 pinned memory pool |
-| `early_stop` | `bool` | `True` | 是否在产生全部 backward 所需 tensor 后提前停止重计算 |
-| `use_reentrant` | `bool` | `False` | 是否启用 Torch eager reentrant checkpoint |
+| `function` | `callable` | — | Function or module to checkpoint |
+| `swap_inputs` | `bool` | `False` | Offload saved checkpoint inputs to CPU |
+| `policy_fn` | `callable` | `None` | Per-operator SAC policy: `(ctx, op, *args, **kwargs) -> CheckpointPolicy` |
+| `context_fn` | `callable` | `None` | Zero-argument factory returning `(forward_ctx, recompute_ctx)`; can be combined with `policy_fn` in non-reentrant mode |
+| `group_swap` | `bool` | `False` | Enable grouped copy fusion for `MUST_SWAP` tensors |
+| `cpu_pool` | Optional object | `None` | Pinned memory pool for non-reentrant input swapping |
+| `early_stop` | `bool` | `True` | Stop recomputation once all tensors needed by backward are available |
+| `use_reentrant` | `bool` | `False` | Whether to enable Torch eager reentrant checkpointing |
 
-默认 eager 路径使用 HyperParallel non-reentrant 实现。`early_stop` 只接受单次调用关键字或
-`checkpoint_kwargs` 配置，不继承外层 `torch.utils.checkpoint.set_checkpoint_early_stop()`。
-`preserve_rng_state` 两种模式均可配置；`determinism_check` 和 `debug` 仅适用于 non-reentrant。
-reentrant 支持 `context_fn` 和普通 `backward()`，但不支持 `policy_fn`、`swap_inputs`、
-`group_swap`、`cpu_pool`、非默认 `early_stop`、`torch.compile` 或高阶梯度。
-未使用 PP stage 的显式分阶段作用域时，`autograd.grad` 即使只请求输入梯度，reentrant 内部
-仍可能累积闭包捕获参数的梯度；需要通用的目标限定求导 API 时使用 non-reentrant。
+The default eager path uses HyperParallel's non-reentrant implementation. `early_stop` accepts only a per-call keyword or
+`checkpoint_kwargs` configuration; it does not inherit the outer `torch.utils.checkpoint.set_checkpoint_early_stop()` setting.
+`preserve_rng_state` is configurable in both modes; `determinism_check` and `debug` apply only to non-reentrant mode.
+Reentrant mode supports `context_fn` and ordinary `backward()`, but not `policy_fn`, `swap_inputs`,
+`group_swap`, `cpu_pool`, nondefault `early_stop`, `torch.compile`, or higher-order gradients.
+Outside the explicit phased scope of a PP stage, reentrant internals may accumulate gradients for parameters captured by closures
+even when `autograd.grad` requests only input gradients. Use non-reentrant mode when a general differentiation API restricted to specified targets is required.
 
 ---
 
 ### `swap`
 
-函数式激活 swap（不重计算）。须在使用时调用 `SwapManager.set_forward_prefetch_layer` 建立层间预取关系。
+Functional activation swapping without recomputation. Call `SwapManager.set_forward_prefetch_layer` to establish inter-layer prefetch relationships.
 
 ```python
 swap(
@@ -818,32 +820,32 @@ swap(
 )
 ```
 
-**参数：**
+**Parameters:**
 
-| 参数 | 类型 | 默认值 | 说明 |
+| Parameter | Type | Default | Description |
 |------|------|--------|------|
-| `function` | `callable` | — | 要 swap 的函数或模块 |
-| `policy_fn` | `callable` | `None` | 逐 tensor 策略：`(tensor) -> CheckpointPolicy`；仅 `MUST_SAVE` / `MUST_SWAP` 有效 |
+| `function` | `callable` | — | Function or module to swap |
+| `policy_fn` | `callable` | `None` | Per-tensor policy: `(tensor) -> CheckpointPolicy`; only `MUST_SAVE` / `MUST_SWAP` are valid |
 
 ---
 
 ### `checkpoint_wrapper`
 
-模块级 checkpoint 装饰器（`CheckpointWrapper`，继承 `ActivationWrapper`）。
+Module-level checkpoint wrapper (`CheckpointWrapper`, inheriting `ActivationWrapper`).
 
 ```python
 checkpoint_wrapper(module, **checkpoint_kwargs) -> CheckpointWrapper
 ```
 
-`checkpoint_kwargs` 与 `checkpoint` 一致，例如默认模式下的 `policy_fn`、`swap_inputs`、`early_stop`，
-或 Torch eager 下的 `use_reentrant=True`。
+`checkpoint_kwargs` matches `checkpoint`, such as `policy_fn`, `swap_inputs`, and `early_stop` in the default mode,
+or `use_reentrant=True` in Torch eager mode.
 
 ---
 
 ### `checkpoint_exclude_wrapper`
 
-将 checkpoint 内部的指定函数或 Cell 标记为不重算区域。原始前向阶段缓存该区域输出及反向所需
-tensor，重算阶段直接复用缓存输出。可选的 activation swap 会将符合条件的输出和内部激活卸载到 CPU。
+Marks a function or Cell inside a checkpoint as a region excluded from recomputation. The original forward caches its outputs and tensors needed for
+backward; recomputation reuses those cached outputs. Optional activation swapping offloads eligible outputs and internal activations to CPU.
 
 ```python
 checkpoint_exclude_wrapper(
@@ -855,27 +857,27 @@ checkpoint_exclude_wrapper(
 ) -> CheckpointExcludeWrapper
 ```
 
-支持 PyTorch eager 模式，在 HyperParallel 的 `checkpoint` 或 `checkpoint_wrapper` 内部使用，
-适用于 non-reentrant 与 reentrant。支持包装 Module 和普通 callable。
+Supported in PyTorch eager mode inside HyperParallel's `checkpoint` or `checkpoint_wrapper`,
+for both non-reentrant and reentrant modes. Supports Modules and ordinary callables.
 
-默认 `swap=False`，输出始终保存在设备侧并进入 replay cache。设置 `swap=True` 后，显式输出以及不能从
-replay 输入重建的内部 saved tensor 会尝试注册到当前 `SwapManager` group；Parameter、Parameter view、空
-storage、缺少 active group 或位于最后一个 group 的 tensor 自动退化为设备侧保存。`group_swap` 和
-`cpu_pool` 仅在 `swap=True` 且外层存在 active checkpoint 时生效，并同时用于输出和内部激活。
+The default is `swap=False`: outputs remain on the device and enter the replay cache. With `swap=True`, explicit outputs and internal saved tensors that cannot be
+reconstructed from replay inputs attempt to register with the current `SwapManager` group. Parameters, Parameter views, empty
+storage, tensors without an active group, and tensors in the last group automatically remain on the device. `group_swap` and
+`cpu_pool` take effect only with `swap=True` inside an active checkpoint, and apply to both outputs and internal activations.
 
-`swap=True` 不会自动建立 prefetch chain，仍需通过
-`SwapManager().set_forward_prefetch_layer(layer, next_layer)` 配置 offload/load 顺序。外层没有 active
-checkpoint 时，wrapper 完全透传，不缓存输出、不安装 saved-tensor hooks，也不注册 swap storage。
+`swap=True` does not automatically create a prefetch chain. Configure the offload/load order through
+`SwapManager().set_forward_prefetch_layer(layer, next_layer)`. Without an enclosing active
+checkpoint, the wrapper passes through completely: it does not cache outputs, install saved-tensor hooks, or register swap storage.
 
-PP stage 使用 reentrant checkpoint 时，普通 backward 无需额外配置；对于启用 dx/dw 分离的
-`ScheduleInterleaved1F1B`，stage 自动管理每个微批的分阶段求导与 replay 状态，无需用户手动绑定。
-reentrant + PP split + FSDP/HSDP 尚不支持并会显式报错；普通 FSDP backward 不受此限制。
+For PP stages using reentrant checkpointing, ordinary backward needs no additional configuration. With dx/dw separation enabled in
+`ScheduleInterleaved1F1B`, the stage automatically manages phased differentiation and replay state per micro-batch, without manual binding.
+Reentrant + PP split + FSDP/HSDP is unsupported and raises an explicit error; ordinary FSDP backward is unaffected.
 
 ---
 
 ### `swap_wrapper`
 
-模块级纯 swap 装饰器（不重计算）。
+Module-level pure swap wrapper, without recomputation.
 
 ```python
 swap_wrapper(
@@ -888,7 +890,7 @@ swap_wrapper(
 
 ### `swap_tensor_wrapper`
 
-在 `forward`/`construct` 内将指定 tensor 注册到当前 swap group。
+Register a tensor in the current swap group inside `forward`.
 
 ```python
 swap_tensor_wrapper(target, tag: Optional[str] = None)
@@ -898,22 +900,22 @@ swap_tensor_wrapper(target, tag: Optional[str] = None)
 
 ### `CheckpointPolicy`
 
-重计算 / swap 策略枚举。
+Recomputation / swap policy enum.
 
 ```python
 class CheckpointPolicy(enum.Enum):
-    MUST_SAVE = 0        # 必须保存（留在设备）
-    PREFER_SAVE = 1      # 优先保存
-    MUST_RECOMPUTE = 2   # 必须重计算
-    PREFER_RECOMPUTE = 3 # 优先重计算
-    MUST_SWAP = 4        # offload 到 HOST，反向 reload（需 SwapManager）
+    MUST_SAVE = 0        # Must save on the device.
+    PREFER_SAVE = 1      # Prefer saving.
+    MUST_RECOMPUTE = 2   # Must recompute.
+    PREFER_RECOMPUTE = 3 # Prefer recomputation.
+    MUST_SWAP = 4        # Offload to host and reload during backward; requires SwapManager.
 ```
 
 ---
 
 ### `SwapManager`
 
-Swap 分组管理器（单例）。
+Swap group manager (singleton).
 
 ```python
 class SwapManager:
@@ -926,9 +928,9 @@ class SwapManager:
 
 ---
 
-## 其他导出接口
+## Other Exported Interfaces
 
-### 主接口导出（`hyper_parallel/__init__.py`）
+### Main Exports (`hyper_parallel/__init__.py`)
 
 ```python
 __all__ = ["DFunction", "fully_shard", "hsdp_sync_stream", "HSDPModule", "DTensor",

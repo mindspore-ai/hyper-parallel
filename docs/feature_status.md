@@ -1,8 +1,10 @@
-# 特性清单
+# Feature Status
 
-本文记录 HyperParallel 当前已支持与规划中的模型和系统能力。`[x]` 表示当前版本已支持，`[ ]` 表示规划中。
+**English** | [简体中文](feature_status.zh.md)
 
-## 支持模型
+This document records HyperParallel's supported and planned model and system capabilities. `[x]` means supported in the current version; `[ ]` means planned.
+
+## Supported Models
 
 - [x] Qwen3-30B-A3B
 
@@ -12,147 +14,147 @@
 
 - [x] DTensor basic
 - [x] DTensor redistribute
-- [x] manual_seed 分布式随机数种子控制
+- [x] manual_seed distributed random seed control
 - [ ] DTensor centric communication
 - [ ] Cross Mesh DTensor redistribution
 
 ### HSDP / FSDP
 
-- [x] Parameter 与 Optimizer 切分
-- [x] Parameter、Optimizer 与 Gradient 切分
-- [x] Overlap（全 overlap 模式）
-- [x] gradient_scaling_factor 梯度缩放因子
-- [ ] 动转静
+- [x] Parameter and optimizer sharding
+- [x] Parameter, optimizer, and gradient sharding
+- [x] Overlap (full overlap mode)
+- [x] gradient_scaling_factor gradient scaling
+- [ ] Dynamic-to-static conversion
 
 ### Shard / TP
 
-- [x] 分布式算子支持列表
-- [x] 自定义分布式算子注册（YAML registry + Python impl）
+- [x] Supported distributed operator list
+- [x] Custom distributed operator registration (YAML registry + Python implementation)
 - [x] Custom Shard
-- [x] DFunction Torch 自定义分布式 autograd 函数
-- [x] Loss Parallel（TP 训练损失并行）
+- [x] DFunction custom distributed Torch autograd functions
+- [x] Loss Parallel for TP training
 
 #### TP Styles
 
 - [x] ColwiseParallel / RowwiseParallel / SequenceParallel
-- [x] parallelize_module 声明式 TP 接口
+- [x] parallelize_module declarative TP interface
 - [x] 1D
-- [ ] 高维TP，2D/2.5D/3D
+- [ ] Higher-dimensional TP: 2D/2.5D/3D
 
 #### EP
 
-- [x] ExpertParallel / ExpertTensorParallel 基础流程
-- [x] MoE 构建模块（GroupedExperts / TokenChoiceTopKRouter / MoE）
-- [x] 负载均衡（expert_bias + aux_loss + AutoScaler）
+- [x] Basic ExpertParallel / ExpertTensorParallel workflow
+- [x] MoE building blocks (GroupedExperts / TokenChoiceTopKRouter / MoE)
+- [x] Load balancing (expert_bias + aux_loss + AutoScaler)
 - [x] MoE zero-overhead activation storage
-- [x] MoE + EP token dispatch 解耦
-- [ ] Dropless 基础流程
-- [ ] 通信与计算重叠
-- [ ] 专家热迁移 / 热点专家副本
+- [x] Decoupled MoE + EP token dispatch
+- [ ] Basic dropless workflow
+- [ ] Compute-communication overlap
+- [ ] Live expert migration / replicas for overloaded experts
 
 #### CP
 
-- [x] ContextParallel 基础上下文并行
-- [x] AsyncContextParallel 异步上下文并行
-- [x] DSA 系列（Indexer / Loss / SparseAttention）
+- [x] ContextParallel basic context parallelism
+- [x] AsyncContextParallel asynchronous context parallelism
+- [x] DSA variants (Indexer / Loss / SparseAttention)
 - [x] TP DTensor local rewrap
 - [ ] DeepSpeed Ulysses
 - [ ] Ring Attention
-- [ ] 3D 序列并行
+- [ ] 3D sequence parallelism
 
 - [ ] Overlap
 
-### 分布式随机数
+### Distributed Random Numbers
 
-- [x] manual_seed 随机数种子控制
+- [x] manual_seed random seed control
 - [ ] Dropout
 
 ## HyperMPMD
 
-### Pipeline 并行
+### Pipeline Parallelism
 
 - [x] GPipe
 - [x] 1F1B
-- [x] VPP（ScheduleInterleaved1F1B）
-- [x] PP+FSDP（MetaStep集成）
-- [x] PipelineStage dx/dw计算
-- [x] 通算掩盖 overlap_b_f（CommComputeOverlap双线程协调器）
+- [x] VPP(ScheduleInterleaved1F1B)
+- [x] PP+FSDP (MetaStep integration)
+- [x] PipelineStage dx/dw computation
+- [x] overlap_b_f compute-communication overlap (CommComputeOverlap two-thread coordinator)
 - [x] batched P2P transport / overlap_p2p
 - [x] PP Activation Swap
 - [x] variable-layer + mixed-recompute under overlap_b_f
 - [ ] ZBV
 - [ ] SeqPP
-- [ ] 每个 PP Stage 分配不同卡数
+- [ ] Different device counts per PP stage
 
-### Mpipe 多模态并行
+### Mpipe Multimodal Parallelism
 
-- [x] Mpipe Transpose 调度
+- [x] Mpipe Transpose scheduling
 - [ ] Mpipe data-reordering
 
-### 子图切分
+### Subgraph Partitioning
 
-- [ ] 多模态 encoder / decoder 切分到不同设备
+- [ ] Partition multimodal encoders / decoders across different devices
 
-### 多核并行
+### Multicore Parallelism
 
-- [ ] 多核并行 - O0
-- [ ] 多核并行 - O1
-- [x] 基于多核并行优化 MoE 通算掩盖
-- [ ] 基于多核并行优化 PP 1F1B 通算掩盖
+- [ ] Multicore parallelism - O0
+- [ ] Multicore parallelism - O1
+- [x] Multicore optimization of MoE compute-communication overlap
+- [ ] Multicore optimization of PP 1F1B compute-communication overlap
 
 ## HyperOffload
 
-- [x] Activation Checkpoint（checkpoint / checkpoint_wrapper / CheckpointPolicy）
-- [x] Activation Swap（swap / swap_wrapper / swap_tensor_wrapper / SwapManager）
-- [x] Activation Swap 与 Checkpointing 协同配置
+- [x] Activation Checkpoint(checkpoint / checkpoint_wrapper / CheckpointPolicy)
+- [x] Activation Swap(swap / swap_wrapper / swap_tensor_wrapper / SwapManager)
+- [x] Combined Activation Swap and Checkpointing configuration
 - [x] Swap fusion
-- [ ] SAS（Selective Activation Swap）
-- [ ] SPO（Selective Parameter/Gradient/Optimizer Offload）
-- [ ] 基于内存语义的Offload
-- [ ] 自动Activation Swap策略生成
+- [ ] SAS(Selective Activation Swap)
+- [ ] SPO(Selective Parameter/Gradient/Optimizer Offload)
+- [ ] Offload based on memory semantics
+- [ ] Automatic Activation Swap policy generation
 
 ## Optimizer
 
 - [x] AdamW
-- [x] Muon（momentum-based optimizer）
-- [x] ChainedOptimizer（Muon + AdamW 链式组合）
+- [x] Muon(momentum-based optimizer)
+- [x] ChainedOptimizer (chained Muon + AdamW)
 - [x] get_hyper_optimizer
-- [x] 分片优化器（FSDP / HSDP 集成）
-- [x] gradient scaling factor + clip_grad 增强
+- [x] Sharded optimizers (FSDP / HSDP integration)
+- [x] Gradient scaling factor + clip_grad enhancements
 
 ## AutoParallel
 
-- [x] SAPP-ND：ND 搜索（内存估算 + 性能估算）
-- [x] SAPP-PPB：Pipeline Parallelism Balancing
+- [x] SAPP-ND: ND search (memory and performance estimation) <!-- codespell:ignore nd -->
+- [x] SAPP-PPB:Pipeline Parallelism Balancing
 - [ ] SAPP-Omni
 
-## 故障快速恢复
+## Fast Failure Recovery
 
-- [x] DCP（Distributed Checkpoint）
-  - [x] 分布式检查点保存/加载
-  - [x] 异步 staging 保存
-  - [x] 离线格式转换
-  - [ ] 支持 Hugging Face 格式
-  - [ ] 支持不同切分策略倒换
-- [ ] 基础故障恢复流程
-- [ ] 进程级故障快速恢复
-- [ ] 临终遗言
-- [ ] SDC检测
+- [x] DCP(Distributed Checkpoint)
+  - [x] Distributed checkpoint saving/loading
+  - [x] Asynchronous staging and saving
+  - [x] Offline format conversion
+  - [ ] Hugging Face format support
+  - [ ] Conversion between sharding strategies
+- [ ] Basic failure recovery workflow
+- [ ] Fast process-level failure recovery
+- [ ] Last-gasp diagnostics
+- [ ] SDC detection
 
 ## Trainer
 
-- [x] AutoModels TextTrainer 文本训练
-- [x] AutoModels VLMTrainer 多模态训练
-- [x] Callbacks（Logging / MoeMonitor）
-- [x] AutoModels YAML Trainer 配置与并行维度配置
+- [x] AutoModels TextTrainer text training
+- [x] AutoModels VLMTrainer multimodal training
+- [x] Callbacks(Logging / MoeMonitor)
+- [x] AutoModels YAML Trainer and parallel dimension configuration
 
-## 生态集成
+## Ecosystem Integration
 
-- [x] LlamaFactory 集成（activation recompute & swap + HSDP）
+- [x] LlamaFactory integration (activation recomputation and swap + HSDP)
 
-## 工具
+## Tools
 
-### 精度监控
+### Numerical Monitoring
 
 - [ ] global norm
 - [ ] local norm
@@ -160,7 +162,7 @@
 
 ### DryRun
 
-- [ ] 内存开销分析
-- [ ] 单卡模拟集群执行
+- [ ] Memory overhead analysis
+- [ ] Simulate cluster execution on one device
 
-[返回项目 README](../README.md)
+[Back to the project README](../README.md)

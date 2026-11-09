@@ -1,45 +1,47 @@
-# HotpotQA 文件搜索
+# HotpotQA File Search
+
+**English** | [简体中文](search_r1.zh.md)
 
 See [prepare_data.py](../examples/search_r1/prepare_data.py), [training config](../examples/search_r1/configs/qwen3_4b_search_r1.yaml), and [run_search_r1.sh](../examples/search_r1/scripts/run_search_r1.sh).
 
-在宿主机运行 `launcher.py`，由宿主机启动可信训练容器及同级、无特权 Codex 容器。
-不使用 Docker-in-Docker。CLI指令文件使用候选容器内的`/codex-home`路径，不能引用训练容器的`/results`路径。
-Codex 只能读取该题候选文章，通过 shell 搜索；
-不挂载数据集标签、其他会话、NPU 或 Docker socket。每个会话在正式候选容器中、Codex启动前实际探测隔离边界。
-训练镜像保持`hyper-rl:v0.23.0.post1-code-agent-arm64`，候选默认使用本地构建的
-`hyper-rl-codex:0.152.1-arm64`。`--candidate-image`可显式选择其他经过核验的CLI镜像。
-候选镜像仅包含Codex、Python和搜索工具，不包含模型推理库；
-两类容器的权限和挂载保持独立，见 [镜像说明](../docker/README.md#search-r1-的独立-codex-候选容器)。
+Run `launcher.py` on the host to start the trusted training container and a sibling, unprivileged Codex container.
+Docker-in-Docker is not used. CLI instruction files use the candidate container's `/codex-home` path and must not reference the training container's `/results` path.
+Codex can read only the current question's candidate articles and search them through the shell.
+Dataset labels, other sessions, NPUs, and the Docker socket are not mounted. Each session probes isolation inside its actual candidate container before starting Codex.
+Training retains the `hyper-rl:v0.23.0.post1-code-agent-arm64` image; candidates default to the locally built
+`hyper-rl-codex:0.152.1-arm64`. Use `--candidate-image` to explicitly select another verified CLI image.
+Candidate images contain only Codex, Python, and search tools, without model-inference libraries.
+Permissions and mounts remain independent; see the [image guide](../docker/README.md#independent-codex-candidate-containers-for-search-r1).
 
-## 数据与训练
+## Data and Training
 
-当前使用官方 `hotpotqa/hotpot_qa` 的 **Distractor** 数据，保留每题原始候选文章与句级引用。
-不使用为MemAgent构造的长上下文数据。训练题从官方train的90,447题中抽取，留出题来自独立validation源；
-准备程序检查跨源ID/规范化问题重叠，记录SHA256并禁止覆盖已有数据。
+The current dataset is the official `hotpotqa/hotpot_qa` **Distractor** split, retaining each question's original candidate articles and sentence-level citations.
+Long-context data constructed for MemAgent is not used. Training questions are sampled from the 90,447 official training questions; held-out questions come from the independent validation source.
+Preparation checks cross-source IDs and normalized-question overlap, records SHA256 hashes, and refuses to overwrite existing data.
 
-当前八卡两步配方沿用GSM8K已验收的Qwen3-4B训练/推理能力，搜索组合仍须独立完成NPU验收：
+The current eight-device, two-step recipe reuses Qwen3-4B training/inference capabilities accepted for GSM8K; the search combination still requires independent NPU acceptance:
 
-| 项目 | 配置 |
+| Item | Configuration |
 | --- | --- |
-| 数据 | 准备6,400训练题和128留出题；两步只消费前256道训练题 |
-| 每步预算 | 128题×8个episode，最多10次LLM调用/episode，包含引用修正 |
-| 推理 | native vLLM TP2×DP4，0.8显存比例，256序列/副本，图执行/prefix/chunked开启 |
-| 调度 | Gateway上限1024，每rank最多128个episode；宿主默认同时运行128个候选容器 |
-| 容器资源 | 每候选最多2 CPU、2 GiB内存；可用`--agent-workers`改变并发容器上限 |
-| 调用长度 | 每次输出最多1024 tokens，完整模型上下文最多8192 tokens |
-| 训练 | DP分片8、TP1，逐微批梯度同步，生成期间卸载训练状态；训练本身不启用Actor CPU offload |
-| 概率计算 | old由Actor重算，保留采样概率；Actor/old/reference动态预算均8192，selected_chunked分块512 |
-| 优化器 | 每rank mini batch上限1280调用行，覆盖128个episode×10次调用，每步一次更新 |
-| 奖励 | 沿用旧规则：0.70×答案F1 + 0.20×答案EM + 0.08×支持句F1 + 0.02×格式奖励；引用检查不变 |
-| 验证/保存 | 两步跑通默认关闭；不将短实验称为50步或验证集验收 |
+| Data | Prepare 6,400 training questions and 128 held-out questions; two steps consume only the first 256 training questions |
+| Per-step budget | 128 questions × 8 episodes, at most 10 LLM calls per episode including citation correction |
+| Inference | Native vLLM TP2×DP4, 0.8 memory utilization, 256 sequences per replica, graph execution/prefix caching/chunked prefill enabled |
+| Scheduling | Gateway limit 1,024; at most 128 episodes per rank; the host defaults to 128 concurrent candidate containers |
+| Container resources | At most 2 CPUs and 2 GiB memory per candidate; use `--agent-workers` to change the concurrent-container limit |
+| Call length | At most 1,024 output tokens per call and 8,192 tokens of complete model context |
+| Training | DP shard8, TP1, gradient synchronization per microbatch, training-state offload during generation; Actor CPU offload is disabled during training itself |
+| Probability computation | Actor recomputes old probabilities while sampling probabilities are retained; Actor/old/reference dynamic budgets are all 8,192, with selected_chunked chunks of 512 |
+| Optimizer | At most 1,280 call rows per rank mini-batch, covering 128 episodes × 10 calls, with one update per step |
+| Reward | Existing rule: 0.70×answer F1 + 0.20×answer EM + 0.08×supporting-sentence F1 + 0.02×format reward; citation checks are unchanged |
+| Evaluation/saving | Disabled by default for the two-step flow; short experiments are not 50-step or validation-set acceptance |
 
-`max_prompt_length=1024`约束初始问题，不表示CLI指令、工具和历史总共只有1024 tokens。
-动态预算控制普通微批分组，超预算完整调用单独成批；单样本显存容量仍需按上下文上限验收。
-该配方保留8192预算；分块概率复用已有RL实现，未新增训练核心。
-CPU准备重叠保持关闭：当前搜索使用自定义program及容器execution，不在原生本地CLI重叠的支持范围内。
-候选容器并发与vLLM序列上限是两项资源限制，128个容器不能保证推理端达到256序列/副本。
+`max_prompt_length=1024` constrains the initial question, not the combined CLI instructions, tools, and history.
+Dynamic budgets govern ordinary microbatch grouping; an over-budget complete call forms its own batch. Single-sample memory capacity still requires acceptance at the context limit.
+This recipe retains the 8,192 budget; chunked probability computation reuses the existing RL implementation without adding a training core.
+CPU preparation overlap remains disabled: current search uses custom programs and container execution outside the supported native local CLI overlap path.
+Candidate-container concurrency and vLLM sequence limits are separate resource constraints; 128 containers do not guarantee 256 inference sequences per replica.
 
-在仓库根目录准备数据（原始文件需已下载）：
+Prepare data from the repository root after downloading the raw files:
 
 ```bash
 python3 hyper_parallel/rl/examples/search_r1/prepare_data.py \
@@ -50,10 +52,10 @@ python3 hyper_parallel/rl/examples/search_r1/prepare_data.py \
   --output-dir /absolute/path/to/new-prepared-hotpotqa
 ```
 
-有旧留出集时增加`--preserve-test /absolute/old/test.parquet`。不可省略训练源与独立validation源：
-历史准备工具的默认下载地址为validation，单源拆分不等于官方train/validation划分。
+Add `--preserve-test /absolute/old/test.parquet` to retain an existing held-out set. Both the training source and independent validation source are required:
+the historical preparation tool downloaded validation by default, and splitting one source does not reproduce the official train/validation split.
 
-在`hyper_parallel/rl/`下，确认8卡空闲后运行：
+From `hyper_parallel/rl/`, verify that eight devices are idle, then run:
 
 ```bash
 python3 examples/search_r1/launcher.py --devices 0,1,2,3,4,5,6,7 --steps 2 \
@@ -61,78 +63,78 @@ python3 examples/search_r1/launcher.py --devices 0,1,2,3,4,5,6,7 --steps 2 \
   --backend-privileged --agent-workers 128 --output /absolute/path/to/new-results
 ```
 
-启动器及`scripts/run_search_r1.sh DEVICE_IDS STEPS DATA_DIRECTORY --model MODEL_DIRECTORY`支持末尾YAML覆盖。
-启动时复用RL插件安装和已接受的采样器stream修补、DP协调器冷启动超时修补；依赖不匹配则失败。
-本次不会覆盖已有实验目录；`container.json`记录实际训练容器ID，供宿主监控识别设备进程归属。
-`--backend-privileged`只用于可信训练后端，不用于Codex候选容器。
-训练HCCL端口为`62800-62900`，vLLM为`62600-62799`；设备检查与占用监控仍由实验运行环境负责。
+The launcher and `scripts/run_search_r1.sh DEVICE_IDS STEPS DATA_DIRECTORY --model MODEL_DIRECTORY` accept trailing YAML overrides.
+Startup reuses RL plugin installation and the accepted sampler stream fix and DP coordinator cold-start timeout patch; mismatched dependencies fail.
+Existing experiment directories are not overwritten. `container.json` records the actual training container ID so host monitoring can identify ownership of device processes.
+`--backend-privileged` applies only to the trusted training backend, never to Codex candidate containers.
+Training HCCL uses ports `62800-62900`; vLLM uses `62600-62799`. The experiment environment still owns device checks and utilization monitoring.
 
-默认验收检查目标策略版本、非零梯度、优化器更新、逐会话隔离与真实上下文。
-`--strict-acceptance`保留旧的额外验收要求：严格概率一致、验证和checkpoint重载；
-使用它时须相应配置hyper推理实现、consistency、验证和保存，不能把默认native短实验误标为严格一致性通过。
-`--resume /原输出目录/checkpoints/step_N`要求完整checkpoint标记及相同数据哈希。
+Default acceptance checks the target policy version, nonzero gradients, optimizer updates, per-session isolation, and actual contexts.
+The legacy `--strict-acceptance` flag still checks retired exact-probability metrics alongside evaluation and checkpoint reload.
+It is not a supported acceptance path for current native-vLLM; the removed Hyper inference implementation and consistency profile cannot be re-enabled.
+`--resume /original/output/checkpoints/step_N` requires a complete checkpoint marker and identical data hashes.
 
-## 提示词与上下文
+## Prompts and Context
 
-原始问题来自数据集的`question`，文章正文来自`context`；标准答案和supporting-facts标签不提供给候选进程。
-任务模板只说明证据来源、绝对文章路径、工具示例和`ANSWER/SOURCES`格式，不强制第一次回复调用工具，
-也不指定逐步搜索策略。系统指令要求依据实际读到的证据回答。奖励公式及引用检查保持不变。
-启用thinking时使用vLLM已有的`reasoning_parser: qwen3`，由现有Codex协议分别传递推理与最终答案，
-避免将`<think>`正文送入两行答案检查。原始生成tokens仍完整保留；不通过放宽奖励格式解决协议问题。
+The original question comes from the dataset's `question`, and articles from `context`; reference answers and supporting-facts labels are not exposed to candidate processes.
+The task template specifies evidence sources, absolute article paths, tool examples, and the `ANSWER/SOURCES` format without forcing a tool call in the first response
+or prescribing a step-by-step search strategy. System instructions require answers grounded in actually read evidence. Reward formulas and citation checks remain unchanged.
+With thinking enabled, use vLLM's existing `reasoning_parser: qwen3`; the existing Codex protocol carries reasoning and final answers separately,
+keeping `<think>` content out of the two-line answer check. Original generated tokens remain intact; reward-format constraints are not relaxed to solve protocol issues.
 
-Search-R1设置`compact_harness_context: true`和`preserve_environment_context: true`：
-过滤无关技能目录，保留Codex原始环境和权限消息，包括工作目录`/work`及shell。
-候选容器的文章固定挂载在`/work/articles`；命令示例使用绝对路径，避免切换workdir后重复拼接articles。
-GSM8K的精简配方仍使用默认过滤策略，不共用文件搜索任务的环境保留要求。
+Search-R1 sets `compact_harness_context: true` and `preserve_environment_context: true`:
+it removes irrelevant skill-directory instructions while retaining Codex's original environment and permission messages, including the `/work` directory and shell.
+Candidate articles are mounted at `/work/articles`; command examples use absolute paths to avoid appending articles again after changing workdir.
+GSM8K's compact recipe retains its default filtering policy without sharing file-search environment-preservation requirements.
 
-工具白名单仅保留`exec_command`与`write_stdin`，参数说明及历史调用/观察保留；
-最后一次常规调用和引用修正显式禁用工具，Gateway允许这类请求没有工具声明。
-工具返回值原样交给Codex和模型；接入层不解析shell命令、退出码或错误文本，
-不追加重试指导，不因无匹配或重复命令提前中止。仅记录已见工具输出用于引用检查。
+The tool allowlist retains only `exec_command` and `write_stdin`, preserving argument descriptions and historical calls/observations.
+The last ordinary call and citation correction explicitly disable tools; the Gateway permits these requests to omit tool declarations.
+Tool outputs pass unchanged to Codex and the model. The integration layer does not parse shell commands, exit codes, or error text,
+add retry guidance, or terminate early for no matches or repeated commands. It records only observed tool output for citation checks.
 
-## 正确性与故障边界
+## Correctness and Failure Boundaries
 
-- 每轮分别训练真实 `P_i + A_i`；`training-audit.json` 核对 token、mask、采样 logprob。
-  不要求相邻调用前缀连续，不用重新编码后的历史替换训练输入。
-- 当前native配方记录训推概率差异，不宣称逐token严格相等；严格一致性profile仍保留为显式可选路径。
-- 训练 reward 和评测按完整 episode 统计，不按模型调用次数重复加权。
-- 最后一个常规模型调用禁用工具，另预留一次真实引用修正调用；全部动作保留。
-- 模型输出token耗尽、Gateway调用次数耗尽及明确上下文超限复用通用Codex终态判定，
-  核验完成后保留原始轨迹并记零奖励，不再调用引用修正。
-  容器异常退出、缺失最终消息但无完整预算证据，以及未知通信故障仍拒绝更新。
-- 已确认的模型预算用尽、无效引用是任务失败，保留真实动作并记零奖励。
-  没有任何采样动作则报错，不能制造空训练样本。
-- `failure_origin`、`failure_reason`、`trainable` 分别记录责任、原因和训练资格。
-  实际执行服务/容器故障、HTTP/网络错误、未经归因的上下文超限及未知失败中止整次更新；
-  不补零奖励、不丢弃组成员、不只屏蔽 loss，避免污染 GRPO 优势。
-- shell命令的非零退出、路径/参数错误和无匹配都是工具观察，由模型决定后续行动，受总预算限制。
-  工具输出中的退出码不等于Codex进程或容器的退出码；后者仍按真实执行结果核验。
-- Hermes 证据由固定版本 vLLM 插件记录：真实生成 token、解码文本、引擎文本、parser 输入和输出。
-  证据一致的非法工具 JSON 会收到明确格式反馈并重新采样，计入总模型调用预算；不执行、不修复原命令。
-  恢复成功仍按最终任务结果评分。合法原文解析失败或证据不一致则中止更新。
-- 格式恢复调用也占用原有预算，因此可能用掉原计划预留的引用修正调用；不会额外扩充预算。
-- `training-audit.json` 保留原始前缀不匹配数量与最多三个 token 差异样本；训练仍使用真实逐调用 token。
-- `training-acceptance.json` 只有在指定优化步数、权重同步及全部会话审计通过后才产生。
-  引用存在/可见不等于语义正确；短程通过也不保证任意长程训练无故障。
+- Train each actual `P_i + A_i` separately; `training-audit.json` checks tokens, masks, and sampling logprobs.
+  Adjacent calls need not have continuous prefixes; re-encoded history must not replace training inputs.
+- The current native recipe records training/inference probability differences without claiming exact per-token equality; the former strict consistency profile has been removed.
+- Training rewards and evaluation are aggregated by complete episode, without repeated weighting by model call count.
+- Disable tools on the last ordinary model call and reserve one actual citation-correction call; retain all actions.
+- Model output-token exhaustion, Gateway call-budget exhaustion, and explicit context-limit rejection reuse the generic Codex terminal-state checks.
+  After validation, original trajectories are retained with zero reward and no further citation-correction call.
+  Abnormal container exits, missing final messages without complete budget evidence, and unknown communication failures still reject updates.
+- Confirmed model-budget exhaustion and invalid citations are task failures; actual actions are retained with zero reward.
+  If no sampled actions exist, raise an error rather than fabricate an empty training sample.
+- `failure_origin`, `failure_reason`, and `trainable` record responsibility, cause, and training eligibility respectively.
+  Actual execution-service/container failures, HTTP/network errors, unattributed context overflows, and unknown failures abort the entire update.
+  Do not substitute zero rewards, discard group members, or merely mask loss, which would corrupt GRPO advantages.
+- Nonzero shell-command exits, path/argument errors, and no matches are tool observations; the model chooses subsequent actions within the overall budget.
+  Exit codes in tool output are distinct from Codex process/container exit codes; the latter still require validation against actual execution results.
+- A pinned vLLM plugin records Hermes evidence: actual generated tokens, decoded text, engine text, and parser input/output.
+  Invalid tool JSON with consistent evidence receives explicit format feedback and resampling, consuming the total call budget. Do not execute or repair the original command.
+  Successful recovery is still scored by final task outcome. Parser failure on valid source text or inconsistent evidence aborts the update.
+- Format-recovery calls consume the original budget and may use the reserved citation-correction call; the budget is not expanded.
+- `training-audit.json` retains original prefix-mismatch counts and up to three token-difference samples; training still uses actual per-call tokens.
+- `training-acceptance.json` is produced only after the specified optimizer steps, weight synchronization, and all session audits pass.
+  Citation existence/visibility does not establish semantic correctness; short-run success does not guarantee arbitrary long training is failure-free.
 
-## 文件职责
+## File Responsibilities
 
-- `workspace.py`：只导出当前题目的候选文章。
-- `agent.py`：任务结果、引用检查与修正、逐调用训练轨迹。
-- `container_runtime.py`：宿主交接、文章隔离探针与搜索预算反馈；调用共用工作区和Codex执行器，仅依赖标准库。
-- `rl/agentic/envs/docker_workspace.py`与`rl/agentic/codex/container_execution.py`：共用容器生命周期、会话转发和CLI执行。
-- `launcher.py`：宿主机训练入口、数据校验与训练验收。
-- 通用 token/mask/logprob 审计位于 `rl/agentic/core/program_runner.py`。
+- `workspace.py`: Export only the current question's candidate articles.
+- `agent.py`: Task outcomes, citation checks/correction, and per-call training trajectories.
+- `container_runtime.py`: host handoff, article isolation probes, and search-budget feedback; calls shared workspace and Codex execution components using only the standard library.
+- `rl/agentic/envs/docker_workspace.py` and `rl/agentic/codex/container_execution.py`: shared container lifecycle, session forwarding, and CLI execution.
+- `launcher.py`: Host training entry point, data verification, and training acceptance.
+- Generic token/mask/logprob auditing lives in `rl/agentic/core/program_runner.py`.
 
-隔离检查仍在每个正式会话启动前执行，独立冒烟入口放在测试目录。
+Isolation checks still run before every production session; the standalone smoke entry point lives under tests.
 
-在宿主机的 `rl/` 目录执行无模型隔离检查（不使用 NPU）：
+Run the model-free isolation check from the host's `rl/` directory, without NPUs:
 
 ```bash
 python3 tests/st/search_r1_isolation.py \
   --output output/search_r1/search_r1_isolation_check
 ```
 
-输出目录必须是新目录。该检查验证容器边界与 Codex 启动，不代替真实模型训练测试。
-`candidate-runtime.json`记录实际候选镜像身份；逐会话`execution-timing.json`记录各执行阶段耗时。
-历史实验详情以各输出目录的日志为准。
+The output directory must be new. This verifies container boundaries and Codex startup, not real model training.
+`candidate-runtime.json` records the actual candidate image identity; each session's `execution-timing.json` records execution-stage durations.
+Historical experiment details remain in logs under their respective output directories.

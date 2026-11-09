@@ -1,7 +1,9 @@
 # HyperParallel Data
 
-`hyper_parallel.data` 将原始记录或 Indexed Dataset 转换为一次
-forward/backward 所需的模型输入和 loss 输入。模块按数据职责分层，不按模型名称组织：
+**English** | [简体中文](README.zh.md)
+
+`hyper_parallel.data` converts raw records or Indexed Datasets into model inputs and loss inputs for one
+forward/backward pass. Modules are organized by data responsibility rather than model name:
 
 ```text
 source
@@ -12,30 +14,30 @@ source
   -> model
 ```
 
-## 1. 目录与职责
+## 1. Directory Structure and Responsibilities
 
 ```text
 data/
-├── indexed/    # .idx/.bin、Indexed split、sample index、blend
-├── online/     # 原始 Mapping/Iterable source、文件/HF 加载、source blend
-├── text/       # LLM tokenizer、chat template、transform、Dataset 入口
-├── omni/       # image/video/audio processor transform 生命周期、Omni Dataset 入口
-├── batching/   # 候选池、packing、collator、DataLoader、get-batch
-├── parallel/   # Mapping DP sampler、DataLoader 所有权、CP shard、TP broadcast
-└── tools/      # Indexed 离线制作和检查工具
+├── indexed/    # .idx/.bin, Indexed split, sample index, blend
+├── online/     # Raw Mapping/Iterable sources, file/HF loading, and source blending
+├── text/       # LLM tokenizers, chat templates, transforms, and Dataset entry points
+├── omni/       # Image/video/audio processor transform lifecycle and Omni Dataset entry points
+├── batching/   # Candidate pools, packing, collators, DataLoaders, and get-batch
+├── parallel/   # Mapping DP samplers, DataLoader ownership, CP sharding, and TP broadcast
+└── tools/      # Offline Indexed preparation and inspection tools
 ```
 
-| 模块 | 输入 | 输出 | 不负责 |
+| Module | Input | Output | Outside its responsibility |
 | --- | --- | --- | --- |
-| `online` | 文件、目录、glob、Hub Dataset | RawSample source | tokenizer、模型语义 |
-| `text` | RawSample + tokenizer/template | Text ModelSample | 多模态 processor |
-| `omni` | RawSample + processor | Omni planning/ModelSample | source IO、DP 采样 |
-| `batching` | ModelSample | collated batch | 原始文件加载 |
-| `parallel` | Dataset index 或 collated batch | rank-local batch | 模型 transform |
-| `indexed` | `.idx/.bin` prefix | 固定训练样本 | Online transform |
+| `online` | Files, directories, globs, Hub Datasets | RawSample source | Tokenizers and model semantics |
+| `text` | RawSample + tokenizer/template | Text ModelSample | Multimodal processors |
+| `omni` | RawSample + processor | Omni planning/ModelSample | Source I/O and DP sampling |
+| `batching` | ModelSample | Collated batch | Raw file loading |
+| `parallel` | Dataset index or collated batch | Rank-local batch | Model transforms |
+| `indexed` | `.idx/.bin` prefix | Fixed training samples | Online transforms |
 
-`online` 只提供 source，不承载 LLM、VLM 或具体模型语义。模型特有的 processor/transform
-放在模型 adapter 中，例如 DeepSeek-V4.1：
+`online` provides sources only, without LLM, VLM, or model-specific semantics. Model-specific processors/transforms
+belong in model adapters, for example DeepSeek-V4.1:
 
 ```text
 hyper_parallel/models/deepseek_v41/adapter/
@@ -43,28 +45,28 @@ hyper_parallel/models/deepseek_v41/adapter/
 └── transform_fn.py
 ```
 
-DeepSeek-V4.1 Online VLM 的样本契约、图片展开、label mask 和 batch 字段说明见
-[`docs/guide/data/deepseek_v41_vlm_online_data_guide.md`](../../docs/guide/data/deepseek_v41_vlm_online_data_guide.md)。
+For DeepSeek-V4.1 Online VLM sample contracts, image expansion, label masks, and batch fields, see
+[`docs/guide/data/deepseek_v41_vlm_online_data_guide.md`](../../docs/guide/data/deepseek_v41_vlm_online_data_guide.md).
 
-## 2. 支持状态
+## 2. Support Status
 
-| 路径 | 状态 | 主要入口 |
+| Path | Status | Main entry point |
 | --- | --- | --- |
-| Indexed Text | 已支持 | `build_indexed_text_dataset` |
-| Online Mapping Text | 已支持 | `build_online_text_mapping_dataset` |
-| Online Iterable Text | 已支持 | `build_online_iterable_dataset` |
-| Online Mapping Omni | 已支持 | `build_online_omni_mapping_dataset` |
-| Online Iterable Omni | 尚未提供顶层 Dataset 入口 | 可复用 `online` Iterable source seam |
-| Offline Omni metadata | transform 生命周期已预留 | Dataset/provider 尚未落地 |
-| Omni TP/CP get-batch | 已实现，待多卡训练验证 | `OmniParallelBatch` 仅支持 PP=1 |
+| Indexed Text | Supported | `build_indexed_text_dataset` |
+| Online Mapping Text | Supported | `build_online_text_mapping_dataset` |
+| Online Iterable Text | Supported | `build_online_iterable_dataset` |
+| Online Mapping Omni | Supported | `build_online_omni_mapping_dataset` |
+| Online Iterable Omni | No top-level Dataset entry point yet | Reuse the `online` Iterable source interface |
+| Offline Omni metadata | Transform lifecycle reserved | Dataset/provider not yet implemented |
+| Omni TP/CP get-batch | Implemented; multi-device training validation pending | `OmniParallelBatch` supports only PP=1 |
 
-当前 Omni 已接入 image/VLM 字段；目录和 transform contract 可继续扩展 video、audio。
+Omni currently integrates image/VLM fields; directory structure and transform contracts can extend to video and audio.
 
-## 3. 两类 source
+## 3. Two Source Types
 
 ### 3.1 Mapping
 
-Mapping source 有稳定长度和整数索引：
+Mapping sources have stable lengths and integer indices:
 
 ```text
 source[index]
@@ -73,20 +75,20 @@ source[index]
   -> ModelSample
 ```
 
-本地 JSONL 使用原生 byte-offset 索引，避免 heterogeneous JSONL 被 Arrow 强制合并 schema。
-JSON、Parquet、CSV、Arrow 和 Hub Dataset 使用 Hugging Face `load_dataset(..., streaming=False)`。
+Local JSONL uses native byte-offset indexing, avoiding Arrow schema coercion for heterogeneous JSONL.
+JSON, Parquet, CSV, Arrow, and Hub Datasets use Hugging Face `load_dataset(..., streaming=False)`.
 
-Mapping 的顺序为：
+Mapping processing order:
 
 ```text
-每个 source 确定 train/valid/test
-  -> 同名 split 内构造全局 blend index
+Determine train/valid/test for each source
+  -> construct a global blend index within each named split
   -> source-local deterministic shuffle/repeat
-  -> 公共 BatchSampler 做 DP index shard
+  -> shared BatchSampler shards indices across DP
   -> lazy transform
 ```
 
-单路径默认全部作为 train：
+A single path defaults entirely to train:
 
 ```yaml
 dataset:
@@ -95,17 +97,17 @@ dataset:
   data_config: {}
 ```
 
-比例 split 使用 Hugging Face split expression，只适用于 Mapping：
+Ratio splits use Hugging Face split expressions and apply only to Mapping sources:
 
 ```yaml
 dataset:
   _target_: hyper_parallel.data.text.build_dataset.build_online_text_mapping_dataset
   data_path: /data/all/*.parquet
   data_config:
-    split: "98, 1, 1"  # train / valid / test，合计必须为 100
+    split: "98, 1, 1"  # train / valid / test; must total 100.
 ```
 
-已制作好的独立 split 使用路径 Mapping；`valid`、`test` 可省略：
+For independently prepared splits, use a path mapping; `valid` and `test` are optional:
 
 ```yaml
 dataset:
@@ -117,7 +119,7 @@ dataset:
   data_config: {}
 ```
 
-Hub Dataset 与本地路径使用同一个 `data_path`：
+Hub Datasets and local paths use the same `data_path` field:
 
 ```yaml
 dataset:
@@ -129,7 +131,7 @@ dataset:
     cache_dir: null
 ```
 
-多源 Mapping 使用确定性权重调度：
+Multiple Mapping sources use deterministic weighted scheduling:
 
 ```yaml
 data_config:
@@ -140,12 +142,12 @@ data_config:
       weight: 0.3
 ```
 
-顶层 blend index 保存 `(source_id, source_logical_index)`；每个 source 的逻辑索引再映射到
-确定性 shuffle/repeat 后的物理样本。这与 Indexed/Megatron 的“先构造全局顺序，再做 DP shard”一致。
+The top-level blend index stores `(source_id, source_logical_index)`. Each source's logical index then maps to
+physical samples after deterministic shuffle/repeat, matching Indexed/Megatron's global-order-before-DP-sharding approach.
 
 ### 3.2 Iterable
 
-Iterable source 使用 Hugging Face `load_dataset(..., streaming=True)`，没有可随机访问的全局 index：
+Iterable sources use Hugging Face `load_dataset(..., streaming=True)` and have no randomly accessible global index:
 
 ```text
 each source
@@ -155,32 +157,32 @@ each source
   -> lazy transform
 ```
 
-因此 Iterable 不支持运行期比例 split。应由输入路径或 Hub 原生 split 决定 train/valid/test。
-其 epoch、shuffle buffer 和恢复语义由 stream 自身维护；不能套用 Mapping 的全局 shuffle index。
+Iterable therefore does not support runtime ratio splits. Input paths or native Hub splits must define train/valid/test.
+The stream owns epoch, shuffle-buffer, and resume semantics; Mapping's global shuffle index does not apply.
 
-多源 Iterable 默认使用 `local_weighted`；也可选择 Hugging Face 风格的
-`global_interleave`。二者是 source 组合策略，不是 train/valid/test split。
+Multiple Iterable sources default to `local_weighted`; Hugging Face-style
+`global_interleave` is also available. These combine sources rather than define train/valid/test splits.
 
-## 4. Text 路径
+## 4. Text Path
 
-Text transform 负责 RawSample 到 `input_ids/labels`：
+Text transforms convert RawSample into `input_ids/labels`:
 
 ```text
 Online source
   -> PlaintextTransform / TextConversationTransform
   -> input_ids [sample_length]
   -> labels    [sample_length]
-  -> FixedBatchDataLoader 或 TokenBatchLoader
+  -> FixedBatchDataLoader or TokenBatchLoader
   -> TextPackingCollator
   -> input_ids/labels [1, packed_length] + cu_seq_lens
   -> TextParallelBatch
 ```
 
-`TextParallelBatch` 统一处理 Online Text 与 Indexed Text：
+`TextParallelBatch` handles both Online Text and Indexed Text:
 
 ```text
-DataLoader owner 读取 batch
-  -> 解析 sequence boundaries
+The DataLoader owner reads a batch
+  -> parse sequence boundaries
   -> CP sequence shard
   -> TP broadcast
   -> position_ids / loss_mask
@@ -188,26 +190,26 @@ DataLoader owner 读取 batch
   -> (model_inputs, loss_inputs)
 ```
 
-`FixedBatchDataLoader` 固定每批样本数；`TokenBatchLoader` 按 token budget 从候选池选择
-可变数量的完整样本。二者都不会把单条超长样本静默截断。
+`FixedBatchDataLoader` fixes the number of samples per batch; `TokenBatchLoader` selects a variable number of complete samples
+from a candidate pool according to a token budget. Neither silently truncates an oversized sample.
 
-## 5. Omni transform 生命周期
+## 5. Omni Transform Lifecycle
 
-`OmniDataTransform` 采用 Energon 风格的 hook 组合。实现类必须满足以下三种模式之一：
+`OmniDataTransform` uses Energon-style hook composition. Implementations must satisfy one of three modes:
 
-| 模式 | 实现 hook | 候选池之前 | 选中之后 |
+| Mode | Implemented hooks | Before candidate pooling | After selection |
 | --- | --- | --- | --- |
-| Eager Online | `encode_sample` | 完整 encode | 原样返回 |
-| Deferred Online | `preencode_sample` + `postencode_sample` | 只生成 planning metadata | 完整 encode |
-| Offline metadata | `postencode_sample` | 保留已有 metadata | 完成 encode |
+| Eager Online | `encode_sample` | Full encoding | Return unchanged |
+| Deferred Online | `preencode_sample` + `postencode_sample` | Planning metadata only | Full encoding |
+| Offline metadata | `postencode_sample` | Retain existing metadata | Complete encoding |
 
-禁止同时实现 `encode_sample` 和 `preencode_sample/postencode_sample`。只有
-`preencode_sample` 而没有 `postencode_sample` 也属于无效组合。
+Implementing both `encode_sample` and `preencode_sample/postencode_sample` is forbidden. Implementing only
+`preencode_sample` without `postencode_sample` is also invalid.
 
-`encode_batch` 是最终 batch adapter：它在 packing/collate 之后把通用字段转换为模型 forward contract。
-例如 DeepSeek-V4.1 在这里将图片 patch length 转换为 offset，并生成 image-to-batch 映射。
+`encode_batch` is the final batch adapter: after packing/collation, it converts generic fields into the model's forward contract.
+DeepSeek-V4.1, for example, converts image patch lengths to offsets and generates image-to-batch mappings here.
 
-AutoProcessor 默认模式：
+Default AutoProcessor behavior:
 
 ```python
 processor = AutoProcessor.from_pretrained(
@@ -216,16 +218,16 @@ processor = AutoProcessor.from_pretrained(
 )
 ```
 
-如果 processor 没有 `chat_template`，会复用 `processor.tokenizer.chat_template`。
-`AutoProcessorTransform` 只负责 `apply_chat_template`；模型特有的 label、media metadata 和 batch
-contract 由模型 adapter 实现。
+If the processor lacks `chat_template`, reuse `processor.tokenizer.chat_template`.
+`AutoProcessorTransform` handles `apply_chat_template`; model adapters implement model-specific labels, media metadata, and batch
+contracts.
 
-相对图片、视频和音频路径在 transform 前根据 RawSample 的 source 文件目录解析；远端 URL、data URL
-和绝对路径保持不变。
+Before transformation, relative image/video/audio paths are resolved against the RawSample source file's directory. Remote URLs, data URLs,
+and absolute paths are unchanged.
 
 ## 6. Omni packing
 
-当前 Online Mapping Omni 流程：
+Current Online Mapping Omni flow:
 
 ```text
 build_online_mapping_source
@@ -242,11 +244,11 @@ build_online_mapping_source
   -> model
 ```
 
-默认 `FirstFitPackingSelector` 使用 `packing_length`；字段不存在时使用 `input_ids` 长度。
-`SamplePacker` 拼接 token、label、modality tensor，生成 `cu_seq_lens`，并把
-`*_token_starts` 从 sample-local 坐标转换为 packed-sequence 坐标。
+The default `FirstFitPackingSelector` uses `packing_length`, falling back to `input_ids` length when absent.
+`SamplePacker` concatenates tokens, labels, and modality tensors, generates `cu_seq_lens`, and converts
+`*_token_starts` from sample-local to packed-sequence coordinates.
 
-候选池同时满足以下条件才生成 micro-batch：
+The candidate pool emits a micro-batch only when both conditions hold:
 
 ```text
 len(buffer) >= min_buffered_samples
@@ -254,13 +256,13 @@ and
 sum(sample_cost) >= token_budget
 ```
 
-默认：
+Default:
 
 ```text
 token_budget = micro_batch_size * data_transform.max_seq_len
 ```
 
-可在 DataLoader 配置中独立覆盖候选选择预算：
+Override the selection budget independently in DataLoader configuration:
 
 ```yaml
 dataloader:
@@ -269,43 +271,43 @@ dataloader:
   min_buffered_samples: 1
 ```
 
-`token_budget` 只控制候选选择，不截断样本。若第一条样本本身超过 budget，first-fit 会让它单独成 batch。
-transform 的 `max_seq_len` 仍负责验证模型允许的最大样本长度。
+`token_budget` controls selection only, not truncation. If the first sample alone exceeds the budget, first-fit emits it as a standalone batch.
+The transform's `max_seq_len` still validates the model's maximum allowed sample length.
 
-## 7. Omni 分布式约束
+## 7. Omni Distributed Constraints
 
-`OmniParallelBatch` 在每个 CP 坐标的 TP0 读取相同 DP 样本，通过 `CPBatchSharder` 仅切分 token 字段，
-再通过 `TPBatchBroadcaster` 将 CP-local token 和完整图像字段送到同一 CP 坐标的 TP peers。
-`pixel_values`、图像网格和全局 `image_token_starts` 不按 CP 切分。当前要求：
+`OmniParallelBatch` reads identical DP samples on TP0 at each CP coordinate. `CPBatchSharder` shards only token fields,
+then `TPBatchBroadcaster` sends CP-local tokens and complete image fields to TP peers at that CP coordinate.
+`pixel_values`, image grids, and global `image_token_starts` are not CP-sharded. Current requirements:
 
 ```text
-PP=1；TP/CP 路径需要分布式进程组
+PP=1; TP/CP paths require distributed process groups.
 ```
 
-`get_batch.encoder_dp` 默认为 `false`：每个 TP×CP rank 接收完整图片并独立计算 ViT，
-只将对应本地 CP token 的视觉 embedding 写入文本序列。`true` 留作按完整图片分桶、
-经 all-to-all 路由视觉 embedding 的路径；该路径尚未实现，配置为 `true` 会立即报错。
+`get_batch.encoder_dp` defaults to `false`: every TP×CP rank receives complete images and computes ViT independently,
+inserting only visual embeddings corresponding to local CP tokens into the text sequence. `true` is reserved for whole-image bucketing
+and all-to-all routing of visual embeddings; it is unimplemented and raises immediately when configured.
 
-DeepSeek-V4.1 在 YAML 中为 `OmniParallelBatch.runtime_input_adapter` 挂载 `DeepseekV41Runtime`，
-负责 packed attention 和图像插入坐标；各 TP×CP rank 在模型前向中重复执行完整 ViT，
-再按全局图像 span 与本地 CP token 区间的交集替换 embedding。TP/CP 下 ViT 重复参数的
-梯度同步仍需多卡训练验证。
+DeepSeek-V4.1 attaches `DeepseekV41Runtime` through YAML `OmniParallelBatch.runtime_input_adapter`
+for packed attention and image insertion coordinates. Every TP×CP rank repeats full ViT computation during forward,
+then replaces embeddings at the intersection of global image spans and local CP token intervals. Gradient synchronization for ViT parameters replicated
+across TP/CP still requires multi-device training validation.
 
-EP/FSDP 可由模型并行计划启用，但模型必须保证每个 rank 以相同顺序和次数调用分布式子模块。
+EP/FSDP can be enabled through model parallel plans, but every rank must call distributed submodules in identical order and count.
 
-DeepSeek-V4.1 当前逐图片调用 vision tower：
+DeepSeek-V4.1 currently invokes the vision tower once per image:
 
 ```text
 for each image:
-    vision(...)   # vision 被 FSDP shard 时会触发 collective
+    vision(...)   # Triggers collectives when vision is FSDP-sharded.
     aligner(...)
 ```
 
-因此，在 vision 使用 FSDP 时，各 rank 的一个 micro-batch 必须包含相同数量的图片。图片尺寸不同只造成
-计算量差异；图片数量不同会造成 vision/FSDP collective 调用次数不同，并可能与后续 EP collective
-形成死锁。
+With FSDP-sharded vision, each rank's micro-batch must therefore contain the same number of images. Different image sizes change only
+computation volume; different image counts change the number of vision/FSDP collectives and may deadlock with
+subsequent EP collectives.
 
-当前 DeepSeek-V4.1 smoke 配置使用一条样本、一张图片组成一个 rank-local micro-batch：
+The current DeepSeek-V4.1 smoke configuration uses one sample and one image per rank-local micro-batch:
 
 ```yaml
 data_transform:
@@ -314,41 +316,41 @@ data_transform:
 
 dataloader:
   _target_: hyper_parallel.data.batching.OmniPackingLoader
-  token_budget: 128       # 第一条完整样本立即出 batch，不截断到 128
+  token_budget: 128       # Emit the first complete sample immediately; do not truncate to 128.
   min_buffered_samples: 1
 ```
 
-这只是当前 baseline，不是通用多图 packing 方案。多图 FSDP 的目标方案参考 PanGu：
+This is the current baseline, not a general multi-image packing solution. The target multi-image FSDP approach follows PanGu:
 
 ```text
-本 rank real image count
-  -> 在 vision 第一次调用前对齐 global image count
-  -> 不足部分补最小合法 dummy image
+Real image count on this rank
+  -> align global image count before the first vision call
+  -> fill missing slots with minimal valid dummy images
   -> real/dummy mask
-  -> 每个 rank 执行相同次数的 vision/aligner
-  -> 仅 real image 写回语言 token span
+  -> run the same number of vision/aligner calls on every rank
+  -> write only real images back to language-token spans
 ```
 
-dummy 必须保留零梯度依赖，使 forward 和 backward 的 FSDP 调用次数都一致。该 image-call padding
-尚未在 HyperParallel 实现；在实现前，不要恢复每 rank 可变图片数的 DeepSeek FSDP packing。
+Dummy inputs must retain zero-gradient dependencies so FSDP forward and backward call counts both match. This image-call padding
+is not implemented in HyperParallel; do not re-enable DeepSeek FSDP packing with variable image counts per rank until it is.
 
 ## 8. Indexed Text
 
-Indexed 路径使用同一 prefix 的两个文件：
+The Indexed path uses two files sharing one prefix:
 
 ```text
-<prefix>.idx  # dtype、length、pointer、document index
-<prefix>.bin  # 连续 token payload
+<prefix>.idx  # dtype, length, pointer, document index
+<prefix>.bin  # Contiguous token payload
 ```
 
-两种 mid-level Dataset：
+Two mid-level Dataset types:
 
-| 数据形式 | 配置 | Dataset | 运行期行为 |
+| Data form | Configuration | Dataset | Runtime behavior |
 | --- | --- | --- | --- |
-| 变长文档 | `is_dataset_from_mr: false` | `GPTDataset` | document/sample/shuffle index 动态组样 |
-| 离线预切定长 record | `is_dataset_from_mr: true` | `GPTFromMRDataset` | 直接读取固定 record |
+| Variable-length documents | `is_dataset_from_mr: false` | `GPTDataset` | Dynamic samples from document/sample/shuffle indices |
+| Offline fixed-length records | `is_dataset_from_mr: true` | `GPTFromMRDataset` | Read fixed records directly |
 
-Indexed 的逻辑顺序为：
+Indexed processing order:
 
 ```text
 build low-level source
@@ -359,33 +361,33 @@ build low-level source
   -> DP BatchSampler
 ```
 
-`split: "98, 1, 1"` 按 low-level element 连续划分。独立的
-`train_data_path/valid_data_path/test_data_path` 可替代共享 split。
+`split: "98, 1, 1"` partitions low-level elements consecutively. Separate
+`train_data_path/valid_data_path/test_data_path` may replace the shared split.
 
-标准 blend 使用权重调度；`simple_blend: inter/intra` 只适用于离线预切 record。
-离线制作命令和格式说明见 `docs/guide/data/offline_preparation_guide.md`。
+Standard blending uses weighted scheduling; `simple_blend: inter/intra` applies only to offline fixed records.
+See `docs/guide/data/offline_preparation_guide.md` for offline preparation commands and format details.
 
-## 9. Sampler、epoch 与恢复
+## 9. Samplers, Epochs, and Resume
 
-Mapping Dataset 使用 `build_dataset_batch_sampler`：
+Mapping Datasets use `build_dataset_batch_sampler`:
 
-- `single`：顺序消费 Dataset 已构造好的全局索引；跨 epoch 复用相同顺序。
-- `cyclic`：使用 `seed + epoch` 构造确定性 shuffle。
-- `drop_last`：丢弃不能组成完整 distributed micro-batch 的尾部。
-- `data_rearrange_map`：在逻辑 index 与物理 Dataset index 之间增加映射。
+- `single`: Consume the Dataset's existing global index sequentially, reusing the order across epochs.
+- `cyclic`: Build a deterministic shuffle with `seed + epoch`.
+- `drop_last`: Drop the tail that cannot fill a complete distributed micro-batch.
+- `data_rearrange_map`: Add a mapping from logical indices to physical Dataset indices.
 
-动态 DataLoader checkpoint 保存：
+Dynamic DataLoader checkpoints save:
 
 ```text
 source DataLoader cursor
 + BatchSampler consumed_samples / epoch
-+ 未消费 candidate buffer
++ Unconsumed candidate buffer
 ```
 
-Mapping 默认按 index 保存 buffer，可重放 transform；Iterable 默认保存完整 sample。当前 Online
-DataLoader resume 要求 `global_batch_size` 和 DP world size 不变。
+Mapping buffers store indices by default, allowing transform replay; Iterable buffers store complete samples. Online
+DataLoader resume currently requires unchanged `global_batch_size` and DP world size.
 
-## 10. 配置示例
+## 10. Configuration Examples
 
 ### Online Mapping Text
 
@@ -436,14 +438,14 @@ dataloader:
     _target_: hyper_parallel.data.batching.OmniParallelBatch
 ```
 
-## 11. 调试
+## 11. Debugging
 
 ```yaml
 debug:
-  check_dataset: debug  # debug / info / warn；null 表示跟随全局级别
+  check_dataset: debug  # debug / info / warn; null follows the global level.
 ```
 
-也可在 Trainer 初始化前启用：
+Alternatively, enable before Trainer initialization:
 
 ```python
 from hyper_parallel.data.dataset_logging import enable_dataset_logging
@@ -453,4 +455,4 @@ enable_dataset_logging("debug", ranks=(1, 3))
 enable_dataset_logging("debug", ranks=None)
 ```
 
-日志覆盖 source、split/blend、Dataset、Sampler、DataLoader 和 parallel batch 形状，不记录样本文本内容。
+Logs cover sources, splits/blending, Datasets, Samplers, DataLoaders, and parallel batch shapes, without recording sample text.

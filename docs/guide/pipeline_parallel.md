@@ -1,65 +1,67 @@
-# PP 流水线并行使用指南
+# PP Pipeline Parallelism Guide
 
-HyperParallel 提供 Pipeline Parallel（流水线并行）能力，将模型按层切分为多个 stage 分布到不同设备上，支持 GPipe、1F1B、VPP 等调度策略，并提供通算掩盖（overlap_b_f）、PP+FSDP、P2P prefetch 等高级特性。
+**English** | [简体中文](pipeline_parallel.zh.md)
 
-## 核心概念
+HyperParallel provides pipeline parallelism, partitioning a model by layers into stages distributed across devices. It supports GPipe, 1F1B, and VPP schedules, with advanced features such as compute-communication overlap (overlap_b_f), PP+FSDP, and P2P prefetch.
 
-| 调度策略 | 说明 | Bubble 比例 |
+## Core Concepts
+
+| Schedule | Description | Bubble ratio |
 |----------|------|-------------|
-| GPipe | 所有 micro-batch 先正向再反向 | 较大 |
-| 1F1B | 一个正向紧跟一个反向 | 较小 |
-| VPP (Interleaved 1F1B) | 交错分配，每个 rank 多个 virtual stage | 最小 |
-| MPipe (demo 版本) | 将多模态大模型流水拆分为 Encoder Stage 和 LLM Backbone Stage，并将 Encoder 计算转置到多个 PP rank 上并行执行 | 消除模态 bubble |
+| GPipe | Run all micro-batch forwards before backwards | Larger |
+| 1F1B | Alternate one forward and one backward | Smaller |
+| VPP (Interleaved 1F1B) | Interleaved assignment with multiple virtual stages per rank | Smallest |
+| MPipe (demo) | Split multimodal pipelines into encoder and LLM backbone stages, transposing encoder computation across PP ranks for parallel execution | Eliminates modality bubbles |
 
-## 接口概览
+## API Overview
 
-| 接口 | 说明 |
+| Interface | Description |
 |------|------|
-| `PipelineStage` | 流水线 stage 封装，支持 dx/dw 计算 |
-| `Schedule1F1B` | 1F1B 调度 |
-| `ScheduleGPipe` | GPipe 调度 |
-| `ScheduleInterleaved1F1B` | VPP（交错 1F1B）调度 |
-| `ScheduleMPipeTranspose` | MPipe Transpose 调度 |
-| `MetaStep` / `MetaStepType` / `BatchDimSpec` | 调度单元抽象 |
-| `CommComputeOverlap` | 双线程通算掩盖协调器 |
-| `HookCoordinator` / `HookRole` | COMM-first rendezvous 原语 |
+| `PipelineStage` | Pipeline stage wrapper supporting dx/dw computation |
+| `Schedule1F1B` | 1F1B schedule |
+| `ScheduleGPipe` | GPipe schedule |
+| `ScheduleInterleaved1F1B` | VPP (interleaved 1F1B) schedule |
+| `ScheduleMPipeTranspose` | MPipe Transpose schedule |
+| `MetaStep` / `MetaStepType` / `BatchDimSpec` | Scheduling unit abstractions |
+| `CommComputeOverlap` | Two-thread compute-communication overlap coordinator |
+| `HookCoordinator` / `HookRole` | COMM-first rendezvous primitives |
 
 ---
 
-## 基础使用
+## Basic Usage
 
-### 1. 标准 1F1B 调度
+### 1. Standard 1F1B Schedule
 
 ```python
 from hyper_parallel import PipelineStage, Schedule1F1B
 
-# 将切分后的 module 封装成 PipelineStage
+# Wrap a partitioned module in PipelineStage.
 stage = PipelineStage(split_model, stage_index, stage_num=4)
 
-# 选择流水线并行的调度
+# Select the pipeline parallel schedule.
 schedule = Schedule1F1B(stage, micro_batch_num=8)
 
-# 执行
+# Execute.
 x = DTensor.from_local(local_x, x_layout)
 losses = schedule.run(x)
 ```
 
-### 2. VPP (Interleaved 1F1B) 调度
+### 2. VPP (Interleaved 1F1B) Schedule
 
 ```python
 from hyper_parallel import PipelineStage, ScheduleInterleaved1F1B
 
-# VPP 场景下每个 rank 有多个 virtual stage
+# Each rank owns multiple virtual stages in VPP.
 schedule = ScheduleInterleaved1F1B(stages, micro_batch_num=8)
 losses = schedule.run(*inputs)
 ```
 
-### 3. MPipe (Transpose) 调度
+### 3. MPipe (Transpose) Schedule
 
 ```python
 from hyper_parallel import PipelineStage, ScheduleMPipeTranspose
 
-# MPipe 将 Encoder 或 dataload-only identity 放到每个 PP rank 上
+# MPipe places an encoder or dataload-only identity on every PP rank.
 stage = PipelineStage(stage_module, stage_index=rank, stage_num=pp_size)
 
 schedule = ScheduleMPipeTranspose(
@@ -74,38 +76,38 @@ losses = schedule.run(local_batch)
 
 ---
 
-## PP+FSDP 集成
+## PP+FSDP Integration
 
-PP stage 内部可以使用 FSDP 进行参数切分，进一步降低单卡内存占用：
+Use FSDP inside each PP stage to shard parameters and further reduce per-device memory usage:
 
 ```python
 from hyper_parallel import PipelineStage, Schedule1F1B, fully_shard, init_device_mesh
 
 mesh = init_device_mesh("npu", (pp_size, dp_size), mesh_dim_names=("pp", "dp"))
 
-# 每个 PP stage 内部应用 FSDP
+# Apply FSDP inside each PP stage.
 for stage_model in split_models:
     fully_shard(stage_model, mesh=mesh["dp"])
 
-# PipelineStage 支持 MetaStep 集成 FSDP
+# PipelineStage supports FSDP integration through MetaStep.
 stage = PipelineStage(stage_model, stage_index, stage_num=pp_size)
 ```
 
 ---
 
-## 通算掩盖 (overlap_b_f)
+## Compute-Communication Overlap (overlap_b_f)
 
-overlap_b_f 将稳态期的 BWD 和 FWD 配对为复合 step，通过双线程协调器实现 EP A2A 与 compute 的物理并发：
+overlap_b_f pairs steady-state BWD and FWD into composite steps. A two-thread coordinator enables physical concurrency between EP A2A and computation:
 
 ```python
 from hyper_parallel import ScheduleInterleaved1F1B, MetaStepType
 
-# 1. 构造 schedule，启用 B/F overlap + P2P overlap
+# 1. Construct a schedule with B/F overlap and P2P overlap enabled.
 schedule = ScheduleInterleaved1F1B(
     stages, micro_batch_num, overlap_p2p=True, overlap_b_f=True,
 )
 
-# 2. 给每个 MoE 层装钩子
+# 2. Attach hooks to every MoE layer.
 overlap = CommComputeOverlap()
 for i, layer in enumerate(moe_layers):
     layer.experts.dispatch = overlap.wrap_dispatch(layer.experts.dispatch)
@@ -113,20 +115,20 @@ for i, layer in enumerate(moe_layers):
         layer.experts.combine, is_last_layer=(i == len(moe_layers) - 1),
     )
 
-# 3. 注册 OVERLAP_B_F callback
+# 3. Register the OVERLAP_B_F callback.
 def callback(step, ctx):
     bwd_step, fwd_step = step.sub_steps
     overlap.run(fwd_fn=..., bwd_fn=...)
 
 schedule.register_custom_function(MetaStepType.OVERLAP_B_F, callback)
 
-# 4. 执行
+# 4. Execute.
 losses = schedule.run(*inputs)
 ```
 
 ### P2P Prefetch
 
-`overlap_p2p=True` 让 PP stage 间的 P2P send/recv 提前一拍 issue，与本拍的 compute 自然并发：
+`overlap_p2p=True` issues inter-stage P2P send/recv one step ahead, naturally overlapping it with computation in the current step:
 
 ```python
 schedule = ScheduleInterleaved1F1B(
@@ -136,10 +138,10 @@ schedule = ScheduleInterleaved1F1B(
 
 ### batched P2P transport
 
-overlap_b_f 下默认使用 duplex P2P（batch_isend_irecv），减少 P2P 通信次数：
+With overlap_b_f, duplex P2P (batch_isend_irecv) is enabled by default to reduce P2P communication calls:
 
 ```python
-# 默认启用 duplex batched P2P
+# Duplex batched P2P is enabled by default.
 # forward-side P2P prefetch via batch_isend_irecv
 ```
 
@@ -147,51 +149,51 @@ overlap_b_f 下默认使用 duplex P2P（batch_isend_irecv），减少 P2P 通�
 
 ## PP Activation Swap
 
-Pipeline Parallel 场景下可以配合 Activation Swap，将 stage 内的激活 offload 到 CPU：
+Pipeline parallelism can be combined with Activation Swap to offload activations within a stage to CPU:
 
 ```python
 from hyper_parallel.core.activation_checkpoint import swap_wrapper
 
-# PP stage 内部使用 swap
+# Use swap within a PP stage.
 for layer in stage_model.layers:
     stage_model.layers[layer] = swap_wrapper(layer)
 ```
 
 ---
 
-## PipelineStage dx/dw 计算
+## PipelineStage dx/dw Computation
 
-PipelineStage 支持 dx（输入梯度）和 dw（权重梯度）的独立计算：
+PipelineStage supports independent computation of dx (input gradients) and dw (weight gradients):
 
 ```python
 stage = PipelineStage(split_model, stage_index, stage_num=4)
-# dx/dw 在 backward 时自动计算
+# dx/dw are computed automatically during backward.
 ```
 
 ---
 
 ## variable-layer + mixed-recompute
 
-overlap_b_f 支持不同 PP stage 包含不同层数，并支持混合重计算策略：
+overlap_b_f supports different layer counts across PP stages and mixed recomputation strategies:
 
 ```python
-# 不同 stage 可包含不同层数
-# mixed-recompute 在 overlap_b_f 下正确处理
+# Different stages may contain different numbers of layers.
+# Mixed recomputation is handled correctly under overlap_b_f.
 ```
 
 ---
 
-## 性能建议
+## Performance Recommendations
 
-1. **micro_batch_num 选择**：通常设为 2×pp_size 或 4×pp_size，增大可减少 bubble 但增加内存
-2. **overlap_b_f**：PP+EP 场景下开启 overlap_b_f 可显著减少通算串行等待
-3. **overlap_p2p**：配合 overlap_b_f 开启 overlap_p2p 可进一步减少 P2P 通信延迟
-4. **PP+FSDP**：stage 内部使用 FSDP 切分参数可大幅降低单卡内存占用
-5. **batch size 整除**：batch size 必须整除 micro_batch_num
+1. **micro_batch_num**: Typically set to 2×pp_size or 4×pp_size. Increasing it reduces bubbles but increases memory usage.
+2. **overlap_b_f**: Enabling it for PP+EP can substantially reduce serialized compute-communication waits.
+3. **overlap_p2p**: Enable it together with overlap_b_f to further reduce P2P communication latency.
+4. **PP+FSDP**: Sharding parameters inside each stage with FSDP significantly reduces per-device memory usage.
+5. **Batch divisibility**: The batch size must be divisible by micro_batch_num.
 
 ---
 
-## 更多参考
+## Further Reading
 
-- [PP overlap_b_f 设计文档](./pipeline_parallel_overlap_b_f.md) — 通算掩盖详细设计
-- [API 参考](../api/api_reference.md) — PP 模块接口详细说明
+- [PP overlap_b_f Design](./pipeline_parallel_overlap_b_f.md) — Detailed compute-communication overlap design
+- [API Reference](../api/api_reference.md) — Detailed PP interfaces

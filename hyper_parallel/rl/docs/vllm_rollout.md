@@ -1,49 +1,54 @@
 # vLLM Rollout
 
-## 适用范围
+**English** | [简体中文](vllm_rollout.zh.md)
 
-仅保留 native-vLLM。训练模型由 HP 构建，RL 插件不注册替代 Qwen3 模型。
-插件入口为 `rl.rollout.vllm_plugin:install_runtime_hooks`，安装权重同步、工具证据、partial service 和必要采样修复。
-版本敏感的私有生命周期钩子必须匹配支持的 vLLM/vLLM-Ascend 组合，未知版本明确失败。
+## Scope
+
+Only native-vLLM remains. HP constructs training models; the RL plugin does not register a replacement Qwen3 model.
+The plugin entry point is `rl.rollout.vllm_plugin:install_runtime_hooks`, which installs weight synchronization, tool evidence, partial service, and required sampling fixes.
+Version-sensitive private lifecycle hooks must match supported vLLM/vLLM-Ascend combinations; unknown versions fail explicitly.
 
 ## Qwen3-30B-A3B
 
-MoE 使用本次 YAML 声明的 HP 替换规则和 native rollout。保持 GRPO、colocated、EPLB 关闭等既有约束，不支持 MoE PPO 或 disjoint。
-full_gather 将 GroupedExperts 切片还原为逐专家 checkpoint 权重，通过 native layerwise reload 更新目标存储。
-接收方持有独立 tensor，避免后续 bucket 释放造成悬空引用；回执必须覆盖全部 DP×TP worker。
+MoE uses the HP replacement rules declared in this run's YAML and native rollout. Existing constraints such as GRPO, colocation, and disabled EPLB remain; MoE PPO and disjoint deployment are unsupported.
+full_gather reconstructs per-expert checkpoint weights from GroupedExperts shards and updates target storage through native layerwise reload.
+Receivers retain independent tensors to prevent dangling references after bucket release; acknowledgments must cover every DP×TP worker.
 
-### MoE R3 路由重放
+<!-- markdownlint-disable-next-line MD033 -->
+<a id="moe-r3-路由重放"></a>
 
-`train.router_replay.mode: R3` 启用 expert capture 和 Actor replay，默认 `disabled`。
-继续限制为现有 eager/raw-logprob/拓扑组合；不改变 Agent 预算或睡眠级别。
-详细范围见 [MoE 指南](moe_code_agent.md#moe-r3)。
+### MoE R3 Router Replay
+
+`train.router_replay.mode: R3` enables expert capture and Actor replay; the default is `disabled`.
+Existing eager/raw-logprob/topology restrictions remain; Agent budgets and sleep levels are unchanged.
+See the [MoE guide](moe_code_agent.md#moe-r3) for detailed scope.
 
 ## Ownership
 
-所有训练 rank 参与参数 gather；协调 rank 管理共享 HTTP 控制端点。
-worker 在实际加载完成后确认版本，DP engine 返回值不能代替所有物理 worker 的确认。
-配置校验区分共卡设备映射和分离设备集合，并检查每个训练 rank 的 endpoint 一致性。
+All training ranks participate in parameter gathering; the coordinator rank manages the shared HTTP control endpoint.
+Workers acknowledge versions after actual loading completes; a DP engine return value cannot replace acknowledgment from every physical worker.
+Configuration validation distinguishes colocated device mappings from disjoint device sets and verifies endpoint consistency across training ranks.
 
-## Request 与 Admission
+## Requests and Admission
 
-请求必须携带已提交策略版本。暂停 admission 后等待活动请求结束或按 partial 协议暂停，再更新参数。
-token IDs、raw logprobs、worker version 和可选路由 trace 一起返回；工具/观察 token 不成为模型 action。
-采样器修复恢复 partial prefill 中被丢弃请求的 RNG 偏移，不重建已删除的一致性模型路径。
+Requests must carry a committed policy version. After pausing admission, wait for active requests to finish or pause them through the partial protocol before updating parameters.
+Token IDs, raw logprobs, worker version, and optional routing traces return together; tool/observation tokens do not become model actions.
+The sampler fix restores RNG offsets for discarded requests during partial prefill; it does not recreate the deleted consistency-model path.
 
-## Policy 生命周期
+## Policy Lifecycle
 
-训练释放分片和 optimizer 驻留后才唤醒 rollout。发布失败不唤醒 KV cache、不提交版本。
-加载完成、缓存处理和 committed-version 检查全部成功后才恢复 admission。
-重启恢复从新进程实际状态出发，重新发布 Actor；不认为旧 checkpoint 的版本代表新 worker 已加载。
+Rollout wakes only after training releases shard and optimizer residency. Publication failure neither wakes the KV cache nor commits a version.
+Admission resumes only after loading, cache handling, and committed-version checks all succeed.
+Restart recovery begins with the new process's actual state and republishes Actor; an old checkpoint version does not prove that new workers have loaded it.
 
-## 权重同步
+## Weight Synchronization
 
-`WeightPublisher` 直接实现流式 full_gather；没有单实现 strategy 选择层。
-colocated 使用 IPC，disjoint 使用 HCCL。每次一个 bucket，确认后释放；超大单参数独占 bucket。
-桶计划只缓存名称和布局，不缓存完整 gather 后参数；tied 权重和 MoE 映射保持各自的 native 加载语义。
-旧 `direct_reshard` 配置和 RPC 已删除。
+`WeightPublisher` directly implements streaming full_gather, without a strategy-selection layer around a single implementation.
+Colocation uses IPC; disjoint deployment uses HCCL. Transfer one bucket at a time and release it after acknowledgment; an oversized parameter occupies its own bucket.
+Bucket plans cache only names and layouts, not fully gathered parameters; tied weights and MoE mappings retain their respective native loading semantics.
+The old `direct_reshard` configuration and RPCs have been removed.
 
-## 配置
+## Configuration
 
 ```yaml
 rollout:
@@ -55,16 +60,16 @@ rollout:
       bucket_size_mb: 128
 ```
 
-这是字段示意；启动时使用包含模型、数据、算法和设备声明的完整 examples 配置。
-运行前安装主项目和 `hyper_parallel/rl`，核对 `rl.__file__` 指向当前 checkout，并检查插件 metadata 的新入口。
+This illustrates fields only; launch with a complete example configuration declaring the model, data, algorithm, and devices.
+Before running, install both the main project and `hyper_parallel/rl`, verify that `rl.__file__` resolves to the current checkout, and inspect plugin metadata for the new entry point.
 
-## 验证状态
+## Validation Status
 
-CPU UT 验证事务顺序、故障传播、参数内容、单 bucket 内存生命周期和恢复协议。
-NPU 训练、真实 IPC/HCCL、MoE、vLLM 图捕获及长期学习效果必须在明确分配设备后分别验收。
-历史设备结果不自动证明本次重构后的设备路径已通过。
+CPU unit tests validate transaction ordering, failure propagation, parameter content, single-bucket memory lifecycles, and recovery protocols.
+NPU training, actual IPC/HCCL, MoE, vLLM graph capture, and long-term learning must each be accepted separately on explicitly allocated devices.
+Historical device results do not automatically establish that device paths pass after this refactor.
 
-## 修改门禁
+## Change Gates
 
-不得用禁用概率记录、放宽版本检查或跳过 worker 回执换取测试通过。
-入口、配置、插件和接收端必须同步迁移；完整合同见[架构](architecture.md)。
+Do not make tests pass by disabling probability recording, relaxing version checks, or skipping worker acknowledgments.
+Entry points, configuration, plugins, and receivers must migrate together; see the [architecture](architecture.md) for the complete contract.

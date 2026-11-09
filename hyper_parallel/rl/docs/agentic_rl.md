@@ -1,271 +1,276 @@
-# Agentic RL：任务环境与外部 Agent 如何接入 Hyper-RL
+# Agentic RL: Integrating Task Environments and External Agents with Hyper-RL
 
-Agentic 模块负责让模型在一个 episode 内反复执行“生成动作—调用工具—接收观察—继续生成”，并把完整过程收敛为
-Hyper-RL 认识的 `Trajectory`。Hyper-RL 仍然负责数据加载、批处理、优势估计、Actor 更新、权重发布和检查点。
+**English** | [简体中文](agentic_rl.zh.md)
 
-Agentic 决定模型如何与任务环境交互；Hyper-RL 决定这些交互数据如何用于强化学习。
+Agentic repeatedly runs “generate action—call tools—receive observations—continue generation” within an episode, producing
+Hyper-RL `Trajectory` objects. Hyper-RL still handles data loading, batching, advantage estimation, Actor updates, weight publication, and checkpoints.
 
-## 整体关系
+Agentic determines how the model interacts with tasks; Hyper-RL determines how those interactions train the policy.
 
-![Agentic RL 与 Hyper-RL 的交互架构](images/agentic_rl_architecture.svg)
+## Overall Relationship
 
-三种 runner 共享 `PromptRecord → Trajectory → ExperienceBatch` 训练契约，由同一个 `SyncTrainer` 编排。
-一个 episode 可以包含多条逐调用 `Trajectory`；episode 是奖励单位，训练行保留各次真实生成上下文。
+![Interaction architecture of Agentic RL and Hyper-RL](images/agentic_rl_architecture.svg)
 
-## 职责边界
+All three runners share the `PromptRecord → Trajectory → ExperienceBatch` contract under one `SyncTrainer`.
+An episode may contain multiple per-call `Trajectory` objects. Rewards are episode-level; training rows preserve each actual generation context.
 
-| 层次 | 主要职责 | 不负责的内容 |
+## Responsibility Boundaries
+
+| Layer | Responsibilities | Outside its scope |
 | --- | --- | --- |
-| Agentic | episode 生命周期、多轮动作与观察、工具执行、终止判断、任务奖励、轨迹构造 | 优势估计、梯度更新、权重发布 |
-| Rollout | 提供共享 vLLM 推理端点，返回 token ID、raw logprob 和策略身份 | 任务语义和奖励规则 |
-| Hyper-RL Trainer | 构建 prompt、选择 runner、准备训练 batch、更新 Actor、发布策略并记录指标 | 具体工具如何实现 |
+| Agentic | Episode lifecycle, multi-turn actions/observations, tools, termination, task rewards, trajectory construction | Advantages, gradient updates, weight publication |
+| Rollout | Shared vLLM endpoint returning token IDs, raw logprobs, policy identity | Task semantics and rewards |
+| Hyper-RL Trainer | Build prompts, select runners, prepare batches, update Actor, publish policy, record metrics | Specific tool implementations |
 
-同步模式由 `SyncTrainer` 编排。它在 `rl/trainer/sync.py` 中创建 rollout engine，再根据 `agentic.runner` 选择对应的
-rollout manager。Agentic 不绕过 Trainer，也不直接更新模型参数。
+Synchronous execution is orchestrated by `SyncTrainer` in `rl/trainer/sync.py`. `rl/trainer/build.py` constructs the rollout engine
+and selects the rollout manager using `agentic.runner`. Agentic neither bypasses Trainer nor updates model parameters directly.
 
-## 三种执行路径
+## Three Execution Paths
 
-| `agentic.runner` | 实际入口 | episode 控制者 | 适用方式 |
+| `agentic.runner` | Entry point | Episode controller | Use case |
 | --- | --- | --- | --- |
-| `internal`（默认） | `RolloutManager` → `AgentRunner` | Hyper-RL 内部循环 | 自定义环境、协议和 Python 工具 |
-| `codex` | `CodexRolloutManager` → `ProgramAgentRunner` | Codex CLI program | Codex Responses 协议、shell 或 MCP 工具 |
-| `deepseek` | `DeepSeekRolloutManager` → `ProgramAgentRunner` | DeepSeek Harness program | DeepSeek Chat 协议和 Harness 工具 |
+| `internal` (default) | `RolloutManager` → `AgentRunner` | Hyper-RL internal loop | Custom environments, protocols, Python tools |
+| `codex` | `CodexRolloutManager` → `ProgramAgentRunner` | Codex CLI program | Codex Responses protocol, shell/MCP tools |
+| `deepseek` | `DeepSeekRolloutManager` → `ProgramAgentRunner` | DeepSeek Harness program | DeepSeek Chat protocol and Harness tools |
 
-配置校验只接受以上三个值。当前不能在 YAML 中填写任意第四种 runner。`ProgramAgentRunner` 虽然是公开的 Python
-接口，但把新的外部 harness 接入 `SyncTrainer` 仍需要增加对应的 runtime、factory、manager 和配置校验。
-DeepSeek 的实现目录是 `rl/agentic/ds_harness/`，YAML 中的 runner 值和子配置键仍分别是 `deepseek` 与
-`agentic.deepseek`。
+Configuration accepts only these three values, not an arbitrary fourth runner. Although `ProgramAgentRunner` is a public Python
+interface, integrating another external harness into `SyncTrainer` still requires runtime, factory, manager, and configuration-validation changes.
+DeepSeek implementation lives in `rl/agentic/ds_harness/`; YAML runner and subconfiguration remain `deepseek` and
+`agentic.deepseek`.
 
-### Internal：框架内多轮交互
+### Internal: Framework-Driven Multi-Turn Interaction
 
-`AgentRunner` 为每个 `PromptRecord` 创建 `AgentSession` 和已注册的 Environment。每一轮按以下顺序运行：
+`AgentRunner` creates an `AgentSession` and registered Environment for each `PromptRecord`. Each turn proceeds as follows:
 
-1. Environment 的 `reset()` 返回初始 `Observation`。
-2. `AgentRunner` 将活跃 session 左填充成 batch，并调用共享 `GenerationEngine`。
-3. 生成结果作为 `Action` 交给 Environment 的 `step()`。
-4. `ToolEnvironment` 使用 `InteractionProtocol` 解析最终答案或工具调用。
-5. 工具调用由 `ToolExecutor` 在 `ToolRegistry` 中查找并执行，结果编码成下一轮 observation。
-6. 最终答案由环境奖励函数评分；达到终止条件后，`AgentSession.build()` 生成 `Trajectory`。
+1. Environment `reset()` returns the initial `Observation`.
+2. `AgentRunner` left-pads active sessions into a batch and invokes the shared `GenerationEngine`.
+3. Generation becomes an `Action` passed to Environment `step()`.
+4. `ToolEnvironment` parses final answers or tool calls using `InteractionProtocol`.
+5. `ToolExecutor` resolves calls in `ToolRegistry` and executes them; results become the next observation.
+6. The environment reward function scores the final answer; at termination, `AgentSession.build()` produces a `Trajectory`.
 
-已完成的 session 仍保留一个 dummy batch row，以保证所有分布式 rank 执行相同数量的 generation collective；
-dummy 输出会被丢弃，不进入训练。
+Completed sessions retain dummy batch rows so all distributed ranks execute the same number of generation collectives.
+Dummy outputs are discarded and never enter training.
 
-### 单轮 code 环境
+### Single-Turn Code Environment
 
-`examples.code.agent` 注册 `code_stdio`，使用同一个 internal runner 完成一次 Python stdio 生成与远程判题。
-`data.row_adapter: examples.code.prepare_data:adapt_row` 保留多消息、稳定任务 ID 和私有结构化测试；
-测试不进入 prompt，代码提取不改写训练使用的采样 token/logprob。训练 TP 组仅 request owner 调用环境，
-其他 rank 重放相同 observation、reward 和终止状态，避免重复判题。
+`examples.code.agent` registers `code_stdio`, using the same internal runner for one Python stdio generation and remote grading.
+`data.row_adapter: examples.code.prepare_data:adapt_row` preserves multiple messages, stable task IDs, and private structured tests.
+Tests never enter prompts; code extraction does not rewrite sampled training tokens/logprobs. Only the request owner in each training TP group invokes the environment;
+other ranks replay identical observations, rewards, and termination states, preventing duplicate grading.
 
-全部测试按空白分词精确比较后给二值奖励；HTTP、协议或沙箱服务故障上抛，不能混成候选代码的零分。
-`finish_reason=length` 随 action 传递并记录截断。数据审核、固定镜像部署与运行命令见
-[单轮 code 示例](../examples/code/README.md)。
+After exact whitespace-tokenized comparison across all tests, assign binary reward. HTTP, protocol, and sandbox failures propagate rather than become zero scores for candidate code.
+`finish_reason=length` travels with the action and records truncation. See the
+[single-turn code example](../examples/code/README.md) for data review, pinned-image deployment, and launch commands.
 
-### Codex 与 DeepSeek：外部 harness 交互
+### Codex and DeepSeek: External Harness Interaction
 
-两条外部路径使用相同的数据面结构：
+Both external paths use the same data-plane structure:
 
-1. manager 启动本节点的 Gateway，并读取 vLLM 当前整数 `policy_version`。
-2. runtime 将该策略身份绑定到本次 episode。
-3. `ProgramAgentRunner` 只在 Trainer TP 组的 request-owner rank 启动外部 program，并按本地容量逐个派发。
-4. Gateway 把 Codex Responses 或 DeepSeek Chat 请求转换为 vLLM 的 `/v1/chat/completions` 请求。
-5. Gateway 记录模型返回的 token ID、raw sampled-token logprob、工具调用和策略身份。
-6. harness 的 trajectory builder 将记录转换为标准 `Trajectory`。
-7. request-owner 将 trajectory 序列化，并通过 `synchronize_agent_payload()` 同步给同 TP 组的 sibling ranks。
-8. manager 再次读取策略身份；episode 执行期间发生版本变化会直接报错。
+1. The manager starts this node's Gateway and reads vLLM's integer `policy_version`.
+2. Runtime binds that policy identity to the episode.
+3. `ProgramAgentRunner` starts external programs only on the Trainer TP group's request-owner rank, dispatching them individually according to local capacity.
+4. Gateway converts Codex Responses or DeepSeek Chat requests to vLLM `/v1/chat/completions`.
+5. Gateway records returned token IDs, raw sampled-token logprobs, tool calls, and policy identity.
+6. The harness trajectory builder converts records to standard `Trajectory` objects.
+7. The request owner serializes trajectories and synchronizes them to TP siblings with `synchronize_agent_payload()`.
+8. The manager rereads policy identity; any version change during the episode raises an error.
 
 `agentic.codex.max_concurrent_episodes_per_rank` / `agentic.deepseek.max_concurrent_episodes_per_rank`
-默认8，限制每个request-owner rank的活跃program；TP1/DP8时合计最多64个，不改变训练题数或每题候选数。
-程序按提交顺序回填结果，保持题组、调用身份与损失语义。一个program失败时立即记录原始异常，
-停止该rank继续派发待运行候选，等待已经派发的program清理后再同步跨rank错误；不是跨rank即时取消。
-调用方取消会取消并等待本地worker清理，不把部分成功轨迹交给训练。
+These default to 8, limiting active programs per request-owner rank. TP1/DP8 allows at most 64 in total without changing the number of training questions or candidates per question.
+Results are placed in submission order, preserving question groups, call identities, and loss semantics. A program failure immediately records the original exception,
+stops that rank from dispatching pending candidates, and waits for already dispatched programs to clean up before synchronizing errors across ranks; it is not immediate cross-rank cancellation.
+Caller cancellation cancels local workers and waits for cleanup; partially successful trajectories are not passed to training.
 
-Codex管理面注册支持同一session ID、完全相同payload的幂等重试；身份或配置冲突、已封闭/释放的会话仍拒绝。
-删除不存在的session成功返回并保留释放标记，避免晚到注册重新创建会话。
-只有注册和删除在明确连接错误时最多尝试3次，注册每次最多30秒；HTTP拒绝不重试，模型生成不使用此重试机制。
-`program.failed`将原始错误写入session性能记录，即使清理失败也不会丢失首个原因。
+Codex management registration permits idempotent retries for the same session ID and identical payload; identity/configuration conflicts and closed/released sessions are still rejected.
+Deleting a nonexistent session succeeds and retains a release marker to prevent a late registration from recreating it.
+Only registration and deletion retry explicit connection errors, with at most 3 attempts and 30 seconds per registration attempt. HTTP rejections are not retried; model generation does not use this retry mechanism.
+`program.failed` writes the original error into session performance records, preserving the first cause even if cleanup fails.
 
-Codex Gateway 按 `agentic.max_turns` 预留模型调用额度，成功、失败和取消路径均释放预留；
-`agentic.codex.max_inflight_requests` 限制共享后端的同时请求数，默认 1。
-最后一次调用仍保留原工具选择，额度用尽不会改写模型动作来强制答案。
-普通文本任务与自定义Search-R1程序共用`CodexAgentProgram.resolve_execution_outcome`核验终态。
-CLI正常退出并发出`turn.completed`、却没有最终消息时，只有最后一次调用确为reasoning-only、
-`finish_reason=length`且真实token数等于该请求的`max_tokens`，才记为`output_budget_exhausted`。
-还须核验策略版本、连续调用序号、可训练采样证据及无Gateway故障；缺失证据仍报错。
-该终态保留所有真实调用、token、mask和log-prob，以零奖励及`max_output_tokens`截断标记进入轨迹，
-不伪造最终答案、不追加修正调用、不提高预算。已有最终文本的length输出仍按任务规则评分。
-正常完成的 reasoning-only 调用若以采样到的模型结束 token 终止（`finish_reason=stop`），
-且没有正式答案或工具调用，则记为模型失败 `reasoning_only_eos` 并给零奖励，保留全部真实调用。
-该终态不标为预算截断，不提取 reasoning 中的答案、不追加调用；没有结束 token、缺失采样证据或进程异常仍拒绝训练。
-进程超时和异常退出不能被已有模型失败或预算记录覆盖；退出码为零本身也不代表任务成功。
-普通文本任务在调用额度内未完成最终答案，且 CLI 与 Gateway 均确认完整调用后的预算终止时，
-该候选记零奖励并标记 `truncated/max_completions`，保留所有已采样调用参与 episode 分组与训练。
-额度耗尽不增加调用次数，也不改写最后一次工具动作；此行为与 R3 开关无关。
-已至少完成一次采样调用后，若vLLM返回匹配已验证格式的HTTP 400上下文长度拒绝，
-保留所有已采样调用，以 `context_budget_exhausted` / `max_context_tokens` 标记零奖励预算终止。
-被拒绝的请求没有生成动作，不创建训练行或重新生成；初始请求超限、未知400或不完整采样证据仍拒绝训练。
-此路径不截断真实prompt，不扩展上下文或生成上限。
-通信故障、未知 CLI 错误或不完整轨迹仍拒绝训练，不能仅凭调用数达到上限降为零奖励。
-终态读取 session 先封闭新请求，再等待在途请求排空；释放 session 同样排空。
-整组 program 收尾后再同步跨 rank 错误。
-标准 `tools` 与 input 中 `additional_tools` 共用工具名称映射，未知声明明确报错。
+Codex Gateway reserves model-call slots according to `agentic.max_turns`, releasing reservations on success, failure, and cancellation.
+`agentic.codex.max_inflight_requests` limits concurrent shared-backend requests and defaults to 1.
+The final call retains its original tool choice; budget exhaustion does not rewrite actions to force an answer.
+Ordinary text tasks and custom Search-R1 programs share `CodexAgentProgram.resolve_execution_outcome` for terminal-state validation.
+When the CLI exits normally and emits `turn.completed` without a final message, the result is `output_budget_exhausted` only if the last call is genuinely reasoning-only,
+with `finish_reason=length` and an actual token count equal to that request's `max_tokens`.
+Policy version, consecutive call indexes, trainable sampling evidence, and the absence of Gateway failures must also be verified; missing evidence still raises an error.
+This terminal state retains all actual calls, tokens, masks, and logprobs, producing a zero-reward trajectory marked as truncated by `max_output_tokens`,
+without fabricating a final answer, adding a correction call, or increasing the budget. Length-limited output containing final text is still scored by task rules.
+A normally completed reasoning-only call that terminates with a sampled model end token (`finish_reason=stop`),
+without a formal answer or tool call, is recorded as the model failure `reasoning_only_eos`, receiving zero reward while preserving every actual call.
+This state is not marked as budget truncation; no answer is extracted from reasoning and no call is added. Missing end tokens, missing sampling evidence, or abnormal process exits still reject training.
+Process timeouts and abnormal exits cannot be overridden by earlier model-failure or budget records; a zero exit code alone does not establish task success.
+For ordinary text tasks lacking a final answer within budget, when both CLI and Gateway confirm budget termination after complete calls,
+assign zero reward and mark `truncated/max_completions`, retaining all sampled calls for episode grouping and training.
+Exhaustion neither adds calls nor rewrites the last tool action; behavior is independent of R3.
+After at least one completed sampling call, if vLLM returns an HTTP 400 context-length rejection matching a validated format,
+all sampled calls are retained as a zero-reward budget termination marked `context_budget_exhausted` / `max_context_tokens`.
+The rejected request generates no actions, so it creates no training row or replacement generation. An oversized initial request, unknown 400, or incomplete sampling evidence still rejects training.
+This path does not truncate actual prompts or increase context/generation limits.
+Communication failures, unknown CLI errors, and incomplete trajectories remain untrainable; reaching the call limit alone cannot justify zero reward.
+Terminal session reads first close admission, then drain in-flight requests; releasing a session also drains them.
+Synchronize cross-rank errors only after the entire program group finishes cleanup.
+Standard `tools` and input `additional_tools` share name mapping; unknown declarations raise explicit errors.
 
-任务可以用 `agentic.codex.model_instructions` 替换CLI自带模型指令，
-用 `compact_harness_context: true` 在生成前移除带已知标记的技能、权限和环境说明消息；
-这会改变模型输入，只适合已确认这些说明不属于任务语义的配方，不能用于训练后的单独删减。
-文件操作任务可同时设置`preserve_environment_context: true`，保留环境与权限消息，
-仅过滤技能说明；默认false保持既有精简行为，未开启compact时不做过滤。
-`agentic.codex.allowed_tools` 默认null，保持全部声明；显式列表只向模型公开指定工具，
-空列表不公开工具。普通函数写工具名，namespace成员写`namespace.function`。
-白名单名称在请求中不存在、重复/非法配置或强制tool_choice选择被排除的工具均报错，
-不静默回退。显式`tool_choice: none`的终答/修正请求允许省略白名单中的工具声明，
-仍保留历史工具调用与观察，不放开普通请求的名称校验。保留工具的参数、历史及响应名称映射不变；原始CLI请求和实际vLLM请求分别记录，
-训练使用后者对应的真实tokens。该开关限定模型可见工具，不改变CLI执行环境的权限。
+Tasks may replace the CLI's built-in model instructions with `agentic.codex.model_instructions`
+and use `compact_harness_context: true` to remove skill, permission, and environment messages with known markers before generation.
+This changes model input and is suitable only for recipes that establish these messages are outside task semantics; it cannot be applied solely as post-training deletion.
+File-operation tasks may also set `preserve_environment_context: true` to retain environment and permission messages,
+filtering only skill instructions. The default false preserves existing compaction behavior; no filtering occurs unless compaction is enabled.
+`agentic.codex.allowed_tools` defaults to null, retaining all declarations. An explicit list exposes only specified tools to the model;
+an empty list exposes none. Use the tool name for ordinary functions and `namespace.function` for namespace members.
+Allowlisted names absent from the request, duplicate/invalid configuration, or a forced tool_choice selecting an excluded tool raise errors,
+without silent fallback. Final-answer/correction requests with explicit `tool_choice: none` may omit allowlisted tool declarations,
+while retaining historical tool calls and observations; ordinary-request name validation remains strict. Retained tools preserve their parameters, history, and response-name mappings. Original CLI requests and actual vLLM requests are recorded separately,
+and training uses the actual tokens corresponding to the latter. This setting limits model-visible tools without changing CLI execution permissions.
 
-Codex 性能记录与原始协议内容分开保存。Gateway 的 `completion.queued` / `completion.admitted`
-事件用于观察在途排队；成功的 `completion.recorded.payload.timing` 包含墙钟起止点、
-单调时钟测得的 `queue_seconds` 和 `backend_seconds`。后者包含HTTP传输及后端完整请求，
-不能直接作为纯模型计算、prefill或decode耗时。
-每个session的 `performance.jsonl` 记录CLI启动、版本检查、轨迹构建及stdout接收时间，
-`cli_stdout.received.line_index` 与原始 `codex-events.jsonl` 的零基行号对应。
-工具开始/结束事件可用于估计工具区间，但这是父进程接收时间，不是工具内部精确计时；
-各session并发区间不可相加当作整个rollout墙钟时间。原始CLI事件、token和概率证据保持原样。
+Codex performance records are stored separately from raw protocol content. Gateway `completion.queued` / `completion.admitted`
+events expose in-flight queueing; successful `completion.recorded.payload.timing` records contain wall-clock start/end timestamps
+and monotonic-clock `queue_seconds` and `backend_seconds`. The latter includes HTTP transport and the complete backend request,
+so it cannot directly represent pure model compute, prefill, or decode time.
+Each session's `performance.jsonl` records CLI startup, version checks, trajectory construction, and stdout receipt times.
+`cli_stdout.received.line_index` corresponds to the zero-based line number in raw `codex-events.jsonl`.
+Tool start/end events can estimate tool intervals, but these are parent-process receipt times, not precise tool-internal timings.
+Overlapping session intervals cannot be summed as total rollout wall time. Raw CLI events, tokens, and probability evidence remain unchanged.
 
-`agentic.codex.overlap_preparation`通用默认关闭，Qwen3-4B GSM8K Codex配方显式开启。开启后，Trainer只提前一批CPU会话：
-第一批可与vLLM冷启动重叠，后续批次在上一轮Actor更新前启动。Codex CLI、shell快照和独立工作目录保持原样。
-`preparation_cpu_fraction`默认0.5，范围为(0,1]。它按训练进程可用的逻辑CPU集合，均匀选择一个子集，
-仅绑定Linux准备线程及其继承的CLI/工具子进程；不修改训练主线程亲和性，也不设置Codex线程数或关闭其功能。
-`preparation_max_cpus`默认null，可设正整数作为额外的逻辑CPU数量上限；两项取更严格的限制。
-最终数量为`min(max(1, floor(可用逻辑CPU数 × preparation_cpu_fraction)), preparation_max_cpus)`，
-其中null表示不施加额外数量上限。例如192个可用逻辑CPU、比例0.5时使用96个；再设上限64则使用64个。
-同一宿主上可用CPU集合相同的rank选择同一子集，共享该预算，不是每个rank独占这么多CPU；
-若各rank原本绑定不同集合，则限制分别生效，不代表宿主全局总量上限。
-这是CPU亲和性范围，不是主机CPU利用率百分比、CPU时间配额或资源预留；不限制Gateway等其他线程。
-预算持续作用于整个episode，CPU密集工具的执行速度也会受影响；比例设为1且数量上限为null可恢复全部可用CPU。
-关闭重叠时不使用这两项准备预算。
-后台事件循环不启动模型、不调用分布式collective；Gateway按session的目标policy version挂起模型请求，
-主线程完成权重发布、推理唤醒和版本核查后才放行。`completion.policy_ready`及
-`timing.policy_ready_at`给出放行等待结束的时间；`queue_seconds`包含该策略等待，
-不能把它解释为后端缺少并发槽位。实际后端接收仍以`completion.admitted`为参考。
+`agentic.codex.overlap_preparation` is off by default and explicitly enabled in the Qwen3-4B GSM8K Codex recipe. When enabled, Trainer prepares only one batch of CPU sessions ahead:
+the first may overlap vLLM cold start, and later batches start before the preceding Actor update. Codex CLI behavior, shell snapshots, and independent workspaces remain unchanged.
+`preparation_cpu_fraction` defaults to 0.5 and ranges over (0,1]. It evenly selects a subset of the logical CPUs available to the training process,
+binding only Linux preparation threads and the CLI/tool subprocesses inheriting that affinity. It does not alter the main training thread's affinity, set Codex thread counts, or disable Codex features.
+`preparation_max_cpus` defaults to null; a positive integer adds a logical-CPU count cap. The stricter limit applies.
+The final count is `min(max(1, floor(available logical CPUs × preparation_cpu_fraction)), preparation_max_cpus)`,
+where null means no additional count cap. For example, 192 available logical CPUs at fraction 0.5 use 96; an additional cap of 64 reduces this to 64.
+Ranks on the same host with identical available CPU sets choose the same subset and share that budget; each rank does not exclusively own that many CPUs.
+If ranks were already bound to different sets, limits apply separately and do not establish a host-wide total cap.
+This is a CPU-affinity range, not a host-utilization percentage, CPU-time quota, or resource reservation; other threads such as the Gateway are unrestricted.
+The budget applies for the entire episode, so CPU-intensive tools can also slow down. Set the fraction to 1 and count cap to null to restore all available CPUs.
+These preparation budgets are unused when overlap is disabled.
+The background event loop neither starts models nor calls distributed collectives. The Gateway holds model requests for each session's target policy version
+until the main thread completes weight publication, inference wakeup, and version checks. `completion.policy_ready` and
+`timing.policy_ready_at` mark the end of this release wait; `queue_seconds` includes policy waiting,
+so it cannot be interpreted as a lack of backend concurrency slots. Actual backend admission is represented by `completion.admitted`.
 
-准备批次只可按原顺序、原问题内容和目标版本消费；取消时先停止后台程序及其子进程，再关闭Gateway。
-epoch结束、验证和checkpoint边界不提前读取下一批，避免改变数据恢复或评估顺序。
-当前只支持原生本地CLI路径，配置`program_callable`或`execution_callable`时拒绝开启；
-自定义工作目录准备函数仍须遵守CPU准备合同。会话总超时和HTTP超时包含等待策略发布的时间，
-必须覆盖重叠的训练或首次服务启动窗口，超时属于基础设施错误，不能转成零奖励。
-本功能不代表异步RL：所有训练回答仍来自对应的同一已发布版本。
+Prepared batches can be consumed only in their original order, with original question content and target versions. Cancellation stops background programs and their children before closing the Gateway.
+Epoch ends, evaluation, and checkpoint boundaries do not read the next batch ahead, preserving data recovery and evaluation order.
+Only the native local CLI path is supported; enabling overlap with `program_callable` or `execution_callable` is rejected.
+Custom workspace-preparation functions must still satisfy the CPU preparation contract. Overall session and HTTP timeouts include policy-publication waiting
+and must cover the overlapped training or initial service-startup window. Timeouts are infrastructure errors and cannot become zero rewards.
+This feature is not asynchronous RL: all training responses still come from the corresponding single published version.
 
-Codex 可按配置启动 MCP stdio server。`rl/agentic/mcp_server.py` 只是把现有 `ToolRegistry` 暴露为 MCP
-`tools/list` 和 `tools/call`，不会复制或改写工具实现。
+Codex may start a configured MCP stdio server. `rl/agentic/mcp_server.py` exposes the existing `ToolRegistry` through MCP
+`tools/list` and `tools/call`, without copying or rewriting tool implementations.
 
-### 共用容器执行
+### Shared Container Execution
 
-Search-R1与SWE-Smith复用`DockerWorkspace`和`codex/container_execution.py`中的候选中继、CLI执行及输出记录。
-容器只提供当前会话的模型请求通道，Codex内部的多轮shell/PTY行为保持原样；任务准备、终态评分和grader仍由示例持有。
-Search-R1保留宿主broker，通过Unix socket访问训练容器内的任务反馈服务；SWE-Smith保留controller的Docker连接方式。
-公共中继只转发固定模型路由，不根据任务名选择奖励；任务终止头由调用方显式传入。
-非root、只读根目录及文章绑定由工作区执行参数声明，不改变SWE-Smith原有仓库写入要求。
-HTTP管理请求被提取到标准库模块`core/gateway_transport.py`，旧`program_runner`导入路径继续导出同一函数和异常。
-Codex公共导出按需加载，以便宿主执行器导入容器能力时不加载Torch或推理依赖。
+Search-R1 and SWE-Smith reuse `DockerWorkspace` and the candidate relay, CLI execution, and output recording in `codex/container_execution.py`.
+Containers provide only the current session's model-request channel; Codex's multi-turn shell/PTY behavior remains unchanged. Examples still own task preparation, terminal scoring, and graders.
+Search-R1 retains its host broker, accessing task feedback inside the training container through a Unix socket; SWE-Smith retains the controller's Docker connection.
+The shared relay forwards only fixed model routes and does not choose rewards by task name; callers explicitly supply task termination headers.
+Workspace execution arguments declare non-root execution, read-only roots, and article mounts without changing SWE-Smith's repository write requirements.
+HTTP management requests reside in the standard-library module `core/gateway_transport.py`; the old `program_runner` import path continues exporting the same functions and exceptions.
+Public Codex exports load on demand so host executors can import container functionality without loading Torch or inference dependencies.
 
-### 仓库型 Codex Code Agent
+### Repository Codex Code Agent
 
-`agentic.codex.program_callable=examples.swe_smith.agent:SWESmithProgram` 选择仓库任务，
-复用 Search-R1 的程序扩展方式。`admin_auth=true` 显式启用管理鉴权，任务编排和评分由示例持有。
-候选与 grader 各使用固定镜像的离线 Docker 工作区，不挂载 NPU 或 Docker socket。
-控制侧管理接口鉴权，候选仅持有会话 token，通过 relay 调用共享模型；原始请求与转发后的
-容器上下文分别保留，固定 CLI 的工具 schema 和压缩请求均校验。
+`agentic.codex.program_callable=examples.swe_smith.agent:SWESmithProgram` selects repository tasks,
+reusing Search-R1's program extension mechanism. `admin_auth=true` explicitly enables management authentication; examples own orchestration and grading.
+Candidates and graders each use offline Docker workspaces from pinned images, without NPU or Docker-socket mounts.
+Controller management interfaces authenticate; candidates hold only session tokens and access the shared model through a relay. Original requests and forwarded
+container contexts are retained separately; pinned-CLI tool schemas and compaction requests are validated.
 
-CLI 正常退出并确认 `turn.completed` 后，停止候选、冻结提交，再由独立 grader 给出奖励。
-仓库任务允许没有文字总结；已完成的调用预算耗尽也可在核验终止证据后冻结判题。
-仓库任务按冻结产物评分；普通文本任务预算内没有最终答案则记零奖励。
-基础设施或不完整轨迹不能降为零奖励。
+After normal CLI exit and confirmed `turn.completed`, stop the candidate, freeze the submission, then obtain reward from an independent grader.
+Repository tasks need no textual summary. Completed-call budget exhaustion may also freeze and grade after termination evidence is verified.
+Repository tasks are scored from frozen artifacts; ordinary text tasks without final answers within budget receive zero reward.
+Infrastructure failures and incomplete trajectories must not become zero rewards.
 
-SWE-Smith 子集/全量准备、Qwen3.5/3.8 配方及运行命令见
-[仓库示例](../examples/swe_smith/README.md)；CPU 合同与待完成的镜像/NPU 验收见
-[验证范围](../examples/swe_smith/README.md#图执行与验证范围)。
+See the [repository example](../examples/swe_smith/README.md) for SWE-Smith subset/full-data preparation, Qwen3.5/3.8 recipes,
+and commands. CPU contracts and pending image/NPU acceptance are described in
+[validation scope](../examples/swe_smith/README.md#graph-execution-and-validation-scope).
 
-## Hyper-RL 如何消费 Agentic 结果
+## How Hyper-RL Consumes Agentic Results
 
-一次训练 step 的真实顺序位于 `SyncTrainer._train_step()`：
+The actual training-step order is in `SyncTrainer._train_step()`:
 
-1. `build_prompt_records()` 把 dataloader batch 转成 `PromptRecord`。
-2. 选定的 rollout manager 调用 `generate()`，返回 `ExperienceBatch`。
-3. rollout engine 从 rollout residency 切回 training residency。
-4. 逐调用 batch 先按 DP 最大行数补齐，再执行角色前向；`ExperiencePreparer` 根据算法需求准备训练目标。
-5. Actor 使用准备好的 experience 执行更新。
-6. `_publish_policy()` 把 `PolicySnapshot(version=next_step)` 发布到 vLLM。
-7. vLLM 恢复 rollout residency，下一 step 使用新策略生成。
+1. `build_prompt_records()` converts a dataloader batch to `PromptRecord` objects.
+2. The selected rollout manager calls `generate()`, returning `ExperienceBatch`.
+3. The rollout engine switches from rollout to training residency.
+4. Per-call batches are padded to the maximum DP row count before role forwards; `ExperiencePreparer` builds objectives from algorithm requirements.
+5. Actor updates from the prepared experience.
+6. `_publish_policy()` publishes `PolicySnapshot(version=next_step)` to vLLM.
+7. vLLM restores rollout residency; the next step generates with the new policy.
 
-Agentic 输出与训练侧之间最重要的边界是 token-first 契约：
+The key boundary between Agentic output and training is the token-first contract:
 
-| 字段 | 作用 | 约束 |
+| Field | Purpose | Constraint |
 | --- | --- | --- |
-| `token_ids` | 完整 prompt、动作和观察序列 | rollout 返回的 ID 是训练依据，不能 decode 后再 encode |
-| `attention_mask` | 标记有效 token | 必须与 `token_ids` 等长 |
-| `action_mask` | 标记参与策略损失的模型动作 | 不能选中 padding；环境和工具 observation 不参与策略损失 |
-| `rollout_log_probs` | rollout 策略的 next-token logprob | 使用 FP32 raw logprob，并与 next-token 位置对齐 |
-| `reward` | episode 最终奖励 | 每条 trajectory 一个标量 |
-| `worker_policy_version` | 记录生成使用的策略版本 | batch 内必须一致，并匹配请求的策略版本 |
+| `token_ids` | Complete prompt, action, and observation sequence | Rollout IDs are authoritative; no decode/re-encode |
+| `attention_mask` | Valid tokens | Same length as `token_ids` |
+| `action_mask` | Model actions contributing to policy loss | Must exclude padding and environment/tool observations |
+| `rollout_log_probs` | Rollout policy next-token logprobs | FP32 raw logprobs aligned to next-token positions |
+| `reward` | Final episode reward | One scalar per trajectory |
+| `worker_policy_version` | Policy version used for generation | Consistent across the batch and matching the requested version |
 
-`build_experience_batch()` 会验证这些 trajectory 的对齐关系，并将其填充成 `ExperienceBatch`；随后算法和 Actor
-只处理标准 batch，不需要知道 episode 来自 internal、Codex 还是 DeepSeek。
+`build_experience_batch()` validates trajectory alignment and pads into `ExperienceBatch`. Algorithms and Actor then
+consume standard batches without knowing whether episodes came from internal, Codex, or DeepSeek runners.
 
-## 逐调用轨迹与 episode GRPO
+## Per-Call Trajectories and Episode GRPO
 
-外部 Codex 与 DeepSeek program 每次模型调用返回一条训练行，tokens 严格等于本次真实 prompt 加 sampled action；
-历史被 harness 改写或裁剪也不会伪造连续上下文。`episode_id`、`call_index` 和 `call_count`
-描述完整 episode，缺失、重复调用以及 prompt/group/策略版本/奖励不一致都会报错。
-旧连续轨迹构造器（含 DeepSeek）只有在后续 prompt 精确延续全部已采样 token 时才允许拼接。
-分段路径的 `max_episode_tokens` 校验每次调用的真实 prompt 加 action 长度；调用总数由 `max_turns`
-限制，不把重复上下文累加成单条虚构轨迹的长度。
+External Codex and DeepSeek programs return one training row per model call, with tokens exactly equal to that call's actual prompt plus sampled action.
+Harness rewriting/truncation never fabricates continuous context. `episode_id`, `call_index`, and `call_count`
+describe the complete episode. Missing/duplicate calls or inconsistent prompts, groups, policy versions, or rewards raise errors.
+Legacy continuous builders, including DeepSeek, concatenate only when later prompts exactly extend all sampled tokens.
+For segmented paths, `max_episode_tokens` validates each actual prompt-plus-action length, while `max_turns`
+limits call count. Repeated context is not accumulated into a fictitious single-trajectory length.
 
-例如同一道题的两个候选分别调用 2 次和 5 次，最终奖励为 1 和 0：GRPO 对两个 episode 计算优势，
-再映射到七条调用行；准确率为 1/2，不能按调用行算成 2/7。
-每条调用的动作仍参与既有有效 token 均值损失；episode 计奖并不等于每个 episode 的梯度权重相同。
-评估和样例按 episode 汇总，响应长度为其所有调用的动作 token 总数。
+For example, two candidates for one question make two and five calls and earn rewards 1 and 0. GRPO computes advantages for the two episodes,
+then maps them onto seven call rows. Accuracy is 1/2, not 2/7.
+Every call's actions still participate in the existing valid-token-mean loss. Episode-level rewards do not imply equal gradient weight per episode.
+Evaluation and examples aggregate by episode; response length sums action tokens across all calls.
 
-DP rank 的调用行数不同会追加 `dp_padding` 行，保留合法上下文供前向执行，但 action mask、奖励和优势为零。
-它们不参与奖励、episode 数、响应长度或损失的有效 token 分母。
-分段轨迹当前只支持 GRPO；Codex/DeepSeek+PPO 在启动前拒绝，现有非分段 PPO 仍按原合同运行。
+Unequal DP call-row counts receive `dp_padding` rows with valid forward context but zero action masks, rewards, and advantages.
+Padding is excluded from rewards, episode counts, response lengths, and valid-token loss denominators.
+Segmented trajectories currently support only GRPO. Codex/DeepSeek+PPO is rejected before launch; existing nonsegmented PPO retains its contract.
 
-### 多轮 MoE 路由重放
+### Multi-Turn MoE Router Replay
 
-`train.router_replay.mode: R3` 同时开启 vLLM capture 与 Actor replay，当前适配 internal 和 Codex。
-Codex 每条调用行携带本次真实 prompt + action 的独立 `router_trace`；重写或裁剪过的上下文
-不拼成连续路由，也不以最后一轮覆盖历史调用。Gateway 从 Agent 响应中提取路由，
-训练行单独保存紧凑 CPU trace，TP 同步传输 bytes，审计 metadata 只保留原有 token/logprob 等证据。
-episode 奖励、GRPO 优势和调用身份的合同保持不变。
+`train.router_replay.mode: R3` enables vLLM capture and Actor replay together, currently for internal and Codex runners.
+Every Codex call row carries an independent `router_trace` for its actual prompt + action. Rewritten/truncated contexts
+are not joined into continuous routing, and the last turn does not overwrite historical calls. Gateway extracts routing from agent responses;
+training rows store separate compact CPU traces, TP synchronization transfers bytes, and audit metadata retains existing token/logprob evidence only.
+Episode rewards, GRPO advantages, and call identity contracts are unchanged.
 
-internal 连续多轮仅在新 trace 保留旧有效前缀的有序 expert ID 时替换快照；缺失或冲突会报错。
-后续 action 之前的工具 observation 属于必要因果前缀，最终 observation 和最后未执行的 sampled token
-保持无效路由。DeepSeek 尚未适配 R3。配置、模型适配和验证范围见 [MoE R3 指南](moe_code_agent.md#moe-r3)。
+Internal continuous multi-turn replaces snapshots only when new traces preserve ordered expert IDs on the old valid prefix; missing/conflicting evidence raises errors.
+Tool observations preceding later actions are necessary causal prefixes. Terminal observations and the final unexecuted sampled token
+retain invalid routing. DeepSeek is not yet adapted to R3. See [MoE R3](moe_code_agent.md#moe-r3) for configuration, adapters, and scope.
 
-## 工具失败归因与收尾
+<!-- markdownlint-disable-next-line MD033 -->
+<a id="工具失败归因与收尾"></a>
 
-固定版本 vLLM 的 Hermes（Qwen3）或 Qwen3Coder XML（Qwen3.5 家族）只读采集原始 token、engine text、parser 输入和结果，不修改采样动作。
-归因规则为：
+## Tool Failure Attribution and Cleanup
 
-- 原始证据一致且模型 JSON 或工具调用封装结构不合法：模型失败，保留该次动作及概率；在剩余调用额度内可重新生成。
-- 原始工具 JSON 合法但解析结果不一致：基础设施失败，不进入训练。
-- 工具调用缺少原始证据或证据互相矛盾：未知失败，不进入训练。
+Pinned vLLM Hermes (Qwen3) or Qwen3Coder XML (Qwen3.5 family) captures original tokens, engine text, parser input/results read-only, without altering sampled actions.
+Attribution rules:
 
-无法训练的失败拒绝整组更新，不能悄悄丢弃候选；同一 session 的后续模型失败不能覆盖已有基础设施失败。
-Codex 格式重采样也计入调用额度和完整 episode；已确认的模型格式错误耗尽额度时形成零奖励终止结果。
-DeepSeek 保留自己的终止方式：已记录证据的模型格式错误或明确调用额度耗尽可形成零奖励终止，
-未知 SDK `error/aborted`、服务错误和解析证据不一致均拒绝训练。
-外部程序结束、超时或取消后清理本程序组的工具子进程；vLLM 先优雅退出，超时才强制终止。
-最终 checkpoint 在评估结束后先释放 vLLM 及其 IPC 消费者，减少保存阶段的资源竞争。
+- Consistent original evidence with invalid model JSON/tool-call structure: model failure; retain actions/probabilities and permit regeneration within remaining budget.
+- Valid original tool JSON but inconsistent parsing: infrastructure failure, excluded from training.
+- Missing or contradictory original tool evidence: unknown failure, excluded from training.
 
-## 接入自定义 Environment
+Untrainable failures reject the whole group update; do not silently discard candidates. Later model failures cannot overwrite earlier infrastructure failures in the same session.
+Codex format resampling consumes call budget and remains in the full episode. Confirmed model-format errors exhausting the budget yield zero-reward termination.
+DeepSeek retains its own termination behavior: evidenced model-format errors or explicit call-budget exhaustion may produce zero-reward termination;
+unknown SDK `error/aborted`, service errors, and inconsistent parsing evidence reject training.
+Clean up tool subprocesses in the program group after completion, timeout, or cancellation. Shut vLLM down gracefully, forcing termination only after timeout.
+For final checkpoints, release vLLM and its IPC consumers after evaluation before saving to reduce resource contention.
 
-现有的自定义入口是 `agentic.module_path` 和 `ENVIRONMENTS`：
+## Integrate a Custom Environment
 
-1. 在扩展模块中实现接收 `EpisodeContext` 的 environment builder。
-2. 返回实现 `reset()`、`step()`、`close()` 的 Environment；需要工具时可组合 `ToolEnvironment`、
-   `InteractionProtocol`、`ToolExecutor` 和 `ToolRegistry`。
-3. 使用 `ENVIRONMENTS.register("name")(builder)` 注册。
-4. 在 YAML 中配置同一模块路径和环境名称。
+Existing extension entry points are `agentic.module_path` and `ENVIRONMENTS`:
+
+1. Implement an environment builder accepting `EpisodeContext` in an extension module.
+2. Return an Environment implementing `reset()`, `step()`, and `close()`; combine `ToolEnvironment`,
+   `InteractionProtocol`, `ToolExecutor`, and `ToolRegistry` when tools are needed.
+3. Register with `ENVIRONMENTS.register("name")(builder)`.
+4. Configure the same module path and environment name in YAML.
 
 ```yaml
 agentic:
@@ -279,75 +284,75 @@ agentic:
   max_episode_tokens: 1024
 ```
 
-仓库中的 [GSM8K 环境](../examples/gsm8k/agent.py)提供单轮问答和组合 calculator 的多轮任务，
-两条路径都通过同一个 `ENVIRONMENTS` registry 接入 Trainer。上面的 YAML 是 `agentic` 片段；
-基础训练配置见 [GRPO 基础配方](../examples/gsm8k/configs/qwen3_4b_gsm8k_base.yaml)和
-[多轮配置](../examples/gsm8k/README.md#其他功能)，训练入口为 [train_rl.py](../train_rl.py)。
+The [GSM8K environment](../examples/gsm8k/agent.py) provides single-turn QA and multi-turn calculator tasks.
+Both enter Trainer through the same `ENVIRONMENTS` registry. The YAML above is an `agentic` fragment;
+For complete training configuration, see the [base GRPO recipe](../examples/gsm8k/configs/qwen3_4b_gsm8k_base.yaml) and
+[multi-turn configuration](../examples/gsm8k/README.md#rewards-and-agent-interaction); the training entry point is [train_rl.py](../train_rl.py).
 
-### GSM8K 数值奖励
+### GSM8K Numeric Rewards
 
-规则评分读取最后一个 `####` 后的完整数值行，或者工具 final-answer 的完整直接数值。
-允许货币符号、千位分隔符、符号和小数，按十进制精确值比较；例如 `$18`、`18.00` 与 `18` 等价。
-畸形数字、分式和无效最终答案不能用数值前缀或更早答案获得奖励；保留最后 300 字符的答案窗口。
-实现见 [GSM8K agent](../examples/gsm8k/agent.py)，回归见
-[实际奖励测试](../../../tests/ut/rl/agentic/test_gsm8k_reward.py)。
+Rule scoring reads the complete numeric line after the last `####`, or the complete direct numeric tool final-answer.
+Currency symbols, thousands separators, signs, and decimals are allowed, comparing exact decimal values: `$18`, `18.00`, and `18` are equivalent.
+Malformed numbers, fractions, and invalid final answers cannot earn rewards from numeric prefixes or earlier answers. Retain the last 300 characters as the answer window.
+See [GSM8K agent](../examples/gsm8k/agent.py) and
+[actual reward tests](../../../tests/ut/rl/agentic/test_gsm8k_reward.py).
 
-## 外部 runner 的必要配置
+## Required External-Runner Configuration
 
-Codex 和 DeepSeek 除各自子配置外，还必须满足以下共享约束：
+In addition to runner-specific subconfiguration, Codex and DeepSeek must satisfy:
 
-- `rollout.engine` 必须是 `vllm`。
-- `rollout.vllm.logprobs_mode` 必须是 `raw_logprobs`。
-- `rollout.vllm.enable_auto_tool_choice` 必须为 `true`。
-- `rollout.vllm.tool_call_parser` 按模型家族选择：Qwen3 为 `hermes`，Qwen3.5 家族为 `qwen3_coder`。
-  原始解析证据须来自固定运行时中对应的 parser。
-- Gateway 端口不能与 vLLM 端口相同。
-- Codex CLI 当前固定验证版本为 `0.152.1`。
-- DeepSeek Harness SDK 当前固定验证版本为 `0.1.1rc1`。
+- `rollout.engine` must be `vllm`.
+- `rollout.vllm.logprobs_mode` must be `raw_logprobs`.
+- `rollout.vllm.enable_auto_tool_choice` must be `true`.
+- Select `rollout.vllm.tool_call_parser` by model family: `hermes` for Qwen3, `qwen3_coder` for Qwen3.5.
+  Original parser evidence must come from the corresponding parser in the pinned runtime.
+- Gateway and vLLM must use different ports.
+- The pinned validated Codex CLI is `0.152.1`.
+- The pinned validated DeepSeek Harness SDK is `0.1.1rc1`.
 
-完整配置以以下文件为准：
+The following files define complete configurations:
 
-- [Codex 多轮配置](../examples/gsm8k/configs/qwen3_4b_gsm8k_codex_50step.yaml)
-- [Qwen3-30B-A3B Codex 四卡配置与 R3 示例](../examples/gsm8k/README.md)
-- [DeepSeek 多轮配置](../examples/gsm8k/configs/deepseek_multi_turn.yaml)
+- [Codex multi-turn configuration](../examples/gsm8k/configs/qwen3_4b_gsm8k_codex_50step.yaml)
+- [Four-Device Qwen3-30B-A3B Codex and R3](../examples/gsm8k/README.md)
+- [DeepSeek Multi-Turn](../examples/gsm8k/configs/deepseek_multi_turn.yaml)
 
-## 代码导航
+## Code Navigation
 
-| 关注点 | 文件 |
+| Concern | Files |
 | --- | --- |
-| 配置与 runner 约束 | `rl/config/validate.py` |
-| 同步训练编排入口 | `rl/trainer/sync.py` |
-| 三种 rollout manager | `rl/rollout/manager.py` |
-| Internal episode 循环 | `rl/agentic/core/trajectory_runner.py`、`session.py` |
-| 外部 program 数据面 | `rl/agentic/core/program_runner.py` |
-| 环境与工具组合 | `rl/agentic/envs/environment.py`、`rl/agentic/tools/` |
-| Codex 适配 | `rl/agentic/codex/` |
-| DeepSeek 适配 | `rl/agentic/ds_harness/` |
-| MCP 工具桥接 | `rl/agentic/mcp_server.py` |
-| 标准训练数据契约与 episode 分组 | `rl/data/contracts.py`、`batch_builder.py`、`episodes.py` |
-| 原始工具证据与可训练性 | `rl/tool_protocol/protocol.py`、`rl/rollout/vllm_plugin.py` |
-| 共享 vLLM 与策略身份 | `rl/rollout/vllm.py` |
+| Configuration and runner constraints | `rl/config/validate.py` |
+| Synchronous training orchestration | `rl/trainer/sync.py` |
+| Three rollout managers | `rl/rollout/manager.py` |
+| Internal episode loop | `rl/agentic/core/trajectory_runner.py`, `session.py` |
+| External program data plane | `rl/agentic/core/program_runner.py` |
+| Environments and tools | `rl/agentic/envs/environment.py`, `rl/agentic/tools/` |
+| Codex adaptation | `rl/agentic/codex/` |
+| DeepSeek adaptation | `rl/agentic/ds_harness/` |
+| MCP tool bridge | `rl/agentic/mcp_server.py` |
+| Standard training-data contracts and episode grouping | `rl/data/contracts.py`, `experience.py`, `episodes.py` |
+| Raw tool evidence and trainability | `rl/tool_protocol/protocol.py`, `rl/rollout/vllm_plugin.py` |
+| Shared vLLM and policy identity | `rl/rollout/vllm.py` |
 
-## 当前实现边界
+## Current Implementation Boundaries
 
-- 当前支持的训练算法是 GRPO、PPO 和 GSPO；外部逐调用轨迹限定 GRPO。实际验证范围以[RL 支持范围](../README.md)及
-  [系统测试指南](../README.md#系统测试)为准。多节点和异步 rollout 不在本文描述的实现范围内。
-- 外部 runner 复用唯一共享 vLLM endpoint，不创建第二个 rollout Router 或 rank-local server。
-- External harness 的语义循环可以不同，但必须返回标准、token 对齐且策略身份一致的 `Trajectory`。
-- Agentic UT 可从仓库根目录运行 `pytest -q tests/ut/rl/agentic/agentic_ut.py`；
-  完整 CPU 回归与合同分组见 [Code Agent 验证范围](../examples/swe_smith/README.md#图执行与验证范围)。
+- Training algorithms currently include GRPO, PPO, and GSPO; external per-call trajectories are GRPO-only. Actual validation follows [RL support](../README.md) and
+  the [system-test guide](../README.md#system-tests). Multi-node and asynchronous rollout are outside the implementation described here.
+- External runners reuse the sole shared vLLM endpoint, without a second rollout router or rank-local server.
+- External harness semantic loops may differ but must return standard, token-aligned `Trajectory` objects with consistent policy identity.
+- Run Agentic UT from the repository root using `pytest -q tests/ut/rl/agentic/agentic_ut.py`.
+  See [Code Agent validation scope](../examples/swe_smith/README.md#graph-execution-and-validation-scope) for full CPU regression and contract groupings.
 
-## 验证入口
+## Validation Entry Points
 
-逐调用轨迹、episode GRPO、DP 补齐及工具失败归因的 CPU 合同位于 `tests/ut/rl/` 的
-`data/`、`agentic/` 和 `trainer/` 模块；入口清单见[功能验证说明](moe_code_agent.md#单元测试)。
-`hyper_parallel/rl/tests/st/test_feature_st.py` 提供独立两进程 Gloo 梯度验证及真实 agent 训练入口。
-Gloo 验证不需要模型；真实训练须显式配置 CLI/SDK、模型、数据、设备与具有不等调用的任务，
-并保留真实参数更新、策略版本和零损失补齐断言。CPU 用例及资源缺失时的 skip 不能代替真机验收。
+CPU contracts for per-call trajectories, episode GRPO, DP padding, and tool-failure attribution live in `tests/ut/rl/`
+`data/`, `agentic/`, and `trainer/`; see [feature validation](moe_code_agent.md#unit-tests) for entry points.
+`hyper_parallel/rl/tests/st/test_feature_st.py` provides independent two-process Gloo gradient validation and real agent-training entry points.
+Gloo validation needs no model. Real training requires explicit CLI/SDK, models, data, devices, and tasks with unequal call counts,
+retaining real parameter-update, policy-version, and zero-loss-padding assertions. CPU tests and missing-resource skips do not replace real-device acceptance.
 
-## 异步 Codex 多轮任务
+## Asynchronous Codex Multi-Turn Tasks
 
-异步入口复用现有 Codex 程序，支持 Qwen3 dense 的 Search/SWE-Smith 多轮候选。
-模型调用按实际提交版本记录，允许一个 episode 的不同调用跨版本；同步路径仍检查整个 episode 版本一致。
-权重发布等待活跃模型调用结束，工具执行继续，checkpoint 边界则排空完整任务。
-配置、重试、版本滞后及验证边界见[异步运行合同](architecture.md#rayless-asynchronous-grpo)。
+The asynchronous entry point reuses existing Codex programs for Qwen3 dense Search/SWE-Smith multi-turn candidates.
+Model calls record their actual committed versions, allowing calls within an episode to span versions; the synchronous path still requires one version for the entire episode.
+Weight publication waits for active model calls to finish while tools continue executing; checkpoint boundaries drain complete tasks.
+See the [asynchronous runtime contract](architecture.md#rayless-asynchronous-grpo) for configuration, retries, policy lag, and validation boundaries.

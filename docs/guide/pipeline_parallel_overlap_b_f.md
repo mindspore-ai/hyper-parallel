@@ -1,67 +1,69 @@
-# Pipeline Parallel 通算掩盖设计文档
+# Pipeline Parallel Compute-Communication Overlap Design
 
-## 1. 背景与动机
+**English** | [简体中文](pipeline_parallel_overlap_b_f.zh.md)
 
-在 PP（Pipeline Parallelism）+ EP（Expert Parallelism）混合并行场景下，单 micro-batch 内的关键路径包含两类高延迟通信：
+## 1. Background and Motivation
 
-- **跨 stage 的 P2P send/recv**：上下游 stage 之间传递 activation（FWD）/ gradient（BWD）。
-- **MoE 层的 EP all-to-all（A2A）**：dispatch 把 token 发到对应 expert 所在 rank，combine 把 expert 输出聚合回原 rank。
+In hybrid PP (pipeline parallelism) + EP (expert parallelism), a single micro-batch's critical path includes two high-latency communication classes:
 
-在传统 1F1B 调度里，这些通信与 compute 串行，timeline 上构成显著的 bubble。本 PR 在 `ScheduleInterleaved1F1B` 上加了 **`overlap_b_f` 选项**，把稳态期相邻的 BWD 与 FWD 配对成 `OVERLAP_B_F` 复合 step；运行时由独立的 **`CommComputeOverlap`** 协调器以两个 Python 线程并发驱动，让一侧的 EP A2A 与另一侧的非通信 compute 在 GPU 上真正并发执行。
+- **Inter-stage P2P send/recv**: Transfer activations during FWD and gradients during BWD between adjacent stages.
+- **MoE EP all-to-all (A2A)**: Dispatch tokens to ranks hosting the selected experts; combine expert outputs back on their original ranks.
 
-设计目标：
+Traditional 1F1B serializes these communications with computation, creating substantial timeline bubbles. The **`overlap_b_f` option** on `ScheduleInterleaved1F1B` pairs adjacent steady-state BWD and FWD operations into `OVERLAP_B_F` composite steps. An independent **`CommComputeOverlap`** coordinator drives them concurrently through two Python threads, allowing one side's EP A2A to run physically concurrently with the other side's noncommunication compute on the GPU.
 
-1. **正确性**：与非 overlap 路径数值完全一致。
-2. **可组合**：保持现有 `PipelineStage` / `ScheduleInterleaved1F1B` 抽象，新增 flag + 通过 callback 注册扩展，不污染调度核心。
-3. **机制与调度解耦**：`CommComputeOverlap` 是独立的双线程协调器，未来可用于 TP+CP、FSDP prefetch 等其他场景，不绑定 PP。
-4. **Torch 原生实现**：PP 仅支持 PyTorch；`CommComputeOverlap` 直接使用 PP 内部的 `torch.autograd.Function` 同步钩子。
+Design goals:
+
+1. **Correctness**: Exact numerical agreement with the non-overlap path.
+2. **Composability**: Preserve `PipelineStage` / `ScheduleInterleaved1F1B` abstractions; extend through a flag and registered callbacks without complicating the scheduling core.
+3. **Separate mechanism from scheduling**: `CommComputeOverlap` is an independent two-thread coordinator, potentially reusable for TP+CP or FSDP prefetch without binding it to PP.
+4. **Native Torch implementation**: PP supports PyTorch only; `CommComputeOverlap` directly uses PP's internal `torch.autograd.Function` synchronization hooks.
 
 ---
 
-## 2. 模块结构
+## 2. Module Structure
 
 ```text
 hyper_parallel/core/pipeline_parallel/
-├── scheduler.py                # 调度核心（OVERLAP_B_F、PipelineContext、custom_fn 注册、overlap_b_f flag）
+├── scheduler.py                # Scheduling core: OVERLAP_B_F, PipelineContext, custom_fn registration, overlap_b_f flag
 ├── stage.py                    # PipelineStage
-├── hook_coordinator.py         # NEW：双线程 COMM-first rendezvous
-├── comm_compute_overlap.py     # NEW：CommComputeOverlap orchestrator + A/B/C/D wrap
+├── hook_coordinator.py         # NEW: two-thread COMM-first rendezvous
+├── comm_compute_overlap.py     # NEW:CommComputeOverlap orchestrator + A/B/C/D wrap
 ├── _sync_hook.py               # _SyncHookFunction (torch.autograd.Function)
-└── __init__.py                 # 导出新增 API
+└── __init__.py                 # New API exports
 
 examples/torch/pp_overlap/
-└── pp_overlap_moe_example.py   # 端到端示例：PP + EP + 通算掩盖 + MoE
+└── pp_overlap_moe_example.py   # End-to-end example: PP + EP + compute-communication overlap + MoE
 ```
 
 ---
 
-## 3. 关键概念
+## 3. Key Concepts
 
-### 3.1 MetaStep 与 OVERLAP_B_F
+### 3.1 MetaStep and OVERLAP_B_F
 
-`MetaStep` 描述调度单元，`MetaStepType` 增加：
+`MetaStep` describes a scheduling unit. `MetaStepType` adds:
 
-- `OVERLAP_F_B` / `OVERLAP_B_F`：复合 step，`sub_steps = (first, second)`。
-- `OVERLAP_B_F` 把 1F1B 的稳态期 `B_i, F_{i+1}` 合并成一拍。
+- `OVERLAP_F_B` / `OVERLAP_B_F`: Composite steps with `sub_steps = (first, second)`.
+- `OVERLAP_B_F` combines steady-state 1F1B operations `B_i, F_{i+1}` into one step.
 
-`ScheduleInterleaved1F1B(overlap_b_f=True).construct_stage_exec_order` 在原有 interleaved 1F1B 基础上做替换：
+`ScheduleInterleaved1F1B(overlap_b_f=True).construct_stage_exec_order` transforms the original interleaved 1F1B sequence:
 
 ```text
-原:    F₁, B₁, F₂, B₂, ..., F_n, B_n
-新:    F₁, [B₁,F₂], [B₂,F₃], ..., [B_{n-1},F_n], B_n
+Before: F₁, B₁, F₂, B₂, ..., F_n, B_n
+After:  F₁, [B₁,F₂], [B₂,F₃], ..., [B_{n-1},F_n], B_n
 ```
 
-第一个 FWD 与最后一个 BWD 不配对（暖热/冷却），其余每拍稳态都是一个 `OVERLAP_B_F`。
+The first FWD and last BWD remain unpaired for warmup/cooldown; each other steady-state step is `OVERLAP_B_F`.
 
-### 3.2 PipelineContext 与 custom_fn 注册
+### 3.2 PipelineContext and custom_fn Registration
 
-`PipelineScheduleRuntime` 引入：
+`PipelineScheduleRuntime` introduces:
 
 ```python
 schedule.register_custom_function(MetaStepType.OVERLAP_B_F, callback)
 ```
 
-`run_microbatches` 遇到 `OVERLAP_B_F` 时把控制权交给 callback，传入 `PipelineContext`：
+On `OVERLAP_B_F`, `run_microbatches` delegates to the callback with a `PipelineContext`:
 
 ```python
 class PipelineContext:
@@ -70,55 +72,55 @@ class PipelineContext:
     bwd_recv_ops = schedule.bwd_handle_cache
 ```
 
-这样调度核心保持泛化，dual-pipe 是一个外挂插件。
+This keeps the scheduling core generic, with dual-pipe implemented as an extension.
 
-### 3.3 P2P 重叠与 `overlap_p2p`
+### 3.3 P2P Overlap and `overlap_p2p`
 
-新增 `PipelineScheduleRuntime(overlap_p2p: bool = False)` 参数：
+The `PipelineScheduleRuntime(overlap_p2p: bool = False)` parameter controls:
 
-- `False`（默认）：FWD_RECV / BWD_RECV 在 `_exec_step` 里 issue 并立即 wait（HCCL 流侧 wait，不阻塞 host），与原行为兼容。
-- `True`：RECV 把 handle 缓存到 `fwd_handle_cache / bwd_handle_cache`，由消费者（`_exec_step` 的 FWD/BWD 分支或 OVERLAP_B_F callback）按需 pop+wait。
+- `False` (default): `_exec_step` issues FWD_RECV / BWD_RECV and immediately waits on the HCCL stream without blocking the host, preserving existing behavior.
+- `True`: RECV caches handles in `fwd_handle_cache / bwd_handle_cache`; consumers, either FWD/BWD branches in `_exec_step` or the OVERLAP_B_F callback, pop and wait as needed.
 
-SEND 在 `overlap_p2p=True` 下追加到 `send_handles` 列表，在 `run_microbatches` 末尾统一 drain，不做 per-step 阻塞——HCCL 按 PG 自动分流，与下一拍 compute 物理并发。
+With `overlap_p2p=True`, SEND appends to `send_handles`, drained together at the end of `run_microbatches`, without per-step blocking. HCCL automatically separates streams by process group, enabling physical overlap with the next step's computation.
 
-### 3.4 add_send_recv 与 OVERLAP 列扫描
+### 3.4 add_send_recv and OVERLAP Column Scanning
 
-`add_send_recv` 把 OVERLAP 步骤展开成 2 个虚拟 time slot（`_OverlapPhantom`），按列扫描穿插插入 SEND/RECV，并保持偶/奇 rank 处理顺序避免 P2P 死锁。具体：
+`add_send_recv` expands each OVERLAP step into two virtual time slots (`_OverlapPhantom`), inserts SEND/RECV by column scanning, and preserves even/odd rank processing order to avoid P2P deadlocks:
 
-- `_expand_overlap_slots`：每个 OVERLAP 拆成 `(first_half, second_half)` 两个 phantom。
-- `_column_scan_insert_comms`：对齐时间步，先把当前 step 入队，再调 `_insert_comms_for_step` 发 SEND/RECV。
-- 偶数 rank 先于奇数 rank 处理，`'loop'` / `'v'` 两种 stage→rank 映射。
+- `_expand_overlap_slots`: Split each OVERLAP into `(first_half, second_half)` phantoms.
+- `_column_scan_insert_comms`: Align time steps, enqueue the current step, then call `_insert_comms_for_step` to issue SEND/RECV.
+- Process even ranks before odd ranks, supporting both `'loop'` and `'v'` stage-to-rank mappings.
 
 ---
 
-## 4. EP A2A 通算掩盖
+## 4. EP A2A Compute-Communication Overlap
 
-### 4.1 A/B/C/D 同步钩子
+### 4.1 A/B/C/D Synchronization Hooks
 
-每个 MoE 层在 forward 时执行：
+Each MoE layer executes the following during forward:
 
 ```text
 [A] ─► dispatch(A2A) ─► [B] ─► expert(compute) ─► [C] ─► combine(A2A) ─► [D] ─► (Attention)
 ```
 
-`CommComputeOverlap` 提供 `wrap_dispatch` / `wrap_combine`，调用 `_SyncHookFunction.apply` 把 A、B、C、D 4 个钩子点插到张量计算图里。Backward 自动得到对称的 D'、C'、B'、A' 触发顺序。
+`CommComputeOverlap` provides `wrap_dispatch` / `wrap_combine`, using `_SyncHookFunction.apply` to insert A, B, C, and D hook points into the tensor graph. Backward automatically triggers them in the symmetric D', C', B', A' order.
 
-### 4.2 HookCoordinator：COMM-first rendezvous
+### 4.2 HookCoordinator:COMM-first rendezvous
 
-仅靠 `threading.Barrier` 不够——两个线程到达 rendezvous 后**释放顺序由 GIL 决定**，host 侧 dispatch 顺序不可控，GPU 侧的 A2A 与 compute 启动顺序也就不可控。
+A `threading.Barrier` alone is insufficient: once both threads rendezvous, **the GIL determines their release order**. Host dispatch order, and therefore GPU A2A/compute launch order, is uncontrolled.
 
-`HookCoordinator` 在 Barrier 之上叠加 **per-rendezvous `threading.Event`**：
+`HookCoordinator` adds a **per-rendezvous `threading.Event`** on top of the barrier:
 
-1. 两线程都到 → Barrier 通过。
-2. `COMM` 侧立即 dispatch 它的 A2A，然后 `notify_dispatched()` 触发 Event。
-3. `COMPUTE` 侧 wait Event，确认 COMM 已 dispatch 后再 dispatch 自己的 compute kernel。
+1. Both threads arrive and pass the barrier.
+2. `COMM` immediately dispatches its A2A, then `notify_dispatched()` signals the event.
+3. `COMPUTE` waits for the event and dispatches its compute kernel only after COMM has dispatched.
 
-每次 rendezvous 用**独立** Event，避免单 Event 在连续 rendezvous 间出现 set/clear race。
+Every rendezvous uses an **independent** event, avoiding set/clear races between consecutive rendezvous.
 
-`HookRole`：
+`HookRole`:
 
-- `COMM`：先 dispatch（dispatch / combine A2A）
-- `COMPUTE`：等 COMM 通知后再 dispatch（expert compute / Attention）
+- `COMM`: Dispatch first (dispatch / combine A2A).
+- `COMPUTE`: Dispatch after COMM notification (expert compute / attention).
 
 ### 4.3 CommComputeOverlap.run
 
@@ -126,22 +128,22 @@ SEND 在 `overlap_p2p=True` 下追加到 `send_handles` 列表，在 `run_microb
 overlap.run(fwd_fn, bwd_fn)
 ```
 
-主线程跑 `fwd_fn`，spawn daemon 线程跑 `bwd_fn`。`coordinator.enable()` 把 Barrier + per-rendezvous Event 状态重置；任一侧异常会立即 `disable` 解除另一侧 wait，避免死锁。**不需要传 `num_layers`**——见 4.5。
+The main thread runs `fwd_fn`; a spawned daemon thread runs `bwd_fn`. `coordinator.enable()` resets the barrier and per-rendezvous events. An exception on either side immediately disables the coordinator and releases the other side's wait to avoid deadlock. **No `num_layers` argument is needed**; see §4.5.
 
-### 4.4 跨层 `D → A_next` 窗口
+### 4.4 Cross-Layer `D → A_next` Window
 
-层与层之间，第 k 层的 combine（D 钩）与第 k+1 层的 dispatch（A 钩）相邻。现实现把它们各自配 COMM/COMPUTE 角色，让一侧的 combine.bwd 与另一侧的 Attention 计算并发——这是除"层内 dispatch ↔ expert compute"之外的第二个掩盖窗口。
+Between layers, layer k's combine (D hook) is adjacent to layer k+1's dispatch (A hook). Assigning COMM/COMPUTE roles to them lets one side's combine.bwd overlap the other side's attention computation, providing a second window beyond within-layer dispatch ↔ expert compute.
 
-### 4.5 最后一层 D 的特殊处理：`D_LAST` 静态标注
+### 4.5 Final-Layer D Handling: Static `D_LAST` Annotation
 
-FWD 与 BWD 一拍下来 hook 数本应都是 4N（每层 A/B/C/D），但 BWD 的入口结构有非对称：autograd 进入反向时第一个被调用的就是 `combine_N.bwd`（一个 A2A），它**先于**任何 hook 的 backward 触发，是个"自由 dispatch"——D_N 的 backward hook 想去 rendezvous 时 A2A 已经在 EP 流上了，rendezvous 也无意义。
+FWD and BWD would each have 4N hooks (A/B/C/D per layer), but the backward entry is asymmetric. Autograd first invokes `combine_N.bwd`, an A2A, **before** any backward hook fires. This is a free dispatch: when D_N's backward hook would rendezvous, the A2A is already on the EP stream, so the rendezvous has no purpose.
 
-所以 D_N 这个 hook 在两侧都要跳过：
+Therefore, skip D_N on both sides:
 
-- **FWD 一侧**：D_N 是最后一个 D，next op 是"layer N+1 的 Attention"，根本不存在 → rendezvous 没意义
-- **BWD 一侧**：D_N 是 BWD 第一个 hook，前面的 combine.bwd 已经自由 dispatch 过了 → rendezvous 也没意义
+- **FWD**: D_N is the last D; its next operation would be layer N+1 attention, which does not exist, so rendezvous is unnecessary.
+- **BWD**: D_N is the first backward hook, and the preceding combine.bwd has already dispatched freely, so rendezvous is unnecessary.
 
-**实现**：在 `CommComputeOverlap.wrap_combine(combine_fn, is_last_layer=True)` 时把闭合的 D 钩 tag 成 `"D_LAST"`，`_TorchSyncHookFunction` 的 forward / backward 看到 `D_LAST` 直接 return：
+**Implementation**: `CommComputeOverlap.wrap_combine(combine_fn, is_last_layer=True)` tags the closing D hook as `"D_LAST"`. `_TorchSyncHookFunction` returns immediately when forward/backward sees this tag:
 
 ```python
 if hook_name == "D_LAST":
@@ -150,12 +152,12 @@ if hook_name == "D_LAST":
     return grad_output, None, None  # backward
 ```
 
-同一个 hook 实例在 FWD 是"最后一个 D"、在 BWD 是"第一个 D"，**一个 tag 同时关掉两侧的特判**。这样 `HookCoordinator` 就不需要再维护 runtime 计数器（早期版本有 `_num_layers` / `increment_cycle` 让 FWD 计数到 N 自动 disable，以及 `_bwd_local` thread-local 计数让 BWD 跳过第一个 D，这两个机制现在都被静态标注取代）。
+The same hook is the last D in FWD and first D in BWD, so **one tag handles both boundary cases**. `HookCoordinator` no longer needs runtime counters. Earlier `_num_layers` / `increment_cycle` logic disabled FWD after N layers, while `_bwd_local` thread-local counting skipped the first backward D; static annotation replaces both mechanisms.
 
-跳过后 FWD/BWD 各跑 4N-1 个 rendezvous，按位置严格配对：
+After skipping, FWD and BWD each run 4N-1 rendezvous, paired strictly by position:
 
 ```text
-FWD A_1 ↔ BWD C_N    (COMM ↔ COMPUTE，FWD dispatch_1 与 BWD expert.bwd_N 重叠)
+FWD A_1 ↔ BWD C_N    (COMM ↔ COMPUTE: FWD dispatch_1 overlaps BWD expert.bwd_N)
 FWD B_1 ↔ BWD B_N
 FWD C_1 ↔ BWD A_N
 FWD D_1 ↔ BWD D_{N-1}
@@ -163,84 +165,84 @@ FWD D_1 ↔ BWD D_{N-1}
 FWD C_N ↔ BWD A_1
 ```
 
-每对至少有一侧是 COMM，没有 COMPUTE+COMPUTE 死锁风险。
+Every pair has at least one COMM side, avoiding COMPUTE+COMPUTE deadlocks.
 
 ---
 
-## 5. PP P2P 与 RECV-Compute 重叠
+## 5. PP P2P and RECV-Compute Overlap
 
-`overlap_p2p=True` + `OVERLAP_B_F` callback 中：
+With `overlap_p2p=True` in the `OVERLAP_B_F` callback:
 
 ```python
-# callback 入口（main thread, default stream）
+# Callback entry: main thread, default stream.
 fwd_recv_handles = ctx.fwd_recv_ops.pop((fwd_stage.stage_index, fwd_mi), None)
 bwd_recv_handles = ctx.bwd_recv_ops.pop((bwd_stage.stage_index, bwd_mi), None)
 
 def fwd_fn():
     if fwd_recv_handles:
-        schedule._wait_p2p(fwd_recv_handles)   # 主线程默认流 wait
+        schedule._wait_p2p(fwd_recv_handles)   # Wait on the main thread's default stream.
     out = fwd_stage.forward_one_chunk(fwd_mi, ...)
 
 def bwd_fn():
-    torch.npu.set_device(device.index)         # BWD 线程绑设备，否则 HCCL hang
+    torch.npu.set_device(device.index)         # Bind the BWD thread's device to avoid HCCL hangs.
     if bwd_recv_handles:
-        schedule._wait_p2p(bwd_recv_handles)   # BWD 线程默认流 wait
+        schedule._wait_p2p(bwd_recv_handles)   # Wait on the BWD thread's default stream.
     bwd_stage.backward_one_chunk(bwd_mi, ...)
 ```
 
-效果：
+Effects:
 
-- FWD/BWD RECV 在前一拍就被 issue 到 HCCL P2P 流，与本拍 OVERLAP_B_F 的 compute 自然并发。
-- callback 内的 `wait()` 把 PP-RECV stream 完成事件挂到当前默认流上 → 后续的 EP A2A 通过 PyTorch HCCL backend 的 `queueEvent(currentStream)` 链取到这个等待事件 → A2A 正确等到 PP-RECV 完成才启动。
-- SEND 不需要 callback 内特殊处理：`overlap_p2p=True` 路径把 send handle 攒到末尾 drain，HCCL 自动用生产者流上的 event 排序。
+- FWD/BWD RECV is issued to HCCL P2P streams in the preceding step, naturally overlapping current OVERLAP_B_F computation.
+- Callback `wait()` places the PP-RECV completion event on the current default stream. Subsequent EP A2A obtains this dependency through the PyTorch HCCL backend's `queueEvent(currentStream)` chain, starting only after PP-RECV completes.
+- SEND needs no special callback handling: `overlap_p2p=True` accumulates send handles for final draining, and HCCL orders them through producer-stream events automatically.
 
-### 5.1 关键设计决策：BWD 不开独立 stream
+### 5.1 Key Design Decision: No Separate BWD Stream
 
-早期版本曾尝试 `with torch.npu.stream(bwd_stream):` 把 BWD 跑到独立侧流，期望 FWD/BWD compute 物理并发。**实测发现该方案不工作**：
+An earlier version tried `with torch.npu.stream(bwd_stream):` to execute backward on a side stream for physical FWD/BWD compute overlap. **Measurements showed this did not work**:
 
-1. `torch.autograd.backward()` 派发反向 kernel 时使用的是 forward 期间 saved tensor 的 producer stream，**不看** `with torch.npu.stream(...)` 的 thread-local current stream——BWD compute 实际上还是落在主线程默认流上。
-2. `recv_buffer` 由主线程默认流分配，PyTorch tensor allocator-stream 跟踪把 buffer 与默认流绑定。即便我们把 `handle.wait()` 的 event 挂到 bwd_stream 上，EP A2A 在读 buffer 时通过 allocator 看到的依赖流是默认流（不含 wait_event），导致 A2A 提前启动，与 PP-RECV 形成数据竞争。
+1. `torch.autograd.backward()` dispatches backward kernels on the producer streams of tensors saved during forward, **not** the thread-local current stream selected by `with torch.npu.stream(...)`. BWD computation still runs on the main default stream.
+2. `recv_buffer` is allocated on the main default stream, and PyTorch allocator-stream tracking binds it there. Even if `handle.wait()` places an event on bwd_stream, EP A2A sees the default stream through allocator dependencies, without that wait event. A2A can start prematurely and race PP-RECV.
 
-最终设计：BWD 跑在 BWD 线程的默认流（与主线程默认流物理相同），整个 wait 链路与 buffer 跟踪对齐。失去的"FWD/BWD compute 真并行"在 MoE 模型里收益本就有限——MoE 的 A2A 在 EP HCCL 流，与默认流的 compute 物理并发，这部分掩盖窗口靠流隔离实现，**不依赖**独立的 BWD compute 流。
+The final design runs BWD on its thread's default stream, physically the same as the main default stream, aligning waits and buffer tracking. Losing true FWD/BWD compute concurrency has limited impact for MoE: A2A runs on EP HCCL streams and physically overlaps default-stream computation. This window comes from communication-stream separation and **does not require** a separate BWD compute stream.
 
 ---
 
-## 6. 端到端时间线
+## 6. End-to-End Timeline
 
-PP=2 / EP=2 / chunks_per_rank=2 / moe_layers=2 的稳态某拍：
+A steady-state step with PP=2 / EP=2 / chunks_per_rank=2 / moe_layers=2:
 
 ```text
-默认流(compute):  [BWD attention][FWD attention][BWD expert][FWD expert]...
-EP HCCL 流(A2A):           [BWD combine.bwd][FWD dispatch][BWD dispatch.bwd][FWD combine]...
-PP-RECV 流:        [本拍 BWD-RECV.....]  [本拍 FWD-RECV.....]
-PP-SEND 流:                                          [上拍 BWD-SEND.....]
+Default stream (compute): [BWD attention][FWD attention][BWD expert][FWD expert]...
+EP HCCL stream (A2A):              [BWD combine.bwd][FWD dispatch][BWD dispatch.bwd][FWD combine]...
+PP-RECV stream:           [current BWD-RECV.....] [current FWD-RECV.....]
+PP-SEND stream:                                           [previous BWD-SEND.....]
 ```
 
-掩盖关系：
+Overlap relationships:
 
-- EP A2A ↔ 默认流 compute（核心收益，由 A/B/C/D 钩子保证 dispatch 顺序）
-- PP-RECV ↔ EP A2A / 默认流 compute（recv 提前一拍 issue）
-- PP-SEND ↔ 下一拍 compute（末尾 drain）
+- EP A2A ↔ default-stream compute: the main benefit; A/B/C/D hooks guarantee dispatch order.
+- PP-RECV ↔ EP A2A / default-stream compute: receives are issued one step early.
+- PP-SEND ↔ next-step compute: handles are drained at the end.
 
 ---
 
-## 7. API 概览
+## 7. API Overview
 
 ```python
 from hyper_parallel.core.pipeline_parallel import (
-    ScheduleInterleaved1F1B,           # 调度（带 overlap flag）
-    CommComputeOverlap,                # 双线程 orchestrator
-    HookCoordinator, HookRole,         # 底层 rendezvous 原语
-    MetaStepType, MetaStep,            # 调度单元
-    PipelineContext,                   # callback 上下文
+    ScheduleInterleaved1F1B,           # Schedule with overlap flags.
+    CommComputeOverlap,                # Two-thread orchestrator.
+    HookCoordinator, HookRole,         # Low-level rendezvous primitives.
+    MetaStepType, MetaStep,            # Scheduling units.
+    PipelineContext,                   # Callback context.
 )
 
-# 1. 构造 schedule，启用 B/F overlap + P2P overlap
+# 1. Construct the schedule with B/F and P2P overlap enabled.
 schedule = ScheduleInterleaved1F1B(
     stages, micro_batch_num, overlap_p2p=True, overlap_b_f=True,
 )
 
-# 2. 给每个 MoE 层的 dispatch / combine 装钩；最后一层标 is_last_layer=True
+# 2. Attach hooks to each MoE layer's dispatch/combine; mark the final layer is_last_layer=True.
 overlap = CommComputeOverlap()
 last_idx = len(moe_layers) - 1
 for i, layer in enumerate(moe_layers):
@@ -249,7 +251,7 @@ for i, layer in enumerate(moe_layers):
         layer.experts.combine, is_last_layer=(i == last_idx),
     )
 
-# 3. 注册 OVERLAP_B_F callback
+# 3. Register the OVERLAP_B_F callback.
 def callback(step, ctx):
     bwd_step, fwd_step = step.sub_steps
     ...
@@ -257,45 +259,45 @@ def callback(step, ctx):
 
 schedule.register_custom_function(MetaStepType.OVERLAP_B_F, callback)
 
-# 4. 跑一个 iteration
+# 4. Run one iteration.
 losses = schedule.run(*inputs)
 ```
 
-完整示例见 `examples/torch/pp_overlap/pp_overlap_moe_example.py`。
+See `examples/torch/pp_overlap/pp_overlap_moe_example.py` for the full example.
 
 ---
 
-## 8. Torch 原生同步钩子
+## 8. Native Torch Synchronization Hooks
 
-`core/pipeline_parallel/_sync_hook.py` 中的 `_SyncHookFunction` 直接继承
-`torch.autograd.Function`。前向时根据 `hook_name`（`A`/`B`/`C`/`D`）计算
-COMM/COMPUTE role 并调用 `coordinator.rendezvous`；反向时角色对称翻转。
-`D_LAST` 保留最后一层的通知语义并跳过边界 rendezvous。
+`_SyncHookFunction` in `core/pipeline_parallel/_sync_hook.py` directly subclasses
+`torch.autograd.Function`. During forward, it derives the COMM/COMPUTE role from `hook_name` (`A`/`B`/`C`/`D`)
+and calls `coordinator.rendezvous`; backward reverses the roles symmetrically.
+`D_LAST` preserves final-layer notification semantics while skipping the boundary rendezvous.
 
-`CommComputeOverlap` 直接调用此钩子；每个 overlap window 新建并等待一个
-反向线程。PP 不再经过 Platform 抽象层。
-
----
-
-## 9. 限制与未来工作
-
-### 当前限制
-
-- **MoE 层数对齐**：FWD 与 BWD chunk 层数不等时，多余的 hook 落在没有配对的一侧 → barrier 死等。当前实现假设 FWD/BWD chunk 层数一致；不一致时需要在装钩时按短边对齐（多余层不装钩），框架不会自动处理。
-- **FWD/BWD compute 不并行**：autograd 的 stream 行为决定了 BWD 必然跑在 forward 流上，目前接受这个事实。
-- **OVERLAP_F_B 未对 P2P 适配**：本 PR 只完成了 OVERLAP_B_F 路径的 `overlap_p2p=True` 适配，对称的 F_B 需类似改造。
-
-### 后续优化方向
-
-1. **FWD/BWD 双向独立 PG**：避免 HCCL P2P group 内序列化，让 FWD-RECV 与 BWD-RECV 在两条 HCCL 流上真正并发。
-2. **CUDA Graph / 静态化**：把 OVERLAP_B_F 内的 dispatch/combine/compute kernel 序列做成 graph，进一步降低 host 侧 dispatch overhead。
-3. **FWD compute 与 BWD compute 真并行**：方案上需要重新设计 forward 时的 stream 分配（比如 forward 时就把 chunk 分到两条流上），属于较大改动。
+`CommComputeOverlap` calls this hook directly. Each overlap window creates and waits for a new
+backward thread. PP no longer uses the Platform abstraction.
 
 ---
 
-## 10. 验证
+## 9. Limitations and Future Work
 
-- **数值一致性**：`overlap_p2p=False` vs `True` 同 seed 同 input，loss / 各参数 grad 完全相等（atol=0, rtol=0）。
-- **profile 验证 1**：单拍 OVERLAP_B_F 内 EP A2A 数量与 compute 完整重叠（A/B/C/D 钩子链不破）。
-- **profile 验证 2**：PP-RECV 与 OVERLAP_B_F 内的 A2A 重叠数 ≤ FWD 的 A2A 数（BWD A2A 正确等待 PP-RECV）。
-- **端到端**：`pp_overlap_moe_example.py` 在 8 卡（PP=2 × EP=4 或 PP=4 × EP=2）下跑通，loss 收敛符合预期。
+### Current Limitations
+
+- **MoE layer alignment**: Unequal FWD/BWD chunk layer counts leave extra hooks unpaired and cause an indefinite barrier wait. The implementation assumes equal counts; otherwise register hooks only up to the shorter side, leaving excess layers unhooked. The framework does not handle this automatically.
+- **No concurrent FWD/BWD compute**: Autograd stream behavior keeps BWD on the forward stream; this is currently accepted.
+- **OVERLAP_F_B lacks P2P integration**: Only OVERLAP_B_F currently supports `overlap_p2p=True`; the symmetric F_B path needs a similar adaptation.
+
+### Future Optimization Directions
+
+1. **Separate directional FWD/BWD process groups**: Avoid serialization within an HCCL P2P group so FWD-RECV and BWD-RECV can run on separate HCCL streams concurrently.
+2. **CUDA Graph / static execution**: Capture OVERLAP_B_F dispatch/combine/compute kernel sequences in a graph to further reduce host dispatch overhead.
+3. **True FWD/BWD compute concurrency**: Redesign forward stream assignment, for example assigning chunks to two streams during forward. This requires substantial changes.
+
+---
+
+## 10. Validation
+
+- **Numerical consistency**: With identical seeds and inputs, `overlap_p2p=False` and `True` produce exactly equal losses and parameter gradients (`atol=0, rtol=0`).
+- **Profile check 1**: EP A2A operations fully overlap computation within one OVERLAP_B_F step, preserving the A/B/C/D hook chain.
+- **Profile check 2**: The number of A2A operations overlapping PP-RECV within OVERLAP_B_F is ≤ the FWD A2A count, confirming that BWD A2A correctly waits for PP-RECV.
+- **End to end**: `pp_overlap_moe_example.py` runs on eight devices (PP=2 × EP=4 or PP=4 × EP=2), with loss convergence as expected.

@@ -1,54 +1,56 @@
-# CP 上下文并行使用指南
+# CP Context Parallelism Guide
 
-HyperParallel 的 Context Parallel（CP）是面向注意力计算边界的 `ParallelStyle`。它通过 forward hooks 把每个 CP rank 上的本地序列分片包装为 DTensor，并在进入/离开 core attention 或 DSA 算子边界时完成 Q/K/V 的重排与通信。
+**English** | [简体中文](context_parallel.zh.md)
 
-CP 不负责切分数据集、token ids 或整层 Transformer 输入。启用 CP 后，调用模型前仍需要让每个 CP rank 只拿到自己的序列切片，并保证 position ids、RoPE 起始位置和 attention mask 与全局序列窗口对齐。
+HyperParallel's Context Parallel (CP) is a `ParallelStyle` applied at attention computation boundaries. Forward hooks wrap each CP rank's local sequence shard as a DTensor and rearrange and communicate Q/K/V when entering or leaving core attention or DSA operator boundaries.
 
-Kimi Delta Attention 的状态递推使用专用入口，P2P、AllGather、Ulysses 及其混合配置见
-[KDA 上下文并行使用指南](./kda_context_parallel.md)。
+CP does not shard datasets, token IDs, or entire Transformer layer inputs. Before calling the model with CP enabled, each CP rank must receive its own sequence slice, with position IDs, the RoPE starting position, and attention masks aligned to the global sequence window.
 
-DeepSeek V4.1 的共享压缩 attention 使用专用 CP 包装；均衡策略与通信配置见
-[DeepSeek V4.1 Indexer 负载均衡与 CP 通信](./deepseek_v41_indexer_cp.md)。
+Kimi Delta Attention uses dedicated entry points for state recurrence. For P2P, AllGather, Ulysses, and hybrid configurations, see the
+[KDA Context Parallelism Guide](./kda_context_parallel.md).
 
-## 适用边界
+DeepSeek V4.1 shared compressed attention uses a dedicated CP wrapper. For balancing policies and communication settings, see
+[DeepSeek V4.1 Indexer Load Balancing and CP Communication](./deepseek_v41_indexer_cp.md).
 
-| 接口 | 真实作用 |
+## Scope
+
+| Interface | Behavior |
 |------|----------|
-| `ContextParallel` | 给普通 core attention 注册同步 CP hooks。默认处理 forward 参数中的 Q/K/V。 |
-| `AsyncContextParallel` | 在普通 core attention 上注册异步 CP hooks；传入 Q/K/V producer 模块时，可把投影计算与 CP 通信重叠。 |
-| `DSAIndexerContextParallel` | 给 DeepSeek Sparse Attention（DSA）的 indexer 边界改写 query/key/weights 的 DTensor placement。 |
-| `DSASparseAttentionContextParallel` | 给 DSA sparse attention 边界改写 query/key/value/topk/rope 的 placement。 |
-| `DSAIndexerLossContextParallel` | 给 DSA indexer-loss 边界改写输入 placement，并处理部分 loss/grad 输出。 |
-| `AsyncDSA*ContextParallel` | DSA 边界的异步 all-gather 版本；提供 handoff 模块时提前发起 key/value 侧 gather，否则回退到同步 gather。 |
+| `ContextParallel` | Register synchronous CP hooks on ordinary core attention, processing Q/K/V in forward arguments by default. |
+| `AsyncContextParallel` | Register asynchronous CP hooks on ordinary core attention; supplying Q/K/V producer modules enables projection computation to overlap CP communication. |
+| `DSAIndexerContextParallel` | Rewrite DTensor placements of query/key/weights at the DeepSeek Sparse Attention (DSA) indexer boundary. |
+| `DSASparseAttentionContextParallel` | Rewrite placements of query/key/value/topk/rope at the DSA sparse attention boundary. |
+| `DSAIndexerLossContextParallel` | Rewrite input placements at the DSA indexer-loss boundary and handle partial loss/gradient outputs. |
+| `AsyncDSA*ContextParallel` | Asynchronous all-gather variants for DSA boundaries; initiate key/value gathers early when handoff modules are provided, otherwise fall back to synchronous gathers. |
 
-## `ContextParallel` 模式
+## `ContextParallel` Modes
 
-`ContextParallel` 由 `ulysses_degree` 决定执行模式。CP size 等于传入 `device_mesh.mesh.numel()`。
+`ulysses_degree` selects the `ContextParallel` execution mode. CP size is `device_mesh.mesh.numel()` for the supplied mesh.
 
-| 模式 | 参数 | 通信与 placement | 约束 |
+| Mode | Parameter | Communication and placement | Constraints |
 |------|------|------------------|------|
-| Pure Ulysses | `ulysses_degree=None`，也是默认值 | Q/K/V 在进入 attention 前从 `Shard(seq_dim)` all-to-all 到 `Shard(head_dim)`，输出再从 head shard 转回 sequence shard。 | `num_heads % cp_size == 0` |
-| Pure Colossal AI | `ulysses_degree=1` | Q 保持 `Shard(seq_dim)`，K/V 沿序列维 all-gather 到 `Replicate()`。 | 无 head 数整除 CP 的约束 |
-| Hybrid | `1 < ulysses_degree < cp_size` | 先在 Ulysses 子组上对 Q/K/V 做 seq->head all-to-all，再在 Colossal 子组上 gather K/V。 | `cp_size % ulysses_degree == 0`，且 `num_heads % ulysses_degree == 0` |
+| Pure Ulysses | `ulysses_degree=None` (default) | All-to-all Q/K/V from `Shard(seq_dim)` to `Shard(head_dim)` before attention; convert output head shards back to sequence shards. | `num_heads % cp_size == 0` |
+| Pure Colossal AI | `ulysses_degree=1` | Keep Q as `Shard(seq_dim)`; all-gather K/V along the sequence dimension to `Replicate()`. | No requirement for the head count to be divisible by CP size |
+| Hybrid | `1 < ulysses_degree < cp_size` | First perform seq->head all-to-all for Q/K/V within Ulysses subgroups, then gather K/V within Colossal subgroups. | `cp_size % ulysses_degree == 0` and `num_heads % ulysses_degree == 0` |
 
-常用参数：
+Common parameters:
 
-| 参数 | 默认值 | 说明 |
+| Parameter | Default | Description |
 |------|--------|------|
-| `seq_dim` | `1` | 序列维下标。BSHD 使用 `1`，BNSD 使用 `2`。 |
-| `head_dim` | `2` | head 维下标。BSHD 使用 `2`，BNSD 使用 `1`。 |
-| `qkv_indices` | `(0, 1, 2)` | attention forward 中 Q/K/V 的位置参数下标。 |
-| `qkv_kwarg_names` | `()` | Q/K/V 以关键字参数传入时的参数名。 |
-| `use_local_output` | `False` | 为 `True` 时 public output 总是 local tensor；为 `False` 时 plain tensor 输入返回 local tensor，CP DTensor 输入保持 CP DTensor，TP 等非 CP DTensor 输入会在输出处去掉 CP 维并保留原来的非 CP layout。 |
-| `load_balance` | `False` | 仅支持 `ulysses_degree=1`。使用 Head-Tail Q 交换做 Colossal CP 负载均衡。 |
+| `seq_dim` | `1` | Sequence dimension index: `1` for BSHD, `2` for BNSD. |
+| `head_dim` | `2` | Head dimension index: `2` for BSHD, `1` for BNSD. |
+| `qkv_indices` | `(0, 1, 2)` | Positional argument indices of Q/K/V in attention forward. |
+| `qkv_kwarg_names` | `()` | Argument names when Q/K/V are passed as keyword arguments. |
+| `use_local_output` | `False` | If `True`, public output is always a local tensor. If `False`, plain tensor inputs return local tensors, CP DTensor inputs retain CP DTensors, and non-CP DTensor inputs such as TP lose the CP dimension at output while retaining their original non-CP layout. |
+| `load_balance` | `False` | Supported only for `ulysses_degree=1`. Use head-tail Q exchange to balance Colossal CP load. |
 
-Hybrid CP 可以直接传 1-D CP mesh；如果传 2-D mesh，mesh 维度需要命名，且第一维按 Colossal 子组、第二维按 Ulysses 子组使用，通常写作 `mesh_dim_names=("co", "ds")`。
+Hybrid CP accepts a 1-D CP mesh directly. A 2-D mesh must have named dimensions, with the first used for Colossal subgroups and the second for Ulysses subgroups, typically `mesh_dim_names=("co", "ds")`.
 
-`load_balance=True` 会把本地 Q 分成两半并与对端 rank 做 P2P 交换，内部会调用两次 attention。此时 attention 内部如果要构造 mask，应使用 K 的序列长度作为全局长度来源；Q 在子 attention 中看到的是半段序列。
+`load_balance=True` splits local Q into halves and exchanges them with the peer rank using P2P, invoking attention twice internally. When constructing masks inside attention, use K's sequence length as the global length: Q sees only half the sequence in each sub-attention.
 
-## 基础用法
+## Basic Usage
 
-以 BSHD core attention 为例，每个 CP rank 先拿到本地序列切片，再把 CP style 挂到真正接收 Q/K/V 的 attention 子模块上：
+For BSHD core attention, each CP rank first receives its local sequence slice; attach the CP style to the attention submodule that actually consumes Q/K/V:
 
 ```python
 from hyper_parallel import ContextParallel, init_device_mesh
@@ -64,7 +66,7 @@ cp = ContextParallel(seq_dim=1, head_dim=2, ulysses_degree=1)
 cp.apply(layer.attention.sdpa_core, mesh)
 ```
 
-如果使用 `parallelize_module`，也可以把 CP 写进并行计划：
+With `parallelize_module`, CP can also be included in the parallel plan:
 
 ```python
 from hyper_parallel import ContextParallel, parallelize_module
@@ -76,22 +78,22 @@ parallelize_module(
 )
 ```
 
-不同布局和模式示例：
+Examples for different layouts and modes:
 
 ```python
-# BSHD: [batch, seq, head, dim]，Colossal CP
+# BSHD: [batch, seq, head, dim], Colossal CP
 ContextParallel(seq_dim=1, head_dim=2, ulysses_degree=1).apply(core_attn, cp_mesh)
 
-# BNSD: [batch, head, seq, dim]，Pure Ulysses
+# BNSD: [batch, head, seq, dim], Pure Ulysses
 ContextParallel(seq_dim=2, head_dim=1).apply(core_attn, cp_mesh)
 
-# Hybrid CP，Ulysses 子组大小为 2
+# Hybrid CP with Ulysses subgroup size 2.
 ContextParallel(seq_dim=1, head_dim=2, ulysses_degree=2).apply(core_attn, cp_mesh)
 ```
 
 ## AsyncContextParallel
 
-`AsyncContextParallel` 的构造参数与 `ContextParallel` 基本一致，但 `apply` 额外接收 `q_proj`、`k_proj`、`v_proj`：
+`AsyncContextParallel` has largely the same constructor parameters as `ContextParallel`, but `apply` additionally accepts `q_proj`, `k_proj`, and `v_proj`:
 
 ```python
 from hyper_parallel import AsyncContextParallel
@@ -105,42 +107,42 @@ AsyncContextParallel(seq_dim=1, head_dim=2, ulysses_degree=None).apply(
 )
 ```
 
-真实行为如下：
+Its behavior is:
 
-| 模式 | 异步重叠点 |
+| Mode | Asynchronous overlap point |
 |------|------------|
-| Pure Ulysses | Q/K/V projection 后发起 seq->head all-to-all，attention pre-hook 等待。 |
-| Pure Colossal AI | K/V projection 后发起 sequence all-gather，attention pre-hook 等待；Q 仍在 attention 边界包装为 sequence shard。 |
-| Hybrid | Q/K/V projection 后发起 Ulysses all-to-all；K/V 在 Colossal 子组上的 gather 仍在 attention 边界同步执行。 |
+| Pure Ulysses | Issue seq->head all-to-all after Q/K/V projection; wait in the attention pre-hook. |
+| Pure Colossal AI | Issue sequence all-gather after K/V projection; wait in the attention pre-hook. Q is still wrapped as a sequence shard at the attention boundary. |
+| Hybrid | Issue Ulysses all-to-all after Q/K/V projection; K/V gathers in Colossal subgroups remain synchronous at the attention boundary. |
 
-注意事项：
+Notes:
 
-1. 如果 `q_proj`、`k_proj`、`v_proj` 任意一个未传入，`AsyncContextParallel.apply` 会回退为同步 `ContextParallel.apply`。
-2. 传入的 projection 模块必须是 Q/K/V 进入 attention 前的最后一个可 hook 模块；projection 和 attention 之间如果还有 reshape、transpose、QK norm 等操作，异步 pre-hook 会绕过这些操作。带 QK norm 的模型应把 norm 后的模块作为 `q_proj`/`k_proj` handoff。
-3. `ulysses_degree=1` 且 `load_balance=True` 时，async 版本会回退到同步 Colossal CP。
+1. If any of `q_proj`, `k_proj`, or `v_proj` is omitted, `AsyncContextParallel.apply` falls back to synchronous `ContextParallel.apply`.
+2. Each projection module must be the last hookable module before Q/K/V enter attention. The asynchronous pre-hook bypasses any intervening reshape, transpose, or QK normalization. For models with QK normalization, use the post-normalization modules as the `q_proj`/`k_proj` handoffs.
+3. With `ulysses_degree=1` and `load_balance=True`, the asynchronous variant falls back to synchronous Colossal CP.
 
 ## DSA CP
 
-DSA 这里指 DeepSeek Sparse Attention。DSA CP 不是通用 attention 的替代实现，而是给 DSA 的 indexer、sparse attention 和 indexer-loss 模块边界准备 DTensor placement。边界实现负责消费转换后的 DTensor 或 local tensor 输入。
+DSA means DeepSeek Sparse Attention here. DSA CP prepares DTensor placements at indexer, sparse attention, and indexer-loss module boundaries, rather than replacing general attention. The boundary implementation consumes the transformed DTensor or local tensor inputs.
 
-DSA CP 当前只支持 `mode="colossal"`，`mode="ulysses"` 会直接报错。支持的输入布局为：
+DSA CP currently supports only `mode="colossal"`; `mode="ulysses"` raises an error. Supported input layouts:
 
-| `layout` | 序列维 |
+| `layout` | Sequence dimension |
 |----------|--------|
 | `"BSND"` | `seq_dim=1` |
 | `"TND"` | `seq_dim=0` |
 
-DSA style 会把传入的 `device_mesh` 当作 1-D CP mesh 使用；如果传入多维 mesh，会先按 rank list flatten。DSA CP 不走 Ulysses/Hybrid head sharding。
+DSA styles treat the supplied `device_mesh` as a 1-D CP mesh. Multidimensional meshes are first flattened by rank list. DSA CP does not use Ulysses/Hybrid head sharding.
 
-各 DSA style 默认按位置参数改写输入，也可以通过 `*_kwarg_name` 适配关键字参数。
+DSA styles rewrite positional inputs by default; `*_kwarg_name` parameters adapt them to keyword arguments.
 
-| Style | 默认 forward 边界 | Query 侧 placement | Key 侧 placement |
+| Style | Default forward boundary | Query-side placement | Key-side placement |
 |-------|-------------------|--------------------|------------------|
-| `DSAIndexerContextParallel` | `(query, key, weights, ...)` | `query`、`weights` -> `Shard(seq)` | `key` -> `Replicate()` |
-| `DSASparseAttentionContextParallel` | `(query, key, value, topk_indices, query_rope, key_rope, ...)` | `query`、`topk_indices`、`query_rope` -> `Shard(seq)` | `key`、`value`、`key_rope` -> `Replicate()` |
-| `DSAIndexerLossContextParallel` | `(query, key, query_index, key_index, weights, topk_indices, softmax_max, softmax_sum, query_rope, key_rope, ...)` | `query`、`query_index`、`weights`、`topk_indices`、`query_rope` -> `Shard(seq)` | `key`、`key_index`、`key_rope` -> `Replicate()` |
+| `DSAIndexerContextParallel` | `(query, key, weights, ...)` | `query`, `weights` -> `Shard(seq)` | `key` -> `Replicate()` |
+| `DSASparseAttentionContextParallel` | `(query, key, value, topk_indices, query_rope, key_rope, ...)` | `query`, `topk_indices`, `query_rope` -> `Shard(seq)` | `key`, `value`, `key_rope` -> `Replicate()` |
+| `DSAIndexerLossContextParallel` | `(query, key, query_index, key_index, weights, topk_indices, softmax_max, softmax_sum, query_rope, key_rope, ...)` | `query`, `query_index`, `weights`, `topk_indices`, `query_rope` -> `Shard(seq)` | `key`, `key_index`, `key_rope` -> `Replicate()` |
 
-同步 DSA 用法：
+Synchronous DSA usage:
 
 ```python
 from hyper_parallel import DSASparseAttentionContextParallel
@@ -148,7 +150,7 @@ from hyper_parallel import DSASparseAttentionContextParallel
 DSASparseAttentionContextParallel(layout="BSND").apply(sparse_attention_boundary, cp_mesh)
 ```
 
-异步 DSA 用法：
+Asynchronous DSA usage:
 
 ```python
 from hyper_parallel import AsyncDSASparseAttentionContextParallel
@@ -162,11 +164,11 @@ AsyncDSASparseAttentionContextParallel(layout="BSND").apply(
 )
 ```
 
-异步 DSA 的 handoff 模块用于提前发起 key/value 侧 sequence all-gather。没有传对应 handoff 时，该输入会在 consumer 边界走同步 gather，输出 placement 与同步 DSA style 保持一致。
+Asynchronous DSA handoff modules initiate key/value sequence all-gather early. Without a corresponding handoff, that input uses a synchronous gather at the consumer boundary. Output placements match the synchronous DSA style.
 
-## 与 TP/FSDP/PP 组合
+## Combine with TP/FSDP/PP
 
-CP 应使用多维 mesh 中的 CP 子 mesh；TP、FSDP、PP 分别使用自己的子 mesh。Llama3 示例中通常先在 TP mesh 上对 projection/MLP 做 TP，再把 CP 挂到每层 attention 的 `sdpa_core`。
+CP should use the CP submesh of a multidimensional mesh; TP, FSDP, and PP use their respective submeshes. Llama3 examples typically apply TP to projections/MLPs first, then attach CP to each attention layer's `sdpa_core`.
 
 ```python
 from hyper_parallel import ContextParallel, init_device_mesh, parallelize_module
@@ -186,9 +188,9 @@ for layer in model.layers:
     )
 ```
 
-当 Q/K/V 已经是 TP DTensor 时，CP 会在内部临时组合 CP + TP mesh 执行通信。`use_local_output=False` 时，输出会去掉 CP 维并恢复成原来的非 CP layout，例如 TP head shard；`use_local_output=True` 时则返回 local tensor。
+When Q/K/V are already TP DTensors, CP temporarily combines CP and TP meshes internally for communication. With `use_local_output=False`, output drops the CP dimension and restores the original non-CP layout, such as TP head sharding. With `use_local_output=True`, it returns a local tensor.
 
-与 FSDP 组合时，CP 并行必须放到 FSDP 上：FSDP 使用的 mesh 必须由 `mesh[("dp_shard", "cp")]` flatten 成一维 `fsdp_mesh`，不能直接传二维 `mesh[("dp_shard", "cp")]`，也不能只用纯 `dp_shard` 子 mesh。这样 CP 的反向梯度才能由 FSDP 管理。代码顺序上先挂 CP hook，再执行 FSDP；推荐顺序是 TP -> CP -> FSDP。
+When combined with FSDP, the CP dimension must be included in FSDP: flatten `mesh[("dp_shard", "cp")]` into a 1-D `fsdp_mesh`. Do not pass the 2-D `mesh[("dp_shard", "cp")]` directly or use only `dp_shard`. This allows FSDP to manage CP backward gradients. Attach CP hooks before applying FSDP; the recommended order is TP -> CP -> FSDP.
 
 ```python
 mesh = init_device_mesh(
@@ -212,13 +214,13 @@ for layer in model.layers:
 fully_shard(model, mesh=fsdp_mesh)
 ```
 
-PP 场景下仍在各 stage 内按上述规则组合 FSDP 与 CP：先将 `dp_shard + cp` flatten 为一维 FSDP mesh，再在 stage 内先挂 CP 后执行 FSDP。CP hooks 不替代 FSDP 的参数/梯度管理，也不负责 pipeline stage 调度。
+With PP, combine FSDP and CP within each stage using the same rules: flatten `dp_shard + cp` into a 1-D FSDP mesh, then attach CP before applying FSDP inside the stage. CP hooks do not replace FSDP parameter/gradient management or schedule pipeline stages.
 
-## 常见检查项
+## Common Checks
 
-1. 每个 CP rank 输入的是本地序列切片，通常需要满足 `seq_len % cp_size == 0`。
-2. Pure Ulysses 要满足 `num_heads % cp_size == 0`；Hybrid 要满足 `cp_size % ulysses_degree == 0` 和 `num_heads % ulysses_degree == 0`。
-3. `seq_dim`、`head_dim` 必须匹配实际 Q/K/V 布局，BSHD 与 BNSD 不要混用。
-4. attention forward 中 Q/K/V 不在前三个位置参数时，需要配置 `qkv_indices` 或 `qkv_kwarg_names`。
-5. DSA style 只支持 `layout="BSND"` 或 `"TND"`，且只支持 `mode="colossal"`。
-6. Async CP 的 projection/handoff 模块要贴近 consumer 边界；中间存在额外 tensor 变换时，应把变换后的最后一个模块作为 handoff。
+1. Each CP rank receives a local sequence slice, typically requiring `seq_len % cp_size == 0`.
+2. Pure Ulysses requires `num_heads % cp_size == 0`; Hybrid requires `cp_size % ulysses_degree == 0` and `num_heads % ulysses_degree == 0`.
+3. `seq_dim` and `head_dim` must match the actual Q/K/V layout; do not mix BSHD and BNSD conventions.
+4. Configure `qkv_indices` or `qkv_kwarg_names` when Q/K/V are not the first three positional arguments in attention forward.
+5. DSA styles support only `layout="BSND"` or `"TND"`, and only `mode="colossal"`.
+6. Async CP projection/handoff modules must be close to the consumer boundary. If additional tensor transformations intervene, use the last module after those transformations as the handoff.

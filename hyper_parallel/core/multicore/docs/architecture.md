@@ -1,50 +1,52 @@
-# Multicore MoE-FFN 架构设计
+# Multicore MoE-FFN Architecture Design
+
+**English** | [简体中文](architecture.zh.md)
 
 ---
 
-## 1. 背景与融合思路
+## 1. Background and Fusion Approach
 
-### 1.1 问题
+### 1.1 Problem
 
-标准 MoE-FFN 正向计算流程为：
+The standard MoE-FFN forward flow is:
 
 ```text
 AllToAll-Dispatch → GMM1(up_proj) → SwiGLU → GMM2(down_proj) → AllToAll-Combine
 ```
 
-每个算子是独立的 NPU kernel，算子之间存在大量 HBM 读写（激活值中间结果落盘再读回）。
-在 Expert Parallel（EP）场景下，AllToAll 通信与 GMM 计算通常串行执行，造成大量空闲等待。
+Each operator is a separate NPU kernel, with substantial HBM traffic between operators as intermediate activations are written and read back.
+With Expert Parallelism (EP), AllToAll communication and GMM computation usually execute serially, creating substantial idle time.
 
-实测数据（昇腾 A3，DeepSeek-V3 规模 MoE 负载）：
+Measured results on Ascend A3 with a DeepSeek-V3-scale MoE workload:
 
-| 指标 | 测量值 |
+| Metric | Measurement |
 |---|---|
-| Cube 核平均 MAC 利用率 | ~54%（离理论峰值差距显著） |
-| 关键路径 Vector 核执行时间 | ~18%（SwiGLU 等，此时 Cube 全闲） |
-| AllToAll 通信占端到端时间 | ~17%（其中 61% 被 GEMM 掩盖，39% 暴露） |
-| Cube/Vector 相互空闲 | 两类核轮流空转，任一时刻只有一类核工作 |
+| Average Cube MAC utilization | ~54%, significantly below theoretical peak |
+| Critical-path Vector execution time | ~18%, for operations such as SwiGLU while Cube cores are idle |
+| AllToAll share of end-to-end time | ~17%, with 61% hidden by GEMM and 39% exposed |
+| Mutual Cube/Vector idleness | The two core types alternate; only one type works at any instant |
 
-根因分析：GroupedGEMM 只使用 Cube 核，Vector 核在 GMM 执行期间全部空闲；SwiGLU 由 Vector 核执行时 Cube 全部空转；AllToAll 由 HOST 驱动，通信空窗期设备内 AIC 和 AIV 也无法计算。
+Root cause: GroupedGEMM uses only Cube cores, leaving Vector cores idle. SwiGLU runs on Vector cores while Cube cores idle. Host-driven AllToAll leaves both AIC and AIV unable to compute during communication gaps.
 
-### 1.2 融合方案
+### 1.2 Fusion Approach
 
-Multicore MoE-FFN 将上述五个算子**融合为一个 kernel**，由 AIC（AI Cube）和 AIV（AI Vector）核同时执行：
+Multicore MoE-FFN **fuses the five operators into one kernel**, executed concurrently by AIC (AI Cube) and AIV (AI Vector) cores:
 
-- **AIV 核**负责 AllToAll 通信（dispatch / combine）和 SwiGLU
-- **AIC 核**负责 GMM1、GMM2（矩阵乘）
-- 核间通过**共享内存 + 事件信号量**流水线协调，实现通信与计算的**细粒度重叠**
+- **AIV cores** handle AllToAll dispatch/combine and SwiGLU.
+- **AIC cores** handle GMM1 and GMM2 matrix multiplication.
+- **Shared memory and event semaphores** coordinate the pipeline across cores for **fine-grained compute-communication overlap**.
 
-关键收益：
+Key benefits:
 
-- 通过单 kernel 调度减少 host launch 和同步边界，使通信、GMM 与 Vector 计算按 tile 重叠
-- 通信与计算深度重叠，提升硬件利用率
-- 正向、反向均适用，支持端到端训练
+- A single kernel reduces host launches and synchronization boundaries, overlapping communication, GMM, and Vector computation by tile.
+- Deep compute-communication overlap improves hardware utilization.
+- Applies to forward and backward for end-to-end training.
 
 ### 1.3 RATR：Rank-Aware Tile Reordering
 
-在多卡 AllToAll 场景下，各 Rank 同时向同一目标 Rank 发送数据会造成网络拥塞，导致尾延迟暴露。RATR 通过调整 AllToAll Tile 的执行顺序，使发往不同 Rank 的通信流量在时间轴上均匀分散，避免多源 Rank 同时涌向同一目标。RATR 不修改任何计算逻辑，仅对 `vector_task_indexs` 中 AllToAll Tile 重排，与静态调度配置一起在 RuntimeConfig 中离线生成，运行时零开销。
+In multi-device AllToAll, simultaneous sends from multiple ranks to one destination cause congestion and expose tail latency. Rank-Aware Tile Reordering (RATR) changes AllToAll tile order to distribute destination traffic over time and avoid converging bursts. It changes no computation: only AllToAll tiles in `vector_task_indexs` are reordered. RATR and static schedules are generated offline in RuntimeConfig, adding no runtime overhead.
 
-反向计算流程（同理融合）：
+Backward computation is fused similarly:
 
 ```text
 AllToAll-Dispatch → ┌─ GMM1(act_grad) ──────────────────────┐
@@ -54,127 +56,127 @@ AllToAll-Dispatch → ┌─ GMM1(act_grad) ────────────
                                                                                 └─ GMM3(w1_grad)
 ```
 
-GMM1 与 GMM4 并行，AllToAll-Combine 与 GMM3 并行，进一步减少空闲等待。
+GMM1 runs concurrently with GMM4, and AllToAll-Combine with GMM3, further reducing idle time.
 
 ---
 
-## 2. 目录结构
+## 2. Directory Structure
 
-### 2.1 设计原则
+### 2.1 Design Principles
 
-本框架针对昇腾 A3/A2 NPU 的 AIC/AIV 双路硬件特点制定如下分层规则：
+The framework uses the following layers for the AIC/AIV hardware on Ascend A3/A2 NPUs:
 
-| 层次 | Python 模块 | C++ 模块 | 职责 | 不包含 |
+| Layer | Python module | C++ module | Responsibility | Excludes |
 |---|---|---|---|---|
-| **图层** | `scheduler/graph.py` | — | 算子拓扑、切分规则、形状推导 | 任何算子特定参数 |
-| **运行时层** | `scheduler/config.py` `scheduler/scheduler.py` | — | TaskDesc 生成、事件图、RATR 优化 | 框架 / 编译细节 |
-| **任务层** | `tasks/` | — | 每类算子的 FillConfig（填充策略） | 调度核心逻辑 |
-| **模块层** | `modules/<op>/` | — | 具体 DAG + CLI 数据生成 | C++ / 框架代码 |
-| **调度器层** | — | `ops/runtime/` | 通用 AIC/AIV 事件同步原语 | 计算核实现 |
-| **算子层** | — | `ops/<op_name>/` | 算子特有计算核 + KernelWorker 调度循环 | 跨算子共享逻辑 |
-| **Torch binding** | `torch/` | `torch/csrc/` | Torch 算子注册 | 图与调度逻辑 |
+| **Graph** | `scheduler/graph.py` | — | Operator topology, split rules, shape inference | Operator-specific parameters |
+| **Runtime** | `scheduler/config.py` `scheduler/scheduler.py` | — | TaskDesc generation, event graphs, RATR optimization | Framework/compiler details |
+| **Task** | `tasks/` | — | Per-operator FillConfig strategies | Core scheduling logic |
+| **Module** | `modules/<op>/` | — | Concrete DAGs and CLI data generation | C++/framework code |
+| **Scheduler** | — | `ops/runtime/` | Generic AIC/AIV event synchronization primitives | Compute kernel implementations |
+| **Operator** | — | `ops/<op_name>/` | Operator-specific kernels and KernelWorker loops | Shared cross-operator logic |
+| **Torch binding** | `torch/` | `torch/csrc/` | Torch operator registration | Graph and scheduling logic |
 
-### 2.2 核心运行时目录
+### 2.2 Core Runtime Directories
 
 ```text
 multicore/
 ├── __init__.py
-├── _loader.py                      # 首次调用时定位 payload、校验 OPP 并加载框架 adapter
+├── _loader.py                      # Locate payload, validate OPP, and load the framework adapter on first use.
 │
-├── scheduler/                       # Python 编译器核心（无算子特化）
+├── scheduler/                       # Python compiler core, without operator specialization.
 │   ├── __init__.py
 │   ├── config.py                    # TaskSplitValue + init_task_split_value
-│   │                                # + 全部 ctypes structs（RuntimeConfigC 等）
+│   │                                # All ctypes structs, including RuntimeConfigC.
 │   ├── graph.py                     # ComputeGraph / OperatorNode / TensorSpec
 │   │                                # SplitSpec / OpType / propagate_splits()
 │   ├── builder.py                   # build_runtime_config(graph, tsv, rank_id)
 │   ├── scheduler.py                 # revise_task_queue() / revise_gmm_task_queue_bwd()
-│   └── allocator.py                 # param_position 自动分配（预留）
+│   └── allocator.py                 # Automatic param_position allocation (reserved).
 │
-├── tasks/                           # 任务类型注册与填充策略
+├── tasks/                           # Task type registration and fill strategies.
 │   ├── __init__.py
-│   ├── task_base.py                 # FillConfig (ABC): fill(cfg, op, tsv) 接口
+│   ├── task_base.py                 # FillConfig ABC: fill(cfg, op, tsv).
 │   ├── alltoall.py                  # AllToAllFillConfig（dispatch / combine）
-│   ├── gmm.py                       # GmmFillConfig（各变体）
+│   ├── gmm.py                       # GmmFillConfig variants.
 │   ├── swiglu.py                    # SwiGLUFillConfig + SwiGLUGradFillConfig
 │   ├── utils.py                     # advance_tsv_* / add_terminate / add_dynamic_data
-│   ├── tiling.py                    # 全局 tiling 字节注册表
-│   └── registry.py                  # FILL_CONFIG_REGISTRY 字典
+│   ├── tiling.py                    # Global tiling byte registry.
+│   └── registry.py                  # FILL_CONFIG_REGISTRY dictionary.
 │
-├── modules/                         # 算子模块层（图定义 + CLI 数据生成）
+├── modules/                         # Operator modules: graph definitions and CLI data generation.
 │   └── mega_moe/
 │       ├── forward/
 │       │   ├── graph.py             # build_forward_graph(tsv, ...) → ComputeGraph
-│       │   ├── gen_runtime_data.py  # CLI: --tp/--ep/... 生成 *.bin 文件
-│       │   └── tiling_tables.py     # GMM/SwiGLU tiling 参数表
+│       │   ├── gen_runtime_data.py  # CLI: --tp/--ep/... generates *.bin files.
+│       │   └── tiling_tables.py     # GMM/SwiGLU tiling parameter tables.
 │       └── backward/
 │           ├── graph.py             # build_backward_graph(tsv, ...) → ComputeGraph
 │           ├── gen_runtime_data.py
 │           └── tiling_tables.py
 │
-├── ops/                             # C++ CANN AscendC 算子实现
-│   ├── runtime/                     # ⭐ 通用共享层（build 时拷入各 op_kernel/runtime/）
-│   │   ├── runtime_config.hpp       # 共享常量 + struct 定义（TaskDesc / EventDesc / TaskType 等）
-│   │   └── worker_kernel.h          # KernelWorkerBase<Derived> CRTP 基类
+├── ops/                             # C++ CANN AscendC implementations.
+│   ├── runtime/                     # Shared layer copied into each op_kernel/runtime/ during builds.
+│   │   ├── runtime_config.hpp       # Shared constants and structs: TaskDesc / EventDesc / TaskType.
+│   │   └── worker_kernel.h          # KernelWorkerBase<Derived> CRTP base class.
 │   │
-│   ├── hyper_mega_moe/              # MoE FFN 正向算子
-│   │   ├── op_host/                 # 主机侧：infershape / tiling / API
-│   │   └── op_kernel/               # 设备侧
-│   │       ├── hyper_mega_moe.cpp  # kernel 入口（include worker_kernel.cpp）
+│   ├── hyper_mega_moe/              # MoE FFN forward operator.
+│   │   ├── op_host/                 # Host-side shape inference, tiling, and APIs.
+│   │   └── op_kernel/               # Device side.
+│   │       ├── hyper_mega_moe.cpp  # Kernel entry point including worker_kernel.cpp.
 │   │       ├── hyper_mega_moe_tiling_key.h
-│   │       ├── worker_kernel.cpp    # KernelWorker（fwd 特化：tiling@[23], event@[24]）
+│   │       ├── worker_kernel.cpp    # Forward KernelWorker specialization: tiling@[23], event@[24].
 │   │       │                        # #include "runtime/worker_kernel.h"
-│   │       ├── swi_glu/             # 仅隔离构建树：从 ops-nn 拷入
-│   │       ├── grouped_matmul/      # 仅隔离构建树：从 ops-transformer 拷入
+│   │       ├── swi_glu/             # Isolated build tree only: copied from ops-nn.
+│   │       ├── grouped_matmul/      # Isolated build tree only: copied from ops-transformer.
 │   │       ├── put_mem_signal/
-│   │       │   └── put_mem_signal_kernel.cpp  # 自包含；DTYPE_DISPATCH_TARGET 实例化
-│   │       └── runtime/             # 构建时由源码组装器从 ops/runtime/ 拷入
+│   │       │   └── put_mem_signal_kernel.cpp  # Self-contained DTYPE_DISPATCH_TARGET instantiation.
+│   │       └── runtime/             # Copied from ops/runtime/ by the source assembler.
 │   │           ├── runtime_config.hpp
 │   │           └── worker_kernel.h
 │   │
-│   └── hyper_mega_moe_grad/         # MoE FFN 反向算子（结构同上）
+│   └── hyper_mega_moe_grad/         # MoE FFN backward operator, structured as above.
 │       ├── op_host/
 │       └── op_kernel/
 │           ├── hyper_mega_moe_grad.cpp
 │           ├── hyper_mega_moe_grad_tiling_key.h
-│           ├── worker_kernel.cpp    # KernelWorker（bwd 特化：tiling@[30], event@[31]）
+│           ├── worker_kernel.cpp    # Backward KernelWorker specialization: tiling@[30], event@[31].
 │           ├── swi_glu/
 │           ├── swi_glu_grad/
 │           ├── grouped_matmul/
 │           ├── put_mem_signal/
-│           │   └── put_mem_signal_kernel.cpp  # 自包含；DTYPE_DY 实例化
-│           └── runtime/             # build 时拷入
+│           │   └── put_mem_signal_kernel.cpp  # Self-contained DTYPE_DY instantiation.
+│           └── runtime/             # Copied during build.
 │               ├── runtime_config.hpp
 │               └── worker_kernel.h
 │
 ├── torch/                          # CMakeLists.txt + csrc/ + ops.py
-└── shmem/                          # 私有 Torch 单边通信与构建
+└── shmem/                          # Private Torch one-sided communication and build support.
 ```
 
-### 2.3 核心模块说明
+### 2.3 Core Modules
 
-#### scheduler/graph.py — 计算图层
+#### scheduler/graph.py — Computation Graph
 
-提供三个核心抽象：
+Three core abstractions:
 
-- **TensorSpec**：描述一个张量（shape、dtype、param_position、split_dim、is_dynamic、transpose）
-- **SplitSpec**：声明该算子如何切分（split_inputs、task_num_fn、split_output_dims）
-- **ComputeGraph**：DAG 管理器，`propagate_splits(tsv)` 按拓扑序自动计算每个节点的 task_num 和 split_dim
+- **TensorSpec**: Describes a tensor's shape, dtype, param_position, split_dim, is_dynamic, and transpose.
+- **SplitSpec**: Declares operator splitting through split_inputs, task_num_fn, and split_output_dims.
+- **ComputeGraph**: DAG manager whose `propagate_splits(tsv)` computes each node's task_num and split_dim in topological order.
 
-#### scheduler/config.py — 配置与拓扑参数
+#### scheduler/config.py — Configuration and Topology
 
-`TaskSplitValue` 封装拓扑超参数（tp、ep、seq_size、all_expert_num、top_k）和运行时计数器。
+`TaskSplitValue` encapsulates topology hyperparameters (tp, ep, seq_size, all_expert_num, top_k) and runtime counters.
 
-`RuntimeConfigC` 定义 64 字节的公共 header；`scheduler/runtime.py` 为每个图创建子类，追加按实际容量分配的
-task、queue 和 event 数组。Host 与 Device 使用同一套 dense 布局，TaskDesc 为 576 字节。
-所有图均使用此结构，不区分大小图，不包含旧格式分支、magic 或 version 字段。
+`RuntimeConfigC` defines a 64-byte common header. `scheduler/runtime.py` creates a subclass per graph, appending task,
+queue, and event arrays sized to actual capacity. Host and device share the same dense layout; TaskDesc is 576 bytes.
+All graphs use this structure regardless of size, without legacy-format branches, magic, or version fields.
 
-#### tasks/ — 任务填充策略层
+#### tasks/ — Task Fill Strategies
 
-每个文件对应一类算子任务类型，实现 `FillConfig.fill(cfg, op, tsv)` 接口，向 `RuntimeConfigC` 的
-`all_tasks[]`、task index 数组和 `all_event_num_triggers[]` 写入任务与事件关系。
+Each file implements one operator task type through `FillConfig.fill(cfg, op, tsv)`, writing task/event relationships into
+`RuntimeConfigC`'s `all_tasks[]`, task index arrays, and `all_event_num_triggers[]`.
 
-注册机制（`registry.py`）：
+Registration in `registry.py`:
 
 ```python
 FILL_CONFIG_REGISTRY: Dict[OpType, Type[FillConfig]] = {
@@ -185,75 +187,75 @@ FILL_CONFIG_REGISTRY: Dict[OpType, Type[FillConfig]] = {
 }
 ```
 
-新增算子只需在此字典中添加一行，无需修改核心调度逻辑。
+Adding an operator requires only one dictionary entry, without changing core scheduling logic.
 
-#### ops/runtime/ — C++ 通用共享层
+#### ops/runtime/ — Shared C++ Layer
 
-| 文件 | 职责 |
+| File | Responsibility |
 |---|---|
-| `runtime_config.hpp` | 共享数据结构：`RuntimeHeader`、`TaskDesc`、`EventDesc`、`TaskType` 枚举、所有 accessor 函数 |
-| `worker_kernel.h` | `KernelWorkerBase<Derived>` CRTP 基类，含 `Process()`、`WaitForDependency()`、`TriggerEvent()` |
+| `runtime_config.hpp` | Shared structures: `RuntimeHeader`, `TaskDesc`, `EventDesc`, `TaskType`, and accessors |
+| `worker_kernel.h` | `KernelWorkerBase<Derived>` CRTP base with `Process()`, `WaitForDependency()`, and `TriggerEvent()` |
 
-**关键**：`ops/runtime/` 不会直接参与编译。[源码组装器](../_build/assemble_multicore_source.py)
-在隔离的临时源码树中，将整个 `runtime/` 目录分别拷贝到
-`hyper_mega_moe/op_kernel/runtime/` 和 `hyper_mega_moe_grad/op_kernel/runtime/`，使各算子
-`worker_kernel.cpp` 可以用 `#include "runtime/worker_kernel.h"` 访问共享定义。仓内业务源码和上游依赖源码
-均不会被原地修改。
+**Key point**: `ops/runtime/` is not compiled directly. The [source assembler](../_build/assemble_multicore_source.py)
+copies the complete `runtime/` directory into
+`hyper_mega_moe/op_kernel/runtime/` and `hyper_mega_moe_grad/op_kernel/runtime/` in an isolated temporary source tree, allowing each operator's
+`worker_kernel.cpp` to access shared definitions through `#include "runtime/worker_kernel.h"`. Neither repository business sources nor upstream dependencies
+are modified in place.
 
-#### ops/<op_name>/op_kernel/worker_kernel.cpp — 算子调度循环
+#### ops/<op_name>/op_kernel/worker_kernel.cpp — Operator Scheduling Loop
 
-每个算子保留自己的 `KernelWorker` 类，原因是 `input_list` 索引硬编码不同：
+Each operator retains its own `KernelWorker` because its hard-coded `input_list` indices differ:
 
-| | mega_moe（正向）| mega_moe_grad（反向）|
+| | mega_moe (forward) | mega_moe_grad (backward) |
 |---|---|---|
-| tiling 参数 | `input_list[23]` | `input_list[30]` |
-| event 计数器 | `input_list[24]` | `input_list[31]` |
+| Tiling parameters | `input_list[23]` | `input_list[30]` |
+| Event counters | `input_list[24]` | `input_list[31]` |
 | GMM workspace | `input_list[11]` | `input_list[25]` |
 | SwiGLU grad workspace | — | `input_list[26]` |
-| 特有计算核 | `TASK_SWI_GLU` | `TASK_SWI_GLU_GRAD` |
+| Specific compute kernel | `TASK_SWI_GLU` | `TASK_SWI_GLU_GRAD` |
 
-### 2.4 数据流总览
+### 2.4 Data Flow Overview
 
 ```text
-用户 (Python)
+User (Python)
     ↓ build_forward_graph(tsv)
 ComputeGraph [modules/mega_moe/forward/graph.py]
     ↓ propagate_splits(tsv)
-各 OperatorNode 的 task_num / split_dim 被自动填充
+Each OperatorNode's task_num / split_dim is populated automatically.
     ↓ build_runtime_config(graph, tsv, rank_id)
-    ↓  → 多态调用各 FillConfig.fill()
-    ↓  → RATR / GMM 交错优化
-RuntimeConfigC (ctypes) → 序列化为 runtime_config_rank_*.bin
+    ↓  → Polymorphic FillConfig.fill() calls.
+    ↓  → RATR / GMM interleaving optimization.
+RuntimeConfigC (ctypes) → Serialize to runtime_config_rank_*.bin.
                                       ↓
-                          C++ worker_kernel 读取
+                          Read by C++ worker_kernel.
                                       ↓
-                    KernelWorker::Process() 主调度循环
-                    AIC（偶数 block）→ cube_task_indexs → GMM
-                    AIV（奇数 block）→ vector_task_indexs → SwiGLU/AllToAll
-                    事件同步：WaitForDependency / TriggerEvent
+                    KernelWorker::Process() main scheduling loop.
+                    AIC (even blocks) → cube_task_indexs → GMM.
+                    AIV (odd blocks) → vector_task_indexs → SwiGLU/AllToAll.
+                    Event synchronization: WaitForDependency / TriggerEvent.
 ```
 
 ---
 
-## 3. 正向算子
+## 3. Forward Operator
 
-### 3.1 计算流图
+### 3.1 Computation Graph
 
 ```text
 dispatch ──► up_proj (GMM1) ──► swiglu ──► down_proj (GMM2) ──► combine
 ```
 
-| 算子 | 类型 | 执行核 | 说明 |
+| Operator | Type | Core | Description |
 |---|---|---|---|
-| dispatch | AllToAll | AIV | 将 token 按 expert 路由分发到各 rank |
+| dispatch | AllToAll | AIV | Route tokens to ranks by expert |
 | up_proj | GroupedMatmul | AIC | `[tokens, hidden] × [E, hidden, intermediate*2]` |
-| swiglu | SwiGLU | AIV | `silu(gate) * up`，输出 `[tokens, intermediate]` |
+| swiglu | SwiGLU | AIV | `silu(gate) * up`, producing `[tokens, intermediate]` |
 | down_proj | GroupedMatmul | AIC | `[tokens, intermediate] × [E, intermediate, hidden]` |
-| combine | AllToAll | AIV | 将 expert 结果汇聚回原始 rank |
+| combine | AllToAll | AIV | Gather expert outputs back to their original ranks |
 
-### 3.2 Task 切分参数
+### 3.2 Task Split Parameters
 
-| 算子 | split_value | 执行核 | task_num 计算 |
+| Operator | split_value | Core | task_num calculation |
 |---|---|---|---|
 | dispatch | 128 | AIV | `all_expert_num × (per_expert_seq_to_other // 128)` |
 | up_proj | 4096 | AIC | `num_cube_cores × single_rank_expert_num` |
@@ -261,21 +263,21 @@ dispatch ──► up_proj (GMM1) ──► swiglu ──► down_proj (GMM2) �
 | down_proj | 4096 | AIC | `num_cube_cores × single_rank_expert_num` |
 | combine | 128 | AIV | `all_expert_num × (per_expert_seq_to_other // 128)` |
 
-### 3.3 Tiling 文件（正向，各 rank 共用）
+### 3.3 Tiling Files (Forward, Shared Across Ranks)
 
-| 文件 | 参数位置 | 说明 |
+| File | Parameter position | Description |
 |---|---|---|
-| `up_proj_tiling.bin` | pos 17 | GMM1 tiling，大小 = `num_cube_cores × tiling_entry_size` |
-| `swiglu_tiling.bin` | pos 18 | SwiGLU tiling，大小 = `(2×num_cube_cores+1) × entry_size` |
+| `up_proj_tiling.bin` | pos 17 | GMM1 tiling; size = `num_cube_cores × tiling_entry_size` |
+| `swiglu_tiling.bin` | pos 18 | SwiGLU tiling; size = `(2×num_cube_cores+1) × entry_size` |
 | `down_proj_tiling.bin` | pos 19 | GMM2 tiling |
 
-生成方式见第 6.1 节。
+See §6.1 for generation.
 
 ---
 
-## 4. 反向算子
+## 4. Backward Operator
 
-### 4.1 计算流图
+### 4.1 Computation Graph
 
 ```text
 dispatch ──► act_grad (GMM1) ──────────────────────────────────────────────────────────┐
@@ -285,179 +287,179 @@ dispatch ──► act_grad (GMM1) ───────────────
                                                                                      └── w1_grad (GMM3)
 ```
 
-| 算子 | 映射 | 输入 | 输出 |
+| Operator | Mapping | Inputs | Outputs |
 |---|---|---|---|
-| dispatch | AllToAll | `dy`（输入梯度） | `dispatch_target`（分发后梯度） |
-| act_grad (GMM1) | `dispatch_target @ w2.T` | `dispatch_target`, `w2` | `act_grad_y`（激活梯度） |
-| w2_grad (GMM4) | `hidden.T @ dispatch_target` | `hidden`（正向 SwiGLU 输出）, `dispatch_target` | `hidden_dw`（W2 权重梯度） |
-| swiglu_grad | SwiGLU backward | `act_grad_y`, `gate`（正向 up_proj_y） | `grad_gate`（SwiGLU 梯度） |
-| gate_grad (GMM2) | `grad_gate @ w1.T` | `grad_gate`, `w1` | `gate_dx`（combine 前梯度） |
-| w1_grad (GMM3) | `permute_out.T @ grad_gate` | `permute_out`（正向 dispatch_target）, `grad_gate` | `gate_dw`（W1 权重梯度） |
-| combine | AllToAll | `gate_dx` | `grad_x`（汇聚后梯度） |
+| dispatch | AllToAll | `dy` (input gradient) | `dispatch_target` (dispatched gradient) |
+| act_grad (GMM1) | `dispatch_target @ w2.T` | `dispatch_target`, `w2` | `act_grad_y` (activation gradient) |
+| w2_grad (GMM4) | `hidden.T @ dispatch_target` | `hidden` (forward SwiGLU output), `dispatch_target` | `hidden_dw` (W2 gradient) |
+| swiglu_grad | SwiGLU backward | `act_grad_y`, `gate` (forward up_proj_y) | `grad_gate` (SwiGLU gradient) |
+| gate_grad (GMM2) | `grad_gate @ w1.T` | `grad_gate`, `w1` | `gate_dx` (pre-combine gradient) |
+| w1_grad (GMM3) | `permute_out.T @ grad_gate` | `permute_out` (forward dispatch_target), `grad_gate` | `gate_dw` (W1 gradient) |
+| combine | AllToAll | `gate_dx` | `grad_x` (combined gradient) |
 
-### 4.2 并行执行说明
+### 4.2 Parallel Execution
 
-- **act_grad（GMM1）与 w2_grad（GMM4）并行**：两者均依赖 dispatch 输出 `target`；GMM1 使用 `advance_mode="cube_only"`（只推进 task 计数，不推进 event），GMM4 使用 `advance_mode="cube_custom"` 统一推进 event，避免重复计数。
+- **act_grad (GMM1) and w2_grad (GMM4) overlap**: Both depend on dispatch output `target`. GMM1 uses `advance_mode="cube_only"` to advance task counts without events; GMM4 uses `advance_mode="cube_custom"` to advance events centrally and avoid double counting.
 
-- **combine 与 w1_grad（GMM3）并行**：两者均依赖 gate_grad（GMM2）输出；combine 使用 `advance_mode="vector_only"`，GMM3 使用 `cube_custom` 处理 event。
+- **combine and w1_grad (GMM3) overlap**: Both depend on gate_grad (GMM2). Combine uses `advance_mode="vector_only"`; GMM3 uses `cube_custom` for events.
 
-### 4.3 Tiling 文件（反向，各 rank 共用）
+### 4.3 Tiling Files (Backward, Shared Across Ranks)
 
-| 文件 | 参数名 | 说明 |
+| File | Parameter name | Description |
 |---|---|---|
-| `act_grad_tiling.bin` | `act_grad_tiling` | GMM1 反向 tiling（dispatch_target @ W2.T） |
-| `gate_grad_tiling.bin` | `gate_grad_tiling` | GMM2 反向 tiling（grad_gate @ W1.T） |
-| `w1_grad_tiling.bin` | `w1_grad_tiling` | GMM3（W1 权重梯度）tiling |
-| `w2_grad_tiling.bin` | `w2_grad_tiling` | GMM4（W2 权重梯度）tiling |
-| `swiglu_grad_tiling.bin` | `swiglu_grad_tiling` | SwiGLU 反向 tiling |
+| `act_grad_tiling.bin` | `act_grad_tiling` | GMM1 backward tiling (dispatch_target @ W2.T) |
+| `gate_grad_tiling.bin` | `gate_grad_tiling` | GMM2 backward tiling (grad_gate @ W1.T) |
+| `w1_grad_tiling.bin` | `w1_grad_tiling` | GMM3 W1-gradient tiling |
+| `w2_grad_tiling.bin` | `w2_grad_tiling` | GMM4 W2-gradient tiling |
+| `swiglu_grad_tiling.bin` | `swiglu_grad_tiling` | SwiGLU backward tiling |
 
-生成方式见第 6.2 节。
+See §6.2 for generation.
 
 ---
 
-## 5. Task 切分设计
+## 5. Task Splitting Design
 
 ### 5.1 TaskSplitValue
 
-`TaskSplitValue` 封装硬件拓扑参数和运行时计数器：
+`TaskSplitValue` encapsulates hardware topology parameters and runtime counters:
 
 ```python
 from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
 
 tsv = TaskSplitValue(
-    tp=4,              # Tensor Parallel 度
-    ep=4,              # Expert Parallel 度（等于 NPU 卡数）
-    seq_size=8192,     # 全局序列长度
-    all_expert_num=32, # 总 expert 数
-    top_k=8,           # Top-K 路由数
+    tp=4,              # Tensor parallel degree.
+    ep=4,              # Expert parallel degree, equal to the NPU count.
+    seq_size=8192,     # Global sequence length.
+    all_expert_num=32, # Total expert count.
+    top_k=8,           # Top-K routing count.
 )
 ```
 
-关键推导属性（只读 property）：
+Key derived read-only properties:
 
-| 属性 | 计算 | 含义 |
+| Property | Calculation | Meaning |
 |---|---|---|
-| `single_rank_expert_num` | `all_expert_num // ep` | 每个 rank 持有的 expert 数 |
-| `seq_all` | `seq_size × ep × top_k // tp` | TP 切分后、包含 Top-K 展开的总 token 数 |
-| `per_rank_seq` | `seq_all // ep` | 每个 rank 处理的 token 数 |
-| `per_expert_seq` | `seq_all // top_k` | Top-K 路由维度上的单份 token 数 |
-| `per_expert_seq_to_other` | `seq_all // (ep × top_k)` | 每个目标 rank、每个 Top-K 分片的 token 数 |
-| `all_event_num` | 自动计算 | 全局 event 总数 |
+| `single_rank_expert_num` | `all_expert_num // ep` | Experts owned by each rank |
+| `seq_all` | `seq_size × ep × top_k // tp` | Total tokens after TP partitioning and Top-K expansion |
+| `per_rank_seq` | `seq_all // ep` | Tokens processed by each rank |
+| `per_expert_seq` | `seq_all // top_k` | Tokens in one Top-K routing slice |
+| `per_expert_seq_to_other` | `seq_all // (ep × top_k)` | Tokens per destination rank and Top-K slice |
+| `all_event_num` | Computed automatically | Total global events |
 
-### 5.2 propagate_splits 算法
+### 5.2 propagate_splits Algorithm
 
-`ComputeGraph.propagate_splits(tsv)` 按拓扑顺序自动计算每个算子的 `task_num`：
+`ComputeGraph.propagate_splits(tsv)` computes each operator's `task_num` in topological order:
 
 ```text
-1. 重置所有 TensorSpec.split_dim = -1, split_num = 1
+1. Reset all TensorSpec.split_dim = -1 and split_num = 1.
 
-2. 对每个算子（拓扑顺序）：
-   a. 若 split_inputs is None（源算子）→ task_num = task_num_fn(tsv)
-   b. 否则，若所有 (input_idx, dim) 均满足 op.inputs[input_idx].split_dim == dim
-      → task_num = task_num_fn(tsv)  [切分]
-      否则 task_num = 1              [不切分]
-   c. 标记输出张量：out.split_dim = split_output_dims[i]（task_num > 1 时）
+2. For each operator in topological order:
+   a. If split_inputs is None (source operator), task_num = task_num_fn(tsv).
+   b. Otherwise, if every (input_idx, dim) satisfies op.inputs[input_idx].split_dim == dim:
+      → task_num = task_num_fn(tsv)  [split]
+      Otherwise task_num = 1        [unsplit]
+   c. Mark output tensors: out.split_dim = split_output_dims[i] when task_num > 1.
 ```
 
-**TensorSpec 共享机制**：同一个 `TensorSpec` 对象被生产者写入 `split_dim`，消费者直接读取，切分信息自动沿图传播，无需手工传递。
+**Shared TensorSpec**: Producers write `split_dim` to a shared `TensorSpec` object and consumers read it directly, propagating split information through the graph automatically.
 
-正向传播示例：
+Forward propagation example:
 
 ```text
-dispatch (源算子)  → target.split_dim = 0
+dispatch (source)  → target.split_dim = 0
 up_proj   [(0,0)]  → target.split_dim == 0 ✓ → gmm1_y.split_dim = 0
 swiglu    [(0,0)]  → gmm1_y.split_dim == 0 ✓ → swiglu_out.split_dim = 0
 down_proj [(0,0)]  → swiglu_out.split_dim == 0 ✓ → gmm2_y.split_dim = 0
 combine   [(1,0)]  → gmm2_y.split_dim == 0 ✓
 ```
 
-### 5.3 split_inputs 选择原则
+### 5.3 Selecting split_inputs
 
-`split_inputs` 中必须选择**图内有上游生产者的输入**（非外部叶子张量）。叶子张量的 `split_dim` 在每次 `propagate_splits` 时重置为 -1，以叶子为触发条件将导致 `task_num` 始终为 1。
+`split_inputs` must select **inputs with upstream producers inside the graph**, not external leaf tensors. Leaf `split_dim` resets to -1 on every `propagate_splits` call, so using a leaf as the trigger leaves `task_num` permanently at 1.
 
 ```python
-# ✅ 正确：inputs[1]=target 是 dispatch 的输出，图内连通
+# Correct: inputs[1]=target is produced by dispatch and connected within the graph.
 w2_grad: split_inputs=[(1, 0)]   # inputs[1] = target
 
-# ❌ 错误：inputs[0]=hidden（外部叶子），split_dim 永远 -1
-w2_grad: split_inputs=[(0, 0)]   # task_num 始终 = 1
+# Incorrect: inputs[0]=hidden is an external leaf whose split_dim remains -1.
+w2_grad: split_inputs=[(0, 0)]   # task_num always equals 1.
 ```
 
-### 5.4 Event 驱动协调
+### 5.4 Event-Driven Coordination
 
-Multicore MoE-FFN 中各核通过事件信号量（event）同步：
+Multicore MoE-FFN synchronizes cores through event semaphores:
 
-**AllToAll dispatch**：per-expert 触发
+**AllToAll dispatch**: Per-expert triggering.
 
 ```text
 trigger_event = pre_event_num + (task_index // expert_group_size) + 1
 ```
 
-每个 expert group 的 dispatch task 完成后触发一个 event，GMM 以 expert 粒度消费，无需等待全部 token 发送完毕。
+Each expert group's completed dispatch task triggers an event. GMM consumes at expert granularity without waiting for all tokens to be sent.
 
-**AllToAll combine**：global 触发
+**AllToAll combine**: Global triggering.
 
 ```text
-trigger_event = all_event_num  （全局唯一 event）
+trigger_event = all_event_num  (one globally unique event)
 ```
 
-**GMM 间 event 协调**（反向）：
+**Inter-GMM event coordination in backward:**
 
-| 算子 | advance_mode | 说明 |
+| Operator | advance_mode | Description |
 |---|---|---|
-| act_grad (GMM1) | `cube_only` | 只推进 task 计数，不推进 event |
-| w2_grad (GMM4) | `cube_custom` | 统一推进 event（补偿 GMM1 未推进的部分） |
-| combine | `vector_only` | 只推进 task 计数 |
-| w1_grad (GMM3) | `cube_custom` | 统一推进 event |
+| act_grad (GMM1) | `cube_only` | Advance task count only, without advancing events |
+| w2_grad (GMM4) | `cube_custom` | Advance events centrally, accounting for GMM1 |
+| combine | `vector_only` | Advance task count only |
+| w1_grad (GMM3) | `cube_custom` | Advance events centrally |
 
-### 5.5 Task 切分参数设计原则
+### 5.5 Task Split Parameter Principles
 
-| 算子类型 | 推荐 split_dim | task_num_fn | 注意事项 |
+| Operator type | Recommended split_dim | task_num_fn | Notes |
 |---|---|---|---|
-| GroupedMatMul（GMM）| 0（M 维，expert 并行）| `expert_num × (seq_per_expert // TILE_M)` | TILE_M 必须对齐 GMM block_size |
-| AllToAll（dispatch）| 0（token 维）| `total_tokens // token_tile` | event 范围：per-expert（dispatch）vs 全局（combine）|
-| AllToAll（combine）| 0 | `total_tokens // token_tile` | 依赖所有 down_proj tile 完成（N:1 扇入）|
-| SwiGLU / Add | 0 | = 上游 GMM task_num（1:1）| task_num 必须等于上游，否则事件错位 |
+| GroupedMatMul (GMM) | 0 (M dimension, expert parallelism) | `expert_num × (seq_per_expert // TILE_M)` | TILE_M must align with GMM block_size |
+| AllToAll (dispatch) | 0 (token dimension) | `total_tokens // token_tile` | Per-expert events for dispatch; global events for combine |
+| AllToAll (combine) | 0 | `total_tokens // token_tile` | Depends on all down_proj tiles completing: N:1 fan-in |
+| SwiGLU / Add | 0 | Upstream GMM task_num (1:1) | Must match upstream task_num to avoid event misalignment |
 
-### 5.6 Event 设计规范
+### 5.6 Event Design Rules
 
-| 规则 | 说明 |
+| Rule | Description |
 |---|---|
-| **单调性** | event 计数器只增不减，保证无死锁 |
-| **1:1 依赖** | 每个生产者 tile 完成后触发对应消费者 tile |
-| **N:1 扇入** | 多个上游 tile 共同触发一个下游 tile，设置 `trigger_count = N` |
-| **1:N 扇出** | 一个上游触发多个下游，每个下游分配独立 event ID |
-| **ID 不重叠** | dispatch / combine / gmm 事件 ID 段需严格区分 |
+| **Monotonicity** | Event counters only increase, preventing deadlock |
+| **1:1 dependency** | Each completed producer tile triggers the corresponding consumer tile |
+| **N:1 fan-in** | Multiple upstream tiles trigger one downstream tile; set `trigger_count = N` |
+| **1:N fan-out** | One upstream triggers multiple downstream tiles, each with a separate event ID |
+| **Nonoverlapping IDs** | Keep dispatch, combine, and GMM event ID ranges strictly separate |
 
 ---
 
-## 6. RuntimeConfig 生成
+## 6. RuntimeConfig Generation
 
-`RuntimeConfig` 是 Multicore MoE-FFN 的调度配置二进制，包含每个 task 的依赖 event、触发 event、tensor 地址偏移等信息，**按 rank 独立生成**。
+`RuntimeConfig` is the binary Multicore MoE-FFN scheduling configuration, containing each task's dependency events, trigger events, and tensor address offsets. It is **generated independently per rank**.
 
-header 的前五个 uint32 字段依次为 task_num、num_workers、task_capacity、event_capacity、ready_event；
-ready_event 为 0 表示无需跨 rank ready。接着三个 uint32 为 diagnostic_mode、
-aic_profile_record_capacity、aiv_profile_record_capacity；再两个为 completion_event、protocol_version，
-最后 24 字节用于对齐。diagnostic_mode=0 表示普通执行，=1 表示 profiling，=2 表示 L1 dump。
-protocol_version=0 表示 push，=1 表示 pull；pull 的 completion_event
-用于等待所有参与 worker 完成，随后跨 rank 确认 source 可安全复用。
-task capacity 覆盖计算 task、terminate、队列长度和所有引用的最大 task ID，并按 16 对齐，没有固定 task 数上限。
-event capacity 至少为 1024，并覆盖无融合图、ready/completion 事件和 atomic-write 尾部。布局大小为
-`128 + 588 × task_capacity + 20 × event_capacity + group_list_bytes` 字节，必须能用 uint32 字节偏移寻址。
-在线 plan 与离线工具共用 `serialize_runtime_config()`；Device 检查协议版本以及存储与索引边界。
-普通事件区占 `event_capacity × 4` 字节；EP 大于 1 时，其后预留 `2 × (EP + 1) × 64` 字节持久 ready/completion 状态。
-每次调用只清零普通事件区，首次使用才初始化持久区并执行 Host barrier。
+The header's first five uint32 fields are task_num, num_workers, task_capacity, event_capacity, and ready_event.
+A ready_event of 0 means no cross-rank readiness is required. The next three uint32 fields are diagnostic_mode,
+aic_profile_record_capacity, and aiv_profile_record_capacity, followed by completion_event and protocol_version,
+The final 24 bytes provide alignment. diagnostic_mode=0 means ordinary execution, =1 profiling, and =2 L1 dump.
+protocol_version=0 means push and =1 means pull; pull's completion_event
+waits for all participating workers, followed by cross-rank confirmation that source storage is safe to reuse.
+Task capacity covers compute tasks, terminate tasks, queue length, and the largest referenced task ID, aligned to 16, without a fixed task-count ceiling.
+Event capacity is at least 1024 and covers unfused graphs, ready/completion events, and atomic-write tails. Layout size is
+`128 + 588 × task_capacity + 20 × event_capacity + group_list_bytes` bytes and must be addressable with uint32 byte offsets.
+Online plans and offline tools share `serialize_runtime_config()`. Device code validates protocol versions, storage, and index bounds.
+The ordinary event region occupies `event_capacity × 4` bytes; when EP > 1, it is followed by `2 × (EP + 1) × 64` bytes of persistent ready/completion state.
+Each call clears only ordinary events. Persistent state is initialized once on first use, followed by a host barrier.
 
-grouped-matmul 的各 AIC scratch 按 128 字节对齐，每核步长为 `ceil(local_experts × 8 / 128) × 128` 字节。
-`group_list_bytes = max(4096, 24 × 每核步长 + 128)`，包含首地址对齐余量，完整 cache line 写回不会覆盖相邻核。
-每 rank 不再有固定的 16 专家上限；Host 分配、序列化与 Device 偏移均使用实际专家数。
-16 个以内保持原布局大小，更多专家按需扩大 scratch，仍受 uint32 偏移与实际内存限制。
+Grouped-matmul scratch for each AIC is 128-byte aligned, with per-core stride `ceil(local_experts × 8 / 128) × 128` bytes.
+`group_list_bytes = max(4096, 24 × per_core_stride + 128)` includes base-alignment slack, preventing full-cache-line writeback from overwriting neighboring cores.
+There is no longer a fixed limit of 16 experts per rank. Host allocation, serialization, and device offsets use actual expert counts.
+Up to 16 experts retain the original layout size; larger counts expand scratch as needed, subject to uint32 offsets and available memory.
 
-### 6.1 正向
+### 6.1 Forward
 
 ```bash
-# 必须从 hyper-parallel 仓库根目录（hyper_parallel/ 包所在目录）运行
-# 直接 python gen_runtime_data.py 会报 ImportError（相对导入）
+# Run from the hyper-parallel repository root, containing the hyper_parallel/ package.
+# Direct python gen_runtime_data.py fails with ImportError because of relative imports.
 python -m hyper_parallel.core.multicore.modules.mega_moe.forward.gen_runtime_data \
     --tp 4 --ep 4 \
     --seq_size 8192 \
@@ -469,21 +471,21 @@ python -m hyper_parallel.core.multicore.modules.mega_moe.forward.gen_runtime_dat
     --output_dir /path/to/fwd_data
 ```
 
-输出文件：
+Output files:
 
 ```text
 <output_dir>/
-├── up_proj_tiling.bin              # GMM1 tiling（各 rank 共用）
-├── swiglu_tiling.bin               # SwiGLU tiling（各 rank 共用）
-├── down_proj_tiling.bin            # GMM2 tiling（各 rank 共用）
-├── all_event_counters.bin          # 普通事件计数器及持久 ready 状态（需 symmetric memory）
-├── gmm_workspace.bin               # 256 MiB zeros（各 rank 共用）
-├── runtime_config_input_rank_0.bin # Rank 0 调度配置
+├── up_proj_tiling.bin              # GMM1 tiling, shared across ranks.
+├── swiglu_tiling.bin               # SwiGLU tiling, shared across ranks.
+├── down_proj_tiling.bin            # GMM2 tiling, shared across ranks.
+├── all_event_counters.bin          # Ordinary event counters and persistent ready state; requires symmetric memory.
+├── gmm_workspace.bin               # 256 MiB of zeros, shared across ranks.
+├── runtime_config_input_rank_0.bin # Rank 0 scheduling configuration.
 ├── runtime_config_input_rank_1.bin
 └── ...
 ```
 
-也可在 Python 代码中直接调用：
+You can also invoke it directly from Python:
 
 ```python
 from hyper_parallel.core.multicore.modules.mega_moe.forward.gen_runtime_data import build_config_for_rank
@@ -496,11 +498,11 @@ graph = build_forward_graph(tsv, dispatch_sv=128, up_proj_sv=4096,
                             swiglu_sv=128, down_proj_sv=4096, combine_sv=128,
                             hidden_size=7168, intermediate_size=2048)
 graph.propagate_splits(tsv)
-cfg = build_config_for_rank(graph, tsv, rank_id=0)   # 返回 RuntimeConfigC
+cfg = build_config_for_rank(graph, tsv, rank_id=0)   # Returns RuntimeConfigC.
 data = serialize_runtime_config(cfg)
 ```
 
-### 6.2 反向
+### 6.2 Backward
 
 ```bash
 python -m hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_data \
@@ -514,145 +516,145 @@ python -m hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_da
     --output_dir /path/to/bwd_data
 ```
 
-输出文件：
+Output files:
 
 ```text
 <output_dir>/
-├── act_grad_tiling.bin             # GMM1 反向 tiling（各 rank 共用）
-├── gate_grad_tiling.bin            # GMM2 反向 tiling
-├── w1_grad_tiling.bin              # GMM3（W1 梯度）tiling
-├── w2_grad_tiling.bin              # GMM4（W2 梯度）tiling
-├── swiglu_grad_tiling.bin          # SwiGLU 反向 tiling
-├── all_event_counters.bin          # 4096 uint8 zeros，4 KB（各 rank 共用）
+├── act_grad_tiling.bin             # GMM1 backward tiling, shared across ranks.
+├── gate_grad_tiling.bin            # GMM2 backward tiling.
+├── w1_grad_tiling.bin              # GMM3 W1-gradient tiling.
+├── w2_grad_tiling.bin              # GMM4 W2-gradient tiling.
+├── swiglu_grad_tiling.bin          # SwiGLU backward tiling.
+├── all_event_counters.bin          # 4096 uint8 zeros, 4 KB, shared across ranks.
 ├── gmm_workspace.bin
 └── runtime_config_input_rank_<i>.bin
 ```
 
 ---
 
-## 7. 构建与交付边界
+## 7. Build and Delivery Boundaries
 
-Multicore 组件入口负责依赖准备、私有 SHMEM、分 SoC vendor、vendor 合并和 Torch adapter；仓库根入口只调用
-组件脚本并将成功产物纳入完整 wheel。构建命令、环境要求、缓存和 payload 位置统一见
-[构建与交付](build.md)，源码态与 wheel 安装态的 CANN custom OPP 激活方式统一见
-[HyperParallel 安装指南](../../../../docs/installation.md)。
+The Multicore entry point prepares dependencies, private SHMEM, per-SoC vendors, vendor merging, and the Torch adapter. The repository root entry point only invokes
+component scripts and packages successful artifacts into the complete wheel. Build commands, environment requirements, caches, and payload paths are documented in
+[Build and Delivery](build.md). CANN custom OPP activation for source and installed-wheel environments is documented in the
+[HyperParallel Installation Guide](../../../../docs/installation.md).
 
-每个 SoC 的 CANN 构建同时生成 `HyperMegaMoe` 和 `HyperMegaMoeGrad`。组件会校验新构建及缓存 vendor，
-并在合并后再次校验四个 `aclnnHyperMegaMoe*` API、kernel object/metadata、SONAME 和运行时依赖。
-私有 SHMEM 库会校验专属 SONAME；所有随包 host 共享库均校验 ELF 架构、安全链接属性、无
-RPATH/RUNPATH 和依赖边界。动态库搜索路径由 `set_env.bash` 在启动 Python 前统一配置。
+Each SoC's CANN build generates both `HyperMegaMoe` and `HyperMegaMoeGrad`. The component validates new and cached vendors,
+then revalidates the four `aclnnHyperMegaMoe*` APIs, kernel objects/metadata, SONAMEs, and runtime dependencies after merging.
+Private SHMEM libraries are checked for dedicated SONAMEs. All shipped host shared libraries are checked for ELF architecture, secure linking properties, absence of
+RPATH/RUNPATH, and dependency boundaries. `set_env.bash` configures library search paths before Python starts.
 
-Torch adapter 是由 CMake 构建、通过 `torch.ops.load_library()` 加载的 dispatcher 共享库，不生成
-`PyInit_*` 入口，也不链接 `libpython` 或 `libtorch_python`。adapter 运行时按组件相对路径定位并绝对加载
-自带 vendor；`set_env.bash` 按 CANN custom OPP 契约设置 vendor 的 OPP 与动态库搜索路径。
+The Torch adapter is a CMake-built dispatcher shared library loaded by `torch.ops.load_library()`. It has no
+`PyInit_*` entry point and links neither `libpython` nor `libtorch_python`. At runtime it locates its bundled vendor relative to the component and loads it by absolute path.
+`set_env.bash` configures vendor OPP and library search paths according to the CANN custom OPP contract.
 
 ---
 
 ## 8. Native ABI
 
-SHMEM 的 `_lifecycle.py` 管理native初始化、bootstrap、引用及调用方计划驱动的Runtime restart。
-MegaMoe 的 `heap_manager.py` 管理容量、workspace布局、heap预算和增长诊断，`spec.py`提供容量公式，
-`workspace.py`管理物理buffer与graph lease，`module.py`的执行资源对象负责绑定和关闭。
-SHMEM lifecycle不读取专家容量或workspace布局；配置和restart规则见
-[SHMEM 文档](shmem.md#runtime-restart)。
+SHMEM's `_lifecycle.py` manages native initialization, bootstrap, references, and caller-plan-driven runtime restart.
+MegaMoe's `heap_manager.py` manages capacity, workspace layout, heap budgets, and growth diagnostics; `spec.py` supplies capacity formulas,
+`workspace.py` manages physical buffers and graph leases, and execution-resource objects in `module.py` handle binding and closing.
+The SHMEM lifecycle does not read expert capacity or workspace layouts. See the
+[SHMEM documentation](shmem.md#runtime-restart) for configuration and restart rules.
 
-用户使用方式、输入约束、容量和资源生命周期由组件 [README](../README.md) 统一说明。本节只记录
-`MegaMoeExperts` 内部调用的正反向 native ABI。
+The component [README](../README.md) owns usage, input constraints, capacity, and lifecycle documentation. This section records only
+the forward/backward native ABI invoked internally by `MegaMoeExperts`.
 
-### 8.1 `mega_moe` 正向 ABI
+### 8.1 `mega_moe` Forward ABI
 
 ```python
 multicore_ops.mega_moe(
     # AllToAll dispatch
-    dispatch_target,      # [tokens, hidden]          bf16   AllToAll 目标缓冲区，output（in-place）
-    dispatch_target_off,  # [all_expert_num]           int64  每 expert 的远端写偏移（目标 PE）
-    dispatch_src,         # [tokens, hidden]           bf16   发送源数据
-    dispatch_src_off,     # [all_expert_num]           int64  每 expert 的本地读偏移
-    dispatch_size,        # [all_expert_num]           int32  每 expert 发送的元素数
+    dispatch_target,      # [tokens, hidden]          bf16   AllToAll destination buffer; in-place output.
+    dispatch_target_off,  # [all_expert_num]           int64  Per-expert remote write offset on target PE.
+    dispatch_src,         # [tokens, hidden]           bf16   Send source data.
+    dispatch_src_off,     # [all_expert_num]           int64  Per-expert local read offset.
+    dispatch_size,        # [all_expert_num]           int32  Elements sent per expert.
     # GMM1（up_proj）
-    up_proj_weight,       # [E, hidden, intermediate*2] bf16  W1 权重
-    up_proj_glist,        # [E]                        int64  每 expert token 累积和
-    up_proj_y,            # [tokens, intermediate*2]  bf16   GMM1 输出，output（in-place）
-    swiglu_out,           # [tokens, intermediate]    bf16   SwiGLU 输出，output（in-place）
+    up_proj_weight,       # [E, hidden, intermediate*2] bf16  W1 weights.
+    up_proj_glist,        # [E]                        int64  Per-expert cumulative token counts.
+    up_proj_y,            # [tokens, intermediate*2]  bf16   GMM1 in-place output.
+    swiglu_out,           # [tokens, intermediate]    bf16   SwiGLU in-place output.
     # GMM2（down_proj）
-    down_proj_weight,     # [E, intermediate, hidden] bf16   W2 权重
-    down_proj_glist,      # [E]                       int64  每 expert token 累积和
-    down_proj_y,          # [tokens, hidden]          bf16   GMM2 输出，output（in-place）
+    down_proj_weight,     # [E, intermediate, hidden] bf16   W2 weights.
+    down_proj_glist,      # [E]                       int64  Per-expert cumulative token counts.
+    down_proj_y,          # [tokens, hidden]          bf16   GMM2 in-place output.
     # AllToAll combine
-    combine_target,       # [tokens, hidden]          bf16   AllToAll 汇聚目标缓冲区，output（in-place）
-    combine_target_off,   # [all_expert_num]          int64  每 expert 的远端写偏移
-    combine_src_off,      # [all_expert_num]          int64  每 expert 的本地读偏移
-    combine_size,         # [all_expert_num]          int32  每 expert 发送的元素数
-    # 配置张量
-    gmm_workspace,        # [256*1024*1024]           uint8  GMM 工作区（256 MiB）
+    combine_target,       # [tokens, hidden]          bf16   AllToAll combine destination; in-place output.
+    combine_target_off,   # [all_expert_num]          int64  Per-expert remote write offset.
+    combine_src_off,      # [all_expert_num]          int64  Per-expert local read offset.
+    combine_size,         # [all_expert_num]          int32  Elements sent per expert.
+    # Configuration tensors.
+    gmm_workspace,        # [256*1024*1024]           uint8  GMM workspace, 256 MiB.
     up_proj_tiling,       # uint8                     GMM1 tiling，from gen_runtime_data.py
     swiglu_tiling,        # uint8                     SwiGLU tiling
     down_proj_tiling,     # uint8                     GMM2 tiling
-    runtime_config,       # uint8                     per-rank 调度配置，from gen_runtime_data.py
-    all_event_counters,   # uint8  事件同步计数器（symmetric memory）
-    # 标量
-    rank_id,              # int  当前 rank
-    ep,                   # int  Expert Parallel 度
-    expert_num,           # int  全局 expert 总数（all_expert_num）
-    hidden_size,          # int  隐藏层维度
-    seq_size,             # int  全局序列长度
+    runtime_config,       # uint8                     Per-rank schedule from gen_runtime_data.py.
+    all_event_counters,   # uint8                       Event synchronization counters in symmetric memory.
+    # Scalars.
+    rank_id,              # int                       Current rank.
+    ep,                   # int                       Expert parallel degree.
+    expert_num,           # int                       Global expert count (all_expert_num).
+    hidden_size,          # int                       Hidden dimension.
+    seq_size,             # int                       Global sequence length.
 )
 ```
 
-**返回值**：无；输出写入调用方提供的 Torch 张量
+**Returns**: Nothing; outputs are written into caller-provided Torch tensors.
 
-### 8.2 `mega_moe_grad` 反向 ABI
+### 8.2 `mega_moe_grad` Backward ABI
 
 ```python
 multicore_ops.mega_moe_grad(
-    # AllToAll dispatch（梯度分发）
-    dispatch_target,      # [tokens, hidden]           bf16   AllToAll 目标缓冲区，output（in-place）
-    dispatch_target_off,  # [all_expert_num]            int64  每 expert 的远端写偏移
-    dy,                   # [tokens, hidden]            bf16   输入梯度（AllToAll 发送源）
-    dispatch_src_off,     # [all_expert_num]            int64  每 expert 的本地读偏移
-    dispatch_size,        # [all_expert_num]            int32  每 expert 发送的元素数
-    # act_grad（GMM1 反向：dispatch_target @ W2.T）
-    hidden,               # [tokens, intermediate]      bf16   正向 SwiGLU 输出（缓存）
-    hidden_dw,            # [E, intermediate, hidden]   bf16   W2 权重梯度，output（in-place）
-    w2,                   # [E, intermediate, hidden]   bf16   W2 权重（= 正向 down_proj_weight）
-    act_grad_y,           # [tokens, intermediate]      bf16   GMM1 反向输出，output（in-place）
+    # AllToAll dispatch for gradients.
+    dispatch_target,      # [tokens, hidden]           bf16   AllToAll destination; in-place output.
+    dispatch_target_off,  # [all_expert_num]            int64  Per-expert remote write offset.
+    dy,                   # [tokens, hidden]            bf16   Input gradient, AllToAll send source.
+    dispatch_src_off,     # [all_expert_num]            int64  Per-expert local read offset.
+    dispatch_size,        # [all_expert_num]            int32  Elements sent per expert.
+    # act_grad: GMM1 backward, dispatch_target @ W2.T.
+    hidden,               # [tokens, intermediate]      bf16   Cached forward SwiGLU output.
+    hidden_dw,            # [E, intermediate, hidden]   bf16   W2 gradient; in-place output.
+    w2,                   # [E, intermediate, hidden]   bf16   W2 weights, forward down_proj_weight.
+    act_grad_y,           # [tokens, intermediate]      bf16   GMM1 backward in-place output.
     # swiglu_grad
-    gate,                 # [tokens, intermediate*2]   bf16   正向 up_proj_y（SwiGLU 输入缓存）
-    grad_gate,            # [tokens, intermediate*2]   bf16   SwiGLU 梯度输出，output（in-place）
-    # gate_grad（GMM2 反向：grad_gate @ W1.T）
-    w1,                   # [E, hidden, intermediate*2] bf16  W1 权重（= 正向 up_proj_weight）
-    gate_dx,              # [tokens, hidden]            bf16   GMM2 反向输出，output（in-place）
-    grad_x,               # [tokens, hidden]            bf16   AllToAll combine 输出，output（in-place）
-    # AllToAll combine（梯度汇聚）
-    combine_target_off,   # [all_expert_num]            int64  每 expert 的远端写偏移
-    combine_src_off,      # [all_expert_num]            int64  每 expert 的本地读偏移
-    combine_size,         # [all_expert_num]            int32  每 expert 发送的元素数
+    gate,                 # [tokens, intermediate*2]   bf16   Forward up_proj_y, cached SwiGLU input.
+    grad_gate,            # [tokens, intermediate*2]   bf16   SwiGLU gradient in-place output.
+    # gate_grad: GMM2 backward, grad_gate @ W1.T.
+    w1,                   # [E, hidden, intermediate*2] bf16  W1 weights, forward up_proj_weight.
+    gate_dx,              # [tokens, hidden]            bf16   GMM2 backward in-place output.
+    grad_x,               # [tokens, hidden]            bf16   AllToAll combine in-place output.
+    # AllToAll combine for gradients.
+    combine_target_off,   # [all_expert_num]            int64  Per-expert remote write offset.
+    combine_src_off,      # [all_expert_num]            int64  Per-expert local read offset.
+    combine_size,         # [all_expert_num]            int32  Elements sent per expert.
     # w1_grad（GMM3）、w2_grad（GMM4）
-    permute_out,          # [tokens, hidden]            bf16   W1 梯度计算的 in-place 中间缓冲区
-    gate_dw,              # [E, hidden, intermediate*2] bf16  W1 权重梯度，output（in-place）
-    group_list,           # [E]                         int64  每 expert token 累积和
-    # 配置张量
-    act_grad_tiling,      # uint8                       GMM1 反向 tiling
-    gate_grad_tiling,     # uint8                       GMM2 反向 tiling
-    w1_grad_tiling,       # uint8                       GMM3（W1 梯度）tiling
-    w2_grad_tiling,       # uint8                       GMM4（W2 梯度）tiling
-    swiglu_grad_tiling,   # uint8                       SwiGLU 反向 tiling
-    gmm_workspace,        # [256*1024*1024]             uint8  GMM 工作区
-    swiglu_grad_workspace, # [64*1024*1024]             uint8  SwiGLU 反向工作区
-    runtime_config,       # uint8                       per-rank 调度配置
-    all_event_counters,   # uint8  事件同步计数器（symmetric memory）
-    # 标量
+    permute_out,          # [tokens, hidden]            bf16   In-place intermediate buffer for W1 gradients.
+    gate_dw,              # [E, hidden, intermediate*2] bf16  W1 gradient; in-place output.
+    group_list,           # [E]                         int64  Per-expert cumulative token counts.
+    # Configuration tensors.
+    act_grad_tiling,      # uint8                       GMM1 backward tiling.
+    gate_grad_tiling,     # uint8                       GMM2 backward tiling.
+    w1_grad_tiling,       # uint8                       GMM3 W1-gradient tiling.
+    w2_grad_tiling,       # uint8                       GMM4 W2-gradient tiling.
+    swiglu_grad_tiling,   # uint8                       SwiGLU backward tiling.
+    gmm_workspace,        # [256*1024*1024]             uint8  GMM workspace.
+    swiglu_grad_workspace, # [64*1024*1024]             uint8  SwiGLU backward workspace.
+    runtime_config,       # uint8                       Per-rank scheduling configuration.
+    all_event_counters,   # uint8                       Event synchronization counters in symmetric memory.
+    # Scalars.
     rank_id, ep, expert_num, hidden_size, seq_size,
 )
 ```
 
 ---
 
-## 9. 扩展指南
+## 9. Extension Guide
 
-### 9.1 添加新算子任务类型（Python 侧）
+### 9.1 Add an Operator Task Type (Python)
 
-**Step 1** — 在 `scheduler/graph.py` 扩展 `OpType`：
+**Step 1** — Extend `OpType` in `scheduler/graph.py`:
 
 ```python
 class OpType(Enum):
@@ -660,26 +662,26 @@ class OpType(Enum):
     GMM         = "gmm"
     SWIGLU      = "swiglu"
     SWIGLU_GRAD = "swiglu_grad"
-    RMSNORM     = "rmsnorm"   # ← 新增
+    RMSNORM     = "rmsnorm"   # New entry.
 ```
 
-**Step 2** — 在 `scheduler/config.py` 和 C++ `runtime_config.hpp` 同步新增 `TaskType`，然后在
-`tasks/rmsnorm.py` 实现 `FillConfig`。以 [SwiGLUFillConfig](../tasks/swiglu.py) 为 Vector 任务参考：
+**Step 2** — Add matching `TaskType` entries in `scheduler/config.py` and C++ `runtime_config.hpp`, then
+implement `FillConfig` in `tasks/rmsnorm.py`. Use [SwiGLUFillConfig](../tasks/swiglu.py) as the Vector task reference:
 
-- 使用 `TaskDescC`、`TensorDescC` 构造任务和输入输出描述。
-- 将任务写入 `cfg.all_tasks`，并把索引写入对应的 `cube_task_indices`、`vector_task_indices` 或
-  `mix_task_indices`。
-- 设置 `dependent_event`、`trigger_event` 和 `all_event_num_triggers`，再更新 `cfg.task_index_num`。
-- 通过 `tasks/utils.py` 的 `advance_tsv_*` 辅助函数统一推进 task 和 event 计数。
+- Construct task and input/output descriptions with `TaskDescC` and `TensorDescC`.
+- Write tasks into `cfg.all_tasks` and indices into the corresponding `cube_task_indices`, `vector_task_indices`, or
+  `mix_task_indices`.
+- Set `dependent_event`, `trigger_event`, and `all_event_num_triggers`, then update `cfg.task_index_num`.
+- Advance task and event counts through the `advance_tsv_*` helpers in `tasks/utils.py`.
 
-**Step 3** — 在 `tasks/registry.py` 注册：
+**Step 3** — Register in `tasks/registry.py`:
 
 ```python
 from .rmsnorm import RMSNormFillConfig
 FILL_CONFIG_REGISTRY[OpType.RMSNORM] = RMSNormFillConfig
 ```
 
-**Step 4** — 在 C++ `ops/<op>/op_kernel/worker_kernel.cpp` 的 switch 中添加分支：
+**Step 4** — Add a switch branch in C++ `ops/<op>/op_kernel/worker_kernel.cpp`:
 
 ```cpp
 case TaskType::TASK_RMSNORM:
@@ -687,9 +689,9 @@ case TaskType::TASK_RMSNORM:
     break;
 ```
 
-### 9.2 添加新模型（MoE FFN 以外的算子组合）
+### 9.2 Add a Model (Operator Combinations Beyond MoE FFN)
 
-**Step 1** — 建立目录：
+**Step 1** — Create the directory:
 
 ```text
 modules/
@@ -702,7 +704,7 @@ modules/
         └── ...
 ```
 
-**Step 2** — 在 `graph.py` 构建 DAG：
+**Step 2** — Build the DAG in `graph.py`:
 
 ```python
 from hyper_parallel.core.multicore.scheduler.graph import (
@@ -725,7 +727,7 @@ def build_attention_fwd_graph(tsv: TaskSplitValue, ...) -> ComputeGraph:
     return g
 ```
 
-**Step 3** — 实现 CLI（参考 `modules/mega_moe/forward/gen_runtime_data.py`）：
+**Step 3** — Implement the CLI, following `modules/mega_moe/forward/gen_runtime_data.py`:
 
 ```python
 def main():
@@ -738,9 +740,9 @@ def main():
         write_bin(cfg, f"{args.output_dir}/runtime_config_rank_{rank_id}.bin")
 ```
 
-### 9.3 添加新 C++ 计算核（AscendC 侧）
+### 9.3 Add a C++ Compute Kernel (AscendC)
 
-**Step 1** — 建立算子目录：
+**Step 1** — Create the operator directory:
 
 ```text
 ops/
@@ -757,7 +759,7 @@ ops/
             └── put_mem_signal_kernel.cpp
 ```
 
-**Step 2** — 在 `attn_fwd.cpp` 中引用共享 scheduler：
+**Step 2** — Include the shared scheduler in `attn_fwd.cpp`:
 
 ```cpp
 #include "kernel_operator.h"
@@ -771,43 +773,43 @@ __global__ __aicore__ void multicore_attn_fwd(...) {
 }
 ```
 
-**Step 3** — 在 `worker_kernel.cpp` 中引用共享 runtime：
+**Step 3** — Include the shared runtime in `worker_kernel.cpp`:
 
 ```cpp
 #include "kernel_operator.h"
-#include "runtime/worker_kernel.h"  // build 脚本将 ops/runtime/ 拷入 op_kernel/runtime/
+#include "runtime/worker_kernel.h"  // The build copies ops/runtime/ into op_kernel/runtime/.
 
 class KernelWorker : public KernelWorkerBase<KernelWorker> {
  public:
-    // input_list 索引由本算子的参数布局决定
-    static constexpr uint32_t TILING_IDX = N;   // 替换为实际索引
+    // input_list indices follow this operator's parameter layout.
+    static constexpr uint32_t TILING_IDX = N;   // Replace with the actual index.
     static constexpr uint32_t EVENT_IDX  = M;
 
     __aicore__ inline void ExecuteComputeKernel(TaskDesc task_desc) {
         switch (task_desc.task_type) {
-            // 添加本算子的 case
+            // Add this operator's cases.
         }
     }
 };
 ```
 
-**Step 4** — 在 `put_mem_signal/put_mem_signal_kernel.cpp` 中用本算子的数据类型实例化：
+**Step 4** — Instantiate `put_mem_signal/put_mem_signal_kernel.cpp` with the operator's dtype:
 
 ```cpp
 #include "kernel_operator.h"
 #include "shmem.h"
 
 template <typename T>
-class PutMemSignalKernel { /* ... */ };  // 与现有实现相同
+class PutMemSignalKernel { /* ... */ };  // Same as the existing implementation.
 
 extern "C" inline __aicore__ void put_mem_signal_kernel(...) {
-    PutMemSignalKernel<DTYPE_YOUR_TYPE> op;  // 替换为本算子的数据类型宏
+    PutMemSignalKernel<DTYPE_YOUR_TYPE> op;  // Replace with the operator's dtype macro.
     op.Init(...);
     op.Process();
 }
 ```
 
-**Step 5** — 在[源码组装器](../_build/assemble_multicore_source.py)中登记新算子，使源码组装阶段复制共享的
+**Step 5** — Register the operator in the [source assembler](../_build/assemble_multicore_source.py) so source assembly copies the shared
 `runtime/`：
 
 ```python
@@ -816,13 +818,13 @@ _HYPER_OPERATORS = ("hyper_mega_moe", "hyper_mega_moe_grad", "hyper_attn_fwd")
 
 ---
 
-## 10. 附录：常见错误与排查
+## 10. Appendix: Common Errors and Troubleshooting
 
-| 错误现象 | 可能原因 | 排查步骤 |
+| Symptom | Possible cause | Investigation |
 |---|---|---|
-| `TaskDesc` event_id 越界 | all_event_num 计算错误 | 检查 `scheduler/config.py` 中 `all_event_num` 属性公式 |
-| 两 bin 文件 task_num 不一致 | SplitSpec 的 task_num_fn 写错 | 打印 `propagate_splits()` 后每个 op 的 task_num |
-| AIV hang（无限等待）| N:1 扇入 trigger_count 设置偏大 | 检查 FillConfig 的 trigger_count = 实际上游 tile 数 |
-| GMM workspace 越界 | TILE_M/N 设置过大 | 检查 `tiling_tables.py` 中 workspace 预算 |
-| `runtime/worker_kernel.h` 找不到 | 新算子未纳入隔离源码组装 | 检查 `assemble_multicore_source.py` 的算子列表和 `MULTICORE_SOURCE_ASSEMBLY_FAILED` 日志 |
-| Python `ImportError: scheduler` | 从非包根目录运行 | 从 `hyper-parallel/` 根目录用 `python -m` 方式运行 |
+| `TaskDesc` event_id out of bounds | Incorrect all_event_num calculation | Check the `all_event_num` property formula in `scheduler/config.py` |
+| Different task_num in two bin files | Incorrect SplitSpec task_num_fn | Print each operator's task_num after `propagate_splits()` |
+| AIV hang (infinite wait) | N:1 fan-in trigger_count is too large | Verify FillConfig trigger_count equals the actual upstream tile count |
+| GMM workspace out of bounds | TILE_M/N too large | Check workspace budgeting in `tiling_tables.py` |
+| Missing `runtime/worker_kernel.h` | New operator absent from isolated source assembly | Check the operator list in `assemble_multicore_source.py` and `MULTICORE_SOURCE_ASSEMBLY_FAILED` logs |
+| Python `ImportError: scheduler` | Running outside the package root | Run with `python -m` from the `hyper-parallel/` root |

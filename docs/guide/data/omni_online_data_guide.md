@@ -1,14 +1,16 @@
-# Omni Online 数据接入指南
+# Omni Online Data Integration Guide
 
-本文以仓库中的 Qwen2-VL 示例说明如何把图片对话样本接入 `VLMTrainer`。通用 Omni 链路负责读取、过滤、
-编码、packing 和 TP/CP batch 传输；模型特有的 processor、监督标签和额外 forward 字段由 transform 或
-runtime adapter 负责。DeepSeek-V4.1 的模型专用处理见
-[DeepSeek-V4.1 Online VLM 数据转换指南](deepseek_v41_vlm_online_data_guide.md)。
+**English** | [简体中文](omni_online_data_guide.zh.md)
 
-## 1. 最小可用样本
+Using the repository's Qwen2-VL example, this guide explains how to feed image-dialogue samples into `VLMTrainer`. The generic Omni path handles reading, filtering,
+encoding, packing, and TP/CP batch transport. Transforms or runtime adapters handle model-specific processors, supervision labels,
+and additional forward fields. For DeepSeek-V4.1-specific processing, see the
+[DeepSeek-V4.1 Online VLM Data Transformation Guide](deepseek_v41_vlm_online_data_guide.md).
 
-`AutoProcessorTransform` 接收非空 `messages`，并要求最后一条是 assistant。Qwen2-VL 示例使用如下
-processor 兼容格式；图片路径请先使用绝对路径：
+## 1. Minimal Sample
+
+`AutoProcessorTransform` accepts nonempty `messages` and requires the last message to be from the assistant. The Qwen2-VL example uses this
+processor-compatible format; start with absolute image paths:
 
 ```json
 {
@@ -28,14 +30,14 @@ processor 兼容格式；图片路径请先使用绝对路径：
 }
 ```
 
-可以将多个这样的对象放进 JSON 数组（`.json`），也可以每行一个对象写成 `.jsonl`。示例脚本默认读取
-`synthetic.json`；要使用自己的文件，可通过 `DATA_PATH` 指定。`messages=[]` 会在 source 建索引时被
-`is_valid_sample()` 丢弃；缺失 `messages` 或其类型不是 list 则会报错。JSONL 的原生索引、相对媒体路径、
-split 与其他文件格式的路由细节见上面的 DeepSeek-V4.1 指南；不要假定任意 JSON 图片路径都按文件目录解析。
+Place multiple objects in a JSON array (`.json`) or write one object per line in `.jsonl`. The example script reads
+`synthetic.json` by default; set `DATA_PATH` to use your own file. During source indexing,
+`is_valid_sample()` drops `messages=[]`; missing `messages` or a non-list value raises an error. See the DeepSeek-V4.1 guide above for native JSONL indexing, relative media paths,
+splits, and routing for other formats. Do not assume every JSON image path is resolved relative to its data file.
 
-## 2. YAML 接入点
+## 2. YAML Integration Points
 
-参照 [`examples/training_demo/train_vlm.yaml`](../../../examples/training_demo/train_vlm.yaml) 配置以下两段：
+Configure these two sections following [`examples/training_demo/train_vlm.yaml`](../../../examples/training_demo/train_vlm.yaml):
 
 ```yaml
 dataset:
@@ -63,11 +65,11 @@ dataloader:
   num_workers: 0
 ```
 
-`model_assets` 创建 processor，配置解析器将其注入 `data_transform.processor`；Dataset builder 接收
-transform。`OmniPackingLoader` 完成候选样本选择和 packing，`build_omni_collate_fn` 组装 batch，
-`OmniParallelBatch` 为模型 forward 准备分布式输入。示例直接使用该类，无需额外 hook。
+`model_assets` creates the processor, which the configuration resolver injects into `data_transform.processor`. The Dataset builder receives the
+transform. `OmniPackingLoader` selects and packs candidate samples, `build_omni_collate_fn` assembles batches,
+and `OmniParallelBatch` prepares distributed model inputs. The example uses this class directly without additional hooks.
 
-不经过 Trainer 时，也可以单独检查 Dataset 接口：
+You can also inspect the Dataset interface independently of the Trainer:
 
 ```python
 from types import SimpleNamespace
@@ -89,21 +91,21 @@ dataset = build_online_omni_mapping_dataset(
     transform=transform,
     training_config=SimpleNamespace(seed=42),
 )
-encoded_sample = dataset[0]  # 无 split 时返回 Mapping Dataset
+encoded_sample = dataset[0]  # Without splits, the builder returns a Mapping Dataset.
 print(encoded_sample["input_ids"].shape, encoded_sample["labels"].shape)
 ```
 
-配置 ratio split 或预分割路径后，Dataset builder 返回 `(train, valid, test)`，其中不存在的 split 为
-`None`。`transform.is_valid_sample` 会自动作为原始记录过滤器传入 source builder；无需再手动传一次。
+With ratio splits or presplit paths configured, the Dataset builder returns `(train, valid, test)`, using
+`None` for absent splits. `transform.is_valid_sample` is automatically passed to the source builder as the raw-record filter; do not pass it again manually.
 
-`AutoProcessorTransform` 会拒绝超过 `max_seq_len` 的样本，**不会截断或填充媒体序列**；
-`token_budget` 决定一次 packing 尽量选择多少 token，不是单样本截断上限。
-接入较长样本时，应在模型专用 transform 中明确实现截断及图像 patch/grid 同步处理，或提前清洗数据。
+`AutoProcessorTransform` rejects samples exceeding `max_seq_len`; it **does not truncate or pad media sequences**.
+`token_budget` controls the target number of tokens selected for one packing operation, not a per-sample truncation limit.
+For long samples, explicitly implement truncation and synchronized image patch/grid handling in the model-specific transform, or clean the data beforehand.
 
-### 固定 packing 后的输入长度
+### Fix the Input Length After Packing
 
-在 collator target 上配置 `pad_to_length`，可以让不同 DP 分支、不同 micro-batch 的全局 token
-序列补到相同长度：
+Set `pad_to_length` on the collator target to pad global token sequences across different DP branches and micro-batches
+to the same length:
 
 ```yaml
 dataloader:
@@ -115,84 +117,84 @@ dataloader:
   min_buffered_samples: 1
 ```
 
-- `pad_to_length` 默认 `null`，仅按 TP × CP 对齐；正整数表示精确的全局目标长度，不接受布尔值。
-  目标必须能被运行时的 TP × CP 整除，否则创建 collator 时抛出 `ValueError`。
-- `token_budget` 仍只控制样本选择，和固定 padding 独立；`pad_to_length` 不会从 `max_seq_len`、
-  `micro_batch_size` 或 `token_budget` 自动推导，也不会改写这些参数。
-- padding 在 packing 后、CP 切片和 TP 广播前执行。例如目标为 1024、CP=2 时，全局输入为
-  `[1, 1024]`，各 CP rank 的输入为 `[1, 512]`。各 DP 无需通信来确定目标长度。
-- packed 长度超过目标时抛出 `ValueError`，不截断，也不自动增大目标。单样本即使超过
-  `token_budget` 仍可能被选择，应保证有效样本长度和组批预算都不超过固定目标。
-- labels 尾部补 `-100`，mask 尾部补 0；真实样本边界保留，新增一个 padding 段。例如
-  `cu_seq_lens=[0, 300, 700]` 补到 1024 后为 `[0, 300, 700, 1024]`。
-  已经达到目标时不新增空段。图片 patch、grid 和图片起点不受固定 padding 影响。
+- `pad_to_length` defaults to `null`, aligning only to TP × CP. A positive integer specifies an exact global target length; booleans are rejected.
+  The target must be divisible by runtime TP × CP, or collator construction raises `ValueError`.
+- `token_budget` still controls only sample selection, independently of fixed padding. `pad_to_length` is neither inferred from `max_seq_len`,
+  `micro_batch_size`, or `token_budget`, nor used to overwrite them.
+- Padding occurs after packing, before CP slicing and TP broadcasting. For a target of 1024 and CP=2, the global input is
+  `[1, 1024]`, and each CP rank receives `[1, 512]`. DP ranks need no communication to determine the target length.
+- If the packed length exceeds the target, `ValueError` is raised without truncation or automatic target growth. A single sample exceeding
+  `token_budget` may still be selected; ensure both valid sample lengths and the batching budget stay within the fixed target.
+- Labels are padded with `-100` and masks with 0. Real sample boundaries are preserved, with a new padding segment appended. For example,
+  padding `cu_seq_lens=[0, 300, 700]` to 1024 produces `[0, 300, 700, 1024]`.
+  No empty segment is added if the target is already met. Fixed padding does not affect image patches, grids, or starting positions.
 
-文本 Online 的 `build_online_text_collate_fn` 支持相同的 `pad_to_length` 参数。命令行可以使用
-`--dataloader.collate_fn.pad_to_length=1024`，或用 `=null` 恢复仅对齐模式。固定长度会增加短序列的
-计算和内存占用，且不会统一各 DP 的图片 patch 数或专家路由负载。
+Text Online's `build_online_text_collate_fn` supports the same `pad_to_length` parameter. Use
+`--dataloader.collate_fn.pad_to_length=1024` on the command line, or `=null` to restore alignment-only mode. Fixed lengths increase computation and memory
+for short sequences, and do not equalize image-patch counts or expert-routing loads across DP ranks.
 
-## 3. 从原始样本到模型输入
+## 3. From Raw Samples to Model Inputs
 
 ```text
 JSON/JSONL record
-  -> build_online_omni_mapping_dataset: 过滤空 messages，建立 Mapping source
-  -> OmniDataTransform.prepare_messages: 复制消息，处理可识别的媒体路径
-  -> AutoProcessorTransform.encode_sample: processor 编码并生成 labels
-  -> OmniPackingLoader: 按 token_budget 选择样本，SamplePacker 拼接同名字段
-  -> OmniCollator: 合并 token 与变长图像字段
-  -> OmniParallelBatch: CP 切 token 字段、TP 广播、生成 loss_mask
-  -> VLMTrainer -> 模型 forward/loss/backward
+  -> build_online_omni_mapping_dataset: filter empty messages and construct the Mapping source
+  -> OmniDataTransform.prepare_messages: copy messages and process recognized media paths
+  -> AutoProcessorTransform.encode_sample: encode with the processor and generate labels
+  -> OmniPackingLoader: select samples by token_budget; SamplePacker concatenates matching fields
+  -> OmniCollator: merge token and variable-length image fields
+  -> OmniParallelBatch: CP-shard token fields, broadcast over TP, and generate loss_mask
+  -> VLMTrainer -> model forward/loss/backward
 ```
 
-`AutoProcessorTransform.encode_sample()` 对同一条记录编码两次：
+`AutoProcessorTransform.encode_sample()` encodes each record twice:
 
-1. 完整对话，`add_generation_prompt=False`，得到 `input_ids`、`attention_mask`、图片字段等模型输入；
-2. 去掉最后的 assistant 回复，`add_generation_prompt=True`，得到包含 assistant 起始标记的 prompt 长度。
+1. Encode the full conversation with `add_generation_prompt=False` to obtain `input_ids`, `attention_mask`, image fields, and other model inputs.
+2. Remove the final assistant response and use `add_generation_prompt=True` to obtain the prompt length, including the assistant start marker.
 
-它首先检查 prompt token 是否为完整对话的前缀；若仅发生模板边界的 token 合并，则验证
-解码文本与公共 token 前缀，保守屏蔽边界 token。无法确认边界的模板重写会报错。
-完整输入 token 不会被重新拼接。随后复制 `input_ids` 得到 `labels`：prompt 区间以及
-`mm_token_type_ids != 0` 的多模态位置设为 `-100`，最后的 assistant 文本保留 token ID。例如：
+It first checks whether prompt tokens are a prefix of the complete conversation. If only token merging at a template boundary occurs, it verifies
+the decoded text and common token prefix, conservatively masking boundary tokens. Template rewrites whose boundaries cannot be established raise an error.
+The complete input tokens are not reconstructed by concatenation. It then copies `input_ids` into `labels`: the prompt region and
+multimodal positions where `mm_token_type_ids != 0` are set to `-100`; final assistant text retains its token IDs. For example:
 
 ```text
 input_ids:  [system / user / image / assistant prefix | answer / end]
 labels:     [-100  / -100 / -100  / -100             | answer / end]
 ```
 
-processor 本身不会自动生成训练 `labels`。此处标签与 `input_ids` 等长、尚未手工左移；示例使用的
-Qwen2-VL Causal LM 在计算 loss 时处理位移。transform 返回单条样本的一维 token 字段，以及完整的
-`pixel_values`、`image_grid_thw` 等模态字段；`OmniParallelBatch` 要求 batch 中已有 `labels`，并在缺少
-`loss_mask` 时由 `labels >= 0` 推导。不要让所有 token 都保留为有效标签，否则用户提示和图像占位符
-也会参与监督。没有剩余监督 token 的样本会报错。
+The processor itself does not automatically generate training `labels`. Here, labels have the same length as `input_ids` and have not been manually shifted left;
+the example's Qwen2-VL causal LM applies the shift during loss computation. The transform returns 1-D token fields for one sample and complete
+modality fields such as `pixel_values` and `image_grid_thw`. `OmniParallelBatch` requires existing `labels` and derives
+`loss_mask` from `labels >= 0` when absent. Do not leave every token as a valid label, or user prompts and image placeholders
+will also be supervised. Samples with no remaining supervised tokens raise an error.
 
-默认非 encoder-DP 路径中，`OmniParallelBatch` 只对 token 字段做 CP 分片；图像等模态字段不按 CP
-切分，而是在 TP×CP 坐标上保持完整，供各 rank 的视觉分支使用。`encoder_dp: true` 的图像 bucket
-与 all-to-all 路径尚未实现；PP/`pp_shared_data` 当前也不支持。模型如果还需要特殊的 image-token
-映射或额外 forward 参数，应提供模型自己的 `OmniDataTransform`，并按需配置
-`runtime_input_adapter`，不要把模型专用字段规则写进通用 collator。
+In the default path without encoder DP, `OmniParallelBatch` CP-shards only token fields. Image and other modality fields are not CP-sharded;
+they remain complete at each TP×CP coordinate for each rank's vision branch. The image bucket
+and all-to-all path for `encoder_dp: true` is not implemented; PP/`pp_shared_data` is also unsupported. Models requiring special image-token
+mappings or extra forward arguments should provide their own `OmniDataTransform` and, when needed,
+`runtime_input_adapter`. Keep model-specific field rules out of the generic collator.
 
-## 4. 接入另一种 Omni 模型
+## 4. Integrate Another Omni Model
 
-保持 Dataset、packing 和并行 batch 入口不变，只替换模型专用部分：
+Keep the Dataset, packing, and parallel batch entry points unchanged, replacing only model-specific parts:
 
-1. 配置能处理该模型消息格式的 processor，或提供自己的 `model_assets` builder。
-2. 继承 `OmniDataTransform` 并实现 `encode_sample()`；至少返回同长度的 `input_ids`、`labels`，
-   其中不参与 loss 的 token 为 `-100`。图片、视频等字段应与模型 forward 的参数名称、形状一致。
-   若需要先按轻量元数据选择样本，再做昂贵的媒体编码，可改用成对的
-   `preencode_sample()` / `postencode_sample()`；如需 batch 级整理，可实现 `encode_batch()`。
-3. 将 YAML 的 `dataset.model_assets`、`dataset.data_transform` 改为新目标。若 TP/CP 传输后还需构造
-   模型专用位置、mask 或图片映射，在 `dataloader.get_batch.runtime_input_adapter` 配置模型 adapter；
-   普通 processor 字段无需该 hook。
+1. Configure a processor that understands the model's message format, or supply a custom `model_assets` builder.
+2. Subclass `OmniDataTransform` and implement `encode_sample()`, returning at least equal-length `input_ids` and `labels`,
+   with non-loss tokens set to `-100`. Image/video fields must match model forward argument names and shapes.
+   To select samples from lightweight metadata before expensive media encoding, use the paired
+   `preencode_sample()` / `postencode_sample()` methods instead; implement `encode_batch()` for batch-level processing.
+3. Update YAML `dataset.model_assets` and `dataset.data_transform` to the new targets. If model-specific positions,
+   masks, or image mappings must be constructed after TP/CP transport, configure an adapter in `dataloader.get_batch.runtime_input_adapter`.
+   Ordinary processor fields do not need this hook.
 
-`build_online_omni_mapping_dataset()` 会检查 transform 是 `OmniDataTransform`，因此单独实现一个
-`__call__(record)` 的类不能直接替代它。可参考
+`build_online_omni_mapping_dataset()` verifies that the transform is an `OmniDataTransform`; a class implementing only
+`__call__(record)` is not a direct replacement. See the model-specific implementation in
 [`DeepseekV41OmniTransform`](../../../hyper_parallel/models/deepseek_v41/adapter/data/transform_fn.py)
-的模型专用实现。
+for reference.
 
-## 5. 运行示例与检查
+## 5. Run the Example and Check Results
 
-脚本 [`examples/training_demo/run_vlm.sh`](../../../examples/training_demo/run_vlm.sh) 默认启动 8 个进程，
-并将 `MODEL_PATH`、`DATA_PATH` 和命令行覆盖项传入 YAML。使用自己的本地模型和样本：
+[`examples/training_demo/run_vlm.sh`](../../../examples/training_demo/run_vlm.sh) launches eight processes by default
+and forwards `MODEL_PATH`, `DATA_PATH`, and command-line overrides to YAML. To use local models and samples:
 
 ```bash
 cd /path/to/hyper-parallel
@@ -202,7 +204,7 @@ RUN_NAME=vlm_smoke \
 bash examples/training_demo/run_vlm.sh --training.train_iters=1
 ```
 
-日志写入 `output/training_demo/vlm/run_vlm_smoke.log`。先检查数据阶段不再出现
-`Omni batch must contain labels`，再检查是否实际输出 step/loss；前者只证明标签接入，不能证明视觉
-模型的反向计算已跑通。当前提供的 tiny Qwen2-VL 示例在本地 Ascend 环境中已通过标签与 batch 检查，
-但单卡、8 卡试跑均在 backward 阶段发生原生 `SIGSEGV`，其原因尚未确认。
+Logs are written to `output/training_demo/vlm/run_vlm_smoke.log`. First check that the data stage no longer reports
+`Omni batch must contain labels`, then verify actual step/loss output. The first check proves only label integration, not successful backward computation
+for the vision model. The supplied tiny Qwen2-VL example passed label and batch checks in the local Ascend environment,
+but both single-device and eight-device trials encountered a native `SIGSEGV` during backward; the cause remains unconfirmed.
