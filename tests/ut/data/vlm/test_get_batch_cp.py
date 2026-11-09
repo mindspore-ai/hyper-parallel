@@ -33,7 +33,6 @@ from hyper_parallel.distributed.context_parallel.compressed_document import (
     compressed_document_offsets,
     document_compression_plan,
 )
-from tests.common.mark_utils import arg_mark
 
 
 def _make_batch(seq_len: int = 8, pad_tail: int = 2) -> dict[str, torch.Tensor]:
@@ -71,8 +70,6 @@ def _collate_batch(batch: dict[str, torch.Tensor], cp_size: int, tp_size: int = 
 class TestOmniBatchCpSharding(unittest.TestCase):
     """Token fields shard per CP rank; modality metadata stays complete."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_natural_documents_keep_boundaries_and_compression_ownership(self) -> None:
         """Feature: Natural document lengths through Omni CP batching.
 
@@ -102,8 +99,6 @@ class TestOmniBatchCpSharding(unittest.TestCase):
 
         self.assertEqual(block_rows, [[4, 5], [7, 8], [9, 10], [12, 13]])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_sp_alignment_cp1_and_cp2(self) -> None:
         """Feature: Omni token padding for decoder sequence parallelism.
 
@@ -124,8 +119,6 @@ class TestOmniBatchCpSharding(unittest.TestCase):
 
             self.assertEqual(aligned["labels"][0, 11:].tolist(), [-100] * (expected_length * cp_size - 11))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_cp1_keeps_the_batch_untouched(self) -> None:
         """Feature: single-rank CP batching.
 
@@ -140,8 +133,6 @@ class TestOmniBatchCpSharding(unittest.TestCase):
         self.assertTrue(torch.equal(sharded["pixel_values"], batch["pixel_values"]))
         self.assertTrue(torch.equal(sharded["image_grid_thw"], batch["image_grid_thw"]))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_cp2_slices_token_fields_to_the_rank_window(self) -> None:
         """Feature: CP token-field sharding.
 
@@ -160,8 +151,6 @@ class TestOmniBatchCpSharding(unittest.TestCase):
                     torch.testing.assert_close(sharded[field], batch[field][:, window])
                 torch.testing.assert_close(sharded["cu_seq_lens"], batch["cu_seq_lens"])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_cp_keeps_media_fields_complete(self) -> None:
         """Feature: CP multimodal metadata preservation.
 
@@ -176,8 +165,6 @@ class TestOmniBatchCpSharding(unittest.TestCase):
         self.assertTrue(torch.equal(sharded["pixel_values"], batch["pixel_values"]))
         self.assertTrue(torch.equal(sharded["image_grid_thw"], batch["image_grid_thw"]))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_collate_pads_before_cp_shards_an_indivisible_sequence_length(self) -> None:
         """Feature: CP sequence alignment.
 
@@ -205,8 +192,6 @@ class TestOmniBatchCpSharding(unittest.TestCase):
         self.assertEqual(batch["input_ids"].shape[1], seq_len)
         self.assertEqual(batch["cu_seq_lens"].tolist(), [0, seq_len])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_cp_rejects_batches_not_aligned_by_collate(self) -> None:
         """Feature: CP input length validation.
 
@@ -219,8 +204,6 @@ class TestOmniBatchCpSharding(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "align token fields in collate_fn"):
                     _build_sharder(cp_size, tp_size=tp_size).shard(batch)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_cp_rejects_boundaries_that_do_not_cover_the_global_sequence(self) -> None:
         """Feature: Packed document boundary validation.
 
@@ -234,8 +217,6 @@ class TestOmniBatchCpSharding(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "cover the complete CP input sequence"):
                     _build_sharder(2).shard(batch)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_cp_rejects_a_multi_row_batch(self) -> None:
         """Feature: packed Omni batch shape validation.
 
@@ -248,8 +229,6 @@ class TestOmniBatchCpSharding(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"shape \[1, sequence\]"):
             _build_sharder(2).shard(batch)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_cp_rejects_token_fields_that_do_not_match_input_ids(self) -> None:
         """Feature: CP token-field shape validation.
 

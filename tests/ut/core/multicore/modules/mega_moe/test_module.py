@@ -37,7 +37,6 @@ from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import build_f
 from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
-from tests.common.mark_utils import arg_mark
 
 
 class TestMegaMoeExperts(unittest.TestCase):
@@ -56,8 +55,6 @@ class TestMegaMoeExperts(unittest.TestCase):
         resources._plans = {}
         return resources
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_automatic_constructor_accepts_shapes_without_token_arguments(self) -> None:
         """Feature: Automatic token API.
         Description: Construct both transports without predicting token counts and reject removed keywords.
@@ -84,8 +81,6 @@ class TestMegaMoeExperts(unittest.TestCase):
             with self.subTest(keyword=keyword), self.assertRaisesRegex(TypeError, keyword):
                 MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2, **{keyword: 128})
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_dynamic_cycles_retain_bucket_plans_and_reserved_specification(self) -> None:
         """Feature: Geometric token plan retention.
         Description: Replay seven buckets plus nearby and wide length sequences after warmup.
@@ -110,8 +105,6 @@ class TestMegaMoeExperts(unittest.TestCase):
                     self.assertEqual(resources.spec, replace(plan.spec, schedule_tokens=None))
 
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_partial_and_small_buckets_cover_inputs_without_expanding_storage(self) -> None:
         """Feature: bounded token schedule coverage.
 
@@ -132,8 +125,6 @@ class TestMegaMoeExperts(unittest.TestCase):
                         self.assertEqual(plan.spec.routed_slots, reserved * 2)
                     self.assertEqual(resources.plan_for_tokens(1, "cpu").spec.plan_tokens, 128)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_automatic_plan_uses_committed_capacity_in_both_transports(self) -> None:
         """Feature: automatic token schedule coverage.
 
@@ -160,8 +151,6 @@ class TestMegaMoeExperts(unittest.TestCase):
                 self.assertEqual(resources.spec.local_num_tokens, 128)
                 self.assertEqual(resources._token_capacity, 4096)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_partial_bucket_upgrade_is_retryable_and_keeps_retained_plans(self) -> None:
         """Feature: Immutable partial bucket replacement.
         Description: Fail a larger plan build, then retry it while backward retains the old plan.
@@ -186,8 +175,6 @@ class TestMegaMoeExperts(unittest.TestCase):
             self.assertEqual(resources.spec.local_num_tokens, 128)
 
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_unprepared_capacity_is_rejected_before_building(self) -> None:
         """Feature: committed token capacity enforcement.
 
@@ -207,8 +194,6 @@ class TestMegaMoeExperts(unittest.TestCase):
             resources.plan_for_tokens(4096, "cpu")
         build.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_native_int32_limit_bounds_the_number_of_cached_plans(self) -> None:
         """Feature: bounded geometric plan cache.
 
@@ -226,8 +211,6 @@ class TestMegaMoeExperts(unittest.TestCase):
             self.assertEqual(len(resources._plans), 21)
             self.assertLessEqual(max(plan.spec.plan_tokens for plan in resources._plans.values()), capacity)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_resource_consensus_rejects_configuration_and_wire_mismatches(self) -> None:
         """Feature: Distributed resource and automatic count agreement.
         Description: Inject a different manifest, legacy wire version or incompatible expert-weight layout.
@@ -254,8 +237,6 @@ class TestMegaMoeExperts(unittest.TestCase):
                 resources._validate_distributed_configuration(
                     ({"local_num_tokens": 128, "auto_tokens": True, "expert_weight_layout": "EOI"},))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     @patch.object(mega_moe_module, "_create_mega_moe_parameters")
     def test_constructor_defaults_to_growing_push(self, mock_create_parameters: Mock) -> None:
         """Feature: Push capacity defaults.
@@ -271,8 +252,6 @@ class TestMegaMoeExperts(unittest.TestCase):
         mock_create_parameters.assert_called_once_with(2, 16, 8, "EIO")
         self.assertIsNone(experts.swiglu_limit)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_eoi_layout_is_validated_and_propagated_to_native_graphs(self) -> None:
         """Feature: Native EOI expert-weight layout.
         Description: Construct automatic-token experts and build both native graphs with Torch linear storage.
@@ -345,8 +324,6 @@ class TestMegaMoeExperts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "EOI expert weights must be contiguous"):
             experts._validate_tensors(hidden_states, (noncontiguous_gate_up, noncontiguous_down))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_eio_is_the_default_native_graph_layout(self) -> None:
         """Feature: Default EIO expert-weight layout.
         Description: Build forward/backward graphs with the default layout and reject unknown layouts.
@@ -369,8 +346,6 @@ class TestMegaMoeExperts(unittest.TestCase):
                 ):
                     builder(topology, expert_weight_layout="invalid")
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     @patch.object(mega_moe_module, "_create_mega_moe_parameters")
     def test_constructor_rejects_invalid_static_values_before_allocation(
         self,
@@ -412,8 +387,6 @@ class TestMegaMoeExperts(unittest.TestCase):
 
         mock_create_parameters.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     @patch.object(mega_moe_module, "_create_mega_moe_parameters")
     def test_constructor_validates_and_records_swiglu_limit(
         self,
@@ -467,8 +440,6 @@ class TestMegaMoeExperts(unittest.TestCase):
                     ep_size=2,
                 )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_forward_passes_router_inputs_and_restores_shape(self) -> None:
         """Feature: forward passes router inputs and restores shape.
         Description: Execute forward with router metadata and caller-shaped inputs.
@@ -543,8 +514,6 @@ class TestMegaMoeExperts(unittest.TestCase):
             expert_output, route.unpermute_mapping, topk_weights
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_forward_rejects_invalid_weights_before_resource_creation(self) -> None:
         """Feature: MegaMoe public API and resource lifecycle.
 
@@ -587,8 +556,6 @@ class TestMegaMoeExperts(unittest.TestCase):
                             torch.ones(128, 2), expert_weights=weights)
         mock_create_resources.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     @patch.object(mega_moe_module, "_create_mega_moe_parameters")
     @patch.object(MegaMoeExperts, "_register_runtime_release", return_value=None)
     def test_shared_layers_create_once_and_close_after_last_owner(
@@ -652,8 +619,6 @@ class TestMegaMoeExperts(unittest.TestCase):
         layers[-1].close()
         resources.close.assert_called_once_with()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_execution_resource_uses_manager_owned_runtime(self) -> None:
         """Feature: execution resource uses manager-owned Runtime.
         Description: Construct and close one execution resource twice.
@@ -703,8 +668,6 @@ class TestMegaMoeExperts(unittest.TestCase):
         manager.detach_runtime.assert_not_called()
         self.assertEqual(close_order, ["workspace"])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_execution_resource_construction_failure_rolls_back_manager_state(self) -> None:
         """Feature: construction failure rolls back manager state.
         Description: Fail plan creation after attaching the sole Runtime reference.
@@ -742,8 +705,6 @@ class TestMegaMoeExperts(unittest.TestCase):
         manager.rollback_reservations.assert_called_once()
         manager.detach_runtime.assert_called_once_with()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_construction_failure_after_restart_preserves_committed_heap(self) -> None:
         """Feature: MegaMoe public API and resource lifecycle.
 
@@ -786,8 +747,6 @@ class TestMegaMoeExperts(unittest.TestCase):
         self.assertEqual((manager.heap_bytes, manager.epoch), (4096, 1))
         self.assertEqual(manager.growth_records, [growth_record])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_workspace_close_failure_is_retryable(self) -> None:
         """Feature: MegaMoe public API and resource lifecycle.
 

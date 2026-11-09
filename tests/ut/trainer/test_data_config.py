@@ -25,7 +25,6 @@ from hyper_parallel.data.batching import FixedBatchDataLoader, build_dataloader
 from hyper_parallel.distributed_data import DistributedDataLoader, WorkloadCost
 from hyper_parallel.trainer.config.data import DataLoaderConfig
 from hyper_parallel.trainer.config.resolver import ConfigResolutionError, replace_override_path, resolve_component
-from tests.common.mark_utils import arg_mark
 
 
 def _resolve(suffix: str) -> DataLoaderConfig:
@@ -37,7 +36,6 @@ def _resolve(suffix: str) -> DataLoaderConfig:
 class TestDataLoaderBalanceConfig(unittest.TestCase):
     """Keep optional balance blocks separate from native DataLoader arguments."""
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_yaml_presence_and_round_trip(self) -> None:
         """Feature: Presence-based load balancing.
         Description: Resolve omitted, empty and populated YAML blocks, then serialize and reload.
@@ -59,7 +57,6 @@ class TestDataLoaderBalanceConfig(unittest.TestCase):
                 )
                 self.assertEqual(restored.load_balance, expected)
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_scalar_balance_blocks_are_rejected(self) -> None:
         """Feature: Balancing block validation.
         Description: Use obsolete boolean switches and other scalar values.
@@ -69,7 +66,6 @@ class TestDataLoaderBalanceConfig(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(ConfigResolutionError, "dataloader.load_balance"):
                 _resolve(f"load_balance: {value}")
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_balance_options_support_config_overrides(self) -> None:
         """Feature: DataLoader balancing overrides.
         Description: Add a balance block or update its existing window option through the CLI resolver.
@@ -86,7 +82,6 @@ class TestDataLoaderBalanceConfig(unittest.TestCase):
         self.assertEqual(enabled.load_balance, {"balance_window_size": 3})
         self.assertEqual(updated.to_dict()["load_balance"], {"balance_window_size": 5})
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_empty_balance_block_selects_collective_loader(self) -> None:
         """Feature: YAML to DataLoader integration.
         Description: Consume identical samples with an omitted or empty balance block.

@@ -60,7 +60,6 @@ from hyper_parallel.distributed.expert_parallel.experts import (  # noqa: E402
     ep_routed_dispatch,
     ep_routed_experts_and_combine,
 )
-from tests.common.mark_utils import arg_mark  # noqa: E402
 
 _EP_SIZE = 4
 _LOCAL_EXPERTS = 2
@@ -71,8 +70,6 @@ _TOP_K = 2
 _BATCH, _SEQ = 2, 2
 _ROWS_PER_PEER = 2
 _BARRIER_TIMEOUT = 20.0
-_CPU_MARKS = {"plat_marks": ["cpu_linux", "cpu_macos"], "level_mark": "level0",
-              "card_mark": "allcards", "essential_mark": "essential"}
 
 # A balanced plan: every rank dispatches two rows to each of the four ranks (two
 # local experts per rank, so destination rank = expert // 2), rotated so the rows
@@ -513,7 +510,6 @@ def _positions(entries: List[str], entry: str) -> List[int]:
 class TestSplitPathWithTheEqualKnob(unittest.TestCase):
     """Which collectives the dispatch split (``overlap_shared_expert``) issues."""
 
-    @arg_mark(**_CPU_MARKS)
     def test_scenario_is_balanced(self):
         """The plan the cases run on must be uniform, or the equal path cannot apply.
 
@@ -528,7 +524,6 @@ class TestSplitPathWithTheEqualKnob(unittest.TestCase):
                 self.assertEqual(counts, [_ROWS_PER_PEER] * _EP_SIZE,
                                  f"rank {rank} routes {counts}, not a balanced plan")
 
-    @arg_mark(**_CPU_MARKS)
     def test_knob_off_keeps_todays_ragged_split(self):
         """Unchanged behaviour: the split exchanges its tokens ragged, as today.
 
@@ -549,7 +544,6 @@ class TestSplitPathWithTheEqualKnob(unittest.TestCase):
             collections.Counter({(rank, uniform, uniform): 3 for rank in range(_EP_SIZE)}),
             f"every exchange must go through the lazy entry, got {run.lazy_calls}")
 
-    @arg_mark(**_CPU_MARKS)
     def test_knob_on_sends_the_whole_split_over_the_split_free_exchange(self):
         """The knob swaps all three exchanges of the split, not just one.
 
@@ -566,7 +560,6 @@ class TestSplitPathWithTheEqualKnob(unittest.TestCase):
         self.assertEqual(run.lazy_calls, [],
                          f"the lazy ragged entry must not be used, got {run.lazy_calls}")
 
-    @arg_mark(**_CPU_MARKS)
     def test_knob_on_waits_only_after_the_overlapped_work(self):
         """The wait is placed by the caller, after the work the split overlaps.
 
@@ -600,7 +593,6 @@ class TestSplitPathWithTheEqualKnob(unittest.TestCase):
                 self.assertLess(issued_at[2], waited_at[2],
                                 f"the combine must be waited after it is issued: {entries}")
 
-    @arg_mark(**_CPU_MARKS)
     def test_pending_dispatch_state_is_a_handle_that_the_consumer_waits(self):
         """The dispatched values reach the consumer as a pending handle.
 
@@ -634,7 +626,6 @@ class TestSplitPathWithTheEqualKnob(unittest.TestCase):
                          f"the exchanged indices are {tuple(indices.shape)}, "
                          f"expected [{rows}]")
 
-    @arg_mark(**_CPU_MARKS)
     def test_both_paths_agree_on_the_routed_output_and_its_gradient(self):
         """Knob on and knob off differ in the schedule only, not in the numbers.
 

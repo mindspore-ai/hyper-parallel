@@ -31,7 +31,6 @@ from hyper_parallel.distributed_data import (
     build_distributed_dataloader,
 )
 from hyper_parallel.distributed_data.transport import DataPlaneTransport
-from tests.common.mark_utils import arg_mark
 
 
 class _Mesh:
@@ -94,7 +93,6 @@ def _pack(samples: list[dict], seq_len: int) -> dict:
 class TestExternalStepSource(unittest.TestCase):
     """Verify source iteration, metadata, and externally owned recovery."""
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_device_prefetch_depth_requires_native_sampler(self) -> None:
         """Feature: External-step prefetch configuration.
         Description: Request device lookahead depths supported only by the native sampler path.
@@ -107,7 +105,6 @@ class TestExternalStepSource(unittest.TestCase):
                 _build(_Source(), device_prefetch_depth=depth)
             groups.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_non_planner_rank_consumes_source_without_plan_broadcast(self) -> None:
         """Feature: Independent planning for external steps.
         Description: Disable plan broadcast on a non-Planner rank with either collective schedule.
@@ -126,7 +123,6 @@ class TestExternalStepSource(unittest.TestCase):
                 self.assertEqual(list(loader), [[({"id": 0, "tokens": 4},)], [({"id": 1, "tokens": 5},)]])
                 self.assertEqual(plan.call_count, 2)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_source_steps_and_optional_epoch_hook(self) -> None:
         """Feature: External complete-step sources.
         Description: Consume two selected steps with the automatic balancing pipeline.
@@ -143,7 +139,6 @@ class TestExternalStepSource(unittest.TestCase):
         finally:
             loader.close()
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_source_does_not_require_checkpoint_hooks(self) -> None:
         """Feature: External source lifecycle validation.
         Description: Consume plain iterable steps, then wrap a caller-restored source.
@@ -166,7 +161,6 @@ class TestExternalStepSource(unittest.TestCase):
 class TestExternalStepCallbacks(unittest.TestCase):
     """Verify raw-step callbacks, buffering and source lifecycle without process groups."""
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_device_handoff_preserves_complete_batch_and_host_view(self) -> None:
         """Feature: Complete external-step device handoff.
         Description: Collate two steps as lists or tuples and stage separate pinned copies.
@@ -221,7 +215,6 @@ class TestExternalStepCallbacks(unittest.TestCase):
                             item["storage"].record_stream.assert_called_once_with(accelerator.current_stream.return_value)
                     self.assertEqual(accelerator.current_stream.return_value.wait_event.call_count, 2)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_shared_metadata_keeps_independent_occurrences(self) -> None:
         """Feature: Local-step metadata binding.
         Description: Return one shared metadata object for all raw samples in a step.
@@ -249,7 +242,6 @@ class TestExternalStepCallbacks(unittest.TestCase):
         self.assertIsNone(shared_metadata.key)
         self.assertEqual(shared_metadata.cost, WorkloadCost(llm=1))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_source_limit_stops_prefetch_and_reports_custom_cost(self) -> None:
         """Feature: Buffered local balancing.
         Description: Apply a custom cost model and truncate the external source with islice.
@@ -286,7 +278,6 @@ class TestExternalStepCallbacks(unittest.TestCase):
                 next(loader)
         self.assertEqual(reads, [0])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_padding_cost_is_included_in_rank_and_bin_statistics(self) -> None:
         """Feature: Padding-aware external-step diagnostics.
         Description: Plan two underfilled packs with the causal Attention square model.
@@ -311,7 +302,6 @@ class TestExternalStepCallbacks(unittest.TestCase):
             self.assertEqual(stats["accepted_objective"], 208)
             self.assertIn("cost=104, padding=10", logs.output[0])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_default_balancing_requires_backbone_dimensions(self) -> None:
         """Feature: Default cost model.
         Description: Build enabled balancing without model dimensions or a callback.
@@ -324,7 +314,6 @@ class TestExternalStepCallbacks(unittest.TestCase):
                 pack_fn=_pack, collate_fn=list, device="cpu",
             )
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_epoch_and_checkpoint_contract(self) -> None:
         """Feature: External source lifecycle.
         Description: Change epochs and request unsupported local checkpoint operations.
@@ -348,7 +337,6 @@ class TestExternalStepCallbacks(unittest.TestCase):
             with self.assertRaisesRegex(NotImplementedError, "checkpoint"):
                 loader.load_state_dict({})
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_background_collator_error_reaches_consumer(self) -> None:
         """Feature: Background failure propagation.
         Description: Raise from a user collator on the producer thread.

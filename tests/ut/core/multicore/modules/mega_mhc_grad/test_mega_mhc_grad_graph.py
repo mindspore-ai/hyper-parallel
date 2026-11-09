@@ -35,7 +35,6 @@ from hyper_parallel.core.multicore.scheduler.config import (
     TaskType,
     _validate_runtime_task_queues,
 )
-from tests.common.mark_utils import arg_mark
 
 
 NUM_CUBE_CORES = 20
@@ -45,8 +44,6 @@ NUM_VECTOR_CORES = 40
 class TestMegaMhcGradGraph(unittest.TestCase):
     """Validate task types, dependencies, tiling, and AIV queue order."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     @patch("hyper_parallel.core.multicore.modules.mega_mhc_grad.function.torch.npu", create=True)
     def test_resolve_core_counts_uses_device_vector_count(self, mock_npu) -> None:
         """Feature: HyperMegaMhcGrad device core discovery.
@@ -64,8 +61,6 @@ class TestMegaMhcGradGraph(unittest.TestCase):
             (NUM_CUBE_CORES, NUM_VECTOR_CORES),
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     @patch("hyper_parallel.core.multicore.modules.mega_mhc_grad.function.torch.npu", create=True)
     def test_resolve_core_counts_rejects_incompatible_mixed_ratio(self, mock_npu) -> None:
         """Feature: HyperMegaMhcGrad mixed-kernel core ratio.
@@ -81,8 +76,6 @@ class TestMegaMhcGradGraph(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "KERNEL_TYPE_MIX_AIC_1_2"):
             _resolve_core_counts(0)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_builds_rms_and_fused_prepare_pipeline(self) -> None:
         """Feature: HyperMegaMhcGrad task graph.
 
@@ -172,8 +165,6 @@ class TestMegaMhcGradGraph(unittest.TestCase):
             list(range(48)) + list(range(50, 54)),
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_order_groups_all_tiles_by_stage(self) -> None:
         """Feature: HyperMegaMhcGrad AIV scheduling.
 
@@ -199,8 +190,6 @@ class TestMegaMhcGradGraph(unittest.TestCase):
         self.assertEqual(task_types[120:200], [TaskType.TASK_MHC_GRAD_PREV_A_AND_MAPPING] * 80)
         self.assertEqual(task_types[200:280], [TaskType.TASK_MHC_GRAD_PREV_X_AND_POST] * 80)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_tail_macro_tile_waits_for_two_producers(self) -> None:
         """Feature: HyperMegaMhcGrad tail dependency.
 
@@ -217,8 +206,6 @@ class TestMegaMhcGradGraph(unittest.TestCase):
         self.assertEqual(config.all_event_num_triggers[layout.macro_ready_base], 2)
         self.assertEqual(config.all_event_num_triggers[layout.macro_ready_base + 1], 1)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_token_tile_is_tunable_and_auto_grows_for_event_capacity(self) -> None:
         """Feature: HyperMegaMhcGrad token tiling.
 
@@ -243,8 +230,6 @@ class TestMegaMhcGradGraph(unittest.TestCase):
         self.assertEqual(resolve_grad_token_tile(20000, 32), 64)
         self.assertEqual(resolve_grad_token_tile(40000, 32), 128)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_prev_x_post_uses_the_same_token_tile_as_other_aiv_tasks(self) -> None:
         """Feature: HyperMegaMhcGrad fused final stage.
 
@@ -274,8 +259,6 @@ class TestMegaMhcGradGraph(unittest.TestCase):
             )
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_reduction_output_initialization_uses_all_vector_workers(self) -> None:
         """Feature: HyperMegaMhcGrad reduction-output initialization.
 
@@ -310,8 +293,6 @@ class TestMegaMhcGradGraph(unittest.TestCase):
         )
         self.assertEqual(config.all_event_num_triggers[0], NUM_VECTOR_CORES)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_atomic_write_tail_is_reserved_at_event_boundary(self) -> None:
         """Feature: Backward event storage bounds.
 
@@ -334,8 +315,6 @@ class TestMegaMhcGradGraph(unittest.TestCase):
                             if task.trigger_event < MIN_EVENT_CAPACITY)
                 self.assertLessEqual(final + ATOMIC_ADD_VALUE_LEN, MIN_EVENT_CAPACITY)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_rejects_non_positive_shapes(self) -> None:
         """Feature: HyperMegaMhcGrad input validation.
 

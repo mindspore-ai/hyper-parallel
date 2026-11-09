@@ -46,7 +46,6 @@ from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41Model,
     bind_shared_expert_forward,
 )
-from tests.common.mark_utils import arg_mark
 
 
 def _config() -> DeepseekV4Config:
@@ -94,8 +93,6 @@ def _native_shared_oracle(module: torch.nn.Module, states: torch.Tensor) -> torc
 class TestV41SharedExpert(unittest.TestCase):
     """Check activation precision, autograd, state compatibility, and entry points."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_natural_document_compressor_matches_separate_documents(self) -> None:
         """Preserve pooling and RoPE across odd document boundaries.
 
@@ -125,8 +122,6 @@ class TestV41SharedExpert(unittest.TestCase):
         for parameter, target in zip(module.parameters(), reference.parameters()):
             torch.testing.assert_close(parameter.grad, target.grad)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_megamoe_workspace_prepared_once_before_forward(self) -> None:
         """Prepare model-owned expert sharing before the first native submission.
 

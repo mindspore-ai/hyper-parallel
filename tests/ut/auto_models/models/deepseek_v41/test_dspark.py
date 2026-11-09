@@ -28,8 +28,6 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from tests.common.mark_utils import arg_mark
-
 from hyper_parallel import init_empty_weights
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import build_layer_cropped_config
@@ -582,8 +580,6 @@ class TestHFLayerCropConfig(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "released hashing assets"):
                 build_layer_cropped_config(source, Path(directory) / "crop", text_layers=2)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_vision_depth_and_original_dimensions(self) -> None:
         """
         Feature: Runtime HF prefix-layer crop configuration.

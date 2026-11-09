@@ -26,7 +26,6 @@ from hyper_parallel.distributed_data.schema import (
     SampleMetadata,
     WorkloadCost,
 )
-from tests.common.mark_utils import arg_mark
 
 
 def _candidate(
@@ -59,7 +58,6 @@ def _reference_bins(candidates, bin_sizes) -> tuple[tuple[SampleKey, ...], ...]:
 class TestDynamicPackingPlanner(unittest.TestCase):
     """Verify exact-set sample balancing, fallback, overflow, and stability."""
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_explicit_target_slots_preserve_round_costs_with_multiple_bins(self) -> None:
         """Feature: Explicit window destinations independent of physical DP size.
         Description: Plan two DP2 rounds with two bins per destination, then one ordinary round.
@@ -87,7 +85,6 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         self.assertEqual([len(batch) for batch in plan.local_batches], [2, 2])
         self.assertEqual(planner.last_balance_decision["accepted_objective"], 9)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_target_slots_require_complete_nonempty_rounds(self) -> None:
         """Feature: Target-slot validation.
         Description: Supply invalid slot counts or a reference that does not fill the requested slots.
@@ -106,7 +103,6 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "target_slot_count.*non-empty bins"):
             planner.plan(samples, reference_bins=reference, step=0, target_slot_count=4)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_changing_window_sizes_and_assignment_failure_preserve_dp_size(self) -> None:
         """Feature: Planner reuse across differently sized windows.
         Description: Plan three, two, and one DP4 rounds after an assignment exception.
@@ -134,7 +130,6 @@ class TestDynamicPackingPlanner(unittest.TestCase):
                 self.assertEqual(planner.data_parallel_size, 4)
                 self.assertEqual(planner.distributed_bin_count, 4)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_schedule_intact_packs_after_greedy_fallback(self) -> None:
         """Feature: Intact-pack scheduling inside accumulation windows.
         Description: Keep twelve packs intact after assignment falls back to the reference.
@@ -163,7 +158,6 @@ class TestDynamicPackingPlanner(unittest.TestCase):
             )
             self.assertFalse(planner.last_balance_decision["accepted"])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_window_scheduling_respects_scope_and_equal_cost(self) -> None:
         """Feature: Scheduling scope and benefit gate.
         Description: Use a single round, multiple local bins, or identical-cost packs.
@@ -189,7 +183,6 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         self.assertFalse(planner.last_balance_decision["accepted"])
         self.assertEqual(tuple(batch[0].sample_keys for plan in plans for batch in plan.local_batches), reference)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_window_scheduling_keeps_better_unscheduled_balance_candidate(self) -> None:
         """Feature: Supported variance-objective compatibility.
         Description: LPT produces costs 200/2/3/3 where descending sorting worsens normalized variance.
@@ -210,7 +203,6 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         self.assertTrue(planner.last_balance_decision["accepted"])
         self.assertGreater(planner.last_balance_decision["relative_gain"], 0.1)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_scheduling_does_not_hide_invalid_subclass_assignments(self) -> None:
         """Feature: Validation before scheduling.
         Description: A custom LPT subclass loses samples while retaining the expected bin count.
@@ -232,7 +224,6 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "conserve every selected sample key"):
             planner.plan_window(samples, reference_bins=tuple((item.key,) for item in samples), step=0)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_custom_non_lpt_policy_keeps_its_window_order(self) -> None:
         """Feature: Custom assignment ownership.
         Description: Supply a non-LPT strategy whose intact packs could benefit from sorting.
@@ -263,7 +254,6 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         self.assertEqual(tuple(batch[0].sample_keys for plan in plans for batch in plan.local_batches), reference)
         self.assertEqual(planner.last_balance_decision["accepted_objective"], 17)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_planning_requires_bound_sample_keys(self) -> None:
         """Feature: Sample occurrence binding.
         Description: Construct an invalid key and pass unbound metadata directly to the planner.
@@ -279,7 +269,6 @@ class TestDynamicPackingPlanner(unittest.TestCase):
                 planner.plan((SampleMetadata(4),), reference_bins=((SampleKey(0, 0),),), step=0)
             estimate.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_repeated_dataset_indices_remain_distinct_occurrences(self) -> None:
         """Feature: Sample occurrence identity.
         Description: Plan two occurrences of the same Dataset index.
@@ -297,7 +286,6 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         self.assertEqual(set(plan.selected_keys), {sample.key for sample in samples})
         self.assertEqual(len(plan.selected_keys), 2)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_cost_estimation_preserves_input_metadata_and_fallback(self) -> None:
         """Feature: Cost estimation without a selection wrapper.
         Description: Estimate costs on a step whose greedy packing reaches a dead end.
@@ -325,7 +313,6 @@ class TestDynamicPackingPlanner(unittest.TestCase):
                     [WorkloadCost(encoder=index + 1) for index in range(len(samples))],
                 )
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_minimum_gain_uses_original_rank_grouping(self) -> None:
         """Feature: Native minimum balancing gain.
         Description: Require more improvement than the balanced placement provides.
@@ -344,7 +331,6 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         self.assertEqual(tuple(batch[0].sample_keys for batch in plan.local_batches), reference_bins)
         self.assertEqual([cost.llm for cost in plan.rank_costs], [18, 2])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_capacity_checks_remain_active_for_trusted_inputs(self) -> None:
         """Feature: Mandatory packing capacity.
         Description: Supply two individually valid samples that overflow their only bin.
@@ -360,7 +346,6 @@ class TestDynamicPackingPlanner(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "cannot admit sample"):
                     planner.plan(samples, reference_bins=_reference_bins(samples, (2,)), step=0)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_enabled_cost_first_balancing_keeps_nonimproving_reference(self) -> None:
         """Feature: Cost-first LPT planning.
         Description: Plan skewed and equal-cost selected sample sets.
@@ -386,7 +371,6 @@ class TestDynamicPackingPlanner(unittest.TestCase):
                         tuple(batch[0].sample_keys for batch in plan.local_batches), reference_bins,
                     )
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_balances_individual_samples_and_conserves_selection(self) -> None:
         """Feature: Sample-level load balancing.
         Description: Place complementary selected samples across data-parallel bins.
@@ -407,7 +391,6 @@ class TestDynamicPackingPlanner(unittest.TestCase):
             self.assertEqual(packing_bin.pack_tokens, 10)
             self.assertEqual(len(packing_bin.sample_keys), 2)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_workload_cost_changes_placement_not_step_membership(self) -> None:
         """Feature: Workload-aware sample placement.
         Description: Change sample costs while preserving packing footprints.
@@ -433,7 +416,6 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         self.assertEqual(set(first_plan.selected_keys), set(second_plan.selected_keys))
         self.assertNotEqual(first_plan.local_sample_keys(0), second_plan.local_sample_keys(0))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_falls_back_to_reference_packing_without_dropping_samples(self) -> None:
         """Feature: Reference-packing fallback.
         Description: Drive workload-aware greedy placement into a dead end.
@@ -456,7 +438,6 @@ class TestDynamicPackingPlanner(unittest.TestCase):
             ((0, 1, 2), (3, 4, 5)),
         )
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_rejects_a_balanced_plan_that_does_not_conserve_selection(self) -> None:
         """Feature: Plan conservation validation.
         Description: Inject a balanced plan that omits selected keys.
@@ -475,7 +456,6 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         ):
             planner.plan(candidates, reference_bins=reference_bins, step=0)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_candidate_gather_order_does_not_change_the_plan(self) -> None:
         """Feature: Deterministic distributed planning.
         Description: Plan candidates in forward and reverse gathered order.
@@ -503,7 +483,6 @@ class TestDynamicPackingPlanner(unittest.TestCase):
 
         self.assertEqual(forward, reversed_plan)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_oversized_sample_errors_by_default(self) -> None:
         """Feature: Oversized sample policy.
         Description: Select a sample larger than the configured sequence length.
@@ -517,7 +496,6 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires 12 tokens, exceeding seq_len=10"):
             planner.plan(samples, reference_bins=_reference_bins(samples, (1,)), step=0)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_single_policy_places_oversized_sample_alone(self) -> None:
         """Feature: Singleton oversized sample policy.
         Description: Enable explicit singleton placement for an oversized sample.

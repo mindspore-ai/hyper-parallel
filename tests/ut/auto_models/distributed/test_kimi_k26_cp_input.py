@@ -31,8 +31,6 @@ os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 import torch
 from torch import nn
 
-from tests.common.mark_utils import arg_mark
-
 from hyper_parallel.models.kimi_k26.adapter.distributed.context_parallel import (
     bind_context_parallel,
     build_cp_attention_mask,
@@ -93,8 +91,6 @@ def _make_kwargs(seq_len=8, pad_tail=2, batch_size=2):
 class TestBuildCpAttentionMask(unittest.TestCase):
     """``build_cp_attention_mask`` matches causal-offset + padding semantics."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_mask_is_offset_causal_and_padding_aware(self):
         """Row i of rank r admits j <= r*L + i and un-padded K/V positions."""
         seq_len, cp_size, pad_tail = 8, 2, 2
@@ -124,8 +120,6 @@ class TestBuildCpAttentionMask(unittest.TestCase):
                                 bool(mask[batch, 0, row, col].item()), expected
                             )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_mask_requires_the_complete_sequence(self):
         """The mask must be a 2D [B, S] tensor covering every rank's K/V."""
         with self.assertRaisesRegex(ValueError, "requires a 2D attention_mask"):
@@ -147,8 +141,6 @@ class TestBuildCpAttentionMask(unittest.TestCase):
 class TestBindContextParallel(unittest.TestCase):
     """``bind_context_parallel`` installs the rank-local text-tower input."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_cp1_is_a_no_op(self):
         """cp_size == 1 leaves the language-model forward untouched."""
         model = _FakeModel()
@@ -161,8 +153,6 @@ class TestBindContextParallel(unittest.TestCase):
         self.assertNotIn("forward", vars(language_model))
         self.assertFalse(getattr(language_model, "_hp_kimi_k26_cp_sharded", False))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_cp2_slices_embeds_and_offsets_positions(self):
         """Rank r receives its own embed window with global position ids."""
         seq_len, cp_size = 8, 2
@@ -190,8 +180,6 @@ class TestBindContextParallel(unittest.TestCase):
                 self.assertIsNone(call["past_key_values"])
                 self.assertFalse(call["use_cache"])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_bind_is_idempotent(self):
         """Rebinding a sharded tower keeps the already-installed forward."""
         model = _FakeModel()
@@ -202,8 +190,6 @@ class TestBindContextParallel(unittest.TestCase):
 
         self.assertIs(vars(model.model.language_model)["forward"], installed)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_forward_requires_inputs_embeds(self):
         """The media scatter must run before the text tower is entered."""
         model = _FakeModel()
@@ -212,8 +198,6 @@ class TestBindContextParallel(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "requires inputs_embeds"):
             model.model.language_model(input_ids=torch.zeros(2, 8, dtype=torch.long))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_forward_rejects_indivisible_sequence_length(self):
         """cp_size must divide the padded sequence length."""
         model = _FakeModel()
@@ -222,8 +206,6 @@ class TestBindContextParallel(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "divisible by cp_size"):
             model.model.language_model(**_make_kwargs(seq_len=8))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_rejects_unexpected_model_structure(self):
         """A non-Kimi config or a missing text tower fails fast."""
         with self.assertRaisesRegex(TypeError, r"model_type in \('kimi_k25', 'kimi_k26'\)"):

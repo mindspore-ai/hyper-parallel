@@ -19,7 +19,6 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from tests.common.mark_utils import arg_mark
 from tests.ut.codegen.helpers import SourceMLP, _replace_mlp
 
 from hyper_parallel.codegen.model_build_overlay import use_codegen_model_build_overlay
@@ -61,8 +60,6 @@ def _offline_config(*, tp: int = 1, cp: int = 1, ep: int = 1, pp: int = 1,
 class TestOfflineTopologyMatrix(unittest.TestCase):
     """Codegen accepts every supported combination without creating devices."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-              card_mark="onecard", essential_mark="unessential")
     def test_legal_parallel_combinations_preserve_requested_degrees(self):
         """Build representative TP/CP/EP/PP/FSDP combinations as pure metadata."""
         cases = (
@@ -96,8 +93,6 @@ class TestOfflineTopologyMatrix(unittest.TestCase):
                 self.assertEqual(mesh.edp_shard_size, edp_shard)
                 self.assertEqual(mesh.device_mesh.mesh_dim_names, ("dp", "cp", "tp"))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-              card_mark="onecard", essential_mark="unessential")
     def test_non_positive_parallel_degrees_match_trainer_compatibility(self):
         """Normalize non-positive degrees exactly as the native Trainer does."""
         fields = {
@@ -128,8 +123,6 @@ class TestOfflineTopologyMatrix(unittest.TestCase):
 class TestStrategyReplacementMatrix(unittest.TestCase):
     """Conditional strategies and replacements compose through one config."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-              card_mark="onecard", essential_mark="unessential")
     def test_cp_ep_and_module_replacement_can_be_declared_together(self):
         """Activate CP and EP sharding entries while compiling an independent replacement."""
         replacement = Target(
@@ -175,8 +168,6 @@ class TestStrategyReplacementMatrix(unittest.TestCase):
             "tests.ut.codegen.helpers._replace_mlp",
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-              card_mark="onecard", essential_mark="unessential")
     def test_inactive_conditional_strategies_do_not_disable_replacement(self):
         """Keep replacement declarations when CP/EP strategy conditions are inactive."""
         replacement = Target(
@@ -240,8 +231,6 @@ class TestGenerationFailureIsolation(unittest.TestCase):
             )
         self.assertEqual(events, ["methods", "plan"])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-              card_mark="onecard", essential_mark="unessential")
     def test_nested_overlays_restore_native_symbols_after_exception(self):
         """Restore AutoModel build and planner factories when generation raises."""
         model_class = auto_model._BaseHyperAutoModelClass  # pylint: disable=protected-access
@@ -255,8 +244,6 @@ class TestGenerationFailureIsolation(unittest.TestCase):
         self.assertIs(model_class.__dict__["_build_model"], original_build)
         self.assertIs(auto_model.instantiate_infrastructure, original_factory)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-              card_mark="onecard", essential_mark="unessential")
     def test_failure_does_not_prevent_a_subsequent_native_factory_call(self):
         """Call the restored native factory after an isolated codegen failure."""
         native_result = (object(), object())

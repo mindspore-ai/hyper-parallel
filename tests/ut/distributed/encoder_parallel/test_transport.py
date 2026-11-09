@@ -33,7 +33,6 @@ from hyper_parallel.models.deepseek_v41.vision import (
     DeepseekV41VisionTower,
     _vision_cos_sin,
 )
-from tests.common.mark_utils import arg_mark
 
 
 class TestEncoderTransport(unittest.TestCase):
@@ -72,7 +71,6 @@ class TestEncoderTransport(unittest.TestCase):
             finalize_plan=Mock(),
         )
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "allcards", "essential")
     def test_cpu_plan_precedes_device_payload_and_excludes_complete_images(self) -> None:
         """Feature: metadata-first image transport.
 
@@ -105,7 +103,6 @@ class TestEncoderTransport(unittest.TestCase):
         self.assertEqual(self.batch["pixel_values"].device.type, "cpu")
         self.assertEqual(runtime.finalize_plan.call_args.args[0], self.items)
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "allcards", "essential")
     def test_tp_destinations_receive_different_buckets_and_cp_shards(self) -> None:
         """Feature: destination-specific TP image transport.
 
@@ -139,7 +136,6 @@ class TestEncoderTransport(unittest.TestCase):
             torch.testing.assert_close(actual, self.bridge.pack_payload(self.batch, segments))
         self.assertTrue(all(tensor.numel() * tensor.element_size() <= 32 for tensor in broadcasts))
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "allcards", "essential")
     def test_local_rope_matches_full_grid_with_padding_and_empty_shards(self) -> None:
         """Feature: local rotary position construction.
 
@@ -163,7 +159,6 @@ class TestEncoderTransport(unittest.TestCase):
         dummy = build_segments((), 0, 2)
         torch.testing.assert_close(self.bridge.pack_payload({}, dummy), torch.zeros(1, 3, 2, 2))
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "allcards", "essential")
     def test_invalid_source_fails_before_plan_or_payload(self) -> None:
         """Feature: image transport input validation.
 
@@ -183,7 +178,6 @@ class TestEncoderTransport(unittest.TestCase):
                         transport(batch, broadcaster)
         runtime.finalize_plan.assert_not_called()
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "allcards", "essential")
     def test_inactive_batch_has_no_patch_allocation(self) -> None:
         """Feature: inactive visual input transport.
 

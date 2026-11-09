@@ -30,15 +30,8 @@ from hyper_parallel.models.qwen3_vl_moe.adapter.distributed import (
     context_parallel,
     expert_parallel,
 )
-from tests.common.mark_utils import arg_mark
 
 
-@arg_mark(
-    plat_marks=["cpu_linux", "cpu_macos"],
-    level_mark="level0",
-    card_mark="allcards",
-    essential_mark="essential",
-)
 def test_model_adapter_registers_its_distributed_providers() -> None:
     """The family registry resolves Qwen3-VL-MoE's own CP and EP providers."""
     spec = get_model_adapter("qwen3_vl_moe")
@@ -51,12 +44,6 @@ def test_model_adapter_registers_its_distributed_providers() -> None:
     assert spec.sharding_rules() == [("model.visual.", ParamRole.REPLICATED)]
 
 
-@arg_mark(
-    plat_marks=["cpu_linux", "cpu_macos"],
-    level_mark="level0",
-    card_mark="allcards",
-    essential_mark="essential",
-)
 def test_text_cp_keeps_global_2d_padding_mask() -> None:
     """Retain global padding metadata and restore variable-length kernel output."""
     query = torch.arange(32, dtype=torch.float32).reshape(2, 1, 4, 4)
@@ -133,12 +120,6 @@ def test_text_cp_window_uses_compressed_band_mask() -> None:
                 assert kernel.call_args.kwargs["actual_seq_qlen"] == ends, f"Expected sequence ends {ends}"
 
 
-@arg_mark(
-    plat_marks=["cpu_linux", "cpu_macos"],
-    level_mark="level0",
-    card_mark="allcards",
-    essential_mark="essential",
-)
 def test_text_input_cp_wrapper_slices_after_visual_injection() -> None:
     """The VLM wrapper shards text tensors while retaining matching visual features."""
     calls = []
@@ -172,12 +153,6 @@ def test_text_input_cp_wrapper_slices_after_visual_injection() -> None:
     torch.testing.assert_close(forwarded["deepstack_visual_embeds"][0], torch.tensor([[12.0], [13.0]]))
 
 
-@arg_mark(
-    plat_marks=["cpu_linux", "cpu_macos"],
-    level_mark="level0",
-    card_mark="allcards",
-    essential_mark="essential",
-)
 def test_vision_cp_wrapper_keeps_replicated_forward() -> None:
     """Vision compute remains replicated before the language sequence is sharded."""
     class _VisionModule(nn.Module):
@@ -196,12 +171,6 @@ def test_vision_cp_wrapper_keeps_replicated_forward() -> None:
     torch.testing.assert_close(target(inputs), inputs + 1)
 
 
-@arg_mark(
-    plat_marks=["cpu_linux", "cpu_macos"],
-    level_mark="level0",
-    card_mark="allcards",
-    essential_mark="essential",
-)
 def test_text_cp_wrapper_accepts_qwen3_vl_contract_without_sliding_window() -> None:
     """Qwen3-VL-MoE attention has a model-owned contract without sliding_window."""
     target = nn.Module()
@@ -224,12 +193,6 @@ def test_text_cp_wrapper_accepts_qwen3_vl_contract_without_sliding_window() -> N
     assert request.target is target
 
 
-@arg_mark(
-    plat_marks=["cpu_linux", "cpu_macos"],
-    level_mark="level0",
-    card_mark="allcards",
-    essential_mark="essential",
-)
 def test_ep_router_uses_qwen3_vl_model_outputs() -> None:
     """The VL EP adapter preserves the model-native router weights and indices."""
     weights = torch.tensor([[0.75, 0.25]])

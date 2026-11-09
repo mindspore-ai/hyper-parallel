@@ -59,7 +59,6 @@ from hyper_parallel.core.multicore.diagnostics.profiler.cycle_trace import _Prep
 from hyper_parallel.core.multicore.scheduler.config import RuntimeConfigC, TaskAiCoreType, TaskType
 from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph, OperatorNode, OpType, SplitSpec, TensorSpec
 from hyper_parallel.core.multicore.scheduler.runtime import allocate_runtime_config
-from tests.common.mark_utils import arg_mark
 
 
 def _two_stage_graph():
@@ -100,8 +99,6 @@ def _prepare(graph, config, **options):
 class TestMegaKernelDiagnosticContract(unittest.TestCase):
     """Reject structural errors before any runtime image reaches a Device."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_read_only_validation_accepts_termination_outside_task_num(self):
         """Feature: MegaKernel diagnostics.
         Description: Read only validation accepts termination outside task num.
@@ -114,8 +111,6 @@ class TestMegaKernelDiagnosticContract(unittest.TestCase):
         config.task_num = 3
         validate_mega_kernel_diagnostic_contract(graph, config, 3)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_rejects_bad_parameter_count_and_header_only_runtime(self):
         """Feature: MegaKernel diagnostics.
         Description: Rejects bad parameter count and header only runtime.
@@ -128,8 +123,6 @@ class TestMegaKernelDiagnosticContract(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "graph-sized"):
             validate_mega_kernel_diagnostic_contract(graph, RuntimeConfigC(), 3)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_rejects_graph_port_and_task_port_mismatches(self):
         """Feature: MegaKernel diagnostics.
         Description: Rejects graph port and task port mismatches.
@@ -146,8 +139,6 @@ class TestMegaKernelDiagnosticContract(unittest.TestCase):
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, "disagrees|does not match"):
                 validate_mega_kernel_diagnostic_contract(graph, config, 3)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_stage_directory_constraints_belong_only_to_dump(self):
         """Feature: MegaKernel diagnostics.
         Description: Stage directory constraints belong only to dump.
@@ -161,8 +152,6 @@ class TestMegaKernelDiagnosticContract(unittest.TestCase):
             with self.subTest(names=(first, second)), self.assertRaisesRegex(ValueError, "stage"):
                 tensor_dump._stage_names(graph.topological_sort())
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_rejects_missing_duplicate_and_out_of_capacity_schedule_entries(self):
         """Feature: MegaKernel diagnostics.
         Description: Rejects missing duplicate and out of capacity schedule entries.
@@ -174,8 +163,6 @@ class TestMegaKernelDiagnosticContract(unittest.TestCase):
             with self.subTest(task_id=task_id), self.assertRaisesRegex(ValueError, "schedule|scheduled"):
                 validate_mega_kernel_diagnostic_contract(graph, config, 3)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_rejects_graph_task_count_and_unmapped_compute_tasks(self):
         """Feature: MegaKernel diagnostics.
         Description: Rejects graph task count and unmapped compute tasks.
@@ -190,8 +177,6 @@ class TestMegaKernelDiagnosticContract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no graph stage"):
             validate_mega_kernel_diagnostic_contract(graph, config, 3)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_dynamic_view_constraints_belong_only_to_l1_dump(self):
         """Feature: MegaKernel diagnostics.
         Description: Dynamic view constraints belong only to l1 dump.
@@ -209,8 +194,6 @@ class TestMegaKernelDiagnosticContract(unittest.TestCase):
 class TestMegaKernelDiagnostics(unittest.TestCase):
     """Exercise the same public launch API for ordinary, L0, L1 and profiling modes."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_normal_preparation_ignores_unused_diagnostic_semantics(self):
         """Feature: MegaKernel diagnostics.
         Description: A broken optional diagnostic name or callback cannot break ordinary execution.
@@ -227,8 +210,6 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
         self.assertIsNone(adapter._runtime._metadata)
         owner.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_ordinary_launch_and_metadata_need_no_business_resolver(self):
         """Feature: MegaKernel diagnostics.
         Description: Ordinary launch and metadata need no business resolver.
@@ -251,8 +232,6 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "direction"):
                 adapter.launch([torch_ones(2)] * 3, direction="sideways", fallback_event_counters=events)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_owner_callback_and_profiling_use_public_adapter(self):
         """Feature: MegaKernel diagnostics.
         Description: Owner callback and profiling use public adapter.
@@ -275,8 +254,6 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
                 call.cancel()
             self.assertEqual(len(profiler._pending), 0)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_tools_prepare_independently_and_skipped_calls_remain_lazy(self):
         """Feature: MegaKernel diagnostics.
         Description: Tools prepare independently and skipped calls remain lazy.
@@ -317,8 +294,6 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
             self.assertEqual(adapter.runtime_config[RuntimeConfigC.diagnostic_mode.offset].item(), 0)
             self.assertEqual(config.diagnostic_mode, 0)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_inactive_dump_schedule_does_not_activate_launch(self):
         """Feature: MegaKernel diagnostics.
         Description: Inactive dump schedule does not activate launch.
@@ -339,8 +314,6 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
                 dumper.step()
                 self.assertTrue(adapter.is_active)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_l0_two_stage_dump_without_moe_semantics_or_port_customization(self):
         """Feature: MegaKernel diagnostics.
         Description: L0 two stage dump without moe semantics or port customization.
@@ -367,8 +340,6 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
             self.assertFalse(list(Path(directory).rglob("before")))
             self.assertFalse(list(Path(directory).rglob("after")))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_l1_public_launch_decodes_simulated_device_records(self):
         """Feature: MegaKernel diagnostics.
         Description: L1 public launch decodes simulated device records.
@@ -400,8 +371,6 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
             assert_close(torch_load(manifest_path.parent / record["file"], weights_only=True),
                                        torch_tensor([4.0, 5.0]))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_dynamic_bounds_failure_and_failed_launch_leave_no_dump(self):
         """Feature: MegaKernel diagnostics.
         Description: Dynamic bounds failure and failed launch leave no dump.
@@ -425,8 +394,6 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
                         raise RuntimeError("native failure")
             self.assertFalse(list(Path(directory).rglob("*.pt")))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_l1_rejects_invalid_views_noncontiguous_parameters_and_wrong_element_size(self):
         """Feature: MegaKernel diagnostics.
         Description: L1 rejects invalid views noncontiguous parameters and wrong element size.
@@ -462,8 +429,6 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-contiguous split"):
             tensor_dump_l1._default_tensor_view(operator, task, task.inputs[0], operator.inputs[0], "input", 0)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_mega_moe_forward_backward_plans_pass_public_contract_on_cpu(self):
         """Feature: MegaKernel diagnostics.
         Description: Mega moe forward backward plans pass public contract on cpu.
@@ -489,8 +454,6 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
                 )
                 call.cancel()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_mhc_native_ports_are_bound_lazily_without_changing_normal_runtime(self):
         """Feature: Native hard-coded ABI. Description: Bind both mHC graphs on CPU.
 
@@ -543,8 +506,6 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
             with tensor_dump.tensor_dump(unsupported), self.assertRaisesRegex(ValueError, "multi-core reductions"):
                 plans[1].runtime.launch(parameters, direction="backward", fallback_event_counters=torch_zeros(8))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_gate_broadcast_snapshots_keep_worker_payloads_and_files_separate(self):
         """Feature: Broadcast L1. Description: Simulate four workers on one task ID.
 
@@ -587,8 +548,6 @@ class TestMegaKernelDiagnostics(unittest.TestCase):
                 payload = torch_load(manifest.parent / task["tensors"][0]["file"], weights_only=True)
                 assert_close(payload, scores[task["coreId"]:task["coreId"] + 1])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_gate_acl_tail_output_is_captured_only_after_native_completion(self):
         """Feature: ACLNN tail L0. Description: Supply the result after a native call.
 

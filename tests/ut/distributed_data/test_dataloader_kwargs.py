@@ -36,7 +36,6 @@ from hyper_parallel.distributed_data.api import _normalize_dataloader_kwargs
 from hyper_parallel.distributed_data.metadata import PlannedSampleLoader
 from hyper_parallel.trainer.config import DataLoaderConfig
 from hyper_parallel.trainer.config.resolver import ConfigResolutionError, resolve_component
-from tests.common.mark_utils import arg_mark
 from tests.fixtures.data.workers import initialize_worker
 
 
@@ -54,7 +53,6 @@ def _metadata_fn(sample: dict[str, int]) -> SampleMetadata:
 class TestDataLoaderKwargs(unittest.TestCase):
     """Verify DataLoader execution options without ceding sample ownership."""
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_legacy_sampler_option_reports_renamed_field(self) -> None:
         """Feature: DataLoader configuration compatibility.
         Description: Resolve a removed dataloader_type option.
@@ -88,7 +86,6 @@ class TestDataLoaderKwargs(unittest.TestCase):
             "in_order": True,
         }
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_public_builder_exposes_keyword_only_dataloader_kwargs(self) -> None:
         """Feature: DataLoader execution options API.
         Description: Inspect the public builder's dataloader_kwargs parameter.
@@ -99,7 +96,6 @@ class TestDataLoaderKwargs(unittest.TestCase):
         self.assertEqual(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
         self.assertIsNone(parameter.default)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_dataloader_kwargs_preserve_supplied_options(self) -> None:
         """Feature: DataLoader execution options.
         Description: Normalize explicit options over independent execution defaults.
@@ -114,7 +110,6 @@ class TestDataLoaderKwargs(unittest.TestCase):
             self.assertIs(normalized[name], expected)
         self.assertEqual(supplied, original)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_omitted_execution_options_keep_native_defaults(self) -> None:
         """Feature: Default DataLoader execution.
         Description: Build online and metadata loaders without explicit worker settings.
@@ -147,7 +142,6 @@ class TestDataLoaderKwargs(unittest.TestCase):
         )
         return loaders[0]
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_trainer_forwards_execution_options_to_native_dataloader(self) -> None:
         """Feature: Trainer worker configuration.
         Description: Build with default and explicit DataLoader target options.
@@ -164,7 +158,6 @@ class TestDataLoaderKwargs(unittest.TestCase):
                     self.assertEqual(forwarded["num_workers"], supplied.get("num_workers", 0))
                     self.assertIsNone(forwarded["batch_size"], "Worker options must not change plan-aware batching.")
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_trainer_rejects_worker_options_in_packing_config(self) -> None:
         """Feature: Trainer configuration ownership.
         Description: Put DataLoader execution options in the distributed packing section.
@@ -178,7 +171,6 @@ class TestDataLoaderKwargs(unittest.TestCase):
                     self._trainer_loader({}, {name: self._execution_options()[name]})
                 dataloader_type.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_online_source_forwards_execution_options_to_native_dataloader(self) -> None:
         """Feature: Online sample loading options.
         Description: Build an online loader with custom worker execution options.
@@ -206,7 +198,6 @@ class TestDataLoaderKwargs(unittest.TestCase):
         self.assertIn("collate_fn", forwarded)
         self.assertIn("generator", forwarded)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_metadata_reader_forwards_execution_options_to_native_dataloader(self) -> None:
         """Feature: Metadata-mode sample loading options.
         Description: Build a metadata-mode loader with custom worker execution options.
@@ -236,7 +227,6 @@ class TestDataLoaderKwargs(unittest.TestCase):
         self.assertIn("collate_fn", forwarded)
         self.assertIn("generator", forwarded)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_rejects_framework_managed_and_unknown_options(self) -> None:
         """Feature: DataLoader option ownership.
         Description: Supply framework-managed or unsupported DataLoader options.
@@ -254,7 +244,6 @@ class TestDataLoaderKwargs(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, expected_error):
                     _normalize_dataloader_kwargs(supplied)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_rejects_invalid_worker_option_combinations(self) -> None:
         """Feature: DataLoader worker option validation.
         Description: Supply incompatible worker settings or invalid callback types.
@@ -274,7 +263,6 @@ class TestDataLoaderKwargs(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, expected_error):
                     _normalize_dataloader_kwargs(supplied)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_worker_validation_is_shared_by_kwargs_and_direct_readers(self) -> None:
         """Feature: Shared worker validation.
         Description: Supply invalid settings through execution kwargs and planned reads.
@@ -294,7 +282,6 @@ class TestDataLoaderKwargs(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     PlannedSampleLoader(self._samples(), seed=17, **options)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_accepts_string_and_object_multiprocessing_contexts(self) -> None:
         """Feature: Native DataLoader execution options.
         Description: Validate both supported multiprocessing context representations.
@@ -308,7 +295,6 @@ class TestDataLoaderKwargs(unittest.TestCase):
                 self.assertIs(options["multiprocessing_context"], context)
                 self.assertIs(options["worker_init_fn"], initialize_worker)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_direct_planned_reads_reject_unordered_results(self) -> None:
         """Feature: Ordered plan-aware reads.
         Description: Disable ordered results when constructing a planned reader directly.
@@ -320,7 +306,6 @@ class TestDataLoaderKwargs(unittest.TestCase):
                 prefetch_factor=2, persistent_workers=True, dataloader_kwargs={"in_order": False},
             )
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_planned_reads_replace_requests_with_persistent_workers(self) -> None:
         """Feature: Reusable plan-aware sample loading.
         Description: Fetch changing requests, repeated indices and an empty request with and without workers.
@@ -359,7 +344,6 @@ class TestDataLoaderKwargs(unittest.TestCase):
             device="cpu", cost_model=lambda metadata: metadata.cost, **kwargs,
         )
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_checkpoint_restore_allows_different_worker_options(self) -> None:
         """Feature: DataLoader checkpoint replay.
         Description: Resume online and metadata loaders with new worker settings in dataloader_kwargs.
@@ -379,7 +363,6 @@ class TestDataLoaderKwargs(unittest.TestCase):
                     resumed.load_state_dict(state)
                     self.assertEqual(list(resumed), expected, "Worker settings must not change checkpoint replay.")
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_checkpoint_restore_allows_changed_packing_config(self) -> None:
         """Feature: DataLoader checkpoint compatibility.
         Description: Resume both metadata modes with changed packing settings and optional legacy fingerprints.
@@ -406,7 +389,6 @@ class TestDataLoaderKwargs(unittest.TestCase):
                     resumed.load_state_dict(saved)
                     self.assertEqual(list(resumed), expected, "Compatible packing settings must preserve replay.")
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_checkpoint_restore_rejects_changed_reader_seed(self) -> None:
         """Feature: Deterministic reader checkpoint replay.
         Description: Restore online and metadata readers with a different worker seed.
@@ -422,7 +404,6 @@ class TestDataLoaderKwargs(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "checkpoint seed"):
                     resumed.load_state_dict(state)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_checkpoint_restore_rejects_another_rank(self) -> None:
         """Feature: Rank-local checkpoint ownership.
         Description: Restore a checkpoint saved by a different global rank in both loading modes.

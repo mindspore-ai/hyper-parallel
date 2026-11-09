@@ -22,14 +22,11 @@ from pathlib import Path
 
 from hyper_parallel.data.online.mapping import build_online_mapping_source
 from hyper_parallel.data.parallel.batch_sampler import build_dataset_batch_sampler
-from tests.common.mark_utils import arg_mark
 
 
 class TestOnlineMappingOrder(unittest.TestCase):
     """Keep source ordering separate from epoch sampling."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_training_horizon_preserves_cyclic_prefix(self):
         """Different training lengths must share the same initial samples.
 
@@ -57,8 +54,6 @@ class TestOnlineMappingOrder(unittest.TestCase):
                     actual = [source[i]["id"] for batch in sampler for i in batch]
                     self.assertEqual(actual, expected)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_cyclic_blend_preserves_source_order_and_weights(self):
         """Feature: Cyclic source ordering.
 
@@ -84,8 +79,6 @@ class TestOnlineMappingOrder(unittest.TestCase):
                         self.assertEqual([r["id"] for r in records if r["source"] == "b"],
                                          list(range(8)) + list(range(4)))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_single_keeps_target_sizing_and_cyclic_keeps_explicit_source(self):
         """Feature: Sampler-specific source policy.
 

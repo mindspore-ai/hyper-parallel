@@ -22,7 +22,6 @@ from unittest.mock import Mock, patch
 import torch
 
 from hyper_parallel.distributed_data.device_prefetch import DeviceStepPrefetcher, _move_to_device, _resolve_device
-from tests.common.mark_utils import arg_mark
 
 
 class _DeviceBatch:
@@ -40,7 +39,6 @@ class _DeviceBatch:
 class TestDeviceStepPrefetcher(unittest.TestCase):
     """Verify copy-stream launch, event ordering, and slot lifecycle."""
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_recursive_transfer_moves_all_tensor_fields(self) -> None:
         """Feature: Uniform device placement.
         Description: Transfer nested inputs, offsets and labels to a hardware-free meta device.
@@ -66,7 +64,6 @@ class TestDeviceStepPrefetcher(unittest.TestCase):
         self.assertIsInstance(moved["nested"][0]["labels"], tuple)
         self.assertEqual(moved["metadata"], batch["metadata"])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_gloo_device_selection_does_not_probe_accelerators(self) -> None:
         """Feature: Gloo device selection.
         Description: Resolve implicit CPU and explicit accelerator training devices.
@@ -78,7 +75,6 @@ class TestDeviceStepPrefetcher(unittest.TestCase):
             npu.is_available.assert_not_called()
             cuda.is_available.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_failed_copy_drains_only_copy_stream(self) -> None:
         """Feature: Failed H2D staging lifecycle.
         Description: Fail a batch item after launching the first copy.
@@ -101,7 +97,6 @@ class TestDeviceStepPrefetcher(unittest.TestCase):
             device_module.synchronize.assert_not_called()
             self.assertEqual(prefetcher._pending_staging, [])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_discarded_step_retains_staging_until_close(self) -> None:
         """Feature: Pending H2D staging lifecycle.
         Description: Close immediately after enqueueing an unconsumed device step.
@@ -122,7 +117,6 @@ class TestDeviceStepPrefetcher(unittest.TestCase):
             device_module.Event.return_value.synchronize.assert_called_once()
             self.assertEqual(prefetcher._pending_staging, [])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_producer_prefetch_binds_device_and_hands_off_storage(self) -> None:
         """Feature: Producer-owned H2D.
         Description: Stage two steps on one copy stream and consume the first.
@@ -150,7 +144,6 @@ class TestDeviceStepPrefetcher(unittest.TestCase):
             self.assertEqual(events, [("record_stream", device_module.current_stream.return_value)])
             self.assertIsNone(first.device_batch)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_complete_batch_preserves_containers_and_records_all_storage(self) -> None:
         """Feature: Complete-batch device handoff.
         Description: Prefetch multiple nested items in list, tuple and mapping batches.
@@ -178,7 +171,6 @@ class TestDeviceStepPrefetcher(unittest.TestCase):
                     self.assertEqual(events, [("record_stream", device_module.current_stream.return_value)] * 2)
                     prefetcher.close()
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_completed_copy_releases_source_before_device_delivery(self) -> None:
         """Feature: Pinned source ownership.
         Description: Keep a device result alive while retiring its copy by query or explicit close.

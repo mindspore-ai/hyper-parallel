@@ -30,7 +30,6 @@ import os
 import unittest
 from types import SimpleNamespace
 
-
 import torch
 from torch import nn
 
@@ -43,7 +42,6 @@ from hyper_parallel.distributed._builder.parameter_sharding import (
 )
 from hyper_parallel.distributed.plan import ShardingPlan
 from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
-from tests.common.mark_utils import arg_mark
 from tests.ut.auto_models.distributed.conftest import FakeDeviceMesh
 
 
@@ -89,15 +87,11 @@ def _boundary_plan():
 class TestApplyEntryValidation(unittest.TestCase):
     """Entry-point argument validation and return identity."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_missing_mesh_raises(self):
         """A None device mesh fails fast with a dedicated message."""
         with self.assertRaisesRegex(ValueError, "requires a DeviceMesh"):
             apply_sharding_plan(_TinyModel(), ShardingPlan(), None)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_empty_plan_returns_model_identity(self):
         """An empty plan mutates nothing and returns the same model object."""
         model = _TinyModel()
@@ -113,8 +107,6 @@ class TestApplyEntryValidation(unittest.TestCase):
 class TestForwardInstall(unittest.TestCase):
     """Production/validate wrapper installation characterization."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_validate_mode_installs_validate_forward_once(self):
         """validate_mode=True installs one validate wrapper around the original."""
         model = _TinyModel()
@@ -131,8 +123,6 @@ class TestForwardInstall(unittest.TestCase):
         output = model.child(torch.ones(2, 2))
         self.assertTrue(torch.equal(output, torch.ones(2, 2) * 2 + 4.0))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_production_mode_installs_production_forward_once(self):
         """validate_mode=False installs one production wrapper around the original."""
         model = _TinyModel()
@@ -147,8 +137,6 @@ class TestForwardInstall(unittest.TestCase):
         output = model.child(torch.ones(2, 2))
         self.assertTrue(torch.equal(output, torch.ones(2, 2) * 2 + 4.0))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_repeated_apply_nests_wrappers(self):
         """Current behavior: a second apply wraps again (no idempotency guard).
 
@@ -164,8 +152,6 @@ class TestForwardInstall(unittest.TestCase):
             model.child.forward.__wrapped__.__code__.co_name, "validate_forward"
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_injection_without_region_dispatch_fails_before_wrapping(self):
         """local_compute_fn without region_dispatch fails fast; forward untouched."""
         model = _TinyModel()
@@ -176,8 +162,6 @@ class TestForwardInstall(unittest.TestCase):
         # the original bound method is untouched (no wrapper installed)
         self.assertIs(getattr(model.child.forward, "__func__", None), _TinyChild.forward)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_region_dispatch_true_without_injection_fails(self):
         """region_dispatch=True with no injection is rejected as redundant."""
         model = _TinyModel()
@@ -191,8 +175,6 @@ class TestForwardInstall(unittest.TestCase):
 class TestTiedWeights(unittest.TestCase):
     """Tied-weight detection and within-rank storage sharing."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_detect_tied_weights(self):
         """tie_word_embeddings + shared parameter yields the (embed, lm_head) pair."""
         model = _TiedModel(tie_word_embeddings=True, share=True)
@@ -201,15 +183,11 @@ class TestTiedWeights(unittest.TestCase):
             [("embed_tokens.weight", "lm_head.weight")],
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_detect_tied_weights_disabled(self):
         """No tied pairs when the config does not tie word embeddings."""
         model = _TiedModel(tie_word_embeddings=False, share=True)
         self.assertEqual(detect_tied_weights(model), [])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_replicate_tied_weights_shares_storage(self):
         """End B's data is rebound to end A's storage; parameter objects stay."""
         model = _TiedModel(tie_word_embeddings=False, share=False)
@@ -225,8 +203,6 @@ class TestTiedWeights(unittest.TestCase):
             model.lm_head.weight.data_ptr(), model.embed_tokens.weight.data_ptr()
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_replicate_tied_weights_tolerates_missing_fqn(self):
         """A pair whose FQN does not resolve is skipped without error."""
         model = _TiedModel(tie_word_embeddings=False, share=False)

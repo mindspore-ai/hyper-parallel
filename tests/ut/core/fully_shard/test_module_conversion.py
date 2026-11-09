@@ -22,7 +22,6 @@ from torch.multiprocessing.reductions import StorageWeakRef
 
 from hyper_parallel.core.fully_shard.api import HSDPModule
 from hyper_parallel.core.fully_shard.param_group import AllGatherBucket
-from tests.common.mark_utils import arg_mark
 
 
 class ConvertedLinear(HSDPModule, torch.nn.Linear):
@@ -45,7 +44,6 @@ class ConvertedLinear(HSDPModule, torch.nn.Linear):
         """The test model starts sharded and has no distributed collectives."""
 
 
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 class TestModuleConversion(unittest.TestCase):
     """Keep zero-copy reuse valid while dropping obsolete allocations."""
 

@@ -26,8 +26,6 @@ import os
 import unittest
 
 
-from tests.common.mark_utils import arg_mark
-
 _FACADE_ALL = [
     "VLMBatchProcessor",
     "VLMGetBatch",
@@ -42,11 +40,9 @@ _FACADE_ALL = [
 class TestVlmFacadeExports(unittest.TestCase):
     """The data root package keeps the VLM facade out of its flat exports."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_data_root_does_not_flat_export_vlm(self):
         """The top-level data package never re-exports VLM symbols flat."""
-        import hyper_parallel.data as data
+        from hyper_parallel import data
 
         exported = set(getattr(data, "__all__", None) or [])
         for name in _FACADE_ALL:

@@ -27,7 +27,6 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
-from tests.common.mark_utils import arg_mark
 
 
 class TestMixedPrecisionCustomParams(unittest.TestCase):
@@ -49,8 +48,6 @@ class TestMixedPrecisionCustomParams(unittest.TestCase):
             mesh = DeviceMesh("cpu", [0, 1], mesh_dim_names=("fsdp",), _init_backend=False)
             fully_shard(model, mesh=mesh, mp_policy=policy, comm_fusion=comm_fusion)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_fields_override_policy_and_preserve_storage_dtype(self) -> None:
         """Feature: Per-field precision precedence.
         Description: Shard parameters with full, partial, absent, and explicit None overrides.
@@ -87,8 +84,6 @@ class TestMixedPrecisionCustomParams(unittest.TestCase):
                 self.assertEqual(state.hsdp_params[1].all_gather_inputs[0].dtype, torch.bfloat16)
                 self.assertEqual(state.hsdp_params[1].reduce_comm_dtype(), torch.float32)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_original_parameter_and_storage_are_released(self) -> None:
         """Feature: Source parameter identity without storage retention.
         Description: Keep a policy and shared-weight FSDP module alive after sharding replaces its weight.
@@ -123,8 +118,6 @@ class TestMixedPrecisionCustomParams(unittest.TestCase):
         self.assertEqual(state.hsdp_params[0].all_gather_inputs[0].dtype, torch.float32)
         self.assertEqual(state.hsdp_params[0].reduce_comm_dtype(torch.ones(4)), torch.float32)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_equal_valued_parameters_have_independent_overrides(self) -> None:
         """Feature: Parameter identity matching.
         Description: Configure different dtypes for two multi-element weights containing identical values.
@@ -141,8 +134,6 @@ class TestMixedPrecisionCustomParams(unittest.TestCase):
         self.assertEqual(policy.custom_params[id(second)], {"param_dtype": torch.float16})
         self.assertNotIn(id(nn.Parameter(torch.ones(2, 3))), policy.custom_params)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_native_dtensor_parameter_uses_its_override(self) -> None:
         """Feature: Native DTensor precision overrides.
         Description: Apply FSDP to an original DTensor Parameter with an FP32 override.
@@ -173,8 +164,6 @@ class TestMixedPrecisionCustomParams(unittest.TestCase):
         self.assertEqual(state.hsdp_params[0].all_gather_inputs[0].dtype, torch.float32)
         self.assertEqual(state.hsdp_params[0].reduce_comm_dtype(torch.ones(4)), torch.float32)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_override_values_are_copied(self) -> None:
         """Feature: Policy configuration ownership.
         Description: Modify the input dtype dictionary after creating a policy.
@@ -188,8 +177,6 @@ class TestMixedPrecisionCustomParams(unittest.TestCase):
 
         self.assertEqual(policy.custom_params[id(parameter)], {"param_dtype": torch.float32})
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_fused_communication_uses_overridden_dtypes(self) -> None:
         """Feature: Mixed-dtype communication fusion.
         Description: Unshard FP32 and BF16 parameters and bucket direct and accumulated gradients.
@@ -252,8 +239,6 @@ class TestMixedPrecisionCustomParams(unittest.TestCase):
                     hsdp_param.clear_reduce_scatter_output()
                 state.param_group.reset_iter_state()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_invalid_custom_params_fail_at_policy_construction(self) -> None:
         """Feature: Core precision configuration validation.
         Description: Supply FQN keys, tuple values, unknown fields, and non-Torch dtypes.
@@ -271,8 +256,6 @@ class TestMixedPrecisionCustomParams(unittest.TestCase):
             with self.subTest(custom_params=custom_params), self.assertRaisesRegex(ValueError, "custom_params"):
                 MixedPrecisionPolicy(custom_params=custom_params)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_fp32_override_keeps_original_low_precision_storage(self) -> None:
         """Feature: Separate compute and storage precision.
         Description: Shard a BF16 weight with an FP32 compute and reduction override.
@@ -293,8 +276,6 @@ class TestMixedPrecisionCustomParams(unittest.TestCase):
         self.assertEqual(state.hsdp_params[0].all_gather_inputs[0].dtype, torch.float32)
         self.assertEqual(state.hsdp_params[0].reduce_comm_dtype(torch.ones(4)), torch.float32)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_override_survives_meta_materialization(self) -> None:
         """Feature: Deferred precision initialization.
         Description: Materialize an FP32 meta weight as BF16 after the original Parameter is released.

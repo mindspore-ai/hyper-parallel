@@ -35,7 +35,6 @@ from hyper_parallel.core.multicore.modules.mega_mhc_grad.common import (
     validate_mega_mhc_grad_tensors,
 )
 from hyper_parallel.core.multicore.modules.mega_mhc_grad.plan import MegaMhcGradPlan
-from tests.common.mark_utils import arg_mark
 
 
 def _make_inputs() -> tuple[torch.Tensor, ...]:
@@ -75,8 +74,6 @@ def _make_gradients() -> tuple[torch.Tensor, ...]:
 class TestMegaMhcContracts(unittest.TestCase):
     """Validate all native tensor metadata before launching a kernel."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_training_hidden_and_token_limits(self) -> None:
         """Feature: Native shape contracts.
 
@@ -97,8 +94,6 @@ class TestMegaMhcContracts(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, f"at least {minimum} tokens"):
                     validate_mega_mhc_token_count(minimum - 1, cores)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_native_inputs_validate_every_dtype_and_device(self) -> None:
         """Feature: Production input validation.
 
@@ -132,8 +127,6 @@ class TestMegaMhcContracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "previous_output must have shape"):
             validate_mega_mhc_native_inputs(*inputs, need_backward=True, token_tile=32)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_rejects_cpu_and_invalid_scalar_inputs(self) -> None:
         """Feature: Native launch preconditions.
 
@@ -156,8 +149,6 @@ class TestMegaMhcContracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must be on"):
             validate_mega_mhc_tensor("test", inputs[0], (40, 128), inputs[0].dtype, torch.device("meta"))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_validates_every_gradient_and_cache_tensor(self) -> None:
         """Feature: Backward cache and gradient contracts.
 
@@ -188,8 +179,6 @@ class TestMegaMhcContracts(unittest.TestCase):
 class TestMegaMhcInvocationState(unittest.TestCase):
     """Exercise actual launch wrappers while mocking only native/device boundaries."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_cached_plans_do_not_own_event_tensors(self) -> None:
         """Feature: Immutable plan caching.
 
@@ -247,8 +236,6 @@ class TestMegaMhcInvocationState(unittest.TestCase):
             self.assertEqual(buffer.numel(), 4096)
             self.assertEqual(torch.count_nonzero(buffer).item(), 4096)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_forward_invocations_use_private_counters(self) -> None:
         """Feature: Forward invocation isolation.
 
@@ -257,8 +244,6 @@ class TestMegaMhcInvocationState(unittest.TestCase):
         """
         self._check_invocation_buffers(backward=False)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_backward_invocations_use_private_counters(self) -> None:
         """Feature: Backward invocation isolation.
 

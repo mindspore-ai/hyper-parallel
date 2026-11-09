@@ -37,7 +37,6 @@ from hyper_parallel.trainer.callbacks.checkpoint_callback import (
     _state_leaf_keys,
 )
 from hyper_parallel.trainer.state import TrainerState
-from tests.common.mark_utils import arg_mark
 
 _CALLBACK_MODULE = "hyper_parallel.trainer.callbacks.checkpoint_callback"
 _SUCCESS_LOG = "Checkpoint loaded successfully"
@@ -157,12 +156,6 @@ class TestCheckpointerCallbackRestore(unittest.TestCase):
         emitted = [str(call.args[0])[:40] for call in log.info.call_args_list if call.args]
         raise AssertionError(f"no {_SUCCESS_LOG!r} log was emitted, got={emitted}")
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_weights_only_restore_reports_a_fresh_position(self) -> None:
         """Load weights without the extra_state bundle and still report a position.
 
@@ -200,12 +193,6 @@ class TestCheckpointerCallbackRestore(unittest.TestCase):
             f"weights-only restore must report a fresh position: expected=(0, 0, 0), got={reported}",
         )
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_train_state_restore_maps_the_step_onto_an_epoch_position(self) -> None:
         """Map a restored global step onto its epoch and offset within that epoch.
 
@@ -249,7 +236,6 @@ class TestCheckpointerCallbackRestore(unittest.TestCase):
             f"restore must not carry the resume position on the trainer, got={carried}",
         )
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_restore_uses_loader_owned_state_template(self) -> None:
         """Feature: Loader-owned checkpoint restoration.
         Description: Supply an optional loading template while toggling loader-state restoration.
@@ -272,12 +258,6 @@ class TestCheckpointerCallbackRestore(unittest.TestCase):
 class TestCheckpointerCallbackAsyncFailure(unittest.TestCase):
     """Verify when a failed asynchronous save reaches the training loop."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_step_end_reports_a_failed_async_save_before_the_next_save(self) -> None:
         """Raise a failed async save at the next step, not at the next save.
 
@@ -435,8 +415,6 @@ class TestCheckpointerCallbackExternalValidation(unittest.TestCase):
                 patch(f"{_CALLBACK_MODULE}.build_checkpointer"):
             return CheckpointerCallback(trainer)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_async_and_peft_checkpointing_are_rejected(self) -> None:
         """Host external state requires synchronous non-PEFT checkpointing."""
         for flag in ({"is_async": True}, {"is_peft": True}):
@@ -444,29 +422,21 @@ class TestCheckpointerCallbackExternalValidation(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "synchronous non-PEFT"):
                     self._build(CheckpointingConfig(**flag))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_partial_save_is_rejected(self) -> None:
         """Host checkpoints must save optimizer and train state together."""
         with self.assertRaisesRegex(ValueError, "requires optimizer and train-state saving"):
             self._build(CheckpointingConfig(save_optimizer=False))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_partial_restore_is_rejected(self) -> None:
         """Host restores must include optimizer and train state together."""
         with self.assertRaisesRegex(ValueError, "restore requires optimizer and train state"):
             self._build(CheckpointingConfig(restore_from="x", restore_train_state=False))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_pp_requires_per_rank_extra_state(self) -> None:
         """Host PP checkpoints must write extra state per rank."""
         with self.assertRaisesRegex(ValueError, "per-rank extra state"):
             self._build(CheckpointingConfig(save_extra_state_per_rank=False), pp_size=2)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_compatible_configuration_passes(self) -> None:
         """A synchronous, complete, per-rank configuration is accepted."""
         callback = self._build(CheckpointingConfig())
@@ -476,8 +446,6 @@ class TestCheckpointerCallbackExternalValidation(unittest.TestCase):
 class TestStateLeafKeys(unittest.TestCase):
     """Dense optimizer manifest flattening."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_nested_optimizer_state_flattens_to_leaf_keys(self) -> None:
         """DCP traversal lists every persisted dense optimizer leaf."""
         keys = _state_leaf_keys({"state": {"w": {"exp_avg": 1}}, "param_groups": []})
@@ -487,8 +455,6 @@ class TestStateLeafKeys(unittest.TestCase):
 class TestModelStateDictExternal(unittest.TestCase):
     """External parameter exclusion from the persisted model state."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_external_parameters_are_stripped(self) -> None:
         """The dense payload drops every external FQN."""
         callback = _bare_callback(_external_trainer(CheckpointingConfig()))
@@ -497,8 +463,6 @@ class TestModelStateDictExternal(unittest.TestCase):
             state_dict = callback._model_state_dict()
         self.assertEqual(state_dict, {"dense": 1})
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_missing_external_fqn_is_rejected(self) -> None:
         """Every external FQN must exist in the model state dict."""
         callback = _bare_callback(_external_trainer(CheckpointingConfig()))
@@ -511,8 +475,6 @@ class TestModelStateDictExternal(unittest.TestCase):
 class TestSaveCheckpointExternal(unittest.TestCase):
     """External sidecar publication during checkpoint save."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_save_publishes_persisted_dense_keys(self) -> None:
         """The external save receives the dense optimizer leaf manifest."""
         callback = _bare_callback(_external_trainer(CheckpointingConfig()))
@@ -525,8 +487,6 @@ class TestSaveCheckpointExternal(unittest.TestCase):
         self.assertEqual(external.saved_runtime.persisted_optimizer_keys,
                          frozenset({"state.w"}))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_save_without_optimizer_publishes_an_empty_manifest(self) -> None:
         """A weights-only save reports no persisted dense optimizer keys."""
         callback = _bare_callback(_external_trainer(CheckpointingConfig()))
@@ -541,8 +501,6 @@ class TestSaveCheckpointExternal(unittest.TestCase):
 class TestLoadOptimizerPayloadExternal(unittest.TestCase):
     """Dense optimizer restore with external-state priming."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_unpersisted_dense_state_is_dropped(self) -> None:
         """Primed optimizer state outside the manifest is dropped after load."""
         callback = _bare_callback(_external_trainer(CheckpointingConfig()))
@@ -552,8 +510,6 @@ class TestLoadOptimizerPayloadExternal(unittest.TestCase):
         optimizer.load_state_dict.assert_called_once_with({"state": {}})
         optimizer.drop_unpersisted_dense_state.assert_called_once_with(frozenset({"state"}))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_weights_only_reload_restores_main_params(self) -> None:
         """Without optimizer leaves, mixed-precision main params are reloaded."""
         callback = _bare_callback(_external_trainer(CheckpointingConfig()))
@@ -576,8 +532,6 @@ class TestApplyRestoredPayloadExternal(unittest.TestCase):
                 missing_keys=["host"], unexpected_keys=[]))
         return callback
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_dense_keys_must_match_external_exclusions(self) -> None:
         """A dense payload that is not exactly the complement raises."""
         callback = self._ready_callback()
@@ -586,8 +540,6 @@ class TestApplyRestoredPayloadExternal(unittest.TestCase):
             callback._apply_restored_payload(
                 {"model": {"dense": 1}}, [], external, None, "path", None)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_load_result_keys_must_match_external_exclusions(self) -> None:
         """Unexpected missing keys from load_state_dict raise."""
         callback = self._ready_callback()
@@ -599,8 +551,6 @@ class TestApplyRestoredPayloadExternal(unittest.TestCase):
             callback._apply_restored_payload(
                 {"model": {"dense": 1}}, [], external, None, "path", None)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_weights_only_restore_reloads_mixed_precision_main_params(self) -> None:
         """A weights-only load finishes external state without optimizer moments."""
         callback = self._ready_callback()
@@ -634,8 +584,6 @@ class TestLoadCheckpointExternal(unittest.TestCase):
                 missing_keys=["host"], unexpected_keys=[]))
         return callback
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_no_restore_path_returns_early(self) -> None:
         """Without a restore path the load hook is a no-op."""
         callback = _bare_callback(_external_trainer(CheckpointingConfig()))
@@ -643,8 +591,6 @@ class TestLoadCheckpointExternal(unittest.TestCase):
         callback._load_checkpoint()
         callback.checkpointer.load.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_matching_dense_manifest_passes(self) -> None:
         """A load plan whose keys survive the skeleton proceeds to apply."""
         external = _FakeExternalState({"host": object()}, frozenset({"w"}))
@@ -655,8 +601,6 @@ class TestLoadCheckpointExternal(unittest.TestCase):
         self.assertEqual(external.load_runtime.step_dir, "ckpt_dir")
         callback._apply_restored_payload.assert_called_once()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_lost_dense_optimizer_keys_are_rejected(self) -> None:
         """Persisted keys missing from the loaded skeleton raise."""
         external = _FakeExternalState({"host": object()}, frozenset({"w", "lost"}))

@@ -48,7 +48,6 @@ from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41TopKRouter, _v41_sparse_moe_forward,
 )
 from hyper_parallel.trainer.config import entries_to_module_replacements
-from tests.common.mark_utils import arg_mark
 
 
 # Packaged CPU tests do not include repository-only training examples.
@@ -148,15 +147,12 @@ def _native_reference(module, inputs, indices, weights, *, expert_weights=None):
     return result.reshape(original_shape)
 
 
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 class TestDeepseekV41MegaMoe(unittest.TestCase):
     """Exercise target replacement, dynamic token execution and Trainer ownership."""
 
     # White-box assertions verify executor ownership and parameter lifetimes.
     # pylint: disable=protected-access
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_ordered_ep_subgroup_binds_without_world_size_assumption(self) -> None:
         """Feature: DSV4.1 automatic-token integration.
         Description: Expert FSDP may add ranks outside an ordered EP subgroup.
@@ -212,8 +208,6 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
                 self.assertFalse(mega.fsdp_config.mix_precision.cast_forward_inputs)
                 self.assertTrue(mega.optimizer.fp32_main_params)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_external_weights_preserve_gradients_and_state(self) -> None:
         """Feature: DSV4.1 automatic-token integration.
         Description: Use current tensors across calls and never register placeholder weights.
@@ -257,8 +251,6 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
                     experts.gate_up_proj.copy_(source.gate_up_proj.transpose(1, 2))
         self.assertEqual(len(experts.make_transforms()), 2)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_exception_does_not_retain_external_parameters(self) -> None:
         """Feature: DSV4.1 automatic-token integration.
         Description: An execution failure must not retain FSDP unsharded tensor views.
@@ -273,8 +265,6 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
         self.assertIsNone(experts._executor.gate_up_weight)
         self.assertEqual(len(list(experts.parameters())), 2)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_reject_mismatched_shared_limit_and_parallel_axes(self) -> None:
         """Feature: DSV4.1 automatic-token integration.
         Description: Fail before native initialization when source or topology differs.
@@ -311,8 +301,6 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
             bind.assert_called_once_with(module, 2, use_grouped_gemm=False, apply_gate=experts._apply_gate)
             self.assertEqual(route.call_args.kwargs["ep_group"], "ep-group")
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_multimodal_router_and_shared_expert_gradients(self) -> None:
         """Feature: DSV4.1 automatic-token integration.
         Description: Use real image/text router biases and propagate
@@ -357,8 +345,6 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
             torch.testing.assert_close(left, right, rtol=1e-5, atol=1e-5)
         self.assertGreater(actual_grads[0][image_mask].abs().sum().item(), 0)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_text_forward_signature_and_gradients(self) -> None:
         """Feature: DSV4.1 automatic-token integration.
         Description: Apply the real text MoE contract and preserve routed/shared gradients.
@@ -399,8 +385,6 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
         for left, right in zip(actual_grads, expected_grads):
             torch.testing.assert_close(left, right, rtol=1e-5, atol=1e-5)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_real_token_output_and_all_gradients(self) -> None:
         """Feature: DSV4.1 automatic-token integration.
         Description: Real token rows reach the executor unchanged and preserve every gradient.
@@ -461,8 +445,6 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'Configure every expert'):
                     DeepseekV41MegaMoeExperts.prepare_runtime_group([model.model.layers[0].mlp.experts])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_dispatch_transports_and_capacity_options(self) -> None:
         """Feature: DSV4.1 automatic-token integration.
         Description: Preserve push growth settings and reject push-only factors for pull.
@@ -490,8 +472,6 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
                                                    dispatch_mode="pull", **{option: 1.5})
                 experts.configure(None, 1, 2)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_meta_topology_and_incorrect_pairing(self) -> None:
         """Feature: DSV4.1 automatic-token integration.
         Description: Materialize meta experts and check parallel topology and replacement pairing.
@@ -510,8 +490,6 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, 'module replacement'):
             deepseek_v41_megamoe_compute_fn(module=module, mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=None)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_configured_experts_share_runtime_resources(self) -> None:
         """Feature: DSV4.1 automatic-token integration.
         Description: Configured experts share workspace and retain explicit cleanup.

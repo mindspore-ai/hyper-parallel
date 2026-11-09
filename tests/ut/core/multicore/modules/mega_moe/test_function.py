@@ -26,7 +26,6 @@ from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 from hyper_parallel.core.multicore.diagnostics import MegaKernelDiagnostics
 from hyper_parallel.core.multicore.modules.mega_moe import function as function_module
 from hyper_parallel.core.multicore.modules.mega_moe.function import _MegaMoeFunction
-from tests.common.mark_utils import arg_mark
 
 
 # The private autograd bridge and saved execution buffers are the contracts under test.
@@ -105,8 +104,6 @@ class TestMegaMoeFunction(unittest.TestCase):
             self.assertEqual(torch.count_nonzero(gradient).item(), 0,
                              msg=f"Empty-expert gradients: expected=0, actual={gradient}")
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_backward_unpacks_saved_tensors_once(self) -> None:
         """Feature: MegaKernel diagnostics.
         Description: Checkpoint unpack hooks must only be consumed once per backward call.
@@ -137,8 +134,6 @@ class TestMegaMoeFunction(unittest.TestCase):
         self.assertIs(result[2], execution.intermediates.grad_weight2)
         context.workspace.release.assert_called_once_with()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_deferred_backward_keeps_local_owned_storage_after_workspace_reuse(self) -> None:
         """Feature: Deferred backward storage.
         Description: Reuse the workspace between deferred forward and backward.
@@ -146,8 +141,6 @@ class TestMegaMoeFunction(unittest.TestCase):
         """
         self._check_deferred_backward(permuted=False)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_permutation_gradient_consumes_workspace_before_release(self) -> None:
         """Feature: Deferred backward storage.
         Description: Run the permutation gradient while tracking workspace release.
@@ -155,8 +148,6 @@ class TestMegaMoeFunction(unittest.TestCase):
         """
         self._check_deferred_backward(permuted=True)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_frozen_tokens_do_not_launch_a_permutation_gradient(self) -> None:
         """Feature: Deferred backward storage.
         Description: Backpropagate with frozen token activations.

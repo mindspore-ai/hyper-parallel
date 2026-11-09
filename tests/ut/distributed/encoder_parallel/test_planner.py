@@ -24,7 +24,6 @@ from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.distributed._builder.forward_rewriter import _descendant_boundary_fqns
 from hyper_parallel.distributed._builder.planner import ShardingPlanner
 from hyper_parallel.distributed.recipe_spec import TP
-from tests.common.mark_utils import arg_mark
 
 
 class _Model(nn.Module):
@@ -49,8 +48,6 @@ class TestEncoderPlanner(unittest.TestCase):
         """Evict backend-less cached sub-meshes so later suites rebuild real groups."""
         _DEVICE_MESH_MAP.clear()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_vision_source_only_specs_do_not_become_boundaries(self):
         """Feature: isolated visual source placement in the planner.
 

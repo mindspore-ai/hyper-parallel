@@ -25,7 +25,6 @@ from hyper_parallel.components.functional.aux_loss import (
     bind_aux_loss_scale,
     set_aux_loss_scale,
 )
-from tests.common.mark_utils import arg_mark
 
 
 class TestAuxLossScale(unittest.TestCase):
@@ -40,8 +39,6 @@ class TestAuxLossScale(unittest.TestCase):
         """Restore the standalone API's default scale."""
         set_aux_loss_scale(torch.tensor(1.0))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_weighting_and_checkpoint_match_explicit_loss(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.
@@ -70,8 +67,6 @@ class TestAuxLossScale(unittest.TestCase):
                         torch.testing.assert_close(value.grad, expected)
                         torch.testing.assert_close(output, value.detach().square())
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_contexts_and_manual_scale_do_not_leak(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.
@@ -95,8 +90,6 @@ class TestAuxLossScale(unittest.TestCase):
         aux_loss_auto_scale(standalone * 0, standalone.square()).backward()
         torch.testing.assert_close(standalone.grad, torch.tensor(28.0))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_no_auxiliary_loss_leaves_main_gradient_unchanged(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.

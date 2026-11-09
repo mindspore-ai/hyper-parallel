@@ -27,7 +27,6 @@ from hyper_parallel.distributed_data import (
     collate_indexed_text_sequences,
     pack_indexed_text_samples,
 )
-from tests.common.mark_utils import arg_mark
 
 
 class _StandaloneMesh:
@@ -60,7 +59,6 @@ class _MetadataDataset:
 class TestIndexedTextConstruction(unittest.TestCase):
     """Verify fixed row shapes and sample boundaries after dynamic packing."""
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_pack_and_collate_preserve_boundaries_and_mask_padding(self) -> None:
         """Feature: Built-in Indexed text Data Constructor.
         Description: Pack two bins with and without a padding tail.
@@ -84,7 +82,6 @@ class TestIndexedTextConstruction(unittest.TestCase):
         self.assertEqual(batch["labels"].tolist(), [[2, 9, 9, -100, -100], [5, 6, 7, 8, 9]])
         self.assertEqual(batch["cu_seq_lens"].tolist(), [0, 2, 3, 5, 10])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_builder_uses_explicit_metadata(self) -> None:
         """Feature: Unified distributed DataLoader API.
         Description: Supply aligned metadata separately from a mapping Dataset.
@@ -107,7 +104,6 @@ class TestIndexedTextConstruction(unittest.TestCase):
         self.assertEqual(sorted(sample["input_ids"].tolist() for sample in batch), [[1, 2], [3, 4, 5, 6]])
         self.assertEqual(dataset.payload_reads, 2)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_builder_requires_explicit_metadata(self) -> None:
         """Feature: Explicit offline metadata source.
         Description: Omit metadata for a mapping Dataset in offline mode.
@@ -125,7 +121,6 @@ class TestIndexedTextConstruction(unittest.TestCase):
             )
         self.assertEqual(dataset.payload_reads, 0)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_builder_calls_metadata_fn_with_selected_samples(self) -> None:
         """Feature: Explicit online metadata source.
         Description: Supply a metadata callback for a mapping Dataset.

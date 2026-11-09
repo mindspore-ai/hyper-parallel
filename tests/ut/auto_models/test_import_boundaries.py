@@ -39,16 +39,12 @@ import unittest
 from pathlib import Path
 
 
-from tests.common.mark_utils import arg_mark
-
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 class TestImportBoundaries(unittest.TestCase):
     """Import-time side-effect rules for the entry packages."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_import_has_no_distributed_or_network_side_effects(self):
         """Importing entry packages inits no process group, opens no socket."""
         probe = r"""

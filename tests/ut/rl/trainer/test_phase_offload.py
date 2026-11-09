@@ -25,7 +25,6 @@ from rl.workers.engine.residency import TrainingResidency
 
 from hyper_parallel.components.optim.mixed_precision_optimizer import Float16OptimizerWithFloat16Params
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
-from tests.common.mark_utils import arg_mark
 
 
 def build_optimizer(model: torch.nn.Module) -> Float16OptimizerWithFloat16Params:
@@ -41,7 +40,6 @@ def update(model: torch.nn.Module, optimizer: Float16OptimizerWithFloat16Params)
     optimizer.zero_grad(set_to_none=True)
 
 
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 class TestPhaseOffload(unittest.TestCase):
     """Preserve optimizer identity, CPU policy, and update semantics."""
 

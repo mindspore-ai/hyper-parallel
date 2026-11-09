@@ -26,7 +26,6 @@ from hyper_parallel.components.quantization.functional.hifloat8_gmm_func import 
 from hyper_parallel.components.quantization.functional.mxfp8_gmm_func import MXFP8GroupedLinear
 from hyper_parallel.components.quantization.functional.w4a8_gmm_func import W4A8GroupedLinear
 from hyper_parallel.components.quantization.modules.grouped_experts import GroupedExperts
-from tests.common.mark_utils import arg_mark
 
 
 def _cpu_projection(
@@ -127,7 +126,6 @@ class TestGroupedExpertsRoutingPrecision(unittest.TestCase):
         for parameter, reference_parameter in zip(parameters, reference_parameters):
             torch.testing.assert_close(parameter, reference_parameter, rtol=0, atol=0)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_outputs_gradients_and_update_keep_each_formats_original_precision(self) -> None:
         """Every grouped strategy restores dtype once after routed reduction."""
         cases = (
@@ -148,7 +146,6 @@ class TestGroupedExpertsRoutingPrecision(unittest.TestCase):
                                 top_k,
                             )
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_v41_activation_limit_is_preserved(self) -> None:
         """V4.1's clipped SwiGLU is retained by the shared expert replacement."""
         self._check_case(

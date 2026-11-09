@@ -40,7 +40,6 @@ os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 import torch
 
-from tests.common.mark_utils import arg_mark
 
 # The VLM package facade pulls transformers.AutoProcessor, whose lazy import chain
 # ends in torchvision; some CI pythons lack liblzma and cannot import it.
@@ -98,20 +97,14 @@ class TestInferSeqlen(unittest.TestCase):
 
         return _infer_seqlen
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_small_response_keeps_everything_it_needs(self):
         """``target_len * 2 < cutoff_len``: the response is not cut."""
         self.assertEqual(self._infer_seqlen()(900, 100, 1000), (900, 100))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_small_prompt_gives_the_rest_to_the_response(self):
         """``source_len * 2 < cutoff_len``: target gets ``cutoff_len - source_len``."""
         self.assertEqual(self._infer_seqlen()(200, 900, 1000), (200, 800))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_both_large_splits_proportionally(self):
         """Both sides large: the budget is split by size, truncated with ``int()``."""
         # The real mock-dataset shape: 8803 prompt tokens, 5131 response tokens.
@@ -131,8 +124,6 @@ class TestTruncateMode(unittest.TestCase):
         return KimiVLMChatTransform(processor=object(), max_seq_len=600,
                                     truncate_mode=truncate_mode, **kwargs)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_proportional_keeps_the_head_of_the_response(self):
         """Half the sample is supervised: the cut lands inside the response."""
         from hyper_parallel.models.kimi_k26.adapter.data.transform_fn import _infer_seqlen
@@ -158,8 +149,6 @@ class TestTruncateMode(unittest.TestCase):
         self.assertTrue(torch.equal(out["input_ids"][new_source_len:], torch.arange(500, 800)))
         self.assertTrue((out["labels"][600:] == IGNORE_INDEX).all())
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_head_mode_reproduces_the_old_cut(self):
         """``"head"`` keeps the leading 600 tokens, exactly as before."""
         sample = _sample(1000, supervised_from=500)
@@ -172,8 +161,6 @@ class TestTruncateMode(unittest.TestCase):
         self.assertEqual(int((out["labels"] != IGNORE_INDEX).sum()), 100)
         self.assertTrue((out["labels"][600:] == IGNORE_INDEX).all())
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_head_mode_loses_the_response_when_the_prompt_fills_the_window(self):
         """The bug the proportional mode fixes: 800 prompt + 200 response at 600."""
         sample = _sample(1000, supervised_from=800)
@@ -185,8 +172,6 @@ class TestTruncateMode(unittest.TestCase):
         self.assertEqual(int((prop_out["labels"] != IGNORE_INDEX).sum()), 200)
         self.assertEqual(int(prop_out["input_ids"].shape[0]), 600)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_no_supervised_token_falls_back_to_head(self):
         """With nothing supervised to preserve the proportional mode is a head cut."""
         sample = _sample(1000)
@@ -196,8 +181,6 @@ class TestTruncateMode(unittest.TestCase):
         self.assertTrue(torch.equal(out["input_ids"][:600], torch.arange(600)))
         self.assertEqual(int((out["labels"] != IGNORE_INDEX).sum()), 0)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_short_sample_is_untouched_by_either_mode(self):
         """Below ``max_seq_len`` neither mode cuts: only padding is applied."""
         sample = _sample(300, supervised_from=200)
@@ -213,8 +196,6 @@ class TestTruncateMode(unittest.TestCase):
         self.assertTrue(torch.equal(outputs[0]["input_ids"], outputs[1]["input_ids"]))
         self.assertTrue(torch.equal(outputs[0]["labels"], outputs[1]["labels"]))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_mode_validation_and_default(self):
         """Only the two documented strings are accepted; the default preserves loss."""
         self.assertEqual(self._transform().truncate_mode, "proportional")
@@ -225,8 +206,6 @@ class TestTruncateMode(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "truncate_mode"):
                     self._transform(bad)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_builder_forwards_the_option(self):
         """The builder passes ``truncate_mode`` through and defaults to proportional."""
         from hyper_parallel.models.kimi_k26.adapter.data.transform_fn import build_kimi_vlm_data_transform

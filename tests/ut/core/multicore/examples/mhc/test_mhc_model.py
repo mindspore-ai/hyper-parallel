@@ -36,7 +36,6 @@ from hyper_parallel.core.multicore.examples.mhc.mhc import MhcBoundary
 from hyper_parallel.core.multicore.examples.mhc.model import (
     MhcTransformerConfig, MhcTransformerModel, _finish_state, _initialize_state,
 )
-from tests.common.mark_utils import arg_mark
 from tests.common.multicore.mega_mhc_golden import torch_mega_mhc
 
 rms_norm_module = importlib.import_module("hyper_parallel.components.functional.rms_norm")
@@ -83,8 +82,6 @@ class TestDenseMhcModel(unittest.TestCase):
             model, build_optimizer(model, learning_rate=1e-3, weight_decay=0.01), inputs, inputs.clone(),
             torch.device("cpu")) for name, model in self._models().items()}
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_state_bootstrap_and_final_pending_output_preserve_gradients(self) -> None:
         """Feature: Model-owned mHC state.
         Description: Initialize independent states and apply the final pending block output.
@@ -107,8 +104,6 @@ class TestDenseMhcModel(unittest.TestCase):
         final.float().sum().backward()
         torch.testing.assert_close(output.grad, torch.ones_like(output), rtol=0, atol=0)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_dense_architecture_contains_no_router_or_experts(self) -> None:
         """Feature: Independent mHC example.
         Description: Construct a dense model without an expert-parallel configuration.
@@ -126,8 +121,6 @@ class TestDenseMhcModel(unittest.TestCase):
             self.assertEqual(layer.attention_mhc.phi.dtype, torch.float32)
             self.assertEqual(layer.mlp.gate_up.weight.dtype, torch.bfloat16)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_complete_dense_training_and_optimizer_parity(self) -> None:
         """Feature: Dense mHC training parity.
         Description: Compare actual model loss, logits, every gradient and FP32-master AdamW updates.
@@ -149,8 +142,6 @@ class TestDenseMhcModel(unittest.TestCase):
         self.assertEqual(result["gradients"]["tensor_count"], expected)
         self.assertTrue(all(layer.attention_mhc.use_mega_mhc for layer in workloads["mega"].model.layers))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_boundary_comparison_keeps_all_outputs_and_gradients(self) -> None:
         """Feature: mHC boundary precision.
         Description: Compare the five outputs and nine input/parameter gradients before full-model validation.
@@ -165,8 +156,6 @@ class TestDenseMhcModel(unittest.TestCase):
             self.assertEqual(result[f"{backend}_forward"]["tensor_count"], 5)
             self.assertEqual(result[f"{backend}_gradients"]["tensor_count"], 9)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_corrupted_initial_parameters_are_rejected(self) -> None:
         """Feature: Matched initial state.
         Description: Change one dense parameter before paired training.
@@ -178,8 +167,6 @@ class TestDenseMhcModel(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "initial parameters"):
             benchmark._validate_models(workloads)  # pylint: disable=protected-access
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_multi_rank_launch_is_rejected_before_device_initialization(self) -> None:
         """Feature: Local mHC execution.
         Description: Attempt the single-device example under a multi-rank launcher.
@@ -190,8 +177,6 @@ class TestDenseMhcModel(unittest.TestCase):
             benchmark._build_workloads(benchmark.parse_args([]))  # pylint: disable=protected-access
         select.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_small_inputs_use_the_native_token_limit(self) -> None:
         """Feature: Device-dependent mHC training shapes.
         Description: Reject inputs below each device's native backward reduction minimum.
@@ -206,8 +191,6 @@ class TestDenseMhcModel(unittest.TestCase):
                 benchmark._build_workloads(benchmark.parse_args(["--tokens", str(tokens)]))
             build.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_cli_has_no_expert_or_communication_options(self) -> None:
         """Feature: Independent mHC command line.
         Description: Validate local workload arguments and reject MoE-only controls.
@@ -222,8 +205,6 @@ class TestDenseMhcModel(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "tokens must be positive"):
             benchmark.parse_args(["--tokens", "0"])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_import_does_not_load_moe_or_initialize_distributed(self) -> None:
         """Feature: Independent dense example.
         Description: Import the model and benchmark in a fresh interpreter.
@@ -243,8 +224,6 @@ class TestMhcBoundary(unittest.TestCase):
     """Compare all outputs and gradients with the independent semantic oracle."""
 
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_projection_restores_hf32_after_failure(self) -> None:
         """Feature: MegaKernel model integration.
         Description: Projection restores hf32 after failure.
@@ -264,8 +243,6 @@ class TestMhcBoundary(unittest.TestCase):
                     mhc_module._mapping_logits(residual, torch.ones(24, 512), 1e-6)
                 self.assertEqual(matmul_config.allow_hf32, previous)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_common_runs_without_omni_registration(self) -> None:
         """Feature: MegaKernel model integration.
         Description: Common runs without omni registration.

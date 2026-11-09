@@ -26,7 +26,6 @@ from hyper_parallel.data.batching.runtime_input import (
     RuntimeInputAdapter,
     RuntimeInputContext,
 )
-from tests.common.mark_utils import arg_mark
 
 
 class _ModalityRuntimeAdapter(RuntimeInputAdapter):
@@ -85,8 +84,6 @@ class TestRuntimeInputAdapter(unittest.TestCase):
         batch_runtime.sequence_parallel = False
         return batch_runtime
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_omni_batch_merges_non_attention_runtime_inputs(self):
         """Exercise a model-owned extension of an Omni batch.
 
@@ -116,8 +113,6 @@ class TestRuntimeInputAdapter(unittest.TestCase):
         )
         self.assertEqual(model_inputs["runtime_cp_rank"], 1)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_omni_batch_rejects_runtime_field_collision(self):
         """Reject a runtime adapter that replaces encoded Omni fields.
 
@@ -136,8 +131,6 @@ class TestRuntimeInputAdapter(unittest.TestCase):
                 parallel_batch
             )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_runtime_context_is_feature_neutral(self):
         """Keep model-specific options opaque to the generic context.
 

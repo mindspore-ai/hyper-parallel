@@ -21,8 +21,6 @@ import pytest
 import torch
 from torch import nn
 
-from tests.common.mark_utils import arg_mark
-
 from hyper_parallel.codegen import model_build_overlay
 from hyper_parallel.codegen.plan.observation import observe_emission_plan
 from hyper_parallel.codegen.session import CodegenBuildSession
@@ -48,8 +46,6 @@ def _session():
     return session
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_native_plan_still_applies_sharding(monkeypatch):
     """Native planning retains its original application behavior.
 
@@ -83,8 +79,6 @@ def test_native_plan_still_applies_sharding(monkeypatch):
     assert calls == {"plan": 1, "apply": 1}
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_codegen_observation_does_not_apply_sharding(monkeypatch):
     """Codegen freezes plan facts without invoking the native applier.
 
@@ -112,8 +106,6 @@ def test_codegen_observation_does_not_apply_sharding(monkeypatch):
     assert snapshot.to_dict()["plan"]["param_plan"] == {}
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_codegen_observation_reuses_native_compute_preflight(monkeypatch):
     """Offline planning rejects the same incomplete injection as native apply."""
     plan = _plan()
@@ -146,8 +138,6 @@ def test_codegen_observation_reuses_native_compute_preflight(monkeypatch):
     assert calls == [(plan, device_mesh, model)]
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_codegen_observation_rejects_missing_ep_compute_source():
     """The real native preflight rejects an EP boundary before publication."""
     plan = SimpleNamespace(
@@ -182,8 +172,6 @@ def test_codegen_observation_rejects_missing_ep_compute_source():
         )
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_pure_data_parallel_with_replacement_is_derived_without_planner_call():
     """An observed replacement remains source-visible without model sharding."""
     session = CodegenBuildSession()
@@ -234,8 +222,6 @@ def test_pure_data_parallel_with_replacement_is_derived_without_planner_call():
         (object(), _mesh(device_mesh=None), False, "device_mesh_unavailable"),
     ),
 )
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_codegen_plan_guards_record_reason(planner, mesh, is_hf_model, reason):
     """Codegen records why no distributed plan is required.
 
@@ -250,8 +236,6 @@ def test_codegen_plan_guards_record_reason(planner, mesh, is_hf_model, reason):
     assert snapshot.reason == reason
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_observed_injections_ignore_module_insertion_order():
     """Observed injections have deterministic ordering.
 
@@ -274,8 +258,6 @@ def test_observed_injections_ignore_module_insertion_order():
     assert [item["match"] for item in forward_observed["injections"]] == ["block.0", "block.1"]
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_observation_excludes_native_execution_only_fields():
     """Source emission ignores plan fields owned by native parameter execution."""
     spec = SimpleNamespace(
@@ -296,8 +278,6 @@ def test_observation_excludes_native_execution_only_fields():
     assert "frozen_sharded_params" not in observed
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_model_build_overlay_restores_native_classmethod():
     """The CLI build override is scoped and reversible.
 
@@ -312,8 +292,6 @@ def test_model_build_overlay_restores_native_classmethod():
     assert model_class.__dict__["_build_model"] is original
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_codegen_model_init_context_places_parameters_and_buffers_on_meta():
     """The CLI observation model owns no CPU parameter or buffer storage."""
     with model_build_overlay._codegen_model_init_context():
@@ -325,8 +303,6 @@ def test_codegen_model_init_context_places_parameters_and_buffers_on_meta():
     assert module.inv_freq.is_meta
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_offline_publication_restores_rng(monkeypatch):
     """Snapshot publication cannot advance host RNG state.
 

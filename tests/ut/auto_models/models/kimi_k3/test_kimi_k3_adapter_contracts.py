@@ -49,7 +49,6 @@ from hyper_parallel.models.kimi_k3.adapter.distributed import (
 from hyper_parallel.models.registry import get_model_adapter
 from hyper_parallel.trainer.config import entries_to_plan_overrides
 from hyper_parallel.trainer.config.parser import parse_training_args
-from tests.common.mark_utils import arg_mark
 from tests.ut.auto_models.distributed.conftest import FakeDeviceMesh
 
 _WRAPPER_NAMES = (
@@ -117,8 +116,6 @@ class _TinyKimiModel(nn.Module):
 class TestKimiK3AdapterRegistration(unittest.TestCase):
     """Pin model-family discovery and KDA-specific parameter roles."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_top_level_and_text_specs_share_kda_providers(self):
         """Both official Kimi config identities discover the same KDA rules."""
         top_spec = get_model_adapter("KimiK3ForConditionalGeneration")
@@ -136,8 +133,6 @@ class TestKimiK3AdapterRegistration(unittest.TestCase):
             adapter_context_parallel,
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_kda_specific_parameter_roles_override_generic_rules(self):
         """ShortConv, recurrent-state and low-rank gate parameters are explicit."""
         rules = get_model_adapter("kimi_k3").sharding_rules()
@@ -155,8 +150,6 @@ class TestKimiK3AdapterRegistration(unittest.TestCase):
             with self.subTest(parameter=name):
                 self.assertIs(classifier.classify_param(name, rules), role)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_cp4_plan_retains_all_kda_params_and_injection(self):
         """Feature: Kimi KDA CP planner integration.
 
@@ -189,8 +182,6 @@ class TestKimiK3AdapterRegistration(unittest.TestCase):
         for placements in spec.params.values():
             self.assertEqual(placements[CP], Replicate())
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_yaml_cp_condition_and_wrapper_arguments(self):
         """Feature: Unified KDA CP configuration.
 
@@ -238,8 +229,6 @@ plan_overrides:
 class TestKimiK3CpWrapperContracts(unittest.TestCase):
     """Pin the new Planner-facing KDA CP wrapper protocol."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_wrappers_declare_context_and_configuration(self):
         """Both modes use @inner_wrapper and expose backend/chunk configuration."""
         for name in _WRAPPER_NAMES:
@@ -253,8 +242,6 @@ class TestKimiK3CpWrapperContracts(unittest.TestCase):
                 self.assertEqual(parameters["backend"].default, "eager")
                 self.assertEqual(parameters["chunk_size"].default, 64)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_wrappers_return_atomic_request_without_mutating_target(self):
         """The generic rewriter, rather than the family adapter, owns mutation."""
         cp_mesh = _FakeMesh(4)
@@ -293,8 +280,6 @@ class TestKimiK3CpWrapperContracts(unittest.TestCase):
                     4,
                 )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_wrapper_fail_fast_guards(self):
         """Inactive CP, TPxCP and duplicate application fail before mutation."""
         wrapper = adapter_context_parallel.kimi_delta_attention_p2p_cp_wrapper
@@ -317,8 +302,6 @@ class TestKimiK3CpWrapperContracts(unittest.TestCase):
 class TestKDACombinedAdapter(unittest.TestCase):
     """Pin the recipe options for all pairwise and three-way combinations."""
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_all_combinations_record_effective_options(self):
         """Feature: Unified KDA CP recipe adapter.
 
@@ -345,8 +328,6 @@ class TestKDACombinedAdapter(unittest.TestCase):
                 self.assertEqual(config["backend"], "triton")
                 self.assertEqual(config["chunk_size"], 64)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_invalid_options_rejected_by_real_executors(self):
         """Feature: Unified KDA CP configuration validation.
 
@@ -388,8 +369,6 @@ class TestKDACombinedAdapter(unittest.TestCase):
                         model, None, None, mesh, None, state_cp_method="allgather")
                 self.assertFalse(hasattr(model, "_hp_kda_cp_config"))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_invalid_contracts_rejected_before_transport(self):
         """Feature: KDA state CP validation.
 
@@ -415,8 +394,6 @@ class TestKDACombinedAdapter(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Ascend NPU"):
             state_cp.merge_affine_summaries(state.unsqueeze(0), state.unsqueeze(0), 0, True)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_mesh_split_preserves_world_root_and_noncontiguous_peers(self):
         """Feature: Root-preserving KDA subgroup creation.
 

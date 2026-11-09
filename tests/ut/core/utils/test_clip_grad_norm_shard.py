@@ -33,7 +33,6 @@ from hyper_parallel.core.utils.clip_grad import (
     dense_grad_norm_sq_and_refs,
     scale_grad_refs_,
 )
-from tests.common.mark_utils import arg_mark
 
 
 def _fake_gather(mapping: dict) -> Any:
@@ -48,15 +47,11 @@ def _fake_gather(mapping: dict) -> Any:
 class TestNormCoverage(unittest.TestCase):
     """Global rectangle description for plain and sharded parameters."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_plain_parameter_covers_its_full_shape(self):
         """A non-DTensor parameter represents its entire global shape."""
         param = nn.Parameter(torch.zeros(2, 3))
         self.assertEqual(_norm_coverage(param), ((2, 3), ((0, 2), (0, 3))))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_dtensor_layout_slice_must_match_local_shape(self):
         """The layout slice must describe the exact local tensor shape."""
         param = SimpleNamespace(shape=(2, 2), layout=SimpleNamespace(rank_list=[0, 1]),
@@ -67,8 +62,6 @@ class TestNormCoverage(unittest.TestCase):
             self.assertEqual(_norm_coverage(param), ((2, 2), ((0, 2), (0, 1))))
             infer.assert_called_once()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_dtensor_layout_without_current_rank_is_rejected(self):
         """A layout that lacks the current rank has no local coverage."""
         param = SimpleNamespace(shape=(2, 2), layout=SimpleNamespace(rank_list=[1]),
@@ -77,8 +70,6 @@ class TestNormCoverage(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "does not contain the current global rank"):
                 _norm_coverage(param)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_dtensor_layout_mismatched_local_shape_is_rejected(self):
         """A layout slice inconsistent with the local shape is rejected."""
         param = SimpleNamespace(shape=(2, 2), layout=SimpleNamespace(rank_list=[0]),
@@ -93,8 +84,6 @@ class TestNormCoverage(unittest.TestCase):
 class TestNormRepresentative(unittest.TestCase):
     """Shard coverage validation and representative election."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_disjoint_shards_pick_one_representative_per_copy(self):
         """Disjoint areas with full volume elect the lowest copy rank."""
         stage_data = {
@@ -111,8 +100,6 @@ class TestNormRepresentative(unittest.TestCase):
             "w", (2, 2), stage_data, 3, ((1, 2), (0, 2)))
         self.assertFalse(is_rep)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_global_shape_mismatch_is_rejected(self):
         """All members must agree on the parameter global shape."""
         stage_data = {
@@ -122,8 +109,6 @@ class TestNormRepresentative(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "global shape mismatch"):
             _norm_representative("w", (2, 2), stage_data, 0, ((0, 2), (0, 2)))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_incomplete_coverage_is_rejected(self):
         """Shard volumes must add up to the global shape volume."""
         stage_data = {
@@ -133,8 +118,6 @@ class TestNormRepresentative(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "coverage is incomplete or duplicated"):
             _norm_representative("w", (2, 2), stage_data, 0, ((0, 1), (0, 2)))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_overlapping_rectangles_are_rejected(self):
         """Nonempty shard rectangles must be pairwise disjoint."""
         stage_data = {
@@ -148,8 +131,6 @@ class TestNormRepresentative(unittest.TestCase):
 class TestBuildNormShardPlan(unittest.TestCase):
     """Plan construction with and without torch.distributed."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_single_process_plan_excludes_external_params(self):
         """Excluded parameters stay out of the plan on a single rank."""
         model = nn.Module()
@@ -161,8 +142,6 @@ class TestBuildNormShardPlan(unittest.TestCase):
         self.assertEqual(plan.representatives, {"dense": True})
         self.assertEqual(plan.replica_ranks, {"dense": (0,)})
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_distributed_plan_gathers_stage_members(self):
         """All-gathered coverage elects one representative across ranks."""
         model = nn.Module()
@@ -180,8 +159,6 @@ class TestBuildNormShardPlan(unittest.TestCase):
         self.assertEqual(plan.replica_ranks, {"dense": (0, 1)})
         self.assertEqual(plan.representatives, {"dense": True})
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_different_stage_fqns_are_rejected(self):
         """Members of one PP stage must share identical dense FQNs."""
         model = nn.Module()
@@ -201,8 +178,6 @@ class TestBuildNormShardPlan(unittest.TestCase):
 class TestEffectiveDenseGrads(unittest.TestCase):
     """Local gradient collection for plain parameters."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_plain_parameters_collect_local_grads(self):
         """Plain parameters contribute their grads with no partial reduce."""
         param = nn.Parameter(torch.zeros(2))
@@ -212,8 +187,6 @@ class TestEffectiveDenseGrads(unittest.TestCase):
         self.assertIs(infos[0][1], param.grad)
         self.assertEqual(reduced, {})
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_meshed_parameters_cache_the_mesh_once(self):
         """Parameters on a device mesh register the mesh in the cache."""
         param = nn.Parameter(torch.zeros(2))
@@ -229,14 +202,10 @@ class TestEffectiveDenseGrads(unittest.TestCase):
 class TestCheckDenseGradPresence(unittest.TestCase):
     """Replica gradient presence consistency checks."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_single_process_is_a_noop(self):
         """No consistency check runs without torch.distributed."""
         _check_dense_grad_presence({"w": True}, {"w": (0,)})
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_consistent_replicas_pass(self):
         """Replicas agreeing on gradient presence are accepted."""
         patches = (
@@ -248,8 +217,6 @@ class TestCheckDenseGradPresence(unittest.TestCase):
         with patches[0], patches[1], patches[2]:
             _check_dense_grad_presence({"w": True}, {"w": (0, 1)})
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_mismatched_replicas_are_rejected(self):
         """Replicas disagreeing on gradient presence raise an error."""
         patches = (
@@ -266,8 +233,6 @@ class TestCheckDenseGradPresence(unittest.TestCase):
 class TestDenseGradNormSqAndRefs(unittest.TestCase):
     """Exact dense norm summation and gradient reference collection."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_only_representatives_contribute_to_the_norm(self):
         """Non-representative copies and excluded params are skipped."""
         model = nn.Module()
@@ -287,8 +252,6 @@ class TestDenseGradNormSqAndRefs(unittest.TestCase):
         torch.testing.assert_close(local_sq, torch.tensor(8.0))
         self.assertEqual(len(refs), 2)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_empty_stage_uses_the_mesh_device(self):
         """A stage without dense parameters returns a zero norm on the mesh device."""
         model = nn.Module()
@@ -300,8 +263,6 @@ class TestDenseGradNormSqAndRefs(unittest.TestCase):
         torch.testing.assert_close(local_sq, torch.tensor(0.0))
         self.assertEqual(refs, [])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_mesh_axes_all_reduce_the_local_sum(self):
         """Every multi-rank mesh axis reduces the local norm square."""
         model = nn.Module()
@@ -339,8 +300,6 @@ class TestDenseGradNormSqAndRefs(unittest.TestCase):
 class TestScaleGradRefs(unittest.TestCase):
     """In-place clipping of collected gradient references."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_refs_are_scaled_in_place(self):
         """Every referenced gradient is multiplied by the coefficient."""
         grads = [torch.full((2,), 2.0), torch.full((3,), 4.0)]
