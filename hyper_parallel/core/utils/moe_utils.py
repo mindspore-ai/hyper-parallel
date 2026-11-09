@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING, Optional, Any
 import torch.distributed as dist
 from torch import nn
 
+from hyper_parallel.core.activation_memory.wrapper import ActivationWrapper
+
 if TYPE_CHECKING:
     from hyper_parallel.components.modules.moe import MoE
 
@@ -106,7 +108,11 @@ def _get_moe_layers(model: "nn.Module") -> list:
     Returns:
         List of MoE module instances.
     """
-    return [m for m in model.modules() if getattr(m, 'enable_expert_bias', False)]
+    # Transparent wrappers forward the child's attributes but own no router state.
+    return [
+        module for module in model.modules()
+        if not isinstance(module, ActivationWrapper) and getattr(module, 'enable_expert_bias', False)
+    ]
 
 
 class MoEMonitorCallback:
