@@ -28,6 +28,29 @@ base_module = importlib.import_module("hyper_parallel.trainer.base")
 class TestBaseTrainerCleanup(unittest.TestCase):
     """Tests for cleaning up the data iterator on exceptional exits."""
 
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_dataset_ownership_follows_loader_balance_block(self) -> None:
+        """Feature: Dataset rank participation.
+        Description: Build Dataset splits with absent, empty and populated loader balance settings.
+        Expectation: The Trainer shares ownership context, enabling all ranks for an empty block too.
+        """
+        for options in (None, {}, {"metadata_mode": True}):
+            with self.subTest(options=options):
+                dataset = object()
+                trainer = SimpleNamespace(
+                    config=SimpleNamespace(
+                        dataset=SimpleNamespace(build=MagicMock(return_value=(dataset, None, None))),
+                        dataloader=SimpleNamespace(sampler_type="single", load_balance=options),
+                        training=object(),
+                    ),
+                    data_transform=None, tokenizer=None, mesh=object(),
+                )
+                base_module.BaseTrainer._build_dataset(trainer)
+                context = trainer.config.dataset.build.call_args.kwargs["dataloader_context"]
+                self.assertIs(context, trainer.dataloader_context)
+                self.assertEqual(context.tp_source_rank, 0 if options is None else None)
+                self.assertIs(trainer.train_dataset, dataset)
+
     @staticmethod
     def _make_trainer() -> MagicMock:
         """Build the minimal trainer surface required by ``BaseTrainer.train``."""

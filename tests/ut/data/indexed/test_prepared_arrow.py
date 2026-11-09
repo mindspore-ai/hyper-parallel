@@ -35,6 +35,7 @@ from datasets import Dataset
 from hyper_parallel.data.batching import (
     FixedBatchDataLoader, TextParallelBatch, build_indexed_collate_fn, build_sft_collate_fn,
 )
+from hyper_parallel.data.batching.build_dataloader import build_dataloader
 from hyper_parallel.data.batching.runtime_input import IndexedBoundaryResolver, RuntimeInputAdapter
 from hyper_parallel.data.indexed.indexed_data_reader import ArrowDataReader
 from hyper_parallel.data.indexed.indexed_data_config import (
@@ -46,7 +47,9 @@ from hyper_parallel.data.parallel import DataLoaderParallelContext
 from hyper_parallel.data.text.build_dataset import build_indexed_text_dataset
 from hyper_parallel.data.text.build_tokenizer import AutoTokenizer
 from hyper_parallel.data.tools.io import IndexedDatasetBuilder
+from hyper_parallel.distributed_data import WorkloadCost
 from hyper_parallel.trainer.config.resolver import resolve_config
+from tests.common.mark_utils import arg_mark
 
 
 @contextmanager
@@ -147,11 +150,50 @@ class TestPreparedArrow(unittest.TestCase):
                                                       collate_fn=build_sft_collate_fn())
                         if length == 5:
                             batch = next(iter(loader))
-                            self.assertEqual(tuple(batch["tokens"].shape), (2, 5))
-                            self.assertEqual(batch["tokens"][0].tolist(), self.rows[0]["input_ids"])
+                            self.assertEqual(tuple(batch["input_ids"].shape), (2, 5))
+                            self.assertEqual(batch["input_ids"][0].tolist(), self.rows[0]["input_ids"])
                         else:
                             with self.assertRaisesRegex(ValueError, f"expected {length}, got 5"):
                                 next(iter(loader))
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_indexed_input_ids_through_balancing_and_repacking(self) -> None:
+        """Feature: Unified Indexed text fields.
+        Description: Feed real Arrow records through Trainer balancing with and without repacking.
+        Expectation: Input IDs, shifted labels and document boundaries reach the runtime unchanged.
+        """
+        dataset = self._build(self._write("balanced.arrow", self.rows))
+        context = SimpleNamespace(
+            dp_rank=0, dp_size=1, pp_size=1,
+            device_mesh=SimpleNamespace(mesh_shape=(1,), mesh_dim_names=("dp",), rank_list=(0,)),
+        )
+        for repack in (False, True):
+            with self.subTest(repack=repack):
+                loaders, samplers = build_dataloader(
+                    SimpleNamespace(load_balance={"repack_sequences": repack, "pad_token_id": 0}),
+                    datasets=(dataset, None, None), collate_fn=build_sft_collate_fn(),
+                    mesh_context=context,
+                    training_config=SimpleNamespace(micro_batch_size=2, global_batch_size=2, seed=42),
+                    data_config=self.options,
+                    cost_model=lambda sample: WorkloadCost(llm=sample.pack_tokens ** 2),
+                )
+                self.assertIsNone(samplers[0])
+                with loaders[0] as loader:
+                    batch = next(loader)
+                self.assertNotIn("tokens", batch)
+                self.assertEqual(batch["input_ids"].tolist(), [row["input_ids"] for row in self.rows])
+                self.assertEqual(batch["labels"].tolist(),
+                                 [[-100, 13, -100, 22, -100], [32, -100, 42, -100, -100]])
+                runtime = self._runtime(
+                    attention_mode="compressed", runtime_input_adapter=_BoundaryAdapter(), reset_position_ids=True,
+                )
+                model, loss = runtime(iter([batch]))
+                self.assertTrue(torch.equal(model["input_ids"], batch["input_ids"]))
+                self.assertTrue(torch.equal(loss["shift_labels"], batch["labels"]))
+                self.assertEqual(model["cu_seq_lens"].tolist(), [0, 3, 5, 7, 8, 10])
+                self.assertEqual(model["position_ids"].tolist(), [[0, 1, 2, 0, 1], [0, 1, 0, 0, 1]])
+                self.assertEqual(loss["loss_mask"].sum().item(), 4)
+        self.assertEqual(dataset.dataset[0]["labels"], self.rows[0]["labels"])
 
     def test_skip_data_check_only_skips_record_length_check(self):
         """Explicit opt-out preserves variable rows without bypassing label validation."""
@@ -160,12 +202,12 @@ class TestPreparedArrow(unittest.TestCase):
                    "cu_seq_lens": [0, 2, 3], "loss_mask": [1, 1, 1]}
         path = self._write("variable.arrow", rows)
         checked = self._build(path)
-        self.assertEqual(len(checked[0]["tokens"]), 5)
+        self.assertEqual(len(checked[0]["input_ids"]), 5)
         with self.assertRaisesRegex(ValueError, "record 1: expected 5, got 3"):
             _ = checked[1]
         skipped = self._build(path, seq_length=8, skip_data_check=True)
         batch = next(iter(FixedBatchDataLoader(skipped, batch_size=2, collate_fn=build_sft_collate_fn())))
-        self.assertEqual(tuple(batch["tokens"].shape), (2, 5))
+        self.assertEqual(tuple(batch["input_ids"].shape), (2, 5))
         self.assertEqual(batch["labels"][1].tolist(), [32, -100, 42, -100, -100])
         rows[1]["labels"] = [32]
         invalid = self._build(self._write("invalid-shape.arrow", rows), skip_data_check=True)
@@ -190,8 +232,8 @@ class TestPreparedArrow(unittest.TestCase):
         Dataset.from_list(self.rows).save_to_disk(str(saved), num_shards=2)
         dataset = self._build(str(saved))
         self.assertEqual(len(dataset.datasets), 2)
-        self.assertEqual(dataset[0]["tokens"].tolist(), self.rows[0]["input_ids"])
-        self.assertEqual(dataset[1]["tokens"].tolist(), self.rows[1]["input_ids"])
+        self.assertEqual(dataset[0]["input_ids"].tolist(), self.rows[0]["input_ids"])
+        self.assertEqual(dataset[1]["input_ids"].tolist(), self.rows[1]["input_ids"])
 
     def test_each_arrow_file_is_split_before_blending(self):
         """80/20 splitting keeps both sources in both train and validation."""
@@ -212,8 +254,8 @@ class TestPreparedArrow(unittest.TestCase):
                     self.assertEqual(len(valid.datasets), 2)
                     expected = (list(range(10, 18)) + list(range(50, 58)) if mode == "intra"
                                 else [value for pair in zip(range(10, 18), range(50, 58)) for value in pair])
-                    self.assertEqual([int(train[i]["tokens"][0]) for i in range(16)], expected)
-                    self.assertEqual(sorted(int(valid[i]["tokens"][0]) for i in range(4)), [18, 19, 58, 59])
+                    self.assertEqual([int(train[i]["input_ids"][0]) for i in range(16)], expected)
+                    self.assertEqual(sorted(int(valid[i]["input_ids"][0]) for i in range(4)), [18, 19, 58, 59])
 
     def test_arrow_discovery_on_distributed_ranks(self):
         """Root and nested shards are discovered identically on all ranks."""
@@ -346,13 +388,13 @@ dataloader:
         builder.finalize(prefix + ".idx")
         dataset = self._build(prefix, seq_length=4, low_level_dataset=GPTFromMRDataset)
         batch = build_indexed_collate_fn()([dataset[0], dataset[1]])
-        self.assertEqual(tuple(batch["tokens"].shape), (2, 4))
+        self.assertEqual(tuple(batch["input_ids"].shape), (2, 4))
         self.assertEqual(batch["labels"].tolist(), [[11, 12, 13, 14], [22, 23, 24, 25]])
         sft_batch = build_sft_collate_fn()([dataset[0], dataset[1]])
-        self.assertTrue(torch.equal(batch["tokens"], sft_batch["tokens"]))
+        self.assertTrue(torch.equal(batch["input_ids"], sft_batch["input_ids"]))
         standard = self._build(prefix, seq_length=4, low_level_dataset=GPTDataset, simple_blend="no")
         self.assertEqual(len(standard), 2)
-        self.assertEqual(standard[0]["tokens"].shape, (4,))
+        self.assertEqual(standard[0]["input_ids"].shape, (4,))
         self.assertEqual(standard[0]["labels"].shape, (4,))
         with self.assertRaisesRegex(ValueError, "simple_blend"):
             self._build(prefix, seq_length=4, low_level_dataset=GPTFromMRDataset, simple_blend="no")
@@ -392,13 +434,13 @@ dataloader:
         self.assertIs(config.low_level_dataset, MockGPTDataset)
         mock = self._build(None, mock_data=True, low_level_dataset=MockGPTDataset, simple_blend="no")
         self.assertEqual(len(mock), 2)
-        self.assertEqual(mock[0]["tokens"].shape, (5,))
+        self.assertEqual(mock[0]["input_ids"].shape, (5,))
 
     def test_cp_multibatch_positions_and_targets(self):
         """Row-local CP slices keep both rows and reconstruct their full targets."""
         dataset = self._build(self._write("data.arrow", self.rows))
         batch = build_sft_collate_fn(SimpleNamespace(cp_size=2, tp_size=2))([dataset[0], dataset[1]])
-        self.assertEqual(batch["tokens"].shape, (2, 8))
+        self.assertEqual(batch["input_ids"].shape, (2, 8))
         parts, positions = [], []
         for rank in range(2):
             runtime = self._runtime(cp_size=2, cp_rank=rank, attention_mode="compressed",
@@ -427,4 +469,4 @@ dataloader:
         collate = build_sft_collate_fn()
         for boundaries in ([[0, 2, 2, 4]], [[0, 3]], [[0, 4], [0, 4]], [[[0, 4]]]):
             with self.subTest(boundaries=boundaries), self.assertRaises(ValueError):
-                collate([{"tokens": [[1, 2, 3, 4]], "labels": [[2, 3, 4, 5]], "cu_seq_lens": boundaries}])
+                collate([{"input_ids": [[1, 2, 3, 4]], "labels": [[2, 3, 4, 5]], "cu_seq_lens": boundaries}])

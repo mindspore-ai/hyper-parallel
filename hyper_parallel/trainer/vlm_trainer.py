@@ -17,6 +17,7 @@
 __all__ = ["VLMTrainer"]
 
 from collections import defaultdict
+from itertools import count
 from typing import Any, Dict
 
 import torch  # pylint: disable=forbidden-backend-import
@@ -24,6 +25,7 @@ import torch  # pylint: disable=forbidden-backend-import
 from hyper_parallel.data.batching import calculate_num_micro_batches
 from hyper_parallel.data.batching.get_batch import OmniParallelBatch
 from hyper_parallel.data.omni import OmniDataTransform
+from hyper_parallel.data.omni.metadata import vlm_sample_metadata
 from hyper_parallel.distributed.encoder_parallel import build_encoder_parallel_runtime
 from hyper_parallel.distributed.encoder_parallel.transport import EncoderParallelBatchTransport
 from hyper_parallel.models.registry import resolve_model_adapter
@@ -33,6 +35,7 @@ from hyper_parallel.trainer.runtime.memory import print_device_mem_info
 from hyper_parallel.trainer.runtime.memory_profiler import memory_profiler
 from hyper_parallel.trainer.runtime.device import synchronize  # pylint: disable=syntax-error
 from hyper_parallel.trainer.base import BaseTrainer
+from hyper_parallel.distributed_data import DistributedDataLoader
 from hyper_parallel.trainer.config import TrainerConfig
 
 logger = create_logger(__name__)
@@ -65,7 +68,7 @@ class VLMTrainer:
 
         # dataloader
         self._build_collate_fn()
-        self.base._build_dataloader()
+        self.base._build_dataloader(metadata_fn=vlm_sample_metadata)
 
         # get_batch
         self._build_get_batch()
@@ -148,6 +151,7 @@ class VLMTrainer:
             raise ValueError("encoder_parallel belongs under accelerator, not dataloader.get_batch")
         get_batch = config.dataloader.get_batch.build(
             mesh_context=self.base.mesh,
+            dataloader_context=self.base.dataloader_context,
             device=self.base.device,
             data_config=getattr(config.dataset, "data_config", {}),
             pp_shared_data=bool(getattr(config.dataloader, "pp_shared_data", False)),
@@ -320,10 +324,31 @@ class VLMTrainer:
         }
         return step_metrics
 
+    def _train_epoch(self, epoch: int, balanced_loader: bool) -> bool:
+        """Run complete optimizer steps and report actual Dataset exhaustion."""
+        train_dataloader = self.base.train_dataloader
+        data_iterator = iter(train_dataloader) if train_dataloader is not None else None
+        start_step = self.base.state.global_step - epoch * self.base.train_steps
+        train_steps = min(self.base.train_steps, self.base.train_iters - epoch * self.base.train_steps)
+        if balanced_loader:
+            start_step = 0
+            train_steps = self.base.train_iters - self.base.state.global_step
+        for _ in range(start_step, train_steps):
+            try:
+                self.train_step(data_iterator)
+            except StopIteration:
+                optimizers = self.base.optimizer
+                for optimizer in optimizers if isinstance(optimizers, list) else [optimizers]:
+                    optimizer.zero_grad()
+                logger.info(
+                    "epoch:%s Dataloader finished with drop_last %s", epoch, self.base.config.dataloader.drop_last
+                )
+                return True
+        return False
+
     def train(self) -> None:
         """Run the VLM training loop."""
         try:
-            config = self.base.config
             self.on_train_begin()
             logger.info(
                 "Rank%s Start training. Global step: %s. Train iters: %s. Start epoch: %s. Train epochs: %s.",
@@ -334,33 +359,27 @@ class VLMTrainer:
                 self.base.train_epochs,
             )
 
-            # Checkpoint resume restores state.global_step, state.epoch, and the DataLoader cursor.
-            for epoch in range(self.base.state.epoch, self.base.train_epochs):
-                train_dataloader = self.base.train_dataloader
-
-                if hasattr(train_dataloader, "set_epoch"):
-                    train_dataloader.set_epoch(epoch)
-
-                self.on_epoch_begin()
-                data_iterator = iter(train_dataloader) if train_dataloader is not None else None
-
-                start_step = self.base.state.global_step - epoch * self.base.train_steps
-                train_steps = min(self.base.train_steps, self.base.train_iters - epoch * self.base.train_steps)
-                for _ in range(start_step, train_steps):
-                    try:
-                        self.train_step(data_iterator)
-                    except StopIteration:
-                        logger.info(
-                            "epoch:%s Dataloader finished with drop_last %s", epoch, config.dataloader.drop_last
-                        )
-                        break
-
-                self.on_epoch_end()
-                self.base.state.epoch = epoch + 1
-                print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
-
+            train_dataloader = self.base.train_dataloader
+            balanced_loader = isinstance(train_dataloader, DistributedDataLoader)
+            start_epoch = self.base.state.epoch
+            epochs = count(start_epoch) if balanced_loader else range(start_epoch, self.base.train_epochs)
+            for epoch in epochs:
                 if self.base.state.global_step >= self.base.train_iters:
                     break
+                # Do not erase the cursor restored by on_train_begin on the first epoch.
+                if hasattr(train_dataloader, "set_epoch") and (not balanced_loader or epoch != start_epoch):
+                    train_dataloader.set_epoch(epoch)
+
+                self.base.state.epoch = epoch
+                self.on_epoch_begin()
+                epoch_start_step = self.base.state.global_step
+                epoch_exhausted = self._train_epoch(epoch, balanced_loader)
+                if balanced_loader and epoch != start_epoch and self.base.state.global_step == epoch_start_step:
+                    raise ValueError("VLM Dataset epoch cannot provide one complete optimizer step")
+
+                self.on_epoch_end()
+                self.base.state.epoch = epoch + 1 if not balanced_loader or epoch_exhausted else epoch
+                print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
 
             memory_profiler.stop()
             self.on_train_end()
@@ -374,6 +393,12 @@ class VLMTrainer:
             finally:
                 self.base.abort_profilers()
             raise
+
+        if balanced_loader:
+            try:
+                train_dataloader.wait_for_prefetch()
+            finally:
+                train_dataloader.close()
 
         synchronize()
         self.base.destroy_distributed()

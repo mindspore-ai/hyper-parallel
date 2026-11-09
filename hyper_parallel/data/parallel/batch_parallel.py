@@ -334,7 +334,9 @@ class TPBatchBroadcaster:
         """Broadcast CP-local fields and global boundaries across TP ranks.
 
         Args:
-            cp_local_batch: CP-local fields on TP rank zero, or ``None`` elsewhere.
+            cp_local_batch: CP-local fields on source owners, or ``None`` elsewhere.
+                When ``tp_source_rank=None``, every rank already has its fields
+                and this method only normalizes device and dtype.
             cu_seq_lens: Global sequence boundaries, unsharded across CP ranks.
             broadcast_all_fields: Preserve heterogeneous Omni fields and dtypes.
 
@@ -346,9 +348,8 @@ class TPBatchBroadcaster:
             return parallel_batch
 
         tp_rank = self.parallel_context.tp_rank
-        # TP rank zero owns the CP-local DataLoader fields and moves them to
-        # the target device before communication.
-        if tp_rank == 0:
+        source_rank = self.parallel_context.tp_source_rank
+        if source_rank is None or tp_rank == source_rank:
             parallel_batch = {
                 field: value.to(self.device, dtype=torch.int64, non_blocking=True)
                 for field, value in cp_local_batch.items()
@@ -361,13 +362,13 @@ class TPBatchBroadcaster:
             local_cu_seq_lens = None
 
         tp_size = self.parallel_context.tp_world_size
-        if tp_size <= 1:
+        if source_rank is None or tp_size <= 1:
             parallel_batch["cu_seq_lens"] = local_cu_seq_lens
             return parallel_batch
 
         # Dynamic Online batches do not have a fixed local sequence length.
         # Broadcast compact shape metadata before receivers allocate tensors.
-        if tp_rank == 0:
+        if tp_rank == source_rank:
             batch_size, seq_len = parallel_batch["input_ids"].shape
             num_boundaries = 0 if local_cu_seq_lens is None else local_cu_seq_lens.numel()
             batch_meta = torch.tensor(
@@ -379,10 +380,10 @@ class TPBatchBroadcaster:
             batch_meta = torch.empty((3,), dtype=torch.int64, device=self.device)
 
         tp_group = self.parallel_context.tp_group
-        dist.broadcast(batch_meta, group=tp_group, group_src=0)
+        dist.broadcast(batch_meta, group=tp_group, group_src=source_rank)
 
         # Non-source TP ranks allocate the same device shapes and dtypes.
-        if tp_rank != 0:
+        if tp_rank != source_rank:
             batch_size, seq_len, num_boundaries = [int(value) for value in batch_meta.tolist()]
             shape = (batch_size, seq_len)
             parallel_batch = {
@@ -398,11 +399,11 @@ class TPBatchBroadcaster:
             if tensor is None:
                 raise ValueError(f"parallel batch requires {field!r}")
 
-            dist.broadcast(tensor, group=tp_group, group_src=0)
+            dist.broadcast(tensor, group=tp_group, group_src=source_rank)
 
         # Packed boundaries remain global across CP ranks and variable in size.
         if local_cu_seq_lens is not None:
-            dist.broadcast(local_cu_seq_lens, group=tp_group, group_src=0)
+            dist.broadcast(local_cu_seq_lens, group=tp_group, group_src=source_rank)
 
         parallel_batch["cu_seq_lens"] = local_cu_seq_lens
 
@@ -410,11 +411,12 @@ class TPBatchBroadcaster:
 
     def _broadcast_mapping(self, cp_local_batch: Mapping[str, Any] | None) -> dict[str, Any]:
         """Broadcast variable-shaped Omni tensors and scalar metadata."""
-        if self.parallel_context.tp_world_size == 1:
+        source_rank = self.parallel_context.tp_source_rank
+        if source_rank is None or self.parallel_context.tp_world_size == 1:
             parallel_batch = self._move_mapping_to_device(cp_local_batch)
             return parallel_batch
 
-        is_source = self.parallel_context.tp_rank == 0
+        is_source = self.parallel_context.tp_rank == source_rank
         if is_source:
             parallel_batch = self._move_mapping_to_device(cp_local_batch)
             metadata = []
@@ -428,7 +430,7 @@ class TPBatchBroadcaster:
             metadata = None
         object_list = [metadata]
         dist.broadcast_object_list(
-            object_list, group=self.parallel_context.tp_group, group_src=0, device=self.device
+            object_list, group=self.parallel_context.tp_group, group_src=source_rank, device=self.device
         )
         for name, shape, dtype, value in object_list[0]:
             if shape is None:
@@ -436,7 +438,7 @@ class TPBatchBroadcaster:
                 continue
             if not is_source:
                 parallel_batch[name] = torch.empty(shape, dtype=dtype, device=self.device)
-            dist.broadcast(parallel_batch[name], group=self.parallel_context.tp_group, group_src=0)
+            dist.broadcast(parallel_batch[name], group=self.parallel_context.tp_group, group_src=source_rank)
         return parallel_batch
 
     def _move_mapping_to_device(self, batch: Mapping[str, Any]) -> dict[str, Any]:
