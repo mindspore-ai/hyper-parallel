@@ -238,23 +238,17 @@ class VLMTrainer:
     def forward_backward_step(
             self,
             data_iterator: Any,
-            num_micro_steps: int,
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Fetch and execute one forward-backward micro-step.
 
         Args:
             data_iterator: Iterator providing one multimodal batch per call.
-            num_micro_steps: Number of FB steps in the current optimizer step.
 
         Returns:
             Loss tensor and named loss tensors for this FB step.
         """
         model_inputs, loss_inputs = self.base.get_batch(data_iterator)
         self.base.current_token_counts = count_loss_token(loss_inputs)
-        self.base.step_token_counts = {
-            name: token_count * num_micro_steps
-            for name, token_count in self.base.current_token_counts.items()
-        }
         self.on_micro_step_begin(model_inputs)
         loss, loss_dict = self.base.forward_backward_step(model_inputs, loss_inputs)
 
@@ -271,6 +265,7 @@ class VLMTrainer:
         """
         memory_profiler.step()
         num_micro_steps = self.base.num_micro_batches
+        self.base.begin_loss_step()
 
         self.on_step_begin()
         self.base.model_integration.begin_step(self.base.state.global_step + 1)
@@ -288,14 +283,13 @@ class VLMTrainer:
             self.base.begin_fsdp_runtime_diagnostics(micro_step)
             loss, loss_dict = self.forward_backward_step(
                 data_iterator,
-                num_micro_steps,
             )
 
             total_loss += loss.item()
             for loss_name, loss_value in loss_dict.items():
                 total_loss_dict[loss_name] += loss_value.item()
 
-        grad_norm = self.base.prepare_optimizer_step()
+        total_loss, grad_norm = self.base.prepare_optimizer_step(total_loss, total_loss_dict)
         self.base.step_optimizers_and_schedulers()
 
         # Checkpoint and logging callbacks observe completed optimizer updates.

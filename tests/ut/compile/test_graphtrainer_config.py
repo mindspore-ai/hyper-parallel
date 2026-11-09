@@ -129,14 +129,12 @@ class TestGraphModeIntegration(unittest.TestCase):
             model_inputs={"input_ids": torch.tensor([1])},
             labels=labels,
             current_token_counts=base.current_token_counts,
-            step_token_counts=base.step_token_counts,
         )
 
         model.assert_called_once_with(input_ids=torch.tensor([1]), use_cache=False)
         base.postforward.assert_called_once_with(
             model.return_value, labels,
             current_token_counts=base.current_token_counts,
-            step_token_counts=base.step_token_counts,
         )
         # Both the backward loss and the named losses travel to the tracer:
         # the loss_dict values are emitted as extra graph outputs.
@@ -175,7 +173,6 @@ class TestGraphModeIntegration(unittest.TestCase):
             model_inputs=micro_batch,
             labels=labels,
             current_token_counts=base.current_token_counts,
-            step_token_counts=base.step_token_counts,
         )
         self.assertIs(loss, joint_loss)
         # The named losses flow back from the graph as extra outputs.
@@ -200,7 +197,7 @@ class TestGraphModeIntegration(unittest.TestCase):
         ).mean()
         # ``_graph_train_fn`` routes through ``postforward``; the plain
         # local loss keeps this UT dist-free (no token counting / mesh).
-        base.postforward = lambda outputs, labels, *, current_token_counts, step_token_counts: (
+        base.postforward = lambda outputs, labels, *, current_token_counts: (
             base.loss_fn(model_output=outputs, labels=labels),
             {"foundation_loss": base.loss_fn(model_output=outputs, labels=labels).detach()},
         )

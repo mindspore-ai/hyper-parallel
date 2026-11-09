@@ -628,9 +628,8 @@ def _forward_and_backward(
     distributed_loss = mean_global_loss(
         distributed_local_mean,
         token_counts,
-        token_counts,
         state.mesh_context,
-    )["foundation_loss"]
+    )["foundation_loss"] / global_targets.numel()
     distributed_loss.backward()
     return standalone_full_loss.detach(), distributed_loss
 
