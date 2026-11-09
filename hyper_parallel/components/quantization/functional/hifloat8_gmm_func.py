@@ -37,7 +37,6 @@ class HiFloat8GroupedLinear(GroupedLinear):
     """Bind HiFloat8 role quantizers and GMM lowering to the common flow."""
 
     FORMAT_NAME = "HiFloat8"
-    CAST_ROUTED_OUTPUT_TO_INPUT_DTYPE = True
 
     def __init__(
         self,
