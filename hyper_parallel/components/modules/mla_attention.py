@@ -279,6 +279,23 @@ class MLAAttention(nn.Module):
             value_states,
         )
 
+    def project_output(self, attention_output: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project [B, local_tokens, heads * value_dim] to [B, local_tokens, hidden].
+
+        This model-math extension point lets gated MLA multiply its gate before
+        Wo; the default MLA keeps the original output projection unchanged.
+        This method owns model math only; CP communication belongs to its adapter.
+
+        Args:
+            attention_output: Flattened local-token attention output.
+            hidden_states: Original local-token input, available to gated variants.
+
+        Returns:
+            Projected local hidden states.
+        """
+        del hidden_states
+        return self.o_proj(attention_output)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -321,5 +338,7 @@ class MLAAttention(nn.Module):
             **kwargs,
         )
         attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
+        # Gated MLA derives its gate from the original input before Wo; ordinary
+        # MLA only applies Wo. Keep this math extension shared by CP1 and CP.
+        attn_output = self.project_output(attn_output, hidden_states)
         return attn_output, attn_weights

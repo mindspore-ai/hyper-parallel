@@ -18,14 +18,25 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, wraps
 import math
 from typing import Any, Literal
 
 # Native Torch is required, as in the existing CP adapters; the legacy lint rule predates that migration.
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
+from torch.nn import functional as F  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.distributed._builder.forward_rewriter import _ForwardRewriteRequest
+from hyper_parallel.distributed.context_parallel.mla_backward_overlap import (
+    MLAExpandedInputA2AState, MLAInputA2AState,
+    _InputA2ALaunch, _LatentInputA2AWait, _LatentKVLinear,
+    finish_expanded_inputs, launch_input_a2a,
+)
+from hyper_parallel.distributed.context_parallel.gated_mla_backward_overlap import (
+    GatedMLAInputState, finish_gated_expanded_inputs,
+)
 from hyper_parallel.components import functional
 from hyper_parallel.distributed.context_parallel.collectives import (
     _build_hybrid_cp_submeshes, async_cp_allgather_launch, async_ulysses_seq_to_head_launch,
@@ -35,7 +46,7 @@ from hyper_parallel.components.functional.npu_fusion_attention import (
     PACKED_SEQUENCE_ARGUMENTS, npu_fusion_attention_forward, resolve_packed_sequence_lengths,
 )
 from hyper_parallel.core.utils.communication import (
-    differentiable_all_gather_concat, differentiable_all_to_all_single,
+    differentiable_all_to_all_single,
     differentiable_all_to_all_single_async, wait_async_tensor,
 )
 
@@ -152,7 +163,10 @@ def mla_all_gather(tensor: torch.Tensor, sequence_dim: int, cp_mesh: Any) -> tor
     """
     if cp_mesh is None or cp_mesh.size() == 1:
         return tensor
-    return differentiable_all_gather_concat(tensor, cp_mesh.get_group(), cp_mesh.size(), sequence_dim)
+    # Share the overlap path's SUM ReduceScatter adjoint, but wait immediately.
+    # PyTorch's generic autograd AllGather falls back to AllToAll + local sum on
+    # HCCL, changing BF16 reduction order when only the overlap flag changes.
+    return async_cp_allgather_launch(tensor, sequence_dim, cp_mesh).wait()
 
 
 def apply_mla_rope(
@@ -199,7 +213,15 @@ class _CausalPartition:
     documents: tuple[int, ...]
 
     def select(self, tensor: torch.Tensor, sequence_dim: int) -> torch.Tensor:
-        """Keep a view of the needed prefix before either projection or attention."""
+        """Keep a view of the needed prefix before either projection or attention.
+
+        Args:
+            tensor: Gathered KV features in global sequence order.
+            sequence_dim: Axis containing the gathered tokens.
+
+        Returns:
+            A view of the KV interval needed by this query partition.
+        """
         return tensor.narrow(sequence_dim, self.key_begin, self.key_end - self.key_begin)
 
 
@@ -346,12 +368,15 @@ def _query(
     heads: int,
     rotary_fn: Callable[..., torch.Tensor],
 ) -> torch.Tensor:
-    """Expand and rotate the query through the managed TP-local projection module."""
+    """Expand queries through the model's rotary callback and managed projection."""
     projected = module.q_b_proj(latent)
     projected = projected.view(*latent.shape[:2], heads, module.qk_head_dim)
     content, rotary = projected.split((module.qk_nope_head_dim, module.qk_rope_head_dim), dim=-1)
-    rotary = rotary_fn(rotary, positions, interleaved=module.rotary_interleaved)
-    return torch.cat((content, rotary), dim=-1).transpose(1, 2)
+    rotated = rotary_fn(rotary, positions, interleaved=module.rotary_interleaved)
+    # An identity callback needs no split/concatenate copy of the complete Q.
+    if rotated is rotary:
+        return projected.transpose(1, 2)
+    return torch.cat((content, rotated), dim=-1).transpose(1, 2)
 
 
 def _key_value(
@@ -364,7 +389,12 @@ def _key_value(
     """Expand the requested KV heads through the managed projection module."""
     projected = (module.kv_b_proj(latent) if head_range is None
                  else module.kv_b_proj(latent, mla_head_range=head_range))
-    projected = projected.view(*latent.shape[:2], heads, module.qk_nope_head_dim + module.v_head_dim)
+    return _assemble_key_value(module, projected, key_rope, heads)
+
+
+def _assemble_key_value(module, projected, key_rope, heads):
+    """Build per-head keys and values from shared projection results."""
+    projected = projected.view(*projected.shape[:2], heads, module.qk_nope_head_dim + module.v_head_dim)
     content, value = projected.split((module.qk_nope_head_dim, module.v_head_dim), dim=-1)
     key = torch.cat((content, key_rope.unsqueeze(2).expand(-1, -1, heads, -1)), dim=-1)
     return key.transpose(1, 2), value.transpose(1, 2)
@@ -459,9 +489,21 @@ class MLAContextParallel:
         attention_mask: torch.Tensor | None = None,
         actual_seq_len: torch.Tensor | Sequence[int] | None = None,
         is_causal: bool | None = None,
+        restore_output: bool = True,
+        overlap_input_backward: bool = False,
+        input_gate: GatedMLAInputState | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, None]:
-        """Return local-token BSND attention output before the shared o_proj."""
+        """Run attention and optionally restore its output to token-local BSND.
+
+        Args:
+            overlap_input_backward: Pair input autograd nodes only for pure Ulysses.
+                AG/hybrid input gradients remain native; output backward is selected
+                independently by the model adapter.
+            input_gate: Model-owned gate to cover expanded pure-Ulysses input exchanges.
+            restore_output: False exposes the head-sharded output so model-owned
+                independent work can run before its return exchange completes.
+        """
         packed_kwargs = {name: kwargs.pop(name) for name in PACKED_SEQUENCE_ARGUMENTS if name in kwargs}
         packed_kwargs["actual_seq_len"] = actual_seq_len
         _validate_forward_kwargs(kwargs, position_embeddings)
@@ -488,7 +530,13 @@ class MLAContextParallel:
             lengths, key_lengths = partition.query_lengths, partition.key_lengths
         positions = _positions(position_embeddings, state, dimensions.rope_dim)
         _validate_state(module, self.plan, state)
-        query, key, value = self._attention_inputs(module, state, positions, partition)
+        rotary_fn = apply_mla_rope if self.rotary_fn is None else self.rotary_fn
+        rotated_key = rotary_fn(
+            state.key_rope.unsqueeze(2), positions, interleaved=module.rotary_interleaved,
+        ).squeeze(2)
+        query, key, value = self._prepare_attention_inputs(
+            module, state, positions, rotated_key, partition, overlap_input_backward, input_gate, rotary_fn,
+        )
         attention_interface = (
             npu_fusion_attention_forward if self.attention_interface is None else self.attention_interface
         )
@@ -499,30 +547,63 @@ class MLAContextParallel:
             mla_head_offset=self.head_rank * self.plan.compute_heads,
             mla_local_heads=self.plan.local_heads,
         )[0]
-        if self.plan.ulysses_degree > 1:
-            output = ulysses_head_to_seq(output, 1, 2, self.ulysses_mesh)
-        expected = (batch, sequence, self.plan.local_heads, dimensions.value_dim)
-        if tuple(output.shape) != expected:
-            raise RuntimeError(f"MLA CP output has shape {tuple(output.shape)}, expected {expected}")
+        if restore_output:
+            output = self.restore_output(output)
         return output, None
 
-    def _attention_inputs(self, module, state, positions, partition):
-        """Prepare Q/K/V through the selected rotary callback and communication schedule."""
-        degree = self.plan.cp_degree
-        rotary_fn = apply_mla_rope if self.rotary_fn is None else self.rotary_fn
-        rotated_key = rotary_fn(
-            state.key_rope.unsqueeze(2), positions, interleaved=module.rotary_interleaved,
-        ).squeeze(2)
-        if self.plan.overlap and degree > 1:
-            prepare = self._expanded_overlap if self.plan.strategy == "expanded_ulysses" else self._latent_overlap
-            query, key, value = prepare(module, state, positions, rotated_key, partition, rotary_fn=rotary_fn)
-        else:
+    def _prepare_attention_inputs(self, module, state, positions, key_rope, partition,
+                                  overlap_input_backward, input_gate, rotary_fn):
+        """Select input preparation; paired input backward requires pure Ulysses.
+
+        Forward overlap also supports KV AllGather and hybrid CP. Those paths
+        retain native input collective adjoints; their output dO overlap is
+        selected independently by the model adapter.
+        """
+        use_forward_overlap = self.plan.overlap and self.plan.cp_degree > 1
+        pure_ulysses = self.plan.all_gather_degree == 1
+        expanded = self.plan.strategy == "expanded_ulysses"
+        supports_input_gate = use_forward_overlap and pure_ulysses and expanded
+        if input_gate is not None and not supports_input_gate:
+            raise ValueError("Input gate overlap requires expanded pure Ulysses with overlap enabled")
+        if overlap_input_backward and not pure_ulysses:
+            raise ValueError("Paired MLA input backward currently requires pure Ulysses")
+        if not use_forward_overlap:
             query = _query(module, state.query_latent, positions, self.plan.local_heads, rotary_fn)
-            if self.plan.strategy == "expanded_ulysses" or degree == 1:
-                query, key, value = self._expanded(module, state, query, rotated_key, partition)
-            else:
-                query, key, value = self._latent(module, state, query, rotated_key, partition)
-        return query, key, value
+            prepare = self._expanded if expanded or self.plan.cp_degree == 1 else self._latent
+            return prepare(module, state, query, key_rope, partition)
+        # Pure Ulysses has no outer KV AllGather. Expanded Q/K/V use the same
+        # V/K/Q forward order with or without a gate; overlap_input_backward
+        # selects paired input gradients versus the native collective adjoints.
+        if pure_ulysses and expanded:
+            return self._prepare_expanded_ulysses_inputs(
+                module, state, positions, key_rope, input_gate, overlap_input_backward, rotary_fn,
+            )
+        if overlap_input_backward:
+            # Expanded has returned above and AG/hybrid were rejected earlier:
+            # this is latent pure Ulysses, pairing Q A2A with KV projection/RS.
+            return self._prepare_latent_ulysses_inputs(module, state, positions, key_rope, rotary_fn)
+        # AG/hybrid inputs and forward-only latent Ulysses use native adjoints.
+        prepare = self._expanded_overlap if expanded else self._latent_overlap
+        return prepare(module, state, positions, key_rope, partition, rotary_fn=rotary_fn)
+
+    def restore_output(self, output: torch.Tensor) -> torch.Tensor:
+        """Restore token ownership after attention, before the model output projection.
+
+        Args:
+            output: Attention result in BSND head-sharded layout.
+
+        Returns:
+            Original local-token, all-local-head BSND tensor.
+        """
+        batch, sequence = output.shape[:2]
+        sequence //= self.plan.ulysses_degree
+        if self.plan.ulysses_degree > 1:
+            output = ulysses_head_to_seq(output, 1, 2, self.ulysses_mesh)
+        expected = (batch, sequence, self.plan.local_heads, self.plan.dimensions.value_dim)
+        if tuple(output.shape) != expected:
+            raise RuntimeError(f"MLA CP output has shape {tuple(output.shape)}, expected {expected}")
+        return output
+
 
     def _expanded(self, module, state, query, key_rope, partition=None):
         """Pack unequal-width QKV into one sequence-to-head exchange."""
@@ -571,17 +652,17 @@ class MLAContextParallel:
         payload = torch.cat((key.transpose(1, 2), value.transpose(1, 2)), dim=-1)
         use_ulysses = self.plan.ulysses_degree > 1
         if use_ulysses:
-            pending_kv = async_ulysses_seq_to_head_launch(payload, 1, 2, self.ulysses_mesh)
+            kv_transfer_handle = async_ulysses_seq_to_head_launch(payload, 1, 2, self.ulysses_mesh)
         else:
-            pending_kv = self._expanded_kv_launch(payload, partition)
+            kv_transfer_handle = self._expanded_kv_launch(payload, partition)
         query = _query(module, state.query_latent, positions, self.plan.local_heads, rotary_fn)
-        pending_query = (async_ulysses_seq_to_head_launch(query.transpose(1, 2), 1, 2, self.ulysses_mesh)
-                         if use_ulysses else None)
-        payload = pending_kv.wait()
+        query_a2a_handle = (async_ulysses_seq_to_head_launch(query.transpose(1, 2), 1, 2, self.ulysses_mesh)
+                            if use_ulysses else None)
+        payload = kv_transfer_handle.wait()
         if use_ulysses and self.plan.all_gather_degree > 1:
             payload = self._expanded_kv_launch(payload, partition).wait()
-        if pending_query is not None:
-            query = pending_query.wait().transpose(1, 2)
+        if query_a2a_handle is not None:
+            query = query_a2a_handle.wait().transpose(1, 2)
         if partition is not None and self.plan.kv_exchange == "all_gather":
             payload = partition.select(payload, 1)
         key, value = payload.split((module.qk_head_dim, module.v_head_dim), dim=-1)
@@ -597,15 +678,183 @@ class MLAContextParallel:
         """Cover latent transfer with Q preparation, then Q A2A with KV expansion."""
         payload = torch.cat((state.kv_latent, key_rope), dim=-1)
         if self.plan.kv_exchange == "all_to_all_v":
-            pending_kv = _selective_kv_launch(payload, partition, self.cp_mesh, self.plan.ulysses_degree, True)
+            kv_transfer_handle = _selective_kv_launch(payload, partition, self.cp_mesh, self.plan.ulysses_degree, True)
             partition = None
         else:
-            pending_kv = async_cp_allgather_launch(payload, 1, self.cp_mesh)
+            kv_transfer_handle = async_cp_allgather_launch(payload, 1, self.cp_mesh)
         query = _query(module, state.query_latent, positions, self.plan.local_heads, rotary_fn)
-        payload = pending_kv.wait()
-        pending_query = (async_ulysses_seq_to_head_launch(query.transpose(1, 2), 1, 2, self.ulysses_mesh)
-                         if self.plan.ulysses_degree > 1 else None)
+        payload = kv_transfer_handle.wait()
+        query_a2a_handle = (async_ulysses_seq_to_head_launch(query.transpose(1, 2), 1, 2, self.ulysses_mesh)
+                            if self.plan.ulysses_degree > 1 else None)
         key, value = self._expand_latent(module, payload, partition)
-        if pending_query is not None:
-            query = pending_query.wait().transpose(1, 2)
+        if query_a2a_handle is not None:
+            query = query_a2a_handle.wait().transpose(1, 2)
         return query, key, value
+
+    def _prepare_expanded_ulysses_inputs(self, module, state, positions, key_rope, input_gate,
+                                         overlap_input_backward, rotary_fn):
+        """Prepare expanded Q/K/V in V/K/Q order and attach the selected adjoints."""
+        launch_input = _InputA2ALaunch.apply if overlap_input_backward else launch_input_a2a
+        input_a2a = MLAExpandedInputA2AState(
+            query=MLAInputA2AState(self.ulysses_mesh),
+            key=MLAInputA2AState(self.ulysses_mesh),
+            value=MLAInputA2AState(self.ulysses_mesh),
+        )
+        # V needs no positional transform: it is ready as soon as KV up-projection
+        # is split. Shared-K positional math was already applied by the caller.
+        projected = module.kv_b_proj(state.kv_latent)
+        projected = projected.view(*state.kv_latent.shape[:2], self.plan.local_heads,
+                                   module.qk_nope_head_dim + module.v_head_dim)
+        key_nope, value = projected.split((module.qk_nope_head_dim, module.v_head_dim), dim=-1)
+        # Keep K assembly inside V's communication window.
+        key_nope = launch_input(value, key_nope, input_a2a.value)
+        shared_key = key_rope.unsqueeze(2).expand(-1, -1, self.plan.local_heads, -1)
+        key = torch.cat((key_nope, shared_key), dim=-1)
+        # K is complete; Q projection and its model-defined rotation can cover it.
+        query_latent = launch_input(key, state.query_latent, input_a2a.key)
+        query = _query(module, query_latent, positions, self.plan.local_heads, rotary_fn).transpose(1, 2)
+        # Only gated MLA has independent compute after Q. Both consumers share
+        # the Q/K/V transfer state, but return distinct Q or gate gradient edges.
+        if input_gate is None:
+            query, key, value = finish_expanded_inputs(query, input_a2a, overlap_input_backward)
+        else:
+            query, key, value = finish_gated_expanded_inputs(query, input_a2a, input_gate)
+        return query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
+
+    def _prepare_latent_ulysses_inputs(self, module, state, positions, key_rope, rotary_fn):
+        """Prepare latent Ulysses inputs and pair their Q/KV backward dependencies."""
+        payload = torch.cat((state.kv_latent, key_rope), dim=-1)
+        kv_all_gather_handle = async_cp_allgather_launch(payload, 1, self.cp_mesh)
+        query = _query(module, state.query_latent, positions, self.plan.local_heads, rotary_fn).transpose(1, 2)
+        # wait() normally adds the default AllGather autograd node. Instead,
+        # _LatentKVLinear launches SUM RS before KV wgrad and returns dPayload
+        # via kv_input. Keep this numeric buffer off the default gradient path.
+        with torch.no_grad():
+            gathered = kv_all_gather_handle.wait()
+        query_a2a = MLAInputA2AState(self.ulysses_mesh)
+        # Same payload value, with Q's inverse A2A bracketing its KV backward.
+        kv_input = _InputA2ALaunch.apply(query, payload, query_a2a)
+        heads = self.plan.compute_heads
+        start = self.head_rank * heads
+        projected, shared_key = module.kv_b_proj(
+            kv_input, mla_head_range=(start, start + heads),
+            mla_gathered=gathered, mla_cp_mesh=self.cp_mesh,
+        )
+        key, value = _assemble_key_value(module, projected, shared_key, heads)
+        query, key, value = _LatentInputA2AWait.apply(key, value, query_a2a)
+        return query.transpose(1, 2), key, value
+
+
+def _head_projection_request(projection: nn.Linear, head_dim: int) -> _ForwardRewriteRequest:
+    """Select head rows inside the original Linear call to preserve parameter hooks."""
+    original = projection.forward
+
+    # Keep nn.Linear.forward(input=...) compatible with keyword callers.
+    @wraps(original)
+    def head_projection(  # pylint: disable=redefined-builtin
+        input: torch.Tensor, *, mla_head_range: tuple[int, int] | None = None,
+        mla_gathered: torch.Tensor | None = None, mla_cp_mesh: Any = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Project selected contiguous heads inside the original module call.
+
+        Args:
+            input: Latent activations, or the local packed payload when mla_gathered is provided.
+            mla_head_range: Optional half-open range of TP-local heads.
+            mla_gathered: Completed latent payload for scheduled gather backward.
+            mla_cp_mesh: CP mesh owning the gathered payload.
+
+        Returns:
+            Projected activations, or their pair with the shared key for scheduled gather backward.
+        """
+        if mla_head_range is None:
+            return original(input)
+        begin, end = mla_head_range
+        if not 0 <= begin < end <= projection.weight.shape[0] // head_dim:
+            raise ValueError("MLA projection head range is outside the original parameter")
+        rows = slice(begin * head_dim, end * head_dim)
+        bias = None if projection.bias is None else projection.bias[rows]
+        # Read parameters inside the managed module's forward, after pre-hooks.
+        # Slicing preserves the Parameter identity and scatters gradients back.
+        if mla_gathered is not None:
+            if mla_cp_mesh is None:
+                raise ValueError("Scheduled MLA latent projection requires its CP mesh")
+            return _LatentKVLinear.apply(input, projection.weight[rows], bias, mla_gathered, mla_cp_mesh)
+        return F.linear(input, projection.weight[rows], bias)  # pylint: disable=not-callable
+
+    return _ForwardRewriteRequest(projection, head_projection)
+
+
+def _validate_up_projections(target_module: nn.Module, plan: MLACPPlan) -> None:
+    """Check TP-local Linear weights without replacing managed parameters."""
+    dimensions = plan.dimensions
+    projections = (
+        (target_module.q_b_proj, dimensions.q_rank, dimensions.qk_dim),
+        (target_module.kv_b_proj, dimensions.kv_rank, dimensions.nope_dim + dimensions.value_dim),
+    )
+    for projection, in_features, head_dim in projections:
+        # Quantized/LoRA subclasses do not obey contiguous Linear head slicing.
+        if type(projection) is not nn.Linear:  # pylint: disable=unidiomatic-typecheck
+            raise ValueError("MLA CP requires plain nn.Linear up projections")
+        weight = projection.weight.to_local() if isinstance(projection.weight, DTensor) else projection.weight
+        if weight.shape != (plan.local_heads * head_dim, in_features):
+            raise ValueError("MLA up-projection shape must match TP-local heads; apply TP parameter sharding first")
+        if getattr(projection.forward, "__func__", None) is not nn.Linear.forward:
+            raise ValueError("MLA CP must be installed before other up-projection forward adapters")
+
+
+def prepare_mla_cp(
+    target_module: nn.Module,
+    cp_mesh: Any,
+    tp_mesh: Any,
+    *,
+    strategy: MLACPStrategy,
+    overlap: bool,
+    ulysses_degree: int | None,
+    kv_exchange: str,
+    rotary_fn: Callable[..., torch.Tensor] | None = None,
+    attention_interface: Callable[..., tuple[torch.Tensor, Any]] | None = None,
+) -> tuple[MLAContextParallel, list[_ForwardRewriteRequest]]:
+    """Prepare a shared MLA runtime and managed head-projection rewrites.
+
+    Args:
+        target_module: Module exposing normalized MLA latents and plain projections.
+        cp_mesh: Context-parallel mesh.
+        tp_mesh: Optional tensor-parallel mesh.
+        strategy: Expanded or latent KV representation.
+        overlap: Whether to overlap input communication with projections.
+        ulysses_degree: Head-parallel degree within CP.
+        kv_exchange: Full gather or selective KV exchange.
+        rotary_fn: Model-owned rotary or identity callback.
+        attention_interface: Optional model-local attention implementation.
+
+    Returns:
+        Runtime and child rewrites; the model adapter owns its forward contract.
+    """
+    for name, axis in (("TP", tp_mesh), ("CP", cp_mesh)):
+        if axis is not None and (axis.size() < 1 or getattr(axis, "ndim", 1) != 1):
+            raise ValueError(f"mla_cp_wrapper requires a one-dimensional {name} mesh")
+    cp_degree = 1 if cp_mesh is None else cp_mesh.size()
+    tp_degree = 1 if tp_mesh is None else tp_mesh.size()
+    if getattr(target_module, "mla_cp_runtime", None) is not None:
+        raise ValueError("MLA CP is already configured on this module")
+    if target_module.attention_dropout != 0 or target_module.sliding_window is not None:
+        raise ValueError("MLA CP requires dropout=0 and no implicit sliding_window; use a supported boolean mask")
+    dimensions = MLADimensions(
+        heads=target_module.config.num_attention_heads, q_rank=target_module.q_lora_rank,
+        kv_rank=target_module.kv_lora_rank, nope_dim=target_module.qk_nope_head_dim,
+        rope_dim=target_module.qk_rope_head_dim, value_dim=target_module.v_head_dim,
+    )
+    plan = MLACPPlan(
+        dimensions=dimensions, cp_degree=cp_degree, strategy=strategy,
+        tp_degree=tp_degree, overlap=overlap, ulysses_degree=ulysses_degree, kv_exchange=kv_exchange,
+    )
+    plan.validate_scale(target_module.scaling)
+    _validate_up_projections(target_module, plan)
+    runtime = MLAContextParallel(
+        plan, cp_mesh, rotary_fn=rotary_fn, attention_interface=attention_interface,
+    )
+
+    requests = []
+    if strategy == "latent_kv_head":
+        requests.append(_head_projection_request(target_module.kv_b_proj, dimensions.nope_dim + dimensions.value_dim))
+    return runtime, requests
