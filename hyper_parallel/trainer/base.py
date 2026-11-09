@@ -122,6 +122,18 @@ if TYPE_CHECKING:
     from hyper_parallel.distributed_data.schema import SampleMetadata
 
 
+def _validate_fsdp_enabled(
+    model_parts: List[torch.nn.Module],
+    *,
+    use_joint_graph: bool,
+) -> None:
+    """Require FSDP/HSDP wrapping for every model part in eager training."""
+    if use_joint_graph:
+        return
+    if not model_parts or any(not isinstance(model_part, HSDPModule) for model_part in model_parts):
+        raise ValueError("Trainer requires FSDP/HSDP to be enabled.")
+
+
 def _to_swap_optimizer_config(config: OptimizerSwapConfig) -> SwapOptimizerConfig:
     """Translate the trainer-facing swap section into the core swap config.
 
@@ -410,6 +422,10 @@ class BaseTrainer(Stateful, ABC):
             self.model.loss_function = causal_lm_loss_parallel
         model_parts = getattr(self.model, "parts", None)
         self.model_parts = list(model_parts) if model_parts is not None else [self.model]
+        _validate_fsdp_enabled(
+            self.model_parts,
+            use_joint_graph=self.config.compile.selects_graph_compiler(),
+        )
         self.hsdp_model_parts = [
             model_part
             for model_part in self.model_parts
