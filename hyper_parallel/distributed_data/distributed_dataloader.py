@@ -140,6 +140,7 @@ class DistributedDataLoader(Iterator[Any]):
             model_transport: ModelParallelTransport,
             device_prefetch: DeviceStepPrefetcher | None = None,
             initial_epoch: int = 0,
+            initial_consumed_samples: int = 0,
             broadcast_plan: bool = True,
             log_balance: bool = False,
             accumulation_steps: int = 1,
@@ -171,6 +172,7 @@ class DistributedDataLoader(Iterator[Any]):
         self._device_prefetch = device_prefetch
         self._epoch = initial_epoch
         self._step = 0
+        self._initial_consumed_samples = initial_consumed_samples
         self._stopped = False
         self._pending_local_keys: set[SampleKey] = set()
         self._window_plans: deque[DistributedPackingPlan] = deque()
@@ -522,6 +524,16 @@ class DistributedDataLoader(Iterator[Any]):
     def _snapshot_state(self) -> dict[str, Any]:
         """Capture producer progress at an optimizer-step boundary."""
         state = {
+            "native_sampler": {
+                "consumed_samples": self._initial_consumed_samples + (
+                    self._step * self._planner.local_batch_size * self._topology.data_parallel_size
+                ),
+                "epoch": self._epoch,
+                "global_batch_size": (
+                    self._accumulation_steps * self._planner.local_batch_size * self._topology.data_parallel_size
+                ),
+                "dp_world_size": self._topology.data_parallel_size,
+            },
             "global_rank": self._topology.global_rank,
             "epoch": self._epoch,
             "step": self._step,
@@ -545,6 +557,8 @@ class DistributedDataLoader(Iterator[Any]):
             state_dict: State produced on this same global rank.
         """
         self._validate_restore_boundary()
+        if "global_rank" not in state_dict:
+            state_dict = self._from_fixed_loader(state_dict)
         try:
             state = copy.deepcopy(dict(state_dict))
         except Exception as exc:
@@ -565,8 +579,41 @@ class DistributedDataLoader(Iterator[Any]):
         self._epoch = epoch
         self._step = step
         self._stopped = stopped
+        if "native_sampler" in state:
+            self._initial_consumed_samples = state["native_sampler"]["consumed_samples"] - (
+                step * self._planner.local_batch_size * self._topology.data_parallel_size
+            )
 
         self._delivered_state = self._snapshot_state()
+
+    def _from_fixed_loader(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        """Translate a native fixed-loader cursor at an optimizer boundary."""
+        sampler = state.get("native_sampler", state.get("_index_sampler_state"))
+        if not isinstance(sampler, Mapping) or "consumed_samples" not in sampler:
+            raise ValueError("Fixed checkpoint has no native sampler cursor; cannot switch loaders")
+        target = self._snapshot_state()
+        expected = target["native_sampler"]
+        consumed, epoch = sampler["consumed_samples"], sampler["epoch"]
+        if sampler["global_batch_size"] != expected["global_batch_size"]:
+            raise ValueError("Switching loaders requires an unchanged global_batch_size")
+        if consumed < 0 or consumed % expected["global_batch_size"] or epoch < 0:
+            raise ValueError("Switching loaders requires a complete optimizer-step cursor")
+        # Preserve the source topology until the native sampler validates it.
+        # Rewriting it first would bypass cyclic data_sharding safety checks.
+        sampler = dict(sampler)
+        target.update(epoch=epoch, step=consumed // (
+            self._planner.local_batch_size * self._topology.data_parallel_size
+        ), stopped=False, native_sampler=dict(sampler, dp_world_size=expected["dp_world_size"]))
+        for key in ("dataset_reader", "metadata_reader", "direct_sample_loader"):
+            reader = target[key]
+            if reader is None:
+                continue
+            reader["epoch"] = epoch
+            if "sampler" in reader:
+                reader["sampler"] = sampler
+            if reader.get("sample_loader") is not None:
+                reader["sample_loader"]["epoch"] = epoch
+        return target
 
     def _validate_restore_boundary(self) -> None:
         if self._last_ready_event is not None or self._prefetch_thread is not None or self._step != 0:
@@ -657,6 +704,7 @@ class DistributedDataLoader(Iterator[Any]):
             self._direct_sample_loader.set_epoch(epoch)
         self._epoch = epoch
         self._step = 0
+        self._initial_consumed_samples = 0
         self._stopped = False
         self._pending_local_keys.clear()
         self._window_plans.clear()

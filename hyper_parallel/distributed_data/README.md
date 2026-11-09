@@ -862,6 +862,15 @@ Fields declared `device="cpu"` return on Host even when their transport uses an
 accelerator backend. Metadata/planner and payload A2A serialization are separate
 from this tensor-only model-broadcast protocol and remain unchanged.
 
+When switching between fixed and balanced native loaders, a complete global
+optimizer-batch cursor can be repartitioned across a different DP size. Keep the
+dataset, sampling policy, seed, index mapping and GBS unchanged. Single sampling
+and cyclic sampling with `data_sharding=False` preserve global sample membership;
+cyclic per-rank shuffling and partial optimizer steps cannot change DP safely.
+Validate the saved source DP in the native sampler before recording the target
+DP. Do not rewrite checkpoint topology to bypass sampler validation. This does
+not provide general migration of per-rank DCP files or arbitrary worker RNG state.
+
 Checkpoint through the native sampler loader after the optimizer update for all
 micro-batches in the step. Its snapshot excludes speculative progress; requesting
 it does not wait for or consume pending batches. Call

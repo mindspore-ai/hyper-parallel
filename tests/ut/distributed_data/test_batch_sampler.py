@@ -16,6 +16,7 @@
 
 import copy
 import importlib
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -27,6 +28,7 @@ from hyper_parallel.data.batching.build_dataloader import (
     FixedBatchDataLoader,
     build_dataloader,
 )
+from hyper_parallel.components.checkpoint.dcp_checkpointer import DistributedCheckpointer
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
 from hyper_parallel.data.text.build_dataset import _build_dataloader_context
 from hyper_parallel.distributed_data import DistributedDatasetConfig, SampleMetadata, build_distributed_dataloader
@@ -102,6 +104,143 @@ def _batch_ids(batch: tuple) -> list[int]:
 
 class TestNativeBatchSampler(unittest.TestCase):
     """Test without process groups or accelerator hardware."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_changed_dp_preserves_complete_global_batches(self) -> None:
+        """Feature: Elastic native cursor migration across loader modes.
+        Description: Change DP4 to DP1 and back with a nonzero global cursor.
+        Expectation: Online/metadata readers and fixed loaders keep the remaining samples.
+        """
+        for kind in ("single", "cyclic"):
+            options = {"total_samples": 24, "sampler_type": kind, "seed": 42}
+            reference = _sampler(**options)
+            reference.set_epoch(2)
+            reference.consumed_samples = 4
+            expected = sorted(index for batch in reference for index in batch)
+            for metadata_mode in (False, True):
+                with self.subTest(kind=kind, metadata=metadata_mode):
+                    source_sampler = _sampler(**options, dp_world_size=4, micro_batch_size=1)
+                    source_sampler.set_epoch(2)
+                    source = FixedBatchDataLoader(_TrackedDataset(24), batch_sampler=source_sampler,
+                                                 collate_fn=list, num_workers=0)
+                    next(iter(source))
+                    saved = source.state_dict()
+                    original = copy.deepcopy(saved)
+                    with _loader(_TrackedDataset(24), sampler=_sampler(**options),
+                                 metadata_mode=metadata_mode) as target:
+                        target.load_state_dict(saved)
+                        self.assertEqual(target.state_dict()["native_sampler"]["dp_world_size"], 1)
+                        self.assertEqual(sorted(sample["id"] for batch in target for sample in batch), expected)
+                    self.assertEqual(saved, original)
+                    with _loader(_TrackedDataset(24), sampler=_sampler(**options),
+                                 metadata_mode=metadata_mode) as source:
+                        source.set_epoch(2)
+                        next(source)
+                        next(source)
+                        balanced = source.state_dict()
+                    actual = []
+                    for rank in range(4):
+                        target = FixedBatchDataLoader(
+                            _TrackedDataset(24), batch_sampler=_sampler(
+                                **options, dp_world_size=4, dp_rank=rank, micro_batch_size=1,
+                            ), collate_fn=list, num_workers=0,
+                        )
+                        target.load_state_dict(balanced)
+                        actual.extend(sample["id"] for batch in target for sample in batch)
+                    self.assertEqual(sorted(actual), expected)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_changed_dp_rejects_unsafe_cursor_and_rank_shuffle(self) -> None:
+        """Feature: Elastic cursor safety checks.
+        Description: Preserve source DP for native validation instead of masking it.
+        Expectation: Reject incomplete steps and cyclic per-rank shuffle when DP changes.
+        """
+        source = _sampler(dp_world_size=2, micro_batch_size=1, total_samples=24)
+        saved = dict(source.state_dict(), consumed_samples=2)
+        target = _sampler(total_samples=24)
+        target.enable_source_batch_resume()
+        with self.assertRaisesRegex(ValueError, "complete global optimizer batch"):
+            target.load_state_dict(saved)
+        saved["consumed_samples"] = 4
+        for metadata_mode in (False, True):
+            with self.subTest(metadata=metadata_mode), _loader(
+                    _TrackedDataset(24), metadata_mode=metadata_mode,
+                    sampler=_sampler(total_samples=24, sampler_type="cyclic", data_sharding=True),
+            ) as target:
+                with self.assertRaisesRegex(ValueError, "data_sharding=False"):
+                    target.load_state_dict({"_index_sampler_state": saved})
+                self.assertEqual(target.state_dict()["native_sampler"]["consumed_samples"], 0)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_rank", return_value=0)
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_world_size", return_value=1)
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.barrier")
+    def test_checkpoint_switches_loaders_through_dcp(self, *_mocks) -> None:
+        """Read the saved schema through DCP and resume the next complete batch.
+
+        Feature: Ordinary/balanced checkpoint interoperability.
+        Description: Exercise all four mode pairs, embedded and rank-file state,
+            legacy fixed cursors, worker prefetch, and a nonzero cyclic epoch.
+        Expectation: Restore step one and samples four onward without repetition.
+        """
+        for source_balanced in (False, True):
+            for target_balanced in (False, True):
+                for per_rank in (False, True):
+                    for workers in (0, 1):
+                        with self.subTest(source=source_balanced, target=target_balanced,
+                                          per_rank=per_rank, workers=workers):
+                            def build(balanced: bool) -> object:
+                                """Build either loader over the same native sampler."""
+                                sampler = _sampler(sampler_type="cyclic", seed=42)
+                                sampler.set_epoch(2)
+                                if balanced:
+                                    return _loader(_TrackedDataset(), sampler=sampler, balance_window_size=3)
+                                return FixedBatchDataLoader(_TrackedDataset(), batch_sampler=sampler,
+                                                            collate_fn=list, num_workers=workers)
+
+                            source = build(source_balanced)
+                            iterator = iter(source)
+                            next(iterator)
+                            next(iterator)
+                            saved = source.state_dict()
+                            # Converted checkpoints predate the portable cursor field.
+                            if not source_balanced and workers == 0:
+                                saved.pop("native_sampler")
+                            expected = sorted(sample["id"] for batch in iterator for sample in batch)
+                            target = build(target_balanced)
+                            checkpointer = DistributedCheckpointer(extra_state_per_rank=per_rank)
+                            with tempfile.TemporaryDirectory() as path:
+                                checkpointer.save(path, {"model": {"w": torch.ones(1)}, "extra_state": {
+                                    "global_step": 1, "train_dataloader": saved,
+                                }}, global_step=1, save_async=False)
+                                restored = {"model": {"w": torch.zeros(1)}}
+                                checkpointer.load(path, restored, extra_state_skeleton={
+                                    "global_step": 0, "train_dataloader": target.state_dict(),
+                                })
+                                self.assertEqual(restored["extra_state"]["global_step"], 1)
+                                target.load_state_dict(restored["extra_state"]["train_dataloader"])
+                            actual = sorted(sample["id"] for batch in target for sample in batch)
+                            self.assertEqual(actual, expected)
+                            for loader in (source, target):
+                                if hasattr(loader, "close"):
+                                    loader.close()
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_switch_rejects_incomplete_or_changed_batch_cursor(self) -> None:
+        """Feature: Safe loader switching.
+        Description: Restore incomplete, changed-GBS and missing sampler cursors.
+        Expectation: Reject invalid progress rather than reading from zero.
+        """
+        with _loader(_TrackedDataset(), sampler=_sampler(consumed_samples=4)) as resumed:
+            self.assertEqual(resumed.state_dict()["native_sampler"]["consumed_samples"], 4)
+            next(resumed)
+            next(resumed)
+            self.assertEqual(resumed.state_dict()["native_sampler"]["consumed_samples"], 8)
+        with _loader(_TrackedDataset()) as loader:
+            for cursor in ({"consumed_samples": 2, "epoch": 0, "global_batch_size": 4},
+                           {"consumed_samples": 4, "epoch": 0, "global_batch_size": 8}, {}):
+                with self.subTest(cursor=cursor), self.assertRaises(ValueError):
+                    loader.load_state_dict({"_index_sampler_state": cursor})
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_fixed_membership_without_dynamic_selection(self) -> None:
