@@ -35,7 +35,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import ask
 
-V41_TOOL = Path("examples", "training_demo", "deepseek_v41", "nd_describe_deepseek_v41.py")
+V41_TOOL = Path("hyper_parallel", "models", "deepseek_v41", "tools", "nd_describe_deepseek_v41.py")
 # One step of a check: its command, and the file its standard output is written to (None: the log).
 Step = Tuple[List[str], Optional[Path]]
 

@@ -39,7 +39,7 @@
 # ND is kept out of the trainer's tree.
 #
 # Usage:
-#   ./repeat_deepseek_v41_runs.sh /path/to/DeepSeek-V4.1-Flash
+#   bash hyper_parallel/models/deepseek_v41/tools/repeat_deepseek_v41_runs.sh <model>
 #
 #   POINTS="1:1 1:2"  ./repeat_deepseek_v41_runs.sh <model>   # a subset
 #   REPEATS=1         ./repeat_deepseek_v41_runs.sh <model>   # one pass first
@@ -60,11 +60,11 @@
 set -uo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-PROJECT_ROOT=$(cd "${SCRIPT_DIR}/../../.." && pwd)
+PROJECT_ROOT=$(cd "${SCRIPT_DIR}/../../../.." && pwd)
 OUTPUT_DIR="${PROJECT_ROOT}/output/training_demo/deepseek_v41"
 PYTHON_BIN=${PYTHON_BIN:-python}
-# The trainer yaml every run reads. The default is the timing launcher beside this
-# script: the released launcher saves checkpoints and runs the grouped expert path,
+# The trainer yaml every run reads. The default is the timing recipe beside this script:
+# the released launcher saves checkpoints and runs the grouped expert path,
 # neither of which belongs in a round whose only product is a step time. Point it at
 # another yaml to time another job, and say which yaml wherever the round is reported.
 LAUNCHER=${LAUNCHER:-"${SCRIPT_DIR}/nd_train_deepseek_v41_timing.yaml"}
@@ -161,7 +161,7 @@ cd "${PROJECT_ROOT}" || { echo "cannot enter ${PROJECT_ROOT}" >&2; exit 1; }
 
 if [[ ! -s "${ASSETS_PATH}" ]]; then
     echo "Preparing the Engram assets once"
-    "${PYTHON_BIN}" -m examples.training_demo.deepseek_v41.prepare_deepseek_v41_assets \
+    "${PYTHON_BIN}" -m hyper_parallel.models.deepseek_v41.tools.prepare_deepseek_v41_assets \
         --model-dir "${MODEL_PATH}" \
         --output "${ASSETS_PATH}" \
         --bucket-base 4096 \
@@ -169,7 +169,7 @@ if [[ ! -s "${ASSETS_PATH}" ]]; then
 fi
 if [[ ! -s "${DATA_PATH}" ]]; then
     echo "Preparing ${SAMPLES} samples of ${SEQ_LEN} tokens once"
-    "${PYTHON_BIN}" -m examples.training_demo.deepseek_v41.prepare_deepseek_v41_online_data \
+    "${PYTHON_BIN}" -m hyper_parallel.models.deepseek_v41.tools.prepare_deepseek_v41_online_data \
         --output "${DATA_PATH}" \
         --num-samples "${SAMPLES}" \
         --sequence-length "${SEQ_LEN}"

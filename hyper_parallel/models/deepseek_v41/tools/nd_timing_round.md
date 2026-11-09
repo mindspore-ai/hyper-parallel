@@ -7,10 +7,14 @@ the few worth measuring, so the ranking can be checked rather than believed.
 Four tools do it, in this order. None of them ranks a layout against the cost model on the node: the
 reading and the prediction are kept apart on purpose.
 
+Run the commands below from the repository root. Model-specific tools live in
+[`hyper_parallel/models/deepseek_v41/tools/`](.), including the timing-specific Trainer YAML.
+The main training examples remain in `examples/training_demo/deepseek_v41/`.
+
 ## 1. Before the window: check the node
 
 ```bash
-./preflight_deepseek_v41_window.sh /path/to/DeepSeek-V4.1-Flash
+bash hyper_parallel/models/deepseek_v41/tools/preflight_deepseek_v41_window.sh /path/to/DeepSeek-V4.1-Flash
 ```
 
 Every check is a read. Nothing is launched and no device is allocated, so it is safe to run while
@@ -21,7 +25,7 @@ what it can be used for, so read them.
 ## 2. Pick the points
 
 ```bash
-python nd_v41_ladder.py points
+python hyper_parallel/models/deepseek_v41/tools/nd_v41_ladder.py points
 ```
 
 Prints the points no round has measured, as the `POINTS` string the next step takes, and the command
@@ -30,7 +34,8 @@ that runs them. Nothing is typed by hand on the node.
 ## 3. Measure
 
 ```bash
-POINTS="4:1 4:2 8:1" REPEATS=3 ./repeat_deepseek_v41_runs.sh /path/to/DeepSeek-V4.1-Flash
+POINTS="4:1 4:2 8:1" REPEATS=3 \
+bash hyper_parallel/models/deepseek_v41/tools/repeat_deepseek_v41_runs.sh /path/to/DeepSeek-V4.1-Flash
 ```
 
 Each point is launched `REPEATS` times with no profiler, and every step of every run is written as a
@@ -41,7 +46,7 @@ row, with the summary derived from those same rows. Useful knobs:
 | `POINTS` | the points to run, as `<expert degree>:<shard width>`, space separated |
 | `REPEATS` | passes over the points, so each point gets a spread rather than one number |
 | `RUN_ROOT` | where the rows land. Launch again with the same one and it skips the points already recorded |
-| `LAUNCHER` | the trainer yaml every run reads. The default is `nd_train_deepseek_v41_timing.yaml` |
+| `LAUNCHER` | the trainer yaml every run reads. The default is `hyper_parallel/models/deepseek_v41/tools/nd_train_deepseek_v41_timing.yaml` |
 | `PROFILE` | turns the profiler on, which measures composition and never an order |
 | `TRAIN_ITERS`, `SKIP_STEPS` | steps a run takes, and the warmup steps left out of the mean |
 
@@ -52,7 +57,7 @@ another yaml is timing another job, so say which yaml wherever the round is repo
 ## 4. Read the round back
 
 ```bash
-python nd_v41_ladder.py summary <RUN_ROOT> --out round.txt
+python hyper_parallel/models/deepseek_v41/tools/nd_v41_ladder.py summary <RUN_ROOT> --out round.txt
 ```
 
 Prints what the round measured: each point's mean step and spread, the ladder by expert degree at each
@@ -62,7 +67,8 @@ library only, so it runs under any Python 3 on a node with nothing installed.
 ## What the crop is
 
 ```bash
-python nd_describe_deepseek_v41.py spec /path/to/DeepSeek-V4.1-Flash --divisor 8 --experts 16
+python hyper_parallel/models/deepseek_v41/tools/nd_describe_deepseek_v41.py \
+  spec /path/to/DeepSeek-V4.1-Flash --divisor 8 --experts 16
 ```
 
 Writes what the launcher's factory builds as facts the cost model can read: the layers at their
@@ -70,8 +76,9 @@ released indices, their parts and their widths. `verify` compares that descripti
 tensors the factory actually builds, which is the check that the two agree before any layout is
 priced. Run it whenever the recipe changes.
 
-`nd_deepseek_v41_crop.yaml` is that description kept as a file, beside the run it mirrors, for a
-checkout where Transformers cannot resolve the released checkpoint. Its own header carries the three
+[`nd_deepseek_v41_crop.yaml`](nd_deepseek_v41_crop.yaml)
+keeps that description alongside the model tools for a checkout where Transformers cannot resolve
+the released checkpoint. Its own header carries the three
 commands that describe the crop, check the description and rank the layouts from it.
 
 ## Asking for a layout instead

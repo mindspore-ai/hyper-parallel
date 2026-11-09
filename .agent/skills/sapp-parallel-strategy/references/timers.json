@@ -1,9 +1,9 @@
 {
   "_about": "How a template's layouts are timed on a cluster, for scripts/launch.py and scripts/readback.py. script times the layouts named in POINTS from the root of a checkout and writes runs.csv and steps.csv under RUN_ROOT; preflight checks a node before a round without launching anything; launcher is the trainer yaml the script reads, which must state what ND priced apart from the fields the script sets for each run (sets) and those it takes from the node's own files (node_paths); dies is the world it launches; varies names the degrees POINTS sets, in ND's column names, written as colon-separated values; fixed are the degrees it always launches; train_iters is the steps a run takes; seconds_a_run and repeats come from the rounds in timed; model_glob finds the model's directory on the node; timed lists the folders of rounds already timed, under references/. A template with no record here gets its trainer yamls and no command.",
   "deepseek_v41/a3": {
-    "script": "examples/training_demo/deepseek_v41/repeat_deepseek_v41_runs.sh",
-    "preflight": "examples/training_demo/deepseek_v41/preflight_deepseek_v41_window.sh",
-    "launcher": "examples/training_demo/deepseek_v41/nd_train_deepseek_v41_timing.yaml",
+    "script": "hyper_parallel/models/deepseek_v41/tools/repeat_deepseek_v41_runs.sh",
+    "preflight": "hyper_parallel/models/deepseek_v41/tools/preflight_deepseek_v41_window.sh",
+    "launcher": "hyper_parallel/models/deepseek_v41/tools/nd_train_deepseek_v41_timing.yaml",
     "dies": 16,
     "varies": ["EP", "OP"],
     "fixed": {"MP": "1", "CP": "1", "PP": "1", "VPP": "1"},

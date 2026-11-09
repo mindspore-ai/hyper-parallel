@@ -23,7 +23,7 @@ import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.core.multicore.modules.mega_gate import MegaGate
-from hyper_parallel.models.deepseek_v41.aux_loss import update_modality_bias
+from hyper_parallel.models.deepseek_v41.adapter.aux_loss import update_modality_bias
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41TopKRouter,
     _apply_router_training_state,
