@@ -322,6 +322,10 @@ def bind_local_expert_forward(
     computation. ``apply_gate`` supplies model-specific fused gate/up
     semantics when the default activation-times-up rule is insufficient.
     """
+    if getattr(module.experts, "requires_ep_grouped_gemm", False) and not use_grouped_gemm:
+        raise ValueError(
+            f"{type(module.experts).__name__} requires use_grouped_gemm=True in the EP method replacement"
+        )
     global_expert_count = _get_global_expert_count(module)
     if global_expert_count % ep_size != 0:
         raise ValueError(
