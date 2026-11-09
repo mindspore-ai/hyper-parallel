@@ -149,8 +149,8 @@ class TestAccumulationWindow(unittest.TestCase):
                         loader.prefetch()
                     saved = loader.state_dict()
                     owner = "metadata_reader" if metadata_mode else "dataset_reader"
-                    self.assertEqual(saved[owner]["sampler"]["consumed_samples"], 0)
-                    self.assertNotIn("window", saved[owner])
+                    self.assertEqual(saved["_index_sampler_state"]["consumed_samples"], 0)
+                    self.assertNotIn(owner, saved)
                     self.assertNotIn("window_plans", saved)
                     expected = [_ids(batch) for batch in loader]
                 with _loader(metadata_mode=metadata_mode) as restored:
@@ -167,13 +167,13 @@ class TestAccumulationWindow(unittest.TestCase):
             for _ in range(3):
                 next(loader)
             saved = loader.state_dict()
-            self.assertEqual(saved["dataset_reader"]["sampler"]["consumed_samples"], 0)
-            self.assertNotIn("window", saved["dataset_reader"])
+            self.assertEqual(saved["_index_sampler_state"]["consumed_samples"], 0)
+            self.assertNotIn("dataset_reader", saved)
             self.assertNotIn("window_plans", saved)
             for _ in range(7):
                 next(loader)
             saved = loader.state_dict()
-            self.assertEqual(saved["dataset_reader"]["sampler"]["consumed_samples"], 20)
+            self.assertEqual(saved["_index_sampler_state"]["consumed_samples"], 20)
         with _loader() as restored:
             restored.load_state_dict(saved)
             self.assertEqual(_ids(next(restored)), [20, 21])
@@ -191,7 +191,7 @@ class TestAccumulationWindow(unittest.TestCase):
             next(loader)
             state = loader.state_dict()
             self.assertEqual(len(loader._current.batches), 9)
-            self.assertEqual(state["step"], 0)
+            self.assertEqual(state["_index_sampler_state"]["consumed_samples"], 0)
             self.assertNotIn("window_plans", state)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
@@ -237,8 +237,8 @@ class TestAccumulationWindow(unittest.TestCase):
                         state = loader.state_dict()
                         reader = loader._dataset_reader
                         self.assertEqual(reader._sampler.consumed_samples, 12)
-                        self.assertEqual(state["dataset_reader"]["sampler"]["consumed_samples"], 0)
-                        self.assertNotIn("window", state["dataset_reader"])
+                        self.assertEqual(state["_index_sampler_state"]["consumed_samples"], 0)
+                        self.assertNotIn("dataset_reader", state)
                         self.assertEqual(_ids(next(loader)), [2, 3])
                         loader.prefetch()
                         self.assertEqual(_ids(next(loader)), [4, 5])
@@ -270,13 +270,13 @@ class TestAccumulationWindow(unittest.TestCase):
             reader = loader._dataset_reader
             loader.wait_for_prefetch()
             self.assertEqual(dataset.reads, list(range(12)))
-            self.assertEqual(loader.state_dict()["dataset_reader"]["sampler"]["consumed_samples"], 0)
-            self.assertNotIn("window", loader.state_dict()["dataset_reader"])
+            self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 0)
+            self.assertNotIn("dataset_reader", loader.state_dict())
             self.assertEqual(_ids(next(loader)), [2, 3])
             self.assertEqual(_ids(next(loader)), [4, 5])
             state = loader.state_dict()
-            self.assertEqual(state["dataset_reader"]["sampler"]["consumed_samples"], 6)
-            self.assertNotIn("window", state["dataset_reader"])
+            self.assertEqual(state["_index_sampler_state"]["consumed_samples"], 6)
+            self.assertNotIn("dataset_reader", state)
         self.assertFalse(dataset.thread.is_alive())
         with _loader(samples=[{"id": i} for i in range(18)], accumulation=3) as restored:
             restored.load_state_dict(state)
@@ -309,7 +309,7 @@ class TestAccumulationWindow(unittest.TestCase):
                         with self.assertRaises(ValueError) as failure:
                             next(loader)
                         self.assertIs(failure.exception, error)
-                        self.assertEqual(loader.state_dict()["dataset_reader"]["sampler"]["consumed_samples"], 6)
+                        self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 6)
                 finally:
                     loader.close()
                 self.assertFalse(dataset.thread.is_alive())
@@ -386,7 +386,7 @@ class TestAccumulationWindow(unittest.TestCase):
             with self.assertRaises(RuntimeError) as failure:
                 next(loader)
             self.assertIs(failure.exception, error)
-            self.assertEqual(loader.state_dict()["step"], 0)
+            self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_nonpersistent_workers_exit_normally_after_future_reads(self) -> None:

@@ -37,6 +37,9 @@ from hyper_parallel.data.batching.dynamic_batch import (
 from hyper_parallel.data.batching.build_collate_fn import TextPackingCollator
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
+from hyper_parallel.data.parallel.batch_sampler import (
+    get_sampler_checkpoint_state, has_torchdata_state, sampler_optimizer_step_progress, sampler_state_for_load,
+)
 
 from hyper_parallel.distributed_data import (
     BalancingAlgorithm,
@@ -445,6 +448,56 @@ class FixedBatchDataLoader(StatefulDataLoader):
                 collate_fn=collate_fn,
                 **worker_options,
             )
+            # Native worker snapshots may precede the delivered optimizer boundary.
+            enable_source_resume = getattr(batch_sampler, "enable_source_batch_resume", None)
+            if callable(enable_source_resume):
+                enable_source_resume()
+
+    def state_dict(self) -> dict[str, Any]:
+        """Save the native delivered cursor alongside torchdata's worker state."""
+        state = super().state_dict()
+        if "_snapshot" not in state:
+            return state
+        snapshot = state["_snapshot"]["_main_snapshot"]
+        sampler = snapshot.get("_index_sampler_state")
+        if isinstance(sampler, dict) and "consumed_samples" in sampler:
+            sampler = dict(sampler)
+            sampler["consumed_samples"] += (
+                state.get("_steps_since_snapshot", 0) * self.batch_sampler.global_micro_batch_size
+            )
+            state["_index_sampler_state"] = sampler
+        return state
+
+    def state_dict_for_load(self) -> dict[str, Any]:
+        """Request native worker state and shared or legacy sampler cursors."""
+        return sampler_state_for_load(self.state_dict())
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Restore torchdata state, or a balanced loader's complete native cursor.
+
+        Args:
+            state_dict: State saved by the ordinary or balanced native loader.
+        """
+        sampler = get_sampler_checkpoint_state(state_dict)
+        snapshot = state_dict.get("_snapshot", {}).get("_main_snapshot", {})
+        native_sampler = sampler if sampler is not None else snapshot.get("_index_sampler_state")
+        repartition = isinstance(native_sampler, Mapping) and any(
+            native_sampler.get(name) != getattr(self.batch_sampler, name, native_sampler.get(name))
+            for name in ("global_batch_size", "dp_world_size")
+        )
+        if state_dict.get("global_rank") is None and has_torchdata_state(state_dict) and not repartition:
+            if isinstance(native_sampler, Mapping) and native_sampler.get("epoch") is not None:
+                self.set_epoch(native_sampler["epoch"])
+            super().load_state_dict(state_dict)
+            return
+        if sampler is None:
+            raise ValueError("Balanced checkpoint has no native sampler cursor on this rank")
+        if sampler["epoch"] < 0 or sampler_optimizer_step_progress(sampler):
+            raise ValueError("Switching loaders requires a complete optimizer-step cursor")
+        self.batch_sampler.load_state_dict(sampler)
+        self.set_epoch(sampler["epoch"])
+        super().load_state_dict({})
+        self.next_iter_state = None
 
     def set_epoch(self, epoch: int) -> None:
         """Forward epoch state to the Dataset and configured batch sampler.

@@ -15,6 +15,7 @@
 """DP2/TP2 native BatchSampler ownership, metadata, and checkpoint coverage."""
 
 import logging
+import random
 from collections import Counter
 from contextlib import ExitStack, nullcontext
 from datetime import timedelta
@@ -163,8 +164,7 @@ def _run_case(
             if round_idx == 1:
                 saved_state = loader.state_dict()
                 if rank % 2 == 0:
-                    owner = "metadata_reader" if metadata_mode else "dataset_reader"
-                    saved_cursor = saved_state[owner]["sampler"]["consumed_samples"]
+                    saved_cursor = saved_state["_index_sampler_state"]["consumed_samples"]
                     assert saved_cursor == 8, f"Saved speculative sampler cursor: actual={saved_cursor}, expected=8"
 
         assert not list(loader), f"Native sampler should exhaust after {len(reference)} rounds"
@@ -222,6 +222,67 @@ def test_native_batch_sampler_dp2_tp2_gloo() -> None:
         dist.barrier()
     finally:
         dist.destroy_process_group()
+
+
+def test_changed_gbs_dp2_tp2_gloo() -> None:
+    """Repartition an unaligned global cursor and replay it on Constructors and TP peers."""
+    dist.init_process_group("gloo", timeout=timedelta(seconds=60))
+    try:
+        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("dp", "tp"))
+        for metadata_mode, sampler_type in product((False, True), ("single", "cyclic")):
+            _run_changed_gbs(mesh, metadata_mode, sampler_type)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def _run_changed_gbs(mesh: object, metadata_mode: bool, sampler_type: str) -> None:
+    """Check GBS ten to eight, DP one to two, and a second restore from cursor thirty-eight."""
+    rank = dist.get_rank()
+    source = _Dataset()
+    dataset = [source[index] for index in range(65)]
+    order = list(range(65))
+    if sampler_type == "cyclic":
+        random.Random(44).shuffle(order)
+    metadata_options = {"metadata": [_metadata(sample) for sample in dataset]} if metadata_mode else {
+        "metadata_fn": _metadata,
+    }
+
+    def build_loader() -> object:
+        """Build the target layout on every TP peer."""
+        sampler = build_dataset_batch_sampler(
+            total_samples=65, micro_batch_size=2, global_batch_size=8,
+            dp_rank=rank // 2, dp_world_size=2, sampler_type=sampler_type, seed=42,
+        )
+        return build_distributed_dataloader(
+            dataset if rank % 2 == 0 else None, mesh,
+            DistributedDatasetConfig(seq_len=8, local_batch_size=2, balance_window_size=3,
+                                     metadata_mode=metadata_mode, communication_backend="gloo"),
+            batch_sampler=sampler, collate_fn=_native_collate, model_batch_spec=_native_spec(2),
+            cost_model=lambda item: item.cost, **metadata_options,
+        )
+
+    with build_loader() as loader:
+        loader.load_state_dict({"_index_sampler_state": {
+            "consumed_samples": 30, "epoch": 2, "global_batch_size": 10, "dp_world_size": 1,
+        }})
+        delivered = [_plain(next(loader))]
+        assert loader.state_dict()["_index_sampler_state"]["consumed_samples"] == 30, "Saved a partial step"
+        delivered.append(_plain(next(loader)))
+        saved = loader.state_dict()
+        cursor = saved["_index_sampler_state"]
+        assert cursor == {"consumed_samples": 38, "epoch": 2, "global_batch_size": 8,
+                          "dp_world_size": 2, "optimizer_step_offset": 6}, f"Wrong cursor on rank {rank}: {cursor}"
+        delivered.extend(_plain(batch) for batch in loader)
+    gathered = _gather(delivered)
+    assert all(len(batches) == 8 for batches in gathered), f"Unequal DP lengths: {gathered}"
+    assert gathered[0] == gathered[1] and gathered[2] == gathered[3], f"TP mismatch: {gathered}"
+    actual = sorted(sample["id"] for batches in gathered[::2] for batch in batches for sample in batch)
+    assert actual == sorted(order[30:62]), f"Changed suffix: {actual}"
+    with build_loader() as resumed:
+        resumed.load_state_dict(saved)
+        remaining = [_plain(batch) for batch in resumed]
+    assert remaining == delivered[2:], f"Replayed offset differs on rank {rank}: {remaining}"
 
 
 def _window_loader(
@@ -349,7 +410,9 @@ def test_host_window_device_queue_dp2_tp2_gloo() -> None:
                     outputs.append(_window_output(batch, False))
                     if len(outputs) == 5:
                         state = loader.state_dict()
-                assert state["step"] == 5, f"Delivered checkpoint differs: state={state}"
+                assert state["_index_sampler_state"]["consumed_samples"] == 10, (
+                    f"Delivered checkpoint differs: state={state}"
+                )
                 _check_window_membership(_gather(outputs), False, 5)
                 worker = loader._prefetch_thread
                 loader.set_epoch(1)
@@ -494,7 +557,7 @@ def _run_sequence_repacking(mesh: object, broadcast_plan: bool) -> None:
             if step == 0:
                 saved_state = loader.state_dict()
                 if dist.get_rank() % 2 == 0:
-                    cursor = saved_state["dataset_reader"]["sampler"]["consumed_samples"]
+                    cursor = saved_state["_index_sampler_state"]["consumed_samples"]
                     assert cursor == 2, f"Prefetched record progress was saved: cursor={cursor}"
     with build_loader() as resumed:
         resumed.load_state_dict(saved_state)

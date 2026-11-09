@@ -33,6 +33,18 @@ def test_native_batch_sampler_dp2_tp2_gloo() -> None:
 
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_changed_gbs_dp2_tp2_gloo() -> None:
+    """Feature: Variable GBS and DP restoration.
+    Description: Restore thirty consumed samples with new GBS/DP and replay the resulting offset cursor.
+    Expectation: Constructors and TP peers preserve progress, full steps and the unconsumed global suffix.
+    """
+    torchrun_case(
+        file_name=str(Path(__file__).with_name("_test_batch_sampler_gloo.py")),
+        case_name="test_changed_gbs_dp2_tp2_gloo", num_proc=4,
+    )
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_accumulation_window_dp2_tp2_gloo() -> None:
     """Feature: Accumulation-window native loading.
     Description: Balance windows with three or ten accumulation rounds using DP2/TP2 and replay checkpoints.

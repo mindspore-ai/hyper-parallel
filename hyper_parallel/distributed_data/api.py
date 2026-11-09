@@ -813,6 +813,7 @@ def _build_distributed_dataloader_impl(
         device_prefetch_depth=config.device_prefetch_depth,
         device=device,
         initial_epoch=batch_sampler.epoch,
+        initial_consumed_samples=batch_sampler.consumed_samples,
         topology=state.topology,
         dataset_reader_ranks=state.dataset_reader_ranks,
         dataset_reader=state.dataset_reader,

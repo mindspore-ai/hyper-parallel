@@ -101,7 +101,9 @@ def _native(device: torch.device, backend: str, metadata_mode: bool) -> None:
                 window_ids.clear()
             if step == 0:
                 loader.wait_for_prefetch()
-                assert loader.state_dict()["step"] == 0, f"Incomplete step committed: step={step}"
+                assert loader.state_dict()["_index_sampler_state"]["consumed_samples"] == 0, (
+                    f"Incomplete step committed: step={step}"
+                )
                 if loader._topology.is_constructor:
                     for host_batch in loader._current.batches:
                         assert all(item["input_ids"].device.type == "cpu" for item in host_batch), (

@@ -61,7 +61,7 @@ class TestNativeBalanceLogging(unittest.TestCase):
                     for _ in range(accumulation - 1):
                         next(loader)
                     self.assertEqual(len(captured.records), expected_windows)
-                    self.assertEqual(loader.state_dict()["step"], accumulation)
+                    self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 2 * accumulation)
                     next(loader)
                     self.assertEqual(len(captured.records), expected_windows + 1)
                     self.assertIn("[dp-balance] iteration 2 :", captured.records[expected_windows].getMessage())

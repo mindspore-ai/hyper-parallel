@@ -22,6 +22,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
+from hyper_parallel.data.parallel.batch_sampler import sampler_optimizer_step_progress
 from hyper_parallel.distributed_data.schema import SampleKey, SampleMetadata
 from hyper_parallel.distributed_data.metadata import PlannedSampleLoader
 
@@ -46,7 +47,7 @@ def validate_native_sampler(sampler: Any, *, data_rank: int, dp_size: int, local
     for name, value in expected.items():
         if getattr(sampler, name, None) != value:
             raise ValueError(f"batch_sampler.{name} must equal {value!r}.")
-    if sampler.consumed_samples % sampler.global_batch_size:
+    if sampler_optimizer_step_progress(sampler.state_dict()):
         raise ValueError("batch_sampler.consumed_samples must align to a complete optimizer step.")
 
 
@@ -305,7 +306,7 @@ class BatchSamplerReader:
             raise ValueError("Native BatchSampler checkpoint epoch is inconsistent.")
         if (state.get("sample_loader") is None) != (self._sample_loader is None):
             raise ValueError("Native BatchSampler checkpoint payload reader ownership changed.")
-        if "window" in state or sampler_state["consumed_samples"] % self._sampler.global_batch_size:
+        if "window" in state or sampler_optimizer_step_progress(sampler_state):
             raise ValueError("Native BatchSampler checkpoint must align to a complete optimizer step.")
         self.close()
         self._sampler.load_state_dict(sampler_state)
