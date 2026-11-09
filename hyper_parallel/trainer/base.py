@@ -651,7 +651,8 @@ class BaseTrainer(Stateful, ABC):
             tp_group=self.device_mesh["tp"].get_group() if self.mesh.sequence_parallel else None,
         )
         self.state = TrainerState()
-        self.environ_meter_callback = EnvironMeterCallback(self)
+        # Raw AUX is not normalized with the backward loss; average its observations.
+        self.environ_meter_callback = EnvironMeterCallback(self, microbatch_mean_metrics=("router_aux_loss",))
         self.tqdm_callback = TqdmCallback(self)
         self.logging_callback = LoggingCallback(self)
         self.evaluate_callback = EvaluateCallback(self)

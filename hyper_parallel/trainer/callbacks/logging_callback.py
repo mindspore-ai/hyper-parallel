@@ -37,34 +37,6 @@ class LoggingCallback(Callback):
         super().__init__(trainer)
         self.logging_steps = trainer.config.training.logging_steps
         self._last_logged_step: int | None = None
-        self._router_aux_sum: Any = None
-        self._router_aux_count = 0
-        self._micro_step_outputs_seen = False
-
-    def on_step_begin(
-            self, state: TrainerState, micro_batches: list[dict[str, Any]] | None = None, **kwargs: Any,
-    ) -> None:
-        """Reset per-step metric state, including steps that do not emit a log."""
-        del state, micro_batches, kwargs
-        self._router_aux_sum = None
-        self._router_aux_count = 0
-        self._micro_step_outputs_seen = False
-
-    def on_micro_step_end(self, state: TrainerState, loss_dict: dict[str, Any], **kwargs: Any) -> None:
-        """Accumulate detached router outputs without synchronizing device scalars."""
-        del state, kwargs
-        if self.logging_steps <= 0 or getattr(self.trainer, "global_rank", 0) != 0:
-            return
-        self._micro_step_outputs_seen = True
-        aux_loss = loss_dict.get("router_aux_loss") if loss_dict is not None else None
-        if aux_loss is not None:
-            value = aux_loss.detach()
-            if self._router_aux_sum is None:
-                # Graph executors may reuse output storage on the next microbatch.
-                self._router_aux_sum = value.clone()
-            else:
-                self._router_aux_sum += value
-            self._router_aux_count += 1
 
     @staticmethod
     def _format_value(value: Any) -> str:
@@ -115,17 +87,16 @@ class LoggingCallback(Callback):
             return
 
         metrics = dict(getattr(self.trainer, "step_env_metrics", {}))
-        moe_monitor = getattr(self.trainer, "moe_monitor", None)
-        if self._micro_step_outputs_seen:
-            aux_loss = (self._router_aux_sum / self._router_aux_count
-                        if self._router_aux_count else None)
-        else:
-            # Keep direct step-end callers compatible when no micro-step outputs were observed.
+        if "training/router_aux_loss" not in metrics:
+            # Without the meter, callers supply their own step aggregation.
+            # The logger does not normalize local values across micro-batches or ranks.
             aux_loss = loss_dict.get("router_aux_loss") if loss_dict is not None else None
-            if aux_loss is None and moe_monitor is not None:
-                aux_loss = moe_monitor.last_mean_aux_loss
-        if aux_loss is not None:
-            metrics["training/router_aux_loss"] = float(aux_loss)
+            if aux_loss is None:
+                moe_monitor = getattr(self.trainer, "moe_monitor", None)
+                if moe_monitor is not None:
+                    aux_loss = moe_monitor.last_mean_aux_loss
+            if aux_loss is not None:
+                metrics["training/router_aux_loss"] = float(aux_loss)
         if not metrics:
             return
         self._write(self._format_message(state, metrics))

@@ -37,11 +37,14 @@ class EnvironMeterCallback(Callback):
     consume those dictionaries without recalculating or reducing metrics.
     """
 
-    def __init__(self, trainer: Any) -> None:
+    def __init__(self, trainer: Any, *, microbatch_mean_metrics: Sequence[str] = ()) -> None:
         """Initialize per-step and cumulative counters.
 
         Args:
             trainer: Trainer that owns the callback lifecycle.
+            microbatch_mean_metrics: Raw metric names to average over observed
+                micro-batches before the existing DP+CP mean reduction. Other
+                metrics retain the step values supplied by the Trainer.
         """
         super().__init__(trainer)
         self._step_start_time = 0.0
@@ -49,6 +52,8 @@ class EnvironMeterCallback(Callback):
         self._local_step_input_tokens: Any = None
         self._local_step_seq_len_sq: Any = None
         self._local_step_samples = 0
+        self._microbatch_mean_metrics = tuple(microbatch_mean_metrics)
+        self._local_mean_metrics: dict[str, tuple[Any, int]] = {}
         self._consumed_tokens = 0
         self._consumed_samples = 0
         self.trainer.step_train_metrics = {}
@@ -348,6 +353,7 @@ class EnvironMeterCallback(Callback):
         self._local_step_seq_len_sq = None
         self._local_step_samples = 0
         self._step_start_time = time.perf_counter()
+        self._local_mean_metrics.clear()
         self._accumulate_batches(micro_batches)
 
     def on_micro_step_begin(
@@ -365,6 +371,15 @@ class EnvironMeterCallback(Callback):
         """
         del state, kwargs
         self._accumulate_batches(micro_batch)
+
+    def on_micro_step_end(self, state: TrainerState, loss_dict: dict[str, Any], **kwargs: Any) -> None:
+        """Accumulate explicitly registered micro-batch means without host reads."""
+        del state, kwargs
+        for name in self._microbatch_mean_metrics:
+            value = loss_dict.get(name)
+            if value is not None:
+                total, count = self._local_mean_metrics.get(name, (None, 0))
+                self._local_mean_metrics[name] = (self._accumulate_scalar(total, value), count + 1)
 
     def on_step_end(
         self,
@@ -416,8 +431,12 @@ class EnvironMeterCallback(Callback):
             "training/lr": self._current_lr(),
         }
         for name, value in sorted((loss_dict or {}).items()):
+            if name in self._local_mean_metrics:
+                total, count = self._local_mean_metrics[name]
+                value = total / count
             metric_name = name if name.startswith("training/") else f"training/{name}"
             train_metrics[metric_name] = self._reduce(self._scalar(value, name), op="mean")
+        self._local_mean_metrics.clear()
 
         tokens_per_second = global_tokens / global_step_time if global_step_time > 0 else 0.0
         env_metrics = {

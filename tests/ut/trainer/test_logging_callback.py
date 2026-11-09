@@ -26,7 +26,6 @@ import torch
 from hyper_parallel.components.modules.moe_utils import MoEMonitorCallback
 from hyper_parallel.trainer.callbacks.logging_callback import LoggingCallback
 from hyper_parallel.trainer.state import TrainerState
-from tests.common.mark_utils import arg_mark
 
 
 class TestLoggingCallback(unittest.TestCase):
@@ -41,8 +40,29 @@ class TestLoggingCallback(unittest.TestCase):
             step_env_metrics={"training/total_loss": 2.5}, tqdm_callback=None,
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
+    def test_global_aux_metric_is_not_overwritten_by_local_mean(self) -> None:
+        """Preserve the shared AUX value in terminal output, including zero."""
+        for global_value in (4.0, 0.0):
+            with self.subTest(global_value=global_value):
+                trainer = self._trainer()
+                trainer.step_env_metrics["training/router_aux_loss"] = global_value
+                callback = LoggingCallback(trainer)
+                state = TrainerState(global_step=2)
+                with patch("hyper_parallel.trainer.callbacks.logging_callback.logger.info") as log:
+                    callback.on_step_end(state, loss=2.5, loss_dict={"router_aux_loss": 2.0}, grad_norm=1.0)
+                self.assertIn(f"training/router_aux_loss={global_value:g}", log.call_args.args[1])
+
+    def test_meterless_fallback_preserves_supplied_step_value(self) -> None:
+        """Log the supplied local step value without inferring normalization."""
+        trainer = self._trainer()
+        trainer.num_micro_batches = 2
+        callback = LoggingCallback(trainer)
+        state = TrainerState(global_step=2)
+        with patch("hyper_parallel.trainer.callbacks.logging_callback.logger.info") as log:
+            callback.on_step_end(state, loss=2.5, loss_dict={"router_aux_loss": 4.0}, grad_norm=1.0)
+        message = log.call_args.args[1]
+        self.assertIn("training/router_aux_loss=4", message.split(), f"expected supplied AUX=4, got={message}")
+
     def test_callback_import_does_not_load_model_runtime(self) -> None:
         """
         Feature: CPU callback imports.
@@ -74,8 +94,6 @@ class TestLoggingCallback(unittest.TestCase):
             f"Expected import exit code 0, got {result.returncode}: {result.stderr}",
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_raw_aux_loss_is_logged_with_bias_updates_disabled(self) -> None:
         """
         Feature: Auxiliary-loss logging.
@@ -96,8 +114,6 @@ class TestLoggingCallback(unittest.TestCase):
         self.assertIn("training/total_loss=2.5", message)
         self.assertEqual(trainer.step_env_metrics, {"training/total_loss": 2.5})
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_skipped_logs_do_not_read_aux_device_scalars(self) -> None:
         """
         Feature: Auxiliary-loss logging.
@@ -117,8 +133,6 @@ class TestLoggingCallback(unittest.TestCase):
                 read.assert_not_called()
                 log.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_missing_aux_is_omitted_and_zero_aux_is_logged(self) -> None:
         """
         Feature: Auxiliary-loss logging.
@@ -136,8 +150,6 @@ class TestLoggingCallback(unittest.TestCase):
                 else:
                     self.assertNotIn("training/router_aux_loss", message)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_aux_log_uses_active_tqdm_writer(self) -> None:
         """
         Feature: Auxiliary-loss logging.
