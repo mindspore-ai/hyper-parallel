@@ -17,12 +17,15 @@
 from copy import deepcopy
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 from torch.nn import functional as F
-from transformers.models.deepseek_v3.modeling_deepseek_v3 import apply_rotary_pos_emb_interleave
+from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
+    apply_rotary_pos_emb, apply_rotary_pos_emb_interleave,
+)
 
+from hyper_parallel.components import functional
 from hyper_parallel.components.checkpoint.weight_conversion import revert_weight_conversion
 from hyper_parallel.components.functional.npu_fusion_attention import (
     _prepare_fusion_attention_context, resolve_packed_sequence_lengths,
@@ -75,6 +78,24 @@ def _reference_attention(module, query, key, value, attention_mask=None, **kwarg
 
 class TestMLAContextParallel(unittest.TestCase):
     """Keep focused adapter contracts; distributed score math lives in the ST worker."""
+
+    def test_local_callback_arguments(self) -> None:
+        """
+        Feature: Model-local MLA CP callbacks.
+        Description: Install callable overrides and reject invalid callback arguments.
+        Expectation: The wrapper preserves callback identity and rejects invalid values before installation.
+        """
+        rotary, attention = Mock(), Mock()
+        module = make_mla()
+        install_mla_cp(module, TestCPMesh(singleton=True), "expanded_ulysses",
+                       rotary_fn=rotary, attention_interface=attention)
+        self.assertIs(module.mla_cp_runtime.rotary_fn, rotary)
+        self.assertIs(module.mla_cp_runtime.attention_interface, attention)
+        for name in ("rotary_fn", "attention_interface"):
+            module = make_mla()
+            with self.subTest(name=name), self.assertRaisesRegex(TypeError, name):
+                install_mla_cp(module, TestCPMesh(singleton=True), "expanded_ulysses", **{name: object()})
+            self.assertFalse(hasattr(module, "mla_cp_runtime"))
 
     def test_packed_boundaries_and_long_causal_mask(self) -> None:
         """
@@ -307,8 +328,8 @@ class TestMLAContextParallel(unittest.TestCase):
 class TestMLAModel(unittest.TestCase):
     """Exercise real decoder objects and the family-specific fused latent rules."""
 
-    @patch("hyper_parallel.components.functional.apply_rotary_pos_emb_interleave",
-           new=apply_rotary_pos_emb_interleave)
+    @patch.dict(functional.__dict__, {"apply_rotary_pos_emb": apply_rotary_pos_emb,
+                                     "apply_rotary_pos_emb_interleave": apply_rotary_pos_emb_interleave})
     def test_replacement_decoder_and_checkpoint_roundtrip(self) -> None:
         """
         Feature: HF DeepSeek MLA replacement and checkpoint compatibility.

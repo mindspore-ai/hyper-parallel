@@ -54,3 +54,14 @@ def test_mla_npu_reference() -> None:
     Expectation: Kernel outputs and gradients satisfy the existing elementwise tolerances.
     """
     torchrun_case(_WORKER, "test_mla_npu_single_card", num_proc=1)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_mla_local_callbacks_npu_4_cards() -> None:
+    """
+    Feature: MLA local callback composition on four NPUs.
+    Description: Run TP2 CP2 with per-head attention scaling and checkpointed gradient comparisons.
+    Expectation: Local callbacks preserve the unsharded output and gradient contract.
+    """
+    torchrun_case(_WORKER, "test_mla_local_callbacks_npu_bfloat16", num_proc=4)

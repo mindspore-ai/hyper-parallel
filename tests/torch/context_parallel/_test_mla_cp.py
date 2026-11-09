@@ -34,7 +34,7 @@ from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 from hyper_parallel.distributed._builder.planner import ShardingPlanner
 from hyper_parallel.distributed.apply import apply_sharding_plan
 from hyper_parallel.distributed.context_parallel.mla_context_parallel import (
-    MLADimensions, MLA_CP_STRATEGIES, _apply_mla_rope,
+    MLADimensions, MLA_CP_STRATEGIES, apply_mla_rope,
 )
 from hyper_parallel.distributed.mesh import MeshContext
 from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
@@ -149,7 +149,7 @@ def _check_npu_rope(device: torch.device) -> None:
                            if interleaved else reference)
                 first, second = ordered.chunk(2, -1)
                 expected.append(ordered * cos + torch.cat((-second, first), -1) * sin)
-            actual = tuple(_apply_mla_rope(tensor, positions, interleaved=interleaved) for tensor in inputs)
+            actual = tuple(apply_mla_rope(tensor, positions, interleaved=interleaved) for tensor in inputs)
             for name, tensor, reference, source, source_reference in zip(
                     ("Q", "K"), actual, expected, inputs, references):
                 _compare(tensor, reference, dtype, f"fused RoPE {name}")
@@ -215,7 +215,7 @@ def _sync_tp_cp_gradients(parallel, reference, tp_mesh, cp_mesh, tp, tp_rank, dt
 
 
 def _build_composition(mesh, tp, cp, strategy, metadata, device, dtype, overlap=False, ulysses_degree=None,
-                       kv_exchange="all_gather"):
+                       kv_exchange="all_gather", callbacks=None):
     """Apply the production plan and assert the physical TP layout before training."""
     tp_rank = mesh["tp"].get_local_rank() if tp > 1 else 0
     torch.manual_seed(409)
@@ -231,7 +231,7 @@ def _build_composition(mesh, tp, cp, strategy, metadata, device, dtype, overlap=
             mla_cp_wrapper,
             target_path="hyper_parallel.models.deepseek_v3.adapter.distributed.context_parallel.mla_cp_wrapper",
             strategy=strategy, overlap=overlap, ulysses_degree=ulysses_degree,
-            kv_exchange=kv_exchange,
+            kv_exchange=kv_exchange, **(callbacks or {}),
         ),
     )
     plan = ShardingPlanner(plan_overrides={"self_attn": spec}).plan(
@@ -244,19 +244,22 @@ def _build_composition(mesh, tp, cp, strategy, metadata, device, dtype, overlap=
     assert parallel.self_attn.mla_cp_runtime.plan.compute_heads == dimensions.heads // (tp * (ulysses_degree or cp))
     for name, parameter in parallel.named_parameters():
         _compare(parameter, _tp_shard(reference.get_parameter(name), name, tp, tp_rank), dtype, f"TP layout {name}")
+    if callbacks is not None:
+        reference.self_attn.attention_interface = callbacks["attention_interface"]
     return reference, parallel, dimensions
 
 
 def _gradient_composition(mesh, tp: int, cp: int, strategy: str, metadata: dict,
                        device: torch.device, dtype: torch.dtype, overlap: bool = False,
-                       ulysses_degree: int | None = None, kv_exchange: str = "all_gather") -> None:
+                       ulysses_degree: int | None = None, kv_exchange: str = "all_gather",
+                       callbacks: dict | None = None) -> None:
     """Compare recomputed TP/CP outputs and accumulated gradients to the unsharded reference."""
     tp_mesh = mesh["tp"] if tp > 1 else None
     cp_mesh = mesh["cp"] if cp > 1 else None
     tp_rank = tp_mesh.get_local_rank() if tp_mesh is not None else 0
     cp_rank = cp_mesh.get_local_rank() if cp_mesh is not None else 0
     reference, parallel, dimensions = _build_composition(
-        mesh, tp, cp, strategy, metadata, device, dtype, overlap, ulysses_degree, kv_exchange,
+        mesh, tp, cp, strategy, metadata, device, dtype, overlap, ulysses_degree, kv_exchange, callbacks,
     )
     lengths = metadata.get("actual_seq_len")
     sequence = lengths[-1] if lengths else 64
@@ -365,6 +368,57 @@ def test_mla_tp_cp_npu_bfloat16() -> None:
     Expectation: Outputs and reconstructed TP/CP gradients agree with the native non-CP module.
     """
     _tp_suite(_npu_device(), torch.bfloat16, ((2, 4, True),))
+
+
+def test_mla_local_callbacks_npu_bfloat16() -> None:
+    """
+    Feature: Local rotary and attention overrides under TP2 CP2.
+    Description: Reuse TP/CP gradient comparisons for synchronous and overlapping callback paths.
+    Expectation: Head-scaled outputs and accumulated gradients match the unsharded reference.
+    """
+    device = _npu_device()
+    dist.init_process_group("hccl", timeout=timedelta(seconds=180))
+    try:
+        mesh = init_device_mesh(device.type, (2, 2), mesh_dim_names=("cp", "tp"))
+        tp_rank = mesh["tp"].get_local_rank()
+        cp_rank = mesh["cp"].get_local_rank()
+        rotary_heads, attention_offsets = set(), set()
+
+        def rotary(
+            tensor: torch.Tensor, positions: tuple[torch.Tensor, torch.Tensor] | None, *, interleaved: bool,
+        ) -> torch.Tensor:
+            """Record Q/K dispatch while executing the existing fused rotary implementation."""
+            rotary_heads.add((tensor.shape[2], interleaved))
+            return apply_mla_rope(tensor, positions, interleaved=interleaved)
+
+        def attention(
+            owner: nn.Module, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+            mask: torch.Tensor | None = None, **options: Any,
+        ) -> tuple[torch.Tensor, Any]:
+            """Scale global heads so an incorrect CP head slice changes outputs and gradients."""
+            local = "mla_head_offset" in options
+            offset = options.pop("mla_head_offset", 0)
+            heads = options.pop("mla_local_heads", query.shape[1])
+            if local:
+                assert heads == 4 and query.shape[1] == 2
+                attention_offsets.add(offset)
+            start = tp_rank * heads + offset if local else 0
+            output, weights = npu_fusion_attention_forward(owner, query, key, value, mask, **options)
+            scales = (1 + (torch.arange(query.shape[1], device=query.device) + start) / 16).to(output.dtype)
+            return output * scales.view(1, 1, -1, 1), weights
+
+        for strategy, overlap in (("expanded_ulysses", False), ("expanded_ulysses", True),
+                                  ("latent_kv_head", True)):
+            rotary_heads.clear()
+            attention_offsets.clear()
+            _gradient_composition(
+                mesh, 2, 2, strategy, attention_options(), device, torch.bfloat16, overlap,
+                callbacks={"rotary_fn": rotary, "attention_interface": attention},
+            )
+            assert rotary_heads == {(1, False), (4, False)}
+            assert attention_offsets == {cp_rank * 2}
+    finally:
+        dist.destroy_process_group()
 
 
 def _model_fsdp_case(mesh: MeshContext, strategy: str, device: torch.device, *, sequence_parallel: bool) -> None:
