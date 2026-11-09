@@ -198,3 +198,53 @@ PyTorch/torch-npu `2.10.0` at these source revisions:
 | --- | --- |
 | ops-nn | `b7af75e68cc07c0912f9e020bce639e53de60700` |
 | ops-transformer | `a041b05638a5a3f94b79c97ce196a331738a56a1` |
+
+## Linear attention backends
+
+`backend="ascendc"` for local KDA/GDN and pure Ulysses requires
+[fla-npu](https://github.com/flashserve/flash-linear-attention-npu), installed with
+matching Python bindings, stable launcher and native operator libraries.
+KDA and GDN use the same package and public `fla_npu.ops.ascendc` namespace.
+The shared qualification revision is unmodified source commit
+[`131fd3e937bd7607e372cf80c1022a80ed5fb853`](https://github.com/flashserve/flash-linear-attention-npu/commit/131fd3e937bd7607e372cf80c1022a80ed5fb853).
+A filtered build must include both model families and their required operators;
+a KDA-only wheel does not qualify GDN, even if the Python exports exist.
+Do not combine bindings or operator libraries from different revisions.
+Install the wheel appropriate to the target hardware and CANN environment using
+[the upstream installation guide](https://github.com/flashserve/flash-linear-attention-npu).
+
+KDA local, Ulysses and state CP share `chunk_kda_fwd_prepare` save mode,
+`chunk_fwd_h`, `chunk_kda_fwd_finalize`, `chunk_kda_bwd_prepare`,
+`chunk_gated_delta_rule_bwd_dhu` and `chunk_kda_bwd_finalize`.
+The adapter owns raw-input gradients and converts sequence-major inputs to the
+head-major native stage layouts. Beta sigmoid backward uses Torch's
+`aten.sigmoid_backward` with the FP32 `beta_eff` already saved by Prepare.
+The native finalize sigmoid-backward flag stays disabled on every device;
+the adapter does not inspect device names or require an FLA beta helper.
+Raw beta logits are not retained for backward. Native operators validate their
+own hardware support; this common adapter does not imply every device has
+completed numerical or performance qualification.
+
+GDN requires `chunk_gated_delta_rule_fwd` and `chunk_gated_delta_rule_bwd` with
+`layout`, `cu_seqlens` and `chunk_indices`. Normalization and effective gate/beta
+remain in the caller's autograd graph. Both wrappers use per-invocation save
+mode and reject unsupported external state-gradient requests. KDA layer CP
+and GDN pure Ulysses use the same backend for causal convolution; Ascend C additionally requires
+`causal_conv1d` and `causal_conv1d_bwd` with the SiLU derivative included.
+
+KDA state P2P, AllGather, grouped AllGather/P2P and recursive doubling
+additionally require native CP summary/merge APIs. RD shares the existing
+transport and reset planner while scanning native S/M forward and native G/N
+in reverse, without the Triton forward-transfer cache. The validated native
+base is the same shared revision above, built for the target device.
+This is a main-source build, not a claim that the
+`v26.9.1` release wheel exports the required CP/staged backward interfaces.
+The adapter converts backward-summary `gk` and local `dHT` to model dtype as
+required by its public ABI. Communication and summary apply remain FP32.
+These conversions introduce rounding relative to FP32-input extensions;
+no local native patches are required. Older releases without the independent
+stages or CP summary exports are not compatible with this path.
+These protocols share the same local KDA stages and can be combined with Ulysses.
+Forward exchanges use S/M, while backward produces fresh G/N instead of caching M.
+See [KDA context parallelism](../../../docs/guide/kda_context_parallel.md)
+for configurations, supported shapes and the state-buffer lifetime contract.

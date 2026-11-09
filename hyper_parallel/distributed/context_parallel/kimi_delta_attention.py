@@ -54,7 +54,7 @@ from hyper_parallel.distributed.context_parallel.kimi_delta_attention_state impo
 )
 
 
-_KDA_BACKENDS = frozenset({"eager", "triton"})
+_KDA_BACKENDS = frozenset({"eager", "triton", "ascendc"})
 
 
 def _run_local_kda(
@@ -74,8 +74,14 @@ def _run_local_kda(
     sequence_info: Optional[PackedSequenceInfo] = None,
 ) -> torch.Tensor:
     """Run the explicitly selected local KDA implementation."""
-    if backend == "triton" and not safe_gate:
+    if backend in ("triton", "ascendc") and not safe_gate:
         raise RuntimeError("The fused KDA backend requires the lower-bounded gate.")
+    cu_seqlens = None
+    if sequence_info is not None:
+        # Native APIs consume host metadata; do not materialize an NPU plan
+        # only to copy its offsets back to the host at every layer.
+        cu_seqlens = (sequence_info.local_offsets if backend == "ascendc" else
+                      sequence_info.materialize(query.device, chunk_size).cu_seqlens)
     output, _ = chunk_kda(
         query,
         key,
@@ -93,7 +99,7 @@ def _run_local_kda(
         use_gate_in_kernel=True,
         use_beta_sigmoid_in_kernel=True,
         backend=backend,
-        cu_seqlens=None if sequence_info is None else sequence_info.materialize(query.device, chunk_size).cu_seqlens,
+        cu_seqlens=cu_seqlens,
     )
     return output
 
@@ -247,8 +253,13 @@ def _run_causal_short_conv(
     convolution: nn.Conv1d,
     halo: Optional[torch.Tensor] = None,
     sequence_info: Optional[PackedSequenceInfo] = None,
+    backend: str = "eager",
 ) -> torch.Tensor:
     """Apply one local ShortConv, optionally with a preceding-rank halo."""
+    if backend != "eager":
+        return fused_causal_conv1d(
+            tensor, convolution.weight, convolution.bias, sequence_info, halo,
+            backend=backend, dilation=convolution.dilation[0])
     if sequence_info is not None:
         return packed_causal_conv1d(tensor, convolution, sequence_info, halo)
     if halo is None:
@@ -278,6 +289,7 @@ def _causal_short_convs_with_cp_halo(
     cp_rank: int,
     cp_size: int,
     sequence_info: Optional[PackedSequenceInfo] = None,
+    backend: str = "eager",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run three causal depthwise ShortConvs with one packed halo exchange."""
     halo_widths = {
@@ -288,7 +300,7 @@ def _causal_short_convs_with_cp_halo(
     halo_width = halo_widths.pop()
     if halo_width == 0 or cp_size == 1:
         return tuple(
-            _run_causal_short_conv(tensor, convolution, sequence_info=sequence_info)
+            _run_causal_short_conv(tensor, convolution, sequence_info=sequence_info, backend=backend)
             for tensor, convolution in zip(projected, convolutions)
         )
     if projected[0].shape[1] < halo_width:
@@ -310,7 +322,7 @@ def _causal_short_convs_with_cp_halo(
     )
     halos = torch.split(packed_halo, channel_sizes, dim=-1)
     return tuple(
-        _run_causal_short_conv(tensor, convolution, halo, sequence_info=sequence_info)
+        _run_causal_short_conv(tensor, convolution, halo, sequence_info=sequence_info, backend=backend)
         for tensor, halo, convolution in zip(projected, halos, convolutions)
     )
 
@@ -837,8 +849,10 @@ class _KDAStateCP(nn.Module):
         self.cp_size = self.cp_mesh.size()
         self.cp_rank = self.cp_mesh.get_local_rank()
         self.cp_group = self.cp_mesh.get_group()
-        if backend != "triton" and state_cp_method != "p2p":
-            raise ValueError("KDA non-P2P state exchange requires backend='triton'.")
+        if backend == "ascendc" and (chunk_size != 64 or not safe_gate):
+            raise ValueError("Ascend C KDA requires safe_gate=True and chunk_size=64.")
+        if backend == "eager" and state_cp_method != "p2p":
+            raise ValueError("Eager KDA state exchange supports P2P only.")
         self.state_cp = build_kda_state_cp(self.cp_mesh, state_cp_method, allgather_group_size)
         self.prev_rank = _global_peer_rank(
             self.cp_mesh,
@@ -913,6 +927,16 @@ class _KDAStateCP(nn.Module):
                 cp_size=self.cp_size,
                 sequence_info=sequence_info,
             )
+
+        if self.backend == "ascendc":
+            # The native package remains optional; loading it belongs to the selected backend.
+            from hyper_parallel.components.functional.kimi_delta_attention_ascendc import (  # pylint: disable=import-outside-toplevel
+                ascendc_state_kda,
+            )
+            return ascendc_state_kda(
+                query, key, value, gate, beta, a_log=a_log, dt_bias=dt_bias, scale=scale,
+                lower_bound=self.lower_bound, state_cp=self.state_cp, cp_mesh=self.cp_mesh,
+                sequence_info=sequence_info)
 
         from hyper_parallel.components.functional.kimi_delta_attention import (  # pylint: disable=import-outside-toplevel
             fused_chunk_kda_p2p,
@@ -1296,7 +1320,7 @@ class KimiDeltaAttentionLayerCP(nn.Module):
         num_v_heads = _num_value_heads(self.module)
         if num_v_heads % self.module.num_heads:
             raise ValueError("KDA num_v_heads must be divisible by num_heads.")
-        if self.backend == "triton" and (
+        if self.backend in ("triton", "ascendc") and (
             self.module.head_k_dim != 128 or _value_head_dim(self.module) != 128
         ):
             raise NotImplementedError(
@@ -1358,6 +1382,7 @@ class KimiDeltaAttentionLayerCP(nn.Module):
                 self.cp_rank,
                 self.cp_size,
                 sequence_info=sequence_info,
+                backend="ascendc" if self.backend == "ascendc" else "eager",
             )
         else:
             query, key, value = (F.silu(tensor) for tensor in (query, key, value))
@@ -1432,8 +1457,8 @@ class KimiDeltaAttentionCoreCP(nn.Module):
         device_mesh = _ensure_1d(device_mesh)
         if state_cp_method not in ("p2p", "allgather", "grouped_allgather_p2p", "recursive_doubling"):
             raise ValueError("KDA requires a supported state_cp_method.")
-        if backend.lower() != "triton" and state_cp_method != "p2p":
-            raise ValueError("KDA non-P2P state exchange requires backend='triton'.")
+        if backend.lower() == "eager" and state_cp_method != "p2p":
+            raise ValueError("Eager KDA state exchange supports P2P only.")
         _validate_cp_degrees(device_mesh.size(), ulysses_degree, allgather_group_size)
         if state_cp_method != "grouped_allgather_p2p" and allgather_group_size != 1:
             raise ValueError("allgather_group_size is only valid for grouped_allgather_p2p.")

@@ -372,7 +372,9 @@ def apply_kda_state_summary(
     """
     if initial_state is None:
         return state_ext
-    return torch.matmul(transition, initial_state.float()) + state_ext
+    # Model autocast must not silently quantize a communicated FP32 state.
+    with torch.autocast(device_type=state_ext.device.type, enabled=False):
+        return torch.matmul(transition.float(), initial_state.float()) + state_ext
 
 
 def apply_kda_state_gradient_summary(
@@ -383,7 +385,8 @@ def apply_kda_state_gradient_summary(
     """Apply the adjoint summary for the reverse P2P state wavefront."""
     if grad_final_state is None:
         return grad_state_ext
-    return (
-        torch.matmul(transition.transpose(-2, -1), grad_final_state.float())
-        + grad_state_ext
-    )
+    with torch.autocast(device_type=grad_state_ext.device.type, enabled=False):
+        return (
+            torch.matmul(transition.float().transpose(-2, -1), grad_final_state.float())
+            + grad_state_ext
+        )

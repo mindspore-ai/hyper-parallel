@@ -224,3 +224,6 @@
 # the Torch-only component contract; the legacy backend-import rule is narrower.
 "hyper-parallel/hyper_parallel/components/functional/linear_attention_packed.py" "forbidden-backend-import"
 "hyper-parallel/hyper_parallel/components/functional/linear_attention_convolution.py" "forbidden-backend-import"
+
+"hyper-parallel/hyper_parallel/components/functional/kimi_delta_attention_ascendc.py" "forbidden-backend-import"
+"hyper-parallel/hyper_parallel/components/functional/gated_delta_net_ascendc.py" "forbidden-backend-import"
