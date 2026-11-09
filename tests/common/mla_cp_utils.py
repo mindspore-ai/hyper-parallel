@@ -126,7 +126,7 @@ def install_mla_cp(module: MLAAttention, mesh: TestCPMesh, strategy: str, **opti
     """Commit the same adapter requests as the recipe rewriter, for isolated tests."""
     wrapper = mla_cp_wrapper
     if isinstance(module, KimiMLAAttention):
-        # Kimi CP also imports optional KDA kernels; keep ordinary CPU fixtures independent.
+        # Keep ordinary MLA fixtures independent of model-specific adapter imports.
         from hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel import (  # pylint: disable=C0415
             kimi_mla_cp_wrapper,
         )

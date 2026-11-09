@@ -7,7 +7,7 @@ ascend910b:
   pipeline_parallel: 5400
   dtensor: 960
   tensor_parallel: 2400
-  context_parallel: 960
+  context_parallel: 1920
   clip_grad: 960
   expert_parallel: 1600
   trainer: 960

@@ -93,8 +93,9 @@ def test_mla_npu_single_card() -> None:
     torch.manual_seed(913)
     mask = torch.ones(32, 32, dtype=torch.bool).tril()
     mask[3] = False
+    # Direct shared FA uses 4D Q/K masks; the CP suite retains the MLA 2D input contract.
     cases = (attention_options(), attention_options((3, 17, 32)), attention_options((3, 17, 32), False),
-             {**attention_options(causal=False), "attention_mask": mask.to(device)})
+             {**attention_options(causal=False), "attention_mask": mask[None, None].to(device)})
     for dtype in (torch.float16, torch.bfloat16):
         for metadata in cases:
             query = torch.randn(1, 4, 32, 192, dtype=dtype, device="cpu").to(device).requires_grad_()
@@ -108,7 +109,7 @@ def test_mla_npu_single_card() -> None:
             if metadata.get("is_causal", True):
                 allowed &= allowed.tril()
             if metadata.get("attention_mask") is not None:
-                allowed &= metadata["attention_mask"].cpu()
+                allowed &= metadata["attention_mask"][0, 0].cpu()
             ref_query, ref_key, ref_value = reference_inputs
             scale = 0.73 / 192**0.5
             scores = (ref_query @ ref_key.transpose(-2, -1)) * scale
