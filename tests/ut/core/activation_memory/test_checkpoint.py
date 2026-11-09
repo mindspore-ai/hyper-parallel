@@ -18,7 +18,6 @@
 # pylint: disable=wrong-import-position,protected-access
 import contextlib
 import importlib
-import os
 import unittest
 from unittest.mock import MagicMock, call, patch, sentinel
 
@@ -139,6 +138,27 @@ class TestCheckpointHelpers(_CheckpointTestCase):
         self.assertEqual(device_module.device.call_args_list, [call(3), call(3)])
         device_module.get_rng_state.assert_called_once_with()
         device_module.set_rng_state.assert_called_once_with(sentinel.rng_state)
+
+    def test_disabled_autocast_does_not_initialize_accelerator(self):
+        """Inactive accelerator autocast must not probe a device backend."""
+        disabled = {"enabled": False, "dtype": torch.float16, "cache_enabled": True}
+
+        with patch.object(_checkpoint.torch.amp, "autocast") as autocast:
+            context = _checkpoint._autocast_context("npu", disabled)
+
+        self.assertIsInstance(context, contextlib.nullcontext)
+        autocast.assert_not_called()
+
+    def test_enabled_autocast_preserves_device_options(self):
+        """Active accelerator autocast should pass through the captured options."""
+        enabled = {"enabled": True, "dtype": torch.float16, "cache_enabled": False}
+        expected = contextlib.nullcontext()
+
+        with patch.object(_checkpoint.torch.amp, "autocast", return_value=expected) as autocast:
+            context = _checkpoint._autocast_context("cuda", enabled)
+
+        self.assertIs(context, expected)
+        autocast.assert_called_once_with(device_type="cuda", **enabled)
 
     def test_meta_device_states_are_empty_and_restore_is_noop(self):
         """Meta tensors should not participate in RNG state capture or restore."""

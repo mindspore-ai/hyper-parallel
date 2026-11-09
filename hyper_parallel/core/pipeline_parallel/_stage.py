@@ -23,6 +23,12 @@ from torch.distributed.pipelining._backward import (
 )
 
 import hyper_parallel
+from hyper_parallel.core.activation_memory.checkpoint import recompute_handle_collector_ctx
+from hyper_parallel.core.activation_memory.reentrant_checkpoint import (
+    ReentrantCheckpointHandle,
+    reentrant_checkpoint_scope,
+)
+from hyper_parallel.core.fully_shard.api import HSDPModule
 
 
 class PipelineStageBase:
@@ -60,9 +66,13 @@ class PipelineStageBase:
         self.last_stage_outputs = None  # Initialized in forward_one_chunk()
         self._trainable_params = None
         self._dw_cache = {}
+        self._reentrant_frames = {}
+        self._has_sharded_params = any(isinstance(module, HSDPModule) for module in submodule.modules())
 
     def clear_cache(self) -> None:
         """clear cache."""
+        for micro_index in tuple(self._reentrant_frames):
+            self._release_reentrant(micro_index)
         self.fwd_outputs_cache.clear()
         self.bwd_cache.clear()
         self._dw_cache.clear()
@@ -107,7 +117,23 @@ class PipelineStageBase:
                 raise RuntimeError(f"The exec order is wrong. The corresponding forward calculation \
                                     is executed before the Receive operation. micro is {micro_index}.")
         composite_kwargs = kwargs or {}
-        out = self.submodule(*composite_args, **composite_kwargs)
+        # The scope also catches direct checkpoint() calls inside forward, not
+        # only checkpoint wrappers registered as children of the stage module.
+        if self._has_sharded_params:
+            scope = recompute_handle_collector_ctx()
+        else:
+            scope = reentrant_checkpoint_scope(self._get_trainable_params)
+        with scope as frames:
+            try:
+                out = self.submodule(*composite_args, **composite_kwargs)
+            except BaseException:
+                for frame in frames:
+                    if isinstance(frame, ReentrantCheckpointHandle):
+                        frame.release()
+                raise
+        reentrant_frames = tuple(frame for frame in frames if isinstance(frame, ReentrantCheckpointHandle))
+        if reentrant_frames:
+            self._reentrant_frames[micro_index] = reentrant_frames
         out_tuple = out if isinstance(out, tuple) else (out,)
         self.fwd_cache[micro_index] = out_tuple
         self.fwd_outputs_cache[micro_index] = out_tuple
@@ -150,10 +176,50 @@ class PipelineStageBase:
     def _get_trainable_params(self):
         """Return the stable parameter tuple used to partition dx and dw."""
         if self._trainable_params is None:
-            self._trainable_params = tuple(
-                param for param in self.submodule.parameters() if param.requires_grad
-            )
+            self._trainable_params = tuple({id(param): param for param in self.submodule.parameters()
+                                            if param.requires_grad}.values())
         return self._trainable_params
+
+    def _release_reentrant(self, micro_index):
+        """Discard per-microbatch replay graphs even after a failed backward."""
+        frames = self._reentrant_frames.pop(micro_index, ())
+        for frame in frames:
+            frame.release()
+        self._dw_cache.pop(micro_index, None)
+
+    def _bind_reentrant(self, micro_index, phase):
+        """Bind phase on frames, not on caller thread-local state (autograd uses workers)."""
+        for frame in self._reentrant_frames[micro_index]:
+            frame.set_phase(phase)
+
+    def _reentrant_backward(self, micro_index, phase):
+        """Use public autograd targets while keeping the original output graph for dw."""
+        outputs, grad_tensors = self._dw_cache[micro_index]
+        if getattr(self, "retain_backward_graph", False):
+            raise ValueError("Reentrant PP does not support retain_backward_graph: frames cannot be replayed "
+                             "after the first backward. Disable reentrant checkpointing for this stage.")
+        if phase == "full":
+            if not self._has_sharded_params:
+                self._bind_reentrant(micro_index, "dw")
+            torch.autograd.backward(outputs, grad_tensors=grad_tensors)
+            return
+        inputs = []
+        if phase != "dw":
+            inputs = [info.buffer for info in self.args_recv_info[micro_index] if info.requires_grad]
+        if self._has_sharded_params:
+            raise ValueError("Reentrant PP split with FSDP/HSDP is unsupported: parameter identity "
+                             "changes across forward and backward.")
+        self._bind_reentrant(micro_index, phase)
+        if phase == "dw":
+            # The zero-element trigger traverses closure-only checkpoint nodes
+            # without adding fake edges to real parameters (which fire hooks on None).
+            roots = [*self._get_trainable_params(), *(
+                frame.backward_trigger for frame in self._reentrant_frames[micro_index]
+            )]
+            inputs = list({id(root): root for root in roots}.values())
+        if inputs and outputs:
+            torch.autograd.backward(outputs, grad_tensors=grad_tensors, inputs=inputs,
+                                    retain_graph=phase == "dx")
 
     def backward_one_chunk(self, micro_index: int) -> None:
         """Execution a backward function.
@@ -177,11 +243,23 @@ class PipelineStageBase:
 
         if not local_output:
             # Nothing to backprop through (e.g. all forward outputs detached).
+            self._release_reentrant(micro_index)
             self._clear_recv_buffer(self.grad_recv_info, micro_index)
             self._clear_recv_buffer(self.args_recv_info, micro_index)
             return
 
         grad_tensors = self._build_last_stage_sens() if self.is_last_stage else recv_args
+        if micro_index in self._reentrant_frames:
+            try:
+                self._dw_cache[micro_index] = (local_output, grad_tensors)
+                self._reentrant_backward(micro_index, "full")
+                if not self.is_first_stage:
+                    self._populate_bwd_cache(micro_index)
+            finally:
+                self._release_reentrant(micro_index)
+                self._clear_recv_buffer(self.grad_recv_info, micro_index)
+                self._clear_recv_buffer(self.args_recv_info, micro_index)
+            return
         # MPipe owner-backward shares the tower's all-gather node across micro
         # graphs, so freeing it on the first backward breaks the later ones.
         retain_graph = getattr(self, "retain_backward_graph", False)
@@ -206,6 +284,21 @@ class PipelineStageBase:
         grad_tensors = self._build_last_stage_sens() if self.is_last_stage else recv_args
         if not isinstance(grad_tensors, (list, tuple)):
             grad_tensors = [grad_tensors]
+        if micro_index in self._reentrant_frames:
+            try:
+                self._dw_cache[micro_index] = (local_output, grad_tensors)
+                if not local_output:
+                    self._dw_cache[micro_index] = ([], [])
+                    self._populate_bwd_cache(micro_index)
+                    return
+                self._reentrant_backward(micro_index, "dx")
+                self._populate_bwd_cache(micro_index)
+            except BaseException:
+                self._release_reentrant(micro_index)
+                self._clear_recv_buffer(self.grad_recv_info, micro_index)
+                self._clear_recv_buffer(self.args_recv_info, micro_index)
+                raise
+            return
         input_values = [
             recv_info.buffer
             for recv_info in self.args_recv_info[micro_index]
@@ -230,6 +323,17 @@ class PipelineStageBase:
             return
         if micro_index not in self._dw_cache:
             raise RuntimeError(f"stage: {self.stage_index} micro_{micro_index} dw called before dx.")
+
+        if micro_index in self._reentrant_frames:
+            try:
+                self._reentrant_backward(micro_index, "dw")
+            finally:
+                self._release_reentrant(micro_index)
+                self._clear_recv_buffer(self.grad_recv_info, micro_index)
+                self._clear_recv_buffer(self.args_recv_info, micro_index)
+                if self.is_last_stage:
+                    self.fwd_outputs_cache.pop(micro_index, None)
+            return
 
         param_groups = self._dw_cache.pop(micro_index)
         stage_backward_weight(iter(self._get_trainable_params()), param_groups)

@@ -1,10 +1,10 @@
 ascend910b:
-  activation_memory: 2400
+  activation_memory: 3000
   shard: 2400
   distributed_checkpoint: 960
   distributed_data: 3600
   accuracy: 960
-  pipeline_parallel: 4800
+  pipeline_parallel: 5400
   dtensor: 960
   tensor_parallel: 2400
   context_parallel: 960

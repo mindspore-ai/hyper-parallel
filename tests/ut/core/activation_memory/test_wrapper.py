@@ -19,30 +19,23 @@
 import contextlib
 import gc
 import importlib
-import os
 import unittest
 import warnings
 import weakref
 from typing import Any, Callable, cast
-from unittest.mock import MagicMock, call, patch, sentinel
+from unittest.mock import MagicMock, patch, sentinel
 
 import torch
-from torch.utils.checkpoint import DefaultDeviceType
 
 
 from hyper_parallel.core.activation_memory.api import (
     CheckpointPolicy,
-    clear_recompute_session,
-    recompute_handle,
-    recompute_handle_collector_ctx,
-    recompute_session_ctx,
 )
 from hyper_parallel.core.activation_memory import wrapper as wrapper_module
 from hyper_parallel.core.activation_memory.wrapper import (
     ActivationWrapper,
     AsyncSaveOnCpu,
     CheckpointExcludeWrapper,
-    CheckpointWrapper,
     FuncModule,
     SwapWrapper,
     base_check_fn,
@@ -82,7 +75,7 @@ class _CallableObject:
 class _PassthroughWrapper(ActivationWrapper):
     """Concrete activation wrapper used to exercise base-class behavior."""
 
-    def forward(self, *args, **kwargs):
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
         """Forward directly to the wrapped module."""
         wrapped_module = cast(Callable[..., Any], self._wrapped_module)
         return wrapped_module(*args, **kwargs)
@@ -132,7 +125,7 @@ class TestWrapperHelpers(unittest.TestCase):
         callable_obj = _CallableObject()
 
         wrapper_module._mark_wrapped(callable_obj)
-        self.assertTrue(callable_obj._is_wrapped)
+        self.assertTrue(getattr(callable_obj, "_is_wrapped", False))
         self.assertIsNone(wrapper_module._mark_wrapped(object()))
 
     def test_get_wrapped_callable_unwraps_function_modules(self):
@@ -153,7 +146,7 @@ class TestWrapperHelpers(unittest.TestCase):
         with self.assertWarnsRegex(UserWarning, "already wrapped"):
             wrapper_module._check_and_mark_callable(callable_obj)
 
-        self.assertTrue(callable_obj._is_wrapped)
+        self.assertTrue(getattr(callable_obj, "_is_wrapped", False))
 
     def test_wrapping_parent_warns_for_wrapped_parameterized_child(self):
         """A wrapped parameterized child should be detected when wrapping its parent."""
@@ -386,6 +379,27 @@ class TestAsyncSaveOnCpu(unittest.TestCase):
         self.assertTrue(torch.equal(packed, tensor))
         fake_manager.is_last_group.assert_called_once_with("group0")
         fake_manager.add_storage.assert_not_called()
+
+
+class TestCheckpointWrapperSwapState(unittest.TestCase):
+    """Keep wired swap groups reusable after custom checkpoint backward."""
+
+    def test_new_forward_resets_stale_backward_state(self):
+        """A real forward must rearm offload when the full backward hook did not fire."""
+        for use_reentrant in (False, True):
+            with self.subTest(use_reentrant=use_reentrant):
+                wrapper = ckpt_wrapper(torch.nn.Identity(), use_reentrant=use_reentrant)
+                wrapper._swap_group_name = "group0"
+                wrapper._swap_state = "pre_backward"
+                manager = MagicMock()
+                expected = torch.tensor(2.0)
+                with patch.object(wrapper_module, "SwapManager", return_value=manager), \
+                     patch.object(_api_module, "checkpoint", return_value=expected):
+                    result = wrapper(expected)
+
+                self.assertIs(result, expected)
+                self.assertEqual(wrapper._swap_state, "backward")
+                manager.set_current_group_name.assert_called_once_with("group0")
 
 
 class TestCheckpointExcludeWrapper(unittest.TestCase):

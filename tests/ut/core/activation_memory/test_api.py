@@ -99,6 +99,7 @@ class TestApiExports(unittest.TestCase):
                 "get_class_activation_wrapper",
                 "noop_context_fn",
                 "is_compiling",
+                "reentrant_checkpoint_scope",
             ],
         )
 
@@ -392,11 +393,12 @@ class TestLazyApiDelegates(unittest.TestCase):
         mock_recompute.assert_called_once_with(sentinel.handle, sentinel.session_id)
 
     def test_recompute_session_ctx_forwards_options(self):
-        """Test recompute-session context forwards retention configuration."""
-        with patch.object(_checkpoint_impl, "recompute_session_ctx", return_value=sentinel.context) as mock_session:
-            result = recompute_session_ctx(sentinel.session_id, retain_on_unpack=True)
+        """Test session entry forwards options while binding reentrant frames."""
+        with patch.object(_checkpoint_impl, "recompute_session_ctx",
+                          wraps=_checkpoint_impl.recompute_session_ctx) as mock_session:
+            with recompute_session_ctx(sentinel.session_id, retain_on_unpack=True):
+                pass
 
-        self.assertIs(result, sentinel.context)
         mock_session.assert_called_once_with(session_id=sentinel.session_id, retain_on_unpack=True)
 
     def test_recompute_session_ctx_rejects_none_session_id(self):
@@ -573,12 +575,18 @@ class TestCheckpointFunction(unittest.TestCase):
         self.assertEqual(result, "result")
         self.assertFalse(spy.call_args.kwargs["early_stop"])
 
-    def test_checkpoint_forces_non_reentrant_implementation(self):
-        """Test callers cannot override the non-reentrant implementation mode."""
-        with _spy_checkpoint() as spy:
-            checkpoint(sentinel.function, use_reentrant=True)
+    def test_checkpoint_honors_reentrant_implementation(self):
+        """Test reentrant mode dispatches to the eager reentrant implementation."""
+        from hyper_parallel.core.activation_memory import reentrant_checkpoint as implementation
 
-        self.assertFalse(spy.call_args.kwargs["use_reentrant"])
+        with patch.object(implementation, "checkpoint", return_value=sentinel.result) as mock_reentrant:
+            result = checkpoint(sentinel.function, use_reentrant=True)
+
+        self.assertIs(result, sentinel.result)
+        mock_reentrant.assert_called_once()
+        self.assertIs(mock_reentrant.call_args.args[0], sentinel.function)
+        self.assertTrue(mock_reentrant.call_args.kwargs["preserve_rng_state"])
+        self.assertTrue(callable(mock_reentrant.call_args.kwargs["context_fn"]))
 
     def test_checkpoint_rejects_non_boolean_early_stop(self):
         """Test checkpoint rejects ambiguous early_stop values."""

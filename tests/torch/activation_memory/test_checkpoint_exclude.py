@@ -14,19 +14,21 @@
 # ============================================================================
 """Validate replay behavior for adjacent PyTorch checkpoint SAVE regions."""
 
+import os
 from pathlib import Path
 
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 
 CHECKPOINT_EXCLUDE = str(Path(__file__).with_name("checkpoint_exclude.py"))
+REENTRANT_CASES = str(Path(__file__).with_name("reentrant_checkpoint_cases.py"))
 
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
-    essential_mark="essential",
+    essential_mark="unessential",
 )
 def test_checkpoint_exclude_wrapper():
     """
@@ -36,11 +38,25 @@ def test_checkpoint_exclude_wrapper():
         2. test_checkpoint_exclude_save_chain_swap
         3. test_checkpoint_exclude_save_chain_group_swap_cpu_pool
         4. test_rmsnorm_matmul_checkpoint_exclude_memory
+        5. test_reentrant_checkpoint_exclude_swap
+        6. test_operator_numerics
+        7. test_rng_autocast
+        8. test_memory_lifecycle
     Expectation: Run success.
     """
-    parallel_run([
-        TorchCase(CHECKPOINT_EXCLUDE, "test_adjacent_save_regions_execute_once_and_replay_cached_outputs", 12414, 1),
-        TorchCase(CHECKPOINT_EXCLUDE, "test_checkpoint_exclude_save_chain_swap", 12415, 1),
-        TorchCase(CHECKPOINT_EXCLUDE, "test_checkpoint_exclude_save_chain_group_swap_cpu_pool", 12416, 1),
-        TorchCase(CHECKPOINT_EXCLUDE, "test_rmsnorm_matmul_checkpoint_exclude_memory", 12417, 1),
-    ])
+    cases = [
+        TorchCase(CHECKPOINT_EXCLUDE, "test_adjacent_save_regions_execute_once_and_replay_cached_outputs", num_proc=1),
+        TorchCase(CHECKPOINT_EXCLUDE, "test_checkpoint_exclude_save_chain_swap", num_proc=1),
+        TorchCase(CHECKPOINT_EXCLUDE, "test_checkpoint_exclude_save_chain_group_swap_cpu_pool", num_proc=1),
+        TorchCase(CHECKPOINT_EXCLUDE, "test_rmsnorm_matmul_checkpoint_exclude_memory", num_proc=1),
+        TorchCase(CHECKPOINT_EXCLUDE, "test_reentrant_checkpoint_exclude_swap", num_proc=1),
+        TorchCase(REENTRANT_CASES, "test_operator_numerics", num_proc=1),
+        TorchCase(REENTRANT_CASES, "test_rng_autocast", num_proc=1),
+        TorchCase(REENTRANT_CASES, "test_memory_lifecycle", num_proc=1),
+    ]
+    # The parent must remain torch-free; smaller hosts opt in with an explicit device budget.
+    budget = int(os.environ.get("HYPER_PARALLEL_TEST_CARD_COUNT", "8"))
+    if budget < 1 or budget > 8:
+        raise ValueError("HYPER_PARALLEL_TEST_CARD_COUNT must be between 1 and 8")
+    for offset in range(0, len(cases), budget):
+        parallel_run(cases[offset:offset + budget], global_num_proc=budget)
