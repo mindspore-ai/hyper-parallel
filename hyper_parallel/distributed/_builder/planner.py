@@ -291,7 +291,8 @@ class ShardingPlanner:
         """Find subtrees whose activation layout is owned by a separate runtime."""
         from hyper_parallel.models.registry import get_model_adapter  # pylint: disable=C0415
 
-        adapter = get_model_adapter(arch)
+        adapter = (model._hp_model_adapter_spec if hasattr(model, "_hp_model_adapter_spec")  # pylint: disable=protected-access
+                   else get_model_adapter(arch))
         if adapter is None or adapter.encoder_parallel is None:
             return ()
         spec = adapter.encoder_parallel()
@@ -652,7 +653,8 @@ class ShardingPlanner:
         from hyper_parallel.models.registry import (  # pylint: disable=import-outside-toplevel
             get_model_adapter,
         )
-        spec = get_model_adapter(arch)
+        spec = (model._hp_model_adapter_spec if hasattr(model, "_hp_model_adapter_spec")  # pylint: disable=protected-access
+                else get_model_adapter(arch))
         rules = []
         if spec is not None and spec.sharding_rules is not None:
             rules = list(spec.sharding_rules())

@@ -21,6 +21,8 @@ model-construction inputs, while process-group lifecycle helpers moved to
 ``hyper_parallel.trainer.runtime.logging``.
 """
 
+from __future__ import annotations
+
 __all__ = [
     "DistributedSetup",
     "LogicalDeviceMesh",
@@ -430,6 +432,7 @@ class DistributedSetup:
     # Normalized module replacement rules (tuple[ModuleReplacementSpec])
     # desugared Trainer-side via entries_to_module_replacements.
     module_replacements: Any = None
+    module_replacement_requests: Any = None
     # Non-forward method patches installed after module replacement and before planning.
     method_replacements: Any = None
     # TrainingConfig.training.low_precision. Kept on the setup so model

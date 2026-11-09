@@ -263,14 +263,17 @@ def test_unmatched_rule_is_recorded_before_native_error_is_raised():
 
 
 def test_replacement_observer_restores_native_installer_after_error():
-    original = replacement_api._install_replacement_target
+    original_prepare = replacement_api._prepare_replacement_target
+    original_install = replacement_api._install_module_candidates
 
     with pytest.raises(RuntimeError, match="probe"):
         with _observe_replacement_installations(nn.Module(), ()):
-            assert replacement_api._install_replacement_target is not original
+            assert replacement_api._prepare_replacement_target is not original_prepare
+            assert replacement_api._install_module_candidates is not original_install
             raise RuntimeError("probe")
 
-    assert replacement_api._install_replacement_target is original
+    assert replacement_api._prepare_replacement_target is original_prepare
+    assert replacement_api._install_module_candidates is original_install
 
 
 def test_observed_replacement_class_needs_no_codegen_declaration():

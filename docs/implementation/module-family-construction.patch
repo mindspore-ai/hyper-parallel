@@ -1,0 +1,2448 @@
+diff --git a/hyper_parallel/codegen/family_model.py b/hyper_parallel/codegen/family_model.py
+new file mode 100644
+index 00000000..0c25ad86
+--- /dev/null
++++ b/hyper_parallel/codegen/family_model.py
+@@ -0,0 +1,146 @@
++# Copyright 2026 Huawei Technologies Co., Ltd
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ============================================================================
++"""Stable construction artifacts for models directly composed from module families."""
++
++from __future__ import annotations
++
++import hashlib
++from importlib.metadata import PackageNotFoundError, version
++import json
++import os
++import tempfile
++from pathlib import Path
++from typing import Any, Callable, Mapping
++
++from torch import nn
++
++from hyper_parallel.components.modules.module_family import _plain, family_plan_snapshot
++from hyper_parallel.models.module_build import construct_family_model, prepare_model_components
++
++
++_SCHEMA_VERSION = 1
++
++
++def _spec_record(context: Mapping[str, Any]) -> Any:
++    spec = context.get("model_spec")
++    if spec is None:
++        return None
++    return {"model_type": spec.model_type, "architecture": spec.architecture,
++            "providers": {name: _plain(value) for name, value in vars(spec).items() if callable(value)}}
++
++
++def direct_model_manifest(
++    model: nn.Module, factory: Callable, config: Any, context: Mapping[str, Any],
++) -> dict[str, Any]:
++    """Capture effective direct choices before checking a cached construction artifact.
++
++    Args:
++        model: Final or source model tree for this build.
++        factory: Construction callable or protocol factory.
++        config: Complete logical model configuration.
++        context: Read-only job context and effective model facts.
++    """
++    payload = {
++        "schema_version": _SCHEMA_VERSION, "factory": _plain(factory), "config": _plain(config),
++        "spec": _spec_record(context), "families": family_plan_snapshot(model),
++        "model_class": _plain(type(model)),
++        "runtime_versions": _runtime_versions(),
++    }
++    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
++    return {**payload, "signature": hashlib.sha256(encoded.encode()).hexdigest()}
++
++
++def construct_cached_direct_model(
++    factory: Callable, config: Any, context: Mapping[str, Any], expected_signature: str,
++) -> nn.Module:
++    """Construct once and reject a stale factory/config/member/backend/layout snapshot.
++
++    Args:
++        factory: Construction callable or protocol factory.
++        config: Complete logical model configuration.
++        context: Read-only job context and effective model facts.
++        expected_signature: Effective construction fingerprint recorded by the artifact.
++    """
++    model = construct_family_model(factory, config, context=context)
++    model, _ = prepare_model_components(model, context)
++    actual = direct_model_manifest(model, factory, config, context)["signature"]
++    if actual != expected_signature:
++        raise ValueError("direct model codegen signature changed; regenerate the construction artifact")
++    return model
++
++
++def prepare_direct_model_artifact(
++    model: nn.Module, factory: Callable, config: Any, context: Mapping[str, Any], *, artifact_dir: str | None = None,
++) -> str:
++    """Write an importable constructor and manifest without replacement or live resources.
++
++    Args:
++        model: Prepared real or meta tree, before parameter layout.
++        factory: Stable importable model factory.
++        config: Complete reconstruction configuration.
++        context: Current logical job context and effective model spec.
++        artifact_dir: Optional explicit cache directory; otherwise use a content-addressed cache.
++
++    Returns:
++        Directory containing the versioned manifest and generated entry point.
++    """
++    if (not getattr(model, "_hp_components_prepared", False)
++            or getattr(model, "_hp_module_build_context", None) is not context):
++        raise ValueError("construction artifacts require prepare_model_components with the same context")
++    manifest = direct_model_manifest(model, factory, config, context)
++    path = Path(artifact_dir) if artifact_dir is not None else (
++        Path(".cache") / "hyper_parallel" / "direct_models" / manifest["signature"]
++    )
++    path.mkdir(parents=True, exist_ok=True)
++    manifest_path = path / "family_manifest.json"
++    if manifest_path.exists():
++        existing = json.loads(manifest_path.read_text(encoding="utf-8"))
++        if existing.get("signature") != manifest["signature"]:
++            raise ValueError("direct model codegen cache differs from the effective build; choose a new artifact_dir")
++    factory_path = manifest["factory"]["callable"]
++    module_path, _, name = factory_path.rpartition(".")
++    generated = (
++        '"""Generated direct-family model constructor."""\n'
++        f"from {module_path} import {name} as _model_factory\n"
++        "from hyper_parallel.codegen.family_model import construct_cached_direct_model\n\n"
++        "def build_model(config, *, context):\n"
++        "    return construct_cached_direct_model(\n"
++        f"        _model_factory, config, context, {manifest['signature']!r},\n"
++        "    )\n"
++    )
++    _write_atomic(path / "modeling_family.py", generated)
++    _write_atomic(manifest_path, json.dumps(manifest, indent=2, sort_keys=True)+"\n")
++    return str(path)
++
++
++def _write_atomic(path: Path, content: str) -> None:
++    """Publish complete files when multiple ranks share the construction cache."""
++    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as stream:
++        temporary = Path(stream.name)
++        stream.write(content)
++    try:
++        os.replace(temporary, path)
++    finally:
++        temporary.unlink(missing_ok=True)
++
++
++def _runtime_versions() -> dict[str, str]:
++    result = {}
++    for name in ("torch", "torch-npu", "transformers"):
++        try:
++            result[name] = version(name)
++        except PackageNotFoundError:
++            result[name] = "unavailable"
++    return result
+diff --git a/hyper_parallel/codegen/model_build_overlay.py b/hyper_parallel/codegen/model_build_overlay.py
+index db772bd4..535e2a35 100644
+--- a/hyper_parallel/codegen/model_build_overlay.py
++++ b/hyper_parallel/codegen/model_build_overlay.py
+@@ -25,14 +25,13 @@ import torch
+ 
+ from hyper_parallel.codegen.manager import ensure_codegen_artifact_from_snapshot
+ from hyper_parallel.codegen.session import CodegenBuildSession
+-from hyper_parallel.components.checkpoint.weight_conversion import get_model_conversion_mapping
+ from hyper_parallel.core.dtensor.init_weights import init_empty_weights
+ from hyper_parallel.distributed._builder.applier import (
+     _get_active_mesh,
+     _preflight_compute_injection,
+ )
+ from hyper_parallel.models._transformers import auto_model, model_builder
+-from hyper_parallel.models import replacement as replacement_api
++from hyper_parallel.models import module_build, replacement as replacement_api
+ from hyper_parallel.models.registry import get_model_adapter
+ 
+ 
+@@ -98,31 +97,31 @@ def _observe_replacements(
+     session: CodegenBuildSession,
+ ) -> Any:
+     """Apply native replacement declarations while recording their result."""
+-    weights_mapping = get_model_conversion_mapping(model)
+-    specs = tuple(getattr(distributed_setup, "module_replacements", None) or ())
++    specs = list(getattr(distributed_setup, "module_replacements", None) or ())
++    original_compile = module_build.compile_module_replacements
++
++    def _observe_compile(*args: Any, **kwargs: Any) -> Any:
++        plan = original_compile(*args, **kwargs)
++        specs[:] = plan.specs
++        return plan
++
++    module_build.compile_module_replacements = _observe_compile
+     try:
+         with _observe_replacement_installations(model, specs) as applications:
+-            model, _ = replacement_api._apply_module_replacement_actions(  # pylint: disable=protected-access
+-                model,
+-                specs,
+-                weights_mapping=weights_mapping,
+-                context=model_builder._build_replacement_context(  # pylint: disable=protected-access
+-                    distributed_setup,
+-                    low_precision_config,
+-                ),
+-                capture_checkpoint_metadata=load_base_model,
++            model, _ = model_builder._maybe_apply_module_replacements(  # pylint: disable=protected-access
++                model, distributed_setup, low_precision_config, load_base_model,
+             )
+     except replacement_api.ModuleReplacementMatchError as exc:
+         session.record_replacements(
+             declarations=replacement_api.describe_replacement_declarations(specs),
+-            applications=(),
+-            unmatched=exc.unmatched,
++            applications=(), unmatched=exc.unmatched,
+         )
+         raise
++    finally:
++        module_build.compile_module_replacements = original_compile
+     session.record_replacements(
+         declarations=replacement_api.describe_replacement_declarations(specs),
+-        applications=applications,
+-        unmatched=(),
++        applications=applications, unmatched=(),
+     )
+     return model
+ 
+@@ -132,39 +131,45 @@ def _observe_replacement_installations(
+     model: Any,
+     specs: tuple[Any, ...],
+ ) -> Iterator[list[dict[str, Any]]]:
+-    """Observe native replacement installation without changing its API."""
++    """Record metadata only after the shared installer commits a prepared candidate."""
++    del model
+     applications: list[dict[str, Any]] = []
+     spec_indexes = {id(spec): index for index, spec in enumerate(specs)}
+-    original_install = replacement_api._install_replacement_target  # pylint: disable=protected-access
+-
+-    def _observe_install(*args: Any, **kwargs: Any) -> None:
+-        """Record the source and result of the one native installation call."""
+-        target = args[1]
+-        transforms = args[3]
+-        transform_count = len(transforms)
+-        source_type = _symbol_path(type(target.source))
+-        original_install(*args, **kwargs)
+-        replacement = model.get_submodule(target.module_fqns[0])
+-        applications.append({
+-            "rule_id": replacement_api._replacement_rule_id(  # pylint: disable=protected-access
+-                target.spec,
+-                spec_indexes.get(id(target.spec), 0),
+-            ),
++    pending = {}
++    original_prepare = replacement_api._prepare_replacement_target  # pylint: disable=protected-access
++    original_install = replacement_api._install_module_candidates  # pylint: disable=protected-access
++
++    def _observe_prepare(target: Any, *args: Any, **kwargs: Any) -> Any:
++        candidate, transforms = original_prepare(target, *args, **kwargs)
++        if id(target.spec) not in spec_indexes:
++            spec_indexes.update({id(spec): index for index, spec in enumerate(specs)})
++        index = spec_indexes.setdefault(id(target.spec), len(spec_indexes))
++        pending[id(candidate)] = {
++            "rule_id": replacement_api._replacement_rule_id(target.spec, index),  # pylint: disable=protected-access
+             "module_fqns": list(target.module_fqns),
+             "primary_fqn": target.module_fqns[0],
+-            "source_type": source_type,
+-            "replacement_type": _symbol_path(type(replacement)),
+-            "weight_transforms": [
+-                _symbol_path(type(transform))
+-                for transform in transforms[transform_count:]
+-            ],
+-        })
+-
+-    replacement_api._install_replacement_target = _observe_install  # pylint: disable=protected-access
++            "source_type": _symbol_path(type(target.source)),
++            "replacement_type": _symbol_path(type(candidate)),
++            "weight_transforms": [_symbol_path(type(transform)) for transform in transforms],
++        }
++        return candidate, transforms
++
++    def _observe_install(root: Any, candidates: Any) -> Any:
++        candidates = tuple(candidates)
++        result = original_install(root, candidates)
++        for _, _, candidate in candidates:
++            record = pending.pop(id(candidate), None)
++            if record is not None:
++                applications.append(record)
++        return result
++
++    replacement_api._prepare_replacement_target = _observe_prepare  # pylint: disable=protected-access
++    replacement_api._install_module_candidates = _observe_install  # pylint: disable=protected-access
+     try:
+         yield applications
+     finally:
+-        replacement_api._install_replacement_target = original_install  # pylint: disable=protected-access
++        replacement_api._prepare_replacement_target = original_prepare  # pylint: disable=protected-access
++        replacement_api._install_module_candidates = original_install  # pylint: disable=protected-access
+ 
+ 
+ def _symbol_path(symbol: Any) -> str:
+@@ -298,7 +303,9 @@ def _codegen_build_model(session: CodegenBuildSession, artifact_dir: Optional[st
+             swap_inputs,
+             allow_cache_entry_mutation,
+             activation_swap,
+-            model_init_dtype,
++        )
++        factory, context = auto_model._resolve_module_construction(  # pylint: disable=protected-access
++            kwargs, hf_config, distributed_setup, model_init_dtype or torch_dtype,
+         )
+         init_kwargs = auto_model._model_init_kwargs(  # pylint: disable=protected-access
+             dict(kwargs),
+@@ -308,16 +315,16 @@ def _codegen_build_model(session: CodegenBuildSession, artifact_dir: Optional[st
+             init_kwargs["trust_remote_code"] = kwargs["trust_remote_code"]
+         _prepare_model_source_compat(hf_config)
+         with _codegen_model_init_context():
+-            _, model = auto_model._init_model(  # pylint: disable=protected-access
+-                cls,
+-                None,
+-                hf_config,
+-                attn_implementation,
+-                torch_dtype,
+-                is_hf_model,
+-                *model_args,
+-                **init_kwargs,
+-            )
++            if factory is not None:
++                if model_args:
++                    raise ValueError("model_factory uses config and context, not additional positional model arguments")
++                model = auto_model.construct_family_model(factory, hf_config, context=context)
++            else:
++                _, model = auto_model._init_model(  # pylint: disable=protected-access
++                    cls, None, hf_config, attn_implementation, torch_dtype, is_hf_model,
++                    *model_args, **init_kwargs,
++                )
++                auto_model.attach_build_context(model, context)
+         _record_source(
+             session,
+             model,
+diff --git a/hyper_parallel/components/modules/family.py b/hyper_parallel/components/modules/family.py
+index bbd0951e..dd5f54a9 100644
+--- a/hyper_parallel/components/modules/family.py
++++ b/hyper_parallel/components/modules/family.py
+@@ -14,6 +14,8 @@
+ # ============================================================================
+ """Construction-time, allowlisted module selection without device dependencies."""
+ 
++from __future__ import annotations
++
+ from dataclasses import dataclass, field, replace
+ from importlib import import_module
+ from inspect import Parameter, signature
+@@ -39,6 +41,26 @@ class VariantRule:
+     variant: str
+ 
+ 
++@dataclass(frozen=True)
++class BackendSpec:
++    """Capabilities of one explicitly selected numerical implementation.
++
++    Attributes:
++        local_variants: Numerical variants supported by this backend.
++        device_types: Accepted device types; empty means unrestricted.
++        dtypes: Accepted dtype names; empty means unrestricted.
++        features: Supported source/config features when explicitly requested.
++        implementation: Optional import path checked only for the selected backend.
++    """
++
++    local_variants: tuple[str, ...]
++    device_types: tuple[str, ...] = ()
++    dtypes: tuple[str, ...] = ()
++    features: frozenset[str] = frozenset()
++    implementation: str | None = None
++    version: str = "1"
++
++
+ @dataclass(frozen=True)
+ class ModuleFamily:
+     """One baseline and explicitly allowed construction-time alternatives."""
+@@ -48,6 +70,14 @@ class ModuleFamily:
+     variants: Mapping[str, str]
+     selector_specs: Mapping[str, SelectorSpec] = field(default_factory=dict)
+     variant_rules: tuple[VariantRule, ...] = ()
++    default_variant: str | None = None
++    parallel_axis: str | None = None
++    sharding: Callable | None = None
++    backend_specs: Mapping[str, "BackendSpec"] = field(default_factory=dict)
++    default_backends: Mapping[str, str] = field(default_factory=dict)
++    local_variant_of: Mapping[str, str] = field(default_factory=dict)
++    validate: Callable | None = None
++    version: str = "1"
+ 
+ 
+ # Keep the baseline in the value so its identity cannot be reused while registered.
+@@ -103,6 +133,14 @@ def _validate_family_rules(family: ModuleFamily) -> None:
+     """Check complete, unique whitelist entries before registration."""
+     defaults = _validate_selector_specs(family)
+     _validate_variant_paths(family)
++    if family.parallel_axis not in (None, "cp", "ep"):
++        raise ValueError("parallel_axis must be cp, ep or None")
++    if family.default_variant is not None:
++        if family.default_variant not in family.variants:
++            raise ValueError("default_variant must name a declared concrete variant")
++        if "parallel" in family.selector_specs:
++            raise ValueError("parallel is derived from context, not a public selector")
++        defaults = {**defaults, "parallel": False}
+     conditions = [defaults]  # The default combination is an explicit baseline allowance.
+     for rule in family.variant_rules:
+         if not isinstance(rule, VariantRule) or not isinstance(rule.when, Mapping):
+@@ -110,7 +148,12 @@ def _validate_family_rules(family: ModuleFamily) -> None:
+         if set(rule.when) != set(defaults):
+             raise ValueError(f"ModuleFamily {family.name}: each rule must contain exactly {sorted(defaults)}")
+         for name, value in rule.when.items():
+-            _validate_selector_value(family, name, value)
++            if name == "parallel" and family.default_variant is not None:
++                actual_type = type(value)
++                if actual_type is not bool:
++                    raise TypeError("derived parallel conditions must be bool")
++            else:
++                _validate_selector_value(family, name, value)
+         if rule.variant not in family.variants:
+             raise ValueError(f"ModuleFamily {family.name}: undeclared variant {rule.variant!r}")
+         condition = dict(rule.when)
+@@ -119,6 +162,36 @@ def _validate_family_rules(family: ModuleFamily) -> None:
+         conditions.append(condition)
+ 
+ 
++def _validate_backend_entries(family: ModuleFamily, local_variants: set[str]) -> None:
++    """Validate static backend capabilities against concrete numerical members."""
++    for name, spec in family.backend_specs.items():
++        if not isinstance(name, str) or not name or not isinstance(spec, BackendSpec):
++            raise TypeError("backend_specs must map non-empty names to BackendSpec")
++        if not set(spec.local_variants) <= local_variants:
++            raise ValueError(f"backend {name!r} declares unknown local variants")
++    for variant, backend in family.default_backends.items():
++        if backend not in family.backend_specs or variant not in family.backend_specs[backend].local_variants:
++            raise ValueError(f"default backend {backend!r} does not support {variant!r}")
++
++
++def _validate_backends(family: ModuleFamily) -> None:
++    """Validate complete local-variant mappings without importing implementations."""
++    if family.default_variant is None:
++        if family.backend_specs or family.default_backends or family.local_variant_of:
++            raise ValueError("backend declarations require default_variant")
++        return
++    if set(family.local_variant_of) != set(family.variants):
++        raise ValueError("local_variant_of must cover every concrete variant")
++    local_variants = set(family.local_variant_of.values())
++    if not local_variants <= set(family.variants):
++        raise ValueError("local_variant_of must reference concrete numerical variants")
++    if not isinstance(family.version, str) or not family.version:
++        raise ValueError("family version must be a non-empty string")
++    if family.backend_specs and set(family.default_backends) != local_variants:
++        raise ValueError("default_backends must cover every local variant")
++    _validate_backend_entries(family, local_variants)
++
++
+ def register_module_family(family: ModuleFamily) -> None:
+     """Register a checked snapshot for an exact baseline callable.
+ 
+@@ -132,10 +205,14 @@ def register_module_family(family: ModuleFamily) -> None:
+     if id(family.baseline) in _FAMILIES:
+         raise ValueError(f"Module family already registered: {family.name}")
+     _validate_family_rules(family)
++    _validate_backends(family)
+     snapshot = replace(
+         family,
+         variants=MappingProxyType(dict(family.variants)),
+         selector_specs=MappingProxyType(dict(family.selector_specs)),
++        backend_specs=MappingProxyType(dict(family.backend_specs)),
++        default_backends=MappingProxyType(dict(family.default_backends)),
++        local_variant_of=MappingProxyType(dict(family.local_variant_of)),
+         variant_rules=tuple(
+             VariantRule(MappingProxyType(dict(rule.when)), rule.variant) for rule in family.variant_rules
+         ),
+@@ -232,6 +309,9 @@ def resolve_module_family_target(target: Callable, arguments: Mapping) -> tuple[
+     family = get_module_family(target)
+     if family is None:
+         return target, args
++    if family.default_variant is not None:
++        _validate_deferred_arguments(family, args)
++        return target, args
+     target = _select_variant(family, args)
+     target_signature = signature(target)
+     allowed = {
+@@ -244,3 +324,17 @@ def resolve_module_family_target(target: Callable, arguments: Mapping) -> tuple[
+         raise TypeError(f"ModuleFamily {family.name}: unknown replacement arguments: {sorted(unknown)}")
+     target_signature.bind_partial(**args)
+     return target, args
++
++
++def _validate_deferred_arguments(family: ModuleFamily, args: Mapping[str, Any]) -> None:
++    """Validate a new-family request without choosing a topology-dependent member."""
++    allowed = set(signature(family.baseline).parameters) - {"module", "module_fqn", "context"}
++    unknown = set(args) - allowed
++    if unknown:
++        raise TypeError(f"ModuleFamily {family.name}: unknown replacement arguments: {sorted(unknown)}")
++    for name, spec in family.selector_specs.items():
++        if name in args:
++            _validate_selector_value(family, name, args[name])
++    if "backend" in args and args["backend"] is not None:
++        if not isinstance(args["backend"], str) or args["backend"] not in family.backend_specs:
++            raise ValueError(f"ModuleFamily {family.name}: unknown backend {args['backend']!r}")
+diff --git a/hyper_parallel/components/modules/module_family.py b/hyper_parallel/components/modules/module_family.py
+new file mode 100644
+index 00000000..686553ae
+--- /dev/null
++++ b/hyper_parallel/components/modules/module_family.py
+@@ -0,0 +1,404 @@
++# Copyright 2026 Huawei Technologies Co., Ltd
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ============================================================================
++"""Shared construction of concrete family members for direct and source models."""
++
++from __future__ import annotations
++
++import hashlib
++import inspect
++from collections.abc import Mapping
++from copy import deepcopy
++from dataclasses import dataclass, fields, is_dataclass
++from importlib import import_module
++from types import MappingProxyType
++from typing import Any, Callable
++
++import torch
++from torch import nn
++
++from hyper_parallel.components.modules.family import (
++    BackendSpec,
++    ModuleFamily,
++    SelectorSpec,
++    VariantRule,
++    _FAMILIES,
++    _validate_deferred_arguments,
++    _validate_selector_value,
++    get_family_selector_specs,
++    get_module_family,
++    register_module_family,
++    resolve_module_family_target,
++)
++
++
++__all__ = [
++    "BackendSpec", "ModuleFamily", "SelectorSpec", "VariantRule", "FamilyRequest", "ResolvedFamily",
++    "FamilyBuildInfo", "FamilyBoundary", "register_module_family", "get_module_family",
++    "get_family_selector_specs", "resolve_module_family_target", "resolve_family", "build_family",
++    "get_family_build_info", "collect_family_modules", "validate_family_context",
++    "family_plan_snapshot",
++]
++
++@dataclass(frozen=True)
++class FamilyRequest:
++    """A public family and its explicit construction arguments, before selection."""
++
++    target: Callable
++    kwargs: Mapping[str, Any]
++
++    def __post_init__(self) -> None:
++        family = get_module_family(self.target)
++        if family is None or family.default_variant is None:
++            raise ValueError("FamilyRequest requires a family with a concrete default_variant")
++        _validate_deferred_arguments(family, self.kwargs)
++        object.__setattr__(self, "kwargs", MappingProxyType(deepcopy(dict(self.kwargs))))
++
++
++@dataclass(frozen=True)
++class ResolvedFamily:
++    """One validated implementation choice without parameters or communication resources."""
++
++    family: ModuleFamily
++    variant: str
++    local_variant: str
++    constructor: Callable
++    arguments: Mapping[str, Any]
++    selectors: Mapping[str, Any]
++    backend: str | None
++    axis_sizes: Mapping[str, int]
++
++    @property
++    def sharding(self) -> Callable | None:
++        """Return the selected family's layout provider."""
++        return self.family.sharding
++
++
++@dataclass(frozen=True)
++class FamilyBuildInfo:
++    """Immutable construction provenance; runtime bindings live outside this record."""
++
++    request: FamilyRequest
++    resolved: ResolvedFamily
++    config_snapshot: Any
++    origin: str
++
++
++@dataclass(frozen=True)
++class FamilyBoundary:
++    """One concrete family instance with all its paths in the final model tree."""
++
++    module: nn.Module
++    fqns: tuple[str, ...]
++    info: FamilyBuildInfo
++
++
++def _symbol(path: str) -> Any:
++    module_path, _, name = path.rpartition(".")
++    if not module_path or not name:
++        raise ValueError(f"expected a stable import path, got {path!r}")
++    return getattr(import_module(module_path), name)
++
++
++def _axis_sizes(context: Mapping[str, Any]) -> Mapping[str, int]:
++    result = {}
++    for axis in ("tp", "cp", "ep", "pp"):
++        size = context.get(f"{axis}_size")
++        if size is None:
++            if context.get(axis):
++                raise ValueError(f"{axis}_size is required when {axis} is active")
++            size = 1
++        actual_type = type(size)
++        if actual_type is not int or size < 1:
++            raise ValueError(f"{axis}_size must be a positive integer")
++        result[axis] = size
++    return MappingProxyType(result)
++
++
++def _resolve_backend(
++    family: ModuleFamily,
++    local_variant: str,
++    requested: str | None,
++    context: Mapping[str, Any],
++) -> str | None:
++    backend = requested if requested is not None else family.default_backends.get(local_variant)
++    if not family.backend_specs:
++        if backend is not None:
++            raise ValueError(f"family {family.name!r} does not declare backend {backend!r}")
++        return None
++    declaration = family.backend_specs.get(backend)
++    if declaration is None or local_variant not in declaration.local_variants:
++        raise ValueError(f"backend {backend!r} does not support local variant {local_variant!r}")
++    for key, allowed in (("device_type", declaration.device_types), ("dtype", declaration.dtypes)):
++        actual = context.get(key)
++        actual = str(actual).removeprefix("torch.") if actual is not None else None
++        if actual is not None and allowed and actual not in allowed:
++            raise ValueError(f"backend {backend!r} does not support {key}={actual!r}")
++    missing = set(context.get("features", ())) - declaration.features
++    if missing:
++        raise ValueError(f"backend {backend!r} does not support features {sorted(missing)}")
++    if declaration.implementation is not None:
++        _symbol(declaration.implementation)
++    return backend
++
++
++def resolve_family(request: FamilyRequest, *, context: Mapping[str, Any] | None = None) -> ResolvedFamily:
++    """Resolve exactly one allowlisted member using the current job context.
++
++    Args:
++        request: Original family and explicit arguments.
++        context: Read-only logical topology and target numerical constraints.
++
++    Returns:
++        Concrete construction information without allocating model resources.
++    """
++    family = get_module_family(request.target)
++    context = dict(context or {})
++    axes = _axis_sizes(context)
++    args = deepcopy(dict(request.kwargs))
++    selectors = {name: args.pop(name, spec.default) for name, spec in family.selector_specs.items()}
++    for name, value in selectors.items():
++        _validate_selector_value(family, name, value)
++    selectors["parallel"] = family.parallel_axis is not None and axes[family.parallel_axis] > 1
++    defaults = {name: spec.default for name, spec in family.selector_specs.items()}
++    defaults["parallel"] = False
++    if selectors == defaults:
++        variant = family.default_variant
++    else:
++        matches = [rule.variant for rule in family.variant_rules if dict(rule.when) == selectors]
++        if len(matches) != 1:
++            raise ValueError(f"family {family.name!r} has no legal combination for {selectors}")
++        variant = matches[0]
++    local_variant = family.local_variant_of[variant]
++    backend = _resolve_backend(family, local_variant, args.pop("backend", None), context)
++    constructor = _symbol(family.variants[variant])
++    if constructor is family.baseline:
++        raise ValueError("a concrete family member cannot be its public factory")
++    return ResolvedFamily(
++        family, variant, local_variant, constructor, MappingProxyType(args),
++        MappingProxyType(selectors), backend, axes,
++    )
++
++
++def _constructor_arguments(
++    member: ResolvedFamily, config: Any, module: nn.Module | None, fqn: str, context: Mapping[str, Any],
++) -> dict[str, Any]:
++    signature = inspect.signature(member.constructor)
++    required = "config" if module is None else "module"
++    if required not in signature.parameters:
++        raise TypeError(f"member {member.variant!r} must explicitly accept {required}")
++    kwargs = dict(member.arguments)
++    unknown = set(kwargs) - set(signature.parameters)
++    if unknown:
++        raise TypeError(f"member {member.variant!r} does not accept {sorted(unknown)}")
++    runtime = {"config": config, "module": module, "module_fqn": fqn, "context": context}
++    if member.backend is not None:
++        runtime["backend"] = member.backend
++    kwargs.update({name: value for name, value in runtime.items() if name in signature.parameters})
++    signature.bind(**kwargs)
++    return kwargs
++
++
++def _normalize_family_request(target, kwargs):
++    """Resolve a public name without selecting a topology-dependent member."""
++    if isinstance(target, str):
++        matches = [family.baseline for family in _FAMILIES.values() if family.name == target]
++        if len(matches) != 1:
++            raise ValueError(f"family name {target!r} must identify exactly one registration")
++        target = matches[0]
++    if isinstance(target, FamilyRequest):
++        if kwargs:
++            raise ValueError("request arguments cannot be combined with additional keywords")
++        return target
++    return FamilyRequest(target, kwargs)
++
++
++def _build_family_member(
++    request: FamilyRequest,
++    member: ResolvedFamily,
++    *,
++    config: Any = None,
++    module: nn.Module | None = None,
++    module_fqn: str = "",
++    context: Mapping[str, Any],
++) -> nn.Module:
++    """Construct an already resolved choice without parsing the same request again."""
++    context = MappingProxyType(dict(context))
++    if member.family.validate is not None:
++        member.family.validate(config=config, module=module, context=context, member=member)
++    config = deepcopy(config)
++    result = member.constructor(**_constructor_arguments(member, config, module, module_fqn, context))
++    if not isinstance(result, nn.Module):
++        raise TypeError("a family constructor must return nn.Module")
++    info = FamilyBuildInfo(request, member, deepcopy(config), "direct" if module is None else "replacement")
++    result._hp_family_build_info = info  # pylint: disable=protected-access
++    if config is not None and callable(getattr(result, "reset_parameters", None)):
++        result._hp_reset_after_materialization = True  # pylint: disable=protected-access
++    return result
++
++
++def build_family(
++    target: Callable | str | FamilyRequest,
++    *,
++    config: Any = None,
++    module: nn.Module | None = None,
++    module_fqn: str = "",
++    context: Mapping[str, Any] | None = None,
++    **kwargs: Any,
++) -> nn.Module:
++    """Construct a selected member and retain its request for model preparation.
++
++    Args:
++        target: Public family callable, registered name, or preserved request.
++        config: Complete logical model configuration for direct construction.
++        module: Existing source module; mutually exclusive with config.
++        module_fqn: Source path when converting an existing module.
++        context: Job topology and numerical constraints; omission initially selects local execution.
++        **kwargs: Explicit selectors and ordinary public factory arguments.
++
++    Returns:
++        The runnable current member with its discoverable family request and construction provenance.
++    """
++    request = _normalize_family_request(target, kwargs)
++    arguments = dict(request.kwargs)
++    if "config" in arguments:
++        if config is not None:
++            raise ValueError("config was supplied twice")
++        config = arguments.pop("config")
++        request = FamilyRequest(request.target, arguments)
++    if (config is None) == (module is None):
++        raise ValueError("provide exactly one of config or module")
++    context = MappingProxyType(dict(context or {}))
++    member = resolve_family(request, context=context)
++    return _build_family_member(request, member, config=config, module=module,
++                                module_fqn=module_fqn, context=context)
++
++
++def get_family_build_info(module: nn.Module) -> FamilyBuildInfo | None:
++    """Return only framework-created family provenance, or None for ordinary modules.
++
++    Args:
++        module: Module whose construction provenance is queried.
++    """
++    value = getattr(module, "_hp_family_build_info", None)
++    return value if isinstance(value, FamilyBuildInfo) else None
++
++
++def _module_aliases(model: nn.Module) -> dict[int, tuple[nn.Module, tuple[str, ...]]]:
++    """Inventory registered module identities and all paths, including the root."""
++    found: dict[int, tuple[nn.Module, list[str]]] = {}
++    for fqn, module in model.named_modules(remove_duplicate=False):
++        found.setdefault(id(module), (module, []))[1].append(fqn)
++    return {identity: (module, tuple(paths)) for identity, (module, paths) in found.items()}
++
++
++def collect_family_modules(model: nn.Module) -> tuple[FamilyBoundary, ...]:
++    """Discover final family boundaries by object identity, including root and aliases.
++
++    Args:
++        model: Final or source model tree for this build.
++    """
++    boundaries = []
++    for module, paths in _module_aliases(model).values():
++        info = get_family_build_info(module)
++        if info is not None:
++            boundaries.append(FamilyBoundary(module, paths, info))
++    return tuple(boundaries)
++
++
++def validate_family_context(model: nn.Module, context: Mapping[str, Any]) -> None:
++    """Validate that model preparation has finalized members for the job context.
++
++    Args:
++        model: Final or source model tree for this build.
++        context: Read-only job context and effective model facts.
++    """
++    axes = _axis_sizes(context)
++    for boundary in collect_family_modules(model):
++        member = boundary.info.resolved
++        for axis in ("cp", "ep"):
++            if member.axis_sizes[axis] != axes[axis]:
++                raise ValueError(
++                    f"family at {boundary.fqns} was constructed with {axis}={member.axis_sizes[axis]}, "
++                    f"job requires {axes[axis]}; call prepare_model_components with the job context before layout"
++                )
++        _resolve_backend(member.family, member.local_variant, member.backend, context)
++
++
++def _plain_callable(value: Callable) -> dict[str, str]:
++    """Serialize only an importable callable with stable implementation identity."""
++    name = getattr(value, "__qualname__", None)
++    if not isinstance(name, str):
++        raise ValueError("codegen requires stable importable callables")
++    path = f"{value.__module__}.{name}"
++    if "<" in path or _symbol(path) is not value:
++        raise ValueError("codegen requires stable importable callables")
++    return {"callable": path, "source_hash": _code_hash(value)}
++
++
++def _plain(value: Any) -> Any:
++    if value is None or isinstance(value, (str, bool, int, float)):
++        return value
++    if is_dataclass(value) and not isinstance(value, type):
++        return {field.name: _plain(getattr(value, field.name)) for field in fields(value)}
++    if isinstance(value, Mapping):
++        return {str(key): _plain(item) for key, item in value.items()}
++    if isinstance(value, (frozenset, set)):
++        return [_plain(item) for item in sorted(value, key=str)]
++    if isinstance(value, (tuple, list)):
++        return [_plain(item) for item in value]
++    if isinstance(value, (torch.dtype, torch.device)):
++        return str(value)
++    if hasattr(value, "to_dict"):
++        return _plain(value.to_dict())
++    if callable(value):
++        return _plain_callable(value)
++    raise ValueError(f"cannot serialize family value of type {type(value).__name__}")
++
++
++def family_plan_snapshot(model: nn.Module) -> list[dict[str, Any]]:
++    """Describe effective members for cache validation and checkpoint provenance.
++
++    Args:
++        model: Final or source model tree for this build.
++    """
++    records = []
++    for boundary in collect_family_modules(model):
++        info = boundary.info
++        member = info.resolved
++        records.append({
++            "fqns": list(boundary.fqns), "family": member.family.name, "version": member.family.version,
++            "origin": info.origin, "variant": member.variant,
++            "local_variant": member.local_variant, "backend": member.backend,
++            "selectors": dict(member.selectors), "axis_sizes": dict(member.axis_sizes),
++            "config": _plain(info.config_snapshot), "kwargs": _plain(info.request.kwargs),
++            "constructor": _plain(member.constructor), "sharding": _plain(member.sharding),
++            "backend_specs": _plain(member.family.backend_specs),
++            "default_backends": dict(member.family.default_backends),
++        })
++    return records
++
++
++def _code_hash(value: Callable) -> str:
++    """Include inherited algorithms while requiring external kernels to declare versions."""
++    definitions = value.__mro__ if isinstance(value, type) else (value,)
++    sources = []
++    for definition in definitions:
++        if definition is object or getattr(definition, "__module__", "").startswith("torch."):
++            continue
++        try:
++            sources.append(inspect.getsource(definition))
++        except (OSError, TypeError):
++            sources.append(str(getattr(definition, "__qualname__", "")))
++    return hashlib.sha256("\n".join(sources).encode()).hexdigest()
+diff --git a/hyper_parallel/models/_generated/build_overlay.py b/hyper_parallel/models/_generated/build_overlay.py
+index 3eec3f83..cd59d021 100644
+--- a/hyper_parallel/models/_generated/build_overlay.py
++++ b/hyper_parallel/models/_generated/build_overlay.py
+@@ -22,6 +22,7 @@ from typing import Any, Iterator
+ 
+ from hyper_parallel.models._generated.phase_c import apply_generated_phase_c
+ from hyper_parallel.models._transformers import auto_model, model_builder
++from hyper_parallel.models.module_build import model_weight_mapping
+ 
+ distributed_apply = importlib.import_module("hyper_parallel.distributed.apply")
+ 
+@@ -31,11 +32,10 @@ def _skip_materialized_replacements(
+     distributed_setup: Any,
+     low_precision_config: Any,
+     load_base_model: bool,
+-    weights_mapping: Any,
+ ) -> tuple[Any, Any]:
+     """Keep generated constructor replacements and their conversion mapping."""
+     del distributed_setup, low_precision_config, load_base_model
+-    return model, weights_mapping
++    return model, model_weight_mapping(model)
+ 
+ 
+ @contextmanager
+diff --git a/hyper_parallel/models/_transformers/auto_model.py b/hyper_parallel/models/_transformers/auto_model.py
+index 0360e9b7..c7b26034 100644
+--- a/hyper_parallel/models/_transformers/auto_model.py
++++ b/hyper_parallel/models/_transformers/auto_model.py
+@@ -38,6 +38,9 @@ from hyper_parallel.models._transformers.model_builder import (
+     instantiate_infrastructure,
+ )
+ from hyper_parallel.models._transformers.config_resolver import get_hf_config, get_is_hf_model
++from hyper_parallel.models.module_build import (
++    attach_build_context, build_module_context, construct_family_model, resolve_effective_model_spec,
++)
+ from hyper_parallel.distributed.mesh import DistributedSetup
+ from hyper_parallel.models.build_options import (  # pylint: disable=syntax-error
+     CompileConfig,
+@@ -131,7 +134,8 @@ def _load_pretrained_config(
+         kwargs: dict[str, Any],
+ ) -> PretrainedConfig:
+     """Load the HF configuration with call-time overrides."""
+-    config_kwargs = dict(kwargs)
++    config_kwargs = {name: value for name, value in kwargs.items()
++                     if name not in {"model_factory", "model_spec"}}
+     config_kwargs.update(config_overrides or {})
+     return get_hf_config(pretrained_model_name_or_path, attn_implementation, torch_dtype, **config_kwargs)
+ 
+@@ -170,6 +174,16 @@ def _prepare_pretrained_build(
+     return sharding_planner, fsdp2_manager, hf_config, is_hf_model
+ 
+ 
++def _resolve_module_construction(kwargs, hf_config, distributed_setup, dtype):
++    """Consume model construction arguments and create one shared build context."""
++    factory = kwargs.pop("model_factory", None)
++    spec = resolve_effective_model_spec(hf_config, kwargs.pop("model_spec", None))
++    context = build_module_context(
++        distributed_setup, device=_current_device(), dtype=dtype, model_spec=spec,
++    )
++    return factory, context
++
++
+ class _BaseHyperAutoModelClass:
+     """Shared from_pretrained / from_config logic.
+ 
+@@ -405,6 +419,9 @@ class _BaseHyperAutoModelClass:
+             world_size > 1 or not is_hf_model or defer_hf_load
+         ) and not quantized_init
+ 
++        model_factory, module_context = _resolve_module_construction(
++            kwargs, hf_config, distributed_setup, model_init_dtype or torch_dtype,
++        )
+         init_ctx = _model_init_context(is_meta_device)
+ 
+         # Step 2: Config-first construction defers pretrained I/O until after sharding.
+@@ -416,16 +433,18 @@ class _BaseHyperAutoModelClass:
+             load_base_model=init_pretrained_path is not None,
+         )
+         with init_ctx:
+-            _, model = _init_model(
+-                cls,
+-                init_pretrained_path,
+-                hf_config,
+-                attn_implementation,
+-                torch_dtype,
+-                is_hf_model,
+-                *model_args,
+-                **init_kwargs,
+-            )
++            if model_factory is not None:
++                if model_args:
++                    raise ValueError("model_factory uses config and context, not additional positional model arguments")
++                if quantized_init:
++                    raise ValueError("model_factory requires config-first floating-point initialization")
++                model = construct_family_model(model_factory, hf_config, context=module_context)
++            else:
++                _, model = _init_model(
++                    cls, init_pretrained_path, hf_config, attn_implementation,
++                    torch_dtype, is_hf_model, *model_args, **init_kwargs,
++                )
++                attach_build_context(model, module_context)
+ 
+         # Step 3-12: Apply infrastructure
+         model = apply_model_infrastructure(
+diff --git a/hyper_parallel/models/_transformers/model_builder.py b/hyper_parallel/models/_transformers/model_builder.py
+index 9328a737..debff034 100644
+--- a/hyper_parallel/models/_transformers/model_builder.py
++++ b/hyper_parallel/models/_transformers/model_builder.py
+@@ -34,9 +34,6 @@ from hyper_parallel.core.fully_shard.hsdp_utils import get_hsdp_state
+ from hyper_parallel.components.checkpoint.huggingface_checkpointer import (
+     HuggingFaceCheckpointer,
+ )
+-from hyper_parallel.components.checkpoint.weight_conversion import (
+-    get_model_conversion_mapping,
+-)
+ 
+ from hyper_parallel.models._transformers.checkpoint_loader import (
+     _finalize_model_loading,
+@@ -65,16 +62,16 @@ from hyper_parallel.distributed._builder.fsdp_adapter import (
+ from hyper_parallel.distributed.mesh import DistributedSetup, MeshContext
+ from hyper_parallel.distributed.apply import apply_sharding_plan
+ from hyper_parallel.distributed._builder.planner import ShardingPlanner
+-from hyper_parallel.models.registry import _resolve_custom_model_cls, get_model_adapter
++from hyper_parallel.models.registry import _resolve_custom_model_cls, resolve_model_adapter
++from hyper_parallel.models.module_build import (
++    attach_build_context, build_module_context, prepare_model_components, resolve_effective_model_spec,
++)
+ from hyper_parallel.models.external_state import (
+     ExternalBuildContext,
+     ExternalLoadContext,
+     get_model_external_state,
+ )
+-from hyper_parallel.models.replacement import (
+-    _apply_module_replacement_actions,
+-    apply_method_replacements,
+-)
++from hyper_parallel.models.replacement import apply_method_replacements
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -347,24 +344,7 @@ def _build_replacement_context(
+     low_precision_config: Any,
+ ) -> dict[str, Any]:
+     """Build the replacement-factory context from the resolved setup."""
+-    if low_precision_config is None:
+-        low_precision_config = getattr(
+-            distributed_setup,
+-            "low_precision_config",
+-            None,
+-        )
+-    low_precision_enabled = bool(
+-        getattr(low_precision_config, "enabled", False)
+-    )
+-    mesh_context = getattr(distributed_setup, "mesh_context", None)
+-    return {
+-        "low_precision": low_precision_config if low_precision_enabled else None,
+-        "tp": getattr(mesh_context, "tp_size", 1) > 1,
+-        "cp": getattr(mesh_context, "cp_size", 1) > 1,
+-        "ep": getattr(mesh_context, "ep_size", 1) > 1,
+-        "pp": getattr(mesh_context, "pp_size", 1) > 1,
+-        "sequence_parallel": bool(getattr(mesh_context, "sequence_parallel", False)),
+-    }
++    return dict(build_module_context(distributed_setup, low_precision_config=low_precision_config))
+ 
+ 
+ def _apply_pre_sharding_features(
+@@ -429,16 +409,7 @@ def _apply_parameter_freezing(model: nn.Module, freeze_config: Any) -> None:
+ 
+ def _apply_materialization_adapter(model: nn.Module) -> None:
+     """Let a family adapter declare derived state on native or custom models."""
+-    config = getattr(model, "config", None)
+-    identities = [getattr(config, "model_type", None)]
+-    identities.extend(getattr(config, "architectures", None) or ())
+-    adapter_spec = None
+-    for identity in identities:
+-        if not identity:
+-            continue
+-        adapter_spec = get_model_adapter(identity)
+-        if adapter_spec is not None:
+-            break
++    adapter_spec = resolve_model_adapter(model)
+     provider = getattr(adapter_spec, "materialization", None)
+     if provider is None:
+         return
+@@ -575,14 +546,7 @@ def _create_external_state(model: nn.Module, mesh: Optional[MeshContext],
+                            validate_placement: bool, compile_for_execution: bool,
+                            distributed_setup: Any, fsdp2_manager: Optional[FSDP2Manager]) -> Any:
+     """Create and validate the model-owned external state after sharding."""
+-    config = getattr(model, "config", None)
+-    identities = (getattr(config, "model_type", None), *(getattr(config, "architectures", None) or ()))
+-    adapter_spec = None
+-    for identity in identities:
+-        if identity:
+-            adapter_spec = get_model_adapter(identity)
+-            if adapter_spec is not None:
+-                break
++    adapter_spec = resolve_model_adapter(model)
+     provider = getattr(adapter_spec, "external_state", None)
+     if provider is None:
+         return None
+@@ -604,16 +568,16 @@ def _maybe_apply_module_replacements(
+     distributed_setup: Optional[Any],
+     low_precision_config: Optional[Any],
+     load_base_model: bool,
+-    weights_mapping: Any,
+ ) -> tuple:
+-    """Apply native structure-preserving replacements."""
+-    return _apply_module_replacement_actions(
+-        model,
+-        getattr(distributed_setup, "module_replacements", None),
+-        weights_mapping=weights_mapping,
+-        context=_build_replacement_context(distributed_setup, low_precision_config),
+-        capture_checkpoint_metadata=load_base_model,
+-    )
++    """Prepare source and directly composed components through the same entry point."""
++    context = getattr(model, "_hp_module_build_context", None)
++    if context is None:
++        spec = resolve_effective_model_spec(getattr(model, "config", None))
++        context = build_module_context(
++            distributed_setup, low_precision_config=low_precision_config, model_spec=spec,
++        )
++        attach_build_context(model, context)
++    return prepare_model_components(model, context, capture_checkpoint_metadata=load_base_model)
+ 
+ 
+ def _tie_model_weights_before_parallelism(model: nn.Module) -> None:
+@@ -698,6 +662,31 @@ def apply_model_infrastructure(
+     materialization/loading -> model_init_dtype conversion -> per-layer compile.
+     Placement validation keeps the DTensor placement path and skips compile;
+     FSDP2 consumes DTensor parameter layouts in both modes.
++
++    Args:
++        model: Final or source model tree for this build.
++        mesh: Job mesh carrying the logical parallel axes.
++        sharding_planner: Planner used to derive and apply logical layouts.
++        fsdp2_manager: Main-repository FSDP2 lifecycle manager, when configured.
++        peft_config: Optional parameter-efficient adaptation settings.
++        qat_config: Optional quantization-aware training settings.
++        fp8_config: Optional model precision settings.
++        freeze_config: Model subtrees whose parameters are frozen before planning.
++        compile_config: Optional compilation settings.
++        activation_checkpoint: Activation checkpoint selection policy.
++        activation_checkpoint_selection: Resolved model-owned activation regions.
++        activation_swap: Activation memory policy.
++        swap_inputs: Whether checkpointing swaps its input activations.
++        allow_cache_entry_mutation: Whether activation checkpointing may update cache entries.
++        is_meta_device: Whether parameters need storage materialization.
++        is_hf_model: Whether the source follows the HF model contract.
++        device: Target device for initialization and loading.
++        load_base_model: Whether to load a pretrained checkpoint after layout.
++        pretrained_path: Source checkpoint directory or identifier.
++        validate_placement: Whether to validate runtime tensor placements.
++        low_precision_config: Normalized online precision policy.
++        model_init_dtype: Model initialization dtype override.
++
+     """
+ 
+     distributed_setup = kwargs.get("distributed_setup")
+@@ -709,10 +698,8 @@ def apply_model_infrastructure(
+     )
+     _apply_pre_sharding_features(peft_config, qat_config, fp8_config)
+ 
+-    weights_mapping = get_model_conversion_mapping(model)
+     model, weights_mapping = _maybe_apply_module_replacements(
+-        model, distributed_setup, low_precision_config,
+-        load_base_model, weights_mapping,
++        model, distributed_setup, low_precision_config, load_base_model,
+     )
+     if is_meta_device:
+         _apply_materialization_adapter(model)
+@@ -722,13 +709,11 @@ def apply_model_infrastructure(
+     if freeze_config is not None:
+         _apply_parameter_freezing(model, freeze_config)
+ 
+-    method_context = _build_replacement_context(distributed_setup, low_precision_config)
+-    method_context["mesh_context"] = getattr(distributed_setup, "mesh_context", None)
+-    apply_method_replacements(
+-        model,
+-        getattr(distributed_setup, "method_replacements", None) or (),
+-        context=method_context,
+-    )
++    method_replacements = getattr(distributed_setup, "method_replacements", None) or ()
++    if method_replacements:
++        method_context = _build_replacement_context(distributed_setup, low_precision_config)
++        method_context["mesh_context"] = getattr(distributed_setup, "mesh_context", None)
++        apply_method_replacements(model, method_replacements, context=method_context)
+ 
+     # Steps 7-8: plan and apply parameter/activation layouts.
+     model, source_shard_info = _plan_and_apply_sharding(
+diff --git a/hyper_parallel/models/module_build.py b/hyper_parallel/models/module_build.py
+new file mode 100644
+index 00000000..8908744a
+--- /dev/null
++++ b/hyper_parallel/models/module_build.py
+@@ -0,0 +1,322 @@
++# Copyright 2026 Huawei Technologies Co., Ltd
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ============================================================================
++"""One model-build context and effective spec shared by direct and source paths."""
++
++from __future__ import annotations
++
++import inspect
++from collections.abc import Mapping
++from copy import deepcopy
++from dataclasses import replace
++from types import MappingProxyType
++from typing import Any, Callable
++
++import torch
++from torch import nn
++
++from hyper_parallel.components.modules.module_family import (
++    FamilyBoundary, FamilyBuildInfo, _build_family_member, collect_family_modules, resolve_family,
++    validate_family_context,
++)
++from hyper_parallel.models.adapter_spec import ModelAdapterSpec
++from hyper_parallel.models.registry import _normalize_family_key, get_model_adapter
++from hyper_parallel.models.replacement import (
++    ModuleReplacementPlan, _apply_module_replacement_actions, _install_module_candidates,
++    _validate_replacement, compile_module_replacements,
++)
++from hyper_parallel.components.checkpoint.weight_conversion import get_model_conversion_mapping
++
++
++def resolve_effective_model_spec(config: Any, explicit: ModelAdapterSpec | None = None) -> ModelAdapterSpec | None:
++    """Resolve once without changing process-wide registration.
++
++    Args:
++        config: Model identity, independent of a constructed source object.
++        explicit: Complete per-build declaration replacing the builtin spec.
++
++    Returns:
++        The effective immutable spec or None for a fully self-described model.
++    """
++    identities = tuple(value for value in (
++        getattr(config, "model_type", None), *(getattr(config, "architectures", None) or ()),
++    ) if value)
++    if explicit is not None:
++        if not isinstance(explicit, ModelAdapterSpec):
++            raise TypeError("model_spec must be ModelAdapterSpec")
++        accepted = {_normalize_family_key(explicit.model_type), _normalize_family_key(explicit.architecture)}
++        if identities and not accepted.intersection(_normalize_family_key(value) for value in identities):
++            raise ValueError("explicit model_spec does not match the model configuration identity")
++        return explicit
++    for identity in identities:
++        spec = get_model_adapter(identity)
++        if spec is not None:
++            return spec
++    return None
++
++
++def build_module_context(
++    distributed_setup: Any = None,
++    *,
++    low_precision_config: Any = None,
++    device: Any = None,
++    dtype: Any = None,
++    model_spec: ModelAdapterSpec | None = None,
++) -> Mapping[str, Any]:
++    """Create the read-only logical context for family selection and model preparation.
++
++    Args:
++        distributed_setup: Existing job setup; no new topology configuration.
++        low_precision_config: Optional normalized numerical scheme.
++        device: Target device, if already known.
++        dtype: Target model dtype, if already known.
++        model_spec: Already resolved per-build model facts.
++
++    Returns:
++        Logical axes and target constraints, without creating groups or workspaces.
++    """
++    mesh = getattr(distributed_setup, "mesh_context", None)
++    result = {}
++    for axis in ("tp", "cp", "ep", "pp"):
++        size = getattr(mesh, f"{axis}_size", 1)
++        actual_type = type(size)
++        if actual_type is not int or size < 1:
++            raise ValueError(f"{axis}_size must be a positive integer")
++        result[f"{axis}_size"] = size
++        result[axis] = size > 1
++    policy = low_precision_config
++    if policy is None:
++        policy = getattr(distributed_setup, "low_precision_config", None)
++    result["low_precision"] = policy if getattr(policy, "enabled", False) else None
++    result["legacy_low_precision_targets"] = bool(getattr(distributed_setup,
++                                                          "_hp_legacy_low_precision_targets", False))
++    result["sequence_parallel"] = bool(getattr(mesh, "sequence_parallel", False))
++    result["model_spec"] = model_spec
++    result["module_replacement_requests"] = getattr(distributed_setup, "module_replacement_requests", None)
++    result["module_replacements"] = getattr(distributed_setup, "module_replacements", None)
++    if device is not None:
++        result["device_type"] = torch.device(device).type
++    if dtype is not None and dtype != "auto":
++        result["dtype"] = str(dtype).removeprefix("torch.")
++    return MappingProxyType(result)
++
++
++def attach_build_context(model: nn.Module, context: Mapping[str, Any]) -> None:
++    """Attach this build's explicit spec and context, without registering either globally.
++
++    Args:
++        model: Final or source model tree for this build.
++        context: Read-only job context and effective model facts.
++    """
++    if (getattr(model, "_hp_components_prepared", False)
++            and getattr(model, "_hp_module_build_context", None) is not context):
++        raise ValueError("prepared model components cannot be reused with another build context")
++    model._hp_module_build_context = context  # pylint: disable=protected-access
++    model._hp_model_adapter_spec = context.get("model_spec")  # pylint: disable=protected-access
++
++
++def _adopt_family_state(source: nn.Module, candidate: nn.Module, fqn: str) -> None:
++    """Retain logical tensors when selecting another member of the same family."""
++    source_contract = getattr(source, "state_contract", None)
++    candidate_contract = getattr(candidate, "state_contract", None)
++    original = source_contract() if source_contract is not None else None
++    selected = candidate_contract() if candidate_contract is not None else None
++    if original != selected:
++        raise ValueError(f"family at {fqn!r} changed its logical state contract during configuration")
++    for kind in ("parameter", "buffer"):
++        source_values = dict(getattr(source, f"named_{kind}s")(remove_duplicate=False))
++        candidate_values = dict(getattr(candidate, f"named_{kind}s")(remove_duplicate=False))
++        if source_values.keys() != candidate_values.keys():
++            raise ValueError(f"family at {fqn!r} changed logical {kind} names during configuration")
++        for name, value in source_values.items():
++            if value.shape != candidate_values[name].shape:
++                raise ValueError(f"family at {fqn!r} changed logical {kind} shape for {name!r}")
++            parent, _, leaf = name.rpartition(".")
++            owner = candidate.get_submodule(parent)
++            if kind == "parameter":
++                owner.register_parameter(leaf, value)
++            else:
++                persistent = leaf not in owner._non_persistent_buffers_set  # pylint: disable=protected-access
++                owner.register_buffer(leaf, value, persistent=persistent)
++    for name, original in source.named_modules():
++        target = candidate.get_submodule(name)
++        target.training = original.training
++        if type(original).get_extra_state is not nn.Module.get_extra_state:
++            target.set_extra_state(deepcopy(original.get_extra_state()))
++    _validate_replacement(source, candidate, fqn)
++
++
++def _validate_family_lifetime(source: nn.Module) -> None:
++    """Reject changes after a member has entered distributed execution."""
++    if any(getattr(child, "_hp_parallel_binding", None) is not None
++           or getattr(child, "hsdp_scheduler", None) is not None for child in source.modules()):
++        raise ValueError("family configuration must finish before communication binding and FSDP")
++    if any(parameter.grad is not None for parameter in source.parameters()):
++        raise ValueError("family configuration requires cleared gradients and must finish before optimizer creation")
++
++
++def _prepare_family_member(
++    boundary: FamilyBoundary, context: Mapping[str, Any],
++) -> tuple[nn.Module, FamilyBuildInfo]:
++    """Resolve a saved request, preparing a candidate without changing the model."""
++    source, info = boundary.module, boundary.info
++    member = resolve_family(info.request, context=context)
++    previous = info.resolved
++    axis = member.family.parallel_axis
++    same_topology = axis is None or member.axis_sizes[axis] == previous.axis_sizes[axis]
++    unchanged = (member.constructor is previous.constructor and member.backend == previous.backend
++                 and member.selectors == previous.selectors and same_topology)
++    if not unchanged or member.axis_sizes != previous.axis_sizes:
++        _validate_family_lifetime(source)
++    if unchanged:
++        if member.family.validate is not None:
++            member.family.validate(config=info.config_snapshot, module=None if info.origin == "direct" else source,
++                                   context=context, member=member)
++        return source, replace(info, resolved=member)
++    if info.origin == "direct":
++        # A meta skeleton avoids reinitializing or copying the caller's existing weights.
++        with torch.device("meta"):
++            candidate = _build_family_member(info.request, member, config=info.config_snapshot,
++                                             module_fqn=boundary.fqns[0], context=context)
++    else:
++        candidate = _build_family_member(info.request, member, module=source,
++                                         module_fqn=boundary.fqns[0], context=context)
++    _adopt_family_state(source, candidate, boundary.fqns[0])
++    return candidate, replace(info, resolved=member)
++
++
++def _finalize_family_modules(model: nn.Module, context: Mapping[str, Any]) -> nn.Module:
++    """Finalize family requests atomically before layout, keeping all module aliases."""
++    boundaries = collect_family_modules(model)
++    if not boundaries:
++        return model
++    prepared = [(boundary, *_prepare_family_member(boundary, context)) for boundary in boundaries]
++    model = _install_module_candidates(
++        model, ((boundary.fqns, boundary.module, candidate) for boundary, candidate, _ in prepared),
++    )
++    for _, candidate, info in prepared:
++        candidate._hp_family_build_info = info  # pylint: disable=protected-access
++    validate_family_context(model, context)
++    return model
++
++
++def construct_family_model(
++    factory: Callable, config: Any, *, context: Mapping[str, Any],
++) -> nn.Module:
++    """Call a model factory once and attach the shared preparation context.
++
++    Args:
++        factory: Model constructor accepting config and keyword-only context.
++        config: Complete model configuration.
++        context: The already resolved job context, shared by nested family calls.
++
++    Returns:
++        A constructed model that must pass through prepare_model_components before layout or codegen.
++    """
++    if not callable(factory):
++        raise TypeError("model_factory must be callable")
++    inspect.signature(factory).bind(config, context=context)
++    model = factory(config, context=context)
++    if not isinstance(model, nn.Module):
++        raise TypeError("model_factory must return nn.Module")
++    attach_build_context(model, context)
++    return model
++
++
++def _provider_rules(provider: Callable, model: nn.Module, context: Mapping[str, Any]) -> tuple:
++    signature = inspect.signature(provider)
++    try:
++        signature.bind(model=model, context=context)
++    except TypeError:
++        signature.bind()
++        value = provider()
++    else:
++        value = provider(model=model, context=context)
++    if value is None:
++        return ()
++    if isinstance(value, (tuple, list)):
++        return tuple(value)
++    rules = getattr(value, "get_replacement_rules", None)
++    return tuple(rules(model=model, context=context)) if rules is not None else ()
++
++
++def prepare_model_components(
++    model: nn.Module, context: Mapping[str, Any], *, capture_checkpoint_metadata: bool = True,
++) -> tuple[nn.Module, Any]:
++    """Finalize family choices and source components once before parameter layout.
++
++    Args:
++        model: Final or source model tree for this build.
++        context: Read-only job context and effective model facts.
++        capture_checkpoint_metadata: Save source shapes when loading transformed checkpoint tensors.
++    """
++    if getattr(model, "_hp_components_prepared", False):
++        if getattr(model, "_hp_module_build_context", None) is not context:
++            raise ValueError("prepared model components cannot be reused with another build context")
++        return model, model._hp_family_weight_mapping  # pylint: disable=protected-access
++    model = _finalize_family_modules(model, context)
++    attach_build_context(model, context)
++    spec = context.get("model_spec")
++    defaults = () if spec is None or spec.replacements is None else _provider_rules(spec.replacements, model, context)
++    overrides = context.get("module_replacement_requests")
++    legacy = () if overrides is not None else (context.get("module_replacements") or ())
++    plan = compile_module_replacements(model, legacy, defaults=defaults, overrides=overrides or ())
++    weights = model_weight_mapping(model)
++    _validate_low_precision_targets(model, plan, context)
++    if plan.targets:
++        model, weights = _apply_module_replacement_actions(
++            model, plan, weights_mapping=weights, context=context,
++            capture_checkpoint_metadata=capture_checkpoint_metadata,
++        )
++    model._hp_components_prepared = True  # pylint: disable=protected-access
++    model._hp_family_weight_mapping = weights  # pylint: disable=protected-access
++    return model, weights
++
++
++def model_weight_mapping(model: nn.Module) -> list:
++    """Read declared conversion rules without importing HF modeling for a plain Module.
++
++    Args:
++        model: Concrete source or directly composed model.
++
++    Returns:
++        Model-owned or HF-normalized checkpoint conversion rules.
++    """
++    if getattr(model, "config_class", None) is not None:
++        return get_model_conversion_mapping(model)
++    declared = getattr(model, "_weight_conversions", None)
++    if declared is not None:
++        return list(declared)
++    return []
++
++
++def _validate_low_precision_targets(
++    model: nn.Module, plan: ModuleReplacementPlan, context: Mapping[str, Any],
++) -> None:
++    """Validate a policy after direct members and model-owned defaults are known."""
++    if context.get("low_precision") is None:
++        return
++    if context.get("legacy_low_precision_targets"):
++        return
++    if context.get("module_replacement_requests") is None and context.get("module_replacements"):
++        return
++    if any(boundary.info.resolved.selectors.get("precision", "inherit") != "inherit"
++           for boundary in collect_family_modules(model)):
++        return
++    for target in plan.targets:
++        request = target.spec.request
++        if request is not None and (request.kwargs.get("precision", "inherit") != "inherit"
++                                    or request.kwargs.get("use_mxfp8") is True):
++            return
++    raise ValueError("low_precision is enabled but no low-precision family or module replacement is configured")
+diff --git a/hyper_parallel/models/replacement.py b/hyper_parallel/models/replacement.py
+index ce5a2554..47872c5a 100644
+--- a/hyper_parallel/models/replacement.py
++++ b/hyper_parallel/models/replacement.py
+@@ -21,11 +21,15 @@ import inspect
+ import logging
+ import weakref
+ from collections.abc import Mapping
+-from dataclasses import dataclass
++from dataclasses import dataclass, field, replace
+ from types import MappingProxyType
+ from typing import Any, Callable, Iterable, Optional
+ 
+-from torch import nn  # pylint: disable=forbidden-backend-import
++from torch import nn
++
++from hyper_parallel.components.modules.module_family import (
++    FamilyRequest, _module_aliases, build_family, get_family_build_info, get_module_family,
++)
+ 
+ from hyper_parallel.components.checkpoint.weight_conversion import (
+     WeightConverter,
+@@ -33,6 +37,7 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
+     get_model_conversion_mapping,
+ )
+ 
++
+ ModuleReplacementFactory = Callable[..., nn.Module]
+ MethodReplacementFactory = Callable[..., Callable[..., Any]]
+ logger = logging.getLogger(__name__)
+@@ -45,15 +50,22 @@ class ModuleReplacementMatchError(ValueError):
+         """Initialize the error with unmatched replacement declarations."""
+         self.unmatched = unmatched
+         patterns = [item["pattern"] for item in unmatched]
++        message = ("matched no compatible module" if any(
++            item["reason"] == "matched_no_compatible_module" for item in unmatched
++        ) else "matched no final module")
+         super().__init__(
+             "module replacement pattern(s) matched no final module: "
+-            f"{patterns}. Inspect the finalized module inventory and update the "
++            f"{patterns} ({message}). Inspect the finalized module inventory and update the "
+             "adapter pattern; do not silently skip a required replacement."
+         )
+ 
+ 
+ def module_replacement(factory: ModuleReplacementFactory) -> ModuleReplacementFactory:
+-    """Declare a factory compatible with the generic replacement executor."""
++    """Declare a factory compatible with the generic replacement executor.
++
++    Args:
++        factory: Construction callable or protocol factory.
++    """
+ 
+     signature = inspect.signature(factory)
+     required = {"module", "module_fqn", "context"}
+@@ -77,6 +89,10 @@ def method_replacement(factory: MethodReplacementFactory) -> MethodReplacementFa
+     The factory receives the owning module, the full method FQN, the original
+     bound method, and a read-only build context. It returns a callable whose
+     arguments are the same as calls to the original bound method.
++
++    Args:
++        factory: Construction callable or protocol factory.
++
+     """
+     signature = inspect.signature(factory)
+     required = {"module", "method_fqn", "original_method", "context"}
+@@ -173,6 +189,49 @@ def apply_method_replacements(
+     return model
+ 
+ 
++def _validate_module_match(
++    match: tuple[str, ...], module_type: type[nn.Module] | None, exact_type: bool,
++) -> None:
++    """Validate source selection fields shared by requests and executable specs."""
++    if not match or any(not isinstance(pattern, str) or not pattern for pattern in match):
++        raise ValueError("module replacement match must contain non-empty FQN patterns")
++    if module_type is not None and (not isinstance(module_type, type) or not issubclass(module_type, nn.Module)):
++        raise TypeError("module_type must be an nn.Module type")
++    if exact_type and module_type is None:
++        raise ValueError("exact_type requires module_type")
++
++
++@dataclass(frozen=True)
++class ModuleReplacementRequest:
++    """Framework-neutral requested family and explicit arguments, before selection.
++
++    Attributes:
++        match: Real source module paths or glob patterns.
++        target: Public family entry or an ordinary replacement factory.
++        kwargs: Explicit construction and numerical policy arguments.
++        origin: Diagnostic origin, assigned by the normalization layer.
++        module_type: Optional source type constraint owned by model code.
++        exact_type: Match only the exact declared source type.
++    """
++
++    match: tuple[str, ...]
++    target: Callable
++    kwargs: Mapping[str, Any] = field(default_factory=dict)
++    origin: str = "adapter"
++    module_type: type[nn.Module] | None = None
++    exact_type: bool = False
++    declaration_id: str = ""
++
++    def __post_init__(self) -> None:
++        _validate_module_match(self.match, self.module_type, self.exact_type)
++        if not callable(self.target) or not getattr(self.target, "_hp_module_replacement", False):
++            raise TypeError("replacement request target must use @module_replacement")
++        reserved = {"module", "module_fqn", "context", "origin"} & set(self.kwargs)
++        if reserved:
++            raise ValueError(f"replacement kwargs contain reserved fields: {sorted(reserved)}")
++        object.__setattr__(self, "kwargs", MappingProxyType(dict(self.kwargs)))
++
++
+ @dataclass(frozen=True)
+ class ModuleReplacementSpec:
+     """One declarative, structure-preserving module replacement rule."""
+@@ -185,19 +244,15 @@ class ModuleReplacementSpec:
+     replacement_target: Optional[str] = None
+     static_arguments: Mapping[str, Any] | None = None
+ 
++    request: ModuleReplacementRequest | None = None
++
+     def __post_init__(self) -> None:
+         self._validate_match_and_type()
+         self._validate_factory_and_codegen_metadata()
+ 
+     def _validate_match_and_type(self) -> None:
+         """Validate matching and source-module constraints."""
+-        if not self.match or any(not isinstance(pattern, str) or not pattern for pattern in self.match):
+-            raise ValueError("module replacement match must contain non-empty FQN patterns")
+-        if self.module_type is not None and (
+-                not isinstance(self.module_type, type) or not issubclass(self.module_type, nn.Module)):
+-            raise TypeError("module_type must be an nn.Module type")
+-        if self.exact_type and self.module_type is None:
+-            raise ValueError("exact_type requires module_type")
++        _validate_module_match(self.match, self.module_type, self.exact_type)
+ 
+     def _validate_factory_and_codegen_metadata(self) -> None:
+         """Validate the factory and optional serializable declaration metadata."""
+@@ -234,39 +289,44 @@ class ModuleReplacementPlan:
+ 
+     targets: tuple[ModuleReplacementTarget, ...]
+     specs: tuple[ModuleReplacementSpec, ...] = ()
++    atomic: bool = False
+ 
+ 
+ def _all_module_aliases(model: nn.Module) -> dict[int, tuple[nn.Module, tuple[str, ...]]]:
+-    aliases: dict[int, tuple[nn.Module, list[str]]] = {}
+-    for fqn, module in model.named_modules(remove_duplicate=False):
+-        if not fqn:
+-            continue
+-        module_id = id(module)
+-        if module_id not in aliases:
+-            aliases[module_id] = (module, [])
+-        aliases[module_id][1].append(fqn)
+     return {
+         module_id: (module, tuple(sorted(fqns)))
+-        for module_id, (module, fqns) in aliases.items()
++        for module_id, (module, fqns) in _module_aliases(model).items() if fqns[0]
+     }
+ 
+ 
++def _matches_module_type(module: nn.Module, rule: ModuleReplacementSpec | ModuleReplacementRequest) -> bool:
++    """Share source type checks while leaving error policy to each rule consumer."""
++    if rule.module_type is None:
++        return True
++    return (type(module) is rule.module_type  # pylint: disable=unidiomatic-typecheck
++            if rule.exact_type else isinstance(module, rule.module_type))
++
++
++def _match_module_patterns(aliases: dict, patterns: tuple[str, ...], cache: dict) -> dict[int, tuple[str, ...]]:
++    """Expand each pattern tuple once per compilation, preserving inventory order."""
++    patterns = tuple(patterns)
++    if patterns not in cache:
++        matches = {}
++        for identity, (_, fqns) in aliases.items():
++            matched = tuple(pattern for pattern in patterns if any(fnmatch.fnmatchcase(fqn, pattern) for fqn in fqns))
++            if matched:
++                matches[identity] = matched
++        cache[patterns] = matches
++    return cache[patterns]
++
++
+ def _validate_module_type(
+     module: nn.Module,
+     fqns: tuple[str, ...],
+     spec: ModuleReplacementSpec,
+ ) -> None:
+     """Validate one matched module against a replacement specification."""
+-    if spec.module_type is None:
+-        return
+-    # exact_type deliberately requires an exact type match, so the type()
+-    # comparison is intentional and must not become isinstance().
+-    type_matches = (
+-        type(module) is spec.module_type  # pylint: disable=unidiomatic-typecheck
+-        if spec.exact_type
+-        else isinstance(module, spec.module_type)
+-    )
+-    if not type_matches:
++    if not _matches_module_type(module, spec):
+         raise TypeError(
+             f"module replacement {spec.match} selected {fqns[0]!r} "
+             f"of type {type(module).__name__}, expected "
+@@ -276,21 +336,17 @@ def _validate_module_type(
+ 
+ def _select_replacement_spec(
+     spec: ModuleReplacementSpec,
+-    spec_index: int,
+     aliases: dict[int, tuple[nn.Module, tuple[str, ...]]],
+     selected: dict[int, ModuleReplacementTarget],
++    cache: dict,
++    *,
++    spec_index: int = 0,
+ ) -> None:
+     """Match one replacement specification and merge its targets."""
+-    matched_ids_by_pattern = {pattern: set() for pattern in spec.match}
+-    for module_id, (module, fqns) in aliases.items():
+-        matched_patterns = tuple(
+-            pattern for pattern in spec.match if any(fnmatch.fnmatchcase(fqn, pattern) for fqn in fqns)
+-        )
+-        if not matched_patterns:
+-            continue
++    matches = _match_module_patterns(aliases, spec.match, cache)
++    for module_id in matches:
++        module, fqns = aliases[module_id]
+         _validate_module_type(module, fqns, spec)
+-        for pattern in matched_patterns:
+-            matched_ids_by_pattern[pattern].add(module_id)
+         previous = selected.get(module_id)
+         if previous is not None and previous.spec is not spec:
+             raise ValueError(
+@@ -298,20 +354,14 @@ def _select_replacement_spec(
+                 "one source module may match only one factory"
+             )
+         selected[module_id] = ModuleReplacementTarget(fqns, weakref.ref(module), spec)
+-    unmatched_patterns = [
+-        pattern for pattern, matched_ids in matched_ids_by_pattern.items() if not matched_ids
+-    ]
++    matched_patterns = {pattern for patterns in matches.values() for pattern in patterns}
++    unmatched_patterns = [pattern for pattern in spec.match if pattern not in matched_patterns]
+     if unmatched_patterns:
+-        raise ModuleReplacementMatchError(
+-            tuple(
+-                {
+-                    "rule_id": _replacement_rule_id(spec, spec_index),
+-                    "pattern": pattern,
+-                    "reason": "matched_no_final_module",
+-                }
+-                for pattern in unmatched_patterns
+-            )
+-        )
++        raise ModuleReplacementMatchError(tuple(
++            {"rule_id": _replacement_rule_id(spec, spec_index), "pattern": pattern,
++             "reason": "matched_no_final_module"}
++            for pattern in unmatched_patterns
++        ))
+ 
+ 
+ def _validate_non_nested_targets(targets: tuple[ModuleReplacementTarget, ...]) -> None:
+@@ -328,22 +378,52 @@ def _validate_non_nested_targets(targets: tuple[ModuleReplacementTarget, ...]) -
+ 
+ def compile_module_replacements(
+     model: nn.Module,
+-    specs: Iterable[ModuleReplacementSpec],
++    specs: Iterable[ModuleReplacementSpec] = (),
++    *,
++    defaults: Iterable[ModuleReplacementRequest] = (),
++    overrides: Iterable[ModuleReplacementRequest] = (),
+ ) -> ModuleReplacementPlan:
+-    """Match rules once, validate aliases, and return an immutable plan."""
++    """Compose source rules into one plan using a build-local pattern cache.
+ 
+-    specs = tuple(specs)
+-    if not specs:
+-        return ModuleReplacementPlan((), specs)
++    Args:
++        model: Final or source model tree for this build.
++        specs: Declarative executable replacement rules.
++        defaults: Model-owned requests, skipped on directly constructed families.
++        overrides: User requests overriding defaults by identity.
+ 
+-    aliases = _all_module_aliases(model)
+-    selected: dict[int, ModuleReplacementTarget] = {}
+-    for spec_index, spec in enumerate(specs):
+-        _select_replacement_spec(spec, spec_index, aliases, selected)
++    Returns:
++        A final plan consumed directly by application, without matching again.
++    """
+ 
+-    targets = tuple(selected.values())
+-    _validate_non_nested_targets(targets)
+-    return ModuleReplacementPlan(targets, specs)
++    specs, defaults, overrides = tuple(specs), tuple(defaults), tuple(overrides)
++    if not (specs or defaults or overrides):
++        return ModuleReplacementPlan(())
++
++    inventory = _module_aliases(model)
++    direct_ids = {identity for identity, (module, _) in inventory.items()
++                  if (info := get_family_build_info(module)) is not None and info.origin == "direct"}
++    aliases = {identity: (module, tuple(sorted(paths))) for identity, (module, paths) in inventory.items() if paths[0]}
++    cache, selected, opaque = {}, {}, {}
++    _compose_request_layer(aliases, defaults, selected, direct_ids, cache, explicit=False)
++    explicit_ids = _compose_request_layer(aliases, overrides, selected, direct_ids, cache, explicit=True)
++    for index, spec in enumerate(specs):
++        _select_replacement_spec(spec, aliases, opaque, cache, spec_index=index)
++    for identity, target in opaque.items():
++        if identity in direct_ids or identity in explicit_ids:
++            raise ValueError(f"explicit replacement conflict at {target.module_fqns}")
++        selected.pop(identity, None)
++    targets = []
++    for module, request in selected.values():
++        spec = ModuleReplacementSpec(request.match, _factory_for_request(request),
++                                     request.module_type, request.exact_type, request=request,
++                                     replacement_target=_symbol_path(request.target), static_arguments=request.kwargs,
++                                     declaration_id=request.declaration_id)
++        targets.append(ModuleReplacementTarget(request.match, weakref.ref(module), spec))
++    targets.extend(opaque.values())
++
++    _validate_non_nested_targets(tuple(targets))
++    return ModuleReplacementPlan(tuple(targets), specs=tuple(target.spec for target in targets) if selected else specs,
++                                 atomic=any(target.spec.request is not None for target in targets))
+ 
+ 
+ def _symbol_path(symbol: Any) -> str | None:
+@@ -378,23 +458,66 @@ def describe_replacement_declarations(
+     )
+ 
+ 
+-def _parent_and_name(model: nn.Module, fqn: str) -> tuple[nn.Module, str]:
+-    """Resolve a replacement target's parent module and local name."""
+-
+-    parent_fqn, _, name = fqn.rpartition(".")
+-    parent = model.get_submodule(parent_fqn) if parent_fqn else model
+-    if not name or parent._modules.get(name) is None:  # pylint: disable=protected-access
+-        raise ValueError(f"replacement target {fqn!r} is no longer registered on its parent")
+-    return parent, name
+-
+-
+-def _validate_target_binding(model: nn.Module, target: ModuleReplacementTarget) -> None:
+-    """Check all aliases before installing any part of one replacement."""
+-    source = target.source
+-    for fqn in target.module_fqns:
+-        parent, name = _parent_and_name(model, fqn)
+-        if parent._modules[name] is not source:  # pylint: disable=protected-access
+-            raise ValueError(f"replacement target {fqn!r} changed while plan was being applied")
++def _validate_candidate_projection(
++    model: nn.Module,
++    replacements: Mapping[str, nn.Module],
++    assignments: Mapping[tuple[int, str], tuple[nn.Module, str, nn.Module]],
++) -> None:
++    """Check every target remains reachable after all scheduled parent-slot changes."""
++    for fqn, candidate in replacements.items():
++        current = model
++        for name in filter(None, fqn.split(".")):
++            assignment = assignments.get((id(current), name))
++            current = (assignment[2] if assignment is not None
++                       else current._modules.get(name))  # pylint: disable=protected-access
++            if not isinstance(current, nn.Module):
++                break
++        if current is not candidate:
++            raise ValueError(f"conflicting replacement paths on the final module tree at {fqn!r}")
++
++
++def _install_module_candidates(
++    model: nn.Module,
++    candidates: Iterable[tuple[tuple[str, ...], nn.Module, nn.Module]],
++) -> nn.Module:
++    """Preflight and install (aliases, source, candidate) records, returning the final root."""
++    replacements = {}
++    for fqns, source, candidate in candidates:
++        for fqn in fqns:
++            try:
++                current = model.get_submodule(fqn)
++            except AttributeError as exc:
++                raise ValueError(f"replacement target {fqn!r} is no longer registered") from exc
++            if current is not source:
++                raise ValueError(f"replacement target {fqn!r} changed while plan was being applied")
++            if replacements.setdefault(fqn, candidate) is not candidate:
++                raise ValueError(f"conflicting replacement candidates at {fqn!r}")
++
++    assignments = {}
++    for fqn, candidate in replacements.items():
++        if not fqn:
++            continue
++        parent, _, name = fqn.rpartition(".")
++        ancestor = parent
++        while ancestor and ancestor not in replacements:
++            ancestor = ancestor.rpartition(".")[0]
++        root = replacements.get(ancestor, model)
++        relative = parent[len(ancestor):].lstrip(".") if ancestor in replacements else parent
++        try:
++            owner = root.get_submodule(relative)
++        except AttributeError as exc:
++            raise ValueError(f"replacement parent for {fqn!r} is no longer registered") from exc
++        if not isinstance(owner._modules.get(name), nn.Module):  # pylint: disable=protected-access
++            raise ValueError(f"replacement target {fqn!r} is no longer registered on its final parent")
++        slot = (id(owner), name)
++        previous = assignments.setdefault(slot, (owner, name, candidate))
++        if previous[2] is not candidate:
++            raise ValueError(f"conflicting replacement candidates on the final parent slot for {fqn!r}")
++    final_model = replacements.get("", model)
++    _validate_candidate_projection(final_model, replacements, assignments)
++    for owner, name, candidate in assignments.values():
++        owner._modules[name] = candidate  # pylint: disable=protected-access
++    return final_model
+ 
+ 
+ def _registered_names(module: nn.Module) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+@@ -432,16 +555,6 @@ def _named_tensor_shapes(model: nn.Module) -> dict[str, tuple[int, ...]]:
+     return shapes
+ 
+ 
+-def _validate_forward_compatibility(
+-    source: nn.Module,
+-    replacement: nn.Module,
+-    fqn: str,
+-) -> None:
+-    """Ensure replacement accepts every call shape supported by source.forward."""
+-
+-    _validate_callable_compatibility(source.forward, replacement.forward, fqn, kind="forward")
+-
+-
+ def _validate_callable_compatibility(
+     source: Callable, replacement: Callable, fqn: str, *, kind: str = "call",
+ ) -> None:
+@@ -451,28 +564,14 @@ def _validate_callable_compatibility(
+         source_signature = inspect.signature(source)
+         replacement_signature = inspect.signature(replacement)
+         source_parameters = tuple(source_signature.parameters.values())
+-        source_has_varargs = any(
+-            parameter.kind is inspect.Parameter.VAR_POSITIONAL
+-            for parameter in source_parameters
+-        )
+-        source_has_varkwargs = any(
+-            parameter.kind is inspect.Parameter.VAR_KEYWORD
+-            for parameter in source_parameters
+-        )
+-        replacement_has_varargs = any(
+-            parameter.kind is inspect.Parameter.VAR_POSITIONAL
+-            for parameter in replacement_signature.parameters.values()
+-        )
+-        replacement_has_varkwargs = any(
+-            parameter.kind is inspect.Parameter.VAR_KEYWORD
+-            for parameter in replacement_signature.parameters.values()
+-        )
+-        if source_has_varargs and not replacement_has_varargs:
+-            raise TypeError("replacement drops source *args support")
+-        if source_has_varkwargs and not replacement_has_varkwargs:
+-            raise TypeError("replacement drops source **kwargs support")
++        source_kinds = {parameter.kind for parameter in source_parameters}
++        replacement_kinds = {parameter.kind for parameter in replacement_signature.parameters.values()}
++        required_variadics = source_kinds & {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}
++        if not required_variadics.issubset(replacement_kinds):
++            raise TypeError("replacement drops source variadic arguments")
+ 
+         all_positional_args = []
++        required_positional_args = []
+         keyword_probe_positional_args = []
+         keyword_args = {}
+         for parameter in source_parameters:
+@@ -481,6 +580,8 @@ def _validate_callable_compatibility(
+                 inspect.Parameter.POSITIONAL_OR_KEYWORD,
+             ):
+                 all_positional_args.append(None)
++                if parameter.default is inspect.Parameter.empty:
++                    required_positional_args.append(None)
+             if parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
+                 keyword_probe_positional_args.append(None)
+             if parameter.kind in (
+@@ -489,10 +590,16 @@ def _validate_callable_compatibility(
+             ):
+                 keyword_args[parameter.name] = None
+ 
+-        source_signature.bind(*all_positional_args)
+-        source_signature.bind(*keyword_probe_positional_args, **keyword_args)
+-        replacement_signature.bind(*all_positional_args)
+-        replacement_signature.bind(*keyword_probe_positional_args, **keyword_args)
++        required_keyword_args = {
++            parameter.name: None for parameter in source_parameters
++            if parameter.kind is inspect.Parameter.KEYWORD_ONLY and parameter.default is inspect.Parameter.empty
++        }
++        probes = [(all_positional_args, required_keyword_args), (keyword_probe_positional_args, keyword_args)]
++        if required_positional_args != all_positional_args:
++            probes.append((required_positional_args, required_keyword_args))
++        for args, kwargs in probes:
++            source_signature.bind(*args, **kwargs)
++            replacement_signature.bind(*args, **kwargs)
+     except (TypeError, ValueError) as error:
+         raise ValueError(
+             f"replacement for {fqn!r} has an incompatible "
+@@ -539,7 +646,7 @@ def _validate_replacement(
+             raise ValueError(
+                 f"replacement for {fqn!r} changed state_dict keys"
+             )
+-    _validate_forward_compatibility(source, replacement, fqn)
++    _validate_callable_compatibility(source.forward, replacement.forward, fqn, kind="forward")
+     hook_registries = {
+         name: value for name, value in vars(source).items()
+         if "hook" in name and isinstance(value, Mapping) and value
+@@ -552,7 +659,7 @@ def _validate_replacement(
+ 
+ def _apply_module_replacement_actions(
+     model: nn.Module,
+-    replacement_rules: Iterable[ModuleReplacementSpec] | None = None,
++    replacement_rules: Iterable[ModuleReplacementSpec] | ModuleReplacementPlan | None = None,
+     *,
+     weights_mapping: list[WeightRenaming | WeightConverter] | None = None,
+     context: Mapping[str, Any] | None = None,
+@@ -570,7 +677,7 @@ def _apply_module_replacement_actions(
+ 
+     if weights_mapping is None:
+         weights_mapping = get_model_conversion_mapping(model)
+-    context = dict(context or {})
++    context = context or {}
+     active_model_parallel_axes = [
+         axis.upper()
+         for axis in ("tp", "cp", "ep", "pp")
+@@ -581,8 +688,8 @@ def _apply_module_replacement_actions(
+             "Low-precision online training currently requires TP=CP=EP=PP=1; "
+             f"active axes: {active_model_parallel_axes}."
+         )
+-    specs = tuple(replacement_rules or ())
+-    plan = compile_module_replacements(model, specs)
++    plan = (replacement_rules if isinstance(replacement_rules, ModuleReplacementPlan)
++            else compile_module_replacements(model, tuple(replacement_rules or ())))
+     return apply_module_replacements(
+         model,
+         plan,
+@@ -592,14 +699,12 @@ def _apply_module_replacement_actions(
+     )
+ 
+ 
+-def _install_replacement_target(
+-    model: nn.Module,
++def _prepare_replacement_target(
+     target: ModuleReplacementTarget,
+     context: Mapping[str, Any],
+-    extra_transforms: list[WeightRenaming | WeightConverter],
+     weights_mapping: list[WeightRenaming | WeightConverter] | None,
+-) -> None:
+-    """Build, validate, and install one replacement target in place."""
++) -> tuple[nn.Module, list[WeightRenaming | WeightConverter]]:
++    """Build and validate a source-read-only candidate without mutating the model tree."""
+     source = target.source
+     replacement = target.spec.factory(
+         module=source,
+@@ -619,7 +724,6 @@ def _install_replacement_target(
+         )
+     for transform in transforms:
+         transform.scope_prefix = target.module_fqns[0]
+-        extra_transforms.append(transform)
+     _validate_replacement(
+         source,
+         replacement,
+@@ -628,14 +732,22 @@ def _install_replacement_target(
+     )
+     if transforms and callable(getattr(replacement, "reset_parameters", None)):
+         replacement._hp_reset_after_materialization = True  # pylint: disable=protected-access
+-    _validate_target_binding(model, target)
+     if transforms and weights_mapping is None:
+         raise ValueError(
+             "weights_mapping is required when a replacement defines make_transforms()"
+         )
+-    for fqn in target.module_fqns:
+-        parent, name = _parent_and_name(model, fqn)
+-        parent._modules[name] = replacement  # pylint: disable=protected-access
++    return replacement, transforms
++
++
++def _prepare_replacement_batches(plan, context, weights_mapping):
++    """Prepare all atomic candidates together or one legacy candidate at a time."""
++    candidates = ((target, *_prepare_replacement_target(target, context, weights_mapping))
++                  for target in plan.targets)
++    if plan.atomic:
++        yield list(candidates)
++    else:
++        for candidate in candidates:
++            yield [candidate]
+ 
+ 
+ def apply_module_replacements(
+@@ -646,24 +758,31 @@ def apply_module_replacements(
+     context: Mapping[str, Any] | None = None,
+     capture_checkpoint_metadata: bool = True,
+ ) -> tuple[nn.Module, list[WeightRenaming | WeightConverter] | None]:
+-    """Build, validate, and install one target at a time to bound live storage.
++    """Install a validated request batch, or a legacy incremental plan.
++
++    Neutral requests construct and validate every candidate before any tree change.
++    Opaque legacy factories retain bounded incremental conversion; on their failure
++    callers discard the partially converted model.
+ 
+-    Plans do not retain replaced source modules. A factory or validation
+-    failure may leave earlier targets installed; callers must discard the
+-    partially converted model and rebuild rather than retrying this plan.
++    Args:
++        model: Model tree whose source boundaries are finalized.
++        plan: Precompiled aliases, source constraints and installation policy.
++        weights_mapping: Mutable mapping receiving successful checkpoint transforms.
++        context: Read-only logical job context.
++        capture_checkpoint_metadata: Whether source shapes are retained for loading.
+     """
+ 
+     context = MappingProxyType(dict(context or {}))
+-    source_shapes = _named_tensor_shapes(model) if plan.targets and capture_checkpoint_metadata else None
++    source_shapes = None
+     extra_transforms: list[WeightRenaming | WeightConverter] = []
+-    for target in plan.targets:
+-        _install_replacement_target(
+-            model,
+-            target,
+-            context,
+-            extra_transforms,
+-            weights_mapping,
++    for prepared in _prepare_replacement_batches(plan, context, weights_mapping):
++        if capture_checkpoint_metadata and source_shapes is None and any(transforms for _, _, transforms in prepared):
++            source_shapes = _named_tensor_shapes(model)
++        model = _install_module_candidates(
++            model, ((target.module_fqns, target.source, candidate) for target, candidate, _ in prepared),
+         )
++        for _, _, transforms in prepared:
++            extra_transforms.extend(transforms)
+     if extra_transforms:
+         if capture_checkpoint_metadata:
+             model._hp_checkpoint_source_shapes = source_shapes  # pylint: disable=protected-access
+@@ -679,3 +798,53 @@ def apply_module_replacements(
+         dict.fromkeys((*previous_replacements, *current_replacements))
+     )
+     return model, weights_mapping
++
++
++def _factory_for_request(request: ModuleReplacementRequest) -> ModuleReplacementFactory:
++    @module_replacement
++    def factory(*, module: nn.Module, module_fqn: str, context: Mapping[str, Any]) -> nn.Module:
++        """Construct one already-composed source boundary using its preserved request."""
++        family = get_module_family(request.target)
++        if family is not None and family.default_variant is not None:
++            return build_family(
++                FamilyRequest(request.target, request.kwargs),
++                module=module, module_fqn=module_fqn, context=context,
++            )
++        return request.target(module=module, module_fqn=module_fqn, context=context, **request.kwargs)
++    return factory
++
++
++def _request_matches(aliases: dict, request: ModuleReplacementRequest, cache: dict) -> dict[int, tuple]:
++    """Filter shared path matches using the request's source type contract."""
++    matches = {identity: aliases[identity] for identity in _match_module_patterns(aliases, request.match, cache)
++               if _matches_module_type(aliases[identity][0], request)}
++    if not matches:
++        raise ModuleReplacementMatchError(tuple(
++            {"rule_id": request.declaration_id or "python-replacement-0000", "pattern": pattern,
++             "reason": "matched_no_compatible_module"} for pattern in request.match
++        ))
++    return matches
++
++
++def _compose_request_layer(aliases, requests, selected, direct_ids, cache, *, explicit):
++    """Compose one precedence layer without allocating candidate modules."""
++    current_ids = set()
++    for request in requests:
++        if not isinstance(request, ModuleReplacementRequest):
++            raise TypeError("replacement providers must return ModuleReplacementRequest objects")
++        for identity, (module, paths) in _request_matches(aliases, request, cache).items():
++            if identity in direct_ids:
++                if explicit:
++                    raise ValueError(f"explicit replacement conflicts with directly constructed family at {paths}")
++                continue
++            if any(id(child) in direct_ids for child in module.modules()):
++                raise ValueError(f"parent replacement at {paths} overlaps a directly constructed family")
++            if identity in current_ids:
++                raise ValueError(f"duplicate {'user' if explicit else 'default'} replacement for aliases {paths}")
++            current_ids.add(identity)
++            old = selected.get(identity)
++            same_family = (explicit and old is not None and old[1].target is request.target
++                           and get_module_family(request.target) is not None)
++            arguments = {**old[1].kwargs, **request.kwargs} if same_family else request.kwargs
++            selected[identity] = (module, replace(request, kwargs=arguments, match=paths))
++    return current_ids
+diff --git a/hyper_parallel/trainer/config/parallelism.py b/hyper_parallel/trainer/config/parallelism.py
+index a992106b..97ba3be2 100644
+--- a/hyper_parallel/trainer/config/parallelism.py
++++ b/hyper_parallel/trainer/config/parallelism.py
+@@ -38,6 +38,7 @@ from hyper_parallel.models.replacement import (
+     MethodReplacementSpec,
+     ModuleReplacementFactory,
+     ModuleReplacementSpec,
++    ModuleReplacementRequest,
+     method_replacement,
+     module_replacement,
+ )
+@@ -369,6 +370,22 @@ class PlanOverride:
+         if meta.kind not in ("local_compute", "inner_wrapper"):
+             raise TypeError(f"unsupported forward target metadata kind {meta.kind!r}")
+ 
++    def _serialized_replacement(self):
++        """Serialize only the replacement action, independently of layout fields."""
++        implementation_config = _serialize_config_value(self.replace.implementation)
++        implementation_value = (
++            implementation_config["_target_"]
++            if isinstance(implementation_config, dict) and set(implementation_config) == {"_target_"}
++            else implementation_config
++        )
++        action = {"kind": self.replace.kind, "implementation": implementation_value}
++        if self.replace.kind == "module":
++            if self.replace.source_type is not None:
++                action["source_type"] = self.replace.source_type
++            if self.replace.exact_type:
++                action["exact_type"] = True
++        return action
++
+     def to_dict(self) -> dict[str, Any]:
+         """Serialize the public declaration."""
+         result: dict[str, Any] = {"match": self.match}
+@@ -377,19 +394,7 @@ class PlanOverride:
+         if self.low_precision_dtype_scheme is not None:
+             result["low_precision_dtype_scheme"] = self.low_precision_dtype_scheme
+         if self.replace is not None:
+-            implementation_config = _serialize_config_value(self.replace.implementation)
+-            implementation_value = (
+-                implementation_config["_target_"]
+-                if isinstance(implementation_config, dict) and set(implementation_config) == {"_target_"}
+-                else implementation_config
+-            )
+-            action = {"kind": self.replace.kind, "implementation": implementation_value}
+-            if self.replace.kind == "module":
+-                if self.replace.source_type is not None:
+-                    action["source_type"] = self.replace.source_type
+-                if self.replace.exact_type:
+-                    action["exact_type"] = True
+-            result["replace"] = action
++            result["replace"] = self._serialized_replacement()
+         for name in ("region_dispatch", "params", "in_src", "in_dst", "out_src", "out_dst", "tp_divide_attrs"):
+             value = getattr(self, name)
+             default_forward_dispatch = (
+@@ -401,6 +406,17 @@ class PlanOverride:
+                 result[name] = _serialize_config_value(value)
+         return result
+ 
++    def _validate_override_match(self):
++        """Reject method-only and empty declarations before creating a boundary."""
++        if self.replace is not None and self.replace.kind == "method" and (
++                self.match.rpartition(".")[2] != "forward"):
++            raise ValueError("non-forward method replacements do not create planner boundaries")
++
++        if not self.match:
++            raise ValueError(
++                "plan_overrides entry is missing 'match' (an fqn or "
++                "fqn glob such as '*.self_attn' or '*.mlp')")
++
+     def to_override(self) -> "tuple[str, Any]":
+         """Desugar to a ``(match, ModuleShardingSpec)`` plan_overrides entry.
+ 
+@@ -417,14 +433,7 @@ class PlanOverride:
+             ModuleShardingSpec,
+         )
+ 
+-        if self.replace is not None and self.replace.kind == "method" and (
+-                self.match.rpartition(".")[2] != "forward"):
+-            raise ValueError("non-forward method replacements do not create planner boundaries")
+-
+-        if not self.match:
+-            raise ValueError(
+-                "plan_overrides entry is missing 'match' (an fqn or "
+-                "fqn glob such as '*.self_attn' or '*.mlp')")
++        self._validate_override_match()
+         implementation = self.replace.implementation if self.replace is not None else None
+         meta = getattr(implementation.callable, "_injection_meta", None) if implementation is not None else None
+         spec = ModuleShardingSpec(
+@@ -634,6 +643,42 @@ def entries_to_method_replacements(
+     return tuple(rules)
+ 
+ 
++def entries_to_module_replacement_requests(
++    entries: List[PlanOverride], *, low_precision_enabled: bool = False,
++    low_precision_config: Optional[LowPrecisionConfig] = None,
++) -> tuple[ModuleReplacementRequest, ...]:
++    """Preserve public family identity and explicit parameters through desugaring.
++
++    Args:
++        entries: Value passed to this operation.
++    """
++    effective = low_precision_config if low_precision_enabled else None
++    result = []
++    for entry_index, entry in enumerate(entries):
++        if entry.replace is None or entry.replace.kind != "module":
++            continue
++        if entry.when == "low_precision" and not low_precision_enabled:
++            continue
++        _validate_replacement_entry(entry, effective)
++        target = entry.replace.implementation
++        baseline = target.requested_target if isinstance(target, ReplacementTarget) else target.callable
++        arguments = {name: value for name, value in target._kwargs.items()  # pylint: disable=protected-access
++                     if name not in {"module", "module_fqn", "context"}}
++        if isinstance(target, ReplacementTarget):
++            arguments.update(target.selectors)
++        if entry.when == "low_precision":
++            # Legacy policy-bearing closures remain on the explicit compatibility path.
++            continue
++        result.append(ModuleReplacementRequest(
++            match=(entry.match,) if isinstance(entry.match, str) else tuple(entry.match),
++            target=baseline, kwargs=arguments, origin="user",
++            declaration_id=f"plan_override:{entry_index}:replace",
++            module_type=_import_module_type(entry.replace.source_type) if entry.replace.source_type else None,
++            exact_type=entry.replace.exact_type,
++        ))
++    return tuple(result)
++
++
+ def entries_to_module_replacements(
+     entries: List[PlanOverride],
+     *,
+@@ -755,6 +800,26 @@ def _merge_plan_override(overrides: dict[str, Any], match: str, spec: Any) -> No
+         previous.region_dispatch = spec.region_dispatch
+ 
+ 
++def _validate_override_transport(entry):
++    """Validate YAML module-selection transport separately from placement lowering."""
++    if isinstance(entry.match, list) and (
++        entry.replace is None or entry.replace.kind != "module" or _has_sharding_action(entry)
++    ):
++        raise ValueError(
++            "plan_overrides match lists are supported only for replace.kind='module' "
++            "entries; use separate string matches for sharding actions"
++        )
++    if entry.replace is not None and entry.replace.kind == "module" and entry.when not in (
++        None,
++        "low_precision",
++    ):
++        raise ValueError(
++            f"plan_overrides match={entry.match!r} uses replace.kind='module' and "
++            "does not support 'when' values other than 'low_precision' "
++            "(module replacements are not conditioned on parallel topology)"
++        )
++
++
+ def entries_to_plan_overrides(
+         entries: "List[PlanOverride]", *, cp_size: int = 1, ep_size: int = 1,
+         sequence_parallel: bool = False,
+@@ -784,22 +849,7 @@ def entries_to_plan_overrides(
+                 entry.match.rpartition(".")[2] != "forward"):
+             _validate_when(entry)
+             continue
+-        if isinstance(entry.match, list) and (
+-            entry.replace is None or entry.replace.kind != "module" or _has_sharding_action(entry)
+-        ):
+-            raise ValueError(
+-                "plan_overrides match lists are supported only for replace.kind='module' "
+-                "entries; use separate string matches for sharding actions"
+-            )
+-        if entry.replace is not None and entry.replace.kind == "module" and entry.when not in (
+-            None,
+-            "low_precision",
+-        ):
+-            raise ValueError(
+-                f"plan_overrides match={entry.match!r} uses replace.kind='module' and "
+-                "does not support 'when' values other than 'low_precision' "
+-                "(module replacements are not conditioned on parallel topology)"
+-            )
++        _validate_override_transport(entry)
+         _validate_when(entry)
+         if entry.when is not None:
+             active = {
+@@ -846,17 +896,20 @@ def normalize_distributed_setup_overrides(
+             False,
+         )
+     )
+-    if low_precision_enabled and not any(
++    distributed_setup._hp_legacy_low_precision_targets = any(  # pylint: disable=protected-access
+         entry.replace is not None and entry.replace.kind == "module" and (
+             entry.when == "low_precision"
+             or getattr(entry.replace.implementation, "low_precision_dtype_scheme", None) is not None
+         )
+         for entry in entries
+-    ):
+-        raise ValueError(
+-            "low_precision is enabled but no low-precision module replacement "
+-            "is configured"
++    )
++    if not distributed_setup._hp_legacy_low_precision_targets:  # pylint: disable=protected-access
++        distributed_setup.module_replacement_requests = entries_to_module_replacement_requests(
++            entries, low_precision_enabled=low_precision_enabled,
++            low_precision_config=getattr(distributed_setup, "low_precision_config", None),
+         )
++    else:
++        distributed_setup.module_replacement_requests = None
+     distributed_setup.module_replacements = entries_to_module_replacements(
+         entries,
+         low_precision_enabled=low_precision_enabled,
+diff --git a/hyper_parallel/trainer/config/replacement.py b/hyper_parallel/trainer/config/replacement.py
+index 9487e6a2..f5346f19 100644
+--- a/hyper_parallel/trainer/config/replacement.py
++++ b/hyper_parallel/trainer/config/replacement.py
+@@ -21,11 +21,13 @@ from typing import Any, Callable
+ from hyper_parallel.components.modules.family import (
+     SelectorSpec,
+     get_family_selector_specs,
++    get_module_family,
+     normalize_family_selectors,
+     resolve_module_family_target,
+ )
+ from hyper_parallel.components.quantization.config import LowPrecisionDtypeScheme
+-from hyper_parallel.trainer.config.target import Target
++from hyper_parallel.components.modules.module_family import FamilyRequest, build_family
++from hyper_parallel.trainer.config.target import Target, _build_nested_targets
+ 
+ 
+ class ReplacementTarget(Target):
+@@ -80,7 +82,17 @@ class ReplacementTarget(Target):
+         """Build only after a named scheme has been bound by the replacement planner."""
+         if self.low_precision_dtype_scheme is not None:
+             raise ValueError("Bind low_precision_dtype_scheme through the replacement plan before building")
+-        return super().build(**runtime_kwargs)
++        family = get_module_family(self.requested_target)
++        if family is None or family.default_variant is None:
++            return super().build(**runtime_kwargs)
++        arguments = {name: _build_nested_targets(value) for name, value in self._kwargs.items()}
++        arguments.update(self.selectors)
++        return build_family(
++            FamilyRequest(self.requested_target, arguments),
++            module=runtime_kwargs.get("module"),
++            module_fqn=runtime_kwargs.get("module_fqn", ""),
++            context=runtime_kwargs.get("context"),
++        )
+ 
+     def get_family_selector_spec(self, name: str) -> SelectorSpec | None:
+         """Query the requested baseline's schema for Target-level overrides.

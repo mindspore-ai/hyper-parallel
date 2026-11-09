@@ -363,6 +363,8 @@ class FSDP2Manager:
     @staticmethod
     def _get_model_adapter_spec(model: ModuleClass) -> Any | None:
         """Resolve a model adapter from the final model configuration."""
+        if hasattr(model, "_hp_model_adapter_spec"):
+            return model._hp_model_adapter_spec  # pylint: disable=protected-access
         config = getattr(model, "config", None)
         if config is None:
             return None

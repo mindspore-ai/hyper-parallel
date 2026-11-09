@@ -25,14 +25,13 @@ import torch
 
 from hyper_parallel.codegen.manager import ensure_codegen_artifact_from_snapshot
 from hyper_parallel.codegen.session import CodegenBuildSession
-from hyper_parallel.components.checkpoint.weight_conversion import get_model_conversion_mapping
 from hyper_parallel.core.dtensor.init_weights import init_empty_weights
 from hyper_parallel.distributed._builder.applier import (
     _get_active_mesh,
     _preflight_compute_injection,
 )
 from hyper_parallel.models._transformers import auto_model, model_builder
-from hyper_parallel.models import replacement as replacement_api
+from hyper_parallel.models import module_build, replacement as replacement_api
 from hyper_parallel.models.registry import get_model_adapter
 
 
@@ -98,31 +97,31 @@ def _observe_replacements(
     session: CodegenBuildSession,
 ) -> Any:
     """Apply native replacement declarations while recording their result."""
-    weights_mapping = get_model_conversion_mapping(model)
-    specs = tuple(getattr(distributed_setup, "module_replacements", None) or ())
+    specs = list(getattr(distributed_setup, "module_replacements", None) or ())
+    original_compile = module_build.compile_module_replacements
+
+    def _observe_compile(*args: Any, **kwargs: Any) -> Any:
+        plan = original_compile(*args, **kwargs)
+        specs[:] = plan.specs
+        return plan
+
+    module_build.compile_module_replacements = _observe_compile
     try:
         with _observe_replacement_installations(model, specs) as applications:
-            model, _ = replacement_api._apply_module_replacement_actions(  # pylint: disable=protected-access
-                model,
-                specs,
-                weights_mapping=weights_mapping,
-                context=model_builder._build_replacement_context(  # pylint: disable=protected-access
-                    distributed_setup,
-                    low_precision_config,
-                ),
-                capture_checkpoint_metadata=load_base_model,
+            model, _ = model_builder._maybe_apply_module_replacements(  # pylint: disable=protected-access
+                model, distributed_setup, low_precision_config, load_base_model,
             )
     except replacement_api.ModuleReplacementMatchError as exc:
         session.record_replacements(
             declarations=replacement_api.describe_replacement_declarations(specs),
-            applications=(),
-            unmatched=exc.unmatched,
+            applications=(), unmatched=exc.unmatched,
         )
         raise
+    finally:
+        module_build.compile_module_replacements = original_compile
     session.record_replacements(
         declarations=replacement_api.describe_replacement_declarations(specs),
-        applications=applications,
-        unmatched=(),
+        applications=applications, unmatched=(),
     )
     return model
 
@@ -132,39 +131,45 @@ def _observe_replacement_installations(
     model: Any,
     specs: tuple[Any, ...],
 ) -> Iterator[list[dict[str, Any]]]:
-    """Observe native replacement installation without changing its API."""
+    """Record metadata only after the shared installer commits a prepared candidate."""
+    del model
     applications: list[dict[str, Any]] = []
     spec_indexes = {id(spec): index for index, spec in enumerate(specs)}
-    original_install = replacement_api._install_replacement_target  # pylint: disable=protected-access
+    pending = {}
+    original_prepare = replacement_api._prepare_replacement_target  # pylint: disable=protected-access
+    original_install = replacement_api._install_module_candidates  # pylint: disable=protected-access
 
-    def _observe_install(*args: Any, **kwargs: Any) -> None:
-        """Record the source and result of the one native installation call."""
-        target = args[1]
-        transforms = args[3]
-        transform_count = len(transforms)
-        source_type = _symbol_path(type(target.source))
-        original_install(*args, **kwargs)
-        replacement = model.get_submodule(target.module_fqns[0])
-        applications.append({
-            "rule_id": replacement_api._replacement_rule_id(  # pylint: disable=protected-access
-                target.spec,
-                spec_indexes.get(id(target.spec), 0),
-            ),
+    def _observe_prepare(target: Any, *args: Any, **kwargs: Any) -> Any:
+        candidate, transforms = original_prepare(target, *args, **kwargs)
+        if id(target.spec) not in spec_indexes:
+            spec_indexes.update({id(spec): index for index, spec in enumerate(specs)})
+        index = spec_indexes.setdefault(id(target.spec), len(spec_indexes))
+        pending[id(candidate)] = {
+            "rule_id": replacement_api._replacement_rule_id(target.spec, index),  # pylint: disable=protected-access
             "module_fqns": list(target.module_fqns),
             "primary_fqn": target.module_fqns[0],
-            "source_type": source_type,
-            "replacement_type": _symbol_path(type(replacement)),
-            "weight_transforms": [
-                _symbol_path(type(transform))
-                for transform in transforms[transform_count:]
-            ],
-        })
+            "source_type": _symbol_path(type(target.source)),
+            "replacement_type": _symbol_path(type(candidate)),
+            "weight_transforms": [_symbol_path(type(transform)) for transform in transforms],
+        }
+        return candidate, transforms
 
-    replacement_api._install_replacement_target = _observe_install  # pylint: disable=protected-access
+    def _observe_install(root: Any, candidates: Any) -> Any:
+        candidates = tuple(candidates)
+        result = original_install(root, candidates)
+        for _, _, candidate in candidates:
+            record = pending.pop(id(candidate), None)
+            if record is not None:
+                applications.append(record)
+        return result
+
+    replacement_api._prepare_replacement_target = _observe_prepare  # pylint: disable=protected-access
+    replacement_api._install_module_candidates = _observe_install  # pylint: disable=protected-access
     try:
         yield applications
     finally:
-        replacement_api._install_replacement_target = original_install  # pylint: disable=protected-access
+        replacement_api._prepare_replacement_target = original_prepare  # pylint: disable=protected-access
+        replacement_api._install_module_candidates = original_install  # pylint: disable=protected-access
 
 
 def _symbol_path(symbol: Any) -> str:
@@ -298,7 +303,9 @@ def _codegen_build_model(session: CodegenBuildSession, artifact_dir: Optional[st
             swap_inputs,
             allow_cache_entry_mutation,
             activation_swap,
-            model_init_dtype,
+        )
+        factory, context = auto_model._resolve_module_construction(  # pylint: disable=protected-access
+            kwargs, hf_config, distributed_setup, model_init_dtype or torch_dtype,
         )
         init_kwargs = auto_model._model_init_kwargs(  # pylint: disable=protected-access
             dict(kwargs),
@@ -308,16 +315,16 @@ def _codegen_build_model(session: CodegenBuildSession, artifact_dir: Optional[st
             init_kwargs["trust_remote_code"] = kwargs["trust_remote_code"]
         _prepare_model_source_compat(hf_config)
         with _codegen_model_init_context():
-            _, model = auto_model._init_model(  # pylint: disable=protected-access
-                cls,
-                None,
-                hf_config,
-                attn_implementation,
-                torch_dtype,
-                is_hf_model,
-                *model_args,
-                **init_kwargs,
-            )
+            if factory is not None:
+                if model_args:
+                    raise ValueError("model_factory uses config and context, not additional positional model arguments")
+                model = auto_model.construct_family_model(factory, hf_config, context=context)
+            else:
+                _, model = auto_model._init_model(  # pylint: disable=protected-access
+                    cls, None, hf_config, attn_implementation, torch_dtype, is_hf_model,
+                    *model_args, **init_kwargs,
+                )
+                auto_model.attach_build_context(model, context)
         _record_source(
             session,
             model,
