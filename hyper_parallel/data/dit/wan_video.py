@@ -412,6 +412,15 @@ class WanVideoTransform:
         self.video_keys = tuple(video_keys)
         self.image_keys = tuple(image_keys)
 
+    def is_valid_sample(self, sample: Mapping[str, Any]) -> bool:
+        """Return whether one source record holds a prompt and a video to build a sample from."""
+        # Mirrors the fields _preprocess requires, so a record that passes here never fails
+        # there; images stay optional because i2v falls back to the video's first frame.
+        prompt = _first_available(sample, self.prompt_keys)
+        if prompt is None:
+            return False
+        return _first_available(sample, self.video_keys) is not None
+
     def _preprocess(self, example: Mapping[str, Any]) -> tuple[str, list[Any], list[Any]]:
         if (
             self.source_name == "Tom-and-Jerry-VideoGeneration-Dataset"

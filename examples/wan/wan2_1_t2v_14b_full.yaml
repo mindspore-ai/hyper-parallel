@@ -156,14 +156,3 @@ checkpoint:
 debug:
   check_nan_inf: false
   check_dataset: null
-
-profiling:
-  enabled: false
-  start_step: 3
-  end_step: 4
-  trace_dir: ./outputs/wan2_1_t2v_1_3b_full/profiling
-  record_shapes: false
-  profile_memory: false
-  with_stack: false
-  with_modules: false
-  rank: 0
