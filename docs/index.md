@@ -25,6 +25,7 @@ Documentation for the distributed parallel acceleration library optimized for As
 | [Activation Checkpoint / Swap](./guide/activation_checkpoint.md) | checkpoint_wrapper, swap_wrapper, swap_tensor_wrapper, and combined configuration |
 | [Optimizer](./guide/optimizer.md) | AdamW, Muon, ChainedOptimizer, and learning rate schedulers |
 | [Chunk Loss](./guide/chunk_loss.md) | Chunked output projection and cross-entropy for large vocabularies; Trainer and Qwen3-MoE integration |
+| [DeepSeek Ascend Operators](./guide/deepseek_ascend_ops.md) | Dependencies, installation, and supported operator paths |
 | [DCP Distributed Checkpoints](./guide/distributed_checkpoint.md) | Saving/loading checkpoints, asynchronous staging, and offline conversion |
 | [Automatic Parallelism](./guide/auto_parallel.md) | SAPP-ND and SAPP-PPB |
 | [LlamaFactory + HyperParallel SFT Training](./guide/llama_factory_hyperparallel_sft_guide.md) | SFT configuration, launch, numerical validation, and performance validation |
