@@ -4,7 +4,7 @@
 
 **Release date: 2026-06-30**
 
-HyperParallel v1.0.0 is the project's first official release, marking the transition from rapid iteration to stable delivery. This release delivers the complete feature set of a distributed parallel acceleration library optimized for Ascend supernodes, spanning cluster-level distributed parallelism and on-chip multicore parallelism, data parallelism and multidimensional hybrid parallelism, and acceleration for both training and inference.
+HyperParallel v1.0.0 is the project's first official release, marking the transition from rapid iteration to stable delivery. This release delivers the complete feature set of a distributed parallel acceleration library optimized for Ascend SuperPoDs, spanning cluster-level distributed parallelism and on-chip multicore parallelism, data parallelism and multidimensional hybrid parallelism, and acceleration for both training and inference.
 
 ---
 

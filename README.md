@@ -8,7 +8,7 @@
 [![HyperParallel on REDnote](https://img.shields.io/badge/REDnote-FF2442?style=flat&logo=xiaohongshu&logoColor=white)](#xiaohongshu-qrcode)
 [![Documentation](https://img.shields.io/badge/Document-0088CC?style=flat&logo=readthedocs&logoColor=white)](docs/index.md)
 [![Papers](https://img.shields.io/badge/Papers-red?style=flat&logo=arxiv&logoColor=white)](#technical-reports)
-  <h3>Simplify SuperNode Programming &nbsp;·&nbsp; Unleash Parallel Computing Power</h3>
+  <h3>Simplify SuperPoD Programming &nbsp;·&nbsp; Unleash Parallel Computing Power</h3>
 
   <p><strong>English</strong> | <a href="README.zh.md">简体中文</a></p>
 
@@ -29,13 +29,13 @@
 
 ## Introduction
 
-HyperParallel provides distributed parallel acceleration for Ascend SuperNodes. Designed for resource pooling, peer-to-peer architectures, hierarchical network topologies, and FP8 low-precision formats, it spans cluster-level distributed parallelism and in-chip multicore parallelism. It supports pooled management of CPU DRAM and NPU HBM, topology-aware scheduling, communication path planning, and FP8 mixed-precision training.
+HyperParallel provides distributed parallel acceleration for Ascend SuperPoDs. Designed for resource pooling, peer-to-peer architectures, hierarchical network topologies, and FP8 low-precision formats, it spans cluster-level distributed parallelism and on-chip multicore parallelism. It supports pooled management of CPU DRAM and NPU HBM, topology-aware scheduling, communication path planning, and FP8 mixed-precision training.
 
 ---
 
 ## Core Design
 
-- **Decoupling model code from system optimization**: HyperParallel separates parallelism, recomputation, and offload from model code and injects them through declarative interfaces. Its parallel paradigms cover cluster SPMD, cluster MPMD, and in-chip multicore MPMD for large language and multimodal model training.
+- **Decoupling model code from system optimization**: HyperParallel separates parallelism, recomputation, and offload from model code and injects them through declarative interfaces. Its parallel paradigms cover cluster SPMD, cluster MPMD, and on-chip multicore MPMD for large language and multimodal model training.
 
 - **Hugging Face ecosystem compatibility**: HyperParallel reads Hugging Face model configurations and pretrained weights directly and reuses existing Transformers model implementations. After model creation, HyperParallel declaratively injects distributed logic such as parallelism, recomputation, and operator replacement.
 
@@ -67,7 +67,7 @@ HyperParallel provides distributed parallel acceleration for Ascend SuperNodes. 
 > **Core capabilities**
 >
 > - **Model sharding and parallel composition**: Describe device topology and tensor layouts with DeviceMesh, DTensor, and Shard, and combine FSDP/HSDP, TP, CP, EP, and PP strategies.
-> - **MoE and heterogeneous execution**: Expert sharding, routing, and token dispatch, along with pipeline scheduling, cluster MPMD, and in-chip multicore MPMD.
+> - **MoE and heterogeneous execution**: Expert sharding, routing, and token dispatch, along with pipeline scheduling, cluster MPMD, and on-chip multicore MPMD.
 > - **Memory and performance optimization**: Activation checkpointing, activation swapping, compute-communication overlap, communication fusion, and automatic parallelism.
 > - **Training and state management**: Optimizers, distributed checkpoints, asynchronous saving, offline format conversion, and deterministic training.
 >

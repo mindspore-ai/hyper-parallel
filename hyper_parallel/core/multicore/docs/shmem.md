@@ -388,7 +388,7 @@ One-sided communication removes the peer's matching receive call, but neither ch
 2. **Cross-rank initialization agreement**: before any remotely visible write, all ranks must finish local initialization of the corresponding slots and use
    `host_barrier()` to establish completion. A late `zero_()` or `fill_()` can overwrite delivered remote writes, causing indefinitely waiting signals or all-zero data.
 3. **Use a host barrier for initialization agreement**: remote waits in `shmem.barrier()` may spin without a timeout and trigger
-   AICore 507015 under interconnect contention; it is not a substitute for initialization agreement.
+   AI Core error 507015 under interconnect contention; it is not a substitute for initialization agreement.
 
 ## 6. Configuration and Logging
 

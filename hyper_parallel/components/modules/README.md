@@ -54,7 +54,7 @@ cd training/ascendc
 bash build.sh -c ascend910_93
 ```
 
-Install the generated AscendC operator package:
+Install the generated Ascend C operator package:
 
 ```bash
 cd output

@@ -11,11 +11,11 @@ In September 2026, DeepSeek released **DeepSeek-V4.1-Flash**. This new multimoda
 Compared with its predecessor, DeepSeek-V4.1-Flash introduces an asymmetric Causal Encoder-Decoder (CED) architecture, Compressed Sparse Attention 2 (CSA2), Engram conditional memory, and Single-Pass mHC, together with Head-wise Muon and Sinkhorn Balancing optimization methods, exploring more efficient large-scale training.
 These innovations improve efficiency while posing new framework requirements: sharing parameters and computational state across layers, managing enormous sparse parameter sets, combining new optimizers with distributed training, and maintaining efficient computation and communication across multimodal, MoE, and long-sequence workloads.
 
-**HyperParallel is a distributed parallel acceleration framework for Ascend SuperNodes.** It decouples model code from system optimization and provides FSDP, TP, CP, EP, and PP, along with mixed precision, recomputation, heterogeneous memory management, and optimizers.
+**HyperParallel is a distributed parallel acceleration framework for Ascend SuperPoDs.** It decouples model code from system optimization and provides FSDP, TP, CP, EP, and PP, along with mixed precision, recomputation, heterogeneous memory management, and optimizers.
 
 To meet DeepSeek-V4.1-Flash's architectural requirements, HyperParallel adapts model training using composable distributed parallelism and modular system design, exploring efficient training of advanced models on Ascend.
 
-## II. Supporting Model Innovations with Efficient Training on Ascend SuperNodes
+## II. Supporting Model Innovations with Efficient Training on Ascend SuperPoDs
 
 DeepSeek-V4.1-Flash requires more than additional model layers: it needs coordinated cross-layer state transfer, parameter sharding, activation recomputation, sparse access, optimizer updates, and device operators. Building on TP, CP, EP, and FSDP, HyperParallel adapts six core technologies and combines reusable high-performance Ascend operators to connect model architecture with distributed training.
 
@@ -332,7 +332,7 @@ From Causal Encoder-Decoder and CSA2 to Engram, Head-wise Muon, and Sinkhorn Bal
 
 Growing architectural complexity also demands more flexible, composable, and extensible training frameworks.
 
-**HyperParallel continues building unified, efficient, scalable distributed training infrastructure around Ascend SuperNode architectures.** Decoupled model/system optimization, modular adaptation, and multidimensional parallel composition support MoE, multimodality, very long sequences, and new optimizers.
+**HyperParallel continues building unified, efficient, scalable distributed training infrastructure around Ascend SuperPoD architectures.** Decoupled model/system optimization, modular adaptation, and multidimensional parallel composition support MoE, multimodality, very long sequences, and new optimizers.
 
 HyperParallel will continue improving complex-model adaptation, distributed optimizers, sparse parameter management, mixed precision, and compute-communication overlap to make large-scale training easier and more efficient.
 

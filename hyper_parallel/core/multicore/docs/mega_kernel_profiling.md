@@ -156,7 +156,7 @@ The pool is destroyed with the session at context exit; it does not retain devic
 
 ### 4.1 RuntimeConfig Fields
 
-Python `RuntimeConfigC` and AscendC `RuntimeHeader` must agree on field order and widths in the fixed 64-byte header. Task, event,
+Python `RuntimeConfigC` and Ascend C `RuntimeHeader` must agree on field order and widths in the fixed 64-byte header. Task, event,
 and other arrays follow the header, serialized at actual graph capacity. Profiling reuses reserved header fields without changing dynamic-array layouts:
 
 | Field | Type | Description |
@@ -475,7 +475,7 @@ Default workflow:
 
 1. Derive a case-insensitive regex allowing underscores from internal `kernelName`.
 2. Consider only complete events with positive durations.
-3. Prefer device events with NPU/AICore/kernel evidence.
+3. Prefer device events with NPU/AI Core/kernel evidence.
 4. Sort by outer timestamps and pair with invocations starting at `kernel_index`.
 5. If automatic name matching fails, allow duration-similarity fallback between the internal span and consecutive device kernels, recording a warning.
 6. If an explicit `kernel_pattern` matches nothing, fail without name fallback.
@@ -652,7 +652,7 @@ inference from tiling or input slots. Shared task builders must not write model-
 
 When modifying headers, records, capacities, or core types, update all of:
 
-- Python ctypes and AscendC structs.
+- Python ctypes and Ascend C structs.
 - Input order in OpProto, OpDef, operator JSON, ACLNN GetWorkspaceSize, L0, and framework adapters.
 - Host buffer-size and slot-offset calculations.
 - Device recorder；

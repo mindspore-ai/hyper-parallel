@@ -114,7 +114,7 @@ multicore/
 │           ├── gen_runtime_data.py
 │           └── tiling_tables.py
 │
-├── ops/                             # C++ CANN AscendC implementations.
+├── ops/                             # C++ CANN Ascend C implementations.
 │   ├── runtime/                     # Shared layer copied into each op_kernel/runtime/ during builds.
 │   │   ├── runtime_config.hpp       # Shared constants and structs: TaskDesc / EventDesc / TaskType.
 │   │   └── worker_kernel.h          # KernelWorkerBase<Derived> CRTP base class.
@@ -740,7 +740,7 @@ def main():
         write_bin(cfg, f"{args.output_dir}/runtime_config_rank_{rank_id}.bin")
 ```
 
-### 9.3 Add a C++ Compute Kernel (AscendC)
+### 9.3 Add a C++ Compute Kernel (Ascend C)
 
 **Step 1** — Create the operator directory:
 
