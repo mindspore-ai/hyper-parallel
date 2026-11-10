@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from hyper_parallel.models._transformers.auto_model import (
         HyperAutoModelForCausalLM,
         HyperAutoModelForImageTextToText,
+        HyperAutoModelForMultimodalLM,
         HyperAutoModelForSequenceClassification,
     )
 
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
 _LAZY_EXPORTS = {
     "HyperAutoModelForCausalLM": ".auto_model",
     "HyperAutoModelForImageTextToText": ".auto_model",
+    "HyperAutoModelForMultimodalLM": ".auto_model",
     "HyperAutoModelForSequenceClassification": ".auto_model",
 }
 
@@ -53,5 +55,6 @@ def __dir__():  # pylint: disable=invalid-name
 __all__ = [
     "HyperAutoModelForCausalLM",
     "HyperAutoModelForImageTextToText",
+    "HyperAutoModelForMultimodalLM",
     "HyperAutoModelForSequenceClassification",
 ]
