@@ -33,6 +33,9 @@ _MAPPING_GET_POLYFILL_INSTALLED = False
 # contract comes first, and the generic HF-convention fallback paths below
 # cover every supported family. A family whose container lives elsewhere
 # declares the contract on its model class instead of registering here.
+# (Qwen3-Omni's containers live at ``thinker.model.layers`` /
+# ``talker.model.layers``; the omni wrapper patch in
+# ``models/_transformers/auto_model.py`` declares ``get_compile_layers()``.)
 _GENERIC_LAYER_PATHS = ("layers", "model.layers")
 
 
