@@ -100,6 +100,21 @@ def _batch_ids(batch: tuple) -> list[int]:
     return sorted(sample["id"] for sample in batch)
 
 
+def _legacy_loader_state(state: dict, metadata_mode: bool) -> dict:
+    """Build the former Reader-tree checkpoint from the shared native fields."""
+    sampler = copy.deepcopy(state["_index_sampler_state"])
+    payload = dict(state["dataset_state"], epoch=sampler["epoch"])
+    reader = {"epoch": sampler["epoch"], "sampler": sampler,
+              "sample_loader": None if metadata_mode else payload}
+    return {
+        "global_rank": 0, "epoch": sampler["epoch"], "step": sampler["consumed_samples"] // 2,
+        "stopped": state["_iterator_finished"],
+        "dataset_reader": None if metadata_mode else reader,
+        "metadata_reader": reader if metadata_mode else None,
+        "direct_sample_loader": payload if metadata_mode else None,
+    }
+
+
 class TestNativeBatchSampler(unittest.TestCase):
     """Test without process groups or accelerator hardware."""
 
@@ -196,16 +211,15 @@ class TestNativeBatchSampler(unittest.TestCase):
                 self.assertEqual(sampler.consumed_samples, 6)
                 state = loader.state_dict()
                 owner = "metadata_reader" if metadata_mode else "dataset_reader"
-                self.assertEqual(state[owner]["sampler"]["consumed_samples"], 4)
-                payload_state = state["direct_sample_loader"] if metadata_mode else state[owner]["sample_loader"]
-                self.assertNotIn("version", state[owner])
-                self.assertNotIn("version", payload_state)
+                self.assertEqual(state["_index_sampler_state"]["consumed_samples"], 4)
+                self.assertNotIn(owner, state)
+                self.assertNotIn("version", state["dataset_state"])
                 original = [_batch_ids(batch) for batch in loader]
                 for reader_key, legacy_version in (
                         ("metadata_reader", None), ("metadata_reader", 0), ("sidecar_reader", 1),
                 ):
                     with self.subTest(reader_key=reader_key, legacy_version=legacy_version):
-                        restored_state = copy.deepcopy(state)
+                        restored_state = _legacy_loader_state(state, metadata_mode)
                         if legacy_version is not None:
                             restored_state[owner]["version"] = legacy_version
                             payload_state = (
@@ -233,10 +247,9 @@ class TestNativeBatchSampler(unittest.TestCase):
                 ) as loader:
                     next(loader)
                     state = loader.state_dict()
-                owner = "metadata_reader" if metadata_mode else "dataset_reader"
                 reference = _sampler(sampler_type="cyclic", seed=14)
                 reference.enable_source_batch_resume()
-                reference.load_state_dict(state[owner]["sampler"])
+                reference.load_state_dict(state["_index_sampler_state"])
                 with _loader(
                         _TrackedDataset(), sampler=_sampler(sampler_type="cyclic", seed=14),
                         metadata_mode=metadata_mode,
@@ -279,7 +292,7 @@ class TestNativeBatchSampler(unittest.TestCase):
         sampler.epoch = 2
         loader = _loader(_TrackedDataset(), sampler=sampler)
         self.assertEqual(_batch_ids(next(loader)), [4, 5])
-        self.assertEqual(loader.state_dict()["epoch"], 2)
+        self.assertEqual(loader.state_dict()["_index_sampler_state"]["epoch"], 2)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_metadata_failure_does_not_look_like_exhaustion(self) -> None:
@@ -317,7 +330,7 @@ class TestNativeBatchSampler(unittest.TestCase):
             with self.assertRaises(ValueError) as caught:
                 next(loader)
         self.assertIs(caught.exception, failure)
-        self.assertEqual(loader.state_dict()["dataset_reader"]["sampler"]["consumed_samples"], 0)
+        self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_invalid_native_sampler_options_fail_at_build(self) -> None:

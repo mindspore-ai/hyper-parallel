@@ -139,6 +139,7 @@ class TestCheckpointerCallbackRestore(unittest.TestCase):
         """Run the callback's restore hook and return the stubbed module logger."""
         with patch(f"{_CALLBACK_MODULE}.build_checkpointer", return_value=checkpointer), \
                 patch(f"{_CALLBACK_MODULE}.initialize_optimizer_state", return_value=True), \
+                patch(f"{_CALLBACK_MODULE}.get_device_rng_state", return_value=None), \
                 patch(f"{_CALLBACK_MODULE}.logger") as log:
             callback = CheckpointerCallback(trainer)
             callback.on_train_begin(trainer.state)
@@ -247,6 +248,25 @@ class TestCheckpointerCallbackRestore(unittest.TestCase):
             [],
             f"restore must not carry the resume position on the trainer, got={carried}",
         )
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_restore_uses_loader_owned_state_template(self) -> None:
+        """Feature: Loader-owned checkpoint restoration.
+        Description: Supply an optional loading template while toggling loader-state restoration.
+        Expectation: The checkpointer receives the template only when loader restoration is enabled.
+        """
+        for restore_loader in (False, True):
+            with self.subTest(restore_loader=restore_loader), tempfile.TemporaryDirectory() as restore_from:
+                trainer = self._build_trainer(restore_from, restore_train_state=True)
+                trainer.config.checkpoint.restore_dataloader_state = restore_loader
+                template = {"_index_sampler_state": {"consumed_samples": None}}
+                checkpointer = _FakeCheckpointer({"global_step": 1, "epoch": 0})
+                with patch.object(trainer.train_dataloader, "state_dict_for_load", create=True,
+                                  return_value=template) as load_template:
+                    self._restore(trainer, checkpointer)
+                expected = template if restore_loader else trainer.train_dataloader.state_dict()
+                self.assertEqual(checkpointer.skeleton_seen["train_dataloader"], expected)
+                self.assertEqual(load_template.call_count, int(restore_loader))
 
 
 class TestCheckpointerCallbackAsyncFailure(unittest.TestCase):

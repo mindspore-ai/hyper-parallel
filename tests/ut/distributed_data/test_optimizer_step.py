@@ -68,7 +68,7 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
                     for batch in loader:
                         delivered.append(_ids(batch))
                         boundary = len(delivered) // accumulation * accumulation
-                        self.assertEqual(loader.state_dict()["step"], boundary)
+                        self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 2 * boundary)
                     self.assertEqual(delivered, [list(range(i, i + 2)) for i in range(0, len(dataset), 2)])
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
@@ -139,8 +139,7 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
             for _ in range(4):
                 next(loader)
             state = loader.state_dict()
-            self.assertEqual(state["step"], 3)
-            self.assertEqual(state["dataset_reader"]["sampler"]["consumed_samples"], 6)
+            self.assertEqual(state["_index_sampler_state"]["consumed_samples"], 6)
             with self.assertRaises(StopIteration):
                 next(loader)
             exhausted = loader.state_dict()
@@ -178,16 +177,15 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
                 self.assertEqual({thread for _, thread in staged}, {loader._prefetch_thread})
                 self.assertIsNot(loader._prefetch_thread, current_thread())
                 state = loader.state_dict()
-                self.assertEqual(state["step"], 0)
-                self.assertEqual(state["dataset_reader"]["sampler"]["consumed_samples"], 0)
-                self.assertNotIn("window", state["dataset_reader"])
+                self.assertEqual(state["_index_sampler_state"]["consumed_samples"], 0)
+                self.assertNotIn("dataset_reader", state)
                 self.assertNotIn("optimizer_step_remaining", state)
                 for _ in range(3):
                     loader.prefetch()
                 self.assertEqual(dataset.reads, list(range(12)))
                 self.assertEqual(_ids(next(loader)), [2, 3])
                 self.assertEqual(_ids(next(loader)), [4, 5])
-                self.assertEqual(loader.state_dict()["step"], 3)
+                self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 6)
                 self.assertEqual(dataset.reads, list(range(12)))
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
@@ -261,7 +259,7 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
                     with _loader(**options) as resumed:
                         resumed.load_state_dict(state)
                         boundary = count // accumulation * accumulation
-                        self.assertEqual(state["step"], boundary)
+                        self.assertEqual(state["_index_sampler_state"]["consumed_samples"], 2 * boundary)
                         self.assertEqual([_ids(batch) for batch in resumed], delivered[boundary:])
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
@@ -301,7 +299,7 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
             self.assertEqual(_ids(next(loader)), [2, 3])
             self.assertEqual(_ids(next(loader)), [4, 5])
             state = loader.state_dict()
-            self.assertEqual(state["dataset_reader"]["sampler"]["consumed_samples"], 6)
+            self.assertEqual(state["_index_sampler_state"]["consumed_samples"], 6)
             with self.assertRaises(ValueError) as caught:
                 next(loader)
             self.assertIs(caught.exception, error)
@@ -365,8 +363,8 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
                         self.assertIsNone(loader._future)
                         self.assertIsNone(next(loader, None))
                         loader.set_epoch(epoch)
-                        self.assertEqual(loader.state_dict()["epoch"], epoch)
-                        self.assertEqual(loader.state_dict()["step"], 0)
+                        self.assertEqual(loader.state_dict()["_index_sampler_state"]["epoch"], epoch)
+                        self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 0)
                         self.assertEqual([_ids(batch) for batch in loader], expected)
                         self.assertIs(loader._prefetch_thread, worker)
                         module.Event.return_value.record.assert_called_with(module.current_stream.return_value)
@@ -418,7 +416,7 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
                     release.set()
                 reset.result(timeout=5)
             self.assertIsNone(loader._future)
-            self.assertEqual(loader.state_dict()["epoch"], 1)
+            self.assertEqual(loader.state_dict()["_index_sampler_state"]["epoch"], 1)
             self.assertEqual([_ids(batch) for batch in loader], [list(range(i, i + 2)) for i in range(0, 44, 2)])
             self.assertIs(loader._prefetch_thread, worker)
 
@@ -443,7 +441,7 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
             module.current_stream.return_value.wait_event.assert_not_called()
             loader.wait_for_prefetch()
             event.synchronize.assert_called_once_with()
-            self.assertEqual(loader.state_dict()["step"], 0)
+            self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 0)
         self.assertEqual(module.Stream.return_value.synchronize.call_count, 1)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
@@ -461,7 +459,7 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
             with self.assertRaises(RuntimeError) as caught:
                 next(loader)
             self.assertIs(caught.exception, error)
-            self.assertEqual(loader.state_dict()["step"], 0)
+            self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_initial_sampler_offset_requires_optimizer_boundary(self) -> None:
@@ -519,15 +517,15 @@ class TestOptimizerStepPrefetch(unittest.TestCase):
                     invalid = copy.deepcopy(state)
                     owner = "metadata_reader" if metadata_mode else "dataset_reader"
                     if field == "step":
-                        invalid["step"] += 1
+                        invalid["step"] = 1
                     elif field == "remaining":
                         invalid["optimizer_step_remaining"] = 2
                     elif field == "plans":
                         invalid["window_plans"] = (None,)
                     elif field == "window":
-                        invalid[owner]["window"] = {"rounds": 3, "delivered_rounds": 1}
+                        invalid[owner] = {"window": {"rounds": 3, "delivered_rounds": 1}}
                     else:
-                        invalid[owner]["sampler"]["consumed_samples"] += 2
+                        invalid["_index_sampler_state"]["consumed_samples"] += 2
                     with self.subTest(field=field), _native_loader(
                             dataset, sampler=_sampler(total_samples=18, global_batch_size=6), **options,
                     ) as resumed, self.assertRaisesRegex(ValueError, "complete optimizer step"):

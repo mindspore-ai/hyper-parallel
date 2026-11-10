@@ -120,7 +120,9 @@ def _run_case(
                 f"Training stream read unfinished input: actual={actual_input}, expected={expected_input}"
             )
             boundary = (micro + 1) // accumulation * accumulation
-            assert loader.state_dict()["step"] == boundary, f"Incomplete step committed at micro={micro}"
+            assert loader.state_dict()["_index_sampler_state"]["consumed_samples"] == 2 * boundary, (
+                f"Incomplete step committed at micro={micro}"
+            )
             if micro == 0:
                 loader.wait_for_prefetch()
                 ready_batches = loader._future.result().batches

@@ -421,6 +421,88 @@ the loader cannot observe that update, and partially accumulated gradients are
 not saved. Legacy complete-step checkpoints remain readable; partial-step
 checkpoints and initial sampler cursors inside an optimizer step are rejected.
 
+Native `FixedBatchDataLoader` and balanced loading can restore each other's
+checkpoints when toggling `dataloader.load_balance`. Keep the dataset, sampling
+policy and seed unchanged, and save at a complete optimizer-step boundary.
+GBS may change at restoration: the absolute sample cursor is retained and the
+next optimizer step uses the target GBS. The shared cursor also supports DP-size
+changes for `single` sampling and `cyclic`
+sampling with `data_sharding=False`. The target configuration must still satisfy
+`GBS % (micro_batch_size * DP) == 0`. Per-rank shuffled buckets
+(`data_sharding=True`) cannot be repartitioned this way. Restoration validates
+the saved source DP before recording the target DP in subsequent checkpoints.
+Dataset tails follow the target sampler's native `drop_last` policy starting
+at the restored cursor, so every DP rank still receives complete micro-batches.
+
+For example, after consuming 30 samples with GBS 10, restoring with GBS 8 consumes
+the next eight occurrences and saves cursor 38. An optional
+`optimizer_step_offset` in `_index_sampler_state` records the shifted boundary:
+it is 6 in this example, so `(38 - 6) % 8 == 0`. The next save at cursor 46 is also
+a complete step. Both loaders use this same sampler field; zero offsets are
+omitted, and legacy checkpoints default to zero. Epoch changes reset the offset.
+Validation checks the **source** GBS and offset, not divisibility by the new GBS.
+Changing GBS or DP rebuilds the fixed loader's iterator from its delivered cursor
+instead of replaying worker snapshots with the old batching geometry. With
+unchanged geometry, native worker snapshots remain available, including their
+internal micro-batch positions before the delivered boundary.
+
+The loader does not recompute the Trainer's historical `global_step` or scheduler
+state. Configure the remaining training budget and learning-rate policy for the
+new GBS; source-sample continuity does not imply identical optimization results.
+Both loaders use the existing top-level `_index_sampler_state` field for
+`consumed_samples`, `epoch`, `global_batch_size` and `dp_world_size`. Balanced
+loading exports only these existing native loader fields:
+
+```python
+{
+    "_index_sampler_state": {
+        "consumed_samples": 4,
+        "epoch": 2,
+        "global_batch_size": 4,
+        "dp_world_size": 1,
+    },
+    "_iterator_finished": False,
+    "dataset_state": {"dataset_size": 24, "seed": 1234},
+}
+```
+
+`dataset_state` contains payload-reader compatibility checks, or `None` on ranks
+without a payload reader. It is separate from the user's Dataset state in an
+ordinary torchdata checkpoint; restoring an ordinary checkpoint does not
+interpret the user's fields as these checks. New balanced checkpoints contain no
+Reader trees or separate `global_rank`, `epoch`, `step`, or `stopped` fields.
+The loader derives its micro-batch position from the committed sample count,
+rebuilds Reader ownership from the current mesh and configuration, and restores
+all Reader epochs from the sampler. Model peers without a Reader derive the
+same cursor from the initial position and completed rounds.
+
+Single-process fixed loading returns its original state unchanged. With workers, the top-level
+cursor includes deliveries since the last snapshot; torchdata's nested snapshot
+is retained unchanged for same-mode restoration. Balanced loading does not
+fabricate worker snapshots. A fixed loader receiving only the shared cursor
+rebuilds its iterator from that cursor.
+
+The Trainer uses the loader's optional `state_dict_for_load()` method when
+building the checkpoint load template. This no-argument method returns a fresh
+mapping with `None` placeholders for sampler and iterator fields, plus legacy
+Reader aliases needed only during loading. Missing progress cannot silently become
+the new loader's initial zero cursor. New checkpoints are still saved through
+`state_dict()` and contain no loading placeholders or duplicated sampler state.
+Custom embedded-DCP callers should use `state_dict_for_load()` for the loader
+subtree of their load template, then pass the loaded mapping to `load_state_dict()`.
+DCP remains independent of the loader's state format and Reader implementation.
+
+Legacy single-process fixed checkpoints and balanced Reader checkpoints also
+retain a usable sampler cursor, including nonzero initial positions. Old worker
+snapshots without a portable cursor are rejected for cross-mode restoration.
+Legacy nested Reader sampler states remain readable and are saved in the new
+top-level form after restoration; an existing top-level cursor takes precedence.
+Legacy model peers without Reader state can resume in the same mode; until an
+epoch reset gives them a known initial cursor, they retain their legacy progress
+fields instead of exporting an inferred absolute cursor. Switching modes preserves source-sample
+progress, not arbitrary Dataset/worker RNG state or identical per-step losses.
+Same-mode fixed loading continues to use torchdata's own restoration rules.
+
 ### Window-aware greedy placement and bounded refinement
 
 Ordinary LPT can fragment remaining capacity and fall back to the original
@@ -530,8 +612,10 @@ Current boundaries of the native-sampler path:
 - Save and restore through `loader.state_dict()` / `load_state_dict()`, not
   through the original sampler: its live cursor may include a prefetched window.
   Native cursor snapshots count Dataset-output occurrences, never
-  tokens or fragments, and can restore at a synchronized forward/backward boundary with
-  unchanged DP topology, global batch size, and sampler policy.
+  tokens or fragments, and can restore at a complete optimizer-step boundary with
+  an unchanged sampler policy. GBS may change; DP size may change for sequential
+  or globally shuffled sampling as described above; checkpoint-file redistribution
+  and arbitrary worker RNG migration are outside this cursor contract.
 - Whole-record loading preserves pre-collation Dataset fields. Repacking must
   preserve each independent sequence's tokens, shifted labels, attention and
   position semantics. Neither mode promises bitwise training results. Worker

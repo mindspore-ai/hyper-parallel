@@ -748,6 +748,10 @@ class CheckpointerCallback(Callback):
             if self._restore_train_state
             else None
         )
+        if extra_state_skeleton is not None and self._restore_dataloader_state:
+            loader_template = getattr(self.trainer.train_dataloader, "state_dict_for_load", None)
+            if callable(loader_template):
+                extra_state_skeleton["train_dataloader"] = loader_template()
 
         self.checkpointer.load(
             restore_path,

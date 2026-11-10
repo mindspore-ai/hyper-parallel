@@ -242,7 +242,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
             with self.assertRaises(RuntimeError) as caught:
                 next(loader)
             self.assertIs(caught.exception, failure)
-            self.assertEqual(loader.state_dict()["step"], 0)
+            self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_configurable_depth_bounds_allocations_and_preserves_order(self) -> None:
@@ -265,7 +265,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
                         batch = next(loader)
                         loader.wait_for_prefetch()
                         self.assertEqual(len(accelerator.copies), min(depth + 1, 9))
-                        self.assertEqual(loader.state_dict()["step"], 0)
+                        self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 0)
                         outputs = [_ids(batch.host)]
                         del batch
                         while (batch := next(loader, None)) is not None:
@@ -276,7 +276,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
                         self.assertEqual(accelerator.peak_batches, min(depth + 1, 9))
                         self.assertEqual(len(accelerator.live_batches), 0)
                         self.assertEqual(accelerator.broadcasts, 10)
-                        self.assertEqual(loader.state_dict()["step"], 9)
+                        self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 18)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_depth_validation_and_cpu_behavior(self) -> None:
@@ -366,7 +366,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
                     loader.wait_for_prefetch()
                     self.assertEqual(dataset.reads, list(range(12)))
                     self.assertEqual(accelerator.copies, [[0, 1], [2, 3]])
-                    self.assertEqual(loader.state_dict()["step"], 0)
+                    self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 0)
                     self.assertEqual(_ids(batch.host), [0, 1])
                     self.assertFalse(hasattr(loader, "_batch_thread"))
                     self.assertTrue(all(thread is current_thread() for thread in accelerator.copy_threads))
@@ -381,7 +381,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
                     self.assertEqual(outputs, [list(range(i, i + 2)) for i in range(0, 18, 2)])
                     self.assertEqual(accelerator.peak_batches, 2)
                     self.assertEqual(len(accelerator.live_batches), 0)
-                    self.assertEqual(loader.state_dict()["step"], 9)
+                    self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 18)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_retired_training_event_blocks_third_allocation(self) -> None:
@@ -400,7 +400,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
                 self.assertFalse(accelerator.retire_started.is_set())
                 self.assertEqual(_ids(batch.host), [2, 3])
                 self.assertEqual(len(accelerator.copies), 2)
-                self.assertEqual(loader.state_dict()["step"], 0)
+                self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 0)
                 accelerator.retire_allowed.set()
                 loader.wait_for_prefetch()
                 self.assertEqual(len(accelerator.copies), 3)
@@ -428,7 +428,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
                     self.assertEqual(_ids(batch.host), expected)
                     del batch
                 self.assertFalse(dataset.release.is_set())
-                self.assertEqual(loader.state_dict()["step"], 3)
+                self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 6)
             finally:
                 dataset.release.set()
 
@@ -463,7 +463,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
                 with self.assertRaises(RuntimeError) as caught:
                     next(loader)
             self.assertIs(caught.exception, failure)
-            self.assertEqual(loader.state_dict()["step"], 0)
+            self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 0)
             copies = list(accelerator.copies)
             loader.prefetch()
             loader.wait_for_prefetch()
@@ -495,7 +495,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
                     batch = next(loader)
                     del batch
                 state = loader.state_dict()
-                self.assertEqual(state["step"], 5)
+                self.assertEqual(state["_index_sampler_state"]["consumed_samples"], 10)
                 expected = []
                 while (batch := next(loader, None)) is not None:
                     expected.append(_ids(batch.host))
@@ -541,7 +541,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
             worker = loader._prefetch_thread
             loader.set_epoch(1)
             self.assertEqual(len(accelerator.live_batches), 0)
-            self.assertEqual(loader.state_dict()["epoch"], 1)
+            self.assertEqual(loader.state_dict()["_index_sampler_state"]["epoch"], 1)
             batch = next(loader)
             self.assertEqual(_ids(batch.host), [0, 1])
             del batch

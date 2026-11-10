@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import copy
 import operator
 import os
 import random
@@ -30,6 +31,85 @@ IndexMapping = Union[Mapping[int, int], Sequence[int]]
 SamplerType = Literal["single", "cyclic"]
 
 logger = get_dataset_logger(__name__)
+
+
+def sampler_state_for_load(state_dict: Mapping[str, Any]) -> dict[str, Any]:
+    """Build a loader-owned checkpoint template without inventing missing progress.
+
+    Args:
+        state_dict: Fresh fixed or balanced loader state.
+
+    Returns:
+        Loading-only placeholders for the shared cursor and legacy Reader paths.
+    """
+    state = copy.deepcopy(dict(state_dict))
+    balanced = "_num_yielded" not in state and "_snapshot" not in state
+    if not balanced and get_sampler_checkpoint_state(state) is None:
+        return state
+    cursor = dict.fromkeys(("consumed_samples", "epoch", "global_batch_size", "dp_world_size", "optimizer_step_offset"))
+    state["_index_sampler_state"] = dict(cursor)
+    state["_iterator_finished"] = None
+    # Missing torchdata fields must not make a cursor-only checkpoint look like
+    # the target's freshly initialized worker snapshot.
+    state["_num_yielded"] = None
+    snapshot = state.setdefault("_snapshot", {}).setdefault("_main_snapshot", {})
+    snapshot["_num_workers"] = None
+    if isinstance(snapshot.get("_index_sampler_state"), dict):
+        snapshot["_index_sampler_state"]["optimizer_step_offset"] = None
+    state["global_rank"] = None
+    payload = dict.fromkeys(("dataset_size", "seed"))
+    for key in ("dataset_reader", "metadata_reader", "sidecar_reader"):
+        state[key] = {"sampler": dict(cursor), "sample_loader": dict(payload)}
+    if balanced:
+        state.update(epoch=0, step=0, stopped=False, direct_sample_loader=dict(payload))
+        state["dataset_state"] = dict(payload)
+    return state
+
+
+def has_torchdata_state(state_dict: Mapping[str, Any]) -> bool:
+    """Return whether a loaded checkpoint contains real torchdata iterator state."""
+    snapshot = state_dict.get("_snapshot")
+    return state_dict.get("_num_yielded") is not None or (
+        isinstance(snapshot, Mapping)
+        and snapshot.get("_main_snapshot", {}).get("_num_workers") is not None
+    )
+
+
+def get_sampler_checkpoint_state(state_dict: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """Read the shared native cursor, accepting legacy Reader-only checkpoints.
+
+    Args:
+        state_dict: Saved loader state or a template filled by checkpoint loading.
+
+    Returns:
+        Saved sampler state, or None when no cursor was loaded.
+    """
+    candidates = [state_dict.get("_index_sampler_state")]
+    for key in ("dataset_reader", "metadata_reader", "sidecar_reader"):
+        reader = state_dict.get(key)
+        if isinstance(reader, Mapping):
+            candidates.append(reader.get("sampler"))
+    return next((state for state in candidates
+                 if isinstance(state, Mapping) and state.get("consumed_samples") is not None), None)
+
+
+def sampler_optimizer_step_progress(state: Mapping[str, Any]) -> int:
+    """Return samples accumulated since the saved optimizer-step boundary.
+
+    Args:
+        state: Native sampler cursor; old checkpoints use an offset of zero.
+
+    Returns:
+        Zero at a complete optimizer step, otherwise the partial sample count.
+    """
+    consumed, batch_size = state["consumed_samples"], state["global_batch_size"]
+    offset = state.get("optimizer_step_offset")
+    offset = 0 if offset is None else offset
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in (consumed, batch_size, offset)):
+        raise ValueError("Sampler cursor, global_batch_size and optimizer_step_offset must be integers")
+    if not 0 <= offset <= consumed or offset >= batch_size:
+        raise ValueError("Sampler optimizer_step_offset must be within the cursor and global_batch_size")
+    return (consumed - offset) % batch_size
 
 
 def _validate_positive_integer(value: int, name: str) -> None:
@@ -80,6 +160,7 @@ class _DatasetBatchSampler:
             raise ValueError("global_batch_size must be divisible by micro_batch_size * dp_world_size")
 
         self.global_batch_size = global_batch_size
+        self._optimizer_step_offset = 0
         self.epoch = 0
         self._resume_at_source_batch = False
 
@@ -139,6 +220,8 @@ class _DatasetBatchSampler:
             "global_batch_size": self.global_batch_size,
             "dp_world_size": self.dp_world_size,
         }
+        if self._optimizer_step_offset:
+            sampler_state["optimizer_step_offset"] = self._optimizer_step_offset
         return sampler_state
 
     def enable_source_batch_resume(self) -> None:
@@ -156,25 +239,19 @@ class _DatasetBatchSampler:
         """
         consumed_samples = state_dict["consumed_samples"]
         self._validate_consumed_samples(consumed_samples, self.total_samples)
-        if state_dict["global_batch_size"] != self.global_batch_size:
-            if self._resume_at_source_batch:
-                raise ValueError("Online dataloader resume requires an unchanged global_batch_size")
+        progress = sampler_optimizer_step_progress(state_dict)
+        repartition = (state_dict["global_batch_size"] != self.global_batch_size
+                       or state_dict["dp_world_size"] != self.dp_world_size)
+        if progress and (repartition or not self._resume_at_source_batch):
+            raise ValueError("Sampler restoration requires a complete global optimizer batch")
+        offset = consumed_samples % self.global_batch_size if repartition else (
+            state_dict.get("optimizer_step_offset") or 0
+        )
+        if (self._resume_at_source_batch and consumed_samples != self.total_samples
+                and (consumed_samples - offset) % self.global_micro_batch_size):
+            raise ValueError("Online source sampler state must align to a distributed micro-batch")
 
-            raise ValueError("elastic DP resume requires an unchanged global_batch_size")
-
-        if self._resume_at_source_batch:
-            if state_dict["dp_world_size"] != self.dp_world_size:
-                raise ValueError("Online dataloader resume does not support DP world-size changes")
-
-            if (
-                    consumed_samples != self.total_samples
-                    and consumed_samples % self.global_micro_batch_size != 0
-            ):
-                raise ValueError("Online source sampler state must align to a distributed micro-batch")
-
-        elif consumed_samples % self.global_batch_size != 0:
-            raise ValueError("sampler state must align to a global optimizer batch")
-
+        self._optimizer_step_offset = offset
         self.consumed_samples = consumed_samples
         self.epoch = state_dict["epoch"]
 
@@ -192,6 +269,7 @@ class _DatasetBatchSampler:
 
         if epoch != self.epoch:
             self.consumed_samples = 0
+            self._optimizer_step_offset = 0
             self.epoch = epoch
 
 
@@ -208,7 +286,7 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
         self.seed = seed
 
     def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
-        """Restore a fixed-GBS cursor, repartitioning only global shuffle order."""
+        """Restore a global cursor, repartitioning only global shuffle order."""
         if self.data_sharding and state_dict["dp_world_size"] != self.dp_world_size:
             raise ValueError("elastic DP resume requires data_sharding=False")
 
@@ -223,7 +301,7 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
     def __iter__(self) -> Iterator[list[int]]:
         """Build the current epoch permutation and DP slices."""
         active_samples = self._active_samples()
-        if self.consumed_samples % self.global_micro_batch_size != 0:
+        if (self.consumed_samples - self._optimizer_step_offset) % self.global_micro_batch_size != 0:
             raise ValueError("cyclic consumed_samples must align to a distributed micro-batch")
 
         logger.debug(
@@ -259,7 +337,8 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
 
     def _active_samples(self) -> int:
         """Return the number of samples fitting complete global micro-batches."""
-        active_samples = self.total_samples - self.total_samples % self.global_micro_batch_size
+        remaining = self.total_samples - self.consumed_samples
+        active_samples = self.total_samples - remaining % self.global_micro_batch_size
         if active_samples <= 0:
             raise ValueError("cyclic Dataset must contain one complete global micro-batch")
 

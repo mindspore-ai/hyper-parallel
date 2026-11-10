@@ -274,7 +274,7 @@ class TestSequenceRepacking(unittest.TestCase):
             torch.testing.assert_close(batch["input_ids"], record["input_ids"].repeat(2, 1))
             torch.testing.assert_close(batch["labels"], record["labels"].repeat(2, 1))
             self.assertEqual(batch["cu_seq_lens"].tolist(), [0, 4, 12, 16, 24])
-            self.assertEqual(loader.state_dict()["dataset_reader"]["sampler"]["consumed_samples"], 2)
+            self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 2)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_repacking_preserves_masked_attention_loss_and_gradients(self) -> None:
@@ -321,7 +321,7 @@ class TestSequenceRepacking(unittest.TestCase):
             first = next(loader)
             loader.wait_for_prefetch()
             state = copy.deepcopy(loader.state_dict())
-            self.assertEqual(state["dataset_reader"]["sampler"]["consumed_samples"], 1)
+            self.assertEqual(state["_index_sampler_state"]["consumed_samples"], 1)
             self.assertEqual(first["cu_seq_lens"].tolist(), [0, 4, 12])
             torch.testing.assert_close(first["input_ids"][0], records[0]["input_ids"])
             torch.testing.assert_close(first["labels"][0], records[0]["labels"])

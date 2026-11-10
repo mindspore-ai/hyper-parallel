@@ -128,7 +128,7 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                         for _ in range(2):
                             loader.prefetch()
                     loader.wait_for_prefetch()
-                    self.assertEqual(loader.state_dict()["step"], 1)
+                    self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 1)
                     self.assertEqual(next(loader)[0][0]["id"], 2)
                     self.assertIs(worker, loader._prefetch_thread)
                     self.assertEqual(len(list(loader)), 1)
@@ -173,7 +173,7 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                         self.assertTrue(started.wait(5))
                         for _ in range(2):
                             loader.prefetch()
-                        self.assertEqual(loader.state_dict()["step"], 1)
+                        self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 1)
                         self.assertFalse(release.is_set())
                         release.set()
                         self.assertEqual(next(loader)[0][0]["id"], 2)
@@ -204,7 +204,7 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                 with self.assertRaises(ValueError) as caught:
                     next(loader)
             self.assertIs(caught.exception, failure)
-            self.assertEqual(loader.state_dict()["step"], 1)
+            self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 1)
 
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
@@ -284,7 +284,7 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                         self.assertEqual(len(copies), 2)
                         self.assertTrue(all(thread == current_thread().name for _, _, thread in copies))
                         state = loader.state_dict()
-                        self.assertEqual(state["step"], 1)
+                        self.assertEqual(state["_index_sampler_state"]["consumed_samples"], 2)
                         self.assertEqual(len(copies), 2)
                         self.assertEqual(next(loader)["data"], (2, 3))
 
@@ -577,7 +577,7 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                 self.assertEqual(sorted(sample["id"] for row in batch for sample in row),
                                  [position * 2, position * 2 + 1])
                 loader.wait_for_prefetch()
-                self.assertEqual(loader.state_dict()["dataset_reader"]["sampler"]["consumed_samples"], position + 1)
+                self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], position + 1)
                 self.assertEqual(prepare.call_count, position + 2)
         self.assertFalse(hasattr(loader, "_step_sample_selector"))
 
@@ -619,7 +619,7 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         next(loader)
         thread = loader._prefetch_thread
         loader.wait_for_prefetch()
-        self.assertEqual(loader.state_dict()["dataset_reader"]["sampler"]["consumed_samples"], 1)
+        self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 1)
         batch = next(loader)
         self.assertEqual(sorted(sample["id"] for row in batch for sample in row), [2, 3])
         self.assertIs(loader._prefetch_thread, thread)

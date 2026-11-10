@@ -30,6 +30,9 @@ from typing import Any, Union
 
 import torch  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.data.parallel.batch_sampler import (
+    get_sampler_checkpoint_state, has_torchdata_state, sampler_optimizer_step_progress, sampler_state_for_load,
+)
 from hyper_parallel.distributed_data.balance_logging import format_balance_stats, logger as balance_logger
 from hyper_parallel.distributed_data.data_constructor import PackingDataConstructor
 from hyper_parallel.distributed_data.batch_sampler import BatchSamplerReader, _ReaderPlanInput
@@ -140,6 +143,7 @@ class DistributedDataLoader(Iterator[Any]):
             model_transport: ModelParallelTransport,
             device_prefetch: DeviceStepPrefetcher | None = None,
             initial_epoch: int = 0,
+            initial_consumed_samples: int = 0,
             broadcast_plan: bool = True,
             log_balance: bool = False,
             accumulation_steps: int = 1,
@@ -171,6 +175,7 @@ class DistributedDataLoader(Iterator[Any]):
         self._device_prefetch = device_prefetch
         self._epoch = initial_epoch
         self._step = 0
+        self._initial_consumed_samples: int | None = initial_consumed_samples
         self._stopped = False
         self._pending_local_keys: set[SampleKey] = set()
         self._window_plans: deque[DistributedPackingPlan] = deque()
@@ -517,21 +522,55 @@ class DistributedDataLoader(Iterator[Any]):
         Save training checkpoints only after the corresponding optimizer update.
         An incomplete step leaves this cursor at that step's beginning.
         """
-        return copy.deepcopy(self._delivered_state)
+        state = self._delivered_state
+        if "_index_sampler_state" not in state:
+            # Old non-Reader checkpoints may lack an absolute source cursor.
+            # Keep their same-mode progress without inventing a portable position.
+            return copy.deepcopy(dict(state, global_rank=self._topology.global_rank))
+        return copy.deepcopy({
+            "_index_sampler_state": state["_index_sampler_state"],
+            "_iterator_finished": state["stopped"],
+            "dataset_state": state["dataset_state"],
+        })
+
+    def state_dict_for_load(self) -> dict[str, Any]:
+        """Request the shared cursor and legacy Reader aliases without defaulting to zero."""
+        return sampler_state_for_load(self.state_dict())
 
     def _snapshot_state(self) -> dict[str, Any]:
         """Capture producer progress at an optimizer-step boundary."""
+        reader = self._planning_reader()
+        reader_state = reader.state_dict() if reader is not None else None
+        payload_state = (
+            self._direct_sample_loader.state_dict() if self._direct_sample_loader is not None
+            else (reader_state or {}).get("sample_loader")
+        )
         state = {
-            "global_rank": self._topology.global_rank,
             "epoch": self._epoch,
             "step": self._step,
             "stopped": self._stopped,
-            "dataset_reader": self._dataset_reader.state_dict() if self._dataset_reader is not None else None,
-            "metadata_reader": self._metadata_reader.state_dict() if self._metadata_reader is not None else None,
-            "direct_sample_loader": (
-                self._direct_sample_loader.state_dict() if self._direct_sample_loader is not None else None
+            "dataset_state": (
+                {key: payload_state[key] for key in ("dataset_size", "seed")} if payload_state is not None else None
             ),
         }
+        if reader_state is not None:
+            state["_index_sampler_state"] = reader_state["sampler"]
+        elif self._initial_consumed_samples is not None:
+            # Model peers have no Reader; advance their cursor from the known initial position.
+            state["_index_sampler_state"] = {
+                "consumed_samples": self._initial_consumed_samples + (
+                    self._step * self._planner.local_batch_size * self._topology.data_parallel_size
+                ),
+                "epoch": self._epoch,
+                "global_batch_size": (
+                    self._accumulation_steps * self._planner.local_batch_size * self._topology.data_parallel_size
+                ),
+                "dp_world_size": self._topology.data_parallel_size,
+            }
+            sampler = state["_index_sampler_state"]
+            offset = self._initial_consumed_samples % sampler["global_batch_size"]
+            if offset:
+                sampler["optimizer_step_offset"] = offset
         try:
             copied_state = copy.deepcopy(state)
         except Exception as exc:
@@ -539,34 +578,66 @@ class DistributedDataLoader(Iterator[Any]):
         return copied_state
 
     def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
-        """Restore a fixed-topology rank-local checkpoint.
+        """Restore a shared native cursor or a legacy rank-local checkpoint.
 
         Args:
-            state_dict: State produced on this same global rank.
+            state_dict: A complete-step cursor; legacy rank-local state must match this rank.
         """
         self._validate_restore_boundary()
         try:
             state = copy.deepcopy(dict(state_dict))
         except Exception as exc:
             raise ValueError(f"Distributed DataLoader state is not copyable: {exc}") from exc
-        if state.get("global_rank") != self._topology.global_rank:
+        if state.get("global_rank") not in (None, self._topology.global_rank):
             raise ValueError(
                 f"Distributed DataLoader checkpoint global_rank={state.get('global_rank')!r} "
                 f"does not match {self._topology.global_rank!r}."
             )
         epoch, step, stopped = self._validate_checkpoint_values(state)
-        reader_state, metadata_reader_state, direct_sample_state = self._validate_component_states(state, epoch)
+        sampler = get_sampler_checkpoint_state(state)
+        # Legacy step counters use the source accumulation size. The sampler
+        # cursor validates complete steps independently of the target GBS/DP.
+        layout_changed = sampler is not None and (
+            sampler["global_batch_size"] != (
+                self._accumulation_steps * self._planner.local_batch_size * self._topology.data_parallel_size
+            ) or sampler["dp_world_size"] != self._topology.data_parallel_size
+        )
         if (
-                step % self._accumulation_steps or state.get("window_plans")
+                (not layout_changed and step % self._accumulation_steps) or state.get("window_plans")
                 or state.get("optimizer_step_remaining", self._accumulation_steps) != self._accumulation_steps
+                or any(isinstance(state.get(key), Mapping) and "window" in state[key]
+                       for key in ("dataset_reader", "metadata_reader", "sidecar_reader"))
         ):
             raise ValueError("Distributed DataLoader checkpoint must align to a complete optimizer step.")
-        self._restore_component_states(reader_state, metadata_reader_state, direct_sample_state)
+        if sampler is not None:
+            epoch, step = self._progress_from_sampler(sampler)
+        elif self._dataset_reader is not None or self._metadata_reader is not None or state.get("global_rank") is None:
+            raise ValueError("Distributed DataLoader checkpoint has no native sampler cursor.")
+        self._restore_component_states(state, sampler, epoch)
         self._epoch = epoch
         self._step = step
         self._stopped = stopped
+        self._initial_consumed_samples = None
+        if sampler is not None:
+            self._initial_consumed_samples = sampler["consumed_samples"] - (
+                step * self._planner.local_batch_size * self._topology.data_parallel_size
+            )
 
         self._delivered_state = self._snapshot_state()
+
+    def _progress_from_sampler(self, sampler: Mapping[str, Any]) -> tuple[int, int]:
+        """Validate the shared cursor and derive the epoch and micro-batch position."""
+        global_micro_batch_size = self._planner.local_batch_size * self._topology.data_parallel_size
+        global_batch_size = self._accumulation_steps * global_micro_batch_size
+        consumed, epoch = sampler["consumed_samples"], sampler["epoch"]
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in (consumed, epoch)):
+            raise ValueError("Sampler consumed_samples and epoch must be integers")
+        if sampler_optimizer_step_progress(sampler) or epoch < 0:
+            raise ValueError("Sampler cursor must align to a complete optimizer step")
+        if sampler["global_batch_size"] != global_batch_size:
+            return epoch, 0
+        offset = sampler.get("optimizer_step_offset") or 0
+        return epoch, (consumed - offset) // global_micro_batch_size
 
     def _validate_restore_boundary(self) -> None:
         if self._last_ready_event is not None or self._prefetch_thread is not None or self._step != 0:
@@ -575,9 +646,11 @@ class DistributedDataLoader(Iterator[Any]):
     @staticmethod
     def _validate_checkpoint_values(state: Mapping[str, Any]) -> tuple[int, int, bool]:
         """Validate and return the saved epoch, micro-batch index and stopped flag."""
-        epoch = state.get("epoch")
-        step = state.get("step")
-        stopped = state.get("stopped")
+        epoch = state.get("epoch", 0)
+        step = state.get("step", 0)
+        stopped = state.get("_iterator_finished")
+        if stopped is None:
+            stopped = state.get("stopped", False)
         if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch < 0:
             raise ValueError("Distributed DataLoader checkpoint epoch must be non-negative.")
         if not isinstance(step, int) or isinstance(step, bool) or step < 0:
@@ -586,51 +659,44 @@ class DistributedDataLoader(Iterator[Any]):
             raise ValueError("Distributed DataLoader checkpoint stopped must be boolean.")
         return epoch, step, stopped
 
-    def _validate_component_states(
-            self,
-            state: Mapping[str, Any],
-            epoch: int,
-    ) -> tuple[Mapping[str, Any] | None, Mapping[str, Any] | None, Mapping[str, Any] | None]:
-        """Check restored Reader ownership and agreement with the loader epoch."""
-        reader_state = state.get("dataset_reader")
-        # Accept the old field name when restoring checkpoints written before the rename.
-        metadata_reader_state = state.get("metadata_reader", state.get("sidecar_reader"))
-        direct_sample_state = state.get("direct_sample_loader")
-        if (self._dataset_reader is None) != (reader_state is None):
-            raise ValueError("Distributed DataLoader checkpoint Dataset Reader ownership changed.")
-        if (self._metadata_reader is None) != (metadata_reader_state is None):
-            raise ValueError("Distributed DataLoader checkpoint metadata ownership changed.")
-        if (self._direct_sample_loader is None) != (direct_sample_state is None):
-            raise ValueError("Distributed DataLoader checkpoint direct-reader ownership changed.")
-        for component_name, component_state in (
-                ("Dataset Reader", reader_state),
-                ("metadata reader", metadata_reader_state),
-                ("direct reader", direct_sample_state),
-        ):
-            if component_state is None:
-                continue
-            if not isinstance(component_state, Mapping):
-                raise ValueError(f"Distributed DataLoader checkpoint {component_name} state must be a mapping.")
-            if component_state.get("epoch") != epoch:
-                raise ValueError(
-                    f"Distributed DataLoader checkpoint {component_name} epoch "
-                    f"{component_state.get('epoch')!r} does not match loader epoch {epoch}."
-                )
-        return reader_state, metadata_reader_state, direct_sample_state
-
     def _restore_component_states(
             self,
-            reader_state: Mapping[str, Any] | None,
-            metadata_reader_state: Mapping[str, Any] | None,
-            direct_sample_state: Mapping[str, Any] | None,
+            state: Mapping[str, Any],
+            sampler_state: Mapping[str, Any] | None,
+            epoch: int,
     ) -> None:
-        """Restore each owned Reader from its validated checkpoint state."""
-        if self._dataset_reader is not None:
-            self._dataset_reader.load_state_dict(reader_state)
-        if self._metadata_reader is not None:
-            self._metadata_reader.load_state_dict(metadata_reader_state)
+        """Rebuild current Readers from shared progress and optional Dataset checks."""
+        reader = self._planning_reader()
+        reader_state = reader.state_dict() if reader is not None else None
+        payload_state = (
+            self._direct_sample_loader.state_dict() if self._direct_sample_loader is not None
+            else (reader_state or {}).get("sample_loader")
+        )
+        # Native torchdata Dataset state belongs to the user's Dataset. Only
+        # cursor-only and legacy balanced states carry our Dataset compatibility fields.
+        if not has_torchdata_state(state):
+            candidates = [state.get("dataset_state"), state.get("direct_sample_loader")]
+            for key in ("dataset_reader", "metadata_reader", "sidecar_reader"):
+                legacy_reader = state.get(key)
+                if isinstance(legacy_reader, Mapping):
+                    candidates.append(legacy_reader.get("sample_loader"))
+            for saved in candidates:
+                if saved is None or payload_state is None:
+                    continue
+                if not isinstance(saved, Mapping):
+                    raise ValueError("Dataset checkpoint state must be a mapping.")
+                for key in ("dataset_size", "seed"):
+                    if saved.get(key) is not None and saved[key] != payload_state[key]:
+                        raise ValueError(f"Dataset checkpoint {key} does not match the current loader.")
+        if payload_state is not None:
+            payload_state["epoch"] = epoch
+        if reader is not None:
+            reader_state.update(epoch=epoch, sampler=sampler_state)
+            if reader_state["sample_loader"] is not None:
+                reader_state["sample_loader"] = payload_state
+            reader.load_state_dict(reader_state)
         if self._direct_sample_loader is not None:
-            self._direct_sample_loader.load_state_dict(direct_sample_state)
+            self._direct_sample_loader.load_state_dict(payload_state)
 
     def set_epoch(self, epoch: int) -> None:
         """Reset the native source while retaining the Host thread and device streams.
@@ -657,6 +723,7 @@ class DistributedDataLoader(Iterator[Any]):
             self._direct_sample_loader.set_epoch(epoch)
         self._epoch = epoch
         self._step = 0
+        self._initial_consumed_samples = 0
         self._stopped = False
         self._pending_local_keys.clear()
         self._window_plans.clear()
