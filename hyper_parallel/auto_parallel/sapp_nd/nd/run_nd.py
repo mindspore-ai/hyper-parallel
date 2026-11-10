@@ -160,8 +160,8 @@ def _apply_cli_overrides(search_cfg, cli_args):
     if cli_args.devices is not None:
         cards_per_node = search_cfg.cluster_spec.get("cards_per_node")
         if not cards_per_node:
-            # The device type knows its node size (A3: 16); defaulting to 8
-            # silently halves an A3 node and invalidates every candidate.
+            # Use the device topology when the search config omits its node size.
+            # A3 has 2 dies/chip and 4 chips/node, hence 8 ranks/node.
             device = Hard.device_map.get(cli_args.device_type)
             cards_per_node = device.intra_node_num() if device else 8
             search_cfg.cluster_spec["cards_per_node"] = cards_per_node

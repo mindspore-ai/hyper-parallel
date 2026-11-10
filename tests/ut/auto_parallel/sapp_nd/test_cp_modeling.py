@@ -2819,11 +2819,11 @@ class TestCPBandwidthAndRecommendation(unittest.TestCase):
     def test_bandwidth_a3_intra_and_cross(self):
         """
         Feature: CP Bandwidth Lookup
-        Description: Device_A3.level_bandwidth=[200, 25, 10]; intra→200, cross→25
-        Expectation: A3 intra-node=200.0, cross-node=25.0
+        Description: Device_A3.level_bandwidth=[196, 196]; intra→196, cross→196
+        Expectation: A3 intra-node=196.0, cross-node=196.0
         """
-        self.assertEqual(get_cp_bandwidth("intra-node", "A3"), 200.0)
-        self.assertEqual(get_cp_bandwidth("cross-node", "A3"), 25.0)
+        self.assertEqual(get_cp_bandwidth("intra-node", "A3"), 196.0)
+        self.assertEqual(get_cp_bandwidth("cross-node", "A3"), 196.0)
 
     @arg_mark(
         plat_marks=["cpu_linux"], level_mark="level0",

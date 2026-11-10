@@ -1,0 +1,42 @@
+# Validation-set catalog of the bring-up asset benchmark.
+#
+# Each row is a model *category* drawn from the layout taxonomy that six
+# completed bring-up runs established; `checks` maps every deterministic
+# check to the verdict a CORRECT checker must reach on that category
+# (a tied release is supposed to trip the tied-save detector — `fail`
+# here means "the detector fires", and that is the passing outcome).
+#
+# The list is fixed by the operator; changing it requires a ledger entry.
+# The held-out TEST set is deliberately not in the repository — agents
+# being benchmarked must not be able to read it. Model directories are
+# site-local and never named here: see catalog/paths.example.yaml.
+#
+# All checks run from config.json + the safetensors index alone; weight
+# shards are not required, so a catalog entry costs kilobytes, not a
+# download.
+schema: bringup-bench/catalog/v1
+models:
+  - id: smollm2-360m
+    family: smollm2
+    category: tied-embeddings
+    checks:
+      released_layout: pass
+      tied_save: fail      # aliased storage must be detected
+  - id: glm4-9b
+    family: glm4
+    category: standard-dense
+    checks:
+      released_layout: pass
+      tied_save: pass
+  - id: dsv2-lite
+    family: deepseek-v2
+    category: per-expert-moe
+    checks:
+      released_layout: pass
+      tied_save: pass
+  - id: qwen25-32b
+    family: qwen2
+    category: dense-large
+    checks:
+      released_layout: pass
+      tied_save: pass

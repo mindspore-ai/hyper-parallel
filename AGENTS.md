@@ -143,12 +143,29 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **code-review** | Full distributed review (stream/memory/DTensor/collectives) | `/code-review` |
 | **dist-op-analysis** | Operator analysis → plan (human confirm) | called before dist-op-dev |
 | **dist-op-dev** | Implement + test from confirmed plan | `/dist-op-dev` |
-| **gate-doctor** | GitCode PR gate diagnose → autofix to green | 门禁 / autofix / `/retest` |
+| **gate-doctor** | GitCode PR gate diagnose → autofix to green | CI gate diagnosis / automatic fixes / `/retest` |
 | **parallel-strategy-analyzer** | DP/FSDP/TP/PP/EP/CP strategy + cost estimate | `/parallel-strategy-analyzer` |
 | **sapp-parallel-strategy** | Layout for a job on Ascend dies, every valid layout priced by ND: the pick, the next two, why | `$sapp-parallel-strategy` (Codex), `/sapp-parallel-strategy` |
 | **add-unit-test** | How-to for `tests/ut` (procedures) | when adding UT / coverage |
 | **hf-model-integration** | Integrate HF-native or HF-component custom models through model-owned adapters | model onboarding / functional bring-up |
 | **hf-model-precision-validation** | Validate module parity and distributed numerical self-consistency | model numerical acceptance / diagnosis |
+| **feature-doc** | Author / update a feature or model design document from a fixed template (new or update path) | feature documentation / design review |
+| **perf-playbook** | Bottleneck-to-optimization mapping, fused-operator and CANN/PTA references, profile-guided optimization, utilization conventions, acceptance targets, optimizer-overhead accounting, and report template | performance optimization / MFU targets / tuning reports |
+| **precision** | Precision dump compare (msprobe) + nan/spike/diverge triage + report | numerical comparison / parity checks / error localization |
+| **profiling** | Collect Ascend traces and report step breakdown (compute / exposed communication / device idle, optimizer share) with cross-file consistency checks | profiling / performance breakdown / bottleneck analysis |
+| **debug** | Single-node debug SOP: scope, inputs, flow, fix/verify constraints, stop conditions | single-node debugging / bug localization |
+| **cluster-debug** | Read-only multi-rank failure diagnosis: per-rank logs/plog/py-spy, first real error, fault classes | cluster debugging / HCCL timeouts / distributed hangs |
+| **knowledge-retrieval** | Answer from the repo: search rules/docs/code/tests, rank by authority, cite the source | repository lookup / documentation / error interpretation |
+| **memory-analysis** | NPU snapshot analysis: allocation categories, call-site attribution, fragmentation, growth, and peak-coverage checks | device-memory analysis / allocation breakdown / OOM diagnosis |
+| **formal-verification** | Official FM-Agent integration for training contracts and reproduced correctness bugs | `/formal-verify`, specification-driven bug hunting |
+| **autoresearch** | Bounded autonomous-experiment loop: benchmark + gate + keep/discard/crash + bookkeeping | bounded experiments / kernel optimization / autoresearch |
+| **bringup-benchmark** | Bring-up evaluation suite: deterministic checks across a model catalog, isolated-session scoring, minimum-detectable-difference calibration, three-valued A/B decisions, and self-checks | asset A/B evaluation / bring-up benchmark |
+| **moe-profiler** | Extract MoE training facts only: expert load distribution, All-to-All overhead, routing integrity, gradient flow | MoE profiling / expert-load distribution / All-to-All overhead |
+| **moe-optimizer** | Closed-loop MoE optimization: diagnose imbalance/overhead, validate, refine EP/TP/capacity/routing | MoE load balancing / training performance |
+| **routing-validator** | MoE routing correctness only: token conservation, expert-major order, gradient reach | MoE routing correctness / gradient-flow validation |
+| **strategy-validator** | Benchmark candidate parallel strategies, extract metrics, pick the best measured one | `/validate-strategy`, benchmark PSA candidates |
+| **strategy-optimizer** | PSA analysis + measured validation in an adaptive loop to settle a parallel strategy | `/optimize-strategy`, parallel-strategy selection for new models or hardware |
+| **mfu-riser** | Bounded MFU experiment loop using profiling evidence, Ascend fusion knowledge, and correctness/performance gates | iterative MFU improvement / fused-kernel search |
 
 ### Commands
 
@@ -159,6 +176,9 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | `/create-pr` | `autogit pr` → upstream |
 | `/code-review` | `code-review` skill (+ mandatory `code-style.md`) |
 | `/gen-commit-msg` | Message only, no commit |
+| `/formal-verify` | `formal-verification` skill → official FM-Agent + training context |
+| `/validate-strategy` | `strategy-validator` skill → benchmark candidate strategies, report measured metrics |
+| `/optimize-strategy` | `strategy-optimizer` skill → PSA analysis + validation loop |
 
 ### Agents
 
@@ -177,6 +197,8 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **llamafactory-hp** | LlamaFactory integration surface (activation details → `activation-dev`) |
 | **parallel-strategy-analyzer** | Thin proxy → `skills/parallel-strategy-analyzer` |
 | **sapp-parallel-strategy** | Thin proxy → `skills/sapp-parallel-strategy` (layout advice priced by ND) |
+| **formal-verifier** | Thin proxy → `skills/formal-verification` (training correctness + bug reproduction) |
+| **moe-load-balancer** | Consumes `moe-profiler` output; recommends capacity_factor / expert_bias / top_k fixes |
 
 ### Rules (auto-applied by path)
 
@@ -191,3 +213,4 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **hyper-rl** | `hyper_parallel/rl/**`, RL docs and agent rules — sole RL entry; also consult it for migrated RL tests |
 | **nd-cost-model** | `hyper_parallel/auto_parallel/**`, `tests/ut/auto_parallel/**`: golden before and after, measured figures |
 | **distributed-op-dev** / **distributed-op-testing** / **test-assertion-style** | Op impl & tests (scoped) |
+| **precision-acceptance** | `docs/design/**`, precision tools & skill — 1000-step numerical acceptance criteria |

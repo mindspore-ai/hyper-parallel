@@ -38,6 +38,7 @@ over strategies with prohibitive communication.
 - [references/known-hardware.md](references/known-hardware.md)
 - [references/memory-estimation.md](references/memory-estimation.md)
 - [references/strategy-rules.md](references/strategy-rules.md)
+- [references/moe-strategy-rules.md](references/moe-strategy-rules.md) — **MoE-specific** (load when `is_moe=True`)
 
 ## Output (short)
 

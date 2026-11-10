@@ -1,0 +1,40 @@
+{
+  "framework": "HyperParallel",
+  "domain_knowledge": [
+    "references/training-invariants.md",
+    "references/hyperparallel.md",
+    "../../rules/project-overview.md",
+    "../../rules/distributed.md"
+  ],
+  "bug_validator": "references/bug-validator.md",
+  "profiles": {
+    "dtensor": {
+      "submodules": ["hyper_parallel/core/dtensor", "hyper_parallel/core/utils"],
+      "focus": "Mesh, placements, shard geometry, redistribution and autograd contracts"
+    },
+    "fsdp": {
+      "submodules": ["hyper_parallel/core/fully_shard"],
+      "focus": "Parameter storage state, hook ordering, gradient scaling and HSDP communication"
+    },
+    "pipeline": {
+      "submodules": ["hyper_parallel/core/pipeline_parallel"],
+      "focus": "Microbatch schedules, matched P2P, backward ordering and buffer lifetimes"
+    },
+    "activation": {
+      "submodules": ["hyper_parallel/core/activation_memory"],
+      "focus": "Swap ordering, storage ownership, recomputation and RNG equivalence"
+    },
+    "tensor-parallel": {
+      "submodules": ["hyper_parallel/core/tensor_parallel", "hyper_parallel/core/shard"],
+      "focus": "Operator sharding, layout propagation and forward/backward equivalence"
+    },
+    "checkpoint": {
+      "submodules": ["hyper_parallel/core/distributed_checkpoint"],
+      "focus": "Shard coverage, metadata consistency and checkpoint save/load round trips"
+    },
+    "training-core": {
+      "submodules": ["hyper_parallel/core", "hyper_parallel/collectives"],
+      "focus": "Full distributed training core; start with a narrower profile to inspect cost"
+    }
+  }
+}

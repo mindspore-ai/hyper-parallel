@@ -45,6 +45,7 @@ from hyper_parallel.models.build_options import CompileConfig
 from hyper_parallel.models.materialization import (
     MaterializationContext,
     rebuild_materialized_state,
+    register_rebuildable_buffer,
 )
 from hyper_parallel.distributed.activation_checkpoint import (
     _apply_activation_checkpointing,
@@ -291,6 +292,31 @@ def _plan_and_apply_sharding(
     return model, source_shard_info
 
 
+def _tied_parameter_groups(model: nn.Module) -> list[list[str]]:
+    """Group parameter names that are one shared object (tied weights)."""
+    groups: dict[int, list[str]] = {}
+    for name, param in model.named_parameters(remove_duplicate=False):
+        groups.setdefault(id(param), []).append(name)
+    return [names for names in groups.values() if len(names) > 1]
+
+
+def _restore_parameter_aliases(model: nn.Module, groups: list[list[str]]) -> None:
+    """Re-point tied aliases at one object after per-module materialization.
+
+    ``to_empty`` materializes every module's view of a shared parameter
+    separately, so a pair that entered as one object leaves as two storages
+    and deferred loading later fails its alias validation. Restore exactly
+    the groups that were tied going in — no mapping policy, only the
+    object identity observed before materialization.
+    """
+    for names in groups:
+        source = model.get_parameter(names[0])
+        for alias in names[1:]:
+            parent, _, attr = alias.rpartition(".")
+            module = model.get_submodule(parent) if parent else model
+            module._parameters[attr] = source  # pylint: disable=protected-access
+
+
 def _move_model_to_device(
     model: nn.Module,
     is_meta_device: bool,
@@ -304,7 +330,9 @@ def _move_model_to_device(
         logger.info("Model moved to %s", device)
         return model
 
+    tied_groups = _tied_parameter_groups(model)
     model.to_empty(device=device)
+    _restore_parameter_aliases(model, tied_groups)
     return model
 
 
@@ -616,6 +644,36 @@ def _maybe_apply_module_replacements(
     )
 
 
+def _declare_constructed_buffers(model: nn.Module) -> None:
+    """Keep constructed non-persistent buffers across storage materialization.
+
+    ``to_empty`` gives every buffer fresh uninitialized storage, and a
+    checkpoint never carries non-persistent buffers, so without a recipe a
+    native module's derived state (RoPE ``inv_freq``, ``position_ids``) reached
+    a pretrained run as whatever memory the allocator returned. Meta
+    construction keeps buffers real, so the constructed value is the recipe.
+    Buffers an adapter already declared keep that adapter's recipe; one built
+    on meta has no value to keep and is reported instead.
+    """
+    unrecoverable = []
+    for module_fqn, module in model.named_modules():
+        declared = module.__dict__.get("_hp_rebuildable_buffer_specs", {})
+        for name in sorted(module._non_persistent_buffers_set):  # pylint: disable=protected-access
+            buffer = module._buffers.get(name)  # pylint: disable=protected-access
+            if buffer is None or name in declared:
+                continue
+            if buffer.is_meta:
+                unrecoverable.append(f"{module_fqn}.{name}" if module_fqn else name)
+                continue
+            register_rebuildable_buffer(module, name)
+    if unrecoverable:
+        logger.warning(
+            "%d non-persistent buffers were constructed on meta and have no rebuild recipe; "
+            "they stay uninitialized after materialization unless the model restores them: %s",
+            len(unrecoverable), ", ".join(unrecoverable[:10]),
+        )
+
+
 def _tie_model_weights_before_parallelism(model: nn.Module) -> None:
     """Establish declared parameter aliases before distributed wrapping.
 
@@ -716,6 +774,7 @@ def apply_model_infrastructure(
     )
     if is_meta_device:
         _apply_materialization_adapter(model)
+        _declare_constructed_buffers(model)
 
     _tie_model_weights_before_parallelism(model)
 

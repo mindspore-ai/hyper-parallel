@@ -33,6 +33,7 @@ __all__ = [
     "DebugConfig",
     "FSDP2Config",
     "MemoryConfig",
+    "MfuConfig",
     "MixedPrecisionConfig",
     "ModelIntegrationConfig",
     "OptimizerConfig",
@@ -86,6 +87,7 @@ from hyper_parallel.trainer.config.trainer import TrainerConfig, save_configs
 from hyper_parallel.trainer.config.training import (
     DebugConfig,
     MemoryConfig,
+    MfuConfig,
     ModelIntegrationConfig,
     ProfilingAnalysisConfig,
     ProfilingConfig,
