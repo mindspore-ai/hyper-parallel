@@ -30,7 +30,6 @@ from typing import Dict, Optional
 from hyper_parallel.trainer.config import MemoryConfig, ProfilingConfig
 from hyper_parallel.trainer.config.parser import parse_training_args
 from hyper_parallel.trainer.config.resolver import ConfigResolutionError
-from tests.common.mark_utils import arg_mark
 
 
 def _sample_model(  # pylint: disable=unused-argument
@@ -112,7 +111,6 @@ class TestConfigOverrides(unittest.TestCase):
         with self.assertRaises(ConfigResolutionError):
             self._parse("--profiler.enabled=true")
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_profiler_warmup_yaml_and_override(self) -> None:
         """Resolve warmup steps from YAML and CLI overrides.
 
@@ -131,7 +129,6 @@ class TestConfigOverrides(unittest.TestCase):
             config = parse_training_args([str(yaml_path), "--profiler.warmup_steps=2"])
             self.assertEqual(config.profiler.warmup_steps, 2)
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_removed_profiler_options_are_rejected(self) -> None:
         """Reject removed options through every user configuration entry.
 

@@ -22,7 +22,6 @@ import unittest
 from dataclasses import fields
 from pathlib import Path
 
-
 import torch
 
 from hyper_parallel.models.build_options import (
@@ -32,7 +31,6 @@ from hyper_parallel.models.build_options import (
     ModelBuildOptions,
     normalize_build_options,
 )
-from tests.common.mark_utils import arg_mark
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -45,8 +43,6 @@ def _field_snapshot(cls):
 class TestBuildOptionsFields(unittest.TestCase):
     """Field/default snapshots for the options owned by build_options."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_compile_config_fields(self):
         """CompileConfig field order and defaults stay unchanged after the move."""
         self.assertEqual(
@@ -67,8 +63,6 @@ class TestBuildOptionsFields(unittest.TestCase):
             ],
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_fsdp2_config_fields(self):
         """FSDP2Config field order and defaults stay unchanged after the move."""
         self.assertEqual(
@@ -90,8 +84,6 @@ class TestBuildOptionsFields(unittest.TestCase):
         self.assertIsNone(config.comm_fusion_zero_copy)
         self.assertTrue(config.reshard_after_forward)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_fsdp2_config_validation(self):
         """FSDP2Config rejects non-positive topology sizes and negative depths."""
         with self.assertRaisesRegex(ValueError, "dp_shard_size"):
@@ -103,8 +95,6 @@ class TestBuildOptionsFields(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "forward_prefetch_depth"):
             FSDP2Config(forward_prefetch_depth=-1)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_compile_config_validation(self):
         """CompileConfig rejects non-bool flags and contradictory options."""
         with self.assertRaisesRegex(TypeError, "compile.enabled must be a bool"):
@@ -118,8 +108,6 @@ class TestBuildOptionsFields(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dynamo_cache_size_limit"):
             CompileConfig(dynamo_cache_size_limit=0)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_use_joint_graph_selects_graph_compiler(self):
         """Graph-mode trainer selection is driven by compile.enabled + flag."""
         config = CompileConfig(
@@ -138,8 +126,6 @@ class TestBuildOptionsFields(unittest.TestCase):
             ).selects_graph_compiler()
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_model_build_options_fields(self):
         """ModelBuildOptions covers device/dtype/activation/compile/validate/low-precision."""
         self.assertEqual(
@@ -164,22 +150,16 @@ class TestBuildOptionsFields(unittest.TestCase):
 class TestModelBuildOptionsNormalization(unittest.TestCase):
     """Dict normalization at the AutoModels boundary (never a Trainer DTO)."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_normalize_none_gives_defaults(self):
         """None normalizes to a default ModelBuildOptions."""
         options = normalize_build_options(None)
         self.assertIsInstance(options, ModelBuildOptions)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_normalize_passthrough_identity(self):
         """An existing ModelBuildOptions is returned unchanged (identity)."""
         options = ModelBuildOptions(activation_swap="attention")
         self.assertIs(normalize_build_options(options), options)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_from_dict_normalizes_nested(self):
         """Nested compile/low_precision dicts and device strings are normalized."""
         options = normalize_build_options({
@@ -203,8 +183,6 @@ class TestModelBuildOptionsNormalization(unittest.TestCase):
         self.assertIsInstance(options.low_precision, LowPrecisionConfig)
         self.assertTrue(options.low_precision.enabled)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_invalid_values_fail_fast(self):
         """Bad enum values and types are rejected with clear messages."""
         with self.assertRaisesRegex(ValueError, "model_init_dtype"):
@@ -222,8 +200,6 @@ class TestModelBuildOptionsNormalization(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "build options"):
             normalize_build_options(42)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_from_dict_rejects_unknown_keys(self):
         """Unknown keys fail fast instead of being silently swallowed."""
         with self.assertRaises(TypeError):
@@ -233,8 +209,6 @@ class TestModelBuildOptionsNormalization(unittest.TestCase):
 class TestTrainerReexportIdentity(unittest.TestCase):
     """Trainer re-exports the very same class objects (no duplicate types)."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_trainer_config_reexport_identity(self):
         """trainer.config CompileConfig/FSDP2Config ARE the build_options classes."""
         from hyper_parallel.trainer import config as trainer_config
@@ -242,8 +216,6 @@ class TestTrainerReexportIdentity(unittest.TestCase):
         self.assertIs(trainer_config.CompileConfig, CompileConfig)
         self.assertIs(trainer_config.FSDP2Config, FSDP2Config)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_package_root_reexport_identity(self):
         """The auto_models package root re-exports the same class objects."""
         import hyper_parallel.models as auto_models
@@ -256,8 +228,6 @@ class TestTrainerReexportIdentity(unittest.TestCase):
 class TestBuildOptionsBoundary(unittest.TestCase):
     """build_options/api must not import the Trainer layer (subprocess probe)."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_build_options_imports_no_trainer(self):
         """Importing build_options/api pulls in no trainer module."""
         probe = (
@@ -286,8 +256,6 @@ class TestBuildOptionsBoundary(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("BUILD_OPTIONS_CLEAN", result.stdout)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_api_skeleton_surface(self):
         """api.py exposes the stable skeleton and delegates from_pretrained lazily."""
         from hyper_parallel.models import api

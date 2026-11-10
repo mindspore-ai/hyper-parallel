@@ -23,7 +23,6 @@ from unittest.mock import Mock, patch
 
 from hyper_parallel.distributed_data import DistributedDatasetConfig
 from hyper_parallel.distributed_data.packed_balancing import _LocalBalancingIterator, _LocalBatch
-from tests.common.mark_utils import arg_mark
 
 
 class _SynchronousCollectiveLoader:
@@ -85,7 +84,6 @@ class _SynchronousCollectiveLoader:
 class TestPackedBalancingPrefetch(unittest.TestCase):
     """Verify staged prefetch preserves data, ownership, source exhaustion and failures."""
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_collectives_use_caller_with_or_without_explicit_hooks(self) -> None:
         """Feature: Caller-owned accelerator collectives.
         Description: Consume steps with and without explicit prefetch hooks.
@@ -123,7 +121,6 @@ class TestPackedBalancingPrefetch(unittest.TestCase):
                             "hp-local-balance-prefetch"
                         self.assertEqual(thread, expected)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_metadata_completion_does_not_block_launch(self) -> None:
         """Feature: Background local-step metadata completion.
         Description: Delay the gathered result after the foreground launches metadata exchange.
@@ -154,7 +151,6 @@ class TestPackedBalancingPrefetch(unittest.TestCase):
             release.set()
             iterator.close()
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_payload_completion_does_not_block_launch(self) -> None:
         """Feature: Background payload completion.
         Description: Delay collation after the foreground launches the next step.
@@ -185,7 +181,6 @@ class TestPackedBalancingPrefetch(unittest.TestCase):
             release.set()
             iterator.close()
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_background_errors_reach_consumer(self) -> None:
         """Feature: Prefetch error propagation.
         Description: Fail planning and collation in the background worker.
@@ -202,7 +197,6 @@ class TestPackedBalancingPrefetch(unittest.TestCase):
                 finally:
                     iterator.close()
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_source_exhaustion_and_early_close(self) -> None:
         """Feature: Prefetch lifecycle.
         Description: Exercise source EOF and close during each pipeline phase.

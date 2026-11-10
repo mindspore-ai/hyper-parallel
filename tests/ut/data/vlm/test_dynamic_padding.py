@@ -37,7 +37,6 @@ os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 import torch
 
-from tests.common.mark_utils import arg_mark
 
 # The VLM facade pulls transformers.AutoProcessor, whose lazy import chain ends
 # in torchvision; some CI pythons lack liblzma and cannot import it.
@@ -81,8 +80,6 @@ class TestPadTarget(unittest.TestCase):
 
         return KimiVLMChatTransform(processor=object(), max_seq_len=8192, **kwargs)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_without_granularity_pads_to_max_seq_len(self):
         """
         Feature: fixed-length padding contract.
@@ -94,8 +91,6 @@ class TestPadTarget(unittest.TestCase):
         self.assertEqual(transform._pad_target(3000), 8192)
         self.assertEqual(transform._pad_target(8192), 8192)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_granularity_rounds_up_and_caps_at_max_seq_len(self):
         """
         Feature: granularity-based padding.
@@ -111,8 +106,6 @@ class TestPadTarget(unittest.TestCase):
         self.assertEqual(transform._pad_target(8189), 8192)
         self.assertEqual(transform._pad_target(9000), 8192)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_truncate_and_pad_pads_all_sequence_fields(self):
         """
         Feature: sequence-aligned padding of one sample.
@@ -130,8 +123,6 @@ class TestPadTarget(unittest.TestCase):
         self.assertTrue((out["labels"][300:] == IGNORE_INDEX).all())
         self.assertEqual(int(out["pixel_values"].shape[0]), 3)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_rejects_bad_granularity(self):
         """
         Feature: padding-option validation.

@@ -29,7 +29,6 @@ from hyper_parallel.components.functional.aux_loss import (
 )
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import shared_compressed_indexer_kl_loss
 from hyper_parallel.models.deepseek_v41.adapter.aux_loss import sequence_load_balancing_loss, update_modality_bias
-from tests.common.mark_utils import arg_mark
 
 
 def reference_loss(
@@ -54,8 +53,6 @@ def reference_loss(
 class TestSequenceLoadBalancingLoss(unittest.TestCase):
     """Validate logical sample boundaries, masking and distributed gradients."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_sequence_imbalance_cannot_cancel_across_samples(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.
@@ -72,8 +69,6 @@ class TestSequenceLoadBalancingLoss(unittest.TestCase):
         torch.testing.assert_close(torch.autograd.grad(pooled, scores, retain_graph=True)[0], torch.zeros_like(scores))
         self.assertGreater(torch.autograd.grad(actual, scores)[0].abs().sum().item(), 0)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_unequal_packed_samples_mask_and_mixed_precision(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.
@@ -96,8 +91,6 @@ class TestSequenceLoadBalancingLoss(unittest.TestCase):
                 torch.testing.assert_close(grad[3], torch.zeros_like(grad[3]))
                 self.assertEqual(actual.dtype, torch.float32)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_empty_and_fully_masked_samples(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.
@@ -121,8 +114,6 @@ class TestSequenceLoadBalancingLoss(unittest.TestCase):
             reduce_counts.assert_called_once()
             reduce_probs.assert_called_once()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_partitioned_statistics_match_full_sequences(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.
@@ -159,8 +150,6 @@ class TestSequenceLoadBalancingLoss(unittest.TestCase):
             torch.testing.assert_close(actual, expected)
             torch.testing.assert_close(local.grad / 2, full.grad[local_slice])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_invalid_metadata(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.
@@ -178,8 +167,6 @@ class TestSequenceLoadBalancingLoss(unittest.TestCase):
 class TestModalityBias(unittest.TestCase):
     """Preserve exact load comparisons when updating expert biases."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_adjacent_large_counts_preserve_update_direction(self) -> None:
         """
         Feature: Auxiliary-loss-free expert-bias updates.
@@ -193,8 +180,6 @@ class TestModalityBias(unittest.TestCase):
                 update_modality_bias(bias, counts, 0.001)
                 torch.testing.assert_close(bias, torch.tensor([-0.001, 0.001], dtype=dtype))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_fractional_mean_preserves_update_direction(self) -> None:
         """
         Feature: Auxiliary-loss-free expert-bias updates.
@@ -210,8 +195,6 @@ class TestModalityBias(unittest.TestCase):
 class TestV41IndexerAuxLossScaling(unittest.TestCase):
     """Verify the V4.1 Indexer consumer of the shared injection mechanism."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_compressed_indexer_kl_obeys_scale_and_detaches_teacher(self) -> None:
         """
         Feature: Auxiliary-loss training lifecycle.

@@ -24,7 +24,6 @@ import torch
 
 from hyper_parallel.models.deepseek_v41.adapter.engram.host_state import DeepseekV41HostState
 from hyper_parallel.models.deepseek_v41.adapter.engram.host_table import HostEngramTable
-from tests.common.mark_utils import arg_mark
 
 base_module = importlib.import_module("hyper_parallel.trainer.base")
 
@@ -32,7 +31,6 @@ base_module = importlib.import_module("hyper_parallel.trainer.base")
 class TestBaseTrainerCleanup(unittest.TestCase):
     """Tests for cleaning up the data iterator on exceptional exits."""
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_dataset_ownership_follows_loader_balance_block(self) -> None:
         """Feature: Dataset rank participation.
         Description: Build Dataset splits with absent, empty and populated loader balance settings.
@@ -73,12 +71,6 @@ class TestBaseTrainerCleanup(unittest.TestCase):
         trainer.train_steps = 1
         return trainer
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="allcards",
-        essential_mark="essential",
-    )
     def test_train_stops_data_iterator_when_training_or_callback_raises(self) -> None:
         """
         Feature: BaseTrainer lifecycle cleanup.
@@ -103,12 +95,6 @@ class TestBaseTrainerCleanup(unittest.TestCase):
 class TestHcclDeterminismSetup(unittest.TestCase):
     """Check that HCCL receives its reproducibility flag before group creation."""
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="allcards",
-        essential_mark="essential",
-    )
     def test_hccl_flag_is_set_before_distributed_initialization(self) -> None:
         """The communicator must read the flag when it is initialized."""
         trainer = MagicMock()
@@ -152,12 +138,6 @@ class TestBaseTrainerExternalState(unittest.TestCase):
         )
         return trainer
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="allcards",
-        essential_mark="essential",
-    )
     def test_build_optimizer_delegates_to_external_state(self) -> None:
         """
         Feature: Host external-state optimizer wiring.
@@ -196,12 +176,6 @@ class TestBaseTrainerExternalState(unittest.TestCase):
                         swap_wrap.assert_not_called()
                     self.assertEqual(wrapped, expected)
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="allcards",
-        essential_mark="essential",
-    )
     def test_clip_grad_norm_uses_external_norm(self) -> None:
         """
         Feature: Host external-state gradient clipping.
@@ -221,7 +195,6 @@ class TestBaseTrainerExternalState(unittest.TestCase):
         trainer.model_integration.after_clip.assert_called_once_with(0.5)
 
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_main_grad_normalizes_before_clipping(self) -> None:
         """Feature: FP32 main-gradient normalization.
 
@@ -254,7 +227,6 @@ class TestBaseTrainerExternalState(unittest.TestCase):
                 torch.testing.assert_close(ordinary_grad, torch.tensor([[99.]], dtype=torch.bfloat16))
 
 
-    @arg_mark(["cpu_linux", "cpu_macos"], "level0", "onecard", "essential")
     def test_host_gradients_normalize_before_joint_clipping(self) -> None:
         """Feature: External gradient normalization.
 

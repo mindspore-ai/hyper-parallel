@@ -18,7 +18,6 @@ import os
 import weakref
 from types import SimpleNamespace
 
-
 import unittest
 from unittest.mock import patch, MagicMock, Mock
 
@@ -32,7 +31,6 @@ from hyper_parallel.core.dtensor.placement_types import Partial, Replicate, Shar
 from hyper_parallel.core.dtensor.tensor_redistribution import TensorRedistribution
 from hyper_parallel.core.fully_shard.state_dict_utils import get_model_state_dict
 from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
-from tests.common.mark_utils import arg_mark
 
 
 def _setup_mock_dm_platform(platform_mock):
@@ -183,7 +181,6 @@ class TestUnevenShardRedistribution(unittest.TestCase):
         self.assertEqual(source.placements, original_placements)
         self.assertEqual(tuple(dtensor.shape), tuple(full.shape))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_full_tensor_ceil_shards_and_empty_ranks(self):
         """Feature: Uneven full tensor reconstruction.
 
@@ -195,7 +192,6 @@ class TestUnevenShardRedistribution(unittest.TestCase):
                 self._check_full_tensor(torch.arange(size, dtype=torch.float32), (count,),
                                         (Shard(0, uneven_shard=True),), tuple(range(count)))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_full_tensor_mixed_mesh_and_nonzero_dimension(self):
         """Feature: Mixed-mesh uneven export.
 
@@ -213,7 +209,6 @@ class TestUnevenShardRedistribution(unittest.TestCase):
                 self._check_full_tensor(torch.arange(30, dtype=torch.float32).reshape(5, 6),
                                         mesh_shape, placements, (3, 1, 2, 0))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_get_model_state_dict_cpu_offload(self):
         """Feature: Full-state CPU export.
 
@@ -245,7 +240,6 @@ class TestUnevenShardRedistribution(unittest.TestCase):
             state_dist.get_rank.return_value = 1
             self.assertEqual(get_model_state_dict(model, options=options), {})
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_rejects_unsupported_target_and_invalid_local_shape(self):
         """Feature: Uneven redistribution validation.
 
@@ -260,7 +254,6 @@ class TestUnevenShardRedistribution(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "local shape"):
             invalid.full_tensor()
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_export_rejects_partial_nonzero_uneven_axis_and_autograd(self):
         """Feature: Export-only boundary.
 
@@ -282,7 +275,6 @@ class TestUnevenShardRedistribution(unittest.TestCase):
                 tensor.full_tensor()
             gather.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_export_does_not_retain_communication_storage(self):
         """Feature: Communication buffer lifetime.
 

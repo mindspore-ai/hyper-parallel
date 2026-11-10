@@ -32,7 +32,6 @@ from hyper_parallel.distributed_data import (
     pack_indexed_text_samples, split_packed_text_sample,
 )
 from hyper_parallel.distributed_data.planner import DynamicPackingPlanner
-from tests.common.mark_utils import arg_mark
 
 
 _MESH = SimpleNamespace(mesh_shape=(1,), mesh_dim_names=("dp",), rank_list=(0,))
@@ -88,7 +87,6 @@ def _attention_loss(records: list[dict], weights: torch.Tensor) -> torch.Tensor:
 class TestSequenceRepacking(unittest.TestCase):
     """Exercise the real reader, planner, constructors and checkpoint entry points."""
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_config_repacking_applies_padding_cost_and_logging(self) -> None:
         """Feature: Configuration-only text repacking.
         Description: Read padded and short records without supplying packing callbacks or a cost model.
@@ -127,7 +125,6 @@ class TestSequenceRepacking(unittest.TestCase):
                     torch.testing.assert_close(batch["labels"][0, :9], record["labels"][:9])
                     self.assertEqual(batch["labels"][0, -3:].tolist(), [-100] * 3)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_pad_id_alone_preserves_complete_records(self) -> None:
         """Feature: Disabled built-in repacking.
         Description: Set a PAD ID without enabling repacking or logging.
@@ -147,7 +144,6 @@ class TestSequenceRepacking(unittest.TestCase):
         for field, expected in record.items():
             torch.testing.assert_close(batch[0][field], expected, rtol=0, atol=0)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_config_repacking_preserves_custom_cost_and_collator(self) -> None:
         """Feature: Explicit policy precedence with built-in text packing.
         Description: Supply a custom cost model and collator alongside the repacking switch.
@@ -167,7 +163,6 @@ class TestSequenceRepacking(unittest.TestCase):
         self.assertEqual(batch[0]["cu_seq_lens"].tolist(), [0, 4, 12])
         self.assertIn("original=14, candidate=14", logs.output[0])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_config_repacking_rejects_custom_pack_and_external_sources(self) -> None:
         """Feature: Unambiguous repacking contract.
         Description: Combine the switch with custom packing callbacks or unsupported sources.
@@ -193,7 +188,6 @@ class TestSequenceRepacking(unittest.TestCase):
                 [], _MESH, config, metadata_fn=_metadata, pack_fn=pack_indexed_text_samples, device="cpu",
             )
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_trim_only_configured_ignored_tail_padding(self) -> None:
         """Feature: Explicit source PAD trimming.
         Description: Split records containing ignored prompts, internal PAD IDs and trailing PAD.
@@ -227,7 +221,6 @@ class TestSequenceRepacking(unittest.TestCase):
             with self.subTest(pad_token_id=pad_token_id), self.assertRaisesRegex(ValueError, "pad_token_id"):
                 split_packed_text_sample(record, pad_token_id=pad_token_id)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_trim_and_repack_preserve_causal_loss_and_gradients(self) -> None:
         """Feature: Independent PAD sequence boundaries.
         Description: Move ignored trailing PAD into its own sequence in a causal model.
@@ -248,7 +241,6 @@ class TestSequenceRepacking(unittest.TestCase):
         torch.testing.assert_close(balanced_loss, reference_loss, rtol=1e-12, atol=1e-12)
         torch.testing.assert_close(balanced_weights.grad, reference_weights.grad, rtol=1e-12, atol=1e-12)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_repeated_record_indices_keep_distinct_sequence_occurrences(self) -> None:
         """Feature: Repeated record sampling.
         Description: Select the same packed record twice in one native round.
@@ -276,7 +268,6 @@ class TestSequenceRepacking(unittest.TestCase):
             self.assertEqual(batch["cu_seq_lens"].tolist(), [0, 4, 12, 16, 24])
             self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 2)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_repacking_preserves_masked_attention_loss_and_gradients(self) -> None:
         """Feature: Independent sequence repacking.
         Description: Redistribute unequal records and compare a causal attention model's gradients.
@@ -310,7 +301,6 @@ class TestSequenceRepacking(unittest.TestCase):
         torch.testing.assert_close(balanced_loss, reference_loss, rtol=1e-12, atol=1e-12)
         torch.testing.assert_close(balanced_weights.grad, reference_weights.grad, rtol=1e-12, atol=1e-12)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_no_gain_replays_original_grouping_and_committed_cursor(self) -> None:
         """Feature: Native-round checkpoint replay.
         Description: Prefetch repeated records and resume after one delivered batch.
@@ -336,7 +326,6 @@ class TestSequenceRepacking(unittest.TestCase):
             for field in left:
                 torch.testing.assert_close(left[field], right[field], rtol=0, atol=0)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_explicit_boundaries_and_online_mode_are_required(self) -> None:
         """Feature: Repacking input contract.
         Description: Supply invalid boundaries and incompatible callback combinations.
@@ -370,7 +359,6 @@ class TestSequenceRepacking(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "at least one independent sequence"):
                 next(loader)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_saved_arrow_through_trainer_builder_preserves_document_boundaries(self) -> None:
         """Feature: Offline packed Arrow integration.
         Description: Build the native loader and shared text adapter from stored packed records.
@@ -414,7 +402,6 @@ class TestSequenceRepacking(unittest.TestCase):
             self.assertEqual(model["position_ids"].tolist(), [[0, 1, 2, 3, 0, 1, 2, 3, 4, 0, 1, 2]])
             torch.testing.assert_close(loss["shift_labels"][0], record["labels"])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_repack_respects_supplied_and_configured_cost_models(self) -> None:
         """Feature: Explicit cost-model precedence.
         Description: Build repacking loaders with configured and supplied cost models.

@@ -27,7 +27,6 @@ from hyper_parallel.data.indexed.indexed_dataset import build_indexed_dataset
 from hyper_parallel.data.indexed.indexed_lazy_dataset import LazyDatasetProxy
 from hyper_parallel.data.indexed.indexed_pretrain_dataset import GPTDataset, GPTFromMRDataset, MockGPTDataset
 from hyper_parallel.data.tools.io import IndexedDatasetBuilder
-from tests.common.mark_utils import arg_mark
 
 
 class _Tokenizer:
@@ -65,7 +64,6 @@ def _write_records(directory: str, name: str, records: list[list[int]]) -> str:
 class TestIndexedDataset(unittest.TestCase):
     """Preserve native packing, lazy loading and weighted sample counts."""
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_gpt_and_precut_records_with_eager_and_lazy_loading(self) -> None:
         """Feature: Indexed Dataset storage.
         Description: Read real files through both Dataset types and eager/lazy loading.
@@ -109,7 +107,6 @@ class TestIndexedDataset(unittest.TestCase):
                         if lazy:
                             self.assertIsInstance(train._dataset, expected_type)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_weighted_blend_preserves_requested_counts_without_repeating_sources(self) -> None:
         """Feature: Weighted indexed Dataset blending.
         Description: Select a short training plan from two larger corpora.
@@ -139,7 +136,6 @@ class TestIndexedDataset(unittest.TestCase):
                             train.datasets, [1, 1], sum(len(dataset) for dataset in train.datasets) + 1, train.config,
                         )
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_mock_splits_need_no_files(self) -> None:
         """Feature: Mock Dataset splits.
         Description: Build training and validation without indexed files.

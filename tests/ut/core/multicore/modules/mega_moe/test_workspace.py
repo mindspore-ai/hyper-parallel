@@ -35,14 +35,11 @@ from hyper_parallel.core.multicore.modules.mega_moe.workspace import (
     _workspace_allocation_specs,
 )
 from hyper_parallel.core.multicore.scheduler.config import event_workspace_bytes
-from tests.common.mark_utils import arg_mark
 
 
 class TestMegaMoeWorkspaceSizing(unittest.TestCase):
     """Validate SHMEM planning without allocating accelerator memory."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_pending_backward_prevents_close_without_changing_buffers(self) -> None:
         """Feature: Automatic MegaMoe route workspace reuse.
 
@@ -135,8 +132,6 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
             384,
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_explicit_heap_requires_sufficient_aligned_capacity(self) -> None:
         """Feature: explicit heap requires sufficient aligned capacity.
         Description: Configure aligned, undersized, partial-page and zero budgets.
@@ -156,8 +151,6 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
                         manager = _HeapManager(None, reference)
                         manager.reserve(((spec, _workspace_layout(spec, reference.dtype)),), allow_resize=True)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_allocation_covers_dynamic_events_and_ready_tail(self) -> None:
         """Feature: Dynamic event allocation.
         Description: Allocate and reuse event storage through the SHMEM API.
@@ -183,8 +176,6 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         self.assertEqual(workspace.gmm_workspace.numel(), 512)
         self.assertEqual(workspace.swiglu_grad_workspace.numel(), 512)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_reuse_waits_with_event_without_host_synchronize(self) -> None:
         """Feature: Cross-stream workspace reuse.
         Description: Claim and release a workspace with a pending completion event.
@@ -240,8 +231,6 @@ class TestReadyEventWorkspace(unittest.TestCase):
         self.assertEqual(torch.count_nonzero(workspace.forward_event_counters).item(), 0)
         mock_barrier.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_reuse_wait_precedes_claim_without_consuming_lease(self) -> None:
         """Feature: Workspace lease ordering.
         Description: Wait before claiming a previously used workspace.

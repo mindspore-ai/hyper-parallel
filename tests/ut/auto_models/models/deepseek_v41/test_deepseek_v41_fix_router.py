@@ -35,7 +35,6 @@ from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
 )
 from hyper_parallel.trainer.config.parallelism import PlanOverride, entries_to_plan_overrides
 from hyper_parallel.trainer.config.resolver import resolve_component
-from tests.common.mark_utils import arg_mark
 
 
 def _make_module(scoring: str, dtype: torch.dtype, multimodal: bool) -> SimpleNamespace:
@@ -63,8 +62,6 @@ def _make_module(scoring: str, dtype: torch.dtype, multimodal: bool) -> SimpleNa
 class TestDeepseekV41FixedRouter(unittest.TestCase):
     """Check destination balancing, native gate gradients, and local image masks."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_fixed_destinations_keep_native_weights_and_gradients(self) -> None:
         """
         Feature: DSV4.1 framework-balanced router.
@@ -76,8 +73,6 @@ class TestDeepseekV41FixedRouter(unittest.TestCase):
             with self.subTest(scoring=scoring, dtype=dtype, multimodal=multimodal):
                 self._check_forward_backward(scoring, dtype, multimodal, fixed=True)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_disabled_switch_keeps_native_routing(self) -> None:
         """
         Feature: DSV4.1 learned routing compatibility.
@@ -88,8 +83,6 @@ class TestDeepseekV41FixedRouter(unittest.TestCase):
             with self.subTest(multimodal=multimodal):
                 self._check_forward_backward("sqrtsoftplus", torch.float32, multimodal, fixed=False)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_training_signature_keeps_fixed_destinations_and_auxiliary_gradients(self) -> None:
         """
         Feature: Fixed routing through the auxiliary-aware V4.1 forward contract.
@@ -100,8 +93,6 @@ class TestDeepseekV41FixedRouter(unittest.TestCase):
             with self.subTest(dtype=dtype, multimodal=multimodal, fixed=fixed):
                 self._check_forward_backward("sqrtsoftplus", dtype, multimodal, fixed, training_contract=True)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_megamoe_keeps_fixed_destinations_and_auxiliary_gradients(self) -> None:
         """
         Feature: MegaMoe benchmark routing with the real auxiliary-aware gate.
@@ -114,8 +105,6 @@ class TestDeepseekV41FixedRouter(unittest.TestCase):
                     "sqrtsoftplus", dtype, multimodal, fixed, training_contract=True, megamoe=True,
                 )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_megamoe_yaml_override_transports_switch(self) -> None:
         """
         Feature: Typed MegaMoe fixed-router configuration.
@@ -154,8 +143,6 @@ replace:
                 torch.testing.assert_close(module.experts.call_args.args[2], expected_weights)
                 module.experts.configure.assert_called_once_with(ep_mesh.get_group.return_value, 4, 2)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_megamoe_preserves_expert_shared_and_auxiliary_gradients(self) -> None:
         """
         Feature: MegaMoe fixed routing around real model-owned parameters.
@@ -244,8 +231,6 @@ replace:
             output = output + projected * weights[:, slot, None]
         return output.view_as(inputs)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_training_signature_transports_flags_and_partitioned_metadata(self) -> None:
         """
         Feature: Training-aware fixed-router metadata and statistics groups.
@@ -302,8 +287,6 @@ replace:
         self.assertEqual(routed.call_args.kwargs["sequence_partition_groups"], ("cp-group", "tp-group"))
         self.assertEqual(module.gate.expert_bias_update_groups, ("dp-group", "cp-group", "tp-group"))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_yaml_override_transports_both_switches(self) -> None:
         """
         Feature: DSV4.1 typed EP configuration.
@@ -346,8 +329,6 @@ replace:
                     module, states, image_mask, ep_mesh.get_group.return_value, ep_size=4, fix_router=fixed,
                 )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_fixed_router_keeps_tp_local_image_mask(self) -> None:
         """
         Feature: DSV4.1 fixed routing with TP sequence slicing.
@@ -473,8 +454,6 @@ replace:
             destinations = captured["indices"].flatten() // 2
             torch.testing.assert_close(torch.bincount(destinations, minlength=4), torch.full((4,), 5))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_destination_cycles_cover_partial_and_empty_inputs(self) -> None:
         """
         Feature: DSV4.1 fixed routing across expert-parallel layouts.
@@ -505,8 +484,6 @@ replace:
                 counts = torch.bincount(indices.flatten().long() // local_count, minlength=peers)
                 self.assertLessEqual((counts.max() - counts.min()).item(), 1)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_invalid_expert_layout_fails_before_dispatch(self) -> None:
         """
         Feature: DSV4.1 fixed-router expert layout validation.
@@ -521,8 +498,6 @@ replace:
                     module, torch.ones(1, 5, 4),
                 )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_invalid_switch_fails_at_factory_boundary(self) -> None:
         """
         Feature: Strict benchmark flag validation.

@@ -26,7 +26,6 @@ from hyper_parallel.models._transformers.auto_model import (
     HyperAutoModelForCausalLM, HyperAutoModelForImageTextToText,
     HyperAutoModelForSequenceClassification,
 )
-from tests.common.mark_utils import arg_mark
 
 
 _TARGET = "hyper_parallel.models._transformers.auto_model"
@@ -54,8 +53,6 @@ def _make_check_callbacks(test_case, events, model, failed):
 class TestDeferredPretrained(unittest.TestCase):
     """Construct unquantized models from config for both finalized HF loaders."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_from_config_binds_standard_hf_auto_model_parent(self):
         """Feature: remote-code lookup uses the standard AutoModel identity.
 
@@ -73,8 +70,6 @@ class TestDeferredPretrained(unittest.TestCase):
         self.assertIs(result, model)
         parent.assert_called_once_with(config, trust_remote_code=True)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_loader_selects_initial_construction_and_preserves_final_load(self):
         """Feature: automatic deferred HF loading.
 
@@ -103,8 +98,6 @@ class TestDeferredPretrained(unittest.TestCase):
                     self.assertTrue(infrastructure.call_args.kwargs["load_base_model"])
                     self.assertNotIn("init_from_config", initialize.call_args.kwargs)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_from_config_does_not_enable_checkpoint_loading(self):
         """Feature: random initialization remains independent of HF loader selection.
 
@@ -123,8 +116,6 @@ class TestDeferredPretrained(unittest.TestCase):
         self.assertIsNone(initialize.call_args.args[1])
         self.assertFalse(infrastructure.call_args.kwargs["load_base_model"])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_quantized_dcp_fails_before_initial_construction(self):
         """Feature: unsupported quantized DCP initialization.
 
@@ -141,8 +132,6 @@ class TestDeferredPretrained(unittest.TestCase):
                     quantization_config=object())
         initialize.assert_not_called()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_legacy_quantized_construction_retains_transformers_loading(self):
         """Feature: Transformers-owned quantized initialization.
 
@@ -164,8 +153,6 @@ class TestDeferredPretrained(unittest.TestCase):
         self.assertIs(initialize.call_args.kwargs["quantization_config"], quantization)
         self.assertFalse(infrastructure.call_args.kwargs["is_meta_device"])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_real_single_rank_model_loads_exact_weights_without_transformers_preload(self):
         """Feature: finalized single-rank pretrained loading.
 
@@ -192,8 +179,6 @@ class TestDeferredPretrained(unittest.TestCase):
                     for name, expected in source.state_dict().items():
                         torch.testing.assert_close(model.state_dict()[name], expected, rtol=0, atol=0)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_public_pretrained_checks_finalized_model_and_propagates_failure(self):
         """Feature: generic weight checking.
 
@@ -222,8 +207,6 @@ class TestDeferredPretrained(unittest.TestCase):
                             self.assertIs(auto_class.from_pretrained("/weights", **options), model)
                         self.assertEqual(verifier.call_count, int(enabled))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_public_pretrained_rejects_check_without_loading(self):
         """Feature: weight-check preconditions.
 

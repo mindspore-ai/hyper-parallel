@@ -29,7 +29,6 @@ from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41TopKRouter,
     _initialize_v41_owned_module,
 )
-from tests.common.mark_utils import arg_mark
 
 
 def _config(vision: bool, scoring: str = "sqrtsoftplus") -> SimpleNamespace:
@@ -46,8 +45,6 @@ def _replace(router: DeepseekV41TopKRouter) -> DeepseekV41MegaGate:
     )
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
 class TestMegaGateReplacement(unittest.TestCase):
     """Preserve model state and construction semantics across replacement."""
 

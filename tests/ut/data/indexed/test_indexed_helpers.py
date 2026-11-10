@@ -28,7 +28,6 @@ import unittest
 from unittest.mock import Mock, patch
 
 from hyper_parallel.data import indexed
-from tests.common.mark_utils import arg_mark
 
 
 _CPP_MODULE_NAME = "hyper_parallel.data.indexed._indexed_helpers_cpp"
@@ -82,8 +81,6 @@ def _execute_helper_module(importer):
 class TestIndexedPackagePath(unittest.TestCase):
     """Verify source builds expose their staged native helper directory."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_extend_native_path_appends_existing_payload_once(self):
         """Verify source payload discovery does not duplicate package paths.
 
@@ -110,8 +107,6 @@ class TestIndexedPackagePath(unittest.TestCase):
 class TestIndexedHelperCompilation(unittest.TestCase):
     """Verify rank-local source compilation without invoking a compiler."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_rank_zero_builds_and_loads_helper(self):
         """Verify rank zero builds and atomically publishes the native helper.
 
@@ -147,8 +142,6 @@ class TestIndexedHelperCompilation(unittest.TestCase):
         self.assertEqual(importer.calls, 2)
         self.assertIs(getattr(module, "build_sample_index_int32"), getattr(cpp_module, "build_sample_index_int32"))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_nonzero_rank_waits_for_rank_zero_output(self):
         """Verify nonzero ranks wait for the rank-zero helper output.
 
@@ -174,8 +167,6 @@ class TestIndexedHelperCompilation(unittest.TestCase):
         self.assertEqual(importer.calls, 2)
         self.assertIs(getattr(module, "build_sample_index_int64"), getattr(cpp_module, "build_sample_index_int64"))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_nonzero_rank_times_out_waiting_for_helper(self):
         """Verify nonzero-rank waiting has a bounded failure.
 

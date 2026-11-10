@@ -30,7 +30,6 @@ from hyper_parallel.distributed.encoder_parallel.planning import (
     build_segments,
     required_omni_global_alignment,
 )
-from tests.common.mark_utils import arg_mark
 
 
 def _e0_items():
@@ -49,8 +48,6 @@ def _mesh(sequence_parallel=True):
 class TestEncoderPlanning(unittest.TestCase):
     """Check E0's exact image and token ownership without process groups."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_e0_lpt_and_route(self):
         """Feature: E0 work assignment and SP destination planning.
 
@@ -68,8 +65,6 @@ class TestEncoderPlanning(unittest.TestCase):
                          [(rank * 32, (rank + 1) * 32) for rank in range(8)])
         self.assertEqual(build_destinations(items, layouts), {0: (3, 4, 5), 1: (1, 2), 2: (6,)})
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_nosp_fanout_and_exchange_modes(self):
         """Feature: decoder routing without sequence parallelism.
 
@@ -86,8 +81,6 @@ class TestEncoderPlanning(unittest.TestCase):
                                                               sequence_parallel=False)),
                       FeatureExchangeMode.TP_VARIABLE_ALL_GATHER)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_layout_validation_and_coordinates(self):
         """Feature: decoder SP token layout validation.
 
@@ -107,8 +100,6 @@ class TestEncoderPlanning(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "decoder hidden does not match planned CP/SP shard"):
             layout.validate_hidden(torch.zeros(1, 31, 8))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_segments_and_invalid_spans(self):
         """Feature: padded image segments and decoder span validation.
 
@@ -125,8 +116,6 @@ class TestEncoderPlanning(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "image span is outside the decoder domain"):
             build_destinations((EncoderWorkItem(1, 0, 2, 1, 255, 3, 0, 2, {}),), layouts)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_config_rejects_invalid_cp(self):
         """Feature: Encoder-CP configuration validation.
 

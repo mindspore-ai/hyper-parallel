@@ -19,15 +19,12 @@ import unittest
 import torch
 
 from hyper_parallel.core.multicore.modules.mega_mhc.module import MegaMhc
-from tests.common.mark_utils import arg_mark
 from tests.common.multicore.mega_mhc_golden import torch_mega_mhc
 
 
 class TestMegaMhc(unittest.TestCase):
     """Validate shifted mapping semantics independently of NPU kernels."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_torch_golden_uses_previous_mappings(self) -> None:
         """Use previous mappings at the shifted boundary.
 
@@ -81,8 +78,6 @@ class TestMegaMhc(unittest.TestCase):
             rtol=0,
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_torch_golden_preserves_leading_token_dimensions(self) -> None:
         """Preserve arbitrary leading token dimensions.
 
@@ -113,8 +108,6 @@ class TestMegaMhc(unittest.TestCase):
         self.assertEqual(tuple(outputs[3].shape), (*shape, 4, 4))
         self.assertEqual(tuple(outputs[4].shape), (*shape, hidden_size))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_module_rejects_unsupported_static_shapes(self) -> None:
         """Reject shapes outside the native static contract.
 

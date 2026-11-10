@@ -17,11 +17,8 @@
 import pytest
 
 from hyper_parallel.codegen.emit.validation import verify_generated_source_structure
-from tests.common.mark_utils import arg_mark
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_structure_check_accepts_unseen_class_and_strategy_name():
     """No registry entry is needed for a future model or enable flag."""
     source = """
@@ -40,8 +37,6 @@ class FutureModelBlock:
     verify_generated_source_structure({"modeling_future.py": source})
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_structure_check_rejects_duplicate_forward_impl():
     """Duplicate ownership is rejected independently of the class name."""
     source = """
@@ -57,8 +52,6 @@ class PreviouslyUnknownBlock:
         verify_generated_source_structure({"modeling_new.py": source})
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_structure_check_rejects_recursive_forward_impl():
     """A shadowed fallback cannot silently recurse after composition."""
     source = """
@@ -71,8 +64,6 @@ class AnyAttention:
         verify_generated_source_structure({"modeling_new.py": source})
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
-          card_mark="onecard", essential_mark="unessential")
 def test_structure_check_rejects_unused_enable_flag():
     """Every emitted strategy flag must participate in the forward pipeline."""
     source = """

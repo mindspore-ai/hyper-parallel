@@ -23,7 +23,6 @@ from hyper_parallel.distributed_data import (
 )
 from hyper_parallel.distributed_data.cost_model import resolve_cost_model
 from hyper_parallel.distributed_data.planner import DynamicPackingPlanner
-from tests.common.mark_utils import arg_mark
 
 
 def _backbone_config() -> BackboneFlopsConfig:
@@ -38,7 +37,6 @@ def _backbone_config() -> BackboneFlopsConfig:
 class TestCostModel(unittest.TestCase):
     """Verify explicit model configuration, overrides, and backbone estimates."""
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_causal_square_cost_and_relative_gain_exclude_linear_terms(self) -> None:
         """Feature: Normalized causal Attention cost.
         Description: Plan unequal document groups using the square-cost model.
@@ -59,7 +57,6 @@ class TestCostModel(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "causal text"):
             CausalAttentionCostModel()(SampleMetadata(4, features={"P": 2, "D": 2}))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_gain_gate_rejects_document_gain_that_increases_padding_cost(self) -> None:
         """Feature: Padding-aware acceptance gate.
         Description: Propose a layout with lower source cost but higher padded cost.
@@ -84,7 +81,6 @@ class TestCostModel(unittest.TestCase):
         self.assertFalse(planner.last_balance_decision["accepted"])
         self.assertAlmostEqual(planner.last_balance_decision["relative_gain"], -2 / 102)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_padding_is_charged_per_pack_for_multiple_local_packs(self) -> None:
         """Feature: Rank-local multi-pack cost.
         Description: Keep two independently padded packs on each rank.
@@ -104,7 +100,6 @@ class TestCostModel(unittest.TestCase):
         plan = planner.plan(samples, reference_bins=reference, step=0)
         self.assertEqual([cost.llm for cost in plan.rank_costs], [194, 154])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_default_requires_model_configuration(self) -> None:
         """Feature: Explicit default cost configuration.
         Description: Construct the FLOPs model without model dimensions.
@@ -113,7 +108,6 @@ class TestCostModel(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "model_config"):
             DefaultCostModel(None)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_custom_cost_model_does_not_require_model_configuration(self) -> None:
         """Feature: Custom workload model.
         Description: Resolve a metadata-based callback without backbone dimensions.
@@ -125,7 +119,6 @@ class TestCostModel(unittest.TestCase):
         model = resolve_cost_model(lambda sample: sample.cost, None)
         self.assertEqual(model(metadata), cost)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_backbone_estimate_preserves_token_footprint(self) -> None:
         """Feature: Backbone workload estimation.
         Description: Evaluate projection, MLP and attention costs from sample dimensions.
@@ -138,7 +131,6 @@ class TestCostModel(unittest.TestCase):
         self.assertEqual(model(metadata), WorkloadCost(llm=15552.0))
         self.assertEqual(metadata.pack_tokens, 4)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_backbone_rejects_boolean_noninteger_and_nonpositive_dimensions(self) -> None:
         """Feature: Backbone configuration validation.
         Description: Supply boolean, noninteger and nonpositive hidden sizes.

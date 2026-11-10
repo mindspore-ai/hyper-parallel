@@ -27,7 +27,6 @@ from hyper_parallel.components.checkpoint.dcp_checkpointer import (
     STEP_PREFIX,
     DistributedCheckpointer,
 )
-from tests.common.mark_utils import arg_mark
 
 _CHECKPOINTER_MODULE = "hyper_parallel.components.checkpoint.dcp_checkpointer"
 
@@ -49,12 +48,6 @@ class TestDistributedCheckpointerPublish(unittest.TestCase):
         """Return a payload shaped like the trainer's, small enough to ignore."""
         return {"model": {"weight": 1}, "extra_state": {"global_step": 7}}
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_async_save_publishes_from_its_persist_callback(self) -> None:
         """Publish the pointer when persistence completes, not at the next save.
 
@@ -108,12 +101,6 @@ class TestDistributedCheckpointerPublish(unittest.TestCase):
                     f"draining must leave the published pointer alone: expected=7, got={after_drain!r}",
                 )
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_a_failed_async_save_is_raised_without_waiting(self) -> None:
         """Re-raise a failed async save on the asking thread, keeping its type.
 
@@ -150,12 +137,6 @@ class TestDistributedCheckpointerPublish(unittest.TestCase):
             # Cleared, so the same failure is not reported twice.
             checkpointer.raise_for_failed_async_save()
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_a_finished_async_save_is_retired_by_whoever_notices_first(self) -> None:
         """Retire a save that succeeded without raising, leaving the drain nothing to do.
 
@@ -191,12 +172,6 @@ class TestDistributedCheckpointerPublish(unittest.TestCase):
                 f"a retired save leaves the drain nothing to wait on, logged={waited}",
             )
 
-    @arg_mark(
-        plat_marks=["cpu_linux", "cpu_macos"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="essential",
-    )
     def test_sync_save_publishes_before_returning(self) -> None:
         """Keep the synchronous path publishing inline, under its barriers.
 

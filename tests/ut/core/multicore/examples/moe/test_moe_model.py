@@ -45,7 +45,6 @@ from hyper_parallel.core.multicore.examples.moe.model import (
 )
 from hyper_parallel.core.optimizer.adamw import AdamW
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
-from tests.common.mark_utils import arg_mark
 
 rms_norm_module = importlib.import_module("hyper_parallel.components.functional.rms_norm")
 
@@ -112,8 +111,6 @@ class TestMoeTransformerExample(unittest.TestCase):
         finally:
             torch.set_default_dtype(original_dtype)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_router_scores_and_gradients(self) -> None:
         """Feature: MegaKernel model integration.
         Description: Router scores and gradients.
@@ -139,8 +136,6 @@ class TestMoeTransformerExample(unittest.TestCase):
         for got, want in zip(actual_grads, expected_grads):
             torch.testing.assert_close(got, want, rtol=0, atol=0)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_two_layer_training_with_plain_residuals(self) -> None:
         """Feature: MegaKernel model integration.
         Description: Two-layer training with ordinary residual connections.
@@ -174,8 +169,6 @@ class TestMoeTransformerExample(unittest.TestCase):
             if got.requires_grad:
                 torch.testing.assert_close(got.grad, want.grad, rtol=0, atol=0)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_selective_backend_construction(self) -> None:
         """Feature: MegaKernel model integration.
         Description: Selective backend construction.
@@ -203,8 +196,6 @@ class TestMoeTransformerExample(unittest.TestCase):
                     if isinstance(layer.mlp.experts, MegaMoeExperts):
                         layer.mlp.experts.close()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_mixed_dtype_gradient_synchronization(self) -> None:
         """Feature: MegaKernel model integration.
         Description: Mixed dtype gradient synchronization.
@@ -238,8 +229,6 @@ class TestMoeTransformerExample(unittest.TestCase):
             torch.testing.assert_close(got, want, rtol=0, atol=0)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0)
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_ep_main_gradient_layout_and_optimizer_update(self, mock_rank: object) -> None:
         """Feature: MegaKernel model integration.
         Description: Ep main gradient layout and optimizer update.
@@ -270,8 +259,6 @@ class TestMoeTransformerExample(unittest.TestCase):
         self.assertIsInstance(adamw.state[parameter.main_param]["exp_avg"], DTensor)
         self.assertEqual(tuple(adamw.state[parameter.main_param]["exp_avg"].shape), (4,))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_arguments_and_topology_validation(self) -> None:
         """Feature: MegaKernel model integration.
         Description: Arguments and topology validation.
@@ -289,8 +276,6 @@ class TestMoeTransformerExample(unittest.TestCase):
             with (self.subTest(value=value), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit)):
                 benchmark.parse_args(["--mega-kernels", value])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_expert_configuration_tracks_runtime_world_size(self) -> None:
         """Feature: Configurable MoE benchmark EP.
         Description: Prepare different runtime sizes and explicit expert-count overrides.
@@ -309,8 +294,6 @@ class TestMoeTransformerExample(unittest.TestCase):
                 ["--num-experts", "48", "--top-k", "4"])
         self.assertEqual((context.config.ep_size, context.config.num_experts, context.config.top_k), (4, 48, 4))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_invalid_expert_configuration_releases_only_owned_group(self) -> None:
         """Feature: Configurable MoE benchmark EP.
         Description: Reject non-divisible experts and invalid TopK after runtime initialization.
@@ -327,8 +310,6 @@ class TestMoeTransformerExample(unittest.TestCase):
                     benchmark._prepare_benchmark(argv)  # pylint: disable=protected-access
                 self.assertEqual(destroy.call_count, int(owned))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_runtime_accepts_non_eight_rank_groups(self) -> None:
         """Feature: Configurable MoE benchmark EP.
         Description: Bind the last local device of an EP16 group without executing device operations.
@@ -347,8 +328,6 @@ class TestMoeTransformerExample(unittest.TestCase):
             select.assert_called_once_with(15)
             self.assertEqual(initialize.call_count, int(not initialized))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_result_records_configured_topology_and_experts(self) -> None:
         """Feature: Configurable MoE benchmark EP.
         Description: Write a result for an EP16 run using the default expert count.
@@ -366,8 +345,6 @@ class TestMoeTransformerExample(unittest.TestCase):
         self.assertEqual((result["shape"]["num_experts"], result["shape"]["top_k"]), (96, 8))
 
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_import_does_not_load_mhc_implementation(self) -> None:
         """Feature: Independent MoE example.
         Description: Import the model and benchmark in a fresh interpreter.
@@ -380,8 +357,6 @@ assert 'hyper_parallel.core.multicore.modules.mega_mhc.module' not in sys.module
 """
         subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_tensor_comparison_rejects_a_peer_failure(self) -> None:
         """Feature: Distributed model comparison.
         Description: Emulate a failed peer while the local common/Mega tensors are equal.

@@ -32,12 +32,10 @@ import unittest
 from typing import Any, Optional
 from unittest import mock
 
-
 import torch
 import torch.nn.functional as F
 
 from hyper_parallel.models._transformers import loss_parallel as loss_module
-from tests.common.mark_utils import arg_mark
 
 _VOCAB = 11
 
@@ -116,8 +114,6 @@ class TestCausalLmLossParallel(unittest.TestCase):
             logits, labels, vocab_size=logits.shape[-1], **kwargs
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_full_logits_matches_reference(self):
         """Verify full-logits loss and gradient correctness.
 
@@ -140,8 +136,6 @@ class TestCausalLmLossParallel(unittest.TestCase):
             torch.allclose(logits.grad, ref_logits.grad, rtol=1e-3, atol=1e-4)
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_full_token_dimension_uses_one_call(self):
         """Verify loss computation does not split the token dimension.
 
@@ -162,8 +156,6 @@ class TestCausalLmLossParallel(unittest.TestCase):
         reference = _reference_loss(logits, labels)
         self.assertTrue(torch.allclose(loss, reference, rtol=1e-4, atol=1e-4))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_ignore_index_excluded_from_denominator(self):
         """Verify ignored labels do not affect loss normalization.
 
@@ -178,8 +170,6 @@ class TestCausalLmLossParallel(unittest.TestCase):
         reference = _reference_loss(logits, labels)
         self.assertTrue(torch.allclose(loss, reference, rtol=1e-4, atol=1e-5))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_num_items_in_batch_is_the_denominator(self):
         """Verify explicit item-count normalization.
 
@@ -193,8 +183,6 @@ class TestCausalLmLossParallel(unittest.TestCase):
         reference = _reference_loss(logits, labels, num_items=7)
         self.assertTrue(torch.allclose(loss, reference, rtol=1e-4, atol=1e-5))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_explicit_shift_labels_skip_padding(self):
         """Verify explicit shifted labels bypass internal shifting.
 
@@ -209,8 +197,6 @@ class TestCausalLmLossParallel(unittest.TestCase):
         reference = _reference_loss(logits, labels, shift_labels=shift_labels)
         self.assertTrue(torch.allclose(loss, reference, rtol=1e-4, atol=1e-5))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_empty_targets_raise(self):
         """Verify empty target tensors fail fast.
 
@@ -223,8 +209,6 @@ class TestCausalLmLossParallel(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "at least one target token"):
             self._run(logits, labels)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_missing_tp_mesh_raises(self):
         """Verify the TP mesh is required.
 

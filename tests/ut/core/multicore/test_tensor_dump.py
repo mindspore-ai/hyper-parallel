@@ -40,7 +40,6 @@ from hyper_parallel.core.multicore.scheduler.graph import (
     SplitSpec,
     TensorSpec,
 )
-from tests.common.mark_utils import arg_mark
 
 
 def _make_test_graph() -> ComputeGraph:
@@ -62,8 +61,6 @@ def _make_test_graph() -> ComputeGraph:
 class TestTensorDumpConfig(unittest.TestCase):
     """Validate L0 configuration normalization and filtering."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_normalizes_scalar_filters(self):
         """Feature: MegaKernel diagnostics.
         Description: Normalizes scalar filters.
@@ -83,8 +80,6 @@ class TestTensorDumpConfig(unittest.TestCase):
         self.assertFalse(config.selects_invocation("forward", 2, "other_kernel"))
         self.assertFalse(config.selects_invocation("backward", 2))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_normalizes_l1_filters(self):
         """Feature: MegaKernel diagnostics.
         Description: Normalizes l1 filters.
@@ -108,8 +103,6 @@ class TestTensorDumpConfig(unittest.TestCase):
         self.assertEqual(config.core_types, ("AIV",))
         self.assertEqual(config.io, ("output",))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_rejects_unsupported_level_and_invalid_rank(self):
         """Feature: MegaKernel diagnostics.
         Description: Rejects unsupported level and invalid rank.
@@ -126,8 +119,6 @@ class TestTensorDumpConfig(unittest.TestCase):
 class TestGraphDiagnosticMetadata(unittest.TestCase):
     """Validate generic and explicitly overridden operator stage names."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_default_stage_names_do_not_depend_on_operator_type(self):
         """Feature: MegaKernel diagnostics.
         Description: Default stage names do not depend on operator type.
@@ -142,8 +133,6 @@ class TestGraphDiagnosticMetadata(unittest.TestCase):
             {"up_proj": "UpProj", "down_proj": "DownProj"},
         )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_rejects_duplicate_explicit_stage_names(self):
         """Feature: MegaKernel diagnostics.
         Description: Rejects duplicate explicit stage names.
@@ -163,8 +152,6 @@ class TestTorchMegaKernelTensorDumper(unittest.TestCase):
         """Reset the process-local diagnostic session after each test."""
         _reset_active_session_for_test()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_exports_graph_tensors(self):
         """Feature: MegaKernel diagnostics.
         Description: Exports graph tensors.
@@ -224,8 +211,6 @@ class TestTorchMegaKernelTensorDumper(unittest.TestCase):
                 torch_tensor([4.0, 6.0]),
             )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_filters_and_preserves_bfloat16(self):
         """Feature: MegaKernel diagnostics.
         Description: Filters and preserves bfloat16.
@@ -258,8 +243,6 @@ class TestTorchMegaKernelTensorDumper(unittest.TestCase):
             assert_close(payload, torch_ones(2, dtype=torch_bfloat16))
             self.assertEqual(manifest["invocations"][0]["tensorCount"], 1)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_exports_unmapped_tensor_under_kernel_boundary_stage(self):
         """Feature: MegaKernel diagnostics.
         Description: Keep an unmapped diagnostic Tensor in the stage-only public layout.
@@ -294,8 +277,6 @@ class TestTorchMegaKernelTensorDumper(unittest.TestCase):
                 torch_tensor([1.0, 2.0]),
             )
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_profiler_and_tensor_dump_are_mutually_exclusive(self):
         """Feature: MegaKernel diagnostics.
         Description: Profiler and tensor dump are mutually exclusive.

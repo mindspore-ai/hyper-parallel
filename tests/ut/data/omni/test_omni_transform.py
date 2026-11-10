@@ -21,7 +21,6 @@ import unittest
 from PIL import Image
 
 from hyper_parallel.data.omni.omni_transform import AutoProcessorTransform
-from tests.common.mark_utils import arg_mark
 
 
 def image_bytes(color: str, mode: str = "RGB") -> bytes:
@@ -38,8 +37,6 @@ class TestOmniImageBinding(unittest.TestCase):
         """Build a transform for message preparation independently of tokenization."""
         self.transform = AutoProcessorTransform(max_seq_len=4096, processor=object())
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_bytes_bind_across_messages_and_text_blocks(self):
         """Verify image order across a conversation.
 
@@ -68,8 +65,6 @@ class TestOmniImageBinding(unittest.TestCase):
         self.assertEqual([image.getpixel((0, 0)) for image in images], [(255, 0, 0), (0, 128, 0), (0, 0, 255)])
         self.assertTrue(all(image.mode == "RGB" and image.size == (2, 3) for image in images))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_path_fallback_and_bare_image_block(self):
         """Verify path-only external images.
 
@@ -89,8 +84,6 @@ class TestOmniImageBinding(unittest.TestCase):
         self.assertEqual([block["image"] for block in content],
                          ["/data/explicit.png", "/data/relative.png", "https://example.com/img.png"])
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_image_count_mismatch_is_not_silent(self):
         """Verify image-count validation.
 
@@ -103,8 +96,6 @@ class TestOmniImageBinding(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "image.*(count|placeholder)|placeholder.*image"):
                     self.transform.prepare_messages({"messages": [{"content": text}], "images": images})
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_bad_images_fail_with_index(self):
         """Verify malformed-image diagnostics.
 
@@ -117,8 +108,6 @@ class TestOmniImageBinding(unittest.TestCase):
             with self.subTest(item=item), self.assertRaisesRegex((ValueError, TypeError), r"images\[0\]"):
                 self.transform.prepare_messages({"messages": [{"content": "<image>"}], "images": [item]})
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_decode_grayscale_to_rgb(self):
         """Verify decoded image ownership.
 
@@ -131,8 +120,6 @@ class TestOmniImageBinding(unittest.TestCase):
         self.assertEqual(image.mode, "RGB")
         self.assertEqual(image.getpixel((1, 2)), (255, 255, 255))
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_arrow_null_image_fields_are_not_extra_sources(self):
         """Verify nullable Arrow image structs.
 
@@ -152,8 +139,6 @@ class TestOmniImageBinding(unittest.TestCase):
         self.assertEqual(content[0], {"type": "image", "path": "/data/a.png"})
         self.assertEqual(set(content[1]), {"type", "image"})
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_no_images_preserves_legacy_messages(self):
         """Verify legacy message compatibility.
 

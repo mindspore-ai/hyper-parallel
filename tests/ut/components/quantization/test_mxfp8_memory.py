@@ -27,8 +27,6 @@ from hyper_parallel.components.quantization.functional.mxfp8_linear_func import 
 from hyper_parallel.components.quantization.functional.mxfp8_gmm_func import MXFP8GroupedLinear
 from hyper_parallel.components.quantization.quantizers.mxfp8 import MXFP8Quantizer
 
-from tests.common.mark_utils import arg_mark
-
 
 def npu_quant_grouped_linear(inputs: torch.Tensor, weight: torch.Tensor,
                              group_list: torch.Tensor, quantizer: MXFP8Quantizer,
@@ -112,8 +110,6 @@ class MXFP8MemoryTests(unittest.TestCase):
              else function(x, w, quantizer))
         return x, w, y, groups
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_repeat_and_final_release(self) -> None:
         """
         Feature: MXFP8 autograd contracts.
@@ -157,8 +153,6 @@ class MXFP8MemoryTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             torch.autograd.grad(y.sum(), params)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_double_backward_rejected(self) -> None:
         """
         Feature: MXFP8 autograd contracts.
@@ -175,8 +169,6 @@ class MXFP8MemoryTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'once_differentiable'):
                     dx.sum().backward()
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_first_result_matches_cpu_reference(self) -> None:
         """
         Feature: MXFP8 autograd contracts.

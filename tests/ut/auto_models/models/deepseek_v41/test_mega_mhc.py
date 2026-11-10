@@ -33,7 +33,6 @@ from hyper_parallel.models.replacement import (
 )
 from hyper_parallel.trainer.config import entries_to_module_replacements
 from hyper_parallel.trainer.config.resolver import resolve_config
-from tests.common.mark_utils import arg_mark
 
 
 def _model_target():
@@ -70,8 +69,6 @@ class _SourceMhc(nn.Module):
         self.hc_eps = 1.0e-6
 
 
-@arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-          card_mark="onecard", essential_mark="essential")
 class TestDeepseekV41HyperMegaMhc(unittest.TestCase):
     """Validate replacement contracts and the hardware-free shifted protocol."""
 

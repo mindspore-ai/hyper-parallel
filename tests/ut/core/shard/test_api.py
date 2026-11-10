@@ -17,7 +17,6 @@ import os
 import unittest
 from unittest.mock import MagicMock, patch
 
-
 import numpy as np
 import torch
 
@@ -29,7 +28,6 @@ from hyper_parallel.core.dtensor.device_mesh import init_device_mesh, _DEVICE_ME
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 from hyper_parallel.core.shard import api as shard_api
-from tests.common.mark_utils import arg_mark
 
 
 def _make_mesh(mock_platform, mesh_shape, mesh_dim_names):
@@ -51,7 +49,6 @@ def _make_mesh(mock_platform, mesh_shape, mesh_dim_names):
 class TestPublicShardApi(unittest.TestCase):
     """Keep the public entry points available to downstream training libraries."""
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_public_shard_exports(self) -> None:
         """
         Feature: Public shard API compatibility.

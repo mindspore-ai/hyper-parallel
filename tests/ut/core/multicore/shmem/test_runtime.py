@@ -22,7 +22,6 @@ import torch
 
 from hyper_parallel.core.multicore import _collective
 from hyper_parallel.core.multicore.shmem import _lifecycle
-from tests.common.mark_utils import arg_mark
 
 
 # These tests deliberately inspect the private state machine and mocked native entry points.
@@ -775,8 +774,6 @@ class TestRuntimeLifecycle(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "restart the process"):
             _lifecycle.release()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_release_stages_use_the_acquired_root_group(self) -> None:
         """Feature: Explicit SHMEM Root selection.
         Description: Release a Runtime acquired on a subgroup.

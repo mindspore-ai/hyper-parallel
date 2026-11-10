@@ -20,7 +20,6 @@ from typing import Any
 import torch
 
 from hyper_parallel.data.omni.omni_transform import AutoProcessorTransform
-from tests.common.mark_utils import arg_mark
 
 class FakeProcessor:
     """Return stable processor-shaped data without loading any model."""
@@ -74,8 +73,6 @@ class BoundaryMergeProcessor(FakeProcessor):
 class TestOmniProcessorBoundaries(unittest.TestCase):
     """Preserve native processor tokens while locating assistant supervision."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_processor_labels_and_length(self):
         """Final assistant is supervised; overlong media samples are not sliced."""
         transform = AutoProcessorTransform(max_seq_len=5, processor=FakeProcessor())
@@ -89,8 +86,6 @@ class TestOmniProcessorBoundaries(unittest.TestCase):
             transform.encode_sample({"messages": sample["messages"][:-1]})
 
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_processor_masks_merged_boundary_without_changing_inputs(self):
         """Empty thinking preserves image expansion and masks the shared newline token."""
         processor = BoundaryMergeProcessor()
@@ -105,8 +100,6 @@ class TestOmniProcessorBoundaries(unittest.TestCase):
             self.assertTrue(torch.equal(result[field], original[field]))
 
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_processor_rejects_real_rewrites_and_lossy_decoding(self):
         """Text rewrites and changed expanded tokens must not be hidden by the fallback."""
         sample = {"messages": [{"role": "user"}, {"role": "assistant"}]}
@@ -121,8 +114,6 @@ class TestOmniProcessorBoundaries(unittest.TestCase):
                     AutoProcessorTransform(max_seq_len=16, processor=processor).encode_sample(sample)
 
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
     def test_processor_rejects_no_targets_after_boundary_masking(self):
         """A merge consuming all remaining tokens does not create a supervised answer."""
         processor = BoundaryMergeProcessor()

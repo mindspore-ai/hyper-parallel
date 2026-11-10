@@ -25,13 +25,11 @@ from hyper_parallel.data.parallel import (
     DataLoaderParallelContext, TPBatchBroadcaster, build_dataset_for_dataloader,
     create_dataloader_parallel_context,
 )
-from tests.common.mark_utils import arg_mark
 
 
 class TestDataLoaderParallelContext(unittest.TestCase):
     """Dataset construction and consumption follow the same source policy."""
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_source_ownership_and_dataset_cache(self):
         """Every balanced peer owns an iterator; native peers only read on TP0."""
         mesh = SimpleNamespace(mesh_dim_names=())
@@ -52,7 +50,6 @@ class TestDataLoaderParallelContext(unittest.TestCase):
                     self.assertEqual(factory.call_count, int(owns_source))
                     self.assertIs(dataset, factory.return_value if owns_source else None)
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_balanced_text_and_omni_skip_tp_communication(self):
         """Both runtimes preserve CP slices, dtypes and EOF without another broadcast."""
         batch = {
@@ -101,7 +98,6 @@ class TestDataLoaderParallelContext(unittest.TestCase):
                         self.assertEqual(model["custom_input"], 7)
                         runtime.batch_transport.assert_called_once()
 
-    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_native_source_still_broadcasts(self):
         """The native source sends shape, tokens, labels and global boundaries."""
         context = DataLoaderParallelContext(tp_world_size=2, tp_group=object())

@@ -31,7 +31,6 @@ from hyper_parallel.data.parallel import build_dataset_batch_sampler
 from hyper_parallel.distributed_data import DistributedDatasetConfig, SampleMetadata, build_distributed_dataloader
 from hyper_parallel.distributed_data.distributed_dataloader import DistributedDataLoader
 from hyper_parallel.distributed_data.topology import DataTopology
-from tests.common.mark_utils import arg_mark
 from tests.ut.distributed_data.test_batch_sampler import _legacy_loader_state
 
 
@@ -91,7 +90,6 @@ def _build_loader(mode: str, *, consumed: int = 0, epoch: int = 0, workers: int 
 class TestLoaderResume(unittest.TestCase):
     """Exercise delivered cursors independently of prefetch and saved schemas."""
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_gbs_change_preserves_absolute_cursor_and_new_step_boundaries(self) -> None:
         """Feature: Variable-GBS checkpoint restoration.
         Description: Consume thirty samples at GBS ten, then restore with GBS eight and twelve.
@@ -162,7 +160,6 @@ class TestLoaderResume(unittest.TestCase):
                 self.assertNotIn("optimizer_step_offset", restored.state_dict()["_index_sampler_state"])
                 list(iterator)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_gbs_and_dp_change_repartition_unaligned_cursor(self) -> None:
         """Feature: Joint GBS and DP migration.
         Description: Restore cursor thirty at GBS eight and DP four, with a short dataset tail.
@@ -187,7 +184,6 @@ class TestLoaderResume(unittest.TestCase):
                     selected.extend(sample["id"] for batch in batches for sample in batch)
                 self.assertEqual(sorted(selected), sorted(order[30:62]))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_legacy_step_counter_uses_source_gbs(self) -> None:
         """Feature: Legacy complete-step cursors with changed GBS.
         Description: Restore old micro-step fifteen at cursor thirty from GBS ten into GBS eight.
@@ -204,7 +200,6 @@ class TestLoaderResume(unittest.TestCase):
                 self.assertEqual(sorted(selected), list(range(30, 38)))
                 self.assertEqual(target.state_dict()["_index_sampler_state"]["consumed_samples"], 38)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_rank", return_value=0)
     @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_world_size", return_value=1)
     @patch("hyper_parallel.core.distributed_checkpoint.api.dist.barrier")
@@ -247,7 +242,6 @@ class TestLoaderResume(unittest.TestCase):
                 self.assertEqual(target.state_dict()["_index_sampler_state"]["consumed_samples"], 46)
                 list(iterator)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_plain_torch_sampler_keeps_native_resume_state(self) -> None:
         """Feature: Ordinary torchdata loader compatibility.
         Description: Restore a fixed loader using the default PyTorch batch sampler.
@@ -262,7 +256,6 @@ class TestLoaderResume(unittest.TestCase):
         target.load_state_dict(template)
         self.assertEqual(next(iter(target)), [2, 3])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_legacy_balanced_cursor_retains_nonzero_start(self) -> None:
         """Feature: Legacy balanced checkpoint migration.
         Description: Resume nested or duplicated legacy cursors, then switch to fixed loading.
@@ -288,7 +281,6 @@ class TestLoaderResume(unittest.TestCase):
                     self.assertEqual([sample["id"] for sample in next(iter(fixed))], [8, 9])
                 self.assertEqual([sample["id"] for sample in next(restored)], [8, 9])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_mode_switch_repartitions_global_cursor(self) -> None:
         """Feature: Native cursor restoration with a changed DP size.
         Description: Switch DP4 fixed to DP1 balanced and back at a nonzero epoch.
@@ -326,7 +318,6 @@ class TestLoaderResume(unittest.TestCase):
                 self.assertEqual(sorted(selected), expected)
                 self.assertEqual(restored["_index_sampler_state"]["dp_world_size"], 1)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_mode_switch_rejects_changed_dp_with_sharded_shuffle(self) -> None:
         """Feature: Native sampler topology validation.
         Description: Change DP in either direction with per-rank shuffle enabled.
@@ -350,7 +341,6 @@ class TestLoaderResume(unittest.TestCase):
                 self.assertEqual(saved, original)
                 self.assertEqual(target.state_dict()["_index_sampler_state"]["consumed_samples"], 0)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_source_sampler_dp_change_requires_complete_step(self) -> None:
         """Feature: Source-batch sampler DP migration.
         Description: Restore partial source cursors with unchanged or changed DP.
@@ -369,7 +359,6 @@ class TestLoaderResume(unittest.TestCase):
                         sampler.load_state_dict(state)
                     self.assertEqual(sampler.consumed_samples, 0)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_rank", return_value=0)
     @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_world_size", return_value=1)
     @patch("hyper_parallel.core.distributed_checkpoint.api.dist.barrier")
@@ -439,7 +428,6 @@ class TestLoaderResume(unittest.TestCase):
                 target.set_epoch(3)
                 self.assertEqual(len(list(target)), 12)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_legacy_fixed_cursor_and_unsafe_worker_state(self) -> None:
         """Feature: Legacy fixed checkpoint migration.
         Description: Restore the original zero-worker and nested worker snapshots.
@@ -462,7 +450,6 @@ class TestLoaderResume(unittest.TestCase):
                     target.load_state_dict(saved)
                     self.assertEqual([sample["id"] for sample in next(target)], [4, 5])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_portable_cursor_excludes_prefetched_windows(self) -> None:
         """Feature: Delivered checkpoint progress.
         Description: Complete one step, wait for lookahead, and resume a nonzero start.
@@ -484,7 +471,6 @@ class TestLoaderResume(unittest.TestCase):
                     next(restored)
                     self.assertEqual(restored.state_dict()["_index_sampler_state"]["consumed_samples"], 12)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_shared_cursor_restores_all_reader_epochs(self) -> None:
         """Feature: Loader-owned progress restoration.
         Description: Restore only the native sampler cursor, or a template retaining fresh Reader epochs.
@@ -508,7 +494,6 @@ class TestLoaderResume(unittest.TestCase):
                 self.assertEqual([sample["id"] for sample in next(target)], [8, 9])
                 self.assertEqual(saved, original)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_reader_checkpoint_requires_sampler_cursor(self) -> None:
         """Feature: Deduplicated Reader checkpoint validation.
         Description: Restore a Reader checkpoint without a valid sampler state in either location.
@@ -531,7 +516,6 @@ class TestLoaderResume(unittest.TestCase):
                 self.assertEqual(saved, original)
                 self.assertEqual(target.state_dict(), initial)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_shared_cursor_preserves_payload_reader_validation(self) -> None:
         """Feature: Shared-cursor restoration compatibility checks.
         Description: Restore a valid sampler with incompatible payload-reader metadata.
@@ -546,7 +530,6 @@ class TestLoaderResume(unittest.TestCase):
                     target.load_state_dict(saved)
                 self.assertEqual(saved, original)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_switch_rejects_invalid_native_cursor(self) -> None:
         """Feature: Complete-step cursor validation.
         Description: Switch with incomplete source steps, negative cursors or invalid offsets in either direction.
@@ -569,7 +552,6 @@ class TestLoaderResume(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     target.load_state_dict(saved)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_new_gbs_does_not_hide_partial_source_step(self) -> None:
         """Feature: Source-boundary validation for variable GBS.
         Description: Load cursor thirty-two at offset six with source GBS eight and target GBS sixteen.
@@ -586,7 +568,6 @@ class TestLoaderResume(unittest.TestCase):
                         "dp_world_size": 1, "optimizer_step_offset": 6,
                     }})
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_legacy_model_peer_does_not_invent_absolute_cursor(self) -> None:
         """Feature: Legacy non-Reader checkpoint compatibility.
         Description: Resume a model peer whose old state has no sampler or initial cursor.
@@ -606,7 +587,6 @@ class TestLoaderResume(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "no native sampler cursor"):
                 _build_loader("fixed").load_state_dict(restored)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_worker_cursor_includes_deliveries_since_snapshot(self) -> None:
         """Feature: Portable cursor for infrequent worker snapshots.
         Description: Save after deliveries between torchdata snapshots while workers prefetch.

@@ -21,8 +21,6 @@ from unittest.mock import MagicMock, patch
 import torch
 from transformers import PretrainedConfig, PreTrainedModel
 
-from tests.common.mark_utils import arg_mark
-
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.models._transformers.checkpoint_loader import CheckpointManager
 from hyper_parallel.core.fully_shard.api import _extend_module_with_hsdp_interface
@@ -53,8 +51,6 @@ class ExportableModel(PreTrainedModel):
 class TestCheckpointManagerSave(unittest.TestCase):
     """Verify DCP-backed export does not read live training parameters."""
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_hsdp_export_uses_original_class_without_mutating_training_model(self) -> None:
         """Feature: HF checkpoint export.
 
@@ -74,8 +70,6 @@ class TestCheckpointManagerSave(unittest.TestCase):
         self.assertEqual(model.config.architectures, ["ExportableModel"])
         self.assertIsNot(model.exports[0][1], model.config)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_export_failure_preserves_live_class_config_and_conversions(self) -> None:
         """Feature: HF checkpoint export.
 
@@ -97,8 +91,6 @@ class TestCheckpointManagerSave(unittest.TestCase):
         self.assertIs(model._weight_conversions, conversions)
         self.assertEqual(model.config.architectures, ["ExportableModel"])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_qwen_text_keeps_native_namespace_and_fused_experts(self) -> None:
         """Feature: HF checkpoint export.
 
@@ -113,8 +105,6 @@ class TestCheckpointManagerSave(unittest.TestCase):
                 self.assertFalse(model.exports[0][2]["save_original_format"])
                 torch.testing.assert_close(model.exports[0][2]["state_dict"]["weight"], model.weight)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_qwen_text_still_reverses_replacement_layout(self) -> None:
         """Feature: HF checkpoint export.
 
@@ -141,8 +131,6 @@ class TestCheckpointManagerSave(unittest.TestCase):
         self.assertFalse(model.exports[0][2]["save_original_format"])
         torch.testing.assert_close(model.exports[0][2]["state_dict"]["weight"], model.weight + 1)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_explicit_original_format_policy_is_preserved(self) -> None:
         """Feature: HF checkpoint export.
 
@@ -158,8 +146,6 @@ class TestCheckpointManagerSave(unittest.TestCase):
                 self.assertTrue(model.exports[0][2]["save_original_format"])
                 self.assertIn("model.language_model.weight", model.exports[0][2]["state_dict"])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_unregistered_model_preserves_explicit_export_policy(self) -> None:
         """Feature: HF checkpoint export.
 
@@ -170,8 +156,6 @@ class TestCheckpointManagerSave(unittest.TestCase):
         CheckpointManager(model).save_pretrained("/unused", save_original_format=False)
         self.assertFalse(model.exports[0][2]["save_original_format"])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_qwen_conversion_failure_preserves_metadata(self) -> None:
         """Feature: HF checkpoint export.
 
@@ -188,8 +172,6 @@ class TestCheckpointManagerSave(unittest.TestCase):
         self.assertIs(model._weight_conversions, original_mapping)
         self.assertEqual(model.exports, [])
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
     def test_live_export_disables_autograd_for_parameter_gather(self) -> None:
         """Feature: Live HF export without autograd.
 
