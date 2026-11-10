@@ -34,7 +34,8 @@ from torch import distributed as dist
 from hyper_parallel.distributed.mesh import (
     DistributedSetup,
     MeshContext,
-    _build_device_mesh_from_accelerator,
+    ParallelTopologySpec,
+    resolve_parallel_layout,
 )
 from hyper_parallel.trainer.runtime.device import get_device_type, get_torch_device
 
@@ -136,30 +137,6 @@ def initialize_distributed(backend: str = "nccl") -> Any:
     return dist
 
 
-def _resolve_data_parallel_sizes(
-    world_size: int,
-    tp_size: int,
-    cp_size: int,
-    pp_size: int,
-    dp_shard_size: int,
-) -> tuple[int, int]:
-    """Validate parallel sizes and return DP and replicated-DP sizes."""
-    non_dp_size = tp_size * cp_size * pp_size
-    if world_size % non_dp_size != 0:
-        raise ValueError(
-            f"world_size {world_size} is not divisible by non-DP size {non_dp_size}"
-        )
-    dp_size = world_size // non_dp_size
-    fsdp_data_parallel_size = dp_size * cp_size
-    if fsdp_data_parallel_size % dp_shard_size != 0:
-        raise ValueError(
-            "DP+CP size "
-            f"{fsdp_data_parallel_size} is not divisible by FSDP shard size "
-            f"{dp_shard_size}"
-        )
-    return dp_size, fsdp_data_parallel_size // dp_shard_size
-
-
 def _populate_mesh_ranks(mesh_context: MeshContext, dp_shard_size: int) -> None:
     """Populate local mesh ranks after device-mesh construction."""
     def _local_rank(dim: str) -> int:
@@ -201,59 +178,19 @@ def create_distributed_setup_from_config(cfg: Any) -> DistributedSetup:
     if accel is None:
         return DistributedSetup(mesh_context=MeshContext())
 
-    fsdp_config = cfg.fsdp_config
-    dp_shard_size = max(1, fsdp_config.dp_shard_size)
-    edp_shard_size = max(1, fsdp_config.edp_shard_size)
-    tp_size = max(1, accel.tp_size)
-    cp_size = max(1, accel.cp_size)
-    pp_size = max(1, accel.pp_size)
-    ep_size = max(1, accel.ep_size)
-
+    topology_spec = ParallelTopologySpec.from_config(cfg)
     world_size = dist.get_world_size() if dist.is_initialized() else 1
-    dp_size, dp_replicate_size = _resolve_data_parallel_sizes(
-        world_size,
-        tp_size,
-        cp_size,
-        pp_size,
-        dp_shard_size,
-    )
-    mesh_context = MeshContext(
-        dp_size=dp_size,
-        dp_replicate_size=dp_replicate_size,
-        dp_shard_size=dp_shard_size,
-        edp_shard_size=edp_shard_size,
-        tp_size=tp_size,
-        cp_size=cp_size,
-        pp_size=pp_size,
-        ep_size=ep_size,
-        sequence_parallel=bool(accel.sequence_parallel),
-        loss_parallel=bool(accel.loss_parallel),
-    )
+    layout = resolve_parallel_layout(topology_spec, world_size)
+    mesh_context = MeshContext.from_layout(layout)
     if dist.is_initialized():
-        mesh_context, _ = _build_device_mesh_from_accelerator(
-            accel,
-            dp_shard_size,
-            dp_replicate_size,
-            world_size,
-            edp_shard_size,
-        )
+        mesh_context.build_meshs(get_device_type(), world_size)
 
-    _populate_mesh_ranks(mesh_context, dp_shard_size)
+    _populate_mesh_ranks(mesh_context, topology_spec.dp_shard_size)
 
-    fsdp_enabled = dist.is_initialized()
-    strategy_config = fsdp_config if fsdp_enabled else None
-    return DistributedSetup(
+    return DistributedSetup.from_config(
+        cfg,
         mesh_context=mesh_context,
-        strategy_config=strategy_config,
-        # plan_overrides/module_replacements stay unset here: the Trainer
-        # desugars the raw YAML entries onto the setup (05 §15.2.6) before
-        # model construction.
-        low_precision_config=getattr(
-            getattr(cfg, "training", None),
-            "low_precision",
-            None,
-        ),
-        fp32_main_params=cfg.optimizer.fp32_main_params,
+        strategy_enabled=dist.is_initialized(),
     )
 
 

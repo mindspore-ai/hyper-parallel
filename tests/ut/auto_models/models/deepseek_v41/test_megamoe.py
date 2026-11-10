@@ -233,8 +233,11 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
                 inputs = (torch.randn(128, 8) * 5).requires_grad_()
                 weights = torch.randn(128, 2, requires_grad=True)
                 ids = torch.arange(256).reshape(128, 2) % 4
-                reference = SimpleNamespace(gate_up_weight=source.gate_up_proj.transpose(1, 2),
-                                            down_weight=source.down_proj.transpose(1, 2), swiglu_limit=10.0)
+                reference = SimpleNamespace(
+                    gate_up_weight=source.gate_up_proj.transpose(1, 2).contiguous(),
+                    down_weight=source.down_proj.transpose(1, 2).contiguous(),
+                    swiglu_limit=10.0,
+                )
                 expected = _native_reference(reference, inputs, ids, weights)
                 with patch.object(MegaMoeExperts, "forward", _native_reference):
                     actual = experts(inputs, ids, weights)

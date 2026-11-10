@@ -163,15 +163,9 @@ class TPCollectiveLowerer:
         tensor_dim: Optional[int] = None,
         reduce_op: str = "sum",
     ) -> TPExecutionOp:
-        """Build an execution op for one bare-operator call by kind.
-
-        The codegen bare-operator runtime (``runtime.TPOperators``) calls this
-        with the kind the generated forward named, so a statically emitted
-        ``reduce_scatter`` runs the exact same gloo remap (all_reduce + local
-        chunk) the placement-driven ``__call__`` path applies.
-        """
+        """Build an execution operation using the native backend's lowering."""
         # Gloo has no reduce_scatter: lower to all_reduce + local chunk, the
-        # same remap the bare-operator runtime (``TPOperators``) applies.
+        # same remap is used by placement-driven and explicit operation callers.
         if kind == "reduce_scatter" and "gloo" in self.backend:
             kind = "all_reduce_shard"
         return TPExecutionOp(

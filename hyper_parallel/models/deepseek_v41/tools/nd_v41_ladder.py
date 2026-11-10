@@ -38,13 +38,12 @@ missing is the three things around it.
     not run.  Standard library only, so it runs under any Python 3 on any node.
     ``--out FILE`` writes the block to send back.
 
-All twenty-five points are legal at sixteen dies, checked against the trainer's
-own ``_build_device_mesh_from_accelerator`` under a fake process group with no
-device: the dense mesh needs ``dp * cp`` divisible by the shard width and the
-expert mesh needs ``world / ep`` divisible by the expert shard, and every power
-of two on both axes satisfies both.  So no point in the grid can be refused for
-its mesh, and the round needs no pre-flight beyond the one the window already
-has.
+All twenty-five points are legal at sixteen dies, checked against the shared
+``resolve_parallel_layout`` topology rules: the dense mesh needs ``dp * cp``
+divisible by the shard width and the expert mesh needs ``world / ep`` divisible
+by the expert shard, and every power of two on both axes satisfies both.  So no
+point in the grid can be refused for its mesh, and the round needs no pre-flight
+beyond the one the window already has.
 
 The two orders it prints are the result, and they are what the cost model is
 scored against off the device.  The script ranks nothing against ND: ND is not

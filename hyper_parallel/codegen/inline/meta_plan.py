@@ -17,16 +17,22 @@
 from __future__ import annotations
 
 import logging
+from copy import copy
 from fnmatch import fnmatch
 from typing import Any
 
-from hyper_parallel.codegen.inline.ir import InlineRule
-from hyper_parallel.codegen.inline.specs import strategy_spec
+from hyper_parallel.codegen.inline.ir import SourceObservation
+from hyper_parallel.codegen.inline.framework_spec import strategy_spec_for as strategy_spec
+from hyper_parallel.codegen.inline.strategy_pass import rule_block_classes
 
 logger = logging.getLogger(__name__)
 
 
-def normalize_inline_meta(meta: Any, rules: tuple[InlineRule, ...], model_type: str | None = None) -> None:
+def normalize_inline_meta(
+    meta: Any,
+    rules: tuple[SourceObservation, ...],
+    model_type: str | None = None,
+) -> Any:
     """Align the frozen plan with the inline-generated source shape.
 
     Every stage is structure-proven: the strategy each strategy target
@@ -49,10 +55,25 @@ def normalize_inline_meta(meta: Any, rules: tuple[InlineRule, ...], model_type: 
     # inside MoE). Source lowering rewrites class.forward, which ALL
     # instances inherit -- a non-boundary instance would get a boundary
     # body it cannot satisfy (no _hp_boundary installed).
-    full_class_map = dict(getattr(meta, "boundary_classes", None) or {})
-    _strip_ep_sub_boundaries(meta, rules, model_type)
-    _strip_external_state_boundaries(meta)
-    _mark_shared_class_boundaries(meta, full_class_map)
+    normalized = _copy_inline_meta(meta)
+    full_class_map = dict(getattr(normalized, "boundary_classes", None) or {})
+    _strip_ep_sub_boundaries(normalized, rules, model_type)
+    _strip_external_state_boundaries(normalized)
+    _mark_shared_class_boundaries(normalized, full_class_map)
+    return normalized
+
+
+def _copy_inline_meta(meta: Any) -> Any:
+    """Copy only fields normalized by source emission, preserving all other context."""
+    normalized = copy(meta)
+    normalized.param_plan = dict(getattr(meta, "param_plan", None) or {})
+    normalized.boundary_classes = dict(
+        getattr(meta, "boundary_classes", None) or {}
+    )
+    normalized.external_state_classes = list(
+        getattr(meta, "external_state_classes", None) or ()
+    )
+    return normalized
 
 
 def _strip_external_state_boundaries(meta: Any) -> None:
@@ -72,12 +93,12 @@ def _strip_external_state_boundaries(meta: Any) -> None:
             continue
         entry = param_plan.get(fqn)
         if isinstance(entry, dict):
-            entry["is_boundary"] = False
+            param_plan[fqn] = {**entry, "is_boundary": False}
         boundary_classes.pop(fqn)
 
 
 def _strip_ep_sub_boundaries(
-    meta: Any, rules: tuple[InlineRule, ...], model_type: str | None,
+    meta: Any, rules: tuple[SourceObservation, ...], model_type: str | None,
 ) -> None:
     """Mark boundary entries owned by inline EP strategy forwards as non-boundary.
 
@@ -91,23 +112,53 @@ def _strip_ep_sub_boundaries(
     """
     param_plan = getattr(meta, "param_plan", None) or {}
     boundary_classes = getattr(meta, "boundary_classes", None) or {}
+    ep_fqns, strip_patterns = _collect_ep_boundaries(
+        meta, rules, model_type, boundary_classes
+    )
+    if not ep_fqns:
+        return
+    mark_fqns = _expanded_ep_boundaries(ep_fqns, strip_patterns, param_plan)
+    for fqn in mark_fqns:
+        entry = param_plan.get(fqn)
+        if isinstance(entry, dict):
+            param_plan[fqn] = {**entry, "is_boundary": False}
+        boundary_classes.pop(fqn, None)
+
+
+def _collect_ep_boundaries(
+    meta: Any,
+    rules: tuple[SourceObservation, ...],
+    model_type: str | None,
+    boundary_classes: dict[str, str],
+) -> tuple[set[str], tuple[str, ...]]:
+    """Collect EP host FQNs and sub-boundary patterns from inline rules."""
     ep_fqns: set[str] = set()
     strip_patterns: tuple[str, ...] = ()
     for rule in rules:
-        target = rule.local_compute_target
-        if target is None:
+        resolved = _ep_rule_hosts(rule, model_type, boundary_classes)
+        if resolved is None:
             continue
-        spec = strategy_spec(target, model_type)
-        if spec is None or spec.target_class is None:
-            continue
+        spec, host_classes = resolved
         if spec.strip_boundary_subpatterns:
             strip_patterns = spec.strip_boundary_subpatterns
-        for pattern in rule.match:
-            for fqn, cls in boundary_classes.items():
-                if fnmatch(fqn, pattern) and cls == spec.target_class:
-                    ep_fqns.add(fqn)
-    if not ep_fqns:
-        return
+        if host_classes:
+            # Persist the derived classes so a re-emission of this
+            # already-normalized meta (whose boundary entries the strip below
+            # consumes) can still resolve its patch hosts.
+            recorded = set(getattr(meta, "external_state_classes", None) or ())
+            meta.external_state_classes = sorted(recorded | host_classes)
+        for fqn, cls in boundary_classes.items():
+            if cls not in host_classes:
+                continue
+            if any(fnmatch(fqn, pattern) for pattern in rule.match):
+                ep_fqns.add(fqn)
+    return ep_fqns, strip_patterns
+
+
+def _expanded_ep_boundaries(
+    ep_fqns: set[str], strip_patterns: tuple[str, ...], param_plan: dict[str, Any]
+) -> set[str]:
+    """Expand EP hosts with matching routed/shared expert sub-boundaries."""
     mark_fqns: set[str] = set()
     for ep_fqn in ep_fqns:
         mark_fqns.add(ep_fqn)
@@ -122,11 +173,21 @@ def _strip_ep_sub_boundaries(
                 if fnmatch(local_suffix, pat):
                     mark_fqns.add(fqn)
                     break
-    for fqn in mark_fqns:
-        entry = param_plan.get(fqn)
-        if isinstance(entry, dict):
-            entry["is_boundary"] = False
-        boundary_classes.pop(fqn, None)
+    return mark_fqns
+
+
+def _ep_rule_hosts(
+    rule: SourceObservation, model_type: str | None, boundary_classes: dict[str, str]
+) -> tuple[Any, set[str]] | None:
+    """Resolve an inline EP rule and the source classes that host it."""
+    if rule.local_compute_target is None:
+        return None
+    spec = strategy_spec(rule.local_compute_target, model_type)
+    if spec is None or spec.body_template is None:
+        return None
+    if spec.target_class is not None:
+        return spec, {spec.target_class}
+    return spec, rule_block_classes(rule, boundary_classes)
 
 
 def _mark_shared_class_boundaries(meta: Any, full_class_map: dict[str, str]) -> None:
@@ -176,7 +237,7 @@ def _mark_shared_class_boundaries(meta: Any, full_class_map: dict[str, str]) -> 
             continue
         entry = param_plan.get(fqn)
         if isinstance(entry, dict):
-            entry["skip_source_lowering"] = True
+            param_plan[fqn] = {**entry, "skip_source_lowering": True}
             logger.info(
                 "codegen: boundary %s (class %s) marked skip_source_lowering "
                 "-- the class is shared with a non-boundary instance; the "

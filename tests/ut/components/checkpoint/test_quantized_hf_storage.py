@@ -138,7 +138,7 @@ class TestQuantizedReader(unittest.TestCase):
                 patch(target + "._current_device", return_value=torch.device("cpu")):
             HyperAutoModelForImageTextToText._build_model(
                 "/weights", hf_config=config, mesh=None, sharding_planner=None, fsdp2_manager=None,
-                backend=None, is_hf_model=False, peft_config=None, torch_dtype=torch.bfloat16,
+                is_hf_model=False, peft_config=None, torch_dtype=torch.bfloat16,
                 attn_implementation="eager", validate_placement=False, load_base_model=True)
         self.assertIsNone(initialize.call_args.args[1])
         self.assertTrue(infrastructure.call_args.kwargs["is_meta_device"])

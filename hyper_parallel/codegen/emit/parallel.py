@@ -49,9 +49,8 @@ stay valid when combined with the body replacement), and the public
   the instance-bound compiled plan (``self._hp_boundary``, bound once by
   ``hp_install_boundaries``), with a declarative comment block annotating
   what each side's transitions lower to.
-- ``region`` (EP MoE local region): redistribute in,
-  ``__hp_compute__`` (bound by ``hp_parallelize``), re-wrap locals per
-  ``out_src``, redistribute out.
+- ``region`` (EP MoE local region): redistribute in, call the explicit
+  factory-named attribute materialized by source emission, redistribute out.
 
 A CP inner-wrapper boundary is ``generic`` in the generated code: the wrapper
 is installed at runtime by ``hp_apply_inner_wrapper`` (it mutates
@@ -66,12 +65,11 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from hyper_parallel.codegen.astkit.edits import (
     TextEdit,
     apply_edits,
-    insert_after_imports,
     replace_function_body,
 )
 from hyper_parallel.codegen.astkit.index import (
@@ -91,7 +89,7 @@ from hyper_parallel.codegen.plan.boundary_forms import (
     classify_boundary_form,
     is_boundary_entry,
 )
-from hyper_parallel.codegen.plan.freeze import parse_placement
+from hyper_parallel.codegen.emit.patches import local_compute_binding_name
 
 #: Injection keys that describe how a boundary's compute is regioned.
 _INJECTION_KEYS = ("inner_wrapper", "inner_target", "inner_out_src", "local_compute_fn")
@@ -121,8 +119,9 @@ def lower_forward_boundaries(
     / ``_hp_tp`` instance attributes that ``hp_install_boundaries`` binds
     at runtime — no per-boundary global constant is emitted.
     """
+    if _plan_field(frozen_plan, "status") == "not_required":
+        raise ValueError("codegen emit: not_required snapshot has no parallel boundaries")
     edits: list[TextEdit] = []
-    needs_runtime_helper_import = False
     for class_name, form, emitted, func, injection, deferred_bias in iter_emitted_forms(
         source_text,
         frozen_plan,
@@ -145,11 +144,6 @@ def lower_forward_boundaries(
                     "identity forward has no exit hook to re-add them"
                 )
             continue
-        # Every emitted forward body (generic, local-region) ends with the
-        # runtime helper ``hp_to_local_if_dtensor``; that helper is a
-        # dependency of the templates, not of any declaration, so the lowerer
-        # must import it itself — otherwise the artifact is not self-contained.
-        needs_runtime_helper_import = True
         body = _build_forward_body(
             source_text, injection, func, form, emitted, deferred_bias
         )
@@ -173,37 +167,7 @@ def lower_forward_boundaries(
             "lower_forward_boundaries: edits overlap (circular class nesting); "
             "cannot safely rewrite: " + ", ".join(nested)
         )
-    patched = apply_edits(source_text, edits)
-    if needs_runtime_helper_import:
-        patched = _add_runtime_helper_import(patched)
-    return patched
-
-
-#: Runtime helper the emitted forward templates call. The templates (and
-#: this constant) must stay in sync — see ``_render_local_compute`` and
-#: ``_render_output_redistribute``.
-_RUNTIME_HELPER_IMPORT = (
-    "from hyper_parallel.codegen.runtime import hp_to_local_if_dtensor"
-)
-
-
-def _add_runtime_helper_import(source_text: str) -> str:
-    """Ensure the forward templates' runtime helper is imported.
-
-    The helper is a template dependency, so nothing in the declarations
-    contributes it; without this the generated artifact raises ``NameError`` at
-    the first forward call. No-op when the source already imports it.
-    """
-    if "import hp_to_local_if_dtensor" in source_text:
-        return source_text
-    index = build_source_index(source_text)
-    edit = insert_after_imports(
-        source_text,
-        index.import_end,
-        _RUNTIME_HELPER_IMPORT,
-        default_offset=index.docstring_end or 0,
-    )
-    return apply_edits(source_text, [edit]) if edit is not None else source_text
+    return apply_edits(source_text, edits)
 
 
 #: Class attribute a ``tp_collective`` forward carries, naming its form so the
@@ -221,7 +185,7 @@ def iter_emitted_forms(
     *,
     boundary_classes: Optional[dict[str, str]] = None,
     module_name: str = "",
-):
+) -> Iterator[tuple[str, BoundaryForm, str, FunctionInfo, Any, bool]]:
     """Yield every boundary class's emit decision over ``source_text``.
 
     Single decision path shared by the emitter
@@ -250,7 +214,9 @@ def iter_emitted_forms(
     index = build_source_index(source_text)
     param_plan = _plan_field(frozen_plan, "param_plan") or {}
     injections = _plan_field(frozen_plan, "injections") or []
-    injection_by_class = _index_injections_by_class(injections, boundary_classes, index)
+    injection_by_class = _index_injections_by_class(
+        injections, boundary_classes, index, param_plan
+    )
     mesh_dim_names = tuple(_plan_field(frozen_plan, "mesh_dim_names") or ())
 
     groups = _group_boundaries_by_class(
@@ -509,6 +475,7 @@ def _index_injections_by_class(
     injections: list[dict[str, Any]],
     boundary_classes: Optional[dict[str, str]],
     index: SourceIndex,
+    param_plan: Optional[dict[str, Any]] = None,
 ) -> dict[str, dict[str, Any]]:
     """Fold a class's injection declarations (inner wrapper / local compute).
 
@@ -521,6 +488,9 @@ def _index_injections_by_class(
     for rule in injections:
         match = rule.get("match")
         if not isinstance(match, str) or not match:
+            continue
+        entry = (param_plan or {}).get(match) or {}
+        if entry.get("skip_source_lowering"):
             continue
         class_name = _class_for_fqn(match, boundary_classes, index, "")
         if class_name is None:
@@ -541,262 +511,6 @@ def _index_injections_by_class(
 
 def _json_stable(value: Any) -> str:
     return json.dumps(value, sort_keys=True, default=str)
-
-
-# ---------------------------------------------------------------------------
-# toggle / switch forward template (parallel, non-default generation mode)
-# ---------------------------------------------------------------------------
-#: Class marker value naming the switch-based (toggle) template.  Distinct from
-#: ``TP_FORM_MARKER`` ("tp_collective") so the runtime install path and preflight
-#: can tell the two opt-in templates apart.  Like the static marker it names the
-#: template a boundary class actually got.
-TOGGLE_FORM_MARKER = "toggle"
-#: The emitted marker statement (method indent, then a blank line).
-_TOGGLE_FORM_MARKER_LINE = f'    {TP_FORM_ATTRIBUTE} = "{TOGGLE_FORM_MARKER}"\n\n'
-
-
-def lower_forward_boundaries_toggle(
-    source_text: str,
-    frozen_plan: Any,
-    *,
-    boundary_classes: Optional[dict[str, str]] = None,
-    module_name: str = "",
-) -> str:
-    """Rewrite each boundary ``forward`` into per-dimension-switched segments.
-
-    A SEPARATE generation mode from :func:`lower_forward_boundaries`: it emits,
-    for every source-defined boundary class, a forward that keeps the *original
-    HF forward body verbatim* as ``_forward_impl`` and wraps it with independent
-    ``if tp_enable`` / ``if cp_enable`` / ``if ep_enable`` segments that slice /
-    communicate / merge along each dimension the frozen plan shards on.  Only ONE
-    mode is chosen per generation (see ``emit.modeling``), so a generated artifact
-    never carries a second parallel execution path.
-
-    What the switch bodies read is bound by the block-1 runtime path:
-
-    - ``mesh_context`` — the codegen mesh context already published as a module
-      global by ``runtime.publish_codegen_mesh_context``; the toggle booleans and
-      the submesh handles defer to it.  Referencing a module global keeps the
-      artifact importable without a mesh (the name is only resolved at call time).
-    - ``self._hp_tp`` — the bare TP operator object bound by
-      ``hp_install_boundaries``'s collectives step for the ``tp_enable`` body.
-
-    The per-axis decomposition is re-derived here from ``frozen_plan`` (the
-    frozen entry's full per-axis placement dicts), independently of the merged
-    ``tp_collective`` classification, because the switch template needs one
-    guarded segment per *axis* rather than one merged verdict over all axes.
-    """
-    edits: list[TextEdit] = []
-    for class_name, _, emitted, func, injection, deferred_bias in iter_emitted_forms(
-        source_text,
-        frozen_plan,
-        boundary_classes=boundary_classes,
-        module_name=module_name,
-    ):
-        del injection
-        if emitted == FORM_IDENTITY:
-            # Pruned as in the parallel mode: identity boundaries need no rewrite.
-            continue
-        if emitted == FORM_REGION:
-            raise NotImplementedError(
-                "toggle forward: the region (EP MoE local) form is not emitted "
-                f"for {_class_for_fqn(class_name, boundary_classes, build_source_index(source_text), module_name)!r}; "
-                "the toggle template assumes a dense (non-MoE) boundary. Split the "
-                "plan or keep the default parallel mode for MoE topologies."
-            )
-        if deferred_bias:
-            # D-22: the toggle template decomposes the exit into per-axis
-            # guarded segments and has no single boundary-exit point to hang
-            # the deferred-bias re-add on; emitting nothing would silently
-            # drop the suppressed bias. Fail fast and point at the mode that
-            # supports deferral.
-            raise NotImplementedError(
-                f"toggle forward: boundary class {class_name!r} declares "
-                "deferred bias params (D-22); the toggle template has no "
-                "boundary exit hook to re-add them — use the default "
-                "parallel mode for plans that defer rowwise biases"
-            )
-        body = _render_toggle_forward(
-            source_text,
-            frozen_plan,
-            class_name,
-            func,
-            boundary_classes=boundary_classes,
-            module_name=module_name,
-        )
-        impl = _build_forward_impl_edit(source_text, func, prefix=_TOGGLE_FORM_MARKER_LINE)
-        if impl is not None:
-            edits.append(impl)
-        edits.extend(replace_function_body(source_text, func, body, indent=""))
-    if not edits:
-        return source_text
-
-    nested = _validate_no_circular(edits)
-    if nested:
-        raise ValueError(
-            "lower_forward_boundaries_toggle: edits overlap (circular class "
-            "nesting); cannot safely rewrite: " + ", ".join(nested)
-        )
-    return apply_edits(source_text, edits)
-
-
-def _render_toggle_forward(
-    source_text: str,
-    frozen_plan: Any,
-    class_name: str,
-    func: FunctionInfo,
-    *,
-    boundary_classes: Optional[dict[str, str]] = None,
-    module_name: str = "",
-) -> str:
-    """Render one switch-based forward body for a boundary class.
-
-    The body keeps the original forward as ``_forward_impl`` and inserts one
-    guarded segment per enabled dimension.  TP calls the block-1-bound
-    ``self._hp_tp``; the ``tp_enable`` / ``cp_enable`` / ``ep_enable``
-    booleans are bound on the instance by the install path and defer to
-    ``mesh_context``.
-    """
-    inbound, outbound = _per_axis_toggle_ops(
-        frozen_plan, class_name, source_text,
-        boundary_classes=boundary_classes, module_name=module_name,
-    )
-
-    lines = [
-        "        # [HYPER TOGGLE] keep the original HF forward as ``_forward_impl``",
-        "        # and insert per-dimension slice / collective / merge segments,",
-        "        # each guarded by its own {{tp|cp|ep}}_enable switch.",
-        f"        # [HYPER INLINE] {_fusion_note_for(class_name)}",
-        "",
-    ]
-    for axis in ("tp", "cp", "ep"):
-        axis_ops = inbound.get(axis)
-        if not axis_ops:
-            continue
-        lines.append(f"        if self.{axis}_enable:")
-        for name, op in sorted(axis_ops.items()):
-            expr = _render_tp_call_expr(name, op)
-            lines.append(f"            {name} = {expr}")
-        lines.append("")
-    lines.append(
-        "        # [HYPER TOGGLE] original forward body (now ``_forward_impl``)"
-    )
-    lines.append(_render_forward_call(func))
-    lines.append("")
-    for axis in reversed(("ep", "cp", "tp")):
-        axis_ops = outbound.get(axis)
-        if not axis_ops:
-            continue
-        lines.append(f"        if self.{axis}_enable:")
-        for name, op in sorted(axis_ops.items()):
-            if op.kind == "all_reduce":
-                lines.append("            outputs = self._hp_tp.all_reduce(outputs)")
-            elif op.kind == "all_gather":
-                lines.append(
-                    f"            outputs = self._hp_tp.all_gather(outputs, dim={op.tensor_dim})"
-                )
-            else:
-                lines.append(
-                    f"            outputs = self._hp_tp.reduce_scatter(outputs, dim={op.tensor_dim})"
-                )
-        lines.append("")
-    lines.append("        return outputs")
-    return "\n".join(lines)
-
-
-def _per_axis_toggle_ops(
-    frozen_plan: Any,
-    class_name: str,
-    source_text: str,
-    *,
-    boundary_classes: Optional[dict[str, str]] = None,
-    module_name: str = "",
-) -> tuple[dict[str, dict[str, TransitionOp]], dict[str, dict[str, TransitionOp]]]:
-    """Decompose one class's boundary into per-axis switch ops for the toggle body.
-
-    Returns ``(in, out)``, each ``{axis: {name: TransitionOp}}`` for only the
-    axes whose placements actually change (op ``kind != identity``).  The
-    decomposition re-classifies each declared name on each of the plan's active
-    axes independently so a boundary can guard ``tp`` and ``cp`` work in separate
-    blocks.  A class's forward is shared by every instance, so only the first
-    boundary FQN that resolves to ``class_name`` is decomposed.
-    """
-    param_plan = _plan_field(frozen_plan, "param_plan") or {}
-    axes = tuple(_plan_field(frozen_plan, "mesh_dim_names") or ())
-    if not axes or not param_plan:
-        return {}, {}
-    index = build_source_index(source_text)
-    for fqn, entry in param_plan.items():
-        if not is_boundary_entry(entry):
-            continue
-        if _class_for_fqn(fqn, boundary_classes, index, module_name) != class_name:
-            continue
-        inbound = _per_axis_side(entry, "in_src", "in_dst", axes)
-        outbound = _per_axis_side(entry, "out_src", "out_dst", axes)
-        return inbound, outbound
-    return {}, {}
-
-
-def _per_axis_side(
-    entry: dict[str, Any], src_field: str, dst_field: str, axes: tuple[str, ...]
-) -> dict[str, dict[str, TransitionOp]]:
-    """Per-axis non-identity ops for one side, from the frozen placement strings.
-
-    Classifies each declared name on each single active axis purely from the
-    canonical placement strings (``"R"`` / ``"S(n)"`` / ``"P(sum)"``) that the
-    freeze wrote — deliberately NOT via ``classify_tp_transition`` (which pulls
-    ``hyper_parallel.distributed`` / ``accelerate`` and trips over the tests'
-    ``torch_npu`` stub in isolated runs).  So a boundary can carry an independent
-    ``tp`` and ``cp`` segment.  ``ep`` changes (MoE expert routing) are left for
-    the caller to reject via the region/dense guard.
-    """
-    src_raw = entry.get(src_field) or {}
-    dst_raw = entry.get(dst_field) or {}
-    result: dict[str, dict[str, TransitionOp]] = {}
-    for axis in axes:
-        axis_ops: dict[str, TransitionOp] = {}
-        for name in sorted(set(src_raw) | set(dst_raw)):
-            src_pl = src_raw.get(name) or {}
-            dst_pl = dst_raw.get(name) or {}
-            src = src_pl.get(axis, "R")
-            dst = dst_pl.get(axis, "R")
-            if not isinstance(src, str) or not isinstance(dst, str) or src == dst:
-                continue
-            op = _toggle_placement_op(src, dst)
-            if op is not None:
-                axis_ops[name] = op
-        if axis_ops:
-            result[axis] = axis_ops
-    return result
-
-
-def _toggle_placement_op(src: str, dst: str) -> Optional[TransitionOp]:
-    """One per-axis transition op from a valid frozen placement pair, or None.
-
-    Delegates the placement semantics to native
-    ``classify_tp_transition`` (the single source of truth the boundary-form
-    classifier already uses), invoked on the single active axis.  Frozen
-    strings are parsed with ``freeze.parse_placement``; any transition the
-    native path cannot lower (non-``sum`` partial, unsupported pair) or an
-    identity yields ``None`` (left to the boundary's compiled-plan/DTensor
-    fallback).
-    """
-    from hyper_parallel.distributed._builder.tp_collective_lowering import (  # pylint: disable=C0415
-        classify_tp_transition,
-    )
-
-    result = classify_tp_transition(
-        [parse_placement(src)], [parse_placement(dst)], ("tp",)
-    )
-    if result is None or result["kind"] == "identity":
-        return None
-    return TransitionOp(kind=result["kind"], tensor_dim=result.get("tensor_dim"))
-
-
-def _fusion_note_for(class_name: str) -> str:
-    """One-line replacement note placed at the top of a switch forward."""
-    return f"fused module {class_name}: the switch template keeps the original HF " \
-           "forward as its backbone and only adds dimension-guarded segments."
 
 
 # ---------------------------------------------------------------------------
@@ -895,8 +609,8 @@ def _build_forward_body(
     form after the static gates).  The redistribute calls go through the
     instance-bound compiled plan (``self._hp_boundary``, installed by
     ``hp_install_boundaries``); the static ``tp_collective`` form calls bare
-    operators on ``self._hp_tp`` instead; ``__hp_compute__`` is bound by
-    ``hp_bind_compute`` for the local-region shape. Either way the class
+    operators on ``self._hp_tp`` instead; the factory-named compute attribute
+    is bound by ``hp_bind_compute`` for the local-region shape. Either way the class
     stays runtime-importable without a mesh.
 
     ``deferred_bias`` (D-22) appends the exit hook call
@@ -912,7 +626,11 @@ def _build_forward_body(
 
     local = injection.get("local_compute_fn") if injection else None
     if local is not None:
-        return _render_local_compute(local, input_redist, out_redist, form)
+        raise RuntimeError(
+            "codegen: local_compute_fn reached source boundary lowering; "
+            "builder recording must mark it skip_source_lowering so runtime "
+            "can install the trainer's native Phase C wrapper"
+        )
     # A generic boundary (including an inner-wrapper one — the CP wrapper is
     # installed at runtime by ``hp_apply_inner_wrapper`` and weaves into
     # this forward) redistributes through the compiled plan, annotated with
@@ -959,23 +677,12 @@ def _render_input_redistribute(func: FunctionInfo) -> str:
 def _render_output_redistribute(deferred_bias: bool = False) -> str:
     """Render the output-side boundary exit (no signature to bind).
 
-    Mirrors the native ``_wrap_local_region_forward`` exit order exactly:
-    Step-3 re-wrap first (local -> DTensor per ``out_src``), then the Step-4
-    ``out_src -> out_dst`` redistribute, then ``to_local`` so the boundary
-    always hands its caller a plain local tensor.
+    Mirrors the native production path: the compute output remains local and
+    ``PrecompiledBoundary`` executes a lowered collective directly when
+    possible. An unlowerable transition performs any required temporary
+    DTensor wrapping internally and still returns a local tensor.
 
-    The order is load-bearing, not stylistic. The compute output is the
-    ``out_src`` *local shard* (e.g. a Partial(sum) partial sum). Re-wrapping
-    first attaches the matching ``out_src`` metadata, and the redistribute then
-    lowers the declared transition (e.g. reduce/all-reduce) to the ``out_dst``
-    value. Reversing the two — redistribute first, re-wrap second — would wrap
-    the already-reduced value with the stale ``out_src`` metadata (a DTensor
-    whose values are reduced but whose placements still say Partial(sum)), and
-    any downstream DTensor dispatch would then make placement-based decisions
-    on false metadata (e.g. ``AddDistributedOp`` zeroing a replicated operand
-    on non-zero coordinates of the partial axis).
-
-    ``deferred_bias`` (D-22) appends the exit hook AFTER ``to_local``: the
+    ``deferred_bias`` (D-22) appends the exit hook after redistribution: the
     rowwise bias was suppressed inside the region so the exit reduction sees
     a pure matmul contribution, and the hook re-adds it exactly once on the
     reduced local output — Megatron RowParallelLinear semantics.  The hook is
@@ -984,9 +691,7 @@ def _render_output_redistribute(deferred_bias: bool = False) -> str:
     cannot disagree about whether a boundary defers.
     """
     lines = [
-        "        outputs = self._hp_boundary.rewrap_outputs(outputs)",
         "        outputs = self._hp_boundary.redistribute_outputs(outputs)",
-        "        outputs = hp_to_local_if_dtensor(outputs)",
     ]
     if deferred_bias:
         lines.append("        outputs = self._hp_deferred_bias(outputs)")
@@ -1148,8 +853,8 @@ def _render_local_compute(
 ) -> str:
     """Local-region boundary (shape 2, EP MoE): compute fn on local tensors, then exit.
 
-    ``__hp_compute__`` is ``functools.partial(compute_fn, module)`` bound by
-    ``hp_parallelize``. The applier calls it as ``compute_fn(*args,
+    The factory-named attribute is ``functools.partial(compute_fn, module)``
+    bound by the emitted constructor patch. The applier calls it as ``compute_fn(*args,
     **kwargs)`` (``_wrap_local_region_forward``), so the generated forward
     forwards its own re-distributed ``*args, **kwargs`` through.  The local
     Production keeps the compute output local so the lowered boundary
@@ -1162,19 +867,14 @@ def _render_local_compute(
     identity in/out region emits no noise.
     """
     compute_name = _callable_name(local)
+    binding_name = local_compute_binding_name(local)
     return "\n".join([
         "        # [HYPER LOCAL REGION] boundary entry",
         *_ordered_notes(form.in_notes),
         input_redist,
-        "        args = tuple(hp_to_local_if_dtensor(arg) for arg in args)",
-        "        kwargs = {",
-        "            key: hp_to_local_if_dtensor(value)",
-        "            for key, value in kwargs.items()",
-        "        }",
-        "",
         "        # [HYPER LOCAL REGION] run the region compute fn on local tensors",
-        f"        # {compute_name} is bound to self by hp_parallelize.",
-        "        outputs = self.__hp_compute__(*args, **kwargs)",
+        f"        # {compute_name} is bound to self by generated source.",
+        f"        outputs = self.{binding_name}(*args, **kwargs)",
         "",
         "        # [HYPER LOCAL REGION] boundary exit",
         *_ordered_notes(form.out_notes),
@@ -1187,7 +887,12 @@ def _render_local_compute(
 def _callable_name(value: Any) -> str:
     """Human name for an injection's callable (dict target / string / fn)."""
     if isinstance(value, dict):
-        return value.get("name") or value.get("target") or repr(value)
+        return (
+            value.get("_target_")
+            or value.get("name")
+            or value.get("target")
+            or repr(value)
+        )
     if isinstance(value, str):
         return value
     return getattr(value, "__name__", repr(value))
@@ -1228,9 +933,7 @@ def _validate_no_circular(edits: list[TextEdit]) -> list[str]:
 __all__ = [
     "TP_FORM_ATTRIBUTE",
     "TP_FORM_MARKER",
-    "TOGGLE_FORM_MARKER",
     "iter_emitted_forms",
     "lower_forward_boundaries",
-    "lower_forward_boundaries_toggle",
     "resolve_emitted_form",
 ]

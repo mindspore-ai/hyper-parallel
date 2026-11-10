@@ -39,12 +39,20 @@ def _load_attention():
     return attention
 
 
+def _load_codegen():
+    """Return Qwen3 source renderers only when Codegen requests them."""
+    from hyper_parallel.models.qwen3.adapter import codegen  # pylint: disable=C0415
+
+    return codegen
+
+
 QWEN3_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="Qwen3ForCausalLM",
     model_type="qwen3",
     replacements=_load_replacements,
     attention=_load_attention,
     sharding_rules=build_parameter_sharding_rules,
+    codegen=_load_codegen,
 )
 
 register_model_adapter(QWEN3_ADAPTER_SPEC)

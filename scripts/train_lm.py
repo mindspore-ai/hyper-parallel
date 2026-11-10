@@ -14,16 +14,14 @@
 # ============================================================================
 """Language-model training entry point for the AutoModel workflow."""
 
+from hyper_parallel.codegen.train_sidecar import run_training_with_codegen
 from hyper_parallel.trainer.config.parser import parse_training_args
-from hyper_parallel.trainer.config import TrainerConfig
 from hyper_parallel.trainer.text_trainer import TextTrainer
 
 
 def main() -> None:
     """Resolve configured components and execute language-model training."""
-    config: TrainerConfig = parse_training_args()
-    trainer = TextTrainer(config)
-    trainer.train()
+    run_training_with_codegen(parse_training_args, TextTrainer)
 
 
 if __name__ == "__main__":
