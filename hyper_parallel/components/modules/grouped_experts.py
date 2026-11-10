@@ -398,7 +398,8 @@ class GroupedExperts(nn.Module):
             gate_up_proj = gate_up_proj.view(self.num_local_experts, self.hidden_size, -1)
 
         # up
-        if permuted.nelement() != 0:
+        numel = permuted.nelement()
+        if torch.compiler.is_compiling() or not isinstance(numel, int) or numel != 0:
             fc1_output = grouped_matmul(  # pylint: disable=not-callable
                 permuted, gate_up_proj, bias=None, group_list=self._group_list, group_type=0, group_list_type=0,
             )
@@ -421,7 +422,8 @@ class GroupedExperts(nn.Module):
         if self.use_2d_experts:
             down_proj = down_proj.view(self.num_local_experts, -1, self.hidden_size)
 
-        if fc1_output.nelement() != 0:
+        numel = fc1_output.nelement()
+        if torch.compiler.is_compiling() or not isinstance(numel, int) or numel != 0:
             fc2_output = grouped_matmul(  # pylint: disable=not-callable
                 fc1_output, down_proj, bias=None, group_list=self._group_list, group_type=0, group_list_type=0,
             )
