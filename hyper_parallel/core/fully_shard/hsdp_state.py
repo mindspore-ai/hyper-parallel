@@ -343,14 +343,17 @@ class HSDPStateV2:
         # Collect parameters that need gradient reduction
         params_to_reduce = []
         for hsdp_param in self.hsdp_params:
+            # NOTE: unlike torch-native FSDP we must NOT skip params whose grad
+            # is None: sparse/conditionally-executed MoE layers (HF Qwen3-Omni)
+            # leave the currently-unrouted experts with ``grad=None``, and the
+            # missed set differs per DP rank. Skipping them gives each rank a
+            # different fused collective size (HCCL EI0005 / dispatch timeout).
+            # ``reduction_grad()`` substitutes exact zeros for those params, so
+            # every rank reduces the same parameter set.
             skip_param = (
                 not hasattr(hsdp_param, "_unsharded_param")
                 or not hsdp_param.unsharded_param_buffers
                 or not hsdp_param.sharded_param.requires_grad
-                or (
-                    hsdp_param.unsharded_param.grad is None
-                    and hsdp_param.unsharded_accumulated_grad_data is None
-                )
             )
             if skip_param:
                 continue
@@ -521,7 +524,14 @@ class HSDPStateV2:
             hsdp_param.reduce_partial_output = None
             hsdp_param.unsharded_accumulated_grad = None
             hsdp_param._grad = None
-            if hsdp_param.unsharded_param_buffers:
+            # ``unsharded_param_buffers`` is allocated eagerly at setup, but the
+            # stable ``_unsharded_param`` only exists once the module has been
+            # unsharded (i.e. ran forward at least once). A module that never
+            # runs forward (e.g. the audio tower in image-only training) has
+            # buffers but no ``_unsharded_param`` and thus no gradient to clear.
+            if hsdp_param.unsharded_param_buffers and hasattr(
+                hsdp_param, "_unsharded_param"
+            ):
                 hsdp_param.unsharded_param.grad = None
 
     def set_requires_grad_sync(self, requires_grad_sync: bool) -> None:
