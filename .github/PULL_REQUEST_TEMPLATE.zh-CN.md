@@ -1,14 +1,16 @@
+<!-- markdownlint-disable MD041 MD033 -->
+<!-- This is a form rather than a document; keep the bot's /kind <label> placeholder. -->
 <!--  Thanks for sending a pull request!  Here are some tips for you:
 
-1) If this is your first time, please read our contributor guidelines: https://gitee.com/mindspore/mindspore/blob/master/CONTRIBUTING.md
+1) If this is your first time, please read our contributor guidelines: https://github.com/mindspore-ai/hyper-parallel/blob/master/CONTRIBUTING.zh.md
 
 2) If you want to contribute your code but don't know who will review and merge, please add label `mindspore-assistant` to the pull request, we will find and do it as soon as possible.
 -->
 
 **What type of PR is this?**
-<!-- 
+<!--
 选择下面一种标签替换下方 `/kind <label>`，可选标签类型有：
-- /kind bug 
+- /kind bug
 - /kind task
 - /kind feature
 - /kind refactor
@@ -24,7 +26,7 @@
 ----
 
 **Which issue(s) this PR fixes**:
-<!-- 
+<!--
 注意：在下方 #号 后仅输入issue编号或SR/AR编号，粘贴issue链接无效。
 如PR描述不符合规范，修改PR描述后需要/check-pr重新检查PR规范。
 -->

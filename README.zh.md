@@ -47,52 +47,16 @@ HyperParallel 面向昇腾超节点提供分布式并行加速能力。针对资
 
 ## 📣 最新消息
 
-- [Oct, 9, 2026]: [moonshotai/Kimi-K2.6 模型支持](hyper_parallel/models/kimi_k26/recipes/train.yaml)
-- [Aug. 25, 2026]: [Qwen/Qwen3-30B-A3B 模型支持](hyper_parallel/models/qwen3_moe/recipes/train.yaml)
-
----
-
-## 使用入口
-
-### HyperParallel 模型训练
-
-> [HyperParallel 模型](hyper_parallel/models/README.zh.md) 面向训练用户，通过 YAML 配置 Hugging Face 模型、数据、优化器、并行策略以及保存与恢复方式。
->
-> 已支持的模型与配置入口见[支持模型](#supported-models)。
-
-### HyperParallel Core
-
-> [HyperParallel Core](docs/api/api_reference.zh.md) 面向模型作者和框架开发者，提供从分布式模型构建到训练执行与状态管理的底层能力。
->
-> **核心能力**
->
-> - **模型切分与并行组合**：以 DeviceMesh、DTensor 和 Shard 描述设备拓扑与 Tensor 布局，并组合 FSDP/HSDP、TP、CP、EP、PP 等并行策略。
-> - **MoE 与异构执行**：覆盖专家切分、路由和 token dispatch，以及流水线调度、集群 MPMD 和芯片内多核 MPMD。
-> - **内存与性能优化**：提供 Activation Checkpoint、Activation Swap、通信与计算重叠、通信融合和自动并行能力。
-> - **训练与状态管理**：提供优化器、分布式检查点、异步保存、离线格式转换和确定性训练能力。
->
-> <details>
-> <summary><strong>相关文档</strong></summary>
->
-> - **模型切分**：[DTensor](docs/api/api_reference.zh.md#dtensor-分布式张量) · [FSDP/HSDP](docs/guide/fsdp.zh.md) · [TP](docs/guide/tensor_parallel.zh.md)
-> - **并行执行**：[CP](docs/guide/context_parallel.zh.md) · [EP / MoE](docs/guide/expert_parallel.zh.md) · [PP / 集群 MPMD](docs/guide/pipeline_parallel.zh.md) · [多核 MPMD](hyper_parallel/core/multicore/README.zh.md)
-> - **内存与性能**：[Activation Checkpoint / Swap](docs/guide/activation_checkpoint.zh.md) · [通信与计算重叠](docs/guide/pipeline_parallel_overlap_b_f.zh.md) · [通信融合](docs/guide/fsdp.zh.md#通信融合) · [自动并行](docs/guide/auto_parallel.zh.md)
-> - **训练与状态**：[Optimizer](docs/guide/optimizer.zh.md) · [DCP](docs/guide/distributed_checkpoint.zh.md) · [确定性调试](docs/faq.zh.md#3-确定性模式调试)
->
-> </details>
->
-> <br>
->
-> <details>
-> <summary><strong>未来计划</strong></summary>
->
-> </details>
+- [Oct. 15, 2026]: [DeepSeek-V4.1-Flash 模型支持](docs/deepseek_v41_article/README.zh.md)
+- [Oct, 9, 2026]: [moonshotai/Kimi-K2.6 模型支持](hyper_parallel/models/kimi_k26/README.zh.md)
+- [Aug. 25, 2026]: [Qwen/Qwen3-30B-A3B 模型支持](examples/training_demo/README.md#full-pretrained-model)
 
 ---
 
 <a id="supported-models"></a>
+<a id="支持模型"></a>
 
-## 支持模型
+## 🤖 支持模型
 
 详细能力与在研进展见[模型路线图](https://github.com/mindspore-ai/hyper-parallel/issues/1305)。
 
@@ -110,7 +74,9 @@ HyperParallel 面向昇腾超节点提供分布式并行加速能力。针对资
 
 ---
 
-## 安装
+<a id="安装"></a>
+
+## 🛠️ 安装
 
 完整安装方式、源码构建参数和环境要求见 [安装指南](docs/installation.zh.md)。
 
@@ -162,14 +128,14 @@ TP、CP、EP、PP 等组合方式见 [特性使用指南](docs/guide)，公开�
 - [API 参考](./docs/api/api_reference.zh.md) — 按特性模块组织的接口说明
 - [FAQ 与故障排查](./docs/faq.zh.md) — 常见问题与解决方案
 - [AI 辅助开发](./AGENTS.md) — AI 辅助开发说明
-- [社区贡献](./docs/contributing) — 开发环境、测试规范和发布流程
+- [社区贡献](CONTRIBUTING.zh.md) — 贡献流程、测试、评审和版本发布
 - [版本说明](./hyper_parallel_v1.0.0_release_notes.zh.md) — 版本变更记录
 
 ---
 
 ## 🤝 加入我们
 
-欢迎提交 Issue 和 Pull Request。开发环境、测试规范和提交流程见 [社区贡献指南](./docs/contributing)。
+欢迎提交 Issue 和 Pull Request。开发环境、测试、评审和社区发布流程见[社区贡献指南](CONTRIBUTING.zh.md)。
 
 ### Parallel Training System SIG
 
