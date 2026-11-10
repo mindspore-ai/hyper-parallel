@@ -25,6 +25,7 @@ AutoModels objects and never imports trainer config (05 §15.2.6).
 
 import fnmatch
 import logging
+import math
 from typing import Any, Dict, Literal, Optional, Union
 
 import torch
@@ -475,6 +476,132 @@ def _apply_activation_features(
     return apply_attention_swap(model, activation_swap)
 
 
+def _repair_omni_derived_buffers(model: nn.Module) -> None:
+    """Re-derive positional/rotary buffers that the meta->to_empty path erases.
+
+    hyper-parallel materialises meta models with ``to_empty``, which zeroes (or
+    leaves NaN in) every tensor -- including buffers that are DERIVED inside a
+    module's ``__init__`` (rotary ``inv_freq``, Sinusoids ``positional_embedding``)
+    and are NOT stored in the checkpoint. ``initialize_weights()`` only runs the
+    modules' ``_init_weights`` (a no-op for these derived buffers), so after
+    loading they hold 0/NaN and every forward is corrupted (inflated loss; a
+    plain from_pretrained model preserves them). Recompute them from the
+    modules' own init logic (idempotent; safe also on already-correct values).
+    """
+    try:
+        from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe as _M  # noqa: PLC0415
+    except ImportError:  # pragma: no cover
+        return
+    _thinker_rotary = getattr(_M, "Qwen3OmniMoeThinkerTextRotaryEmbedding", None)
+    _vision_rotary = getattr(_M, "Qwen3OmniMoeVisionRotaryEmbedding", None)
+    _sinusoid = getattr(_M, "SinusoidsPositionEmbedding", None)
+    changed = []
+
+    def _recompute_inv_freq(mod: nn.Module) -> None:
+        # Compute the formula on CPU: NPU pow/div is ~1 ulp off the CPU result
+        # and stock transformers computes these buffers in a CPU/meta __init__,
+        # so device-native recomputation breaks byte-parity with a plain
+        # from_pretrained model (which preserves the __init__ CPU values).
+        dev = mod.inv_freq.device
+        if getattr(mod, "rope_init_fn", None) is not None and hasattr(mod, "config"):
+            inv_freq, attn_scaling = mod.rope_init_fn(mod.config, "cpu")
+            mod.attention_scaling = attn_scaling
+        else:
+            dim = int(mod.inv_freq.numel()) * 2
+            inv_freq = 1.0 / (10000.0 ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        mod.inv_freq.copy_(inv_freq.float().to(dev))
+
+    for mod in model.modules():
+        if _thinker_rotary is not None and isinstance(mod, _thinker_rotary):
+            _recompute_inv_freq(mod)
+            changed.append(type(mod).__name__)
+        elif _vision_rotary is not None and isinstance(mod, _vision_rotary):
+            _recompute_inv_freq(mod)
+            changed.append(type(mod).__name__)
+        elif _sinusoid is not None and isinstance(mod, _sinusoid):
+            # transformers 4.57 inlines this in __init__ (5.x adds a method);
+            # replicate the exact 4.57.1 formula.
+            length, channels = tuple(mod.positional_embedding.shape)
+            max_timescale = 10000.0
+            log_timescale_increment = math.log(max_timescale) / (channels // 2 - 1)
+            inv_timescales = torch.exp(
+                -log_timescale_increment * torch.arange(channels // 2, dtype=torch.float32)
+            )
+            scaled_time = torch.arange(length, dtype=torch.float32)[:, None] * inv_timescales[None, :]
+            encoded = torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
+            mod.positional_embedding.copy_(encoded.to(mod.positional_embedding.device))
+            changed.append(type(mod).__name__)
+    if changed:
+        logger.info("Re-derived derived buffers: %s", sorted(set(changed)))
+
+
+def _restore_omni_derived_buffer_fp32(model: nn.Module) -> None:
+    """Re-derive the omni positional/rotary buffers as float32 after the
+    ``model_init_dtype`` cast.
+
+    hyper-parallel's ``apply_model_init_dtype`` runs ``model.to(dtype)`` which
+    downcasts every floating tensor -- including the non-persistent derived
+    buffers (thinker ``inv_freq``, vision ``inv_freq``, audio Sinusoids
+    ``positional_embedding``) that stock transformers 4.57.1 keeps in **float32**
+    (they are computed with explicit ``.float()`` in ``__init__`` and are not
+    part of the checkpoint). In the omni forward these buffers are implicitly
+    re-widened (``inv_freq[...].float()``) for the rotary product, so a bf16
+    storage pre-rounds them at ~0.4% and shifts every position-dependent logit
+    keeping them fp32 in storage preserves the reference logits exactly
+    (bf16 storage shifts step-0 loss by ~0.05%). Recompute the exact 4.57.1
+    formulas in fp32 and re-register.
+    """
+    try:
+        from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe as _M  # noqa: PLC0415
+    except ImportError:  # pragma: no cover
+        return
+    _thinker_rotary = getattr(_M, "Qwen3OmniMoeThinkerTextRotaryEmbedding", None)
+    _vision_rotary = getattr(_M, "Qwen3OmniMoeVisionRotaryEmbedding", None)
+    _sinusoid = getattr(_M, "SinusoidsPositionEmbedding", None)
+    changed = []
+
+    def _set_buffer(mod: nn.Module, name: str, value: torch.Tensor) -> None:
+        # Write straight into ``_buffers`` -- the module was ALREADY FSDP-wrapped
+        # by the time this runs, and calling ``register_buffer`` on a wrapped
+        # module desyncs FSDP's tracked tensor identities (hangs the first
+        # backward). In-place dict replace keeps the wrapped layout intact; the
+        # ``Module.__getattr__`` path reads from ``_buffers`` so forwards see the
+        # new fp32 value.
+        mod._buffers[name] = value
+        mod._non_persistent_buffers_set.add(name)
+
+    for mod in model.modules():
+        if _thinker_rotary is not None and isinstance(mod, _thinker_rotary):
+            if getattr(mod, "rope_init_fn", None) is not None and hasattr(mod, "config"):
+                # CPU computation: NPU pow/div is ~1 ulp off CPU (see above).
+                inv_freq, attn_scaling = mod.rope_init_fn(mod.config, "cpu")
+                mod.attention_scaling = attn_scaling
+            else:
+                # Same fallback formula as _repair_omni_derived_buffers.
+                dim = int(mod.inv_freq.numel()) * 2
+                inv_freq = 1.0 / (10000.0 ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+            _set_buffer(mod, "inv_freq", inv_freq.float().to(mod.inv_freq.device))
+            changed.append("thinker_rotary")
+        elif _vision_rotary is not None and isinstance(mod, _vision_rotary):
+            dim = int(mod.inv_freq.numel()) * 2
+            inv_freq = 1.0 / (10000.0 ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+            _set_buffer(mod, "inv_freq", inv_freq.float().to(mod.inv_freq.device))
+            changed.append("vision_rotary")
+        elif _sinusoid is not None and isinstance(mod, _sinusoid):
+            length, channels = tuple(mod.positional_embedding.shape)
+            max_timescale = 10000.0
+            log_timescale_increment = math.log(max_timescale) / (channels // 2 - 1)
+            inv_timescales = torch.exp(
+                -log_timescale_increment * torch.arange(channels // 2, dtype=torch.float32)
+            )
+            scaled_time = torch.arange(length, dtype=torch.float32)[:, None] * inv_timescales[None, :]
+            encoded = torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
+            _set_buffer(mod, "positional_embedding", encoded.to(mod.positional_embedding.device))
+            changed.append("sinusoid")
+    if changed:
+        logger.info("Restored omni derived buffers to fp32: %s", sorted(set(changed)))
+
+
 def _materialize_and_load_model(
     model: nn.Module,
     *,
@@ -532,6 +659,8 @@ def _materialize_and_load_model(
     )
     if external is not None:
         external.check_identities()
+    # meta -> to_empty erased derived (non-checkpoint) positional/rotary buffers
+    _repair_omni_derived_buffers(model)
     return model
 
 
