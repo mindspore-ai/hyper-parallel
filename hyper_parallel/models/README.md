@@ -42,4 +42,4 @@ hyper_parallel/
 └── distributed/     # Distributed model construction, parallel plan application, and activation management
 ```
 
-Each model family's replacement factories, CP/EP rules, and training entry points reside under `models/<family>/`. The repository currently ships `models/qwen3_moe/recipes/train.yaml`, `models/deepseek_v32/recipes/train.yaml`, and `models/kimi_k26/recipes/train.yaml`. The Kimi-K2.6 multimodal recipe targets four SuperNodes / 512 devices; see the [Kimi-K2.6 model-family guide](kimi_k26/README.md).
+Each model family's replacement factories, CP/EP rules, and training entry points reside under `models/<family>/`. The repository currently ships `models/qwen3_moe/recipes/train.yaml`, `models/deepseek_v32/recipes/train.yaml`, and `models/kimi_k26/recipes/train.yaml`. The Kimi-K2.6 multimodal recipe targets four SuperPoDs / 512 devices; see the [Kimi-K2.6 model-family guide](kimi_k26/README.md).

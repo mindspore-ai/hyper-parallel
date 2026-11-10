@@ -2,7 +2,7 @@
 
 **English** | [简体中文](index.zh.md)
 
-Documentation for the distributed parallel acceleration library optimized for Ascend SuperNodes.
+Documentation for the distributed parallel acceleration library optimized for Ascend SuperPoDs.
 
 ## Getting Started
 

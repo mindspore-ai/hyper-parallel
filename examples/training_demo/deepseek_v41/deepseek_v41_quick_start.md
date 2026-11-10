@@ -1,6 +1,6 @@
 # DeepSeek V4.1 快速启动
 
-在 Atlas 900 A3 SuperPoD 单机 16 个逻辑 NPU die 上，使用 HyperParallel 运行
+在 Atlas 900 A3/A5 SuperPoD 单机 16 个逻辑 NPU die 上，使用 HyperParallel 运行
 DeepSeek-V4.1 图文或纯文本预训练链路。
 
 本文以 [VLM 配置](train_deepseek_v41_vlm_online.yaml)为主，

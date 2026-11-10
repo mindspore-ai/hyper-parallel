@@ -36,7 +36,7 @@ models/kimi_k26/
 │   │   └── cropped_model.py         # build_cropped_kimi_vlm model builder (recipe model._target_)
 │   └── registration.py              # ModelAdapterSpec: sharding_rules + loss
 └── recipes/
-    ├── train.yaml                   # Main recipe: 4 SuperNodes / 512 devices, best measured configuration
+    ├── train.yaml                   # Main recipe: 4 SuperPoDs / 512 devices, best measured configuration
     ├── run_kimi_k26_4sn.sh          # Multinode launcher: 64 nodes × 8 devices by default
     └── prepare_kimi_vlm_data.py     # Generate demo image-text data for offline self-tests
 ```
@@ -114,7 +114,7 @@ Data transformations also reside in this family: `adapter/data/transform_fn.py` 
 
 ## Using the Recipe
 
-`recipes/train.yaml` targets the **main scale of 4 SuperNodes / 512 devices**, with
+`recipes/train.yaml` targets the **main scale of 4 SuperPoDs / 512 devices**, with
 `cp 1 × dp_shard 512 (= edp 4 × ep 128)`, `GBS 512 = 512 × MBS 1`, and sequence length 8192.
 This is the family's best measured 4SN configuration: minimum step time **18.2617 s**, padded throughput **228,873 tok/s**,
 and peak allocated memory **39.19 GB**, without activation swap; `edp=4` reduces each device's share of expert parameters to one quarter.

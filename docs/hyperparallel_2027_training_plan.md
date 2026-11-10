@@ -20,7 +20,7 @@ It develops four core capabilities—**usability and decoupling, parallelism for
 Responsibilities of the four capabilities:
 
 - **Codegen**: Generate specialized training implementations from models, user requirements, parallel strategies, and hardware capabilities, supporting Agent RSI and user extensions.
-- **Multidimensional parallelism**: Determine how complex models and dynamic workloads are distributed across devices, nodes, and SuperNodes.
+- **Multidimensional parallelism**: Determine how complex models and dynamic workloads are distributed across devices, nodes, and SuperPoDs.
 - **High-availability runtime**: Protect training state and preserve effective training progress through failures and recovery.
 - **Multicore parallel development framework**: Express and schedule core-level computation and communication to improve execution performance and new-operator development efficiency.
 
@@ -133,7 +133,7 @@ Fixed sample or token counts do not fully describe costs. Worst-case configurati
 | ID | Work package | Work | Deliverables |
 | --- | --- | --- | --- |
 | 2.1 | Hardware, workload, and memory modeling | Measure target GPU/NPU compute, memory, and hierarchical interconnects; model how routing, sequence length, modality mix, and micro-batches affect compute, communication, and memory peaks. | Hardware/workload profiles, calibrated cost and peak-memory models, prediction-error reports. |
-| 2.2 | Joint parallel/resource planning | Jointly choose DP/FSDP, TP, EP, CP, PP, rank mapping, recomputation, offload, and prefetch; consider intra-/inter-SuperNode communication; map search results to executable plans. | Topology-aware strategies, resource-budgeted recipes, capacity/throughput tradeoffs. |
+| 2.2 | Joint parallel/resource planning | Jointly choose DP/FSDP, TP, EP, CP, PP, rank mapping, recomputation, offload, and prefetch; consider intra-/inter-SuperPoD communication; map search results to executable plans. | Topology-aware strategies, resource-budgeted recipes, capacity/throughput tradeoffs. |
 | 2.3 | Sparse MoE and long-sequence execution | Optimize expert placement, dispatch/combine, and hotspots; support CP for target attention structures; improve variable-length packing, bucketing, and load assignment to control communication and pipeline waits. | MoE/long-sequence paths, EP/CP balance reports, regression cases for extreme routing and length distributions. |
 | 2.4 | All-modal and world-model training | Coordinate encoders/backbones and balance modality branches/stages; implement spatiotemporal partitioning and memory optimization for representative world models; validate sample alignment and loss semantics. | Architecture recipes, modality/spatiotemporal workload benchmarks, correctness/performance evidence. |
 | 2.5 | End-to-end performance and capability limits | Increase model size, context length, and modality load under fixed resources; measure startup/compilation cost, steady-state throughput, and scaling; compare same-hardware alternatives and add release regression checks. | Trainable limits, performance baselines, regression workflows, reproducible comparisons. |

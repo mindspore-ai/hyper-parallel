@@ -2,7 +2,7 @@
 
 **English** | [简体中文](RELEASE_CN.md)
 
-HyperParallel is a distributed parallel acceleration library for Ascend SuperNodes, decoupling model code from system optimization and providing unified distributed training capabilities ranging from cluster-level MPMD to in-chip multicore parallelism. v1.0.0 is the first official release, with the following core features:
+HyperParallel is a distributed parallel acceleration library for Ascend SuperPoDs, decoupling model code from system optimization and providing unified distributed training capabilities ranging from cluster-level MPMD to on-chip multicore parallelism. v1.0.0 is the first official release, with the following core features:
 
 ## Core Features
 
@@ -14,7 +14,7 @@ HyperParallel is a distributed parallel acceleration library for Ascend SuperNod
 
 - **Context Parallel (CP)** `[STABLE]`: Sequence-dimension partitioning for long-context training (128K+), offering synchronous CP, asynchronous CP, and DSA (Dense Sparse Attention) variants with asynchronous compute-communication overlap.
 
-- **Pipeline Parallel (PP)** `[STABLE]`: Supports GPipe, 1F1B, and VPP scheduling strategies, PP+FSDP integration, P2P prefetch overlap, Mpipe multimodal transpose, and forward-backward overlap for EP all-to-all communication masking.
+- **Pipeline Parallel (PP)** `[STABLE]`: Supports GPipe, 1F1B, and VPP scheduling strategies, PP+FSDP integration, P2P prefetch overlap, Mpipe multimodal transpose, and forward-backward overlap to hide EP all-to-all communication latency.
 
 - **Expert Parallel (EP)** `[DEMO]`: Expert parallelism for MoE models with EP+TP 2D parallelism, building blocks such as GroupedExperts and TokenChoiceTopKRouter, and support for load balancing and auxiliary loss.
 
@@ -30,7 +30,7 @@ HyperParallel is a distributed parallel acceleration library for Ascend SuperNod
 
 - **Distributed Optimizer** `[STABLE]`: Provides AdamW and Muon optimizers with ChainedOptimizer for mixed parameter group training, gradient scaling, and FSDP-integrated sharded optimizer states.
 
-- **In-Chip Multicore Parallelism** `[DEMO]`: Two-level on-chip MPMD parallelism with O0 (Host CPU scheduling) and O1 (AICore scheduling), combining multicore dispatch with one-sided communication to improve communication masking and MAC utilization in MoE scenarios.
+- **On-Chip Multicore Parallelism** `[DEMO]`: Two-level on-chip MPMD parallelism with O0 (host CPU scheduling) and O1 (AI Core scheduling), combining multicore dispatch with one-sided communication to improve communication latency hiding and MAC utilization in MoE scenarios.
 
 - **DFunction** `[STABLE]`: Custom distributed autograd function interface with automatic DTensor dispatch, layout inference, and output wrapping, enabling users to extend custom distributed operators.
 
