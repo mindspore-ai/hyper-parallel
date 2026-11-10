@@ -1,0 +1,155 @@
+# Four devices: DP2/CP2, three accumulation rounds, independent-document repacking.
+# Retain all 40 decoder layers and native layer roles; scale widths and expert count.
+# Use portable attention/MoE execution; no optional fused kernel build is required.
+model:
+  _target_: hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model.build_cropped_deepseek_v41
+  config_path: /path/to/DeepSeek-V4.1-Flash
+  engram_assets_path: /path/to/engram_d8.json
+  text_parameter_divisor: 8
+  num_routed_experts: 8
+  enable_vision: false
+  enable_candidate_pool: false
+  exercise_post_training_indexer: false
+  indexer_loss_coeff: 0.001
+  router_aux_loss_coeff: 0.0001
+  router_bias_update_rate: 0.001
+  torch_dtype: float32
+  validate_placement: false
+model_init_dtype: float32
+training:
+  train_iters: 20
+  eval_iters: 0
+  global_batch_size: 6
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: true
+accelerator:
+  tp_size: 1
+  cp_size: 2
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+fsdp_config:
+  dp_shard_size: 2
+  edp_shard_size: 1
+  replicate_params: []
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  comm_fusion: false
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    cast_forward_inputs: false
+mixed_precision:
+  enabled: false
+plan_overrides:
+  - match: "model.layers.*.self_attn"
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
+        use_fused_ops: false
+  - match: "model.layers.*.*_hc"
+    region_dispatch: false
+    params:
+      fn: {tp: replicate}
+      base: {tp: replicate}
+      scale: {tp: replicate}
+    in_src:
+      hidden_streams: {tp: replicate, cp: "shard(1)", ep: replicate}
+    in_dst:
+      hidden_streams: {tp: replicate, cp: "shard(1)", ep: replicate}
+    out_src:
+      pre: {tp: replicate, cp: "shard(1)", ep: replicate}
+      post: {tp: replicate, cp: "shard(1)", ep: replicate}
+      residual: {tp: replicate, cp: "shard(1)", ep: replicate}
+    out_dst:
+      pre: {tp: replicate, cp: "shard(1)", ep: replicate}
+      post: {tp: replicate, cp: "shard(1)", ep: replicate}
+      residual: {tp: replicate, cp: "shard(1)", ep: replicate}
+  - match: "model.layers.*.engram"
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.engram.EngramModule
+  - match: "model.layers.*.engram"
+    params:
+      q_weight: {tp: replicate}
+      k_weight: {tp: replicate}
+      embed.weight: {ep: "shard(0)"}
+      wkv.weight: {tp: replicate}
+  - match: "model.layers.*.engram.forward"
+    replace:
+      kind: method
+      implementation: >-
+        hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn
+  - match: "model.layers.*.mlp.forward"
+    replace:
+      kind: method
+      implementation: >-
+        hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_replicated_moe_compute_fn
+  - match: "model.layers.*.self_attn.forward"
+    when: cp
+    replace:
+      kind: method
+      implementation: >-
+        hyper_parallel.models.deepseek_v41.adapter.distributed.shared_attention_context_parallel.deepseek_v41_shared_attention_parallel_wrapper
+dataset:
+  _target_: examples.training_demo.packed_dataset.PackedTextDataset
+  data_path: /path/to/packed_arrow_dataset
+  sequence_length: 512
+  data_config:
+    seq_length: 512
+    labels_are_shifted: true
+    create_attention_mask_in_dataloader: true
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  load_balance:
+    repack_sequences: true
+    balance_window_size: 3
+    device_prefetch_depth: 1
+    min_balance_gain: 0.0
+    log_balance: true
+    metadata_mode: false
+    pad_token_id: 2
+  # Repacking uses the shared L^2 + padding^2 scheduling proxy, not DS4.1 FLOPs.
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_online_text_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.TextParallelBatch
+    source_type: packed_text
+    attention_mode: compressed
+    reset_position_ids: true
+    runtime_input_adapter:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.data.runtime.DeepseekV41Runtime
+      include_position_ids: false
+      include_image_sequence_start: false
+      pad_token_id: 2
+  drop_last: true
+  num_workers: 0
+  pin_memory: true
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+  fp32_main_params: true
+  adamw_config:
+    adamw_lr: 0.0001
+    adamw_weight_decay: 0.0
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-08
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: constant
+  lr_config:
+    lr: 0.0001
+    lr_warmup_steps: 0
+    min_lr: 0.0
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ''
+  restore_from: null

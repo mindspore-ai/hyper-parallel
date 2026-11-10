@@ -42,7 +42,7 @@ fsdp_config:
 mixed_precision:
   enabled: false
 dataset:
-  _target_: examples.training_demo.qwen3.packed_dataset.PackedTextDataset
+  _target_: examples.training_demo.packed_dataset.PackedTextDataset
   data_path: /path/to/packed_arrow_dataset
   data_config:
     seq_length: 512

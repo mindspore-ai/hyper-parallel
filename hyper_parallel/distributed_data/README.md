@@ -696,7 +696,7 @@ is supplied.
 
 The [Qwen3 repacking recipe](../../examples/training_demo/qwen3/train_balanced.yaml)
 uses HP TextTrainer and the existing Qwen3 adapter. Its
-[packed Dataset](../../examples/training_demo/qwen3/packed_dataset.py) reads a
+[packed Dataset](../../examples/training_demo/packed_dataset.py) reads a
 Hugging Face Dataset saved with `save_to_disk`, containing `input_ids`,
 pre-shifted `labels`, and `cu_seqlens`. It exposes these boundaries as
 `cu_seq_lens` to the shared repacker. Dense document attention consumes the
@@ -732,6 +732,54 @@ document tokens in `seq_len`, appended tokens in `padding`, and both square
 terms in `cost`. Fully occupied original rows can
 leave little room for a better feasible partition; the default greedy algorithm
 then retains the original grouping. Repacking does not imply a guaranteed speedup.
+
+### DeepSeek-V4.1 packed text
+
+The [DeepSeek-V4.1 recipe](../../examples/training_demo/deepseek_v41/train_balanced.yaml)
+uses the same packed Dataset and repacker with `TextTrainer`. Its default four-device
+topology is DP2/CP2/TP1/EP1, with three accumulation rounds per optimizer step.
+The parameter crop retains all 40 decoder layers and their native shared-attention
+and Engram roles. It initializes random weights; it does not load pretrained weights.
+Vision, DSpark and candidate pools are disabled. The portable attention and MoE
+paths require no optional fused operator build.
+
+Prepare Engram assets from an existing local model directory, then train on an
+existing Arrow Dataset with `input_ids`, pre-shifted `labels`, and `cu_seqlens`:
+
+```bash
+python -m hyper_parallel.models.deepseek_v41.tools.prepare_deepseek_v41_assets \
+  --model-dir /path/to/DeepSeek-V4.1-Flash \
+  --output /path/to/engram_d8.json --parameter-divisor 8 --bucket-base 128
+
+torchrun --standalone --nproc_per_node=4 --module examples.training_demo.train_text \
+  examples/training_demo/deepseek_v41/train_balanced.yaml \
+  --model.config_path=/path/to/DeepSeek-V4.1-Flash \
+  --model.engram_assets_path=/path/to/engram_d8.json \
+  --dataset.data_path=/path/to/packed_arrow_dataset
+```
+
+For DP2 without CP, launch two processes and add `--accelerator.cp_size=1`.
+When changing packing capacity, set both `dataset.sequence_length` and
+`dataset.data_config.seq_length` to the same value, divisible by CP size.
+The recipe requires a Transformers version providing the DeepSeek-V4 classes.
+Missing local assets fail explicitly; neither command downloads model weights.
+
+`attention_mode: compressed` and `DeepseekV41Runtime` pass the rebuilt global
+boundaries to shared attention and Engram without allocating a dense sequence-square
+mask. RoPE positions reset within each document, while CP query offsets remain
+physical offsets in the packed row. The Engram replacement exchanges the n-gram
+context across CP boundaries, and the replicated MoE adapter reduces auxiliary
+statistics over CP and expert-bias statistics over DP/CP. `TextParallelBatch` owns
+positions and shifted labels. The runtime supplies `packed_seq_params` and a
+`router_token_mask` that excludes PAD while retaining prompt-masked text. The PAD ID
+defaults to 2 and must match a dedicated PAD token in the input Dataset; keep
+`dataloader.load_balance.pad_token_id` and the runtime adapter's `pad_token_id` equal.
+
+The default repacking cost remains the normalized `sum(L_i**2) + P**2` proxy.
+It is not an exact DS4.1 compressed-attention FLOPs or latency model; a lower planned
+cost does not establish a training speedup. Use `dataloader.cost_model` for a
+calibrated model-specific estimator when needed. This recipe covers packed text,
+not image/text repacking or fused-kernel performance acceptance.
 
 Native-sampler regression coverage:
 

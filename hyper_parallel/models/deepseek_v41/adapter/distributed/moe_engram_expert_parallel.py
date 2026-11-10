@@ -188,6 +188,67 @@ def _resolve_router(router_fn: Callable, ep_size: int, fix_router: bool = False)
 
 
 @local_compute
+def deepseek_v41_replicated_moe_compute_fn(
+        *,
+        module: Any,
+        mesh: Any,
+        tp_mesh: Any,
+        cp_mesh: Any,
+        ep_mesh: Any,
+) -> Callable:
+    """Keep native experts with distributed router statistics for EP1 training.
+
+    Args:
+        module: V4.1 MoE block with replicated routed and shared experts.
+        mesh: Full mesh supplying data-parallel bias statistics groups.
+        tp_mesh: Tensor-parallel mesh used to align token metadata.
+        cp_mesh: Context-parallel mesh partitioning each packed sequence.
+        ep_mesh: Must be absent; sharded experts require an EP compute adapter.
+
+    Returns:
+        Native expert computation with CP/TP auxiliary and DP bias reductions.
+    """
+    require_attrs(module, "gate", "experts", "shared_experts", owner="DeepSeek-V4.1 replicated MoE")
+    if ep_mesh is not None:
+        raise ValueError("DeepSeek-V4.1 replicated MoE requires EP1")
+    if module.is_hash:
+        raise ValueError("DeepSeek-V4.1 replicated MoE requires learned routing")
+    sequence_groups = _configure_router_statistics(module.gate, mesh, tp_mesh, cp_mesh)
+
+    def compute_fn(
+            module: Any,
+            hidden_states: torch.Tensor,
+            input_ids: torch.Tensor | None = None,
+            image_mask: torch.Tensor | None = None,
+            router_token_mask: torch.Tensor | None = None,
+            router_sequence_ids: torch.Tensor | None = None,
+            router_num_sequences: int | None = None,
+    ) -> torch.Tensor:
+        """Route local tokens with statistics over complete logical samples.
+
+        Args:
+            module: MoE block owning replicated experts.
+            hidden_states: Local token activations.
+            input_ids: Unused by learned routing.
+            image_mask: Optional image-token mask.
+            router_token_mask: Optional valid-token mask.
+            router_sequence_ids: Optional packed logical sample IDs.
+            router_num_sequences: Global sample count within this microbatch.
+        """
+        del input_ids
+        indices, weights = _router(
+            module, hidden_states, _local_router_metadata(image_mask, hidden_states, tp_mesh),
+            _local_router_metadata(router_token_mask, hidden_states, tp_mesh),
+            _local_router_metadata(router_sequence_ids, hidden_states, tp_mesh),
+            router_num_sequences, sequence_partition_groups=sequence_groups,
+        )
+        routed = module.experts(hidden_states.reshape(-1, hidden_states.shape[-1]), indices, weights)
+        return routed.view_as(hidden_states) + module.shared_experts(hidden_states)
+
+    return compute_fn
+
+
+@local_compute
 def deepseek_v41_ep_compute_fn(
         *,
         module: Any,
@@ -506,4 +567,7 @@ def deepseek_v41_engram_compute_fn(
     return compute_fn
 
 
-__all__ = ["deepseek_v41_engram_compute_fn", "deepseek_v41_ep_compute_fn", "deepseek_v41_megamoe_compute_fn"]
+__all__ = [
+    "deepseek_v41_engram_compute_fn", "deepseek_v41_ep_compute_fn", "deepseek_v41_megamoe_compute_fn",
+    "deepseek_v41_replicated_moe_compute_fn",
+]
