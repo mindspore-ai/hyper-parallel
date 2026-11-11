@@ -18,8 +18,7 @@ wheel_path=/absolute/path/printed/by/build.sh
 pip install "${wheel_path}"
 ```
 
-If you only need a core-only wheel without optional native components, use
-`./build.sh --multicore off`. The indexed Dataset helper is a base component and has no separate disable switch.
+`./build.sh` compiles the indexed Dataset helper. HyperMulticore is installed separately when required.
 
 ### Q: Import fails with `GLIBC_2.xx not found`
 

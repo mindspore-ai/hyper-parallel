@@ -227,7 +227,7 @@ Writing these system mechanisms separately for every operator raises development
 The framework targets heterogeneous on-chip cores and connects to cross-device communication. Developers describe semantics, necessary kernels, and task dependencies; the framework handles common core mapping, orchestration, memory planning, and execution generation.
 
 **Existing foundation.** Multicore already provides fused MoE forward/backward, task graphs, scheduling, and Torch integration. Work in 2027 expands reuse, completes tuning/validation tools, and adds representative scenarios based on measured benefit.
-References: [Multicore Guide](../hyper_parallel/core/multicore/README.md), [Multicore Architecture](../hyper_parallel/core/multicore/docs/architecture.md).
+Reference: [HyperMulticore project](https://github.com/mindspore-ai/hyper-multicore).
 
 ### 6.4 Concrete Work
 

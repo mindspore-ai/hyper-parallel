@@ -268,8 +268,7 @@ MoE 区分专家路由分布与 EP rank 计算耗时；CP 按实际注意力计�
 
 **现有基础。** Multicore 已有 MoE 前后向融合、任务图、调度和 Torch 接入基础。
 2027 年重点扩大框架复用范围、完善调优与验证工具，并根据实际收益扩展代表场景。
-参考：[Multicore 使用指南](../hyper_parallel/core/multicore/README.zh.md)、
-[Multicore 架构设计](../hyper_parallel/core/multicore/docs/architecture.zh.md)。
+参考：[HyperMulticore 项目](https://github.com/mindspore-ai/hyper-multicore)。
 
 ### 6.4 具体工作
 

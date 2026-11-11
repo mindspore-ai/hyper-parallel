@@ -109,27 +109,11 @@ bash docker/run_hyper-parallel.sh --cards 0,1,2,3,4,5,6,7 -- \
   python3 -c "import importlib.metadata as md; print(md.version('hyper_parallel'))"
 ```
 
-## Native 扩展构建
+## 按需使用 HyperMulticore
 
-Dockerfile 支持以下构建参数：
-
-```text
-BUILD_MULTICORE_EXTENSION=off|torch|all
-BUILD_SHMEM_EXTENSION=off|torch|all
-HYPER_PARALLEL_BUILD_STRICT=off|on
-```
-
-示例：
-
-```bash
-docker build -f docker/Dockerfile.torch \
-  -t hyper-parallel:torch-native \
-  --build-arg TORCH_EXTRA=torch29 \
-  --build-arg BUILD_MULTICORE_EXTENSION=torch \
-  --build-arg BUILD_SHMEM_EXTENSION=torch \
-  --build-arg HYPER_PARALLEL_BUILD_STRICT=off \
-  .
-```
+使用 MegaMoE、MegaGate 或 MegaMHC 的训练镜像需要独立安装 HyperMulticore。
+安装匹配的 wheel，并在启动训练前激活 `hyper_multicore_set_env.bash`。
+Dockerfile 不编译多核算子。
 
 ## 验证
 

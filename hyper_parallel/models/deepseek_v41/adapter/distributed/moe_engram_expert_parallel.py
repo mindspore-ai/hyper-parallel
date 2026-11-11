@@ -366,7 +366,7 @@ def deepseek_v41_megamoe_compute_fn(
     if dist.is_initialized() and dist.get_world_size(ep_group) != ep_size:
         raise ValueError("MegaMoe EP mesh and process group sizes must match")
     sequence_groups = _configure_router_statistics(module.gate, mesh, tp_mesh, cp_mesh)
-    module.experts.configure(ep_group, ep_size, module.gate.top_k)
+    module.experts.configure(ep_group, module.gate.top_k)
 
     def compute_fn(
             module: Any, hidden_states: torch.Tensor,

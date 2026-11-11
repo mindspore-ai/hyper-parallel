@@ -16,9 +16,7 @@
 FROM quay.io/ascend/cann:9.1.0-a3-ubuntu22.04-py3.11
 
 ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    BUILD_MULTICORE_EXTENSION=off \
-    BUILD_SHMEM_EXTENSION=off
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /workspace/hyper-parallel
 

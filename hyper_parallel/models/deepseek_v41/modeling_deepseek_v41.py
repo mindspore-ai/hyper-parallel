@@ -47,7 +47,6 @@ from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
 from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
 from hyper_parallel.components.modules.mhc import PipelinedMhcModule, pipelined_mhc_post
-from hyper_parallel.core.multicore.modules.mega_gate import MegaGate
 from hyper_parallel.models.deepseek_v41.adapter.aux_loss import (
     accumulate_router_load,
     sequence_load_balancing_loss,
@@ -77,6 +76,14 @@ from hyper_parallel.models.deepseek_v41.vision import (
     DeepseekV41VisionTower,
 )
 from hyper_parallel.models.materialization import register_rebuildable_buffer
+
+# Native model replacements are optional; an installed package's own failures propagate.
+try:
+    from hyper_multicore import MegaGate
+except ModuleNotFoundError as error:
+    if error.name != "hyper_multicore":
+        raise
+    MegaGate = None
 
 _FULL_MODEL_MODE = "full"
 _VALIDATION_CROP_MODE = "validation_crop"
@@ -594,7 +601,7 @@ def _initialize_v41_owned_module(module: nn.Module, std: float) -> None:
     if isinstance(module, (DeepseekV41Engram, EngramModule)):
         module.q_weight.fill_(1.0)
         module.k_weight.fill_(1.0)
-    elif isinstance(module, (DeepseekV41TopKRouter, MegaGate)):
+    elif isinstance(module, DeepseekV41TopKRouter) or (MegaGate is not None and isinstance(module, MegaGate)):
         nn.init.normal_(module.weight, mean=0.0, std=std)
         tokens_per_expert = getattr(module, "tokens_per_expert", None)
         if tokens_per_expert is not None:

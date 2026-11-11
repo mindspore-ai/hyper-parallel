@@ -5,7 +5,7 @@
 HyperParallel 提供两种安装方式：
 
 - **pip 安装**：安装已经构建好的 `hyper-parallel` 包，并通过 extras 选择运行时深度学习框架依赖。
-- **源码构建**：使用 `./build.sh` 生成 whl 包，并按构建参数决定是否编译 native 扩展。
+- **源码构建**：使用 `./build.sh` 生成 whl 包。
 
 如果只需要安装已发布的包，优先使用 `pip install`。如果需要在本机生成 whl，或需要调整 native 扩展构建配置，再使用源码构建。
 
@@ -26,21 +26,11 @@ zsh 等 shell 下建议给带 extras 的包名加引号，避免 `[]` 被解释�
 
 ## 2. 从源码编译 whl 包
 
-统一入口调用所选组件的构建脚本，再将成功组件的产物组装为一个 wheel。indexed Dataset C++ helper
-每次都会编译；Multicore 包含其私有 SHMEM 依赖，不再提供独立 SHMEM 开关。
-
-| 参数 | 默认值 | 可选值 | 说明 |
-|------|--------|--------|------|
-| `--multicore` | `on` | `on`、`off` | 编译 Torch Multicore 及其私有 SHMEM。 |
-| `--soc-list` | `ascend910b,ascend910_93` | SoC 列表 | 选择 Multicore kernel 目标。 |
-| `--strict` | `off` | `on`、`off` | 所选 optional 组件失败时是否终止。 |
-| `--jobs` | `nproc` | 正整数 | 设置 native 编译并行度。 |
-| `--clean` | 关闭 | 无参数开关 | 重建所选组件的工作和安装目录。 |
+indexed Dataset C++ helper 每次都会编译。
 
 ```bash
 ./build.sh --help
-./build.sh --multicore on --soc-list ascend910b,ascend910_93
-./build.sh --strict on --jobs 24
+./build.sh
 # 安装本次命令打印的精确 wheel 路径
 pip install /absolute/path/to/the-built-wheel.whl
 ```
@@ -50,32 +40,23 @@ pip install /absolute/path/to/the-built-wheel.whl
 源码和预编译 wheel 的运行环境还必须满足最终 ELF 记录的 glibc、框架 ABI 及 SDK 约束。
 
 每次统一构建重新生成 `build/native/payload/hyper_parallel`；只交付本次成功的组件。
-`--strict on` 在所选组件失败时终止，适用于验收与发布；默认宽松模式允许 optional 组件失败后继续组包，
-因此 wheel 生成不代表所有 optional 组件可用。
 `python setup.py bdist_wheel` 不触发 native 编译；无显式 payload 时仅组装 Python 源码。
-启用 Multicore 后，必须在启动 Python 前激活其 CANN custom OPP。
 
-## 3. 激活 Multicore CANN custom OPP
+## 3. 按需使用 HyperMulticore
 
-源码或 editable 开发使用统一构建生成的 payload：
+MegaMoE、MegaGate 和 MegaMHC 替换使用独立安装的
+[HyperMulticore](https://github.com/mindspore-ai/hyper-multicore)。HyperParallel 不自动安装或编译该组件。
+启用对应替换前，安装匹配训练环境的 wheel，并在启动 Python 前激活 CANN custom OPP：
 
 ```bash
+pip install /absolute/path/to/hyper_multicore.whl
 source /usr/local/Ascend/cann/set_env.sh
-source build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
+source "$(command -v hyper_multicore_set_env.bash)"
 python your_program.py
 ```
 
-wheel 安装后，使用安装到当前 Python 环境的定位脚本：
-
-```bash
-source /usr/local/Ascend/cann/set_env.sh
-source "$(command -v hyper_parallel_multicore_set_env.bash)"
-python your_program.py
-```
-
-激活脚本必须在启动业务 Python 进程前执行。脚本设置已交付 Multicore vendor 所需的
-`ASCEND_CUSTOM_OPP_PATH` 和动态库路径。wheel 安装态不依赖源码仓中的 `build/` 目录；源码或 editable
-开发态则从同一 checkout 的 `build/native/payload` 加载构建产物。
+CANN 激活脚本路径以本机安装为准。源码构建和框架兼容要求见 HyperMulticore 构建指南。
+普通 HyperParallel 功能及未启用这些替换的模型不要求安装 HyperMulticore。
 
 ## 4. 验证安装
 

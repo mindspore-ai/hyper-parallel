@@ -29,7 +29,7 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.models.replacement import module_replacement
 
 if TYPE_CHECKING:
-    from hyper_parallel.core.multicore import MegaMoeExperts
+    from hyper_multicore import MegaMoeExperts
 
 
 def _swiglu_limit(value: float) -> float:
@@ -98,26 +98,28 @@ class DeepseekV41MegaMoeExperts(nn.Module):
                                 operations=[Transpose(dim0=-2, dim1=-1)])
                 for name in ("gate_up_proj", "down_proj")]
 
-    def configure(self, ep_group: Any, ep_size: int, top_k: int) -> None:
+    def configure(self, ep_group: Any, top_k: int) -> None:
         """Bind the EP mesh and routing width after model replacement.
 
         Args:
             ep_group: Ordered EP process group, including a subgroup of the training world.
-            ep_size: Number of EP ranks.
             top_k: Number of selected experts per token.
         """
         if self._executor is not None:
             raise RuntimeError("Cannot reconfigure an active MegaMoe expert executor")
         # Multicore is optional for the default native-EP replacement provider.
-        from hyper_parallel.core.multicore import MegaMoeExperts  # pylint: disable=C0415
+        from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions  # pylint: disable=C0415
+        from hyper_multicore.experimental import MegaMoeTuningOptions  # pylint: disable=C0415
 
         self._executor = MegaMoeExperts(
             hidden_size=self.hidden_size,
             intermediate_size=self.intermediate_size, num_experts=self.global_experts,
-            top_k=top_k, ep_group=ep_group, ep_size=ep_size,
-            dispatch_mode=self.dispatch_mode, initial_capacity_factor=self.initial_capacity_factor,
-            capacity_growth_factor=self.capacity_growth_factor, swiglu_limit=self.swiglu_limit,
-            create_parameters=False,
+            top_k=top_k, ep_group=ep_group,
+            numerics_options=MegaMoeNumericsOptions(swiglu_limit=self.swiglu_limit),
+            tuning_options=MegaMoeTuningOptions(
+                dispatch_mode=self.dispatch_mode, initial_capacity_factor=self.initial_capacity_factor,
+                capacity_growth_factor=self.capacity_growth_factor,
+            ),
         )
 
     def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor,
@@ -152,7 +154,7 @@ class DeepseekV41MegaMoeExperts(nn.Module):
         if any(executor is None for executor in executors):
             raise RuntimeError("Configure every expert before sharing execution resources")
         # Import only when explicitly sharing configured MegaMoe executors.
-        from hyper_parallel.core.multicore import MegaMoeExperts  # pylint: disable=C0415
+        from hyper_multicore import MegaMoeExperts  # pylint: disable=C0415
 
         MegaMoeExperts.share_execution_resources(executors)
 

@@ -27,6 +27,8 @@ from torch.nn import functional as F
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Experts, DeepseekV4SparseMoeBlock
 
+from hyper_multicore import MegaMoeExperts
+
 from hyper_parallel.components.checkpoint.weight_conversion import revert_weight_conversion
 from hyper_parallel.models.replacement import (
     apply_module_replacements, compile_module_replacements,
@@ -34,7 +36,6 @@ from hyper_parallel.models.replacement import (
 from hyper_parallel.trainer.config.parser import parse_training_args
 from hyper_parallel.trainer.config.trainer import TrainerConfig
 
-from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.distributed._builder.forward_rewriter import validate_local_compute_signature
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import (
     DeepseekV41MegaMoeExperts,
@@ -169,7 +170,7 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
                                  forward=lambda hidden_states, input_ids=None: hidden_states)
         with (patch.object(ep_adapter.dist, 'is_initialized', return_value=True),
               patch.object(ep_adapter.dist, 'get_world_size', return_value=2) as world_size,
-              patch('hyper_parallel.core.multicore.modules.mega_moe.module.shmem.root_members', return_value=(1, 3))):
+              patch('hyper_multicore.modules.mega_moe.module.shmem.root_members', return_value=(1, 3))):
             deepseek_v41_megamoe_compute_fn(module=module, mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=mesh)
         self.assertGreater(world_size.call_count, 0)
         for invocation in world_size.call_args_list:
@@ -216,12 +217,12 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
         torch.manual_seed(9)
         source = _source()
         experts = DeepseekV41MegaMoeExperts(module=source)
-        experts.configure(None, 1, 2)
+        experts.configure(None, 2)
         self.addCleanup(experts.close_runtime)
         self.assertEqual(set(experts.state_dict()), {"gate_up_proj", "down_proj"})
         self.assertEqual(len(list(experts.parameters())), 2)
         kernel = experts._executor
-        self.assertIsNone(kernel.gate_up_weight)
+        self.assertEqual(list(kernel.parameters()), [])
         for step in range(2):
             with self.subTest(step=step):
                 inputs = (torch.randn(128, 8) * 5).requires_grad_()
@@ -245,7 +246,7 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
                     torch.testing.assert_close(left, right, rtol=1e-5, atol=1e-5)
                 for left, right in zip(grads[2:], ref_grads[2:]):
                     torch.testing.assert_close(left, right.transpose(1, 2), rtol=1e-5, atol=1e-5)
-                self.assertIsNone(kernel.gate_up_weight)
+                self.assertEqual(list(kernel.parameters()), [])
                 with torch.no_grad():
                     source.gate_up_proj.add_(0.1)
                     experts.gate_up_proj.copy_(source.gate_up_proj.transpose(1, 2))
@@ -257,12 +258,12 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
         Expectation: Release all references to unsharded expert views after an execution failure.
         """
         experts = DeepseekV41MegaMoeExperts(module=_source())
-        experts.configure(None, 1, 2)
+        experts.configure(None, 2)
         self.addCleanup(experts.close_runtime)
         with patch.object(MegaMoeExperts, "forward", side_effect=RuntimeError("native failure")):
             with self.assertRaisesRegex(RuntimeError, "native failure"):
                 experts(torch.zeros(128, 8), torch.zeros(128, 2, dtype=torch.int32), torch.ones(128, 2))
-        self.assertIsNone(experts._executor.gate_up_weight)
+        self.assertEqual(list(experts._executor.parameters()), [])
         self.assertEqual(len(list(experts.parameters())), 2)
 
     def test_reject_mismatched_shared_limit_and_parallel_axes(self) -> None:
@@ -393,7 +394,7 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
         for tokens in (0, 7, 128):
             with self.subTest(tokens=tokens):
                 experts = DeepseekV41MegaMoeExperts(module=_source())
-                experts.configure(None, 1, 2)
+                experts.configure(None, 2)
                 self.addCleanup(experts.close_runtime)
                 hidden = torch.randn(tokens, 8, requires_grad=True)
                 ids = torch.arange(tokens * 2).reshape(tokens, 2) % 4
@@ -460,17 +461,20 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
             with self.subTest(options=options):
                 experts = DeepseekV41MegaMoeExperts(module=_source(), **options)
                 self.addCleanup(experts.close_runtime)
-                experts.configure(None, 1, 2)
+                experts.configure(None, 2)
                 executor = experts._executor
-                self.assertEqual((executor.dispatch_mode, executor.initial_capacity_factor,
-                                  executor.capacity_growth_factor), expected)
+                settings = executor._resource_group.specification
+                self.assertEqual((settings["dispatch_mode"], settings["initial_capacity_factor"],
+                                  settings["capacity_growth_factor"]), expected)
                 self.assertEqual(executor.swiglu_limit, 10.0)
+                self.assertFalse(executor.clamp_after_silu)
+                self.assertFalse(executor.apply_probs_before_fc2)
                 self.assertEqual(set(experts.state_dict()), {"gate_up_proj", "down_proj"})
         for option in ("initial_capacity_factor", "capacity_growth_factor"):
             with self.subTest(option=option), self.assertRaisesRegex(ValueError, "only supported for push"):
                 experts = DeepseekV41MegaMoeExperts(module=_source(),
                                                    dispatch_mode="pull", **{option: 1.5})
-                experts.configure(None, 1, 2)
+                experts.configure(None, 2)
 
     def test_meta_topology_and_incorrect_pairing(self) -> None:
         """Feature: DSV4.1 automatic-token integration.
@@ -498,7 +502,7 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
         model = nn.ModuleList([DeepseekV41MegaMoeExperts(module=_source()) for _ in range(2)])
         for experts in model:
             self.addCleanup(experts.close_runtime)
-            experts.configure(None, 1, 2)
+            experts.configure(None, 2)
         DeepseekV41MegaMoeExperts.prepare_runtime_group(list(model))
         self.assertIs(model[0]._executor._resource_group, model[1]._executor._resource_group)
         self.assertTrue(all(experts._executor is not None for experts in model))

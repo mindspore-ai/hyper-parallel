@@ -109,27 +109,11 @@ bash docker/run_hyper-parallel.sh --cards 0,1,2,3,4,5,6,7 -- \
   python3 -c "import importlib.metadata as md; print(md.version('hyper_parallel'))"
 ```
 
-## Native Extension Builds
+## Optional HyperMulticore
 
-The Dockerfile supports these build arguments:
-
-```text
-BUILD_MULTICORE_EXTENSION=off|torch|all
-BUILD_SHMEM_EXTENSION=off|torch|all
-HYPER_PARALLEL_BUILD_STRICT=off|on
-```
-
-Example:
-
-```bash
-docker build -f docker/Dockerfile.torch \
-  -t hyper-parallel:torch-native \
-  --build-arg TORCH_EXTRA=torch29 \
-  --build-arg BUILD_MULTICORE_EXTENSION=torch \
-  --build-arg BUILD_SHMEM_EXTENSION=torch \
-  --build-arg HYPER_PARALLEL_BUILD_STRICT=off \
-  .
-```
+HyperMulticore is installed separately in training images that use MegaMoE, MegaGate or MegaMHC.
+Install a matching wheel and activate `hyper_multicore_set_env.bash` before starting training.
+The Dockerfiles do not build multicore operators.
 
 ## Verification
 

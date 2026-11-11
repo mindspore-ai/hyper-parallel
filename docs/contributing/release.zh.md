@@ -65,17 +65,15 @@ git push upstream vX.Y.Z
 ### 5. 构建 Wheel
 
 ```bash
-# 外部构建工程先选择 CANN 环境；统一入口完成依赖准备、native 编译和 wheel 打包
+# 选择 CANN 环境
 source /usr/local/Ascend/cann/set_env.sh
-bash build.sh --multicore on --strict on --jobs 24
+bash build.sh
 
 # 每个 Python ABI/host 架构一个 wheel，例如：
 # hyper_parallel-0.1.0-cp310-cp310-linux_aarch64.whl
 ```
 
-严格模式下，任一启用组件失败都会终止，本次不生成 wheel。开发场景使用默认 `--strict off` 时，optional
-native 组件失败会记录 warning 并继续组包；此时 wheel 生成不代表所有 optional 能力可用。正式发布由版本
-指定的 glibc 基线构建、全量用例和人工评审共同决定。native 制品要求 CANN >= 9.1.0。
+正式发布由版本指定的 glibc 基线构建、全量用例和人工评审共同决定。
 
 ### 6. 发布后验证
 
@@ -89,7 +87,7 @@ native 组件失败会记录 warning 并继续组包；此时 wheel 生成不代
 - [ ] 交叉引用链接正确、术语一致
 - [ ] wheel/PYTHONPATH 的组件验证和 clean-venv smoke 通过
 - [ ] 所选组件的缺失依赖、环境未激活和 ABI 错误诊断符合各自契约
-- [ ] 目标 glibc 基线检查通过；910B/910C native 构建与用例通过，不支持的 SoC 返回明确 reason code
+- [ ] 目标 glibc 基线检查通过
 
 ## 版本历史
 

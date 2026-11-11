@@ -21,11 +21,8 @@ import sys
 import pytest
 
 from tests.common.mark_utils import arg_mark
-from tests.torch.multicore._case_launcher import run_multicore_case
-from tests.torch.multicore._test_env import (
-    prepare_multicore_test_environment,
-    without_inherited_rank_environment,
-)
+from tests.common.distributed_launcher import torchrun_case
+from tests.torch.multicore._integration import activate_multicore_environment, without_inherited_rank_environment
 
 _WORKER = str(Path(__file__).with_name("_test_mega_gate_deepseek_v41.py"))
 _HCCL_PORT_RANGE = "62100-62163"
@@ -62,8 +59,8 @@ def deepseek_v41_environment() -> None:
           card_mark="allcards", essential_mark="essential")
 def test_mega_gate_deepseek_v41(case: str, num_proc: int, monkeypatch: pytest.MonkeyPatch) -> None:
     """Exercise the native router and model-owned distributed execution paths."""
-    prepare_multicore_test_environment()
     if num_proc > 1:
         monkeypatch.setenv("HCCL_NPU_SOCKET_PORT_RANGE", _HCCL_PORT_RANGE)
+    activate_multicore_environment(monkeypatch)
     with without_inherited_rank_environment():
-        run_multicore_case(_WORKER, case, num_proc=num_proc)
+        torchrun_case(_WORKER, case, num_proc=num_proc)
