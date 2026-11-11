@@ -22,7 +22,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
-from typing import Any, Callable, Optional, Sequence
+from typing import Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -121,22 +121,4 @@ def start_codegen_sidecar(
     return process
 
 
-def run_training_with_codegen(
-    parse_training_args: Callable[[], Any],
-    trainer_type: Callable[[Any], Any],
-    argv: Optional[Sequence[str]] = None,
-) -> None:
-    """Start rank-zero generation before running the standard Trainer.
-
-    Args:
-        parse_training_args: Native Trainer configuration parser.
-        trainer_type: Native Trainer class or compatible factory.
-        argv: Complete training command arguments. Defaults to ``sys.argv``.
-    """
-    arguments = sys.argv if argv is None else argv
-    config = parse_training_args()
-    start_codegen_sidecar(config._yaml_path, arguments[2:])  # pylint: disable=protected-access
-    trainer_type(config).train()
-
-
-__all__ = ["run_training_with_codegen", "start_codegen_sidecar"]
+__all__ = ["start_codegen_sidecar"]
