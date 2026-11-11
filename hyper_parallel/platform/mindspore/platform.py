@@ -13,10 +13,12 @@
 # limitations under the License.
 # ============================================================================
 """MindSpore platform api"""
+import contextlib
 from datetime import timedelta
-from typing import Any, Optional, Union
+from typing import Any, Iterator, Optional, Union
 import dataclasses
 from collections import OrderedDict
+import uuid
 
 import numpy as np
 import mindspore as ms
@@ -69,6 +71,27 @@ _tensor_transform = TensorTransform.get_instance()
 
 
 # pylint: disable=C0103
+
+
+class _CombinedHandleList:
+    """Expose multiple live handle lists as one sequence."""
+
+    def __init__(self, lists: tuple[list[Any], ...]) -> None:
+        """Store the source lists without copying their contents."""
+        self._lists = lists
+
+    def __iter__(self) -> Iterator[Any]:
+        """Iterate handles from every source list."""
+        for handles in self._lists:
+            yield from handles
+
+    def __len__(self) -> int:
+        """Return the current number of collected handles."""
+        return sum(len(handles) for handles in self._lists)
+
+    def __bool__(self) -> bool:
+        """Return whether any source list currently contains a handle."""
+        return any(self._lists)
 
 
 def _a2a_reconstruct_ms(out_perm: Tensor, concat_dim: int) -> Tensor:
@@ -1850,26 +1873,68 @@ class MindSporePlatform(Platform):
         return AsyncSaveOnCpu(policy_fn=policy_fn, group_swap=group_swap)
 
     @staticmethod
-    def recompute_handle_collector_ctx():
-        # pylint: disable=C0415
-        from mindspore.common.recompute import _recompute_handle_collector_ctx
-        return _recompute_handle_collector_ctx()
+    def recompute_handle_collector_ctx() -> Any:
+        """Collect native and HyperParallel reentrant recompute handles."""
+        @contextlib.contextmanager
+        def collect_handles() -> Iterator[Any]:
+            """Yield a live combined view of native and reentrant handles."""
+            # pylint: disable=C0415
+            from mindspore.common.recompute import _recompute_handle_collector_ctx
+            from hyper_parallel.platform.mindspore.activation_checkpoint.reentrant_checkpoint import (
+                reentrant_recompute_handle_collector_ctx,
+            )
+
+            with (
+                _recompute_handle_collector_ctx() as native_handles,
+                reentrant_recompute_handle_collector_ctx() as reentrant_handles,
+            ):
+                yield _CombinedHandleList((native_handles, reentrant_handles))
+
+        return collect_handles()
 
     @staticmethod
-    def recompute_handle(handle, session_id):
+    def recompute_handle(handle: Any, session_id: Any) -> None:
+        """Recompute one native or HyperParallel reentrant checkpoint handle."""
         return handle.recompute(session_id)
 
     @staticmethod
-    def recompute_session_ctx(session_id, retain_on_unpack=False):
-        # pylint: disable=C0415
-        from mindspore.common.recompute import _recompute_session_ctx
-        return _recompute_session_ctx(session_id=session_id, retain_on_unpack=retain_on_unpack)
+    def recompute_session_ctx(session_id: Any, retain_on_unpack: bool = False) -> Any:
+        """Open one recompute session for native and reentrant handles."""
+        @contextlib.contextmanager
+        def session_context() -> Iterator[Any]:
+            """Enter the matching native and reentrant replay sessions."""
+            resolved_session_id = session_id if session_id is not None else uuid.uuid4().hex
+            # pylint: disable=C0415
+            from mindspore.common.recompute import _recompute_session_ctx
+            from hyper_parallel.platform.mindspore.activation_checkpoint.reentrant_checkpoint import (
+                reentrant_recompute_session_ctx,
+            )
+
+            with (
+                _recompute_session_ctx(
+                    session_id=resolved_session_id,
+                    retain_on_unpack=retain_on_unpack,
+                ),
+                reentrant_recompute_session_ctx(
+                    session_id=resolved_session_id,
+                    retain_on_unpack=retain_on_unpack,
+                ),
+            ):
+                yield resolved_session_id
+
+        return session_context()
 
     @staticmethod
-    def clear_recompute_session(session_id):
+    def clear_recompute_session(session_id: Any) -> None:
+        """Release native and reentrant recompute state for one session."""
         # pylint: disable=C0415
         from mindspore.common.recompute import _clear_recompute_session
-        return _clear_recompute_session(session_id)
+        from hyper_parallel.platform.mindspore.activation_checkpoint.reentrant_checkpoint import (
+            clear_reentrant_recompute_session,
+        )
+
+        _clear_recompute_session(session_id)
+        clear_reentrant_recompute_session(session_id)
 
     _MS_DEVICE_MAP = {
         "npu": "Ascend",

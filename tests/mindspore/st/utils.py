@@ -23,7 +23,7 @@ from packaging import version
 
 def msrun_case(glog_v, file_name, case_name, master_port, worker_num=8, local_worker_num=8):
     """Run test case."""
-    filename = file_name.split(".py")[0]
+    filename = os.path.splitext(os.path.basename(file_name))[0]
     log_path = f"./logs/{filename}/{case_name}"
     if os.path.exists(log_path):
         shutil.rmtree(log_path)
