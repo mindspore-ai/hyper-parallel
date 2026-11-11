@@ -38,6 +38,7 @@ from hyper_parallel.distributed.context_parallel.gated_mla_backward_overlap impo
     GatedMLAInputState, finish_gated_expanded_inputs,
 )
 from hyper_parallel.components import functional
+from hyper_parallel.components.modules.mla_attention import prepare_mla_attention_mask
 from hyper_parallel.distributed.context_parallel.collectives import (
     _build_hybrid_cp_submeshes, async_cp_allgather_launch, async_ulysses_seq_to_head_launch,
     ulysses_head_to_seq, ulysses_seq_to_head,
@@ -521,6 +522,7 @@ class MLAContextParallel:
         if not isinstance(causal, bool):
             raise ValueError("is_causal must be bool")
         _validate_mask(attention_mask, lengths, batch, sequence * degree, query_latent.device)
+        attention_mask = prepare_mla_attention_mask(attention_mask, sequence * degree, sequence * degree)
         partition = None
         if self.plan.all_gather_degree > 1:
             _validate_query_partition(causal, attention_mask)

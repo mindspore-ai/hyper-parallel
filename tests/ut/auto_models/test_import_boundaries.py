@@ -32,7 +32,6 @@ package remain.
 """
 # pylint: disable=wrong-import-position
 
-import os
 import subprocess
 import sys
 import unittest
@@ -85,6 +84,35 @@ print("IMPORT_CLEAN")
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("IMPORT_CLEAN", result.stdout)
+
+    def test_kimi_mla_import_without_optional_kda_kernels(self):
+        """Importing gated MLA must not load KDA or its optional fused kernels."""
+        probe = r"""
+import sys
+import torch
+
+# Hide installed optional kernels too; a developer environment can mask this regression.
+optional_modules = ("triton", "fla", "fla_npu")
+for name in optional_modules:
+    sys.modules[name] = None
+
+from hyper_parallel.models.kimi_k3.adapter.distributed import kimi_mla_cp_wrapper
+
+assert callable(kimi_mla_cp_wrapper)
+assert "hyper_parallel.distributed.context_parallel.kimi_delta_attention" not in sys.modules
+assert all(sys.modules[name] is None for name in optional_modules)
+print("MLA_IMPORT_ISOLATED")
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            cwd=_REPO_ROOT,
+            timeout=300,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("MLA_IMPORT_ISOLATED", result.stdout)
 
 
 if __name__ == "__main__":

@@ -258,9 +258,9 @@ class TestKimiK3CpWrapperContracts(unittest.TestCase):
             "KimiDeltaAttentionLayerP2PCP",
         )
         for wrapper_name, executor_name in zip(_WRAPPER_NAMES, patch_names):
-            with self.subTest(wrapper=wrapper_name), patch.object(
-                adapter_context_parallel,
-                executor_name,
+            # Wrappers import executors lazily, so patch their defining module.
+            with self.subTest(wrapper=wrapper_name), patch(
+                f"hyper_parallel.distributed.context_parallel.kimi_delta_attention.{executor_name}",
                 _RecordingExecutor,
             ):
                 request = getattr(adapter_context_parallel, wrapper_name)(
@@ -315,9 +315,11 @@ class TestKDACombinedAdapter(unittest.TestCase):
                  ("recursive_doubling", 1, 1), ("recursive_doubling", 2, 1)]
         for protocol, ulysses, width in cases:
             with self.subTest(protocol=protocol, ulysses=ulysses):
-                name = "KimiDeltaAttentionLayerCP"
                 model = _TinyKimiModel().self_attn
-                with patch.object(adapter_context_parallel, name, _RecordingExecutor):
+                with patch(
+                    "hyper_parallel.distributed.context_parallel.kimi_delta_attention.KimiDeltaAttentionLayerCP",
+                    _RecordingExecutor,
+                ):
                     request = adapter_context_parallel.kimi_delta_attention_cp_wrapper(
                         model, None, None, _FakeMesh(8), None, state_cp_method=protocol,
                         ulysses_degree=ulysses, allgather_group_size=width)
