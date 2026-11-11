@@ -20,7 +20,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 _IGNORE_INDEX = -100
 

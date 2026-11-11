@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from math import lcm
 from typing import Any, Mapping, Sequence
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.distributed.encoder_parallel.contracts import EncoderSegment, EncoderWorkItem
 

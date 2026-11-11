@@ -16,7 +16,7 @@
 
 from typing import Any, Callable, Iterable, Optional
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 
 def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:

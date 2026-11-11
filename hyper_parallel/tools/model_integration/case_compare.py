@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Comparators across validation-case evidence directories."""
-# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 

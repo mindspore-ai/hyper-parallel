@@ -20,7 +20,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 
 def _get_device_module(device: torch.device) -> Any:

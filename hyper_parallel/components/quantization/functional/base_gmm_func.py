@@ -24,7 +24,7 @@ the dgrad direction and owns weight-view cleanup.
 from abc import ABC, abstractmethod
 from typing import Optional
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.components.quantization.tensor import QuantizedTensor
 from hyper_parallel.components.quantization.config import (

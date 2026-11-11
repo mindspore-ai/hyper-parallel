@@ -21,8 +21,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
-import torch.distributed as dist  # pylint: disable=forbidden-backend-import
+import torch
+import torch.distributed as dist
 
 from hyper_parallel.distributed.context_parallel.compressed_document import (
     compressed_document_offsets, compressed_owner_offsets,

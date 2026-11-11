@@ -16,7 +16,7 @@
 
 from typing import Optional
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.components.quantization.functional.base_gmm_func import GroupedLinear
 from hyper_parallel.components.quantization.ops.npu_mxfp8 import (

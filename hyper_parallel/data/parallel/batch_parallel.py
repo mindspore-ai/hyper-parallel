@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-# pylint: disable=missing-apache-license-header,forbidden-backend-import
+# pylint: disable=missing-apache-license-header
 
 """data.parallel.batch_parallel: CP-aware batch sharding.
 
@@ -34,8 +34,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
-import torch.distributed as dist  # pylint: disable=forbidden-backend-import
+import torch
+import torch.distributed as dist
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.data.parallel.dataloader_parallel import DataLoaderParallelContext

@@ -28,7 +28,7 @@ from queue import Queue
 from threading import Thread
 from typing import Any, Union
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.data.parallel.batch_sampler import (
     get_sampler_checkpoint_state, has_torchdata_state, sampler_optimizer_step_progress, sampler_state_for_load,

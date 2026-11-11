@@ -28,7 +28,7 @@ parameters and the same ``Float16OptimizerWithFloat16Params`` wrapper around
 AdamW. The run compares loss, gradients, fp32 main_param updates, and model
 copyback while also covering the multi-dimensional parallel implementation.
 """
-# pylint: disable=C0413,C9002,E1123
+# pylint: disable=C0413,E1123
 
 import os
 from dataclasses import dataclass

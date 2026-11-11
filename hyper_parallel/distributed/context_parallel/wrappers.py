@@ -87,7 +87,7 @@ import inspect
 import logging
 from typing import Any, Callable
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 import torch.nn.functional as F
 from torch.nn import Module
 

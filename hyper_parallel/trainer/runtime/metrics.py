@@ -21,8 +21,8 @@ __all__ = ["mean_global_loss"]
 
 from typing import TYPE_CHECKING, Union
 
-import torch  # pylint: disable=forbidden-backend-import
-import torch.distributed as dist  # pylint: disable=forbidden-backend-import
+import torch
+import torch.distributed as dist
 
 from hyper_parallel.core.utils.communication import (
     _is_tracing_or_compiling,

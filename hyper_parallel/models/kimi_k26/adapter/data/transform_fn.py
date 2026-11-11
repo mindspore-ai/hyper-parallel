@@ -49,7 +49,7 @@ import os
 import re
 from typing import Any, Optional
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.data.constants import IGNORE_INDEX, ONLINE_SOURCE_PATH_KEY
 from hyper_parallel.data.omni.omni_transform import OmniDataTransform

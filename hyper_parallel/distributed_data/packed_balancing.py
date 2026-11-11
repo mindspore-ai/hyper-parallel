@@ -23,7 +23,7 @@ from dataclasses import dataclass, replace
 from threading import Thread
 from typing import TYPE_CHECKING, Any
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.distributed_data.balance_logging import log_balance_stats
 from hyper_parallel.distributed_data.balancing_algorithm import BalancingAlgorithm, resolve_balancing_algorithm

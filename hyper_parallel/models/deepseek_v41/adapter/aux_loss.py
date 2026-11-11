@@ -18,8 +18,8 @@ from __future__ import annotations
 
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
-import torch.distributed as dist  # pylint: disable=forbidden-backend-import
+import torch
+import torch.distributed as dist
 
 from hyper_parallel.core.dtensor.dtensor import DTensor, SkipDTensorDispatch, distribute_tensor
 from hyper_parallel.core.utils.communication import differentiable_all_reduce

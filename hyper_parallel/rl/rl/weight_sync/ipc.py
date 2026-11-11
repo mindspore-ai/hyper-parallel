@@ -80,7 +80,7 @@ class IPCContext:
 def tensor_ipc_rebuild_args(tensor: Any) -> tuple[Any, ...]:
     """Export Torch storage without copying the packed weight buffer."""
     # The vLLM IPC wire protocol specifically uses Torch storage reconstruction.
-    from torch.multiprocessing.reductions import reduce_tensor  # pylint: disable=C0415,forbidden-backend-import
+    from torch.multiprocessing.reductions import reduce_tensor  # pylint: disable=C0415
 
     _, rebuild_args = reduce_tensor(tensor)
     return rebuild_args

@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from urllib.request import urlopen
 
 import numpy as np
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 from PIL import Image, ImageOps
 
 from hyper_parallel.models.deepseek_v41.adapter.data.encoding import IMAGE_PLACEHOLDER

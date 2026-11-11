@@ -17,7 +17,7 @@
 from functools import lru_cache
 from typing import Any, Optional
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.components.quantization.config import (
     GMM_GROUP_K,

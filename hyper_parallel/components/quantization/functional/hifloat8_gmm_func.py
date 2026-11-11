@@ -16,8 +16,8 @@
 
 from typing import Optional
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch.autograd.function import once_differentiable  # pylint: disable=forbidden-backend-import
+import torch
+from torch.autograd.function import once_differentiable
 
 from hyper_parallel.components.quantization.functional.base_gmm_func import GroupedLinear
 from hyper_parallel.components.quantization.ops.npu_hifloat8 import (

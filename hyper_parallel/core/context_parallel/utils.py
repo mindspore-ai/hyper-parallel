@@ -15,7 +15,7 @@
 """PyTorch helpers used by context-parallel implementations."""
 
 # Context parallel is Torch-only after removal of the backend abstraction.
-# pylint: disable=forbidden-backend-import,missing-public-type-hints
+# pylint: disable=missing-public-type-hints
 
 from __future__ import annotations
 

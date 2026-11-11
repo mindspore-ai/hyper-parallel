@@ -16,7 +16,7 @@
 
 from typing import Any, Tuple
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.tools.logging import get_logger
 
@@ -41,7 +41,7 @@ def _sparse_indexer_kl_loss_grad(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute teacher, indexer gradients and summed KL inside CANN."""
     # Keep the optional NPU dependency out of CPU and Omni-only imports.
-    from torch_npu import (  # pylint: disable=import-outside-toplevel,forbidden-backend-import
+    from torch_npu import (  # pylint: disable=import-outside-toplevel
         npu_sparse_lightning_indexer_grad_kl_loss,
     )
 

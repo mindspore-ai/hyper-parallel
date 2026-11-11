@@ -15,7 +15,6 @@
 """Cached eager recursive doubling using public batched point-to-point transport."""
 from __future__ import annotations
 
-# pylint: disable=forbidden-backend-import
 
 from dataclasses import dataclass
 from functools import lru_cache

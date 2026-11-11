@@ -21,7 +21,6 @@ Trainer step runtime); ``FSDP2Manager`` / ``_instantiate_fsdp2`` and the
 (FQN/DTensor source-shard resolution) merged into
 ``distributed/_builder/source_shard.py`` (05 row 406).
 """
-# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 

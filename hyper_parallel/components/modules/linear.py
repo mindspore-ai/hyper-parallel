@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from torch import nn  # pylint: disable=forbidden-backend-import
+from torch import nn
 
 from hyper_parallel.components.modules.family import ModuleFamily, SelectorSpec, VariantRule, register_module_family
 from hyper_parallel.models.replacement import module_replacement

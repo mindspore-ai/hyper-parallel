@@ -21,9 +21,9 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-import torch  # pylint: disable=forbidden-backend-import
-import torch.distributed as dist  # pylint: disable=forbidden-backend-import
-from torch import nn  # pylint: disable=forbidden-backend-import
+import torch
+import torch.distributed as dist
+from torch import nn
 
 from hyper_parallel.core.dtensor._utils import differentiable_variable_all_gather
 from hyper_parallel.distributed.encoder_parallel.attention import (

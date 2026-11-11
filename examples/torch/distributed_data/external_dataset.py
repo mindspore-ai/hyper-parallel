@@ -23,9 +23,9 @@ from collections.abc import Sequence
 from contextlib import closing
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
-import torch.distributed as dist  # pylint: disable=forbidden-backend-import
-from torch.distributed.device_mesh import init_device_mesh  # pylint: disable=forbidden-backend-import
+import torch
+import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
 
 from hyper_parallel.distributed_data import (
     DistributedDatasetConfig,

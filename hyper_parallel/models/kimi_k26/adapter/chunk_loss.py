@@ -21,7 +21,6 @@ from typing import Any
 
 # This family adapter targets the PyTorch-native Transformers Kimi-K2.6
 # implementation and intentionally shares its tensor/module contracts.
-# pylint: disable=forbidden-backend-import
 import torch
 from torch import nn
 

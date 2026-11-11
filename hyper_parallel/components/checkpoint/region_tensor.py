@@ -31,7 +31,7 @@ from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.components.checkpoint.remap_planner import RemapBlock
 

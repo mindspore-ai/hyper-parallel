@@ -22,10 +22,10 @@ from functools import wraps
 from typing import Any
 
 # Gate math and its autograd scheduling use native Torch.
-import torch  # pylint: disable=forbidden-backend-import
-from torch import nn  # pylint: disable=forbidden-backend-import
-from torch.autograd.function import once_differentiable  # pylint: disable=forbidden-backend-import
-from torch.nn import functional as F  # pylint: disable=forbidden-backend-import
+import torch
+from torch import nn
+from torch.autograd.function import once_differentiable
+from torch.nn import functional as F
 
 from hyper_parallel.distributed._builder.forward_rewriter import _ForwardRewriteRequest
 from hyper_parallel.distributed.context_parallel.collectives import (

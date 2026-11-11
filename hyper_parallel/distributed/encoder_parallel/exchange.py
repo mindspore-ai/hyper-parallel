@@ -19,7 +19,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Mapping, Sequence
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.core.dtensor._utils import differentiable_all_to_all_single, differentiable_variable_all_gather
 from hyper_parallel.distributed.encoder_parallel.contracts import (

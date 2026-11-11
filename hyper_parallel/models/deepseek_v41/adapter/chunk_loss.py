@@ -20,7 +20,6 @@ import functools
 from typing import Any
 
 # This model-family adapter follows the PyTorch-native V4.1 facade.
-# pylint: disable=forbidden-backend-import
 import torch
 from torch import nn
 

@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Numerical and build-contract tests for the shared Qwen3 RL integration."""
-# pylint: disable=forbidden-backend-import,protected-access
+# pylint: disable=protected-access
 
 from copy import deepcopy
 from types import SimpleNamespace

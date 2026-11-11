@@ -113,12 +113,6 @@
 "hyper-parallel/hyper_parallel/auto_parallel/sapp_nd/memory_estimation/demo.py"              "locally-disabled"
 "hyper-parallel/hyper_parallel/auto_parallel/sapp_nd/memory_estimation/hooks/template.py"    "locally-disabled"
 
-# 19. Graph-mode compile package — a torch.fx-based compiler that reaches into
-#     torch internals (torch._guards, torch._subclasses, torch.fx.experimental,
-#     torch.nn.utils.stateless, torch.distributed.device_mesh). These have no
-#     public API, so the raw imports stay.
-"hyper-parallel/hyper_parallel/compile/"                                   "forbidden-backend-import"
-
 # 20. Trainer runtime — torch_npu is imported for torch.npu and HCCL registration side effects
 "hyper-parallel/hyper_parallel/trainer/runtime/random.py"                  "unused-import"
 
@@ -219,11 +213,3 @@
 # Linear replacements must preserve forward(input=...) for keyword calls and
 # the existing replacement executor's signature validation.
 "hyper-parallel/tests/ut/trainer/test_module_family_replacement.py" "redefined-builtin"
-
-# Linear-attention layout and convolution adapters use native Torch, following
-# the Torch-only component contract; the legacy backend-import rule is narrower.
-"hyper-parallel/hyper_parallel/components/functional/linear_attention_packed.py" "forbidden-backend-import"
-"hyper-parallel/hyper_parallel/components/functional/linear_attention_convolution.py" "forbidden-backend-import"
-
-"hyper-parallel/hyper_parallel/components/functional/kimi_delta_attention_ascendc.py" "forbidden-backend-import"
-"hyper-parallel/hyper_parallel/components/functional/gated_delta_net_ascendc.py" "forbidden-backend-import"

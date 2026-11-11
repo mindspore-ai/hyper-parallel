@@ -19,7 +19,6 @@ from collections.abc import Callable
 from typing import Any, Optional
 
 # Torch is the native framework; the legacy platform-agnostic lint rule is obsolete here.
-# pylint: disable=forbidden-backend-import
 import torch
 from torch.autograd.function import once_differentiable
 

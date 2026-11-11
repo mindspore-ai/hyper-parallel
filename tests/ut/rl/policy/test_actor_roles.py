@@ -14,7 +14,7 @@
 # ============================================================================
 """CPU unit tests for trainable and frozen Actor roles."""
 # Hyper-RL CPU tests intentionally exercise the verified Torch runtime.
-# pylint: disable=forbidden-backend-import,missing-public-docstring
+# pylint: disable=missing-public-docstring
 
 from types import SimpleNamespace
 from unittest.mock import Mock

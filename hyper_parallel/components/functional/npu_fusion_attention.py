@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, Optional
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 
 _QUERY_LENGTH_ALIASES = (

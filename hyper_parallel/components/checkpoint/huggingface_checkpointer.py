@@ -35,8 +35,8 @@ import os
 from functools import partial
 from typing import Any, Dict, List, Optional, Union
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch import nn  # pylint: disable=forbidden-backend-import
+import torch
+from torch import nn
 
 from hyper_parallel.components.checkpoint.base import CheckpointerBase
 from hyper_parallel.components.checkpoint.huggingface_load_planner import HFLoadPlanner, load_hf_checkpoint

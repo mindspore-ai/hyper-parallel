@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Codegen-owned model observation layered over the native AutoModel API."""
-# pylint: disable=forbidden-backend-import
 
 from collections.abc import Sequence
 from contextlib import contextmanager

@@ -22,7 +22,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.data.batching.build_dataloader import build_dataloader as build_trainer_dataloader
 from hyper_parallel.data.parallel import build_dataset_batch_sampler

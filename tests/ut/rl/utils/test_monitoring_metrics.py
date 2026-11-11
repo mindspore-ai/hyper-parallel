@@ -14,7 +14,7 @@
 # ============================================================================
 """CPU unit tests for distributed Hyper-RL monitoring metrics."""
 # Local test doubles are not public APIs; the suite intentionally uses Torch CPU tensors.
-# pylint: disable=forbidden-backend-import,missing-public-docstring
+# pylint: disable=missing-public-docstring
 
 import math
 from dataclasses import replace

@@ -14,7 +14,7 @@
 # ============================================================================
 """CPU unit test for distributed Hyper-RL evaluation aggregation."""
 # Local test doubles are not public APIs; the suite intentionally uses Torch CPU tensors.
-# pylint: disable=forbidden-backend-import,missing-public-docstring
+# pylint: disable=missing-public-docstring
 
 from functools import partial
 from types import SimpleNamespace

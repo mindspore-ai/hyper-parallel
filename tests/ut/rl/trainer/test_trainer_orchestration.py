@@ -17,7 +17,7 @@ from __future__ import annotations
 
 # Tests intentionally exercise stable internal stage boundaries.
 # Local test doubles are not public APIs; the suite intentionally uses Torch CPU tensors.
-# pylint: disable=forbidden-backend-import,missing-public-docstring,protected-access,unnecessary-lambda
+# pylint: disable=missing-public-docstring,protected-access,unnecessary-lambda
 
 import gc
 import unittest

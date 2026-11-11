@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Differentiable owner-row staging for CPU-resident Engram tables."""
-# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 

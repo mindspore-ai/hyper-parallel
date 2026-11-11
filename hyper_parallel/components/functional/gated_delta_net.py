@@ -19,7 +19,6 @@
 # pylint: disable=non-google-docstring,disallowed-name,unused-argument,invalid-name
 # pylint: disable=missing-module-docstring,missing-function-docstring
 # pylint: disable=abstract-method,arguments-differ
-# pylint: disable=forbidden-backend-import
 
 import warnings
 from typing import Optional

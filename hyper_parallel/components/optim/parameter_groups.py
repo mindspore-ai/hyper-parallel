@@ -23,7 +23,7 @@ __all__ = [
 import logging
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from torch import nn  # pylint: disable=forbidden-backend-import
+from torch import nn
 
 logger = logging.getLogger(__name__)
 

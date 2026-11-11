@@ -23,7 +23,7 @@ import shutil
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.components.checkpoint import build_checkpointer
 from hyper_parallel.components.checkpoint.dcp_checkpointer import (

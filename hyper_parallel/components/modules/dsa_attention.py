@@ -20,8 +20,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 # This package provides PyTorch-specific high-performance modules.
-# pylint: disable=forbidden-backend-import
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 from torch import nn
 from torch.nn import functional as F
 from hyper_parallel.components.checkpoint.weight_conversion import WeightConverter
@@ -53,7 +52,7 @@ def _dense_flash_attention(
     q_flat, k_flat, v_flat = (tensor.flatten(0, 1) for tensor in (query, key, value))
     num_heads = q_flat.shape[1]
     causal_mask = torch.ones((2048, 2048), dtype=torch.bool, device=query.device).triu(diagonal=1)
-    import torch_npu  # pylint: disable=import-outside-toplevel,forbidden-backend-import
+    import torch_npu  # pylint: disable=import-outside-toplevel
 
     result = torch_npu.npu_fusion_attention(
         q_flat.contiguous(), k_flat.contiguous(), v_flat.contiguous(), num_heads, "TND",

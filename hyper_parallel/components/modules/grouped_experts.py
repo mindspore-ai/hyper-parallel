@@ -20,8 +20,8 @@ from collections.abc import Mapping
 from functools import partial
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch import nn  # pylint: disable=forbidden-backend-import
+import torch
+from torch import nn
 from transformers.activations import ACT2FN
 from hyper_parallel.components.checkpoint.weight_conversion import (
     Transpose,

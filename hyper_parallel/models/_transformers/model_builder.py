@@ -21,7 +21,6 @@ plan/apply sharding -> activation checkpoint/swap -> FSDP2 ->
 materialize/load -> compile. This module consumes only normalized
 AutoModels objects and never imports trainer config (05 §15.2.6).
 """
-# pylint: disable=forbidden-backend-import
 
 import fnmatch
 import logging
