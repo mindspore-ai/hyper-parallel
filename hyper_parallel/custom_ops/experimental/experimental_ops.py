@@ -721,6 +721,10 @@ def npu_chunk_kda(
     Returns ``(attn_out, final_state)``; ``final_state`` is ``None`` unless
     ``output_final_state=True``. MindSpore automatically invokes the fused
     backward operator when gradients are requested.
+
+    Training with the current FLA-NPU backward ABI requires BF16 inputs,
+    ``safe_gate=True``, ``use_gate_in_kernel=True``, ``a_log`` and ``dt_bias``.
+    The legacy backward binary is not compatible with this bridge.
     """
     _validate_chunk_kda_autograd_options(initial_state, disable_recompute, state_v_first)
     return _platform.custom_ops.npu_chunk_kda(
