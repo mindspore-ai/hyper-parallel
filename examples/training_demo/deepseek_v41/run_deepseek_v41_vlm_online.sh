@@ -62,9 +62,14 @@ if [[ ! -s "${DATA_PATH}" ]]; then
     exit 1
 fi
 
-# Load the native runtime and custom operator environment from the repository root.
+# Load native operators from the selected training environment.
 cd "${PROJECT_ROOT}"
-source build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
+PYTHON_BIN=$(command -v "${PYTHON_BIN}")
+PATH="$(dirname "${PYTHON_BIN}"):${PATH}"
+export PATH
+# shellcheck source=/dev/null
+source "$(command -v hyper_multicore_set_env.bash)"
+# shellcheck source=/dev/null
 source "${OPS_TRANSFORMER_ROOT}/install/vendors/custom_transformer/bin/set_env.bash"
 
 mkdir -p "${OUTPUT_DIR}"

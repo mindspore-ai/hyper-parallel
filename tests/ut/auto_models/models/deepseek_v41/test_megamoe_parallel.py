@@ -26,7 +26,8 @@ from torch import nn
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4SparseMoeBlock
 
-from hyper_parallel.core.multicore import MegaMoeExperts
+from hyper_multicore import MegaMoeExperts
+
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.distributed import ShardingPlanner
 from hyper_parallel.models._transformers.model_builder import _build_replacement_context
@@ -132,7 +133,7 @@ class TestMegaMoeParallel(unittest.TestCase):
         module = SimpleNamespace(experts=experts, gate=gate, shared_experts=shared,
                                  is_hash=False, forward=signature)
         tp_rank = tp - 1
-        with patch('hyper_parallel.core.multicore.modules.mega_moe.module.shmem.root_members', return_value=(0, 1)):
+        with patch('hyper_multicore.modules.mega_moe.module.shmem.root_members', return_value=(0, 1)):
             compute = deepseek_v41_megamoe_compute_fn(
                 module=module, mesh=None, tp_mesh=_Mesh((tp,), ('tp',), tp_rank) if tp > 1 else None,
                 cp_mesh=_Mesh((cp,), ('cp',)) if cp > 1 else None, ep_mesh=_Mesh((2,), ('ep',)),

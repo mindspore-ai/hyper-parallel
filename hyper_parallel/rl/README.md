@@ -65,7 +65,7 @@ Organize training and sampling around Ascend computation, memory, and communicat
 - **Colocated and disjoint deployment:** Qwen3 dense supports shared or separate training/inference devices, publishing weights through NPU IPC or HCCL respectively. Colocated deployment releases and restores sampling resources by phase. MoE currently requires colocation; see [supported capabilities](#supported-capabilities).
 - **Streaming weight synchronization:** native-vLLM uses full_gather, sending one bucket at a time over IPC/HCCL and releasing buffers after acknowledgment.
 
-HyperParallel also provides [one-sided communication and multicore MoE compute-communication overlap](../core/multicore/README.md) as an optimization foundation. HyperParallel-RL integration and end-to-end benefits remain to be validated.
+The independent [HyperMulticore](https://github.com/mindspore-ai/hyper-multicore) package provides one-sided communication and multicore MoE compute-communication overlap as an optimization foundation. HyperParallel-RL integration and end-to-end benefits remain to be validated.
 
 ### Published Policies and Probability Records
 

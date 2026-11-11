@@ -18,8 +18,7 @@ wheel_path=/absolute/path/printed/by/build.sh
 pip install "${wheel_path}"
 ```
 
-如明确只需要不含 optional native 组件的 core-only wheel，可使用
-`./build.sh --multicore off`。indexed Dataset helper 是基础组件，没有独立关闭开关。
+`./build.sh` 编译 indexed Dataset helper。HyperMulticore 按需独立安装。
 
 ### Q: 导入时报错 `GLIBC_2.xx not found`
 

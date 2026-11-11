@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 
-"""NPU parity of DSV4.1 MegaMoe with production TP/SP and CP boundaries."""
+"""NPU parity of DSV4.1 MegaMoe on one card and with TP/SP and CP boundaries."""
 
 from __future__ import annotations
 
@@ -47,8 +47,8 @@ from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     _v41_sparse_moe_forward,
     bind_shared_expert_forward,
 )
-from tests.torch.multicore._mega_moe_utils import start_shmem_lifetime, write_evidence
-from tests.torch.multicore._test_mega_moe_dynamic_tokens import _assert_close
+from tests.torch.multicore._references import start_shmem_lifetime, write_evidence
+from tests.torch.multicore._references import _assert_close
 
 
 def _text_signature(self: nn.Module, hidden_states: torch.Tensor,
@@ -260,3 +260,28 @@ def test_deepseek_v41_parallel() -> None:
     print(json.dumps(report), flush=True)
     block.experts.close_runtime()
     dist.destroy_process_group()
+
+
+def test_deepseek_v41_single_card() -> None:
+    """Check native experts, V4.1 visual/text routing and shared-expert gradients on EP1."""
+    torch.npu.set_device(int(os.environ['LOCAL_RANK']))
+    dist.init_process_group('hccl')
+    if dist.get_world_size() != 1:
+        raise ValueError('This smoke test requires one NPU')
+    start_shmem_lifetime()
+    mesh = MeshContext(dp_size=1, dp_shard_size=1, tp_size=1, cp_size=1, ep_size=1)
+    mesh.build_meshs('npu', 1)
+    model = _model(1, 1, True, 'push')
+    block = model.model.layers[0].mlp
+    reference = deepcopy(block).float()
+    compute = deepseek_v41_megamoe_compute_fn(
+        module=block, mesh=mesh.device_mesh, tp_mesh=None, cp_mesh=None, ep_mesh=None,
+    )
+    block.forward = MethodType(compute, block)
+    try:
+        cases = [_compare(block, reference, mesh, count, True) for count in (17, 129)]
+        write_evidence({'rank': 0, 'ep': 1, 'vision': True, 'dispatch_mode': 'push',
+                        'passed': True, 'cases': cases})
+    finally:
+        block.experts.close_runtime()
+        dist.destroy_process_group()

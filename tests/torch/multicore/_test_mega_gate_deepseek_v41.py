@@ -24,9 +24,10 @@ import torch_npu  # pylint: disable=unused-import
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4DecoderLayer
 
+from hyper_multicore.modules.mega_gate import MegaGate
+
 from hyper_parallel import SkipDTensorDispatch, fully_shard, init_device_mesh
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
-from hyper_parallel.core.multicore.modules.mega_gate import MegaGate
 from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_gate import (
     DeepseekV41MegaGate,
 )
