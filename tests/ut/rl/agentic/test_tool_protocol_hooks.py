@@ -30,6 +30,8 @@ from rl.tool_protocol import protocol as tool_protocol
 class TestUnifiedParserEvidence(unittest.IsolatedAsyncioTestCase):
     """Capture genuine parser invocations without importing a vLLM runtime."""
 
+    uses_engine_adapters = False
+
     def setUp(self) -> None:
         """Provide the reviewed 0.23 public Parser property and generator signature."""
         class Hermes:
@@ -85,6 +87,11 @@ class TestUnifiedParserEvidence(unittest.IsolatedAsyncioTestCase):
             "vllm.reasoning.qwen3_reasoning_parser": {"Qwen3ReasoningParser": Qwen},
             "vllm.tool_parsers.qwen3coder_tool_parser": {"Qwen3CoderToolParser": Coder},
         }
+        if self.uses_engine_adapters:
+            del definitions["vllm.reasoning.qwen3_reasoning_parser"]
+            del definitions["vllm.tool_parsers.qwen3coder_tool_parser"]
+            definitions["vllm.reasoning.qwen3_engine_reasoning_parser"] = {"Qwen3ParserReasoningAdapter": Qwen}
+            definitions["vllm.tool_parsers.qwen3_engine_tool_parser"] = {"Qwen3EngineToolParser": Coder}
         modules = {}
         for name, attributes in definitions.items():
             parts = name.split(".")
@@ -92,10 +99,14 @@ class TestUnifiedParserEvidence(unittest.IsolatedAsyncioTestCase):
                 module = modules.setdefault(".".join(parts[:length]), ModuleType(".".join(parts[:length])))
                 module.__path__ = []
             modules[name].__dict__.update(attributes)
+        if self.uses_engine_adapters:
+            modules["vllm.reasoning.qwen3_reasoning_parser"] = None
+            modules["vllm.tool_parsers.qwen3coder_tool_parser"] = None
         mocked = patch.dict(sys.modules, modules)
         mocked.start()
         self.addCleanup(mocked.stop)
         self.server, self.reasoning = Server(), Qwen()
+        self.coder_class = Coder
         tool_protocol.install_tool_evidence()
 
     async def _call(self, label: str, *, reasoning: bool = False, keyword: bool = True,
@@ -165,7 +176,7 @@ class TestUnifiedParserEvidence(unittest.IsolatedAsyncioTestCase):
 
     async def test_xml_delegate_keeps_request_schema_before_parser_mutation(self) -> None:
         """The captured schema comes from the request before the real delegate executes."""
-        coder = sys.modules["vllm.tool_parsers.qwen3coder_tool_parser"].Qwen3CoderToolParser
+        coder = self.coder_class
         request = SimpleNamespace(return_token_ids=True, fail=False, mutate_schema=True, tools=[{
             "type": "function", "function": {"name": "add_numbers", "parameters": {
                 "type": "object", "properties": {"a": {"type": "integer"}}}}}])
@@ -192,7 +203,7 @@ class TestUnifiedParserEvidence(unittest.IsolatedAsyncioTestCase):
         text = "Unfinished reasoning without a closing think token"
         ids = [17, 18]
         request = SimpleNamespace(return_token_ids=True, fail=False)
-        coder = sys.modules["vllm.tool_parsers.qwen3coder_tool_parser"].Qwen3CoderToolParser
+        coder = self.coder_class
 
         async def outputs() -> AsyncIterator[SimpleNamespace]:
             """Preserve the engine output when no final content was sampled."""
@@ -233,3 +244,19 @@ class TestUnifiedParserEvidence(unittest.IsolatedAsyncioTestCase):
                 else:
                     evidence["reasoning_parser"][field] = "changed"
                 self.assertFalse(tool_protocol.inspect_tool_response(altered)["trainable"])
+
+
+class TestV030ParserEvidence(TestUnifiedParserEvidence):
+    """The renamed 0.30 delegates preserve the existing evidence contract."""
+
+    uses_engine_adapters = True
+
+    def test_fused_parser_without_delegate_evidence_is_not_trainable(self) -> None:
+        """A fused tool call cannot substitute uncaptured text for evidence."""
+        for message in ({"content": "<tool_call>invalid</tool_call>"},
+                        {"content": None, "tool_calls": [{"function": {"name": "run", "arguments": "{}"}}]}):
+            with self.subTest(message=message):
+                response = {"choices": [{"token_ids": [17], "finish_reason": "stop", "message": message}]}
+                result = tool_protocol.inspect_tool_response(response)
+                self.assertFalse(result["trainable"])
+                self.assertEqual(result["failure_reason"], "missing_parser_evidence")

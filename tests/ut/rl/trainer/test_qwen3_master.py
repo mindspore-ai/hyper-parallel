@@ -16,28 +16,28 @@
 # pylint: disable=forbidden-backend-import,protected-access
 
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
 import torch_npu
+import yaml
 from transformers import Qwen3Config, Qwen3ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP
 
-import rl.workers.adapters.qwen3 as qwen3
-from rl.workers.engine.model import ModelRegistration, resolve_vllm_model
-from rl.workers.adapters.qwen3 import Qwen3ShardingPlanner as ShardingPlanner
-from pathlib import Path
-import yaml
 import rl
-from hyper_parallel.trainer.config import PlanOverride, normalize_distributed_setup_overrides
-from hyper_parallel.trainer.config.resolver import resolve_component
+from rl.workers.adapters import qwen3
+from rl.workers.adapters.qwen3 import Qwen3ShardingPlanner as ShardingPlanner
 from rl.workers.adapters.qwen3 import restore_tied_parameter as _replicate_tied_weights
+from rl.workers.engine.model import ModelRegistration, resolve_vllm_model
 from rl.weight_sync import packed_weight
-from rl.weight_sync.model_adapter import ModelWeightAdapter, rollout_tensor_descriptions
-from rl.weight_sync.packed_weight import build_packed_weight_buckets, materialize_packed_weight_bucket, unpack_packed_weights
+from rl.weight_sync.model_adapter import ModelWeightAdapter
+from rl.weight_sync.packed_weight import (
+    build_packed_weight_buckets, materialize_packed_weight_bucket, unpack_packed_weights,
+)
 
-from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.distributed import ShardingPlanner as SharedPlanner
 from hyper_parallel.distributed._builder import parameter_sharding
 from hyper_parallel.distributed.mesh import DistributedSetup, MeshContext
@@ -47,11 +47,13 @@ from hyper_parallel.models._transformers.checkpoint_loader import CheckpointMana
 from hyper_parallel.models._transformers.model_builder import _move_model_to_device
 from hyper_parallel.models.build_options import FSDP2Config
 from hyper_parallel.models.replacement import apply_module_replacements, compile_module_replacements
+from hyper_parallel.trainer.config import PlanOverride, normalize_distributed_setup_overrides
+from hyper_parallel.trainer.config.resolver import resolve_component
 from tests.ut.auto_models.distributed.conftest import FakeDeviceMesh
 
 
 
-def declared_setup():
+def declared_setup() -> DistributedSetup:
     """Exercise the shipped RL YAML through the actual HP normalization path."""
     recipe = Path(rl.__file__).resolve().parents[1] / "examples/gsm8k/configs/qwen3_4b_gsm8k_base.yaml"
     raw = yaml.safe_load(recipe.read_text())["train"]["plan_overrides"]
@@ -63,26 +65,30 @@ def declared_setup():
 
 def tiny_config() -> Qwen3Config:
     """Keep explicit head_dim different from hidden_size / query heads."""
-    return Qwen3Config(
-        vocab_size=64, hidden_size=24, intermediate_size=32, num_hidden_layers=2,
-        num_attention_heads=4, num_key_value_heads=2, head_dim=8,
-        max_position_embeddings=64, tie_word_embeddings=True, use_cache=False,
-        architectures=["Qwen3ForCausalLM"],
-    )
+    return Qwen3Config.from_dict({
+        "vocab_size": 64, "hidden_size": 24, "intermediate_size": 32, "num_hidden_layers": 2,
+        "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
+        "max_position_embeddings": 64, "tie_word_embeddings": True, "use_cache": False,
+        "architectures": ["Qwen3ForCausalLM"],
+    })
 
 
 @pytest.fixture(name="cpu_kernels")
 def _cpu_kernels(monkeypatch):
     """Use independent CPU mathematical oracles for only the NPU primitives."""
-    def rms(x, weight, epsilon):
+    def rms(x: torch.Tensor, weight: torch.Tensor, epsilon: float) -> tuple[torch.Tensor]:
+        """Compute a CPU RMS reference."""
         normalized = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + epsilon)
         return (normalized.to(x.dtype) * weight,)
 
-    def rotary(x, cos, sin, **_kwargs):
+    def rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, **_kwargs: Any) -> torch.Tensor:
+        """Compute the independent CPU rotary reference."""
         first, second = x.chunk(2, dim=-1)
         return x * cos + torch.cat((-second, first), dim=-1) * sin
 
-    def attention(q, k, v, *, atten_mask, sparse_mode, keep_prob, scale, **_kwargs):
+    def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, atten_mask: Any,
+                  sparse_mode: int, keep_prob: float, scale: float, **_kwargs: Any) -> tuple[torch.Tensor]:
+        """Use CPU SDPA as the NPU primitive reference."""
         allowed = None if sparse_mode == 2 else ~atten_mask
         ratio = q.shape[1] // k.shape[1]
         out = torch.nn.functional.scaled_dot_product_attention(
@@ -97,7 +103,7 @@ def _cpu_kernels(monkeypatch):
     monkeypatch.setattr(torch_npu, "npu_fusion_attention", attention)
 
 
-def replace_model(model):
+def replace_model(model: torch.nn.Module) -> torch.nn.Module:
     """Apply the production declarations with the real replacement executor."""
     plan = compile_module_replacements(model, declared_setup().module_replacements)
     return apply_module_replacements(model, plan, weights_mapping=[])[0]
@@ -168,7 +174,7 @@ def test_native_mlp_tp_shards_match_original_forward_and_input_gradients():
     torch.testing.assert_close(hidden.grad, reference_hidden.grad, atol=1e-8, rtol=1e-5)
 
 
-def weight_adapter(config):
+def weight_adapter(config: Qwen3Config) -> ModelWeightAdapter:
     """Build the same source adapter used by both publication strategies."""
     identity = ModelRegistration("qwen", "qwen3", "/unused", "/unused", "Qwen3ForCausalLM", "qwen3", "qwen3", True)
     adapter = ModelWeightAdapter(resolve_vllm_model(identity, "native"))
@@ -202,7 +208,9 @@ def test_shared_model_hf_export_round_trip(tmp_path, monkeypatch, cpu_kernels):
     source_dir = tmp_path / "source"
     reference.save_pretrained(source_dir)
     monkeypatch.setattr(auto_model, "_current_device", lambda: torch.device("cpu"))
-    model = qwen3.from_pretrained(str(source_dir), distributed_setup=declared_setup(), torch_dtype="float32", local_files_only=True)
+    model = qwen3.from_pretrained(
+        str(source_dir), distributed_setup=declared_setup(), torch_dtype="float32", local_files_only=True,
+    )
     destination = tmp_path / "export"
     assert CheckpointManager(model).save_pretrained(destination)
     restored = Qwen3ForCausalLM.from_pretrained(destination)
@@ -266,7 +274,9 @@ def test_scoped_fsdp_retie_precedes_shared_manager(monkeypatch, exclude_embeddin
 
     ignored = {model.model.embed_tokens.weight} if exclude_embedding else None
 
-    def parallelize(unused_manager, value, source_shard_info=None, ignored_params=None):
+    def parallelize(unused_manager: Any, value: torch.nn.Module, source_shard_info: Any = None,
+                    ignored_params: Any = None) -> torch.nn.Module:
+        """Check tied identity at the shared manager boundary."""
         del unused_manager
         assert value.lm_head.weight is value.model.embed_tokens.weight
         received.append(source_shard_info)
@@ -283,7 +293,7 @@ def test_scoped_runtime_rejects_other_model_families():
     """Explicit opt-in cannot accidentally adapt a non-Qwen3 model."""
     model = Qwen3ForCausalLM(tiny_config())
     model.config.model_type = "llama"
-    with pytest.raises(ValueError, match="model_type='qwen3'"):
+    with pytest.raises(ValueError, match="requires a supported Qwen3 family config"):
         qwen3.adapt_materialization(model)
-    with pytest.raises(ValueError, match="model_type='qwen3'"):
+    with pytest.raises(ValueError, match="requires a supported Qwen3 family config"):
         ShardingPlanner().plan(model, FakeDeviceMesh((2,), ("tp",)), tp_size=2)

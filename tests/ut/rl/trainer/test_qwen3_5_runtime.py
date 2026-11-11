@@ -82,7 +82,7 @@ class TestQwen35Runtime(unittest.TestCase):
         """Hybrid policy support cannot expand through an unrelated dense default."""
         cases = [
             (("algorithm", "name"), "ppo", "GRPO only"),
-            (("consistency", "enabled"), True, "consistency was removed"),
+            (("consistency", "enabled"), True, "consistency requires schema_version=1"),
             (("train", "accelerator", "tp"), 2, "tp=1"),
             (("train", "accelerator", "cp"), 2, "cp=1"),
             (("train", "accelerator", "ep"), 2, "ep=1"),

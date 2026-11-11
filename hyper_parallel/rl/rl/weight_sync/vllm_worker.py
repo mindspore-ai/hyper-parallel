@@ -17,6 +17,7 @@ import asyncio
 import base64
 import gc
 from importlib.metadata import version as package_version
+import inspect
 import json
 import logging
 import os
@@ -36,6 +37,7 @@ from rl.workers.engine.model import (
     NATIVE_QWEN3_ARCHITECTURE,
     NATIVE_QWEN3_MOE_ARCHITECTURE,
     NATIVE_QWEN3_5_ARCHITECTURE,
+    UNIFIED_MODEL_ARCHITECTURES,
 )
 from rl.weight_sync.model_adapter import rollout_tensor_descriptions
 from rl.weight_sync.packed_weight import unpack_packed_weights
@@ -46,6 +48,7 @@ _SUPPORTED_ARCHITECTURES = frozenset(
             NATIVE_QWEN3_ARCHITECTURE,
         NATIVE_QWEN3_MOE_ARCHITECTURE,
         NATIVE_QWEN3_5_ARCHITECTURE,
+        *UNIFIED_MODEL_ARCHITECTURES,
     )
 )
 
@@ -140,6 +143,13 @@ def _validate_topology(
 def get_policy_version(worker: Any) -> dict[str, int]:
     """Return the committed version without touching sleeping model tensors."""
     return {"version": int(getattr(worker, "_rl_loaded_policy_version", 0))}
+
+
+def get_unified_numerical_policy(worker: Any) -> Optional[dict[str, Any]]:
+    """Read the unified model's verified process policy without changing model state."""
+    if not UNIFIED_MODEL_ARCHITECTURES.intersection(_worker_architectures(worker)):
+        return None
+    return worker.model_runner.get_model().verify_numerical_policy()
 
 
 def _receive_ack(
@@ -525,7 +535,7 @@ def _is_supported_worker(worker: Any) -> bool:
     return bool(_SUPPORTED_ARCHITECTURES.intersection(_worker_architectures(worker)))
 
 
-def _finish_custom_weight_update(worker: Any) -> None:
+def _finish_custom_weight_update(worker: Any, *, reset_lora_state: bool = False) -> None:
     """Commit a custom worker transaction only after versioned weights arrived."""
     worker._check_weight_transfer_engine()  # pylint: disable=W0212
     if not worker._weight_update_active:  # pylint: disable=W0212
@@ -535,6 +545,8 @@ def _finish_custom_weight_update(worker: Any) -> None:
         raise RuntimeError(
             "finish_weight_update requires received weights with a pending policy version"
         )
+    if UNIFIED_MODEL_ARCHITECTURES.intersection(_worker_architectures(worker)):
+        worker.model_runner.get_model().finish_weight_update()
     if getattr(worker, "_rl_layerwise_reload", False):
         _finalize_moe_checkpoint_reload(worker)
     if NATIVE_QWEN3_5_ARCHITECTURE in _worker_architectures(worker):
@@ -542,6 +554,8 @@ def _finish_custom_weight_update(worker: Any) -> None:
         missing = expected - getattr(worker, "_rl_received_weights", set())
         if not expected or missing:
             raise RuntimeError(f"Qwen3.5 text policy update is incomplete: missing={sorted(missing)}")
+    if reset_lora_state:
+        worker.model_runner.reset_lora_state()
     worker._weight_update_active = False  # pylint: disable=W0212
     worker._is_checkpoint_format = True  # pylint: disable=W0212
     worker._rl_loaded_policy_version = pending_version
@@ -628,12 +642,17 @@ def _patch_ascend_weight_update_lifecycle() -> None:
     original_start = NPUWorker.start_weight_update
     original_finish = NPUWorker.finish_weight_update
     original_wake = NPUWorker.wake_up
+    # Ascend 0.30 moved layerwise reload into the transfer engine and removed
+    # this argument. Direct RL receivers still own their model reload lifecycle.
+    engine_owned_reload = "is_checkpoint_format" not in inspect.signature(original_start).parameters
 
     def wake_up(worker: Any, tags: Optional[list[str]] = None) -> None:
         """Keep MoE kernel layout intact until the explicit checkpoint transaction."""
         if (NATIVE_QWEN3_MOE_ARCHITECTURE not in _worker_architectures(worker)
                 or (tags is not None and "weights" not in tags)):
             original_wake(worker, tags)
+            if UNIFIED_MODEL_ARCHITECTURES.intersection(_worker_architectures(worker)):
+                worker.model_runner.get_model().verify_numerical_policy()
             if tags is None or "kv_cache" in tags:
                 _refresh_ascend_decode_graphs(worker)
             return
@@ -654,7 +673,12 @@ def _patch_ascend_weight_update_lifecycle() -> None:
     def start_weight_update(worker: Any, is_checkpoint_format: bool = True) -> None:
         """Start one model-owned direct weight-update transaction."""
         if not _is_supported_worker(worker):
-            original_start(worker, is_checkpoint_format=is_checkpoint_format)
+            if engine_owned_reload:
+                if not is_checkpoint_format:
+                    raise ValueError("This vLLM worker requires engine-configured weight format")
+                original_start(worker)
+            else:
+                original_start(worker, is_checkpoint_format=is_checkpoint_format)
             worker._rl_pending_policy_version = None
             return
         if not is_checkpoint_format:
@@ -666,6 +690,8 @@ def _patch_ascend_weight_update_lifecycle() -> None:
             )
         worker._check_nz_disabled()  # pylint: disable=W0212
         _clear_pending_update(worker)
+        if UNIFIED_MODEL_ARCHITECTURES.intersection(_worker_architectures(worker)):
+            worker.model_runner.get_model().begin_weight_update()
         worker._is_checkpoint_format = True  # pylint: disable=W0212
         worker._weight_update_active = True  # pylint: disable=W0212
 
@@ -674,7 +700,7 @@ def _patch_ascend_weight_update_lifecycle() -> None:
         if not _is_supported_worker(worker):
             original_finish(worker)
         else:
-            _finish_custom_weight_update(worker)
+            _finish_custom_weight_update(worker, reset_lora_state=engine_owned_reload)
             return
         pending_version = getattr(worker, "_rl_pending_policy_version", None)
         if pending_version is not None:
@@ -715,6 +741,7 @@ def _patch_dp_weight_rpc() -> None:
     original = DPLBAsyncMPClient.collective_rpc_async
     weight_methods = frozenset((
         "get_policy_version",
+        "get_unified_numerical_policy",
         "receive_ipc_packed_weights",
     ))
 
@@ -722,7 +749,7 @@ def _patch_dp_weight_rpc() -> None:
         client: Any, method: str, timeout: Optional[float] = None,
         args: tuple = (), kwargs: Optional[dict[str, Any]] = None,
     ) -> list[Any]:
-        """Aggregate only weight-control results across the fixed engine group."""
+        """Aggregate weight and numerical-policy results across the fixed engine group."""
         if method not in weight_methods:
             return await original(client, method, timeout, args, kwargs)
         results = await asyncio.gather(*(
@@ -741,6 +768,7 @@ def install_vllm_weight_sync_hooks(*, private_lifecycle: bool = True) -> None:
     if not hasattr(WorkerBase, "get_policy_version"):
         setattr(WorkerBase, "get_policy_version", get_policy_version)
     for name, method in (
+        ("get_unified_numerical_policy", get_unified_numerical_policy),
         ("init_packed_weight_group", init_packed_weight_group),
         ("receive_ipc_packed_weights", receive_ipc_packed_weights),
         ("receive_packed_weights", receive_packed_weights),

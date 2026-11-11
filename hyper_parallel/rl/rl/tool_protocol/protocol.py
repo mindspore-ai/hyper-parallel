@@ -286,7 +286,14 @@ def install_tool_evidence() -> None:
     # Optional server dependency: this module is also used by CPU-only training code.
     from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat  # pylint: disable=C0415
     from vllm.tool_parsers.hermes_tool_parser import Hermes2ProToolParser  # pylint: disable=C0415
-    from vllm.reasoning.qwen3_reasoning_parser import Qwen3ReasoningParser  # pylint: disable=C0415
+    try:
+        from vllm.reasoning.qwen3_reasoning_parser import Qwen3ReasoningParser  # pylint: disable=C0415
+    except ModuleNotFoundError as exc:
+        if exc.name != "vllm.reasoning.qwen3_reasoning_parser":
+            raise
+        from vllm.reasoning.qwen3_engine_reasoning_parser import (  # pylint: disable=C0415
+            Qwen3ParserReasoningAdapter as Qwen3ReasoningParser,
+        )
 
     original = OpenAIServingChat.chat_completion_full_generator
     if getattr(original, "hyper_tool_evidence", False):
@@ -300,8 +307,16 @@ def install_tool_evidence() -> None:
         raise ValueError("vLLM full-generator interface has no supported parser parameter")
     parsers = [(Hermes2ProToolParser, False, "Hermes2ProToolParser.extract_tool_calls")]
     if parser_parameter == "parser":
-        # Qwen3Coder is a reviewed 0.23 delegate; legacy 0.22 Hermes behavior stays unchanged.
-        from vllm.tool_parsers.qwen3coder_tool_parser import Qwen3CoderToolParser  # pylint: disable=C0415
+        # The 0.30 adapters retain these delegate methods. Fused parser routes
+        # that bypass them produce no evidence and fail the existing validation.
+        try:
+            from vllm.tool_parsers.qwen3coder_tool_parser import Qwen3CoderToolParser  # pylint: disable=C0415
+        except ModuleNotFoundError as exc:
+            if exc.name != "vllm.tool_parsers.qwen3coder_tool_parser":
+                raise
+            from vllm.tool_parsers.qwen3_engine_tool_parser import (  # pylint: disable=C0415
+                Qwen3EngineToolParser as Qwen3CoderToolParser,
+            )
         parsers.append((Qwen3CoderToolParser, True, "Qwen3CoderToolParser.extract_tool_calls"))
     extract_reasoning = Qwen3ReasoningParser.extract_reasoning
 

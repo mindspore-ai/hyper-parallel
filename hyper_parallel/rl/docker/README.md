@@ -2,6 +2,11 @@
 
 **English** | [简体中文](README.zh.md)
 
+Unified execution uses
+`swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:consistency-v0.30.0-cann9.2.1-arm64`.
+Its versions and local setup are documented in [Unified Execution](../rl/unified_execution/README.md#运行环境).
+The older image below remains available for existing workflows.
+
 ARM64 ordinary RL, MoE R3, Codex Agent, DeepSeek Harness, and Qwen3.5/3.8 controllers all use
 `swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:v0.23.0.post1-code-agent-arm64`.
 GSM8K launch scripts, Search-R1 training containers, and RL system tests use this image by default, with explicit image overrides still available.
@@ -162,3 +167,40 @@ Candidates and graders use `pids_limit=1024`, leaving room for CLI and pytest th
 CPU-only controllers receive no NPU and set `TORCH_DEVICE_BACKEND_AUTOLOAD=0`.
 SWE preparation, training/resume commands, graph configuration, and acceptance boundaries are maintained in the
 [Code Agent example](../examples/swe_smith/README.md).
+
+## 构建 V4 补丁 wheel
+
+无需传递预编译 wheel，也无需修改基础镜像。从仓库根目录运行：
+
+```bash
+bash hyper_parallel/rl/docker/build_v4_wheel.sh ../wheels/v4-build
+```
+
+[构建脚本](build_v4_wheel.sh)在固定一致性镜像的临时容器中下载源码、应用补丁、编译并导出产物，
+不挂载 NPU；输出目录须为空。固定 FlashAttention NPU 提交
+`2e5320494cb474365bacaf42c94abf0c7de0affc`（0.5.0）及 CATLASS 提交
+`769cd40a8716b28650b6bebb08db4834eea4462f`，只编译 Ascend 910 的 V4，版本标记为 `0.5.0+hpbi1`。
+构建使用镜像内的 CANN/Torch 工具链，强制从源码编译，不下载上游预编译 wheel。
+输出包括 wheel、`SHA256SUMS`、`build.json`、依赖清单和构建日志；临时源码与编译缓存随容器删除。
+
+已有完整 Git 源码和 CATLASS 子模块时，可离线构建；脚本导出固定提交，不使用工作区改动：
+
+```bash
+SOURCE_DIR=/path/to/flash-attention-npu \
+  bash hyper_parallel/rl/docker/build_v4_wheel.sh ../wheels/v4-build
+```
+
+在线构建继承宿主的 HTTP/HTTPS 代理变量。重新编译可能改变 wheel 的归档时间及二进制哈希，
+因此不要求与历史 wheel 的 SHA256 相同；使用本次构建记录中的校验和启动：
+
+```bash
+wheel_dir=$(realpath ../wheels/v4-build)
+(cd "$wheel_dir" && sha256sum --check SHA256SUMS)
+V4_WHEEL="$wheel_dir/flash_attn_npu-0.5.0+hpbi1-cp312-cp312-linux_aarch64.whl" \
+V4_WHEEL_SHA256=$(cut -d ' ' -f 1 "$wheel_dir/SHA256SUMS") \
+  bash hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_docker.sh
+```
+
+构建检查 native library 可加载；上面的两步 RL 示例负责验证实际训推数值一致性。
+校验和用于核对所选产物，源码与补丁身份记录在 `build.json` 中。
+新一致性镜像的 vLLM-Ascend 0.30.0 已包含 `q.record_stream(...)`，不需要运行旧版 `patch_sampler.py`。

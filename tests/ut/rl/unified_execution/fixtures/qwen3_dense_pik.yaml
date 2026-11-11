@@ -1,0 +1,258 @@
+# Model-level test fixture. The runnable two-step RL recipe is in examples/consistency/configs/.
+model:
+  registry_name: qwen3_4b
+  name: qwen3
+  weights_path: /models/Qwen3-4B
+  tokenizer_path: /models/Qwen3-4B
+  config_overrides: null
+rollout:
+  engine: vllm
+  vllm:
+    sleep_level: 1
+    deployment: colocated
+    data_parallel_size: 2
+    port: 8100
+    model_implementation: unified
+    tensor_parallel_size: 1
+    weight_sync:
+      strategy: full_gather
+      bucket_size_mb: 128
+    dtype: bfloat16
+    trust_remote_code: false
+    enforce_eager: false
+    batch_invariant: false
+    enable_prefix_caching: true
+    enable_chunked_prefill: true
+    gpu_memory_utilization: 0.35
+    kv_cache_memory_bytes: 536870912
+    max_model_len: 576
+    block_size: 128
+    max_num_seqs: 2
+    max_num_batched_tokens: 128
+    compilation_config:
+      mode: 3
+      cudagraph_mode: FULL_AND_PIECEWISE
+      cudagraph_capture_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+    logprobs_mode: raw_logprobs
+    startup_timeout: 600
+    request_timeout: 600
+    enable_prompt_tokens_details: false
+    server_hccl_if_base_port: null
+    server_hccl_npu_socket_port_range: null
+train:
+  plan_overrides:
+  - match:
+    - '*.input_layernorm'
+    - '*.post_attention_layernorm'
+    - model.norm
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3.modeling_qwen3.Qwen3RMSNorm
+      implementation:
+        _target_: hyper_parallel.models.qwen3.adapter.conversion.module_replacement.replace_qwen3_rms_norm
+  - match: '*.self_attn'
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3.modeling_qwen3.Qwen3Attention
+      implementation:
+        _target_: rl.unified_execution.components.row_parallel.replace_attention_with_pik
+        num_leaves: 8
+        leaf_layout: strided
+        fill_uninitialized_memory: false
+  - match: '*.self_attn'
+    region_dispatch: false
+  - match: '*.mlp.down_proj'
+    replace:
+      kind: module
+      source_type: torch.nn.Linear
+      exact_type: true
+      implementation:
+        _target_: rl.unified_execution.components.row_parallel.replace_pik_linear
+        num_leaves: 8
+        leaf_layout: strided
+        fill_uninitialized_memory: false
+  - match: '*.self_attn.o_proj.forward'
+    replace:
+      kind: method
+      implementation:
+        _target_: rl.unified_execution.components.row_parallel.pik_row_compute_fn
+        sequence_parallel: false
+    params: {}
+    in_src:
+      input:
+        tp: shard(2)
+    in_dst:
+      input:
+        tp: shard(2)
+    out_src:
+      output:
+        tp: replicate
+    out_dst:
+      output:
+        tp: replicate
+  - match: '*.self_attn.o_proj.forward'
+    when: sequence_parallel
+    replace:
+      kind: method
+      implementation:
+        _target_: rl.unified_execution.components.row_parallel.pik_row_compute_fn
+        sequence_parallel: true
+    params: {}
+    in_src:
+      input:
+        tp: shard(2)
+    in_dst:
+      input:
+        tp: shard(2)
+    out_src:
+      output:
+        tp: shard(1)
+    out_dst:
+      output:
+        tp: shard(1)
+  - match: '*.self_attn'
+    region_dispatch: false
+    out_src:
+      output:
+        tp: replicate
+        cp: shard(1)
+    out_dst:
+      output:
+        tp: replicate
+        cp: shard(1)
+  - match: '*.self_attn'
+    when: sequence_parallel
+    region_dispatch: false
+    out_src:
+      output:
+        tp: shard(1)
+        cp: shard(1)
+    out_dst:
+      output:
+        tp: shard(1)
+        cp: shard(1)
+  - match: '*.mlp.down_proj.forward'
+    replace:
+      kind: method
+      implementation:
+        _target_: rl.unified_execution.components.row_parallel.pik_row_compute_fn
+        sequence_parallel: false
+    params: {}
+    in_src:
+      input:
+        tp: shard(2)
+    in_dst:
+      input:
+        tp: shard(2)
+    out_src:
+      output:
+        tp: replicate
+    out_dst:
+      output:
+        tp: replicate
+  - match: '*.mlp.down_proj.forward'
+    when: sequence_parallel
+    replace:
+      kind: method
+      implementation:
+        _target_: rl.unified_execution.components.row_parallel.pik_row_compute_fn
+        sequence_parallel: true
+    params: {}
+    in_src:
+      input:
+        tp: shard(2)
+    in_dst:
+      input:
+        tp: shard(2)
+    out_src:
+      output:
+        tp: shard(1)
+    out_dst:
+      output:
+        tp: shard(1)
+  - match: '*.mlp'
+    region_dispatch: false
+    out_src:
+      output:
+        tp: replicate
+        cp: shard(1)
+    out_dst:
+      output:
+        tp: replicate
+        cp: shard(1)
+  - match: '*.mlp'
+    when: sequence_parallel
+    region_dispatch: false
+    out_src:
+      output:
+        tp: shard(1)
+        cp: shard(1)
+    out_dst:
+      output:
+        tp: shard(1)
+        cp: shard(1)
+  token_log_probs_mode: dense
+  model_init_cpu_threads: null
+  max_steps: 2
+  seed: 1234
+  prompt_batch_size: 1
+  micro_batch_size: 1
+  response_mini_batch_size: 2
+  policy_update_epochs: 1
+  init_device: meta
+  comm_backend: hccl
+  learning_gate:
+    enabled: false
+    min_gradient_norm: 0.0
+    require_mixed_rewards: false
+  accelerator:
+    requires_grad_sync: true
+    reshard_after_backward: false
+    loss_parallel: false
+    sequence_parallel: false
+    dp_replicate: 1
+    dp_shard: 2
+    tp: 1
+    cp: 1
+    pp: 1
+    reshard_after_forward: true
+    comm_fusion: true
+    cpu_offload: true
+  mixed_precision:
+    enabled: true
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: null
+  optimizer:
+    lr: 1.0e-06
+    lr_min: 0.0
+    lr_decay_style: constant
+    lr_warmup_ratio: 0.0
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+    eps: 1.0e-08
+    betas:
+    - 0.9
+    - 0.999
+    foreach: null
+  checkpoint:
+    load_path: null
+    output_dir: ./output/unified_execution/checkpoints
+    save_steps: 0
+    save_final: false
+    verify_reload: false
+consistency:
+  schema_version: 1
+  mode: batch_invariant
+  attention_backend: flash_attention_npu_v4
+  batch_invariant:
+    provider: torch_npu_level3
+    fill_uninitialized_memory: false
