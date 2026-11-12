@@ -321,6 +321,20 @@ def _param_device(param: torch.Tensor) -> torch.device:
     return param.device
 
 
+def _all_reduce_offloaded(
+    tensor: torch.Tensor, op: dist.ReduceOp, group: object,
+) -> torch.Tensor:
+    """Reduce CPU-offloaded values on the backend's communication device."""
+    original_device = tensor.device
+    if original_device.type == "cpu":
+        device_type = {"nccl": "cuda", "hccl": "npu"}.get(dist.get_backend(group))
+        if device_type is not None:
+            device_module = torch.get_device_module(device_type)
+            tensor = tensor.to(torch.device(device_type, device_module.current_device()))
+    dist.all_reduce(tensor, op=op, group=group)
+    return tensor.to(original_device)
+
+
 def _get_grad_obj(param: torch.nn.Parameter) -> Optional[torch.Tensor]:
     """Return the gradient object for *param*.
 
@@ -608,10 +622,7 @@ def _total_norm_inf(  # pylint: disable=R0913,R0917
         if mesh_id is not None:
             mesh = mesh_cache[mesh_id]
             for dim in shard_dims:
-                dist.all_reduce(
-                    local_norm, op=reduce_op,
-                    group=mesh.get_group(dim),
-                )
+                local_norm = _all_reduce_offloaded(local_norm, reduce_op, mesh.get_group(dim))
         group_norms.append(local_norm)
     if not group_norms:
         if norm_type == -math.inf:
@@ -629,10 +640,7 @@ def _total_norm_sum(grad_groups, norm_type, mesh_cache, device):
         if mesh_id is not None:
             mesh = mesh_cache[mesh_id]
             for dim in shard_dims:
-                dist.all_reduce(
-                    local_val, op=dist.ReduceOp.SUM,
-                    group=mesh.get_group(dim),
-                )
+                local_val = _all_reduce_offloaded(local_val, dist.ReduceOp.SUM, mesh.get_group(dim))
         total.add_(local_val)
     return total
 
@@ -732,7 +740,7 @@ def _total_norm_fsdp2_aligned(grad_groups, norm_type, mesh_cache, device,
             local_p = torch.tensor(0.0, device=device, dtype=torch.float32)
 
         for group in sig_groups[sig]:
-            dist.all_reduce(local_p, op=dist.ReduceOp.SUM, group=group)
+            local_p = _all_reduce_offloaded(local_p, dist.ReduceOp.SUM, group)
 
         total_p = total_p + local_p
 
@@ -854,7 +862,7 @@ def _coalesce_partial_reduce(  # pylint: disable=R0914
 
         for pdim, reduce_op, needs_avg in partial_info:
             group = mesh.get_group(pdim)
-            dist.all_reduce(buf, op=reduce_op, group=group)
+            buf = _all_reduce_offloaded(buf, reduce_op, group)
             if needs_avg:
                 buf /= dist.get_world_size(group=group)
 
