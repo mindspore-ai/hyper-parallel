@@ -59,7 +59,7 @@ import inspect
 import warnings
 from collections.abc import Callable, Generator
 from collections import deque
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
@@ -443,13 +443,15 @@ def _make_fwd_bwd_fn(
     state_is_param: list[bool],
     state_spec: Any,
     user_inputs_spec: Any,
-) -> tuple[Callable, list[str]]:
-    """Build the joint callable and its named-loss output metadata."""
+    mixed_precision: Any = None,
+) -> tuple[Callable, list[str], list[bool]]:
+    """Build the joint callable with named-loss and trainable-gradient metadata."""
     num_state_inputs = len(state_fqns)
     # ``_fwd_bwd_fn`` communicates the traced ``loss_dict`` key order to the
     # enclosing scope through this box (plain closure writes cannot escape
     # the nested ``def``); the keys are attached to the GraphModule below.
     loss_dict_keys_box: list[str] = []
+    gradient_usage_box: list[bool] = []
 
     def _fwd_bwd_fn(*plain_args):
         state_wrapped = plain_args[:num_state_inputs]
@@ -458,9 +460,10 @@ def _make_fwd_bwd_fn(
         user_args = torch.utils._pytree.tree_unflatten(
             list(user_wrapped), user_inputs_spec
         )
+        model_state = mixed_precision.cast_state(state_t["model"]) if mixed_precision else state_t["model"]
 
         with (
-            _reparametrize_train_state(model, state_t["model"]),
+            _reparametrize_train_state(model, model_state),
             _patch_engine_backward(),
         ):
             out = train_fn(model, **user_args)
@@ -483,28 +486,32 @@ def _make_fwd_bwd_fn(
             else:
                 loss, loss_dict_keys, loss_dict_values = out, [], []
 
-            # Read params from state_t["model"] so the exact trace-time
-            # tensors (not the live module's) drive autograd.grad.
+            # Like eager FSDP, differentiate compute parameters. Casting back
+            # to storage here could round gradients before their reduction.
             params = []
+            param_names = []
             for idx, fqn in enumerate(state_fqns):
                 if state_is_param[idx]:
-                    param = state_t["model"][fqn]
+                    param = model_state[fqn]
                     if param.requires_grad:
                         params.append(param)
+                        param_names.append(fqn)
 
             grads = torch.autograd.grad(loss, params, allow_unused=True)
 
+        gradient_usage_box[:] = [grad is not None for grad in grads]
         # Replace None grads with zeros so the output arity is stable.
         processed_grads = []
-        for grad, param in zip(grads, params):
+        for name, grad, param in zip(param_names, grads, params):
             if grad is None:
-                processed_grads.append(torch.zeros_like(param))
-            else:
-                processed_grads.append(grad)
+                grad = torch.zeros_like(param)
+            if mixed_precision:
+                grad = mixed_precision.cast_gradient(name, grad)
+            processed_grads.append(grad)
 
         return [loss] + processed_grads + loss_dict_values
 
-    return _fwd_bwd_fn, loss_dict_keys_box
+    return _fwd_bwd_fn, loss_dict_keys_box, gradient_usage_box
 
 
 def trace_model_graph(  # pylint: disable=too-many-locals
@@ -514,6 +521,8 @@ def trace_model_graph(  # pylint: disable=too-many-locals
     *,
     dynamic: bool = False,
     dynamic_arg_dims: dict[str, int | list[int]] | None = None,
+    state_shapes: dict[str, tuple] | None = None,
+    mixed_precision: Any = None,
 ) -> JointGraph:
     """
     Trace model to generate complete forward + backward graph
@@ -527,6 +536,8 @@ def trace_model_graph(  # pylint: disable=too-many-locals
         dynamic_arg_dims: Dotted input paths to dynamic dimensions (supports negative indices).
             Providing a mapping enables selective symbolic tracing, even when dynamic is False.
             Parameters and buffers always remain static.
+        state_shapes: Source-local logical parameter shapes before live FSDP slicing.
+        mixed_precision: Resolved shared FSDP precision policy and module cast boundaries.
 
     Returns:
         JointGraph: Joint forward-backward computation graph
@@ -566,9 +577,16 @@ def trace_model_graph(  # pylint: disable=too-many-locals
         fake_mode = FakeTensorMode(allow_non_fake_inputs=True, shape_env=ShapeEnv(), static_shapes=True)
         fake_args = tuple(_fakeify_input(fake_mode, value) for value in full_args)
     num_state_inputs = len(state_flat)
+    if state_shapes:
+        with fake_mode:
+            fake_args = tuple(
+                value.new_empty(state_shapes[name], requires_grad=value.requires_grad)
+                if name in state_shapes and tuple(value.shape) != state_shapes[name] else value
+                for name, value in zip(state_fqns, fake_args[:num_state_inputs])
+            ) + fake_args[num_state_inputs:]
 
-    _fwd_bwd_fn, loss_dict_keys_box = _make_fwd_bwd_fn(  # pylint: disable=C0103
-        model, train_fn, state_fqns, state_is_param, state_spec, user_inputs_spec
+    _fwd_bwd_fn, loss_dict_keys_box, gradient_usage_box = _make_fwd_bwd_fn(  # pylint: disable=C0103
+        model, train_fn, state_fqns, state_is_param, state_spec, user_inputs_spec, mixed_precision
     )
 
     # make_fx only records ``nn_module_stack`` when the traced callable
@@ -583,6 +601,7 @@ def trace_model_graph(  # pylint: disable=too-many-locals
     ctx = TracingContext(fake_mode)
     with (
         fake_mode,
+        mixed_precision.module_casts() if mixed_precision else nullcontext(),
         tracing(ctx),
         preserve_node_meta(),
         _skip_nested_compile(),
@@ -628,10 +647,12 @@ def trace_model_graph(  # pylint: disable=too-many-locals
     # (loss, grads, loss_dict) and passes can trim the trailing loss_dict
     # outputs off the gradient range.
     traced_graph.loss_dict_keys = list(loss_dict_keys_box)
+    # None denotes absence from autograd, while a real zero gradient remains used.
+    traced_graph.gradient_usage = tuple(gradient_usage_box)
 
     param_names = [name for name, _ in model.named_parameters() if _.requires_grad]
     param_shapes = {
-        name: tuple(param.shape) for name, param in model.named_parameters()
+        name: (state_shapes or {}).get(name, tuple(param.shape)) for name, param in model.named_parameters()
     }
 
     num_layers = 0

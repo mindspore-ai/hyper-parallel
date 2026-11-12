@@ -25,6 +25,47 @@ from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
 
 
+@dataclass(frozen=True)
+class ShardGeometry:
+    """Valid local shard and uniform communication shape within a source-local tensor."""
+
+    start: int
+    local_shape: torch.Size
+    padded_shape: torch.Size
+
+
+def get_shard_geometry(
+    shape: Sequence[int], shard_dim: int, shard_world_size: int, shard_rank: int
+) -> ShardGeometry:
+    """Plan chunk-based FSDP sharding without allocating or modifying tensors.
+
+    Args:
+        shape: Parameter shape after any source parallelism, such as TP or EP.
+        shard_dim: Non-negative dimension to shard.
+        shard_world_size: Size of the parameter's FSDP shard group.
+        shard_rank: Rank within that group.
+
+    Returns:
+        Valid slice start and shape, plus the uniform padded communication shape.
+        Ranks beyond the chunks returned by ``torch.chunk`` own an empty slice.
+
+    Raises:
+        ValueError: If the shard dimension, group size or group-local rank is invalid.
+    """
+    if shard_world_size < 1 or not 0 <= shard_rank < shard_world_size:
+        raise ValueError(f"Invalid shard rank {shard_rank} for shard degree {shard_world_size}")
+    if not 0 <= shard_dim < len(shape):
+        raise ValueError(f"Invalid shard dimension {shard_dim} for shape {tuple(shape)}")
+    size = shape[shard_dim]
+    chunk_size = (size + shard_world_size - 1) // shard_world_size
+    start = min(shard_rank * chunk_size, size)
+    local_shape = list(shape)
+    padded_shape = list(shape)
+    local_shape[shard_dim] = min(chunk_size, size - start)
+    padded_shape[shard_dim] = chunk_size
+    return ShardGeometry(start, torch.Size(local_shape), torch.Size(padded_shape))
+
+
 class ShardedState(Enum):
     """
     Parameter shard state

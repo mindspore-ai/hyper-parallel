@@ -109,6 +109,31 @@ class TestTraceModelGraph(unittest.TestCase):
         self.assertEqual(joint.state_fqns, ["lin.weight", "lin.bias", "buf"])
         self.assertEqual(gm.state_is_param, [True, True, False])
         self.assertEqual(gm.num_state_inputs, 3)
+        self.assertEqual(gm.gradient_usage, (True, True))
+
+    def test_gradient_usage_distinguishes_unused_zero_and_empty_gradients(self):
+        """Keep a used mask in gradient order without shifting aliases, frozen state or named losses."""
+        model = nn.Linear(2, 2, bias=False)
+        model.register_parameter("unused", nn.Parameter(torch.ones(2, 2)))
+        model.register_parameter("empty", nn.Parameter(torch.empty(0, 2)))
+        model.register_parameter("frozen", nn.Parameter(torch.ones(2, 2), requires_grad=False))
+        model.alias = model.weight
+        model.register_buffer("offset", torch.ones(2))
+
+        def train_fn(current, x, y):
+            """Produce real zero gradients and a truly absent parameter gradient."""
+            loss = (current(x) - y).square().sum() + current.empty.sum() + current.frozen.sum()
+            return loss, {"aux": loss + current.offset.sum()}
+
+        joint, _, grads, losses = _trace_and_run(model, train_fn, torch.zeros(2, 2), torch.zeros(2, 2))
+        self.assertEqual(joint.state_fqns, ["weight", "unused", "empty", "frozen", "offset"])
+        self.assertEqual(joint.graph_module.gradient_usage, (True, False, True))
+        self.assertEqual(len(grads), 3)
+        torch.testing.assert_close(grads[0], torch.zeros_like(model.weight), rtol=0, atol=0)
+        torch.testing.assert_close(grads[1], torch.zeros_like(model.unused), rtol=0, atol=0)
+        self.assertEqual(grads[2].shape, model.empty.shape)
+        self.assertEqual(joint.graph_module.loss_dict_keys, ["aux"])
+        self.assertEqual(list(losses), ["aux"])
 
     def test_param_names_only_trainable(self):
         """Test ``param_names`` lists trainable parameter names."""

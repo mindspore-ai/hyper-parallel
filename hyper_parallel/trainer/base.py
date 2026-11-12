@@ -615,6 +615,7 @@ class BaseTrainer(Stateful, ABC):
             mesh_context=self.mesh,
             source_shard_info=getattr(self.model, "_source_shard_info", None),
         )
+        self.graph_compiler.prepare_model()
 
     def _graph_train_fn(
             self,

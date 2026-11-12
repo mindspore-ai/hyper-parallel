@@ -255,7 +255,7 @@ class MixedPrecisionPolicy:
 
     Attributes:
         param_dtype: Data type for parameter computation. If None, uses original dtype.
-        reduce_dtype: Data type for gradient reduction. If None, uses param_dtype.
+        reduce_dtype: Data type for gradient reduction. If None, uses the gradient dtype.
         output_dtype: Data type for module outputs. If None, no casting applied.
         custom_params: Per-parameter overrides that take precedence over this policy's
             ``param_dtype`` and ``reduce_dtype`` defaults.
@@ -291,6 +291,30 @@ class MixedPrecisionPolicy:
             for dtype_name, dtype in custom_dtypes.items():
                 if dtype is not None and not isinstance(dtype, torch.dtype):
                     raise ValueError(f"custom_params {dtype_name} must be torch.dtype or None, got {dtype!r}")
+
+
+def resolve_param_dtypes(
+    policy: MixedPrecisionPolicy, source_parameter_id: int, storage_dtype: DType
+) -> tuple[Optional[DType], Optional[DType]]:
+    """Resolve parameter casts without retaining source parameters or choosing a runtime gradient dtype.
+
+    Args:
+        policy: Shared precision policy with source-ID-indexed parameter overrides.
+        source_parameter_id: Original parameter identity, before FSDP replaces its storage.
+        storage_dtype: Local parameter storage dtype.
+
+    Returns:
+        Compute and reduction cast targets. None preserves storage or gradient dtype,
+        respectively; explicit per-field None overrides policy defaults.
+    """
+    custom_dtypes = (policy.custom_params or {}).get(source_parameter_id, {})
+    param_dtype = custom_dtypes.get("param_dtype", policy.param_dtype)
+    reduce_dtype = custom_dtypes.get("reduce_dtype", policy.reduce_dtype)
+    if reduce_dtype == param_dtype:
+        reduce_dtype = None
+    if param_dtype == storage_dtype:
+        param_dtype = None
+    return param_dtype, reduce_dtype
 
 
 @dataclass
