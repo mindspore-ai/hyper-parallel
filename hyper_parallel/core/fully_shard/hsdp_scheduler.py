@@ -534,14 +534,13 @@ class HSDPSchedulerV2:
 
     @_dynamo_disable
     def _root_backward_hook(self):
-        """Drain all DP pipelines, then run final TP reduction and apply gradients."""
+        """Drain gradient communication and finish backward for all states."""
         logger.debug("hook=root_backward_hook enter module=%s", self.hsdp_state)
         for hsdp_scheduler in self.scheduler_ctx.all_hsdp_schedulers:
             # let modules which are not triggered backward_hook launch backward communication.
             hsdp_scheduler._backward_hook()
-        # Keep pending gradient reductions in flight while unused parameter
-        # prefetches finish, rather than delaying their launch on those waits.
-        self._finalize_unused_prefetches()
+            hsdp_scheduler._finalize_unused_prefetches()
+            hsdp_scheduler.scheduler_state = None
         self.scheduler_ctx.root_bp_state = False
         with torch.profiler.record_function(f"root_backward reduce:{self.hsdp_state.module_name}"):
             logger.debug(
@@ -550,47 +549,42 @@ class HSDPSchedulerV2:
             )
             self._finalize_comm_fusion_reductions()
             self._finalize_per_param_reductions()
-            self.launch_tp_replicate_reduce_and_apply()
-        # BACKWARD only deduplicates hooks within one autograd execution;
-        # accumulated no-sync gradients must outlive this state reset.
-        for scheduler in self.scheduler_ctx.all_hsdp_schedulers:
-            scheduler.scheduler_state = None
+            self._apply_reduced_gradients()
         self.scheduler_ctx.post_backward_final_callback_queued = False
 
     def _finalize_unused_prefetches(self) -> None:
-        """Wait and release unused all-gathers after autograd has finished.
+        """Wait and release this scheduler's unused all-gathers after backward.
 
         A module used in forward need not participate in this backward. Its
         speculative prefetch may therefore have no pre-backward consumer.
         """
-        for scheduler in self.scheduler_ctx.all_hsdp_schedulers:
-            state = scheduler.hsdp_state
-            if state is None:
+        state = self.hsdp_state
+        if state is None:
+            return
+        for param in state.hsdp_params:
+            context = param.allgather_comm_ctx
+            if context.allgather_handle is None and context.allgather_output is None:
                 continue
-            for param in state.hsdp_params:
-                context = param.allgather_comm_ctx
-                if context.allgather_handle is None and context.allgather_output is None:
+            with profiler_record(f"finalize_unused_prefetch param:{param}"):
+                if context.allgather_handle is not None:
+                    context.allgather_handle.wait()
+                    context.allgather_handle = None
+                context.allgather_output = None
+                if state.is_shard and param.shard_world_size > 1:
+                    param.free_unsharded_param()
+        if state.param_group is not None:
+            for bucket in state.param_group.all_gather_buckets:
+                result = bucket.all_gather_result
+                if result is None:
                     continue
-                with profiler_record(f"finalize_unused_prefetch param:{param}"):
-                    if context.allgather_handle is not None:
-                        context.allgather_handle.wait()
-                        context.allgather_handle = None
-                    context.allgather_output = None
-                    if state.is_shard and param.shard_world_size > 1:
-                        param.free_unsharded_param()
-            if state.param_group is not None:
-                for bucket in state.param_group.all_gather_buckets:
-                    result = bucket.all_gather_result
-                    if result is None:
-                        continue
-                    param_fqns = ", ".join(str(param) for param in bucket.hsdp_params)
-                    with profiler_record(f"finalize_unused_prefetch bucket:{state.module_name}:{param_fqns}"):
-                        if result.handle is not None:
-                            result.handle.wait()
-                            result.handle = None
-                        result.all_gather_input = None
-                        result.all_gather_output = None
-                        bucket.all_gather_result = None
+                param_fqns = ", ".join(str(param) for param in bucket.hsdp_params)
+                with profiler_record(f"finalize_unused_prefetch bucket:{state.module_name}:{param_fqns}"):
+                    if result.handle is not None:
+                        result.handle.wait()
+                        result.handle = None
+                    result.all_gather_input = None
+                    result.all_gather_output = None
+                    bucket.all_gather_result = None
 
     def check_state_prefetch_handles_consumed(self) -> None:
         """Check that all parameters in the module tree consumed their prefetch work.
@@ -650,8 +644,8 @@ class HSDPSchedulerV2:
         self.hsdp_state._issue_prev_fused_all_reduce(last_all_reduce_groups)
         self.hsdp_state.wait_and_split_all_reduce_work_groups()
 
-    def launch_tp_replicate_reduce_and_apply(self) -> None:
-        """Run final TP replicate reductions and apply gradients for all states."""
+    def _apply_reduced_gradients(self) -> None:
+        """Apply pending reduced gradients after communication completes."""
         for hsdp_scheduler in self.scheduler_ctx.all_hsdp_schedulers:
             hsdp_state = hsdp_scheduler.hsdp_state
             if hsdp_state is None:
@@ -663,10 +657,11 @@ class HSDPSchedulerV2:
                     reduced_grad = hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output
                 if reduced_grad is None:
                     continue
-                hsdp_param.all_reduce_source_replicate_grad_inplace(
-                    reduced_grad,
-                    hsdp_state.reduce_op_type,
-                )
+                if hsdp_state.comm_fusion_policy.enable_comm_fusion:
+                    hsdp_param.all_reduce_source_replicate_grad_inplace(
+                        reduced_grad,
+                        hsdp_state.reduce_op_type,
+                    )
                 need_synchronize = hsdp_param.apply_reduced_grad(reduced_grad) or need_synchronize
                 hsdp_param.clear_all_reduce_output()
                 hsdp_param.clear_reduce_scatter_output()
