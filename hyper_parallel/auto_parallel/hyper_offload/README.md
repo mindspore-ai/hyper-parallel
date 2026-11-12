@@ -78,7 +78,7 @@ for step in range(10):
 |-------|------|---------|-------------|
 | `max_resident_activation_mb` | `int` | `1024` | Device-side activation memory budget (MiB). |
 | `max_offload_activation_mb` | `int` | `65536` | Pinned host memory pool size (MiB). |
-| `planner` | `ResidencyPlanner \| None` | `None` | Pluggable planner; defaults to `GreedyResidencyPlanner`. |
+| `planner` | `ResidencyPlanner \| None` | `None` | Pluggable planner; defaults to `PeakResidencyPlanner`. |
 
 ### `OffloadSession`
 
@@ -95,6 +95,37 @@ with session:
 with session:
     loss = model(x); loss.backward()
 ```
+
+### Native autograd replay
+
+HyperOffload automatically selects native autograd replay for an eligible static,
+complete forward/backward step; no additional switch is required:
+
+```python
+config = OffloadConfig(max_resident_activation_mb=512)
+session = OffloadSession(config)
+```
+
+Warmup still records the operator trace and uses the configured planner. If every
+selected storage is an immutable forward activation saved for backward, with one
+offload interval and one use of each saved view, replay uses autograd hooks
+without installing a global `TorchDispatchMode`. There is no activation-count
+limit. Unsupported plans keep operator replay.
+
+Only selected saves replace their original tensor with storage/view metadata.
+Other saves retain detached tensors with version checks. Copies use the existing
+residency manager and copy stream. D2H starts at the first selected save; source
+release and individual H2D prefetch points are compiled onto the next available
+save/use hook. H2D is fenced before its consumer, and restored manager ownership
+ends at the last saved-view use. These hook anchors can differ from the exact
+operator anchors in the original plan.
+
+Keep the same forward save order, view metadata and backward use order on every
+entry, and complete backward before leaving the session. Interleaved backward,
+recomputation, repeated access to an offloaded save and changing control flow are
+unsupported by this path. Record a new session when the graph changes. The
+session checks selected metadata, storage aliases, mutation versions and save/use
+counts; it does not validate every unrelated operator during native replay.
 
 ### `skip_offload`
 
