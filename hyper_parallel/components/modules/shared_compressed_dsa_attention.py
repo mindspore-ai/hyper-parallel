@@ -1732,21 +1732,15 @@ class SharedCompressedDSAAttentionBase(nn.Module):
     @staticmethod
     def _validate_cp_inputs(
             cp_context: SharedCompressedAttentionCPContext,
-            position_ids: torch.Tensor,
             sequence_length: int,
     ) -> tuple[int, int]:
-        """Validate contiguous CP shards and return global query geometry."""
+        """Derive packed row addresses independently of RoPE position IDs."""
         if cp_context.size <= 1 or not 0 <= cp_context.rank < cp_context.size:
             raise ValueError(
                 "shared compressed attention CP requires size > 1 and "
                 f"0 <= rank < size, got rank={cp_context.rank}, size={cp_context.size}"
             )
         query_offset = cp_context.rank * sequence_length
-        if not torch.all(position_ids[..., 0] == query_offset):
-            raise ValueError(
-                "shared compressed attention CP requires contiguous global position_ids; "
-                f"rank {cp_context.rank} expected first position {query_offset}"
-            )
         return query_offset, sequence_length * cp_context.size
 
     def _project_raw_kv(
@@ -2197,6 +2191,9 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Publish or consume compressed KV and execute indexed K=V attention."""
+        # The model already encoded position_ids in position_embeddings. Packed
+        # row addresses come from the CP shard and may differ from RoPE positions.
+        del position_ids
         (
             shared_state,
             packed_sequence,
@@ -2210,7 +2207,6 @@ class SharedCompressedDSAAttentionBase(nn.Module):
         if cp_context is not None:
             query_offset, global_sequence_length = self._validate_cp_inputs(
                 cp_context,
-                position_ids,
                 sequence_length,
             )
         if packed_sequence is not None:
