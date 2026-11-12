@@ -32,8 +32,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from hyper_parallel.components.functional.dsa_indexer import dsa_indexer
-from hyper_parallel.components.functional.dsa_sparse_attention import dsa_sparse_attention
+from hyper_parallel.components.functional import dsa_indexer, dsa_sparse_attention
 from hyper_parallel.components.functional.npu_fusion_attention import (
     resolve_packed_sequence_lengths,
 )
@@ -215,7 +214,7 @@ def _run_cp_dsa_kernels(
     if use_dense:
         return _deepseek_v32_dense_attention(module, index_states, attention_states, sequence_lengths)
 
-    topk_indices, index_query_tnd, index_key_tnd, merge_weight_tnd = dsa_indexer(
+    topk_indices, index_query_tnd, index_key_tnd, merge_weight_tnd = dsa_indexer(  # pylint: disable=not-callable
         index_query,
         index_key,
         merge_weight,
@@ -224,7 +223,7 @@ def _run_cp_dsa_kernels(
         module.index_topk,
         backend="cann",
     )
-    attn_output, softmax_max, softmax_sum = dsa_sparse_attention(
+    attn_output, softmax_max, softmax_sum = dsa_sparse_attention(  # pylint: disable=not-callable
         absorbed_query,
         kv_nope,
         q_rot,
