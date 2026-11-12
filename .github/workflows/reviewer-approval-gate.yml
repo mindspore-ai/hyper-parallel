@@ -12,14 +12,17 @@ on:
       - review_requested
       - review_request_removed
       - closed
+      - labeled
+      - unlabeled
   workflow_run:
-    workflows: [Reviewer approval signal]
+    workflows: [Reviewer approval signal, Label Gate Check]
     types: [completed]
   push:
     branches: [master]
     paths:
       - .github/reviewer-approval-policy.json
       - .github/scripts/reviewer-approval-gate.mjs
+      - .github/scripts/ci-label-expiry.mjs
       - .github/workflows/reviewer-approval-gate.yml
       - .github/workflows/reviewer-approval-signal.yml
   schedule:

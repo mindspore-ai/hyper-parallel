@@ -11,10 +11,11 @@ on:
 permissions:
   contents: read
   pull-requests: write
-  checks: write
+  statuses: write
 
 concurrency:
-  group: expire-ci-pass-labels-${{ github.event.workflow_run.head_sha || 'sweep' }}
+  # Sweeps and completion events can update the same head and merge commit.
+  group: expire-ci-pass-labels
   cancel-in-progress: false
 
 jobs:
@@ -28,7 +29,7 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
-      - name: Remove expired labels and invalidate stale label checks
+      - name: Reconcile CI validity status and remove expired labels
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
