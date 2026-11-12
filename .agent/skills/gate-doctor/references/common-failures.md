@@ -31,7 +31,7 @@ entry here before editing.
 
 **Signature** (PR comment from `micro-compass`):
 
-```
+```text
 当前/check-pr未通过，原因如下:
 以下Pull Request描述检查项未通过:
     模板中'Test Plan and Test Result' 信息为空，请补充对应信息。
@@ -53,10 +53,12 @@ entry here before editing.
 4. If "Pull Request未关联issue" appears, append `Fixes #<n>` to the body.
    Ask the user for the issue number — never invent one.
 5. Push the updated body via
+
    ```bash
    python3 .agent/skills/autogit/scripts/autogit.py update <pr> \
        --title "<unchanged>" --body "$(cat /tmp/new_body.md)"
    ```
+
 6. Re-trigger: `gate_doctor.py check-pr <pr>`.
 
 ---
@@ -65,14 +67,15 @@ entry here before editing.
 
 **Signature**
 
-```
+```text
 [PYTHON] Function 'test_xxx' is missing: Description:, Expectation:
 [FAILURE] comment issues found in test cases
 [ERROR] Check DT design is failed, the actual value is 1.
 ```
 
-MindSpore mandates every test function (Python + C++) carries a docstring
-with three fields: `Feature:`, `Description:`, `Expectation:`.
+Apply this recipe only when the active CI job explicitly requires these
+fields and reports them missing. HyperParallel test authoring follows
+`.agent/rules/testing.md`; this is not a universal test-docstring requirement.
 
 **Fix recipe (Python)**
 
@@ -111,24 +114,21 @@ TEST_F(TestSuit, test_xxx) { ... }
 
 **Signature**
 
-```
+```text
 [INFO] Filter pylint.
 <file>:<line>: [<rule>(<rule-name>), <function>] <message>
 [ERROR] Filter pylint is failed, the actual value is 1.
 ```
 
-Each line is a real violation. CI uses pylint 3.3.7 with the rcfile at
-`https://tools.mindspore.cn/tools/check/pylint/rules/pylintrc`. Reproduce
-locally:
+Use the repository's `.pylintrc` and the pylint version declared in
+`.pre-commit-config.yaml`. Reproduce locally from the repository root:
 
 ```bash
 pip install pylint==3.3.7
-curl -fsSL https://tools.mindspore.cn/tools/check/pylint/rules/pylintrc \
-     -o /tmp/ms_pylintrc
-pylint --rcfile=/tmp/ms_pylintrc <files>
+pylint --rcfile=.pylintrc <files>
 ```
 
-The score after the fix must be **10.00/10**.
+Resolve the violations under the repository's configured checks.
 
 **Common rule recipes**:
 
@@ -138,7 +138,7 @@ The score after the fix must be **10.00/10**.
 | `W0612 unused-variable` | A local binding that's never read | Delete the binding, OR use it, OR (last resort) prefix with `_` to mark intentional. |
 | `C0116 missing-function-docstring` | Function lacks a `"""..."""` | Add a one-line docstring. `_private` helpers also need one. |
 | `C0115 missing-class-docstring` | Class lacks a docstring | Add a one-line class docstring. |
-| `C0301 line-too-long` | Line >100 chars (per MS rcfile) | Wrap or refactor; never use `# pylint: disable=line-too-long`. |
+| `C0301 line-too-long` | Line exceeds the limit in `.pylintrc` | Wrap or refactor; never use `# pylint: disable=line-too-long`. |
 | `C0413 wrong-import-position` | Import after top-of-file code | Move imports to the top. |
 | `E0401 import-error` | Module can't be imported in CI env | Verify it's in `requirements.txt`; for test-only deps, use `pytest.importorskip`. |
 | `R0913 too-many-arguments` | Function with >5 args | Bundle related args into a dataclass, or accept the warning if the rcfile has it disabled. |
@@ -147,7 +147,7 @@ The score after the fix must be **10.00/10**.
 | `W0102 dangerous-default-value` | `def f(x=[])` style | Use `None` default + assign inside. |
 
 If the rule appears in `failures[].rule` but isn't listed above, lookup at
-https://pylint.readthedocs.io/en/stable/user_guide/messages/ — the lookup
+<https://pylint.readthedocs.io/en/stable/user_guide/messages/> — the lookup
 URL is `.../messages/<category>/<rule-name>.html`.
 
 ---
@@ -156,7 +156,7 @@ URL is `.../messages/<category>/<rule-name>.html`.
 
 **Signature**
 
-```
+```text
 <file>:<line>:  <message> [<category>] [<priority>]
 [ERROR] Cpplint error number: <N>
 ```
@@ -176,7 +176,7 @@ URL is `.../messages/<category>/<rule-name>.html`.
 
 **Signature**
 
-```
+```text
 <file>:<line>: <misspelled> ==> <suggestion>
 [ERROR] Codespell error number: <N>
 ```
@@ -192,7 +192,7 @@ root (depending on the repo's convention).
 
 **Signature**
 
-```
+```text
 <file>:<line>: [<category>] <message>
 [ERROR] Cmakelint error number: <N>
 ```
@@ -211,7 +211,7 @@ root (depending on the repo's convention).
 
 **Signature**
 
-```
+```text
 <file>:<line> MD<NNN>/<rule-name>  <message>
 [ERROR] Markdownlint error number: <N>
 ```
@@ -221,7 +221,7 @@ root (depending on the repo's convention).
 | Rule | Fix |
 |---|---|
 | `MD013 line-length` | Wrap markdown at 120 cols. Code blocks and tables are usually exempt by repo config. |
-| `MD025 single-h1` | One `# Title` per file; demote duplicates to `## `. |
+| `MD025 single-h1` | One `# Title` per file; demote duplicates to `##`. |
 | `MD031 blanks-around-fences` | Blank line before and after each ```` ``` ```` fence. |
 | `MD040 fenced-code-language` | Tag every fence with a language, e.g. ```` ```python ````. |
 | `MD012 no-multiple-blanks` | Collapse multiple blank lines to one. |
@@ -232,7 +232,7 @@ root (depending on the repo's convention).
 
 **Signature**
 
-```
+```text
 <file>:<line>: tab character found
 [ERROR] Tab error number: <N>
 ```
@@ -250,7 +250,7 @@ expand -t 4 <file> > <file>.tmp && mv <file>.tmp <file>
 
 **Signature**
 
-```
+```text
 <file>: non-UTF-8 byte at offset <N>
 [ERROR] Utf8 error number: <N>
 ```
@@ -269,7 +269,7 @@ Inspect first with `file <path>` to confirm the source encoding.
 
 **Signature**
 
-```
+```text
 <file>:<line>: <function>: cyclomatic complexity = <N> (threshold <T>)
 [ERROR] Lizard error number: <N>
 ```
@@ -284,7 +284,7 @@ config unless the function is intrinsically hard to split (rare).
 
 **Signature**
 
-```
+```text
 In <file> line <N>:
 SC<NNNN>: <message>
 [ERROR] ShellCheck error number: <N>
@@ -305,7 +305,7 @@ SC<NNNN>: <message>
 
 **Signature**
 
-```
+```text
 <file>:<line>: code does not match clang-format
 [ERROR] ClangFormat error number: <N>
 ```
@@ -326,7 +326,7 @@ docstrings in ways that change meaning.
 
 **Signature**
 
-```
+```text
 <file>:<line>: dead link: <url>
 [ERROR] Linklint error number: <N>
 ```
