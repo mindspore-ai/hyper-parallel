@@ -16,12 +16,14 @@
 
 import unittest
 from collections import namedtuple
-from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from contextlib import ExitStack
+from types import FunctionType, SimpleNamespace
+from unittest.mock import MagicMock, Mock, patch
 
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from hyper_parallel.auto_parallel.hyper_offload import OffloadConfig, OffloadSession
 from hyper_parallel.auto_parallel.hyper_offload.api.scope import (
     dispatch_framework_op,
     has_managed_inputs,
@@ -32,13 +34,17 @@ from hyper_parallel.auto_parallel.hyper_offload.api.session import (
 from hyper_parallel.auto_parallel.hyper_offload.execution.replay import ReplayExecutor
 from hyper_parallel.auto_parallel.hyper_offload.execution.tensor import ShadowTensor
 from hyper_parallel.auto_parallel.hyper_offload.execution.warmup import WarmupExecutor
-from hyper_parallel.auto_parallel.hyper_offload.ir.trace import AccessKind
+from hyper_parallel.auto_parallel.hyper_offload.ir.trace import AccessKind, ActivationTrace
+from hyper_parallel.auto_parallel.hyper_offload.ir.replay import OpGuide
+from hyper_parallel.auto_parallel.hyper_offload.ir.schedule import ResidencyActionType, ResidencySchedule
 from hyper_parallel.auto_parallel.hyper_offload.planning import PeakResidencyPlanner
 from hyper_parallel.auto_parallel.hyper_offload.runtime.residency import (
     PhysicalBuffer,
     ResidencyManager,
 )
 from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
+from tests.common.mark_utils import arg_mark
+from tests.ut.auto_parallel.hyper_offload.execution.test_selective_replay import BytePool, CPUActivationTracker
 from tests.ut.core.fully_shard.test_param import _new_param
 
 
@@ -59,6 +65,25 @@ class _CountingMode(TorchDispatchMode):
 class TestFrameworkBoundary(unittest.TestCase):
     """Check real FSDP methods and exported storage lifetimes."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_opaque_native_ops_preserve_other_modes_without_stack_scan(self) -> None:
+        """Feature: Opaque native dispatch.
+
+        Description: Execute under an unrelated mode with live-stack checks forbidden.
+        Expectation: Preserve values and observe the operation in the unrelated mode.
+        """
+        source = torch.arange(4.0)
+        executor = SimpleNamespace(in_opaque_region=True, dispatch=Mock())
+        observer = _CountingMode()
+        with observer, ActivationDispatchMode(SimpleNamespace(executor=executor)), patch(
+            "hyper_parallel.auto_parallel.hyper_offload.api.session.inside_fsdp_runtime",
+            side_effect=RuntimeError("opaque native operation inspected the stack"),
+        ):
+            result = source.sin()
+        torch.testing.assert_close(result, source.sin(), rtol=0, atol=0)
+        executor.dispatch.assert_not_called()
+        self.assertEqual(observer.calls, 1)
+
     def test_managed_input_query_does_not_reconstruct_containers(self) -> None:
         """A read-only query must not invoke user container constructors."""
         pair_type = namedtuple("Pair", "left right")
@@ -71,12 +96,17 @@ class TestFrameworkBoundary(unittest.TestCase):
             self.assertFalse(has_managed_inputs((native,), {}))
             self.assertTrue(has_managed_inputs((), {"input": managed}))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     def test_native_gradient_assignment_preserves_alias_and_other_modes(self) -> None:
-        """Framework metadata bypass keeps the exact gradient view and observer."""
+        """Feature: FSDP storage ownership.
+
+        Description: Assign a native gradient under the offload and observer modes.
+        Expectation: Preserve the gradient view alias and bypass replay dispatch.
+        """
         param = _new_param()
         source = torch.arange(4.0)
         param.to_sharded_dtensor = lambda value: value.detach()
-        executor = SimpleNamespace(dispatch=Mock(side_effect=RuntimeError("unexpected replay")))
+        executor = SimpleNamespace(in_opaque_region=False, dispatch=Mock(side_effect=RuntimeError("unexpected replay")))
         observer = _CountingMode()
         with observer, ActivationDispatchMode(SimpleNamespace(executor=executor)), patch(
             "hyper_parallel.auto_parallel.hyper_offload.api.session.has_managed_inputs",
@@ -127,12 +157,19 @@ class TestFrameworkBoundary(unittest.TestCase):
         self.assertIsNone(manager.device_resident_size(sid))
         torch.testing.assert_close(param.reduce_scatter_comm_ctx.reduce_scatter_output, source)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     def test_parameter_allocation_bypasses_only_offload(self) -> None:
-        """FSDP gets a resizable buffer, while model computation remains tracked."""
+        """Feature: FSDP storage ownership.
+
+        Description: Run FSDP allocation and model computation under an observer.
+        Expectation: Keep framework buffers resizable and preserve model dispatch.
+        """
         param = _new_param()
         param.unsharded_param_buffers = [torch.empty(4)]
         param.unsharded_param_buffers[0].untyped_storage().resize_(0)
-        executor = SimpleNamespace(dispatch=Mock(side_effect=lambda op, args, kwargs: op(*args, **kwargs)))
+        executor = SimpleNamespace(
+            in_opaque_region=False, dispatch=Mock(side_effect=lambda op, args, kwargs: op(*args, **kwargs)),
+        )
         observer = _CountingMode()
         with observer, ActivationDispatchMode(SimpleNamespace(executor=executor)):
             with patch.object(param, "reduce_comm_dtype", return_value=torch.float32):
@@ -147,14 +184,21 @@ class TestFrameworkBoundary(unittest.TestCase):
             self.assertEqual(executor.dispatch.call_count, 1)
         self.assertGreater(observer.calls, 0)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     def test_shadow_gradient_export_owns_storage(self) -> None:
-        """Unmodified FSDP can retire a gradient without resizing activation storage."""
+        """Feature: FSDP storage ownership.
+
+        Description: Export a managed gradient through the FSDP reduction boundary.
+        Expectation: Keep exported storage independent of the managed activation.
+        """
         source = torch.arange(4, dtype=torch.float32)
         buffer = PhysicalBuffer(device=source.device, device_buffer=source.view(torch.uint8))
         param = _new_param()
         param.shard_world_size = 1
         param._unsharded_param.grad = ShadowTensor(source, buffer, 1)
-        executor = SimpleNamespace(dispatch=Mock(side_effect=lambda op, args, kwargs: op(*args, **kwargs)))
+        executor = SimpleNamespace(
+            in_opaque_region=False, dispatch=Mock(side_effect=lambda op, args, kwargs: op(*args, **kwargs)),
+        )
         with ActivationDispatchMode(SimpleNamespace(executor=executor)):
             param.reduce_scatter_grad()
         self.assertEqual(executor.dispatch.call_count, 1)
@@ -183,3 +227,111 @@ class TestFrameworkBoundary(unittest.TestCase):
         source.untyped_storage().resize_(0)
         torch.testing.assert_close(first, torch.arange(3, 7, dtype=torch.float32))
         torch.testing.assert_close(second, torch.arange(5, 9, dtype=torch.float32))
+
+
+class TestRecordedFrameworkBoundary(unittest.TestCase):
+    """Replay framework ownership from the trace without inspecting live stacks."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_native_framework_output_keeps_alias_and_other_modes(self) -> None:
+        """Feature: Native framework operations recorded during warmup.
+
+        Description: Replay a framework view followed by an ordinary model op.
+        Expectation: Preserve native alias ownership, other modes, and sequence validation.
+        """
+        source = torch.arange(4.0)
+        replay = ReplayExecutor(ResidencyManager(1024), ResidencySchedule(), [
+            OpGuide("framework_read:view.default", input_bindings={}),
+            OpGuide("sin.default", 1, {0: 1}, {}),
+        ])
+        observer = _CountingMode()
+        with observer, ActivationDispatchMode(SimpleNamespace(executor=replay), record_framework_ops=True), patch(
+            "hyper_parallel.auto_parallel.hyper_offload.api.session.inside_fsdp_runtime",
+            side_effect=RuntimeError("native replay inspected the stack"),
+        ):
+            view = source.view(-1)
+            actual = view.sin()
+        replay.finish()
+        torch.testing.assert_close(actual, source.sin(), rtol=0, atol=0)
+        self.assertEqual(view.untyped_storage().data_ptr(), source.untyped_storage().data_ptr())
+        self.assertIs(type(view), torch.Tensor)
+        self.assertEqual(observer.calls, 2)
+        replay.reset()
+        with self.assertRaisesRegex(RuntimeError, "operator differs"):
+            replay.dispatch(torch.ops.aten.cos.default, (source,), {})
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_replay_framework_read_preserves_copies_aliases_and_gradients(self) -> None:
+        """Feature: Recorded framework reads with activation transfers.
+
+        Description: Offload and reload an activation before FSDP exports a view.
+        Expectation: Exact forward/gradient parity and independently owned view storage.
+        """
+        def view(value: torch.Tensor) -> torch.Tensor:
+            """Run identical view code under the framework module identity."""
+            return value.view(-1)
+
+        framework_view = FunctionType(view.__code__, {"__name__": "hyper_parallel.core.fully_shard.test"})
+
+        def build(trace: ActivationTrace) -> ResidencySchedule:
+            """Move the producer storage and reload before the framework read."""
+            producer = next(op for op in trace.ops if op.name == "sin.default")
+            consumer = next(op for op in trace.ops if op.name == "framework_read:view.default")
+            sid = next(access.storage_id for access in producer.accesses if access.kind == AccessKind.WRITE)
+            schedule = ResidencySchedule()
+            schedule.add_post(trace.ops.index(producer), ResidencyActionType.COPY_D2H, sid)
+            schedule.add_post(trace.ops.index(producer), ResidencyActionType.RELEASE_DEVICE, sid)
+            schedule.add_pre(trace.ops.index(consumer), ResidencyActionType.COPY_H2D, sid)
+            schedule.add_post(trace.ops.index(consumer), ResidencyActionType.RELEASE_HOST, sid)
+            return schedule
+
+        def run(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            """Consume both framework-owned and ordinary activation views."""
+            activation = value.sin()
+            native = value.cos()
+            exported = framework_view(activation)  # pylint: disable=not-callable
+            loss = (exported * native.view(-1)).sum()
+            loss.backward()
+            return activation, exported, loss
+
+        data = torch.linspace(-2, 2, 16).reshape(4, 4)
+        reference = data.clone().requires_grad_()
+        expected = run(reference)
+        with ExitStack() as stack:
+            for target in ("torch.accelerator.current_stream", "torch.Event", "torch.Tensor.record_stream"):
+                stack.enter_context(patch(target))
+            stack.enter_context(patch(
+                "hyper_parallel.auto_parallel.hyper_offload.execution.warmup.executor.profile_transfer_bandwidth",
+                return_value=(10.0, 10.0),
+            ))
+            session = OffloadSession(OffloadConfig(planner=SimpleNamespace(build=build)))
+            manager = session.residency_manager
+            manager._host_pool = BytePool()
+            manager._copy_stream = MagicMock(device=torch.device("cpu"))
+            manager.wait_for_transfers = lambda: None
+            session.executor._timer = Mock()
+            session.executor._timer.stop.return_value = 0.0
+            session.executor._tracker = CPUActivationTracker()
+            warmup = data.clone().requires_grad_()
+            with session:
+                run(warmup)
+            for _ in range(2):
+                value = data.clone().requires_grad_()
+                with patch(
+                    "hyper_parallel.auto_parallel.hyper_offload.api.session.inside_fsdp_runtime",
+                    side_effect=RuntimeError("replay inspected the stack"),
+                ), patch.object(manager, "copy_d2h", wraps=manager.copy_d2h) as d2h, patch.object(
+                    manager, "copy_h2d", wraps=manager.copy_h2d,
+                ) as h2d:
+                    with session:
+                        activation, exported, loss = run(value)
+                    d2h.assert_called_once()
+                    h2d.assert_called_once()
+                torch.testing.assert_close(loss, expected[2], rtol=0, atol=0)
+                torch.testing.assert_close(value.grad, reference.grad, rtol=0, atol=0)
+                self.assertIs(type(exported), torch.Tensor)
+                self.assertNotEqual(
+                    exported.untyped_storage().data_ptr(), activation.resolve().untyped_storage().data_ptr(),
+                )
+                manager.release_device(activation.storage_id)
+                torch.testing.assert_close(exported, expected[1], rtol=0, atol=0)

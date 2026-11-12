@@ -59,19 +59,24 @@ class CopyFirstActivation:
     """Offload the first activation and prefetch before its view is consumed."""
 
     def build(self, trace: ActivationTrace) -> ResidencySchedule:
-        """Build a small schedule containing real byte transfers."""
-        assert trace.ops[0].name == "sin.default"
-        assert trace.ops[1].name == "cos.default"
-        assert trace.ops[2].name == "view.default"
+        """Build a small schedule containing real byte transfers.
+
+        Args:
+            trace: Recorded operations, including autograd save detaches.
+        """
+        self.producer = next(index for index, op in enumerate(trace.ops) if op.name == "sin.default")
+        self.next_producer = next(index for index, op in enumerate(trace.ops) if op.name == "cos.default")
+        view = next(index for index, op in enumerate(trace.ops) if op.name == "view.default")
+        consumer = next(index for index, op in enumerate(trace.ops) if op.name == "mul.Tensor")
         sid = next(
-            a.storage_id for a in trace.ops[0].accesses if a.kind == AccessKind.WRITE
+            a.storage_id for a in trace.ops[self.producer].accesses if a.kind == AccessKind.WRITE
         )
         self.sid = sid
         schedule = ResidencySchedule()
-        schedule.add_post(0, Action.COPY_D2H, sid)
-        schedule.add_post(0, Action.RELEASE_DEVICE, sid)
-        schedule.add_pre(2, Action.COPY_H2D, sid)
-        schedule.add_post(4, Action.RELEASE_HOST, sid)
+        schedule.add_post(self.producer, Action.COPY_D2H, sid)
+        schedule.add_post(self.producer, Action.RELEASE_DEVICE, sid)
+        schedule.add_pre(view, Action.COPY_H2D, sid)
+        schedule.add_post(consumer, Action.RELEASE_HOST, sid)
         return schedule
 
 
@@ -90,11 +95,16 @@ class CheckFirstActivation(CopyFirstActivation):
     """Check completion after the producer; enforce release one op later."""
 
     def build(self, trace: ActivationTrace) -> ResidencySchedule:
-        """Exercise optional retirement before the next native operation."""
+        """Exercise optional retirement before the next native operation.
+
+        Args:
+            trace: Recorded operators used to locate the two producers.
+        """
         schedule = super().build(trace)
-        schedule.post[0] = [action for action in schedule.post[0] if action.kind == Action.COPY_D2H]
-        schedule.add_post(0, Action.TRY_RELEASE_DEVICE, self.sid)
-        schedule.add_post(1, Action.RELEASE_DEVICE, self.sid)
+        schedule.post[self.producer] = [action for action in schedule.post[self.producer]
+                                        if action.kind == Action.COPY_D2H]
+        schedule.add_post(self.producer, Action.TRY_RELEASE_DEVICE, self.sid)
+        schedule.add_post(self.next_producer, Action.RELEASE_DEVICE, self.sid)
         return schedule
 
 
