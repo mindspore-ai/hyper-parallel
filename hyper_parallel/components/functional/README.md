@@ -58,6 +58,19 @@ teacher probabilities and scalar loss are computed inside CANN. Dense indexer
 LSE returns the native max/sum pair. Indexer and sparse-attention backward use
 `cann_ops_transformer`; attention forward uses `torch_npu.npu_sparse_flash_attention`.
 
+## MHC functions
+
+The MHC interfaces are `mhc_pre` and `mhc_post`. The CANN backend targets
+CANN 9.2.0 and requires its matching `cann_ops_transformer` extension and
+native operators: `mhc_pre` calls the fused `mhc_pre_sinkhorn` operator (RMS
+norm, projection and Sinkhorn in one kernel); `mhc_post` calls the
+differentiable `mhc_post` operator with its native backward. The optional
+RMS scale `gamma` is folded into phi as a differentiable product. CANN
+operators require fp32 coefficients, fp16/bf16 streams with a 128-aligned
+tail axis, and N=4 streams with 20 Sinkhorn iterations on Atlas A2/A3.
+`backend="omni"` selects the deprecated `omni_training_custom_ops` operators;
+CPU `mhc_post` keeps the eager fallback.
+
 ## DeepSeek V4.1 fused operators
 
 The V4.1 adapters use the optional `cann_ops_transformer` PyTorch extension:
