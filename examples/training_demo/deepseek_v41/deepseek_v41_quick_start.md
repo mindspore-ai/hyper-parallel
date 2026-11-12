@@ -280,3 +280,45 @@ plan_overrides:
         use_grouped_gemm: true
         fix_router: false  # Keep learned routing for normal training.
 ```
+
+## V4.1 路由专家的 MXFP8 SwiGLU 融合
+
+Ascend 950PR/950DT 上可通过 Module Family 启用带 clamp 的 SwiGLU 与双轴 MXFP8
+量化融合。已验证的环境为 CANN Toolkit/950 ops 9.2.1、PyTorch 2.9.0、
+TorchNPU 2.9.0.post9，以及随 ops 包安装的 `cann_ops_nn 1.0.1`。
+需要先加载对应的 CANN `set_env.sh`；模型构造时会检查前向和反向融合接口是否齐全。
+
+此路径当前要求 **TP=CP=EP=PP=1**，可以配合数据并行/FSDP。
+从本目录的 online YAML 修改时，将 `accelerator` 中各并行大小设为 1，关闭
+`sequence_parallel`，并按实际卡数设置 `fsdp_config.dp_shard_size`。
+移除 `model.layers.*.mlp.forward` 的 MegaMoe/EP 方法替换，将
+`model.layers.*.mlp.experts` 的 MegaMoe 替换改成下面的 Family 配置：
+
+```yaml
+training:
+  low_precision:
+    dtype_schemes:
+      experts_mxfp8:
+        weight_format: mxfp8
+        act_format: mxfp8
+        block_size: 32
+        is_fake_quantize: false
+
+plan_overrides:
+  - match: "model.layers.*.mlp.experts"
+    replace:
+      kind: module
+      source_type: transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4Experts
+      implementation:
+        _target_: hyper_parallel.components.modules.GroupedExperts
+        low_precision_dtype_scheme: experts_mxfp8
+        fused: true
+```
+
+以上是需要合并到原 YAML 的片段，其余数据、参数覆盖声明、优化器和注意力配置继续保留。
+若未安装 MegaGate/MegaMhc 等独立原生组件，可删除相应模块替换，使用模型原生实现；
+本特性不要求启用它们或 CSA2 注意力融合。
+
+融合直接继承源 experts 的 `swiglu_limit`：gate 只裁剪上界，up 裁剪正负两侧；
+路由权重仍由外层在第二次 GMM 后应用一次。设置 `fused: false` 可回到现有非融合
+MXFP8 路径。融合使用算子内部的激活计算精度，FP8 结果与非融合路径不保证逐位一致。

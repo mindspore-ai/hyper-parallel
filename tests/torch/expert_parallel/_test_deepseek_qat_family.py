@@ -16,6 +16,7 @@
 
 import json
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -23,8 +24,70 @@ from torch import nn
 
 from hyper_parallel.components.quantization.functional.base_gmm_func import _GroupedLinearFunction
 from hyper_parallel.components.quantization.functional.strategy_factory import build_low_precision_strategy
+from hyper_parallel.components.quantization.tensor import QuantizedTensor
 from tests.common.qat_family import deepseek_experts_model, deepseek_qat_config, install_family
 from tests.torch.expert_parallel._test_family_mxfp8_local import _device
+
+
+def test_deepseek_fused_mxfp8() -> None:
+    """Train native V4.1 clipped experts with both real CANN fusion kernels."""
+    _device()
+    torch.manual_seed(971)
+    model = deepseek_experts_model().to(device="npu", dtype=torch.bfloat16)
+    source = model.experts
+    install_family(model, deepseek_qat_config(fused=True))
+    expert = model.experts
+    optimizer = torch.optim.SGD(expert.parameters(), lr=1e-4)
+    counts = torch.tensor([16, 0, 16, 32], device="npu", dtype=torch.int64)
+    inputs = torch.randn(64, 128, device="npu", dtype=torch.bfloat16) * 64
+    initial = [parameter.detach().clone() for parameter in expert.parameters()]
+    chunks = inputs.split([16, 0, 16, 32])
+    expected = torch.cat([
+        source._apply_gate(chunk @ gate_up.T) @ down.T  # pylint: disable=protected-access
+        for chunk, gate_up, down in zip(chunks, source.gate_up_proj, source.down_proj)
+    ])
+    runtime = expert.quantizer.npu_ops
+    losses = []
+    saved = []
+
+    def pack(tensor: torch.Tensor) -> torch.Tensor:
+        """Observe that swap/recompute hooks see physical tensors only.
+
+        Args:
+            tensor: Physical saved activation or quantized payload buffer.
+        """
+        assert isinstance(tensor, torch.Tensor) and not isinstance(tensor, QuantizedTensor)
+        saved.append(tuple(tensor.shape))
+        return tensor
+
+    with patch.object(runtime, "swiglu_mx_quant_dual_axis", wraps=runtime.swiglu_mx_quant_dual_axis) as forward, \
+         patch.object(runtime, "swiglu_backward_mx_quant_dual_axis",
+                      wraps=runtime.swiglu_backward_mx_quant_dual_axis) as backward:
+        for step in range(10):
+            optimizer.zero_grad(set_to_none=True)
+            states = inputs.detach().clone().requires_grad_()
+            with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+                actual = expert.forward_expert_major(states, counts)
+                loss = actual.float().square().mean()
+            if step == 0:
+                relative_l2 = ((actual.float() - expected.float()).norm() / expected.float().norm()).item()
+                assert relative_l2 < 0.12, relative_l2
+            loss.backward()
+            assert torch.isfinite(loss)
+            assert torch.isfinite(states.grad).all()
+            assert all(parameter.grad is not None and torch.isfinite(parameter.grad).all()
+                       for parameter in expert.parameters())
+            optimizer.step()
+            losses.append(loss.item())
+        assert forward.call_count == backward.call_count == 10
+        assert all(call.kwargs["clamp_limit"] == source.limit for call in forward.call_args_list)
+        assert all(call.kwargs["clamp_limit"] == source.limit for call in backward.call_args_list)
+    assert all(not torch.equal(before, after) for before, after in zip(initial, expert.parameters()))
+    assert saved
+    print(json.dumps({"deepseek_clamp": source.limit, "fused": True, "steps": 10,
+                      "losses": losses, "bf16_forward_relative_l2": relative_l2,
+                      "fused_forward_calls": 10, "fused_backward_calls": 10,
+                      "physical_saved_tensors": len(saved)}), flush=True)
 
 
 @pytest.mark.parametrize("fake,weight_format", [(False, "mxfp8"), (False, "mxfp4"), (True, "mxfp4")])

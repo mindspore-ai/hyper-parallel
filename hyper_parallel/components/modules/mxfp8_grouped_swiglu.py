@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from typing import Any
 
@@ -23,6 +24,7 @@ import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 from torch.nn import functional as F  # pylint: disable=forbidden-backend-import
 from transformers.activations import ACT2FN
+from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Experts
 
 from hyper_parallel.components.modules.grouped_experts import GroupedExperts
 from hyper_parallel.components.quantization.functional.mxfp8_fused_grouped_swiglu import (
@@ -118,12 +120,22 @@ class FusedMXFP8GroupedSwiGLU(MXFP8GroupedSwiGLU):
     def __init__(self, *, module: nn.Module, module_fqn: str = "",
                  context: Mapping[str, Any] | None = None) -> None:
         """Validate both fused kernels during construction, with module diagnostics."""
+        self.clamp_limit = float(module.limit) if isinstance(module, DeepseekV4Experts) else None
+        if self.clamp_limit is not None and (not math.isfinite(self.clamp_limit) or self.clamp_limit <= 0):
+            raise ValueError(f"{module_fqn or '<root>'}: clipped MXFP8 fusion requires a positive finite limit")
         super().__init__(module=module, module_fqn=module_fqn, context=context)
         try:
-            validate_npu_swiglu_runtime()
+            validate_npu_swiglu_runtime(clamp_limit=self.clamp_limit)
         except RuntimeError as exc:
             raise RuntimeError(f"{module_fqn or '<root>'}: {exc}") from exc
 
+    @classmethod
+    def _activation(cls, module: nn.Module, config: Any, gated_linear_unit: bool) -> Any:
+        """Accept DeepSeek V4/V4.1 clipped experts while keeping the custom-gate guard for others."""
+        return (None if isinstance(module, DeepseekV4Experts)
+                else super()._activation(module, config, gated_linear_unit))
+
     def _local_compute(self, permuted, gate_up_proj, down_proj, counts):
         """Use one autograd boundary without passing quantized carriers between nodes."""
-        return fused_grouped_swiglu(permuted, gate_up_proj, down_proj, counts, self.quantizer)
+        return fused_grouped_swiglu(
+            permuted, gate_up_proj, down_proj, counts, self.quantizer, clamp_limit=self.clamp_limit)

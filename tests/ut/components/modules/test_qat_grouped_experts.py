@@ -36,6 +36,8 @@ from tests.common.grouped_experts_family import TinyMoE
 from tests.common.linear_family import linear_config
 from tests.common.qat_family import deepseek_experts_model, deepseek_qat_config, install_family, qat_config
 
+from tests.common.mark_utils import arg_mark
+
 
 class TestQATGroupedExperts(unittest.TestCase):
     """Mock device capability checks only; registration and strategy selection stay real."""
@@ -47,6 +49,8 @@ class TestQATGroupedExperts(unittest.TestCase):
             probe.start()
             self.addCleanup(probe.stop)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_named_scheme_selects_strategy_and_preserves_weights(self) -> None:
         """
         Feature: Scheme-selected Module Family.
@@ -74,8 +78,14 @@ class TestQATGroupedExperts(unittest.TestCase):
                         torch.zeros(4, 128), torch.tensor([1, 1, 1, 1], dtype=torch.int64))
                     self.assertEqual(tuple(out.shape), (4, 128))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_source_activation_contract(self) -> None:
-        """Reject non-SwiGLU sources through every supported activation selector."""
+        """
+        Feature: SwiGLU source validation.
+        Description: Exercise every supported activation selector.
+        Expectation: Non-SwiGLU sources are rejected before computation.
+        """
         for fake, fmt in ((False, "mxfp8"), (False, "mxfp4"), (True, "mxfp4")):
             for selector in ("hidden_act", "hidden_activation", "mlp_hidden_act", "act_fn"):
                 for valid in (False, True):
@@ -98,13 +108,21 @@ class TestQATGroupedExperts(unittest.TestCase):
                             with self.assertRaisesRegex(ValueError, "requires SwiGLU source activation"):
                                 install_family(model, config)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_module_activation_cannot_override_silu_with_gelu(self) -> None:
-        """A nominal SiLU config must not hide an incompatible source callable."""
+        """
+        Feature: SwiGLU callable validation.
+        Description: Attach GELU to a source configured as SiLU.
+        Expectation: The incompatible callable is rejected.
+        """
         model = TinyMoE()
         model.mlp.experts.act_fn = nn.GELU()
         with self.assertRaisesRegex(ValueError, "requires SwiGLU source activation"):
             install_family(model, qat_config(weight_format="mxfp8"))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_scheme_conflicts_and_unknown_arguments(self) -> None:
         """
         Feature: Scheme-selected Module Family.
@@ -136,6 +154,8 @@ class TestQATGroupedExperts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dtype scheme requires training.low_precision"):
             entries_to_module_replacements(qat_config().plan_overrides, low_precision_config=None)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_named_schemes_keep_upstream_block_constraints(self) -> None:
         """
         Feature: Scheme-selected quantization constraints.
@@ -166,6 +186,8 @@ class TestQATGroupedExperts(unittest.TestCase):
 
     @patch("hyper_parallel.components.modules.mxfp8_grouped_swiglu.validate_npu_swiglu_runtime")
     @patch("hyper_parallel.components.modules.mxfp8_grouped_swiglu.validate_npu_gmm_runtime")
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_fused_yaml_and_legacy_alias_overrides(self, gmm_probe, swiglu_probe) -> None:
         """
         Feature: Format-independent fusion selector.
@@ -191,6 +213,8 @@ class TestQATGroupedExperts(unittest.TestCase):
         self.assertEqual(gmm_probe.call_count, 2)
         self.assertEqual(swiglu_probe.call_count, 2)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_scheme_name_roundtrip_and_override(self) -> None:
         """
         Feature: Scheme-selected Module Family.
@@ -212,6 +236,8 @@ class TestQATGroupedExperts(unittest.TestCase):
         self.assertIs(type(model.mlp.experts.grouped_linear), MXFP8GroupedLinear)
 
     @patch("hyper_parallel.components.modules.low_precision_linear.validate_npu_runtime")
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_mixed_dense_and_expert_schemes(self, probe) -> None:
         """
         Feature: Scheme-selected Module Family.
@@ -233,6 +259,8 @@ class TestQATGroupedExperts(unittest.TestCase):
         self.assertIs(type(model.mlp.experts.grouped_linear), FakeW4A8GroupedLinear)
         probe.assert_called_once()
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_transposed_layout_preserves_loaded_values(self) -> None:
         """
         Feature: Scheme-selected Module Family.
@@ -244,6 +272,8 @@ class TestQATGroupedExperts(unittest.TestCase):
         install_family(model, qat_config())
         torch.testing.assert_close(model.mlp.experts.gate_up_proj, before.transpose(-2, -1))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
     def test_deepseek_clamp_matches_native_forward_and_gradient(self) -> None:
         """
         Feature: Non-fused V4.1 expert activation.
@@ -277,16 +307,47 @@ class TestQATGroupedExperts(unittest.TestCase):
                     gc.collect()
                     self.assertIsNone(source_ref())
 
-    def test_deepseek_fusion_and_baseline_keep_existing_guard(self) -> None:
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_deepseek_baseline_keeps_existing_guard(self) -> None:
         """
         Feature: Localized V4.1 QAT support.
-        Description: Non-fused QAT support does not broaden the public baseline or fused contracts.
-        Expectation: Both unsupported replacements still reject the custom activation.
+        Description: Clipped QAT support does not broaden the public BF16 baseline.
+        Expectation: The baseline still rejects the custom activation.
         """
-        for fused in (False, True):
-            with self.subTest(fused=fused):
-                raw = deepseek_qat_config(fused=fused).to_dict()
-                if not fused:
-                    del raw["plan_overrides"][0]["replace"]["implementation"]["low_precision_dtype_scheme"]
-                with self.assertRaisesRegex(ValueError, "custom _apply_gate"):
-                    install_family(deepseek_experts_model(), resolve_config(raw))
+        raw = deepseek_qat_config().to_dict()
+        del raw["plan_overrides"][0]["replace"]["implementation"]["low_precision_dtype_scheme"]
+        with self.assertRaisesRegex(ValueError, "custom _apply_gate"):
+            install_family(deepseek_experts_model(), resolve_config(raw))
+
+    @patch("hyper_parallel.components.modules.mxfp8_grouped_swiglu.validate_npu_swiglu_runtime")
+    @patch("hyper_parallel.components.modules.mxfp8_grouped_swiglu.validate_npu_gmm_runtime")
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_deepseek_fusion_preserves_clamp_and_parameters(self, gmm_probe, fusion_probe) -> None:
+        """
+        Feature: V4.1 clipped MXFP8 fusion through the named Family scheme.
+        Description: Resolve the production configuration and retain only canonical weights and the clip limit.
+        Expectation: Setup validates the clipped kernel and local math forwards the original limit.
+        """
+        del gmm_probe
+        model = deepseek_experts_model()
+        source = model.experts
+        source_ref = weakref.ref(source)
+        gate_up = source.gate_up_proj
+        install_family(model, deepseek_qat_config(fused=True))
+        expert = model.experts
+        self.assertIs(type(expert), FusedMXFP8GroupedSwiGLU)
+        self.assertEqual(expert.clamp_limit, source.limit)
+        fusion_probe.assert_called_once_with(clamp_limit=source.limit)
+        torch.testing.assert_close(expert.gate_up_proj, gate_up.transpose(-2, -1))
+        inputs = torch.randn(4, 128, dtype=torch.bfloat16)
+        counts = torch.tensor([1, 0, 1, 2])
+        with patch("hyper_parallel.components.modules.mxfp8_grouped_swiglu.fused_grouped_swiglu",
+                   return_value=inputs) as fused:
+            expert.forward_expert_major(inputs, counts)
+        self.assertEqual(fused.call_args.kwargs, {"clamp_limit": source.limit})
+        self.assertEqual(set(dict(expert.named_parameters())), {"gate_up_proj", "down_proj"})
+        del source
+        gc.collect()
+        self.assertIsNone(source_ref())
