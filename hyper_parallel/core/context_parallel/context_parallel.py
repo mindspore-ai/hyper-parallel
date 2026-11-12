@@ -436,8 +436,53 @@ def _gather_seq(
 # Unified ContextParallel
 # ---------------------------------------------------------------------------
 
+class _RecurrentStateContext:
+    """DTensor transport for local recurrent operators and causal stencils."""
+
+    def __init__(self, sequence_mesh: DeviceMesh, head_mesh: Optional[DeviceMesh] = None) -> None:
+        """Bind chronological state transport and optional Ulysses head sharding."""
+        self.sequence_mesh = sequence_mesh
+        self.head_mesh = head_mesh
+        self.rank = sequence_mesh.get_local_rank()
+        self.size = sequence_mesh.size()
+
+    def gather_summaries(self, summary: Tensor) -> Tensor:
+        """Collect fixed-size summaries in sequence order, without gathering tokens."""
+        return (DTensor.from_local(summary.unsqueeze(0), self.sequence_mesh, (Shard(0),))
+                .redistribute(self.sequence_mesh, (Replicate(),)).to_local())
+
+    def sequence_halo(self, tensor: Tensor, width: int, seq_dim: int = 1) -> Tensor:
+        """Prepend a differentiable causal halo, including shards shorter than width."""
+        if width <= 0:
+            return tensor
+        length = min(width, tensor.shape[seq_dim])
+        if length == 0:
+            raise ValueError("State-parallel convolution requires nonempty sequence shards.")
+        tails = tensor.narrow(seq_dim, tensor.shape[seq_dim] - length, length).movedim(seq_dim, 0).contiguous()
+        gathered = (DTensor.from_local(tails, self.sequence_mesh, (Shard(0),))
+                    .redistribute(self.sequence_mesh, (Replicate(),)).to_local())
+        end = self.rank * length
+        available = min(width, end)
+        prefix = gathered[end - available:end]
+        if available < width:
+            shape = (width - available,) + tuple(gathered.shape[1:])
+            padding = platform.zeros(shape, dtype=tensor.dtype, device=getattr(tensor, "device", None))
+            # Keep rank zero in the gather's backward collective as well.
+            padding = padding + gathered.sum() * 0
+            prefix = platform.cat((padding, prefix), dim=0)
+        return platform.cat((prefix.movedim(0, seq_dim), tensor), dim=seq_dim)
+
+
 class ContextParallel(ParallelStyle):
     """Unified Context Parallel for core-attention modules.
+
+    With ``state_parallel=True``, Colossal retains local sequence shards for
+    every configured input instead of gathering K/V. The module receives
+    ``_context_parallel_state`` with differentiable halo and fixed-size summary
+    redistribution helpers. Hybrid first redistributes heads within Ulysses
+    subgroups, then uses state parallelism across the remaining sequence mesh.
+    The module must consume this context to propagate its recurrent state.
+    State parallelism requires contiguous sequence order (no load balancing).
 
     Three modes controlled by ``ulysses_degree``:
 
@@ -496,6 +541,7 @@ class ContextParallel(ParallelStyle):
         qkv_kwarg_names: tuple = (),
         use_local_output: bool = False,
         load_balance: bool = False,
+        state_parallel: bool = False,
     ):
         if load_balance and ulysses_degree != 1:
             raise ValueError(
@@ -508,6 +554,9 @@ class ContextParallel(ParallelStyle):
         self.qkv_kwarg_names = qkv_kwarg_names
         self.use_local_output = use_local_output
         self.load_balance = load_balance
+        self.state_parallel = state_parallel
+        if state_parallel and load_balance:
+            raise ValueError("State-parallel recurrence requires natural sequence order.")
 
     # ------------------------------------------------------------------
     # ParallelStyle interface
@@ -531,6 +580,8 @@ class ContextParallel(ParallelStyle):
         if ds == 1:
             # Pure Colossal AI
             co_submesh = _ensure_1d(device_mesh)
+            if self.state_parallel:
+                module._context_parallel_state = _RecurrentStateContext(co_submesh)
             if self.load_balance:
                 self._apply_lb_colossal(module, co_submesh)
             else:
@@ -558,6 +609,10 @@ class ContextParallel(ParallelStyle):
             if dim_names is None:
                 raise ValueError("2-D mesh must have mesh_dim_names (guaranteed by _build_2d_mesh)")
             ds_submesh = hybrid_cp_mesh[dim_names[1]]
+            if self.state_parallel:
+                module._context_parallel_state = _RecurrentStateContext(
+                    hybrid_cp_mesh[dim_names[0]], ds_submesh
+                )
             module.register_forward_pre_hook(
                 partial(
                     self._pre_hook_hybrid,
@@ -599,6 +654,16 @@ class ContextParallel(ParallelStyle):
         new_kwargs = dict(kwargs)
 
         self._record_q_output_tp_layout(module, new_args, new_kwargs, co_submesh)
+        if self.state_parallel:
+            for idx in self.qkv_indices:
+                if idx < len(new_args) and _is_tensor_or_dtensor(new_args[idx]):
+                    new_args[idx] = _to_cp_dtensor(new_args[idx], co_submesh,
+                                                 (Shard(self.seq_dim),), (Shard(self.seq_dim),), self.seq_dim)
+            for name in self.qkv_kwarg_names:
+                if name in new_kwargs and _is_tensor_or_dtensor(new_kwargs[name]):
+                    new_kwargs[name] = _to_cp_dtensor(new_kwargs[name], co_submesh,
+                                                    (Shard(self.seq_dim),), (Shard(self.seq_dim),), self.seq_dim)
+            return tuple(new_args), new_kwargs
         q_idx = self.qkv_indices[0]
         if q_idx < len(new_args) and _is_tensor_or_dtensor(new_args[q_idx]):
             new_args[q_idx] = _to_cp_dtensor(
@@ -725,6 +790,14 @@ class ContextParallel(ParallelStyle):
                 new_args[idx] = self._ata_scatter_to_hybrid(
                     new_args[idx], ds_submesh, hybrid_cp_mesh, ds_size
                 )
+
+        if self.state_parallel:
+            for name in self.qkv_kwarg_names:
+                if name in new_kwargs and self._needs_hybrid_ata(new_kwargs[name], hybrid_cp_mesh):
+                    new_kwargs[name] = self._ata_scatter_to_hybrid(
+                        new_kwargs[name], ds_submesh, hybrid_cp_mesh, ds_size
+                    )
+            return tuple(new_args), new_kwargs
 
         # Step 2: all-gather K/V on co-dim (Shard(seq)→Replicate)
         for idx in self.qkv_indices[1:]:

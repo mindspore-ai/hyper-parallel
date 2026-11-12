@@ -33,6 +33,7 @@ from hyper_parallel.custom_ops.experimental.experimental_ops import (  # noqa: E
     _MAX_INT64,
     npu_dense_lightning_indexer_grad_kl_loss,
     npu_dense_lightning_indexer_softmax_lse,
+    npu_chunk_kda,
     npu_mhc_post,
     npu_mhc_pre_clamp_sinkhorn,
     npu_mhc_pre_cmhc,
@@ -414,6 +415,54 @@ class TestNpuMhcPreCmhc(unittest.TestCase):
             "x", "phi", "alpha", "bias", "perm_mats",
             "should_be_ignored", 1e-6, 1e-6,
         )
+
+
+class TestNpuChunkKda(unittest.TestCase):
+    """Validate the differentiable Chunk KDA wrapper contract."""
+
+    @patch(_PATCH_TARGET)
+    def test_defaults_forward_latest_backward_contract(self, mock_platform):
+        expected = (MagicMock(), None)
+        mock_platform.custom_ops.npu_chunk_kda.return_value = expected
+
+        result = npu_chunk_kda("q", "k", "v", "g", "beta", 0.125, a_log="a_log")
+
+        mock_platform.custom_ops.npu_chunk_kda.assert_called_once_with(
+            "q", "k", "v", "g", "beta", 0.125, 64, "BNSD", False,
+            False, -5.0, True, "a_log", None, None, None, 1e-6,
+            False, False, False, True, None, True, False,
+        )
+        self.assertIs(result, expected)
+
+    @patch(_PATCH_TARGET)
+    def test_fwd_v2_options_forward(self, mock_platform):
+        npu_chunk_kda(
+            "q", "k", "v", "g", "beta", 1.0, a_log="a_log",
+            use_qk_l2norm_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
+            allow_neg_eigval=True,
+            epsilon=1e-5,
+        )
+
+        args = mock_platform.custom_ops.npu_chunk_kda.call_args.args
+        self.assertEqual(args[16:21], (1e-5, True, True, True, True))
+
+    @patch(_PATCH_TARGET)
+    def test_state_and_recompute_options_forward(self, mock_platform):
+        npu_chunk_kda("q", "k", "v", "g", "beta", 1.0, a_log="a", safe_gate=True,
+                      initial_state="h0", disable_recompute=False, state_v_first=True)
+        self.assertEqual(mock_platform.custom_ops.npu_chunk_kda.call_args.args[21:], ("h0", False, True))
+
+    @patch(_PATCH_TARGET)
+    def test_forwards_backward_options_for_kernel_validation(self, mock_platform):
+        """The HP wrapper forwards option contracts for validation by FLA-NPU."""
+        npu_chunk_kda(
+            "q", "k", "v", "g", "beta", 1.0,
+            use_gate_in_kernel=False, use_exp2=False, allow_neg_eigval=True,
+        )
+        args = mock_platform.custom_ops.npu_chunk_kda.call_args.args
+        self.assertEqual(args[11:13], (False, None))
+        self.assertEqual(args[19:21], (True, False))
 
 
 if __name__ == "__main__":
