@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 
 export const PASS_LABELS = ['ci-pipeline-passed', 'ci-pipeline-passed-but-overtime'];
 export const TTL_MS = 24 * 60 * 60 * 1000;
-const PASSING_CONCLUSIONS = new Set(['success', 'neutral', 'skipped']);
+export const STATUS_CONTEXT = 'label-check';
 
 /** Evaluate each currently attached label using its latest label transition. */
 export function evaluate_labels(pull, events, now = Date.now()) {
@@ -58,16 +58,17 @@ export class LabelClient {
   list_pulls() { return this.api('pulls?state=open&per_page=100', { paginate: true }).flat(); }
   get_pull(number) { return this.api(`pulls/${number}`); }
   get_events(number) { return this.api(`issues/${number}/events?per_page=100`, { paginate: true }).flat(); }
-  get_checks(sha) {
-    return this.api(`commits/${sha}/check-runs?check_name=label-check&filter=latest&per_page=100`,
-      { paginate: true }).flatMap(page => page.check_runs);
+  get_statuses(sha) {
+    return this.api(`commits/${sha}/status?per_page=100`,
+      { paginate: true }).flatMap(page => page.statuses);
   }
-  fail_check(check) {
-    this.api(`check-runs/${check.id}`, {
-      method: 'PATCH', body: {
-        status: 'completed', conclusion: 'failure',
-        output: { title: 'A fresh CI pass label is required',
-          summary: 'Neither CI pass label is within its 24-hour validity period. Run CI again to renew it.' },
+  set_status(sha, state, number) {
+    this.api(`statuses/${sha}`, {
+      method: 'POST', body: {
+        context: STATUS_CONTEXT, state,
+        description: state === 'success' ? 'Every open PR using this commit has a fresh CI pass label.' :
+          'An open PR using this commit needs a fresh CI pass label. Run CI again.',
+        target_url: `https://github.com/${this.repository}/pull/${number}`,
       },
     });
   }
@@ -88,21 +89,73 @@ function identity(value) {
     value.labels.map(label => [label.name, label.event_id])]);
 }
 
-function invalidate_checks(client, current, now) {
-  // pull_request checks can belong to the synthetic merge commit or the head.
+function sharing_pulls(pulls, sha) {
+  return pulls.filter(pull => pull.state === 'open' && [pull.head.sha, pull.merge_commit_sha].includes(sha));
+}
+
+function sync_statuses(client, current, now, pulls) {
+  // Actions-owned check conclusions cannot be patched. A commit status with
+  // the same required context must pass alongside that check (on either SHA).
   const shas = [...new Set([current.pull.head.sha, current.pull.merge_commit_sha].filter(Boolean))];
-  const checks = shas.flatMap(sha => client.get_checks(sha)).filter(check =>
-    check.name === 'label-check' && check.app?.id === 15368 && PASSING_CONCLUSIONS.has(check.conclusion));
-  for (const check of checks) {
-    const fresh = snapshot(client, current.pull.number, now);
-    if (identity(fresh) !== identity(current) || fresh.labels.some(label => !label.expired)) {
-      throw new Error('PR or CI labels changed before invalidating the old check; retry on the next sweep');
+  const valid = current.labels.some(label => !label.expired);
+  for (const sha of shas) {
+    // Commit statuses are shared by every PR using the SHA. A fresh sibling PR
+    // must not restore a status while another sibling still has expired CI.
+    const peers = sharing_pulls(pulls, sha).filter(pull => pull.number !== current.pull.number);
+    const snapshots = valid ? peers.map(pull => snapshot(client, pull.number, now)) : [];
+    const state = valid && snapshots.every(value => value.labels.some(label => !label.expired)) ? 'success' : 'failure';
+    const previous = client.get_statuses(sha).find(status => status.context === STATUS_CONTEXT);
+    const status_time = now();
+    if (state === 'success' && [current, ...snapshots].some(value =>
+      !value.labels.some(label => status_time - Date.parse(label.added_at) < TTL_MS))) {
+      throw new Error('CI labels expired while reading status; retry on the next sweep');
     }
-    client.fail_check(check);
+    // GitHub limits each SHA/context to 1000 statuses; only publish transitions.
+    if (previous?.state === state) continue;
+    if (state === 'success') {
+      const expected = [current.pull.number, ...peers.map(pull => pull.number)].sort((a, b) => a - b);
+      const actual = sharing_pulls(client.list_pulls(), sha).map(pull => pull.number).sort((a, b) => a - b);
+      if (JSON.stringify(expected) !== JSON.stringify(actual) || snapshots.some(value => {
+        const latest = snapshot(client, value.pull.number, now);
+        return identity(latest) !== identity(value) || !latest.labels.some(label => !label.expired);
+      })) {
+        throw new Error('PRs sharing this commit changed before publishing success; retry on the next sweep');
+      }
+    }
+    const fresh = snapshot(client, current.pull.number, now);
+    if (identity(fresh) !== identity(current) || fresh.labels.some(label => !label.expired) !== valid) {
+      throw new Error('PR or CI labels changed before updating the status; retry on the next sweep');
+    }
+    const write_time = now();
+    if (state === 'success' && [fresh, ...snapshots].some(value =>
+      !value.labels.some(label => write_time - Date.parse(label.added_at) < TTL_MS))) {
+      throw new Error('CI labels expired before publishing success; retry on the next sweep');
+    }
+    client.set_status(sha, state, current.pull.number);
   }
 }
 
-/** Expire labels and invalidate stale passing checks; default to read-only. */
+function block_after_error(client, pull, errors) {
+  // A read error must not deliberately preserve an earlier success. If reads
+  // fail too, try the last known SHAs; an API outage can still prevent revocation.
+  let current = pull;
+  try { current = client.get_pull(pull.number); } catch (error) {
+    errors.push(`PR #${pull.number}: cannot refresh commits before blocking: ${error.message}`);
+  }
+  if (current.state !== 'open') return;
+  for (const sha of new Set([current.head.sha, current.merge_commit_sha].filter(Boolean))) {
+    let previous;
+    try { previous = client.get_statuses(sha).find(status => status.context === STATUS_CONTEXT); } catch (error) {
+      errors.push(`PR #${pull.number}: cannot read status on ${sha}: ${error.message}`);
+    }
+    if (previous?.state === 'failure') continue;
+    try { client.set_status(sha, 'failure', pull.number); } catch (error) {
+      errors.push(`PR #${pull.number}: cannot block ${sha}: ${error.message}`);
+    }
+  }
+}
+
+/** Expire labels and reconcile the required commit status; default to read-only. */
 export function reconcile_labels(client, { write = false, now = Date.now, only_pr, completed_head } = {}) {
   const reports = [];
   const errors = [];
@@ -118,7 +171,7 @@ export function reconcile_labels(client, { write = false, now = Date.now, only_p
       if (!write) continue;
       // GITHUB_TOKEN removals do not trigger the unlabeled workflow. A completed
       // label-check workflow also signals this reconciler to handle late successes.
-      if (!current.labels.some(label => !label.expired)) invalidate_checks(client, current, now);
+      sync_statuses(client, current, now, pulls);
       for (const label of expired) {
         const fresh = snapshot(client, pull.number, now);
         if (identity(fresh) !== identity(current)) {
@@ -135,6 +188,7 @@ export function reconcile_labels(client, { write = false, now = Date.now, only_p
       }
     } catch (error) {
       errors.push(`PR #${pull.number}: ${error.message}`);
+      if (write) block_after_error(client, pull, errors);
     }
   }
   return { reports, errors };
