@@ -450,7 +450,9 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
                 module, boundary, spec, mesh, mesh_dim_names,
                 validate_mode=validate_mode, compute_fn=compute_fn,
                 exclude_subtrees=nested)
-        elif validate_mode:
+        elif validate_mode and mesh_dim_names:
+            # EP-only plans have no active dense axes: dense parameters stay
+            # local, so wrapping their inputs as DTensors would mix types.
             _wrap_validate_forward(
                 module,
                 boundary,

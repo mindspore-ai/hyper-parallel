@@ -499,6 +499,9 @@ class GroupedExperts(nn.Module):
 register_module_family(ModuleFamily(
     name="grouped_experts",
     baseline=GroupedExperts,
+    parallel_adapters={
+        "ep": "hyper_parallel.distributed.expert_parallel.experts.grouped_experts_contract",
+    },
     variants={
         "w8a8": "hyper_parallel.components.modules.low_precision_grouped_experts.replace_mxfp8_grouped_experts",
         "w4a8": "hyper_parallel.components.modules.low_precision_grouped_experts.replace_w4a8_grouped_experts",
