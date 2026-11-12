@@ -27,6 +27,7 @@ from hyper_parallel.high_availability.config import RecoveryConfig
 from hyper_parallel.components.ops.catalog import builtin_registry
 
 from hyper_parallel.trainer.config.data import DataLoaderConfig, DatasetConfig
+from hyper_parallel.trainer.config.hyper_offload import HyperOffloadConfig
 from hyper_parallel.trainer.config.optimization import (
     MixedPrecisionConfig,
     OptimizerConfig,
@@ -70,6 +71,7 @@ class TrainerConfig:
         default_factory=MixedPrecisionConfig
     )
     activation_checkpoint: Optional[ActivationCheckpointConfig] = None
+    hyper_offload: HyperOffloadConfig = field(default_factory=HyperOffloadConfig)
     compile: CompileConfig = field(default_factory=CompileConfig)
 
     # data
@@ -107,6 +109,11 @@ class TrainerConfig:
             and self.accelerator.pp_size > 1
         ):
             raise ValueError("compile is not supported together with pipeline parallelism")
+        if self.hyper_offload.enable:
+            if self.compile.enabled or self.accelerator.pp_size > 1:
+                raise ValueError("hyper_offload requires eager training without pipeline parallelism")
+            if self.activation_swap != "none" or self.activation_checkpoint.swap_inputs:
+                raise ValueError("hyper_offload cannot be combined with activation swapping")
         reduce_dtype = self.fsdp_config.mix_precision.reduce_dtype
         if self.optimizer.fp32_main_params and reduce_dtype != "float32":
             raise ValueError(

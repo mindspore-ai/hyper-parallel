@@ -27,6 +27,7 @@ class ResidencyActionType(Enum):
     COPY_H2D = auto()
     RELEASE_DEVICE = auto()
     RELEASE_HOST = auto()
+    TRY_RELEASE_DEVICE = auto()
 
 
 @dataclass(frozen=True)

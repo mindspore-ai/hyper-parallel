@@ -20,10 +20,21 @@ import unittest
 from unittest.mock import patch
 
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
-from hyper_parallel.auto_parallel.hyper_offload import OffloadConfig, OffloadSession
+from hyper_parallel.auto_parallel.hyper_offload import (
+    OffloadConfig,
+    OffloadSession,
+    skip_offload,
+)
 from hyper_parallel.auto_parallel.hyper_offload.execution.replay import ReplayExecutor
+from hyper_parallel.auto_parallel.hyper_offload.execution.tensor import ShadowTensor
 from hyper_parallel.auto_parallel.hyper_offload.execution.warmup import WarmupExecutor
+from hyper_parallel.auto_parallel.hyper_offload.ir.replay import OpGuide
+from hyper_parallel.auto_parallel.hyper_offload.ir.schedule import (
+    ResidencyActionType,
+    ResidencySchedule,
+)
 
 
 class _MockExecutorContext:
@@ -124,6 +135,7 @@ class TestOffloadSessionLifecycle(unittest.TestCase):
         # Second pass: should still have op_idx = -1 at entry
         with session:
             self.assertEqual(session.executor.op_idx, -1)
+            _ = torch.randn(4, 4) + 1
 
     def test_tensor_operation_during_session(self) -> None:
         """Simple tensor operations should work inside a session."""
@@ -163,9 +175,8 @@ class TestOffloadSessionLifecycle(unittest.TestCase):
                 raise ValueError("boom")
 
         model = _RaisesOnForward()
-        with self.assertRaisesRegex(ValueError, "boom"):
-            with session:
-                model(torch.randn(4, 4))
+        with self.assertRaisesRegex(ValueError, "boom"), session:
+            model(torch.randn(4, 4))
 
         # State should be cleaned up
         self.assertEqual(len(session.executor._alive_shadows), 0)  # pylint: disable=protected-access
@@ -225,8 +236,8 @@ class TestOffloadSessionLifecycle(unittest.TestCase):
             # Should have multiple ops recorded (access inside session while WarmupExecutor)
             self.assertGreaterEqual(len(session.executor._ops), 4)  # pylint: disable=protected-access
 
-    def test_replay_op_idx_tracking(self) -> None:
-        """During replay, op_idx should increment through ops."""
+    def test_transfer_free_replay_does_not_track_ops(self) -> None:
+        """A plan without transfers leaves ordinary tensor execution native."""
         session = OffloadSession(OffloadConfig(max_resident_activation_mb=1))
         t = torch.randn(4, 4, requires_grad=True)
 
@@ -235,9 +246,67 @@ class TestOffloadSessionLifecycle(unittest.TestCase):
             _ = t + 1
         self.assertEqual(session.mode, "replay")
 
-        # Second pass: replay mode, op_idx starts at -1 and increments
+        # The empty transfer plan does not intercept later operations.
         with session:
             self.assertEqual(session.executor.op_idx, -1)
             _ = t + 1
-            # After executing one op in replay, op_idx should be 0
-            self.assertEqual(session.executor.op_idx, 0)
+            self.assertFalse(session.executor.requires_dispatch)
+            self.assertEqual(session.executor.op_idx, -1)
+
+    def test_native_replay_preserves_gradients_and_outer_modes(self) -> None:
+        """Empty plans preserve opaque functions, autograd, and unrelated modes."""
+        session = OffloadSession(OffloadConfig(max_resident_activation_mb=1))
+        seen = []
+
+        class Observer(TorchDispatchMode):
+            """Observe execution beneath the session."""
+
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                seen.append(func)
+                return func(*args, **(kwargs or {}))
+
+        @skip_offload
+        def block(value: torch.Tensor) -> torch.Tensor:
+            """Exercise an opaque differentiable function."""
+            return value.sin() * value
+
+        source = torch.linspace(-1, 1, 16)
+        expected_input = source.clone().requires_grad_()
+        expected = block(expected_input).sum()
+        expected.backward()
+        for _ in range(3):
+            value = source.clone().requires_grad_()
+            with Observer(), session:
+                result = block(value).sum()
+                result.backward()
+            torch.testing.assert_close(result, expected, rtol=0, atol=0)
+            torch.testing.assert_close(value.grad, expected_input.grad, rtol=0, atol=0)
+        self.assertNotIsInstance(result, ShadowTensor)
+        self.assertIn(torch.ops.aten.sin.default, seen)
+        self.assertEqual(session.executor.op_idx, -1)
+        self.assertIsNone(OffloadSession.get_active())
+
+    def test_native_replay_exception_restores_context(self) -> None:
+        """A native execution failure never leaves an active session behind."""
+        session = OffloadSession(OffloadConfig(max_resident_activation_mb=1))
+        with session:
+            _ = torch.ones(2) + 1
+        with self.assertRaisesRegex(ValueError, "native failure"), session:
+            raise ValueError("native failure")
+        self.assertIsNone(OffloadSession.get_active())
+        with session:
+            torch.testing.assert_close(torch.ones(2) + 1, torch.full((2,), 2.0))
+
+    def test_transfer_and_legacy_plans_keep_dispatch(self) -> None:
+        """Any transfer or incomplete guide retains managed execution."""
+        session = OffloadSession(OffloadConfig(max_resident_activation_mb=1))
+        guide = [OpGuide(name="add.Tensor", output_leaf_count=1, output_bindings={}, input_bindings={})]
+        for kind in (ResidencyActionType.COPY_D2H, ResidencyActionType.COPY_H2D):
+            with self.subTest(kind=kind):
+                schedule = ResidencySchedule()
+                schedule.add_pre(0, kind, 1)
+                executor = ReplayExecutor(session.residency_manager, schedule, guide)
+                self.assertTrue(executor.requires_dispatch)
+        legacy = [OpGuide(name="add.Tensor", output_leaf_count=1, output_bindings={})]
+        executor = ReplayExecutor(session.residency_manager, ResidencySchedule(), legacy)
+        self.assertTrue(executor.requires_dispatch)

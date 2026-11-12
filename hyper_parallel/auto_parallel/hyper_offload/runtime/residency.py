@@ -25,7 +25,9 @@ from dataclasses import dataclass
 
 import torch
 
-from hyper_parallel.auto_parallel.hyper_offload.runtime.pinned_memory import PinnedMemoryPool
+from hyper_parallel.auto_parallel.hyper_offload.runtime.pinned_memory import (
+    PinnedMemoryPool,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +114,7 @@ class ResidencyManager:
         self,
         max_host_bytes: int,
     ) -> None:
+        """Initialize deferred copy streams and the bounded pinned-memory pool."""
         self._copy_stream = None
         self._host_pool = PinnedMemoryPool(max_host_bytes)
         self._residency: dict[int, PhysicalBuffer] = {}
@@ -175,6 +178,14 @@ class ResidencyManager:
         buffer.device = tensor.device
 
         storage = tensor.untyped_storage()
+        current = buffer.device_buffer
+        if current is not None and (
+            current.untyped_storage()._cdata == storage._cdata
+            and current.numel() == storage.nbytes()
+        ):
+            # Reuse the full-storage byte view for aliases without changing
+            # transfer fences. Storage growth requires a newly sized view.
+            return buffer
         dev_view = torch.empty(0, dtype=torch.uint8, device=tensor.device)
         dev_view.set_(storage, 0, (storage.size(),), (1,))
         buffer.device_buffer = dev_view
@@ -310,17 +321,41 @@ class ResidencyManager:
     # Release helpers
     # ------------------------------------------------------------------
 
+    def try_release_device(self, sid: int) -> bool:
+        """Retire an idle D2H source only if its copy has already completed.
+
+        This optional action never inserts a stream wait or synchronizes the
+        host. The planner must also schedule a mandatory release before its
+        memory deadline and before any H2D restore or source mutation.
+
+        Returns:
+            Whether the source is absent or was safely retired.
+        """
+        buffer = self._residency.get(sid)
+        if buffer is None or buffer.device_buffer is None:
+            return True
+        if buffer.host_buffer is None or buffer.device_event is not None:
+            return False
+        if buffer.host_event is not None and not buffer.host_event.query():
+            return False
+        buffer.device_buffer = None
+        return True
+
     def release_device(self, sid: int) -> None:
         """Release device-resident bytes for a storage ID.
 
         Frees the device buffer. If an H2D prefetch is still in flight,
         waits for it before dropping the destination buffer reference.
-        Pending D2H copies are protected by ``record_stream`` during
-        ``copy_d2h``.
+        At a delayed D2H release, order compute after the source copy before
+        freeing its storage. The wait is enqueued only at the release point,
+        so intervening forward computation can overlap the transfer.
         """
         buffer = self._residency.get(sid)
         if buffer is None or buffer.device_buffer is None:
             return
+
+        if buffer.host_event is not None:
+            buffer.host_event.wait(torch.accelerator.current_stream())
 
         if buffer.device_event is not None:
             buffer.device_event.synchronize()

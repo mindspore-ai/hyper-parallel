@@ -20,9 +20,10 @@ resolves a view of its :class:`PhysicalBuffer`'s storage on every dispatch.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Self
 
 import torch
+from torch.utils._pytree import tree_map
 
 from hyper_parallel.auto_parallel.hyper_offload.runtime.residency import PhysicalBuffer
 
@@ -47,7 +48,7 @@ class ShadowTensor(torch.Tensor):
         elem: torch.Tensor,
         buffer: PhysicalBuffer,
         storage_id: int,
-    ) -> ShadowTensor:
+    ) -> Self:
         """Create a new instance using *elem*'s metadata."""
         return torch.Tensor._make_wrapper_subclass(
             cls,
@@ -66,6 +67,7 @@ class ShadowTensor(torch.Tensor):
         buffer: PhysicalBuffer,
         storage_id: int,
     ) -> None:
+        """Bind a physical buffer and its tracked storage identity."""
         self._buffer = buffer
         self._storage_id = storage_id
 
@@ -103,17 +105,14 @@ class ShadowTensor(torch.Tensor):
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):  # pylint: disable=unused-argument
         """Dispatch a torch operation."""
         kwargs = kwargs or {}
+        resolved: dict[int, torch.Tensor] = {}
 
         def unwrap(value: Any) -> Any:
             if isinstance(value, ShadowTensor):
-                return value.resolve()
-            if isinstance(value, tuple):
-                return tuple(unwrap(v) for v in value)
-            if isinstance(value, list):
-                return [unwrap(v) for v in value]
-            if isinstance(value, dict):
-                return {k: unwrap(v) for k, v in value.items()}
+                if id(value) not in resolved:
+                    resolved[id(value)] = value.resolve()
+                return resolved[id(value)]
             return value
 
         with torch._C._DisableTorchDispatch():  # pylint: disable=protected-access
-            return func(*unwrap(args), **unwrap(kwargs))
+            return func(*tree_map(unwrap, args), **tree_map(unwrap, kwargs))

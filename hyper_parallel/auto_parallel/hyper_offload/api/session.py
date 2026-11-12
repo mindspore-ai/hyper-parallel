@@ -18,14 +18,26 @@ from __future__ import annotations
 
 import contextvars
 import logging
+from types import TracebackType
+from typing import Any
 
+import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from hyper_parallel.auto_parallel.hyper_offload.api.config import OffloadConfig
+from hyper_parallel.auto_parallel.hyper_offload.api.scope import (
+    dispatch_framework_op,
+    has_managed_inputs,
+    inside_fsdp_runtime,
+)
 from hyper_parallel.auto_parallel.hyper_offload.execution.replay import ReplayExecutor
 from hyper_parallel.auto_parallel.hyper_offload.execution.warmup import WarmupExecutor
-from hyper_parallel.auto_parallel.hyper_offload.planning.greedy import GreedyResidencyPlanner
-from hyper_parallel.auto_parallel.hyper_offload.runtime.residency import ResidencyManager
+from hyper_parallel.auto_parallel.hyper_offload.planning.peak import (
+    PeakResidencyPlanner,
+)
+from hyper_parallel.auto_parallel.hyper_offload.runtime.residency import (
+    ResidencyManager,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,12 +53,32 @@ class ActivationDispatchMode(TorchDispatchMode):
     is active.
     """
 
-    def __init__(self, session: OffloadSession):
+    def __init__(self, session: OffloadSession) -> None:
+        """Bind this dispatch mode to the active offload session."""
         super().__init__()
         self.session = session
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # pylint: disable=unused-argument
         """Dispatch a torch operation."""
+        if inside_fsdp_runtime():
+            kwargs = kwargs or {}
+            # Native redispatch may report Tensor itself (notably for detach).
+            # Neither that case nor an empty set can contain a ShadowTensor.
+            if all(tensor_type is torch.Tensor for tensor_type in types) or not has_managed_inputs(args, kwargs):
+                return func(*args, **kwargs)
+            output = None
+
+            def framework_read(*inputs: Any, **options: Any) -> tuple:
+                """Record input lifetimes without adopting framework-owned outputs."""
+                nonlocal output
+                output = dispatch_framework_op(func, inputs, options)
+                return ()
+
+            framework_read.__name__ = "framework_read:" + func.__name__
+            if hasattr(func, "_schema"):
+                framework_read._schema = func._schema
+            self.session.executor.dispatch(framework_read, args, kwargs)
+            return output
         return self.session.executor.dispatch(func, args, kwargs)
 
 
@@ -58,10 +90,11 @@ class OffloadSession:
     warmup → replay transition in :meth:`__exit__`.
     """
 
-    def __init__(self, config: OffloadConfig):
+    def __init__(self, config: OffloadConfig) -> None:
+        """Initialize warmup execution and the configured residency planner."""
         self.mode: str = "warmup"
 
-        self.planner = config.planner or GreedyResidencyPlanner()
+        self.planner = config.planner if config.planner is not None else PeakResidencyPlanner()
         self.residency_manager = ResidencyManager(
             max_host_bytes=config.max_offload_activation_mb * 1024**2,
         )
@@ -72,6 +105,7 @@ class OffloadSession:
 
         self._dispatch_context = None
         self._session_token = None
+        self._native_replay = False
 
     # ------------------------------------------------------------------
     # Active session lookup (used by skip_offload decorator)
@@ -86,16 +120,22 @@ class OffloadSession:
     # Context manager
     # ------------------------------------------------------------------
 
-    def __enter__(self):
+    def __enter__(self) -> OffloadSession:
         """Enter the runtime context."""
         self.executor.reset()
 
         self._session_token = _active_session.set(self)
+        self._native_replay = self.mode == "replay" and not self.executor.requires_dispatch
+        if self._native_replay:
+            return self
         self._dispatch_context = ActivationDispatchMode(self)
         self._dispatch_context.__enter__()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(
+        self, exc_type: type[BaseException] | None,
+        exc_val: BaseException | None, exc_tb: TracebackType | None,
+    ) -> bool:
         """Exit the runtime context."""
         if self._dispatch_context is not None:
             self._dispatch_context.__exit__(exc_type, exc_val, exc_tb)
@@ -103,6 +143,9 @@ class OffloadSession:
         if self._session_token is not None:
             _active_session.reset(self._session_token)
             self._session_token = None
+
+        if self._native_replay:
+            return False
 
         if exc_type is not None:
             self.residency_manager.sync_all_transfers()
@@ -116,5 +159,9 @@ class OffloadSession:
             schedule = self.planner.build(trace)
             self.executor = ReplayExecutor(self.residency_manager, schedule, guide)
             self.mode = "replay"
+            if not self.executor.requires_dispatch:
+                logger.info("HyperOffload plan has no transfers; subsequent steps use native execution")
+        else:
+            self.executor.finish()
 
         return False
