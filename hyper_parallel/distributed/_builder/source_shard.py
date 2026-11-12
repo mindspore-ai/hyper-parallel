@@ -39,6 +39,7 @@ from torch.utils.weak import WeakIdKeyDictionary
 
 import hyper_parallel.core.fully_shard.utils as fully_shard_utils
 from hyper_parallel import DeviceMesh, DTensor, Replicate
+from hyper_parallel.components.modules.module_family import _family_source_shard_info
 from hyper_parallel.core.dtensor.placement_types import Partial, Placement, Shard
 from hyper_parallel.core.fully_shard.hsdp_utils import get_managed_modules_parameters
 from hyper_parallel.distributed.plan import ShardingPlan
@@ -151,7 +152,7 @@ def build_source_shard_info(
     info = {}
     for fqn, spec in plan.modules.items():
         for param_name, named_placement in spec.params.items():
-            full_fqn = f"{fqn}.{param_name}"
+            full_fqn = f"{fqn}.{param_name}" if fqn else param_name
             _check_fsdp_owned_axes(full_fqn, named_placement)
             if (spec._ep_size > 0  # pylint: disable=protected-access
                     and isinstance((named_placement or {}).get(EP), Shard)):
@@ -279,6 +280,12 @@ def _build_source_shard_info_by_param(
         ValueError: If TP metadata is missing, references an unknown FQN,
             contains ``Partial``, or gives tied aliases conflicting layouts.
     """
+    constructed = _family_source_shard_info(model)
+    if constructed:
+        for name, layout in constructed.items():
+            if name in (source_shard_info or {}) and source_shard_info[name] != layout:
+                raise ValueError(f"source_shard_info conflicts with the constructed family layout at {name!r}")
+        source_shard_info = {**constructed, **(source_shard_info or {})}
     if source_shard_info is None:
         return _build_dtensor_source_shard_info(manager, model)
     if manager.mesh_context.tp_size > 1 and not source_shard_info:

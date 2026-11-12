@@ -12,4 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Business-owned agent implementations loaded by generic configuration."""
+"""Public causal attention family."""
+
+from __future__ import annotations
+
+from examples.torch.module_family.attention.family import CausalAttention
+
+__all__ = ["CausalAttention"]

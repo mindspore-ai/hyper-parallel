@@ -29,7 +29,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Spars
 from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.distributed import ShardingPlanner
-from hyper_parallel.models._transformers.model_builder import _build_replacement_context
+from hyper_parallel.models.module_build import build_module_context
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
 from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
     deepseek_v41_megamoe_compute_fn,
@@ -81,11 +81,11 @@ class TestMegaMoeParallel(unittest.TestCase):
             setup = SimpleNamespace(mesh_context=SimpleNamespace(
                 tp_size=2, cp_size=2, ep_size=4, pp_size=1, sequence_parallel=enabled,
             ))
-            context = _build_replacement_context(setup, None)
+            context = build_module_context(setup)
             self.assertIs(context['sequence_parallel'], enabled)
             self.assertTrue(context['tp'])
             self.assertTrue(context['cp'])
-        context = _build_replacement_context(SimpleNamespace(), None)
+        context = build_module_context(SimpleNamespace())
         for axis in ('tp', 'cp', 'ep', 'pp', 'sequence_parallel'):
             self.assertFalse(context[axis])
 

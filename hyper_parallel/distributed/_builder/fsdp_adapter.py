@@ -36,6 +36,7 @@ import torch
 from torch.nn import Module as ModuleClass
 from torch.nn import Parameter as ParameterClass
 
+from hyper_parallel.components.modules.module_family import collect_family_modules
 import hyper_parallel.core.fully_shard.utils as fully_shard_utils
 from hyper_parallel import DeviceMesh, HSDPModule, fully_shard
 from hyper_parallel.core.fully_shard.hsdp_utils import get_managed_modules_parameters
@@ -77,6 +78,21 @@ def _get_checkpoint_wrapped_module(module: ModuleClass) -> ModuleClass | None:
         if isinstance(wrapped_module, ModuleClass):
             return wrapped_module
     return None
+
+
+def _declared_expert_unit_fqns(model, expert_parameters):
+    """Find family/native execution units by identity rather than an experts path suffix."""
+    expert_module_fqns = set()
+    for boundary in collect_family_modules(model):
+        parameters = set(boundary.module.parameters())
+        if parameters and parameters <= expert_parameters:
+            expert_module_fqns.add(boundary.fqns[0])
+    for fqn, module in model.named_modules():
+        binding = getattr(module, "_hp_parallel_binding", None)
+        if binding is not None and binding.ep_context is not None:
+            expert_module_fqns.add(fqn)
+    expert_module_fqns.discard("")
+    return expert_module_fqns
 
 
 class FSDP2Manager:
@@ -348,6 +364,8 @@ class FSDP2Manager:
             for parameter_fqn, parameter in model.named_parameters(remove_duplicate=False)
             if parameter in expert_parameters and ".experts." in parameter_fqn
         }
+        expert_module_fqns.update(_declared_expert_unit_fqns(model, expert_parameters))
+        expert_module_fqns.discard("")
         module_by_fqn = dict(model.named_modules())
         expert_wrap_modules = []
         for expert_module_fqn in sorted(expert_module_fqns):
@@ -363,6 +381,8 @@ class FSDP2Manager:
     @staticmethod
     def _get_model_adapter_spec(model: ModuleClass) -> Any | None:
         """Resolve a model adapter from the final model configuration."""
+        if hasattr(model, "_hp_model_adapter_spec"):
+            return model._hp_model_adapter_spec  # pylint: disable=protected-access
         config = getattr(model, "config", None)
         if config is None:
             return None

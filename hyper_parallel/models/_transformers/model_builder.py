@@ -34,9 +34,6 @@ from hyper_parallel.core.fully_shard.hsdp_utils import get_hsdp_state
 from hyper_parallel.components.checkpoint.huggingface_checkpointer import (
     HuggingFaceCheckpointer,
 )
-from hyper_parallel.components.checkpoint.weight_conversion import (
-    get_model_conversion_mapping,
-)
 
 from hyper_parallel.models._transformers.checkpoint_loader import (
     _finalize_model_loading,
@@ -64,17 +61,19 @@ from hyper_parallel.distributed._builder.fsdp_adapter import (
 )
 from hyper_parallel.distributed.mesh import DistributedSetup, MeshContext
 from hyper_parallel.distributed.apply import apply_sharding_plan
+from hyper_parallel.distributed.module_binding import validate_materialized_modules
 from hyper_parallel.distributed._builder.planner import ShardingPlanner
-from hyper_parallel.models.registry import _resolve_custom_model_cls, get_model_adapter
+from hyper_parallel.models.registry import _resolve_custom_model_cls, resolve_model_adapter
+from hyper_parallel.components.modules.module_family import collect_family_modules
+from hyper_parallel.models.module_build import (
+    attach_build_context, build_module_context, prepare_model_components, resolve_effective_model_spec,
+)
 from hyper_parallel.models.external_state import (
     ExternalBuildContext,
     ExternalLoadContext,
     get_model_external_state,
 )
-from hyper_parallel.models.replacement import (
-    _apply_module_replacement_actions,
-    apply_method_replacements,
-)
+from hyper_parallel.models.replacement import apply_method_replacements
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +240,14 @@ def _init_model(
     return True, model
 
 
+def _has_module_owned_layouts(model):
+    """Family/native declarations remain active even for a size-one job."""
+    spec = resolve_model_adapter(model)
+    if spec is not None and (spec.sharding is not None or spec.native_parallel is not None):
+        return True
+    return any(boundary.info.resolved.sharding is not None for boundary in collect_family_modules(model))
+
+
 def _plan_and_apply_sharding(
     model: nn.Module,
     mesh,
@@ -256,7 +263,7 @@ def _plan_and_apply_sharding(
     if (
         sharding_planner is None
         or mesh is None
-        or (is_hf_model and not model_sharding_requested)
+        or (is_hf_model and not model_sharding_requested and not _has_module_owned_layouts(model))
     ):
         return model, None
     if mesh.device_mesh is None:
@@ -342,29 +349,16 @@ def _initialize_model_weights(model: nn.Module) -> None:
     logger.info("Initialized model state with model-native random initialization")
 
 
-def _build_replacement_context(
-    distributed_setup: Any,
-    low_precision_config: Any,
-) -> dict[str, Any]:
-    """Build the replacement-factory context from the resolved setup."""
-    if low_precision_config is None:
-        low_precision_config = getattr(
-            distributed_setup,
-            "low_precision_config",
-            None,
-        )
-    low_precision_enabled = bool(
-        getattr(low_precision_config, "enabled", False)
-    )
-    mesh_context = getattr(distributed_setup, "mesh_context", None)
-    return {
-        "low_precision": low_precision_config if low_precision_enabled else None,
-        "tp": getattr(mesh_context, "tp_size", 1) > 1,
-        "cp": getattr(mesh_context, "cp_size", 1) > 1,
-        "ep": getattr(mesh_context, "ep_size", 1) > 1,
-        "pp": getattr(mesh_context, "pp_size", 1) > 1,
-        "sequence_parallel": bool(getattr(mesh_context, "sequence_parallel", False)),
-    }
+def _apply_model_method_replacements(model: nn.Module, distributed_setup: Any, low_precision_config: Any) -> None:
+    """Apply configured methods using the prepared model's logical context."""
+    rules = getattr(distributed_setup, "method_replacements", None) or ()
+    if not rules:
+        return
+    context = getattr(model, "_hp_module_build_context", None)
+    if context is None:
+        context = build_module_context(distributed_setup, low_precision_config=low_precision_config)
+    context = {**context, "mesh_context": getattr(distributed_setup, "mesh_context", None)}
+    apply_method_replacements(model, rules, context=context)
 
 
 def _apply_pre_sharding_features(
@@ -429,16 +423,7 @@ def _apply_parameter_freezing(model: nn.Module, freeze_config: Any) -> None:
 
 def _apply_materialization_adapter(model: nn.Module) -> None:
     """Let a family adapter declare derived state on native or custom models."""
-    config = getattr(model, "config", None)
-    identities = [getattr(config, "model_type", None)]
-    identities.extend(getattr(config, "architectures", None) or ())
-    adapter_spec = None
-    for identity in identities:
-        if not identity:
-            continue
-        adapter_spec = get_model_adapter(identity)
-        if adapter_spec is not None:
-            break
+    adapter_spec = resolve_model_adapter(model)
     provider = getattr(adapter_spec, "materialization", None)
     if provider is None:
         return
@@ -580,14 +565,7 @@ def _create_external_state(model: nn.Module, mesh: Optional[MeshContext],
                            validate_placement: bool, compile_for_execution: bool,
                            distributed_setup: Any, fsdp2_manager: Optional[FSDP2Manager]) -> Any:
     """Create and validate the model-owned external state after sharding."""
-    config = getattr(model, "config", None)
-    identities = (getattr(config, "model_type", None), *(getattr(config, "architectures", None) or ()))
-    adapter_spec = None
-    for identity in identities:
-        if identity:
-            adapter_spec = get_model_adapter(identity)
-            if adapter_spec is not None:
-                break
+    adapter_spec = resolve_model_adapter(model)
     provider = getattr(adapter_spec, "external_state", None)
     if provider is None:
         return None
@@ -609,16 +587,16 @@ def _maybe_apply_module_replacements(
     distributed_setup: Optional[Any],
     low_precision_config: Optional[Any],
     load_base_model: bool,
-    weights_mapping: Any,
 ) -> tuple:
-    """Apply native structure-preserving replacements."""
-    return _apply_module_replacement_actions(
-        model,
-        getattr(distributed_setup, "module_replacements", None),
-        weights_mapping=weights_mapping,
-        context=_build_replacement_context(distributed_setup, low_precision_config),
-        capture_checkpoint_metadata=load_base_model,
-    )
+    """Prepare source and directly composed components through the same entry point."""
+    context = getattr(model, "_hp_module_build_context", None)
+    if context is None:
+        spec = resolve_effective_model_spec(getattr(model, "config", None))
+        context = build_module_context(
+            distributed_setup, low_precision_config=low_precision_config, model_spec=spec,
+        )
+        attach_build_context(model, context)
+    return prepare_model_components(model, context, capture_checkpoint_metadata=load_base_model)
 
 
 def _tie_model_weights_before_parallelism(model: nn.Module) -> None:
@@ -703,6 +681,31 @@ def apply_model_infrastructure(
     materialization/loading -> model_init_dtype conversion -> per-layer compile.
     Placement validation keeps the DTensor placement path and skips compile;
     FSDP2 consumes DTensor parameter layouts in both modes.
+
+    Args:
+        model: Final or source model tree for this build.
+        mesh: Job mesh carrying the logical parallel axes.
+        sharding_planner: Planner used to derive and apply logical layouts.
+        fsdp2_manager: Main-repository FSDP2 lifecycle manager, when configured.
+        peft_config: Optional parameter-efficient adaptation settings.
+        qat_config: Optional quantization-aware training settings.
+        fp8_config: Optional model precision settings.
+        freeze_config: Model subtrees whose parameters are frozen before planning.
+        compile_config: Optional compilation settings.
+        activation_checkpoint: Activation checkpoint selection policy.
+        activation_checkpoint_selection: Resolved model-owned activation regions.
+        activation_swap: Activation memory policy.
+        swap_inputs: Whether checkpointing swaps its input activations.
+        allow_cache_entry_mutation: Whether activation checkpointing may update cache entries.
+        is_meta_device: Whether parameters need storage materialization.
+        is_hf_model: Whether the source follows the HF model contract.
+        device: Target device for initialization and loading.
+        load_base_model: Whether to load a pretrained checkpoint after layout.
+        pretrained_path: Source checkpoint directory or identifier.
+        validate_placement: Whether to validate runtime tensor placements.
+        low_precision_config: Normalized online precision policy.
+        model_init_dtype: Model initialization dtype override.
+
     """
 
     distributed_setup = kwargs.get("distributed_setup")
@@ -714,10 +717,8 @@ def apply_model_infrastructure(
     )
     _apply_pre_sharding_features(peft_config, qat_config, fp8_config)
 
-    weights_mapping = get_model_conversion_mapping(model)
     model, weights_mapping = _maybe_apply_module_replacements(
-        model, distributed_setup, low_precision_config,
-        load_base_model, weights_mapping,
+        model, distributed_setup, low_precision_config, load_base_model,
     )
     if is_meta_device:
         _apply_materialization_adapter(model)
@@ -727,21 +728,11 @@ def apply_model_infrastructure(
     if freeze_config is not None:
         _apply_parameter_freezing(model, freeze_config)
 
-    method_context = _build_replacement_context(distributed_setup, low_precision_config)
-    method_context["mesh_context"] = getattr(distributed_setup, "mesh_context", None)
-    apply_method_replacements(
-        model,
-        getattr(distributed_setup, "method_replacements", None) or (),
-        context=method_context,
-    )
+    _apply_model_method_replacements(model, distributed_setup, low_precision_config)
 
     # Steps 7-8: plan and apply parameter/activation layouts.
     model, source_shard_info = _plan_and_apply_sharding(
-        model,
-        mesh,
-        sharding_planner,
-        is_hf_model,
-        validate_placement,
+        model, mesh, sharding_planner, is_hf_model, validate_placement,
     )
 
     model = _apply_activation_features(
@@ -758,17 +749,14 @@ def apply_model_infrastructure(
     model = _apply_fsdp2_with_external(model, fsdp2_manager, source_shard_info, external)
 
     model = _materialize_and_load_model(
-        model,
-        is_meta_device=is_meta_device,
-        device=device,
-        load_base_model=load_base_model,
-        pretrained_path=pretrained_path,
-        weights_mapping=weights_mapping,
+        model, is_meta_device=is_meta_device, device=device,
+        load_base_model=load_base_model, pretrained_path=pretrained_path, weights_mapping=weights_mapping,
     )
 
     # Final dtype conversion belongs to the atomic build (05 stage-5 item
     # 5): the Trainer never patches model dtype after construction.
     apply_model_init_dtype(model, model_init_dtype)
+    validate_materialized_modules(model)
     if external is not None:
         external.check_identities()
 

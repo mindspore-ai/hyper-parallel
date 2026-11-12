@@ -26,8 +26,12 @@ from torch import nn
 from hyper_parallel.components.modules import family as registry
 from hyper_parallel.auto_parallel._layer_census import replacement_specs
 from hyper_parallel.components.modules.family import ModuleFamily, SelectorSpec, VariantRule, register_module_family
+from hyper_parallel.distributed.mesh import DistributedSetup
+from hyper_parallel.models.module_build import build_module_context, prepare_model_components
 from hyper_parallel.models.replacement import apply_module_replacements, compile_module_replacements, module_replacement
-from hyper_parallel.trainer.config.parallelism import ReplaceAction, entries_to_module_replacements
+from hyper_parallel.trainer.config.parallelism import (
+    ReplaceAction, entries_to_module_replacements, normalize_distributed_setup_overrides,
+)
 from hyper_parallel.trainer.config.resolver import ConfigResolutionError, replace_override_path, resolve_config
 from hyper_parallel.trainer.config.target import Target
 
@@ -137,6 +141,22 @@ class TestFamilyReplacement(unittest.TestCase):
                 ),
             )
         )
+
+    def test_normalized_requests_reuse_existing_family_selector_resolution(self):
+        """Trainer normalization must select legacy family members through the shared resolver."""
+        for selectors, expected_type in (({}, ReferenceLinear), ({"algorithm": "matmul"}, MatmulLinear),
+                                         ({"algorithm": "matmul", "fused": True}, AddmmLinear)):
+            with self.subTest(selectors=selectors):
+                config = resolve_config(_raw_config(**selectors))
+                setup = DistributedSetup()
+                normalize_distributed_setup_overrides(setup, config)
+                source = nn.Linear(4, 3)
+                inputs = torch.randn(2, 4)
+                expected = source(inputs)
+                model, _ = prepare_model_components(nn.Sequential(source), build_module_context(setup))
+                self.assertIs(type(model[0]), expected_type)
+                self.assertIs(model[0].weight, source.weight)
+                torch.testing.assert_close(model(inputs), expected)
 
     def test_yaml_real_replacement_and_autograd(self) -> None:
         """

@@ -19,6 +19,8 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+from torch import nn
+
 from tests.ut.codegen.helpers import SourceMLP, _replace_mlp
 
 from hyper_parallel.codegen.model_build_overlay import use_codegen_model_build_overlay
@@ -196,7 +198,7 @@ class TestGenerationFailureIsolation(unittest.TestCase):
 
     def test_method_replacements_run_before_planning(self):
         """Offline construction uses native method rules and mesh context."""
-        model = mock.Mock()
+        model = nn.Module()
         mesh = object()
         rules = (object(),)
         setup = SimpleNamespace(mesh_context=mesh, method_replacements=rules)
@@ -217,8 +219,8 @@ class TestGenerationFailureIsolation(unittest.TestCase):
             _observe_plan=mock.Mock(side_effect=lambda *_args: events.append("plan")),
             _publish_session=mock.Mock(),
         ), mock.patch.object(auto_model, "_init_model", return_value=(False, model)), \
+                mock.patch.object(auto_model, "_current_device", return_value="cpu"), \
                 mock.patch.object(model_builder, "_apply_pre_sharding_features"), \
-                mock.patch.object(model_builder, "_build_replacement_context", return_value={}), \
                 mock.patch.object(model_builder, "apply_method_replacements", side_effect=apply_methods):
             build_model = model_build_overlay._codegen_build_model(
                 CodegenBuildSession(), None, SimpleNamespace(),

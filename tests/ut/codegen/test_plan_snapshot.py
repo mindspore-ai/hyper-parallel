@@ -29,7 +29,7 @@ from hyper_parallel.models._transformers import auto_model, model_builder
 
 
 def _plan():
-    return SimpleNamespace(modules={}, tied_pairs=[], special_handlers={}, mesh_dim_names=("tp",))
+    return SimpleNamespace(modules={}, tied_pairs=[], special_handlers={}, parallel_modules={}, mesh_dim_names=("tp",))
 
 
 def _mesh(*, tp_size=2, device_mesh=object()):
@@ -150,6 +150,7 @@ def test_codegen_observation_rejects_missing_ep_compute_source():
             ),
         },
         tied_pairs=[],
+        parallel_modules={},
         special_handlers={},
         mesh_dim_names=("tp",),
     )

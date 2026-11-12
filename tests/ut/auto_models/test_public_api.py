@@ -105,6 +105,9 @@ class TestShardingConfigContracts(unittest.TestCase):
                 ("special_handlers", "<factory> {}"),
                 ("mesh_dim_names", "()"),
                 ("tied_pairs", "<factory> []"),
+                ("parallel_modules", "<factory> {}"),
+                ("owned_parameter_names", "<factory> set()"),
+                ("parameter_aliases", "<factory> []"),
             ],
         )
 

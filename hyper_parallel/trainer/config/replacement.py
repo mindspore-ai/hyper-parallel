@@ -21,11 +21,13 @@ from typing import Any, Callable
 from hyper_parallel.components.modules.family import (
     SelectorSpec,
     get_family_selector_specs,
+    get_module_family,
     normalize_family_selectors,
     resolve_module_family_target,
 )
 from hyper_parallel.components.quantization.config import LowPrecisionDtypeScheme
-from hyper_parallel.trainer.config.target import Target
+from hyper_parallel.components.modules.module_family import FamilyRequest, build_family
+from hyper_parallel.trainer.config.target import Target, _build_nested_targets
 
 
 class ReplacementTarget(Target):
@@ -80,7 +82,17 @@ class ReplacementTarget(Target):
         """Build only after a named scheme has been bound by the replacement planner."""
         if self.low_precision_dtype_scheme is not None:
             raise ValueError("Bind low_precision_dtype_scheme through the replacement plan before building")
-        return super().build(**runtime_kwargs)
+        family = get_module_family(self.requested_target)
+        if family is None or family.default_variant is None:
+            return super().build(**runtime_kwargs)
+        arguments = {name: _build_nested_targets(value) for name, value in self._kwargs.items()}
+        arguments.update(self.selectors)
+        return build_family(
+            FamilyRequest(self.requested_target, arguments),
+            module=runtime_kwargs.get("module"),
+            module_fqn=runtime_kwargs.get("module_fqn", ""),
+            context=runtime_kwargs.get("context"),
+        )
 
     def get_family_selector_spec(self, name: str) -> SelectorSpec | None:
         """Query the requested baseline's schema for Target-level overrides.

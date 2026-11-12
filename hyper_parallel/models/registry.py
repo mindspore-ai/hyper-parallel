@@ -191,11 +191,21 @@ def _discover_family_providers() -> Dict[str, str]:
                 continue
             if child.name.startswith("_"):
                 continue
-            if not (child / "adapter" / "registration.py").is_file():
-                continue
-            providers[_normalize_family_key(child.name)] = (
-                f"{__package__}.{child.name}.adapter.registration"
-            )
+            spec_files = sorted(child.glob("*_spec.py"))
+            if len(spec_files) > 1:
+                raise ValueError(f"model directory {child.name!r} contains multiple MODEL_SPEC entry files")
+            if spec_files:
+                module_path = f"{__package__}.{child.name}.{spec_files[0].stem}"
+                keys = (child.name, spec_files[0].stem.removesuffix("_spec"))
+                for key in keys:
+                    normalized = _normalize_family_key(key)
+                    if normalized in providers and providers[normalized] != module_path:
+                        raise ValueError(f"conflicting model spec discovery for {key!r}")
+                    providers[normalized] = module_path
+            elif (child / "adapter" / "registration.py").is_file():
+                providers[_normalize_family_key(child.name)] = (
+                    f"{__package__}.{child.name}.adapter.registration"
+                )
         _DISCOVERED_PROVIDERS = providers
     return _DISCOVERED_PROVIDERS
 
@@ -243,8 +253,15 @@ def get_model_adapter(model_type: str) -> Optional[ModelAdapterSpec]:
             key if family_dir is None else _normalize_family_key(family_dir)
         )
         if module_path is not None:
-            # Importing the registration module self-registers the family.
-            importlib.import_module(module_path)
+            provider = importlib.import_module(module_path)
+            if module_path.endswith("_spec"):
+                declared = getattr(provider, "MODEL_SPEC", None)
+                if not isinstance(declared, ModelAdapterSpec):
+                    raise TypeError(f"{module_path}.MODEL_SPEC must be ModelAdapterSpec")
+                registered = MODEL_ADAPTER_REGISTRY.get(declared.model_type)
+                if registered is not None and registered is not declared:
+                    raise ValueError(f"conflicting canonical MODEL_SPEC for {declared.model_type!r}")
+                register_model_adapter(declared)
             spec = MODEL_ADAPTER_REGISTRY.get(model_type)
         if spec is None:
             canonical = _FAMILY_ALIASES.get(key)
@@ -262,6 +279,8 @@ def resolve_model_adapter(model: Any) -> Optional[ModelAdapterSpec]:
     Returns:
         Registered adapter, or ``None`` when the model has no provider.
     """
+    if hasattr(model, "_hp_model_adapter_spec"):
+        return model._hp_model_adapter_spec  # pylint: disable=protected-access
     config = getattr(model, "config", None)
     identities = (getattr(config, "model_type", None), *(getattr(config, "architectures", None) or ()))
     for identity in identities:

@@ -21,6 +21,7 @@ from unittest import mock
 from hyper_parallel.codegen.build import create_offline_distributed_setup
 from hyper_parallel.distributed.mesh import DistributedSetup, LogicalDeviceMesh
 from hyper_parallel.trainer.runtime import distributed as runtime_distributed
+from tests.common.mark_utils import arg_mark
 
 
 class TestOfflineBuild(unittest.TestCase):
@@ -137,8 +138,12 @@ class TestOfflineBuild(unittest.TestCase):
         self.assertEqual(active_mesh.shape, (4, 8))
         self.assertEqual(active_mesh.size("tp"), 8)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_virtual_ep_divides_logical_dense_domain(self):
-        """The projected dense domain always covers the configured EP group."""
+        """Feature: Offline topology exposes the named expert-parallel domain.
+        Description: Project EP16 and its dense domain without runtime communication.
+        Expectation: The logical ep view has the configured size and covers the dense domain.
+        """
         config = self._config(
             tp_size=1,
             cp_size=1,
@@ -152,6 +157,9 @@ class TestOfflineBuild(unittest.TestCase):
 
         self.assertEqual(dense_size, 16)
         self.assertEqual(dense_size % setup.mesh_context.ep_size, 0)
+        self.assertIsInstance(setup.mesh_context.fsdp_moe_mesh, LogicalDeviceMesh)
+        self.assertEqual(setup.mesh_context.fsdp_moe_mesh["ep"].size(), 16)
+        self.assertEqual(setup.mesh_context.fsdp_moe_mesh.size(), dense_size)
 
 
 if __name__ == "__main__":

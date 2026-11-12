@@ -26,6 +26,7 @@ import logging
 
 import numpy as np
 
+from hyper_parallel.components.modules.module_family import get_family_build_info
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, init_device_mesh
 from hyper_parallel.distributed._builder.forward_rewriter import (
     _bind_input_indices,
@@ -135,6 +136,8 @@ def _validate_cp_compute_injections(plan, cp_mesh):
     if cp_mesh is None or cp_mesh.size() <= 1:
         return
     for fqn, spec in plan.modules.items():
+        if fqn in plan.parallel_modules:
+            continue
         if not spec.is_boundary or not getattr(spec, "_needs_cp_attn", False):
             continue
         if spec.inner_wrapper is not None or spec.local_compute_fn is not None:
@@ -160,6 +163,8 @@ def _validate_ep_compute_injections(plan, model):
         EP_ARCHETYPE_SUGGESTIONS,
     )
     for fqn, spec in plan.modules.items():
+        if fqn in plan.parallel_modules:
+            continue
         if not spec.is_boundary or not getattr(spec, "_ep_size", 0):
             continue
         if spec.local_compute_fn is not None or spec.region_dispatch is False:
@@ -369,9 +374,14 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
     )
     for module_fqn, spec in sorted(
             plan.modules.items(), key=_boundary_post_order_key):
+        if module_fqn in plan.parallel_modules:
+            continue
         if not spec.is_boundary:
             continue
         module = _resolve_module(model, module_fqn)
+        family = get_family_build_info(module)
+        if family is not None and family.layout is not None:
+            continue
         boundary = PrecompiledBoundary(
             spec,
             mesh,

@@ -47,6 +47,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from torch import nn
 
+from hyper_parallel.components.modules.module_family import FamilyShardingContext, _family_parameter_shapes
+from hyper_parallel.distributed._builder.family_layout import collect_owned_layouts, validate_owned_layouts
+from hyper_parallel.models.registry import resolve_model_adapter
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.placement_types import (
     Partial,
@@ -291,16 +294,18 @@ class ShardingPlanner:
         """Find subtrees whose activation layout is owned by a separate runtime."""
         from hyper_parallel.models.registry import get_model_adapter  # pylint: disable=C0415
 
-        adapter = get_model_adapter(arch)
+        adapter = (model._hp_model_adapter_spec if hasattr(model, "_hp_model_adapter_spec")  # pylint: disable=protected-access
+                   else get_model_adapter(arch))
         if adapter is None or adapter.encoder_parallel is None:
             return ()
         spec = adapter.encoder_parallel()
         names = {name for name, _ in model.named_modules()}
         return tuple(root for root in spec.isolated_subtrees if root in names)
 
-    def _classify_boundary_groups(self, model: Any, arch: str, isolated_roots=()):
+    def _classify_boundary_groups(self, model: Any, arch: str, isolated_roots=(), excluded_names=()):
         """Classify model parameters and group them into candidate boundaries."""
-        param_roles = self._classify_all_params(model, arch)
+        param_roles = {name: role for name, role in self._classify_all_params(model, arch).items()
+                       if name not in excluded_names}
         regular_roles = {
             name: role for name, role in param_roles.items()
             if not any(name.startswith(root + ".") for root in isolated_roots)
@@ -376,6 +381,7 @@ class ShardingPlanner:
             mesh_dim_names,
             arch,
             tp_size=tp_size,
+            cp_size=cp_size,
             ep_size=ep_size,
             sequence_parallel=sequence_parallel,
             loss_parallel=loss_parallel,
@@ -404,6 +410,7 @@ class ShardingPlanner:
         arch: str,
         *,
         tp_size: int,
+        cp_size: int,
         ep_size: int,
         sequence_parallel: bool,
         loss_parallel: bool,
@@ -417,15 +424,23 @@ class ShardingPlanner:
         # MoE (pre-stacked EP-aware modules use their own dispatcher and
         # are not subject to this constraint)
         # Phase 1: parameter role classification
+        layout_context = FamilyShardingContext(
+            mesh_dim_names, {"tp": tp_size, "cp": cp_size, "ep": ep_size},
+            _family_parameter_shapes(model),
+            sequence_parallel, loss_parallel,
+        )
+        owned = collect_owned_layouts(model, layout_context, resolve_model_adapter(model))
         isolated_roots = self._resolve_isolated_roots(model, arch) if self._derive else ()
-        param_roles, boundary_groups = self._classify_boundary_groups(model, arch, isolated_roots)
+        param_roles, boundary_groups = self._classify_boundary_groups(
+            model, arch, isolated_roots, excluded_names=owned.owned_names,
+        )
 
         # Phase 3+4: semantic inference + template-fills I/O
         # F4a/F4b: full shapes + requires_grad for the plan-time lints
         # (meta tensors carry shapes too — the zero-memory path is unaffected)
         param_metadata = (
             {name: p.ndim for name, p in model.named_parameters()},
-            {name: tuple(p.shape) for name, p in model.named_parameters()},
+            dict(layout_context.parameter_shapes),
         )
         plan = ShardingPlan(
             mesh_dim_names=mesh_dim_names,
@@ -451,6 +466,12 @@ class ShardingPlanner:
                       if parameter.requires_grad}
             plan.modules[root] = ModuleShardingSpec(params=params, in_src={}, in_dst={}, is_boundary=False)
 
+        plan.modules.update(owned.specs)
+        plan.parallel_modules.update(owned.parallel)
+        plan.owned_parameter_names.update(owned.owned_names)
+        plan.tied_pairs.extend(owned.aliases)
+        plan.parameter_aliases.extend(owned.aliases)
+
         # Phase 4.5: merge derived matches and expand fully declared globs
         # against the final model tree to insert new boundaries.
         self._finalize_boundary_specs(
@@ -461,6 +482,7 @@ class ShardingPlanner:
             mesh=mesh,
             mesh_dim_names=mesh_dim_names,
         )
+        validate_owned_layouts(model, plan, owned, layout_context)
         return plan, param_roles, param_metadata
 
     def _finalize_plan(
@@ -502,7 +524,7 @@ class ShardingPlanner:
         self._warn_uncovered_function_modules(model, plan)
 
         # tied-weight detection (embed <-> lm_head sharing storage)
-        plan.tied_pairs = self._detect_tied_pairs(model)
+        plan.tied_pairs = list(dict.fromkeys([*plan.tied_pairs, *self._detect_tied_pairs(model)]))
         return plan
 
     # ── Architecture detection ──────────────────────────────────────────
@@ -652,7 +674,8 @@ class ShardingPlanner:
         from hyper_parallel.models.registry import (  # pylint: disable=import-outside-toplevel
             get_model_adapter,
         )
-        spec = get_model_adapter(arch)
+        spec = (model._hp_model_adapter_spec if hasattr(model, "_hp_model_adapter_spec")  # pylint: disable=protected-access
+                else get_model_adapter(arch))
         rules = []
         if spec is not None and spec.sharding_rules is not None:
             rules = list(spec.sharding_rules())
@@ -1476,6 +1499,7 @@ class ShardingPlanner:
         if not self._derive:
             return
         covered = self._declared_parameter_names(plan)
+        covered.update(plan.owned_parameter_names)
         uncovered = [
             name for name, p in model.named_parameters()
             if p.requires_grad and name not in covered

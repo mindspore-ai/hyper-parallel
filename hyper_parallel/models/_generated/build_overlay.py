@@ -22,6 +22,7 @@ from typing import Any, Iterator
 
 from hyper_parallel.models._generated.phase_c import apply_generated_phase_c
 from hyper_parallel.models._transformers import auto_model, model_builder
+from hyper_parallel.models.module_build import model_weight_mapping
 
 distributed_apply = importlib.import_module("hyper_parallel.distributed.apply")
 
@@ -31,11 +32,10 @@ def _skip_materialized_replacements(
     distributed_setup: Any,
     low_precision_config: Any,
     load_base_model: bool,
-    weights_mapping: Any,
 ) -> tuple[Any, Any]:
     """Keep generated constructor replacements and their conversion mapping."""
     del distributed_setup, low_precision_config, load_base_model
-    return model, weights_mapping
+    return model, model_weight_mapping(model)
 
 
 @contextmanager

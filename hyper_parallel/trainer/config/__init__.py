@@ -72,6 +72,7 @@ from hyper_parallel.trainer.config.parallelism import (
     ReplaceAction,
     _import_module_type,
     entries_to_module_replacements,
+    entries_to_module_replacement_requests,
     entries_to_method_replacements,
     entries_to_plan_overrides,
     normalize_distributed_setup_overrides,
