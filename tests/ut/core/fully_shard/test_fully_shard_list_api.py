@@ -29,6 +29,7 @@ import torch
 from torch import nn
 
 from hyper_parallel.core.fully_shard.api import (
+    _extend_module_with_hsdp_interface,
     _check_hsdp_input_valid,
     HsdpValidationOptions,
     _get_root_modules,
@@ -42,6 +43,7 @@ from hyper_parallel.core.fully_shard.api import (
     get_model_state_dict,
     hsdp_sync_stream,
 )
+from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerContext, HSDPSchedulerV2
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy, SourceShardMetaInfo
 from hyper_parallel.core.dtensor.placement_types import Replicate
 
@@ -547,6 +549,53 @@ class TestFullyShardListAPI(unittest.TestCase):
 
 class TestModuleControlScope(unittest.TestCase):
     """Check control scopes and gradient clearing on shared module groups."""
+
+    def test_reduce_interval_applies_to_entire_tree_and_survives_reset(self):
+        """Root configuration must reach every child when contexts are shared."""
+        root = ParentModule()
+        for module in (root, root.child):
+            _extend_module_with_hsdp_interface(module)
+            scheduler = object.__new__(HSDPSchedulerV2)
+            scheduler.cell = module
+            scheduler.scheduler_ctx = HSDPSchedulerContext()
+            scheduler.scheduler_state = None
+            scheduler.comm_fusion_policy = SimpleNamespace(enable_comm_fusion=False)
+            scheduler.hsdp_state = MagicMock(param_group=None)
+            scheduler.mp_policy = _default_mp_policy()
+            scheduler.forward_prefetch_cells = []
+            scheduler._fsdp_group_post_pending = None
+            scheduler._backup_forward_fetch = None
+            scheduler._init_params_fqn = MagicMock()
+            scheduler._lazy_init_all_states = MagicMock()
+            module.hsdp_scheduler = scheduler
+
+        root.set_reduce_comm_interval()
+        self.assertEqual(root.hsdp_scheduler.scheduler_ctx.reduce_interval, 1)
+        root.set_reduce_comm_interval(2)
+        root.hsdp_scheduler._hsdp_forward_pre_hook(root, (), {})
+
+        self.assertIs(root.child.hsdp_scheduler.scheduler_ctx, root.hsdp_scheduler.scheduler_ctx)
+        self.assertEqual(root.child.hsdp_scheduler.hsdp_state.scheduler_ctx.reduce_interval, 2)
+        with self.assertRaisesRegex(ValueError, "before the root module's first forward"):
+            root.set_reduce_comm_interval(3)
+        root.reset_iter_state()
+        self.assertEqual(root.hsdp_scheduler.scheduler_ctx.reduce_interval, 2)
+
+    def test_reduce_interval_validation_and_fusion_fallback(self):
+        """Reject invalid intervals and preserve the fused single-work lifecycle."""
+        module = HSDPModule()
+        with self.assertRaisesRegex(ValueError, "fully_shard"):
+            module.set_reduce_comm_interval(2)
+        module.hsdp_scheduler = SimpleNamespace(
+            scheduler_ctx=HSDPSchedulerContext(),
+            comm_fusion_policy=SimpleNamespace(enable_comm_fusion=True),
+        )
+        for interval in (True, False, 0, -1, 1.0, "2", None):
+            with self.subTest(interval=interval), self.assertRaisesRegex(ValueError, "positive int"):
+                module.set_reduce_comm_interval(interval)
+        with self.assertWarnsRegex(UserWarning, "comm_fusion=True"):
+            module.set_reduce_comm_interval(2)
+        self.assertEqual(module.hsdp_scheduler.scheduler_ctx.reduce_interval, 1)
 
     def test_controls_allow_outer_override_and_respect_recurse(self):
         """Feature: FSDP module control scope.

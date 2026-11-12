@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """hybrid shard data parallel interface"""
+import warnings
 from collections import namedtuple
 from typing import Any, List, Mapping, cast, Optional, Union
 
@@ -321,6 +322,42 @@ class HSDPModule:
     def set_is_last_backward(self, is_last_backward: bool):
         """set is_last_backward flag"""
         self.hsdp_scheduler.scheduler_ctx.is_last_backward = is_last_backward
+
+    def set_reduce_comm_interval(self, interval: int = 1) -> None:
+        """Set the non-fused reduction interval for the entire FSDP module tree.
+
+        Call on the root module before its first forward. A unit's reduce-scatter
+        is waited after the next ``interval`` non-fused units finish backward;
+        units without gradients still count. Larger intervals retain more
+        communication buffers. Root backward always drains the remaining work.
+
+        Args:
+            interval: Positive number of subsequent non-fused units to overlap.
+
+        Raises:
+            ValueError: If the interval is invalid, fully_shard has not initialized
+                the module, or the root has already started its first forward.
+
+        Note:
+            Communication fusion supports only interval=1. Configuring a larger
+            interval on a fused root warns and falls back to one for the tree.
+        """
+        if isinstance(interval, bool) or not isinstance(interval, int) or interval < 1:
+            raise ValueError(f"interval must be a positive int, but got {interval!r}.")
+        if self.hsdp_scheduler is None:
+            raise ValueError("call fully_shard before setting reduce communication interval")
+        ctx = self.hsdp_scheduler.scheduler_ctx
+        if ctx.lazy_init_done:
+            raise ValueError("set reduce communication interval before the root module's first forward")
+        if self.hsdp_scheduler.comm_fusion_policy.enable_comm_fusion and interval > 1:
+            warnings.warn(
+                "reduce communication intervals greater than one are not supported when "
+                "comm_fusion=True; using interval=1.",
+                UserWarning,
+                stacklevel=2,
+            )
+            interval = 1
+        ctx.reduce_interval = interval
 
     def reset_iter_state(self, recursive: bool = True) -> None:
         """Reset fully_shard iteration bookkeeping without clearing optimizer gradients.
