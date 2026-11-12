@@ -42,3 +42,4 @@ class OpGuide:
     name: str
     output_leaf_count: int = 0
     output_bindings: dict[int, int] = field(default_factory=dict)
+    input_bindings: dict[int, int] | None = None

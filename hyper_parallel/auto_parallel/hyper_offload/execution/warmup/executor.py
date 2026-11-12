@@ -26,18 +26,31 @@ Physical state transitions are delegated to
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 import torch
 from torch.utils._pytree import tree_flatten
 
 from hyper_parallel.auto_parallel.hyper_offload.execution.base import BaseExecutor
-from hyper_parallel.auto_parallel.hyper_offload.runtime.timer import DeviceTimer
-from hyper_parallel.auto_parallel.hyper_offload.execution.warmup.tracker import ActivationTracker
+from hyper_parallel.auto_parallel.hyper_offload.execution.tensor import ShadowTensor
+from hyper_parallel.auto_parallel.hyper_offload.execution.warmup.tracker import (
+    ActivationTracker,
+)
 from hyper_parallel.auto_parallel.hyper_offload.ir.replay import OpGuide
-from hyper_parallel.auto_parallel.hyper_offload.ir.trace import AccessKind, ActivationTrace, StorageAccess, TraceOp
-from hyper_parallel.auto_parallel.hyper_offload.runtime.bandwidth import profile_transfer_bandwidth
-from hyper_parallel.auto_parallel.hyper_offload.runtime.residency import ResidencyManager
+from hyper_parallel.auto_parallel.hyper_offload.ir.trace import (
+    AccessKind,
+    ActivationTrace,
+    StorageAccess,
+    TraceOp,
+)
+from hyper_parallel.auto_parallel.hyper_offload.runtime.bandwidth import (
+    profile_transfer_bandwidth,
+)
+from hyper_parallel.auto_parallel.hyper_offload.runtime.residency import (
+    ResidencyManager,
+)
+from hyper_parallel.auto_parallel.hyper_offload.runtime.timer import DeviceTimer
 
 logger = logging.getLogger(__name__)
 
@@ -63,12 +76,14 @@ class WarmupExecutor(BaseExecutor):
         residency_manager: ResidencyManager,
         memory_limit_bytes: int,
     ) -> None:
+        """Initialize activation tracking under the device-residency budget."""
         super().__init__(residency_manager)
         self._memory_limit_bytes = memory_limit_bytes
         self._tracker = ActivationTracker()
         self._timer = DeviceTimer()
         self._guide: list[OpGuide] = []
         self._ops: list[TraceOp] = []
+        self._input_bindings = {}
         #: sid -> the op index that first produced this activation.
         self._sid_produced_at_op: dict[int, int] = {}
 
@@ -78,6 +93,14 @@ class WarmupExecutor(BaseExecutor):
 
     def _enforce_budget(self, protected_sids: set[int]) -> None:
         """Evict warmup activations until resident bytes fit the configured budget."""
+        # The residency table owns buffers, not tensor lifetimes. Retire dead
+        # temporaries before considering live activations for host offload.
+        for sid, shadows in tuple(self._alive_shadows.items()):
+            if not shadows and sid not in protected_sids:
+                self.residency_manager.release_device(sid)
+                self.residency_manager.release_host(sid)
+                del self._alive_shadows[sid]
+                self._sid_produced_at_op.pop(sid, None)
         while self.residency_manager.resident_bytes > self._memory_limit_bytes:
             # Greedy: evict oldest first; within the same op, evict largest first.
             victim_sid: int | None = None
@@ -109,7 +132,7 @@ class WarmupExecutor(BaseExecutor):
     # Lifecycle hooks
     # ------------------------------------------------------------------
 
-    def on_op_begin(self, func, args, kwargs) -> None:
+    def on_op_begin(self, func: Callable[..., Any], args: tuple, kwargs: dict) -> None:
         """Before op: enforce memory budget and fault inputs back to device."""
         super().on_op_begin(func, args, kwargs)
 
@@ -119,9 +142,14 @@ class WarmupExecutor(BaseExecutor):
                 protected_sids.add(sid)
         self._enforce_budget(protected_sids)
 
+        self._input_bindings = {
+            index: value.storage_id
+            for index, value in enumerate(self._last_flat_inputs[0])
+            if isinstance(value, ShadowTensor)
+        }
         self._timer.start()
 
-    def on_op_end(self, result) -> Any:
+    def on_op_end(self, result: Any) -> Any:
         """After op: record trace, residency metadata, and return shadowed result."""
         op_duration_ms = self._timer.stop()
 
@@ -153,7 +181,7 @@ class WarmupExecutor(BaseExecutor):
                 op.accesses.append(StorageAccess(self.op_idx, sid, kind))
 
         # --- Output accesses + bindings ---
-        leaves, _ = tree_flatten(result)
+        leaves, output_spec = tree_flatten(result)
         output_bindings: dict[int, int] = {}
 
         for leaf_index, t in enumerate(leaves):
@@ -178,12 +206,13 @@ class WarmupExecutor(BaseExecutor):
             name=func.__name__,
             output_leaf_count=len(leaves),
             output_bindings=output_bindings,
+            input_bindings=self._input_bindings,
         )
 
         self._ops.append(op)
         self._guide.append(guide)
 
-        return self.apply_shadows(result, output_bindings)
+        return self.apply_shadows(result, output_bindings, flattened=(leaves, output_spec))
 
     def finish(self) -> tuple[ActivationTrace, list[OpGuide]]:
         """Finish warmup and return recorded trace and replay guide."""
@@ -207,5 +236,6 @@ class WarmupExecutor(BaseExecutor):
         self._sid_produced_at_op.clear()
         self._ops = []
         self._guide = []
+        self._input_bindings = {}
         self._tracker.clear_activations()
         super().reset()

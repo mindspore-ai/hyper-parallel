@@ -48,6 +48,7 @@ from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizerB
 from transformers.modeling_outputs import ModelOutput
 
 from hyper_parallel import DTensor, HSDPModule, SkipDTensorDispatch
+from hyper_parallel.auto_parallel.hyper_offload import OffloadConfig, OffloadSession
 from hyper_parallel.compile.compiler import GraphCompiler
 from hyper_parallel.core.tensor_parallel import loss_parallel
 from hyper_parallel.core.utils import clip_grad_norm_
@@ -600,6 +601,14 @@ class BaseTrainer(Stateful, ABC):
         else:
             self.model_fwd_context = nullcontext()
         self.model_bwd_context = nullcontext()
+        offload = self.config.hyper_offload
+        self.hyper_offload_context = nullcontext()
+        if offload.enable:
+            self.hyper_offload_context = OffloadSession(OffloadConfig(
+                max_resident_activation_mb=offload.max_resident_activation_mb,
+                max_offload_activation_mb=offload.max_offload_activation_mb,
+            ))
+            logger.info("HyperOffload enabled: peak planner with communication masking; %s", offload)
         self.graph_compiler: Optional[GraphCompiler] = None
 
     def _build_graph_compiler(self) -> None:
@@ -845,7 +854,8 @@ class BaseTrainer(Stateful, ABC):
             if channel_loss_callback is not None
             else nullcontext()
         )
-        with micro_step_context, aux_loss_scale_context():
+        offload_context = getattr(self, "hyper_offload_context", nullcontext())
+        with offload_context, micro_step_context, aux_loss_scale_context():
             micro_batch = self.preforward(micro_batch)
             # TextTrainer passes loss-only fields separately. Keep the legacy
             # BaseTrainer/VLM one-dictionary call contract working as well.

@@ -16,5 +16,6 @@
 
 from .base import ResidencyPlanner
 from .greedy import GreedyResidencyPlanner
+from .peak import PeakResidencyPlanner
 
-__all__ = ["GreedyResidencyPlanner", "ResidencyPlanner"]
+__all__ = ["GreedyResidencyPlanner", "PeakResidencyPlanner", "ResidencyPlanner"]
