@@ -47,9 +47,8 @@ Distributed ST helpers: `torchrun_case()` via `tests.common.distributed_launcher
 ## Env Gotchas / Do Not
 
 - **Editable must track this tree.** If `pip show hyper_parallel` shows another path (e.g. a deleted `.worktrees/...`), re-run `pip install -e .` from repo root. Do not rely on `PYTHONPATH` alone.
-- **Torch-only.** The `platform/` abstraction layer (and with it the MindSpore backend) has been
-  removed. Every module uses native Torch APIs (`torch.distributed`, `torch.Tensor`, autograd)
-  directly; do not reintroduce Platform dispatch or MindSpore implementations anywhere.
+- **Torch-only.** Every module uses native Torch APIs (`torch.distributed`, `torch.Tensor`, autograd)
+  directly; do not introduce a framework-dispatch abstraction.
 - **Collectives.** Use `torch.distributed` directly, or the thin wrappers in
   `hyper_parallel/core/context_parallel/utils.py` and `hyper_parallel/core/dtensor/_utils.py`.
 - **Never** invent Jenkins build numbers or force-push shared branches in agent workflows.

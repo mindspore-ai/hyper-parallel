@@ -125,10 +125,10 @@ Pick the matching paragraph for the report's last section:
 ## Worked example (success with one temp-skip)
 
 ```markdown
-# gate-doctor final report — mindspore/hyper-parallel#651
+# gate-doctor final report — owner/hyper-parallel#651
 
 - Status: **ci-pipeline-passed**
-- Last pipeline: #2453 (SUCCESS) — https://build.mindspore.cn/.../2453/
+- Last pipeline: #2453 (SUCCESS) — <observed Jenkins build URL>
 - Wall time: 1h 22m
 
 ## Timeline

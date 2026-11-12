@@ -15,8 +15,7 @@ tools:
 # FSDP Expert Agent
 
 Domain expert for Fully / Hybrid Sharded Data Parallel. FSDP is **torch-only**
-and lives entirely under `core/fully_shard/`; the platform abstraction and the
-MindSpore backend have been removed.
+and lives entirely under `core/fully_shard/`, using native Torch APIs directly.
 
 ## Load on demand
 

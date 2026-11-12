@@ -111,7 +111,7 @@ target accelerator, and record unsupported native kernels separately from a
 mathematical mismatch.
 
 Follow `.agent/rules/testing.md`. Distributed ST launchers must remain free of
-top-level Torch, MindSpore, and HyperParallel imports.
+top-level Torch and HyperParallel imports.
 
 ## Handoff Manifest
 
