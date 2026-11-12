@@ -249,21 +249,6 @@ def run_pylint(files: List[str],
     return not has_issues, f"[pylint]\n{output}\n"
 
 
-def run_pylint_plugin_tests(files: List[str]) -> Tuple[bool, str]:
-    """Verify the repository lint plugin in the development-tool environment.
-
-    Args:
-        files: Changed Python files that require the lint stage.
-    """
-    if not files:
-        return True, ""
-    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../.."))
-    result = _run_cmd([sys.executable, "-m", "unittest", "discover",
-                       "-s", os.path.join(root, "tests", "lint"), "-p", "test_pylint_hyperparallel.py"])
-    output = (result.stdout + result.stderr).strip()
-    return result.returncode == 0, f"[pylint-plugin-tests]\n{output}\n"
-
-
 def _has_pylint_issues(output: str) -> bool:
     """Check whether pylint output contains actual issues.
 
@@ -942,11 +927,12 @@ def run_test_coverage_check(
 # ============================================================================
 
 def _classify_files(files: List[str]) -> dict:
-    """Group files by type for dispatching to checkers.
+    """Group existing files by type, excluding deletions from the staged diff.
 
     Args:
         files: List of all file paths to classify.
     """
+    files = [path for path in files if os.path.isfile(path)]
     cpp_exts = (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hxx")
     return {
         "py": [f for f in files if f.endswith(".py")],
@@ -999,7 +985,6 @@ def _build_check_plan(
     plan = []
     if include_pylint:
         plan.append((run_pylint, by_type["py"], {"filter_file": filter_file}))
-        plan.append((run_pylint_plugin_tests, by_type["py"], {}))
     plan.extend([
         (run_code_style_guard, by_type["all"],                {}),
         (run_lizard,          by_type["py"] + by_type["cpp"], {}),

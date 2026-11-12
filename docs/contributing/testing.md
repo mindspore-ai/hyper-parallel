@@ -15,35 +15,63 @@ Use pytest with the project's `@arg_mark` decorator, defined in `tests/common/ma
 
 ## Run Tests
 
-### Unit Tests (Local, Single Device)
+### Unit Tests (No Distributed Setup)
 
 ```bash
-pytest tests/ut/
+python -m pytest -vs tests/ut/core/shard/
+# Run the full unit suite when the change scope requires it.
+python -m pytest -vs tests/ut/
 ```
 
 ### PyTorch Distributed Tests
 
+Run the selected pytest launcher directly; it starts the required workers through `torchrun_case()` or `parallel_run()`.
+For example, run this existing Gloo ST from the repository root with an editable installation of this checkout:
+
 ```bash
-torchrun --nproc_per_node=8 -m pytest tests/torch/
+(
+  export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+  export HYPER_PARALLEL_TEST_DEVICE_TYPE=cpu
+  cd tests/torch/shard
+  python -m pytest -vs test_base_dtensor_init.py::test_base_dtensor_init_group1_gloo
+)
 ```
+
+This launcher resolves worker filenames relative to its working directory, so run it in `tests/torch/shard`.
+The root on `PYTHONPATH` makes the repository's `tests.common` helpers available to child processes; it does not replace
+the editable package installation. Explicitly select `cpu` because the `_gloo` test name and platform marker do not
+select a backend. The subshell restores your original directory and environment when it exits.
+
+Do not wrap launcher tests in an outer `torchrun`, which would start the launcher once per rank and duplicate jobs.
+Check the selected case's platform markers, worker count, and runtime before running NPU/GPU ST. Missing hardware must
+be reported as untested and coordinated with maintainers. The [testing rules](../../.agent/rules/testing.md) define
+launcher and worker responsibilities.
 
 ### Run by Module
 
 ```bash
 # Run only shard unit tests.
-pytest tests/ut/core/shard/
+python -m pytest -vs tests/ut/core/shard/
 
-# Run only activation_checkpoint unit tests.
-pytest tests/ut/core/activation_memory/
+# Run only activation-memory unit tests.
+python -m pytest -vs tests/ut/core/activation_memory/
 ```
 
 ## Test Markers
 
-The project's `@arg_mark` system supports:
+Use the arguments accepted by [mark_utils.py](../../tests/common/mark_utils.py):
 
-- **level0**: Basic coverage runnable with the Gloo CPU backend.
-- **level1**: Tests requiring an NPU.
-- **Feature markers**: Mark tests by feature, for example `@arg_mark(arg0=['arg0'], arg1=['arg1'])`.
+```python
+@arg_mark(
+    plat_marks=["cpu_linux"],
+    level_mark="level0",
+    card_mark="onecard",
+    essential_mark="essential",
+)
+```
+
+`level_mark` records the test tier; it does not select hardware. Use `plat_marks` for platform requirements and check
+the launcher's worker configuration for distributed resource needs. CPU/Gloo multiprocess checks are ST, not UT.
 
 ## Test Authoring Standards
 
@@ -65,8 +93,10 @@ The project's `@arg_mark` system supports:
 
 ## CI Workflow
 
-The following checks run when a PR is submitted:
+Run applicable lint and tests locally before submission. Local pre-commit hooks check staged files; they do not start
+the remote pipeline. Jenkins runs the configured code checks and test suites and reports the actual stages on the PR.
+GitHub Actions separately reconciles CI-label validity and review approvals.
 
-1. **Lint**: pylint and markdownlint through the pre-commit hook.
-2. **Level0 UT**: Basic CPU coverage.
-3. **Codecheck**: Static checks, including C0116 docstring checks.
+Use the [contributing guide](../../CONTRIBUTING.md#when-a-gate-fails) for Jenkins retests and gate troubleshooting.
+Include the tested commit, commands, environment, results, and unrun cases in the PR. A green local check does not
+replace the target branch's required remote checks.
