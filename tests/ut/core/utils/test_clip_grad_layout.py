@@ -45,9 +45,11 @@ def _mesh(shape, names):
 
 @contextmanager
 def _norm_collectives():
+    """Simulate CPU norm collectives without initializing process groups."""
     groups = {"axis0": [0, 2], "axis1": [0, 1]}
     with patch.object(DeviceMesh, "get_group", autospec=True,
                       side_effect=lambda mesh, dim: f"axis{dim}"), \
+            patch("hyper_parallel.core.utils.clip_grad.dist.get_backend", return_value="gloo"), \
             patch("hyper_parallel.core.utils.clip_grad.dist.get_process_group_ranks",
                   side_effect=lambda group: groups[group]), \
             patch("hyper_parallel.core.utils.clip_grad.dist.all_reduce",
