@@ -60,6 +60,8 @@ class TestBuildOptionsFields(unittest.TestCase):
                 ("fsdp_allgather_prefetch", "True"),
                 ("fsdp_overlap_grad_reduce", "True"),
                 ("max_in_flight_gb", "0.25"),
+                ("offload_budget_gb", "64.0"),
+                ("offload_prefetch_n_layers", "1"),
             ],
         )
 
@@ -107,6 +109,10 @@ class TestBuildOptionsFields(unittest.TestCase):
             CompileConfig(mode="reduce-overhead", options={"triton": True})
         with self.assertRaisesRegex(ValueError, "dynamo_cache_size_limit"):
             CompileConfig(dynamo_cache_size_limit=0)
+        with self.assertRaisesRegex(ValueError, "offload_budget_gb"):
+            CompileConfig(offload_budget_gb=-1)
+        with self.assertRaisesRegex(ValueError, "offload_prefetch_n_layers"):
+            CompileConfig(offload_prefetch_n_layers=-1)
 
     def test_use_joint_graph_selects_graph_compiler(self):
         """Graph-mode trainer selection is driven by compile.enabled + flag."""

@@ -198,6 +198,8 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 ("fsdp_allgather_prefetch", "True"),
                 ("fsdp_overlap_grad_reduce", "True"),
                 ("max_in_flight_gb", "0.25"),
+                ("offload_budget_gb", "64.0"),
+                ("offload_prefetch_n_layers", "1"),
             ],
         )
 

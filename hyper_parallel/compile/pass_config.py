@@ -39,6 +39,7 @@ __all__ = [
     "DP_MODES",
     "AC_MODES",
     "AC_REGION_SOURCES",
+    "ACTIVATION_SWAP_MODES",
     "normalize_dp_mode",
     "build_pass_config_from_trainer_config",
 ]
@@ -91,6 +92,11 @@ AC_MODES = ("off", "full", "selective")
 # (and lets ``full`` auto-upgrade to a model-owned RecomputePolicy);
 # ``model_adapter_safe_regions`` requires an adapter-declared region.
 AC_REGION_SOURCES = ("default", "model_adapter_safe_regions")
+
+# Dynamic-graph activation-swap modes reused by graph mode. ``attention``
+# offloads saved activations inside ``self_attn`` modules to host memory
+# (the graph pass equivalent of the eager attention swap wrapper).
+ACTIVATION_SWAP_MODES = ("none", "attention")
 
 
 def normalize_dp_mode(mode: str) -> str:
@@ -278,6 +284,21 @@ class PassConfig:
             a forward collective. FSDP parameter all-gathers are inserted after
             this pass and are unaffected. Set ``False`` to replay the
             all-gather, trading communication for less retained memory.
+        activation_swap: Reuse the dynamic-graph ``activation_swap`` setting.
+            ``"attention"`` (the only enabled mode) runs ``CpuOffloadPass``:
+            saved activations produced inside ``self_attn`` modules are copied
+            to host memory asynchronously during forward and reloaded before
+            their first backward consumer. ``"none"`` disables offload.
+        offload_budget_gb: Host-memory budget, in GiB per rank, for activations
+            selected by ``CpuOffloadPass``. Tensors are selected largest-first
+            until the budget is exhausted; ``0`` means no budget. Graph-mode
+            only (the eager attention swap has no budget knob). The budget caps
+            offloaded activation bytes, not the pinned host buffer footprint, so
+            size it against the host's free memory to avoid host OOM.
+        offload_prefetch_n_layers: Move each backward reload this many attention
+            regions earlier to overlap H2D copies with preceding backward
+            compute. ``0`` keeps the reload immediately before its consumer.
+            Graph-mode only.
 
     Note:
         ``fsdp_enabled`` / ``pp_enabled`` no longer probe
@@ -311,6 +332,9 @@ class PassConfig:
     ac_layer_indices: Optional[List[int]] = None
     ac_region_source: str = "default"
     ac_save_forward_all_gather: bool = True
+    activation_swap: str = "none"
+    offload_budget_gb: float = 64.0
+    offload_prefetch_n_layers: int = 1
 
     def __post_init__(self) -> None:
         self.dp_mode = normalize_dp_mode(self.dp_mode)
@@ -331,6 +355,7 @@ class PassConfig:
         self._validate_dp()
         self._validate_pp()
         self._validate_ac()
+        self._validate_offload()
 
     def _validate_ac(self) -> None:
         """Validate the activation checkpointing mode and layer selectors."""
@@ -397,6 +422,41 @@ class PassConfig:
             raise ValueError(
                 f"ac_layer_indices must not contain duplicates, got {indices!r}"
             )
+
+    def _validate_offload(self) -> None:
+        """Validate graph-mode activation offload (dynamic attention-swap reuse)."""
+        if (
+            not isinstance(self.activation_swap, str)
+            or self.activation_swap not in ACTIVATION_SWAP_MODES
+        ):
+            raise ValueError(
+                "activation_swap must be one of "
+                f"{ACTIVATION_SWAP_MODES}, got {self.activation_swap!r}"
+            )
+        if self.activation_swap == "none":
+            return
+        if self.ac_mode != "off":
+            raise ValueError(
+                "activation_swap='attention' is incompatible with graph-mode "
+                "activation checkpointing; the dynamic path enforces the same "
+                "combination rule"
+            )
+        if self.pp_enabled:
+            raise ValueError(
+                "activation_swap='attention' does not support pipeline "
+                "parallelism; the dynamic path enforces the same rule"
+            )
+        value = self.offload_budget_gb
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError("offload_budget_gb must be a finite non-negative number")
+        prefetch = self.offload_prefetch_n_layers
+        if isinstance(prefetch, bool) or not isinstance(prefetch, int) or prefetch < 0:
+            raise ValueError("offload_prefetch_n_layers must be a non-negative integer")
 
     def _validate_flags(self) -> None:
         """Validate boolean flags and the overlap memory budget."""
@@ -511,7 +571,14 @@ def build_pass_config_from_trainer_config(
     ``model_adapter_safe_regions`` selection contributes its layer
     selectors. ``swap_inputs`` and ``allow_cache_entry_mutation`` have no
     static-graph counterpart (no eager checkpoint cache) and are ignored
-    with a warning when set, mirroring the dynamic compile path.
+    with a warning when set, mirroring the dynamic compile path. The
+    top-level dynamic ``activation_swap`` field is projected onto
+    ``activation_swap`` so graph mode reuses the eager attention-swap
+    configuration (the graph pass owns offload instead of the eager wrapper).
+    The graph-only ``compile.offload_budget_gb`` and
+    ``compile.offload_prefetch_n_layers`` knobs are projected too, so Trainer
+    YAML can tune the offload budget instead of being pinned to the 64 GiB
+    default.
 
     Args:
         config: Trainer topology (e.g. a ``TrainerConfig``); only the
@@ -573,4 +640,9 @@ def build_pass_config_from_trainer_config(
         ac_layer_count=ac_layer_count,
         ac_layer_indices=ac_layer_indices,
         ac_region_source=ac_region_source,
+        activation_swap=getattr(config, "activation_swap", "none"),
+        offload_budget_gb=getattr(compile_config, "offload_budget_gb", 64.0),
+        offload_prefetch_n_layers=getattr(
+            compile_config, "offload_prefetch_n_layers", 1
+        ),
     )
