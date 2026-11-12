@@ -20,6 +20,7 @@ import logging
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from types import SimpleNamespace
 from typing import Any, Optional
 
@@ -139,7 +140,6 @@ _SELECTIVE_AC_COMM_OP_NAMES = (
     "aten.reduce_scatter_tensor",
     "_c10d_functional.all_to_all_single",
     "_c10d_functional.reduce_scatter_tensor",
-    "c10d.allreduce_",
 )
 
 
@@ -163,7 +163,8 @@ def _build_selective_ac_must_save_ops():
     save_ops.update(compute_ops)
     save_ops.update(comm_ops)
     save_ops.difference_update(_SELECTIVE_AC_FORCE_RECOMPUTE_OPS)
-    return frozenset(save_ops)
+    # A raw c10d return value cannot replay writes or provide a fresh Work.
+    return frozenset(op for op in save_ops if op.namespace != "c10d")
 
 
 _SELECTIVE_AC_MUST_SAVE_OPS = _build_selective_ac_must_save_ops()
@@ -513,21 +514,18 @@ def _should_use_hf_native_gradient_checkpointing(
 def _wrap_layer_containers(
     containers: list[_LayerContainerInfo],
     wrapper: Callable,
-    *,
-    context_fn: Optional[Callable[[], tuple[object, object]]] = None,
 ) -> int:
     """Wrap every layer in the discovered containers and return the count."""
     wrapped_count = 0
     for container_info in containers:
         for block_info in container_info.blocks:
-            checkpoint_kwargs = {} if context_fn is None else {"context_fn": context_fn}
             current_block = getattr(block_info.parent, block_info.child_name, None)
             if not isinstance(current_block, nn.Module) or _is_checkpoint_wrapped(current_block):
                 continue
             setattr(
                 block_info.parent,
                 block_info.child_name,
-                wrapper(current_block, **checkpoint_kwargs),
+                wrapper(current_block),
             )
             wrapped_count += 1
     return wrapped_count
@@ -643,14 +641,20 @@ def _wrap_first_existing_attr(
     return 0
 
 
-def _eager_checkpoint_kwargs(swap_inputs: bool) -> dict[str, Any]:
-    """Build the eager-mode checkpoint keyword arguments.
-
-    Compile mode drops ``swap_inputs`` entirely, but eager checkpointing accepts
-    it in both states: ``False`` keeps ordinary recomputation, while ``True``
-    offloads the checkpoint inputs to host memory.
-    """
-    return {"swap_inputs": swap_inputs}
+def _checkpoint_kwargs_for_mode(
+    mode: Optional[str],
+    *,
+    enable_compile: bool,
+    swap_inputs: bool,
+    allow_cache_entry_mutation: bool = False,
+) -> dict[str, Any]:
+    """Resolve checkpoint policy independently of the chosen HP wrapper boundary."""
+    if enable_compile:
+        return {"policy_fn": compile_selective_checkpoint_policy} if mode == "selective" else {}
+    checkpoint_kwargs = {"swap_inputs": swap_inputs}
+    if mode == "selective":
+        checkpoint_kwargs["context_fn"] = make_selective_checkpoint_context_fn(allow_cache_entry_mutation)
+    return checkpoint_kwargs
 
 
 def apply_submodule_checkpointing(
@@ -669,7 +673,7 @@ def apply_submodule_checkpointing(
         swap_inputs: Whether checkpoint inputs should be offloaded in eager
             execution. This is ignored in compile mode.
     """
-    checkpoint_kwargs = {} if enable_compile else _eager_checkpoint_kwargs(swap_inputs)
+    checkpoint_kwargs = _checkpoint_kwargs_for_mode("full", enable_compile=enable_compile, swap_inputs=swap_inputs)
 
     def submodule_checkpoint_wrapper(module: nn.Module) -> nn.Module:
         """Wrap one selected layer submodule with checkpointing."""
@@ -981,8 +985,7 @@ def _apply_model_adapter_regions_checkpointing(
     ac_layers: list[nn.Module],
     selection: Any,
     *,
-    enable_compile: bool,
-    swap_inputs: bool,
+    checkpoint_kwargs: dict[str, Any],
     recompute_spec: Optional[RecomputePolicy] = None,
 ) -> nn.Module:
     """Wrap the adapter-declared recompute regions of the selected layers.
@@ -1006,8 +1009,6 @@ def _apply_model_adapter_regions_checkpointing(
         return model
     if hasattr(model, "gradient_checkpointing_disable"):
         model.gradient_checkpointing_disable()
-    checkpoint_kwargs = {"swap_inputs": swap_inputs} if not enable_compile else {}
-
     module_by_fqn = dict(model.named_modules())
     roots = _select_layer_region_roots(module_by_fqn, selected_layer_fqns, recompute_spec)
     if not roots:
@@ -1016,7 +1017,7 @@ def _apply_model_adapter_regions_checkpointing(
         )
     excluded_count = _wrap_declared_exclusions(module_by_fqn, roots, recompute_spec)
     wrapped_count = _wrap_region_roots(model, module_by_fqn, roots, checkpoint_kwargs)
-    if swap_inputs and not enable_compile:
+    if checkpoint_kwargs.get("swap_inputs"):
         _register_forward_prefetch_layers(containers)
     if recompute_spec.on_applied is not None:
         recompute_spec.on_applied(model)
@@ -1126,30 +1127,13 @@ def _apply_selective_checkpointing(
             swap_inputs=swap_inputs,
         )
 
-    if enable_compile:
-        def compile_checkpoint_wrapper(layer: nn.Module) -> nn.Module:
-            """Wrap one layer with the compile-compatible SAC policy."""
-            return checkpoint_wrapper(
-                layer,
-                policy_fn=compile_selective_checkpoint_policy,
-            )
-
-        return _wrap_layer_containers(containers, compile_checkpoint_wrapper)
-
-    def eager_checkpoint_wrapper(layer: nn.Module, **checkpoint_kwargs: Any) -> nn.Module:
-        """Wrap one layer with eager selective checkpointing."""
-        return checkpoint_wrapper(
-            layer,
-            swap_inputs=swap_inputs,
-            **checkpoint_kwargs,
-        )
-
-    return _wrap_layer_containers(
-        containers,
-        eager_checkpoint_wrapper,
-        context_fn=make_selective_checkpoint_context_fn(
-            allow_cache_entry_mutation),
+    checkpoint_kwargs = _checkpoint_kwargs_for_mode(
+        "selective",
+        enable_compile=enable_compile,
+        swap_inputs=swap_inputs,
+        allow_cache_entry_mutation=allow_cache_entry_mutation,
     )
+    return _wrap_layer_containers(containers, partial(checkpoint_wrapper, **checkpoint_kwargs))
 
 
 def _apply_full_checkpointing(
@@ -1203,13 +1187,8 @@ def _apply_full_checkpointing(
             swap_inputs=swap_inputs,
         )
 
-    def full_checkpoint_wrapper(layer: nn.Module) -> nn.Module:
-        """Wrap one complete transformer layer for full recomputation."""
-        if enable_compile:
-            return checkpoint_wrapper(layer)
-        return checkpoint_wrapper(layer, **_eager_checkpoint_kwargs(swap_inputs))
-
-    return _wrap_layer_containers(containers, full_checkpoint_wrapper)
+    checkpoint_kwargs = _checkpoint_kwargs_for_mode("full", enable_compile=enable_compile, swap_inputs=swap_inputs)
+    return _wrap_layer_containers(containers, partial(checkpoint_wrapper, **checkpoint_kwargs))
 
 
 def _apply_activation_checkpointing(
@@ -1245,13 +1224,18 @@ def _apply_activation_checkpointing(
             selection = SimpleNamespace(layer_count=len(ac_layers), layer_indices=None)
             selection_source = "model_adapter_safe_regions"
     if selection_source == "model_adapter_safe_regions":
+        checkpoint_kwargs = _checkpoint_kwargs_for_mode(
+            activation_checkpoint,
+            enable_compile=enable_compile,
+            swap_inputs=swap_inputs,
+            allow_cache_entry_mutation=allow_cache_entry_mutation,
+        )
         return _apply_model_adapter_regions_checkpointing(
             model,
             containers,
             ac_layers,
             selection,
-            enable_compile=enable_compile,
-            swap_inputs=swap_inputs,
+            checkpoint_kwargs=checkpoint_kwargs,
             recompute_spec=recompute_spec,
         )
 

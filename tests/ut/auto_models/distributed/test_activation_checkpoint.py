@@ -15,10 +15,13 @@
 """Unit tests for model-agnostic activation-checkpoint block discovery."""
 
 import unittest
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
+import torch
 from torch import Tensor, nn
+from torch.utils._python_dispatch import TorchDispatchMode
 
 
 from hyper_parallel.core.activation_memory.wrapper import ckpt_wrapper as _checkpoint_wrapper
@@ -303,6 +306,52 @@ class TestModelAdapterRecomputeRegions(unittest.TestCase):
         self._apply(model, adapter, self._selection())
 
         self.assertEqual(applied, [model])
+
+    def test_selected_region_keeps_sac_policy_and_excluded_gradients(self):
+        """Feature: Model-adapter selective checkpoint regions.
+
+        Description: Exclude the first of two linear operators from recomputation.
+        Expectation: SAC skips replayed matmuls and preserves all reference gradients.
+        """
+        class AddmmCounter(TorchDispatchMode):
+            """Count physical executions below the checkpoint cache."""
+            def __init__(self):
+                super().__init__()
+                self.count = 0
+
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                del types
+                if func == torch.ops.aten.addmm.default:
+                    self.count += 1
+                return func(*args, **(kwargs or {}))
+
+        reference = _DiscoveryOwner()
+        reference.config = SimpleNamespace(model_type="fixture")
+        reference.decoder = nn.ModuleDict({
+            "2": nn.Sequential(nn.Linear(2, 2), nn.Sigmoid(), nn.Linear(2, 2), nn.Sigmoid()),
+        })
+        policy = RecomputePolicy(region_patterns=("decoder.*",), exclude_patterns=("decoder.*.0",))
+        selection = self._selection(layer_count=1)
+        inputs = torch.ones(2, 2, requires_grad=True)
+        expected = reference(inputs)
+        expected.sum().backward()
+        for mode, expected_count in (("full", 3), ("selective", 2)):
+            with self.subTest(mode=mode):
+                model = deepcopy(reference)
+                model.zero_grad(set_to_none=True)
+                adapter = SimpleNamespace(recompute=lambda: policy)
+                with patch(f"{_ACTIVATION_CHECKPOINT_MODULE}.get_model_adapter", return_value=adapter):
+                    _apply_activation_checkpointing(model, mode, selection=selection)
+                counter = AddmmCounter()
+                candidate_inputs = inputs.detach().requires_grad_()
+                with counter:
+                    actual = model(candidate_inputs)
+                    actual.sum().backward()
+                self.assertEqual(counter.count, expected_count)
+                torch.testing.assert_close(actual, expected)
+                torch.testing.assert_close(candidate_inputs.grad, inputs.grad)
+                for got, want in zip(model.parameters(), reference.parameters()):
+                    torch.testing.assert_close(got.grad, want.grad)
 
     def test_layer_region_requires_region_patterns(self):
         """A policy without region patterns cannot be applied."""
