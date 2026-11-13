@@ -320,9 +320,33 @@ class _MeshLayout:
         """Flatten this layout into a single canonicalized flat layout."""
         return _FlatLayout(self.shape, self.stride)
 
+    def is_contiguous(self) -> bool:
+        """Return True when the flattened strides are C-contiguous."""
+        flat_shape = _flatten_inttuple(self.shape)
+        flat_stride = _flatten_inttuple(self.stride)
+        return flat_stride == _contiguous_strides(flat_shape)
+
     def remap_to_numpy(self, rank_map: Any) -> np.ndarray:
         """Materialize this layout as a dense numpy mesh over the provided rank map."""
         rank_map_np = np.asarray(rank_map).reshape(-1)
+        if self.is_contiguous():
+            # A contiguous layout enumerates exactly ``0..numel-1``, so the
+            # anchor scan below collapses to a reshape. Doing it directly keeps
+            # this O(N) instead of O(N * numel).
+            numel = self.numel()
+            if numel == 0:
+                raise ValueError("Cannot remap an empty layout.")
+            world_size = rank_map_np.shape[0]
+            if world_size % numel != 0:
+                raise ValueError(
+                    f"Layout {self} does not form a full partition over rank_map "
+                    f"with world size {world_size}."
+                )
+            num_groups = world_size // numel
+            return rank_map_np.reshape(num_groups, numel).reshape(
+                (num_groups,) + self.top_level_sizes
+            )
+
         base_offsets = self.all_ranks_from_zero()
         if len(base_offsets) == 0:
             raise ValueError("Cannot remap an empty layout.")
