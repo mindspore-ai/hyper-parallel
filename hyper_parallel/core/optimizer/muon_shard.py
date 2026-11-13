@@ -28,8 +28,9 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import torch
-import torch.distributed as dist
+# Native Torch is required by the current core rules; the legacy backend-dispatch lint is inapplicable.
+import torch  # pylint: disable=forbidden-backend-import
+import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.core.optimizer.dtensor_compat import to_local_if_dtensor
 from hyper_parallel.core.optimizer.sharding_category import (
@@ -46,7 +47,12 @@ def make_param_shard_meta(
         param: torch.Tensor,
         stage_metas: List[ParamShardStageMeta],
 ) -> ParamShardMeta:
-    """Construct shard metadata from real local-shape plans."""
+    """Construct shard metadata from real local-shape plans.
+
+    Args:
+        param: Parameter whose local and global shapes are described.
+        stage_metas: Per-axis padding and split metadata.
+    """
     global_shape = tuple(param.shape)
     local_shape = tuple(to_local_if_dtensor(param.data).shape)
     return ParamShardMeta(
@@ -146,10 +152,30 @@ def _allgather_shapes_for_group(
     ]
 
 
+def _build_shard_stage(gathered_shapes, record_idx, tensor_dim, shard_size, cur_rank):
+    """Construct one padding stage and its reconstructed shape."""
+    rank_shapes = tuple(tuple(gathered_shapes[rank_idx][record_idx]) for rank_idx in range(shard_size))
+    tensor_dim_norm = tensor_dim % len(rank_shapes[0])
+    split_sizes = tuple(shape[tensor_dim_norm] for shape in rank_shapes)
+    pad_shape = tuple(max(shape[dim] for shape in rank_shapes) for dim in range(len(rank_shapes[0])))
+    stage = ParamShardStageMeta(
+        tensor_dim=tensor_dim_norm, shard_size=shard_size, cur_rank_in_shard_group=cur_rank,
+        rank_shapes=rank_shapes, split_sizes=split_sizes, pad_shape=pad_shape,
+    )
+    output_shape = list(rank_shapes[cur_rank])
+    if shard_size > 1:
+        output_shape[tensor_dim_norm] = sum(split_sizes)
+    return stage, tuple(output_shape)
+
+
 def build_param_shard_metadata_for_group(
         hsdp_group: HSDPCommGroup,
 ) -> Dict[torch.Tensor, ParamShardMeta]:
-    """Build per-parameter shard metadata before HSDP batching."""
+    """Build per-parameter shard metadata before HSDP batching.
+
+    Args:
+        hsdp_group: Communication group and its parameter records.
+    """
     # pylint: disable=too-many-locals
     layout_spec = hsdp_group.layout_spec
     shard_pgs = hsdp_group.shard_pgs
@@ -167,28 +193,9 @@ def build_param_shard_metadata_for_group(
         next_shapes: List[Tuple[int, ...]] = []
 
         for record_idx, _ in enumerate(hsdp_group.records):
-            rank_shapes = tuple(
-                tuple(gathered_shapes[rank_idx][record_idx])
-                for rank_idx in range(shard_size)
-            )
-            tensor_dim_norm = tensor_dim % len(rank_shapes[0])
-            split_sizes = tuple(shape[tensor_dim_norm] for shape in rank_shapes)
-            pad_shape = tuple(max(shape[dim] for shape in rank_shapes) for dim in range(len(rank_shapes[0])))
-            stage_metas_per_param[record_idx].append(
-                ParamShardStageMeta(
-                    tensor_dim=tensor_dim_norm,
-                    shard_size=shard_size,
-                    cur_rank_in_shard_group=cur_rank,
-                    rank_shapes=rank_shapes,
-                    split_sizes=split_sizes,
-                    pad_shape=pad_shape,
-                )
-            )
-
-            output_shape = list(rank_shapes[cur_rank])
-            if shard_size > 1:
-                output_shape[tensor_dim_norm] = sum(split_sizes)
-            next_shapes.append(tuple(output_shape))
+            stage, output_shape = _build_shard_stage(gathered_shapes, record_idx, tensor_dim, shard_size, cur_rank)
+            stage_metas_per_param[record_idx].append(stage)
+            next_shapes.append(output_shape)
 
         current_shapes = next_shapes
 
@@ -208,7 +215,13 @@ def build_pad_ns_inputs(
         param_to_ns_input: Dict[torch.Tensor, torch.Tensor],
         param_shard_metadata: Optional[Dict[torch.Tensor, ParamShardMeta]] = None,
 ) -> List[torch.Tensor]:
-    """Build aligned local NS inputs for all communication params."""
+    """Build aligned local NS inputs for all communication params.
+
+    Args:
+        comm_params: Parameters in communication order.
+        param_to_ns_input: Prepared local momentum inputs.
+        param_shard_metadata: Optional cached per-parameter shape metadata.
+    """
     if not comm_params:
         return []
 
@@ -249,7 +262,14 @@ def chunk_update_by_layout(
         layout_spec: ParamLayoutSpec,
         param_shard_meta: Optional[ParamShardMeta] = None,
 ) -> torch.Tensor:
-    """Slice a full update back to the local shard using narrow."""
+    """Slice a full update back to the local shard using narrow.
+
+    Args:
+        global_update: Full orthogonalized parameter update.
+        param: Parameter whose local and global shapes are described.
+        layout_spec: Shard axes used to restore the local update.
+        param_shard_meta: Optional cached shape metadata for this parameter.
+    """
     if not hasattr(param, "device_mesh") or layout_spec is None or not layout_spec.shard_axes:
         return global_update
 
@@ -369,18 +389,17 @@ def _prepare_gather_inputs(
     return gather_inputs, param_meta, total_padded_numel
 
 
-def _pack_and_allgather(
+def _pack_gather_buffers(
         gather_inputs: List[torch.Tensor],
         param_meta: List[_GatherParamMeta],
         total_padded_numel: int,
         axis_idx: int,
         dtype: torch.dtype,
         device: torch.device,
-        shard_pg: dist.ProcessGroup,
         shard_size: int,
         buffer_cache: Optional[Dict],
-) -> torch.Tensor:
-    """Pack local shards into one buffer, all-gather, return gathered view."""
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pack local shards and allocate the matching receive buffer."""
     pack_buffer = _get_or_alloc_buffer(
         buffer_cache, ("fused_allgather", axis_idx, dtype, device), total_padded_numel,
         dtype, device,
@@ -397,6 +416,25 @@ def _pack_and_allgather(
         dtype, device,
     )[:total_padded_numel * shard_size]
 
+    return pack_buffer, gathered_buffer
+
+
+def _pack_and_allgather(
+        gather_inputs: List[torch.Tensor],
+        param_meta: List[_GatherParamMeta],
+        total_padded_numel: int,
+        axis_idx: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        shard_pg: dist.ProcessGroup,
+        shard_size: int,
+        buffer_cache: Optional[Dict],
+) -> torch.Tensor:
+    """Pack local shards into one buffer, all-gather, return gathered view."""
+    pack_buffer, gathered_buffer = _pack_gather_buffers(
+        gather_inputs, param_meta, total_padded_numel, axis_idx,
+        dtype, device, shard_size, buffer_cache,
+    )
     dist.all_gather_into_tensor(gathered_buffer, pack_buffer, group=shard_pg)
     return gathered_buffer.view(shard_size, total_padded_numel)
 
@@ -454,7 +492,16 @@ def fused_allgather_dtensor_params(
         buffer_cache: Optional[Dict] = None,
         keep_indices: Optional[set] = None,
 ) -> List[Optional[torch.Tensor]]:
-    """Fuse many parameter shards into one all-gather per shard axis."""
+    """Fuse many parameter shards into one all-gather per shard axis.
+
+    Args:
+        local_tensors: Local NS inputs to gather.
+        shard_pgs: Process groups for each shard axis.
+        layout_spec: Shard axes used to restore the local update.
+        param_shard_metadata: Optional cached per-parameter shape metadata.
+        buffer_cache: Optional reusable communication buffers.
+        keep_indices: Indices of updates reconstructed on this compute owner.
+    """
     if not shard_pgs or not local_tensors:
         return _early_return_tensors(local_tensors, keep_indices)
 
@@ -511,3 +558,134 @@ def fused_allgather_dtensor_params(
         current_tensors = new_tensors  # type: ignore[assignment]
 
     return current_tensors
+
+
+@dataclass
+class PendingMuonGather:
+    """Own asynchronous gather storage until the consumer has finished using it."""
+
+    work: Any
+    send_buffer: torch.Tensor
+    gathered_view: torch.Tensor
+    inputs: List[torch.Tensor]
+    metadata: List[_GatherParamMeta]
+    tensor_dim: int
+    shard_size: int
+    keep_indices: set
+
+    def finish(self) -> List[Optional[torch.Tensor]]:
+        """Wait on the caller's stream and reconstruct only its owner inputs."""
+        self.work.wait()
+        return _unpack_gathered_results(
+            self.gathered_view, self.inputs, self.metadata, self.inputs,
+            self.tensor_dim, self.shard_size, len(self.inputs), True, self.keep_indices,
+        )
+
+
+@dataclass
+class PreparedMuonGather:
+    """Packed input independent of the reusable receive slot."""
+
+    send_buffer: torch.Tensor
+    inputs: List[torch.Tensor]
+    metadata: List[_GatherParamMeta]
+    tensor_dim: int
+    shard_size: int
+    keep_indices: set
+
+    def launch(self, shard_pg: dist.ProcessGroup, buffer_cache: Dict) -> PendingMuonGather:
+        """Submit the collective after input packing has been enqueued.
+
+        Args:
+            shard_pg: Process group for this shard axis.
+            buffer_cache: Reusable receive buffers for this pipeline slot.
+        """
+        source = self.send_buffer
+        output = _get_or_alloc_buffer(
+            buffer_cache, ("fused_allgather_out", 0, source.dtype, source.device),
+            source.numel() * self.shard_size, source.dtype, source.device,
+        )[:source.numel() * self.shard_size]
+        work = dist.all_gather_into_tensor(output, source, group=shard_pg, async_op=True)
+        return PendingMuonGather(
+            work, source, output.view(self.shard_size, source.numel()),
+            self.inputs, self.metadata, self.tensor_dim, self.shard_size, self.keep_indices,
+        )
+
+
+def prepare_muon_gather(
+        local_tensors: List[torch.Tensor],
+        shard_pg: dist.ProcessGroup,
+        tensor_dim: int,
+        stage_metas: List[ParamShardStageMeta],
+        keep_indices: set,
+        buffer_cache: Optional[Dict] = None,
+        plan_cache: Optional[Dict] = None,
+) -> PreparedMuonGather:
+    """Pack one bucket, reusing static layout metadata and bounded send storage.
+
+    Args:
+        local_tensors: Local NS inputs in parameter order.
+        shard_pg: Process group for the shard axis.
+        tensor_dim: Tensor dimension partitioned across the group.
+        stage_metas: Padding and split metadata for each parameter.
+        keep_indices: Parameters reconstructed by this rank after gathering.
+        buffer_cache: Optional reusable send storage and views.
+        plan_cache: Optional static layout plan cache.
+    """
+    shard_size = dist.get_world_size(shard_pg)
+    first = local_tensors[0]
+    signature = (tensor_dim, shard_size, first.dtype,
+                 tuple((tuple(tensor.shape), tensor.stride()) for tensor in local_tensors),
+                 tuple((tuple(meta.pad_shape), tuple(meta.split_sizes)) for meta in stage_metas))
+    if plan_cache is not None and plan_cache.get("signature") == signature:
+        metadata, padded_numel = plan_cache["metadata"], plan_cache["padded_numel"]
+        gather_inputs = [
+            tensor if tensor_dim % tensor.dim() == 0 and tensor.is_contiguous()
+            else tensor.movedim(tensor_dim % tensor.dim(), 0).contiguous()
+            for tensor in local_tensors
+        ]
+    else:
+        gather_inputs, metadata, padded_numel = _prepare_gather_inputs(
+            local_tensors, tensor_dim, max(1, 512 // first.element_size()), shard_size, stage_metas,
+        )
+        if plan_cache is not None:
+            plan_cache.update(signature=signature, metadata=metadata, padded_numel=padded_numel)
+    source = _get_or_alloc_buffer(
+        buffer_cache, ("pipeline_send", first.dtype, first.device), padded_numel, first.dtype, first.device,
+    )[:padded_numel]
+    source.zero_()
+    view_key = (source.data_ptr(), signature)
+    cached_views = buffer_cache.get("pipeline_views") if buffer_cache is not None else None
+    if cached_views is None or cached_views[0] != view_key:
+        destinations = [source[meta.offset:meta.offset + meta.actual_numel].view_as(tensor)
+                        for tensor, meta in zip(gather_inputs, metadata)]
+        if buffer_cache is not None:
+            buffer_cache["pipeline_views"] = (view_key, destinations)
+    else:
+        destinations = cached_views[1]
+    # Torch exposes batched tensor copies only through its private foreach API.
+    torch._foreach_copy_(destinations, gather_inputs)  # pylint: disable=protected-access
+    return PreparedMuonGather(source, local_tensors, metadata, tensor_dim, shard_size, keep_indices)
+
+
+def launch_muon_gather(
+        local_tensors: List[torch.Tensor],
+        shard_pg: dist.ProcessGroup,
+        tensor_dim: int,
+        stage_metas: List[ParamShardStageMeta],
+        keep_indices: set,
+        buffer_cache: Dict,
+) -> PendingMuonGather:
+    """Prepare and submit a single-axis asynchronous gather.
+
+    Args:
+        local_tensors: Local NS inputs in parameter order.
+        shard_pg: Process group for the shard axis.
+        tensor_dim: Tensor dimension partitioned across the group.
+        stage_metas: Padding and split metadata for each parameter.
+        keep_indices: Parameters reconstructed by this rank after gathering.
+        buffer_cache: Reusable receive buffers for this pipeline slot.
+    """
+    return prepare_muon_gather(local_tensors, shard_pg, tensor_dim, stage_metas, keep_indices).launch(
+        shard_pg, buffer_cache,
+    )
