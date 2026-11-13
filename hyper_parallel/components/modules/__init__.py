@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from hyper_parallel.components.modules.linear import Linear
     from hyper_parallel.components.modules.mhc import MhcPostModule, MhcPreModule
     from hyper_parallel.components.modules.mla_attention import MLAAttention
+    from hyper_parallel.components.modules.head_chunk_mla import HeadChunkMLA
     from hyper_parallel.components.modules.rms_norm import OffsetRMSNorm, RMSNorm
     from hyper_parallel.components.modules.shared_expert import SharedExpert
     from hyper_parallel.components.modules.swiglu_mlp import SwiGLUMLP
@@ -58,6 +59,7 @@ _EXPORT_TO_MODULE = {
     "NgramHashMapping": "engram",
     "PipelinedMhcModule": "mhc",
     "MLAAttention": "mla_attention",
+    "HeadChunkMLA": "head_chunk_mla",
     "OffsetRMSNorm": "rms_norm",
     "RMSNorm": "rms_norm",
     "SharedExpert": "shared_expert",
