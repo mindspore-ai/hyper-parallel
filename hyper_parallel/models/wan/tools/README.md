@@ -5,7 +5,7 @@
 训练入口和配置文件如下：
 
 - `scripts/train_dit.py`
-- `examples/wan/wan2_1_t2v_14b_full.yaml`
+- `hyper_parallel/models/wan/tools/wan2_1_t2v_14b_full.yaml`
 
 配置文件保持旧版内容不变。新版配置解析器会将 YAML 中的旧
 `hyper_parallel.auto_models...` 目标路径映射到新版 `models`、`data`、
@@ -70,7 +70,7 @@ Tom-and-Jerry-VideoGeneration-Dataset/
 将原始数据转换为 Parquet：
 
 ```bash
-python examples/wan/convert_tom_and_jerry.py \
+python hyper_parallel/models/wan/tools/convert_tom_and_jerry.py \
   --dataset_path /data/datasets/Tom-and-Jerry-VideoGeneration-Dataset \
   --output_dir /data/datasets/Tom-and-Jerry-VideoGeneration-Dataset-parquet \
   --num_shards 30 \
@@ -91,7 +91,7 @@ python examples/wan/convert_tom_and_jerry.py \
 
 ```bash
 torchrun --nproc_per_node=8 scripts/train_dit.py \
-  examples/wan/wan2_1_t2v_14b_full.yaml \
+  hyper_parallel/models/wan/tools/wan2_1_t2v_14b_full.yaml \
   --training.backend=hccl \
   --fsdp_config.dp_shard_size=8
 ```
@@ -100,7 +100,7 @@ torchrun --nproc_per_node=8 scripts/train_dit.py \
 
 ```bash
 torchrun --nproc_per_node=8 scripts/train_dit.py \
-  examples/wan/wan2_1_t2v_14b_full.yaml \
+  hyper_parallel/models/wan/tools/wan2_1_t2v_14b_full.yaml \
   --model.pretrained_model_name_or_path=/data/models/Wan2.1-T2V-14B-Diffusers \
   --model.local_files_only=true \
   --dataset.data_path=/data/datasets/Tom-and-Jerry-VideoGeneration-Dataset-parquet \
@@ -121,7 +121,7 @@ torchrun --nproc_per_node=8 scripts/train_dit.py \
 
 ```bash
 torchrun --nproc_per_node=8 scripts/train_dit.py \
-  examples/wan/wan2_1_t2v_14b_full.yaml \
+  hyper_parallel/models/wan/tools/wan2_1_t2v_14b_full.yaml \
   --checkpoint.restore_from=/data/output/wan2_1/checkpoints/<step> \
   --training.backend=hccl \
   --fsdp_config.dp_shard_size=8

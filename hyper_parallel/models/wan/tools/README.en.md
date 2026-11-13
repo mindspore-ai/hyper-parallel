@@ -6,7 +6,7 @@ training stack.
 The training entry point and configuration file are:
 
 - `scripts/train_dit.py`
-- `examples/wan/wan2_1_t2v_14b_full.yaml`
+- `hyper_parallel/models/wan/tools/wan2_1_t2v_14b_full.yaml`
 
 The model target uses
 `hyper_parallel.models._transformers.HyperAutoModelForDiT.from_pretrained`
@@ -91,7 +91,7 @@ Paths in `videos.txt` are resolved relative to the original dataset root.
 Convert the original data to Parquet:
 
 ```bash
-python examples/wan/convert_tom_and_jerry.py \
+python hyper_parallel/models/wan/tools/convert_tom_and_jerry.py \
   --dataset_path /data/datasets/Tom-and-Jerry-VideoGeneration-Dataset \
   --output_dir /data/datasets/Tom-and-Jerry-VideoGeneration-Dataset-parquet \
   --num_shards 30 \
@@ -114,7 +114,7 @@ Run the command from the repository root:
 
 ```bash
 torchrun --nproc_per_node=8 scripts/train_dit.py \
-  examples/wan/wan2_1_t2v_14b_full.yaml \
+  hyper_parallel/models/wan/tools/wan2_1_t2v_14b_full.yaml \
   --training.backend=hccl \
   --fsdp_config.dp_shard_size=8
 ```
@@ -123,7 +123,7 @@ To use a local model and local Parquet data:
 
 ```bash
 torchrun --nproc_per_node=8 scripts/train_dit.py \
-  examples/wan/wan2_1_t2v_14b_full.yaml \
+  hyper_parallel/models/wan/tools/wan2_1_t2v_14b_full.yaml \
   --model.pretrained_model_name_or_path=/data/models/Wan2.1-T2V-14B-Diffusers \
   --model.local_files_only=true \
   --dataset.data_path=/data/datasets/Tom-and-Jerry-VideoGeneration-Dataset-parquet \
@@ -144,7 +144,7 @@ To resume training, pass the checkpoint directory:
 
 ```bash
 torchrun --nproc_per_node=8 scripts/train_dit.py \
-  examples/wan/wan2_1_t2v_14b_full.yaml \
+  hyper_parallel/models/wan/tools/wan2_1_t2v_14b_full.yaml \
   --checkpoint.restore_from=/data/output/wan2_1/checkpoints/<step> \
   --training.backend=hccl \
   --fsdp_config.dp_shard_size=8
