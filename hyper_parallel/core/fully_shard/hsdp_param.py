@@ -387,7 +387,7 @@ class HSDPParamV2:
 
     @property
     def reduce_partial_output(self) -> Optional[torch.Tensor]:
-        """Return reduce-scatter results accumulated before the final micro-step."""
+        """Return RS results pending replica all-reduce or gradient application."""
         return self._reduce_partial_output
 
     @reduce_partial_output.setter
@@ -1257,16 +1257,21 @@ class HSDPParamV2:
         reduced_grad: torch.Tensor,
         reduce_op: dist.ReduceOp,
     ) -> None:
-        """All-reduce a final gradient over replicated source-layout axes, in place.
+        """All-reduce gradients over non-FSDP replicated axes, in place.
 
         ``reduced_grad`` is modified in place; the caller keeps using its own
         reference and must not expect a returned tensor. No-op when the source
         layout has no replicated mesh axis, so callers may invoke it
         unconditionally.
 
+        The auto_models Trainer needs this reduction for FSDP+TP Norm/Gate
+        gradients, which require SUM over TP regardless of FSDP's reduction.
+        If a source axis needs AVG in the future, carry its reduce_op in
+        source_shard_info instead of reusing the FSDP reduce_op.
+
         Args:
-            reduced_grad: Final local gradient after FSDP/HSDP reduction.
-            reduce_op: Reduction operation shared with the DP communication path.
+            reduced_grad: Gradient to reduce.
+            reduce_op: Reduction operation for the non-FSDP source axes.
         """
         if self.source_shard_info is None or not self.source_shard_info.placements:
             return

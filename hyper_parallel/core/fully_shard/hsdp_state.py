@@ -433,7 +433,8 @@ class HSDPStateV2:
                     prev_group.hsdp_params,
                 )
                 for hsdp_param in prev_group.hsdp_params:
-                    hsdp_param.reduce_scatter_output()
+                    reduced_grad = hsdp_param.reduce_scatter_output()
+                    hsdp_param.all_reduce_source_replicate_grad_inplace(reduced_grad, torch.distributed.ReduceOp.SUM)
                     hsdp_param.clear_reduce_scatter_output()
                     if hsdp_param.unsharded_accumulated_grad_data is not None:
                         hsdp_param.unsharded_accumulated_grad = None
@@ -462,13 +463,12 @@ class HSDPStateV2:
             self.scheduler_ctx.pending_all_reduce_groups.append(prev_group)
 
     def _wait_prev_reduce_scatter_without_all_reduce(self) -> None:
-        """Wait previous RS outputs that do not enter a replicate all-reduce.
+        """Wait RS outputs, accumulate partial results, and clear communication slots.
 
-        When the current micro-step disables all-reduce, outputs accumulate in
-        ``reduce_partial_output`` without being cast or applied to the parameter.
-        On the final synchronized micro-step, the partial result is merged into
-        the current RS output and retained for root-hook finalization.
+        Single-replica partials are applied immediately. Multi-replica partials
+        remain for the existing AllReduceParamGroup to consume before all-reduce.
         """
+        need_synchronize = False
         while self.scheduler_ctx.pre_reduce_scatter_params:
             pre_hsdp_param = self.scheduler_ctx.pre_reduce_scatter_params.pop(0)
             logger.debug(
@@ -477,20 +477,26 @@ class HSDPStateV2:
                 pre_hsdp_param,
             )
             reduced_grad = pre_hsdp_param.reduce_scatter_output()
-            if not self.requires_all_reduce:
-                if pre_hsdp_param.reduce_partial_output is None:
-                    pre_hsdp_param.reduce_partial_output = reduced_grad
-                else:
-                    pre_hsdp_param.reduce_partial_output.add_(reduced_grad)
-                pre_hsdp_param.clear_reduce_scatter_output()
-            elif pre_hsdp_param.reduce_partial_output is not None:
-                reduced_grad.add_(pre_hsdp_param.reduce_partial_output)
+            pre_hsdp_param.all_reduce_source_replicate_grad_inplace(reduced_grad, torch.distributed.ReduceOp.SUM)
+            if pre_hsdp_param.reduce_partial_output is None:
+                pre_hsdp_param.reduce_partial_output = reduced_grad
+            else:
+                pre_hsdp_param.reduce_partial_output.add_(reduced_grad)
+            pre_hsdp_param.clear_reduce_scatter_output()
+
+            if pre_hsdp_param.replicate_world_size <= 1:
+                # No replica all-reduce follows, so accumulate into the parameter
+                # gradient immediately and clear the consumed partial.
+                need_synchronize = (
+                    pre_hsdp_param.apply_reduced_grad(pre_hsdp_param.reduce_partial_output) or need_synchronize
+                )
                 pre_hsdp_param.reduce_partial_output = None
 
             if pre_hsdp_param.unsharded_accumulated_grad_data is not None:
                 pre_hsdp_param.unsharded_accumulated_grad = None
             elif pre_hsdp_param.unsharded_param.grad is not None:
                 pre_hsdp_param.unsharded_param.grad = None
+        self._sync_current_stream_if_needed(need_synchronize)
 
     def wait_and_split_all_reduce_work_groups(self) -> None:
         """Wait fused all-reduce work and expose each parameter result."""
