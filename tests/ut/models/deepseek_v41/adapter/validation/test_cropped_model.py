@@ -22,15 +22,18 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper as torch_checkpoint_wrapper
 from safetensors.torch import save_file
 
 from hyper_parallel.components.checkpoint.quantized_hf_storage import build_quantized_hf_reader
+from hyper_parallel.core.activation_memory.api import checkpoint_exclude_wrapper, checkpoint_wrapper
 from hyper_parallel.models.deepseek_v41.adapter.validation import cropped_model
 from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import (
     build_cropped_deepseek_v41,
     build_deepseek_v41_validation_config,
 )
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41Engram, DeepseekV41ForCausalLM
+from hyper_parallel.tools.model_integration.integration_validator import resolve_model_validation_spec
 
 
 def _write_engram_assets(
@@ -143,6 +146,103 @@ def _write_released_config(directory: str) -> Path:
 
 class TestDeepseekV41ValidationCrop(unittest.TestCase):
     """Depth crops preserve retained model roles and reject inconsistent layouts."""
+
+    def test_shared_state_requirements_follow_retained_layer_roles(self):
+        """Resolve shared-state requirements from actual cropped model roles.
+
+        Feature: Runtime shared-state contracts for configurable depth crops.
+        Description: Resolve real meta models with SWA, Full, Reuse, and Reindex layers.
+        Expectation: Each crop requires only the producer and consumer roles it retains.
+        """
+        full_keys = ("compressed_kv", "index_key", "topk_indices")
+        reuse_keys = ("compressed_kv", "topk_indices")
+        candidate_keys = full_keys + ("candidate_blocks",)
+        cases = (
+            (2, False, (), ()),
+            (4, False, full_keys, reuse_keys),
+            (24, True, candidate_keys, reuse_keys),
+            (40, False, full_keys, full_keys),
+            (40, True, candidate_keys, candidate_keys),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            _write_released_config(directory)
+            assets_path = _write_engram_assets(
+                directory, num_hidden_layers=40, layer_ids=(1,), head_dim=8
+            )
+            for depth, candidates, producer_keys, consumer_keys in cases:
+                with self.subTest(depth=depth, candidates=candidates):
+                    config = build_deepseek_v41_validation_config(
+                        directory, str(assets_path), num_hidden_layers=depth,
+                        text_parameter_divisor=4, exercise_post_training_indexer=False,
+                        enable_candidate_pool=candidates,
+                    )
+                    # Engram hashing reads tensor values during initialization, which meta tensors cannot supply.
+                    config.v41_engram_layer_ids = []
+                    with torch.device("meta"):
+                        model = DeepseekV41ForCausalLM(config)
+
+                    shared_state = resolve_model_validation_spec(model).shared_state
+
+                    self.assertEqual(shared_state.producer_keys, producer_keys)
+                    self.assertEqual(shared_state.consumer_keys, consumer_keys)
+
+    def test_shared_state_requirements_reject_missing_configured_indexer(self):
+        """Reject missing model roles before collecting runtime trace evidence.
+
+        Feature: Runtime shared-state contract integrity.
+        Description: Remove the configured Full-layer Indexer from a real four-layer model.
+        Expectation: Resolution fails instead of dropping the missing producer requirements.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            _write_released_config(directory)
+            assets_path = _write_engram_assets(
+                directory, num_hidden_layers=40, layer_ids=(1,), head_dim=8
+            )
+            config = build_deepseek_v41_validation_config(
+                directory, str(assets_path), num_hidden_layers=4,
+                text_parameter_divisor=4, exercise_post_training_indexer=False,
+            )
+            # Engram hashing reads tensor values during initialization, which meta tensors cannot supply.
+            config.v41_engram_layer_ids = []
+            with torch.device("meta"):
+                model = DeepseekV41ForCausalLM(config)
+            model.model.layers[2].self_attn.indexer = None
+
+            with self.assertRaisesRegex(ValueError, r"Indexer presence at model\.layers\.2\.self_attn"):
+                resolve_model_validation_spec(model)
+
+    def test_shared_state_validation_accepts_checkpoint_wrapped_attention(self):
+        """Inspect actual attention roles underneath supported checkpoint wrappers.
+
+        Feature: Runtime validation after activation-checkpoint wrapping.
+        Description: Wrap real cropped attention with HyperParallel and Torch wrappers.
+        Expectation: Shared-state requirements and canonical module checks remain valid.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            _write_released_config(directory)
+            assets_path = _write_engram_assets(
+                directory, num_hidden_layers=40, layer_ids=(1,), head_dim=8
+            )
+            config = build_deepseek_v41_validation_config(
+                directory, str(assets_path), num_hidden_layers=4,
+                text_parameter_divisor=4, exercise_post_training_indexer=False,
+            )
+            config.v41_engram_layer_ids = []
+            for wrapper in (checkpoint_wrapper, checkpoint_exclude_wrapper, torch_checkpoint_wrapper):
+                with self.subTest(wrapper=wrapper.__module__ + "." + wrapper.__name__):
+                    with torch.device("meta"):
+                        model = DeepseekV41ForCausalLM(config)
+                    model.model.layers[2].self_attn = wrapper(model.model.layers[2].self_attn)
+
+                    spec = resolve_model_validation_spec(model)
+                    canonical = next(
+                        invariant for invariant in spec.state_invariants
+                        if invariant.name == "deepseek_v41.canonical_module_tree"
+                    )
+
+                    self.assertEqual(spec.shared_state.producer_keys, ("compressed_kv", "index_key", "topk_indices"))
+                    self.assertEqual(spec.shared_state.consumer_keys, ("compressed_kv", "topk_indices"))
+                    self.assertIsNone(canonical.checker(model, {}))
 
     def test_pretrained_builder_preserves_config_and_decodes_native_weights(self):
         """Retain training options and decode selected FP8 weights with their scales."""

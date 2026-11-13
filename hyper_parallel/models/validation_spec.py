@@ -131,16 +131,23 @@ class StateInvariantSpec:
 
 @dataclass(frozen=True)
 class SharedStateValidationSpec:
-    """Declare cross-layer state keys and producers that must not be replayed."""
+    """Declare cross-layer state keys and producers that must not be replayed.
+
+    ``required_keys_for_model`` optionally resolves producer and consumer keys
+    from the final model before tracing. Otherwise the static keys are used.
+    """
 
     producer_keys: tuple[str, ...]
     consumer_keys: tuple[str, ...]
     begin_trace: Optional[Callable[[], Any]] = None
     finish_trace: Optional[Callable[[Any], tuple[dict[str, Any], ...]]] = None
+    required_keys_for_model: Optional[Callable[[Any], tuple[tuple[str, ...], tuple[str, ...]]]] = None
 
     def __post_init__(self) -> None:
         if (self.begin_trace is None) != (self.finish_trace is None):
             raise ValueError("shared-state tracing requires both begin_trace and finish_trace")
+        if self.required_keys_for_model is not None and not callable(self.required_keys_for_model):
+            raise TypeError("required_keys_for_model must be callable")
 
 
 @dataclass(frozen=True)
