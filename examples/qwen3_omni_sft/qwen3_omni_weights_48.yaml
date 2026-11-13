@@ -1,0 +1,99 @@
+# Qwen3-Omni-30B-A3B full-48-layer SFT with REAL downloaded weights on 8x 910B2.
+# Loads via HyperAutoModelForMultimodalLM.from_pretrained from a config dir with
+# enable_audio_output=false (thinker only; talker/code2wav tensors ignored).
+# Determinism + parity settings for cross-run comparison:
+#   seed 42, full 48 layers, max_seq_len 512, global_batch 8 / micro 1 / dp 8,
+#   AdamW lr 1e-5 cosine warmup 0, max_grad_norm 1.0, bf16.
+model:
+  _target_: hyper_parallel.models._transformers.HyperAutoModelForMultimodalLM.from_pretrained
+  pretrained_model_name_or_path: /data/qwen3_omni/Qwen3-Omni-30B-A3B-Instruct
+  torch_dtype: bfloat16
+  attn_implementation: eager
+  force_hf: true
+  local_files_only: true
+  ignore_mismatched_sizes: true
+  validate_placement: false
+
+model_init_dtype: bfloat16
+
+training:
+  train_iters: 16
+  eval_iters: 0
+  global_batch_size: 8
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: false
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 8
+  enable_offload: false
+  reshard_after_forward: true
+  reshard_after_backward: true
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: full
+
+dataset:
+  training_mode: sft
+  _target_: hyper_parallel.data.vlm.build_vlm_dataset
+  data_path: /data/qwen3_omni/datasets/scienceqa/converted/train.json
+  data_config:
+    source_type: online
+  model_assets:
+    _target_: hyper_parallel.data.omni.build_auto_processor
+    pretrained_model_name_or_path: /data/qwen3_omni/Qwen3-Omni-30B-A3B-Instruct
+    local_files_only: true
+  data_transform:
+    _target_: hyper_parallel.models.qwen3_omni.adapter.data.transform_fn.build_qwen3_omni_transform
+    max_seq_len: 512
+
+dataloader:
+  _target_: hyper_parallel.data.batching.build_dataloader.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.vlm.build_vlm_collator
+  get_batch:
+    _target_: hyper_parallel.data.vlm.build_vlm_get_batch
+  sampler_type: single
+  drop_last: true
+  num_workers: 0
+  pin_memory: false
+
+optimizer:
+  _target_: hyper_parallel.components.optim.builders.AdamW
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.0
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.lr_scheduler.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr_warmup_steps: 0
+    min_lr: 0.0
+
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ""
+  restore_from: null
+
+debug:
+  check_nan_inf: true
+  check_dataset: null
