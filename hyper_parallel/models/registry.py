@@ -126,6 +126,10 @@ _FAMILY_DIR_ALIASES = {
     # registered from ``models/kimi_k26/``.
     "kimik25": "kimi_k26",
     "qwen35moetext": "qwen3_5_moe",
+    # Qwen3-Omni: the HF checkpoint's ``model_type`` (qwen3_omni_moe) carries
+    # the MoE suffix the family directory ``models/qwen3_omni/`` does not —
+    # the family also covers Qwen2.5-Omni's thinker forward.
+    "qwen3omnimoe": "qwen3_omni",
 }
 
 # A provider directory normally does not rename the copied upstream modeling

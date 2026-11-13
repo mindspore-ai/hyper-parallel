@@ -461,11 +461,6 @@ def _finalize_model_loading(
         missing_keys=tuple(sorted(missing_keys)),
         unexpected_keys=tuple(sorted(unexpected_keys)),
     )
-    if initialization_targets:
-        logger.info(
-            "ParityDebug initialized tensors = %s",
-            [getattr(t, "fqn", str(t)) for t in initialization_targets],
-        )
     logger.info(
         "Finalized pretrained model state: loaded=%d initialized=%d ignored_missing=%d "
         "ignored_unexpected=%d unresolved_missing=%d unexpected=%d",

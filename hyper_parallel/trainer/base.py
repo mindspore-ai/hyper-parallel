@@ -405,17 +405,6 @@ class BaseTrainer(Stateful, ABC):
                 "Model config:\n%s",
                 json.dumps(self.model.config.to_dict(), indent=2),
             )
-        # model_init_dtype cast downcasts the omni derived positional buffers too;
-        # stock 4.57.1 keeps them fp32 (CPU-computed), so restore them.
-        # Fail loudly: with the buffers left in bf16 the run does not crash, it
-        # silently trains with degraded RoPE/embedding precision.
-        try:
-            from hyper_parallel.models._transformers.model_builder import (  # noqa: PLC0415
-                _restore_omni_derived_buffer_fp32,
-            )
-            _restore_omni_derived_buffer_fp32(self.model)
-        except Exception:  # pylint: disable=broad-exception-caught
-            logger.warning("omni derived-buffer fp32 restore failed", exc_info=True)
         if self.config.accelerator.loss_parallel:
             self.model.loss_function = causal_lm_loss_parallel
         model_parts = getattr(self.model, "parts", None)
