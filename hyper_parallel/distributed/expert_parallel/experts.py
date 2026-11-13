@@ -36,6 +36,7 @@ import logging
 import math
 import os
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Any, Callable, NamedTuple, Optional
 import torch
 import torch.distributed as dist
@@ -44,6 +45,7 @@ import torch.nn.functional as F
 from hyper_parallel.components.functional.npu_grouped_swiglu import (
     npu_grouped_swiglu,
 )
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.distributed._builder.forward_rewriter import (
     _install_bound_forward,
 )
@@ -63,6 +65,12 @@ from hyper_parallel.distributed.expert_parallel.collectives import (
     ep_all_to_all_async,
     ep_split_sizes,
     wait_ep_all_to_all,
+)
+from hyper_parallel.distributed.expert_parallel.moonep import run_moonep_experts
+from hyper_parallel.distributed.expert_parallel.moonep_dedup import compile_token_dedup
+from hyper_parallel.distributed.expert_parallel.moonep_planner import compile_plan, select_allocation
+from hyper_parallel.distributed.expert_parallel.moonep_runtime import (
+    MoonEPExecution, checkpoint_execution, get_transport,
 )
 
 
@@ -304,11 +312,45 @@ def _get_global_expert_count(module):
     )
 
 
+def _local_moonep_expert_forward(
+    experts, hidden: torch.Tensor, execution: MoonEPExecution, scores: torch.Tensor,
+) -> torch.Tensor:
+    """Run MoonEP inside the same nested expert boundary as ordinary EP."""
+    def read_weights() -> tuple[torch.Tensor, torch.Tensor]:
+        """Read the local expert parameters restored by the current FSDP boundary."""
+        # The forward wrapper unwraps DTensors temporarily. Backward reads the
+        # local data of the parameters restored by the FSDP pre-backward hook.
+        gate, down = experts.gate_up_proj, experts.down_proj
+        if isinstance(gate, DTensor):
+            gate = gate.to_local()
+        if isinstance(down, DTensor):
+            down = down.to_local()
+        return gate, down
+
+    activation = (  # pylint: disable=protected-access
+        experts._ep_apply_gate or getattr(experts, "activation_func", None)
+    )
+    if activation is None:
+        # torch_npu is optional for callers importing generic Expert Parallel on CPU.
+        from hyper_parallel.components.functional.swiglu import swiglu  # pylint: disable=import-outside-toplevel
+
+        activation = swiglu
+    execution.fsdp = getattr(experts, "hsdp_scheduler", None) is not None
+    return run_moonep_experts(
+        hidden, execution, scores, read_weights, activation, getattr(experts, "is_transposed", False),
+    )
+
+
 def bind_local_expert_forward(
     module: Any,
     ep_size: int,
     use_grouped_gemm: bool = False,
     apply_gate: Optional[Callable] = None,
+    *,
+    use_moonep: bool = False,
+    moonep_token_dedup: bool = True,
+    moonep_replica_capacity: Optional[int] = None,
+    moonep_prefetch_depth: int = 1,
 ) -> None:
     """Install the local expert compute entry used by TP-extend-EP.
 
@@ -318,6 +360,18 @@ def bind_local_expert_forward(
     point) so nested FSDP hooks unshard/reshard around the local SwiGLU
     computation. ``apply_gate`` supplies model-specific fused gate/up
     semantics when the default activation-times-up rule is insufficient.
+    MoonEP defaults to token deduplication, E/EP remote expert slots, and one
+    earlier invocation prefetched during backward when FSDP is absent.
+
+    Args:
+        module: MoE block exposing stacked expert parameters.
+        ep_size: Number of ranks owning the global experts.
+        use_grouped_gemm: Select the native grouped expert implementation.
+        apply_gate: Optional model-specific packed gate activation.
+        use_moonep: Select collective MoonEP execution.
+        moonep_token_dedup: Send unique token/destination vectors.
+        moonep_replica_capacity: Remote expert slots per rank; None means E/EP.
+        moonep_prefetch_depth: Earlier calls to prefetch without FSDP.
     """
     if getattr(module.experts, "requires_ep_grouped_gemm", False) and not use_grouped_gemm:
         raise ValueError(
@@ -343,7 +397,7 @@ def bind_local_expert_forward(
                 f"{type(module).__name__}: unsupported expert activation {hidden_act!r}; "
                 "provide experts.act_fn or extend the EP activation registry"
             )
-    if apply_gate is not None and use_grouped_gemm:
+    if apply_gate is not None and use_grouped_gemm and not use_moonep:
         raise ValueError("custom expert gate activation is not supported by grouped GEMM")
     # ``_ep_*`` is the contract the local compute path reads back off the module's
     # experts child; setting them here is the point of the binder.
@@ -351,10 +405,32 @@ def bind_local_expert_forward(
     module.experts._ep_act_fn = activation
     module.experts._ep_apply_gate = apply_gate
     module.experts._ep_use_grouped_gemm = use_grouped_gemm
+    module.experts._ep_use_moonep = use_moonep
     # The forward write itself lives in the forward rewriter (05 §15.2.3:
     # the single MethodType/assignment site); this binder only sets the
     # companion attributes above.
-    _install_bound_forward(module.experts, _local_swiglu_expert_forward)
+    if use_moonep:
+        require_attrs(module.experts, "gate_up_proj", "down_proj", owner="MoonEP")
+        capacity = _validate_moonep_options(
+            moonep_token_dedup, moonep_replica_capacity, moonep_prefetch_depth, module.experts.local_expert_count,
+        )
+        module.experts._moonep_token_dedup = moonep_token_dedup
+        module.experts._moonep_replica_capacity = capacity
+        module.experts._moonep_prefetch_depth = moonep_prefetch_depth
+        _install_bound_forward(module.experts, _local_moonep_expert_forward)
+    else:
+        _install_bound_forward(module.experts, _local_swiglu_expert_forward)
+
+
+def _validate_moonep_options(token_dedup, replica_capacity, prefetch_depth, local_experts):
+    """Resolve default replica slots and validate the public MoonEP options."""
+    if not isinstance(token_dedup, bool):
+        raise ValueError("moonep_token_dedup must be a boolean")
+    capacity = local_experts if replica_capacity is None else replica_capacity
+    for name, value in (("moonep_replica_capacity", capacity), ("moonep_prefetch_depth", prefetch_depth)):
+        if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
+            raise ValueError(f"{name} must be a nonnegative integer")
+    return capacity
 
 
 def _resolve_capacity_factor(module: Any) -> Optional[float]:
@@ -1092,6 +1168,9 @@ def ep_routed_forward(
     expert dim -- each rank holds num_experts/ep_size complete experts, so
     there is no all_gather/reduce_scatter pair.
     """
+    if getattr(module.experts, "_ep_use_moonep", False):
+        topk_indices, topk_weights = router_fn(module, hidden_states)
+        return _moonep_routed_forward(module.experts, hidden_states, topk_indices, topk_weights, ep_group)
     ep_size = ep_group.size()
     ep_rank = dist.get_rank(group=ep_group)
     local_expert_count = module.experts.local_expert_count
@@ -1139,6 +1218,35 @@ def ep_routed_forward(
         unpermute_indices=dispatch.unpermute_indices,
         routing_weights=dispatch.routing_weights,
     )
+
+
+def _moonep_routed_forward(experts, hidden, topk_indices, topk_weights, group):
+    # NPU token unpermute is optional in the generic EP import path.
+    from hyper_parallel.components.functional.moe_token_unpermute import (  # pylint: disable=import-outside-toplevel
+        moe_token_unpermute,
+    )
+
+    def create_execution() -> MoonEPExecution:
+        """Compile one route and its optional token/destination compression map."""
+        with torch.no_grad(), torch.profiler.record_function("moonep::planner"):
+            ids = topk_indices.reshape(-1).long()
+            ranks = group.size()
+            local = _expert_token_counts(ids, experts.local_expert_count * ranks)
+            gathered = local.new_empty(ranks * local.numel())
+            dist.all_gather_into_tensor(gathered, local, group=group)
+            counts = gathered.cpu().numpy().reshape(ranks, -1)
+            allocation = select_allocation(counts, experts._moonep_replica_capacity)
+            plan = compile_plan(counts, allocation, ids, dist.get_rank(group=group))
+            dedup = compile_token_dedup(plan, topk_indices.shape[-1], group) if experts._moonep_token_dedup else None
+        return MoonEPExecution(plan, get_transport(group, hidden.device), dedup, experts._moonep_prefetch_depth)
+
+    execution = checkpoint_execution(experts, create_execution)
+    if execution.plan.source_order.numel() != topk_indices.numel():
+        raise RuntimeError("MoonEP recomputation changed the number of routed selections")
+    returned = experts(hidden.reshape(-1, hidden.shape[-1]), execution, topk_weights)
+    if execution.dedup is not None:
+        return returned.reshape_as(hidden)
+    return moe_token_unpermute(returned, execution.plan.source_inverse, topk_weights).reshape_as(hidden)
 
 
 class _EPRoutedChunks(NamedTuple):

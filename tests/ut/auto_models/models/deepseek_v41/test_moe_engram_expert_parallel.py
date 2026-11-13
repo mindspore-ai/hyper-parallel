@@ -31,6 +31,8 @@ try:
 except ImportError as exc:
     raise unittest.SkipTest(f"DeepSeek-V4 Transformers dependency unavailable: {exc}") from exc
 
+from tests.common.mark_utils import arg_mark
+
 from hyper_parallel.components import functional as hp_functional
 from hyper_parallel.distributed._builder.rule_resolver import _resolve_local_compute_fn
 from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
@@ -272,6 +274,8 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
         old_result = functional.silu(gate) * up
         self.assertNotEqual(actual.item(), old_result.item())
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="dryrun", essential_mark="essential")
     def test_ep_grouped_path_binds_model_owned_forward(self) -> None:
         """
         Feature: Model-owned grouped EP execution.
@@ -293,7 +297,10 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
             )
         self.assertTrue(callable(compute))
         self.assertIs(experts.forward_expert_major.__func__, _deepseek_v41_grouped_expert_forward)
-        bind.assert_called_once_with(module, 2, use_grouped_gemm=True, apply_gate=None)
+        bind.assert_called_once_with(
+            module, 2, use_grouped_gemm=True, apply_gate=None, use_moonep=False,
+            moonep_token_dedup=True, moonep_replica_capacity=None, moonep_prefetch_depth=1,
+        )
 
     def test_yaml_override_selects_grouped_or_eager_factory(self) -> None:
         """
@@ -346,6 +353,32 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
         self.assertEqual(entries_to_plan_overrides([entry], ep_size=1), {})
         self.assertIn("*.mlp", entries_to_plan_overrides([entry], ep_size=2))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="dryrun", essential_mark="essential")
+    def test_moonep_configuration_reaches_expert_boundary(self) -> None:
+        """
+        Feature: MoonEP adapter configuration.
+        Description: Apply defaults and explicit zero/custom replica settings.
+        Expectation: The expert boundary receives all requested MoonEP options.
+        """
+        for options, expected in (({}, (True, 2, 1)),
+                                  ({"moonep_token_dedup": False, "moonep_replica_capacity": 0,
+                                    "moonep_prefetch_depth": 2}, (False, 0, 2))):
+            with self.subTest(options=options):
+                experts = DeepseekV4Experts(_expert_config())
+                module = SimpleNamespace(gate=Mock(), experts=experts, shared_experts=Mock(), is_hash=False,
+                                         forward=lambda hidden_states, input_ids=None: hidden_states)
+                ep_mesh = Mock()
+                ep_mesh.__getitem__ = Mock(return_value=SimpleNamespace(size=lambda: 2))
+                deepseek_v41_ep_compute_fn(module=module, mesh=None, tp_mesh=None, cp_mesh=None,
+                                           ep_mesh=ep_mesh, use_moonep=True, **options)
+                actual = (experts._moonep_token_dedup, experts._moonep_replica_capacity,
+                          experts._moonep_prefetch_depth)
+                self.assertEqual(actual, expected)
+                self.assertTrue(experts._ep_use_moonep)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="dryrun", essential_mark="essential")
     def test_eager_path_retains_source_gate(self) -> None:
         """
         Feature: Eager expert activation compatibility.
@@ -369,4 +402,6 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
         bind.assert_called_once_with(
             module, 2, use_grouped_gemm=False,
             apply_gate=experts._apply_gate,  # pylint: disable=protected-access
+            use_moonep=False, moonep_token_dedup=True,
+            moonep_replica_capacity=None, moonep_prefetch_depth=1,
         )
