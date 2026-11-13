@@ -25,6 +25,7 @@ AutoModels objects and never imports trainer config (05 §15.2.6).
 
 import fnmatch
 import logging
+import math
 from typing import Any, Dict, Literal, Optional, Union
 
 import torch
@@ -41,7 +42,9 @@ from hyper_parallel.models._transformers.checkpoint_loader import (
 from hyper_parallel.models.build_options import CompileConfig
 from hyper_parallel.models.materialization import (
     MaterializationContext,
+    fp32_rebuildable_buffer_ids,
     rebuild_materialized_state,
+    restore_fp32_rebuildable_buffers,
 )
 from hyper_parallel.distributed.activation_checkpoint import (
     _apply_activation_checkpointing,
@@ -841,6 +844,7 @@ def _validate_model_state_dtype(
     external = get_model_external_state(model)
     external_ids = {id(parameter) for parameter in external.parameters.values()} if external is not None else set()
     fp32_ids = _model_fp32_parameter_ids(model)
+    fp32_buffer_ids = fp32_rebuildable_buffer_ids(model)
     mismatched = [
         name
         for name, tensor in model.named_parameters(remove_duplicate=False)
@@ -849,7 +853,9 @@ def _validate_model_state_dtype(
     ]
     mismatched.extend(
         name for name, tensor in model.named_buffers(remove_duplicate=False)
-        if tensor.is_floating_point() and tensor.dtype != target_dtype
+        if tensor.is_floating_point()
+        and id(tensor) not in fp32_buffer_ids
+        and tensor.dtype != target_dtype
     )
     if mismatched:
         raise RuntimeError(
@@ -921,6 +927,18 @@ def apply_model_init_dtype(
             raise RuntimeError(
                 "Model initialization dtype conversion changed a DTensor layout"
             )
+
+    # Family-declared float32 derived buffers (rebuildable with an fp32
+    # source) keep their declared precision across the cast: stock modeling
+    # computes them in fp32 and the forward implicitly re-widens from the
+    # stored value, so bf16 storage pre-rounds every position-dependent
+    # logit. Fail loudly rather than silently degrade precision.
+    restored = restore_fp32_rebuildable_buffers(model)
+    if restored:
+        logger.info(
+            "Kept %d family-declared derived buffers in float32: %s",
+            len(set(restored)), sorted(set(restored)),
+        )
 
     _refresh_hsdp_precision_state(model)
     _validate_model_state_dtype(model, target_dtype)

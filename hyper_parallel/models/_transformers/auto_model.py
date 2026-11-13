@@ -18,7 +18,11 @@ Following design doc 01_hf_compatibility_layer.md §6.
 Stub — provides from_pretrained/from_config as entry points.
 """
 
+import json
 import logging
+import os
+from dataclasses import is_dataclass, replace
+from types import SimpleNamespace
 from typing import Any, Literal, Optional, Union
 
 import torch
@@ -29,6 +33,18 @@ from transformers import (
     PretrainedConfig,
     PreTrainedModel,
 )
+
+# ``AutoModelForMultimodalLM`` was introduced in transformers 5.x. On older
+# installs the omni-class architectures map instead under
+# ``AutoModelForTextToWaveform`` (MODEL_FOR_TEXT_TO_WAVEFORM_MAPPING_NAMES).
+# Pick whichever the installed transformers exposes so
+# ``HyperAutoModelForMultimodalLM`` resolves a valid HF parent on both.
+try:
+    from transformers import AutoModelForMultimodalLM  # pylint: disable=import-outside-toplevel
+except ImportError:  # pragma: no cover - depends on installed transformers version
+    from transformers import (  # pylint: disable=import-outside-toplevel
+        AutoModelForTextToWaveform as AutoModelForMultimodalLM,
+    )
 
 from hyper_parallel.components.checkpoint.huggingface_checkpointer import resolve_hf_loader
 from hyper_parallel.components.checkpoint.weight_verifier import verify_hf_weights as check_hf_weights
@@ -489,3 +505,103 @@ class HyperAutoModelForImageTextToText(_BaseHyperAutoModelClass, AutoModelForIma
 
 class HyperAutoModelForSequenceClassification(_BaseHyperAutoModelClass, AutoModelForSequenceClassification):
     """Hyper-Parallel SequenceClassification."""
+
+
+class HyperAutoModelForMultimodalLM(_BaseHyperAutoModelClass, AutoModelForMultimodalLM):
+    """Hyper-Parallel multimodal LM — equivalent to AutoModelForMultimodalLM.
+
+    Covers architectures registered in Transformers' multimodal-LM mapping that
+    the image-text-to-text / causal-LM auto classes do not cover (e.g.
+    ``*OmniMoeForConditionalGeneration`` thinker/talker wrappers).
+    The HF-native path (``force_hf=True``) loads the stock Transformers model.
+
+    Some ``*ForConditionalGeneration`` wrappers in this class are
+    generation-only: they expose ``generate`` but no training ``forward`` —
+    the trainable module is the ``thinker`` submodule, which computes the LM
+    loss from ``labels``. When audio output is disabled the talker/code2wav
+    are not built, so the wrapper holds only the thinker. The owning family
+    adapter applies any required stock-modeling fixes (delegating
+    ``forward``, packed audio, patch-embed Linear, deepstack masks) through
+    its registered ``stock_model_patches`` provider.
+    """
+
+    @classmethod
+    def from_pretrained(cls, *args: Any, **kwargs: Any) -> PreTrainedModel:
+        """Apply family stock-model patches, then load via the shared path.
+
+        The patch set is family-scoped and idempotent; families without a
+        patch module are untouched (the import is guarded on the model type
+        resolving to a registered family).
+        """
+        _apply_family_model_patches(*args, **kwargs)
+        return super().from_pretrained(*args, **kwargs)
+
+
+def _apply_family_model_patches(*args: Any, **kwargs: Any) -> None:
+    """Run the target family's stock-model patch set, when one exists.
+
+    Resolves the family from the ``from_pretrained`` source (the HF
+    checkpoint id or config) through the model registry; a family that
+    registers no ``stock_model_patches`` provider (the default for every
+    family) is a no-op. This keeps the shared auto-model free of per-family
+    knowledge: the registry, not this module, decides what runs.
+
+    The source may arrive positionally or as the
+    ``pretrained_model_name_or_path`` keyword — config-driven trainers
+    (Hydra ``_target_: ...from_pretrained``) build the call from a mapping.
+    """
+    from hyper_parallel.models.registry import get_model_adapter  # pylint: disable=import-outside-toplevel
+
+    source = args[0] if args else kwargs.get("pretrained_model_name_or_path")
+    if source is None:
+        return
+    model_type = _resolve_model_type_hint(source)
+    if model_type is None:
+        return
+    adapter = get_model_adapter(model_type)
+    if adapter is None:
+        return
+    patches = getattr(adapter, "stock_model_patches", None)
+    if patches is None:
+        return
+    patches()
+
+
+def _resolve_model_type_hint(source: Any) -> Optional[str]:
+    """Best-effort model_type/architecture hint from a ``from_pretrained`` arg.
+
+    A string is treated as a checkpoint path: its ``config.json`` (when
+    readable) provides ``model_type``/``architectures``; the directory name
+    is the fallback hint. An HF ``PretrainedConfig`` (or any object exposing
+    ``model_type`` / ``architectures``) is read directly.
+    """
+    from hyper_parallel.models.registry import get_model_adapter  # pylint: disable=import-outside-toplevel
+
+    hints = []
+    if isinstance(source, str):
+        hints.append(source.rstrip("/").split("/")[-1])
+        config_path = os.path.join(source, "config.json")
+        try:
+            with open(config_path, encoding="utf-8") as handle:
+                summary = json.load(handle)
+        except (OSError, ValueError):
+            summary = None
+        if isinstance(summary, dict):
+            model_type = summary.get("model_type")
+            if isinstance(model_type, str):
+                hints.append(model_type)
+            for architecture in summary.get("architectures") or []:
+                if isinstance(architecture, str):
+                    hints.append(architecture)
+    else:
+        config = getattr(source, "config", source)
+        model_type = getattr(config, "model_type", None)
+        if isinstance(model_type, str):
+            hints.append(model_type)
+        for architecture in getattr(config, "architectures", None) or []:
+            if isinstance(architecture, str):
+                hints.append(architecture)
+    for hint in hints:
+        if get_model_adapter(hint) is not None:
+            return hint
+    return None

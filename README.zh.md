@@ -47,9 +47,49 @@ HyperParallel 面向昇腾超节点提供分布式并行加速能力。针对资
 
 ## 📣 最新消息
 
+- [Nov, 12, 2026]: [Qwen/Qwen3-Omni-30B-A3B 模型支持](hyper_parallel/models/qwen3_omni/recipes/train.yaml)
 - [Oct. 15, 2026]: [DeepSeek-V4.1-Flash 模型支持](docs/deepseek_v41_article/README.zh.md)
-- [Oct, 9, 2026]: [moonshotai/Kimi-K2.6 模型支持](hyper_parallel/models/kimi_k26/README.zh.md)
-- [Aug. 25, 2026]: [Qwen/Qwen3-30B-A3B 模型支持](examples/training_demo/README.md#full-pretrained-model)
+- [Oct, 9, 2026]: [moonshotai/Kimi-K2.6 模型支持](hyper_parallel/models/kimi_k26/recipes/train.yaml)
+- [Aug. 25, 2026]: [Qwen/Qwen3-30B-A3B 模型支持](hyper_parallel/models/qwen3_moe/recipes/train.yaml)
+
+---
+
+## 使用入口
+
+### HyperParallel 模型训练
+
+> [HyperParallel 模型](hyper_parallel/models/README.zh.md) 面向训练用户，通过 YAML 配置 Hugging Face 模型、数据、优化器、并行策略以及保存与恢复方式。
+>
+> 已支持的模型与配置入口见[支持模型](#supported-models)。
+
+### HyperParallel Core
+
+> [HyperParallel Core](docs/api/api_reference.zh.md) 面向模型作者和框架开发者，提供从分布式模型构建到训练执行与状态管理的底层能力。
+>
+> **核心能力**
+>
+> - **模型切分与并行组合**：以 DeviceMesh、DTensor 和 Shard 描述设备拓扑与 Tensor 布局，并组合 FSDP/HSDP、TP、CP、EP、PP 等并行策略。
+> - **MoE 与异构执行**：覆盖专家切分、路由和 token dispatch，以及流水线调度、集群 MPMD 和芯片内多核 MPMD。
+> - **内存与性能优化**：提供 Activation Checkpoint、Activation Swap、通信与计算重叠、通信融合和自动并行能力。
+> - **训练与状态管理**：提供优化器、分布式检查点、异步保存、离线格式转换和确定性训练能力。
+>
+> <details>
+> <summary><strong>相关文档</strong></summary>
+>
+> - **模型切分**：[DTensor](docs/api/api_reference.zh.md#dtensor-分布式张量) · [FSDP/HSDP](docs/guide/fsdp.zh.md) · [TP](docs/guide/tensor_parallel.zh.md)
+> - **并行执行**：[CP](docs/guide/context_parallel.zh.md) · [EP / MoE](docs/guide/expert_parallel.zh.md) · [PP / 集群 MPMD](docs/guide/pipeline_parallel.zh.md) · [多核 MPMD](hyper_parallel/core/multicore/README.zh.md)
+> - **内存与性能**：[Activation Checkpoint / Swap](docs/guide/activation_checkpoint.zh.md) · [通信与计算重叠](docs/guide/pipeline_parallel_overlap_b_f.zh.md) · [通信融合](docs/guide/fsdp.zh.md#通信融合) · [自动并行](docs/guide/auto_parallel.zh.md)
+> - **训练与状态**：[Optimizer](docs/guide/optimizer.zh.md) · [DCP](docs/guide/distributed_checkpoint.zh.md) · [确定性调试](docs/faq.zh.md#3-确定性模式调试)
+>
+> </details>
+>
+> <br>
+>
+> <details>
+> <summary><strong>未来计划</strong></summary>
+>
+> </details>
+>>>>>>> theirs
 
 ---
 
@@ -65,6 +105,7 @@ HyperParallel 面向昇腾超节点提供分布式并行加速能力。针对资
 | Qwen3 | [模型入口](hyper_parallel/models/qwen3) |
 | Qwen3-MoE | [recipes](hyper_parallel/models/qwen3_moe/recipes) |
 | Qwen3-VL-MoE | [模型适配](hyper_parallel/models/qwen3_vl_moe) |
+| Qwen3-Omni | [模型适配](hyper_parallel/models/qwen3_omni) |
 | Qwen3.5 Dense | [模型入口](hyper_parallel/models/qwen3_5) |
 | DeepSeek-V3 | [recipes](hyper_parallel/models/deepseek_v3/recipes) |
 | DeepSeek-V3.2 | [recipes](hyper_parallel/models/deepseek_v32/recipes) |
