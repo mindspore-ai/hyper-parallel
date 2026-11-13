@@ -47,7 +47,7 @@ HyperParallel 面向昇腾超节点提供分布式并行加速能力。针对资
 
 ## 📣 最新消息
 
-- [Oct. 15, 2026]: [DeepSeek-V4.1-Flash 模型支持](docs/deepseek_v41_article/README.zh.md)
+- [Oct. 15, 2026]: [DeepSeek-V4.1-Flash 模型支持](hyper_parallel/models/deepseek_v41/README.zh.md)
 - [Oct, 9, 2026]: [moonshotai/Kimi-K2.6 模型支持](hyper_parallel/models/kimi_k26/README.zh.md)
 - [Aug. 25, 2026]: [Qwen/Qwen3-30B-A3B 模型支持](examples/training_demo/README.md#full-pretrained-model)
 
@@ -68,8 +68,8 @@ HyperParallel 面向昇腾超节点提供分布式并行加速能力。针对资
 | Qwen3.5 Dense | [模型入口](hyper_parallel/models/qwen3_5) |
 | DeepSeek-V3 | [recipes](hyper_parallel/models/deepseek_v3/recipes) |
 | DeepSeek-V3.2 | [recipes](hyper_parallel/models/deepseek_v32/recipes) |
-| DeepSeek-V4.1 | [文本配置](examples/training_demo/deepseek_v41/train_deepseek_v41_online.yaml) · [多模态配置](examples/training_demo/deepseek_v41/train_deepseek_v41_vlm_online.yaml) |
-| Kimi-K2.6 | [recipes](hyper_parallel/models/kimi_k26/recipes) |
+| DeepSeek-V4.1 | [训练指南](hyper_parallel/models/deepseek_v41/README.zh.md) |
+| Kimi-K2.6 | [训练指南](hyper_parallel/models/kimi_k26/README.zh.md) |
 | openPangu-2.0 | [代码仓](https://gitcode.com/ascend-tribe/openPangu-2.0-Training) |
 
 ---
