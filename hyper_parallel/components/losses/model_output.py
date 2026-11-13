@@ -26,7 +26,17 @@ from hyper_parallel.data.constants import IGNORE_INDEX
 
 
 class ModelOutputLoss(torch.nn.Module):
-    """Return the loss field from a Transformers-style model output."""
+    """Return the loss field from a Transformers-style model output.
+
+    The value the model reports is the mean over its own valid targets, so the
+    module declares ``token_mean`` normalization. Standalone evaluation reads
+    that declaration to turn the value into a token-weighted numerator; a
+    replacement loss that reports a sum or an already-reduced value must
+    declare its own normalization instead of inheriting this one silently.
+    """
+
+    #: How this loss's reported value is normalized across valid targets.
+    loss_normalization = "token_mean"
 
     def forward(  # pylint: disable=unused-argument
         self,
