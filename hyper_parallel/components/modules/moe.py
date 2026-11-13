@@ -44,6 +44,7 @@ from torch import nn
 
 from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_swiglu
 from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.components.modules.chunked_moe import chunked_moe
 
 
 def _is_npu_tensor(tensor: torch.Tensor) -> bool:
@@ -448,6 +449,21 @@ class TokenChoiceTopKRouter(nn.Module):
         )
         return top_scores, selected_experts, num_tokens_per_expert
 
+    def scores_for_selected(self, x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        """Recompute differentiable scores for the original discrete routing plan.
+
+        Args:
+            x: Original source chunk [tokens, hidden].
+            indices: Original selected expert IDs [tokens, top_k].
+
+        Returns:
+            Unbiased selected scores. Selection-only group masks and expert bias
+            do not change the gathered probabilities and are not recomputed.
+        """
+        scores = self.gate(x).float()
+        scores = torch.sigmoid(scores) if self.score_func == "sigmoid" else F.softmax(scores, dim=-1)
+        return (scores * self.route_scale).gather(1, indices)
+
     def _get_node_limited_routing_scores(self, scores: torch.Tensor) -> torch.Tensor:
         """Mask out low-scoring expert groups (node-limited routing).
 
@@ -658,6 +674,10 @@ class MoE(nn.Module):
         use_grouped_mm: If ``True``, uses a hardware-accelerated grouped
             matmul kernel (e.g. ``npu_grouped_matmul``) inside
             :class:`GroupedExperts`.  Defaults to ``False``.
+        chunk_size: Optional source-token chunk size for complete first-order
+            training. Uses the original parameters, routing and EP layout.
+            Requires score-after experts; NPU requires BF16 grouped kernels.
+            Defaults to ``None`` (original whole-input execution).
 
     Note:
         *Auxiliary-loss-free load balancing*: call :func:`update_expert_bias`
@@ -683,6 +703,7 @@ class MoE(nn.Module):
         shared_expert: FeedForward | None = None,
         router_kwargs: dict | None = None,
         use_grouped_mm: bool = False,
+        chunk_size: int | None = None,
     ) -> None:
         """Initialize MoE block with experts, router and optional shared expert.
 
@@ -697,8 +718,20 @@ class MoE(nn.Module):
             shared_expert: Optional shared expert applied to all tokens.
             router_kwargs: Additional keyword arguments for the router.
             use_grouped_mm: Whether to use grouped matrix multiplication.
+            chunk_size: Optional source-token chunk size for complete first-order
+                training. Requires score-after experts, BF16 grouped NPU kernels
+                or CPU reference execution. Does not replace model parameters.
+                FSDP must wrap this whole module or a parent. Outer MoE checkpoint,
+                TP and repeated backward are unsupported.
         """
         super().__init__()
+        if chunk_size is not None and (
+            not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size <= 0
+        ):
+            raise ValueError("chunk_size must be a positive integer or None.")
+        if chunk_size is not None and score_before_experts:
+            raise ValueError("Chunk MoE requires score_before_experts=False.")
+        self.chunk_size = chunk_size
         router_kw = router_kwargs or {}
         self.experts = GroupedExperts(
             dim=dim, hidden_dim=hidden_dim, num_experts=num_experts,
@@ -795,6 +828,15 @@ class MoE(nn.Module):
             gradient injection is handled automatically by
             :class:`MoEAuxLossAutoScaler`).
         """
+        if self.chunk_size is not None and self.training:
+            # Expert forwards are bypassed; router forward/scores_for_selected remain explicit extension points.
+            # pylint: disable=unidiomatic-typecheck
+            if type(self.experts) is not GroupedExperts or not isinstance(self.router, TokenChoiceTopKRouter):
+                raise TypeError("Chunk MoE requires the common GroupedExperts and TokenChoiceTopKRouter.")
+            if self.shared_expert is not None and type(self.shared_expert) is not FeedForward:
+                raise TypeError("Chunk MoE requires the common FeedForward shared expert.")
+            return chunked_moe(self, x, _run_experts_for_loop, MoEAuxLossAutoScaler)
+            # pylint: enable=unidiomatic-typecheck
         bs, seq_len, dim = x.shape
         num_tokens = bs * seq_len
         x_flat = x.view(num_tokens, dim)  # [num_tokens, dim]
@@ -837,9 +879,10 @@ class MoE(nn.Module):
         # --- Expert computation ---
         if self.score_before_experts:
             routed_x = routed_x * top_scores_sorted.unsqueeze(1)
-            expert_out = self.experts(routed_x, num_tokens_per_expert, scores=None)
+            expert_out = self.experts(routed_x, num_tokens_per_expert)
         else:
-            expert_out = self.experts(routed_x, num_tokens_per_expert, scores=top_scores_sorted)
+            # EP pre-hooks dispatch positional inputs together, including the routing scores.
+            expert_out = self.experts(routed_x, num_tokens_per_expert, top_scores_sorted)
 
         # --- Shared expert (parallel with routed experts) ---
         shared_out = None

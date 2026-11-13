@@ -24,6 +24,7 @@ from hyper_parallel.models.deepseek_v3.adapter.policies.sharding import (
     build_parameter_sharding_rules,
 )
 from hyper_parallel.models.registry import register_model_adapter
+from hyper_parallel.models.deepseek_v3.adapter.policies.activation_checkpointing import build_recompute_policy
 
 
 def _load_replacements():
@@ -48,6 +49,7 @@ DEEPSEEK_V3_ADAPTER_SPEC = ModelAdapterSpec(
     replacements=_load_replacements,
     sharding_rules=build_parameter_sharding_rules,
     context_parallel=_load_context_parallel,
+    recompute=build_recompute_policy,
 )
 register_model_adapter(DEEPSEEK_V3_ADAPTER_SPEC)
 

@@ -1,0 +1,21 @@
+# Merge into a local DeepSeek-V3 training configuration before constructing the optimizer.
+# The source must expose batched SwiGLU experts (Transformers 5.5.4 is validated).
+# Configure actual model/data paths in the surrounding recipe; no downloads are implied.
+plan_overrides:
+  - match: "model.layers.*.mlp"
+    replace:
+      kind: module
+      source_type: transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3MoE
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v3.adapter.conversion.chunked_moe.DeepseekV3ChunkMoE
+        chunk_size: 2048
+
+activation_checkpoint:
+  mode: full
+  selection:
+    source: model_adapter_safe_regions
+    layer_count: 61  # Set to the actual decoder depth. Only self_attn is replayed.
+
+# Whole-parent FSDP+EP is demonstrated by examples/torch/chunk_moe/deepseek_v3.py.
+# The generic Trainer's automatic nested expert-FSDP boundary is not yet supported
+# by this chunk executor; do not infer that this fragment enables that path.
