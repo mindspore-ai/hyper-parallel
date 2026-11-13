@@ -25,13 +25,14 @@ import torch_npu  # pylint: disable=unused-import
 from torch import nn
 from torch.nn import functional
 
-from hyper_parallel.core.multicore import MegaMoeExperts
+from hyper_multicore import MegaMoeExperts
+
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import (
     DeepseekV41MegaMoeExperts,
 )
-from tests.torch.multicore._evidence_helpers import EXTENDED_LEVEL1
-from tests.torch.multicore._mega_moe_utils import start_shmem_lifetime, write_evidence
-from tests.torch.multicore._test_mega_moe_dynamic_tokens import (
+from tests.torch.multicore._integration import EXTENDED_LEVEL1
+from tests.torch.multicore._references import start_shmem_lifetime, write_evidence
+from tests.torch.multicore._references import (
     _assert_close,
     _inputs,
     _weights,

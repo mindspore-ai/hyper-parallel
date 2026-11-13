@@ -34,21 +34,20 @@ git remote add upstream https://gitcode.com/mindspore/hyper-parallel.git
 ```bash
 # Python source development only, without optional native components.
 pip install -e .
-
-# Local native development: first source your selected official CANN environment.
-source /usr/local/Ascend/cann/set_env.sh
-./build.sh --multicore on --soc-list ascend910b,ascend910_93
-export PYTHONPATH="$PWD:${PYTHONPATH:-}"
-source build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
-python your_program.py
-
-# The build also produces a wheel; install the exact path printed by build.sh.
-wheel_path=/absolute/path/printed/by/build.sh
-pip install "${wheel_path}"
-source "$(command -v hyper_parallel_multicore_set_env.bash)"
 ```
 
-Running `python setup.py bdist_wheel` directly produces a core-only wheel. The setup/pip phase does not download or compile native dependencies. See the [Installation Guide](../installation.md) for other public build options, and [Multicore Build and Usage](../../hyper_parallel/core/multicore/docs/build.md) for Multicore dependencies and CANN custom OPP activation.
+Multicore model replacements use the separately installed HyperMulticore package:
+
+```bash
+# Local native development: first source your selected official CANN environment.
+source /usr/local/Ascend/cann/set_env.sh
+pip install /absolute/path/to/hyper_multicore.whl
+export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+source "$(command -v hyper_multicore_set_env.bash)"
+python your_program.py
+```
+
+Running `python setup.py bdist_wheel` directly produces a core-only wheel. The setup/pip phase does not download or compile native dependencies. See the [Installation Guide](../installation.md) for HyperParallel build instructions, and [HyperMulticore](https://github.com/mindspore-ai/hyper-multicore) for Multicore dependencies and CANN custom OPP activation.
 
 ## Install Development Dependencies
 

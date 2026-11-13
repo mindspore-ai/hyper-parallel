@@ -26,8 +26,6 @@ Canonical shortlist for always-on context. Full patterns:
 ## Architecture Invariants
 
 - Every module is Torch-only: direct `torch.distributed` / `torch.Tensor` / autograd APIs.
-- `hyper_parallel/core/multicore/` keeps direct Torch imports; its SHMEM component is private to
-  Multicore.
 - `hyper_parallel/core/shard/dfunction.py` inherits directly from `torch.autograd.Function`.
 - DTensor = local shard + DeviceMesh + Placements
 - Distributed ops registered via YAML (`core/shard/ops/yaml/`)

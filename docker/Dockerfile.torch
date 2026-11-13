@@ -38,18 +38,12 @@ LABEL version="cann${CANN_VERSION}-${CANN_ARCH}-hyper-parallel-torch"
 
 ARG PIP_INDEX_URL="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
 ARG TORCH_EXTRA="torch29"
-ARG BUILD_MULTICORE_EXTENSION="off"
-ARG BUILD_SHMEM_EXTENSION="off"
-ARG HYPER_PARALLEL_BUILD_STRICT="off"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     ASCEND_HOME_PATH=/usr/local/Ascend/cann \
     PIP_INDEX_URL=${PIP_INDEX_URL} \
     PIP_NO_CACHE_DIR=1 \
-    PYTHONUNBUFFERED=1 \
-    BUILD_MULTICORE_EXTENSION=${BUILD_MULTICORE_EXTENSION} \
-    BUILD_SHMEM_EXTENSION=${BUILD_SHMEM_EXTENSION} \
-    HYPER_PARALLEL_BUILD_STRICT=${HYPER_PARALLEL_BUILD_STRICT}
+    PYTHONUNBUFFERED=1
 
 ENV PATH=/usr/local/Ascend/cann/bin:/usr/local/Ascend/cann/tools/ccec_compiler/bin:${PATH} \
     LD_LIBRARY_PATH=/usr/local/Ascend/cann/lib64:/usr/local/Ascend/cann/aarch64-linux/devlib:${LD_LIBRARY_PATH}

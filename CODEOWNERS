@@ -52,8 +52,6 @@
 /requirements.txt  @yangzhenzhang02
 /setup.py  @yangzhenzhang02
 
-/hyper_parallel/core/multicore/ @davidhe91 @Probiotics5333
-/tests/ut/core/multicore/ @davidhe91 @Probiotics5333
 /tests/torch/multicore/ @davidhe91 @Probiotics5333
 
 # Hyper-RL code and Qwen3 adapters.

@@ -29,7 +29,7 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.models.replacement import module_replacement
 
 if TYPE_CHECKING:
-    from hyper_parallel.core.multicore import MegaMoeExperts
+    from hyper_multicore import MegaMoeExperts
 
 
 def _swiglu_limit(value: float) -> float:
@@ -109,7 +109,7 @@ class DeepseekV41MegaMoeExperts(nn.Module):
         if self._executor is not None:
             raise RuntimeError("Cannot reconfigure an active MegaMoe expert executor")
         # Multicore is optional for the default native-EP replacement provider.
-        from hyper_parallel.core.multicore import MegaMoeExperts  # pylint: disable=C0415
+        from hyper_multicore import MegaMoeExperts  # pylint: disable=C0415
 
         self._executor = MegaMoeExperts(
             hidden_size=self.hidden_size,
@@ -152,7 +152,7 @@ class DeepseekV41MegaMoeExperts(nn.Module):
         if any(executor is None for executor in executors):
             raise RuntimeError("Configure every expert before sharing execution resources")
         # Import only when explicitly sharing configured MegaMoe executors.
-        from hyper_parallel.core.multicore import MegaMoeExperts  # pylint: disable=C0415
+        from hyper_multicore import MegaMoeExperts  # pylint: disable=C0415
 
         MegaMoeExperts.share_execution_resources(executors)
 

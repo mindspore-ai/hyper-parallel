@@ -27,6 +27,8 @@ from torch.nn import functional as F
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Experts, DeepseekV4SparseMoeBlock
 
+from hyper_multicore import MegaMoeExperts
+
 from hyper_parallel.components.checkpoint.weight_conversion import revert_weight_conversion
 from hyper_parallel.models.replacement import (
     apply_module_replacements, compile_module_replacements,
@@ -34,7 +36,6 @@ from hyper_parallel.models.replacement import (
 from hyper_parallel.trainer.config.parser import parse_training_args
 from hyper_parallel.trainer.config.trainer import TrainerConfig
 
-from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.distributed._builder.forward_rewriter import validate_local_compute_signature
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import (
     DeepseekV41MegaMoeExperts,
@@ -169,7 +170,7 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
                                  forward=lambda hidden_states, input_ids=None: hidden_states)
         with (patch.object(ep_adapter.dist, 'is_initialized', return_value=True),
               patch.object(ep_adapter.dist, 'get_world_size', return_value=2) as world_size,
-              patch('hyper_parallel.core.multicore.modules.mega_moe.module.shmem.root_members', return_value=(1, 3))):
+              patch('hyper_multicore.modules.mega_moe.module.shmem.root_members', return_value=(1, 3))):
             deepseek_v41_megamoe_compute_fn(module=module, mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=mesh)
         self.assertGreater(world_size.call_count, 0)
         for invocation in world_size.call_args_list:

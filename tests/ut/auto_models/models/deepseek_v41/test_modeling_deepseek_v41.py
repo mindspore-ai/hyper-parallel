@@ -31,13 +31,14 @@ try:
 except ImportError as exc:
     raise unittest.SkipTest(f"DeepSeek-V4 Transformers dependency unavailable: {exc}") from exc
 
+from hyper_multicore import MegaMoeExperts
+
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import SharedCompressedPackedSequence
 from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
     deepseek_v41_ep_compute_fn,
     deepseek_v41_megamoe_compute_fn,
 )
 from hyper_parallel.distributed.context_parallel.compressed_document import document_compression_plan
-from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
 from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import DeepseekV41HyperMegaMhc
 from hyper_parallel.models.deepseek_v41.adapter.validation.native_module_parity import HyperParallelMoE

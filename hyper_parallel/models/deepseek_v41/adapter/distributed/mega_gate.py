@@ -22,7 +22,7 @@ from typing import Any
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.core.multicore.modules.mega_gate import MegaGate
+from hyper_multicore.modules.mega_gate import MegaGate
 from hyper_parallel.models.deepseek_v41.adapter.aux_loss import update_modality_bias
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41TopKRouter,
@@ -36,6 +36,8 @@ from hyper_parallel.models.replacement import module_replacement
 @module_replacement
 class DeepseekV41MegaGate(MegaGate):
     """Adopt a DeepSeek V4.1 router's parameters without copying their storage."""
+
+    fp32_parameter_names: tuple[str, ...] = ("bias", "bias_vl")
 
     def __init__(
         self,

@@ -172,7 +172,7 @@ class BuildPy(build_py):
     """Build py files."""
 
     def run(self) -> None:
-        """Build Python sources and copy the explicitly prepared native payload."""
+        """Build Python sources and copy the explicitly prepared indexed helper."""
         shutil.rmtree(self.build_lib, ignore_errors=True)
         super().run()
         target_lib_dir = os.path.join(self.build_lib, 'hyper_parallel')
@@ -184,7 +184,11 @@ class BuildPy(build_py):
                     native_payload,
                 )
             else:
-                shutil.copytree(native_payload, target_lib_dir, dirs_exist_ok=True)
+                shutil.copytree(
+                    os.path.join(native_payload, "data", "indexed"),
+                    os.path.join(target_lib_dir, "data", "indexed"),
+                    dirs_exist_ok=True,
+                )
                 logger.info("Copied optional native payload from %s", native_payload)
         else:
             logger.info("No native payload selected; assembling a core-only wheel.")
@@ -247,12 +251,10 @@ if __name__ == '__main__':
         ),
         platforms=[get_platform()],
         include_package_data=True,
-        scripts=['hyper_parallel/core/multicore/scripts/hyper_parallel_multicore_set_env.bash'],
         package_data={
             'hyper_parallel.core.shard.ops': ['yaml/*.yaml'],
             'hyper_parallel.components.functional._triton.gated_delta_net': ['GDN_LICENSE'],
             'hyper_parallel.components.functional._triton.kimi_delta_attention': ['KDA_README.md'],
-            'hyper_parallel.core.multicore': ['README.md', 'docs/**/*', 'examples/**/*', 'set_env.bash'],
             # Model adapter recipes + committed codegen reference bundles.
             'hyper_parallel.models.qwen3_moe': [
                 'recipes/*.yaml', 'generated/*.json', 'generated/*.diff',

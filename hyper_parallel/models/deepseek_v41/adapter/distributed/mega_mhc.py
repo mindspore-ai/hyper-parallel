@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 import math
 from typing import Any
 
@@ -66,6 +66,8 @@ def _reference_shifted_boundary(
 class DeepseekV41HyperMegaMhc(DeepseekV41PipelinedHyperConnection):
     """Retain V4.1 parameter names while executing a shifted MegaKernel boundary."""
 
+    fp32_parameter_names: tuple[str, ...] = ("fn", "base", "scale")
+
     def __init__(
             self,
             *,
@@ -88,6 +90,28 @@ class DeepseekV41HyperMegaMhc(DeepseekV41PipelinedHyperConnection):
             )
         self.norm_eps = _rms_norm_eps(self.input_norm)
         self.token_tile = token_tile
+
+    def _apply(
+            self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True,
+    ) -> DeepseekV41HyperMegaMhc:
+        """Preserve FP32 coefficients and gradients while following device conversion."""
+        protected = set()
+        for name in self.fp32_parameter_names:
+            parameter = getattr(self, name)
+            protected.add(id(parameter))
+            if parameter.grad is not None:
+                protected.add(id(parameter.grad))
+
+        def apply(tensor: torch.Tensor) -> torch.Tensor:
+            """Avoid rounding protected values through the requested lower precision."""
+            converted = fn(tensor)
+            if id(tensor) not in protected or converted.dtype == torch.float32:
+                return converted
+            if tensor.is_meta:
+                return converted.float()
+            return tensor.to(device=converted.device, dtype=torch.float32)
+
+        return super()._apply(apply, recurse=recurse)
 
     def advance(
             self,
@@ -113,7 +137,7 @@ class DeepseekV41HyperMegaMhc(DeepseekV41PipelinedHyperConnection):
         if residual.device.type != "npu":
             raise TypeError("DeepSeek-V4.1 HyperMegaMhc supports only NPU execution")
         # Multicore is an optional native dependency unless this replacement is selected.
-        from hyper_parallel.core.multicore.modules.mega_mhc.function import (  # pylint: disable=C0415
+        from hyper_multicore.modules.mega_mhc.function import (  # pylint: disable=C0415
             hyper_mega_mhc,
         )
 

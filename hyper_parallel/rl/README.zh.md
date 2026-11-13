@@ -65,7 +65,7 @@ HyperParallel-RL 是面向 LLM、VLM、世界模型、具身智能和 Agentic AI
 - **共卡与分离部署**：Qwen3 dense 支持训推共卡或独立设备部署，分别通过 NPU IPC、HCCL 发布权重；共卡按阶段释放与恢复采样侧资源。MoE 当前限于共卡，见[支持范围](#支持范围)。
 - **流式权重同步**：native-vLLM 使用 full_gather，经 IPC/HCCL 逐桶发送并在确认后释放缓冲。
 
-底层优化基础还包括 HyperParallel 的[单边通信与多核 MoE 通算重叠](../core/multicore/README.zh.md)，其 HyperParallel-RL 接入与端到端收益待验证。
+独立的 [HyperMulticore](https://github.com/mindspore-ai/hyper-multicore) 提供单边通信与多核 MoE 通算重叠能力，可作为底层优化基础；其 HyperParallel-RL 接入与端到端收益待验证。
 
 ### 已发布策略与概率记录
 

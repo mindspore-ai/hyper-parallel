@@ -68,7 +68,6 @@ Distributed ST helpers: `torchrun_case()` via `tests.common.distributed_launcher
 | **Pipeline** | `core/pipeline_parallel/` | Torch-only stage schedule, micro-batch, P2P |
 | **Activation** | `core/activation_checkpoint/`, `core/activation_memory/` | SAC + activation swap |
 | **Checkpoint** | `core/distributed_checkpoint/` | Distributed save/load |
-| **Multicore** | `core/multicore/` | Torch-only component with private SHMEM and native build |
 | **Collectives** | `collectives/cc.py` | Process groups |
 | **Tests** | `tests/ut/`, `tests/torch/` | UT + distributed ST |
 

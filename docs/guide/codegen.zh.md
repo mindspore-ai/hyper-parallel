@@ -86,12 +86,16 @@ generated/
 
 ### DeepSeek-V4.1 训练时报 Multicore 或 MegaMoE 动态库错误
 
-这不是 codegen 专属错误：原生模型和生成模型都会使用 DeepSeek-V4.1 的Multicore/MegaMoE native 扩展。请确认编译与训练使用同一套 Python、PyTorch、torch_npu 和 CANN 环境，并执行一次严格的干净构建：
+这不是 codegen 专属错误：原生模型和生成模型都会使用 DeepSeek-V4.1 的Multicore/MegaMoE native 扩展。请确认编译与训练使用同一套 Python、PyTorch、torch_npu 和 CANN 环境，并安装匹配的 HyperMulticore wheel 后激活：
 
 ```bash
-./build.sh --multicore on --strict on --clean
+pip install /absolute/path/to/hyper_multicore.whl
 source /usr/local/Ascend/cann/set_env.sh
-source build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
+source "$(command -v hyper_multicore_set_env.bash)"
 ```
 
-如果日志出现 `undefined symbol`，或加载了与当前 Python ABI 不同的 `.so`（例如 cp311 环境加载 cp313 产物），应清理旧构建并在当前训练环境重新编译；不要通过关闭 MegaMoE 或修改模型结构绕过。完整环境要求见[安装指南](../installation.md)。
+如果 Multicore 动态库出现 `undefined symbol`，或加载了与当前 Python ABI 不同的 `.so`
+（例如 cp311 环境加载 cp313 产物），应检查实际加载的 HyperMulticore 包并重新安装匹配的 wheel。
+需要源码重编时，在独立仓库按 [HyperMulticore](https://github.com/mindspore-ai/hyper-multicore)
+构建指南使用训练环境重新构建。
+不要通过关闭 MegaMoE 或修改模型结构绕过。完整环境要求见[安装指南](../installation.zh.md)。
