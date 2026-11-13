@@ -5,8 +5,8 @@
 #
 #   source       : hyper_parallel.models.deepseek_v41.modeling_deepseek_v41
 #   architecture : DeepseekV41ForCausalLM
-#   parallel_dims: tp=1 cp=1 ep=8 pp=1 sp=False loss_parallel=False
-#   injections   : 42 rule(s)
+#   parallel_dims: tp=1 cp=4 ep=8 pp=1 sp=True loss_parallel=False
+#   injections   : 82 rule(s)
 #   runtime      : mesh / FSDP2 / PP / AC / compile still handled by runtime
 #
 # [HYPER PLAN] training derives a live plan from its YAML and this model;
@@ -62,7 +62,7 @@ from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
 from hyper_parallel.components.modules.mhc import PipelinedMhcModule, pipelined_mhc_post
 from hyper_parallel.core.multicore.modules.mega_gate import MegaGate
-from hyper_parallel.models.deepseek_v41.aux_loss import (
+from hyper_parallel.models.deepseek_v41.adapter.aux_loss import (
     accumulate_router_load,
     sequence_load_balancing_loss,
     update_modality_bias,
@@ -92,11 +92,51 @@ from hyper_parallel.models.deepseek_v41.vision import (
 )
 
 
+from hyper_parallel.components.modules.shared_compressed_dsa_attention import SharedCompressedDSAAttention as _SharedCompressedDSAAttentionBase
+from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_gate import DeepseekV41MegaGate
+from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import DeepseekV41HyperMegaMhc
+from hyper_parallel.models.deepseek_v41.adapter.engram.host_replacement import HostEngramModule
 
-# Codegen replacement: PipelinedMhcModule wraps DeepseekV41PipelinedHyperConnection; the original class is kept as the wrapper input.
 
-# Codegen replacement: EngramModule wraps DeepseekV41Engram; the original class is kept as the wrapper input.
 
+
+# Codegen replacement: HostEngramModule wraps DeepseekV41Engram; the original class is kept as the wrapper input.
+
+# Codegen replacement: SharedCompressedDSAAttention wraps DeepseekV41Attention; the original class is kept as the wrapper input.
+
+# Codegen replacement: DeepseekV41MegaMoeExperts wraps DeepseekV4Experts; the original class is kept as the wrapper input.
+
+# Codegen replacement: DeepseekV41HyperMegaMhc wraps DeepseekV41PipelinedHyperConnection; the original class is kept as the wrapper input.
+
+# Codegen replacement: DeepseekV41MegaGate wraps DeepseekV41TopKRouter; the original class is kept as the wrapper input.
+
+class SharedCompressedDSAAttention(_SharedCompressedDSAAttentionBase):
+    """Generated source-visible parallel form."""
+
+    cp_enable = False
+
+    def _forward_impl(self, *args, **kwargs):
+        if self.cp_enable:
+            if 'shared_attention_cp_context' in kwargs or 'shared_attention_tp_context' in kwargs:
+                raise ValueError('shared attention parallel contexts are owned by the wrapper')
+            call_kwargs = dict(kwargs)
+            if self._hyper_v41_shared_attention_cp_context is not None:
+                call_kwargs['shared_attention_cp_context'] = self._hyper_v41_shared_attention_cp_context
+            if self._hyper_v41_shared_attention_tp_context is not None:
+                call_kwargs['shared_attention_tp_context'] = self._hyper_v41_shared_attention_tp_context
+            return super().forward(*args, **call_kwargs)
+
+        return super().forward(*args, **kwargs)
+    def forward(self, *args, **kwargs):
+        # [HYPER BOUNDARY] input redistribution
+        args, kwargs = self._hp_boundary.redistribute_inputs(
+            ((*args,), {**kwargs}),
+        )
+        # [HYPER BOUNDARY] original forward body (now ``_forward_impl``)
+        outputs = self._forward_impl(*args, **kwargs)
+        # [HYPER BOUNDARY] output redistribution
+        outputs = self._hp_boundary.redistribute_outputs(outputs)
+        return outputs
 from hyper_parallel.models.materialization import register_rebuildable_buffer
 
 _FULL_MODEL_MODE = "full"
@@ -450,8 +490,8 @@ def _v41_sparse_moe_forward(
             ((hidden_states, input_ids, image_mask, router_token_mask, router_sequence_ids, router_num_sequences), {}),
         )
         # [HYPER LOCAL REGION] run the region compute fn on local tensors
-        # hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn is bound to self by generated source.
-        outputs = self.deepseek_v41_ep_compute_fn(*args, **kwargs)
+        # hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_megamoe_compute_fn is bound to self by generated source.
+        outputs = self.deepseek_v41_megamoe_compute_fn(*args, **kwargs)
 
         # [HYPER LOCAL REGION] boundary exit
         outputs = self._hp_boundary.redistribute_outputs(outputs)
@@ -882,16 +922,16 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
         )
         for layer_idx in range(config.num_hidden_layers):
             layer = self.layers[layer_idx]
-            layer.attn_hc = PipelinedMhcModule(module=DeepseekV41PipelinedHyperConnection(layer.attn_hc), module_fqn='', context={})
-            layer.ffn_hc = PipelinedMhcModule(module=DeepseekV41PipelinedHyperConnection(layer.ffn_hc), module_fqn='', context={})
-            layer.self_attn = DeepseekV41Attention(config, layer_idx)
+            layer.attn_hc = DeepseekV41HyperMegaMhc(module=DeepseekV41PipelinedHyperConnection(layer.attn_hc), module_fqn='', context={})
+            layer.ffn_hc = DeepseekV41HyperMegaMhc(module=DeepseekV41PipelinedHyperConnection(layer.ffn_hc), module_fqn='', context={})
+            layer.self_attn = SharedCompressedDSAAttention(module=DeepseekV41Attention(config, layer_idx), module_fqn='', context={})
             layer.forward = MethodType(_v41_decoder_layer_forward, layer)
-            layer.mlp.gate = DeepseekV41TopKRouter(config)
+            layer.mlp.gate = DeepseekV41MegaGate(module=DeepseekV41TopKRouter(config), module_fqn='', context={})
             bind_shared_expert_forward(layer.mlp.shared_experts)
             layer.mlp._forward_impl = MethodType(_v41_sparse_moe_forward_hp_impl, layer.mlp)
             layer.mlp.forward = MethodType(_v41_sparse_moe_forward, layer.mlp)
         for layer_id in getattr(config, "v41_engram_layer_ids", assets["layer_ids"]):
-            self.layers[layer_id].engram = EngramModule(module=DeepseekV41Engram(config, layer_id, assets), module_fqn='', context={})
+            self.layers[layer_id].engram = HostEngramModule(module=DeepseekV41Engram(config, layer_id, assets), module_fqn='', context={})
         self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
         self.vision = None
@@ -1292,14 +1332,9 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             packed_sequence = packed_sequence.prepare(input_ids.device, tuple(self.config.v41_compress_ratios))
             kwargs["packed_seq_params"] = packed_sequence
 
-            boundaries = packed_sequence.cu_seq_lens.to(device=input_ids.device, dtype=torch.long)
-            positions = torch.arange(
-                packed_sequence.local_query_start,
-                packed_sequence.local_query_start + packed_sequence.local_query_length,
-                device=input_ids.device,
-            )
-            kwargs["router_sequence_ids"] = torch.bucketize(positions, boundaries[1:], right=True).unsqueeze(0)
-            kwargs["router_num_sequences"] = boundaries.numel() - 1
+            sequence_ids, sequence_capacity = packed_sequence.router_metadata(input_ids.device)
+            kwargs["router_sequence_ids"] = sequence_ids
+            kwargs["router_num_sequences"] = sequence_capacity
         segment_start_mask = self._build_segment_start_mask(packed_sequence, input_ids)
         hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
         pre_mix = hidden_states.new_zeros(*hidden_states.shape[:2], self.config.hc_mult, dtype=torch.float32)
@@ -1371,7 +1406,7 @@ def _build_dspark_mlp(config: Any) -> nn.Module:
     dspark_config.num_local_experts = experts
     dspark_config.num_experts_per_tok = int(getattr(config, "v41_dspark_top_k", config.num_experts_per_tok))
     mlp = DeepseekV4DecoderLayer(dspark_config, 0).mlp
-    mlp.gate = DeepseekV41TopKRouter(dspark_config)
+    mlp.gate = DeepseekV41MegaGate(module=DeepseekV41TopKRouter(dspark_config), module_fqn='', context={})
     mlp.forward = MethodType(_dspark_sparse_moe_forward, mlp)
     return mlp
 
@@ -1399,6 +1434,16 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
             self.dspark = DeepseekV41DSpark(config, mlp_factory=lambda: _build_dspark_mlp(config))
             self.dspark_loss_coeff = float(getattr(config, "v41_dspark_loss_coeff", 1.0))
         self.post_init()
+        _hp_replacement_cache = {}
+        for _hp_fqn in ('model.layers.0.mlp.experts', 'model.layers.1.mlp.experts', 'model.layers.10.mlp.experts', 'model.layers.11.mlp.experts', 'model.layers.12.mlp.experts', 'model.layers.13.mlp.experts', 'model.layers.14.mlp.experts', 'model.layers.15.mlp.experts', 'model.layers.16.mlp.experts', 'model.layers.17.mlp.experts', 'model.layers.18.mlp.experts', 'model.layers.19.mlp.experts', 'model.layers.2.mlp.experts', 'model.layers.20.mlp.experts', 'model.layers.21.mlp.experts', 'model.layers.22.mlp.experts', 'model.layers.23.mlp.experts', 'model.layers.24.mlp.experts', 'model.layers.25.mlp.experts', 'model.layers.26.mlp.experts', 'model.layers.27.mlp.experts', 'model.layers.28.mlp.experts', 'model.layers.29.mlp.experts', 'model.layers.3.mlp.experts', 'model.layers.30.mlp.experts', 'model.layers.31.mlp.experts', 'model.layers.32.mlp.experts', 'model.layers.33.mlp.experts', 'model.layers.34.mlp.experts', 'model.layers.35.mlp.experts', 'model.layers.36.mlp.experts', 'model.layers.37.mlp.experts', 'model.layers.38.mlp.experts', 'model.layers.39.mlp.experts', 'model.layers.4.mlp.experts', 'model.layers.5.mlp.experts', 'model.layers.6.mlp.experts', 'model.layers.7.mlp.experts', 'model.layers.8.mlp.experts', 'model.layers.9.mlp.experts'):
+            _hp_parent_fqn, _, _hp_name = _hp_fqn.rpartition('.')
+            _hp_parent = self.get_submodule(_hp_parent_fqn)
+            _hp_source = getattr(_hp_parent, _hp_name)
+            _hp_key = id(_hp_source)
+            if _hp_key not in _hp_replacement_cache:
+                _hp_replacement_cache[_hp_key] = DeepseekV41MegaMoeExperts(
+                    module=_hp_source, module_fqn=_hp_fqn, context={})
+            setattr(_hp_parent, _hp_name, _hp_replacement_cache[_hp_key])
 
     @torch.no_grad()
     def _init_weights(self, module: nn.Module) -> None:
