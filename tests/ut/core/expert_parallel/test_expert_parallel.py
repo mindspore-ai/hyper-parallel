@@ -28,8 +28,10 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import torch
+from torch import nn
 
-
+from hyper_parallel.core.dtensor.placement_types import Shard
+from hyper_parallel.core.expert_parallel import static_splits
 from hyper_parallel.core.expert_parallel.expert_parallel import (
     AllToAllTokenDispatcher,
     AsyncHandle,
@@ -48,6 +50,7 @@ from hyper_parallel.core.expert_parallel.expert_parallel import (
     TensorParallel,
     ExpertTensorParallel,
 )
+from hyper_parallel.distributed.expert_parallel.experts import _prepare_ep_dispatch
 
 
 # ---------------------------------------------------------------------------
@@ -77,8 +80,6 @@ def _make_mock_device_mesh(ep_size: int, local_rank: int = 0):
 
 def _make_mock_module(num_experts: int = 4, dim: int = 8, hidden_dim: int = 16):
     """Create a minimal nn.Module mimic with w1, w2, w3 parameters."""
-    from torch import nn
-
     class _FakeExperts(nn.Module):
         def __init__(self) -> None:
             """Initialize fake expert module with random weights."""
@@ -275,7 +276,7 @@ class TestPermute(unittest.TestCase):
         counts = torch.tensor([3, 2, 1, 4])  # 2 ranks, 2 local experts
         total = int(counts.sum())
         x = torch.randn(total, dim)
-        orig_shape, permuted_x, perm_idx, num_tok = _permute(
+        orig_shape, permuted_x, perm_idx, num_tok, _ = _permute(
             x, counts, ep_degree=2, num_local_experts=2
         )
         self.assertEqual(
@@ -304,7 +305,7 @@ class TestPermute(unittest.TestCase):
         dim = 6
         counts = torch.tensor([2, 3, 4, 1])
         x = torch.arange(int(counts.sum()) * dim, dtype=torch.float).view(-1, dim)
-        _, permuted_x, perm_idx, _ = _permute(x, counts, ep_degree=2, num_local_experts=2)
+        _, permuted_x, perm_idx, _, _ = _permute(x, counts, ep_degree=2, num_local_experts=2)
         for i in range(permuted_x.shape[0]):
             self.assertTrue(
                 torch.equal(permuted_x[i], x[perm_idx[i]]),
@@ -320,7 +321,7 @@ class TestPermute(unittest.TestCase):
         dim = 4
         counts = torch.zeros(4, dtype=torch.long)
         x = torch.zeros(0, dim)
-        _, permuted_x, perm_idx, num_tok = _permute(x, counts, ep_degree=2, num_local_experts=2)
+        _, permuted_x, perm_idx, num_tok, _ = _permute(x, counts, ep_degree=2, num_local_experts=2)
         self.assertEqual(
             permuted_x.numel(), 0,
             f"Expected empty permuted_x, got numel={permuted_x.numel()}"
@@ -344,7 +345,7 @@ class TestUnpermute(unittest.TestCase):
         dim = 5
         counts = torch.tensor([3, 2, 1, 4])
         x = torch.randn(int(counts.sum()), dim)
-        orig_shape, permuted_x, perm_idx, _ = _permute(x, counts, ep_degree=2, num_local_experts=2)
+        orig_shape, permuted_x, perm_idx, _, _ = _permute(x, counts, ep_degree=2, num_local_experts=2)
         restored = _unpermute(permuted_x, orig_shape, perm_idx)
         self.assertTrue(
             torch.allclose(restored, x, atol=1e-6),
@@ -360,7 +361,7 @@ class TestUnpermute(unittest.TestCase):
         dim = 3
         counts = torch.tensor([4, 0, 0, 6])
         x = torch.randn(10, dim)
-        orig_shape, permuted_x, perm_idx, _ = _permute(x, counts, ep_degree=2, num_local_experts=2)
+        orig_shape, permuted_x, perm_idx, _, _ = _permute(x, counts, ep_degree=2, num_local_experts=2)
         restored = _unpermute(permuted_x, orig_shape, perm_idx)
         self.assertTrue(
             torch.allclose(restored, x, atol=1e-6),
@@ -377,7 +378,7 @@ class TestUnpermute(unittest.TestCase):
         counts = torch.tensor([2, 3, 1, 2])
         total = int(counts.sum())
         x = torch.randn(total, dim, requires_grad=True)
-        _, permuted_x, perm_idx, _ = _permute(x, counts, ep_degree=2, num_local_experts=2)
+        _, permuted_x, perm_idx, _, _ = _permute(x, counts, ep_degree=2, num_local_experts=2)
         restored = _unpermute(permuted_x, (total, dim), perm_idx)
         restored.sum().backward()
         self.assertIsNotNone(x.grad, "Gradient should flow through _permute and _unpermute")
@@ -741,7 +742,7 @@ class TestExpertParallelCombine(unittest.TestCase):
         # Since Torch a2a is identity, the token values don't change.
         # After dispatch (permute) and combine (unpermute) with identity expert,
         # we should recover routed_input.
-        _, permuted_x, perm_idx, _ = _permute(
+        _, permuted_x, perm_idx, _, _ = _permute(
             self.routed_input, self.counts_out, self.ep_size, self.num_local_experts
         )
         combined = self._run_dispatch_and_combine(permuted_x, mock_dist, mock_dist_func)
@@ -849,11 +850,14 @@ class TestAllToAllTokenDispatcher(unittest.TestCase):
     def test_dispatch_standalone(self, mock_dist, mock_dist_func):
         """dispatch can be called directly without an ExpertParallel instance."""
         self._configure_collectives(mock_dist, mock_dist_func)
-        permuted, local_counts, ctx = AllToAllTokenDispatcher.dispatch(
+        result = AllToAllTokenDispatcher.dispatch(
             module=None,
             inputs=(self.routed_input, self.num_tokens_per_expert_in),
             device_mesh=self.mock_mesh,
         )
+        self.assertEqual(len(result), 3)
+        permuted, local_counts = result[:2]
+        ctx = result[-1]
         assert isinstance(ctx, DispatchContext), (
             f"ctx should be DispatchContext, got {type(ctx).__name__}"
         )
@@ -869,11 +873,11 @@ class TestAllToAllTokenDispatcher(unittest.TestCase):
     def test_dispatch_context_fields(self, mock_dist, mock_dist_func):
         """dispatch returns a DispatchContext with correct field values."""
         self._configure_collectives(mock_dist, mock_dist_func)
-        _, _, ctx = AllToAllTokenDispatcher.dispatch(
+        ctx = AllToAllTokenDispatcher.dispatch(
             module=None,
             inputs=(self.routed_input, self.num_tokens_per_expert_in),
             device_mesh=self.mock_mesh,
-        )
+        )[-1]
         assert ctx.input_splits == [5, 5], (
             f"ctx.input_splits={ctx.input_splits}, expected [5, 5]"
         )
@@ -918,11 +922,14 @@ class TestAllToAllTokenDispatcher(unittest.TestCase):
     def test_dispatch_combine_round_trip(self, mock_dist, mock_dist_func):
         """dispatch then combine with identity expert restores original input."""
         self._configure_collectives(mock_dist, mock_dist_func)
-        permuted, _, ctx = AllToAllTokenDispatcher.dispatch(
+        result = AllToAllTokenDispatcher.dispatch(
             module=None,
             inputs=(self.routed_input, self.num_tokens_per_expert_in),
             device_mesh=self.mock_mesh,
         )
+        self.assertEqual(len(result), 3)
+        permuted = result[0]
+        ctx = result[-1]
         # Identity "expert computation": same permuted tensor.
         combined = AllToAllTokenDispatcher.combine(
             module=None,
@@ -1324,15 +1331,13 @@ class TestTensorParallelPartition(unittest.TestCase):
         mock_param_source,
         mock_distribute_tensor,
         mock_new_param,
-        mock_set_param,
+        _mock_set_param,
     ):
         """
         Feature: TensorParallel._partition_fn shard dimensions
         Description: w1 and w3 use Shard(1) (column-wise), w2 uses Shard(2) (row-wise).
         Expectation: distribute_tensor called with Shard(1) for w1/w3 and Shard(2) for w2
         """
-        from hyper_parallel.core.dtensor.placement_types import Shard
-
         module = _make_mock_module()
         device_mesh = _make_mock_device_mesh(ep_size=2)
         tp = TensorParallel()
@@ -1381,15 +1386,13 @@ class TestExpertParallelPartition(unittest.TestCase):
         mock_param_source,
         mock_distribute_tensor,
         mock_new_param,
-        mock_set_param,
+        _mock_set_param,
     ):
         """
         Feature: ExpertParallel._partition_fn shards on dim 0
         Description: _partition_fn calls distribute_tensor with Shard(0) for every parameter.
         Expectation: distribute_tensor called once per parameter with [Shard(0)] placement
         """
-        from hyper_parallel.core.dtensor.placement_types import Shard
-
         module = _make_mock_module()
         device_mesh = _make_mock_device_mesh(ep_size=2)
         ep = ExpertParallel()
@@ -1434,15 +1437,13 @@ class TestExpertTensorParallelPartition(unittest.TestCase):
         mock_param_source,
         mock_distribute_tensor,
         mock_new_param,
-        mock_set_param,
+        _mock_set_param,
     ):
         """
         Feature: ExpertTensorParallel._partition_fn 2-D shard placements
         Description: w1/w3 use [Shard(0), Shard(1)]; w2 uses [Shard(0), Shard(2)].
         Expectation: distribute_tensor called with 2-element placements list for each param
         """
-        from hyper_parallel.core.dtensor.placement_types import Shard
-
         module = _make_mock_module()
         device_mesh = _make_mock_device_mesh(ep_size=4)
         etp = ExpertTensorParallel()
@@ -1636,6 +1637,7 @@ class TestCombineStartWait(unittest.TestCase):
     """Unit tests for :meth:`AllToAllTokenDispatcher.combine_start` and :meth:`combine_wait`."""
 
     def setUp(self) -> None:
+        """Build mocked expert owners and their fixed receive counts."""
         self.ep_size = 2
         self.num_local_experts = 2
         self.dim = 8
@@ -1666,11 +1668,11 @@ class TestCombineStartWait(unittest.TestCase):
             lambda inp, *_args, **_kw: inp
         )
 
-        _, _, ctx = AllToAllTokenDispatcher.dispatch(
+        ctx = AllToAllTokenDispatcher.dispatch(
             module=None,
             inputs=(self.routed_input, self.num_tokens_per_expert_in),
             device_mesh=self.mock_mesh,
-        )
+        )[-1]
         expert_output = torch.randn(self.total_tokens, self.dim)
         handle = AllToAllTokenDispatcher.combine_start(
             expert_output, self.mock_mesh, ctx
@@ -1693,11 +1695,11 @@ class TestCombineStartWait(unittest.TestCase):
             lambda inp, *_args, **_kw: inp
         )
 
-        _, _, ctx = AllToAllTokenDispatcher.dispatch(
+        ctx = AllToAllTokenDispatcher.dispatch(
             module=None,
             inputs=(self.routed_input, self.num_tokens_per_expert_in),
             device_mesh=self.mock_mesh,
-        )
+        )[-1]
         expert_output = torch.randn(self.total_tokens, self.dim)
 
         # Sync path
@@ -1735,11 +1737,11 @@ class TestCombineStartWait(unittest.TestCase):
             lambda inp, *_args, **_kw: inp
         )
 
-        _, _, ctx = AllToAllTokenDispatcher.dispatch(
+        ctx = AllToAllTokenDispatcher.dispatch(
             module=None,
             inputs=(self.routed_input, self.num_tokens_per_expert_in),
             device_mesh=self.mock_mesh,
-        )
+        )[-1]
         expert_output = torch.randn(self.total_tokens, self.dim)
         AllToAllTokenDispatcher.combine_start(expert_output, self.mock_mesh, ctx)
 
@@ -1750,6 +1752,7 @@ class TestExpertParallelAsyncCombine(unittest.TestCase):
     """Unit tests for ExpertParallel(async_combine=True) / ExpertTensorParallel."""
 
     def setUp(self) -> None:
+        """Build mocked expert owners and their fixed receive counts."""
         self.ep_size = 2
         self.num_local_experts = 2
         self.dim = 8
@@ -2045,7 +2048,7 @@ class TestPermutedProbsDispatch(unittest.TestCase):
             self.mock_mesh,
         )
         # Reference: the expert-major permutation the dispatcher applies to tokens.
-        _, _, token_perm_idx, _ = _permute(
+        _, _, token_perm_idx, _, _ = _permute(
             self.routed_input, self.counts_out, self.ep_size, self.num_local_experts
         )
         expected = self.permuted_probs[token_perm_idx]
@@ -2176,7 +2179,7 @@ class TestPermutedProbsDispatch(unittest.TestCase):
             device_mesh=self.mock_mesh,
         )
         self.assertEqual(len(result2), 3, f"expected 3-tuple, got len={len(result2)}")
-        _, _, ctx2 = result2
+        ctx2 = result2[-1]
         self.assertIsNone(
             ctx2.probs_input_shape,
             "probs_input_shape should be None when permuted_probs is absent"
@@ -2197,8 +2200,6 @@ class TestStaticSplitsFastPath(unittest.TestCase):
 
     def setUp(self) -> None:
         """Build the same mocked dispatch as ``TestExpertParallelDispatch``."""
-        from hyper_parallel.core.expert_parallel import static_splits
-
         self.static_splits = static_splits
         self.ep = ExpertParallel()
         self.ep_size = 2
@@ -2212,7 +2213,8 @@ class TestStaticSplitsFastPath(unittest.TestCase):
 
         saved_enabled = static_splits._ENABLED  # pylint: disable=protected-access
 
-        def restore():
+        def restore() -> None:
+            """Restore the shared static-plan state after this test."""
             static_splits._ENABLED = saved_enabled  # pylint: disable=protected-access
             static_splits.clear_static_plans()
 
@@ -2295,14 +2297,13 @@ class TestRealDispatchStaticPlan(unittest.TestCase):
 
     def setUp(self) -> None:
         """Enable the switch and clear the plan cache, restoring both afterwards."""
-        from hyper_parallel.core.expert_parallel import static_splits
-
         self.static_splits = static_splits
         saved_enabled = static_splits._ENABLED  # pylint: disable=protected-access
         static_splits._ENABLED = True  # pylint: disable=protected-access
         static_splits.clear_static_plans()
 
-        def restore():
+        def restore() -> None:
+            """Restore the shared static-plan state after this test."""
             static_splits._ENABLED = saved_enabled  # pylint: disable=protected-access
             static_splits.clear_static_plans()
 
@@ -2314,10 +2315,8 @@ class TestRealDispatchStaticPlan(unittest.TestCase):
         self.token_count = 4
         self.topk = 2
 
-    def _dispatch(self, mock_dist):
+    def _dispatch(self, _mock_dist):
         """Run the real ``_prepare_ep_dispatch`` with a stubbed collective."""
-        from hyper_parallel.distributed.expert_parallel.experts import _prepare_ep_dispatch
-
         hidden = torch.randn(self.token_count, self.dim)
         # Top-k indices spread over both ranks' experts so the plan is non-trivial.
         topk_indices = torch.tensor([[0, 1], [2, 3], [1, 2], [3, 0]])
@@ -2362,8 +2361,6 @@ class TestStaticSplitsProbe(unittest.TestCase):
 
     def _mode(self, value):
         """Return ``probe_mode()`` for one env value, restoring the environment."""
-        from hyper_parallel.core.expert_parallel import static_splits
-
         previous = os.environ.get("HP_EP_STATIC_SPLITS_PROBE")
         if value is None:
             os.environ.pop("HP_EP_STATIC_SPLITS_PROBE", None)
