@@ -51,6 +51,8 @@ from hyper_parallel.core.dtensor.placement_types import (
     Shard,
 )
 
+from tests.common.mark_utils import arg_mark
+
 
 class _FakeMesh:
     mesh_dim_names = ("tp", "cp")
@@ -66,17 +68,17 @@ class _FakeTPMesh:
         """Create a distinct fake process group."""
         self.group = object()
 
-    def get_group(self):
+    def get_group(self) -> object:
         """Return the fake process group."""
         return self.group
 
     @staticmethod
-    def size():
+    def size() -> int:
         """Return the fake TP group size."""
         return 2
 
     @staticmethod
-    def get_local_rank():
+    def get_local_rank() -> int:
         """Return the fake rank inside the TP group."""
         return 1
 
@@ -104,8 +106,13 @@ def _attention_spec():
 # S2.4: PrecompiledBoundary compile time (identity skip / multi-output mapping / None branches).
 # ==========================================================================
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
 def test_compile_input_plan(monkeypatch):
-    """Compile input plan family: in_plan structure, TP lowering hit/skip paths."""
+    """Feature: Compile TP input placement transitions.
+
+    Description: Lower supported collectives and local slices with fake groups.
+    Expectation: Plans preserve placement contracts and zero-padded slice gradients.
+    """
     # --- case: attention_cp_dim_identity ---
     # attention CP-axis in_dst=Shard(1) identity assertion: in_plan has only the TP all-gather.
     b = PrecompiledBoundary(_attention_spec(), _FakeMesh(), ("tp", "cp"))
@@ -130,6 +137,7 @@ def test_compile_input_plan(monkeypatch):
     _set_fake_group_ranks(monkeypatch)
     for src, dst, kind, tensor_dim in [
         (Shard(1), Replicate(), "all_gather", 1),
+        (Replicate(), Shard(1), "local_shard", 1),
         (Partial(), Replicate(), "all_reduce", None),
         (Partial(), Shard(1), "reduce_scatter", 1),
     ]:
@@ -182,23 +190,6 @@ def test_compile_input_plan(monkeypatch):
     assert boundary.in_plan[0].execution_op is None, \
         "case: validate_plan_does_not_lower_tp_transition"
 
-    # --- case: replicate_to_shard_is_not_lowered ---
-    # Local slicing stays generic until its backward all-gather is explicit.
-    spec = ModuleShardingSpec(
-        in_src={"x": {TP: Replicate()}},
-        in_dst={"x": {TP: Shard(1)}},
-    )
-    boundary = PrecompiledBoundary(
-        spec,
-        _FakeTPMesh(),
-        ("tp",),
-        op_lowerer=create_tp_collective_lowerer(
-            _FakeTPMesh(), ("tp",), collective_backend="hccl"
-        ),
-    )
-    assert boundary.in_plan[0].execution_op is None, \
-        "case: replicate_to_shard_is_not_lowered"
-
     # --- case: non_tp_difference_is_not_lowered ---
     # A boundary that also changes CP remains on the generic redistribution path.
     class _FakeTPAndCPMesh(_FakeTPMesh):
@@ -242,6 +233,37 @@ def test_compile_input_plan(monkeypatch):
     )
     assert boundary.in_plan[0].execution_op is None, \
         "case: rank_order_mismatch_is_not_lowered"
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+def test_local_shard_backward(monkeypatch):
+    """Feature: Traceable replicated-to-sharded TP inputs.
+
+    Description: Execute a compiled local slice with a fake two-rank mesh.
+    Expectation: Forward selects local rows and backward zero-pads other rows.
+    """
+    _set_fake_group_ranks(monkeypatch)
+    # --- case: replicate_to_shard_preserves_native_slice_backward ---
+    # The DTensor path uses local torch.chunk, without a backward all-gather.
+    spec = ModuleShardingSpec(
+        in_src={"x": {TP: Replicate()}},
+        in_dst={"x": {TP: Shard(1)}},
+    )
+    boundary = PrecompiledBoundary(
+        spec,
+        _FakeTPMesh(),
+        ("tp",),
+        op_lowerer=create_tp_collective_lowerer(
+            _FakeTPMesh(), ("tp",), collective_backend="hccl"
+        ),
+    )
+    execution_op = boundary.in_plan[0].execution_op
+    assert execution_op.kind == "local_shard", "case: replicate_to_shard_is_lowered"
+    tensor = torch.arange(8.0).reshape(1, 8).requires_grad_()
+    output = execution_op.execute(tensor)
+    torch.testing.assert_close(output, tensor[:, 4:])
+    output.sum().backward()
+    torch.testing.assert_close(tensor.grad, torch.tensor([[0., 0., 0., 0., 1., 1., 1., 1.]]))
 
 
 def test_compile_output_plan():
