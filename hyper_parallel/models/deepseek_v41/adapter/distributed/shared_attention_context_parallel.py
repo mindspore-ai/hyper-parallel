@@ -20,6 +20,7 @@ from functools import wraps
 from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
+import torch.distributed._functional_collectives as funcol
 from torch import nn  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.core.utils.communication import differentiable_all_to_all_single
@@ -122,10 +123,8 @@ def _build_shared_attention_tp_context(tp_mesh: Any) -> SharedCompressedAttentio
     group = tp_mesh.get_group()
 
     def _reduce_sum(tensor: torch.Tensor) -> torch.Tensor:
-        """Sum local Indexer-head contributions across the TP group."""
-        reduced = tensor.contiguous()
-        torch.distributed.all_reduce(reduced, group=group)
-        return reduced
+        """Sum Indexer-head contributions with native functional collective semantics."""
+        return funcol.all_reduce(tensor.contiguous(), "sum", group)
 
     return SharedCompressedAttentionTPContext(
         size=tp_mesh.size(),

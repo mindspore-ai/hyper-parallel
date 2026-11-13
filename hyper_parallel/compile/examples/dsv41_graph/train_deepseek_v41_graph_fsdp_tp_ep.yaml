@@ -1,4 +1,4 @@
-# WikiText packed static graph with active Compressor and Indexer; CP1 reference DSA.
+# Eight ranks: dense FSDP4 + TP2/SP + EP2, expert EDP4; CP=PP=1.
 # The packed documents are per-doc aligned (lcm of active ratios) and padded to a
 # fixed row length, so eager and one captured graph share the same shape contract.
 model:
@@ -10,7 +10,7 @@ model:
   config_overrides:
     _experts_implementation: batched_mm
     router_aux_loss_coef: 0.0001
-    v41_indexer_loss_coeff: 0.1
+    v41_indexer_loss_coeff: 0.001
     v41_candidate_source_layer_id: -1
 optimizer:
   _target_: hyper_parallel.components.optim.builders.AdamW
@@ -25,7 +25,7 @@ lr_scheduler:
     lr_warmup_steps: 0
 training:
   train_iters: 30
-  global_batch_size: 2
+  global_batch_size: 8
   micro_batch_size: 1
   backend: hccl
   init_device: meta
@@ -33,20 +33,23 @@ training:
   seed: 42
   enable_full_determinism: false
 accelerator:
-  tp_size: 1
+  tp_size: 2
   cp_size: 1
-  ep_size: 1
+  ep_size: 2
   pp_size: 1
-  sequence_parallel: false
+  sequence_parallel: true
   loss_parallel: false
 fsdp_config:
-  dp_shard_size: 2
+  dp_shard_size: 4
+  edp_shard_size: 4
 compile:
   enabled: true
   use_joint_graph: true
   fsdp_allgather_prefetch: false
   fsdp_overlap_grad_reduce: false
   dynamic: true
+  # Packed rows have fixed shapes; EP receive lengths remain dynamic.
+  dynamic_arg_dims: {}
 dataset:
   model_assets:
     chat_template: null
@@ -60,7 +63,7 @@ dataset:
     _target_: hyper_parallel.models.deepseek_v41.adapter.data.text_transform.build_deepseek_v41_text_transform
     data_type: plaintext
     text_keys: text
-    max_seq_len: 32
+    max_seq_len: 2304
     drop_ragged_tail: false
     # lcm of the model's active compress ratios: blocks never cross a document.
     sample_alignment_size: 2
@@ -69,7 +72,7 @@ dataset:
   data_config:
     create_attention_mask_in_dataloader: true
     labels_are_shifted: true
-    cache_dir: ./output/automodel_text_graph/wikitext_packing_cache
+    cache_dir: ./output/dsv41_graph/wikitext_fsdp_tp_ep_cache
 dataloader:
   _target_: hyper_parallel.data.batching.TokenBatchLoader
   min_buffered_samples: 200
@@ -77,7 +80,7 @@ dataloader:
     _target_: hyper_parallel.data.batching.build_online_text_collate_fn
     # Fixed packed row length: one captured graph replays for every batch and
     # eager keeps the identical shape contract.
-    pad_to_length: 32
+    pad_to_length: 2304
   get_batch:
     _target_: hyper_parallel.data.batching.TextParallelBatch
     source_type: online
@@ -91,7 +94,9 @@ dataloader:
       compress_ratios:
       - 1
       - 2
-  sampler_type: single
+  # Packing can consume several source documents per row; retain the natural
+  # source instead of capping it at train_iters * global_batch_size.
+  sampler_type: cyclic
   data_rearrange_map: null
   data_sharding: false
   drop_last: true
@@ -99,9 +104,7 @@ dataloader:
   num_workers: 0
   pin_memory: false
   prefetch_factor: null
-  # One max_seq_len document per micro-batch: the planned per-epoch sample
-  # count then equals the iteration count and the padded row stays at 32.
-  token_budget: 32
+  token_budget: 2304
 checkpoint:
   save_ckpt: false
 model_init_dtype: float32
@@ -161,5 +164,79 @@ plan_overrides:
       tp: replicate
     wkv.weight:
       tp: replicate
-debug:
-  check_dataset: debug
+- match: model.layers.*.mlp.forward
+  when: ep
+  replace:
+    kind: method
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
+      use_grouped_gemm: true
+      fix_router: false
+- match: model.layers.*.*_hc
+  when: sequence_parallel
+  in_src:
+    hidden_streams:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+  in_dst:
+    hidden_streams:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+  out_src:
+    pre:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+    post:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+    residual:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+  out_dst:
+    pre:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+    post:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+    residual:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+- match: '*.self_attn'
+  tp_divide_attrs:
+  - num_groups
+- match: '*.self_attn.forward'
+  replace:
+    kind: method
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.shared_attention_context_parallel.deepseek_v41_shared_attention_parallel_wrapper
+- match: model.layers.*.engram
+  when: sequence_parallel
+  in_src:
+    hidden_states:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+  in_dst:
+    hidden_states:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+  out_src:
+    output:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+  out_dst:
+    output:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
