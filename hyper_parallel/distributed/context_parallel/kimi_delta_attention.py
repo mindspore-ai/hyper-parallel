@@ -834,6 +834,7 @@ class _KDAStateCP(nn.Module):
         backend: str = "eager",
         state_cp_method: str = "p2p",
         allgather_group_size: int = 1,
+        p2p_transport: Any = None,
     ) -> None:
         """Initialize local KDA and its state exchange on one chronological axis."""
         super().__init__()
@@ -853,6 +854,12 @@ class _KDAStateCP(nn.Module):
             raise ValueError("Ascend C KDA requires safe_gate=True and chunk_size=64.")
         if backend == "eager" and state_cp_method != "p2p":
             raise ValueError("Eager KDA state exchange supports P2P only.")
+        if p2p_transport is not None:
+            if backend != "triton" or state_cp_method != "p2p" or self.cp_size == 1:
+                raise ValueError("One-sided KDA transport requires Triton state P2P with multiple ranks.")
+            if p2p_transport.arena.group is not self.cp_group:
+                raise ValueError("One-sided transport and KDA must use the same process group.")
+        self.p2p_transport = p2p_transport
         self.state_cp = build_kda_state_cp(self.cp_mesh, state_cp_method, allgather_group_size)
         self.prev_rank = _global_peer_rank(
             self.cp_mesh,
@@ -959,6 +966,7 @@ class _KDAStateCP(nn.Module):
             chunk_size=self.chunk_size,
             safe_gate=self.safe_gate,
             state_cp=self.state_cp,
+            p2p_transport=self.p2p_transport,
             sequence_info=sequence_info,
         )
 
@@ -1279,6 +1287,7 @@ class KimiDeltaAttentionLayerCP(nn.Module):
         ulysses_degree: int = 1,
         state_cp_method: str = "p2p",
         allgather_group_size: int = 1,
+        p2p_transport: Any = None,
     ) -> None:
         """Keep layer ownership and full-CP halo metadata separate from the core."""
         super().__init__()
@@ -1295,7 +1304,8 @@ class KimiDeltaAttentionLayerCP(nn.Module):
         self.core = KimiDeltaAttentionCoreCP(
             device_mesh, ulysses_degree=ulysses_degree, chunk_size=chunk_size,
             lower_bound=float(lower_bound), safe_gate=_uses_safe_gate(module), backend=backend,
-            state_cp_method=state_cp_method, allgather_group_size=allgather_group_size)
+            state_cp_method=state_cp_method, allgather_group_size=allgather_group_size,
+            p2p_transport=p2p_transport)
 
     def _validate_module(self) -> None:
         """Validate the KimiDeltaAttention contract used by state CP."""
@@ -1451,7 +1461,7 @@ class KimiDeltaAttentionCoreCP(nn.Module):
     def __init__(self, device_mesh: DeviceMesh, *, ulysses_degree: int = 1,
                  chunk_size: int = 64, lower_bound: float = -5.0, safe_gate: bool = True,
                  backend: str = "triton", state_cp_method: str = "p2p",
-                 allgather_group_size: int = 1) -> None:
+                 allgather_group_size: int = 1, p2p_transport: Any = None) -> None:
         """Build all communication groups once, before forward or checkpoint replay."""
         super().__init__()
         device_mesh = _ensure_1d(device_mesh)
@@ -1477,7 +1487,8 @@ class KimiDeltaAttentionCoreCP(nn.Module):
             state_mesh = hybrid["kda_state"]
         self.state = _KDAStateCP(
             state_mesh, chunk_size=chunk_size, lower_bound=lower_bound, safe_gate=safe_gate,
-            backend=backend, state_cp_method=state_cp_method, allgather_group_size=allgather_group_size)
+            backend=backend, state_cp_method=state_cp_method, allgather_group_size=allgather_group_size,
+            p2p_transport=p2p_transport)
 
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                 gate: torch.Tensor, beta: torch.Tensor, *, a_log: torch.Tensor,
