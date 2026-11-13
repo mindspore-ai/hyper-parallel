@@ -27,8 +27,16 @@ from rl.data.prompts import validate_chat_template_kwargs, validate_row_adapter_
 from rl.workers.engine.model import ModelRegistration, resolve_model, resolve_vllm_model
 from rl.reward_model.scoring import load_reward_function
 from rl.rollout.registry import ROLLOUT_ENGINES
+from rl.rollout.topology import model_parallel_size
 from rl.weight_sync.config import resolve_weight_sync_config
-from rl.config.schema import AsyncTrainingConfig, ColocateAsyncConfig, _EXPECTED_TOP_LEVEL, _HCCL_MAX_PORT, _HCCL_MIN_PORT, _async_integer, _normalize_dtype_name, _optimizer_fp32_main_params, _positive_integer, _require_async, _trainer_topology, _trainer_world_size, build_model_registration, optional_mapping, required_mapping, router_replay_mode, uses_colocated_vllm
+from rl.unified_execution.contract import validate_unified_config
+from rl.unified_execution.execution_plan import pik_row_options
+from rl.config.schema import (
+    AsyncTrainingConfig, ColocateAsyncConfig, _EXPECTED_TOP_LEVEL, _HCCL_MAX_PORT, _HCCL_MIN_PORT,
+    _async_integer, _normalize_dtype_name, _optimizer_fp32_main_params, _positive_integer,
+    _require_async, _trainer_topology, _trainer_world_size, build_model_registration,
+    optional_mapping, required_mapping, router_replay_mode, uses_colocated_vllm,
+)
 
 
 def _path_value(section: Mapping[str, Any], name: str) -> str:
@@ -160,6 +168,8 @@ def _reject_removed_vllm_topology(vllm: Mapping[str, Any]) -> None:
 def _validate_vllm_basics(vllm: Mapping[str, Any]) -> tuple[str, int, int]:
     """Validate settings shared by colocated and disjoint vLLM."""
     _reject_removed_vllm_topology(vllm)
+    if "expert_parallel_size" in vllm and vllm.get("model_implementation", "native") != "unified":
+        raise ValueError("rollout.vllm.expert_parallel_size selects HP EP and requires model_implementation=unified")
     deployment = str(vllm.get("deployment", "disjoint"))
     if deployment not in ("disjoint", "colocated"):
         raise ValueError(
@@ -173,6 +183,7 @@ def _validate_vllm_basics(vllm: Mapping[str, Any]) -> tuple[str, int, int]:
         raise ValueError("rollout.vllm.sleep_level=2 requires deployment='colocated'")
     rollout_dp = _positive_integer(vllm, "data_parallel_size", "rollout.vllm")
     rollout_tp = _positive_integer(vllm, "tensor_parallel_size", "rollout.vllm")
+    model_parallel_size(vllm)
     if str(vllm.get("dtype", "bfloat16")) not in ("bfloat16", "bf16"):
         raise ValueError("The vLLM rollout path requires bfloat16")
     if str(vllm.get("host", "127.0.0.1")) not in ("127.0.0.1", "localhost"):
@@ -205,11 +216,12 @@ def _validate_colocated_vllm(
             "Colocated rollout derives its physical NPUs from the Trainer; "
             "remove rollout.vllm.visible_devices"
         )
-    if rollout_dp * rollout_tp != trainer_world_size:
+    if rollout_dp * model_parallel_size(vllm) != trainer_world_size:
         raise ValueError(
             "Colocated rollout devices must match the Trainer world: "
             f"data_parallel_size={rollout_dp}, tensor_parallel_size={rollout_tp}, "
-            f"trainer_world_size={trainer_world_size}"
+            f"pipeline_parallel_size={vllm.get('pipeline_parallel_size', 1)}, "
+            f"context_parallel_size={vllm.get('context_parallel_size', 1)}, trainer_world_size={trainer_world_size}"
         )
 
 
@@ -232,17 +244,16 @@ def _validate_disjoint_vllm(
     vllm: Mapping[str, Any],
     trainer_count: int,
     rollout_dp: int,
-    rollout_tp: int,
 ) -> None:
     """Validate disjoint trainer and rollout device ownership."""
     visible_devices = vllm.get("visible_devices")
     if visible_devices is None:
         raise ValueError("rollout.vllm.visible_devices must select the external server NPUs")
     device_ids = [device.strip() for device in str(visible_devices).split(",")]
-    expected_devices = rollout_dp * rollout_tp
+    expected_devices = rollout_dp * model_parallel_size(vllm)
     if not all(device_ids) or len(device_ids) != expected_devices:
         raise ValueError(
-            "Disjoint rollout requires data_parallel_size * tensor_parallel_size devices: "
+            "Disjoint rollout requires data_parallel_size * tensor_parallel_size * CP * PP devices: "
             f"expected {expected_devices} rollout devices, "
             f"got {device_ids}"
         )
@@ -346,8 +357,8 @@ def _validate_model_scope(config: Mapping[str, Any], model: ModelRegistration) -
     rollout = required_mapping(config, "rollout")
     vllm = optional_mapping(rollout, "vllm")
     if (rollout.get("engine") != "vllm" or vllm.get("deployment") != "colocated"
-            or vllm.get("model_implementation", "native") != "native"):
-        raise ValueError("Qwen3-MoE requires colocated native vLLM rollout")
+            or vllm.get("model_implementation", "native") not in ("native", "unified")):
+        raise ValueError("Qwen3-MoE requires colocated native or unified vLLM rollout")
     if required_mapping(config, "algorithm").get("name") != "grpo":
         raise ValueError("Qwen3-MoE currently supports GRPO only")
     for name in ("enable_expert_parallel", "enable_eplb"):
@@ -463,7 +474,7 @@ def _validate_vllm(
             raise ValueError("Colocated device-resident training currently requires Qwen3 dense with TP1")
         _validate_colocated_vllm(vllm, accelerator, trainer_world_size, rollout_dp, rollout_tp)
     else:
-        _validate_disjoint_vllm(vllm, trainer_world_size, rollout_dp, rollout_tp)
+        _validate_disjoint_vllm(vllm, trainer_world_size, rollout_dp)
     _validate_vllm_limits(vllm)
     rollout_model = resolve_vllm_model(
         model_registration,
@@ -769,7 +780,7 @@ def _validate_log_prob_source(config: Mapping[str, Any], train: Mapping[str, Any
             raise ValueError("rollout.collect_log_probs=false requires train.old_log_prob_source=actor")
         if agentic.get("runner", "internal") != "internal":
             raise ValueError("Disabling rollout log-probabilities requires the internal runner")
-        if (parse_distillation_config(config.get("distillation")).enabled):
+        if parse_distillation_config(config.get("distillation")).enabled:
             raise ValueError("Consistency and distillation require rollout log-probabilities")
 
 
@@ -848,10 +859,20 @@ def _validate_dynamic_batching(config: Mapping[str, Any], model_registration: Mo
 
 
 def _validate_accelerator_options(
-    train: Mapping[str, Any], accelerator: Mapping[str, Any],
+    train: Mapping[str, Any], accelerator: Mapping[str, Any], config: Mapping[str, Any], algorithm: RLAlgorithm,
 ) -> None:
-    """Check supported parallel execution flags and explicit HP replacement rules."""
-    for field, supported in (("sequence_parallel", False), ("loss_parallel", False),
+    """Check parallel execution flags against the shared numerical recipe."""
+    sequence_parallel = accelerator.get("sequence_parallel", False)
+    if not isinstance(sequence_parallel, bool):
+        raise ValueError("train.accelerator.sequence_parallel must be boolean")
+    if sequence_parallel:
+        if algorithm.name != "grpo":
+            raise ValueError("PIK SP RL integration currently requires GRPO")
+        if pik_row_options(train.get("plan_overrides", [])) is None or "consistency" not in config:
+            raise ValueError("train.accelerator.sequence_parallel requires the explicit shared PIK recipe")
+        if train.get("token_log_probs_mode", "dense") != "dense":
+            raise ValueError("PIK SP currently requires train.token_log_probs_mode=dense")
+    for field, supported in (("loss_parallel", False),
                              ("reshard_after_backward", False), ("requires_grad_sync", True)):
         value = accelerator.get(field, supported)
         if not isinstance(value, bool) or value is not supported:
@@ -859,11 +880,9 @@ def _validate_accelerator_options(
     if "plan_overrides" not in train or not isinstance(train["plan_overrides"], list):
         raise ValueError("train.plan_overrides must explicitly declare a list of HP rules")
 
-
 def validate_config(config: Mapping[str, Any], algorithm: RLAlgorithm) -> None:
     """Validate Hyper-RL configuration before distributed startup."""
-    if "consistency" in config:
-        raise ValueError("consistency was removed; remove the field and use native-vLLM")
+    validate_unified_config(config)
     unknown = set(config) - _EXPECTED_TOP_LEVEL
     if unknown:
         raise ValueError(f"Unsupported top-level configuration keys: {sorted(unknown)}")
@@ -884,7 +903,7 @@ def validate_config(config: Mapping[str, Any], algorithm: RLAlgorithm) -> None:
         _positive_integer(train, "model_init_cpu_threads", "train")
     accelerator = required_mapping(train, "accelerator")
     _validate_training_residency(config, algorithm)
-    _validate_accelerator_options(train, accelerator)
+    _validate_accelerator_options(train, accelerator, config, algorithm)
     _validate_training_optimizer(train, rollout, model, algorithm)
     model_registration = build_model_registration(config)
     _validate_rollout_offload(config, model_registration, algorithm)
@@ -1086,6 +1105,7 @@ def _validate_codex_mcp_servers(codex: Mapping[str, Any]) -> None:
 
 def validate_async_config(config: Mapping[str, Any]) -> AsyncTrainingConfig:
     """Admit only validated GRPO/topology/task combinations before creating models."""
+    validate_unified_config(config)
     settings = AsyncTrainingConfig.from_mapping(config.get("async_training", {}))
     data, rollout, agent = (config.get(key, {}) for key in ("data", "rollout", "agentic"))
     train = config.get("train", {})
@@ -1177,6 +1197,7 @@ def _validate_colocate_generation(config: Mapping[str, Any]) -> None:
 
 def validate_colocate_async_config(config: Mapping[str, Any]) -> ColocateAsyncConfig:
     """Admit single-node Qwen3 dense GRPO with internal or existing Codex sampling."""
+    validate_unified_config(config)
     _require_async("async_training" not in config, "Choose either async_training or colocate_async")
     settings = ColocateAsyncConfig.from_mapping(required_mapping(config, "colocate_async"))
     dp_size = _validate_colocate_topology(config)

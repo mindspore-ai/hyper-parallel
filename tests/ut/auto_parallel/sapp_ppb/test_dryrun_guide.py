@@ -106,6 +106,17 @@ def _input_from(values):
 class TestDryunGuide:
     """A test class for testing dryrun guide."""
 
+    def test_offset_variation_must_be_in_rows_used_for_rank(self, monkeypatch):
+        """Reject variation outside the coefficient rows before searching recompute configs."""
+        bad_offset = [0] * 16
+        bad_offset[7] = 1
+        good_offset = [0] * 16
+        good_offset[1] = 1
+        candidates = iter([bad_offset, good_offset])
+        monkeypatch.setattr(config_utils, "_generate_offset_array", lambda *_args: next(candidates))
+
+        assert config_utils._generate_offset_config(1, 6, 17, 16) == [good_offset]
+
     def test_dryrun_guide_one_round(self):
         """A single-round dryrun config must identify each recompute coefficient."""
         considered_rec = [Recompute.TYPE.BOTH, Recompute.TYPE.SLCT, Recompute.TYPE.COMM]

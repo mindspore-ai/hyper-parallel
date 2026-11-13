@@ -145,6 +145,26 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
         """
         if tuple(attention_mask.shape) != tuple(sequences.shape):
             raise ValueError("attention_mask must align with sequences")
+        length = sequences.shape[1]
+        multiple = getattr(self.actor_model, "unified_sequence_multiple", 1)
+        padding = (-length) % multiple
+        if padding:
+            sequences = functional.pad(sequences, (0, padding))
+            attention_mask = functional.pad(attention_mask, (0, padding))
+            if action_mask is not None:
+                action_mask = functional.pad(action_mask, (0, padding))
+        result = self._model_log_probs(sequences, attention_mask, action_mask)
+        return result[:, :length - 1] if padding else result
+
+    def _model_log_probs(
+        self, sequences: torch.Tensor, attention_mask: torch.Tensor,
+        action_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run the model on prepared rows; caller restores original token coordinates."""
+        model_kwargs = {}
+        if getattr(self.actor_model, "unified_sequence_multiple", 1) > 1:
+            # SP embeddings shorten the local sequence; RoPE needs global positions.
+            model_kwargs["position_ids"] = torch.arange(sequences.shape[1], device=sequences.device).unsqueeze(0)
         if getattr(self.actor_model, "supports_token_log_probs", False):
             selected_kwargs = {}
             if action_mask is not None and getattr(self.actor_model, "supports_token_log_probs_mask", False):
@@ -155,6 +175,7 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
                 use_cache=False,
                 return_token_log_probs=True,
                 **selected_kwargs,
+                **model_kwargs,
             )
             if (not isinstance(log_probs, torch.Tensor) or log_probs.dtype != torch.float32
                     or tuple(log_probs.shape) != (sequences.shape[0], sequences.shape[1] - 1)):
@@ -164,6 +185,7 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
             input_ids=sequences,
             attention_mask=attention_mask,
             use_cache=False,
+            **model_kwargs,
         )
         logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
         next_token_ids = sequences[:, 1:]

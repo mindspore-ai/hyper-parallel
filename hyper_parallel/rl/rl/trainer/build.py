@@ -14,8 +14,6 @@
 # ============================================================================
 """The sole construction boundary for all RL training modes."""
 import functools
-from rl.workers.targets import TargetPreparer
-from rl.workers.engine.residency import TrainingResidency
 import os
 import json
 import logging
@@ -25,6 +23,8 @@ from dataclasses import replace
 from typing import Any, Mapping, Optional
 import torch
 import torch.distributed as dist
+from rl.workers.targets import TargetPreparer
+from rl.workers.engine.residency import TrainingResidency
 from rl.agentic.codex import CodexRuntime
 from rl.agentic.ds_harness import DeepSeekRuntime
 from rl.algorithm.distillation import compose_training_algorithm
@@ -33,7 +33,7 @@ from rl.distillation.config import parse_distillation_config
 from rl.distillation.teacher import TeacherManager
 from rl.trainer.checkpoint import CheckpointResources, RLCheckpointManager
 from rl.config.schema import build_model_registration, required_mapping, router_replay_mode, uses_colocated_vllm
-from rl.config.resolve import build_runtime_config, resolve_router_replay_config
+from rl.config.resolve import build_runtime_config, resolve_router_replay_config, resolve_unified_execution_config
 from rl.config.limits import resolve_vllm_automatic_limits
 from rl.config.validate import validate_config
 from rl.data.experience import ExperiencePreparer
@@ -51,15 +51,18 @@ from rl.rollout.registry import build_rollout_engine
 from rl.rollout.manager import CodexRolloutManager, DeepSeekRolloutManager, RolloutManager
 from rl.utils.monitoring.tracker import TrainingTracker
 from rl.utils.monitoring.config import sanitize_config
-from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo
-from hyper_parallel.trainer.config import normalize_distributed_setup_overrides
-from hyper_parallel.trainer.runtime.distributed import create_distributed_setup_from_config, initialize_distributed
 from rl.trainer.state import RLTrainerState
 from rl.trainer.distributed import run_synchronized
 from rl.trainer.lifecycle import RunLifecycle
 from rl.weight_sync.publication import PolicyPublication
 from rl.distillation.runtime import TeacherScorer
 from rl.reward_model.runtime import RewardScorer
+from rl.unified_execution.validation import capture_training_structure
+from rl.unified_execution.runtimes.hyper_parallel.training import guard_training_numerics, install_training_attention
+from rl.unified_execution.batch_invariant import initialize_batch_invariant, verify_batch_invariant
+from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo
+from hyper_parallel.trainer.config import normalize_distributed_setup_overrides
+from hyper_parallel.trainer.runtime.distributed import create_distributed_setup_from_config, initialize_distributed
 
 def _configure_batch_invariant_communication(config: Mapping[str, Any]) -> None:
     """Align HCCL options before Trainer and rollout process groups initialize."""
@@ -132,7 +135,9 @@ class _TrainerBuilder:
 
     def __init__(self, resolved_config: Mapping[str, Any]) -> None:
         """Validate configuration and build the complete distributed runtime."""
-        self.resolved_config = resolve_vllm_automatic_limits(resolve_router_replay_config(resolved_config))
+        self.resolved_config = resolve_vllm_automatic_limits(
+            resolve_router_replay_config(resolve_unified_execution_config(resolved_config))
+        )
         self.distillation_config = parse_distillation_config(self.resolved_config.get('distillation'))
         self.algorithm = compose_training_algorithm(
             build_algorithm(required_mapping(self.resolved_config, 'algorithm')), self.distillation_config,
@@ -194,6 +199,9 @@ class _TrainerBuilder:
         seed = int(self.runtime_config.training.seed)
         random.seed(seed)
         torch.manual_seed(seed)
+        unified = self.resolved_config.get("rollout", {}).get("vllm", {}).get("unified_execution")
+        if unified is not None and "batch_invariant" in unified:
+            self.batch_invariant_state = initialize_batch_invariant(unified["batch_invariant"])
 
     def _validate_runtime_topology(self) -> None:
         """Validate torchrun world size against the resolved Trainer mesh."""
@@ -364,6 +372,14 @@ class _TrainerBuilder:
             token_log_probs_chunk_size=train_config.get("token_log_probs_chunk_size", 512),
         )
 
+    @staticmethod
+    def _install_unified_training(model, unified) -> None:
+        """Attach shared attention and numerical-policy guards to a built role."""
+        if unified["attention_backend"] == "flash_attention_npu_v4":
+            install_training_attention(model)
+        if "batch_invariant" in unified:
+            guard_training_numerics(model, unified["batch_invariant"])
+
     def _build_models_and_optimizers(self) -> None:
         """Build requirement-selected models and their independent optimizers."""
         train_config = required_mapping(self.resolved_config, "train")
@@ -376,8 +392,14 @@ class _TrainerBuilder:
             token_log_probs_mode=train_config.get("token_log_probs_mode", "auto"),
             token_log_probs_chunk_size=train_config.get("token_log_probs_chunk_size", 512),
         )
+        unified = self.resolved_config.get("rollout", {}).get("vllm", {}).get("unified_execution")
+        if unified is not None:
+            unified["training_structure"] = capture_training_structure(actor_model, unified)
+            self._install_unified_training(actor_model, unified)
         self._record_role_config("actor", self.runtime_config, self.distributed_setup)
         reference_model = self._build_reference_model(train_config)
+        if reference_model is not None and unified is not None:
+            self._install_unified_training(reference_model, unified)
         critic_model = None
         critic_config = train_config.get("critic", {})
         if self.algorithm.requirements.roles.critic:
@@ -389,6 +411,10 @@ class _TrainerBuilder:
                 critic_runtime, critic_setup, frozen=False,
                 cpu_threads=train_config.get("model_init_cpu_threads"),
             )
+            if unified is not None and "batch_invariant" in unified:
+                guard_training_numerics(critic_model, unified["batch_invariant"])
+        if unified is not None and "batch_invariant" in unified:
+            self.batch_invariant_state = verify_batch_invariant(unified["batch_invariant"])
         actor_optimizer, actor_lr_scheduler = build_role_optimizer(
             self.runtime_config,
             actor_model,
@@ -649,13 +675,14 @@ def build_resources(config: Mapping[str, Any]) -> _TrainerBuilder:
 
 def build_trainer(config: Mapping[str, Any]) -> Any:
     """Select the concrete training loop from the declared execution mode."""
+    # Concrete loops import this builder; defer their imports to break the cycle.
     if "async_training" in config and "colocate_async" in config:
         raise ValueError("Choose exactly one asynchronous execution mode")
     if "async_training" in config:
-        from rl.trainer.fully_async import FullyAsyncTrainer
+        from rl.trainer.fully_async import FullyAsyncTrainer  # pylint: disable=C0415
         return FullyAsyncTrainer(config)
     if "colocate_async" in config:
-        from rl.trainer.colocate_async import ColocateAsyncTrainer
+        from rl.trainer.colocate_async import ColocateAsyncTrainer  # pylint: disable=C0415
         return ColocateAsyncTrainer(config)
-    from rl.trainer.sync import SyncTrainer
+    from rl.trainer.sync import SyncTrainer  # pylint: disable=C0415
     return SyncTrainer(build_resources(config))

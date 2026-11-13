@@ -19,14 +19,44 @@ import torch
 from rl.workers.engine.model import model_trust_remote_code, trainer_attention_implementation
 from rl.workers.critic import build_value_model
 from rl.workers.adapters.qwen3 import build_causal_lm
+from rl.config.schema import (
+    _activation_checkpoint_mode, _normalize_dtype_name, _optimizer_fp32_main_params,
+    _trainer_topology, build_model_registration, optional_mapping, required_mapping, router_replay_mode,
+)
+from rl.config.validate import _validate_model_scope
+from rl.unified_execution.contract import build_unified_payload, validate_unified_config
 from hyper_parallel.components.checkpoint.config import CheckpointingConfig
 from hyper_parallel.components.optim import AdamW, MultiLRScheduler
 from hyper_parallel.models import HyperAutoModelForCausalLM
 from hyper_parallel.models.build_options import FSDP2Config, FSDP2MixedPrecisionConfig
-from hyper_parallel.trainer.config import AcceleratorConfig, ActivationCheckpointConfig, MixedPrecisionConfig, OptimizerConfig, PlanOverride, Target, TrainerConfig, TrainingConfig
+from hyper_parallel.trainer.config import (
+    AcceleratorConfig, ActivationCheckpointConfig, MixedPrecisionConfig, OptimizerConfig,
+    PlanOverride, Target, TrainerConfig, TrainingConfig,
+)
 from hyper_parallel.trainer.config.resolver import resolve_component
-from rl.config.schema import _activation_checkpoint_mode, _normalize_dtype_name, _optimizer_fp32_main_params, _trainer_topology, build_model_registration, optional_mapping, required_mapping, router_replay_mode
-from rl.config.validate import _validate_model_scope
+
+
+def resolve_unified_execution_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Derive both runtime selections from the explicitly shared training plan.
+
+    Args:
+        config: Complete user RL configuration, never modified in place.
+
+    Returns:
+        Independent configuration containing the validated worker payload.
+    """
+    resolved = deepcopy(dict(config))
+    payload = build_unified_payload(resolved)
+    if payload is not None:
+        vllm = resolved["rollout"].setdefault("vllm", {})
+        if vllm.get("model_implementation", "unified") != "unified":
+            raise ValueError("consistency.mode=architecture conflicts with rollout.vllm.model_implementation")
+        vllm["model_implementation"] = "unified"
+        vllm["unified_execution"] = payload
+        for field, axis in (("tensor_parallel_size", "tp"), ("context_parallel_size", "cp"),
+                            ("pipeline_parallel_size", "pp"), ("sequence_parallel", "sequence_parallel")):
+            vllm[field] = payload["parallelism"][axis]
+    return resolved
 
 
 def resolve_router_replay_config(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -67,10 +97,11 @@ def _build_model_target(
     *,
     value_model: bool = False,
     family: str = "qwen3",
+    unified: bool = False,
 ) -> Target:
     """Build the pretrained causal-language-model target."""
     attention_implementation = trainer_attention_implementation(model_config)
-    if family in ("qwen3_moe", "qwen3_5"):
+    if family == "qwen3_5" or (family == "qwen3_moe" and not unified):
         builder = HyperAutoModelForCausalLM.from_pretrained
         target_path = "hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained"
         builder_options = {}
@@ -214,8 +245,7 @@ def build_runtime_config(
     config: Mapping[str, Any], *, critic: bool = False, reference: bool = False,
 ) -> TrainerConfig:
     """Translate Hyper-RL YAML into the HyperAutoModel runtime configuration."""
-    if "consistency" in config:
-        raise ValueError("consistency was removed; remove the field and use native-vLLM")
+    validate_unified_config(config)
     if critic and reference:
         raise ValueError("A role cannot be both Critic and Reference")
     registration = build_model_registration(config)
@@ -261,6 +291,7 @@ def build_runtime_config(
             model_config, param_dtype_name, mixed_precision_enabled,
             value_model=critic,
             family=registration.family,
+            unified="consistency" in config,
         ),
         plan_overrides=resolve_component(
             train_config["plan_overrides"], annotation=list[PlanOverride], path="train.plan_overrides",

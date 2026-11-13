@@ -20,6 +20,9 @@ __all__ = [
     "NATIVE_QWEN3_ARCHITECTURE",
     "NATIVE_QWEN3_MOE_ARCHITECTURE",
     "NATIVE_QWEN3_5_ARCHITECTURE",
+    "UNIFIED_QWEN3_ARCHITECTURE",
+    "UNIFIED_QWEN3_MOE_ARCHITECTURE",
+    "UNIFIED_MODEL_ARCHITECTURES",
     "SUPPORTED_MODEL_IMPLEMENTATIONS",
     "VLLMModelRegistration",
     "architecture_for_implementation",
@@ -39,15 +42,20 @@ from typing import Any, Iterator, Mapping, Optional
 import torch
 from transformers import AutoTokenizer
 
-from hyper_parallel import HSDPModule
 from rl.workers.adapters.moe_rotary import rebuild_qwen3_moe_rotary_state
+
+from hyper_parallel import HSDPModule
 
 _TRANSFORMERS_BUILTIN_ATTENTION = "transformers_builtin"
 
 # Existing recipes and vLLM registrations depend on these public identifiers.
 NATIVE_MODEL_IMPLEMENTATION = "native"
+UNIFIED_QWEN3_ARCHITECTURE = "HyperParallelQwen3ForCausalLM"
+UNIFIED_QWEN3_MOE_ARCHITECTURE = "HyperParallelQwen3MoeForCausalLM"
+UNIFIED_MODEL_ARCHITECTURES = frozenset((UNIFIED_QWEN3_ARCHITECTURE, UNIFIED_QWEN3_MOE_ARCHITECTURE))
 SUPPORTED_MODEL_IMPLEMENTATIONS = (
     NATIVE_MODEL_IMPLEMENTATION,
+    "unified",
 )
 NATIVE_QWEN3_ARCHITECTURE = "Qwen3ForCausalLM"
 NATIVE_QWEN3_MOE_ARCHITECTURE = "Qwen3MoeForCausalLM"
@@ -119,7 +127,7 @@ def normalize_model_implementation(value: Any) -> str:
     implementation = str(value or NATIVE_MODEL_IMPLEMENTATION).strip().lower()
     if implementation not in SUPPORTED_MODEL_IMPLEMENTATIONS:
         raise ValueError(
-            "rollout.vllm.model_implementation only supports 'native'; the 'hyper' implementation was removed, "
+            "rollout.vllm.model_implementation supports 'native' or 'unified'; the 'hyper' implementation was removed, "
             f"got {value!r}"
         )
     return implementation
@@ -134,9 +142,11 @@ def architecture_for_implementation(
     architectures = {
         "qwen3": {
             NATIVE_MODEL_IMPLEMENTATION: NATIVE_QWEN3_ARCHITECTURE,
+            "unified": UNIFIED_QWEN3_ARCHITECTURE,
         },
     }
-    architectures["qwen3_moe"] = {NATIVE_MODEL_IMPLEMENTATION: NATIVE_QWEN3_MOE_ARCHITECTURE}
+    architectures["qwen3_moe"] = {NATIVE_MODEL_IMPLEMENTATION: NATIVE_QWEN3_MOE_ARCHITECTURE,
+                                  "unified": UNIFIED_QWEN3_MOE_ARCHITECTURE}
     architectures["qwen3_5"] = {NATIVE_MODEL_IMPLEMENTATION: NATIVE_QWEN3_5_ARCHITECTURE}
     try:
         return architectures[model_family][normalized]
@@ -187,7 +197,7 @@ def build_role_model(
         if previous_threads is not None:
             torch.set_num_threads(previous_threads)
     model_type = getattr(getattr(model, "config", None), "model_type", None)
-    if model_type == "qwen3_moe":
+    if model_type == "qwen3_moe" and not getattr(model, "_rl_rope_materialization_registered", False):
         rebuild_qwen3_moe_rotary_state(model)
     if token_log_probs_mode == "selected_chunked" or (token_log_probs_mode == "auto" and model_type == "qwen3_5_text"):
         # policy exports Actor, whose rollout imports this module during package initialization.

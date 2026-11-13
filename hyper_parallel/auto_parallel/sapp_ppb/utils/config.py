@@ -412,7 +412,8 @@ def _generate_offset_config(rounds, unknowns, target_sum, array_length):
             flat.append(offset_config_slice)
             offset_config_list.append(offset_config)
         flat = np.array(flat)
-        flat = flat.flatten()[0 : unknowns + 1]
+        # Match the rows used by _get_coef_matrix; an extra row can hide rank deficiency.
+        flat = flat.flatten()[:unknowns]
         if not np.all(flat == flat[0]):
             return offset_config_list
 

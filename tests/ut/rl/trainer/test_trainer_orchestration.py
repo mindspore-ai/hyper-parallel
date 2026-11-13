@@ -24,7 +24,7 @@ import unittest
 import weakref
 from dataclasses import replace
 from types import MethodType, SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 from unittest.mock import Mock, patch
 
 import pytest
@@ -34,7 +34,6 @@ from torch.multiprocessing.reductions import StorageWeakRef
 import rl.utils.process_cleanup as cleanup_module
 import rl.trainer.sync as trainer_module
 import rl.trainer.build as builder_module
-import rl.trainer.lifecycle as lifecycle_module
 import rl.weight_sync.publication as publication_module
 from rl.trainer.build import _TrainerBuilder
 from rl.trainer.lifecycle import RunLifecycle
@@ -86,7 +85,6 @@ def test_trainer_initializes_batch_invariant_settings_before_distributed_runtime
     resolved = {"algorithm": {"name": "grpo", "loss_aggregation": "token-mean"}}
     monkeypatch.setattr(builder_module, "resolve_vllm_automatic_limits", lambda config: config)
     monkeypatch.setattr(builder_module, "resolve_router_replay_config", lambda config: config)
-    pass
     monkeypatch.setattr(
         builder_module,
         "build_algorithm",
@@ -98,7 +96,6 @@ def test_trainer_initializes_batch_invariant_settings_before_distributed_runtime
         "_configure_batch_invariant_communication",
         lambda _config: calls.append("batch-invariant"),
     )
-    pass
     monkeypatch.setattr(
         builder_module,
         "build_model_registration",
@@ -151,7 +148,12 @@ def test_trainer_builds_independent_trainable_and_reference_roles(
 ) -> None:
     """GRPO construction exposes one trainable Actor and one frozen Reference."""
     trainer = object.__new__(_TrainerBuilder)
-    trainer.residency = SimpleNamespace(offload_manager=None, metrics={}, move=lambda **kw: None, reshard_model=TrainingResidency.reshard_model)
+    trainer.residency = SimpleNamespace(
+        offload_manager=None,
+        metrics={},
+        move=lambda **kw: None,
+        reshard_model=TrainingResidency.reshard_model,
+    )
     trainer.distillation_config = DistillationConfig()
     trainer.algorithm = build_algorithm({"name": "grpo", "loss_aggregation": "token-mean"})
     trainer.resolved_config = {
@@ -203,7 +205,12 @@ def test_trainer_step_orchestrates_required_role_outputs_in_order(
     trainer.teacher_scorer = trainer.reward_scorer = None
     trainer.lifecycle = RunLifecycle(state=getattr(trainer, "state", None))
     trainer.publication = SimpleNamespace(publish=lambda version: None)
-    trainer.residency = SimpleNamespace(offload_manager=None, metrics={}, move=lambda **kw: None, reshard_model=TrainingResidency.reshard_model)
+    trainer.residency = SimpleNamespace(
+        offload_manager=None,
+        metrics={},
+        move=lambda **kw: None,
+        reshard_model=TrainingResidency.reshard_model,
+    )
     trainer.distillation_config = DistillationConfig()
     trainer._consistency_profile = "qwen3"
     trainer.algorithm = SimpleNamespace(
@@ -326,7 +333,8 @@ def test_trainer_step_orchestrates_required_role_outputs_in_order(
 
         critic=trainer.critic, algorithm=trainer.algorithm, experience_preparer=trainer.experience_preparer,
 
-        run_synchronized=trainer._run_rank_synchronized, old_log_prob_source=getattr(trainer, "_old_log_prob_source", "rollout"))
+        run_synchronized=trainer._run_rank_synchronized,
+        old_log_prob_source=getattr(trainer, "_old_log_prob_source", "rollout"))
 
     trainer.publication = PolicyPublication(actor=trainer.actor, model_registration=trainer.model_registration,
         rollout_engine=trainer.rollout_engine, residency=trainer.residency)
@@ -364,7 +372,12 @@ def test_trainer_publication_releases_training_state_before_rollout_wake(
     trainer.teacher_scorer = trainer.reward_scorer = None
     trainer.lifecycle = RunLifecycle(state=getattr(trainer, "state", None))
     trainer.publication = SimpleNamespace(publish=lambda version: None)
-    trainer.residency = SimpleNamespace(offload_manager=None, metrics={}, move=lambda **kw: None, reshard_model=TrainingResidency.reshard_model)
+    trainer.residency = SimpleNamespace(
+        offload_manager=None,
+        metrics={},
+        move=lambda **kw: None,
+        reshard_model=TrainingResidency.reshard_model,
+    )
     trainer.distillation_config = DistillationConfig()
     trainer.actor = SimpleNamespace(actor_model=object())
     trainer.model_registration = SimpleNamespace(name="qwen")
@@ -389,7 +402,12 @@ def test_post_publication_release_failure_does_not_wake_rollout(monkeypatch: pyt
     trainer.teacher_scorer = trainer.reward_scorer = None
     trainer.lifecycle = RunLifecycle(state=getattr(trainer, "state", None))
     trainer.publication = SimpleNamespace(publish=lambda version: None)
-    trainer.residency = SimpleNamespace(offload_manager=None, metrics={}, move=lambda **kw: None, reshard_model=TrainingResidency.reshard_model)
+    trainer.residency = SimpleNamespace(
+        offload_manager=None,
+        metrics={},
+        move=lambda **kw: None,
+        reshard_model=TrainingResidency.reshard_model,
+    )
     trainer.actor = SimpleNamespace(actor_model=object())
     trainer.model_registration = SimpleNamespace(name="qwen")
     trainer.residency.reshard_model = Mock()
@@ -413,7 +431,12 @@ def test_trainer_completes_metrics_and_evaluation_after_published_step(
     trainer = object.__new__(SyncTrainer)
     trainer.teacher_scorer = trainer.reward_scorer = None
     trainer.lifecycle = RunLifecycle(state=getattr(trainer, "state", None))
-    trainer.residency = SimpleNamespace(offload_manager=None, metrics={}, move=lambda **kw: None, reshard_model=TrainingResidency.reshard_model)
+    trainer.residency = SimpleNamespace(
+        offload_manager=None,
+        metrics={},
+        move=lambda **kw: None,
+        reshard_model=TrainingResidency.reshard_model,
+    )
     trainer.distillation_config = DistillationConfig()
     trainer.state = SimpleNamespace(global_step=0, max_steps=2)
     trainer._log_samples = 1
@@ -477,7 +500,12 @@ def test_trainer_runs_one_complete_synchronous_training_step(
     trainer.teacher_scorer = trainer.reward_scorer = None
     trainer.lifecycle = RunLifecycle(state=getattr(trainer, "state", None))
     trainer.publication = SimpleNamespace(publish=lambda version: None)
-    trainer.residency = SimpleNamespace(offload_manager=None, metrics={}, move=lambda **kw: None, reshard_model=TrainingResidency.reshard_model)
+    trainer.residency = SimpleNamespace(
+        offload_manager=None,
+        metrics={},
+        move=lambda **kw: None,
+        reshard_model=TrainingResidency.reshard_model,
+    )
     trainer.distillation_config = DistillationConfig()
     trainer._consistency_profile = "off"
     trainer._old_log_prob_source = "actor" if omit_sampling_probabilities else "rollout"
@@ -614,7 +642,8 @@ def test_trainer_runs_one_complete_synchronous_training_step(
 
     trainer.targets = TargetPreparer(actor=trainer.actor, reference_actor=trainer.reference_actor,
         critic=trainer.critic, algorithm=trainer.algorithm, experience_preparer=trainer.experience_preparer,
-        run_synchronized=trainer._run_rank_synchronized, old_log_prob_source=getattr(trainer, "_old_log_prob_source", "rollout"))
+        run_synchronized=trainer._run_rank_synchronized,
+        old_log_prob_source=getattr(trainer, "_old_log_prob_source", "rollout"))
     trainer.publication = PolicyPublication(actor=trainer.actor, model_registration=trainer.model_registration,
         rollout_engine=trainer.rollout_engine, residency=trainer.residency)
     trainer.lifecycle = RunLifecycle(_tracker=trainer._tracker, rollout_manager=trainer.rollout_manager,
@@ -650,7 +679,13 @@ def test_trainer_sets_up_runtime_with_mocked_distributed_boundary(
     setup = SimpleNamespace(mesh_context=mesh_context, strategy_config=None)
     handle = SimpleNamespace(set_device=lambda rank: calls.append(("set-device", rank)))
     trainer = object.__new__(_TrainerBuilder)
-    trainer.residency = SimpleNamespace(offload_manager=None, metrics={}, move=lambda **kw: None, reshard_model=TrainingResidency.reshard_model)
+    trainer.resolved_config = {}
+    trainer.residency = SimpleNamespace(
+        offload_manager=None,
+        metrics={},
+        move=lambda **kw: None,
+        reshard_model=TrainingResidency.reshard_model,
+    )
     trainer.distillation_config = DistillationConfig()
     trainer.runtime_config = SimpleNamespace(
         training=SimpleNamespace(backend="hccl", seed=1234),
@@ -740,7 +775,12 @@ def test_trainer_builds_tokenizer_data_and_dataloader(
     monkeypatch.setattr(builder_module, "PromptDataset", Dataset)
     monkeypatch.setattr(builder_module, "build_train_dataloader", build_dataloader)
     trainer = object.__new__(_TrainerBuilder)
-    trainer.residency = SimpleNamespace(offload_manager=None, metrics={}, move=lambda **kw: None, reshard_model=TrainingResidency.reshard_model)
+    trainer.residency = SimpleNamespace(
+        offload_manager=None,
+        metrics={},
+        move=lambda **kw: None,
+        reshard_model=TrainingResidency.reshard_model,
+    )
     trainer.distillation_config = DistillationConfig()
     trainer.resolved_config = {
         "model": {"tokenizer_path": "/model"},
@@ -824,7 +864,12 @@ def test_trainer_builds_rollout_evaluator_and_tp_request_owner(
         lambda **kwargs: calls.append(("evaluator", kwargs)) or SimpleNamespace(**kwargs),
     )
     trainer = object.__new__(_TrainerBuilder)
-    trainer.residency = SimpleNamespace(offload_manager=None, metrics={}, move=lambda **kw: None, reshard_model=TrainingResidency.reshard_model)
+    trainer.residency = SimpleNamespace(
+        offload_manager=None,
+        metrics={},
+        move=lambda **kw: None,
+        reshard_model=TrainingResidency.reshard_model,
+    )
     trainer.distillation_config = DistillationConfig()
     trainer.algorithm = build_algorithm({"name": "grpo", "loss_aggregation": "token-mean"})
     trainer.model_registration = SimpleNamespace(name="qwen")
@@ -882,7 +927,12 @@ def test_trainer_builds_runtime_and_tracker_components(
     """Production runtime and tracker methods retain component order and rank-zero config."""
     calls: list[Any] = []
     trainer = object.__new__(_TrainerBuilder)
-    trainer.residency = SimpleNamespace(offload_manager=None, metrics={}, move=lambda **kw: None, reshard_model=TrainingResidency.reshard_model)
+    trainer.residency = SimpleNamespace(
+        offload_manager=None,
+        metrics={},
+        move=lambda **kw: None,
+        reshard_model=TrainingResidency.reshard_model,
+    )
     trainer.distillation_config = DistillationConfig()
     trainer._dp_group_info = None
     trainer.algorithm = build_algorithm({"name": "grpo", "loss_aggregation": "token-mean"})
@@ -951,7 +1001,12 @@ def test_trainer_validates_supported_shared_runtime_topology(
 ) -> None:
     """Production topology validation accepts one consistent shared DP2xTP1 deployment."""
     trainer = object.__new__(_TrainerBuilder)
-    trainer.residency = SimpleNamespace(offload_manager=None, metrics={}, move=lambda **kw: None, reshard_model=TrainingResidency.reshard_model)
+    trainer.residency = SimpleNamespace(
+        offload_manager=None,
+        metrics={},
+        move=lambda **kw: None,
+        reshard_model=TrainingResidency.reshard_model,
+    )
     trainer.distillation_config = DistillationConfig()
     trainer.parallel_dims = SimpleNamespace(
         dp_size=2,
@@ -1224,7 +1279,12 @@ def test_trainer_builds_required_models_optimizers_and_role_runtime(
 ) -> None:
     """GRPO construction creates independent trainable/reference models and Actor roles."""
     trainer = object.__new__(_TrainerBuilder)
-    trainer.residency = SimpleNamespace(offload_manager=None, metrics={}, move=lambda **kw: None, reshard_model=TrainingResidency.reshard_model)
+    trainer.residency = SimpleNamespace(
+        offload_manager=None,
+        metrics={},
+        move=lambda **kw: None,
+        reshard_model=TrainingResidency.reshard_model,
+    )
     trainer.distillation_config = DistillationConfig()
     trainer.algorithm = build_algorithm(
         {"name": "grpo", "loss_aggregation": "token-mean"}
@@ -1245,7 +1305,10 @@ def test_trainer_builds_required_models_optimizers_and_role_runtime(
     trainer.parallel_dims = SimpleNamespace(dp_size=2)
     trainer.runtime_config = SimpleNamespace(fsdp_config=SimpleNamespace(enable_offload=False), to_dict=lambda: {})
     trainer.distributed_setup = DistributedSetup(strategy_config=trainer.runtime_config.fsdp_config)
-    reference_runtime = SimpleNamespace(fsdp_config=SimpleNamespace(enable_offload=reference_offload), to_dict=lambda: {})
+    reference_runtime = SimpleNamespace(
+        fsdp_config=SimpleNamespace(enable_offload=reference_offload),
+        to_dict=lambda: {},
+    )
     if reference_offload is not None:
         trainer.resolved_config["train"]["accelerator"] = {"reference_cpu_offload": reference_offload}
     runtime_builder = Mock(return_value=reference_runtime)
@@ -1410,7 +1473,12 @@ def test_trainer_complete_step_coordinates_colocated_checkpoint_residency(
     trainer = object.__new__(SyncTrainer)
     trainer.teacher_scorer = trainer.reward_scorer = None
     trainer.lifecycle = RunLifecycle(state=getattr(trainer, "state", None))
-    trainer.residency = SimpleNamespace(offload_manager=None, metrics={}, move=lambda **kw: None, reshard_model=TrainingResidency.reshard_model)
+    trainer.residency = SimpleNamespace(
+        offload_manager=None,
+        metrics={},
+        move=lambda **kw: None,
+        reshard_model=TrainingResidency.reshard_model,
+    )
     trainer.distillation_config = DistillationConfig()
     trainer.state = SimpleNamespace(global_step=0, max_steps=2)
     trainer._log_samples = 0
@@ -1468,14 +1536,11 @@ def _install_step_diagnostics(monkeypatch, calls):
     """Record forward-contract and consistency calls for step-order assertions."""
     monkeypatch.setattr(publication_module, "hsdp_sync_stream", lambda: None)
     monkeypatch.setattr(trainer_module.dist, "get_rank", lambda: 0)
-    pass
-    pass
     monkeypatch.setattr(
         targets_module,
         "summarize_training_diagnostics",
         lambda *_args: calls.append("diagnostics") or {"training/tokens": 1.0},
     )
-    pass
 
 
 def _recording_checkpoints(calls):
@@ -1633,7 +1698,12 @@ class TestTrainingContracts(unittest.TestCase):
                 trainer = SyncTrainer.__new__(SyncTrainer)
                 trainer.teacher_scorer = trainer.reward_scorer = None
                 trainer.lifecycle = RunLifecycle(state=getattr(trainer, "state", None))
-                trainer.residency = SimpleNamespace(offload_manager=None, metrics={}, move=lambda **kw: None, reshard_model=TrainingResidency.reshard_model)
+                trainer.residency = SimpleNamespace(
+                    offload_manager=None,
+                    metrics={},
+                    move=lambda **kw: None,
+                    reshard_model=TrainingResidency.reshard_model,
+                )
                 trainer.resolved_config = {
                     "train": {"checkpoint": {"save_final": False}},
                     "evaluation": {"before_train": True, "every_n_steps": 5, "at_end": True},
@@ -1648,14 +1718,15 @@ class TestTrainingContracts(unittest.TestCase):
                 trainer.evaluator = Mock(last_step=-1)
                 calls = []
 
-                def evaluate(step: int, *, trainer=trainer, record_call=calls.append) -> tuple[dict[str, float], list]:
+                def evaluate(step: int, *, trainer: SyncTrainer = trainer,
+                                          record_call: Callable = calls.append) -> tuple[dict[str, float], list]:
                     """Record the exact published policy version."""
                     record_call(step)
                     self.assertEqual(trainer.state.global_step, step)
                     trainer.evaluator.last_step = step
                     return {"validation/accuracy": 0.5}, []
 
-                def train_step(batch: object, *, trainer=trainer) -> None:
+                def train_step(batch: object, *, trainer: SyncTrainer = trainer) -> None:
                     """Advance a simulated successful publication."""
                     del batch
                     trainer.state.global_step += 1
@@ -1702,7 +1773,7 @@ class TestTrainingContracts(unittest.TestCase):
                 trainer_module, "build_training_metrics", return_value={"train/gradient_norm": 1.0}), patch.object(
                 trainer_module, "enforce_learning_gate"), patch.object(
                 trainer_module, "uses_colocated_vllm", return_value=True):
-            trainer._complete_step(step=2, batch={}, rollout=object(), actor_update=update,
+            SyncTrainer._complete_step(trainer, step=2, batch={}, rollout=object(), actor_update=update,
                                    critic_update=None, diagnostic_metrics={})
         self.assertEqual(events, ["evaluate", "close", "save"])
         self.assertEqual(trainer.evaluator.last_step, 2)
@@ -1726,7 +1797,12 @@ class TestTrainingContracts(unittest.TestCase):
         trainer = SyncTrainer.__new__(SyncTrainer)
         trainer.teacher_scorer = trainer.reward_scorer = None
         trainer.lifecycle = RunLifecycle(state=getattr(trainer, "state", None))
-        trainer.residency = SimpleNamespace(offload_manager=None, metrics={}, move=lambda **kw: None, reshard_model=TrainingResidency.reshard_model)
+        trainer.residency = SimpleNamespace(
+            offload_manager=None,
+            metrics={},
+            move=lambda **kw: None,
+            reshard_model=TrainingResidency.reshard_model,
+        )
         trainer.evaluator = Mock()
         trainer.state = SimpleNamespace(max_steps=10)
         trainer.checkpoints = Mock()
@@ -1750,11 +1826,19 @@ class TestCodexPreparation(unittest.TestCase):
                 trainer = object.__new__(SyncTrainer)
                 trainer.teacher_scorer = trainer.reward_scorer = None
                 trainer.lifecycle = RunLifecycle(state=getattr(trainer, "state", None))
-                trainer.residency = SimpleNamespace(offload_manager=None, metrics={}, move=lambda **kw: None, reshard_model=TrainingResidency.reshard_model)
+                trainer.residency = SimpleNamespace(
+                    offload_manager=None,
+                    metrics={},
+                    move=lambda **kw: None,
+                    reshard_model=TrainingResidency.reshard_model,
+                )
                 trainer.state = SimpleNamespace(global_step=0, max_steps=3, epoch=4)
                 trainer.rollout_manager = SimpleNamespace(preparation_enabled=boundary != "disabled", prepare=Mock())
                 trainer._evaluation_due = lambda step, boundary=boundary: boundary == "evaluation"
-                trainer.checkpoints = SimpleNamespace(will_save=lambda step, boundary=boundary: boundary == "checkpoint")
+                trainer.checkpoints = SimpleNamespace(
+                    will_save=lambda step,
+                    boundary=boundary: boundary == "checkpoint",
+                )
                 trainer._run_rank_synchronized = lambda _name, operation: operation()
                 trainer._prefetched_batch = None
                 batch = {"sample_indices": [1], "input_ids": torch.tensor([[1, 2]]),

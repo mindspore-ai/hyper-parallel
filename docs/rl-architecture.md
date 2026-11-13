@@ -17,3 +17,11 @@ GRPO/PPO/GSPO, MoE, RM, Teacher, Agent, and both asynchronous modes retain their
 See the [runtime architecture](../hyper_parallel/rl/docs/architecture.md) for detailed ordering and state contracts,
 [feature navigation](rl-navigation.md) for configuration and validation entry points, and [RL rules](../.agent/rules/hyper-rl.md) for development boundaries.
 Record CPU contract validation, short device flows, and learning outcomes separately.
+
+## Unified Training and Inference
+
+The optional [unified execution runtime](../hyper_parallel/rl/rl/unified_execution/README.md)
+reuses the HP model builder and complete `train.plan_overrides` for Qwen3 Dense and MoE.
+HP owns TP/SP and expert sharding; vLLM owns scheduling, paged KV cache and graph execution.
+Shared V4 attention, Level 3, ordinary row-parallel PIK and fixed-capacity EP provide the numerical path.
+The MoE path supports graph capture with fixed-capacity routing. CP/PP and expert-internal PIK remain separate work.

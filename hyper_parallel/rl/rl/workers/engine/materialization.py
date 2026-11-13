@@ -31,9 +31,13 @@ def _rope_factory(rotary: nn.Module) -> Callable[[MaterializationContext], torch
 
     def rebuild(context: MaterializationContext) -> torch.Tensor:
         """Compute canonical FP32 frequencies on CPU, then transfer to the target device."""
-        # Hyper-vLLM initializes the canonical frequencies on CPU. NPU pow
+        # Both model construction paths use canonical frequencies on CPU. NPU pow
         # differs by FP32 ULPs that can flip BF16 cos/sin at later positions.
-        value, _ = rope_function(rotary.config, device=torch.device("cpu"))
+        # HF may create intermediate tensors without an explicit device before
+        # applying its device argument. Keep those factories out of a caller's
+        # meta/NPU default-device context as well.
+        with torch.device("cpu"):
+            value, _ = rope_function(rotary.config, device=torch.device("cpu"))
         return value.to(device=context.device)
 
     return rebuild
@@ -41,15 +45,25 @@ def _rope_factory(rotary: nn.Module) -> Callable[[MaterializationContext], torch
 
 def register_qwen3_materialization(model: Any) -> None:
     """Declare native non-persistent buffers before sharding and to_empty lose their values."""
-    from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding  # pylint: disable=C0415
+    from rl.unified_execution.models import get_model_family  # pylint: disable=C0415
+
+    rotary_type = get_model_family(model.config.model_type).execution_types()["rotary"]
 
     if getattr(model, "_rl_rope_materialization_registered", False):
         return
     for module in model.modules():
-        if isinstance(module, Qwen3RotaryEmbedding):
+        if isinstance(module, rotary_type):
             factory = _rope_factory(module)
             for name in ("inv_freq", "original_inv_freq"):
                 if name in module._buffers:  # pylint: disable=protected-access
                     register_rebuildable_buffer(module, name, factory=factory)
+                    buffer = getattr(module, name)
+                    if not buffer.is_meta:
+                        # Single-rank from_config keeps live storage and never
+                        # enters HP's post-meta rebuild. Apply the same recipe
+                        # now without changing buffer identity or parameters.
+                        context = MaterializationContext(reason="random_init", device=buffer.device)
+                        with torch.no_grad():
+                            buffer.copy_(factory(context))
 
     setattr(model, "_rl_rope_materialization_registered", True)

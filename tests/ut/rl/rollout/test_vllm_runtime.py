@@ -916,6 +916,7 @@ def test_http_generate_tokens_routes_unseeded_and_batch_invariant_parents(
 def test_engine_exposes_weight_sync_strategy_and_streaming_stats() -> None:
     """Rollout forwards the retained publication status."""
     engine = object.__new__(VLLMGenerationEngine)
+    engine._unified_execution = None
     engine._weight_sync = SimpleNamespace(
         configured_strategy="full_gather",
         last_strategy="full_gather",

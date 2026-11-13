@@ -23,10 +23,16 @@ from types import SimpleNamespace
 from typing import Any, Optional
 
 import pytest
-import torch
-
 import rl.weight_sync.vllm_worker as worker_module
-from rl.weight_sync.vllm_worker import _native_weight_layout, get_policy_version, init_packed_weight_group, install_vllm_weight_sync_hooks, receive_ipc_packed_weights, receive_packed_weights
+import torch
+from rl.weight_sync.vllm_worker import (
+    _native_weight_layout,
+    get_policy_version,
+    init_packed_weight_group,
+    install_vllm_weight_sync_hooks,
+    receive_ipc_packed_weights,
+    receive_packed_weights,
+)
 
 
 class _Placement:
@@ -338,11 +344,14 @@ def test_worker_initializes_one_packed_group_for_all_rollout_workers(
     assert calls[0][0][2:4] == (4, 5)
 
 
+@pytest.mark.parametrize("engine_owned_reload", [False, True])
 def test_worker_hook_installation_runs_custom_update_and_wake_lifecycles(
     monkeypatch: pytest.MonkeyPatch,
+    engine_owned_reload: bool,
 ) -> None:
     """Installed vLLM hooks commit custom weights and keep the scheduler paused."""
     original_calls = []
+    reset_calls = []
 
     class WorkerBase:
         pass
@@ -364,6 +373,13 @@ def test_worker_hook_installation_runs_custom_update_and_wake_lifecycles(
         @staticmethod
         def finish_weight_update(worker: Any) -> None:
             original_calls.append(("finish", worker))
+
+    if engine_owned_reload:
+        def start_engine_update(worker: Any) -> None:
+            """Match the no-format-argument Ascend 0.30 worker signature."""
+            original_calls.append(("start", worker))
+
+        NPUWorker.start_weight_update = staticmethod(start_engine_update)
 
     class EngineCore:
         @staticmethod
@@ -411,6 +427,7 @@ def test_worker_hook_installation_runs_custom_update_and_wake_lifecycles(
         is receive_ipc_packed_weights
     )
     worker = SimpleNamespace(
+        model_runner=SimpleNamespace(reset_lora_state=lambda: reset_calls.append("reset")),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"])
         ),
@@ -422,6 +439,12 @@ def test_worker_hook_installation_runs_custom_update_and_wake_lifecycles(
         _check_nz_disabled=lambda: None,
     )
     NPUWorker.start_weight_update(worker)
+    with pytest.raises(RuntimeError, match="already active"):
+        NPUWorker.start_weight_update(worker)
+    with pytest.raises(RuntimeError, match="pending policy version"):
+        NPUWorker.finish_weight_update(worker)
+    assert worker._weight_update_active
+    assert not reset_calls
     worker._rl_pending_policy_version = 1
     NPUWorker.finish_weight_update(worker)
 
@@ -452,8 +475,9 @@ def test_worker_hook_installation_runs_custom_update_and_wake_lifecycles(
     assert worker._rl_loaded_policy_version == 1
     assert worker._rl_pending_policy_version is None
     assert worker._weight_update_active is False
+    assert reset_calls == (["reset"] if engine_owned_reload else [])
     assert original_calls == [
-        ("start", native_worker, True),
+        (("start", native_worker) if engine_owned_reload else ("start", native_worker, True)),
         ("update", native_worker, {"name": "native"}),
         ("finish", native_worker),
         ("wake", engine_core, ["kv_cache"]),
@@ -495,6 +519,25 @@ def test_finish_weight_update_commits_pending_version() -> None:
 
     assert worker._rl_loaded_policy_version == 1
     assert worker._rl_pending_policy_version is None
+
+
+def test_finish_weight_update_does_not_commit_when_lora_reset_fails() -> None:
+    """The 0.30 runner reset must succeed before publishing the new version."""
+    def fail_reset() -> None:
+        raise RuntimeError("LoRA reset failed")
+
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(reset_lora_state=fail_reset),
+        _weight_update_active=True,
+        _rl_pending_policy_version=2,
+        _rl_loaded_policy_version=1,
+        _check_weight_transfer_engine=lambda: None,
+    )
+    with pytest.raises(RuntimeError, match="LoRA reset failed"):
+        worker_module._finish_custom_weight_update(worker, reset_lora_state=True)
+    assert worker._weight_update_active
+    assert worker._rl_loaded_policy_version == 1
+    assert worker._rl_pending_policy_version == 2
 
 
 def test_worker_reports_native_qwen3_fused_qkv_layout(

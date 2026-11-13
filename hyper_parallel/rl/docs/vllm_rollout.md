@@ -4,7 +4,10 @@
 
 ## Scope
 
-Only native-vLLM remains. HP constructs training models; the RL plugin does not register a replacement Qwen3 model.
+Native-vLLM remains the default. Optional unified execution registers HP Qwen3 Dense and MoE models,
+reusing the training builder, replacement plan and supported parallel strategies.
+Shared V4 attention, Level 3, PIK and fixed-capacity EP retain paged KV, prefix caching, chunked prefill
+and `FULL_AND_PIECEWISE` graphs. See [Unified Execution](../rl/unified_execution/README.md) for recipes and scope.
 The plugin entry point is `rl.rollout.vllm_plugin:install_runtime_hooks`, which installs weight synchronization, tool evidence, partial service, and required sampling fixes.
 Version-sensitive private lifecycle hooks must match supported vLLM/vLLM-Ascend combinations; unknown versions fail explicitly.
 
