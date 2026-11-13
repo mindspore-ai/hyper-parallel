@@ -460,5 +460,10 @@ class DistributedSetup:
             low_precision_config=getattr(
                 getattr(config, "training", None), "low_precision", None
             ),
-            fp32_main_params=config.optimizer.fp32_main_params,
+            # Standalone eval/predict configure no optimizer; only the training
+            # assembly consumes the fp32 main-parameter policy.
+            fp32_main_params=(
+                bool(config.optimizer.fp32_main_params)
+                if getattr(config, "optimizer", None) is not None else False
+            ),
         )
