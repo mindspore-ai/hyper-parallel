@@ -24,7 +24,15 @@ from typing import Any, List, Literal, Optional
 from hyper_parallel.models.build_options import CompileConfig, FSDP2Config
 from hyper_parallel.components.checkpoint.config import CheckpointingConfig
 
-from hyper_parallel.trainer.config.data import DataLoaderConfig, DatasetConfig
+from hyper_parallel.trainer.config.data import (
+    DataLoaderConfig,
+    DatasetConfig,
+    ModelAssetsConfig,
+)
+from hyper_parallel.trainer.config.evaluation import (
+    EvaluationConfig,
+    PredictionConfig,
+)
 from hyper_parallel.trainer.config.optimization import (
     MixedPrecisionConfig,
     OptimizerConfig,
@@ -51,7 +59,11 @@ class TrainerConfig:
     """Resolved component tree; runtime objects are built by the task trainer."""
 
     model: Target[Any]
-    optimizer: OptimizerConfig
+    run_mode: Literal["train", "eval", "predict"] = "train"
+    # ``optimizer`` is required by the training assembly only. Standalone eval
+    # and predict tasks never build one, so the section is optional here and
+    # the run-mode validator enforces it for ``run_mode: train``.
+    optimizer: Optional[OptimizerConfig] = None
 
     lr_scheduler: Optional[Target[Any]] = None
     loss_fn: Optional[Target[Any]] = None
@@ -77,6 +89,12 @@ class TrainerConfig:
     dataset: Optional[DatasetConfig] = None
     dataloader: Optional[DataLoaderConfig] = None
     packed_sequence: Optional[Any] = None
+    # Top-level tokenizer/processor assets for standalone tasks. Empty falls
+    # back to the selected ``DatasetConfig.model_assets``.
+    model_assets: Optional[ModelAssetsConfig] = None
+
+    evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
+    prediction: PredictionConfig = field(default_factory=PredictionConfig)
 
     checkpoint: CheckpointingConfig = field(default_factory=CheckpointingConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
@@ -96,6 +114,15 @@ class TrainerConfig:
             and self.accelerator.pp_size > 1
         ):
             raise ValueError("compile is not supported together with pipeline parallelism")
+        if self.optimizer is None:
+            # Standalone eval/predict never build an optimizer. Rejecting a
+            # training run here as well keeps the old ``Trainer.train()`` entry
+            # honest: it never runs the run-mode validator.
+            if self.run_mode == "train":
+                raise ValueError(
+                    "run_mode='train' requires an 'optimizer' configuration section"
+                )
+            return
         reduce_dtype = self.fsdp_config.mix_precision.reduce_dtype
         if self.optimizer.fp32_main_params and reduce_dtype != "float32":
             raise ValueError(

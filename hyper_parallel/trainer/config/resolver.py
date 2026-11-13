@@ -653,6 +653,33 @@ def _resolve_target(node: object, *, path: str) -> Target[Any]:
     )
 
 
+def _resolve_target_list(node: object, *, path: str, item_type: object) -> list[Target[Any]]:
+    """Resolve a YAML sequence of target mappings into unbuilt ``Target`` objects.
+
+    Used by declarative lists such as ``evaluation.metrics``, where each entry
+    is an independent component built at task start rather than a field of a
+    parent configuration object.
+
+    Args:
+        node: Parsed YAML sequence.
+        path: Configuration path used in error messages.
+        item_type: Declared item annotation; either ``Target`` or ``Target[T]``.
+
+    Returns:
+        The resolved targets, in declared order.
+
+    Raises:
+        ConfigResolutionError: The node is not a sequence or an entry is invalid.
+    """
+    del item_type  # Every entry resolves to Target[Any]; the parameter documents intent.
+    if not isinstance(node, (list, tuple)):
+        raise ConfigResolutionError(path, f"expected a list of targets, got {type(node).__name__}")
+    return [
+        _resolve_target(item, path=f"{path}[{index}]")
+        for index, item in enumerate(node)
+    ]
+
+
 def _resolve_replacement_target(node: object, *, path: str) -> Target[Any]:
     """Apply Family selection only to registered baselines in replacement entries."""
     if not isinstance(node, Mapping) or "_target_" not in node:
@@ -847,6 +874,10 @@ def resolve_component(node: object, *, annotation: object, path: str) -> object:
         if path.endswith(".replace.implementation"):
             return _resolve_replacement_target(node, path=path)
         return _resolve_target(node, path=path)
+    if origin in (list, tuple) and get_args(annotation):
+        item_type = get_args(annotation)[0]
+        if item_type is Target or get_origin(item_type) is Target:
+            return _resolve_target_list(node, path=path, item_type=item_type)
     if annotation is DatasetConfig:
         return _resolve_dataset_config(node, path=path)
     if annotation is DataLoaderConfig:

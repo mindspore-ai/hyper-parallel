@@ -395,9 +395,13 @@ class BaseTrainer(Stateful, ABC):
             # item 5); the Trainer no longer patches it afterwards.
             model_init_dtype=self.config.model_init_dtype,
         )
+        optimizer_config = self.config.optimizer
         _validate_optimize_dtype(
             self.model,
-            fp32_main_params=self.config.optimizer.fp32_main_params,
+            fp32_main_params=(
+                bool(optimizer_config.fp32_main_params)
+                if optimizer_config is not None else False
+            ),
         )
         self.model_config = self.model.config
         if self.global_rank == 0:
@@ -486,15 +490,24 @@ class BaseTrainer(Stateful, ABC):
             cost_model: CostModel | None = None,
             balancing_algorithm: BalancingAlgorithm | None = None,
     ) -> None:
-        """Build and assign train, validation, and test dataloaders."""
+        """Build and assign train, validation, and test dataloaders.
+
+        A concrete Trainer may set ``dataloader_config_override`` and
+        ``training_config_override`` before calling this: standalone evaluation
+        uses its own dataloader section and its own logical batch instead of the
+        training ones, and both must reach the shared builder rather than only
+        the call sites in the Trainer.
+        """
+        dataloader_config = getattr(self, "dataloader_config_override", None) or self.config.dataloader
+        training_config = getattr(self, "training_config_override", None) or self.config.training
         split_names = ("train", "valid", "test")
         datasets = tuple(getattr(self, f"{split_name}_dataset", None) for split_name in split_names)
         dataloaders, batch_samplers = build_dataloader(
-            self.config.dataloader,
+            dataloader_config,
             datasets=datasets,
             collate_fn=self.collate_fn,
             mesh_context=self.mesh,
-            training_config=self.config.training,
+            training_config=training_config,
             data_config=getattr(self.config.dataset, "data_config", {}),
             max_seq_len=getattr(self.data_transform, "max_seq_len", None),
             default_seed=self.default_seed,
