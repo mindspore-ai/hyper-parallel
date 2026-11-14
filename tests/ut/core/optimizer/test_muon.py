@@ -20,7 +20,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from hyper_parallel.core.optimizer.muon import Muon
+from hyper_parallel.components.functional import make_gram_newton_schulz
+from hyper_parallel.core.optimizer.muon import (
+    Muon,
+    NSInputTransform,
+    _NS_ASYM5_COEFFS,
+    _NS_LEGACY_COEFFS,
+    zeropower_via_newtonschulz5,
+)
 from hyper_parallel.core.optimizer.optimizer import BaseDistributedOptimizer
 
 
@@ -70,6 +77,77 @@ def test_compute_batched_ns_updates_with_transform_accepts_plain_parameter():
         [parameter], ns_inputs, group, no_shard=True)
 
     assert updates[parameter].shape == parameter.shape
+
+
+@pytest.mark.parametrize("input_mode", ["plain", "reshape", "transform"])
+def test_muon_gram_callback_restores_updates(input_mode: str) -> None:
+    """Feature: Gram NS callback integration.
+
+    Description: Run plain, reshape and reversible transform preparation routes.
+    Expectation: The two-argument callback restores updates to the original shape.
+    """
+    calls = []
+
+    def backend(inputs: torch.Tensor) -> torch.Tensor:
+        """Record the prepared shape and return deterministic updates."""
+        calls.append(tuple(inputs.shape))
+        return inputs.clone().mul_(2)
+
+    implementation = MagicMock(return_value=backend)
+    with patch(
+        "hyper_parallel.components.functional.gram_newton_schulz._load_gram_newton_schulz",
+        return_value=implementation,
+    ):
+        callback = make_gram_newton_schulz([(1, 0, 0)] * 3, use_kernels=False)
+
+    optimizer = Muon.__new__(Muon)
+    optimizer.zeropower_fn = callback
+    optimizer.reshape_fn = None
+    optimizer.ns_transform_fn = None
+    parameter = torch.nn.Parameter(torch.ones(8, 8))
+    parameter.model_name = "weight"
+    original = torch.arange(64, dtype=torch.float32).view(8, 8)
+
+    if input_mode == "reshape":
+        optimizer.reshape_fn = lambda name, tensor: [tensor.view(4, 2, 8)]
+    elif input_mode == "transform":
+        def transform(name: str, tensor: torch.Tensor) -> NSInputTransform:
+            """Split a matrix into slices with a matching restoration callback."""
+            assert name == parameter.model_name, f"expected={parameter.model_name}, got={name}"
+            def restore(updates: list[torch.Tensor], output: torch.Tensor) -> None:
+                """Join transformed slice updates in their original order."""
+                output.copy_(torch.cat(updates, dim=0))
+
+            return NSInputTransform(tensors=[tensor[:4], tensor[4:]], restore=restore)
+
+        optimizer.ns_transform_fn = transform
+
+    updates = optimizer._compute_batched_ns_updates(  # pylint: disable=protected-access
+        [parameter], {parameter: original.clone()},
+        _plain_ns_group(ns_steps=3, matched_adamw_rms=0, zero_rms_scale_mode="use_lr"), no_shard=True,
+    )
+    torch.testing.assert_close(updates[parameter], original * 2)
+    expected_shapes = {"plain": (8, 8), "reshape": (4, 2, 8), "transform": (2, 4, 8)}
+    assert calls == [expected_shapes[input_mode]], f"expected={expected_shapes[input_mode]}, got={calls}"
+    assert len(implementation.call_args.kwargs["ns_coefficients"]) == 3, (
+        f"expected=3 coefficient groups, got={implementation.call_args.kwargs['ns_coefficients']}"
+    )
+
+
+@pytest.mark.parametrize("variant,steps", [("legacy", 1), ("legacy", 6), ("asym5", 1), ("asym5", 5), ("asym5", 6)])
+def test_native_ns_coefficient_resolution_preserves_updates(variant: str, steps: int) -> None:
+    """Feature: Native NS coefficient resolution.
+
+    Description: Compare legacy/asym5 schedules against explicit custom schedules.
+    Expectation: Updates remain bitwise equal, including asym5 step truncation.
+    """
+    coefficients = (_NS_LEGACY_COEFFS,) * steps if variant == "legacy" else _NS_ASYM5_COEFFS[:steps]
+    inputs = torch.randn(2, 4, 8, generator=torch.Generator().manual_seed(17))
+    expected = zeropower_via_newtonschulz5(
+        inputs, steps=len(coefficients), ns_variant="custom", ns_coefficients=coefficients,
+    )
+    actual = zeropower_via_newtonschulz5(inputs, steps=steps, ns_variant=variant)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_muon_rejects_invalid_ns_variant():

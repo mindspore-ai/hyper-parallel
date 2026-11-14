@@ -116,6 +116,27 @@ def _resolve_muon_advanced_options(options: Dict[str, Any]) -> _MuonAdvancedOpti
 _TransformNSState = Dict[str, Any]
 
 
+def _resolve_ns_coefficients(
+        steps: int,
+        ns_variant: str = "asym5",
+        ns_coefficients: Optional[Sequence[Tuple[float, float, float]]] = None,
+) -> Tuple[Tuple[float, float, float], ...]:
+    """Resolve the coefficient prefix shared by native NS and backend construction."""
+    if ns_variant == "legacy":
+        return (_NS_LEGACY_COEFFS,) * steps
+    if ns_variant == "asym5":
+        return _NS_ASYM5_COEFFS[:steps]
+    if ns_variant == "custom":
+        if ns_coefficients is None:
+            raise ValueError("ns_coefficients must be provided when ns_variant='custom'")
+        if steps > len(ns_coefficients):
+            raise ValueError(
+                f"ns_steps={steps} exceeds the {len(ns_coefficients)} provided coefficient groups"
+            )
+        return tuple(tuple(row) for row in ns_coefficients[:steps])
+    raise ValueError(f"ns_variant must be 'legacy', 'asym5', or 'custom', got {ns_variant!r}")
+
+
 def zeropower_via_newtonschulz5(
         ns_inputs: torch.Tensor,
         steps: int,
@@ -123,7 +144,18 @@ def zeropower_via_newtonschulz5(
         epsilon: float = 1e-10,
         ns_coefficients: Optional[Sequence[Tuple[float, float, float]]] = None,
 ) -> torch.Tensor:
-    """Newton-Schulz orthogonalization with preallocated matmul buffers."""
+    """Newton-Schulz orthogonalization with preallocated matmul buffers.
+
+    Args:
+        ns_inputs: Matrix or matrix batch to orthogonalize.
+        steps: Requested iteration count; asym5 uses at most five iterations.
+        ns_variant: Built-in legacy/asym5 schedule or an explicit custom schedule.
+        epsilon: Normalization epsilon added to the input norm.
+        ns_coefficients: Coefficient triples required by the custom variant.
+
+    Returns:
+        Orthogonalized updates with the input shape, dtype and device.
+    """
     mat_x = ns_inputs
     transposed = ns_inputs.size(-2) > ns_inputs.size(-1)
     if transposed:
@@ -137,22 +169,7 @@ def zeropower_via_newtonschulz5(
     buf_b = torch.empty_like(buf_a)
     buf_c = torch.empty(mat_x.shape, dtype=mat_x.dtype, device=mat_x.device)
 
-    if ns_variant == "legacy":
-        step_coeffs = [_NS_LEGACY_COEFFS] * steps
-    elif ns_variant == "asym5":
-        step_coeffs = _NS_ASYM5_COEFFS[:steps]
-    elif ns_variant == "custom":
-        if ns_coefficients is None:
-            raise ValueError("ns_coefficients must be provided when ns_variant='custom'")
-        if steps > len(ns_coefficients):
-            raise ValueError(
-                f"ns_steps={steps} exceeds the {len(ns_coefficients)} provided coefficient groups"
-            )
-        step_coeffs = tuple(ns_coefficients[:steps])
-    else:
-        raise ValueError(
-            f"ns_variant must be 'legacy', 'asym5', or 'custom', got {ns_variant!r}"
-        )
+    step_coeffs = _resolve_ns_coefficients(steps, ns_variant, ns_coefficients)
 
     for coeff_a, coeff_b, coeff_c in step_coeffs:
         torch.matmul(mat_x, mat_x.mT, out=buf_a)
@@ -223,7 +240,11 @@ class Muon(BaseDistributedOptimizer):
             ns_variant: Newton-Schulz coefficient variant.
             ns_coefficients: Optional custom Newton-Schulz coefficients.
             ns_epsilon: Numerical stability term used during normalization.
-            zeropower_fn: Optional Newton-Schulz implementation override.
+            zeropower_fn: Optional ``fn(local_tensor, steps=ns_steps)`` override.
+                Return a writable tensor with the same shape, dtype and device.
+                The callback owns its coefficient schedule and epsilon; these
+                group options are not forwarded. Recreate matching callback
+                configuration when restoring an optimizer checkpoint.
             momentum_update_fn: Optional momentum update implementation override.
             reshape_fn: Optional logical-matrix reshape function.
             ns_transform_fn: Optional Newton-Schulz input transformation.

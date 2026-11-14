@@ -17,7 +17,7 @@ from importlib import import_module as _import_module  # pylint: disable=invalid
 
 import inspect
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from hyper_parallel.core.optimizer.swap_optimizer import (
     SwapOptimizer,
@@ -61,10 +61,10 @@ def _load_torch_optimizer_runtime():
 
     from hyper_parallel.core.optimizer.adamw import AdamW
     from hyper_parallel.core.optimizer.dtensor_compat import detect_dtensor_backend
-    from hyper_parallel.core.optimizer.muon import Muon
+    from hyper_parallel.core.optimizer.muon import Muon, _resolve_ns_coefficients
     from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
 
-    return AdamW, Muon, ChainedOptimizer, detect_dtensor_backend
+    return AdamW, Muon, ChainedOptimizer, detect_dtensor_backend, _resolve_ns_coefficients
 
 
 def _effective_optimizer_config(
@@ -135,6 +135,34 @@ def _build_configured_optimizer(
     return optimizer
 
 
+def _configure_muon_gram_ns(optimizer: Any, resolve_coefficients: Callable[..., Any], backend: str) -> None:
+    """Bind the optional Gram callback from fully resolved Muon parameter groups."""
+    if optimizer.zeropower_fn is not None:
+        raise ValueError(f"muon_ns_backend={backend!r} cannot be combined with an explicit zeropower_fn")
+    schedules = []
+    for group in optimizer.param_groups:
+        steps = group["ns_steps"]
+        if not isinstance(steps, int) or isinstance(steps, bool) or steps <= 0:
+            raise ValueError(f"Gram Muon ns_steps must be a positive integer, got {steps!r}")
+        schedule = resolve_coefficients(steps, group["ns_variant"], group["ns_coefficients"])
+        if steps > len(schedule):
+            raise ValueError(f"Gram Muon ns_steps={steps} exceeds the {len(schedule)} coefficient groups")
+        schedules.append(schedule)
+    coefficients = max(schedules, key=len)
+    epsilon = optimizer.param_groups[0]["ns_epsilon"]
+    for group, schedule in zip(optimizer.param_groups, schedules):
+        if schedule != coefficients[:len(schedule)] or group["ns_epsilon"] != epsilon:
+            raise ValueError(
+                f"muon_ns_backend={backend!r} requires compatible coefficient prefixes and the same "
+                "ns_epsilon across Muon parameter groups"
+            )
+    # Optional CUDA dependencies stay off the native factory and optimizer import paths.
+    gram_module = _import_module("hyper_parallel.components.functional.gram_newton_schulz")
+    optimizer.zeropower_fn = gram_module.make_gram_newton_schulz(
+        coefficients, epsilon=epsilon, use_kernels=False if backend == "gram" else None,
+    )
+
+
 def get_hyper_optimizer(
         model: Any,
         muon_params: List[Dict[str, Any]],
@@ -142,6 +170,7 @@ def get_hyper_optimizer(
         muon_kwargs: Optional[Dict[str, Any]] = None,
         adamw_kwargs: Optional[Dict[str, Any]] = None,
         *,
+        muon_ns_backend: str = "native",
         sinkhorn_params: Optional[List[Dict[str, Any]]] = None,
         sinkhorn_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Any:
@@ -153,6 +182,12 @@ def get_hyper_optimizer(
         adamw_params: Param groups for AdamW. Empty list disables AdamW.
         muon_kwargs: Dedicated configurations dict for Muon.
         adamw_kwargs: Dedicated configurations dict for AdamW.
+        muon_ns_backend: ``"native"`` (default) preserves the configured Muon callback.
+            ``"gram"`` uses the upstream Torch path on CPU/CUDA. ``"gram_quack"``
+            enables Quack on Hopper/Blackwell CUDA and falls back to Torch on CPU
+            or other CUDA devices. Both bind the effective Muon group settings,
+            require compatible coefficient prefixes and one epsilon across groups,
+            and reject a manual ``zeropower_fn``. Ignored without Muon parameters.
         sinkhorn_params: Optional Sinkhorn groups. Empty or None disables Sinkhorn.
         sinkhorn_kwargs: Dedicated configurations dict for Sinkhorn.
 
@@ -186,18 +221,12 @@ def get_hyper_optimizer(
 
         optimizer.step()
     """
-    AdamW, Muon, ChainedOptimizer, detect_dtensor_backend = _load_torch_optimizer_runtime()
+    if muon_ns_backend not in ("native", "gram", "gram_quack"):
+        raise ValueError(f"muon_ns_backend must be 'native', 'gram', or 'gram_quack', got {muon_ns_backend!r}")
+    AdamW, Muon, ChainedOptimizer, detect_dtensor_backend, resolve_coefficients = _load_torch_optimizer_runtime()
 
-    filtered_adamw_config = _filter_optimizer_config(
-        "adamw",
-        AdamW,
-        adamw_kwargs,
-    )
-    filtered_muon_config = _filter_optimizer_config(
-        "muon",
-        Muon,
-        muon_kwargs,
-    )
+    filtered_adamw_config = _filter_optimizer_config("adamw", AdamW, adamw_kwargs)
+    filtered_muon_config = _filter_optimizer_config("muon", Muon, muon_kwargs)
     optimizers = {}
     detect_dtensor_backend(adamw_params or sinkhorn_params or [], muon_params)
 
@@ -216,6 +245,9 @@ def get_hyper_optimizer(
             muon_params,
             filtered_muon_config,
         )
+        if muon_ns_backend != "native":
+            _configure_muon_gram_ns(optimizers["muon"], resolve_coefficients, muon_ns_backend)
+        logger.info_rank0("Muon NS backend selection: %s", muon_ns_backend)
 
     if sinkhorn_params:
         sinkhorn_class = __getattr__("Sinkhorn")
