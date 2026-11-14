@@ -24,6 +24,7 @@ from typing import Any, Iterator
 import torch  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.core.dtensor.dtensor import DTensor, SkipDTensorDispatch
+from hyper_parallel.core.utils.communication import differentiable_all_reduce
 
 
 @dataclass
@@ -150,3 +151,74 @@ def set_aux_loss_scale(scale: torch.Tensor) -> None:
         scale: Tensor used to scale the injected auxiliary-loss gradient.
     """
     _AuxLossAutoScaler.set_loss_scale(scale)
+
+
+class _SequenceProbabilitySum(torch.autograd.Function):
+    """Preserve the SUM adjoint when graph capture uses a functional collective."""
+
+    @staticmethod
+    def forward(ctx: Any, probabilities: torch.Tensor, group: Any) -> torch.Tensor:
+        """Sum local probability contributions over the token partitions."""
+        ctx.group = group
+        return differentiable_all_reduce(probabilities, "sum", group)
+
+    @staticmethod
+    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[torch.Tensor, None]:
+        """Sum gradients from the replicas of the sequence loss."""
+        return differentiable_all_reduce(gradient, "sum", ctx.group), None
+
+
+def sequence_load_balancing_loss(
+        scores: torch.Tensor,
+        selected_experts: torch.Tensor,
+        sequence_ids: torch.Tensor,
+        num_sequences: int,
+        token_mask: torch.Tensor | None = None,
+        sequence_partition_groups: tuple[Any, ...] = (),
+) -> torch.Tensor:
+    """Average ``E * sum_i(fraction_i * mean_probability_i)`` over sequences.
+
+    Args:
+        scores: Nonnegative, unbiased scores for all experts, shaped ``[T, E]``.
+        selected_experts: Int64 Top-K expert IDs selected from unbiased scores, shaped ``[T, K]``.
+        sequence_ids: Int64 sample index of each token, shaped ``[T]``. IDs must be in
+            ``[0, num_sequences)`` even for masked tokens.
+        num_sequences: Global number of samples shared by the token-partition ranks.
+        token_mask: Optional boolean ``[T]`` mask; true tokens contribute.
+        sequence_partition_groups: Independent axes partitioning the same
+            sequences' tokens, such as CP or TP with sequence parallelism.
+            All ranks must use the same sample ID space and enter the reductions,
+            including ranks with no local tokens. The probability SUM has a SUM
+            backward, so account for the replicated loss in gradient reduction.
+
+    Returns:
+        FP32 mean over nonempty sequences across the token partitions. If all
+        sequences are empty or fully masked, returns a differentiable zero.
+    """
+    if scores.ndim != 2 or selected_experts.ndim != 2 or scores.shape[0] != selected_experts.shape[0]:
+        raise ValueError("scores and selected_experts must have shapes [T, E] and [T, K]")
+    num_tokens, num_experts = scores.shape
+    if num_sequences <= 0 or sequence_ids.shape != (num_tokens,) or sequence_ids.dtype != torch.long:
+        raise ValueError("sequence_ids must be int64 [T] and num_sequences must be positive")
+    top_k = selected_experts.shape[1]
+    if not 0 < top_k <= num_experts:
+        raise ValueError("top_k must be positive and no greater than num_experts")
+    if token_mask is not None and (token_mask.shape != (num_tokens,) or token_mask.dtype != torch.bool):
+        raise ValueError("token_mask must be a boolean tensor with shape [T]")
+    scores = scores.float()
+    probabilities = scores / scores.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(torch.float32).tiny)
+    valid = scores.new_ones(num_tokens) if token_mask is None else token_mask.float()
+    indices = sequence_ids.unsqueeze(-1) * num_experts + selected_experts
+    counts = scores.new_zeros(num_sequences * num_experts).scatter_add(
+        0, indices.reshape(-1), valid.unsqueeze(-1).expand(-1, top_k).reshape(-1),
+    ).view(num_sequences, num_experts)
+    probability_sum = scores.new_zeros(num_sequences, num_experts).index_add(
+        0, sequence_ids, probabilities * valid.unsqueeze(-1),
+    )
+    for group in sequence_partition_groups:
+        counts = differentiable_all_reduce(counts, "sum", group)
+        probability_sum = _SequenceProbabilitySum.apply(probability_sum, group)
+    assignments = counts.sum(dim=-1, keepdim=True)
+    token_count = (assignments / top_k).clamp_min(1.0)
+    losses = num_experts * ((counts / assignments.clamp_min(1.0)) * (probability_sum / token_count)).sum(-1)
+    return losses.sum() / (assignments > 0).sum().clamp_min(1)

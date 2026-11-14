@@ -26,9 +26,10 @@ from hyper_parallel.components.functional.aux_loss import (
     aux_loss_auto_scale,
     aux_loss_scale_context,
     bind_aux_loss_scale,
+    sequence_load_balancing_loss,
 )
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import shared_compressed_indexer_kl_loss
-from hyper_parallel.models.deepseek_v41.adapter.aux_loss import sequence_load_balancing_loss, update_modality_bias
+from hyper_parallel.models.deepseek_v41.adapter.aux_loss import update_modality_bias
 
 
 def reference_loss(
@@ -102,17 +103,14 @@ class TestSequenceLoadBalancingLoss(unittest.TestCase):
             indices = torch.zeros(tokens, 2, dtype=torch.long)
             ids = torch.zeros(tokens, dtype=torch.long)
             group = object()
-            module = "hyper_parallel.models.deepseek_v41.adapter.aux_loss"
-            with patch(f"{module}.dist.all_reduce") as reduce_counts, patch(
-                    f"{module}.differentiable_all_reduce", side_effect=lambda tensor, *args: tensor,
-            ) as reduce_probs:
+            module = "hyper_parallel.components.functional.aux_loss"
+            with patch(f"{module}.differentiable_all_reduce", side_effect=lambda tensor, *_: tensor) as reduce:
                 loss = sequence_load_balancing_loss(scores, indices, ids, 2,
                                                     torch.zeros(tokens, dtype=torch.bool), (group,))
                 loss.backward()
             torch.testing.assert_close(loss, torch.tensor(0.0))
             torch.testing.assert_close(scores.grad, torch.zeros_like(scores))
-            reduce_counts.assert_called_once()
-            reduce_probs.assert_called_once()
+            self.assertEqual(reduce.call_count, 3, f"Expected three collective calls, got {reduce.call_count}")
 
     def test_partitioned_statistics_match_full_sequences(self) -> None:
         """
@@ -135,15 +133,13 @@ class TestSequenceLoadBalancingLoss(unittest.TestCase):
             remote_sum = torch.zeros(2, 3).index_add(
                 0, remote_ids, functional.normalize(values[remote_slice], p=1, dim=-1),
             )
-            module = "hyper_parallel.models.deepseek_v41.adapter.aux_loss"
-            with (
-                patch(f"{module}.dist.all_reduce",
-                      side_effect=lambda tensor, counts=remote_counts, **kwargs: tensor.add_(counts)),
-                patch(f"{module}.differentiable_all_reduce",
-                      side_effect=lambda tensor, *args, probabilities=remote_sum: (
-                          2 * tensor + probabilities - tensor.detach()
-                      )),
-            ):
+            module = "hyper_parallel.components.functional.aux_loss"
+            reductions = iter((
+                lambda tensor, counts=remote_counts: tensor + counts,
+                lambda tensor, probabilities=remote_sum: tensor + probabilities,
+                lambda tensor: tensor * 2,
+            ))
+            with patch(f"{module}.differentiable_all_reduce", side_effect=lambda tensor, *_: next(reductions)(tensor)):
                 actual = sequence_load_balancing_loss(local, indices[local_slice], ids[local_slice], 2,
                                                      sequence_partition_groups=(object(),))
                 actual.backward()

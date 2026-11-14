@@ -46,7 +46,23 @@ weights and computation; routing, expert-parallel communication, and shared expe
 
 ## Auxiliary-loss functions
 
-`hyper_parallel.components.functional` also exports `aux_loss_auto_scale` and `set_aux_loss_scale` for auxiliary-loss gradient injection.
+Use `sequence_load_balancing_loss` for an equal-weight mean over logical samples, including packed samples.
+Pass full nonnegative expert scores, unbiased Top-K IDs, logical sample IDs, and an optional valid-token mask.
+For CP or TP sequence parallelism, pass only the groups that shard tokens of the same logical samples.
+
+```python
+from hyper_parallel.components.functional import aux_loss_auto_scale, sequence_load_balancing_loss
+
+aux_experts = scores.topk(top_k, dim=-1, sorted=False).indices
+aux_loss = sequence_load_balancing_loss(
+    scores, aux_experts, sequence_ids, num_sequences,
+    token_mask=token_mask, sequence_partition_groups=sequence_partition_groups,
+)
+routing_weights = aux_loss_auto_scale(routing_weights, aux_loss_coeff * aux_loss)
+```
+
+Trainer supplies the microstep gradient multiplier. For standalone loops, use `aux_loss_scale_context`
+with `bind_aux_loss_scale`, or set a manual multiplier with `set_aux_loss_scale`.
 
 ## DeepSeek V3.2 DSA
 

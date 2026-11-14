@@ -43,6 +43,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     DeepseekV4RotaryEmbedding,
 )
 
+from hyper_parallel.components.functional import sequence_load_balancing_loss
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
 from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
@@ -50,7 +51,6 @@ from hyper_parallel.components.modules.mhc import PipelinedMhcModule, pipelined_
 from hyper_parallel.core.multicore.modules.mega_gate import MegaGate
 from hyper_parallel.models.deepseek_v41.adapter.aux_loss import (
     accumulate_router_load,
-    sequence_load_balancing_loss,
     update_modality_bias,
 )
 from hyper_parallel.models.deepseek_v41.dspark import DeepseekV41DSpark
