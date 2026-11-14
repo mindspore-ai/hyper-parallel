@@ -15,99 +15,56 @@
 """Test fully_shard autograd scheduling and standalone parity."""
 # pylint: disable=W0611,C0413,C0412
 from copy import deepcopy
-import os
 
 import torch
 import torch_npu
 from torch import nn, optim
+from torch.nn import functional
 from hyper_parallel import DTensor, init_device_mesh, SkipDTensorDispatch
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from tests.torch.common_net import SimpleTransformer
+from tests.torch.fully_shard.mem_tracker import MemTrackerWrapper
 from tests.torch.utils import init_dist
 
 
-class OutputLayer(nn.Module):
-    """A simple linear output layer for chunked forward testing.
+class TransformerWithChunkLoss(SimpleTransformer):
+    """Apply the Transformer output head and cross-entropy one chunk at a time.
 
     Args:
-        in_features: Size of each input sample.
-        out_features: Size of each output sample.
+        vocab_size: Number of tokens in the vocabulary.
+        dim: Hidden dimension.
+        depth: Number of Transformer blocks.
+        num_chunks: Number of sequence chunks passed through the shared head.
     """
 
-    def __init__(self, in_features: int, out_features: int):
-        super().__init__()
-        self.linear = nn.Linear(in_features, out_features, bias=False)
-
-    def forward(self, input_tensor):
-        return self.linear(input_tensor)
-
-
-class MLPAndChunkedOutputLayer(nn.Module):
-    """MLP followed by a chunked output layer.
-
-    The forward pass runs a simple MLP, then chunks the hidden states and
-    calls the same OutputLayer in a for-loop for each chunk — mimicking
-    the memory-efficient LLM output head pattern.
-
-    Args:
-        hidden_size: Dimension of input and MLP hidden layer.
-        output_size: Dimension of the output projection.
-        num_chunks: Number of chunks to split hidden states into.
-    """
-
-    def __init__(self, hidden_size: int, output_size: int, num_chunks: int = 2):
-        super().__init__()
-        self.mlp = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.output_layer = OutputLayer(hidden_size, output_size)
+    def __init__(self, vocab_size: int, dim: int, depth: int, num_chunks: int = 4) -> None:
+        """Initialize the Transformer and its chunked loss configuration."""
+        super().__init__(vocab_size=vocab_size, dim=dim, depth=depth)
         self.num_chunks = num_chunks
 
-    def forward(self, input_tensor):
-        hidden_states = torch.relu(self.mlp(input_tensor))
-        hidden_state_chunks = torch.chunk(hidden_states, self.num_chunks, dim=0)
-        chunk_outputs = []
-        for hidden_state_chunk in hidden_state_chunks:
-            chunk_outputs.append(self.output_layer(hidden_state_chunk))
-        return torch.cat(chunk_outputs, dim=0)
+    def forward(self, tokens: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Return summed cross-entropy over local tokens.
 
+        Args:
+            tokens: Input token IDs.
+            targets: Target token IDs aligned with inputs.
 
-def test_chunked_output_fully_shard():
-    """Test fully_shard with chunked input and looped OutputLayer forward.
-
-    Feature: fully_shard autograd with chunked output
-    Description: Verify that a fully_shard-wrapped OutputLayer can be called
-        multiple times in a for-loop (once per input chunk), with results
-        concatenated and a single backward pass. This pattern is common in
-        LLM output heads for memory-efficient loss computation.
-    Expectation: Training completes, loss is finite, and gradients are present.
-    """
-    init_dist()
-    world_size = torch.distributed.get_world_size()
-    hidden_size = 16
-    output_size = 8
-    batch_size = 8
-    num_chunks = 4
-
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("dp",))
-
-    torch.manual_seed(42)
-    model = MLPAndChunkedOutputLayer(hidden_size, output_size, num_chunks).npu()
-    fully_shard(model.output_layer, mesh=mesh)
-    fully_shard(model, mesh=mesh)
-    optimizer = optim.SGD(model.parameters(), lr=0.01)
-    model_input = torch.randn(batch_size, hidden_size).npu()
-
-    with SkipDTensorDispatch():
-        model_output = model(model_input)
-        loss = torch.sum(model_output)
-        loss.backward()
-
-        assert torch.isfinite(loss), f"Loss is not finite: loss={loss.item()}"
-        for parameter_name, parameter in model.named_parameters():
-            assert parameter.grad is not None, f"Missing gradient for {parameter_name}: grad={parameter.grad}"
-
-        optimizer.step()
-        optimizer.zero_grad()
+        Returns:
+            The sum of per-token losses across chunks.
+        """
+        hidden = self.embed(tokens)
+        for layer in self.layers:
+            hidden = layer(hidden)
+        hidden = self.norm(hidden)
+        chunk_losses = []
+        for hidden_chunk, target_chunk in zip(
+                torch.chunk(hidden, self.num_chunks, dim=1), torch.chunk(targets, self.num_chunks, dim=1)):
+            logits = self.head(hidden_chunk)
+            chunk_losses.append(functional.cross_entropy(
+                logits.reshape(-1, logits.size(-1)), target_chunk.reshape(-1), reduction="sum"
+            ))
+        return torch.stack(chunk_losses).sum()
 
 
 def _apply_fully_shard_with_prefetch(model, mesh) -> None:
@@ -251,5 +208,97 @@ def test_single_rank_hsdp_autograd_parity():
 
 
 def test_hsdp_ffbb_autograd_parity():
-    """Verify four-rank HSDP parity for forward-forward-backward-backward."""
-    _run_fully_shard_autograd_parity((2, 2), ("replicate", "shard"), forward_pass_count=2)
+    """Verify two-rank HSDP replica reduction with forward-forward-backward-backward."""
+    _run_fully_shard_autograd_parity((2, 1), ("replicate", "shard"), forward_pass_count=2)
+
+
+def test_fsdp_transformer_chunkloss_ga_mem() -> None:
+    """Check Transformer chunk loss, accumulated gradients, and RS storage lifetime.
+
+    Feature: FSDP gradient accumulation.
+    Description: Reuse a sharded output head for sequence chunks over accumulated microbatches.
+    Expectation: Loss and gradients match dense CE, and previous RS outputs are released promptly.
+    """
+    rank, _ = init_dist()
+    world_size = torch.distributed.get_world_size()
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("dp",))
+    local_batch_size, microbatches, training_steps, sequence_length = 2, 3, 2, 32
+    global_batch_size = world_size * local_batch_size
+    model_config = {"vocab_size": 1024, "dim": 2048, "depth": 16}
+
+    torch.manual_seed(2026)
+    base_model = SimpleTransformer(**model_config)
+    standalone_model = deepcopy(base_model).npu()
+    sharded_model = TransformerWithChunkLoss(**model_config).npu()
+    sharded_model.load_state_dict(base_model.state_dict())
+    del base_model
+    fully_shard(sharded_model.head, mesh=mesh)
+    _apply_fully_shard_with_prefetch(sharded_model, mesh)
+    sharded_model.layers[-1].set_modules_to_forward_prefetch([sharded_model.head])
+    sharded_model.set_modules_to_backward_prefetch([sharded_model.head])
+    sharded_model.head.set_modules_to_backward_prefetch([sharded_model.layers[-1]])
+    standalone_model.layers = nn.ModuleList(
+        MemTrackerWrapper(layer, enabled=False) for layer in standalone_model.layers
+    )
+    sharded_model.layers = nn.ModuleList(MemTrackerWrapper(layer) for layer in sharded_model.layers)
+    for layer, next_layer in zip(sharded_model.layers[:-1], sharded_model.layers[1:]):
+        layer.set_next_layer(next_layer)
+
+    standalone_optimizer = optim.Adam(standalone_model.parameters(), lr=1e-3)
+    sharded_optimizer = optim.Adam(sharded_model.parameters(), lr=1e-3)
+    input_generator = torch.Generator().manual_seed(84)
+    for training_step in range(training_steps):
+        for _ in range(microbatches):
+            tokens = torch.randint(
+                model_config["vocab_size"], (global_batch_size, sequence_length), generator=input_generator
+            ).npu()
+            targets = torch.randint(model_config["vocab_size"], tokens.shape, generator=input_generator).npu()
+            local_tokens = tokens.narrow(0, rank * local_batch_size, local_batch_size)
+            local_targets = targets.narrow(0, rank * local_batch_size, local_batch_size)
+            with SkipDTensorDispatch():
+                standalone_output = standalone_model(tokens)
+                standalone_losses = functional.cross_entropy(
+                    standalone_output.transpose(1, 2), targets, reduction="none"
+                )
+                sharded_loss = sharded_model(local_tokens, local_targets)
+                expected = standalone_losses.narrow(0, rank * local_batch_size, local_batch_size).sum()
+                torch.testing.assert_close(sharded_loss, expected, rtol=1e-5, atol=1e-6)
+                total_tokens = global_batch_size * sequence_length * microbatches
+                (standalone_losses.sum() / total_tokens).backward()
+                (sharded_loss / total_tokens).backward()
+            sharded_model.layers[0].check_pending()
+            _assert_accumulated_gradients_match(standalone_model, sharded_model, rank, training_step)
+
+        with SkipDTensorDispatch():
+            standalone_optimizer.step()
+            sharded_optimizer.step()
+            standalone_optimizer.zero_grad(set_to_none=True)
+            sharded_optimizer.zero_grad(set_to_none=True)
+
+    for layer_index, (reference_layer, layer) in enumerate(zip(standalone_model.layers, sharded_model.layers)):
+        assert layer.checked_count >= training_steps * (microbatches - 1)
+        assert layer.output_hook_count == training_steps * microbatches
+        assert len(layer.release_history) == training_steps * microbatches
+        full_grad_bytes = sum(param.numel() * param.element_size() for param in reference_layer.parameters())
+        assert full_grad_bytes % world_size == 0
+        sharded_grad_bytes = full_grad_bytes // world_size
+        for backward_index, (input_released, output_released, output_retained) in enumerate(layer.release_history):
+            first_microbatch = backward_index % microbatches == 0
+            expected_release = 0 if first_microbatch else sharded_grad_bytes
+            expected_retained = sharded_grad_bytes if first_microbatch else 0
+            assert input_released == full_grad_bytes, (
+                f"Rank {rank}, layer {layer_index}, backward {backward_index}: "
+                f"source gradient release expected={full_grad_bytes}, actual={input_released}"
+            )
+            assert (output_released, output_retained) == (expected_release, expected_retained), (
+                f"Rank {rank}, layer {layer_index}, backward {backward_index}: "
+                f"RS release/retention expected={(expected_release, expected_retained)}, "
+                f"actual={(output_released, output_retained)}"
+            )
+        print(
+            f"RS_BYTES rank={rank} layer={layer_index} input_expected={full_grad_bytes} "
+            f"input_released={[record[0] for record in layer.release_history]} "
+            f"output_shard={sharded_grad_bytes} released={[record[1] for record in layer.release_history]} "
+            f"retained={[record[2] for record in layer.release_history]}"
+        )
+    sharded_model.reset_iter_state()

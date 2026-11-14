@@ -234,7 +234,8 @@ class TestMixedPrecisionCustomParams(unittest.TestCase):
                 self.assertIs(reduce_buckets[1].hsdp_params[0], state.hsdp_params[1])
                 state.param_group.wait_reduce_scatter_and_issue_all_reduce()
                 for hsdp_param in state.hsdp_params:
-                    reduced_grad = hsdp_param.reduce_scatter_output()
+                    hsdp_param.wait_reduce_scatter()
+                    reduced_grad = hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output
                     torch.testing.assert_close(reduced_grad, torch.full_like(reduced_grad, 2))
                     hsdp_param.clear_reduce_scatter_output()
                 state.param_group.reset_iter_state()

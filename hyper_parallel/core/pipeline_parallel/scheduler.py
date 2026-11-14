@@ -26,7 +26,7 @@ import torch
 import torch.distributed as dist
 
 import hyper_parallel
-from hyper_parallel.core.fully_shard.api import HSDPModule
+from hyper_parallel.core.pipeline_parallel.fsdp_comm_controller import FSDPCommController
 from hyper_parallel.core.pipeline_parallel.pipeline_swap import (
     PipelineSwapSession,
     inject_pipeline_swap_steps,
@@ -82,18 +82,10 @@ def generate_rank_to_stage_mapping(real_stage_num, stage_num, style='loop'):
 
 
 def iter_leaf_meta_steps(step):
-    """Yield leaf MetaSteps, recursively expanding OVERLAP containers.
-
-    Both ``OVERLAP_F_B`` and ``OVERLAP_B_F`` carry their real FWD/BWD work in
-    ``sub_steps``; the FSDP unshard/reshard injection pass relies on this to
-    see the FWD/BWD buried inside an overlap. Missing ``OVERLAP_B_F`` here let
-    an overlapped FWD run against a resharded stage → "expected HSDPModule
-    parameters in unsharded state". Mirror the other expansion sites
-    (run/_expand/add_fsdp_*) which already handle both composite types.
-    """
+    """Yield leaf MetaSteps by recursively expanding composite containers."""
     if step is None:
         return
-    if step.type in (MetaStepType.OVERLAP_F_B, MetaStepType.OVERLAP_B_F) and step.sub_steps:
+    if step.sub_steps:
         for sub_step in step.sub_steps:
 
             yield from iter_leaf_meta_steps(sub_step)
@@ -125,35 +117,7 @@ class PipelineContext:
         self.arg_mbs = arg_mbs
         self.kwarg_mbs = kwarg_mbs
         self.losses = losses
-
-
-def _exec_fsdp_unshard(stage):
-    """Unshard every HSDPModule in the stage's submodule tree."""
-    for _, module in stage.submodule.named_modules():
-        if isinstance(module, HSDPModule):
-            module.unshard()
-
-
-def _exec_fsdp_reshard(stage):
-    """Reshard every HSDPModule in the stage's submodule tree."""
-    for _, module in stage.submodule.named_modules():
-        if isinstance(module, HSDPModule):
-            module.reshard()
-
-
-def _exec_fsdp_reduce_grad(stage):
-    """Run the stage's FSDP post-backward gradient reduction."""
-    stage.execute_reduce_grad()
-
-
-# FSDP control MetaStep -> handler(stage). Membership also marks which
-# MetaStepTypes are FSDP control steps, so the runtime loop dispatches with a
-# single table lookup instead of re-switching on the step type.
-_FSDP_STEP_HANDLERS = {
-    MetaStepType.FSDP_UNSHARD: _exec_fsdp_unshard,
-    MetaStepType.FSDP_RESHARD: _exec_fsdp_reshard,
-    MetaStepType.FSDP_REDUCE_GRAD: _exec_fsdp_reduce_grad,
-}
+        self.fsdp_comm_controller = schedule.fsdp_comm_controller
 
 
 class PipelineScheduleRuntime(ABC):
@@ -239,6 +203,11 @@ class PipelineScheduleRuntime(ABC):
         self._stage_to_rank_index = None
         self._overlap_p2p = overlap_p2p
         self.exec_order = {}
+        self.fsdp_comm_controller = FSDPCommController(self.stages, micro_batch_num)
+        if swap and self.fsdp_comm_controller.stage_contexts:
+            raise ValueError("HSDP pipeline stages do not support activation swap")
+        for stage in self.stages:
+            stage.fsdp_comm_controller = self.fsdp_comm_controller
         self._init_stages()
         self._build_stage_to_rank_index()
         self.fwd_handle_cache = {}
@@ -343,59 +312,6 @@ class PipelineScheduleRuntime(ABC):
         """
         self._custom_fn_map[step_type] = fn
 
-    @staticmethod
-    def _stage_hsdp_modules(stage):
-        """Return the independently configurable HSDP roots in a stage."""
-        if isinstance(stage.submodule, HSDPModule):
-            return [stage.submodule]
-        modules = []
-        seen = set()
-        for _, module in stage.submodule.named_modules():
-            if not isinstance(module, HSDPModule) or id(module) in seen:
-                continue
-            seen.add(id(module))
-            modules.append(module)
-        return modules
-
-    def _inject_local_fsdp_actions(self):
-        """Annotate the local rank schedule with optional FSDP control actions."""
-        current_rank = self._stage_to_rank_index[self.stages[0].stage_index]
-        managed_stage_indices = {
-            stage.stage_index
-            for stage in self.stages
-            if self._stage_hsdp_modules(stage)
-        }
-        if not managed_stage_indices:
-            return
-        if len(managed_stage_indices) != len(self.stages):
-            raise RuntimeError(
-                "When injecting fsdp_action, expect all stages to be HSDPModule. "
-                "Check whether all separated modules are wrapped with 'fully_shard'."
-            )
-        for stage in self.stages:
-            for module in self._stage_hsdp_modules(stage):
-                module.set_reshard_after_forward(False)
-        rank_actions = add_fsdp_unshard_reshard(self.exec_order[current_rank], managed_stage_indices)
-        self.exec_order[current_rank] = add_fsdp_reduce_grad(
-            rank_actions,
-            managed_stage_indices,
-            self.micro_batch_num,
-        )
-
-    def _prepare_fsdp_backward(self):
-        """Disable HSDP post-backward actions once for the current pipeline run.
-
-        Pipeline accumulates gradients across all micro-batches and executes
-        the reduction through ``FSDP_REDUCE_GRAD`` after the last backward.
-        ``execute_reduce_grad`` restores both flags, so they must be disabled
-        once again at the beginning of the next run.
-        """
-        for stage in self.stages:
-            if not stage.has_backward:
-                continue
-            for module in self._stage_hsdp_modules(stage):
-                module.set_reshard_after_backward(False)
-                module.set_requires_gradient_sync(False)
 
     def _inject_local_pp_swap_actions(self):
         """Annotate the local rank schedule with pipeline activation-swap actions."""
@@ -423,51 +339,11 @@ class PipelineScheduleRuntime(ABC):
         """Build exec order, PP cmopute and PP comms(Send/Recv)"""
 
     def build_exec_order(self) -> None:
-        """Build the execution order and inject optional FSDP / PP-swap actions.
+        """Build compute/P2P steps, form transport containers, then inject activation swap.
 
-        Meta-Step Ordering Contract
-        --------------------------
-        The per-rank execution schedule is assembled in layers:
-
-        1. ``construct_exec_order()``
-           Pure compute (FWD/BWD) + P2P communication (SEND/RECV).
-
-        2. ``_inject_local_fsdp_actions()``
-           FSDP parameter management: UNSHARD before compute, RESHARD after,
-           REDUCE_GRAD after the last backward of each stage. This layer must
-           run *before* swap injection so that swap can see the already-placed
-           FSDP steps and optimise its placement relative to them:
-
-           * After FWD: ``SWAP_LAUNCH_OFFLOAD`` before ``FSDP_RESHARD``
-             (start D2H early, freeing parameter memory is fast).
-           * Before BWD: if a direct lookahead ``FSDP_UNSHARD`` exists,
-             ``SWAP_LAUNCH_LOAD`` precedes it so H2D overlaps all-gather.
-             If parameters are already unsharded, load is delayed until the
-             BWD container to avoid extending activation residency.
-
-        3. ``coalesce_p2p()`` or ``attach_fwd_boundary_p2p()``
-           P2P batching — runs before swap injection so P2P containers are
-           finalized first.
-
-        4. ``_inject_local_pp_swap_actions()``
-           Activation swap: leaf-local collection around ``FWD``, followed by
-           ``LAUNCH_OFFLOAD → WAIT_OFFLOAD → LAUNCH_LOAD → WAIT_LOAD``.
-           ``WAIT_LOAD`` executes on the scheduler thread immediately before
-           the backward consumer container.
-           When ``enable_dxdw_split`` is active, ``BWD_INPUT`` is used as
-           the backward anchor because it is the activation consumer;
-           ``BWD_WEIGHT`` receives no swap control steps.
-
-           Swap steps are inserted only into before/after slots around
-           top-level containers and never inside ``BATCH_SEND_RECV.sub_steps``.
-           This preserves symmetric, paired fusion-block members and avoids
-           deadlocks caused by splitting a fused P2P block.
-
-        Also resolves ``p2p_transport``: ``"auto"`` becomes ``"batch"`` (the
-        measured-beneficial duplex) on schedules running with ``overlap_b_f``
-        and ``"plain"`` everywhere else.  The matching P2P order-rewrite pass
-        runs after FSDP injection and before swap injection, so swap sees the
-        finalized top-level P2P containers.
+        Parameter communication follows actual module hooks rather than schedule
+        steps. Swap actions stay outside P2P containers and wait before backward
+        reads activations; split weight backward needs no repeated activation load.
         """
         mode = self._p2p_transport
         if mode == "auto":
@@ -481,10 +357,6 @@ class PipelineScheduleRuntime(ABC):
         if mode == "multi_stream":
             self._init_p2p_multi_stream_groups()
         self.construct_exec_order()
-        # FSDP must inject before PP-swap so that swap can optimise
-        # placement relative to FSDP steps (LAUNCH_OFFLOAD before
-        # RESHARD after FWD; LAUNCH_LOAD before UNSHARD for BWD).
-        self._inject_local_fsdp_actions()
         if mode == "boundary":
             # fwd-boundary mode: hang the forward's F_SEND + next slot's recvs
             # on the OVERLAP step (issued mid-overlap, right after the
@@ -946,16 +818,6 @@ class PipelineScheduleRuntime(ABC):
             else:
                 self._send_handles.append(handles)
 
-    def _assert_in_unshard_if_needed(self, stage, check_step):
-        if not isinstance(stage.submodule, HSDPModule):
-            return
-        submodule_hsdp_scheduler = stage.submodule.hsdp_scheduler
-        scheduler_state = submodule_hsdp_scheduler.hsdp_state
-        if scheduler_state.is_shard:
-            raise RuntimeError(
-                f"Executing MetaStep: {check_step}, expected HSDPModule parameters in unsharded "
-                f"state, but got sharded parameters."
-            )
 
     def _exec_step(self, cur_step, arg_mbs, kwarg_mbs, losses):
         """Execute one built-in step (non-custom, non-composite).
@@ -1000,35 +862,25 @@ class PipelineScheduleRuntime(ABC):
             self.recv_bwd(stage, micro_index)
 
         elif step_type == MetaStepType.BWD_INPUT:
-            self._assert_in_unshard_if_needed(stage, cur_step)
             self.wait_bwd_recv(stage_index, micro_index)
             stage.backward_input_one_chunk(micro_index)
 
         elif step_type == MetaStepType.BWD_WEIGHT:
-            self._assert_in_unshard_if_needed(stage, cur_step)
             self.wait_bwd_recv(stage_index, micro_index)
             stage.backward_weight_one_chunk(micro_index)
 
         elif step_type == MetaStepType.BWD:
-            self._assert_in_unshard_if_needed(stage, cur_step)
             self.wait_bwd_recv(stage_index, micro_index)
             stage.backward_one_chunk(micro_index)
 
         elif step_type == MetaStepType.BWD_SEND:
             self.send_bwd(stage, micro_index)
 
-        else:
-            # FSDP control steps dispatch via the handler table; any other type
-            # is a no-op here (composite/custom types are handled upstream).
-            fsdp_handler = _FSDP_STEP_HANDLERS.get(step_type)
-            if fsdp_handler is not None:
-                fsdp_handler(stage)
 
     def execute_fwd_leaf(self, step: MetaStep, arg_mbs: list, kwarg_mbs: list, losses: list) -> None:
         """Execute a forward leaf within its run-scoped swap group context."""
         stage = self._stage_dict[step.stage_index]
         micro_index = step.micro_index
-        self._assert_in_unshard_if_needed(stage, step)
         self.wait_fwd_recv(stage.stage_index, micro_index)
         swap_managed = self._swap_session is not None and self._swap_session.manages(step)
         group_context = self._swap_session.group_context(step) if swap_managed else nullcontext()
@@ -1172,7 +1024,7 @@ class PipelineScheduleRuntime(ABC):
         self._ensure_batch_p2p_group_initialized()
         self._ensure_p2p_multi_stream_groups_initialized()
         real_stage_index = self.stages[0].stage_index % self.real_stage_num
-        self._prepare_fsdp_backward()
+        self.fsdp_comm_controller.begin()
         self._send_handles = []
         self._boundary_issued = set()
         self._pending_boundary = {}
@@ -1235,6 +1087,10 @@ class PipelineScheduleRuntime(ABC):
             "run_microbatches end: rank=%d pending_send_handles=%d",
             real_stage_index, len(self._send_handles),
         )
+        for stage in self.stages:
+            if stage._dw_cache:
+                raise RuntimeError(f"Stage {stage.stage_index} has unconsumed weight-backward graphs")
+        self.fsdp_comm_controller.finalize()
         self.sync_shared_parameters_grad()
         while self._send_handles:
             self._wait_p2p(self._send_handles.pop())
@@ -2679,82 +2535,3 @@ def validate_pipeline_execution(order_list: dict[int, list[MetaStep]],
         'has_cycle': bool(cycle_path)
     }
     return result
-
-
-_COMPUTE_META_STEP_TYPES = frozenset({
-    MetaStepType.FWD,
-    MetaStepType.BWD,
-    MetaStepType.BWD_INPUT,
-    MetaStepType.BWD_WEIGHT,
-})
-
-
-def _next_active_stage_indices(actions, start_index, max_active_stages, managed_stage_indices):
-    """Find the next distinct managed stages that will execute compute work.
-
-    Send/recv and previously injected FSDP control steps are skipped so that the
-    lookahead window only counts real compute, otherwise communication-only
-    actions would consume the budget and shrink the effective prefetch depth.
-    """
-    stage_indices = []
-    seen = set()
-    for action in actions[start_index:]:
-        for leaf_step in iter_leaf_meta_steps(action):
-            if leaf_step.type not in _COMPUTE_META_STEP_TYPES:
-                continue
-            if leaf_step.stage_index not in managed_stage_indices or leaf_step.stage_index in seen:
-                continue
-            seen.add(leaf_step.stage_index)
-            stage_indices.append(leaf_step.stage_index)
-            if len(stage_indices) == max_active_stages:
-                return stage_indices
-    return stage_indices
-
-
-def add_fsdp_unshard_reshard(actions, managed_stage_indices, max_active_stages=3):
-    """Insert FSDP unshard/reshard actions for locally managed stages."""
-    if not managed_stage_indices:
-        return actions
-
-    fsdp_actions = []
-    active_stages = []
-    for index, action in enumerate(actions):
-        next_stage_indices = _next_active_stage_indices(
-            actions, index, max_active_stages, managed_stage_indices
-        )
-        evicted_stages = [stage_index for stage_index in active_stages if stage_index not in next_stage_indices]
-        fetched_stages = [stage_index for stage_index in next_stage_indices if stage_index not in active_stages]
-        for stage_index in evicted_stages:
-            fsdp_actions.append(MetaStep(None, MetaStepType.FSDP_RESHARD, stage_index))
-            active_stages.remove(stage_index)
-        for stage_index in fetched_stages:
-            fsdp_actions.append(MetaStep(None, MetaStepType.FSDP_UNSHARD, stage_index))
-            active_stages.append(stage_index)
-        fsdp_actions.append(action)
-
-    while active_stages:
-        fsdp_actions.append(MetaStep(None, MetaStepType.FSDP_RESHARD, active_stages.pop(0)))
-    return fsdp_actions
-
-
-def add_fsdp_reduce_grad(actions, managed_stage_indices, micro_batch_num):
-    """Insert FSDP reduce-grad actions after the last backward-like action of each stage."""
-    if not managed_stage_indices:
-        return actions
-
-    fsdp_actions = []
-    for action in actions:
-        fsdp_actions.append(action)
-        reduced_stage_indices = []
-        for leaf_step in iter_leaf_meta_steps(action):
-            if leaf_step.stage_index not in managed_stage_indices:
-                continue
-            if leaf_step.type not in (MetaStepType.BWD, MetaStepType.BWD_WEIGHT):
-                continue
-            if leaf_step.micro_index != micro_batch_num - 1:
-                continue
-            if leaf_step.stage_index not in reduced_stage_indices:
-                reduced_stage_indices.append(leaf_step.stage_index)
-        for stage_index in reduced_stage_indices:
-            fsdp_actions.append(MetaStep(None, MetaStepType.FSDP_REDUCE_GRAD, stage_index))
-    return fsdp_actions

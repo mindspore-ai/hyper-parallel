@@ -22,6 +22,7 @@ import torch
 from hyper_parallel.core.pipeline_parallel import scheduler as scheduler_module
 from hyper_parallel.core.pipeline_parallel.scheduler import ScheduleInterleaved1F1B
 from hyper_parallel.core.pipeline_parallel.stage import PipelineStage
+from hyper_parallel.core.pipeline_parallel.fsdp_comm_controller import FSDPCommController
 
 
 class TestBatchP2PGroupInitialization(unittest.TestCase):
@@ -41,10 +42,13 @@ class TestBatchP2PGroupInitialization(unittest.TestCase):
             stage_index=0,
             pp_group=mock.sentinel.pp_group,
             has_backward=False,
+            submodule=torch.nn.Identity(),
+            _dw_cache={},
         )]
         schedule.real_stage_num = 2
         schedule.exec_order = {0: []}
         schedule.micro_batch_num = 1
+        schedule.fsdp_comm_controller = FSDPCommController(schedule.stages, schedule.micro_batch_num)
         schedule._send_handles = []
         schedule._boundary_issued = set()
         schedule._pending_boundary = {}
