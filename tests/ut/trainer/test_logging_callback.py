@@ -37,7 +37,7 @@ class TestLoggingCallback(unittest.TestCase):
         return SimpleNamespace(
             mesh=None, global_rank=rank, moe_monitor=monitor,
             config=SimpleNamespace(training=SimpleNamespace(logging_steps=logging_steps)),
-            step_env_metrics={"training/total_loss": 2.5}, tqdm_callback=None,
+            step_env_metrics={"training/total_loss": 2.5},
         )
 
     def test_global_aux_metric_is_not_overwritten_by_local_mean(self) -> None:
@@ -150,17 +150,19 @@ class TestLoggingCallback(unittest.TestCase):
                 else:
                     self.assertNotIn("training/router_aux_loss", message)
 
-    def test_aux_log_uses_active_tqdm_writer(self) -> None:
+    def test_aux_log_uses_single_monitor_writer(self) -> None:
         """
-        Feature: Auxiliary-loss logging.
-        Description: Router auxiliary metrics share the active progress bar's structured output path.
-        Expectation: The tqdm writer receives the aux field and standard logging does not duplicate it.
+        Feature: Structured output.
+        Description: Router auxiliary metrics share the canonical monitor writer.
+        Expectation: One writer call contains the aux field, with no duplicate console call.
         """
         trainer = self._trainer(SimpleNamespace(last_mean_aux_loss=1.25))
-        trainer.tqdm_callback = SimpleNamespace(write=Mock(return_value=True))
+        trainer.monitor = SimpleNamespace(enabled=True, log_step=Mock())
         callback = LoggingCallback(trainer)
+        state = TrainerState(global_step=2)
         with patch("hyper_parallel.trainer.callbacks.logging_callback.logger.info") as log:
-            callback.on_step_end(TrainerState(global_step=2), loss=2.5, loss_dict={}, grad_norm=1.0)
-        trainer.tqdm_callback.write.assert_called_once()
-        self.assertIn("training/router_aux_loss=1.25", trainer.tqdm_callback.write.call_args.args[0])
+            callback.on_step_end(state, loss=2.5, loss_dict={}, grad_norm=1.0)
+            callback.on_step_end(state, loss=2.5, loss_dict={}, grad_norm=1.0)
+        trainer.monitor.log_step.assert_called_once()
+        self.assertEqual(trainer.monitor.log_step.call_args.args[1]["training/router_aux_loss"], 1.25)
         log.assert_not_called()

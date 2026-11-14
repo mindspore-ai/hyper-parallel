@@ -48,6 +48,7 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, Un
 import torch
 import torch.distributed as dist
 
+from hyper_parallel.components.monitor import report_statistics
 from hyper_parallel.core.dtensor.placement_types import Partial
 
 if TYPE_CHECKING:
@@ -1100,6 +1101,8 @@ def clip_grad_norm_(
         grad_groups, norm_type, mesh_cache, device,
         norm_grads, key_per_grad,
     )
+
+    report_statistics("gradients", parameters, parameters=params, gradients=norm_grads)
 
     if error_if_nonfinite and torch.logical_or(
         total_norm.isnan(), total_norm.isinf()

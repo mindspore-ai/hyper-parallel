@@ -29,7 +29,9 @@ from typing import Any, Dict, Literal, Optional, Union
 
 import torch
 from torch import nn
+
 from hyper_parallel import DTensor
+from hyper_parallel.components.monitor import statistics_phase
 from hyper_parallel.core.fully_shard.hsdp_utils import get_hsdp_state
 from hyper_parallel.components.checkpoint.huggingface_checkpointer import (
     HuggingFaceCheckpointer,
@@ -500,11 +502,12 @@ def _materialize_and_load_model(
             raise RuntimeError("External materialization did not cover exactly its parameters")
     if load_base_model:
         state = {"model": model}
-        HuggingFaceCheckpointer(weights_mapping=weights_mapping).load(
-            pretrained_path, state, strict_model=False,
-            external_target_fqns=(external_result.target_fqns if external_result else frozenset()),
-            claimed_source_keys=(external_result.source_keys if external_result else frozenset()),
-        )
+        with statistics_phase("pretrained_weights_load"):
+            HuggingFaceCheckpointer(weights_mapping=weights_mapping).load(
+                pretrained_path, state, strict_model=False,
+                external_target_fqns=(external_result.target_fqns if external_result else frozenset()),
+                claimed_source_keys=(external_result.source_keys if external_result else frozenset()),
+            )
         load_report = state["load_report"]
         if external_result is not None:
             load_report = type(load_report)(

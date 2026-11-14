@@ -41,6 +41,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from hyper_parallel.components.monitor import report_statistics
 from hyper_parallel.components.functional.npu_grouped_swiglu import (
     npu_grouped_swiglu,
 )
@@ -329,6 +330,7 @@ def bind_local_expert_forward(
             f"num_experts ({global_expert_count}) must be divisible by ep_size ({ep_size})"
         )
     module.experts.local_expert_count = global_expert_count // ep_size
+    module.monitor_expert_count = global_expert_count
     activation = getattr(module.experts, "act_fn", None)
     if activation is None:
         hidden_act = getattr(getattr(module, "config", None), "hidden_act", "silu")
@@ -1116,6 +1118,7 @@ def ep_routed_forward(
             and chunk_count == 1 and _resolve_capacity_factor(module) is None
         ),
     )
+    report_statistics("expert_routes", module, indices=dispatch.expert_indices, attempted=topk_indices.numel())
     if chunk_count > 1:
         return _chunked_ep_forward(
             module, dispatch, ep_group, ep_size, ep_rank, chunk_count, expert_offset,
@@ -1321,6 +1324,7 @@ def ep_routed_dispatch(
         keep=keep,
     )
     source_token_indices = dispatch.source_indices
+    report_statistics("expert_routes", module, indices=dispatch.expert_indices, attempted=topk_indices.numel())
     flattened_expert_weights = dispatch.expert_weights
     dispatch_order = dispatch.dispatch_order
     dispatched_states = dispatch.states

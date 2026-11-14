@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import torch  # pylint: disable=forbidden-backend-import
 import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.components.monitor import report_statistics
 from hyper_parallel.core.optimizer.optimizer import AsyncReplicateBroadcaster, BaseDistributedOptimizer
 from hyper_parallel.core.optimizer.dtensor_compat import to_local_if_dtensor
 from hyper_parallel.core.optimizer.sharding_category import (
@@ -868,6 +869,8 @@ class Muon(BaseDistributedOptimizer):
         else:
             merged_update = self.zeropower_fn(merged_input, steps=ns_steps)
 
+        report_statistics("ns_norm", self, values=merged_update, tensors=tensor_list, sizes=state["slice_sizes"])
+
         if merged_input.dim() == 2:
             merged_update = merged_update.unsqueeze(0)
         del merged_input
@@ -956,6 +959,7 @@ class Muon(BaseDistributedOptimizer):
             working_input, reshaped_inputs = self._reshape_ns_input(
                 param, ns_inputs[param].view(state["origin_shapes"][param])
             )
+            report_statistics("ns_inputs", self, parameter=param, tensors=reshaped_inputs)
             state["working_inputs"][param] = working_input
             for reshaped_input in reshaped_inputs:
                 state["reshape_groups"][self._shape_to_core_shape(tuple(reshaped_input.shape))].append(
@@ -1013,6 +1017,7 @@ class Muon(BaseDistributedOptimizer):
                 tuple(to_local_if_dtensor(p.data).shape) if no_shard else tuple(p.shape)
             )
             prepared = self._prepare_ns_transform(p, ns_inputs[p].view(state["origin_shapes"][p]))
+            report_statistics("ns_inputs", self, parameter=p, tensors=prepared[1].tensors)
             state["working_inputs"][p] = prepared[0]
             state["transforms"][p] = prepared[1]
             state["transform_updates"].append([None] * len(prepared[1].tensors))

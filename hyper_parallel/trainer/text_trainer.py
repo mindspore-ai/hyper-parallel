@@ -29,6 +29,7 @@ from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import print_device_mem_info
 from hyper_parallel.trainer.runtime.memory_profiler import memory_profiler
 from hyper_parallel.trainer.runtime.device import synchronize
+from hyper_parallel.trainer.runtime.monitor.session import monitor_phase, monitor_scope
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.distributed_data import DistributedDataLoader
 from hyper_parallel.trainer.config import TrainerConfig
@@ -57,13 +58,17 @@ class TextTrainer:
         self.base._build_loss()
 
         # datasets
-        self._build_model_assets()
-        self._build_data_transform()
-        self.base._build_dataset()
+        with monitor_phase(self.base, "tokenizer_processor_load"):
+            self._build_model_assets()
+        with monitor_phase(self.base, "data_transform_build"):
+            self._build_data_transform()
+        with monitor_phase(self.base, "dataset_build"):
+            self.base._build_dataset()
 
         # dataloader
         self._build_collate_fn()
-        self.base._build_dataloader()
+        with monitor_phase(self.base, "dataloader_build"):
+            self.base._build_dataloader()
 
         # get_batch
         self._build_get_batch()
@@ -82,6 +87,10 @@ class TextTrainer:
         config: TrainerConfig = self.base.config
         if config.dataset is None:
             raise ValueError("dataset must define a build target")
+        template_logging = config.debug.log_first_rendered_template or (
+            getattr(getattr(config, "monitor", None), "enabled", False)
+            and config.monitor.datasets.log_first_rendered_template
+        )
         assets_config = config.dataset.model_assets
         tokenizer_target = assets_config.tokenizer
         if tokenizer_target is None:
@@ -102,10 +111,10 @@ class TextTrainer:
                     assets_config.chat_template,
                     self.base.tokenizer,
                     chat_template_kwargs=assets_config.chat_template_kwargs,
-                    log_first_rendered_template=config.debug.log_first_rendered_template,
+                    log_first_rendered_template=template_logging,
                 )
             else:
-                if assets_config.chat_template_kwargs or config.debug.log_first_rendered_template:
+                if assets_config.chat_template_kwargs or template_logging:
                     raise ValueError(
                         "dataset.model_assets chat-template options require chat_template='tokenizer'"
                     )
@@ -244,7 +253,8 @@ class TextTrainer:
         Returns:
             Loss tensor and named loss tensors for this FB step.
         """
-        model_inputs, loss_inputs = self.base.get_batch(data_iterator)
+        with monitor_phase(self.base, "get_batch"), monitor_scope(self.base):
+            model_inputs, loss_inputs = self.base.get_batch(data_iterator)
         self.base.current_token_counts = count_loss_token(loss_inputs)
         metric_inputs = {
             **model_inputs,
@@ -386,6 +396,8 @@ class TextTrainer:
                 logger.exception("Failed to save memory snapshot after training error.")
             finally:
                 self.base.abort_profilers()
+                if getattr(self.base, "monitor", None) is not None:
+                    self.base.monitor.close()
             raise
 
         if balanced_loader:

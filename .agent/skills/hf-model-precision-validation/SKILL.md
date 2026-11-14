@@ -287,6 +287,32 @@ rows in `comparison.json` for every formal case.
    The built-in matrix's descriptive throughput is not a substitute for the paired
    optimization experiment.
 
+## Trainer Monitor Evidence for Diagnosis
+
+When diagnosing Trainer loss/norm divergence, packing, EP load, or throughput,
+read [the metric-to-problem guide](../../../docs/trainer_monitor_diagnostics.md).
+Use its definitions and companion design to distinguish implemented fields from
+proposed Recorder metrics; a design YAML is not evidence that collection exists.
+
+- Align observations by original sample step, rank, micro-step and module, even
+  when asynchronous delivery arrives later. Check coverage and pending/dropped
+  records before comparing values; missing data is not zero or proof of health.
+- Collect from all ranks that own the metric. A PP stage without loss is not an
+  error; unequal FSDP shard norms do not by themselves establish divergence.
+  Keep rank-local detail separate from the global-rank-0 output policy.
+- Follow the guide's loss-spike, EP-skew, packing and MFU diagnosis paths. Report
+  the observed symptom, corroborating evidence, unresolved alternatives and next
+  discriminating check; do not infer a root cause from one scalar.
+- If collection itself may perturb results, compare no hook, idle hook,
+  synchronous summaries and asynchronous summaries under the same workload.
+  Inspect graph breaks, callback count, device and pinned-host memory, queue
+  pressure and runtime. Asynchrony must not retain live activations/gradients or
+  let background threads reorder distributed collectives.
+- For MFU evidence, require standard-block coverage, exclusive parent/child
+  accounting, runtime input geometry and a versioned device peak. Missing GDN or
+  other material blocks invalidate a full-model MFU; low MFU alone does not prove
+  a kernel regression. Numerical and performance acceptance remain separate.
+
 ## Stop Conditions
 
 Stop and report `BLOCKED` instead of changing the experiment when required

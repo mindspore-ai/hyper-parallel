@@ -452,8 +452,10 @@ class EnvironMeterCallback(Callback):
 
         training_config = getattr(getattr(self.trainer, "config", None), "training", None)
         model_config = getattr(self.trainer, "model_config", None)
+        monitor = getattr(self.trainer, "monitor", None)
         if (
-            getattr(training_config, "log_tflops", False)
+            (monitor is None or not monitor.enabled)
+            and getattr(training_config, "log_tflops", False)
             and model_config is not None
             and global_input_tokens > 0
             and global_step_time > 0
@@ -466,5 +468,12 @@ class EnvironMeterCallback(Callback):
                     step_flops / (global_step_time * get_world_size_safe()) / 1e12
                 )
 
+        if monitor is not None and monitor.enabled:
+            env_metrics["data/step_input_tokens"] = global_input_tokens
+            env_metrics["performance/input_tokens_per_second"] = (
+                global_input_tokens / global_step_time if global_step_time > 0 else 0.0
+            )
+            env_metrics.update(monitor.flops_metrics(global_input_tokens, global_seq_len_sq, global_step_time))
+            env_metrics.update(monitor.end_step())
         self.trainer.step_train_metrics = train_metrics
         self.trainer.step_env_metrics = env_metrics

@@ -43,6 +43,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_swiglu
+from hyper_parallel.components.monitor import report_statistics
 from hyper_parallel.core.dtensor.dtensor import DTensor
 
 
@@ -710,6 +711,7 @@ class MoE(nn.Module):
         self.shared_expert = shared_expert
         self.num_experts = num_experts
         self.top_k = top_k
+        self.monitor_expert_count = num_experts
         self.score_before_experts = score_before_experts
         self.load_balance_coeff = load_balance_coeff
         self.sequence_partition_group = sequence_partition_group
@@ -803,6 +805,8 @@ class MoE(nn.Module):
         top_scores, selected_experts, token_counts = self.router(
             x_flat, self.expert_bias
         )
+
+        report_statistics("expert_load", self, counts=token_counts)
 
         # Accumulate token histogram without creating gradient nodes.
         with torch.no_grad():

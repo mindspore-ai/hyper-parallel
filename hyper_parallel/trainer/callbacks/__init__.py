@@ -20,8 +20,7 @@ Provides callback system for customizing trainer behavior at various stages of t
 
 Moved from ``auto_models/trainer/callbacks`` in stage 7 (05 §15.11 step 2);
 ``TrainerState`` is defined in ``hyper_parallel.trainer.state`` and
-re-exported here. The temporary ``TempLogCallback`` alias was dropped —
-``TqdmCallback`` is the logging callback it pointed at.
+re-exported here. Structured output is owned by ``LoggingCallback``.
 """
 
 from hyper_parallel.trainer.state import TrainerState
@@ -33,7 +32,6 @@ from .logging_callback import LoggingCallback
 from .checkpoint_callback import CheckpointerCallback
 from .profiler_callback import ProfilerCallback
 from .stress_detect_callback import StressDetectCallback
-from .tqdm_callback import TqdmCallback
 
 
 __all__ = [
@@ -45,6 +43,5 @@ __all__ = [
     "CheckpointerCallback",
     "ProfilerCallback",
     "StressDetectCallback",
-    "TqdmCallback",
     "TrainerState",
 ]
