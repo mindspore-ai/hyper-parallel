@@ -33,10 +33,32 @@ from hyper_parallel.components.quantization.tensor import MXFP8Tensor
 
 _A5_DEVICE_MARKERS = ("Ascend950", "Ascend910_95")
 _SUPPORTED_LAYOUTS = ("NN", "NT", "TN")
+# CANN clipped SwiGLU expects (256 + aclDataType) in forward and raw aclDataType in backward.
+_CLAMPED_SWIGLU_DST_TYPES = {
+    torch.float8_e4m3fn: (292, 36),
+    torch.float8_e5m2: (291, 35),
+}
 
 
 class LowPrecisionCapabilityError(RuntimeError):
     """Report that the active torch_npu stack lacks the A5 MXFP8 contract."""
+
+
+@lru_cache(maxsize=1)
+def _get_clamped_swiglu_ops() -> Any:
+    """Load optional CANN registration only when clipped fusion is requested."""
+    try:
+        import cann_ops_nn  # pylint: disable=C0415,unused-import
+    except ImportError as exc:
+        raise LowPrecisionCapabilityError(
+            "Clipped MXFP8 SwiGLU requires cann_ops_nn (CANN 9.2.1 on Ascend 950PR/950DT)."
+        ) from exc
+    operators = torch.ops.cann_ops_nn
+    names = ("swiglu_group_quant_with_dual_axis", "swiglu_backward_group_quant_with_dual_axis")
+    missing = [name for name in names if not hasattr(operators, name)]
+    if missing:
+        raise LowPrecisionCapabilityError(f"Clipped MXFP8 SwiGLU requires cann_ops_nn operators {missing}")
+    return operators
 
 
 class MXFP8NpuOps:
@@ -121,8 +143,11 @@ class MXFP8NpuOps:
             scale_alg=MX_SCALE_ALG_CUBALS,
         )
 
-    def validate_swiglu_fusion(self) -> None:
+    def validate_swiglu_fusion(self, *, clamp_limit: Optional[float] = None) -> None:
         """Require both fused kernels; never silently fall back to plain SwiGLU."""
+        if clamp_limit is not None:
+            _get_clamped_swiglu_ops()
+            return
         names = ("npu_swiglu_mx_quant_with_dual_axis", "_npu_swiglu_backward_mx_quant_with_dual_axis")
         missing = [name for name in names if not hasattr(self._torch_npu, name)]
         if missing:
@@ -134,6 +159,7 @@ class MXFP8NpuOps:
         *,
         quant_dtype: torch.dtype = torch.float8_e4m3fn,
         group_index: Optional[torch.Tensor] = None,
+        clamp_limit: Optional[float] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Apply SiLU(gate) * up and quantize both MX directions.
 
@@ -141,10 +167,17 @@ class MXFP8NpuOps:
             tensor: BF16/FP16 matrix containing [gate | up] along its last axis.
             quant_dtype: Payload dtype, E4M3 for the current MXFP8 recipe.
             group_index: Cumulative expert token boundaries, or None for Dense.
+            clamp_limit: Positive DeepSeek clipping limit, or None for standard SwiGLU.
 
         Returns:
             Row data, row scale, column data, and column scale.
         """
+        if clamp_limit is not None:
+            outputs = _get_clamped_swiglu_ops().swiglu_group_quant_with_dual_axis(
+                tensor.detach(), group_index=group_index,
+                dst_type=_CLAMPED_SWIGLU_DST_TYPES[quant_dtype][0], quant_mode=1, clamp_limit=clamp_limit,
+            )
+            return tuple(outputs[:4])
         return self._torch_npu.npu_swiglu_mx_quant_with_dual_axis(
             tensor, group_index=group_index, activate_left=True,
             dst_type=quant_dtype, scale_alg=1,
@@ -157,6 +190,7 @@ class MXFP8NpuOps:
         *,
         quant_dtype: torch.dtype = torch.float8_e4m3fn,
         group_index: Optional[torch.Tensor] = None,
+        clamp_limit: Optional[float] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute the SwiGLU derivative and quantize both MX directions.
 
@@ -165,10 +199,17 @@ class MXFP8NpuOps:
             grad_output: BF16/FP16 gradient of the SwiGLU output.
             quant_dtype: Payload dtype, E4M3 for the current MXFP8 recipe.
             group_index: The same cumulative boundaries used by forward.
+            clamp_limit: The clipping limit used by forward, or None for standard SwiGLU.
 
         Returns:
             Row data, row scale, column data, and column scale of the gradient.
         """
+        if clamp_limit is not None:
+            outputs = _get_clamped_swiglu_ops().swiglu_backward_group_quant_with_dual_axis(
+                grad_output, tensor, group_index=group_index,
+                dst_type=_CLAMPED_SWIGLU_DST_TYPES[quant_dtype][1], quant_mode=1, clamp_limit=clamp_limit,
+            )
+            return tuple(outputs[:4])
         return self._torch_npu._npu_swiglu_backward_mx_quant_with_dual_axis(  # pylint: disable=protected-access
             tensor, grad_output, group_index=group_index, activate_left=True,
             dst_type=quant_dtype, scale_alg=1,
@@ -289,9 +330,9 @@ def validate_npu_runtime() -> None:
     _get_npu_ops()
 
 
-def validate_npu_swiglu_runtime() -> None:
+def validate_npu_swiglu_runtime(*, clamp_limit: Optional[float] = None) -> None:
     """Validate fusion without storing runtime modules on a model's quantizer."""
-    _get_npu_ops().validate_swiglu_fusion()
+    _get_npu_ops().validate_swiglu_fusion(clamp_limit=clamp_limit)
 
 
 def validate_npu_gmm_runtime() -> None:

@@ -59,8 +59,9 @@ def install_family(model: nn.Module, config: TrainerConfig) -> nn.Module:
 def deepseek_experts_model() -> nn.Module:
     """Build the native packed experts used by V4.1, retaining its clamp semantics."""
     model = nn.Module()
-    config = DeepseekV4Config(hidden_size=128, intermediate_size=256, num_local_experts=4,
-                            num_experts_per_tok=2, swiglu_limit=10.0)
+    config = DeepseekV4Config.from_dict({
+        "hidden_size": 128, "intermediate_size": 256, "num_local_experts": 4,
+        "num_experts_per_tok": 2, "swiglu_limit": 10.0})
     model.experts = DeepseekV4Experts(config)
     for parameter in model.parameters():
         nn.init.normal_(parameter, std=0.02)
@@ -74,7 +75,7 @@ def deepseek_qat_config(*, fake: bool = False, weight_format: str = "mxfp8",
     Args:
         fake: Select the fake W4A8 strategy.
         weight_format: Weight format in the named scheme.
-        fused: Request fusion, which remains unsupported for this activation.
+        fused: Request the CANN clipped SwiGLU dual-axis fusion.
     """
     raw = qat_config(fake=fake, weight_format=weight_format).to_dict()
     raw["model"] = {"_target_": "tests.common.qat_family.deepseek_experts_model"}
