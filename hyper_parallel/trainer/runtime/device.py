@@ -37,6 +37,8 @@ __all__ = [
     "stream_synchronize",
     "empty_cache",
     "set_device",
+    "simulate_device_runtime",
+    "is_device_runtime_simulated",
     "get_device_rng_state",
     "set_device_rng_state",
     "is_nccl_backend",
@@ -62,6 +64,24 @@ from hyper_parallel.models.build_options import (
 
 logger = logging.getLogger(__name__)
 
+# Logical-simulation mode: when enabled (by the dry-run tool before it drives
+# real Trainer code over FakeTensors), every device-side effect in this module
+# becomes a no-op so the process never binds an accelerator, initializes its
+# runtime, or appears on device tooling. Pure queries (device type, flags)
+# stay live — simulation intentionally reports the real accelerator topology.
+_SIMULATED_DEVICE_RUNTIME = False
+
+
+def simulate_device_runtime(enabled: bool = True) -> None:
+    """Toggle no-op device effects for logical (FakeTensor) simulation."""
+    global _SIMULATED_DEVICE_RUNTIME  # pylint: disable=global-statement
+    _SIMULATED_DEVICE_RUNTIME = bool(enabled)
+
+
+def is_device_runtime_simulated() -> bool:
+    """Return whether device-side effects are currently simulated."""
+    return _SIMULATED_DEVICE_RUNTIME
+
 
 def get_device_name() -> str:
     """Get real device name, e.g. A100, H100"""
@@ -79,11 +99,15 @@ def get_dist_comm_backend() -> str:
 
 def synchronize() -> None:
     """Execute torch synchronize operation."""
+    if _SIMULATED_DEVICE_RUNTIME:
+        return
     get_torch_device().synchronize()
 
 
 def stream_synchronize() -> None:
     """Execute device stream synchronize operation."""
+    if _SIMULATED_DEVICE_RUNTIME:
+        return
     if IS_CUDA_AVAILABLE:
         torch.cuda.current_stream().synchronize()
     elif IS_NPU_AVAILABLE:
@@ -94,11 +118,15 @@ def stream_synchronize() -> None:
 
 def empty_cache() -> None:
     """Execute torch empty cache operation."""
+    if _SIMULATED_DEVICE_RUNTIME:
+        return
     get_torch_device().empty_cache()
 
 
 def set_device(device: torch.types.Device) -> None:
     """Execute set device operation."""
+    if _SIMULATED_DEVICE_RUNTIME:
+        return
     get_torch_device().set_device(device)
 
 

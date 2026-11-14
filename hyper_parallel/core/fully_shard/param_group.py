@@ -141,9 +141,12 @@ class AllGatherBucket:
         """
         if self.flat_param_buffer is None:
             return False
-        flat_storage_ptr = self.flat_param_buffer.untyped_storage().data_ptr()
+        # Storage identity instead of data_ptr: empty shards and FakeTensors
+        # report data_ptr 0 for distinct storages, which would validate a
+        # buffer the parameters do not actually alias.
+        flat_storage = self.flat_param_buffer.untyped_storage()
         return all(
-            hsdp_param._sharded_param_data.untyped_storage().data_ptr() == flat_storage_ptr
+            hsdp_param._sharded_param_data.untyped_storage() is flat_storage
             for hsdp_param in self.hsdp_params
         )
 

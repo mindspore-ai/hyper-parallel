@@ -17,6 +17,109 @@
 from typing import Tuple, Dict, Any, Optional
 import torch
 from torch import Tensor
+from torch._subclasses.fake_tensor import FakeTensor, unset_fake_temporarily
+
+
+def _make_shell_subclass(cls, local_tensor: Tensor) -> Tensor:
+    """Wrap ``local_tensor`` in subclass ``cls``, aliasing or shadowing its storage.
+
+    Real local tensors share their storage with the wrapper (the normal path,
+    byte-identical to a plain ``_make_subclass``). ``Tensor._make_subclass``
+    cannot re-wrap a FakeTensor because a FakeTensor is already a Tensor
+    subclass, so storage-less locals get a meta shell with identical metadata
+    instead — built as a :func:`_fake_local_variant` of ``cls`` so every
+    FakeTensor-specific accessor lives on that variant class and the real
+    training path never executes a fake-aware branch.
+
+    Args:
+        cls: The DTensor subclass to instantiate.
+        local_tensor: The local shard the wrapper represents.
+
+    Returns:
+        Tensor: An uninitialized ``cls`` instance (``__init_data__`` pending).
+    """
+    if isinstance(local_tensor, FakeTensor):
+        # Inside an active FakeTensorMode even meta factories return
+        # FakeTensors, which _make_subclass rejects; build the shell outside.
+        with unset_fake_temporarily():
+            shell = torch.empty_strided(
+                local_tensor.size(),
+                local_tensor.stride(),
+                dtype=local_tensor.dtype,
+                device="meta",
+            )
+        return Tensor._make_subclass(
+            _fake_local_variant(cls), shell, local_tensor.requires_grad
+        )
+    return Tensor._make_subclass(cls, local_tensor, local_tensor.requires_grad)
+
+
+_FAKE_LOCAL_VARIANTS: Dict[type, type] = {}
+
+
+def _fake_local_variant(cls: type) -> type:
+    """Return the meta-shell variant of DTensor subclass ``cls``.
+
+    The variant overrides exactly the accessors whose base implementation
+    assumes the wrapper owns real storage. Keeping these overrides on a
+    separate class (instead of ``if is_meta_shell`` branches in the base)
+    means real-tensor instances resolve the unmodified base methods — the
+    hot ``grad``/``data``/``zero_grad`` paths cost nothing extra when
+    dry-run is not in use. Variants are cached per subclass and are
+    idempotent (a variant is its own variant), so ``self.__class__(...)``
+    reconstruction in ``detach``/``to``/``type`` stays type-stable, which
+    ``nn.Parameter`` requires of ``detach``.
+    """
+    if getattr(cls, "_is_fake_local_variant", False):
+        return cls
+    variant = _FAKE_LOCAL_VARIANTS.get(cls)
+    if variant is None:
+        variant = type(f"_FakeLocal{cls.__name__}", (cls,), {
+            "_is_fake_local_variant": True,
+            "is_meta_shell": _variant_is_meta_shell,
+            "grad": property(_variant_grad_get, _variant_grad_set),
+            "data": property(_variant_data_get, _variant_data_set),
+        })
+        _FAKE_LOCAL_VARIANTS[cls] = variant
+    return variant
+
+
+def _variant_is_meta_shell(self) -> bool:
+    """Meta-shell wrappers have no storage of their own."""
+    return True
+
+
+def _variant_grad_get(self) -> Optional[Tensor]:
+    """Return the stored DTensor gradient wrapper while it owns the leaf's grad."""
+    local_grad = self._local_tensor.grad
+    wrapper = getattr(self, "_grad_dtensor_wrapper", None)
+    if wrapper is not None and wrapper._local_tensor is local_grad:
+        return wrapper
+    return local_grad
+
+
+def _variant_grad_set(self, value: Optional[Tensor]) -> None:
+    """Store DTensor gradients on the local leaf; autograd rejects meta-device grads."""
+    if isinstance(value, DTensorBase) and value.is_meta_shell():
+        self._local_tensor.grad = value._local_tensor
+        self._grad_dtensor_wrapper = value
+        return
+    self._local_tensor.grad = value
+    if getattr(self, "_grad_dtensor_wrapper", None) is not None:
+        self._grad_dtensor_wrapper = None
+
+
+def _variant_data_get(self):
+    """A meta shell owns no storage; the local tensor's data is the payload."""
+    with torch._C.DisableTorchFunctionSubclass():
+        return self._local_tensor.data
+
+
+def _variant_data_set(self, value) -> None:
+    """Rebind only the local tensor; the meta shell cannot adopt device storage."""
+    local_value = value.to_local() if isinstance(value, DTensorBase) else value
+    with torch._C.DisableTorchFunctionSubclass():
+        Tensor.data.__set__(self._local_tensor, local_value)
 
 
 class DTensorBase(Tensor):
@@ -40,7 +143,7 @@ class DTensorBase(Tensor):
         """
         if isinstance(local_tensor, DTensorBase):
             # Copy from existing DTensorBase — use alias_placements to preserve multi-axis ordering
-            t = Tensor._make_subclass(cls, local_tensor._local_tensor, local_tensor._local_tensor.requires_grad)
+            t = _make_shell_subclass(cls, local_tensor._local_tensor)
             copy_placements = local_tensor.layout.alias_placements if local_tensor.layout else local_tensor.placements
             t.__init_data__(
                 local_tensor._local_tensor,
@@ -56,7 +159,8 @@ class DTensorBase(Tensor):
             raise ValueError("placements is None, must provide placements")
 
         # Create Tensor subclass instance, sharing local_tensor's underlying storage
-        t = Tensor._make_subclass(cls, local_tensor, local_tensor.requires_grad)
+        # (or shadowing it with a meta shell when the local is a FakeTensor).
+        t = _make_shell_subclass(cls, local_tensor)
         t.__init_data__(local_tensor, device_mesh, placements, layout, shape)
         return t
 
@@ -85,6 +189,12 @@ class DTensorBase(Tensor):
             Any: The result of the dispatched operation, typically a DTensor or tuple of DTensors.
         """
         kwargs = kwargs or {}
+        if func in (torch.numel, Tensor.numel):
+            # numel must keep logical global semantics (DTensor.numel) even for
+            # functional / unbound call forms and under SkipDTensorDispatch,
+            # where the bypass would otherwise leak the local shard's capacity.
+            tensor = args[0] if args else kwargs["input"]
+            return tensor.numel()
         # pylint: disable=C0415
         from hyper_parallel.core.shard._op_dispatch import _OP_DISPATCHER
         out = _OP_DISPATCHER.dispatch(func, args, kwargs)
@@ -109,6 +219,15 @@ class DTensorBase(Tensor):
             value (Optional[Tensor]): The gradient tensor to set, or None to clear.
         """
         self._local_tensor.grad = value
+
+    def is_meta_shell(self) -> bool:
+        """Return whether this wrapper is a storage-less meta shell.
+
+        Always False here; the ``_fake_local_variant`` subclass used for
+        FakeTensor locals overrides this (and the storage-touching accessors)
+        so the real-tensor path carries no fake-aware branches.
+        """
+        return False
 
     @property
     def requires_grad(self) -> bool:
@@ -344,6 +463,19 @@ class DTensorBase(Tensor):
         # Force return local_tensor's data pointer (ensure address consistency)
         return self._local_tensor.data_ptr()
 
+    def untyped_storage(self) -> torch.UntypedStorage:
+        """
+        Get the untyped storage of the local tensor.
+
+        Like ``data_ptr``, storage queries answer for the local shard: the
+        wrapper either aliases the same storage (real locals) or holds a
+        storage-less meta shell (FakeTensor locals).
+
+        Returns:
+            torch.UntypedStorage: The local tensor's untyped storage.
+        """
+        return self._local_tensor.untyped_storage()
+
     def numel(self) -> int:
         """
         Get the total number of elements in this tensor.
@@ -375,7 +507,7 @@ class DTensorBase(Tensor):
             DTensorBase: A new DTensor with the converted local tensor.
         """
         new_local = self._local_tensor.to(*args, **kwargs)
-        new_dt = Tensor._make_subclass(type(self), new_local, new_local.requires_grad)
+        new_dt = _make_shell_subclass(type(self), new_local)
         new_dt.__init_data__(
             new_local,
             self._device_mesh,

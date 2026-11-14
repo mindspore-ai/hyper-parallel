@@ -42,6 +42,7 @@ from hyper_parallel.core.optimizer.muon_shard import (
 
 logger = logging.getLogger(__name__)
 
+
 # Legacy: single-coefficient quintic NS (Keller Jordan / Moonlight).
 # Same (a, b, c) applied every step; typically 5 steps.
 _NS_LEGACY_COEFFS: Tuple[float, float, float] = (3.4445, -4.7750, 2.0315)
@@ -763,7 +764,7 @@ class Muon(BaseDistributedOptimizer):
             )
 
         for reshaped_input in reshaped_inputs:
-            if reshaped_input.untyped_storage().data_ptr() != working_input.untyped_storage().data_ptr():
+            if reshaped_input.untyped_storage() is not working_input.untyped_storage():
                 raise ValueError("reshape_fn must return views that share storage with the working NS input tensor")
 
         return working_input, reshaped_inputs
@@ -788,7 +789,7 @@ class Muon(BaseDistributedOptimizer):
             """Write reshaped NS updates back into the views and the working input."""
             for reshaped_input, update in zip(reshaped_inputs, updates):
                 reshaped_input.copy_(update.contiguous().view_as(reshaped_input))
-            if output.untyped_storage().data_ptr() != working_input.untyped_storage().data_ptr():
+            if output.untyped_storage() is not working_input.untyped_storage():
                 output.copy_(working_input)
 
         return working_input, NSInputTransform(tensors=reshaped_inputs, restore=restore_view_updates)
@@ -977,7 +978,7 @@ class Muon(BaseDistributedOptimizer):
         for param in p_list:
             update = ns_inputs[param].view(state["origin_shapes"][param])
             working_input = state["working_inputs"][param]
-            if working_input.untyped_storage().data_ptr() != update.untyped_storage().data_ptr():
+            if working_input.untyped_storage() is not update.untyped_storage():
                 update.copy_(working_input)
             state["restored"][param] = update
         return state["restored"]
@@ -1052,9 +1053,7 @@ class Muon(BaseDistributedOptimizer):
 
         for p in p_list:
             reshaped_update = ns_inputs[p].view(state["origin_shapes"][p])
-
-            if (state["working_inputs"][p].untyped_storage().data_ptr()
-                    != reshaped_update.untyped_storage().data_ptr()):
+            if state["working_inputs"][p].untyped_storage() is not reshaped_update.untyped_storage():
                 reshaped_update.copy_(state["working_inputs"][p])
             state["restored"][p] = reshaped_update
 
