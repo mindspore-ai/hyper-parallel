@@ -21,6 +21,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Optional
 
+from hyper_parallel.core.activation_memory.wrapper import CheckpointWrapper
 from hyper_parallel.tools.model_integration.structure_inventory import build_model_inventory
 from hyper_parallel.tools.model_integration.checkpoint_coverage import build_checkpoint_coverage
 from hyper_parallel.tools.model_integration.schemas import (
@@ -446,10 +447,10 @@ def inventory_final_model(model: Any, source: Optional[dict[str, Any]] = None) -
 
 
 def collect_activation_checkpoint_wrappers(model: Any) -> dict[str, Any]:
-    """List final activation-checkpoint wrappers without backend imports."""
+    """List final activation-checkpoint wrappers, including FSDP-derived wrappers."""
     wrappers = []
     for module_fqn, module in model.named_modules(remove_duplicate=False):
-        if type(module).__name__ != "CheckpointWrapper":
+        if not isinstance(module, CheckpointWrapper):
             continue
         wrapped = getattr(module, "_wrapped_module", None)
         wrappers.append(
