@@ -34,6 +34,7 @@ from torch.nn import functional as F
 
 from hyper_parallel.components.functional.linear_attention_convolution import (
     fused_causal_conv1d,
+    validate_conv_backend,
 )
 from hyper_parallel.components.functional.linear_attention_packed import (
     PackedSequenceInfo, packed_causal_conv1d, resolve_packed_sequence,
@@ -72,6 +73,7 @@ def _run_local_kda(
     safe_gate: bool,
     backend: str,
     sequence_info: Optional[PackedSequenceInfo] = None,
+    use_qk_l2norm_in_kernel: bool = True,
 ) -> torch.Tensor:
     """Run the explicitly selected local KDA implementation."""
     if backend in ("triton", "ascendc") and not safe_gate:
@@ -95,7 +97,7 @@ def _run_local_kda(
         chunk_size=chunk_size,
         initial_state=None,
         output_final_state=False,
-        use_qk_l2norm_in_kernel=True,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         use_gate_in_kernel=True,
         use_beta_sigmoid_in_kernel=True,
         backend=backend,
@@ -879,6 +881,7 @@ class _KDAStateCP(nn.Module):
         dt_bias: torch.Tensor,
         scale: Optional[float] = None,
         sequence_info: Optional[PackedSequenceInfo] = None,
+        use_qk_l2norm_in_kernel: bool = True,
     ) -> torch.Tensor:
         """Run one local KDA segment and propagate its recurrent state.
 
@@ -891,7 +894,13 @@ class _KDAStateCP(nn.Module):
             a_log: Decay parameter with one value per value head.
             dt_bias: Learned bias with one value per gate channel.
             scale: Optional attention scaling factor.
+            use_qk_l2norm_in_kernel: False accepts caller-normalized Q/K on the fused path.
         """
+        if not isinstance(use_qk_l2norm_in_kernel, bool):
+            raise ValueError("use_qk_l2norm_in_kernel must be bool")
+        if not use_qk_l2norm_in_kernel and (
+                self.backend == "ascendc" or (self.backend == "eager" and self.cp_size > 1)):
+            raise ValueError("Caller-normalized state CP currently requires backend=triton")
         if self.cp_size == 1:
             return _run_local_kda(
                 query,
@@ -907,6 +916,7 @@ class _KDAStateCP(nn.Module):
                 safe_gate=self.safe_gate,
                 backend=self.backend,
                 sequence_info=sequence_info,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             )
         if self.backend == "eager":
             return _eager_kda_state_p2p(
@@ -934,7 +944,7 @@ class _KDAStateCP(nn.Module):
                 ascendc_state_kda,
             )
             return ascendc_state_kda(
-                query, key, value, gate, beta, a_log=a_log, dt_bias=dt_bias, scale=scale,
+                query, key, value, gate, beta, a_log=a_log.float(), dt_bias=dt_bias.float(), scale=scale,
                 lower_bound=self.lower_bound, state_cp=self.state_cp, cp_mesh=self.cp_mesh,
                 sequence_info=sequence_info)
 
@@ -960,6 +970,7 @@ class _KDAStateCP(nn.Module):
             safe_gate=self.safe_gate,
             state_cp=self.state_cp,
             sequence_info=sequence_info,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         )
 
 
@@ -995,7 +1006,7 @@ def _validate_layer_short_conv(module: nn.Module, mode: str) -> None:
 
 
 class KimiDeltaAttentionLayerUlyssesCP(KimiDeltaAttentionUlyssesCP):
-    """Wrap a training-time Kimi K3 attention layer with Ulysses CP.
+    """Wrap stateless full-sequence Kimi K3 attention with Ulysses CP.
 
     The wrapped module keeps ownership of all model parameters. Its local
     sequence shard is projected first, then Q/K/V, per-dimension gate logits,
@@ -1119,6 +1130,10 @@ class KimiDeltaAttentionLayerUlyssesCP(KimiDeltaAttentionUlyssesCP):
         packed = self._seq_to_head(torch.cat(rank_major, dim=-1).contiguous())
         return torch.split(packed, split_sizes, dim=-1)
 
+    def _run_local_attention(self, *args: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        """Run the shared kernel while allowing model-owned normalization semantics."""
+        return _run_local_kda(*args, **kwargs)
+
     def _local_short_conv(
         self,
         projected: torch.Tensor,
@@ -1173,8 +1188,6 @@ class KimiDeltaAttentionLayerUlyssesCP(KimiDeltaAttentionUlyssesCP):
             output_attentions: Must be False; KDA does not materialize attention weights.
             kwargs: Optional global sample offsets or prebuilt packed_sequence_info.
         """
-        if not self.module.training:
-            raise NotImplementedError("Kimi K3 Ulysses CP currently supports training only.")
         if past_key_values is not None or use_cache:
             raise NotImplementedError("Kimi K3 Ulysses CP does not support recurrent cache.")
         if output_attentions:
@@ -1232,7 +1245,7 @@ class KimiDeltaAttentionLayerUlyssesCP(KimiDeltaAttentionUlyssesCP):
             self.cp_rank,
             self.cp_size,
         )
-        output = _run_local_kda(
+        output = self._run_local_attention(
             query,
             key,
             value,
@@ -1276,11 +1289,17 @@ class KimiDeltaAttentionLayerCP(nn.Module):
         *,
         chunk_size: int = 64,
         backend: str = "eager",
+        conv_backend: Optional[str] = None,
         ulysses_degree: int = 1,
         state_cp_method: str = "p2p",
         allgather_group_size: int = 1,
     ) -> None:
-        """Keep layer ownership and full-CP halo metadata separate from the core."""
+        """Keep layer ownership and full-CP halo metadata separate from the core.
+
+        Args:
+            conv_backend: Optional independent ShortConv backend. None preserves
+                the existing choice: AscendC for native KDA, otherwise eager.
+        """
         super().__init__()
         lower_bound = _gate_lower_bound(module)
         if lower_bound is None:
@@ -1288,6 +1307,8 @@ class KimiDeltaAttentionLayerCP(nn.Module):
         self.cp_mesh = _ensure_1d(device_mesh)
         self.cp_rank, self.cp_size = self.cp_mesh.get_local_rank(), self.cp_mesh.size()
         self.module, self.backend = module, backend.lower()
+        default_conv = "ascendc" if self.backend == "ascendc" else "eager"
+        self.conv_backend = validate_conv_backend(default_conv if conv_backend is None else conv_backend)
         self._validate_module()
         _validate_cp_degrees(self.cp_size, ulysses_degree, allgather_group_size)
         if module.num_heads % ulysses_degree or _num_value_heads(module) % ulysses_degree:
@@ -1358,8 +1379,6 @@ class KimiDeltaAttentionLayerCP(nn.Module):
             output_attentions: Must be False; KDA does not materialize attention weights.
             kwargs: Optional global sample offsets or prebuilt packed_sequence_info.
         """
-        if not self.module.training:
-            raise NotImplementedError("Kimi K3 CP currently supports training only.")
         if past_key_values is not None or use_cache:
             raise NotImplementedError("Kimi K3 CP does not support recurrent cache.")
         if output_attentions:
@@ -1382,7 +1401,7 @@ class KimiDeltaAttentionLayerCP(nn.Module):
                 self.cp_rank,
                 self.cp_size,
                 sequence_info=sequence_info,
-                backend="ascendc" if self.backend == "ascendc" else "eager",
+                backend=self.conv_backend,
             )
         else:
             query, key, value = (F.silu(tensor) for tensor in (query, key, value))
@@ -1482,7 +1501,8 @@ class KimiDeltaAttentionCoreCP(nn.Module):
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                 gate: torch.Tensor, beta: torch.Tensor, *, a_log: torch.Tensor,
                 dt_bias: torch.Tensor, scale: float | None = None,
-                sequence_info: Optional[PackedSequenceInfo] = None) -> torch.Tensor:
+                sequence_info: Optional[PackedSequenceInfo] = None,
+                use_qk_l2norm_in_kernel: bool = True) -> torch.Tensor:
         """Run state CP with optional token/head redistribution.
 
         Args:
@@ -1494,14 +1514,18 @@ class KimiDeltaAttentionCoreCP(nn.Module):
             a_log: Learned decay parameter with one entry per value head.
             dt_bias: Learned gate bias with HV times K entries.
             scale: Attention scaling factor; None selects the local default.
+            use_qk_l2norm_in_kernel: Normalize internally or accept caller-normalized Q/K.
 
         Returns:
             Output restored to this rank's original token/head layout.
         """
-        is_flat_input = query.ndim == 3
-        if is_flat_input:
+        if not isinstance(use_qk_l2norm_in_kernel, bool):
+            raise ValueError("use_qk_l2norm_in_kernel must be bool")
+        is_tnd = query.ndim == 3
+        if is_tnd:
             output = self.forward(*(tensor.unsqueeze(0) for tensor in (query, key, value, gate, beta)),
-                                  a_log=a_log, dt_bias=dt_bias, scale=scale, sequence_info=sequence_info)
+                                  a_log=a_log, dt_bias=dt_bias, scale=scale, sequence_info=sequence_info,
+                                  use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel)
             return output.squeeze(0)
         if sequence_info is not None:
             if query.shape[0] != 1:
@@ -1510,7 +1534,8 @@ class KimiDeltaAttentionCoreCP(nn.Module):
                                     cp_rank=self.cp_rank, cp_size=self.cp_size)
         if self.ulysses_mesh is None:
             return self.state(query, key, value, gate, beta, a_log=a_log, dt_bias=dt_bias, scale=scale,
-                              sequence_info=sequence_info)
+                              sequence_info=sequence_info,
+                              use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel)
         _validate_projected_inputs(self.ulysses_degree, query, key, value, gate, beta, a_log, dt_bias)
         heads, key_dim = value.shape[2], query.shape[-1]
         inputs = self._exchange_inputs((query, key, value, gate, beta))
@@ -1518,7 +1543,8 @@ class KimiDeltaAttentionCoreCP(nn.Module):
         local_bias = _slice_local_heads(dt_bias.reshape(heads, key_dim), self.ulysses_rank, self.ulysses_degree)
         exchanged_info = None if sequence_info is None else sequence_info.ulysses(
             self.ulysses_degree, self.ulysses_rank)
-        output = self.state(*inputs, a_log=local_a, dt_bias=local_bias, scale=scale, sequence_info=exchanged_info)
+        output = self.state(*inputs, a_log=local_a, dt_bias=local_bias, scale=scale, sequence_info=exchanged_info,
+                            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel)
         return _differentiable_all_to_all_shard(output, self.ulysses_mesh, split_dim=1, concat_dim=2)
 
     def _exchange_inputs(self, inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:

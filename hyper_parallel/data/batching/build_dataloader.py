@@ -36,6 +36,7 @@ from hyper_parallel.data.batching.dynamic_batch import (
 )
 from hyper_parallel.data.batching.build_collate_fn import TextPackingCollator
 from hyper_parallel.data.dataset_logging import get_dataset_logger
+from hyper_parallel.data.batching.worker_state import WorkerRNGDataset
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
 from hyper_parallel.data.parallel.batch_sampler import (
     get_sampler_checkpoint_state, has_torchdata_state, sampler_optimizer_step_progress, sampler_state_for_load,
@@ -417,11 +418,16 @@ class FixedBatchDataLoader(StatefulDataLoader):
             seed: int = 1234,
             pin_memory: bool = False,
             prefetch_factor: int | None = None,
+            checkpoint_worker_rng: bool = False,
     ) -> None:
         """Initialize the stateful DataLoader."""
         if sampler_type not in ("single", "cyclic"):
             raise ValueError("sampler_type must be 'single' or 'cyclic'")
 
+        if checkpoint_worker_rng and num_workers > 0:
+            if _is_iterable_dataset(dataset):
+                raise ValueError("checkpoint_worker_rng currently requires a map-style Dataset")
+            dataset = WorkerRNGDataset(dataset)
         self.drop_last = drop_last
         self.sampler_type = sampler_type
         generator = torch.Generator().manual_seed(seed)
@@ -540,6 +546,7 @@ class _DynamicBatchLoader(ABC):
         seed: Source DataLoader random seed.
         pin_memory: Whether source samples use pinned host memory.
         prefetch_factor: Number of source batches prefetched by each worker.
+        checkpoint_worker_rng: Save worker CPU RNG and full augmented buffer samples.
     """
 
     def __init__(
@@ -560,6 +567,7 @@ class _DynamicBatchLoader(ABC):
             seed: int = 1234,
             pin_memory: bool = False,
             prefetch_factor: int | None = None,
+            checkpoint_worker_rng: bool = False,
     ) -> None:
         """Initialize source reading, token selection, and Online packing."""
         # pylint: disable=too-many-locals
@@ -595,7 +603,11 @@ class _DynamicBatchLoader(ABC):
             if callable(enable_source_resume):
                 enable_source_resume()
 
-        # Resuming training from a checkpoint
+        if checkpoint_worker_rng:
+            if save_by_idx is True:
+                raise ValueError("Worker RNG continuation requires full buffered samples: save_by_idx=False")
+            save_by_idx = False
+        # Retain already augmented samples rather than rerunning their transforms.
         self._buffer_checkpoint = self._build_buffer_checkpoint(dataset, save_by_idx)
 
         self.source_dataloader = FixedBatchDataLoader(
@@ -610,6 +622,7 @@ class _DynamicBatchLoader(ABC):
             seed=seed,
             pin_memory=pin_memory,
             prefetch_factor=prefetch_factor,
+            checkpoint_worker_rng=checkpoint_worker_rng,
         )
         self.resume_pending = False
 

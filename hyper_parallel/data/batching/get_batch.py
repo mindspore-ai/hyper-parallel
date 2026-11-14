@@ -126,7 +126,7 @@ class OmniParallelBatch:
             device_batch = self.tp_broadcaster.broadcast(local_batch, broadcast_all_fields=True)
         else:
             device_batch, transport_inputs = self.batch_transport(local_batch, self.tp_broadcaster)
-        runtime_inputs = self._build_runtime_inputs(device_batch)
+        runtime_inputs = self._build_runtime_inputs({**device_batch, **transport_inputs})
         model_inputs, loss_inputs = self._split_model_and_loss_inputs(device_batch)
         if set(transport_inputs).intersection((*device_batch, *runtime_inputs)):
             raise ValueError("batch transport cannot replace Omni model or runtime inputs")
@@ -370,6 +370,8 @@ class TextParallelBatch:
             options={
                 "source_type": self.source_type,
                 "attention_mode": self.attention_runtime.mode,
+                "reset_attention_mask": self.attention_runtime.reset_mask,
+                "reset_position_ids": self.reset_position_ids,
                 "causal": self.causal,
                 "sliding_window": self.sliding_window,
             },

@@ -1,14 +1,15 @@
 # High-performance modules
 
-`hyper_parallel.components.modules` provides drop-in high-performance modules for Ascend NPU. Modules can be used directly in
-Python or declaratively replace existing model modules through Trainer YAML.
+`hyper_parallel.components.modules` provides reusable model building blocks and high-performance modules for Ascend NPU.
+Hardware-backed modules can be used directly in Python or replace existing model modules through Trainer YAML.
+Portable routing and residual components also support reference execution without an NPU backend.
 
 ## Available modules
 
 | Category | Modules |
 | --- | --- |
 | Attention | `GQAAttention`, `GatedGQAAttention`, `MLAAttention`, `DSAAttention`, `DeepseekV32DSAAttention` |
-| MoE and MLP | `GroupedExperts`, `SharedExpert`, `SwiGLUMLP` |
+| MoE and MLP | `GroupedExperts`, `SharedExpert`, `SwiGLUMLP`, `LatentMoE`, `QuantileBalancer` |
 | Normalization | `RMSNorm`, `OffsetRMSNorm` |
 | MHC | `MhcPreModule`, `MhcPostModule` |
 
@@ -22,6 +23,36 @@ from hyper_parallel.components.modules import RMSNorm
 norm = RMSNorm(hidden_size=4096, eps=1e-6).npu()
 output = norm(hidden_states)
 ```
+
+## Reusable routing and residual components
+
+`LatentMoE` routes full-width hidden states, evaluates experts in an optional latent space,
+combines their outputs in FP32, then applies the latent norm and output projection.
+Its optional shared expert consumes the original full-width input. The calling model supplies
+executable router/expert/projection modules and retains ownership of parameter names and initialization.
+The portable reference does not require an NPU backend.
+
+`QuantileBalancer` records local required-bias histograms from sigmoid scores and the router's
+existing TopK indices. `finalize_step(bias)` commits a local step. Distributed callers use
+`finalize_quantile_balancers` from `distributed.expert_parallel.balancing` with explicitly declared,
+non-overlapping token groups. Commit only after a successful optimizer update; discard observations
+on skipped updates. Evaluation and recomputation must not record observations. Visual routing masks
+are independent of language-loss masks. The existing router finalize/discard callback protocol owns
+this lifecycle; no model-specific Trainer is needed.
+
+`expert_compute.py` provides `grouped_expert_mlp`, `grouped_expert_slots` and
+`grouped_routed_experts`. Their activation callable consumes complete concatenated gate/up rows,
+so SiTU and SwiGLU can share the compute path without changing either activation's mathematics.
+Slots return unweighted outputs; routed tokens apply FP32 probabilities after expert computation.
+The grouped operations require their existing NPU primitives, imported only when used.
+`activation` and `fc1_activation` checkpoint scopes replay local expert computation only.
+`GroupedExperts` uses this common bias-free GLU computation and preserves its existing biased and
+pre-FC2-weighting paths. Its optional `activation` constructor argument binds a complete GLU.
+
+`attention_residuals.py` contains explicit block-history materialization and boundary operations.
+The model chooses block boundaries and passes each history Tensor through checkpoint/swap inputs.
+Each consumer materializes its own history to preserve the original gradient accumulation grouping.
+The stateless eager/fused attention-residual operation remains in `components.functional`.
 
 ## Module families
 

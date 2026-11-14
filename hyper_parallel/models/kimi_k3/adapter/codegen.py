@@ -12,24 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Code generation compatibility owned by the Kimi model families."""
+"""Compatibility alias for shared exported-source import preparation."""
 
-
-def prepare_model_import() -> None:
-    """Restore the data-only descriptor expected by Kimi remote source."""
-    from transformers.utils import generic  # pylint: disable=C0415
-
-    if hasattr(generic, "OutputRecorder"):
-        return
-
-    class OutputRecorder:  # pylint: disable=too-few-public-methods
-        """Describe the output class and tuple index recorded by remote source."""
-
-        def __init__(self, target_class: type, index: int = 0) -> None:
-            self.target_class = target_class
-            self.index = index
-
-    generic.OutputRecorder = OutputRecorder
-
+from hyper_parallel.codegen.source.compat import prepare_model_import
 
 __all__ = ["prepare_model_import"]

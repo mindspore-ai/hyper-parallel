@@ -42,6 +42,7 @@ from hyper_parallel.models._transformers.model_builder import (
 )
 from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import empty_cache
+from hyper_parallel.trainer.runtime.rng import capture_numpy_rng_state, restore_numpy_rng_state
 from hyper_parallel.trainer.runtime.device import (
     get_device_rng_state,
     set_device_rng_state,
@@ -158,6 +159,19 @@ class CheckpointerCallback(Callback):
         self._restore_train_state = ckpt_cfg.restore_train_state
         self._restore_dataloader_state = ckpt_cfg.restore_dataloader_state
 
+        self._validate_external_checkpoint(trainer)
+
+        self._last_saved_step: int = -1
+        self._last_hf_saved_step: int = -1
+        self.checkpointer = build_checkpointer(
+            extra_state_per_rank=self._save_extra_state_per_rank,
+        )
+        self._hf_checkpoint_manager = (
+            CheckpointManager(trainer.model) if self._save_hf_weights else None
+        )
+
+    def _validate_external_checkpoint(self, trainer: "BaseTrainer") -> None:
+        """Check host-owned state requirements without changing save cadence."""
         external = get_model_external_state(getattr(trainer, "model", None))
         if external is not None:
             if self._is_async or self._is_peft:
@@ -168,15 +182,6 @@ class CheckpointerCallback(Callback):
                 raise ValueError("Host restore requires optimizer and train state together")
             if trainer.mesh.pp_size > 1 and not self._save_extra_state_per_rank:
                 raise ValueError("Host PP checkpoint requires per-rank extra state")
-
-        self._last_saved_step: int = -1
-        self._last_hf_saved_step: int = -1
-        self.checkpointer = build_checkpointer(
-            extra_state_per_rank=self._save_extra_state_per_rank,
-        )
-        self._hf_checkpoint_manager = (
-            CheckpointManager(trainer.model) if self._save_hf_weights else None
-        )
 
     # ------------------------------------------------------------------
     # Hook dispatchers
@@ -318,6 +323,7 @@ class CheckpointerCallback(Callback):
 
         return {
             "global_step": state.global_step,
+            "optimizer_step": state.optimizer_step,
             "epoch": state.epoch,
             "lr_scheduler": lr_scheduler_sd,
             "train_dataloader": dataloader_state,
@@ -325,6 +331,7 @@ class CheckpointerCallback(Callback):
                 "torch_cpu": torch.get_rng_state(),
                 "torch_device": get_device_rng_state(),
                 "python": random.getstate(),
+                "numpy": capture_numpy_rng_state(),
             },
         }
 
@@ -397,14 +404,7 @@ class CheckpointerCallback(Callback):
             self._save_train_state,
         )
 
-        checkpoint_state: Dict[str, Any] = {"model": self._model_state_dict()}
-        optimizers = _as_list(self.trainer.optimizer) if self._save_optimizer else []
-        if self._save_optimizer:
-            checkpoint_state["optimizer"] = _unwrap_single(
-                [optimizer.state_dict() for optimizer in optimizers]
-            )
-        if self._save_train_state:
-            checkpoint_state["extra_state"] = self._collect_extra_state(state)
+        checkpoint_state, optimizers = self._collect_checkpoint_payload(state)
 
         external = get_model_external_state(self.trainer.model)
         if external is not None:
@@ -452,6 +452,19 @@ class CheckpointerCallback(Callback):
             self._rotate_checkpoints()
         elif not save_async:
             self._rotate_checkpoints()
+
+    def _collect_checkpoint_payload(self, state: TrainerState):
+        """Collect configured state and retain optimizers for post-save cleanup."""
+        checkpoint_state: Dict[str, Any] = {"model": self._model_state_dict()}
+        optimizers = _as_list(self.trainer.optimizer) if self._save_optimizer else []
+        if self._save_optimizer:
+            checkpoint_state["optimizer"] = _unwrap_single(
+                [optimizer.state_dict() for optimizer in optimizers]
+            )
+        if self._save_train_state:
+            checkpoint_state["extra_state"] = self._collect_extra_state(state)
+
+        return checkpoint_state, optimizers
 
     def _save_hf_checkpoint(self, save_dir: str, global_step: int) -> None:
         """Collect and export one Transformers-compatible model checkpoint."""
@@ -571,27 +584,31 @@ class CheckpointerCallback(Callback):
             delete_count = len(deletable)
 
         for step, checkpoint_path in deletable[:delete_count]:
-            # Revalidate immediately before deletion so a replaced path or
-            # symlink can never redirect rotation outside checkpoint_dir.
-            checkpoint_root = os.path.realpath(self._checkpoint_dir)
-            if (
-                    os.path.islink(checkpoint_path)
-                    or not os.path.isdir(checkpoint_path)
-                    or os.path.dirname(os.path.realpath(checkpoint_path)) != checkpoint_root
-                    or self._checkpoint_step(os.path.basename(checkpoint_path)) != step
-            ):
-                logger.warning("Skipping unsafe checkpoint deletion target: %s", checkpoint_path)
-                continue
-            try:
-                shutil.rmtree(checkpoint_path)
-            except OSError as exc:
-                logger.warning("Failed to delete old checkpoint %s: %s", checkpoint_path, exc)
-                continue
-            logger.info(
-                "Deleted old checkpoint due to save_total_limit=%s: %s",
-                limit,
-                checkpoint_path,
-            )
+            self._delete_rotated_checkpoint(step, checkpoint_path, limit)
+
+    def _delete_rotated_checkpoint(self, step: int, checkpoint_path: str, limit: int) -> None:
+        """Revalidate each completed checkpoint immediately before deleting it."""
+        # Revalidate immediately before deletion so a replaced path or
+        # symlink can never redirect rotation outside checkpoint_dir.
+        checkpoint_root = os.path.realpath(self._checkpoint_dir)
+        if (
+                os.path.islink(checkpoint_path)
+                or not os.path.isdir(checkpoint_path)
+                or os.path.dirname(os.path.realpath(checkpoint_path)) != checkpoint_root
+                or self._checkpoint_step(os.path.basename(checkpoint_path)) != step
+        ):
+            logger.warning("Skipping unsafe checkpoint deletion target: %s", checkpoint_path)
+            return
+        try:
+            shutil.rmtree(checkpoint_path)
+        except OSError as exc:
+            logger.warning("Failed to delete old checkpoint %s: %s", checkpoint_path, exc)
+            return
+        logger.info(
+            "Deleted old checkpoint due to save_total_limit=%s: %s",
+            limit,
+            checkpoint_path,
+        )
 
     def _save_hf_assets(self, hf_dir: str) -> None:
         """Write the tokenizer or processor assets next to exported weights."""
@@ -669,12 +686,17 @@ class CheckpointerCallback(Callback):
     def _load_optimizer_payload(self, checkpoint_state: Dict[str, Any], optimizers: List[Any],
                                 persisted_keys: Optional[frozenset[str]]) -> None:
         """Restore dense optimizer leaves or reload dense main parameters."""
-        optimizer_sds = _as_list(checkpoint_state.get("optimizer"))
-        for optimizer, optimizer_sd in zip(optimizers, optimizer_sds):
+        optimizer_payload = checkpoint_state.get("optimizer")
+        optimizer_sds = _as_list(optimizer_payload)
+        for index, (optimizer, optimizer_sd) in enumerate(zip(optimizers, optimizer_sds)):
             optimizer.load_state_dict(optimizer_sd)
             drop_primed = getattr(optimizer, "drop_unpersisted_dense_state", None)
             if drop_primed is not None and persisted_keys is not None:
-                drop_primed(persisted_keys)
+                keys = persisted_keys
+                if isinstance(optimizer_payload, list):
+                    prefix = f"{index}."
+                    keys = frozenset(key.removeprefix(prefix) for key in keys if key.startswith(prefix))
+                drop_primed(keys)
         if not optimizers:
             for optimizer in _as_list(self.trainer.optimizer):
                 if isinstance(optimizer, MixedPrecisionOptimizer):
@@ -700,7 +722,8 @@ class CheckpointerCallback(Callback):
             self.trainer.model,
             self.trainer.config.model_init_dtype,
         )
-        persisted_keys = load_plan.persisted_optimizer_keys if load_plan is not None else None
+        persisted_keys = (load_plan.persisted_optimizer_keys if load_plan is not None
+                          else getattr(self.checkpointer, "persisted_optimizer_keys", None))
         self._load_optimizer_payload(checkpoint_state, optimizers, persisted_keys)
 
         if self._restore_train_state:
@@ -801,6 +824,7 @@ class CheckpointerCallback(Callback):
         """Restore progress, scheduler, dataloader position and RNG state."""
         trainer = self.trainer
         trainer.state.global_step = extra["global_step"]
+        trainer.state.optimizer_step = extra.get("optimizer_step", extra["global_step"])
         persisted_epoch = extra.get("epoch", 0)
         trainer.state.epoch = persisted_epoch
 
@@ -849,3 +873,4 @@ class CheckpointerCallback(Callback):
         python_rng = rng_state.get("python")
         if python_rng is not None:
             random.setstate(python_rng)
+        restore_numpy_rng_state(rng_state.get("numpy"))

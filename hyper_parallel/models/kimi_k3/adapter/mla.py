@@ -47,7 +47,13 @@ class KimiMLAAttention(GatedMLAAttention):
             Local hidden states after gated attention and output projection.
         """
         del position_ids
+        kwargs.pop("position_embeddings", None)
         if past_key_values is not None:
             raise ValueError("Kimi MLA training replacement does not support a KV cache")
-        output, _ = super().forward(hidden_states, attention_mask=attention_mask, **kwargs)
-        return output
+        valid = (attention_mask if attention_mask is not None
+                 and attention_mask.shape == hidden_states.shape[:2] else None)
+        # K3 validates right padding; causal attention isolates valid keys.
+        output, _ = super().forward(
+            hidden_states, attention_mask=None if valid is not None else attention_mask, **kwargs,
+        )
+        return output if valid is None else output * valid.unsqueeze(-1).to(output.dtype)

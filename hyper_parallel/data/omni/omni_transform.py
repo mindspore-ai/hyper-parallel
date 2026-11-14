@@ -97,6 +97,10 @@ def build_auto_processor(
     if tokenizer is None:
         raise ValueError("AutoProcessor must provide a tokenizer")
 
+    # ProcessorMixin does not always retain its source, which the data contract needs.
+    if not (getattr(processor, "name_or_path", None) or getattr(processor, "_name_or_path", None)):
+        processor.name_or_path = str(pretrained_model_name_or_path)
+
     chat_template = getattr(processor, "chat_template", None)
     if chat_template is None:
         chat_template = getattr(tokenizer, "chat_template", None)

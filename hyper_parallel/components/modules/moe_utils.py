@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+# pylint: disable=forbidden-backend-import
 """MoE utilities for distributed training."""
 
 from typing import TYPE_CHECKING, Optional, Any
@@ -102,7 +103,7 @@ class MoEMonitorCallback:
     Provides a three-layer invocation architecture:
 
     - **Layer 0**: :func:`sync_and_update_expert_bias` — per-module sync + update
-    - **Layer 1**: :meth:`on_step_end` — iterates all MoE layers, calling Layer 0
+    - **Layer 1**: :meth:`on_step_end` — selects a model-owned finalizer or Layer 0
     - **Layer 2**: :meth:`register` — registers optimizer post-hook for auto-trigger
 
     Each layer can be used independently; Layer 0 is sufficient for basic usage,
@@ -138,8 +139,9 @@ class MoEMonitorCallback:
 
     Note:
         Sync dimensions use ``dp_group``/``tp_group``/``cp_group`` (not ``ep_group``).
-        EP does not need synchronization because all EP ranks have identical
-        routing data (``tokens_per_expert`` shape = ``[total_experts]``).
+        The legacy count protocol assumes identical routing data across EP
+        ranks. Model-owned finalizers can override ``expert_bias_update_groups``
+        to match the ownership of their statistics.
     """
 
     def __init__(
@@ -181,15 +183,40 @@ class MoEMonitorCallback:
     def on_step_end(self) -> None:
         """Update expert bias for all MoE layers in the model.
 
-        Iterates over all :class:`MoE` sub-modules with
-        ``enable_expert_bias=True`` and calls
-        :func:`sync_and_update_expert_bias` for each one.
+        Training modules exposing ``finalize_router_step(process_groups=...)``
+        own their statistics reduction and state update. Their optional
+        ``expert_bias_update_groups`` overrides the callback groups, including an
+        empty tuple for local updates. GroupInfo wrappers are unwrapped before
+        calling the provider. Providers must exclude replicated token domains and
+        handle their own recomputation policy; generic count reduction is skipped.
 
-        Auxiliary loss is read separately through ``last_mean_aux_loss`` so
-        bias updates do not synchronize device scalars for logging each step.
+        Providers may additionally expose a shared ``finalize_router_steps``
+        callable. Routers with the same callable and token groups are submitted
+        together; providers own compatible-shape bucketing and device-side updates.
+
+        Other sub-modules retain the ``enable_expert_bias=True`` protocol and
+        :func:`sync_and_update_expert_bias`. Auxiliary loss is read separately
+        through ``last_mean_aux_loss`` to avoid per-step logging synchronization.
         """
+        batches = {}
         for moe in self.model.modules():
-            if isinstance(moe, ActivationWrapper) or not getattr(moe, "enable_expert_bias", False):
+            if isinstance(moe, ActivationWrapper):
+                continue
+            finalize_router_step = getattr(moe, "finalize_router_step", None)
+            if callable(finalize_router_step):
+                if moe.training:
+                    groups = getattr(moe, "expert_bias_update_groups", None)
+                    if groups is None:
+                        groups = (self.tp_group, self.cp_group, self.dp_group)
+                    process_groups = tuple(getattr(group, "group", group) for group in groups if group is not None)
+                    batch_finalize = getattr(moe, "finalize_router_steps", None)
+                    if callable(batch_finalize):
+                        key = (batch_finalize, process_groups)
+                        batches.setdefault(key, []).append(moe)
+                    else:
+                        finalize_router_step(process_groups=process_groups)
+                continue
+            if not getattr(moe, "enable_expert_bias", False):
                 continue
             sync_and_update_expert_bias(
                 moe,
@@ -200,10 +227,39 @@ class MoEMonitorCallback:
                 num_recomputations=self.num_recomputations,
             )
 
+        for (finalize, groups), routers in batches.items():
+            finalize(tuple(routers), process_groups=groups)
+
+    def on_step_skipped(self) -> None:
+        """Discard local router observations without updating correction biases.
+
+        Model-owned finalizers provide discard_router_step for their statistics.
+        Legacy expert counters are cleared locally; no token reduction is needed
+        once all training ranks have agreed to skip the update.
+
+        Raises:
+            ValueError: A model-owned finalizer has no matching discard hook.
+        """
+        for moe in self.model.modules():
+            if isinstance(moe, ActivationWrapper):
+                continue
+            if callable(getattr(moe, "finalize_router_step", None)) and not callable(
+                getattr(moe, "discard_router_step", None)
+            ):
+                raise ValueError("Model-owned router finalizers must provide discard_router_step to skip updates")
+        for moe in self.model.modules():
+            if isinstance(moe, ActivationWrapper):
+                continue
+            discard = getattr(moe, "discard_router_step", None)
+            if callable(discard):
+                discard()
+            elif getattr(moe, "enable_expert_bias", False):
+                moe.tokens_per_expert.zero_()
+
     def register(self, optimizer: Any) -> None:
         """Register an optimizer post-hook to auto-trigger :meth:`on_step_end`.
 
-        On PyTorch 2.0+, uses ``optimizer.register_step_post_hook``.
+        Uses the optimizer's ``register_step_post_hook`` interface.
         The hook fires after each ``optimizer.step()`` call, so that
         expert bias is updated once parameters have been updated. Repeated
         calls replace the existing hook registration.

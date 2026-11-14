@@ -67,6 +67,7 @@ from hyper_parallel.trainer.runtime.distributed import (
     get_local_rank_safe,
     get_world_size_safe,
 )
+from hyper_parallel.trainer.runtime.evaluation import evaluate
 from hyper_parallel.trainer.runtime.distributed import (
     create_distributed_setup_from_config,
     destroy_process_group,
@@ -648,6 +649,9 @@ class BaseTrainer(Stateful, ABC):
             tp_group=self.device_mesh["tp"].get_group() if self.mesh.sequence_parallel else None,
         )
         self.state = TrainerState()
+        self.last_optimizer_step_applied = True
+        self._optimizer_update_info = {}
+        self._optimizer_grad_norm = None
         # Raw AUX is not normalized with the backward loss; average its observations.
         self.environ_meter_callback = EnvironMeterCallback(self, microbatch_mean_metrics=("router_aux_loss",))
         self.tqdm_callback = TqdmCallback(self)
@@ -680,6 +684,10 @@ class BaseTrainer(Stateful, ABC):
                 "restore_from=None); "
                 "no checkpoint callback registered."
             )
+
+    def evaluate(self) -> Dict[str, float]:
+        """Return token-weighted validation metrics without changing training progress."""
+        return evaluate(self)
 
     def on_train_begin(self) -> None:
         """Run all registered callbacks at the start of training."""
@@ -739,8 +747,9 @@ class BaseTrainer(Stateful, ABC):
             loss_dict: Named loss values for the optimizer step.
             grad_norm: Gradient norm measured before the optimizer update.
         """
+        update_info = getattr(self, "_optimizer_update_info", {})
         for callback in self._callbacks:
-            callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+            callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm, **update_info)
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass.
@@ -1028,6 +1037,7 @@ class BaseTrainer(Stateful, ABC):
         if external is not None:
             preparation = external.prepare_optimizer_step(max_norm=max_grad_norm, gradient_divisor=gradient_divisor)
             self.model_integration.after_clip(preparation.post_clip_norm)
+            self._optimizer_grad_norm = preparation.global_norm
             return preparation.global_norm
         grad_norm: Any = 0.0
         post_clip_norm = None
@@ -1046,15 +1056,48 @@ class BaseTrainer(Stateful, ABC):
                     1.0,
                 )
                 post_clip_norm = grad_norm_value * clip_coefficient
-        elif self.model_integration.runtime_enabled:
+        elif self.model_integration.runtime_enabled or self.config.training.skip_nonfinite_gradients:
             grad_norm = clip_grad_norm_(self.model, float("inf"), **clip_kwargs)
             post_clip_norm = grad_norm
         self.model_integration.after_clip(post_clip_norm)
+        self._optimizer_grad_norm = grad_norm
         return grad_norm
 
-    def step_optimizers_and_schedulers(self) -> None:
-        """Step every optimizer and scheduler, then expose the final state."""
+    def step_optimizers_and_schedulers(self) -> bool:
+        """Apply or discard one complete optimizer transaction across all ranks.
+
+        The optional nonfinite-gradient policy decides before any optimizer can
+        mutate parameters. Arbitrary optimizer return values are not skip signals.
+        Global steps count consumed batches; optimizer_step counts applied updates.
+
+        Call prepare_optimizer_step first to record the pre-clipping norm when
+        training.skip_nonfinite_gradients is enabled.
+
+        Returns:
+            Whether all optimizers, router updates and schedulers were advanced.
+        """
         optimizers = self.optimizer if isinstance(self.optimizer, list) else [self.optimizer]
+        self.last_optimizer_step_applied = True
+        self._optimizer_update_info = {}
+        training_config = getattr(getattr(self, "config", None), "training", None)
+        if getattr(training_config, "skip_nonfinite_gradients", False):
+            grad_norm = getattr(self, "_optimizer_grad_norm", None)
+            if grad_norm is None:
+                raise ValueError("skip_nonfinite_gradients requires the pre-clipping global gradient norm")
+            finite = torch.isfinite(torch.as_tensor(grad_norm, device=self.device)).to(torch.int32)
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+            self.last_optimizer_step_applied = bool(finite.item())
+            self._optimizer_update_info = {"optimizer_step_applied": self.last_optimizer_step_applied}
+        self._optimizer_grad_norm = None
+        if not self.last_optimizer_step_applied:
+            for optimizer in optimizers:
+                optimizer.zero_grad()
+            moe_monitor = getattr(self, "moe_monitor", None)
+            if moe_monitor is not None:
+                moe_monitor.on_step_skipped()
+            logger.warning("Discarded nonfinite gradients; optimizer, router bias and scheduler were not advanced")
+            return False
         for optimizer in optimizers:
             # Keep zeros_like dispatched so lazily created optimizer states retain DTensor metadata.
             with SkipDTensorDispatch(no_skip={torch.zeros_like}):
@@ -1072,12 +1115,18 @@ class BaseTrainer(Stateful, ABC):
         )
         for scheduler in schedulers:
             scheduler.step()
+        state = getattr(self, "state", None)
+        if state is not None:
+            state.optimizer_step += 1
+        return True
 
     def _end_model_integration_step(self, metrics: Dict[str, Any]) -> None:
         """Persist structured step metrics and global input identity."""
         if not self.model_integration.runtime_enabled:
             return
         resolved_metrics = dict(metrics)
+        resolved_metrics["optimizer_step"] = self.state.optimizer_step
+        resolved_metrics["optimizer_step_applied"] = self.last_optimizer_step_applied
         optimizers = self.optimizer if isinstance(self.optimizer, list) else [self.optimizer]
         learning_rates = []
         for optimizer in optimizers:

@@ -34,6 +34,7 @@ class TrainingConfig:
 
     backend: Literal["nccl", "hccl", "gloo"] = "nccl"
     max_grad_norm: float = 1.0
+    skip_nonfinite_gradients: bool = False
     init_device: Literal["meta", "cpu", "cuda", "npu"] = "meta"
     loss_aggregation: Literal["token_weighted", "rank_average"] = "token_weighted"
     seed: Optional[int] = None

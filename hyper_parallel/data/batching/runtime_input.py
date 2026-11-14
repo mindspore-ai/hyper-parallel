@@ -23,6 +23,8 @@ from typing import Any
 
 import torch
 
+from hyper_parallel.components.functional.linear_attention_packed import resolve_packed_sequence
+
 
 class OnlineBoundaryResolver:
     """Read global cumulative sequence boundaries emitted by Online packing."""
@@ -277,7 +279,39 @@ class AttentionRuntime(RuntimeInputAdapter):
         return attention_mask, sliding_window_mask
 
 
+class PackedSequenceRuntimeInputAdapter(RuntimeInputAdapter):
+    """Describe one contiguous CP interval without allocating a dense attention mask.
+
+    Position IDs, shifted labels and loss masks remain owned by TextParallelBatch.
+    cu_seq_lens is the global leading-zero sample list emitted by the collator.
+    """
+
+    def runtime_input_fields(self) -> tuple[str, ...]:
+        """Declare the metadata shared by the model's linear and full attention."""
+        return ("packed_sequence_info", "cu_seq_lens_q", "cu_seq_lens_k")
+
+    def build_runtime_inputs(self, *, batch: Mapping[str, Any], context: RuntimeInputContext) -> Mapping[str, Any]:
+        """Snapshot global boundaries once, then reuse their immutable local plan."""
+        shape = context.local_input_shape
+        if len(shape) != 2 or shape[0] != 1:
+            raise ValueError("Packed sequence metadata requires flattened input_ids [1,T].")
+        if context.parallel_sizes.get("tp", 1) != 1:
+            raise NotImplementedError("Packed sequence runtime currently requires TP1.")
+        if batch.get("cu_seq_lens") is None:
+            raise ValueError("Packed sequence metadata requires global cu_seq_lens.")
+        info = resolve_packed_sequence(
+            batch, shape[1], cp_rank=context.parallel_ranks.get("cp", 0), cp_size=context.parallel_sizes.get("cp", 1)
+        )
+        # Tuples avoid device-to-host conversion in downstream full-attention adapters.
+        return {
+            "packed_sequence_info": info,
+            "cu_seq_lens_q": info.global_offsets,
+            "cu_seq_lens_k": info.global_offsets,
+        }
+
+
 __all__ = [
+    "PackedSequenceRuntimeInputAdapter",
     "AttentionRuntime",
     "IndexedBoundaryResolver",
     "OnlineBoundaryResolver",

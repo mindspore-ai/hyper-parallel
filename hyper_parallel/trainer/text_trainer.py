@@ -337,6 +337,35 @@ class TextTrainer:
                 return True
         return False
 
+    def _run_training_epochs(self) -> tuple[Any, bool]:
+        """Run epochs while retaining a restored cursor on the first iteration."""
+        train_dataloader = self.base.train_dataloader
+        balanced_loader = isinstance(train_dataloader, DistributedDataLoader)
+        start_epoch = self.base.state.epoch
+        epochs = count(start_epoch) if balanced_loader else range(start_epoch, self.base.train_epochs)
+        for epoch in epochs:
+            if self.base.state.global_step >= self.base.train_iters:
+                break
+            # The first collective iterator may hold a restored checkpoint cursor.
+            if hasattr(train_dataloader, "set_epoch") and (not balanced_loader or epoch != start_epoch):
+                train_dataloader.set_epoch(epoch)
+
+            self.base.state.epoch = epoch
+            self.on_epoch_begin()
+            epoch_start_step = self.base.state.global_step
+            epoch_exhausted = self._train_epoch(epoch, balanced_loader)
+
+            if balanced_loader and epoch != start_epoch and self.base.state.global_step == epoch_start_step:
+                raise ValueError("Indexed source epoch cannot provide one complete optimizer step")
+
+            self.on_epoch_end()
+            self.base.state.epoch = epoch + 1 if not balanced_loader or epoch_exhausted else epoch
+            print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+            if self.base.state.global_step >= self.base.train_iters:
+                break
+
+        return train_dataloader, balanced_loader
+
     def train(self) -> None:
         """Run the configured global optimizer steps by Dataset epoch."""
         try:
@@ -350,30 +379,7 @@ class TextTrainer:
                 self.base.train_epochs,
             )
 
-            train_dataloader = self.base.train_dataloader
-            balanced_loader = isinstance(train_dataloader, DistributedDataLoader)
-            start_epoch = self.base.state.epoch
-            epochs = count(start_epoch) if balanced_loader else range(start_epoch, self.base.train_epochs)
-            for epoch in epochs:
-                if self.base.state.global_step >= self.base.train_iters:
-                    break
-                # The first collective iterator may hold a restored checkpoint cursor.
-                if hasattr(train_dataloader, "set_epoch") and (not balanced_loader or epoch != start_epoch):
-                    train_dataloader.set_epoch(epoch)
-
-                self.base.state.epoch = epoch
-                self.on_epoch_begin()
-                epoch_start_step = self.base.state.global_step
-                epoch_exhausted = self._train_epoch(epoch, balanced_loader)
-
-                if balanced_loader and epoch != start_epoch and self.base.state.global_step == epoch_start_step:
-                    raise ValueError("Indexed source epoch cannot provide one complete optimizer step")
-
-                self.on_epoch_end()
-                self.base.state.epoch = epoch + 1 if not balanced_loader or epoch_exhausted else epoch
-                print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
-                if self.base.state.global_step >= self.base.train_iters:
-                    break
+            train_dataloader, balanced_loader = self._run_training_epochs()
 
             memory_profiler.stop()
             self.on_train_end()

@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from functools import partial
 from typing import Any
 
@@ -29,6 +29,7 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
     WeightRenaming,
 )
 
+from hyper_parallel.components.modules.expert_compute import grouped_expert_mlp
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.components.modules.family import ModuleFamily, SelectorSpec, VariantRule, register_module_family
 from hyper_parallel.components.functional import (
@@ -228,7 +229,7 @@ class GroupedExperts(nn.Module):
                 target_biases.append(
                     nn.Parameter(torch.empty_like(source_bias), requires_grad=source_bias.requires_grad)
                 )
-        # astroid cannot infer the length of a list built by appends in a
+        # Static inference cannot determine the length of a list built by appends in a
         # loop; the zip above always yields exactly two entries.
         self.bias1, self.bias2 = target_biases  # pylint: disable=W0632
 
@@ -238,8 +239,17 @@ class GroupedExperts(nn.Module):
         module: nn.Module,
         module_fqn: str = "",
         context: Mapping[str, Any] | None = None,
+        activation: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> None:
-        """Build the high-performance module from a Transformers experts module."""
+        """Build the replacement, optionally binding a full GLU activation.
+
+        Args:
+            module: Source expert module with complete projection parameters.
+            module_fqn: Replacement source path.
+            context: Framework replacement context.
+            activation: Full projection activation, including both branches when gated.
+                None preserves the source-compatible default activation.
+        """
         super().__init__()
         del module_fqn, context
         config = getattr(module, "config", None)
@@ -269,7 +279,8 @@ class GroupedExperts(nn.Module):
         self.router_gating_in_fp32 = bool(
             getattr(module, "router_gating_in_fp32", True)
         )
-        self.activation_func = self._activation(module, config, gated_linear_unit)
+        self.activation_func = (self._activation(module, config, gated_linear_unit)
+                                if activation is None else activation)
 
         # GroupGemm state (NPU-only)
         self._group_list = None
@@ -387,6 +398,12 @@ class GroupedExperts(nn.Module):
                 )
         return transforms
 
+    @staticmethod
+    def _can_run_grouped_matmul(inputs: torch.Tensor) -> bool:
+        """Keep symbolic shapes in the graph while handling eager empty tokens."""
+        numel = inputs.nelement()
+        return torch.compiler.is_compiling() or not isinstance(numel, int) or numel != 0
+
     def _grouped_gemm_expert_forward(
         self, gate_up_proj, down_proj, permuted, tokens_per_expert, permuted_probs
     ):
@@ -397,9 +414,16 @@ class GroupedExperts(nn.Module):
         if self.use_2d_experts:
             gate_up_proj = gate_up_proj.view(self.num_local_experts, self.hidden_size, -1)
 
+        # Share the bias-free GLU path without changing the legacy bias/weighting contract.
+        if (self.has_gate and not self.add_bias and self.router_gating_in_fp32
+                and self._can_run_grouped_matmul(permuted)):
+            down = (down_proj.view(self.num_local_experts, -1, self.hidden_size)
+                    if self.use_2d_experts else down_proj)
+            return grouped_expert_mlp(permuted, (gate_up_proj.transpose(1, 2), down.transpose(1, 2)),
+                                      self._group_list, activation=self.activation_func, matmul=grouped_matmul)
+
         # up
-        numel = permuted.nelement()
-        if torch.compiler.is_compiling() or not isinstance(numel, int) or numel != 0:
+        if self._can_run_grouped_matmul(permuted):
             fc1_output = grouped_matmul(  # pylint: disable=not-callable
                 permuted, gate_up_proj, bias=None, group_list=self._group_list, group_type=0, group_list_type=0,
             )
@@ -422,8 +446,7 @@ class GroupedExperts(nn.Module):
         if self.use_2d_experts:
             down_proj = down_proj.view(self.num_local_experts, -1, self.hidden_size)
 
-        numel = fc1_output.nelement()
-        if torch.compiler.is_compiling() or not isinstance(numel, int) or numel != 0:
+        if self._can_run_grouped_matmul(fc1_output):
             fc2_output = grouped_matmul(  # pylint: disable=not-callable
                 fc1_output, down_proj, bias=None, group_list=self._group_list, group_type=0, group_list_type=0,
             )
