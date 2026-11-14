@@ -148,6 +148,7 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **add-unit-test** | How-to for `tests/ut` (procedures) | when adding UT / coverage |
 | **hf-model-integration** | Integrate HF-native or HF-component custom models through model-owned adapters | model onboarding / functional bring-up |
 | **hf-model-precision-validation** | Validate module parity and distributed numerical self-consistency | model numerical acceptance / diagnosis |
+| **memory-analysis** | NPU memory snapshot breakdown: static/dynamic, peak tensor composition, recompute saving, to HTML | 显存分析 / 显存拆解 / OOM 定位 |
 
 ### Commands
 
