@@ -80,7 +80,7 @@ def search_config(run: Path, doc: Dict[str, Any], degrees: Dict[str, int], clust
                   trust: Dict[str, Any]) -> Dict[str, Any]:
     """The search config: the layout fixed, recompute chosen per layer, the budget the cluster's reserve leaves."""
     dies = int(doc["context"]["device_num"])
-    per_node = int(cluster.get("dies_per_node", 16))
+    per_node = int(cluster.get("dies_per_node", 8))
     modes = [mode for mode in ("off", "full") if mode not in (trust.get("exclude_modes") or {})]
     return {
         "train_yaml": (run / "run.yaml").as_posix(),

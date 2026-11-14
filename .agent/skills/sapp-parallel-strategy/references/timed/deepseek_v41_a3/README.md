@@ -1,7 +1,7 @@
 # DeepSeek-V4.1 on the A3, the round of 8 October 2026
 
 Seven layouts of the validation crop, three runs each with the profiler off, timed by
-`hyper_parallel/models/deepseek_v41/tools/repeat_deepseek_v41_runs.sh` on one node of 16 dies: 4096 tokens a
+`hyper_parallel/models/deepseek_v41/tools/repeat_deepseek_v41_runs.sh` on 16 dies across two A3 nodes: 4096 tokens a
 sequence, global batch 16, micro-batch 1, recompute off, Muon, six steps a run with steps 3 to 6 kept.
 
 - `runs.csv`: one row a run, its mean step (ms) over the kept steps and its peaks. The trainer reports the

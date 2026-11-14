@@ -11,7 +11,7 @@ Reference table for auto-filling hardware parameters in Phase 1.
 | Device | dies/chip | chips/node | dies/node | Mem/die | bw_intra/die | bw_inter/die | BF16 TFLOPS/die |
 |--------|-----------|------------|-----------|---------|--------------|--------------|-----------------|
 | Ascend A2 | 1 | 8 | 8 | 64GB | 400 GB/s | 50 GB/s | 256 |
-| Ascend A3 | 2 | 8 | 16 | 64GB | 400 GB/s | 50 GB/s | 200 |
+| Ascend A3 | 2 | 4 | 8 | 64GB | 196 GB/s | 196 GB/s | 400 |
 | Ascend 950DT | 2 | 8 | 16 | 72GB | 1000 GB/s | 100 GB/s | 250 |
 | A100 40GB | 1 | 8 | 8 | 40GB | 600 GB/s | 50 GB/s | 312 |
 | A100 80GB | 1 | 8 | 8 | 80GB | 600 GB/s | 50 GB/s | 312 |
@@ -29,13 +29,12 @@ Reference table for auto-filling hardware parameters in Phase 1.
 - Prefer tp=8 for models > 13B
 - Memory-constrained (64GB): aggressive FSDP or PP needed for large models
 
-### Ascend A3 (2 dies/chip, 64GB/die, 16 dies/node)
+### Ascend A3 (2 dies/chip, 4 chips/node, 8 dies/node)
 
-- Each chip has 2 dies, each die is an independent compute unit (~200 TFLOPS BF16)
-- Per-die bandwidth: ~400 GB/s intra-node, ~50 GB/s inter-node (chip bandwidth shared by 2 dies)
-- Intra-chip die-to-die bandwidth is higher than inter-chip HCCS
-- tp_size: up to 16 (all dies in node), commonly 8 or 16
-- Same per-die memory as A2 (64GB), but 2× dies per node enables finer-grained sharding
+- Each chip has 2 dies, each die is an independent compute unit (~400 TFLOPS BF16)
+- Per-die bandwidth: 196 GB/s intra-node and 196 GB/s inter-node (chip bandwidth shared by 2 dies)
+- tp_size: up to 8 (all dies in the node), commonly 2, 4, or 8
+- Same per-die memory as A2 (64GB) and the same 8 dies per node; do not model A3 as a 16-rank node
 
 ### Ascend 950DT (2 dies/chip, 72GB/die, 16 dies/node) — Atlas 950 Supernode
 

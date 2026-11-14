@@ -224,8 +224,8 @@ Device_A2 = Type(
 )
 Device_A3 = Type(
     name="A3",
-    bounds=[16, 24, None],
-    bandwidths=[200, 25, 10],
+    bounds=[8, None],
+    bandwidths=[196, 196],
     host_link=HostLink(gib_per_s=6.92, sustained_tflops=160.0, copy_cost_ms_per_gib=2.8),
 )
 device_map = {

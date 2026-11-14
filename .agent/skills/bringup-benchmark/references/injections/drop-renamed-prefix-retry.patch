@@ -1,0 +1,18 @@
+Self-check injection 3 (category: wholesale prefix renames, e.g. renamed
+multimodal releases). Disables the rename-agnostic retry in the
+released-layout pin. The renamed category is deliberately held out in the
+sealed TEST set, so the expected outcome on the validation set is
+"not detected" — recorded as a known blind spot that only the periodic
+test-set audit covers.
+Applied only inside throwaway benchmark snapshots; never commit applied.
+--- a/.agent/skills/hf-model-integration/scripts/check_released_layout.py
++++ b/.agent/skills/hf-model-integration/scripts/check_released_layout.py
+@@ -426,7 +426,7 @@
+     released_rest, built_rest, notes, problems = reconcile_fused_experts(
+         released, built)
+     strict = compare(released_rest, built_rest)
+-    if strict:
++    if strict and False:  # injected damage: rename retry disabled
+         # A wholesale prefix rename reports every entry as both missing and
+         # invented; retry on the rename-agnostic pairing before failing.
+         renamed_rel, renamed_built, rename_notes, rename_problems = (

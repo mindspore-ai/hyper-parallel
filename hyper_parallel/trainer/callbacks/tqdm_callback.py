@@ -109,6 +109,9 @@ class TqdmCallback(Callback):
         ("performance/tokens_per_second", "tokens/s"),
         ("performance/step_time", "step_time"),
         ("performance/tflops_per_device", "TFLOP/s"),
+        ("performance/model_tflops_per_device", "tflops/device"),
+        ("performance/mfu_percent", "mfu"),
+        ("performance/hfu_percent", "hfu"),
     )
 
     def __init__(self, trainer: Any) -> None:
@@ -146,6 +149,10 @@ class TqdmCallback(Callback):
             return f"{scalar:.3f}s"
         if name == "performance/tflops_per_device":
             return f"{scalar:.3f}"
+        if name == "performance/model_tflops_per_device":
+            return f"{scalar:.2f}"
+        if name in ("performance/mfu_percent", "performance/hfu_percent"):
+            return f"{scalar:.2f}%"
         return f"{scalar:.6g}"
 
     def _create_progress_bar(self, total: int, initial: int) -> Any:

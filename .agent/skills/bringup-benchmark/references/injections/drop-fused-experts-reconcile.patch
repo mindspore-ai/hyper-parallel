@@ -1,0 +1,18 @@
+Self-check injection 2 (category: MoE expert-layout reconciliation).
+Bypasses the fused-experts reconciliation in the released-layout pin.
+The reconciliation bridges BOTH directions — releases that store experts
+fused, and builds that group experts while the release stores them per
+expert — so any MoE row whose release and build disagree on expert
+packing must flip to fail when this damage is applied.
+Applied only inside throwaway benchmark snapshots; never commit applied.
+--- a/.agent/skills/hf-model-integration/scripts/check_released_layout.py
++++ b/.agent/skills/hf-model-integration/scripts/check_released_layout.py
+@@ -423,7 +423,6 @@
+               f"_keys_to_ignore_on_load_unexpected {list(ignore_patterns)} — "
+               f"upstream does not build these; reported, not failed",
+               flush=True)
+-    released_rest, built_rest, notes, problems = reconcile_fused_experts(
+-        released, built)
++    released_rest, built_rest, notes, problems = released, built, [], []
+     strict = compare(released_rest, built_rest)
+     if strict:

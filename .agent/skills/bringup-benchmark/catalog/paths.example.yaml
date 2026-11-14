@@ -1,0 +1,9 @@
+# Local mapping from catalog model ids to HF model directories.
+#
+# Copy this file somewhere OUTSIDE the repository, fill in your site's
+# paths, and pass it with `--paths` (or export BRINGUP_BENCH_PATHS).
+# Site paths never enter the repository; there is no default location.
+smollm2-360m: <local-hf-model-dir>/SmolLM2-360M
+glm4-9b: <local-hf-model-dir>/GLM-4-9B-0414
+dsv2-lite: <local-config-dir>/deepseek-v2-lite
+qwen3-32b: <local-config-dir>/qwen3-32b

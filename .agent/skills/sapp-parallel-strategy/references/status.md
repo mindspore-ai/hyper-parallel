@@ -40,6 +40,6 @@ it to plan a round and refuses to write a command when the launcher would run an
 priced. `timed/` keeps the rounds already timed: a new round leaves their layouts out, apart from ND's best of
 them and the fastest, which it times again first, and `scripts/readback.py` reads them with every new round.
 
-- **DeepSeek-V4.1 on the A3:** `hyper_parallel/models/deepseek_v41/tools/repeat_deepseek_v41_runs.sh` on one node of
-  16 dies, expert degree and FSDP shard width varied, TP, CP and PP at 1; one round kept, seven layouts of the
+- **DeepSeek-V4.1 on the A3:** `hyper_parallel/models/deepseek_v41/tools/repeat_deepseek_v41_runs.sh` on 16 dies across
+  two A3 nodes, expert degree and FSDP shard width varied, TP, CP and PP at 1; one round kept, seven layouts of the
   25 the script can launch, three runs each.

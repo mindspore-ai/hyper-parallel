@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Device-memory breakdown report</title>
+<style>
+  body { font-family: Consolas, "Courier New", monospace; margin: 24px; color: #171c23; }
+  h1 { font-size: 20px; }
+  h2 { font-size: 16px; margin-top: 24px; }
+  table { border-collapse: collapse; margin: 8px 0; }
+  th, td { border: 1px solid #b9c0c8; padding: 4px 12px; text-align: left; }
+  th { background: #edf3fa; }
+  .note { color: #555e68; font-size: 13px; }
+  .todo { color: #a5322e; }
+</style>
+</head>
+<body>
+<h1>Device-memory breakdown report</h1>
+<p class="note">Snapshot: <code><!--SOURCE--></code> (<!--SEGMENTS-->)</p>
+<p class="note">Parser rules: memory breakdown-dimensions v2, based on fields captured
+with torch_npu 2.9.0. Units are MiB.</p>
+
+<h2>1. Totals and fragmentation</h2>
+<table>
+  <tr><th>Metric</th><th>MiB</th><th>Notes</th></tr>
+  <!--TOTAL_ROWS-->
+</table>
+<p class="note"><b>A snapshot represents one instant, not necessarily the peak.</b>
+Observed post-step snapshots contain no activations; even mid-backward snapshots had
+less active memory than <code>max_memory_allocated</code>. Peak composition requires
+a capture at the peak or replay of <code>device_traces</code>.</p>
+
+<h2>2. Allocation categories</h2>
+<table>
+  <tr><th>Category</th><th>MiB</th><th>Share of active memory</th></tr>
+  <!--CATEGORY_ROWS-->
+</table>
+<p class="note">Categories are inferred from recorded stacks: <code>torch/optim</code>
+frames indicate optimizer states; module <code>.to()</code> conversions indicate parameters;
+native <code>AccumulateGrad</code> frames indicate gradients. The C++ autograd engine
+allocates these gradients with <b>no Python frame</b>, so the native symbol is the available
+signal. An innermost user-code frame in <code>forward</code> indicates activations.</p>
+
+<h2>3. Largest active blocks</h2>
+<table>
+  <tr><th>MiB</th><th>Category</th><th>Call site</th></tr>
+  <!--BLOCK_ROWS-->
+</table>
+<p class="note">Attribution uses the <b>innermost Python frame outside site-packages</b>.
+Recorded stacks are innermost-first, but their first frames belong to the capture machinery
+(<code>unwind</code>, <code>CapturedTraceback</code>, or <code>??</code>). Using
+<code>frames[0]</code> would assign every block to that same internal location.</p>
+
+<h2>4. Growth across snapshots (leaks versus transient allocations)</h2>
+<table>
+  <tr><th>Metric</th><th>Δ MiB</th><th>Notes</th></tr>
+  <!--COMPARE_ROWS-->
+</table>
+<p class="note">A single snapshot cannot distinguish a leak from a large transient
+allocation. Inspect continued category growth across consecutive steps. The default
+captures cover steps 1–3 for pairwise comparison.</p>
+
+<h2>5. Consistency checks</h2>
+<table>
+  <tr><th>Check</th><th>Result</th><th>Details</th></tr>
+  <!--CHECK_ROWS-->
+</table>
+<p class="note">A failed check limits confidence in the affected measurements.
+Exit codes: 0 = all checks passed; 2 = one or more checks failed.</p>
+
+<h2>6. Findings and next step</h2>
+<p><!--VERDICT--></p>
+<p class="note">The breakdown identifies memory consumers. Use the perf-playbook skill
+to select recomputation, offload, allocator configuration, or other memory optimizations.
+Measure their performance impact as well.</p>
+</body>
+</html>

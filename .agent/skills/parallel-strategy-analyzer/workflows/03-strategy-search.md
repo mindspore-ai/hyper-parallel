@@ -1,5 +1,11 @@
 # Phase 3: Strategy Space Search
 
+**Load references before starting:**
+- [references/strategy-rules.md](../references/strategy-rules.md) — Base rules
+- [references/moe-strategy-rules.md](../references/moe-strategy-rules.md) — **MoE-specific** (if `is_moe=True`)
+- [references/known-models.md](../references/known-models.md)
+- [references/known-hardware.md](../references/known-hardware.md)
+
 ## 3.1 Determine Long-Sequence Flag & CP Limits
 
 Before enumerating, compute whether s² activation terms dominate:
