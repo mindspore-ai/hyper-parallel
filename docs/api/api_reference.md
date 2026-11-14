@@ -709,9 +709,16 @@ class Muon(torch.optim.Optimizer):
         ns_steps: int = 5,
         nesterov: bool = True,
         weight_decay: float = 0.1,
+        hsdp_replica_count: int | None = None,
         ...
     )
 ```
+
+`hsdp_replica_count` sets the target size of each Muon HSDP replicate subgroup
+when topology detection enables splitting. The default `None` lets Muon infer
+whether to split and choose the subgroup size. See
+[Muon HSDP replica deduplication](../guide/optimizer.md#muon-hsdp-replica-deduplication)
+for when an explicit value takes effect.
 
 ---
 
