@@ -31,7 +31,9 @@ See [Module Family](README.module_family.md) for GroupedExperts MXFP8 examples, 
 ## Install custom operators
 
 Some modules depend on the training operators from [Omni Ops](https://gitee.com/omniai/omni-ops). Ensure that CANN,
-PyTorch and `torch_npu` are compatible before building the operators.
+PyTorch and `torch_npu` are compatible before building the operators. MHC functions default to the CANN
+ops-transformer operators instead (see `hyper_parallel/components/functional/README.md`); Omni Ops remains the
+deprecated `backend="omni"` fallback for them and the operator source for other Omni-only paths.
 
 ```bash
 git clone https://gitee.com/omniai/omni-ops.git
