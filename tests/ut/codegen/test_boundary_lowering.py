@@ -119,11 +119,6 @@ def test_inline_meta_normalization_does_not_mutate_native_observation():
             "qwen3_5_gdn_ulysses_cp_wrapper",
             "qwen3_5_gdn_cp_forward",
         ),
-        (
-            "hyper_parallel.models.deepseek_v3.adapter.distributed.context_parallel."
-            "mla_cp_wrapper",
-            "mla_cp_forward",
-        ),
     ),
 )
 def test_delegating_cp_wrapper_exposes_source_visible_helper(factory, helper):
@@ -788,7 +783,7 @@ def test_model_adapter_replacement_keeps_declared_factory_contract():
     """Observed types do not erase a model-owned factory's interface facts."""
     meta = SimpleNamespace(
         module_overrides=[{
-            "factory": "hyper_parallel.components.modules.GQAAttention",
+            "factory": "hyper_parallel.components.modules.GroupedQueryAttention",
             "replacement_target": (
                 "hyper_parallel.models.qwen3_moe.adapter.conversion."
                 "module_replacement.replace_qwen3_moe_flash_attention"

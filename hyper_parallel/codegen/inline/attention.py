@@ -16,7 +16,7 @@
 
 The generated artifact preserves the genuine construction and fused QKV weight
 layout (``linear_qkv`` + ``InterleaveQKV`` checkpoint conversion) by copying the
-real ``GQAAttention`` methods verbatim; ``forward`` is emitted exactly as the
+real ``GroupedQueryAttentionModule`` methods verbatim; ``forward`` is emitted exactly as the
 native class writes it, keeping its ``self.attention_interface(...)`` call.  The
 kernel entry function that the real class normally receives as
 ``attention_interface`` is inlined from its real source (plan §6) so the
@@ -47,7 +47,7 @@ from typing import Any, Callable, Iterable
 from hyper_parallel.codegen.inline.expansion import ExpandedSource, expand_function
 
 
-#: The generated forward is the native GQAAttention.forward verbatim — its
+#: The generated forward is the native GroupedQueryAttentionModule.forward verbatim — its
 #: ``self.attention_interface(...)`` call site is kept unmodified, and neither CP
 #: nor TP orchestration is inlined into it.  The rendered class keeps the
 #: component's own forward, so the emitted boundary form owns the TP
@@ -320,7 +320,7 @@ def render_attention_class(module_type: type, *, interface: Callable[..., Any]) 
     references: helpers are inlined and imports derived there, never listed here.
 
     Args:
-        module_type: The real grouped-query attention component (e.g. ``modules.GQAAttention``).
+        module_type: The real grouped-query attention component (e.g. ``GroupedQueryAttentionModule``).
         interface: The attention kernel entry function to inline (e.g.
             ``run_qwen3_moe_flash_attention``); its closure is expanded into the
             artifact and it must stop at the hardware kernel.

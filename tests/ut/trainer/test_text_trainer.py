@@ -25,6 +25,8 @@ import torch
 from hyper_parallel.trainer.config.data import ModelAssetsConfig
 from hyper_parallel.trainer.config.training import DebugConfig
 from hyper_parallel.trainer.base import BaseTrainer
+from hyper_parallel.components.losses.model_output import ModelOutputLoss
+from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 
 
 def _load_text_trainer() -> type:
@@ -48,6 +50,34 @@ TextTrainer = _load_text_trainer()
 
 class TestTextTrainer(unittest.TestCase):
     """Verify text training streams prepared batches into callbacks."""
+
+    def test_default_loss_uses_aligned_trainer_token_count(self) -> None:
+        """Feature: Packed supervision and the default loss use the same token count.
+        Description: Exercise first-token-only, unshifted and empty local targets.
+        Expectation: Postforward preserves valid CE and makes empty shards a connected zero.
+        """
+        trainer = BaseTrainer.__new__(BaseTrainer)
+        trainer.loss_fn = ModelOutputLoss()
+        trainer.mesh = SimpleNamespace(dp_cp_mesh=None, sequence_parallel=False, dp_size=1, cp_size=1)
+        labels = torch.tensor([[2, -100, -100, -100]])
+        for shifted, empty in ((True, False), (False, False), (True, True)):
+            with self.subTest(shifted=shifted, empty=empty):
+                targets = torch.full_like(labels, -100) if empty else labels
+                loss_inputs = {"labels": targets}
+                if shifted:
+                    loss_inputs["shift_labels"] = targets
+                aligned = targets if shifted else torch.nn.functional.pad(targets[..., 1:], (0, 1), value=-100)
+                logits = torch.randn(1, 4, 8, requires_grad=True)
+                raw_loss = torch.nn.functional.cross_entropy(logits.flatten(0, 1), aligned.flatten())
+                counts = count_loss_token(loss_inputs)
+                loss, _ = trainer.postforward(SimpleNamespace(loss=raw_loss), targets, current_token_counts=counts)
+                loss.backward()
+                if shifted and not empty:
+                    torch.testing.assert_close(loss, raw_loss)
+                    self.assertGreater(logits.grad.abs().sum().item(), 0)
+                else:
+                    torch.testing.assert_close(loss, torch.zeros_like(loss))
+                    torch.testing.assert_close(logits.grad, torch.zeros_like(logits.grad))
 
     def test_template_logging_is_independent_of_dataset_debug(self) -> None:
         """Feature: Independent template debug configuration.

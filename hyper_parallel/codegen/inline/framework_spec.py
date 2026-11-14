@@ -21,7 +21,7 @@ providers* plus the frozen plan, never from a family-name dispatch table:
 * a YAML ``replace_module._target_`` names the family's own
   ``@module_replacement`` factory; inspecting that factory's source reveals
   which generic component it constructs (``RMSNorm`` / ``GroupedExperts`` /
-  ``GQAAttention``) and, for fused attention, the kernel entry it hands over;
+  ``GroupedQueryAttention``) and, for fused attention, the kernel entry it hands over;
 * a YAML ``replace_module._target_`` that names a generic component class
   directly (under ``hyper_parallel.components.``) resolves through that
   component's own wrap-style constructor -- the same declaration the native
@@ -49,6 +49,8 @@ import importlib
 import inspect
 from typing import Any, Callable, cast
 
+from hyper_parallel.components.modules.family import get_module_family
+
 from hyper_parallel.codegen.inline.ir import (
     ImportPatch,
     ModuleSnippetPatch,
@@ -73,7 +75,11 @@ return self._forward_impl(__hp_forward_args__)
 
 
 def cp_dispatch_shell_body(helper_name: str) -> str:
-    """Render CP dispatch around the extracted original forward."""
+    """Render CP dispatch around the extracted original forward.
+
+    Args:
+        helper_name: Generated helper that implements the selected CP forward.
+    """
     return _CP_DISPATCH_SHELL.format(helper_name=helper_name)
 
 #: The framework CP attention strategy kind (structure-keyed, not family-named).
@@ -181,8 +187,8 @@ def _component_replacement_target(component: type) -> ReplacementTarget | None:
     )
 
 
-def _component_class(target: ReplacementTarget) -> type:
-    """Import the component class one factory constructs.
+def _replacement_component(target: ReplacementTarget) -> Callable[..., Any]:
+    """Import the component class or registered family a factory constructs.
 
     Lazy by construction: the component's own module is imported only when a
     rule that constructs it is actually present (``components.modules``
@@ -190,16 +196,16 @@ def _component_class(target: ReplacementTarget) -> type:
     """
     module = importlib.import_module(target.module)
     component = getattr(module, target.component, None)
-    if not isinstance(component, type):
+    if not isinstance(component, type) and get_module_family(component) is None:
         raise RuntimeError(
-            f"codegen: {target.module!r} does not export the class "
+            f"codegen: {target.module!r} does not export the component "
             f"{target.component!r} the replacement factory constructs"
         )
     return component
 
 
 def _render_arguments(
-    target: ReplacementTarget, component: type
+    target: ReplacementTarget, component: Callable[..., Any]
 ) -> tuple[str, ...] | None:
     """Render the constructor keywords the generated call passes.
 
@@ -247,10 +253,18 @@ def _build_replacement_spec(
     (visible in the artifact) instead of merely imported. ``None`` means the
     construction is not one codegen can sink into the generated ``__init__``.
     """
-    component = _component_class(target)
+    component = _replacement_component(target)
     keyword_args = _render_arguments(target, component)
     if keyword_args is None:
         return None
+    if get_module_family(component) is not None:
+        # A thin source-model adapter may delegate to a registered family.
+        # Preserve that request so later TP/CP promotion does not freeze the local class.
+        return ReplacementSpec(
+            old_ctor=old_ctor, new_ctor=target.component,
+            imports=(ImportPatch(target.module, (target.component,)),),
+            mode="wrap_source", keyword_args=keyword_args, remove_class=False, defer_to_fqns=True,
+        )
     # A component that receives a family interface is rendered into the artifact,
     # so its class is defined there -- importing it as well would be dead weight
     # the rendered definition shadows.
@@ -307,9 +321,20 @@ def replacement_spec_for(
     ``module_type`` is the matched source module's dotted type path from the
     YAML rule; the source class name (``old_ctor``) is its class name — a
     property of the matched source module, never a hand-written literal.
+
+    Args:
+        target: Import path of the replacement factory or component.
+        model_type: Optional source model type.
+        module_type: Observed source module type used to match construction sites.
     """
     if target is None:
         return None
+    # Builder observations serialize callables as module:attribute, while YAML
+    # commonly uses module.attribute. Both identify the same replacement.
+    target = target.replace(":", ".", 1)
+    family_spec = _module_family_replacement_spec(target, module_type)
+    if family_spec is not None:
+        return family_spec
     if _direct_component_class(target) is not None:
         return _component_replacement_spec(target, model_type, module_type=module_type)
     if not adapter_path_parts(target):
@@ -327,6 +352,25 @@ def replacement_spec_for(
     spec = _resolve_replacement_spec(factory, model_type, module_type, target)
     _REPLACEMENT_CACHE[key] = spec
     return spec
+
+
+
+def _module_family_replacement_spec(target: str, module_type: str | None) -> ReplacementSpec | None:
+    """Retain registered module-family construction instead of freezing its concrete class."""
+    module_name, _, name = target.replace(":", ".", 1).rpartition(".")
+    if not module_name or not name:
+        return None
+    try:
+        factory = getattr(importlib.import_module(module_name), name, None)
+    except ImportError:
+        return None
+    if get_module_family(factory) is None or not class_name_of(module_type):
+        return None
+    return ReplacementSpec(
+        old_ctor=class_name_of(module_type), new_ctor=name,
+        imports=(ImportPatch(module_name, (name,)),), mode="wrap_source",
+        keyword_args=("module_fqn=''",), remove_class=False, defer_to_fqns=True,
+    )
 
 
 def _resolve_replacement_spec(
@@ -393,6 +437,11 @@ def strategy_spec_for(
     framework CP attention strategy (imports only). EP mutations come from the
     builder recorder instead of secondary structural inference. Anything else
     is unresolvable and yields ``None`` — recognition never guesses a strategy.
+
+    Args:
+        target: Import path of the selected strategy.
+        model_type: Optional source model type.
+        inner_wrapper: Whether the strategy wraps the existing forward boundary.
     """
     if target is None:
         return None

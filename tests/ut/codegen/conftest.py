@@ -14,8 +14,8 @@
 # ============================================================================
 """Shared fixtures for ``tests/ut/codegen``.
 
-The inline generator renders the real ``GQAAttention`` component and inlines
-``run_qwen3_moe_flash_attention`` at build time; importing those resolves a
+The generator resolves real attention families and optional NPU-backed
+components at build time; importing those resolves a
 ``torch_npu`` stub so NPU-backed modules import on CPU-only checkouts. Heavy
 framework subsystems (torch, transformers) are already imported by the time a
 test body runs, so a recording stub suffices — matching how
