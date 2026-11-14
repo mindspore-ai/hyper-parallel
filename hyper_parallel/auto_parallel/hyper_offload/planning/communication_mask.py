@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import math
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from itertools import accumulate
 
@@ -56,21 +56,6 @@ def mask_communications(
         placements.append(TransferPlacement(gap, copy_after, gap.start, gap.end))
         restored_at[gap.storage_id] = gap.end
 
-    # Preserve D2H issue order when delaying release fences on one copy stream.
-    next_release = len(resident_bytes)
-    for placement in sorted(
-        placements, key=lambda item: (item.copy_after, item.gap.start), reverse=True
-    ):
-        gap = placement.gap
-        upper = min(gap.end - 1, next_release)
-        while placement.release_after < upper:
-            slot = placement.release_after + 1
-            if resident_bytes[slot] + gap.size_bytes > limit:
-                break
-            resident_bytes[slot] += gap.size_bytes
-            placement.release_after = slot
-        next_release = placement.release_after
-
     previous_prefetch = 0
     for placement in sorted(
         placements, key=lambda item: (item.gap.end, item.gap.start, item.gap.storage_id)
@@ -84,6 +69,22 @@ def mask_communications(
             resident_bytes[slot] += gap.size_bytes
             placement.prefetch_before = slot
         previous_prefetch = placement.prefetch_before
+
+    # Spend spare residency on H2D overlap first; delaying D2H release is
+    # useful only when it does not push a prefetch past its source retirement.
+    next_release = len(resident_bytes)
+    for placement in sorted(
+        placements, key=lambda item: (item.copy_after, item.gap.start), reverse=True
+    ):
+        gap = placement.gap
+        upper = min(gap.end - 1, placement.prefetch_before - 1, next_release)
+        while placement.release_after < upper:
+            slot = placement.release_after + 1
+            if resident_bytes[slot] + gap.size_bytes > limit:
+                break
+            resident_bytes[slot] += gap.size_bytes
+            placement.release_after = slot
+        next_release = placement.release_after
     return placements
 
 
@@ -118,6 +119,41 @@ def limit_release_delay(
         )
         placement.release_deadline = placement.release_after
         placement.release_after = min(ready, placement.release_deadline)
+
+
+def limit_prefetch_advance(
+    placements: list[TransferPlacement], resident_bytes: list[int],
+    durations_ms: list[float], bandwidth_gbps: float,
+) -> None:
+    """Keep H2D lead time proportional to queued transfer work.
+
+    Memory headroom alone can move many restores hundreds of milliseconds
+    before their consumers. Holding those destinations fragments the allocator
+    and competes with backward workspaces. Schedule the copy queue backwards
+    from consumer deadlines with a margin for faster replay than warmup.
+    Moving a prefetch later only reduces the memory-only mask's residency.
+    """
+    if (
+        not placements or not math.isfinite(bandwidth_gbps) or bandwidth_gbps <= 0
+        or any(not math.isfinite(value) or value < 0 for value in durations_ms)
+        or not any(durations_ms)
+    ):
+        return
+    starts = [0.0, *accumulate(durations_ms)]
+    next_start = math.inf
+    for placement in sorted(
+        placements, key=lambda item: (item.gap.end, item.gap.storage_id), reverse=True
+    ):
+        transfer_ms = placement.gap.size_bytes * 1000 / (bandwidth_gbps * 1024**3)
+        # Warmup dispatch and synchronization can overestimate the time available
+        # in replay. Keep several copy durations of lead without filling all slack.
+        start_ms = min(starts[placement.gap.end], next_start) - 4.0 * transfer_ms
+        target = max(placement.prefetch_before, bisect_right(starts, start_ms) - 1)
+        target = min(target, placement.gap.end)
+        for slot in range(placement.prefetch_before, target):
+            resident_bytes[slot] -= placement.gap.size_bytes
+        placement.prefetch_before = target
+        next_start = starts[target]
 
 
 def release_checkpoints(placement: TransferPlacement) -> list[int]:

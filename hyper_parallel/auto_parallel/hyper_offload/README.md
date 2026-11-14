@@ -108,24 +108,39 @@ session = OffloadSession(config)
 
 Warmup still records the operator trace and uses the configured planner. If every
 selected storage is an immutable forward activation saved for backward, with one
-offload interval and one use of each saved view, replay uses autograd hooks
+offload interval and a static save/use sequence, replay uses autograd hooks
 without installing a global `TorchDispatchMode`. There is no activation-count
 limit. Unsupported plans keep operator replay.
+
+The default Peak planner prefers eligible forward-to-backward intervals covering
+the current peak. It keeps the same memory budget and can choose other intervals
+when eligible activations do not provide enough relief. Communication masking
+uses spare residency for early H2D prefetch before delaying D2H source releases.
 
 Only selected saves replace their original tensor with storage/view metadata.
 Other saves retain detached tensors with version checks. Copies use the existing
 residency manager and copy stream. D2H starts at the first selected save; source
 release and individual H2D prefetch points are compiled onto the next available
-save/use hook. H2D is fenced before its consumer, and restored manager ownership
+save/use hook. H2D destinations are allocated on the copy stream and depend only
+on the host snapshot; unrelated compute is not a producer dependency. H2D is
+fenced before its consumer, and restored manager ownership
 ends at the last saved-view use. These hook anchors can differ from the exact
 operator anchors in the original plan.
 
 Keep the same forward save order, view metadata and backward use order on every
-entry, and complete backward before leaving the session. Interleaved backward,
-recomputation, repeated access to an offloaded save and changing control flow are
-unsupported by this path. Record a new session when the graph changes. The
-session checks selected metadata, storage aliases, mutation versions and save/use
-counts; it does not validate every unrelated operator during native replay.
+entry, and complete backward before leaving the session. Activation checkpointing
+can save additional aliases during backward; replay validates their position among
+the recorded uses and checks them against restored storage. Repeated reads of a
+saved view keep that storage until its final recorded use. Both non-reentrant and
+reentrant checkpointing can use this path when every selected storage is first
+saved in forward, is immutable after its first save, and has one
+forward-to-backward offload interval. Initialization before the first save and
+read-only split/unbind aliases are supported. A storage must have at least one
+recorded backward use; extra unused saved aliases do not extend its lifetime.
+Changing save/use order or control flow is unsupported. Record a new session when
+the graph changes. The session checks selected metadata, storage aliases, mutation
+versions and save/use counts; it does not validate every unrelated operator during
+native replay.
 
 ### `skip_offload`
 

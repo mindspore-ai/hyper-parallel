@@ -32,6 +32,7 @@ from hyper_parallel.auto_parallel.hyper_offload.planning._peak_model import (
 )
 from hyper_parallel.auto_parallel.hyper_offload.planning.communication_mask import (
     TransferPlacement,
+    limit_prefetch_advance,
     limit_release_delay,
     mask_communications,
     release_checkpoints,
@@ -42,9 +43,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ScoreWeights:
-    """Relative weights for size, peak coverage and neighboring lifetimes."""
+    """Weight freed bytes above coverage to avoid many tiny transfer intervals."""
 
-    size: float = 1.0
+    size: float = 2.0
     cover_start: float = 1.0
     cover_end: float = 1.0
     neighbor_impact: float = 1.0
@@ -86,7 +87,8 @@ def _choose_gap(
 
 
 def _select_gaps(
-    resident: list[int], gaps: list[EvictionGap], limit: int, weights: ScoreWeights
+    resident: list[int], gaps: list[EvictionGap], limit: int, weights: ScoreWeights,
+    preferred: set[tuple[int, int, int]] | None = None,
 ) -> list[EvictionGap]:
     remaining, selected = list(gaps), []
     delta = [0] * (len(resident) + 1)
@@ -105,7 +107,11 @@ def _select_gaps(
         if peak is None:
             break
         eligible = [gap for gap in remaining if gap.start < peak < gap.end]
-        chosen = _choose_gap(eligible, peak, selected, weights)
+        native = [
+            gap for gap in eligible
+            if preferred and (gap.storage_id, gap.start, gap.end) in preferred
+        ]
+        chosen = _choose_gap(native or eligible, peak, selected, weights)
         selected.append(chosen)
         remaining.remove(chosen)
         for slot in range(chosen.start + 1, chosen.end):
@@ -164,6 +170,9 @@ def _emit_schedule(
 class PeakResidencyPlanner:
     """Select idle storage gaps covering the current peak, then mask transfers.
 
+    Prefer trace-supplied native autograd intervals when they cover the peak;
+    use other candidates when needed to satisfy the same memory budget.
+
     Args:
         enable_communication_masking: Delay releases and advance H2D copies in
             available memory. Runtime events enforce transfer dependencies.
@@ -200,10 +209,13 @@ class PeakResidencyPlanner:
             raise ValueError("memory_limit_bytes must be a nonnegative integer or None")
         profile = build_profile(trace)
         selected = _select_gaps(
-            profile.resident_bytes, profile.gaps, limit, self.weights
+            profile.resident_bytes, profile.gaps, limit, self.weights, set(trace.preferred_eviction_gaps)
         )
         if self.enable_communication_masking:
             placements = mask_communications(selected, profile.resident_bytes, limit)
+            limit_prefetch_advance(
+                placements, profile.resident_bytes, [op.duration_ms for op in trace.ops], trace.h2d_bandwidth_gbps
+            )
             limit_release_delay(
                 placements, [op.duration_ms for op in trace.ops], trace.d2h_bandwidth_gbps
             )

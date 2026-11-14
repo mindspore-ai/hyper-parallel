@@ -108,10 +108,12 @@ class CheckFirstActivation(CopyFirstActivation):
         return schedule
 
 
-def compute(x: torch.Tensor, replace_left: torch.Tensor | None = None) -> tuple:
+def compute(x: torch.Tensor, replace_left: torch.Tensor | None = None, native_detach: bool = False) -> tuple:
     """Compute and differentiate through one moved and one native activation."""
     a = x.sin()
     b = x.cos()
+    if native_detach:
+        b.detach()
     left = a.view(-1)
     right = b.view(-1)
     loss = ((left if replace_left is None else replace_left) * right).sum()
@@ -176,8 +178,9 @@ def test_native_view_created_outside_tracking_keeps_original_input_contract(opaq
 
 @pytest.mark.parametrize("invalid_managed_input", [False, True])
 @pytest.mark.parametrize("copy_complete", [None, False, True])
+@pytest.mark.parametrize("native_detach", [False, True])
 def test_partial_replay_preserves_gradients_aliases_and_retained_native_outputs(
-    invalid_managed_input, copy_complete,
+    invalid_managed_input, copy_complete, native_detach,
 ):
     planner = CopyFirstActivation() if copy_complete is None else CheckFirstActivation()
     session = OffloadSession(OffloadConfig(planner=planner))
@@ -226,7 +229,7 @@ def test_partial_replay_preserves_gradients_aliases_and_retained_native_outputs(
         ):
             events.return_value.query.return_value = copy_complete
             with session:
-                actual = compute(value)
+                actual = compute(value, native_detach=native_detach)
             assert d2h.call_count == 1
             if copy_complete is not None:
                 events.return_value.query.assert_called()

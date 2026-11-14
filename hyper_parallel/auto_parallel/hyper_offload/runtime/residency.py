@@ -293,19 +293,20 @@ class ResidencyManager:
             buffer.device,
         )
 
-        # 1. Allocate device memory.
-        dev_bytes = torch.empty(size_bytes, dtype=torch.uint8, device=buffer.device)
-
-        # 2. Launch async H2D copy (wait for prior D2H event if present).
+        # Keep restored activations in the copy stream's allocation pool so
+        # their varied lifetimes do not split the compute stream's large blocks.
         copy_stream = self._get_copy_stream()
         event = None
-        if dev_bytes.device != copy_stream.device:
+        if buffer.device != copy_stream.device:
+            dev_bytes = torch.empty(size_bytes, dtype=torch.uint8, device=buffer.device)
             dev_bytes.copy_(buffer.host_buffer, non_blocking=False)
         else:
-            producer_stream = torch.accelerator.current_stream()
             event = torch.Event()
             with copy_stream:
-                copy_stream.wait_stream(producer_stream)
+                # The destination belongs to this stream's allocator pool.
+                # Only the host snapshot must be ready; waiting for unrelated
+                # compute here prevents early H2D from overlapping its work.
+                dev_bytes = torch.empty(size_bytes, dtype=torch.uint8, device=buffer.device)
                 if buffer.host_event is not None:
                     buffer.host_event.wait(copy_stream)
                 dev_bytes.copy_(buffer.host_buffer, non_blocking=True)
