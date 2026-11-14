@@ -22,7 +22,6 @@ __all__ = ["mean_global_loss"]
 from typing import TYPE_CHECKING, Union
 
 import torch  # pylint: disable=forbidden-backend-import
-import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.core.utils.communication import (
     _is_tracing_or_compiling,
@@ -34,9 +33,8 @@ if TYPE_CHECKING:
     from hyper_parallel.distributed.mesh import MeshContext
 
 
-def _reduce_weighted_loss(cur_loss, cur_token_len, device_mesh, dp_cp_group):
+def _reduce_weighted_loss(local_weighted_loss, device_mesh, dp_cp_group):
     """Reduce a loss numerator while preserving the local backward graph."""
-    local_weighted_loss = cur_loss.float() * cur_token_len
     backward_loss = local_weighted_loss * device_mesh.dp_size * device_mesh.cp_size
     global_weighted_loss = local_weighted_loss.detach().item()
     if device_mesh.dp_cp_mesh is not None and device_mesh.dp_cp_mesh.size() > 1:
@@ -59,7 +57,10 @@ def mean_global_loss(
     FSDP divides gradients over its flattened DP+CP domain, so each local loss
     is weighted by valid tokens and multiplied by ``dp_size * cp_size``.
     Trainer divides accumulated gradients and reported losses by the actual
-    optimizer-step token count afterwards. Empty shards must return finite losses.
+    optimizer-step token count afterwards. Empty shards contribute zero even if
+    their mean loss is NaN. Token counts describe aligned, masked local targets
+    and are replicated across TP ranks, including with sequence parallelism.
+    Only DP+CP ranks contribute distinct tokens to the numerator and denominator.
 
     Args:
         losses: A loss tensor or mapping of named loss tensors.
@@ -70,19 +71,11 @@ def mean_global_loss(
         Token-weighted loss numerators keyed by loss name.
 
     Raises:
-        ValueError: If sequence parallelism is enabled without a TP device mesh.
+        ValueError: If the losses use different token-count families.
     """
     loss_dict = {}
     dp_cp_mesh = device_mesh.dp_cp_mesh
     dp_cp_group = dp_cp_mesh.get_group() if dp_cp_mesh is not None else None
-    sequence_parallel = device_mesh.sequence_parallel
-    sequence_parallel_group = None
-    sequence_parallel_size = 1
-    if sequence_parallel:
-        if device_mesh.device_mesh is None or "tp" not in device_mesh.device_mesh.mesh_dim_names:
-            raise ValueError("Sequence parallelism requires a DeviceMesh with a 'tp' dimension.")
-        sequence_parallel_group = device_mesh.device_mesh["tp"].get_group()
-        sequence_parallel_size = dist.get_world_size(group=sequence_parallel_group)
 
     if isinstance(losses, torch.Tensor):  # text loss only
         losses = {"foundation_loss": losses}
@@ -94,15 +87,10 @@ def mean_global_loss(
         loss_name = key.split("_loss", maxsplit=1)[0]  # foundation/image_decoder/**
 
         cur_token_len = current_token_counts[f"{loss_name}_tokens"]
-        if sequence_parallel:
-            if _is_tracing_or_compiling():
-                # Graph tracing: ``.item()`` is data-dependent and unsupported
-                # by the static-shape tracer; aggregate on tensors instead.
-                cur_token_len = differentiable_all_reduce(
-                    cur_token_len, "sum", sequence_parallel_group
-                )
-            else:
-                cur_token_len = all_reduce(cur_token_len.item(), op="sum", group=sequence_parallel_group)
+        # Counting already accounts for causal alignment and loss masks. In
+        # particular, a CP-local target at position zero is not padding.
+        cur_loss = torch.where(cur_token_len > 0, cur_loss.float(), torch.zeros_like(cur_loss, dtype=torch.float32))
+        local_weighted_loss = cur_loss * cur_token_len
 
         if _is_tracing_or_compiling():
             # Graph-traced variant of the aggregation below: identical math
@@ -111,7 +99,6 @@ def mean_global_loss(
             # ``differentiable_all_reduce`` dispatches to functional collectives
             # under tracing. BaseTrainer passes token-count tensors as explicit
             # graph inputs so packed/ignored-token counts remain live.
-            local_weighted_loss = cur_loss.float() * cur_token_len
             backward_loss = local_weighted_loss * device_mesh.dp_size * device_mesh.cp_size
             global_weighted_loss = local_weighted_loss.detach()
             if dp_cp_mesh is not None and dp_cp_mesh.size() > 1:
@@ -119,20 +106,14 @@ def mean_global_loss(
                     global_weighted_loss, "sum", dp_cp_group
                 )
             cur_loss = global_weighted_loss + (backward_loss - backward_loss.detach())
-            if sequence_parallel:
-                cur_loss = cur_loss / sequence_parallel_size
             loss_dict[key] = cur_loss
             continue
 
         cur_loss = _reduce_weighted_loss(
-            cur_loss,
-            cur_token_len,
+            local_weighted_loss,
             device_mesh,
             dp_cp_group,
         )
-
-        if sequence_parallel:
-            cur_loss = cur_loss / sequence_parallel_size
 
         loss_dict[key] = cur_loss
 
