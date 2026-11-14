@@ -4,6 +4,11 @@
 
 ## Prerequisites
 
+For documentation-only changes, follow the [contributing guide](../../CONTRIBUTING.md#prepare-your-development-environment);
+framework runtimes and native build tools are unnecessary unless a changed example needs them.
+For Python development, use an isolated environment, Git, a supported PyTorch installation, and the affected module's
+dependencies. The compiler, SDK, and build tools below apply when building native components:
+
 - Python 3.10 / 3.11 / 3.12
 - Development headers for the current Python, plus `setuptools`, `wheel`, and `pybind11`
 - Git
@@ -12,22 +17,20 @@
 - CMake ≥ 3.18
 - Ninja for native targets
 
-## Clone the Repository
+## Clone Your GitHub Fork
+
+Fork the upstream repository first and replace `YOUR_GITHUB_USERNAME`. Cloning your fork sets `origin` automatically:
 
 ```bash
-git clone https://gitcode.com/mindspore/hyper-parallel.git
+git clone https://github.com/YOUR_GITHUB_USERNAME/hyper-parallel.git
 cd hyper-parallel
+git remote add upstream https://github.com/mindspore-ai/hyper-parallel.git
+git fetch upstream
+git switch -c feat/your-change upstream/master
 ```
 
-## Fork Workflow
-
-Use origin for your fork and upstream for the main repository:
-
-```bash
-# After forking the repository on GitCode:
-git remote add origin https://gitcode.com/<your-username>/hyper-parallel.git
-git remote add upstream https://gitcode.com/mindspore/hyper-parallel.git
-```
+For an existing clone, inspect `git remote -v` before changing remotes. Keep `origin` pointing to your fork and
+`upstream` to the main repository. Paired GitCode requests follow the [submission guidance](../../CONTRIBUTING.md#submit-and-iterate-on-a-pull-request).
 
 ## Build a Development Version
 
@@ -53,8 +56,12 @@ Running `python setup.py bdist_wheel` directly produces a core-only wheel. The s
 ## Install Development Dependencies
 
 ```bash
-pip install pytest pylint markdownlint
+python -m pip install pytest pre-commit PyYAML
+bash scripts/pre-commit/install.sh
 ```
+
+The installer prepares the configured pylint, lizard, and Node-based markdownlint hook environments. Documentation-only
+contributors can omit pytest. See the [pre-commit guide](../../scripts/pre-commit/README.md) for other lint tools.
 
 ## Coding Standards
 

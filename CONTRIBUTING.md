@@ -6,6 +6,26 @@ HyperParallel welcomes bug reports, documentation improvements, tests, model int
 parallel capabilities. You can contribute through a fork without write access to the upstream repository.
 Use public issues and pull requests to make designs, review decisions, and validation results available to the community.
 
+## Start here
+
+| Task | Where to go |
+| --- | --- |
+| Choose an issue or propose a change | [Contribution types](#choose-a-contribution) |
+| Prepare tools for your change | [Development environment](#prepare-your-development-environment) |
+| Check style and test results | [Standards](#follow-the-coding-and-documentation-standards) · [Validation](#validate-the-change) |
+| Open or update a PR | [Submission steps](#submit-and-iterate-on-a-pull-request) |
+| Understand merge requirements | [Merge flowchart](#ci-review-and-merge) |
+| Unblock a PR | [Gate troubleshooting](#when-a-gate-fails) |
+| Plan a release or integration | [Release and integration guidance](#releases-and-downstream-integration) |
+
+Before requesting final review:
+
+- [ ] Keep one focused change and one commit, based on the intended upstream branch.
+- [ ] Complete the relevant local checks and record results for the current commit, including unrun cases.
+- [ ] Update affected documentation and its translation; check links and examples.
+- [ ] Fill in the PR template with the problem, resulting behavior, compatibility impact, and actual evidence.
+- [ ] Mark the completed PR ready, request the relevant reviewers, and confirm CI has started for the current commit.
+
 ## Choose a contribution
 
 - **Report a problem:** Search [existing issues](https://github.com/mindspore-ai/hyper-parallel/issues) first, then use the
@@ -35,7 +55,17 @@ git fetch upstream
 git switch -c feat/your-change upstream/master
 ```
 
-Create and activate an isolated Python environment using your preferred tool, such as `venv` or Conda.
+Choose the environment for the work you are doing:
+
+| Contribution | Local setup |
+| --- | --- |
+| Documentation only | Git, an isolated Python environment with `pre-commit` and `PyYAML`, and the [documentation checks](#follow-the-coding-and-documentation-standards). PyTorch, a package install, and NPU/GPU runtimes are unnecessary unless you are validating a runtime example. |
+| Python logic or unit tests | A supported Python/PyTorch environment, this checkout installed in editable mode, pytest, and dependencies used by the affected module. |
+| Distributed or native code | The code-development environment plus the selected test's devices, runtime, and build tools. Coordinate unavailable hardware validation with the module/CI maintainer before requesting final review. |
+
+For all contribution types, create and activate an isolated Python environment using your preferred tool, such as
+`venv` or Conda. Documentation-only work can then continue with the checks below. For code development, also follow
+the runtime installation steps:
 Choose a Python version supported by the installation guide; the environment name is up to you.
 Install a supported PyTorch and hardware runtime combination following the [installation guide](docs/installation.md).
 Then run the following commands in that environment to install this checkout in editable mode:
@@ -73,17 +103,25 @@ The coding standards are the authoritative reference, including their documented
 Install the local pre-commit hooks and run the repository checks from the activated environment:
 
 ```bash
+python -m pip install pre-commit PyYAML
 bash scripts/pre-commit/install.sh
-python .agent/skills/autogit/scripts/autogit.py check
+# Replace these paths with every changed or new file in your contribution.
+python -m pre_commit run --files CONTRIBUTING.md CONTRIBUTING.zh.md
 python .agent/scripts/check_agents_catalog.py
 git diff --check
 ```
 
-Checks select applicable tools such as pylint, lizard, C++/shell linters, codespell, and markdownlint.
+The configured hooks select pylint, lizard, and markdownlint by file type. Passing explicit paths includes new files
+before they are staged and allows a committed PR to be checked again without creating another change.
 The catalog check is required whenever Markdown changes; it checks the agent catalog, so check documentation links
 separately. See the [pre-commit guide](scripts/pre-commit/README.md) for installation and tool coverage.
-The `autogit check` command temporarily stages changes to determine its scope; use a focused working tree.
-AutoGit's remote PR workflow targets GitCode. Use Git and GitHub tooling for GitHub submissions.
+
+For additional code checks such as C++/shell lint and codespell, use
+`python .agent/skills/autogit/scripts/autogit.py check` in a focused working tree. It inspects uncommitted changes,
+temporarily stages tracked files, and resets staging afterward; add new files explicitly before running it.
+Its Markdown dependency setup requires Node.js/npm on `PATH` and may install `markdownlint-cli2` globally;
+the pre-commit-managed tools above do not put that executable on `PATH`. AutoGit's remote PR workflow targets GitCode;
+use Git and GitHub tooling for GitHub submissions.
 
 ## Validate the change
 
@@ -137,45 +175,89 @@ counterpart. Avoid competing edits on both platforms. Follow the target branch's
 ## CI, review, and merge
 
 Jenkins runs the project pipeline and reports test/build results to the PR. GitHub workflows enforce CI-label validity
-and the review quorum. The current `master` gates include:
+and the review quorum. The flow below summarizes normal merge eligibility for the current commit. CI and reviews can
+run in parallel; all three groups of requirements must be satisfied.
 
-| Gate | What contributors need to know |
+```mermaid
+flowchart LR
+    PR["Open, non-draft PR<br/>Latest commit"]
+    CI["label-check passes<br/>Latest commit tested<br/>At least 1 pass label<br/>under 24h old"]
+    REVIEW["Review gate passes<br/>1 reviewer: 1 approval<br/>2+: 2 approvals<br/>Current commit only<br/>Author excluded<br/>No change requests<br/>No pending team reviews"]
+    RULES["Branch rules pass<br/>Independent approval<br/>of the latest push<br/>Discussions resolved<br/>Other checks pass<br/>No merge conflicts"]
+    ALL{"All gates pass?"}
+    BLOCKED["Not ready<br/>Fix / retest / review"]
+    READY["Ready to merge<br/>Auto-merge / maintainer"]
+
+    PR --> CI
+    PR --> REVIEW
+    PR --> RULES
+    CI --> ALL
+    REVIEW --> ALL
+    RULES --> ALL
+    ALL -->|No| BLOCKED
+    BLOCKED -->|Recheck| PR
+    ALL -->|Yes| READY
+
+    classDef gate fill:#eff6ff,stroke:#2563eb,color:#111827
+    classDef blocked fill:#fff7ed,stroke:#c2410c,color:#111827
+    classDef ready fill:#f0fdf4,stroke:#15803d,color:#111827
+    class CI,REVIEW,RULES gate
+    class BLOCKED blocked
+    class READY ready
+```
+
+The diagram describes the normal path without bypass privileges. The current `master` gates include:
+
+| Gate | What contributors need to do |
 | --- | --- |
-| `label-check` | A CI pass label must be valid. `ci-pipeline-passed` and `ci-pipeline-passed-but-overtime` expire 24 hours after being added. New commits require fresh CI results. The overtime label retains the indication of an abnormal duration. |
-| `all-reviewers-approved` | One reviewer requires one approval; two or more reviewers require two distinct approvals. Approvals must apply to the current commit, and the author does not count. Outstanding change requests or pending team-review requests still block the gate. |
-| Native branch rules | The latest push requires independent approval, stale reviews are dismissed after pushes, and review discussions must be resolved. The target branch's live rules determine additional requirements. |
+| `label-check` | Obtain CI results for the current commit and at least one valid `ci-pipeline-passed` or `ci-pipeline-passed-but-overtime` label. Each label expires 24 hours after its latest recorded addition; either valid label meets the age requirement. The overtime label retains the indication of an abnormal duration. |
+| `all-reviewers-approved` | Obtain one approval with one reviewer, or two distinct approvals with two or more reviewers. Approvals must apply to the current commit; the author does not count. A valid CI label is also required. Resolve outstanding change requests and pending team-review requests. A Draft PR or a PR without independent reviewers cannot pass. |
+| Native branch rules | Obtain independent approval of the latest push, resolve review discussions, pass other required checks, and resolve merge conflicts. New pushes invalidate stale approvals. Follow the target branch's [live rules](https://github.com/mindspore-ai/hyper-parallel/rules) for additional requirements. |
 
-Use [review and merge rules](docs/contributing/github_auto_merge.md) for the detailed policy. Passing one gate does not
-replace the others. Maintainers decide readiness under the effective branch rules.
+### CI validity and auto-merge
 
-If validation fails, inspect the failing stage and logs. The author fixes code regressions with the module maintainer;
-CI maintainers handle runner, environment, and reporting failures. After fixing the cause, request a retest using the
-repository's supported entry point and verify results against the current commit. Do not manually add pass labels or
-disable checks to make a PR mergeable.
+- Pushes require fresh CI and approvals for the new commit. If a label expires, rerun CI and let CI renew it; comments
+  and reviews do not extend its lifetime. Do not manually add pass labels.
+- The automated path checks the current commit and label age before publishing approval success and before enabling
+  auto-merge. GitHub may still wait for other merge requirements afterward.
+- **Expiry enforcement is asynchronous: merging is not guaranteed to stop at the exact 24-hour boundary.** Scheduling
+  delays or API failures can leave an earlier success in place. Accounts allowed to bypass the live branch rules remain
+  outside these gates.
 
-## Release cadence and compatibility work
+See [review and merge rules](docs/contributing/github_auto_merge.md) for reviewer eligibility, the check/status pair
+named `label-check`, shared-commit behavior, event triggers, scheduling, and enforcement limits. That document maintains
+the detailed policy and implementation; this guide covers the contributor steps.
 
-The community plans approximately **one Beta per month and one Stable per quarter**. Betas support early adoption and
-downstream feedback. Stable releases provide accepted deployment baselines. Actual dates and scope depend on candidate
-validation and maintainer review. Follow the [release process](docs/contributing/release.md) for SemVer, packaging,
-release notes, documentation, known limitations, and upgrade guidance.
+### When a gate fails
 
-The **Q4 2026 CI/CD plan** expands validation from PyTorch 2.9 through the latest stable version on Ascend NPUs and
-NVIDIA GPUs, including tracking the two most recent PyTorch releases. This is a roadmap target; use published results
-to determine supported combinations. Record unavailable runtime combinations as pending validation with a tracking
-issue. A feature marked `DEMO` retains its stated limitations even in a Stable release.
+Start from the PR's **Checks** details and the latest `mindspore-ai-bot` pipeline report in **Conversation**. Match the
+build's commit to the current PR head before using its result.
 
-### Downstream integration, including VeOmni
+| Symptom | Where to look | Action and owner |
+| --- | --- | --- |
+| CI pass label missing or expired | `label-check` details and the latest Jenkins report | The author requests a Jenkins retest using the steps below. Wait for a successful current-commit result and a renewed label. |
+| Jenkins test or code check failed | The failing stage and log linked by the bot | The author fixes regressions with the module maintainer, runs relevant local checks, then requests a retest. CI maintainers handle runner, environment, and reporting failures. |
+| Approval gate pending or failed | `all-reviewers-approved` details and the Reviewers sidebar | Mark a complete PR ready, obtain the required current-commit approvals, and ask the relevant reviewer/team to address outstanding requests. If CI has expired, retest first. |
+| Discussion unresolved or merge conflict | Review threads and the PR merge box | The author addresses feedback and resolves conflicts; resolve threads once concerns are addressed. A new commit needs fresh CI and approvals. |
+| Fresh CI/approvals but stale gate status | Linked GitHub Actions run and its error/queue details | Ask a CI maintainer to inspect or rerun the gate workflow. Refreshing a gate does not rerun Jenkins or renew expired CI. |
+| Description or CLA check failed | The specific bot message or check details | The author fixes the reported fields or identity mapping. For description-only changes, use `/check-pr` as directed by the PR template; follow the CLA check's own instructions for CLA failures. |
 
-Downstream projects consume HyperParallel as an optional package dependency and release independently. Integration PRs
-should provide an installation path, user configuration, runnable example, compatibility boundaries, and reproducible
-correctness/performance results. Update the downstream usage guide alongside the adapter.
+To request a Jenkins retest, explain what was fixed or why renewal is needed, then post `/retest` as a separate
+**Conversation** comment on the GitHub PR. This entry point is evidenced by a [retest request](https://github.com/mindspore-ai/hyper-parallel/pull/1476#issuecomment-6766402177)
+and the [bot's build acknowledgement](https://github.com/mindspore-ai/hyper-parallel/pull/1476#issuecomment-6766413958).
+Confirm a new build link appears, then inspect its final report and tested commit. If the command is rejected or no
+build appears, provide the PR link, head SHA, command, and any bot/error response to a CI maintainer in the PR.
+Avoid repeated requests while a build is running. Do not disable checks or manually add pass labels to unblock merging.
 
-The planned VeOmni pipeline refreshes a pinned upstream baseline weekly and validates HyperParallel changes before
-merge. Adopt a new baseline only after it passes; otherwise retain the previous passing combination and track the
-failure. Required integration cases must report results for both project commits and the exact environment.
-The initial VeOmni integration targets Ascend; GPU support follows later. These planned checks become merge
-requirements when enabled for the integration and must not be described as already running without evidence.
+## Releases and downstream integration
+
+Use the [release process](docs/contributing/release.md) for versioning, packaging, release notes, and upgrade guidance.
+The [release and integration plan](docs/contributing/release_and_integration_plan.md) records the planned cadence,
+Q4 2026 compatibility targets, and proposed VeOmni validation and responsibilities.
+
+Downstream integration PRs should include the installation path, user configuration, a runnable example, compatibility
+boundaries, and reproducible correctness/performance results. Record both project commits and the exact environment,
+and update the downstream usage guide alongside the adapter. Follow the integration's enabled checks for acceptance.
 
 ## Maintenance and issue follow-up
 
@@ -187,9 +269,6 @@ method and baseline. Remove credentials and private training data from attachmen
 Module owners review design and implementation changes. PR authors address regressions they introduce, while CI
 maintainers own infrastructure failures. Record the root cause, affected/fixed versions, and regression results in
 the original issue.
-
-For the proposed VeOmni integration, HyperParallel owns the package, adapter, VeOmni usage guide, Ascend test resources,
-and weekly compatibility validation. VeOmni maintainers retain review, merge, and release decisions in their repository.
 
 ## License
 
