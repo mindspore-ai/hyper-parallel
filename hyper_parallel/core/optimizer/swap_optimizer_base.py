@@ -21,12 +21,12 @@ import contextlib
 import copy
 import itertools
 import logging
+import weakref
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
 
 # Optimizer runtime is Torch-only; the legacy checker still flags core imports.
 import torch  # pylint: disable=forbidden-backend-import
-from torch.optim import optimizer as torch_optimizer  # pylint: disable=forbidden-backend-import
 
 logger = logging.getLogger(__name__)
 
@@ -1204,6 +1204,22 @@ def validate_state_keys(state_keys: Optional[Sequence[str]]) -> Optional[tuple[s
 AdapterFactory = Callable[[Any, Any, PipelineSwapRuntime], "StateSwapAdapter"]
 
 
+def _build_profiled_step(wrapper: Any) -> Callable[..., Any]:
+    """Build a PyTorch step-hook dispatcher without retaining ``wrapper`` strongly."""
+    wrapper_ref = weakref.ref(wrapper)
+
+    def hooked_leaf_step(optimizer: Any, *args: Any, **kwargs: Any) -> Any:
+        """Dispatch one raw optimizer leaf through its swap wrapper."""
+        current = wrapper_ref()
+        if current is None:
+            raise RuntimeError("Swap optimizer wrapper has been released.")
+        if optimizer is not current.optimizer:
+            raise ValueError("Optimizer step hooks cannot replace optimizer identity.")
+        return current._step_impl(*args, **kwargs)
+
+    return torch.optim.Optimizer.profile_hook_step(hooked_leaf_step)
+
+
 class StateSwapAdapter:
     """Algorithm-independent optimizer-state swap adapter base.
 
@@ -1910,39 +1926,31 @@ class StateSwapAdapter:
         return tuple(self.config.state_keys or self.default_state_keys())
 
 
-def _check_step_hooks(optimizer: Any) -> None:
-    """Reject step hooks that the swap pipeline bypasses."""
-    if (getattr(optimizer, "_optimizer_step_pre_hooks", None)
-            or getattr(optimizer, "_optimizer_step_post_hooks", None)
-            or torch_optimizer._global_optimizer_pre_hooks
-            or torch_optimizer._global_optimizer_post_hooks):
-        raise ValueError(
-            "Optimizer-state swap does not support registered step hooks; "
-            "remove the hooks or disable swap"
-        )
-
-
 class SwapOptimizer(torch.optim.Optimizer):
     """Torch optimizer wrapper around a family-provided swap adapter.
 
     The wrapper is algorithm agnostic: it owns the pipeline runtime, exposes the
     wrapped optimizer's ``param_groups``/``state``/``defaults`` and drives one
     step as ``prepare_step`` -> ``partition`` -> ``run_pipeline`` ->
-    ``finish_step``.  The concrete adapter is built by the family factory passed
-    as ``adapter_factory`` (see ``swap_adam.py``/``swap_muon.py``).
+    ``finish_step``. Every step passes through PyTorch's hook dispatcher,
+    including steps with no hooks currently registered, so hooks added later
+    take effect. Step hooks must not access optimizer state because swapped
+    tensors are not materialized for hook execution. The concrete adapter is
+    built by the family factory passed as ``adapter_factory`` (see
+    ``swap_adam.py``/``swap_muon.py``).
     """
 
     _is_swap_optimizer = True
 
     def __init__(self, optimizer: Any, config: Any, adapter_factory: AdapterFactory) -> None:
         """Wrap a leaf with its family adapter and independent transfer runtime."""
-        _check_step_hooks(optimizer)
         # Do not call ``torch.optim.Optimizer.__init__``: the wrapped base
         # optimizer already owns param_groups/state/defaults. Inheriting keeps
         # PyTorch LR schedulers and isinstance checks happy while this wrapper
         # delegates all optimizer state to ``self.optimizer``.
         self.optimizer = optimizer
         self.config = config
+        self._hooked_leaf_step = _build_profiled_step(self)
         self._step_active = False
         self._reset_active = False
         self._reset_required = False
@@ -2021,23 +2029,51 @@ class SwapOptimizer(torch.optim.Optimizer):
             self._reset_active = False
 
     def step(self, closure: Optional[Any] = None) -> Any:
-        """Run one optimizer step with pipeline state swap."""
+        """Run one optimizer step through PyTorch's leaf hook dispatcher.
+
+        The swap pipeline never runs a closure, so a non-None value is rejected
+        before step hooks run, before any swap transfer is enqueued and before
+        any optimizer state is rewritten. Omitted and explicit ``None`` closures
+        are both forwarded to leaf hooks as ``closure=None``.
+
+        Args:
+            closure: Unsupported. Must be omitted or None.
+
+        Raises:
+            RuntimeError: If called recursively.
+            ValueError: If a non-None closure is supplied.
+        """
         if closure is not None:
             raise ValueError("Swap optimizer does not support closure.")
-        _check_step_hooks(self.optimizer)
+        if self._step_active:
+            raise RuntimeError("Recursive SwapOptimizer.step() is not supported.")
         self._check_reset_complete()
         self._step_active = True
         try:
-            with self._no_grad_context():
-                step_context = self.adapter.prepare_step()
-                units = self.adapter.iter_update_units(step_context)
-                unit_costs = self.adapter.partition_costs(units, step_context)
-                batches = self.runtime.partition(units, unit_costs=unit_costs)
-                self.adapter.prepare_pipeline(batches, step_context)
-                self.runtime.run_pipeline(batches, step_context, self.adapter.step_batch)
-                return self.adapter.finish_step(step_context)
+            return self._hooked_leaf_step(self.optimizer, closure=closure)
         finally:
             self._step_active = False
+
+    def _step_impl(self, *args: Any, **kwargs: Any) -> Any:
+        """Execute the swap pipeline between PyTorch pre- and post-hooks."""
+        # ``step()`` already rejected the caller's closure; whatever arrives here
+        # is either the forwarded ``closure=None`` or a pre-hook rewrite.
+        if len(args) > 1 or set(kwargs) - {"closure"}:
+            raise ValueError("Swap optimizer does not support extra step arguments.")
+        if args and "closure" in kwargs:
+            raise TypeError("closure was passed both positionally and by keyword.")
+        closure = args[0] if args else kwargs.get("closure")
+        if closure is not None:
+            raise ValueError("Swap optimizer does not support closure.")
+
+        with self._no_grad_context():
+            step_context = self.adapter.prepare_step()
+            units = self.adapter.iter_update_units(step_context)
+            unit_costs = self.adapter.partition_costs(units, step_context)
+            batches = self.runtime.partition(units, unit_costs=unit_costs)
+            self.adapter.prepare_pipeline(batches, step_context)
+            self.runtime.run_pipeline(batches, step_context, self.adapter.step_batch)
+            return self.adapter.finish_step(step_context)
 
     def _check_reset_complete(self) -> None:
         """Prevent using a partially rebuilt optimizer after reset failed."""
