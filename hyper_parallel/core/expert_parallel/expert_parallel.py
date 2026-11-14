@@ -45,6 +45,8 @@ from typing import Any, List, Optional, Tuple, Union
 import torch
 from torch.nn import Module
 
+from hyper_parallel.core.expert_parallel.receive_permutation import try_generate_receive_indices
+from hyper_parallel.core.expert_parallel.row_permutation import invert_permutation, permute_rows
 from hyper_parallel.core.expert_parallel.static_splits import (
     get_static_plan,
     static_plan_key,
@@ -81,11 +83,12 @@ class AsyncHandle:
     :meth:`wait` method that is safe to call multiple times.
     """
 
-    def __init__(self, async_tensor) -> None:
+    def __init__(self, async_tensor: torch.Tensor) -> None:
+        """Keep the asynchronous collective result until its consumer waits."""
         self._tensor = async_tensor
         self._waited = False
 
-    def wait(self):
+    def wait(self) -> torch.Tensor:
         """Wait for the async collective to complete.
 
         Idempotent — the first call blocks until the collective finishes;
@@ -108,6 +111,7 @@ def _generate_permute_indices(
     tokens_per_expert_group,
     experts_per_rank: int,
     num_ranks: int,
+    total_received: Optional[int] = None,
 ):
     """Generate permutation indices for rank-major → expert-major reordering.
 
@@ -126,6 +130,7 @@ def _generate_permute_indices(
             number of tokens received from rank ``r`` for local expert ``e``.
         experts_per_rank: Number of experts owned by each rank.
         num_ranks: EP degree (total number of ranks in the EP group).
+        total_received: Known receive-buffer length, avoiding a host count read.
 
     Returns:
         Tuple of:
@@ -143,10 +148,10 @@ def _generate_permute_indices(
     counts_2d = counts.view(num_ranks, experts_per_rank)  # [R, E]
     num_tokens_per_expert = counts_2d.sum(dim=0)          # [E]
 
-    # ``total`` must be a host int because ``arange`` needs a scalar size.
-    # That single D2H drain is unavoidable.  Everything else stays on
-    # device — no per-block ``.item()`` in a loop.
-    total = int(num_tokens_per_expert.sum())
+    # Dispatch already knows the receive-buffer shape; standalone callers may
+    # fall back to reading counts. Supplying output_size also avoids repeat's
+    # internal count synchronization.
+    total = int(num_tokens_per_expert.sum()) if total_received is None else total_received
     if total == 0:
         return counts.new_zeros(0, dtype=counts.dtype), num_tokens_per_expert
 
@@ -160,18 +165,15 @@ def _generate_permute_indices(
     # Counts in expert-major iteration order.
     counts_em = counts_2d.T.contiguous().view(-1)         # [E*R]
 
-    # ``repeat_interleave`` expands each block's src start to one entry per
-    # token in that block — gives the source position of each output token.
-    block_src_starts = src_offsets_em.repeat_interleave(counts_em)   # [total]
+    permuted_indices = try_generate_receive_indices(src_offsets_em, counts_em, total_received)
+    if permuted_indices is not None:
+        return permuted_indices, num_tokens_per_expert
 
-    # Destination block starts in expert-major order, then expanded.  The
-    # ``arange(total) - dst_block_starts_per_token`` produces 0..n-1 within
-    # each block, i.e. the intra-block offset.
-    dst_block_starts = counts_em.cumsum(0) - counts_em               # [E*R]
-    dst_block_starts_per_token = dst_block_starts.repeat_interleave(counts_em)
-    intra = torch.arange(0, total, device=counts.device) - dst_block_starts_per_token
-
-    permuted_indices = (block_src_starts + intra).long()
+    # A token's source index is its destination index plus the block offset.
+    # Expand the offset once, instead of expanding source and destination starts.
+    dst_block_starts = counts_em.cumsum(0) - counts_em
+    offsets = (src_offsets_em - dst_block_starts).repeat_interleave(counts_em, output_size=total)
+    permuted_indices = (torch.arange(total, device=counts.device) + offsets).long()
     return permuted_indices, num_tokens_per_expert
 
 
@@ -195,41 +197,27 @@ def _permute(x, tokens_per_expert_group, ep_degree: int, num_local_experts: int)
         - ``permuted_indices``: permutation indices (needed for
           :func:`_unpermute`).
         - ``num_tokens_per_expert``: token count per local expert.
+        - ``inverse_indices``: cached inverse row map, shared by combine and backward.
     """
     original_shape = x.shape
     permuted_indices, num_tokens_per_expert = _generate_permute_indices(
-        tokens_per_expert_group, num_local_experts, ep_degree
+        tokens_per_expert_group, num_local_experts, ep_degree, total_received=x.shape[0]
     )
-    # ``x[permuted_indices]`` works for empty indices too (returns a
-    # shape-0 tensor with a real grad_fn).  Avoid the early-return with
-    # ``new_zeros`` which would produce a leaf tensor without grad_fn and
-    # silently break autograd for ranks that happen to receive zero tokens.
-    permuted_x = x[permuted_indices]
-    return original_shape, permuted_x, permuted_indices, num_tokens_per_expert
+    inverse_indices = invert_permutation(permuted_indices)
+    # A real gather keeps the autograd edge even when this owner receives no rows.
+    permuted_x = permute_rows(x, permuted_indices, inverse_indices)
+    return original_shape, permuted_x, permuted_indices, num_tokens_per_expert, inverse_indices
 
 
-def _unpermute(out, original_shape, permuted_indices):
-    """Reverse the permutation applied by :func:`_permute`.
+def _unpermute(out, original_shape, permuted_indices, inverse_indices=None):
+    """Restore a bijective receive order without a high-dimensional scatter.
 
-    Args:
-        out: Expert-major output tensor of shape
-            ``[sum(num_tokens_per_expert), *feature_dims]``.
-        original_shape: Shape before permutation (from :func:`_permute`).
-        permuted_indices: Permutation indices from :func:`_permute`.
-
-    Returns:
-        Token tensor restored to the rank-major layout received after
-        all-to-all, with shape ``original_shape``.
+    Standalone callers may omit the cached inverse; dispatch contexts retain it
+    once and reuse it across output, input-gradient and probability-gradient rows.
     """
-    # ``result[permuted_indices] = out`` is a differentiable scatter that
-    # also handles the empty-index case (no-op assignment, but autograd
-    # still connects ``result`` back to ``out``).  Do NOT short-circuit
-    # with a bare ``new_zeros`` — that returns a leaf tensor without
-    # grad_fn and the downstream combine a2a loses its backward path,
-    # which manifests as "element 0 of tensors does not require grad".
-    result = out.new_zeros(*original_shape)
-    result[permuted_indices] = out
-    return result
+    if inverse_indices is None:
+        inverse_indices = invert_permutation(permuted_indices)
+    return permute_rows(out, inverse_indices, permuted_indices).reshape(original_shape)
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +255,7 @@ class DispatchContext:
     input_shape: Tuple[int, ...]
     permuted_indices: Any
     probs_input_shape: Optional[Tuple[int, ...]] = None
+    inverse_indices: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -617,7 +606,7 @@ class AllToAllTokenDispatcher:
         )
 
         # --- Step 4a: rank-major → expert-major permutation ---
-        input_shape, permuted, permuted_indices, local_counts = _permute(
+        input_shape, permuted, permuted_indices, local_counts, inverse_indices = _permute(
             dispatched, counts_out, ep_size, num_local_experts
         )
 
@@ -627,7 +616,7 @@ class AllToAllTokenDispatcher:
         probs_input_shape, permuted_probs_reordered = (
             AllToAllTokenDispatcher._exchange_and_reorder_probs(
                 permuted_probs, input_splits, output_splits,
-                counts_out, ep_size, num_local_experts, ep_group,
+                permuted_indices, inverse_indices, ep_group,
             )
         )
 
@@ -640,6 +629,7 @@ class AllToAllTokenDispatcher:
             output_splits=output_splits,
             input_shape=input_shape,
             permuted_indices=permuted_indices,
+            inverse_indices=inverse_indices,
             probs_input_shape=probs_input_shape,
         )
 
@@ -649,7 +639,7 @@ class AllToAllTokenDispatcher:
 
     @staticmethod
     def _exchange_and_reorder_probs(permuted_probs, input_splits, output_splits,
-                                    counts_out, ep_size, num_local_experts, ep_group):
+                                    permuted_indices, inverse_indices, ep_group):
         """Exchange ``permuted_probs`` via a2a and reorder to expert-major.
 
         Returns ``(probs_input_shape, permuted_probs_reordered)``; both are
@@ -662,10 +652,8 @@ class AllToAllTokenDispatcher:
             permuted_probs, input_splits, output_splits, group=ep_group,
         )
         # --- Step 4b: rank-major → expert-major permutation for probs ---
-        probs_input_shape, permuted_probs_reordered, _, _ = _permute(
-            dispatched_probs, counts_out, ep_size, num_local_experts
-        )
-        return probs_input_shape, permuted_probs_reordered
+        permuted_probs_reordered = permute_rows(dispatched_probs, permuted_indices, inverse_indices)
+        return dispatched_probs.shape, permuted_probs_reordered
 
     @staticmethod
     def combine(module: Module, routed_output: object, device_mesh: DeviceMesh, ctx: DispatchContext) -> object:
@@ -690,7 +678,7 @@ class AllToAllTokenDispatcher:
         ep_group = device_mesh.get_group()
 
         # expert-major → rank-major
-        unpermuted = _unpermute(routed_output, ctx.input_shape, ctx.permuted_indices)
+        unpermuted = _unpermute(routed_output, ctx.input_shape, ctx.permuted_indices, ctx.inverse_indices)
 
         # reverse all-to-all (output/input splits are swapped)
         combined = differentiable_all_to_all_single(
@@ -702,7 +690,7 @@ class AllToAllTokenDispatcher:
         return combined
 
     @staticmethod
-    def combine_start(routed_output, device_mesh, ctx):
+    def combine_start(routed_output: torch.Tensor, device_mesh: DeviceMesh, ctx: DispatchContext) -> AsyncHandle:
         """Launch async combine all-to-all without waiting for completion.
 
         Splits the combine into two phases so that the caller can overlap
@@ -728,7 +716,7 @@ class AllToAllTokenDispatcher:
         ep_group = device_mesh.get_group()
 
         # expert-major → rank-major (local, no communication)
-        unpermuted = _unpermute(routed_output, ctx.input_shape, ctx.permuted_indices)
+        unpermuted = _unpermute(routed_output, ctx.input_shape, ctx.permuted_indices, ctx.inverse_indices)
 
         # async reverse all-to-all (output/input splits are swapped)
         combined_async = differentiable_all_to_all_single_async(
@@ -741,7 +729,7 @@ class AllToAllTokenDispatcher:
         return AsyncHandle(combined_async)
 
     @staticmethod
-    def combine_wait(handle):
+    def combine_wait(handle: AsyncHandle) -> torch.Tensor:
         """Wait for the async combine all-to-all to complete.
 
         Args:
@@ -910,7 +898,7 @@ class DeredundencyTokenDispatcher:
             outer_routed_input, iep_input_splits, iep_output_splits,
             group=mesh_info.iep_group,
         )
-        input_shape, permuted, permuted_indices, local_counts = _permute(
+        input_shape, permuted, permuted_indices, local_counts, inverse_indices = _permute(
             dispatched, iep_counts_out, mesh_info.iep_size, num_local_experts,
         )
         ctx = DeredundencyDispatchContext(
@@ -918,6 +906,7 @@ class DeredundencyTokenDispatcher:
             output_splits=iep_output_splits,
             input_shape=input_shape,
             permuted_indices=permuted_indices,
+            inverse_indices=inverse_indices,
             dispatch_indices=dispatch_indices,
             router_coeff=outer_router_coeff,
             gathered_shape=gathered_routed.shape,
@@ -951,7 +940,7 @@ class DeredundencyTokenDispatcher:
         mesh_info = _get_deredundency_mesh_info(device_mesh)
         DeredundencyTokenDispatcher._validate_combine_mesh(mesh_info, ctx)
 
-        unpermuted = _unpermute(routed_output, ctx.input_shape, ctx.permuted_indices)
+        unpermuted = _unpermute(routed_output, ctx.input_shape, ctx.permuted_indices, ctx.inverse_indices)
         outer_output = differentiable_all_to_all_single(
             unpermuted,
             ctx.output_splits,
@@ -1012,7 +1001,7 @@ class DeredundencyTokenDispatcher:
         mesh_info = _get_deredundency_mesh_info(device_mesh)
         DeredundencyTokenDispatcher._validate_combine_mesh(mesh_info, ctx)
 
-        unpermuted = _unpermute(routed_output, ctx.input_shape, ctx.permuted_indices)
+        unpermuted = _unpermute(routed_output, ctx.input_shape, ctx.permuted_indices, ctx.inverse_indices)
         outer_output_async = differentiable_all_to_all_single_async(
             unpermuted,
             ctx.output_splits,
