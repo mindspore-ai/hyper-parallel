@@ -90,7 +90,11 @@ class TestCommunicationRuntime(unittest.TestCase):
         buffer = self.manager.bind(1, tensor)
         self.manager.copy_d2h(1)
         self.manager.release_device(1)
+        self.copy.wait_stream.reset_mock()
         self.manager.copy_h2d(1)
+        self.copy.wait_stream.assert_not_called()
+        self.d2h_event.wait.assert_any_call(self.copy)
+        self.h2d_event.record.assert_called_once_with(self.copy)
         self.h2d_event.wait.assert_not_called()
         self.h2d_event.synchronize.assert_not_called()
         host = buffer.host_buffer
@@ -229,9 +233,9 @@ class TestCommunicationRuntime(unittest.TestCase):
         executor.dispatch(torch.sum, (peak,), {})
         executor.dispatch(torch.zeros, (1,), {})
         self.assertIsNotNone(first._buffer.device_buffer)
+        first_sum = executor.dispatch(torch.sum, (first,), {})
         self.assertIsNotNone(second._buffer.device_buffer)
         self.assertIsNone(first._buffer.host_buffer)
-        first_sum = executor.dispatch(torch.sum, (first,), {})
         second_sum = executor.dispatch(torch.sum, (second,), {})
         torch.testing.assert_close(
             first_sum, torch.arange(60, dtype=torch.float32).sum(), rtol=0, atol=0

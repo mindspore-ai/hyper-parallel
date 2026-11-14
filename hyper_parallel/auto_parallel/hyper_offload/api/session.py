@@ -21,7 +21,7 @@ import logging
 from types import TracebackType
 
 import torch
-from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils._python_dispatch import TorchDispatchMode, _get_current_dispatch_mode_stack
 
 from hyper_parallel.auto_parallel.hyper_offload.api.config import OffloadConfig
 from hyper_parallel.auto_parallel.hyper_offload.api.scope import (
@@ -131,7 +131,15 @@ class OffloadSession:
     @staticmethod
     def get_active() -> OffloadSession | None:
         """Return the currently active OffloadSession, or ``None``."""
-        return _active_session.get()
+        session = _active_session.get()
+        if session is not None:
+            return session
+        # Autograd carries dispatch modes into worker threads, but Python
+        # context variables are not inherited by checkpoint recomputation.
+        for mode in reversed(_get_current_dispatch_mode_stack()):
+            if isinstance(mode, ActivationDispatchMode):
+                return mode.session
+        return None
 
     # ------------------------------------------------------------------
     # Context manager
@@ -208,12 +216,18 @@ class OffloadSession:
 
         if self.mode == "warmup":
             trace, guide = self.executor.finish()
+            if self._saved_recorder is not None:
+                SavedTensorReplay.add_planning_hints(self._saved_recorder, trace)
             schedule = self.planner.build(trace)
             if self._saved_recorder is not None:
                 self._saved_replay = SavedTensorReplay.from_trace(
                     self.residency_manager, self._saved_recorder, trace, schedule,
                 )
-            self.executor = ReplayExecutor(self.residency_manager, schedule, guide)
+            # Native hooks own the complete replay contract. Retaining the
+            # operator guide and its binding dictionaries only adds host memory
+            # and garbage-collector traversal to every subsequent iteration.
+            replay_guide = guide if self._saved_replay is None else []
+            self.executor = ReplayExecutor(self.residency_manager, schedule, replay_guide)
             self._saved_recorder = None
             self.mode = "replay"
             if not self.executor.requires_dispatch:

@@ -40,9 +40,14 @@ from hyper_parallel.auto_parallel.hyper_offload.planning import (
     PeakResidencyPlanner,
 )
 from hyper_parallel.auto_parallel.hyper_offload.planning._peak_model import (
+    EvictionGap,
     build_profile,
 )
-from hyper_parallel.auto_parallel.hyper_offload.planning.peak import ScoreWeights
+from hyper_parallel.auto_parallel.hyper_offload.planning.communication_mask import (
+    limit_prefetch_advance,
+    mask_communications,
+)
+from hyper_parallel.auto_parallel.hyper_offload.planning.peak import ScoreWeights, _choose_gap
 
 
 def make_trace(
@@ -156,6 +161,72 @@ class TestPeakResidencyPlanner(unittest.TestCase):
         ]
         return make_trace(rows, {1: 60, 2: 60, 3: 130}, 180)
 
+    def test_prefetch_uses_headroom_before_delaying_source_release(self):
+        resident = [100, 100, 40, 40, 40, 40, 40, 40, 100]
+        gap = EvictionGap(1, 60, 1, 8, 0, 0, 8)
+
+        placement = mask_communications([gap], resident, 100)[0]
+
+        self.assertEqual(placement.prefetch_before, 2)
+        self.assertEqual(placement.release_after, 1)
+        self.assertLessEqual(max(resident), 100)
+
+    def test_default_score_favors_bytes_over_tiny_long_lived_candidates(self):
+        """Cover the peak with a large interval before scheduling many tiny copies."""
+        small = EvictionGap(1, 1, 0, 20, 0, 0, 20)
+        large = EvictionGap(2, 100, 8, 12, 8, 8, 12)
+
+        chosen = _choose_gap([small, large], 10, [], ScoreWeights())
+
+        self.assertEqual(chosen, large, f"chosen={chosen}, expected={large}")
+
+    def test_timed_prefetch_reduces_idle_destinations_and_keeps_transfer_lead(self):
+        """Avoid holding a restored buffer throughout a long idle backward interval."""
+        resident = [100, 100] + [40] * 97 + [100]
+        gap = EvictionGap(1, 60, 1, 99, 0, 0, 99)
+        placements = mask_communications([gap], resident, 100)
+        before = list(resident)
+        bandwidth = 60 * 1000 / (2 * 1024**3)
+
+        limit_prefetch_advance(placements, resident, [1.0] * 100, bandwidth)
+
+        restore = placements[0].prefetch_before
+        self.assertGreaterEqual(restore, 90, f"restore={restore}, earliest_use=99")
+        self.assertLessEqual(restore, 97, f"restore={restore}, minimum_copy_lead=2")
+        self.assertEqual(resident[10], 40, f"resident={resident[10]}, expected=40")
+        self.assertTrue(all(new <= old for new, old in zip(resident, before)))
+
+    def test_timed_prefetch_accounts_for_serial_copy_queue(self):
+        """Overlapping consumers need lead for all copies on the shared stream."""
+        resident = [120, 120] + [0] * 97 + [120]
+        gaps = [EvictionGap(sid, 60, 1, 99, 0, 0, 99) for sid in (1, 2)]
+        placements = mask_communications(gaps, resident, 120)
+        bandwidth = 60 * 1000 / (2 * 1024**3)
+
+        limit_prefetch_advance(placements, resident, [1.0] * 100, bandwidth)
+
+        lead = sorted(99 - row.prefetch_before for row in placements)
+        self.assertGreaterEqual(lead[1] - lead[0], 8, f"lead={lead}, minimum_spacing=8")
+        self.assertLessEqual(max(resident), 120, f"peak={max(resident)}, budget=120")
+
+    def test_saved_gap_preference_preserves_budget_and_general_fallback(self):
+        """Prefer a saved activation while retaining other gaps when memory requires them."""
+        rows = [
+            [(1, AccessKind.WRITE)], [(2, AccessKind.WRITE)], [],
+            [(3, AccessKind.WRITE)], [(3, AccessKind.READ)], [], [], [],
+            [(1, AccessKind.READ)], [(2, AccessKind.READ)],
+        ]
+        for budget, expected in ((200, {1}), (150, {1, 2})):
+            with self.subTest(budget=budget):
+                trace = make_trace(rows, {1: 60, 2: 100, 3: 100}, budget)
+                trace.preferred_eviction_gaps = [(1, 0, 8)]
+                schedule = PeakResidencyPlanner().build(trace)
+                selected = {action.storage_id for actions in schedule.post.values()
+                            for action in actions if action.kind == Action.COPY_D2H}
+                self.assertEqual(selected, expected, f"selected={selected}, expected={expected}")
+                peak = max(simulate(self, trace, schedule))
+                self.assertLessEqual(peak, budget, f"peak={peak}, budget={budget}")
+
     def test_forward_delayed_release_and_backward_prefetch(self):
         trace = self.forward_backward_trace()
         schedule = PeakResidencyPlanner().build(trace)
@@ -181,7 +252,7 @@ class TestPeakResidencyPlanner(unittest.TestCase):
         self.assertEqual(positions(schedule, Action.RELEASE_DEVICE, 1), [4, 8])
         self.assertEqual(positions(schedule, Action.RELEASE_DEVICE, 2), [4, 9])
         for sid in (1, 2):
-            self.assertEqual(positions(schedule, Action.COPY_H2D, sid), [7])
+            self.assertEqual(positions(schedule, Action.COPY_H2D, sid), [sid + 6])
         self.assertLessEqual(max(simulate(self, trace, schedule)), 180)
         self.assertLessEqual(max(simulate(self, trace, schedule, complete_copies=True)), 180)
 
@@ -439,5 +510,9 @@ class TestPeakResidencyPlanner(unittest.TestCase):
                 self.assertTrue(all(early <= late for early, late in zip(completed_resident, timed_resident)))
                 self.assertTrue(all(early <= late for early, late in zip(timed_resident, actual)))
                 for sid in sizes:
-                    for kind in (Action.COPY_D2H, Action.COPY_H2D, Action.RELEASE_HOST):
-                        self.assertEqual(positions(timed, kind, sid), positions(masked, kind, sid))
+                    self.assertEqual(positions(timed, Action.COPY_D2H, sid), positions(masked, Action.COPY_D2H, sid))
+                    for kind in (Action.COPY_H2D, Action.RELEASE_HOST):
+                        before = positions(masked, kind, sid)
+                        after = positions(timed, kind, sid)
+                        self.assertEqual(len(after), len(before), f"after={after}, before={before}")
+                        self.assertTrue(all(new >= old for new, old in zip(after, before)))

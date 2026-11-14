@@ -47,7 +47,12 @@ class TraceOp:
 
 @dataclass
 class ActivationTrace:
-    """Scheduler input: ordered ops plus storage metadata."""
+    """Scheduler input: ordered ops plus storage metadata.
+
+    ``preferred_eviction_gaps`` contains optional ``(storage_id, start, end)``
+    preferences. A planner may prioritize these intervals to preserve native
+    autograd replay, but must retain its ordinary memory-budget constraints.
+    """
 
     ops: list[TraceOp] = field(default_factory=list)
     storage_sizes: dict[int, int] = field(default_factory=dict)
@@ -55,3 +60,4 @@ class ActivationTrace:
     memory_limit_bytes: int | None = None
     d2h_bandwidth_gbps: float = 16.0
     h2d_bandwidth_gbps: float = 16.0
+    preferred_eviction_gaps: list[tuple[int, int, int]] = field(default_factory=list)

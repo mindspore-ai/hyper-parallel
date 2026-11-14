@@ -172,6 +172,15 @@ class ReplayExecutor(BaseExecutor):
 
     def _dispatch_slow(self, func: Callable, args: tuple, kwargs: dict, index: int) -> Any:
         """Handle elided records and managed ownership boundaries."""
+        if self._managed_sids is not None and func.__name__ == "detach.default":
+            leaves, _ = tree_flatten((args, kwargs))
+            if not self._input_bindings(leaves) and (
+                index >= len(self._guide)
+                or self._dispatch_names[index] != "detach.default"
+            ):
+                # Checkpoint recomputation can add native detaches when fewer
+                # outputs are subclasses. They own no planned transfer state.
+                return func(*args, **kwargs)
         if index < len(self._guide) and self._framework_ops[index] and func.__name__ == self._dispatch_names[index]:
             if not self._active_ops[index]:
                 self.op_idx = index

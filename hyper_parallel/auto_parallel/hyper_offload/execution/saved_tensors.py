@@ -20,16 +20,17 @@ import weakref
 from bisect import bisect_left
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 
+from hyper_parallel.auto_parallel.hyper_offload.execution.native_saved_tensor import get_native_saved_tensor
 from hyper_parallel.auto_parallel.hyper_offload.execution.tensor import ShadowTensor
 from hyper_parallel.auto_parallel.hyper_offload.ir.schedule import ResidencyActionType as Action
 from hyper_parallel.auto_parallel.hyper_offload.ir.trace import AccessKind
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SavedSlot:
     """Metadata for a saved value; never owns the recorded activation."""
 
@@ -59,6 +60,7 @@ class SavedTensorRecorder:
         self.executor = executor
         self.slots: list[SavedSlot] = []
         self.unpacks: list[tuple[int, int]] = []
+        self.save_unpack_counts: list[int] = []
 
     def pack(self, tensor: torch.Tensor) -> tuple:
         """Record a save without retaining a tensor in the persistent guide.
@@ -70,6 +72,7 @@ class SavedTensorRecorder:
                else self.executor._tracker.get_activation_sid(tensor))
         index = len(self.slots)
         self.slots.append(SavedSlot(sid, tensor_metadata(tensor), self.executor.op_idx))
+        self.save_unpack_counts.append(len(self.unpacks))
         return index, tensor.detach(), tensor._version
 
     def unpack(self, packed: tuple) -> torch.Tensor:
@@ -85,20 +88,37 @@ class SavedTensorRecorder:
         return tensor
 
 
-@dataclass
+class NativeSavedValue(Protocol):
+    """Native and Python saved values expose the same replay access contract."""
+
+    slot_index: int | None
+
+    def unpack(self) -> torch.Tensor:
+        """Return a saved view after checking its shared version counter."""
+
+
+@dataclass(slots=True)
 class SavedNative:
     """Keep native autograd values detached and preserve mutation checks."""
 
     tensor: torch.Tensor
     version: int
+    slot_index: int | None = None
+
+    def unpack(self) -> torch.Tensor:
+        """Check mutations before returning a Python-managed saved view."""
+        if self.tensor._version != self.version:
+            raise RuntimeError("a tensor saved for backward was modified in place")
+        return self.tensor
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SavedActivation:
     """Reference moved storage without retaining its original device bytes."""
 
     storage_id: int
     metadata: tuple
+    slot_index: int | None = None
 
 
 class SavedTensorReplay:
@@ -118,6 +138,7 @@ class SavedTensorReplay:
             selected: Storage IDs selected by the unchanged planner.
         """
         self.manager = manager
+        self._native_saved_tensor = get_native_saved_tensor()
         self.slot_count = len(slots)
         self.slots = {index: slot for index, slot in enumerate(slots) if slot.storage_id in selected}
         self.selected = selected
@@ -132,14 +153,53 @@ class SavedTensorReplay:
         self._next_unpack = 0
         self._restored: set[int] = set()
         self._remaining_uses: dict[int, int] = dict(Counter(slot.storage_id for slot in self.slots.values()))
+        self._use_counts = dict(self._remaining_uses)
+        self.save_unpack_counts: list[int] | None = None
+        self.unpack_slots: list[int] | None = None
+        self._forward_slot_count = len(slots)
+
+    @staticmethod
+    def add_planning_hints(recorder: SavedTensorRecorder, trace: Any) -> None:
+        """Prefer immutable forward-save/backward-use gaps without relaxing budgets.
+
+        Args:
+            recorder: Completed autograd save and use recording.
+            trace: Planner input receiving optional candidate preferences.
+        """
+        if not recorder.unpacks:
+            return
+        backward = recorder.unpacks[0][1]
+        used = {recorder.slots[index].storage_id for index, _ in recorder.unpacks}
+        first_saves = {}
+        for slot in recorder.slots:
+            if slot.storage_id is not None and slot.storage_id in used and slot.op_id < backward:
+                first_saves.setdefault(slot.storage_id, slot.op_id)
+        positions, writes = {}, {}
+        for op_id, op in enumerate(trace.ops):
+            for access in op.accesses:
+                sid = access.storage_id
+                if sid not in first_saves:
+                    continue
+                rows = positions.setdefault(sid, [])
+                if not rows or rows[-1] != op_id:
+                    rows.append(op_id)
+                if access.kind == AccessKind.WRITE:
+                    writes.setdefault(sid, []).append(op_id)
+        for sid, accesses in positions.items():
+            boundary = bisect_left(accesses, backward)
+            if not 0 < boundary < len(accesses) or sid in trace.retained_sids:
+                continue
+            if not SavedTensorReplay._writes_are_immutable(first_saves[sid], writes.get(sid, []), trace):
+                continue
+            start, end = accesses[boundary - 1], accesses[boundary]
+            if end > start + 1:
+                trace.preferred_eviction_gaps.append((sid, start, end))
 
     @staticmethod
     def _immutable_save_slots(sid: int, recorder: SavedTensorRecorder, trace: Any) -> bool:
         slots = [index for index, slot in enumerate(recorder.slots) if slot.storage_id == sid]
         used = [index for index, _ in recorder.unpacks if index in slots]
-        if not slots or Counter(slots) != Counter(used):
-            return False
-        if any(recorder.slots[index].op_id >= recorder.unpacks[0][1] for index in slots):
+        if not used:
             return False
         return SavedTensorReplay._immutable_writes(sid, recorder.slots[slots[0]].op_id, trace)
 
@@ -147,12 +207,19 @@ class SavedTensorReplay:
     def _immutable_writes(sid: int, first_save: int, trace: Any) -> bool:
         writes = [op_id for op_id, op in enumerate(trace.ops)
                   if any(access.storage_id == sid and access.kind == AccessKind.WRITE for access in op.accesses)]
+        return SavedTensorReplay._writes_are_immutable(first_save, writes, trace)
+
+    @staticmethod
+    def _writes_are_immutable(first_save: int, writes: list[int], trace: Any) -> bool:
         aliases = {"detach.default", "view.default", "_unsafe_view.default", "alias.default", "t.default",
                    "transpose.int", "permute.default", "slice.Tensor", "select.int", "as_strided.default",
-                   "squeeze.default", "squeeze.dim", "unsqueeze.default", "expand.default"}
+                   "squeeze.default", "squeeze.dim", "unsqueeze.default", "expand.default",
+                   "split.Tensor", "split.sizes", "split_with_sizes.default", "unbind.int"}
         if not writes or writes[0] > first_save:
             return False
-        return all(trace.ops[op_id].name in aliases for op_id in writes[1:])
+        # Initialization can update storage before its first autograd save.
+        # Later writes must only create aliases of the saved bytes.
+        return all(op_id < first_save or trace.ops[op_id].name in aliases for op_id in writes[1:])
 
     @staticmethod
     def _copy_actions(schedule: Any) -> list:
@@ -186,6 +253,16 @@ class SavedTensorReplay:
         if not all(cls._immutable_save_slots(sid, recorder, trace) for sid in selected):
             return None
         replay = cls(manager, recorder.slots, selected)
+        replay.save_unpack_counts = getattr(recorder, "save_unpack_counts", None)
+        replay.unpack_slots = [index for index, _ in recorder.unpacks]
+        replay._forward_slot_count = (
+            replay.save_unpack_counts.count(0) if replay.save_unpack_counts is not None
+            else sum(slot.op_id < recorder.unpacks[0][1] for slot in recorder.slots)
+        )
+        replay._use_counts = dict(Counter(
+            recorder.slots[index].storage_id for index, _ in recorder.unpacks if index in replay.slots
+        ))
+        replay._remaining_uses = dict(replay._use_counts)
         replay._compile_prefetch(copies, recorder)
         replay._compile_releases(schedule, recorder)
         return replay
@@ -193,8 +270,12 @@ class SavedTensorReplay:
     @staticmethod
     def _forward_intervals(copies: list, recorder: SavedTensorRecorder) -> bool:
         first_backward = recorder.unpacks[0][1]
-        if any(slot.op_id >= first_backward for slot in recorder.slots):
-            return False
+        # Checkpoint recomputation can save additional aliases after backward
+        # starts. Each moved storage must still be saved in the forward.
+        for sid in {action.storage_id for action in copies}:
+            saves = [slot.op_id for slot in recorder.slots if slot.storage_id == sid]
+            if not saves or min(saves) >= first_backward:
+                return False
         for action in copies:
             if action.kind == Action.COPY_D2H and action.op_id >= first_backward:
                 return False
@@ -242,14 +323,14 @@ class SavedTensorReplay:
         self._pending_release.clear()
         self._next_unpack = 0
         self._restored.clear()
-        self._remaining_uses = dict(Counter(slot.storage_id for slot in self.slots.values()))
+        self._remaining_uses = dict(self._use_counts)
 
     def _retire_sources(self) -> None:
         for sid in tuple(self._pending_release):
             if self.manager.try_release_device(sid):
                 self._pending_release.remove(sid)
 
-    def pack(self, tensor: torch.Tensor) -> SavedNative | SavedActivation:
+    def pack(self, tensor: torch.Tensor) -> NativeSavedValue | SavedActivation:
         """Save unrelated values natively and move only planned immutable storage.
 
         Args:
@@ -257,15 +338,19 @@ class SavedTensorReplay:
         """
         index = self._next_slot
         self._next_slot += 1
-        if index >= self.slot_count or self._prefetched:
+        if index >= self.slot_count:
             raise RuntimeError("saved-tensor replay save sequence differs from warmup")
+        if self.save_unpack_counts is not None and self.save_unpack_counts[index] != self._next_unpack:
+            raise RuntimeError("saved-tensor replay save/use order differs from warmup")
         if self._pending_release:
             self._release_due_sources(index)
         slot = self.slots.get(index)
         if slot is None:
             if self._pending_release and index % 32 == 0:
                 self._retire_sources()
-            return SavedNative(tensor.detach(), tensor._version)
+            if self._native_saved_tensor is not None and type(tensor) is torch.Tensor:
+                return self._native_saved_tensor(tensor, index)
+            return SavedNative(tensor.detach(), tensor._version, index)
         if tensor_metadata(tensor) != slot.metadata:
             raise RuntimeError(f"saved-tensor replay metadata differs at slot={index}")
         sid = slot.storage_id
@@ -276,21 +361,28 @@ class SavedTensorReplay:
             self.manager.bind(sid, tensor)
             self.manager.copy_d2h(sid)
             self._pending_release.add(sid)
-        if self._bound[sid][0] != storage_id:
+        if sid in self._restored:
+            storage_id_expected = self.manager._residency[sid].device_storage()._cdata
+        else:
+            storage_id_expected = self._bound[sid][0]
+        if storage_id_expected != storage_id:
             raise RuntimeError(f"saved-tensor replay alias differs at slot={index}")
         self._bound[sid][1].append((weakref.ref(tensor), version))
-        return SavedActivation(sid, slot.metadata)
+        return SavedActivation(sid, slot.metadata, index)
 
     def _validate_forward(self) -> None:
-        if self._next_slot != self.slot_count or set(self._bound) != self.selected:
+        if self._next_slot != self._forward_slot_count or set(self._bound) != self.selected:
             raise RuntimeError("saved-tensor replay forward save count differs from warmup")
-        for sid, (_, versions) in self._bound.items():
-            for reference, version in versions:
-                tensor = reference()
-                if tensor is not None and tensor._version != version:
-                    raise RuntimeError("an offloaded saved tensor was modified in place")
-        self._release_due_sources(self.slot_count)
+        for sid in self._bound:
+            self._validate_versions(sid)
+        self._release_due_sources(self._next_slot)
         self._prefetched = True
+
+    def _validate_versions(self, sid: int) -> None:
+        for reference, version in self._bound[sid][1]:
+            tensor = reference()
+            if tensor is not None and tensor._version != version:
+                raise RuntimeError("an offloaded saved tensor was modified in place")
 
     def _prefetch(self, sid: int) -> None:
         self.manager.release_device(sid)
@@ -299,7 +391,7 @@ class SavedTensorReplay:
         self._pending_release.discard(sid)
         self._restored.add(sid)
 
-    def unpack(self, packed: SavedNative | SavedActivation) -> torch.Tensor:
+    def unpack(self, packed: NativeSavedValue | SavedActivation) -> torch.Tensor:
         """Prefetch at compiled backward anchors and resolve moved saved views.
 
         Args:
@@ -307,15 +399,18 @@ class SavedTensorReplay:
         """
         if not self._prefetched:
             self._validate_forward()
+        if self.unpack_slots is not None:
+            if (self._next_unpack >= len(self.unpack_slots)
+                    or packed.slot_index != self.unpack_slots[self._next_unpack]):
+                raise RuntimeError("saved-tensor replay unpack sequence differs from warmup")
         for sid in self.prefetch_at.get(self._next_unpack, ()):
             self._prefetch(sid)
         self._next_unpack += 1
-        if isinstance(packed, SavedNative):
-            if packed.tensor._version != packed.version:
-                raise RuntimeError("a tensor saved for backward was modified in place")
-            return packed.tensor
+        if not isinstance(packed, SavedActivation):
+            return packed.unpack()
         if packed.storage_id not in self._restored:
             raise RuntimeError("saved-tensor replay unpack sequence differs from warmup")
+        self._validate_versions(packed.storage_id)
         self._unpacked += 1
         shape, stride, offset, dtype, device = packed.metadata
         storage = self.manager._residency[packed.storage_id].device_storage()
@@ -330,7 +425,7 @@ class SavedTensorReplay:
 
     def finish(self) -> None:
         """Require the complete recorded step and release restored device storage."""
-        if self._next_slot != self.slot_count or self._unpacked != len(self.slots):
+        if self._next_slot != self.slot_count or self._unpacked != sum(self._use_counts.values()):
             raise RuntimeError("saved-tensor replay step differs from warmup")
         if self.unpack_count is not None and self._next_unpack != self.unpack_count:
             raise RuntimeError("saved-tensor replay backward use count differs from warmup")

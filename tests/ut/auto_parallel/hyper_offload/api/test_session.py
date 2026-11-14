@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import unittest
+from contextvars import Context
 from unittest.mock import patch
 
 import torch
@@ -35,6 +36,7 @@ from hyper_parallel.auto_parallel.hyper_offload.ir.schedule import (
     ResidencyActionType,
     ResidencySchedule,
 )
+from tests.common.mark_utils import arg_mark
 
 
 class _MockExecutorContext:
@@ -81,6 +83,7 @@ class _MockExecutorContext:
         self._patches.append(acc_stream_patch)
 
     def stop(self) -> None:
+        """Remove CPU accelerator replacements in reverse installation order."""
         for p in reversed(self._patches):
             p.stop()
 
@@ -89,10 +92,12 @@ class TestOffloadSessionLifecycle(unittest.TestCase):
     """OffloadSession enter/exit, warmup→replay transition, error cleanup."""
 
     def setUp(self) -> None:
+        """Install CPU accelerator replacements for each session test."""
         self._mock_ctx = _MockExecutorContext()
         self._mock_ctx.start()
 
     def tearDown(self) -> None:
+        """Restore accelerator helpers after each test."""
         self._mock_ctx.stop()
 
     def test_enter_exit_safe(self) -> None:
@@ -101,6 +106,19 @@ class TestOffloadSessionLifecycle(unittest.TestCase):
         with session:
             pass
         self.assertEqual(session.mode, "replay")
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_active_session_survives_autograd_context_boundary(self) -> None:
+        """Feature: Active session lookup in autograd worker contexts.
+
+        Description: Dispatch modes propagate while Python context variables do not.
+        Expectation: Recover the active session only while its dispatch mode is installed.
+        """
+        session = OffloadSession(OffloadConfig())
+        with session:
+            active = Context().run(OffloadSession.get_active)
+            self.assertIs(active, session)
+        self.assertIsNone(Context().run(OffloadSession.get_active))
 
     def test_context_manager_entry_point(self) -> None:
         """The context manager should return the session itself."""
@@ -171,7 +189,8 @@ class TestOffloadSessionLifecycle(unittest.TestCase):
         class _RaisesOnForward(torch.nn.Module):
             """Module that raises during forward."""
 
-            def forward(self, x):
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                """Raise a model error to exercise session cleanup."""
                 raise ValueError("boom")
 
         model = _RaisesOnForward()
