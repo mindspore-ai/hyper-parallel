@@ -64,3 +64,33 @@ def test_pp_plus_fully_shard_vpp_dxdw_split():
         "test_pp_hsdp_vpp_dxdw_split_matches_reference",
         num_proc=8,
     )
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b", "platform_gpu"], level_mark="level1",
+    card_mark="allcards", essential_mark="essential",
+)
+def test_pp_hsdp_checkpoint_concurrent_overlap():
+    """Validate policies with checkpointing and a genuine backward worker thread."""
+    torchrun_case(_WORKER, "test_pp_hsdp_policies_checkpoint_overlap_matches_reference", num_proc=8)
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b", "platform_gpu"], level_mark="level1",
+    card_mark="allcards", essential_mark="essential",
+)
+def test_pp_hsdp_gpipe_and_1f1b(monkeypatch):
+    """Validate ordinary schedules on PP=4/HSDP=(1,2)."""
+    monkeypatch.setenv("HSDP_VPP_PP_SIZE", "4")
+    monkeypatch.setenv("HSDP_VPP_DP_SIZE", "1")
+    monkeypatch.setenv("HSDP_VPP_FSDP_SIZE", "2")
+    torchrun_case(_WORKER, "test_pp_hsdp_gpipe_1f1b_matches_reference", num_proc=8)
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b", "platform_gpu"], level_mark="level1",
+    card_mark="allcards", essential_mark="essential",
+)
+def test_pp_hsdp_nested_units_with_checkpoint():
+    """Validate an empty HSDP root over multiple parameter-management units."""
+    torchrun_case(_WORKER, "test_pp_hsdp_nested_units_checkpoint_matches_reference", num_proc=8)

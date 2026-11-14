@@ -20,8 +20,7 @@ using the ``examples/torch/llama3`` Llama3 PP stage layout:
 * **Distributed** — 3-D mesh ``(pp=2, fsdp=2, tp=2)`` on 8 ranks, ``Schedule1F1B``,
   ``parallelize_llama3`` on ``mesh["tp"]``, and nested ``fully_shard`` on every trainable
   submodule (``tok_embeddings``, decoder blocks, ``norm``, ``output``) over
-  ``mesh["fsdp"]``.  Stage root stays unwrapped (see ``pp_fsdp_tp_cp_sp_example``) so
-  Torch PP scheduler FSDP MetaSteps do not conflict with nested autograd hooks.
+  ``mesh["fsdp"]``. Each stage root is also wrapped so its units share one runtime context.
 * **Reference** — full ``Llama3Model`` on every rank; each step runs one forward +
   sum-CE + backward on the **same** global ``(tokens, targets)`` mini-batch.
 
@@ -33,6 +32,8 @@ from the last PP stage against an in-process single-card ``Llama3Model`` baselin
 from __future__ import annotations
 
 import os
+from contextlib import nullcontext
+from unittest.mock import patch
 
 
 from typing import Iterable, List, Optional
@@ -41,10 +42,9 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-import torch_npu
 from torch import nn, optim
 
-from hyper_parallel import DTensor, SkipDTensorDispatch, fully_shard, init_device_mesh
+from hyper_parallel import DTensor, SkipDTensorDispatch, fully_shard, init_device_mesh, distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.core.pipeline_parallel.scheduler import Schedule1F1B
 
@@ -55,8 +55,9 @@ from tests.torch.pipeline_parallel.pipeline import (
     build_pipeline_stage,
     load_pp_chunk_from_reference,
     split_batch_dim0,
+    layer_range_for_pp_stage,
 )
-from tests.torch.utils import init_dist
+from tests.torch.pipeline_parallel.hsdp_overlap import initialize_device
 
 _BATCH_SIZE = 8
 _SEQ_LEN = 16
@@ -140,10 +141,15 @@ def _reporter_global_rank(pp_size: int, fsdp_size: int, tp_size: int) -> int:
 
 
 def _shard_module(module: nn.Module, fsdp_mesh) -> None:
-    """Apply ``fully_shard`` to ``module`` and configure sum gradient reduction."""
+    """Normalize the repeated DP batch and the TP-replicated scalar loss.
+
+    Differentiable TP AllGather sums backward contributions from every TP
+    rank. Each rank evaluates the same scalar cross-entropy, so its multiplicity
+    must be removed along with the repeated batch across FSDP ranks.
+    """
     fully_shard(module, mesh=fsdp_mesh, reshard_after_forward=True)
-    if hasattr(module, "set_reduce_op_type"):
-        module.set_reduce_op_type("sum")
+    module.set_reduce_op_type("sum")
+    module.set_gradient_scaling_factor(1.0 / (_FSDP_SIZE * _TP_SIZE))
 
 
 def _fsdp_trainable_modules(stage_module: nn.Module) -> Iterable[nn.Module]:
@@ -160,11 +166,11 @@ def _fsdp_trainable_modules(stage_module: nn.Module) -> Iterable[nn.Module]:
 def _apply_fsdp_all_params(stage_module: nn.Module, fsdp_mesh) -> None:
     """``fully_shard`` every trainable submodule so all parameters become ``DTensor``.
 
-    The stage root stays a plain ``nn.Module`` (see ``pp_fsdp_tp_cp_sp_example``) so
-    ``Schedule1F1B`` does not inject conflicting root-level FSDP MetaSteps.
+    A parameter-free HSDP root coordinates the nested management units.
     """
     for module in _fsdp_trainable_modules(stage_module):
         _shard_module(module, fsdp_mesh)
+    _shard_module(stage_module, fsdp_mesh)
 
 
 def _assert_all_params_are_dtensor(stage_module: nn.Module, pp_rank: int) -> None:
@@ -381,7 +387,8 @@ def _assert_pp_fsdp_tp_1f1b_match_reference(
     drift summary on rank 0 (no tolerance assertion).  When ``print_drift_summary`` is
     ``True`` and tolerances are set, assert first then print error statistics on rank 0.
     """
-    rank, device_id = init_dist()
+    device = initialize_device()
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
     expected_world = _PP_SIZE * _FSDP_SIZE * _TP_SIZE
     if world_size != expected_world:
@@ -392,7 +399,6 @@ def _assert_pp_fsdp_tp_1f1b_match_reference(
             )
         return
 
-    device = torch.device("npu", device_id)
     cfg = _build_config()
     if cfg.n_layers < _PP_SIZE:
         raise AssertionError(f"n_layers ({cfg.n_layers}) must be >= pp_size ({_PP_SIZE}).")
@@ -404,7 +410,7 @@ def _assert_pp_fsdp_tp_1f1b_match_reference(
         raise AssertionError("batch_size must divide micro_batch_num.")
 
     mesh = init_device_mesh(
-        device_type="npu",
+        device_type=device.type,
         mesh_shape=(_PP_SIZE, _FSDP_SIZE, _TP_SIZE),
         mesh_dim_names=("pp", "fsdp", "tp"),
     )
@@ -423,7 +429,12 @@ def _assert_pp_fsdp_tp_1f1b_match_reference(
     load_pp_chunk_from_reference(stage_chunk, reference, pp_rank, _PP_SIZE)
 
     parallelize_llama3(stage_chunk, tp_mesh)
-    _apply_fsdp_all_params(stage_chunk, fsdp_mesh)
+    device_resolution = (
+        patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh", return_value=device)
+        if device.type == "cpu" else nullcontext()
+    )
+    with device_resolution:
+        _apply_fsdp_all_params(stage_chunk, fsdp_mesh)
     _assert_all_params_are_dtensor(stage_chunk, pp_rank)
 
     pipeline_stage = build_pipeline_stage(
@@ -439,6 +450,16 @@ def _assert_pp_fsdp_tp_1f1b_match_reference(
     dist_optimizer = optim.SGD(stage_chunk.parameters(), lr=_LR)
     single_card_model = _build_reference_model(cfg, device)
     single_card_optimizer = optim.SGD(single_card_model.parameters(), lr=_LR)
+    reference_parameters = dict(single_card_model.named_parameters())
+    stage_references = {}
+    layer_start, _ = layer_range_for_pp_stage(pp_rank, cfg.n_layers, _PP_SIZE)
+    for name, param in stage_chunk.named_parameters():
+        if name.startswith("layers."):
+            _, layer_index, suffix = name.split(".", 2)
+            reference_name = f"layers.{layer_start + int(layer_index)}.{suffix}"
+        else:
+            reference_name = name
+        stage_references[name] = (param, reference_parameters[reference_name])
 
     distributed_losses: List[float] = []
     single_card_losses: List[float] = []
@@ -478,9 +499,26 @@ def _assert_pp_fsdp_tp_1f1b_match_reference(
         distributed_losses.append(dist_loss)
         single_card_losses.append(single_card_loss)
 
+        if rtol is not None and atol is not None:
+            for name, (param, reference_param) in stage_references.items():
+                if param.grad is None:
+                    raise AssertionError(f"{case_name}: rank={rank}, step={step}, missing parameter gradient")
+                reference_grad = distribute_tensor(reference_param.grad, param.device_mesh, param.placements)
+                torch.testing.assert_close(
+                    param.grad.to_local(), reference_grad.to_local(), rtol=rtol, atol=atol,
+                    msg=f"{case_name}: rank={rank}, step={step}, parameter={name}, gradient mismatch",
+                )
+
         with SkipDTensorDispatch():
             dist_optimizer.step()
             single_card_optimizer.step()
+        if rtol is not None and atol is not None:
+            for name, (param, reference_param) in stage_references.items():
+                reference_weight = distribute_tensor(reference_param.detach(), param.device_mesh, param.placements)
+                torch.testing.assert_close(
+                    param.to_local(), reference_weight.to_local(), rtol=rtol, atol=atol,
+                    msg=f"{case_name}: rank={rank}, step={step}, parameter={name}, weight mismatch",
+                )
 
     if rtol is not None and atol is not None:
         _assert_loss_trajectory_matches_single_card(

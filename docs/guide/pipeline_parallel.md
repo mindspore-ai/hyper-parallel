@@ -76,22 +76,79 @@ losses = schedule.run(local_batch)
 
 ---
 
-## PP+FSDP Integration
+## PP+FSDP/HSDP Integration
 
-Use FSDP inside each PP stage to shard parameters and further reduce per-device memory usage:
+Wrap each stage root with `fully_shard()` before constructing `PipelineStage`.
+Nested units and `fully_shard([module1, module2])` are supported within that root;
+a grouped scheduler is registered once. Ordinary and sharded stages may coexist,
+but a plain stage root containing sharded children is rejected. Different stages
+must own separate schedulers, parameter wrappers, and mutable parameter storage.
+Tied weights across stages use independent copies and `SharedParameterInfo`.
+
+Initialize each local chunk in this order: wrap and materialize parameters on the
+application's device, set residency/synchronization and prefetch options, construct
+its stage, then construct the schedule. Parameter identity, wrapping, and communication
+groups must remain stable after construction.
 
 ```python
-from hyper_parallel import PipelineStage, Schedule1F1B, fully_shard, init_device_mesh
+from hyper_parallel import PipelineStage, ScheduleInterleaved1F1B, fully_shard, init_device_mesh
 
-mesh = init_device_mesh("npu", (pp_size, dp_size), mesh_dim_names=("pp", "dp"))
-
-# Apply FSDP inside each PP stage.
-for stage_model in split_models:
-    fully_shard(stage_model, mesh=mesh["dp"])
-
-# PipelineStage supports FSDP integration through MetaStep.
-stage = PipelineStage(stage_model, stage_index, stage_num=pp_size)
+mesh = init_device_mesh(
+    "npu", (pp_size, replicate_size, shard_size),
+    mesh_dim_names=("pp", "replicate", "shard"),
+)
+parameter_mesh = mesh["replicate", "shard"]
+stages = []
+for stage_index, stage_model in local_model_chunks:
+    fully_shard(stage_model, mesh=parameter_mesh)
+    stage_model.set_reshard_after_forward(True)
+    stage_model.set_reshard_after_backward(True)
+    stage_model.set_requires_gradient_sync(True)
+    stages.append(PipelineStage(
+        stage_model, stage_index, total_stage_num, device=device,
+        group=mesh["pp"].get_group(), mesh=mesh["pp"],
+    ))
+schedule = ScheduleInterleaved1F1B(stages, micro_batch_num=8)
 ```
+
+For pure FSDP, pass a one-dimensional parameter mesh. The three existing settings
+are independent; their selected values give these common configurations:
+
+| Configuration | Reshard after forward | Reshard after backward | Gradient synchronization |
+| --- | --- | --- | --- |
+| ZeRO1 | `False` | `False` | `False` |
+| ZeRO2 | `False` | `False` | `True` |
+| ZeRO3 | `True` | `True` | `True` |
+| Rebuild parameters, synchronize at the end | `True` | `True` | `False` |
+
+The schedule preserves `fully_shard()` defaults and per-unit user settings, including
+settings made with `recurse=False`. It forces gradient synchronization and replica
+AllReduce on each stage's last completed backward, determined from completed microbatch
+identities rather than their numerical order. Earlier backwards disable replica
+AllReduce. Parameters referenced by unfinished split weight backwards or explicitly
+retained by an overlap callback temporarily remain unsharded.
+
+Full backwards retain the module backward hooks. During a pipeline run, those hooks
+delegate gradient processing to the PP communication controller, which calls the
+existing HSDPState preparation and communication primitives. Parameter-owning units
+keep the module-level ReduceScatter pipeline; empty units leave their children's tail
+communication for later computation or finalization. Standalone FSDP keeps its existing
+`post_backward()` path.
+
+Split input backwards retain their graphs without gradient communication; weight
+backwards submit a batch of reductions after all weight calculations finish. Parameter
+AllGather follows normal module hooks and user-configured prefetch. There are no FSDP
+MetaSteps or schedule strategy arguments. After communication completes, the schedule
+restores stable parameter shards, original settings, and ordinary backward processing
+before shared-parameter gradient synchronization.
+Optimizer updates and checkpoint operations belong after a successful `schedule.run()`.
+Gradients for `ignored_params` remain the caller's responsibility.
+
+This combination supports GPipe, 1F1B, interleaved 1F1B, and non-reentrant activation
+checkpointing. Managed stages require backward execution. Communication fusion,
+parameter/optimizer offload, activation swap combined with sharding, MPipe, and
+`torch.compile` are unsupported. Ordinary pipeline activation swap and standalone
+FSDP/HSDP retain their own supported configurations.
 
 ---
 

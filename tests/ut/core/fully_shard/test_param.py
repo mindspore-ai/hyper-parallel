@@ -585,7 +585,7 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
     def test_init_unsharded_param_requires_single_buffer(self):
         """Stable unsharded parameter initialization should require exactly one buffer."""
         hsdp_param = _new_param()
-        hsdp_param.unsharded_param_buffers = []
+        hsdp_param.unsharded_param_buffers = [torch.empty(1), torch.empty(1)]
 
         with self.assertRaisesRegex(AssertionError, "Expected 1 unsharded_param_buffer"):
             hsdp_param.init_unsharded_param()
@@ -598,7 +598,8 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         hsdp_param.all_reduce_comm_ctx.all_reduce_output = "ar"
         hsdp_param.all_reduce_comm_ctx.all_reduce_handle = MagicMock()
 
-        self.assertEqual(hsdp_param.reduce_scatter_output(), "rs")
+        hsdp_param.wait_reduce_scatter()
+        self.assertEqual(hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output, "rs")
         self.assertEqual(hsdp_param.all_reduce_output(), "ar")
         self.assertIsNone(hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_handle)
         self.assertIsNone(hsdp_param.all_reduce_comm_ctx.all_reduce_handle)
@@ -623,7 +624,7 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
             hsdp_param.sharded_param.grad._local_tensor,
             torch.tensor([1.0, 2.0], dtype=torch.float16),
         )
-        self.assertIsNone(hsdp_param._unsharded_param.grad)
+        torch.testing.assert_close(hsdp_param._unsharded_param.grad, torch.ones(2))
 
         hsdp_param._unsharded_param.grad = torch.ones(2)
         hsdp_param.apply_reduced_grad(torch.tensor([3.0, 4.0]))
@@ -645,6 +646,35 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
 
         torch.testing.assert_close(hsdp_param.sharded_param.main_grad._local_tensor, torch.tensor([3.0, 4.0]))
         self.assertIsNone(hsdp_param.sharded_param.grad)
+
+    def test_offload_application_preserves_current_full_gradient_slots(self):
+        """Old-result CPU assignment/accumulation must leave the next backward's gradients intact."""
+        for main_grad, existing_grad in product((False, True), (False, True)):
+            with self.subTest(main_grad=main_grad, existing_grad=existing_grad):
+                hsdp_param = _new_param()
+                hsdp_param.offload_to_cpu = True
+                hsdp_param.pin_memory = True
+                hsdp_param.apply_grad_on_fp32_main_grad = main_grad
+                hsdp_param.to_sharded_dtensor = MagicMock(
+                    side_effect=lambda tensor: SimpleNamespace(_local_tensor=tensor.clone())
+                )
+                hsdp_param.sharded_param.main_grad = None
+                if existing_grad:
+                    if main_grad:
+                        hsdp_param.sharded_param.main_grad = SimpleNamespace(_local_tensor=torch.ones(2))
+                    else:
+                        hsdp_param.sharded_param.grad = SimpleNamespace(_local_tensor=torch.ones(2))
+                full_grad = torch.tensor([7.0, 8.0])
+                accumulated_grad = torch.tensor([9.0, 10.0])
+                hsdp_param.unsharded_param.grad = full_grad
+                hsdp_param.unsharded_accumulated_grad = accumulated_grad
+
+                self.assertTrue(hsdp_param.apply_reduced_grad(torch.tensor([2.0, 3.0])))
+
+                applied = hsdp_param.sharded_param.main_grad if main_grad else hsdp_param.sharded_param.grad
+                torch.testing.assert_close(applied._local_tensor, torch.tensor([2.0, 3.0]) + int(existing_grad))
+                self.assertIs(hsdp_param.unsharded_param.grad, full_grad)
+                self.assertIs(hsdp_param.unsharded_accumulated_grad, accumulated_grad)
 
     @patch("hyper_parallel.core.fully_shard.hsdp_param.dist.all_reduce")
     def test_all_reduce_grad_single_rank_and_mocked_multi_rank(self, mock_all_reduce):
@@ -670,13 +700,16 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
     @patch("hyper_parallel.core.fully_shard.hsdp_param.dist.reduce_scatter_tensor")
     def test_reduce_scatter_grad_skips_size_one_meshes(self, mock_reduce_scatter):
         """Size-one DP meshes should reduce a retained grad after the parameter is resharded."""
-        for mesh_shape, use_output_buffer in product(((1,), (1, 1)), (False, True)):
-            with self.subTest(mesh_shape=mesh_shape, use_output_buffer=use_output_buffer):
+        for mesh_shape, use_output_buffer, transposed in product(((1,), (1, 1)), (False, True), (False, True)):
+            with self.subTest(mesh_shape=mesh_shape, use_output_buffer=use_output_buffer, transposed=transposed):
                 hsdp_param = _new_param()
                 hsdp_param.shard_world_size = 1
                 hsdp_param._orig_size = torch.Size((4,))
                 hsdp_param.sharded_size = torch.Size((4,))
-                hsdp_param._unsharded_param.grad = torch.arange(4, dtype=torch.float32)
+                grad = torch.arange(4, dtype=torch.float32).view(2, 2)
+                hsdp_param._unsharded_param.grad = grad.t() if transposed else grad
+                expected_output = hsdp_param._unsharded_param.grad.flatten().clone()
+                grad = None
                 source_storage = weakref.ref(hsdp_param._unsharded_param.grad.untyped_storage())
                 output_buffer = torch.empty(4) if use_output_buffer else None
 
@@ -685,10 +718,10 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
                 self.assertIsNone(hsdp_param._grad)
                 torch.testing.assert_close(
                     hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output,
-                    torch.arange(4, dtype=torch.float32),
+                    expected_output,
                 )
                 self.assertIsNone(hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_handle)
-                if use_output_buffer:
+                if use_output_buffer or transposed:
                     self.assertIsNone(source_storage())
                 else:
                     self.assertIs(
@@ -728,16 +761,19 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         expectation: Copied source storage is released before communication; input values stay valid.
         feature: FSDP gradient memory release.
         """
-        for shard_dim, reduce_dtype, accumulate, async_op in product(
-            (0, 1), (None, torch.float32), (False, True), (False, True)
+        for shard_dim, reduce_dtype, accumulate, async_op, transposed in product(
+            (0, 1), (None, torch.float32), (False, True), (False, True), (False, True)
         ):
-            with self.subTest(shard_dim=shard_dim, reduce_dtype=reduce_dtype, accumulate=accumulate, async_op=async_op):
+            with self.subTest(shard_dim=shard_dim, reduce_dtype=reduce_dtype, accumulate=accumulate,
+                              async_op=async_op, transposed=transposed):
                 hsdp_param = _new_param()
                 hsdp_param.hsdp_placement = Shard(shard_dim)
                 hsdp_param.reduce_dtype = reduce_dtype
                 hsdp_param.mesh_info.shard_process_group = "shard-group"
                 hsdp_param.padded_sharded_param_size = torch.Size((2, 4) if shard_dim == 0 else (4, 2))
                 grad = torch.arange(16, dtype=torch.bfloat16).view(4, 4)
+                if transposed:
+                    grad = grad.t()
                 source_storage = weakref.ref(grad.untyped_storage())
                 expected_input = torch.cat(torch.chunk(grad, 2, dim=shard_dim), dim=0).flatten()
                 expected_input = expected_input.to(reduce_dtype or grad.dtype)
@@ -757,7 +793,7 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
                     **kwargs: object,
                 ) -> Optional[MagicMock]:
                     """Check storage ownership at collective launch and simulate its output."""
-                    if hsdp_param.hsdp_placement.dim != 0 or hsdp_param.reduce_dtype is not None:
+                    if hsdp_param.hsdp_placement.dim != 0 or hsdp_param.reduce_dtype is not None or transposed:
                         self.assertIsNone(source_storage())
                     else:
                         self.assertIs(source_storage(), reduce_input.untyped_storage())
@@ -777,8 +813,9 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
                     work.wait.side_effect = partial(torch.testing.assert_close, hsdp_param._grad, expected_input)
                 else:
                     self.assertIsNone(hsdp_param._grad)
+                hsdp_param.wait_reduce_scatter()
                 torch.testing.assert_close(
-                    hsdp_param.reduce_scatter_output(),
+                    hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output,
                     expected_input[:8],
                 )
                 self.assertIsNone(hsdp_param._grad)
