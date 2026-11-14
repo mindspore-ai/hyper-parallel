@@ -1,8 +1,8 @@
-numpy>=1.26.0,<2.0.0
+numpy>=1.26.0,<3.0.0
 torchdata>=0.10.0
 PyYAML>=6.0.1
-pybind11>=2.11.1
-datasets>=2.16.0
+pybind11>=2.12.0
+datasets>=2.21.0
 psutil>=5.9.6
 tqdm>=4.62.1
 
