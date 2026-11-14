@@ -30,6 +30,7 @@ from torch.distributed.utils import _replace_by_prefix
 from hyper_parallel.core.activation_memory.policy import CheckpointPolicy
 from hyper_parallel.core.activation_memory.pinned_memory_pool import PinnedMemoryPool
 from hyper_parallel.core.activation_memory.recompute_state import get_recompute_state
+from hyper_parallel.core.activation_memory.sac import _suspend_sac
 from hyper_parallel.core.activation_memory.swap import SwapManager, SwapTensor, Storage
 from . import checkpoint_exclude as _checkpoint_exclude
 from .reentrant_exclude import current_frame, run_exclude
@@ -614,12 +615,23 @@ class CheckpointExcludeWrapper(ActivationWrapper):
         """Execute normally outside recompute and return the cached output in recompute."""
         wrapped_module = cast(Callable[..., Any], self._wrapped_module)
         frame = current_frame()
-        if frame is not None:
-            return run_exclude(self, wrapped_module, args, kwargs, frame)
         state = get_recompute_state()
-        if state is None:
+        if frame is None and state is None:
             return wrapped_module(*args, **kwargs)
-        cache = state.get_resource(_checkpoint_exclude._EXCLUDE_CACHE_KEY, _checkpoint_exclude._ExcludeCache)
+        cache = (
+            frame.exclude_cache if frame is not None
+            else state.get_resource(_checkpoint_exclude._EXCLUDE_CACHE_KEY, _checkpoint_exclude._ExcludeCache)
+        )
+        with _suspend_sac(cache):
+            if frame is not None:
+                return run_exclude(self, wrapped_module, args, kwargs, frame)
+            return self._run_excluded(state, cache, wrapped_module, args, kwargs)
+
+    def _run_excluded(
+        self, state: Any, cache: _checkpoint_exclude._ExcludeCache,
+        wrapped_module: Callable, args: tuple, kwargs: dict,
+    ) -> Any:
+        """Manage the region's cache without adding entries to the parent SAC cache."""
         if state.is_recomputing:
             entry = cache.pop(id(self))
             _checkpoint_exclude._restore_rng_state(entry.rng_state)

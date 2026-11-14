@@ -18,7 +18,7 @@ from collections import defaultdict, deque
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import cached_property, lru_cache
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, Iterator, List, Optional, Tuple
 
 import torch
 
@@ -178,6 +178,12 @@ class _ExcludeCache:
         if not entries:
             self._entries.pop(wrapper_id)
         return entry
+
+    def output_tensors(self) -> Iterator[torch.Tensor]:
+        """Yield saved output tensors whose storage is reused in replay."""
+        for entries in self._entries.values():
+            for entry in entries:
+                yield from _iter_tensor_leaves(entry.output)
 
     def clear(self) -> None:
         """Release outputs not consumed because recomputation stopped early."""
