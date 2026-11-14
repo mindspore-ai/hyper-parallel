@@ -16,10 +16,12 @@
 
 import contextlib
 import copy
+import inspect
 import os
 import types
 import unittest
 from types import SimpleNamespace
+from typing import Any, Callable, Sequence
 from unittest import mock
 
 os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
@@ -29,21 +31,14 @@ from torch.optim import optimizer as torch_optimizer
 
 from hyper_parallel import DTensor, Replicate
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
-from hyper_parallel.core.optimizer import Muon, SwapOptimizerConfig, swap_optimizer
+from hyper_parallel.core.optimizer import (Muon, SwapOptimizerConfig,
+                                           swap_optimizer)
+from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
 from hyper_parallel.core.optimizer.swap_optimizer_base import (
-    PipelineSwapRuntime,
-    StateSwapAdapter,
-    SwapSlot,
-    SwapUpdateUnit,
-    UpdateUnit,
-    _PackedBatchPlan,
-    _PackedBatchRegion,
-    _StagingArena,
-    _iter_unique_events,
-    _iter_unique_slot_objects,
-    _iter_unique_slots,
-    validate_state_keys,
-)
+    PipelineSwapRuntime, StateSwapAdapter, SwapOptimizer, SwapSlot, SwapUpdateUnit,
+    UpdateUnit, _iter_unique_events, _iter_unique_slot_objects,
+    _iter_unique_slots, _PackedBatchPlan, _PackedBatchRegion, _StagingArena,
+    validate_state_keys)
 
 # Real Torch allocators, captured before the tests patch them for CPU-only runs.
 _TORCH_EMPTY = torch.empty
@@ -1974,11 +1969,38 @@ class TestSwapRuntimeStreamHooks(unittest.TestCase):
         self.runtime.record_event.assert_called_once_with("compute")
 
 
-class TestSwapOptimizerHookGuard(unittest.TestCase):
-    """Reject unsupported step hooks before swap side effects."""
+class TestSwapOptimizerStepHooks(unittest.TestCase):
+    """Step hooks remain active across swap wrapper construction and execution."""
 
-    def test_existing_hooks_are_rejected_before_runtime(self):
-        """Existing instance and global hooks fail before swap construction."""
+    def test_step_signature_uses_optional_closure(self):
+        """The wrapper exposes the same closure parameter shape as Torch optimizers."""
+        actual = inspect.signature(SwapOptimizer.step).parameters
+        expected = inspect.signature(torch.optim.Optimizer.step).parameters
+
+        self.assertEqual(tuple(actual), ("self", "closure"))
+        self.assertEqual(actual["closure"].kind, expected["closure"].kind)
+        self.assertIsNone(actual["closure"].default)
+
+    def test_non_none_closure_is_rejected_before_pre_hooks(self):
+        """An unsupported closure cannot trigger hooks or optimizer updates."""
+        param = torch.nn.Parameter(torch.ones(2, 2))
+        optimizer = torch.optim.AdamW([param], lr=0.01)
+        wrapped = swap_optimizer(
+            optimizer,
+            SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False),
+        )
+        pre_hook = mock.Mock(return_value=None)
+        handle = optimizer.register_step_pre_hook(pre_hook)
+        self.addCleanup(handle.remove)
+
+        with self.assertRaisesRegex(ValueError, "does not support closure"):
+            wrapped.step(closure=lambda: None)
+
+        pre_hook.assert_not_called()
+        self.assertEqual(dict(optimizer.state), {})
+
+    def test_existing_instance_and_global_hooks_are_dispatched(self):
+        """Hooks registered before wrapping execute around the swap step."""
         config = SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False)
         cases = ((torch.optim.AdamW, "leaf", "pre"), (Muon, "leaf", "post"),
                  (torch.optim.AdamW, "global", "pre"), (torch.optim.AdamW, "global", "post"))
@@ -1988,23 +2010,354 @@ class TestSwapOptimizerHookGuard(unittest.TestCase):
                 optimizer = optimizer_type([param], lr=0.01)
                 register = (getattr(torch_optimizer, f"register_optimizer_step_{hook_kind}_hook")
                             if scope == "global" else getattr(optimizer, f"register_step_{hook_kind}_hook"))
-                handle = register(lambda *args: None)
-                self.addCleanup(handle.remove)
-                before = param.detach().clone()
-                with mock.patch(
-                    "hyper_parallel.core.optimizer.swap_optimizer_base.PipelineSwapRuntime"
-                ) as runtime:
-                    with self.assertRaisesRegex(ValueError, "registered step hooks"):
-                        swap_optimizer(optimizer, config)
-                    runtime.assert_not_called()
-                self.assertTrue(torch.equal(param, before))
-                self.assertEqual(len(optimizer.state), 0)
-                handle.remove()
+                hook = mock.Mock(return_value=None)
+                handle = register(hook)
                 wrapped = swap_optimizer(optimizer, config)
-                self.assertIs(wrapped.optimizer, optimizer)
+                try:
+                    wrapped.step()
+                    hook.assert_called_once_with(optimizer, (optimizer,), {"closure": None})
+                    self.assertIs(wrapped.optimizer, optimizer)
+                finally:
+                    handle.remove()
 
-    def test_late_hooks_are_rejected_before_step(self):
-        """Late hooks cannot silently bypass callbacks or partially update a leaf."""
+    def test_dispatch_order_and_pre_hook_kwargs_rewrite(self):
+        """The dispatcher preserves PyTorch order and forwards pre-hook rewrites."""
+        param = torch.nn.Parameter(torch.ones(2, 2))
+        optimizer = torch.optim.AdamW([param], lr=0.01)
+        wrapped = swap_optimizer(
+            optimizer,
+            SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False),
+        )
+        events = []
+        hook_args = []
+
+        def global_pre(leaf: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, Any]:
+            """Record global pre-hook arguments and move the closure to args."""
+            del leaf
+            events.append("global_pre")
+            hook_args.append(("global_pre", args, dict(kwargs)))
+            return args + (kwargs["closure"],), {}
+
+        def instance_pre(leaf: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+            """Record instance pre-hook arguments."""
+            del leaf
+            events.append("instance_pre")
+            hook_args.append(("instance_pre", args, dict(kwargs)))
+
+        def finish_step(context: Any) -> None:
+            """Record completion of the stubbed optimizer body."""
+            del context
+            events.append("algorithm")
+
+        def optimizer_step_code() -> None:
+            """Record PyTorch's optimizer step-code callback."""
+            events.append("optimizer_step_code")
+
+        def instance_post(leaf: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+            """Record instance post-hook arguments."""
+            del leaf
+            events.append("instance_post")
+            hook_args.append(("instance_post", args, dict(kwargs)))
+
+        def global_post(leaf: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+            """Record global post-hook arguments."""
+            del leaf
+            events.append("global_post")
+            hook_args.append(("global_post", args, dict(kwargs)))
+
+        global_pre_handle = torch_optimizer.register_optimizer_step_pre_hook(global_pre)
+        global_post_handle = torch_optimizer.register_optimizer_step_post_hook(global_post)
+        instance_pre_handle = optimizer.register_step_pre_hook(instance_pre)
+        instance_post_handle = optimizer.register_step_post_hook(instance_post)
+        self.addCleanup(global_pre_handle.remove)
+        self.addCleanup(global_post_handle.remove)
+        self.addCleanup(instance_pre_handle.remove)
+        self.addCleanup(instance_post_handle.remove)
+        with mock.patch.object(wrapped.adapter, "finish_step", side_effect=finish_step), \
+                mock.patch.object(optimizer, "_optimizer_step_code", side_effect=optimizer_step_code):
+            wrapped.step()
+
+        self.assertEqual(
+            events,
+            ["global_pre", "instance_pre", "algorithm", "optimizer_step_code", "instance_post", "global_post"],
+        )
+        self.assertEqual(hook_args[0][1:], ((optimizer,), {"closure": None}))
+        self.assertEqual(hook_args[1][1:], ((optimizer, None), {}))
+        self.assertEqual(hook_args[2][1:], ((optimizer, None), {}))
+        self.assertEqual(hook_args[3][1:], ((optimizer, None), {}))
+
+    def test_none_closure_is_normalized_to_keyword_for_hooks(self):
+        """Omitted, positional and keyword None closures have one hook representation."""
+        param = torch.nn.Parameter(torch.ones(2, 2))
+        optimizer = torch.optim.AdamW([param], lr=0.01)
+        wrapped = swap_optimizer(
+            optimizer,
+            SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False),
+        )
+        seen = []
+        pre_handle = optimizer.register_step_pre_hook(
+            lambda _optimizer, args, kwargs: seen.append(("pre", args, dict(kwargs)))
+        )
+        post_handle = optimizer.register_step_post_hook(
+            lambda _optimizer, args, kwargs: seen.append(("post", args, dict(kwargs)))
+        )
+        self.addCleanup(pre_handle.remove)
+        self.addCleanup(post_handle.remove)
+
+        calls = (
+            ("omitted", wrapped.step),
+            ("positional", lambda: wrapped.step(None)),
+            ("keyword", lambda: wrapped.step(closure=None)),
+        )
+        for name, call in calls:
+            with self.subTest(call=name):
+                seen.clear()
+                call()
+                self.assertEqual(
+                    seen,
+                    [
+                        ("pre", (optimizer,), {"closure": None}),
+                        ("post", (optimizer,), {"closure": None}),
+                    ],
+                )
+
+    def test_chained_optimizer_passes_explicit_none_to_leaf_hooks(self):
+        """Muon and AdamW chain leaves see PyTorch order and explicit None kwargs."""
+        model = torch.nn.Linear(2, 2)
+        muon = Muon([model.weight], lr=0.01)
+        adamw = torch.optim.AdamW([model.bias], lr=0.01)
+        config = SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False)
+        wrapped_muon = swap_optimizer(muon, config)
+        wrapped_adamw = swap_optimizer(adamw, config)
+        chain = ChainedOptimizer(model, {"muon": wrapped_muon, "adamw": wrapped_adamw})
+        seen = []
+
+        def label(leaf: Any) -> str:
+            """Return the optimizer-family label for one leaf."""
+            return "muon" if leaf is muon else "adamw"
+
+        def global_pre(leaf: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+            """Record a global pre-hook call for one chain leaf."""
+            seen.append((f"global_pre_{label(leaf)}", leaf, args, dict(kwargs)))
+
+        def global_post(leaf: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+            """Record a global post-hook call for one chain leaf."""
+            seen.append((f"global_post_{label(leaf)}", leaf, args, dict(kwargs)))
+
+        global_pre_handle = torch_optimizer.register_optimizer_step_pre_hook(global_pre)
+        global_post_handle = torch_optimizer.register_optimizer_step_post_hook(global_post)
+        muon_pre_handle = muon.register_step_pre_hook(
+            lambda leaf, args, kwargs: seen.append(("instance_pre_muon", leaf, args, dict(kwargs)))
+        )
+        muon_post_handle = muon.register_step_post_hook(
+            lambda leaf, args, kwargs: seen.append(("instance_post_muon", leaf, args, dict(kwargs)))
+        )
+        adamw_pre_handle = adamw.register_step_pre_hook(
+            lambda leaf, args, kwargs: seen.append(("instance_pre_adamw", leaf, args, dict(kwargs)))
+        )
+        adamw_post_handle = adamw.register_step_post_hook(
+            lambda leaf, args, kwargs: seen.append(("instance_post_adamw", leaf, args, dict(kwargs)))
+        )
+        for handle in (
+                global_pre_handle, global_post_handle, muon_pre_handle, muon_post_handle,
+                adamw_pre_handle, adamw_post_handle):
+            self.addCleanup(handle.remove)
+
+        chain.step()
+
+        expected = [
+            ("global_pre_muon", muon),
+            ("instance_pre_muon", muon),
+            ("instance_post_muon", muon),
+            ("global_post_muon", muon),
+            ("global_pre_adamw", adamw),
+            ("instance_pre_adamw", adamw),
+            ("instance_post_adamw", adamw),
+            ("global_post_adamw", adamw),
+        ]
+        self.assertEqual([(entry[0], entry[1]) for entry in seen], expected)
+        for entry in seen:
+            leaf, args, kwargs = entry[1:]
+            self.assertEqual(args, (leaf,))
+            self.assertEqual(kwargs, {"closure": None})
+
+    def test_pre_and_post_hooks_run_once_for_multiple_swap_batches(self):
+        """Batching multiple parameter updates does not multiply hook calls."""
+        params = [torch.nn.Parameter(torch.ones(2, 2)) for _ in range(2)]
+        optimizer = torch.optim.AdamW(params, lr=0.01)
+        for param in params:
+            param.grad = torch.ones_like(param)
+        wrapped = swap_optimizer(
+            optimizer,
+            SwapOptimizerConfig(swap_times=2, min_numel=1, packed_swap=False),
+        )
+        pre_hook = mock.Mock(return_value=None)
+        post_hook = mock.Mock(return_value=None)
+        pre_handle = optimizer.register_step_pre_hook(pre_hook)
+        post_handle = optimizer.register_step_post_hook(post_hook)
+        self.addCleanup(pre_handle.remove)
+        self.addCleanup(post_handle.remove)
+        partitioned_batches = []
+
+        def split_units(units: Sequence[Any], unit_costs: Any = None) -> list[list[Any]]:
+            """Return one update unit per batch and capture the partition."""
+            del unit_costs
+            batches = [[unit] for unit in units]
+            partitioned_batches.extend(batches)
+            return batches
+
+        with mock.patch.object(PipelineSwapRuntime, "new_stream", return_value=None), \
+                mock.patch.object(PipelineSwapRuntime, "current_stream", return_value=None), \
+                mock.patch.object(
+                    PipelineSwapRuntime,
+                    "is_swappable_tensor",
+                    side_effect=lambda tensor, min_numel: tensor.numel() >= min_numel,
+                ), \
+                mock.patch.object(
+                    wrapped.runtime,
+                    "partition",
+                    side_effect=split_units,
+                ) as partition:
+            wrapped.step()
+
+        self.assertEqual(partition.call_count, 1)
+        self.assertEqual(len(partitioned_batches), len(params))
+        pre_hook.assert_called_once_with(optimizer, (optimizer,), {"closure": None})
+        post_hook.assert_called_once_with(optimizer, (optimizer,), {"closure": None})
+
+    def test_hook_exceptions_preserve_pytorch_update_semantics(self):
+        """Pre-hook failures skip updates; post-hook failures keep completed updates."""
+        param = torch.nn.Parameter(torch.ones(2, 2))
+        param.grad = torch.full_like(param, 0.1)
+        optimizer = torch.optim.AdamW([param], lr=0.01)
+        wrapped = swap_optimizer(
+            optimizer,
+            SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False),
+        )
+        initial = torch.clone(param)
+
+        def pre_failure(*_args: Any) -> None:
+            """Raise from the pre-hook before the optimizer update starts."""
+            raise RuntimeError("pre failed")
+
+        pre_handle = optimizer.register_step_pre_hook(pre_failure)
+        post_mock = mock.Mock()
+        post_handle = optimizer.register_step_post_hook(post_mock)
+        self.addCleanup(pre_handle.remove)
+        self.addCleanup(post_handle.remove)
+
+        with self.assertRaisesRegex(RuntimeError, "pre failed"):
+            wrapped.step()
+
+        torch.testing.assert_close(param, initial, rtol=0, atol=0)
+        post_mock.assert_not_called()
+        self.assertFalse(wrapped._step_active)
+        pre_handle.remove()
+
+        def post_failure(hook_optimizer: Any, hook_args: Any, hook_kwargs: Any) -> None:
+            """Raise after the optimizer update has already completed."""
+            del hook_optimizer, hook_args, hook_kwargs
+            self.assertTrue(wrapped._step_active)
+            raise RuntimeError("post failed")
+
+        failing_post = optimizer.register_step_post_hook(post_failure)
+        self.addCleanup(failing_post.remove)
+        with self.assertRaisesRegex(RuntimeError, "post failed"):
+            wrapped.step()
+
+        self.assertFalse(torch.equal(param, initial))
+        self.assertFalse(wrapped._step_active)
+
+    def test_body_failure_keeps_lazily_initialized_state(self):
+        """A body failure retains optimizer state initialized before the failure."""
+        param = torch.nn.Parameter(torch.ones(2, 2))
+        param.grad = torch.ones_like(param)
+        optimizer = torch.optim.AdamW([param], lr=0.01)
+        wrapped = swap_optimizer(
+            optimizer,
+            SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False),
+        )
+        handle = optimizer.register_step_pre_hook(lambda *_args: None)
+        self.addCleanup(handle.remove)
+
+        with mock.patch.object(wrapped.runtime, "partition", side_effect=RuntimeError("partition failed")):
+            with self.assertRaisesRegex(RuntimeError, "partition failed"):
+                wrapped.step()
+
+        self.assertIn(param, optimizer.state)
+        self.assertEqual(set(optimizer.state[param]), {"step", "exp_avg", "exp_avg_sq"})
+
+    def test_hooks_cannot_reset_optimizer_parameters(self):
+        """Parameter reset is rejected throughout pre- and post-hook dispatch."""
+        for hook_kind in ("pre", "post"):
+            with self.subTest(hook=hook_kind):
+                param = torch.nn.Parameter(torch.ones(2, 2))
+                param.grad = torch.ones_like(param)
+                optimizer = torch.optim.AdamW([param], lr=0.01)
+                wrapped = swap_optimizer(
+                    optimizer,
+                    SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False),
+                )
+
+                def reset_from_hook(*hook_args: Any, active_wrapper: SwapOptimizer = wrapped) -> None:
+                    """Attempt to rebuild parameter metadata while hook dispatch is active."""
+                    del hook_args
+                    self.assertTrue(active_wrapper._step_active)
+                    active_wrapper.reset_optimizer_parameters()
+
+                register = getattr(optimizer, f"register_step_{hook_kind}_hook")
+                handle = register(reset_from_hook)
+                self.addCleanup(handle.remove)
+                with mock.patch.object(
+                        optimizer, "reset_optimizer_parameters", create=True,
+                ) as reset, mock.patch.object(
+                        wrapped.adapter,
+                        "rebind_parameter_slots",
+                        wraps=wrapped.adapter.rebind_parameter_slots,
+                ) as rebind:
+                    with self.assertRaisesRegex(RuntimeError, "during a step, checkpoint or transfer"):
+                        wrapped.step()
+
+                reset.assert_not_called()
+                rebind.assert_not_called()
+                self.assertFalse(wrapped._step_active)
+
+    def test_recursive_step_is_rejected_from_pre_and_post_hooks(self):
+        """The full step-active window prevents recursion from either hook phase."""
+        def make_recurse_hook(active_wrapper: SwapOptimizer, hook_calls: list[str],
+                              active_hook_kind: str) -> Callable[..., None]:
+            """Bind one loop iteration's wrapper, call log and hook kind."""
+            def recurse_from_hook(*hook_args: Any) -> None:
+                """Try a nested step while the outer hook dispatcher is active."""
+                del hook_args
+                self.assertTrue(active_wrapper._step_active)
+                with self.assertRaisesRegex(RuntimeError, "Recursive SwapOptimizer.step"):
+                    active_wrapper.step()
+                hook_calls.append(active_hook_kind)
+
+            return recurse_from_hook
+
+        for hook_kind in ("pre", "post"):
+            with self.subTest(hook=hook_kind):
+                param = torch.nn.Parameter(torch.ones(2, 2))
+                optimizer = torch.optim.AdamW([param], lr=0.01)
+                wrapped = swap_optimizer(
+                    optimizer,
+                    SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False),
+                )
+                calls = []
+                recurse_from_hook = make_recurse_hook(wrapped, calls, hook_kind)
+
+                handle = getattr(optimizer, f"register_step_{hook_kind}_hook")(recurse_from_hook)
+                self.addCleanup(handle.remove)
+
+                wrapped.step()
+
+                self.assertEqual(calls, [hook_kind])
+                self.assertFalse(wrapped._step_active)
+
+    def test_hooks_registered_after_wrapping_are_dispatched(self):
+        """Instance and global hooks are read at step time, not cached at wrap time."""
         config = SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False)
         for scope, hook_kind in (("leaf", "pre"), ("wrapper", "post"), ("global", "pre"), ("global", "post")):
             with self.subTest(scope=scope, hook=hook_kind):
@@ -2013,7 +2366,7 @@ class TestSwapOptimizerHookGuard(unittest.TestCase):
                 optimizer = torch.optim.AdamW([param], lr=0.01)
                 wrapped = swap_optimizer(optimizer, config)
                 wrapped.step()
-                before = param.detach().clone()
+                before = torch.clone(param)
                 state_before = copy.deepcopy(optimizer.state_dict())
                 owner = optimizer if scope == "leaf" else wrapped
                 register = (getattr(torch_optimizer, f"register_optimizer_step_{hook_kind}_hook")
@@ -2024,19 +2377,48 @@ class TestSwapOptimizerHookGuard(unittest.TestCase):
                 with mock.patch.object(
                     wrapped.adapter, "prepare_step", wraps=wrapped.adapter.prepare_step
                 ) as prepare:
-                    with self.assertRaisesRegex(ValueError, "registered step hooks"):
-                        wrapped.step()
-                    prepare.assert_not_called()
-                torch.testing.assert_close(param, before, rtol=0, atol=0)
-                torch.testing.assert_close(optimizer.state_dict(), state_before, rtol=0, atol=0)
-                hook.assert_not_called()
-                handle.remove()
-                wrapped.step()
+                    wrapped.step()
+                    prepare.assert_called_once_with()
+                hook.assert_called_once()
                 self.assertFalse(torch.equal(param, before))
-                torch.testing.assert_close(optimizer.state[param]["step"], state_before["state"][0]["step"] + 1)
+                torch.testing.assert_close(
+                    optimizer.state[param]["step"],
+                    state_before["state"][0]["step"] + 1,
+                )
+                handle.remove()
+                hook.reset_mock()
+                wrapped.step()
+                hook.assert_not_called()
+                torch.testing.assert_close(
+                    optimizer.state[param]["step"],
+                    state_before["state"][0]["step"] + 2,
+                )
+
+    def test_pre_hook_can_add_post_hook_for_current_step(self):
+        """A pre-hook can register a post-hook for the current dispatch."""
+        param = torch.nn.Parameter(torch.ones(2, 2))
+        optimizer = torch.optim.AdamW([param], lr=0.01)
+        wrapped = swap_optimizer(
+            optimizer,
+            SwapOptimizerConfig(swap_times=1, min_numel=1024, packed_swap=False),
+        )
+        post_hook = mock.Mock(return_value=None)
+
+        def dynamic_pre(hook_optimizer: Any, hook_args: Any, hook_kwargs: Any) -> None:
+            """Register a post-hook without accessing optimizer state."""
+            del hook_optimizer, hook_args, hook_kwargs
+            post_handle = optimizer.register_step_post_hook(post_hook)
+            self.addCleanup(post_handle.remove)
+
+        pre_handle = optimizer.register_step_pre_hook(dynamic_pre)
+        self.addCleanup(pre_handle.remove)
+
+        wrapped.step()
+
+        post_hook.assert_called_once_with(optimizer, (optimizer,), {"closure": None})
 
     def test_unsupported_optimizer_keeps_value_error(self):
-        """Hook inspection preserves the factory's unsupported-type error."""
+        """Hook support preserves the factory's unsupported-type error."""
         with self.assertRaisesRegex(ValueError, "only supports"):
             swap_optimizer(object())
 

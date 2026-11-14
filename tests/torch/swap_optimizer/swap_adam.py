@@ -20,18 +20,20 @@ import weakref
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+from torch.optim.optimizer import (register_optimizer_step_post_hook,
+                                   register_optimizer_step_pre_hook)
 
 from hyper_parallel import DTensor, SkipDTensorDispatch, init_device_mesh
-from hyper_parallel.components.optim.mixed_precision_optimizer import Float16OptimizerWithFloat16Params
+from hyper_parallel.components.optim.mixed_precision_optimizer import \
+    Float16OptimizerWithFloat16Params
+from hyper_parallel.core.fully_shard.api import fully_shard
+from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from hyper_parallel.core.optimizer import SwapOptimizerConfig, swap_optimizer
 from hyper_parallel.core.optimizer.adamw import AdamW as NewAdamW
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
-from hyper_parallel.core.fully_shard.api import fully_shard
-from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from hyper_parallel.trainer.base import _attach_optimizer_swap
 from hyper_parallel.trainer.config.optimization import OptimizerSwapConfig
 from tests.torch.utils import init_dist
-
 
 _TRAIN_STEPS = 8
 _SWAP_TIMES = 3
@@ -589,6 +591,73 @@ def test_torch_adamw_swap_optimizer_parameter_align() -> None:
     Expectation: Per-step losses and final parameters are aligned; swap AdamW uses lower peak memory.
     """
     _run_optimizer_align_case("test_torch_adamw_swap_optimizer_parameter_align", torch.optim.AdamW)
+
+
+def _run_adamw_step_hook_case(packed_swap: bool) -> None:
+    """Verify state-independent hook ordering and arguments for one swap mode."""
+    param = torch.nn.Parameter(torch.arange(64, dtype=torch.float32, device="npu").reshape(8, 8) * 0.01)
+    leaf = torch.optim.AdamW([param], **_optimizer_kwargs(torch.optim.AdamW))
+    events = []
+
+    def _check_call(name: str, optimizer: Any, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+        assert optimizer is leaf, f"{name} received optimizer={optimizer!r}, expected leaf={leaf!r}"
+        assert args == (leaf,), f"{name} args mismatch: actual={args!r}, expected={(leaf,)!r}"
+        assert kwargs == {"closure": None}, (
+            f"{name} kwargs mismatch: actual={kwargs!r}, expected={{'closure': None}}"
+        )
+        events.append(name)
+
+    def _global_pre(optimizer: Any, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+        """Record the global pre-hook call."""
+        _check_call("global_pre", optimizer, args, kwargs)
+
+    def _instance_pre(optimizer: Any, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+        """Record the instance pre-hook call."""
+        _check_call("instance_pre", optimizer, args, kwargs)
+
+    def _instance_post(optimizer: Any, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+        """Record the instance post-hook call."""
+        _check_call("instance_post", optimizer, args, kwargs)
+
+    def _global_post(optimizer: Any, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+        """Record the global post-hook call."""
+        _check_call("global_post", optimizer, args, kwargs)
+
+    instance_pre_handle = leaf.register_step_pre_hook(_instance_pre)
+    instance_post_handle = leaf.register_step_post_hook(_instance_post)
+    optimizer = swap_optimizer(
+        leaf,
+        SwapOptimizerConfig(swap_times=2, min_numel=1, packed_swap=packed_swap),
+    )
+    # Register globals after wrapping to verify the dispatcher never caches an
+    # empty global-hook container at construction time.
+    global_pre_handle = register_optimizer_step_pre_hook(_global_pre)
+    global_post_handle = register_optimizer_step_post_hook(_global_post)
+    before = torch.clone(param)
+    try:
+        for step in range(2):
+            param.grad = torch.full_like(param, step + 1.0)
+            optimizer.step(closure=None)
+    finally:
+        global_post_handle.remove()
+        global_pre_handle.remove()
+        instance_post_handle.remove()
+        instance_pre_handle.remove()
+
+    expected_events = [
+        "global_pre", "instance_pre", "instance_post", "global_post",
+        "global_pre", "instance_pre", "instance_post", "global_post",
+    ]
+    assert events == expected_events, f"hook order mismatch: actual={events!r}, expected={expected_events!r}"
+    assert not torch.equal(param, before), "AdamW hooks prevented the parameter update"
+
+
+def test_torch_adamw_swap_optimizer_step_hooks() -> None:
+    """Verify state-independent AdamW hooks for per-tensor and packed swap."""
+    print("test_torch_adamw_swap_optimizer_step_hooks")
+    for packed_swap in (False, True):
+        _run_adamw_step_hook_case(packed_swap)
+        _release_device_memory()
 
 
 def test_torch_fused_adamw_swap_optimizer_parameter_align() -> None:

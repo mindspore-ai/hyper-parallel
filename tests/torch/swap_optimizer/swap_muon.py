@@ -26,13 +26,18 @@ from unittest import mock
 
 import torch
 import torch.distributed as dist
+from torch.optim.optimizer import (register_optimizer_step_post_hook,
+                                   register_optimizer_step_pre_hook)
 
-from hyper_parallel import DTensor, Replicate, Shard, SkipDTensorDispatch, distribute_tensor, init_device_mesh
-from hyper_parallel.components.optim.mixed_precision_optimizer import Float16OptimizerWithFloat16Params
+from hyper_parallel import (DTensor, Replicate, Shard, SkipDTensorDispatch,
+                            distribute_tensor, init_device_mesh)
+from hyper_parallel.components.optim.mixed_precision_optimizer import \
+    Float16OptimizerWithFloat16Params
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
+from hyper_parallel.core.optimizer import (Muon, SwapOptimizerConfig,
+                                           swap_optimizer)
 from hyper_parallel.core.optimizer.dtensor_compat import to_local_if_dtensor
-from hyper_parallel.core.optimizer import Muon, SwapOptimizerConfig, swap_optimizer
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
 from tests.torch.utils import init_dist
 
@@ -175,6 +180,126 @@ def test_swap_muon_parameter_align() -> None:
     Expectation: Losses and parameters align exactly, and every momentum slot ends host-resident.
     """
     _run_align_case("test_swap_muon_parameter_align", swap_times=2)
+
+
+def _run_muon_step_hook_case(packed_swap: bool) -> None:
+    """Verify state-independent Muon hook ordering for one swap mode."""
+    batches = _fixed_batches()
+    model, optimizer = _build(True, 2, _initial_state(), packed_swap=packed_swap)
+    leaf = optimizer.optimizer
+    events = []
+
+    def _check_call(name: str, current: object, args: Tuple[object, ...], kwargs: Dict[str, object]) -> None:
+        assert current is leaf, f"{name} received optimizer={current!r}, expected leaf={leaf!r}"
+        assert args == (leaf,), f"{name} args mismatch: actual={args!r}, expected={(leaf,)!r}"
+        assert kwargs == {"closure": None}, (
+            f"{name} kwargs mismatch: actual={kwargs!r}, expected={{'closure': None}}"
+        )
+        events.append(name)
+
+    def _global_pre(current: object, args: Tuple[object, ...], kwargs: Dict[str, object]) -> None:
+        """Record the global pre-hook call."""
+        _check_call("global_pre", current, args, kwargs)
+
+    def _instance_pre(current: object, args: Tuple[object, ...], kwargs: Dict[str, object]) -> None:
+        """Record the instance pre-hook call."""
+        _check_call("instance_pre", current, args, kwargs)
+
+    def _instance_post(current: object, args: Tuple[object, ...], kwargs: Dict[str, object]) -> None:
+        """Record the instance post-hook call."""
+        _check_call("instance_post", current, args, kwargs)
+
+    def _global_post(current: object, args: Tuple[object, ...], kwargs: Dict[str, object]) -> None:
+        """Record the global post-hook call."""
+        _check_call("global_post", current, args, kwargs)
+
+    instance_pre_handle = leaf.register_step_pre_hook(_instance_pre)
+    instance_post_handle = leaf.register_step_post_hook(_instance_post)
+    global_pre_handle = register_optimizer_step_pre_hook(_global_pre)
+    global_post_handle = register_optimizer_step_post_hook(_global_post)
+    before = [param.detach().clone() for param in model.parameters()]
+    try:
+        for inputs, target in batches[:2]:
+            optimizer.zero_grad(set_to_none=True)
+            loss = torch.nn.functional.mse_loss(model(inputs), target)
+            loss.backward()
+            optimizer.step(closure=None)
+            _assert_swap_state_offloaded(optimizer, expected_params=len(tuple(model.parameters())))
+    finally:
+        global_post_handle.remove()
+        global_pre_handle.remove()
+        instance_post_handle.remove()
+        instance_pre_handle.remove()
+
+    expected_events = [
+        "global_pre", "instance_pre", "instance_post", "global_post",
+        "global_pre", "instance_pre", "instance_post", "global_post",
+    ]
+    assert events == expected_events, f"hook order mismatch: actual={events!r}, expected={expected_events!r}"
+    assert any(not torch.equal(param, old) for param, old in zip(model.parameters(), before)), (
+        "Muon hooks prevented the parameter update"
+    )
+
+
+def test_swap_muon_optimizer_step_hooks() -> None:
+    """Verify state-independent Muon hooks for per-tensor and packed swap."""
+    print("test_swap_muon_optimizer_step_hooks")
+    for packed_swap in (False, True):
+        _run_muon_step_hook_case(packed_swap)
+        _release_device_memory()
+
+
+def test_swap_muon_post_hook_exception_semantics() -> None:
+    """Verify a failing Muon post-hook keeps updates and stops later hooks."""
+    print("test_swap_muon_post_hook_exception_semantics")
+    batches = _fixed_batches()
+    model, optimizer = _build(True, 2, _initial_state(), packed_swap=False)
+    leaf = optimizer.optimizer
+    _train(model, optimizer, batches, steps=1)
+    before = [param.detach().clone() for param in model.parameters()]
+    later_calls = []
+
+    def _fail_post(hook_optimizer: object, hook_args: Tuple[object, ...],
+                   hook_kwargs: Dict[str, object]) -> None:
+        """Raise after Muon finishes its parameter and momentum updates."""
+        del hook_optimizer, hook_args, hook_kwargs
+        assert optimizer._step_active, (  # pylint: disable=protected-access
+            "Muon wrapper did not mark post-hook dispatch as active"
+        )
+        raise RuntimeError("muon post-hook failed")
+
+    def _later_post(hook_optimizer: object, hook_args: Tuple[object, ...],
+                    hook_kwargs: Dict[str, object]) -> None:
+        """Record a hook that must not run after the previous failure."""
+        del hook_optimizer, hook_args, hook_kwargs
+        later_calls.append("called")
+
+    failing_handle = leaf.register_step_post_hook(_fail_post)
+    later_handle = leaf.register_step_post_hook(_later_post)
+    inputs, target = batches[1]
+    optimizer.zero_grad(set_to_none=True)
+    loss = torch.nn.functional.mse_loss(model(inputs), target)
+    loss.backward()
+    error = None
+    try:
+        optimizer.step()
+    except RuntimeError as caught:
+        error = caught
+    finally:
+        later_handle.remove()
+        failing_handle.remove()
+
+    assert error is not None, "failing Muon post-hook must propagate RuntimeError"
+    assert str(error) == "muon post-hook failed", f"unexpected Muon post-hook error: {error!r}"
+    assert not later_calls, f"later Muon post-hook unexpectedly ran: calls={later_calls!r}"
+    assert any(not torch.equal(param, old) for param, old in zip(model.parameters(), before)), (
+        "Muon post-hook failure rolled back the completed parameter update"
+    )
+    assert not optimizer._step_active, (  # pylint: disable=protected-access
+        "Muon wrapper left _step_active set after post-hook failure"
+    )
+    _assert_swap_state_offloaded(optimizer, expected_params=len(tuple(model.parameters())))
+    _release_device_memory()
 
 
 def test_swap_muon_swap_times_parameter_align() -> None:
