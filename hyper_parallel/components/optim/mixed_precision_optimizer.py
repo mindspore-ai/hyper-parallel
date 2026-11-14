@@ -17,8 +17,8 @@
 import logging
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch import nn  # pylint: disable=forbidden-backend-import
+import torch
+from torch import nn
 
 from hyper_parallel.core.optimizer.dtensor_compat import (
     device_meshes_are_compatible,

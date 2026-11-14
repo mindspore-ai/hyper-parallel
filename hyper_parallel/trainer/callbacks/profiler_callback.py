@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 # Trainer is Torch-owned; match the other callbacks under the legacy backend-import checker.
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.trainer.callbacks.base import Callback
 from hyper_parallel.trainer.config.training import ProfilingAnalysisConfig, ProfilingConfig

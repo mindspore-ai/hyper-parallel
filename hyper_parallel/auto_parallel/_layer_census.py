@@ -105,11 +105,11 @@ from typing import (
     Tuple,
 )
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode  # pylint: disable=forbidden-backend-import
-from torch.utils._python_dispatch import TorchDispatchMode  # pylint: disable=forbidden-backend-import
-from torch.utils._pytree import tree_flatten  # pylint: disable=forbidden-backend-import
-from torch.utils.checkpoint import DefaultDeviceType  # pylint: disable=forbidden-backend-import
+import torch
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils._pytree import tree_flatten
+from torch.utils.checkpoint import DefaultDeviceType
 
 from hyper_parallel.auto_parallel._model_spec import KindActivations
 from hyper_parallel.auto_parallel._npu_contracts import npu_contracts

@@ -14,7 +14,7 @@
 # ============================================================================
 """W4A8 format hooks for the shared native grouped-linear flow."""
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.components.quantization.config import (
     GMM_SPLIT_ANTIQ,

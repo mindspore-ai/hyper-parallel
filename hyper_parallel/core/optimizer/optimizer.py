@@ -14,7 +14,6 @@
 # ============================================================================
 
 """Base distributed optimizer and chain optimizer composition."""
-# pylint: disable=forbidden-backend-import
 
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext

@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Build one model and loss batch from a DataLoader iterator."""
-# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 

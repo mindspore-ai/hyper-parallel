@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any, Tuple
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 
 def _dense_indexer_lse(
@@ -31,7 +31,7 @@ def _dense_indexer_lse(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return native indexer maximum and exponential sum, without gradients."""
     # Dense operators remain optional for CPU, sparse and Omni-only execution.
-    from torch_npu import (  # pylint: disable=import-outside-toplevel,forbidden-backend-import
+    from torch_npu import (  # pylint: disable=import-outside-toplevel
         npu_dense_lightning_indexer_softmax_lse,
     )
 
@@ -93,7 +93,7 @@ class _DenseIndexerKLLoss(torch.autograd.Function):
             index_query.shape[0] * index_query.shape[1] if query_ends is None else sum(query_ends)
         )
         # Load only when the dense native path is selected.
-        from torch_npu import (  # pylint: disable=import-outside-toplevel,forbidden-backend-import
+        from torch_npu import (  # pylint: disable=import-outside-toplevel
             npu_dense_lightning_indexer_grad_kl_loss,
         )
 

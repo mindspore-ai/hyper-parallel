@@ -14,7 +14,7 @@
 # ============================================================================
 """Context parallel execution for Qwen3.5-style Gated DeltaNet layers."""
 
-# pylint: disable=forbidden-backend-import,missing-public-type-hints
+# pylint: disable=missing-public-type-hints
 # pylint: disable=missing-public-docstring,not-callable
 # PyTorch autograd.Function intentionally defines framework-specific signatures.
 # pylint: disable=abstract-method,arguments-differ

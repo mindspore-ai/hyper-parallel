@@ -16,7 +16,7 @@
 
 from typing import Any, Optional, Tuple
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 try:
     import omni_training_custom_ops  # noqa: F401  # pylint: disable=unused-import

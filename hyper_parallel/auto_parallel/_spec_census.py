@@ -45,8 +45,8 @@ import functools
 import importlib
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch.utils._python_dispatch import TorchDispatchMode  # pylint: disable=forbidden-backend-import
+import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from hyper_parallel.auto_parallel._layer_census import _fake_layer, _positions, _run, delta_rule_module
 from hyper_parallel.auto_parallel._model_spec import LayerGroup, ModelSpec, ModelSpecError, OpCounts

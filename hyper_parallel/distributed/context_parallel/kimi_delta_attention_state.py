@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """KDA state exchange and mesh construction for gathered or recursive scans."""
-# pylint: disable=forbidden-backend-import
 from __future__ import annotations
 
 from typing import Any

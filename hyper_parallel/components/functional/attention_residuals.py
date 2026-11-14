@@ -18,7 +18,6 @@ import importlib
 from collections.abc import Callable
 
 # Torch is the native framework; the legacy platform-agnostic lint rule is obsolete here.
-# pylint: disable=forbidden-backend-import
 import torch
 
 

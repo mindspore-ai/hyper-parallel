@@ -21,7 +21,7 @@ BoolTensor masks are not supported because the output shape is data-dependent.
 """
 from typing import Callable, NamedTuple, Optional
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import (

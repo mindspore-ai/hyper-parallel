@@ -17,8 +17,8 @@
 from typing import Any, Optional
 
 # Transformers model adapters implement PyTorch-native model contracts.
-import torch  # pylint: disable=forbidden-backend-import
-import torch.nn.functional as F  # pylint: disable=forbidden-backend-import
+import torch
+import torch.nn.functional as F
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.tensor_parallel.loss_parallel import _get_loss_parallel_mesh

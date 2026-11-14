@@ -21,7 +21,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 
 @dataclass(frozen=True)

@@ -26,7 +26,6 @@ on every source (non-FSDP) mesh axis, together with the source sub-mesh.
 final sharded parameter carries the full distributed layout (FSDP dims +
 source dims) for downstream consumers such as distributed checkpointing.
 """
-# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 

@@ -22,8 +22,8 @@ from functools import lru_cache
 from itertools import accumulate
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch.nn import functional  # pylint: disable=forbidden-backend-import
+import torch
+from torch.nn import functional
 
 
 @dataclass(frozen=True)

@@ -14,7 +14,7 @@
 # ============================================================================
 """NPU SwiGLU function."""
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 import torch_npu
 
 

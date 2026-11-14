@@ -21,8 +21,8 @@ from functools import wraps
 from typing import Any, Literal
 
 # Native Torch is required, as in the existing CP adapters; the legacy lint rule predates that migration.
-import torch  # pylint: disable=forbidden-backend-import
-from torch import nn  # pylint: disable=forbidden-backend-import
+import torch
+from torch import nn
 
 from hyper_parallel.components.modules.mla_attention import MLAAttention
 from hyper_parallel.distributed._builder.forward_rewriter import _ForwardRewriteRequest

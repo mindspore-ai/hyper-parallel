@@ -18,8 +18,8 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch import nn  # pylint: disable=forbidden-backend-import
+import torch
+from torch import nn
 
 from hyper_parallel.core.activation_memory.wrapper import CheckpointWrapper
 from hyper_parallel.distributed.context_parallel import ulysses_head_to_seq, ulysses_seq_to_head

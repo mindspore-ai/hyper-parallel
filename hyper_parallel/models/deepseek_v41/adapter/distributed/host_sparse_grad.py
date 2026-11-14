@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Sparse row synchronization along existing same-owner mesh axes."""
-# pylint: disable=forbidden-backend-import
 
 from typing import Any
 import torch

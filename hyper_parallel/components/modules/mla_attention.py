@@ -21,8 +21,7 @@ from dataclasses import dataclass
 from typing import Any
 
 # This package provides PyTorch-specific high-performance modules.
-# pylint: disable=forbidden-backend-import
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 from torch import nn
 from hyper_parallel.components.checkpoint.weight_conversion import WeightConverter
 

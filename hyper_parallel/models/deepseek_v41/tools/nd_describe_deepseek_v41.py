@@ -243,7 +243,7 @@ def build_crop(model_dir: str, assets: str, divisor: int, experts: int) -> Any:
     # Imported here, not at the top: describing a crop reads config.json alone, and must
     # work in a checkout or an environment where neither torch nor the model is installed.
     # pylint: disable=import-outside-toplevel
-    import torch  # pylint: disable=forbidden-backend-import
+    import torch
     from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import (
         build_cropped_deepseek_v41,
     )

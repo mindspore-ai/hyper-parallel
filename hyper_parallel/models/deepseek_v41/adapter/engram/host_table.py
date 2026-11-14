@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Owner-local FP32 Engram parameters and one-step sparse gradient storage."""
-# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 

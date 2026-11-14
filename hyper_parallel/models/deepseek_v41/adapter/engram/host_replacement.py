@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Structure-preserving DeepSeek Engram replacement with a Host table."""
-# pylint: disable=forbidden-backend-import,unsupported-binary-operation
+# pylint: disable=unsupported-binary-operation
 
 from collections.abc import Mapping
 from typing import Any

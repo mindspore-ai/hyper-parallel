@@ -20,7 +20,6 @@ context-parallel wrappers.
 """
 # pylint: disable=invalid-name
 # This module mirrors the existing Torch model building blocks in this package.
-# pylint: disable=forbidden-backend-import
 from __future__ import annotations
 
 __all__ = [

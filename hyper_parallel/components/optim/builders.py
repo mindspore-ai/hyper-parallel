@@ -25,7 +25,7 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from torch import nn  # pylint: disable=forbidden-backend-import
+from torch import nn
 
 from hyper_parallel.core.optimizer import get_hyper_optimizer
 from hyper_parallel.components.optim.parameter_groups import (

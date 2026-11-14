@@ -16,7 +16,7 @@
 
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.trainer.runtime.device import get_device_type
 from hyper_parallel.trainer.callbacks.base import Callback, TrainerState

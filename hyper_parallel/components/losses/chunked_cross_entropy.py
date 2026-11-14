@@ -34,7 +34,7 @@ from typing import Any
 # This loss is a PyTorch Trainer component and differentiates through
 # torch.func; there is no platform-neutral autograd equivalent. PyTorch's
 # Function metaclass supplies its public variadic dispatch contract.
-# pylint: disable=forbidden-backend-import,not-callable,abstract-method,arguments-differ
+# pylint: disable=not-callable,abstract-method,arguments-differ
 import torch
 from torch import nn
 from torch.autograd.function import once_differentiable

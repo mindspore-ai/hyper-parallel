@@ -174,7 +174,7 @@ class EvidenceStore:
         except ImportError:
             environment["hyper_parallel"] = None
         try:
-            import torch  # pylint: disable=import-outside-toplevel,forbidden-backend-import
+            import torch  # pylint: disable=import-outside-toplevel
 
             environment["torch"] = {
                 "version": torch.__version__,

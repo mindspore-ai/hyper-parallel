@@ -16,8 +16,8 @@
 
 from typing import Any, Tuple
 
-import torch  # pylint: disable=forbidden-backend-import
-import torch.nn.functional as F  # pylint: disable=forbidden-backend-import
+import torch
+import torch.nn.functional as F
 import torch_npu
 from einops import rearrange
 import omni_training_custom_ops  # noqa: F401  # pylint: disable=unused-import

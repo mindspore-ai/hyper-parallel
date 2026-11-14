@@ -70,7 +70,7 @@ from functools import partial
 from multiprocessing.context import BaseContext
 from typing import Any, Literal
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.distributed_data.batch_sampler import (
     BatchSamplerReader,

@@ -19,7 +19,6 @@ __all__ = ["ModelOutputLoss"]
 from typing import Any, Dict, Optional, Union
 
 # AutoModels loss components implement the Transformers/PyTorch Trainer API.
-# pylint: disable-next=forbidden-backend-import
 import torch
 
 from hyper_parallel.data.constants import IGNORE_INDEX

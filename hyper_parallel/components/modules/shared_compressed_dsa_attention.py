@@ -31,9 +31,9 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Protocol
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch import nn  # pylint: disable=forbidden-backend-import
-from torch.utils._pytree import register_pytree_node  # pylint: disable=forbidden-backend-import
+import torch
+from torch import nn
+from torch.utils._pytree import register_pytree_node
 
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
 from hyper_parallel.components.functional.lightning_indexer import (

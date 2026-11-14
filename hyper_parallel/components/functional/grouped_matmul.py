@@ -16,7 +16,7 @@
 
 from typing import Any, Optional, Union
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 import torch_npu
 
 GroupList = Optional[Union[torch.Tensor, list[int], tuple[int, ...]]]

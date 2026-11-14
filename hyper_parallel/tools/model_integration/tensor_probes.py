@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Tensor summaries, input identity, and parameter probe recorders."""
-# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 

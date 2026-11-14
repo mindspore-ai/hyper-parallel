@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Planner-injected Context Parallel wrappers for Qwen3.5 Gated DeltaNet."""
-# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 

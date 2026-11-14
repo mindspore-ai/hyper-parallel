@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """KDA context-parallel executors: state CP, Ulysses and their combinations."""
-# pylint: disable=forbidden-backend-import
 from __future__ import annotations
 
 __all__ = [

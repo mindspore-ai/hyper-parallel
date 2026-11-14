@@ -14,7 +14,6 @@
 # ============================================================================
 """Affine KDA state summary built from prepared WY intermediates."""
 
-# pylint: disable=forbidden-backend-import
 
 __all__ = [
     "apply_kda_state_gradient_summary",

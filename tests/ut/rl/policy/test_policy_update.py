@@ -14,7 +14,7 @@
 # ============================================================================
 """CPU unit tests for Actor and Critic update orchestration."""
 # Local test doubles are not public APIs; the suite intentionally uses Torch CPU tensors.
-# pylint: disable=forbidden-backend-import,missing-public-docstring
+# pylint: disable=missing-public-docstring
 
 import math
 from contextlib import AbstractContextManager, nullcontext

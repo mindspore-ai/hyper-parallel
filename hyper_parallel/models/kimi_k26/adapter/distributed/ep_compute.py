@@ -30,7 +30,7 @@ and must not be reported as an efficiency result; correctness runs keep it off.
 import logging
 from typing import Any, Callable, Optional
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.distributed.expert_parallel.recipes import build_ep_compute
 from hyper_parallel.distributed.recipe_spec import local_compute

@@ -19,7 +19,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Any, Callable
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.components.functional.sparse_flash_mla import csa_tnd_plan
 

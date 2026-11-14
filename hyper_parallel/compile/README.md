@@ -4,9 +4,7 @@ Graph-mode architecture for automatic parallelization with FSDP.
 
 > **Note**: The `compile/` subpackage relies on a patched autograd engine for
 > joint-graph capture (see Limitations). Its `torch.*` imports — including
-> `torch.fx.experimental` and `torch._guards` — are therefore intentional and
-> carry a `forbidden-backend-import` suppression in
-> `.jenkins/check/config/filter_pylint.txt`.
+> `torch.fx.experimental` and `torch._guards` — are therefore intentional.
 
 ## Core Concept
 

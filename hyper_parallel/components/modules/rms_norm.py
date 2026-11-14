@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 from hyper_parallel.components.checkpoint.weight_conversion import WeightConverter
 
 from hyper_parallel.components.checkpoint.conversion_ops import AddScalar

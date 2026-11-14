@@ -17,8 +17,8 @@
 
 from __future__ import annotations
 
-import torch  # pylint: disable=forbidden-backend-import
-import torch.nn.functional as F  # pylint: disable=forbidden-backend-import
+import torch
+import torch.nn.functional as F
 
 from hyper_parallel.core.multicore import MegaGate
 

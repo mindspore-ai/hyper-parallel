@@ -16,7 +16,7 @@
 
 from typing import Any, Optional, Sequence, Tuple
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 import torch_npu
 from einops import rearrange
 

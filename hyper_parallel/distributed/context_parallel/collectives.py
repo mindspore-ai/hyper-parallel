@@ -40,10 +40,10 @@ hyper_parallel/data/parallel/batch_parallel.py.
 
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
-import torch  # pylint: disable=forbidden-backend-import
-import torch.distributed as dist  # pylint: disable=forbidden-backend-import
-from torch import Tensor  # pylint: disable=forbidden-backend-import
-from torch.distributed.nn.functional import all_gather as differentiable_all_gather  # pylint: disable=forbidden-backend-import
+import torch
+import torch.distributed as dist
+from torch import Tensor
+from torch.distributed.nn.functional import all_gather as differentiable_all_gather
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.utils import communication
 

@@ -16,7 +16,7 @@
 
 import unittest
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.data.batching.build_collate_fn import (
     IGNORE_INDEX,

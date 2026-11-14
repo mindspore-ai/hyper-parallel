@@ -27,8 +27,8 @@ import os
 from functools import partial
 from typing import Any, Dict, List, Optional
 
-import torch  # pylint: disable=forbidden-backend-import
-import torch.distributed as dist  # pylint: disable=forbidden-backend-import
+import torch
+import torch.distributed as dist
 
 from hyper_parallel import SkipDTensorDispatch
 from hyper_parallel.components.optim.mixed_precision_optimizer import (

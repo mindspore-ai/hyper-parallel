@@ -20,8 +20,8 @@ from collections.abc import Mapping
 from functools import partial
 from typing import Any
 
-from torch import Tensor, nn  # pylint: disable=forbidden-backend-import
-from torch.nn import functional as F  # pylint: disable=forbidden-backend-import
+from torch import Tensor, nn
+from torch.nn import functional as F
 from transformers.activations import ACT2FN
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Experts
 

@@ -29,8 +29,8 @@ from heapq import heapify, heappop, heappush
 from itertools import accumulate
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
-import torch.distributed as dist  # pylint: disable=forbidden-backend-import
+import torch
+import torch.distributed as dist
 
 
 def resolve_indexer_balance_block_size(mode: str, block_size: int | None) -> int | None:

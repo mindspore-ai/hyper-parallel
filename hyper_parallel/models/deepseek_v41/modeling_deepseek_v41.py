@@ -30,9 +30,9 @@ from pathlib import Path
 from types import MethodType
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch import nn  # pylint: disable=forbidden-backend-import
-from torch.nn import functional  # pylint: disable=forbidden-backend-import
+import torch
+from torch import nn
+from torch.nn import functional
 from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     DeepseekV4Attention,

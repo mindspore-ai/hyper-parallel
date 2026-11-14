@@ -16,7 +16,7 @@
 
 from typing import Tuple
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 from einops import rearrange
 
 from hyper_parallel.tools.logging import get_logger

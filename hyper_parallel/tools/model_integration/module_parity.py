@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Generic final-module forward/intermediate/backward parity runner."""
-# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 
