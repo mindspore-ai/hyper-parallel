@@ -47,7 +47,7 @@ HyperParallel provides distributed parallel acceleration for Ascend SuperPoDs. D
 
 ## 📣 Latest News
 
-- [Oct. 15, 2026]: [DeepSeek-V4.1-Flash model support](docs/deepseek_v41_article/README.md)
+- [Oct. 15, 2026]: [DeepSeek-V4.1-Flash model support](hyper_parallel/models/deepseek_v41/README.md)
 - [Oct. 9, 2026]: [moonshotai/Kimi-K2.6 model support](hyper_parallel/models/kimi_k26/README.md)
 - [Aug. 25, 2026]: [Qwen/Qwen3-30B-A3B model support](examples/training_demo/README.md#full-pretrained-model)
 
@@ -67,8 +67,8 @@ See the [model roadmap](https://github.com/mindspore-ai/hyper-parallel/issues/13
 | Qwen3.5 Dense | [Model entry](hyper_parallel/models/qwen3_5) |
 | DeepSeek-V3 | [Recipes](hyper_parallel/models/deepseek_v3/recipes) |
 | DeepSeek-V3.2 | [Recipes](hyper_parallel/models/deepseek_v32/recipes) |
-| DeepSeek-V4.1 | [Text configuration](examples/training_demo/deepseek_v41/train_deepseek_v41_online.yaml) · [Multimodal configuration](examples/training_demo/deepseek_v41/train_deepseek_v41_vlm_online.yaml) |
-| Kimi-K2.6 | [Recipes](hyper_parallel/models/kimi_k26/recipes) |
+| DeepSeek-V4.1 | [Training guide](hyper_parallel/models/deepseek_v41/README.md) |
+| Kimi-K2.6 | [Training guide](hyper_parallel/models/kimi_k26/README.md) |
 | openPangu-2.0 | [Repository](https://gitcode.com/ascend-tribe/openPangu-2.0-Training) |
 
 ---
