@@ -406,6 +406,22 @@ class TestGraphModeIntegration(unittest.TestCase):
         self.assertTrue(config.compile.selects_graph_compiler())
 
 
+    def test_dp_replicas_enable_ddp_or_hsdp_without_changing_single_rank_defaults(self):
+        """Resolved DP replicas select reductions even when the shard degree is one."""
+        for shard, replicas, mode in ((1, 4, "ddp"), (2, 2, "hsdp"), (4, 1, "fsdp"), (1, 1, "fsdp")):
+            with self.subTest(shard=shard, replicas=replicas):
+                config = SimpleNamespace(fsdp_config=SimpleNamespace(dp_shard_size=shard, edp_shard_size=1))
+                result = build_pass_config_from_trainer_config(
+                    config, mesh_context=MeshContext(dp_replicate_size=replicas))
+                self.assertEqual(result.fsdp_enabled, shard > 1 or replicas > 1)
+                self.assertEqual(result.dp_mode, mode)
+                self.assertEqual(result.dp_replicate_degree, replicas)
+                disabled = build_pass_config_from_trainer_config(
+                    config, mesh_context=MeshContext(dp_replicate_size=replicas), fsdp_enabled=False)
+                self.assertFalse(disabled.fsdp_enabled)
+        self.assertFalse(build_pass_config_from_trainer_config(
+            SimpleNamespace(fsdp_config=SimpleNamespace(dp_shard_size=1, edp_shard_size=1))).fsdp_enabled)
+
     def test_build_pass_config_projects_parallel_topology(self):
         """Trainer topology and inferred FSDP intent are copied to PassConfig."""
         config = SimpleNamespace(

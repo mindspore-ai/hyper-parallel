@@ -37,11 +37,47 @@ from hyper_parallel.core.fully_shard.hsdp_utils import (
     get_hsdp_state,
     get_managed_modules_parameters,
     get_rank_list_for_axes,
+    get_shard_geometry,
     get_split_rank_lists_for_axes,
     infer_fully_shard_param_mode,
     is_dtensor_managed_param,
     unwrap_dtensor_param,
 )
+
+
+class TestShardGeometry(unittest.TestCase):
+    """Shared geometry follows Torch chunks, including absent and empty shards."""
+
+    def test_matches_torch_chunk(self):
+        """Plan valid views and padded shapes on source-local parameter dimensions."""
+        cases = (
+            ((8, 3), 0, 4), ((10, 3), 0, 3), ((5, 3), 0, 4), ((2, 3), 0, 4),
+            ((0, 3), 0, 4), ((5, 0), 0, 4), ((3, 8), 1, 4), ((3, 5), 1, 4),
+            ((3, 0), 1, 4), ((5, 3), 0, 1),
+        )
+        for shape, dim, degree in cases:
+            source = torch.arange(torch.Size(shape).numel()).reshape(shape)
+            chunks = source.chunk(degree, dim)
+            for rank in range(degree):
+                with self.subTest(shape=shape, dim=dim, degree=degree, rank=rank):
+                    geometry = get_shard_geometry(shape, dim, degree, rank)
+                    expected = chunks[rank] if rank < len(chunks) else source.narrow(dim, shape[dim], 0)
+                    actual = source.narrow(dim, geometry.start, geometry.local_shape[dim])
+                    self.assertEqual(geometry.local_shape, expected.shape,
+                                     f"local shape={geometry.local_shape}, expected={expected.shape}")
+                    self.assertEqual(geometry.padded_shape, chunks[0].shape,
+                                     f"padded shape={geometry.padded_shape}, expected={chunks[0].shape}")
+                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    def test_rejects_invalid_shard_coordinates(self):
+        """Invalid dimensions and group coordinates fail before tensor slicing."""
+        for shape, dim, degree, rank in (
+            ((), 0, 2, 0), ((4,), -1, 2, 0), ((4,), 1, 2, 0),
+            ((4,), 0, 0, 0), ((4,), 0, 2, -1), ((4,), 0, 2, 2),
+        ):
+            with self.subTest(shape=shape, dim=dim, degree=degree, rank=rank):
+                with self.assertRaises(ValueError):
+                    get_shard_geometry(shape, dim, degree, rank)
 
 
 class SimpleLinear(nn.Module):

@@ -147,6 +147,16 @@ class FSDP2Manager:
             return expert_mesh[("edp_replicate", "edp_shard")]
         return expert_mesh["edp_shard"]
 
+    def replicate_parameter_names(self, model: ModuleClass) -> frozenset[str]:
+        """Resolve configured replicated parameters, including all tied aliases.
+
+        Args:
+            model: Final model before FSDP storage is prepared.
+        """
+        parameters = self._resolve_replicate_params(model) or set()
+        return frozenset(name for name, parameter in model.named_parameters(remove_duplicate=False)
+                         if parameter in parameters)
+
     def _build_dense_fsdp_mesh(self) -> DeviceMesh | None:
         """Select the prebuilt dense FSDP child mesh when available."""
         dense_mesh = self.mesh_context.fsdp_non_moe_mesh
@@ -217,6 +227,22 @@ class FSDP2Manager:
             bindings.update(dict.fromkeys(parameters, mesh))
             claimed.update(parameters)
         return bindings
+
+    def mixed_precision_bindings(
+        self, model: ModuleClass, source_shard_info: SourceShardInfoByFQN | None,
+    ) -> tuple[fully_shard_utils.MixedPrecisionPolicy, tuple[ModuleClass, ...]]:
+        """Resolve the eager precision policy and unit boundaries without hooks.
+
+        Args:
+            model: Final model before parameter storage is partitioned.
+            source_shard_info: Source TP/EP layout returned by the planner.
+        """
+        parameters = dict(model.named_parameters(remove_duplicate=False))
+        custom = self._resolve_custom_params(parameters) if self.config.mix_precision.custom_params else None
+        policy = self._build_mixed_precision_policy(custom)
+        metadata = _build_source_shard_info_by_param(self, model, source_shard_info)
+        units = self._find_wrap_modules(model, metadata)
+        return policy, tuple(dict.fromkeys([model, *(unit.module for unit in units)]))
 
     def _resolve_custom_params(
         self, parameters_by_fqn: Mapping[str, ParameterClass]

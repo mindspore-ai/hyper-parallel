@@ -73,6 +73,16 @@ class TestFSDPCustomPrecisionConfig(unittest.TestCase):
         self.assertEqual(len(bindings), len(list(model.parameters())) - 1)
         self.assertTrue(all(not getattr(param, "_hsdp_param_initialized", False) for param in model.parameters()))
 
+    def test_replicate_parameter_names_validate_and_expand_tied_aliases(self):
+        """Both execution paths select configured replicas by actual parameter identity."""
+        model = _DecoderModel()
+        model.head.bias = model.layers[0].bias
+        manager = FSDP2Manager(FSDP2Config(replicate_params=["layers.0.bias"]), MeshContext())
+        self.assertEqual(manager.replicate_parameter_names(model), frozenset(("layers.0.bias", "head.bias")))
+        manager.config.replicate_params = ["missing"]
+        with self.assertRaisesRegex(ValueError, "unknown parameter FQN"):
+            manager.replicate_parameter_names(model)
+
     def test_preinitialized_parameters_are_absent_from_graph_bindings(self):
         """An already managed nested parameter is not claimed a second time."""
         model = _DecoderModel()

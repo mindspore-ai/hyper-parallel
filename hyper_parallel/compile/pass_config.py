@@ -555,8 +555,9 @@ def build_pass_config_from_trainer_config(
     *,
     fsdp_enabled: Optional[bool] = None,
     enable_overlap: bool = False,
+    mesh_context: Optional[Any] = None,
 ) -> PassConfig:
-    """Project trainer topology intent onto graph-mode pass config.
+    """Project trainer topology and joint-backend intent onto graph-mode passes.
 
     This helper stays in the pass-config module because it computes the
     graph-pass surface from the trainer topology without altering runtime
@@ -587,17 +588,23 @@ def build_pass_config_from_trainer_config(
         fsdp_enabled: Overrides the sharded-DP intent derived from
             ``config.fsdp_config`` when provided.
         enable_overlap: Value for the legacy ``AutoOverlapPass`` switch.
+        mesh_context: Resolved topology, including the DP replicate axis.
 
     Returns:
         The graph-mode ``PassConfig`` for this trainer topology.
     """
     compile_config = getattr(config, "compile", None)
+    replicate_degree = getattr(mesh_context, "dp_replicate_size", 1)
     if fsdp_enabled is None:
         fsdp_enabled = (
             config.fsdp_config.dp_shard_size > 1
             or config.fsdp_config.edp_shard_size > 1
+            or replicate_degree > 1
         )
     fsdp_degree = config.fsdp_config.dp_shard_size if fsdp_enabled else None
+    dp_mode = "fsdp"
+    if replicate_degree > 1:
+        dp_mode = "hsdp" if config.fsdp_config.dp_shard_size > 1 else "ddp"
 
     ac_mode = "off"
     ac_layer_count = None
@@ -626,6 +633,8 @@ def build_pass_config_from_trainer_config(
         enable_overlap=enable_overlap,
         fsdp_enabled=fsdp_enabled,
         fsdp_degree=fsdp_degree,
+        dp_mode=dp_mode,
+        dp_replicate_degree=replicate_degree,
         fsdp_reshard_after_forward=getattr(
             config.fsdp_config, "reshard_after_forward", True
         ),
@@ -636,6 +645,8 @@ def build_pass_config_from_trainer_config(
             compile_config, "fsdp_overlap_grad_reduce", True
         ),
         max_in_flight_gb=getattr(compile_config, "max_in_flight_gb", 0.25),
+        inductor_mode=getattr(compile_config, "inductor_mode", "off"),
+        inductor_configs=getattr(compile_config, "inductor_configs", None),
         ac_mode=ac_mode,
         ac_layer_count=ac_layer_count,
         ac_layer_indices=ac_layer_indices,

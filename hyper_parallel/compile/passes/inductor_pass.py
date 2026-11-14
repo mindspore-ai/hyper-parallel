@@ -318,7 +318,7 @@ class InductorPass(GraphPass):
                 placeholder metas.
 
         Returns:
-            The same graph module with compiled regions spliced in and the
+            The runtime module with compiled regions spliced in and the
             positional calling convention restored. On torch builds without
             regional Inductor support it is returned untouched, logging a
             warning and recording ``"unavailable"`` in its meta.
@@ -342,7 +342,7 @@ class InductorPass(GraphPass):
                     "JointGraph.example_inputs) to size compiled regions"
                 )
             if _regional_inductor_available():
-                self._compile_graph(graph_module, pass_config, example_inputs)
+                graph_module = self._compile_graph(graph_module, pass_config, example_inputs)
                 compiled = True
             else:
                 self._warn_unavailable(mode)
@@ -424,6 +424,11 @@ class InductorPass(GraphPass):
         _propagate_fake_vals(graph_module)
         if example_inputs is None:
             example_inputs = _placeholder_fake_args(graph_module)
+        else:
+            # FSDP partitions state storage after capture; user symbols stay unchanged.
+            state_count = getattr(graph_module, "num_state_inputs", 0)
+            state_inputs = tuple(_placeholder_fake_args(graph_module)[:state_count])
+            example_inputs = state_inputs + tuple(example_inputs[state_count:])
         _LOG.info(
             "InductorPass: compiling graph in %r mode (%d placeholders, %d nodes)",
             mode,
