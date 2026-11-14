@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Distributed adapters for DeepSeek-V3."""
+"""Public multi_latent_attention construction and concrete algorithm."""
 
-from hyper_parallel.models.deepseek_v3.adapter.distributed.context_parallel import mla_cp_wrapper
+from .multi_latent_attention import MultiLatentAttentionModule
+from .multi_latent_attention_family import MultiLatentAttention
 
-__all__ = ["mla_cp_wrapper"]
+__all__ = ["MultiLatentAttention", "MultiLatentAttentionModule"]

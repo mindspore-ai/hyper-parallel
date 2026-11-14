@@ -12,43 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Contract pinning for the Qwen3-MoE adapter homes (post-M5).
-
-Post-M5 state (adjust doc §5.1-§5.3, M5): the legacy
-``components/models/qwen3_moe_fusions.py`` and
-``qwen3_moe_attention_common.py`` are deleted, the whole-block
-``replace_qwen3_moe_sparse_moe`` is gone (breaking change — superseded by a
-``*.mlp.experts`` replacement onto ``modules.GroupedExperts``), and every
-Qwen3-MoE rule lives at exactly one adapter home:
-
-* the ``@module_replacement`` factories in
-  ``models/qwen3_moe/adapter/conversion/module_replacement.py`` (declaring the generic
-  ``modules.RMSNorm`` / ``modules.GQAAttention`` entries);
-* the Qwen mask/cache attention contract in
-  ``models/qwen3_moe/adapter/runtime/attention.py``;
-* the fused ``@inner_wrapper`` CP wrappers in
-  ``adapter/distributed/context_parallel.py`` and the async (whole-forward,
-  HF-structure) wrappers in ``adapter/distributed/context_parallel_async.py``
-  — all returning ``_ForwardRewriteRequest`` (they never assign
-  ``target.forward``);
-* the ``@local_compute`` EP archetype factory in
-  ``adapter/distributed/expert_parallel.py`` on top of the generic
-  ``build_ep_compute`` skeleton.
-
-Pinned here (Gate-1: no NPU, no process group):
-
-* the legacy import paths, the generic-surface Qwen3 exports and the
-  ``EP_ARCHETYPES["qwen3moe_topk_router"]`` entry are gone;
-* marks, signatures, fail-fast validation and the rewrite-request return
-  contract of every adapter wrapper/factory;
-* the attention mask/cache branches of ``run_qwen3_moe_flash_attention``
-  driven through a recording ``torch_npu`` stub.
-"""
-# pylint: disable=wrong-import-position
+"""Qwen adapter contracts and class-owned GQA family integration on CPU."""
+# These per-case imports keep optional model implementations behind the CPU fixtures.
+# pylint: disable=wrong-import-position,import-outside-toplevel
 
 import importlib.util
 import inspect
-import os
 import sys
 import types
 import unittest
@@ -58,12 +27,8 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
-from hyper_parallel.distributed._builder.forward_rewriter import (
-    _ForwardRewriteRequest,
-)
 from hyper_parallel.distributed.expert_parallel import recipes as ep_compute
 from hyper_parallel.distributed.recipe_spec import (
-    INNER_WRAPPER,
     LOCAL_COMPUTE,
 )
 from hyper_parallel.models.qwen3_moe.adapter.conversion import (
@@ -74,32 +39,13 @@ from hyper_parallel.models.qwen3_moe.adapter.runtime.attention import (
     run_qwen3_moe_flash_attention,
 )
 from hyper_parallel.models.qwen3_moe.adapter.distributed import (
-    context_parallel as adapter_context_parallel,
-)
-from hyper_parallel.models.qwen3_moe.adapter.distributed import (
-    context_parallel_async as adapter_context_parallel_async,
-)
-from hyper_parallel.models.qwen3_moe.adapter.distributed import (
     expert_parallel as adapter_expert_parallel,
 )
-from tests.ut.auto_models.distributed.conftest import FakeSubMesh
 
 _REPLACEMENT_NAMES = (
     "replace_qwen3_moe_rms_norm",
     "replace_qwen3_moe_flash_attention",
     "replace_qwen3_moe_grouped_experts",
-)
-
-_CP_WRAPPER_NAMES = (
-    "qwen3_moe_flash_attention_cp_wrapper",
-    "qwen3_moe_flash_attention_cp_mask_wrapper",
-    "qwen3_moe_flash_attention_ulysses_cp_wrapper",
-)
-
-_ASYNC_CP_WRAPPER_NAMES = (
-    "qwen3_moe_async_colossal_cp_wrapper",
-    "qwen3_moe_async_ulysses_cp_wrapper",
-    "qwen3_moe_async_hybrid_cp_wrapper",
 )
 
 _MESH_FAMILY = frozenset({"mesh", "tp_mesh", "cp_mesh", "ep_mesh"})
@@ -134,15 +80,14 @@ class TestLegacyEntryPointsRemoved(unittest.TestCase):
         from hyper_parallel.distributed import expert_parallel
         self.assertFalse(hasattr(expert_parallel, "qwen3moe_ep_compute_fn"))
 
-    def test_generic_cp_surface_has_no_qwen3_branch(self):
-        """The async Qwen3 wrappers leave the generic CP surface."""
-        from hyper_parallel.distributed import context_parallel
-        from hyper_parallel.distributed.context_parallel import wrappers
-        for name in _ASYNC_CP_WRAPPER_NAMES:
-            with self.subTest(wrapper=name):
-                self.assertFalse(hasattr(context_parallel, name))
-                self.assertFalse(hasattr(wrappers, name))
-        self.assertFalse(any("qwen3" in name for name in wrappers.INNER_WRAPPER_REGISTRY))
+    def test_cp_wrappers_replaced_by_family(self):
+        """Feature: No model-specific CP forward closures remain.
+        Description: Resolve the deleted wrapper modules without importing them.
+        Expectation: CP is selected by the family and both old modules are absent.
+        """
+        for suffix in ("context_parallel", "context_parallel_async"):
+            self.assertIsNone(importlib.util.find_spec(
+                "hyper_parallel.models.qwen3_moe.adapter.distributed." + suffix))
 
 
 class TestReplacementFactoryContracts(unittest.TestCase):
@@ -177,7 +122,6 @@ class TestAdapterHomeContracts(unittest.TestCase):
     def test_attention_contract_lives_in_the_adapter(self):
         """The mask/cache contract and the function-form forward are callables."""
         self.assertTrue(callable(adapter_attention.run_qwen3_moe_flash_attention))
-        self.assertTrue(callable(adapter_attention._get_compressed_causal_mask))  # pylint: disable=protected-access
         # the function-form forward keeps the historical contract
         self.assertTrue(callable(adapter_attention.qwen3_moe_flash_attention_forward))
 
@@ -187,247 +131,84 @@ class TestAdapterHomeContracts(unittest.TestCase):
         spec = get_model_adapter("qwen3_moe")
         self.assertIs(spec.replacements(), adapter_replacements)
         self.assertIs(spec.attention(), adapter_attention)
-        self.assertIs(spec.context_parallel(), adapter_context_parallel)
+        self.assertIsNone(spec.context_parallel)
         self.assertIs(spec.expert_parallel(), adapter_expert_parallel)
 
 
-class TestCpWrapperContracts(unittest.TestCase):
-    """Fused ``@inner_wrapper`` CP wrappers: mark, signature, validation."""
+class TestGQAFamilyContracts(unittest.TestCase):
+    """Minimal family promotion, layout and packed-partition regressions."""
 
-    def test_inner_wrapper_mark_and_signature(self):
-        """Each wrapper declares the full wrapper context and returns a request."""
-        for name in _CP_WRAPPER_NAMES:
-            with self.subTest(wrapper=name):
-                wrapper = getattr(adapter_context_parallel, name)
-                meta = getattr(wrapper, "_injection_meta", None)
-                self.assertIsNotNone(meta)
-                self.assertEqual(meta.kind, INNER_WRAPPER)
-                self.assertEqual(meta.context, {"target_module"} | _MESH_FAMILY)
-                parameters = list(inspect.signature(wrapper).parameters.values())
-                self.assertEqual(
-                    [param.name for param in parameters],
-                    ["target_module", "mesh", "tp_mesh", "cp_mesh", "ep_mesh"],
-                )
-                for param in parameters:
-                    self.assertIs(param.default, inspect.Parameter.empty)
-                # the wrappers return a _ForwardRewriteRequest instead of
-                # assigning target.forward (`from __future__ import
-                # annotations` stores the annotation as a string)
-                self.assertEqual(
-                    inspect.signature(wrapper).return_annotation,
-                    "_ForwardRewriteRequest",
-                )
+    @staticmethod
+    def _source(gated=False):
+        source = nn.Module()
+        source.config = SimpleNamespace(hidden_size=16, num_attention_heads=4,
+                                        num_key_value_heads=2, head_dim=4)
+        source.q_proj = nn.Linear(16, 32 if gated else 16)
+        source.k_proj = nn.Linear(16, 8)
+        source.v_proj = nn.Linear(16, 8)
+        source.o_proj = nn.Linear(16, 16)
+        source.q_norm = nn.LayerNorm(4)
+        source.k_norm = nn.LayerNorm(4)
+        return source
 
-    def test_wrappers_require_active_cp_mesh(self):
-        """cp_mesh None or size 1 fails fast before any forward is touched."""
-        for name in _CP_WRAPPER_NAMES:
-            wrapper = getattr(adapter_context_parallel, name)
-            with self.subTest(wrapper=name, cp_mesh="none"):
-                with self.assertRaisesRegex(ValueError, "requires an active CP mesh"):
-                    wrapper(nn.Module(), None, None, None, None)
-            with self.subTest(wrapper=name, cp_mesh="size1"):
-                size_one = FakeSubMesh("cpu", (1,), ("cp",))
-                with self.assertRaisesRegex(ValueError, "requires an active CP mesh"):
-                    wrapper(nn.Module(), None, None, size_one, None)
-
-    def test_wrappers_require_flash_attention_forward_first(self):
-        """A target without the fused attention forward is rejected."""
-        cp_mesh = FakeSubMesh("cpu", (2,), ("cp",))
-        target = nn.Module()
-        original_forward = target.forward
-        for name in (
-            "qwen3_moe_flash_attention_cp_wrapper",
-            "qwen3_moe_flash_attention_cp_mask_wrapper",
-        ):
-            with self.subTest(wrapper=name):
-                with self.assertRaisesRegex(
-                    ValueError, "replace_qwen3_moe_flash_attention first"
-                ):
-                    getattr(adapter_context_parallel, name)(target, None, None, cp_mesh, None)
-        self.assertIs(target.forward.__func__, original_forward.__func__)
-
-    def test_ulysses_wrapper_validates_head_counts(self):
-        """Pure Ulysses requires config head counts divisible by the CP degree."""
-        cp_mesh = FakeSubMesh("cpu", (2,), ("cp",))
-        wrapper = adapter_context_parallel.qwen3_moe_flash_attention_ulysses_cp_wrapper
-        with self.assertRaisesRegex(ValueError, "requires target_module.config"):
-            wrapper(nn.Module(), None, None, cp_mesh, None)
-        target = nn.Module()
-        target.config = SimpleNamespace(num_attention_heads=3, num_key_value_heads=2)
-        with self.assertRaisesRegex(ValueError, "divisible"):
-            wrapper(target, None, None, cp_mesh, None)
-
-    def test_wrappers_return_rewrite_requests_without_mutating_forward(self):
-        """The adapter wrappers never assign ``target.forward`` (05 §15.2.3).
-
-        Each wrapper returns one ``_ForwardRewriteRequest`` for the target
-        whose companion attribute swaps ``attention_interface`` for the
-        CP-orchestrated interface; the target's forward and interface stay
-        untouched until the generic forward rewriter commits the request.
+    def test_promotion_preserves_parameters_and_fixed_representation(self):
+        """Feature: Class-owned CP with stable parameter/FSDP boundaries.
+        Description: Promote ordinary, split and gated local members to CP2/TP2.
+        Expectation: Weights keep identity and overlap never changes their names.
         """
-        cp_mesh = FakeSubMesh("cpu", (2,), ("cp",))
-        for name in _CP_WRAPPER_NAMES:
-            with self.subTest(wrapper=name):
-                target = nn.Module()
-                target.config = SimpleNamespace(
-                    num_attention_heads=4, num_key_value_heads=2
-                )
-                sentinel_interface = unittest.mock.Mock()
-                target.attention_interface = sentinel_interface
-                recording_forward = unittest.mock.Mock(return_value="sentinel-output")
-
-                target.forward = recording_forward
-                request = getattr(adapter_context_parallel, name)(
-                    target, None, None, cp_mesh, None
-                )
-                self.assertIsInstance(request, _ForwardRewriteRequest)
-                self.assertIs(request.target, target)
-                self.assertTrue(callable(request.forward))
-                self.assertEqual(set(request.companion_attrs), {"attention_interface"})
-                self.assertTrue(callable(request.companion_attrs["attention_interface"]))
-                # nothing is installed until the rewriter commits the request
-                self.assertIs(target.forward, recording_forward)
-                self.assertIs(target.attention_interface, sentinel_interface)
-                # the returned forward passes through to the original forward
-                self.assertIs(request.forward("a", key=1), "sentinel-output")
-                recording_forward.assert_called_once_with("a", key=1)
-
-
-def _hf_structure_attention():
-    """A module carrying the HF-structure attributes the async wrappers need."""
-    target = nn.Module()
-    for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
-        setattr(target, name, nn.Linear(4, 4, bias=False))
-    target.q_norm = SimpleNamespace(weight=torch.ones(4), variance_epsilon=1e-6)
-    target.k_norm = SimpleNamespace(weight=torch.ones(4), variance_epsilon=1e-6)
-    target.head_dim = 4
-    target.scaling = 0.5
-    target.config = SimpleNamespace(num_attention_heads=4, num_key_value_heads=2)
-    return target
-
-
-class TestAsyncCpWrapperContracts(unittest.TestCase):
-    """Async (HF-structure) ``@inner_wrapper`` CP wrappers at their M5 home."""
-
-    def test_inner_wrapper_mark_and_signature(self):
-        """Each async wrapper declares the wrapper context (+ ulysses_degree)."""
-        expected_params = {
-            "qwen3_moe_async_colossal_cp_wrapper":
-                ["target_module", "mesh", "tp_mesh", "cp_mesh", "ep_mesh"],
-            "qwen3_moe_async_ulysses_cp_wrapper":
-                ["target_module", "mesh", "tp_mesh", "cp_mesh", "ep_mesh"],
-            "qwen3_moe_async_hybrid_cp_wrapper":
-                ["target_module", "mesh", "tp_mesh", "cp_mesh", "ep_mesh",
-                 "ulysses_degree"],
-        }
-        for name in _ASYNC_CP_WRAPPER_NAMES:
-            with self.subTest(wrapper=name):
-                wrapper = getattr(adapter_context_parallel_async, name)
-                meta = getattr(wrapper, "_injection_meta", None)
-                self.assertIsNotNone(meta)
-                self.assertEqual(meta.kind, INNER_WRAPPER)
-                self.assertEqual(meta.context, {"target_module"} | _MESH_FAMILY)
-                parameters = list(inspect.signature(wrapper).parameters.values())
-                self.assertEqual(
-                    [param.name for param in parameters], expected_params[name]
-                )
-                for param in parameters:
-                    self.assertIs(param.default, inspect.Parameter.empty)
-                self.assertEqual(
-                    inspect.signature(wrapper).return_annotation,
-                    "_ForwardRewriteRequest",
-                )
-
-    def test_async_wrappers_require_active_cp_mesh(self):
-        """cp_mesh None or size 1 fails fast before any forward is touched."""
-        for name in _ASYNC_CP_WRAPPER_NAMES:
-            wrapper = getattr(adapter_context_parallel_async, name)
-            extra = (2,) if name == "qwen3_moe_async_hybrid_cp_wrapper" else ()
-            with self.subTest(wrapper=name, cp_mesh="none"):
-                with self.assertRaisesRegex(ValueError, "requires an active CP mesh"):
-                    wrapper(nn.Module(), None, None, None, None, *extra)
-            with self.subTest(wrapper=name, cp_mesh="size1"):
-                size_one = FakeSubMesh("cpu", (1,), ("cp",))
-                with self.assertRaisesRegex(ValueError, "requires an active CP mesh"):
-                    wrapper(nn.Module(), None, None, size_one, None, *extra)
-
-    def test_async_wrappers_require_hf_attention_structure(self):
-        """A target without q_proj/k_proj/v_proj/q_norm/k_norm is rejected."""
-        cp_mesh = FakeSubMesh("cpu", (2,), ("cp",))
-        for name in (
-            "qwen3_moe_async_colossal_cp_wrapper",
-            "qwen3_moe_async_ulysses_cp_wrapper",
-        ):
-            with self.subTest(wrapper=name):
-                # config present so head validation passes; the HF projection
-                # structure is what's missing
-                target = nn.Module()
-                target.config = SimpleNamespace(
-                    num_attention_heads=4, num_key_value_heads=2
-                )
-                with self.assertRaisesRegex(
-                    TypeError, "requires an attention module with attributes"
-                ):
-                    getattr(adapter_context_parallel_async, name)(
-                        target, None, None, cp_mesh, None
-                    )
-
-    def test_async_ulysses_wrapper_validates_head_counts(self):
-        """Async Pure Ulysses requires head counts divisible by the CP degree."""
-        cp_mesh = FakeSubMesh("cpu", (2,), ("cp",))
-        wrapper = adapter_context_parallel_async.qwen3_moe_async_ulysses_cp_wrapper
-        target = _hf_structure_attention()
-        target.config = SimpleNamespace(num_attention_heads=3, num_key_value_heads=2)
-        with self.assertRaisesRegex(ValueError, "divisible"):
-            wrapper(target, None, None, cp_mesh, None)
-
-    def test_async_cp_expands_2d_padding_mask(self):
-        """A HuggingFace padding mask should become a local causal mask."""
-        query = torch.zeros(2, 2, 3, 4)
-        key = torch.zeros(2, 2, 6, 4)
-        padding_mask = torch.tensor([[1, 1, 1, 1, 1, 0], [1, 1, 1, 1, 0, 0]])
-
-        mask = adapter_context_parallel_async._prepare_qwen3_moe_attention_mask(
-            padding_mask,
-            query,
-            key,
-            query_offset=3,
+        from hyper_parallel.components.modules import (
+            GroupedQueryAttention, SplitGroupedQueryAttention, GatedGroupedQueryAttention,
         )
+        from hyper_parallel.components.modules.module_family import get_family_build_info
+        for factory in (GroupedQueryAttention, SplitGroupedQueryAttention, GatedGroupedQueryAttention):
+            local = factory(module=self._source(factory is GatedGroupedQueryAttention))
+            parallel = factory(module=local, context={"cp_size": 2, "tp_size": 2}, overlap=True, ulysses_degree=1)
+            self.assertEqual(get_family_build_info(parallel).resolved.variant, "cp")
+            self.assertEqual(set(dict(local.named_parameters())), set(dict(parallel.named_parameters())))
+            for name, parameter in parallel.named_parameters():
+                self.assertIs(parameter, local.get_parameter(name))
+            self.assertNotIn("forward", vars(parallel))
+            if factory is not SplitGroupedQueryAttention:
+                source = self._source(factory is GatedGroupedQueryAttention)
+                parallel.num_key_value_heads = 1  # TP binding localizes runtime heads, not checkpoint layout.
+                transform = parallel.make_transforms()[0]
+                converted = transform.operations[0].convert(
+                    dict(source.named_parameters()), transform.source_patterns, transform.target_patterns)
+                self.assertEqual(converted["linear_qkv.weight"].shape, local.linear_qkv.weight.shape)
+        with self.assertRaisesRegex(ValueError, "divisible by TP"):
+            GroupedQueryAttention(module=self._source(), context={"tp_size": 3})
 
-        self.assertEqual(mask.shape, (2, 1, 3, 6))
-        self.assertEqual(mask.dtype, torch.bool)
-        self.assertFalse(mask[0, :, :, -1].any())
-        self.assertFalse(mask[1, :, :, -2:].any())
-
-    def test_async_wrappers_return_rewrite_requests_without_mutating_forward(self):
-        """M5: the async wrappers return a request and never assign forward.
-
-        Unlike the fused wrappers there are no companion attributes — the
-        request's forward IS the whole replacement forward (the async
-        overlap-scheduled pipeline), so nothing passes through to the
-        original forward.
+    def test_family_owns_qkv_groups_norm_and_output_bias_layout(self):
+        """Feature: Complete TP/SP layout without KV replication.
+        Description: Build the final layout for a biased GQA module at TP2 CP2.
+        Expectation: QKV rows and output columns shard; per-head Norm and O bias replicate.
         """
-        cp_mesh = FakeSubMesh("cpu", (2,), ("cp",))
-        for name in (
-            "qwen3_moe_async_colossal_cp_wrapper",
-            "qwen3_moe_async_ulysses_cp_wrapper",
-        ):
-            with self.subTest(wrapper=name):
-                target = _hf_structure_attention()
+        from hyper_parallel.components.modules import GroupedQueryAttention
+        from hyper_parallel.components.modules.module_family import FamilyShardingContext, get_family_build_info
+        from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
+        module = GroupedQueryAttention(module=self._source())
+        info = get_family_build_info(module)
+        context = FamilyShardingContext(("cp", "tp"), {"cp": 2, "tp": 2}, {}, sequence_parallel=True)
+        spec = info.resolved.sharding(module=module, module_fqn="", member=info.resolved, context=context)
+        self.assertEqual(spec.params["linear_qkv.weight"]["tp"], Shard(0))
+        self.assertEqual(spec.params["o_proj.weight"]["tp"], Shard(1))
+        self.assertEqual(spec.params["o_proj.bias"]["tp"], Replicate())
+        self.assertEqual(spec.params["q_norm.weight"]["tp"], Replicate())
+        self.assertEqual(spec.in_src["hidden_states"]["tp"], Shard(1))
 
-                def recording_forward(*args, **kwargs):
-                    return "sentinel-output"
-
-                target.forward = recording_forward
-                request = getattr(adapter_context_parallel_async, name)(
-                    target, None, None, cp_mesh, None
-                )
-                self.assertIsInstance(request, _ForwardRewriteRequest)
-                self.assertIs(request.target, target)
-                self.assertTrue(callable(request.forward))
-                self.assertFalse(request.companion_attrs)
-                # nothing is installed until the rewriter commits the request
-                self.assertIs(target.forward, recording_forward)
+    def test_packed_query_fragments_preserve_document_visibility(self):
+        """Feature: Packed AG consumes local Q and correct global document prefixes.
+        Description: Include a document crossing a batch boundary with CP2.
+        Expectation: Every selected key belongs to the query's own document and causal prefix.
+        """
+        from hyper_parallel.components.modules.attention.grouped_query_attention.cp_grouped_query_attention import (
+            _query_documents,
+        )
+        lengths = (3, 10, 16)
+        ranges, q_lengths, k_lengths = _query_documents(lengths, 2, 8, 4, 1, True)
+        self.assertEqual(ranges, ((3, 8), (10, 16)))
+        self.assertEqual(q_lengths, (4, 8))
+        self.assertEqual(k_lengths, (5, 11))
 
 
 class TestEpFactoryContract(unittest.TestCase):
@@ -471,16 +252,17 @@ class _AttentionNpuStub(types.ModuleType):
         super().__init__("torch_npu")
         self.calls = []
 
-    def npu_fusion_attention(self, query, key, value, **kwargs):
+    def npu_fusion_attention(self, query, key, value, head_num, input_layout, **kwargs):
         """Record the kernel kwargs and echo the query as attention output."""
-        self.calls.append(kwargs)
+        del key, value
+        self.calls.append(dict(kwargs, head_num=head_num, input_layout=input_layout))
         return query, None
 
 
 class TestFlashAttentionMaskBranches(unittest.TestCase):
     """Mask/cache branches of ``run_qwen3_moe_flash_attention`` (Ascend kernel)."""
 
-    def _run(self, query, key, value, attention_mask, module=None):
+    def _run(self, query, key, value, attention_mask, module=None, **options):
         """Run the attention helper with a recording ``torch_npu`` stub."""
         stub = _AttentionNpuStub()
         with unittest.mock.patch.dict(sys.modules, {"torch_npu": stub}):
@@ -490,26 +272,26 @@ class TestFlashAttentionMaskBranches(unittest.TestCase):
                 key,
                 value,
                 attention_mask,
+                **options,
             )
         return stub, output, weights
 
-    def test_none_mask_uses_cached_compressed_causal_mask(self):
-        """mask=None selects sparse_mode=2 with the cached 2048 compressed mask."""
+    def test_packed_lengths_reach_tnd_kernel(self):
+        """Feature: Qwen no longer discards packed metadata.
+        Description: Supply two documents to the adapter's common FA delegate.
+        Expectation: TND and both cumulative-length arrays reach the kernel unchanged.
+        """
         query = torch.randn(1, 2, 4, 8)
-        stub, output, weights = self._run(query, query, query, None)
-        self.assertEqual(stub.calls[0]["sparse_mode"], 2)
-        mask = stub.calls[0]["atten_mask"]
-        self.assertEqual(mask.shape, (2048, 2048))
-        self.assertEqual(mask.dtype, torch.bool)
-        self.assertTrue(mask[0, 1])
-        self.assertFalse(mask[1, 0])
-        self.assertFalse(mask.diagonal().any())
-        # per-device cache: a second call reuses the identical mask object
-        stub_two, _, _ = self._run(query, query, query, None)
-        self.assertIs(stub_two.calls[0]["atten_mask"], mask)
-        # the kernel output is transposed back to (B, S, N, D) and weights are None
+        stub, output, weights = self._run(query, query, query, None, actual_seq_len=(1, 4))
+        call = stub.calls[0]
+        self.assertEqual(call["input_layout"], "TND")
+        self.assertEqual(list(call["actual_seq_qlen"]), [1, 4])
+        self.assertEqual(list(call["actual_seq_kvlen"]), [1, 4])
+        self.assertEqual(output.shape, (1, 4, 2, 8))
         self.assertIsNone(weights)
-        self.assertTrue(torch.equal(output, query.transpose(1, 2).contiguous()))
+        stub, _, _ = self._run(query, query, query, None, actual_seq_len=(1, 4), sliding_window=2)
+        self.assertEqual(stub.calls[0]["sparse_mode"], 4)
+        self.assertEqual(stub.calls[0]["pre_tockens"], 1)
 
     def test_bool_mask_is_inverted_and_sliced(self):
         """A Transformers-convention bool mask is inverted (True = blocked) for the
@@ -522,7 +304,7 @@ class TestFlashAttentionMaskBranches(unittest.TestCase):
         call = stub.calls[0]
         self.assertEqual(call["sparse_mode"], 0)
         self.assertTrue(torch.equal(
-            call["atten_mask"], torch.logical_not(full_mask[:, :, :, :4])
+            call["atten_mask"], torch.logical_not(full_mask[:, :, :, :4]) | torch.ones(4, 4, dtype=torch.bool).triu(1)
         ))
         # is_causal default + self-attention length match adds next_tockens=0
         self.assertEqual(call["next_tockens"], 0)
@@ -536,7 +318,7 @@ class TestFlashAttentionMaskBranches(unittest.TestCase):
         call = stub.calls[0]
         self.assertEqual(call["sparse_mode"], 0)
         self.assertTrue(torch.equal(
-            call["atten_mask"], float_mask.bool()
+            call["atten_mask"], float_mask.bool() | torch.ones(4, 4, dtype=torch.bool).triu(1)
         ))
 
     def test_next_tockens_requires_causal_self_attention(self):
@@ -545,12 +327,12 @@ class TestFlashAttentionMaskBranches(unittest.TestCase):
         key = torch.randn(1, 2, 4, 8)
         mask = torch.ones(1, 1, 2, 4, dtype=torch.bool)
         stub, _, _ = self._run(query, key, key, mask)
-        self.assertNotIn("next_tockens", stub.calls[0])
+        self.assertEqual(stub.calls[0]["next_tockens"], 0)
         non_causal = nn.Module()
         non_causal.is_causal = False
         self_mask = torch.ones(1, 1, 4, 4, dtype=torch.bool)
         stub, _, _ = self._run(key, key, key, self_mask, module=non_causal)
-        self.assertNotIn("next_tockens", stub.calls[0])
+        self.assertEqual(stub.calls[0]["next_tockens"], 2147483647)
 
 
 if __name__ == "__main__":

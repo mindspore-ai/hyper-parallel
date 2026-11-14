@@ -47,12 +47,12 @@ from transformers.utils.generic import is_flash_attention_requested, maybe_autoc
 from transformers.utils.output_capturing import capture_outputs
 
 
-from hyper_parallel.components.modules.mla_attention import MLAAttention
+from hyper_parallel.components.modules import MultiLatentAttention
 
 
 
 
-# Codegen replacement: MLAAttention wraps DeepseekV3Attention; the original class is kept as the wrapper input.
+# Codegen replacement: MultiLatentAttention wraps DeepseekV3Attention; the original class is kept as the wrapper input.
 
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
@@ -530,7 +530,7 @@ class DeepseekV3DecoderLayer(GradientCheckpointingLayer):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.self_attn = MLAAttention(module=DeepseekV3Attention(config=config, layer_idx=layer_idx), module_fqn='', context={})
+        self.self_attn = MultiLatentAttention(module=DeepseekV3Attention(config=config, layer_idx=layer_idx), module_fqn='', context={})
 
         if layer_idx >= config.first_k_dense_replace:
             self.mlp = DeepseekV3MoE(config)

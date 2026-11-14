@@ -7,7 +7,7 @@ Python or declaratively replace existing model modules through Trainer YAML.
 
 | Category | Modules |
 | --- | --- |
-| Attention | `GQAAttention`, `GatedGQAAttention`, `MLAAttention`, `DSAAttention`, `DeepseekV32DSAAttention` |
+| Attention | `GroupedQueryAttention`, `SplitGroupedQueryAttention`, `GatedGroupedQueryAttention`, `MultiLatentAttention`, `GatedMultiLatentAttention`, `DSAAttention`, `DeepseekV32DSAAttention` |
 | MoE and MLP | `GroupedExperts`, `SharedExpert`, `SwiGLUMLP` |
 | Normalization | `RMSNorm`, `OffsetRMSNorm` |
 | MHC | `MhcPreModule`, `MhcPostModule` |
@@ -27,6 +27,50 @@ output = norm(hidden_states)
 
 Registered module families select an implementation from explicit configuration rules before model construction.
 See [Module Family](README.module_family.md) for GroupedExperts MXFP8 examples, rule semantics, and extension guidance.
+
+## GQA and context parallelism
+
+GQA families own their parameter layouts and select local or CP members from the job topology:
+
+- `GroupedQueryAttention` uses a grouped, fused QKV projection and declares checkpoint conversion.
+- `SplitGroupedQueryAttention` retains independent Q/K/V projections and their checkpoint names. This preserves
+  the early communication windows of the former Qwen3-MoE asynchronous implementation.
+- `GatedGroupedQueryAttention` uses the per-query-head sigmoid output gate of Qwen3.5 full attention.
+  This does not replace the model's linear-attention layers.
+
+`overlap` changes launch/wait placement within the chosen representation; it does not change projection weights.
+The CP members reuse `CPContext`, while `TensorParallelExecution` owns SP input gathering and TP output reduction.
+`ulysses_degree: 1` selects KV AllGather; an omitted degree selects pure Ulysses; an intermediate divisor selects
+Ulysses plus KV AllGather. The Ulysses degree must divide both TP-local Q and KV head counts. KV heads are not
+replicated to the Q head count. Unsupported head layouts fail during construction.
+
+For example, the existing Qwen3-MoE KV AllGather recipe uses:
+
+```yaml
+plan_overrides:
+  - match: "model.layers.*.self_attn"
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.GroupedQueryAttention
+        ulysses_degree: 1
+        overlap: false
+```
+
+There is no additional CP forward-wrapper replacement. Use `SplitGroupedQueryAttention` with `overlap: true`
+to retain separate projection calls while overlapping ready Q/K/V transfers.
+
+Packed attention accepts global, batch-major cumulative lengths through the common FA interface, for example
+`actual_seq_len=(100, 300)` for documents of length 100 and 200. CP converts these boundaries into each query
+owner's document fragments; the FA call uses TND and preserves document isolation. Ordinary CP causal attention
+without an explicit mask also uses document/prefix metadata instead of creating a global square mask.
+
+Do not combine packed lengths with an explicit attention mask. At the full HF model boundary, select a model
+input adapter that forwards the lengths and suppresses the model's own dense-mask builder. Attention-level TND
+support alone does not change Trainer data preparation. Existing Qwen3-MoE online examples still use their
+explicit global document mask; the CP member slices it to the local query interval. Two-dimensional padding
+masks use one/True for valid tokens; fully masked query rows produce zero attention output before output bias.
+CP is a training path and does not accept a KV cache; local attention retains cache support.
 
 ## Install custom operators
 
@@ -94,7 +138,7 @@ plan_overrides:
       source_type: transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextAttention
       exact_type: true
       implementation:
-        _target_: hyper_parallel.components.modules.GQAAttention
+        _target_: hyper_parallel.components.modules.GroupedQueryAttention
 
   - match: "*.language_model.layers.*.mlp.experts"
     replace:

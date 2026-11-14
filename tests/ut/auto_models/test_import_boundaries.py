@@ -96,9 +96,9 @@ optional_modules = ("triton", "fla", "fla_npu")
 for name in optional_modules:
     sys.modules[name] = None
 
-from hyper_parallel.models.kimi_k3.adapter.distributed import kimi_mla_cp_wrapper
+from hyper_parallel.models.kimi_k3.adapter.mla import KimiMultiLatentAttention
 
-assert callable(kimi_mla_cp_wrapper)
+assert callable(KimiMultiLatentAttention)
 assert "hyper_parallel.distributed.context_parallel.kimi_delta_attention" not in sys.modules
 assert all(sys.modules[name] is None for name in optional_modules)
 print("MLA_IMPORT_ISOLATED")

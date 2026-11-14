@@ -30,20 +30,19 @@ from torch.utils.checkpoint import checkpoint
 
 from hyper_parallel import SkipDTensorDispatch, init_device_mesh
 from hyper_parallel.components.functional.npu_fusion_attention import npu_fusion_attention_forward
+from hyper_parallel.components.modules import MultiLatentAttention
+from hyper_parallel.models.kimi_k3.adapter.mla import KimiMultiLatentAttention
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 from hyper_parallel.distributed._builder.planner import ShardingPlanner
 from hyper_parallel.distributed.apply import apply_sharding_plan
-from hyper_parallel.distributed.context_parallel.mla_context_parallel import (
+from hyper_parallel.components.modules.attention.multi_latent_attention.cp_multi_latent_attention import (
     MLADimensions, MLA_CP_STRATEGIES, apply_mla_rope,
 )
 from hyper_parallel.distributed.mesh import MeshContext
-from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
 from hyper_parallel.models.build_options import FSDP2Config, FSDP2MixedPrecisionConfig
-from hyper_parallel.models.deepseek_v3.adapter.distributed.context_parallel import mla_cp_wrapper
-from hyper_parallel.trainer.config import Target
 from hyper_parallel.trainer.runtime.metrics import mean_global_loss
 from tests.common.mla_cp_utils import (
-    attention_options, install_mla_cp, make_mla, position_embeddings,
+    attention_options, make_mla, position_embeddings,
     make_deepseek_model, replace_and_load_mla,
 )
 
@@ -226,23 +225,22 @@ def _build_composition(mesh, tp, cp, strategy, metadata, device, dtype, overlap=
     ))
     reference.to(device)
     parallel = deepcopy(reference)
-    spec = ModuleShardingSpec(
-        inner_target="self", region_dispatch=False,
-        inner_wrapper=Target(
-            mla_cp_wrapper,
-            target_path="hyper_parallel.models.deepseek_v3.adapter.distributed.context_parallel.mla_cp_wrapper",
-            strategy=strategy, overlap=overlap, ulysses_degree=ulysses_degree,
-            kv_exchange=kv_exchange, **(callbacks or {}),
-        ),
+    parallel.self_attn = MultiLatentAttention(
+        module=parallel.self_attn, context={"tp_size": tp, "cp_size": cp},
+        strategy=strategy, overlap=overlap, ulysses_degree=ulysses_degree, kv_exchange=kv_exchange,
     )
-    plan = ShardingPlanner(plan_overrides={"self_attn": spec}).plan(
-        parallel, mesh, tp_size=tp, cp_size=cp, sequence_parallel=False,
-    )
+    plan = ShardingPlanner().plan(parallel, mesh, tp_size=tp, cp_size=cp, sequence_parallel=False)
     parallel, source_info = apply_sharding_plan(parallel, plan, mesh)
     if tp > 1:
         assert source_info, "TP parameter shards must retain source layouts for the reducer"
     assert parallel.self_attn.num_heads == dimensions.heads // tp
-    assert parallel.self_attn.mla_cp_runtime.plan.compute_heads == dimensions.heads // (tp * (ulysses_degree or cp))
+    runtime = parallel.self_attn.cp_runtime
+    if callbacks is not None:
+        runtime = type(runtime)(parallel.self_attn.cp_plan, mesh["cp"], **callbacks)
+        parallel.self_attn.cp_runtime = runtime
+    assert runtime.plan.compute_heads == dimensions.heads // (tp * (ulysses_degree or cp))
+    for module in (parallel.self_attn, parallel.self_attn.kv_b_proj, parallel.self_attn.o_proj):
+        assert "forward" not in vars(module), "MLA members must retain class-owned forward methods"
     for name, parameter in parallel.named_parameters():
         _compare(parameter, _tp_shard(reference.get_parameter(name), name, tp, tp_rank), dtype, f"TP layout {name}")
     if callbacks is not None:
@@ -388,7 +386,13 @@ def test_mla_local_callbacks_npu_bfloat16() -> None:
         def rotary(
             tensor: torch.Tensor, positions: tuple[torch.Tensor, torch.Tensor] | None, *, interleaved: bool,
         ) -> torch.Tensor:
-            """Record Q/K dispatch while executing the existing fused rotary implementation."""
+            """Record Q/K dispatch while executing the existing fused rotary implementation.
+
+            Args:
+                tensor: Local query or shared key.
+                positions: Rotary frequencies.
+                interleaved: Source channel-order convention.
+            """
             rotary_heads.add((tensor.shape[2], interleaved))
             return apply_mla_rope(tensor, positions, interleaved=interleaved)
 
@@ -396,7 +400,16 @@ def test_mla_local_callbacks_npu_bfloat16() -> None:
             owner: nn.Module, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
             mask: torch.Tensor | None = None, **options: Any,
         ) -> tuple[torch.Tensor, Any]:
-            """Scale global heads so an incorrect CP head slice changes outputs and gradients."""
+            """Scale global heads so an incorrect CP head slice changes outputs and gradients.
+
+            Args:
+                owner: Attention module.
+                query: Local query heads.
+                key: Local key heads.
+                value: Local value heads.
+                mask: Optional attention mask.
+                **options: Attention options and callback head ownership.
+            """
             local = "mla_head_offset" in options
             offset = options.pop("mla_head_offset", 0)
             heads = options.pop("mla_local_heads", query.shape[1])
@@ -426,19 +439,17 @@ def _model_fsdp_case(mesh: MeshContext, strategy: str, device: torch.device, *, 
     """Compare two real decoder layers and reconstructed FSDP gradients with SP on or off."""
     dtype = torch.bfloat16
     torch.manual_seed(314)
-    parallel, _ = replace_and_load_mla(make_deepseek_model(dtype=dtype, npu_dimensions=True))
+    source = make_deepseek_model(dtype=dtype, npu_dimensions=True)
+    reference, _ = replace_and_load_mla(deepcopy(source))
+    parallel, _ = replace_and_load_mla(source)
+    reference.to(device)
     parallel.to(device)
-    reference = deepcopy(parallel)
-    planner = ShardingPlanner(plan_overrides={
-        "*.self_attn": ModuleShardingSpec(
-            inner_target="self", region_dispatch=False,
-            inner_wrapper=Target(
-                mla_cp_wrapper,
-                target_path="hyper_parallel.models.deepseek_v3.adapter.distributed.context_parallel.mla_cp_wrapper",
-                strategy=strategy, overlap=True,
-            ),
-        ),
-    })
+    for layer in parallel.model.layers:
+        layer.self_attn = MultiLatentAttention(
+            module=layer.self_attn, context={"tp_size": mesh.tp_size, "cp_size": mesh.cp_size},
+            strategy=strategy, overlap=True,
+        )
+    planner = ShardingPlanner()
     plan = planner.plan(parallel, mesh.device_mesh, tp_size=mesh.tp_size, cp_size=mesh.cp_size,
                         sequence_parallel=sequence_parallel)
     parallel, source_info = apply_sharding_plan(parallel, plan, mesh)
@@ -529,7 +540,10 @@ def _overlap_graph_nodes(output: torch.Tensor) -> list[str]:
 
 def _overlap_snapshot(module, mesh, strategy, packed, gated, overlap, degree):
     """Keep two forward states alive before backward, then inspect local accumulated gradients."""
-    install_mla_cp(module, mesh, strategy, overlap=overlap, ulysses_degree=degree)
+    module = (KimiMultiLatentAttention if gated else MultiLatentAttention)(
+        module=module, mesh=MeshContext(device_mesh=mesh, cp_size=mesh.size()),
+        strategy=strategy, overlap=overlap, ulysses_degree=degree,
+    )
     rank, world = mesh.get_local_rank(), mesh.size()
     batch, local = (1 if packed else 2), 64
     sequence, hidden = local * world, module.linear_qkv.in_features
@@ -540,9 +554,18 @@ def _overlap_snapshot(module, mesh, strategy, packed, gated, overlap, degree):
     inputs, outputs, losses = [], [], []
 
     def forward(value: torch.Tensor) -> torch.Tensor:
-        """Use one callable for direct and non-reentrant checkpoint execution."""
+        """Use one callable for direct and non-reentrant checkpoint execution.
+
+        Args:
+            value: Local input tokens with their current autograd history.
+        """
         result = module(value, **options)
-        return result if gated else result[0]
+        if gated:
+            assert isinstance(result, torch.Tensor), (
+                f"Kimi output contract: expected=Tensor, actual={type(result).__name__}"
+            )
+            return result
+        return result[0]
 
     for microbatch in range(2):
         generator = torch.Generator().manual_seed(821 + microbatch)

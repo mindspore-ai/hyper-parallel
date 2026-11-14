@@ -221,7 +221,7 @@ def _prepare_attention_inputs(
         value = value.transpose(1, 2).reshape(-1, value.shape[1], value.shape[-1])
         if attention_mask is None and is_causal:
             npu_mask = _get_compressed_causal_mask(query.device)
-            sparse_mode = 3
+            sparse_mode = 4 if sliding_window is not None and sliding_window > 0 else 3
         else:
             npu_mask = None if attention_mask is None else _npu_attention_mask(attention_mask)
         return query, key, value, "TND", npu_mask, sparse_mode
@@ -294,6 +294,9 @@ def _prepare_attention_mask(
                 context.pre_tokens = sliding_window - 1
             elif context.query_length > _COMPRESSED_CAUSAL_MASK_SIZE:
                 context.sparse_mode = 2
+    if context.is_packed and sliding_window is not None and sliding_window > 0:
+        # Match the existing padding-to-TND window contract: W includes the current token.
+        context.pre_tokens = sliding_window - 1
     prepared = _prepare_attention_inputs(
         context.query, context.key, context.value, context.attention_mask,
         is_packed=context.is_packed,

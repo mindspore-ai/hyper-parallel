@@ -18,7 +18,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import wraps
 from typing import Any
 
 # Gate math and its autograd scheduling use native Torch.
@@ -27,16 +26,44 @@ from torch import nn  # pylint: disable=forbidden-backend-import
 from torch.autograd.function import once_differentiable  # pylint: disable=forbidden-backend-import
 from torch.nn import functional as F  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.distributed._builder.forward_rewriter import _ForwardRewriteRequest
 from hyper_parallel.distributed.context_parallel.collectives import (
     AsyncCPCollective, async_ulysses_seq_to_head_launch,
 )
-from hyper_parallel.distributed.context_parallel.mla_backward_overlap import (
+from hyper_parallel.components.modules.attention.multi_latent_attention.cp_mla_backward_overlap import (
     MLAExpandedInputA2AState, _InputA2ALaunch, launch_input_a2a,
 )
 
 
-@dataclass
+class CPGatedMLAOutputLinear(nn.Linear):
+    """Managed output projection with the gated MLA derivative contract."""
+
+    def __init__(self, source: nn.Linear) -> None:
+        """Preserve the source parameter tree and train/freeze state."""
+        nn.Module.__init__(self)
+        if type(source) is not nn.Linear and not isinstance(source, CPGatedMLAOutputLinear):  # pylint: disable=unidiomatic-typecheck
+            raise ValueError("Gated MLA scheduled output requires a plain Linear")
+        self.in_features, self.out_features = source.in_features, source.out_features
+        self.weight, self.bias = source.weight, source.bias
+        self.train(source.training)
+
+    def forward(self, input: torch.Tensor, *, mla_output_state: Any = None,
+                mla_output_gate: torch.Tensor | None = None) -> torch.Tensor:
+        """Enter the existing output Function only for an explicit CP invocation.
+
+        Args:
+            input: Local or head-partitioned attention output.
+            mla_output_state: Invocation-local layout and optional gate-gradient handoff.
+            mla_output_gate: Sigmoid gate paired with a scheduled CP output.
+        """
+        if mla_output_state is None:
+            if mla_output_gate is not None:
+                raise ValueError("Scheduled gated output requires a state")
+            return F.linear(input, self.weight, self.bias)
+        if mla_output_gate is None:
+            raise ValueError("Scheduled gated output requires its sigmoid gate")
+        return _GatedOutputProjection.apply(input, self.weight, self.bias, mla_output_gate, mla_output_state)
+
+
 class GatedMLAInputState:
     """Invocation-local gate values and the optional deferred native derivative.
 
@@ -46,11 +73,20 @@ class GatedMLAInputState:
     it only after submitting the input-gradient A2As.
     """
 
-    hidden: torch.Tensor | None
-    projection: Callable[[torch.Tensor], torch.Tensor] | None
-    defer_gate_gradient: bool
-    value: torch.Tensor | None = None
-    gradient: torch.Tensor | None = None
+    def __init__(self, hidden: torch.Tensor | None,
+                 projection: Callable[[torch.Tensor], torch.Tensor] | None,
+                 defer_gate_gradient: bool) -> None:
+        """Keep one identity across the input/output autograd nodes and FSDP hooks.
+
+        FSDP maps tensors recursively inside dataclass arguments. This shared
+        handoff is an opaque control object, not a tensor container to rebuild.
+        Its forward-only hidden/projection references are released by project().
+        """
+        self.hidden = hidden
+        self.projection = projection
+        self.defer_gate_gradient = defer_gate_gradient
+        self.value: torch.Tensor | None = None
+        self.gradient: torch.Tensor | None = None
 
     def project(self, source: torch.Tensor) -> torch.Tensor:
         """Run the managed gate and release its temporary forward-only references.
@@ -227,48 +263,3 @@ def _gated_output_projection_backward(ctx, gradient):
     grad_bias = flat_gradient.sum(0) if ctx.has_bias and needs_bias_grad else None
     grad_attention_output = grad_output_a2a.wait() if grad_output_a2a is not None else None
     return grad_attention_output, grad_weight, grad_bias, grad_gate, None
-
-
-def gated_mla_output_projection_request(projection: nn.Linear) -> _ForwardRewriteRequest:
-    """Install the gated output derivative after managed parameter pre-hooks.
-
-    Args:
-        projection: Plain, unwrapped output Linear, before FSDP installation.
-
-    Returns:
-        An atomic child rewrite; ordinary Linear calls remain unchanged.
-    """
-    if type(projection) is not nn.Linear:  # pylint: disable=unidiomatic-typecheck
-        raise ValueError("Gated MLA backward overlap requires a plain output Linear")
-    if getattr(projection.forward, "__func__", None) is not nn.Linear.forward:
-        raise ValueError("Gated MLA backward overlap requires an unwrapped plain output Linear")
-    original = projection.forward
-
-    @wraps(original)
-    def gated_output_projection(*args: torch.Tensor,
-                                mla_output_state: GatedMLAOutputProjectionState | None = None,
-                                mla_output_gate: torch.Tensor | None = None, **kwargs: Any) -> torch.Tensor:
-        """Select the scheduled gated boundary only for explicit internal calls.
-
-        Args:
-            *args: Positional arguments of the original Linear.
-            mla_output_state: Optional state selecting the scheduled output path.
-            mla_output_gate: Required post-sigmoid gate for a scheduled call.
-            **kwargs: Keyword arguments of the original Linear.
-
-        Returns:
-            Projected hidden states using ordinary or gated scheduled autograd.
-        """
-        if mla_output_state is None:
-            if mla_output_gate is not None:
-                raise ValueError("Scheduled gated MLA output requires an output state")
-            return original(*args, **kwargs)
-        if len(args) != 1 or kwargs:
-            raise TypeError("Scheduled gated MLA output projection requires one positional activation")
-        if mla_output_gate is None:
-            raise ValueError("Scheduled gated MLA output requires a gate tensor")
-        return _GatedOutputProjection.apply(
-            args[0], projection.weight, projection.bias, mla_output_gate, mla_output_state,
-        )
-
-    return _ForwardRewriteRequest(projection, gated_output_projection)

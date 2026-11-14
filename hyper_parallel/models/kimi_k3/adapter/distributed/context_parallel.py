@@ -12,13 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Planner-injected Context Parallel wrappers for Kimi KDA and gated MLA."""
+"""Planner-injected Context Parallel wrappers for Kimi KDA."""
 # pylint: disable=forbidden-backend-import
 from __future__ import annotations
 
 __all__ = [
     "kimi_delta_attention_cp_wrapper",
-    "kimi_mla_cp_wrapper",
     "kimi_delta_attention_p2p_cp_wrapper",
     "kimi_delta_attention_ulysses_cp_wrapper",
 ]
@@ -26,23 +25,24 @@ __all__ = [
 from functools import wraps
 from typing import Any, Type
 
-import torch
 from torch import nn
 
 from hyper_parallel.distributed import inner_wrapper
 from hyper_parallel.distributed._builder.forward_rewriter import (
     _ForwardRewriteRequest,
 )
-from hyper_parallel.distributed.context_parallel.mla_context_parallel import prepare_mla_cp
-from hyper_parallel.distributed.context_parallel.gated_mla_context_parallel import gated_mla_forward
-from hyper_parallel.distributed.context_parallel.gated_mla_backward_overlap import gated_mla_output_projection_request
-from hyper_parallel.models.kimi_k3.adapter.mla import KimiMLAAttention
 
 
 def kimi_delta_attention_cp_forward(
     target_module: nn.Module, *args: Any, **kwargs: Any
 ) -> Any:
-    """Run the KDA context-parallel executor selected by the wrapper."""
+    """Run the KDA context-parallel executor selected by the wrapper.
+
+    Args:
+        target_module: Module holding the prepared executor.
+        *args: Positional arguments forwarded to the executor.
+        **kwargs: Keyword arguments forwarded to the executor.
+    """
     executor = getattr(target_module, "_hp_kda_cp_executor")
     return executor(*args, **kwargs)
 
@@ -126,7 +126,7 @@ def kimi_delta_attention_ulysses_cp_wrapper(
         backend: Local KDA implementation: eager, triton or ascendc.
         chunk_size: Tokens per local recurrence chunk.
     """
-    # MLA shares this adapter entry but does not require optional KDA kernels.
+    # Load optional KDA kernels only when this wrapper is selected.
     from hyper_parallel.distributed.context_parallel.kimi_delta_attention import (  # pylint: disable=C0415
         KimiDeltaAttentionLayerUlyssesCP,
     )
@@ -164,7 +164,7 @@ def kimi_delta_attention_p2p_cp_wrapper(
         backend: Local KDA implementation: eager, triton or ascendc.
         chunk_size: Tokens per local recurrence chunk.
     """
-    # MLA shares this adapter entry but does not require optional KDA kernels.
+    # Load optional KDA kernels only when this wrapper is selected.
     from hyper_parallel.distributed.context_parallel.kimi_delta_attention import (  # pylint: disable=C0415
         KimiDeltaAttentionLayerP2PCP,
     )
@@ -211,7 +211,7 @@ def kimi_delta_attention_cp_wrapper(
     Returns:
         Atomic forward rewrite with the selected configuration recorded.
     """
-    # MLA shares this adapter entry but does not require optional KDA kernels.
+    # Load optional KDA kernels only when this wrapper is selected.
     from hyper_parallel.distributed.context_parallel.kimi_delta_attention import (  # pylint: disable=C0415
         KimiDeltaAttentionLayerCP,
     )
@@ -226,75 +226,3 @@ def kimi_delta_attention_cp_wrapper(
         executor_class=KimiDeltaAttentionLayerCP, backend=backend, chunk_size=64,
         execution_options=options,
     )
-
-
-@inner_wrapper
-def kimi_mla_cp_wrapper(
-    target_module: nn.Module, mesh: Any, tp_mesh: Any, cp_mesh: Any, ep_mesh: Any,
-    *, strategy: str = "expanded_ulysses", overlap: bool = False,
-    ulysses_degree: int | None = None, kv_exchange: str = "all_gather",
-) -> list[_ForwardRewriteRequest]:
-    """Attach shared MLA CP to gated NoPE attention at TP1.
-
-    Args:
-        target_module: Kimi MLA replacement retaining its original gate.
-        mesh: Full framework mesh, unused.
-        tp_mesh: Tensor-parallel mesh; simultaneous TP is unsupported.
-        cp_mesh: Chronologically ordered context-parallel mesh.
-        ep_mesh: Expert mesh, unused.
-        strategy: Expanded QKV or shared latent KV representation.
-        overlap: Enable forward and supported backward communication overlap.
-            Paired input backward requires pure Ulysses; hybrid CP can still overlap
-            output dO A2A. Expanded pure Ulysses gates after V/K/Q; other paths gate the output.
-        ulysses_degree: Head-parallel degree, defaulting to the complete CP group.
-        kv_exchange: Full gather or selective KV exchange.
-
-    Returns:
-        Atomic model and child-projection rewrites preserving module hooks.
-
-    Note:
-        Scheduled backward supports complete first-order training backward. Use
-        overlap=False for partial autograd.grad calls or higher-order derivatives.
-    """
-    del mesh, ep_mesh
-    if not isinstance(target_module, KimiMLAAttention):
-        raise ValueError("Kimi MLA CP requires the KimiMLAAttention replacement")
-    if tp_mesh is not None and tp_mesh.size() > 1:
-        raise ValueError("Kimi MLA CP currently supports TP1 only")
-    runtime, children = prepare_mla_cp(
-        target_module, cp_mesh, tp_mesh, strategy=strategy, overlap=overlap,
-        ulysses_degree=ulysses_degree, kv_exchange=kv_exchange,
-        rotary_fn=target_module.apply_nope,
-    )
-    supports_output_backward = overlap and runtime.plan.ulysses_degree > 1
-    if supports_output_backward:
-        children.append(gated_mla_output_projection_request(target_module.o_proj))
-    original = target_module.forward
-
-    @wraps(original)
-    def cp_forward(hidden_states: torch.Tensor, attention_mask: torch.Tensor | None = None,
-                   position_ids: torch.Tensor | None = None, past_key_values: Any | None = None,
-                   **kwargs: Any) -> torch.Tensor:
-        """Keep NoPE positions and output gating at their model-owned boundary.
-
-        Args:
-            hidden_states: Chronological local tokens in BSH layout.
-            attention_mask: Optional mask accepted by the selected CP strategy.
-            position_ids: Unused by NoPE attention.
-            past_key_values: Unsupported training-time KV cache.
-            **kwargs: Packed lengths and attention options.
-
-        Returns:
-            Projected hidden states in the original local-token order.
-        """
-        del position_ids
-        if past_key_values is not None:
-            raise ValueError("Kimi MLA CP does not support a KV cache")
-        return gated_mla_forward(
-            target_module, runtime, hidden_states, attention_mask, kwargs,
-            overlap_output_backward=supports_output_backward and torch.is_grad_enabled(),
-        )
-
-    return [_ForwardRewriteRequest(
-        target_module, cp_forward, companion_attrs={"mla_cp_runtime": runtime},
-    )] + children

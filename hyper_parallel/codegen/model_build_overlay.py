@@ -26,6 +26,7 @@ import torch
 
 from hyper_parallel.codegen.manager import ensure_codegen_artifact_from_snapshot
 from hyper_parallel.codegen.session import CodegenBuildSession
+from hyper_parallel.components.modules.module_family import get_family_build_info
 from hyper_parallel.core.dtensor.init_weights import init_empty_weights
 from hyper_parallel.distributed._builder.applier import (
     _get_active_mesh,
@@ -146,6 +147,15 @@ def _observe_replacement_installations(specs: Sequence[Any]) -> Iterator[list[di
             "replacement_type": replacement_api._symbol_path(type(candidate)),
             "weight_transforms": [replacement_api._symbol_path(type(transform)) for transform in transforms],
         }
+        family = get_family_build_info(candidate)
+        if family is not None:
+            # A concrete type alone loses the request, variant selection and owned
+            # layout provenance. Rebuild through the same public factory.
+            pending[(target.module_fqns, id(candidate))]["family_request"] = {
+                "factory": replacement_api._symbol_path(family.request.target),  # pylint: disable=protected-access
+                "kwargs": dict(family.request.kwargs),
+                "context": {f"{axis}_size": size for axis, size in family.resolved.axis_sizes.items()},
+            }
         return candidate, transforms
 
     def _observe_install(root: Any, candidates: Any) -> Any:
@@ -331,7 +341,12 @@ def use_codegen_model_build_overlay(
     session: CodegenBuildSession,
     artifact_dir: Optional[str] = None,
 ) -> Iterator[CodegenModelBuildResult]:
-    """Temporarily replace AutoModel's final build step for offline codegen."""
+    """Temporarily replace AutoModel's final build step for offline codegen.
+
+    Args:
+        session: Build session receiving native observations and emitted artifacts.
+        artifact_dir: Optional output directory for generated sources.
+    """
     model_class = auto_model._BaseHyperAutoModelClass  # pylint: disable=protected-access
     original = model_class.__dict__["_build_model"]
     result = CodegenModelBuildResult()

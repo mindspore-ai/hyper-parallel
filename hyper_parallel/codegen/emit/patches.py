@@ -74,7 +74,11 @@ class EmissionPatchSet:
 
 
 def emission_patches_from_meta(meta: Any) -> Optional[EmissionPatchSet]:
-    """Rehydrate emitter views from plain snapshot data."""
+    """Rehydrate emitter views from plain snapshot data.
+
+    Args:
+        meta: Snapshot metadata containing serialized emission records.
+    """
     data = getattr(meta, "emission_patches", None)
     if not data:
         return None
@@ -83,6 +87,8 @@ def emission_patches_from_meta(meta: Any) -> Optional[EmissionPatchSet]:
             module_fqn=item["module_fqn"],
             source_type=_resolve_symbol(item["source_type"]),
             replacement_type=_resolve_symbol(item["replacement_type"]),
+            factory=_resolve_symbol(item["factory"]) if item.get("factory") else None,
+            factory_kwargs=MappingProxyType(item.get("factory_kwargs", {})),
         )
         for item in data.get("module_replacements", ())
     )
@@ -113,7 +119,11 @@ def emission_patches_from_meta(meta: Any) -> Optional[EmissionPatchSet]:
 
 
 def local_compute_binding_name(target: Any) -> str:
-    """Return the explicit instance attribute used for one compute factory."""
+    """Return the explicit instance attribute used for one compute factory.
+
+    Args:
+        target: Compute factory whose declared binding name is required.
+    """
     if isinstance(target, Mapping):
         target = target.get("_target_") or target.get("target") or target.get("name")
     else:

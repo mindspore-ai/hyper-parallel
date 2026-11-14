@@ -25,15 +25,25 @@ import importlib
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from hyper_parallel.components.modules.attention.multi_latent_attention import (
+        MultiLatentAttention, MultiLatentAttentionModule,
+    )
+    from hyper_parallel.components.modules.attention.gated_multi_latent_attention import (
+        GatedMultiLatentAttention, GatedMultiLatentAttentionModule,
+    )
     from hyper_parallel.components.modules.mtp import (
         MTPLayer, MultiTokenPrediction, MTPOutput, build_mtp,
     )
     from hyper_parallel.components.modules.dsa_attention import DSAAttention, DeepseekV32DSAAttention
-    from hyper_parallel.components.modules.gqa_attention import GatedGQAAttention, GQAAttention
+    from hyper_parallel.components.modules.attention.grouped_query_attention import (
+        GroupedQueryAttention, SplitGroupedQueryAttention,
+    )
+    from hyper_parallel.components.modules.attention.gated_grouped_query_attention import (
+        GatedGroupedQueryAttention,
+    )
     from hyper_parallel.components.modules.grouped_experts import GroupedExperts
     from hyper_parallel.components.modules.linear import Linear
     from hyper_parallel.components.modules.mhc import MhcPostModule, MhcPreModule
-    from hyper_parallel.components.modules.mla_attention import MLAAttention
     from hyper_parallel.components.modules.rms_norm import OffsetRMSNorm, RMSNorm
     from hyper_parallel.components.modules.shared_expert import SharedExpert
     from hyper_parallel.components.modules.swiglu_mlp import SwiGLUMLP
@@ -46,8 +56,9 @@ _EXPORT_TO_MODULE = {
     "MTPOutput": "mtp",
     "DeepseekV32DSAAttention": "dsa_attention",
     "DSAAttention": "dsa_attention",
-    "GQAAttention": "gqa_attention",
-    "GatedGQAAttention": "gqa_attention",
+    "GroupedQueryAttention": "attention.grouped_query_attention.grouped_query_attention_family",
+    "SplitGroupedQueryAttention": "attention.grouped_query_attention.grouped_query_attention_family",
+    "GatedGroupedQueryAttention": "attention.gated_grouped_query_attention.gated_grouped_query_attention_family",
     "EngramModule": "engram",
     "GroupedExperts": "grouped_experts",
     "Linear": "linear",
@@ -57,7 +68,10 @@ _EXPORT_TO_MODULE = {
     "MhcPreModule": "mhc",
     "NgramHashMapping": "engram",
     "PipelinedMhcModule": "mhc",
-    "MLAAttention": "mla_attention",
+    "MultiLatentAttention": "attention.multi_latent_attention",
+    "MultiLatentAttentionModule": "attention.multi_latent_attention",
+    "GatedMultiLatentAttention": "attention.gated_multi_latent_attention",
+    "GatedMultiLatentAttentionModule": "attention.gated_multi_latent_attention",
     "OffsetRMSNorm": "rms_norm",
     "RMSNorm": "rms_norm",
     "SharedExpert": "shared_expert",

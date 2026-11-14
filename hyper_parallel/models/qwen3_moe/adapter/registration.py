@@ -38,14 +38,6 @@ def _load_attention():
     return attention
 
 
-def _load_context_parallel():
-    """Return the family's CP-wrapper module (lazy provider)."""
-    from hyper_parallel.models.qwen3_moe.adapter.distributed import (  # pylint: disable=C0415
-        context_parallel,
-    )
-    return context_parallel
-
-
 def _load_expert_parallel():
     """Return the family's EP-factory module (lazy provider)."""
     from hyper_parallel.models.qwen3_moe.adapter.distributed import (  # pylint: disable=C0415
@@ -74,7 +66,6 @@ QWEN3_MOE_ADAPTER_SPEC = ModelAdapterSpec(
     model_type="qwen3_moe",
     replacements=_load_replacements,
     attention=_load_attention,
-    context_parallel=_load_context_parallel,
     expert_parallel=_load_expert_parallel,
     loss=_load_loss,
     codegen=_load_codegen,

@@ -99,6 +99,7 @@ class ParallelBinding:
     mesh_binding: MeshBinding
     cp_context: CPContext | None = None
     ep_context: EPContext | None = None
+    sharding: Any = None
 
 
 def validate_parallel_module(module: nn.Module, parallel: ParallelModuleSpec, sharding: Any, context: Any) -> None:
@@ -173,7 +174,9 @@ def bind_parallel_modules(model: nn.Module, plan: Any, mesh_context: Any) -> Non
         cp = CPContext(mesh_binding.axis_mesh("cp")) if parallel.binding_kind == "cp" else None
         ep = (EPContext(mesh_binding.axis_mesh("ep"), num_experts=parallel.options["num_experts"])
               if parallel.binding_kind == "ep" else None)
-        prepared.append((module, ParallelBinding(mesh_binding, cp, ep)))
+        # Bind the final validated contract, including user overrides. Modules must not
+        # reconstruct a second layout from configuration or local parameter shapes.
+        prepared.append((module, ParallelBinding(mesh_binding, cp, ep, deepcopy(plan.modules[fqn]))))
     for module, binding in prepared:
         module.bind_parallel(binding)
         module._hp_parallel_binding = binding  # pylint: disable=protected-access

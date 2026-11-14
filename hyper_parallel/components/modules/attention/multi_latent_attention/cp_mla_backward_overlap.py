@@ -21,7 +21,6 @@ Partial autograd.grad calls can prune the consumer and are not supported.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import wraps
 from typing import Any
 
 # This CP scheduler uses the native Torch autograd and communication APIs.
@@ -31,15 +30,79 @@ from torch import nn  # pylint: disable=forbidden-backend-import
 from torch.autograd.function import once_differentiable  # pylint: disable=forbidden-backend-import
 from torch.nn import functional as F  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.distributed._builder.forward_rewriter import _ForwardRewriteRequest
 from hyper_parallel.distributed.context_parallel.collectives import (
     AsyncCPCollective, async_ulysses_seq_to_head_launch,
 )
 
 
+class CPMLAOutputLinear(nn.Linear):
+    """A managed Linear boundary with explicit optional CP output scheduling."""
+
+    def __init__(self, source: nn.Linear) -> None:
+        """Retain source Parameters without registering an extra child prefix."""
+        nn.Module.__init__(self)
+        if type(source) is not nn.Linear and not isinstance(source, CPMLAOutputLinear):  # pylint: disable=unidiomatic-typecheck
+            raise ValueError("MLA scheduled output requires a plain Linear")
+        self.in_features, self.out_features = source.in_features, source.out_features
+        self.weight, self.bias = source.weight, source.bias
+        self.train(source.training)
+
+    def forward(self, input: torch.Tensor, *, mla_output_state: Any = None) -> torch.Tensor:
+        """Read materialized parameters after the normal Module pre-hooks.
+
+        Args:
+            input: Local attention output or head-partitioned CP output.
+            mla_output_state: Invocation-local CP layout; absent for an ordinary projection.
+        """
+        if mla_output_state is None:
+            return F.linear(input, self.weight, self.bias)
+        return _OutputProjection.apply(input, self.weight, self.bias, mla_output_state)
+
+
+class CPMLAKVLinear(nn.Linear):
+    """Select computation heads inside the managed KV up-projection boundary."""
+
+    def __init__(self, source: nn.Linear, head_dim: int) -> None:
+        """Reuse full TP-local parameter storage; CP changes only computation ownership."""
+        nn.Module.__init__(self)
+        if type(source) is not nn.Linear and not isinstance(source, CPMLAKVLinear):  # pylint: disable=unidiomatic-typecheck
+            raise ValueError("MLA KV projection requires a plain Linear")
+        self.in_features, self.out_features = source.in_features, source.out_features
+        self.weight, self.bias = source.weight, source.bias
+        self.head_dim = head_dim
+        self.train(source.training)
+
+    def forward(self, input: torch.Tensor, *, mla_head_range: tuple[int, int] | None = None,
+                mla_gathered: torch.Tensor | None = None, mla_cp_mesh: Any = None) -> Any:
+        """Project all heads or selected rows with the existing latent RS adjoint.
+
+        Args:
+            input: KV latent tokens.
+            mla_head_range: Optional half-open interval of computation heads.
+            mla_gathered: Gathered latent storage used by the scheduled derivative.
+            mla_cp_mesh: CP mesh required by the scheduled latent derivative.
+        """
+        if mla_head_range is None:
+            return F.linear(input, self.weight, self.bias)
+        begin, end = mla_head_range
+        if not 0 <= begin < end <= self.weight.shape[0] // self.head_dim:
+            raise ValueError("MLA projection head range is outside the managed parameter")
+        rows = slice(begin * self.head_dim, end * self.head_dim)
+        bias = None if self.bias is None else self.bias[rows]
+        if mla_gathered is not None:
+            if mla_cp_mesh is None:
+                raise ValueError("Scheduled latent projection requires its CP mesh")
+            return _LatentKVLinear.apply(input, self.weight[rows], bias, mla_gathered, mla_cp_mesh)
+        return F.linear(input, self.weight[rows], bias)
+
+
 @dataclass
 class MLAOutputProjectionState:
-    """Output layout for ordinary MLA; its projection node owns O A2A."""
+    """Value-only output layout; the projection node owns its O/dO A2A handles.
+
+    FSDP may rebuild this container without affecting the derivative: no paired
+    node relies on mutating it to deliver a gradient or communication handle.
+    """
 
     mesh: Any
     head_dim: int
@@ -110,45 +173,6 @@ def _output_projection_backward(ctx, gradient):
     return grad_attention_output, grad_weight, grad_bias, None
 
 
-def mla_output_projection_request(projection: nn.Linear) -> _ForwardRewriteRequest:
-    """Keep parameter materialization hooks while allowing dgrad/wgrad scheduling.
-
-    Args:
-        projection: Plain, unwrapped output Linear, before FSDP installation.
-
-    Returns:
-        An atomic child forward rewrite; ordinary calls remain unchanged.
-    """
-    # Quantized and LoRA subclasses need their own derivative contracts.
-    if type(projection) is not nn.Linear:  # pylint: disable=unidiomatic-typecheck
-        raise ValueError("MLA backward overlap requires a plain output Linear")
-    if getattr(projection.forward, "__func__", None) is not nn.Linear.forward:
-        raise ValueError("MLA backward overlap requires an unwrapped plain output Linear")
-    original = projection.forward
-
-    @wraps(original)
-    def output_projection(*args: torch.Tensor, mla_output_state: MLAOutputProjectionState | None = None,
-                          **kwargs: Any) -> torch.Tensor:
-        """Read managed parameters after their normal module pre-hooks.
-
-        Args:
-            *args: Positional arguments of the original Linear.
-            mla_output_state: Optional layout selecting the scheduled ordinary output.
-            **kwargs: Keyword arguments of the original Linear.
-
-        Returns:
-            Projected hidden states using ordinary or scheduled autograd.
-        """
-        if mla_output_state is None:
-            return original(*args, **kwargs)
-        # Scheduled calls consume the FA output; ordinary calls retain Linear input= support.
-        if len(args) != 1 or kwargs:
-            raise TypeError("Scheduled MLA output projection requires one positional activation")
-        return _OutputProjection.apply(args[0], projection.weight, projection.bias, mla_output_state)
-
-    return _ForwardRewriteRequest(projection, output_projection)
-
-
 @dataclass
 class MLAInputA2AState:
     """Own one input A2A and its inverse for a single forward invocation.
@@ -161,6 +185,8 @@ class MLAInputA2AState:
 
     Each handle owns the communication work and its buffers. The paired consumer
     waits for it exactly once before reading the result, then clears the field.
+    This shared state passes directly between autograd nodes, not through the
+    managed projection's forward arguments and FSDP input conversion.
     """
 
     mesh: Any

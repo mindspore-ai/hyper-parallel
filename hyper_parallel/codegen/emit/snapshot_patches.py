@@ -28,13 +28,21 @@ from hyper_parallel.codegen.source.resolver import resolve_remote_siblings
 def emission_patches_from_snapshot_payload(
     payload: dict[str, Any],
 ) -> dict[str, Any]:
-    """Translate resolved native observations into emitter patch records."""
+    """Translate resolved native observations into emitter patch records.
+
+    Args:
+        payload: Serialized native observations and selected strategy records.
+    """
     applications = payload["replacements"]["applications"]
     replacements = [
         {
             "module_fqn": item["primary_fqn"],
             "source_type": item["source_type"],
             "replacement_type": item["replacement_type"],
+            **({"factory": item["family_request"]["factory"],
+                "factory_kwargs": {**item["family_request"]["kwargs"],
+                                   "context": item["family_request"]["context"]}}
+               if item.get("family_request") else {}),
         }
         for item in applications
     ]
