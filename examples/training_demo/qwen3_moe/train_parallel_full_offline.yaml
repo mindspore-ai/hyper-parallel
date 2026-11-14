@@ -56,18 +56,13 @@ plan_overrides:
     replace:
       kind: module
       implementation:
-        _target_: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_flash_attention
+        _target_: hyper_parallel.components.modules.GroupedQueryAttention
+        ulysses_degree: 1
   - match: "*.mlp.experts"
     replace:
       kind: module
       implementation:
         _target_: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_grouped_experts
-  - match: "*.self_attn.forward"
-    when: cp
-    replace:
-      kind: method
-      implementation:
-        _target_: hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel.qwen3_moe_flash_attention_cp_mask_wrapper
   - match: "*.mlp.forward"
     when: ep
     replace:

@@ -26,7 +26,7 @@ from hyper_parallel.components.modules.module_family import (
     ModuleFamily, VariantRule, build_family, get_module_family, register_module_family,
 )
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
-from hyper_parallel.distributed.context_parallel.cp_context import SequencePartition
+from hyper_parallel.distributed.context_parallel.cp_types import SequencePartition
 from hyper_parallel.distributed.module_binding import ParallelModuleSpec
 from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec

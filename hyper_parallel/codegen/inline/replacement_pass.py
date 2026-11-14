@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from dataclasses import replace
 from typing import Any
 
 from hyper_parallel.codegen.inline.ir import (
@@ -58,9 +59,9 @@ def build_replacement_patches(
     """
 
     patch_set = InlinePatchSet()
-    scopes_by_target: dict[str, set[str]] = defaultdict(set)
-    fqns_by_target: dict[str, set[str]] = defaultdict(set)
-    specs_by_target: dict[str, Any] = {}
+    scopes_by_target: dict[tuple, set[str]] = defaultdict(set)
+    fqns_by_target: dict[tuple, set[str]] = defaultdict(set)
+    specs_by_target: dict[tuple, Any] = {}
     for rule in rules:
         target = rule.replace_target
         if target is None:
@@ -68,9 +69,15 @@ def build_replacement_patches(
         spec = replacement_spec(target, model_type, module_type=rule.module_type)
         if spec is None:
             continue
-        specs_by_target.setdefault(target, spec)
-        scopes_by_target[target].update(_scope_attrs(rule))
-        fqns_by_target[target].update(fqn for fqn in rule.match if fqn)
+        # Different layer requests may use the same factory with different schedules.
+        # Keep their scopes separate rather than applying the first layer's arguments.
+        arguments = {item.split("=", 1)[0]: item for item in spec.keyword_args}
+        arguments.update({item.split("=", 1)[0]: item for item in rule.construction_kwargs})
+        spec = replace(spec, keyword_args=tuple(arguments.values()))
+        key = (target, rule.module_type, spec.keyword_args)
+        specs_by_target.setdefault(key, spec)
+        scopes_by_target[key].update(_scope_attrs(rule))
+        fqns_by_target[key].update(fqn for fqn in rule.match if fqn)
     for target, spec in specs_by_target.items():
         scope_attrs = tuple(sorted(scopes_by_target[target]))
         if not scope_attrs:
@@ -93,6 +100,7 @@ def build_replacement_patches(
                 keyword_args=spec.keyword_args,
                 scope_attrs=scope_attrs,
                 scope_fqns=tuple(sorted(fqns_by_target[target])),
+                defer_to_fqns=spec.defer_to_fqns,
             )
         )
         if spec.remove_class:

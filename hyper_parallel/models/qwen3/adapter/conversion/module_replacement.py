@@ -25,9 +25,6 @@ from typing import Any
 
 from torch import nn, no_grad  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.models.qwen3.adapter.runtime.attention import (
-    run_qwen3_flash_attention,
-)
 from hyper_parallel.models.replacement import module_replacement
 
 
@@ -54,13 +51,12 @@ def replace_qwen3_flash_attention(
 ) -> nn.Module:
     """Replace ``Qwen3Attention`` with fused grouped-query attention."""
     # Lazy: importing the implementation requires the optional NPU runtime.
-    from hyper_parallel.components.modules import GQAAttention  # pylint: disable=C0415
+    from hyper_parallel.components.modules import GroupedQueryAttention  # pylint: disable=C0415
 
-    replacement = GQAAttention(
+    replacement = GroupedQueryAttention(
         module=module,
         module_fqn=module_fqn,
         context=context,
-        attention_interface=run_qwen3_flash_attention,
     )
     # The one-rank HF path loads live weights before replacement; the meta
     # path is populated later by the shared checkpoint loader.

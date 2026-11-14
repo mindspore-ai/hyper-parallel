@@ -23,10 +23,15 @@ import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.distributed.context_parallel.collectives import async_ulysses_seq_to_head_launch
-from hyper_parallel.distributed.context_parallel.gated_mla_backward_overlap import (
-    GatedMLAInputState, GatedMLAOutputProjectionState,
+from hyper_parallel.components.modules.attention.gated_multi_latent_attention.cp_gated_mla_backward_overlap import (
+    CPGatedMLAOutputLinear, GatedMLAInputState, GatedMLAOutputProjectionState, finish_gated_expanded_inputs,
 )
-from hyper_parallel.distributed.context_parallel.mla_context_parallel import MLAContextParallel
+from hyper_parallel.components.modules.attention.multi_latent_attention.cp_multi_latent_attention import (
+    CPMultiLatentAttentionModule, MLAContextParallel,
+)
+from hyper_parallel.components.modules.attention.gated_multi_latent_attention.gated_multi_latent_attention import (
+    GatedMultiLatentAttentionModule,
+)
 
 
 def gated_mla_forward(module: nn.Module, runtime: MLAContextParallel, hidden_states: torch.Tensor,
@@ -92,3 +97,46 @@ def _prepare_input_gate(module, runtime, hidden_states, overlap_input_backward):
     return GatedMLAInputState(
         hidden_states, lambda source: module.g_proj(source).sigmoid(), defer_gate_gradient,
     )
+
+
+class GatedMLAContextParallel(MLAContextParallel):
+    """Gated input completion belongs to the gated family, not ordinary MLA."""
+
+    def finish_input_exchange(self, query: torch.Tensor, transfers: Any, overlap_backward: bool,
+                              input_gate: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Keep gate computation and its gradient dependency between Q launch and waits."""
+        if input_gate is None:
+            return super().finish_input_exchange(query, transfers, overlap_backward, None)
+        return finish_gated_expanded_inputs(query, transfers, input_gate)
+
+
+class CPGatedMultiLatentAttentionModule(GatedMultiLatentAttentionModule, CPMultiLatentAttentionModule):
+    """NoPE and mandatory gate math with the same transport strategies as ordinary MLA."""
+
+    def prepare_output_projection(self) -> None:
+        """Install the gated output Function inside its managed projection Module."""
+        if self.cp_plan.tp_degree != 1:
+            raise ValueError("Gated MLA CP currently supports TP1 only")
+        if self.cp_plan.overlap and self.cp_plan.ulysses_degree > 1:
+            self.o_proj = CPGatedMLAOutputLinear(self.o_proj)
+
+    def make_cp_execution(self, context: Any) -> GatedMLAContextParallel:
+        """Borrow CP resources; select only the gated completion boundary."""
+        return GatedMLAContextParallel(self.cp_plan, context.mesh)
+
+    def forward(self, hidden_states: torch.Tensor,
+                position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+                attention_mask: torch.Tensor | None = None, past_key_values: Any = None,
+                actual_seq_len: Any = None, **kwargs: Any) -> tuple[torch.Tensor, None]:
+        """Run NoPE gated CP with per-invocation gate/communication state."""
+        del position_embeddings
+        if past_key_values is not None:
+            raise ValueError("Gated MLA CP training does not support a KV cache")
+        if self.cp_runtime is None:
+            raise RuntimeError("MLA CP resources must be bound before forward")
+        hidden_states = self.prepare_input(hidden_states)
+        kwargs["actual_seq_len"] = actual_seq_len
+        plan = self.cp_plan
+        overlap_output = plan.overlap and plan.ulysses_degree > 1 and torch.is_grad_enabled()
+        return gated_mla_forward(self, self.cp_runtime, hidden_states, attention_mask, kwargs,
+                                 overlap_output_backward=overlap_output), None

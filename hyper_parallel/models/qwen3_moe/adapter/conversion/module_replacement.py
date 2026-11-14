@@ -16,7 +16,7 @@
 
 The factories keep their historical names and factory parameters (adjust
 doc §5.3) but now declare/construct the generic high-performance
-``modules.RMSNorm`` / ``modules.GQAAttention`` entries instead of rebinding
+``modules.RMSNorm`` / ``modules.GroupedQueryAttention`` entries instead of rebinding
 model-local forward functions; the NPU kernels live in ``functional`` — no
 second family implementation exists here.
 
@@ -38,9 +38,6 @@ from torch import nn  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.models.replacement import (
     module_replacement as register_module_replacement,
-)
-from hyper_parallel.models.qwen3_moe.adapter.runtime.attention import (
-    run_qwen3_moe_flash_attention,
 )
 
 
@@ -72,20 +69,17 @@ def replace_qwen3_moe_flash_attention(
 ) -> nn.Module:
     """Replace ``Qwen3MoeAttention`` with the generic grouped-query attention.
 
-    ``modules.GQAAttention`` fuses the Q/K/V projections (checkpoint
+    ``modules.GroupedQueryAttention`` fuses the Q/K/V projections (checkpoint
     conversion declared through ``make_transforms``), keeps the Qwen Q/K-norm
-    submodules and RoPE/cache handling, and calls the attention kernel
-    through the Qwen mask/cache contract in
-    ``adapter.runtime.attention.run_qwen3_moe_flash_attention``.
+    submodules and RoPE/cache handling, and delegates packed lengths and masks to the common FA contract.
     """
     # Lazy: the modules package wraps NPU-only functional backends.
-    from hyper_parallel.components.modules import GQAAttention  # pylint: disable=C0415
+    from hyper_parallel.components.modules import GroupedQueryAttention  # pylint: disable=C0415
 
-    return GQAAttention(
+    return GroupedQueryAttention(
         module=module,
         module_fqn=module_fqn,
         context=context,
-        attention_interface=run_qwen3_moe_flash_attention,
     )
 
 

@@ -160,7 +160,8 @@ def _constructor_edits(
     """Build the edits that swap constructor calls per patch target."""
     patches_by_old: dict[str, list[ConstructorReplacePatch]] = defaultdict(list)
     for patch in patches:
-        patches_by_old[patch.old_ctor].append(patch)
+        if not patch.defer_to_fqns:
+            patches_by_old[patch.old_ctor].append(patch)
     if not patches_by_old:
         return []
     scopes = _scopes_by_old_ctor(patches)
@@ -270,11 +271,13 @@ def _deferred_replacement_edits(
     constructor call to rewrite. For a wrap-style replacement, the native
     operation is still expressible exactly: wait until the root model has
     built the observed FQNs, then replace those module attributes in place.
+    Module-family requests also use this form: different layers can share the
+    same source constructor while requiring distinct options and provenance.
     """
     pending = [
         patch
         for patch in patches
-        if patch.scope_fqns and not hits.get(patch.old_ctor)
+        if patch.scope_fqns and (patch.defer_to_fqns or not hits.get(patch.old_ctor))
     ]
     if not pending:
         return []
