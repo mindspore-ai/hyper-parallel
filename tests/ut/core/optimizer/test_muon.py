@@ -15,6 +15,7 @@
 
 """Unit tests for the Muon optimizer."""
 
+from typing import Tuple, Union
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -151,3 +152,94 @@ def test_async_hierarchical_broadcast_waits_between_mesh_dimensions():
     first_work.wait.assert_called_once_with()
     final_work.wait.assert_not_called()
     assert handles == [final_work]
+
+
+@pytest.mark.parametrize("mode", ["legacy", "vanilla"])
+@pytest.mark.parametrize("nesterov", [False, True])
+@pytest.mark.parametrize("momentum", [0.0, 0.95, (0.7, 0.9)])
+def test_muon_momentum_matches_multistep_scalar_reference(
+        mode: str, nesterov: bool, momentum: Union[float, Tuple[float, float]],
+) -> None:
+    """Feature: Selectable Muon momentum formulas.
+
+    Description: Compare both modes and Nesterov settings with multistep scalar recurrences.
+    Expectation: BF16 updates and persistent momentum buffers match the reference.
+    """
+    parameter = torch.nn.Parameter(torch.zeros(2, 2, dtype=torch.float64))
+    optimizer = Muon([parameter], momentum=momentum, momentum_mode=mode, nesterov=nesterov)
+    update_beta, buffer_beta = momentum if isinstance(momentum, tuple) else (momentum, momentum)
+    reference_buffer = [0.0] * 4
+    gradients = [[1.0, -2.0, 0.5, 3.0], [-0.5, 1.0, -4.0, 0.25], [2.0, 0.0, 1.0, -1.0]]
+
+    for gradient in gradients:
+        parameter.grad = torch.tensor(gradient, dtype=torch.float64).view(2, 2)
+        expected_update = []
+        next_buffer = []
+        for grad, old_buffer in zip(gradient, reference_buffer):
+            if mode == "legacy":
+                candidate = grad + update_beta * old_buffer
+                update = grad + update_beta * candidate if nesterov else candidate
+                buffer = grad + buffer_beta * old_buffer
+            else:
+                candidate = (1 - update_beta) * grad + update_beta * old_buffer
+                update = (1 - update_beta) * grad + update_beta * candidate if nesterov else candidate
+                buffer = (1 - buffer_beta) * grad + buffer_beta * old_buffer
+            expected_update.append(update)
+            next_buffer.append(buffer)
+
+        actual = optimizer._update_muon_momentum(  # pylint: disable=protected-access
+            optimizer.param_groups[0], [parameter])
+        expected = torch.tensor(expected_update, dtype=torch.float64).view(2, 2).to(torch.bfloat16)
+        torch.testing.assert_close(actual[parameter], expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            optimizer.state[parameter]["momentum_buffer"],
+            torch.tensor(next_buffer, dtype=torch.float64).view(2, 2), rtol=1e-14, atol=1e-14,
+        )
+        reference_buffer = next_buffer
+
+
+def test_muon_default_step_matches_explicit_legacy() -> None:
+    """Feature: Backward-compatible Muon momentum defaults.
+
+    Description: Run the default and explicit legacy optimizers with identical gradients.
+    Expectation: Parameter trajectories remain identical across multiple steps.
+    """
+    first = torch.nn.Parameter(torch.eye(2))
+    second = torch.nn.Parameter(torch.eye(2))
+    default = Muon([first])
+    legacy = Muon([second], momentum_mode="legacy")
+
+    for step in range(3):
+        gradient = torch.tensor([[1.0 + step, -0.5], [0.25, 2.0 - step]])
+        first.grad = gradient.clone()
+        second.grad = gradient.clone()
+        default.step()
+        legacy.step()
+        torch.testing.assert_close(first, second, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("mode", ["unknown", None, 1])
+def test_muon_rejects_invalid_momentum_mode(mode: object) -> None:
+    """Feature: Muon momentum configuration validation.
+
+    Description: Construct Muon with unsupported momentum mode values.
+    Expectation: Invalid modes raise a descriptive ValueError.
+    """
+    with pytest.raises(ValueError, match="momentum_mode"):
+        Muon([torch.nn.Parameter(torch.ones(2, 2))], momentum_mode=mode)
+
+
+def test_muon_rejects_invalid_stored_momentum_mode() -> None:
+    """Feature: Muon momentum runtime validation.
+
+    Description: Attempt a step after the stored momentum mode has become invalid.
+    Expectation: The optimizer rejects the invalid mode instead of updating the parameter.
+    """
+    parameter = torch.nn.Parameter(torch.ones(2, 2))
+    optimizer = Muon([parameter])
+    optimizer._update_muon_momentum_mode = "unknown"  # pylint: disable=protected-access
+    parameter.grad = torch.ones_like(parameter)
+
+    with pytest.raises(ValueError, match="momentum_mode"):
+        optimizer.step()
+    torch.testing.assert_close(parameter, torch.ones_like(parameter), rtol=0, atol=0)
