@@ -120,7 +120,7 @@ Read-only mode does not publish statuses, enable auto-merge, or merge PRs. Write
 in the workflow. After updating this document, run the repository catalog check in the designated environment:
 
 ```bash
-conda run -n py312 python .agent/scripts/check_agents_catalog.py
+python .agent/scripts/check_agents_catalog.py
 ```
 
 ## Operational limitations
