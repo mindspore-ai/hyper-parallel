@@ -175,7 +175,9 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         GM_ADDR grouped_list_real = this->runtimeConfigPtr + this->grouped_matmul_group_list_offset_;
         GlobalTensor<int64_t> grouped_list_tensor_real;
         grouped_list_tensor_real.SetGlobalBuffer((__gm__ int64_t *)(grouped_list_real), expert_num_single_rank);
-        uint32_t data_index = task_desc.task_index / this->core_num;
+        uint32_t expert_task_num = task_desc.extra_value_2 != 0
+                                     ? task_desc.extra_value_2 : this->core_num;
+        uint32_t data_index = task_desc.task_index / expert_task_num;
         int64_t value = grouped_list_tensor.GetValue(data_index);
         int64_t start = 0;
         if (data_index != 0) {

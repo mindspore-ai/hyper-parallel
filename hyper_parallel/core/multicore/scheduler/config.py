@@ -438,6 +438,7 @@ def validate_runtime_config(
     cfg: RuntimeConfigC,
     tsv: TaskSplitValue,
     num_cube_cores: int,
+    gmm_cube_cores: int | None = None,
 ) -> None:
     """Validate task arithmetic before serializing a runtime configuration.
 
@@ -487,7 +488,7 @@ def validate_runtime_config(
         if task_type in (TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD):
             _validate_swiglu_task(task, descriptor_index, group_size)
         elif task_type == TaskType.TASK_GROUPED_MATMUL:
-            _validate_gmm_task(task, descriptor_index, num_cube_cores * local_experts)
+            _validate_gmm_task(task, descriptor_index, (gmm_cube_cores or num_cube_cores) * local_experts)
         else:
             _validate_shmem_task(task, descriptor_index, tsv)
 

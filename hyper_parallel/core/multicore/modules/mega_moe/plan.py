@@ -130,6 +130,11 @@ def _build_task_values(spec: MegaMoeSpec) -> TaskSplitValue:
     )
 
 
+def _gmm_cores(spec: MegaMoeSpec) -> int:
+    """Cube cores cooperating on one expert's GMM task wave."""
+    return spec.gmm_cube_cores or spec.num_cube_cores
+
+
 def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
     """Build forward/backward graphs and their serialized RuntimeConfig objects."""
     task_values = _build_task_values(spec)
@@ -140,7 +145,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         combine_sv=spec.combine_split,
         hidden_size=spec.hidden_size,
         intermediate_size=spec.intermediate_size,
-        num_cube_cores=spec.num_cube_cores,
+        num_cube_cores=_gmm_cores(spec),
         swiglu_limit=spec.swiglu_limit,
         expert_weight_layout=spec.expert_weight_layout,
     )
@@ -151,6 +156,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         task_values,
         spec.rank_id,
         spec.num_cube_cores,
+        gmm_cube_cores=_gmm_cores(spec),
     )
     backward_graph = build_backward_graph(
         task_values,
@@ -159,7 +165,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         combine_sv=spec.combine_split,
         hidden_size=spec.hidden_size,
         intermediate_size=spec.intermediate_size,
-        num_cube_cores=spec.num_cube_cores,
+        num_cube_cores=_gmm_cores(spec),
         swiglu_limit=spec.swiglu_limit,
         expert_weight_layout=spec.expert_weight_layout,
     )
@@ -170,6 +176,7 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         task_values,
         spec.rank_id,
         spec.num_cube_cores,
+        gmm_cube_cores=_gmm_cores(spec),
     )
     return forward_graph, forward_data, backward_graph, backward_data
 
@@ -189,7 +196,7 @@ def _prepare_diagnostics(
         "kernel_name": "mega_moe",
         "device": device,
         "rank": dist.get_rank() if dist.is_initialized() else spec.rank_id,
-        **_mega_moe_owner_options(topology, num_cube_cores=spec.num_cube_cores),
+        **_mega_moe_owner_options(topology, num_cube_cores=_gmm_cores(spec)),
     }
     return (
         prepare_mega_kernel_diagnostics(forward_graph, forward_config, parameter_count=16, **options),
@@ -215,7 +222,8 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
         "hidden_size": spec.hidden_size,
         "intermediate_size": spec.intermediate_size,
         "num_groups": spec.local_experts,
-        "num_cube_cores": spec.num_cube_cores,
+        "num_cube_cores": _gmm_cores(spec),
+        "repeat_cores": spec.num_cube_cores,
     }
     return MegaMoePlan(
         spec=spec,
