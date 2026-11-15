@@ -105,7 +105,7 @@ GH_REPO=mindspore-ai/hyper-parallel \
 更新本说明后，仓库目录检查使用指定环境：
 
 ```bash
-conda run -n py312 python .agent/scripts/check_agents_catalog.py
+python .agent/scripts/check_agents_catalog.py
 ```
 
 ## 运行边界

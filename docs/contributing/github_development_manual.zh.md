@@ -161,16 +161,10 @@ GitHub 的 `#123` 指向当前 GitHub 仓库中的编号，不能直接当成 Gi
 ~~~bash
 git --version
 gh --version
-conda env list
+python --version
 ~~~
 
-已有 py312 环境时直接使用。尚未创建时，根据团队环境规范创建 Python 3.12 环境：
-
-~~~bash
-conda create -n py312 python=3.12
-~~~
-
-后续 Python 命令使用 `conda run -n py312`，避免误用系统 Python。硬件驱动、CANN、CUDA 和框架组合按目标分支的[安装指南](../installation.zh.md)安装。
+使用项目支持的 Python 版本，并在执行下列命令前激活所选开发环境。硬件驱动、CANN、CUDA 和框架组合见目标分支的[安装指南](../installation.zh.md)。
 
 ### 2.2 SSH / HTTPS 认证与多账号配置
 
@@ -264,12 +258,12 @@ git remote -v
 
 ### 2.7 项目环境、可编辑安装和本地测试
 
-按[项目安装说明](../installation.zh.md)为 py312 安装匹配的框架及硬件依赖，然后在本工作树根目录执行：
+按[项目安装说明](../installation.zh.md)在开发环境中安装匹配的框架及硬件依赖，然后在本工作树根目录执行：
 
 ~~~bash
-conda run -n py312 python -m pip install -e .
-conda run -n py312 python -m pip show hyper_parallel
-conda run -n py312 python -c "import hyper_parallel; print(hyper_parallel.__file__)"
+python -m pip install -e .
+python -m pip show hyper_parallel
+python -c "import hyper_parallel; print(hyper_parallel.__file__)"
 ~~~
 
 导入路径必须指向当前工作树。切换 worktree 或发现旧路径后，重新进行可编辑安装；只设置 PYTHONPATH 不能替代这项验收。
@@ -277,7 +271,7 @@ conda run -n py312 python -c "import hyper_parallel; print(hyper_parallel.__file
 单元测试示例：
 
 ~~~bash
-conda run -n py312 python -m pytest -vs tests/ut
+python -m pytest -vs tests/ut
 ~~~
 
 先运行受影响模块，再按提交门禁执行所需测试集合。没有 NPU/GPU 时，应如实记录已完成的逻辑测试和待 CI 验证内容。对于通过 torchrun_case 等启动子进程的 ST，按用例入口运行 pytest，由项目启动器管理进程；不要给整套启动器再套一层 torchrun。遵循[测试规则](../../.agent/rules/testing.md)，不把 GitHub 手册写成另一套测试实现规范。
@@ -493,7 +487,7 @@ git commit -S -m "fix: describe the actual change"
 git diff --check
 git diff upstream/master...HEAD
 git log --oneline upstream/master..HEAD
-conda run -n py312 python -m pytest -vs tests/ut
+python -m pytest -vs tests/ut
 ~~~
 
 完整 UT 可能需要当前平台的依赖；无法在本机执行时，写清缺失条件和交由哪个 CI 环境验证。不能把“命令未运行”记录为“测试通过”。
@@ -984,7 +978,7 @@ git push --force-with-lease=refs/heads/YOUR_BRANCH:EXPECTED_REMOTE_SHA \
 - [ ] 本仓 name、email 正确，邮箱已关联 GitHub。
 - [ ] 签名密钥登记为 Signing key，新提交能显示 Verified。
 - [ ] CLA 已按当前要求签署，账号和邮箱映射正确。
-- [ ] Python 使用 py312，editable install 指向当前工作目录。
+- [ ] 已激活开发环境，editable install 指向当前工作目录。
 - [ ] 能执行相关本地检查，理解需要交由硬件 CI 验证的范围。
 - [ ] 已阅读目标分支开发规则，知道模块 Owner 和支持入口。
 - [ ] 首次 PR 没有模板占位符，附有真实验证结果。

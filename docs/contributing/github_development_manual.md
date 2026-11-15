@@ -161,16 +161,10 @@ Install [Git](https://git-scm.com/downloads) and [GitHub CLI](https://cli.github
 ~~~bash
 git --version
 gh --version
-conda env list
+python --version
 ~~~
 
-Use an existing py312 environment. Otherwise, create Python 3.12 according to team standards:
-
-~~~bash
-conda create -n py312 python=3.12
-~~~
-
-Use `conda run -n py312` for subsequent Python commands to avoid system Python. Install drivers, CANN, CUDA, and framework combinations according to the target branch's [Installation Guide](../installation.md).
+Use a Python version supported by the project and activate your chosen development environment before running these commands. See the target branch’s [Installation Guide](../installation.md) for drivers, CANN, CUDA, and framework combinations.
 
 ### 2.2 SSH / HTTPS Authentication and Multiple Accounts
 
@@ -264,12 +258,12 @@ Replace the hostname if using an SSH alias. Verify origin points to your GitHub 
 
 ### 2.7 Environment, Editable Installation, and Local Tests
 
-Install matching framework/hardware dependencies into py312 using the [Installation Guide](../installation.md), then run from this worktree's root:
+Install matching framework/hardware dependencies in your development environment using the [Installation Guide](../installation.md), then run from this worktree's root:
 
 ~~~bash
-conda run -n py312 python -m pip install -e .
-conda run -n py312 python -m pip show hyper_parallel
-conda run -n py312 python -c "import hyper_parallel; print(hyper_parallel.__file__)"
+python -m pip install -e .
+python -m pip show hyper_parallel
+python -c "import hyper_parallel; print(hyper_parallel.__file__)"
 ~~~
 
 The import path must point to this worktree. Reinstall editably after changing worktrees or discovering a stale path; PYTHONPATH alone does not satisfy this check.
@@ -277,7 +271,7 @@ The import path must point to this worktree. Reinstall editably after changing w
 Unit-test example:
 
 ~~~bash
-conda run -n py312 python -m pytest -vs tests/ut
+python -m pytest -vs tests/ut
 ~~~
 
 Run affected modules first, then required gate suites. Without NPU/GPU resources, report completed logic tests and remaining CI validation honestly. For ST that spawns workers through torchrun_case or similar, run pytest at the case entry point and let the launcher manage processes; do not wrap the entire launcher suite in another torchrun. Follow the [testing rules](../../.agent/rules/testing.md), rather than duplicating test implementation standards here.
@@ -493,7 +487,7 @@ Inspect the patch first, then run tests required by the change:
 git diff --check
 git diff upstream/master...HEAD
 git log --oneline upstream/master..HEAD
-conda run -n py312 python -m pytest -vs tests/ut
+python -m pytest -vs tests/ut
 ~~~
 
 Full UT may require platform dependencies. If unavailable locally, state missing conditions and the CI environment responsible for validation. “Not run” cannot be recorded as “passed.”
@@ -984,7 +978,7 @@ Do not automatically retry permanently noncompliant pushes or remove all protect
 - [ ] Repository name/email are correct and associated with GitHub.
 - [ ] Signing key registered; new commits show Verified.
 - [ ] CLA signed under current requirements with correct account/email mapping.
-- [ ] Python uses py312; editable install points to this checkout.
+- [ ] The development environment is active and the editable install points to this checkout.
 - [ ] Relevant local checks run; hardware-CI scope is understood.
 - [ ] Target-branch rules read; module owners/support known.
 - [ ] First PR has no placeholders and includes real evidence.
