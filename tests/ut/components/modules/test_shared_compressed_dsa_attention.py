@@ -26,7 +26,11 @@ from hyper_parallel.distributed.context_parallel.compressed_document import docu
 from hyper_parallel.components.modules import shared_compressed_dsa_attention as attention
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import reference_sparse_attention
 from hyper_parallel.distributed.context_parallel.indexer_balance import indexer_task_plan, indexer_route
+from hyper_parallel.distributed.context_parallel.index_key_dispatch import index_key_plan
 from hyper_parallel.distributed.context_parallel.sequence_dispatch import document_prefix_route, sliding_window_route
+from hyper_parallel.models.deepseek_v41.adapter.distributed.shared_attention_context_parallel import (
+    deepseek_v41_shared_attention_parallel_wrapper,
+)
 from hyper_parallel.trainer.config import PlanOverride, ReplaceAction, Target, entries_to_module_replacements
 
 
@@ -65,6 +69,55 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
         self.key = torch.ones(1, 2, 128)
         self.weights = torch.ones(1, 2, 8)
         self.indices = torch.tensor([[[0, -1], [0, 1]]], dtype=torch.int32)
+
+    def test_index_key_transport_reaches_wrapper_and_shared_consumers(self):
+        """The public replacement controls dispatch and rejects incompatible shared banks."""
+        mesh = SimpleNamespace(size=lambda: 2, get_local_rank=lambda: 0)
+        for transport in ("all_gather", "all_to_all_v"):
+            with self.subTest(transport=transport):
+                source = _source(index_source=True)
+                module = attention.SharedCompressedDSAAttention(source, index_k_comm=transport)
+                request = deepseek_v41_shared_attention_parallel_wrapper(module, None, None, mesh, None)
+                context = request.companion_attrs["_hyper_v41_shared_attention_cp_context"]
+                self.assertEqual(context.plan_index_key is not None, transport == "all_to_all_v")
+                self.assertEqual(context.launch_index is not None, transport == "all_to_all_v")
+                plan = module.indexer._resolve_key_plan(context, (3, 5), None)
+                module.indexer.owns_key = False
+                self.assertEqual(module.indexer._resolve_key_plan(context, (3, 5), plan), plan)
+                if plan is not None:
+                    with self.assertRaisesRegex(ValueError, "Full/Reindex"):
+                        module.indexer._resolve_key_plan(None, (3, 5), plan)
+                    module.indexer.owns_key = True
+                    module.indexer.is_candidate_source = True
+                    with self.assertRaisesRegex(NotImplementedError, "ordinary causal selection"):
+                        module.indexer._resolve_key_plan(context, (3, 5), None)
+        self.assertEqual(attention.SharedCompressedDSAAttention(_source()).index_k_comm, "all_gather")
+        with self.assertRaisesRegex(ValueError, "index_k_comm"):
+            attention.SharedCompressedDSAAttention(_source(), index_k_comm="invalid")
+
+    def test_compact_index_key_aligns_kl_with_either_main_bank_layout(self):
+        """Index K compaction must preserve teacher/student IDs with main AG or A2AV."""
+        module = attention.SharedCompressedDSAAttention(_source(index_source=True))
+        plan = index_key_plan((3, 5), 2, 1, 1, "greedy", 2)
+        main = torch.arange(8 * 128, dtype=torch.float32).view(1, 8, 128)
+        compact = main[:, plan.global_positions(main.device)].clone().requires_grad_()
+        selected = torch.tensor([[[3, -1], [7, 4]]], dtype=torch.int32)
+        output = attention.SharedCompressedIndexerOutput(
+            selected, compact.detach(), None, self.query, self.weights, plan, plan.owner_view(compact),
+        )
+        segments = ((0, 2, 3, 8, 3),)
+        expected_segments = ((0, 2, 0, 5, 3),)
+        for offset in (0, 3):
+            with self.subTest(main_key_offset=offset):
+                with patch.object(attention, "shared_compressed_indexer_kl_loss",
+                                  return_value=torch.zeros(())) as loss:
+                    module._apply_indexer_loss(output, self.query, main[:, offset:], None, segments, offset)
+                args, kwargs = loss.call_args
+                torch.testing.assert_close(args[1], main[:, 3:], rtol=0, atol=0)
+                torch.testing.assert_close(args[4], main[:, 3:], rtol=0, atol=0)
+                torch.testing.assert_close(args[5], torch.tensor([[[0, -1], [4, 1]]], dtype=torch.int32))
+                self.assertEqual(kwargs["query_segments"], expected_segments)
+                self.assertTrue(args[1].requires_grad)
 
     def test_indexer_requires_native_when_explicitly_selected(self):
         """Unsupported CPU inputs cannot silently satisfy native mode."""

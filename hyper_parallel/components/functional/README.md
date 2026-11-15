@@ -115,6 +115,75 @@ raises on missing entries or unsupported inputs, without automatic fallback.
 The fused path supports ordinary causal CSA with compression ratio 1 or 2;
 candidate-pool selection is not supported.
 
+### Optional Index K prefix communication
+
+Set `index_k_comm` on the V4.1 `SharedCompressedDSAAttention` replacement:
+
+```yaml
+index_k_comm: all_to_all_v  # default: all_gather
+```
+
+`all_to_all_v` exchanges the union of document-causal prefixes required by worker
+Indexer selection and original-owner KL. It supports `none`, `zigzag`, `greedy`
+and `hybrid` allocation. Full/Reindex consumers of the same source bank must use
+matching communication, compression and allocation settings. Candidate-pool
+selection is unsupported and raises an error.
+
+TopK IDs are restored to global bank coordinates before main attention. Worker
+selection has no gradient; reverse communication carries only original-owner KL
+contributions. The wait boundary exposes a detached worker selection bank and a
+separate differentiable owner prefix. Full/Reindex KL consumers share the latter,
+so backward does not first expand its gradient to the entire selection bank.
+BF16/FP16 contributions retain their wire dtype, are summed in FP32
+at the owning rank, then cast back once. The public all-gather/reduce-scatter path
+is unchanged. Its BF16 rounding order can differ, so bitwise equality with that
+path is not the numerical acceptance criterion.
+
+The route cache stores document boundaries and row mappings, never current-step
+keys or TopK results. This option is independent of main KV communication and does
+not require paged Index K or a placement kernel. Reducing transferred rows does not
+by itself guarantee a speedup: packing, owner reduction and rank hotspots still
+need measurement for the target workload.
+
+Indexer query routes also keep merged contiguous storage intervals on the CPU.
+Device row indices are expanded in bulk and cached; their immutable route hash
+is computed once. This changes neither document attention segments nor peer
+splits, task assignment, payload order or TopK ownership, and needs no new option.
+
+### All-gather de-padding backward
+
+Natural document compression can leave different numbers of valid K rows on each
+rank. The all-gather path pads each owner to a common capacity and removes these
+padding rows from the gathered bank. Its backward copies each compact gradient
+segment back into the corresponding owner's valid rows and zeros only padding.
+Each selected row has a unique destination, so no scatter reduction is needed.
+Equal-capacity and all-empty banks retain their existing fast paths. This applies
+to both main and Index K banks without changing the collective or its dtype.
+
+### Optional shared-page Index K storage
+
+```yaml
+use_fused_ops: true
+indexer_paged_k: true  # default: false; independent of index_k_comm
+```
+
+The LI V2 `PA_BBND` entry lets repeated logical document prefixes reference the
+same physical K pages. The adapter uses 128-row contiguous pages with batch size
+one and retains document-local causal lengths for r1/r2. Page tails are padded
+and masked by `seqused_k`; TopK IDs are restored to the input bank's coordinates.
+Owner-side KL and its gradients do not use the paged selection storage.
+
+Paging caches contain only addresses, lengths and native metadata, never current
+Q/K, scores or TopK results. CPU plans store compact page ranges. Device cache
+entries are scoped by device and stream, with a process-wide 64 MiB retained-tensor
+budget; shared storage may be charged more than once conservatively. An entry
+larger than the budget is used without caching, not rejected or silently replaced
+with another implementation. All tensors referenced by a cached call plan count
+against the budget, including its block table.
+
+This option targets repeated-prefix storage. It does not reduce dense Indexer
+arithmetic and can add overhead for small inputs with little duplication.
+
 ## SiTU and block attention residuals
 
 These shared functions support `backend="eager"` (default, Torch reference with FP32

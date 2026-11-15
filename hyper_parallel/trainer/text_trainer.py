@@ -161,6 +161,11 @@ class TextTrainer:
             pp_shared_data=bool(getattr(config.dataloader, "pp_shared_data", False)),
         )
         self.base.get_batch = get_batch
+        prepare_dataloader = getattr(get_batch, "prepare_dataloader", None)
+        if callable(prepare_dataloader):
+            self.base.train_dataloader = prepare_dataloader(
+                self.base.train_dataloader, graph_mode=config.compile.selects_graph_compiler(),
+            )
 
     @property
     def distributed_setup(self) -> Any:
@@ -387,6 +392,10 @@ class TextTrainer:
             finally:
                 self.base.abort_profilers()
             raise
+        finally:
+            close_data_pipeline = getattr(self.base.get_batch, "close_data_pipeline", None)
+            if callable(close_data_pipeline):
+                close_data_pipeline()
 
         if balanced_loader:
             try:
