@@ -111,7 +111,7 @@ class ObjectStorageConfig:
 
     Attributes:
         path_to_idx_cache: Local directory where the ``.idx`` file is cached on
-            first use. Re-used across ranks via a per-host directory layout.
+            first use. Reused across ranks via a per-host directory layout.
         bin_chunk_nbytes: Size in bytes of each chunked range read against the
             ``.bin`` object. Defaults to 256 MiB. Larger values reduce request
             count but increase per-rank memory footprint.
@@ -929,14 +929,14 @@ class IndexedDatasetBuilder:
         """Add an entire document to the dataset
 
         Args:
-            tensor (torch.Tensor): The document to add
+            tensor: The tensor, array or token list containing the document.
 
             lengths (List[int]): The lengths of each item in the document
 
             modes (Optional[List[int]], optional): The modes for each item in the document.
                 Defaults to None.
         """
-        np_array = numpy.array(tensor, dtype=self.dtype)
+        np_array = numpy.asarray(tensor, dtype=self.dtype)
         self.data_file.write(np_array.tobytes(order="C"))
         self.sequence_lengths.extend(lengths)
         self.document_indices.append(len(self.sequence_lengths))
