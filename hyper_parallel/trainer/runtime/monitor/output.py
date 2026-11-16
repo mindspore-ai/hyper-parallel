@@ -117,10 +117,11 @@ class OutputWriter:
                 data=[[record["step"], row["token_id"], row["count"], row["fraction"]] for row in record["top_tokens"]],
             )
         if event.startswith("expert_load") and ("counts" in record or "values" in record):
-            tables[f"moe/distribution_rank_{record['rank']}"] = wandb.Table(
-                columns=["step", "module", "expert_id", "assignments"],
+            distribution = "local_distribution" if event == "expert_load_local" else "distribution"
+            tables[f"moe/{distribution}_rank_{record['rank']}"] = wandb.Table(
+                columns=["step", "scope", "module", "expert_id", "assignments"],
                 data=[
-                    [record["step"], record["module"], index, count]
+                    [record["step"], record.get("scope", "unknown"), record["module"], index, count]
                     for index, count in enumerate(record.get("counts", record.get("values", [])))
                 ],
             )

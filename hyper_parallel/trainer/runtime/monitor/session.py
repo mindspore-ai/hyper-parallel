@@ -106,12 +106,13 @@ class MonitorSession:
             self.names = {id(module): name or "<root>" for name, module in self.trainer.model.named_modules()}
             self.parameter_names = {id(parameter): name for name, parameter in self.trainer.model.named_parameters()}
             self.expert_recorder = ExpertLoadRecorder()
-            for name, module in self.trainer.model.named_modules():
-                if getattr(module, "monitor_expert_count", None) is not None:
-                    reference = getattr(module, "tokens_per_expert", None)
-                    if reference is None:
-                        reference = next(module.parameters())
-                    self.expert_recorder.register(name or "<root>", module.monitor_expert_count, reference.device)
+            if self.config.moe.enabled:
+                for name, module in self.trainer.model.named_modules():
+                    if getattr(module, "monitor_expert_count", None) is not None:
+                        reference = getattr(module, "tokens_per_expert", None)
+                        if reference is None:
+                            reference = next(module.parameters())
+                        self.expert_recorder.register(name or "<root>", module.monitor_expert_count, reference.device)
             self.gradient_parameters = {
                 prefix: [
                     (name, parameter)
@@ -293,7 +294,7 @@ class MonitorSession:
             return
         mapping = losses if isinstance(losses, dict) else {"foundation_loss": losses}
         for name, value in mapping.items():
-            count_name = name.removesuffix("_loss") + "_tokens"
+            count_name = name.split("_loss", maxsplit=1)[0] + "_tokens"
             count = token_counts.get(count_name)
             if count is None or value.numel() != 1:
                 self._emit("unavailable", metric="local_loss", name=name,

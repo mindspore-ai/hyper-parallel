@@ -300,9 +300,18 @@ proposed Recorder metrics; a design YAML is not evidence that collection exists.
 - Collect from all ranks that own the metric. A PP stage without loss is not an
   error; unequal FSDP shard norms do not by themselves establish divergence.
   Keep rank-local detail separate from the global-rank-0 output policy.
-- Follow the guide's loss-spike, EP-skew, packing and MFU diagnosis paths. Report
-  the observed symptom, corroborating evidence, unresolved alternatives and next
-  discriminating check; do not infer a root cause from one scalar.
+- Follow the guide's symptom-based blocks: collection coverage, startup, data and
+  packing, loss/gradients/optimizer, EP load, step performance/MFU, checkpoint/resume.
+  Show only the relevant blocks. For each, give the observed event/field and step,
+  the priority investigation direction, a concrete action, the result that would
+  distinguish candidate causes, and evidence still missing. A metric definition
+  or "check the profiler" alone is not an actionable diagnosis.
+- Check that the measured boundary can answer the question: transform construction
+  is not per-batch preprocessing, host submission is not device execution, and
+  completion-only startup records cannot identify a live hang before output starts.
+  When coverage is insufficient, name the specific input identity, worker evidence,
+  rank stack, or targeted trace needed; do not present a hypothesis as a root cause.
+  Initial log triage does not itself require a new full precision-validation run.
 - If collection itself may perturb results, compare no hook, idle hook,
   synchronous summaries and asynchronous summaries under the same workload.
   Inspect graph breaks, callback count, device and pinned-host memory, queue

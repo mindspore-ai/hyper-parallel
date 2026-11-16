@@ -106,6 +106,43 @@ class TestMonitorSession(unittest.TestCase):
         torch.testing.assert_close(parameter.grad, torch.ones_like(parameter))
         torch.testing.assert_close(parameter.main_grad, torch.full_like(parameter, 2.0))
 
+    def test_disabled_moe_skips_expert_registration_and_collection(self) -> None:
+        """Disabled EP diagnostics must not impose recorder capacity on model startup."""
+        self.trainer.model = torch.nn.Sequential(*[torch.nn.Linear(1, 1) for _ in range(64)])
+        for module in self.trainer.model:
+            module.monitor_expert_count = 1024
+        self.assertFalse(self.config.moe.enabled)
+        self.session.bind_model()
+        self.session.begin_step(1)
+        with patch("hyper_parallel.trainer.runtime.monitor.experts.dist.all_reduce") as collective:
+            self.session.record_component(
+                "expert_load", self.trainer.model[0], {"counts": torch.ones(1024)}
+            )
+            self.session.end_step()
+        collective.assert_not_called()
+        self.assertEqual(self.session.expert_recorder.specs, {})
+        self.assertEqual(self.session.expert_recorder.counts, {})
+        self.assertFalse(any(record["event"].startswith("expert_load") for record in self.records()))
+
+    def test_mtp_local_loss_uses_foundation_token_counts(self) -> None:
+        """Foundation and MTP micro losses share the trainer's token family and step weighting."""
+        self.config.local_loss = SamplingConfig(True, 1)
+        self.session.begin_step(1)
+        for foundation, mtp, count in ((2.0, 3.0, 2), (5.0, 9.0, 1)):
+            self.session.record_loss(
+                {"foundation_loss": torch.tensor(foundation), "foundation_loss_mtp": torch.tensor(mtp)},
+                {"foundation_tokens": torch.tensor(count)},
+            )
+        self.session.end_step()
+        records = self.records()
+        micros = [record for record in records if record["event"] == "local_micro_loss"]
+        steps = {record["name"]: record for record in records if record["event"] == "local_step_loss"}
+        self.assertEqual([record["values"] for record in micros], [[2, 2], [3, 2], [5, 1], [9, 1]])
+        self.assertEqual(steps["foundation_loss"]["loss"], 3.0)
+        self.assertEqual(steps["foundation_loss_mtp"]["loss"], 5.0)
+        self.assertEqual(steps["foundation_loss_mtp"]["tokens"], 3.0)
+        self.assertFalse(any(record.get("metric") == "local_loss" for record in records))
+
     def test_original_forward_only_with_checkpoint_recomputation(self) -> None:
         """Feature: EP recorder. Description: Reentrant recompute. Expectation: One logical count."""
         self.config.moe = replace(self.config.moe, enabled=True, sampler_steps=1, record_distribution=True)
@@ -443,25 +480,36 @@ class TestMonitorDataAndOutput(unittest.TestCase):
                 )
                 writer.emit({"event": "flops_coverage", "step": 7, "blocks": {"q": 123}, "complete": True})
                 writer.emit({"event": "local_micro_loss", "step": 7, "values": [2.5, 10]})
-                writer.emit({"event": "expert_load", "step": 7, "module": "layer.0", "counts": [2, 1],
+                writer.emit({"event": "expert_load", "step": 7, "module": "layer.0", "counts": [20, 10],
+                             "scope": "dp_cp_and_sequence_tp",
                              "metrics": {"moe/max_vio": 1 / 3}})
+                writer.emit({"event": "expert_load_local", "step": 7, "module": "layer.0", "values": [2, 1],
+                             "scope": "rank"})
                 writer.close()
             sdk.init.assert_called_once()
             self.assertEqual(sdk.init.call_args.kwargs["id"], "resume-id")
             self.assertEqual(sdk.init.call_args.kwargs["resume"], "allow")
             run.log.assert_any_call({"global_step": 7, "training/total_loss": 2.5})
-            self.assertEqual(run.log.call_count, 3)
-            self.assertEqual(sdk.Table.call_count, 2)
+            self.assertEqual(run.log.call_count, 4)
+            self.assertEqual(sdk.Table.call_count, 3)
             table_call = run.log.call_args_list[1].args[0]
             self.assertEqual(table_call["data/top_tokens_rank_0"]["data"], [[7, 3, 4, 0.5]])
             self.assertEqual(table_call["global_step"], 7)
             expert_call = run.log.call_args_list[2].args[0]
+            self.assertEqual(expert_call["moe/distribution_rank_0"]["columns"],
+                             ["step", "scope", "module", "expert_id", "assignments"])
             self.assertEqual(expert_call["moe/distribution_rank_0"]["data"],
-                             [[7, "layer.0", 0, 2], [7, "layer.0", 1, 1]])
+                             [[7, "dp_cp_and_sequence_tp", "layer.0", 0, 20],
+                              [7, "dp_cp_and_sequence_tp", "layer.0", 1, 10]])
             self.assertEqual(expert_call["moe/max_vio/rank_0/layer.0"], 1 / 3)
             self.assertEqual(expert_call["global_step"], 7)
+            local_call = run.log.call_args_list[3].args[0]
+            self.assertNotIn("moe/distribution_rank_0", local_call)
+            self.assertEqual(local_call["moe/local_distribution_rank_0"]["data"],
+                             [[7, "rank", "layer.0", 0, 2], [7, "rank", "layer.0", 1, 1]])
+            self.assertEqual(local_call["global_step"], 7)
             records = [json.loads(line) for line in (writer.directory / "rank_0.jsonl").read_text().splitlines()]
-            self.assertEqual(len(records), 5)
+            self.assertEqual(len(records), 6)
             self.assertEqual(records[2]["blocks"], {"q": 123})
             self.assertEqual(records[3]["values"], [2.5, 10])
             run.finish.assert_called_once()
