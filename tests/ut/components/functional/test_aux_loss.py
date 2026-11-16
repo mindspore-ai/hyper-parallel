@@ -15,14 +15,17 @@
 """Auxiliary gradients must follow the scalar objective under recomputation."""
 
 import unittest
+from unittest.mock import patch
 
 import torch
+from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 
-from hyper_parallel.components.functional.aux_loss import (
+from hyper_parallel.components.functional import (
     aux_loss_auto_scale,
     aux_loss_scale_context,
     bind_aux_loss_scale,
+    sequence_load_balancing_loss,
     set_aux_loss_scale,
 )
 
@@ -102,3 +105,34 @@ class TestAuxLossScale(unittest.TestCase):
             bind_aux_loss_scale(loss)
             (loss * 0.25).backward()
         torch.testing.assert_close(value.grad, torch.tensor(1.0))
+
+
+    def test_sequence_loss_graph_matches_eager(self) -> None:
+        """Capture both forward reductions and the probability SUM backward."""
+        group = object()
+        scores = torch.tensor([[0.7, 0.3], [0.2, 0.8]], requires_grad=True)
+        indices = torch.tensor([[0], [1]])
+        ids = torch.tensor([0, 1])
+
+        def objective(local_scores, local_indices):
+            """Return the loss and its gradient from the same graph."""
+            loss = sequence_load_balancing_loss(
+                local_scores, local_indices, ids, 2, sequence_partition_groups=(group,),
+            )
+            gradient, = torch.autograd.grad(loss, local_scores)
+            return loss, gradient
+
+        # A second rank contributes the same statistics and loss gradient.
+        replay_scores = scores.detach().flip(0).requires_grad_()
+        replay_indices = replay_scores.detach().topk(1).indices
+        with patch("hyper_parallel.core.utils.communication.dist_func.all_reduce",
+                   side_effect=lambda data, **_: data * 2):
+            expected = objective(replay_scores, replay_indices)
+        with (
+            patch("hyper_parallel.core.utils.communication._is_tracing_or_compiling", return_value=True),
+            patch("hyper_parallel.core.utils.communication._functional_collectives.all_reduce",
+                  side_effect=lambda data, *_: data * 2) as collective,
+        ):
+            graph = make_fx(objective)(scores, indices)
+            self.assertEqual(collective.call_count, 3, f"Expected three collective calls, got {collective.call_count}")
+        torch.testing.assert_close(graph(replay_scores, replay_indices), expected)
