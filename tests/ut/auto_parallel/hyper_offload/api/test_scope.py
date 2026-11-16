@@ -26,6 +26,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from hyper_parallel.auto_parallel.hyper_offload import OffloadConfig, OffloadSession
 from hyper_parallel.auto_parallel.hyper_offload.api.scope import (
     dispatch_framework_op,
+    dispatch_framework_read,
     has_managed_inputs,
 )
 from hyper_parallel.auto_parallel.hyper_offload.api.session import (
@@ -58,12 +59,57 @@ class _CountingMode(TorchDispatchMode):
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         """Count operations while preserving execution."""
+        del types
         self.calls += 1
         return func(*args, **(kwargs or {}))
 
 
 class TestFrameworkBoundary(unittest.TestCase):
     """Check real FSDP methods and exported storage lifetimes."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_framework_allocation_records_only_unique_fresh_storage_bytes(self) -> None:
+        """Feature: Framework workspace accounting.
+
+        Description: Return fresh output aliases and a view of an existing input.
+        Expectation: Count fresh storage once and exclude the input storage.
+        """
+        allocations = []
+        executor = SimpleNamespace(
+            dispatch=lambda function, args, kwargs: function(*args, **kwargs),
+            record_framework_allocation=allocations.append,
+        )
+        source = torch.arange(8, dtype=torch.float16)
+
+        def convert(value: torch.Tensor) -> tuple:
+            """Create fresh aliases and an input view.
+
+            Args:
+                value: Existing input storage to exclude from accounting.
+            """
+            converted = value.float()
+            return converted, converted.view(2, 4), value.view(-1)
+
+        dispatch_framework_read(executor, convert, (source,), {}, native_inputs=True)
+        self.assertEqual(allocations, [32])
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_framework_workspace_metadata_survives_finish_and_resets(self) -> None:
+        """Feature: Framework workspace trace lifecycle.
+
+        Description: Record different allocation sizes before completing warmup.
+        Expectation: The trace retains the maximum and the executor resets its metadata.
+        """
+        manager = ResidencyManager(1024)
+        with patch("hyper_parallel.auto_parallel.hyper_offload.execution.warmup.executor.DeviceTimer"):
+            executor = WarmupExecutor(manager, 1024)
+        executor.record_framework_allocation(64)
+        executor.record_framework_allocation(32)
+        with patch("hyper_parallel.auto_parallel.hyper_offload.execution.warmup.executor.profile_transfer_bandwidth",
+                   return_value=(16.0, 16.0)):
+            trace, _ = executor.finish()
+        self.assertEqual(trace.framework_allocation_bytes, 64)
+        self.assertEqual(executor._framework_allocation_bytes, 0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     def test_opaque_native_ops_preserve_other_modes_without_stack_scan(self) -> None:

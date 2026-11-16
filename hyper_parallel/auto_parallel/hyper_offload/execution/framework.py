@@ -17,7 +17,7 @@
 from typing import Any
 
 import torch
-from torch.utils._pytree import tree_map
+from torch.utils._pytree import tree_iter, tree_map
 
 from hyper_parallel.auto_parallel.hyper_offload.execution.tensor import ShadowTensor
 
@@ -43,6 +43,18 @@ def dispatch_framework_read(executor: Any, func: Any, args: tuple, kwargs: dict,
         """
         nonlocal output
         output = func(*inputs, **options) if native_inputs else dispatch_framework_op(func, inputs, options)
+        recorder = getattr(executor, "record_framework_allocation", None)
+        if recorder is not None:
+            input_storages = {
+                value.untyped_storage()._cdata for value in tree_iter((inputs, options))
+                if isinstance(value, torch.Tensor)
+            }
+            allocated = {
+                value.untyped_storage()._cdata: value.untyped_storage().nbytes()
+                for value in tree_iter(output) if isinstance(value, torch.Tensor)
+                and value.untyped_storage()._cdata not in input_storages
+            }
+            recorder(sum(allocated.values()))
         return ()
 
     framework_read.__name__ = "framework_read:" + func.__name__

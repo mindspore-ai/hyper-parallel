@@ -48,6 +48,7 @@ from hyper_parallel.auto_parallel.hyper_offload.planning.communication_mask impo
     mask_communications,
 )
 from hyper_parallel.auto_parallel.hyper_offload.planning.peak import ScoreWeights, _choose_gap
+from tests.common.mark_utils import arg_mark
 
 
 def make_trace(
@@ -226,6 +227,57 @@ class TestPeakResidencyPlanner(unittest.TestCase):
                 self.assertEqual(selected, expected, f"selected={selected}, expected={expected}")
                 peak = max(simulate(self, trace, schedule))
                 self.assertLessEqual(peak, budget, f"peak={peak}, budget={budget}")
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_framework_workspace_reserve_uses_additional_native_intervals(self):
+        """Feature: Framework workspace reserve.
+
+        Description: Plan native saved intervals with and without framework workspace metadata.
+        Expectation: Extra offload leaves workspace headroom without modifying the trace budget.
+        """
+        trace = self.forward_backward_trace()
+        trace.memory_limit_bytes = 250
+        trace.preferred_eviction_gaps = [(1, 0, 8), (2, 1, 9)]
+        planner = PeakResidencyPlanner()
+        baseline = planner.build(trace)
+        self.assertEqual(positions(baseline, Action.COPY_D2H, 1), [])
+        self.assertEqual(positions(baseline, Action.COPY_D2H, 2), [])
+        trace.framework_allocation_bytes = 40
+        schedule = planner.build(trace)
+        self.assertEqual(len(positions(schedule, Action.COPY_D2H, 1)), 1)
+        self.assertEqual(len(positions(schedule, Action.COPY_D2H, 2)), 1)
+        self.assertLessEqual(max(simulate(self, trace, schedule)), 170)
+        self.assertEqual(trace.memory_limit_bytes, 250)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_workspace_slack_does_not_force_non_native_extra_intervals(self):
+        """Feature: Native replay eligibility.
+
+        Description: Provide workspace metadata with only one eligible native saved interval.
+        Expectation: Extra offload preserves native replay and the original activation budget.
+        """
+        trace = self.forward_backward_trace()
+        trace.memory_limit_bytes = 250
+        trace.framework_allocation_bytes = 40
+        trace.preferred_eviction_gaps = [(1, 0, 8)]
+        schedule = PeakResidencyPlanner().build(trace)
+        self.assertEqual(len(positions(schedule, Action.COPY_D2H, 1)), 1)
+        self.assertEqual(positions(schedule, Action.COPY_D2H, 2), [])
+        self.assertLessEqual(max(simulate(self, trace, schedule)), trace.memory_limit_bytes)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_invalid_framework_workspace_is_rejected(self):
+        """Feature: Framework workspace validation.
+
+        Description: Supply negative, boolean and non-integer workspace metadata.
+        Expectation: Reject each invalid value before returning a schedule.
+        """
+        for value in (-1, True, 1.5):
+            with self.subTest(value=value):
+                trace = self.forward_backward_trace()
+                trace.framework_allocation_bytes = value
+                with self.assertRaisesRegex(ValueError, "framework_allocation_bytes"):
+                    PeakResidencyPlanner().build(trace)
 
     def test_forward_delayed_release_and_backward_prefetch(self):
         trace = self.forward_backward_trace()

@@ -84,6 +84,7 @@ class WarmupExecutor(BaseExecutor):
         self._guide: list[OpGuide] = []
         self._ops: list[TraceOp] = []
         self._input_bindings = {}
+        self._framework_allocation_bytes = 0
         #: sid -> the op index that first produced this activation.
         self._sid_produced_at_op: dict[int, int] = {}
 
@@ -214,6 +215,14 @@ class WarmupExecutor(BaseExecutor):
 
         return self.apply_shadows(result, output_bindings, flattened=(leaves, output_spec))
 
+    def record_framework_allocation(self, size_bytes: int) -> None:
+        """Remember framework workspace sizes without adopting their storage.
+
+        Args:
+            size_bytes: Fresh storage allocated by one framework operation.
+        """
+        self._framework_allocation_bytes = max(self._framework_allocation_bytes, size_bytes)
+
     def finish(self) -> tuple[ActivationTrace, list[OpGuide]]:
         """Finish warmup and return recorded trace and replay guide."""
         d2h, h2d = profile_transfer_bandwidth()
@@ -225,6 +234,7 @@ class WarmupExecutor(BaseExecutor):
             memory_limit_bytes=self._memory_limit_bytes,
             d2h_bandwidth_gbps=d2h,
             h2d_bandwidth_gbps=h2d,
+            framework_allocation_bytes=self._framework_allocation_bytes,
         )
         guide = self._guide
 
@@ -237,5 +247,6 @@ class WarmupExecutor(BaseExecutor):
         self._ops = []
         self._guide = []
         self._input_bindings = {}
+        self._framework_allocation_bytes = 0
         self._tracker.clear_activations()
         super().reset()
