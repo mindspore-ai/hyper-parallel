@@ -28,6 +28,7 @@ from hyper_parallel.auto_parallel.hyper_offload.ir.schedule import (
 from hyper_parallel.auto_parallel.hyper_offload.ir.trace import ActivationTrace
 from hyper_parallel.auto_parallel.hyper_offload.planning._peak_model import (
     EvictionGap,
+    PeakProfile,
     build_profile,
 )
 from hyper_parallel.auto_parallel.hyper_offload.planning.communication_mask import (
@@ -195,12 +196,43 @@ class PeakResidencyPlanner:
         ):
             raise ValueError("peak score weights must be finite and nonnegative")
 
+    def _reserve_framework_workspace(
+        self, trace: ActivationTrace, profile: PeakProfile, selected: list[EvictionGap], limit: int,
+    ) -> int:
+        """Select extra native intervals and return the workspace-adjusted limit.
+
+        Args:
+            trace: Recorded framework allocation sizes and native interval hints.
+            profile: Residency profile updated by the extra selections.
+            selected: Existing selections extended with extra native intervals.
+            limit: Original activation-residency limit in bytes.
+        """
+        workspace = trace.framework_allocation_bytes
+        if isinstance(workspace, bool) or not isinstance(workspace, int) or workspace < 0:
+            raise ValueError("framework_allocation_bytes must be a nonnegative integer")
+        if not workspace:
+            return limit
+        # Framework dtype conversions are outside activation ownership.
+        # Leave room for their large contiguous allocation plus allocator
+        # split slack, using only native-save intervals for extra offload.
+        limit = max(0, limit - 2 * workspace)
+        preferred = set(trace.preferred_eviction_gaps)
+        remaining = [
+            gap for gap in profile.gaps
+            if gap not in selected and (gap.storage_id, gap.start, gap.end) in preferred
+        ]
+        selected.extend(_select_gaps(profile.resident_bytes, remaining, limit, self.weights, preferred))
+        return limit
+
     def build(self, trace: ActivationTrace) -> ResidencySchedule:
         """Build actions compatible with the baseline replay executor.
 
         The limit covers trace-managed storage bytes, not total device memory.
         Irreducible operator peaks are reported; a schedule is not an OOM or
         performance guarantee. Input trace data is never modified.
+
+        Args:
+            trace: Warmup operations, storage lifetimes and allocation metadata.
         """
         limit = trace.memory_limit_bytes
         if limit is None:
@@ -211,6 +243,7 @@ class PeakResidencyPlanner:
         selected = _select_gaps(
             profile.resident_bytes, profile.gaps, limit, self.weights, set(trace.preferred_eviction_gaps)
         )
+        limit = self._reserve_framework_workspace(trace, profile, selected, limit)
         if self.enable_communication_masking:
             placements = mask_communications(selected, profile.resident_bytes, limit)
             limit_prefetch_advance(
