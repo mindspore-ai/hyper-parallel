@@ -26,17 +26,13 @@ def test_fully_shard_auto_grad():
     """
     Feature: parallel run case in fully_shard auto grad
     Description:
-        Run chunked output autograd, single-rank FSDP and HSDP standalone
-        parity, and four-rank HSDP forward-forward-backward-backward parity.
+        Run Transformer chunk-loss accumulation and memory checks, single-rank
+        FSDP/HSDP parity, and two-rank HSDP FFBB parity on six devices.
     Expectation: Every case completes with matching outputs and gradients.
     """
-    # Independent multi-rank HCCL jobs may bind the same NPU NIC socket even
-    # when parallel_run assigns disjoint devices, so run them in separate waves.
     parallel_run([
-        TorchCase(_TEST_FULLY_SHARD_AUTO_GRAD, "test_chunked_output_fully_shard", 12501, 2),
+        TorchCase(_TEST_FULLY_SHARD_AUTO_GRAD, "test_fsdp_transformer_chunkloss_ga_mem", 12501, 2),
         TorchCase(_TEST_FULLY_SHARD_AUTO_GRAD, "test_single_rank_fsdp_autograd_parity", 12502, 1),
         TorchCase(_TEST_FULLY_SHARD_AUTO_GRAD, "test_single_rank_hsdp_autograd_parity", 12503, 1),
-    ])
-    parallel_run([
-        TorchCase(_TEST_FULLY_SHARD_AUTO_GRAD, "test_hsdp_ffbb_autograd_parity", 12504, 4),
+        TorchCase(_TEST_FULLY_SHARD_AUTO_GRAD, "test_hsdp_ffbb_autograd_parity", 12504, 2),
     ])

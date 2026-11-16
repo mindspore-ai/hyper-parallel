@@ -482,7 +482,8 @@ def test_hsdp_param_v2_reduce_scatter_grad():
 
     # Execute reduce-scatter
     hsdp_param.reduce_scatter_grad(async_op=False, reduce_op=dist.ReduceOp.SUM)
-    sharded_grad = hsdp_param.reduce_scatter_output()
+    hsdp_param.wait_reduce_scatter()
+    sharded_grad = hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output
     hsdp_param.clear_reduce_scatter_output()
     # Verify output size
     expected_numel = in_channels * hidden_size // world_size
@@ -623,7 +624,8 @@ def test_hsdp_param_v2_accumulate_grad():
     assert hsdp_param._unsharded_param.grad is None, "Gradient should be cleared after accumulation"
 
     hsdp_param.reduce_scatter_grad(async_op=False, reduce_op=dist.ReduceOp.SUM)
-    sharded_grad = hsdp_param.reduce_scatter_output()
+    hsdp_param.wait_reduce_scatter()
+    sharded_grad = hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output
     hsdp_param.clear_reduce_scatter_output()
     # Calculate expected reduced value:
     # Each rank's accumulated grad = rank + (rank + 1) = 2 * rank + 1
@@ -833,7 +835,8 @@ def test_hsdp_param_v2_pure_tp_no_param_shard_all_reduce():
     hsdp_param.unsharded_param.grad = grad
     hsdp_param.shard()
     hsdp_param.reduce_scatter_grad(async_op=False, reduce_op=dist.ReduceOp.SUM)
-    reduced_grad = hsdp_param.reduce_scatter_output()
+    hsdp_param.wait_reduce_scatter()
+    reduced_grad = hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output
     hsdp_param.all_reduce_source_replicate_grad_inplace(reduced_grad, dist.ReduceOp.SUM)
 
     expected_value = float(sum(range(world_size)))
@@ -890,7 +893,8 @@ def test_hsdp_param_v2_pure_tp_sharded_param_skips_all_reduce():
     hsdp_param.unsharded_param.grad = grad
     hsdp_param.shard()
     hsdp_param.reduce_scatter_grad(async_op=False, reduce_op=dist.ReduceOp.SUM)
-    reduced_grad = hsdp_param.reduce_scatter_output()
+    hsdp_param.wait_reduce_scatter()
+    reduced_grad = hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output
     hsdp_param.all_reduce_source_replicate_grad_inplace(reduced_grad, dist.ReduceOp.SUM)
 
     assert torch.allclose(reduced_grad.view_as(grad), grad)
@@ -1109,7 +1113,8 @@ def test_hsdp_param_v2_non_dim0_reduce_scatter_grad():
         async_op=False,
         reduce_op=dist.ReduceOp.SUM,
     )
-    reduced_grad = hsdp_param.reduce_scatter_output()
+    hsdp_param.wait_reduce_scatter()
+    reduced_grad = hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output
     expected_full_grad = grad_base * world_size
     expected_full_grad += sum(range(world_size)) * 1000
     expected_local_grad = torch.chunk(expected_full_grad, world_size, dim=1)[rank].contiguous()
@@ -1187,7 +1192,8 @@ def test_hsdp_param_v2_same_dim_strided_non_dim0_backward():
         async_op=False,
         reduce_op=dist.ReduceOp.SUM,
     )
-    reduced_grad = hsdp_param.reduce_scatter_output()
+    hsdp_param.wait_reduce_scatter()
+    reduced_grad = hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output
     expected_full_grad = grad_base * dp_size
     expected_full_grad += tp_rank * 100 * dp_size
     expected_full_grad += sum(range(dp_size)) * 1000

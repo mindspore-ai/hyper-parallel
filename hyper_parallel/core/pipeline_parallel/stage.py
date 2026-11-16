@@ -17,10 +17,13 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
+from torch._dynamo.eval_frame import OptimizedModule
 
 from hyper_parallel import DTensor
+from hyper_parallel.core.activation_memory.wrapper import SwapWrapper
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.fully_shard.api import HSDPModule
+from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy
 from hyper_parallel.core.pipeline_parallel._stage import PipelineStageBase
 from hyper_parallel.core.pipeline_parallel.utils import _RecvInfo
 
@@ -131,6 +134,23 @@ class PipelineStage(PipelineStageBase):
         self._dyn_shape = dyn_shape
         self._shared_parameters = self._check_shared_parameters(shared_parameters)
         self._virtual_chunk_num = 1
+        if self._has_sharded_params:
+            if any(isinstance(module, OptimizedModule) for module in submodule.modules()):
+                raise ValueError("HSDP pipeline stages do not support torch.compile")
+            if any(isinstance(module, SwapWrapper) or "_swap_group_name" in module.__dict__
+                   for module in submodule.modules()):
+                raise ValueError("HSDP pipeline stages do not support activation swap")
+            submodule.hsdp_scheduler.lazy_init()
+            if submodule.hsdp_scheduler.scheduler_ctx.root_module is not submodule:
+                raise ValueError("An HSDP parameter-management unit must belong to exactly one pipeline stage")
+            stage_modules = set(submodule.modules())
+            for scheduler in submodule.hsdp_scheduler.scheduler_ctx.all_hsdp_schedulers:
+                if not set(scheduler.modules).issubset(stage_modules):
+                    raise ValueError("An HSDP module group cannot span pipeline stages")
+                if scheduler.comm_fusion_policy.enable_comm_fusion:
+                    raise ValueError("HSDP pipeline stages do not support comm_fusion=True")
+                if isinstance(scheduler.offload_policy, CPUOffloadPolicy):
+                    raise ValueError("HSDP pipeline stages do not support parameter offload")
 
     @property
     def has_backward(self) -> bool:
@@ -560,44 +580,3 @@ class PipelineStage(PipelineStageBase):
             ("isend", grad.to_local() if isinstance(grad, DTensor) else grad, info.global_rank)
             for grad, info in zip(out, rg_infos)
         ]
-
-    def execute_reduce_grad(self) -> None:
-        """Reduce nested FSDP gradients and finalize every HSDP root in the stage."""
-        fsdp_schedulers = []
-        seen_scheduler_ids = set()
-        for _, submod in self.submodule.named_modules():
-            if not isinstance(submod, HSDPModule):
-                continue
-            scheduler = submod.hsdp_scheduler
-            scheduler_id = id(scheduler)
-            if scheduler_id in seen_scheduler_ids:
-                continue
-            seen_scheduler_ids.add(scheduler_id)
-            fsdp_schedulers.append(scheduler)
-
-        if not fsdp_schedulers:
-            return
-
-        for scheduler in fsdp_schedulers:
-            scheduler.scheduler_ctx.is_last_backward = True
-            scheduler.set_reshard_after_backward(True)
-            scheduler.set_requires_grad_sync(True)
-
-        for scheduler in fsdp_schedulers:
-            scheduler.hsdp_state.post_backward()
-
-        # A plain pipeline-stage root may contain one or more independently
-        # wrapped HSDP child roots. Finalize every runtime root so each context
-        # clears its backward state; the HSDP hook also drains the global
-        # fused reduction queues. A pre-forward fallback retains the historical
-        # single-root behavior for callers that invoke this method directly.
-        root_schedulers = [
-            scheduler for scheduler in fsdp_schedulers
-            if scheduler._is_root  # pylint: disable=protected-access
-        ]
-        if not root_schedulers:
-            root_schedulers = fsdp_schedulers[:1]
-        for scheduler in root_schedulers:
-            # No public API exposes root backward finalization. The hook drains
-            # unconditionally, so a differentiable PP input cannot defer it.
-            scheduler._root_backward_hook()  # pylint: disable=protected-access

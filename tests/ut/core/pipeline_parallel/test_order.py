@@ -40,8 +40,6 @@ from hyper_parallel.core.pipeline_parallel.scheduler import (
     generate_operations,
     coalesce_p2p,
     attach_fwd_boundary_p2p,
-    add_fsdp_unshard_reshard,
-    add_fsdp_reduce_grad,
     _P2P_STEP_TYPES,
     _RECV_STEP_TYPES,
 )
@@ -362,8 +360,8 @@ class TestParseAndValidate(unittest.TestCase):
         self.assertLess(pos(MetaStepType.SWAP_WAIT_LOAD, 4, 0), overlap_pos)
         self.assertLess(pos(MetaStepType.BWD_RECV, 4, 0), overlap_pos)
         # LAUNCH_OFFLOAD is placed right after the FWD container (overlap_pos)
-        # so D2H starts as early as possible — before any FWD_SEND or
-        # FSDP_RESHARD that may follow.
+        # so D2H starts before any following send.
+        # any following send.
         self.assertLess(overlap_pos, pos(MetaStepType.SWAP_LAUNCH_OFFLOAD, 0, 7))
         self.assertLess(pos(MetaStepType.SWAP_LAUNCH_OFFLOAD, 0, 7), pos(MetaStepType.SWAP_WAIT_OFFLOAD, 0, 7))
 
@@ -585,7 +583,6 @@ class TestParseAndValidate(unittest.TestCase):
         schedule = object.__new__(Schedule1F1B)
         schedule._stage_dict = {0: stage}
         schedule._swap_session = session
-        schedule._assert_in_unshard_if_needed = Mock()
         schedule.wait_fwd_recv = Mock()
         schedule.wait_bwd_recv = Mock()
         schedule.update_losses = Mock()
@@ -729,9 +726,9 @@ class TestParseAndValidate(unittest.TestCase):
     def test_pipeline_swap_accepts_pytorch_backend(self):
         """The PyTorch backend builds the same swap metastep lifecycle."""
         stage = Mock(stage_index=0, stage_num=4, submodule=Mock(), pp_group=None)
+        stage.submodule.parameters.return_value = ()
         with patch.object(Schedule1F1B, "_check_stages", return_value=[stage]), \
-             patch.object(scheduler_module, "unregister_layer_swap_hooks"), \
-             patch.object(Schedule1F1B, "_inject_local_fsdp_actions"):
+             patch.object(scheduler_module, "unregister_layer_swap_hooks"):
             schedule = Schedule1F1B(stage, 4, swap=True)
 
         swap_types = {
@@ -843,147 +840,10 @@ class TestParseAndValidate(unittest.TestCase):
         }
         parse_and_validate(data)
 
-    def test_fsdp_swap_injection_ordering(self):
-        """FSDP→swap injection: verify FSDP steps are optimally placed relative to swap steps.
 
-        Validates the injection order contract:
-        - Before FWD: FSDP_UNSHARD → FWD collection scope
-        - After FWD:  SWAP_LAUNCH_OFFLOAD → FSDP_RESHARD
-        - Before BWD: SWAP_LAUNCH_LOAD → FSDP_UNSHARD → SWAP_WAIT_LOAD → BWD
-        """
-        # Construct a simple 1F1B-like schedule with 1 managed stage and a gap
-        # large enough for swap injection.
-        stage_index = 0
-        order = [
-            MetaStep(0, MetaStepType.FWD, stage_index),
-            MetaStep(0, MetaStepType.FWD_SEND, stage_index),
-            MetaStep(1, MetaStepType.FWD, stage_index),
-            MetaStep(1, MetaStepType.FWD_SEND, stage_index),
-            MetaStep(2, MetaStepType.FWD, stage_index),
-            MetaStep(2, MetaStepType.FWD_SEND, stage_index),
-            MetaStep(3, MetaStepType.FWD, stage_index),
-            MetaStep(3, MetaStepType.FWD_SEND, stage_index),
-            MetaStep(0, MetaStepType.BWD_RECV, stage_index),
-            MetaStep(0, MetaStepType.BWD, stage_index),
-            MetaStep(1, MetaStepType.BWD_RECV, stage_index),
-            MetaStep(1, MetaStepType.BWD, stage_index),
-            MetaStep(2, MetaStepType.BWD_RECV, stage_index),
-            MetaStep(2, MetaStepType.BWD, stage_index),
-            MetaStep(3, MetaStepType.BWD_RECV, stage_index),
-            MetaStep(3, MetaStepType.BWD, stage_index),
-        ]
 
-        # Simulate the build_exec_order pipeline: FSDP first, then swap.
-        managed_stage_indices = {stage_index}
-        order = add_fsdp_unshard_reshard(order, managed_stage_indices, max_active_stages=3)
-        order = add_fsdp_reduce_grad(order, managed_stage_indices, micro_batch_num=4)
-        order = inject_pipeline_swap_steps(order)
-
-        def pos(micro_index, step_type):
-            for index, step in enumerate(order):
-                if step is None:
-                    continue
-                if step.micro_index != micro_index or step.type != step_type:
-                    continue
-                if step.stage_index != stage_index:
-                    continue
-                return index
-            return None
-
-        # --- After FWD assertions ---
-        # SWAP_LAUNCH_OFFLOAD must appear before FSDP_RESHARD (perf: early D2H start).
-        launch_off_pos = pos(0, MetaStepType.SWAP_LAUNCH_OFFLOAD)
-        self.assertIsNotNone(launch_off_pos, "SWAP_LAUNCH_OFFLOAD missing")
-        # The first FSDP_RESHARD after FWD should come after LAUNCH_OFFLOAD.
-        reshard_positions = [
-            i for i, s in enumerate(order)
-            if s is not None and s.type == MetaStepType.FSDP_RESHARD
-        ]
-        self.assertTrue(reshard_positions, "FSDP_RESHARD missing")
-        self.assertLess(launch_off_pos, reshard_positions[0],
-                        "SWAP_LAUNCH_OFFLOAD must precede FSDP_RESHARD after FWD")
-
-        # --- Before FWD assertions ---
-        # FSDP_UNSHARD must precede the FWD leaf collection scope.
-        unshard_positions = [
-            i for i, s in enumerate(order)
-            if s is not None and s.type == MetaStepType.FSDP_UNSHARD
-        ]
-        self.assertTrue(unshard_positions, "FSDP_UNSHARD missing")
-        fwd_pos = pos(0, MetaStepType.FWD)
-        self.assertIsNotNone(fwd_pos, "FWD missing")
-        self.assertLess(unshard_positions[0], fwd_pos,
-                        "FSDP_UNSHARD must precede FWD")
-
-        # --- Before BWD assertions ---
-        # SWAP_LAUNCH_LOAD → FSDP_UNSHARD → SWAP_WAIT_LOAD → BWD.
-        bwd_m0_pos = pos(0, MetaStepType.BWD)
-        self.assertIsNotNone(bwd_m0_pos, "BWD(m=0) missing")
-        launch_load_m0_pos = pos(0, MetaStepType.SWAP_LAUNCH_LOAD)
-        self.assertIsNotNone(launch_load_m0_pos, "SWAP_LAUNCH_LOAD(m=0) missing")
-        wait_load_m0_pos = pos(0, MetaStepType.SWAP_WAIT_LOAD)
-        self.assertIsNotNone(wait_load_m0_pos, "SWAP_WAIT_LOAD(m=0) missing")
-        bwd_recv_m0_pos = pos(0, MetaStepType.BWD_RECV)
-        self.assertIsNotNone(bwd_recv_m0_pos, "BWD_RECV(m=0) missing")
-
-        # Find the FSDP_UNSHARD that was injected for BWD (the one right before
-        # BWD_RECV, which will be the second UNSHARD for this stage if the
-        # schedule happens to have two).
-        bwd_unshard = None
-        for i in range(bwd_m0_pos - 1, 0, -1):
-            if order[i] is not None and order[i].type == MetaStepType.FSDP_UNSHARD:
-                bwd_unshard = i
-                break
-        if bwd_unshard is not None:
-            self.assertLess(launch_load_m0_pos, bwd_unshard,
-                            "SWAP_LAUNCH_LOAD must precede FSDP_UNSHARD before BWD")
-            self.assertLess(bwd_unshard, bwd_m0_pos,
-                            "FSDP_UNSHARD must precede BWD")
-        self.assertLess(launch_load_m0_pos, wait_load_m0_pos,
-                        "SWAP_LAUNCH_LOAD must precede SWAP_WAIT_LOAD")
-        self.assertLess(bwd_recv_m0_pos, wait_load_m0_pos,
-                        "BWD_RECV must precede SWAP_WAIT_LOAD")
-        self.assertLess(wait_load_m0_pos, bwd_m0_pos,
-                        "SWAP_WAIT_LOAD must precede BWD")
-
-        # --- Gap lifecycle assertions ---
-        # WAIT_OFFLOAD must precede LAUNCH_LOAD for same micro.
-        wait_off_pos = pos(0, MetaStepType.SWAP_WAIT_OFFLOAD)
-        self.assertIsNotNone(wait_off_pos, "SWAP_WAIT_OFFLOAD missing")
-        self.assertLess(wait_off_pos, launch_load_m0_pos,
-                        "SWAP_WAIT_OFFLOAD must precede SWAP_LAUNCH_LOAD")
-
-    def test_fsdp_swap_delays_load_when_parameters_stay_unsharded(self):
-        """FSDP swap should not restore activations across an extra compute step."""
-        stage_index = 0
-        order = [
-            MetaStep(None, MetaStepType.FSDP_UNSHARD, stage_index),
-            MetaStep(0, MetaStepType.FWD, stage_index),
-            MetaStep(1, MetaStepType.FWD, stage_index),
-            MetaStep(2, MetaStepType.FWD, stage_index),
-            MetaStep(3, MetaStepType.FWD, stage_index),
-            MetaStep(0, MetaStepType.BWD, stage_index),
-            MetaStep(None, MetaStepType.FSDP_RESHARD, stage_index),
-        ]
-        order = inject_pipeline_swap_steps(order)
-
-        launch_load = next(
-            index for index, step in enumerate(order)
-            if step.type == MetaStepType.SWAP_LAUNCH_LOAD and step.micro_index == 0
-        )
-        wait_load = next(
-            index for index, step in enumerate(order)
-            if step.type == MetaStepType.SWAP_WAIT_LOAD and step.micro_index == 0
-        )
-        backward = next(
-            index for index, step in enumerate(order)
-            if step.type == MetaStepType.BWD and step.micro_index == 0
-        )
-        self.assertEqual(launch_load + 1, wait_load)
-        self.assertEqual(wait_load + 1, backward)
-
-    def test_fsdp_swap_dxdw_split_ordering(self):
-        """FSDP+swap with dxdw split should anchor activation load on BWD_INPUT."""
+    def test_swap_dxdw_split_ordering(self):
+        """Activation load must precede BWD_INPUT without another load for BWD_WEIGHT."""
         stage_index = 0
         # Construct a schedule with enough gap for swap injection, using
         # BWD_INPUT as the backward anchor.
@@ -1010,9 +870,6 @@ class TestParseAndValidate(unittest.TestCase):
             MetaStep(3, MetaStepType.BWD_WEIGHT, stage_index),
         ]
 
-        managed_stage_indices = {stage_index}
-        order = add_fsdp_unshard_reshard(order, managed_stage_indices, max_active_stages=3)
-        order = add_fsdp_reduce_grad(order, managed_stage_indices, micro_batch_num=4)
         order = inject_pipeline_swap_steps(order)
 
         def step_indices(step_type):
@@ -1021,22 +878,21 @@ class TestParseAndValidate(unittest.TestCase):
                 if s is not None and s.type == step_type
             ]
 
-        # Each H2D launch must target BWD_INPUT, never BWD_WEIGHT.
+        # H2D can overlap another chunk's weight computation, but its matching
+        # activation consumer is always BWD_INPUT.
         launch_load_positions = step_indices(MetaStepType.SWAP_LAUNCH_LOAD)
         self.assertTrue(launch_load_positions, "SWAP_LAUNCH_LOAD should exist for BWD_INPUT")
         for launch_pos in launch_load_positions:
-            next_comp = None
-            for j in range(launch_pos + 1, len(order)):
-                if order[j] is not None and order[j].type in (
-                    MetaStepType.BWD_INPUT,
-                    MetaStepType.BWD_WEIGHT,
-                    MetaStepType.BWD,
-                ):
-                    next_comp = order[j]
-                    break
-            self.assertIsNotNone(next_comp, f"No compute step after LAUNCH_LOAD at {launch_pos}")
-            self.assertEqual(next_comp.type, MetaStepType.BWD_INPUT,
-                             f"LAUNCH_LOAD at {launch_pos} should target BWD_INPUT, got {next_comp.type}")
+            consumer_pos = next(
+                index for index, step in enumerate(order)
+                if step.type == MetaStepType.BWD_INPUT and step.micro_index == order[launch_pos].micro_index
+            )
+            wait_pos = next(
+                index for index, step in enumerate(order)
+                if step.type == MetaStepType.SWAP_WAIT_LOAD and step.micro_index == order[launch_pos].micro_index
+            )
+            self.assertLess(launch_pos, wait_pos)
+            self.assertLess(wait_pos, consumer_pos)
 
         # Verify the schedulable lifecycle for m=0. Collection remains
         # leaf-local while the H2D wait is an explicit scheduler action.

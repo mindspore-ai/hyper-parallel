@@ -260,31 +260,6 @@ def _post_compute_launch_anchor(leaf):
     return leaf.container_index
 
 
-def _load_launch_anchor(
-        order: List[Any], fwd_leaf: _ComputeLeaf, bwd_leaf: _ComputeLeaf,
-        compute_between: List[int]) -> int:
-    """Choose the latest safe H2D launch point for plain or FSDP execution."""
-    has_fsdp_steps = any(
-        step is not None and step.type in (
-            MetaStepType.FSDP_UNSHARD,
-            MetaStepType.FSDP_RESHARD,
-            MetaStepType.FSDP_REDUCE_GRAD,
-        )
-        for step in order
-    )
-    if not has_fsdp_steps:
-        return compute_between[-1]
-
-    for index in range(bwd_leaf.container_index - 1, fwd_leaf.container_index, -1):
-        step = order[index]
-        if (
-                step is not None
-                and step.type == MetaStepType.FSDP_UNSHARD
-                and step.stage_index == bwd_leaf.step.stage_index):
-            return index
-    return bwd_leaf.container_index
-
-
 def _index_compute_leaves(order):
     """Index compute leaves by chunk key, separating FWD from BWD consumers."""
     fwd_index = {}
@@ -320,9 +295,7 @@ def _chunk_swap_actions(order, fwd_leaf, bwd_leaf, container_by_compute_index):
 
     stage_index = fwd_leaf.step.stage_index
     micro_index = fwd_leaf.step.micro_index
-    # Always launch offload immediately after the FWD container so that the
-    # async D2H starts before any FSDP_RESHARD or FWD_SEND that may sit
-    # between the FWD and the next compute step.
+    # Launch D2H as soon as the forward container has produced its activations.
     after = [
         (
             _post_compute_launch_anchor(fwd_leaf),
@@ -337,7 +310,7 @@ def _chunk_swap_actions(order, fwd_leaf, bwd_leaf, container_by_compute_index):
     ]
     before = [
         (
-            _load_launch_anchor(order, fwd_leaf, bwd_leaf, compute_between),
+            compute_between[-1],
             _BeforeActionPriority.LAUNCH_LOAD,
             MetaStep(micro_index, MetaStepType.SWAP_LAUNCH_LOAD, stage_index),
         ),

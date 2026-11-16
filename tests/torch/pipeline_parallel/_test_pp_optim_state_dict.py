@@ -55,14 +55,14 @@ from torch.distributed.checkpoint.state_dict import StateDictOptions  # noqa: E4
 
 from hyper_parallel import (  # noqa: E402
     SkipDTensorDispatch,
-    get_optim_state_dict,
     init_device_mesh,
-    set_optim_state_dict,
 )
 from hyper_parallel.core.distributed_checkpoint import (  # noqa: E402
     FileSystemReader,
+    get_optim_state_dict,
     save,
     load,
+    set_optim_state_dict,
 )
 from hyper_parallel.core.dtensor.dtensor import DTensor  # noqa: E402
 from hyper_parallel.core.dtensor.placement_types import Replicate  # noqa: E402
@@ -372,8 +372,8 @@ def _build_pp_hsdp_stages():
 def _pp_hsdp_train_step(schedule, stage_optimizers, x, pp_rank):
     """Run one PP+HSDP training step.
 
-    The schedule handles forward, backward, and HSDP gradient drain
-    (``FSDP_REDUCE_GRAD`` MetaStep).  After ``schedule.run()``, gradients
+    The schedule handles forward, backward, and HSDP communication finalization.
+    After ``schedule.run()``, gradients
     are reduced and ready for the optimizer.  ``SkipDTensorDispatch`` is
     required for ``optimizer.step()`` on DTensor parameters.
     """

@@ -12,44 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""PP + HSDP (2-D ``(replicate, shard)`` mesh) under Interleaved 1F1B vs single-card.
-
-The ``fully_shard`` units run over a **2-D HSDP** submesh.  The point is to exercise the HSDP gradient
-*drain* (reduce-scatter over the shard dim **and** all-reduce over the replicate
-dim) when it is driven by the pipeline ``FSDP_REDUCE_GRAD`` MetaStep under
-``ScheduleInterleaved1F1B`` -- the path fixed by the unconditional drain in
-``_root_backward_hook``.
-
-Topology (default, 8 ranks): 3-D mesh ``(pp=2, dp=2, fsdp=2)``.
-
-* ``pp`` -- pipeline width 2.
-* ``(dp, fsdp)`` -- the 2-D HSDP submesh handed to ``fully_shard``: ``dp`` is the
-  replicate dim (grads all-reduced), ``fsdp`` is the shard dim (params sharded
-  dim-0, grads reduce-scattered).  The combined ``dp * fsdp`` group is the data-
-  parallel world, so each of those ranks consumes a distinct micro-batch slice.
-
-VPP loop layout (``TOTAL_LAYERS=4, pp=2``): virtual stage ``v`` is owned by
-``pp_rank v % pp_size`` and holds exactly layer ``v`` -- pp_rank 0 -> stages [0, 2],
-pp_rank 1 -> stages [1, 3]; ``stage_num = TOTAL_LAYERS``.
-
-Reference: every rank holds the full MLP stack and runs all ``dp*fsdp*num_microbatches``
-micro-batches serially under the additive loss ``sum(output)``.  Because the loss is
-additive and grads are reduced with SUM, the HSDP-reduced stage gradient must equal
-the full serial gradient (sliced to this rank's shard).  Each training step asserts:
-
-1. global summed loss (all-reduced over the HSDP group) == reference total loss;
-2. every owned parameter's reduced gradient == the reference gradient shard
-   (this is the direct drain check -- a missed drain shows up as ``grad is None``
-   or a one-DP-rank-short gradient).
-
-Sizes are env-tunable (``HSDP_VPP_PP_SIZE`` / ``_DP_SIZE`` / ``_FSDP_SIZE`` /
-``_STEPS``) so the same worker can run a reduced config on fewer cards.
-"""
+"""PP/HSDP policy, split backward, checkpointing, and concurrent-overlap parity."""
 # pylint: disable=W0611,C0413,C0412,W0613,W0612
 from __future__ import annotations
 
 import copy
 import os
+from contextlib import nullcontext
+from functools import partial
+from unittest.mock import patch
 
 
 from typing import Dict, List, Tuple
@@ -57,23 +28,24 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
-import torch_npu
 from torch import nn, optim
+from torch.utils.checkpoint import checkpoint
 
-from hyper_parallel import DTensor, ScheduleInterleaved1F1B, SkipDTensorDispatch, init_device_mesh
+from hyper_parallel import DTensor, SkipDTensorDispatch, init_device_mesh
+from hyper_parallel.core.pipeline_parallel.scheduler import ScheduleGPipe, Schedule1F1B, ScheduleInterleaved1F1B
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.pipeline_parallel import PipelineStage
 
-from tests.torch.utils import init_dist
+from tests.torch.pipeline_parallel.hsdp_overlap import initialize_device, register_hsdp_overlap
 
 _D_HID = 8
-_TOTAL_LAYERS = 4
+_NUM_STAGES = 4
 _NUM_MICROBATCHES = 4
 _LR = 0.01
 _INIT_SEED = 42
 _DATA_SEED = 2026
-_RTOL = 2e-3
-_ATOL = 1e-3
+_RTOL = 1e-5
+_ATOL = 1e-6
 
 _PP_SIZE = int(os.environ.get("HSDP_VPP_PP_SIZE", "2"))
 _DP_SIZE = int(os.environ.get("HSDP_VPP_DP_SIZE", "2"))      # HSDP replicate dim
@@ -99,20 +71,21 @@ class MLPModule(nn.Module):
 class StageModel(nn.Module):
     """One pipeline (virtual) stage: a contiguous slice of MLP layers."""
 
-    def __init__(self, layers) -> None:
+    def __init__(self, layers, checkpointing=False) -> None:
         super().__init__()
         self.layers = nn.ModuleList(list(layers))
+        self.checkpointing = checkpointing
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward received activations through the owned layers."""
         for layer in self.layers:
-            x = layer(x)
+            x = checkpoint(layer, x, use_reentrant=False) if self.checkpointing else layer(x)
         return x
 
 
 def _owned_virtual_stages(pp_rank: int) -> List[int]:
-    """Loop layout: virtual stage ``v`` (== layer ``v``) is owned by ``v % pp_size``."""
-    return list(range(pp_rank, _TOTAL_LAYERS, _PP_SIZE))
+    """Loop layout: virtual stage ``v`` is owned by ``v % pp_size``."""
+    return list(range(pp_rank, _NUM_STAGES, _PP_SIZE))
 
 
 def _to_numpy(tensor) -> np.ndarray:
@@ -149,18 +122,15 @@ def _run_reference_step(
 def _wrap_stage_with_hsdp(stage_model: StageModel, hsdp_mesh) -> StageModel:
     """``fully_shard`` the stage over the 2-D HSDP mesh, reducing grads with SUM.
 
-    Single-layer virtual stages (the VPP loop layout) skip a per-layer wrap to avoid
-    nesting an FSDP root inside another FSDP root with the same single child -- matching
-    ``_wrap_stage_with_fsdp`` in the composite reference.
+    Multiple layers have independent management units under an empty HSDP root.
+    Single-layer stages let their root manage the layer's parameters directly.
     """
     if len(stage_model.layers) > 1:
         for layer in stage_model.layers:
             fully_shard(layer, mesh=hsdp_mesh, reshard_after_forward=True)
-            if hasattr(layer, "set_reduce_op_type"):
-                layer.set_reduce_op_type("sum")
+            layer.set_reduce_op_type("sum")
     fully_shard(stage_model, mesh=hsdp_mesh, reshard_after_forward=True)
-    if hasattr(stage_model, "set_reduce_op_type"):
-        stage_model.set_reduce_op_type("sum")
+    stage_model.set_reduce_op_type("sum")
     return stage_model
 
 
@@ -170,6 +140,9 @@ def _build_stages(
     pp_mesh,
     hsdp_mesh,
     device: torch.device,
+    module_settings: dict,
+    checkpointing: bool,
+    layers_per_stage: int,
 ) -> Tuple[List[StageModel], List[PipelineStage], Dict[str, torch.nn.Parameter]]:
     """Realise this pp_rank's owned virtual stages into HSDP-wrapped stages + PipelineStages.
 
@@ -180,20 +153,26 @@ def _build_stages(
     pipeline_stages: List[PipelineStage] = []
     param_map: Dict[str, torch.nn.Parameter] = {}
     for virtual_stage_idx in _owned_virtual_stages(pp_rank):
-        owned_layer = copy.deepcopy(base_layers[virtual_stage_idx]).to(device=device)
-        stage_model = _wrap_stage_with_hsdp(StageModel([owned_layer]), hsdp_mesh)
+        layer_start = virtual_stage_idx * layers_per_stage
+        owned_layers = [copy.deepcopy(layer).to(device=device)
+                        for layer in base_layers[layer_start:layer_start + layers_per_stage]]
+        stage_model = _wrap_stage_with_hsdp(StageModel(owned_layers, checkpointing), hsdp_mesh)
+        stage_model.set_reshard_after_forward(module_settings["reshard_after_forward"])
+        stage_model.set_reshard_after_backward(module_settings["reshard_after_backward"])
+        stage_model.set_requires_gradient_sync(module_settings["requires_gradient_sync"])
         pipeline_stage = PipelineStage(
             stage_model,
             stage_index=virtual_stage_idx,
-            stage_num=_TOTAL_LAYERS,
+            stage_num=_NUM_STAGES,
             group=pp_mesh.get_group(),
             mesh=pp_mesh,
             device=device,
         )
         stages.append(stage_model)
         pipeline_stages.append(pipeline_stage)
-        for sub_name, param in stage_model.layers[0].named_parameters():
-            param_map[f"{virtual_stage_idx}.{sub_name}"] = param
+        for layer_index, layer in enumerate(stage_model.layers):
+            for sub_name, param in layer.named_parameters():
+                param_map[f"{layer_start + layer_index}.{sub_name}"] = param
     return stages, pipeline_stages, param_map
 
 
@@ -252,10 +231,18 @@ def _assert_grad_parity(
 
 
 def _assert_pp_hsdp_vpp_matches_reference(
-    case_name: str, enable_dxdw_split: bool = False,
+    case_name: str, schedule_factory=ScheduleInterleaved1F1B, *,
+    module_settings=None, checkpointing=False, concurrent_overlap=False, layers_per_stage=1,
 ) -> None:
     """Drive PP + HSDP + Interleaved 1F1B and assert loss + grad parity vs single-card."""
-    rank, device_id = init_dist()
+    device = initialize_device()
+    rank = dist.get_rank()
+    if module_settings is None:
+        module_settings = {
+            "reshard_after_forward": True,
+            "reshard_after_backward": True,
+            "requires_gradient_sync": True,
+        }
     world_size = dist.get_world_size()
     expected_world = _PP_SIZE * _DP_SIZE * _FSDP_SIZE
     if world_size != expected_world:
@@ -265,14 +252,13 @@ def _assert_pp_hsdp_vpp_matches_reference(
                 f"(pp={_PP_SIZE}, dp={_DP_SIZE}, fsdp={_FSDP_SIZE}), got {world_size}."
             )
         return
-    if _TOTAL_LAYERS % _PP_SIZE != 0:
-        raise AssertionError(f"TOTAL_LAYERS ({_TOTAL_LAYERS}) must be divisible by pp_size ({_PP_SIZE}).")
+    if _NUM_STAGES % _PP_SIZE != 0:
+        raise AssertionError(f"NUM_STAGES ({_NUM_STAGES}) must be divisible by pp_size ({_PP_SIZE}).")
     if _D_HID % _FSDP_SIZE != 0:
         raise AssertionError(f"D_HID ({_D_HID}) must be divisible by fsdp_size ({_FSDP_SIZE}).")
 
-    device = torch.device("npu", device_id)
     mesh = init_device_mesh(
-        device_type="npu",
+        device_type=device.type,
         mesh_shape=(_PP_SIZE, _DP_SIZE, _FSDP_SIZE),
         mesh_dim_names=("pp", "dp", "fsdp"),
     )
@@ -290,17 +276,21 @@ def _assert_pp_hsdp_vpp_matches_reference(
     total_microbatches = total_dp * _NUM_MICROBATCHES
 
     torch.manual_seed(_INIT_SEED)
-    base_layers = [MLPModule(_D_HID) for _ in range(_TOTAL_LAYERS)]
+    base_layers = [MLPModule(_D_HID) for _ in range(_NUM_STAGES * layers_per_stage)]
 
-    stages, pipeline_stages, stage_param_map = _build_stages(
-        base_layers, pp_rank, pp_mesh, hsdp_mesh, device
+    # The public API targets accelerators. An explicit CPU test substitutes only
+    # device resolution; process groups, collectives, autograd, and P2P stay real.
+    device_resolution = (
+        patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh", return_value=device)
+        if device.type == "cpu" else nullcontext()
     )
-    schedule = ScheduleInterleaved1F1B(
-        pipeline_stages,
-        _NUM_MICROBATCHES,
-        overlap_b_f=enable_dxdw_split,
-        enable_dxdw_split=enable_dxdw_split,
-    )
+    with device_resolution:
+        stages, pipeline_stages, stage_param_map = _build_stages(
+            base_layers, pp_rank, pp_mesh, hsdp_mesh, device, module_settings, checkpointing, layers_per_stage
+        )
+    schedule = schedule_factory(pipeline_stages, _NUM_MICROBATCHES)
+    if concurrent_overlap:
+        register_hsdp_overlap(schedule, pipeline_stages, device)
     stage_optimizers = [optim.SGD(stage.parameters(), lr=_LR) for stage in stages]
 
     ref_layers = nn.ModuleList(copy.deepcopy(layer) for layer in base_layers).to(device=device)
@@ -350,12 +340,21 @@ def _assert_pp_hsdp_vpp_matches_reference(
             for optimizer in stage_optimizers:
                 optimizer.step()
             ref_optimizer.step()
+        for fqn, param in stage_param_map.items():
+            reference_weight = _to_numpy(ref_param_map[fqn])
+            shard_rows = (reference_weight.shape[0] + _FSDP_SIZE - 1) // _FSDP_SIZE
+            reference_shard = reference_weight[fsdp_rank * shard_rows:(fsdp_rank + 1) * shard_rows]
+            np.testing.assert_allclose(
+                _to_numpy(param).reshape(-1), reference_shard.reshape(-1), rtol=_RTOL, atol=_ATOL,
+                err_msg=f"{case_name}: rank={rank}, step={step}, parameter={fqn}",
+            )
 
     if rank == 0:
         print(
             f"[Rank {rank}] {case_name} ok "
             f"(pp={_PP_SIZE}, dp={_DP_SIZE}, fsdp={_FSDP_SIZE}, "
-            f"virtual_stages={_TOTAL_LAYERS}, micro_batches={_NUM_MICROBATCHES}, steps={_STEPS})"
+            f"virtual_stages={_NUM_STAGES}, layers_per_stage={layers_per_stage}, "
+            f"micro_batches={_NUM_MICROBATCHES}, steps={_STEPS})"
         )
 
 
@@ -372,7 +371,7 @@ def test_pp_hsdp_vpp_interleaved_1f1b_matches_reference() -> None:
            directly exercising the PP-driven HSDP gradient drain.
     Expectation:
         Every step's global loss and every owned gradient match the reference within
-        ``rtol=2e-3`` / ``atol=1e-3``.
+        ``rtol=1e-5`` / ``atol=1e-6``.
     """
     _assert_pp_hsdp_vpp_matches_reference("pp_hsdp_vpp_interleaved_1f1b")
 
@@ -381,5 +380,41 @@ def test_pp_hsdp_vpp_dxdw_split_matches_reference() -> None:
     """Torch PP+HSDP split backward should match the full-model reference."""
     _assert_pp_hsdp_vpp_matches_reference(
         "pp_hsdp_vpp_dxdw_split",
-        enable_dxdw_split=True,
+        schedule_factory=partial(ScheduleInterleaved1F1B, overlap_b_f=True, enable_dxdw_split=True),
     )
+
+
+def test_pp_hsdp_policies_checkpoint_overlap_matches_reference() -> None:
+    """Exercise all residency/sync combinations with real concurrent full and split backward."""
+    for reshard_after_forward, reshard_after_backward, gradient_sync in (
+        (False, False, False), (False, False, True), (True, True, True), (True, True, False),
+    ):
+        for split in (False, True):
+            _assert_pp_hsdp_vpp_matches_reference(
+                "pp_hsdp_policies_checkpoint_overlap",
+                schedule_factory=partial(ScheduleInterleaved1F1B, overlap_b_f=True, enable_dxdw_split=split),
+                module_settings={
+                    "reshard_after_forward": reshard_after_forward,
+                    "reshard_after_backward": reshard_after_backward,
+                    "requires_gradient_sync": gradient_sync,
+                },
+                checkpointing=True, concurrent_overlap=True,
+            )
+
+
+def test_pp_hsdp_gpipe_1f1b_matches_reference() -> None:
+    """Use PP=4/HSDP=(1,2) with each ordinary pipeline schedule on eight ranks."""
+    if (_PP_SIZE, _DP_SIZE, _FSDP_SIZE) != (4, 1, 2):
+        raise ValueError("Set HSDP_VPP_PP_SIZE=4, HSDP_VPP_DP_SIZE=1, HSDP_VPP_FSDP_SIZE=2")
+    for schedule_factory in (ScheduleGPipe, Schedule1F1B):
+        _assert_pp_hsdp_vpp_matches_reference("pp_hsdp_gpipe_1f1b", schedule_factory=schedule_factory)
+
+
+def test_pp_hsdp_nested_units_checkpoint_matches_reference() -> None:
+    """Compare real nested-unit HSDP gradients under full and split backward."""
+    for split in (False, True):
+        _assert_pp_hsdp_vpp_matches_reference(
+            "pp_hsdp_nested_units_checkpoint",
+            schedule_factory=partial(ScheduleInterleaved1F1B, overlap_b_f=True, enable_dxdw_split=split),
+            checkpointing=True, layers_per_stage=2,
+        )
