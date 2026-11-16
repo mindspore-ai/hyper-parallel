@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.trainer.runtime.monitor.session import monitor_phase, monitor_scope
+from hyper_parallel.trainer.runtime.monitor.session import monitor_phase
 from hyper_parallel.components.checkpoint import build_checkpointer
 from hyper_parallel.components.checkpoint.dcp_checkpointer import (
     STEP_PREFIX,
@@ -208,7 +208,7 @@ class CheckpointerCallback(Callback):
             self._save_extra_state_per_rank,
             self._restore_from,
         )
-        with monitor_phase(self.trainer, "checkpoint_restore"), monitor_scope(self.trainer):
+        with monitor_phase(self.trainer, "checkpoint_restore", observe=True):
             self._load_checkpoint()
         if self._save_time_interval_seconds > 0:
             self._next_time_save = time.monotonic() + self._save_time_interval_seconds
@@ -276,7 +276,7 @@ class CheckpointerCallback(Callback):
 
     def wait_for_pending_save(self) -> None:
         """Block until the checkpointer's in-flight async save is persisted."""
-        with monitor_phase(self.trainer, "checkpoint_wait"), monitor_scope(self.trainer):
+        with monitor_phase(self.trainer, "checkpoint_wait", observe=True):
             self.checkpointer.maybe_wait_for_async_save()
         self._rotate_checkpoints()
 
@@ -438,7 +438,7 @@ class CheckpointerCallback(Callback):
             )
 
         phase = "checkpoint_submit" if save_async else "checkpoint_save"
-        with monitor_phase(self.trainer, phase), monitor_scope(self.trainer):
+        with monitor_phase(self.trainer, phase, observe=True):
             self.checkpointer.save(
                 save_dir,
                 checkpoint_state,

@@ -110,12 +110,7 @@ class OutputWriter:
     @staticmethod
     def _tables(wandb: Any, record: dict) -> dict:
         event = record["event"]
-        tables = {
-            f"events/{event}": wandb.Table(
-                columns=["event", "step", "rank", "payload"],
-                data=[[event, record.get("step"), record["rank"], json.dumps(record, ensure_ascii=False)]],
-            )
-        }
+        tables = {}
         if event == "datasets" and "top_tokens" in record:
             tables[f"data/top_tokens_rank_{record['rank']}"] = wandb.Table(
                 columns=["step", "token_id", "count", "fraction"],
@@ -141,10 +136,10 @@ class OutputWriter:
         return scalars
 
     def _write_wandb(self, wandb: Any, run: Any, record: dict, scalars: dict) -> None:
-        if scalars:
-            run.log({"global_step": record.get("step", 0), **scalars})
-        if record["event"] != "train_step":
-            run.log(self._tables(wandb, record))
+        # Full diagnostic payloads already live in JSONL; only distributions need tables.
+        payload = {**scalars, **self._tables(wandb, record)}
+        if payload:
+            run.log({"global_step": record.get("step", 0), **payload})
 
     @staticmethod
     def _write_tensorboard(tensorboard: Any, record: dict, scalars: dict) -> None:

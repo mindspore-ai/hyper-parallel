@@ -40,16 +40,19 @@ from .transfer import SummaryTransfer
 logger = logging.getLogger(__name__)
 
 
-def monitor_phase(trainer: Any, name: str) -> Any:
-    """Enter an explicitly instrumented boundary, including legacy trainer fixtures."""
-    monitor = getattr(trainer, "monitor", None)
-    return monitor.phase(name) if monitor is not None else nullcontext()
+@contextmanager
+def monitor_phase(trainer: Any, name: str, *, observe: bool = False) -> Iterator[None]:
+    """Time a boundary and optionally observe its original component calls.
 
-
-def monitor_scope(trainer: Any) -> Any:
-    """Install the observer only during original forward/data/optimizer execution."""
+    Keep observation off during backward so recomputation cannot count twice.
+    """
     monitor = getattr(trainer, "monitor", None)
-    return statistics_scope(monitor if monitor is not None and monitor.enabled else None)
+    if monitor is None or not monitor.enabled:
+        with statistics_scope(None) if observe else nullcontext():
+            yield
+        return
+    with monitor.phase(name), statistics_scope(monitor) if observe else nullcontext():
+        yield
 
 
 class MonitorSession:
@@ -132,17 +135,18 @@ class MonitorSession:
         """Expose unsupported coverage without publishing a misleading zero."""
         if (metric, reason) not in self.unavailable_reasons:
             self.unavailable_reasons.add((metric, reason))
-            self._emit({"event": "unavailable", "step": self.step, "metric": metric, "reason": reason})
+            self._emit("unavailable", metric=metric, reason=reason)
 
-    def _emit(self, event: dict) -> None:
+    def _emit(self, event: str, **fields: Any) -> None:
         if not self.enabled or self.closed:
             return
+        record = {"event": event, "step": self.step, **fields}
         if self.writer is None:
             # Delay remote initialization until checkpoint restoration chooses the run ID.
             if len(self.events) < 256:
-                self.events.append(event)
+                self.events.append(record)
             return
-        self.writer.emit(event)
+        self.writer.emit(record)
 
     def completion(self, name: str) -> Any:
         """Capture submit time; future callbacks enqueue only small immutable CPU records."""
@@ -171,7 +175,7 @@ class MonitorSession:
     def _drain_completions(self) -> None:
         while True:
             try:
-                self._emit(self.completions.get_nowait())
+                self._emit(**self.completions.get_nowait())
             except queue.Empty:
                 return
 
@@ -202,16 +206,7 @@ class MonitorSession:
             if self.in_step:
                 self.timing[name] += duration
             else:
-                self._emit(
-                    {
-                        "event": "timing",
-                        "step": self.step,
-                        "phase": name,
-                        "clock": "host_wall",
-                        "duration_seconds": duration,
-                        "outcome": outcome,
-                    }
-                )
+                self._emit("timing", phase=name, clock="host_wall", duration_seconds=duration, outcome=outcome)
 
     def sampled(self, config: Any) -> bool:
         """Decide at optimizer-step boundaries, identically on all ranks."""
@@ -301,15 +296,8 @@ class MonitorSession:
             count_name = name.removesuffix("_loss") + "_tokens"
             count = token_counts.get(count_name)
             if count is None or value.numel() != 1:
-                self._emit(
-                    {
-                        "event": "unavailable",
-                        "step": self.step,
-                        "metric": "local_loss",
-                        "name": name,
-                        "reason": "scalar loss and matching token count required",
-                    }
-                )
+                self._emit("unavailable", metric="local_loss", name=name,
+                           reason="scalar loss and matching token count required")
                 continue
             count = torch.as_tensor(count, device=value.device).detach().float().reshape(())
             raw = value.detach().float().reshape(())
@@ -351,15 +339,8 @@ class MonitorSession:
                 counts[prefix] += 1
         for prefix in selected:
             if not buckets[prefix]:
-                self._emit(
-                    {
-                        "event": "unavailable",
-                        "step": self.step,
-                        "metric": "local_grad_norm",
-                        "module": prefix or "<root>",
-                        "reason": "no local gradients",
-                    }
-                )
+                self._emit("unavailable", metric="local_grad_norm", module=prefix or "<root>",
+                           reason="no local gradients")
                 continue
             by_device = defaultdict(list)
             for norm in buckets[prefix]:
@@ -382,67 +363,45 @@ class MonitorSession:
         event = {"event": kind, "step": self.step, **metadata}
         self.transfer.submit(tensor, partial(self._consume, event))
 
+    def _consume_experts(self, event: dict, values: list) -> None:
+        global_load = event["event"] == "expert_layers"
+        metadata = {key: value for key, value in event.items() if key not in ("event", "modules", "lengths")}
+        offset, violations = 0, []
+        for name, length in zip(event["modules"], event["lengths"]):
+            counts = values[offset : offset + length - 2]
+            attempted, observations = values[offset + length - 2 : offset + length]
+            offset += length
+            if not observations:
+                self._emit("unavailable", step=event["step"], metric="expert_load", module=name,
+                           scope=event["scope"], reason="no instrumented forward observation")
+                continue
+            if not global_load:
+                self._emit("expert_load_local", **metadata, module=name, attempted_assignments=attempted, values=counts)
+                continue
+            total, maximum = sum(counts), max(counts, default=0)
+            mean = total / len(counts) if counts else 0
+            summary = {
+                "max": maximum, "mean": mean, "max_vio": maximum / mean - 1 if mean else None,
+                "empty_expert_fraction": sum(v == 0 for v in counts) / len(counts) if counts else None,
+                "accepted_assignments": total, "attempted_assignments": attempted,
+                "dropped_assignments": attempted - total,
+            }
+            if total:
+                violations.append(maximum * len(counts) / total - 1)
+            metrics = {f"moe/{name}/{key}": value for key, value in summary.items() if value is not None}
+            distribution = {"counts": counts} if self.config.moe.record_distribution else {}
+            self._emit("expert_load", **metadata, module=name, attempted_assignments=attempted,
+                       summary=summary, metrics=metrics, **distribution)
+        if violations:
+            self._emit("expert_load_summary", step=event["step"], scope=event["scope"],
+                       metrics={"moe/max_vio": max(violations)})
+
     def _consume(self, event: dict, values: list) -> None:
-        event = dict(event)
         if event["event"] in ("expert_layers", "expert_layers_local"):
-            offset = 0
-            violations = []
-            for name, length in zip(event["modules"], event["lengths"]):
-                layer_counts = values[offset : offset + length - 2]
-                attempted, observations = values[offset + length - 2 : offset + length]
-                if not observations:
-                    self._emit(
-                        {
-                            "event": "unavailable",
-                            "step": event["step"],
-                            "metric": "expert_load",
-                            "module": name,
-                            "scope": event["scope"],
-                            "reason": "no instrumented forward observation",
-                        }
-                    )
-                    offset += length
-                    continue
-                total = sum(layer_counts)
-                if total:
-                    violations.append(max(layer_counts) * len(layer_counts) / total - 1)
-                self._consume(
-                    {key: value for key, value in event.items() if key not in ("modules", "lengths")}
-                    | {
-                        "event": "expert_load" if event["event"] == "expert_layers" else "expert_load_local",
-                        "module": name,
-                        "attempted_assignments": attempted,
-                    },
-                    layer_counts,
-                )
-                offset += length
-            if event["event"] == "expert_layers" and violations:
-                self._emit(
-                    {
-                        "event": "expert_load_summary",
-                        "step": event["step"],
-                        "scope": event["scope"],
-                        "metrics": {"moe/max_vio": max(violations)},
-                    }
-                )
+            self._consume_experts(event, values)
             return
-        if event["event"] == "expert_load":
-            mean = sum(values) / len(values) if values else 0
-            event["summary"] = {
-                "max": max(values, default=0),
-                "mean": mean,
-                "max_vio": max(values) / mean - 1 if mean else None,
-                "empty_expert_fraction": sum(v == 0 for v in values) / len(values) if values else None,
-                "accepted_assignments": sum(values),
-                "attempted_assignments": event["attempted_assignments"],
-                "dropped_assignments": event["attempted_assignments"] - sum(values),
-            }
-            if self.config.moe.record_distribution:
-                event["counts"] = values
-            event["metrics"] = {
-                f"moe/{event['module']}/{key}": value for key, value in event["summary"].items() if value is not None
-            }
-        elif event["event"] == "local_grad_norm":
+        event = dict(event)
+        if event["event"] == "local_grad_norm":
             event["values"] = values
             event["metrics"] = {"training/grad_norm_local_post_reduce_pre_clip": values[0]}
         elif event["event"] == "ns_norm":
@@ -460,7 +419,7 @@ class MonitorSession:
                 event["metrics"] = {f"training/local_{event['name']}": event["loss"]}
         else:
             event["values"] = values
-        self._emit(event)
+        self._emit(**event)
 
     def end_step(self) -> dict:
         """Launch small ordered reductions on the training thread, then async host copies."""
@@ -483,9 +442,7 @@ class MonitorSession:
         for name, values in sorted(self.losses.items()):
             self._submit("local_step_loss", values, {"name": name})
         if self.sampled(self.config.datasets):
-            self._emit(
-                {"event": "datasets", "step": self.step, "scope": "rank_source_before_cp", **self.dataset.snapshot()}
-            )
+            self._emit("datasets", scope="rank_source_before_cp", **self.dataset.snapshot())
         metrics = {f"timing/host/{key}": value for key, value in self.timing.items()}
         if self.transfer.dropped:
             metrics["monitor/dropped_summaries"] = self.transfer.dropped
@@ -504,15 +461,8 @@ class MonitorSession:
             return {}
         work = estimator.estimate(tokens, lengths_squared)
         if not work:
-            self._emit(
-                {
-                    "event": "flops_coverage",
-                    "step": self.step,
-                    "missing_blocks": list(estimator.missing),
-                    "formula": estimator.version,
-                    "complete": False,
-                }
-            )
+            self._emit("flops_coverage", missing_blocks=list(estimator.missing),
+                       formula=estimator.version, complete=False)
             return {}
         world = max(1, getattr(self.trainer, "world_size", 1))
         result = {}
@@ -531,21 +481,13 @@ class MonitorSession:
                     )
                 else:
                     result["performance/mfu_status"] = "unavailable_peak"
-        self._emit(
-            {
-                "event": "flops_coverage",
-                "step": self.step,
-                "formula": estimator.version,
-                "complete": True,
-                "blocks": work,
-                "peak": asdict(self.peak) if self.peak is not None else None,
-            }
-        )
+        self._emit("flops_coverage", formula=estimator.version, complete=True, blocks=work,
+                   peak=asdict(self.peak) if self.peak is not None else None)
         return result
 
     def log_step(self, state: Any, metrics: dict) -> None:
         """Write one canonical logging event, using only the external cadence."""
-        self._emit({"event": "train_step", "step": state.global_step, "epoch": state.epoch, "metrics": metrics})
+        self._emit("train_step", step=state.global_step, epoch=state.epoch, metrics=metrics)
 
     def state_dict(self) -> dict:
         """Persist run identity alongside cumulative meter state."""
@@ -570,13 +512,7 @@ class MonitorSession:
         self.start_output()
         self.transfer.close()
         self._drain_completions()
-        self._emit(
-            {
-                "event": "monitor_closed",
-                "step": self.step,
-                "dropped_summaries": self.transfer.dropped,
-                "dropped_remote_records": self.writer.dropped,
-            }
-        )
+        self._emit("monitor_closed", dropped_summaries=self.transfer.dropped,
+                   dropped_remote_records=self.writer.dropped)
         self.writer.close()
         self.closed = True

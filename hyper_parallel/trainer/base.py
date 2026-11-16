@@ -103,7 +103,7 @@ from hyper_parallel.trainer.runtime.device import (  # pylint: disable=syntax-er
     synchronize,
 )
 
-from hyper_parallel.trainer.runtime.monitor.session import MonitorSession, monitor_phase, monitor_scope
+from hyper_parallel.trainer.runtime.monitor.session import MonitorSession, monitor_phase
 from hyper_parallel.trainer.callbacks import (
     EnvironMeterCallback,
     EvaluateCallback,
@@ -390,7 +390,7 @@ class BaseTrainer(Stateful, ABC):
     def _build_model(self) -> None:
         """Build the model and derive Trainer-owned runtime state."""
         self.peft_config = self.config.peft
-        with monitor_phase(self, "model_build"), monitor_scope(self):
+        with monitor_phase(self, "model_build", observe=True):
             self.model = self.config.model.build(
                 distributed_setup=self.distributed_setup,
                 peft_config=self.peft_config,
@@ -923,7 +923,7 @@ class BaseTrainer(Stateful, ABC):
                     if callable(self.model_fwd_context)
                     else self.model_fwd_context
                 )
-                with model_fwd_context, monitor_phase(self, "forward"), monitor_scope(self):
+                with model_fwd_context, monitor_phase(self, "forward", observe=True):
                     outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
 
                 # with use_parallel_state("base"):
@@ -1048,7 +1048,7 @@ class BaseTrainer(Stateful, ABC):
 
     def clip_grad_norm(self, *, gradient_divisor: float = 1.0) -> Any:
         """Run pre-optimizer diagnostics and clipping in their required order."""
-        with monitor_phase(self, "gradient_prepare_clip"), monitor_scope(self):
+        with monitor_phase(self, "gradient_prepare_clip", observe=True):
             self.model_integration.after_backward_before_clip()
             self.validate_fsdp_runtime_before_optimizer()
             max_grad_norm = self.config.training.max_grad_norm
@@ -1093,7 +1093,7 @@ class BaseTrainer(Stateful, ABC):
         for optimizer in optimizers:
             # Keep zeros_like dispatched so lazily created optimizer states retain DTensor metadata.
             with (SkipDTensorDispatch(no_skip={torch.zeros_like}),
-                  monitor_phase(self, "optimizer"), monitor_scope(self)):
+                  monitor_phase(self, "optimizer", observe=True)):
                 optimizer.step()
             optimizer.zero_grad()
         moe_monitor = getattr(self, "moe_monitor", None)

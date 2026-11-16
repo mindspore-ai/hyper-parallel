@@ -34,7 +34,7 @@ from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import print_device_mem_info
 from hyper_parallel.trainer.runtime.memory_profiler import memory_profiler
 from hyper_parallel.trainer.runtime.device import synchronize  # pylint: disable=syntax-error
-from hyper_parallel.trainer.runtime.monitor.session import monitor_phase, monitor_scope
+from hyper_parallel.trainer.runtime.monitor.session import monitor_phase
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.distributed_data import DistributedDataLoader
 from hyper_parallel.trainer.config import TrainerConfig
@@ -260,7 +260,7 @@ class VLMTrainer:
         Returns:
             Loss tensor and named loss tensors for this FB step.
         """
-        with monitor_phase(self.base, "get_batch"), monitor_scope(self.base):
+        with monitor_phase(self.base, "get_batch", observe=True):
             model_inputs, loss_inputs = self.base.get_batch(data_iterator)
         self.base.current_token_counts = count_loss_token(loss_inputs)
         self.on_micro_step_begin(model_inputs)

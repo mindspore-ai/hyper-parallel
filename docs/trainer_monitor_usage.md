@@ -58,13 +58,14 @@ monitor:
 | --- | --- | --- |
 | Local/micro loss | `BaseTrainer.postforward`，全局加权前 | 原始 micro 均值；step 用有效 token 加权；零分母不可用 |
 | Local grad norm | `clip_grad_norm_`，Partial 规约后、裁剪前 | 复用 norm 输入视图；L2、本地分片、含选中子树 expert；没有新增规约 |
-| 不启用裁剪时的 local norm | `BaseTrainer.prepare_optimizer_step` | 读取已有 main_grad/grad；未完成 Partial 的值不冒充 post-reduce |
+| 不启用裁剪时的 local norm | `BaseTrainer.clip_grad_norm` | 读取已有 main_grad/grad；未完成 Partial 的值不冒充 post-reduce |
 | EP | 共享 `MoE.forward`，原生 EP 的 `ep_routed_forward` / `ep_routed_dispatch` | `ExpertLoadRecorder` 固定注册全部层；真实 forward 计数，backward 重计算不计数 |
 | Muon NS | `Muon._compute_batched_ns_outputs_for_tensors` | NS 后、学习率/RMS 缩放前的矩阵 Frobenius norm；保留 parameter、transform、call 与 matrix 范围 |
 | 数据 | 通用 get-batch 的 CPU 源 batch、CP 切片和 H2D 前 | 本 rank 的原始源数据分布；精确 step Top-N，先合并全部 micro 计数再取 Top-N |
 | 分块耗时 | 显式生命周期和 `statistics_phase` | 主机墙钟，非 kernel 执行时间；不新增逐块设备同步 |
 | FLOPs | 初始化时的标准块清单 | Linear/attention/FFN/router/shared expert/LM head 组合；逐步只更新输入几何 |
 
+Trainer 通过 `monitor_phase(..., observe=True)` 同时进入计时和采集作用域；backward 仅计时，不观察重计算。
 默认没有新增 forward/backward hook。`components.monitor` 是独立的注入接口，不导入 Trainer。
 模型/优化器只借出当前有效 tensor；训练线程生成小摘要，异步 D2H 只持有摘要的独立存储。
 D2H 完成 event 就绪后才读 CPU 缓冲。通信全部在训练线程上按固定层序执行。
@@ -124,7 +125,8 @@ monitor:
 ```
 
 标量直接以 Python 数值传给 `run.log()`，横轴为 `global_step`，不解析终端字符串。
-Top-N 和 expert 分布转换为带 step/rank/module 的 Table；其他诊断事件保留完整结构化 payload。
+仅 Top-N 和 expert 分布转换为带 step/rank/module 的 Table，并与同一事件的标量合并为一次 `run.log()`。
+普通诊断事件（如 micro loss 明细、FLOPs 块清单、不可用原因）完整保留在 JSONL，不再额外生成 W&B payload Table。
 TensorBoard 标量使用相同原始数值。rank-local 标量的远端 key 附带 rank/module，避免混为同一曲线。
 WandB 离线目录可用 SDK 的 `wandb sync <offline-run-directory>` 上传；JSONL 本身不是 SDK 离线 run 文件。
 已有外部 `wandb.entity` 继续生效；恢复时同一 run ID 使用 SDK resume。

@@ -37,7 +37,7 @@ from hyper_parallel.trainer.config.monitor import MonitorConfig, SamplingConfig,
 from hyper_parallel.trainer.runtime.monitor.datasets import DatasetStatsRecorder
 from hyper_parallel.trainer.runtime.monitor.flops import BlockFlopsEstimator, DevicePeak, FlopsBlock, transformer_blocks
 from hyper_parallel.trainer.runtime.monitor.output import OutputWriter, json_value
-from hyper_parallel.trainer.runtime.monitor.session import MonitorSession
+from hyper_parallel.trainer.runtime.monitor.session import MonitorSession, monitor_phase
 from hyper_parallel.trainer.runtime.monitor.transfer import SummaryTransfer
 from hyper_parallel.trainer.state import TrainerState
 
@@ -109,6 +109,7 @@ class TestMonitorSession(unittest.TestCase):
     def test_original_forward_only_with_checkpoint_recomputation(self) -> None:
         """Feature: EP recorder. Description: Reentrant recompute. Expectation: One logical count."""
         self.config.moe = replace(self.config.moe, enabled=True, sampler_steps=1, record_distribution=True)
+        self.config.timing = False
         self.session.expert_recorder.register("0", 4, "cpu")
         self.session.begin_step(1)
         owner = self.model[0]
@@ -119,7 +120,7 @@ class TestMonitorSession(unittest.TestCase):
             return value.square()
 
         source = torch.ones(2, requires_grad=True)
-        with statistics_scope(self.session):
+        with monitor_phase(self.trainer, "forward", observe=True):
             result = checkpoint(forward, source, use_reentrant=True)
         result.sum().backward()
         self.session.end_step()
@@ -129,6 +130,47 @@ class TestMonitorSession(unittest.TestCase):
         self.assertEqual(records[0]["summary"]["max_vio"], 2.0)
         self.assertEqual(records[0]["summary"]["empty_expert_fraction"], 0.5)
         torch.testing.assert_close(source.grad, torch.full_like(source, 2.0))
+
+    def test_observation_scope_restores_after_failure_and_disabled_nested_phase(self) -> None:
+        """Observe only the chosen phase, masking disabled children and restoring on failure."""
+        observer = Mock(enabled=True)
+        observer.phase.return_value = ExitStack()
+        with statistics_scope(observer):
+            with monitor_phase(SimpleNamespace(), "disabled", observe=True):
+                report_statistics("expert_load", self.model)
+            observer.record_component.assert_not_called()
+            with self.assertRaisesRegex(ValueError, "forward failed"):
+                with monitor_phase(self.trainer, "forward", observe=True):
+                    raise ValueError("forward failed")
+            report_statistics("expert_load", self.model)
+        observer.record_component.assert_called_once_with("expert_load", self.model, {})
+
+    def test_delayed_expert_records_keep_source_step_and_zero_load(self) -> None:
+        """Decode ready summaries after another step without changing rank scope or zero counts."""
+        self.config.moe = replace(self.config.moe, enabled=True, sampler_steps=1, record_distribution=True)
+        self.session.expert_recorder.register("0", 2, "cpu")
+        self.session.expert_recorder.register("missing", 2, "cpu")
+        self.session.begin_step(3)
+        self.session.expert_recorder.record("0", torch.zeros(2))
+        pending = []
+        with patch.object(self.session.transfer, "submit", side_effect=lambda tensor, consume: pending.append(
+                (tensor.tolist(), consume))):
+            self.session.end_step()
+        self.session.begin_step(4)
+        for values, consume in pending:
+            consume(values)
+        records = [r for r in self.records() if r.get("module") in ("0", "missing")]
+        self.assertEqual(len(records), 4)
+        self.assertTrue(all(record["step"] == 3 for record in records))
+        local = next(record for record in records if record["event"] == "expert_load_local")
+        self.assertEqual(local["scope"], "rank")
+        self.assertEqual(local["values"], [0, 0])
+        global_load = next(record for record in records if record["event"] == "expert_load")
+        self.assertEqual(global_load["scope"], "dp_cp_and_sequence_tp")
+        self.assertEqual(global_load["counts"], [0, 0])
+        self.assertEqual(global_load["summary"]["empty_expert_fraction"], 1)
+        self.assertIsNone(global_load["summary"]["max_vio"])
+        self.assertEqual(sum(record["event"] == "unavailable" for record in records), 2)
 
     def test_ns_norm_is_pre_scale_and_does_not_retain_update(self) -> None:
         """Feature: Muon. Description: Batched NS matrices. Expectation: Frobenius norm per matrix."""
@@ -399,13 +441,29 @@ class TestMonitorDataAndOutput(unittest.TestCase):
                 writer.emit(
                     {"event": "datasets", "step": 7, "top_tokens": [{"token_id": 3, "count": 4, "fraction": 0.5}]}
                 )
+                writer.emit({"event": "flops_coverage", "step": 7, "blocks": {"q": 123}, "complete": True})
+                writer.emit({"event": "local_micro_loss", "step": 7, "values": [2.5, 10]})
+                writer.emit({"event": "expert_load", "step": 7, "module": "layer.0", "counts": [2, 1],
+                             "metrics": {"moe/max_vio": 1 / 3}})
                 writer.close()
             sdk.init.assert_called_once()
             self.assertEqual(sdk.init.call_args.kwargs["id"], "resume-id")
             self.assertEqual(sdk.init.call_args.kwargs["resume"], "allow")
             run.log.assert_any_call({"global_step": 7, "training/total_loss": 2.5})
-            table_call = run.log.call_args_list[-1].args[0]
+            self.assertEqual(run.log.call_count, 3)
+            self.assertEqual(sdk.Table.call_count, 2)
+            table_call = run.log.call_args_list[1].args[0]
             self.assertEqual(table_call["data/top_tokens_rank_0"]["data"], [[7, 3, 4, 0.5]])
+            self.assertEqual(table_call["global_step"], 7)
+            expert_call = run.log.call_args_list[2].args[0]
+            self.assertEqual(expert_call["moe/distribution_rank_0"]["data"],
+                             [[7, "layer.0", 0, 2], [7, "layer.0", 1, 1]])
+            self.assertEqual(expert_call["moe/max_vio/rank_0/layer.0"], 1 / 3)
+            self.assertEqual(expert_call["global_step"], 7)
+            records = [json.loads(line) for line in (writer.directory / "rank_0.jsonl").read_text().splitlines()]
+            self.assertEqual(len(records), 5)
+            self.assertEqual(records[2]["blocks"], {"q": 123})
+            self.assertEqual(records[3]["values"], [2.5, 10])
             run.finish.assert_called_once()
 
     def test_packing_missing_and_empty_batches_are_not_success(self) -> None:
