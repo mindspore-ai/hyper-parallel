@@ -22,6 +22,19 @@ from tests.common.mark_utils import arg_mark
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
           essential_mark="unessential")
+def test_control_gather_hccl() -> None:
+    """Feature: Contiguous metadata gathering.
+    Description: Gather unequal objects on WORLD and non-contiguous HCCL subgroups.
+    Expectation: Rank order and contents survive two bulk host transfers on a separate stream.
+    """
+    torchrun_case(
+        file_name=str(Path(__file__).with_name("_test_buffered_device_loading_hccl.py")),
+        case_name="test_control_gather_hccl", num_proc=4,
+    )
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
+          essential_mark="unessential")
 def test_buffered_device_loading_hccl() -> None:
     """Feature: Buffered accelerator data loading.
     Description: Exercise DP2/TP2 native loading and DP4 sources with asynchronous H2D.

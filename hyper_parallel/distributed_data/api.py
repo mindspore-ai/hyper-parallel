@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -43,7 +42,7 @@ from hyper_parallel.distributed_data.balancing_algorithm import BalancingAlgorit
 from hyper_parallel.distributed_data.cost_model import CostModel
 from hyper_parallel.distributed_data.packed_balancing import LocalBalancingDataLoader, build_local_balancing_dataloader
 from hyper_parallel.distributed_data.external_step import ExternalStepSource
-from hyper_parallel.distributed_data.planner import DynamicPackingPlanner, OversizedPolicy
+from hyper_parallel.distributed_data.planner import DynamicPackingPlanner, _policy_fingerprint, OversizedPolicy
 from hyper_parallel.distributed_data.schema import PackingConstraints, SampleMetadata
 from hyper_parallel.distributed_data.metadata import PlannedSampleLoader
 from hyper_parallel.distributed_data.dataset_reader import _validate_worker_options
@@ -575,18 +574,6 @@ def _finalize_build_state(
     state.config_fingerprint += ":policies:" + _policy_fingerprint(state.planner)
 
 
-def _policy_fingerprint(planner: DynamicPackingPlanner) -> str:
-    """Include policy versions in native build agreement and checkpoint identity."""
-    identities = []
-    for policy, field_name in ((planner.cost_model, "model_id"), (planner.balancing_algorithm, "algorithm_id")):
-        policy_type = policy if hasattr(policy, "__qualname__") else type(policy)
-        identities.append({
-            "implementation": f"{policy_type.__module__}.{policy_type.__qualname__}",
-            "version": getattr(policy, field_name, None),
-        })
-    return hashlib.sha256(json.dumps(identities, sort_keys=True).encode()).hexdigest()
-
-
 def _populate_build_state(
         state: _BuildState,
         dataset: Any | None,
@@ -764,7 +751,10 @@ def build_distributed_dataloader(
             HP supplies metadata, payload caching, packing, collation and
             distributed placement through ``metadata_fn``, ``pack_fn`` and
             ``collate_fn``. Optional ``set_epoch`` is forwarded to the source;
-            source recovery is managed by the caller, outside this buffered route.
+            the unstarted source and callbacks must be serializable into a CPU
+            process. Source workers must return CPU tensors with pin_memory=False.
+            Optional state_dict/load_state_dict hooks enable loader checkpoints
+            that preserve the prefetched but unconsumed batch.
         model_config: Effective backbone dimensions required when cost_model
             is omitted. The default cost model is constructed from these dimensions.
         cost_model: Optional user workload callback replacing the default.
@@ -786,7 +776,9 @@ def build_distributed_dataloader(
         min_balance_gain. HCCL is the default backend; Gloo transports control
         and CPU payloads on the host. HCCL transports control and payload
         tensors on the rank-local NPU.
-        Checkpoint/resume remains available only on the sampler path.
+        External steps run in a CPU process, with parent-owned data collectives
+        and H2D. They prefetch automatically during current-step computation.
+        External checkpoint/resume requires matching source state hooks.
         Stateful custom policies should expose configuration-versioned model_id
         or algorithm_id attributes for build/checkpoint identity.
     """

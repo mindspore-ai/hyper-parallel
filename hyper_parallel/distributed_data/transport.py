@@ -19,14 +19,16 @@ from __future__ import annotations
 
 import pickle
 import struct
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
 import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.distributed_data.schema import SampleKey
 from hyper_parallel.distributed_data.topology import DataTopology
+
 
 @dataclass(frozen=True)
 class DataGroups:
@@ -121,6 +123,43 @@ def _decode_control(payload: torch.Tensor, size: int) -> Any:
     return pickle.loads(encoded)
 
 
+def all_gather_control_tensor(
+        encoded: torch.Tensor, *, group: Any, device: Any = None,
+) -> tuple[torch.Tensor, list[int]]:
+    """Gather serialized CPU bytes, downloading each collective result once.
+
+    Returns a flat CPU tensor and per-rank lengths. Rows are padded to the
+    maximum length; decoding belongs to the CPU producer.
+    """
+    resolved = torch.device("cpu") if device is None else torch.device(device)
+    world_size = dist.get_world_size(group)
+    local_size = torch.tensor([encoded.numel()], dtype=torch.int64, device=resolved)
+    sizes = torch.empty((world_size,), dtype=torch.int64, device=resolved)
+    dist.all_gather_into_tensor(sizes, local_size, group=group)
+    host_sizes = sizes.cpu().tolist()
+    maximum = max(1, *host_sizes)
+    padded = torch.zeros((maximum,), dtype=torch.uint8, device=resolved)
+    padded[:encoded.numel()].copy_(encoded)
+    gathered = torch.empty((world_size * maximum,), dtype=torch.uint8, device=resolved)
+    dist.all_gather_into_tensor(gathered, padded, group=group)
+    return gathered.cpu(), host_sizes
+
+
+def broadcast_control_tensor(
+        encoded: torch.Tensor, *, src: int, group: Any, device: Any = None,
+) -> torch.Tensor:
+    """Broadcast serialized bytes without decoding objects in the training process."""
+    resolved = torch.device("cpu") if device is None else torch.device(device)
+    size = torch.tensor([encoded.numel()], dtype=torch.int64, device=resolved)
+    dist.broadcast(size, src=src, group=group)
+    count = size.cpu().tolist()[0]
+    payload = torch.empty((count,), dtype=torch.uint8, device=resolved)
+    if dist.get_rank() == src:
+        payload.copy_(encoded)
+    dist.broadcast(payload, src=src, group=group)
+    return payload.cpu()
+
+
 def all_gather_control_object(
         value: Any,
         *,
@@ -145,18 +184,10 @@ def all_gather_control_object(
         dist.all_gather_object(gathered, value, group=group)
         return tuple(gathered)
     resolved = _require_control_device(device, effective_backend)
-    encoded, encoded_size = _encode_control(value, resolved)
-    local_size = torch.tensor([encoded_size], dtype=torch.int64, device=resolved)
-    sizes = [torch.empty_like(local_size) for _ in range(dist.get_world_size(group))]
-    dist.all_gather(sizes, local_size, group=group)
-    max_size = max(int(item.item()) for item in sizes)
-    if encoded.numel() < max_size:
-        padded = torch.zeros((max_size,), dtype=torch.uint8, device=resolved)
-        padded[:encoded.numel()] = encoded
-        encoded = padded
-    gathered = [torch.empty_like(encoded) for _ in sizes]
-    dist.all_gather(gathered, encoded, group=group)
-    return tuple(_decode_control(payload, int(size.item())) for payload, size in zip(gathered, sizes))
+    encoded = torch.frombuffer(bytearray(pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)), dtype=torch.uint8)
+    gathered, host_sizes = all_gather_control_tensor(encoded, group=group, device=resolved)
+    host_payloads = gathered.view(len(host_sizes), -1).numpy()
+    return tuple(pickle.loads(payload[:size].tobytes()) for payload, size in zip(host_payloads, host_sizes))
 
 
 def broadcast_control_object(
@@ -919,6 +950,32 @@ class DataPlaneTransport:
             group=self._control_group,
             device=self._communication_device,
         )
+
+    def exchange_cpu_request(self, operation: str, value: Any) -> Any:
+        """Serve an ordered CPU-producer request using only serialized tensors.
+
+        The caller owns the data stream and must finish the returned CPU copy
+        before publishing it to the producer. No source objects, planner
+        objects, or raw samples are deserialized here.
+        """
+        if operation == "gather":
+            return all_gather_control_tensor(
+                value, group=self._control_group, device=self._communication_device,
+            )
+        if operation == "broadcast":
+            return broadcast_control_tensor(
+                value, src=self._planner_rank, group=self._control_group, device=self._communication_device,
+            )
+        if operation != "exchange":
+            raise ValueError(f"Unknown CPU producer transport operation: {operation}.")
+        encoded, splits = value
+        prepared = PreparedPayloadExchange(
+            tuple(splits), bytearray(), encoded.to(self._communication_device or "cpu"), b"",
+        )
+        work = self.begin_exchange_prepared(prepared)
+        if work.data_work is not None:
+            work.data_work.wait()
+        return work.received_tensor.cpu(), work.output_splits
 
     def prepare_exchange(
             self,

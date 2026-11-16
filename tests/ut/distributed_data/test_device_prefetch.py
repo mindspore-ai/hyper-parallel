@@ -98,6 +98,28 @@ class TestDeviceStepPrefetcher(unittest.TestCase):
             accelerator.synchronize.assert_not_called()
             self.assertEqual(prefetcher._pending_staging, [])
 
+    def test_custom_placement_preserves_host_fields_and_consumer_order(self) -> None:
+        """Allow application placement while retaining copy-event lifetime guarantees."""
+        accelerator = Mock()
+        accelerator.stream.side_effect = lambda _stream: nullcontext()
+        events = []
+        lengths = torch.tensor([2, 3])
+        host = [{"lengths": lengths, "values": torch.arange(5)}]
+        placed = {"lengths": lengths, "values": _DeviceBatch(events)}
+        placement = Mock(return_value=[placed])
+        with patch.object(torch, "cuda", accelerator), patch(
+                "hyper_parallel.distributed_data.device_prefetch._pin_memory", side_effect=lambda value: value,
+        ):
+            prefetcher = DeviceStepPrefetcher("cuda:0", placement)
+            batch = prefetcher(host)
+            placement.assert_called_once_with(host, torch.device("cuda:0"))
+            self.assertIs(batch.take_microbatch(0), placed)
+            self.assertIs(placed["lengths"], lengths)
+            self.assertEqual(placed["lengths"].device.type, "cpu")
+            accelerator.current_stream.return_value.wait_event.assert_called_once_with(batch.ready_event)
+            self.assertEqual(events, [("record_stream", accelerator.current_stream.return_value)])
+            prefetcher.close()
+
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_discarded_step_retains_staging_until_close(self) -> None:
         """Feature: Pending H2D staging lifecycle.

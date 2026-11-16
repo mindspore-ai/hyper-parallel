@@ -13,9 +13,9 @@ native BatchSampler selects this step's Dataset-index occurrences
   -> preserve complete Dataset outputs -> collate_fn
 
 external_step_source emits a complete local step of raw-sample bins
-  -> HP derives metadata and freezes the source step -> Planner
-  -> node-local payload A2A when redistributed -> pack_fn -> collate_fn
-  -> buffered H2D -> Trainer (pure DP, no loader checkpoint)
+  -> CPU process derives metadata and plans the frozen source step
+  -> parent serves node-local data collectives -> CPU process pack_fn/collate_fn
+  -> shared CPU storage -> parent H2D -> Trainer (pure DP)
 
 native BatchSampler
   -> broadcast the local batch to model-parallel peers (schema object + direct tensor leaves)
@@ -34,8 +34,9 @@ checkpoint compatibility remain validated at their boundaries. Fixed-group
 snapshots and internally generated tensor descriptors are not revalidated at
 every stage. Payload A2A uses one pickle format without an application-level
 checksum; duplicate received keys and missing/unexpected Constructor payloads
-still fail. All ranks in a job must run the same code version. Runtime errors
-propagate locally without error-synchronization collectives.
+still fail. All ranks in a job must run the same code version. External source
+and planner failures propagate through existing metadata/plan collectives;
+other runtime errors propagate locally.
 
 `DistributedDatasetConfig.metadata_mode` selects the metadata source explicitly.
 The default `False` is online mode: pass `metadata_fn` and let HP derive
@@ -66,7 +67,8 @@ should contain; there is no refill/`attempt` loop.
   placement fails, the Planner falls back to the known-feasible reference bins.
 - Native BatchSampler always emits its complete batch. An external source emits one
   complete local step; HP owns metadata extraction, payload caching, and final
-  packing/collation. Checkpointing is supported only by the sampler path.
+  packing/collation. External checkpointing requires source state hooks;
+  sampler loading retains its native checkpoint contract.
 
 The Planner consumes the step's metadata and original grouping directly:
 `planner.plan(samples, reference_bins=reference_bins, step=step)`.
@@ -356,8 +358,8 @@ run on the collated batch. Local-step loaders retain CPU inputs in
 `last_host_batch` for host metering.
 The old standalone trainer-owned device-prefetch slot has been removed.
 
-HCCL/NCCL collectives must be launched on the training thread in a consistent
-order. Both loader adapters expose the same idempotent scheduling hooks:
+Native sampler collectives are launched on the training thread in a consistent
+order. Its adapter exposes idempotent scheduling hooks:
 
 ```python
 batch = next(loader)
@@ -368,11 +370,12 @@ loader.prefetch()       # launch routing; construct and H2D in the worker
 ```
 
 HP's Trainer invokes these hooks automatically before synchronizing loss.
-External training loops should invoke them at the same boundaries to overlap
-accelerator routing and final H2D. Without hooks, iteration remains correct,
-but completes these stages at the next `next(loader)` call. Gloo preparation
-can run entirely in the producer thread. Overlap is not a guarantee that all
-loading time is hidden; that depends on compute time and data volume.
+Without hooks, native sampler iteration completes these stages at the next
+`next(loader)` call. External-step loading instead uses a CPU process and a
+parent communication/staging thread. It automatically prefetches before
+returning the current batch, including HCCL control/payload transfers; the
+hooks remain harmless compatibility calls. Overlap depends on compute time
+and data volume.
 
 All model peers call `next(loader)` in the same order. Constructor ranks stage
 H2D before direct tensor broadcast to model peers; Gloo data transport can use
@@ -383,7 +386,8 @@ Its snapshot excludes speculative progress and leaves the pending batch intact,
 without repeating reads or advancing the delivered-step cursor. Call
 `wait_for_prefetch()` before process-group teardown, or use the loader as a
 context manager to also release its persistent worker. Local-step loaders retain
-CPU metering inputs in `last_host_batch` and do not support checkpoint/resume.
+CPU metering inputs in `last_host_batch`. Their checkpoints require source
+`state_dict`/`load_state_dict` hooks and retain one speculative CPU batch.
 
 PyTorch DataLoader execution options can be passed through
 `dataloader_kwargs`:
@@ -486,16 +490,24 @@ loader = build_distributed_dataloader(
 ```
 
 The source must yield exactly `local_batch_size` non-empty raw-sample bins per
-step. This node-local route automatically buffers preparation/H2D and applies
-the shared gain gate. It does not provide checkpoint/resume. HP owns metadata,
-payload and placement state; source epoch handling stays in the source.
+step. This node-local route uses an independent CPU process for source reads,
+metadata, planning, payload codecs and pack/collate. A lightweight parent
+thread executes ordered data communication and final H2D. Tensor IPC uses
+reusable shared memory; every received batch has independent destination
+storage, so subsequent prefetch cannot overwrite retained batches.
 
-The caller's training components own checkpointing and restore the source to
-its next unconsumed step before building a new loader. This layer maintains
-only transient metadata, payloads, and placement for preparation and delivery;
-it requires no source `state_dict`, `load_state_dict`, or Reader lifecycle
-methods. `set_epoch` is optional. Configure DataLoader workers on the external
-producer itself.
+Pass a serializable, unstarted iterable and CPU-only callbacks. Generator
+methods are supported; live generator objects and already-running workers
+are not. Source DataLoaders must use `pin_memory=False`; HP pins only final
+collated batches in the training process. The process path uses Linux
+`/dev/shm` and supports payload-dependent growth without a fixed size limit.
+
+`set_epoch` is optional. A source with `state_dict` and `load_state_dict` can
+checkpoint through the HP loader after a completed training step. HP saves
+source progress and any prefetched batch at the consumed cursor; full source
+state is transferred only during explicit save/load. Plain iterable sources
+remain usable without checkpoint hooks. Configure source worker counts on
+the source itself, and call `close()` before process-group teardown.
 
 The default packer and collator preserve the structure as a tuple of bins,
 each containing the raw samples. Custom callbacks must be consistent across
@@ -531,9 +543,9 @@ estimation, node-local LPT balancing and rank-zero DP logs, see
 to use the default cost, or provide `cost_model`. A custom
 `balancing_algorithm` owns assignment and its scalar objective; Hyper applies
 the shared `min_balance_gain` acceptance threshold before sample exchange.
-Gloo uses a speculative producer thread. HCCL keeps collective launches on
-the training thread, with independent data groups and a data stream. Calling
-`prefetch_plan()` after forward submission and `prefetch()` after backward
-submission overlaps CPU planning, payload exchange, collation and H2D with
-pending computation. Call these hooks consistently on all ranks before host
-synchronization; ordinary iteration remains supported without the hooks.
+Both Gloo and HCCL use a CPU producer process. The parent communication thread
+owns the data groups, device stream and H2D, while the producer handles object
+serialization, planning and collation. Next-step preparation starts before
+`next(loader)` returns; explicit prefetch hooks are optional. Metadata AG
+copies its complete length result once and complete padded content once to
+CPU, then the producer decodes the gathered bytes.

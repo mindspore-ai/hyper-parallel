@@ -23,8 +23,11 @@ from typing import Any, Protocol
 class ExternalStepSource(Protocol):
     """Emit one complete local step of raw-sample bins at a time.
 
-    The caller owns source recovery. HP forwards an optional ``set_epoch``
-    hook but requires no checkpoint or Reader lifecycle methods.
+    The source and callbacks are serialized into a fresh CPU process before
+    iteration. Use an unstarted iterable, not a live generator or open workers.
+    HP forwards optional ``set_epoch``, ``state_dict`` and ``load_state_dict``
+    hooks in that process. Checkpointing requires the two state hooks; normal
+    iteration does not. Source code must not initialize an accelerator.
     """
 
     def __iter__(self) -> Iterator[Sequence[Sequence[Any]]]:

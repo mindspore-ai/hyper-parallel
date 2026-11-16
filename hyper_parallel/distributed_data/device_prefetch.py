@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
@@ -139,7 +139,7 @@ class DevicePrefetchedStep:
 
 
 class DeviceStepPrefetcher:
-    """Stage a complete step inside the DataLoader's existing producer thread.
+    """Stage a complete step inside the DataLoader's communication thread.
 
     This is not an additional iterator, queue, or thread. Packing and payload
     exchange finish before this stage runs. The consumer stream waits for the
@@ -147,17 +147,19 @@ class DeviceStepPrefetcher:
     Host view for metrics and takes device microbatches immediately before use.
     """
 
-    def __init__(self, device: Any) -> None:
+    def __init__(self, device: Any, batch_to_device_fn: Callable[[Any, torch.device], Any] | None = None) -> None:
         """Configure final input transfer without allocating a device stream.
 
         Args:
             device: Target CUDA or NPU device, independent of payload transport.
+            batch_to_device_fn: Optional CPU/device placement callback on the copy stream.
         """
         self.device = torch.device(device)
         if self.device.type not in ("cuda", "npu"):
             raise ValueError("DeviceStepPrefetcher requires a CUDA or NPU device.")
         self._accelerator = _accelerator_module(self.device)
         self._copy_stream = None
+        self._batch_to_device = batch_to_device_fn
         self._pending_staging: list[tuple[Any, list[Any]]] = []
 
     def close(self) -> None:
@@ -178,8 +180,7 @@ class DeviceStepPrefetcher:
             orders itself with ``wait_event`` in ``take_microbatch``.
         """
         accelerator = self._accelerator
-        # The local loader may create a fresh producer thread each step; device
-        # selection is thread-local even when payload exchange uses only Gloo.
+        # Device selection is thread-local, including when payload exchange uses Gloo.
         accelerator.set_device(self.device)
         if self._copy_stream is None:
             self._copy_stream = accelerator.Stream(device=self.device)
@@ -188,8 +189,11 @@ class DeviceStepPrefetcher:
         device_micro_batches = []
         try:
             with accelerator.stream(self._copy_stream):
-                for micro_batch in staging:
-                    device_micro_batches.append(_move_to_device(micro_batch, self.device))
+                if self._batch_to_device is None:
+                    for micro_batch in staging:
+                        device_micro_batches.append(_move_to_device(micro_batch, self.device))
+                else:
+                    device_micro_batches = self._batch_to_device(staging, self.device)
                 ready_event = accelerator.Event()
                 ready_event.record(self._copy_stream)
         except BaseException:

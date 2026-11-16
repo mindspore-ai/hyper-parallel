@@ -17,14 +17,79 @@
 import os
 from datetime import timedelta
 from types import SimpleNamespace
+from typing import Any
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
 
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
 from hyper_parallel.distributed_data import (
-    DistributedDatasetConfig, SampleMetadata, WorkloadCost, build_distributed_dataloader,
+    DistributedDatasetConfig,
+    SampleKey,
+    SampleMetadata,
+    WorkloadCost,
+    build_distributed_dataloader,
 )
+from hyper_parallel.distributed_data.transport import all_gather_control_object
+
+
+def _control_value(rank: int, step: int) -> object:
+    if (rank + step) % 5 == 0:
+        return None
+    size = (0, 31, 513, 4097)[(rank + step) % 4]
+    return {
+        "sample": (SampleKey(rank, step, rank + step), SampleMetadata(
+            rank + 1, features={"P": rank + 1, "D": 0}, sample_id=f"sample-{rank}-{step}",
+        )),
+        "bytes": bytes([rank]) * size,
+        "nested": ("多模态", [None, True, 2 ** 65]),
+    }
+
+
+def test_control_gather_hccl() -> None:
+    """Check variable-length objects and bounded host copies on a non-default stream."""
+    device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
+    torch.npu.set_device(device)
+    dist.init_process_group("hccl", timeout=timedelta(seconds=90))
+    stream = torch.npu.Stream(device=device)
+    tensor_cpu = torch.Tensor.cpu
+    transfers = []
+
+    def copy_to_cpu(tensor: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        """Count actual device-to-host calls while preserving their synchronization."""
+        transfers.append((tensor.device, tensor.dtype, tensor.numel()))
+        return tensor_cpu(tensor, *args, **kwargs)
+
+    try:
+        rank = dist.get_rank()
+        for ranks in ((0, 1, 2, 3), (0, 2), (1, 3)):
+            group = dist.new_group(ranks=list(ranks), backend="hccl")
+            if rank not in ranks:
+                continue
+            try:
+                for step in range(3):
+                    transfers.clear()
+                    with torch.npu.stream(stream), patch.object(torch.Tensor, "cpu", new=copy_to_cpu):
+                        received = all_gather_control_object(_control_value(rank, step), group=group, device=device)
+                    expected = tuple(_control_value(member, step) for member in ranks)
+                    assert received == expected, f"Control values differ: received={received}, expected={expected}"
+                    assert len(transfers) == 2, f"Host transfer count: actual={len(transfers)}, expected=2"
+                    actual = [(source, dtype) for source, dtype, _ in transfers]
+                    expected_transfers = [(device, torch.int64), (device, torch.uint8)]
+                    assert actual == expected_transfers, (
+                        f"Host transfer sources: actual={actual}, expected={expected_transfers}"
+                    )
+                    assert transfers[0][2] == len(ranks), (
+                        f"Length result size: actual={transfers[0][2]}, expected={len(ranks)}"
+                    )
+            finally:
+                stream.synchronize()
+                dist.destroy_process_group(group)
+        dist.barrier()
+    finally:
+        torch.npu.synchronize()
+        dist.destroy_process_group()
 
 
 class _Dataset:
@@ -95,7 +160,7 @@ def _local(device: torch.device) -> None:
     rank = dist.get_rank()
     mesh = SimpleNamespace(mesh_shape=(4,), mesh_dim_names=("dp",), rank_list=(0, 1, 2, 3))
     source = [
-        [[_Dataset()[step * 4 + rank]]]
+        [[_Dataset()[step * 8 + rank * 2 + index] for index in range(2)]]
         for step in range(3)
     ]
     loader = build_distributed_dataloader(
@@ -113,7 +178,12 @@ def _local(device: torch.device) -> None:
             assert loader.last_host_batch[0][0]["offsets"].device.type == "cpu", "Host offsets moved"
             loader.prefetch_plan()
             loader.prefetch()
-            assert batch[0]["input_ids"][0].item() == step * 4 + rank, f"Local step changed: {batch}"
+            ids = torch.tensor([sample["id"] for sample in batch], device=device)
+            gathered = [torch.empty_like(ids) for _ in range(4)]
+            dist.all_gather(gathered, ids)
+            actual = sorted(value for peer in gathered for value in peer.cpu().tolist())
+            assert actual == list(range(step * 8, step * 8 + 8)), f"Local sample union changed: {actual}"
+            assert loader.last_balance_stats["moved_samples"] > 0, "Expected a real payload redistribution"
         assert next(loader, None) is None, "Local source should be exhausted"
     finally:
         loader.close()

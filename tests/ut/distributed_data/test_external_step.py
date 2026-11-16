@@ -17,7 +17,6 @@
 import unittest
 from collections.abc import Iterator
 from contextlib import closing
-from unittest.mock import Mock
 
 import torch
 
@@ -87,6 +86,33 @@ def _pack(samples: list[dict], seq_len: int) -> dict:
     return {"input_ids": torch.cat([sample["input_ids"] for sample in samples])}
 
 
+class _CountingSource:
+    """Expose child-owned reads and epoch state through the checkpoint protocol."""
+
+    def __init__(self, steps: list) -> None:
+        """Store immutable steps and a consumed source cursor."""
+        self.steps, self.position, self.epoch = steps, 0, 0
+
+    def __iter__(self) -> Iterator:
+        """Advance only inside the source-owning process."""
+        while self.position < len(self.steps):
+            value = self.steps[self.position]
+            self.position += 1
+            yield value
+
+    def state_dict(self) -> dict:
+        """Expose actual reads, including the single speculative step."""
+        return {"position": self.position, "epoch": self.epoch}
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore source-owned progress."""
+        self.position, self.epoch = state["position"], state["epoch"]
+
+    def set_epoch(self, epoch: int) -> None:
+        """Reset data while retaining the selected epoch for verification."""
+        self.position, self.epoch = 0, epoch
+
+
 class TestExternalStepSource(unittest.TestCase):
     """Verify source iteration, metadata, and externally owned recovery."""
 
@@ -136,18 +162,12 @@ class TestExternalStepCallbacks(unittest.TestCase):
         Expectation: Logging uses modeled costs and prefetch does not cross the limit.
         """
         samples = _samples()
-        reads = []
-
-        def source() -> Iterator[list[list[dict]]]:
-            """Record every physical source read, including speculative reads."""
-            for step in range(2):
-                reads.append(step)
-                yield [samples[step * 2:step * 2 + 2]]
+        source = _CountingSource([[samples[:2]], [samples[2:]]])
 
         config = DistributedDatasetConfig(seq_len=8, local_batch_size=1)
         with closing(build_distributed_dataloader(
                 None, _Mesh(), config, device="cpu", max_steps=1,
-                external_step_source=source(), metadata_fn=lambda sample: sample["metadata"],
+                external_step_source=source, metadata_fn=lambda sample: sample["metadata"],
                 pack_fn=_pack, collate_fn=list,
                 cost_model=lambda metadata: WorkloadCost(llm=metadata.cost.llm * 10),
         )) as loader:
@@ -163,7 +183,7 @@ class TestExternalStepCallbacks(unittest.TestCase):
             self.assertEqual(loader.group_ranks, (0,))
             with self.assertRaises(StopIteration):
                 next(loader)
-        self.assertEqual(reads, [0])
+            self.assertEqual(loader.state_dict()["producer"]["source"]["position"], 1)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_default_balancing_requires_backbone_dimensions(self) -> None:
@@ -181,11 +201,10 @@ class TestExternalStepCallbacks(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_epoch_and_checkpoint_contract(self) -> None:
         """Feature: External source lifecycle.
-        Description: Change epochs and request unsupported local checkpoint operations.
-        Expectation: Epochs reach the source and checkpoint operations fail explicitly.
+        Description: Change epochs and restore the delivered cursor after source EOF.
+        Expectation: Epochs reach the child source and restore preserves the consumed cursor.
         """
-        source = Mock()
-        source.__iter__ = Mock(side_effect=lambda: iter([[_samples()]]))
+        source = _CountingSource([[_samples()]])
         with closing(build_distributed_dataloader(
                 None, _Mesh(), DistributedDatasetConfig(seq_len=8, local_batch_size=1),
                 external_step_source=source, metadata_fn=lambda sample: sample["metadata"],
@@ -193,28 +212,31 @@ class TestExternalStepCallbacks(unittest.TestCase):
         )) as loader:
             first = next(loader)[0]["input_ids"]
             loader.set_epoch(3)
-            source.set_epoch.assert_called_once_with(3)
+            self.assertEqual(loader.state_dict()["producer"]["source"]["epoch"], 3)
             self.assertEqual(loader.step, 0)
             self.assertIsNone(loader.last_host_batch)
             torch.testing.assert_close(next(loader)[0]["input_ids"], first)
-            with self.assertRaisesRegex(NotImplementedError, "checkpoint"):
-                loader.state_dict()
-            with self.assertRaisesRegex(NotImplementedError, "checkpoint"):
-                loader.load_state_dict({})
+            checkpoint = loader.state_dict()
+            self.assertEqual(checkpoint["producer"]["step"], 1)
+            loader.load_state_dict(checkpoint)
+            with self.assertRaises(StopIteration):
+                next(loader)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_background_collator_error_reaches_consumer(self) -> None:
         """Feature: Background failure propagation.
-        Description: Raise from a user collator on the producer thread.
-        Expectation: The waiting training thread receives the original exception.
+        Description: Raise from a user collator in the CPU producer process.
+        Expectation: The waiting consumer receives the producer traceback.
         """
-        failure = RuntimeError("collation failed")
+        def fail(samples: list, seq_len: int) -> None:
+            """Raise a recognizable error inside the producer."""
+            del samples, seq_len
+            raise RuntimeError("collation failed")
         with closing(build_distributed_dataloader(
                 None, _Mesh(), DistributedDatasetConfig(seq_len=8, local_batch_size=1),
                 external_step_source=[[_samples()]], metadata_fn=lambda sample: sample["metadata"],
-                pack_fn=Mock(side_effect=failure), collate_fn=list,
+                pack_fn=fail, collate_fn=list,
                 device="cpu", cost_model=lambda metadata: metadata.cost,
         )) as loader:
-            with self.assertRaises(RuntimeError) as caught:
+            with self.assertRaisesRegex(RuntimeError, "collation failed"):
                 next(loader)
-            self.assertIs(caught.exception, failure)

@@ -272,3 +272,15 @@ class DynamicPackingPlanner:
 
 
 __all__ = ["DynamicPackingPlanner", "OversizedPolicy"]
+
+
+def _policy_fingerprint(planner: DynamicPackingPlanner) -> str:
+    """Include policy versions in native build agreement and checkpoint identity."""
+    identities = []
+    for policy, field_name in ((planner.cost_model, "model_id"), (planner.balancing_algorithm, "algorithm_id")):
+        policy_type = policy if hasattr(policy, "__qualname__") else type(policy)
+        identities.append({
+            "implementation": f"{policy_type.__module__}.{policy_type.__qualname__}",
+            "version": getattr(policy, field_name, None),
+        })
+    return hashlib.sha256(json.dumps(identities, sort_keys=True).encode()).hexdigest()

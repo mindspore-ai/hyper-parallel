@@ -5,7 +5,7 @@ capacity-constrained LPT, configurable node-local data exchange, automatic
 one-step buffering, and final H2D on a copy stream. Set
 `communication_backend="hccl"` (the default) with an NPU `device` to encode
 control objects as device tensors and route all data-plane collectives through
-HCCL. Set `communication_backend="gloo"` for CPU object/payload exchange.
+HCCL. Set `communication_backend="gloo"` for encoded control/payload exchange on CPU.
 Gloo defaults to CPU batches; an explicit NPU/CUDA `device` enables final H2D
 without changing the data-plane backend.
 Set `balance_group_size` to partition the root mesh into fixed-size independent
@@ -19,42 +19,32 @@ the candidate's relative objective improvement is strictly greater than
 retain the original distribution. Metadata gathering and planning still occur
 when sample exchange is skipped.
 
-With HCCL, source loading starts one step ahead. Metadata and payload
-collectives are issued by the training thread on an independent data stream;
-control and payload groups are separate from model groups. CPU planning,
-decoding and collation run in the producer. H2D uses a copy stream, and the
-consumer waits on its ready event without a host event synchronization.
-Pinned copy sources are retained until completion, including early close.
-Gloo keeps its complete background producer.
+A fresh CPU process owns the source, metadata, planning, sample codecs and
+pack/collate. A lightweight thread in the training process executes serialized
+HCCL requests on an independent data stream; control and payload groups remain
+separate from model groups. Metadata AG uses a continuous receive tensor:
+one length D2H and one content D2H, independent of group size. CPU decoding
+happens in the producer. Gloo uses the same process protocol on CPU tensors.
 
-To overlap the full pipeline with model computation, call the two optional
-hooks on **every rank at the same training boundaries**:
+The loader automatically prefetches the next step before returning the current
+batch, so preparation overlaps forward as well as backward. `prefetch_plan()`
+and `prefetch()` remain idempotent compatibility hooks; no scheduling switch is
+required. H2D uses a copy stream and a consumer event. Its pinned source remains
+alive until the copy completes. Shared buffers grow with the payload and are
+reused only after the receiver copies them into independently owned storage.
+There is no fixed payload-size limit.
 
-```python
-for microbatches in loader:
-    for index, batch in enumerate(microbatches):
-        loss = forward(batch)
-        if index == 0:
-            loader.prefetch_plan()  # HCCL metadata, then background CPU planner
-        loss.backward()
-        if index == 0:
-            loader.prefetch()       # HCCL plan/payload, then decode/collate/H2D
-        log_loss(loss.item())       # Host synchronization belongs after launch
-```
+Sources and callbacks must be serializable with `cloudpickle` before workers
+start. A source may implement `__iter__` as a generator method, but an already
+created generator cannot be moved to the child process. Source code, workers
+and callbacks must stay CPU-only; disable source `pin_memory` and let HP pin the
+final batch. The process path requires Linux shared memory (`/dev/shm`).
 
-`prefetch()` completes `prefetch_plan()` if needed; repeated calls before
-consumption do not advance the source twice. Ordinary `next(loader)` also
-completes omitted hooks, preserving the iteration contract. Without early
-hooks, accelerator data exchange starts only when the batch is requested.
-The first step has no prior compute to overlap. End-of-source and `max_steps`
-stop speculative work. All ranks must still consume equal step counts.
-
-Launch these hooks while previously submitted device computation is still
-pending. A separate group alone does not create overlap: using the model's
-current stream, calling device-wide synchronization, or launching after a
-blocking loss read can remove that window. Metadata sizes and the plan still
-need to reach the host, and payload encoding/split exchange run on the caller;
-the amount hidden depends on the remaining compute and shared bandwidth.
+Checkpoint through the loader after training a returned step. If the source
+implements `state_dict()` and `load_state_dict()`, HP captures its progress and
+retains any prefetched batch at the delivered cursor. Full source state is
+transferred only for explicit save/load, never attached to ordinary batches.
+Call `close()` on every data rank before destroying its communication groups.
 
 ## External-step integration
 
@@ -117,9 +107,10 @@ with closing(build_distributed_dataloader(
   metadata fields here if the model collator does not accept them; avoid mutating
   source samples. `collate_fn` assembles all packed bins into one local step;
   use `list` to yield a list of microbatches.
-- Accelerator prefetch recursively moves tensor leaves to the training device,
-  preserving dtype and non-tensor metadata. Batch objects with a `to` method use
-  that method. CPU execution keeps batches on the host.
+- Use tensor/scalar trees built from dictionaries, lists and tuples for final
+  batches so tensor payloads use shared storage. Accelerator prefetch recursively
+  moves tensor leaves to the device, preserving dtype and scalar metadata.
+  CPU execution keeps batches on the host.
 - Balance logs report per-bin sample counts, token counts and predicted costs,
   plus per-rank send/receive counts and the balancing decision.
   Configure the application's Python logging to include INFO messages.
@@ -155,9 +146,8 @@ with closing(build_distributed_dataloader(
   CPU-only execution keeps host batches. Use compute-stream synchronization,
   not device-wide synchronization, to avoid draining the next step's copy.
 - This local-step route requires pure DP, equal step counts and a raw-step source.
-  It does not support loader checkpoint/resume or native shared-metadata reads.
-  Use the native sampler entry for checkpointable loading; it uses the same
-  cost/algorithm contracts.
+  It supports source-backed checkpoint/resume; use native sampler mode for
+  shared-metadata reads. Both paths use the same cost/algorithm contracts.
 
 ## Independent cost and assignment policies
 
@@ -206,7 +196,7 @@ custom algorithm cannot replace costs or force an inferior placement through.
 The default LPT assignment and its objective live in `balancing_algorithm.py`;
 `planner.py` handles cost evaluation, plan construction and acceptance.
 
-For checkpointable native sampler loading, stateful cost/algorithm objects
+For checkpointable loading, stateful cost/algorithm objects
 should provide configuration-versioned `model_id` / `algorithm_id` attributes.
 Those identities participate in cross-rank build and checkpoint fingerprints.
 
