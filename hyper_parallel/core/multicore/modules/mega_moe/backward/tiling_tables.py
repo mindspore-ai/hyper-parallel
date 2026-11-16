@@ -178,6 +178,8 @@ SWIGLU_GRAD_TABLE = {
     32:  _make_swiglu(row_len=32,  col_len=2048, base_row_len=19, base_col_len=256),
     64:  _make_swiglu(row_len=64,  col_len=2048, base_row_len=19, base_col_len=256),
     128: _make_swiglu(row_len=128, col_len=2048, base_row_len=19, base_col_len=256),
+    256: _make_swiglu(row_len=256, col_len=2048, base_row_len=19, base_col_len=256),
+    512: _make_swiglu(row_len=512, col_len=2048, base_row_len=19, base_col_len=256),
 }
 
 

@@ -207,7 +207,8 @@ class _MegaMoeExecutionResources:
             return
         fields = ("local_num_tokens", "max_local_num_tokens", "hidden_size", "intermediate_size",
                   "num_experts", "top_k", "initial_capacity_factor", "capacity_growth_factor", "dispatch_mode",
-                  "dispatch_split", "combine_split", "swiglu_limit", "expert_weight_layout", "ep_size", "auto_tokens")
+                  "dispatch_split", "combine_split", "swiglu_split", "swiglu_limit", "expert_weight_layout",
+                  "ep_size", "auto_tokens")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v3", "bfloat16",
                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications))
@@ -335,6 +336,7 @@ class MegaMoeExperts(MulticoreModule):
         initial_capacity_factor: float | None = None,
         capacity_growth_factor: float | None = None,
         dispatch_split: int = _COMMUNICATION_SPLIT,
+        swiglu_split: int = _COMMUNICATION_SPLIT,
         combine_split: int = _COMMUNICATION_SPLIT,
     ) -> None:
         """Initialize local expert parameters and a lazy execution owner.
@@ -353,6 +355,9 @@ class MegaMoeExperts(MulticoreModule):
                 Construct separate modules to switch modes; sharing requires equal modes.
             dispatch_split: Dispatch tile rows in forward and backward, default 128.
                 Must be a positive multiple of 128.
+            swiglu_split: SwiGLU tile rows in forward and backward, default 128.
+                Must be a positive multiple of 32 and present in both the forward
+                and backward tiling tables. Sharing requires equal splits.
             combine_split: Combine tile rows in forward and backward, with the same
                 constraints and default as dispatch_split. Sharing requires equal splits.
             swiglu_limit: Optional positive, finite float32-representable clamp
@@ -383,6 +388,7 @@ class MegaMoeExperts(MulticoreModule):
             "dispatch_mode": dispatch_mode,
             "capacity_growth_factor": capacity_growth_factor,
             "dispatch_split": dispatch_split,
+            "swiglu_split": swiglu_split,
             "combine_split": combine_split,
         }
         specification["auto_tokens"] = True
@@ -448,6 +454,7 @@ class MegaMoeExperts(MulticoreModule):
             dispatch_split=specification["dispatch_split"],
             combine_split=specification["combine_split"],
             auto_tokens=specification.get("auto_tokens", False),
+            swiglu_split=specification.get("swiglu_split", _COMMUNICATION_SPLIT),
         )
         swiglu_limit = specification["swiglu_limit"]
         return {
@@ -470,6 +477,7 @@ class MegaMoeExperts(MulticoreModule):
         dispatch_split: int,
         combine_split: int,
         auto_tokens: bool = False,
+        swiglu_split: int = _COMMUNICATION_SPLIT,
     ) -> None:
         """Validate static shape and topology values before allocation."""
         values = {
@@ -492,6 +500,10 @@ class MegaMoeExperts(MulticoreModule):
                 f"num_experts ({num_experts}) must be divisible by ep_size ({ep_size})."
             )
         _validate_swiglu_limit(swiglu_limit)
+        if (not isinstance(swiglu_split, int) or isinstance(swiglu_split, bool)
+                or swiglu_split <= 0 or swiglu_split % 32 or swiglu_split > 1024):
+            raise ValueError(
+                f"swiglu_split must be a positive multiple of 32 up to 1024, got {swiglu_split!r}.")
         for name, split in (("dispatch_split", dispatch_split), ("combine_split", combine_split)):
             if (not isinstance(split, int) or isinstance(split, bool)
                     or split <= 0 or split % _COMMUNICATION_SPLIT):
