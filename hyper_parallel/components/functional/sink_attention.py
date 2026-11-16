@@ -16,7 +16,7 @@
 
 from typing import Optional, Sequence
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 import omni_training_custom_ops  # noqa: F401  # pylint: disable=unused-import
 
 

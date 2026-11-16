@@ -19,9 +19,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
-import torch.distributed as dist  # pylint: disable=forbidden-backend-import
-from torch import nn  # pylint: disable=forbidden-backend-import
+import torch
+import torch.distributed as dist
+from torch import nn
 
 from hyper_parallel.distributed.expert_parallel.collectives import ep_all_to_all
 from hyper_parallel.models.materialization import register_rebuildable_buffer

@@ -16,8 +16,8 @@
 
 from typing import Any, Tuple
 
-import torch  # pylint: disable=forbidden-backend-import
-import torch.nn.functional as F  # pylint: disable=forbidden-backend-import
+import torch
+import torch.nn.functional as F
 from einops import rearrange
 
 from hyper_parallel.tools.logging import get_logger
@@ -212,7 +212,7 @@ def dsa_sparse_attention(
     # Load only the selected optional backend so either can be used independently.
     # pylint: disable=import-outside-toplevel
     if backend == "cann":
-        import torch_npu  # pylint: disable=forbidden-backend-import
+        import torch_npu
 
         output, softmax_max, softmax_sum = _cann_sparse_attention(
             query_tnd,

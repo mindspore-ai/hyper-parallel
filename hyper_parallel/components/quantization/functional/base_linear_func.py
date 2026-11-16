@@ -17,8 +17,8 @@
 from abc import ABC, abstractmethod
 from typing import Optional
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch.autograd.function import once_differentiable  # pylint: disable=forbidden-backend-import
+import torch
+from torch.autograd.function import once_differentiable
 
 from hyper_parallel.components.quantization.config import MATRIX_NDIM
 from hyper_parallel.components.quantization.tensor import QuantizedTensorStorage

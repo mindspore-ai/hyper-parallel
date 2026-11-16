@@ -20,8 +20,8 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 # This adapter implements the Torch-only Qwen Transformers training contract.
-import torch  # pylint: disable=forbidden-backend-import
-from torch.nn import functional  # pylint: disable=forbidden-backend-import
+import torch
+from torch.nn import functional
 
 from hyper_parallel.data.batching.get_batch import OmniParallelBatch
 from hyper_parallel.data.batching.runtime_input import RuntimeInputAdapter, RuntimeInputContext

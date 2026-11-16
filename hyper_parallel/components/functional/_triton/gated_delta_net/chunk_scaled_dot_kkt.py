@@ -17,7 +17,6 @@
 # pylint: disable=line-too-long,missing-public-type-hints,missing-public-docstring
 # pylint: disable=unused-argument,invalid-name,missing-module-docstring
 # pylint: disable=missing-function-docstring
-# pylint: disable=forbidden-backend-import
 
 from typing import Optional
 

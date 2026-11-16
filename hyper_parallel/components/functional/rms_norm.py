@@ -14,7 +14,7 @@
 # ============================================================================
 """Root mean square normalization function."""
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 import torch_npu
 
 

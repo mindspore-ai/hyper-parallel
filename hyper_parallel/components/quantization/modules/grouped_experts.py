@@ -20,8 +20,8 @@ projections run through the bound ``GroupedLinear``, whose
 instance is picked exclusively in ``strategy_factory``.
 """
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch import nn  # pylint: disable=forbidden-backend-import
+import torch
+from torch import nn
 
 from hyper_parallel.components.quantization.config import (
     GROUPED_NDIM,

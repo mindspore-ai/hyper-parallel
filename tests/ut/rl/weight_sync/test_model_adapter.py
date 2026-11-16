@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """CPU unit tests for model-owned canonical weight mappings."""
-# pylint: disable=forbidden-backend-import,missing-public-docstring
+# pylint: disable=missing-public-docstring
 
 import pytest
 import torch

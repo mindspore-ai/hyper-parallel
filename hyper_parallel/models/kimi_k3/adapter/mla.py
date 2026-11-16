@@ -19,7 +19,7 @@ from __future__ import annotations
 from typing import Any
 
 # Model adapters use native Torch, as required by the shared MLA replacement.
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.components.modules.gated_mla import GatedMLAAttention
 from hyper_parallel.models.replacement import module_replacement

@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Transport CPU image shards without staging complete images on a device."""
-# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 

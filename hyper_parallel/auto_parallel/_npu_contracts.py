@@ -55,8 +55,8 @@ import sys
 import types
 from typing import Any, Iterator, List, Optional, Sequence, Tuple
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch._subclasses.fake_tensor import FakeTensor  # pylint: disable=forbidden-backend-import
+import torch
+from torch._subclasses.fake_tensor import FakeTensor
 
 # The softmax statistics the fused attention keeps per head and token.
 _STATS = 8

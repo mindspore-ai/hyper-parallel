@@ -21,7 +21,7 @@ from functools import lru_cache
 from itertools import accumulate
 from typing import Any, Callable
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 
 def pack_ranges(tensor: torch.Tensor, ranges: tuple[tuple[int, int], ...]) -> torch.Tensor:

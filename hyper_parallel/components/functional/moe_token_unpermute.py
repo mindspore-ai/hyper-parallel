@@ -16,7 +16,7 @@
 
 from typing import Optional
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 import torch_npu
 
 

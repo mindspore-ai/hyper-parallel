@@ -26,7 +26,7 @@ from functools import lru_cache
 from types import ModuleType
 from typing import Callable, Optional
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.components.quantization.config import (
     GMM_SPLIT_SCALE,

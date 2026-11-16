@@ -20,8 +20,8 @@ from collections.abc import Mapping
 from typing import Any
 
 # The high-performance attention modules use native Torch.
-import torch  # pylint: disable=forbidden-backend-import
-from torch import nn  # pylint: disable=forbidden-backend-import
+import torch
+from torch import nn
 
 from hyper_parallel.components.modules.mla_attention import MLAAttention
 

@@ -21,7 +21,6 @@ delegating subclass hooks; the policy itself lives here. The FSDP config is
 duck-typed (``reshard_after_backward`` / ``dp_shard_size`` /
 ``requires_grad_sync`` attributes) so this module does not import Trainer DTOs.
 """
-# pylint: disable=forbidden-backend-import
 
 import logging
 from collections import defaultdict

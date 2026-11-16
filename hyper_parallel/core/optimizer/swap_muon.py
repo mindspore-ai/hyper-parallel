@@ -15,7 +15,6 @@
 """Muon momentum-only optimizer-state swap adapter."""
 
 # pylint: disable=protected-access
-# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 

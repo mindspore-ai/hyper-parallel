@@ -19,9 +19,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 import torch_npu
-from torch import nn  # pylint: disable=forbidden-backend-import
+from torch import nn
 
 from hyper_parallel.components.modules import SwiGLUMLP
 from hyper_parallel.components.modules.moe import GroupedExperts

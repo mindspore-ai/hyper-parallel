@@ -14,7 +14,6 @@
 # ============================================================================
 """CPU unit tests for Hyper-RL advantage estimators and rule rewards."""
 # Hyper-RL CPU tests intentionally exercise the verified Torch runtime.
-# pylint: disable=forbidden-backend-import
 
 import math
 

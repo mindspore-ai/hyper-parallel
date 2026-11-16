@@ -21,9 +21,9 @@ from contextvars import ContextVar
 from functools import wraps
 from typing import Any, Mapping
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch import nn  # pylint: disable=forbidden-backend-import
-from torch.nn import functional  # pylint: disable=forbidden-backend-import
+import torch
+from torch import nn
+from torch.nn import functional
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 
 from hyper_parallel import HSDPModule

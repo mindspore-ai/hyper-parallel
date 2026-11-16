@@ -14,7 +14,6 @@
 # ============================================================================
 """CPU unit tests for Hyper-RL objectives, KL, and value loss."""
 # Hyper-RL CPU tests intentionally exercise the verified Torch runtime.
-# pylint: disable=forbidden-backend-import
 
 import math
 from unittest.mock import patch

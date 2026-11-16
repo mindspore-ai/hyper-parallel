@@ -18,9 +18,9 @@ from __future__ import annotations
 
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch import nn  # pylint: disable=forbidden-backend-import
-from torch.nn import functional  # pylint: disable=forbidden-backend-import
+import torch
+from torch import nn
+from torch.nn import functional
 
 
 def _vision_cos_sin(

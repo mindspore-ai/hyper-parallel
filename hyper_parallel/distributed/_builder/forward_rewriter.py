@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-# pylint: disable=missing-apache-license-header,forbidden-backend-import
+# pylint: disable=missing-apache-license-header
 """forward_rewriter: forward-mutation machinery for the sharding applier.
 
 All boundary forward generation, validation and installation lives here:

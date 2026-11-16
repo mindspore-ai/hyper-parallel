@@ -23,7 +23,7 @@ __all__ = [
 from collections.abc import Mapping
 from typing import Any
 
-from torch import nn, no_grad  # pylint: disable=forbidden-backend-import
+from torch import nn, no_grad
 
 from hyper_parallel.models.qwen3.adapter.runtime.attention import (
     run_qwen3_flash_attention,

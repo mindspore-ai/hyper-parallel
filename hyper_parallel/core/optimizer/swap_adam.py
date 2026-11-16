@@ -15,7 +15,6 @@
 """Adam/AdamW optimizer-state swap adapters."""
 
 # pylint: disable=protected-access
-# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 

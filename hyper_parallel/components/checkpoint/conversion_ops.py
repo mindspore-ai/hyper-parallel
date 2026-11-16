@@ -16,7 +16,7 @@
 
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 from hyper_parallel.components.checkpoint.weight_conversion import ConversionOps
 
 

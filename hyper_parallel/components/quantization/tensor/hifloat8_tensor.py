@@ -16,7 +16,7 @@
 
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.components.quantization.tensor.base import (
     QuantizedTensorStorage,

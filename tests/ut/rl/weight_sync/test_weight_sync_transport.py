@@ -14,7 +14,7 @@
 # ============================================================================
 """CPU unit tests for production HCCL weight-transfer control logic."""
 # Local fakes replace HCCL/NPU boundaries while production transport methods run.
-# pylint: disable=forbidden-backend-import,missing-public-docstring,missing-public-type-hints,protected-access
+# pylint: disable=missing-public-docstring,missing-public-type-hints,protected-access
 
 import base64
 import pickle

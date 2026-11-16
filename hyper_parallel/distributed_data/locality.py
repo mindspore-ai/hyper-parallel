@@ -21,7 +21,7 @@ import os
 import socket
 from typing import Any
 
-import torch.distributed as dist  # pylint: disable=forbidden-backend-import
+import torch.distributed as dist
 
 from hyper_parallel.distributed_data.topology import DataTopology
 from hyper_parallel.distributed_data.transport import DataGroups, all_gather_control_object

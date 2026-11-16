@@ -20,7 +20,7 @@ from collections import defaultdict
 from itertools import count
 from typing import Any, Dict
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.data.batching import calculate_num_micro_batches
 from hyper_parallel.data.text import build_chat_template

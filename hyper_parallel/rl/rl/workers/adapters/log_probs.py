@@ -17,8 +17,8 @@
 from functools import wraps
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch import nn  # pylint: disable=forbidden-backend-import
+import torch
+from torch import nn
 from rl.workers.adapters.token_log_probs import chunked_token_log_probs
 
 from hyper_parallel.core.fully_shard.hsdp_utils import get_hsdp_state

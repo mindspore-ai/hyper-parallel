@@ -14,7 +14,7 @@
 # ============================================================================
 """CPU unit tests for Policy forward-computation micro-batching."""
 # Local test doubles are not public APIs; the suite intentionally uses Torch CPU tensors.
-# pylint: disable=forbidden-backend-import,missing-public-docstring
+# pylint: disable=missing-public-docstring
 
 from types import MethodType
 from typing import Any

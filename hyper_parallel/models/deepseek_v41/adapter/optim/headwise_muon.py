@@ -20,7 +20,7 @@ from __future__ import annotations
 from functools import partial
 from typing import Callable
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 
 def _reshape_heads(

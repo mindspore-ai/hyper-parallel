@@ -16,7 +16,7 @@
 
 from typing import Optional
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.components.quantization.functional.base_linear_func import (
     LinearStrategy,

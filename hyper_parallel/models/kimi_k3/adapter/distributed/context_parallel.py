@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Planner-injected Context Parallel wrappers for Kimi KDA and gated MLA."""
-# pylint: disable=forbidden-backend-import
 from __future__ import annotations
 
 __all__ = [

@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Model-owned Host Engram state across build, load and optimization."""
-# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 

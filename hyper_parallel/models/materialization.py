@@ -20,8 +20,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch import nn  # pylint: disable=forbidden-backend-import
+import torch
+from torch import nn
 
 from hyper_parallel import DTensor, distribute_tensor
 

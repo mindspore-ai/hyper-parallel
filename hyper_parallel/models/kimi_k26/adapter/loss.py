@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.components.losses.chunked_cross_entropy import (
     ChunkedCausalLMLoss,

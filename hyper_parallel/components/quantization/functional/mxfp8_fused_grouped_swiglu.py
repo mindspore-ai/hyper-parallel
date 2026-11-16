@@ -16,8 +16,8 @@
 
 from typing import TYPE_CHECKING, Optional
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch.autograd.function import once_differentiable  # pylint: disable=forbidden-backend-import
+import torch
+from torch.autograd.function import once_differentiable
 
 from hyper_parallel.components.quantization.ops.npu_mxfp8 import mxfp8_grouped_matmul
 from hyper_parallel.components.quantization.tensor import MXFP8Tensor

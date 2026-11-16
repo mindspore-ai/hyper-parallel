@@ -20,8 +20,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch.utils.data import DataLoader, Dataset  # pylint: disable=forbidden-backend-import
+import torch
+from torch.utils.data import DataLoader, Dataset
 
 from hyper_parallel.distributed_data.schema import SampleKey
 from hyper_parallel.distributed_data.dataset_reader import (

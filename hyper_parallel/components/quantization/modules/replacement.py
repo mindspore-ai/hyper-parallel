@@ -21,7 +21,7 @@ These factories retain the original low-precision module layout and policy API.
 from collections.abc import Mapping
 from typing import Any
 
-from torch import nn  # pylint: disable=forbidden-backend-import
+from torch import nn
 
 from hyper_parallel.components.quantization.functional import build_low_precision_strategy
 from hyper_parallel.components.quantization.functional.linear_strategy_factory import (

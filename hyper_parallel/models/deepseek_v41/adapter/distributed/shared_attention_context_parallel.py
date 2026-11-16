@@ -19,8 +19,8 @@ from __future__ import annotations
 from functools import wraps
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch import nn  # pylint: disable=forbidden-backend-import
+import torch
+from torch import nn
 
 from hyper_parallel.core.utils.communication import differentiable_all_to_all_single
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (

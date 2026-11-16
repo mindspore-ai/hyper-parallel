@@ -21,7 +21,6 @@ that communication and length conversion; the high-performance DSA operators
 remain in :mod:`hyper_parallel.components.functional`.
 """
 # This model-specific adapter orchestrates PyTorch/NPU tensors directly.
-# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 

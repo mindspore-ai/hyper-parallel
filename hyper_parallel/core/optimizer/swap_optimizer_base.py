@@ -25,8 +25,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
 
 # Optimizer runtime is Torch-only; the legacy checker still flags core imports.
-import torch  # pylint: disable=forbidden-backend-import
-from torch.optim import optimizer as torch_optimizer  # pylint: disable=forbidden-backend-import
+import torch
+from torch.optim import optimizer as torch_optimizer
 
 logger = logging.getLogger(__name__)
 

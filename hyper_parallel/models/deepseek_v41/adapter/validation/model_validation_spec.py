@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Declare DeepSeek-V4.1 parity and self-consistency contracts."""
-# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 

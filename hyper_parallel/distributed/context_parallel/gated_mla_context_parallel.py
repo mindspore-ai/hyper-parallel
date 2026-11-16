@@ -19,8 +19,8 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 # Model-owned gate math and CP scheduling use native Torch.
-import torch  # pylint: disable=forbidden-backend-import
-from torch import nn  # pylint: disable=forbidden-backend-import
+import torch
+from torch import nn
 
 from hyper_parallel.distributed.context_parallel.collectives import async_ulysses_seq_to_head_launch
 from hyper_parallel.distributed.context_parallel.gated_mla_backward_overlap import (

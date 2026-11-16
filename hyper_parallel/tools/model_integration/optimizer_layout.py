@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Optimizer and checkpoint-layout observations for Trainer validation."""
-# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 

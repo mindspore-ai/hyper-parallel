@@ -20,8 +20,8 @@ from collections.abc import Mapping
 import math
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch import nn  # pylint: disable=forbidden-backend-import
+import torch
+from torch import nn
 
 from hyper_parallel.components.modules.mhc import pipelined_mhc_post
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (

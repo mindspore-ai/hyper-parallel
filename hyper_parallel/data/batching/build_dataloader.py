@@ -22,8 +22,8 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import replace
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch.utils.data import IterableDataset, default_collate  # pylint: disable=forbidden-backend-import
+import torch
+from torch.utils.data import IterableDataset, default_collate
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from hyper_parallel.data.batching.dynamic_batch import (

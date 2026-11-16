@@ -29,7 +29,7 @@ from typing import Any, Mapping, Optional
 # Installed worker hooks share RL-owned version state on foreign vLLM worker instances.
 # vLLM has no public policy-version API for these transaction fields.
 # pylint: disable=protected-access
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 from safetensors import safe_open
 
 from rl.workers.engine.model import (

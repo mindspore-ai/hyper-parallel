@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Gated DeltaNet eager oracle and explicit local-backend dispatcher."""
-# pylint: disable=forbidden-backend-import,missing-public-type-hints
+# pylint: disable=missing-public-type-hints
 # pylint: disable=missing-public-docstring,not-callable
 
 __all__ = ["chunk_gated_delta_rule", "is_triton_gdn_available", "torch_chunk_gated_delta_rule"]

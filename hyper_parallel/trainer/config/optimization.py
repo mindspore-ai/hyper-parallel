@@ -21,7 +21,7 @@ class names, fields and defaults are unchanged.
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
-from torch.optim import Optimizer  # pylint: disable=forbidden-backend-import
+from torch.optim import Optimizer
 
 from hyper_parallel.core.optimizer.swap_optimizer_base import validate_state_keys
 from hyper_parallel.trainer.config.target import Target, _serialize_config_value

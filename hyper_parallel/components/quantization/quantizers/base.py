@@ -16,7 +16,7 @@
 
 from abc import ABC, abstractmethod
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.components.quantization.tensor import QuantizedTensor
 

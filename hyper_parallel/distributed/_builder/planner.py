@@ -38,7 +38,6 @@ Registries:
 - ``SPECIAL_HANDLERS``: {handler_name: callable(module, param_name, mesh)} —
   lives in ``_builder/special_handlers.py``.
 """
-# pylint: disable=forbidden-backend-import
 
 import copy
 import logging

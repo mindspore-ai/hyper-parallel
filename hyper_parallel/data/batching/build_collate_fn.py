@@ -22,8 +22,8 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch.utils.data import default_collate  # pylint: disable=forbidden-backend-import
+import torch
+from torch.utils.data import default_collate
 
 from hyper_parallel.data.constants import (
     IGNORE_INDEX,

@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Model-independent lifecycle context for externally managed parameters."""
-# pylint: disable=forbidden-backend-import,unsupported-binary-operation
+# pylint: disable=unsupported-binary-operation
 
 from dataclasses import dataclass
 from typing import Any

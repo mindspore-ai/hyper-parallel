@@ -23,7 +23,6 @@ from typing import Any
 
 # This adapter targets the PyTorch-native Transformers Qwen3 implementation
 # and intentionally shares its tensor and module contracts.
-# pylint: disable=forbidden-backend-import
 import torch
 from torch import nn
 

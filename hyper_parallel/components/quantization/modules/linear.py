@@ -14,8 +14,8 @@
 # ============================================================================
 """Canonical shell for low-precision Dense Linear."""
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch import nn  # pylint: disable=forbidden-backend-import
+import torch
+from torch import nn
 
 from hyper_parallel.components.quantization.functional.base_linear_func import (
     LinearStrategy,

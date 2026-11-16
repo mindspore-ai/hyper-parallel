@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Activation checkpointing helpers for distributed model components."""
-# pylint: disable=forbidden-backend-import
 
 import fnmatch
 import logging

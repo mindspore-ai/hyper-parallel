@@ -21,7 +21,7 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
-import torch.distributed as dist  # pylint: disable=forbidden-backend-import
+import torch.distributed as dist
 
 _DEFAULT_DP_DIM_NAMES = ("dp_replicate", "dp_shard", "dp")
 

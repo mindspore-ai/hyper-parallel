@@ -46,7 +46,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional, Union
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 # Importing torch_npu registers the ``torch.npu`` namespace and HCCL backend.
 # The dependency is optional on CUDA-only and CPU-only installations.

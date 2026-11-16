@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, List, Literal, Optional, Union
 
-from torch import nn  # pylint: disable=forbidden-backend-import
+from torch import nn
 
 from hyper_parallel.components.quantization.config import (
     LowPrecisionConfig,

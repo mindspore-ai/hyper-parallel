@@ -15,7 +15,6 @@
 """Dense Triton-Ascend KDA execution helpers for Torch training."""
 from __future__ import annotations
 
-# pylint: disable=forbidden-backend-import
 
 __all__ = ["fused_chunk_kda", "fused_chunk_kda_p2p"]
 

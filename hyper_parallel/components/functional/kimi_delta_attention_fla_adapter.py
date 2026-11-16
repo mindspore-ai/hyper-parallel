@@ -15,7 +15,6 @@
 """Lazy adapter for the external FLA Triton-Ascend KDA backend."""
 from __future__ import annotations
 
-# pylint: disable=forbidden-backend-import
 
 __all__ = [
     "FLAKDAStagedOps",

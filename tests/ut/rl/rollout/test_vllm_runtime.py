@@ -15,7 +15,7 @@
 """CPU unit tests for the primary shared-vLLM runtime contracts."""
 # Tests intentionally exercise stable internal HTTP and ownership seams.
 # Local test doubles are not public APIs; the suite intentionally uses Torch CPU tensors.
-# pylint: disable=forbidden-backend-import,missing-public-docstring,protected-access,no-member,unnecessary-lambda
+# pylint: disable=missing-public-docstring,protected-access,no-member,unnecessary-lambda
 
 import asyncio
 import json

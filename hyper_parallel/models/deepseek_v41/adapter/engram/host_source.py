@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Resolve and materialize only the Host rows owned by this EP rank."""
-# pylint: disable=forbidden-backend-import
 
 import hashlib
 import json

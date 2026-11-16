@@ -19,7 +19,6 @@
 # pylint: disable=missing-public-type-hints,missing-public-docstring,invalid-name
 # pylint: disable=import-outside-toplevel,unused-argument,unused-import
 # pylint: disable=missing-module-docstring,missing-function-docstring
-# pylint: disable=forbidden-backend-import
 
 import os
 from typing import Optional

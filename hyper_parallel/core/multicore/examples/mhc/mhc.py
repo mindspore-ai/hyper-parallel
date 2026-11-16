@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.core.multicore import MegaMhc
 

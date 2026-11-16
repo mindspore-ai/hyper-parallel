@@ -26,7 +26,6 @@ Features:
     - Gradient accumulation
     - Checkpointing
 """
-# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 

@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """CPU tests for whole-parameter packed full-gather buckets."""
-# pylint: disable=forbidden-backend-import,missing-public-docstring
+# pylint: disable=missing-public-docstring
 
 import pytest
 import torch

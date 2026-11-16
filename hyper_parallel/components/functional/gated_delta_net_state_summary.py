@@ -14,7 +14,6 @@
 # ============================================================================
 """Affine state-summary operations used by GDN State-P2P."""
 
-# pylint: disable=forbidden-backend-import
 
 __all__ = [
     "apply_gdn_state_gradient_summary",

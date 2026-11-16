@@ -14,8 +14,8 @@
 # ============================================================================
 """Rebuild DeepSeek-V3.2 rotary buffers after empty materialization."""
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch import nn  # pylint: disable=forbidden-backend-import
+import torch
+from torch import nn
 from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32RotaryEmbedding
 
 from hyper_parallel.models.materialization import register_rebuildable_buffer

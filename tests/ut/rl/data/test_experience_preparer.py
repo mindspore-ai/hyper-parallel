@@ -14,7 +14,6 @@
 # ============================================================================
 """CPU unit tests for trajectory batching and algorithm target preparation."""
 # Hyper-RL CPU tests intentionally exercise the verified Torch runtime.
-# pylint: disable=forbidden-backend-import
 
 import math
 

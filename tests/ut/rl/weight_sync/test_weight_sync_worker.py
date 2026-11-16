@@ -14,7 +14,7 @@
 # ============================================================================
 """CPU unit tests for production rollout-worker weight synchronization logic."""
 # Local fakes replace vLLM/NPU boundaries while worker functions execute unchanged.
-# pylint: disable=forbidden-backend-import,missing-public-docstring,protected-access,unnecessary-lambda
+# pylint: disable=missing-public-docstring,protected-access,unnecessary-lambda
 
 import base64
 import pickle

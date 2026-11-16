@@ -17,7 +17,7 @@
 from collections.abc import Mapping
 from typing import Any
 
-from torch import nn  # pylint: disable=forbidden-backend-import
+from torch import nn
 
 from hyper_parallel.models.replacement import module_replacement
 

@@ -19,7 +19,6 @@
 # pylint: disable=unused-argument,no-member,import-outside-toplevel
 # pylint: disable=invalid-name,missing-module-docstring,missing-function-docstring
 # pylint: disable=missing-class-docstring,broad-exception-caught,protected-access
-# pylint: disable=forbidden-backend-import
 
 import itertools
 import contextlib

@@ -25,11 +25,11 @@ from functools import wraps
 from typing import Any
 
 # This CP scheduler uses the native Torch autograd and communication APIs.
-import torch  # pylint: disable=forbidden-backend-import
-import torch.distributed as dist  # pylint: disable=forbidden-backend-import
-from torch import nn  # pylint: disable=forbidden-backend-import
-from torch.autograd.function import once_differentiable  # pylint: disable=forbidden-backend-import
-from torch.nn import functional as F  # pylint: disable=forbidden-backend-import
+import torch
+import torch.distributed as dist
+from torch import nn
+from torch.autograd.function import once_differentiable
+from torch.nn import functional as F
 
 from hyper_parallel.distributed._builder.forward_rewriter import _ForwardRewriteRequest
 from hyper_parallel.distributed.context_parallel.collectives import (

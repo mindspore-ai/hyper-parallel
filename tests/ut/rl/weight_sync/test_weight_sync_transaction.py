@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """CPU contracts for one-shot direct and full-gather publication."""
-# pylint: disable=forbidden-backend-import,missing-public-docstring,missing-public-type-hints,protected-access
+# pylint: disable=missing-public-docstring,missing-public-type-hints,protected-access
 
 from types import SimpleNamespace
 from typing import Any

@@ -22,8 +22,8 @@ import struct
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-import torch  # pylint: disable=forbidden-backend-import
-import torch.distributed as dist  # pylint: disable=forbidden-backend-import
+import torch
+import torch.distributed as dist
 
 from hyper_parallel.distributed_data.model_batch import ModelBatchLayout
 from hyper_parallel.distributed_data.schema import SampleKey

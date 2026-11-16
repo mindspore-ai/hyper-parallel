@@ -21,7 +21,7 @@ import os
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.data.constants import IGNORE_INDEX, ONLINE_SOURCE_PATH_KEY
 from hyper_parallel.data.dataset_logging import get_dataset_logger

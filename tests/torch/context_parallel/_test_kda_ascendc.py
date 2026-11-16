@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Native dense/TND Ulysses must preserve resets, gradients and saved calls."""
-# pylint: disable=forbidden-backend-import
 from datetime import timedelta
 import os
 

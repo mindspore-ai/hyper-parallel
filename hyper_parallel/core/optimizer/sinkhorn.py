@@ -18,8 +18,8 @@
 import math
 from typing import Any, Callable, Dict, Optional, Tuple
 
-import torch  # pylint: disable=forbidden-backend-import
-import torch.distributed as dist  # pylint: disable=forbidden-backend-import
+import torch
+import torch.distributed as dist
 
 from hyper_parallel.core.optimizer.dtensor_compat import is_dtensor, to_local_if_dtensor
 

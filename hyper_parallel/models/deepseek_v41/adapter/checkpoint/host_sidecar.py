@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Synchronous row-interval sidecars committed before dense DCP save."""
-# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 

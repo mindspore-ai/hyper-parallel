@@ -21,7 +21,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from typing import Any
 
-from torch.utils.data import IterableDataset  # pylint: disable=forbidden-backend-import
+from torch.utils.data import IterableDataset
 
 from hyper_parallel.data.constants import ONLINE_BLEND_STRATEGIES
 from hyper_parallel.data.online.source import OnlineDataPath, _OnlineSourceBuilder

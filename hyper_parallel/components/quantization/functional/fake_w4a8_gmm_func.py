@@ -14,7 +14,7 @@
 # ============================================================================
 """Fake-QAT W4A8 strategy for the shared grouped-linear lifecycle."""
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.components.quantization.config import (
     GROUP_LIST_COUNTS,

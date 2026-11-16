@@ -36,7 +36,7 @@ Note: PP does not use DTensor layout for gradients today.  Cross-stage
 norm aggregation will require an additional manual all-reduce and is
 left for future work.
 """
-# pylint: disable=forbidden-backend-import,not-callable
+# pylint: disable=not-callable
 import functools
 import math
 import warnings

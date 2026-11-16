@@ -20,9 +20,9 @@ import math
 from collections.abc import Mapping
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch import nn  # pylint: disable=forbidden-backend-import
-from torch.nn import functional as F  # pylint: disable=forbidden-backend-import
+import torch
+from torch import nn
+from torch.nn import functional as F
 from transformers.activations import ACT2FN
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Experts
 
