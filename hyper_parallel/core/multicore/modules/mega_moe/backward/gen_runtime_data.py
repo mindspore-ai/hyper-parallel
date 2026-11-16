@@ -95,7 +95,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int,
-                          num_cube_cores: int = 24) -> RuntimeConfigC:
+                          num_cube_cores: int = 24,
+                          gmm_cube_cores: int | None = None) -> RuntimeConfigC:
     """Build backward RuntimeConfig for a single rank.
 
     Args:
@@ -132,13 +133,13 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
                   w2_grad_op.task_num + w1_grad_op.task_num
                   + combine_op.task_num // tsv.ep * tsv.ep)
     revise_task_queue(cfg, tsv, dispatch_op.task_num, swiglu_grad_op.task_num, combine_op.task_num)
-    revise_gmm_task_queue_bwd(cfg, tsv, act_grad_op.task_num, num_cube_cores=num_cube_cores)
+    revise_gmm_task_queue_bwd(cfg, tsv, act_grad_op.task_num, num_cube_cores=gmm_cube_cores or num_cube_cores)
     add_dynamic_data(cfg, tsv, dynamic_input_position=19)
 
     cfg.task_num = task_num_all
     cfg.atomic_add_values[0] = 1
     configure_ready_handshake(cfg, tsv)
-    validate_runtime_config(cfg, tsv, num_cube_cores)
+    validate_runtime_config(cfg, tsv, num_cube_cores, gmm_cube_cores=gmm_cube_cores)
     return cfg
 
 

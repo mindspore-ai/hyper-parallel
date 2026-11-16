@@ -187,7 +187,8 @@ def get_act_grad_tiling_bytes(split_value: int, *,
                                 hidden_size: int = 7168,
                                 intermediate_size: int = 2048,
                                 num_groups: int = 8,
-                                num_cube_cores: int = 24) -> bytes:
+                                num_cube_cores: int = 24,
+                                repeat_cores: int | None = None,) -> bytes:
     """Backward GMM1 [x,hidden]×[E,intermediate,hidden] → y=[x,intermediate]."""
     csv = FIRST_GMM_TABLE.get(split_value)
     if csv is None:
@@ -196,14 +197,15 @@ def get_act_grad_tiling_bytes(split_value: int, *,
                           {7168: hidden_size, 2048: intermediate_size},
                           num_groups, split_value=split_value,
                           num_cube_cores=num_cube_cores)
-    return _expand_gmm_string(csv, repeat=num_cube_cores)
+    return _expand_gmm_string(csv, repeat=repeat_cores or num_cube_cores)
 
 
 def get_gate_grad_tiling_bytes(split_value: int, *,
                                  hidden_size: int = 7168,
                                  intermediate_size: int = 2048,
                                  num_groups: int = 8,
-                                 num_cube_cores: int = 24) -> bytes:
+                                 num_cube_cores: int = 24,
+                                 repeat_cores: int | None = None,) -> bytes:
     """Backward GMM2 [x,intermediate*2]×[E,hidden,intermediate*2] → y=[x,hidden]."""
     csv = SECOND_GMM_TABLE.get(split_value)
     if csv is None:
@@ -212,7 +214,7 @@ def get_gate_grad_tiling_bytes(split_value: int, *,
                           {4096: intermediate_size * 2, 7168: hidden_size},
                           num_groups, split_value=split_value,
                           num_cube_cores=num_cube_cores)
-    return _expand_gmm_string(csv, repeat=num_cube_cores)
+    return _expand_gmm_string(csv, repeat=repeat_cores or num_cube_cores)
 
 
 def get_w1_grad_tiling_bytes(split_value: int, *,
@@ -220,6 +222,7 @@ def get_w1_grad_tiling_bytes(split_value: int, *,
                                 intermediate_size: int = 2048,
                                 num_groups: int = 8,
                                 num_cube_cores: int = 24,
+                                repeat_cores: int | None = None,
                                 expert_weight_layout: str = "EIO") -> bytes:
     """Build W13-gradient tiling with caller-layout output axes and dynamic reduction K."""
     csv = THIRD_GMM_TABLE.get(split_value)
@@ -231,7 +234,7 @@ def get_w1_grad_tiling_bytes(split_value: int, *,
                           {7168: rows, 4096: columns},
                           num_groups, split_value=split_value,
                           num_cube_cores=num_cube_cores)
-    return _expand_gmm_string(csv, repeat=num_cube_cores)
+    return _expand_gmm_string(csv, repeat=repeat_cores or num_cube_cores)
 
 
 def get_w2_grad_tiling_bytes(split_value: int, *,
@@ -239,6 +242,7 @@ def get_w2_grad_tiling_bytes(split_value: int, *,
                                  intermediate_size: int = 2048,
                                  num_groups: int = 8,
                                  num_cube_cores: int = 24,
+                                 repeat_cores: int | None = None,
                                  expert_weight_layout: str = "EIO") -> bytes:
     """Build W2-gradient tiling with caller-layout output axes and dynamic reduction K."""
     csv = FOURTH_GMM_TABLE.get(split_value)
@@ -251,7 +255,7 @@ def get_w2_grad_tiling_bytes(split_value: int, *,
                            4096: intermediate_size * 2},
                           num_groups, split_value=split_value,
                           num_cube_cores=num_cube_cores)
-    return _expand_gmm_string(csv, repeat=num_cube_cores)
+    return _expand_gmm_string(csv, repeat=repeat_cores or num_cube_cores)
 
 
 def get_swiglu_grad_tiling_bytes(split_value: int, *,

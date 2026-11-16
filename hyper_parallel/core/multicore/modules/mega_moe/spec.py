@@ -45,6 +45,7 @@ class MegaMoeSpec:
     rank_id: int
     num_cube_cores: int
     dispatch_mode: str = "push"
+    gmm_cube_cores: int | None = None
     capacity_growth_factor: float | None = _DEFAULT_CAPACITY_FACTOR
     dispatch_split: int = _COMMUNICATION_SPLIT
     combine_split: int = _COMMUNICATION_SPLIT
@@ -217,6 +218,7 @@ def bind_mega_moe_spec(
         capacity_growth_factor=specification.get("capacity_growth_factor", _DEFAULT_CAPACITY_FACTOR),
         dispatch_split=specification.get("dispatch_split", _COMMUNICATION_SPLIT),
         combine_split=specification.get("combine_split", _COMMUNICATION_SPLIT),
+        gmm_cube_cores=specification.get("gmm_cube_cores"),
         max_local_num_tokens=specification.get("max_local_num_tokens"),
         auto_tokens=specification.get("auto_tokens", False),
     )

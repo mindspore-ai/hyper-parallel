@@ -88,7 +88,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int,
-                          num_cube_cores: int = 24) -> RuntimeConfigC:
+                          num_cube_cores: int = 24,
+                          gmm_cube_cores: int | None = None) -> RuntimeConfigC:
     """Build RuntimeConfig for a single rank.
 
     Args:
@@ -123,7 +124,7 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
     cfg.task_num = task_num_all
     cfg.atomic_add_values[0] = 1
     configure_ready_handshake(cfg, tsv)
-    validate_runtime_config(cfg, tsv, num_cube_cores)
+    validate_runtime_config(cfg, tsv, num_cube_cores, gmm_cube_cores=gmm_cube_cores)
     return cfg
 
 

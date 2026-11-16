@@ -168,7 +168,8 @@ def get_up_proj_tiling_bytes(split_value: int, *,
                            hidden_size: int = 7168,
                            intermediate_size: int = 2048,
                            num_groups: int = 8,
-                           num_cube_cores: int = 24) -> bytes:
+                           num_cube_cores: int = 24,
+                           repeat_cores: int | None = None,) -> bytes:
     """Forward GMM1 tiling [x,hidden]×[E,hidden,intermediate*2], expanded num_cube_cores times."""
     if split_value not in GMM1_TABLE:
         raise KeyError(f"GMM1 tiling: split_value={split_value} not found")
@@ -176,14 +177,15 @@ def get_up_proj_tiling_bytes(split_value: int, *,
                           {7168: hidden_size, 4096: intermediate_size * 2},
                           num_groups, split_value=split_value,
                           num_cube_cores=num_cube_cores)
-    return _expand_gmm_string(csv, repeat=num_cube_cores)
+    return _expand_gmm_string(csv, repeat=repeat_cores or num_cube_cores)
 
 
 def get_down_proj_tiling_bytes(split_value: int, *,
                            hidden_size: int = 7168,
                            intermediate_size: int = 2048,
                            num_groups: int = 8,
-                           num_cube_cores: int = 24) -> bytes:
+                           num_cube_cores: int = 24,
+                           repeat_cores: int | None = None,) -> bytes:
     """Forward GMM2 tiling [x,intermediate]×[E,intermediate,hidden], expanded num_cube_cores times."""
     if split_value not in GMM2_TABLE:
         raise KeyError(f"GMM2 tiling: split_value={split_value} not found")
@@ -191,7 +193,7 @@ def get_down_proj_tiling_bytes(split_value: int, *,
                           {2048: intermediate_size, 7168: hidden_size},
                           num_groups, split_value=split_value,
                           num_cube_cores=num_cube_cores)
-    return _expand_gmm_string(csv, repeat=num_cube_cores)
+    return _expand_gmm_string(csv, repeat=repeat_cores or num_cube_cores)
 
 
 def get_swiglu_tiling_bytes(split_value: int, *,

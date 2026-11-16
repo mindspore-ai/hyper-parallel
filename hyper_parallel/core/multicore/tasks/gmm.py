@@ -152,6 +152,7 @@ class GmmFillConfig(FillConfig):
             task.task_index           = i
             task.task_split_num       = task_num
             task.task_split_value     = op.split_value
+            task.extra_value_2        = self.num_cube_cores
             task.tiling_data_position = op.tiling_position
 
             cfg.all_tasks[tsv.pre_task_num + i]              = task

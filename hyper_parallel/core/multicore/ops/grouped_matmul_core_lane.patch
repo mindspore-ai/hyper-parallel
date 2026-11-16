@@ -1,0 +1,14 @@
+diff --git a/gmm/grouped_matmul/op_kernel/grouped_matmul.h b/gmm/grouped_matmul/op_kernel/grouped_matmul.h
+index c740eee..7cef4d1 100644
+--- a/gmm/grouped_matmul/op_kernel/grouped_matmul.h
++++ b/gmm/grouped_matmul/op_kernel/grouped_matmul.h
+@@ -164,6 +164,9 @@ __aicore__ inline void GMMProcess<ComputeType>::Init(const GMMBaseParams* __rest
+     if (coreRation > 1) {
+         coreIdx /= coreRation;
+     }
++    if (gmmBaseParamsIn != nullptr && gmmBaseParamsIn->coreNum > 0 && coreIdx >= gmmBaseParamsIn->coreNum) {
++        coreIdx = coreIdx % gmmBaseParamsIn->coreNum;
++    }
+     gmmBaseParams = gmmBaseParamsIn;
+     mmTilingData = mmTilingDataIn;
+     groupNum = gmmBaseParams->groupNum;
