@@ -111,6 +111,36 @@ optimizer = get_hyper_optimizer(
 )
 ```
 
+### Muon HSDP replica deduplication
+
+Within each HSDP replicate group, Muon assigns each parameter to an owner. The
+owner maintains momentum, computes the update, and broadcasts the updated
+parameter to the group.
+
+Muon enables replicate group splitting when a replicate group has more ranks
+than there are visible devices on the local node. With splitting enabled,
+`hsdp_replica_count` specifies a positive integer subgroup size. If the value is
+smaller than a replicate group, it must evenly divide that group's size. The
+default `None` lets Muon infer the size from the topology.
+
+When splitting is enabled, set `hsdp_replica_count=1` to use one-rank subgroups.
+Each replica then maintains its own momentum and computes its own updates,
+skipping Muon's replicate broadcasts and increasing per-replica optimizer state
+and computation. Use the same value on all participating ranks.
+
+```python
+from hyper_parallel.core.optimizer.muon import Muon
+
+optimizer = Muon(muon_param_groups, hsdp_replica_count=1)
+```
+
+When using `get_hyper_optimizer`, pass `muon_kwargs={"hsdp_replica_count": 1}`.
+
+If all replicate groups fit within the local device count, Muon keeps the
+original groups and ignores the explicit value. For example, on a single node
+with eight visible devices and a `replicate=2, shard=4` mesh, each replicate group
+has two ranks, so setting `hsdp_replica_count=1` leaves deduplication enabled.
+
 ---
 
 ## gradient scaling factor + clip_grad
