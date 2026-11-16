@@ -37,6 +37,7 @@ from hyper_parallel.auto_parallel.hyper_offload.execution.warmup import WarmupEx
 from hyper_parallel.auto_parallel.hyper_offload.planning.peak import (
     PeakResidencyPlanner,
 )
+from hyper_parallel.auto_parallel.hyper_offload.runtime.allocator import SessionAllocator
 from hyper_parallel.auto_parallel.hyper_offload.runtime.residency import (
     ResidencyManager,
 )
@@ -123,6 +124,7 @@ class OffloadSession:
         self._saved_recorder = None
         self._saved_replay = None
         self._saved_context = None
+        self._allocator = SessionAllocator()
 
     # ------------------------------------------------------------------
     # Active session lookup (used by skip_offload decorator)
@@ -147,6 +149,7 @@ class OffloadSession:
 
     def __enter__(self) -> OffloadSession:
         """Enter the runtime context."""
+        self._allocator.activate()
         self.executor.reset()
 
         self._session_token = _active_session.set(self)
@@ -171,6 +174,17 @@ class OffloadSession:
         self._saved_context = torch.autograd.graph.saved_tensors_hooks(pack, unpack)
         self._saved_context.__enter__()
         return self
+
+    def close(self) -> None:
+        """Release the process-wide allocation policy after optimizer work finishes.
+
+        Ordinary context exits retain the policy for optimizer work between
+        iterations. Destruction also releases it. Closing an active context is
+        invalid; closing an idle session permits a later entry to reacquire it.
+        """
+        if self._session_token is not None:
+            raise RuntimeError("cannot close an active OffloadSession")
+        self._allocator.close()
 
     def __exit__(
         self, exc_type: type[BaseException] | None,

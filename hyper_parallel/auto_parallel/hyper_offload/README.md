@@ -60,11 +60,14 @@ for step in range(10):
         loss.backward()
     optimizer.step()
     optimizer.zero_grad()
+
+session.close()
 ```
 
 ## 4. Key Features
 
-- **Automatic memory budget enforcement** — Peak device memory stays below `max_resident_activation_mb`.
+- **Activation residency budget** — `max_resident_activation_mb` budgets managed activations;
+  parameters, optimizer state, collective buffers and allocator fragmentation also consume device memory.
 - **Greedy offline planner** — Selects eviction candidates by access distance and tensor size.
 - **Asynchronous copy streams** — D2H / H2D transfers overlap with computation on a dedicated stream.
 - **ShadowTensor** — A `torch.Tensor` subclass that lazily resolves from device or host storage.
@@ -96,51 +99,16 @@ with session:
     loss = model(x); loss.backward()
 ```
 
+Call `session.close()` outside the context after finishing optimizer work to release
+its allocator policy. A later context entry can reuse the session.
+
 ### Native autograd replay
 
-HyperOffload automatically selects native autograd replay for an eligible static,
-complete forward/backward step; no additional switch is required:
-
-```python
-config = OffloadConfig(max_resident_activation_mb=512)
-session = OffloadSession(config)
-```
-
-Warmup still records the operator trace and uses the configured planner. If every
-selected storage is an immutable forward activation saved for backward, with one
-offload interval and a static save/use sequence, replay uses autograd hooks
-without installing a global `TorchDispatchMode`. There is no activation-count
-limit. Unsupported plans keep operator replay.
-
-The default Peak planner prefers eligible forward-to-backward intervals covering
-the current peak. It keeps the same memory budget and can choose other intervals
-when eligible activations do not provide enough relief. Communication masking
-uses spare residency for early H2D prefetch before delaying D2H source releases.
-
-Only selected saves replace their original tensor with storage/view metadata.
-Other saves retain detached tensors with version checks. Copies use the existing
-residency manager and copy stream. D2H starts at the first selected save; source
-release and individual H2D prefetch points are compiled onto the next available
-save/use hook. H2D destinations are allocated on the copy stream and depend only
-on the host snapshot; unrelated compute is not a producer dependency. H2D is
-fenced before its consumer, and restored manager ownership
-ends at the last saved-view use. These hook anchors can differ from the exact
-operator anchors in the original plan.
-
-Keep the same forward save order, view metadata and backward use order on every
-entry, and complete backward before leaving the session. Activation checkpointing
-can save additional aliases during backward; replay validates their position among
-the recorded uses and checks them against restored storage. Repeated reads of a
-saved view keep that storage until its final recorded use. Both non-reentrant and
-reentrant checkpointing can use this path when every selected storage is first
-saved in forward, is immutable after its first save, and has one
-forward-to-backward offload interval. Initialization before the first save and
-read-only split/unbind aliases are supported. A storage must have at least one
-recorded backward use; extra unused saved aliases do not extend its lifetime.
-Changing save/use order or control flow is unsupported. Record a new session when
-the graph changes. The session checks selected metadata, storage aliases, mutation
-versions and save/use counts; it does not validate every unrelated operator during
-native replay.
+HyperOffload automatically uses native autograd replay for supported static
+forward/backward steps and operator replay for other plans. No additional switch
+is required. Keep tensor save/use order and view metadata consistent across entries,
+and complete backward before leaving the session. Create a new session when the
+graph changes.
 
 ### `skip_offload`
 
@@ -200,5 +168,5 @@ hyper_offload/
 
 ## 8. References
 
-- PyTorch `TorchDispatchMode`: https://pytorch.org/docs/stable/notes/extending.html
+- [PyTorch `TorchDispatchMode`](https://pytorch.org/docs/stable/notes/extending.html)
 - HyperParallel activation checkpoint swap: `hyper_parallel.core.activation_memory`
