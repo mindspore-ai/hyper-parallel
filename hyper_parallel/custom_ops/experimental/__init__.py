@@ -30,7 +30,9 @@ Usage::
 
 When inputs are ``DTensor`` objects, the call is automatically routed
 through the registered ``DistributedOp`` for layout inference and
-re-distribution.
+re-distribution where supported. Chunk KDA explicit stage primitives are
+local-Tensor-only: they provide neither distributed dispatch nor implicit
+automatic differentiation. The caller owns CP communication and gradients.
 """
 __all__ = [
     "npu_dense_lightning_indexer_grad_kl_loss",
@@ -48,6 +50,15 @@ __all__ = [
     "npu_sparse_lightning_indexer_grad_kl_loss",
     "npu_sparse_lightning_indexer_kl_loss_grad",
     "npu_chunk_kda",
+    "npu_chunk_kda_fwd_prepare",
+    "npu_chunk_kda_pre_process_fwd",
+    "npu_chunk_kda_fwd_h",
+    "npu_chunk_kda_fwd_finalize",
+    "npu_chunk_kda_bwd_prepare",
+    "npu_chunk_kda_pre_process_bwd",
+    "npu_chunk_kda_bwd_dhu",
+    "npu_chunk_kda_bwd_finalize",
+    "npu_chunk_kda_merge_fwd_bwd",
 ]
 
 from hyper_parallel.custom_ops.experimental.experimental_ops import (
@@ -66,4 +77,13 @@ from hyper_parallel.custom_ops.experimental.experimental_ops import (
     npu_sparse_lightning_indexer_grad_kl_loss,
     npu_sparse_lightning_indexer_kl_loss_grad,
     npu_chunk_kda,
+    npu_chunk_kda_fwd_prepare,
+    npu_chunk_kda_pre_process_fwd,
+    npu_chunk_kda_fwd_h,
+    npu_chunk_kda_fwd_finalize,
+    npu_chunk_kda_bwd_prepare,
+    npu_chunk_kda_pre_process_bwd,
+    npu_chunk_kda_bwd_dhu,
+    npu_chunk_kda_bwd_finalize,
+    npu_chunk_kda_merge_fwd_bwd,
 )

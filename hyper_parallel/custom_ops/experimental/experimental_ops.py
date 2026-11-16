@@ -17,7 +17,7 @@
 Each function is a thin delegation wrapper around ``_platform.custom_ops``,
 which routes to the platform-specific Ascend NPU custom C++ kernel.
 """
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 from mindspore import Tensor
 
@@ -26,6 +26,9 @@ from hyper_parallel.platform import get_platform
 _platform = get_platform()
 
 _MAX_INT64 = 9223372036854775807
+
+_Metadata = Optional[Sequence[int]]
+_StageOutputs = Tuple[Optional[Tensor], ...]
 
 
 def npu_dense_lightning_indexer_softmax_lse(
@@ -684,16 +687,6 @@ def npu_sparse_lightning_indexer_kl_loss_grad(
     )
 
 
-def _validate_chunk_kda_autograd_options(initial_state, disable_recompute, state_v_first):
-    """Validate state options not yet supported by automatic backward."""
-    if initial_state is not None:
-        raise ValueError("initial_state is not supported until backward provides dht/dh0 semantics.")
-    if not disable_recompute:
-        raise ValueError("disable_recompute=False is not supported by the fused backward kernel.")
-    if state_v_first:
-        raise ValueError("state_v_first=True is not supported by the fused backward kernel.")
-
-
 def npu_chunk_kda(
         q: Tensor,
         k: Tensor,
@@ -707,24 +700,169 @@ def npu_chunk_kda(
         output_final_state: bool = False,
         safe_gate: bool = False,
         lower_bound: float = -5.0,
-        use_gate_in_kernel: bool = False,
+        use_gate_in_kernel: bool = True,
         a_log: Tensor = None,
         dt_bias: Tensor = None,
-        cu_seqlens=None,
-        chunk_indices=None,
+        cu_seqlens: _Metadata = None,
+        chunk_indices: _Metadata = None,
         initial_state: Tensor = None,
         disable_recompute: bool = True,
         state_v_first: bool = False,
+        epsilon: float = 1e-6,
+        use_qk_l2norm_in_kernel: bool = False,
+        use_beta_sigmoid_in_kernel: bool = False,
+        allow_neg_eigval: bool = False,
+        use_exp2: bool = True,
 ):
     """Run differentiable dense or packed Chunk KDA.
 
+    ``cu_seqlens`` and ``chunk_indices`` are optional host integer sequences,
+    passed directly to the operator without Tensor-to-host conversion.
     Returns ``(attn_out, final_state)``; ``final_state`` is ``None`` unless
-    ``output_final_state=True``. MindSpore automatically invokes the fused
-    backward operator when gradients are requested.
+    ``output_final_state=True``. MindSpore automatically invokes the paired
+    backward path when gradients are requested. The FLA master backward
+    path requires BF16 q/k/v with 128-wide key/value dimensions,
+    ``chunk_size=64``, ``use_gate_in_kernel=True``, and ``use_exp2=True``.
+    Safe raw gates use the explicit stage chain, including ordinary training.
+    State/recompute training currently requires ``safe_gate=True`` and the
+    six local forward/backward stage APIs. That path differentiates both boundary states
+    and canonicalizes V-first states internally to K-first.
+    ``use_qk_l2norm_in_kernel`` and ``use_beta_sigmoid_in_kernel`` select the
+    optional FwdV2 saved values consumed by backward.
+
+    BF16 state relays can amplify cancellation in terminal-state-only losses;
+    one strong-decay reference case currently exceeds the 4% gradient error
+    target. State-gradient accuracy is not fully validated for that regime.
     """
-    _validate_chunk_kda_autograd_options(initial_state, disable_recompute, state_v_first)
     return _platform.custom_ops.npu_chunk_kda(
         q, k, v, g, beta, scale, chunk_size, layout, output_final_state,
         safe_gate, lower_bound, use_gate_in_kernel, a_log, dt_bias,
-        cu_seqlens, chunk_indices
+        cu_seqlens, chunk_indices, epsilon, use_qk_l2norm_in_kernel,
+        use_beta_sigmoid_in_kernel, allow_neg_eigval, use_exp2,
+        initial_state, disable_recompute, state_v_first,
+    )
+
+
+def npu_chunk_kda_fwd_prepare(
+        q: Tensor, k: Tensor, v: Tensor, g: Tensor, beta: Tensor, scale: float,
+        chunk_size: int = 64, *, layout: str = "BNSD",
+        a_log: Optional[Tensor] = None, dt_bias: Optional[Tensor] = None,
+        cu_seqlens: _Metadata = None, chunk_indices: _Metadata = None,
+        epsilon: float = 1e-6, use_qk_l2norm_in_kernel: bool = False, use_gate_in_kernel: bool = False,
+        use_beta_sigmoid_in_kernel: bool = False, allow_neg_eigval: bool = False,
+        safe_gate: bool = False, lower_bound: float = -5.0, use_exp2: bool = True,
+        backward_mode: str = "save") -> _StageOutputs:
+    """Return head-major caches from local inputs in ``layout``.
+
+    Output order is ``gk, Aqk, Akk, w, u, qg, kg, qg_scaled, q_hat, k_hat,
+    q_rstd, k_rstd, beta_eff``. Optional output slots and supported flags
+    follow the paired FLA-NPU stage ACLNN ABI.
+    ``cu_seqlens`` and ``chunk_indices`` must be host integer sequences or ``None``.
+    """
+    return _platform.custom_ops.npu_chunk_kda_fwd_prepare(
+        q, k, v, g, beta, scale, chunk_size, layout, a_log, dt_bias,
+        cu_seqlens, chunk_indices, epsilon, use_qk_l2norm_in_kernel,
+        use_gate_in_kernel, use_beta_sigmoid_in_kernel, allow_neg_eigval,
+        safe_gate, lower_bound, use_exp2, backward_mode,
+    )
+
+
+def npu_chunk_kda_pre_process_fwd(
+        k: Tensor, w: Tensor, u: Tensor, *, gk: Tensor, cu_seqlens: _Metadata = None,
+        chunk_size: int = 64) -> Tuple[Tensor]:
+    """Return the local FP32 forward state summary ``(summary,)``.
+
+    With ``cu_seqlens=None``, inputs use dense ``[B, H, T, D]`` layout and
+    each batch entry produces one summary. HP packs the sequences and supplies
+    boundaries ``[0, T, ..., B*T]`` to FLA. Explicit boundaries apply to packed
+    ``[1, H, T, D]`` inputs and are passed through unchanged.
+    """
+    return _platform.custom_ops.npu_chunk_kda_pre_process_fwd(
+        k, w, u, gk, cu_seqlens, chunk_size,
+    )
+
+
+def npu_chunk_kda_fwd_h(
+        k: Tensor, w: Tensor, u: Tensor, *, gk: Tensor, initial_state: Optional[Tensor] = None,
+        output_final_state: bool = False, chunk_size: int = 64, cu_seqlens: _Metadata = None,
+        chunk_indices: _Metadata = None, use_exp2: bool = True,
+        state_v_first: bool = False) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+    """Propagate local chunk states from the caller-supplied boundary state."""
+    return _platform.custom_ops.npu_chunk_kda_fwd_h(
+        k, w, u, gk, initial_state, output_final_state, chunk_size,
+        cu_seqlens, chunk_indices, use_exp2, state_v_first,
+    )
+
+
+def npu_chunk_kda_fwd_finalize(
+        qg_scaled: Tensor, aqk: Tensor, v_new: Tensor, h: Tensor, *, output_layout: str = "BSND",
+        state_v_first: bool = False, cu_seqlens: _Metadata = None, chunk_indices: _Metadata = None) -> Tensor:
+    """Compute local attention output from forward caches and state relays."""
+    return _platform.custom_ops.npu_chunk_kda_fwd_finalize(
+        qg_scaled, aqk, v_new, h, output_layout, state_v_first,
+        cu_seqlens, chunk_indices,
+    )
+
+
+def npu_chunk_kda_bwd_prepare(
+        aqk: Tensor, v_new: Tensor, d_o: Tensor, h: Tensor, *, scale: float, layout: str = "BNSD",
+        chunk_size: int = 64, state_v_first: bool = False, cu_seqlens: _Metadata = None,
+        chunk_indices: _Metadata = None) -> Tuple[Tensor, Tensor, Tensor]:
+    """Prepare local block gradients ``(dAqk, dv_local, dq_raw)``."""
+    return _platform.custom_ops.npu_chunk_kda_bwd_prepare(
+        aqk, v_new, d_o, h, scale, layout, chunk_size,
+        state_v_first, cu_seqlens, chunk_indices,
+    )
+
+
+def npu_chunk_kda_pre_process_bwd(
+        q: Tensor, k: Tensor, w: Tensor, d_o: Tensor, dv: Tensor, scale: float,
+        chunk_size: int = 64, *, gk: Tensor, cu_seqlens: _Metadata = None) -> Tensor:
+    """Build the local FP32 backward state summary for the caller's reverse scan.
+
+    HP casts ``gk`` to the q/k dtype for this stage without modifying the
+    caller's original gate cache.
+    """
+    return _platform.custom_ops.npu_chunk_kda_pre_process_bwd(
+        q, k, w, d_o, dv, scale, chunk_size, gk, cu_seqlens,
+    )
+
+
+def npu_chunk_kda_bwd_dhu(
+        q: Tensor, k: Tensor, w: Tensor, d_o: Tensor, dv: Tensor, scale: float,
+        chunk_size: int = 64, *, gk: Tensor, h0: Optional[Tensor] = None,
+        dht: Optional[Tensor] = None, cu_seqlens: _Metadata = None, chunk_indices: _Metadata = None,
+        use_exp2: bool = True, state_v_first: bool = False) -> Tuple[Tensor, Optional[Tensor], Tensor]:
+    """Propagate state gradients and return ``(dh, dh0, dv_scan)``."""
+    return _platform.custom_ops.npu_chunk_kda_bwd_dhu(
+        q, k, w, d_o, dv, scale, chunk_size, gk, h0, dht,
+        cu_seqlens, chunk_indices, use_exp2, state_v_first,
+    )
+
+
+def npu_chunk_kda_bwd_finalize(
+        q: Tensor, k: Tensor, v: Tensor, gk: Tensor, raw_g: Tensor, beta: Tensor,
+        a_log: Tensor, dt_bias: Tensor, akk: Tensor, v_new: Tensor, h: Tensor, dh: Tensor,
+        dv_scan: Tensor, d_aqk: Tensor, dq_raw: Tensor, *, scale: float, lower_bound: float = -5.0,
+        chunk_size: int = 64, safe_gate: bool = True, use_gate_in_kernel: bool = True, use_exp2: bool = True,
+        state_v_first: bool = False, q_rstd: Optional[Tensor] = None, k_rstd: Optional[Tensor] = None,
+        cu_seqlens: _Metadata = None, chunk_indices: _Metadata = None,
+        use_beta_sigmoid_in_kernel: bool = False, allow_neg_eigval: bool = False,
+        output_layout: str = "BNSD") -> _StageOutputs:
+    """Finalize local input and parameter gradients in ``output_layout``."""
+    return _platform.custom_ops.npu_chunk_kda_bwd_finalize(
+        q, k, v, gk, raw_g, beta, a_log, dt_bias, akk, v_new, h, dh,
+        dv_scan, d_aqk, dq_raw, scale, lower_bound, chunk_size,
+        safe_gate, use_gate_in_kernel, use_exp2, state_v_first, q_rstd,
+        k_rstd, cu_seqlens, chunk_indices, use_beta_sigmoid_in_kernel,
+        allow_neg_eigval, output_layout,
+    )
+
+
+def npu_chunk_kda_merge_fwd_bwd(
+        state: Tensor, summaries: Tensor, pre_or_post_num_ranks: int, rank: int, *, forward: bool = True,
+        state_v_first: bool = False) -> Tensor:
+    """Merge summaries already gathered by the caller into the local state buffer."""
+    return _platform.custom_ops.npu_chunk_kda_merge_fwd_bwd(
+        state, summaries, pre_or_post_num_ranks, rank, forward, state_v_first,
     )

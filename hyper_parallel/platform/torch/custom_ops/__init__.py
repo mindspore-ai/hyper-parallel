@@ -135,3 +135,66 @@ class TorchCustomOps:
         raise NotImplementedError(
             "npu_chunk_kda is not supported on the PyTorch platform."
         )
+
+    @staticmethod
+    def npu_chunk_kda_fwd_prepare(*args: Any, **kwargs: Any) -> Any:
+        """Chunk KDA forward preparation; MindSpore Ascend only."""
+        raise NotImplementedError(
+            "npu_chunk_kda_fwd_prepare is not supported on the PyTorch platform."
+        )
+
+    @staticmethod
+    def npu_chunk_kda_pre_process_fwd(*args: Any, **kwargs: Any) -> Any:
+        """Chunk KDA forward preprocessing; MindSpore Ascend only."""
+        raise NotImplementedError(
+            "npu_chunk_kda_pre_process_fwd is not supported on the PyTorch platform."
+        )
+
+    @staticmethod
+    def npu_chunk_kda_fwd_h(*args: Any, **kwargs: Any) -> Any:
+        """Chunk KDA state scan; MindSpore Ascend only."""
+        raise NotImplementedError(
+            "npu_chunk_kda_fwd_h is not supported on the PyTorch platform."
+        )
+
+    @staticmethod
+    def npu_chunk_kda_fwd_finalize(*args: Any, **kwargs: Any) -> Any:
+        """Chunk KDA forward finalization; MindSpore Ascend only."""
+        raise NotImplementedError(
+            "npu_chunk_kda_fwd_finalize is not supported on the PyTorch platform."
+        )
+
+    @staticmethod
+    def npu_chunk_kda_bwd_prepare(*args: Any, **kwargs: Any) -> Any:
+        """Chunk KDA backward preparation; MindSpore Ascend only."""
+        raise NotImplementedError(
+            "npu_chunk_kda_bwd_prepare is not supported on the PyTorch platform."
+        )
+
+    @staticmethod
+    def npu_chunk_kda_pre_process_bwd(*args: Any, **kwargs: Any) -> Any:
+        """Chunk KDA backward preprocessing; MindSpore Ascend only."""
+        raise NotImplementedError(
+            "npu_chunk_kda_pre_process_bwd is not supported on the PyTorch platform."
+        )
+
+    @staticmethod
+    def npu_chunk_kda_bwd_dhu(*args: Any, **kwargs: Any) -> Any:
+        """Chunk KDA state-gradient scan; MindSpore Ascend only."""
+        raise NotImplementedError(
+            "npu_chunk_kda_bwd_dhu is not supported on the PyTorch platform."
+        )
+
+    @staticmethod
+    def npu_chunk_kda_bwd_finalize(*args: Any, **kwargs: Any) -> Any:
+        """Chunk KDA backward finalization; MindSpore Ascend only."""
+        raise NotImplementedError(
+            "npu_chunk_kda_bwd_finalize is not supported on the PyTorch platform."
+        )
+
+    @staticmethod
+    def npu_chunk_kda_merge_fwd_bwd(*args: Any, **kwargs: Any) -> Any:
+        """Chunk KDA forward/backward state merge; MindSpore Ascend only."""
+        raise NotImplementedError(
+            "npu_chunk_kda_merge_fwd_bwd is not supported on the PyTorch platform."
+        )
