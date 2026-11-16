@@ -208,6 +208,7 @@ class Muon(BaseDistributedOptimizer):
             ns_steps: int = 5,
             ns_variant: str = "asym5",
             hsdp_replica_count: Optional[Union[int, Tuple[int, ...]]] = None,
+            momentum_mode: str = "legacy",
             **advanced_options: Any,
     ) -> None:
         """Initialize Muon and build parameter-identity runtime caches.
@@ -231,8 +232,14 @@ class Muon(BaseDistributedOptimizer):
             zero_rms_scale_mode: Scaling behavior when matched AdamW RMS is zero.
             apply_lr_in_update: Whether the update callback applies the learning rate.
             hsdp_replica_count: Optional optimizer-state replica group size.
+            momentum_mode: Momentum formula, either "legacy" or "vanilla".
+                Both modes support distinct update and buffer coefficients.
         """
         advanced = _resolve_muon_advanced_options(advanced_options)
+        if momentum_mode not in ("legacy", "vanilla"):
+            raise ValueError(
+                f"momentum_mode must be 'legacy' or 'vanilla', got {momentum_mode!r}"
+            )
         if ns_variant not in ("legacy", "asym5", "custom"):
             raise ValueError(
                 f"ns_variant must be 'legacy', 'asym5', or 'custom', got {ns_variant!r}"
@@ -268,6 +275,7 @@ class Muon(BaseDistributedOptimizer):
         self.reshape_fn = advanced.reshape_fn
         self.zeropower_fn = advanced.zeropower_fn
         self.momentum_update_fn = advanced.momentum_update_fn
+        self._update_muon_momentum_mode = momentum_mode
         self.ns_transform_fn = advanced.ns_transform_fn
         self.post_update_fn = advanced.post_update_fn
         self.reset_optimizer_parameters()
@@ -530,18 +538,33 @@ class Muon(BaseDistributedOptimizer):
             param_updates = dict(zip(valid_params, custom_updates))
             return param_updates
 
-        # Match muon_update_core():
-        # m_for_update = grad + momentum1 * m_old
-        # m_new = grad + momentum2 * m_old
-        # pylint: disable=protected-access
-        local_us = torch._foreach_add(grads, bufs, alpha=momentum1)
+        if self._update_muon_momentum_mode == "vanilla":
+            # Match vanilla implementation in Muon paper & PyTorch implementation:
+            # m_for_update = (1 - momentum1) * grad + momentum1 * m_old
+            # m_new = (1 - momentum2) * grad + momentum2 * m_old
+            # Fold the Nesterov interpolation into one lerp with momentum1 squared.
+            # pylint: disable=protected-access
+            update_momentum = momentum1 ** 2 if group["nesterov"] else momentum1
+            local_us = torch._foreach_lerp(grads, bufs, weight=update_momentum)
+            torch._foreach_lerp_(bufs, grads, weight=1 - momentum2)
+        elif self._update_muon_momentum_mode == "legacy":
+            # Match muon_update_core():
+            # m_for_update = grad + momentum1 * m_old
+            # m_new = grad + momentum2 * m_old
+            # pylint: disable=protected-access
+            local_us = torch._foreach_add(grads, bufs, alpha=momentum1)
 
-        torch._foreach_mul_(bufs, momentum2)
-        torch._foreach_add_(bufs, grads)
+            torch._foreach_mul_(bufs, momentum2)
+            torch._foreach_add_(bufs, grads)
 
-        if group["nesterov"]:
-            torch._foreach_mul_(local_us, momentum1)
-            torch._foreach_add_(local_us, grads)
+            if group["nesterov"]:
+                torch._foreach_mul_(local_us, momentum1)
+                torch._foreach_add_(local_us, grads)
+        else:
+            raise ValueError(
+                "Muon._update_muon_momentum_mode must be 'vanilla' or 'legacy', "
+                f"got {self._update_muon_momentum_mode!r}"
+            )
 
         if local_us[0].dtype != torch.bfloat16:
             local_us = [update.to(torch.bfloat16) for update in local_us]
