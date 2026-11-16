@@ -76,6 +76,9 @@ from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.metrics import mean_global_loss
 from hyper_parallel.components.functional.aux_loss import aux_loss_scale_context, bind_aux_loss_scale
 from hyper_parallel.components.modules.moe_utils import MoEMonitorCallback
+from hyper_parallel.components.ops import ops
+from hyper_parallel.components.ops.catalog import builtin_registry
+from hyper_parallel.components.ops.factory import OpRuntime, bind_model_runtime
 from hyper_parallel.models._transformers.loss_parallel import causal_lm_loss_parallel
 from hyper_parallel.models._transformers.model_builder import _validate_optimize_dtype
 from hyper_parallel.models.external_state import get_model_external_state
@@ -380,6 +383,7 @@ class BaseTrainer(Stateful, ABC):
     def _build_model(self) -> None:
         """Build the model and derive Trainer-owned runtime state."""
         self.peft_config = self.config.peft
+        op_selections = getattr(self.config, "ops", {})
         self.model = self.config.model.build(
             distributed_setup=self.distributed_setup,
             peft_config=self.peft_config,
@@ -393,7 +397,15 @@ class BaseTrainer(Stateful, ABC):
             # The final dtype is applied inside the atomic build (05 stage-5
             # item 5); the Trainer no longer patches it afterwards.
             model_init_dtype=self.config.model_init_dtype,
+            op_selections=op_selections,
         )
+        self.op_runtime = getattr(self.model, "_hp_op_runtime", None)
+        if not isinstance(self.op_runtime, OpRuntime) and getattr(self, "device", None) is not None:
+            self.op_runtime = ops.configure(
+                registry=builtin_registry, selections=op_selections, target_device=self.device,
+            )
+            bind_model_runtime(self.model, self.op_runtime)
+        self._last_op_report = {}
         _validate_optimize_dtype(
             self.model,
             fp32_main_params=self.config.optimizer.fp32_main_params,
@@ -853,7 +865,9 @@ class BaseTrainer(Stateful, ABC):
             if channel_loss_callback is not None
             else nullcontext()
         )
-        with micro_step_context, aux_loss_scale_context():
+        runtime = getattr(self, "op_runtime", None)
+        op_context = runtime.activate() if isinstance(runtime, OpRuntime) else nullcontext()
+        with op_context, micro_step_context, aux_loss_scale_context():
             micro_batch = self.preforward(micro_batch)
             # TextTrainer passes loss-only fields separately. Keep the legacy
             # BaseTrainer/VLM one-dictionary call contract working as well.
@@ -928,6 +942,11 @@ class BaseTrainer(Stateful, ABC):
             if callable(prefetch):
                 prefetch()  # pylint: disable=not-callable  # Guarded dynamic hook.
 
+            if isinstance(runtime, OpRuntime) and self.global_rank == 0:
+                report = runtime.report()
+                if report != self._last_op_report:
+                    logger.info("HyperOps on %s: %s", self.device, report)
+                    self._last_op_report = report
             del micro_batch
             return loss, loss_dict
 

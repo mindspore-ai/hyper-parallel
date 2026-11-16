@@ -25,6 +25,7 @@ from torch.utils._pytree import tree_flatten, tree_unflatten
 
 from hyper_parallel.compile.tracer.graph_tracer import trace_model_graph, run_traced_graph
 from hyper_parallel.components.modules import shared_compressed_dsa_attention as attention
+from hyper_parallel.components.ops import _dsa_layout
 from hyper_parallel.models.deepseek_v41.adapter.data.runtime import DeepseekV41Runtime
 from hyper_parallel.models.deepseek_v41.adapter.aux_loss import sequence_load_balancing_loss
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
@@ -260,12 +261,12 @@ class TestCompressionGraphInputs(unittest.TestCase):
                     packed = _inputs(boundaries, graph=False)["packed_seq_params"]
                     prepared = packed.prepare(device, (ratio,))
                     query = torch.zeros(1, boundaries[-1], 1, 4)
-                    segment_upper, lower = attention._causal_key_bounds(  # pylint: disable=protected-access
+                    segment_upper, lower = _dsa_layout._causal_key_bounds(  # pylint: disable=protected-access
                         query, ratio, 0,
                         prepared.minimum_key_indices(device, ratio),
                         prepared.indexer_segments(ratio),
                     )
-                    tensor_upper, tensor_lower = attention._causal_key_bounds(  # pylint: disable=protected-access
+                    tensor_upper, tensor_lower = _dsa_layout._causal_key_bounds(  # pylint: disable=protected-access
                         query, ratio, 0,
                         prepared.minimum_key_indices(device, ratio),
                         None,

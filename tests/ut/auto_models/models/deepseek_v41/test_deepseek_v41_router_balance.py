@@ -67,9 +67,9 @@ class TestModalityRouterBalance(unittest.TestCase):
         mesh.__getitem__ = Mock(return_value=dp)
         images = torch.tensor([[False, True, False, True]])
 
-        def dispatch(target, states, *, router_fn, ep_group):
+        def dispatch(target, states, *, router_fn, ep_group, use_fused_moe_token_permute_and_unpermute):
             """Consume the real routing weights without expert communication."""
-            del ep_group
+            del ep_group, use_fused_moe_token_permute_and_unpermute
             _, weights = router_fn(target, states)
             return weights.sum(-1).reshape(*states.shape[:-1], 1).expand_as(states)
 
@@ -256,9 +256,9 @@ class TestModalityRouterBalance(unittest.TestCase):
         images = torch.tensor([[False, False, True, False]])
         valid = torch.tensor([[True, False, True, True]])
 
-        def dispatch(target, states, *, router_fn, ep_group):
+        def dispatch(target, states, *, router_fn, ep_group, use_fused_moe_token_permute_and_unpermute):
             """Exercise the real gate call without expert communication."""
-            del ep_group
+            del ep_group, use_fused_moe_token_permute_and_unpermute
             router_fn(target, states)
             return torch.zeros_like(states)
 

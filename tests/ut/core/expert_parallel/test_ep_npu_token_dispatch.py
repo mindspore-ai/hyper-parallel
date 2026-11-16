@@ -23,6 +23,9 @@ import pytest
 import torch
 from torch import nn
 
+from hyper_parallel.components.ops.catalog import builtin_registry
+from hyper_parallel.components.ops.factory import OpRuntime
+from hyper_parallel.components.ops.registry import OpBuildContext
 from hyper_parallel.distributed.expert_parallel import experts as ep_experts
 
 
@@ -121,7 +124,7 @@ def test_token_dispatch_preserves_local_expert_forward():
 
 
 @pytest.mark.parametrize("token_dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("enabled", [None, False])
+@pytest.mark.parametrize("enabled", [None, False, "auto", "native"])
 def test_npu_ep_dispatcher_matches_reference(monkeypatch, token_dtype, enabled):
     """Preserve FP32 routing weights and weighted Top-K forward/backward semantics."""
     permute = Mock(side_effect=_reference_token_permute)
@@ -137,10 +140,14 @@ def test_npu_ep_dispatcher_matches_reference(monkeypatch, token_dtype, enabled):
         order: torch.Tensor,
         probabilities: torch.Tensor,
     ) -> torch.Tensor:
-        """Match the NPU output dtype without rounding the router probabilities."""
-        assert probabilities is topk_weights, (
-            f"Expected original routing weights ({topk_weights.dtype}), got {probabilities.dtype}"
-        )
+        """Check the legacy and HyperOps inputs at the fused kernel boundary."""
+        if enabled == "auto":
+            torch.testing.assert_close(probabilities, topk_weights.to(states.dtype).to(topk_weights.dtype))
+            probabilities = probabilities.to(states.dtype)
+        else:
+            assert probabilities is topk_weights, (
+                f"Expected original routing weights ({topk_weights.dtype}), got {probabilities.dtype}"
+            )
         return _reference_token_unpermute(states, order, probabilities).to(states.dtype)
 
     unpermute = Mock(side_effect=checked_unpermute)
@@ -149,6 +156,9 @@ def test_npu_ep_dispatcher_matches_reference(monkeypatch, token_dtype, enabled):
         "hyper_parallel.components.functional.moe_token_unpermute",
         SimpleNamespace(moe_token_unpermute=unpermute),
     )
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(
+        npu_moe_token_permute=permute, npu_moe_token_unpermute=unpermute,
+    ))
     monkeypatch.setattr(ep_experts.dist, "get_rank", lambda group: 0)
 
     monkeypatch.setattr(ep_experts, "ep_exchange_counts", lambda counts, group: counts)
@@ -169,20 +179,32 @@ def test_npu_ep_dispatcher_matches_reference(monkeypatch, token_dtype, enabled):
     )
     module = SimpleNamespace(experts=_ExpertMajorExperts(num_experts=3))
 
-    options = {} if enabled is None else {"use_fused_moe_token_permute_and_unpermute": enabled}
-    output = ep_experts.ep_routed_forward(
-        module,
-        hidden_states,
-        router_fn=lambda owner, states: (topk_indices, topk_weights),
-        ep_group=_SingleRankGroup(),
-        **options,
-    )
-    if enabled is False:
+    options = {} if enabled is None else {
+        "use_fused_moe_token_permute_and_unpermute": False if enabled is False else None,
+    }
+    selections = {"moe_token_reorder": enabled} if isinstance(enabled, str) else {}
+    runtime = OpRuntime(builtin_registry, selections, OpBuildContext(_MockNpuDevice("cpu"), None, {}))
+    with runtime.activate():
+        output = ep_experts.ep_routed_forward(
+            module,
+            hidden_states,
+            router_fn=lambda owner, states: (topk_indices, topk_weights),
+            ep_group=_SingleRankGroup(),
+            **options,
+        )
+    fused = enabled in (None, "auto")
+    if not fused:
         permute.assert_not_called()
         unpermute.assert_not_called()
     else:
         permute.assert_called_once()
         unpermute.assert_called_once()
+    if isinstance(enabled, str):
+        selected = "torch_npu" if fused else "native"
+        assert runtime.report() == {
+            ("moe_token_reorder", "standard"): selected,
+            ("moe_token_reorder", "weighted_restore"): selected,
+        }
 
     scales = topk_indices.to(hidden_states.dtype) + 1
     reference_states = hidden_states.detach().clone().requires_grad_()

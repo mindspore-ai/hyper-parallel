@@ -24,6 +24,7 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel.components.modules.engram import local_token_mask
+from hyper_parallel.components.ops import grouped_matmul
 from hyper_parallel.distributed.expert_parallel.experts import (
     bind_local_expert_forward,
     ep_routed_forward,
@@ -50,36 +51,19 @@ def _deepseek_v41_grouped_expert_forward(
     """Run FP32 clamped SwiGLU between two grouped GEMMs.
 
     The generic EP path has already sorted ``hidden_states`` into expert-major
-    order. Routed and shared experts reuse the native FP32 clamp and SwiGLU
-    implementation. Nonpositive limits disable clamping; the down projection
+    order. Routed and shared experts use the same FP32 SwiGLU contract.
+    Nonpositive limits disable clamping; the down projection
     still receives the original hidden-state dtype.
     """
-    # The shared primitive imports optional torch_npu; keep CPU/GPU imports lazy.
-    from hyper_parallel.components.functional import grouped_matmul  # pylint: disable=C0415
-
     group_list = torch.cumsum(
         tokens_per_expert.to(device=hidden_states.device, dtype=torch.int64),
         dim=0,
     )
-    gate_up = grouped_matmul(  # pylint: disable=not-callable
-        hidden_states,
-        experts.gate_up_proj.transpose(1, 2),
-        bias=None,
-        group_list=group_list,
-        group_type=0,
-        group_list_type=0,
-    )
+    gate_up = grouped_matmul(hidden_states, experts.gate_up_proj.transpose(1, 2), group_list)
     # Cast the packed projections once; the shared helper's casts are then no-ops.
     gate, up = gate_up.float().chunk(2, dim=-1)
     intermediate = deepseek_v41_swiglu(gate, up, experts.limit)
-    return grouped_matmul(  # pylint: disable=not-callable
-        intermediate.to(hidden_states.dtype),
-        experts.down_proj.transpose(1, 2),
-        bias=None,
-        group_list=group_list,
-        group_type=0,
-        group_list_type=0,
-    )
+    return grouped_matmul(intermediate.to(hidden_states.dtype), experts.down_proj.transpose(1, 2), group_list)
 
 
 def _local_router_metadata(tensor: torch.Tensor | None, states: torch.Tensor, tp_mesh: Any) -> torch.Tensor | None:
@@ -151,6 +135,7 @@ def _routed_and_shared_forward(
     routed = ep_routed_forward(
         module, hidden_states,
         router_fn=_resolve_router(router_fn, ep_size=ep_size, fix_router=fix_router), ep_group=ep_group,
+        use_fused_moe_token_permute_and_unpermute=None,
     )
     return routed + module.shared_experts(hidden_states)
 

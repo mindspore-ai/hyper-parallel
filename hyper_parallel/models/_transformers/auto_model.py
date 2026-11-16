@@ -19,6 +19,7 @@ Stub — provides from_pretrained/from_config as entry points.
 """
 
 import logging
+from collections.abc import Mapping
 from typing import Any, Literal, Optional, Union
 
 import torch
@@ -32,6 +33,9 @@ from transformers import (
 
 from hyper_parallel.components.checkpoint.huggingface_checkpointer import resolve_hf_loader
 from hyper_parallel.components.checkpoint.weight_verifier import verify_hf_weights as check_hf_weights
+from hyper_parallel.components.ops import ops
+from hyper_parallel.components.ops.catalog import builtin_registry
+from hyper_parallel.components.ops.factory import bind_model_runtime
 from hyper_parallel.models._transformers.model_builder import (
     _init_model,
     apply_model_infrastructure,
@@ -237,6 +241,7 @@ class _BaseHyperAutoModelClass:
         config_overrides: Optional[dict[str, Any]] = None,
         load_base_model: bool = True,
         verify_hf_weights: Optional[str] = None,
+        op_selections: Optional[Mapping[str, str]] = None,
         **kwargs: Any,
     ) -> PreTrainedModel:
         """HF-compatible from_pretrained entry point.
@@ -249,6 +254,7 @@ class _BaseHyperAutoModelClass:
             *model_args: Positional arguments for model construction.
             verify_hf_weights: Optional report directory for checking all loaded shards
                 against a local HF checkpoint before the first forward. All ranks must opt in.
+            op_selections: Optional HyperOps family selections for this model.
             **kwargs: Additional model construction and HF configuration arguments.
 
         Returns:
@@ -299,6 +305,7 @@ class _BaseHyperAutoModelClass:
             allow_cache_entry_mutation=allow_cache_entry_mutation,
             activation_swap=activation_swap,
             model_init_dtype=model_init_dtype,
+            op_selections=op_selections,
             **kwargs,
         )
         if verify_hf_weights is not None:
@@ -326,6 +333,7 @@ class _BaseHyperAutoModelClass:
         allow_cache_entry_mutation: bool = False,
         activation_swap: str = "none",
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
+        op_selections: Optional[Mapping[str, str]] = None,
         **kwargs: Any,
     ) -> PreTrainedModel:
         """Build model from PretrainedConfig (no weight loading).
@@ -369,6 +377,7 @@ class _BaseHyperAutoModelClass:
             allow_cache_entry_mutation=allow_cache_entry_mutation,
             activation_swap=activation_swap,
             model_init_dtype=model_init_dtype,
+            op_selections=op_selections,
             **kwargs,
         )
 
@@ -398,6 +407,7 @@ class _BaseHyperAutoModelClass:
         allow_cache_entry_mutation: bool = False,
         activation_swap: str = "none",
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
+        op_selections: Optional[Mapping[str, str]] = None,
         **kwargs,
     ) -> PreTrainedModel:
         """Core model building orchestration.
@@ -422,6 +432,16 @@ class _BaseHyperAutoModelClass:
         model_factory, module_context = _resolve_module_construction(
             kwargs, hf_config, distributed_setup, model_init_dtype or torch_dtype,
         )
+        runtime = None
+        if op_selections is not None:
+            dtype_name = module_context.get("dtype")
+            runtime = ops.configure(
+                registry=builtin_registry,
+                selections=op_selections,
+                target_device=_current_device(),
+                dtype=getattr(torch, dtype_name, None) if dtype_name else None,
+                parallel={key: module_context[key] for key in ("tp_size", "cp_size", "ep_size", "pp_size")},
+            )
         init_ctx = _model_init_context(is_meta_device)
 
         # Step 2: Config-first construction defers pretrained I/O until after sharding.
@@ -472,6 +492,8 @@ class _BaseHyperAutoModelClass:
             model_init_dtype=model_init_dtype,
         )
 
+        if runtime is not None:
+            bind_model_runtime(model, runtime)
         model.train()
         return model
 

@@ -32,11 +32,10 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.components.modules.family import ModuleFamily, SelectorSpec, VariantRule, register_module_family
 from hyper_parallel.components.functional import (
-    grouped_matmul,
     moe_token_permute,
     moe_token_unpermute,
-    swiglu,
 )
+from hyper_parallel.components.ops import grouped_matmul, swiglu
 
 
 @module_replacement
@@ -390,7 +389,7 @@ class GroupedExperts(nn.Module):
     def _grouped_gemm_expert_forward(
         self, gate_up_proj, down_proj, permuted, tokens_per_expert, permuted_probs
     ):
-        """GroupGemm expert computation (NPU-only)."""
+        """Run expert-major projections through the selected grouped GEMM."""
         self._tokens_per_expert_gmm = tokens_per_expert.to(device=permuted.device)
         self._group_list = self._tokens_per_expert_gmm.cumsum(dim=0)
 
@@ -400,9 +399,7 @@ class GroupedExperts(nn.Module):
         # up
         numel = permuted.nelement()
         if torch.compiler.is_compiling() or not isinstance(numel, int) or numel != 0:
-            fc1_output = grouped_matmul(  # pylint: disable=not-callable
-                permuted, gate_up_proj, bias=None, group_list=self._group_list, group_type=0, group_list_type=0,
-            )
+            fc1_output = grouped_matmul(permuted, gate_up_proj, self._group_list)
             if self.add_bias:
                 b1 = self.bias1.view(self.num_local_experts, -1)
                 fc1_output = fc1_output + torch.repeat_interleave(b1, self._tokens_per_expert_gmm, dim=0)
@@ -424,9 +421,7 @@ class GroupedExperts(nn.Module):
 
         numel = fc1_output.nelement()
         if torch.compiler.is_compiling() or not isinstance(numel, int) or numel != 0:
-            fc2_output = grouped_matmul(  # pylint: disable=not-callable
-                fc1_output, down_proj, bias=None, group_list=self._group_list, group_type=0, group_list_type=0,
-            )
+            fc2_output = grouped_matmul(fc1_output, down_proj, self._group_list)
             if self.add_bias:
                 b2 = self.bias2.view(self.num_local_experts, -1)
                 fc2_output = fc2_output + torch.repeat_interleave(

@@ -43,6 +43,9 @@ from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41TopKRouter,
 )
 from hyper_parallel.models.deepseek_v41.vision import DeepseekV41VisionTower, _vision_attention
+from hyper_parallel.components.ops.catalog import builtin_registry
+from hyper_parallel.components.ops.factory import OpRuntime
+from hyper_parallel.components.ops.registry import OpBuildContext
 
 
 def _vision_model() -> nn.Module:
@@ -204,9 +207,12 @@ class TestVisionAttention(unittest.TestCase):
         ).transpose(0, 1)
         native = Mock(side_effect=lambda q, k, v, *_args, **_kwargs: (_attention_oracle(q, k, v),))
         extension = SimpleNamespace(npu_fusion_attention=native)
+        runtime = OpRuntime(builtin_registry, {"attention": "torch_npu"}, OpBuildContext(
+            SimpleNamespace(type="npu"), None, {},
+        ))
         with (
             patch.dict(sys.modules, {"torch_npu": extension}),
-            patch.object(torch.Tensor, "device", property(lambda _tensor: SimpleNamespace(type="npu"))),
+            runtime.activate(),
         ):
             actual = _vision_attention(nn.Module(), query, key, value, key_length=3)
         torch.testing.assert_close(actual, expected)

@@ -18,12 +18,6 @@ from typing import Any, Tuple
 
 import torch
 
-try:
-    import omni_training_custom_ops  # noqa: F401  # pylint: disable=unused-import
-except ImportError:
-    omni_training_custom_ops = None
-
-
 class _Sinkhorn(torch.autograd.Function):
     """Autograd bridge for the NPU Sinkhorn custom operator."""
 
@@ -35,8 +29,9 @@ class _Sinkhorn(torch.autograd.Function):
         eps: float = 1e-6,
     ) -> torch.Tensor:
         """Run the NPU Sinkhorn forward operator."""
-        if omni_training_custom_ops is None:
-            raise ImportError("NPU Sinkhorn requires omni_training_custom_ops")
+        # Importing the optional package registers the native operators.
+        import omni_training_custom_ops  # noqa: F401  # pylint: disable=unused-import,import-outside-toplevel
+
         output, norm_out, sum_out = torch.ops.custom.npu_sinkhorn(
             h_res,
             out_flag=1,

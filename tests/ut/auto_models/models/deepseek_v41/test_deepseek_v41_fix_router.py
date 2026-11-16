@@ -341,9 +341,10 @@ replace:
                 *,
                 router_fn: Callable,
                 ep_group: object,
+                use_fused_moe_token_permute_and_unpermute: bool | None,
         ) -> torch.Tensor:
             """Keep native routing weights observable after mask slicing."""
-            del ep_group
+            del ep_group, use_fused_moe_token_permute_and_unpermute
             return router_fn(target, hidden)[1].sum() * hidden
 
         for tp_rank, fixed in product((0, 1), (False, True)):
@@ -400,9 +401,10 @@ replace:
                 *,
                 router_fn: Callable,
                 ep_group: object,
+                use_fused_moe_token_permute_and_unpermute: bool | None,
         ) -> torch.Tensor:
             """Make routed output depend on both expert identities and gate weights."""
-            del ep_group
+            del ep_group, use_fused_moe_token_permute_and_unpermute
             indices, weights = router_fn(target, inputs)
             return execute(inputs, indices, weights)
 

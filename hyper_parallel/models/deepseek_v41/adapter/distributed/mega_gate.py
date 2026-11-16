@@ -23,11 +23,12 @@ import torch
 from torch import nn
 
 from hyper_multicore.modules.mega_gate import MegaGate
+
+from hyper_parallel.components.ops import router_scores
 from hyper_parallel.models.deepseek_v41.adapter.aux_loss import update_modality_bias
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41TopKRouter,
     _apply_router_training_state,
-    _router_scores,
 )
 from hyper_parallel.models.materialization import register_rebuildable_buffer
 from hyper_parallel.models.replacement import module_replacement
@@ -116,7 +117,7 @@ class DeepseekV41MegaGate(MegaGate):
         logits, weights, indices = super().forward(hidden_states, image_mask=image_mask)
         scores = None
         if self.training and self.aux_loss_coeff:
-            scores = _router_scores(logits, self.scoring_func)
+            scores = router_scores(logits, self.scoring_func)
         weights = _apply_router_training_state(
             self,
             hidden_states,

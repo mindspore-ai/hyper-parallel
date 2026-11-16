@@ -43,6 +43,8 @@ from typing import Any, Callable, Optional, Tuple
 
 import torch
 
+from hyper_parallel.components.ops.factory import capture_op_runtime
+
 from .policy import CheckpointPolicy
 from .recompute_state import create_recompute_contexts
 
@@ -456,13 +458,16 @@ def checkpoint(
         raise ValueError(f"early_stop must be bool, but got {type(early_stop).__name__}.")
     if not isinstance(use_reentrant, bool):
         raise ValueError("use_reentrant must be bool")
+    compiling = is_compiling()
+    if not compiling:
+        function = capture_op_runtime(function)
     if use_reentrant:
         _validate_reentrant_options(
             swap_inputs, policy_fn, group_swap, cpu_pool, early_stop, kwargs
         )
         return _checkpoint_reentrant(function, args, context_fn, kwargs)
 
-    if is_compiling():
+    if compiling:
         _validate_compile_checkpoint_options(
             swap_inputs, group_swap, cpu_pool, context_fn, kwargs.get("use_reentrant", False)
         )
