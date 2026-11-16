@@ -19,8 +19,10 @@
 """
 from typing import Any
 
+import hyper_parallel.platform.mindspore.custom_ops.custom_op_impl as _custom_op_impl
 from hyper_parallel.platform.mindspore.custom_ops.custom_op_impl import (
     NpuChunkKdaDFunction,
+    run_chunk_kda_stages,
     NpuFlashAttentionVarLenV4DFunction,
     NpuDenseLightningIndexerGradKlLossDFunction,
     NpuDenseLightningIndexerSoftmaxLseDFunction,
@@ -36,6 +38,19 @@ from hyper_parallel.platform.mindspore.custom_ops.custom_op_impl import (
     NpuSparseLightningIndexerKlLossGradDFunction,
     npu_sparse_flash_mla_grad as _npu_sparse_flash_mla_grad,
 )
+
+
+def _prepare_chunk_kda_stage_args(args, require_contiguous_state=False):
+    """Make stage tensor arguments contiguous while preserving in-place state updates."""
+    import mindspore as ms  # pylint: disable=C0415
+    values = list(args)
+    if require_contiguous_state and not values[0].is_contiguous():
+        raise ValueError("state must be contiguous because merge updates it in place.")
+    return [value.contiguous() if isinstance(value, ms.Tensor) else value for value in values]
+
+
+def _chunk_kda_optional_stage_outputs(outputs):
+    return tuple(None if tuple(tensor.shape) == (0,) else tensor for tensor in outputs)
 
 
 class MindSporeCustomOps:
@@ -114,4 +129,121 @@ class MindSporeCustomOps:
     @staticmethod
     def npu_chunk_kda(*args, **kwargs):
         """Run differentiable Chunk KDA with automatic backward dispatch."""
-        return NpuChunkKdaDFunction.apply(*args, **kwargs)
+        initial_state, disable_recompute, state_v_first = args[21:] if len(args) > 21 else (None, True, False)
+        # Reuse the state-capable stage chain for its paired safe-gate ABI.
+        # The legacy fused backward produces nonfinite gradients for the MF
+        # Ulysses workload; the stage chain also covers ordinary no-state loss.
+        paired_stages = args[9] and args[11] and args[20] and args[12] is not None
+        if paired_stages or initial_state is not None or not disable_recompute or state_v_first:
+            names = ("layout", "output_final_state", "safe_gate", "lower_bound", "use_gate_in_kernel",
+                     "a_log", "dt_bias", "cu_seqlens", "chunk_indices", "epsilon", "use_qk_l2norm_in_kernel",
+                     "use_beta_sigmoid_in_kernel", "allow_neg_eigval", "use_exp2")
+            options = dict(zip(names, args[7:21]))
+            options.update(initial_state=initial_state, disable_recompute=disable_recompute,
+                           state_v_first=state_v_first)
+            return run_chunk_kda_stages(*args[:7], **options)
+        return NpuChunkKdaDFunction.apply(*args[:21], **kwargs)
+
+    @staticmethod
+    def npu_chunk_kda_fwd_prepare(*args: Any) -> Any:
+        """Prepare local head-major KDA caches without automatic backward."""
+        values = list(args)
+        if values[11] is None:
+            values[11] = _custom_op_impl._canonical_chunk_indices(  # pylint: disable=protected-access
+                values[10], values[6],
+            )
+        values = _prepare_chunk_kda_stage_args(values)
+        outputs = _custom_op_impl._custom_ops.npu_chunk_kda_fwd_prepare(*values)  # pylint: disable=protected-access
+        return _chunk_kda_optional_stage_outputs(outputs)
+
+    @staticmethod
+    def npu_chunk_kda_pre_process_fwd(*args: Any) -> Any:
+        """Build local forward affine summaries."""
+        values = list(args)
+        if values[4] is None:
+            if len(values[0].shape) != 4:
+                raise ValueError("Dense forward preprocess expects k in [B, H, T, K] layout.")
+            batch, _, tokens, _ = values[0].shape
+            values[4] = [index * tokens for index in range(batch + 1)]
+            # FLA requires B=1; concatenate dense sequences along the token axis.
+            if batch > 1:
+                for index in range(4):
+                    tensor = values[index]
+                    if tensor is None:
+                        continue
+                    if len(tensor.shape) != 4 or tensor.shape[0] != batch or tensor.shape[2] != tokens:
+                        raise ValueError("Dense forward preprocess inputs must share batch and token dimensions.")
+                    values[index] = tensor.transpose(1, 0, 2, 3).reshape(
+                        1, tensor.shape[1], batch * tokens, tensor.shape[3],
+                    )
+        values = _prepare_chunk_kda_stage_args(values)
+        output = _custom_op_impl._custom_ops.npu_chunk_kda_pre_process_fwd(*values)  # pylint: disable=protected-access
+        return (output,)
+
+    @staticmethod
+    def npu_chunk_kda_fwd_h(*args: Any) -> Any:
+        """Propagate local states from caller-supplied boundary states."""
+        values = list(args)
+        if values[8] is None:
+            values[8] = _custom_op_impl._canonical_chunk_indices(  # pylint: disable=protected-access
+                values[7], values[6],
+            )
+        values = _prepare_chunk_kda_stage_args(values)
+        outputs = _custom_op_impl._custom_ops.npu_chunk_kda_fwd_h(*values)  # pylint: disable=protected-access
+        return _chunk_kda_optional_stage_outputs(outputs)
+
+    @staticmethod
+    def npu_chunk_kda_fwd_finalize(*args: Any) -> Any:
+        """Finalize local attention output."""
+        values = _prepare_chunk_kda_stage_args(args)
+        return _custom_op_impl._custom_ops.npu_chunk_kda_fwd_finalize(*values)  # pylint: disable=protected-access
+
+    @staticmethod
+    def npu_chunk_kda_bwd_prepare(*args: Any) -> Any:
+        """Prepare local block gradients."""
+        values = list(args)
+        if values[9] is None:
+            values[9] = _custom_op_impl._canonical_chunk_indices(  # pylint: disable=protected-access
+                values[8], values[6],
+            )
+        values = _prepare_chunk_kda_stage_args(values)
+        outputs = _custom_op_impl._custom_ops.npu_chunk_kda_bwd_prepare(*values)  # pylint: disable=protected-access
+        return _chunk_kda_optional_stage_outputs(outputs)
+
+    @staticmethod
+    def npu_chunk_kda_pre_process_bwd(*args: Any) -> Any:
+        """Build local backward affine summaries."""
+        values = _prepare_chunk_kda_stage_args(args)
+        if values[7] is not None and values[7].dtype != values[0].dtype:
+            values[7] = values[7].astype(values[0].dtype)
+        return _custom_op_impl._custom_ops.npu_chunk_kda_pre_process_bwd(*values)  # pylint: disable=protected-access
+
+    @staticmethod
+    def npu_chunk_kda_bwd_dhu(*args: Any) -> Any:
+        """Propagate state gradients from caller-supplied dht."""
+        values = list(args)
+        if values[11] is None:
+            values[11] = _custom_op_impl._canonical_chunk_indices(  # pylint: disable=protected-access
+                values[10], values[6],
+            )
+        values = _prepare_chunk_kda_stage_args(values)
+        outputs = _custom_op_impl._custom_ops.npu_chunk_kda_bwd_dhu(*values)  # pylint: disable=protected-access
+        return _chunk_kda_optional_stage_outputs(outputs)
+
+    @staticmethod
+    def npu_chunk_kda_bwd_finalize(*args: Any) -> Any:
+        """Finalize local input and parameter gradients."""
+        values = list(args)
+        if values[25] is None:
+            values[25] = _custom_op_impl._canonical_chunk_indices(  # pylint: disable=protected-access
+                values[24], values[17],
+            )
+        values = _prepare_chunk_kda_stage_args(values)
+        outputs = _custom_op_impl._custom_ops.npu_chunk_kda_bwd_finalize(*values)  # pylint: disable=protected-access
+        return _chunk_kda_optional_stage_outputs(outputs)
+
+    @staticmethod
+    def npu_chunk_kda_merge_fwd_bwd(*args: Any) -> Any:
+        """Merge already gathered summaries into a local state buffer."""
+        values = _prepare_chunk_kda_stage_args(args, require_contiguous_state=True)
+        return _custom_op_impl._custom_ops.npu_chunk_kda_merge_fwd_bwd(*values)  # pylint: disable=protected-access
