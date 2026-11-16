@@ -28,6 +28,7 @@ from hyper_parallel.data.batching.runtime_input import (
     RuntimeInputAdapter,
 )
 from hyper_parallel.data.constants import (
+    IGNORE_INDEX,
     OMNI_CP_TOKEN_FIELDS,
     OMNI_INTERNAL_FIELDS,
     OMNI_LOSS_INPUT_FIELDS,
@@ -43,6 +44,26 @@ from hyper_parallel.data.parallel import (
 )
 
 logger = get_dataset_logger(__name__)
+
+
+def _apply_loss_mask(
+        labels: torch.Tensor,
+        loss_mask: torch.Tensor,
+        *,
+        dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Copy targets, excluding zeros in a same-shape mask in label coordinates.
+
+    Nonzero entries include targets; they are not fractional loss weights.
+    For example, labels=[1, 2, 3] with loss_mask=[1, 0, 1] yields [1, -100, 3].
+    Text requests int64 before masking so IGNORE_INDEX also survives source
+    labels with an unsigned dtype. Omni retains its model-owned target dtype.
+    """
+    if (not isinstance(labels, torch.Tensor) or not isinstance(loss_mask, torch.Tensor)
+            or loss_mask.shape != labels.shape):
+        raise ValueError("loss_mask must be a Tensor with the same shape as labels")
+    masked_labels = labels.to(dtype=dtype or labels.dtype, copy=True)
+    return masked_labels.masked_fill_(loss_mask.eq(0), IGNORE_INDEX)
 
 
 class OmniParallelBatch:
@@ -143,7 +164,11 @@ class OmniParallelBatch:
 
     @staticmethod
     def _normalize_source_batch(source_batch: Mapping[str, Any]) -> dict[str, Any]:
-        """Validate required fields and derive the default loss mask."""
+        """Validate fields and make explicit loss masks part of the targets.
+
+        Zero excludes a target and any nonzero value includes it; these masks
+        do not represent fractional loss weights.
+        """
         batch = dict(source_batch)
         if "input_ids" not in batch:
             raise ValueError("Omni batch must contain input_ids")
@@ -151,8 +176,14 @@ class OmniParallelBatch:
         if "labels" not in batch:
             raise ValueError("Omni batch must contain labels")
 
-        if "loss_mask" not in batch:
+        loss_mask = batch.get("loss_mask")
+        if loss_mask is None:
             batch["loss_mask"] = batch["labels"] >= 0
+        else:
+            # Apply explicit supervision once on the source, before CP/TP transport
+            # (e.g. labels=[1, 2, 3], loss_mask=[1, 0, 1] -> [1, -100, 3]) so default
+            # model CE and token counting share identical targets.
+            batch["labels"] = _apply_loss_mask(batch["labels"], loss_mask)
         if "cu_seq_lens" in batch:
             batch["cu_seq_lens"] = batch["cu_seq_lens"].reshape(-1)
         return batch
@@ -231,7 +262,8 @@ class TextParallelBatch:
             sliding_window: Sliding-window size, or ``None`` for full attention.
             reset_position_ids: Whether positions restart at sequence boundaries.
             reset_attention_mask: Whether EOD starts an independent attention sequence.
-            eod_mask_loss: Whether EOD tokens are excluded from the loss.
+            eod_mask_loss: Whether predictions made from an EOD context are excluded
+                from the loss. Requires a non-None ``tokenizer.eod`` when enabled.
             runtime_input_adapter: Optional model-owned forward-input extension.
             dataloader_context: Shared ownership and transport policy from the Trainer.
         """
@@ -268,6 +300,8 @@ class TextParallelBatch:
         )
         self.eod_mask_loss = eod_mask_loss or bool(self.data_config.get("eod_mask_loss", False))
         self._validate_attention_inputs(attention_mode, create_attention_mask)
+        if self.eod_mask_loss and getattr(self.tokenizer, "eod", None) is None:
+            raise ValueError("eod_mask_loss=True requires tokenizer.eod to be set")
         self.cp_sharder = CPBatchSharder(self.parallel_context)
         self.tp_broadcaster = TPBatchBroadcaster(self.parallel_context, device)
 
@@ -410,13 +444,24 @@ class TextParallelBatch:
             self._batch_flow_logged = True
 
     def _read_source_batch(self, data_iterator: Any) -> Mapping[str, Any] | None:
-        """Advance the source only on ranks selected by the shared context."""
-        if self.parallel_context.build_on_rank():
-            source_batch = next(data_iterator)
-        else:
-            source_batch = None
+        """Read on source owners and fold optional masks before CP/TP transport.
 
-        return source_batch
+        Source masks share the source labels' coordinates. The later causal
+        alignment and EOD exclusions still follow ``labels_are_shifted``.
+        """
+        if not self.parallel_context.build_on_rank():
+            return None
+        source_batch = next(data_iterator)
+        if not isinstance(source_batch, Mapping):
+            raise TypeError("Text DataLoader must yield a mapping batch")
+        if source_batch.get("loss_mask") is None:
+            return source_batch
+        # CPBatchSharder forwards only input_ids and labels in Text mode. Fold
+        # source loss_mask before sharding (e.g. labels=[20, 30, 0, 0] with
+        # loss_mask=[1, 1, 0, 0] -> [20, 30, -100, -100], not 4 valid tokens).
+        batch = dict(source_batch)
+        batch["labels"] = _apply_loss_mask(batch["labels"], batch["loss_mask"], dtype=torch.int64)
+        return batch
 
     def _resolve_sequence_boundaries(
             self,
@@ -477,12 +522,21 @@ class TextParallelBatch:
         return local_position_ids
 
     def _build_loss_mask(self, parallel_batch: Mapping[str, Any]) -> Any:
-        """Build the local loss mask from labels and input IDs."""
+        """Build the local loss mask in the same coordinates as the labels."""
         loss_mask = (parallel_batch["labels"] >= 0).to(dtype=torch.int64)
 
         if self.eod_mask_loss:
             eod_token_id = getattr(self.tokenizer, "eod", None)
-            loss_mask = loss_mask.masked_fill(parallel_batch["input_ids"] == eod_token_id, 0)
+            input_ids = parallel_batch["input_ids"]
+            target_mask = loss_mask
+            # Exclude predictions made from an EOD context (e.g. input=[10, 2, 20], eod=2):
+            # - labels_are_shifted=True: input[1]=2 predicts labels[1]=20, mask index 1.
+            # - labels_are_shifted=False: input[1]=2 predicts labels[2]=20, mask target[1:].
+            if not self.labels_are_shifted:
+                input_ids = input_ids[..., :-1]
+                target_mask = target_mask[..., 1:]
+            # The view only writes into this function's newly allocated mask.
+            target_mask.masked_fill_(input_ids == eod_token_id, 0)
 
         return loss_mask
 
@@ -491,14 +545,21 @@ class TextParallelBatch:
             parallel_batch: Mapping[str, Any],
             runtime_inputs: Mapping[str, Any] | None = None,
     ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
-        """Split forward fields from loss and token-accounting fields."""
+        """Publish the same effective targets to model CE and token accounting."""
+        # Runtime adapters run before this split for forward metadata only;
+        # supervision must use the effective targets prepared here.
+        labels = parallel_batch["labels"]
+        if self.eod_mask_loss:
+            # Default masks already follow labels. Only EOD masking introduces
+            # exclusions that the model's CE cannot infer from those labels.
+            labels = _apply_loss_mask(labels, parallel_batch["loss_mask"])
         model_inputs = {
             "input_ids": parallel_batch["input_ids"],
-            "labels": parallel_batch["labels"],
+            "labels": labels,
             "position_ids": parallel_batch["position_ids"],
         }
         if self.labels_are_shifted:
-            model_inputs["shift_labels"] = parallel_batch["labels"]
+            model_inputs["shift_labels"] = labels
 
         runtime_inputs = runtime_inputs or {}
         collisions = set(model_inputs).intersection(runtime_inputs)
@@ -511,10 +572,10 @@ class TextParallelBatch:
         model_inputs.update(runtime_inputs)
 
         loss_inputs = {
-            "labels": parallel_batch["labels"],
+            "labels": labels,
             "loss_mask": parallel_batch["loss_mask"],
         }
         if self.labels_are_shifted:
-            loss_inputs["shift_labels"] = parallel_batch["labels"]
+            loss_inputs["shift_labels"] = labels
 
         return model_inputs, loss_inputs

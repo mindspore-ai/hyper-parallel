@@ -48,7 +48,7 @@ train_dataset: &train_dataset
       seed: 1234  # Random seed for data sampling
       split: "1, 0, 0"  # Proportions for training, test, and evaluation sets (test/eval currently unsupported)
       seq_length: 4096  # Sequence length of the dataset
-      eod_mask_loss: False  # Whether to calculate loss at the end-of-document (EOD)
+      eod_mask_loss: False  # Whether to exclude predictions made from an EOD context
       reset_position_ids: False  # Whether to reset position_ids at EOD
       create_attention_mask: False  # Whether to include attention_mask in the dataset
       reset_attention_mask: False  # Whether to reset attention_mask at EOD, creating a stepped attention_mask

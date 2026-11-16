@@ -1,19 +1,23 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
 # Copyright 2025-2026 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# ============================================================================
 """Loss token counting for trainer-side aggregation."""
 
-from typing import Union
+from __future__ import annotations
+
+from typing import Any
 
 import torch
 
@@ -21,16 +25,20 @@ from hyper_parallel.data.constants import IGNORE_INDEX
 
 
 def count_loss_token(
-    batches: Union[list[dict[str, torch.Tensor]], dict[str, torch.Tensor]],
+    batches: dict[str, Any] | list | tuple,
 ) -> dict[str, torch.Tensor]:
-    # FIXME: VeOmni version -> AutoModels version
-    """Calculate the total number of text_tokens/image_tokens/** for loss in a global batch, or one micro batch."""
-    if isinstance(batches, dict):
-        batches = [batches]
+    """Sum loss token counts for a microbatch or nested list/tuple of batches.
+
+    Batches marked with ``padding_flag`` contribute no targets. Each target
+    field contributes to its token family, including across microbatches.
+    """
     token_len: dict[str, torch.Tensor] = {}
 
     def _count(obj):
-        if isinstance(obj, dict) and not obj.get("padding_flag", False):
+        if isinstance(obj, dict):
+            # Skip padding marker dicts (e.g. {"padding_flag": True}) before target lookup.
+            if obj.get("padding_flag", False):
+                return
             # ``shift_labels`` already aligns one target with every local hidden
             # position. Otherwise align both labels and mask with the causal
             # next-token prediction before counting.
@@ -52,20 +60,17 @@ def count_loss_token(
                     )
                 valid_targets = valid_targets & loss_mask.to(torch.bool)
             foundation_tokens = torch.sum(valid_targets)
-            if "foundation_tokens" in token_len:
-                foundation_tokens = token_len["foundation_tokens"] + foundation_tokens
-            token_len["foundation_tokens"] = foundation_tokens  # text tokens
+            token_len["foundation_tokens"] = token_len.get("foundation_tokens", 0) + foundation_tokens
 
             for key in obj.keys():
                 if key.endswith("_labels") and key != "shift_labels":
-                    token_name = key.split("_labels")[0]
-                    token_len[f"{token_name}_tokens"] = torch.sum(obj[key] != IGNORE_INDEX)  # image generation tokens
+                    token_key = f"{key.removesuffix('_labels')}_tokens"
+                    # Accumulate across batches in a collection (e.g. 2 + 1 = 3, not overwritten to 1).
+                    token_len[token_key] = token_len.get(token_key, 0) + torch.sum(obj[key] != IGNORE_INDEX)
 
             if "image_output_mask" in obj:
                 image_decoder_tokens = torch.sum(obj["image_output_mask"])
-                if "image_decoder_tokens" in token_len:
-                    image_decoder_tokens = token_len["image_decoder_tokens"] + image_decoder_tokens
-                token_len["image_decoder_tokens"] = image_decoder_tokens  # image generation tokens
+                token_len["image_decoder_tokens"] = token_len.get("image_decoder_tokens", 0) + image_decoder_tokens
         elif isinstance(obj, (list, tuple)):
             for item in obj:
                 _count(item)
