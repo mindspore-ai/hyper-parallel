@@ -193,3 +193,45 @@ and [VLM example](../../examples/training_demo/deepseek_v41/train_deepseek_v41_v
 for nested callback configuration and Engram parameter groups. The examples
 configure optimizer hyperparameters; they do not reproduce the report's full
 training schedule. Resume with the same optimizer partition and head layout.
+
+## 可选 Gram Newton-Schulz 后端
+
+通过 `muon_ns_backend` 选择带 Quack 加速的 Gram NS：
+
+```python
+optimizer = get_hyper_optimizer(
+    model, muon_params, adamw_params,
+    muon_ns_backend="gram_quack",
+)
+```
+
+| `muon_ns_backend` | 执行路径 |
+| --- | --- |
+| `native`（默认） | 使用原生 Muon NS 或已配置的 `zeropower_fn`。 |
+| `gram` | 在 CPU 和 CUDA 上使用上游 Torch 算子。 |
+| `gram_quack` | 在 Hopper／Blackwell CUDA 上对符合条件的矩阵使用 Quack，CPU 和其他 CUDA 设备走 `gram` 路径。 |
+
+两个 Gram 选项均依赖 `gram-newton-schulz`，支持 CPU 和 CUDA 输入。
+传入 NPU 张量会报设备错误，依赖加载、编译或执行失败也会直接报错。
+
+工厂从实际生效的 Muon 参数组读取配置，包含默认值、`muon_kwargs` 和参数组覆盖值，
+自动沿用 `legacy`、`asym5` 或 `custom` 系数及 epsilon，并绑定各组所需的最长迭代序列。
+各组步数可以不同，但系数前缀必须一致、epsilon 必须相同；不兼容配置或同时传入
+`zeropower_fn` 时会报错。没有 Muon 参数时不会加载可选依赖。自动构造使用默认
+restart `(2,)` 并关闭编译。可以通过下方的手动工厂自定义 restart、kernel 选择和编译。
+
+Muon 通过 `zeropower_fn` 接收计算回调，也可以经
+`get_hyper_optimizer(..., muon_kwargs={"zeropower_fn": callback, ...})` 传入。
+使用 `hyper_parallel.components.functional.make_gram_newton_schulz` 适配
+Dao-AILab 的可选 Gram NS 包，安装及完整示例见
+[functional 文档](../../hyper_parallel/components/functional/README.md#gram-newton-schulz-for-muon)。
+
+工厂显式绑定系数、正数 epsilon 和 restart 位置；Muon 使用 `ns_variant="custom"`
+并传入同一份系数及 epsilon。现有回调只接收 `steps`，不接收参数组的系数和 epsilon，
+因此各组必须共用绑定配置，步数可以不同。仅在明确选择该后端时创建回调，其他场景
+保留 `zeropower_fn=None`。显式选择后端后的错误直接抛出。
+
+上游使用 FP32 归一化、FP16 迭代，与当前 Muon 通常采用的 BF16 NS 路径存在数值差异。
+需要针对实际负载验证更新精度和训练收敛，并将预热后性能与首次编译耗时分开测量。
+恢复 checkpoint 前，需要使用相同后端及 NS 配置重建回调。加载优化器参数组不会重新
+绑定回调，也不会恢复编译缓存。

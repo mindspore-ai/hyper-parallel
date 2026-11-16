@@ -193,3 +193,52 @@ and [VLM example](../../examples/training_demo/deepseek_v41/train_deepseek_v41_v
 for nested callback configuration and Engram parameter groups. The examples
 configure optimizer hyperparameters; they do not reproduce the report's full
 training schedule. Resume with the same optimizer partition and head layout.
+
+## Optional Gram Newton-Schulz backend
+
+Set `muon_ns_backend` to select Gram NS with Quack acceleration:
+
+```python
+optimizer = get_hyper_optimizer(
+    model, muon_params, adamw_params,
+    muon_ns_backend="gram_quack",
+)
+```
+
+| `muon_ns_backend` | Execution |
+| --- | --- |
+| `native` (default) | Native Muon NS or a configured `zeropower_fn`. |
+| `gram` | Upstream Torch operations on CPU and CUDA. |
+| `gram_quack` | Quack on Hopper/Blackwell CUDA when eligible. Uses the `gram` path on CPU and other CUDA devices. |
+
+Both Gram options require `gram-newton-schulz` and support CPU/CUDA inputs.
+NPU inputs raise a device error. Dependency loading, compilation, and execution
+errors propagate.
+
+The factory reads effective Muon parameter groups, including defaults and
+`muon_kwargs`/group overrides. It preserves `legacy`, `asym5` or `custom`
+coefficients and epsilon, and binds the longest requested iteration schedule.
+Groups may use different step counts if their coefficient prefixes agree;
+incompatible schedules/epsilons and an explicit `zeropower_fn` raise an error.
+Empty Muon routing does not load the optional dependency. The factory uses
+restart `(2,)` with compilation disabled. Use the manual factory below to
+customize restart, kernel selection, and compilation.
+
+Muon accepts a callable through `zeropower_fn`, also passed via
+`get_hyper_optimizer(..., muon_kwargs={"zeropower_fn": callback, ...})`.
+Use `hyper_parallel.components.functional.make_gram_newton_schulz` to adapt
+Dao-AILab's optional Gram NS package. See the [functional installation and example](../../hyper_parallel/components/functional/README.md#gram-newton-schulz-for-muon).
+
+The factory binds explicit coefficients, a positive epsilon and restart locations.
+Pass the same coefficients/epsilon to Muon using `ns_variant="custom"`.
+Muon's callback forwards only `steps`; it does not forward group coefficients or
+epsilon. All groups must share the bound schedule and epsilon, though their step
+counts may differ. Create the callback only when explicitly selecting this backend;
+otherwise leave `zeropower_fn=None`. Explicit backend failures propagate.
+
+The upstream FP32 normalization/FP16 iteration differs from native Muon's usual
+BF16 NS path. Validate update accuracy and training convergence for your workload,
+and measure performance after warmup separately from compilation costs. Recreate
+the callback with the same backend and NS settings before loading a checkpoint.
+Optimizer group state restoration does not rebind the callback or restore
+compiled caches.
