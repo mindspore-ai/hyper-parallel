@@ -44,9 +44,13 @@ def _restore_operands(ctx):
     return counts, projected, operands
 
 
-def _fused_quant(projected, quantizer, counts, gradient=None):
+def _fused_quant(projected, quantizer, counts, gradient=None, clamp_limit=None):
     """Keep prequantized operands internal to this Function's GMM calls."""
-    options = {"quant_dtype": quantizer.quant_dtype, "group_index": counts.cumsum(0).to(torch.int64)}
+    options = {
+        "quant_dtype": quantizer.quant_dtype,
+        "group_index": counts.cumsum(0).to(torch.int64),
+        "clamp_limit": clamp_limit,
+    }
     if gradient is None:
         buffers = quantizer.npu_ops.swiglu_mx_quant_dual_axis(projected, **options)
         shape = (projected.shape[0], projected.shape[1] // 2)
@@ -73,6 +77,7 @@ class _FusedGroupedSwiGLU(torch.autograd.Function):
     def forward(
         ctx: torch.autograd.function.FunctionCtx, inputs: torch.Tensor,
         gate_up: torch.Tensor, down: torch.Tensor, counts: torch.Tensor, quantizer: "MXFP8Quantizer",
+        clamp_limit: Optional[float],
     ) -> torch.Tensor:
         """Compute two MXFP8 GMMs with a fused activation/quantization boundary.
 
@@ -83,9 +88,11 @@ class _FusedGroupedSwiGLU(torch.autograd.Function):
             down: Canonical down weights.
             counts: Per-expert token counts.
             quantizer: MXFP8 quantizer.
+            clamp_limit: Optional positive clipping limit for DeepSeek experts.
         """
         ctx.shapes = (inputs.shape, gate_up.shape, down.shape)
         ctx.dtype, ctx.device, ctx.quantizer = inputs.dtype, inputs.device, quantizer
+        ctx.clamp_limit = clamp_limit
         if inputs.shape[0] == 0:
             ctx.save_for_backward()
             return inputs.new_empty((0, down.shape[-1]))
@@ -93,7 +100,7 @@ class _FusedGroupedSwiGLU(torch.autograd.Function):
         gate_up_q = quantizer.quantize(gate_up.contiguous(), rowwise=True, colwise=True)
         down_q = quantizer.quantize(down.contiguous(), rowwise=True, colwise=True)
         projected = _gmm(input_q, gate_up_q, counts, inputs.dtype)
-        activated_q = _fused_quant(projected, quantizer, counts)
+        activated_q = _fused_quant(projected, quantizer, counts, clamp_limit=clamp_limit)
         output = _gmm(activated_q, down_q, counts, inputs.dtype)
         _save_operands(ctx, counts, projected, (input_q, gate_up_q, activated_q, down_q))
         return output
@@ -102,7 +109,7 @@ class _FusedGroupedSwiGLU(torch.autograd.Function):
     @once_differentiable
     def backward(
         ctx: torch.autograd.function.FunctionCtx, gradient: torch.Tensor,
-    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], None, None]:
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], None, None, None]:
         """Fuse SwiGLU derivative/quantization and compute requested first gradients.
 
         Args:
@@ -113,7 +120,7 @@ class _FusedGroupedSwiGLU(torch.autograd.Function):
         if ctx.shapes[0][0] == 0:
             grads = [torch.zeros(shape, device=ctx.device, dtype=ctx.dtype) if needed else None
                      for shape, needed in zip(ctx.shapes, (needs_input, needs_gate, needs_down))]
-            return *grads, None, None
+            return *grads, None, None, None
         counts, projected, (input_q, gate_up_q, activated_q, down_q) = _restore_operands(ctx)
         grad_q = ctx.quantizer.quantize(
             gradient, group_list=counts if needs_down else None, group_list_type=1,
@@ -122,17 +129,18 @@ class _FusedGroupedSwiGLU(torch.autograd.Function):
         grad_input = grad_gate = None
         if needs_input or needs_gate:
             grad_activated = _gmm(grad_q, down_q, counts, ctx.dtype, "NT")
-            grad_projected_q = _fused_quant(projected, ctx.quantizer, counts, grad_activated)
+            grad_projected_q = _fused_quant(projected, ctx.quantizer, counts, grad_activated, ctx.clamp_limit)
             if needs_input:
                 grad_input = _gmm(grad_projected_q, gate_up_q, counts, ctx.dtype, "NT")
             if needs_gate:
                 grad_gate = _gmm(input_q, grad_projected_q, counts, ctx.dtype, "TN")
-        return grad_input, grad_gate, grad_down, None, None
+        return grad_input, grad_gate, grad_down, None, None, None
 
 
 def fused_grouped_swiglu(
     inputs: torch.Tensor, gate_up: torch.Tensor, down: torch.Tensor,
     counts: torch.Tensor, quantizer: "MXFP8Quantizer",
+    *, clamp_limit: Optional[float] = None,
 ) -> torch.Tensor:
     """Compute expert-major outputs with canonical [E,H,2I]/[E,I,H] weights.
 
@@ -142,6 +150,7 @@ def fused_grouped_swiglu(
         down: Canonical down weights.
         counts: Per-local-expert token counts, including zero-token experts.
         quantizer: MXFP8 recipe with both fused NPU kernels available.
+        clamp_limit: Optional positive clipping limit for gate and up projections.
 
     Returns:
         Ordinary BF16 outputs before outer routing weights are applied.
@@ -157,4 +166,4 @@ def fused_grouped_swiglu(
         raise ValueError("Fused MXFP8 SwiGLU weight dimensions do not match inputs")
     if counts.ndim != 1 or counts.numel() != gate_up.shape[0] or counts.dtype not in (torch.int32, torch.int64):
         raise ValueError("Fused MXFP8 SwiGLU requires one integer count per expert")
-    return _FusedGroupedSwiGLU.apply(inputs, gate_up, down, counts, quantizer)
+    return _FusedGroupedSwiGLU.apply(inputs, gate_up, down, counts, quantizer, clamp_limit)

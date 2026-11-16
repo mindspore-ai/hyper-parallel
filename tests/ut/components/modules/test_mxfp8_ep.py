@@ -69,8 +69,9 @@ def _projection(inputs, weights, counts, quantizer):
     return torch.cat([part @ weight for part, weight in zip(parts, weights)])
 
 
-def _fused_swiglu(inputs, gate_up, down, counts, quantizer):
+def _fused_swiglu(inputs, gate_up, down, counts, quantizer, clamp_limit=None):
     """CPU oracle for the fused operator with the same expert-major boundary."""
+    del clamp_limit
     gate, up = _projection(inputs, gate_up, counts, quantizer).chunk(2, dim=-1)
     return _projection(F.silu(gate) * up, down, counts, quantizer)
 

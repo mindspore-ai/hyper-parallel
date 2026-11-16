@@ -48,3 +48,14 @@ def test_deepseek_qat_family() -> None:
     Expectation: Ten steps match outputs, input/weight gradients and updates exactly, including clipping.
     """
     torchrun_case(str(Path(__file__).with_name("_test_deepseek_qat_family.py")), "test_deepseek_qat_family", num_proc=1)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+def test_deepseek_fused_mxfp8() -> None:
+    """
+    Feature: Clipped V4.1 MXFP8 fusion through Module Family.
+    Description: Train native clipped experts with an empty expert and observe both CANN kernels.
+    Expectation: Ten steps retain finite gradients, update weights, and save physical tensors for hooks.
+    """
+    torchrun_case(str(Path(__file__).with_name("_test_deepseek_qat_family.py")),
+                  "test_deepseek_fused_mxfp8", num_proc=1)
