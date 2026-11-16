@@ -53,7 +53,8 @@ def torchrun_case(
             "torch.distributed.run",
             f"--nproc-per-node={num_proc}",
             f"--log-dir=./logs/{file_name}/{case_name}",
-            "-r",
+            # Keep rank logs and return worker tracebacks with failed CI output.
+            "-t",
             "3",
             "--master_addr=127.0.0.1",
             f"--master_port={master_port}",
@@ -62,7 +63,11 @@ def torchrun_case(
             "-s",
             f"{abs_file}::{case_name}",
         ]
-        result = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+        # Native runtime logs can contain bytes outside UTF-8; keep their diagnostics
+        # without turning a successful worker exit into a decoding failure.
+        result = subprocess.run(
+            cmd, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False
+        )
         if result.returncode == 0:
             return
         combined = result.stdout + result.stderr

@@ -65,10 +65,10 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from demo_utils import init_dist
-from model import MoEDemoConfig, MoEDemoModel
-from parallelize import broadcast_state_dict_from_rank0, parallelize_moe_ep
-from pipeline import (
+from examples.torch.moe.demo_utils import init_dist
+from examples.torch.moe.model import MoEDemoConfig, MoEDemoModel
+from examples.torch.moe.parallelize import broadcast_state_dict_from_rank0, parallelize_moe_ep
+from examples.torch.moe.pipeline import (
     build_moe_pp_chunk,
     build_pipeline_stage,
     count_moe_parameters,

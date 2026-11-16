@@ -14,7 +14,7 @@
 # ============================================================================
 """MoE utilities for distributed training."""
 
-from typing import TYPE_CHECKING, Optional, Any
+from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
@@ -22,12 +22,9 @@ from torch import nn
 
 from hyper_parallel.core.activation_memory.wrapper import ActivationWrapper
 
-if TYPE_CHECKING:
-    from hyper_parallel.components.modules.moe import MoE
-
 
 def sync_and_update_expert_bias(
-    moe: "MoE",
+    moe: nn.Module,
     lr: float = 1e-3,
     tp_group: Optional[Any] = None,
     cp_group: Optional[Any] = None,
@@ -181,7 +178,7 @@ class MoEMonitorCallback:
     def on_step_end(self) -> None:
         """Update expert bias for all MoE layers in the model.
 
-        Iterates over all :class:`MoE` sub-modules with
+        Iterates over router modules with
         ``enable_expert_bias=True`` and calls
         :func:`sync_and_update_expert_bias` for each one.
 

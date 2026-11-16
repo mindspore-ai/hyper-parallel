@@ -12,18 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""PyTorch MoE building blocks: router, experts and orchestrator.
-
-Provides :class:`FeedForward`, :class:`GroupedExperts`,
-:class:`TokenChoiceTopKRouter`, and the top-level :class:`MoE` orchestrator.
-Load-balancing utilities (expert bias update and auxiliary loss) are also
-included.
-
-All modules compose naturally with EP / TP parallel strategies via DTensor.
-Distributed collectives are handled by
-:mod:`hyper_parallel.core.expert_parallel.expert_parallel`; this module
-contains only single-device computation.
-"""
+"""Original standalone MoE layer used by the legacy EP examples."""
 from __future__ import annotations
 
 __all__ = [

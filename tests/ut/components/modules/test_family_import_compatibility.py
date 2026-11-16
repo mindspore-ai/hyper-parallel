@@ -91,12 +91,11 @@ class TestFamilyImportCompatibility(unittest.TestCase):
         """Root imports support config construction and source replacement through the same family."""
         public = importlib.import_module("hyper_parallel.components.modules")
         canonical = importlib.import_module("hyper_parallel.components.modules.router")
-        legacy = importlib.import_module("hyper_parallel.components.modules.moe")
         self.assertIs(public.TokenChoiceTopKRouter, canonical.TokenChoiceTopKRouter)
         self.assertEqual(get_module_family(public.TokenChoiceTopKRouter).name, "token_choice_topk_router")
         direct = public.TokenChoiceTopKRouter(config=TokenChoiceTopKRouterConfig(4, 6, 2))
         self.assertIs(type(direct), canonical.TokenChoiceTopKRouterModule)
-        source = legacy.TokenChoiceTopKRouter(dim=4, num_experts=6, top_k=2).eval()
+        source = canonical.TokenChoiceTopKRouterModule(config=TokenChoiceTopKRouterConfig(4, 6, 2)).eval()
         adopted = public.TokenChoiceTopKRouter(module=source)
         self.assertIs(adopted.gate, source.gate)
         self.assertFalse(adopted.training)

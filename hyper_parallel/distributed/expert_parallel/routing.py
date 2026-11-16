@@ -31,7 +31,6 @@ Split out of components/distributed/ep_utils.py in stage 4e.
 
 import logging
 import math
-import os
 from typing import Optional
 
 import torch
@@ -39,24 +38,9 @@ import torch
 logger = logging.getLogger(__name__)
 
 # float32 represents every integer up to 2**24 exactly, so a smaller expert count
-# can use the AICore float sort (see ``experts._SORT_KEY_FP32_LIMIT``).
+# can use the AICore float sort.
 _SORT_KEY_FP32_LIMIT = 1 << 24
 
-# Which slots inside an over-capacity expert survive (``HP_EP_CAPACITY_ORDER``):
-#
-# * ``score`` (default): the heaviest routing weights -- the contributions whose removal
-#   perturbs the routed sum the least.  A cap exists to bound memory, and spending the bound
-#   on the cheapest slots is what makes "which slots die" a defined policy instead of an
-#   accident of the sort order;
-# * ``first``: the first slots of the expert-major order, i.e. what the archived
-#   ``HP_EP_CAPACITY_FACTOR`` sweeps (drop rate / peak / step time) were measured with.
-#
-# Both policies keep exactly the same number of slots per expert, which is the invariant the
-# memory bound rests on, so the choice cannot move a peak, a row count or a step time -- it
-# only decides whose contribution is lost.
-_CAPACITY_ORDER_SCORE = "score"
-_CAPACITY_ORDER_FIRST = "first"
-_CAPACITY_ORDERS = (_CAPACITY_ORDER_SCORE, _CAPACITY_ORDER_FIRST)
 _FP32_KEY_WARNED = False
 
 
@@ -205,34 +189,21 @@ def apply_capacity_limit(
     *dropped* (their contribution is removed), so this changes the model, exactly as it does
     in those implementations; the returned drop rate is what makes the trade measurable.
 
-    The cap is what bounds memory, and it is policy-independent: every expert keeps exactly
-    ``min(count_e, capacity)`` slots.  *Which* slots those are is decided by
-    ``HP_EP_CAPACITY_ORDER``:
-
-    * ``score`` (default): the ``capacity`` heaviest ``weights`` of each expert, so the
-      contributions dropped are the cheapest ones.  Cheap and deterministic -- the expert index
-      and the inverted weight share a single fp32 sort key, keeping the AICore float sort (see
-      :func:`_expert_score_order`);
-    * ``first``: the first slots of the expert-major order (see :func:`_expert_major_order`).
-      Deterministic for a given input and backend as well, but not a policy with a meaning:
-      within one expert it is "not necessarily first in token order".
+    Each expert keeps ``min(count_e, capacity)`` slots, prioritized by descending
+    routing weight. Without weights, the slots follow the expert-major order.
 
     Args:
         topk_idx: Routed expert per slot, shape ``[T, K]``.
         capacity_factor: Multiplier on the mean load, or ``None`` to disable the cap.
         num_experts: Total routed experts ``E``.
-        weights: Routing weight of every slot, shaped like ``topk_idx``.  Only the ``score``
-            policy reads it, so a caller that passes ``None`` gets the ``first`` policy.
+        weights: Optional routing weights, shaped like ``topk_idx``.
 
     Returns:
         ``(keep, dropped)`` where ``keep`` is a bool tensor shaped like ``topk_idx`` and
         ``dropped`` is the number of dropped slots as a 0-dim tensor on the plan's device.
-        Draining it costs a host sync, so callers must not read it on the hot path -- the one
-        caller logs it once and then sparsely (see ``ep_routed_dispatch``).
 
     Raises:
-        ValueError: If ``num_experts`` is not positive, or ``HP_EP_CAPACITY_ORDER`` is neither
-            ``score`` nor ``first``.
+        ValueError: If ``num_experts`` is not positive or the weights do not match the slots.
     """
     if capacity_factor is None or float(capacity_factor) <= 0:
         return (
@@ -247,36 +218,12 @@ def apply_capacity_limit(
     capacity = int(math.ceil(float(capacity_factor) * slots / float(num_experts)))
     keep_flat = torch.zeros_like(flat_expert, dtype=torch.bool)
     if capacity > 0:
-        order = _slot_order(flat_expert, weights, num_experts)
+        permutation = _slot_order(flat_expert, weights, num_experts)
         counts = torch.bincount(flat_expert, minlength=num_experts)
         starts = torch.cumsum(counts, dim=0) - counts
-        ranks = torch.arange(slots, device=flat_expert.device) - starts[flat_expert[order]]
-        keep_flat[order] = ranks < capacity
-    # ``dropped`` stays a device tensor on purpose: draining it costs a host sync, and this
-    # runs once per MoE layer, so callers that want the number must ask for it explicitly
-    # (they log it once, see ``ep_routed_dispatch``) instead of paying it every layer.
+        ranks = torch.arange(slots, device=flat_expert.device) - starts[flat_expert[permutation]]
+        keep_flat[permutation] = ranks < capacity
     return keep_flat.view_as(topk_idx), (~keep_flat).sum()
-
-
-def _resolve_capacity_order() -> str:
-    """Resolve ``HP_EP_CAPACITY_ORDER`` for the current call.
-
-    Read per call rather than at import time, like the capacity factor itself, so the policy
-    can be switched without reloading the module.
-
-    Returns:
-        ``"score"`` or ``"first"``.
-
-    Raises:
-        ValueError: If the knob is neither; a typo must not silently keep a policy the
-            operator did not ask for.
-    """
-    raw = os.environ.get("HP_EP_CAPACITY_ORDER", _CAPACITY_ORDER_SCORE).strip().lower()
-    if raw not in _CAPACITY_ORDERS:
-        raise ValueError(
-            f"HP_EP_CAPACITY_ORDER must be one of {list(_CAPACITY_ORDERS)}, but got {raw!r}"
-        )
-    return raw
 
 
 def _slot_order(
@@ -284,8 +231,8 @@ def _slot_order(
     flat_weights: Optional["torch.Tensor"],
     num_experts: int,
 ) -> "torch.Tensor":
-    """Order slots by expert, and under the ``score`` policy by descending weight as well."""
-    if flat_weights is None or _resolve_capacity_order() == _CAPACITY_ORDER_FIRST:
+    """Order slots by expert and by descending weight when available."""
+    if flat_weights is None:
         return _expert_major_order(flat_expert, num_experts)
     return _expert_score_order(flat_expert, flat_weights, num_experts)
 
@@ -299,17 +246,14 @@ def _expert_score_order(
 
     Both keys travel in ONE fp32 sort key: the integer part is the expert index and the
     fractional part carries the inverted, normalized weight, so a heavier slot always sorts
-    earlier and the fraction can never carry into the next expert.  One key also means one sort
-    -- the AICore float sort the expert-major order already uses.  A lexicographic or int64 key
-    would lose that kernel (the same reason ``HP_EP_SORT_FP32`` exists for the dispatch sort),
-    and a second pass is not needed either.
+    earlier and the fraction can never carry into the next expert. The single key uses the
+    same AICore float sort as the expert-major order.
 
     Resolution limit: fp32 spends the integer part's exponent on the expert index, so the
     fractional step is about ``2**-15`` around ``num_experts = 2**8..2**9`` (and ``2**-11``
     around ``2**12``).  Weights closer together than that, relative to the plan's spread, tie
     and their relative order is arbitrary -- the *count* kept per expert, which is what bounds
-    the busiest rank, is exact either way.  ``HP_EP_CAPACITY_ORDER=first`` stays available for a
-    bit-exact reproduction of the archived sweeps.
+    the busiest rank, remains exact.
 
     Args:
         flat_expert: Expert index of every routed slot, shape ``[T*K]``.
@@ -332,7 +276,7 @@ def _expert_score_order(
         if not _FP32_KEY_WARNED:
             _FP32_KEY_WARNED = True
             logger.warning(
-                "HP_EP_CAPACITY_ORDER=score needs the expert index to be exact in a float32 "
+                "Capacity ranking needs the expert index to be exact in a float32 "
                 "key, but num_experts=%d is outside (0, 2**24]; keeping the expert-major order",
                 num_experts,
             )
@@ -352,8 +296,7 @@ def _expert_score_order(
 def _expert_major_order(flat_expert: "torch.Tensor", num_experts: int) -> "torch.Tensor":
     """Return the permutation that groups slots by expert.
 
-    Integer ``argsort`` has no AICore kernel on this stack (the same reason
-    ``HP_EP_SORT_FP32`` exists for the dispatch sort), so keys are cast to float32 when the
+    Integer ``argsort`` has no AICore kernel on this stack, so keys are cast to float32 when the
     expert count is exactly representable.  Ties inside one expert may then be ordered
     arbitrarily rather than by token: the *count* kept per expert -- which is what bounds the
     busiest rank's memory -- is unaffected, and the result is still deterministic for a given

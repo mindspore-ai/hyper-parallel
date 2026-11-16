@@ -44,24 +44,21 @@ Launch::
 """
 # pylint: disable=C0413
 import torch
-from torch import nn
 import torch.distributed as dist
+from torch import nn
 
 from hyper_parallel import PipelineStage, init_device_mesh
-from hyper_parallel.components.modules.moe import MoE
 from hyper_parallel.core.context_parallel.utils import all_to_all_single
-from hyper_parallel.core.utils.communication import differentiable_all_to_all_single_async
-from hyper_parallel.core.expert_parallel.expert_parallel import (  # pylint: disable=C0412
-    ExpertParallel,
-    _permute,
-    _unpermute,
-)
 from hyper_parallel.core.pipeline_parallel import (
     CommComputeOverlap,
     MetaStepType,
     ScheduleInterleaved1F1B,
 )
 from hyper_parallel.core.pipeline_parallel._sync_hook import _SyncHookFunction
+from hyper_parallel.core.utils.communication import differentiable_all_to_all_single_async
+
+from examples.torch.moe.legacy_expert_parallel import ExpertParallel, _permute, _unpermute
+from examples.torch.moe.legacy_moe import MoE
 
 
 def differentiable_sync_hook(tensor, hook_name, coordinator):

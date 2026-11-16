@@ -34,7 +34,6 @@ from hyper_parallel.components.modules.moe_utils import (  # pylint: disable=C04
     sync_and_update_expert_bias,
 )
 from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo  # pylint: disable=C0413
-from hyper_parallel.components.modules.moe import MoE  # pylint: disable=C0413
 
 
 class TestSyncAndUpdateExpertBias(unittest.TestCase):
@@ -149,22 +148,6 @@ class TestSyncAndUpdateExpertBias(unittest.TestCase):
             mock_all_reduce.assert_called_once_with(moe.tokens_per_expert, group=cp_group.group)
             moe.update_expert_bias.assert_called_once_with(lr=1e-3, num_recomputations=1)
 
-    def test_integration_with_real_moe(self):
-        """Integration test with real MoE module on CPU."""
-        torch.manual_seed(42)
-        moe = MoE(dim=16, hidden_dim=32, num_experts=4, top_k=2)
-        x = torch.randn(2, 8, 16)
-
-        moe(x)
-
-        tokens_before = moe.tokens_per_expert.sum().item()
-        self.assertGreater(tokens_before, 0, "Tokens should accumulate during forward")
-
-        sync_and_update_expert_bias(moe, lr=1e-2)
-
-        tokens_after = moe.tokens_per_expert.sum().item()
-        self.assertEqual(tokens_after, 0.0, "Tokens should be reset after update")
-
 
 class TestMoEMonitorCallback(unittest.TestCase):
     """Unit tests for MoEMonitorCallback (Layer 1+2 of the three-layer architecture)."""
@@ -229,7 +212,7 @@ class TestMoEMonitorCallback(unittest.TestCase):
 
         moe_layers = []
         for i in range(num_layers):
-            moe = MagicMock(spec=MoE)
+            moe = MagicMock(spec=torch.nn.Module)
             moe.enable_expert_bias = enable_expert_bias_list[i]
             moe.tokens_per_expert = torch.zeros(num_experts_list[i])
             moe.last_aux_loss = None

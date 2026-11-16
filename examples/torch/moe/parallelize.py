@@ -33,7 +33,7 @@ from hyper_parallel import (
 )
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
-from hyper_parallel.core.expert_parallel.expert_parallel import ExpertParallel
+from examples.torch.moe.legacy_expert_parallel import ExpertParallel
 
 
 def parallelize_moe_ep(

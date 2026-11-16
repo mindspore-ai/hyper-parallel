@@ -29,7 +29,7 @@ from torch import nn
 
 from hyper_parallel import PipelineStage
 
-from model import (
+from examples.torch.moe.model import (
     MoEDemoConfig,
     MoEDemoModel,
     MoETransformerBlock,

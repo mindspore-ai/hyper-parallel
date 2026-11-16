@@ -31,8 +31,7 @@ from hyper_parallel.components.modules import (
     MegaMhc, SpatialMergeProjector, RotaryEmbedding, RMSNorm, OffsetRMSNorm,
     SwiGLUMLP, SharedExpert, Engram, get_family_build_info,
 )
-from hyper_parallel.components.modules.router import TokenChoiceTopKRouter
-from hyper_parallel.components.modules.moe import TokenChoiceTopKRouter as SourceRouter
+from hyper_parallel.components.modules.router import TokenChoiceTopKRouter, TokenChoiceTopKRouterModule
 from hyper_parallel.components.modules.mhc.mega_mhc import MegaMhcModule, FusedMegaMhcModule
 from hyper_parallel.components.modules.engram.host_engram_table import HostEngramTable
 from hyper_parallel.models.deepseek_v41.vision import DeepseekV41VisionAligner
@@ -187,7 +186,7 @@ class TestAdditionalFamilies(unittest.TestCase):
 
     def test_router_replacement_and_metadata(self):
         """Only public factories declare replacement; model bias is supplied at each call."""
-        source = SourceRouter(4, 6, top_k=2)
+        source = TokenChoiceTopKRouterModule(config=TokenChoiceTopKRouterConfig(4, 6, top_k=2))
         model = nn.Sequential(source)
         model, _ = prepare_model_components(model, {"module_replacements": (
             ModuleReplacementSpec(("0",), TokenChoiceTopKRouter),)})

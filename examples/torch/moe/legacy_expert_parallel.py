@@ -12,32 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Expert Parallelism distributed strategies.
-
-Provides token permutation helpers and four parallel styles that compose with
-:class:`~hyper_parallel.core.expert_parallel.moe.GroupedExperts`:
-
-- :class:`BaseExpertParallel` — abstract base for EP strategies with
-  all-to-all token dispatch/combine.
-- :class:`ExpertParallel` — standard EP: each rank owns a shard of experts;
-  tokens are routed via differentiable all-to-all.
-- :class:`TensorParallel` — TP-only weight sharding for experts with no token
-  dispatch; for use when EP degree = 1.
-- :class:`ExpertTensorParallel` — combined EP + TP on a 2-D mesh ``[ep, tp]``;
-  weights are doubly sharded, dispatch uses the EP sub-mesh.
-"""
+"""Legacy EP used by the standalone MoE and PP overlap examples."""
 __all__ = [
     "AllToAllTokenDispatcher",
     "DeredundencyTokenDispatcher",
     "BaseExpertParallel",
     "ExpertParallel",
-    "TensorParallel",
-    "ExpertTensorParallel",
-    # Re-exported for the UT, which applies it directly.
-    "_AsyncA2ALazyBwd",
 ]
 
-import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple, Union
@@ -45,11 +27,6 @@ from typing import Any, List, Optional, Tuple, Union
 import torch
 from torch.nn import Module
 
-from hyper_parallel.core.expert_parallel.static_splits import (
-    get_static_plan,
-    static_plan_key,
-    store_static_plan,
-)
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import (
     distribute_module,
@@ -62,7 +39,6 @@ from hyper_parallel.core.dtensor.dtensor import (
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.core.tensor_parallel.style import ParallelStyle
 from hyper_parallel.core.utils.communication import (
-    _AsyncA2ALazyBwd,
     differentiable_all_gather_concat,
     differentiable_all_to_all_single,
     differentiable_all_to_all_single_async,
@@ -580,36 +556,21 @@ class AllToAllTokenDispatcher:
         num_local_experts = num_tokens_per_expert.shape[0] // ep_size
 
         # --- Steps 1-2: token counts and the split vectors ---
-        # Under a static routing plan the answer never changes, so it is computed once and
-        # reused: that is what removes the per-layer counts a2a and its two D2H syncs.
-        plan_key = static_plan_key(
-            num_tokens_per_expert.shape[0], ep_size, num_local_experts,
-            device=num_tokens_per_expert.device,
-        )
-        cached_plan = get_static_plan(plan_key)
-        if cached_plan is not None:
-            counts_out, input_splits, output_splits = cached_plan
-        else:
-            # The counts exchange is shared with the other dispatchers (see
-            # ``core.utils.communication``): async with an explicit wait, because the
-            # implicit cross-stream sync is NCCL-only and on HCCL the compute stream
-            # could read ``counts_out`` before the collective write is visible.
-            counts_out = exchange_splits_via_all_to_all(num_tokens_per_expert, ep_group)
-            # counts_out shape: [ep_size * num_local_experts]
-            # counts_out[r * num_local_experts + e] = tokens from rank r for expert e
+        # The counts exchange is shared with the other dispatchers (see
+        # ``core.utils.communication``): async with an explicit wait, because the
+        # implicit cross-stream sync is NCCL-only and on HCCL the compute stream
+        # could read ``counts_out`` before the collective write is visible.
+        counts_out = exchange_splits_via_all_to_all(num_tokens_per_expert, ep_group)
+        # counts_out shape: [ep_size * num_local_experts]
+        # counts_out[r * num_local_experts + e] = tokens from rank r for expert e
 
-            # input_splits[r] = tokens this rank sends to rank r
-            # output_splits[r] = tokens this rank receives from rank r
-            # Reshape to [ep_size, num_local_experts] and sum per rank on device;
-            # a single ``tolist()`` drains the rank-sum vector to host, replacing
-            # ``2 * ep_size`` scalar ``int()`` D2H syncs with 2.
-            input_splits = num_tokens_per_expert.view(ep_size, num_local_experts).sum(dim=1).tolist()
-            output_splits = counts_out.view(ep_size, num_local_experts).sum(dim=1).tolist()
-            store_static_plan(
-                plan_key, (counts_out, input_splits, output_splits),
-                f"(ep={ep_size}, local_experts={num_local_experts}, "
-                f"tokens/peer={input_splits[0] if input_splits else 0})",
-            )
+        # input_splits[r] = tokens this rank sends to rank r
+        # output_splits[r] = tokens this rank receives from rank r
+        # Reshape to [ep_size, num_local_experts] and sum per rank on device;
+        # a single ``tolist()`` drains the rank-sum vector to host, replacing
+        # ``2 * ep_size`` scalar ``int()`` D2H syncs with 2.
+        input_splits = num_tokens_per_expert.view(ep_size, num_local_experts).sum(dim=1).tolist()
+        output_splits = counts_out.view(ep_size, num_local_experts).sum(dim=1).tolist()
 
         # --- Step 3a: exchange actual tokens (differentiable) ---
         dispatched = differentiable_all_to_all_single(
@@ -1034,8 +995,6 @@ class DeredundencyTokenDispatcher:
         return handle.wait()
 
 
-logger = logging.getLogger(__name__)
-
 _TOKEN_DISPATCHERS = {
     "all_to_all": AllToAllTokenDispatcher,
     "deredundency": DeredundencyTokenDispatcher,
@@ -1236,223 +1195,5 @@ class ExpertParallel(BaseExpertParallel):
             src = _distribute_module_param_source(param)
             requires_grad = bool(getattr(param, "requires_grad", True))
             dt = distribute_tensor(src, partition_mesh, [Shard(0)])
-            new_param = _distribute_module_new_parameter(key, dt, requires_grad)
-            _distribute_module_set_param(module, key, new_param)
-
-
-# ---------------------------------------------------------------------------
-# TensorParallel — TP-only weight sharding for experts (no token dispatch)
-# ---------------------------------------------------------------------------
-class TensorParallel(ParallelStyle):
-    """Tensor Parallel for expert weights (no token dispatch).
-
-    Shards the ``GroupedExperts`` weight tensors in the column/row-wise
-    pattern used by standard TP:
-
-    - ``w1`` / ``w3``: ``Shard(1)`` — column-wise (hidden_dim dimension).
-    - ``w2``: ``Shard(2)`` — row-wise (output dim dimension).
-
-    Use this when EP degree is 1 and you want TP across experts without
-    any all-to-all token dispatch.  Typically combined with the standard
-    :class:`~hyper_parallel.core.tensor_parallel.style.ColwiseParallel` /
-    :class:`~hyper_parallel.core.tensor_parallel.style.RowwiseParallel`
-    pattern for attention layers.
-
-    Example::
-        >>> tp_style = TensorParallel()
-        >>> sharded_experts = tp_style.apply(experts_module, tp_device_mesh)
-    """
-
-    def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
-        """Apply TP weight sharding to *module*.
-
-        Args:
-            module: A :class:`GroupedExperts` instance.
-            device_mesh: 1-D TP device mesh (``mesh_dim_names=("tp",)``).
-
-        Returns:
-            The module with TP-sharded expert parameters.
-        """
-        return distribute_module(
-            module,
-            device_mesh,
-            self._partition_fn,
-        )
-
-    @staticmethod
-    def _partition_fn(name: str, module: Module, device_mesh: DeviceMesh) -> None:
-        """Shard expert weights column-wise (w1/w3) or row-wise (w2).
-
-        ``GroupedExperts`` weight layout is ``[num_experts, out_dim, in_dim]``
-        so:
-
-        - ``w1``/``w3``: shard ``Shard(1)`` → split ``hidden_dim``
-          (column-wise analogue).
-        - ``w2``: shard ``Shard(2)`` → split ``in_dim = hidden_dim``
-          (row-wise analogue).
-
-        Args:
-            name: Submodule name (unused).
-            module: The module whose parameters are being sharded.
-            device_mesh: TP device mesh.
-        """
-        del name
-        for key, param in _distribute_module_iter_params(module):
-            if param is None:
-                continue
-            src = _distribute_module_param_source(param)
-            requires_grad = bool(getattr(param, "requires_grad", True))
-            # w1, w3: column-wise → Shard(1); w2: row-wise → Shard(2).
-            shard_dim = 2 if key == "w2" else 1
-            dt = distribute_tensor(src, device_mesh, [Shard(shard_dim)])
-            new_param = _distribute_module_new_parameter(key, dt, requires_grad)
-            _distribute_module_set_param(module, key, new_param)
-
-
-# ---------------------------------------------------------------------------
-# ExpertTensorParallel — combined EP + TP on a 2-D [ep, tp] mesh
-# ---------------------------------------------------------------------------
-
-class ExpertTensorParallel(ExpertParallel):
-    """Combined Expert + Tensor Parallel on a 2-D ``[ep, tp]`` device mesh.
-
-    Extends :class:`ExpertParallel` to operate on a 2-D mesh with named
-    dimensions ``"ep"`` and ``"tp"``:
-
-    - **Partition**: each expert weight ``[num_experts, out, in]`` is doubly
-      sharded — ``Shard(0)`` along the EP dim (expert ownership) and
-      ``Shard(1)``/``Shard(2)`` along the TP dim (column-wise / row-wise).
-    - **Dispatch / Combine**: use only the 1-D ``device_mesh["ep"]`` sub-mesh
-      so that token routing uses EP-group collectives, not the full 2-D mesh.
-
-    Args:
-        token_dispatcher: Token dispatch strategy. Supported values are
-            ``"all_to_all"`` and ``"deredundency"``.
-        async_combine: Forwarded to :class:`ExpertParallel`.  When ``True``,
-            the combine all-to-all is launched asynchronously for
-            shared-expert overlap.
-
-    Example::
-        >>> etp_style = ExpertTensorParallel()
-        >>> sharded = etp_style.apply(experts_module, ep_tp_2d_mesh)
-    """
-
-    def __init__(self, token_dispatcher: Union[str, bool] = "all_to_all", async_combine: bool = False) -> None:
-        """Initialize ExpertTensorParallel.
-
-        Args:
-            async_combine: If ``True``, use asynchronous combine all-to-all.
-        """
-        super().__init__(token_dispatcher=token_dispatcher, async_combine=async_combine)
-
-    def _dispatch_mesh(self, device_mesh: DeviceMesh) -> DeviceMesh:
-        """Return the mesh used for token dispatch in ETP."""
-        if self._token_dispatcher_name == "deredundency":
-            raise NotImplementedError(
-                "ExpertTensorParallel does not yet support "
-                "token_dispatcher='deredundency'. Use ExpertParallel with a "
-                "[oep, iep] mesh, or add [oep, iep, tp] mesh handling first."
-            )
-        return device_mesh["ep"]
-
-    def _token_dispatch(self, module: Module, inputs, device_mesh: DeviceMesh):
-        """Dispatch tokens using only the EP sub-mesh.
-
-        Args:
-            module: The ``GroupedExperts`` module.
-            inputs: Tuple ``(routed_input, num_tokens_per_expert)`` or
-                ``(routed_input, num_tokens_per_expert, routed_probs)``.
-            device_mesh: 2-D device mesh with dims ``("ep", "tp")``.
-
-        Returns:
-            Tuple ``(permuted_local_input, local_token_counts)`` or
-            ``(permuted_local_input, local_token_counts, permuted_probs)``
-            depending on whether *routed_probs* was provided.
-        """
-        dispatch_mesh = self._dispatch_mesh(device_mesh)
-        # Gate: _dispatch_mesh raises NotImplementedError for deredundency,
-        # keeping dispatch/combine symmetric (both reject deredundency).
-        dispatch_result = self._token_dispatcher.dispatch(module, inputs, dispatch_mesh)
-        ctx = dispatch_result[-1]
-        # Store context in module attribute for _token_combine to read.
-        # Using module attribute ensures each module has its own context,
-        # solving the instance sharing problem when the same ExpertParallel
-        # style object is applied to multiple GroupedExperts modules.
-        # pylint: disable=W0212
-        # Store context in module attribute for _token_combine to read.
-        module._ep_dispatch_ctx = ctx
-        # dispatch_result is either (permuted, local_counts, ctx) or
-        # (permuted, local_counts, permuted_probs, ctx); return all but ctx.
-        return dispatch_result[:-1]
-
-    def _token_combine(self, module: Module, routed_output, device_mesh: DeviceMesh):
-        """Combine tokens using only the EP sub-mesh.
-
-        When ``async_combine=True``, launches the combine all-to-all
-        asynchronously via :meth:`self._token_dispatcher.combine_start`.
-
-        Args:
-            module: The ``GroupedExperts`` module.
-            routed_output: Expert output tensor in expert-major order.
-            device_mesh: 2-D device mesh with dims ``("ep", "tp")``.
-
-        Returns:
-            Token tensor in the original token-major layout.
-
-        Raises:
-            RuntimeError: If dispatch context is not found.
-        """
-        # pylint: disable=W0212
-        # Read dispatch context from module attribute set by _token_dispatch.
-        ctx = getattr(module, "_ep_dispatch_ctx", None)
-        if ctx is None:
-            raise RuntimeError(
-                "_token_combine called but no dispatch context found in module. "
-                "This indicates _token_dispatch was not called before _token_combine, "
-                "or the context was already consumed by a previous combine call."
-            )
-
-        # Note: Do NOT delete the context here. The tensors in ctx are
-        # captured by the autograd graph, so the attribute is not needed for
-        # backward and is simply overwritten on the next forward call.
-
-        dispatch_mesh = self._dispatch_mesh(device_mesh)
-
-        if self.async_combine:
-            handle = self._token_dispatcher.combine_start(
-                routed_output, dispatch_mesh, ctx
-            )
-            return handle.wait()
-
-        return self._token_dispatcher.combine(
-            module, routed_output, dispatch_mesh, ctx,
-        )
-
-    def _partition_fn(
-        self, name: str, module: Module, device_mesh: DeviceMesh
-    ) -> None:
-        """Shard expert weights along both EP (dim 0) and TP (dim 1 or 2).
-
-        Weight layout ``[num_experts, out_dim, in_dim]``:
-
-        - ``w1``/``w3``: ``[Shard(0), Shard(1)]`` — EP shards experts,
-          TP splits hidden_dim (column-wise).
-        - ``w2``: ``[Shard(0), Shard(2)]`` — EP shards experts, TP splits
-          the input dimension (row-wise).
-
-        Args:
-            name: Submodule name (unused).
-            module: The module whose parameters are being sharded.
-            device_mesh: 2-D device mesh with dims ``("ep", "tp")``.
-        """
-        del name
-        for key, param in _distribute_module_iter_params(module):
-            if param is None:
-                continue
-            src = _distribute_module_param_source(param)
-            requires_grad = bool(getattr(param, "requires_grad", True))
-            # EP shards expert ownership (dim 0); TP shards weight dim.
-            tp_dim = 2 if key == "w2" else 1
-            dt = distribute_tensor(src, device_mesh, [Shard(0), Shard(tp_dim)])
             new_param = _distribute_module_new_parameter(key, dt, requires_grad)
             _distribute_module_set_param(module, key, new_param)

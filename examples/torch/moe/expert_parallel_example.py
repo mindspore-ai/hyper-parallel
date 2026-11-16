@@ -20,7 +20,7 @@ identical results:
 
 1. **Standalone** — single-rank reference with all experts local.
 2. **EP distributed** — experts sharded across ranks via
-   :class:`~hyper_parallel.core.expert_parallel.expert_parallel.ExpertParallel`
+   :class:`~examples.torch.moe.legacy_expert_parallel.ExpertParallel`
    with differentiable all-to-all token routing.
 
 Run (from repo root or this directory)::
@@ -41,7 +41,7 @@ Verification strategy:
     All ranks create the same model and input with identical seeds.
     The standalone path runs independently on each rank (producing identical
     results everywhere).  The EP path shards experts and routes tokens across
-    ranks.  Forward outputs and input gradients are compared with
+    ranks.  Forward outputs and embedding activation gradients are compared with
     ``rtol=1e-3, atol=1e-3`` tolerances.
 """
 # pylint: disable=C0413
@@ -52,7 +52,7 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent
 # Required for direct script execution (``torchrun expert_parallel_example.py``)
-# so that ``from model import ...`` resolves within this package directory.
+# so that ``from examples.torch.moe.model import ...`` resolves within this package directory.
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
@@ -61,9 +61,9 @@ import torch.nn.functional as F
 
 from hyper_parallel import SkipDTensorDispatch, init_device_mesh
 
-from demo_utils import init_dist
-from model import MoEDemoConfig, MoEDemoModel
-from parallelize import broadcast_state_dict_from_rank0, parallelize_moe_ep
+from examples.torch.moe.demo_utils import init_dist
+from examples.torch.moe.model import MoEDemoConfig, MoEDemoModel
+from examples.torch.moe.parallelize import broadcast_state_dict_from_rank0, parallelize_moe_ep
 
 
 SEED_MODEL = 42
@@ -97,8 +97,8 @@ def _run_forward_backward(
     tokens: torch.Tensor,
     targets: torch.Tensor,
     cfg: MoEDemoConfig,
-) -> tuple:
-    """Run a forward + backward pass and return (loss, logits, input_grad).
+) -> tuple[float, torch.Tensor, torch.Tensor]:
+    """Run a forward + backward pass and return the embedding activation gradient.
 
     Args:
         model: The MoE model.
@@ -107,17 +107,29 @@ def _run_forward_backward(
         cfg: Model configuration.
 
     Returns:
-        Tuple of ``(loss_item, logits_detached, token_grad)``.
+        Tuple of ``(loss_item, logits_detached, embedding_grad)``.
     """
-    tokens_in = tokens.clone().detach().requires_grad_(True)
-    logits = model(tokens_in)
+    embedding_outputs = []
+
+    def retain_embedding_output(
+        module: torch.nn.Module,
+        inputs: tuple[torch.Tensor, ...],
+        output: torch.Tensor,
+    ) -> None:
+        """Keep the gradient of the differentiable model input."""
+        del module, inputs
+        output.retain_grad()
+        embedding_outputs.append(output)
+
+    with model.tok_embeddings.register_forward_hook(retain_embedding_output):
+        logits = model(tokens)
     loss = F.cross_entropy(
         logits.float().reshape(-1, cfg.vocab_size),
         targets.reshape(-1),
     )
     with SkipDTensorDispatch():
         loss.backward()
-    return loss.item(), logits.detach(), tokens_in.grad.clone()
+    return loss.item(), logits.detach(), embedding_outputs[0].grad.detach()
 
 
 def _precision_close(
@@ -210,25 +222,27 @@ def main() -> None:
 
         # --- Standalone forward/backward ---
         standalone_optimizer.zero_grad(set_to_none=True)
-        s_loss, s_logits, _ = _run_forward_backward(
+        s_loss, s_logits, s_embedding_grad = _run_forward_backward(
             standalone_model, tokens, targets, cfg
         )
         standalone_optimizer.step()
 
         # --- EP forward/backward ---
         ep_optimizer.zero_grad(set_to_none=True)
-        e_loss, e_logits, _ = _run_forward_backward(
+        e_loss, e_logits, e_embedding_grad = _run_forward_backward(
             ep_model, tokens, targets, cfg
         )
-        ep_optimizer.step()
+        with SkipDTensorDispatch():
+            ep_optimizer.step()
 
         # --- Compare outputs ---
         logits_close, logits_diff = _precision_close(
             e_logits, s_logits
         )
+        embedding_grad_close, embedding_grad_diff = _precision_close(e_embedding_grad, s_embedding_grad)
         loss_close = abs(e_loss - s_loss) < max(ATOL, RTOL * abs(s_loss))
 
-        passed = logits_close and loss_close
+        passed = logits_close and loss_close and embedding_grad_close
         if not passed:
             all_passed = False
 
@@ -238,6 +252,7 @@ def main() -> None:
                 f"[ep step {step}] {status}  "
                 f"standalone_loss={s_loss:.4f}  ep_loss={e_loss:.4f}  "
                 f"logits_max_diff={logits_diff:.6f}  "
+                f"embedding_grad_max_diff={embedding_grad_diff:.6e}  "
                 f"(rtol={RTOL}, atol={ATOL})"
             )
 

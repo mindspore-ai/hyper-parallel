@@ -566,39 +566,7 @@ class AsyncContextParallel(ParallelStyle)
 
 ## EP 专家并行
 
-### `ExpertParallel`
-
-标准 all-to-all EP。
-
-```python
-class ExpertParallel(BaseExpertParallel)
-```
-
-每个 rank 持有 `num_experts / ep_degree` 个本地专家，通过 differentiable all-to-all 实现 token dispatch/combine。
-
-**Mesh 需求：** 1-D mesh，如 `mesh_dim_names=("ep",)`。
-
----
-
-### `TensorParallel`（EP 内）
-
-TP-only 权重切分（EP degree = 1 时使用）。
-
-```python
-class TensorParallel(BaseExpertParallel)
-```
-
----
-
-### `ExpertTensorParallel`
-
-EP+TP 二维并行。
-
-```python
-class ExpertTensorParallel(BaseExpertParallel)
-```
-
-**Mesh 需求：** 2-D mesh，如 `mesh_dim_names=("ep", "tp")`。
+使用模型 recipe 选择路由专家计算入口。自定义执行可以从 `hyper_parallel.distributed.expert_parallel.ep_context` 导入 `EPContext`，在一维专家 mesh 上派发已选槽位，计算并加权后使用同一次 dispatch 的 receipt 合并。详见 [EP 指南](../guide/expert_parallel.zh.md)。
 
 ---
 

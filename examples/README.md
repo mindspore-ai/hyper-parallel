@@ -9,7 +9,8 @@ examples/
 ├── torch/              # PyTorch examples
 │   ├── fully_shard/    # FSDP (Fully Sharded Data Parallel) examples
 │   ├── llama3/         # Llama3-style tensor parallel + sequence parallel
-│   └── moe/            # MoE expert parallel + pipeline parallel examples
+│   ├── moe/            # MoE expert parallel + pipeline parallel examples
+│   └── pp_overlap/     # Interleaved pipeline + expert parallel overlap
 ```
 
 ## Environment Requirements
@@ -28,33 +29,28 @@ The delivered Qwen3-MoE AutoModel training recipe lives at
 package (shipped in the wheel). Model, dataset, optimizer, and parallel
 components are selected through typed targets in `train.yaml`.
 
-## PyTorch MoE Examples
+## Expert Parallel Training
 
-The `torch/moe/` directory provides Mixture-of-Experts (MoE) distributed training examples, demonstrating expert parallelism and pipeline parallelism with correctness verification.
+Use the [Qwen3-MoE AutoModel recipe](../hyper_parallel/models/qwen3_moe/recipes/train.yaml) with the [EP guide](../docs/guide/expert_parallel.md).
 
-### Expert Parallelism (EP)
+## PyTorch MoE examples
 
-Shards MoE experts across devices using `ExpertParallel`, each device holds a subset of experts.
+The [EP](torch/moe/expert_parallel_example.py), [PP+EP](torch/moe/pp_ep_example.py), and [interleaved overlap](torch/pp_overlap/pp_overlap_moe_example.py) examples use the original [ExpertParallel implementation](torch/moe/legacy_expert_parallel.py) and [standalone MoE layer](torch/moe/legacy_moe.py) from the example directory. Migration to the training EP path is tracked in [the second stage of the EP refactor](https://github.com/mindspore-ai/hyper-parallel/issues/1585).
 
-```bash
-torchrun --nproc_per_node=2 expert_parallel_example.py
-```
-
-### Pipeline Parallelism + Expert Parallelism (PP + EP)
-
-Combines pipeline parallelism (1F1B schedule) with expert parallelism, verifying that the distributed forward loss matches a standalone reference.
+Run from the repository root.
 
 ```bash
-torchrun --nproc_per_node=4 pp_ep_example.py
+torchrun --nproc_per_node=2 -m examples.torch.moe.expert_parallel_example
+torchrun --nproc_per_node=4 -m examples.torch.moe.pp_ep_example
+torchrun --nproc_per_node=4 -m examples.torch.pp_overlap.pp_overlap_moe_example
 ```
 
-Environment variables:
+The EP and PP+EP launchers use `MOE_DEVICE_TYPE` (`npu` by default). The PP+EP launcher also accepts `MOE_PP_SIZE` and `MOE_EP_SIZE` (both default to 2) and `MOE_NUM_STEPS` (defaults to 5). The overlap example defaults to four ranks with PP=2 and EP=2.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MOE_PP_SIZE` | 2 | Pipeline parallel width |
-| `MOE_EP_SIZE` | 2 | Expert parallel width |
-| `MOE_NUM_STEPS` | 5 | Number of verification steps |
-| `MOE_DEVICE_TYPE` | npu | Device type (`npu` or `cuda`) |
+For PP+EP, set the world size to `MOE_PP_SIZE * MOE_EP_SIZE`. The number of experts must be divisible by `MOE_EP_SIZE`, and the number of layers must be at least `MOE_PP_SIZE`.
 
-Requirements: `world_size == MOE_PP_SIZE * MOE_EP_SIZE`, `num_experts % MOE_EP_SIZE == 0`, `n_layers >= MOE_PP_SIZE`.
+Run the grouped-matmul regression cases from the source checkout with a Torch build that provides `torch._grouped_mm`.
+
+```bash
+python -m pytest examples/torch/moe/test_legacy_moe.py
+```
