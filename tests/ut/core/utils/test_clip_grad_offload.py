@@ -48,9 +48,11 @@ class TestOffloadedReduction(unittest.TestCase):
                 module = SimpleNamespace(current_device=lambda: 3)
                 with patch("hyper_parallel.core.utils.clip_grad.dist.get_backend", return_value=backend), \
                         patch("hyper_parallel.core.utils.clip_grad.torch.get_device_module", return_value=module), \
+                        patch.object(torch, "device") as make_device, \
                         patch("hyper_parallel.core.utils.clip_grad.dist.all_reduce") as reduce:
                     result = _all_reduce_offloaded(value, dist.ReduceOp.MAX, group)
-                value.to.assert_called_once_with(torch.device(device_type, 3))
+                make_device.assert_called_once_with(device_type, 3)
+                value.to.assert_called_once_with(make_device.return_value)
                 reduce.assert_called_once_with(staged, op=dist.ReduceOp.MAX, group=group)
                 staged.to.assert_called_once_with(torch.device("cpu"))
                 self.assertIs(result, staged.to.return_value)
