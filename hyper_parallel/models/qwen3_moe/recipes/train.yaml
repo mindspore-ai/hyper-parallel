@@ -15,7 +15,8 @@ model:
   pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
   ignore_mismatched_sizes: true
   torch_dtype: bfloat16
-  attn_implementation: sdpa
+  attn_implementation:
+    _target_: hyper_parallel.models._transformers.packed_attention.register_npu_packed_attention
   force_hf: true
 
 training:
@@ -63,7 +64,8 @@ plan_overrides:
       kind: module
       source_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention
       implementation:
-        _target_: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_flash_attention
+        _target_: hyper_parallel.components.modules.GroupedQueryAttention
+        ulysses_degree: 1
   # The experts module is always the same grouped-GEMM implementation;
   # enabling EP changes only token dispatch/combine around this boundary.
   - match: "*.mlp.experts"
@@ -72,14 +74,6 @@ plan_overrides:
       source_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts
       implementation:
         _target_: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_grouped_experts
-  # This CP wrapper accepts Online global block masks and falls back to an
-  # implicit offset-aware causal mask for Offline Indexed Dataset input.
-  - match: "*.self_attn.forward"
-    when: cp
-    replace:
-      kind: method
-      implementation:
-        _target_: hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel.qwen3_moe_flash_attention_cp_mask_wrapper
   # EP conditional override: Qwen3-MoE TopKRouter archetype compute.
   - match: "*.mlp.forward"
     when: ep
@@ -136,8 +130,12 @@ dataloader:
   get_batch:
     _target_: hyper_parallel.data.batching.TextParallelBatch
     source_type: online
-    attention_mode: dense
-  sampler_type: single
+    attention_mode: compressed
+    reset_position_ids: true
+    runtime_input_adapter:
+      _target_: hyper_parallel.data.batching.runtime_input.PackedAttentionRuntime
+  # Packed batches consume multiple documents; keep the complete source for the step budget.
+  sampler_type: cyclic
   data_rearrange_map: null
   data_sharding: false
   drop_last: true

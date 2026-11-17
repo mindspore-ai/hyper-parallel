@@ -54,6 +54,9 @@ def copy_original_modeling(source: Any) -> str:
     a ``file_path`` key.  Accepts either a dict or a ``ResolvedSource`` (the
     dict form is what the manager records, but the helper tolerates the live
     dataclass so it stays usable outside the meta path).
+
+    Args:
+        source: Resolved source metadata containing the original modeling file.
     """
     if isinstance(source, dict):
         path = source.get("file_path")
@@ -96,6 +99,10 @@ def rewrite_relative_imports(text: str, module_name: str) -> str:
     list, comments, and whitespace are preserved.  It uses ``tokenize`` rather
     than a regex so relative-looking text inside string literals or comments is
     never touched.
+
+    Args:
+        text: Original modeling source text.
+        module_name: Fully qualified module name used to resolve relative imports.
     """
     unless_anchor = _relative_anchor(module_name)
     if unless_anchor is None:
@@ -278,6 +285,12 @@ def _splice(
         acc += len(line)
 
     def offset(row: int, col: int) -> int:
+        """Map a source row and column to an absolute character offset.
+
+        Args:
+            row: One-based source row.
+            col: Zero-based column within that row.
+        """
         if 1 <= row <= len(line_offsets):
             return line_offsets[row - 1] + col
         return acc
@@ -306,6 +319,10 @@ def emit_modeling_file(meta: Any, *, patch_plan: Any = None) -> str:
     first. The header banner carries the generation provenance; the source is
     copied verbatim, rewritten by the adapter-driven inline pipeline, and then
     lowered at the boundary classes.
+
+    Args:
+        meta: Resolved model metadata and observed replacements.
+        patch_plan: Optional precomputed structural patch plan.
     """
     text = copy_original_modeling(meta.source)
     # Stale-source sanitize: a trust-remote-code modeling file ships with the
@@ -467,7 +484,8 @@ def _verify_replacement_records(
     } | set(classes)
     missing = []
     for record in records:
-        name = record.replacement_type.__name__
+        constructor = getattr(record, "factory", None) or record.replacement_type
+        name = constructor.__name__
         visible = name in bound_names and any(
             isinstance(node, ast.Call) and _call_name(node.func) == name
             for node in ast.walk(tree)
@@ -569,7 +587,12 @@ def verify_recorded_patch_bundle(
     *,
     patch_plan: Any = None,
 ) -> None:
-    """Verify recorded local-compute patches across all generated source units."""
+    """Verify recorded local-compute patches across all generated source units.
+
+    Args:
+        files: Generated file names mapped to their source text.
+        patch_plan: Recorded patches whose generated bindings must remain visible.
+    """
     records = (
         getattr(patch_plan, "local_computes", ()) if patch_plan is not None else ()
     )

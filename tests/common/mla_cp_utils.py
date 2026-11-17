@@ -26,21 +26,28 @@ from torch import nn
 from transformers import DeepseekV3Config, DeepseekV3ForCausalLM
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3Attention
 
-from hyper_parallel.components.modules.mla_attention import MLAAttention
-from hyper_parallel.distributed._builder.forward_rewriter import (
-    _commit_forward_rewrite,
-    validate_wrapped_forward,
+from hyper_parallel.components.modules import MultiLatentAttention, MultiLatentAttentionModule
+from hyper_parallel.components.modules.attention.multi_latent_attention.cp_multi_latent_attention import (
+    MLADimensions, CPMultiLatentAttentionModule,
 )
-from hyper_parallel.distributed.context_parallel.mla_context_parallel import MLADimensions
-from hyper_parallel.models.deepseek_v3.adapter.distributed.context_parallel import mla_cp_wrapper
-from hyper_parallel.models.kimi_k3.adapter.mla import KimiMLAAttention
+from hyper_parallel.distributed.context_parallel.cp_context import CPContext
+from hyper_parallel.distributed.module_binding import MeshBinding, ParallelBinding
+from hyper_parallel.distributed.mesh import LogicalDeviceMesh, MeshContext
+from hyper_parallel.models.kimi_k3.adapter.mla import (
+    KimiMultiLatentAttentionModule, CPKimiMultiLatentAttentionModule,
+)
 from hyper_parallel.models.replacement import (
     ModuleReplacementSpec, apply_module_replacements, compile_module_replacements,
 )
 
 
 def attention_options(lengths: tuple[int, ...] | None = None, causal: bool = True) -> dict:
-    """Build ordinary model kwargs shared by packed and unpacked test cases."""
+    """Build ordinary model kwargs shared by packed and unpacked test cases.
+
+    Args:
+        lengths: Cumulative global document endpoints, or None.
+        causal: Whether queries see only preceding keys.
+    """
     return {"actual_seq_len": lengths, "is_causal": causal}
 
 
@@ -76,7 +83,11 @@ class TinyRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(width))
 
     def forward(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Normalize the complete latent feature dimension."""
+        """Normalize the complete latent feature dimension.
+
+        Args:
+            tensor: Latent activations to normalize.
+        """
         variance_input = tensor if tensor.dtype == torch.float64 else tensor.float()
         normalized = variance_input * (variance_input.square().mean(-1, keepdim=True) + 1e-6).rsqrt()
         return normalized.to(tensor.dtype) * self.weight
@@ -90,8 +101,17 @@ def make_mla(
     bias: bool = True,
     hidden_dim: int | None = None,
     gated: bool = False,
-) -> MLAAttention:
-    """Build the replacement and explicitly load its declared fused down-projection weights."""
+) -> MultiLatentAttentionModule:
+    """Build the replacement and explicitly load its declared fused down-projection weights.
+
+    Args:
+        dimensions: Global MLA projection dimensions.
+        dtype: Parameter dtype.
+        interleaved: Use the source interleaved rotary convention.
+        bias: Include projection biases.
+        hidden_dim: Optional hidden width override.
+        gated: Build NoPE MLA with a sigmoid output gate.
+    """
     dims = dimensions or MLADimensions(4, 5, 6, 3, 2, 4)
     hidden_dim = hidden_dim or (12 if dims.qk_dim < 32 else 64)
     source = nn.Module()
@@ -113,7 +133,7 @@ def make_mla(
         source.use_output_gate = True
         source.g_proj = nn.Linear(hidden_dim, dims.heads * dims.value_dim, bias=bias)
     source = source.to(dtype=dtype)
-    replacement = KimiMLAAttention if gated else MLAAttention
+    replacement = KimiMultiLatentAttentionModule if gated else MultiLatentAttentionModule
     result = replacement(module=source)
     with torch.no_grad():
         result.linear_qkv.weight.copy_(torch.cat((source.q_a_proj.weight, source.kv_a_proj_with_mqa.weight)))
@@ -122,20 +142,25 @@ def make_mla(
     return result
 
 
-def install_mla_cp(module: MLAAttention, mesh: TestCPMesh, strategy: str, **options: Any) -> None:
-    """Commit the same adapter requests as the recipe rewriter, for isolated tests."""
-    wrapper = mla_cp_wrapper
-    if isinstance(module, KimiMLAAttention):
-        # Keep ordinary MLA fixtures independent of model-specific adapter imports.
-        from hyper_parallel.models.kimi_k3.adapter.distributed.context_parallel import (  # pylint: disable=C0415
-            kimi_mla_cp_wrapper,
-        )
-        wrapper = kimi_mla_cp_wrapper
-    requests = wrapper(module, None, None, mesh, None, strategy=strategy, **options)
-    for request in requests:
-        validate_wrapped_forward(request.target.forward, request.forward, owner="MLA CP test")
-    for request in requests:
-        _commit_forward_rewrite(request)
+def make_cp_mla(module: MultiLatentAttentionModule, mesh: TestCPMesh, strategy: str,
+                **options: Any) -> MultiLatentAttentionModule:
+    """Bind the production CP class, including a singleton for CPU contract tests.
+
+    Args:
+        module: Source MLA mathematical member.
+        mesh: Existing CP process group or singleton.
+        strategy: Expanded or latent KV communication.
+        **options: Additional CP selectors and test callbacks.
+    """
+    callbacks = {name: options.pop(name) for name in ("rotary_fn", "attention_interface") if name in options}
+    implementation = CPKimiMultiLatentAttentionModule if isinstance(module, KimiMultiLatentAttentionModule) else (
+        CPMultiLatentAttentionModule)
+    result = implementation(module=module, context={"cp_size": mesh.size()}, strategy=strategy, **options)
+    logical = LogicalDeviceMesh(("cp",), (mesh.size(),))
+    result.bind_parallel(ParallelBinding(MeshBinding(MeshContext(device_mesh=logical)), CPContext(mesh)))
+    if callbacks:
+        result.cp_runtime = type(result.cp_runtime)(result.cp_plan, mesh, **callbacks)
+    return result
 
 
 def position_embeddings(
@@ -146,7 +171,15 @@ def position_embeddings(
     dtype: torch.dtype,
     device: torch.device | str = "cpu",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Create nontrivial document-relative RoPE frequencies with a YaRN-like scale."""
+    """Create nontrivial document-relative RoPE frequencies with a YaRN-like scale.
+
+    Args:
+        sequence: Total token count.
+        rope_dim: Rotary feature width.
+        metadata: Packed document endpoints.
+        dtype: Frequency dtype.
+        device: Frequency device.
+    """
     ends = metadata.get("actual_seq_len") or (sequence,)
     positions = torch.cat([torch.arange(end - begin) for begin, end in zip((0,) + ends[:-1], ends)])
     inverse = torch.linspace(0.017, 0.21, rope_dim // 2)
@@ -174,10 +207,14 @@ def make_deepseek_model(*, dtype: torch.dtype = torch.float32, npu_dimensions: b
 
 
 def replace_and_load_mla(model: nn.Module) -> tuple[nn.Module, list[Any]]:
-    """Use the real replacement matcher and its declared checkpoint converters."""
+    """Use the real replacement matcher and its declared checkpoint converters.
+
+    Args:
+        model: Source model whose attention modules will be replaced.
+    """
     original = deepcopy(model.state_dict())
     rule = ModuleReplacementSpec(
-        match=("model.layers.*.self_attn",), factory=MLAAttention, module_type=DeepseekV3Attention,
+        match=("model.layers.*.self_attn",), factory=MultiLatentAttention, module_type=DeepseekV3Attention,
     )
     plan = compile_module_replacements(model, [rule])
     model, transforms = apply_module_replacements(model, plan, weights_mapping=[])

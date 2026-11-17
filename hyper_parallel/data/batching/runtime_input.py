@@ -19,6 +19,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Any
 
 import torch
@@ -189,6 +190,44 @@ class RuntimeInputAdapter(ABC):
         raise NotImplementedError
 
 
+class PackedAttentionRuntime(RuntimeInputAdapter):
+    """Share global document boundaries across attention layers without a dense mask.
+
+    The selected attention implementation must consume cumulative lengths and
+    bypass model-side dense mask construction. Position IDs and loss ownership
+    remain with TextParallelBatch; this adapter does not shard document bounds.
+    """
+
+    def runtime_input_fields(self) -> tuple[str, ...]:
+        """Declare the two leading-zero FA length arguments."""
+        return ("cu_seq_lens_q", "cu_seq_lens_k")
+
+    def build_runtime_inputs(self, *, batch: Mapping[str, Any], context: RuntimeInputContext) -> Mapping[str, Any]:
+        """Read boundaries once per batch and preserve their global batch-major coordinates."""
+        if context.options.get("attention_mode") != "compressed":
+            raise ValueError("PackedAttentionRuntime requires attention_mode='compressed'")
+        shape = context.local_input_shape
+        if len(shape) != 2:
+            raise ValueError("Packed attention requires input_ids with shape [batch, local_sequence]")
+        boundaries = batch.get("cu_seq_lens")
+        if isinstance(boundaries, torch.Tensor):
+            if boundaries.ndim != 1:
+                raise ValueError("Packed attention requires one-dimensional global cu_seq_lens")
+            boundaries = boundaries.tolist()
+        if boundaries is None or any(isinstance(value, bool) or not isinstance(value, Integral)
+                                     for value in boundaries):
+            raise ValueError("Packed attention requires integer global cu_seq_lens")
+        boundaries = tuple(int(value) for value in boundaries)
+        if len(boundaries) < 2 or boundaries[0] != 0:
+            raise ValueError("Packed attention cu_seq_lens must start with zero and contain a document")
+        if any(end <= start for start, end in zip(boundaries, boundaries[1:])):
+            raise ValueError("Packed attention cu_seq_lens must be strictly increasing")
+        tokens = shape[0] * shape[1] * context.parallel_sizes["cp"]
+        if boundaries[-1] != tokens:
+            raise ValueError("Packed attention cu_seq_lens must cover the global batch token count")
+        return {"cu_seq_lens_q": boundaries, "cu_seq_lens_k": boundaries}
+
+
 class AttentionRuntime(RuntimeInputAdapter):
     """Build dense attention fields from common runtime context."""
 
@@ -281,6 +320,7 @@ __all__ = [
     "AttentionRuntime",
     "IndexedBoundaryResolver",
     "OnlineBoundaryResolver",
+    "PackedAttentionRuntime",
     "RuntimeInputAdapter",
     "RuntimeInputContext",
 ]

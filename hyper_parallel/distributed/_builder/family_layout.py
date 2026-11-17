@@ -28,7 +28,7 @@ from hyper_parallel.components.modules.module_family import (
     collect_family_modules, _family_parameter_shapes, get_family_build_info,
     _record_family_layouts, _validate_applied_layout,
 )
-from hyper_parallel.core.dtensor.placement_types import Partial
+from hyper_parallel.core.dtensor.placement_types import Partial, Replicate, Shard
 from hyper_parallel.distributed.module_binding import (
     NativeParallelBindingRequest, ParallelModuleSpec, validate_materialized_modules, validate_parallel_module,
 )
@@ -56,8 +56,12 @@ def _is_child(fqn, parent):
 
 
 def _module_parallel(module, member):
+    """Resolve the member declaration, falling back to family-owned layout validation."""
     provider = getattr(module, "parallel_module_spec", None)
     declaration = provider() if provider is not None else None
+    if provider is None and member is not None and member.family.parallel_spec is not None:
+        # A standalone math class need not import the distributed binding protocol.
+        declaration = member.family.parallel_spec(module=module, member=member)
     if declaration is not None and not isinstance(declaration, ParallelModuleSpec):
         raise TypeError("parallel_module_spec() must return ParallelModuleSpec")
     if member is not None and member.selectors["parallel"] and declaration is None:
@@ -104,6 +108,43 @@ def _native_providers(entries, model, spec, context, boundaries):
 
 def _overlaps_family(module, family_subtrees):
     return any(id(child) in family_subtrees for child in module.modules())
+
+
+def validate_tp_boundary(sharding: Any, expected: Any, *, name: str) -> None:
+    """Validate supported layouts after overrides, with omitted axes meaning Replicate.
+
+    Parameter overrides must preserve the implemented column/row pairing; arbitrary
+    new algorithms do not follow from DSL precedence. External TP/SP token ports
+    may change, while internal computation and non-TP ownership must stay valid.
+
+    Args:
+        sharding: Final layout after user overrides.
+        expected: Supported parameter roles and computation layouts from the family.
+        name: Family name used in construction-time errors.
+    """
+    if set(sharding.params) != set(expected.params):
+        raise ValueError(f"{name} must declare every owned parameter")
+    for parameter, required in expected.params.items():
+        actual = sharding.params[parameter]
+        if any(actual.get(axis, Replicate()) != required.get(axis, Replicate())
+               for axis in set(actual) | set(required)):
+            raise ValueError(f"{name} unsupported parameter layout for {parameter}: "
+                             f"expected {required}, got {actual}")
+    if not sharding.is_boundary:
+        raise ValueError(f"{name} requires a TP redistribution boundary")
+    for field_name, key in (("in_src", "hidden_states"), ("in_dst", "hidden_states"),
+                            ("out_src", "output"), ("out_dst", "output")):
+        ports, required_ports = getattr(sharding, field_name), getattr(expected, field_name)
+        if ports is None or set(ports) != {key}:
+            raise ValueError(f"{name} {field_name} must declare its named token port")
+        actual, required = ports[key], required_ports[key]
+        for axis in set(actual) | set(required):
+            placement = actual.get(axis, Replicate())
+            if axis == "tp" and field_name in ("in_src", "out_dst"):
+                if placement not in (Replicate(), Shard(1)):
+                    raise ValueError(f"{name} TP token ports support Replicate or sequence Shard(1)")
+            elif placement != required.get(axis, Replicate()):
+                raise ValueError(f"{name} {field_name} cannot change {axis} computation/ownership")
 
 
 def _validate_ports(module, spec):

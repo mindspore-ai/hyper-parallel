@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Distributed adapters for DeepSeek-V3."""
+"""Class-owned attention math and parallel family members."""
 
-from hyper_parallel.models.deepseek_v3.adapter.distributed.context_parallel import mla_cp_wrapper
+from .grouped_query_attention_family import GroupedQueryAttention
 
-__all__ = ["mla_cp_wrapper"]
+__all__ = ['GroupedQueryAttention']

@@ -126,8 +126,6 @@ train:
       source_type: transformers.models.qwen3.modeling_qwen3.Qwen3Attention
       implementation:
         _target_: hyper_parallel.models.qwen3.adapter.conversion.module_replacement.replace_qwen3_flash_attention
-  - match: '*.self_attn'
-    region_dispatch: false
   model_init_cpu_threads: null  # Optional 8 during model build; restore original threads afterward.
   max_steps: 2
   seed: 1234
