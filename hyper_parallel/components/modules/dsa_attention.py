@@ -303,6 +303,9 @@ class DeepseekV32DSAAttention(nn.Module):
         self.dsa_dense_warm_up = bool(
             getattr(module, "dsa_dense_warm_up", getattr(config, "dsa_dense_warm_up", False))
         )
+        self.dsa_tnd_compact_kv = bool(
+            getattr(module, "dsa_tnd_compact_kv", getattr(config, "dsa_tnd_compact_kv", False))
+        )
         if getattr(module, "param_sink_number", 0) > 0:
             raise ValueError("DeepseekV32DSAAttention does not support the parameter-sink path")
         if getattr(module, "use_mome", False):

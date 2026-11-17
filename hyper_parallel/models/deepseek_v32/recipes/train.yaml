@@ -19,6 +19,14 @@ model:
   torch_dtype: bfloat16
   attn_implementation: eager
   force_hf: true
+  # Document-aware KV compaction for the sparse DSA CP path (default: off).
+  # Uncomment `dsa_tnd_compact_kv` below to trim each query block's causal KV
+  # prefix down to its earliest active document before the indexer / sparse
+  # attention / KL-loss kernels run. Requires packed-sequence document
+  # boundaries (actual_seq_len) and a CP-only topology (PP=1); AllGather
+  # bytes are unchanged, what shrinks is the kernels' physical KV input.
+  # config_overrides:
+  #   dsa_tnd_compact_kv: true
 
 training:
   train_iters: 3
@@ -62,6 +70,8 @@ plan_overrides:
         _target_: hyper_parallel.models.deepseek_v32.adapter.distributed.context_parallel.deepseek_v32_dsa_attention_cp_wrapper
         # null follows dsa_dense_warm_up; true/false forces one path for the full run.
         dense_warmup: null
+        # null follows dsa_tnd_compact_kv; true/false forces one path for the full run.
+        kv_compact: null
 
 mixed_precision:
   enabled: false
