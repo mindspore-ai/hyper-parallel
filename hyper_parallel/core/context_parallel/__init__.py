@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@
 # ============================================================================
 """Context Parallel implementations for HyperParallel."""
 from hyper_parallel.core.context_parallel.context_parallel import ContextParallel
+from hyper_parallel.core.context_parallel.kda_context_parallel import KDAContextParallel
 from hyper_parallel.core.context_parallel.async_context_parallel import AsyncContextParallel
 from hyper_parallel.core.context_parallel.async_dsa_context_parallel import (
     AsyncDSAIndexerContextParallel,
@@ -27,7 +28,7 @@ from hyper_parallel.core.context_parallel.dsa_context_parallel import (
 )
 
 __all__ = [
-    "ContextParallel",
+    "ContextParallel", "KDAContextParallel",
     "AsyncContextParallel",
     "AsyncDSAIndexerContextParallel",
     "AsyncDSAIndexerLossContextParallel",

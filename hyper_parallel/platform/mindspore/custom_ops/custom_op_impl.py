@@ -1389,11 +1389,11 @@ class _ChunkKdaStageFunction(DFunction):
     @staticmethod
     def forward(ctx: Any, q: ms.Tensor, k: ms.Tensor, v: ms.Tensor, g: ms.Tensor,
                 beta: ms.Tensor, a_log: ms.Tensor, bias: ms.Tensor,
-                initial_state: ms.Tensor | None, options: dict, scan: Any) -> tuple:
+                initial_state: ms.Tensor | None, options: dict) -> tuple:
         """Prepare local relays and optionally obtain the caller-supplied boundary state."""
         inputs = (q, k, v, g, beta, a_log, bias)
         cache = _chunk_kda_stage_prepare(inputs, options, "save" if options["disable_recompute"] else "none")
-        h0 = initial_state if scan is None else scan.forward_boundary(cache, initial_state)
+        h0 = initial_state
         h, vn, final = _chunk_kda_stage_scan_forward(cache, h0, options)
         from hyper_parallel.custom_ops.experimental.experimental_ops import npu_chunk_kda_fwd_finalize  # pylint: disable=C0415
         out = npu_chunk_kda_fwd_finalize(
@@ -1408,7 +1408,7 @@ class _ChunkKdaStageFunction(DFunction):
             saved.update(h=h, vn=vn)
         ctx.names = tuple(saved)
         ctx.save_for_backward(*saved.values())
-        ctx.options, ctx.scan = options, scan
+        ctx.options = options
         ctx.has_initial = initial_state is not None
         ctx.final_shape = final.shape
         return out, final if options["output_final_state"] else None
@@ -1423,7 +1423,7 @@ class _ChunkKdaStageFunction(DFunction):
             npu_chunk_kda_bwd_finalize,
         )
         saved = dict(zip(ctx.names, ctx.saved_tensors))
-        options, scan = ctx.options, ctx.scan
+        options = ctx.options
         inputs = tuple(saved[key] for key in ("q", "k", "v", "g", "beta", "a", "bias"))
         q, k, v, g, beta, a_log, bias = inputs
         h0 = saved.get("h0")
@@ -1440,8 +1440,6 @@ class _ChunkKdaStageFunction(DFunction):
             cache[1], vn, d_o, h,
             scale=options["scale"], **metadata,
         )
-        if scan is not None:
-            grad_final = scan.backward_boundary(cache, d_o, dv_local, grad_final, options["scale"])
         relay_h0 = mint.zeros(ctx.final_shape, dtype=q.dtype) if h0 is None else h0.astype(q.dtype)
         dh, dh0, dv_scan = npu_chunk_kda_bwd_dhu(
             cache[5], cache[6], cache[3], d_o, dv_local, options["scale"],
@@ -1460,9 +1458,7 @@ class _ChunkKdaStageFunction(DFunction):
         )
         d_bias = d_bias.reshape(bias.shape)
         dh0 = dh0.astype(h0.dtype) if ctx.has_initial else None
-        if scan is not None:
-            d_a, d_bias, dh0 = scan.finish_gradients(d_a, d_bias, dh0)
-        return dq, dk, dv, dg, dbeta, d_a, d_bias, dh0, None, None
+        return dq, dk, dv, dg, dbeta, d_a, d_bias, dh0, None
 
 
 def _chunk_kda_head_major(tensor, layout, scalar=False):
@@ -1484,11 +1480,11 @@ def run_chunk_kda_stages(
         chunk_indices: list | None = None, initial_state: ms.Tensor | None = None,
         disable_recompute: bool = True, state_v_first: bool = False, epsilon: float = 1e-6,
         use_qk_l2norm_in_kernel: bool = False, use_beta_sigmoid_in_kernel: bool = False,
-        allow_neg_eigval: bool = False, use_exp2: bool = True, scan: Any = None) -> tuple:
+        allow_neg_eigval: bool = False, use_exp2: bool = True) -> tuple:
     """Run the state-aware local training path assembled from explicit KDA stages.
 
-    This adapter performs no communication. An optional caller-owned ``scan``
-    supplies boundary-state handling and replicated-gradient reduction.
+    This local adapter only handles mathematical tensors and boundary states.
+    Parallelization and parameter-gradient reductions belong to the caller.
     """
     from mindspore import mint  # pylint: disable=C0415
     # Keep only adapter-specific layout/GQA guards here; FLA validates kernel inputs.
@@ -1515,7 +1511,7 @@ def run_chunk_kda_stages(
                "disable_recompute": disable_recompute, "epsilon": epsilon,
                "use_qk_l2norm_in_kernel": use_qk_l2norm_in_kernel,
                "use_beta_sigmoid_in_kernel": use_beta_sigmoid_in_kernel, "allow_neg_eigval": allow_neg_eigval}
-    out, final = _ChunkKdaStageFunction.apply(q, k, v, g, beta, a_log, dt_bias, initial_state, options, scan)
+    out, final = _ChunkKdaStageFunction.apply(q, k, v, g, beta, a_log, dt_bias, initial_state, options)
     out = out.squeeze(0).transpose(1, 0, 2) if packed else out.transpose(0, 2, 1, 3)
     if final is not None and state_v_first:
         final = final.swapaxes(-1, -2)
