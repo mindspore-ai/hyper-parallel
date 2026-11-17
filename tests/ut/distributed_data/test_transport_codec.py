@@ -29,7 +29,6 @@ from hyper_parallel.distributed_data.transport import (
     DataGroups,
     DataPlaneTransport,
     ModelParallelTransport,
-    _decode_control,
     create_data_groups,
     _decode_payload_segment,
     _decode_received_payloads,
@@ -37,9 +36,13 @@ from hyper_parallel.distributed_data.transport import (
 )
 
 
+from tests.common.mark_utils import arg_mark
+
+
 class TestPayloadCodec(unittest.TestCase):
     """Verify route round trips and conservation checks at payload merge."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_round_trip_preserves_order_keys_and_payloads(self) -> None:
         """Feature: Payload serialization.
         Description: Encode and decode an ordered sample route.
@@ -56,6 +59,7 @@ class TestPayloadCodec(unittest.TestCase):
         self.assertEqual(_encode_payload_segment(()), b"")
         self.assertEqual(_decode_payload_segment(b""), ())
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_tensor_payload_uses_metadata_and_binary_buffer(self) -> None:
         """Feature: Tensor-buffer payload serialization.
         Description: Encode nested tensor and byte leaves without pickling data.
@@ -85,6 +89,7 @@ class TestPayloadCodec(unittest.TestCase):
         self.assertEqual(decoded[0][1]["shape"], (3, 2))
         self.assertIsInstance(decoded[0][1]["shape"], tuple)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_wire_format_is_plain_pickle(self) -> None:
         """Feature: Payload serialization.
         Description: Encode a route with the transport codec.
@@ -94,6 +99,7 @@ class TestPayloadCodec(unittest.TestCase):
 
         self.assertEqual(_encode_payload_segment(items), pickle.dumps(items, protocol=pickle.HIGHEST_PROTOCOL))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_decoder_propagates_pickle_errors(self) -> None:
         """Feature: Payload serialization.
         Description: Decode malformed payload bytes.
@@ -102,6 +108,7 @@ class TestPayloadCodec(unittest.TestCase):
         with self.assertRaises(pickle.UnpicklingError):
             _decode_payload_segment(b"invalid pickle")
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_receive_rejects_duplicates_within_and_across_routes(self) -> None:
         """Feature: Payload conservation.
         Description: Merge routes containing duplicate sample keys.
@@ -115,6 +122,7 @@ class TestPayloadCodec(unittest.TestCase):
             with self.subTest(segment_count=len(segments)), self.assertRaisesRegex(ValueError, "duplicate payload"):
                 _decode_received_payloads(b"".join(segments), tuple(map(len, segments)))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_receive_preserves_empty_routes_and_repeated_dataset_indices(self) -> None:
         """Feature: Payload conservation.
         Description: Merge empty routes and distinct occurrences of one index.
@@ -131,6 +139,7 @@ class TestPayloadCodec(unittest.TestCase):
 class TestDataPlaneTransport(unittest.TestCase):
     """Verify control metadata and payload bytes use their designated groups."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_control_gather_defers_decode_and_retains_variable_length_buffers(self) -> None:
         """Feature: Deferred control gather completion.
         Description: Gather differently sized objects using a mocked accelerator backend and delayed data work.
@@ -140,22 +149,28 @@ class TestDataPlaneTransport(unittest.TestCase):
         payloads = [pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL) for value in values]
         transport = DataPlaneTransport(DataGroups((0, 1), "control", None, None, 0, True), 0)
         work = Mock()
+        downloads = []
+        original_cpu = torch.Tensor.cpu
 
-        def gather(outputs: list[torch.Tensor], source: torch.Tensor, **kwargs: Any) -> Any:
+        def cpu(tensor: Any, *args: Any, **kwargs: Any) -> Any:
+            """Count whole-buffer Host transfers."""
+            downloads.append(tensor.numel())
+            return original_cpu(tensor, *args, **kwargs)
+
+        def gather(outputs: torch.Tensor, source: torch.Tensor, **kwargs: Any) -> Any:
             """Populate lengths immediately and bytes only when the consumer waits."""
             self.assertEqual(kwargs["group"], "control")
             if source.dtype == torch.int64:
-                for output, payload in zip(outputs, payloads):
-                    output.fill_(len(payload))
+                outputs.copy_(torch.tensor([len(payload) for payload in payloads]))
                 self.assertFalse(kwargs.get("async_op", False))
                 return None
             self.assertTrue(kwargs["async_op"])
 
             def complete() -> None:
                 """Populate received bytes only after the consumer waits."""
-                for output, payload in zip(outputs, payloads):
+                for output, payload in zip(outputs.view(2, -1), payloads):
                     output.zero_()
-                    output[:len(payload)].copy_(torch.tensor(list(payload), dtype=torch.uint8))
+                    output[:len(payload)].copy_(torch.frombuffer(bytearray(payload), dtype=torch.uint8))
 
             work.wait.side_effect = complete
             return work
@@ -166,8 +181,9 @@ class TestDataPlaneTransport(unittest.TestCase):
                 "hyper_parallel.distributed_data.transport._require_control_device", return_value=torch.device("cpu"),
             ),
             patch("hyper_parallel.distributed_data.transport.dist.get_world_size", return_value=2),
-            patch("hyper_parallel.distributed_data.transport.dist.all_gather", side_effect=gather),
-            patch("hyper_parallel.distributed_data.transport._decode_control", wraps=_decode_control) as decode,
+            patch("hyper_parallel.distributed_data.transport.dist.all_gather_into_tensor", side_effect=gather),
+            patch.object(torch.Tensor, "cpu", new=cpu),
+            patch("hyper_parallel.distributed_data.transport.pickle.loads", wraps=pickle.loads) as decode,
         ):
             pending = transport.begin_all_gather_object(values[0])
             work.wait.assert_not_called()
@@ -178,7 +194,9 @@ class TestDataPlaneTransport(unittest.TestCase):
             self.assertEqual(pending.wait(), values)
             work.wait.assert_called_once()
             self.assertEqual(decode.call_count, 2)
+            self.assertEqual(downloads, [2, 2 * max(map(len, payloads))])
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_default_communication_backend_is_hccl(self) -> None:
         """Feature: HCCL data-plane default.
         Description: Construct a dataset config without selecting a backend.
@@ -202,6 +220,7 @@ class TestDataPlaneTransport(unittest.TestCase):
             dp_dim_names=("dp",),
         )
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_cpu_communication_device_reuses_gloo_control_group(self) -> None:
         """Feature: Gloo data groups.
         Description: Build data groups with an explicit CPU device.
@@ -230,6 +249,7 @@ class TestDataPlaneTransport(unittest.TestCase):
         self.assertEqual(new_group.call_count, 1)
         get_backend.assert_not_called()
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_hccl_control_and_payload_groups_accept_npu_device(self) -> None:
         """Feature: HCCL data groups.
         Description: Build control and payload groups with an NPU device.
@@ -257,6 +277,7 @@ class TestDataPlaneTransport(unittest.TestCase):
         self.assertEqual(groups.payload_group, "payload")
         self.assertEqual(new_group.call_count, 2)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_payload_a2a_uses_payload_group_after_cpu_size_exchange(self) -> None:
         """Feature: Payload all-to-all.
         Description: Exchange split sizes and serialized payload bytes.
@@ -295,6 +316,7 @@ class TestDataPlaneTransport(unittest.TestCase):
         self.assertEqual(received, expected)
         self.assertEqual(collective_groups, ["control", "payload"])
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_async_exchange_defers_wait_and_preserves_send_storage(self) -> None:
         """Feature: Asynchronous payload exchange.
         Description: Launch a bulk exchange with a deferred fake Work handle.
@@ -321,6 +343,7 @@ class TestDataPlaneTransport(unittest.TestCase):
             self.assertEqual(pending.wait(), {key: {"value": 19}})
             work.wait.assert_called_once()
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_singleton_exchange_still_rejects_duplicate_occurrences(self) -> None:
         """Feature: Singleton payload exchange.
         Description: Decode duplicate keys without a distributed collective.
@@ -333,6 +356,7 @@ class TestDataPlaneTransport(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate payload"):
             transport.exchange_prepared(prepared)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_unknown_target_is_not_silently_dropped(self) -> None:
         """Feature: Payload routing.
         Description: Prepare a route to a rank outside the data plane.
@@ -343,6 +367,7 @@ class TestDataPlaneTransport(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "outside the data plane"):
             transport.prepare_exchange({1: ((SampleKey(0, 1), "sample"),)})
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_missing_control_group_fails_at_construction(self) -> None:
         """Feature: Transport validation.
         Description: Construct a multi-rank transport without a process group.
@@ -367,6 +392,7 @@ class TestModelParallelTransport(unittest.TestCase):
         return ModelParallelTransport(topology, DataGroups((0,), None, None, "model", 0, True),
                                       model_batch_spec=spec)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_dynamic_tensor_batches_round_trip_without_object_serialization(self) -> None:
         """Feature: Tensor-only model broadcast.
         Description: Replay changing lengths, empty tensors, nested fields and EOF on a peer.
@@ -401,6 +427,39 @@ class TestModelParallelTransport(unittest.TestCase):
                 torch.testing.assert_close(received["nested"][0], batch["nested"][0])
                 self.assertEqual(received["nested"][1:], ["causal", None])
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_fields_coalesce_by_dtype_and_placement_with_independent_storage(self) -> None:
+        """Feature: Coalesced model broadcast.
+        Description: Exchange dynamic, scalar, empty and noncontiguous tensor fields.
+        Expectation: One collective per dtype and placement restores independent leaf storage.
+        """
+        spec = {
+            "ids": TensorFieldSpec((None, 2), torch.int64),
+            "labels": TensorFieldSpec((None,), torch.int64),
+            "empty": TensorFieldSpec((None,), torch.int64),
+            "offsets": TensorFieldSpec((None,), torch.int64, "cpu"),
+            "count": TensorFieldSpec((), torch.int64, "cpu"),
+            "weight": TensorFieldSpec((2,), torch.float32),
+        }
+        batch = {"ids": torch.arange(12).reshape(3, 4)[:, ::2], "labels": torch.arange(3),
+                 "empty": torch.empty(0, dtype=torch.int64), "offsets": torch.tensor([0, 3]),
+                 "count": torch.tensor(3), "weight": torch.tensor([0.5, 1.0])}
+        wire = []
+        with patch("hyper_parallel.distributed_data.transport.dist.get_backend", return_value="gloo"), \
+                patch("hyper_parallel.distributed_data.transport.dist.broadcast") as broadcast:
+            broadcast.side_effect = lambda tensor, **_: wire.append(tensor.clone())
+            sent = self._transport(0, spec).broadcast(batch)
+            self.assertEqual(len(wire), 4)
+            pending = iter(wire)
+            broadcast.side_effect = lambda tensor, **_: tensor.copy_(next(pending))
+            received = self._transport(1, spec).broadcast(None)
+        for key, value in batch.items():
+            torch.testing.assert_close(sent[key], value, rtol=0, atol=0)
+            torch.testing.assert_close(received[key], value, rtol=0, atol=0)
+        self.assertNotEqual(received["ids"].untyped_storage().data_ptr(),
+                            received["labels"].untyped_storage().data_ptr())
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_eof_broadcast_is_one_small_tensor(self) -> None:
         """Feature: Tensor-only model broadcast.
         Description: EOF reaches peers without any payload or object collective.
@@ -417,6 +476,7 @@ class TestModelParallelTransport(unittest.TestCase):
             self.assertIsNone(self._transport(1, spec).broadcast(None))
             self.assertEqual(broadcast.call_count, 2)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_invalid_source_notifies_peer_before_payload_collectives(self) -> None:
         """Feature: Tensor-only model broadcast.
         Description: Changed keys, dtype, fixed shapes and static values fail on all peers.
@@ -443,6 +503,7 @@ class TestModelParallelTransport(unittest.TestCase):
                         self._transport(1, spec).broadcast(None)
                     self.assertEqual(broadcast.call_count, 2)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_model_parallel_requires_an_explicit_layout(self) -> None:
         """Feature: Tensor-only model broadcast.
         Description: Unknown Python batch structures cannot silently restore object broadcasts.
@@ -451,6 +512,7 @@ class TestModelParallelTransport(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "model_batch_spec"):
             self._transport(0, None)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_pure_dp_needs_no_layout_or_collectives(self) -> None:
         """Feature: Tensor-only model broadcast.
         Description: Pure-DP callers retain their existing arbitrary batch contract.
@@ -463,6 +525,7 @@ class TestModelParallelTransport(unittest.TestCase):
             self.assertIs(transport.broadcast(batch), batch)
             broadcast.assert_not_called()
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_invalid_tensor_specs_are_rejected_locally(self) -> None:
         """Feature: Tensor-only model broadcast.
         Description: Reject ambiguous dimensions, unsupported dtype values and device policies.

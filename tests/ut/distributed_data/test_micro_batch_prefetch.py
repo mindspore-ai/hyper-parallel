@@ -21,12 +21,16 @@ import weakref
 from contextlib import contextmanager
 from itertools import product
 from threading import Event, current_thread, local
+from typing import Any
 from unittest.mock import Mock, patch
 
 import torch
 
 from hyper_parallel.distributed_data import DistributedDatasetConfig
 from tests.ut.distributed_data.test_accumulation_window import _GatedDataset, _ids, _loader
+
+
+from tests.common.mark_utils import arg_mark
 
 
 class _DeviceBatch:
@@ -128,6 +132,7 @@ class _Accelerator:
 class TestMicroBatchPrefetch(unittest.TestCase):
     """Verify Host lookahead, device backpressure and delivery checkpoints."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_lookahead_copies_without_broadcasting_or_waiting_on_future_copies(self) -> None:
         """Feature: Micro-batch prefetch.
         Description: Future H2D must not add communication or dependencies to current delivery.
@@ -152,12 +157,52 @@ class TestMicroBatchPrefetch(unittest.TestCase):
             accelerator.training_stream.wait_event.assert_called_once_with(current_copy_event)
             self.assertEqual(accelerator.broadcast_streams, [accelerator.training_stream])
             self.assertTrue(all(stream is accelerator.training_stream for stream in batch.streams))
-            self.assertEqual(accelerator.module.Stream.call_count, 2)
+            self.assertEqual(accelerator.module.Stream.call_count, 1)
             loader.wait_for_prefetch()
             self.assertEqual(accelerator.broadcasts, 1)
             self.assertEqual(accelerator.copies, [[0, 1], [2, 3], [4, 5]])
             del batch
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_late_host_result_starts_h2d_without_another_training_hook(self) -> None:
+        """Feature: Automatic H2D.
+        Description: Release a Host result after prefetch returns and leave training idle.
+        Expectation: H2D starts without another next or prefetch call.
+        """
+        entered, release, copied = Event(), Event(), Event()
+        accelerator = _Accelerator()
+
+        class Dataset:
+            def __len__(self):
+                return 2
+
+            def __getitem__(self, index):
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("test did not release Host input")
+                return {"id": index}
+
+        def move(host: Any, device: Any) -> Any:
+            """Record a device copy and notify the waiting test."""
+            result = accelerator.move(host, device)
+            copied.set()
+            return result
+
+        with accelerator.installed(), _loader(
+                samples=Dataset(), accumulation=1, device="cuda:0",
+        ) as loader, patch("hyper_parallel.distributed_data.device_prefetch._move_to_device", side_effect=move):
+            try:
+                loader.prefetch()
+                self.assertTrue(entered.wait(5))
+                self.assertFalse(copied.is_set())
+                release.set()
+                self.assertTrue(copied.wait(5))
+                self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 0)
+                self.assertEqual(accelerator.copies, [[0, 1]])
+            finally:
+                release.set()
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_broadcast_uses_callers_non_default_training_stream(self) -> None:
         """Feature: Current-stream model broadcast.
         Description: Deliver input on a caller-selected stream while future H2D stays independent.
@@ -178,7 +223,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
             accelerator.training_stream.wait_event.assert_not_called()
             self.assertEqual(accelerator.broadcast_streams, [training_stream])
             self.assertTrue(all(stream is training_stream for stream in batch.streams))
-            self.assertEqual(accelerator.module.Stream.call_count, 2)
+            self.assertEqual(accelerator.module.Stream.call_count, 1)
             marker = loader._last_ready_event
             marker.record.assert_called_once_with(training_stream)
             marker.synchronize.assert_not_called()
@@ -187,6 +232,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
             training_stream.synchronize.assert_not_called()
             del batch
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_close_drains_partial_broadcast_after_failure(self) -> None:
         """Feature: Current-stream broadcast cleanup.
         Description: Fail a broadcast after submission and close the loader.
@@ -207,6 +253,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
             marker.synchronize.assert_called_once_with()
             accelerator.training_stream.synchronize.assert_not_called()
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_speculative_copy_failure_is_delivered_after_earlier_batches(self) -> None:
         """Feature: Micro-batch prefetch.
         Description: A future H2D failure is forwarded only when its micro-batch is consumed.
@@ -239,6 +286,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
             self.assertIs(caught.exception, failure)
             self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 0)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_configurable_depth_bounds_allocations_and_preserves_order(self) -> None:
         """Feature: Micro-batch prefetch.
         Description: Include zero lookahead and a queue deeper than an entire short epoch.
@@ -272,6 +320,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
                         self.assertEqual(accelerator.broadcasts, 10)
                         self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 18)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_depth_validation_and_cpu_behavior(self) -> None:
         """Feature: Micro-batch prefetch.
         Description: Reject invalid depths locally and leave CPU Host buffering unchanged.
@@ -285,6 +334,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
                 self.assertEqual([_ids(batch) for batch in loader], [list(range(i, i + 2)) for i in range(0, 44, 2)])
                 self.assertIsNone(loader._consumer_stream)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_prefetch_after_close_does_not_restart_loading(self) -> None:
         """Feature: Prefetch lifecycle.
         Description: Request and drain prefetch after early close on CPU and simulated accelerators.
@@ -314,6 +364,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
                     self.assertEqual(accelerator.copies, copies)
                     self.assertEqual(loader.state_dict(), state)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_deeper_prefetch_waits_before_reusing_each_slot(self) -> None:
         """Feature: Micro-batch prefetch.
         Description: Increasing depth still requires retirement before each replacement allocation.
@@ -339,6 +390,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
                     finally:
                         accelerator.retire_allowed.set()
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_host_windows_do_not_expand_device_prefetch(self) -> None:
         """Feature: Micro-batch prefetch.
         Description: Prepare two three-round Host windows but allocate only current and next device inputs.
@@ -359,7 +411,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
                     self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 0)
                     self.assertEqual(_ids(batch.host), [0, 1])
                     self.assertFalse(hasattr(loader, "_batch_thread"))
-                    self.assertTrue(all(thread is current_thread() for thread in accelerator.copy_threads))
+                    self.assertTrue(all(thread is loader._prefetch_thread for thread in accelerator.copy_threads))
                     self.assertTrue(all(thread is loader._prefetch_thread for thread in accelerator.pin_threads))
                     outputs = [_ids(batch.host)]
                     del batch
@@ -373,6 +425,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
                     self.assertEqual(len(accelerator.live_batches), 0)
                     self.assertEqual(loader.state_dict()["_index_sampler_state"]["consumed_samples"], 18)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_retired_training_event_blocks_third_allocation(self) -> None:
         """Feature: Micro-batch prefetch.
         Description: Keep the previous backward in flight and forbid allocating a third device batch.
@@ -398,6 +451,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
             finally:
                 accelerator.retire_allowed.set()
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_blocked_host_lookahead_does_not_block_current_device_batches(self) -> None:
         """Feature: Micro-batch prefetch.
         Description: Consume the current window while the Host producer is blocked on the next window.
@@ -420,6 +474,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
             finally:
                 dataset.release.set()
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_device_failure_preserves_last_delivered_checkpoint(self) -> None:
         """Feature: Micro-batch prefetch.
         Description: Propagate a broadcast failure despite the Host producer having committed later reads.
@@ -459,6 +514,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
                 next(loader)
             self.assertIs(repeated.exception, failure)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_checkpoint_tail_and_epoch_reuse(self) -> None:
         """Feature: Micro-batch prefetch.
         Description: Replay incomplete steps and reuse the Host thread and streams across an uneven tail.
@@ -504,6 +560,7 @@ class TestMicroBatchPrefetch(unittest.TestCase):
                     del batch
                 self.assertEqual(actual, expected)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_reset_before_first_device_delivery_and_drain_after_eof(self) -> None:
         """Feature: Micro-batch prefetch.
         Description: Discard a speculative first batch on epoch reset and drain the final device event after EOF.

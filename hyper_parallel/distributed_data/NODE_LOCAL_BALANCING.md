@@ -19,44 +19,35 @@ the candidate's relative objective improvement is strictly greater than
 retain the original distribution. Metadata gathering and planning still occur
 when sample exchange is skipped.
 
-With HCCL, source loading starts one step ahead. Metadata and payload
-collectives are issued by the training thread on an independent data stream;
-control and payload groups are separate from model groups. CPU planning,
-decoding and collation run in the producer. H2D uses a copy stream, and the
-consumer waits on its ready event without a host event synchronization.
-Pinned copy sources are retained until completion, including early close.
-Gloo keeps its complete background producer.
+Both HCCL and Gloo run source loading, metadata exchange, planning, payload
+encoding/exchange, decoding and collation in one independent data process.
+HCCL communicators belong to that process and are separate from training groups.
+The parent receives CPU tensors through PyTorch shared-storage reducers; a small
+staging thread pins them and submits H2D on a copy stream. The training stream
+waits only for the current batch's copy event. Pinned sources remain alive until
+their copies complete, including during early close.
 
-To overlap the full pipeline with model computation, call the two optional
-hooks on **every rank at the same training boundaries**:
+Ordinary iteration requests the next complete step automatically:
 
 ```python
 for microbatches in loader:
-    for index, batch in enumerate(microbatches):
+    for batch in microbatches:
         loss = forward(batch)
-        if index == 0:
-            loader.prefetch_plan()  # HCCL metadata, then background CPU planner
         loss.backward()
-        if index == 0:
-            loader.prefetch()       # HCCL plan/payload, then decode/collate/H2D
-        log_loss(loss.item())       # Host synchronization belongs after launch
 ```
 
-`prefetch()` completes `prefetch_plan()` if needed; repeated calls before
-consumption do not advance the source twice. Ordinary `next(loader)` also
-completes omitted hooks, preserving the iteration contract. Without early
-hooks, accelerator data exchange starts only when the batch is requested.
-The first step has no prior compute to overlap. Source exhaustion stops
-speculative work. To limit iteration, truncate the external source before
-wrapping it, for example with `itertools.islice(source, train_steps)`. All ranks
-must still consume equal step counts.
+`prefetch()` and the compatibility hook `prefetch_plan()` are identical,
+idempotent requests for the full pipeline. They need no forward/backward timing.
+The first step has no previous computation to overlap. Truncate the external
+source before wrapping it to limit iteration; all ranks must consume equal step
+counts. Metadata AG uses contiguous receive buffers with one bulk D2H for lengths
+and one for the gathered payload, independent of the group size. Object encoding
+still uses pickle; arbitrary metadata is supported.
 
-Launch these hooks while previously submitted device computation is still
-pending. A separate group alone does not create overlap: using the model's
-current stream, calling device-wide synchronization, or launching after a
-blocking loss read can remove that window. Metadata sizes and the plan still
-need to reach the host, and payload encoding/split exchange run on the caller;
-the amount hidden depends on the remaining compute and shared bandwidth.
+Sources and callbacks must be serializable before iteration. Tensor IPC consumes
+CPU shared memory; HCCL requires a separate child listener port range and device
+context. See [Data process requirements](README.md#data-process-requirements) for
+serialization, RNG, memory, lifecycle and deployment details.
 
 ## External-step integration
 
@@ -73,6 +64,14 @@ from hyper_parallel.distributed_data import (
     SampleMetadata,
     build_distributed_dataloader,
 )
+
+class LimitedSteps:
+    def __init__(self, source, steps):
+        self.source, self.steps = source, steps
+
+    def __iter__(self):
+        return islice(self.source, self.steps)
+
 
 config = DistributedDatasetConfig(
     seq_len=seq_len,
@@ -91,7 +90,7 @@ def pack_samples(samples, seq_len):
 
 with closing(build_distributed_dataloader(
     None, mesh, config,
-    external_step_source=islice(source, train_steps),
+    external_step_source=LimitedSteps(source, train_steps),
     metadata_fn=lambda sample: SampleMetadata(len(sample["input_ids"]), features=sample["metadata"]),
     pack_fn=pack_samples,
     collate_fn=list,

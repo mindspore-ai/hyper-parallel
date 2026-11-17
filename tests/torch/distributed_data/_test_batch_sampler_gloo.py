@@ -15,6 +15,9 @@
 """DP2/TP2 native BatchSampler ownership, metadata, and checkpoint coverage."""
 
 import logging
+import os
+import tempfile
+import weakref
 import random
 from collections import Counter
 from contextlib import ExitStack, nullcontext
@@ -47,7 +50,15 @@ class _Dataset:
 
     def __init__(self) -> None:
         """Initialize the payload read log."""
-        self.reads = []
+        descriptor, self._read_log = tempfile.mkstemp(prefix="hp-reader-test-")
+        os.close(descriptor)
+        weakref.finalize(self, os.unlink, self._read_log)
+
+    @property
+    def reads(self) -> list[int]:
+        """Inspect reads from the independent source process."""
+        with open(self._read_log, encoding="utf-8") as handle:
+            return [int(line) for line in handle]
 
     def __len__(self) -> int:
         """Return a size with an incomplete distributed tail."""
@@ -55,7 +66,8 @@ class _Dataset:
 
     def __getitem__(self, index: int) -> dict:
         """Record a read and return original model fields."""
-        self.reads.append(index)
+        with open(self._read_log, "a", encoding="utf-8") as handle:
+            handle.write(f"{index}\n")
         return {"id": index, "labels": [index + 1], "position_ids": [7], "loss_mask": [1]}
 
 
@@ -144,8 +156,7 @@ def _run_case(
         {"metadata": [_metadata({"id": index}) for index in range(len(dataset))]}
         if metadata_mode else {"metadata_fn": _metadata}
     )
-    no_a2a = patch.object(dist, "all_to_all_single", side_effect=AssertionError("metadata used A2A"))
-    with (no_a2a if metadata_mode else nullcontext()), ExitStack() as resources:
+    with ExitStack() as resources:
         loader = resources.enter_context(build_distributed_dataloader(
             dataset if rank % 2 == 0 else None, mesh, config, batch_sampler=source_sampler, **metadata_options,
             cost_model=lambda metadata: metadata.cost, collate_fn=_native_collate, model_batch_spec=_native_spec(2),
@@ -440,13 +451,29 @@ def _check_early_close_with_uneven_lookahead(mesh: object, accelerator: object) 
                 accumulation=1, device_prefetch_depth=1,
         ) as loader:
             loader._device = torch.device("cuda:0")
-            # Delay all optional staging until ranks can deliberately diverge.
-            with patch.object(loader, "_host_batch_ready", return_value=False):
+            blocked = False
+            ready = loader._host_batch_ready
+            stage = loader._stage_device_batch
+
+            def stage_first(event: object) -> object:
+                """Pause optional staging once the first batch is ready.
+
+                Args:
+                    event: Completion event from the retired input slot.
+                """
+                nonlocal blocked
+                prepared = stage(event)
+                blocked = True
+                return prepared
+
+            with patch.object(loader, "_host_batch_ready", side_effect=lambda: not blocked and ready()), \
+                    patch.object(loader, "_stage_device_batch", side_effect=stage_first):
                 next(loader)
-            if dist.get_rank() == 0:
-                loader._prefetch_device_batches(1, blocking=True)
-            queued = _gather(len(loader._device_batches))
-            assert queued == [1, 0, 0, 0], f"Fixture did not create uneven lookahead: {queued}"
+                if dist.get_rank() == 0:
+                    blocked = False
+                    loader._fill_requested_device_prefetch()
+                queued = _gather(len(loader._device_batches))
+                assert queued == [1, 0, 0, 0], f"Fixture did not create uneven lookahead: {queued}"
             worker = loader._prefetch_thread
         assert not worker.is_alive(), "Early close left a Host producer running"
         dist.barrier()

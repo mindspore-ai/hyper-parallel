@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import math
 import pickle
 import struct
 from dataclasses import dataclass
@@ -58,7 +59,7 @@ class ControlGatherWork:
 
     encoded: torch.Tensor | None = None
     sizes: tuple[int, ...] = ()
-    gathered: tuple[torch.Tensor, ...] = ()
+    gathered: torch.Tensor | None = None
     data_work: Any = None
     completed_values: tuple[Any, ...] | None = None
 
@@ -67,9 +68,9 @@ class ControlGatherWork:
         if self.completed_values is None:
             if self.data_work is not None:
                 self.data_work.wait()
-            self.completed_values = tuple(
-                _decode_control(payload, size) for payload, size in zip(self.gathered, self.sizes)
-            )
+            rows = self.gathered.cpu().view(len(self.sizes), -1).numpy()
+            self.completed_values = tuple(pickle.loads(row[:size].tobytes())
+                                          for row, size in zip(rows, self.sizes))
         return self.completed_values
 
 
@@ -130,9 +131,7 @@ def _require_control_device(device: Any, backend: str) -> torch.device:
 def _encode_control(value: Any, device: Any) -> tuple[torch.Tensor, int]:
     encoded = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
     resolved = torch.device(device)
-    payload = torch.zeros((max(1, len(encoded)),), dtype=torch.uint8, device=resolved)
-    if encoded:
-        payload[:len(encoded)] = torch.tensor(list(encoded), dtype=torch.uint8, device=resolved)
+    payload = torch.frombuffer(bytearray(encoded), dtype=torch.uint8).to(resolved)
     return payload, len(encoded)
 
 
@@ -178,17 +177,17 @@ def _begin_all_gather_control_object(
     resolved = _require_control_device(device, effective_backend)
     encoded, encoded_size = _encode_control(value, resolved)
     local_size = torch.tensor([encoded_size], dtype=torch.int64, device=resolved)
-    sizes = [torch.empty_like(local_size) for _ in range(dist.get_world_size(group))]
-    dist.all_gather(sizes, local_size, group=group)
-    host_sizes = tuple(int(item.item()) for item in sizes)
+    sizes = torch.empty(dist.get_world_size(group), dtype=torch.int64, device=resolved)
+    dist.all_gather_into_tensor(sizes, local_size, group=group)
+    host_sizes = tuple(sizes.cpu().tolist())
     max_size = max(host_sizes)
     if encoded.numel() < max_size:
         padded = torch.zeros((max_size,), dtype=torch.uint8, device=resolved)
         padded[:encoded.numel()] = encoded
         encoded = padded
-    gathered = [torch.empty_like(encoded) for _ in sizes]
-    work = dist.all_gather(gathered, encoded, group=group, async_op=True)
-    return ControlGatherWork(encoded=encoded, sizes=host_sizes, gathered=tuple(gathered), data_work=work)
+    gathered = torch.empty(len(host_sizes) * max_size, dtype=torch.uint8, device=resolved)
+    work = dist.all_gather_into_tensor(gathered, encoded, group=group, async_op=True)
+    return ControlGatherWork(encoded=encoded, sizes=host_sizes, gathered=gathered, data_work=work)
 
 
 def broadcast_control_object(
@@ -670,12 +669,14 @@ class DataPlaneTransport:
     topology is fixed at build time; it is not revalidated for each collective.
     """
 
-    def __init__(self, groups: DataGroups, global_rank: int, communication_device: Any = None) -> None:
+    def __init__(self, groups: DataGroups, global_rank: int, communication_device: Any = None,
+                 *, planner_process_rank: int | None = None) -> None:
         """Store service-group membership."""
         self._ranks = groups.data_plane_ranks
         self._control_group = groups.control_group
         self._payload_group = groups.payload_group
         self._planner_rank = groups.planner_rank
+        self._planner_process_rank = groups.planner_rank if planner_process_rank is None else planner_process_rank
         self._global_rank = global_rank
         self._is_member = global_rank in self._ranks
         self._local_index = self._ranks.index(global_rank) if self._is_member else None
@@ -709,6 +710,11 @@ class DataPlaneTransport:
     def communication_backend(self) -> str:
         """Return the backend used by this data-plane control group."""
         return _control_backend(self._control_group)
+
+    @property
+    def payload_backend(self) -> str | None:
+        """Return the payload backend for rebuilding an independent data group."""
+        return _control_backend(self._payload_group) if self._payload_group is not None else None
 
     def all_gather_object(self, value: Any) -> tuple[Any, ...]:
         """Gather small control objects on every data-plane rank.
@@ -786,7 +792,7 @@ class DataPlaneTransport:
             return value
         return broadcast_control_object(
             value if self._global_rank == self._planner_rank else None,
-            src=self._planner_rank,
+            src=self._planner_process_rank,
             group=self._control_group,
             device=self._communication_device,
         )
@@ -973,9 +979,36 @@ class ModelParallelTransport:
         if values[0] != 1:
             raise ValueError("Invalid model batch status header.")
         shapes = self._layout.shapes(values[1:])
-        received = [self._broadcast_tensor(field, shape, tensors[index] if is_constructor else None)
-                    for index, (field, shape) in enumerate(zip(self._layout.fields, shapes))]
+        received = self._broadcast_tensors(shapes, tensors)
         return self._layout.rebuild(received)
+
+    def _broadcast_tensors(self, shapes: list[tuple[int, ...]], sources: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Coalesce fields with the same dtype and destination placement."""
+        buckets = {}
+        for index, field in enumerate(self._layout.fields):
+            buckets.setdefault((field.dtype, field.device), []).append(index)
+        received = [None] * len(shapes)
+        for indices in buckets.values():
+            field = self._layout.fields[indices[0]]
+            bucket_shapes = [shapes[index] for index in indices]
+            local = [sources[index] for index in indices] if sources else []
+            for index, tensor in zip(indices, self._broadcast_bucket(field, bucket_shapes, local)):
+                received[index] = tensor
+        return received
+
+    def _broadcast_bucket(self, field: Any, shapes: list[tuple[int, ...]],
+                          sources: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Broadcast one packed payload while retaining independent leaf storage."""
+        if len(shapes) == 1:
+            return [self._broadcast_tensor(field, shapes[0], sources[0] if sources else None)]
+        target = torch.device("cpu") if field.device == "cpu" else self._device
+        local = [tensor.to(target).contiguous() for tensor in sources]
+        sizes = [math.prod(shape) for shape in shapes]
+        packed = torch.cat([tensor.reshape(-1) for tensor in local]) if local else None
+        packed = self._broadcast_tensor(field, (sum(sizes),), packed)
+        if local:
+            return local
+        return [part.reshape(shape).clone() for part, shape in zip(packed.split(sizes), shapes)]
 
     def _broadcast_tensor(self, field: Any, shape: tuple[int, ...], source: Any) -> torch.Tensor:
         """Broadcast one declared tensor using a backend-compatible transfer device."""
