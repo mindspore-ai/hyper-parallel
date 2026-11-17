@@ -99,8 +99,11 @@ class TestSelectedLogProbs(unittest.TestCase):
                         del module, inputs
                         counts[index] += 1
 
+                    # Transformers 5.23 checkpoints ``forward`` instead of ``__call__`` so module
+                    # hooks on the layer stay outside the checkpoint and fire once; a submodule
+                    # hook still observes the real recomputation of the decoder body.
                     for index, layer in enumerate(selected.model.layers):
-                        layer.register_forward_pre_hook(partial(count, index=index, counts=decoder_calls))
+                        layer.mlp.register_forward_pre_hook(partial(count, index=index, counts=decoder_calls))
                     expected = _dense(dense, self.ids, self.mask)
                     actual = selected(input_ids=self.ids, attention_mask=self.mask, use_cache=False,
                                       return_token_log_probs=True)

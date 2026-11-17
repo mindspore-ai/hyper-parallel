@@ -14,6 +14,8 @@
 # ============================================================================
 """Rebuild Qwen dense and MoE rotary buffers after empty materialization."""
 
+import inspect
+
 import torch
 from torch import nn
 
@@ -30,7 +32,14 @@ def register_rotary_materialization(model: nn.Module) -> None:
         class_name = type(module).__name__
         with torch.device("cpu"):
             if class_name in _TEXT_ROTARY_CLASSES:
-                reference = type(module)(module.config, device="cpu")
+                # Transformers 5.23 dropped the `device` kwarg from rotary
+                # __init__ (device comes from the surrounding torch.device
+                # context); our generated classes still accept it. Pass it
+                # only when the installed class takes it.
+                if "device" in inspect.signature(type(module).__init__).parameters:
+                    reference = type(module)(module.config, device="cpu")
+                else:
+                    reference = type(module)(module.config)
             elif class_name in _VISION_ROTARY_CLASSES:
                 reference = type(module)(module.dim, module.theta)
             else:

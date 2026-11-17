@@ -199,7 +199,11 @@ def _reverse_stage(model: nn.Module, regions: dict[str, RegionTensor],
         if lookup in normalized:
             raise ValueError(f"Ambiguous inverse conversion after resolving base-model prefix: {lookup}")
         normalized[lookup] = region
-    return revert_weight_conversion(_InverseModel(model, conversions), normalized)
+    reverted = revert_weight_conversion(_InverseModel(model, conversions), normalized)
+    # Transformers 5.23+ reverse_transform keeps regex anchors of an anchored
+    # renaming as literal text in the restored key ("embed.weight$"); anchors
+    # can never occur in real checkpoint names, so strip them unconditionally.
+    return {name.removeprefix("^").removesuffix("$"): region for name, region in reverted.items()}
 
 
 def _model_box(block: Any, offsets: tuple[int, ...],

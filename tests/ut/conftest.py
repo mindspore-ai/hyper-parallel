@@ -32,6 +32,11 @@ import pytest
 # skips that chain; nothing in this suite uses tensorflow.
 os.environ.setdefault("USE_TF", "0")
 
+# UT tensors are tiny, so OpenMP fan-out/join dominates the actual math on
+# many-core gate executors (a 70s case drops to 3s with 4 threads on a
+# 256-core host). Cap intra-op threads before torch initializes its pool.
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+
 
 class NoAcceleratorGuard:
     """Fail fast when a CPU-gated test accidentally reaches for a device.
@@ -154,4 +159,35 @@ _preload_libgomp_early_for_static_tls()
 
 def pytest_configure(config) -> None:  # pylint: disable=unused-argument
     """Import ``dtensor`` early so collection does not race the torch backend binding."""
+    import torch  # pylint: disable=import-outside-toplevel
+
+    # Enforce the cap even when torch was imported before this conftest
+    # (environment variables are only read at pool creation).
+    torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", "4")))
+    _restore_cpu_dataloader_iter_init(torch)
     import hyper_parallel.core.dtensor.dtensor  # noqa: F401 pylint: disable=unused-import
+
+
+def _restore_cpu_dataloader_iter_init(torch) -> None:
+    """Undo torch_npu's DataLoader patch when no NPU device is usable.
+
+    ``torch_npu`` unconditionally replaces ``_MultiProcessingDataLoaderIter.__init__``
+    with a wrapper that calls ``_npu_set_thread_affinity``; with the toolkit
+    sourced but no visible device (CPU gate, ``ASCEND_RT_VISIBLE_DEVICES=""``)
+    that ACL call raises and every multi-worker DataLoader fails. These are
+    CPU-gated tests, so put the original initializer back.
+    """
+    try:
+        import torch_npu  # pylint: disable=import-outside-toplevel
+    except ImportError:
+        return
+    try:
+        if torch_npu.npu.is_available():
+            return
+        from torch_npu.utils import _module as npu_module  # pylint: disable=import-outside-toplevel
+        original = getattr(npu_module, "origin_mpdl_iter_init", None)
+        if original is not None:
+            torch.utils.data.dataloader._MultiProcessingDataLoaderIter.__init__ = original  # pylint: disable=protected-access
+    except Exception:  # pylint: disable=broad-except
+        # Never let an optional accelerator integration break CPU collection.
+        return
