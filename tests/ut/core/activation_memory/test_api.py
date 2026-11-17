@@ -18,6 +18,7 @@
 # pylint: disable=wrong-import-position,import-outside-toplevel,unused-argument
 import contextlib
 import importlib
+from tests.common.mark_utils import arg_mark
 import inspect
 import os
 import unittest
@@ -204,8 +205,14 @@ class TestLazyApiDelegates(unittest.TestCase):
 
         self.assertIs(result, sentinel.noop_context_fn)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_checkpoint_exclude_wrapper_forwards_arguments(self):
-        """Test checkpoint-exclusion wrapper forwards all swap options."""
+        """
+        Feature: lazy API delegation for checkpoint exclusion.
+        Description: Call the facade checkpoint_exclude_wrapper with every option.
+        Expectation: The facade forwards all options to the wrapper implementation.
+        """
         with patch.object(
             _wrapper_impl,
             "checkpoint_exclude_wrapper",
@@ -216,6 +223,8 @@ class TestLazyApiDelegates(unittest.TestCase):
                 swap=True,
                 group_swap=True,
                 cpu_pool=sentinel.cpu_pool,
+                preserve_inputs=True,
+                exclude_single_op=True,
             )
 
         self.assertIs(result, sentinel.wrapper)
@@ -224,10 +233,18 @@ class TestLazyApiDelegates(unittest.TestCase):
             swap=True,
             group_swap=True,
             cpu_pool=sentinel.cpu_pool,
+            preserve_inputs=True,
+            exclude_single_op=True,
         )
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard",
+              essential_mark="essential")
     def test_checkpoint_exclude_wrapper_forwards_defaults(self):
-        """Test checkpoint-exclusion defaults are explicit at the facade boundary."""
+        """
+        Feature: lazy API delegation for checkpoint exclusion.
+        Description: Call the facade checkpoint_exclude_wrapper without options.
+        Expectation: The facade forwards explicit defaults to the wrapper implementation.
+        """
         with patch.object(
             _wrapper_impl,
             "checkpoint_exclude_wrapper",
@@ -241,6 +258,8 @@ class TestLazyApiDelegates(unittest.TestCase):
             swap=False,
             group_swap=False,
             cpu_pool=None,
+            preserve_inputs=False,
+            exclude_single_op=False,
         )
 
     def test_checkpoint_exclude_wrapper_rejects_removed_save_output_argument(self):

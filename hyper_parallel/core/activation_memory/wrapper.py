@@ -21,7 +21,7 @@
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
-from typing import Optional, Callable, Any, Union, cast
+from typing import Optional, Callable, Any, Dict, Tuple, Union, cast
 import types
 import warnings
 import torch
@@ -559,6 +559,8 @@ class CheckpointExcludeWrapper(ActivationWrapper):
         swap: bool = False,
         group_swap: bool = False,
         cpu_pool: Optional[PinnedMemoryPool] = None,
+        preserve_inputs: bool = False,
+        exclude_single_op: bool = False,
     ) -> None:
         """Initialize a checkpoint exclusion wrapper for a PyTorch module or function."""
         if not callable(module):
@@ -569,6 +571,10 @@ class CheckpointExcludeWrapper(ActivationWrapper):
             raise ValueError(f"group_swap must be a bool, got {type(group_swap).__name__}")
         if cpu_pool is not None and not isinstance(cpu_pool, PinnedMemoryPool):
             raise ValueError(f"cpu_pool must be a PinnedMemoryPool or None, got {type(cpu_pool).__name__}")
+        if not isinstance(preserve_inputs, bool):
+            raise ValueError(f"preserve_inputs must be a bool, got {type(preserve_inputs).__name__}")
+        if not isinstance(exclude_single_op, bool):
+            raise ValueError(f"exclude_single_op must be a bool, got {type(exclude_single_op).__name__}")
         ignored_options = []
         if not swap:
             if group_swap:
@@ -586,6 +592,8 @@ class CheckpointExcludeWrapper(ActivationWrapper):
         self.swap = swap
         self.group_swap = group_swap
         self.cpu_pool = cpu_pool
+        self.preserve_inputs = preserve_inputs
+        self.exclude_single_op = exclude_single_op
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         """Execute normally outside recompute and return the cached output in recompute."""
@@ -593,6 +601,44 @@ class CheckpointExcludeWrapper(ActivationWrapper):
         state = get_recompute_state()
         if state is None:
             return wrapped_module(*args, **kwargs)
+        if self.exclude_single_op:
+            return self._forward_local_op(wrapped_module, state, args, kwargs)
+        return self._forward_region(wrapped_module, state, args, kwargs)
+
+    def _forward_local_op(
+        self,
+        wrapped_module: Callable[..., Any],
+        state: Any,
+        args: Tuple[Any, ...],
+        kwargs: Dict[str, Any],
+    ) -> Any:
+        """Keep only the first dispatched local kernel out of recomputation."""
+        scope = _checkpoint_exclude._LocalOpExclusionScope(
+            id(self),
+            state,
+            preserve_inputs=self.preserve_inputs,
+        )
+        pack_token = _checkpoint_exclude._ACTIVE_LOCAL_EXCLUSION.set(scope)
+        try:
+            output = wrapped_module(*args, **kwargs)
+        finally:
+            _checkpoint_exclude._ACTIVE_LOCAL_EXCLUSION.reset(pack_token)
+        if not scope.consumed:
+            raise RuntimeError(
+                "checkpoint_exclude_wrapper(exclude_single_op=True) wrapped a callable "
+                "that dispatched no custom-shard operator: wrap the single expensive "
+                "dispatched kernel call, or use region exclusion (exclude_single_op=False)"
+            )
+        return output
+
+    def _forward_region(
+        self,
+        wrapped_module: Callable[..., Any],
+        state: Any,
+        args: Tuple[Any, ...],
+        kwargs: Dict[str, Any],
+    ) -> Any:
+        """Exclude the whole wrapped region from checkpoint recomputation."""
         cache = state.get_resource(_checkpoint_exclude._EXCLUDE_CACHE_KEY, _checkpoint_exclude._ExcludeCache)
         if state.is_recomputing:
             entry = cache.pop(id(self))
@@ -619,7 +665,12 @@ class CheckpointExcludeWrapper(ActivationWrapper):
         input_infos = _checkpoint_exclude._capture_recompute_inputs(args, kwargs)
         input_bindings = []
         pack_token = _checkpoint_exclude._ACTIVE_PACK_STATE.set(
-            _checkpoint_exclude._PackState(input_infos, input_bindings, swap_hooks=swap_hooks)
+            _checkpoint_exclude._PackState(
+                input_infos,
+                input_bindings,
+                swap_hooks=swap_hooks,
+                preserve_inputs=self.preserve_inputs,
+            )
         )
         try:
             with _checkpoint_exclude._saved_tensors_context():
@@ -646,7 +697,7 @@ class CheckpointExcludeWrapper(ActivationWrapper):
         cache.save(
             id(self),
             _checkpoint_exclude._ExcludeCacheEntry(
-                output,
+                finalized_output,
                 input_bindings,
                 rng_state,
             ),
@@ -660,11 +711,13 @@ def checkpoint_exclude_wrapper(
     swap: bool = False,
     group_swap: bool = False,
     cpu_pool: Optional[PinnedMemoryPool] = None,
+    preserve_inputs: bool = False,
+    exclude_single_op: bool = False,
 ) -> CheckpointExcludeWrapper:
-    """Wrap a PyTorch module or function so its region is not recomputed.
+    """Wrap a module or function so its region is not recomputed.
 
     Args:
-        module: PyTorch Module or callable to execute only during the original
+        module: Module or callable to execute only during the original
             checkpoint forward pass.
         swap: Whether eligible outputs and non-recomputable saved tensors should
             use the active activation-swap group. Default: ``False``.
@@ -672,6 +725,17 @@ def checkpoint_exclude_wrapper(
             Only used when ``swap=True`` inside an active checkpoint.
         cpu_pool: Optional pinned-memory pool used for swapped tensors. Only used
             when ``swap=True`` inside an active checkpoint.
+        preserve_inputs: Keep the real forward inputs as the excluded region's
+            saved tensors instead of deferred replay aliases. Backward through
+            the excluded region may then run before the surrounding checkpoint
+            has recomputed, which is what an early (layer-wise) auxiliary
+            backward requires. Default: ``False``.
+        exclude_single_op: Move the exclusion boundary down to the first
+            custom-shard local kernel dispatched inside the callable. The
+            DTensor expansion helpers around that kernel keep running during
+            replay while the kernel output is reused from cache; the wrapped
+            callable must dispatch at least one custom-shard operator.
+            Default: ``False``.
 
     Returns:
         A wrapper that saves the callable's autograd tensors and reuses its
@@ -687,4 +751,6 @@ def checkpoint_exclude_wrapper(
         swap=swap,
         group_swap=group_swap,
         cpu_pool=cpu_pool,
+        preserve_inputs=preserve_inputs,
+        exclude_single_op=exclude_single_op,
     )

@@ -105,6 +105,8 @@ def checkpoint_exclude_wrapper(  # pylint: disable=redefined-outer-name
     swap: bool = False,
     group_swap: bool = False,
     cpu_pool: Any = None,
+    preserve_inputs: bool = False,
+    exclude_single_op: bool = False,
 ) -> Any:
     """Wrap a callable whose region is excluded from activation recomputation.
 
@@ -114,6 +116,10 @@ def checkpoint_exclude_wrapper(  # pylint: disable=redefined-outer-name
             use the active activation-swap group. Default: ``False``.
         group_swap: Whether swapped tensors participate in group copy fusion.
         cpu_pool: Optional pinned-memory pool used for swapped tensors.
+        preserve_inputs: Keep real forward inputs as the excluded region's saved
+            tensors so its backward may run before checkpoint replay. Default: ``False``.
+        exclude_single_op: Exclude only the first dispatched custom-shard local
+            kernel instead of the whole region. Default: ``False``.
 
     Returns:
         The checkpoint exclusion wrapper.
@@ -125,6 +131,8 @@ def checkpoint_exclude_wrapper(  # pylint: disable=redefined-outer-name
         swap=swap,
         group_swap=group_swap,
         cpu_pool=cpu_pool,
+        preserve_inputs=preserve_inputs,
+        exclude_single_op=exclude_single_op,
     )
 
 

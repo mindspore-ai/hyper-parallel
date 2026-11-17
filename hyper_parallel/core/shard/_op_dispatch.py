@@ -28,6 +28,7 @@ from typing import Any, Dict, FrozenSet, List, Optional
 import torch
 import yaml
 
+from hyper_parallel.core.activation_memory import checkpoint_exclude
 from hyper_parallel.core.shard.ops.parallel_ops import DistributedOp
 from hyper_parallel.core.shard.utils import distributed_cross_entropy_from_op_call, get_op_name
 from hyper_parallel.core.shard.ops.parallel_ops_register import get_distributed_op
@@ -792,7 +793,9 @@ class OpDispatcher:
         )
 
         op_impl = op_call if op_impl is None else op_impl
-        py_output = op_impl(*local_args, **local_kwargs)
+        # An exclude_single_op wrapper moves the exclusion boundary down to this
+        # local kernel; the expansion helpers above and below keep re-running.
+        py_output = checkpoint_exclude.run_excludable_local_kernel(op_impl, local_args, local_kwargs)
         output = distribute_op.wrap_output(py_output, infer_result[0])
         return OpDispatcher._restore_inplace_dtensor_result(op_name, args, output)
 

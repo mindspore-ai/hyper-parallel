@@ -935,8 +935,13 @@ def _select_excluded_targets(
     return selected_targets
 
 
-def _wrap_excluded_targets(module_by_fqn: dict, exclude_targets: list) -> int:
+def _wrap_excluded_targets(
+    module_by_fqn: dict,
+    exclude_targets: list,
+    wrapper_kwargs: Optional[dict] = None,
+) -> int:
     """Install exclusion wrappers deepest-first; return the wrapped count."""
+    options = wrapper_kwargs or {}
     wrapped_count = 0
     for module_fqn, module in sorted(
         exclude_targets,
@@ -949,7 +954,7 @@ def _wrap_excluded_targets(module_by_fqn: dict, exclude_targets: list) -> int:
         setattr(
             module_by_fqn[parent_fqn],
             child_name,
-            checkpoint_exclude_wrapper(module),
+            checkpoint_exclude_wrapper(module, **options),
         )
         wrapped_count += 1
     return wrapped_count
@@ -1041,7 +1046,12 @@ def _wrap_declared_exclusions(module_by_fqn: dict, roots: list, recompute_spec: 
             "inside the selected regions"
         )
     _validate_region_exclusions(roots, exclude_targets)
-    return _wrap_excluded_targets(module_by_fqn, exclude_targets)
+    options = (
+        {"preserve_inputs": True}
+        if getattr(recompute_spec, "exclude_preserve_inputs", False)
+        else None
+    )
+    return _wrap_excluded_targets(module_by_fqn, exclude_targets, options)
 
 
 def _wrap_region_roots(model: nn.Module, module_by_fqn: dict, roots: list, checkpoint_kwargs: dict) -> int:

@@ -224,3 +224,11 @@
 # the Torch-only component contract; the legacy backend-import rule is narrower.
 "hyper-parallel/hyper_parallel/components/functional/linear_attention_packed.py" "forbidden-backend-import"
 "hyper-parallel/hyper_parallel/components/functional/linear_attention_convolution.py" "forbidden-backend-import"
+
+# 29. Activation memory — api.py is a thin lazy facade over wrapper.py and
+#     wrapper.py resolves its runtime config via the api module at call time;
+#     the import cycle is resolved lazily at runtime, so pylint's static
+#     import graph (api -> wrapper -> api) flags R0401 on whichever module
+#     in the co-lint set closes the cycle.
+"hyper-parallel/hyper_parallel/core/activation_memory/" "cyclic-import"
+"hyper-parallel/tests/ut/core/activation_memory/" "cyclic-import"

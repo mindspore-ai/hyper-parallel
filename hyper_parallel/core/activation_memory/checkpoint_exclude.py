@@ -18,7 +18,7 @@ from collections import defaultdict, deque
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import cached_property, lru_cache
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import torch
 
@@ -124,6 +124,7 @@ class _PackState:
     inputs: Tuple[_InputInfo, ...]
     bindings: List[_InputBinding]
     swap_hooks: Optional[Any] = None
+    preserve_inputs: bool = False
 
 
 _ACTIVE_PACK_STATE: ContextVar[Any] = ContextVar(
@@ -181,6 +182,91 @@ class _ExcludeCache:
     def clear(self) -> None:
         """Release outputs not consumed because recomputation stopped early."""
         self._entries.clear()
+
+
+class _LocalOpExclusionScope:
+    """One-shot exclusion boundary for the first dispatched local kernel.
+
+    ``exclude_single_op`` wrappers install this scope around the wrapped
+    callable. The first custom-shard local kernel executed under the scope is
+    the exclusion target: its output and saved tensors are captured on the
+    SAVE pass and reused on the RECOMPUTE pass, while the DTensor expansion
+    helpers around it keep their original lifecycle in both passes. The scope
+    is consumed exactly once so kernel-level exclusion can never leak into
+    expansion helpers or sibling dispatches.
+    """
+
+    def __init__(self, wrapper_id: int, recompute_state: Any, preserve_inputs: bool = False) -> None:
+        """Initialize an unconsumed scope bound to one exclusion wrapper."""
+        self.wrapper_id = wrapper_id
+        self.recompute_state = recompute_state
+        self.preserve_inputs = preserve_inputs
+        self.consumed = False
+
+
+_ACTIVE_LOCAL_EXCLUSION: ContextVar[Optional[_LocalOpExclusionScope]] = ContextVar(
+    "hyper_parallel_checkpoint_exclude_local_op",
+    default=None,
+)
+
+
+def run_excludable_local_kernel(
+    op_impl: Callable[..., Any],
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+) -> Any:
+    """Run one dispatched local kernel under an active local-op exclusion scope.
+
+    Outside a fresh scope this is a plain call. Under a fresh scope, the first
+    kernel executes once on the SAVE pass with its saved tensors captured at
+    kernel granularity, and the RECOMPUTE pass returns the cached output
+    without re-running the kernel. Only the kernel boundary is excluded from
+    the replay; the surrounding DTensor expansion helpers always re-run.
+
+    Args:
+        op_impl: The local operator implementation resolved by dispatch.
+        args: Positional arguments of the local kernel call.
+        kwargs: Keyword arguments of the local kernel call.
+
+    Returns:
+        The kernel output, fresh on SAVE and cached on RECOMPUTE.
+    """
+    scope = _ACTIVE_LOCAL_EXCLUSION.get()
+    if scope is None or scope.consumed:
+        return op_impl(*args, **kwargs)
+    scope.consumed = True
+    state = scope.recompute_state
+    cache = state.get_resource(_EXCLUDE_CACHE_KEY, _ExcludeCache)
+    if state.is_recomputing:
+        entry = cache.pop(scope.wrapper_id)
+        _restore_rng_state(entry.rng_state)
+        _materialize_recompute_inputs(entry, args, kwargs)
+        # Re-apply the boundary so the recompute pass saves the trigger the
+        # forward pass saved, keeping checkpoint save counts consistent.
+        return _finalize_save_outputs(entry.output, _has_used_input(entry.input_bindings))
+
+    input_infos = _capture_recompute_inputs(args, kwargs)
+    input_bindings: List[_InputBinding] = []
+    pack_token = _ACTIVE_PACK_STATE.set(
+        _PackState(input_infos, input_bindings, preserve_inputs=scope.preserve_inputs)
+    )
+    try:
+        with _saved_tensors_context():
+            output = op_impl(*args, **kwargs)
+    finally:
+        _ACTIVE_PACK_STATE.reset(pack_token)
+    rng_state = _capture_rng_state(
+        args,
+        kwargs,
+        output,
+        state.preserve_rng_state,
+    )
+    finalized_output = _finalize_save_outputs(output, _has_used_input(input_bindings))
+    cache.save(
+        scope.wrapper_id,
+        _ExcludeCacheEntry(finalized_output, input_bindings, rng_state),
+    )
+    return finalized_output
 
 
 @lru_cache(maxsize=1)
@@ -378,6 +464,10 @@ def _pack_saved_tensor(tensor: Any) -> Any:
             return _SavedTensorData(tensor.detach(), tensor._version)  # pylint: disable=protected-access
         matched = _match_recompute_input(tensor, pack_state.inputs)
         if matched is not None:
+            if pack_state.preserve_inputs:
+                # Early backward may run before checkpoint replay has produced
+                # its inputs, so keep the real tensor instead of a deferred alias.
+                return _SavedTensorData(tensor.detach(), tensor._version)  # pylint: disable=protected-access
             input_info, recipe = matched
             handle = _RecomputedInputHandle(recipe)
             pack_state.bindings.append(_InputBinding(input_info.path, handle))

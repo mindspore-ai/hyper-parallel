@@ -63,12 +63,19 @@ class RecomputePolicy:
     path cannot express, such as "keep the attention of every role that does not
     recompute out of the region". It receives ``(module_fqn, module)`` and is
     evaluated together with ``exclude_patterns``.
+
+    ``exclude_preserve_inputs`` installs the exclusions with
+    ``checkpoint_exclude_wrapper(preserve_inputs=True)``: their backward may run
+    before the surrounding checkpoint recomputes, which a layer-wise auxiliary
+    backward (for example the DSA indexer KL loss) requires. Without it the
+    excluded regions defer their saved inputs to replay aliases.
     """
 
     region_patterns: tuple[str, ...]
     exclude_patterns: tuple[str, ...] = ()
     exclude_predicate: Optional[Callable[[str, Any], bool]] = None
     on_applied: Optional[Callable[[Any], None]] = None
+    exclude_preserve_inputs: bool = False
 
 
 @dataclass(frozen=True)
