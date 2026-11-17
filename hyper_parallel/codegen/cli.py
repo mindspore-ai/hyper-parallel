@@ -29,7 +29,14 @@ logger = logging.getLogger(__name__)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    """Run the CLI and return its process exit code."""
+    """Run the CLI and return its process exit code.
+
+    Args:
+        argv: Optional command-line arguments. Defaults to ``sys.argv``.
+
+    Returns:
+        Zero on success and a nonzero process exit code on failure.
+    """
     parser = _build_parser()
     args, config_overrides = parser.parse_known_args(argv)
     setattr(args, "_config_overrides", config_overrides)
@@ -40,15 +47,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         return args.func(args)
     except Exception as exc:  # A CLI reports failures without a traceback by default.
-        if getattr(args, "verbose", False):
-            logger.exception("codegen: %s", exc)
-        else:
-            logger.error("codegen: %s", exc)
+        logger.warning("codegen: %s", exc, exc_info=getattr(args, "verbose", False))
         return 1
 
 
 def cmd_generate(args: argparse.Namespace) -> int:
-    """Observe a meta model and generate a fresh bundle."""
+    """Observe a meta model and generate a fresh bundle.
+
+    Args:
+        args: Parsed codegen generation arguments.
+
+    Returns:
+        Zero after the bundle is generated successfully.
+    """
     if int(os.environ.get("WORLD_SIZE", "1")) > 1:
         raise RuntimeError(
             "codegen generate is a single-process CPU/meta command; "
