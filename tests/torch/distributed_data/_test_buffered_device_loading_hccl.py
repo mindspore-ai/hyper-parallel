@@ -15,15 +15,19 @@
 """Accelerator integration for automatic H2D, caller collectives and MP broadcast."""
 
 import os
+from contextlib import closing
 from datetime import timedelta
 from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
+from torch.utils.data import DataLoader
 
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
 from hyper_parallel.distributed_data import (
-    DistributedDatasetConfig, SampleMetadata, TensorFieldSpec, WorkloadCost, build_distributed_dataloader,
+    CausalAttentionCostModel, DistributedDatasetConfig, SampleMetadata, TensorFieldSpec, WorkloadCost,
+    build_distributed_dataloader,
 )
 
 
@@ -66,6 +70,7 @@ def _native(device: torch.device, backend: str, metadata_mode: bool) -> None:
                 seq_len=8, local_batch_size=2, communication_backend=backend, metadata_mode=metadata_mode,
                 balance_window_size=3,
             ),
+            dataloader_kwargs={"num_workers": 1, "persistent_workers": True},
             batch_sampler=sampler, device=device,
             collate_fn=lambda samples: tuple({**sample, "id": torch.tensor(sample["id"])} for sample in samples),
             model_batch_spec=(sample_spec, sample_spec),
@@ -153,6 +158,100 @@ def test_buffered_device_loading_hccl() -> None:
             for metadata_mode in (False, True):
                 _native(device, backend, metadata_mode)
         _local(device)
+        dist.barrier()
+    finally:
+        torch.npu.synchronize()
+        dist.destroy_process_group()
+
+
+def _bins(samples: list[dict]) -> list[list[dict]]:
+    return [[sample] for sample in samples]
+
+
+def _pack(samples: list[dict], seq_len: int) -> dict:
+    del seq_len
+    return {"ids": torch.tensor([item["id"] for item in samples]),
+            "tokens": torch.cat([item["tokens"] for item in samples]),
+            "producer": os.getpid(), "backend": dist.get_backend()}
+
+
+def _batch_ids(batch: list[dict]) -> list[int]:
+    return [value for item in batch for value in item["ids"].tolist()]
+
+
+def _check_external_windows(device: torch.device, mesh: torch.distributed.DeviceMesh, rank: int) -> None:
+    """Accept only the first two-round window and keep the remaining source bins in place."""
+    costs = ((9, 9), (1, 1), (9, 1), (1, 9))[rank] + (1, 1, 1)
+    source = [
+        [[{"id": rank * 100 + step * 5 + index, "cost": cost}] for index, cost in enumerate(costs)]
+        for step in range(2)
+    ]
+    with closing(build_distributed_dataloader(
+            None, mesh, DistributedDatasetConfig(seq_len=1, local_batch_size=5, balance_window_size=2),
+            external_step_source=source, metadata_fn=lambda s: SampleMetadata(1, cost=WorkloadCost(llm=s["cost"])),
+            pack_fn=lambda samples, _: samples[0]["id"], collate_fn=torch.tensor,
+            cost_model=lambda metadata: metadata.cost, device=device,
+    )) as loader:
+        for step in range(len(source)):
+            batch = next(loader)
+            stats = loader.last_balance_stats
+            decisions = [w["accepted"] for w in stats["windows"]]
+            assert decisions == [True, False, False], f"Unexpected window decisions: {decisions}"
+            assert (stats["original_objective"], stats["accepted_objective"]) == (21, 13), f"Wrong objectives: {stats}"
+            assert stats["moved_samples"] > 0, "Accepted window must exchange samples between physical ranks"
+            assert batch.device == device, f"Unexpected device: {batch.device}"
+            peer_batches = [torch.empty_like(batch) for _ in range(4)]
+            dist.all_gather(peer_batches, batch)
+            ids = [peer.tolist() for peer in peer_batches]
+            start = step * 5
+            expected = [[peer * 100 + start + i for i in range(5)] for peer in range(4)]
+            assert sorted(i for row in ids for i in row[:2]) == sorted(i for row in expected for i in row[:2]), (
+                f"First window changed sample membership: {ids}"
+            )
+            assert [row[2:] for row in ids] == [row[2:] for row in expected], f"Rejected windows reordered: {ids}"
+        assert next(loader, None) is None, "Windowing created an extra optimizer step"
+
+
+def test_external_process_hccl() -> None:
+    """Preserve exact global samples while child HCCL balances a worker-backed source."""
+    rank = int(os.environ["RANK"])
+    device = torch.device("npu", int(os.environ["LOCAL_RANK"]))
+    torch.npu.set_device(device)
+    dist.init_process_group("hccl", timeout=timedelta(seconds=120))
+    try:
+        mesh = init_device_mesh("npu", (4,), mesh_dim_names=("dp",))
+        samples = [{"id": rank * 100 + index,
+                    "tokens": torch.full(((9, 1, 4, 4)[rank],), rank * 100 + index, dtype=torch.int64)}
+                   for index in range(8)]
+        source = DataLoader(samples, batch_size=2, collate_fn=_bins, num_workers=1, persistent_workers=True)
+        with closing(build_distributed_dataloader(
+                None, mesh, DistributedDatasetConfig(seq_len=16, local_batch_size=2, communication_backend="hccl"),
+                external_step_source=source, metadata_fn=lambda sample: SampleMetadata(len(sample["tokens"])),
+                pack_fn=_pack, collate_fn=list, cost_model=CausalAttentionCostModel(), device=device,
+        )) as loader:
+            outputs = []
+            moved_between_ranks = False
+            for step, batch in enumerate(loader):
+                for item in batch:
+                    assert item["producer"] != os.getpid(), "Collation ran in the training process"
+                    assert item["backend"] == "hccl", "Child metadata used the wrong backend"
+                    assert item["tokens"].device == device, "Parent H2D did not deliver device input"
+                local_ids = _batch_ids(batch)
+                all_ids = [[] for _ in range(4)]
+                dist.all_gather_object(all_ids, local_ids)
+                expected = sorted(peer * 100 + index for peer in range(4) for index in (step * 2, step * 2 + 1))
+                assert sorted(value for ids in all_ids for value in ids) == expected, "Sample membership changed"
+                outputs.append(local_ids)
+                if loader.last_balance_stats["accepted"]:
+                    moved_between_ranks |= any(
+                        value // 100 != peer for peer, ids in enumerate(all_ids) for value in ids
+                    )
+            assert len(outputs) == 4, "External source produced an unexpected step count"
+            assert moved_between_ranks, "No accepted plan delivered a sample to a different rank"
+            loader.set_epoch(1)
+            replay = [_batch_ids(batch) for batch in loader]
+            assert replay == outputs, "Epoch reset changed balanced input order"
+        _check_external_windows(device, mesh, rank)
         dist.barrier()
     finally:
         torch.npu.synchronize()

@@ -22,6 +22,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from hyper_parallel.distributed_data.device_prefetch import DeviceStepPrefetcher, _move_to_device, _resolve_device
+from tests.common.mark_utils import arg_mark
 
 
 class _DeviceBatch:
@@ -117,6 +118,7 @@ class TestDeviceStepPrefetcher(unittest.TestCase):
             device_module.Event.return_value.synchronize.assert_called_once()
             self.assertEqual(prefetcher._pending_staging, [])
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_producer_prefetch_binds_device_and_hands_off_storage(self) -> None:
         """Feature: Producer-owned H2D.
         Description: Stage two steps on one copy stream and consume the first.
@@ -126,8 +128,14 @@ class TestDeviceStepPrefetcher(unittest.TestCase):
         device_module = Mock()
         device_module.stream.side_effect = lambda _stream: nullcontext()
         device_batch = _DeviceBatch(events)
+
+        def pin(batch: object) -> object:
+            """Check device selection before the pinned allocator is used."""
+            device_module.set_device.assert_called_with(torch.device("cuda:0"))
+            return batch
+
         with patch.object(torch, "cuda", device_module), patch(
-                "hyper_parallel.distributed_data.device_prefetch._pin_memory", side_effect=lambda value: value,
+                "hyper_parallel.distributed_data.device_prefetch._pin_memory", side_effect=pin,
         ), patch(
                 "hyper_parallel.distributed_data.device_prefetch._move_to_device", return_value=device_batch,
         ):

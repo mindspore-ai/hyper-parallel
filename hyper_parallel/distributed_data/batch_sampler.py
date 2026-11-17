@@ -221,7 +221,13 @@ class BatchSamplerReader:
         return payloads, tuple(original_batches)
 
     def close(self) -> None:
-        """Release source buffers after the owning loader has drained its producer."""
+        """Release buffers and workers after the owning loader has drained its producer."""
+        self._reset_window()
+        if self._sample_loader is not None:
+            self._sample_loader.close()
+
+    def _reset_window(self) -> None:
+        """Discard speculative reads without shutting down reusable workers."""
         self._window = None
         self._iterator = None
 
@@ -308,7 +314,7 @@ class BatchSamplerReader:
             raise ValueError("Native BatchSampler checkpoint payload reader ownership changed.")
         if "window" in state or sampler_optimizer_step_progress(sampler_state):
             raise ValueError("Native BatchSampler checkpoint must align to a complete optimizer step.")
-        self.close()
+        self._reset_window()
         self._sampler.load_state_dict(sampler_state)
         if self._sample_loader is not None:
             self._sample_loader.load_state_dict(state["sample_loader"])
@@ -321,7 +327,7 @@ class BatchSamplerReader:
         Args:
             epoch: Epoch to apply to the sampler and sample loader.
         """
-        self.close()
+        self._reset_window()
         self._sampler.load_state_dict(self._committed_state)
         self._sampler.set_epoch(epoch)
         if self._sample_loader is not None:

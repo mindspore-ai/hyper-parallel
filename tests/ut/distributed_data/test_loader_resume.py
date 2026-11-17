@@ -14,6 +14,8 @@
 # ============================================================================
 """Checkpoint interoperability for native fixed and balanced data loading."""
 
+from __future__ import annotations
+
 import copy
 import random
 import tempfile
@@ -21,6 +23,7 @@ import unittest
 from contextlib import ExitStack
 from itertools import product
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock, patch
 
 import torch
@@ -31,6 +34,7 @@ from hyper_parallel.data.parallel import build_dataset_batch_sampler
 from hyper_parallel.distributed_data import DistributedDatasetConfig, SampleMetadata, build_distributed_dataloader
 from hyper_parallel.distributed_data.distributed_dataloader import DistributedDataLoader
 from hyper_parallel.distributed_data.topology import DataTopology
+from tests.common.mark_utils import arg_mark
 from tests.ut.distributed_data.test_batch_sampler import _legacy_loader_state
 
 
@@ -184,6 +188,7 @@ class TestLoaderResume(unittest.TestCase):
                     selected.extend(sample["id"] for batch in batches for sample in batch)
                 self.assertEqual(sorted(selected), sorted(order[30:62]))
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_legacy_step_counter_uses_source_gbs(self) -> None:
         """Feature: Legacy complete-step cursors with changed GBS.
         Description: Restore old micro-step fifteen at cursor thirty from GBS ten into GBS eight.
@@ -195,15 +200,16 @@ class TestLoaderResume(unittest.TestCase):
                 saved = _legacy_loader_state(source.state_dict(), mode == "metadata")
             with _build_loader(mode, global_batch_size=8, **options) as target:
                 target.load_state_dict(saved)
-                self.assertEqual(target._step, 0)
+                self.assertEqual(target._source._step, 0)
                 selected = [sample["id"] for _ in range(4) for sample in next(target)]
                 self.assertEqual(sorted(selected), list(range(30, 38)))
                 self.assertEqual(target.state_dict()["_index_sampler_state"]["consumed_samples"], 38)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_rank", return_value=0)
     @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_world_size", return_value=1)
     @patch("hyper_parallel.core.distributed_checkpoint.api.dist.barrier")
-    def test_dcp_keeps_optimizer_step_offset(self, *_mocks) -> None:
+    def test_dcp_keeps_optimizer_step_offset(self, *_mocks: Any) -> None:
         """Feature: Persistent boundaries after a GBS change.
         Description: Save offset cursors with native worker snapshots through embedded and per-rank DCP.
         Expectation: Restored GBS-eight steps consume samples 38 through 45 and preserve the training step.
@@ -281,6 +287,7 @@ class TestLoaderResume(unittest.TestCase):
                     self.assertEqual([sample["id"] for sample in next(iter(fixed))], [8, 9])
                 self.assertEqual([sample["id"] for sample in next(restored)], [8, 9])
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_mode_switch_repartitions_global_cursor(self) -> None:
         """Feature: Native cursor restoration with a changed DP size.
         Description: Switch DP4 fixed to DP1 balanced and back at a nonzero epoch.
@@ -303,7 +310,7 @@ class TestLoaderResume(unittest.TestCase):
                     self.assertEqual(restored["_index_sampler_state"], dict(
                         saved["_index_sampler_state"], dp_world_size=1,
                     ))
-                    self.assertEqual(target._step, 2)
+                    self.assertEqual(target._source._step, 2)
                     self.assertEqual(sorted(sample["id"] for batch in target for sample in batch), expected)
                 self.assertEqual(saved, original)
                 selected = []
@@ -359,10 +366,11 @@ class TestLoaderResume(unittest.TestCase):
                         sampler.load_state_dict(state)
                     self.assertEqual(sampler.consumed_samples, 0)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_rank", return_value=0)
     @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_world_size", return_value=1)
     @patch("hyper_parallel.core.distributed_checkpoint.api.dist.barrier")
-    def test_dcp_restores_shared_sampler_cursor(self, *_mocks) -> None:
+    def test_dcp_restores_shared_sampler_cursor(self, *_mocks: Any) -> None:
         """Feature: Native loader checkpoint interoperability.
         Description: Restore embedded and per-rank state across fixed and balanced loaders.
         Expectation: Step and remaining samples match with workers and shuffled epochs.
@@ -405,10 +413,7 @@ class TestLoaderResume(unittest.TestCase):
             saved = source.state_dict()
             self.assertNotIn("native_sampler", saved)
             self.assertEqual(saved["_index_sampler_state"]["consumed_samples"], 24 if finished else 4)
-            if source_mode != "fixed":
-                self.assertEqual(set(saved), {"_index_sampler_state", "_iterator_finished", "dataset_state"})
-                if legacy:
-                    saved = _legacy_loader_state(saved, source_mode == "metadata")
+            saved = self._check_saved_format(saved, source_mode, legacy)
             expected = sorted(sample["id"] for batch in iterator for sample in batch)
             checkpointer = DistributedCheckpointer(extra_state_per_rank=per_rank)
             path = stack.enter_context(tempfile.TemporaryDirectory())
@@ -427,6 +432,14 @@ class TestLoaderResume(unittest.TestCase):
             if finished:
                 target.set_epoch(3)
                 self.assertEqual(len(list(target)), 12)
+
+    def _check_saved_format(self, saved: dict, source_mode: str, legacy: bool) -> dict:
+        """Check the balanced cursor schema and optionally build its legacy representation."""
+        if source_mode != "fixed":
+            self.assertEqual(set(saved), {"_index_sampler_state", "_iterator_finished", "dataset_state"})
+            if legacy:
+                return _legacy_loader_state(saved, source_mode == "metadata")
+        return saved
 
     def test_legacy_fixed_cursor_and_unsafe_worker_state(self) -> None:
         """Feature: Legacy fixed checkpoint migration.
@@ -471,6 +484,7 @@ class TestLoaderResume(unittest.TestCase):
                     next(restored)
                     self.assertEqual(restored.state_dict()["_index_sampler_state"]["consumed_samples"], 12)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_shared_cursor_restores_all_reader_epochs(self) -> None:
         """Feature: Loader-owned progress restoration.
         Description: Restore only the native sampler cursor, or a template retaining fresh Reader epochs.
@@ -485,12 +499,12 @@ class TestLoaderResume(unittest.TestCase):
                 original = copy.deepcopy(saved)
                 target.load_state_dict(saved)
                 restored = target.state_dict()
-                reader_state = target._planning_reader().state_dict()
-                sample_state = (target._direct_sample_loader.state_dict() if mode == "metadata"
+                reader_state = target._source._planning_reader().state_dict()
+                sample_state = (target._source._direct_sample_loader.state_dict() if mode == "metadata"
                                 else reader_state["sample_loader"])
                 self.assertEqual((restored["_index_sampler_state"]["epoch"],
                                   reader_state["epoch"], sample_state["epoch"]), (2, 2, 2))
-                self.assertEqual(target._step, 4)
+                self.assertEqual(target._source._step, 4)
                 self.assertEqual([sample["id"] for sample in next(target)], [8, 9])
                 self.assertEqual(saved, original)
 

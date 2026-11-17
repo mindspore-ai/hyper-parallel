@@ -29,12 +29,12 @@ from hyper_parallel.distributed_data.transport import (
     DataGroups,
     DataPlaneTransport,
     ModelParallelTransport,
-    _decode_control,
     create_data_groups,
     _decode_payload_segment,
     _decode_received_payloads,
     _encode_payload_segment,
 )
+from tests.common.mark_utils import arg_mark
 
 
 class TestPayloadCodec(unittest.TestCase):
@@ -131,6 +131,7 @@ class TestPayloadCodec(unittest.TestCase):
 class TestDataPlaneTransport(unittest.TestCase):
     """Verify control metadata and payload bytes use their designated groups."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_control_gather_defers_decode_and_retains_variable_length_buffers(self) -> None:
         """Feature: Deferred control gather completion.
         Description: Gather differently sized objects using a mocked accelerator backend and delayed data work.
@@ -140,22 +141,28 @@ class TestDataPlaneTransport(unittest.TestCase):
         payloads = [pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL) for value in values]
         transport = DataPlaneTransport(DataGroups((0, 1), "control", None, None, 0, True), 0)
         work = Mock()
+        downloads = []
+        original_cpu = torch.Tensor.cpu
 
-        def gather(outputs: list[torch.Tensor], source: torch.Tensor, **kwargs: Any) -> Any:
+        def cpu(tensor: Any, *args: Any, **kwargs: Any) -> Any:
+            """Count whole-buffer Host transfers."""
+            downloads.append(tensor.numel())
+            return original_cpu(tensor, *args, **kwargs)
+
+        def gather(outputs: torch.Tensor, source: torch.Tensor, **kwargs: Any) -> Any:
             """Populate lengths immediately and bytes only when the consumer waits."""
             self.assertEqual(kwargs["group"], "control")
             if source.dtype == torch.int64:
-                for output, payload in zip(outputs, payloads):
-                    output.fill_(len(payload))
+                outputs.copy_(torch.tensor([len(payload) for payload in payloads]))
                 self.assertFalse(kwargs.get("async_op", False))
                 return None
             self.assertTrue(kwargs["async_op"])
 
             def complete() -> None:
                 """Populate received bytes only after the consumer waits."""
-                for output, payload in zip(outputs, payloads):
+                for output, payload in zip(outputs.view(2, -1), payloads):
                     output.zero_()
-                    output[:len(payload)].copy_(torch.tensor(list(payload), dtype=torch.uint8))
+                    output[:len(payload)].copy_(torch.frombuffer(bytearray(payload), dtype=torch.uint8))
 
             work.wait.side_effect = complete
             return work
@@ -166,8 +173,9 @@ class TestDataPlaneTransport(unittest.TestCase):
                 "hyper_parallel.distributed_data.transport._require_control_device", return_value=torch.device("cpu"),
             ),
             patch("hyper_parallel.distributed_data.transport.dist.get_world_size", return_value=2),
-            patch("hyper_parallel.distributed_data.transport.dist.all_gather", side_effect=gather),
-            patch("hyper_parallel.distributed_data.transport._decode_control", wraps=_decode_control) as decode,
+            patch("hyper_parallel.distributed_data.transport.dist.all_gather_into_tensor", side_effect=gather),
+            patch.object(torch.Tensor, "cpu", new=cpu),
+            patch("hyper_parallel.distributed_data.transport.pickle.loads", wraps=pickle.loads) as decode,
         ):
             pending = transport.begin_all_gather_object(values[0])
             work.wait.assert_not_called()
@@ -178,6 +186,7 @@ class TestDataPlaneTransport(unittest.TestCase):
             self.assertEqual(pending.wait(), values)
             work.wait.assert_called_once()
             self.assertEqual(decode.call_count, 2)
+            self.assertEqual(downloads, [2, 2 * max(map(len, payloads))])
 
     def test_default_communication_backend_is_hccl(self) -> None:
         """Feature: HCCL data-plane default.
@@ -229,6 +238,27 @@ class TestDataPlaneTransport(unittest.TestCase):
         self.assertIs(groups.payload_group, groups.control_group)
         self.assertEqual(new_group.call_count, 1)
         get_backend.assert_not_called()
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_payload_group_creation_failure_releases_only_the_new_control_group(self) -> None:
+        """Feature: Process group creation rollback.
+        Description: Fail allocation of the second HCCL group after allocating the control group.
+        Expectation: The factory releases its first handle and propagates the original error.
+        """
+        control = object()
+        with (
+                patch("torch.distributed.is_initialized", return_value=True),
+                patch("torch.distributed.get_world_size", return_value=2),
+                patch("torch.distributed.get_rank", return_value=0),
+                patch("torch.distributed.new_group", side_effect=[control, RuntimeError("payload allocation")]),
+                patch("torch.distributed.destroy_process_group") as destroy,
+                self.assertRaisesRegex(RuntimeError, "payload allocation"),
+        ):
+            create_data_groups(
+                self._two_rank_topology(), (0, 1), 0, cpu_backend="hccl", payload_backend="hccl",
+                communication_device=torch.device("npu"), enable_payload_exchange=True,
+            )
+        destroy.assert_called_once_with(control)
 
     def test_hccl_control_and_payload_groups_accept_npu_device(self) -> None:
         """Feature: HCCL data groups.
@@ -400,6 +430,38 @@ class TestModelParallelTransport(unittest.TestCase):
                 torch.testing.assert_close(received["input_ids"], batch["input_ids"])
                 torch.testing.assert_close(received["nested"][0], batch["nested"][0])
                 self.assertEqual(received["nested"][1:], ["causal", None])
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_fields_coalesce_by_dtype_and_placement_with_independent_storage(self) -> None:
+        """Feature: Coalesced model broadcast.
+        Description: Exchange dynamic, scalar, empty and noncontiguous tensor fields.
+        Expectation: One collective per dtype and placement restores independent leaf storage.
+        """
+        spec = {
+            "ids": TensorFieldSpec((None, 2), torch.int64),
+            "labels": TensorFieldSpec((None,), torch.int64),
+            "empty": TensorFieldSpec((None,), torch.int64),
+            "offsets": TensorFieldSpec((None,), torch.int64, "cpu"),
+            "count": TensorFieldSpec((), torch.int64, "cpu"),
+            "weight": TensorFieldSpec((2,), torch.float32),
+        }
+        batch = {"ids": torch.arange(12).reshape(3, 4)[:, ::2], "labels": torch.arange(3),
+                 "empty": torch.empty(0, dtype=torch.int64), "offsets": torch.tensor([0, 3]),
+                 "count": torch.tensor(3), "weight": torch.tensor([0.5, 1.0])}
+        wire = []
+        with patch("hyper_parallel.distributed_data.transport.dist.get_backend", return_value="gloo"), \
+                patch("hyper_parallel.distributed_data.transport.dist.broadcast") as broadcast:
+            broadcast.side_effect = lambda tensor, **_: wire.append(tensor.clone())
+            sent = self._transport(0, spec).broadcast(batch)
+            self.assertEqual(len(wire), 4)
+            pending = iter(wire)
+            broadcast.side_effect = lambda tensor, **_: tensor.copy_(next(pending))
+            received = self._transport(1, spec).broadcast(None)
+        for key, value in batch.items():
+            torch.testing.assert_close(sent[key], value, rtol=0, atol=0)
+            torch.testing.assert_close(received[key], value, rtol=0, atol=0)
+        self.assertNotEqual(received["ids"].untyped_storage().data_ptr(),
+                            received["labels"].untyped_storage().data_ptr())
 
     def test_eof_broadcast_is_one_small_tensor(self) -> None:
         """Feature: Tensor-only model broadcast.

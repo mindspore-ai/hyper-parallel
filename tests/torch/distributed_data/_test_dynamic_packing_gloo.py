@@ -31,7 +31,7 @@ def _gather(value):
     return gathered
 
 
-def _run_local_steps(source_api: str, broadcast_plan: bool) -> list:
+def _run_local_steps(source_api: str, broadcast_plan: bool, use_data_process: bool = True) -> list:
     """Exercise the shared codec through locality-scoped moved and retained steps."""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -43,7 +43,7 @@ def _run_local_steps(source_api: str, broadcast_plan: bool) -> list:
     ]
     config = DistributedDatasetConfig(
         seq_len=10, local_batch_size=1, communication_backend="gloo", balance_group_size=2,
-        broadcast_plan=broadcast_plan,
+        broadcast_plan=broadcast_plan, use_data_process=use_data_process,
     )
 
     def metadata_fn(sample: dict) -> SampleMetadata:
@@ -99,5 +99,7 @@ def test_dynamic_packing_dp4_gloo() -> None:
             assert independent == baseline, (
                 f"Broadcast mode changed batches/stats: actual={independent}, expected={baseline}"
             )
+            inline = _run_local_steps(source_api, broadcast_plan=True, use_data_process=False)
+            assert inline == baseline, f"In-process batches/stats differ: actual={inline}, expected={baseline}"
     finally:
         dist.destroy_process_group()

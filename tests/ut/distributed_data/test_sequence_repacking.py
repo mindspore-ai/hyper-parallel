@@ -32,6 +32,7 @@ from hyper_parallel.distributed_data import (
     pack_indexed_text_samples, split_packed_text_sample,
 )
 from hyper_parallel.distributed_data.planner import DynamicPackingPlanner
+from tests.common.mark_utils import arg_mark
 
 
 _MESH = SimpleNamespace(mesh_shape=(1,), mesh_dim_names=("dp",), rank_list=(0,))
@@ -241,6 +242,7 @@ class TestSequenceRepacking(unittest.TestCase):
         torch.testing.assert_close(balanced_loss, reference_loss, rtol=1e-12, atol=1e-12)
         torch.testing.assert_close(balanced_weights.grad, reference_weights.grad, rtol=1e-12, atol=1e-12)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_repeated_record_indices_keep_distinct_sequence_occurrences(self) -> None:
         """Feature: Repeated record sampling.
         Description: Select the same packed record twice in one native round.
@@ -257,7 +259,7 @@ class TestSequenceRepacking(unittest.TestCase):
             pack_fn=pack_indexed_text_samples, collate_fn=collate_indexed_text_sequences,
             device="cpu", cost_model=lambda item: item.cost,
         ) as loader:
-            reader = loader._planning_reader()
+            reader = loader._source._planning_reader()
             reader.prepare_next_step(1)
             keys = [item.key for item in reader.metadata()]
             self.assertEqual({(key.dataset_index, key.global_sample_position, key.sequence_index) for key in keys},

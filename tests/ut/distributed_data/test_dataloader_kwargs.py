@@ -36,6 +36,7 @@ from hyper_parallel.distributed_data.api import _normalize_dataloader_kwargs
 from hyper_parallel.distributed_data.metadata import PlannedSampleLoader
 from hyper_parallel.trainer.config import DataLoaderConfig
 from hyper_parallel.trainer.config.resolver import ConfigResolutionError, resolve_component
+from tests.common.mark_utils import arg_mark
 from tests.fixtures.data.workers import initialize_worker
 
 
@@ -362,6 +363,39 @@ class TestDataLoaderKwargs(unittest.TestCase):
                 with self._checkpoint_loader(config, dataloader_kwargs={**worker_options, **extra_options}) as resumed:
                     resumed.load_state_dict(state)
                     self.assertEqual(list(resumed), expected, "Worker settings must not change checkpoint replay.")
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_close_stops_workers_without_breaking_epoch_reuse(self) -> None:
+        """Feature: Owned DataLoader worker lifetime.
+        Description: Reuse online and metadata workers across epochs, then close twice.
+        Expectation: Resets preserve worker processes; explicit close stops them and releases the native iterator.
+        """
+        for metadata_mode in (False, True):
+            with self.subTest(metadata_mode=metadata_mode):
+                loader = self._checkpoint_loader(
+                    self._config(metadata_mode=metadata_mode),
+                    dataloader_kwargs={"num_workers": 1, "persistent_workers": True},
+                )
+                source = loader._source
+                sample_loader = source._direct_sample_loader if metadata_mode else source._dataset_reader._sample_loader
+                native = sample_loader._data_loader
+                iterator = None
+                try:
+                    list(loader)
+                    iterator = native._iterator
+                    workers = tuple(iterator._workers)
+                    self.assertTrue(all(worker.is_alive() for worker in workers))
+                    loader.set_epoch(1)
+                    next(loader)
+                    self.assertIs(native._iterator, iterator, "Epoch resets must reuse workers.")
+                    loader.close()
+                    loader.close()
+                    self.assertTrue(all(not worker.is_alive() for worker in workers), "close() must join workers.")
+                    self.assertIsNone(native._iterator, "A closed loader must not retain its worker iterator.")
+                finally:
+                    loader.close()
+                    if iterator is not None:
+                        iterator._shutdown_workers()
 
     def test_checkpoint_restore_allows_changed_packing_config(self) -> None:
         """Feature: DataLoader checkpoint compatibility.

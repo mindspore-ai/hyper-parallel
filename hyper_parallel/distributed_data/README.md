@@ -25,8 +25,9 @@ native BatchSampler
 Model-parallel batch broadcast uses only tensor collectives. Each peer declares
 an identical `model_batch_spec` locally: container structure, tensor dtypes,
 fixed dimensions and static values never travel over the network. A small int64
-header carries EOF/error status and dynamic dimensions; tensor leaves use
-`dist.broadcast`. Pure DP needs no declaration. Built-in text collation provides
+header carries EOF/error status and dynamic dimensions. Tensor leaves with
+the same dtype and CPU/device placement share one packed `dist.broadcast`;
+receivers restore independent leaf storage. There is no additional byte cap. Pure DP needs no declaration. Built-in text collation provides
 its declaration automatically; custom model-parallel batches must supply one
 (see [Tensor-only model broadcasts](#tensor-only-model-broadcasts)).
 
@@ -86,6 +87,7 @@ and model-parallel batch broadcast still follow the normal loading path.
 - One synchronized iterator step covers `local_batch_size * dp_size` bins.
   `balance_window_size` defaults to one. Native loading can jointly plan several
   accumulation rounds, bounded by the sampler's optimizer and epoch boundaries.
+  External loading can group consecutive bins inside a single source yield.
 - Native BatchSampler fixes index occurrences and uses singleton reference bins;
   `external_step_source` fixes samples and lets HP preserve the original packing
   bins.
@@ -225,7 +227,7 @@ as `true` and `false` are rejected. Configuration serialization preserves the
 absence of this field, so saving and reloading a disabled run does not enable it.
 
 Put `DistributedDatasetConfig` tuning fields in this block, including
-`balance_window_size`, `device_prefetch_depth`, `min_balance_gain`, `log_balance`,
+`balance_window_size`, `device_prefetch_depth`, `use_data_process`, `min_balance_gain`, `log_balance`,
 `repack_sequences`, `pad_token_id`, `metadata_mode`, `broadcast_plan`,
 `communication_backend`, `dataset_reader_ranks`, `planner_rank`,
 `oversized_policy`, `packing_budgets`, and `balance_group_size`. Their defaults
@@ -283,15 +285,23 @@ For direct construction, pass `balance_window_size=3` in
 The positive integer defaults to one. Values larger than accumulation are
 clipped at the next optimizer boundary. Epoch tails contain only the available
 complete distributed micro-batches; windows never borrow from the next epoch.
-External-step loaders require `balance_window_size=1`.
 In Trainer configuration, this option belongs under `dataloader.load_balance`.
 
 Planning treats each `(micro-batch, DP rank)` as a destination. Custom assignment
 policies therefore receive `DP size * window rounds` virtual ranks, ordered by
 micro-batch then physical DP rank. The acceptance gate sums the per-round
 objectives; the default makespan objective estimates the sum of each round's
-slowest-rank cost. Samples are transferred, collated, and copied to the device
-one micro-batch at a time.
+slowest-rank cost. Native loading transfers, collates, and copies one
+micro-batch at a time.
+
+An external source supplies a complete optimizer step per yield. At the default
+`balance_window_size=1`, its existing policy sums costs over all local bins on
+each rank and plans the step once. Set a larger value when each bin represents
+one forward/backward round. For example, five bins per rank and a window of two
+give windows of `2 + 2 + 1`. Each window has its own sample set and gain decision.
+A step with one bin and a window of three still uses only that one bin.
+HP gathers metadata for the step once and delivers all its bins in one collator
+call. Source yields always define the optimizer boundary.
 
 For LPT policies with one pack per rank and multiple rounds, the planner also
 schedules intact packs by decreasing backbone cost. It compares the unscheduled
@@ -303,41 +313,49 @@ This can improve a window even when document-level repacking fails. It does not
 change attention boundaries inside a pack. Single-round windows, multiple local
 packs per rank, and non-LPT custom policies retain their existing behavior.
 
-Native loading double-buffers Host balancing windows independently of device
-prefetch. A persistent Host producer handles reads, splitting, metadata,
-window-level planning, per-micro-batch A2A, packing/collation and final
-pinned-memory preparation. The window
-contains CPU batches; it does not enqueue H2D for the entire window.
+With the default `use_data_process: true`, native loading double-buffers Host
+balancing windows independently of device prefetch. Each data-plane member owns an independent process for reads,
+splitting, metadata, planning, data collectives and packing/collation. CPU
+batches reach the parent through PyTorch shared-storage reducers. The training thread pins each input and
+submits H2D on the parent copy stream. With device lookahead enabled, the first
+delivery waits for the first two Host inputs (or EOF) and submits both copies.
+The consumer waits on the copy event for its current input only.
 
-On NPU/CUDA the main thread launches H2D on a copy stream and model broadcasts
-on the caller's training stream, with no device worker thread or dedicated
-broadcast stream. Constructor ranks stage H2D for up to
+With `use_data_process: false`, the training process reads and constructs a Host
+window when delivery first needs it. All data ranks enter that window's collectives
+in delivery order. A Constructor can stage up to `device_prefetch_depth` future
+inputs from that window. Optional prefetch and drain calls never open another
+window in this mode. Set both `use_data_process: false` and `device_prefetch_depth: 0`
+for on-demand Host preparation and H2D. Set `dataloader.num_workers: 0` as well
+to run Dataset reads in the training process for debugging. All ranks must agree
+on `use_data_process`.
+
+The main thread issues model broadcasts on the caller's training stream. Constructor ranks stage H2D for up to
 `device_prefetch_depth` future micro-batches, excluding the current training batch.
 Model peers receive a batch only when `next(loader)` delivers that micro-batch;
 shape/EOF headers and payload broadcasts are never part of Device lookahead.
 Set `dataloader.load_balance.device_prefetch_depth` in Trainer YAML, or the same field
 on `DistributedDatasetConfig` when building directly. It defaults to `1` (current
-plus next); `0` stages on demand while retaining Host window buffering, and `2`
+plus next); `0` stages on demand, and `2`
 retains current plus two future batches. Values must be non-negative integers
 (booleans are rejected), identical across ranks. Depth is independent of
 `balance_window_size` and may exceed it. CPU loading ignores this option;
 external-step loaders accept only the default value and keep their step buffering.
-Data-plane and model-group collectives each retain a
-single owning thread and separate streams/groups. Non-Constructors hold Host
+Data-plane and model-group collectives use separate groups. Non-Constructors hold Host
 placeholders and receive each real batch, including EOF, through the model-group
 broadcast at delivery. Future Constructor inputs retain only their copy event;
 the training stream waits for the current input's copy event, then orders its
 model broadcast before computation. A marker after the broadcast is retained
 only for explicit drains, including partially submitted broadcasts on errors;
 training does not wait on that marker. Tensor storage is recorded on the consumer stream.
-CPU-only loading retains window preparation and broadcast on one producer.
+CPU-only loading uses the same Host preparation mode and broadcasts at delivery.
 
 Advancing the iterator retires the previous input: callers must finish submitting
 its uses on the consuming stream and release its references before advancing.
 Each input allocation spends one of `device_prefetch_depth + 1` slots. Advancing
-returns a slot with its consumption event. Optional lookahead queries the event
-and skips staging if it is incomplete; only demanded input or an explicit drain
-may synchronize it before allocating a replacement. A stream wait alone would still allow
+returns a slot with its consumption event. Rolling prefetch checks that
+event before allocating a replacement. A busy slot defers optional H2D until
+the next loader call. A stream wait alone would still allow
 CPU-side allocations ahead of completion. Deeper buffering can absorb preparation
 jitter but consumes more input memory; start with the default depth of `1`.
 Text and VLM Trainers consume accumulation batches one at a time and emit
@@ -390,16 +408,19 @@ buffers at most twice the configured window's micro-batch count on Host.
 Device lookahead is separately bounded by `device_prefetch_depth`. Neither
 bound is a byte limit on variable-size payloads, temporary exchange/staging
 buffers or inputs retained by training. The Reader has no separate lookahead
-thread; the Host producer owns all speculative reads.
-Accumulation one follows the same background pipeline. A blocked or failed
+thread; the data process owns all speculative reads.
+Accumulation one follows the same background pipeline. After warmup, a blocked or failed
 future window does not prevent delivery of current inputs; its error is raised
 when that window is requested. `close()` drains production.
 
-Epoch exhaustion stops iteration while retaining the Host thread, its data-plane
-stream and the H2D copy stream for reuse. `set_epoch()` drains any
+Epoch exhaustion stops iteration while retaining the data process and H2D copy stream for reuse. `set_epoch()` drains any
 pending preparation before resetting source and delivery state, then reuses
-the same Host thread and streams. Explicit `close()` or context-manager exit ends
+the same process and copy stream. Explicit `close()` or context-manager exit ends
 the loader lifetime; a closed loader cannot be restarted with `set_epoch()`.
+Close the loader on all participating ranks at the same consumption boundary before distributed teardown.
+Closing drains pending work, stops owned persistent Dataset workers and releases loader-created process groups.
+The training mesh and caller-owned sources keep their own lifetimes.
+
 Text and VLM Trainers close their collective loader before distributed teardown.
 
 The Trainer retains its existing per-micro-batch loss normalization. If valid
@@ -854,8 +875,8 @@ Native sampler loading retains checkpoint/resume and metadata direct reads;
 metadata mode still skips payload A2A.
 
 `next(loader)` returns inputs with readiness ordered on the consumer stream.
-For native loading, the Host thread pins final collated tensors; the main thread
-launches non-blocking H2D on a copy stream. When that micro-batch is requested,
+For native loading, the training thread pins ready shared CPU tensors and
+launches non-blocking H2D on a copy stream during loader calls. When that micro-batch is requested,
 the caller's current training stream waits for its copy event and broadcasts
 it to model peers before computing on it. Future copy events are not added to
 the current training stream. The delivered batch retains a completion marker
@@ -866,15 +887,12 @@ External-step results separately retain the original CPU metering inputs and
 publish them in `last_host_batch` at delivery. Tensor leaves in standard containers move recursively;
 custom batch objects with a `to` method remain supported for pure DP.
 
-The native Host thread owns metadata exchange, planning, payload A2A and CPU
-construction, using a dedicated data-plane stream when required. It starts the
-next Host window when the caller takes the first batch from the current window.
-The main thread owns model-peer communication and training launches on the same
-caller stream, using separate communication groups. No second native prefetch
-thread or dedicated model-input broadcast stream is created. A backend may
-still use internal communication streams. Broadcasts now follow earlier work
-on the training stream, so overlap with the previous round's computation is
-not guaranteed; H2D lookahead remains independent.
+With `use_data_process: true`, the data process owns metadata exchange, planning, payload A2A and CPU
+construction. It uses independent process groups rebuilt from the launcher's
+TCPStore or FileStore, preserving the configured logical reader/planner ranks.
+During rolling prefetch the caller polls child readiness. It can deliver the current input
+while the child finishes the next Host window. Only the consumed
+batch enters model-peer broadcast on the main thread.
 
 ```python
 batch = next(loader)  # prepares the next Host window and attempts device lookahead
@@ -884,13 +902,13 @@ backward(loss)
 
 Native `prefetch()` attempts to fill Constructor H2D lookahead. CPU loading,
 non-Constructors and depth-zero loading request only a Host window. Optional
-staging skips unfinished Host preparation or a busy input slot instead of waiting
-for either. It performs no model-peer collectives, shape-header reads or readiness
-all-reduces. Peers may therefore make different numbers of optional H2D requests;
-all peers must still call `next(loader)` in the same order. Data-plane window
-collectives continue in the Host producer, and explicit drains can wait for peers.
+requests return without waiting for Host preparation or input-slot retirement.
+The next delivery or optional hook retries deferred H2D. Optional prefetch
+uses only local status. Peers may make different numbers of optional H2D requests.
+All peers must call `next(loader)` in the same order. Data-plane window
+collectives continue in the child process, and explicit drains can wait for peers.
 
-For example, micro-batch 0 computes while Constructor copies micro-batch 1.
+For example, the Constructor can overlap the copy for micro-batch 1 with computation on micro-batch 0.
 On the next delivery, peers exchange micro-batch 1's dynamic dimensions/EOF,
 broadcast its tensors, and then compute micro-batch 1. This leaves MP broadcast
 on the current batch's critical path, while avoiding future header synchronization
@@ -898,7 +916,7 @@ before current computation can be submitted. A speculative H2D/Host failure is
 queued in order and forwarded to peers only when its batch is consumed.
 
 When no copied input is queued, `next(loader)` waits for required preparation.
-The first input and depth-zero mode have no H2D lookahead. Actual overlap depends
+Depth zero always stages on demand. Actual overlap depends
 on Host readiness, input slots, CPU scheduling and device copy/compute resources;
 a small broadcast cost is a workload assumption, not a guaranteed latency bound.
 
@@ -1115,9 +1133,9 @@ ranks.
 
 Online payload A2A defaults to CPU/Gloo. A rank-local `device`
 uses the WORLD accelerator backend by default (HCCL for NPU or NCCL for CUDA);
-Python payloads still incur serialization and Host/device copies. The enabled
-node-local path always exchanges raw samples with Gloo and uses the training
-device only for final H2D. Shared metadata mode bypasses payload transport entirely.
+Python payloads still incur serialization and Host/device copies. The node-local
+path uses its configured Gloo or HCCL backend for metadata and raw samples.
+Shared metadata mode bypasses payload transport entirely.
 
 ## Current boundaries
 
@@ -1125,8 +1143,8 @@ device only for final H2D. Shared metadata mode bypasses payload transport entir
 - Iterable/streaming online data uses an external complete-step source on every pure-DP rank.
 - Node-local balancing retains at most one prefetched step, including
   final H2D. The first step waits for preparation; the original path is synchronous.
-- Gloo control plane and pickle payloads; online A2A
-  may use Gloo, NCCL, or HCCL.
+- Control objects retain pickle encoding on the selected communication backend;
+  online A2A may use Gloo, NCCL, or HCCL.
 - `drop_last=True`; every DP rank receives the same number of non-empty bins.
 - Native sampler checkpoints are per rank and save the last fully delivered
   optimizer-step cursor, excluding prefetched payloads and incomplete steps.
@@ -1144,9 +1162,48 @@ estimation, node-local LPT balancing and rank-zero DP logs, see
 to use the default cost, or provide `cost_model`. A custom
 `balancing_algorithm` owns assignment and its scalar objective; Hyper applies
 the shared `min_balance_gain` acceptance threshold before sample exchange.
-Gloo uses a speculative producer thread. HCCL keeps collective launches on
-the training thread, with independent data groups and a data stream. Calling
-`prefetch_plan()` after forward submission and `prefetch()` after backward
-submission overlaps CPU planning, payload exchange, collation and H2D with
-pending computation. Call these hooks consistently on all ranks before host
-synchronization; ordinary iteration remains supported without the hooks.
+Both Gloo and HCCL use the independent data process by default. Ordinary iteration starts
+one successor automatically. `prefetch()` and the compatibility hook
+`prefetch_plan()` both request the same complete pipeline and are idempotent.
+With `use_data_process: false`, each `next(loader)` reads, balances and stages
+one external step on the caller. The optional prefetch hooks leave the source cursor in place.
+
+## Data process requirements
+
+With `use_data_process: true`, HP starts each data process with
+`torch.multiprocessing.get_context("spawn").Process(target=...)`. The current
+implementation uses Linux process groups to clean up nested workers.
+
+- Python imports the training entry point in the new interpreter. Put training
+  setup and execution (including distributed initialization and loader iteration)
+  inside a function called under `if __name__ == "__main__":`. The
+  [text training example](../../examples/training_demo/train_text.py) shows this pattern.
+- Pass a re-iterable source or an unstarted DataLoader with CPU-only callbacks.
+  When the environment provides `dill`, callbacks may be lambdas or closures.
+  With standard-library `pickle`, define callbacks and source classes at the top
+  level of an importable module. The child owns its copy of the source and any
+  callback mutations. Live iterators and process-local resources are unsupported.
+- The data process is non-daemonic, so a source DataLoader can start its own
+  workers. With spawned inner workers, PyTorch must be able to pickle the
+  Dataset, collator and worker initialization function it sends to them.
+  Define these in an importable module. HP restores the captured Python, NumPy
+  and CPU Torch RNG states in the data process. Custom callbacks must use
+  process-local state and data collectives. For callbacks that rely on a specific
+  OpenBLAS thread count, set `OPENBLAS_NUM_THREADS` in the launch environment
+  so NumPy sees it during import.
+- Tensor IPC uses CPU shared memory, like PyTorch DataLoader. It transfers storage
+  handles, not a full tensor pickle or NPU allocation. There is no reserved shared
+  arena or fixed byte limit. Provision `/dev/shm` and file descriptors for the
+  bounded windows and any batches retained by training. Pinning and H2D remain
+  parent operations; no NPU IPC or D2D handoff copy is required.
+- HCCL data processes own an additional device context and communicators. Their
+  listener range is applied in the child before it initializes its communication
+  groups. To override the default `50000-50031`, set `HP_DATA_HCCL_SOCKET_PORT_RANGE`
+  consistently on every rank. It must not overlap the training
+  `HCCL_NPU_SOCKET_PORT_RANGE`. Data traffic still shares device/network resources
+  with training; process isolation removes Python GIL sharing, not bandwidth costs.
+- Call `close()` (or use the native loader as a context manager) before destroying
+  training process groups. Child failures are forwarded with their traceback.
+  As with the existing distributed path, the training driver must coordinate
+  shutdown if a rank fails. External checkpoint and pure-DP restrictions remain
+  unchanged; native delivered-cursor checkpoint and Mesh behavior are preserved.

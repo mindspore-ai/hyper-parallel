@@ -18,8 +18,10 @@ Source modes and buffering
 --------------------------
 Online mode without ``batch_sampler`` requires ``external_step_source``.
 The source emits one complete local step of raw-sample bins. HP derives
-metadata, freezes the sample union,
-balances it across Data Constructors, and routes payloads when necessary.
+metadata, balances the selected samples across Data Constructors, and routes
+payloads when necessary. With an external window greater than one, each bin
+represents a micro-batch and consecutive bins are planned together within that
+source yield. The iterator returns the complete collated step.
 Metadata mode requires ``batch_sampler`` to define step/sample boundaries.
 It looks up ``metadata[index]`` before any Dataset read; target constructors
 then directly read their assigned indices from the shared Dataset and skip
@@ -29,7 +31,7 @@ With ``batch_sampler``, native HP sampling owns step selection:
 ``balance_window_size`` consecutive sampler yields per DP Constructor are
 planned together, stopping at optimizer and epoch boundaries. Each iterator
 yield still returns exactly one forward/backward round. The current window
-and at most one future window are double-buffered on Host. Device staging
+and at most one future window are double-buffered on Host by default. Device staging
 independently retains up to ``device_prefetch_depth`` future micro-batches;
 model-parallel input broadcast runs when the current batch is consumed.
 Checkpoints advance only at complete optimizer-step boundaries.
@@ -143,18 +145,22 @@ class DistributedDatasetConfig:
     Args:
         seq_len: Maximum token count in one non-oversized packed sequence.
         local_batch_size: Packed sequences constructed per DP rank and yield.
-        balance_window_size: Maximum native sampler micro-batches planned together.
-            Native prefetch buffers the current window and at most one future window,
-            each clipped at the optimizer-step boundary.
-            Defaults to one. Windows stop at optimizer and epoch boundaries;
-            gradient accumulation is inferred from the native sampler's global
-            batch size. External-step sources support only one.
+        balance_window_size: Maximum consecutive micro-batches planned together.
+            Native windows end at the sampler's optimizer or epoch boundary.
+            For an external source, one (the default) retains the original
+            whole-step, per-rank objective. Larger values group consecutive bins
+            within one source yield, with one bin per rank per micro-batch.
+            The final window uses the remaining bins. Each yield still returns
+            one complete optimizer step.
         device_prefetch_depth: Future native NPU/CUDA micro-batches copied ahead
             on Constructors. Model peers receive each batch only at delivery.
-            Defaults to one. Zero stages only on
-            demand while retaining Host window prefetch. Must be a non-negative
+            Defaults to one. Zero stages only on demand. Must be a non-negative
             integer and identical across ranks. Independent of balance_window_size;
             ignored on CPU. External-step sources support only the default value.
+        use_data_process: Prepare Host data in a separate process on data-plane
+            ranks (default True). With False, the caller prepares windows or
+            external steps on demand. Native H2D lookahead can use the remaining
+            batches in the current window. Configure the same value on every rank.
         dp_dim_names: Named mesh dimensions that define DP coordinates.
         balance_group_size: Optional number of DP ranks in each independent
             local-balancing group. ``None`` preserves launcher/node grouping.
@@ -225,6 +231,7 @@ class DistributedDatasetConfig:
     repack_sequences: bool = False
     pad_token_id: int | None = None
     device_prefetch_depth: int = 1
+    use_data_process: bool = True
 
     def __post_init__(self) -> None:
         """Validate topology-independent configuration boundaries."""
@@ -270,6 +277,7 @@ class DistributedDatasetConfig:
                 "broadcast_plan",
                 "log_balance",
                 "repack_sequences",
+                "use_data_process",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be boolean.")
@@ -795,6 +803,8 @@ def _build_distributed_dataloader_impl(
             "labels": TensorFieldSpec(shape, torch.int64),
             "cu_seq_lens": TensorFieldSpec((None,), torch.int32),
         }
+    if model_batch_spec is None and len(state.topology.model_parallel_ranks) > 1:
+        raise ValueError("Model-parallel loading requires the same model_batch_spec on every rank.")
     groups = create_data_groups(
         state.topology,
         state.dataset_reader_ranks,
@@ -806,38 +816,41 @@ def _build_distributed_dataloader_impl(
         model_device=device,
     )
 
-    accumulation_steps = batch_sampler.global_batch_size // batch_sampler.global_micro_batch_size
-    return DistributedDataLoader(
-        accumulation_steps=accumulation_steps,
-        balance_window_size=config.balance_window_size,
-        device_prefetch_depth=config.device_prefetch_depth,
-        device=device,
-        initial_epoch=batch_sampler.epoch,
-        initial_consumed_samples=batch_sampler.consumed_samples,
-        topology=state.topology,
-        dataset_reader_ranks=state.dataset_reader_ranks,
-        dataset_reader=state.dataset_reader,
-        metadata_reader=state.metadata_reader,
-        direct_sample_loader=state.direct_sample_loader,
-        metadata_mode=config.metadata_mode,
-        broadcast_plan=config.broadcast_plan,
-        log_balance=config.log_balance,
-        planner=state.planner,
-        data_constructor=state.constructor,
-        data_plane=DataPlaneTransport(
-            groups,
-            state.topology.global_rank,
-            communication_device=communication_device,
-        ),
-        model_transport=ModelParallelTransport(
-            state.topology,
-            groups,
-            model_batch_spec=model_batch_spec,
+    with groups.close_on_error():
+        accumulation_steps = batch_sampler.global_batch_size // batch_sampler.global_micro_batch_size
+        return DistributedDataLoader(
+            groups=groups,
+            accumulation_steps=accumulation_steps,
+            balance_window_size=config.balance_window_size,
+            device_prefetch_depth=config.device_prefetch_depth,
+            use_data_process=config.use_data_process,
             device=device,
-            communication_device=communication_device,
-        ),
-        device_prefetch=device_prefetch if state.topology.is_constructor else None,
-    )
+            initial_epoch=batch_sampler.epoch,
+            initial_consumed_samples=batch_sampler.consumed_samples,
+            topology=state.topology,
+            dataset_reader_ranks=state.dataset_reader_ranks,
+            dataset_reader=state.dataset_reader,
+            metadata_reader=state.metadata_reader,
+            direct_sample_loader=state.direct_sample_loader,
+            metadata_mode=config.metadata_mode,
+            broadcast_plan=config.broadcast_plan,
+            log_balance=config.log_balance,
+            planner=state.planner,
+            data_constructor=state.constructor,
+            data_plane=DataPlaneTransport(
+                groups,
+                state.topology.global_rank,
+                communication_device=communication_device,
+            ),
+            model_transport=ModelParallelTransport(
+                state.topology,
+                groups,
+                model_batch_spec=model_batch_spec,
+                device=device,
+                communication_device=communication_device,
+            ),
+            device_prefetch=device_prefetch if state.topology.is_constructor else None,
+        )
 
 
 __all__ = ["DistributedDatasetConfig", "build_distributed_dataloader"]

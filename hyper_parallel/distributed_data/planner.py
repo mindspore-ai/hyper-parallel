@@ -226,10 +226,10 @@ class DynamicPackingPlanner:
             reference_bins: Sequence[Sequence[SampleKey]],
             step: int,
     ) -> tuple[DistributedPackingPlan, ...]:
-        """Balance native rounds jointly over rank-by-micro-batch destinations.
+        """Balance consecutive rounds jointly over rank-by-micro-batch destinations.
 
         Args:
-            samples: The frozen union of the window's native sample occurrences.
+            samples: The frozen union of the window's sample occurrences.
             reference_bins: Original bins ordered by micro-batch, DP rank, then local bin.
             step: First distributed micro-batch index in the window.
 

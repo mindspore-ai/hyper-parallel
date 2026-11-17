@@ -24,7 +24,9 @@ from typing import Any
 import torch.distributed as dist
 
 from hyper_parallel.distributed_data.topology import DataTopology
-from hyper_parallel.distributed_data.transport import DataGroups, all_gather_control_object
+from hyper_parallel.distributed_data.transport import (
+    DataGroups, _create_data_plane_process_groups, all_gather_control_object,
+)
 
 
 def _node_rank_groups(
@@ -102,7 +104,11 @@ def _gather_startup_statuses(
     startup_group = None
     if backend == "gloo":
         startup_group = dist.new_group(ranks=list(range(dist.get_world_size())), backend="gloo")
-    return list(all_gather_control_object(status, group=startup_group, device=device, backend=backend))
+    try:
+        return list(all_gather_control_object(status, group=startup_group, device=device, backend=backend))
+    finally:
+        if startup_group is not None:
+            dist.destroy_process_group(startup_group)
 
 
 def _create_locality_groups(
@@ -143,15 +149,18 @@ def _create_locality_groups(
         rank_groups = _node_rank_groups(topology, dict(statuses))
     else:
         rank_groups = _fixed_rank_groups(topology, balance_group_size)
-    own_groups = None
-    for ranks in rank_groups:
-        control_group = None
-        payload_group = None
-        if distributed and len(ranks) > 1:
-            control_group = dist.new_group(ranks=list(ranks), backend=communication_backend)
-            payload_group = control_group
-            if communication_backend == "hccl":
-                payload_group = dist.new_group(ranks=list(ranks), backend=communication_backend)
-        if rank in ranks:
-            own_groups = DataGroups(ranks, control_group, payload_group, None, min(ranks), distributed)
+    own_ranks = next(ranks for ranks in rank_groups if rank in ranks)
+    own_groups = DataGroups(own_ranks, None, None, None, min(own_ranks), distributed)
+    if not distributed:
+        return topology, own_groups
+    with own_groups.close_on_error():
+        for ranks in rank_groups:
+            control, payload = _create_data_plane_process_groups(
+                groups=own_groups, topology=topology, data_plane_ranks=ranks,
+                cpu_backend=communication_backend, payload_backend=communication_backend,
+                reuse_control_group=communication_backend == "gloo", enable_payload_exchange=True,
+            )
+            if rank in ranks:
+                own_groups.control_group = control
+                own_groups.payload_group = payload
     return topology, own_groups

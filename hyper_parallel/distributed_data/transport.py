@@ -17,10 +17,12 @@
 
 from __future__ import annotations
 
+import math
 import pickle
 import struct
-from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass, field as dataclass_field
+from typing import Any, Iterator, Mapping, Sequence
 
 import torch
 import torch.distributed as dist
@@ -29,7 +31,8 @@ from hyper_parallel.distributed_data.model_batch import ModelBatchLayout
 from hyper_parallel.distributed_data.schema import SampleKey
 from hyper_parallel.distributed_data.topology import DataTopology
 
-@dataclass(frozen=True)
+
+@dataclass
 class DataGroups:
     """Control, payload, and model-consumer groups for distributed data."""
 
@@ -40,6 +43,39 @@ class DataGroups:
     planner_rank: int
     distributed: bool
     model_parallel_tensor_group: Any = None
+    _owned: list[Any] = dataclass_field(default_factory=list, init=False, repr=False, compare=False)
+
+    def new_group(self, ranks: tuple[int, ...], backend: str | None) -> Any:
+        """Create a subgroup and register member handles for rollback and explicit close.
+
+        Args:
+            ranks: Global ranks in collective order.
+            backend: Backend for the new subgroup.
+        """
+        group = dist.new_group(ranks=list(ranks), backend=backend)
+        if group != dist.GroupMember.NON_GROUP_MEMBER:
+            self._owned.append(group)
+        return group
+
+    @contextmanager
+    def close_on_error(self) -> Iterator[None]:
+        """Release acquired groups if construction fails before ownership transfers to the loader."""
+        try:
+            yield
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        """Destroy owned handles in creation order and drop all their transport aliases."""
+        while self._owned:
+            group = self._owned[0]
+            if dist.is_initialized():
+                dist.destroy_process_group(group)
+            self._owned.pop(0)
+            for name in ("control_group", "payload_group", "model_parallel_group", "model_parallel_tensor_group"):
+                if getattr(self, name) is group:
+                    setattr(self, name, None)
 
 
 @dataclass(frozen=True)
@@ -58,7 +94,7 @@ class ControlGatherWork:
 
     encoded: torch.Tensor | None = None
     sizes: tuple[int, ...] = ()
-    gathered: tuple[torch.Tensor, ...] = ()
+    gathered: torch.Tensor | None = None
     data_work: Any = None
     completed_values: tuple[Any, ...] | None = None
 
@@ -67,9 +103,9 @@ class ControlGatherWork:
         if self.completed_values is None:
             if self.data_work is not None:
                 self.data_work.wait()
-            self.completed_values = tuple(
-                _decode_control(payload, size) for payload, size in zip(self.gathered, self.sizes)
-            )
+            rows = self.gathered.cpu().view(len(self.sizes), -1).numpy()
+            self.completed_values = tuple(pickle.loads(row[:size].tobytes())
+                                          for row, size in zip(rows, self.sizes))
         return self.completed_values
 
 
@@ -130,9 +166,7 @@ def _require_control_device(device: Any, backend: str) -> torch.device:
 def _encode_control(value: Any, device: Any) -> tuple[torch.Tensor, int]:
     encoded = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
     resolved = torch.device(device)
-    payload = torch.zeros((max(1, len(encoded)),), dtype=torch.uint8, device=resolved)
-    if encoded:
-        payload[:len(encoded)] = torch.tensor(list(encoded), dtype=torch.uint8, device=resolved)
+    payload = torch.frombuffer(bytearray(encoded), dtype=torch.uint8).to(resolved)
     return payload, len(encoded)
 
 
@@ -178,17 +212,17 @@ def _begin_all_gather_control_object(
     resolved = _require_control_device(device, effective_backend)
     encoded, encoded_size = _encode_control(value, resolved)
     local_size = torch.tensor([encoded_size], dtype=torch.int64, device=resolved)
-    sizes = [torch.empty_like(local_size) for _ in range(dist.get_world_size(group))]
-    dist.all_gather(sizes, local_size, group=group)
-    host_sizes = tuple(int(item.item()) for item in sizes)
+    sizes = torch.empty(dist.get_world_size(group), dtype=torch.int64, device=resolved)
+    dist.all_gather_into_tensor(sizes, local_size, group=group)
+    host_sizes = tuple(sizes.cpu().tolist())
     max_size = max(host_sizes)
     if encoded.numel() < max_size:
         padded = torch.zeros((max_size,), dtype=torch.uint8, device=resolved)
         padded[:encoded.numel()] = encoded
         encoded = padded
-    gathered = [torch.empty_like(encoded) for _ in sizes]
-    work = dist.all_gather(gathered, encoded, group=group, async_op=True)
-    return ControlGatherWork(encoded=encoded, sizes=host_sizes, gathered=tuple(gathered), data_work=work)
+    gathered = torch.empty(len(host_sizes) * max_size, dtype=torch.uint8, device=resolved)
+    work = dist.all_gather_into_tensor(gathered, encoded, group=group, async_op=True)
+    return ControlGatherWork(encoded=encoded, sizes=host_sizes, gathered=gathered, data_work=work)
 
 
 def broadcast_control_object(
@@ -271,25 +305,25 @@ def create_data_groups(
         communication_device=communication_device,
         enable_payload_exchange=enable_payload_exchange,
     )
-    control_group, payload_group = _create_data_plane_process_groups(
-        topology=topology,
-        data_plane_ranks=data_plane_ranks,
-        cpu_backend=cpu_backend,
-        payload_backend=effective_payload_backend,
-        reuse_control_group=reuse_control_group,
-        enable_payload_exchange=enable_payload_exchange,
-    )
-    tensor_backend = _resolve_model_tensor_backend(communication_device, payload_backend)
-    model_device = torch.device(model_device) if model_device is not None else None
-    if model_device is not None and model_device.type in ("cuda", "npu"):
-        tensor_backend = "nccl" if model_device.type == "cuda" else "hccl"
-    model_parallel_group, model_parallel_tensor_group = _create_model_parallel_process_groups(
-        topology, cpu_backend, tensor_backend,
-    )
-    return DataGroups(
-        data_plane_ranks, control_group, payload_group, model_parallel_group, planner_rank, True,
-        model_parallel_tensor_group,
-    )
+    groups = DataGroups(data_plane_ranks, None, None, None, planner_rank, True)
+    with groups.close_on_error():
+        groups.control_group, groups.payload_group = _create_data_plane_process_groups(
+            groups=groups,
+            topology=topology,
+            data_plane_ranks=data_plane_ranks,
+            cpu_backend=cpu_backend,
+            payload_backend=effective_payload_backend,
+            reuse_control_group=reuse_control_group,
+            enable_payload_exchange=enable_payload_exchange,
+        )
+        tensor_backend = _resolve_model_tensor_backend(communication_device, payload_backend)
+        model_device = torch.device(model_device) if model_device is not None else None
+        if model_device is not None and model_device.type in ("cuda", "npu"):
+            tensor_backend = "nccl" if model_device.type == "cuda" else "hccl"
+        groups.model_parallel_group, groups.model_parallel_tensor_group = _create_model_parallel_process_groups(
+            groups, topology, cpu_backend, tensor_backend,
+        )
+    return groups
 
 
 def _single_rank_data_groups(
@@ -380,6 +414,7 @@ def _validate_payload_device(
 
 def _create_data_plane_process_groups(
         *,
+        groups: DataGroups,
         topology: DataTopology,
         data_plane_ranks: tuple[int, ...],
         cpu_backend: str,
@@ -390,14 +425,14 @@ def _create_data_plane_process_groups(
     """Create control and payload groups in common rank order, returning owned handles."""
     if len(data_plane_ranks) == 1:
         return None, None
-    created_control_group = dist.new_group(ranks=list(data_plane_ranks), backend=cpu_backend)
+    created_control_group = groups.new_group(data_plane_ranks, cpu_backend)
     is_member = topology.global_rank in data_plane_ranks
     control_group = created_control_group if is_member else None
     if not enable_payload_exchange:
         return control_group, None
     if reuse_control_group:
         return control_group, control_group
-    created_payload_group = dist.new_group(ranks=list(data_plane_ranks), backend=payload_backend)
+    created_payload_group = groups.new_group(data_plane_ranks, payload_backend)
     return control_group, created_payload_group if is_member else None
 
 
@@ -416,6 +451,7 @@ def _resolve_model_tensor_backend(communication_device: Any, payload_backend: st
 
 
 def _create_model_parallel_process_groups(
+        groups: DataGroups,
         topology: DataTopology,
         cpu_backend: str,
         tensor_backend: str | None,
@@ -427,11 +463,11 @@ def _create_model_parallel_process_groups(
         if len(rank_group) == 1:
             continue
         is_member = topology.global_rank in rank_group
-        created_group = dist.new_group(ranks=list(rank_group), backend=cpu_backend)
+        created_group = groups.new_group(rank_group, cpu_backend)
         if is_member:
             model_parallel_group = created_group
         if tensor_backend is not None:
-            created_tensor_group = dist.new_group(ranks=list(rank_group), backend=tensor_backend)
+            created_tensor_group = groups.new_group(rank_group, tensor_backend)
             if is_member:
                 model_parallel_tensor_group = created_tensor_group
     return model_parallel_group, model_parallel_tensor_group
@@ -670,16 +706,17 @@ class DataPlaneTransport:
     topology is fixed at build time; it is not revalidated for each collective.
     """
 
-    def __init__(self, groups: DataGroups, global_rank: int, communication_device: Any = None) -> None:
+    def __init__(self, groups: DataGroups, global_rank: int, communication_device: Any = None,
+                 *, planner_process_rank: int | None = None) -> None:
         """Store service-group membership."""
         self._ranks = groups.data_plane_ranks
-        self._control_group = groups.control_group
-        self._payload_group = groups.payload_group
+        self._groups = groups
         self._planner_rank = groups.planner_rank
+        self._planner_process_rank = groups.planner_rank if planner_process_rank is None else planner_process_rank
         self._global_rank = global_rank
         self._is_member = global_rank in self._ranks
         self._local_index = self._ranks.index(global_rank) if self._is_member else None
-        if self._is_member and len(self._ranks) > 1 and (not groups.distributed or self._control_group is None):
+        if self._is_member and len(self._ranks) > 1 and (not groups.distributed or self._groups.control_group is None):
             raise ValueError("Multi-rank data-plane communication requires an initialized process group.")
         self._communication_device = (
             torch.device(communication_device) if communication_device is not None else None
@@ -708,7 +745,12 @@ class DataPlaneTransport:
     @property
     def communication_backend(self) -> str:
         """Return the backend used by this data-plane control group."""
-        return _control_backend(self._control_group)
+        return _control_backend(self._groups.control_group)
+
+    @property
+    def payload_backend(self) -> str | None:
+        """Return the payload backend for rebuilding an independent data group."""
+        return _control_backend(self._groups.payload_group) if self._groups.payload_group is not None else None
 
     def all_gather_object(self, value: Any) -> tuple[Any, ...]:
         """Gather small control objects on every data-plane rank.
@@ -736,7 +778,7 @@ class DataPlaneTransport:
             return ControlGatherWork(completed_values=(value,))
         return _begin_all_gather_control_object(
             value,
-            group=self._control_group,
+            group=self._groups.control_group,
             device=self._communication_device,
         )
 
@@ -751,14 +793,14 @@ class DataPlaneTransport:
         """
         if len(self._ranks) == 1:
             return value
-        backend = _control_backend(self._control_group)
+        backend = _control_backend(self._groups.control_group)
         flag_device = (
             _require_control_device(self._communication_device, backend)
             if _is_accelerator_backend(backend)
             else torch.device("cpu")
         )
         flag = torch.tensor([int(value)], dtype=torch.int32, device=flag_device)
-        dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=self._control_group)
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=self._groups.control_group)
         return bool(flag.item())
 
     def gather_object_to_planner(self, value: Any) -> tuple[Any, ...] | None:
@@ -786,8 +828,8 @@ class DataPlaneTransport:
             return value
         return broadcast_control_object(
             value if self._global_rank == self._planner_rank else None,
-            src=self._planner_rank,
-            group=self._control_group,
+            src=self._planner_process_rank,
+            group=self._groups.control_group,
             device=self._communication_device,
         )
 
@@ -869,13 +911,13 @@ class DataPlaneTransport:
                     prepared.input_splits,
                 ),
             )
-        if self._payload_group is None:
+        if self._groups.payload_group is None:
             raise ValueError("Sample payload exchange requires a payload process group.")
 
         input_splits = list(prepared.input_splits)
         output_splits = _exchange_payload_sizes(
             input_splits,
-            self._control_group,
+            self._groups.control_group,
             device=self._communication_device,
         )
         received_tensor = torch.empty(
@@ -888,7 +930,7 @@ class DataPlaneTransport:
             prepared.send_tensor,
             output_split_sizes=output_splits,
             input_split_sizes=input_splits,
-            group=self._payload_group,
+            group=self._groups.payload_group,
             async_op=True,
         )
         return PayloadExchangeWork(
@@ -908,21 +950,20 @@ class ModelParallelTransport:
     ) -> None:
         """Bind model peers, communication devices and the local batch declaration."""
         self._ranks = topology.model_parallel_ranks
-        self._control_group = groups.model_parallel_group
-        self._accelerator_tensor_group = groups.model_parallel_tensor_group
+        self._groups = groups
         self._constructor_rank = topology.constructor_rank
         self._global_rank = topology.global_rank
         self._communication_device = torch.device(communication_device) if communication_device is not None else None
         self._device = torch.device(device or communication_device or "cpu")
         self._layout = None if model_batch_spec is None else ModelBatchLayout(model_batch_spec)
         if len(self._ranks) > 1:
-            if not groups.distributed or self._control_group is None:
+            if not groups.distributed or self._groups.model_parallel_group is None:
                 raise ValueError("Multi-rank model broadcast requires an initialized process group.")
             if self._layout is None:
                 raise ValueError("Model-parallel loading requires the same model_batch_spec on every rank.")
 
     def _control_tensor(self, values: list[int]) -> torch.Tensor:
-        backend = _control_backend(self._control_group)
+        backend = _control_backend(self._groups.model_parallel_group)
         device = (
             _require_control_device(self._communication_device, backend) if _is_accelerator_backend(backend) else "cpu"
         )
@@ -961,7 +1002,7 @@ class ModelParallelTransport:
                 error = exc
                 values[0] = -1
         header = self._control_tensor(values)
-        dist.broadcast(header, src=self._constructor_rank, group=self._control_group)
+        dist.broadcast(header, src=self._constructor_rank, group=self._groups.model_parallel_group)
         if not is_constructor:
             values = header.cpu().tolist()
         if values[0] == -1:
@@ -973,9 +1014,36 @@ class ModelParallelTransport:
         if values[0] != 1:
             raise ValueError("Invalid model batch status header.")
         shapes = self._layout.shapes(values[1:])
-        received = [self._broadcast_tensor(field, shape, tensors[index] if is_constructor else None)
-                    for index, (field, shape) in enumerate(zip(self._layout.fields, shapes))]
+        received = self._broadcast_tensors(shapes, tensors)
         return self._layout.rebuild(received)
+
+    def _broadcast_tensors(self, shapes: list[tuple[int, ...]], sources: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Coalesce fields with the same dtype and destination placement."""
+        buckets = {}
+        for index, field in enumerate(self._layout.fields):
+            buckets.setdefault((field.dtype, field.device), []).append(index)
+        received = [None] * len(shapes)
+        for indices in buckets.values():
+            field = self._layout.fields[indices[0]]
+            bucket_shapes = [shapes[index] for index in indices]
+            local = [sources[index] for index in indices] if sources else []
+            for index, tensor in zip(indices, self._broadcast_bucket(field, bucket_shapes, local)):
+                received[index] = tensor
+        return received
+
+    def _broadcast_bucket(self, field: Any, shapes: list[tuple[int, ...]],
+                          sources: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Broadcast one packed payload while retaining independent leaf storage."""
+        if len(shapes) == 1:
+            return [self._broadcast_tensor(field, shapes[0], sources[0] if sources else None)]
+        target = torch.device("cpu") if field.device == "cpu" else self._device
+        local = [tensor.to(target).contiguous() for tensor in sources]
+        sizes = [math.prod(shape) for shape in shapes]
+        packed = torch.cat([tensor.reshape(-1) for tensor in local]) if local else None
+        packed = self._broadcast_tensor(field, (sum(sizes),), packed)
+        if local:
+            return local
+        return [part.reshape(shape).clone() for part, shape in zip(packed.split(sizes), shapes)]
 
     def _broadcast_tensor(self, field: Any, shape: tuple[int, ...], source: Any) -> torch.Tensor:
         """Broadcast one declared tensor using a backend-compatible transfer device."""
@@ -993,9 +1061,9 @@ class ModelParallelTransport:
         return tensor.to(target)
 
     def _group_for_tensor(self, device_type: str) -> Any:
-        if device_type == "cpu" or self._accelerator_tensor_group is None:
-            return self._control_group
-        return self._accelerator_tensor_group
+        if device_type == "cpu" or self._groups.model_parallel_tensor_group is None:
+            return self._groups.model_parallel_group
+        return self._groups.model_parallel_tensor_group
 
 
 __all__ = [
