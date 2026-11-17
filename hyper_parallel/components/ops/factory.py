@@ -44,7 +44,7 @@ class OpRuntime:
         self._registry = registry
         self._selections = selections
         self._context = context
-        self._resolved: dict[tuple[OpSpec[Any], torch.dtype | None, bool], tuple[str, Any]] = {}
+        self._resolved: dict[tuple[OpSpec[Any], torch.dtype | None, str, bool, tuple[str, ...]], tuple[str, Any]] = {}
         self._report: dict[tuple[str, str], str] = {}
         self._used_backends: dict[tuple[str, str, str], None] = {}
         self._lock = RLock()
@@ -70,33 +70,40 @@ class OpRuntime:
             return tuple(self._used_backends)
 
     def _load(
-        self, spec: OpSpec[Fn], input_dtype: torch.dtype | None, native_only: str | None,
+        self, spec: OpSpec[Fn], input_dtype: torch.dtype | None, selection: str,
+        native_only: str | None, blocked_backends: tuple[tuple[str, str], ...],
     ) -> tuple[str, Fn]:
         context = self._context
         if input_dtype is not None:
             context = OpBuildContext(context.target_device, context.dtype, context.parallel, input_dtype)
         selected = self._registry.resolve(
-            spec, self._selections.get(spec.config_key, "auto"), context, native_only=native_only,
+            spec, selection, context, native_only=native_only, blocked_backends=blocked_backends,
         )
         self._report[(spec.config_key, spec.variant)] = selected[0]
         self._used_backends[(spec.config_key, spec.variant, selected[0])] = None
         return selected
 
-    def _get_or_resolve(self, spec: OpSpec[Fn], x: torch.Tensor, native_only: str | None = None) -> Fn:
+    def _get_or_resolve(
+        self, spec: OpSpec[Fn], x: torch.Tensor, native_only: str | None,
+        blocked_backends: tuple[tuple[str, str], ...], default_backend: str,
+    ) -> Fn:
         # CUDA grouped kernels can have an input dtype constraint independent
         # of parameter initialization and FSDP mixed precision.
         input_dtype = x.dtype if self._context.target_device.type == "cuda" else None
-        key = (spec, input_dtype, native_only is not None)
+        selection = self._selections.get(spec.config_key, default_backend)
+        key = (spec, input_dtype, selection, native_only is not None, tuple(name for name, _ in blocked_backends))
         selected = self._resolved.get(key)
         if selected is None:
             if torch.compiler.is_compiling():
                 # The graph already captures the selected callable. Avoid
                 # publishing a Python callable as a side effect of tracing.
-                return self._load(spec, input_dtype, native_only)[1]
+                return self._load(spec, input_dtype, selection, native_only, blocked_backends)[1]
             with self._lock:
                 selected = self._resolved.get(key)
                 if selected is None:
-                    selected = self._resolved[key] = self._load(spec, input_dtype, native_only)
+                    selected = self._resolved[key] = self._load(
+                        spec, input_dtype, selection, native_only, blocked_backends,
+                    )
         return cast(Fn, selected[1])
 
 
@@ -166,15 +173,21 @@ def _standalone_runtime(device: torch.device) -> OpRuntime:
     return ops.configure(registry=builtin_registry, selections={}, target_device=device)
 
 
-def _select_for_call(spec: OpSpec[Fn], x: torch.Tensor, *, native_only: str | None = None) -> Fn:
+def _select_for_call(
+    spec: OpSpec[Fn], x: torch.Tensor, *, native_only: str | None = None,
+    blocked_backends: tuple[tuple[str, str], ...] = (), default_backend: str = "auto",
+) -> Fn:
     runtime = getattr(_ACTIVE, "runtime", None)
     if runtime is None:
         if torch.compiler.is_compiling():
             return builtin_registry.resolve(
-                spec, "auto", OpBuildContext(x.device, None, {}, x.dtype), native_only=native_only,
+                spec, default_backend, OpBuildContext(x.device, None, {}, x.dtype), native_only=native_only,
+                blocked_backends=blocked_backends,
             )[1]
         runtime = _standalone_runtime(x.device)
-    return runtime._get_or_resolve(spec, x, native_only)  # pylint: disable=protected-access
+    return runtime._get_or_resolve(  # pylint: disable=protected-access
+        spec, x, native_only, blocked_backends, default_backend,
+    )
 
 
 def _dispatch(spec: OpSpec[Fn]) -> Fn:

@@ -31,11 +31,7 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
 
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.components.modules.family import ModuleFamily, SelectorSpec, VariantRule, register_module_family
-from hyper_parallel.components.functional import (
-    moe_token_permute,
-    moe_token_unpermute,
-)
-from hyper_parallel.components.ops import grouped_matmul, swiglu
+from hyper_parallel.components.ops import grouped_matmul, moe_token_reorder, moe_token_restore, swiglu
 
 
 @module_replacement
@@ -466,12 +462,11 @@ class GroupedExperts(nn.Module):
         """Run grouped experts with the Transformers Experts interface."""
         hidden_shape = hidden_states.shape
         hidden_states_flat = hidden_states.view(-1, hidden_states.shape[-1])
-        permuted_tokens, sorted_indices = moe_token_permute(  # pylint: disable=not-callable
-            hidden_states_flat,
-            top_k_index,
-        )
+        top_k_index = top_k_index.flatten(0, -2)
+        top_k_weights = top_k_weights.reshape_as(top_k_index)
+        permuted_tokens, order, positions = moe_token_reorder(hidden_states_flat, top_k_index)
         flatten_probs = top_k_weights.view(-1)
-        permuted_probs = flatten_probs.index_select(0, sorted_indices)
+        permuted_probs = flatten_probs.index_select(0, order)
         tokens_per_expert = torch.histc(
             top_k_index.view(-1).float(),
             bins=self.num_experts,
@@ -483,11 +478,7 @@ class GroupedExperts(nn.Module):
             tokens_per_expert,
             permuted_probs,
         )
-        output = moe_token_unpermute(  # pylint: disable=not-callable
-            expert_outputs,
-            sorted_indices,
-            top_k_weights,
-        )
+        output = moe_token_restore(expert_outputs, positions, top_k_weights)
         return output.view(hidden_shape)
 
 

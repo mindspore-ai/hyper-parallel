@@ -22,12 +22,14 @@ from typing import Any, Protocol
 
 import torch
 
+from hyper_parallel.components.functional.dsa_dense import dsa_dense_indexer_kl_loss, dsa_dense_indexer_lse
+from hyper_parallel.components.functional.dsa_kl_loss import dsa_kl_loss as fused_packed_kl
 from hyper_parallel.components.functional.sparse_lightning_indexer_kl_loss_grad import (
     gather_selected_keys, sparse_lightning_indexer_kl_loss, validate_fused_kl_inputs,
 )
 
-from .._dependency import load_cann
-from .._dsa_layout import DsaQueryLayout, ReduceSum
+from .._dependency import load_cann, require_package, require_symbol
+from .._dsa_layout import DsaQueryLayout, ReduceSum, packed_segments, selected_packed_keys, selected_packed_scores
 from ..registry import OpRegistry
 from ..spec import OpSpec
 from .dsa_indexer import indexer_native_only
@@ -46,6 +48,116 @@ class DsaIndexerKlFn(Protocol):
 
 
 DSA_INDEXER_KL = OpSpec[DsaIndexerKlFn](config_key="dsa_indexer_kl", variant="compressed_teacher")
+
+
+class PackedDsaKlFn(Protocol):
+    """Distill the packed sparse attention distribution into the DSA indexer."""
+
+    def __call__(
+        self, x: torch.Tensor, index_key: torch.Tensor, merge_weight: torch.Tensor,
+        query: torch.Tensor, key: torch.Tensor, topk_indices: torch.Tensor,
+        softmax_max: torch.Tensor, softmax_sum: torch.Tensor, query_rope: torch.Tensor, key_rope: torch.Tensor,
+        query_ends: torch.Tensor, key_ends: torch.Tensor, scale: float, loss_coeff: float,
+    ) -> torch.Tensor:
+        """Return a token-mean KL loss with gradients on the three student inputs only."""
+
+
+DSA_PACKED_KL = OpSpec[PackedDsaKlFn](config_key="dsa_indexer_kl", variant="packed_sparse_teacher")
+
+
+class DenseDsaKlFn(Protocol):
+    """Distill unabsorbed MLA into the indexer over each packed document."""
+
+    def __call__(
+        self, x: torch.Tensor, index_key: torch.Tensor, weights: torch.Tensor, query: torch.Tensor, key: torch.Tensor,
+        maximum: torch.Tensor, total: torch.Tensor, query_rope: torch.Tensor, key_rope: torch.Tensor,
+        query_ends: torch.Tensor, key_ends: torch.Tensor, *, scale: float, loss_coeff: float,
+    ) -> torch.Tensor:
+        """Return the token-mean KL and differentiate the indexer inputs only."""
+
+
+DSA_DENSE_KL = OpSpec[DenseDsaKlFn](config_key="dsa_indexer_kl", variant="packed_dense_teacher")
+
+
+def _native_dense_kl(
+    x: torch.Tensor, index_key: torch.Tensor, weights: torch.Tensor, query: torch.Tensor, key: torch.Tensor,
+    maximum: torch.Tensor, total: torch.Tensor, query_rope: torch.Tensor, key_rope: torch.Tensor,
+    query_ends: torch.Tensor, key_ends: torch.Tensor, *, scale: float, loss_coeff: float,
+) -> torch.Tensor:
+    del maximum, total
+    loss = x.new_zeros((), dtype=torch.float32)
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        for qs, qe, ks, ke in packed_segments(query_ends, key_ends):
+            key_pos = torch.arange(ke - ks, device=x.device)
+            for start in range(qs, qe, 128):
+                end = min(start + 128, qe)
+                causal = torch.arange(start, end, device=x.device) - qe + ke - ks
+                valid = key_pos[None, :] <= causal[:, None]
+                with torch.no_grad():
+                    logits = torch.einsum("thd,khd->thk", query[start:end].float(), key[ks:ke].float())
+                    rotary = torch.einsum("thd,khd->thk", query_rope[start:end].float(), key_rope[ks:ke].float())
+                    teacher = ((logits + rotary) * scale).masked_fill(~valid[:, None], -1.0e9)
+                    target = teacher.softmax(-1).mean(1).masked_fill(~valid, 0.0)
+                student = (x[start:end].float() @ index_key[ks:ke, 0].float().T).relu()
+                student = (student * weights[start:end].float().unsqueeze(-1)).sum(dim=1)
+                student = student.masked_fill(~valid, -1.0e9)
+                loss = loss + (target * (target.clamp_min(1.0e-30).log() - student.log_softmax(-1))).sum()
+    return loss * (loss_coeff / x.shape[0])
+
+
+def _cann_dense_kl(
+    x: torch.Tensor, index_key: torch.Tensor, weights: torch.Tensor, query: torch.Tensor, key: torch.Tensor,
+    maximum: torch.Tensor, total: torch.Tensor, query_rope: torch.Tensor, key_rope: torch.Tensor,
+    query_ends: torch.Tensor, key_ends: torch.Tensor, *, scale: float, loss_coeff: float,
+) -> torch.Tensor:
+    indexer_stats = dsa_dense_indexer_lse(x, index_key, weights, query_lengths=query_ends, key_lengths=key_ends)
+    return dsa_dense_indexer_kl_loss(
+        x, index_key, weights, query, key, maximum, total, indexer_stats, scale=scale,
+        query_rope=query_rope, key_rope=key_rope, query_lengths=query_ends, key_lengths=key_ends,
+        loss_coefficient=loss_coeff,
+    )
+
+
+def _load_cann_dense_kl() -> DenseDsaKlFn:
+    extension = require_package("torch_npu")
+    require_symbol(extension, "npu_dense_lightning_indexer_softmax_lse")
+    require_symbol(extension, "npu_dense_lightning_indexer_grad_kl_loss")
+    return _cann_dense_kl
+
+
+def _native_packed_kl(
+    x: torch.Tensor, index_key: torch.Tensor, merge_weight: torch.Tensor,
+    query: torch.Tensor, key: torch.Tensor, topk_indices: torch.Tensor,
+    softmax_max: torch.Tensor, softmax_sum: torch.Tensor, query_rope: torch.Tensor, key_rope: torch.Tensor,
+    query_ends: torch.Tensor, key_ends: torch.Tensor, scale: float, loss_coeff: float,
+) -> torch.Tensor:
+    del softmax_max, softmax_sum
+    loss = x.new_zeros((), dtype=torch.float32)
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        for qs, qe, ks, ke in packed_segments(query_ends, key_ends):
+            for start in range(qs, qe, 32):
+                end = min(start + 32, qe)
+                indices = topk_indices[start:end]
+                causal = torch.arange(start, end, device=x.device) - qe + ke - ks
+                with torch.no_grad():
+                    selected, valid = selected_packed_keys(key[ks:ke], indices, causal_end=causal)
+                    rotary_keys, _ = selected_packed_keys(key_rope[ks:ke], indices, causal_end=causal)
+                    teacher = (selected_packed_scores(query[start:end], selected)
+                               + selected_packed_scores(query_rope[start:end], rotary_keys)) * scale
+                    teacher = teacher.masked_fill(~valid.unsqueeze(2), -1.0e9).softmax(-1)
+                    target = teacher.mean(dim=2).masked_fill(~valid, 0.0)
+                selected, _ = selected_packed_keys(index_key[ks:ke], indices, causal_end=causal)
+                student = selected_packed_scores(x[start:end], selected).relu()
+                weights = merge_weight[start:end].unflatten(-1, (selected.shape[1], -1)).float()
+                student = (student * weights.unsqueeze(-1)).sum(dim=2).masked_fill(~valid, -1.0e9)
+                loss = loss + (target * (target.clamp_min(1.0e-30).log() - student.log_softmax(-1))).sum()
+    return loss * (loss_coeff / x.shape[0])
+
+
+def _load_cann_packed_kl() -> PackedDsaKlFn:
+    extension = require_package("torch_npu")
+    require_symbol(extension, "npu_sparse_lightning_indexer_grad_kl_loss")
+    return fused_packed_kl
 
 
 class _SharedCompressedIndexerKLLoss(torch.autograd.Function):
@@ -231,10 +343,18 @@ def _cann_kl(
 
 def register_dsa_indexer_kl(registry: OpRegistry) -> None:
     """Register the compressed-teacher KL contract and its implementations."""
-    registry.register_family("dsa_indexer_kl", specs=(DSA_INDEXER_KL,))
+    registry.register_family("dsa_indexer_kl", specs=(DSA_INDEXER_KL, DSA_PACKED_KL, DSA_DENSE_KL))
     registry.register_impl(
         DSA_INDEXER_KL, name="native", devices=("cpu", "cuda", "npu"), load=lambda: native_dsa_indexer_kl,
     )
+    registry.register_impl(
+        DSA_PACKED_KL, name="native", devices=("cpu", "cuda", "npu"), load=lambda: _native_packed_kl,
+    )
+    registry.register_impl(DSA_PACKED_KL, name="cann", devices=("npu",), load=_load_cann_packed_kl)
+    registry.register_impl(
+        DSA_DENSE_KL, name="native", devices=("cpu", "cuda", "npu"), load=lambda: _native_dense_kl,
+    )
+    registry.register_impl(DSA_DENSE_KL, name="cann", devices=("npu",), load=_load_cann_dense_kl)
     registry.register_impl(
         DSA_INDEXER_KL, name="cann", devices=("npu",),
         load=partial(load_cann, _cann_kl, "sparse_lightning_indexer_kl_loss_grad",

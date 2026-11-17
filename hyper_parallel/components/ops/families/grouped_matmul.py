@@ -87,7 +87,8 @@ def _load_cuda() -> GroupedMatmulFn:
     return run
 
 
-def _check_cuda(context: OpBuildContext) -> str | None:
+def check_torch_grouped_mm(context: OpBuildContext) -> str | None:
+    """Check CUDA requirements shared by grouped matrix multiplication users."""
     if context.input_dtype != torch.bfloat16:
         return "torch_grouped_mm requires BF16 inputs"
     if torch.cuda.get_device_capability(context.target_device)[0] < 8:
@@ -101,5 +102,6 @@ def register_grouped_matmul(registry: OpRegistry) -> None:
     registry.register_impl(GROUPED_MATMUL, name="native", devices=("cuda", "cpu", "npu"), load=_load_native)
     registry.register_impl(GROUPED_MATMUL, name="torch_npu", devices=("npu",), load=_load_npu)
     registry.register_impl(
-        GROUPED_MATMUL, name="torch_grouped_mm", devices=("cuda",), load=_load_cuda, check_compatibility=_check_cuda,
+        GROUPED_MATMUL, name="torch_grouped_mm", devices=("cuda",), load=_load_cuda,
+        check_compatibility=check_torch_grouped_mm,
     )

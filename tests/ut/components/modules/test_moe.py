@@ -21,6 +21,7 @@ from unittest.mock import patch
 import torch
 
 from hyper_parallel.components.modules import moe
+from hyper_parallel.components.ops.families import grouped_swiglu as grouped_swiglu_family
 
 
 class TestGroupedExperts(unittest.TestCase):
@@ -48,7 +49,7 @@ class TestGroupedExperts(unittest.TestCase):
         native_grouped_mm = torch._grouped_mm
 
         with patch.object(moe.torch, "_grouped_mm", wraps=native_grouped_mm) as grouped_mm:
-            outputs = [moe._run_experts_grouped_mm_gpu(*inputs, counts) for _ in range(2)]
+            outputs = [grouped_swiglu_family._cuda(inputs[3], *inputs[:3], counts) for _ in range(2)]
 
         self.assertEqual(grouped_mm.call_count, 6, f"Expected 6 GEMMs, got {grouped_mm.call_count}")
         for index, call in enumerate(grouped_mm.call_args_list):
@@ -78,9 +79,11 @@ class TestGroupedExperts(unittest.TestCase):
                 )
                 actual_inputs = inputs + ((scores,) if weighted else ())
                 reference_inputs = tuple(tensor.detach().clone().requires_grad_() for tensor in actual_inputs)
-                actual = moe._run_experts_grouped_mm_gpu(*inputs, counts, scores)
+                actual = grouped_swiglu_family._cuda(inputs[3], *inputs[:3], counts, scores)
                 reference_scores = reference_inputs[4] if weighted else None
-                expected = moe._run_experts_for_loop(*reference_inputs[:4], counts, reference_scores)
+                expected = grouped_swiglu_family.native_grouped_swiglu(
+                    reference_inputs[3], *reference_inputs[:3], counts, reference_scores,
+                )
 
                 torch.testing.assert_close(actual, expected)
                 grad_output = torch.linspace(-0.5, 0.5, actual.numel(), dtype=dtype).reshape_as(actual)

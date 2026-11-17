@@ -27,58 +27,12 @@ from hyper_parallel.components.checkpoint.weight_conversion import WeightConvert
 
 from hyper_parallel.components.checkpoint import ConcatenateWithSections
 from hyper_parallel.models.replacement import module_replacement
-from hyper_parallel.components.functional import aggregate_hidden, aux_loss_auto_scale
-from hyper_parallel.components.functional import apply_rotary_pos_emb, apply_rotary_pos_emb_interleave
-from hyper_parallel.components.functional import (
-    dsa_indexer,
-    dsa_kl_loss,
-    dsa_sparse_attention,
-    dsa_sparse_attention_rescale,
-)
+from hyper_parallel.components.functional import aux_loss_auto_scale
 from hyper_parallel.components.functional.npu_fusion_attention import resolve_packed_sequence_lengths
-
-
-def _dense_flash_attention(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    sequence_lengths: tuple[torch.Tensor, torch.Tensor],
-    *,
-    need_stats: bool,
-) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    """Run one TND FA and return dense-indexer statistics."""
-    query_ends, key_ends = (lengths.tolist() for lengths in sequence_lengths)
-    q_flat, k_flat, v_flat = (tensor.flatten(0, 1) for tensor in (query, key, value))
-    num_heads = q_flat.shape[1]
-    causal_mask = torch.ones((2048, 2048), dtype=torch.bool, device=query.device).triu(diagonal=1)
-    import torch_npu  # pylint: disable=import-outside-toplevel
-
-    result = torch_npu.npu_fusion_attention(
-        q_flat.contiguous(), k_flat.contiguous(), v_flat.contiguous(), num_heads, "TND",
-        pse=None, padding_mask=None, atten_mask=causal_mask, scale=module.scaling,
-        pre_tockens=getattr(module, "pre_tockens", 1048576),
-        next_tockens=getattr(module, "next_tockens", 0), keep_prob=1.0, inner_precise=0,
-        actual_seq_qlen=query_ends, actual_seq_kvlen=key_ends, sparse_mode=3,
-    )
-    output = result[0].reshape(*query.shape[:3], value.shape[-1])
-    if not need_stats:
-        return output, None, None
-
-    # TND FA stores each packed segment as [head, token, 8], while exposing a
-    # physical [token, head, 8] shape. Dense KL consumes [head, token, 1].
-    statistics = []
-    starts = [0, *query_ends[:-1]]
-    for statistic in result[1:3]:
-        rows = statistic.reshape(-1, statistic.shape[-1])
-        segments = [
-            rows[start * num_heads : end * num_heads].reshape(
-                num_heads, end - start, statistic.shape[-1]
-            )[..., :1]
-            for start, end in zip(starts, query_ends)
-        ]
-        statistics.append(torch.cat(segments, dim=1).detach())
-    return output, statistics[0], statistics[1]
+from hyper_parallel.components.ops import (
+    dsa_indexer_kl_dense, dsa_indexer_kl_packed, dsa_indexer_packed, dsa_sparse_attention_absorbed,
+    dsa_sparse_attention_with_sink, mla_attention_with_stats, mome, rope_interleaved, rope_qk,
+)
 
 
 def _deepseek_v32_dense_attention(
@@ -95,29 +49,16 @@ def _deepseek_v32_dense_attention(
     key, value = projected_kv.split((module.qk_nope_head_dim, module.v_head_dim), dim=-1)
     key_rope = key_rope.expand(-1, -1, module.num_heads, -1)
     need_stats = bool(module.training and not module.freeze_dsa and module.dsa_loss_coeff)
-    output, maximum, total = _dense_flash_attention(
-        module, torch.cat((query, query_rope), dim=-1), torch.cat((key, key_rope), dim=-1),
-        value, sequence_lengths, need_stats=need_stats,
+    output, maximum, total = mla_attention_with_stats(
+        torch.cat((query, query_rope), dim=-1), torch.cat((key, key_rope), dim=-1),
+        value, *sequence_lengths, scale=module.scaling, need_stats=need_stats,
     )
     if need_stats:
-        # Dense CANN operators are optional for sparse and Omni execution.
-        # pylint: disable=import-outside-toplevel
-        from hyper_parallel.components.functional.dsa_dense import (
-            dsa_dense_indexer_kl_loss,
-            dsa_dense_indexer_lse,
-        )
-        # pylint: enable=import-outside-toplevel
-
-        query_lengths, key_lengths = sequence_lengths
         index_query, index_key, weights = (tensor.flatten(0, 1) for tensor in index_states)
-        indexer_stats = dsa_dense_indexer_lse(
-            index_query, index_key, weights, query_lengths=query_lengths, key_lengths=key_lengths,
-        )
-        loss = dsa_dense_indexer_kl_loss(
+        loss = dsa_indexer_kl_dense(
             index_query, index_key, weights, query.flatten(0, 1), key.flatten(0, 1),
-            maximum, total, indexer_stats, scale=module.scaling,
-            query_rope=query_rope.flatten(0, 1), key_rope=key_rope.flatten(0, 1),
-            query_lengths=query_lengths, key_lengths=key_lengths, loss_coefficient=module.dsa_loss_coeff,
+            maximum, total, query_rope.flatten(0, 1), key_rope.flatten(0, 1), *sequence_lengths,
+            scale=module.scaling, loss_coeff=module.dsa_loss_coeff,
         )
         output = aux_loss_auto_scale(output, loss)
     return output
@@ -128,7 +69,7 @@ def apply_mome(
     mome_mask: torch.Tensor | None,
     convolution: nn.Conv1d,
     *,
-    fused: bool,
+    fused: bool | None,
 ) -> torch.Tensor:
     """Apply masked causal depthwise convolution and residual."""
     if mome_mask is None:
@@ -140,21 +81,16 @@ def apply_mome(
         )
 
     mome_mask = mome_mask.to(device=hidden_states.device, dtype=torch.bool)
+    channels = hidden_states.shape[-1]
+    if (
+        fused is not False and convolution.groups == channels and convolution.out_channels == channels
+        and convolution.stride == (1,) and convolution.dilation == (1,) and convolution.padding == (0,)
+    ):
+        return mome(hidden_states, mome_mask, convolution.weight, convolution.bias)
     padding = convolution.kernel_size[0] - 1
     padded_states = F.pad(hidden_states, (0, 0, padding, 0))
-    if fused:
-        padded_mask = F.pad(mome_mask, (padding, 0), value=False)
-        weight = convolution.weight.squeeze(1).transpose(0, 1)
-        mixed_states = aggregate_hidden(  # pylint: disable=not-callable
-            padded_states.transpose(0, 1).contiguous(),
-            weight,
-            padded_mask,
-        )
-        mixed_states = mixed_states[padding:].transpose(0, 1).contiguous()
-    else:
-        mixed_states = convolution(padded_states.transpose(1, 2)).transpose(1, 2)
-        mixed_states = mixed_states * mome_mask.unsqueeze(-1).to(mixed_states.dtype)
-    return hidden_states + mixed_states
+    mixed_states = convolution(padded_states.transpose(1, 2)).transpose(1, 2)
+    return hidden_states + mixed_states * mome_mask.unsqueeze(-1).to(mixed_states.dtype)
 
 
 def _apply_attention_rope(
@@ -168,7 +104,7 @@ def _apply_attention_rope(
     if position_embeddings is None:
         return query, key
     cos, sin = position_embeddings
-    rotary_op = apply_rotary_pos_emb_interleave if interleaved else apply_rotary_pos_emb
+    rotary_op = rope_interleaved if interleaved else rope_qk
     return rotary_op(query, key, cos, sin, unsqueeze_dim=2)
 
 
@@ -188,7 +124,7 @@ def _apply_index_rope(
     split_sizes = (rope_head_dim, index_head_dim - rope_head_dim)
     query_rot, query_pass = torch.split(query, split_sizes, dim=-1)
     key_rot, key_pass = torch.split(key, split_sizes, dim=-1)
-    rotary_op = apply_rotary_pos_emb_interleave if interleaved else apply_rotary_pos_emb
+    rotary_op = rope_interleaved if interleaved else rope_qk
     query_rot, key_rot = rotary_op(query_rot, key_rot, cos, sin, unsqueeze_dim=2)
     return torch.cat((query_rot, query_pass), dim=-1), torch.cat((key_rot, key_pass), dim=-1)
 
@@ -526,11 +462,10 @@ class DeepseekV32DSAAttention(nn.Module):
             tensor.reshape(-1, tensor.shape[2], tensor.shape[3])
             for tensor in attention_states
         )
-        aux_loss = dsa_kl_loss(
+        aux_loss = dsa_indexer_kl_packed(
             *index_states, query_tnd, key_tnd,
             topk_indices, *softmax_stats, q_rot_tnd, k_rot_tnd,
             actual_q_len, actual_kv_len, self.scaling, self.dsa_loss_coeff,
-            backend="cann",
         )
         return aux_loss_auto_scale(attn_output, aux_loss)
 
@@ -560,8 +495,8 @@ class DeepseekV32DSAAttention(nn.Module):
         actual_kv_len = self._get_actual_seq_len(
             actual_kv_len, *hidden_states.shape[:-1], hidden_states.device,
         )
-        indexed = dsa_indexer(
-            *index_states, actual_q_len, actual_kv_len, self.index_topk, backend="cann",
+        indexed = dsa_indexer_packed(
+            *index_states, actual_q_len, actual_kv_len, self.index_topk,
         )
         return indexed[0], indexed[1:], actual_q_len, actual_kv_len
 
@@ -572,9 +507,8 @@ class DeepseekV32DSAAttention(nn.Module):
         topk_indices, index_states, actual_q_len, actual_kv_len = self._run_indexer(
             hidden_states, q_resid, position_embeddings, actual_seq_len, kwargs,
         )
-        attn_output, softmax_max, softmax_sum = dsa_sparse_attention(
+        attn_output, softmax_max, softmax_sum = dsa_sparse_attention_absorbed(
             *attention_states, topk_indices, self.scaling, actual_q_len, actual_kv_len,
-            backend="cann",
         )
         return self._apply_auxiliary_loss(
             attn_output, index_states, attention_states, topk_indices,
@@ -695,7 +629,7 @@ class DSAAttention(nn.Module):
         self.freeze_dsa = module.freeze_dsa
         self.use_flash_attn = bool(getattr(module, "use_flash_attn", True))
         self.use_mome = bool(getattr(module, "use_mome", False))
-        self.use_fused_mome = bool(getattr(module, "use_fused_mome", False))
+        self.use_fused_mome = getattr(module, "use_fused_mome", None)
         self.param_sink_number = int(getattr(module, "param_sink_number", 0))
         self.param_sink_scalar = getattr(module, "param_sink_scalar", None)
         self.apply_fa_rescale = bool(
@@ -855,21 +789,19 @@ class DSAAttention(nn.Module):
         actual_q_len: torch.Tensor,
         actual_kv_len: torch.Tensor,
         batch_size: int,
-        seq_length: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run sparse attention with or without parameter-sink rescaling."""
         absorbed_query, kv_nope, q_rot, k_rot = attention_states
         sparse_scale = self.qk_head_dim**-0.5
         if self.param_sink_number <= 0:
-            return dsa_sparse_attention(  # pylint: disable=not-callable
+            return dsa_sparse_attention_absorbed(
                 absorbed_query, kv_nope, q_rot, k_rot, topk_indices,
                 sparse_scale, actual_q_len, actual_kv_len,
             )
         sink_key, sink_value = self._prepare_param_sink(batch_size)
-        return dsa_sparse_attention_rescale(  # pylint: disable=not-callable
-            absorbed_query, kv_nope, q_rot, k_rot, sink_key, sink_value,
-            topk_indices, batch_size, seq_length, self.num_heads, sparse_scale,
-            1 - self.attention_dropout.p, actual_q_len, actual_kv_len,
+        return dsa_sparse_attention_with_sink(
+            absorbed_query, kv_nope, q_rot, k_rot, topk_indices, sparse_scale, actual_q_len, actual_kv_len,
+            sink_key=sink_key, sink_value=sink_value, dropout=self.attention_dropout.p,
         )
 
     def _apply_auxiliary_loss(
@@ -889,7 +821,7 @@ class DSAAttention(nn.Module):
             tensor.reshape(-1, tensor.shape[2], tensor.shape[3])
             for tensor in attention_states
         )
-        aux_loss = dsa_kl_loss(  # pylint: disable=not-callable
+        aux_loss = dsa_indexer_kl_packed(
             *index_states, query_tnd, key_tnd,
             topk_indices, *softmax_stats, q_rot_tnd, k_rot_tnd,
             actual_q_len, actual_kv_len, self.qk_head_dim**-0.5, self.dsa_loss_coeff,
@@ -922,7 +854,7 @@ class DSAAttention(nn.Module):
         actual_kv_len = self._get_actual_seq_len(
             actual_kv_len, *hidden_states.shape[:-1], hidden_states.device,
         )
-        indexed = dsa_indexer(  # pylint: disable=not-callable
+        indexed = dsa_indexer_packed(
             *index_states, actual_q_len, actual_kv_len, self.index_topk
         )
         return indexed[0], indexed[1:], actual_q_len, actual_kv_len
@@ -935,7 +867,7 @@ class DSAAttention(nn.Module):
             hidden_states, q_resid, position_embeddings, actual_seq_len, kwargs,
         )
         attn_output, softmax_max, softmax_sum = self._run_sparse_attention(
-            attention_states, topk_indices, actual_q_len, actual_kv_len, *hidden_states.shape[:-1],
+            attention_states, topk_indices, actual_q_len, actual_kv_len, hidden_states.shape[0],
         )
         return self._apply_auxiliary_loss(
             attn_output, index_states, attention_states, topk_indices,

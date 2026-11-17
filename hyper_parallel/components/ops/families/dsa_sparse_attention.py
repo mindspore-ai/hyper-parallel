@@ -20,11 +20,13 @@ from functools import partial
 from typing import Protocol
 
 import torch
+from torch.nn import functional as F
 
+from hyper_parallel.components.functional.dsa_sparse_attention import dsa_sparse_attention as fused_packed_attention
 from hyper_parallel.components.functional.sparse_flash_mla import sparse_flash_mla, supports_fused_attention_inputs
 
-from .._dependency import load_cann
-from .._dsa_layout import DsaQueryLayout
+from .._dependency import load_cann, require_package, require_symbol
+from .._dsa_layout import DsaQueryLayout, packed_segments, selected_packed_keys, selected_packed_scores
 from ..registry import OpRegistry
 from ..spec import OpSpec
 
@@ -42,6 +44,122 @@ class DsaCompressedBanksFn(Protocol):
 
 
 DSA_COMPRESSED_BANKS = OpSpec[DsaCompressedBanksFn](config_key="dsa_sparse_attention", variant="compressed_banks")
+
+
+class PackedDsaAttentionFn(Protocol):
+    """Attend packed, absorbed MLA states and expose per-head sparse softmax statistics."""
+
+    def __call__(
+        self, x: torch.Tensor, key: torch.Tensor, query_rope: torch.Tensor, key_rope: torch.Tensor,
+        topk_indices: torch.Tensor, scale: float, query_ends: torch.Tensor, key_ends: torch.Tensor,
+        *, sink_key: torch.Tensor | None = None, sink_value: torch.Tensor | None = None, dropout: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return padded BSND output and sparse max/sum in KV-head, token, group layout."""
+
+
+DSA_ABSORBED = OpSpec[PackedDsaAttentionFn](config_key="dsa_sparse_attention", variant="absorbed_with_stats")
+DSA_ABSORBED_SINK = OpSpec[PackedDsaAttentionFn](
+    config_key="dsa_sparse_attention", variant="absorbed_with_parameter_sink",
+)
+
+
+def _native_absorbed(
+    x: torch.Tensor, key: torch.Tensor, query_rope: torch.Tensor, key_rope: torch.Tensor,
+    topk_indices: torch.Tensor, scale: float, query_ends: torch.Tensor, key_ends: torch.Tensor,
+    *, sink_key: torch.Tensor | None = None, sink_value: torch.Tensor | None = None, dropout: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    query, value, q_rope, k_rope = (tensor.flatten(0, 1) for tensor in (x, key, query_rope, key_rope))
+    outputs, maxima, totals = [], [], []
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        for qs, qe, ks, ke in packed_segments(query_ends, key_ends):
+            for start in range(qs, qe, 32):
+                end = min(start + 32, qe)
+                indices = topk_indices[start:end]
+                causal = torch.arange(start, end, device=x.device) - qe + ke - ks
+                selected, valid = selected_packed_keys(value[ks:ke], indices, causal_end=causal)
+                rotary_keys, _ = selected_packed_keys(k_rope[ks:ke], indices, causal_end=causal)
+                scores = (selected_packed_scores(query[start:end], selected)
+                          + selected_packed_scores(q_rope[start:end], rotary_keys)) * scale
+                scores = scores.masked_fill(~valid.unsqueeze(2), -torch.inf)
+                maximum = scores.amax(dim=-1, keepdim=True)
+                maximum = torch.where(maximum.isfinite(), maximum, 0.0)
+                exp = (scores - maximum).exp()
+                total = exp.sum(dim=-1, keepdim=True)
+                if sink_key is None:
+                    probabilities = exp / total.clamp_min(torch.finfo(torch.float32).tiny)
+                    output = torch.einsum("tngk,tnkd->tngd", probabilities, selected.float()).flatten(1, 2)
+                    output = F.pad(output, (0, q_rope.shape[-1]))
+                else:
+                    output = _parameter_sink(
+                        query[start:end], q_rope[start:end], selected, scores, sink_key, sink_value,
+                        start, end, x.shape[1], scale, dropout,
+                    )
+                outputs.append(output.to(x.dtype))
+                maxima.append(maximum.detach().squeeze(-1))
+                totals.append(total.detach().squeeze(-1))
+    return (
+        torch.cat(outputs).reshape(*x.shape[:3], -1),
+        torch.cat(maxima).transpose(0, 1).contiguous(),
+        torch.cat(totals).transpose(0, 1).contiguous(),
+    )
+
+
+def _parameter_sink(
+    query: torch.Tensor, rope: torch.Tensor, selected: torch.Tensor, scores: torch.Tensor,
+    sink_key: torch.Tensor, sink_value: torch.Tensor, start: int, end: int, seq_len: int,
+    scale: float, dropout: float,
+) -> torch.Tensor:
+    batch_ids = torch.arange(start, end, device=query.device) // seq_len
+    keys, values = sink_key[batch_ids].float(), sink_value[batch_ids].float()
+    queries = torch.cat((query, rope), dim=-1).float()
+    sink_scores = torch.einsum("thd,tshd->ths", queries, keys) * scale
+    probabilities = torch.cat((scores.flatten(1, 2), sink_scores), dim=-1).softmax(-1)
+    sparse_prob, sink_prob = probabilities.split((scores.shape[-1], sink_scores.shape[-1]), dim=-1)
+    sparse_out = torch.einsum("tngk,tnkd->tngd", sparse_prob.reshape_as(scores),
+                             selected.float()).flatten(1, 2)
+    sparse_out = F.pad(sparse_out, (0, rope.shape[-1]))
+    sink_out = torch.einsum("ths,tshd->thd", F.dropout(sink_prob, dropout), values)
+    return sparse_out + sink_out
+
+
+def _cann_absorbed(
+    x: torch.Tensor, key: torch.Tensor, query_rope: torch.Tensor, key_rope: torch.Tensor,
+    topk_indices: torch.Tensor, scale: float, query_ends: torch.Tensor, key_ends: torch.Tensor,
+    *, sink_key: torch.Tensor | None = None, sink_value: torch.Tensor | None = None, dropout: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del sink_key, sink_value, dropout
+    return fused_packed_attention(x, key, query_rope, key_rope, topk_indices, scale, query_ends, key_ends)
+
+
+def _load_cann_absorbed() -> PackedDsaAttentionFn:
+    require_symbol(require_package("torch_npu"), "npu_sparse_flash_attention")
+    require_symbol(require_package("cann_ops_transformer.ops"), "sparse_flash_attention_grad")
+    return _cann_absorbed
+
+
+def _load_omni_sink() -> PackedDsaAttentionFn:
+    require_package("omni_training_custom_ops")
+    extension = require_package("torch_npu")
+    require_symbol(extension, "npu_fusion_attention")
+    require_symbol(extension, "npu_fusion_attention_grad")
+    require_symbol(torch.ops.custom, "npu_sparse_flash_attention_enhance")
+    require_symbol(torch.ops.custom, "npu_sparse_flash_attention_grad_enhance")
+    # Parameter-sink rescaling imports the optional Omni extension.
+    from hyper_parallel.components.functional.dsa_sparse_attention_rescale import (  # pylint: disable=C0415
+        dsa_sparse_attention_rescale,
+    )
+
+    def run(
+        x: torch.Tensor, key: torch.Tensor, query_rope: torch.Tensor, key_rope: torch.Tensor,
+        topk_indices: torch.Tensor, scale: float, query_ends: torch.Tensor, key_ends: torch.Tensor,
+        *, sink_key: torch.Tensor | None = None, sink_value: torch.Tensor | None = None, dropout: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return dsa_sparse_attention_rescale(
+            x, key, query_rope, key_rope, sink_key, sink_value, topk_indices,
+            *x.shape[:3], scale, 1.0 - dropout, query_ends, key_ends,
+        )
+
+    return run
 
 
 def build_sliding_window_indices(
@@ -178,7 +296,7 @@ def _cann_attention(
 
 def register_dsa_sparse_attention(registry: OpRegistry) -> None:
     """Register the compressed-banks attention contract and its implementations."""
-    registry.register_family("dsa_sparse_attention", specs=(DSA_COMPRESSED_BANKS,))
+    registry.register_family("dsa_sparse_attention", specs=(DSA_COMPRESSED_BANKS, DSA_ABSORBED, DSA_ABSORBED_SINK))
     registry.register_impl(
         DSA_COMPRESSED_BANKS, name="native", devices=("cpu", "cuda", "npu"), load=lambda: native_dsa_sparse_attention,
     )
@@ -187,3 +305,7 @@ def register_dsa_sparse_attention(registry: OpRegistry) -> None:
         load=partial(load_cann, _cann_attention, "sparse_flash_mla", "sparse_flash_mla_grad",
                      "sparse_flash_mla_metadata"),
     )
+    for spec in (DSA_ABSORBED, DSA_ABSORBED_SINK):
+        registry.register_impl(spec, name="native", devices=("cpu", "cuda", "npu"), load=lambda: _native_absorbed)
+    registry.register_impl(DSA_ABSORBED, name="cann", devices=("npu",), load=_load_cann_absorbed)
+    registry.register_impl(DSA_ABSORBED_SINK, name="omni", devices=("npu",), load=_load_omni_sink)

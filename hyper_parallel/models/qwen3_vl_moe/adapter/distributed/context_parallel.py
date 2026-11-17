@@ -21,9 +21,8 @@ from typing import Any
 
 import torch
 
-from hyper_parallel.components.functional.npu_fusion_attention import npu_fusion_attention_forward
+from hyper_parallel.components.ops import gqa_attention, rms_norm, rope
 from hyper_parallel.distributed._builder.forward_rewriter import _ForwardRewriteRequest
-from hyper_parallel.distributed.context_parallel.attention import _cp_offset_causal_mask
 from hyper_parallel.distributed.context_parallel.collectives import (
     async_ulysses_seq_to_head_launch,
     ulysses_head_to_seq,
@@ -32,8 +31,6 @@ from hyper_parallel.distributed.recipe_spec import inner_wrapper
 
 _SEQUENCE_DIM = 2
 _HEAD_DIM = 1
-_COMPRESSED_CAUSAL_MASK_SIZE = 2048
-_COMPRESSED_CAUSAL_MASKS: dict[torch.device, torch.Tensor] = {}
 
 
 def _require_text_attention(module: Any) -> None:
@@ -82,22 +79,6 @@ def _prepare_attention_mask(
     return attention_mask
 
 
-def _get_compressed_causal_mask(device: torch.device) -> torch.Tensor:
-    """Return the mask required by the Ascend left-up causal sparse mode."""
-    mask = _COMPRESSED_CAUSAL_MASKS.get(device)
-    if mask is None:
-        mask = torch.triu(
-            torch.ones(
-                (_COMPRESSED_CAUSAL_MASK_SIZE, _COMPRESSED_CAUSAL_MASK_SIZE),
-                dtype=torch.bool,
-                device=device,
-            ),
-            diagonal=1,
-        )
-        _COMPRESSED_CAUSAL_MASKS[device] = mask
-    return mask
-
-
 def _run_flash_attention(
     module: Any,
     query: torch.Tensor,
@@ -106,50 +87,11 @@ def _run_flash_attention(
     attention_mask: torch.Tensor | None,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, None]:
-    """Run Qwen3-VL-MoE text attention with the Ascend fused kernel."""
-    import torch_npu  # pylint: disable=C0415
-
-    shared_mask = attention_mask is not None and attention_mask.ndim == 2
-    shared_window = attention_mask is None and (kwargs.get("sliding_window") is not None or "pre_tokens" in kwargs)
-    if query.shape[-2] == key.shape[-2] and (shared_mask or shared_window):
-        return npu_fusion_attention_forward(
-            module, query, key, value, attention_mask,
-            dropout=module.attention_dropout if module.training else 0.0,
-            scaling=module.scaling,
-            **kwargs,
-        )
-    if attention_mask is None:
-        attention_mask = _get_compressed_causal_mask(query.device)
-        sparse_mode = 2
-    else:
-        if attention_mask.ndim == 2:
-            causal_mask = _cp_offset_causal_mask(query.shape[-2], key.shape[-2], 0, query.device)
-            attention_mask = causal_mask[None, None] & attention_mask[:, None, None, :]
-        if attention_mask.ndim == 4:
-            attention_mask = attention_mask[:, :, :, : key.shape[-2]]
-        if attention_mask.dtype == torch.bool:
-            attention_mask = torch.logical_not(attention_mask).to(query.device)
-        else:
-            attention_mask = attention_mask.bool().to(query.device)
-        sparse_mode = 0
-
-    sparse_kwargs = {}
-    if sparse_mode == 0 and getattr(module, "is_causal", True) and query.shape[-2] == key.shape[-2]:
-        sparse_kwargs["next_tockens"] = 0
-
-    output = torch_npu.npu_fusion_attention(
-        query,
-        key,
-        value,
-        head_num=query.shape[1],
-        input_layout="BNSD",
-        atten_mask=attention_mask,
-        keep_prob=1 - (0.0 if not module.training else module.attention_dropout),
-        scale=module.scaling,
-        sparse_mode=sparse_mode,
-        **sparse_kwargs,
-    )[0]
-    return output.transpose(1, 2).contiguous(), None
+    """Run GQA on the exchanged text states."""
+    return gqa_attention(
+        module, query, key, value, attention_mask,
+        dropout=module.attention_dropout if module.training else 0.0, scaling=module.scaling, **kwargs,
+    )
 
 
 def _async_ulysses_forward(
@@ -170,17 +112,11 @@ def _async_ulysses_forward(
     hidden_shape = (*input_shape, -1, module.head_dim)
     cos, sin = (term.unsqueeze(1) for term in position_embeddings)
 
-    import torch_npu  # pylint: disable=C0415
-
-    from hyper_parallel.components.functional.rms_norm import (  # pylint: disable=C0415
-        rms_norm,
-    )
-
     query = module.q_proj(hidden_states).view(hidden_shape)
     query = rms_norm(
         query, module.q_norm.weight, module.q_norm.variance_epsilon
     ).transpose(1, 2)
-    query = torch_npu.npu_rotary_mul(query, cos, sin)
+    query = rope(query, cos, sin)
     query_pending = async_ulysses_seq_to_head_launch(
         query, _SEQUENCE_DIM, _HEAD_DIM, cp_mesh
     )
@@ -189,7 +125,7 @@ def _async_ulysses_forward(
     key = rms_norm(
         key, module.k_norm.weight, module.k_norm.variance_epsilon
     ).transpose(1, 2)
-    key = torch_npu.npu_rotary_mul(key, cos, sin)
+    key = rope(key, cos, sin)
     key_pending = async_ulysses_seq_to_head_launch(
         key, _SEQUENCE_DIM, _HEAD_DIM, cp_mesh
     )

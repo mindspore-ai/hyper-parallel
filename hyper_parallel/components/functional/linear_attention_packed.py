@@ -364,6 +364,25 @@ def packed_causal_conv1d(
         return fused_causal_conv1d(
             inputs, weight, bias, info, halo, backend=backend, dilation=dilation,
         )
+    return packed_causal_conv1d_reference(inputs, weight, bias, info, halo, dilation=dilation)
+
+
+def packed_causal_conv1d_reference(
+    inputs: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    info: PackedSequenceInfo,
+    halo: torch.Tensor | None = None,
+    *,
+    dilation: int = 1,
+) -> torch.Tensor:
+    """Apply depthwise SiLU convolution within the true packed document boundaries."""
+    channels, _, width = weight.shape
+    halo_width = (width - 1) * dilation
+    if inputs.ndim != 3 or inputs.shape != (1, info.length, channels):
+        raise ValueError("Packed convolution expects [1,T,C] matching its token interval and weights.")
+    if halo is not None and halo.shape != (1, halo_width, channels):
+        raise ValueError("Packed convolution halo has an incompatible shape.")
     if halo is None:
         halo = inputs.new_zeros((1, halo_width, channels))
     extended = torch.cat((halo, inputs), dim=1)

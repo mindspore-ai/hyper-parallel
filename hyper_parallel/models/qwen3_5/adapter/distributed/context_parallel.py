@@ -103,7 +103,7 @@ def qwen3_5_gdn_ulysses_cp_wrapper(
     tp_mesh: Any,
     cp_mesh: Any,
     ep_mesh: Any,
-    backend: str = "eager",
+    backend: str = "auto",
     chunk_size: int = 64,
 ) -> _ForwardRewriteRequest:
     """Install full-layer Ulysses CP on a Qwen3.5 GDN module."""

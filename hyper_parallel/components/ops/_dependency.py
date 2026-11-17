@@ -26,7 +26,7 @@ def require_package(name: str) -> ModuleType:
     try:
         return import_module(name)
     except ModuleNotFoundError as exc:
-        if exc.name == name:
+        if exc.name is not None and (exc.name == name or name.startswith(f"{exc.name}.")):
             raise ImplementationUnavailable(f"missing optional package {name}") from exc
         raise
 

@@ -107,7 +107,6 @@ class TestMhcPre(unittest.TestCase):
         custom.npu_sinkhorn = Mock(return_value=(sink_out, norm_out, sum_out))
         with patch.dict(sys.modules, {"omni_training_custom_ops": omni}), \
                 patch.object(torch.ops, "custom", custom, create=True), \
-                patch("hyper_parallel.components.functional.sinkhorn.omni_training_custom_ops", omni), \
                 patch("hyper_parallel.components.functional.mhc_pre.logger") as fake_logger:
             block_input, post, residual, streams = mhc_pre(
                 x, torch.randn(N * N + 2 * N, N * C), torch.randn(3), torch.randn(N * N + 2 * N), N,

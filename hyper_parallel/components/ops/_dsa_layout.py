@@ -84,3 +84,35 @@ def _causal_key_bounds(
         upper[begin:end] = (positions + 1) // ratio
         lower[begin:end] = key_start
     return upper.unsqueeze(0), lower.unsqueeze(0).expand(batch_size, -1)
+
+
+def packed_segments(
+    query_ends: torch.Tensor, key_ends: torch.Tensor,
+) -> tuple[tuple[int, int, int, int], ...]:
+    """Return query/key ranges for packed documents from cumulative ends."""
+    q_ends, k_ends = query_ends.tolist(), key_ends.tolist()
+    if len(q_ends) != len(k_ends):
+        raise ValueError("Packed DSA query and key lengths must describe the same documents")
+    return tuple(zip([0, *q_ends[:-1]], q_ends, [0, *k_ends[:-1]], k_ends))
+
+
+def packed_causal_mask(query: torch.Tensor, key: torch.Tensor) -> torch.Tensor:
+    """Return the right-aligned causal mask for a single DSA document."""
+    q_pos = torch.arange(query.shape[0], device=query.device) + key.shape[0] - query.shape[0]
+    return torch.arange(key.shape[0], device=query.device)[None, :] <= q_pos[:, None]
+
+
+def selected_packed_keys(
+    key: torch.Tensor, indices: torch.Tensor, *, causal_end: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather document-local key IDs in T,N,K,D layout and return validity."""
+    valid = (indices >= 0) & (indices < key.shape[0]) & (indices <= causal_end[:, None, None])
+    positions = indices.clamp(0, max(0, key.shape[0] - 1)).long()
+    heads = torch.arange(key.shape[1], device=key.device)[None, :, None]
+    return key[positions, heads], valid
+
+
+def selected_packed_scores(query: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
+    """Dot grouped query heads and selected keys in T,N,G,K layout."""
+    grouped = query.unflatten(1, (keys.shape[1], -1))
+    return torch.einsum("tngd,tnkd->tngk", grouped.float(), keys.float())

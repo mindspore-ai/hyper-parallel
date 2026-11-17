@@ -16,37 +16,215 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
+
+from hyper_parallel.components.functional.linear_attention_packed import PackedSequenceInfo
+from hyper_parallel.components.functional.npu_fusion_attention import resolve_packed_sequence_lengths
 
 from ._dsa_layout import DsaQueryLayout, ReduceSum
 from .factory import _dispatch, _select_for_call, ops
-from .families.attention import VISION_ATTENTION, VisionAttentionFn
-from .families.dsa_indexer import DSA_INDEXER, indexer_native_only, native_dsa_indexer
-from .families.dsa_indexer_kl import DSA_INDEXER_KL, indexer_kl_native_only, native_dsa_indexer_kl
-from .families.dsa_sparse_attention import DSA_COMPRESSED_BANKS, attention_native_only
+from .families.attention import (
+    GQA_ATTENTION, MLA_ATTENTION, MLA_WITH_STATS, VISION_ATTENTION, DenseAttentionFn, MlaAttentionStatsFn,
+    VisionAttentionFn,
+)
+from .families.causal_conv1d import CAUSAL_CONV1D
+from .families.dsa_indexer import (
+    DSA_INDEXER, DSA_PACKED_INDEXER, PackedDsaIndexerFn, indexer_native_only, native_dsa_indexer,
+)
+from .families.dsa_indexer_kl import (
+    DSA_DENSE_KL, DSA_INDEXER_KL, DSA_PACKED_KL, DenseDsaKlFn, PackedDsaKlFn, indexer_kl_native_only,
+    native_dsa_indexer_kl,
+)
+from .families.dsa_sparse_attention import (
+    DSA_ABSORBED, DSA_ABSORBED_SINK, DSA_COMPRESSED_BANKS, PackedDsaAttentionFn, attention_native_only,
+)
+from .families.gdn import GDN
 from .families.grouped_matmul import GROUPED_MATMUL, GroupedMatmulFn
+from .families.grouped_swiglu import GROUPED_SWIGLU
+from .families.kda import KDA
 from .families.mhc_post import MHC_POST, MhcPostFn
 from .families.moe_router import MOE_ROUTER, router_scores
 from .families.moe_token_reorder import MOE_TOKEN_REORDER, MOE_TOKEN_RESTORE, PermutedTokens
+from .families.mome import MOME, MomeFn
 from .families.rms_norm import RMS_NORM, RMS_NORM_FP32_AFFINE, RMSNormFn
+from .families.rope import ROPE, ROPE_INTERLEAVED, InterleavedRopeFn, RopeFn
 from .families.sinkhorn import SINKHORN, SinkhornFn
 from .families.swiglu import SWIGLU, SWIGLU_CLAMPED, ClampedSwiGLUFn, SwiGLUFn
+from .spec import OpSpec
 
 __all__ = [
-    "DsaQueryLayout", "dsa_indexer", "dsa_indexer_kl", "dsa_sparse_attention_compressed_banks", "grouped_matmul",
-    "mhc_post",
-    "moe_router", "moe_token_reorder", "moe_token_restore", "ops", "rms_norm", "rms_norm_fp32_affine", "router_scores",
+    "DsaQueryLayout", "causal_conv1d", "dsa_indexer", "dsa_indexer_kl", "dsa_indexer_kl_dense",
+    "dsa_indexer_kl_packed", "dsa_indexer_packed",
+    "dsa_sparse_attention_absorbed", "dsa_sparse_attention_compressed_banks", "dsa_sparse_attention_with_sink",
+    "gdn", "gqa_attention", "grouped_matmul", "grouped_swiglu", "kda", "mhc_post", "mla_attention",
+    "mla_attention_with_stats",
+    "moe_router", "moe_token_reorder", "moe_token_restore", "mome", "ops", "rms_norm", "rms_norm_fp32_affine",
+    "router_scores",
+    "rope", "rope_interleaved", "rope_qk",
     "sinkhorn", "swiglu", "swiglu_clamped", "vision_attention",
 ]
 
 grouped_matmul: GroupedMatmulFn = _dispatch(GROUPED_MATMUL)
+dsa_indexer_packed: PackedDsaIndexerFn = _dispatch(DSA_PACKED_INDEXER)
+dsa_indexer_kl_dense: DenseDsaKlFn = _dispatch(DSA_DENSE_KL)
+dsa_indexer_kl_packed: PackedDsaKlFn = _dispatch(DSA_PACKED_KL)
+dsa_sparse_attention_absorbed: PackedDsaAttentionFn = _dispatch(DSA_ABSORBED)
+dsa_sparse_attention_with_sink: PackedDsaAttentionFn = _dispatch(DSA_ABSORBED_SINK)
 mhc_post: MhcPostFn = _dispatch(MHC_POST)
+mla_attention_with_stats: MlaAttentionStatsFn = _dispatch(MLA_WITH_STATS)
+mome: MomeFn = _dispatch(MOME)
 rms_norm: RMSNormFn = _dispatch(RMS_NORM)
 rms_norm_fp32_affine: RMSNormFn = _dispatch(RMS_NORM_FP32_AFFINE)
+rope: RopeFn = _dispatch(ROPE)
+rope_interleaved: InterleavedRopeFn = _dispatch(ROPE_INTERLEAVED)
 sinkhorn: SinkhornFn = _dispatch(SINKHORN)
 swiglu: SwiGLUFn = _dispatch(SWIGLU)
 swiglu_clamped: ClampedSwiGLUFn = _dispatch(SWIGLU_CLAMPED)
 vision_attention: VisionAttentionFn = _dispatch(VISION_ATTENTION)
+
+
+def _dense_attention(
+    spec: OpSpec[DenseAttentionFn], module: torch.nn.Module, query: torch.Tensor,
+    key: torch.Tensor, value: torch.Tensor, attention_mask: torch.Tensor | None,
+    dropout: float, scaling: float | None, kwargs: dict[str, Any],
+) -> tuple[torch.Tensor, None]:
+    if kwargs.get("indices") is not None:
+        raise ValueError("Dense attention does not consume sparse attention indices")
+    q_len, k_len = query.shape[2], key.shape[2]
+    q_ends, k_ends = resolve_packed_sequence_lengths(kwargs, query.shape[0] * q_len, key.shape[0] * k_len)
+    lengths = (q_ends, k_ends) if q_ends is not None else None
+    if lengths is not None and len(q_ends) != len(k_ends):
+        raise ValueError("Packed query and key lengths must contain the same number of segments")
+    if attention_mask is not None and lengths is None:
+        attention_mask = attention_mask[..., :k_len]
+    if attention_mask is not None and attention_mask.ndim == 3:
+        attention_mask = attention_mask.unsqueeze(1)
+    causal = kwargs.get("is_causal", getattr(module, "is_causal", True))
+    if q_len != k_len and attention_mask is not None and attention_mask.ndim >= 3 and lengths is None:
+        # CP masks already encode the query's global offset.
+        causal = False
+    window = kwargs.get("sliding_window")
+    if window is None and causal and q_len == k_len:
+        pre_tokens = kwargs.get("pre_tokens", getattr(module, "pre_tockens", None))
+        if pre_tokens is not None and pre_tokens < q_len:
+            window = pre_tokens + 1
+    query_offset = kwargs.get("query_offset")
+    blocked = ()
+    if lengths is not None and (window is not None or attention_mask is not None):
+        blocked = (("torch_npu", "packed attention requires segment boundaries without a window or external mask"),)
+    operation = _select_for_call(spec, query, blocked_backends=blocked)
+    scale = query.shape[-1] ** -0.5 if scaling is None else scaling
+    return operation(
+        query, key, value, attention_mask, causal=causal, scale=scale, dropout=dropout,
+        window=window, lengths=lengths, query_offset=query_offset,
+    ), None
+
+
+def gqa_attention(
+    module: torch.nn.Module, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+    attention_mask: torch.Tensor | None, dropout: float = 0.0, scaling: float | None = None, **kwargs: Any,
+) -> tuple[torch.Tensor, None]:
+    """Run the dense grouped-query contract through a Transformers-compatible entry point."""
+    return _dense_attention(GQA_ATTENTION, module, query, key, value, attention_mask, dropout, scaling, kwargs)
+
+
+def mla_attention(
+    module: torch.nn.Module, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+    attention_mask: torch.Tensor | None, dropout: float = 0.0, scaling: float | None = None, **kwargs: Any,
+) -> tuple[torch.Tensor, None]:
+    """Attend over projected MLA states, allowing the value dimension to differ from Q and K."""
+    return _dense_attention(MLA_ATTENTION, module, query, key, value, attention_mask, dropout, scaling, kwargs)
+
+
+def rope_qk(
+    query: torch.Tensor, key: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, *, unsqueeze_dim: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply half-layout RoPE on Q and K with Transformers position embeddings."""
+    if cos.ndim == 2:
+        cos, sin = cos.unsqueeze(0), sin.unsqueeze(0)
+    if cos.shape[0] == 1 and query.shape[0] > 1:
+        cos = cos.expand(query.shape[0], -1, -1)
+        sin = sin.expand(query.shape[0], -1, -1)
+    cos, sin = cos.unsqueeze(unsqueeze_dim), sin.unsqueeze(unsqueeze_dim)
+    return rope(query, cos, sin), rope(key, cos, sin)
+
+
+_LINEAR_ATTENTION_BACKENDS = {"eager": "native", "triton": "triton_ascend"}
+
+
+def grouped_swiglu(
+    x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor, w3: torch.Tensor, counts: torch.Tensor,
+    scores: torch.Tensor | None = None, *, backend: str = "auto",
+) -> torch.Tensor:
+    """Apply grouped expert SwiGLU after resolving the family backend."""
+    operation = _select_for_call(GROUPED_SWIGLU, x, default_backend=backend)
+    return operation(x, w1, w2, w3, counts, scores)
+
+
+def causal_conv1d(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, info: PackedSequenceInfo | None = None,
+    *, dilation: int = 1, backend: str = "auto",
+) -> torch.Tensor:
+    """Apply local depthwise causal convolution and SiLU to dense or packed tokens."""
+    reason = "fused convolution requires nonempty batches and dilation one" if dilation != 1 or not x.numel() else None
+    blocked = ()
+    if (
+        weight.shape[-1] not in (2, 3, 4) or x.shape[-1] % 16 or x.dtype not in (torch.bfloat16, torch.float16)
+        or weight.dtype != x.dtype or (bias is not None and bias.dtype != x.dtype)
+    ):
+        blocked = (("ascendc", "requires width 2/3/4, 16-aligned channels and matching BF16/FP16 dtypes"),)
+    operation = _select_for_call(
+        CAUSAL_CONV1D, x, native_only=reason, blocked_backends=blocked,
+        default_backend=_LINEAR_ATTENTION_BACKENDS.get(backend, backend),
+    )
+    return operation(x, weight, bias, info, dilation=dilation)
+
+
+def gdn(
+    x: torch.Tensor, key: torch.Tensor, value: torch.Tensor, gate: torch.Tensor, beta: torch.Tensor,
+    *, chunk_size: int = 64, normalize_qk: bool = True, info: PackedSequenceInfo | None = None,
+    backend: str = "auto",
+) -> torch.Tensor:
+    """Compute zero-state GDN with effective gate and beta inputs."""
+    reason = None
+    if (
+        chunk_size != 64 or x.shape[-1] != 128 or value.shape[-1] != 128
+        or x.dtype != torch.bfloat16 or key.dtype != x.dtype or value.dtype != x.dtype
+        or beta.dtype != x.dtype or gate.dtype != torch.float32
+    ):
+        reason = "fused GDN requires chunk size 64, head dimension 128, BF16 Q/K/V/beta and FP32 gate"
+    operation = _select_for_call(
+        GDN, x, native_only=reason, default_backend=_LINEAR_ATTENTION_BACKENDS.get(backend, backend),
+    )
+    return operation(x, key, value, gate, beta, chunk_size=chunk_size, normalize_qk=normalize_qk, info=info)
+
+
+def kda(
+    x: torch.Tensor, key: torch.Tensor, value: torch.Tensor, gate: torch.Tensor, beta: torch.Tensor,
+    *, a_log: torch.Tensor, dt_bias: torch.Tensor, lower_bound: float | None, chunk_size: int = 64,
+    scale: float | None = None, info: PackedSequenceInfo | None = None, backend: str = "auto",
+) -> torch.Tensor:
+    """Compute zero-state KDA with raw gate and beta logits."""
+    reason = None
+    if (
+        lower_bound is None or not -5.0 <= lower_bound < 0 or chunk_size != 64
+        or x.shape[-1] != 128 or value.shape[-1] != 128
+        or x.dtype != torch.bfloat16 or key.dtype != x.dtype or value.dtype != x.dtype
+    ):
+        reason = "fused KDA requires a safe gate, chunk size 64, head dimension 128 and BF16 Q/K/V"
+    blocked = []
+    if gate.dtype != x.dtype or beta.dtype != x.dtype:
+        blocked.append(("triton_ascend", "requires BF16 gate and beta"))
+    if x.shape[2] != value.shape[2]:
+        blocked.append(("ascendc", "requires matching Q/K/V head counts"))
+    operation = _select_for_call(
+        KDA, x, native_only=reason, blocked_backends=tuple(blocked),
+        default_backend=_LINEAR_ATTENTION_BACKENDS.get(backend, backend),
+    )
+    return operation(x, key, value, gate, beta, a_log=a_log, dt_bias=dt_bias, lower_bound=lower_bound,
+                     chunk_size=chunk_size, scale=scale, info=info)
 
 
 def dsa_indexer(

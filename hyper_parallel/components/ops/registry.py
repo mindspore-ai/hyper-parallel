@@ -140,15 +140,20 @@ class OpRegistry:
 
     def resolve(
         self, spec: OpSpec[Fn], selection: str, context: OpBuildContext, *, native_only: str | None = None,
+        blocked_backends: tuple[tuple[str, str], ...] = (),
     ) -> tuple[str, Fn]:
         """Return the selected name and callable, or explain candidate rejection."""
         self._require_spec(spec)
         device_type = context.target_device.type
         names = self._auto.get((spec, device_type), ()) if selection == "auto" else (selection,)
         reasons = []
+        blocked = dict(blocked_backends)
         for name in names:
             if native_only is not None and name != "native":
                 reasons.append(f"{name}: {native_only}")
+                continue
+            if name in blocked:
+                reasons.append(f"{name}: {blocked[name]}")
                 continue
             impl = self._implementations.get((spec, name, device_type))
             if impl is None:

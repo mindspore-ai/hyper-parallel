@@ -22,6 +22,7 @@ import torch
 from torch import nn
 
 from hyper_parallel.components.functional.npu_fusion_attention import npu_fusion_attention_forward
+from hyper_parallel.components.ops.families.attention import _npu_dense
 from hyper_parallel.distributed._builder.forward_rewriter import _ForwardRewriteRequest
 from hyper_parallel.distributed.tensor_parallel.param_role import ParamRole
 from hyper_parallel.models import get_model_adapter
@@ -55,7 +56,10 @@ def test_text_cp_keeps_global_2d_padding_mask() -> None:
     torch.testing.assert_close(actual, padding_mask.bool())
     module = SimpleNamespace(training=True, attention_dropout=0.0, scaling=0.5)
     kernel = Mock(side_effect=lambda *args, **kwargs: (args[0],))
-    with patch.dict("sys.modules", {"torch_npu": SimpleNamespace(npu_fusion_attention=kernel)}):
+    with (
+        patch.dict("sys.modules", {"torch_npu": SimpleNamespace(npu_fusion_attention=kernel)}),
+        patch("hyper_parallel.components.ops._select_for_call", return_value=_npu_dense),
+    ):
         output, _ = context_parallel._run_flash_attention(module, query, key, query, actual)
     expected = query.transpose(1, 2) * padding_mask[:, :, None, None]
     torch.testing.assert_close(output, expected)
@@ -76,7 +80,10 @@ def test_text_cp_keeps_global_2d_padding_mask() -> None:
         torch.zeros(1, 4, dtype=torch.bool),
     ):
         kernel.reset_mock()
-        with patch.dict("sys.modules", {"torch_npu": SimpleNamespace(npu_fusion_attention=kernel)}):
+        with (
+            patch.dict("sys.modules", {"torch_npu": SimpleNamespace(npu_fusion_attention=kernel)}),
+            patch("hyper_parallel.components.ops._select_for_call", return_value=_npu_dense),
+        ):
             output, _ = context_parallel._run_flash_attention(module, query, key, query, mask)
         torch.testing.assert_close(output, query.transpose(1, 2) * mask[:, :, None, None])
         if mask.any():
@@ -100,7 +107,10 @@ def test_text_cp_window_uses_compressed_band_mask() -> None:
     ):
         for options in ({"sliding_window": 2}, {"pre_tokens": 1}):
             kernel.reset_mock()
-            with patch.dict("sys.modules", {"torch_npu": SimpleNamespace(npu_fusion_attention=kernel)}):
+            with (
+                patch.dict("sys.modules", {"torch_npu": SimpleNamespace(npu_fusion_attention=kernel)}),
+                patch("hyper_parallel.components.ops._select_for_call", return_value=_npu_dense),
+            ):
                 output, _ = context_parallel._run_flash_attention(module, query, query, query, mask, **options)
             expected = query.transpose(1, 2)
             if mask is not None:
