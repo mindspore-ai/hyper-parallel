@@ -1,0 +1,125 @@
+[build-system]
+requires = ["setuptools>=78.1.1", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hyper_parallel"
+requires-python = ">=3.10,<3.13"
+# setuptools reads the remaining package metadata and requirements.txt via setup.py.
+dynamic = [
+    "version", "description", "readme", "license", "authors", "keywords",
+    "classifiers", "urls", "dependencies",
+]
+
+[project.optional-dependencies]
+cpu = ["torch==2.9.1"]
+gpu = ["torch==2.9.1"]
+npu = [
+    "torch==2.9.1",
+    "torch-npu==2.9.1; sys_platform == 'linux'",
+    "hyper-multicore; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'x86_64')",
+]
+torch = ["torch==2.9.1", "torch-npu==2.9.1; sys_platform == 'linux'"]
+torch26 = ["torch==2.6.0", "torch-npu==2.6.0.post3; sys_platform == 'linux'"]
+torch27 = ["torch==2.7.1", "torch-npu==2.7.1; sys_platform == 'linux'"]
+torch29 = ["torch==2.9.1", "torch-npu==2.9.1; sys_platform == 'linux'"]
+all = ["torch==2.9.1", "torch-npu==2.9.1; sys_platform == 'linux'"]
+
+[dependency-groups]
+dev = [{ include-group = "test" }, { include-group = "lint" }, { include-group = "build" }]
+test = [
+    "pytest",
+    "expecttest",
+    "matplotlib",
+    "scipy",
+    # The solver uses the PULP_CBC_CMD API removed in PuLP 4.
+    "pulp>=3.3,<4",
+    "Pillow",
+    "aiohttp",
+    "pandas",
+    "pyarrow",
+]
+lint = ["pylint==3.3.7", "pre-commit", "lizard", "codespell"]
+build = ["setuptools>=78.1.1", "wheel", "build"]
+
+[tool.uv]
+required-version = ">=0.11.16,<0.12"
+default-groups = []
+cache-keys = [{ file = "pyproject.toml" }, { file = "setup.py" }, { file = "requirements.txt" }]
+# The 2.9 NPU aliases remain compatible with each other. GPU uses a different
+# Torch source; older NPU stacks require separate resolution branches.
+conflicts = [
+    [{ extra = "cpu" }, { extra = "gpu" }],
+    [{ extra = "cpu" }, { extra = "npu" }],
+    [{ extra = "cpu" }, { extra = "torch" }],
+    [{ extra = "cpu" }, { extra = "torch26" }],
+    [{ extra = "cpu" }, { extra = "torch27" }],
+    [{ extra = "cpu" }, { extra = "torch29" }],
+    [{ extra = "cpu" }, { extra = "all" }],
+    [{ extra = "gpu" }, { extra = "npu" }],
+    [{ extra = "gpu" }, { extra = "torch" }],
+    [{ extra = "gpu" }, { extra = "torch29" }],
+    [{ extra = "gpu" }, { extra = "all" }],
+    [{ extra = "gpu" }, { extra = "torch26" }, { extra = "torch27" }],
+    [{ extra = "torch26" }, { extra = "npu" }],
+    [{ extra = "torch26" }, { extra = "torch" }],
+    [{ extra = "torch26" }, { extra = "torch29" }],
+    [{ extra = "torch26" }, { extra = "all" }],
+    [{ extra = "torch27" }, { extra = "npu" }],
+    [{ extra = "torch27" }, { extra = "torch" }],
+    [{ extra = "torch27" }, { extra = "torch29" }],
+    [{ extra = "torch27" }, { extra = "all" }],
+]
+
+[tool.uv.sources]
+# NPU uses CPU Torch wheels; other packages still resolve from PyPI.
+torch = [
+    { index = "pytorch-cpu", extra = "cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { index = "pytorch-cu128", extra = "gpu", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cpu", extra = "npu", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cpu", extra = "torch", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cpu", extra = "torch26", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cpu", extra = "torch27", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cpu", extra = "torch29", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cpu", extra = "all", marker = "sys_platform == 'linux'" },
+]
+
+# Draft URLs until the matching HyperMulticore wheels are published.
+[[tool.uv.sources.hyper-multicore]]
+url = "http://hyper-multicore-download-url/hyper_multicore-0.1.0.dev0-cp310-cp310-linux_aarch64.whl"
+marker = "sys_platform == 'linux' and python_version == '3.10' and platform_machine == 'aarch64'"
+
+[[tool.uv.sources.hyper-multicore]]
+url = "http://hyper-multicore-download-url/hyper_multicore-0.1.0.dev0-cp310-cp310-linux_x86_64.whl"
+marker = "sys_platform == 'linux' and python_version == '3.10' and platform_machine == 'x86_64'"
+
+[[tool.uv.sources.hyper-multicore]]
+url = "http://hyper-multicore-download-url/hyper_multicore-0.1.0.dev0-cp311-cp311-linux_aarch64.whl"
+marker = "sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'aarch64'"
+
+[[tool.uv.sources.hyper-multicore]]
+url = "http://hyper-multicore-download-url/hyper_multicore-0.1.0.dev0-cp311-cp311-linux_x86_64.whl"
+marker = "sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'x86_64'"
+
+[[tool.uv.sources.hyper-multicore]]
+url = "http://hyper-multicore-download-url/hyper_multicore-0.1.0.dev0-cp312-cp312-linux_aarch64.whl"
+marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'aarch64'"
+
+[[tool.uv.sources.hyper-multicore]]
+url = "http://hyper-multicore-download-url/hyper_multicore-0.1.0.dev0-cp312-cp312-linux_x86_64.whl"
+marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'"
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true

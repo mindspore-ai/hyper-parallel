@@ -29,21 +29,25 @@ In shells such as zsh, quote package names containing extras so that `[]` is not
 The indexed Dataset C++ helper is always compiled.
 
 ```bash
+# Install the uv version used by this project.
+python -m pip install uv==0.11.16
+```
+
+```bash
 ./build.sh --help
 ./build.sh
 # Install the exact wheel path printed by this build.
 pip install /absolute/path/to/the-built-wheel.whl
 ```
 
-General build requirements: Python 3.10–3.12, matching development headers, setuptools, wheel, pybind11, and a C++17 host toolchain. Each wheel targets one Python ABI and host architecture. Each native component defines its own SDK, framework, and device requirements. Runtime environments for source and prebuilt wheels must also satisfy the glibc, framework ABI, and SDK constraints recorded in the final ELF binaries.
+General build requirements: Python 3.10–3.12, matching development headers, uv, pybind11, and a C++17 host toolchain. Each wheel targets one Python ABI and host architecture. Each native component defines its own SDK, framework, and device requirements. Runtime environments for source and prebuilt wheels must also satisfy the glibc, framework ABI, and SDK constraints recorded in the final ELF binaries.
 
-Each unified build regenerates `build/native/payload/hyper_parallel` and ships only components that succeeded in that build. `python setup.py bdist_wheel` does not trigger native compilation; without an explicit payload, it packages Python sources only.
+Each unified build regenerates `build/native/payload/hyper_parallel` and ships only components that succeeded in that build. `uv build --wheel` does not trigger native compilation; without an explicit payload, it packages Python sources only.
 
 ## 3. Optional HyperMulticore Integration
 
 MegaMoE, MegaGate and MegaMHC replacements use the separately installed
-[HyperMulticore](https://github.com/mindspore-ai/hyper-multicore) package. HyperParallel does not
-install or compile it automatically. Install a wheel matching the training environment and activate
+[HyperMulticore](https://github.com/mindspore-ai/hyper-multicore) package. For an existing pip-managed training environment, install a compatible wheel and activate
 its CANN custom OPP before starting Python:
 
 ```bash
@@ -67,3 +71,30 @@ import importlib.metadata as metadata
 
 print(metadata.version("hyper_parallel"))
 ```
+
+## 5. Manage Development Dependencies with uv
+
+The HyperMulticore download addresses in this draft are placeholders. The sync examples below require an updated lockfile generated after the matching wheels are published.
+
+From the repository root, synchronize the CPU development environment with the lockfile.
+
+```bash
+# Install the project and CPU development dependencies into an isolated environment.
+UV_PROJECT_ENVIRONMENT=.venv-uv uv sync --locked --python 3.12 --extra cpu --dev
+```
+
+For CUDA 12.8 development on Linux, use `--extra gpu` in a separate environment.
+For supported Linux Ascend hosts, the `npu` extra includes PyTorch, TorchNpu and HyperMulticore.
+
+```bash
+# Install the locked Ascend dependencies, including the HyperMulticore wheel.
+UV_PROJECT_ENVIRONMENT=.venv-npu uv sync --locked --python 3.12 --extra npu --dev
+
+# Activate the installed CANN and HyperMulticore environments before training.
+source .venv-npu/bin/activate
+source /usr/local/Ascend/cann/set_env.sh
+source .venv-npu/bin/hyper_multicore_set_env.bash
+```
+
+`requirements.txt` remains the source of runtime dependency ranges for pip installation.
+After changing dependency declarations, run `uv lock` and commit the updated `uv.lock`.

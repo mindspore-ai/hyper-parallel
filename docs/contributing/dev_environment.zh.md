@@ -8,7 +8,7 @@
 Python 开发需要独立环境、Git、支持的 PyTorch 安装及受影响模块的依赖；下列编译器、SDK 和构建工具适用于原生组件构建：
 
 - Python 3.10 / 3.11 / 3.12
-- 当前 Python 的开发头文件，以及 `setuptools`、`wheel`、`pybind11`
+- 当前 Python 的开发头文件，`pybind11` 和 [uv](https://docs.astral.sh/uv/getting-started/installation/)
 - Git
 - GCC/G++（支持 C++17）、GNU Make、binutils、coreutils、tar、sed、awk
 - CANN >= 9.1.0 的完整 toolkit/ops 开发环境（Ascend NPU 开发需要）
@@ -48,7 +48,7 @@ source "$(command -v hyper_multicore_set_env.bash)"
 python your_program.py
 ```
 
-直接执行 `python setup.py bdist_wheel` 只生成 core-only wheel，不在 setup/pip 阶段下载或编译 native 依赖。
+直接执行 `uv build --wheel` 只生成 core-only wheel，不在 setup/pip 阶段下载或编译 native 依赖。
 HyperParallel 构建方式见[安装指南](../installation.zh.md)。Multicore 的依赖和 CANN custom OPP 激活方式见
 [HyperMulticore](https://github.com/mindspore-ai/hyper-multicore)。
 

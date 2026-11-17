@@ -28,6 +28,7 @@ if [[ $# -eq 1 && ( "$1" == -h || "$1" == --help ) ]]; then
 fi
 [[ $# -eq 0 ]] || die "Unknown option '$1'. Run bash build.sh --help."
 PYTHON_BIN=$(command -v python) || die "Python is unavailable in the active PATH."
+UV_BIN=$(command -v uv) || die "Install uv and make it available on PATH to build the wheel."
 cd "${PROJECT_ROOT}"
 mkdir -p "${PAYLOAD_STAGING_ROOT}" "${NATIVE_ROOT}/logs"
 trap 'rm -rf "${PAYLOAD_STAGING_ROOT}"' EXIT
@@ -42,7 +43,7 @@ export HYPER_PARALLEL_NATIVE_OUTPUT_ROOT="${PAYLOAD_ROOT}"
 WHEEL_OUTPUT_ROOT="${NATIVE_ROOT}/wheel-output"
 rm -rf "${WHEEL_OUTPUT_ROOT}"
 mkdir -p "${WHEEL_OUTPUT_ROOT}"
-"${PYTHON_BIN}" setup.py -q bdist_wheel --dist-dir "${WHEEL_OUTPUT_ROOT}"
+"${UV_BIN}" build --wheel --python "${PYTHON_BIN}" --no-python-downloads --out-dir "${WHEEL_OUTPUT_ROOT}"
 mapfile -t built_wheels < <(find "${WHEEL_OUTPUT_ROOT}" -maxdepth 1 -type f -name 'hyper_parallel-*.whl' -print)
 [[ ${#built_wheels[@]} -eq 1 ]] || die "Expected one wheel under ${WHEEL_OUTPUT_ROOT}."
 mkdir -p "${PROJECT_ROOT}/dist"

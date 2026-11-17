@@ -29,24 +29,29 @@ zsh 等 shell 下建议给带 extras 的包名加引号，避免 `[]` 被解释�
 indexed Dataset C++ helper 每次都会编译。
 
 ```bash
+# 安装项目使用的 uv 版本。
+python -m pip install uv==0.11.16
+```
+
+```bash
 ./build.sh --help
 ./build.sh
 # 安装本次命令打印的精确 wheel 路径
 pip install /absolute/path/to/the-built-wheel.whl
 ```
 
-通用构建要求：Python 3.10–3.12、对应开发头文件、setuptools、wheel、pybind11、C++17 主机工具链。
+通用构建要求：Python 3.10–3.12、对应开发头文件、uv、pybind11、C++17 主机工具链。
 每个 wheel 对应一个 Python ABI 和主机架构；各 native 组件的 SDK、框架和设备要求由组件自行定义。
 源码和预编译 wheel 的运行环境还必须满足最终 ELF 记录的 glibc、框架 ABI 及 SDK 约束。
 
 每次统一构建重新生成 `build/native/payload/hyper_parallel`；只交付本次成功的组件。
-`python setup.py bdist_wheel` 不触发 native 编译；无显式 payload 时仅组装 Python 源码。
+`uv build --wheel` 不触发 native 编译；无显式 payload 时仅组装 Python 源码。
 
 ## 3. 按需使用 HyperMulticore
 
 MegaMoE、MegaGate 和 MegaMHC 替换使用独立安装的
-[HyperMulticore](https://github.com/mindspore-ai/hyper-multicore)。HyperParallel 不自动安装或编译该组件。
-启用对应替换前，安装匹配训练环境的 wheel，并在启动 Python 前激活 CANN custom OPP：
+[HyperMulticore](https://github.com/mindspore-ai/hyper-multicore)。
+在已有的 pip 训练环境中，安装匹配的 wheel，并在启动 Python 前激活 CANN custom OPP：
 
 ```bash
 pip install /absolute/path/to/hyper_multicore.whl
@@ -68,3 +73,30 @@ import importlib.metadata as metadata
 
 print(metadata.version("hyper_parallel"))
 ```
+
+## 5. 用 uv 管理开发依赖
+
+当前草稿使用 HyperMulticore 下载占位地址。运行下列同步示例前，需等匹配的 wheel 发布后重新生成锁文件。
+
+在仓库根目录按锁文件同步 CPU 开发环境。
+
+```bash
+# 将项目和 CPU 开发依赖安装到独立环境。
+UV_PROJECT_ENVIRONMENT=.venv-uv uv sync --locked --python 3.12 --extra cpu --dev
+```
+
+Linux CUDA 12.8 开发可在独立环境中选择 `--extra gpu`。
+在受支持的 Linux Ascend 主机上，`npu` extra 包含 PyTorch、TorchNpu 和 HyperMulticore。
+
+```bash
+# 同步锁定的 Ascend 依赖，包括 HyperMulticore wheel。
+UV_PROJECT_ENVIRONMENT=.venv-npu uv sync --locked --python 3.12 --extra npu --dev
+
+# 启动训练前，激活已安装的 CANN 和 HyperMulticore 环境。
+source .venv-npu/bin/activate
+source /usr/local/Ascend/cann/set_env.sh
+source .venv-npu/bin/hyper_multicore_set_env.bash
+```
+
+`requirements.txt` 继续提供 pip 安装所用的运行时依赖范围。
+变更依赖声明后，运行 `uv lock` 并提交更新后的 `uv.lock`。
