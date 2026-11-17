@@ -26,7 +26,8 @@ output = norm(hidden_states)
 ## Module families
 
 Registered module families select an implementation from explicit configuration rules before model construction.
-See [Module Family](README.module_family.md) for GroupedExperts MXFP8 examples, rule semantics, and extension guidance.
+The public [GroupedExperts family](moe/grouped_experts/README.md) selects local or EP execution.
+See [Module Family](README.module_family.md) for legacy MXFP8 examples, rule semantics, and extension guidance.
 
 ## Attention families
 
@@ -148,8 +149,9 @@ plan_overrides:
 
 Invalid patterns, incompatible module types and unavailable weight conversions raise an error.
 
-Replacements use `make_transforms()` only when parameter names or layouts change. Otherwise, they reuse the source
-parameters directly.
+Replacements declare checkpoint conversion through `make_transforms()` and can retain source parameter identity.
+A replacement with a custom `reset_parameters()` must also declare `make_transforms()`, returning an empty list
+when no conversion is needed. The builder then arranges its reset after meta parameters are materialized.
 
 ## Run training
 

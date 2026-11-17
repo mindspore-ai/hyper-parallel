@@ -70,20 +70,12 @@ plan_overrides:
         ulysses_degree: 1
   # The experts module is always the same grouped-GEMM implementation;
   # enabling EP changes only token dispatch/combine around this boundary.
-  - match: "*.mlp.experts"
+  - match: "model.layers.*.mlp.experts"
     replace:
       kind: module
       source_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts
       implementation:
-        _target_: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_grouped_experts
-  # EP conditional override: Qwen3-MoE TopKRouter archetype compute.
-  - match: "*.mlp.forward"
-    when: ep
-    replace:
-      kind: method
-      implementation:
-        _target_: hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn
-        use_grouped_gemm: true
+        _target_: hyper_parallel.components.modules.GroupedExperts
 
 mixed_precision:
   enabled: false

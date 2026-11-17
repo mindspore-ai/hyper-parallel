@@ -242,6 +242,28 @@ def _normalize_family_request(target, kwargs):
     return FamilyRequest(target, kwargs)
 
 
+def _validate_initialization_contract(module: nn.Module) -> bool:
+    """Require replacement-owned reset hooks to declare checkpoint conversion too.
+
+    Torch's inherited default reset is not a replacement initialization policy.
+    An empty conversion list still declares that policy and permits a later reset.
+    Conversion-only modules may rely on their ordinary children for initialization.
+    """
+    make_transforms = getattr(module, "make_transforms", None)
+    if make_transforms is not None and not callable(make_transforms):
+        raise TypeError("replacement make_transforms must be callable")
+    reset_parameters = getattr(module, "reset_parameters", None)
+    reset_owner = next((base for base in type(module).__mro__ if "reset_parameters" in vars(base)), None)
+    custom_reset = (callable(reset_parameters) and reset_owner is not None
+                    and not reset_owner.__module__.startswith("torch.nn."))
+    if custom_reset and not callable(make_transforms):
+        raise TypeError(
+            f"{type(module).__name__}.reset_parameters requires a callable make_transforms(); "
+            "return [] when checkpoint conversion is unnecessary"
+        )
+    return callable(make_transforms) and callable(reset_parameters)
+
+
 def _build_family_member(
     request: FamilyRequest,
     member: ResolvedFamily,
@@ -259,9 +281,10 @@ def _build_family_member(
     result = member.constructor(**_constructor_arguments(member, config, module, module_fqn, context))
     if not isinstance(result, nn.Module):
         raise TypeError("a family constructor must return nn.Module")
+    requires_reset = _validate_initialization_contract(result)
     info = FamilyBuildInfo(request, member, deepcopy(config), "direct" if module is None else "replacement")
     result._hp_family_build_info = info  # pylint: disable=protected-access
-    if config is not None and callable(getattr(result, "reset_parameters", None)):
+    if config is not None and requires_reset:
         result._hp_reset_after_materialization = True  # pylint: disable=protected-access
     return result
 

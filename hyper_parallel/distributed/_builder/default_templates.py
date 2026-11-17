@@ -224,6 +224,22 @@ TEMPLATES: Dict[str, ShardingTemplate] = {
         nosp_out_dst=_out(Replicate(), Shard(1)),
         region_dispatch=False,           # MoE forward has its own a2a; dispatch not allowed
     ),
+
+    # The child expert owner declares complete matrices and its own transport.
+    "moe_mlp_routed": ShardingTemplate(
+        colwise_placement=Replicate(),
+        rowwise_placement=Replicate(),
+        norm_placement=Replicate(),
+        sp_in_src=_hid(Shard(1), Shard(1)),
+        sp_in_dst=_hid(Shard(1), Shard(1)),
+        sp_out_src=_out(Shard(1), Shard(1)),
+        sp_out_dst=_out(Shard(1), Shard(1)),
+        nosp_in_src=_hid(Replicate(), Shard(1)),
+        nosp_in_dst=_hid(Replicate(), Shard(1)),
+        nosp_out_src=_out(Replicate(), Shard(1)),
+        nosp_out_dst=_out(Replicate(), Shard(1)),
+        region_dispatch=False,
+    ),
 }
 
 
@@ -329,6 +345,7 @@ def _build_spec_from_template(
     templates, boundary_fqn: str, group: List[Tuple[str, ParamRole]],
     template: ShardingTemplate, sequence_parallel: bool, loss_parallel: bool,
     mesh_dim_names: Tuple[str, ...], param_ndims: Optional[Dict[str, int]] = None,
+    ep_size: int = 1,
 ) -> Optional[ModuleShardingSpec]:
     """Template + ParamRole → ModuleShardingSpec (05 §3.5 Template Mapping)."""
     has_tp = "tp" in mesh_dim_names
@@ -337,8 +354,10 @@ def _build_spec_from_template(
     # The derived spec is materialized directly with concrete dicts (None
     # is the "undeclared" semantics on the override input side; derived
     # artifacts always hold concrete values).
+    parameter_group = ([(name, ParamRole.REPLICATED) for name, _ in group]
+                       if template is templates.get("moe_mlp_routed") else group)
     spec = ModuleShardingSpec(params=_build_param_placements(
-        boundary_fqn, group, template, has_tp, has_ep, param_ndims,
+        boundary_fqn, parameter_group, template, has_tp, has_ep, param_ndims,
     ))
 
     # Step 2: select the I/O contract per the SP switch (deep copy, so
@@ -353,6 +372,11 @@ def _build_spec_from_template(
         spec.in_dst = copy.deepcopy(template.nosp_in_dst)
         spec.out_src = copy.deepcopy(template.nosp_out_src)
         spec.out_dst = copy.deepcopy(template.nosp_out_dst)
+
+    if template is templates.get("moe_mlp_routed") and has_tp and ep_size > 1:
+        # TP-extend-EP consumes disjoint tokens even when dense SP is disabled.
+        spec.in_dst["hidden_states"][TP] = Shard(1)
+        spec.out_src[TP] = Shard(1)
 
     # Step 2.5: lm_head's out_dst depends on loss_parallel (a runtime
     # decision).

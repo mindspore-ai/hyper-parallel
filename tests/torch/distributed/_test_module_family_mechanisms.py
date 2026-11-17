@@ -117,6 +117,23 @@ def _reference_experts(tokens, indices, probabilities, weight):
     return (torch.tanh(tokens[:, None, :] * weight[indices]) * probabilities[:, :, None]).sum(dim=1)
 
 
+def _permute_routed_slots(hidden_states, expert_indices, routing_weights):
+    """Prepare the worker's selected routes in expert-major order."""
+    top_k = expert_indices.shape[1]
+    ids, order = expert_indices.reshape(-1).sort(stable=True)
+    rows = torch.arange(order.numel(), device=order.device)
+    source_inverse = torch.empty_like(order).scatter_(0, order, rows)
+    hidden = hidden_states.index_select(0, order // top_k)
+    weights = routing_weights.reshape(-1).index_select(0, order)
+    return hidden, ids, weights, source_inverse
+
+
+def _sum_routed_slots(values, source_inverse, top_k):
+    """Restore the worker's source routes and sum top-k outputs."""
+    values = values.index_select(0, source_inverse)
+    return values.reshape(-1, top_k, values.shape[-1]).sum(dim=1)
+
+
 def _check_expert_transport(device):
     """Compare routed EP transport and probability gradients with dense experts."""
     mesh = init_device_mesh(device, (2, 2), mesh_dim_names=("edp", "ep"))
@@ -125,9 +142,13 @@ def _check_expert_transport(device):
     for iteration in range(2):
         tokens, indices, probabilities = _source_slots(dist.get_rank(), iteration, device)
         local_weight = global_weight.chunk(2)[context.rank].clone().requires_grad_()
-        batch = context.dispatch(tokens, indices, probabilities)
-        values = torch.tanh(batch.hidden_states * local_weight[batch.expert_indices]) * batch.routing_weights[:, None]
-        actual = context.combine(values, batch.receipt)
+        slots, expert_ids, weights, source_inverse = _permute_routed_slots(tokens, indices, probabilities)
+        hidden, counts, weights, *transport = context.dispatch(slots, expert_ids, weights)
+        local_ids = torch.arange(counts.numel(), device=counts.device).repeat_interleave(
+            counts, output_size=hidden.shape[0],
+        )
+        values = torch.tanh(hidden * local_weight[local_ids]) * weights[:, None]
+        actual = _sum_routed_slots(context.combine(values, *transport), source_inverse, indices.shape[1])
         expected = _reference_experts(tokens, indices, probabilities, global_weight)
         torch.testing.assert_close(actual, expected)
         actual_grads = torch.autograd.grad(actual.sum(), (tokens, probabilities, local_weight))

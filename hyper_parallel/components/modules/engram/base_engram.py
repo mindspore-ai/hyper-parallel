@@ -93,11 +93,13 @@ class EngramModule(ParallelEngram, nn.Module):
         return nn.Embedding(rows, width)
 
     def reset_parameters(self) -> None:
-        """Initialize direct device-table parameters after meta materialization."""
-        self.embed.reset_parameters()
-        self.wkv.reset_parameters()
+        """Initialize owned query/key scales after materialization."""
         nn.init.ones_(self.q_weight)
         nn.init.ones_(self.k_weight)
+
+    def make_transforms(self) -> list:
+        """Keep source parameter names and layouts unchanged."""
+        return []
 
     def checkpoint_logical_shapes(self) -> dict[str, tuple[int, ...]]:
         """Return the logical embedding shape for checkpoint loading and checking."""

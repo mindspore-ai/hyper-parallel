@@ -131,6 +131,15 @@ class HostEngramTable(ParallelHostTable, nn.Module):
     def reset_parameters(self) -> None:
         """Preserve already materialized CPU rows during model initialization."""
 
+    def make_transforms(self) -> list:
+        """Declare that this member keeps parameter names and layouts unchanged.
+
+        Returns:
+            An empty converter list, matching members whose initialization is
+            fully owned by ``reset_parameters``.
+        """
+        return []
+
     def forward(self, global_ids: torch.Tensor) -> torch.Tensor:
         """Look up global row IDs through the owner-local CPU table.
 

@@ -31,6 +31,7 @@ from hyper_parallel.components.modules.module_family import (
     validate_family_context,
 )
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
+from hyper_parallel.models.build_context import collect_module_contexts, context_with_config
 from hyper_parallel.models.registry import _normalize_family_key, get_model_adapter
 from hyper_parallel.models.replacement import (
     ModuleReplacementPlan, _apply_module_replacement_actions, _install_module_candidates,
@@ -73,6 +74,7 @@ def build_module_context(
     device: Any = None,
     dtype: Any = None,
     model_spec: ModelAdapterSpec | None = None,
+    config: Any = None,
 ) -> Mapping[str, Any]:
     """Create the read-only logical context for family selection and model preparation.
 
@@ -82,6 +84,7 @@ def build_module_context(
         device: Target device, if already known.
         dtype: Target model dtype, if already known.
         model_spec: Already resolved per-build model facts.
+        config: Full model configuration, before pipeline partitioning.
 
     Returns:
         Logical axes and target constraints, without creating groups or workspaces.
@@ -112,7 +115,7 @@ def build_module_context(
         result["device_type"] = torch.device(device).type
     if dtype is not None and dtype != "auto":
         result["dtype"] = str(dtype).removeprefix("torch.")
-    return MappingProxyType(result)
+    return context_with_config(result, config)
 
 
 def attach_build_context(model: nn.Module, context: Mapping[str, Any]) -> None:
@@ -208,7 +211,8 @@ def _finalize_family_modules(model: nn.Module, context: Mapping[str, Any]) -> nn
     boundaries = collect_family_modules(model)
     if not boundaries:
         return model
-    prepared = [(boundary, *_prepare_family_member(boundary, context)) for boundary in boundaries]
+    contexts = context["module_contexts"]
+    prepared = [(boundary, *_prepare_family_member(boundary, contexts[boundary.fqns[0]])) for boundary in boundaries]
     model = _install_module_candidates(
         model, ((boundary.fqns, boundary.module, candidate) for boundary, candidate, _ in prepared),
     )
@@ -277,18 +281,21 @@ def prepare_model_components(
         if getattr(model, "_hp_module_build_context", None) is not context:
             raise ValueError("prepared model components cannot be reused with another build context")
         return model, model._hp_family_weight_mapping  # pylint: disable=protected-access
-    model = _finalize_family_modules(model, context)
+    contexts = collect_module_contexts(model, context)
+    preparation_context = MappingProxyType({**contexts[""], "module_contexts": contexts})
+    model = _finalize_family_modules(model, preparation_context)
     attach_build_context(model, context)
-    spec = context.get("model_spec")
-    defaults = () if spec is None or spec.replacements is None else _provider_rules(spec.replacements, model, context)
+    spec = preparation_context.get("model_spec")
+    defaults = (() if spec is None or spec.replacements is None
+                else _provider_rules(spec.replacements, model, preparation_context))
     overrides = context.get("module_replacement_requests")
     legacy = () if overrides is not None else (context.get("module_replacements") or ())
     plan = compile_module_replacements(model, legacy, defaults=defaults, overrides=overrides or ())
     weights = model_weight_mapping(model)
-    _validate_low_precision_targets(model, plan, context)
+    _validate_low_precision_targets(model, plan, preparation_context)
     if plan.targets:
         model, weights = _apply_module_replacement_actions(
-            model, plan, weights_mapping=weights, context=context,
+            model, plan, weights_mapping=weights, context=preparation_context,
             capture_checkpoint_metadata=capture_checkpoint_metadata,
         )
     model._hp_components_prepared = True  # pylint: disable=protected-access

@@ -167,6 +167,15 @@ class RMSNormModule(_RMSNormPolicy):
         """Restore the direct scale after meta materialization."""
         torch.nn.init.ones_(self.weight)
 
+    def make_transforms(self) -> list:
+        """Declare that this member keeps parameter names and layouts unchanged.
+
+        Returns:
+            An empty converter list, matching members whose initialization is
+            fully owned by ``reset_parameters``.
+        """
+        return []
+
 
 class OffsetRMSNormModule(_RMSNormPolicy):
     """NPU-fused unit-offset RMSNorm preserving offset checkpoint state."""

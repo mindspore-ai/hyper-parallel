@@ -179,7 +179,7 @@ def _resolve_module_construction(kwargs, hf_config, distributed_setup, dtype):
     factory = kwargs.pop("model_factory", None)
     spec = resolve_effective_model_spec(hf_config, kwargs.pop("model_spec", None))
     context = build_module_context(
-        distributed_setup, device=_current_device(), dtype=dtype, model_spec=spec,
+        distributed_setup, device=_current_device(), dtype=dtype, model_spec=spec, config=hf_config,
     )
     return factory, context
 

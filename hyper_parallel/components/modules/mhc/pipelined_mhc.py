@@ -84,6 +84,15 @@ class PipelinedMhcModule(nn.Module):
         nn.init.zeros_(self.base)
         nn.init.constant_(self.scale, 0.01)
 
+    def make_transforms(self) -> list:
+        """Declare that this member keeps parameter names and layouts unchanged.
+
+        Returns:
+            An empty converter list, matching members whose initialization is
+            fully owned by ``reset_parameters``.
+        """
+        return []
+
     def forward(
         self,
         hidden_streams: torch.Tensor,

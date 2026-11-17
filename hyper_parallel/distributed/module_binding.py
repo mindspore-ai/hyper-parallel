@@ -29,6 +29,7 @@ from hyper_parallel.components.modules.module_family import _same_mesh, get_fami
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.distributed.context_parallel.cp_context import CPContext
 from hyper_parallel.distributed.expert_parallel.ep_context import EPContext
+from hyper_parallel.distributed.expert_parallel.moonep_context import MoonEPContext
 
 
 @dataclass(frozen=True)
@@ -98,7 +99,7 @@ class ParallelBinding:
 
     mesh_binding: MeshBinding
     cp_context: CPContext | None = None
-    ep_context: EPContext | None = None
+    ep_context: EPContext | MoonEPContext | None = None
 
 
 def validate_parallel_module(module: nn.Module, parallel: ParallelModuleSpec, sharding: Any, context: Any) -> None:
@@ -161,6 +162,15 @@ def _validate_expert_ownership(module, parallel, sharding, context):
             raise ValueError("EPContext supports balanced contiguous expert Shard(0) ownership")
 
 
+def _build_ep_context(mesh_binding: MeshBinding, parallel: ParallelModuleSpec) -> EPContext | MoonEPContext:
+    """Choose the declared EP runtime while borrowing the existing expert mesh."""
+    moonep = parallel.options.get("moonep", False)
+    if not isinstance(moonep, bool):
+        raise ValueError("the moonep runtime option must be bool")
+    constructor = MoonEPContext if moonep else EPContext
+    return constructor(mesh_binding.axis_mesh("ep"), num_experts=parallel.options["num_experts"])
+
+
 def bind_parallel_modules(model: nn.Module, plan: Any, mesh_context: Any) -> None:
     """Inject shared resources after layout and before activation wrappers/FSDP2.
 
@@ -184,8 +194,7 @@ def bind_parallel_modules(model: nn.Module, plan: Any, mesh_context: Any) -> Non
                 raise ValueError(f"module {fqn!r} already has a communication owner")
             continue
         cp = CPContext(mesh_binding.axis_mesh("cp")) if parallel.binding_kind == "cp" else None
-        ep = (EPContext(mesh_binding.axis_mesh("ep"), num_experts=parallel.options["num_experts"])
-              if parallel.binding_kind == "ep" else None)
+        ep = _build_ep_context(mesh_binding, parallel) if parallel.binding_kind == "ep" else None
         prepared.append((module, ParallelBinding(mesh_binding, cp, ep)))
     for module, binding in prepared:
         module.bind_parallel(binding)

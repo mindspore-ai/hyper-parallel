@@ -2,7 +2,9 @@
 
 Module Family 在构建阶段为同一种模块选择具体实现。用户通过统一的 replacement 入口填写选择参数，框架根据模块族声明的白名单规则选出实现，再复用现有的 Module Replacement 完成模型层匹配和实例安装。
 
-当前内置 `GroupedExperts` Family，提供默认高性能实现、MXFP8 和融合 MXFP8。更多模块可通过注册自己的 Family 接入。
+公共 `hyper_parallel.components.modules.GroupedExperts` 使用[新专家族](moe/grouped_experts/README.md)，
+根据作业拓扑选择 local/EP 成员。本页 MXFP8 示例使用保留的旧专家族，显式路径为
+`hyper_parallel.components.modules.grouped_experts.GroupedExperts`。更多模块可通过注册自己的 Family 接入。
 
 ## 使用 GroupedExperts Family
 
@@ -20,7 +22,7 @@ plan_overrides:
     replace:
       kind: module
       implementation:
-        _target_: hyper_parallel.components.modules.GroupedExperts
+        _target_: hyper_parallel.components.modules.grouped_experts.GroupedExperts
         use_mxfp8: true
         use_fused_mxfp8: true
 ```
@@ -69,12 +71,12 @@ flowchart TD
 `ReplacementTarget` 同时保留用户请求的 baseline、显式选择参数和最终 callable。重新选择或序列化时保留配置意图；真正构建时，选择参数已从普通构造参数中移除。
 
 ```python
-from hyper_parallel.components.modules import GroupedExperts
+from hyper_parallel.components.modules.grouped_experts import GroupedExperts
 from hyper_parallel.trainer.config.replacement import ReplacementTarget
 
 target = ReplacementTarget(
     GroupedExperts,
-    target_path="hyper_parallel.components.modules.GroupedExperts",
+    target_path="hyper_parallel.components.modules.grouped_experts.GroupedExperts",
     use_mxfp8=True,
 )
 fused = target.replace(use_fused_mxfp8=True)

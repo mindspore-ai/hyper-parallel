@@ -23,7 +23,7 @@ models/deepseek_v32/
 ├── __init__.py
 ├── adapter/
 │   ├── conversion/
-│   │   └── module_replacement.py    # Replacement factories: RMSNorm, DSA attention, GroupedExperts
+│   │   └── module_replacement.py    # RMSNorm/DSA factories and the legacy expert entry
 │   ├── distributed/
 │   │   └── context_parallel.py      # DSA context-parallel wrapper
 │   ├── policies/
@@ -41,7 +41,8 @@ models/deepseek_v32/
 
 - **NPU module replacements**, selected by the recipe's `plan_overrides`: `*.input_layernorm`,
   `*.post_attention_layernorm` and `model.norm` use the fused `RMSNorm`; `*.self_attn` uses `DeepseekV32DSAAttention`,
-  which runs the indexer and the sparse attention through CANN fused operators; `*.mlp.experts` uses `GroupedExperts`.
+  which runs the indexer and the sparse attention through CANN fused operators; `*.mlp.experts` selects the
+  [routed expert family](../../components/modules/moe/grouped_experts/README.md).
 - **Parallelism**: FSDP, TP (with loss parallelism), CP and EP. PP and sequence parallelism are not supported.
 - **Training behavior** follows the Transformers implementation:
   - the router selects experts with `e_score_correction_bias` (sigmoid scores, group-limited top-k), and the bias keeps
@@ -54,7 +55,9 @@ models/deepseek_v32/
 
 ## Requirements
 
-- Transformers with `deepseek_v32`: `requirements.txt` requires `transformers>=5.11.0`; validated with 5.13.1.
+- Transformers with `deepseek_v32`: `requirements.txt` requires `transformers>=5.11.0`; the existing native-model
+  validation record is 5.13.1. The new expert-family contract was checked against 5.13.1 source; this migration
+  has not repeated hardware numerical or distributed acceptance.
 - Ascend NPU with CANN and `cann_ops_transformer` for the DSA operators; see the
   [functional README](../../components/functional/README.md#deepseek-v32-dsa).
 - Weights: `from_pretrained` loads the released FP8 checkpoint directly (it is dequantized while reading) as well as BF16
@@ -75,22 +78,21 @@ Trailing arguments override YAML fields, for example `--training.train_iters=200
 
 ### Multiple devices
 
-Set the topology with command-line overrides. The recipe's `when: cp` entry enables the DSA context-parallel wrapper
-when `cp_size > 1`. For EP, add a `when: ep` entry that matches only the MoE layers, i.e. `model.layers.<i>.mlp.forward`
-for `i >= first_k_dense_replace` (layers 3–60 in the released config):
+Set the topology with command-line overrides. The recipe's `when: cp` entry enables the DSA CP wrapper.
+Both ordinary recipes select the expert family directly:
 
 ```yaml
 plan_overrides:
-  - match: "model.layers.[3-9].mlp.forward"
-    when: ep
+  - match: "*.mlp.experts"
     replace:
-      kind: method
+      kind: module
       implementation:
-        _target_: hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn
-        use_grouped_gemm: true
-        overlap_shared_expert: true
-  # Repeat the entry with match: "model.layers.[1-9][0-9].mlp.forward" for layers 10-60.
+        _target_: hyper_parallel.components.modules.GroupedExperts
 ```
+
+The family selects local/EP from the job mesh. Keep the native parent MoE forward for routing and shared experts;
+do not add the old `deepseekv3_ep_compute_fn` method replacement around this path. The ordinary EP path currently
+runs the shared branch in native order, without the old shared-expert overlap option.
 
 For example, eight devices with TP2 × CP2 × DP2 and EP4:
 
@@ -102,7 +104,7 @@ torchrun --standalone --nproc_per_node=8 \
   --fsdp_config.dp_shard_size=2 --fsdp_config.edp_shard_size=2
 ```
 
-Keep these constraints: `ep_size > 1` whenever `tp_size > 1`, because MoE layers shard experts only by EP;
+Expert matrices remain complete (ETP=1), with EP sharding only the expert dimension. Keep these constraints:
 `world_size = tp × cp × dp`; `n_routed_experts` divisible by `ep_size`; `global_batch_size` divisible by
 `micro_batch_size × dp`.
 

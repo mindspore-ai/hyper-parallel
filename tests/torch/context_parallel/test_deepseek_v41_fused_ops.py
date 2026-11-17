@@ -21,7 +21,7 @@ from tests.common.distributed_launcher import torchrun_case
 from tests.common.mark_utils import arg_mark
 
 
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_native_geometry_cp8_gloo():
     """Run the mixed-ratio Full/Reindex/Reuse regression on eight CPU ranks.

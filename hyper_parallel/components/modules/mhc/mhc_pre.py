@@ -115,6 +115,15 @@ class MhcPreModule(nn.Module):
         if self.mhc_use_gamma:
             nn.init.ones_(self.norm_gamma)
 
+    def make_transforms(self) -> list:
+        """Declare that this member keeps parameter names and layouts unchanged.
+
+        Returns:
+            An empty converter list, matching members whose initialization is
+            fully owned by ``reset_parameters``.
+        """
+        return []
+
     def forward(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:

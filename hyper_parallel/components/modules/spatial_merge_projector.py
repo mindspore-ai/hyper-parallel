@@ -59,11 +59,6 @@ class SpatialMergeProjectorModule(nn.Module):
                 or self.downsample_ratio < 1):
             raise ValueError("downsample_ratio must be a positive integer")
 
-    def reset_parameters(self) -> None:
-        """Initialize projections after direct meta construction."""
-        self.w1.reset_parameters()
-        self.w2.reset_parameters()
-
     def forward(self, hidden_states: Tensor, grid_height: int, grid_width: int) -> Tensor:
         """Pad one image grid, merge channel-major patches and project image-token rows."""
         if any(isinstance(size, bool) or not isinstance(size, int) or size < 1 for size in (grid_height, grid_width)):

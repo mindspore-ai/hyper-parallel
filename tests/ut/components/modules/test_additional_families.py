@@ -69,7 +69,9 @@ class TestAdditionalFamilies(unittest.TestCase):
         with torch.device("meta"):
             meta = SpatialMergeProjector(config=SpatialMergeProjectorConfig(3, 5, 5))
         meta.to_empty(device="cpu")
-        meta.reset_parameters()
+        for child in meta.modules():
+            if isinstance(child, nn.Linear):
+                child.reset_parameters()
         self.assertTrue(torch.isfinite(meta(inputs, 3, 5)).all())
 
     def test_rotary_scaling_axes_and_stateless_dynamic(self):

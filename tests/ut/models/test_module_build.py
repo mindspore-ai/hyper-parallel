@@ -14,7 +14,7 @@
 # ============================================================================
 """Real model construction, effective specs, atomic source conversion and codegen."""
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Optional
 import importlib
 from pathlib import Path
@@ -32,6 +32,7 @@ from hyper_parallel.components.modules.family import VariantRule
 from hyper_parallel.components.modules.module_family import get_family_build_info
 from hyper_parallel.models import HyperAutoModelForCausalLM, HyperAutoModelForSequenceClassification, registry
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
+from hyper_parallel.models.build_context import collect_module_contexts
 from hyper_parallel.models.module_build import (
     build_module_context, construct_family_model, resolve_effective_model_spec,
     prepare_model_components,
@@ -87,6 +88,116 @@ class TestModuleBuild(unittest.TestCase):
         model(x).sum().backward()
         torch.testing.assert_close(x.grad, torch.full((2, 4), 0.375))
         self.assertIs(type(model.projection), LocalLinear)
+
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
+        card_mark="onecard", essential_mark="essential",
+    )
+    def test_global_depth_is_available_during_model_construction(self) -> None:
+        """Feature: Model factories receive global depth before creating family modules.
+        Description: Construct through the public facade using a full model config.
+        Expectation: The factory and prepared model context retain the unpartitioned depth.
+        """
+        @dataclass(frozen=True)
+        class DeepModelConfig(FamilyModelConfig):
+            """Minimal model configuration with an explicit global depth."""
+
+            num_hidden_layers: int = 24
+
+        seen = []
+
+        def factory(config: FamilyModelConfig, *, context: Mapping[str, Any]) -> nn.Module:
+            """Observe depth before any model or family member has been constructed."""
+            seen.append(context["num_layers"])
+            return FamilyModel(config, context=context)
+
+        auto = importlib.import_module("hyper_parallel.models._transformers.auto_model")
+        with patch.object(auto, "_current_device", return_value=torch.device("cpu")):
+            model = HyperAutoModelForCausalLM.from_config(
+                DeepModelConfig(), model_factory=factory, torch_dtype=torch.float32,
+            )
+        self.assertEqual(seen, [24])
+        self.assertEqual(model._hp_module_build_context["num_layers"], 24)
+
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
+        card_mark="onecard", essential_mark="essential",
+    )
+    def test_owner_context_propagates_text_and_vision_depth_separately(self) -> None:
+        """Feature: One top-down pass propagates the nearest owning config.
+        Description: Share a leaf across text and vision owners beneath a multimodal model.
+        Expectation: Aliases receive path-specific immutable contexts and global depths.
+        """
+        root_config = SimpleNamespace(num_hidden_layers=99, text_config={"num_hidden_layers": 32})
+        root_config.get_text_config = lambda: root_config.text_config
+        root = nn.Module()
+        root.config = root_config
+        root.language = nn.Sequential(nn.Identity())
+        root.language.config = {"num_layers": 24}
+        root.vision = nn.Sequential(root.language[0])
+        root.vision.config = SimpleNamespace(num_hidden_layers=6)
+        root.unowned = nn.Identity()
+        context = build_module_context(config=root_config)
+
+        contexts = collect_module_contexts(root, context)
+
+        self.assertEqual(context["num_layers"], 32)
+        self.assertEqual(contexts["language.0"]["num_layers"], 24)
+        self.assertEqual(contexts["vision.0"]["num_layers"], 6)
+        self.assertEqual(contexts["unowned"]["num_layers"], 32)
+        self.assertEqual(contexts["language.0"]["module_configs"], (root.language.config, root_config))
+        self.assertEqual(contexts["unowned"]["module_configs"], (root_config,))
+        with self.assertRaises(TypeError):
+            contexts["language.0"]["num_layers"] = 1
+
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
+        card_mark="onecard", essential_mark="essential",
+    )
+    def test_owner_context_is_prepared_once_for_all_replacements(self) -> None:
+        """Feature: Replacement consumes the context map prepared by the model builder.
+        Description: Replace two leaves belonging to owners with different global depths.
+        Expectation: Both factories receive their owner depth without repeated tree traversal.
+        """
+        seen = {}
+
+        @module_replacement
+        def replace_identity(*, module: nn.Module, module_fqn: str, context: Mapping[str, Any]) -> nn.Module:
+            """Observe the fully propagated context without reading ancestor modules."""
+            del module
+            seen[module_fqn] = context
+            return nn.Identity()
+
+        model = nn.Module()
+        model.config = SimpleNamespace(num_hidden_layers=32)
+        model.first = nn.Sequential(nn.Identity())
+        model.second = nn.Sequential(nn.Identity())
+        model.second.config = SimpleNamespace(num_hidden_layers=16)
+        setup = SimpleNamespace(module_replacements=(
+            ModuleReplacementSpec(("first.0", "second.0"), replace_identity),
+        ))
+        builder = importlib.import_module("hyper_parallel.models.module_build")
+        with patch.object(builder, "collect_module_contexts", wraps=collect_module_contexts) as collect:
+            prepare_model_components(model, build_module_context(setup))
+        self.assertEqual(collect.call_count, 1)
+        self.assertEqual(seen["first.0"]["num_layers"], 32)
+        self.assertEqual(seen["second.0"]["num_layers"], 16)
+        self.assertEqual(seen["second.0"]["module_configs"], (model.second.config, model.config))
+
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
+        card_mark="onecard", essential_mark="essential",
+    )
+    def test_global_depth_rejects_invalid_configuration_before_construction(self) -> None:
+        """Feature: Global model depth is validated at the build-context boundary.
+        Description: Supply invalid text depths and an invalid inherited context depth.
+        Expectation: Invalid declarations fail before replacement or materialization.
+        """
+        for value in (0, -1, True, 1.5, "24"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "positive integer"):
+                build_module_context(config={"text_config": {"num_layers": value}})
+        with self.assertRaisesRegex(ValueError, "context num_layers"):
+            collect_module_contexts(nn.Identity(), {"num_layers": False})
 
     @arg_mark(
         plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",

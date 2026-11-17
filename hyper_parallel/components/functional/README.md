@@ -40,8 +40,11 @@ expert_outputs = experts(permuted_tokens, tokens_per_expert, routing_weights)
 output = moe_token_unpermute(expert_outputs, sorted_indices, routing_probs)
 ```
 
-In this example, `experts` is an instance of `hyper_parallel.components.modules.GroupedExperts`. It contains only local expert
-weights and computation; routing, expert-parallel communication, and shared experts remain outside the module.
+In this example, `experts` is an instance of the legacy
+`hyper_parallel.components.modules.grouped_experts.GroupedExperts`. It contains only local expert weights and computation;
+routing, expert-parallel communication, and shared experts remain outside the module.
+The public [GroupedExperts family](../modules/moe/grouped_experts/README.md) accepts token-level top-k routes and owns
+permutation, expert computation and local/EP transport.
 `hyper_parallel.components.modules.SharedExpert` provides the parameter-owning dense MLP used as a shared expert.
 
 ## Auxiliary-loss functions

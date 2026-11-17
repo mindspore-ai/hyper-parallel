@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     from hyper_parallel.components.modules.attention.gated_grouped_query_attention import (
         GatedGroupedQueryAttention,
     )
-    from hyper_parallel.components.modules.grouped_experts import GroupedExperts
+    from hyper_parallel.components.modules.moe.grouped_experts.grouped_experts_family import GroupedExperts
     from hyper_parallel.components.modules.linear import Linear
     from hyper_parallel.components.modules.mhc import MhcPostModule, MhcPreModule
     from hyper_parallel.components.modules.rms_norm import OffsetRMSNorm, RMSNorm
@@ -84,7 +84,7 @@ _EXPORT_TO_MODULE = {
     "GroupedQueryAttention": "attention.grouped_query_attention.grouped_query_attention_family",
     "GatedGroupedQueryAttention": "attention.gated_grouped_query_attention.gated_grouped_query_attention_family",
     "EngramModule": "engram",
-    "GroupedExperts": "grouped_experts",
+    "GroupedExperts": "moe.grouped_experts.grouped_experts_family",
     "Linear": "linear",
     "KimiDeltaAttention": "kimi_delta_attention",
     "KimiRMSNormGated": "kimi_delta_attention",

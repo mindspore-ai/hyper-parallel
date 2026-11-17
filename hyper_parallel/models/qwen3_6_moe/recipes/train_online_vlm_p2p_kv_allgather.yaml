@@ -61,13 +61,6 @@ plan_overrides:
       exact_type: true
       implementation:
         _target_: hyper_parallel.components.modules.GroupedExperts
-  - match: "model.language_model.layers.*.mlp.forward"
-    when: ep
-    replace:
-      kind: method
-      implementation:
-        _target_: hyper_parallel.models.qwen3_5_moe.adapter.distributed.expert_parallel.qwen3_5_moe_ep_compute_fn
-        use_grouped_gemm: true
   - match: "model.language_model.layers.*.linear_attn.forward"
     when: cp
     replace:

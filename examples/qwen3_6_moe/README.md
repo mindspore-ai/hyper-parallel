@@ -24,6 +24,10 @@
 
 高性能算子依赖 Triton-Ascend 和 torch-npu，相关软件版本需要匹配。
 
+当前四份普通专家训练配方使用 `modules.moe.grouped_experts` 新模块族，文本/图文模型均复用
+Transformers `Qwen3_5MoeExperts` 的 packed 接口；EP 运输由专家族负责，父 MoE 保留 router、共享专家和共享 gate。
+不再叠加旧 `qwen3_5_moe_ep_compute_fn` 方法替换。上表是原有示例的实测环境记录，本轮接口迁移尚未重跑多卡验收。
+
 安装与上述实测环境一致的算子相关 Python 包：
 
 ```bash

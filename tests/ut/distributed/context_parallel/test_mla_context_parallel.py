@@ -399,6 +399,30 @@ class TestMLAContextParallel(unittest.TestCase):
 class TestMLAModel(unittest.TestCase):
     """Exercise real decoder objects and the family-specific fused latent rules."""
 
+    def test_gated_unfused_source_checkpoint_roundtrip(self) -> None:
+        """Preserve inherited projection converters for an unfused HF gated NoPE source."""
+        model = make_deepseek_model()
+        gates = []
+        for layer in model.model.layers:
+            source = layer.self_attn
+            source.use_nope = source.use_output_gate = True
+            source.g_proj = torch.nn.Linear(source.config.hidden_size, source.num_heads * source.v_head_dim)
+            gates.append(source.g_proj)
+        original = deepcopy(model.state_dict())
+
+        model, transforms = replace_and_load_mla(model, factory=GatedMultiLatentAttention)
+
+        self.assertEqual(len(transforms), 2 * len(model.model.layers))
+        for layer, gate in zip(model.model.layers, gates):
+            self.assertIs(layer.self_attn.g_proj, gate)
+            self.assertTrue(hasattr(layer.self_attn, "linear_qkv"))
+            self.assertFalse(hasattr(layer.self_attn, "q_a_proj"))
+            self.assertEqual(len(layer.self_attn.make_transforms()), 2)
+        restored = revert_weight_conversion(model, model.state_dict())
+        self.assertEqual(set(restored), set(original))
+        for name, value in original.items():
+            torch.testing.assert_close(restored[name], value, atol=0, rtol=0)
+
     def test_family_construction_preserves_parameters_and_nope(self) -> None:
         """Feature: Family conversion preserves source parameter and position contracts.
 
