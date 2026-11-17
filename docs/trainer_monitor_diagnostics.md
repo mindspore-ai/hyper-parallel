@@ -62,14 +62,14 @@ console/W&B 没显示某个 rank 的明细时，先查它的 JSONL。需要复�
 
 ### Loss、梯度和优化器异常
 
-按需启用 `local_loss`、`local_grad_norm`；怀疑具体子树时设置 `local_grad_norm.modules`。
+按需启用 `local_loss`、`local_grad_norm`；后者每个 rank 汇总一个值，不按 module 拆分。
 先确认模块参与本步且未冻结，避免把无梯度当成梯度消失。
 
 | 看到的现象 | 提示用户可以怎么做 |
 | --- | --- |
 | total/foundation loss 突升 | 先对齐异常步的 lr、有效 token、目标组成，再用 `local_step_loss` 找 rank、`local_micro_loss` 找 micro-step；复现对应输入检查模板、标签和 packing，不能仅凭不同 rank 的 loss 不同判并行错误 |
 | micro loss 平稳但 step loss 不符合预期 | 用同一 loss 名称的 micro 原始均值与 token 数复算 `Σ(loss×tokens)/Σtokens`，检查零监督 micro 和 MTP 分支的分母；再对照 trainer 的全局加权，不能拿 micro 的算术平均替代 |
-| global grad norm 尖峰或持续触发裁剪 | 联查同一步 loss、有效 token 和 lr；按模块采集裁剪前 local norm 缩小范围，再用同输入复现检查第一个异常梯度。不同 FSDP 分片 norm 不要求相等，当前 local norm 也不是规约前梯度 |
+| global grad norm 尖峰或持续触发裁剪 | 联查同一步 loss、有效 token 和 lr；查看各 rank 裁剪前 local norm 的时间变化，再用同输入复现检查第一个异常梯度。不同 FSDP 分片 norm 不要求相等，当前 local norm 也不是规约前梯度 |
 | Muon 更新异常但 loss/梯度暂未异常 | 开启 `optimizer.ns_norm`，按 parameter/transform/call 对齐 `ns_norm`，核对矩阵形状、NS 参数及更新缩放；必要时对可疑矩阵离线复算。这个值取自 NS 后、缩放前，不能直接当成实际参数更新量 |
 
 ### EP 负载倾斜
@@ -124,7 +124,7 @@ host 阶段可以嵌套，不能相加当作设备时间；host 时间正常也�
 | micro-batch loss | 某个 micro-batch 脏数据、梯度累积权重异常 | token 分布、packing 边界、micro-step ID；不能直接对不等长 micro loss 取均值替代整步 loss |
 | router auxiliary loss | 路由均衡目标变化、辅助项尺度异常 | expert load/max_vio、辅助项系数与注入方式；该标量不直接说明 expert 物理负载，也可能仅供日志展示 |
 | global pre-clip grad norm | 梯度爆炸、更新尺度异常、裁剪频繁 | loss、lr、裁剪阈值、并行聚合范围；确认实现是否包含所有 PP stage/专家 |
-| local / module grad norm | 梯度消失、未参与训练的模块、局部异常梯度 | 参数是否冻结/参与本步、FSDP shard 大小与所有权；规约后本地分片不能冒充通信前梯度，不要求不同分片 norm 相等 |
+| local grad norm（每 rank 一个） | rank 本地梯度整体异常、梯度范数尖峰 | 参数是否冻结/参与本步、FSDP shard 大小与所有权；规约后本地分片不能冒充通信前梯度，不要求不同分片 norm 相等 |
 | post-clip norm（可用时） | 裁剪是否符合预期 | pre-clip norm、阈值和共享参数去重；区分实际测量与由裁剪系数推算 |
 | lr | warmup、调度器步数或 resume 恢复错误 | optimizer step、参数组、scheduler state；单个最大 lr 不代表所有组 |
 | step samples / consumed samples | 数据重复消费、漏计、续训计数断裂 | dataloader 游标、输入 hash；packed 行数与原始样本数分开，预取未训练数据不算消费 |

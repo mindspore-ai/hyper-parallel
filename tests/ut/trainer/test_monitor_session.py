@@ -33,7 +33,7 @@ from hyper_parallel.core.optimizer.muon import Muon
 from hyper_parallel.distributed.expert_parallel import experts as ep_experts
 from hyper_parallel.trainer.callbacks.checkpoint_callback import CheckpointerCallback
 from hyper_parallel.trainer.callbacks.environ_meter_callback import EnvironMeterCallback
-from hyper_parallel.trainer.config.monitor import MonitorConfig, SamplingConfig, GradientMonitorConfig
+from hyper_parallel.trainer.config.monitor import MonitorConfig, SamplingConfig
 from hyper_parallel.trainer.runtime.monitor.datasets import DatasetStatsRecorder
 from hyper_parallel.trainer.runtime.monitor.flops import BlockFlopsEstimator, DevicePeak, FlopsBlock, transformer_blocks
 from hyper_parallel.trainer.runtime.monitor.output import OutputWriter, json_value
@@ -90,21 +90,30 @@ class TestMonitorSession(unittest.TestCase):
         self.assertEqual(steps[0]["loss"], 3.0)
         self.assertEqual(steps[0]["tokens"], 3.0)
 
-    def test_gradient_main_grad_and_subtree(self) -> None:
+    def test_gradient_main_grad_across_modules(self) -> None:
         """Feature: Local norm. Description: Prefer main_grad. Expectation: No mutation or collective."""
-        self.config.local_grad_norm = GradientMonitorConfig(True, 1, ["0"])
+        self.config.local_grad_norm = SamplingConfig(True, 1)
+        self.model.append(torch.nn.Linear(2, 2, bias=False))
         self.session.bind_model()
         parameter = self.model[0].weight
         parameter.grad = torch.ones_like(parameter)
         parameter.main_grad = torch.full_like(parameter, 2.0)
+        self.model[1].weight.grad = torch.full_like(self.model[1].weight, 3.0)
         self.session.begin_step(1)
         with patch("torch.distributed.all_reduce") as collective:
             self.session.record_gradients()
         collective.assert_not_called()
-        record = next(r for r in self.records() if r["event"] == "local_grad_norm")
-        self.assertAlmostEqual(record["values"][0], 24**0.5, places=5)
+        records = [r for r in self.records() if r["event"] == "local_grad_norm"]
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record["rank"], 0)
+        self.assertEqual(record["scope"], "rank")
+        self.assertNotIn("module", record)
+        self.assertEqual(record["parameter_count"], 2)
+        self.assertAlmostEqual(record["values"][0], 60**0.5, places=5)
         torch.testing.assert_close(parameter.grad, torch.ones_like(parameter))
         torch.testing.assert_close(parameter.main_grad, torch.full_like(parameter, 2.0))
+        torch.testing.assert_close(self.model[1].weight.grad, torch.full_like(self.model[1].weight, 3.0))
 
     def test_disabled_moe_skips_expert_registration_and_collection(self) -> None:
         """Disabled EP diagnostics must not impose recorder capacity on model startup."""

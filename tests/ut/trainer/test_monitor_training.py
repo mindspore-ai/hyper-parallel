@@ -234,17 +234,17 @@ class TestMonitorTraining(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level1",
               card_mark="dryrun", essential_mark="essential")
-    def test_hybrid_sampling_modules_and_disabled_data_fields(self) -> None:
+    def test_hybrid_sampling_and_disabled_data_fields(self) -> None:
         """Feature: Monitor sampling.
-        Description: Configure independent cadences and select one hybrid-model layer.
-        Expectation: Exact sampled steps, selected module and disabled-field absence.
+        Description: Configure independent cadences for whole-rank gradient monitoring.
+        Expectation: Exact sampled steps, one norm per rank and disabled-field absence.
         """
         def configure(base: BaseTrainer) -> None:
             """Select sampling cadences and disable optional dataset fields."""
             config = base.config.monitor
             config.timing = False
             config.local_loss = SamplingConfig(True, 2)
-            config.local_grad_norm = replace(config.local_grad_norm, sampler_steps=3, modules=["model.layers.0"])
+            config.local_grad_norm = replace(config.local_grad_norm, sampler_steps=3)
             config.datasets = replace(config.datasets, sampler_steps=5, token_distribution=False,
                                       top_n_tokens=0, packing_stats=False, packing_boundary_check=False)
 
@@ -257,7 +257,8 @@ class TestMonitorTraining(unittest.TestCase):
                 self.assertEqual([r["step"] for r in records if r["event"] == event], list(steps))
         for record in records:
             if record["event"] == "local_grad_norm":
-                self.assertEqual(record["module"], "model.layers.0")
+                self.assertEqual(record["scope"], "rank")
+                self.assertNotIn("module", record)
                 self.assertGreater(record["values"][0], 0)
             if record["event"] == "datasets":
                 absent = {"input_lengths", "top_tokens", "padding_fraction", "packing_failures"}
@@ -279,7 +280,6 @@ class TestMonitorTraining(unittest.TestCase):
         def configure(base: BaseTrainer) -> None:
             """Capture source batches and disable clipping for independent norm checks."""
             base.config.training.max_grad_norm = 0
-            base.config.monitor.local_grad_norm.modules = ["model.layers.0"]
 
             def get_batch(iterator: object) -> tuple[dict, dict]:
                 """Record each source batch before the trainer consumes it."""
@@ -294,9 +294,8 @@ class TestMonitorTraining(unittest.TestCase):
 
         def capture_norm(session: MonitorSession, gradient_views: dict | None = None) -> None:
             """Compare the recorder against an independent concatenated FP64 norm."""
-            values = [parameter.grad.detach().double().reshape(-1) for name, parameter in
-                      session.trainer.model.named_parameters() if name.startswith("model.layers.0.")
-                      and parameter.grad is not None]
+            values = [parameter.grad.detach().double().reshape(-1)
+                      for parameter in session.trainer.model.parameters() if parameter.grad is not None]
             expected_norms.append(torch.cat(values).norm().item())
             original(session, gradient_views)
 

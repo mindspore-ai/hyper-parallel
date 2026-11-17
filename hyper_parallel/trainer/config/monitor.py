@@ -30,20 +30,6 @@ class SamplingConfig:
 
 
 @dataclass
-class GradientMonitorConfig(SamplingConfig):
-    """Select parameter subtrees for local post-reduction L2 norms."""
-
-    modules: list[str] = field(default_factory=list)
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        if len(set(self.modules)) != len(self.modules) or any(
-            not isinstance(name, str) or not name or name.strip(".") != name for name in self.modules
-        ):
-            raise ValueError("local_grad_norm.modules requires unique nonempty module paths")
-
-
-@dataclass
 class ExpertMonitorConfig(SamplingConfig):
     """Collect routing assignments without altering expert-bias updates."""
 
@@ -101,7 +87,7 @@ class MonitorConfig:
     mfu: bool = False
     wandb: MonitorWandbConfig = field(default_factory=MonitorWandbConfig)
     local_loss: SamplingConfig = field(default_factory=SamplingConfig)
-    local_grad_norm: GradientMonitorConfig = field(default_factory=GradientMonitorConfig)
+    local_grad_norm: SamplingConfig = field(default_factory=SamplingConfig)
     moe: ExpertMonitorConfig = field(default_factory=ExpertMonitorConfig)
     optimizer: OptimizerMonitorConfig = field(default_factory=OptimizerMonitorConfig)
     datasets: DatasetMonitorConfig = field(default_factory=DatasetMonitorConfig)

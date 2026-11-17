@@ -55,7 +55,7 @@ flowchart TB
 
 ### YAML
 
-以下是完整默认配置。只暴露功能开关、采样频次和必要筛选，不提供内部 recorder 的配置项。
+以下是完整默认配置。只暴露功能开关、采样频次和输出设置，不提供内部 recorder 的配置项。
 
 ```yaml
 monitor:
@@ -73,7 +73,6 @@ monitor:
   local_grad_norm:
     enabled: false
     sampler_steps: 100
-    modules: []  # 整体；非空时选择 module 参数子树，包含其中的 expert
   moe:
     enabled: false
     sampler_steps: 100
@@ -92,7 +91,7 @@ monitor:
 ```
 
 - `sampler_steps` 统一表示采集间隔；基础日志沿用外部 `training.logging_steps`，monitor 不重复定义输出频次。
-- `local_loss` 是整体 loss，不配置 module；只有 local grad norm 接受 module 子树筛选。
+- `local_loss` 是整体 loss；`local_grad_norm` 每个 rank 只有一个值，均不配置 module。
 - 持有数据的 rank 都参与采集，不增加 `ranks` 或 `include_children` 开关；不持有 loss 的 PP stage 不制造 loss。
 - `training.log_tflops` 控制已有 TFLOP/s 输出，`monitor.mfu` 控制 MFU；两者复用标准块估算。
 - W&B 只有显式加入 sinks 才启动；entity/run ID 等实验管理信息复用外部入口。
@@ -104,7 +103,7 @@ monitor:
 | 基础日志 | total/foundation/router AUX loss、lr、global grad norm；观察收敛与异常 | 保留既有全局聚合语义，LoggingCallback 不重新算指标 | 同一 step 无重复基础日志；全局 AUX 不被 rank-local 值覆盖 |
 | 分块耗时 | 组网、模型/数据构建、权重加载/保存、checkpoint、训练各阶段；定位等待与保存阻塞 | 主机墙钟，嵌套阶段不相加；不新增逐块设备同步 | 成功/失败都有记录；异步完成仍属于提交 step |
 | Local/micro loss | 规约前 micro loss、token 加权 step loss；定位脏数据与 rank/micro 差异 | loss 计算后、全局规约前显式采集，不改变 backward loss，不新增通信 | 不等长 micro 加权正确；零分母不可用；监控开关前后参数一致 |
-| Local grad norm | 当前 rank / module 的本地分片 L2；定位梯度异常 | Partial 规约后、clip 前；优先 main_grad，复用裁剪视图，包含选中 expert | 不修改梯度；不增加 collective；没有规约后视图时明确不可用 |
+| Local grad norm | 当前 rank 全部有梯度的可训练参数的本地分片 L2；定位梯度异常 | Partial 规约后、clip 前；优先 main_grad，复用裁剪视图，包含本地 expert 参数 | 不修改梯度；不增加 collective；没有规约后视图时明确不可用 |
 | datasets | 本 step token 长度分布、Top-N、packing 与边界；定位样本异常、低填充与跨样本监督错误 | CPU 源 batch，CP/H2D 前；合并全部 micro 后取 Top-N | 对齐 shift/IGNORE_INDEX/loss_mask/EOD；不分配 S×S mask；缺 metadata 不报成功 |
 | EP | expert assignment、max/mean、max_vio、空 expert、drop、可选分布；定位路由倾斜 | ExpertLoadRecorder 固定层序；只记录真实 forward，按布局规约 | top-k 计数守恒；重计算不重复；未执行层不可用；本地之和与全局一致 |
 | Muon NS | NS 后、LR/RMS 缩放前的逐矩阵 Frobenius norm；定位优化器更新尺度异常 | 显式插在优化器内部，保留 parameter/transform/call 归属 | norm 与独立复算相符，不保留完整更新 tensor，不改变权重更新 |

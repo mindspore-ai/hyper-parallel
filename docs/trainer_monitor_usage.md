@@ -22,7 +22,6 @@ monitor:
   local_grad_norm:
     enabled: true
     sampler_steps: 100
-    modules: []
   moe:
     enabled: true
     sampler_steps: 100
@@ -57,7 +56,7 @@ monitor:
 | 功能 | 接入位置 | 口径与限制 |
 | --- | --- | --- |
 | Local/micro loss | `BaseTrainer.postforward`，全局加权前 | 原始 micro 均值；step 用有效 token 加权；零分母不可用 |
-| Local grad norm | `clip_grad_norm_`，Partial 规约后、裁剪前 | 复用 norm 输入视图；L2、本地分片、含选中子树 expert；没有新增规约 |
+| Local grad norm | `clip_grad_norm_`，Partial 规约后、裁剪前 | 复用 norm 输入视图；每 rank 一个 L2，覆盖本地全部有梯度的可训练参数，包含 expert；没有新增规约 |
 | 不启用裁剪时的 local norm | `BaseTrainer.clip_grad_norm` | 读取已有 main_grad/grad；未完成 Partial 的值不冒充 post-reduce |
 | EP | 共享 `MoE.forward`，原生 EP 的 `ep_routed_forward` / `ep_routed_dispatch` | `ExpertLoadRecorder` 固定注册全部层；真实 forward 计数，backward 重计算不计数 |
 | Muon NS | `Muon._compute_batched_ns_outputs_for_tensors` | NS 后、学习率/RMS 缩放前的矩阵 Frobenius norm；保留 parameter、transform、call 与 matrix 范围 |

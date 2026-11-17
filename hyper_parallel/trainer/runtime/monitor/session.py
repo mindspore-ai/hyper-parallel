@@ -80,7 +80,7 @@ class MonitorSession:
         self.names = {}
         self.parameter_names = {}
         self.ns_tensor_names = {}
-        self.gradient_parameters = {}
+        self.gradient_parameters = []
         self.losses = {}
         self.ns_calls = 0
         self.estimator = None
@@ -113,14 +113,9 @@ class MonitorSession:
                         if reference is None:
                             reference = next(module.parameters())
                         self.expert_recorder.register(name or "<root>", module.monitor_expert_count, reference.device)
-            self.gradient_parameters = {
-                prefix: [
-                    (name, parameter)
-                    for name, parameter in self.trainer.model.named_parameters()
-                    if parameter.requires_grad and (not prefix or name.startswith(prefix + "."))
-                ]
-                for prefix in self.config.local_grad_norm.modules or [""]
-            }
+            self.gradient_parameters = [
+                parameter for parameter in self.trainer.model.parameters() if parameter.requires_grad
+            ]
             if self.config.mfu or self.trainer.config.training.log_tflops:
                 self.estimator = model_blocks(self.trainer.model, getattr(self.trainer, "model_config", None))
             peak_spec = os.environ.get("HYPER_PARALLEL_MONITOR_PEAK")
@@ -315,50 +310,43 @@ class MonitorSession:
         """Compute local shard L2 after reduction and before clipping, without collectives."""
         if not self.sampled(self.config.local_grad_norm):
             return
-        selected = self.config.local_grad_norm.modules or [""]
-        buckets = defaultdict(list)
-        counts = defaultdict(int)
-        for prefix, parameters in self.gradient_parameters.items():
-            for _, parameter in parameters:
-                grad = (
-                    gradient_views.get(id(parameter))
-                    if gradient_views is not None
-                    else getattr(parameter, "main_grad", None)
-                )
-                if grad is None and gradient_views is None:
-                    grad = parameter.grad
-                if grad is None:
-                    continue
-                placements = getattr(grad, "placements", ())
-                if gradient_views is None and any(placement.is_partial() for placement in placements):
-                    self.unavailable("local_grad_norm", "Partial gradient has no reduced view without clipping")
-                    return
-                local = getattr(grad, "_local_tensor", grad)
-                if local.is_sparse:
-                    local = local.coalesce().values()
-                buckets[prefix].append(torch.linalg.vector_norm(local.detach(), dtype=torch.float32))
-                counts[prefix] += 1
-        for prefix in selected:
-            if not buckets[prefix]:
-                self._emit("unavailable", metric="local_grad_norm", module=prefix or "<root>",
-                           reason="no local gradients")
+        norms = []
+        for parameter in self.gradient_parameters:
+            grad = (
+                gradient_views.get(id(parameter))
+                if gradient_views is not None
+                else getattr(parameter, "main_grad", None)
+            )
+            if grad is None and gradient_views is None:
+                grad = parameter.grad
+            if grad is None:
                 continue
-            by_device = defaultdict(list)
-            for norm in buckets[prefix]:
-                by_device[norm.device].append(norm)
-            for device, norms in by_device.items():
-                summary = torch.linalg.vector_norm(torch.stack(norms)).reshape(1)
-                self._submit(
-                    "local_grad_norm",
-                    summary,
-                    {
-                        "module": prefix or "<root>",
-                        "device": str(device),
-                        "parameter_count": counts[prefix],
-                        "norm_type": 2,
-                        "stage": "post_reduce_pre_clip",
-                    },
-                )
+            placements = getattr(grad, "placements", ())
+            if gradient_views is None and any(placement.is_partial() for placement in placements):
+                self.unavailable("local_grad_norm", "Partial gradient has no reduced view without clipping")
+                return
+            local = getattr(grad, "_local_tensor", grad)
+            if local.is_sparse:
+                local = local.coalesce().values()
+            norms.append(torch.linalg.vector_norm(local.detach(), dtype=torch.float32))
+        if not norms:
+            self.unavailable("local_grad_norm", "no local gradients")
+            return
+        device = norms[0].device
+        summary = torch.linalg.vector_norm(
+            torch.stack([norm.to(device=device, non_blocking=True) for norm in norms])
+        ).reshape(1)
+        self._submit(
+            "local_grad_norm",
+            summary,
+            {
+                "scope": "rank",
+                "device": str(device),
+                "parameter_count": len(norms),
+                "norm_type": 2,
+                "stage": "post_reduce_pre_clip",
+            },
+        )
 
     def _submit(self, kind: str, tensor: torch.Tensor, metadata: dict) -> None:
         event = {"event": kind, "step": self.step, **metadata}
