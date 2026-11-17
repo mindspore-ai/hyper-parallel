@@ -14,6 +14,8 @@
 # ============================================================================
 """Unit tests for hyper_parallel.core.dtensor.init_weights."""
 
+import sys
+import types
 import unittest
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
@@ -85,6 +87,169 @@ class TestInitEmptyWeights(unittest.TestCase):
                                      "Nested or exceptional construction must preserve caller state")
         finally:
             torch.utils.deterministic.fill_uninitialized_memory = original_fill
+
+    @patch(_INIT_ON_DEVICE_TARGET, MagicMock(side_effect=_fake_init_on_device))
+    def test_preserves_independent_npu_fill_policy(self):
+        """Feature: Empty parameter initialization alongside torch_npu's asymmetric fill patch.
+
+        Description: Simulate torch_npu's setter-only property patch under default NPU False,
+            explicit NPU True (normal and exception exit), nested contexts, and lazy torch_npu import.
+        Expectation: Preserve Torch's fill_uninitialized_memory and NPU's independent fill flag.
+        """
+        det_mod = torch.utils.deterministic
+        det_cls = type(det_mod)
+        orig_prop = getattr(det_cls, "fill_uninitialized_memory")
+        orig_fget = orig_prop.fget
+        orig_fset = orig_prop.fset
+        orig_torch_fill = det_mod.fill_uninitialized_memory
+        real_npu_c = getattr(sys.modules.get("torch_npu"), "_C", None)
+        real_npu_getter = getattr(real_npu_c, "_npu_get_fill_uninitialized_memory", None)
+        real_npu_setter = getattr(real_npu_c, "_npu_set_fill_uninitialized_memory", None)
+        orig_real_npu_fill = bool(real_npu_getter()) if callable(real_npu_getter) else None
+        npu_state = {"fill": False}
+
+        def _get_npu_fill() -> bool:
+            return npu_state["fill"]
+
+        def _set_npu_fill(mode: bool) -> None:
+            npu_state["fill"] = bool(mode)
+
+        fake_c = types.SimpleNamespace(
+            _npu_get_fill_uninitialized_memory=_get_npu_fill,
+            _npu_set_fill_uninitialized_memory=_set_npu_fill,
+        )
+        fake_torch_npu = types.ModuleType("torch_npu")
+        fake_torch_npu._C = fake_c
+
+        def _patched_fset(self, mode):
+            orig_fset(self, mode)
+            fake_c._npu_set_fill_uninitialized_memory(mode)
+
+        try:
+            setattr(det_cls, "fill_uninitialized_memory", property(orig_fget, _patched_fset))
+
+            with patch.dict(sys.modules, {"torch_npu": fake_torch_npu}):
+                with self.subTest(case="default_npu_false"):
+                    orig_fset(det_mod, True)
+                    npu_state["fill"] = False
+                    with init_weights_module.init_empty_weights():
+                        self.assertFalse(
+                            det_mod.fill_uninitialized_memory,
+                            f"Torch fill policy must be False inside context, got={det_mod.fill_uninitialized_memory}",
+                        )
+                        self.assertFalse(
+                            npu_state["fill"],
+                            f"NPU fill flag must be False inside context, got={npu_state['fill']}",
+                        )
+                    self.assertTrue(
+                        det_mod.fill_uninitialized_memory,
+                        f"Torch fill policy must restore to True, got={det_mod.fill_uninitialized_memory}",
+                    )
+                    self.assertFalse(
+                        npu_state["fill"],
+                        f"Default NPU fill flag must stay False on exit, got={npu_state['fill']}",
+                    )
+
+                for raise_in_ctx in (False, True):
+                    with self.subTest(case="explicit_npu_true", raise_in_ctx=raise_in_ctx):
+                        det_mod.fill_uninitialized_memory = True
+                        self.assertTrue(
+                            npu_state["fill"],
+                            f"Precondition NPU fill flag must be True, got={npu_state['fill']}",
+                        )
+                        if raise_in_ctx:
+                            with self.assertRaisesRegex(RuntimeError, "boom"):
+                                with init_weights_module.init_empty_weights():
+                                    self.assertFalse(
+                                        npu_state["fill"],
+                                        f"NPU fill flag must suspend to False, got={npu_state['fill']}",
+                                    )
+                                    raise RuntimeError("boom")
+                        else:
+                            with init_weights_module.init_empty_weights():
+                                self.assertFalse(
+                                    npu_state["fill"],
+                                    f"NPU fill flag must suspend to False, got={npu_state['fill']}",
+                                )
+                        self.assertTrue(
+                            det_mod.fill_uninitialized_memory,
+                            f"Torch fill policy must restore to True, got={det_mod.fill_uninitialized_memory}",
+                        )
+                        self.assertTrue(
+                            npu_state["fill"],
+                            f"Explicit NPU fill flag must restore to True, got={npu_state['fill']}",
+                        )
+
+                for initial_npu_fill in (False, True):
+                    for raise_in_inner in (False, True):
+                        with self.subTest(
+                            case="nested_npu_state",
+                            initial_npu_fill=initial_npu_fill,
+                            raise_in_inner=raise_in_inner,
+                        ):
+                            orig_fset(det_mod, True)
+                            npu_state["fill"] = initial_npu_fill
+                            if raise_in_inner:
+                                with self.assertRaisesRegex(RuntimeError, "nested boom"):
+                                    with init_weights_module.init_empty_weights():
+                                        with init_weights_module.init_empty_weights():
+                                            self.assertFalse(
+                                                det_mod.fill_uninitialized_memory,
+                                                "Torch fill policy must be False inside nested context, "
+                                                f"got={det_mod.fill_uninitialized_memory}",
+                                            )
+                                            self.assertFalse(
+                                                npu_state["fill"],
+                                                "NPU fill flag must be False inside nested context, "
+                                                f"got={npu_state['fill']}",
+                                            )
+                                            raise RuntimeError("nested boom")
+                            else:
+                                with init_weights_module.init_empty_weights():
+                                    with init_weights_module.init_empty_weights():
+                                        self.assertFalse(
+                                            det_mod.fill_uninitialized_memory,
+                                            "Torch fill policy must be False inside nested context, "
+                                            f"got={det_mod.fill_uninitialized_memory}",
+                                        )
+                                        self.assertFalse(
+                                            npu_state["fill"],
+                                            "NPU fill flag must be False inside nested context, "
+                                            f"got={npu_state['fill']}",
+                                        )
+                            self.assertTrue(
+                                det_mod.fill_uninitialized_memory,
+                                f"Torch fill policy must restore to True, got={det_mod.fill_uninitialized_memory}",
+                            )
+                            self.assertEqual(
+                                npu_state["fill"],
+                                initial_npu_fill,
+                                f"Nested context must preserve NPU fill flag: "
+                                f"expected={initial_npu_fill}, got={npu_state['fill']}",
+                            )
+
+            with self.subTest(case="lazy_torch_npu_import_inside_context"):
+                setattr(det_cls, "fill_uninitialized_memory", orig_prop)
+                det_mod.fill_uninitialized_memory = True
+                npu_state["fill"] = False
+                with patch.dict(sys.modules, clear=False):
+                    sys.modules.pop("torch_npu", None)
+                    with init_weights_module.init_empty_weights():
+                        sys.modules["torch_npu"] = fake_torch_npu
+                        setattr(det_cls, "fill_uninitialized_memory", property(orig_fget, _patched_fset))
+                self.assertTrue(
+                    det_mod.fill_uninitialized_memory,
+                    f"Torch fill policy must restore to True, got={det_mod.fill_uninitialized_memory}",
+                )
+                self.assertFalse(
+                    npu_state["fill"],
+                    f"Lazily imported torch_npu default False flag must stay False, got={npu_state['fill']}",
+                )
+        finally:
+            setattr(det_cls, "fill_uninitialized_memory", orig_prop)
+            det_mod.fill_uninitialized_memory = orig_torch_fill
+            if orig_real_npu_fill is not None and callable(real_npu_setter):
+                real_npu_setter(orig_real_npu_fill)
 
     @patch(_INIT_ON_DEVICE_TARGET, MagicMock(side_effect=_fake_init_on_device))
     def test_default_include_buffers_false(self):
