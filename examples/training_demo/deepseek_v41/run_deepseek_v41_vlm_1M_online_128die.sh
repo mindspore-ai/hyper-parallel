@@ -31,7 +31,7 @@ PYTHON_BIN=${PYTHON_BIN:-/usr/bin/python}
 NNODES=${NNODES:-8}
 NPROC_PER_NODE=${NPROC_PER_NODE:-16}
 NODE_RANK=${NODE_RANK:?Use the cluster controller or set NODE_RANK}
-MASTER_ADDR=${MASTER_ADDR}
+MASTER_ADDR=${MASTER_ADDR:-}
 MASTER_PORT=${MASTER_PORT:-29500}
 NODE_ADDR=${NODE_ADDR:?Set NODE_ADDR to the reachable hostfile IP of this node}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-1}
@@ -39,24 +39,29 @@ mkdir -p "${OUTPUT_DIR}"
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 
+# shellcheck source=/dev/null
 source /usr/local/Ascend/cann/set_env.sh
+# shellcheck source=/dev/null
 source /usr/local/Ascend/cann-9.2.0/opp/vendors/omni_training_custom_transformer/bin/set_env.bash
 
 export ASCEND_CUSTOM_OPP_PATH="/usr/local/Ascend/cann-9.2.0/opp/vendors/custom_transformer${ASCEND_CUSTOM_OPP_PATH:+:${ASCEND_CUSTOM_OPP_PATH}}"
 export LD_LIBRARY_PATH="/usr/local/Ascend/cann-9.2.0/opp/vendors/custom_transformer/op_api/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export PYTHONPATH="/workspace/venv/lib/python3.12/site-packages${PYTHONPATH:+:${PYTHONPATH}}"
 
-source build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
-
-set -u
-
-export PATH="$(dirname "${PYTHON_BIN}"):${PATH}"
+PYTHON_BIN=$(command -v "${PYTHON_BIN}")
+PATH="$(dirname "${PYTHON_BIN}"):${PATH}"
+export PATH
 
 TRAINER_SITE_PACKAGES=$("${PYTHON_BIN}" -c 'import sysconfig; print(sysconfig.get_path("purelib"))')
 case "${PYTHONPATH:-}" in
     "${TRAINER_SITE_PACKAGES}" | "${TRAINER_SITE_PACKAGES}":*) ;;
     *) export PYTHONPATH="${TRAINER_SITE_PACKAGES}${PYTHONPATH:+:${PYTHONPATH}}" ;;
 esac
+# shellcheck source=/dev/null
+source "$(command -v hyper_multicore_set_env.bash)"
+
+set -u
+
 "${PYTHON_BIN}" - <<'PY'
 import importlib.util
 import sys

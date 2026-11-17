@@ -141,7 +141,7 @@ replace:
                 expected_indices = torch.tensor([[0, 2], [4, 6], [1, 3], [5, 7]]) if fixed else expected_indices
                 torch.testing.assert_close(module.experts.call_args.args[1], expected_indices)
                 torch.testing.assert_close(module.experts.call_args.args[2], expected_weights)
-                module.experts.configure.assert_called_once_with(ep_mesh.get_group.return_value, 4, 2)
+                module.experts.configure.assert_called_once_with(ep_mesh.get_group.return_value, 2)
 
     def test_megamoe_preserves_expert_shared_and_auxiliary_gradients(self) -> None:
         """
@@ -189,7 +189,7 @@ replace:
                 module=module, mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=None, fix_router=fixed,
             )
             actual = compute(module, hidden, image_mask=images)
-        configure.assert_called_once_with(None, 1, 2)
+        configure.assert_called_once_with(None, 2)
         _, weights, indices = reference_gate(reference_states, image_mask=images)
         if fixed:
             indices = torch.arange(tokens * 2).view(tokens, 2) % 4

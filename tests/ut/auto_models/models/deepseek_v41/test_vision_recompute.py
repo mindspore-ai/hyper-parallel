@@ -24,10 +24,9 @@ from unittest.mock import Mock, patch
 import torch
 from torch import nn
 from torch.utils.checkpoint import DefaultDeviceType
+from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4HyperConnection
 
 from hyper_parallel.core.activation_memory.wrapper import CheckpointWrapper
-from hyper_parallel.core.multicore.modules.mega_gate.module import MegaGate
-from hyper_parallel.core.multicore.modules.mega_mhc.module import MegaMhc
 from hyper_parallel.distributed.activation_checkpoint import _apply_activation_checkpointing
 from hyper_parallel.distributed.encoder_parallel.attention import (
     EncoderAttentionContext,
@@ -37,6 +36,12 @@ from hyper_parallel.distributed.encoder_parallel.attention import (
 )
 from hyper_parallel.models._transformers.model_builder import validate_model_init_dtype
 from hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel import DeepseekV41VisionBridge
+from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_gate import DeepseekV41MegaGate
+from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import DeepseekV41HyperMegaMhc
+from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
+    DeepseekV41PipelinedHyperConnection,
+    DeepseekV41TopKRouter,
+)
 from hyper_parallel.models.deepseek_v41.vision import DeepseekV41VisionTower, _vision_attention
 
 
@@ -227,16 +232,35 @@ class TestFusedModulePrecision(unittest.TestCase):
     def test_bf16_conversion_preserves_declared_fp32_parameters(self) -> None:
         """Feature: BF16 model validation with fused-module FP32 parameters.
 
-        Description: Convert real MegaGate and MegaMhc modules, then corrupt a declared bias.
+        Description: Convert real Gate and MHC adapters, then corrupt their FP32 parameters.
         Expectation: Correct mixed state passes and the corrupted FP32 declaration is rejected.
         """
         model = nn.Module()
-        model.gate = MegaGate(hidden_size=128, num_experts=4, top_k=2,
-                              scoring_func="softmax", routed_scaling_factor=1.0, vision_enabled=True)
-        model.mhc = MegaMhc(hidden_size=128)
+        config = SimpleNamespace(
+            hidden_size=128, num_local_experts=4, num_experts_per_tok=2,
+            scoring_func="softmax", routed_scaling_factor=1.0, v41_vision_enabled=True,
+            initializer_range=0.02, hc_mult=4, hc_sinkhorn_iters=20,
+            hc_eps=1.0e-6, rms_norm_eps=1.0e-6,
+        )
+        model.gate = DeepseekV41MegaGate(
+            module=DeepseekV41TopKRouter(config), module_fqn="gate", context={},
+        )
+        source_mhc = DeepseekV41PipelinedHyperConnection(DeepseekV4HyperConnection(config))
+        for parameter in source_mhc.parameters():
+            nn.init.normal_(parameter, std=0.02)
+            parameter.grad = torch.randn_like(parameter)
+        model.mhc = DeepseekV41HyperMegaMhc(module=source_mhc, module_fqn="mhc", context={})
+        for name, parameter in source_mhc.named_parameters():
+            self.assertIs(dict(model.mhc.named_parameters())[name], parameter)
+        values = {name: parameter.detach().clone() for name, parameter in model.mhc.named_parameters()}
+        gradients = {name: parameter.grad.clone() for name, parameter in model.mhc.named_parameters()}
         identities = {name: id(parameter) for name, parameter in model.named_parameters()}
         model.to(dtype=torch.bfloat16)
         validate_model_init_dtype(model, "bfloat16")
+        self.assertEqual(model.mhc.fp32_parameter_names, ("fn", "base", "scale"))
+        for name, parameter in model.mhc.named_parameters():
+            torch.testing.assert_close(parameter, values[name], rtol=0, atol=0)
+            torch.testing.assert_close(parameter.grad, gradients[name], rtol=0, atol=0)
         for name, module in model.named_children():
             for local_name, parameter in module.named_parameters():
                 expected = torch.float32 if local_name in module.fp32_parameter_names else torch.bfloat16
@@ -244,4 +268,8 @@ class TestFusedModulePrecision(unittest.TestCase):
                 self.assertEqual(id(parameter), identities[f"{name}.{local_name}"])
         model.gate.bias.data = model.gate.bias.data.to(torch.bfloat16)
         with self.assertRaisesRegex(RuntimeError, "gate.bias"):
+            validate_model_init_dtype(model, "bfloat16")
+        model.gate.bias.data = model.gate.bias.data.float()
+        model.mhc.base.data = model.mhc.base.data.to(torch.bfloat16)
+        with self.assertRaisesRegex(RuntimeError, "mhc.base"):
             validate_model_init_dtype(model, "bfloat16")

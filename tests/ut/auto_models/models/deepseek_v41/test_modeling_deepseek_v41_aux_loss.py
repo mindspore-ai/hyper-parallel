@@ -506,7 +506,7 @@ class TestV41MegaMoeAuxLoss(unittest.TestCase):
                         else:
                             self.assertIsNone(router.last_aux_loss)
                         self.assertEqual(router.tokens_per_expert.sum().item(), 6 if rate else 0)
-                        experts.configure.assert_called_once_with(None, 1, 2)
+                        experts.configure.assert_called_once_with(None, 2)
 
     def test_megamoe_aligns_tp_metadata_and_statistics_groups(self) -> None:
         """Align all metadata and preserve separate sequence and bias domains.

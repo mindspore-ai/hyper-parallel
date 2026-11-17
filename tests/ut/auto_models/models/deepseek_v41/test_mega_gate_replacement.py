@@ -21,7 +21,8 @@ from unittest.mock import patch
 
 import torch
 
-from hyper_parallel.core.multicore.modules.mega_gate import function as gate_function
+from hyper_multicore.modules.mega_gate import function as gate_function
+
 from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_gate import (
     DeepseekV41MegaGate,
 )

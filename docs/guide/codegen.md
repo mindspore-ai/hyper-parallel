@@ -80,12 +80,16 @@ Some models separate their top-level and child models into different source file
 
 ### DeepSeek-V4.1 Training Reports Multicore or MegaMoE Library Errors
 
-These errors can also occur in native training. DeepSeek-V4.1 uses Multicore/MegaMoE native extensions. Build and train with compatible Python, PyTorch, torch_npu, and CANN versions, and perform a strict clean build:
+These errors can also occur in native training. DeepSeek-V4.1 uses Multicore/MegaMoE native extensions. Build and train with compatible Python, PyTorch, torch_npu, and CANN versions, and install a matching HyperMulticore wheel and activate it:
 
 ```bash
-./build.sh --multicore on --strict on --clean
+pip install /absolute/path/to/hyper_multicore.whl
 source /usr/local/Ascend/cann/set_env.sh
-source build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
+source "$(command -v hyper_multicore_set_env.bash)"
 ```
 
-If a library reports `undefined symbol`, or its Python ABI differs from the training environment, clean old build outputs and rebuild in the training environment. Do not bypass the error by disabling MegaMoE or changing model structure. See the [installation guide](../installation.md) for environment requirements.
+If a Multicore library reports `undefined symbol`, or its Python ABI differs from the training
+environment, check the loaded HyperMulticore package and reinstall a matching wheel. Source rebuilds
+follow the [HyperMulticore](https://github.com/mindspore-ai/hyper-multicore) build guide in that
+repository, using the training environment. Do not bypass the error by disabling MegaMoE or changing
+model structure. See the [installation guide](../installation.md) for environment requirements.

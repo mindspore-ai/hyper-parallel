@@ -15,6 +15,8 @@
 
 """Compare unpadded DSV4.1 experts with fixed-capacity execution at SwiGLU limit 10."""
 
+from __future__ import annotations
+
 import json
 import os
 from pathlib import Path
@@ -25,13 +27,15 @@ import torch_npu  # pylint: disable=unused-import
 from torch import nn
 from torch.nn import functional
 
-from hyper_parallel.core.multicore import MegaMoeExperts
+from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions
+from hyper_multicore.experimental import MegaMoeTuningOptions
+
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import (
     DeepseekV41MegaMoeExperts,
 )
-from tests.torch.multicore._evidence_helpers import EXTENDED_LEVEL1
-from tests.torch.multicore._mega_moe_utils import start_shmem_lifetime, write_evidence
-from tests.torch.multicore._test_mega_moe_dynamic_tokens import (
+from tests.torch.multicore._integration import EXTENDED_LEVEL1
+from tests.torch.multicore._references import start_shmem_lifetime, write_evidence
+from tests.torch.multicore._references import (
     _assert_close,
     _inputs,
     _weights,
@@ -57,7 +61,8 @@ def _oracle(weights: tuple, inputs: tuple) -> tuple:
     return (output.detach(), x.grad, probs.grad, first.grad, second.grad), clipped
 
 
-def _snapshot(module: nn.Module, inputs: tuple, rank: int, *, padded: bool = False) -> tuple:
+def _snapshot(module: nn.Module, inputs: tuple, rank: int, *, padded: bool = False,
+              expert_weights: tuple | None = None) -> tuple:
     """Own output and every gradient before the next workspace reuse."""
     states, indices, probabilities, upstream = inputs
     x = states[rank].npu().requires_grad_()
@@ -65,11 +70,13 @@ def _snapshot(module: nn.Module, inputs: tuple, rank: int, *, padded: bool = Fal
     probs = probabilities[rank].npu().requires_grad_()
     module.zero_grad(set_to_none=True)
     if padded:
+        first, second = expert_weights
+        first.grad = second.grad = None
         missing = 4096 - x.shape[0]
         dummy_ids = torch.arange(missing * 6, device=x.device, dtype=ids.dtype).remainder(48).reshape(missing, 6)
         output = module(functional.pad(x, (0, 0, 0, missing)), torch.cat((ids, dummy_ids)),
-                        functional.pad(probs, (0, 0, 0, missing)))[:x.shape[0]]
-        first, second = module.gate_up_weight, module.down_weight
+                        functional.pad(probs, (0, 0, 0, missing)),
+                        expert_weights=expert_weights)[:x.shape[0]]
     else:
         output = module(x, ids, probs)
         first, second = module.gate_up_proj, module.down_proj
@@ -96,13 +103,12 @@ def test_deepseek_v41_dynamic_tokens() -> None:
     experts = slice(rank * 6, (rank + 1) * 6)
     dynamic.gate_up_proj = nn.Parameter(dynamic.gate_up_proj[experts].detach().npu())
     dynamic.down_proj = nn.Parameter(dynamic.down_proj[experts].detach().npu())
-    dynamic.configure(dist.group.WORLD, world, 6)
+    dynamic.configure(dist.group.WORLD, 6)
     fixed = MegaMoeExperts(hidden_size=512, intermediate_size=128,
-                           num_experts=48, top_k=6, swiglu_limit=10.0, ep_size=world,
-                           ep_group=dist.group.WORLD, dispatch_mode=dispatch_mode).npu().bfloat16()
-    with torch.no_grad():
-        fixed.gate_up_weight.copy_(weights[0][experts])
-        fixed.down_weight.copy_(weights[1][experts])
+                           num_experts=48, top_k=6, ep_group=dist.group.WORLD,
+                           numerics_options=MegaMoeNumericsOptions(swiglu_limit=10.0),
+                           tuning_options=MegaMoeTuningOptions(dispatch_mode=dispatch_mode))
+    fixed_weights = tuple(nn.Parameter(weight[experts].clone().npu()) for weight in weights)
     reports = []
     cases = [[0] * 8, [127, 128, 129, 255, 256, 257, 1, 513], [4096, 1, 0, 129, 0, 240, 257, 128]]
     if EXTENDED_LEVEL1:
@@ -112,7 +118,7 @@ def test_deepseek_v41_dynamic_tokens() -> None:
         # Saturation must occur on real routes so disabling the clamp cannot pass unnoticed.
         inputs = ([value * 16 for value in inputs[0]], *inputs[1:])
         actual = _snapshot(dynamic, inputs, rank)
-        baseline = _snapshot(fixed, inputs, rank, padded=True)
+        baseline = _snapshot(fixed, inputs, rank, padded=True, expert_weights=fixed_weights)
         errors = [_assert_close(f"padded reference tensor {index}", value, expected)
                   for index, (value, expected) in enumerate(zip(actual, baseline))]
         reference, clipped = _oracle(weights, inputs)

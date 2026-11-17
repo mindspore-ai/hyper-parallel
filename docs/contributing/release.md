@@ -63,16 +63,15 @@ git push upstream vX.Y.Z
 ### 5. Build the Wheel
 
 ```bash
-# Select the CANN environment; the unified entry point prepares dependencies,
-# compiles native components, and packages the wheel.
+# Select the CANN environment.
 source /usr/local/Ascend/cann/set_env.sh
-bash build.sh --multicore on --strict on --jobs 24
+bash build.sh
 
 # Build one wheel per Python ABI and host architecture, for example:
 # hyper_parallel-0.1.0-cp310-cp310-linux_aarch64.whl
 ```
 
-In strict mode, failure of any enabled component aborts the build without generating a wheel. With the default `--strict off` for development, optional native component failures emit warnings and packaging continues; a generated wheel therefore does not prove all optional capabilities are available. Official release acceptance combines builds against the version's specified glibc baseline, the full test suite, and human review. Native artifacts require CANN >= 9.1.0.
+Official release acceptance combines builds against the version's specified glibc baseline, the full test suite, and human review.
 
 ### 6. Validate After Release
 
@@ -86,7 +85,7 @@ Run each component's declared artifact, import, and system-test checks. Activate
 - [ ] Cross-references work and terminology is consistent.
 - [ ] Component validation through wheel/PYTHONPATH and clean-venv smoke tests pass.
 - [ ] Missing dependency, inactive environment, and ABI error diagnostics satisfy each selected component's contract.
-- [ ] The target glibc baseline check passes; 910B/910C native builds and tests pass, and unsupported SoCs return explicit reason codes.
+- [ ] The target glibc baseline check passes.
 
 ## Version History
 

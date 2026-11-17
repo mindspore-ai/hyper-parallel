@@ -20,8 +20,7 @@ from pathlib import Path
 import pytest
 
 from tests.common.mark_utils import arg_mark
-from tests.torch.multicore._evidence_helpers import EXTENDED_LEVEL1
-from tests.torch.multicore.test_mega_moe import _run_acceptance_worker
+from tests.torch.multicore._integration import EXTENDED_LEVEL1, run_acceptance_worker
 
 _PARALLEL_CASES = [(2, 1, False, "push"), (2, 1, True, "pull"),
                    (1, 2, True, "push"), (1, 2, False, "pull"),
@@ -31,13 +30,22 @@ if EXTENDED_LEVEL1:
                        for vision in (False, True) for mode in ("push", "pull")]
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard",
+          essential_mark="essential")
+def test_deepseek_v41_megamoe_single_card(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Check routed/shared outputs and gradients through the V4.1 MegaMoe adapter."""
+    monkeypatch.setenv("HP_MEGA_MOE_DISPATCH_MODE", "push")
+    run_acceptance_worker(monkeypatch, tmp_path, "test_deepseek_v41_single_card", 1,
+                          "_test_deepseek_v41_parallel.py")
+
+
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
           essential_mark="essential")
 @pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
 def test_deepseek_v41_megamoe(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dispatch_mode: str) -> None:
     """Run EP8/E48 forward and all-gradient comparisons at limit 10."""
     monkeypatch.setenv("HP_MEGA_MOE_DISPATCH_MODE", dispatch_mode)
-    _run_acceptance_worker(monkeypatch, tmp_path, "test_deepseek_v41_dynamic_tokens", 8,
+    run_acceptance_worker(monkeypatch, tmp_path, "test_deepseek_v41_dynamic_tokens", 8,
                            "_test_deepseek_v41_dynamic_tokens.py")
 
 
@@ -51,5 +59,5 @@ def test_deepseek_v41_megamoe_parallel(monkeypatch: pytest.MonkeyPatch, tmp_path
     monkeypatch.setenv("HP_DSV41_CP", str(cp))
     monkeypatch.setenv("HP_DSV41_VISION", str(int(vision)))
     monkeypatch.setenv("HP_MEGA_MOE_DISPATCH_MODE", dispatch_mode)
-    _run_acceptance_worker(monkeypatch, tmp_path, "test_deepseek_v41_parallel", 8,
+    run_acceptance_worker(monkeypatch, tmp_path, "test_deepseek_v41_parallel", 8,
                            "_test_deepseek_v41_parallel.py", variant=f"tp{tp}-cp{cp}-vision{int(vision)}")

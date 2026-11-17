@@ -28,9 +28,6 @@ CANN_ARCH="${CANN_ARCH:-a3}"
 BASE_OS="${BASE_OS:-ubuntu22.04}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
 PIP_INDEX_URL="${PIP_INDEX_URL:-https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple}"
-BUILD_MULTICORE_EXTENSION="${BUILD_MULTICORE_EXTENSION:-off}"
-BUILD_SHMEM_EXTENSION="${BUILD_SHMEM_EXTENSION:-off}"
-HYPER_PARALLEL_BUILD_STRICT="${HYPER_PARALLEL_BUILD_STRICT:-off}"
 
 usage() {
     cat <<EOF
@@ -80,9 +77,6 @@ docker build \
     --build-arg "BASE_OS=${BASE_OS}" \
     --build-arg "PYTHON_VERSION=${PYTHON_VERSION}" \
     --build-arg "PIP_INDEX_URL=${PIP_INDEX_URL}" \
-    --build-arg "BUILD_MULTICORE_EXTENSION=${BUILD_MULTICORE_EXTENSION}" \
-    --build-arg "BUILD_SHMEM_EXTENSION=${BUILD_SHMEM_EXTENSION}" \
-    --build-arg "HYPER_PARALLEL_BUILD_STRICT=${HYPER_PARALLEL_BUILD_STRICT}" \
     .
 
 echo "Verify image: ${IMAGE}"

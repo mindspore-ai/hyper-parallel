@@ -45,9 +45,6 @@ Use these rules as the default coding style and convention set for HyperParallel
 ### Import placement
 
 - **Default:** Put runtime `import` / `from … import` at **module top** (after the license header and any module docstring). Do **not** put imports inside functions, methods, or nested class bodies except the narrow exceptions under “Other exceptions” below. Applies to e.g. `core/`, `collectives/`, `tests/`.
-- **Multicore** (`hyper_parallel/core/multicore/**`): use direct module-level Torch imports.
-  The component root may export its business APIs; the HyperParallel root must not export them.
-  Native-library initialization may still be deferred until an operation needs the activated payload.
 - **DFunction** (`hyper_parallel/core/shard/dfunction.py`): import Torch at module scope
   and inherit directly from `torch.autograd.Function`.
 - **Pipeline** (`hyper_parallel/core/pipeline_parallel/**`): import Torch APIs

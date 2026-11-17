@@ -40,18 +40,16 @@ python -m pip install -r requirements.txt
 python -m pip install --no-deps --no-build-isolation -e .
 ```
 
-### 1.2 编译 Multicore
+### 1.2 安装 HyperMulticore
 
-在 HyperParallel 根目录执行：
+在训练环境中安装匹配的独立 HyperMulticore wheel，并在启动训练前激活：
 
 ```bash
-cd "${HP_REPO_ROOT}"
-./build.sh --multicore on --soc-list ascend910_93 --jobs 128
-source build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
+pip install /absolute/path/to/hyper_multicore.whl
+source "$(command -v hyper_multicore_set_env.bash)"
 ```
 
-`--jobs` 按主机 CPU 资源调整。检查日志确认 Multicore 成功；默认宽松模式下，生成 wheel
-不代表每个可选组件都编译成功。参数和产物说明见[安装指南](../../../docs/installation.md)。
+源码构建要求见 [HyperMulticore](https://github.com/mindspore-ai/hyper-multicore)。
 
 ### 1.3 安装 Omni Ops
 

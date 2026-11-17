@@ -35,23 +35,22 @@ git switch -c feat/your-change upstream/master
 ```bash
 # 仅 Python 源码开发（不编译 optional native 组件）
 pip install -e .
+```
 
+Multicore 模型替换使用独立安装的 HyperMulticore：
+
+```bash
 # native 本地开发；先 source 用户选择的 CANN 官方环境
 source /usr/local/Ascend/cann/set_env.sh
-./build.sh --multicore on --soc-list ascend910b,ascend910_93
+pip install /absolute/path/to/hyper_multicore.whl
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
-source build/native/payload/hyper_parallel/core/multicore/lib/set_env.bash
+source "$(command -v hyper_multicore_set_env.bash)"
 python your_program.py
-
-# 该命令同时生成 wheel；安装 build.sh 最后打印的精确路径
-wheel_path=/absolute/path/printed/by/build.sh
-pip install "${wheel_path}"
-source "$(command -v hyper_parallel_multicore_set_env.bash)"
 ```
 
 直接执行 `python setup.py bdist_wheel` 只生成 core-only wheel，不在 setup/pip 阶段下载或编译 native 依赖。
-其他公共构建选项见[安装指南](../installation.zh.md)。Multicore 的依赖和 CANN custom OPP 激活方式见
-[Multicore 构建与使用](../../hyper_parallel/core/multicore/docs/build.zh.md)。
+HyperParallel 构建方式见[安装指南](../installation.zh.md)。Multicore 的依赖和 CANN custom OPP 激活方式见
+[HyperMulticore](https://github.com/mindspore-ai/hyper-multicore)。
 
 ## 安装开发依赖
 
