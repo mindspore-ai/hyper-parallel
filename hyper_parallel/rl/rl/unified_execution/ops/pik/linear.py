@@ -15,20 +15,21 @@
 """Prepared PIK execution with fixed forward arithmetic and first-order gradients."""
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
 import math
+from dataclasses import dataclass
 from typing import Any
 
 import torch
 import torch.distributed as dist
 from torch.autograd.function import once_differentiable
 
-from rl.unified_execution.batch_invariant import initialize_batch_invariant, normalize_policy
+from rl.unified_execution.core.batch_invariant import initialize_batch_invariant, normalize_policy
+
+from .collectives import combine_partials, gather_sequence_gradient
 from .gemm import local_gemm
 from .plan import PikPlan
-from .collectives import combine_partials, gather_sequence_gradient
 
 
 @dataclass(frozen=True)
@@ -158,14 +159,23 @@ def _validate(x, weight, bias, context):
 
 
 def _forward(x, weight, bias, context, axis):
-    """Compute local leaves, combine rank roots, then cast and add bias."""
+    """Compute local leaves, combine rank roots, then cast and add bias.
+
+    x [..., K/TP] and weight [N, K/TP] produce flattened FP32 rank roots [M, N].
+    The fixed global leaf tree determines the sum; TP only changes ownership.
+    SP returns M/TP rows, while ordinary TP returns all M rows.
+    """
     ordered = x.movedim(axis, 0)
     shape = list(ordered.shape[:-1])
     flat = ordered.reshape(-1, ordered.shape[-1])
     partial = local_gemm(flat, weight, plan=context.plan,
                          local_leaves=context.plan.num_leaves // context.world_size)
+
+    # Communicate rank roots without changing the predetermined reduction tree.
     root = combine_partials(partial, context.group, context.world_size, context.rank,
                             scatter=context.sequence_parallel, transport=context.transport)
+
+    # Casting and bias addition are part of the shared forward rounding contract.
     output = root.to(torch.bfloat16)
     if bias is not None:
         output = output + bias.to(torch.bfloat16)

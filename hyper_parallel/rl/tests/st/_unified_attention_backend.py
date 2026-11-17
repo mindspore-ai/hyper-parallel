@@ -30,7 +30,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 
-from rl.unified_execution.runtimes.vllm.attention_backend import (
+from rl.unified_execution.runtimes.vllm.attention.ascend_v4 import (
     UnifiedAscendAttentionImpl, UnifiedAttentionMetadataBuilder,
 )
 

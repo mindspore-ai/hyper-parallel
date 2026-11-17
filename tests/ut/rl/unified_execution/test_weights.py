@@ -20,7 +20,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-from rl.unified_execution.runtimes.vllm.weight_loader import LogicalWeightLoader
+from rl.unified_execution.runtimes.vllm.weights import LogicalWeightLoader
 from rl.weight_sync.model_adapter import ModelWeightAdapter
 from rl.weight_sync.packed_weight import (
     build_packed_weight_buckets,

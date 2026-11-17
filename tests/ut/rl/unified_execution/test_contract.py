@@ -21,11 +21,11 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
-from rl.unified_execution.contract import build_unified_payload, fingerprint, parse_unified_payload
+from rl.unified_execution.core.contract import build_unified_payload, fingerprint, parse_unified_payload
 from rl.unified_execution.models import get_model_family
 from rl.unified_execution.runtimes.hyper_parallel.builder import build_inference_model
-from rl.unified_execution.runtimes.vllm.parallel_context import build_parallel_context, payload_from_vllm_config
-from rl.unified_execution.validation import capture_training_structure
+from rl.unified_execution.runtimes.vllm.parallel import build_parallel_context, payload_from_vllm_config
+from rl.unified_execution.core.validation import capture_training_structure
 from rl.workers.engine.model import architecture_for_implementation
 from torch import nn
 from transformers import Qwen3Config
@@ -244,7 +244,7 @@ class TestParallelContract(unittest.TestCase):
     def test_explicit_inference_topology_does_not_mutate_training_topology(self) -> None:
         """Explicit CP/PP=1 permits a different training topology without claiming parity."""
         config = self._config()
-        config["train"]["accelerator"].update(cp=2, pp=2)
+        config["train"]["accelerator"].update(pp=2)
         config["rollout"]["vllm"].update(tensor_parallel_size=4, context_parallel_size=1,
                                        pipeline_parallel_size=1, sequence_parallel=False)
         payload = parse_unified_payload(build_unified_payload(config))
@@ -265,7 +265,8 @@ class TestParallelContract(unittest.TestCase):
                         config["train"]["accelerator"][axis] = 2
                     else:
                         config["rollout"]["vllm"][field] = 2
-                    with self.assertRaisesRegex(ValueError, "supports HP TP/SP only"):
+                    message = ("Training CP" if inherited else "Inference PCP") if axis == "cp" else "PP=1"
+                    with self.assertRaisesRegex(ValueError, message):
                         build_unified_payload(config)
 
 
@@ -287,10 +288,10 @@ class TestParallelWorkerMesh(unittest.TestCase):
         mesh.get_local_rank.return_value = 3
         mesh.__getitem__.return_value.get_local_rank.return_value = 3
         with patch.dict("sys.modules", {"vllm.distributed": fake_vllm}), \
-                patch("rl.unified_execution.runtimes.vllm.parallel_context.dist") as distributed, \
-                patch("rl.unified_execution.runtimes.vllm.parallel_context.DeviceMesh.from_group",
+                patch("rl.unified_execution.runtimes.vllm.parallel.dist") as distributed, \
+                patch("rl.unified_execution.runtimes.vllm.parallel.DeviceMesh.from_group",
                       return_value=mesh) as from_group, \
-                patch("rl.unified_execution.runtimes.vllm.parallel_context.MeshContext") as mesh_context:
+                patch("rl.unified_execution.runtimes.vllm.parallel.MeshContext") as mesh_context:
             distributed.is_initialized.return_value = True
             result = build_parallel_context(self._config(), payload)
         distributed.new_group.assert_not_called()
@@ -318,10 +319,10 @@ class TestParallelWorkerMesh(unittest.TestCase):
         dense_mesh.__getitem__.return_value.get_local_rank.return_value = 1
         expert_mesh.__getitem__.return_value.get_local_rank.return_value = 1
         with patch.dict("sys.modules", {"vllm.distributed": fake_vllm}), \
-                patch("rl.unified_execution.runtimes.vllm.parallel_context.dist.is_initialized", return_value=True), \
-                patch("rl.unified_execution.runtimes.vllm.parallel_context.DeviceMesh.from_group",
+                patch("rl.unified_execution.runtimes.vllm.parallel.dist.is_initialized", return_value=True), \
+                patch("rl.unified_execution.runtimes.vllm.parallel.DeviceMesh.from_group",
                       side_effect=[tp_mesh, dense_mesh]) as from_group, \
-                patch("rl.unified_execution.runtimes.vllm.parallel_context.build_expert_mesh",
+                patch("rl.unified_execution.runtimes.vllm.parallel.build_expert_mesh",
                       return_value=expert_mesh) as build_mesh:
             result = build_parallel_context(config, payload)
         from_group.assert_called_with([dp_group, tp_group], "cpu", mesh=[[0], [1]], mesh_dim_names=("dp", "tp"))

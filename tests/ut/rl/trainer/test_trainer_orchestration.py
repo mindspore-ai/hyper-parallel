@@ -675,6 +675,7 @@ def test_trainer_sets_up_runtime_with_mocked_distributed_boundary(
         device_mesh="device-mesh",
         dp_cp_mesh=dp_mesh,
         dp_size=2,
+        cp_size=1,
     )
     setup = SimpleNamespace(mesh_context=mesh_context, strategy_config=None)
     handle = SimpleNamespace(set_device=lambda rank: calls.append(("set-device", rank)))
@@ -689,7 +690,7 @@ def test_trainer_sets_up_runtime_with_mocked_distributed_boundary(
     trainer.distillation_config = DistillationConfig()
     trainer.runtime_config = SimpleNamespace(
         training=SimpleNamespace(backend="hccl", seed=1234),
-        accelerator=SimpleNamespace(tp_size=tp_size),
+        accelerator=SimpleNamespace(tp_size=tp_size, cp_size=1),
         fsdp_config=SimpleNamespace(enable_offload=cpu_offload),
     )
     trainer._runtime_started = False
@@ -880,6 +881,8 @@ def test_trainer_builds_rollout_evaluator_and_tp_request_owner(
     trainer.parallel_dims = SimpleNamespace(
         tp_size=2,
         tp_rank=1,
+        cp_size=1,
+        cp_rank=0,
         dp_rank=0,
         dp_size=1,
         device_mesh={"tp": SimpleNamespace(get_group=lambda: "tp-group")},

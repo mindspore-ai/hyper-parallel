@@ -24,7 +24,7 @@ from rl.config.schema import (
     _trainer_topology, build_model_registration, optional_mapping, required_mapping, router_replay_mode,
 )
 from rl.config.validate import _validate_model_scope
-from rl.unified_execution.contract import build_unified_payload, validate_unified_config
+from rl.unified_execution.core.contract import build_unified_payload, validate_unified_config
 from hyper_parallel.components.checkpoint.config import CheckpointingConfig
 from hyper_parallel.components.optim import AdamW, MultiLRScheduler
 from hyper_parallel.models import HyperAutoModelForCausalLM
@@ -52,7 +52,7 @@ def resolve_unified_execution_config(config: Mapping[str, Any]) -> dict[str, Any
         if vllm.get("model_implementation", "unified") != "unified":
             raise ValueError("consistency.mode=architecture conflicts with rollout.vllm.model_implementation")
         vllm["model_implementation"] = "unified"
-        vllm["unified_execution"] = payload
+        vllm["unified_execution"] = payload # Unified configuration settings for VLLM runtime
         for field, axis in (("tensor_parallel_size", "tp"), ("context_parallel_size", "cp"),
                             ("pipeline_parallel_size", "pp"), ("sequence_parallel", "sequence_parallel")):
             vllm[field] = payload["parallelism"][axis]

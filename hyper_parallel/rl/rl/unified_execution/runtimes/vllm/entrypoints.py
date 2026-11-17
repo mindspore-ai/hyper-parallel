@@ -16,10 +16,8 @@
 
 from vllm.compilation.decorators import support_torch_compile
 
-from rl.unified_execution.runtimes.vllm.model_adapter import (
-    HyperParallelQwen3ForCausalLM as SharedQwen3ForCausalLM,
-    HyperParallelQwen3MoeForCausalLM as SharedQwen3MoeForCausalLM,
-)
+from rl.unified_execution.runtimes.vllm.model import HyperParallelQwen3ForCausalLM as SharedQwen3ForCausalLM
+from rl.unified_execution.runtimes.vllm.model import HyperParallelQwen3MoeForCausalLM as SharedQwen3MoeForCausalLM
 
 
 @support_torch_compile(dynamic_arg_dims={"input_ids": 0, "positions": 0, "inputs_embeds": 0})

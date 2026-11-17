@@ -57,9 +57,10 @@ from rl.trainer.lifecycle import RunLifecycle
 from rl.weight_sync.publication import PolicyPublication
 from rl.distillation.runtime import TeacherScorer
 from rl.reward_model.runtime import RewardScorer
-from rl.unified_execution.validation import capture_training_structure
-from rl.unified_execution.runtimes.hyper_parallel.training import guard_training_numerics, install_training_attention
-from rl.unified_execution.batch_invariant import initialize_batch_invariant, verify_batch_invariant
+from rl.unified_execution.runtimes.hyper_parallel.moe import validate_training_ep
+from rl.unified_execution.core.validation import capture_training_structure
+from rl.unified_execution.runtimes.hyper_parallel.attention import guard_training_numerics, install_training_attention
+from rl.unified_execution.core.batch_invariant import initialize_batch_invariant, verify_batch_invariant
 from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo
 from hyper_parallel.trainer.config import normalize_distributed_setup_overrides
 from hyper_parallel.trainer.runtime.distributed import create_distributed_setup_from_config, initialize_distributed
@@ -178,6 +179,7 @@ class _TrainerBuilder:
         normalize_distributed_setup_overrides(self.distributed_setup, self.runtime_config)
         # Size-one FSDP is also needed to honor requested CPU parameter/gradient offload.
         needs_fsdp = (self.runtime_config.accelerator.tp_size > 1 or
+                      self.runtime_config.accelerator.cp_size > 1 or
                       bool(getattr(self.runtime_config.fsdp_config, "enable_offload", False)))
         if needs_fsdp and self.distributed_setup.strategy_config is None:
             self.distributed_setup.strategy_config = self.runtime_config.fsdp_config
@@ -188,6 +190,10 @@ class _TrainerBuilder:
         self.device_handle = torch.get_device_module()
         self.device_handle.set_device(local_rank)
         dp_mesh = self.parallel_dims.dp_cp_mesh
+        if self.parallel_dims.cp_size > 1:
+            names = self.mesh.mesh_dim_names
+            axes = tuple(name for name in ("dp", "dp_replicate", "dp_shard") if name in names)
+            dp_mesh = self.mesh[axes[0]] if len(axes) == 1 else self.mesh[axes].flatten("rl_dp")
         dp_group = None
         if dp_mesh is not None and self.parallel_dims.dp_size > 1:
             dp_group = dp_mesh.get_group()
@@ -394,8 +400,10 @@ class _TrainerBuilder:
         )
         unified = self.resolved_config.get("rollout", {}).get("vllm", {}).get("unified_execution")
         if unified is not None:
-            unified["training_structure"] = capture_training_structure(actor_model, unified)
-            self._install_unified_training(actor_model, unified)
+            unified["training_structure"] = capture_training_structure(
+                actor_model, unified, ep_validator=validate_training_ep,
+            )
+            self._install_unified_training(actor_model, unified) # Replace V4 shared kernel
         self._record_role_config("actor", self.runtime_config, self.distributed_setup)
         reference_model = self._build_reference_model(train_config)
         if reference_model is not None and unified is not None:
@@ -481,17 +489,23 @@ class _TrainerBuilder:
         self.lr_scheduler = self.actor.lr_scheduler
 
     def _configure_rollout_tensor_parallel(self) -> None:
-        """Give a TP rollout engine its request-ownership process group."""
-        if self.parallel_dims.tp_size <= 1:
+        """Reuse request broadcasting for all TP x CP ranks sharing one DP sample."""
+        if self.parallel_dims.tp_size * self.parallel_dims.cp_size <= 1:
             return
         configure = getattr(self.rollout_engine, "configure_trainer_tensor_parallel", None)
         if not callable(configure):
             raise ValueError("Trainer TP rollout requires request ownership support")
         tp_mesh = self.parallel_dims.device_mesh["tp"]
+        request_rank = int(self.parallel_dims.tp_rank)
+        request_size = int(self.parallel_dims.tp_size)
+        if self.parallel_dims.cp_size > 1:
+            tp_mesh = self.parallel_dims.device_mesh[("cp", "tp")].flatten("rl_request")
+            request_rank = tp_mesh.get_local_rank()
+            request_size = tp_mesh.size()
         configure(
             group=tp_mesh.get_group(),
-            tp_rank=int(self.parallel_dims.tp_rank),
-            tp_size=int(self.parallel_dims.tp_size),
+            tp_rank=request_rank,
+            tp_size=request_size,
             request_rank=int(self.parallel_dims.dp_rank),
             request_size=int(self.parallel_dims.dp_size),
         )
@@ -609,7 +623,7 @@ class _TrainerBuilder:
                 progress_steps=int(evaluation_config.get("progress_steps", 0)),
                 data_parallel_rank=int(self.parallel_dims.dp_rank),
                 data_parallel_size=int(self.parallel_dims.dp_size),
-                is_request_owner=int(self.parallel_dims.tp_rank) == 0,
+                is_request_owner=int(self.parallel_dims.tp_rank) == 0 and int(self.parallel_dims.cp_rank) == 0,
                 score_batch=None,
             )
 

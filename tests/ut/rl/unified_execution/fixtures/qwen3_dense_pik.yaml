@@ -63,7 +63,7 @@ train:
       kind: module
       source_type: transformers.models.qwen3.modeling_qwen3.Qwen3Attention
       implementation:
-        _target_: rl.unified_execution.components.row_parallel.replace_attention_with_pik
+        _target_: rl.unified_execution.models.bindings.replace_attention_with_pik
         num_leaves: 8
         leaf_layout: strided
         fill_uninitialized_memory: false
@@ -75,7 +75,7 @@ train:
       source_type: torch.nn.Linear
       exact_type: true
       implementation:
-        _target_: rl.unified_execution.components.row_parallel.replace_pik_linear
+        _target_: rl.unified_execution.models.bindings.replace_pik_linear
         num_leaves: 8
         leaf_layout: strided
         fill_uninitialized_memory: false
@@ -83,7 +83,7 @@ train:
     replace:
       kind: method
       implementation:
-        _target_: rl.unified_execution.components.row_parallel.pik_row_compute_fn
+        _target_: rl.unified_execution.models.bindings.pik_row_compute_fn
         sequence_parallel: false
     params: {}
     in_src:
@@ -103,7 +103,7 @@ train:
     replace:
       kind: method
       implementation:
-        _target_: rl.unified_execution.components.row_parallel.pik_row_compute_fn
+        _target_: rl.unified_execution.models.bindings.pik_row_compute_fn
         sequence_parallel: true
     params: {}
     in_src:
@@ -143,7 +143,7 @@ train:
     replace:
       kind: method
       implementation:
-        _target_: rl.unified_execution.components.row_parallel.pik_row_compute_fn
+        _target_: rl.unified_execution.models.bindings.pik_row_compute_fn
         sequence_parallel: false
     params: {}
     in_src:
@@ -163,7 +163,7 @@ train:
     replace:
       kind: method
       implementation:
-        _target_: rl.unified_execution.components.row_parallel.pik_row_compute_fn
+        _target_: rl.unified_execution.models.bindings.pik_row_compute_fn
         sequence_parallel: true
     params: {}
     in_src:

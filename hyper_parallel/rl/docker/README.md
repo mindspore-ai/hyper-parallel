@@ -4,7 +4,7 @@
 
 Unified execution uses
 `swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:consistency-v0.30.0-cann9.2.1-arm64`.
-Its versions and local setup are documented in [Unified Execution](../rl/unified_execution/README.md#运行环境).
+Its versions and local setup are documented in [Unified Execution](../docs/unified_execution_guide.md#运行环境).
 The older image below remains available for existing workflows.
 
 ARM64 ordinary RL, MoE R3, Codex Agent, DeepSeek Harness, and Qwen3.5/3.8 controllers all use

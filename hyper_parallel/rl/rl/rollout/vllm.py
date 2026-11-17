@@ -34,7 +34,7 @@ import torch
 import torch.distributed as dist
 
 from rl.data.contracts import RouterTrace, resize_router_trace
-from rl.unified_execution.batch_invariant import verify_batch_invariant
+from rl.unified_execution.core.batch_invariant import verify_batch_invariant
 from rl.workers.engine.model import (
     ModelRegistration,
     VLLMModelRegistration,
@@ -50,13 +50,14 @@ from rl.rollout.router_capture import (
 from rl.rollout.topology import (
     VLLMRolloutTopology,
     resolve_vllm_rollout_topology,
+    model_parallel_size,
     worker_tensor_parallel_size,
 )
 from rl.weight_sync.sync import ActorRolloutWeightSync, PolicySnapshot, synchronize_error, synchronized_call
 from rl.weight_sync.vllm_client import VLLMWeightSyncClientMixin
 from rl.weight_sync.transfer import WeightPublisher, build_weight_publisher
 from rl.weight_sync.config import resolve_weight_sync_config
-from rl.unified_execution.contract import parse_unified_payload
+from rl.unified_execution.core.contract import parse_unified_payload
 
 _DISTRIBUTED_ENVIRONMENT_VARIABLES = (
     "RANK",
@@ -777,7 +778,7 @@ class VLLMGenerationEngine:
         request_rank: int,
         request_size: int,
     ) -> None:
-        """Assign one HTTP request owner per Trainer TP group."""
+        """Assign one HTTP owner per supplied Trainer TP or flattened TP x CP group."""
         if tp_size <= 1:
             raise ValueError("Trainer TP request ownership requires tp_size > 1")
         if not 0 <= tp_rank < tp_size:
@@ -936,6 +937,11 @@ class VLLMGenerationEngine:
             if self._config.get(key) is not None:
                 command.extend((option, str(self._config[key])))
         additional_config = {}
+        if int(self._config.get("context_parallel_size", 1)) > 1:
+            command.extend(("--prefill-context-parallel-size", str(self._config["context_parallel_size"]),
+                            "--decode-context-parallel-size", "1"))
+            # HP continues owning embedding/LM-head weights and their TP layouts.
+            additional_config["enable_pcp_embedding_lmhead_weight_sharding"] = False
         if self._deployment == "colocated":
             command.append("--enable-sleep-mode")
             additional_config["weight_nz_mode"] = 0
@@ -973,6 +979,8 @@ class VLLMGenerationEngine:
                 and os.environ.get("VLLM_BATCH_INVARIANT") == "1"):
             raise ValueError("Unified Level 3 conflicts with inherited VLLM_BATCH_INVARIANT=1")
         server_environment = os.environ.copy()
+        if int(self._config.get("context_parallel_size", 1)) > 1:
+            server_environment["VLLM_USE_V2_MODEL_RUNNER"] = "1"
         for variable in _DISTRIBUTED_ENVIRONMENT_VARIABLES:
             server_environment.pop(variable, None)
         server_environment.pop("HYPER_RL_CONSISTENCY_PROFILE", None)
@@ -1014,7 +1022,7 @@ class VLLMGenerationEngine:
         local_state = verify_batch_invariant(policy)
         expected_state = {name: value for name, value in local_state.items() if name not in ("pid", "device")}
         results = client.collective_rpc("get_unified_numerical_policy")
-        expected_count = int(self._config.get("data_parallel_size", 1)) * worker_tensor_parallel_size(self._config)
+        expected_count = int(self._config.get("data_parallel_size", 1)) * model_parallel_size(self._config)
         if not isinstance(results, list) or len(results) != expected_count:
             raise RuntimeError(f"Unified numerical policy requires {expected_count} worker snapshots; got {results!r}")
         for index, result in enumerate(results):
@@ -1581,7 +1589,9 @@ def build_vllm_engine(
         deployment,
         rollout_model,
         tensor_parallel_size=rollout_tp,
-        data_parallel_size=int(vllm_config.get("data_parallel_size", 1)),
+        # Publication addresses each PCP replica; TP still describes weight shards.
+        data_parallel_size=(int(vllm_config.get("data_parallel_size", 1))
+                            * int(vllm_config.get("context_parallel_size", 1))),
         bucket_size_bytes=normalized_weight_sync.bucket_size_bytes,
         strategy=normalized_weight_sync.strategy,
     )

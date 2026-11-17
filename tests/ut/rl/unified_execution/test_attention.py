@@ -27,7 +27,7 @@ from transformers import Qwen3Config, Qwen3ForCausalLM
 from rl.unified_execution.ops.attention.flash_attention_npu_v4 import (
     dense_attention, varlen_attention,
 )
-from rl.unified_execution.runtimes.hyper_parallel.training import (
+from rl.unified_execution.runtimes.hyper_parallel.attention import (
     install_training_attention,
     prepare_training_attention_metadata,
     run_training_attention,

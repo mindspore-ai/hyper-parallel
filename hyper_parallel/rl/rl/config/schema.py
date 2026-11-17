@@ -97,12 +97,14 @@ def _trainer_topology(accelerator: Mapping[str, Any]) -> dict[str, int]:
             unsupported[name] = size
         elif name == "tp" and size not in (1, 2, 4):
             unsupported[name] = size
-        elif name in ("cp", "pp") and size != 1:
+        elif name == "cp" and size not in (1, 2, 4):
+            unsupported[name] = size
+        elif name == "pp" and size != 1:
             unsupported[name] = size
     if unsupported:
         raise ValueError(
             "Hyper-RL Trainer currently supports dp_replicate=1, TP1/TP2/TP4, "
-            f"and CP=PP=1; invalid topology={unsupported}"
+            f"CP1/CP2/CP4 and PP=1; invalid topology={unsupported}"
         )
     return topology
 

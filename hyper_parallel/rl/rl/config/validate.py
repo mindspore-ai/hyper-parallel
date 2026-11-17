@@ -29,8 +29,8 @@ from rl.reward_model.scoring import load_reward_function
 from rl.rollout.registry import ROLLOUT_ENGINES
 from rl.rollout.topology import model_parallel_size
 from rl.weight_sync.config import resolve_weight_sync_config
-from rl.unified_execution.contract import validate_unified_config
-from rl.unified_execution.execution_plan import pik_row_options
+from rl.unified_execution.core.contract import validate_unified_config
+from rl.unified_execution.core.execution_plan import pik_row_options
 from rl.config.schema import (
     AsyncTrainingConfig, ColocateAsyncConfig, _EXPECTED_TOP_LEVEL, _HCCL_MAX_PORT, _HCCL_MIN_PORT,
     _async_integer, _normalize_dtype_name, _optimizer_fp32_main_params, _positive_integer,

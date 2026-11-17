@@ -50,7 +50,7 @@ def install_runtime_hooks() -> None:
         for family in model_families():
             architecture = family.vllm_architecture
             ModelRegistry.register_model(
-                architecture, f"rl.unified_execution.runtimes.vllm.model_entrypoints:{architecture}",
+                architecture, f"rl.unified_execution.runtimes.vllm.entrypoints:{architecture}",
             )
     install_vllm_weight_sync_hooks(private_lifecycle=False)
     try:

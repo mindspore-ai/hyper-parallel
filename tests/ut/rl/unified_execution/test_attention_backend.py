@@ -29,7 +29,7 @@ import torch
 
 import rl
 from rl.unified_execution.ops.attention import flash_attention_npu_v4 as shared_attention
-from rl.unified_execution.runtimes.vllm.paged_attention import install_paged_attention
+from rl.unified_execution.runtimes.vllm.attention.bridge import install_paged_attention
 
 
 @dataclass
@@ -88,7 +88,7 @@ def _load_backend() -> ModuleType:
     config.CUDAGraphMode = SimpleNamespace(FULL_DECODE_ONLY="decode_graph", FULL_AND_PIECEWISE="mixed_piecewise")
     fence = ModuleType("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence")
     fence.attention_transfer_window = nullcontext
-    path = Path(rl.__file__).parent / "unified_execution/runtimes/vllm/attention_backend.py"
+    path = Path(rl.__file__).parent / "unified_execution/runtimes/vllm/attention/ascend_v4.py"
     spec = importlib.util.spec_from_file_location("_rl_v4_backend_ut", path)
     module = importlib.util.module_from_spec(spec)
     modules = {entry.__name__: entry for entry in (ascend, base, config, fence, module)}
@@ -213,6 +213,47 @@ class TestUnifiedAttentionBackend(unittest.TestCase):
         self.assertEqual(value.data_ptr(), impl.value_cache.data_ptr())
         self.assertEqual(key.stride(), (2048, 8, 1024, 1))
 
+    def test_pcp_enables_native_cache_gather_only_when_selected(self) -> None:
+        """Subclass opt-in preserves PCP1 and rejects DCP before provider execution."""
+        original = _NativeImpl.__init__
+        for pcp, dcp in ((1, 1), (2, 1), (4, 1), (2, 2)):
+            def initialize(instance, *args, **kwargs):
+                original(instance, *args, **kwargs)
+                instance.vllm_config.parallel_config.prefill_context_parallel_size = pcp
+                instance.vllm_config.parallel_config.decode_context_parallel_size = dcp
+
+            with self.subTest(pcp=pcp, dcp=dcp), patch.object(_NativeImpl, "__init__", initialize):
+                if dcp > 1:
+                    with self.assertRaisesRegex(ValueError, "DCP=1"):
+                        self._impl()
+                else:
+                    self.assertEqual(self._impl().pcp_enabled, pcp > 1)
+
+    def test_empty_pcp_rank_returns_zero_without_calling_v4(self) -> None:
+        """Native forward still gathers KV; an empty local query has no attention work."""
+        impl = self._impl()
+        impl.pcp_enabled = True
+        metadata, _ = self._metadata([0], [])
+        query = torch.randn(4, 4, 8, dtype=torch.bfloat16)
+        output = torch.full_like(query, float("nan"))
+        result = impl.forward_impl(query, None, None, (), metadata, output)
+        self.assertIs(result, output)
+        self.assertEqual(int(result.count_nonzero()), 0)
+        self.provider.flash_attn_varlen_func.assert_not_called()
+
+    def test_pcp_segments_keep_independent_causal_prefixes(self) -> None:
+        """Two query segments can reuse one request's pages with distinct KV ends."""
+        metadata, common = self._metadata([0, 3, 5], [35, 99])
+        common.block_table_tensor[1].copy_(common.block_table_tensor[0])
+        impl = self._impl()
+        impl.pcp_enabled = True
+        query = torch.randn(5, 4, 8, dtype=torch.bfloat16)
+        impl.forward_impl(query, None, None, (), metadata, torch.empty_like(query))
+        arguments = self.provider.flash_attn_varlen_func.call_args.kwargs
+        torch.testing.assert_close(arguments["cu_seqlens_q"], torch.tensor([0, 3, 5], dtype=torch.int32))
+        torch.testing.assert_close(arguments["seqused_k"], torch.tensor([35, 99], dtype=torch.int32))
+        self.assertTrue(torch.equal(arguments["page_table"][0], arguments["page_table"][1]))
+
     def test_missing_graph_metadata_fails(self) -> None:
         """Missing device offsets must not use stale host lists as a fallback."""
         impl = self._impl()
@@ -251,7 +292,7 @@ class TestUnifiedAttentionBackend(unittest.TestCase):
         native_module.Attention = attention_factory
         modules = {
             native_module_name: native_module,
-            "rl.unified_execution.runtimes.vllm.attention_backend": self.backend,
+            "rl.unified_execution.runtimes.vllm.attention.ascend_v4": self.backend,
         }
         for name in ("native", "flash_attention_npu_v4"):
             runtime = SimpleNamespace(
@@ -259,10 +300,10 @@ class TestUnifiedAttentionBackend(unittest.TestCase):
                 additional_config={},
             )
             with self.subTest(backend=name), patch.dict(sys.modules, modules), patch(
-                "rl.unified_execution.runtimes.vllm.paged_attention.payload_from_vllm_config",
+                "rl.unified_execution.runtimes.vllm.attention.bridge.payload_from_vllm_config",
                 return_value={"attention_backend": name},
             ), patch(
-                "rl.unified_execution.runtimes.vllm.paged_attention.validate_attention_execution_path",
+                "rl.unified_execution.runtimes.vllm.attention.bridge.validate_attention_execution_path",
                 return_value=(model, [attention]),
             ):
                 install_paged_attention(model, runtime)

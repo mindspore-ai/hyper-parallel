@@ -16,8 +16,8 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 import importlib
+from functools import lru_cache
 from importlib.metadata import version
 from types import ModuleType
 

@@ -16,15 +16,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 import hashlib
 import json
+from collections.abc import Mapping
 from typing import Any
 
-from rl.unified_execution.batch_invariant import normalize_policy
+from rl.unified_execution.core.batch_invariant import normalize_policy
+from rl.unified_execution.core.execution_plan import (
+    unified_ep_options,
+    validate_cp_plan,
+    validate_pcp_plan,
+    validate_pik_contract,
+)
 from rl.unified_execution.models import get_model_family
-from rl.unified_execution.execution_plan import fixed_capacity_ep_capacity, validate_pik_contract
-
 
 _PLAN_FIELDS = frozenset((
     "match", "replace", "when", "low_precision_dtype_scheme", "region_dispatch",
@@ -134,7 +138,7 @@ def _validate_model_parallelism(config, family, train, accelerator, vllm, traini
     if family.moe:
         expert = _expert_options(config)
         if (expert["inference"] > 1 and not vllm.get("enforce_eager", False)
-                and fixed_capacity_ep_capacity(train.get("plan_overrides", [])) is None):
+                and unified_ep_options(train.get("plan_overrides", [])) is None):
             raise ValueError("Unified HP EP requires enforce_eager=true or the shared graph EP recipe")
     elif accelerator.get("ep", 1) != 1 or vllm.get("expert_parallel_size", 1) != 1:
         raise ValueError("Dense unified execution does not use expert parallelism")
@@ -156,7 +160,13 @@ def _validate_precision(train: Mapping, vllm: Mapping) -> None:
 def validate_unified_config(config: Mapping[str, Any]) -> None:
     """Validate model execution independently of numerical acceptance topologies."""
     if "consistency" not in config:
+        if _mapping(_mapping(config, "train"), "accelerator").get("cp", 1) != 1:
+            raise ValueError(
+                "Hyper-RL invalid topology: cp=1 is required without explicit unified batch-invariant execution"
+            )
         vllm = _mapping(_mapping(config, "rollout"), "vllm")
+        if vllm.get("context_parallel_size", 1) != 1:
+            raise ValueError("Inference PCP requires explicit unified batch-invariant execution")
         if vllm.get("model_implementation") == "unified" or "unified_execution" in vllm:
             raise ValueError("Unified model selection requires an explicit consistency configuration")
         return
@@ -168,12 +178,19 @@ def validate_unified_config(config: Mapping[str, Any]) -> None:
     if rollout.get("engine", "vllm") != "vllm":
         raise ValueError("Unified execution requires vLLM rollout")
     training, inference = _parallel_options(config)
+    _validate_training_cp(config, train, training)
     _validate_model_parallelism(config, family, train, accelerator, vllm, training, inference)
+    if vllm.get("decode_context_parallel_size", 1) != 1:
+        raise ValueError("Unified inference requires DCP=1")
+    if inference["cp"] > 1:
+        validate_pcp_plan(train.get("plan_overrides", []), inference, attention_backend,
+                          _validate_numerical_selection(consistency))
+        if family.moe and (_expert_options(config)["inference"] <= 1
+                           or unified_ep_options(train.get("plan_overrides", [])) is None):
+            raise ValueError("Inference MoE PCP requires graph-capable HP EP > 1")
     if attention_backend == "native" and not vllm.get("enforce_eager", False):
         raise ValueError("Unified execution requires rollout.vllm.enforce_eager=true")
     if attention_backend == "flash_attention_npu_v4":
-        if train.get("accelerator", {}).get("cp", 1) != 1:
-            raise ValueError("FlashAttention NPU V4 training CP is not integrated")
         if vllm.get("attention_backend") not in (None, "CUSTOM"):
             raise ValueError("A unified V4 attention selection cannot be overridden on rollout only")
     _validate_precision(train, vllm)
@@ -181,6 +198,33 @@ def validate_unified_config(config: Mapping[str, Any]) -> None:
             or train.get("colocate_async") or train.get("mode", "sync") != "sync"):
         raise ValueError("Unified execution currently supports synchronous training only")
     split_plan_overrides(train.get("plan_overrides"))
+
+
+def _validate_training_cp(config: Mapping, train: Mapping, topology: Mapping) -> None:
+    """Keep unvalidated RL combinations out of the new sequence-sharded path."""
+    if topology["cp"] == 1:
+        return
+    accelerator = _mapping(train, "accelerator")
+    if (topology["cp"] not in (2, 4) or topology["pp"] != 1
+            or _mapping(config, "algorithm").get("name") != "grpo"
+            or _mapping(config, "algorithm").get("loss_aggregation", "token-mean") != "token-mean"
+            or train.get("token_log_probs_mode", "dense") != "dense"):
+        raise ValueError("Training CP supports CP2/CP4, PP1 and dense token-mean GRPO")
+    unsupported = [key for key in ("max_tokens_per_micro_batch", "old_log_prob_max_tokens_per_micro_batch",
+                                   "reference_log_prob_max_tokens_per_micro_batch", "balance_dp_tokens")
+                   if train.get(key)]
+    if (unsupported or accelerator.get("activation_checkpoint", "off") not in ("off", False)
+            or accelerator.get("loss_parallel", False) or "distillation" in config
+            or _mapping(train, "router_replay").get("mode", "off") not in ("off", "disabled", None)):
+        raise ValueError("Training CP does not support dynamic batching, AC, loss parallel, distillation or replay")
+    validate_cp_plan(train.get("plan_overrides", []), topology,
+                     _mapping(config, "consistency").get("attention_backend"),
+                     _validate_numerical_selection(_mapping(config, "consistency")))
+    if get_model_family(_mapping(config, "model").get("name")).moe:
+        experts = _expert_options(config)
+        if (min(experts.values()) <= 1
+                or unified_ep_options(train.get("plan_overrides", [])) is None):
+            raise ValueError("Training MoE CP requires the graph-capable EP recipe on both sides with EP > 1")
 
 
 def _validate_parallelism(value: Mapping) -> dict[str, Any]:
@@ -202,10 +246,9 @@ def _validate_parallelism(value: Mapping) -> dict[str, Any]:
 def _validate_inference_parallelism(value: Mapping) -> dict[str, Any]:
     """Reject axes without a shared HP paged-inference execution path."""
     result = _validate_parallelism(value)
-    if result["cp"] != 1 or result["pp"] != 1:
+    if result["cp"] not in (1, 2, 4) or result["pp"] != 1:
         raise ValueError(
-            "Unified inference currently supports HP TP/SP only; inference CP and PP must be 1. "
-            "Training CP/PP cannot be reused until their HP execution paths support paged inference."
+            "Unified inference supports PCP1/PCP2/PCP4 with PP=1 and DCP=1."
         )
     return result
 
@@ -220,7 +263,7 @@ def _parallel_options(config: Mapping) -> tuple[dict, dict]:
     })
     inference = _validate_inference_parallelism({
         "tp": vllm.get("tensor_parallel_size", training["tp"]),
-        "cp": vllm.get("context_parallel_size", training["cp"]),
+        "cp": vllm.get("context_parallel_size", 1),
         "pp": vllm.get("pipeline_parallel_size", training["pp"]),
         "sequence_parallel": vllm.get("sequence_parallel", training["sequence_parallel"]),
     })
@@ -230,24 +273,27 @@ def _parallel_options(config: Mapping) -> tuple[dict, dict]:
 def _validate_moe_parallelism(training: Mapping, inference: Mapping) -> None:
     """Keep unsupported context and pipeline execution out of the MoE contract."""
     for parallelism in (training, inference):
-        if any(parallelism[axis] != 1 for axis in ("cp", "pp")):
-            raise ValueError("Unified Qwen3-MoE requires CP/PP=1")
+        if parallelism["pp"] != 1:
+            raise ValueError("Unified Qwen3-MoE requires PP=1")
 
 
 def _expert_options(config: Mapping) -> dict[str, int]:
-    """Validate expert sizes against each side's DP and TP domain."""
+    """Validate expert degrees against the full training and inference rank domains."""
     train = _mapping(_mapping(config, "train"), "accelerator")
     rollout = _mapping(_mapping(config, "rollout"), "vllm")
     result = _validate_expert_options({
         "training": train.get("ep", 1), "inference": rollout.get("expert_parallel_size", train.get("ep", 1)),
     })
     domains = {
-        "training": train.get("dp_replicate", 1) * train.get("dp_shard", 1) * train.get("tp", 1),
-        "inference": rollout.get("data_parallel_size", 1) * rollout.get("tensor_parallel_size", train.get("tp", 1)),
+        "training": (train.get("dp_replicate", 1) * train.get("dp_shard", 1)
+                     * train.get("cp", 1) * train.get("tp", 1)),
+        "inference": (rollout.get("data_parallel_size", 1) * rollout.get("context_parallel_size", 1)
+                      * rollout.get("tensor_parallel_size", train.get("tp", 1))),
     }
     for side, size in result.items():
         if domains[side] % size:
-            raise ValueError(f"Unified {side} EP={size} must divide DP x TP={domains[side]}")
+            axes = "DP x CP x TP" if side == "training" else "DP x PCP x TP"
+            raise ValueError(f"Unified {side} EP={size} must divide {axes}={domains[side]}")
     return result
 
 
@@ -289,8 +335,8 @@ def _make_payload(entries: list, attn_implementation: str, training: Mapping, in
     policy = _validate_numerical_selection(result)
     if policy is not None:
         result["batch_invariant"] = policy
-    if attention_backend == "flash_attention_npu_v4" and result["training_parallelism"]["cp"] != 1:
-        raise ValueError("FlashAttention NPU V4 training CP is not integrated")
+    validate_cp_plan(entries, result["training_parallelism"], attention_backend, policy)
+    validate_pcp_plan(entries, result["parallelism"], attention_backend, policy)
     result["plan_fingerprint"] = fingerprint(result)
     return result
 

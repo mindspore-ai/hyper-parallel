@@ -16,21 +16,25 @@
 
 from __future__ import annotations
 
+import inspect
 from fnmatch import fnmatchcase
 from functools import lru_cache, partial
-import inspect
 from types import CodeType
-from typing import Any
+from typing import Any, Callable
 
 from torch import nn
 
-from rl.unified_execution.models import get_model_family
-from rl.unified_execution.contract import fingerprint, parse_unified_payload
-from rl.unified_execution.execution_plan import fixed_capacity_ep_capacity, pik_row_matches, pik_row_options
-from rl.workers.adapters.log_probs import bind_token_log_probs
 from hyper_parallel.components.modules.gqa_attention import GQAAttention
 from hyper_parallel.core.activation_memory.wrapper import CheckpointExcludeWrapper, CheckpointWrapper, SwapWrapper
 from hyper_parallel.distributed._builder import forward_rewriter
+from rl.unified_execution.core.contract import fingerprint, parse_unified_payload
+from rl.unified_execution.core.execution_plan import (
+    pik_row_matches,
+    pik_row_options,
+    unified_ep_options,
+)
+from rl.unified_execution.models import get_model_family
+from rl.workers.adapters.log_probs import bind_token_log_probs
 
 
 def _module_type(module: Any) -> str:
@@ -68,6 +72,7 @@ def _forward_wrapper_targets() -> dict[CodeType, str]:
         "_wrap_validate_forward": ("validate_forward", "original_forward"),
         "_wrap_local_region_forward": ("local_region_forward", "compute_fn"),
         "_wrap_module_forward": ("local_param_forward", "original_forward"),
+        "_install_inner_adapter": ("adapted", "user_fwd"),
     }
     for factory_name, (wrapper_name, target_name) in factories.items():
         factory = getattr(forward_rewriter, factory_name)
@@ -147,7 +152,8 @@ def validate_attention_execution_path(model: nn.Module) -> tuple[nn.Module, list
     return decoder, attentions
 
 
-def capture_training_structure(model: Any, payload: dict, *, inference: bool = False) -> dict[str, Any]:
+def capture_training_structure(model: Any, payload: dict, *, inference: bool = False,
+                               ep_validator: Callable | None = None) -> dict[str, Any]:
     """Check actual replacement coverage and fingerprint shared computation.
 
     The same audit runs on inference before adding its attention cache bridge.
@@ -163,14 +169,14 @@ def capture_training_structure(model: Any, payload: dict, *, inference: bool = F
     if family.moe:
         ep_size = payload.get("expert_parallelism", {}).get("inference" if inference else "training", 1)
         _validate_moe_components(model, family.execution_types(), family.router_adapter, ep_size,
-                                 fixed_capacity_ep_capacity(payload["plan_overrides"]))
+                                 unified_ep_options(payload["plan_overrides"]), ep_validator)
     _validate_pik_components(model, payload, inference=inference)
     structure = model_structure(model)
     replaced = set(getattr(model, "_hp_replaced_module_fqns", ()))
     parallelism = payload["parallelism" if inference else "training_parallelism"]
     for entry in payload["compute_plan_overrides"]:
         condition = entry.get("when")
-        enabled = {"cp": parallelism["cp"] > 1, "ep": False, "low_precision": False,
+        enabled = {"cp": not inference and parallelism["cp"] > 1, "ep": False, "low_precision": False,
                    "sequence_parallel": parallelism["sequence_parallel"]}
         if condition is not None and not enabled[condition]:
             continue
@@ -183,7 +189,8 @@ def capture_training_structure(model: Any, payload: dict, *, inference: bool = F
 
 
 def _validate_moe_components(model: nn.Module, owners: dict[str, type], router_adapter: str, ep_size: int = 1,
-                             graph_capacity: int | None = None) -> None:
+                             role_recipe: dict | None = None,
+                             ep_validator: Callable | None = None) -> None:
     """Require the shared HP expert implementation and authoritative HF routing."""
     # Only a MoE model needs the optional native grouped-expert implementation.
     from hyper_parallel.components.modules.grouped_experts import GroupedExperts  # pylint: disable=C0415
@@ -194,7 +201,8 @@ def _validate_moe_components(model: nn.Module, owners: dict[str, type], router_a
         if not hasattr(mlp, "experts"):
             continue
         if ep_size > 1:
-            _validate_ep_compute(mlp, ep_size, f"layers.{index}.mlp", router_adapter, graph_capacity)
+            _validate_ep_compute(mlp, ep_size, f"layers.{index}.mlp", router_adapter,
+                                 role_recipe, ep_validator)
         else:
             _require_forward_path(mlp, (owners["moe_block"].forward,), f"layers.{index}.mlp.forward")
             _require_forward_path(mlp.experts, (GroupedExperts.forward,), f"layers.{index}.mlp.experts.forward")
@@ -202,16 +210,19 @@ def _validate_moe_components(model: nn.Module, owners: dict[str, type], router_a
 
 
 def _validate_ep_compute(module: nn.Module, ep_size: int, path: str, router_adapter: str,
-                         graph_capacity: int | None = None) -> None:
+                         role_recipe: dict | None = None,
+                         ep_validator: Callable | None = None) -> None:
     """Audit HP's installed EP factory and real router, retaining its communication."""
     # EP dependencies are optional for Dense model execution.
     from hyper_parallel.distributed.expert_parallel import experts, recipes, routing  # pylint: disable=C0415
 
     expert_forward = experts._local_swiglu_expert_forward  # pylint: disable=protected-access
     function = _forward_leaf(module, path)
-    if graph_capacity is not None:
-        _validate_graph_ep_compute(module, function, ep_size, graph_capacity, path,
-                                  routing.MOE_ROUTER_ADAPTERS[router_adapter])
+    if role_recipe is not None:
+        if ep_validator is None:
+            raise ValueError("Unified EP audit requires the caller's role validator")
+        ep_validator(module, function, ep_size, path,
+                     routing.MOE_ROUTER_ADAPTERS[router_adapter], role_recipe)
         _require_forward_path(module.experts, (expert_forward,), path + ".experts")
         return
     if not isinstance(function, partial) or function.args != (module,) or function.keywords:
@@ -232,28 +243,6 @@ def _validate_ep_compute(module: nn.Module, ep_size: int, path: str, router_adap
         raise ValueError("Unified EP requires the HP grouped GEMM expert recipe")
 
 
-def _validate_graph_ep_compute(module: nn.Module, function: Any, ep_size: int, capacity: int, path: str,
-                               router_fn: Any) -> None:
-    """Audit the opt-in transport without weakening the original HP recipe check."""
-    # EP computation is optional for Dense models and configuration-only processes.
-    from rl.unified_execution.components.moe import fixed_capacity_ep_compute_fn  # pylint: disable=C0415
-
-    if not isinstance(function, partial) or function.args != (module,) or function.keywords:
-        raise ValueError(f"Unified graph EP requires the shared bound computation at {path}")
-    expected_codes = {item for item in fixed_capacity_ep_compute_fn.__code__.co_consts
-                      if isinstance(item, CodeType) and item.co_name == "compute_fn"}
-    if getattr(function.func, "__code__", None) not in expected_codes:
-        raise ValueError(f"Unified graph EP requires the shared recipe at {path}")
-    options = inspect.getclosurevars(function.func).nonlocals["options"]
-    if set(options) != {"group", "rank", "world_size", "local_experts", "capacity", "router_fn"}:
-        raise ValueError(f"Unified graph EP received unknown execution options at {path}")
-    if (options["router_fn"] is not router_fn or options["capacity"] != capacity or options["world_size"] != ep_size
-            or options["group"].size() != ep_size or options["group"].rank() != options["rank"]
-            or options["local_experts"] != module.experts.local_expert_count
-            or not getattr(module.experts, "_ep_use_grouped_gemm", False)):
-        raise ValueError(f"Unified graph EP computation differs from its shared plan at {path}")
-
-
 def _validate_pik_components(model: nn.Module, payload: dict, *, inference: bool) -> None:
     """Check every row replacement after HP build, before model execution."""
     family = payload.get("model_family", "qwen3")
@@ -261,18 +250,23 @@ def _validate_pik_components(model: nn.Module, payload: dict, *, inference: bool
     if options is None:
         return
     # The NPU computation adapter is optional for non-PIK configurations.
-    from rl.unified_execution.components.row_parallel import PikLinear, pik_row_compute_fn  # pylint: disable=C0415
+    from rl.unified_execution.models.bindings import PikLinear, pik_row_compute_fn  # pylint: disable=C0415
 
     codes = {code for code in pik_row_compute_fn.__code__.co_consts
              if isinstance(code, CodeType) and code.co_name == "compute_fn"}
     topology = payload["parallelism" if inference else "training_parallelism"]
-    model.unified_sequence_multiple = topology["tp"] if topology["sequence_parallel"] else 1
+    sequence_cp = 1 if inference else topology["cp"]
+    model.unified_sequence_multiple = sequence_cp * (topology["tp"] if topology["sequence_parallel"] else 1)
     for index, wrapped_layer in enumerate(model.model.layers):
         layer = _unwrap_activation_module(wrapped_layer)
         for pattern in pik_row_matches(family):
             parent_name, child = pattern.split(".")[-2:]
             parent = getattr(layer, parent_name)
             parent = _unwrap_activation_module(parent)
+            if not inference and topology["cp"] > 1 and parent_name == get_model_family(family).attention_attribute:
+                cp_mesh = getattr(parent, "unified_cp_mesh", None)
+                if cp_mesh is None or cp_mesh.size() != topology["cp"]:
+                    raise ValueError("Training CP attention was not bound to the requested HP mesh")
             sp = topology["sequence_parallel"] and topology["tp"] > 1
             if topology["tp"] > 1:
                 _validate_pik_boundary(parent, f"layers.{index}", sp=sp)

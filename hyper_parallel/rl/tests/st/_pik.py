@@ -24,7 +24,7 @@ import torch.distributed as dist
 import torch.distributed.nn.functional as dist_func
 import torch_npu
 
-from rl.unified_execution.components.row_parallel import PikLinear
+from rl.unified_execution.models.bindings import PikLinear
 from rl.unified_execution.ops.pik import PikPlan, pik_linear, prepare_pik
 from rl.unified_execution.ops.pik.reduction import fixed_tree
 

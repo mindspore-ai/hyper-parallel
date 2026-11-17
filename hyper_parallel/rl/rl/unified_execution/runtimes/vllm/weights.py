@@ -23,7 +23,6 @@ from typing import Any
 import torch
 from torch import nn
 
-from rl.weight_sync.model_adapter import expert_weight_slices
 from hyper_parallel.components.checkpoint.conversion_ops import ConcatenateWithSections, InterleaveQKV
 from hyper_parallel.components.checkpoint.load_groups import (
     local_target_tensor,
@@ -34,6 +33,7 @@ from hyper_parallel.components.checkpoint.load_groups import (
 from hyper_parallel.core.dtensor.dtensor import distribute_tensor
 from hyper_parallel.core.dtensor.layout import infer_slice_area_by_layout
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
+from rl.weight_sync.model_adapter import expert_weight_slices
 
 
 @dataclass(frozen=True)
@@ -124,6 +124,11 @@ class LogicalWeightLoader:
 
         Logical Q/K/V buckets can arrive independently. Only owned rows are
         copied, so no full fused projection or retained bucket is necessary.
+
+        rows [R] maps the incoming value [R, ...] to global fused-parameter rows.
+        Intersecting that mapping with the HP layout selects both source rows
+        and local destination offsets. Column/other-axis shards use the same
+        layout, and index_copy_ preserves Parameter storage for captured graphs.
         """
         parameter = self.parameters[name]
         local = local_target_tensor(parameter)
@@ -222,6 +227,8 @@ class LogicalWeightLoader:
         value = value.to(device=parameter.device, dtype=parameter.dtype)
         aliases = self.required[id(parameter)]
         local = local_target_tensor(parameter)
+        # Captured graphs retain these parameter storage addresses. Publish by
+        # copying into the HP-owned shard, never by replacing its Parameter.
         if destination.region is not None:
             if destination.local_region is not None:
                 local[destination.local_region].copy_(value.transpose(-1, -2).unsqueeze(0))

@@ -20,8 +20,8 @@ Ascend retains cache allocation, writes, transfers and scheduler metadata.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -36,9 +36,10 @@ from vllm_ascend.attention.attention_v1 import (
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import attention_transfer_window
 
 from rl.unified_execution.ops.attention.flash_attention_npu_v4 import (
-    prepare_scheduler_metadata, require_attention_provider, varlen_attention,
+    prepare_scheduler_metadata,
+    require_attention_provider,
+    varlen_attention,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,8 @@ class UnifiedAttentionMetadataBuilder(AscendAttentionMetadataBuilder):
         if not common_attn_metadata.causal:
             raise ValueError("Unified V4 attention supports causal decoder attention only")
         metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        # Native PCP owns query partitioning and full-prefix cache metadata.
+        # Retain those coordinates; rebuilding lengths from local rows loses history.
         num_reqs = common_attn_metadata.num_reqs
         query_start_loc = common_attn_metadata.query_start_loc
         seq_lens = common_attn_metadata.seq_lens
@@ -119,8 +122,8 @@ class UnifiedAscendAttentionBackend(AscendAttentionBackend):
 
     @classmethod
     def supports_pcp(cls) -> bool:
-        """Keep context parallelism outside the unified Qwen3 contract."""
-        return False
+        """Reuse native PCP partitioning and full-prefix KV cache ownership."""
+        return True
 
 
 class UnifiedAscendAttentionImpl(AscendAttentionBackendImpl):
@@ -147,10 +150,11 @@ class UnifiedAscendAttentionImpl(AscendAttentionBackendImpl):
             kv_cache_dtype, logits_soft_cap, attn_type, kv_sharing_target_layer_name, sinks, **kwargs,
         )
         parallel = self.vllm_config.parallel_config
-        if any(getattr(parallel, name, 1) != 1 for name in (
-            "prefill_context_parallel_size", "decode_context_parallel_size",
-        )):
-            raise ValueError("Unified V4 attention requires context parallel sizes of one")
+        if getattr(parallel, "decode_context_parallel_size", 1) != 1:
+            raise ValueError("Unified V4 attention requires DCP=1")
+        # Native Ascend enables its PCP cache writer only for its exact impl type.
+        # Opt this subclass into that writer; CP1 retains the original branch.
+        self.pcp_enabled = getattr(parallel, "prefill_context_parallel_size", 1) > 1
         if self.vllm_config.speculative_config is not None:
             raise ValueError("Unified V4 attention does not support speculative decoding")
         if self.vllm_config.model_config.runner_type != "generate":
@@ -182,6 +186,11 @@ class UnifiedAscendAttentionImpl(AscendAttentionBackendImpl):
         Native ``forward`` already wrote current K/V using ``slot_mapping``.
         V4's bottom-right causal mask handles an existing prefix and mixed
         query lengths without splitting requests or unpacking cached history.
+
+        query is [Tq, Nq, D] in native scheduler order. The physical cache is
+        viewed as [pages, block_size, Nkv, D]; block_tables [requests, blocks]
+        and cumulative query offsets [requests+1] define logical attention.
+        output is the caller-owned buffer; copy_ preserves its graph address.
         """
         del key, value, kv_cache
         if not attn_metadata.causal:
@@ -195,7 +204,7 @@ class UnifiedAscendAttentionImpl(AscendAttentionBackendImpl):
         num_reqs = seq_lens.shape[0]
         if attn_metadata.block_tables.shape[0] < num_reqs:
             raise ValueError("Unified V4 attention requires one block-table row per request")
-        if query.shape[0] == 0:
+        if query.shape[0] == 0 or (self.pcp_enabled and num_reqs == 0):
             return output.zero_()
         if attn_metadata.v4_scheduler_metadata is None:
             raise ValueError("Unified V4 attention requires scheduler metadata prepared before graph capture")
@@ -204,6 +213,8 @@ class UnifiedAscendAttentionImpl(AscendAttentionBackendImpl):
             # V4 accepts BNBD physical strides with logical page/token/head axes.
             key_cache = key_cache.transpose(1, 2)
             value_cache = value_cache.transpose(1, 2)
+        # Keep the paged history and absolute logical lengths. V4 performs one
+        # causal attention over the full prefix, without a cross-PCP softmax reduction.
         with attention_transfer_window():
             result = varlen_attention(
                 query, key_cache, value_cache,

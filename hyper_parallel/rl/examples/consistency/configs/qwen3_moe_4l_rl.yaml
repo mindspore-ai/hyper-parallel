@@ -1,5 +1,6 @@
+# Four-NPU baseline: train TP4/SP/EP4; rollout TP2/DP2/PCP1/EP4.
 # Ordinary attention o_proj only; expert arithmetic is unchanged and ETP is not enabled.
-# Shared HP MoE with fixed-capacity EP transport; identical recipe on Actor and rollout.
+# Shared MoE arithmetic; dynamic training EP and graph-capable inference EP.
 model:
   registry_name: qwen3_moe_4l
   name: qwen3_moe
@@ -34,6 +35,8 @@ rollout:
     port: 8100
     model_implementation: unified
     tensor_parallel_size: 2
+    context_parallel_size: 1
+    decode_context_parallel_size: 1
     weight_sync:
       strategy: full_gather
       bucket_size_mb: 128
@@ -109,7 +112,7 @@ train:
       kind: module
       source_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention
       implementation:
-        _target_: rl.unified_execution.components.row_parallel.replace_attention_with_pik
+        _target_: rl.unified_execution.models.bindings.replace_attention_with_pik
         num_leaves: 8
         leaf_layout: strided
         fill_uninitialized_memory: false
@@ -126,13 +129,13 @@ train:
     replace:
       kind: method
       implementation:
-        _target_: rl.unified_execution.components.moe.fixed_capacity_ep_compute_fn
-        capacity: 256
+        _target_: rl.unified_execution.runtimes.hyper_parallel.moe.unified_ep_compute_fn
+        mc2_capacity: 256
   - match: '*.self_attn.o_proj.forward'
     replace:
       kind: method
       implementation:
-        _target_: rl.unified_execution.components.row_parallel.pik_row_compute_fn
+        _target_: rl.unified_execution.models.bindings.pik_row_compute_fn
         sequence_parallel: false
     params: {}
     in_src:
@@ -148,7 +151,7 @@ train:
     replace:
       kind: method
       implementation:
-        _target_: rl.unified_execution.components.row_parallel.pik_row_compute_fn
+        _target_: rl.unified_execution.models.bindings.pik_row_compute_fn
         sequence_parallel: true
     params: {}
     in_src:

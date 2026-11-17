@@ -15,16 +15,15 @@
 """Generated fixed-order Ascend Triton tree, one launch for all levels."""
 from __future__ import annotations
 
-from functools import lru_cache
 import hashlib
 import importlib.util
 import os
-from pathlib import Path
 import tempfile
+from functools import lru_cache
+from pathlib import Path
 
 import torch
 import triton
-
 
 _TEMPLATE = '''import triton
 import triton.language as tl

@@ -16,16 +16,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 import importlib
 import logging
 import os
 import sys
+from collections.abc import Mapping
 from typing import Any
 
 import torch
 import torch.utils.deterministic
-
 
 _POLICY = {
     "provider": "torch_npu_level3",
@@ -136,7 +135,7 @@ def initialize_batch_invariant(policy: Mapping[str, Any]) -> dict[str, Any]:
     device = f"npu:{backend.npu.current_device()}"
     _PROCESS_STATE = {"pid": pid, "policy": normalized, "backend": backend,
                       "device": device, "ready": False, **versions}
-    backend.npu.set_deterministic_level(3)
+    backend.npu.set_deterministic_level(3) # set batch invarient
     torch.utils.deterministic.fill_uninitialized_memory = normalized["fill_uninitialized_memory"]
     with torch.no_grad():
         left = torch.ones((1, 16), dtype=torch.bfloat16, device=device)

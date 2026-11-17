@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""JSON-only contracts for shared row projections and fixed-capacity EP."""
+"""JSON-only contracts for shared row projections and role-specific EP."""
 
 from __future__ import annotations
 
@@ -21,11 +21,12 @@ from fnmatch import fnmatchcase
 
 from rl.unified_execution.models import get_model_family, model_families
 
-
-FIXED_EP_TARGET = "rl.unified_execution.components.moe.fixed_capacity_ep_compute_fn"
-PIK_ROW_TARGET = "rl.unified_execution.components.row_parallel.pik_row_compute_fn"
-PIK_ATTENTION_TARGET = "rl.unified_execution.components.row_parallel.replace_attention_with_pik"
-PIK_MODULE_TARGET = "rl.unified_execution.components.row_parallel.replace_pik_linear"
+UNIFIED_EP_TARGET = "rl.unified_execution.runtimes.hyper_parallel.moe.unified_ep_compute_fn"
+INFERENCE_EP_TARGET = "rl.unified_execution.runtimes.vllm.moe.inference_ep_compute_fn"
+PIK_ROW_TARGET = "rl.unified_execution.models.bindings.pik_row_compute_fn"
+PIK_ATTENTION_TARGET = "rl.unified_execution.models.bindings.replace_attention_with_pik"
+PIK_MODULE_TARGET = "rl.unified_execution.models.bindings.replace_pik_linear"
+CP_ATTENTION_TARGET = "rl.unified_execution.runtimes.hyper_parallel.attention.unified_cp_attention_wrapper"
 
 
 def pik_row_matches(family: str) -> tuple[str, ...]:
@@ -137,25 +138,50 @@ def validate_pik_contract(plan: list[dict], policy: dict | None, family: str,
     if policy is None or policy["fill_uninitialized_memory"] != options["fill_uninitialized_memory"]:
         raise ValueError("PIK requires the same explicit Level 3 policy on both sides")
     for topology in (training, inference):
-        if topology["cp"] != 1 or topology["pp"] != 1:
-            raise ValueError("PIK model integration currently requires CP=PP=1")
+        if topology["pp"] != 1:
+            raise ValueError("PIK requires PP=1")
         if options["num_leaves"] % topology["tp"]:
             raise ValueError("Both training and inference TP must divide the fixed PIK leaf count")
 
 
-def fixed_capacity_ep_capacity(plan: list[dict]) -> int | None:
-    """Return the explicit all-layer EP capacity, or None for the original recipe."""
+def validate_cp_plan(plan: list[dict], training: dict, backend: str, policy: dict | None) -> None:
+    """Require one explicit all-layer CP binding and the established numerical recipe."""
+    if training["cp"] == 1:
+        return
+    entries = [entry for entry in plan if entry.get("when") == "cp"]
+    if (backend != "flash_attention_npu_v4" or policy is None or len(entries) != 1
+            or entries[0].get("match") != "*.self_attn.forward"
+            or entries[0].get("replace") != {
+                "kind": "method", "implementation": {"_target_": CP_ATTENTION_TARGET}}):
+        raise ValueError("Training CP requires Level 3 V4 and one explicit shared CP attention binding")
+    if pik_row_options(plan) is None:
+        raise ValueError("Training CP consistency requires the shared PIK attention recipe")
+
+
+def validate_pcp_plan(plan: list[dict], inference: dict, backend: str, policy: dict | None) -> None:
+    """Keep prefill CP on the shared V4/PIK arithmetic without a training CP wrapper."""
+    if inference["cp"] == 1:
+        return
+    if backend != "flash_attention_npu_v4" or policy is None or pik_row_options(plan) is None:
+        raise ValueError("Inference PCP requires Level 3 V4 and the shared PIK recipe")
+
+
+def unified_ep_options(plan: list[dict]) -> dict | None:
+    """Validate the all-layer role recipe; mc2_capacity bounds only the MC2 fast path."""
     entries = [entry for entry in plan if entry.get("match") == "*.mlp.forward" and entry.get("when") == "ep"]
-    if not entries:
+    if not any(_target(entry) == UNIFIED_EP_TARGET for entry in entries):
         return None
-    implementation = entries[-1].get("replace", {}).get("implementation", {})
-    if not isinstance(implementation, Mapping) or implementation.get("_target_") != FIXED_EP_TARGET:
-        return None
-    if len(entries) != 1 or entries[-1]["replace"].get("kind") != "method":
-        raise ValueError("Graph EP requires one unambiguous shared all-layer method recipe")
-    if set(implementation) - {"_target_", "capacity"}:
-        raise ValueError("Graph EP supports only the capacity recipe option")
-    capacity = implementation.get("capacity", 256)
-    if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 1:
-        raise ValueError("Graph EP capacity must be a positive integer")
-    return capacity
+    if len(entries) != 1 or entries[0]["replace"].get("kind") != "method":
+        raise ValueError("Unified EP requires one unambiguous shared all-layer method recipe")
+    implementation = entries[0]["replace"]["implementation"]
+    if not isinstance(implementation, Mapping):
+        raise ValueError("Unified EP requires explicit implementation options")
+    if set(implementation) - {"_target_", "mc2_capacity", "inference_backend"}:
+        raise ValueError("Unified EP received unknown recipe options")
+    mc2_capacity = implementation.get("mc2_capacity", 256)
+    if not isinstance(mc2_capacity, int) or isinstance(mc2_capacity, bool) or mc2_capacity < 1:
+        raise ValueError("MC2 capacity must be a positive integer")
+    backend = implementation.get("inference_backend", "auto")
+    if backend not in ("auto", "mc2", "allgather"):
+        raise ValueError("Unified EP inference_backend must be auto, mc2 or allgather")
+    return {"mc2_capacity": mc2_capacity, "inference_backend": backend}

@@ -66,7 +66,11 @@ _patch_state = _PatchState()
 
 
 def _rollout_worker_topology(worker: Any) -> dict[str, Any]:
-    """Return this worker's explicit DP, TP, and physical-device identity."""
+    """Return publication replica, TP and physical-device identity.
+
+    Publication replicas flatten DP x PCP so every cache/model replica receives
+    each version. TP retains its actual width for logical weight conversion.
+    """
     from vllm.distributed import get_tp_group  # pylint: disable=C0415
     from vllm_ascend.distributed.weight_transfer.npu_ipc_engine import (  # pylint: disable=C0415
         npu_generate_uuid,
@@ -100,6 +104,14 @@ def _rollout_worker_topology(worker: Any) -> dict[str, Any]:
     else:
         dp_rank = int(parallel_config.data_parallel_index)
         dp_size = int(parallel_config.data_parallel_size)
+        pcp_size = int(getattr(parallel_config, "prefill_context_parallel_size", 1))
+        if pcp_size > 1:
+            from vllm.distributed import get_pcp_group  # pylint: disable=C0415
+
+            # Match HP's DP x PCP construction axis: PCP peers may own different
+            # expert shards, so each must receive its own publication endpoint.
+            dp_rank = dp_rank * pcp_size + get_pcp_group().rank_in_group
+            dp_size *= pcp_size
     return {
         "dp_rank": dp_rank,
         "dp_size": dp_size,

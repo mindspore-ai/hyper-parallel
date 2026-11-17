@@ -56,6 +56,7 @@ container="hyper-rl-consistency-$$"
 printf 'Local 4-NPU RL: devices=%s results=%s config=%s\n' "${devices}" "${result_root}" "${config}"
 docker run --rm --name "${container}" --privileged --network=host --shm-size=64g \
     -e "ASCEND_RT_VISIBLE_DEVICES=${devices}" -e PYTHONDONTWRITEBYTECODE=1 \
+    -e "HCCL_BUFFSIZE=${HCCL_BUFFSIZE:-512}" \
     -e HCCL_DETERMINISTIC=true -e OMP_NUM_THREADS=1 -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
     -e VLLM_HOST_IP=127.0.0.1 -e GLOO_SOCKET_IFNAME=lo \
     -e "HCCL_SOCKET_IFNAME=${HCCL_SOCKET_IFNAME:-lo}" \
@@ -87,6 +88,8 @@ docker run --rm --name "${container}" --privileged --network=host --shm-size=64g
         ln -s /workspace/hyper_parallel /tmp/hp-install/hyper_parallel
         python -m pip install --no-deps --no-build-isolation -e /tmp/hp-install
         bash hyper_parallel/rl/docker/install_runtime.sh
+        # The pinned image predates the HP PEFT dependency; preserve all numerical packages.
+        python -m pip install --no-deps peft==0.21.2 accelerate==1.12.0
         python -m pip check
         python -m pip freeze > /results/run/environment.txt
         python hyper_parallel/rl/examples/consistency/scripts/prepare_checkpoint.py \

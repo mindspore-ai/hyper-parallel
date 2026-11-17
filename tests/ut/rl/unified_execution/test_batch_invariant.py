@@ -26,12 +26,12 @@ from unittest.mock import Mock, patch
 import torch
 from torch import nn
 
-from rl.unified_execution import batch_invariant as bi
-from rl.unified_execution.batch_invariant import normalize_policy
-from rl.unified_execution.contract import build_unified_payload
-from rl.unified_execution.runtimes.hyper_parallel.training import guard_training_numerics
-from rl.unified_execution.runtimes.vllm.model_adapter import HyperParallelQwen3ForCausalLM
-from rl.unified_execution.runtimes.vllm.parallel_context import InferenceParallelContext
+from rl.unified_execution.core import batch_invariant as bi
+from rl.unified_execution.core.batch_invariant import normalize_policy
+from rl.unified_execution.core.contract import build_unified_payload
+from rl.unified_execution.runtimes.hyper_parallel.attention import guard_training_numerics
+from rl.unified_execution.runtimes.vllm.model import HyperParallelQwen3ForCausalLM
+from rl.unified_execution.runtimes.vllm.parallel import InferenceParallelContext
 from rl.weight_sync import vllm_worker
 from rl.workers.engine.model import UNIFIED_QWEN3_ARCHITECTURE
 
@@ -201,7 +201,7 @@ class TestTrainingNumericalGuard(unittest.TestCase):
         model = nn.Linear(3, 2)
         parameters = tuple(model.parameters())
         optimizer = torch.optim.SGD(parameters, lr=0.1)
-        with patch("rl.unified_execution.runtimes.hyper_parallel.training.verify_batch_invariant") as verify:
+        with patch("rl.unified_execution.runtimes.hyper_parallel.attention.verify_batch_invariant") as verify:
             guard_training_numerics(model, _policy())
             guard_training_numerics(model, _policy())
             verify.reset_mock()
@@ -215,7 +215,7 @@ class TestTrainingNumericalGuard(unittest.TestCase):
     def test_drift_rejects_forward_before_model_body(self) -> None:
         """An altered process policy cannot execute the guarded training model."""
         model = nn.Linear(3, 2)
-        with patch("rl.unified_execution.runtimes.hyper_parallel.training.verify_batch_invariant") as verify:
+        with patch("rl.unified_execution.runtimes.hyper_parallel.attention.verify_batch_invariant") as verify:
             guard_training_numerics(model, _policy())
             verify.side_effect = RuntimeError("policy drift")
             with patch.object(model, "forward", wraps=model.forward) as forward:
@@ -258,6 +258,7 @@ class TestInferenceNumericalBoundaries(unittest.TestCase):
         self.build = self._patch("build_inference_model", "build", self.hp_model)
         self._patch("capture_training_structure", "structure", {"fingerprint": "structure"})
         self._patch("install_paged_attention", "attention", None)
+        self.install_log_probs = self._patch("install_pcp_log_probs", "log_probs", None)
 
     def _patch(self, name: str, event: str, result: object) -> Mock:
         def record(*_args: object, **_kwargs: object) -> object:
@@ -265,7 +266,7 @@ class TestInferenceNumericalBoundaries(unittest.TestCase):
             self.events.append(event)
             return result
 
-        patcher = patch(f"rl.unified_execution.runtimes.vllm.model_adapter.{name}", side_effect=record)
+        patcher = patch(f"rl.unified_execution.runtimes.vllm.model.{name}", side_effect=record)
         mocked = patcher.start()
         self.addCleanup(patcher.stop)
         return mocked
@@ -278,6 +279,14 @@ class TestInferenceNumericalBoundaries(unittest.TestCase):
         self.verify.assert_called_once_with(_policy())
         self.assertIs(wrapper.lm_head.weight, self.hp_model.lm_head.weight)
         self.assertIs(wrapper.model.embed_tokens.weight, self.hp_model.model.embed_tokens.weight)
+        self.install_log_probs.assert_not_called()
+
+    def test_returned_log_prob_adapter_is_installed_only_for_pcp_workers(self) -> None:
+        """PCP must opt in explicitly; the ordinary worker keeps its native sampler."""
+        module = "rl.unified_execution.runtimes.vllm.model"
+        with patch(module + ".build_parallel_context", return_value=InferenceParallelContext(pcp_size=2)):
+            HyperParallelQwen3ForCausalLM(vllm_config=self.config)
+        self.install_log_probs.assert_called_once_with()
 
     def test_publication_drift_preserves_weight_loader_transaction(self) -> None:
         """A failed policy check cannot start or finish a weight transaction."""

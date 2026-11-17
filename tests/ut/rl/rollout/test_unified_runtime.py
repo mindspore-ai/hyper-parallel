@@ -27,7 +27,7 @@ from unittest.mock import AsyncMock, Mock, call, patch
 from rl.config.resolve import resolve_unified_execution_config
 from rl.rollout import vllm_plugin
 from rl.rollout.vllm import VLLMGenerationEngine
-from rl.unified_execution.contract import build_unified_payload
+from rl.unified_execution.core.contract import build_unified_payload
 from rl.weight_sync import vllm_worker
 from rl.weight_sync.vllm_worker import _finish_custom_weight_update, _load_packed_weights
 from rl.workers.engine.model import UNIFIED_MODEL_ARCHITECTURES, UNIFIED_QWEN3_ARCHITECTURE, ModelRegistration
@@ -121,7 +121,7 @@ class TestUnifiedRuntime(unittest.TestCase):
                 patch.object(vllm_plugin, "install_partial_prefill_rng_fix"):
             vllm_plugin.install_runtime_hooks()
         self.assertEqual(registry.register_model.call_args_list, [
-            call(name, f"rl.unified_execution.runtimes.vllm.model_entrypoints:{name}")
+            call(name, f"rl.unified_execution.runtimes.vllm.entrypoints:{name}")
             for name in ("HyperParallelQwen3ForCausalLM", "HyperParallelQwen3MoeForCausalLM")
         ])
 

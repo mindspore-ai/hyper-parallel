@@ -29,9 +29,9 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 import rl
 from rl.config.resolve import build_runtime_config
-from rl.unified_execution.components.row_parallel import PikLinear, pik_row_compute_fn, replace_pik_linear
-from rl.unified_execution.contract import build_unified_payload, parse_unified_payload
-from rl.unified_execution.execution_plan import PIK_MODULE_TARGET, pik_row_matches, pik_row_options
+from rl.unified_execution.models.bindings import PikLinear, pik_row_compute_fn, replace_pik_linear
+from rl.unified_execution.core.contract import build_unified_payload, parse_unified_payload
+from rl.unified_execution.core.execution_plan import PIK_MODULE_TARGET, pik_row_matches, pik_row_options
 from rl.unified_execution.ops.pik import PikContext, PikPlan, linear
 from rl.unified_execution.ops.pik.gemm import batched_leaves
 from rl.unified_execution.ops.pik.reduction import fixed_tree
@@ -158,12 +158,12 @@ class TestPikModel(unittest.TestCase):
         original = torch.nn.Linear(8, 4)
         parameter = original.weight
         context = SimpleNamespace(world_size=1, sequence_parallel=False, group=None)
-        with patch("rl.unified_execution.components.row_parallel.prepare_pik", return_value=context) as prepare:
+        with patch("rl.unified_execution.models.bindings.prepare_pik", return_value=context) as prepare:
             module = replace_pik_linear(module=original, module_fqn="mlp.down_proj", context={})
         self.assertIs(prepare.call_args.kwargs["group"], None)
         self.assertEqual(prepare.call_args.kwargs["policy"], {"fill_uninitialized_memory": False})
         x = torch.randn(2, 3, 8, requires_grad=True)
-        with patch("rl.unified_execution.components.row_parallel.pik_linear",
+        with patch("rl.unified_execution.models.bindings.pik_linear",
                    side_effect=lambda x, w, b, **_: x @ w.T + b):
             module(x).sum().backward()
             self.assertIs(module.weight, parameter)
@@ -178,7 +178,7 @@ class TestPikModel(unittest.TestCase):
             module(torch.randn(1, 2, 8))
         group = object()
         mesh = SimpleNamespace(size=lambda: 2, get_group=lambda: group)
-        with patch("rl.unified_execution.components.row_parallel.prepare_pik",
+        with patch("rl.unified_execution.models.bindings.prepare_pik",
                    return_value=SimpleNamespace()) as prepare:
             pik_row_compute_fn(module=module, mesh=None, tp_mesh=mesh, cp_mesh=None, ep_mesh=None,
                                sequence_parallel=True)
@@ -216,7 +216,7 @@ class TestPikModel(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unconditional"):
             build_unified_payload(config)
         original = torch.nn.Linear(8, 4)
-        with patch("rl.unified_execution.components.row_parallel.prepare_pik", return_value=SimpleNamespace()):
+        with patch("rl.unified_execution.models.bindings.prepare_pik", return_value=SimpleNamespace()):
             row = replace_pik_linear(module=original, module_fqn="self_attn.o_proj", context={"ep": True})
         self.assertIs(row.weight, original.weight)
 

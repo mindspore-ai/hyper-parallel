@@ -5,7 +5,8 @@
 
 ```text
 consistency/
-├── configs/qwen3_moe_4l_rl.yaml
+├── configs/qwen3_moe_4l_rl.yaml      # TP/SP/DP/EP 基线
+├── configs/qwen3_moe_4l_cp_rl.yaml   # 训练 CP、推理 PCP、跨 PCP EP
 └── scripts/
     ├── run_qwen3_moe_docker.sh   # 本机 Docker 入口
     ├── prepare_checkpoint.py    # 裁剪、校验并复用四层权重
@@ -31,7 +32,7 @@ npu-smi info
 
 构建和运行脚本均校验镜像 ID：
 `sha256:f139fa4776cf71fa1ebf00c47fa1f4c313deec48267c2102a1a42d968634fb08`。
-依赖版本见[运行环境](../../rl/unified_execution/README.md#运行环境)。镜像已包含采样器的
+依赖版本见[运行环境](../../docs/unified_execution_guide.md#运行环境)。镜像已包含采样器的
 `q.record_stream(...)` 修复，不需要再执行 `patch_sampler.py`。
 
 准备以下文件；路径相对于仓库根目录：
@@ -103,62 +104,146 @@ bash hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_docker.sh
 启动器依次检查输入、wheel 校验和、镜像身份和设备占用，创建独立容器，安装当前 checkout 与 RL 插件，
 将补丁 wheel 安装到 `/opt/hp-v4`，供训练进程和 vLLM worker 共同加载，然后裁剪权重并执行两步训练。
 源码、完整模型和数据以只读方式挂载；结果保存在宿主 `RESULT_ROOT`，容器退出后保留。
+固定镜像缺少当前 HP 要求的 PEFT 依赖，启动器会下载固定版本 `peft==0.21.2` 和
+`accelerate==1.12.0`，以 `--no-deps` 安装并执行 `pip check`；不会升级 Torch/NPU/V4 等数值依赖。
 首次启动会进行图编译与捕获，需要等待；过程日志写入 `run/train.log`。
 
-默认使用 [qwen3_moe_4l_rl.yaml](configs/qwen3_moe_4l_rl.yaml)，四卡共卡运行：
+默认使用普通并行基线配置。两份 YAML 都显式包含完整替换配方，不通过隐藏的配置继承补充训练参数。
+运行其他组合时只覆盖下面列出的拓扑字段，保持共享数值实现不变。
 
-| 实验         | 训练配置                  | 推理配置                |
-| ------------ | ------------------------- | ----------------------- |
-| 默认配置     | TP4 / SP / EP4            | TP2 / DP2 / 无 SP / EP4 |
-| 下方对照配置 | TP2 / FSDP2 / 无 SP / EP4 | TP4 / SP / EP4          |
+## 配置与验证矩阵
 
-共卡表示两端复用相同四张物理卡；各自按自己的 TP、DP、EP 配置组织进程组。
-`CONFIG=/absolute/path/to/config.yaml` 可选择另一份 YAML；模型、数据的宿主路径通过上面的环境变量修改。
+所有组合使用四张物理卡。训练的进程数为 `DP × TP × CP`，推理 worker 数为 `DP × TP × PCP`；
+不能只改一个并行度而忽略总 worker 数和 EP 整除约束。表中的 DP2 训练指 `dp_shard=2` 的 FSDP 数据并行。
 
-### 4. 验证另一组并行配置
+| 用例 | 配置 | 训练 | 推理 | 主要验证点 |
+| --- | --- | --- | --- | --- |
+| A | 普通基线 | TP4/SP/EP4/CP1 | TP2/DP2/PCP1/EP4，无 SP | 两端 TP 不同，训练开启 SP |
+| B | 普通基线＋覆盖 | TP2/DP2/EP4/CP1，无 SP | TP4/DP1/PCP1/EP4/SP | FSDP 数据并行与推理 SP |
+| C | CP/PCP 配置 | TP2/CP2/EP2/SP | TP2/DP1/PCP2/EP4，无 SP | 跨 CP 前向与跨 PCP 专家域 |
+| D | CP/PCP 配置＋覆盖 | TP2/CP2/EP2/SP | TP2/DP2/PCP1/EP2，无 SP | 只在训练侧开启 CP |
+| E | CP/PCP 配置＋覆盖 | TP2/CP2/EP2/SP | TP2/DP1/PCP2/EP2，无 SP | 相同 PCP 下不同专家组大小 |
+| F | CP/PCP 配置＋覆盖 | TP2/CP2/EP2/SP | TP2/DP1/PCP2/EP4/SP，budget=512 | 推理 SP 与较大合法 batch |
+| G | CP/PCP 配置＋覆盖 | TP2/DP2/CP1/EP2/SP | TP2/DP1/PCP2/EP4，无 SP | 只在推理侧开启 PCP |
 
-默认实验结束后，保持相同模型、数据和 wheel，使用另一个结果目录运行对照：
+两份文件是 [普通基线](configs/qwen3_moe_4l_rl.yaml) 和 [CP/PCP 配置](configs/qwen3_moe_4l_cp_rl.yaml)。
+后者的 CP wrapper 声明为 `when: cp`，因此 G 中 CP1 不安装该 wrapper。
+EP2 自然在 TP2 组内；EP4 跨两个 PCP 平面。两端 CP 不必相同。
+
+保留上文模型、数据、wheel 和 DEVICES 设置；每个用例使用独立 RESULT_ROOT，**依次**运行：
 
 ```bash
-export RESULT_ROOT=/tmp/hyper-rl-consistency/infer-sp
-bash hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_docker.sh \
+runner=hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_docker.sh
+base=hyper_parallel/rl/examples/consistency/configs/qwen3_moe_4l_rl.yaml
+context=hyper_parallel/rl/examples/consistency/configs/qwen3_moe_4l_cp_rl.yaml
+
+# A：默认的不同 TP/SP 组合。
+CONFIG="$base" RESULT_ROOT=/tmp/hyper-rl-consistency/A bash "$runner"
+
+# B：训练 FSDP2，推理开启 SP。
+CONFIG="$base" RESULT_ROOT=/tmp/hyper-rl-consistency/B bash "$runner" \
   --train.accelerator.tp=2 --train.accelerator.dp_shard=2 \
   --train.accelerator.sequence_parallel=false \
   --rollout.vllm.tensor_parallel_size=4 --rollout.vllm.data_parallel_size=1 \
   --rollout.vllm.sequence_parallel=true
+
+# C：训练 CP2，推理 PCP2，专家域跨 PCP。
+CONFIG="$context" RESULT_ROOT=/tmp/hyper-rl-consistency/C bash "$runner"
+
+# D：训练 CP2，推理 PCP1。
+CONFIG="$context" RESULT_ROOT=/tmp/hyper-rl-consistency/D bash "$runner" \
+  --rollout.vllm.context_parallel_size=1 --rollout.vllm.data_parallel_size=2 \
+  --rollout.vllm.expert_parallel_size=2
+
+# E：推理 PCP2/EP2，每个 TP2 组拥有一份完整专家集合。
+CONFIG="$context" RESULT_ROOT=/tmp/hyper-rl-consistency/E bash "$runner" \
+  --rollout.vllm.expert_parallel_size=2
+
+# F：推理 SP，调度预算大于默认 MC2 容量 256。
+CONFIG="$context" RESULT_ROOT=/tmp/hyper-rl-consistency/F bash "$runner" \
+  --rollout.vllm.sequence_parallel=true --rollout.vllm.max_num_batched_tokens=512
+
+# G：训练 CP1/FSDP2，推理仍为 PCP2。
+CONFIG="$context" RESULT_ROOT=/tmp/hyper-rl-consistency/G bash "$runner" \
+  --train.accelerator.cp=1 --train.accelerator.dp_shard=2
 ```
 
-两组实验分别记录结果，方便对照训练开启 SP、推理开启 SP 时的训推一致性。
+这些是可分别复现的验证组合，不表示一次启动会穷举全部拓扑。
+F 提高调度上界，但短 prompt、max_num_seqs 和实际流量决定是否真的超过 MC2 容量；
+不能仅凭 budget=512 就声称已执行 AllGather。后端切换和大 bucket 图回放由下面的 EP 设备测试强制覆盖。
+
+## EP 后端与图模式对照
+
+两份配方都使用 `unified_ep_compute_fn`，默认 `mc2_capacity: 256`、`inference_backend: auto`。
+训练保持动态路由；推理在 MC2 可用且当前 bucket 适合时使用 MC2，其余合法尺寸由 AllGather 承接。
+具体条件与数值合并规则见 [MoE 实现](../../docs/unified_execution_moe.md#后端选择与容量)。
+
+对照 eager 与图模式，可对任一上述命令增加 `--rollout.vllm.enforce_eager=true`，并使用新的结果目录。
+两种模式使用相同的 MC2/AllGather 算法选择。
+需要显式选择 AllGather 或修改 MC2 容量时，修改选中 YAML 的 MoE replacement 条目：
+
+```yaml
+implementation:
+  _target_: rl.unified_execution.runtimes.hyper_parallel.moe.unified_ep_compute_fn
+  mc2_capacity: 256
+  inference_backend: allgather
+```
+
+CLI loader 不支持通过列表下标覆盖 `plan_overrides`；不要使用 `--train.plan_overrides.4...`。
+修改后使用独立结果目录，实际解析配置会保存在 `run/config.yaml` 中。
 
 ## 检查结果
 
-配方启用统一模型与 Attention、Level 3（关闭未初始化内存填充）、普通 row-parallel PIK、
-固定容量 EP；保留 `FULL_AND_PIECEWISE`、prefix caching、chunked prefill 和权重发布。
-完整配置位于 [YAML](configs/qwen3_moe_4l_rl.yaml)，实现见 [Unified Execution](../../rl/unified_execution/README.md)。
+每步更新前比较实际 rollout log-prob 与 Actor 重算结果，要求使用同一权重版本和 token 前缀。
+仅统计有效 action token，排除 padding，要求非空、有限且最大/平均差值均为 **0**。
+不使用 Actor 概率回填推理结果，不修改采样 token 或 reward 来通过检查。
 
-每步更新前，使用同一权重版本，比较 rollout 实际采样 log-prob 与 Actor 重算结果；
-仅统计有效 action token，排除 padding，要求非空、有限且最大绝对差为 **0**。
-不满足条件立即失败，不修改 token、reward 或 Actor 计算结果来通过检查。
-两步训练与权重发布正常完成后，`run/consistency.json` 才写入 `passed: true`；
-`run/train.log` 保存过程，`run/environment.txt` 保存依赖版本。
-检查针对实际采样 token；梯度正确性与非零参数更新由独立算子/模型回归覆盖。
-
-实验命令成功退出后，检查当前结果目录：
+两步正常 RL 循环与权重发布完成后才写出 `passed: true`：
 
 ```bash
+RESULT_ROOT=/tmp/hyper-rl-consistency/C
 cat "$RESULT_ROOT/run/consistency.json"
 rg 'CONSISTENCY_CHECK|CONSISTENCY_PASS' "$RESULT_ROOT/run/train.log"
 ```
 
-验收时应看到 `passed: true`、`completed_steps: 2`，`checks` 中包含第 1、2 步；
-每步 `log_probs_valid_tokens > 0`，`rollout_log_probs_diff_max` 与 `rollout_log_probs_diff_mean` 均为 `0`。
-若启动或一致性检查失败，先查看终端输出及日志；本次成功报告只在两步完整完成后生成。
+用例命令中的 `RESULT_ROOT=... bash ...` 是该命令的局部环境变量；检查时请先将 RESULT_ROOT
+设为要检查的目录，例如 `RESULT_ROOT=/tmp/hyper-rl-consistency/C`。
+报告需要包含 `completed_steps: 2`、第 1/2 步，以及每步正的 `log_probs_valid_tokens`。
 
-| 结果文件                            | 用途                       |
-| ----------------------------------- | -------------------------- |
-| `run/consistency.json`            | 两步验收结论和每步数值差异 |
-| `run/train.log`                   | 训练、推理及一致性检查日志 |
-| `run/config.yaml`                 | 包含命令行覆盖的实际配置   |
-| `run/environment.txt`             | 容器中的 Python 依赖版本   |
-| `run/v4-wheel.sha256`             | 本次使用的 V4 wheel 校验和 |
-| `Qwen3-MoE-4L/crop_manifest.json` | 裁剪权重的来源和校验记录   |
+| 文件 | 内容 |
+| --- | --- |
+| `run/consistency.json` | 两步采样概率检查与实际训练/推理配置 |
+| `run/train.log` | 图编译、推理、训练、发布及一致性检查日志 |
+| `run/config.yaml` | 包含 CLI 覆盖的完整实际配置 |
+| `run/environment.txt`、`run/v4-wheel.sha256` | 依赖与数值内核身份 |
+| `Qwen3-MoE-4L/crop_manifest.json` | 裁剪权重的来源和校验信息 |
+
+默认短响应可能产生全零任务奖励，因此示例的成功不能单独证明非零梯度或学习效果。
+需要非零更新时使用下述测试夹具：它只提供明确的交替奖励，采样、模型计算、optimizer 和发布仍走真实路径。
+梯度正确性另由完整参数对照检查，不由两步采样概率检查代替。
+
+## 组件与非零更新检查
+
+在已安装本仓及固定数值依赖的环境中，显式选择空闲设备：
+
+```bash
+# 真实 EP 路由、MC2/AllGather、大小 bucket 切换、图回放与训练梯度。
+RL_EP_ST_DEVICES=0,1,2,3 RL_EP_ST_SIZE=4 \
+  pytest -q hyper_parallel/rl/tests/st/test_unified_expert_parallel.py
+
+# CP Attention、完整测试模型的 CP1/CP2 logits 与逐参数梯度。
+RL_CP_ST_DEVICES=0,1,2,3 \
+  pytest -q hyper_parallel/rl/tests/st/test_context_parallel.py -k 'attention or model'
+
+# 跨 PCP 专家域、权重映射及分页 Attention。
+RL_PCP_ST_DEVICES=0,1,2,3 RL_UNIFIED_ST_MODEL=/path/to/Qwen3-MoE-4L \
+  pytest -q hyper_parallel/rl/tests/st/test_prefill_context_parallel.py -k 'mesh or attention'
+
+# 两次非零更新及发布；该 YAML 内的模型、数据和结果路径必须对当前环境有效。
+RL_PCP_ST_DEVICES=0,1,2,3 \
+  RL_PCP_ST_RL_CONFIG=hyper_parallel/rl/examples/consistency/configs/qwen3_moe_4l_cp_rl.yaml \
+  pytest -q hyper_parallel/rl/tests/st/test_prefill_context_parallel.py -k parallel_rl
+```
+
+执行范围和梯度容差见 [统一执行验收](../../docs/unified_execution_guide.md#支持范围与验收)。
+这两份配置聚焦不同并行布局的前向一致性；跨机、大 EP、长上下文性能需要单独验收。

@@ -22,10 +22,9 @@ import torch
 from torch import nn
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-from rl.unified_execution.runtimes.vllm.parallel_context import payload_from_vllm_config
-from rl.unified_execution.validation import validate_attention_execution_path
+from rl.unified_execution.core.validation import validate_attention_execution_path
 from rl.unified_execution.models import get_model_family
-
+from rl.unified_execution.runtimes.vllm.parallel import payload_from_vllm_config
 
 _ATTENTION_INTERFACE = "hyper_parallel_vllm"
 
@@ -44,6 +43,11 @@ def paged_attention_forward(
 
     Request boundaries, absolute cache slots and dummy forwards are owned by
     the current vLLM forward context. No HF cache or mask may be supplied.
+
+    Q is [1, Nq, L, D]; K/V are [1, Nkv, L, D], after HP projections and RoPE.
+    The bridge removes HP SP alignment rows, passes [T, N*D] to vLLM, then
+    restores [1, L, Nq, D]. T is the native scheduled row count; request and
+    PCP padding remain owned by vLLM's metadata rather than inferred from Q.
     """
     del kwargs, scaling
     if attention_mask is not None or dropout != 0.0:
@@ -78,7 +82,7 @@ def install_paged_attention(model: nn.Module, vllm_config: Any, prefix: str = ""
     attentions = [getattr(layer, family.attention_attribute) for layer in model.layers]
     if backend_name == "flash_attention_npu_v4":
         # Ascend and V4 remain optional for the native mode and training imports.
-        from rl.unified_execution.runtimes.vllm.attention_backend import (  # pylint: disable=C0415
+        from rl.unified_execution.runtimes.vllm.attention.ascend_v4 import (  # pylint: disable=C0415
             UnifiedAscendAttentionBackend,
         )
 

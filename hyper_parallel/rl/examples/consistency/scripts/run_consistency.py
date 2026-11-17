@@ -68,7 +68,7 @@ def run(config: dict[str, Any], report_path: Path) -> None:
     def _checked_prepare(rollout, collect_diagnostics, timings):
         if rollout.rollout_log_probs is None:
             raise RuntimeError("Independent rollout sampling log probabilities are required")
-        experience, metrics = prepare(rollout, collect_diagnostics, timings)
+        experience, metrics = prepare(rollout, collect_diagnostics, timings) # The prepare function will continue to be executed
         observed = check_metrics_on_all_ranks(metrics)
         checks.append({"step": trainer.state.global_step + 1, **observed})
         if int(os.environ.get("RANK", "0")) == 0:

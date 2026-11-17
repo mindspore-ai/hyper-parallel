@@ -22,12 +22,12 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
-from rl.unified_execution.contract import build_unified_payload, fingerprint
+from rl.unified_execution.core.contract import build_unified_payload, fingerprint
 from rl.unified_execution.runtimes.hyper_parallel.builder import build_inference_model
-from rl.unified_execution.runtimes.vllm.model_adapter import HyperParallelQwen3ForCausalLM
-from rl.unified_execution.runtimes.vllm.paged_attention import paged_attention_forward
-from rl.unified_execution.runtimes.vllm.parallel_context import InferenceParallelContext
-from rl.unified_execution.validation import capture_training_structure
+from rl.unified_execution.runtimes.vllm.model import HyperParallelQwen3ForCausalLM
+from rl.unified_execution.runtimes.vllm.attention.bridge import paged_attention_forward
+from rl.unified_execution.runtimes.vllm.parallel import InferenceParallelContext
+from rl.unified_execution.core.validation import capture_training_structure
 from rl.workers.engine.materialization import register_qwen3_materialization
 from rl.workers.engine.model import build_role_model
 from torch import nn
@@ -107,8 +107,8 @@ class TestUnifiedModel(unittest.TestCase):
             parallel_config=SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1),
             additional_config={}, quant_config=None,
         )
-        with patch("rl.unified_execution.runtimes.vllm.parallel_context.dist.is_initialized", return_value=False), \
-                patch("rl.unified_execution.runtimes.vllm.model_adapter.install_paged_attention", side_effect=install):
+        with patch("rl.unified_execution.runtimes.vllm.parallel.dist.is_initialized", return_value=False), \
+                patch("rl.unified_execution.runtimes.vllm.model.install_paged_attention", side_effect=install):
             wrapper = HyperParallelQwen3ForCausalLM(vllm_config=config)
         wrapper.load_weights(self.reference.state_dict().items())
         return wrapper
