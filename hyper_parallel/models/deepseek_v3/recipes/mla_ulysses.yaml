@@ -1,5 +1,18 @@
-# Dense MLA CP recipe fragment. Merge into a DeepSeek-V3 training configuration.
-# The model factory/checkpoint, data pipeline and optimizer remain caller choices.
+# Dense MLA CP recipe for the official DeepSeek-V3 model.
+# The data pipeline and scheduler remain caller choices for training.
+model:
+  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
+  torch_dtype: bfloat16
+  attn_implementation: eager
+  force_hf: true
+
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+  adamw_config:
+    lr: 1.0e-5
+    adamw_lr: 1.0e-5
+
 accelerator:
   tp_size: 2
   cp_size: 4
