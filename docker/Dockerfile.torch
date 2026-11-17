@@ -37,7 +37,7 @@ LABEL description="HyperParallel PyTorch Ascend NPU environment"
 LABEL version="cann${CANN_VERSION}-${CANN_ARCH}-hyper-parallel-torch"
 
 ARG PIP_INDEX_URL="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
-ARG TORCH_EXTRA="torch29"
+ARG TORCH_EXTRA="torch-npu-2-9"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     ASCEND_HOME_PATH=/usr/local/Ascend/cann \
@@ -71,11 +71,10 @@ RUN set -eux; \
 COPY . /workspace/hyper-parallel
 
 RUN . /usr/local/Ascend/cann/set_env.sh \
-    && python3 -m pip install --upgrade pip setuptools wheel safetensors \
-    && python3 -m pip install --no-cache-dir \
-        --extra-index-url https://download.pytorch.org/whl/cpu \
-        -e ".[${TORCH_EXTRA}]" \
-        --no-build-isolation
+    && python3 -m pip install uv==0.11.16 \
+    && set -- --extra "${TORCH_EXTRA}" \
+    && UV_PROJECT_ENVIRONMENT="$(python3 -c 'import sys; print(sys.prefix)')" \
+       python3 -m uv sync --locked --inexact --no-cache --python "$(command -v python3)" --group build "$@"
 
 RUN . /usr/local/Ascend/cann/set_env.sh \
     && python3 -c \

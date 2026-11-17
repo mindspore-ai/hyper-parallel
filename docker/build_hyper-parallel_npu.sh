@@ -20,7 +20,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOCKERFILE="${DOCKERFILE:-${ROOT_DIR}/docker/Dockerfile.hyper-parallel-npu}"
 IMAGE="${IMAGE:-hyper-parallel:npu}"
-HP_EXTRA="${HP_EXTRA:-torch29}"
+HP_EXTRA="${HP_EXTRA:-torch-npu-2-9}"
 TORCH_EXTRA="${TORCH_EXTRA:-${HP_EXTRA}}"
 CANN_QUAY_URL="${CANN_QUAY_URL:-quay.io/ascend/cann}"
 CANN_VERSION="${CANN_VERSION:-9.1.0}"

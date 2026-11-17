@@ -49,7 +49,7 @@ python3 -c "import importlib.metadata as md; print(md.version('hyper_parallel'))
 | --- | --- |
 | `Dockerfile.hyper-parallel-npu` | 通用 HyperParallel NPU 镜像，默认 PyTorch 2.9 后端 |
 | `Dockerfile.models-npu-a3` | Ascend A3 / Ubuntu 22.04 / Python 3.11 训练镜像，含高性能融合算子依赖 |
-| `Dockerfile.torch` | PyTorch 后端镜像，安装 `hyper_parallel[torch29]` |
+| `Dockerfile.torch` | PyTorch 后端镜像，安装 `hyper_parallel[torch-npu-2-9]` |
 | `build_hyper-parallel_npu.sh` | 简化构建脚本，构建后自动做 import smoke test |
 | `run_hyper-parallel.sh` | Ascend NPU 容器启动脚本 |
 
@@ -71,15 +71,13 @@ bash docker/build_hyper-parallel_npu.sh hyper-parallel:npu
 
 ```bash
 DOCKERFILE=docker/Dockerfile.torch \
-HP_EXTRA=torch29 \
+HP_EXTRA=torch-npu-2-10 \
 bash docker/build_hyper-parallel_npu.sh hyper-parallel:torch
 ```
 
-`HP_EXTRA` 对应 `docs/installation.md` 中的 extras：
-
-```text
-torch26 | torch27 | torch29 | torch | all
-```
+构建脚本在基础镜像的 Python 环境中执行 `uv sync --locked`。`HP_EXTRA` 默认为 `torch-npu-2-9`，对应 PyTorch 2.9。
+使用 `torch-npu-2-10`、`torch-npu-2-11`、`torch-npu-2-12`、`torch-npu-2-13` 或 `torch-npu-2-14` 可分别选择
+PyTorch 2.10 至 2.14。每个 NPU extra 都安装 CPU 版 PyTorch 和 torchvision、匹配的 TorchNPU 归档 wheel，以及 HyperMulticore。
 
 ## 启动容器
 
@@ -109,11 +107,14 @@ bash docker/run_hyper-parallel.sh --cards 0,1,2,3,4,5,6,7 -- \
   python3 -c "import importlib.metadata as md; print(md.version('hyper_parallel'))"
 ```
 
-## 按需使用 HyperMulticore
+## 激活 HyperMulticore
 
-使用 MegaMoE、MegaGate 或 MegaMHC 的训练镜像需要独立安装 HyperMulticore。
-安装匹配的 wheel，并在启动训练前激活 `hyper_multicore_set_env.bash`。
-Dockerfile 不编译多核算子。
+运行 MegaMoE、MegaGate 或 MegaMHC 前，在训练进程所在的 shell 中激活 CANN 和已安装的算子。
+
+```bash
+source /usr/local/Ascend/cann/set_env.sh
+source "$(command -v hyper_multicore_set_env.bash)"
+```
 
 ## 验证
 

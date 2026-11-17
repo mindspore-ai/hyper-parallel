@@ -14,11 +14,7 @@
 
 # HyperParallel Ascend NPU Environment
 # ===================================
-# Build-time defaults follow the CANN base image and docs/installation.md:
-#   Python 3.12, torch 2.10, torch-npu 2.10, CANN 9.1.
-#
-# The native extensions are disabled by default; enable them for the torch
-# build when the corresponding sources are present.
+# The default torch-npu-2-9 extra pairs PyTorch 2.9 with the archived Ascend wheels.
 
 ARG CANN_QUAY_URL="quay.io/ascend/cann"
 ARG CANN_VERSION="9.1.0"
@@ -38,7 +34,7 @@ LABEL version="cann${CANN_VERSION}-${CANN_ARCH}-python${PYTHON_VERSION}"
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG PIP_INDEX_URL="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
-ARG HP_EXTRA="torch29"
+ARG HP_EXTRA="torch-npu-2-9"
 
 ENV DEBIAN_FRONTEND=${DEBIAN_FRONTEND} \
     ASCEND_HOME_PATH=/usr/local/Ascend/cann \
@@ -82,24 +78,10 @@ COPY . /workspace/hyper-parallel
 RUN if [ -f /usr/local/Ascend/cann/set_env.sh ]; then \
         . /usr/local/Ascend/cann/set_env.sh; \
     fi \
-    && python3 -m pip install --upgrade pip setuptools wheel safetensors \
-    && case "${HP_EXTRA}" in \
-        "") \
-            python3 -m pip install --no-cache-dir -e . --no-build-isolation ;; \
-        torch26|torch27|torch29|torch) \
-            python3 -m pip install --no-cache-dir \
-                --extra-index-url https://download.pytorch.org/whl/cpu \
-                -e ".[${HP_EXTRA}]" \
-                --no-build-isolation ;; \
-        all) \
-            python3 -m pip install --no-cache-dir \
-                --extra-index-url https://download.pytorch.org/whl/cpu \
-                --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi \
-                -e ".[all]" \
-                --no-build-isolation ;; \
-        *) \
-            python3 -m pip install --no-cache-dir -e ".[${HP_EXTRA}]" --no-build-isolation ;; \
-    esac
+    && python3 -m pip install uv==0.11.16 \
+    && set -- ${HP_EXTRA:+--extra "${HP_EXTRA}"} \
+    && UV_PROJECT_ENVIRONMENT="$(python3 -c 'import sys; print(sys.prefix)')" \
+       python3 -m uv sync --locked --inexact --no-cache --python "$(command -v python3)" --group build "$@"
 
 RUN if [ -f /usr/local/Ascend/cann/set_env.sh ]; then \
         . /usr/local/Ascend/cann/set_env.sh; \
