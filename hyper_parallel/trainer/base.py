@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from abc import ABC
 from collections import defaultdict
 from collections.abc import Callable
@@ -405,7 +406,6 @@ class BaseTrainer(Stateful, ABC):
                 registry=builtin_registry, selections=op_selections, target_device=self.device,
             )
             bind_model_runtime(self.model, self.op_runtime)
-        self._last_op_report = {}
         _validate_optimize_dtype(
             self.model,
             fp32_main_params=self.config.optimizer.fp32_main_params,
@@ -750,8 +750,33 @@ class BaseTrainer(Stateful, ABC):
             loss_dict: Named loss values for the optimizer step.
             grad_norm: Gradient norm measured before the optimizer update.
         """
+        if self.state.global_step == 1:
+            self._print_hyperops_usage()
         for callback in self._callbacks:
             callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+
+    def _print_hyperops_usage(self) -> None:
+        """Print the first step's operator backends to stderr on global rank zero."""
+        runtime = getattr(self, "op_runtime", None)
+        local_usage = runtime.used_backends() if isinstance(runtime, OpRuntime) else ()
+        world_size = get_world_size_safe()
+        reports = [local_usage]
+        if world_size > 1:
+            # Some operators only run on pipeline stages or modality ranks other than rank zero.
+            reports = [()] * world_size
+            dist.all_gather_object(reports, local_usage)
+        if get_global_rank_safe() == 0:
+            usage = sorted({entry for report in reports for entry in report})
+            if usage:
+                rows = [("Op", "Variant", "Backend"), *usage]
+                widths = [max(len(value) for value in column) for column in zip(*rows)]
+                rows.insert(1, tuple("-" * width for width in widths))
+                table = "\n".join(
+                    "  ".join(value.ljust(width) for value, width in zip(row, widths)).rstrip()
+                    for row in rows
+                )
+                # Use the config log stream so torchrun applies the same worker prefix.
+                print(f"Fused operator backends used in training step 1\n\n{table}", file=sys.stderr, flush=True)
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass.
@@ -942,11 +967,6 @@ class BaseTrainer(Stateful, ABC):
             if callable(prefetch):
                 prefetch()  # pylint: disable=not-callable  # Guarded dynamic hook.
 
-            if isinstance(runtime, OpRuntime) and self.global_rank == 0:
-                report = runtime.report()
-                if report != self._last_op_report:
-                    logger.info("HyperOps on %s: %s", self.device, report)
-                    self._last_op_report = report
             del micro_batch
             return loss, loss_dict
 

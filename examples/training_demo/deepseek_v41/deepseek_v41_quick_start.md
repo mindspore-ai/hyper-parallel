@@ -248,7 +248,7 @@ model:
 ### 切换融合算子与参考实现
 
 三个示例通过顶层 `ops` 为各算子族选择实现。CSA2、路由、EP token 重排、mHC、分组专家计算和
-视觉注意力分别选型。缺省项按 `auto` 选择，日志中的 `HyperOps` 记录已执行的变体和实现。
+视觉注意力分别选型。缺省项按 `auto` 选择。
 
 例如传入 `--ops.dsa_sparse_attention=native`，只切换 Sparse Flash MLA，Indexer 和 KL 继续按
 各自配置执行。需要对照整套 CSA2 时，可写入以下配置。

@@ -126,3 +126,7 @@ class TestOpRuntime(unittest.TestCase):
             torch.testing.assert_close(swiglu(fp32), fp32)
             torch.testing.assert_close(swiglu(bf16), bf16.square())
             torch.testing.assert_close(swiglu(fp32), fp32)
+        self.assertCountEqual(runtime.used_backends(), (
+            ("swiglu", "standard", "identity"),
+            ("swiglu", "standard", "square"),
+        ))

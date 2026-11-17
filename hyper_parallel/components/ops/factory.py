@@ -46,6 +46,7 @@ class OpRuntime:
         self._context = context
         self._resolved: dict[tuple[OpSpec[Any], torch.dtype | None, bool], tuple[str, Any]] = {}
         self._report: dict[tuple[str, str], str] = {}
+        self._used_backends: dict[tuple[str, str, str], None] = {}
         self._lock = RLock()
 
     @contextmanager
@@ -63,6 +64,11 @@ class OpRuntime:
         with self._lock:
             return self._report.copy()
 
+    def used_backends(self) -> tuple[tuple[str, str, str], ...]:
+        """Return every resolved operator, variant and backend used by this runtime."""
+        with self._lock:
+            return tuple(self._used_backends)
+
     def _load(
         self, spec: OpSpec[Fn], input_dtype: torch.dtype | None, native_only: str | None,
     ) -> tuple[str, Fn]:
@@ -73,6 +79,7 @@ class OpRuntime:
             spec, self._selections.get(spec.config_key, "auto"), context, native_only=native_only,
         )
         self._report[(spec.config_key, spec.variant)] = selected[0]
+        self._used_backends[(spec.config_key, spec.variant, selected[0])] = None
         return selected
 
     def _get_or_resolve(self, spec: OpSpec[Fn], x: torch.Tensor, native_only: str | None = None) -> Fn:
