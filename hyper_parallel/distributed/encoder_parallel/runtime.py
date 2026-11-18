@@ -245,6 +245,9 @@ class EncoderParallelRuntime:
         self.tp_mesh = mesh_context.device_mesh["tp"]
         self.global_mesh = mesh_context.device_mesh.flatten("encoder_global")
         self.feature_exchange_mode = select_feature_exchange(mesh_context)
+        install_forward = getattr(self.bridge, "install_forward", None)
+        if install_forward is not None:
+            install_forward()
 
     def preflight_batch(self, batch: Mapping[str, Any]
                         ) -> tuple[tuple[EncoderWorkItem, ...], DecoderSequenceLayout]:
