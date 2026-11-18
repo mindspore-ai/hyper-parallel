@@ -59,3 +59,16 @@ def test_deepseek_fused_mxfp8() -> None:
     """
     torchrun_case(str(Path(__file__).with_name("_test_deepseek_qat_family.py")),
                   "test_deepseek_fused_mxfp8", num_proc=1)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_deepseek_v41_mxfp8_ep() -> None:
+    """
+    Feature: DeepSeek-V4.1 MXFP8 expert parallelism through Module Family.
+    Description: Train fused and non-fused V4.1 clipped MXFP8 experts under EP=2 across balanced, empty-expert,
+        and empty-receiver-rank routing.
+    Expectation: Planner shards expert weights across EP ranks, executes real MXFP8/fusion kernels with clipping,
+        and matches the unsharded EP reference on outputs, gradients, and updates.
+    """
+    torchrun_case(str(Path(__file__).with_name("_test_deepseek_qat_family.py")),
+                  "test_deepseek_v41_mxfp8_ep", num_proc=2)
