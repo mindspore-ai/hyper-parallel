@@ -30,9 +30,9 @@ __all__ = [
     "CompileConfig",
     "DataLoaderConfig",
     "DatasetConfig",
-    "DebugConfig",
     "FSDP2Config",
     "MemoryConfig",
+    "MonitorConfig",
     "MixedPrecisionConfig",
     "ModelIntegrationConfig",
     "OptimizerConfig",
@@ -46,7 +46,6 @@ __all__ = [
     "Target",
     "TrainerConfig",
     "TrainingConfig",
-    "WandbConfig",
     "save_configs",
     "CheckpointingConfig",
 ]
@@ -77,6 +76,7 @@ from hyper_parallel.trainer.config.parallelism import (
     entries_to_plan_overrides,
     normalize_distributed_setup_overrides,
 )
+from hyper_parallel.trainer.config.monitor import MonitorConfig
 from hyper_parallel.trainer.config.target import Target
 from hyper_parallel.trainer.config.stress_detect import (
     ModelStressDetectConfig,
@@ -85,11 +85,9 @@ from hyper_parallel.trainer.config.stress_detect import (
 )
 from hyper_parallel.trainer.config.trainer import TrainerConfig, save_configs
 from hyper_parallel.trainer.config.training import (
-    DebugConfig,
     MemoryConfig,
     ModelIntegrationConfig,
     ProfilingAnalysisConfig,
     ProfilingConfig,
     TrainingConfig,
-    WandbConfig,
 )

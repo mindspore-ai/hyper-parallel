@@ -24,6 +24,7 @@ from typing import Any, List, Literal, Optional
 from hyper_parallel.models.build_options import CompileConfig, FSDP2Config
 from hyper_parallel.components.checkpoint.config import CheckpointingConfig
 
+from hyper_parallel.trainer.config.monitor import MonitorConfig
 from hyper_parallel.trainer.config.data import DataLoaderConfig, DatasetConfig
 from hyper_parallel.trainer.config.optimization import (
     MixedPrecisionConfig,
@@ -37,12 +38,10 @@ from hyper_parallel.trainer.config.parallelism import (
 from hyper_parallel.trainer.config.target import Target, _serialize_config_value
 from hyper_parallel.trainer.config.stress_detect import StressDetectConfig
 from hyper_parallel.trainer.config.training import (
-    DebugConfig,
     MemoryConfig,
     ModelIntegrationConfig,
     ProfilingConfig,
     TrainingConfig,
-    WandbConfig,
 )
 
 
@@ -79,10 +78,9 @@ class TrainerConfig:
     packed_sequence: Optional[Any] = None
 
     checkpoint: CheckpointingConfig = field(default_factory=CheckpointingConfig)
-    debug: DebugConfig = field(default_factory=DebugConfig)
+    monitor: MonitorConfig = field(default_factory=MonitorConfig)
     model_integration: ModelIntegrationConfig = field(default_factory=ModelIntegrationConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
-    wandb: WandbConfig = field(default_factory=WandbConfig)
     profiler: ProfilingConfig = field(default_factory=ProfilingConfig)
     stress_detect: StressDetectConfig = field(default_factory=StressDetectConfig)
     magi: Optional[Any] = None

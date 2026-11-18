@@ -177,7 +177,7 @@ reference path 与优化 candidate 可以共享语义基类来避免状态机漂
 | `build` | 构建完成后执行结构、布局、数据和 checkpoint 契约检查 | 低成本接入检查 |
 | `runtime` | 包含 `build`，并逐步采集输入、梯度、参数、优化器、共享状态、性能和 checkpoint layout | 正式精度矩阵 |
 
-`debug.check_fsdp_runtime` 是独立的 FSDP 执行顺序诊断开关，不由 `model_integration.mode` 隐式开启。
+`monitor.check_fsdp_runtime` 是独立的 FSDP 执行顺序诊断开关，不由 `model_integration.mode` 隐式开启。
 
 ## 2. 准备工作
 

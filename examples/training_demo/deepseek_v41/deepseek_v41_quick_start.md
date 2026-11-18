@@ -160,7 +160,7 @@ cd "${HP_REPO_ROOT}"
 RUN_NAME=quick_start NPROC_PER_NODE=16 \
 bash examples/training_demo/deepseek_v41/run_deepseek_v41_vlm_online.sh \
   "${MODEL_DIR}" "${DATA_PATH}" \
-  --training.train_iters=1 --checkpoint.restore_from=null --debug.check_dataset=warn
+  --training.train_iters=1 --checkpoint.restore_from=null --monitor.datasets.log_level=warn
 ```
 
 按 YAML 默认步数运行时，去掉 `--training.train_iters=1` 即可。

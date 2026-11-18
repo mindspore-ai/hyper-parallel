@@ -441,8 +441,9 @@ dataloader:
 ## 11. Debugging
 
 ```yaml
-debug:
-  check_dataset: debug  # debug / info / warn; null follows the global level.
+monitor:
+  datasets:
+    log_level: debug  # debug / info / warn; null follows the global level.
 ```
 
 Alternatively, enable before Trainer initialization:

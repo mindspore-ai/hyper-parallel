@@ -439,8 +439,9 @@ dataloader:
 ## 11. 调试
 
 ```yaml
-debug:
-  check_dataset: debug  # debug / info / warn；null 表示跟随全局级别
+monitor:
+  datasets:
+    log_level: debug  # debug / info / warn；null 表示跟随全局级别
 ```
 
 也可在 Trainer 初始化前启用：

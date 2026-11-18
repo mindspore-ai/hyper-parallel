@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Training-loop, debug, profiler, and remote-logging configuration sections."""
+"""Training-loop, memory, integration, and profiler configuration sections."""
 
 from dataclasses import dataclass, field
 from typing import Literal, Optional
@@ -57,16 +57,6 @@ class TrainingConfig:
 
 
 @dataclass
-class DebugConfig:
-    """Debug parameters exposed by the initial YAML schema."""
-
-    check_dataset: Optional[Literal["debug", "info", "warn"]] = None
-    log_first_rendered_template: bool = False
-    check_nan_inf: bool = False
-    check_fsdp_runtime: bool = False
-
-
-@dataclass
 class ModelIntegrationConfig:
     """Enable model-integration checks at one well-defined lifecycle scope.
 
@@ -108,15 +98,6 @@ class MemoryConfig:
     dump_ranks: list[int] = field(default_factory=lambda: [0])
     stacks: Literal["python", "all"] = "all"
     mem_info: bool = False
-
-
-@dataclass
-class WandbConfig:
-    """WandB remote-logging parameters (03 §4.2.5: read by build_callback_manager)."""
-
-    enabled: bool = False
-    project: str = ""
-    entity: Optional[str] = None
 
 
 @dataclass

@@ -146,7 +146,5 @@ checkpoint:
   checkpoint_dir: ./outputs/qwen3_6_moe_vlm/p2p_kv_allgather/checkpoints
   restore_from: null
 
-debug:
-  check_nan_inf: false
 profiler:
   enable: false

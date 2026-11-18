@@ -14,8 +14,13 @@
 # ============================================================================
 """Unit tests for cadence-controlled router auxiliary-loss logging."""
 
+import io
+import json
+import logging
 import subprocess
+import tempfile
 import sys
+from pathlib import Path
 from textwrap import dedent
 from types import SimpleNamespace
 import unittest
@@ -26,6 +31,8 @@ import torch
 from hyper_parallel.components.modules.moe_utils import MoEMonitorCallback
 from hyper_parallel.trainer.callbacks.logging_callback import LoggingCallback
 from hyper_parallel.trainer.state import TrainerState
+from hyper_parallel.trainer.config.monitor import MonitorConfig
+from hyper_parallel.trainer.runtime.monitor.session import MonitorSession
 
 
 class TestLoggingCallback(unittest.TestCase):
@@ -37,7 +44,7 @@ class TestLoggingCallback(unittest.TestCase):
         return SimpleNamespace(
             mesh=None, global_rank=rank, moe_monitor=monitor,
             config=SimpleNamespace(training=SimpleNamespace(logging_steps=logging_steps)),
-            step_env_metrics={"training/total_loss": 2.5}, tqdm_callback=None,
+            step_env_metrics={"training/total_loss": 2.5},
         )
 
     def test_global_aux_metric_is_not_overwritten_by_local_mean(self) -> None:
@@ -150,17 +157,85 @@ class TestLoggingCallback(unittest.TestCase):
                 else:
                     self.assertNotIn("training/router_aux_loss", message)
 
-    def test_aux_log_uses_active_tqdm_writer(self) -> None:
+    def test_aux_log_uses_single_monitor_writer(self) -> None:
         """
-        Feature: Auxiliary-loss logging.
-        Description: Router auxiliary metrics share the active progress bar's structured output path.
-        Expectation: The tqdm writer receives the aux field and standard logging does not duplicate it.
+        Feature: Structured output.
+        Description: Router auxiliary metrics share the canonical monitor writer.
+        Expectation: One writer call contains the aux field, with no duplicate console call.
         """
         trainer = self._trainer(SimpleNamespace(last_mean_aux_loss=1.25))
-        trainer.tqdm_callback = SimpleNamespace(write=Mock(return_value=True))
+        trainer.monitor = SimpleNamespace(enabled=True, log_step=Mock(), config=MonitorConfig(sinks=["jsonl"]))
         callback = LoggingCallback(trainer)
+        state = TrainerState(global_step=2)
         with patch("hyper_parallel.trainer.callbacks.logging_callback.logger.info") as log:
-            callback.on_step_end(TrainerState(global_step=2), loss=2.5, loss_dict={}, grad_norm=1.0)
-        trainer.tqdm_callback.write.assert_called_once()
-        self.assertIn("training/router_aux_loss=1.25", trainer.tqdm_callback.write.call_args.args[0])
+            callback.on_step_end(state, loss=2.5, loss_dict={}, grad_norm=1.0)
+            callback.on_step_end(state, loss=2.5, loss_dict={}, grad_norm=1.0)
+        trainer.monitor.log_step.assert_called_once()
+        self.assertEqual(trainer.monitor.log_step.call_args.args[1]["training/router_aux_loss"], 1.25)
         log.assert_not_called()
+
+    def test_progress_and_metrics_share_one_console_line(self) -> None:
+        """Feature: Combined progress and logging.
+
+        Description: Emit step 3/20 twice through real logging and the monitor writer.
+        Expectation: One line and one structured event; every metric occurs only once.
+        """
+        for active, console in ((False, True), (True, True), (True, False)):
+            with self.subTest(active=active, console=console), tempfile.TemporaryDirectory() as directory:
+                trainer = self._trainer(logging_steps=1)
+                trainer.train_iters = 20
+                trainer.config.monitor = MonitorConfig(
+                    enabled=active, output_dir=directory, sinks=["console", "jsonl"] if console else ["jsonl"],
+                )
+                trainer.monitor = MonitorSession(trainer)
+                trainer.monitor.start_output()
+                self.addCleanup(trainer.monitor.close)
+                callback = LoggingCallback(trainer)
+                state = TrainerState(global_step=3)
+                stream = io.StringIO()
+                handler = logging.StreamHandler(stream)
+                # Catch both callback and writer output so a second emitter cannot pass unnoticed.
+                with self.assertLogs("hyper_parallel.trainer", level="INFO") if console else self.assertNoLogs(
+                    "hyper_parallel.trainer", level="INFO"
+                ) as captured:
+                    if console:
+                        captured_handler = logging.getLogger("hyper_parallel.trainer")
+                        captured_handler.addHandler(handler)
+                    try:
+                        callback.on_step_end(state, loss=2.5, loss_dict={}, grad_norm=1.0)
+                        callback.on_step_end(state, loss=2.5, loss_dict={}, grad_norm=1.0)
+                    finally:
+                        if console:
+                            captured_handler.removeHandler(handler)
+                if console:
+                    self.assertEqual(len(captured.records), 1)
+                    line = stream.getvalue()
+                    self.assertEqual(line.count("\n"), 1)
+                    self.assertNotIn("\r", line)
+                    self.assertIn("Training:  15%|", line)
+                    self.assertIn("3/20 | step=3 epoch=0", line)
+                    self.assertEqual(line.count("training/total_loss=2.5"), 1)
+                    self.assertNotIn("loss=", line.split(" | step=", 1)[0])
+                trainer.monitor.close()
+                if active:
+                    records = [json.loads(line) for line in (
+                        Path(directory) / trainer.monitor.run_id / "rank_0.jsonl"
+                    ).read_text().splitlines()]
+                    steps = [record for record in records if record["event"] == "train_step"]
+                    self.assertEqual(len(steps), 1)
+                    self.assertEqual(steps[0]["step"], 3)
+                    self.assertEqual(steps[0]["metrics"], {"training/total_loss": 2.5})
+                    self.assertNotIn("Training:", json.dumps(steps))
+
+    def test_missing_tqdm_preserves_scalar_logging(self) -> None:
+        """Feature: Optional tqdm. Description: Missing formatter. Expectation: Scalars still print."""
+        trainer = self._trainer()
+        trainer.train_iters = 20
+        callback = LoggingCallback(trainer)
+        with (
+            patch("hyper_parallel.trainer.callbacks.logging_callback.tqdm", None),
+            patch("hyper_parallel.trainer.callbacks.logging_callback.logger.info") as log,
+        ):
+            callback.on_step_end(TrainerState(global_step=2), loss=2.5, loss_dict={}, grad_norm=1.0)
+        log.assert_called_once()
+        self.assertTrue(log.call_args.args[1].startswith("step=2 epoch=0 "))

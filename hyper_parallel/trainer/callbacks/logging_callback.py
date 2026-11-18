@@ -19,6 +19,12 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+# Progress formatting is optional; scalar logging works without tqdm.
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
 from .base import Callback, TrainerState
 
 
@@ -26,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 class LoggingCallback(Callback):
-    """Log shared step metrics on global rank zero without breaking tqdm."""
+    """Print one progress-and-metrics line on global rank zero; persist structured metrics separately."""
 
     def __init__(self, trainer: Any) -> None:
         """Initialize the configured logging cadence.
@@ -49,23 +55,23 @@ class LoggingCallback(Callback):
         except (TypeError, ValueError):
             return str(value)
 
-    @classmethod
-    def _format_message(cls, state: TrainerState, metrics: dict[str, Any]) -> str:
+    def _format_message(self, state: TrainerState, metrics: dict[str, Any]) -> str:
         """Build a deterministic, complete metric line for one optimizer step."""
         fields = [f"step={state.global_step}", f"epoch={state.epoch}"]
         fields.extend(
-            f"{name}={cls._format_value(value)}"
+            f"{name}={self._format_value(value)}"
             for name, value in sorted(metrics.items())
         )
-        return " ".join(fields)
-
-    def _write(self, message: str) -> None:
-        """Write through the active tqdm bar or fall back to standard logging."""
-        tqdm_callback = getattr(self.trainer, "tqdm_callback", None)
-        tqdm_write = getattr(tqdm_callback, "write", None)
-        if callable(tqdm_write) and tqdm_write(message):
-            return
-        logger.info("%s", message)
+        message = " ".join(fields)
+        total = getattr(self.trainer, "train_iters", None)
+        if tqdm is not None and total is not None and total > 0:
+            progress = tqdm.format_meter(
+                n=state.global_step, total=total, elapsed=0, prefix="Training",
+                bar_format="{desc}: {percentage:3.0f}%|{bar:20}| {n_fmt}/{total_fmt}",
+                ascii=True,
+            )
+            message = f"{progress} | {message}"
+        return message
 
     def on_step_end(
         self,
@@ -99,5 +105,9 @@ class LoggingCallback(Callback):
                 metrics["training/router_aux_loss"] = float(aux_loss)
         if not metrics:
             return
-        self._write(self._format_message(state, metrics))
+        monitor = getattr(self.trainer, "monitor", None)
+        if monitor is None or not monitor.enabled or "console" in monitor.config.sinks:
+            logger.info("%s", self._format_message(state, metrics))
+        if monitor is not None and monitor.enabled:
+            monitor.log_step(state, metrics)
         self._last_logged_step = state.global_step

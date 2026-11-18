@@ -161,5 +161,6 @@ plan_overrides:
       tp: replicate
     wkv.weight:
       tp: replicate
-debug:
-  check_dataset: debug
+monitor:
+  datasets:
+    log_level: debug
