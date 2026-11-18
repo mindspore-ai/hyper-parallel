@@ -284,7 +284,10 @@ class TestConstructionBindings(unittest.TestCase):
                 return_value=(object(), object()),
             ),
         ):
-            bindings = dict(_build_construction_bindings(fsdp_config=config))
+            for interval in (1, 2):
+                with self.subTest(reduce_comm_interval=interval):
+                    config.hyper_parallel.reduce_comm_interval = interval
+                    bindings = dict(_build_construction_bindings(fsdp_config=config))
         model = torch.nn.Linear(2, 2)
         with patch("hyper_parallel.integration.veomni.adapter.fully_shard") as builder:
             bindings[parallel.fully_shard](
@@ -296,15 +299,6 @@ class TestConstructionBindings(unittest.TestCase):
             reshard_after_forward=True,
             comm_fusion=True,
         )
-        config.hyper_parallel.reduce_comm_interval = 2
-        with (
-            patch(
-                "hyper_parallel.integration.veomni.adapter.import_module",
-                side_effect=modules.__getitem__,
-            ),
-            self.assertRaisesRegex(NotImplementedError, "set_reduce_comm_interval"),
-        ):
-            _build_construction_bindings(fsdp_config=config)
 
     def test_fsdp_and_optimizer_selection_are_independent(self):
         """An optimizer-only activation must not replace sharding or model DCP."""
