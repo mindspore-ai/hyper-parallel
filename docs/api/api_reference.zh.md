@@ -709,9 +709,15 @@ class Muon(torch.optim.Optimizer):
         ns_steps: int = 5,
         nesterov: bool = True,
         weight_decay: float = 0.1,
+        *,
+        use_kernel: bool = False,
         ...
     )
 ```
+
+在 Ascend NPU 上设置 `use_kernel=True`，即可在内置 Newton–Schulz 的每轮迭代中
+用 Triton-Ascend 执行两次对称矩阵乘法。参数组可以覆盖此开关。
+使用 `get_hyper_optimizer` 时，可传入 `muon_kwargs={"use_kernel": True}`。
 
 ---
 

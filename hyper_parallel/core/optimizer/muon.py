@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import torch
 import torch.distributed as dist
 
+from hyper_parallel.components.functional import symmetric_matmul
 from hyper_parallel.core.optimizer.optimizer import AsyncReplicateBroadcaster, BaseDistributedOptimizer
 from hyper_parallel.core.optimizer.dtensor_compat import to_local_if_dtensor
 from hyper_parallel.core.optimizer.sharding_category import (
@@ -143,6 +144,8 @@ def zeropower_via_newtonschulz5(
         ns_variant: str = "asym5",
         epsilon: float = 1e-10,
         ns_coefficients: Optional[Sequence[Tuple[float, float, float]]] = None,
+        *,
+        use_kernel: bool = False,
 ) -> torch.Tensor:
     """Newton-Schulz orthogonalization with preallocated matmul buffers.
 
@@ -152,6 +155,8 @@ def zeropower_via_newtonschulz5(
         ns_variant: Built-in legacy/asym5 schedule or an explicit custom schedule.
         epsilon: Normalization epsilon added to the input norm.
         ns_coefficients: Coefficient triples required by the custom variant.
+        use_kernel: Use Triton-Ascend for the two symmetric products. Requires
+            dense FP16 or BF16 Ascend NPU matrices or a single batch dimension.
 
     Returns:
         Orthogonalized updates with the input shape, dtype and device.
@@ -170,10 +175,11 @@ def zeropower_via_newtonschulz5(
     buf_c = torch.empty(mat_x.shape, dtype=mat_x.dtype, device=mat_x.device)
 
     step_coeffs = _resolve_ns_coefficients(steps, ns_variant, ns_coefficients)
+    symmetric_product = symmetric_matmul if use_kernel else torch.matmul
 
     for coeff_a, coeff_b, coeff_c in step_coeffs:
-        torch.matmul(mat_x, mat_x.mT, out=buf_a)
-        torch.matmul(buf_a, buf_a, out=buf_b)
+        symmetric_product(mat_x, mat_x.mT, out=buf_a)
+        symmetric_product(buf_a, buf_a, out=buf_b)
         buf_a.mul_(coeff_b)
         buf_b.mul_(coeff_c)
         buf_a.add_(buf_b)
@@ -226,6 +232,8 @@ class Muon(BaseDistributedOptimizer):
             ns_variant: str = "asym5",
             hsdp_replica_count: Optional[Union[int, Tuple[int, ...]]] = None,
             momentum_mode: str = "legacy",
+            *,
+            use_kernel: bool = False,
             **advanced_options: Any,
     ) -> None:
         """Initialize Muon and build parameter-identity runtime caches.
@@ -255,6 +263,9 @@ class Muon(BaseDistributedOptimizer):
             hsdp_replica_count: Optional optimizer-state replica group size.
             momentum_mode: Momentum formula, either "legacy" or "vanilla".
                 Both modes support distinct update and buffer coefficients.
+            use_kernel: Use Triton-Ascend symmetric matmuls in the built-in
+                Newton-Schulz iteration. Can be overridden per parameter group.
+                A custom ``zeropower_fn`` owns its own matmuls.
         """
         advanced = _resolve_muon_advanced_options(advanced_options)
         if momentum_mode not in ("legacy", "vanilla"):
@@ -289,6 +300,7 @@ class Muon(BaseDistributedOptimizer):
             "ns_variant": ns_variant,
             "ns_coefficients": normalized_coefficients,
             "ns_epsilon": advanced.ns_epsilon,
+            "use_kernel": use_kernel,
             "zero_rms_scale_mode": advanced.zero_rms_scale_mode,
             "apply_lr_in_update": advanced.apply_lr_in_update,
         }
@@ -300,6 +312,12 @@ class Muon(BaseDistributedOptimizer):
         self.ns_transform_fn = advanced.ns_transform_fn
         self.post_update_fn = advanced.post_update_fn
         self.reset_optimizer_parameters()
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        """Restore parameter groups saved before the symmetric kernel option was added."""
+        super().__setstate__(state)
+        for group in self.param_groups:
+            group.setdefault("use_kernel", self.defaults.get("use_kernel", False))
 
     def reset_optimizer_parameters(self) -> None:
         """Rebuild all parameter-identity caches from current param groups."""
@@ -866,6 +884,8 @@ class Muon(BaseDistributedOptimizer):
             ns_variant: str = "asym5",
             ns_coefficients: Optional[Sequence[Tuple[float, float, float]]] = None,
             ns_epsilon: float = 1e-10,
+            *,
+            use_kernel: bool = False,
     ) -> List[torch.Tensor]:
         """Run batched NS on mixed-shape tensors and restore their original shapes."""
 
@@ -908,6 +928,7 @@ class Muon(BaseDistributedOptimizer):
                 ns_variant=ns_variant,
                 epsilon=ns_epsilon,
                 ns_coefficients=ns_coefficients,
+                use_kernel=use_kernel,
             )
         else:
             merged_update = self.zeropower_fn(merged_input, steps=ns_steps)
@@ -1007,7 +1028,12 @@ class Muon(BaseDistributedOptimizer):
                 )
         for tensor_list in state["reshape_groups"].values():
             updates = self._compute_batched_ns_outputs_for_tensors(
-                tensor_list, group["ns_steps"], group["ns_variant"], group["ns_coefficients"], group["ns_epsilon"]
+                tensor_list,
+                group["ns_steps"],
+                ns_variant=group["ns_variant"],
+                ns_coefficients=group["ns_coefficients"],
+                ns_epsilon=group["ns_epsilon"],
+                use_kernel=group.get("use_kernel", False),
             )
             for reshaped_input, update in zip(tensor_list, updates):
                 scale = compute_muon_slice_scale(
@@ -1073,6 +1099,7 @@ class Muon(BaseDistributedOptimizer):
                 ns_variant=group["ns_variant"],
                 ns_coefficients=group["ns_coefficients"],
                 ns_epsilon=group["ns_epsilon"],
+                use_kernel=group.get("use_kernel", False),
             )
 
             # Scale updates.
