@@ -87,8 +87,8 @@ class TextTrainer:
         config: TrainerConfig = self.base.config
         if config.dataset is None:
             raise ValueError("dataset must define a build target")
-        template_logging = config.debug.log_first_rendered_template or (
-            getattr(getattr(config, "monitor", None), "enabled", False)
+        template_logging = (
+            config.monitor.enabled
             and config.monitor.datasets.log_first_rendered_template
         )
         assets_config = config.dataset.model_assets

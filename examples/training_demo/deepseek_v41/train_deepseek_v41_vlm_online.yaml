@@ -302,9 +302,9 @@ checkpoint:
   restore_train_state: true
   restore_dataloader_state: true
 
-debug:
-  check_nan_inf: false
-  check_dataset: warn
+monitor:
+  datasets:
+    log_level: warn
 
 loss_fn: null
 

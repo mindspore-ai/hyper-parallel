@@ -24,6 +24,7 @@ import torch
 
 from hyper_parallel.models.deepseek_v41.adapter.engram.host_state import DeepseekV41HostState
 from hyper_parallel.models.deepseek_v41.adapter.engram.host_table import HostEngramTable
+from hyper_parallel.trainer.config.monitor import MonitorConfig
 
 base_module = importlib.import_module("hyper_parallel.trainer.base")
 
@@ -52,6 +53,33 @@ class TestBaseTrainerCleanup(unittest.TestCase):
                 self.assertIs(context, trainer.dataloader_context)
                 self.assertEqual(context.tp_source_rank, 0 if options is None else None)
                 self.assertIs(trainer.train_dataset, dataset)
+
+    def test_fsdp_diagnostics_respects_monitor_switch(self) -> None:
+        """Feature: Monitor-owned FSDP diagnostics.
+
+        Description: Build a model for all monitor/diagnostic switch combinations.
+        Expectation: Runtime tracing is built only when both switches are enabled.
+        """
+        for active, enabled in ((False, False), (False, True), (True, False), (True, True)):
+            with self.subTest(active=active, enabled=enabled):
+                config = MagicMock()
+                config.monitor = MonitorConfig(enabled=active, check_fsdp_runtime=enabled)
+                config.accelerator.loss_parallel = False
+                trainer = SimpleNamespace(
+                    config=config, distributed_setup=object(), global_rank=1, mesh=object(),
+                )
+                with (
+                    patch.object(base_module, "_validate_optimize_dtype"),
+                    patch.object(base_module.model_integration_runtime, "build_model_integration_session"),
+                    patch.object(base_module.fsdp_runtime, "build_fsdp_runtime_diagnostics") as build,
+                ):
+                    base_module.BaseTrainer._build_model(trainer)
+                if active and enabled:
+                    build.assert_called_once_with(trainer.hsdp_model_parts)
+                    self.assertIs(trainer.fsdp_runtime_diagnostics, build.return_value)
+                else:
+                    build.assert_not_called()
+                    self.assertIsNone(trainer.fsdp_runtime_diagnostics)
 
     @staticmethod
     def _make_trainer() -> MagicMock:

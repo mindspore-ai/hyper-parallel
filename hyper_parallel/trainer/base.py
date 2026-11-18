@@ -342,8 +342,8 @@ class BaseTrainer(Stateful, ABC):
         self.local_rank = get_local_rank_safe()
         self.global_rank = get_global_rank_safe()
         self.world_size = get_world_size_safe()
-        if self.config.debug.check_dataset:
-            enable_dataset_logging(self.config.debug.check_dataset)
+        if self.config.monitor.enabled and self.config.monitor.datasets.log_level:
+            enable_dataset_logging(self.config.monitor.datasets.log_level)
 
         if self.config.training.seed is None:
             self.config.training.seed = self.default_seed
@@ -434,7 +434,7 @@ class BaseTrainer(Stateful, ABC):
         )
         self.fsdp_runtime_diagnostics = (
             fsdp_runtime.build_fsdp_runtime_diagnostics(self.hsdp_model_parts)
-            if getattr(self.config.debug, "check_fsdp_runtime", False)
+            if self.config.monitor.enabled and self.config.monitor.check_fsdp_runtime
             else None
         )
 

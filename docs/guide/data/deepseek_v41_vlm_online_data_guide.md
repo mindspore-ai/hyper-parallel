@@ -751,7 +751,7 @@ When checking encoding logic, log the following boundaries instead of full tenso
 - Per-image patch counts, ViT grids, and LLM grids.
 
 The Online transform executes lazily, so its logs do not appear during Dataset construction. The current training configuration sets the root log level to
-`INFO`; ordinary `logger.debug()` calls require DEBUG to be explicitly enabled on the corresponding logger. `debug.check_dataset: debug` configures
+`INFO`; ordinary `logger.debug()` calls require DEBUG to be explicitly enabled on the corresponding logger. `monitor.datasets.log_level: debug` configures
 `hyper_parallel.data.*` dataset loggers and does not automatically raise the verbosity of `hyper_parallel.models.*` loggers.
 
 In multi-device runs, avoid printing complete messages and prompts on every rank. If needed, restrict output to rank 0 or sample only a few
@@ -794,7 +794,7 @@ logger.isEnabledFor(logging.DEBUG)
 logger.getEffectiveLevel()
 ```
 
-For a logger under `hyper_parallel.models.*`, setting only `debug.check_dataset: debug` does not enable it.
+For a logger under `hyper_parallel.models.*`, setting only `monitor.datasets.log_level: debug` does not enable it.
 
 ## 9. Encoder Parallel Input Memory
 

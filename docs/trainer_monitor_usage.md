@@ -15,6 +15,7 @@ monitor:
   sinks: [console, jsonl]
   output_dir: ./outputs/metrics
   timing: true
+  check_fsdp_runtime: false
   mfu: false
   local_loss:
     enabled: true
@@ -37,6 +38,7 @@ monitor:
     packing_stats: true
     packing_boundary_check: true
     log_first_rendered_template: false
+    log_level: null  # debug / info / warn；null 跟随全局日志级别
 ```
 
 20-step 验收时将需要观察的 `sampler_steps` 设为 1。
@@ -50,6 +52,22 @@ monitor:
 - 异步摘要可能晚于本步基础日志到达，仍使用采集时的 step，不回填成下一步。
 - 全部 rank 的细节保留在各自 JSONL。在线远端只由 rank 0 写入其所持有的全局/本地结果；
   不隐式增加跨 rank 细节上传通信，也不把 rank 0 的 local 数据命名为全局数据。
+
+## 旧配置迁移
+
+顶层 `debug`、`wandb` 及其配置类已删除，旧 YAML/CLI 键会报未知配置错误。
+
+| 原配置 | 当前入口 |
+| --- | --- |
+| `debug.log_first_rendered_template` | `monitor.datasets.log_first_rendered_template` |
+| `debug.check_dataset` | `monitor.datasets.log_level` |
+| `debug.check_fsdp_runtime` | `monitor.check_fsdp_runtime` |
+| `debug.check_nan_inf` | 删除：原来没有实际调用，不代表曾提供 NaN/Inf 检查 |
+| `wandb.enabled/project/entity` | `monitor.sinks` 中添加 `wandb`；`monitor.wandb.project`；环境变量 `WANDB_ENTITY` |
+
+上述数据日志与 FSDP 顺序检查均受 `monitor.enabled` 总开关控制。
+FSDP 检查仍由原有 runtime 实现，按 micro-step 检查执行/预取顺序，不受 `sampler_steps` 控制；
+默认关闭，开启后会安装执行跟踪 hook，可能影响性能。
 
 ## 采集位置
 
@@ -128,7 +146,7 @@ monitor:
 普通诊断事件（如 micro loss 明细、FLOPs 块清单、不可用原因）完整保留在 JSONL，不再额外生成 W&B payload Table。
 TensorBoard 标量使用相同原始数值。rank-local 标量的远端 key 附带 rank/module，避免混为同一曲线。
 WandB 离线目录可用 SDK 的 `wandb sync <offline-run-directory>` 上传；JSONL 本身不是 SDK 离线 run 文件。
-已有外部 `wandb.entity` 继续生效；恢复时同一 run ID 使用 SDK resume。
+组织/用户归属通过外部环境变量 `WANDB_ENTITY` 设置；恢复时同一 run ID 使用 SDK resume。
 远端输出队列上限 256 条，容纳多层 EP 在 step 边界集中产生的记录；它与设备摘要传输的 32 槽队列不同。
 每个 sink 独立处理异常，WandB 失败不会跳过 TensorBoard 写入/关闭；同一 sink 的重复故障只首次告警。
 队列满仍显式计数并保留本地 JSONL，不无限重试；退出等待有上限。

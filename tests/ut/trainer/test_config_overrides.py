@@ -77,16 +77,23 @@ class TestConfigOverrides(unittest.TestCase):
         config = self._parse("--monitor.local_loss.enabled=true", "--monitor.local_loss.sampler_steps=2",
                              "--monitor.local_grad_norm.enabled=true", "--monitor.mfu=true",
                              "--monitor.sinks=[console,jsonl,wandb]", "--monitor.wandb.mode=offline",
-                             "--monitor.datasets.top_n_tokens=8")
+                             "--monitor.datasets.top_n_tokens=8", "--monitor.datasets.log_level=warn",
+                             "--monitor.check_fsdp_runtime=true")
         self.assertTrue(config.monitor.local_loss.enabled)
         self.assertEqual(config.monitor.local_loss.sampler_steps, 2)
         self.assertTrue(config.monitor.local_grad_norm.enabled)
         self.assertNotIn("modules", config.to_dict()["monitor"]["local_grad_norm"])
+        self.assertTrue(config.monitor.check_fsdp_runtime)
+        self.assertEqual(config.monitor.datasets.log_level, "warn")
+        self.assertNotIn("debug", config.to_dict())
+        self.assertNotIn("wandb", config.to_dict())
         self.assertTrue(config.monitor.mfu)
         self.assertEqual(config.monitor.wandb.mode, "offline")
         self.assertEqual(config.monitor.datasets.top_n_tokens, 8)
         self.assertEqual(config.to_dict()["monitor"]["local_loss"]["sampler_steps"], 2)
-        for override in ("--monitor.logging_steps=2", "--monitor.sampler_steps=2",
+        for override in ("--debug.check_nan_inf=true", "--debug.check_dataset=debug",
+                         "--wandb.enabled=true", "--monitor.datasets.log_level=invalid",
+                         "--monitor.logging_steps=2", "--monitor.sampler_steps=2",
                          "--monitor.local_loss.every_n_steps=2", "--monitor.moe.include_children=true",
                          "--monitor.local_grad_norm.modules=[]",
                          "--monitor.local_grad_norm.modules=[model.layers.0]"):

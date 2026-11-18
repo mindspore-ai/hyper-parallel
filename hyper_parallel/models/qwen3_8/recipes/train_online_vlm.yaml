@@ -130,7 +130,5 @@ checkpoint:
   checkpoint_dir: ./outputs/qwen3_8_vlm/checkpoints
   restore_from: null
 
-debug:
-  check_nan_inf: false
 profiler:
   enable: false

@@ -153,6 +153,6 @@ checkpoint:
   checkpoint_dir: ""
   restore_from: null
 
-debug:
-  check_nan_inf: false
-  check_dataset: debug
+monitor:
+  datasets:
+    log_level: debug

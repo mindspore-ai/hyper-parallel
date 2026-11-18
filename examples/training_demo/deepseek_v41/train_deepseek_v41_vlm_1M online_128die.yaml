@@ -282,9 +282,6 @@ checkpoint:
   restore_train_state: true
   restore_dataloader_state: true
 
-debug:
-  check_nan_inf: false
-  check_dataset: null
 
 loss_fn: null
 

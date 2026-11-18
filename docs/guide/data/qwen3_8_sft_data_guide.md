@@ -153,8 +153,9 @@ chat_template_kwargs:
 需要查看首次渲染结果时，在训练配置顶层设置：
 
 ```yaml
-debug:
-  log_first_rendered_template: true
+monitor:
+  datasets:
+    log_first_rendered_template: true
 ```
 
 该开关可独立开启；此处对应纯文本 tokenizer 模板日志。

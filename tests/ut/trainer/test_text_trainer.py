@@ -23,7 +23,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from hyper_parallel.trainer.config.data import ModelAssetsConfig
-from hyper_parallel.trainer.config.training import DebugConfig
+from hyper_parallel.trainer.config.monitor import DatasetMonitorConfig, MonitorConfig
 from hyper_parallel.trainer.base import BaseTrainer
 
 
@@ -49,20 +49,22 @@ TextTrainer = _load_text_trainer()
 class TestTextTrainer(unittest.TestCase):
     """Verify text training streams prepared batches into callbacks."""
 
-    def test_template_logging_is_independent_of_dataset_debug(self) -> None:
-        """Feature: Independent template debug configuration.
+    def test_template_logging_respects_monitor_switch(self) -> None:
+        """Feature: Monitor template configuration.
 
-        Description: Build text assets with dataset debugging disabled.
-        Expectation: The debug template flag reaches the template for both values.
+        Description: Build text assets with the monitor and template switches.
+        Expectation: Template logging requires both switches to be enabled.
         """
-        self.assertFalse(DebugConfig().log_first_rendered_template)
-        for enabled in (False, True):
-            with self.subTest(enabled=enabled):
+        self.assertFalse(DatasetMonitorConfig().log_first_rendered_template)
+        for active, enabled in ((False, False), (False, True), (True, False), (True, True)):
+            with self.subTest(active=active, enabled=enabled):
                 tokenizer = Mock(pretrained_model_name_or_path="/unused")
                 assets = ModelAssetsConfig(chat_template="tokenizer", tokenizer=tokenizer)
                 config = SimpleNamespace(
                     dataset=SimpleNamespace(model_assets=assets),
-                    debug=DebugConfig(check_dataset=None, log_first_rendered_template=enabled),
+                    monitor=MonitorConfig(
+                        enabled=active, datasets=DatasetMonitorConfig(log_first_rendered_template=enabled),
+                    ),
                 )
                 trainer = TextTrainer.__new__(TextTrainer)
                 trainer.base = SimpleNamespace(config=config, model_config=object())
@@ -71,7 +73,7 @@ class TestTextTrainer(unittest.TestCase):
                     trainer._build_model_assets()
                 build.assert_called_once_with(
                     "tokenizer", tokenizer.build.return_value,
-                    chat_template_kwargs={}, log_first_rendered_template=enabled,
+                    chat_template_kwargs={}, log_first_rendered_template=active and enabled,
                 )
 
     def test_forward_backward_dispatches_metric_hook_before_forward(self) -> None:

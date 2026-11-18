@@ -61,9 +61,9 @@ training:
   global_batch_size: 2
   micro_batch_size: 2
 
-debug:
-  check_nan_inf: false
-  check_dataset: debug
+monitor:
+  datasets:
+    log_level: debug
 
 dataset:
   _target_: hyper_parallel.data.text.build_dataset.build_indexed_text_dataset
@@ -114,7 +114,7 @@ dataloader:
   SFT labels 已对齐，检查长度直接等于 `seq_length`，不额外加一个 token。
 - labels 已对齐，必须保持 `labels_are_shifted: true`；监督以 labels 为准，设置 `eod_mask_loss: false`。
 - 全局 batch 和并行配置需满足实际训练要求；本例无并行切分、MBS=2，仅用于说明组批结果。
-- `check_dataset: debug` 开启数据模块的调试日志，用于查看路径发现、Dataset 构建及并行取批形状。
+- `monitor.datasets.log_level: debug` 开启数据模块的调试日志，用于查看路径发现、Dataset 构建及并行取批形状。
   它不保证打印所有 tensor 内容，也不替代数据正确性校验。
 
 ## 组批结果

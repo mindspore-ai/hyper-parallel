@@ -177,7 +177,7 @@ Training exposes only three mode values:
 | `build` | Check structure, layout, data, and checkpoint contracts after construction | Low-cost integration checks |
 | `runtime` | Include `build`, then collect inputs, gradients, parameters, optimizer, shared state, performance, and checkpoint layouts step by step | Formal numerical-accuracy matrix |
 
-`debug.check_fsdp_runtime` independently controls FSDP execution-order diagnostics and is not implicitly enabled by `model_integration.mode`.
+`monitor.check_fsdp_runtime` independently controls FSDP execution-order diagnostics and is not implicitly enabled by `model_integration.mode`.
 
 ## 2. Preparation
 

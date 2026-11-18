@@ -751,7 +751,7 @@ image_batch_indices = [image_0_batch, image_1_batch, ...]
 - 单图 patch 数、ViT 网格和 LLM 网格。
 
 Online transform 是惰性执行的，所以日志不会在 Dataset 构造时出现。当前训练配置的根日志级别为
-`INFO`；普通 `logger.debug()` 需要对应 logger 显式启用 DEBUG。`debug.check_dataset: debug` 配置的是
+`INFO`；普通 `logger.debug()` 需要对应 logger 显式启用 DEBUG。`monitor.datasets.log_level: debug` 配置的是
 `hyper_parallel.data.*` dataset logger，不会自动提升 `hyper_parallel.models.*` logger 的级别。
 
 多卡运行时还应避免每个 rank 打印完整 messages 和 prompt。必要时只允许 rank 0 输出，或只采样少量
@@ -794,7 +794,7 @@ logger.isEnabledFor(logging.DEBUG)
 logger.getEffectiveLevel()
 ```
 
-如果 logger 位于 `hyper_parallel.models.*`，仅设置 `debug.check_dataset: debug` 不会启用它。
+如果 logger 位于 `hyper_parallel.models.*`，仅设置 `monitor.datasets.log_level: debug` 不会启用它。
 
 ## 9. Encoder Parallel 输入显存
 

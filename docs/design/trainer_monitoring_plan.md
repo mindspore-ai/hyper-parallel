@@ -44,7 +44,7 @@ flowchart TB
 flowchart TB
     subgraph REMOVE["红色 · 移除与不建设"]
         X["删除 TqdmCallback、进度条 writer 和注册<br/>不迁移 ETA、进度比例、额外 total_steps"]
-        Y["不增加独立 Debug 子系统<br/>原有 NaN / 数据 / FSDP 安全检查保持职责"]
+        Y["删除顶层 debug / wandb 配置<br/>数据日志与 FSDP 顺序检查统一入口到 monitor"]
     end
     style REMOVE fill:#fdebed,stroke:#bd4a57,color:#65242c
 ```
@@ -63,6 +63,7 @@ monitor:
   sinks: [console, jsonl]  # 可选 tensorboard、wandb；不默认上传
   output_dir: ./outputs/metrics
   timing: true
+  check_fsdp_runtime: false
   mfu: false
   wandb:
     project: hyper-parallel
@@ -88,6 +89,7 @@ monitor:
     packing_stats: true
     packing_boundary_check: true
     log_first_rendered_template: false
+    log_level: null  # debug / info / warn；null 跟随全局日志级别
 ```
 
 - `sampler_steps` 统一表示采集间隔；基础日志沿用外部 `training.logging_steps`，monitor 不重复定义输出频次。

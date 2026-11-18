@@ -15,6 +15,7 @@
 """Optional Trainer monitoring, independent of the external logging cadence."""
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 
 @dataclass
@@ -53,6 +54,7 @@ class DatasetMonitorConfig:
     packing_stats: bool = True
     packing_boundary_check: bool = True
     log_first_rendered_template: bool = False
+    log_level: Literal["debug", "info", "warn"] | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -84,6 +86,7 @@ class MonitorConfig:
     sinks: list[str] = field(default_factory=lambda: ["console", "jsonl"])
     output_dir: str = "./outputs/metrics"
     timing: bool = True
+    check_fsdp_runtime: bool = False
     mfu: bool = False
     wandb: MonitorWandbConfig = field(default_factory=MonitorWandbConfig)
     local_loss: SamplingConfig = field(default_factory=SamplingConfig)

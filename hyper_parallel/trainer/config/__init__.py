@@ -30,7 +30,6 @@ __all__ = [
     "CompileConfig",
     "DataLoaderConfig",
     "DatasetConfig",
-    "DebugConfig",
     "FSDP2Config",
     "MemoryConfig",
     "MonitorConfig",
@@ -47,7 +46,6 @@ __all__ = [
     "Target",
     "TrainerConfig",
     "TrainingConfig",
-    "WandbConfig",
     "save_configs",
     "CheckpointingConfig",
 ]
@@ -86,11 +84,9 @@ from hyper_parallel.trainer.config.stress_detect import (
 )
 from hyper_parallel.trainer.config.trainer import TrainerConfig, save_configs
 from hyper_parallel.trainer.config.training import (
-    DebugConfig,
     MemoryConfig,
     ModelIntegrationConfig,
     ProfilingAnalysisConfig,
     ProfilingConfig,
     TrainingConfig,
-    WandbConfig,
 )

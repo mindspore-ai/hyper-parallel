@@ -139,9 +139,6 @@ checkpoint:
   save_ckpt: false
   checkpoint_dir: ''
   restore_from: null
-debug:
-  check_nan_inf: false
-  check_dataset: null
 context:
   device_num: 16
   expert_shard: group
