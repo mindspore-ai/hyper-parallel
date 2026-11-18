@@ -561,8 +561,10 @@ def _tag_inplace_saves(graph_module: fx.GraphModule) -> None:
     the post-mutation original or a pre-mutation duplicate of the producer,
     and neither matches what forward computed at the reader's own position.
     Eager autograd stays silent for such a read — its value reaches backward
-    only through the recompute chain, never as a saved tensor. The storage
-    closure follows operator-schema aliases, so readers of a view (or of a
+    only through the recompute chain, never as a saved tensor.
+    Storage owners must stay saved too: backward may consume a buffer written
+    only through a view, and replaying its allocation would discard those writes.
+    The closure follows operator-schema aliases, so readers of a view (or of a
     sibling view when the write goes through another view) are covered, and
     mutations outside the checkpoint scope still contribute their storage.
     """
@@ -597,7 +599,7 @@ def _tag_inplace_saves(graph_module: fx.GraphModule) -> None:
             or node.meta.get("recompute") not in _RECOMPUTE_POLICIES
         ):
             continue
-        if not aliased_storage.isdisjoint(node.all_input_nodes):
+        if not aliased_storage.isdisjoint((node, *node.all_input_nodes)):
             node.meta["recompute"] = CheckpointPolicy.MUST_SAVE
 
 
