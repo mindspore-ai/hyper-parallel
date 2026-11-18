@@ -150,7 +150,7 @@ packing，无需转换为 `.bin/.idx`。CC12M 原始下载信息见[数据集说
 | 并行 | TP1 / CP4 / EP8 / PP1，dense DP4，encoder CP4 |
 | FSDP | `dp_shard_size=8`，`edp_shard_size=1`；DP+CP 域为 16 个 rank |
 | Batch / 序列 | global batch 8，micro batch 1，累计 2 个 microbatch，4096 token |
-| 优化 | Host Engram、HyperOps CSA2、分组 GEMM EP、流水式 mHC、路由与视觉注意力、全重算、FSDP 预取 |
+| 优化 | Host Engram、OpSelect CSA2、分组 GEMM EP、流水式 mHC、路由与视觉注意力、全重算、FSDP 预取 |
 | 精度 / 步数 | BF16 前向；FP32 初始化、主参数及梯度归约；默认 100 步 |
 
 首次验证可先跑一步，并关闭历史 checkpoint 恢复：
@@ -263,7 +263,7 @@ ops:
 CSA2 融合实现要求适用的 BF16 输入、普通因果 TopK，以及调用所需的文档分段。
 当前示例使用 TP1 并关闭 candidate pool。分块 EP 和容量受限 EP 用参考 token 重排。
 视觉注意力在图文配置中由 `ops.attention` 控制。完整候选顺序见
-[HyperOps 配置参考](../../../hyper_parallel_ops_config_reference.md#5-支持矩阵)。
+[算子后端选型与接入](../../../docs/guide/op_select.zh.md#算子支持矩阵)。
 
 ### 关闭 MegaKernel 后使用普通 EP
 
