@@ -19,11 +19,10 @@ which routes to the platform-specific Ascend NPU custom C++ kernel.
 """
 from typing import Optional, Sequence, Tuple
 
-from mindspore import Tensor
-
 from hyper_parallel.platform import get_platform
 
 _platform = get_platform()
+Tensor = _platform.Tensor
 
 _MAX_INT64 = 9223372036854775807
 
