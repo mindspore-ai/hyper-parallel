@@ -187,20 +187,59 @@ class TestSessionAllocator(unittest.TestCase):
         current.assert_not_called()
         self.reader.assert_not_called()
 
-    def test_failed_enable_does_not_register_a_live_owner(self) -> None:
+    def test_rejected_setting_warns_without_registering_a_live_owner(self) -> None:
         """Feature: Failed native setting initialization.
 
-        Description: The first enable fails and a later activation retries.
-        Expectation: Propagate the failure without leaking owner lifetime state.
+        Description: The backend rejects the setting before changing allocator state.
+        Expectation: Warn once, preserve the backend and permit another owner to acquire.
         """
         self.setter.side_effect = RuntimeError("enable failed")
-        with self.assertRaisesRegex(RuntimeError, "enable failed"):
+        with self.assertLogs("hyper_parallel.auto_parallel.hyper_offload.runtime.allocator", level="WARNING"):
             self.owner.activate()
+        self.owner.activate()
+        self.setter.assert_called_once_with("expandable_segments:True")
+        self.assertFalse(self.current)
+        self.backend.empty_cache.assert_not_called()
+        self.setter.side_effect = self._set_config
+        other = SessionAllocator()
+        self.addCleanup(other.close)
+        other.activate()
+        self.owner.close()
+        self.assertTrue(self.current)
+        other.close()
+        self.assertFalse(self.current)
+
+    def test_partially_applied_setting_is_restored_before_fallback(self) -> None:
+        """Restore an enable that changes native state before reporting failure."""
+        def apply_then_fail(value: str) -> None:
+            """Simulate a setter that applies the value before rejecting it."""
+            self._set_config(value)
+            if self.current:
+                raise RuntimeError("partially applied")
+
+        self.setter.side_effect = apply_then_fail
+        with self.assertLogs("hyper_parallel.auto_parallel.hyper_offload.runtime.allocator", level="WARNING"):
+            self.owner.activate()
+        self.assertFalse(self.current)
+        self.backend.empty_cache.assert_not_called()
+        self.owner.close()
         self.setter.side_effect = self._set_config
         self.owner.activate()
         self.assertTrue(self.current)
         self.owner.close()
         self.assertFalse(self.current)
+
+    def test_failed_setting_restoration_is_not_silently_ignored(self) -> None:
+        """A failed rollback cannot claim that the original backend was preserved."""
+        def fail_setting(value: str) -> None:
+            """Leave the setting enabled and reject both update attempts."""
+            self._set_config("expandable_segments:True")
+            raise RuntimeError(value)
+
+        self.setter.side_effect = fail_setting
+        with self.assertRaisesRegex(RuntimeError, "expandable_segments:False"):
+            self.owner.activate()
+        self.backend.empty_cache.assert_not_called()
 
     def test_uninitialized_accelerator_can_be_activated_later(self) -> None:
         """Defer hardware work for CPU execution, then acquire after device initialization."""

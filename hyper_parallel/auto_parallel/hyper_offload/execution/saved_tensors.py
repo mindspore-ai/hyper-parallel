@@ -362,7 +362,7 @@ class SavedTensorReplay:
             self.manager.copy_d2h(sid)
             self._pending_release.add(sid)
         if sid in self._restored:
-            storage_id_expected = self.manager._residency[sid].device_storage()._cdata
+            storage_id_expected = self.manager.device_storage_id(sid)
         else:
             storage_id_expected = self._bound[sid][0]
         if storage_id_expected != storage_id:
@@ -413,7 +413,7 @@ class SavedTensorReplay:
         self._validate_versions(packed.storage_id)
         self._unpacked += 1
         shape, stride, offset, dtype, device = packed.metadata
-        storage = self.manager._residency[packed.storage_id].device_storage()
+        storage = self.manager.device_storage(packed.storage_id)
         result = torch.empty(0, dtype=dtype, device=device)
         result.set_(storage, offset, shape, stride)
         self._remaining_uses[packed.storage_id] -= 1

@@ -1192,6 +1192,7 @@ class BaseTrainer(Stateful, ABC):
 
     def train(self) -> None:
         """Run the configured training loop."""
+        offload_context = getattr(self, "hyper_offload_context", None)
         try:
             config: TrainerConfig = self.config
             self.on_train_begin()
@@ -1250,8 +1251,16 @@ class BaseTrainer(Stateful, ABC):
                 logger.exception("Failed to save memory snapshot after training error.")
             finally:
                 self.abort_profilers()
+            if isinstance(offload_context, OffloadSession):
+                try:
+                    offload_context.close()
+                # Preserve the causal training error if allocator restoration fails.
+                except BaseException:  # pylint: disable=broad-exception-caught
+                    logger.exception("Failed to restore the HyperOffload allocator after training error.")
             raise
 
+        if isinstance(offload_context, OffloadSession):
+            offload_context.close()
         synchronize()
 
         self.destroy_distributed()

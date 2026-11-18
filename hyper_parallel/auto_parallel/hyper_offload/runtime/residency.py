@@ -150,6 +150,34 @@ class ResidencyManager:
             return None
         return buffer.device_buffer.numel()
 
+    def device_storage(self, sid: int) -> torch.UntypedStorage:
+        """Return device storage, preserving transfer waits and demand paging.
+
+        Args:
+            sid: Registered storage identifier.
+
+        Returns:
+            The device storage after resolving pending transfers.
+
+        Raises:
+            KeyError: If the storage identifier is not registered.
+        """
+        return self._residency[sid].device_storage()
+
+    def device_storage_id(self, sid: int) -> int:
+        """Return the current native identity of a registered device storage.
+
+        Args:
+            sid: Registered storage identifier.
+
+        Returns:
+            The storage identity after resolving pending transfers.
+
+        Raises:
+            KeyError: If the storage identifier is not registered.
+        """
+        return self.device_storage(sid)._cdata
+
     # ------------------------------------------------------------------
     # Stream synchronisation
     # ------------------------------------------------------------------
