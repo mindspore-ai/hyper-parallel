@@ -716,6 +716,9 @@ class AllReduceParamGroup:
         else:
             self.replicate_world_size = 1
         self.fused_buffer: Optional[ms.Tensor] = None
+        # Communication domain this fused group belongs to; only a unit on the
+        # same domain may wait / all-reduce it (see MindSporeHSDPStateV2._owns_group).
+        self.owner_key: Optional[tuple] = None
         self.param_offsets: List[int] = []
         self.param_numels: List[int] = []
         self.all_reduce_handle: Optional[CommHandle] = None
