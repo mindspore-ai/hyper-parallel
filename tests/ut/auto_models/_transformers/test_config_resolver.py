@@ -26,6 +26,8 @@ is never called.
 # These unit tests exercise the registry's private resolver directly.
 # pylint: disable=protected-access
 
+import subprocess
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -71,6 +73,32 @@ class TestEmptyMappingFallback(unittest.TestCase):
         self.assertFalse(is_hf_model)
         discover.assert_called_once_with("lazy_family")
         resolve.assert_called_once_with("LazyFamilyForCausalLM")
+
+    def test_v41_spec_registers_custom_model_in_fresh_process(self) -> None:
+        """Feature: Canonical V4.1 spec discovery initializes model registration.
+        Description: Resolve the custom architecture without legacy registration imports.
+        Expectation: Select V4.1 and its checkpoint mappings instead of the HF V4 fallback.
+        """
+        probe = """
+import sys
+from types import SimpleNamespace
+from hyper_parallel.models._transformers.config_resolver import get_is_hf_model
+from hyper_parallel.models.registry import MODEL_ARCH_MAPPING, get_model_adapter
+from transformers.conversion_mapping import get_checkpoint_conversion_mapping
+
+assert 'DeepseekV41ForCausalLM' not in MODEL_ARCH_MAPPING
+config = SimpleNamespace(model_type='deepseek_v4', architectures=['DeepseekV41ForCausalLM'])
+assert not get_is_hf_model(config)
+assert MODEL_ARCH_MAPPING['DeepseekV41ForCausalLM'] == (
+    'hyper_parallel.models.deepseek_v41.modeling_deepseek_v41', 'DeepseekV41ForCausalLM')
+assert get_model_adapter('deepseek_v41').architecture == 'DeepseekV41ForCausalLM'
+assert get_checkpoint_conversion_mapping('DeepseekV41ForCausalLM')
+assert 'hyper_parallel.models.deepseek_v41.adapter.registration' not in sys.modules
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", probe], capture_output=True, text=True, timeout=180, check=False,
+        )
+        self.assertEqual(result.returncode, 0, f"returncode={result.returncode}, expected=0; {result.stderr}")
 
     def test_lazy_load_success_and_failure(self):
         """A resolvable entry returns the class; a broken entry falls back to None."""

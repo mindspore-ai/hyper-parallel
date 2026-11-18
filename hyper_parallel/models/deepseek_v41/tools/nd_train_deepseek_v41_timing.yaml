@@ -81,16 +81,7 @@ plan_overrides:
   replace:
     kind: module
     implementation:
-      _target_: hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
-- match: '*.self_attn'
-  tp_divide_attrs:
-  - num_groups
-- match: '*.self_attn.forward'
-  region_dispatch: false
-  replace:
-    kind: method
-    implementation:
-      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.shared_attention_context_parallel.deepseek_v41_shared_attention_parallel_wrapper
+      _target_: hyper_parallel.components.modules.CompressedSparseAttention2
 - match: model.layers.*.*_hc
   region_dispatch: false
   params:

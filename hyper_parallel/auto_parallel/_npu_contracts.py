@@ -266,8 +266,7 @@ def npu_sparse_attention_with_scalar_sink(query: torch.Tensor, key_value: torch.
     """The contract of DeepSeek-V4.1's sparse attention, Omni's kernel and the sink it encodes.
 
     Stands in for
-    ``components/modules/shared_compressed_dsa_attention.npu_sparse_attention_with_scalar_sink``,
-    whose kernel is ``omni_training_custom_ops``' and has no torch path a
+    the historical ``omni_training_custom_ops`` attention adapter, which has no torch path a
     run takes: the reference beside it keeps an fp32 score of one sequence
     by another, which is not what the run keeps.
     """
@@ -425,7 +424,8 @@ def npu_contracts() -> Iterator[types.ModuleType]:
 
 # Where DeepSeek-V4.1's sparse attention lives, and the two names in it that
 # decide which path a call takes.
-_V41_ATTENTION = "hyper_parallel.components.modules.shared_compressed_dsa_attention"
+_V41_ATTENTION = "hyper_parallel.components.modules.attention.compressed_sparse_attention2.compressed_sparse_attention2"
+_V41_INDEXER = "hyper_parallel.components.modules.attention.compressed_sparse_attention2.indexer"
 _V41_OMNI = "npu_sparse_attention_with_scalar_sink"
 _V41_REFERENCE = "_reference_sparse_attention"
 
@@ -526,7 +526,7 @@ def v41_indexer_contract() -> Iterator[bool]:
         that carries no V4.1 attention.
     """
     try:
-        module = importlib.import_module(_V41_ATTENTION)
+        module = importlib.import_module(_V41_INDEXER)
     except ImportError:
         yield False
         return

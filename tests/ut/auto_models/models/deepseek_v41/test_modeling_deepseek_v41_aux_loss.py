@@ -33,7 +33,9 @@ except ImportError as exc:
     raise unittest.SkipTest(f"DeepSeek-V4 Transformers dependency unavailable: {exc}") from exc
 
 from hyper_parallel.components.functional.aux_loss import aux_loss_scale_context, bind_aux_loss_scale
-from hyper_parallel.components.modules.shared_compressed_dsa_attention import SharedCompressedPackedSequence
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.document_layout import (
+    SharedCompressedPackedSequence,
+)
 from hyper_parallel.distributed.apply import apply_sharding_plan
 from hyper_parallel.distributed.plan import ShardingPlan
 from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
@@ -314,7 +316,8 @@ class TestV41NativeAuxLoss(unittest.TestCase):
             assets.write_text(json.dumps({"layer_ids": []}), encoding="utf-8")
             config.v41_engram_assets_path = str(assets)
             model = DeepseekV41ForCausalLM(config)
-            reference = copy.deepcopy(model)
+            reference = DeepseekV41ForCausalLM(config)
+            reference.load_state_dict(model.state_dict(), strict=True)
             reference.model.layers[0].mlp.gate.aux_loss_coeff = 0
             tokens = torch.tensor([[1, 2, 3, 4], [4, 2, 5, 6]])
             with aux_loss_scale_context():

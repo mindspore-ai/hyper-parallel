@@ -774,11 +774,13 @@ DeepSeek-V4.1 core model modules and optimized paths correspond one to one, but 
 |---|---|---|---|
 | pipelined mHC | `DeepseekV41PipelinedHyperConnection` | `PipelinedMhcModule` | `replace.kind: module` + `implementation` |
 | Engram | `DeepseekV41Engram` | `EngramModule` | `replace.kind: module` + `implementation` |
-| CSA2 Attention | `DeepseekV41Attention` | `SharedCompressedDSAAttention` | `replace.kind: module` + `implementation` |
+| CSA2 Attention | `DeepseekV41Attention` | `CompressedSparseAttention2` | `replace.kind: module` + `implementation` |
 
-Both Attention implementations share `SharedCompressedDSAAttentionBase`. The production module fixes
-`use_optimized_sparse_attention=False`, while the candidate fixes it to `True`. Providers only register factories; the current demo's recipe
-explicitly selects three replacements. Removing those entries still allows forward/backward and falls back to the unoptimized reference path.
+The `CompressedSparseAttention2` family owns the complete attention algorithm, parameter layouts
+and CP/TP stages. The model spec selects it by default; recipe options choose `use_fused_ops`
+and communication policies. The native model and family use the same `CompressedSparseAttention2Module`
+algorithm. Setting `use_fused_ops: false` selects reference operations; removing an explicit recipe
+override retains the model-spec default. A separate attention forward wrapper is not required.
 
 The example uses EP16 for `recompute_topology` and EP1 for the baseline, so the recomputation group deliberately uses cross-topology thresholds. To isolate the effect of recomputation, make the parallel fields in `recompute_topology` match the baseline.
 

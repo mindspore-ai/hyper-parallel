@@ -95,7 +95,7 @@ plan_overrides:
       kind: module
       source_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Attention
       implementation:
-        _target_: hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
+        _target_: hyper_parallel.components.modules.CompressedSparseAttention2
   - match: model.layers.*.mlp.forward
     region_dispatch: false
     replace:

@@ -87,7 +87,7 @@ complete modules with a declared semantic and state-transfer contract. It may:
 It must not create missing layers or required parameters, invent the model's
 forward semantics, repair an otherwise invalid architecture, or be required merely
 to instantiate and execute the model. For example, replacing an executable
-`DeepseekV41Attention` with `SharedCompressedDSAAttention` is valid; constructing a
+`DeepseekV41Attention` with `CompressedSparseAttention2` is valid; constructing a
 `PlaceholderAttention` that owns weights but cannot run until the same replacement
 is applied is invalid. If a source-only HF repository is the only architecture
 reference, port its required implementation into `modeling*.py` before adding

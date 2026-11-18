@@ -115,74 +115,6 @@ class DocumentCompressionPlan:
         """
         return _compression_indices(self, device)
 
-    def exchange(self, tensor: torch.Tensor, context: Any) -> torch.Tensor:
-        """Complete boundary blocks with the existing differentiable A2AV protocol.
-
-        Args:
-            tensor: Local projected values with raw tokens on dimension one.
-            context: CP boundary-dispatch context, or None when no exchange is needed.
-
-        Returns:
-            Required preceding rows followed by the local rows, preserving autograd.
-        """
-        if not self.route.needs_exchange:
-            return tensor
-        if context is None or context.exchange_boundary is None:
-            raise ValueError("natural document compression across CP requires boundary dispatch")
-        return context.exchange_boundary(tensor, self.route)
-
-    def pool(self, key: torch.Tensor, gate: torch.Tensor, context: Any) -> torch.Tensor:
-        """Pool complete same-document groups using the model's original FP32 softmax.
-
-        Args:
-            key: Local projected values shaped [batch, raw tokens, channels].
-            gate: Pooling logits with the same shape as key.
-            context: CP boundary-dispatch context, or None when no exchange is needed.
-
-        Returns:
-            Pooled values shaped [batch, locally owned complete blocks, channels].
-        """
-        rows = self.indices(key.device)[0]
-        projected = self.exchange(torch.cat((key, gate), dim=-1), context)
-        blocks = projected.index_select(1, rows).reshape(
-            key.shape[0], self.counts[self.rank], self.ratio, projected.shape[-1],
-        )
-        values, scores = blocks.chunk(2, dim=-1)
-        return (values * scores.float().softmax(dim=2).to(values.dtype)).sum(dim=2)
-
-    def positions(self, cos: torch.Tensor, sin: torch.Tensor, context: Any) -> tuple:
-        """Take original block-start RoPE; retain FP32 boundary metadata precision.
-
-        Args:
-            cos: Local raw-token rotary cosine coefficients.
-            sin: Local raw-token rotary sine coefficients with the same shape as cos.
-            context: CP boundary-dispatch context, or None when no exchange is needed.
-
-        Returns:
-            Cosine and sine coefficients for each locally owned block's first token.
-        """
-        positions = self.indices(cos.device)[1]
-        embeddings = self.exchange(torch.cat((cos, sin), dim=-1), context)
-        return embeddings.index_select(1, positions).chunk(2, dim=-1)
-
-    def launch_bank(self, tensor: torch.Tensor, context: Any) -> CompactBankGather:
-        """All-gather equal-capacity containers and exclude every padding slot.
-
-        Args:
-            tensor: Locally owned compressed bank with blocks on dimension one.
-            context: CP context providing an asynchronous sequence all-gather.
-
-        Returns:
-            Handle whose wait method returns the global bank without padding slots.
-        """
-        capacity = max(self.counts)
-        if not capacity:
-            return CompactBankGather(None, tensor, None)
-        padded = tensor if tensor.shape[1] == capacity else functional.pad(
-            tensor, (0, 0, 0, capacity - tensor.shape[1]),
-        )
-        slots = _bank_slots(self.counts, tensor.device)
-        return CompactBankGather(context.launch(padded, 1), tensor, slots)
 
 
 @dataclass
@@ -268,3 +200,20 @@ def _bank_slots(counts: tuple[int, ...], device: torch.device) -> torch.Tensor |
     capacity = max(counts)
     return torch.cat([torch.arange(peer*capacity, peer*capacity+count, device=device)
                       for peer, count in enumerate(counts)])
+
+
+def launch_compressed_bank(tensor: torch.Tensor, counts: tuple[int, ...], launch: Any) -> CompactBankGather:
+    """Launch equal-capacity containers and compact padding at the consumer boundary.
+
+    Args:
+        tensor: Locally owned bank [batch, keys, features].
+        counts: Number of complete keys owned by each CP rank.
+        launch: Existing differentiable sequence-gather launcher, taking tensor and dimension.
+    """
+    capacity = max(counts)
+    if not capacity:
+        return CompactBankGather(None, tensor, None)
+    padded = tensor if tensor.shape[1] == capacity else functional.pad(
+        tensor, (0, 0, 0, capacity - tensor.shape[1]),
+    )
+    return CompactBankGather(launch(padded, 1), tensor, _bank_slots(counts, tensor.device))

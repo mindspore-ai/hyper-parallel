@@ -210,14 +210,6 @@ plan_overrides:
       tp: shard(1)
       cp: shard(1)
       ep: replicate
-- match: '*.self_attn'
-  tp_divide_attrs:
-  - num_groups
-- match: '*.self_attn.forward'
-  replace:
-    kind: method
-    implementation:
-      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.shared_attention_context_parallel.deepseek_v41_shared_attention_parallel_wrapper
 - match: model.layers.*.engram
   when: sequence_parallel
   in_src:

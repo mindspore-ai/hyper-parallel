@@ -114,7 +114,7 @@ plan_overrides:
       source_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Attention
       implementation:
         _target_: >-
-          hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
+          hyper_parallel.components.modules.CompressedSparseAttention2
         use_fused_ops: true
 ```
 

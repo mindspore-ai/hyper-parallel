@@ -38,9 +38,13 @@ from hyper_parallel.components.functional.sparse_lightning_indexer_kl_loss_grad 
 )
 from hyper_parallel.core.activation_memory import checkpoint
 from hyper_parallel.distributed.activation_checkpoint import make_selective_checkpoint_context_fn
-from hyper_parallel.components.modules.shared_compressed_dsa_attention import SharedCompressedPackedSequence
-from hyper_parallel.components.modules.shared_compressed_dsa_attention import shared_compressed_indexer_kl_loss
-from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.document_layout import (
+    SharedCompressedPackedSequence,
+)
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.indexer_kl_loss import (
+    shared_compressed_indexer_kl_loss,
+)
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.indexer import (
     compressed_causal_topk,
 )
 

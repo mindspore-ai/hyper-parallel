@@ -99,17 +99,9 @@ plan_overrides:
       kind: module
       implementation:
         _target_: >-
-          hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
+          hyper_parallel.components.modules.attention.compressed_sparse_attention2.CompressedSparseAttention2
         # Fused CSA2 requires candidate pools to remain disabled and TP=1.
         use_fused_ops: true
-  - match: "*.self_attn"
-    tp_divide_attrs: [num_groups]
-  - match: "*.self_attn.forward"
-    replace:
-      kind: method
-      implementation:
-        _target_: >-
-          hyper_parallel.models.deepseek_v41.adapter.distributed.shared_attention_context_parallel.deepseek_v41_shared_attention_parallel_wrapper
   # Image boundary embeddings stay replicated over TP; FSDP owns their sharding.
   - match: "model"
     params:

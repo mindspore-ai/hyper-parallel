@@ -24,7 +24,7 @@ from torch import nn
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
 from hyper_parallel.compile.tracer.graph_tracer import trace_model_graph, run_traced_graph
-from hyper_parallel.components.modules import shared_compressed_dsa_attention as attention
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2 import indexer as attention
 from hyper_parallel.models.deepseek_v41.adapter.data.runtime import DeepseekV41Runtime
 from hyper_parallel.models.deepseek_v41.adapter.aux_loss import sequence_load_balancing_loss
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
@@ -290,7 +290,7 @@ class TestCompressionGraphInputs(unittest.TestCase):
         """Restored inputs answer alignment, bank length and plan questions tensor-side."""
         leaves, spec = tree_flatten(_inputs([0, 4, 8], compress_ratios=(1, 2))["packed_seq_params"])
         restored = tree_unflatten(leaves, spec)
-        self.assertEqual(restored.block_plan(2, 1, 0), None)
+        self.assertEqual(restored.block_plan(2), None)
         self.assertEqual(restored.compressed_key_length(2), 4)
         self.assertEqual(restored.compressed_key_length(1), 8)
         self.assertEqual(restored.compressed_key_length(0), 8)

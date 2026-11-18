@@ -774,11 +774,12 @@ DeepSeek-V4.1 的模型主体和优化路径是一一对应、但彼此不互相
 |---|---|---|---|
 | pipelined mHC | `DeepseekV41PipelinedHyperConnection` | `PipelinedMhcModule` | `replace.kind: module` + `implementation` |
 | Engram | `DeepseekV41Engram` | `EngramModule` | `replace.kind: module` + `implementation` |
-| CSA2 Attention | `DeepseekV41Attention` | `SharedCompressedDSAAttention` | `replace.kind: module` + `implementation` |
+| CSA2 Attention | `DeepseekV41Attention` | `CompressedSparseAttention2` | `replace.kind: module` + `implementation` |
 
-两种 Attention 共享 `SharedCompressedDSAAttentionBase`：正式模块固定
-`use_optimized_sparse_attention=False`，candidate 固定为 `True`。provider 只登记 factory；当前 demo 是 recipe
-显式选择三项 replacement。删掉这些条目时模型仍能 forward/backward，并回退到未优化 reference path。
+`CompressedSparseAttention2` 模块族拥有完整 attention 算法、参数布局及 CP/TP 阶段。
+模型 spec 默认选择该族，recipe 通过 `use_fused_ops` 和通信选项控制实现。
+原生模型与模块族共用 `CompressedSparseAttention2Module` 算法；设置 `use_fused_ops: false`
+选择小算子，删除 recipe 中的显式覆盖则采用模型 spec 的默认配置，无须额外包装 attention forward。
 
 示例 `recompute_topology` 使用 EP16，而 baseline 使用 EP1，因此重计算组刻意按跨拓扑阈值比较。如果目标是单独验证重计算开关，应让 `recompute_topology` 的并行字段与 baseline 相同。
 

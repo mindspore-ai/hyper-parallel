@@ -12,8 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Generated codegen bundle — DO NOT EDIT MANUALLY.
+"""Public shared compressed sparse attention family (CSA2)."""
 
-Regenerate with ``python -m hyper_parallel.codegen generate``; the
-the bundle is rebuilt from the current training configuration.
-"""
+from .compressed_sparse_attention2_family import CompressedSparseAttention2
+from .compressed_sparse_attention2 import CompressedSparseAttention2Module
+from .document_layout import GraphPackedSequence, SharedCompressedPackedSequence
+from .compressed_sparse_attention2 import SharedCompressedAttentionState
+
+__all__ = ["CompressedSparseAttention2", "CompressedSparseAttention2Module",
+           "SharedCompressedAttentionState", "SharedCompressedPackedSequence", "GraphPackedSequence"]

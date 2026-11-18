@@ -24,8 +24,11 @@ import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
-from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
-    SharedCompressedDSAIndexer,
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.indexer import (
+    CSA2Indexer,
+)
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.compressed_sparse_attention2 import (
+    _apply_v41_rope,
 )
 from hyper_parallel.distributed.activation_checkpoint import (
     make_selective_checkpoint_context_fn,
@@ -151,12 +154,12 @@ class IndexerChunkPlumbingTest(unittest.TestCase):
 
     def test_configured_chunk_size_is_transferred(self):
         """A source-module value overrides the wrapper default."""
-        wrapper = SharedCompressedDSAIndexer(_TinyIndexerSource(1024))
+        wrapper = CSA2Indexer(_TinyIndexerSource(1024), apply_rope=_apply_v41_rope)
         self.assertEqual(wrapper.query_chunk_size, 1024)
 
     def test_missing_chunk_size_falls_back_to_the_released_default(self):
         """Sources without the attribute keep the released 256 default."""
-        wrapper = SharedCompressedDSAIndexer(_TinyIndexerSource(None))
+        wrapper = CSA2Indexer(_TinyIndexerSource(None), apply_rope=_apply_v41_rope)
         self.assertEqual(wrapper.query_chunk_size, 256)
 
 

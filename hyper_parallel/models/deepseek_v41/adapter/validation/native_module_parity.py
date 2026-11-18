@@ -43,9 +43,11 @@ from torch.nn import functional
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Experts, DeepseekV4MLP
 
-from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.compressed_sparse_attention2 import (
     SharedCompressedAttentionState,
-    SharedCompressedDSAAttention,
+)
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.compressed_sparse_attention2 import (
+    CompressedSparseAttention2Module,
     reference_sparse_attention,
 )
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
@@ -582,7 +584,7 @@ def _native_attention_args(
     )
 
 
-def _copy_attention_weights(native: nn.Module, hp: SharedCompressedDSAAttention) -> None:
+def _copy_attention_weights(native: nn.Module, hp: CompressedSparseAttention2Module) -> None:
     """Apply the released checkpoint-name mapping to one attention layer."""
     pairs = (
         (hp.sinks, native.attn_sink),

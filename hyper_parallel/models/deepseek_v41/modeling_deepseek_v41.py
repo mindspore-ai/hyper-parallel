@@ -35,7 +35,6 @@ from torch import nn
 from torch.nn import functional
 from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
-    DeepseekV4Attention,
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
     DeepseekV4PreTrainedModel,
@@ -45,6 +44,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
 
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
 from hyper_parallel.components.modules.shared_expert import SharedExpertModule
+from hyper_parallel.components.modules.rms_norm import RMSNormModule
 from hyper_parallel.components.modules.swiglu_mlp import swiglu_activation
 from hyper_parallel.components.modules.router import routing_scores, select_topk_scores
 from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
@@ -57,15 +57,20 @@ from hyper_parallel.models.deepseek_v41.adapter.aux_loss import (
 )
 from hyper_parallel.models.deepseek_v41.dspark import DeepseekV41DSpark
 # pylint: disable=unused-import
-from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
-    SharedCompressedAttentionCPContext as SharedAttentionCPContext,
-    SharedCompressedPackedSequence as SharedPackedSequence,
-    SharedCompressedAttentionState as SharedAttentionState,
-    SharedCompressedDSAAttention,
-    SharedCompressedDSAAttentionBase,
-    SharedCompressedDSAIndexer,
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.compressed_sparse_attention2 import (
     _apply_v41_rope,
+    CompressedSparseAttention2Module,
 )
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.compressed_sparse_attention2 import (
+    SharedCompressedAttentionState as SharedAttentionState,
+)
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.document_layout import (
+    SharedCompressedPackedSequence as SharedPackedSequence,
+)
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.indexer import (
+    CSA2Indexer,
+)
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.compressor import CSA2Compressor
 from hyper_parallel.models.deepseek_v41.adapter.data.image_processor import (
     IMAGE,
     IMAGE_END,
@@ -415,135 +420,28 @@ def _v41_sparse_moe_forward(
     return routed.view(batch_size, sequence_length, hidden_size) + self.shared_experts(hidden_states)
 
 
-class DeepseekV41Compressor(nn.Module):
-    """Non-overlapping V4.1 compressed-KV producer."""
+class DeepseekV41Compressor(CSA2Compressor):
+    """Construct the model compressor with the CSA2 rotary convention."""
 
     def __init__(self, config: Any, compress_ratio: int) -> None:
-        """Create the learned KV pooling projections."""
-        super().__init__()
-        if compress_ratio < 1:
-            raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
-        self.compress_ratio = compress_ratio
-        self.wkv = nn.Linear(config.hidden_size, config.head_dim, bias=False)
-        if compress_ratio > 1:
-            self.wgate = nn.Linear(config.hidden_size, config.head_dim, bias=False)
-        self.norm = DeepseekV4RMSNorm(config.head_dim, eps=config.rms_norm_eps)
-
-    def forward(
-            self,
-            hidden_states: torch.Tensor,
-            compress_position_embeddings: tuple[torch.Tensor, torch.Tensor],
-            block_plan: Any = None,
-            cp_context: Any = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return unrotated and RoPE-rotated compressed KV tensors.
-
-        Args:
-            hidden_states: Decoder hidden rows to compress.
-            compress_position_embeddings: Rotary coefficients for compressed keys.
-            block_plan: Optional document-local grouping and cross-rank boundary plan.
-            cp_context: Communication context used to complete boundary groups.
-        """
-        batch_size, sequence_length, _ = hidden_states.shape
-        if self.compress_ratio == 1:
-            latent = self.norm(self.wkv(hidden_states))
-            cos, sin = compress_position_embeddings
-            rotated = _apply_v41_rope(latent.unsqueeze(1), cos, sin).squeeze(1)
-            return latent, rotated
-
-        if block_plan is not None:
-            latent = self.norm(block_plan.pool(self.wkv(hidden_states), self.wgate(hidden_states), cp_context))
-            cos, sin = compress_position_embeddings
-            return latent, _apply_v41_rope(
-                latent.unsqueeze(1), cos, sin,
-            ).squeeze(1)
-
-        usable = sequence_length - sequence_length % self.compress_ratio
-        key_value = self.wkv(hidden_states[:, :usable])
-        gate = self.wgate(hidden_states[:, :usable])
-        key_value = key_value.view(batch_size, -1, self.compress_ratio, key_value.shape[-1])
-        gate = gate.view(batch_size, -1, self.compress_ratio, gate.shape[-1])
-        latent = self.norm((key_value * gate.float().softmax(dim=2).to(key_value.dtype)).sum(dim=2))
-        cos, sin = compress_position_embeddings
-        cos = cos[:, :usable:self.compress_ratio]
-        sin = sin[:, :usable:self.compress_ratio]
-        rotated = _apply_v41_rope(latent.unsqueeze(1), cos, sin).squeeze(1)
-        return latent, rotated
+        """Retain the original model construction API."""
+        super().__init__(config, compress_ratio, apply_rope=_apply_v41_rope)
 
 
-class _DeepseekV41IndexerState(nn.Module):
-    """Construct the released Full or Reindex Lightning Indexer state."""
+class DeepseekV41Indexer(CSA2Indexer):
+    """Construct the model's canonical reference Indexer."""
 
     def __init__(self, config: Any, compress_ratio: int, layer_idx: int) -> None:
-        """Create layer-local queries and Full-only shared-key projections."""
-        super().__init__()
-        self.compress_ratio = compress_ratio
-        self.num_heads = config.index_n_heads
-        self.head_dim = config.index_head_dim
-        self.index_topk = config.index_topk
-        # Query rows processed per indexer scoring pass. Larger chunks cut the
-        # Python-loop launch count but enlarge the transient fp32 score
-        # buffer; 256 is the released default, ~1024 measured fastest at 32K.
-        self.query_chunk_size = int(getattr(config, "v41_indexer_query_chunk_size", 256) or 256)
-        self.owns_key = layer_idx in config.v41_kv_source_layer_ids
-        candidate_source = int(getattr(config, "v41_candidate_source_layer_id", -1))
-        self.is_candidate_source = layer_idx == candidate_source
-        self.uses_candidates = 0 <= candidate_source < layer_idx
-        self.candidate_topk_blocks = int(getattr(config, "v41_candidate_topk_blocks", 0))
-        self.candidate_block_size = int(getattr(config, "v41_candidate_block_size", 1))
-        self.loss_coeff = float(getattr(config, "v41_indexer_loss_coeff", 0.0))
-        self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
-        self.weights_proj = nn.Linear(config.hidden_size, self.num_heads, bias=False)
-        if self.owns_key:
-            self.wk = nn.Linear(config.head_dim, self.head_dim, bias=False)
-            self.k_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        """Create the released Full/Reindex projection tree."""
+        super().__init__(config=config, compress_ratio=compress_ratio, layer_idx=layer_idx, apply_rope=_apply_v41_rope)
 
 
-class DeepseekV41Indexer(SharedCompressedDSAIndexer):
-    """Reference Full/Reindex module owned by the V4.1 architecture."""
-
-    def __init__(self, config: Any, compress_ratio: int, layer_idx: int) -> None:
-        """Create the released Indexer state and attach its reference semantics."""
-        super().__init__(_DeepseekV41IndexerState(config, compress_ratio, layer_idx))
-
-
-class _DeepseekV41AttentionState(DeepseekV4Attention):
-    """Construct the released V4.1 attention parameter tree."""
+class DeepseekV41Attention(CompressedSparseAttention2Module):
+    """Construct canonical reference attention before family selection."""
 
     def __init__(self, config: Any, layer_idx: int) -> None:
-        """Create V4 parameters plus the source-only compressor and indexer."""
-        super().__init__(config, layer_idx)
-        # DeepSeek-V4 applies this unweighted RMSNorm after q_b_proj. V4.1
-        # explicitly removes it: q_norm remains between wq_a and wq_b, while
-        # the projected query heads go directly into RoPE.
-        del self.q_b_norm
-        self.compress_ratio = int(config.v41_compress_ratios[layer_idx])
-        self.is_kv_source = layer_idx in config.v41_kv_source_layer_ids
-        self.is_index_source = layer_idx in config.v41_index_source_layer_ids
-        kv_sources = [source for source in config.v41_kv_source_layer_ids if source <= layer_idx]
-        index_sources = [source for source in config.v41_index_source_layer_ids if source <= layer_idx]
-        self.kv_source_layer_idx = max(kv_sources, default=None)
-        self.index_source_layer_idx = max(index_sources, default=None)
-        candidate_source = int(getattr(config, "v41_candidate_source_layer_id", -1))
-        self.candidate_source_layer_idx = (
-            candidate_source if 0 <= candidate_source <= layer_idx else None
-        )
-        if self.is_kv_source:
-            self.compressor = DeepseekV41Compressor(config, self.compress_ratio)
-        if self.is_index_source:
-            self.indexer = DeepseekV41Indexer(config, self.compress_ratio, layer_idx)
-
-
-class DeepseekV41Attention(SharedCompressedDSAAttentionBase):
-    """Reference shared compressed attention owned by the model architecture."""
-
-    def __init__(self, config: Any, layer_idx: int) -> None:
-        """Create the canonical parameter tree with non-fused reference execution."""
-        super().__init__(
-            _DeepseekV41AttentionState(config, layer_idx),
-            replace_indexer=False,
-            use_fused_ops=False,
-        )
+        """Create CSA2 parameters with the original initialization order."""
+        super().__init__(config=config, layer_idx=layer_idx, use_fused_ops=False)
 
 
 class DeepseekV41PipelinedHyperConnection(nn.Module):
@@ -603,7 +501,9 @@ def _initialize_v41_owned_module(module: nn.Module, std: float) -> None:
         module.bias.zero_()
         if module.bias_vl is not None:
             module.bias_vl.zero_()
-    elif isinstance(module, (DeepseekV41Attention, SharedCompressedDSAAttention)):
+    elif isinstance(module, RMSNormModule):
+        module.reset_parameters()
+    elif isinstance(module, CompressedSparseAttention2Module):
         module.sinks.zero_()
     elif isinstance(module, (DeepseekV41PipelinedHyperConnection, PipelinedMhcModule)):
         nn.init.normal_(module.fn, mean=0.0, std=std)
@@ -1419,6 +1319,5 @@ __all__ = [
     "DeepseekV41Model",
     "DeepseekV41PipelinedHyperConnection",
     "DeepseekV41TopKRouter",
-    "SharedAttentionCPContext",
     "SharedAttentionState",
 ]

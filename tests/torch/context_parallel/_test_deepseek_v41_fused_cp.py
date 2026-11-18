@@ -14,9 +14,9 @@
 # ============================================================================
 """Six-layer CPU pretraining CP8 integration, using upstream AG collectives."""
 
-from copy import deepcopy
 from datetime import timedelta
 from importlib import import_module
+from types import SimpleNamespace
 from unittest.mock import patch
 from typing import Any
 
@@ -25,15 +25,19 @@ import torch.distributed as dist
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from transformers.utils import is_torchvision_available
 
+from hyper_parallel.components.modules import CompressedSparseAttention2
+from hyper_parallel.distributed.context_parallel.cp_context import CPContext
+from hyper_parallel.distributed.module_binding import MeshBinding, ParallelBinding
 from hyper_parallel.components.functional.aux_loss import set_aux_loss_scale
-from hyper_parallel.components.modules import shared_compressed_dsa_attention as shared
-from hyper_parallel.models.deepseek_v41.adapter.distributed.shared_attention_context_parallel import (
-    _build_shared_attention_cp_context,
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2 import (
+    SharedCompressedPackedSequence, SharedCompressedAttentionState,
 )
 
 
 class _CPMesh:
     """Minimal mesh interface backed by the initialized world group."""
+
+    ndim = 1
 
     @staticmethod
     def size() -> int:
@@ -112,7 +116,7 @@ def _chain():
     return modules
 
 
-def _forward(modules, hidden, start, boundaries, context):
+def _forward(modules, hidden, start, boundaries):
     """Recreate forward-scoped sharing while preserving learned parameter identity."""
     length = hidden.shape[1]
     positions = torch.arange(start, start+length, device=hidden.device).unsqueeze(0)
@@ -120,9 +124,9 @@ def _forward(modules, hidden, start, boundaries, context):
     freq = 10000 ** (-torch.arange(0, rotary, 2, device=hidden.device).float()/rotary)
     angles = positions.float().unsqueeze(-1)*freq
     embeddings = {kind: (angles.cos(), angles.sin()) for kind in ("main", "compress")}
-    packed = shared.SharedCompressedPackedSequence(boundaries, start, length, int(boundaries[-1]))
+    packed = SharedCompressedPackedSequence(boundaries, start, length, int(boundaries[-1]))
     packed = packed.prepare(hidden.device, (0, 1, 2))
-    state = shared.SharedCompressedAttentionState()
+    state = SharedCompressedAttentionState()
     for module in modules:
         module.use_fused_ops = False
         if module.is_index_source:
@@ -131,7 +135,7 @@ def _forward(modules, hidden, start, boundaries, context):
                       for name, value in module.named_parameters()}
         update = torch.func.functional_call(
             module, parameters, (hidden, embeddings, positions, None),
-            {"shared_attention_state": state, "shared_attention_cp_context": context, "packed_seq_params": packed},
+            {"shared_attention_state": state, "packed_seq_params": packed},
         )[0]
         hidden = hidden + update
     return hidden
@@ -159,10 +163,15 @@ def test_native_geometry_cp8_gloo():
         assert size == 8
         local = length//size
         reference = _chain()
+        # Family members retain immutable build metadata; copy model state, not that metadata.
+        candidate = _chain()
+        candidate.load_state_dict(reference.state_dict(), strict=True)
         candidate = torch.nn.ModuleList([
-            shared.SharedCompressedDSAAttention(module, use_fused_ops=False) for module in deepcopy(reference)
+            CompressedSparseAttention2(module=module, context={"cp_size": size}) for module in candidate
         ])
-        context = _build_shared_attention_cp_context(_CPMesh())
+        binding = ParallelBinding(MeshBinding(SimpleNamespace(tp_size=1)), CPContext(_CPMesh()))
+        for module in candidate:
+            module.bind_parallel(binding)
         # Keep this CPU oracle independent of accelerator optimizer dispatch hooks.
         optimizers = [torch.optim.SGD(model.parameters(), lr=.01, foreach=False)
                       for model in (reference, candidate)]
@@ -175,10 +184,10 @@ def test_native_geometry_cp8_gloo():
             for optimizer in optimizers:
                 optimizer.zero_grad(set_to_none=True)
             set_aux_loss_scale(torch.tensor(1.))
-            expected = _forward(reference, full, 0, boundaries, None)
+            expected = _forward(reference, full, 0, boundaries)
             expected.square().mean().backward()
             set_aux_loss_scale(torch.tensor(1./size))
-            actual = _forward(candidate, shard, rank*local, boundaries, context)
+            actual = _forward(candidate, shard, rank*local, boundaries)
             (actual.square().sum()/expected.numel()).backward()
             _sum_gradients(candidate)
             torch.testing.assert_close(actual, expected[:, rank*local:(rank+1)*local])

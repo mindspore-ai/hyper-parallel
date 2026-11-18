@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import fnmatch
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterable, Mapping, Optional
 
 from hyper_parallel.tools.model_integration.structure_inventory import build_model_inventory
@@ -59,7 +59,14 @@ class ParameterOwnership:
 
 
 def resolve_model_validation_spec(model: Any) -> Optional[ModelValidationSpec]:
-    """Resolve and type-check the final model family's validation provider."""
+    """Resolve and type-check the final model family's validation provider.
+
+    Args:
+        model: Final model after module replacement and wrapping.
+
+    Returns:
+        A model-specific validation contract, or None for unregistered models.
+    """
     config = getattr(model, "config", None)
     identities = [getattr(config, "model_type", None)]
     identities.extend(getattr(config, "architectures", None) or ())
@@ -80,6 +87,15 @@ def resolve_model_validation_spec(model: Any) -> Optional[ModelValidationSpec]:
         raise TypeError(
             "ModelAdapterSpec.validation must return ModelValidationSpec, "
             f"got {type(validation_spec).__name__}"
+        )
+    shared_state_spec = validation_spec.shared_state
+    if shared_state_spec is not None and shared_state_spec.required_keys_for_model is not None:
+        producer_keys, consumer_keys = shared_state_spec.required_keys_for_model(model)
+        validation_spec = replace(
+            validation_spec,
+            shared_state=replace(
+                shared_state_spec, producer_keys=producer_keys, consumer_keys=consumer_keys,
+            ),
         )
     return validation_spec
 

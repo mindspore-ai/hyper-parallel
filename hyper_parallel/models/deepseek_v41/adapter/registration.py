@@ -12,96 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Register the DeepSeek-V4.1 model and adapter providers."""
+"""Compatibility entry for the canonical V4.1 model specification."""
 
-from hyper_parallel.models.adapter_spec import ModelAdapterSpec
-from hyper_parallel.models.deepseek_v41.adapter.engram.host_state import (
-    build_deepseek_v41_external_state,
-)
-from hyper_parallel.models.deepseek_v41.adapter.conversion.checkpoint_mapping import (
-    register_deepseek_v41_checkpoint_mapping,
-)
-from hyper_parallel.models.deepseek_v41.adapter.policies.activation_checkpointing import (
-    build_recompute_policy,
-)
-from hyper_parallel.models.deepseek_v41.adapter.policies.sharding import (
-    build_parameter_sharding_rules,
-    get_fsdp_excluded_subtrees,
-    get_fsdp_execution_order,
-    get_fsdp_wrap_modules,
-)
-from hyper_parallel.models.registry import (
-    register_custom_model,
-    register_model_adapter,
-)
+from hyper_parallel.models.deepseek_v41.deepseek_v41_spec import MODEL_SPEC
+from hyper_parallel.models.registry import register_model_adapter
 
+DEEPSEEK_V41_ADAPTER_SPEC = MODEL_SPEC
 
-def _load_expert_parallel():
-    """Return the model's MoE and Engram EP factories lazily."""
-    from hyper_parallel.models.deepseek_v41.adapter.distributed import (  # pylint: disable=C0415
-        moe_engram_expert_parallel,
-    )
-
-    return moe_engram_expert_parallel
-
-
-def _load_context_parallel():
-    """Return the model's shared-attention CP wrapper lazily."""
-    from hyper_parallel.models.deepseek_v41.adapter.distributed import (  # pylint: disable=C0415
-        shared_attention_context_parallel,
-    )
-
-    return shared_attention_context_parallel
-
-
-def _load_validation_spec():
-    """Return model-owned parity and self-consistency declarations lazily."""
-    from hyper_parallel.models.deepseek_v41.adapter.validation.model_validation_spec import (  # pylint: disable=C0415
-        get_validation_spec,
-    )
-
-    return get_validation_spec()
-
-
-def _load_encoder_parallel_spec():
-    """Load DeepSeek construction rules and its model-bound bridge factory lazily."""
-    from hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel import (  # pylint: disable=C0415
-        get_deepseek_v41_encoder_parallel_spec,
-    )
-
-    return get_deepseek_v41_encoder_parallel_spec()
-
-
-def _load_loss():
-    """Return the V4.1 model-integrated output-loss adapter."""
-    from hyper_parallel.models.deepseek_v41.adapter import chunk_loss  # pylint: disable=C0415
-
-    return chunk_loss
-
-
-register_custom_model(
-    "DeepseekV41ForCausalLM",
-    "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41",
-    "DeepseekV41ForCausalLM",
-)
-register_deepseek_v41_checkpoint_mapping()
-
-DEEPSEEK_V41_ADAPTER_SPEC = ModelAdapterSpec(
-    architecture="DeepseekV41ForCausalLM",
-    model_type="deepseek_v41",
-    context_parallel=_load_context_parallel,
-    expert_parallel=_load_expert_parallel,
-    external_state=build_deepseek_v41_external_state,
-    sharding_rules=build_parameter_sharding_rules,
-    fsdp_wrap_modules=get_fsdp_wrap_modules,
-    fsdp_excluded_subtrees=get_fsdp_excluded_subtrees,
-    fsdp_execution_order=get_fsdp_execution_order,
-    recompute=build_recompute_policy,
-    validation=_load_validation_spec,
-    encoder_parallel=_load_encoder_parallel_spec,
-    loss=_load_loss,
-)
-register_model_adapter(DEEPSEEK_V41_ADAPTER_SPEC)
-
+register_model_adapter(MODEL_SPEC)
 
 __all__ = ["DEEPSEEK_V41_ADAPTER_SPEC"]
