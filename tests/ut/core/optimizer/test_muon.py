@@ -276,6 +276,51 @@ def test_muon_momentum_matches_multistep_scalar_reference(
         reference_buffer = next_buffer
 
 
+@pytest.mark.parametrize("dtypes", [
+    (torch.bfloat16, torch.float32),
+    (torch.float32, torch.bfloat16),
+])
+@pytest.mark.parametrize("mode", ["legacy", "vanilla"])
+def test_muon_mixed_dtype_momentum_returns_per_tensor_bfloat16_inputs(
+        dtypes: Tuple[torch.dtype, torch.dtype], mode: str,
+) -> None:
+    """Feature: Mixed-dtype Muon momentum preparation.
+
+    Description: Compute one momentum update for BF16 and FP32 parameters in both orders.
+    Expectation: Every Newton-Schulz input is BF16 regardless of parameter order.
+    """
+    parameters = [
+        torch.nn.Parameter(torch.zeros(2, 2, dtype=dtype))
+        for dtype in dtypes
+    ]
+    optimizer = Muon(parameters, momentum=0.95, nesterov=True, momentum_mode=mode)
+    for parameter in parameters:
+        parameter.grad = torch.ones_like(parameter)
+
+    with patch.object(torch, "_foreach_add", wraps=torch._foreach_add) as foreach_add, \
+            patch.object(torch, "_foreach_lerp", wraps=torch._foreach_lerp) as foreach_lerp:
+        updates = optimizer._update_muon_momentum(  # pylint: disable=protected-access
+            optimizer.param_groups[0], parameters,
+        )
+
+    actual_dtypes = tuple(updates[parameter].dtype for parameter in parameters)
+    expected_dtypes = (torch.bfloat16, torch.bfloat16)
+    assert actual_dtypes == expected_dtypes, (
+        f"Muon NS input dtype mismatch: expected={expected_dtypes}, actual={actual_dtypes}, "
+        f"parameter_dtypes={dtypes}"
+    )
+    foreach_calls = foreach_add.call_args_list + foreach_lerp.call_args_list
+    actual_foreach_dtypes = [
+        tuple(tensor.dtype for tensor in call.args[0])
+        for call in foreach_calls
+    ]
+    expected_foreach_dtypes = [(dtypes[0],), (dtypes[1],)]
+    assert actual_foreach_dtypes == expected_foreach_dtypes, (
+        f"Muon foreach dtype regions mismatch: expected={expected_foreach_dtypes}, "
+        f"actual={actual_foreach_dtypes}"
+    )
+
+
 def test_muon_default_step_matches_explicit_legacy() -> None:
     """Feature: Backward-compatible Muon momentum defaults.
 

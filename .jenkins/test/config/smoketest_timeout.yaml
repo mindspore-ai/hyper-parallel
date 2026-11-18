@@ -1,5 +1,5 @@
 ascend910b:
-  activation_memory: 3000
+  activation_memory: 3200
   shard: 2400
   distributed_checkpoint: 960
   distributed_data: 3600
@@ -15,7 +15,7 @@ ascend910b:
   init_weights: 950
   llama3_examples: 960
   process_group: 720
-  swap_optimizer: 2400
+  swap_optimizer: 3000
   optimizer: 2400
   multicore: 960
   auto_models: 1200
