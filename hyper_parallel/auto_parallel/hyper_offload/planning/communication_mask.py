@@ -24,6 +24,11 @@ from itertools import accumulate
 from hyper_parallel.auto_parallel.hyper_offload.planning._peak_model import EvictionGap
 
 
+# Warmup includes dispatch and synchronization overhead that replay can avoid.
+# Preserve four transfer durations of H2D lead as a margin for faster replay.
+PREFETCH_LEAD_COPIES = 4.0
+
+
 @dataclass
 class TransferPlacement:
     """D2H post-op, device release post-op, and H2D pre-op positions."""
@@ -145,9 +150,7 @@ def limit_prefetch_advance(
         placements, key=lambda item: (item.gap.end, item.gap.storage_id), reverse=True
     ):
         transfer_ms = placement.gap.size_bytes * 1000 / (bandwidth_gbps * 1024**3)
-        # Warmup dispatch and synchronization can overestimate the time available
-        # in replay. Keep several copy durations of lead without filling all slack.
-        start_ms = min(starts[placement.gap.end], next_start) - 4.0 * transfer_ms
+        start_ms = min(starts[placement.gap.end], next_start) - PREFETCH_LEAD_COPIES * transfer_ms
         target = max(placement.prefetch_before, bisect_right(starts, start_ms) - 1)
         target = min(target, placement.gap.end)
         for slot in range(placement.prefetch_before, target):

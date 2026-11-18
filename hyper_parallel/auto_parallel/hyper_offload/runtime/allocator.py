@@ -73,7 +73,17 @@ class _AllocatorState:
                 if previous is None:
                     return False
                 if not previous:
-                    setter("expandable_segments:True")
+                    try:
+                        setter("expandable_segments:True")
+                    except (RuntimeError, ValueError, TypeError) as error:
+                        # A backend may reject a private setting after applying
+                        # it. Only fall back once its original state is restored.
+                        if reader() != previous:
+                            setter("expandable_segments:False")
+                        logger.warning(
+                            "HyperOffload allocator policy unavailable; keeping original settings: %s", error,
+                        )
+                        return False
                     try:
                         # Model construction can leave fixed-size split segments
                         # that would otherwise compete with the new expandable ones.

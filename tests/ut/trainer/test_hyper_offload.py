@@ -21,6 +21,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from hyper_parallel.auto_parallel.hyper_offload import OffloadConfig, OffloadSession
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.trainer.config.hyper_offload import HyperOffloadConfig
 from hyper_parallel.trainer.config.trainer import TrainerConfig
@@ -139,3 +140,63 @@ class TestHyperOffloadMicrostep(unittest.TestCase):
             trainer.forward_backward_step({"input_ids": torch.tensor(2.0)}, {})
         self.assertFalse(active)
         self.assertIs(context.__exit__.call_args.args[0], RuntimeError)
+
+
+class TestHyperOffloadTrainingLifecycle(unittest.TestCase):
+    """Training completion releases the session without waiting for Trainer GC."""
+
+    def setUp(self) -> None:
+        """Build an empty training loop with a real, inactive offload session."""
+        self.events = []
+        trainer = BaseTrainer.__new__(BaseTrainer)
+        self.trainer = trainer
+        trainer.config = SimpleNamespace(dataloader=SimpleNamespace(use_background_prefetcher=False))
+        trainer.local_rank = 0
+        trainer.state = SimpleNamespace(global_step=0, epoch=0)
+        trainer.train_iters = 0
+        trainer.train_epochs = 0
+        trainer.train_dataloader = Mock()
+        trainer.on_train_begin = Mock()
+        trainer.on_train_end = Mock(side_effect=lambda: self.events.append("train_end"))
+        trainer.destroy_distributed = Mock(side_effect=lambda: self.events.append("destroy"))
+        trainer.hyper_offload_context = OffloadSession(OffloadConfig())
+        trainer.hyper_offload_context.close = Mock(side_effect=lambda: self.events.append("close"))
+        for name, options in (
+            ("memory_profiler", {}),
+            ("HyperIter", {}),
+            ("synchronize", {"side_effect": lambda: self.events.append("synchronize")}),
+        ):
+            patcher = patch(f"hyper_parallel.trainer.base.{name}", **options)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_success_closes_session_before_distributed_teardown(self) -> None:
+        """Keep the policy during training, then release it before process cleanup."""
+        self.trainer.train()
+        self.assertEqual(self.events, ["train_end", "close", "synchronize", "destroy"])
+        self.trainer.hyper_offload_context.close.assert_called_once_with()
+
+    def test_training_failure_closes_session_and_preserves_the_error(self) -> None:
+        """An interrupted run must release its lease even while Trainer remains alive."""
+        error = RuntimeError("training failed")
+        self.trainer.on_train_begin.side_effect = error
+        with self.assertRaises(RuntimeError) as raised:
+            self.trainer.train()
+        self.assertIs(raised.exception, error)
+        self.trainer.hyper_offload_context.close.assert_called_once_with()
+        self.trainer.on_train_end.assert_not_called()
+        self.trainer.destroy_distributed.assert_not_called()
+
+    def test_cleanup_failure_does_not_mask_the_training_error(self) -> None:
+        """Report an allocator restoration failure while preserving the causal error."""
+        self.trainer.on_train_begin.side_effect = ValueError("training failed")
+        self.trainer.hyper_offload_context.close.side_effect = RuntimeError("restore failed")
+        with self.assertLogs("hyper_parallel.trainer.base", level="ERROR"):
+            with self.assertRaisesRegex(ValueError, "training failed"):
+                self.trainer.train()
+
+    def test_cleanup_failure_after_success_is_propagated(self) -> None:
+        """Do not report a successful cleanup when native allocator restoration failed."""
+        self.trainer.hyper_offload_context.close.side_effect = RuntimeError("restore failed")
+        with self.assertRaisesRegex(RuntimeError, "restore failed"):
+            self.trainer.train()
