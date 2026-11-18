@@ -16,10 +16,12 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 from torch import nn
+
+from tests.common.mark_utils import arg_mark
 
 from hyper_parallel.components.functional import sparse_flash_mla as attention_ops
 from hyper_parallel.distributed.context_parallel.compressed_document import document_compression_plan
@@ -65,6 +67,53 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
         self.key = torch.ones(1, 2, 128)
         self.weights = torch.ones(1, 2, 8)
         self.indices = torch.tensor([[[0, -1], [0, 1]]], dtype=torch.int32)
+
+    def test_native_mask_mode_tracks_compressed_bank_presence(self) -> None:
+        """Metadata, forward and backward must disable compressed masking for SWA."""
+        self.addCleanup(attention_ops._attention_metadata.cache_clear)
+        self.addCleanup(attention_ops._tnd_attention_metadata.cache_clear)
+        for layout, has_main in (("BSND", False), ("BSND", True), ("TND", False), ("TND", True)):
+            with self.subTest(layout=layout, has_main=has_main):
+                attention_ops._attention_metadata.cache_clear()
+                attention_ops._tnd_attention_metadata.cache_clear()
+                query_shape = (1, 4, 2, 4) if layout == "BSND" else (4, 2, 4)
+                raw_shape = (1, 4, 1, 4) if layout == "BSND" else (4, 1, 4)
+                main_shape = (1, 2, 1, 4) if layout == "BSND" else (2, 1, 4)
+                index_shape = (1, 4, 1, 2) if layout == "BSND" else (4, 1, 2)
+                query = torch.ones(query_shape, requires_grad=True)
+                raw = torch.ones(raw_shape, requires_grad=True)
+                main = torch.ones(main_shape, requires_grad=True) if has_main else None
+                indices = torch.zeros(index_shape, dtype=torch.int32) if has_main else None
+                sinks = torch.zeros(2, requires_grad=True)
+                native_output = query.detach().clone()
+                native_grads = (torch.ones_like(query), torch.ones_like(raw),
+                                torch.ones_like(main) if has_main else None, torch.ones_like(sinks), None, None)
+                with patch.object(attention_ops, "_load_attention_ops") as loader, \
+                        patch.object(attention_ops, "_load_attention_grad_metadata_op") as grad_loader:
+                    forward, backward, metadata = Mock(), Mock(), Mock()
+                    grad_metadata = grad_loader.return_value = Mock()
+                    forward.return_value = (native_output, torch.zeros(query_shape[:-1]))
+                    backward.return_value = native_grads
+                    metadata.return_value = torch.zeros(1, dtype=torch.int32)
+                    grad_metadata.return_value = torch.ones(1, dtype=torch.int32)
+                    loader.return_value = (forward, backward, metadata)
+                    ratio = 2 if has_main else 1
+                    if layout == "BSND":
+                        result = attention_ops._SparseFlashMla.apply(
+                            query, raw, main, indices, sinks, 0.5, ratio, 0, 128,
+                        )
+                    else:
+                        segments = ((0, 4, 0, 2 if has_main else 0, 0),)
+                        plan = attention_ops.csa_tnd_plan(segments, ratio, has_keys=has_main)
+                        result = attention_ops._SparseFlashMlaTND.apply(
+                            query, raw, main, indices, sinks, 0.5, ratio, 128, plan, ((0, 4),),
+                        )
+                    result.sum().backward()
+                expected = 3 if has_main else 0
+                for call in (metadata.call_args, grad_metadata.call_args, forward.call_args, backward.call_args):
+                    actual = call.kwargs["cmp_mask_mode"]
+                    self.assertEqual(actual, expected, f"expected={expected}, got={actual}")
+                self.assertIs(backward.call_args.kwargs["metadata"], grad_metadata.return_value)
 
     def test_indexer_requires_native_when_explicitly_selected(self):
         """Unsupported CPU inputs cannot silently satisfy native mode."""
@@ -177,6 +226,34 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
         for value in ("false", "true", "auto", None, 0, 1):
             with self.subTest(invalid=value), self.assertRaisesRegex(ValueError, "use_fused_ops must be a bool"):
                 attention.SharedCompressedDSAAttention(_source(), use_fused_ops=value)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="dryrun", essential_mark="essential")
+    def test_bmm_teacher_option_requires_fusion_and_reaches_kl(self):
+        """Validate the FP32-output BMM teacher path.
+
+        Feature: BF16 operands with FP32 score output.
+        Description: Enable BMM through the attention replacement and inspect KL dispatch.
+        Expectation: Valid outputs match the reference; unsupported requests raise.
+        """
+        for value in (True, "true", None, 1):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "use_fp32_output_bmm"):
+                attention.SharedCompressedDSAAttention(_source(), use_fp32_output_bmm=value)
+        module = attention.SharedCompressedDSAAttention(
+            _source(True), use_fused_ops=True, use_fp32_output_bmm=True,
+        )
+        indexer_output = SimpleNamespace(index_query=self.query, index_key=self.key,
+                                         merge_weight=self.weights, topk_indices=self.indices)
+        query = torch.ones(1, 1, 2, 512, requires_grad=True)
+        with patch.object(attention, "shared_compressed_indexer_kl_loss", return_value=query.sum() * 0) as loss:
+            module._apply_indexer_loss(indexer_output, query, self.key, None, ((0, 2, 0, 2, 0),))
+        self.assertTrue(loss.call_args.kwargs["use_fp32_output_bmm"])
+        self.assertTrue(loss.call_args.kwargs["use_fused"])
+        with self.assertRaisesRegex(ValueError, "requires fused KL"):
+            attention.shared_compressed_indexer_kl_loss(
+                self.query, self.key, self.weights, query, self.key, self.indices, module.sinks,
+                attention_scale=1., loss_coeff=1., use_fp32_output_bmm=True,
+            )
 
     def test_candidate_execution_is_rejected_without_reference_fallback(self):
         """A candidate producer or consumer cannot enter its reference branch."""

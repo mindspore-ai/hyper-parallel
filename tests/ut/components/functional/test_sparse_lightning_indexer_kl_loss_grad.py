@@ -22,6 +22,8 @@ from unittest.mock import patch
 import torch
 from torch.utils.checkpoint import DefaultDeviceType
 
+from tests.common.mark_utils import arg_mark
+
 from hyper_parallel.components.functional import lightning_indexer as indexer_ops
 from hyper_parallel.components.functional import sparse_flash_mla as attention_ops
 from hyper_parallel.components.functional import sparse_lightning_indexer_kl_loss_grad as kl_ops
@@ -63,8 +65,165 @@ def _scalar_reference(query, key, weights, attention_query, main_key, indices, s
                        - logits.log_softmax(-1))).sum() * (.7 / (query.shape[0]*query.shape[1]))
 
 
+class TestFP32OutputTeacherScores(unittest.TestCase):
+    """Keep prefix, selected-key and underflow semantics with low-precision operands."""
+
+    @staticmethod
+    def _cpu_bmm(left, right):
+        if left.dtype != torch.bfloat16 or right.dtype != torch.bfloat16:
+            raise AssertionError("Native score operands lost their BF16 representation")
+        return torch.bmm(left.float(), right.float())
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="dryrun", essential_mark="essential")
+    def test_prefix_and_selected_targets_match_reference(self):
+        """Validate the FP32-output BMM teacher path.
+
+        Feature: BF16 operands with FP32 score output.
+        Description: Compare BF16 BMM prefix and selected-key teachers with the FP32 reference.
+        Expectation: Valid outputs match the reference; unsupported requests raise.
+        """
+        for length in (11, 12):
+            torch.manual_seed(927)
+            query = torch.randn(2, 3, length, 8, dtype=torch.bfloat16)
+            key = torch.randn(2, length // 2, 8, dtype=torch.bfloat16)
+            sinks = torch.randn(3)
+            counts = (torch.arange(length) + 1) // 2
+            selected = counts[:, None] - torch.arange(4, 0, -1)[None, :]
+            selected = selected.masked_fill(selected < 0, -1).unsqueeze(0).expand(2, -1, -1)
+            expected = causal_attention_teacher(query, key, selected, sinks, .5, 2, length % 2, 3)
+            with patch.object(kl_ops, "_fp32_output_bmm", self._cpu_bmm):
+                actual = causal_attention_teacher(
+                    query, key, selected, sinks, .5, 2, length % 2, 3, use_fp32_output_bmm=True,
+                )
+            torch.testing.assert_close(actual, expected, rtol=2e-6, atol=1e-7)
+            self.assertEqual(actual.dtype, torch.float32)
+            self.assertFalse(actual.requires_grad)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="dryrun", essential_mark="essential")
+    def test_scores_do_not_round_to_bf16(self):
+        """Validate the FP32-output BMM teacher path.
+
+        Feature: BF16 operands with FP32 score output.
+        Description: Use a score that would lose precision if rounded to BF16.
+        Expectation: Valid outputs match the reference; unsupported requests raise.
+        """
+        query = torch.tensor([[[[1., 1.]]]], dtype=torch.bfloat16)
+        selected = torch.tensor([[[[1., .00390625]]]], dtype=torch.bfloat16)
+        with patch.object(kl_ops, "_fp32_output_bmm", self._cpu_bmm):
+            score = kl_ops._selected_fp32_scores(query, selected)
+        torch.testing.assert_close(score, torch.tensor([[[[1.00390625]]]]), atol=0, rtol=0)
+        self.assertEqual(score.bfloat16().item(), 1.)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="dryrun", essential_mark="essential")
+    def test_underflow_recovery_and_padding_match_reference(self):
+        """Validate the FP32-output BMM teacher path.
+
+        Feature: BF16 operands with FP32 score output.
+        Description: Recover zero student probabilities while retaining invalid-slot masking.
+        Expectation: Valid outputs match the reference; unsupported requests raise.
+        """
+        torch.manual_seed(389)
+        query = torch.randn(1, 4, 2, 8, dtype=torch.bfloat16)
+        key = torch.randn(1, 3, 8, dtype=torch.bfloat16)
+        weights = torch.rand(1, 4, 2)
+        indices = torch.tensor([[[-1, -1], [0, -1], [1, 0], [2, 1]]], dtype=torch.int32)
+        prediction = torch.zeros(1, 4, 2)
+        expected = _stable_prediction_log(prediction, query, key, weights, indices, 2)
+        with patch.object(kl_ops, "_fp32_output_bmm", self._cpu_bmm):
+            actual = _stable_prediction_log(prediction, query, key, weights, indices, 2, True)
+        torch.testing.assert_close(actual, expected, rtol=2e-6, atol=1e-6)
+        torch.testing.assert_close(actual[indices < 0], torch.zeros_like(actual[indices < 0]), atol=0, rtol=0)
+
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="dryrun", essential_mark="essential")
+    def test_fused_bmm_loss_and_gradients_match_scalar_reference(self):
+        """Validate the FP32-output BMM teacher path.
+
+        Feature: BF16 operands with FP32 score output.
+        Description: Compare fused loss and seeded gradients with an independent scalar oracle.
+        Expectation: Valid outputs match the reference; unsupported requests raise.
+        """
+        torch.manual_seed(218)
+        values = [torch.randn(1, 3, 2, 4), torch.randn(1, 3, 4), torch.rand(1, 3, 2)]
+        actual_inputs = [value.to(torch.bfloat16).requires_grad_() for value in values]
+        oracle_inputs = [value.detach().float().requires_grad_() for value in actual_inputs]
+        aq = torch.randn(1, 3, 3, 4, dtype=torch.bfloat16, requires_grad=True)
+        ak = torch.randn(1, 3, 4, dtype=torch.bfloat16, requires_grad=True)
+        sinks = torch.randn(3, requires_grad=True)
+        indices = torch.tensor([[[0, -1, -1], [0, 1, -1], [0, 1, 2]]])
+        expected = _scalar_reference(*oracle_inputs, aq.float(), ak.float(), indices, sinks)
+
+        def _native(query, key, weights, selected, target, **_kwargs):
+            """Use independent autograd for the unavailable native student kernel."""
+            with torch.enable_grad():
+                q, k, w = [value.detach().float().requires_grad_() for value in (query, key, weights)]
+                ids = selected.squeeze(2).long()
+                batch = torch.arange(q.shape[0]).view(-1, 1, 1)
+                chosen = k.squeeze(2)[batch, ids.clamp_min(0)]
+                scores = torch.einsum("bqhd,bqkd->bqhk", q, chosen).relu()
+                logits = (scores * w.unsqueeze(-1)).sum(2).masked_fill(ids < 0, -1e9)
+                logp = logits.log_softmax(-1)
+                target = target.squeeze(2).detach()
+                loss = (target * (target.clamp_min(torch.finfo(torch.float32).tiny).log() - logp)).sum()
+                grads = torch.autograd.grad(loss, (q, k, w))
+                return (*grads, logp.detach().exp().unsqueeze(2))
+
+        with patch.object(kl_ops, "_fp32_output_bmm", self._cpu_bmm), \
+                patch.object(kl_ops, "_load_kl_ops", return_value=(_native, None)), \
+                patch.object(kl_ops, "_kl_metadata", return_value=({}, None)):
+            actual = _SparseLightningIndexerKLLoss.apply(
+                *actual_inputs, aq, ak, indices, sinks, .5, .7, 2, 1, 0, True,
+            )
+            actual.backward(torch.tensor(.37))
+        expected.backward(torch.tensor(.37))
+        torch.testing.assert_close(actual, expected, rtol=2e-6, atol=1e-7)
+        for value, oracle in zip(actual_inputs, oracle_inputs):
+            torch.testing.assert_close(value.grad, oracle.grad.to(value.dtype), rtol=0, atol=0)
+        self.assertIsNone(aq.grad)
+        self.assertIsNone(ak.grad)
+        self.assertIsNone(sinks.grad)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="dryrun", essential_mark="essential")
+    def test_native_bmm_rejects_cpu_operands(self):
+        """Validate the FP32-output BMM teacher path.
+
+        Feature: BF16 operands with FP32 score output.
+        Description: Request native BMM with CPU BF16 operands.
+        Expectation: Valid outputs match the reference; unsupported requests raise.
+        """
+        value = torch.ones(1, 2, 2, dtype=torch.bfloat16)
+        with self.assertRaisesRegex(ValueError, "BF16 NPU operands"):
+            kl_ops._fp32_output_bmm(value, value)
+
+
 class TestSparseLightningIndexerKL(unittest.TestCase):
     """Cover padding, repeated keys, head weights, autocast and teacher underflow."""
+
+    def test_bsnd_indexer_residual_is_present_only_for_compression(self):
+        """Native LI and its metadata require no residual when the ratio is one."""
+        self.addCleanup(_bsnd_indexer_metadata.cache_clear)
+        for ratio in (1, 2):
+            with self.subTest(ratio=ratio):
+                _bsnd_indexer_metadata.cache_clear()
+                query = torch.ones(1, 4, 8, 128)
+                key = torch.ones(1, 4 // ratio, 128)
+                weights = torch.ones(1, 4, 8)
+                with patch.object(indexer_ops, "_uses_indexer_metadata", return_value=True), \
+                        patch.object(indexer_ops, "_load_indexer_metadata_op") as metadata_loader, \
+                        patch.object(indexer_ops, "_load_indexer_op") as loader:
+                    loader.return_value.return_value = (torch.zeros(1, 4, 1, 2, dtype=torch.int32), None)
+                    lightning_indexer(query, key, weights, ratio, 2, ((0, 4, 0, 4 // ratio, 0),))
+                for call in (metadata_loader.return_value.call_args, loader.return_value.call_args):
+                    residual = call.kwargs["cmp_residual_k"]
+                    if ratio == 1:
+                        self.assertIsNone(residual)
+                    else:
+                        torch.testing.assert_close(residual, torch.zeros(1, dtype=torch.int32))
 
     def test_attention_cache_supports_inference_then_training(self):
         """A validation forward must not poison residuals saved by later training."""
@@ -85,7 +244,8 @@ class TestSparseLightningIndexerKL(unittest.TestCase):
         operators = (_forward, _backward, _metadata)
         _attention_metadata.cache_clear()
         self.addCleanup(_attention_metadata.cache_clear)
-        with patch.object(attention_ops, "_load_attention_ops", return_value=operators):
+        with patch.object(attention_ops, "_load_attention_ops", return_value=operators), \
+                patch.object(attention_ops, "_load_attention_grad_metadata_op", return_value=None):
             for ratio in (1, 2):
                 query = torch.ones(1, 2, 1, 3, requires_grad=True)
                 raw = torch.ones_like(query)

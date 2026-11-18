@@ -1223,6 +1223,7 @@ def shared_compressed_indexer_kl_loss(
         compress_ratio: int = 1,
         query_segments: tuple[tuple[int, int, int, int, int], ...] | None = None,
         use_fused: bool = False,
+        use_fp32_output_bmm: bool = False,
 ) -> torch.Tensor:
     """Compute the sparse-stage DSA KL objective on V4.1 compressed keys.
 
@@ -1235,9 +1236,33 @@ def shared_compressed_indexer_kl_loss(
     prefix; its ratio and residual encode the CP query offset for the kernel.
     ``use_fused=True`` raises for unsupported calls when ``loss_coeff != 0``;
     False explicitly selects the numerical reference. Native errors propagate.
+    ``use_fp32_output_bmm=True`` requires fusion and uses BF16 NPU operands
+    with FP32 score output for teacher and student-underflow recovery.
+
+    Args:
+        index_query: Student queries.
+        index_key: Student key bank.
+        merge_weight: Per-query student head weights.
+        attention_query: Main-attention queries for the detached teacher.
+        compressed_key: Compressed main-attention key bank.
+        topk_indices: Selected compressed key IDs, with invalid slots set to -1.
+        sinks: Main-attention sink logits per head.
+        attention_scale: Main-attention score scale.
+        loss_coeff: KL coefficient applied to loss and gradients.
+        query_chunk_size: Maximum queries per teacher chunk.
+        tp_context: Optional tensor-parallel reduction context.
+        compress_ratio: Key compression ratio.
+        query_segments: Document-local query and key ranges with residuals.
+        use_fused: Select the native student KL gradient operator.
+        use_fp32_output_bmm: Use BF16 NPU operands with FP32 score output.
+
+    Returns:
+        Scalar KL loss normalized by the local query count.
     """
     if query_chunk_size <= 0:
         raise ValueError(f"query_chunk_size must be positive, got {query_chunk_size}")
+    if not isinstance(use_fp32_output_bmm, bool) or (use_fp32_output_bmm and not use_fused):
+        raise ValueError("use_fp32_output_bmm must be boolean and requires fused KL")
     if not loss_coeff:
         return index_query.sum(dtype=torch.float32) * 0.0
     if index_key.shape[1] == 0:
@@ -1255,7 +1280,7 @@ def shared_compressed_indexer_kl_loss(
         return sparse_lightning_indexer_kl_loss(
             index_query, index_key, merge_weight, attention_query.detach(), compressed_key.detach(),
             topk_indices, sinks.detach(), attention_scale, loss_coeff, query_chunk_size,
-            compress_ratio, query_segments,
+            compress_ratio, query_segments, use_fp32_output_bmm=use_fp32_output_bmm,
         )
     return _SharedCompressedIndexerKLLoss.apply(
         index_query,
@@ -1725,6 +1750,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
         self.sliding_window = module.sliding_window
         self.scaling = module.scaling
         self.use_fused_ops = use_fused_ops
+        self.use_fp32_output_bmm = False
         if self.is_index_source:
             self.indexer.use_fused = use_fused_ops
         self.train(module.training)
@@ -2126,6 +2152,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
                 compress_ratio=self.compress_ratio,
                 query_segments=query_segments,
                 use_fused=self.use_fused_ops,
+                use_fp32_output_bmm=self.use_fp32_output_bmm,
             )
             query = aux_loss_auto_scale(query, indexer_loss)
         return query
@@ -2305,6 +2332,7 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
         context: Mapping[str, Any] | None = None,
         *,
         use_fused_ops: bool = False,
+        use_fp32_output_bmm: bool = False,
         indexer_load_balance: str = "none",
         main_kv_comm: str = "all_gather",
         indexer_balance_block_size: int | None = None,
@@ -2321,6 +2349,8 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
                 raising on unsupported calls without automatic fallback.
                 False selects eager PyTorch attention, Indexer and KL on every
                 device, without loading optional operator extensions.
+            use_fp32_output_bmm: Keep detached teacher and student-recovery operands in BF16
+                and request FP32 BMM output. Requires use_fused_ops=True and BF16 NPU inputs.
             indexer_load_balance: 'none', 'zigzag', 'greedy' or 'hybrid' query-task allocation.
                 Selection exchanges low-rank qr, merge weights and rotary embeddings;
                 attention and KL retain the original owner and autograd graph.
@@ -2349,6 +2379,8 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
         """
         if not isinstance(use_fused_ops, bool):
             raise ValueError(f"use_fused_ops must be a bool, got {use_fused_ops!r}")
+        if not isinstance(use_fp32_output_bmm, bool) or (use_fp32_output_bmm and not use_fused_ops):
+            raise ValueError("use_fp32_output_bmm must be boolean and requires use_fused_ops=True")
         if main_kv_comm not in ("all_gather", "all_to_all_v"):
             raise ValueError("main_kv_comm must be 'all_gather' or 'all_to_all_v'")
         indexer_balance_block_size = resolve_indexer_balance_block_size(
@@ -2363,6 +2395,7 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
             replace_indexer=True,
             use_fused_ops=use_fused_ops,
         )
+        self.use_fp32_output_bmm = use_fp32_output_bmm
         self.indexer_load_balance = indexer_load_balance
         self.indexer_balance_block_size = indexer_balance_block_size
         self.indexer_zigzag_min_length = indexer_zigzag_min_length

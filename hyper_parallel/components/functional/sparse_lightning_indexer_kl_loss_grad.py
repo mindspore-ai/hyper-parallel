@@ -129,9 +129,28 @@ def gather_selected_keys_fp32(bank: torch.Tensor, indices: torch.Tensor) -> torc
     return gather_selected_keys(_teacher_bank(bank, indices.numel()), indices).float()
 
 
+def _fp32_output_bmm(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    """Multiply detached BF16 operands without rounding the score matrix to BF16."""
+    if left.device.type != "npu" or left.dtype != torch.bfloat16 or right.dtype != torch.bfloat16:
+        raise ValueError("FP32-output score BMM requires BF16 NPU operands")
+    return torch.bmm(left, right, out_dtype=torch.float32)
+
+
+def _selected_fp32_scores(query: torch.Tensor, selected: torch.Tensor) -> torch.Tensor:
+    """Contract [B,Q,H,D] and [B,Q,K,D] with FP32 output and accumulation."""
+    batch, length, heads, dim = query.shape
+    width = selected.shape[-2]
+    scores = _fp32_output_bmm(
+        query.reshape(batch * length, heads, dim),
+        selected.reshape(batch * length, width, dim).transpose(1, 2),
+    )
+    return scores.reshape(batch, length, heads, width)
+
+
 def compressed_attention_teacher(
         query: torch.Tensor, key: torch.Tensor, indices: torch.Tensor, sinks: torch.Tensor,
         scale: float, reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        *, use_fp32_output_bmm: bool = False,
 ) -> torch.Tensor:
     """Compute the detached teacher for one Q chunk, using all heads and selected keys.
 
@@ -142,16 +161,20 @@ def compressed_attention_teacher(
         sinks: Scalar attention sink per head.
         scale: Main attention logit scale.
         reduce_sum: Optional TP SUM of head contributions, before normalization.
+        use_fp32_output_bmm: Retain BF16 operands and request native FP32 score output.
     """
     with torch.no_grad(), torch.autocast(device_type=query.device.type, enabled=False):
         width = indices.shape[-1]
         if width == 0:
             return query.new_zeros(indices.shape, dtype=torch.float32)
         valid = indices >= 0
-        selected = gather_selected_keys_fp32(key, indices.clamp_min(0).long())
-        queries = query.float()
-        scores = torch.einsum("bhqd,bqkd->bhqk", queries, selected) * scale
-        del selected, queries
+        if use_fp32_output_bmm:
+            selected = gather_selected_keys(key, indices.clamp_min(0).long())
+            scores = _selected_fp32_scores(query.transpose(1, 2), selected).transpose(1, 2) * scale
+        else:
+            selected = gather_selected_keys_fp32(key, indices.clamp_min(0).long())
+            scores = torch.einsum("bhqd,bqkd->bhqk", query.float(), selected) * scale
+        del selected
         scores.masked_fill_(~valid.unsqueeze(1), -1.0e9)
         sink_logits = sinks.float().view(1, -1, 1, 1).expand(*scores.shape[:-1], 1)
         probabilities = torch.cat((scores, sink_logits), dim=-1).softmax(dim=-1)
@@ -164,6 +187,7 @@ def compressed_attention_teacher(
 def causal_attention_teacher(
         query: torch.Tensor, key: torch.Tensor, indices: torch.Tensor, sinks: torch.Tensor,
         scale: float, ratio: int, residual: int, chunk_size: int,
+        *, use_fp32_output_bmm: bool = False,
 ) -> torch.Tensor:
     """Preserve the selected-main-plus-sink target without expanding prefix keys.
 
@@ -176,6 +200,7 @@ def causal_attention_teacher(
         ratio: Compression ratio.
         residual: Incomplete raw-token group at the end of the K prefix.
         chunk_size: Maximum queries per teacher chunk, shared with the eager KL path.
+        use_fp32_output_bmm: Select native BF16-product/FP32-output score multiplication.
     """
     with torch.no_grad(), torch.autocast(device_type=query.device.type, enabled=False):
         batch, heads, length, _ = query.shape
@@ -185,12 +210,18 @@ def causal_attention_teacher(
         target = query.new_zeros(indices.shape, dtype=torch.float32)
         max_keys = min(key.shape[1], (offset + partial) // ratio) if partial else 0
         if max_keys:
-            prefix = key[:, :max_keys].float()
+            prefix = key[:, :max_keys] if use_fp32_output_bmm else key[:, :max_keys].float()
             counts = (torch.arange(partial, device=query.device) + offset + 1) // ratio
             valid = torch.arange(max_keys, device=query.device)[None, :] < counts[:, None]
             for start in range(0, partial, chunk_size):
                 end = min(start + chunk_size, partial)
-                scores = torch.einsum("bhqd,bkd->bhqk", query[:, :, start:end].float(), prefix) * scale
+                if use_fp32_output_bmm:
+                    chunk = query[:, :, start:end]
+                    scores = _fp32_output_bmm(
+                        chunk.reshape(batch, heads * (end - start), chunk.shape[-1]), prefix.transpose(1, 2),
+                    ).reshape(batch, heads, end - start, max_keys) * scale
+                else:
+                    scores = torch.einsum("bhqd,bkd->bhqk", query[:, :, start:end].float(), prefix) * scale
                 mask = valid[None, None, start:end]
                 scores.masked_fill_(~mask, -1.0e9)
                 sink = sinks.float().view(1, -1, 1, 1).expand(batch, heads, end-start, 1)
@@ -204,11 +235,12 @@ def causal_attention_teacher(
         # Larger banks remain in their input dtype and are converted only
         # after selected-key gathering; never retain activation caches across
         # layers or training steps.
-        bank = _teacher_bank(key, batch * (length-partial) * width)
+        bank = key if use_fp32_output_bmm else _teacher_bank(key, batch * (length-partial) * width)
         for start in range(partial, length, chunk_size):
             end = min(start + chunk_size, length)
             target[:, start:end] = compressed_attention_teacher(
                 query[:, :, start:end], bank, indices[:, start:end], sinks, scale,
+                use_fp32_output_bmm=use_fp32_output_bmm,
             )
         return target
 
@@ -216,6 +248,7 @@ def causal_attention_teacher(
 def _stable_prediction_log(
         prediction: torch.Tensor, query: torch.Tensor, key: torch.Tensor, weights: torch.Tensor,
         indices: torch.Tensor, chunk_size: int,
+        use_fp32_output_bmm: bool = False,
 ) -> torch.Tensor:
     """Recover valid underflowed probabilities without treating padding as underflow."""
     valid = indices >= 0
@@ -230,11 +263,14 @@ def _stable_prediction_log(
         for start in range(0, rows.numel(), chunk_size):
             chosen = rows[start:start+chunk_size]
             selected = indices[batch:batch+1].index_select(1, chosen).long()
-            keys = gather_selected_keys_fp32(key[batch:batch+1], selected.clamp_min(0))
-            queries = query[batch:batch+1].index_select(1, chosen).float()
+            bank = key[batch:batch+1]
+            keys = (gather_selected_keys(bank, selected.clamp_min(0)) if use_fp32_output_bmm
+                    else gather_selected_keys_fp32(bank, selected.clamp_min(0)))
+            queries = query[batch:batch+1].index_select(1, chosen)
             merge = weights[batch:batch+1].index_select(1, chosen).float()
             # SAC may cache the contraction output for backward replay.
-            logits = torch.einsum("bqhd,bqkd->bqhk", queries, keys).relu()
+            logits = (_selected_fp32_scores(queries, keys) if use_fp32_output_bmm
+                      else torch.einsum("bqhd,bqkd->bqhk", queries.float(), keys)).relu()
             logits = (logits * merge.unsqueeze(-1)).sum(dim=2).masked_fill(selected < 0, -1.0e9)
             log_prediction[batch, chosen] = logits.log_softmax(-1).masked_fill(selected < 0, 0)[0]
     return log_prediction
@@ -248,6 +284,7 @@ class _SparseLightningIndexerKLLoss(torch.autograd.Function):
             ctx: Any, query: torch.Tensor, key: torch.Tensor, weights: torch.Tensor,
             attention_query: torch.Tensor, main_key: torch.Tensor, indices: torch.Tensor, sinks: torch.Tensor,
             scale: float, coefficient: float, chunk_size: int, ratio: int, residual: int,
+            use_fp32_output_bmm: bool = False,
     ) -> torch.Tensor:
         """Save native gradients while retaining Hyper's detached teacher and loss.
 
@@ -265,6 +302,7 @@ class _SparseLightningIndexerKLLoss(torch.autograd.Function):
             chunk_size: Maximum query count for sparse teacher temporaries.
             ratio: Key compression ratio.
             residual: Raw prefix length modulo the compression ratio.
+            use_fp32_output_bmm: Retain BF16 operands and request FP32 score output.
 
         Returns:
             Scalar KL normalized by this document segment's batch and query count.
@@ -274,6 +312,7 @@ class _SparseLightningIndexerKLLoss(torch.autograd.Function):
         with torch.no_grad(), torch.autocast(device_type=query.device.type, enabled=False):
             target = causal_attention_teacher(
                 attention_query, main_key, indices, sinks, scale, ratio, residual, chunk_size,
+                use_fp32_output_bmm=use_fp32_output_bmm,
             )
             options, metadata = _kl_metadata(
                 query.device, batch, length, heads, dim, key.shape[1], indices.shape[-1], ratio, residual,
@@ -284,7 +323,9 @@ class _SparseLightningIndexerKLLoss(torch.autograd.Function):
                 query.contiguous(), native_key, weights.float().contiguous(),
                 indices.unsqueeze(2).int().contiguous(), target.unsqueeze(2), metadata=metadata, **options,
             )
-            log_prediction = _stable_prediction_log(prediction[:, :, 0], query, key, weights, indices, chunk_size)
+            log_prediction = _stable_prediction_log(
+                prediction[:, :, 0], query, key, weights, indices, chunk_size, use_fp32_output_bmm,
+            )
             loss = (target * (target.clamp_min(torch.finfo(torch.float32).tiny).log() - log_prediction)).sum()
             ctx.save_for_backward(dq, dk.squeeze(2), dw)
             ctx.factor = coefficient / (batch * length)
@@ -302,7 +343,7 @@ class _SparseLightningIndexerKLLoss(torch.autograd.Function):
             Student Q/K/weight gradients and None for teacher and sequence metadata.
         """
         gradients = tuple(value.float() * (seed * ctx.factor) for value in ctx.saved_tensors)
-        return (*gradients, *((None,) * 9))
+        return (*gradients, *((None,) * (len(ctx.needs_input_grad) - 3)))
 
 
 def _bsnd_sparse_lightning_indexer_kl_loss(
@@ -310,6 +351,7 @@ def _bsnd_sparse_lightning_indexer_kl_loss(
         attention_query: torch.Tensor, main_key: torch.Tensor, indices: torch.Tensor, sinks: torch.Tensor,
         scale: float, coefficient: float, chunk_size: int, ratio: int,
         segment: tuple[int, int, int, int, int],
+        use_fp32_output_bmm: bool = False,
 ) -> torch.Tensor:
     """Fuse one document segment per batch item with the original KL denominator.
 
@@ -328,6 +370,7 @@ def _bsnd_sparse_lightning_indexer_kl_loss(
         coefficient: KL coefficient applied once to loss and gradient.
         chunk_size: Maximum sparse teacher queries in a Python chunk.
         ratio: Compression ratio.
+        use_fp32_output_bmm: Retain BF16 operands and request FP32 score output.
         segment: Local Q start/end, document K start/prefix end and residual,
             shared by all physical batch items.
     """
@@ -343,7 +386,7 @@ def _bsnd_sparse_lightning_indexer_kl_loss(
     loss = _SparseLightningIndexerKLLoss.apply(
         query[:, start:end], key[:, key_start:key_end], weights[:, start:end],
         attention_query[:, :, start:end], main_key[:, key_start:key_end], selected, sinks,
-        scale, coefficient, chunk_size, ratio, residual,
+        scale, coefficient, chunk_size, ratio, residual, use_fp32_output_bmm,
     )
     return total + loss * ((end-start) / query.shape[1])
 
@@ -368,8 +411,22 @@ class _SparseLightningIndexerKLLossTND(torch.autograd.Function):
     def forward(
             ctx: Any, query: torch.Tensor, key: torch.Tensor, weights: torch.Tensor,
             indices: torch.Tensor, target: torch.Tensor, ratio: int, plan: CSATNDPlan, chunk_size: int,
+            use_fp32_output_bmm: bool = False,
     ) -> torch.Tensor:
-        """Calculate native student gradients and the original scalar KL objective."""
+        """Calculate native student gradients and the original scalar KL objective.
+
+        Args:
+            ctx: Autograd context holding precomputed gradients.
+            query: Packed student queries.
+            key: Packed student key bank.
+            weights: Packed student head weights.
+            indices: Document-local TopK selections.
+            target: Detached packed teacher probabilities.
+            ratio: Key compression ratio.
+            plan: Packed document geometry.
+            chunk_size: Maximum queries per underflow-recovery chunk.
+            use_fp32_output_bmm: Use BF16 operands and FP32 scores during recovery.
+        """
         options, metadata = _tnd_kl_metadata(plan, query.device, query.shape[1], query.shape[2], ratio)
         kernel, _ = _load_kl_ops()
         with torch.autocast(device_type=query.device.type, enabled=False):
@@ -383,7 +440,7 @@ class _SparseLightningIndexerKLLossTND(torch.autograd.Function):
                 logs.append(_stable_prediction_log(
                     prediction[q_slice, 0].unsqueeze(0), query[q_slice].unsqueeze(0),
                     key[k_start:k_start+k_length].unsqueeze(0), weights[q_slice].unsqueeze(0),
-                    indices[q_slice, 0].unsqueeze(0), chunk_size,
+                    indices[q_slice, 0].unsqueeze(0), chunk_size, use_fp32_output_bmm,
                 )[0])
                 q_start += q_length
                 k_start += k_length
@@ -394,14 +451,21 @@ class _SparseLightningIndexerKLLossTND(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, seed: torch.Tensor) -> tuple:
-        """Apply the upstream scalar seed to all three precomputed student gradients."""
-        return (*(value.float() * seed for value in ctx.saved_tensors), None, None, None, None, None)
+        """Apply the upstream scalar seed to all three precomputed student gradients.
+
+        Args:
+            ctx: Autograd context holding precomputed gradients.
+            seed: Upstream gradient of the scalar KL output.
+        """
+        return (*(value.float() * seed for value in ctx.saved_tensors),
+                *((None,) * (len(ctx.needs_input_grad) - 3)))
 
 
 def sparse_lightning_indexer_kl_loss(
         query: torch.Tensor, key: torch.Tensor, weights: torch.Tensor, attention_query: torch.Tensor,
         main_key: torch.Tensor, indices: torch.Tensor, sinks: torch.Tensor, scale: float,
         coefficient: float, chunk_size: int, ratio: int, segments: tuple,
+        *, use_fp32_output_bmm: bool = False,
 ) -> torch.Tensor:
     """Batch packed student KL without changing the detached teacher or normalization.
 
@@ -418,15 +482,18 @@ def sparse_lightning_indexer_kl_loss(
         chunk_size: Maximum queries per external teacher/recovery chunk.
         ratio: Compression ratio.
         segments: Local Q start/end, document K start/prefix end and residual.
+        use_fp32_output_bmm: Use native BF16 operands with FP32 score output for teacher/recovery.
 
     Returns:
         Scalar KL normalized by all local queries, including empty-prefix rows.
         The external teacher retains its per-document bounded computation.
     """
+    if not isinstance(use_fp32_output_bmm, bool):
+        raise ValueError("use_fp32_output_bmm must be a bool")
     if len(segments) == 1:
         return _bsnd_sparse_lightning_indexer_kl_loss(
             query, key, weights, attention_query, main_key, indices, sinks,
-            scale, coefficient, chunk_size, ratio, segments[0],
+            scale, coefficient, chunk_size, ratio, segments[0], use_fp32_output_bmm,
         )
     if query.shape[0] != 1:
         raise ValueError("Packed Lightning Indexer KL requires batch size one")
@@ -442,10 +509,11 @@ def sparse_lightning_indexer_kl_loss(
             targets.append(causal_attention_teacher(
                 attention_query[:, :, start:end], main_key[:, key_start:key_end],
                 selected[cursor:cursor+end-start, 0].unsqueeze(0), sinks, scale, ratio, residual, chunk_size,
+                use_fp32_output_bmm=use_fp32_output_bmm,
             )[0])
             cursor += end-start
     loss = _SparseLightningIndexerKLLossTND.apply(
         plan.query(query), plan.key(key), plan.query(weights), selected,
-        torch.cat(targets).contiguous(), ratio, plan, chunk_size,
+        torch.cat(targets).contiguous(), ratio, plan, chunk_size, use_fp32_output_bmm,
     )
     return total + loss * (coefficient / query.shape[1])

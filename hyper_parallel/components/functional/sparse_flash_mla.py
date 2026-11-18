@@ -142,6 +142,14 @@ def _load_attention_ops() -> tuple[Callable[..., Any], Callable[..., Any], Calla
     return sparse_flash_mla_op, sparse_flash_mla_grad, sparse_flash_mla_metadata
 
 
+@lru_cache(maxsize=1)
+def _load_attention_grad_metadata_op() -> Callable[..., Any] | None:
+    """Resolve scheduling metadata exposed by newer native gradient bindings."""
+    # The optional extension is needed only for explicitly selected native calls.
+    import cann_ops_transformer  # pylint: disable=import-outside-toplevel
+    return getattr(cann_ops_transformer, "sparse_flash_mla_grad_metadata", None)
+
+
 def supports_fused_attention_inputs(query: torch.Tensor, ratio: int, window: int, topk: int = 512) -> bool:
     """Check the validated attention input contract without importing operators.
 
@@ -167,6 +175,7 @@ def supports_fused_attention_inputs(query: torch.Tensor, ratio: int, window: int
 def _attention_metadata(
         device: torch.device, batch: int, length: int, heads: int, dim: int,
         raw_length: int, main_length: int, topk: int, ratio: int, residual: int, window: int,
+        backward: bool = False,
 ) -> tuple:
     """Reuse shape metadata across evaluation and gradient-tracked training.
 
@@ -177,11 +186,14 @@ def _attention_metadata(
     # The training backward requires a zero residual tensor even at ratio one;
     # the forward interface instead omits that optional input at ratio one.
     residue = torch.full((batch,), residual, dtype=torch.int32, device=device) if main_length else None
-    _, _, metadata_op = _load_attention_ops()
+    metadata_op = _load_attention_grad_metadata_op() if backward else _load_attention_ops()[2]
+    if metadata_op is None:
+        return residue, None
     metadata = metadata_op(
         heads, 1, dim, cmp_residual_kv=residue if ratio > 1 else None, batch_size=batch, max_seqlen_q=length,
         max_seqlen_ori_kv=raw_length, max_seqlen_cmp_kv=main_length, ori_topk=0, cmp_topk=topk,
-        cmp_ratio=ratio, ori_mask_mode=4, cmp_mask_mode=3, ori_win_left=window-1, ori_win_right=0,
+        cmp_ratio=ratio, ori_mask_mode=4, cmp_mask_mode=3 if main_length else 0,
+        ori_win_left=window-1, ori_win_right=0,
         layout_q="BSND", layout_kv="BSND", has_ori_kv=True, has_cmp_kv=bool(main_length),
     )
     return residue, metadata
@@ -202,7 +214,8 @@ class _SparseFlashMla(torch.autograd.Function):
             query.device, batch, length, heads, dim, raw.shape[1], 0 if main is None else main.shape[1],
             0 if indices is None else indices.shape[-1], ratio, residual, window,
         )
-        options = {"softmax_scale": scale, "cmp_ratio": ratio, "ori_mask_mode": 4, "cmp_mask_mode": 3,
+        options = {"softmax_scale": scale, "cmp_ratio": ratio, "ori_mask_mode": 4,
+                   "cmp_mask_mode": 3 if main is not None else 0,
                    "ori_win_left": window-1, "ori_win_right": 0, "layout_q": "BSND", "layout_kv": "BSND"}
         attention, _, _ = _load_attention_ops()
         output, lse = attention(
@@ -211,6 +224,7 @@ class _SparseFlashMla(torch.autograd.Function):
         )
         ctx.save_for_backward(query, raw, main, indices, sinks, residue, output, lse)
         ctx.options = options
+        ctx.residual = residual
         return output
 
     @staticmethod
@@ -218,9 +232,18 @@ class _SparseFlashMla(torch.autograd.Function):
         """Return main-branch gradients without substituting the KL teacher."""
         query, raw, main, indices, sinks, residue, output, lse = ctx.saved_tensors
         _, attention_grad, _ = _load_attention_ops()
+        options = dict(ctx.options)
+        _, metadata = _attention_metadata(
+            query.device, query.shape[0], query.shape[1], query.shape[2], query.shape[3],
+            raw.shape[1], 0 if main is None else main.shape[1],
+            0 if indices is None else indices.shape[-1], options["cmp_ratio"],
+            ctx.residual, options["ori_win_left"] + 1, backward=True,
+        )
+        if metadata is not None:
+            options["metadata"] = metadata
         grad_query, grad_raw, grad_main, grad_sinks, _, _ = attention_grad(
             query, grad_output.contiguous(), output, lse, ori_kv=raw, cmp_kv=main,
-            cmp_sparse_indices=indices, sinks=sinks, cmp_residual_kv=residue, **ctx.options,
+            cmp_sparse_indices=indices, sinks=sinks, cmp_residual_kv=residue, **options,
         )
         return grad_query, grad_raw, grad_main if main is not None else None, None, grad_sinks, None, None, None, None
 
@@ -280,15 +303,15 @@ def _bsnd_sparse_flash_mla(
 
 @lru_cache(maxsize=128)
 @torch.inference_mode(False)
-def _tnd_attention_metadata(plan, device, heads, dim, raw_ranges, ratio, window, has_keys, topk):
+def _tnd_attention_metadata(plan, device, heads, dim, raw_ranges, ratio, window, has_keys, topk, backward=False):
     """Describe independent raw and compressed coordinate systems to SMLA."""
     cu_q, cu_k, residuals, _ = plan.lengths(device)
     raw_lengths = tuple(end-start for start, end in raw_ranges)
     cu_raw = torch.tensor((0, *accumulate(raw_lengths)), device=device, dtype=torch.int32)
-    _, _, metadata_op = _load_attention_ops()
+    metadata_op = _load_attention_grad_metadata_op() if backward else _load_attention_ops()[2]
     options = {"layout_q": "TND", "layout_kv": "TND", "cmp_ratio": ratio, "ori_mask_mode": 4,
-               "cmp_mask_mode": 3, "ori_win_left": window-1, "ori_win_right": 0}
-    metadata = metadata_op(
+               "cmp_mask_mode": 3 if has_keys else 0, "ori_win_left": window-1, "ori_win_right": 0}
+    metadata = None if metadata_op is None else metadata_op(
         heads, 1, dim, cu_seqlens_q=cu_q, cu_seqlens_ori_kv=cu_raw,
         cu_seqlens_cmp_kv=cu_k if has_keys else None,
         cmp_residual_kv=residuals if has_keys and ratio > 1 else None,
@@ -314,7 +337,8 @@ class _SparseFlashMlaTND(torch.autograd.Function):
             0 if indices is None else indices.shape[-1],
         )
         options = {"layout_q": "TND", "layout_kv": "TND", "softmax_scale": scale, "cmp_ratio": ratio,
-                   "ori_mask_mode": 4, "cmp_mask_mode": 3, "ori_win_left": window-1, "ori_win_right": 0}
+                   "ori_mask_mode": 4, "cmp_mask_mode": 3 if main is not None else 0,
+                   "ori_win_left": window-1, "ori_win_right": 0}
         forward, _, _ = _load_attention_ops()
         output, lse = forward(
             query, ori_kv=raw, cmp_kv=main, cmp_sparse_indices=indices, sinks=sinks,
@@ -324,6 +348,8 @@ class _SparseFlashMlaTND(torch.autograd.Function):
         )
         ctx.save_for_backward(query, raw, main, indices, sinks, output, lse, cu_q, cu_raw, cu_k, residuals)
         ctx.options = options
+        ctx.plan = plan
+        ctx.raw_ranges = raw_ranges
         return output
 
     @staticmethod
@@ -331,10 +357,18 @@ class _SparseFlashMlaTND(torch.autograd.Function):
         """Return each physical bank's gradient to its autograd communication owner."""
         query, raw, main, indices, sinks, output, lse, cu_q, cu_raw, cu_k, residuals = ctx.saved_tensors
         _, backward, _ = _load_attention_ops()
+        options = dict(ctx.options)
+        metadata = _tnd_attention_metadata(
+            ctx.plan, query.device, query.shape[1], query.shape[2], ctx.raw_ranges,
+            options["cmp_ratio"], options["ori_win_left"] + 1, main is not None,
+            0 if indices is None else indices.shape[-1], backward=True,
+        )[-1]
+        if metadata is not None:
+            options["metadata"] = metadata
         dq, dr, dm, ds, _, _ = backward(
             query, grad_output.contiguous(), output, lse, ori_kv=raw, cmp_kv=main,
             cmp_sparse_indices=indices, sinks=sinks, cu_seqlens_q=cu_q, cu_seqlens_ori_kv=cu_raw,
-            cu_seqlens_cmp_kv=cu_k, cmp_residual_kv=residuals, **ctx.options,
+            cu_seqlens_cmp_kv=cu_k, cmp_residual_kv=residuals, **options,
         )
         return dq, dr, dm if main is not None else None, None, ds, None, None, None, None, None
 
