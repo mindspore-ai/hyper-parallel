@@ -26,11 +26,11 @@ import torch
 from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 from safetensors.torch import save_file
 
-from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
+from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping, Engram
 from hyper_parallel.components.checkpoint.weight_conversion import WeightRenaming
-from hyper_parallel.models.deepseek_v41.adapter.engram.host_replacement import HostEngramModule
+from hyper_parallel.components.modules.engram.host_engram import HostEngramModule
 from hyper_parallel.models.deepseek_v41.adapter.engram.host_state import DeepseekV41HostState
-from hyper_parallel.models.deepseek_v41.adapter.engram.host_table import HostEngramTable
+from hyper_parallel.components.modules.engram.host_engram_table import HostEngramTable
 from hyper_parallel.models._transformers.model_builder import (
     _validate_external_state_build,
     _validate_optimize_dtype,
@@ -119,9 +119,9 @@ class TestHostEngramTable(unittest.TestCase):
             parts[0].copy_(counts)
             parts[1].zero_()
 
-        with (patch("hyper_parallel.models.deepseek_v41.adapter.engram.host_lookup.dist.all_gather",
+        with (patch("hyper_parallel.components.modules.engram.parallel_engram.dist.all_gather",
                     side_effect=gather_counts),
-              patch("hyper_parallel.models.deepseek_v41.adapter.engram.host_lookup.ep_all_to_all",
+              patch("hyper_parallel.components.modules.engram.parallel_engram.ep_all_to_all",
                     side_effect=lambda tensor, *_: tensor) as exchange):
             values = table(torch.tensor([2, 2, 3]))
 
@@ -309,7 +309,7 @@ class TestHostEngramTable(unittest.TestCase):
         weight = host_source.embed.weight.detach().clone()
         host_source.embed.weight = torch.nn.Parameter(torch.empty((16, 3), device="meta"))
         device = EngramModule(module=source)
-        host = HostEngramModule(module=host_source)
+        host = Engram(module=host_source, engram_storage_backend="host")
         host.embed.bind_planned_shard(ep_rank=0, ep_size=1)
         torch.utils.swap_tensors(host.embed.weight, torch.nn.Parameter(weight))
 

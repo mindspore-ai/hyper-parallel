@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -225,7 +226,7 @@ class GroupedQueryAttentionModule(nn.Module):
             if norm is not None and hasattr(norm, "variance_epsilon"):
                 if set(dict(norm.named_parameters())) != {"weight"}:
                     raise ValueError("GQA direct-scale RMSNorm requires only a weight parameter")
-                norm = RMSNorm(module=norm)
+                norm = RMSNorm(module=norm, use_fused_ops=True)
             setattr(self, name, norm)
 
     def __init__(self, *, config: Any = None, module: nn.Module | None = None,
@@ -294,8 +295,14 @@ class GroupedQueryAttentionModule(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, config.hidden_size, bias=output_bias, dtype=dtype)
         # Norm presence is an algorithm choice, not something inferred from model_type
         # or rms_norm_eps. Native gamma is direct scale; source Norms keep their own convention.
-        self.q_norm = RMSNorm(self.qk_head_dim, eps).to(dtype=dtype) if qk_norm else None
-        self.k_norm = RMSNorm(self.qk_head_dim, eps).to(dtype=dtype) if qk_norm else None
+        self.q_norm = (
+            RMSNorm(config=SimpleNamespace(hidden_size=self.qk_head_dim, eps=eps), use_fused_ops=True).to(dtype=dtype)
+            if qk_norm else None
+        )
+        self.k_norm = (
+            RMSNorm(config=SimpleNamespace(hidden_size=self.qk_head_dim, eps=eps), use_fused_ops=True).to(dtype=dtype)
+            if qk_norm else None
+        )
 
     def _initialize_config_projections(self, config: Any, bias: bool, dtype: torch.dtype | None) -> None:
         """Allocate native grouped rows or independent Q/K/V projections."""

@@ -23,7 +23,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from hyper_parallel.models.deepseek_v41.adapter.engram.host_state import DeepseekV41HostState
-from hyper_parallel.models.deepseek_v41.adapter.engram.host_table import HostEngramTable
+from hyper_parallel.components.modules.engram.host_engram_table import HostEngramTable
 
 base_module = importlib.import_module("hyper_parallel.trainer.base")
 

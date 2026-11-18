@@ -71,12 +71,12 @@ plan_overrides:
   replace:
     kind: module
     implementation:
-      _target_: hyper_parallel.components.modules.mhc.PipelinedMhcModule
+      _target_: hyper_parallel.components.modules.mhc.mhc.PipelinedMhc
 - match: model.layers.*.engram
   replace:
     kind: module
     implementation:
-      _target_: hyper_parallel.components.modules.engram.EngramModule
+      _target_: hyper_parallel.components.modules.engram.engram.Engram
 - match: model.layers.*.self_attn
   replace:
     kind: module

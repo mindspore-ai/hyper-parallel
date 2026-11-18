@@ -684,6 +684,11 @@ def _resolve_replacement_target(node: object, *, path: str) -> Target[Any]:
             selected._kwargs, selected_signature,
             _target_hints(selected.callable, path=path), path=path,
         )
+        if get_module_family(requested).default_variant is not None:
+            # Deferred family factories receive these resources from model preparation.
+            # Constructor defaults must not become serialized user request arguments.
+            normalized = {name: value for name, value in normalized.items()
+                          if name not in {"module", "module_fqn", "context", "mesh"}}
         return selected.replace(**normalized)
     except (ValueError, TypeError, ImportError, AttributeError) as exc:
         raise ConfigResolutionError(path, str(exc)) from exc

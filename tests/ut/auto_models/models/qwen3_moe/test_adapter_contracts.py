@@ -225,10 +225,11 @@ class TestGQAFamilyContracts(unittest.TestCase):
         from hyper_parallel.components.modules.attention.grouped_query_attention.grouped_query_attention import (
             rotate_half,
         )
-        # The package also exports a function named rms_norm; patch the owning module explicitly.
-        norm_module = importlib.import_module("hyper_parallel.components.functional.rms_norm")
+        # CPU contract tests replace the NPU boundary while preserving the production fused selection.
+        norm_module = importlib.import_module("hyper_parallel.components.modules.rms_norm")
 
-        def norm_kernel(inputs, weight, eps):
+        def norm_kernel(inputs, weight, eps, cast_order):
+            del cast_order
             return torch.nn.functional.rms_norm(inputs, (inputs.shape[-1],), weight, eps)
 
         def attention(module, query, key, value, mask, **kwargs):
@@ -286,7 +287,7 @@ class TestGQAFamilyContracts(unittest.TestCase):
                     result, _ = attention(None, query.transpose(1, 2), key.transpose(1, 2),
                                           value.transpose(1, 2), mask, scaling=0.7)
                     expected = source.o_proj((result * gate.sigmoid() if gated else result).flatten(-2))
-                    with unittest.mock.patch.object(norm_module, "rms_norm", norm_kernel):
+                    with unittest.mock.patch.object(norm_module, "_npu_rms_norm", norm_kernel):
                         actual = candidate(local, positions, mask)[0]
                         torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
                         gradient = torch.randn_like(expected)

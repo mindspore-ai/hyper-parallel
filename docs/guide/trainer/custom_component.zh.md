@@ -52,7 +52,7 @@ YAML 解析结果为 `list[PlanOverride]`；Trainer 侧先归一化为替换规�
 2. `replace.implementation` 指向训练环境可导入的替换工厂；静态参数可用 `{_target_: 路径, ...}` 映射填写。
 3. 工厂使用 `@module_replacement`，声明 `module`、`module_fqn`、`context` 三个参数，并返回 `torch.nn.Module`。
 
-完整实现可参考 [`RMSNorm`](../../../hyper_parallel/components/modules/rms_norm.py#L31-L82)。
+完整实现可参考 [`RMSNorm`](../../../hyper_parallel/components/modules/rms_norm.py#L269)。
 
 模型族 adapter 按职责统一划分：模块/权重转换位于 `adapter/conversion/`，数据编码、processor、
 transform 和 runtime-input 位于 `adapter/data/`，模型前向合约位于 `adapter/runtime/`，CP/EP

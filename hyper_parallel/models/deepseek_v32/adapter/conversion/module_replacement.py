@@ -32,7 +32,7 @@ def replace_deepseek_v32_rms_norm(
     """Replace DeepSeek RMSNorm with the shared fused RMSNorm module."""
     from hyper_parallel.components.modules import RMSNorm  # pylint: disable=C0415
 
-    return RMSNorm(module=module, module_fqn=module_fqn, context=context)
+    return RMSNorm(module=module, module_fqn=module_fqn, context=context, use_fused_ops=True)
 
 
 @module_replacement
