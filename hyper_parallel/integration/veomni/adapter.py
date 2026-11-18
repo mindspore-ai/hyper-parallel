@@ -30,7 +30,6 @@ import torch
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.fully_shard.api import HSDPModule
-from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.integration.torch import (
     DTensorAdapter,
     fully_shard,
@@ -39,7 +38,7 @@ from hyper_parallel.integration.torch import (
 )
 from hyper_parallel.integration.veomni.extra_parallel import (
     bind_gradient_divisor,
-    parameters_for_clipping,
+    native_clipping_view,
 )
 from hyper_parallel.integration.veomni.optimizer import (
     build_optimizer_binding,
@@ -91,7 +90,7 @@ def _build_construction_bindings(
     """Resolve the optional framework APIs and assemble independent bindings."""
     native_optimizer_module = import_module("veomni.optim.optimizer")
     bindings = [
-        build_optimizer_binding(native_optimizer_module, use_hyper_optimizer=muon)
+        build_optimizer_binding(native_optimizer_module, hyper_muon=muon)
     ]
     if fsdp or muon:
         checkpoint = import_module("veomni.checkpoint.dcp_checkpointer")
@@ -101,20 +100,14 @@ def _build_construction_bindings(
     parallel = import_module("veomni.distributed.torch_parallelize")
     options = getattr(fsdp_config, "hyper_parallel", None)
     if options is not None:
-        if options.reduce_comm_interval != 1 and not hasattr(
-            HSDPModule, "set_reduce_comm_interval"
-        ):
-            raise NotImplementedError(
-                "This Hyper version does not provide set_reduce_comm_interval."
-            )
         if fsdp_config.low_precision_reduce_scatter_comm:
-            raise NotImplementedError(
-                "VeOmni's low-precision RS transport hook is Torch FSDP-specific."
+            raise ValueError(
+                "low_precision_reduce_scatter_comm is not supported by Hyper FSDP."
             )
 
     vit_policy = (
         _ViTFusionPolicy(fsdp_config)
-        if options is not None and getattr(options, "comm_fusion_vit", None) is not None
+        if options is not None and options.comm_fusion_vit is not None
         else None
     )
     bindings.append(_build_sharding_binding(parallel, options, vit_policy))
@@ -236,9 +229,7 @@ def _build_parallelize_binding(
         result.set_reshard_after_backward(config.reshard_after_backward)
         interval = config.hyper_parallel.reduce_comm_interval
         for module in result.modules():
-            if isinstance(module, HSDPModule) and hasattr(
-                module, "set_reduce_comm_interval"
-            ):
+            if isinstance(module, HSDPModule):
                 module.set_reduce_comm_interval(interval)
         targets = {
             name: module
@@ -258,7 +249,7 @@ def _build_parallelize_binding(
 def _configure_block_prefetch(blocks: list, config: Any) -> None:
     """Use VeOmni's existing per-block managed units for Hyper prefetch targets."""
     depth = config.hyper_parallel.forward_prefetch_depth
-    backward_depth = getattr(config.hyper_parallel, "backward_prefetch_depth", 1)
+    backward_depth = config.hyper_parallel.backward_prefetch_depth
 
     def units(targets: list) -> list:
         """Keep the model builder's managed units in their existing order."""
@@ -343,12 +334,7 @@ class VeOmniAdapter:
         """Adapt only Hyper shard writes inside the original loading pipeline."""
         # VeOmni has no public per-shard write hook; keep this coupling local.
         # pylint: disable=protected-access
-        try:
-            loading = import_module("veomni.models.module_utils")
-        except ModuleNotFoundError as error:
-            if error.name != "veomni.models.module_utils":
-                raise
-            loading = import_module("veomni.models.checkpoint.weights")
+        loading = import_module("veomni.models.checkpoint.weights")
         original_load = loading._dispatch_parameter
         load_signature = signature(original_load)
         if not {"module", "name", "tensor"}.issubset(load_signature.parameters):
@@ -383,7 +369,7 @@ class VeOmniAdapter:
         return original_load, dispatch_parameter
 
     def _build_clipping_binding(self) -> tuple:
-        """Delegate Hyper norm reduction to its existing native implementation."""
+        """Reuse VeOmni norm reduction and scaling on local Hyper gradient views."""
         clipping = import_module("veomni.distributed.fsdp2.clip_grad_norm")
         original_clip = clipping.clip_grad_norm
         clip_signature = signature(original_clip)
@@ -400,8 +386,8 @@ class VeOmniAdapter:
             parameters = arguments["model"].parameters()
             if not any(isinstance(parameter, DTensor) for parameter in parameters):
                 return original_clip(*args, **kwargs)
-            return clip_grad_norm_(
-                parameters_for_clipping(arguments["model"]),
+            return original_clip(
+                native_clipping_view(arguments["model"]),
                 arguments["max_norm"],
                 arguments.get("norm_type", 2.0),
                 arguments.get("error_if_nonfinite", False),
@@ -458,60 +444,17 @@ class VeOmniAdapter:
 _ADAPTER = VeOmniAdapter()
 
 
-def _resolve_hyper_fsdp_config(model_config: Any, modules: dict) -> Any:
-    """Select the effective wrap owner's configuration and validate consistency."""
-    fsdp_configs = [model_config.accelerator.fsdp_config]
-    if modules and (
-        model_config.accelerator.fsdp_config.fsdp_scope == "module"
-        or model_config.accelerator.fsdp_config.fsdp_mode == "eager"
-    ):
-        fsdp_configs = [
-            module.accelerator.fsdp_config
-            for module in modules.values()
-            if module.accelerator.fsdp_config.fsdp_mode == "fsdp2"
-        ]
-    config = next(
-        (item for item in fsdp_configs if item.fsdp_backend == "hyper_parallel"),
-        None,
-    )
-    if config is not None and any(item != config for item in fsdp_configs):
-        raise ValueError(
-            "Omni Hyper FSDP modules must share one FSDP backend and configuration."
-        )
-    return config
-
-
-def _resolve_hyper_muon(
-    model_config: Any, modules: dict, *, for_inference: bool
-) -> bool:
-    """Select module optimizers independently of FSDP and exclude inference."""
-    optimizers = (
-        [module.optimizer for module in modules.values()]
-        if modules
-        else [model_config.optimizer]
-    )
-    muon = not for_inference and any(
-        optimizer.use_hyper_optimizer for optimizer in optimizers
-    )
-    if not for_inference and any(
-        optimizer.use_hyper_optimizer and optimizer.type != "muon"
-        for optimizer in optimizers
-    ):
-        raise ValueError("use_hyper_optimizer requires model.optimizer.type='muon'.")
-    return muon
-
-
 def apply_hyper_parallel_patch(
     model_config: Any = None, *, for_inference: bool = False
 ) -> VeOmniAdapter:
     """Apply Hyper bindings once, before constructing VeOmni runtimes."""
     if model_config is not None:
-        modules = getattr(model_config, "modules", {})
-        config = _resolve_hyper_fsdp_config(model_config, modules)
-        muon = _resolve_hyper_muon(model_config, modules, for_inference=for_inference)
-        fsdp = config is not None
-        if fsdp and config.fsdp_mode != "fsdp2":
-            raise ValueError("hyper_parallel requires fsdp_mode='fsdp2'.")
+        config = model_config.accelerator.fsdp_config
+        fsdp = config.fsdp_mode == "hyper_fsdp2"
+        muon = model_config.optimizer.type == "hyper_muon"
+        if for_inference and (fsdp or muon):
+            raise ValueError("HyperParallel VeOmni integration supports training only.")
+        config = config if fsdp else None
         if _ADAPTER.is_patched and (_ADAPTER.fsdp, _ADAPTER.muon) != (fsdp, muon):
             raise RuntimeError(
                 "Remove the existing patch before changing backend selection."

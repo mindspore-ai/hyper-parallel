@@ -59,8 +59,11 @@ def build(backend):
     return model, optimizer
 
 
-class LegacyState(NativeOptimizerState):
+class IncompleteState(NativeOptimizerState):
+    """Write a deliberately incomplete checkpoint to exercise load rejection."""
+
     def state_dict(self):
+        """Omit NS provenance without changing the stored parameter state."""
         return {
             key: value
             for key, value in super().state_dict().items()
@@ -96,8 +99,8 @@ def check_restored_groups(optimizer, reference):
 
 
 def _check_resave_reload(target, optimizer, source, case, tensors, extra_parallel):
-    """Verify that a confirmed legacy restore produces a self-contained save."""
-    name, _, backend, _, _ = case
+    """Verify that restored checkpoints remain self-contained after another save."""
+    name, _, backend, _ = case
     weights, gradient, expected = tensors
     check_restored_groups(optimizer, source)
     resaved = OUT / f"resaved_{name}_ep{extra_parallel}"
@@ -109,7 +112,6 @@ def _check_resave_reload(target, optimizer, source, case, tensors, extra_paralle
     again.weight.copy_(weights)
     if extra_parallel:
         setattr(again, "_fqn2spec_info", {})
-    # A fresh optimizer must restore without another historical confirmation.
     dcp.load(
         {
             "optimizer": checkpoint.OptimizerState(
@@ -130,15 +132,11 @@ def _check_resave_reload(target, optimizer, source, case, tensors, extra_paralle
 
 def _run_restore_case(case, source, tensors, extra_parallel):
     """Exercise acceptance or rejection without changing live groups on failure."""
-    name, saved, backend, confirmation, rejected = case
+    name, saved, backend, rejected = case
     target, optimizer = build(backend)
     target.weight.copy_(tensors[0])
     if extra_parallel:
         setattr(target, "_fqn2spec_info", {})
-    if confirmation:
-        optimizer.confirm_legacy_muon_checkpoint_options(
-            ns_implementation=confirmation, gram_ns_reset_iterations=[2]
-        )
     groups_before = deepcopy(
         [
             {key: value for key, value in group.items() if key != "params"}
@@ -199,15 +197,15 @@ def main():
             checkpoint_id=OUT / "new",
         )
         dcp.save(
-            {"optimizer": LegacyState(model, source, STATE)},
-            checkpoint_id=OUT / "legacy",
+            {"optimizer": IncompleteState(model, source, STATE)},
+            checkpoint_id=OUT / "incomplete",
         )
-        keys = dcp.FileSystemReader(OUT / "legacy").read_metadata().state_dict_metadata
+        keys = dcp.FileSystemReader(OUT / "incomplete").read_metadata().state_dict_metadata
         if any(
             key.endswith(("ns_implementation", "gram_ns_reset_iterations"))
             for key in keys
         ):
-            raise AssertionError("Legacy fixture unexpectedly contains NS provenance")
+            raise AssertionError("Incomplete fixture unexpectedly contains NS provenance")
         model.weight.grad = gradient.clone()
         source.step()
         expected = model.weight.clone()
@@ -216,7 +214,7 @@ def main():
         target, optimizer = build("std")
         dcp.load(
             {"optimizer": NativeOptimizerState(target, optimizer, STATE, load=True)},
-            checkpoint_id=OUT / "legacy",
+            checkpoint_id=OUT / "incomplete",
             planner=DefaultLoadPlanner(allow_partial_load=True),
         )
         if optimizer.param_groups[0]["ns_implementation"] != "std":
@@ -232,19 +230,10 @@ def main():
                 )
             for extra_parallel in (False, True):
                 for case in (
-                    ("new_same", "new", "gram", None, None),
-                    ("new_backend_mismatch", "new", "std", None, "ns_implementation"),
-                    ("legacy_std", "legacy", "std", None, "missing NS configuration"),
-                    ("legacy_gram", "legacy", "gram", None, "missing NS configuration"),
-                    ("legacy_explicit_gram", "legacy", "gram", "gram", None),
-                    (
-                        "legacy_false_target",
-                        "legacy",
-                        "std",
-                        "gram",
-                        "ns_implementation",
-                    ),
-                    ("saved_values_override_confirmation", "new", "gram", "std", None),
+                    ("new_same", "new", "gram", None),
+                    ("new_backend_mismatch", "new", "std", "ns_implementation"),
+                    ("incomplete_std", "incomplete", "std", "missing NS configuration"),
+                    ("incomplete_gram", "incomplete", "gram", "missing NS configuration"),
                 ):
                     records.append(
                         _run_restore_case(
@@ -252,7 +241,7 @@ def main():
                         )
                     )
         result = {
-            "resave_reload_cycles": 6,
+            "resave_reload_cycles": 2,
             "status": "PASS",
             "rank": dist.get_rank(),
             "world": dist.get_world_size(),

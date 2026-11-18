@@ -195,7 +195,7 @@ def _restore_hyper_state_view(value: Any, parameter: DTensor) -> Any:
     return from_torch_view(value, reference=parameter)
 
 
-def build_optimizer_binding(native_module: Any, *, use_hyper_optimizer: bool) -> tuple:
+def build_optimizer_binding(native_module: Any, *, hyper_muon: bool) -> tuple:
     """Translate the VeOmni factory call once, then choose the owning optimizer."""
     original_optimizer = getattr(native_module, "build_optimizer", None)
     try:
@@ -222,6 +222,9 @@ def build_optimizer_binding(native_module: Any, *, use_hyper_optimizer: bool) ->
         bound = optimizer_signature.bind(*args, **kwargs)
         bound.apply_defaults()
         arguments = bound.arguments
+        explicit_hyper_muon = arguments["optimizer_type"] == "hyper_muon"
+        if explicit_hyper_muon:
+            arguments["optimizer_type"] = "muon"
         model = arguments["model"]
         hyper_parameters = uses_hyper(model)
         if arguments["optimizer_type"] != "muon":
@@ -231,15 +234,17 @@ def build_optimizer_binding(native_module: Any, *, use_hyper_optimizer: bool) ->
                 raise NotImplementedError(
                     "The adapter currently supports AdamW and Hyper Muon."
                 )
+            config = arguments.get("optimizer_config")
+            if getattr(config, "state_offload", "none") == "cpu":
+                return _build_native_optimizer_adapter(model, arguments, original_optimizer)
             return _build_native_adamw_adapter(
                 model, arguments, native_module, original_optimizer
             )
-        config = arguments.get("optimizer_config")
-        select_hyper = getattr(config, "use_hyper_optimizer", use_hyper_optimizer)
+        select_hyper = explicit_hyper_muon or hyper_muon
         if not select_hyper:
             if not hyper_parameters:
                 return original_optimizer(*args, **kwargs)
-            return _build_native_muon_adapter(model, arguments, original_optimizer)
+            return _build_native_optimizer_adapter(model, arguments, original_optimizer)
         if arguments["param_groups"] is not None:
             native_module.logger.warning_rank0(
                 "build_optimizer(optimizer_type='muon') ignores the provided "
@@ -261,22 +266,6 @@ class HyperOptimizerAdapter:
         self.model = model
         self.optimizers_dict = optimizers
         self.key_names = list(optimizers)
-        self._legacy_muon_checkpoint_options = {}
-
-    def confirm_legacy_muon_checkpoint_options(self, **options: Any) -> None:
-        """Explicitly supply historical NS settings absent from an old checkpoint.
-
-        Only missing checkpoint fields use these values. Saved fields always
-        take precedence, and every value must match the active Muon configuration.
-        The caller must know the historical settings; this API does not infer them.
-        """
-        if options.keys() - set(_MUON_NS_KEYS):
-            raise ValueError(
-                "Legacy Muon confirmation accepts NS configuration keys only."
-            )
-        self._legacy_muon_checkpoint_options = {
-            key: _canonical_muon_option(value) for key, value in options.items()
-        }
 
     def dcp_load_template(self, state: dict) -> dict:
         """Poison invariant defaults so partial DCP loads cannot impersonate saved values."""
@@ -354,19 +343,15 @@ class HyperOptimizerAdapter:
     def _validate_muon_checkpoint(
         self, state_dict: dict, configured: dict, prefix: str
     ) -> None:
-        """Complete historical metadata before validating the restore payload."""
-        for key, default in (("head_blocks", 1), ("adjust_lr_fn", "match_rms_adamw")):
-            if _is_missing_checkpoint_option(state_dict.get(prefix + key)):
-                state_dict[prefix + key] = default
-        self._complete_muon_ns_options(state_dict, configured, prefix)
-        if configured.get("head_blocks", 1) != state_dict.get(
-            prefix + "head_blocks", 1
+        """Validate saved metadata against the active optimizer before restoring."""
+        if "head_blocks" in configured and configured["head_blocks"] != state_dict.get(
+            prefix + "head_blocks"
         ):
             raise ValueError(
                 "Muon checkpoint head_blocks differs from the configured head splitting."
             )
-        if configured.get("adjust_lr_fn", "match_rms_adamw") != state_dict.get(
-            prefix + "adjust_lr_fn", "match_rms_adamw"
+        if "adjust_lr_fn" in configured and configured["adjust_lr_fn"] != state_dict.get(
+            prefix + "adjust_lr_fn"
         ):
             raise ValueError(
                 "Muon checkpoint LR policy differs from the configured policy."
@@ -374,29 +359,12 @@ class HyperOptimizerAdapter:
         if "ns_implementation" not in configured:
             return
         for key in _MUON_NS_KEYS:
-            if prefix + key not in state_dict:
+            if prefix + key not in state_dict or _is_missing_checkpoint_option(state_dict[prefix + key]):
                 raise ValueError(f"Muon checkpoint is missing NS configuration: {key}.")
             if _canonical_muon_option(configured[key]) != _canonical_muon_option(
                 state_dict[prefix + key]
             ):
                 raise ValueError(f"Muon checkpoint NS configuration differs: {key}.")
-
-    def _complete_muon_ns_options(
-        self, state_dict: dict, configured: dict, prefix: str
-    ) -> None:
-        """Use explicit legacy confirmation only for absent checkpoint settings."""
-        for key in _MUON_NS_KEYS:
-            if prefix + key in state_dict and not _is_missing_checkpoint_option(
-                state_dict[prefix + key]
-            ):
-                continue
-            if key in self._legacy_muon_checkpoint_options:
-                state_dict[prefix + key] = self._legacy_muon_checkpoint_options[key]
-            elif "ns_implementation" in configured:
-                raise ValueError(
-                    f"Muon checkpoint is missing NS configuration: {key}. "
-                    "Explicit historical settings are required for legacy restore."
-                )
 
     def load_state_dict(self, state_dict: dict) -> None:
         """Restore Hyper optimizer states from native DCP transport views."""
@@ -414,8 +382,6 @@ class HyperOptimizerAdapter:
                         fqn = parameter_names[id(parameter)]
                         prefix = f"param_groups.{fqn}."
                         self._validate_muon_checkpoint(state_dict, configured, prefix)
-            # Construct the payload only after confirmed values have replaced
-            # missing-field markers, so validation and restore use the same data.
             payload = _optimizer_leaf_from_flat(state_dict, optimizer, parameters)
             restored = {}
             for fqn, entries in payload["state"].items():
@@ -446,8 +412,8 @@ class HyperOptimizerAdapter:
                 cleanup()
 
 
-class _NativeMuonAdapter:
-    """Run the unchanged native optimizer on shared-storage Torch parameter views."""
+class _NativeOptimizerAdapter:
+    """Run native Muon or state-offloaded AdamW on shared-storage Torch views."""
 
     _is_multi_optimizer = True
 
@@ -506,16 +472,25 @@ class _NativeMuonAdapter:
     def load_state_dict(self, state_dict: dict) -> None:
         """Restore the native optimizer state without changing training parameters."""
         self.optimizer.load_state_dict(state_dict)
+        # Native DCP restores EP states on sliced meshes. Match the active view
+        # descriptor without moving SwapAdamW's host-resident local storage.
+        for leaf in self.optimizers_dict.values():
+            for parameter, state in leaf.state.items():
+                if not isinstance(parameter, TorchDTensor):
+                    continue
+                for name, value in state.items():
+                    if isinstance(value, TorchDTensor) and value.device_mesh != parameter.device_mesh:
+                        rewrap = import_module("veomni.utils.dtensor_utils").rewrap_dtensor_local
+                        state[name] = rewrap(
+                            value.to_local(), mesh=parameter.device_mesh,
+                            placements=value.placements, shape=value.shape, stride=value.stride(),
+                        )
 
 
-def _build_native_muon_adapter(
+def _build_native_optimizer_adapter(
     model: torch.nn.Module, factory_options: dict, factory: Any
-) -> _NativeMuonAdapter:
-    """Preserve native Muon algorithms; bridge only its Torch DTensor inputs."""
-    if getattr(model, "_fqn2spec_info", None):
-        raise NotImplementedError(
-            "Native Muon with Hyper ExtraParallel layouts needs separate validation."
-        )
+) -> _NativeOptimizerAdapter:
+    """Preserve native optimizer algorithms; bridge only Torch DTensor inputs."""
     memo = {}
     parameter_views = {}
 
@@ -557,7 +532,10 @@ def _build_native_muon_adapter(
             for group in options["param_groups"]
         ]
     optimizer = factory(**options)
-    return _NativeMuonAdapter(model, view_model, optimizer)
+    if not getattr(optimizer, "_is_multi_optimizer", False):
+        native = import_module("veomni.optim.optimizer")
+        optimizer = native.MultiOptimizer(view_model, {"adamw": optimizer}, key_names=["adamw"])
+    return _NativeOptimizerAdapter(model, view_model, optimizer)
 
 
 def _extra_parallel_adamw_groups(model, source, names, factory_options, native_module):
@@ -867,4 +845,23 @@ def _build_hyper_muon_adapter(
                 model, adamw_params, optimizer_options, native_optimizer_module
             )
         )
+    _register_torch_extra_parallel_clipping(model, native_optimizer_module)
     return HyperOptimizerAdapter(model, optimizers)
+
+
+def _register_torch_extra_parallel_clipping(model: torch.nn.Module, native_module: Any) -> None:
+    """Retain native mesh-aware clipping when Hyper Muon owns Torch parameters."""
+    if uses_hyper(model) or not any(isinstance(parameter, TorchDTensor) for parameter in model.parameters()):
+        return
+    # VeOmni exposes no public ExtraParallel ownership helpers.
+    if not native_module._should_build_extra_parallel_aware(model):  # pylint: disable=protected-access
+        return
+    names = native_module.get_parallel_state().extra_parallel_names
+    groups = {name: [] for name in (*names, "non_extra_parallel")}
+    for parameter in model.parameters():
+        if parameter.requires_grad:
+            owner = native_module._is_extra_parallel_param(parameter, names)  # pylint: disable=protected-access
+            groups[owner or "non_extra_parallel"].append(parameter)
+    # The native clipper dispatches on these groups, not the optimizer class.
+    setattr(model, "_extra_parallel_param_groups", groups)
+    setattr(model, "_ep_replicated_lora_param_ids", _shared_lora_parameter_ids(model))
