@@ -21,6 +21,7 @@ from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.platform import get_platform
 from hyper_parallel.platform.platform import PlatformType
 from .dsa_cp_fold import dsa_cp_fold_enabled, fold_dense_lightning_indexer_softmax_lse
+from .dsa_cp_fold import compact_tnd_call, tnd_compact_enabled
 from .parallel_ops import DistributedOp
 
 platform = get_platform()
@@ -426,6 +427,12 @@ class NpuDenseLightningIndexerSoftmaxLseDistributedOp(DistributedOp):
                         "signature of the dense indexer forward only.")
                 return fold_dense_lightning_indexer_softmax_lse(
                     func, seq_shard_id, seq_shards, *args, fold_layout='TND', **kwargs)
+
+            if tnd_compact_enabled(qlen_tensor, klen_tensor):
+                return compact_tnd_call(func, seq_shard_id, seq_shards, *args, variant="dense_lse", **kwargs)
+            if seq_shards > 1 and local_q.shape[0] * seq_shards == local_k.shape[0]:
+                return compact_tnd_call(func, seq_shard_id, seq_shards, *args,
+                                        variant="dense_lse", trim_documents=False, **kwargs)
 
             adj_q, adj_k = _adjust_tnd_seq_lens(
                 local_q, local_k, qlen_tensor, klen_tensor,
