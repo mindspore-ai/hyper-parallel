@@ -56,6 +56,7 @@ from .pass_config import (
     normalize_dp_mode,
 )
 from .passes.pipeline import PassPipeline
+from .passes.parallel.fsdp_pass import FsdpParamSpec, FsdpPlan
 from .passes.activation_checkpoint import prepare_activation_checkpoint
 from .tracer.dynamic_shapes import normalize_dynamic_arg_dims
 from .tracer.graph_tracer import run_traced_graph, trace_model_graph
@@ -504,8 +505,6 @@ class GraphCompiler:
             getattr(context, axis, 1) != 1 for axis in ("cp_size", "pp_size")
         ):
             raise ValueError("Graph EP currently requires CP=PP=1")
-        if self.pass_config.enable_overlap:
-            raise ValueError("Graph EP currently requires enable_overlap=False")
 
     def _init_expert_dp(self, context: Any) -> None:
         """Use EDP for the exact parameters owned by bound local experts."""
@@ -808,6 +807,28 @@ class GraphCompiler:
             )
         return shard, replicate
 
+    def _build_fsdp_plan(self) -> Optional[FsdpPlan]:
+        """Build per-parameter shard policies for the FSDP pass."""
+        specs = {
+            name: FsdpParamSpec(group, degree)
+            for name, (group, degree) in self._parameter_groups.items()
+        }
+        if self._expert_param_names:
+            if self._expert_fsdp_mesh is None:
+                raise ValueError("Expert parameters require fsdp_moe_mesh['edp_shard']")
+            expert_degree = self._expert_fsdp_mesh.size()
+            for name in self._expert_param_names:
+                bound = specs.get(name)
+                group = bound.group_name if bound is not None else "fsdp_expert"
+                degree = bound.degree if bound is not None else expert_degree
+                specs[name] = FsdpParamSpec(
+                    group,
+                    degree,
+                    mode="replicate" if degree == 1 else "shard",
+                    pad_policy="error",
+                )
+        return FsdpPlan(specs) if specs else None
+
     def _build_pass_kwargs(self) -> dict:
         """
         Build kwargs to pass to passes.
@@ -820,11 +841,9 @@ class GraphCompiler:
 
         if self.pass_config.fsdp_enabled:
             kwargs["fsdp_group_name"] = "fsdp"
-            if self._parameter_groups:
-                kwargs["parameter_groups"] = self._parameter_groups
-            if self._expert_param_names:
-                kwargs["expert_param_names"] = self._expert_param_names
-                kwargs["expert_fsdp_group_name"] = "fsdp_expert"
+            fsdp_plan = self._build_fsdp_plan()
+            if fsdp_plan is not None:
+                kwargs["fsdp_plan"] = fsdp_plan
             kwargs.update(self._source_reduction_kwargs())
             # DDP / HSDP also reduce gradients on the replicate axis.
             if normalize_dp_mode(self.pass_config.dp_mode) in ("ddp", "hsdp"):

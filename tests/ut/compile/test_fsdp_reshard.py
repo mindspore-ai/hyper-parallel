@@ -50,6 +50,7 @@ from hyper_parallel.compile.passes.parallel.fsdp_pass import (
     FSDPPass,
     _free_tensor_storage,
 )
+from hyper_parallel.compile.passes.parallel.fsdp_pass import FsdpParamSpec, FsdpPlan
 from hyper_parallel.compile.tracer.graph_tracer import (
     extract_module_state,
     trace_model_graph,
@@ -338,7 +339,8 @@ class TestReshardStructure(unittest.TestCase):
             mocked.get_world_size.side_effect = lambda group=None: 2 if group == "edp" else 4
             FSDPPass().run(
                 graph, PassConfig(fsdp_degree=4, fsdp_reshard_after_forward=True), model=live,
-                expert_param_names={expert_name}, expert_fsdp_group_name="edp", fsdp_group_name="fsdp",
+                fsdp_group_name="fsdp",
+                fsdp_plan=FsdpPlan({expert_name: FsdpParamSpec("edp", 2, pad_policy="error")}),
                 gradient_reductions={expert_name: GradientReduction("sum", 4)},
             )
         graph.graph.lint()

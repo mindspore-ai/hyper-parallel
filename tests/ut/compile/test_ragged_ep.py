@@ -58,10 +58,24 @@ class TestRaggedExperts(unittest.TestCase):
             compiler = GraphCompiler(_LocalExperts(), _loss, PassConfig(enable_overlap=False), mesh_context=context)
             with self.subTest(axis=axis), self.assertRaisesRegex(ValueError, "CP=PP=1"):
                 compiler.compile()
-        compiler = GraphCompiler(_LocalExperts(), _loss, PassConfig(enable_overlap=True),
-                                 mesh_context=MeshContext(ep_size=2))
-        with self.assertRaisesRegex(ValueError, "enable_overlap=False"):
+
+    def test_compile_allows_enable_overlap_with_ep(self):
+        """The overlap flag does not block graph EP while AutoOverlap is a no-op."""
+        dense, expert = MagicMock(), MagicMock()
+        dense.mesh_dim_names = ("fsdp_shard",)
+        expert.mesh_dim_names = ("edp_shard", "ep")
+        expert["edp_shard"].size.return_value = 2
+        context = MeshContext(ep_size=2, fsdp_non_moe_mesh=dense, fsdp_moe_mesh=expert)
+        compiler = GraphCompiler(_LocalExperts(), _loss, PassConfig(enable_overlap=True), mesh_context=context)
+        joint = MagicMock(input_guards=None)
+        with (
+            patch("hyper_parallel.compile.compiler.dist.is_initialized", return_value=True),
+            patch("hyper_parallel.compile.compiler._register_process_group"),
+            patch("hyper_parallel.compile.compiler.trace_model_graph", return_value=joint),
+            patch("hyper_parallel.compile.compiler.PassPipeline.from_config") as pipeline,
+        ):
             compiler.compile()
+        pipeline.return_value.run.assert_called_once()
 
     def test_compile_resolves_expert_parameter_aliases(self):
         """Pass exact expert FQNs, including tied aliases, to the FSDP pass."""
@@ -70,6 +84,7 @@ class TestRaggedExperts(unittest.TestCase):
         dense, expert = MagicMock(), MagicMock()
         dense.mesh_dim_names = ("fsdp_shard",)
         expert.mesh_dim_names = ("edp_shard", "ep")
+        expert["edp_shard"].size.return_value = 2
         context = MeshContext(ep_size=2, fsdp_non_moe_mesh=dense, fsdp_moe_mesh=expert)
         compiler = GraphCompiler(model, _loss, PassConfig(enable_overlap=False), mesh_context=context)
         joint = MagicMock(input_guards=None)
@@ -81,8 +96,13 @@ class TestRaggedExperts(unittest.TestCase):
         ):
             compiler.compile()
         self.assertEqual(register.call_args.args, ("fsdp_expert", expert["edp_shard"].get_group()))
-        names = pipeline.return_value.run.call_args.kwargs["expert_param_names"]
-        self.assertEqual(names, {"experts.gate_up_proj", "experts.down_proj", "alias.gate_up_proj", "alias.down_proj"})
+        plan = pipeline.return_value.run.call_args.kwargs["fsdp_plan"]
+        self.assertEqual(
+            set(plan.params),
+            {"experts.gate_up_proj", "experts.down_proj", "alias.gate_up_proj", "alias.down_proj"},
+        )
+        self.assertEqual({spec.group_name for spec in plan.params.values()}, {"fsdp_expert"})
+        self.assertEqual({spec.degree for spec in plan.params.values()}, {2})
 
     def test_compile_rejects_missing_or_replicated_expert_mesh(self):
         """Fail before tracing when the expert DP contract cannot be satisfied."""

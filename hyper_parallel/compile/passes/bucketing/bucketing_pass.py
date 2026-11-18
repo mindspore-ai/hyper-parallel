@@ -278,9 +278,11 @@ class FsdpBucketingPass(GraphPass):
         modules = pass_config.fsdp_bucket_modules
         if modules is not None:
             modules = build_module_bucket_plans(kwargs["model"], module_bucket_plans=modules)
-        names = [kwargs.get("fsdp_group_name", "fsdp")]
-        if kwargs.get("expert_param_names"):
-            names.append(kwargs.get("expert_fsdp_group_name", "fsdp_expert"))
+        names = {kwargs.get("fsdp_group_name", "fsdp")}
+        fsdp_plan = kwargs.get("fsdp_plan")
+        if fsdp_plan is not None:
+            names.update(spec.group_name for spec in fsdp_plan.params.values())
+        names = sorted(names)
         groups = {name: _resolve_process_group(name) for name in names}
         ranks = {name: tuple(dist.get_process_group_ranks(group)) for name, group in groups.items()}
         for apply in (apply_ag_buckets, apply_rs_buckets):

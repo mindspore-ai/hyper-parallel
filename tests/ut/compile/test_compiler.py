@@ -91,14 +91,14 @@ class TestGraphCompilerForwardBackward(unittest.TestCase):
         with patch.object(compiler, "_register_mesh_group") as register:
             compiler._bind_parameter_meshes()
             kwargs = compiler._build_pass_kwargs()
-        groups = kwargs["parameter_groups"]
+        groups = kwargs["fsdp_plan"].params
         registered = {call.args[0]: call.args[1] for call in register.call_args_list}
         self.assertEqual(len(registered), 2)
         self.assertEqual(groups["tied_expert"], groups["mlp.experts.weight"])
-        self.assertEqual(groups["tied_expert"][1], 2)
-        self.assertEqual(groups["dense.weight"][1], 4)
-        self.assertIs(registered[groups["tied_expert"][0]], expert["edp_shard"])
-        self.assertIs(registered[groups["dense.weight"][0]], dense["fsdp_shard"])
+        self.assertEqual(groups["tied_expert"].degree, 2)
+        self.assertEqual(groups["dense.weight"].degree, 4)
+        self.assertIs(registered[groups["tied_expert"].group_name], expert["edp_shard"])
+        self.assertIs(registered[groups["dense.weight"].group_name], dense["fsdp_shard"])
         self.assertIs(model.tied_expert, model.mlp.experts.weight)
         self.assertFalse(hasattr(model, "hsdp_scheduler"))
         self.assertFalse(hasattr(model.mlp.experts, "hsdp_scheduler"))
@@ -639,12 +639,16 @@ class TestGraphCompilerDeviceMesh(unittest.TestCase):
         )
         self.assertNotIn("gradient_reductions", comp._build_pass_kwargs())
         comp._expert_param_names = {"weight"}
+        comp._expert_fsdp_mesh = MagicMock()
+        comp._expert_fsdp_mesh.size.return_value = 2
         kwargs = comp._build_pass_kwargs()
         self.assertEqual(set(kwargs["gradient_reductions"]), {"weight"})
         self.assertEqual(kwargs["gradient_reductions"]["weight"].reduce_op, "sum")
         self.assertEqual(kwargs["gradient_reductions"]["weight"].divisor, 8)
         self.assertNotIn("expert_parallel_degree", kwargs)
-        self.assertEqual(kwargs["expert_fsdp_group_name"], "fsdp_expert")
+        spec = kwargs["fsdp_plan"].params["weight"]
+        self.assertEqual(spec.group_name, "fsdp_expert")
+        self.assertEqual(spec.degree, 2)
 
     def test_tp_source_policies_and_replicated_gradients_are_forwarded(self):
         """Source-sharded weights and tied aliases avoid replicated-TP gradient sums."""
