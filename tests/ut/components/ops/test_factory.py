@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""CPU regressions for model-local HyperOps dispatch."""
+"""CPU regressions for model-local operator dispatch."""
 
 from __future__ import annotations
 

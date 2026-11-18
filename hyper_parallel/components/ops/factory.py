@@ -107,7 +107,9 @@ class OpRuntime:
         return cast(Fn, selected[1])
 
 
-class _HyperOps:
+class _OpRuntimeFactory:
+    """Create model-local operator runtimes."""
+
     def configure(
         self,
         *,
@@ -121,14 +123,14 @@ class _HyperOps:
         registry.validate_selections(selections)
         target = torch.device(target_device)
         if target.type not in {"cpu", "cuda", "npu"}:
-            raise ValueError(f"Unsupported HyperOps execution device {target}")
+            raise ValueError(f"Unsupported operator execution device {target}")
         return OpRuntime(
             registry, MappingProxyType(dict(selections)),
             OpBuildContext(target, dtype, MappingProxyType(dict(parallel or {}))),
         )
 
 
-ops = _HyperOps()
+ops = _OpRuntimeFactory()
 
 
 def _with_runtime(function: Any, runtime: OpRuntime) -> Any:

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Typed contracts for replaceable HyperOps implementations."""
+"""Typed contracts for selectable operator implementations."""
 
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -31,6 +31,6 @@ class OpSpec(Generic[Fn]):
 
     def __post_init__(self) -> None:
         if not isinstance(self.config_key, str) or not self.config_key.strip():
-            raise ValueError("HyperOps config_key must be a nonempty string")
+            raise ValueError("Operator config_key must be a nonempty string")
         if not isinstance(self.variant, str) or not self.variant.strip():
-            raise ValueError("HyperOps variant must be a nonempty string")
+            raise ValueError("Operator variant must be a nonempty string")

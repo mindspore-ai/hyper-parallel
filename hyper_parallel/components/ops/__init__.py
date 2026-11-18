@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Direct HyperOps functions and the model configuration entry point."""
+"""OpSelect operator entry points and runtime configuration."""
 
 from __future__ import annotations
 

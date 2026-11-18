@@ -36,7 +36,7 @@ from hyper_parallel.trainer.config.trainer import TrainerConfig
 
 
 class _TrainingConfigLoader(yaml.SafeLoader):
-    """Check duplicate HyperOps keys before the YAML mapping loses them."""
+    """Reject duplicate keys in the YAML ops mapping."""
 
     def get_single_data(self) -> object:
         root = self.get_single_node()

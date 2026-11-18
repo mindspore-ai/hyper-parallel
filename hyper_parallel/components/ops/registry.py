@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Registry of HyperOps contracts, implementations and automatic selection orders."""
+"""Registry of operator contracts, implementations and automatic selection orders."""
 
 from __future__ import annotations
 
@@ -58,11 +58,11 @@ class OpRegistry:
 
     def _require_mutable(self) -> None:
         if self._sealed:
-            raise RuntimeError("HyperOps registry is sealed")
+            raise RuntimeError("Operator registry is sealed")
 
     def _require_spec(self, spec: OpSpec[Any]) -> None:
         if self._families.get(spec.config_key, {}).get(spec.variant) is not spec:
-            raise ValueError(f"Unregistered HyperOps contract {spec.config_key}.{spec.variant}")
+            raise ValueError(f"Unregistered operator contract {spec.config_key}.{spec.variant}")
 
     def register_family(self, config_key: str, *, specs: tuple[OpSpec[Any], ...]) -> None:
         """Register a family and all of its distinct callable contracts."""
@@ -76,7 +76,7 @@ class OpRegistry:
             or len(variants) != len(specs)
             or any(spec.config_key != config_key for spec in specs)
         ):
-            raise ValueError(f"Invalid or duplicate HyperOps family {config_key!r}")
+            raise ValueError(f"Invalid or duplicate operator family {config_key!r}")
         self._families[config_key] = variants
         self._names[config_key] = set()
 
@@ -93,14 +93,14 @@ class OpRegistry:
         self._require_mutable()
         self._require_spec(spec)
         if not isinstance(name, str) or not name.strip() or name == "auto":
-            raise ValueError(f"Invalid HyperOps implementation name {name!r}")
+            raise ValueError(f"Invalid operator implementation name {name!r}")
         if not devices or len(set(devices)) != len(devices) or set(devices) - {"cpu", "cuda", "npu"}:
-            raise ValueError(f"Invalid HyperOps devices {devices!r} for {spec.config_key}.{name}")
+            raise ValueError(f"Invalid operator devices {devices!r} for {spec.config_key}.{name}")
         if not callable(load) or (check_compatibility is not None and not callable(check_compatibility)):
-            raise ValueError(f"Invalid HyperOps loader or compatibility check for {spec.config_key}.{name}")
+            raise ValueError(f"Invalid operator loader or compatibility check for {spec.config_key}.{name}")
         keys = [(spec, name, device_type) for device_type in devices]
         if any(key in self._implementations for key in keys):
-            raise ValueError(f"Overlapping HyperOps registration for {spec.config_key}.{spec.variant}:{name}")
+            raise ValueError(f"Overlapping operator registration for {spec.config_key}.{spec.variant}:{name}")
         implementation = _Implementation(load, check_compatibility)
         self._implementations.update({key: implementation for key in keys})
         self._names[spec.config_key].add(name)
@@ -118,7 +118,7 @@ class OpRegistry:
             or len(set(candidates)) != len(candidates)
             or any((spec, name, device) not in self._implementations for name in candidates)
         ):
-            raise ValueError(f"Invalid HyperOps auto order for {spec.config_key}.{spec.variant} on {device}")
+            raise ValueError(f"Invalid automatic backend order for {spec.config_key}.{spec.variant} on {device}")
         self._auto[key] = tuple(candidates)
 
     def seal(self) -> None:
@@ -128,12 +128,12 @@ class OpRegistry:
     def validate_selections(self, selections: Mapping[str, str]) -> None:
         """Validate user-facing family and implementation names."""
         if not self._sealed:
-            raise ValueError("HyperOps requires a sealed registry")
+            raise ValueError("Operator backend selection requires a sealed registry")
         if not isinstance(selections, Mapping):
             raise ValueError("ops must be a mapping from family names to implementation names")
         for key, name in selections.items():
             if not isinstance(key, str) or key not in self._names:
-                raise ValueError(f"Unknown HyperOps family {key!r}")
+                raise ValueError(f"Unknown operator family {key!r} in 'ops'")
             if not isinstance(name, str) or (name != "auto" and name not in self._names[key]):
                 allowed = ", ".join(sorted(self._names[key] | {"auto"}))
                 raise ValueError(f"Invalid ops.{key} value {name!r}, expected one of {allowed}")
@@ -170,7 +170,7 @@ class OpRegistry:
                 reasons.append(f"{name}: {exc}")
                 continue
             if not callable(selected):
-                raise TypeError(f"HyperOps loader for {spec.config_key}.{name} did not return a callable")
+                raise TypeError(f"Operator loader for {spec.config_key}.{name} did not return a callable")
             return name, cast(Fn, selected)
         detail = ", ".join(reasons) or "no auto candidates registered"
         raise RuntimeError(

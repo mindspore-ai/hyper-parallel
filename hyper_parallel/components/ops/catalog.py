@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Shared built-in HyperOps catalog."""
+"""Assemble the shared catalog of built-in operator backends."""
 
 from .auto_policy import apply_auto_policy
 from .families.attention import register_attention

@@ -64,7 +64,7 @@ class FakeGatedDeltaNet(nn.Module):
 class TestGatedDeltaNet(unittest.TestCase):
     """Check replacement identity, dispatch and CP composition."""
 
-    def test_replacement_delegates_to_hyperops_and_preserves_weights(self):
+    def test_replacement_calls_gdn_and_preserves_weights(self):
         """Select the zero-state operator at runtime without changing model state."""
         original = FakeGatedDeltaNet()
         replacement = TritonGDN(module=original)

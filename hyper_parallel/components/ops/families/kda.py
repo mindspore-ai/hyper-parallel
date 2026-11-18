@@ -43,7 +43,7 @@ KDA = OpSpec[KdaFn](config_key="kda", variant="zero_state")
 
 
 def _implementation(backend: str) -> KdaFn:
-    # Resolve lazily because the KDA layer also imports the public HyperOps entry points.
+    # Load chunk_kda lazily because its module imports the public kda operator.
     chunk_kda = import_module("hyper_parallel.components.modules.kimi_delta_attention").chunk_kda
 
     def run(

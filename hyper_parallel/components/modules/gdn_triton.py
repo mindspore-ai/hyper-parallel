@@ -93,7 +93,7 @@ def _bind_forward_primitives(source: nn.Module, target: nn.Module) -> None:
 
 @module_replacement
 class TritonGDN:
-    """Factory wiring an existing GDN model's local rule to HyperOps.
+    """Wire an existing GDN model's local rule to the selectable GDN operator.
 
     The returned module retains its source type so the model's forward, CP
     wrapper, and checkpoint layout remain unchanged.

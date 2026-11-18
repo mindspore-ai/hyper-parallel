@@ -1,7 +1,7 @@
 # Multiple hosts: 128 Ascend dies, TP1/CP128/EP128, dense DP1, GBS1/micro1.
 # Retain all 40 decoder layers and 32 vision blocks, divide parameter widths by 4,
 # and use 128 routed experts for 1,048,576-token image-caption pretraining.
-# Use Host Engram with HyperOps attention, grouped EP, mHC, and routing.
+# Use Host Engram and grouped EP. Select operator backends through the ops mapping.
 # Candidate pools are disabled; fixed expert destinations are for benchmarking.
 # Use BF16 initialization and gradient reduction without FP32 main parameters.
 # Full activation recomputation is enabled; FSDP prefetching is disabled.
@@ -172,7 +172,7 @@ plan_overrides:
       implementation:
         _target_: >-
           hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn
-  # The grouped EP path exposes both expert projections and clamped SwiGLU to HyperOps.
+  # Use ops.grouped_matmul and ops.swiglu to select backends for grouped EP.
   - match: "model.layers.*.mlp.forward"
     replace:
       kind: method

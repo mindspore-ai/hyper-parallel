@@ -254,7 +254,7 @@ class _BaseHyperAutoModelClass:
             *model_args: Positional arguments for model construction.
             verify_hf_weights: Optional report directory for checking all loaded shards
                 against a local HF checkpoint before the first forward. All ranks must opt in.
-            op_selections: Optional HyperOps family selections for this model.
+            op_selections: Optional operator backend selections by family for this model.
             **kwargs: Additional model construction and HF configuration arguments.
 
         Returns:

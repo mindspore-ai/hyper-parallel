@@ -117,7 +117,7 @@ class TestHcclDeterminismSetup(unittest.TestCase):
                         base_module.BaseTrainer._setup(trainer)
 
 
-class TestHyperOpsStepOutput(unittest.TestCase):
+class TestStepOneOperatorBackends(unittest.TestCase):
     """Check the first optimizer-step report across ranks."""
 
     def test_rank_zero_prints_all_backend_triples_at_step_one(self) -> None:
@@ -158,7 +158,7 @@ class TestHyperOpsStepOutput(unittest.TestCase):
         )
 
     def test_nonzero_rank_participates_with_empty_local_usage(self) -> None:
-        """A rank with no HyperOps calls still participates in the step-one collective."""
+        """A rank with no local backend usage still participates in the step-one collective."""
         trainer = base_module.BaseTrainer.__new__(base_module.BaseTrainer)
         trainer.state = SimpleNamespace(global_step=1)
         trainer.op_runtime = None

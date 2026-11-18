@@ -1085,7 +1085,8 @@ def ep_routed_forward(
     ``use_fused_moe_token_permute_and_unpermute`` replaces the generic sort/index-add routing
     with NPU token permute/unpermute. It defaults to enabled on NPU and does
     not require grouped GEMM. CPU/GPU, chunked dispatch and capacity-limited
-    dispatch retain the generic permutation path. None uses HyperOps.
+    dispatch retain the generic permutation path. Set the option to ``None`` to
+    select the backend through ``ops.moe_token_reorder``.
 
     Extended EP group = the ep axis of the derived expert mesh (flatten
     ep_size consecutive ranks: first span the TP group, then extend to

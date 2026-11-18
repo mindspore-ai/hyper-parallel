@@ -751,11 +751,11 @@ class BaseTrainer(Stateful, ABC):
             grad_norm: Gradient norm measured before the optimizer update.
         """
         if self.state.global_step == 1:
-            self._print_hyperops_usage()
+            self._print_step_one_op_backends()
         for callback in self._callbacks:
             callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
-    def _print_hyperops_usage(self) -> None:
+    def _print_step_one_op_backends(self) -> None:
         """Print the first step's operator backends to stderr on global rank zero."""
         runtime = getattr(self, "op_runtime", None)
         local_usage = runtime.used_backends() if isinstance(runtime, OpRuntime) else ()

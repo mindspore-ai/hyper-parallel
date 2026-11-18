@@ -196,7 +196,7 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
                 with self.assertRaisesRegex(NotImplementedError, "candidate-pool"):
                     module.indexer._select_indices(self.query, self.key, self.weights, None, 0, None, None, None)
 
-    def test_hyperops_indexer_falls_back_only_for_auto(self) -> None:
+    def test_indexer_falls_back_only_for_auto(self) -> None:
         """The same incompatible Indexer call uses native in auto and rejects explicit CANN."""
         context = OpBuildContext(SimpleNamespace(type="npu"), None, {})
         selections = {"dsa_indexer": "auto"}
@@ -213,7 +213,7 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "LI V2 requires BF16"), explicit.activate():
             attention.compressed_causal_topk(self.query, self.key, self.weights, **args, use_fused=None)
 
-    def test_hyperops_attention_derives_raw_document_origins(self) -> None:
+    def test_sparse_attention_derives_raw_document_origins(self) -> None:
         """Use the same logical document layout for eager, graph and CANN packing."""
         generator = torch.Generator().manual_seed(23)
         query = torch.randn(1, 1, 4, 512, generator=generator, dtype=torch.bfloat16, requires_grad=True)

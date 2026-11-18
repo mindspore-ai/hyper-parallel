@@ -140,7 +140,7 @@ def test_npu_ep_dispatcher_matches_reference(monkeypatch, token_dtype, enabled):
         order: torch.Tensor,
         probabilities: torch.Tensor,
     ) -> torch.Tensor:
-        """Check the legacy and HyperOps inputs at the fused kernel boundary."""
+        """Check routing weights at the fused kernel boundary for each dispatch mode."""
         if enabled == "auto":
             torch.testing.assert_close(probabilities, topk_weights.to(states.dtype).to(topk_weights.dtype))
             probabilities = probabilities.to(states.dtype)
