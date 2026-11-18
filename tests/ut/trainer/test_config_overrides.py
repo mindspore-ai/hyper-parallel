@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from hyper_parallel.trainer.config import MemoryConfig, ProfilingConfig
+from hyper_parallel.trainer.config.monitor import ExpertMonitorConfig
 from hyper_parallel.trainer.config.parser import parse_training_args
 from hyper_parallel.trainer.config.resolver import ConfigResolutionError
 
@@ -74,15 +75,12 @@ class TestConfigOverrides(unittest.TestCase):
 
     def test_monitor_configuration_has_one_sampling_vocabulary(self) -> None:
         """Feature: Monitor YAML. Description: Typed overrides. Expectation: No duplicate cadence keys."""
-        config = self._parse("--monitor.local_loss.enabled=true", "--monitor.local_loss.sampler_steps=2",
-                             "--monitor.local_grad_norm.enabled=true", "--monitor.mfu=true",
+        config = self._parse("--monitor.local_loss=true", "--monitor.local_grad_norm=true", "--monitor.mfu=true",
                              "--monitor.sinks=[console,jsonl,wandb]", "--monitor.wandb.mode=offline",
                              "--monitor.datasets.top_n_tokens=8", "--monitor.datasets.log_level=warn",
                              "--monitor.check_fsdp_runtime=true")
-        self.assertTrue(config.monitor.local_loss.enabled)
-        self.assertEqual(config.monitor.local_loss.sampler_steps, 2)
-        self.assertTrue(config.monitor.local_grad_norm.enabled)
-        self.assertNotIn("modules", config.to_dict()["monitor"]["local_grad_norm"])
+        self.assertIs(config.monitor.local_loss, True)
+        self.assertIs(config.monitor.local_grad_norm, True)
         self.assertTrue(config.monitor.check_fsdp_runtime)
         self.assertEqual(config.monitor.datasets.log_level, "warn")
         self.assertNotIn("debug", config.to_dict())
@@ -90,15 +88,28 @@ class TestConfigOverrides(unittest.TestCase):
         self.assertTrue(config.monitor.mfu)
         self.assertEqual(config.monitor.wandb.mode, "offline")
         self.assertEqual(config.monitor.datasets.top_n_tokens, 8)
-        self.assertEqual(config.to_dict()["monitor"]["local_loss"]["sampler_steps"], 2)
+        self.assertIs(config.to_dict()["monitor"]["local_loss"], True)
         for override in ("--debug.check_nan_inf=true", "--debug.check_dataset=debug",
                          "--wandb.enabled=true", "--monitor.datasets.log_level=invalid",
                          "--monitor.logging_steps=2", "--monitor.sampler_steps=2",
                          "--monitor.local_loss.every_n_steps=2", "--monitor.moe.include_children=true",
-                         "--monitor.local_grad_norm.modules=[]",
+                         "--monitor.local_loss.enabled=true", "--monitor.local_loss.sampler_steps=2",
+                         "--monitor.local_grad_norm.enabled=true", "--monitor.local_grad_norm.sampler_steps=2",
+                         "--monitor.local_loss={enabled: true}", "--monitor.local_grad_norm.modules=[]",
                          "--monitor.local_grad_norm.modules=[model.layers.0]"):
             with self.subTest(override=override), self.assertRaises(ConfigResolutionError):
                 self._parse(override)
+
+    def test_monitor_moe_layer_selection_configuration(self) -> None:
+        """Layer selection defaults to all and accepts only unique non-negative integer IDs."""
+        self.assertIsNone(self._parse().monitor.moe.layers)
+        config = self._parse("--monitor.moe.layers=[0,5,10]")
+        self.assertEqual(config.to_dict()["monitor"]["moe"]["layers"], [0, 5, 10])
+        for layers in ([], [-1], [1, 1], [True], [1.5], "0,5", ["0"]):
+            with self.subTest(layers=layers), self.assertRaisesRegex(ValueError, "monitor.moe.layers"):
+                ExpertMonitorConfig(layers=layers)
+        with self.assertRaisesRegex(ValueError, "sampler_steps"):
+            ExpertMonitorConfig(sampler_steps=0)
 
     def test_reads_yaml_without_overrides(self) -> None:
         """YAML values survive, and the callable default is filled in."""

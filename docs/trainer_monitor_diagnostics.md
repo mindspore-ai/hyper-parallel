@@ -1,9 +1,9 @@
 # 通用 Trainer 监控指标诊断说明
 
 适用范围：通用 Trainer，不涉及 RL。配套 [监控设计方案](design/trainer_monitoring_plan.md) 和 [使用与实现边界](trainer_monitor_usage.md)。
-本文描述指标的诊断用途；Recorder、异步链路及标准模块 MFU 已接入 `monitor_dev`。
+本文只列当前实现的诊断入口和输出字段，版本与设备验收限制见使用说明。
 当前实现范围与本地/设备验收状态以 [使用与实现边界](trainer_monitor_usage.md) 为准。
-开始诊断前核对运行 revision、实际输出字段和能力报告；设计中的字段缺失不自动判为运行故障。
+开始诊断前核对运行 revision、实际输出字段和能力报告；未启用或不支持的采集项缺失，不自动判为训练故障。
 
 ## 使用前提
 
@@ -11,7 +11,7 @@
 - 区分 input/有效监督 token、local/global、裁剪前/后、规约前/后、逻辑量/物理 padding。不同分母和统计阶段不能直接比较。
 - 全 rank 采集不等于每个 rank 都有所有指标：无 loss 的 PP stage、未持有的 expert/module 应标为不适用。
 - 指标是定位线索，不能单凭一次尖峰判定 bug；先排除输入变化、预热、采样缺失和异步迟到，再关联相邻证据。
-- 正常缺失、unsupported、pending、dropped、incomplete 与数值零严格区分。已有 NaN/Inf、数据合法性等强制检查仍在原训练路径执行。
+- 检查 `unavailable` 原因、`flops_coverage.complete` 和实际丢弃计数；未采样或尚未到达不等于数值零。monitor 不提供独立的通用 NaN/Inf 强制检查。
 
 ## 按现象分块排查
 
@@ -21,6 +21,7 @@
 ### 先确认记录是否可用
 
 查看 `<monitor.output_dir>/<run_id>/rank_<rank>.jsonl`，按记录中的 `step` 对齐，而非文件行顺序。
+控制台的 `training metrics:` 是 rank 0 的逐 step 汇总，可能因异步传输晚到。
 console/W&B 没显示某个 rank 的明细时，先查它的 JSONL。需要复现时，在短窗口内把相关项的
 `sampler_steps` 设为 1；不必同时打开全部监控，也不要把全量采集当作无开销操作。
 
@@ -57,13 +58,18 @@ console/W&B 没显示某个 rank 的明细时，先查它的 JSONL。需要复�
 | `counts.valid_tokens` 突降、`top_tokens` 被特殊 token 占据 | 对照同一步的 `input_lengths`、`supervised_lengths` 与 tokenizer 版本；复现该 batch 并检查 input IDs、shifted labels 和 loss mask。首个渲染模板只帮助确认格式，不能代表异常步样本 |
 | `packing_failures` 非空 | `offset_order/offset_coverage/segment_crosses_row` 先查 `cu_seq_lens` 和行边界；`position_reset` 查隔离策略及 position IDs；`cross_segment_target` 查段尾 shifted label/loss mask。用可疑小 batch 复算监督位置和 loss |
 
+CP 尾部 padding 已发现 `cross_segment_target` 误报，先对照真实样本边界；详见
+[八卡验收复现](trainer_monitor_qwen36_validation.md)。
+
 先看 `counts.packing_checks` 和 `unavailable` 再解释“零失败”；没有检查覆盖不等于通过。
 记录目前以 step 聚合数据统计，不保存异常 micro-batch 的原文或完整 tensor；精确定位样本需要可复现的数据游标或另外保留输入身份。
 
 ### Loss、梯度和优化器异常
 
-按需启用 `local_loss`、`local_grad_norm`；后者每个 rank 汇总一个值，不按 module 拆分。
-先确认模块参与本步且未冻结，避免把无梯度当成梯度消失。
+设置 `monitor.local_loss: true`、`monitor.local_grad_norm: true` 即可启用，采集跟随 `training.logging_steps`；
+后者每个 global rank 汇总一个值，不按 module 拆分。跨 rank 比较时读取各自的 `rank_N.jsonl`，
+按 `step`、`rank` 对齐，micro loss 还需对齐 `micro_step`；控制台和远端 sink 目前仅输出 rank 0。
+先确认参数参与本步且未冻结，避免把无梯度当成梯度消失。
 
 | 看到的现象 | 提示用户可以怎么做 |
 | --- | --- |
@@ -75,6 +81,7 @@ console/W&B 没显示某个 rank 的明细时，先查它的 JSONL。需要复�
 ### EP 负载倾斜
 
 启用 `monitor.moe`；需要定位 expert 时再启用 `record_distribution`。
+已定位疑似层后，可用 `monitor.moe.layers: [0, 5, 10]` 缩小采集范围；全模型排查时省略该字段。
 
 | 看到的现象 | 提示用户可以怎么做 |
 | --- | --- |
@@ -113,54 +120,42 @@ host 阶段可以嵌套，不能相加当作设备时间；host 时间正常也�
 如果只有读取耗时增长，继续查数据源；如果 transform 增长，检查模板/tokenize。
 当前主进程等待计时还不能区分这两种情况。”这是提示格式示例，不是本次运行的实测结论。
 
-## 指标与问题映射
+## 当前字段索引
 
-表中的逻辑指标对应设计语义；尚未固定的字段名不视为已实现 API。实现时须为每个导出字段关联此表中的条目、单位与统计范围。
+排查动作见上面的现象分块。此表用于在 JSONL 中找到对应证据，不列未实现的候选指标。
+事件公共身份为 `run_id/rank/step`；有 micro、module、call 时再按相应字段对齐。
 
-| 指标 / 统计项 | 可以观察或定位的问题 | 需要联查的证据与边界 |
-| --- | --- | --- |
-| total loss / foundation loss | 收敛异常、突升、数值非有限、目标组成变化 | lr、有效监督量、local loss、输入身份；两者不一定相等，先确认 auxiliary/MTP 的组成 |
-| local step loss | 单 rank 数据异常、归一化或并行切分差异 | 对齐输入与有效分母；不同 rank 处理不同样本时差异正常，不能直接判定并行错误 |
-| micro-batch loss | 某个 micro-batch 脏数据、梯度累积权重异常 | token 分布、packing 边界、micro-step ID；不能直接对不等长 micro loss 取均值替代整步 loss |
-| router auxiliary loss | 路由均衡目标变化、辅助项尺度异常 | expert load/max_vio、辅助项系数与注入方式；该标量不直接说明 expert 物理负载，也可能仅供日志展示 |
-| global pre-clip grad norm | 梯度爆炸、更新尺度异常、裁剪频繁 | loss、lr、裁剪阈值、并行聚合范围；确认实现是否包含所有 PP stage/专家 |
-| local grad norm（每 rank 一个） | rank 本地梯度整体异常、梯度范数尖峰 | 参数是否冻结/参与本步、FSDP shard 大小与所有权；规约后本地分片不能冒充通信前梯度，不要求不同分片 norm 相等 |
-| post-clip norm（可用时） | 裁剪是否符合预期 | pre-clip norm、阈值和共享参数去重；区分实际测量与由裁剪系数推算 |
-| lr | warmup、调度器步数或 resume 恢复错误 | optimizer step、参数组、scheduler state；单个最大 lr 不代表所有组 |
-| step samples / consumed samples | 数据重复消费、漏计、续训计数断裂 | dataloader 游标、输入 hash；packed 行数与原始样本数分开，预取未训练数据不算消费 |
-| input tokens / consumed input tokens | 输入计算规模变化、吞吐分母错误 | mask、CP 切分及副本去重；prompt 即使不监督也参与计算 |
-| valid tokens / consumed valid tokens | 监督稀疏、全 ignored batch、label shift 计数错误 | 实际 loss 分母和 loss_mask；不拿 input tokens 替代监督量 |
-| padding / ignored 比例 | padding 浪费、模板/mask 异常、训练目标被意外屏蔽 | 明确各自分母；padding 与 ignored 有重叠，不是天然互斥类别 |
-| input/valid 长度 min/max/mean、P50/P90/P99、直方图 | 长尾 batch、数据截断、不同 rank 输入量偏斜 | packed 行与原始 segment 分开；近似分位数须标注，max 增大不必然是数据故障 |
-| token Top-N（ID/count/比例） | 重复文本、异常特殊 token、模板污染、tokenizer 不匹配 | 样本和 tokenizer 版本；padding 按 mask 排除，pad/eos 同 ID 时不能按 ID 全删；高频 token 本身不代表错误 |
-| token 重复度（可用时） | 数据重复或生成式模板退化 | 明确定义是重复 token 比例还是样本重复；Top-N 不能替代样本去重证据 |
-| packed 行数、原始样本数、每行 segment 数 | 拼接策略失效、原始样本计数错误 | packing metadata 与 dataloader；metadata 缺失不能估算成确定样本数 |
-| segment 长度分布、填充率 | packing 效率低、长样本主导、槽位浪费 | 最大序列长度和实际 attention 策略；利用率高不代表边界正确 |
-| 截断样本数 / 丢弃 token 数 | 截断过量、监督尾部丢失 | 原始长度与截断策略；只在有可靠 metadata 时输出 |
-| packing 边界检查失败数 / 检查覆盖数 | offsets 越界/重叠、position 错位、跨段监督泄漏 | 按允许拼接或隔离策略检查；metadata 检查通过不能证明 attention kernel 正确，采样通过不代表每 batch 全覆盖 |
-| 首步渲染模板 | 角色标记、特殊 token、格式或输入文本错误 | 对照实际 input IDs/labels；global rank 0 的首个限长样本不代表全数据集 |
-| expert assignment 数 / 完整分布 | 路由热点、expert 长期闲置、不同层失衡 | top-k、层、expert 全局 ID、统计范围；同一个 token 可产生多个 assignment |
-| expert load max / mean | 最繁忙 expert 与平均负载差距 | 有效接收量与路由分配量分别解释；不等同设备利用率或显存占用 |
-| max_vio / 跨层 max_vio 最大值 | 最严重的路由负载不均衡及所在层 | `max/mean - 1`，空负载单独标记；先逐层算再汇总，不能混合各层 expert 计数 |
-| 空 expert 数 | expert 利用不足或路由塌缩线索 | 小 batch 下自然可能为空；结合长期分布，不能凭单步判断塌缩 |
-| dropped assignment 数 / 比例 | 路由容量限制、token 分配被截断 | capacity、分配/接收总数及 drop 实现；无 drop 统计能力不等于 drop=0 |
-| 物理 padding 槽位 / 有效 assignment | expert kernel 填充开销、逻辑负载与实际工作量差距 | dispatch 策略和计数口径；不能用 padding 槽位替代有效负载 |
-| Muon NS 输出 norm、可选输入 norm / 相对变化 | NS 数值异常、更新方向尺度异常 | 输入尺度、迭代次数、矩阵形状和 optimizer 类型；无通用固定健康阈值，非 Muon 不适用 |
-| 组网耗时 | rendezvous、进程组/DeviceMesh 初始化阻塞 | 各 rank 阶段边界和运行日志；host 耗时不能直接定位网络设备故障 |
-| 模型构建 / 并行包装耗时 | 初始化、模块替换或包装变慢 | 模型大小、初始化方式和各子阶段；避免嵌套阶段重复相加 |
-| 预训练权重加载 / resume 恢复耗时 | 存储读取、转换或状态恢复变慢 | 文件大小、缓存命中和恢复组件；加载与完整续训恢复不是同一范围 |
-| 数据集初始化 / tokenizer / map 耗时 | 数据准备成为启动瓶颈 | worker、缓存、样本量；与训练时等待 batch 分开 |
-| batch_fetch / preprocess / collate 耗时 | 数据供应不足、CPU 预处理或组 batch 瓶颈 | 主进程等待与 worker 执行时间分别看；不能由等待时间推断 tokenize 耗时 |
-| H2D host 耗时 | 拷贝提交/阻塞变化、数据准备问题 | pinned memory、设备流和数据大小；异步提交耗时不是传输执行时长 |
-| forward/backward host 耗时 | 训练阶段变慢、序列/并行策略变化 | 输入几何、通信和 profiler；host 时间不能直接等同 kernel 时间 |
-| grad clip / optimizer / scheduler host 耗时 | norm 通信、参数更新或调度开销变化 | 参数量、DTensor 布局和优化器种类；计时本身不加设备全同步 |
-| 权重保存 / 完整 ckpt 保存、submit / complete | 保存暂停、后台 I/O 堆积、保存未完成 | checkpoint ID、写入量和完成状态；submit 返回不是落盘完成 |
-| step_time / input tokens/s / valid tokens/s | 训练吞吐下降或监督效率变化 | 序列分布、阶段耗时、预热和采样；保持分母与时间窗口一致 |
-| 既有 memory/device_max_allocated_gb、reserved_gb | 峰值压力、监控引入额外显存的线索 | 原有运行累计峰值不会随释放下降；reserved 高不等于泄漏，本方案不改既有显存采集 |
-| 标准模块 FLOPs 分项 / coverage | 公式漏项、重复计数、模型组成变化 | 唯一块所有权、真实调用数、GDN 等特殊块；不完整覆盖不能报完整模型 MFU |
-| TFLOP/s/device / MFU | 同口径下的计算吞吐下降、模型计算量与耗时不匹配 | 峰值 SKU/dtype、输入几何、全局设备数、公式版本；MFU 是估算，不等同硬件 profiler 利用率 |
-| recorder pending/dropped/incomplete / 队列峰值 | 采集背压、异步迟到或退出丢失 | 原采样 step 与完成事件；这些是采集健康度，不是训练数值错误 |
-| hook 调用次数 / CPU 耗时 / graph break（验收证据） | 监控回调过密、重计算重复记录、编译退化 | 无 hook/空 hook/同步/异步 A/B；不以 CUDA/NPU kernel 时间代替 Python 回调开销 |
+| JSONL 位置 | 含义与诊断用途 |
+| --- | --- |
+| `train_step.metrics.training/*` | 当前训练目标的 loss、lr、裁剪开启时的全局 grad norm；用于关联收敛、调度和裁剪异常，loss 名称取决于模型目标 |
+| `local_micro_loss.values` | `[原始 loss 均值, 有效 token 数]`，按 `name/micro_step` 定位异常 micro |
+| `local_step_loss.loss/tokens` | 当前 rank 按 token 加权的 step loss；用于复算累积权重 |
+| `local_grad_norm.metrics.training/grad_norm_local_post_reduce_pre_clip` | 每 rank 一个规约后、裁剪前 L2；用于观察本地梯度整体变化，不按 module 拆分 |
+| `ns_norm.values/matrix_owners/call` | Muon NS 后、缩放前矩阵范数及参数归属；`metrics.optimizer/ns_norm_mean/max/min` 是本次调用内汇总 |
+| `train_step.metrics.data/step_tokens`、`data/consumed_tokens` | 当前步和累计有效监督 token 数；用于检查监督量与续训计数 |
+| `train_step.metrics.data/step_samples`、`data/consumed_samples` | 当前步与累计训练样本计数；packed 行不能直接解释成原始 document 数 |
+| `train_step.metrics.data/step_input_tokens` | 当前步输入计算规模；与有效监督 token 分开解释 |
+| `datasets.counts` | 本采样步源 batch 的 rows、slots、input/valid tokens、target_slots、segments、packing_checks/failures 等；计数不跨 rank 聚合 |
+| `datasets.input_lengths/supervised_lengths/segment_lengths` | min/max/mean、P50/P90/P99 和精确直方图；用于识别长度变化与长尾 |
+| `datasets.top_tokens` | token ID/count/fraction；用于识别特殊 token 或重复模式，不能证明样本重复 |
+| `datasets.padding_fraction/segments_per_row` | 有 padding mask 时的填充比例及平均每行 segment 数；无元数据不能推断利用率 |
+| `datasets.packing_failures/unavailable` | 有界失败原因列表与缺失证据；完整失败次数看 `counts.packing_failures`，零失败须联查检查覆盖 |
+| `expert_load_local.values`、`expert_load.counts` | 启用 `record_distribution` 后的本地/聚合 expert assignment 分布；按 module 定位热点 |
+| `expert_load.summary` | max、mean、max_vio、empty_expert_fraction、attempted/accepted/dropped_assignments；用于观察路由倾斜和容量丢弃 |
+| `expert_load_summary.metrics.moe/max_vio` | 当前 PP stage 选中且实际观测到的层的最大 max_vio；不能解释成全模型跨 stage 汇总 |
+| `timing.phase/duration_seconds/outcome` | 启动、保存和恢复等已结束阶段的主机墙钟事件；不表示正在阻塞的阶段 |
+| `train_step.metrics.timing/host/*` | step 内阶段主机耗时；数据等待、前后向、梯度准备/裁剪、optimizer、scheduler，不能替代设备 profiler |
+| `train_step.metrics.performance/step_time`、`tokens_per_second`、`input_tokens_per_second` | step 时间、有效监督吞吐、输入吞吐；用于区分工作量变化与执行变慢 |
+| `train_step.metrics.memory/device_max_allocated_gb`、`memory/device_max_reserved_gb` | 既有累计显存峰值；不直接表示当前占用或持续增长 |
+| `flops_coverage.complete/blocks/missing_blocks/formula/peak` | 标准块覆盖、逐块 FLOPs 与估算口径；字段随是否完整而变化 |
+| `train_step.metrics.performance/tflops_per_device`、`mfu_percent`、`mfu_window_percent`、`mfu_status` | 相应开关启用时的计算吞吐/MFU 或缺峰值状态；未覆盖完整模型时不输出部分模型值 |
+| `unavailable.metric/reason` | 未支持或缺少观察点的原因；同原因可能只记录一次，要搜索整个 run |
+| `train_step.metrics.monitor/dropped_summaries`、`monitor_closed.dropped_summaries/dropped_remote_records` | 摘要/远端队列丢弃计数；用于排查采集背压，不是训练数值错误 |
+
+`log_first_rendered_template` 输出到模板 logger，不是 JSONL 指标；FSDP 顺序检查通过原有 runtime 检查报错。
+当前不采集 post-clip norm、token 重复度、截断/丢弃 token 数、物理 dispatch padding 槽位、
+NS 输入 norm/相对变化或队列峰值；worker transform/collate 也没有独立计时。
+需要这些证据时单独复现或使用相应 profiler，不按“应有字段缺失”判断 monitor 故障。
 
 ## 文档与验证约定
 

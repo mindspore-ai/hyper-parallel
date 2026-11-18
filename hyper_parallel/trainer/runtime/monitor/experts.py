@@ -21,7 +21,7 @@ import torch.distributed as dist
 
 
 class ExpertLoadRecorder:
-    """Register all local layers once; collective participation never depends on routing."""
+    """Register selected local layers once; collective participation never depends on routing."""
 
     def __init__(self, max_elements: int = 65536) -> None:
         """Initialize a stable layer registry and empty per-step accumulator."""

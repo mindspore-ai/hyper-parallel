@@ -14,6 +14,7 @@
 # ============================================================================
 """CPU contract tests for monitor ownership, arithmetic, lifecycle and output."""
 
+from collections.abc import Callable
 from concurrent.futures import Future
 from contextlib import ExitStack
 import json
@@ -33,6 +34,7 @@ from hyper_parallel.core.optimizer.muon import Muon
 from hyper_parallel.distributed.expert_parallel import experts as ep_experts
 from hyper_parallel.trainer.callbacks.checkpoint_callback import CheckpointerCallback
 from hyper_parallel.trainer.callbacks.environ_meter_callback import EnvironMeterCallback
+from hyper_parallel.trainer.callbacks.logging_callback import LoggingCallback
 from hyper_parallel.trainer.config.monitor import MonitorConfig, SamplingConfig
 from hyper_parallel.trainer.runtime.monitor.datasets import DatasetStatsRecorder
 from hyper_parallel.trainer.runtime.monitor.flops import BlockFlopsEstimator, DevicePeak, FlopsBlock, transformer_blocks
@@ -72,9 +74,171 @@ class TestMonitorSession(unittest.TestCase):
         path = self.session.writer.directory / "rank_0.jsonl"
         return [json.loads(line) for line in path.read_text().splitlines()]
 
+    def test_console_combines_all_diagnostics_after_progress(self) -> None:
+        """Feature: Step summary. Description: Multiple recorders. Expectation: One diagnostic line."""
+        self.config.sinks.append("console")
+        self.trainer.config.training.logging_steps = 1
+        self.trainer.train_iters = 20
+        self.trainer.step_env_metrics = {"training/total_loss": 2.5}
+        self.config.local_loss = True
+        self.config.local_grad_norm = True
+        self.config.moe.enabled = True
+        self.config.moe.sampler_steps = 1
+        self.config.datasets.sampler_steps = 1
+        self.config.optimizer.ns_norm = SamplingConfig(True, 1)
+        self.session.expert_recorder.register("<root>", 2, "cpu")
+        callback = LoggingCallback(self.trainer)
+        with self.assertLogs("hyper_parallel.trainer", level="INFO") as logs:
+            self.session.begin_step(3)
+            self.session.record_loss(torch.tensor(2.0), {"foundation_tokens": torch.tensor(1)})
+            self.session.record_loss(torch.tensor(4.0), {"foundation_tokens": torch.tensor(3)})
+            self.model[0].weight.grad = torch.ones_like(self.model[0].weight)
+            self.session.record_gradients()
+            self.session.record_component("expert_load", self.model, {"counts": torch.tensor([3.0, 1.0])})
+            self.session.record_component("dataset", None, {"batch": {
+                "input_ids": torch.tensor([[1, 2, 3]]), "labels": torch.tensor([[1, 2, 3]]),
+            }})
+            for scale in (1, 2):
+                self.session.record_component("ns_norm", None, {"values": torch.ones(2, 2, 2) * scale})
+            self.session.end_step()
+            state = TrainerState(global_step=3)
+            callback.on_step_end(state, loss=2.5, loss_dict={}, grad_norm=1.0)
+            callback.on_step_end(state, loss=2.5, loss_dict={}, grad_norm=1.0)
+        self.assertEqual(len(logs.records), 2)
+        self.assertTrue(logs.records[0].getMessage().startswith("Training:"))
+        message = logs.records[1].getMessage()
+        self.assertTrue(message.startswith("training metrics: step=3 rank=0 "))
+        for field in ("training/local_foundation_loss=3.5", "training/grad_norm_local_post_reduce_pre_clip=2.44949",
+                      "moe/<root>/max_vio=0.5", "data/local/valid_tokens=2",
+                      "optimizer/ns_norm_mean/call_0=2", "optimizer/ns_norm_mean/call_1=4"):
+            self.assertIn(field, message)
+        for detail in ("\n", "\r", "top_tokens", "histogram", "micro_step", "training/total_loss"):
+            self.assertNotIn(detail, message)
+        self.assertFalse(self.session.console_steps)
+        self.assertEqual(sum(record["event"] == "local_micro_loss" for record in self.records()), 2)
+        self.assertEqual(sum(record["event"] == "train_step" for record in self.records()), 1)
+
+    def test_console_waits_for_late_summaries_and_drains_at_close(self) -> None:
+        """Feature: Async summary. Description: Late copies across steps. Expectation: Original step once."""
+        self.config.sinks.append("console")
+        self.trainer.config.training.logging_steps = 1
+        self.config.local_loss = True
+        event = Mock()
+        event.query.return_value = False
+
+        def defer(values: torch.Tensor, consume: Callable[[list], None]) -> bool:
+            """Keep a copied summary pending until the simulated completion event is ready."""
+            snapshot = values.detach().clone()
+            self.session.transfer.pending.append((event, snapshot, snapshot, consume))
+            return True
+
+        with (
+            patch.object(self.session.transfer, "submit", side_effect=defer),
+            patch("hyper_parallel.trainer.runtime.monitor.session.logger.info") as log,
+        ):
+            for step in (1, 2):
+                self.session.begin_step(step)
+                self.session.record_loss(torch.tensor(float(step)), {"foundation_tokens": torch.tensor(2)})
+                self.session.end_step()
+                self.session.log_step(TrainerState(global_step=step), {})
+            log.assert_not_called()
+            event.synchronize.assert_not_called()
+            # Deliver only the two submissions (micro + step) belonging to step one.
+            event.query.side_effect = [True, True, False]
+            self.session.transfer.poll()
+            log.assert_called_once()
+            self.assertIn("step=1 rank=0 training/local_foundation_loss=1", log.call_args.args[1])
+            self.assertEqual(set(self.session.console_steps), {2})
+            self.session.close()
+            self.session.close()
+            self.assertEqual(log.call_count, 2)
+            self.assertIn("step=2 rank=0 training/local_foundation_loss=2", log.call_args.args[1])
+        self.assertFalse(self.session.console_steps)
+
+    def test_console_summary_obeys_rank_sink_and_external_cadence(self) -> None:
+        """Feature: Console gating. Description: Rank/sink/cadence. Expectation: No extra lines or buffers."""
+        self.config.local_loss = True
+        cases = ((False, 0, 1, 1), (True, 1, 1, 1), (True, 0, 0, 1), (True, 0, 2, 1), (True, 0, 2, 2))
+        for console, rank, cadence, step in cases:
+            with self.subTest(console=console, rank=rank, cadence=cadence, step=step):
+                self.config.sinks = ["jsonl", "console"] if console else ["jsonl"]
+                self.session.rank = rank
+                self.session.writer.rank = rank
+                self.trainer.config.training.logging_steps = cadence
+                with patch("hyper_parallel.trainer.runtime.monitor.session.logger.info") as log:
+                    self.session.begin_step(step)
+                    self.session.record_loss(torch.tensor(2.0), {"foundation_tokens": torch.tensor(1)})
+                    self.session.end_step()
+                    self.session.log_step(TrainerState(global_step=step), {})
+                self.assertEqual(log.call_count, int(console and rank == 0 and cadence > 0 and step % cadence == 0))
+                self.assertFalse(self.session.console_steps)
+
+    def test_local_metrics_keep_global_rank_and_step_identity(self) -> None:
+        """Ranks sharing local rank zero keep distinct JSONL records and one rank-zero console line."""
+        self.config.local_loss = True
+        self.config.local_grad_norm = True
+        self.config.sinks.append("console")
+        self.trainer.config.training.logging_steps = 2
+        with patch("hyper_parallel.trainer.runtime.monitor.session.logger.info") as log:
+            for rank in (0, 8):
+                trainer = SimpleNamespace(**vars(self.trainer))
+                trainer.global_rank, trainer.local_rank = rank, 0
+                session = MonitorSession(trainer)
+                self.addCleanup(session.close)
+                session.initialize()
+                session.run_id = "rank-identity"
+                session.bind_model()
+                session.start_output()
+                for step in (1, 2):
+                    session.begin_step(step)
+                    session.record_loss(torch.tensor(float(rank + 2)), {"foundation_tokens": torch.tensor(3)})
+                    self.model[0].weight.grad = torch.full_like(self.model[0].weight, rank + 1)
+                    session.record_gradients()
+                    session.end_step()
+                    if step == 2:
+                        session.log_step(TrainerState(global_step=step), {})
+                session.close()
+                path = session.writer.directory / f"rank_{rank}.jsonl"
+                records = [json.loads(line) for line in path.read_text().splitlines()]
+                local = [record for record in records
+                         if record["event"] in ("local_micro_loss", "local_step_loss", "local_grad_norm")]
+                self.assertEqual(len(local), 3)
+                self.assertTrue(all(record["rank"] == rank and record["step"] == 2 for record in local))
+                self.assertEqual(local[0]["micro_step"], 0)
+                loss = next(record for record in local if record["event"] == "local_step_loss")
+                self.assertEqual(loss["loss"], rank + 2)
+                self.assertEqual(OutputWriter._scalars(loss),
+                                 {f"training/local_foundation_loss/rank_{rank}/all": rank + 2})
+            log.assert_called_once()
+            self.assertIn("step=2 rank=0", log.call_args.args[1])
+            self.assertIn("training/local_foundation_loss=2", log.call_args.args[1])
+            self.assertIn("training/grad_norm_local_post_reduce_pre_clip=", log.call_args.args[1])
+
+    def test_console_reports_dropped_summaries_without_reusing_values(self) -> None:
+        """Feature: Backpressure. Description: Rejected copy then disabled recorder. Expectation: No stale value."""
+        self.config.sinks.append("console")
+        self.trainer.config.training.logging_steps = 1
+        self.config.local_grad_norm = True
+        self.model[0].weight.grad = torch.ones_like(self.model[0].weight)
+        with (
+            patch.object(self.session.transfer, "submit", return_value=False),
+            patch("hyper_parallel.trainer.runtime.monitor.session.logger.info") as log,
+        ):
+            for step in (2, 3):
+                self.config.local_grad_norm = step == 2
+                self.session.begin_step(step)
+                self.session.record_gradients()
+                self.session.end_step()
+                self.session.log_step(TrainerState(global_step=step), {})
+            self.assertEqual(log.call_count, 2)
+            self.assertIn("monitor/dropped_summaries=1", log.call_args_list[0].args[1])
+            self.assertEqual(log.call_args_list[1].args[1], "step=3 rank=0 status=no_collected_metrics")
+            self.assertFalse(self.session.console_steps)
+
     def test_loss_weighting_cadence_and_gradient_invariance(self) -> None:
         """Feature: Loss sampling. Description: Unequal micro lengths. Expectation: Token-weighted mean."""
-        self.config.local_loss = SamplingConfig(True, 2)
+        self.config.local_loss = True
+        self.trainer.config.training.logging_steps = 2
         for step in (1, 2):
             self.session.begin_step(step)
             for value, count in ((2.0, 2), (5.0, 1)):
@@ -92,7 +256,7 @@ class TestMonitorSession(unittest.TestCase):
 
     def test_gradient_main_grad_across_modules(self) -> None:
         """Feature: Local norm. Description: Prefer main_grad. Expectation: No mutation or collective."""
-        self.config.local_grad_norm = SamplingConfig(True, 1)
+        self.config.local_grad_norm = True
         self.model.append(torch.nn.Linear(2, 2, bias=False))
         self.session.bind_model()
         parameter = self.model[0].weight
@@ -133,9 +297,56 @@ class TestMonitorSession(unittest.TestCase):
         self.assertEqual(self.session.expert_recorder.counts, {})
         self.assertFalse(any(record["event"].startswith("expert_load") for record in self.records()))
 
+    def test_moe_layers_filter_counters_collectives_and_outputs(self) -> None:
+        """Selected global layer IDs bound buffers, collective payloads and summary scope."""
+        layers = torch.nn.ModuleDict({str(index): torch.nn.Linear(2, 2) for index in (0, 5, 10, 17)})
+        self.trainer.model = torch.nn.ModuleDict({"model": torch.nn.ModuleDict({"layers": layers})})
+        for module in layers.values():
+            module.monitor_expert_count = 2
+        self.config.moe = replace(self.config.moe, enabled=True, sampler_steps=1, record_distribution=True)
+        self.session.bind_model()
+        self.assertEqual(len(self.session.expert_recorder.specs), 4)
+        self.config.moe = replace(self.config.moe, layers=[10, 5])
+        self.session.bind_model()
+        self.session.begin_step(1)
+        expected = ["model.layers.10", "model.layers.5"]
+        self.assertEqual(list(self.session.expert_recorder.counts), expected)
+        self.session.record_component("expert_load", layers["5"], {"counts": torch.tensor([3, 1])})
+        self.session.record_component(
+            "expert_routes", layers["10"], {"indices": torch.tensor([0, 1]), "attempted": 2}
+        )
+        # Excluded layers must return before inspecting or allocating from source tensors.
+        self.session.record_component("expert_load", layers["0"], {"counts": Mock()})
+        self.session.record_component("expert_routes", layers["17"], {"indices": Mock(), "attempted": 8})
+        self.trainer.mesh = SimpleNamespace(dp_cp_mesh=Mock())
+        with patch("hyper_parallel.trainer.runtime.monitor.experts.dist") as distributed:
+            self.session.end_step()
+        distributed.all_reduce.assert_called_once()
+        self.assertEqual(distributed.all_reduce.call_args.args[0].numel(), 8)
+        records = self.records()
+        for event in ("expert_load", "expert_load_local"):
+            self.assertEqual([record["module"] for record in records if record["event"] == event], expected)
+        summary = next(record for record in records if record["event"] == "expert_load_summary")
+        self.assertEqual(summary["metrics"]["moe/max_vio"], 0.5)
+
+    def test_moe_layers_without_local_match_report_unavailable(self) -> None:
+        """A stage without selected layers has no buffers or collective and explains missing data."""
+        self.model[0].monitor_expert_count = 2
+        self.config.moe = replace(self.config.moe, enabled=True, sampler_steps=1, layers=[5])
+        self.session.bind_model()
+        self.session.begin_step(1)
+        with patch("hyper_parallel.trainer.runtime.monitor.experts.dist.all_reduce") as collective:
+            self.session.end_step()
+        collective.assert_not_called()
+        self.assertEqual(self.session.expert_recorder.specs, {})
+        reasons = [record["reason"] for record in self.records()
+                   if record.get("metric") == "expert_layer_selection"]
+        self.assertTrue(any("cannot resolve layer index" in reason for reason in reasons))
+        self.assertTrue(any("no selected instrumented" in reason for reason in reasons))
+
     def test_mtp_local_loss_uses_foundation_token_counts(self) -> None:
         """Foundation and MTP micro losses share the trainer's token family and step weighting."""
-        self.config.local_loss = SamplingConfig(True, 1)
+        self.config.local_loss = True
         self.session.begin_step(1)
         for foundation, mtp, count in ((2.0, 3.0, 2), (5.0, 9.0, 1)):
             self.session.record_loss(

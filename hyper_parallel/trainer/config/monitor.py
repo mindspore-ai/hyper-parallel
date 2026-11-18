@@ -14,6 +14,8 @@
 # ============================================================================
 """Optional Trainer monitoring, independent of the external logging cadence."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -35,6 +37,17 @@ class ExpertMonitorConfig(SamplingConfig):
     """Collect routing assignments without altering expert-bias updates."""
 
     record_distribution: bool = False
+    layers: list[int] | None = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.layers is not None and (
+            not isinstance(self.layers, list)
+            or not self.layers
+            or any(not isinstance(index, int) or isinstance(index, bool) or index < 0 for index in self.layers)
+            or len(set(self.layers)) != len(self.layers)
+        ):
+            raise ValueError("monitor.moe.layers must be null or a non-empty list of unique non-negative integers")
 
 
 @dataclass
@@ -89,8 +102,8 @@ class MonitorConfig:
     check_fsdp_runtime: bool = False
     mfu: bool = False
     wandb: MonitorWandbConfig = field(default_factory=MonitorWandbConfig)
-    local_loss: SamplingConfig = field(default_factory=SamplingConfig)
-    local_grad_norm: SamplingConfig = field(default_factory=SamplingConfig)
+    local_loss: bool = False
+    local_grad_norm: bool = False
     moe: ExpertMonitorConfig = field(default_factory=ExpertMonitorConfig)
     optimizer: OptimizerMonitorConfig = field(default_factory=OptimizerMonitorConfig)
     datasets: DatasetMonitorConfig = field(default_factory=DatasetMonitorConfig)

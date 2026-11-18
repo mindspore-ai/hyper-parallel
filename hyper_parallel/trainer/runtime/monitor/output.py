@@ -72,7 +72,8 @@ class OutputWriter:
         if self.file is not None:
             self.file.write(payload + "\n")
             self.file.flush()
-        if self.rank == 0 and "console" in self.config.sinks and record.get("event") in ("train_step", "timing"):
+        # LoggingCallback owns the combined progress/metrics console line.
+        if self.rank == 0 and "console" in self.config.sinks and record.get("event") == "timing":
             logger.info("%s", payload)
         if self.worker is not None:
             try:

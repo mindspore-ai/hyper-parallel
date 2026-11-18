@@ -111,8 +111,8 @@ class TestMonitorTraining(unittest.TestCase):
         torch.manual_seed(123)
         config = MonitorConfig(enabled=enabled, sinks=["jsonl"], output_dir=directory)
         config.mfu = mfu
-        config.local_loss = SamplingConfig(True, 1)
-        config.local_grad_norm = replace(config.local_grad_norm, enabled=True, sampler_steps=1)
+        config.local_loss = True
+        config.local_grad_norm = True
         config.moe = replace(config.moe, enabled=True, sampler_steps=1, record_distribution=True)
         config.datasets = replace(config.datasets, sampler_steps=1)
         base = BaseTrainer.__new__(BaseTrainer)
@@ -236,22 +236,20 @@ class TestMonitorTraining(unittest.TestCase):
               card_mark="dryrun", essential_mark="essential")
     def test_hybrid_sampling_and_disabled_data_fields(self) -> None:
         """Feature: Monitor sampling.
-        Description: Configure independent cadences for whole-rank gradient monitoring.
+        Description: Local loss/norm follow logging cadence while dataset sampling remains independent.
         Expectation: Exact sampled steps, one norm per rank and disabled-field absence.
         """
         def configure(base: BaseTrainer) -> None:
             """Select sampling cadences and disable optional dataset fields."""
             config = base.config.monitor
             config.timing = False
-            config.local_loss = SamplingConfig(True, 2)
-            config.local_grad_norm = replace(config.local_grad_norm, sampler_steps=3)
             config.datasets = replace(config.datasets, sampler_steps=5, token_distribution=False,
                                       top_n_tokens=0, packing_stats=False, packing_boundary_check=False)
 
         with tempfile.TemporaryDirectory() as directory:
             _, records = self._run(directory, True, 4, tiny_hybrid_moe, configure=configure)
-        expected = {"train_step": range(4, 21, 4), "local_step_loss": range(2, 21, 2),
-                    "local_grad_norm": range(3, 21, 3), "datasets": range(5, 21, 5)}
+        expected = {"train_step": range(4, 21, 4), "local_step_loss": range(4, 21, 4),
+                    "local_grad_norm": range(4, 21, 4), "datasets": range(5, 21, 5)}
         for event, steps in expected.items():
             with self.subTest(event=event):
                 self.assertEqual([r["step"] for r in records if r["event"] == event], list(steps))

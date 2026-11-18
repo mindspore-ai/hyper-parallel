@@ -1,51 +1,64 @@
 # 通用 Trainer monitor 使用与实现边界
 
 对应 [设计方案](design/trainer_monitoring_plan.md) 和 [指标诊断说明](trainer_monitor_diagnostics.md)。
-配置已接入 `monitor_dev` 的通用 Base/Text/VLM Trainer；设备显存采集逻辑保持原样。
+适用范围：`monitor_dev` 的通用 Base/Text/VLM Trainer；版本化测试结果见文末。
 本文区分已接入的路径与仍需设备验收的范围，不把 CPU 测试当作多卡性能验收。
 
 ## 配置和输出
 
-将以下段落放入原训练 YAML。省略的字段使用设计文档中的默认值。
-日志输出间隔继续由外部 `training.logging_steps` 控制；下面的间隔只控制采集。
+完整默认 YAML 维护在 [设计方案](design/trainer_monitoring_plan.md#yaml)，实际字段定义见
+[MonitorConfig](../hyper_parallel/trainer/config/monitor.py)。以下是排查 loss/梯度的配置示例，两项采集频次跟随外部 `training.logging_steps`：
 
 ```yaml
 monitor:
-  enabled: true
-  sinks: [console, jsonl]
-  output_dir: ./outputs/metrics
-  timing: true
-  check_fsdp_runtime: false
-  mfu: false
-  local_loss:
-    enabled: true
-    sampler_steps: 100
-  local_grad_norm:
-    enabled: true
-    sampler_steps: 100
-  moe:
-    enabled: true
-    sampler_steps: 100
-    record_distribution: false
-  optimizer:
-    ns_norm:
-      enabled: false
-      sampler_steps: 100
-  datasets:
-    sampler_steps: 100
-    token_distribution: true
-    top_n_tokens: 20
-    packing_stats: true
-    packing_boundary_check: true
-    log_first_rendered_template: false
-    log_level: null  # debug / info / warn；null 跟随全局日志级别
+  local_loss: true
+  local_grad_norm: true
 ```
 
-20-step 验收时将需要观察的 `sampler_steps` 设为 1。
-不配置 `monitor.logging_steps`、顶层 `monitor.sampler_steps`、`ranks`、`include_children` 或 local loss module。
-关闭 `monitor.enabled` 后仍保留原来的基础训练日志，不注册新的采集 hook。
+未指定项使用默认值；按需添加 `moe`、`datasets`、`optimizer.ns_norm` 或 `mfu`。
+基础日志频次由 `training.logging_steps` 控制，local loss/norm 使用同一频次；其他项目的 `sampler_steps` 只控制采集。
+关闭 `monitor.enabled` 后仍保留基础训练日志。
 
-- 全局 rank 0 输出一条规范 `train_step`；TqdmCallback、刷新条和拼接逻辑已删除。
+EP 按层采集只需增加 `layers`：
+
+```yaml
+monitor:
+  moe:
+    enabled: true
+    sampler_steps: 1
+    layers: [0, 5, 10]
+```
+
+层号从 0 开始，表示模型层号，不是第几个 MoE 层；省略或 `null` 表示全部层。
+`layers` 必须是非空、无重复的非负整数列表。按模块路径中的 `layers.N`、`blocks.N` 或 `h.N`
+匹配；Qwen3.6 对应 `model.layers.N.mlp`，PP 切分后应保留原始层号，不按本 rank 重新编号。
+无法解析层号或本 rank 没有选中的已接入 MoE 层时，输出 `expert_layer_selection` 不可用原因。
+筛选在模型绑定时完成，未选中层不分配 monitor 计数向量、不做 monitor 的 scatter 计数，
+也不进入摘要规约、D2H 或任何 sink；原有路由和 EP 训练通信照常运行。
+`moe/max_vio` 只汇总选中层，排查全模型负载倾斜时应省略 `layers`。
+
+- 全局 rank 0 的 LoggingCallback 输出一行 `Training: 百分比|进度条| 当前步/总步数 | step=... 指标...`。
+  tqdm 仅用于进度格式化，不带指标摘要、不独立刷新；终端与重定向输出相同，频次沿用 `training.logging_steps`。
+- monitor 开启时，控制台是否输出由 `sinks` 中的 `console` 控制；关闭 monitor 时沿用基础控制台日志。
+- JSONL 的 `train_step` 和远端指标不含进度条文本；未安装 tqdm 或无总步数时仍正常输出纯指标行。
+- 开启 console 后，monitor 额外输出 `training metrics: step=... rank=0 ...`，每个命中
+  `training.logging_steps` 的 step 恰好一行。内容为该步采样到的 local loss/norm、逐层 EP 标量、
+  datasets 标量及 Muon NS；EP 保留层名，NS 保留 call 编号，不用后一个调用覆盖前一个。
+- 所有输出中的 `rank` 均为 **global rank**，不是节点内的 local rank。控制台行首带 `step=N rank=0`；
+  各 rank 的 JSONL 文件名为 `rank_N.jsonl`，每条记录带 `rank: N`、`step`，micro loss 另带 `micro_step`。
+  W&B/TensorBoard 的局部指标名带 `/rank_0/`；目前远端 sink 只输出 rank 0，并非全 rank 汇总。
+- 汇总等待本步已提交的异步摘要完成；不加设备同步，可能晚于后续 step 的基础日志，始终保留原 step。
+  丢弃的摘要在该行计数，不等待不存在的结果；没有采集值时输出 `status=no_collected_metrics`，不复用上一步。
+- 完整 expert 分布、Top-N、直方图、micro loss 和参数归属继续留在 JSONL。汇总只含 rank 0 已持有的结果，
+  不为控制台收集其他 rank 的局部值，也不把这条汇总重复发送给 SDK。
+
+控制台示例（省略其他指标）：
+
+```text
+Training:  15%|###                 | 3/20 | step=3 epoch=0 training/total_loss=10.5977
+training metrics: step=3 rank=0 moe/max_vio=0.24 training/grad_norm_local_post_reduce_pre_clip=18.2 training/local_foundation_loss=10.5977
+```
+
 - 每个 rank 的诊断记录写到 `<output_dir>/<run_id>/rank_<rank>.jsonl`。
 - `schema_version/run_id/event/rank` 标识记录；训练事件保留原始 `step`。
 - 微步 loss、逐层 EP 等是独立诊断事件，不是另一条重复的 `train_step`。
@@ -76,14 +89,14 @@ FSDP 检查仍由原有 runtime 实现，按 micro-step 检查执行/预取顺�
 | Local/micro loss | `BaseTrainer.postforward`，全局加权前 | 原始 micro 均值；step 用有效 token 加权；零分母不可用 |
 | Local grad norm | `clip_grad_norm_`，Partial 规约后、裁剪前 | 复用 norm 输入视图；每 rank 一个 L2，覆盖本地全部有梯度的可训练参数，包含 expert；没有新增规约 |
 | 不启用裁剪时的 local norm | `BaseTrainer.clip_grad_norm` | 读取已有 main_grad/grad；未完成 Partial 的值不冒充 post-reduce |
-| EP | 共享 `MoE.forward`，原生 EP 的 `ep_routed_forward` / `ep_routed_dispatch` | `ExpertLoadRecorder` 固定注册全部层；真实 forward 计数，backward 重计算不计数 |
+| EP | 共享 `MoE.forward`，原生 EP 的 `ep_routed_forward` / `ep_routed_dispatch` | `ExpertLoadRecorder` 固定注册 `monitor.moe.layers` 选中的层（默认全部）；真实 forward 计数，backward 重计算不计数 |
 | Muon NS | `Muon._compute_batched_ns_outputs_for_tensors` | NS 后、学习率/RMS 缩放前的矩阵 Frobenius norm；保留 parameter、transform、call 与 matrix 范围 |
 | 数据 | 通用 get-batch 的 CPU 源 batch、CP 切片和 H2D 前 | 本 rank 的原始源数据分布；精确 step Top-N，先合并全部 micro 计数再取 Top-N |
 | 分块耗时 | 显式生命周期和 `statistics_phase` | 主机墙钟，非 kernel 执行时间；不新增逐块设备同步 |
 | FLOPs | 初始化时的标准块清单 | Linear/attention/FFN/router/shared expert/LM head 组合；逐步只更新输入几何 |
 
 Trainer 通过 `monitor_phase(..., observe=True)` 同时进入计时和采集作用域；backward 仅计时，不观察重计算。
-默认没有新增 forward/backward hook。`components.monitor` 是独立的注入接口，不导入 Trainer。
+常规指标采集没有新增 forward/backward hook；FSDP 顺序检查的可选 hook 见上节。`components.monitor` 是独立的注入接口，不导入 Trainer。
 模型/优化器只借出当前有效 tensor；训练线程生成小摘要，异步 D2H 只持有摘要的独立存储。
 D2H 完成 event 就绪后才读 CPU 缓冲。通信全部在训练线程上按固定层序执行。
 传输队列上限 32、单摘要上限 65,536 元素；溢出通过 `monitor/dropped_summaries` 显式记录。
@@ -91,17 +104,22 @@ EP 合并所有层后一次提交，避免每层消耗一个传输槽位；关�
 
 ## 数据与 EP 的解释
 
+`data/*` 表示数量，`performance/*` 表示速率或耗时；`step_tokens`/`consumed_tokens` 为有效监督 token，
+`step_input_tokens` 为参与计算的输入 token，当前没有累计 input token 字段。
+
 数据事件包含输入/监督长度直方图与分位数、token ID/count/fraction、segment 长度、填充率和边界错误。
 监督计数遵循 causal shift、IGNORE_INDEX、loss_mask，通用文本入口也传递 EOD mask 与 shifted-label 策略。
 没有 padding mask 时不猜测 pad/eos ID；填充率标记不可用。
 packing 只检查已有 offsets、位置和监督 metadata，不新建 S×S mask，也不声称验证了 attention kernel。
 缺少 metadata、位置尚未生成或不支持的策略会列在 `unavailable`。
+当前 CP 尾部 padding 可能触发 `cross_segment_target` 误报，必须先复查真实样本与 padding 边界；
+复现及证据见 [Qwen3.6 验收报告](trainer_monitor_qwen36_validation.md)。
 
 EP load 是 top-k **assignment 次数**。每层先求其独立 token 域的总计数，再计算 `max/mean - 1`；
-`moe/max_vio` 为当前 PP stage 所持有层的最大值，不跨层平均掩盖异常。
+`moe/max_vio` 为当前 PP stage 选中且实际观测到的层的最大值，不跨层平均掩盖异常。
 共享 dropless MoE 的 attempted=accepted，drop=0；原生 EP 从已生成的 dispatch indices 统计 accepted，
 用路由前 assignment 数减去 accepted 得到 drop，覆盖容量限制的分离 dispatch 路径。
-物理 padding 槽位缺少出口时为 unavailable。注册层没有实际 observation 时标记 unavailable，不输出假零负载。
+物理 dispatch padding 槽位未采集，不能由 assignment 计数推算实际 kernel 填充量。注册层没有实际 observation 时标记 unavailable，不输出假零负载。
 DP+CP 求和，sequence-parallel TP 再求和；TP 副本不重复累加。
 当前 adapter 合约要求每层计数按完整的全局 expert ID 排列。
 未接入这两种原生调用的其他 dispatcher、expert 分片向量、不同副本关系必须提供适配，不能直接套用这套归约。
@@ -120,6 +138,7 @@ step 覆盖取数等待、数据传输提交、forward/backward、梯度准备/�
 - `checkpoint_submit`：异步提交返回。
 - `checkpoint_persist`：提交到 persist future 完成，保留原始 step 和成功/失败状态。
 - `checkpoint_wait`：调用方等待尚未完成保存的时间。
+- `checkpoint_restore`：恢复训练状态。
 
 checkpoint extra state 扩展保存 meter 的累计 token/sample 数与 run ID。
 旧 checkpoint 没有 monitor 状态时不要求新增字段；它无法恢复旧作业未曾保存的累计量。
@@ -157,7 +176,8 @@ WandB artifact staging/cache 目录也必须可写，服务器共享 HOME 不可
 
 ## MFU 完整性
 
-`training.log_tflops` 与 `monitor.mfu` 共用标准块估算，分别控制 TFLOP/s 与 MFU 输出。
+`monitor.enabled=true` 时，`training.log_tflops` 与 `monitor.mfu` 共用标准块估算，分别控制 TFLOP/s 与 MFU 输出。
+关闭 monitor 后，`training.log_tflops` 仍可使用环境计量 callback 的原有估算路径；不产生 monitor coverage 或 MFU。
 计算版本为 `standard-blocks-v2-causal-triangle-gdn-megatron`：训练标准块使用 forward×3，causal attention 使用三角近似。
 router、routed top-k 和 shared expert 分项计入；重计算、通信、optimizer、norm/激活/RoPE 不计入分子。
 按实际 segment 的长度平方和计算 attention，包含不参与监督的 prompt 输入。
@@ -206,33 +226,35 @@ norm、激活及逐元素门控也沿用本方案的忽略约定；没有将整�
 
 设备峰值不能仅凭 GPU/NPU 家族猜测。部署入口可设置 `HYPER_PARALLEL_MONITOR_PEAK` JSON，字段为
 `sku`、`dtype`、`tflops`、`source`、`sparse: false`；必须来自实际 SKU/计算精度的厂商 **dense** 峰值。
-缺少可信峰值时只输出完整模型 TFLOP/s，并给出 `unavailable_peak`。
+缺少可信峰值时，MFU 状态为 `unavailable_peak`；仅在 `training.log_tflops=true` 时输出完整模型 TFLOP/s。
 当前约定为同构设备；异构作业不得复用一个峰值。
 每步 MFU 使用该步耗时，窗口 MFU 使用本进程训练窗口 `sum(F)/sum(dt)`，不平均各步百分比。
 
-## 验收状态
+## 验收状态与已知限制
 
-2026-11-09 本地合并回归通过 534 项测试、746 个子用例，覆盖 Trainer、clip-grad、Muon、MoE、
-checkpoint、数据入口、配置解析与原生 EP；其中既有 EP 用例的 Gloo 仅使用本机回环地址。
-新增 Python 文件通过 Ruff E/F 检查，所有改动 Python 文件可编译，Markdown 格式、相对链接和 AGENTS 目录检查通过。
+| 证据 | 版本与范围 |
+| --- | --- |
+| 2026-11-18 八卡输出复验 | `386640eb` + 工作区补丁 `9b6aca65e145`；8 NPU、20 层 Qwen3.6、EP2/CP2/FSDP8、20 steps，全部 monitor 开关及离线 SDK 开启，退出 0 |
+| [此前 Qwen3.6 八卡验收](trainer_monitor_qwen36_validation.md) | `f49fa939`，2026-11-16 至 17 日；20 层纯文本视图、EP2/CP2/FSDP8、JSONL/离线 SDK、小模型保存恢复与 Muon |
+| [早期 NPU 验收](trainer_monitor_npu_acceptance.md) | 2026-11-09 历史对照，不作为当前版本验收结论 |
+| 配置迁移本地回归 | `386640eb`：配置迁移、每 rank 单一 local grad norm、模板/FSDP 开关及 monitor 训练回归；70 项测试、43 项子测试通过 |
 
-CPU UT 已验证：配置解析、loss/norm 不修改训练结果、重计算去重、Top-N/packing、异步就绪与原始 step、
-输出去重、WandB SDK 接口 mock、checkpoint 累计量/run ID 恢复和标准块公式。
-原生 EP 的两条 dispatch 入口、采样间隔、assignment drop、未执行层的缺失标记已有 CPU 用例；
-Muon 原生 reshape 与自定义 transform 路径的参数归属、缩放前 norm 已用真实计算路径核对。
-`tests/ut/trainer/test_monitor_training.py` 通过真实 TextTrainer 循环训练 tiny MoE 20 steps（每步两个 micro）：
-监控开关前后参数 bitwise 一致，20 条或每 5 步共 4 条基础训练日志，40 条 micro loss、20 条 local loss/norm/EP/data。
-同一测试文件还通过真实 HF hybrid MoE 的 20-step 训练：3 层 GDN、1 层带 gate 的全注意力，均包含 routed/shared experts。
-每步 FLOPs coverage 完整、TFLOP/s/MFU 有输出，开关监控前后参数 bitwise 一致。
-MFU 输出链路使用测试专用峰值验证归一化，不将 CPU 测试数值称为设备实际 MFU。
+本次输出复验确认 20 条进度日志、20 条 `training metrics:`，step 1–20 各一次；8 个 rank 的记录完整，
+汇总标量与 JSONL 对账一致，摘要/远端丢弃均为零。TensorBoard 的 20 个 loss step、W&B offline 的
+800 张 expert 表和 20 张 token 表已回读对账。FSDP 顺序检查开启；AdamW 无 NS 调用，MFU 无可信峰值，均明确不可用。
 
-真实 WandB 0.31.0 offline SDK 已生成 `.wandb` run 与 token Table 文件，
-TensorBoard 2.21.0 event 文件已重新读取并核对原始 step 和 scalar；本轮未上传在线 run。
+全开汇总每行 7,323–7,438 字符，主要是逐层 EP 标量；`datasets.log_level=debug` 另输出样本 DEBUG 日志。
+本轮仍是短跑输出验证，没有关闭监控的配对性能基线，也没有执行大模型权重保存恢复。
+代码快照、命令及原始日志位于服务器 `/home/chaoran/youchu_valid/hp-monitor-qwen36-20261118-udg5_3bm`，
+其中 `manifest.json` 保存基准提交、补丁和快照哈希，`validation.json`、`sdk-validation.json` 保存对账结果。
 
-已完成的单机 NPU 验收和实际开销见 [8 卡验收报告](trainer_monitor_npu_acceptance.md)：
-Qwen3.6 20 层文本视图、EP2/CP2/FSDP8、NPU event/pinned-memory、采样/输出及小模型保存恢复。
-尚未完成：完整 40 层、多机、其他 TP/PP 拓扑、GPU、长跑无增长、在线 WandB 网络故障恢复。
-逐步全量 SDK Table 输出的性能仍需优化；单次短跑不能证明零开销。
-compiled 区域不插入 Python 采集 graph break；缺失的 tensor 诊断明确 unavailable。
-外部稀疏梯度 owner 没有适配时不输出仅含 dense 部分的“完整 local norm”。
-这些边界不能因 CPU 回归通过而标记验收完成。
+此前设备报告的未通过项仍需处理：
+
+- CP 尾部 padding 被误报为跨样本 target；不能直接据此判定监督泄漏。
+- 完整 SDK 输出的 step P50 相对该次基线增加约 36%；尚未拆分各 sink 和 Table 的贡献。
+- Qwen 同步 EP 入口的 capacity drop 分支未生效；monitor 记录实际计数，不代替 EP 算法验收。
+
+完整 40 层、多机、其他 TP/PP 拓扑、GPU、长跑、在线 W&B 与断网恢复尚未完成设备验收。
+小模型保存恢复不等于生产 EP/FSDP 模型及真实 dataloader 游标续训通过。
+compiled 区域缺少观察点时记录不可用；外部 gradient owner 无适配时不发布只含 dense 部分的完整 local norm。
+本地测试中使用的峰值仅验证 MFU 公式，不代表实测硬件 MFU。

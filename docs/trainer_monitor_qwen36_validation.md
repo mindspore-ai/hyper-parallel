@@ -1,5 +1,7 @@
 # Qwen3.6 MoE monitor 逐项验证
 
+> 历史报告：以下结论只对应 `f49fa939`。其中 local grad norm 的模块筛选已在后续代码删除，不能照搬旧配置；当前入口见 [使用说明](trainer_monitor_usage.md)。
+
 ## 结论与环境
 
 2026-11-16 至 2026-11-17，验证 `monitor_dev` 的实现提交 `f49fa939`。

@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import queue
+import re
 import time
 import uuid
 from collections import defaultdict
@@ -83,6 +84,7 @@ class MonitorSession:
         self.gradient_parameters = []
         self.losses = {}
         self.ns_calls = 0
+        self.console_steps = {}
         self.estimator = None
         self.peak = None
         self.window_flops = 0.0
@@ -109,10 +111,19 @@ class MonitorSession:
             if self.config.moe.enabled:
                 for name, module in self.trainer.model.named_modules():
                     if getattr(module, "monitor_expert_count", None) is not None:
+                        if self.config.moe.layers is not None:
+                            layer = re.search(r"(?:^|\.)(?:layers|blocks|h)\.(\d+)(?:\.|$)", name)
+                            if layer is None:
+                                self.unavailable("expert_layer_selection", f"cannot resolve layer index for {name}")
+                                continue
+                            if int(layer.group(1)) not in self.config.moe.layers:
+                                continue
                         reference = getattr(module, "tokens_per_expert", None)
                         if reference is None:
                             reference = next(module.parameters())
                         self.expert_recorder.register(name or "<root>", module.monitor_expert_count, reference.device)
+                if self.config.moe.layers is not None and not self.expert_recorder.specs:
+                    self.unavailable("expert_layer_selection", "no selected instrumented MoE layers on this rank")
             self.gradient_parameters = [
                 parameter for parameter in self.trainer.model.parameters() if parameter.requires_grad
             ]
@@ -137,12 +148,62 @@ class MonitorSession:
         if not self.enabled or self.closed:
             return
         record = {"event": event, "step": self.step, **fields}
+        self._collect_console_metrics(record)
         if self.writer is None:
             # Delay remote initialization until checkpoint restoration chooses the run ID.
             if len(self.events) < 256:
                 self.events.append(record)
             return
         self.writer.emit(record)
+
+    def _collect_console_metrics(self, record: dict) -> None:
+        summary = self.console_steps.get(record["step"])
+        if summary is None:
+            return
+        event = record["event"]
+        metrics = summary["metrics"]
+        if event in ("local_step_loss", "local_grad_norm", "expert_load", "expert_load_summary", "ns_norm"):
+            suffix = f"/call_{record['call']}" if event == "ns_norm" else ""
+            metrics.update({key + suffix: value for key, value in record.get("metrics", {}).items()})
+        elif event == "datasets":
+            metrics.update({f"data/local/{key}": value for key, value in record["counts"].items()})
+            for name in ("input_lengths", "supervised_lengths", "segment_lengths"):
+                metrics.update({
+                    f"data/local/{name}/{key}": value
+                    for key, value in record.get(name, {}).items() if key != "histogram"
+                })
+            for name in ("padding_fraction", "segments_per_row"):
+                if record.get(name) is not None:
+                    metrics[f"data/local/{name}"] = record[name]
+            if record.get("unavailable"):
+                metrics["data/local/unavailable"] = ",".join(record["unavailable"])
+            if record.get("packing_failures"):
+                metrics["data/local/packing_failure_types"] = ",".join(sorted(set(record["packing_failures"])))
+        elif event == "unavailable":
+            module = f"/{record['module']}" if "module" in record else ""
+            metrics[f"unavailable/{record['metric']}{module}"] = record["reason"]
+
+    def _print_step_metrics(self, step: int) -> None:
+        summary = self.console_steps.get(step)
+        if summary is None or not summary["sealed"] or summary["pending"]:
+            return
+        self.console_steps.pop(step)
+        fields = [f"step={step}", f"rank={self.rank}"]
+        if summary["dropped"]:
+            summary["metrics"]["monitor/dropped_summaries"] = summary["dropped"]
+        for key, value in sorted(summary["metrics"].items()):
+            formatted = f"{value:.6g}" if isinstance(value, (int, float)) else json.dumps(value, ensure_ascii=False)
+            fields.append(f"{key}={formatted}")
+        if not summary["metrics"]:
+            fields.append("status=no_collected_metrics")
+        logger.info("training metrics: %s", " ".join(fields).replace("\n", "\\n").replace("\r", "\\r"))
+
+    def _consume_submitted(self, event: dict, values: list) -> None:
+        self._consume(event, values)
+        summary = self.console_steps.get(event["step"])
+        if summary is not None:
+            summary["pending"] -= 1
+            self._print_step_metrics(event["step"])
 
     def completion(self, name: str) -> Any:
         """Capture submit time; future callbacks enqueue only small immutable CPU records."""
@@ -205,7 +266,10 @@ class MonitorSession:
                 self._emit("timing", phase=name, clock="host_wall", duration_seconds=duration, outcome=outcome)
 
     def sampled(self, config: Any) -> bool:
-        """Decide at optimizer-step boundaries, identically on all ranks."""
+        """Sample local loss/norm at logging cadence; other recorders use sampler_steps."""
+        if isinstance(config, bool):
+            cadence = getattr(self.trainer.config.training, "logging_steps", 1)
+            return self.enabled and self.in_step and config and cadence > 0 and self.step % cadence == 0
         return (
             self.enabled and self.in_step and getattr(config, "enabled", True) and self.step % config.sampler_steps == 0
         )
@@ -219,6 +283,9 @@ class MonitorSession:
         self.step, self.micro_step, self.ns_calls = step, 0, 0
         self.ns_tensor_names.clear()
         self.in_step = True
+        cadence = getattr(self.trainer.config.training, "logging_steps", 1)
+        if self.rank == 0 and "console" in self.config.sinks and cadence > 0 and step % cadence == 0:
+            self.console_steps[step] = {"pending": 0, "sealed": False, "dropped": 0, "metrics": {}}
         self.timing.clear()
         self.dataset.reset()
         self.expert_recorder.begin_step(self.sampled(self.config.moe) and not self.compiled_model)
@@ -350,7 +417,13 @@ class MonitorSession:
 
     def _submit(self, kind: str, tensor: torch.Tensor, metadata: dict) -> None:
         event = {"event": kind, "step": self.step, **metadata}
-        self.transfer.submit(tensor, partial(self._consume, event))
+        summary = self.console_steps.get(self.step)
+        if summary is not None:
+            summary["pending"] += 1
+        accepted = self.transfer.submit(tensor, partial(self._consume_submitted, event))
+        if not accepted and summary is not None:
+            summary["pending"] -= 1
+            summary["dropped"] += 1
 
     def _consume_experts(self, event: dict, values: list) -> None:
         global_load = event["event"] == "expert_layers"
@@ -477,6 +550,10 @@ class MonitorSession:
     def log_step(self, state: Any, metrics: dict) -> None:
         """Write one canonical logging event, using only the external cadence."""
         self._emit("train_step", step=state.global_step, epoch=state.epoch, metrics=metrics)
+        summary = self.console_steps.get(state.global_step)
+        if summary is not None:
+            summary["sealed"] = True
+            self._print_step_metrics(state.global_step)
 
     def state_dict(self) -> dict:
         """Persist run identity alongside cumulative meter state."""
@@ -500,6 +577,7 @@ class MonitorSession:
         self.in_step = False
         self.start_output()
         self.transfer.close()
+        self.console_steps.clear()
         self._drain_completions()
         self._emit("monitor_closed", dropped_summaries=self.transfer.dropped,
                    dropped_remote_records=self.writer.dropped)

@@ -1,5 +1,7 @@
 # Trainer monitor 单机 8 卡验收
 
+> 历史报告：保留 2026-11-09 的原始配置与结果。后续验收见 [Qwen3.6 报告](trainer_monitor_qwen36_validation.md)；当前配置见 [使用说明](trainer_monitor_usage.md)。
+
 ## 环境与范围
 
 2026-11-09，`monitor_dev` 实现提交 `743963ae`，并应用本报告随附的输出队列/sink 隔离修复。
