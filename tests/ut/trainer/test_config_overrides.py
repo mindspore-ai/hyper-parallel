@@ -27,6 +27,8 @@ import unittest
 from pathlib import Path
 from typing import Dict, Optional
 
+from tests.common.mark_utils import arg_mark
+
 from hyper_parallel.trainer.config import MemoryConfig, ProfilingConfig
 from hyper_parallel.trainer.config.parser import parse_training_args
 from hyper_parallel.trainer.config.resolver import ConfigResolutionError
@@ -84,6 +86,17 @@ class TestConfigOverrides(unittest.TestCase):
         self.assertEqual(
             config.model.activation, "gelu",
             msg=f"case: keyword_default_is_filled, activation={config.model.activation!r}")
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="dryrun", essential_mark="essential")
+    def test_deferred_microbatch_metrics_can_be_enabled_explicitly(self) -> None:
+        """Feature: deferred logs.
+        Description: default and CLI flag.
+        Expectation: opt-in boolean behavior.
+        """
+        self.assertFalse(self._parse().training.defer_microbatch_metrics)
+        config = self._parse("--training.defer_microbatch_metrics=true")
+        self.assertTrue(config.training.defer_microbatch_metrics)
 
     def test_scalar_overrides_are_coerced(self) -> None:
         """Scalar overrides are coerced against the declared annotations."""

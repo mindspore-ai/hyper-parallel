@@ -33,7 +33,6 @@ import json
 import logging
 import os
 from abc import ABC
-from collections import defaultdict
 from collections.abc import Callable
 from contextlib import nullcontext
 from functools import partial
@@ -95,6 +94,7 @@ from hyper_parallel.trainer.runtime.data_iterator import HyperIter
 from hyper_parallel.trainer.runtime.logging import enable_third_party_logging
 from hyper_parallel.trainer.runtime.memory import empty_cache, print_device_mem_info
 from hyper_parallel.trainer.runtime.memory_profiler import memory_profiler
+from hyper_parallel.trainer.runtime.step_metrics import StepMetricAccumulator
 from hyper_parallel.trainer.runtime.random import enable_high_precision_for_bf16, set_seed
 from hyper_parallel.trainer.runtime.device import (  # pylint: disable=syntax-error
     get_device_type,
@@ -992,9 +992,23 @@ class BaseTrainer(Stateful, ABC):
 
         External providers expose their owned parameters through ``parameters``
         and normalize those gradients in ``prepare_optimizer_step`` instead.
+
+        Args:
+            loss: Accumulated unnormalized loss.
+            loss_dict: Named logging totals, updated in place for loss names.
+            denominator: Explicit denominator or None to use the step token count.
+
+        Returns:
+            Normalized total loss.
         """
         if denominator is None:
             denominator = self._loss_denominator()
+        self._normalize_gradients(denominator)
+        return self.normalize_loss_metrics(loss, loss_dict, denominator=denominator)
+
+    @torch.no_grad()
+    def _normalize_gradients(self, denominator: float) -> None:
+        """Scale Trainer-owned gradients; external providers normalize during clipping."""
         external = get_model_external_state(self.model)
         excluded = {id(param) for param in external.parameters.values()} if external is not None else set()
         with SkipDTensorDispatch():
@@ -1008,6 +1022,18 @@ class BaseTrainer(Stateful, ABC):
                     if isinstance(grad, DTensor):
                         grad = grad.to_local()
                     grad.div_(denominator)
+
+    def normalize_loss_metrics(self, loss: float, loss_dict: Dict[str, float], *, denominator: float) -> float:
+        """Normalize only logged loss values without touching gradients.
+
+        Args:
+            loss: Accumulated unnormalized loss.
+            loss_dict: Named logging totals, updated in place for loss names.
+            denominator: Step loss normalization denominator.
+
+        Returns:
+            Normalized total loss.
+        """
         for name in self.loss_names:
             loss_dict[name] /= denominator
         return loss / denominator
@@ -1017,6 +1043,33 @@ class BaseTrainer(Stateful, ABC):
         denominator = self._loss_denominator()
         loss = self.loss_normalize(loss, loss_dict, denominator=denominator)
         return loss, self.clip_grad_norm(gradient_divisor=denominator)
+
+    def finish_optimizer_step(self, metrics: StepMetricAccumulator) -> tuple[float, Dict[str, float], Any]:
+        """Update parameters and finalize logging scalars at the selected read boundary.
+
+        Deferred metrics retain the original scalar values and Python summation
+        order. Token normalization, gradient clipping, and external-state
+        preparation still precede the optimizer update.
+
+        Args:
+            metrics: Microbatch logging scalars accumulated for this step.
+
+        Returns:
+            Normalized loss, named logging totals, and gradient norm.
+        """
+        if not metrics.defer:
+            loss, loss_dict = metrics.finalize()
+            loss, grad_norm = self.prepare_optimizer_step(loss, loss_dict)
+            self.step_optimizers_and_schedulers()
+            return loss, loss_dict, grad_norm
+
+        denominator = self._loss_denominator()
+        self._normalize_gradients(denominator)
+        grad_norm = self.clip_grad_norm(gradient_divisor=denominator)
+        self.step_optimizers_and_schedulers()
+        loss, loss_dict = metrics.finalize()
+        loss = self.normalize_loss_metrics(loss, loss_dict, denominator=denominator)
+        return loss, loss_dict, grad_norm
 
     def clip_grad_norm(self, *, gradient_divisor: float = 1.0) -> Any:
         """Run pre-optimizer diagnostics and clipping in their required order."""
@@ -1121,8 +1174,9 @@ class BaseTrainer(Stateful, ABC):
         # Forward and backward for each micro batch
         synchronize()
 
-        total_loss = 0.0
-        total_loss_dict = defaultdict(int)
+        metrics = StepMetricAccumulator(
+            defer=getattr(self.config.training, "defer_microbatch_metrics", False),
+        )
 
         # token num for fixed_ce_loss in postforward
         self.begin_loss_step()
@@ -1139,12 +1193,9 @@ class BaseTrainer(Stateful, ABC):
             loss, loss_dict = self.forward_backward_step(micro_batch)
             self.on_micro_step_end(loss_dict)
 
-            total_loss += loss.item()
-            for k, v in loss_dict.items():
-                total_loss_dict[k] += v.item()
+            metrics.add(loss, loss_dict)
 
-        total_loss, grad_norm = self.prepare_optimizer_step(total_loss, total_loss_dict)
-        self.step_optimizers_and_schedulers()
+        total_loss, total_loss_dict, grad_norm = self.finish_optimizer_step(metrics)
 
         grad_norm_value = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
         self._end_model_integration_step({"loss": total_loss, "grad_norm": grad_norm_value})

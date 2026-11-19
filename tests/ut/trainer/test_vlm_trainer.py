@@ -51,6 +51,7 @@ class TestVLMTrainer(unittest.TestCase):
         base = BaseTrainer.__new__(BaseTrainer)
         trainer.base = base
         base.num_micro_batches = num_micro_steps
+        base.config = SimpleNamespace(training=SimpleNamespace(defer_microbatch_metrics=False))
         base.state = TrainerState(global_step=0, epoch=0)
         base.mesh = SimpleNamespace(dp_cp_mesh=None, cp_size=1)
         base.optimizer = SimpleNamespace(param_groups=[{"lr": 0.001}])

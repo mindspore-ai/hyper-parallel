@@ -22,8 +22,12 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from tests.common.mark_utils import arg_mark
+
 from hyper_parallel.models.deepseek_v41.adapter.engram.host_state import DeepseekV41HostState
 from hyper_parallel.models.deepseek_v41.adapter.engram.host_table import HostEngramTable
+from hyper_parallel.trainer.runtime.step_metrics import StepMetricAccumulator
+
 
 base_module = importlib.import_module("hyper_parallel.trainer.base")
 
@@ -122,6 +126,7 @@ class TestBaseTrainerExternalState(unittest.TestCase):
         """Return a build_optimizer stub that captures the wrap_dense hook."""
         def build_optimizer(optimizer_config: Any, *, wrap_dense: Any) -> Any:
             """Capture wrap_dense and return the prebuilt optimizer."""
+            del optimizer_config
             captured["wrap_dense"] = wrap_dense
             return built
         return build_optimizer
@@ -227,43 +232,54 @@ class TestBaseTrainerExternalState(unittest.TestCase):
                 torch.testing.assert_close(ordinary_grad, torch.tensor([[99.]], dtype=torch.bfloat16))
 
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="dryrun", essential_mark="essential")
     def test_host_gradients_normalize_before_joint_clipping(self) -> None:
         """Feature: External gradient normalization.
 
         Description: Normalize dense and sparse gradients together, then apply joint clipping.
         Expectation: Normalization precedes the joint norm/clipping and each gradient is scaled once.
         """
-        table = HostEngramTable(
-            source_weight=torch.nn.Parameter(torch.empty((2, 1), device="meta")), logical_rows=2,
-        )
-        table.bind_planned_shard(ep_rank=0, ep_size=1)
-        table.weight = torch.nn.Parameter(torch.zeros((2, 1)))
-        model = torch.nn.Module()
-        model.register_parameter("dense", torch.nn.Parameter(torch.zeros(1)))
-        model.add_module("embed", table)
-        model.dense.grad = torch.tensor([12.])
-        for value in (4., 12.):
-            table.append_rows(torch.tensor([0]), torch.tensor([[value]]))
-        external = DeepseekV41HostState(model, {"embed": table}, None)
-        external.optimizer = SimpleNamespace(state="ACCUMULATING")
-        model._hp_external_state = external  # pylint: disable=protected-access
-        trainer = base_module.BaseTrainer.__new__(base_module.BaseTrainer)
-        trainer.model, trainer.device = model, torch.device("cpu")
-        trainer.mesh = SimpleNamespace(dp_cp_mesh=None)
-        trainer.config = SimpleNamespace(training=SimpleNamespace(max_grad_norm=2.5))
-        trainer.model_integration = MagicMock()
-        trainer.fsdp_runtime_diagnostics = None
-        trainer.loss_names = ("foundation_loss",)
-        trainer.begin_loss_step()
-        trainer.step_token_counts = {"foundation_tokens": torch.tensor(4)}
-        metrics = {"foundation_loss": 28., "diagnostic": 9.}
-        loss, norm = trainer.prepare_optimizer_step(28., metrics)
-        self.assertEqual(loss, 7.)
-        self.assertEqual(metrics, {"foundation_loss": 7., "diagnostic": 9.})
-        torch.testing.assert_close(norm, torch.tensor(5.))
-        scale = (2.5 / (5. + 1.e-6)) / 4
-        torch.testing.assert_close(model.dense.grad, torch.tensor([12. * scale]))
-        torch.testing.assert_close(table.pending.values(), torch.tensor([[16. * scale]]))
+        for deferred in (False, True):
+            with self.subTest(deferred=deferred):
+                table = HostEngramTable(
+                    source_weight=torch.nn.Parameter(torch.empty((2, 1), device="meta")), logical_rows=2,
+                )
+                table.bind_planned_shard(ep_rank=0, ep_size=1)
+                table.weight = torch.nn.Parameter(torch.zeros((2, 1)))
+                model = torch.nn.Module()
+                model.register_parameter("dense", torch.nn.Parameter(torch.zeros(1)))
+                model.add_module("embed", table)
+                model.dense.grad = torch.tensor([12.])
+                for value in (4., 12.):
+                    table.append_rows(torch.tensor([0]), torch.tensor([[value]]))
+                external = DeepseekV41HostState(model, {"embed": table}, None)
+                external.optimizer = SimpleNamespace(state="ACCUMULATING")
+                model._hp_external_state = external  # pylint: disable=protected-access
+                trainer = base_module.BaseTrainer.__new__(base_module.BaseTrainer)
+                trainer.model, trainer.device = model, torch.device("cpu")
+                trainer.mesh = SimpleNamespace(dp_cp_mesh=None)
+                trainer.config = SimpleNamespace(training=SimpleNamespace(max_grad_norm=2.5))
+                trainer.model_integration = MagicMock()
+                trainer.fsdp_runtime_diagnostics = None
+                trainer.loss_names = ("foundation_loss",)
+                trainer.begin_loss_step()
+                trainer.step_token_counts = {"foundation_tokens": torch.tensor(4)}
+                metrics = {"foundation_loss": 28., "diagnostic": 9.}
+                if deferred:
+                    accumulator = StepMetricAccumulator(defer=True)
+                    accumulator.add(torch.tensor(28.), {key: torch.tensor(value) for key, value in metrics.items()})
+                    trainer.step_optimizers_and_schedulers = MagicMock()
+                    loss, metrics, norm = trainer.finish_optimizer_step(accumulator)
+                    trainer.step_optimizers_and_schedulers.assert_called_once_with()
+                else:
+                    loss, norm = trainer.prepare_optimizer_step(28., metrics)
+                self.assertEqual(loss, 7.)
+                self.assertEqual(metrics, {"foundation_loss": 7., "diagnostic": 9.})
+                torch.testing.assert_close(norm, torch.tensor(5.))
+                scale = (2.5 / (5. + 1.e-6)) / 4
+                torch.testing.assert_close(model.dense.grad, torch.tensor([12. * scale]))
+                torch.testing.assert_close(table.pending.values(), torch.tensor([[16. * scale]]))
 
 
 if __name__ == "__main__":

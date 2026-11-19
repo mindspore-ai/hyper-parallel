@@ -16,7 +16,6 @@
 
 __all__ = ["VLMTrainer"]
 
-from collections import defaultdict
 from itertools import count
 from typing import Any, Dict
 
@@ -33,6 +32,7 @@ from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import print_device_mem_info
 from hyper_parallel.trainer.runtime.memory_profiler import memory_profiler
+from hyper_parallel.trainer.runtime.step_metrics import StepMetricAccumulator
 from hyper_parallel.trainer.runtime.device import synchronize  # pylint: disable=syntax-error
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.distributed_data import DistributedDataLoader
@@ -280,8 +280,9 @@ class VLMTrainer:
         self.base.model_integration.begin_step(self.base.state.global_step + 1)
         synchronize()
 
-        total_loss = 0.0
-        total_loss_dict = defaultdict(int)
+        metrics = StepMetricAccumulator(
+            defer=getattr(self.base.config.training, "defer_microbatch_metrics", False),
+        )
 
         for micro_step in range(num_micro_steps):
             self.base.model_reshard(micro_step, num_micro_steps)
@@ -294,12 +295,9 @@ class VLMTrainer:
                 data_iterator,
             )
 
-            total_loss += loss.item()
-            for loss_name, loss_value in loss_dict.items():
-                total_loss_dict[loss_name] += loss_value.item()
+            metrics.add(loss, loss_dict)
 
-        total_loss, grad_norm = self.base.prepare_optimizer_step(total_loss, total_loss_dict)
-        self.base.step_optimizers_and_schedulers()
+        total_loss, total_loss_dict, grad_norm = self.base.finish_optimizer_step(metrics)
 
         # Checkpoint and logging callbacks observe completed optimizer updates.
         self.base.state.global_step += 1

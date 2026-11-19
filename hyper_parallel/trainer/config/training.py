@@ -46,6 +46,8 @@ class TrainingConfig:
     eval_steps: int = 0
     eval_epochs: int = 0
     logging_steps: int = 1
+    defer_microbatch_metrics: bool = False
+    """Batch detached microbatch logging scalars for host reads after optimizer updates."""
     log_tflops: bool = False
     """Publish analytical per-device model FLOPs throughput.
 
