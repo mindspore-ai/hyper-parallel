@@ -77,6 +77,76 @@ Keep `model.torch_dtype` and `model_init_dtype` consistent when changing precisi
 The default FP32 recipe completed a ten-step functional run on the cropped model;
 this does not establish full-model memory requirements or numerical parity.
 
+## Muon with Graph Training
+
+The supplied `train_deepseek_v41_graph_muon.yaml` enables Muon with full
+recomputation and the same FSDP4 + TP2/SP + EP2 topology. Use the resource
+variables above and select it with:
+
+```bash
+CONFIG=hyper_parallel/compile/examples/dsv41_graph/train_deepseek_v41_graph_muon.yaml \
+bash hyper_parallel/compile/examples/dsv41_graph/run_deepseek_v41_graph.sh
+```
+
+Its optimizer section is:
+
+```yaml
+optimizer:
+  _target_: hyper_parallel.components.optim.builders.Muon
+  fp32_main_params: false
+  muon_config:
+    muon_lr: 0.0001
+    muon_weight_decay: 0.0
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_ns_steps: 5
+    muon_ns_variant: asym5
+  adamw_config:
+    adamw_lr: 0.0001
+    adamw_weight_decay: 0.0
+```
+
+Matrix parameters use Muon; embeddings, output heads,
+and other fallback parameters continue to use AdamW. Forward and backward run
+in the joint graph; optimizer updates remain eager.
+
+For BF16 training, set `model.torch_dtype` and `model_init_dtype` to `bfloat16`,
+enable `optimizer.fp32_main_params`, and add the precision policy to the existing
+`fsdp_config` while retaining its shard degrees:
+
+```yaml
+fsdp_config:
+  dp_shard_size: 4
+  edp_shard_size: 4
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
+    cast_forward_inputs: true
+```
+
+The runtime binds Muon layouts and creates optional FP32 main shards after the
+graph compiler physically shards the model. Optimizer views retain TP/EP/FSDP
+metadata, share FP32 model storage, and exclude padded rows from matrix updates.
+The current eight-rank cropped recipe has been checked for 30 FP32 and BF16
+updates with full recomputation, including independent matrix-update checks.
+This functional validation does not establish long-run convergence.
+
+Optimizer state export and import require compiled parameter layouts. State
+round trips after binding are supported; cold-start `checkpoint.restore_from`
+before the first graph compilation is not yet integrated for this optimizer
+path. Parameter storage or layout replacement after binding requires rebuilding
+the optimizer and restoring its state.
+
+`benchmark_training.py` records per-rank allocator peaks and synchronized
+optimizer timing. `verify_muon_training.py` independently reconstructs selected
+matrix updates from real gradients; run it separately because its references
+add work and memory. Both accept the training YAML and dotted overrides used
+by `scripts/train_lm.py`, and write rank files under `METRICS_DIR`.
+
+See the [development and validation guide](../../../../docs/guide/deepseek_v41_graph_muon.md)
+for the design, TorchTitan reference, reproduction commands and measured results.
+
 ## Compressor, Indexer, and Packing
 
 Edit the existing YAML entries while retaining its other settings. Model-level

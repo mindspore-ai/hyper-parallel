@@ -49,6 +49,7 @@ from transformers.modeling_outputs import ModelOutput
 
 from hyper_parallel import DTensor, HSDPModule, SkipDTensorDispatch
 from hyper_parallel.compile.compiler import GraphCompiler
+from hyper_parallel.compile.optimizer import GraphOptimizer
 from hyper_parallel.core.tensor_parallel import loss_parallel
 from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.trainer.config import (
@@ -570,11 +571,16 @@ class BaseTrainer(Stateful, ABC):
             self.optimizer = external.build_optimizer(config.optimizer, wrap_dense=wrap_dense)
             return
         optimizer = config.optimizer.target.build(model=self.model).get_optimizer()
-        self.optimizer = (
-            Float16OptimizerWithFloat16Params(optimizer, self.model)
-            if config.optimizer.fp32_main_params
-            else optimizer
-        )
+        if config.compile.selects_graph_compiler() and (
+                config.optimizer.fp32_main_params
+                or any(getattr(leaf, "is_muon", False) for leaf in optimizer.chained_optimizers)):
+            self.optimizer = GraphOptimizer(optimizer, self.model, fp32_main_params=config.optimizer.fp32_main_params)
+        else:
+            self.optimizer = (
+                Float16OptimizerWithFloat16Params(optimizer, self.model)
+                if config.optimizer.fp32_main_params
+                else optimizer
+            )
         # Swap is attached after the fp32 main-parameter wrap so leaf optimizers
         # already reference their final parameters, and the lr scheduler built
         # right after reads the wrapped ``self.optimizer.param_groups``.
@@ -992,6 +998,11 @@ class BaseTrainer(Stateful, ABC):
 
         External providers expose their owned parameters through ``parameters``
         and normalize those gradients in ``prepare_optimizer_step`` instead.
+
+        Args:
+            loss: Accumulated unnormalized objective for this optimizer step.
+            loss_dict: Named loss sums, normalized in place.
+            denominator: Optional precomputed valid-token count.
         """
         if denominator is None:
             denominator = self._loss_denominator()
@@ -1013,7 +1024,17 @@ class BaseTrainer(Stateful, ABC):
         return loss / denominator
 
     def prepare_optimizer_step(self, loss: float, loss_dict: Dict[str, float]) -> tuple[float, Any]:
-        """Normalize the step objective before clipping and optimizer preparation."""
+        """Normalize the step objective before clipping and optimizer preparation.
+
+        Args:
+            loss: Accumulated unnormalized objective for this optimizer step.
+            loss_dict: Named loss sums, normalized in place.
+
+        Returns:
+            Normalized loss and the global gradient norm before clipping.
+        """
+        if isinstance(self.optimizer, GraphOptimizer):
+            self.optimizer.bind(self.graph_compiler.optimizer_parameter_layouts)
         denominator = self._loss_denominator()
         loss = self.loss_normalize(loss, loss_dict, denominator=denominator)
         return loss, self.clip_grad_norm(gradient_divisor=denominator)
