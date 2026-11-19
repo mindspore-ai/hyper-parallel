@@ -363,9 +363,9 @@ def emit_modeling_file(meta: Any, *, patch_plan: Any = None) -> str:
 def _emit_preinstalled_components(text: str, meta: Any) -> str:
     """Attach the verified replacement records to the generated source constructor."""
     records = getattr(meta, "preinstalled_components", ())
-    if not records:
-        return text
     source = _source_dict(meta.source)
+    if not records and not (source.get("model_class") and getattr(meta, "param_plan", None)):
+        return text
     model_class = (source.get("model_class") or source["architecture"]).rsplit(":", 1)[-1]
     owners = [node for node in ast.parse(text).body if isinstance(node, ast.ClassDef) and node.name == model_class]
     constructors = [
@@ -381,6 +381,8 @@ def _emit_preinstalled_components(text: str, meta: Any) -> str:
     indent = body[:len(body) - len(body.lstrip())]
     entries = "".join(f"{indent}    {record!r},\n" for record in records)
     lines[constructor.end_lineno:constructor.end_lineno] = [
+        f"{indent}from hyper_parallel.models._generated.phase_c import apply_generated_phase_c\n",
+        f"{indent}self._hp_bind_materialized_forwards = apply_generated_phase_c\n",
         f"{indent}from hyper_parallel.models.preinstalled import install_prepared_components\n",
         f"{indent}self.__hp_prepared_components__ = (\n{entries}{indent})\n",
         f"{indent}install_prepared_components(\n",

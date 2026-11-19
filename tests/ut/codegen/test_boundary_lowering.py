@@ -779,8 +779,8 @@ def test_observed_inner_wrapper_rebinds_boundary_to_replacement_type():
     }
 
 
-def test_model_adapter_replacement_keeps_declared_factory_contract():
-    """Observed types do not erase a model-owned factory's interface facts."""
+def test_legacy_snapshot_uses_observed_constructor_identity():
+    """An older snapshot still uses its observed constructor across adapter paths."""
     meta = SimpleNamespace(
         module_overrides=[{
             "factory": "hyper_parallel.components.modules.GroupedQueryAttention",
@@ -797,7 +797,7 @@ def test_model_adapter_replacement_keeps_declared_factory_contract():
     rules = collect_source_observations(meta)
 
     assert len(rules) == 1
-    assert rules[0].replace_target == meta.module_overrides[0]["replacement_target"]
+    assert rules[0].replace_target == meta.module_overrides[0]["factory"]
 
 
 def test_imported_cp_host_and_boundary_share_one_forward_impl():

@@ -651,6 +651,8 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
 
         # Initialize weights and apply final processing
         self.post_init()
+        from hyper_parallel.models._generated.phase_c import apply_generated_phase_c
+        self._hp_bind_materialized_forwards = apply_generated_phase_c
         from hyper_parallel.models.preinstalled import install_prepared_components
         self.__hp_prepared_components__ = (
             {'rule_id': 'plan_override:0:replace:model.layers.0.input_layernorm', 'module_fqns': ['model.layers.0.input_layernorm'], 'primary_fqn': 'model.layers.0.input_layernorm', 'source_type': 'transformers.models.qwen3_moe.modeling_qwen3_moe:Qwen3MoeRMSNorm', 'replacement_type': 'hyper_parallel.components.modules.rms_norm:RMSNorm', 'weight_transforms': [], 'opaque_legacy': True, 'replay': {'version': 1, 'target': 'hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement:replace_qwen3_moe_rms_norm', 'arguments': {'mapping': {}}, 'context': {'mapping': {'tp': True, 'cp': True, 'ep': True, 'pp': False, 'tp_size': 2, 'cp_size': 2, 'ep_size': 2, 'pp_size': 1, 'sequence_parallel': True, 'loss_parallel': True, 'mesh_dim_names': {'tuple': ['dp', 'cp', 'tp']}, 'device_type': 'npu', 'dtype': 'bfloat16'}}, 'request': True}},

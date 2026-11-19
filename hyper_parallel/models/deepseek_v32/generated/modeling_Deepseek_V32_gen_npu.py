@@ -779,6 +779,8 @@ class DeepseekV32ForCausalLM(DeepseekV32PreTrainedModel, GenerationMixin):
 
         # Initialize weights and apply final processing
         self.post_init()
+        from hyper_parallel.models._generated.phase_c import apply_generated_phase_c
+        self._hp_bind_materialized_forwards = apply_generated_phase_c
         from hyper_parallel.models.preinstalled import install_prepared_components
         self.__hp_prepared_components__ = (
             {'rule_id': 'plan_override:0:replace:model.layers.0.input_layernorm', 'module_fqns': ['model.layers.0.input_layernorm'], 'primary_fqn': 'model.layers.0.input_layernorm', 'source_type': 'transformers.models.deepseek_v32.modeling_deepseek_v32:DeepseekV32RMSNorm', 'replacement_type': 'hyper_parallel.components.modules.rms_norm:RMSNorm', 'weight_transforms': [], 'opaque_legacy': True, 'replay': {'version': 1, 'target': 'hyper_parallel.models.deepseek_v32.adapter.conversion.module_replacement:replace_deepseek_v32_rms_norm', 'arguments': {'mapping': {}}, 'context': {'mapping': {'tp': False, 'cp': False, 'ep': False, 'pp': False, 'tp_size': 1, 'cp_size': 1, 'ep_size': 1, 'pp_size': 1, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': {'tuple': ['dp', 'cp', 'tp']}, 'device_type': 'npu', 'dtype': 'bfloat16'}}, 'request': True}},

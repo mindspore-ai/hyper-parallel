@@ -747,6 +747,8 @@ class Kimi_K25ForConditionalGeneration(Kimi_K25PreTrainedModel, GenerationMixin)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
 
         self.post_init()
+        from hyper_parallel.models._generated.phase_c import apply_generated_phase_c
+        self._hp_bind_materialized_forwards = apply_generated_phase_c
         from hyper_parallel.models.preinstalled import install_prepared_components
         self.__hp_prepared_components__ = (
             {'rule_id': 'plan_override:0:replace:model.language_model.layers.0.self_attn.q_a_layernorm', 'module_fqns': ['model.language_model.layers.0.self_attn.q_a_layernorm'], 'primary_fqn': 'model.language_model.layers.0.self_attn.q_a_layernorm', 'source_type': 'transformers.models.deepseek_v3.modeling_deepseek_v3:DeepseekV3RMSNorm', 'replacement_type': 'hyper_parallel.components.modules.rms_norm:RMSNorm', 'weight_transforms': [], 'opaque_legacy': True, 'replay': {'version': 1, 'target': 'hyper_parallel.components.modules.rms_norm:RMSNorm', 'arguments': {'mapping': {'hidden_size': None, 'eps': 1e-05}}, 'context': {'mapping': {'tp': False, 'cp': False, 'ep': True, 'pp': False, 'tp_size': 1, 'cp_size': 1, 'ep_size': 128, 'pp_size': 1, 'sequence_parallel': False, 'loss_parallel': False, 'mesh_dim_names': {'tuple': ['dp', 'cp', 'tp']}, 'device_type': 'npu', 'dtype': 'bfloat16'}}, 'request': True}},

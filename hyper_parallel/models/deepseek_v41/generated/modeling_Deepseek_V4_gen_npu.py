@@ -1430,6 +1430,8 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
             self.dspark = DeepseekV41DSpark(config, mlp_factory=lambda: _build_dspark_mlp(config))
             self.dspark_loss_coeff = float(getattr(config, "v41_dspark_loss_coeff", 1.0))
         self.post_init()
+        from hyper_parallel.models._generated.phase_c import apply_generated_phase_c
+        self._hp_bind_materialized_forwards = apply_generated_phase_c
         from hyper_parallel.models.preinstalled import install_prepared_components
         self.__hp_prepared_components__ = (
             {'rule_id': 'plan_override:0:replace:model.layers.1.engram', 'module_fqns': ['model.layers.1.engram'], 'primary_fqn': 'model.layers.1.engram', 'source_type': 'hyper_parallel.models.deepseek_v41.modeling_deepseek_v41:DeepseekV41Engram', 'replacement_type': 'hyper_parallel.models.deepseek_v41.adapter.engram.host_replacement:HostEngramModule', 'weight_transforms': [], 'opaque_legacy': True, 'replay': {'version': 1, 'target': 'hyper_parallel.models.deepseek_v41.adapter.engram.host_replacement:HostEngramModule', 'arguments': {'mapping': {}}, 'context': {'mapping': {'tp': False, 'cp': True, 'ep': True, 'pp': False, 'tp_size': 1, 'cp_size': 4, 'ep_size': 8, 'pp_size': 1, 'sequence_parallel': True, 'loss_parallel': False, 'mesh_dim_names': {'tuple': ['dp', 'cp', 'tp']}, 'device_type': 'npu', 'dtype': 'float32'}}, 'request': True}},

@@ -374,6 +374,10 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
     and the unpack-scope exclusion (invariant 3) requires inner wrappers to be
     installed first.
     """
+    bind_materialized = getattr(model, "_hp_bind_materialized_forwards", None)
+    if bind_materialized is not None:
+        bind_materialized(model, plan, mesh, validate_mode, expert_mesh=expert_mesh)
+        return
     mesh_dim_names = plan.mesh_dim_names
     cp_mesh = _get_cp_submesh(mesh, mesh_dim_names)
     tp_mesh = _get_tp_submesh(mesh, mesh_dim_names)

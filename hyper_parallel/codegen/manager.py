@@ -131,6 +131,10 @@ def _replacement_inputs(payload: dict) -> tuple[list, list]:
     applications = payload["replacements"]["applications"]
     if applications and all(item.get("replay") for item in applications):
         return [], list(applications)
+    unsupported = [item["primary_fqn"] for item in applications
+                   if "opaque_legacy" in item and not item.get("replay")]
+    if unsupported:
+        raise ValueError(f"Codegen replacement has no importable replay record at {unsupported!r}")
     return list(replacement_records_from_snapshot(payload)), []
 
 

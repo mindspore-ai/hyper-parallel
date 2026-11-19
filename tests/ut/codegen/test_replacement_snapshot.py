@@ -298,7 +298,7 @@ def test_opaque_replacement_requires_a_lowering():
     },)
     rules = collect_source_observations(SimpleNamespace(module_overrides=records))
 
-    with pytest.raises(RuntimeError, match=r"Opaque legacy replacement .*layers\.0\.experts.*no inline declaration"):
+    with pytest.raises(RuntimeError, match=r"Opaque legacy replacement .*layers\.0\.experts.*no replay record"):
         build_replacement_patches(rules)
 
 
