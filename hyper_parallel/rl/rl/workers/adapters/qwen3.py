@@ -19,19 +19,24 @@ handling here. Main-project callers use HyperAutoModelForCausalLM with the
 Qwen3 adapter and explicit DistributedSetup declarations.
 """
 
+from __future__ import annotations
+
 from functools import wraps
 from typing import Any
 
-from hyper_parallel.distributed import ShardingPlanner, apply_sharding_plan
+from hyper_parallel.components.checkpoint.load_groups import target_layout
+from hyper_parallel.core.dtensor.layout import Layout
+from hyper_parallel.distributed import ShardingPlanner
 # The atomic loader accepts these infrastructure objects at its build boundary.
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
+from hyper_parallel.distributed._builder.source_shard import build_source_shard_info
 from hyper_parallel.models import HyperAutoModelForCausalLM
 from hyper_parallel.distributed.mesh import DistributedSetup
 
 
 def _require_qwen3(model: Any) -> None:
-    if getattr(getattr(model, "config", None), "model_type", None) != "qwen3":
-        raise ValueError("Qwen3 runtime adaptation requires config.model_type='qwen3'")
+    if getattr(getattr(model, "config", None), "model_type", None) not in ("qwen3", "qwen3_moe"):
+        raise ValueError("Qwen3 runtime adaptation requires a supported Qwen3 family config")
 
 
 def restore_tied_parameter(model: Any) -> None:
@@ -88,10 +93,55 @@ class _PlannerModelView:
 class Qwen3ShardingPlanner(ShardingPlanner):
     """Run the shared planner with a Qwen3-only alias-inclusive model view."""
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Keep the final shared plan for parameter metadata after materialization."""
+        super().__init__(*args, **kwargs)
+        self.finalized_plan = None
+
     def plan(self, model: Any, *args: Any, **kwargs: Any) -> Any:
         """Preserve every parameter FQN when deriving Qwen3's parallel plan."""
         _require_qwen3(model)
-        return super().plan(_PlannerModelView(model), *args, **kwargs)
+        # Preserve logical dimensions before production TP replaces parameters
+        # by local tensors. Architecture audits must not depend on FSDP residency.
+        model._rl_logical_parameter_shapes = {  # pylint: disable=protected-access
+            name: tuple(parameter.shape) for name, parameter in model.named_parameters(remove_duplicate=False)
+        }
+        for module in model.modules():
+            make_transforms = getattr(module, "make_transforms", None)
+            if callable(make_transforms):
+                # TP may divide module attributes such as KV head count. Weight
+                # conversion remains a mapping of full checkpoint coordinates.
+                module._rl_logical_weight_transforms = make_transforms()  # pylint: disable=protected-access
+        plan = super().plan(_PlannerModelView(model), *args, **kwargs)
+        self.finalized_plan = plan
+        modules = dict(model.named_modules())
+        for name, spec in plan.modules.items():
+            # External schedulers enter/leave the original model at these
+            # boundaries. Keep the planner's declarations, never infer SP.
+            modules[name]._rl_input_layouts = dict(spec.in_src or {})  # pylint: disable=protected-access
+            outputs = spec.out_dst or spec.out_src or {}
+            modules[name]._rl_output_layout = outputs.get("output")  # pylint: disable=protected-access
+        return plan
+
+    def retain_parameter_layouts(self, model: Any, mesh_context: Any) -> None:
+        """Retain shared source layouts when no FSDP manager consumes them."""
+        mesh = getattr(mesh_context, "device_mesh", None)
+        if self.finalized_plan is None or mesh is None:
+            return
+        sources = build_source_shard_info(
+            self.finalized_plan, dense_source_mesh=mesh,
+            expert_source_mesh=getattr(mesh_context, "fsdp_moe_mesh", None),
+        )
+        for name, parameter in model.named_parameters(remove_duplicate=False):
+            if target_layout(parameter) is not None or name not in sources:
+                continue
+            placements, source_mesh = sources[name]
+            if source_mesh is None:
+                continue
+            layout = Layout.from_device_mesh(source_mesh)
+            layout.set_placements(placements)
+            layout.placement_to_tensor_map(parameter.ndim)
+            parameter._sharding_spec = layout  # pylint: disable=protected-access
 
 
 class _Qwen3FSDP2Manager(FSDP2Manager):
@@ -102,14 +152,6 @@ class _Qwen3FSDP2Manager(FSDP2Manager):
         """Retie this Qwen3 instance before the shared FSDP manager wraps it."""
         restore_tied_parameter(model)
         return super().parallelize(model, source_shard_info=source_shard_info, ignored_params=ignored_params)
-
-
-def apply_qwen3_sharding_plan(model: Any, *args: Any, **kwargs: Any) -> Any:
-    """Apply the shared plan and restore tied identity for the vLLM model."""
-    _require_qwen3(model)
-    result, source_info = apply_sharding_plan(model, *args, **kwargs)
-    restore_tied_parameter(result)
-    return result, source_info
 
 
 class Qwen3AutoModel(HyperAutoModelForCausalLM):
@@ -132,10 +174,11 @@ class Qwen3AutoModel(HyperAutoModelForCausalLM):
     def _build_model(cls, *args: Any, **kwargs: Any) -> Any:
         """Build Qwen3 with scoped sharding and tied-parameter FSDP adapters."""
         setup = kwargs["distributed_setup"]
-        kwargs["sharding_planner"] = Qwen3ShardingPlanner(
+        planner = Qwen3ShardingPlanner(
             plan_overrides=setup.plan_overrides,
             allow_uncovered_params=getattr(setup, "allow_uncovered_params", False),
         )
+        kwargs["sharding_planner"] = planner
         manager = kwargs.get("fsdp2_manager")
         if manager is not None:
             kwargs["fsdp2_manager"] = _Qwen3FSDP2Manager(
@@ -143,11 +186,10 @@ class Qwen3AutoModel(HyperAutoModelForCausalLM):
                 mesh_context=manager.mesh_context,
                 fp32_main_params=manager.fp32_main_params,
             )
-        return super()._build_model(*args, **kwargs)
-
-
-
-
+        model = super()._build_model(*args, **kwargs)
+        if manager is None:
+            planner.retain_parameter_layouts(model, setup.mesh_context)
+        return model
 
 
 def from_pretrained(pretrained_model_name_or_path: str, **kwargs: Any) -> Any:

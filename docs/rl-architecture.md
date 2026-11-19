@@ -17,3 +17,11 @@ GRPO/PPO/GSPO, MoE, RM, Teacher, Agent, and both asynchronous modes retain their
 See the [runtime architecture](../hyper_parallel/rl/docs/architecture.md) for detailed ordering and state contracts,
 [feature navigation](rl-navigation.md) for configuration and validation entry points, and [RL rules](../.agent/rules/hyper-rl.md) for development boundaries.
 Record CPU contract validation, short device flows, and learning outcomes separately.
+
+## Unified Training and Inference
+
+The optional [unified execution runtime](../hyper_parallel/rl/rl/unified_execution/README.md)
+reuses the HP model builder and complete `train.plan_overrides` for Qwen3 Dense and MoE.
+HP owns TP/SP and expert sharding; vLLM owns scheduling, paged KV cache and graph execution.
+Shared V4 attention, Level 3, ordinary row-parallel PIK and ordered FP32 expert merging define the numerical path.
+Training MoE reuses HP dynamic EP and its autograd; inference derives row bounds from scheduling and graph sizes, and selects MC2 or AllGather with device-driven effective-row GMM per batch. A model-owned custom-op boundary keeps this selection out of Dynamo tracing while retaining ACL capture. A dedicated MC2 communicator preserves HP expert rank order, and runtime-specific audits enforce the shared numerical contract. Training CP reuses HP sequence sharding and differentiable K/V gather, with RL-owned target alignment and TP×CP request sharing. Inference PCP reuses native Ascend MRV2 scheduling and KV caches, derives HP EP groups from the full DP×PCP×TP domain according to the EP degree, and publishes to all DP×PCP replicas. This retains native scheduler ownership, expert weight layout and publication protocol. PCP1 retains its prior execution path; DCP, PP and expert-internal PIK remain separate work.

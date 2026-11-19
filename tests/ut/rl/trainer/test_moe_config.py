@@ -72,7 +72,7 @@ def test_moe_runtime_uses_public_recipe_and_native_rollout(moe_config: dict) -> 
     (("train", "accelerator", "ep"), 3, "divide training world_size"),
     (("train", "accelerator", "ep"), 1, "edp_shard requires ep"),
     (("train", "accelerator", "edp_shard"), 0, "positive integer"),
-    (("consistency", "enabled"), True, "consistency was removed"),
+    (("consistency", "enabled"), True, "consistency requires schema_version"),
 ])
 def test_moe_rejects_unsupported_runtime(moe_config: dict, path: tuple, value: object, error: str) -> None:
     """Unsupported combinations fail before constructing models or process groups."""

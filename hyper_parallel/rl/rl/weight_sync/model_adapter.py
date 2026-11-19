@@ -19,6 +19,7 @@ from __future__ import annotations
 __all__ = [
     "ModelWeightAdapter",
     "build_model_weight_adapter",
+    "expert_weight_slices",
 ]
 
 
@@ -29,6 +30,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Mapping, Optional
 
+from hyper_parallel.components.checkpoint.conversion_ops import ConcatenateWithSections
+
 
 # Annotation-only references must not initialize roles while weight_sync is importing.
 if TYPE_CHECKING:
@@ -37,7 +40,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class _WeightRows:
-    """One fused QKV row interval and its canonical HF location."""
+    """One physical row interval and its canonical HF location."""
 
     name: str
     source_start: int
@@ -49,16 +52,52 @@ class _WeightRows:
 def _canonical_weight_rows(name: str, config: Any) -> tuple[_WeightRows, ...]:
     """Map fused QKV rows to canonical Qwen3 parameter names."""
     groups = int(config.num_key_value_heads)
-    head_dim = int(config.head_dim)
+    head_dim = int(getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads)
     sizes = (int(config.num_attention_heads) // groups * head_dim, head_dim, head_dim)
-    prefix = name.removesuffix("linear_qkv.weight")
+    suffix = name.rsplit(".", maxsplit=1)[-1]
+    prefix = name.removesuffix(f"linear_qkv.{suffix}")
     rows = []
     for group in range(groups):
         offset = group * sum(sizes)
         for projection, size in zip(("q_proj", "k_proj", "v_proj"), sizes):
-            rows.append(_WeightRows(prefix + projection + ".weight", offset, group * size, size, groups * size))
+            rows.append(_WeightRows(f"{prefix}{projection}.{suffix}", offset, group * size, size, groups * size))
             offset += size
     return tuple(rows)
+
+
+def _mlp_conversion_rows(module_name: str, module: Any,
+                         logical_shapes: Optional[Mapping[str, Any]] = None) -> dict[str, tuple[_WeightRows, ...]]:
+    """Read the actual HP SwiGLU conversion descriptors without retaining tensors."""
+    result = {}
+    transforms = getattr(module, "_rl_logical_weight_transforms", None)
+    if transforms is None:
+        transforms = module.make_transforms()
+    for transform in transforms:
+        if len(transform.target_patterns) != 1:
+            raise ValueError(f"Unsupported SwiGLU transform targets at {module_name}")
+        target = transform.target_patterns[0]
+        if target not in ("linear_fc1.weight", "linear_fc1.bias", "linear_fc2.weight", "linear_fc2.bias"):
+            raise ValueError(f"Unsupported SwiGLU transform target: {module_name}.{target}")
+        parameter = module.get_parameter(target)
+        row_count = (logical_shapes or {}).get(f"{module_name}.{target}", parameter.shape)[0]
+        operations = getattr(transform, "operations", ())
+        if not operations:
+            if len(transform.source_patterns) != 1:
+                raise ValueError(f"SwiGLU rename requires one logical source: {module_name}.{target}")
+            sections = (int(row_count),)
+        elif len(operations) == 1 and isinstance(operations[0], ConcatenateWithSections) and operations[0].dim == 0:
+            sections = operations[0].sections
+        else:
+            raise ValueError(f"Unsupported SwiGLU conversion operation: {module_name}.{target}")
+        if len(sections) != len(transform.source_patterns) or sum(sections) != row_count:
+            raise ValueError(f"SwiGLU conversion does not cover parameter rows: {module_name}.{target}")
+        rows = []
+        offset = 0
+        for source, length in zip(transform.source_patterns, sections):
+            rows.append(_WeightRows(f"{module_name}.{source}", offset, 0, length, length))
+            offset += length
+        result[f"{module_name}.{target}"] = tuple(rows)
+    return result
 
 
 class ModelWeightAdapter:
@@ -68,15 +107,31 @@ class ModelWeightAdapter:
         """Resolve the canonical parameter mapping for this model family."""
         self._model = model
         self._source_config = None
+        self._source_mlp_rows: dict[str, tuple[_WeightRows, ...]] = {}
 
     def bind_source(self, payload: Any) -> None:
         """Read model configuration without retaining the Actor or its tensors."""
         config = getattr(payload, "config", None)
         if config is not None:
             self._source_config = config
+        self._source_mlp_rows = {}
+        named_modules = getattr(payload, "named_modules", None)
+        if self._model.family == "qwen3" and callable(named_modules):
+            for name, module in named_modules():
+                if name.endswith(".mlp") and hasattr(module, "linear_fc1"):
+                    if not callable(getattr(module, "make_transforms", None)):
+                        raise ValueError(f"Fused Qwen3 MLP has no weight conversion descriptors: {name}")
+                    self._source_mlp_rows.update(_mlp_conversion_rows(
+                        name, module, getattr(payload, "_rl_logical_parameter_shapes", None),
+                    ))
 
     def _canonical_rows(self, name: str) -> tuple:
-        if not name.endswith("self_attn.linear_qkv.weight"):
+        """Recover logical rows from a converted parameter mapping."""
+        if name in self._source_mlp_rows:
+            return self._source_mlp_rows[name]
+        if self._model.family == "qwen3" and ".mlp.linear_fc" in name:
+            raise ValueError(f"Fused Qwen3 MLP publication requires bound model conversion descriptors: {name}")
+        if not name.endswith(("self_attn.linear_qkv.weight", "self_attn.linear_qkv.bias")):
             return ()
         if self._source_config is None:
             config_path = Path(self._model.model.weights_path) / "config.json"
@@ -90,7 +145,7 @@ class ModelWeightAdapter:
         if self._source_config is None:
             config_path = Path(self._model.model.weights_path) / "config.json"
             self._source_config = SimpleNamespace(**json.loads(config_path.read_text(encoding="utf-8")))
-        return _expert_weight_slices(name, shape, self._source_config)
+        return expert_weight_slices(name, shape, self._source_config)
 
     def packed_metadata(self, metadata: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Attach model-owned row conversion to whole-parameter transfer units."""
@@ -101,7 +156,8 @@ class ModelWeightAdapter:
                 entry = {**entry, "canonical_experts": expert_slices}
             rows = self._canonical_rows(entry["name"])
             if rows:
-                if len(entry["shape"]) != 2 or sum(row.length for row in rows) != entry["shape"][0]:
+                expected_rank = 1 if entry["name"].endswith(".bias") else 2
+                if len(entry["shape"]) != expected_rank or sum(row.length for row in rows) != entry["shape"][0]:
                     raise ValueError(f"Fused Qwen3 weight {entry['name']!r} has an incompatible shape")
                 entry = {**entry, "canonical_rows": [asdict(row) for row in rows]}
             result.append(entry)
@@ -133,7 +189,7 @@ _EXPERT_WEIGHT_PATTERN = re.compile(
 )
 
 
-def _expert_weight_slices(name: str, shape: Any, config: Any) -> list[dict[str, Any]]:
+def expert_weight_slices(name: str, shape: Any, config: Any) -> list[dict[str, Any]]:
     """Describe individual expert projections in GroupedExperts physical axes."""
     match = _EXPERT_WEIGHT_PATTERN.fullmatch(name)
     if match is None:

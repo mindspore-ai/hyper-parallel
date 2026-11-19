@@ -18,19 +18,24 @@
 
 import importlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import torch
-
 import rl.config.validate as config_module
+import torch
 from rl.algorithm import build_algorithm
-from rl.config.schema import build_model_registration, uses_colocated_vllm
-from rl.config.resolve import build_runtime_config
 from rl.config.limits import resolve_vllm_automatic_limits
+from rl.config.loader import load_config
+from rl.config.resolve import build_runtime_config, resolve_unified_execution_config
+from rl.config.schema import build_model_registration, uses_colocated_vllm
 from rl.config.validate import validate_config
+from rl.trainer.build import _TrainerBuilder
 from rl.workers.engine.model import resolve_vllm_model
+
+from hyper_parallel.distributed.mesh import DistributedSetup
+from hyper_parallel.trainer.config import normalize_distributed_setup_overrides
 
 
 @pytest.fixture(name="validated_recipe")
@@ -82,7 +87,7 @@ def _validated_recipe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
         (("rollout", "vllm", "task_queue_enable"), 3, "task_queue_enable must be 1 or 2"),
         (("train", "accelerator", "cp"), 2, "invalid topology"),
         (("train", "accelerator", "pp"), 2, "invalid topology"),
-        (("train", "accelerator", "tp"), 4, "invalid topology"),
+        (("train", "accelerator", "tp"), 8, "invalid topology"),
         (("rollout", "vllm", "visible_devices"), "0", "disjoint from the trainer"),
         (("rollout", "vllm", "host"), "0.0.0.0", "loopback"),
         (("rollout", "vllm", "port"), True, "explicit integer"),
@@ -126,7 +131,7 @@ def test_actor_anchor_can_disable_sampling_probabilities(validated_recipe) -> No
     validated_recipe["rollout"]["vllm"]["seed"] = 42
     validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
     validated_recipe["consistency"] = {"enabled": True}
-    with pytest.raises(ValueError, match="consistency was removed"):
+    with pytest.raises(ValueError, match="consistency requires schema_version=1"):
         validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
 
 
@@ -168,6 +173,26 @@ def test_config_accepts_optional_model_init_threads_and_rejects_boolean(validate
     validated_recipe["train"]["model_init_cpu_threads"] = True
     with pytest.raises(ValueError, match="model_init_cpu_threads.*positive integer"):
         validate_config(validated_recipe, algorithm)
+
+
+@pytest.mark.parametrize("recipe,devices", [("qwen3_dense.yaml", "0,1")])
+def test_unified_example_preserves_explicit_training_plan(
+    validated_recipe: dict, monkeypatch: pytest.MonkeyPatch, recipe: str, devices: str,
+) -> None:
+    """The shipped architecture recipe passes real validation and transports every Actor rule."""
+    path = Path(__file__).resolve().parents[1] / "unified_execution/fixtures" / recipe
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", devices)
+    config = load_config(str(path), [])
+    config["model"].update(validated_recipe["model"])
+    for field in ("train_path", "test_path"):
+        config["data"][field] = validated_recipe["data"][field]
+    resolved = resolve_vllm_automatic_limits(resolve_unified_execution_config(config))
+    validate_config(resolved, build_algorithm(resolved["algorithm"]))
+    payload = resolved["rollout"]["vllm"]["unified_execution"]
+    assert payload["plan_overrides"] == config["train"]["plan_overrides"]
+    assert resolved["rollout"]["vllm"]["model_implementation"] == "unified"
+    runtime = build_runtime_config(resolved)
+    assert len(runtime.plan_overrides) == len(config["train"]["plan_overrides"])
 
 
 def test_colocated_reward_model_config_rejects_conflicts(
@@ -223,7 +248,74 @@ def _complete_config(tmp_path: Path) -> dict:
     test_path = tmp_path / "test.parquet"
     train_path.touch()
     test_path.touch()
-    return {'model': {'name': 'qwen3', 'registry_name': 'qwen', 'weights_path': str(model_dir), 'tokenizer_path': str(tokenizer_dir), 'attn_implementation': 'sdpa'}, 'data': {'train_path': str(train_path), 'test_path': str(test_path), 'max_prompt_length': 16}, 'rollout': {'engine': 'vllm', 'num_return_sequences': 2, 'max_new_tokens': 8, 'seed': 7, 'ignore_eos': False, 'vllm': {'deployment': 'disjoint', 'data_parallel_size': 1, 'tensor_parallel_size': 1, 'visible_devices': '4', 'host': '127.0.0.1', 'port': 8200, 'dtype': 'bfloat16', 'gpu_memory_utilization': 0.8, 'kv_cache_memory_bytes': 2 * 1024 * 1024, 'max_model_len': 64, 'max_num_seqs': None, 'max_num_batched_tokens': 64, 'block_size': 16, 'model_implementation': 'native', 'weight_sync': {'strategy': 'full_gather', 'bucket_size_mb': 1}}}, 'agentic': {'environment': 'ut-config-environment', 'max_turns': 1, 'max_observation_tokens': 0, 'interaction_mode': 'single_turn', 'apply_chat_template': False}, 'algorithm': {'name': 'grpo', 'loss_aggregation': 'token-mean'}, 'evaluation': {'enabled': True, 'batch_size': 1, 'max_new_tokens': 8, 'max_samples': 2, 'log_samples': 0, 'progress_steps': 0, 'ignore_eos': False}, 'train': _training_config(tmp_path), 'logging': {'backends': ['console'], 'wandb': {'mode': 'disabled'}}}
+    return {
+        'model': {
+            'name': 'qwen3',
+            'registry_name': 'qwen',
+            'weights_path': str(model_dir),
+            'tokenizer_path': str(tokenizer_dir),
+            'attn_implementation': 'sdpa',
+        },
+        'data': {
+            'train_path': str(train_path),
+            'test_path': str(test_path),
+            'max_prompt_length': 16,
+        },
+        'rollout': {
+            'engine': 'vllm',
+            'num_return_sequences': 2,
+            'max_new_tokens': 8,
+            'seed': 7,
+            'ignore_eos': False,
+            'vllm': {
+                'deployment': 'disjoint',
+                'data_parallel_size': 1,
+                'tensor_parallel_size': 1,
+                'visible_devices': '4',
+                'host': '127.0.0.1',
+                'port': 8200,
+                'dtype': 'bfloat16',
+                'gpu_memory_utilization': 0.8,
+                'kv_cache_memory_bytes': 2 * 1024 * 1024,
+                'max_model_len': 64,
+                'max_num_seqs': None,
+                'max_num_batched_tokens': 64,
+                'block_size': 16,
+                'model_implementation': 'native',
+                'weight_sync': {
+                    'strategy': 'full_gather',
+                    'bucket_size_mb': 1,
+                },
+            },
+        },
+        'agentic': {
+            'environment': 'ut-config-environment',
+            'max_turns': 1,
+            'max_observation_tokens': 0,
+            'interaction_mode': 'single_turn',
+            'apply_chat_template': False,
+        },
+        'algorithm': {
+            'name': 'grpo',
+            'loss_aggregation': 'token-mean',
+        },
+        'evaluation': {
+            'enabled': True,
+            'batch_size': 1,
+            'max_new_tokens': 8,
+            'max_samples': 2,
+            'log_samples': 0,
+            'progress_steps': 0,
+            'ignore_eos': False,
+        },
+        'train': _training_config(tmp_path),
+        'logging': {
+            'backends': ['console'],
+            'wandb': {
+                'mode': 'disabled',
+            },
+        },
+    }
 
 
 def test_complete_config_resolves_validates_and_builds_runtime(
@@ -537,9 +629,6 @@ def test_config_requires_explicit_plan_rules(validated_recipe, rules):
 
 def test_role_rules_replace_shared_list_without_mutating_actor(validated_recipe):
     """Normalization of one role cannot overwrite another role's declarations."""
-    from dataclasses import replace
-    from hyper_parallel.distributed.mesh import DistributedSetup
-    from hyper_parallel.trainer.config import normalize_distributed_setup_overrides
 
     train = validated_recipe["train"]
     train["plan_overrides"] = [{"match": "*.mlp", "region_dispatch": True}]
@@ -562,9 +651,6 @@ def test_role_rules_replace_shared_list_without_mutating_actor(validated_recipe)
 
 def test_effective_role_config_keeps_declared_and_active_rules(validated_recipe):
     """Persist declared HP fields separately from condition-filtered selections."""
-    from hyper_parallel.distributed.mesh import DistributedSetup
-    from hyper_parallel.trainer.config import normalize_distributed_setup_overrides
-    from rl.trainer.build import _TrainerBuilder
 
     runtime = build_runtime_config(validated_recipe)
     setup = DistributedSetup()

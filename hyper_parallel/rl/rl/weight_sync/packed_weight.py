@@ -264,9 +264,9 @@ def _unpack_canonical_experts(tensor: Any, experts: list[Mapping[str, Any]]) -> 
 
 
 def _unpack_canonical_rows(tensor: Any, rows: list[Mapping[str, Any]]) -> list[tuple[str, Any]]:
-    """Restore canonical matrices from explicit disjoint physical row ranges."""
-    if tensor.ndim != 2 or not rows:
-        raise ValueError("Canonical row conversion requires a matrix and non-empty ranges")
+    """Restore canonical weight matrices or bias vectors from physical row ranges."""
+    if tensor.ndim not in (1, 2) or not rows:
+        raise ValueError("Canonical row conversion requires a matrix or vector and non-empty ranges")
     grouped = {}
     source_end = 0
     for row in sorted(rows, key=lambda item: int(item["source_start"])):

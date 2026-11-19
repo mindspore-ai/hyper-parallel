@@ -15,6 +15,7 @@
 """Process-isolated vLLM rollout adapter."""
 import asyncio
 import json
+import logging
 import os
 import signal
 import socket
@@ -33,6 +34,7 @@ import torch
 import torch.distributed as dist
 
 from rl.data.contracts import RouterTrace, resize_router_trace
+from rl.unified_execution.core.batch_invariant import verify_batch_invariant
 from rl.workers.engine.model import (
     ModelRegistration,
     VLLMModelRegistration,
@@ -48,11 +50,14 @@ from rl.rollout.router_capture import (
 from rl.rollout.topology import (
     VLLMRolloutTopology,
     resolve_vllm_rollout_topology,
+    model_parallel_size,
+    worker_tensor_parallel_size,
 )
 from rl.weight_sync.sync import ActorRolloutWeightSync, PolicySnapshot, synchronize_error, synchronized_call
 from rl.weight_sync.vllm_client import VLLMWeightSyncClientMixin
 from rl.weight_sync.transfer import WeightPublisher, build_weight_publisher
 from rl.weight_sync.config import resolve_weight_sync_config
+from rl.unified_execution.core.contract import parse_unified_payload
 
 _DISTRIBUTED_ENVIRONMENT_VARIABLES = (
     "RANK",
@@ -735,6 +740,10 @@ class VLLMGenerationEngine:
             model,
             self._config.get("model_implementation", "native"),
         )
+        self._unified_execution = None
+        self._unified_numerical_policy_snapshots: Optional[list[dict[str, Any]]] = None
+        if self._rollout_model.implementation == "unified":
+            self._unified_execution = parse_unified_payload(self._config.get("unified_execution"))
         self._client = client
         self._router_capture_spec = (
             RouterCaptureSpec.from_checkpoint(model.weights_path)
@@ -769,7 +778,7 @@ class VLLMGenerationEngine:
         request_rank: int,
         request_size: int,
     ) -> None:
-        """Assign one HTTP request owner per Trainer TP group."""
+        """Assign one HTTP owner per supplied Trainer TP or flattened TP x CP group."""
         if tp_size <= 1:
             raise ValueError("Trainer TP request ownership requires tp_size > 1")
         if not 0 <= tp_rank < tp_size:
@@ -890,7 +899,7 @@ class VLLMGenerationEngine:
             "--tokenizer",
             self._model.tokenizer_path,
             "--tensor-parallel-size",
-            str(int(self._config.get("tensor_parallel_size", 1))),
+            str(worker_tensor_parallel_size(self._config)),
             "--data-parallel-size",
             str(int(self._config.get("data_parallel_size", 1))),
             "--dtype",
@@ -927,14 +936,23 @@ class VLLMGenerationEngine:
         ):
             if self._config.get(key) is not None:
                 command.extend((option, str(self._config[key])))
+        additional_config = {}
+        if int(self._config.get("context_parallel_size", 1)) > 1:
+            command.extend(("--prefill-context-parallel-size", str(self._config["context_parallel_size"]),
+                            "--decode-context-parallel-size", "1"))
+            # HP continues owning embedding/LM-head weights and their TP layouts.
+            additional_config["enable_pcp_embedding_lmhead_weight_sharding"] = False
         if self._deployment == "colocated":
-            command.extend(
-                (
-                    "--enable-sleep-mode",
-                    "--additional-config",
-                    json.dumps({"weight_nz_mode": 0}),
-                )
-            )
+            command.append("--enable-sleep-mode")
+            additional_config["weight_nz_mode"] = 0
+        if self._unified_execution is not None:
+            command.extend(("--hf-overrides", json.dumps({
+                "architectures": [self._rollout_model.architecture],
+                "hyper_rl_unified_execution": self._unified_execution,
+            })))
+            additional_config["weight_nz_mode"] = 0
+        if additional_config:
+            command.extend(("--additional-config", json.dumps(additional_config)))
         for key, option in (
             ("attention_backend", "--attention-backend"),
             ("gpu_memory_utilization", "--gpu-memory-utilization"),
@@ -957,10 +975,18 @@ class VLLMGenerationEngine:
 
     def _server_environment(self, visible_devices: str) -> dict[str, str]:
         """Build an isolated environment for the owned vLLM process."""
+        if (self._unified_execution is not None and "batch_invariant" in self._unified_execution
+                and os.environ.get("VLLM_BATCH_INVARIANT") == "1"):
+            raise ValueError("Unified Level 3 conflicts with inherited VLLM_BATCH_INVARIANT=1")
         server_environment = os.environ.copy()
+        if int(self._config.get("context_parallel_size", 1)) > 1:
+            server_environment["VLLM_USE_V2_MODEL_RUNNER"] = "1"
         for variable in _DISTRIBUTED_ENVIRONMENT_VARIABLES:
             server_environment.pop(variable, None)
         server_environment.pop("HYPER_RL_CONSISTENCY_PROFILE", None)
+        server_environment.pop("HYPER_RL_UNIFIED_EXECUTION", None)
+        if self._unified_execution is not None:
+            server_environment["HYPER_RL_UNIFIED_EXECUTION"] = "1"
         server_environment.update(
             {
                 "ASCEND_RT_VISIBLE_DEVICES": str(visible_devices),
@@ -988,6 +1014,30 @@ class VLLMGenerationEngine:
             server_environment.pop("PYTORCH_NPU_ALLOC_CONF", None)
         return server_environment
 
+    def _verify_worker_numerical_policies(self, client: Any) -> None:
+        """Require every rollout worker to match the Trainer's verified Level 3 state."""
+        if self._unified_execution is None or "batch_invariant" not in self._unified_execution:
+            return
+        policy = self._unified_execution["batch_invariant"]
+        local_state = verify_batch_invariant(policy)
+        expected_state = {name: value for name, value in local_state.items() if name not in ("pid", "device")}
+        results = client.collective_rpc("get_unified_numerical_policy")
+        expected_count = int(self._config.get("data_parallel_size", 1)) * model_parallel_size(self._config)
+        if not isinstance(results, list) or len(results) != expected_count:
+            raise RuntimeError(f"Unified numerical policy requires {expected_count} worker snapshots; got {results!r}")
+        for index, result in enumerate(results):
+            if not isinstance(result, Mapping) or result.get("policy") != policy:
+                raise RuntimeError(f"Unified numerical policy mismatch at worker {index}: {result!r}")
+            reported_policy = result["policy"]
+            state = result.get("state")
+            if (any(type(reported_policy[name]) is not type(value) for name, value in policy.items())
+                    or not isinstance(state, Mapping)
+                    or any(type(state.get(name)) is not type(value) or state.get(name) != value
+                           for name, value in expected_state.items())):
+                raise RuntimeError(f"Unified numerical state mismatch at worker {index}: {result!r}")
+        self._unified_numerical_policy_snapshots = results
+        logging.getLogger(__name__).info("Verified rollout numerical policy snapshots: %s", results)
+
     def _launch_client(self, visible_devices: str, host: str, port: int) -> Any:
         """Launch the owned server process and wait for its health endpoint."""
         try:
@@ -1014,6 +1064,7 @@ class VLLMGenerationEngine:
         )
         try:
             client.wait_ready(float(self._config.get("startup_timeout", 300)))
+            self._verify_worker_numerical_policies(client)
         except Exception:
             client.close()
             raise
@@ -1538,7 +1589,9 @@ def build_vllm_engine(
         deployment,
         rollout_model,
         tensor_parallel_size=rollout_tp,
-        data_parallel_size=int(vllm_config.get("data_parallel_size", 1)),
+        # Publication addresses each PCP replica; TP still describes weight shards.
+        data_parallel_size=(int(vllm_config.get("data_parallel_size", 1))
+                            * int(vllm_config.get("context_parallel_size", 1))),
         bucket_size_bytes=normalized_weight_sync.bucket_size_bytes,
         strategy=normalized_weight_sync.strategy,
     )
