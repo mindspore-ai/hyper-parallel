@@ -15,7 +15,6 @@
 """Root mean square normalization function."""
 
 import torch
-import torch_npu
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
@@ -29,4 +28,7 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> torch.
     Returns:
         The normalized tensor.
     """
+    # Torch-npu is optional until the native RMSNorm is actually selected.
+    import torch_npu  # pylint: disable=import-outside-toplevel
+
     return torch_npu.npu_rms_norm(x, weight, epsilon=eps)[0]

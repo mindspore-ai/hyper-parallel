@@ -21,7 +21,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from hyper_parallel.components.functional.mhc_post import mhc_post
+from hyper_parallel.components.functional.mhc_post import mhc_post, weighted_stream_sum
 
 B, S, N, C = 2, 3, 4, 128
 
@@ -86,7 +86,7 @@ class TestMhcPost(unittest.TestCase):
         Description: Run the CPU fallback with either supported backend.
         Expectation: Bypass vendor operators and match eager outputs and gradients.
         """
-        for backend in ("cann", "omni"):
+        for backend in ("cann", "omni", "torch_npu"):
             with self.subTest(backend=backend):
                 inputs = (
                     torch.randn(B, S, C, requires_grad=True),
@@ -144,8 +144,41 @@ class TestMhcPost(unittest.TestCase):
         Description: Invoke mhc_post with an unsupported backend name.
         Expectation: Raise ValueError listing the supported backends.
         """
-        with self.assertRaisesRegex(ValueError, "backend must be 'cann' or 'omni'"):
+        with self.assertRaisesRegex(ValueError, "backend must be"):
             mhc_post(
                 torch.randn(B, S, C), torch.randn(B, S, N * C), torch.randn(B, S, N),
                 torch.randn(B, S, N, N), N, backend="eager",
             )
+
+
+class TestWeightedStreamSum(unittest.TestCase):
+    """Check arbitrary delayed pre coefficients through the native Post bridge."""
+
+    def test_native_reduction_and_gradients(self):
+        """Match an independent weighted sum including coefficient gradients."""
+        def post(x: torch.Tensor, combine: torch.Tensor, output: torch.Tensor,
+                 weights: torch.Tensor) -> torch.Tensor:
+            """Compute the Post formula independently of the native wrapper."""
+            return (torch.einsum("bsij,bsih->bsjh", combine, x.float())
+                    + output.float().unsqueeze(-2) * weights.unsqueeze(-1)).to(x.dtype)
+
+        def backward(grad: torch.Tensor, *inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
+            """Use Torch autograd as the mock native derivative."""
+            with torch.enable_grad():
+                copies = [value.detach().requires_grad_() for value in inputs]
+                return torch.autograd.grad(post(*copies), copies, grad)
+
+        x = torch.randn(2, 3, 4, 16, dtype=torch.bfloat16, requires_grad=True)
+        weights = torch.randn(2, 3, 4, requires_grad=True)
+        expected = (x.float() * weights.unsqueeze(-1)).sum(-2).to(x.dtype)
+        native = ModuleType("torch_npu")
+        native.npu_mhc_post = post
+        native.npu_mhc_post_backward = backward
+        with patch.dict(sys.modules, {"torch_npu": native}), _fake_npu_device():
+            actual = weighted_stream_sum(x, weights)
+            upstream = torch.randn_like(actual)
+            actual_grads = torch.autograd.grad(actual, (x, weights), upstream)
+        expected_grads = torch.autograd.grad(expected, (x, weights), upstream)
+        torch.testing.assert_close(actual, expected)
+        for value, oracle in zip(actual_grads, expected_grads):
+            torch.testing.assert_close(value, oracle)

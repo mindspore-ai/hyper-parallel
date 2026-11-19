@@ -67,6 +67,27 @@ class _MhcPost(torch.autograd.Function):
         return grad_x, grad_h_res, grad_h_out, grad_h_post
 
 
+class _TorchNpuMhcPost(torch.autograd.Function):
+    """First-order bridge for the native Ascend Post and weighted reduction."""
+
+    @staticmethod
+    def forward(ctx: Any, streams: torch.Tensor, combine: torch.Tensor,
+                output: torch.Tensor, post: torch.Tensor) -> torch.Tensor:
+        """Load the optional torch-npu binding only when selected."""
+        import torch_npu  # pylint: disable=import-outside-toplevel
+
+        ctx.save_for_backward(streams, combine, output, post)
+        return torch_npu.npu_mhc_post(streams, combine, output, post)
+
+    @staticmethod
+    def backward(ctx: Any, grad: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Propagate gradients through the original streams and coefficients."""
+        # Torch-npu is an optional dependency for the explicitly selected backend.
+        import torch_npu  # pylint: disable=import-outside-toplevel
+
+        return torch_npu.npu_mhc_post_backward(grad.contiguous(), *ctx.saved_tensors)
+
+
 def mhc_post(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -88,16 +109,18 @@ def mhc_post(
             ops-transformer ``mhc_post`` operator and requires fp16/bf16
             ``x``/``residual`` with fp32 ``h_post``/``h_res``; the legacy
             ``"omni"`` backend is deprecated. CPU execution keeps the eager
-            fallback.
+            fallback. ``"torch_npu"`` selects native Ascend bindings.
 
     Returns:
         Flattened mixed residual streams.
     """
-    if backend not in ("cann", "omni"):
-        raise ValueError(f"backend must be 'cann' or 'omni', got {backend!r}")
+    if backend not in ("cann", "omni", "torch_npu"):
+        raise ValueError(f"backend must be 'cann', 'omni' or 'torch_npu', got {backend!r}")
     x_shape = x.size()
     residual = residual.reshape(x_shape[0], x_shape[1], num_stream, -1)
     if x.device.type == "npu":
+        if backend == "torch_npu":
+            return _TorchNpuMhcPost.apply(residual, h_res, x, h_post).flatten(2)
         # Load only the selected optional backend so either can be used independently.
         # pylint: disable=import-outside-toplevel
         if backend == "cann":
@@ -117,3 +140,30 @@ def mhc_post(
         h_res.unsqueeze(-1) * residual.unsqueeze(-2), dim=2
     )
     return output.flatten(2).to(x.dtype)
+
+
+def weighted_stream_sum(streams: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """Aggregate with arbitrary pre coefficients using native Post on NPU.
+
+    The first destination column contains weights and all other columns are
+    zero. Returning only that destination implements a weighted stream sum
+    without materializing the FP32 product of streams and coefficients.
+
+    Args:
+        streams: Residual streams shaped [B,S,N,H].
+        weights: FP32 pre coefficients shaped [B,S,N], possibly from an earlier boundary.
+
+    Returns:
+        Weighted sum shaped [B,S,H] in the input dtype; CPU uses Torch.
+    """
+    if streams.ndim != 4 or weights.shape != streams.shape[:-1] or weights.dtype != torch.float32:
+        raise ValueError("Weighted stream sum requires [B,S,N,H] streams and FP32 [B,S,N] weights")
+    if streams.device.type == "cpu":
+        return (streams.float() * weights.unsqueeze(-1)).sum(-2).to(streams.dtype)
+    if streams.device.type != "npu" or streams.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError("Native weighted stream sum requires BF16/FP16 NPU streams")
+    count = streams.shape[-2]
+    combine = torch.nn.functional.pad(weights.unsqueeze(-1), (0, count - 1))
+    zero_output = streams.new_zeros((*streams.shape[:-2], streams.shape[-1]))
+    mixed = _TorchNpuMhcPost.apply(streams, combine, zero_output, torch.zeros_like(weights))
+    return mixed[..., 0, :].contiguous()

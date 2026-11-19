@@ -678,7 +678,7 @@ def _v41_shifted_decoder_layer_forward(
     if previous_output is None or previous_post_mix is None or previous_residual_mix is None:
         raise ValueError("shifted mHC decoder state is incomplete")
     if hasattr(layer, "engram"):
-        hidden_states = _hc_post(
+        hidden_states = getattr(layer.attn_hc, "post", _hc_post)(
             previous_output,
             hidden_states,
             previous_post_mix,
@@ -1163,10 +1163,14 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
                 with torch.no_grad():
                     target_hidden = hidden_states
                     if shifted_mhc:
-                        target_hidden = _hc_post(previous_output, hidden_states, post_mix, residual_mix)
+                        target_hidden = getattr(layer.ffn_hc, "post", _hc_post)(
+                            previous_output, hidden_states, post_mix, residual_mix,
+                        )
                     self.dspark_target_hiddens.append(_hc_pre(target_hidden, pre_mix).detach())
         if shifted_mhc:
-            hidden_states = _hc_post(previous_output, hidden_states, post_mix, residual_mix)
+            hidden_states = getattr(self.layers[-1].ffn_hc, "post", _hc_post)(
+                previous_output, hidden_states, post_mix, residual_mix,
+            )
         return hidden_states, pre_mix
 
     def forward(
