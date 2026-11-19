@@ -1,5 +1,10 @@
 # Hyper-Parallel HSDP Refactor All-in-one Rules
 
+# Head-chunk MLA: direct sliced GEMMs require the exact unmodified Linear class.
+"hyper-parallel/hyper_parallel/components/modules/head_chunk_mla.py" "unidiomatic-typecheck"
+# Torch 2.10 exposes F.linear as a C builtin; actual CPU/NPU VJP tests exercise it.
+"hyper-parallel/hyper_parallel/components/modules/_head_chunk_mla_math.py" "not-callable"
+
 # 1. Core Logic: hyper_parallel/core/fully_shard/
 "hyper-parallel/hyper_parallel/core/fully_shard/"                     "f-string-without-interpolation"
 "hyper-parallel/hyper_parallel/core/fully_shard/"                     "missing-function-docstring"

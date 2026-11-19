@@ -1,0 +1,37 @@
+# Experimental opt-in fragment; merge into an existing DeepSeek-V3 Trainer config.
+# This does not choose assets, packing, data, or loss. No generic Trainer changes.
+# Keep attention outside outer checkpoint replay; child-projection FSDP/TP unsupported.
+# examples/torch/head_chunk_mla/train.py registers this opt-in HF kernel name.
+model:
+  attn_implementation: head_chunk_mla_native
+model_init_dtype: float32
+accelerator:
+  tp_size: 1
+  cp_size: 4
+  sequence_parallel: false
+  loss_parallel: false
+optimizer:
+  fp32_main_params: true
+fsdp_config:
+  dp_shard_size: 4
+  reshard_after_forward: true
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    cast_forward_inputs: false
+plan_overrides:
+  - match: "model.layers.*.self_attn"
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v3.adapter.conversion.head_chunk_mla.DeepseekV3HeadChunkMLA
+        head_chunk_size: 32
+        offload_saved_stats: true
+        prefetch_slots: 2
+        overlap_backward: false
+  - match: "model.layers.*.self_attn.forward"
+    when: cp
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v3.adapter.distributed.head_chunk_mla.head_chunk_mla_cp_wrapper
